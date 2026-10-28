@@ -1,0 +1,29 @@
+diff --git a/packages/relayhistory/src/lib/logger.ts b/packages/relayhistory/src/lib/logger.ts
+index d868d00a..ab0f1505 100644
+--- a/packages/relayhistory/src/lib/logger.ts
++++ b/packages/relayhistory/src/lib/logger.ts
+@@ -11,6 +11,7 @@
+  * strings, tokens or history content; a caller that passes one has made a mistake the
+  * type cannot catch, so keep fields to identifiers, counts and durations.
+  */
++import { telemetryIdKey } from "./pipeline/telemetry-ids.js";
+ import type { Bindings } from "../env.js";
+ 
+ export type LogLevel = "debug" | "info" | "warn" | "error";
+@@ -31,6 +32,8 @@ export interface LoggerEnv {
+   environment: string;
+   posthogApiKey?: string;
+   posthogHost?: string;
++  /** Keys the machine/session id tokens in pipeline telemetry (`telemetry-ids.ts`). */
++  telemetryIdKey?: string;
+ }
+ 
+ export function loggerEnvFromBindings(env: Bindings): LoggerEnv {
+@@ -38,6 +41,7 @@ export function loggerEnvFromBindings(env: Bindings): LoggerEnv {
+     environment: env.ENVIRONMENT ?? "development",
+     posthogApiKey: env.POSTHOG_API_KEY || undefined,
+     posthogHost: env.POSTHOG_HOST || undefined,
++    telemetryIdKey: telemetryIdKey(env.PIPELINE_TELEMETRY_ID_KEY),
+   };
+ }
+ 

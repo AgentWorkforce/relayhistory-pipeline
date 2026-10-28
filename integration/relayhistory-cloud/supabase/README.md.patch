@@ -1,0 +1,27 @@
+diff --git a/supabase/README.md b/supabase/README.md
+index 52e67c16..44740a1c 100644
+--- a/supabase/README.md
++++ b/supabase/README.md
+@@ -391,6 +391,22 @@ these keep the stored value when the incoming one is NULL:
+ 
+ Tests: `tests/keep_on_null_test.sql`.
+ 
++## Pipeline stages and queue (migration `20261025000600`)
++
++- Renames the queued stages in the `pipeline_events` and `pipeline_dead_letters`
++  CHECKs to the pipeline registry's (`storage.event` → `object-landed`,
++  `index.upsert` → `session-indexed`, `transform` → `file-normalize`) and adds
++  `summary-short`, `summary-long`, `status-classify`, `file-maintenance`. Existing
++  rows are renamed too, dead letter ids and messages included.
++- `sessions.pipeline_jobs`: the Postgres `PipelineQueue` backend for deployments
++  without Cloudflare Queues. Claimed with `FOR UPDATE SKIP LOCKED` under a lease,
++  index `(stage, visible_at, id)`; exhausted jobs are quarantined into
++  `pipeline_dead_letters`. Service-role only, like the other pipeline tables.
++  Messages carry ids and object keys, never session content.
++
++Tests: `tests/pipeline_queue_test.sql` (the concurrent claim runs when `dblink`
++is installed) and `packages/relayhistory/test/pipeline-queue.test.ts`.
++
+ ## Approved by Khaliq, not yet applied
+ 
+ Recorded on 2026-10-25. None of these has been applied to any live system; they

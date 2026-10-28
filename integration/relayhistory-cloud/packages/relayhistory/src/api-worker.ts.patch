@@ -1,0 +1,50 @@
+diff --git a/packages/relayhistory/src/api-worker.ts b/packages/relayhistory/src/api-worker.ts
+index e508f5a4..05f632c5 100644
+--- a/packages/relayhistory/src/api-worker.ts
++++ b/packages/relayhistory/src/api-worker.ts
+@@ -13,6 +13,13 @@ import {
+   embedPendingSessionBriefs,
+ } from "./lib/session-brief-search.js";
+ import { runSessionAnalysisTick } from "./lib/session-analysis/worker.js";
++import {
++  handleStageQueue,
++  maintainPipelineEvents,
++  PIPELINE_QUEUE_PREFIX,
++  pipelineQueueDeps,
++  type StageMessage,
++} from "./lib/pipeline/index.js";
+ 
+ import {
+   handleSessionQueue,
+@@ -30,8 +37,11 @@ export default {
+     publishAfterRequest(request, response, env, ctx);
+     return response;
+   },
+-  queue(batch: MessageBatch<SessionWake>, env: Bindings) {
+-    return handleSessionQueue(batch, env);
++  queue(batch: MessageBatch<SessionWake | StageMessage>, env: Bindings) {
++    // Session pipeline stages have their own queues and DLQs; nothing binds them yet.
++    if (batch.queue.startsWith(PIPELINE_QUEUE_PREFIX))
++      return handleStageQueue(batch, pipelineQueueDeps(env));
++    return handleSessionQueue(batch as MessageBatch<SessionWake>, env);
+   },
+   async scheduled(
+     controller: ScheduledController,
+@@ -39,6 +49,17 @@ export default {
+     ctx: ExecutionContext,
+   ) {
+     if (controller.cron !== "* * * * *") return;
++    // Supabase pipeline_events partitions and retention, once a day; inert until configured.
++    ctx.waitUntil(
++      maintainPipelineEvents(env, new Date(controller.scheduledTime)).then(
++        (outcome) => {
++          if (outcome === "failed")
++            console.error(
++              JSON.stringify({ message: "pipeline events maintenance failed" }),
++            );
++        },
++      ),
++    );
+     if (env.DATABASE_URL) {
+       // Alongside the maintenance below, never ahead of it: a slow database
+       // must not hold up the work that relieves it.

@@ -1,0 +1,12 @@
+diff --git a/packages/relayhistory/src/middleware/observability.ts b/packages/relayhistory/src/middleware/observability.ts
+index b2a2a8df..3943119e 100644
+--- a/packages/relayhistory/src/middleware/observability.ts
++++ b/packages/relayhistory/src/middleware/observability.ts
+@@ -118,6 +118,7 @@ export const observability = createMiddleware<AppEnv>(async (c, next) => {
+   const fields = {
+     request_id: c.get("requestId"),
+     ...(correlationId ? { correlation_id: correlationId } : {}),
++    ...(c.get("traceId") ? { trace_id: c.get("traceId") } : {}),
+     method: c.req.method,
+     route,
+     status_code: status,
