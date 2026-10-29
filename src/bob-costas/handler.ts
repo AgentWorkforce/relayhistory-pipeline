@@ -86,19 +86,23 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
     const m = read.manifest;
     const s = m.session;
     const pk = [message.ctx.orgId, s.workspace_id, s.harness, s.session_id, s.machine_id];
-    const existing = await deps.db.query<{ content_sha256: string; revision: string }>(
-      `SELECT content_sha256, revision FROM sessions.session_summaries
+    const existing = await deps.db.query<{ content_sha256: string; revision: string; status: string; key_id: string | null }>(
+      `SELECT content_sha256, revision, status, key_id FROM sessions.session_summaries
         WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
       [...pk, kind],
     );
     const row = existing.rows[0];
     if (row && Number(row.revision) > m.revision) return { status: "skipped", reason: "stale_revision" };
-    if (row && Number(row.revision) === m.revision && row.content_sha256 === m.raw.content_sha256) return { status: "skipped", reason: "summary_current" };
+    const ids = { orgId: message.ctx.orgId, workspaceId: s.workspace_id };
+    // Current only if it is the same revision and content and, when ready, under the current key
+    // (after a rotation the summary is re-encrypted rather than stranded on the old key).
+    const currentKeyId = (await deps.keyring.currentKey(ids)).keyId;
+    if (row && Number(row.revision) === m.revision && row.content_sha256 === m.raw.content_sha256 && (row.status !== "ready" || row.key_id === currentKeyId))
+      return { status: "skipped", reason: "summary_current" };
 
     const outcome = await buildOutcome(kind, m, deps);
     const loc = { workspaceId: s.workspace_id, machineId: s.machine_id, harness: s.harness, sessionId: s.session_id, startDate: s.started_at.slice(0, 10) };
     const key = summaryObjectKey(loc, kind);
-    const ids = { orgId: message.ctx.orgId, workspaceId: s.workspace_id };
     const current = { revision: m.revision, manifestSha256: manifestSha256(m) };
     const record: SummaryRecord = {
       v: 1,

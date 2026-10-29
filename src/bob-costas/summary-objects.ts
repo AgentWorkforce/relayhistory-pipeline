@@ -2,8 +2,10 @@
 // packages/relayhistory/src/lib/pipeline/summary-objects.ts @ 73434047b6d7
 // (spec: docs/pipeline-summary-short.md). Body verbatim; only the imports differ
 // (this repo's vendored pipeline and object store), plus `summaryObjectKey` and
-// `SummaryKind` copied from upstream object-layout.ts, and a `BufferSource` alias
-// (this repo's tsconfig has no DOM lib). Keep in sync on upstream changes.
+// `SummaryKind` copied from upstream object-layout.ts, a `BufferSource` alias
+// (this repo's tsconfig has no DOM lib), and one marked deviation in
+// writeSummaryObject (reuse only under the current key, for rotation).
+// Keep in sync on upstream changes.
 /**
  * Summary objects in the bucket: the encrypted envelope at
  * `summary/{short,long}.json.enc` (`summaryObjectKey`), its compare-and-swap
@@ -198,17 +200,9 @@ export async function writeSummaryObject(args: {
       throw storeError(err);
     }
     const keyId = head?.metadata[META_SUMMARY_KEY_ID];
-    if (
-      head &&
-      keyId &&
-      head.metadata[META_SUMMARY_MANIFEST] === args.current.manifestSha256 &&
-      head.metadata[META_SUMMARY_REVISION] === String(record.revision) &&
-      head.metadata[META_SUMMARY_STATUS] === record.status
-    ) {
-      const reused = await storedDigest(call, store, k);
-      if (reused)
-        return { outcome: "written", key: args.key, sha256: reused, keyId };
-    }
+    // 96bulls deviation: the current key is resolved before the reuse check, and
+    // an object is reused only if it is already under that key, so a key
+    // rotation re-encrypts summaries instead of stranding them on a retiring key.
     if (!current) {
       try {
         current = await args.keyring.currentKey(args.ids);
@@ -219,6 +213,18 @@ export async function writeSummaryObject(args: {
       }
       const body = await seal(current, args.key, record);
       sealed = { body, sha256: await sha256Hex(body) };
+    }
+    if (
+      head &&
+      keyId &&
+      keyId === current.keyId &&
+      head.metadata[META_SUMMARY_MANIFEST] === args.current.manifestSha256 &&
+      head.metadata[META_SUMMARY_REVISION] === String(record.revision) &&
+      head.metadata[META_SUMMARY_STATUS] === record.status
+    ) {
+      const reused = await storedDigest(call, store, k);
+      if (reused)
+        return { outcome: "written", key: args.key, sha256: reused, keyId };
     }
     try {
       await call(() =>

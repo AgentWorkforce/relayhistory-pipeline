@@ -52,7 +52,17 @@ describe("summary objects (upstream envelope) with the HKDF keyring", () => {
     const rotated = await masterKeyring(parseMasterKeys(`k2:${HEX_B},k1:${HEX_A}`));
     expect((await rotated.currentKey(ids)).keyId).toBe("hkdf1:k2");
     expect((await readSummaryObject({ store, keyring: rotated, ids, key, sha256: w.sha256, kind: "long", revision: 3 }))?.summary).toBe("SECRET-SUMMARY-TEXT");
+    // Without k1, the k1 object cannot be opened (crypto-shredded).
     const shredded = await masterKeyring(parseMasterKeys(`k2:${HEX_B}`));
     await expect(readSummaryObject({ store, keyring: shredded, ids, key, sha256: w.sha256, kind: "long", revision: 3 })).rejects.toThrow(/does not hold/);
+    // After rotation a retry for the same manifest/revision/status re-encrypts under k2 (no reuse of k1).
+    const rewritten = await writeSummaryObject({ store, keyring: rotated, ids, key, record: record({ kind: "long" }), current: { revision: 3, manifestSha256: "e".repeat(64) } });
+    expect(rewritten.outcome === "written" && rewritten.keyId).toBe("hkdf1:k2");
+    expect(rewritten.outcome === "written" && rewritten.sha256).not.toBe(w.sha256);
+    const onlyK2 = await masterKeyring(parseMasterKeys(`k2:${HEX_B}`));
+    if (rewritten.outcome !== "written") throw new Error("not rewritten");
+    expect((await readSummaryObject({ store, keyring: onlyK2, ids, key, sha256: rewritten.sha256, kind: "long", revision: 3 }))?.summary).toBe("SECRET-SUMMARY-TEXT");
+    // The old pointer no longer matches the stored object.
+    expect(await readSummaryObject({ store, keyring: rotated, ids, key, sha256: w.sha256, kind: "long", revision: 3 })).toBeNull();
   });
 });

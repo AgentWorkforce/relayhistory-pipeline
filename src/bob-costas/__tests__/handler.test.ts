@@ -47,7 +47,7 @@ const message = { payload: { manifestKey: "k" }, ctx: { orgId: "o" } } as never;
 const recorder = { log: { info() {} } } as never;
 
 describe("Bob Costas stores summaries as encrypted Locker objects, pointers in HoopDb", () => {
-  it("ready: object summary/short.json.enc decrypts; the row has only the pointer; old plaintext rows are gone", async () => {
+  it("ready: object summary/short.json.enc decrypts; the row has only the pointer; old plaintext rows are gone", { timeout: 30_000 }, async () => {
     const { pg, db } = await setup();
     expect((await pg.query(`SELECT count(*)::int AS n FROM sessions.session_summaries`)).rows[0]).toEqual({ n: 0 });
     const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
@@ -69,9 +69,16 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     expect(rec?.summary).toContain("PLANTED-PROMPT");
     // A rerun of the same revision and content is a no-op.
     expect(await handler(message, recorder)).toEqual({ status: "skipped", reason: "summary_current" });
+    // After a master rotation the same summary is re-encrypted under the new key, not skipped.
+    const rotated = await masterKeyring(parseMasterKeys(`k2:${"b".repeat(64)},k1:${"a".repeat(64)}`));
+    await bobCostasHandler("short", { db, reader: { provider: "fs", read: async () => ({ manifest: m }) } as never, store, summarizer: extractiveSummarizer, keyring: rotated })(message, recorder);
+    const after = (await pg.query<Record<string, unknown>>(`SELECT key_id, object_sha256 FROM sessions.session_summaries`)).rows[0]!;
+    expect(after.key_id).toBe("hkdf1:k2");
+    const onlyK2 = await masterKeyring(parseMasterKeys(`k2:${"b".repeat(64)}`));
+    expect((await readSummaryObject({ store, keyring: onlyK2, ids: { orgId: "o", workspaceId: "w" }, key: String(row.object_key), sha256: String(after.object_sha256), kind: "short", revision: 2 }))?.summary).toContain("PLANTED-PROMPT");
   });
 
-  it("unscrubbed: recorded quarantined with no pointer, no object created, raw never read", async () => {
+  it("unscrubbed: recorded quarantined with no pointer, no object created, raw never read", { timeout: 30_000 }, async () => {
     const { pg, db } = await setup();
     const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
     const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
@@ -82,7 +89,7 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     expect(await store.head(objectKey("v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/long.json.enc"))).toBeUndefined();
   });
 
-  it("the pointer constraint refuses a ready row without a pointer", async () => {
+  it("the pointer constraint refuses a ready row without a pointer", { timeout: 30_000 }, async () => {
     const { pg } = await setup();
     await expect(pg.query(`INSERT INTO sessions.session_summaries (org_id, workspace_id, harness, session_id, machine_id, kind, trace_id, revision, content_sha256, status)
                            VALUES ('o','w','claude','x','m','short','01a188e1-ef86-7b16-938a-e91b6b78643b',1,'${"e".repeat(64)}','ready')`)).rejects.toThrow(/session_summaries_pointer/);

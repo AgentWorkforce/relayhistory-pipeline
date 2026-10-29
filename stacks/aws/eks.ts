@@ -135,10 +135,16 @@ export const eksStage = (i: EksStageInputs) =>
           // The bucket is created and versioned by IaC; the pods' role has no CreateBucket.
           lockerInit: { enabled: false },
           deployment: { name: "hosted", id: i.stage },
-          // Bob Costas encrypts summaries in the Locker under this key (src/shared/keyring.ts). From the
-          // runtime Secret, never values. The chart's extraEnv reaches every worker component; only
-          // Bob Costas reads it.
-          extraEnv: [{ name: "SUMMARY_MASTER_KEYS", valueFrom: { secretKeyRef: { name: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" } } }],
+          // Bob Costas alone gets the summary master key (src/shared/keyring.ts), from the runtime
+          // Secret, never values. Per-component env, so the indexer and referee never see it.
+          components: {
+            "bob-costas": {
+              env: [
+                { name: "BOB_COSTAS_MODEL", value: "off" },
+                { name: "SUMMARY_MASTER_KEYS", valueFrom: { secretKeyRef: { name: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" } } },
+              ],
+            },
+          },
         },
         alleyoop: {
           image: { repository: i.imageRepository, digest: i.imageDigest },
