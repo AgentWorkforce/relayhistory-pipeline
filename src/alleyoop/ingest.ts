@@ -9,11 +9,9 @@ import { createServer } from "node:http";
 import { Hono } from "hono";
 import {
   createPipelineRoutes,
-  manifestReaderFromEnv,
   pipelineOpsRoutes,
   postgresDeadLetterStore,
   postgresPipelineQueue,
-  rawStoreFromEnv,
   requireAuth,
   TRACE_ID_HEADER,
   traceIdFromHeaders,
@@ -22,6 +20,7 @@ import {
 } from "../shared/vendor.ts";
 import { openHoopDb, waitForHoopDb, waitForSchema } from "../shared/db.ts";
 import { enrichMessage, requestIdentity } from "../shared/enrich.ts";
+import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 import { traceparentFor } from "../shared/ids.ts";
 import { integer, optional, required, vendorBindings } from "../shared/env.ts";
 import { healthVerdict, type WorkerHealth } from "../shared/worker.ts";
@@ -55,12 +54,12 @@ export async function buildIngestApp() {
   await waitForHoopDb(db);
   await waitForSchema(db, await expectedMigrationNames());
   const queue = postgresPipelineQueue(db);
-  const reader = manifestReaderFromEnv(env);
+  const reader = lockerManifestReader();
   const sink = sqlPipelineEventSink(db);
   const deadLetters = postgresDeadLetterStore(db);
   const pipeline = createPipelineRoutes({
     manifests: () => reader,
-    rawStore: () => rawStoreFromEnv(env),
+    rawStore: () => lockerStore(),
     sink: () => sink,
     deadLetters: () => deadLetters,
     send: async (_env, stage, message) =>

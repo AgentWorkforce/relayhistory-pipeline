@@ -5,11 +5,8 @@
  * here, still lands every manifest.
  */
 import {
-  manifestReaderFromEnv,
-  objectStoreManifestReader,
   orgResolverFromEnv,
   prefixAllowed,
-  rawStoreFromEnv,
   reconcileManifests,
   type Bindings,
 } from "../shared/vendor.ts";
@@ -20,6 +17,7 @@ import { runWorker } from "../shared/worker.ts";
 import { hoopDbSessionIndex } from "./index.ts";
 import { postgresPipelineQueue } from "../shared/vendor.ts";
 import { withSpan } from "../shared/telemetry.ts";
+import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 
 const env = vendorBindings() as unknown as Bindings;
 let lastReconcileMinute = -1;
@@ -30,7 +28,7 @@ await runWorker({
   impl: (db, current) => ({
     index: hoopDbSessionIndex({
       db,
-      reader: manifestReaderFromEnv(env)!,
+      reader: lockerManifestReader(),
       queue: postgresPipelineQueue(db),
       current,
     }),
@@ -43,10 +41,10 @@ await runWorker({
     const minute = Math.floor(now.getTime() / 60_000);
     if (minute === lastReconcileMinute || minute % every !== 0) return;
     lastReconcileMinute = minute;
-    const raw = rawStoreFromEnv(env);
+    const raw = lockerStore();
     const orgs = orgResolverFromEnv(env);
-    if (!raw || !orgs) return;
-    const reader = objectStoreManifestReader(raw.store, { provider: raw.provider, bucket: raw.bucket });
+    if (!orgs) return;
+    const reader = lockerManifestReader();
     const queue = postgresPipelineQueue(db);
     const lookback = integer("PIPELINE_RECONCILE_LOOKBACK_MINUTES", 15);
     await withSpan("reconcile manifests", { attrs: { stage: "object-landed" } }, async () => {

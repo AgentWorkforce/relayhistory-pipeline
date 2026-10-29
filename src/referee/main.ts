@@ -1,11 +1,9 @@
-import { manifestReaderFromEnv, type Bindings } from "../shared/vendor.ts";
-import { vendorBindings } from "../shared/env.ts";
+import { lockerManifestReader } from "../shared/locker.ts";
 import { runWorker } from "../shared/worker.ts";
 import { refereeHandler } from "./handler.ts";
 
-const env = vendorBindings() as unknown as Bindings;
 await runWorker({
   service: "referee",
   stages: ["status-classify"],
-  handlers: (db) => ({ "status-classify": refereeHandler({ db, reader: manifestReaderFromEnv(env)! }) }),
+  handlers: (db) => ({ "status-classify": refereeHandler({ db, reader: lockerManifestReader() }) }),
 });

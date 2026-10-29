@@ -6,13 +6,14 @@
  */
 import { createHash, createHmac } from "node:crypto";
 import { lockerEnv } from "../shared/env.ts";
+import { lockerCredentials } from "../shared/locker.ts";
 import { errorFields, log } from "../shared/log.ts";
 
 const sha256 = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
 const hmac = (k: Buffer | string, s: string) => createHmac("sha256", k).update(s).digest();
 
 export async function s3Request(input: {
-  endpoint: string; region: string; accessKeyId: string; secretAccessKey: string;
+  endpoint: string; region: string; accessKeyId: string; secretAccessKey: string; sessionToken?: string;
   method: string; path: string; query?: string; body?: string;
 }): Promise<Response> {
   const url = new URL(`${input.endpoint.replace(/\/$/, "")}${input.path}${input.query ? `?${input.query}` : ""}`);
@@ -22,6 +23,7 @@ export async function s3Request(input: {
   const body = input.body ?? "";
   const payloadHash = sha256(body);
   const headers: Record<string, string> = { host: url.host, "x-amz-content-sha256": payloadHash, "x-amz-date": amzDate };
+  if (input.sessionToken) headers["x-amz-security-token"] = input.sessionToken;
   const signedHeaders = Object.keys(headers).sort().join(";");
   const canonicalHeaders = Object.keys(headers).sort().map((k) => `${k}:${headers[k]}\n`).join("");
   const canonicalQuery = url.searchParams.toString();
@@ -37,12 +39,26 @@ export async function s3Request(input: {
 
 export async function ensureBucket(timeoutMs = 120_000): Promise<void> {
   const l = lockerEnv();
-  const base = { endpoint: l.endpoint, region: l.region, accessKeyId: l.accessKeyId, secretAccessKey: l.secretAccessKey };
+  const provider = lockerCredentials();
+  const creds = typeof provider === "function" ? await provider() : provider;
+  // No endpoint: AWS S3 in the bucket's region (path-style URL on the regional endpoint).
+  const endpoint = l.endpoint ?? `https://s3.${l.region}.amazonaws.com`;
+  const base = { endpoint, region: l.region, accessKeyId: creds.accessKeyId, secretAccessKey: creds.secretAccessKey, ...(creds.sessionToken ? { sessionToken: creds.sessionToken } : {}) };
   const deadline = Date.now() + timeoutMs;
   let attempt = 0;
   for (;;) {
     attempt += 1;
     try {
+      // An existing bucket (e.g. created by IaC on AWS) is left alone: only versioning is confirmed.
+      const head = await s3Request({ ...base, method: "HEAD", path: `/${l.bucket}` });
+      if (head.ok) {
+        const v = await s3Request({ ...base, method: "GET", path: `/${l.bucket}`, query: "versioning" });
+        const body = v.ok ? await v.text() : "";
+        if (/<Status>Enabled<\/Status>/.test(body)) {
+          log.info("locker bucket ready", { ok: true, attempt, reason: "exists" });
+          return;
+        }
+      }
       const res = await s3Request({ ...base, method: "PUT", path: `/${l.bucket}` });
       if (res.ok || res.status === 409) {
         const v = await s3Request({ ...base, method: "PUT", path: `/${l.bucket}`, query: "versioning", body: '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>' });

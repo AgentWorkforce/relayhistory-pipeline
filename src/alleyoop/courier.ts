@@ -14,14 +14,14 @@ import { mkdir, readFile, rename, stat, writeFile, open } from "node:fs/promises
 import { dirname, join } from "node:path";
 import {
   computeContentSha256,
-  createS3Store,
   manifestKey,
   validateManifest,
   type ChunkEntry,
   type ManifestV1,
   type SessionLocation,
 } from "../shared/vendor.ts";
-import { flag, integer, lockerEnv, optional, required } from "../shared/env.ts";
+import { flag, integer, optional, required } from "../shared/env.ts";
+import { lockerStore } from "../shared/locker.ts";
 import { mintToken } from "./auth.ts";
 import { hexTraceId, isUuidV7, spanId, uuidv7 } from "../shared/ids.ts";
 import { errorFields, log } from "../shared/log.ts";
@@ -166,13 +166,7 @@ async function readNewRecords(path: string, from: number): Promise<{ ranges: Arr
 
 export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: number; uploaded: number; chunks: number }> {
   const state = await loadState(cfg.statePath, cfg.machineId);
-  const locker = lockerEnv();
-  const store = createS3Store({
-    bucket: locker.bucket,
-    region: locker.region,
-    endpoint: locker.endpoint,
-    credentials: { accessKeyId: locker.accessKeyId, secretAccessKey: locker.secretAccessKey },
-  });
+  const store = lockerStore().store;
   const rows = await readSessions(cfg.dbPath, cfg.harnesses);
   const token = typeof cfg.token === "function" ? cfg.token() : cfg.token;
   let uploaded = 0;
