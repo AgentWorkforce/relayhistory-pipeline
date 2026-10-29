@@ -1,12 +1,11 @@
 /**
- * The vendored relayhistory-cloud surface 96bulls builds on, re-exported from
- * one place so an upstream rename touches one file. Pinned at the PR #211 head
- * (`vendor/relayhistory-cloud`); nothing here is modified.
+ * The pipeline surface the stack builds on, re-exported from one place so an
+ * upstream rename touches one file. `@rhc/*` is packages/pipeline/src (the
+ * relayhistory-cloud #210 + #211 ports) and `@rhc-object-store` is
+ * packages/object-store; see tsconfig paths and MOVE_NOTES.md.
  */
 export { createPipelineRoutes, pipelineOpsRoutes, type PipelineRouteDeps } from "@rhc/routes/pipeline.ts";
-export { healthRoutes } from "@rhc/routes/health.ts";
 export { requireAuth } from "@rhc/middleware/auth.ts";
-export { observability } from "@rhc/middleware/observability.ts";
 export { TRACE_ID_HEADER, traceIdFromHeaders, isTraceId, type TraceContext } from "@rhc/lib/pipeline/trace.ts";
 export {
   postgresPipelineQueue,

@@ -16,8 +16,9 @@ import { log } from "../shared/log.ts";
 import { flag, optional } from "../shared/env.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
-const VENDOR_MIGRATIONS = join(ROOT, "vendor/relayhistory-cloud/supabase/migrations");
-const SHIM = join(ROOT, "vendor/relayhistory-cloud/supabase/tests/supabase_shim.sql");
+// The relayhistory-cloud sessions migrations, moved into this repo by #1/#6 (provenance: supabase/README.md).
+const UPSTREAM_MIGRATIONS = join(ROOT, "supabase/migrations");
+const SHIM = join(ROOT, "supabase/tests/supabase_shim.sql");
 const OURS = join(ROOT, "src/hoopdb/migrations");
 
 export const MIGRATION_LEDGER = "sessions.__96bulls_migrations";
@@ -28,11 +29,11 @@ interface Step {
 }
 
 export async function plan(): Promise<Step[]> {
-  const vendor = (await readdir(VENDOR_MIGRATIONS)).filter((f) => f.endsWith(".sql")).sort();
+  const upstream = (await readdir(UPSTREAM_MIGRATIONS)).filter((f) => f.endsWith(".sql")).sort();
   const ours = (await readdir(OURS)).filter((f) => f.endsWith(".sql")).sort();
   return [
     ...(flag("HOOPDB_SUPABASE_SHIM", true) ? [{ name: "shim:supabase_roles", path: SHIM }] : []),
-    ...vendor.map((f) => ({ name: `vendor:${f}`, path: join(VENDOR_MIGRATIONS, f) })),
+    ...upstream.map((f) => ({ name: `upstream:${f}`, path: join(UPSTREAM_MIGRATIONS, f) })),
     ...ours.map((f) => ({ name: `96bulls:${f}`, path: join(OURS, f) })),
   ];
 }
@@ -62,6 +63,14 @@ export async function migrate(): Promise<{ applied: number; skipped: number }> {
         (r) => [r.name, r.sha256],
       ),
     );
+    // A HoopDb built from the old vendored pin cannot be moved forward in place:
+    // upstream changed 20261025000600 after it was applied there. Say so plainly.
+    if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
+      throw Object.assign(
+        new Error("96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)"),
+        { code: "legacy_schema" },
+      );
+    }
     for (const step of await plan()) {
       const sql = await readFile(step.path, "utf8");
       const sha = createHash("sha256").update(sql).digest("hex");

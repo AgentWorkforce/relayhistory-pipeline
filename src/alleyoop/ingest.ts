@@ -6,12 +6,10 @@
  * pipeline routes are mounted: the rest of the Worker needs Neon.
  */
 import { createServer } from "node:http";
-import { Hono } from "../shared/hono-runtime.js";
+import { Hono } from "hono";
 import {
   createPipelineRoutes,
-  healthRoutes,
   manifestReaderFromEnv,
-  observability,
   pipelineOpsRoutes,
   postgresDeadLetterStore,
   postgresPipelineQueue,
@@ -45,6 +43,10 @@ export async function buildIngestApp() {
     RELAYAUTH_AUDIENCE: optional("AUTH_AUDIENCE", "relayhistory"),
     RELAYAUTH_JWKS_URL: optional("RELAYAUTH_JWKS_URL", `http://127.0.0.1:${port}/.well-known/jwks.json`),
     ...(process.env.PIPELINE_OPS_SECRET ? { PIPELINE_OPS_SECRET: process.env.PIPELINE_OPS_SECRET } : {}),
+    // Hosted/customer installs on a shared RelayAuth issuer: set RELAYHISTORY_ORIGIN so only
+    // assertions minted for this deployment's origin are accepted (legacy shared audience refused).
+    ...(process.env.RELAYHISTORY_ORIGIN ? { RELAYHISTORY_ORIGIN: process.env.RELAYHISTORY_ORIGIN } : {}),
+    ...(process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS ? { RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS: process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS } : {}),
   }) as unknown as Bindings;
   if (!jwks && !process.env.RELAYAUTH_JWKS_URL) throw new Error("96bulls: ingest needs JWKS_JSON, JWT_PRIVATE_KEY_PEM or RELAYAUTH_JWKS_URL");
 
@@ -79,9 +81,14 @@ export async function buildIngestApp() {
     c.header("X-Correlation-Id", correlationId);
     if (traceId) c.header(TRACE_ID_HEADER, traceId);
   });
-  app.use("*", async (c, next) => observability(c as never, next));
+  // One allowlisted request line per request (method, route status, duration; never bodies or query values).
+  app.use("*", async (c, next) => {
+    const started = Date.now();
+    await next();
+    log.info("request completed", { status: c.res.status, duration_ms: Date.now() - started, trace_id: c.get("traceId") });
+  });
   if (jwks) app.get("/.well-known/jwks.json", (c) => c.json(jwks));
-  app.route("/", healthRoutes);
+  app.get("/health", (c) => c.json({ ok: true, service: "alleyoop-ingest" }));
   app.get("/healthz", (c) => c.json({ ok: true }));
   // Ready = the schema this image was built for is fully migrated, not just "DB answers".
   const expected = await expectedMigrationNames();

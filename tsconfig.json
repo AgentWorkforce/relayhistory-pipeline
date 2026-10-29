@@ -17,13 +17,10 @@
     ],
     "paths": {
       "@rhc/*": [
-        "./vendor/relayhistory-cloud/packages/relayhistory/src/*"
+        "./packages/pipeline/src/*"
       ],
       "@rhc-object-store": [
-        "./vendor/relayhistory-cloud/packages/object-store/src/index.ts"
-      ],
-      "hono": [
-        "./vendor/relayhistory-cloud/node_modules/hono"
+        "./packages/object-store/src/index.ts"
       ]
     },
     "allowJs": true
@@ -38,6 +35,7 @@
   "exclude": [
     "node_modules",
     "vendor",
+    "packages",
     "**/__tests__/**"
   ]
 }

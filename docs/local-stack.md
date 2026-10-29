@@ -12,8 +12,8 @@ services, same env contract, same migrations.
 | `96b-hoopdb` | pgvector/pgvector:pg17 | HoopDb (port 15432 on the host) |
 | `96b-locker` | Chainguard MinIO (digest-pinned) | Locker, S3 API (port 19100) |
 | `96b-locker-init` | 96bulls/services | one-shot: creates the bucket (SigV4, no SDK), enables versioning |
-| `96b-hoopdb-migrate` | 96bulls/services | one-shot: shim roles + vendored `sessions` migrations + 96bulls migrations, ledger `sessions.__96bulls_migrations` |
-| `96b-alleyoop-ingest` | 96bulls/services | the vendored Hono pipeline routes on Node/Bun with Postgres deps; Technical Foul runs in the chunk hop (port 18080) |
+| `96b-hoopdb-migrate` | 96bulls/services | one-shot: shim roles + `sessions` migrations (supabase/migrations) + 96bulls migrations, ledger `sessions.__96bulls_migrations` |
+| `96b-alleyoop-ingest` | 96bulls/services | the pipeline routes from `packages/pipeline` on Node/Bun with Postgres deps; Technical Foul runs in the chunk hop (port 18080) |
 | `96b-hoopdb-indexer` | 96bulls/services | stages `object-landed`, `session-indexed` (our index, fans out), 5-minute manifest reconcile |
 | `96b-referee` | 96bulls/services | stage `status-classify` |
 | `96b-bob-costas` | 96bulls/services | stages `summary-short`, `summary-long` |
