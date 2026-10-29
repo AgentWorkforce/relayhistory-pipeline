@@ -10,6 +10,7 @@ RUN bun install --frozen-lockfile --ignore-scripts --no-progress
 COPY packages packages
 RUN bun run --filter @relayhistory/object-store build
 COPY supabase supabase
+COPY certs certs
 COPY src src
 COPY stacks stacks
 COPY docker/entrypoint.sh /entrypoint.sh
