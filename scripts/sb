@@ -18,5 +18,9 @@ command -v op >/dev/null || { echo "sb: the 1Password CLI (op) is required" >&2;
 : "${SB_TOKEN_REF:?set SB_TOKEN_REF to an op:// reference for the Supabase token}"
 case "$SB_TOKEN_REF" in op://*) ;; *) echo "sb: SB_TOKEN_REF must be an op:// reference, never a literal token" >&2; exit 2 ;; esac
 cmd="${SB_CMD:-supabase}"
+# Never let the CLI persist a credential: `supabase login` writes ~/.supabase/access-token (or the keychain).
+for a in "$@"; do
+  case "$a" in login|logout) echo "sb: '$a' is not allowed; the token is injected per invocation and never saved" >&2; exit 3 ;; esac
+done
 # op run resolves the reference inside the child's environment only; the shell never sees the value.
 exec env SUPABASE_ACCESS_TOKEN="$SB_TOKEN_REF" op run --no-masking=false -- "$cmd" "$@"

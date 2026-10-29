@@ -80,9 +80,10 @@ export const SupabaseProvider = () =>
     Project.Provider.of({
       reconcile: Effect.fn(function* ({ news, output }) {
         if (output?.id) {
-          // Tracked by id only; never adopt a project by name (an unrelated project could share it).
-          const current = yield* Effect.promise(() => api<ApiProject | undefined>("GET", `/projects/${output.id}`));
-          if (!current) throw new Error(`96bulls: Supabase project ${output.id} no longer exists; remove it from the stack or recreate it explicitly`);
+          // Tracked by the ref this stack created; never adopt a project by name (an unrelated project could share it).
+          // The Management API addresses projects by ref, which can differ from id.
+          const current = yield* Effect.promise(() => api<ApiProject | undefined>("GET", `/projects/${output.ref}`));
+          if (!current) throw new Error(`96bulls: Supabase project ${output.ref} no longer exists; remove it from the stack or recreate it explicitly`);
           // Region and organisation are immutable on Supabase, and a rename is not applied here:
           // refuse loudly instead of reporting success for settings that were not applied.
           const drift = [
@@ -90,7 +91,7 @@ export const SupabaseProvider = () =>
             current.organization_id !== news.organizationId ? `organization ${current.organization_id} -> ${news.organizationId}` : "",
             current.name !== news.name ? `name ${current.name} -> ${news.name}` : "",
           ].filter(Boolean);
-          if (drift.length) throw new Error(`96bulls: Supabase.Project ${output.id} cannot change ${drift.join(", ")}; create a new project instead`);
+          if (drift.length) throw new Error(`96bulls: Supabase.Project ${output.ref} cannot change ${drift.join(", ")}; create a new project instead`);
           return toAttrs(current, output.managed);
         }
         const created = yield* Effect.promise(() =>
@@ -103,8 +104,8 @@ export const SupabaseProvider = () =>
       }),
       delete: Effect.fn(function* ({ output }) {
         // Only a project this stack created is ever deleted.
-        if (!output?.id || !output.managed) return;
-        yield* Effect.promise(() => api<unknown>("DELETE", `/projects/${output.id}`));
+        if (!output?.ref || !output.managed) return;
+        yield* Effect.promise(() => api<unknown>("DELETE", `/projects/${output.ref}`));
       }),
       list: () => Effect.succeed([]),
     }),
