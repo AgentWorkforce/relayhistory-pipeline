@@ -95,13 +95,90 @@ export function telemetryString(value: string, key: string | undefined) {
   );
 }
 
-/** Log fields as telemetry may carry them: `telemetryString` on every string value. */
+/**
+ * Ids at least this long are replaced wherever they occur. Shorter ones only
+ * where they stand alone (between non-identifier characters), so `m1` in
+ * "resumed m1 after retry" is replaced but `am1b` is left alone.
+ */
+const MIN_EMBEDDED_ID_LENGTH = 8;
+/** Nested log values deeper than this are dropped rather than walked. */
+const MAX_FIELD_DEPTH = 6;
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Log fields as telemetry may carry them, at any depth (objects and arrays
+ * included): `telemetryString` on every string, and every occurrence of the
+ * caller's own raw machine and session ids (`ids`, the recorder's context)
+ * replaced by their tokens, or `-` without a key, whatever field it sits in.
+ * An id that is both the machine and the session id takes the session token,
+ * matching the base `session_id` field.
+ */
 export function telemetryFields<T extends Record<string, unknown>>(
   fields: T,
   key: string | undefined,
+  ids: { machineId?: string; sessionId?: string } = {},
 ): T {
-  const out: Record<string, unknown> = {};
-  for (const [name, value] of Object.entries(fields))
-    out[name] = typeof value === "string" ? telemetryString(value, key) : value;
-  return out as T;
+  const known = (
+    [
+      // Session first: if the two ids are equal, the session token wins.
+      ["session", ids.sessionId],
+      ["machine", ids.machineId],
+    ] as const
+  )
+    .filter((entry): entry is readonly [TelemetryIdKind, string] =>
+      Boolean(entry[1]),
+    )
+    .filter(
+      ([kind, id], _index, all) =>
+        !(
+          kind === "machine" &&
+          all.some(([k, other]) => k === "session" && other === id)
+        ),
+    )
+    // Each id as written and as it appears percent-encoded (object keys and
+    // URLs carry the encoded form), both standing for the same token.
+    .flatMap(([kind, id]) => {
+      const token = key ? telemetryIdHash(key, kind, id) : "-";
+      return [...new Set([id, encodeURIComponent(id)])].map((form) => {
+        // Case-sensitive, like the ids themselves; only a percent escape's
+        // hex digits may come in either case (%2F and %2f).
+        const literal = escapeRegExp(form).replace(
+          /%([0-9A-F]{2})/g,
+          (_escape, hex: string) => `%(?:${hex}|${hex.toLowerCase()})`,
+        );
+        return {
+          id: form,
+          pattern:
+            form.length >= MIN_EMBEDDED_ID_LENGTH
+              ? new RegExp(literal, "g")
+              : new RegExp(
+                  `(?<![A-Za-z0-9_-])${literal}(?![A-Za-z0-9_-])`,
+                  "g",
+                ),
+          token,
+        };
+      });
+    })
+    // Longest first, so an id that contains the other is replaced whole.
+    .sort((a, b) => b.id.length - a.id.length);
+  const redact = (value: unknown, depth: number): unknown => {
+    if (typeof value === "string") {
+      let text = telemetryString(value, key);
+      for (const { pattern, token } of known)
+        text = text.replace(pattern, () => token);
+      return text;
+    }
+    if (value === null || typeof value !== "object") return value;
+    if (depth >= MAX_FIELD_DEPTH) return "[nested]";
+    if (Array.isArray(value))
+      return value.map((item) => redact(item, depth + 1));
+    const out: Record<string, unknown> = {};
+    for (const [name, item] of Object.entries(value))
+      out[name] = redact(item, depth + 1);
+    return out;
+  };
+  return redact(fields, 0) as T;
 }

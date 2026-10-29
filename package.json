@@ -15,8 +15,9 @@
     "96bulls": "bin/96bulls"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit && bun run --filter @96bulls/pipeline typecheck",
-    "test": "bun test && bun run --filter @96bulls/pipeline test",
+    "build": "bun run --filter @relayhistory/object-store build",
+    "typecheck": "tsc --noEmit && bun run --filter @96bulls/pipeline typecheck && bun run --filter @relayhistory/object-store typecheck",
+    "test": "bun test && bun run --filter @96bulls/pipeline test && bun run --filter @relayhistory/object-store test",
     "up:local": "bun run bin/96bulls up local",
     "down:local": "bun run bin/96bulls down local",
     "smoke:local": "bun run bin/96bulls smoke local"

@@ -1,0 +1,53 @@
+diff --git a/packages/relayhistory/src/api-worker.ts b/packages/relayhistory/src/api-worker.ts
+index 05f632c..f213701 100644
+--- a/packages/relayhistory/src/api-worker.ts
++++ b/packages/relayhistory/src/api-worker.ts
+@@ -18,8 +18,18 @@ import {
+   maintainPipelineEvents,
+   PIPELINE_QUEUE_PREFIX,
+   pipelineQueueDeps,
++  pipelineQueueFromEnv,
+   type StageMessage,
+ } from "./lib/pipeline/index.js";
++import {
++  handleObjectEventQueue,
++  manifestReaderFromEnv,
++  OBJECT_EVENTS_QUEUE_PREFIX,
++  orgResolverFromEnv,
++  prefixAllowed,
++  r2EventSource,
++} from "./lib/pipeline/adapter.js";
++import { runManifestReconcile } from "./lib/pipeline/reconcile.js";
+ 
+ import {
+   handleSessionQueue,
+@@ -41,6 +51,18 @@ export default {
+     // Session pipeline stages have their own queues and DLQs; nothing binds them yet.
+     if (batch.queue.startsWith(PIPELINE_QUEUE_PREFIX))
+       return handleStageQueue(batch, pipelineQueueDeps(env));
++    // R2 event notifications for the raw bucket; nothing binds this queue yet.
++    if (batch.queue.startsWith(OBJECT_EVENTS_QUEUE_PREFIX)) {
++      const orgs = orgResolverFromEnv(env);
++      const reader = manifestReaderFromEnv(env);
++      return handleObjectEventQueue(batch, {
++        source: r2EventSource,
++        ...(reader ? { reader } : {}),
++        ...(orgs ? { orgs } : {}),
++        allowPrefix: (prefix, orgId) => prefixAllowed(env, prefix, orgId),
++        send: (message) => pipelineQueueFromEnv(env).send(message),
++      });
++    }
+     return handleSessionQueue(batch as MessageBatch<SessionWake>, env);
+   },
+   async scheduled(
+@@ -60,6 +82,10 @@ export default {
+         },
+       ),
+     );
++    // Manifest reconcile for raw stores with no event source; inert until enabled.
++    ctx.waitUntil(
++      runManifestReconcile(env, new Date(controller.scheduledTime)),
++    );
+     if (env.DATABASE_URL) {
+       // Alongside the maintenance below, never ahead of it: a slow database
+       // must not hold up the work that relieves it.

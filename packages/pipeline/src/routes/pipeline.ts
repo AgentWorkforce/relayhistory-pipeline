@@ -9,6 +9,7 @@ import {
   isSafeIdentifier,
   isTraceId,
   telemetryIdHash,
+  PipelineError,
   PipelineRecorder,
   PipelineStoreUnavailable,
   RESERVED_ATTR_KEYS,
@@ -25,6 +26,27 @@ import {
   type TraceScope,
   type StageMessage,
 } from "../lib/pipeline/index.js";
+import {
+  buildObjectLandedMessage,
+  manifestReaderFromEnv,
+  OBJECT_LANDED_STAGE,
+  orgResolverFromEnv,
+  prefixAllowed,
+  rawStoreFromEnv,
+  readCapped,
+  type BuildResult,
+  type ManifestReader,
+  type RawStore,
+} from "../lib/pipeline/adapter.js";
+import {
+  ObjectStoreError,
+  parseManifest,
+  parseSessionKey,
+  RAW_FORMATS,
+  type ManifestV1,
+  type RawFormat,
+} from "../lib/pipeline/object-layout.js";
+import { sealRawChunk } from "../lib/pipeline/raw-chunks.js";
 
 /** Stages a client may report about itself. Server stages cannot be forged. */
 const CLIENT_STAGES: readonly PipelineStage[] = [
@@ -47,6 +69,10 @@ const KEY_ATTRS = new Set(["destination", "chunk", "seq", "offset"]);
 const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 export interface PipelineRouteDeps {
+  /** Authoritative manifest reads for the manifest POST; absent: validate the posted copy. */
+  manifests?(env: Bindings): ManifestReader | undefined;
+  /** Where scrubbed raw chunks are written; absent: the chunk route answers 503. */
+  rawStore?(env: Bindings): RawStore | undefined;
   sink(env: Bindings): PipelineEventSink;
   deadLetters(env: Bindings): DeadLetterStore;
   send(
@@ -57,6 +83,8 @@ export interface PipelineRouteDeps {
 }
 
 const defaultDeps: PipelineRouteDeps = {
+  manifests: (env) => manifestReaderFromEnv(env),
+  rawStore: (env) => rawStoreFromEnv(env),
   sink: (env) => pipelineEventSinkFromEnv(env),
   deadLetters: (env) => deadLetterStoreFromEnv(env),
   send: sendToStage,
@@ -64,7 +92,7 @@ const defaultDeps: PipelineRouteDeps = {
 
 function error(
   c: AppContext,
-  status: 400 | 401 | 403 | 404 | 503,
+  status: 400 | 401 | 403 | 404 | 413 | 503,
   code: string,
   message: string,
 ) {
@@ -294,6 +322,264 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     return c.json({ recorded: recorders.length });
   });
 
+  /**
+   * The manifest POST: the delivery coordinator reports a manifest it just
+   * wrote. Org and workspace come from auth, and the key's `ws=` must be the
+   * caller's workspace. With a raw store configured the server reads the
+   * manifest itself (authoritative); otherwise the posted copy is validated
+   * against its key. Enqueues one object-landed message; repeats are
+   * idempotent by work key. Never logs or echoes manifest content.
+   */
+  routes.post("/pipeline/manifests", requireScope("rth:sync"), async (c) => {
+    let body: {
+      key?: unknown;
+      etag?: unknown;
+      version?: unknown;
+      manifest?: unknown;
+    };
+    try {
+      body = await c.req.json();
+    } catch {
+      return error(c, 400, "bad_request", "Request body must be valid JSON");
+    }
+    const key = typeof body?.key === "string" ? body.key : "";
+    const location = parseSessionKey(key);
+    if (!location || location.rest !== "manifest.json")
+      return error(
+        c,
+        400,
+        "bad_request",
+        "key must be a v1 session manifest key",
+      );
+    const env = c.env ?? {};
+    const owned = await callerOwnsLocation(c, location);
+    if (owned !== true) return owned;
+    const scope = pipelineScope(c);
+    let manifest: ManifestV1;
+    let read: { etag?: string; version?: string } | undefined;
+    const reader = (deps.manifests ?? defaultDeps.manifests!)(env);
+    try {
+      if (reader) {
+        const stored = await reader.read(key);
+        if (!stored)
+          return error(
+            c,
+            404,
+            "not_found",
+            "manifest is not in object storage",
+          );
+        manifest = stored.manifest;
+        read = stored;
+      } else {
+        manifest = await parseManifest(body.manifest, key);
+      }
+    } catch (cause) {
+      // The validator's message can quote manifest values: never echo it.
+      if (
+        cause instanceof ObjectStoreError &&
+        (cause.code === "invalid_argument" || cause.code === "unsupported")
+      )
+        return error(c, 400, "bad_request", "manifest failed validation");
+      return error(
+        c,
+        503,
+        "storage_unavailable",
+        "Object storage is temporarily unavailable",
+      );
+    }
+    let built: BuildResult;
+    try {
+      built = buildObjectLandedMessage({
+        // Read from storage: only the stored identity names the version, the
+        // same one a notification or the reconcile job carries. Posted: the
+        // client's identity.
+        landed: {
+          key,
+          ...(reader
+            ? {
+                provider: reader.provider,
+                ...(reader.bucket ? { bucket: reader.bucket } : {}),
+              }
+            : {
+                ...(typeof body.etag === "string" ? { etag: body.etag } : {}),
+                ...(typeof body.version === "string"
+                  ? { version: body.version }
+                  : {}),
+              }),
+        },
+        orgId: scope.orgId,
+        manifest,
+        ...(read ? { read } : {}),
+      });
+    } catch (cause) {
+      if (cause instanceof PipelineError)
+        return error(c, 400, "bad_request", cause.message);
+      throw cause;
+    }
+    if (built.status !== "enqueue")
+      return error(c, 400, "bad_request", "key is not a manifest");
+    try {
+      await deps.send(env, OBJECT_LANDED_STAGE, built.message);
+    } catch {
+      return error(c, 503, "not_configured", "Pipeline queue is not available");
+    }
+    return c.json(
+      {
+        workKey: built.message.workKey,
+        traceId: built.message.ctx.traceId,
+        revision: built.message.revision,
+        scrubbed: built.message.payload.scrubbed,
+      },
+      202,
+    );
+  });
+
+  /**
+   * The scrubbing chunk hop: a client that cannot scrub locally sends the
+   * source range of one raw chunk, and the server scrubs it (`lib/scrub.ts`,
+   * record by record), compresses it and stores it at its v1 key. The
+   * unscrubbed bytes never reach object storage. Returns the chunk entry and
+   * `raw.scrub` marker for the client's manifest. Workspace from auth.
+   */
+  routes.post("/pipeline/chunks", requireScope("rth:sync"), async (c) => {
+    const env = c.env ?? {};
+    const raw = (deps.rawStore ?? defaultDeps.rawStore!)(env);
+    if (!raw)
+      return error(
+        c,
+        503,
+        "not_configured",
+        "Raw object storage is not configured",
+      );
+    const q = (name: string) => c.req.query(name) ?? "";
+    const format = q("format") as RawFormat;
+    // Digits only: a missing or empty position must not become 0.
+    const position = (name: string) =>
+      /^\d+$/.test(q(name)) ? Number(q(name)) : NaN;
+    const seq = position("seq");
+    const epoch = position("epoch");
+    const startOffset = position("offset");
+    const date = q("date");
+    if (
+      !(RAW_FORMATS as readonly string[]).includes(format) ||
+      ![seq, epoch, startOffset].every((n) => Number.isSafeInteger(n)) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(date)
+    )
+      return error(
+        c,
+        400,
+        "bad_request",
+        "format, seq, epoch, offset and date (yyyy-mm-dd) are required",
+      );
+    const scope = pipelineScope(c);
+    const prefix = deploymentPrefix(env, scope.orgId);
+    const location = {
+      ...(prefix ? { prefix } : {}),
+      workspaceId: scope.workspaceId,
+      machineId: q("machine"),
+      harness: q("harness"),
+      sessionId: q("session"),
+      startDate: date,
+    };
+    // The same ownership rule as the manifest POST: a matching ws= is not
+    // ownership, and with no org mapping configured the write fails closed.
+    const owned = await callerOwnsLocation(c, location);
+    if (owned !== true) return owned;
+    const declared = Number(c.req.header("content-length") ?? NaN);
+    if (declared > MAX_CHUNK_BYTES)
+      return error(c, 413, "too_large", "chunk exceeds the size limit");
+    // Bounded while reading: the declared length may be absent or wrong.
+    const source = await readCapped(c.req.raw.body, MAX_CHUNK_BYTES);
+    if (!source)
+      return error(c, 413, "too_large", "chunk exceeds the size limit");
+    const traceId = c.req.header("X-Relay-Trace-Id");
+    try {
+      const sealed = await sealRawChunk(raw.store, {
+        location,
+        format,
+        seq,
+        epoch,
+        startOffset,
+        source,
+        ...(traceId && isTraceId(traceId)
+          ? { traceId: traceId.toLowerCase() }
+          : {}),
+      });
+      return c.json(
+        {
+          key: sealed.key,
+          entry: sealed.entry,
+          scrub: sealed.scrub,
+          created: sealed.created,
+        },
+        sealed.created ? 201 : 200,
+      );
+    } catch (cause) {
+      if (cause instanceof PipelineError && cause.code === "zstd_unavailable")
+        return error(c, 503, "not_supported", cause.message);
+      if (cause instanceof PipelineError)
+        return error(c, 400, "bad_request", cause.message);
+      // Layout validation (ids) is a client error; its message names only ids.
+      if (
+        cause instanceof ObjectStoreError &&
+        cause.code === "invalid_argument"
+      )
+        return error(
+          c,
+          400,
+          "bad_request",
+          "machine, harness or session is not a valid id",
+        );
+      return error(
+        c,
+        503,
+        "storage_unavailable",
+        "Object storage is temporarily unavailable",
+      );
+    }
+  });
+
+  /**
+   * Whether the caller owns a parsed key: its `ws=` is the caller's workspace,
+   * its deployment prefix is allowed for the caller's org, and the object's
+   * owner (by the rule notifications use) is the caller's org. Workspace ids
+   * are not unique across orgs, so `ws=` alone is not ownership. With no org
+   * mapping configured ownership cannot be established: fail closed.
+   */
+  async function callerOwnsLocation(
+    c: AppContext,
+    location: { workspaceId: string; prefix?: string },
+  ) {
+    const scope = pipelineScope(c);
+    const env = c.env ?? {};
+    if (
+      location.workspaceId !== scope.workspaceId ||
+      !prefixAllowed(env, location.prefix, scope.orgId)
+    )
+      return error(
+        c,
+        403,
+        "forbidden",
+        "key is outside the caller's workspace",
+      );
+    const owners = orgResolverFromEnv(env);
+    if (!owners)
+      return error(
+        c,
+        503,
+        "not_configured",
+        "Object ownership is not configured (PIPELINE_ORG_ID or PIPELINE_ORG_FROM_PREFIX)",
+      );
+    if ((await owners.orgFor(location)) !== scope.orgId)
+      return error(
+        c,
+        403,
+        "forbidden",
+        "key is outside the caller's workspace",
+      );
+    return true as const;
+  }
+
   return routes;
 }
 
@@ -397,16 +683,35 @@ export function createPipelineOpsRoutes(deps: PipelineRouteDeps = defaultDeps) {
     } catch {
       return error(c, 400, "bad_request", "Request body must be valid JSON");
     }
-    const ids = (value: unknown) =>
-      Array.isArray(value)
-        ? value.filter((id): id is string => typeof id === "string")
-        : [];
-    const machineIds = ids(body?.machineIds);
-    const sessionIds = ids(body?.sessionIds);
+    // Positions are the request's: a non-string entry is refused where it is,
+    // never dropped (which would shift every later token and error position).
+    const ids = (value: unknown, name: string): string[] | string => {
+      if (value === undefined) return [];
+      if (!Array.isArray(value)) return `${name} must be an array`;
+      const bad = value.findIndex((id) => typeof id !== "string");
+      return bad < 0 ? (value as string[]) : `${name}[${bad}] is not a string`;
+    };
+    const machineIds = ids(body?.machineIds, "machineIds");
+    const sessionIds = ids(body?.sessionIds, "sessionIds");
+    if (typeof machineIds === "string")
+      return error(c, 400, "bad_request", machineIds);
+    if (typeof sessionIds === "string")
+      return error(c, 400, "bad_request", sessionIds);
     if (!machineIds.length && !sessionIds.length)
       return error(c, 400, "bad_request", "machineIds or sessionIds required");
-    if ([...machineIds, ...sessionIds].some((id) => !id || id.length > 256))
-      return error(c, 400, "bad_request", "ids must be 1 to 256 characters");
+    // Never echoed back, not even in the error: a secret-shaped id is refused
+    // by position.
+    const unsafe = [
+      ...machineIds.map((id, index) => [id, `machineIds[${index}]`] as const),
+      ...sessionIds.map((id, index) => [id, `sessionIds[${index}]`] as const),
+    ].find(([id]) => !isSafeIdentifier(id));
+    if (unsafe)
+      return error(
+        c,
+        400,
+        "bad_request",
+        `${unsafe[1]} is not an identifier (1-256 identifier characters, no secret-shaped values)`,
+      );
     if (machineIds.length + sessionIds.length > MAX_TELEMETRY_LOOKUPS)
       return error(
         c,
@@ -414,10 +719,9 @@ export function createPipelineOpsRoutes(deps: PipelineRouteDeps = defaultDeps) {
         "bad_request",
         `at most ${MAX_TELEMETRY_LOOKUPS} ids per request`,
       );
+    // Tokens in request order, so the response never repeats a raw id.
     const tokens = (kind: "machine" | "session", list: string[]) =>
-      Object.fromEntries(
-        list.map((id) => [id, telemetryIdHash(key, kind, id)]),
-      );
+      list.map((id) => telemetryIdHash(key, kind, id));
     return c.json({
       machines: tokens("machine", machineIds),
       sessions: tokens("session", sessionIds),
@@ -509,6 +813,20 @@ async function sameSecret(given: string | undefined, expected: string) {
   for (let index = 0; index < left.length; index += 1)
     diff |= left[index]! ^ right[index]!;
   return diff === 0;
+}
+
+/** The largest source range one chunk POST accepts (the client seals at 8 MiB). */
+export const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
+
+/** The key prefix the server writes a tenant's raw objects under. */
+function deploymentPrefix(
+  env: Pick<Bindings, "PIPELINE_ORG_FROM_PREFIX" | "PIPELINE_KEY_PREFIX">,
+  orgId: string,
+) {
+  const base = (env.PIPELINE_KEY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
+  if (env.PIPELINE_ORG_FROM_PREFIX === "true")
+    return base ? `${base}/${orgId}` : orgId;
+  return base || undefined;
 }
 
 export const pipelineRoutes = createPipelineRoutes();

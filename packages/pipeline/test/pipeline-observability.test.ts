@@ -12,6 +12,7 @@ import {
   isSafeIdentifier,
   isTraceId,
   telemetryContext,
+  telemetryFields,
   telemetryIdHash,
   telemetryIdKey,
   telemetryString,
@@ -1462,6 +1463,9 @@ describe("client event reports", () => {
       "0000000000-0-abcdef12",
       "01JBXK4ZQ8F3M9V2N6T7R5W1YD",
       "machine_01JBXK4ZQ8F3M9V2N6T7R5W1YD",
+      // ULIDs are case-insensitive.
+      "01jbxk4zq8f3m9v2n6t7r5w1yd",
+      "machine_01jbxk4zq8f3m9v2n6t7r5w1yd",
     ])
       expect(isSafeIdentifier(safe)).toBe(true);
   });
@@ -2239,6 +2243,100 @@ describe("keyed telemetry ids", () => {
     expect(telemetryString(MANIFEST_KEY, undefined)).toContain("/m=-/");
   });
 
+  it("replaces the trace's own raw ids in any logged field, not only object-key segments", async () => {
+    const sink = new InMemoryPipelineEventSink();
+    const recorder = new PipelineRecorder(ctx(), {
+      sink,
+      logger: { environment: "test", telemetryIdKey: TELEMETRY_KEY },
+    });
+    // A handler logging the raw ids under its own field names.
+    recorder.log.info("handler detail", {
+      host: MACHINE,
+      note: `resumed ${SESSION_ID} after retry`,
+      unrelated: "keeps m1 and other text",
+    });
+    await recorder.record("session-indexed", "ok", {
+      attrs: { origin: MACHINE },
+    });
+    const logged = JSON.stringify(info.mock.calls);
+    expect(logged).not.toContain(MACHINE);
+    expect(logged).not.toContain(SESSION_ID);
+    expect(logged).toContain(
+      telemetryIdHash(TELEMETRY_KEY, "machine", MACHINE),
+    );
+    expect(logged).toContain(
+      `resumed ${telemetryIdHash(TELEMETRY_KEY, "session", SESSION_ID)} after retry`,
+    );
+    expect(logged).toContain("keeps m1 and other text");
+    // The stored event keeps the raw attr.
+    expect(sink.events[0]!.attrs.origin).toBe(MACHINE);
+    // Without a key the ids are blanked, and a short id is replaced only whole.
+    expect(
+      telemetryFields({ a: `x ${MACHINE} y`, b: "m1", c: "am1b" }, undefined, {
+        machineId: MACHINE,
+        sessionId: "m1",
+      }),
+    ).toEqual({ a: "x - y", b: "-", c: "am1b" });
+  });
+
+  it("hashes ids at any depth, short ids standing alone, and one token for a shared id", () => {
+    const machineToken = telemetryIdHash(TELEMETRY_KEY, "machine", MACHINE);
+    const sessionToken = telemetryIdHash(TELEMETRY_KEY, "session", "m1");
+    expect(
+      telemetryFields(
+        {
+          nested: { host: MACHINE, list: [`on ${MACHINE}`, { deep: "m1" }] },
+          sentence: "resumed m1 after retry",
+          glued: "am1b and m1x",
+          deep: { a: { b: { c: { d: { e: { f: { g: MACHINE } } } } } } },
+        },
+        TELEMETRY_KEY,
+        { machineId: MACHINE, sessionId: "m1" },
+      ),
+    ).toEqual({
+      nested: {
+        host: machineToken,
+        list: [`on ${machineToken}`, { deep: sessionToken }],
+      },
+      sentence: `resumed ${sessionToken} after retry`,
+      glued: "am1b and m1x",
+      deep: { a: { b: { c: { d: { e: "[nested]" } } } } },
+    });
+    // The percent-encoded form (object keys, URLs) maps to the same token.
+    const slashed = "host/with spaces-01";
+    const slashedToken = telemetryIdHash(TELEMETRY_KEY, "machine", slashed);
+    expect(
+      telemetryFields(
+        {
+          url: `/v1/x?m=${encodeURIComponent(slashed)}`,
+          lowerHex: encodeURIComponent(slashed).replace(/%2F/g, "%2f"),
+        },
+        TELEMETRY_KEY,
+        { machineId: slashed },
+      ),
+    ).toEqual({ url: `/v1/x?m=${slashedToken}`, lowerHex: slashedToken });
+    // Ids that differ only in case keep their own tokens.
+    expect(
+      telemetryFields(
+        { m: "Device-ABCdef-01", s: "device-abcdef-01" },
+        TELEMETRY_KEY,
+        { machineId: "Device-ABCdef-01", sessionId: "device-abcdef-01" },
+      ),
+    ).toEqual({
+      m: telemetryIdHash(TELEMETRY_KEY, "machine", "Device-ABCdef-01"),
+      s: telemetryIdHash(TELEMETRY_KEY, "session", "device-abcdef-01"),
+    });
+    // A value that is both ids gets the session token, like `session_id`.
+    expect(
+      telemetryFields({ v: "same-id-0123456789" }, TELEMETRY_KEY, {
+        machineId: "same-id-0123456789",
+        sessionId: "same-id-0123456789",
+      }),
+    ).toEqual({
+      v: telemetryIdHash(TELEMETRY_KEY, "session", "same-id-0123456789"),
+    });
+  });
+
   it("leaves machine and session ids out of telemetry when no key is set", async () => {
     const sink = new InMemoryPipelineEventSink();
     const recorder = new PipelineRecorder(ctx(), {
@@ -2298,14 +2396,41 @@ describe("keyed telemetry ids", () => {
         )
       ).status,
     ).toBe(503);
-    expect(await (await lookup(keyed, authz)).json<any>()).toEqual({
-      machines: {
-        [MACHINE]: telemetryIdHash(TELEMETRY_KEY, "machine", MACHINE),
-      },
-      sessions: {
-        [SESSION_ID]: telemetryIdHash(TELEMETRY_KEY, "session", SESSION_ID),
-      },
+    const looked = await (await lookup(keyed, authz)).text();
+    // Tokens in request order; the raw ids are never echoed back.
+    expect(JSON.parse(looked)).toEqual({
+      machines: [telemetryIdHash(TELEMETRY_KEY, "machine", MACHINE)],
+      sessions: [telemetryIdHash(TELEMETRY_KEY, "session", SESSION_ID)],
     });
+    expect(looked).not.toContain(MACHINE);
+    expect(looked).not.toContain(SESSION_ID);
+    // A secret-shaped id is refused by position, without repeating it.
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    const refused = await app.request(
+      "/v1/internal/pipeline/telemetry-ids",
+      {
+        method: "POST",
+        headers: { ...authz, "Content-Type": "application/json" },
+        body: JSON.stringify({ machineIds: [MACHINE], sessionIds: [token] }),
+      },
+      keyed,
+    );
+    expect(refused.status).toBe(400);
+    const refusedBody = await refused.text();
+    expect(refusedBody).toContain("sessionIds[0]");
+    expect(refusedBody).not.toContain(token);
+    // A non-string entry is refused at its own position, never dropped.
+    const shifted = await app.request(
+      "/v1/internal/pipeline/telemetry-ids",
+      {
+        method: "POST",
+        headers: { ...authz, "Content-Type": "application/json" },
+        body: JSON.stringify({ machineIds: [null, MACHINE] }),
+      },
+      keyed,
+    );
+    expect(shifted.status).toBe(400);
+    expect(await shifted.text()).toContain("machineIds[0] is not a string");
     // From a hashed line's raw trace and tenant back to the raw ids.
     const trace = await (
       await app.request(
