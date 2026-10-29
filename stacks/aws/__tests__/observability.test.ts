@@ -57,12 +57,17 @@ describe("AWS observability values", () => {
   });
 
   it("gives the collector write-only access to telemetry objects", () => {
-    const policy = telemetryPolicy({ lockerBucketArn: "arn:aws:s3:::locker", lockerKmsKeyArn: "arn:aws:kms:us-west-2:1:key/k" });
+    const policy = telemetryPolicy({
+      lockerBucketArn: "arn:aws:s3:::locker",
+      lockerKmsKeyArn: "arn:aws:kms:us-west-2:1:key/k",
+      lockerRegion: "us-west-2",
+    });
     const actions = policy.Statement.flatMap((s) => s.Action);
     expect(actions).toContain("s3:PutObject");
     expect(actions).toContain("kms:Decrypt");
     expect(actions).not.toContain("s3:GetObject");
     expect(actions).not.toContain("s3:DeleteObject");
-    expect(policy.Statement[0]!.Resource).toEqual(["arn:aws:s3:::locker/telemetry/*"]);
+    expect(policy.Statement[0]!.Resource).toEqual(["arn:aws:s3:::locker/telemetry/traces/*"]);
+    expect(policy.Statement[1]!.Condition).toEqual({ StringEquals: { "kms:ViaService": "s3.us-west-2.amazonaws.com" } });
   });
 });

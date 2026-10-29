@@ -179,6 +179,8 @@ Locker bucket's encrypted `telemetry/traces/` prefix. It has its own EKS Pod
 Identity role with only `s3:PutObject`, multipart-abort and KMS encrypt/data-key
 permissions (including the bucket-key-required KMS decrypt); it has no
 `s3:GetObject` or delete permission and cannot fetch telemetry or session objects. The
+KMS grant is conditioned on calls through S3 in the environment's region, so
+collector credentials cannot call KMS decrypt directly.
 collector repeats the service allowlist safeguards: it drops content-bearing
 attributes and masks secret-shaped values before persistence.
 

@@ -51,19 +51,20 @@ export interface EksStageInputs {
 export const OTEL_SERVICE_ACCOUNT = "otel-collector";
 export const OTEL_ENDPOINT = "http://otel-collector:4318";
 
-export function telemetryPolicy(i: Pick<EksStageInputs, "lockerBucketArn" | "lockerKmsKeyArn">) {
+export function telemetryPolicy(i: Pick<EksStageInputs, "lockerBucketArn" | "lockerKmsKeyArn" | "lockerRegion">) {
   return {
     Version: "2012-10-17" as const,
     Statement: [
       {
         Effect: "Allow" as const,
         Action: ["s3:PutObject", "s3:AbortMultipartUpload"],
-        Resource: [`${i.lockerBucketArn}/telemetry/*`],
+        Resource: [`${i.lockerBucketArn}/telemetry/traces/*`],
       },
       {
         Effect: "Allow" as const,
         Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"],
         Resource: [i.lockerKmsKeyArn],
+        Condition: { StringEquals: { "kms:ViaService": `s3.${i.lockerRegion}.amazonaws.com` } },
       },
     ],
   };
