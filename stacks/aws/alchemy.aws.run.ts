@@ -17,6 +17,7 @@
 import * as Alchemy from "alchemy";
 import { Stage } from "alchemy";
 import * as AWS from "@alchemy.run/aws";
+import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { readFileSync } from "node:fs";
@@ -66,7 +67,7 @@ const tags = (stage: string, component: string) => ({ "96bulls:stack": stage, "9
 export default Alchemy.Stack(
   "96bulls-aws",
   {
-    providers: Layer.mergeAll(AWS.providers(), SupabaseProvider()),
+    providers: Layer.mergeAll(AWS.providers(), Kubernetes.providers(), SupabaseProvider()),
     state: AWS.state({ prefix: "96bulls" }),
   },
   Effect.gen(function* () {

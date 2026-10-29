@@ -41,7 +41,8 @@ export const eksStage = (i: EksStageInputs) =>
       clusterName: `96bulls-${i.stage}`,
       compute: "auto",
       resourcesVpcConfig: { subnetIds: network.privateSubnetIds },
-      deletionProtection: !i.stage.startsWith("aws-sandbox-"),
+      // Protection only for production; dev and sandboxes must tear down cleanly with `96bulls down`.
+      deletionProtection: i.stage === "aws-prod",
       tags: i.tags,
     });
     const image = versions.images["services"] as { ref: string; digest: string };
