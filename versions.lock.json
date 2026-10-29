@@ -1,0 +1,24 @@
+{
+  "$comment": "Every third-party artifact the stack runs, pinned. Update with a commit that says why.",
+  "images": {
+    "hoopdb": { "ref": "pgvector/pgvector:pg17", "digest": "sha256:ac08538c6f8b9904c33c8224c5e5706dbe760aca29db1d096972b4052c22a75d" },
+    "locker": { "ref": "cgr.dev/chainguard/minio", "digest": "sha256:268d68a2a3b6fc65f905a61f84d7eab6345ce6bff14f551e2b028ec31e6a1341", "note": "MinIO's own registries went private in 2025; Chainguard's build is public. Used for the server and (via sh+mc) nothing else; bucket init is our own SigV4 code." },
+    "otel-collector": { "ref": "otel/opentelemetry-collector-contrib:0.137.0", "digest": "sha256:886722fe0f37af9d1fe24d29529253ec59fbf263b3b1df4facaf221373e19d23" },
+    "init": { "ref": "alpine:3.20", "digest": "sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc", "note": "root one-shot for volume permissions" },
+    "services-base": { "ref": "oven/bun:1.4.2-slim", "note": "node:sqlite and node:zlib zstd need Bun >= 1.4" }
+  },
+  "vendored": {
+    "relayhistory-cloud": { "path": "vendor/relayhistory-cloud", "commit": "6f6d568849c483be8e3a2a5aaeba3da1d4b47de9", "note": "head of PR #211 (stacks on #210); unmerged; never modified here" },
+    "relayhistory": { "path": "vendor/relayhistory", "commit": "be827d1e", "note": "origin/main at release 0.53.0; provides the ai-hist Rust CLI (Concourse) and the Claude transcript fixtures" }
+  },
+  "tooling": {
+    "alchemy": "2.0.0-beta.84",
+    "@alchemy.run/docker": "2.0.0-beta.84",
+    "@alchemy.run/aws": "2.0.0-beta.84",
+    "@alchemy.run/kubernetes": "2.0.0-beta.84",
+    "effect": "4.0.7",
+    "bun": ">=1.4.0",
+    "rust": ">=1.89 (object-store crate), 1.98.1 used"
+  },
+  "charts": {}
+}
