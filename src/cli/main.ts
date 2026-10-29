@@ -57,6 +57,8 @@ interface Inputs {
   telemetryDir: string;
   deploymentId: string;
   machineId: string;
+  /** SUMMARY_MASTER_KEYS for Bob Costas: summaries are encrypted in the Locker under it. */
+  summaryMasterKeys: string;
 }
 
 function stageDir(stage: string) {
@@ -94,6 +96,7 @@ function prepareInputs(stage: string): Inputs {
   inputs.telemetryDir ||= join(dir, "telemetry");
   inputs.deploymentId ||= `${stage}-${randomBytes(4).toString("hex")}`;
   inputs.machineId ||= `m-${randomBytes(8).toString("hex")}`;
+  inputs.summaryMasterKeys ||= `local1:${randomBytes(32).toString("hex")}`;
   inputs.courierToken = mintToken({ kid: inputs.jwtKid!, privateKeyPem: inputs.jwtPrivateKeyPem }, {
     issuer: TENANT.issuer,
     audience: "relayhistory",

@@ -118,3 +118,35 @@ traffic on EKS is not encrypted by default, so **nothing may send the bootstrap
 key over the cluster network until RelayAuth has TLS** (a mesh with mTLS, or TLS
 terminated in front of RelayAuth). That applies to an in-cluster courier or
 broker, and to a public token endpoint, which is a separate decision.
+
+## Summary encryption key (Bob Costas)
+
+Summaries are stored only as encrypted objects next to the session's raw,
+`{session prefix}/summary/{short,long}.json.enc`, in the upstream envelope
+(relayhistory-cloud `docs/pipeline-summary-short.md`: AES-256-GCM, AAD bound
+to key, kind and revision). `sessions.session_summaries` holds the pointer
+only: object key, ciphertext SHA-256, key id, status and revision. It never
+holds the text or the model name.
+
+Each workspace's key is derived with HKDF-SHA256 from a deployment master key
+(`src/shared/keyring.ts`), so no cloud KMS is needed and the stack stays
+self-hostable. Bob Costas refuses to start without it. The master key is the
+`SUMMARY_MASTER_KEYS` key of the runtime Secret (`96bulls-runtime`):
+`<id>:<64 hex>`, with the newest first. Keep older entries after it until
+everything has been rewritten; removing an entry crypto-shreds what it wrote.
+
+Before deploying a version with migration 0004, add the key from 1Password
+through a pipe, never a file:
+
+```sh
+# on the Mac: create it once
+op item edit "sessions-dev hoopdb" --vault 96Bulls-dev "summary-master-keys[password]=sd1:$(openssl rand -hex 32)"
+# operator shell: merge it into the runtime Secret
+v=$(ssh kjg-lap "zsh -lc 'op read \"op://96Bulls-dev/sessions-dev hoopdb/summary-master-keys\"'")
+kubectl -n 96bulls patch secret 96bulls-runtime --type merge -p "$(jq -nc --arg v "$(printf %s "$v" | base64 -w0)" '{data:{SUMMARY_MASTER_KEYS:$v}}')"; unset v
+```
+
+Migration 0004 deletes existing `session_summaries` rows, because they hold
+plaintext. They are derived: Bob Costas's summary sweep (at startup, then every
+`SUMMARY_SWEEP_SECONDS`, default 300) re-queues every indexed session without a
+summary and rebuilds each as an encrypted object.

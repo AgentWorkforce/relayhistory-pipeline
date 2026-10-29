@@ -1,17 +1,82 @@
 /**
- * Bob Costas: summaries. Consumes `summary-short` and `summary-long`. Reads
- * the scrubbed chunks from the Locker (never the unscrubbed source), builds a
- * digest, summarises, and upserts `sessions.session_summaries`. Idempotent by
- * the manifest's content hash.
+ * Bob Costas: summaries. Consumes `summary-short` and `summary-long`. Reads the
+ * scrubbed chunks from the Locker (never the unscrubbed source), builds a
+ * digest and summarises it.
+ *
+ * The summary is stored as an encrypted object next to the session's raw,
+ * `summary/{short,long}.json.enc` (`summary-objects.ts`, ported from upstream),
+ * under the workspace key. `sessions.session_summaries` holds only the pointer:
+ * object key, ciphertext SHA-256, key id, status and revision, never the text
+ * or the model name. Object first, then pointer, inside one transaction holding
+ * a per-session advisory lock, so two runs never publish in different orders.
+ * Idempotent by revision and raw content hash.
  */
+import { createHash } from "node:crypto";
 import { zstdDecompressSync } from "node:zlib";
-import { PipelineError, rawChunkKey, readAll, type ManifestReader, type ObjectStore, type RawPointer, type StageHandler } from "../shared/vendor.ts";
+import { PipelineError, rawChunkKey, readAll, type ManifestReader, type ManifestV1, type ObjectStore, type RawPointer, type StageHandler } from "../shared/vendor.ts";
 import type { HoopDb } from "../shared/db.ts";
 import { ctxOf } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { digestRecords, type Summarizer } from "./summarizer.ts";
+import {
+  clearSummaryObject,
+  summaryObjectKey,
+  writeSummaryObject,
+  type SummaryKind,
+  type SummaryRecord,
+  type SummaryStatus,
+  type WorkspaceKeyring,
+} from "./summary-objects.ts";
 
-export function bobCostasHandler(kind: "short" | "long", deps: { db: HoopDb; reader: ManifestReader; store: ObjectStore; summarizer: Summarizer }): StageHandler {
+export interface BobCostasDeps {
+  db: HoopDb;
+  reader: ManifestReader;
+  store: ObjectStore;
+  summarizer: Summarizer;
+  keyring: WorkspaceKeyring;
+  now?: () => Date;
+}
+
+/** SHA-256 of the manifest as indexed: the `summary-manifest` fence for the object. */
+export function manifestSha256(m: ManifestV1): string {
+  return createHash("sha256").update(JSON.stringify(m)).digest("hex");
+}
+
+interface Outcome {
+  status: SummaryStatus;
+  summary?: string;
+  model?: string;
+  tokensIn: number;
+  tokensOut: number;
+  records: number;
+}
+
+async function buildOutcome(kind: SummaryKind, m: ManifestV1, deps: BobCostasDeps): Promise<Outcome> {
+  const none = { tokensIn: 0, tokensOut: 0, records: 0 };
+  // Scrub quarantine: an unscrubbed session is never read.
+  if (!m.raw.scrub) return { status: "quarantined", ...none };
+  if (m.raw.format === "sqlite-rows") return { status: "unsupported", ...none };
+  const s = m.session;
+  const loc = { workspaceId: s.workspace_id, machineId: s.machine_id, harness: s.harness, sessionId: s.session_id, startDate: s.started_at.slice(0, 10) };
+  const lines: string[] = [];
+  for (const chunk of m.raw.chunks) {
+    const key = rawChunkKey(loc, chunk.seq, chunk.start_offset, chunk.sha256_8, m.raw.format);
+    let stored: Uint8Array;
+    try {
+      stored = await readAll(await deps.store.get(key));
+    } catch (err) {
+      if ((err as { code?: string }).code === "not_found") throw new PipelineError("chunk_missing", "a listed chunk is not in object storage", true);
+      throw err;
+    }
+    lines.push(...zstdDecompressSync(Buffer.from(stored)).toString("utf8").split("\n"));
+  }
+  const digest = digestRecords(s.harness, lines);
+  if (digest.records === 0) return { status: "empty", ...none };
+  const summary = await deps.summarizer.summarize(kind, digest);
+  return { status: "ready", summary: summary.text, model: summary.modelId, tokensIn: summary.tokensIn, tokensOut: summary.tokensOut, records: digest.records };
+}
+
+export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageHandler {
   return async (message, recorder) => {
     const pointer = message.payload as RawPointer;
     if (!pointer || typeof pointer.manifestKey !== "string")
@@ -21,48 +86,82 @@ export function bobCostasHandler(kind: "short" | "long", deps: { db: HoopDb; rea
     const m = read.manifest;
     const s = m.session;
     const pk = [message.ctx.orgId, s.workspace_id, s.harness, s.session_id, s.machine_id];
-    const existing = await deps.db.query<{ content_sha256: string }>(
-      `SELECT content_sha256 FROM sessions.session_summaries
+    const existing = await deps.db.query<{ content_sha256: string; revision: string }>(
+      `SELECT content_sha256, revision FROM sessions.session_summaries
         WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
       [...pk, kind],
     );
-    if (existing.rows[0]?.content_sha256 === m.raw.content_sha256) return { status: "skipped", reason: "summary_current" };
-    if (!m.raw.scrub) throw new PipelineError("unscrubbed_session", "refusing to summarise an unscrubbed session", false);
+    const row = existing.rows[0];
+    if (row && Number(row.revision) > m.revision) return { status: "skipped", reason: "stale_revision" };
+    if (row && Number(row.revision) === m.revision && row.content_sha256 === m.raw.content_sha256) return { status: "skipped", reason: "summary_current" };
+
+    const outcome = await buildOutcome(kind, m, deps);
     const loc = { workspaceId: s.workspace_id, machineId: s.machine_id, harness: s.harness, sessionId: s.session_id, startDate: s.started_at.slice(0, 10) };
-    const lines: string[] = [];
-    for (const chunk of m.raw.chunks) {
-      const key = rawChunkKey(loc, chunk.seq, chunk.start_offset, chunk.sha256_8, m.raw.format);
-      let stored: Uint8Array;
-      try {
-        stored = await readAll(await deps.store.get(key));
-      } catch (err) {
-        const code = (err as { code?: string }).code;
-        if (code === "not_found") throw new PipelineError("chunk_missing", "a listed chunk is not in object storage", true);
-        throw err;
-      }
-      const bytes = zstdDecompressSync(Buffer.from(stored));
-      lines.push(...bytes.toString("utf8").split("\n"));
-    }
-    const digest = digestRecords(s.harness, lines);
-    const summary = await deps.summarizer.summarize(kind, digest);
+    const key = summaryObjectKey(loc, kind);
+    const ids = { orgId: message.ctx.orgId, workspaceId: s.workspace_id };
+    const current = { revision: m.revision, manifestSha256: manifestSha256(m) };
+    const record: SummaryRecord = {
+      v: 1,
+      kind,
+      revision: m.revision,
+      status: outcome.status,
+      ...(outcome.status === "ready" ? { summary: outcome.summary!, model: outcome.model!, source_content_sha256: m.raw.content_sha256 } : {}),
+      built_at: (deps.now?.() ?? new Date()).toISOString(),
+      trace_id: m.trace_id,
+    };
     const ctx = ctxOf(message);
-    await deps.db.query(
-      `INSERT INTO sessions.session_summaries
-         (org_id, workspace_id, harness, session_id, machine_id, kind, session_uuid, trace_id, revision,
-          content_sha256, summary, model_id, tokens_in, tokens_out, generated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7::uuid,$8::uuid,$9,$10,$11,$12,$13,$14, now())
-       ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, kind) DO UPDATE SET
-         session_uuid = coalesce(excluded.session_uuid, sessions.session_summaries.session_uuid),
-         trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,
-         summary = excluded.summary, model_id = excluded.model_id, tokens_in = excluded.tokens_in,
-         tokens_out = excluded.tokens_out, generated_at = now()`,
-      [...pk, kind, ctx.session_uuid ?? null, m.trace_id, m.revision, m.raw.content_sha256, summary.text,
-       summary.modelId, summary.tokensIn, summary.tokensOut],
-    );
-    recorder.log.info("summary written", { kind, model_id: summary.modelId, tokens_in: summary.tokensIn, tokens_out: summary.tokensOut });
+
+    const client = await deps.db.pool.connect();
+    let published: { sha256: string; keyId: string } | undefined;
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`96bulls:summary:${key}`]);
+      // Under the lock, a newer revision may have published meanwhile: it owns the object.
+      const locked = await client.query<{ revision: string }>(
+        `SELECT revision FROM sessions.session_summaries
+          WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
+        [...pk, kind],
+      );
+      if (locked.rows[0] && Number(locked.rows[0].revision) > m.revision) {
+        await client.query("ROLLBACK");
+        return { status: "skipped", reason: "stale_revision" };
+      }
+      if (outcome.status === "ready") {
+        const written = await writeSummaryObject({ store: deps.store, keyring: deps.keyring, ids, key, record, current });
+        if (written.outcome !== "written") {
+          await client.query("ROLLBACK");
+          return { status: "skipped", reason: "stale_revision" };
+        }
+        published = { sha256: written.sha256, keyId: written.keyId };
+      } else {
+        // Overwrite any earlier summary with a text-free record; create nothing otherwise.
+        await clearSummaryObject({ store: deps.store, keyring: deps.keyring, ids, key, record, current });
+      }
+      await client.query(
+        `INSERT INTO sessions.session_summaries
+           (org_id, workspace_id, harness, session_id, machine_id, kind, session_uuid, trace_id, revision,
+            content_sha256, status, object_key, object_sha256, key_id, tokens_in, tokens_out, generated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::uuid,$8::uuid,$9,$10,$11,$12,$13,$14,$15,$16, now())
+         ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, kind) DO UPDATE SET
+           session_uuid = coalesce(excluded.session_uuid, sessions.session_summaries.session_uuid),
+           trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,
+           status = excluded.status, object_key = excluded.object_key, object_sha256 = excluded.object_sha256,
+           key_id = excluded.key_id, tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out, generated_at = now()`,
+        [...pk, kind, ctx.session_uuid ?? null, m.trace_id, m.revision, m.raw.content_sha256, outcome.status,
+         published ? String(key) : null, published?.sha256 ?? null, published?.keyId ?? null, outcome.tokensIn, outcome.tokensOut],
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+    // Ids, counts and statuses only: never the summary or the model's output.
+    recorder.log.info("summary written", { kind, status: outcome.status, tokens_in: outcome.tokensIn, tokens_out: outcome.tokensOut });
     log.info("bob costas summary", {
-      stage: `summary-${kind}`, kind, model_id: summary.modelId, tokens_in: summary.tokensIn, tokens_out: summary.tokensOut,
-      trace_id: m.trace_id, revision: m.revision, session_uuid: ctx.session_uuid, count: digest.records,
+      stage: `summary-${kind}`, kind, status: outcome.status, model_id: outcome.model, tokens_in: outcome.tokensIn, tokens_out: outcome.tokensOut,
+      trace_id: m.trace_id, revision: m.revision, session_uuid: ctx.session_uuid, count: outcome.records,
     });
   };
 }

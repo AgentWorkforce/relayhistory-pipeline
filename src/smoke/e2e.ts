@@ -18,6 +18,8 @@ import pg from "pg";
 import { createS3Store, objectKey, readAll } from "../shared/vendor.ts";
 import { PLANTED_CONTENT_MARKER, PLANTED_SECRETS, addPlantedSession } from "../concourse/seed.ts";
 import { isUuidV7 } from "../shared/ids.ts";
+import { masterKeyring, parseMasterKeys } from "../shared/keyring.ts";
+import { readSummaryObject } from "../bob-costas/summary-objects.ts";
 import { HOOPDB_NAME, HOOPDB_USER, LOCKER_BUCKET, NAMES, PORTS, TENANT } from "../../stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -38,7 +40,7 @@ const FORBIDDEN_IN_TELEMETRY = [
 
 export async function runSmoke(stage: string): Promise<boolean> {
   const dir = join(ROOT, ".96bulls", stage);
-  const inputs = JSON.parse(readFileSync(join(dir, "inputs.json"), "utf8")) as { hoopdbPassword: string; lockerAccessKeyId: string; lockerSecretAccessKey: string; courierToken: string; concourseDir: string };
+  const inputs = JSON.parse(readFileSync(join(dir, "inputs.json"), "utf8")) as { hoopdbPassword: string; lockerAccessKeyId: string; lockerSecretAccessKey: string; courierToken: string; concourseDir: string; summaryMasterKeys: string };
   const seed = JSON.parse(readFileSync(join(dir, "seed.json"), "utf8")) as { sessions: Array<{ sessionId: string; planted: boolean }> };
   // A brand-new session every run, so the whole pipe (and its spans) is exercised now, not replayed from history.
   const fresh = await addPlantedSession({ dir: inputs.concourseDir });
@@ -135,9 +137,21 @@ export async function runSmoke(stage: string): Promise<boolean> {
     check("stored chunks still carry the (non-secret) content marker", chunkText.includes(PLANTED_CONTENT_MARKER));
     const mf = await store.head(objectKey(manifestKey));
     check("manifest object carries x-amz-meta session uuid and trace id", mf?.metadata?.["session-uuid"] === plantedUuid && mf?.metadata?.["trace-id"] === plantedTrace);
-    const summaries = await q<{ kind: string; summary: string }>("SELECT kind, summary FROM sessions.session_summaries WHERE session_uuid = $1::uuid", [plantedUuid]);
-    const summaryLeak = summaries.some((s) => Object.values(PLANTED_SECRETS).some((v) => s.summary.includes(v.split("\\n")[0]!)));
-    check("Bob Costas summaries contain no planted secret", summaries.length === 2 && !summaryLeak);
+    // Summaries are encrypted Locker objects (summary/{short,long}.json.enc); HoopDb holds only the pointer.
+    const pointers = await q<{ kind: string; status: string; object_key: string | null; object_sha256: string | null; workspace_id: string; revision: string }>(
+      "SELECT kind, status, object_key, object_sha256, workspace_id, revision FROM sessions.session_summaries WHERE session_uuid = $1::uuid", [plantedUuid]);
+    const columns = await q<{ column_name: string }>("SELECT column_name FROM information_schema.columns WHERE table_schema='sessions' AND table_name='session_summaries'");
+    check("HoopDb summaries are pointers only (no summary text or model column)", !columns.some((c) => c.column_name === "summary" || c.column_name === "model_id"));
+    const keyring = await masterKeyring(parseMasterKeys(inputs.summaryMasterKeys));
+    const texts: string[] = [];
+    for (const p of pointers) {
+      if (p.status !== "ready" || !p.object_key || !p.object_sha256) continue;
+      const rec = await readSummaryObject({ store, keyring, ids: { orgId: TENANT.orgId, workspaceId: p.workspace_id }, key: p.object_key, sha256: p.object_sha256, kind: p.kind as "short" | "long", revision: Number(p.revision) });
+      if (rec?.summary) texts.push(rec.summary);
+    }
+    check("Bob Costas wrote summary/{short,long}.json.enc and both decrypt", pointers.length === 2 && texts.length === 2, `pointers=${pointers.length} decrypted=${texts.length}`);
+    const summaryLeak = texts.some((t) => Object.values(PLANTED_SECRETS).some((v) => t.includes(v.split("\\n")[0]!)));
+    check("Bob Costas summaries contain no planted secret", texts.length === 2 && !summaryLeak);
 
     // 4. Telemetry: spans and container logs. Exporters batch, so poll briefly for the planted trace.
     let spansRaw = "";

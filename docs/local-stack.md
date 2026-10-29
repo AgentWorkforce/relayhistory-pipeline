@@ -48,7 +48,9 @@ uses via `/readyz`).
    (ours): `sessions.upsert_session_index`, `session_index_ext` (session uuid),
    then fans out `summary-short`, `summary-long`, `status-classify`.
 5. Referee writes a verdict (`set_session_state` + `session_verdicts`). Bob
-   Costas reads the scrubbed chunks and writes `session_summaries`. Both are
+   Costas reads the scrubbed chunks and writes each summary as an encrypted Locker object
+   (`summary/{short,long}.json.enc`, key `summaryMasterKeys` in `inputs.json`), with only the
+   pointer in `session_summaries`. Both are
    idempotent by revision / content hash. Model calls are off by default.
 6. Every hop records `sessions.pipeline_events` (SQL sink) and a span whose
    trace id is the pipeline trace id; `GET /v1/pipeline/traces/:id` answers.

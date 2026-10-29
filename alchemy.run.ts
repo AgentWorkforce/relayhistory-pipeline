@@ -34,6 +34,7 @@ interface LocalInputs {
   concourseDir: string;
   telemetryDir: string;
   deploymentId: string;
+  summaryMasterKeys?: string;
 }
 
 function readInputs(stage: string): LocalInputs {
@@ -182,7 +183,9 @@ export default Alchemy.Stack(
 
     yield* service("hoopdb-indexer", name(NAMES.indexer), "hoopdb-indexer");
     yield* service("referee", name(NAMES.referee), "referee");
-    yield* service("bob-costas", name(NAMES.bobCostas), "bob-costas", { BOB_COSTAS_MODEL: "off" });
+    if (!inputs.summaryMasterKeys) throw new Error("96bulls: inputs.json has no summaryMasterKeys; run `bin/96bulls up` to add it");
+    // Only Bob Costas gets the summary master key (summaries are encrypted in the Locker under it).
+    yield* service("bob-costas", name(NAMES.bobCostas), "bob-costas", { BOB_COSTAS_MODEL: "off", SUMMARY_MASTER_KEYS: inputs.summaryMasterKeys });
 
     // AlleyOop courier: watches the seeded Concourse (history.db) and uploads.
     yield* service("alleyoop-courier", name(NAMES.courier), "alleyoop-courier", {
