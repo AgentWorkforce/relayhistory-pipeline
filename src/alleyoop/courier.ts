@@ -80,8 +80,12 @@ interface SessionState {
   manifest_key?: string;
   manifest_version?: ObjectVersion;
   closed?: boolean;
-  /** Chunks were sealed but the manifest has not landed yet: retry even with no new bytes. */
+  /** Chunks were sealed but the manifest has not been acknowledged yet. */
   pending?: boolean;
+  /** Exact manifest replayed until acknowledged; prevents timestamps changing after a committed write lost its response. */
+  pending_manifest?: ManifestV1;
+  /** CAS precondition paired with pending_manifest so the whole request is replayed unchanged. */
+  pending_previous_version?: ObjectVersion;
 }
 
 interface CourierState {
@@ -263,7 +267,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       verified.add(st.manifest_key);
     } else if (reconciliation === "reset") {
       log.info("manifest missing in locker; re-uploading with the same ids", { session_uuid: st.session_uuid, trace_id: st.trace_id });
-      state.sessions[key] = { ...st, revision: 0, uploaded_offset: 0, chunks: [], closed: false, pending: false, scrub: undefined, manifest_key: undefined, manifest_version: undefined };
+      state.sessions[key] = { ...st, revision: 0, uploaded_offset: 0, chunks: [], closed: false, pending: false, pending_manifest: undefined, pending_previous_version: undefined, scrub: undefined, manifest_key: undefined, manifest_version: undefined };
     } else {
       log.warn("manifest status unavailable; keeping durable upload state", { session_uuid: st.session_uuid, trace_id: st.trace_id, status: head?.status });
       deferred.add(key);
@@ -301,11 +305,16 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
     const idleMinutes = row.last_activity_ms ? (now.getTime() - row.last_activity_ms) / 60_000 : 0;
     const shouldClose = idleMinutes >= cfg.closeAfterMinutes;
     let result: { ranges: Array<{ start: number; bytes: Buffer }>; size: number };
-    try {
-      result = await readNewRecords(row.raw_path, session.uploaded_offset);
-    } catch (err) {
-      log.warn("transcript unreadable", { harness: row.source, session_id: row.session_id, ...errorFields(err) });
-      continue;
+    if (session.pending_manifest) {
+      // Land the exact already-sealed revision before reading or appending more bytes.
+      result = { ranges: [], size: session.uploaded_offset };
+    } else {
+      try {
+        result = await readNewRecords(row.raw_path, session.uploaded_offset);
+      } catch (err) {
+        log.warn("transcript unreadable", { harness: row.source, session_id: row.session_id, ...errorFields(err) });
+        continue;
+      }
     }
     if (result.size < session.uploaded_offset) {
       log.warn("transcript shrank; epochs are not handled yet, skipping", { harness: row.source, session_id: row.session_id });
@@ -352,55 +361,64 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
           scrub_ruleset: sealed.scrub.ruleset, scrub_version: sealed.scrub.version, trace_id: session.trace_id, session_uuid: session.session_uuid,
         });
       }
-      // The revision and closed flag advance only once the manifest has landed (below).
-      const revision = session.revision + 1;
-      const last = session.chunks.at(-1)!;
-      const nowIso = new Date().toISOString();
-      const manifest: ManifestV1 = {
-        schema_v: 1,
-        layout: "v1",
-        trace_id: session.trace_id,
-        revision,
-        created_at: session.created_at,
-        updated_at: nowIso,
-        session: {
-          workspace_id: loc.workspaceId,
-          machine_id: loc.machineId,
-          harness: loc.harness,
-          session_id: loc.sessionId,
-          started_at: session.started_at,
-          ...(shouldClose && row.last_activity_ms ? { ended_at: new Date(row.last_activity_ms).toISOString() } : {}),
-          ...(row.agent_version ? { harness_version: row.agent_version } : {}),
-          ...(row.cwd ? { cwd_sha256: createHash("sha256").update(row.cwd).digest("hex") } : {}),
-        },
-        writer: { delivery_instance_id: state.machine_id, plugin_version: PLUGIN_VERSION },
-        raw: {
-          owner: state.machine_id,
-          state: shouldClose ? "closed" : "open",
-          updated_at: nowIso,
-          format: "jsonl",
-          compression: "zstd",
-          chunk_count: session.chunks.length,
-          raw_bytes: session.chunks.reduce((n, c) => n + c.bytes, 0),
-          stored_bytes: session.chunks.reduce((n, c) => n + c.stored_bytes, 0),
-          content_sha256: await computeContentSha256(session.chunks),
-          epoch: 0,
-          epochs: [{ epoch: 0, opened_at: session.started_at, reason: "initial", first_seq: 0, opened_by: state.machine_id }],
-          next_offset: last.start_offset + last.bytes,
-          chunks: session.chunks,
-          ...(session.scrub ? { scrub: session.scrub } : {}),
-        },
-        extensions: {
-          [EXT]: { session_uuid: session.session_uuid, session_uuid_source: "minted", tenant_id: cfg.orgId, user_id: cfg.userId },
-        },
-      };
       const mKey = manifestKey(loc);
+      // The revision and closed flag advance only once the exact manifest has
+      // been acknowledged. Persist it before POST so a committed write whose
+      // response is lost can be replayed byte-for-byte after a restart.
+      let manifest = session.pending_manifest;
+      if (!manifest) {
+        const revision = session.revision + 1;
+        const last = session.chunks.at(-1)!;
+        const nowIso = new Date().toISOString();
+        manifest = {
+          schema_v: 1,
+          layout: "v1",
+          trace_id: session.trace_id,
+          revision,
+          created_at: session.created_at,
+          updated_at: nowIso,
+          session: {
+            workspace_id: loc.workspaceId,
+            machine_id: loc.machineId,
+            harness: loc.harness,
+            session_id: loc.sessionId,
+            started_at: session.started_at,
+            ...(shouldClose && row.last_activity_ms ? { ended_at: new Date(row.last_activity_ms).toISOString() } : {}),
+            ...(row.agent_version ? { harness_version: row.agent_version } : {}),
+            ...(row.cwd ? { cwd_sha256: createHash("sha256").update(row.cwd).digest("hex") } : {}),
+          },
+          writer: { delivery_instance_id: state.machine_id, plugin_version: PLUGIN_VERSION },
+          raw: {
+            owner: state.machine_id,
+            state: shouldClose ? "closed" : "open",
+            updated_at: nowIso,
+            format: "jsonl",
+            compression: "zstd",
+            chunk_count: session.chunks.length,
+            raw_bytes: session.chunks.reduce((n, c) => n + c.bytes, 0),
+            stored_bytes: session.chunks.reduce((n, c) => n + c.stored_bytes, 0),
+            content_sha256: await computeContentSha256(session.chunks),
+            epoch: 0,
+            epochs: [{ epoch: 0, opened_at: session.started_at, reason: "initial", first_seq: 0, opened_by: state.machine_id }],
+            next_offset: last.start_offset + last.bytes,
+            chunks: session.chunks,
+            ...(session.scrub ? { scrub: session.scrub } : {}),
+          },
+          extensions: {
+            [EXT]: { session_uuid: session.session_uuid, session_uuid_source: "minted", tenant_id: cfg.orgId, user_id: cfg.userId },
+          },
+        };
+      }
       const issues = await validateManifest(manifest, mKey);
       if (issues.length) {
         log.error("manifest invalid", { count: issues.length, reason: issues[0]!.path });
         throw Object.assign(new Error("manifest invalid"), { code: "manifest_invalid", retryable: false });
       }
       session.manifest_key = mKey;
+      session.pending = true;
+      if (!session.pending_manifest) session.pending_previous_version = session.manifest_version;
+      session.pending_manifest = manifest;
+      await saveState(cfg.statePath, state);
       const landed = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests`, {
         method: "POST",
         headers: {
@@ -410,7 +428,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
           "x-session-id": loc.sessionId,
           traceparent,
         },
-        body: JSON.stringify({ key: mKey, manifest, ...(session.manifest_version ? { previousVersion: session.manifest_version } : {}) }),
+        body: JSON.stringify({ key: mKey, manifest, ...(session.pending_previous_version ? { previousVersion: session.pending_previous_version } : {}) }),
       });
       if (landed.status !== 202) {
         const b = (await landed.json().catch(() => ({}))) as { error?: { code?: string } };
@@ -419,14 +437,16 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       const landedBody = (await landed.json()) as { version?: ObjectVersion };
       if (!landedBody.version?.eTag && !landedBody.version?.version)
         throw Object.assign(new Error("manifest response omitted its version"), { code: "manifest_version_missing", retryable: true });
-      session.revision = revision;
+      session.revision = manifest.revision;
       session.manifest_version = landedBody.version;
-      session.closed = shouldClose;
+      session.closed = manifest.raw.state === "closed";
       session.pending = false;
+      session.pending_manifest = undefined;
+      session.pending_previous_version = undefined;
       verified.add(mKey);
       uploaded += 1;
       log.info("manifest landed", {
-        stage: "object-landed", revision, chunk_count: session.chunks.length, bytes_raw: manifest.raw.raw_bytes,
+        stage: "object-landed", revision: manifest.revision, chunk_count: session.chunks.length, bytes_raw: manifest.raw.raw_bytes,
         trace_id: session.trace_id, session_uuid: session.session_uuid, manifest_key_sha256: createHash("sha256").update(mKey).digest("hex").slice(0, 16),
         state: manifest.raw.state,
       });
