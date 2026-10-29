@@ -47,7 +47,7 @@ const message = { payload: { manifestKey: "k" }, ctx: { orgId: "o" } } as never;
 const recorder = { log: { info() {} } } as never;
 
 describe("Bob Costas stores summaries as encrypted Locker objects, pointers in HoopDb", () => {
-  it("ready: object summary/short.json.enc decrypts; the row has only the pointer; old plaintext rows are gone", { timeout: 30_000 }, async () => {
+  it("ready: object summary/short.json.enc decrypts; the row has only the pointer; old plaintext rows are gone", async () => {
     const { pg, db } = await setup();
     expect((await pg.query(`SELECT count(*)::int AS n FROM sessions.session_summaries`)).rows[0]).toEqual({ n: 0 });
     const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
@@ -76,9 +76,9 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     expect(after.key_id).toBe("hkdf1:k2");
     const onlyK2 = await masterKeyring(parseMasterKeys(`k2:${"b".repeat(64)}`));
     expect((await readSummaryObject({ store, keyring: onlyK2, ids: { orgId: "o", workspaceId: "w" }, key: String(row.object_key), sha256: String(after.object_sha256), kind: "short", revision: 2 }))?.summary).toContain("PLANTED-PROMPT");
-  });
+  }, 30_000);
 
-  it("unscrubbed: recorded quarantined with no pointer, no object created, raw never read", { timeout: 30_000 }, async () => {
+  it("unscrubbed: recorded quarantined with no pointer, no object created, raw never read", async () => {
     const { pg, db } = await setup();
     const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
     const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
@@ -87,11 +87,11 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     const row = (await pg.query<Record<string, unknown>>(`SELECT status, object_key, object_sha256, key_id FROM sessions.session_summaries`)).rows[0]!;
     expect(row).toEqual({ status: "quarantined", object_key: null, object_sha256: null, key_id: null });
     expect(await store.head(objectKey("v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/long.json.enc"))).toBeUndefined();
-  });
+  }, 30_000);
 
-  it("the pointer constraint refuses a ready row without a pointer", { timeout: 30_000 }, async () => {
+  it("the pointer constraint refuses a ready row without a pointer", async () => {
     const { pg } = await setup();
     await expect(pg.query(`INSERT INTO sessions.session_summaries (org_id, workspace_id, harness, session_id, machine_id, kind, trace_id, revision, content_sha256, status)
                            VALUES ('o','w','claude','x','m','short','01a188e1-ef86-7b16-938a-e91b6b78643b',1,'${"e".repeat(64)}','ready')`)).rejects.toThrow(/session_summaries_pointer/);
-  });
+  }, 30_000);
 });
