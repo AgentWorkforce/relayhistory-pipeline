@@ -257,8 +257,14 @@ async function main() {
       return await down(requireLocalStage(stageArg));
     case "status":
       return status(requireLocalStage(stageArg));
-    case "plan":
+    case "plan": {
+      if (!stageArg) die("stage is required");
+      if (stageArg.startsWith("aws-")) {
+        // Code-only until cleared: plan needs credentials and an aws-inputs.json written by hand.
+        return void sh("bunx", ["alchemy", "plan", "--config", "stacks/aws/alchemy.aws.run.ts", "--stage", stageArg, "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: true });
+      }
       return void sh("bunx", ["alchemy", "plan", "--stage", requireLocalStage(stageArg), "--no-input"], { env: { ALCHEMY_PLAIN: "1" } });
+    }
     case "seed":
       requireLocalStage(stageArg);
       prepareInputs(stageArg!);
