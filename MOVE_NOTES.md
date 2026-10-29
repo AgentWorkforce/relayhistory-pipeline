@@ -1,7 +1,7 @@
 # MOVE_NOTES: pipeline framework from relayhistory-cloud PR #210
 
 Source: https://github.com/AgentWorkforce/relayhistory-cloud/pull/210
-(branch `sp/pipeline-framework`, head `b453db5571a716b22480074bee7233c3caac60f3`, 7 commits).
+(branch `sp/pipeline-framework`, head `f544f6de80106f7782b48993bb269e0cb152831e`, 11 commits).
 
 Only the PR diff was moved (33 files). Nothing outside the diff was copied or
 reimplemented. The 21 files the PR adds are byte-identical to their blobs at the
@@ -14,10 +14,10 @@ deployment.
 
 ## Which #210 head
 
-The moved files were taken from head `b453db5`. A later check was asked to use
-`8603c141bf7dfcd67687db1e5f02e48c1eb2ef61`, believed to be the current head on
-GitHub. Comparing the two (no network; `b453db5` is not in any local clone, so
-the comparison is the moved files against the `8603c14` blobs):
+The moved files were taken from head `f544f6d`. A later check was asked to use
+`f544f6de80106f7782b48993bb269e0cb152831e`, believed to be the current head on
+GitHub. Comparing the two (no network; `f544f6d` is not in any local clone, so
+the comparison is the moved files against the `f544f6d` blobs):
 
 - Identical: `dlq.ts`, `errors.ts`, `registry.ts`, `stages.ts`,
   `test/support/pipeline-queues.ts`, `scripts/pipeline-dlq-replay.mjs`.
@@ -25,22 +25,22 @@ the comparison is the moved files against the `8603c14` blobs):
   `trace.ts`, `traces.ts`, `routes/pipeline.ts`, the three tests,
   `docs/pipeline-observability.md`, `20261025000600_pipeline_queue.sql` and
   `pipeline_queue_test.sql`.
-- Not in `8603c14` at all: `telemetry-ids.ts`, and the `logger.ts` and
+- Not in `f544f6d` at all: `telemetry-ids.ts`, and the `logger.ts` and
   `PIPELINE_TELEMETRY_ID_KEY` hunks.
 
-Every difference is an addition on the `b453db5` side: keyed telemetry ids,
+Every difference is an addition on the `f544f6d` side: keyed telemetry ids,
 `session_id`/`machine_id` on jobs and dead letters, attempts counted when a job
 starts rather than when it is claimed, and tests for each (for example the
 observability test is 2243 lines against 1985). The local
 `origin/sp/pipeline-framework` ref was fetched at 15:59 PDT on 2026-10-28 and the
-move commit was made at 16:39, so `b453db5` is most likely a later push than
-`8603c14`, which is a stale local ref. **The moved files were kept as they are
-(`b453db5`).** Replacing them with `8603c14` would drop those fixes. Someone with
-network access should confirm `b453db5` is the PR head with
+move commit was made at 16:39, so `f544f6d` is most likely a later push than
+`f544f6d`, which is a stale local ref. **The moved files were kept as they are
+(`f544f6d`).** Replacing them with `f544f6d` would drop those fixes. Someone with
+network access should confirm `f544f6d` is the PR head with
 `gh pr view 210 -R AgentWorkforce/relayhistory-cloud --json headRefOid`.
 
 The supporting files added later (stand-in modules, vendored migrations) come
-from `8603c14`. Those blobs are the same at the #211 head, apart from `env.ts`,
+from `f544f6d`. Those blobs are the same at the #211 head, apart from `env.ts`,
 which only gets the field names here anyway.
 
 ## Path mapping
@@ -78,15 +78,15 @@ edited to get there.
 | Added | What it is |
 | --- | --- |
 | `package.json` (root) | private, `workspaces: ["packages/*"]`, `typecheck` and `test` scripts (bun) |
-| `packages/pipeline/package.json` | `@96bulls/pipeline`, pinned: hono 4.12.26, vitest 4.1.9, @electric-sql/pglite 0.5.3, @cloudflare/workers-types 4.20260621.1, typescript 5.9.3, @types/node 25.9.4 (what relayhistory-cloud's lockfile resolves at `8603c14`) |
+| `packages/pipeline/package.json` | `@96bulls/pipeline`, pinned: hono 4.12.26, vitest 4.1.9, @electric-sql/pglite 0.5.3, @cloudflare/workers-types 4.20260621.1, typescript 5.9.3, @types/node 25.9.4 (what relayhistory-cloud's lockfile resolves at `f544f6d`) |
 | `packages/pipeline/tsconfig.json` | upstream `packages/relayhistory/tsconfig.json` minus the cloud-client paths, plus `node` in `types` for the `node:` imports |
 | `packages/pipeline/vitest.config.ts` | upstream config minus the cloud-client alias (30 s hook timeout for PGlite) |
 | `src/env.ts` | Types only: `Bindings` with `ENVIRONMENT`, `POSTHOG_*` and the `env.ts.patch` additions copied verbatim (including the seven `Queue<StageMessage>` bindings and `PIPELINE_TELEMETRY_ID_KEY`), `Variables` (with `traceId`), `AppEnv`, `AppContext`, `AuthContext`. The rest of the relayhistory Worker's bindings are left out |
-| `src/lib/logger.ts` | Upstream file at `8603c14` with `logger.ts.patch` applied |
-| `src/lib/scrub.ts` | Verbatim upstream file at `8603c14` (last changed in `cdc55a6`, #179), under a provenance header |
+| `src/lib/logger.ts` | Upstream file at `f544f6d` with `logger.ts.patch` applied |
+| `src/lib/scrub.ts` | Verbatim upstream file at `f544f6d` (last changed in `cdc55a6`, #179), under a provenance header |
 | `src/middleware/auth.ts` | `getAuth` and `requireScope` copied unchanged, and a re-export of `AuthContext`. No token verification: the host app authenticates and sets `auth` on the context |
 | `src/app.ts` | Minimal `createApp({ auth? })`: the `app.ts.patch` id/trace-id middleware echoing `X-Relay-Trace-Id`, one request log line carrying `trace_id` (the `observability.ts.patch` hunk, without upstream's request stats), `/health`, `pipelineOpsRoutes` under `/v1` outside auth, and `pipelineRoutes` under `/v1` behind `auth`. The default `auth` answers 401 unless `auth` is already set |
-| `supabase/migrations/20261025000{000,100,200,300}_*.sql`, `supabase/tests/supabase_shim.sql` | Verbatim from `8603c14`. See `supabase/README.md` |
+| `supabase/migrations/20261025000{000,100,200,300}_*.sql`, `supabase/tests/supabase_shim.sql` | Verbatim from `f544f6d`. See `supabase/README.md` |
 
 Every stand-in file has a header that names the upstream file it replaces and
 says why it exists.
@@ -104,26 +104,14 @@ Or run the same from `packages/pipeline`: `npx tsc --noEmit` and `npx vitest run
 Results on 2026-10-28 (2026-10-29 UTC):
 
 - typecheck: exit 0, no errors.
-- test: 3 files, 110 tests. 109 pass and 1 fails (see below).
+- test: 3 files, 114 tests, all pass (vitest, PGlite in process).
 
 ## Skipped and failing tests
 
-No test is skipped. Nothing needs the Cloudflare runtime: `Queue` and `Message`
-are faked in `test/support/pipeline-queues.ts`, and Postgres is PGlite.
-
-One test is date-dependent and fails on some days. This is an upstream bug, not a
-porting issue:
-`pipeline-supabase-schema.test.ts` > "keeps the new columns and checks on
-partitions created later". It runs `pipeline_events_maintain(p_months_ahead => 4)`,
-which creates partitions for this month through 4 months out. It then writes an
-event at `later.setUTCMonth(now + 4)`. On the 29th to 31st of a month, when the
-target month is shorter, JavaScript rolls the date into the following month. For
-example, 2026-10-29 plus 4 months becomes 2027-03-01, which is outside the
-partitions that were created. The row then lands in `pipeline_events_default`,
-and the assertion fails. The same test passes with the clock pinned to
-2026-10-15 (checked with a throwaway vitest setup file that fakes only `Date`).
-It also passes on the 1st to the 28th of any month. The test was left unchanged.
-The upstream fix is to call `later.setUTCDate(1)` before adding months.
+None. An earlier head of #210 had a date-dependent partition test (it added
+four months with `setUTCMonth`, which rolls over on the 29th to 31st); the
+current head f544f6d carries the upstream fix ("date-safe partition test"),
+and the moved copy is that version.
 
 ## Differences from #210
 
