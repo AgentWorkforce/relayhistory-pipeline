@@ -109,6 +109,12 @@ curl -s http://127.0.0.1:18787/v1/tokens/relayhistory-assertion \
 ```
 
 The token's `aud` is exactly `historyOrigin`, which must equal the stage's
-`relayhistoryOrigin` (AlleyOop refuses anything else). A durable courier would
-mint the same way from inside the cluster, or through a broker that holds the
-key; a public token endpoint is a separate decision.
+`relayhistoryOrigin` (AlleyOop refuses anything else).
+
+**Transport.** The Service is plain HTTP. That is safe for what crosses it today:
+AlleyOop fetches only the public JWKS, and minting goes through
+`kubectl port-forward`, which tunnels inside the API server's TLS. Pod-to-pod
+traffic on EKS is not encrypted by default, so **nothing may send the bootstrap
+key over the cluster network until RelayAuth has TLS** (a mesh with mTLS, or TLS
+terminated in front of RelayAuth). That applies to an in-cluster courier or
+broker, and to a public token endpoint, which is a separate decision.
