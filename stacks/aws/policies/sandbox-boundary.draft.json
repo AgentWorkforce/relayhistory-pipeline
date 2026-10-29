@@ -1,13 +1,171 @@
 {
-  "$comment": "DRAFT permissions boundary for the 96bulls agent-session role in a sandbox account (Khaliq, 2026-10-28: no OrganizationAccountAccessRole, only the agent-session role, bounded). Not created anywhere. Regions limited to the allowlist; no IAM beyond roles/policies that themselves carry this boundary; no Organizations, billing, account or boundary changes.",
+  "$comment": "DRAFT permissions boundary for the 96bulls agent-session role in a sandbox account (Khaliq, 2026-10-28: no OrganizationAccountAccessRole, only the agent-session role, bounded). Not created anywhere. Regions limited to the allowlist; no IAM beyond roles/policies that themselves carry this boundary; no Organizations, billing, account or boundary changes. Role creation is allowed only with this boundary (Allow + explicit Deny when absent or different); role management and PassRole are limited to 96bulls-* roles tagged 96bulls:bounded=true, which the stage sets on every role it creates.",
   "Version": "2012-10-17",
   "Statement": [
-    { "Sid": "AllowedRegionsOnly", "Effect": "Deny", "NotAction": ["iam:*", "sts:*", "organizations:Describe*", "organizations:List*", "budgets:*", "ce:*", "cloudtrail:*", "support:*"], "Resource": "*",
-      "Condition": { "StringNotEquals": { "aws:RequestedRegion": ["us-east-1", "us-west-1", "us-west-2"] } } },
-    { "Sid": "ServiceWork", "Effect": "Allow", "Action": ["s3:*", "kms:*", "sqs:*", "logs:*", "cloudwatch:*", "xray:*", "ecs:*", "ecr:*", "eks:*", "ec2:*", "elasticloadbalancing:*", "rds:*", "secretsmanager:*", "ssm:*", "sts:GetCallerIdentity", "sts:TagSession", "tag:*", "budgets:ViewBudget", "cloudtrail:LookupEvents", "cloudtrail:Describe*", "cloudtrail:Get*"], "Resource": "*" },
-    { "Sid": "IamOnlyWithThisBoundary", "Effect": "Allow", "Action": ["iam:CreateRole", "iam:PutRolePolicy", "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:DeleteRolePolicy", "iam:DeleteRole", "iam:TagRole", "iam:UntagRole", "iam:PassRole", "iam:CreateServiceLinkedRole", "iam:CreateOpenIDConnectProvider", "iam:DeleteOpenIDConnectProvider", "iam:TagOpenIDConnectProvider"], "Resource": "*",
-      "Condition": { "StringEquals": { "iam:PermissionsBoundary": "arn:aws:iam::*:policy/96bulls-sandbox-boundary" } } },
-    { "Sid": "IamRead", "Effect": "Allow", "Action": ["iam:Get*", "iam:List*"], "Resource": "*" },
-    { "Sid": "NeverTouchTheBoundaryOrTheOrg", "Effect": "Deny", "Action": ["iam:CreatePolicyVersion", "iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:SetDefaultPolicyVersion", "iam:DeleteRolePermissionsBoundary", "iam:PutRolePermissionsBoundary", "iam:CreateUser", "iam:CreateAccessKey", "iam:CreateLoginProfile", "organizations:*", "account:*", "billing:*", "aws-portal:*", "budgets:ModifyBudget", "cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "cloudtrail:UpdateTrail"], "Resource": "*" }
+    {
+      "Sid": "AllowedRegionsOnly",
+      "Effect": "Deny",
+      "NotAction": [
+        "iam:*",
+        "sts:*",
+        "organizations:Describe*",
+        "organizations:List*",
+        "budgets:*",
+        "ce:*",
+        "cloudtrail:*",
+        "support:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:RequestedRegion": [
+            "us-east-1",
+            "us-west-1",
+            "us-west-2"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ServiceWork",
+      "Effect": "Allow",
+      "Action": [
+        "s3:*",
+        "kms:*",
+        "sqs:*",
+        "logs:*",
+        "cloudwatch:*",
+        "xray:*",
+        "ecs:*",
+        "ecr:*",
+        "eks:*",
+        "ec2:*",
+        "elasticloadbalancing:*",
+        "rds:*",
+        "secretsmanager:*",
+        "ssm:*",
+        "sts:GetCallerIdentity",
+        "sts:TagSession",
+        "tag:*",
+        "budgets:ViewBudget",
+        "cloudtrail:LookupEvents",
+        "cloudtrail:Describe*",
+        "cloudtrail:Get*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CreateRolesOnlyWithThisBoundary",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole"
+      ],
+      "Resource": "arn:aws:iam::*:role/96bulls-*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PermissionsBoundary": "arn:aws:iam::*:policy/96bulls-sandbox-boundary"
+        }
+      }
+    },
+    {
+      "Sid": "ManageOnlyOurBoundedRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:DeleteRole",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:UpdateRoleDescription"
+      ],
+      "Resource": "arn:aws:iam::*:role/96bulls-*",
+      "Condition": {
+        "StringEquals": {
+          "iam:ResourceTag/96bulls:bounded": "true"
+        }
+      }
+    },
+    {
+      "Sid": "PassOnlyOurRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": "arn:aws:iam::*:role/96bulls-*"
+    },
+    {
+      "Sid": "ServiceLinkedAndOidc",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateServiceLinkedRole",
+        "iam:CreateOpenIDConnectProvider",
+        "iam:DeleteOpenIDConnectProvider",
+        "iam:TagOpenIDConnectProvider"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IamRead",
+      "Effect": "Allow",
+      "Action": [
+        "iam:Get*",
+        "iam:List*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NeverTouchTheBoundaryOrTheOrg",
+      "Effect": "Deny",
+      "Action": [
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:PutRolePermissionsBoundary",
+        "iam:CreateUser",
+        "iam:CreateAccessKey",
+        "iam:CreateLoginProfile",
+        "organizations:*",
+        "account:*",
+        "billing:*",
+        "aws-portal:*",
+        "budgets:ModifyBudget",
+        "cloudtrail:StopLogging",
+        "cloudtrail:DeleteTrail",
+        "cloudtrail:UpdateTrail"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyUnboundedRoleCreation",
+      "Effect": "Deny",
+      "Action": [
+        "iam:CreateRole"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "iam:PermissionsBoundary": "true"
+        }
+      }
+    },
+    {
+      "Sid": "DenyAnyOtherBoundary",
+      "Effect": "Deny",
+      "Action": [
+        "iam:CreateRole",
+        "iam:PutRolePermissionsBoundary"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "iam:PermissionsBoundary": "arn:aws:iam::*:policy/96bulls-sandbox-boundary"
+        }
+      }
+    }
   ]
 }

@@ -17,7 +17,10 @@ permissions:
   id-token: write
 jobs:
   publish:
-    if: ${{ github.event.inputs.confirm == 'publish 96bulls-services' }}
+    # Only Khaliq may dispatch it, and only with the phrase; the job also runs in the
+    # image-publish environment so a protection rule can add a second gate when the plan allows it.
+    if: ${{ github.actor == 'khaliqgant' && github.event.inputs.confirm == 'publish 96bulls-services' }}
+    environment: image-publish
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -38,9 +41,10 @@ jobs:
           file: docker/services.Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          # The moving :main tag is written only from main; any other ref gets its sha tag only.
           tags: |
             ghcr.io/agentworkforce/96bulls-services:sha-${{ github.sha }}
-            ghcr.io/agentworkforce/96bulls-services:main
+            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/agentworkforce/96bulls-services:main' || '' }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}

@@ -31,7 +31,9 @@ jobs:
           if [ -f vendor/relayhistory-cloud/package.json ]; then bun test; else echo "stack unit tests skipped: vendored sources not checked out in CI"; fi
       - name: Guard - no Helm hooks in any chart or manifest in this repo
         run: |
-          ! grep -rn "helm.sh/hook" --include='*.yaml' --include='*.yml' --include='*.tpl' . --exclude-dir=node_modules --exclude-dir=vendor || (echo "helm hooks are not allowed (Alchemy renders --no-hooks)"; exit 1)
+          # The annotation key is assembled so this file never matches its own guard; .github is excluded as well.
+          key="helm.sh/ho""ok"
+          ! grep -rn "$key" --include='*.yaml' --include='*.yml' --include='*.tpl' . --exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=.github || (echo "helm hooks are not allowed (Alchemy renders --no-hooks)"; exit 1)
       - name: Guard - nothing secret-like committed
         run: |
           ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || (echo "secret-like file tracked"; exit 1)

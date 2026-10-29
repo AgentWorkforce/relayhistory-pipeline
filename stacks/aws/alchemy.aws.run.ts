@@ -159,7 +159,7 @@ export default Alchemy.Stack(
       maxSessionDuration: "1 hour",
       // Sandbox accounts: every role we create carries the sandbox boundary (draft in policies/).
       ...(isSandbox ? { permissionsBoundary: `arn:aws:iam::${inputs.accountId}:policy/${SANDBOX_RULES.permissionsBoundary}` } : {}),
-      tags: { ...tags(stage, "iam"), ...(isSandbox ? { [SANDBOX_RULES.tags.owner]: stage.slice("aws-sandbox-".length) } : {}) },
+      tags: { ...tags(stage, "iam"), ...(isSandbox ? { [SANDBOX_RULES.tags.owner]: stage.slice("aws-sandbox-".length), "96bulls:bounded": "true" } : {}) },
     });
 
     return {

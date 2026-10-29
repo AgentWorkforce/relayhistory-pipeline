@@ -27,7 +27,7 @@ export function planSandbox(command: SandboxPlan["command"], agent: string, opts
       `alchemy deploy --config stacks/aws/alchemy.aws.run.ts --stage ${stage} (budget $${r.budgetUsd}, alarm $${r.budgetAlarmUsd}).`,
     ],
     down: [
-      `alchemy destroy --stage ${stage} (reverse dependency order).`,
+      `alchemy destroy --config stacks/aws/alchemy.aws.run.ts --stage ${stage} (reverse dependency order).`,
       `Run the sweeper: delete everything tagged ${r.tags.stack}=${stage}; then the three checks; quarantine on any failure.`,
       `Keep the account open (per-agent accounts are reused).`,
     ],
