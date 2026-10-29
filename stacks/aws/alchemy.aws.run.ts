@@ -23,6 +23,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
+import { eksStage } from "./eks.ts";
+import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const REPO = "AgentWorkforce/96BullSessions";
@@ -38,6 +40,10 @@ interface AwsInputs {
   budgetEmail: string;
   /** Where HoopDb lives (RDS/Supabase URL in Secrets Manager); not created here. */
   hoopdbSecretArn?: string;
+  /** Khaliq, 2026-10-28: EKS is the first cloud compute target. Omit to declare the baseline only. */
+  eks?: { chartVersion: string; runtimeSecretName: string; tenantOrgId: string; relayauthJwksUrl: string; relayhistoryOrigin: string };
+  /** Khaliq, 2026-10-28: dev HoopDb is a Supabase project in the org the 96Bulls team owns. */
+  supabase?: { organizationId: string; projectName: string; region: string; plan?: "free" | "pro"; dbPassRef: string };
 }
 
 function readInputs(stage: string): AwsInputs {
@@ -60,7 +66,7 @@ const tags = (stage: string, component: string) => ({ "96bulls:stack": stage, "9
 export default Alchemy.Stack(
   "96bulls-aws",
   {
-    providers: Layer.mergeAll(AWS.providers()),
+    providers: Layer.mergeAll(AWS.providers(), SupabaseProvider()),
     state: AWS.state({ prefix: "96bulls" }),
   },
   Effect.gen(function* () {
@@ -162,8 +168,36 @@ export default Alchemy.Stack(
       tags: { ...tags(stage, "iam"), ...(isSandbox ? { [SANDBOX_RULES.tags.owner]: stage.slice("aws-sandbox-".length), "96bulls:bounded": "true" } : {}) },
     });
 
+    // HoopDb for this stage: a Supabase project (dev), resolved password via op:// at create time only.
+    const hoopdb = inputs.supabase
+      ? yield* SupabaseProject("hoopdb", {
+          organizationId: inputs.supabase.organizationId,
+          name: inputs.supabase.projectName,
+          region: inputs.supabase.region,
+          plan: inputs.supabase.plan ?? "free",
+          dbPassRef: inputs.supabase.dbPassRef,
+        })
+      : undefined;
+
+    // Compute: EKS with the 96bulls umbrella chart.
+    const eks = inputs.eks
+      ? yield* eksStage({
+          stage,
+          chartVersion: inputs.eks.chartVersion,
+          runtimeSecretName: inputs.eks.runtimeSecretName,
+          lockerBucket: `${name("locker")}-${inputs.accountId}`,
+          lockerRegion: inputs.region,
+          tenantOrgId: inputs.eks.tenantOrgId,
+          relayauthJwksUrl: inputs.eks.relayauthJwksUrl,
+          relayhistoryOrigin: inputs.eks.relayhistoryOrigin,
+          tags: tags(stage, "eks"),
+        })
+      : undefined;
+
     return {
       stage,
+      hoopdb: hoopdb ? { ref: hoopdb.ref, restUrl: hoopdb.restUrl } : null,
+      eks: eks ?? null,
       accountId: inputs.accountId,
       region: inputs.region,
       locker: { bucket: locker.bucketName, kmsKeyArn: key.keyArn },
