@@ -29,6 +29,12 @@ import { Project as SupabaseProject, SupabaseProvider } from "../supabase/projec
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const REPO = "AgentWorkforce/96BullSessions";
+/**
+ * The repo has GitHub immutable OIDC subjects on, so the sub carries numeric ids:
+ * `repo:AgentWorkforce@252050005/96BullSessions@1437714333:environment:<env>`
+ * (checked with `gh api repos/AgentWorkforce/96BullSessions/actions/oidc/customization/sub`).
+ */
+const OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/96BullSessions@1437714333";
 
 /** Written by hand (not by the CLI) once Khaliq clears the account: see docs/aws-stage.md. */
 interface AwsInputs {
@@ -164,10 +170,12 @@ export default Alchemy.Stack(
             Principal: { Federated: oidc.openIDConnectProviderArn },
             Action: ["sts:AssumeRoleWithWebIdentity"],
             Condition: {
-              StringEquals: { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
               // Only jobs that run in the gated GitHub environments may assume it: the Khaliq-only
               // image publish and per-stage deploys. Other workflows in the repo cannot.
-              StringLike: { "token.actions.githubusercontent.com:sub": [`repo:${REPO}:environment:image-publish`, `repo:${REPO}:environment:deploy-${stage}`] },
+              StringEquals: {
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                "token.actions.githubusercontent.com:sub": [`${OIDC_SUB_PREFIX}:environment:image-publish`, `${OIDC_SUB_PREFIX}:environment:deploy-${stage}`],
+              },
             },
           },
         ],
