@@ -23,7 +23,7 @@ import {
   type Bindings,
 } from "../shared/vendor.ts";
 import { openHoopDb, waitForHoopDb, waitForSchema } from "../shared/db.ts";
-import { enrichMessage } from "../shared/enrich.ts";
+import { enrichMessage, requestIdentity } from "../shared/enrich.ts";
 import { traceparentFor } from "../shared/ids.ts";
 import { integer, optional, required, vendorBindings } from "../shared/env.ts";
 import { errorFields, log } from "../shared/log.ts";
@@ -98,6 +98,11 @@ export async function buildIngestApp() {
   });
   const v1 = new Hono<AppEnv>();
   v1.use("*", async (c, next) => requireAuth(c as never, next));
+  // Every send made while handling this request carries the authenticated user.
+  v1.use("*", async (c, next) => {
+    const auth = c.get("auth") as { userId?: string } | undefined;
+    return requestIdentity.run({ userId: auth?.userId }, () => next());
+  });
   v1.route("/", pipeline);
   app.route("/v1", pipelineOpsRoutes);
   app.route("/v1", v1);

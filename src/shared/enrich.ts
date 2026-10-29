@@ -34,7 +34,13 @@ export type EnrichedCtx = StageMessage["ctx"] & {
   session_uuid_source?: string;
   tenant_id: string;
   traceparent: string;
+  /** The authenticated user who caused this work, when known (ingest requests). */
+  user_id?: string;
 };
+
+import { AsyncLocalStorage } from "node:async_hooks";
+/** Set by the ingest server for the duration of an authenticated request. */
+export const requestIdentity = new AsyncLocalStorage<{ userId?: string }>();
 
 /** The manifest key for any payload that names an object in the session's prefix. */
 export function manifestKeyOf(message: StageMessage): string | undefined {
@@ -75,7 +81,9 @@ export async function enrichMessage(message: StageMessage, reader?: ManifestRead
     ctx: {
       ...ctx,
       ...(ext ? { session_uuid: ext.session_uuid, session_uuid_source: ext.session_uuid_source } : {}),
-      tenant_id: ctx.tenant_id ?? ext?.tenant_id ?? message.ctx.orgId,
+      // Tenant is the authenticated org, never a manifest claim.
+      tenant_id: message.ctx.orgId,
+      ...(ctx.user_id ? { user_id: ctx.user_id } : requestIdentity.getStore()?.userId ? { user_id: requestIdentity.getStore()!.userId } : {}),
       traceparent,
     } as EnrichedCtx,
   };

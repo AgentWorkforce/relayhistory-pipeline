@@ -52,9 +52,18 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
       const m = read.manifest;
       const f = pointerFields(m);
       const ext = sessionExt(m);
+      const ectx = ctx as unknown as { user_id?: string; session_uuid?: string };
+      // Identity comes from the authenticated request (ctx), never from the manifest body.
+      // With no request identity (reconcile), keep whatever an authenticated upload recorded.
+      const existing = (await deps.db.query<{ session_uuid: string; user_id: string | null; fanout_revision: string }>(
+        `SELECT session_uuid::text, user_id, fanout_revision::text FROM sessions.session_index_ext
+          WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5`,
+        [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id],
+      )).rows[0];
+      const userId = ectx.user_id ?? existing?.user_id ?? "unknown";
       const row = {
         ...pk,
-        user_id: ext?.user_id ?? "unknown",
+        user_id: userId,
         project_id: null,
         title: null,
         state: null,
@@ -85,13 +94,14 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         [JSON.stringify([row])],
       );
       const applied = rows[0]?.applied ?? false;
-      if (!applied) {
+      const fanoutDone = existing ? Number(existing.fanout_revision) >= f.manifestRevision : false;
+      if (!applied && fanoutDone) {
         log.info("session index unchanged", { revision: f.manifestRevision, reason: "stale_or_equal_revision" });
         return { status: "skipped", reason: "stale_revision" };
       }
       // The customer-level id. Minted client-side; if an older client sent no
-      // uuid we derive one here, once, and say so.
-      const sessionUuid = ext?.session_uuid ?? uuidv7();
+      // uuid we derive one here ONCE (reusing the stored one on later revisions) and say so.
+      const sessionUuid = ext?.session_uuid ?? existing?.session_uuid ?? uuidv7();
       const source = ext ? ext.session_uuid_source : "derived";
       await deps.db.query(
         `INSERT INTO sessions.session_index_ext
@@ -101,11 +111,14 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
          ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET
            last_trace_id = excluded.last_trace_id,
            last_revision = greatest(sessions.session_index_ext.last_revision, excluded.last_revision),
+           user_id = coalesce(excluded.user_id, sessions.session_index_ext.user_id),
            updated_at = now()`,
         [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id, sessionUuid, source,
-         ext?.tenant_id ?? ctx.orgId, ext?.user_id ?? null, f.traceId, f.manifestRevision],
+         ctx.orgId, ectx.user_id ?? null, f.traceId, f.manifestRevision],
       );
-      // Fan out. Each consumer re-reads the manifest; the payload is the same pointer.
+      if (fanoutDone) return;
+      // Fan out, then record it. A crash in between repeats the fan-out on retry
+      // (consumers are idempotent by revision / content hash); nothing is lost.
       const current = deps.current();
       const base: StageMessage = {
         v: 1,
@@ -119,6 +132,11 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         const enriched = await enrichMessage({ ...base, stage }, deps.reader);
         await deps.queue.send(enriched);
       }
+      await deps.db.query(
+        `UPDATE sessions.session_index_ext SET fanout_revision = greatest(fanout_revision, $6)
+          WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5`,
+        [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id, f.manifestRevision],
+      );
       log.info("session indexed", {
         stage: "session-indexed",
         revision: f.manifestRevision,

@@ -57,6 +57,16 @@ is in `.96bulls/local/inputs.json`. Hosted and customer installs point
 `RELAYAUTH_JWKS_URL` at RelayAuth instead. `96bulls token local` mints one for
 manual calls.
 
+## Ports and credentials
+
+Host ports are bound to `127.0.0.1` only; the ingest API is the boundary, and
+HoopDb and the Locker are never reachable from other machines. The courier
+mints a one-hour token per pass from the stack's own key (no long-lived token
+in a container). Its upload ledger (`.alleyoop-courier.json` beside the
+seeded database) survives `down`: ids stay stable, and on the next `up` the
+courier finds its manifests gone from the fresh Locker and re-uploads with the
+same session uuids and trace ids.
+
 ## Known limits
 
 - Alchemy's Docker provider has no health gating; the CLI waits.

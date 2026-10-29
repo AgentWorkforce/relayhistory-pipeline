@@ -55,6 +55,7 @@ interface Inputs {
   concourseDir: string;
   telemetryDir: string;
   deploymentId: string;
+  machineId: string;
 }
 
 function stageDir(stage: string) {
@@ -91,6 +92,7 @@ function prepareInputs(stage: string): Inputs {
   inputs.concourseDir ||= join(dir, "concourse");
   inputs.telemetryDir ||= join(dir, "telemetry");
   inputs.deploymentId ||= `${stage}-${randomBytes(4).toString("hex")}`;
+  inputs.machineId ||= `m-${randomBytes(8).toString("hex")}`;
   inputs.courierToken = mintToken({ kid: inputs.jwtKid!, privateKeyPem: inputs.jwtPrivateKeyPem }, {
     issuer: TENANT.issuer,
     audience: "relayhistory",
@@ -218,6 +220,18 @@ async function down(stage: string) {
   } else {
     sh("bunx", ["alchemy", "destroy", "--stage", stage, "--yes", "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: true });
   }
+  await waitFor("container removal", () => {
+    const left = (docker("ps", "-aq", "--filter", `label=96bulls.stack=${stage}`).stdout ?? "").split("\n").filter(Boolean);
+    if (!left.length) return true;
+    // Only force what destroy left and is not already being removed.
+    for (const id of left) {
+      const st = (docker("inspect", "--format", "{{.State.Status}} {{.State.Removing}}", id).stdout ?? "").trim();
+      if (!st.includes("true") && !st.startsWith("dead")) docker("rm", "-f", id);
+    }
+    return false;
+  }, 600_000);
+  // The courier's ledger is kept: ids stay stable, and the courier re-uploads on its
+  // own when it finds its manifests gone from a fresh Locker.
   await waitFor("container removal", () => {
     const left = (docker("ps", "-aq", "--filter", `label=96bulls.stack=${stage}`).stdout ?? "").split("\n").filter(Boolean);
     if (!left.length) return true;

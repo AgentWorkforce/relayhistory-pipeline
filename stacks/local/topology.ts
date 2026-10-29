@@ -14,8 +14,8 @@ export const STACK = "96bulls";
 export const IMAGES = {
   hoopdb: "pgvector/pgvector:pg17",
   // MinIO's own registries went private in 2025; Chainguard's build is public. Pinned by digest.
-  locker: "cgr.dev/chainguard/minio@sha256:268d68a2a3b6fc65f905a61f84d7eab6345ce6bff14f551e2b028ec31e6a1341",
-  otelCollector: "otel/opentelemetry-collector-contrib:0.137.0",
+  locker: "cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7",
+  otelCollector: "otel/opentelemetry-collector-contrib:0.163.2", // kept in step with the collector chart 0.178.0 (helm-chart-lead)
   services: "96bulls/services:local",
   /** Root one-shot for volume permissions; Alchemy containers cannot set a user. */
   init: "alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc",

@@ -27,7 +27,10 @@ interface LocalInputs {
   lockerAccessKeyId: string;
   lockerSecretAccessKey: string;
   jwksJson: string;
+  jwtKid: string;
+  jwtPrivateKeyPem: string;
   courierToken: string;
+  machineId: string;
   concourseDir: string;
   telemetryDir: string;
   deploymentId: string;
@@ -74,7 +77,7 @@ export default Alchemy.Stack(
       name: name(NAMES.hoopdb),
       image: IMAGES.hoopdb,
       environment: { POSTGRES_DB: HOOPDB_NAME, POSTGRES_USER: HOOPDB_USER, POSTGRES_PASSWORD: inputs.hoopdbPassword },
-      ports: [{ external: PORTS.hoopdb, internal: 5432 }],
+      ports: [{ external: `127.0.0.1:${PORTS.hoopdb}`, internal: 5432 }], // loopback only: the ingest API is the boundary
       volumes: [{ hostPath: hoopdbData.name, containerPath: "/var/lib/postgresql/data" }],
       networks: [{ name: net.name, aliases: [name(NAMES.hoopdb)] }],
       healthcheck: { cmd: ["CMD-SHELL", `pg_isready -U ${HOOPDB_USER} -d ${HOOPDB_NAME}`], interval: "5 seconds", timeout: "3 seconds", retries: 20 },
@@ -89,7 +92,7 @@ export default Alchemy.Stack(
       image: IMAGES.locker,
       command: ["server", "/data", "--address", ":9000"],
       environment: { MINIO_ROOT_USER: inputs.lockerAccessKeyId, MINIO_ROOT_PASSWORD: inputs.lockerSecretAccessKey, MINIO_BROWSER: "off" },
-      ports: [{ external: PORTS.locker, internal: 9000 }],
+      ports: [{ external: `127.0.0.1:${PORTS.locker}`, internal: 9000 }],
       volumes: [{ hostPath: lockerData.name, containerPath: "/data" }],
       networks: [{ name: net.name, aliases: [name(NAMES.locker)] }],
       healthcheck: { cmd: ["CMD-SHELL", 'mc alias set h http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 && mc ready h >/dev/null 2>&1'], interval: "5 seconds", timeout: "4 seconds", retries: 20 },
@@ -114,7 +117,7 @@ export default Alchemy.Stack(
       name: name(NAMES.otel),
       image: IMAGES.otelCollector,
       command: ["--config=/etc/otelcol/config.yaml"],
-      ports: [{ external: PORTS.otelHttp, internal: 4318 }],
+      ports: [{ external: `127.0.0.1:${PORTS.otelHttp}`, internal: 4318 }],
       volumes: [
         { hostPath: join(ROOT, "docker/otel-collector.yaml"), containerPath: "/etc/otelcol/config.yaml", readOnly: true },
         { hostPath: telemetry.name, containerPath: IMAGE_PATHS.telemetry },
@@ -147,7 +150,7 @@ export default Alchemy.Stack(
       DEPLOYMENT_ID: inputs.deploymentId,
       ENVIRONMENT: "local",
     };
-    const service = (id: string, containerName: string, serviceName: string, extra: Record<string, string> = {}, opts: { ports?: Array<{ external: number; internal: number }>; volumes?: Array<{ hostPath: string; containerPath: string; readOnly?: boolean }>; restart?: "no" | "unless-stopped" } = {}) =>
+    const service = (id: string, containerName: string, serviceName: string, extra: Record<string, string> = {}, opts: { ports?: Array<{ external: number | string; internal: number }>; volumes?: Array<{ hostPath: string; containerPath: string; readOnly?: boolean }>; restart?: "no" | "unless-stopped" } = {}) =>
       Docker.Container(id, {
         name: containerName,
         image: services,
@@ -171,7 +174,7 @@ export default Alchemy.Stack(
       INGEST_PORT: "8080",
       JWKS_JSON: inputs.jwksJson,
       AUTH_ISSUER: TENANT.issuer,
-    }, { ports: [{ external: PORTS.ingest, internal: 8080 }] });
+    }, { ports: [{ external: `127.0.0.1:${PORTS.ingest}`, internal: 8080 }] });
 
     yield* service("hoopdb-indexer", name(NAMES.indexer), "hoopdb-indexer");
     yield* service("referee", name(NAMES.referee), "referee");
@@ -182,8 +185,12 @@ export default Alchemy.Stack(
       CONCOURSE_DB: `${inputs.concourseDir}/history.db`,
       COURIER_STATE: `${inputs.concourseDir}/.alleyoop-courier.json`,
       INGEST_URL: `http://${name(NAMES.ingest)}:8080`,
-      ALLEYOOP_TOKEN: inputs.courierToken,
+      // Short-lived tokens minted per pass from the stack's own key; no 7-day token in the container.
+      JWT_KID: inputs.jwtKid,
+      JWT_PRIVATE_KEY_PEM: inputs.jwtPrivateKeyPem,
+      AUTH_ISSUER: TENANT.issuer,
       USER_ID: TENANT.userId,
+      MACHINE_ID: inputs.machineId,
       COURIER_INTERVAL_MS: "5000",
       COURIER_CLOSE_AFTER_MINUTES: "30",
     }, {

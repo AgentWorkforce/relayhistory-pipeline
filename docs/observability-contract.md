@@ -17,6 +17,9 @@ courier HTTP headers `traceparent` + `X-Relay-Trace-Id`; ingest span joins it;
 Dead letters keep `session_uuid` + original `traceparent`; replay links.
 
 `tenant_id` = org id, from auth, in `ctx.tenant_id` and the jobs column.
+`user_id` on the index comes from the authenticated ingest request
+(`ctx.user_id`), never from the manifest body; a reconcile without a request
+keeps the value an authenticated upload recorded.
 
 **Telemetry carries ids, codes and counts only.** The allowlist is in
 `src/shared/log.ts` and applies to log lines and span attributes. Strings are

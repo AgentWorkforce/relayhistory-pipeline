@@ -22,6 +22,7 @@ import {
   type SessionLocation,
 } from "../shared/vendor.ts";
 import { flag, integer, lockerEnv, optional, required } from "../shared/env.ts";
+import { mintToken } from "./auth.ts";
 import { hexTraceId, isUuidV7, spanId, uuidv7 } from "../shared/ids.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { flushTelemetry, initTelemetry, withSpan } from "../shared/telemetry.ts";
@@ -51,6 +52,8 @@ interface SessionState {
   scrub?: { ruleset: string; version: number };
   manifest_key?: string;
   closed?: boolean;
+  /** Chunks were sealed but the manifest has not landed yet: retry even with no new bytes. */
+  pending?: boolean;
 }
 
 interface CourierState {
@@ -62,7 +65,8 @@ export interface CourierConfig {
   dbPath: string;
   statePath: string;
   ingestUrl: string;
-  token: string;
+  /** A fixed bearer token, or a minter for short-lived ones (local stack: the stack's own key). */
+  token: string | (() => string);
   orgId: string;
   workspaceId: string;
   userId: string;
@@ -77,7 +81,17 @@ export function configFromEnv(): CourierConfig {
     dbPath,
     statePath: optional("COURIER_STATE", join(dirname(dbPath), ".alleyoop-courier.json")),
     ingestUrl: required("INGEST_URL").replace(/\/$/, ""),
-    token: required("ALLEYOOP_TOKEN"),
+    token: process.env.JWT_PRIVATE_KEY_PEM
+      ? () =>
+          mintToken({ kid: required("JWT_KID"), privateKeyPem: required("JWT_PRIVATE_KEY_PEM") }, {
+            issuer: optional("AUTH_ISSUER", "https://96bulls.local"),
+            audience: optional("AUTH_AUDIENCE", "relayhistory"),
+            orgId: required("TENANT_ORG_ID"),
+            workspaceId: optional("WORKSPACE_ID", "default"),
+            userId: optional("USER_ID", "unknown"),
+            ttlSeconds: 3600,
+          })
+      : required("ALLEYOOP_TOKEN"),
     orgId: required("TENANT_ORG_ID"),
     workspaceId: optional("WORKSPACE_ID", "default"),
     userId: optional("USER_ID", "unknown"),
@@ -160,8 +174,19 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
     credentials: { accessKeyId: locker.accessKeyId, secretAccessKey: locker.secretAccessKey },
   });
   const rows = await readSessions(cfg.dbPath, cfg.harnesses);
+  const token = typeof cfg.token === "function" ? cfg.token() : cfg.token;
   let uploaded = 0;
   let chunks = 0;
+  // The ledger follows the Locker, not the other way round: if a recorded manifest is
+  // gone (a fresh stack after `down`), the upload state resets while the ids stay.
+  for (const [key, st] of Object.entries(state.sessions)) {
+    if (!st.manifest_key || st.revision === 0) continue;
+    const head = await store.head(st.manifest_key as never).catch(() => undefined);
+    if (!head) {
+      log.info("manifest missing in locker; re-uploading with the same ids", { session_uuid: st.session_uuid, trace_id: st.trace_id });
+      state.sessions[key] = { ...st, revision: 0, uploaded_offset: 0, chunks: [], closed: false, pending: false, scrub: undefined, manifest_key: undefined };
+    }
+  }
   for (const row of rows) {
     if (!row.raw_path || !row.first_activity_ms) continue;
     const key = `${row.source}:${row.session_id}`;
@@ -203,8 +228,10 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       continue;
     }
     const nothingNew = result.ranges.length === 0;
-    if (nothingNew && (session.closed || !shouldClose) && session.revision > 0) continue;
-    if (nothingNew && session.revision === 0) continue;
+    if (nothingNew && !session.pending) {
+      if (session.revision === 0) continue;
+      if (session.closed || !shouldClose) continue;
+    }
     await withSpan("alleyoop upload", {
       traceparent,
       attrs: { stage: "ingest", trace_id: session.trace_id, session_uuid: session.session_uuid, tenant_id: cfg.orgId, workspace_id: cfg.workspaceId, harness: row.source, session_id: row.session_id },
@@ -218,7 +245,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
         const res = await fetch(`${cfg.ingestUrl}/v1/pipeline/chunks?${q}`, {
           method: "POST",
           headers: {
-            authorization: `Bearer ${cfg.token}`,
+            authorization: `Bearer ${token}`,
             "content-type": "application/octet-stream",
             "x-relay-trace-id": session.trace_id,
             traceparent,
@@ -233,21 +260,22 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
         session.chunks.push(sealed.entry);
         session.scrub = session.scrub && session.scrub.version < sealed.scrub.version ? session.scrub : sealed.scrub;
         session.uploaded_offset = range.start + range.bytes.length;
+        session.pending = true; // sealed chunks exist that no landed manifest lists yet
         chunks += 1;
         log.info("chunk sealed", {
           stage: "deliver.put", seq, offset: range.start, bytes_raw: sealed.entry.bytes, bytes_stored: sealed.entry.stored_bytes,
           scrub_ruleset: sealed.scrub.ruleset, scrub_version: sealed.scrub.version, trace_id: session.trace_id, session_uuid: session.session_uuid,
         });
       }
-      session.revision += 1;
-      session.closed = shouldClose;
+      // The revision and closed flag advance only once the manifest has landed (below).
+      const revision = session.revision + 1;
       const last = session.chunks.at(-1)!;
       const nowIso = new Date().toISOString();
       const manifest: ManifestV1 = {
         schema_v: 1,
         layout: "v1",
         trace_id: session.trace_id,
-        revision: session.revision,
+        revision,
         created_at: session.created_at,
         updated_at: nowIso,
         session: {
@@ -290,21 +318,24 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       const body = new TextEncoder().encode(JSON.stringify(manifest));
       await store.put(mKey, body, {
         contentType: "application/json",
-        metadata: { "session-uuid": session.session_uuid, "trace-id": session.trace_id, revision: String(session.revision) },
+        metadata: { "session-uuid": session.session_uuid, "trace-id": session.trace_id, revision: String(revision) },
       });
       session.manifest_key = mKey;
       const landed = await fetch(`${cfg.ingestUrl}/v1/pipeline/manifests`, {
         method: "POST",
-        headers: { authorization: `Bearer ${cfg.token}`, "content-type": "application/json", "x-relay-trace-id": session.trace_id, traceparent },
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-relay-trace-id": session.trace_id, traceparent },
         body: JSON.stringify({ key: mKey }),
       });
       if (landed.status !== 202) {
         const b = (await landed.json().catch(() => ({}))) as { error?: { code?: string } };
         throw Object.assign(new Error("manifest not accepted"), { code: b.error?.code ?? `http_${landed.status}`, retryable: landed.status >= 500 });
       }
+      session.revision = revision;
+      session.closed = shouldClose;
+      session.pending = false;
       uploaded += 1;
       log.info("manifest landed", {
-        stage: "object-landed", revision: session.revision, chunk_count: session.chunks.length, bytes_raw: manifest.raw.raw_bytes,
+        stage: "object-landed", revision, chunk_count: session.chunks.length, bytes_raw: manifest.raw.raw_bytes,
         trace_id: session.trace_id, session_uuid: session.session_uuid, manifest_key_sha256: createHash("sha256").update(mKey).digest("hex").slice(0, 16),
         state: manifest.raw.state,
       });

@@ -46,15 +46,18 @@ export async function ensureBucket(timeoutMs = 120_000): Promise<void> {
       const res = await s3Request({ ...base, method: "PUT", path: `/${l.bucket}` });
       if (res.ok || res.status === 409) {
         const v = await s3Request({ ...base, method: "PUT", path: `/${l.bucket}`, query: "versioning", body: '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>' });
-        log.info("locker bucket ready", { ok: true, attempt, reason: res.status === 409 ? "exists" : "created", count: v.status });
-        return;
-      }
+        if (!v.ok) {
+          // Manifests are overwritten per revision; without versioning there is no history. Not ready.
+          log.warn("locker versioning not enabled yet", { attempt, error_code: `http_${v.status}` });
+        } else {
+          log.info("locker bucket ready", { ok: true, attempt, reason: res.status === 409 ? "exists" : "created" });
+          return;
+        }
+      } else {
       const text = await res.text();
-      if (/BucketAlreadyOwnedByYou|BucketAlreadyExists/.test(text)) {
-        log.info("locker bucket ready", { ok: true, attempt, reason: "exists" });
-        return;
+      if (!/BucketAlreadyOwnedByYou|BucketAlreadyExists/.test(text))
+        log.warn("locker bucket create refused", { attempt, error_code: `http_${res.status}` });
       }
-      log.warn("locker bucket create refused", { attempt, error_code: `http_${res.status}` });
     } catch (err) {
       if (attempt % 5 === 1) log.info("waiting for locker", { attempt, ...errorFields(err) });
     }
