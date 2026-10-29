@@ -49,7 +49,7 @@ export const eksStage = (i: EksStageInputs) =>
     });
     const sandbox = i.stage.startsWith("aws-sandbox-");
     // The hosted image is the ECR build; its digest is pinned after publish-image-ecr runs.
-    const image = (versions.images as Record<string, { digest: string | null }>)["services-ecr"];
+    const image = (versions.images as unknown as Record<string, { digest?: string | null }>)["services-ecr"];
     if (!image?.digest)
       throw new Error("96bulls: versions.lock.json has no services-ecr digest; run publish-image-ecr after the stage creates the repository, then pin it. Nothing was deployed to EKS.");
     const chart = yield* Kubernetes.HelmChart("96bulls", {
