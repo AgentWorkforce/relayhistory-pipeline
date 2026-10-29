@@ -28,6 +28,11 @@ export interface EksStageInputs {
   imageRepository: string;
   /** The digest published to this account's repository (per account, from aws-inputs.json). */
   imageDigest: string;
+  /** The Locker bucket ARN and its KMS key ARN, for the pods' Pod Identity role. */
+  lockerBucketArn: string;
+  lockerKmsKeyArn: string;
+  /** Sandbox stages: every role we create carries this permissions boundary and the bounded tag. */
+  permissionsBoundaryArn?: string;
   tags: Record<string, string>;
 }
 
@@ -52,6 +57,40 @@ export const eksStage = (i: EksStageInputs) =>
       tags: i.tags,
     });
     const sandbox = i.stage.startsWith("aws-sandbox-");
+
+    // EKS Pod Identity: one role for the 96bulls pods, Locker objects + its KMS key only.
+    // No static keys anywhere; the services read short-lived credentials from the pod identity agent.
+    const podRole = yield* AWS.IAM.Role("pods-role", {
+      roleName: `96bulls-${i.stage}-pods`,
+      description: `96bulls ${i.stage}: worker and ingest pods (EKS Pod Identity)`,
+      assumeRolePolicyDocument: {
+        Version: "2012-10-17",
+        Statement: [{ Effect: "Allow", Principal: { Service: "pods.eks.amazonaws.com" }, Action: ["sts:AssumeRole", "sts:TagSession"] }],
+      },
+      inlinePolicies: {
+        locker: {
+          Version: "2012-10-17",
+          Statement: [
+            { Effect: "Allow", Action: ["s3:ListBucket", "s3:GetBucketLocation", "s3:GetBucketVersioning"], Resource: [i.lockerBucketArn] },
+            { Effect: "Allow", Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject"], Resource: [`${i.lockerBucketArn}/*`] },
+            { Effect: "Allow", Action: ["kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"], Resource: [i.lockerKmsKeyArn] },
+          ],
+        },
+      },
+      maxSessionDuration: "1 hour",
+      ...(i.permissionsBoundaryArn ? { permissionsBoundary: i.permissionsBoundaryArn } : {}),
+      tags: { ...i.tags, ...(i.permissionsBoundaryArn ? { "96bulls:bounded": "true" } : {}) },
+    });
+    for (const sa of ["96bulls-worker", "96bulls-alleyoop"]) {
+      yield* AWS.EKS.PodIdentityAssociation(`pod-identity-${sa}`, {
+        clusterName: cluster.clusterName,
+        namespace: "96bulls",
+        serviceAccount: sa,
+        roleArn: podRole.roleArn,
+        tags: i.tags,
+      });
+    }
+
     const chart = yield* Kubernetes.HelmChart("96bulls", {
       cluster,
       chart: "96bulls",
@@ -60,29 +99,29 @@ export const eksStage = (i: EksStageInputs) =>
       releaseName: "96bulls",
       namespace: "96bulls",
       createNamespace: true,
+      // Keys per the released umbrella chart (helm-charts 96bulls 0.1.0; worker/alleyoop 0.2.0).
       values: {
         global: {
-          // Digest of the image pushed to ECR by publish-image-ecr (same build as versions.lock.json's digest).
-          image: { repository: i.imageRepository, digest: i.imageDigest },
-          existingSecret: i.runtimeSecretName,
-          env: {
-            TENANT_ORG_ID: i.tenantOrgId,
-            LOCKER_BUCKET: i.lockerBucket,
-            LOCKER_REGION: i.lockerRegion,
-            DEPLOYMENT: "hosted",
-            DEPLOYMENT_ID: i.stage,
-          },
-        },
-        // Keys per helm-chart-lead (umbrella helm-charts#15, 96bulls-worker 0.2.0).
-        alleyoop: {
-          auth: { jwksUrl: i.relayauthJwksUrl },
-          relayhistoryOrigin: i.relayhistoryOrigin,
-          ...(sandbox ? {} : { hoopdb: { existingSecret: i.runtimeSecretName } }),
+          imageRegistry: "", // the ECR repository below is fully qualified
+          tenant: { orgId: i.tenantOrgId },
         },
         worker: {
+          image: { repository: i.imageRepository, digest: i.imageDigest },
+          hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
+          locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
           // Supabase already has anon/authenticated/service_role; the plain-Postgres shim is for in-cluster DBs only.
           migrations: { supabaseShim: sandbox },
-          ...(sandbox ? {} : { hoopdb: { existingSecret: i.runtimeSecretName } }),
+          // The bucket is created and versioned by IaC; the pods' role has no CreateBucket.
+          lockerInit: { enabled: false },
+          deployment: { name: "hosted", id: i.stage },
+        },
+        alleyoop: {
+          image: { repository: i.imageRepository, digest: i.imageDigest },
+          hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
+          locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
+          auth: { jwksUrl: i.relayauthJwksUrl },
+          relayhistoryOrigin: i.relayhistoryOrigin,
+          deployment: { name: "hosted", id: i.stage },
         },
         // Sandboxes run HoopDb in-cluster (Khaliq: container Postgres); other stages use Supabase + S3.
         hoopdb: { enabled: sandbox },

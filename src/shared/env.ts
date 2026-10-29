@@ -20,14 +20,14 @@ export function integer(name: string, fallback: number): number {
   return Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 
-/** The Locker (S3) settings every service that touches raw objects needs. */
+/** The Locker (S3) settings. Endpoint and keys are optional (AWS S3 with Pod Identity); see shared/locker.ts. */
 export function lockerEnv() {
   return {
-    endpoint: required("LOCKER_ENDPOINT"),
+    endpoint: process.env.LOCKER_ENDPOINT || undefined,
     bucket: required("LOCKER_BUCKET"),
     region: optional("LOCKER_REGION", "us-east-1"),
-    accessKeyId: required("LOCKER_ACCESS_KEY_ID"),
-    secretAccessKey: required("LOCKER_SECRET_ACCESS_KEY"),
+    accessKeyId: process.env.LOCKER_ACCESS_KEY_ID || undefined,
+    secretAccessKey: process.env.LOCKER_SECRET_ACCESS_KEY || undefined,
   };
 }
 
