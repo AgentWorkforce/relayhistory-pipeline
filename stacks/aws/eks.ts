@@ -45,6 +45,7 @@ export const eksStage = (i: EksStageInputs) =>
       deletionProtection: i.stage === "aws-prod",
       tags: i.tags,
     });
+    const sandbox = i.stage.startsWith("aws-sandbox-");
     const image = versions.images["services"] as { ref: string; digest: string };
     const chart = yield* Kubernetes.HelmChart("96bulls", {
       cluster,
@@ -66,9 +67,19 @@ export const eksStage = (i: EksStageInputs) =>
             DEPLOYMENT_ID: i.stage,
           },
         },
-        alleyoop: { auth: { jwksUrl: i.relayauthJwksUrl }, relayhistoryOrigin: i.relayhistoryOrigin },
-        // Sandboxes run HoopDb and the Locker in-cluster (Khaliq: container Postgres); other stages use Supabase + S3.
-        hoopdb: { enabled: i.stage.startsWith("aws-sandbox-") },
+        // Keys per helm-chart-lead (umbrella helm-charts#15, 96bulls-worker 0.2.0).
+        alleyoop: {
+          auth: { jwksUrl: i.relayauthJwksUrl },
+          relayhistoryOrigin: i.relayhistoryOrigin,
+          ...(sandbox ? {} : { hoopdb: { existingSecret: i.runtimeSecretName } }),
+        },
+        worker: {
+          // Supabase already has anon/authenticated/service_role; the plain-Postgres shim is for in-cluster DBs only.
+          migrations: { supabaseShim: sandbox },
+          ...(sandbox ? {} : { hoopdb: { existingSecret: i.runtimeSecretName } }),
+        },
+        // Sandboxes run HoopDb in-cluster (Khaliq: container Postgres); other stages use Supabase + S3.
+        hoopdb: { enabled: sandbox },
         locker: { enabled: false },
       },
     });

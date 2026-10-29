@@ -24,6 +24,7 @@ import { openHoopDb, waitForHoopDb, waitForSchema } from "../shared/db.ts";
 import { enrichMessage, requestIdentity } from "../shared/enrich.ts";
 import { traceparentFor } from "../shared/ids.ts";
 import { integer, optional, required, vendorBindings } from "../shared/env.ts";
+import { healthVerdict, type WorkerHealth } from "../shared/worker.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
@@ -89,7 +90,21 @@ export async function buildIngestApp() {
   });
   if (jwks) app.get("/.well-known/jwks.json", (c) => c.json(jwks));
   app.get("/health", (c) => c.json({ ok: true, service: "alleyoop-ingest" }));
-  app.get("/healthz", (c) => c.json({ ok: true }));
+  // Liveness: same rule as the workers. A background SELECT 1 every 10s; after
+  // WORKER_UNHEALTHY_AFTER_FAILURES consecutive failures (e.g. a rotated HoopDb
+  // password once sessions reconnect) /healthz turns 503 so the orchestrator restarts us.
+  const health: WorkerHealth = { ready: true, lastTickAt: Date.now(), consecutiveDbFailures: 0 };
+  const maxFailures = integer("WORKER_UNHEALTHY_AFTER_FAILURES", 5);
+  setInterval(() => {
+    db.query("SELECT 1")
+      .then(() => (health.consecutiveDbFailures = 0))
+      .catch(() => (health.consecutiveDbFailures += 1))
+      .finally(() => (health.lastTickAt = Date.now()));
+  }, 10_000).unref();
+  app.get("/healthz", (c) => {
+    const v = healthVerdict(health, Date.now(), { maxFailures, maxTickAgeMs: 120_000 });
+    return c.json(v, v.ok ? 200 : 503);
+  });
   // Ready = the schema this image was built for is fully migrated, not just "DB answers".
   const expected = await expectedMigrationNames();
   app.get("/readyz", async (c) => {
