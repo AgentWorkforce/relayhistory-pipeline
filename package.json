@@ -1,15 +1,45 @@
 {
-  "name": "96bulls-root",
+  "name": "96bullsessions",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
+  "description": "96Bulls: infrastructure and services for the Agent Relay sessions pipeline. One entry point brings the whole pipe up or down.",
   "workspaces": [
     "packages/*"
   ],
+  "engines": {
+    "bun": ">=1.4.0",
+    "node": ">=24.11.1"
+  },
+  "bin": {
+    "96bulls": "bin/96bulls"
+  },
   "scripts": {
-    "typecheck": "bun run --filter @96bulls/pipeline typecheck",
-    "test": "bun run --filter @96bulls/pipeline test"
+    "typecheck": "tsc --noEmit && bun run --filter @96bulls/pipeline typecheck",
+    "test": "bun test && bun run --filter @96bulls/pipeline test",
+    "up:local": "bun run bin/96bulls up local",
+    "down:local": "bun run bin/96bulls down local",
+    "smoke:local": "bun run bin/96bulls smoke local"
+  },
+  "dependencies": {
+    "@alchemy.run/aws": "2.0.0-beta.84",
+    "@alchemy.run/docker": "2.0.0-beta.84",
+    "@alchemy.run/kubernetes": "2.0.0-beta.84",
+    "@effect/platform-bun": "4.0.7",
+    "@effect/platform-node": "4.0.7",
+    "@opentelemetry/api": "1.10.0",
+    "@opentelemetry/core": "3.0.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.300.0",
+    "@opentelemetry/resources": "3.0.0",
+    "@opentelemetry/sdk-trace-base": "2.12.0",
+    "alchemy": "2.0.0-beta.84",
+    "effect": "4.0.7",
+    "pg": "8.23.1"
   },
   "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "24",
+    "@types/pg": "8.15.5",
     "typescript": "5.9.3"
   }
 }

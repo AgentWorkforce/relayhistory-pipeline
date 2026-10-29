@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# 96bulls: one entry point for the sessions pipeline.
+#   96bulls up <stage> | down <stage> | status <stage> | smoke <stage> | seed <stage> | token <stage>
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+command -v bun >/dev/null 2>&1 || { echo "96bulls: bun is required (https://bun.sh)" >&2; exit 2; }
+exec bun run "$ROOT/src/cli/main.ts" "$@"
