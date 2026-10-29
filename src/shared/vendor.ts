@@ -44,14 +44,18 @@ export {
   sessionIndexedHandler,
 } from "@rhc/lib/pipeline/stages.ts";
 export {
+  buildObjectLandedMessage,
+  OBJECT_LANDED_STAGE,
   rawStoreFromEnv,
   manifestReaderFromEnv,
   objectStoreManifestReader,
   orgResolverFromEnv,
   prefixAllowed,
+  readCapped,
   type ManifestReader,
   type RawStore,
 } from "@rhc/lib/pipeline/adapter.ts";
+export { telemetryIdHash, telemetryIdKey } from "@rhc/lib/pipeline/telemetry-ids.ts";
 export { reconcileManifests } from "@rhc/lib/pipeline/reconcile.ts";
 export { SCRUB_RULESET, SCRUB_RULESET_VERSION, sealRawChunk } from "@rhc/lib/pipeline/raw-chunks.ts";
 export { scrubText, scrubJson } from "@rhc/lib/scrub.ts";
@@ -73,5 +77,7 @@ export {
   type SessionLocation,
   type ObjectStore,
   type ObjectKey,
+  type ObjectVersion,
   type RawFormat,
 } from "@rhc-object-store";
+export { ObjectStoreError, isObjectStoreError } from "@rhc-object-store";

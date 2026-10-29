@@ -38,9 +38,12 @@ uses via `/readyz`).
 3. The courier builds `manifest.json` (validated with the vendored validator,
    hash chain and all; `extensions["96bulls"]` carries the session uuid) and
    POSTs it to `/v1/pipeline/manifests`. AlleyOop validates it again, writes it
-   to Locker with its own storage identity, re-reads the authoritative copy,
-   and enqueues `object-landed` into `sessions.pipeline_jobs` with the ids in
-   `ctx`. The host courier never receives Locker credentials.
+   create-only (or by compare-and-swap for the same writer's next revision)
+   after verifying every referenced chunk carries the server's scrub metadata,
+   restores identity and keyed telemetry object metadata, re-reads the
+   authoritative copy, and enqueues `object-landed` into
+   `sessions.pipeline_jobs` with the ids in `ctx`. The host courier never
+   receives Locker credentials.
 4. The indexer handles `object-landed` (vendored), then `session-indexed`
    (ours): `sessions.upsert_session_index`, `session_index_ext` (session uuid),
    then fans out `summary-short`, `summary-long`, `status-classify`.
@@ -70,10 +73,12 @@ uses short-lived in-memory auth and sends all storage writes through AlleyOop.
 Its upload ledger (`.alleyoop-courier.json` beside the seeded database)
 survives `down`: ids stay stable, and on the next process start the courier
 checks its manifests through the authenticated ingest API and re-uploads
-missing ones with the same session uuids and trace ids. Set
-`COURIER_START_MODE=new` for a host enrollment that leaves existing sessions
-local; `all` is the explicit backfill mode and remains the fixture-stack
-default.
+missing ones with the same session uuids and trace ids. Host enrollment defaults
+to `COURIER_START_MODE=new`, leaving existing sessions local; `all` is the
+explicit backfill mode and is set explicitly by the fixture stack. Fixed bearer
+tokens require `COURIER_ALLOW_FIXED_TOKEN=1`. `JWT_PRIVATE_KEY_PEM` is local
+fixture auth only and is refused in `new` mode unless
+`COURIER_ALLOW_LOCAL_SIGNING_KEY=1` is explicitly set.
 
 ## Known limits
 

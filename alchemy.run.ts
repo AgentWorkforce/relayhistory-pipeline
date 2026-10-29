@@ -198,6 +198,7 @@ export default Alchemy.Stack(
       AUTH_ISSUER: TENANT.issuer,
       USER_ID: TENANT.userId,
       MACHINE_ID: inputs.machineId,
+      COURIER_START_MODE: "all",
       COURIER_INTERVAL_MS: "5000",
       COURIER_CLOSE_AFTER_MINUTES: "30",
     }, {

@@ -40,7 +40,6 @@ import {
 } from "../lib/pipeline/adapter.js";
 import {
   ObjectStoreError,
-  objectKey,
   parseManifest,
   parseSessionKey,
   RAW_FORMATS,
@@ -64,7 +63,6 @@ const CLIENT_STATUSES: readonly PipelineStatus[] = [
 ];
 const MAX_REPORTED_EVENTS = 100;
 const MAX_TELEMETRY_LOOKUPS = 100;
-const MAX_POSTED_MANIFEST_BYTES = 8 * 1024 * 1024;
 /** Client attrs that say which destination and which unit of work an event is for. */
 const KEY_ATTRS = new Set(["destination", "chunk", "seq", "offset"]);
 /** Never accepted as an attr key or a destination name: they name prototype slots. */
@@ -362,23 +360,6 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     const reader = (deps.manifests ?? defaultDeps.manifests!)(env);
     try {
       if (reader) {
-        if (body.manifest !== undefined) {
-          const posted = await parseManifest(body.manifest, key);
-          const encoded = new TextEncoder().encode(JSON.stringify(posted));
-          if (encoded.byteLength > MAX_POSTED_MANIFEST_BYTES)
-            return error(c, 413, "payload_too_large", "manifest is too large");
-          const raw = (deps.rawStore ?? defaultDeps.rawStore!)(env);
-          if (!raw)
-            return error(
-              c,
-              503,
-              "not_configured",
-              "Raw object storage is not configured",
-            );
-          await raw.store.put(objectKey(key), encoded, {
-            contentType: "application/json",
-          });
-        }
         const stored = await reader.read(key);
         if (!stored)
           return error(
@@ -451,22 +432,6 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
       },
       202,
     );
-  });
-
-  /** A content-free existence probe used once when a durable courier starts. */
-  routes.get("/pipeline/manifests/status", requireScope("rth:sync"), async (c) => {
-    const key = c.req.query("key") ?? "";
-    const location = parseSessionKey(key);
-    if (!location || location.rest !== "manifest.json") return c.body(null, 400);
-    const owned = await callerOwnsLocation(c, location);
-    if (owned !== true) return c.body(null, owned.status as 403 | 503);
-    const reader = (deps.manifests ?? defaultDeps.manifests!)(c.env ?? {});
-    if (!reader) return c.body(null, 503);
-    try {
-      return c.body(null, (await reader.read(key)) ? 204 : 404);
-    } catch {
-      return c.body(null, 503);
-    }
   });
 
   /**

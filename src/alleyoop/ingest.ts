@@ -17,6 +17,8 @@ import {
   traceIdFromHeaders,
   type AppEnv,
   type Bindings,
+  type PipelineStage,
+  type StageMessage,
 } from "../shared/vendor.ts";
 import { openHoopDb, waitForHoopDb, waitForSchema } from "../shared/db.ts";
 import { enrichMessage, requestIdentity } from "../shared/enrich.ts";
@@ -29,6 +31,7 @@ import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedMigrationNames } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
+import { createCourierManifestRoutes } from "./manifests.ts";
 
 export async function buildIngestApp() {
   const port = integer("INGEST_PORT", 8080);
@@ -57,16 +60,18 @@ export async function buildIngestApp() {
   const reader = lockerManifestReader();
   const sink = sqlPipelineEventSink(db);
   const deadLetters = postgresDeadLetterStore(db);
+  const send = async (_env: Bindings, stage: PipelineStage, message: StageMessage) =>
+    withSpan("enqueue", { traceparent: traceparentFor(message.ctx.traceId), attrs: { stage, trace_id: message.ctx.traceId } }, async () => {
+      await queue.send(await enrichMessage({ ...message, stage }, reader));
+    });
   const pipeline = createPipelineRoutes({
     manifests: () => reader,
     rawStore: () => lockerStore(),
     sink: () => sink,
     deadLetters: () => deadLetters,
-    send: async (_env, stage, message) =>
-      withSpan("enqueue", { traceparent: traceparentFor(message.ctx.traceId), attrs: { stage, trace_id: message.ctx.traceId } }, async () => {
-        await queue.send(await enrichMessage({ ...message, stage }, reader));
-      }),
+    send,
   });
+  const courierManifests = createCourierManifestRoutes({ manifests: reader, raw: lockerStore(), send });
 
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
@@ -132,6 +137,9 @@ export async function buildIngestApp() {
     const auth = c.get("auth") as { userId?: string } | undefined;
     return requestIdentity.run({ userId: auth?.userId }, () => next());
   });
+  // AlleyOop owns authenticated manifest writes and their compare-and-swap
+  // fence. Mount before the provenance-tracked pipeline routes it shadows.
+  v1.route("/", courierManifests);
   v1.route("/", pipeline);
   app.route("/v1", pipelineOpsRoutes);
   app.route("/v1", v1);
