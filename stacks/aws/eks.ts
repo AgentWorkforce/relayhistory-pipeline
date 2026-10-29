@@ -11,6 +11,7 @@
 import * as AWS from "@alchemy.run/aws";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
+import { ingressStage } from "./ingress.ts";
 
 export interface EksStageInputs {
   stage: string;
@@ -33,6 +34,8 @@ export interface EksStageInputs {
   lockerKmsKeyArn: string;
   /** Sandbox stages: every role we create carries this permissions boundary and the bounded tag. */
   permissionsBoundaryArn?: string;
+  /** Public hostname for the ingest (Cloudflare DNS). Omit to keep the ingest cluster-internal. */
+  ingress?: { hostname: string; cloudflareZoneId: string; zoneDomain: string; cloudflareTokenSecret: string };
   tags: Record<string, string>;
 }
 
@@ -128,5 +131,19 @@ export const eksStage = (i: EksStageInputs) =>
         locker: { enabled: false },
       },
     });
-    return { clusterName: cluster.clusterName, endpoint: cluster.endpoint, chartRelease: chart.releaseName };
+    const publicIngest = i.ingress
+      ? yield* ingressStage({
+          stage: i.stage,
+          cluster,
+          hostname: i.ingress.hostname,
+          cloudflareZoneId: i.ingress.cloudflareZoneId,
+          zoneDomain: i.ingress.zoneDomain,
+          namespace: "96bulls",
+          serviceName: "96bulls-alleyoop",
+          servicePort: 8080,
+          cloudflareTokenSecret: i.ingress.cloudflareTokenSecret,
+          tags: i.tags,
+        })
+      : undefined;
+    return { clusterName: cluster.clusterName, endpoint: cluster.endpoint, chartRelease: chart.releaseName, hostname: publicIngest?.hostname ?? null };
   });
