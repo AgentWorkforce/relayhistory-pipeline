@@ -25,6 +25,8 @@ export interface EksStageInputs {
   tenantOrgId: string;
   relayauthJwksUrl: string;
   relayhistoryOrigin: string;
+  /** The account's private ECR repository; nodes pull with their node role, no pull secret. */
+  imageRepository: string;
   tags: Record<string, string>;
 }
 
@@ -46,7 +48,10 @@ export const eksStage = (i: EksStageInputs) =>
       tags: i.tags,
     });
     const sandbox = i.stage.startsWith("aws-sandbox-");
-    const image = versions.images["services"] as { ref: string; digest: string };
+    // The hosted image is the ECR build; its digest is pinned after publish-image-ecr runs.
+    const image = (versions.images as Record<string, { digest: string | null }>)["services-ecr"];
+    if (!image?.digest)
+      throw new Error("96bulls: versions.lock.json has no services-ecr digest; run publish-image-ecr after the stage creates the repository, then pin it. Nothing was deployed to EKS.");
     const chart = yield* Kubernetes.HelmChart("96bulls", {
       cluster,
       chart: "96bulls",
@@ -57,7 +62,8 @@ export const eksStage = (i: EksStageInputs) =>
       createNamespace: true,
       values: {
         global: {
-          image: { repository: image.ref, digest: image.digest },
+          // Digest of the image pushed to ECR by publish-image-ecr (same build as versions.lock.json's digest).
+          image: { repository: i.imageRepository, digest: image.digest },
           existingSecret: i.runtimeSecretName,
           env: {
             TENANT_ORG_ID: i.tenantOrgId,

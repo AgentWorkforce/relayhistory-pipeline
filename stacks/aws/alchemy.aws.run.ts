@@ -130,6 +130,17 @@ export default Alchemy.Stack(
       ],
     });
 
+    // ECR: the hosted service image lives in the account, private (Khaliq, 2026-10-28: not public).
+    const ecr = yield* AWS.ECR.Repository("services-image", {
+      repositoryName: "96bulls-services",
+      imageTagMutability: "IMMUTABLE",
+      scanOnPush: true,
+      lifecyclePolicyText: JSON.stringify({
+        rules: [{ rulePriority: 1, description: "keep the last 50 images", selection: { tagStatus: "any", countType: "imageCountMoreThan", countNumber: 50 }, action: { type: "expire" } }],
+      }),
+      tags: tags(stage, "ecr"),
+    });
+
     // GitHub OIDC: the only way CI deploys. Trusted for this repository alone.
     const oidc = yield* AWS.IAM.OpenIDConnectProvider("github-oidc", {
       url: "https://token.actions.githubusercontent.com",
@@ -162,6 +173,15 @@ export default Alchemy.Stack(
             { Effect: "Allow", Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"], Resource: [key.keyArn as unknown as string] },
           ],
         },
+        // Push the services image to this account's ECR repository only.
+        ecrPush: {
+          Version: "2012-10-17",
+          Statement: [
+            { Effect: "Allow", Action: ["ecr:GetAuthorizationToken"], Resource: "*" },
+            { Effect: "Allow", Action: ["ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:BatchGetImage", "ecr:DescribeImages"],
+              Resource: [`arn:aws:ecr:${inputs.region}:${inputs.accountId}:repository/96bulls-services`] },
+          ],
+        },
       },
       maxSessionDuration: "1 hour",
       // Sandbox accounts: every role we create carries the sandbox boundary (draft in policies/).
@@ -191,6 +211,7 @@ export default Alchemy.Stack(
           tenantOrgId: inputs.eks.tenantOrgId,
           relayauthJwksUrl: inputs.eks.relayauthJwksUrl,
           relayhistoryOrigin: inputs.eks.relayhistoryOrigin,
+          imageRepository: ecr.repositoryUri as unknown as string,
           tags: tags(stage, "eks"),
         })
       : undefined;
@@ -202,6 +223,7 @@ export default Alchemy.Stack(
       accountId: inputs.accountId,
       region: inputs.region,
       locker: { bucket: locker.bucketName, kmsKeyArn: key.keyArn },
+      imageRepository: ecr.repositoryUri,
       deployerRoleArn: deployer.roleArn,
       hoopdbSecretArn: inputs.hoopdbSecretArn ?? null,
     };

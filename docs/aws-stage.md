@@ -35,3 +35,17 @@ provisioning API lives in Pippin Tools.
 
 Still gated: nothing here runs until `.96bulls/<stage>/aws-inputs.json` carries
 Khaliq's clearance and the account id is confirmed on the command line.
+
+## Image registry (Khaliq, 2026-10-28)
+
+The services image is the hosted product and stays private. The AWS stage
+creates a private, tag-immutable ECR repository (`96bulls-services`, scan on
+push, last 50 images kept); EKS nodes pull from it with their node role. The
+`publish-image-ecr` workflow pushes to it via GitHub OIDC (repo variables
+`AWS_DEPLOYER_ROLE_ARN`, `AWS_REGION`), manual and Khaliq-only. The EKS chart
+deploy refuses to run until `versions.lock.json` pins the ECR digest. The GHCR
+copy stays private for kind and self-host tests.
+
+Order for the first environment: apply the baseline (creates ECR and the
+deployer role) -> set the two repo variables -> run publish-image-ecr -> pin the
+digest -> apply again with `eks` inputs.

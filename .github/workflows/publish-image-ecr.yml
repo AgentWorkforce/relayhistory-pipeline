@@ -1,0 +1,48 @@
+# Publishes the 96bulls services image to the 96Bulls AWS account's private ECR
+# repository, using GitHub OIDC (no stored AWS keys). Manual only; requires
+# Khaliq as the dispatcher and a typed confirmation, like publish-image.yml.
+# Needs repo variables AWS_DEPLOYER_ROLE_ARN and AWS_REGION, set once the AWS
+# stage has created the deployer role.
+name: publish-image-ecr
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "publish 96bulls-services to ecr" to confirm Khaliq approved this publish'
+        required: true
+      ref_note:
+        description: 'Where the approval was given (date, call/message)'
+        required: true
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    if: ${{ github.actor == 'khaliqgant' && github.event.inputs.confirm == 'publish 96bulls-services to ecr' }}
+    environment: image-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOYER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push (amd64 + arm64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/services.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # The repository is tag-immutable: sha tags only.
+          tags: ${{ steps.ecr.outputs.registry }}/96bulls-services:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            96bulls.approval=${{ github.event.inputs.ref_note }}
+      - name: Digest
+        run: echo "${{ steps.ecr.outputs.registry }}/96bulls-services@${{ steps.build.outputs.digest }}" | tee -a "$GITHUB_STEP_SUMMARY"
