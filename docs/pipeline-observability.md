@@ -242,11 +242,20 @@ PostHog export), OTLP and Sentry error reports. A token is
   session), `org_id` and `workspace_id` stay raw everywhere. The token is
   deterministic, so one machine or session is the same value in every line and
   every tool.
+- **Inside log fields too**: every field the recorder's logger emits (its own
+  lines and a handler's `recorder.log`), at any depth (nested objects and
+  arrays included), has object-key `m=`/`s=` segments and the trace's own raw
+  machine and session ids replaced by their tokens, whatever the field is
+  called. Ids of 8+ characters are replaced wherever they occur; shorter ones
+  where they stand alone. A value that is both ids takes the session token.
 - **Raw ids only in service-role storage**: `pipeline_events`, `pipeline_jobs`,
   `pipeline_dead_letters` and the queue messages, beside the same `trace_id`.
 - **Operator lookup** (ops secret):
   - `POST /v1/internal/pipeline/telemetry-ids` with `{machineIds?, sessionIds?}`
-    returns each raw id's token, so its telemetry can be searched.
+    returns `{machines: [token…], sessions: [token…]}`, in request order, so
+    the raw ids are never echoed back. An id that fails `isSafeIdentifier`
+    (secret-shaped, or not 1–256 identifier characters), or a non-string
+    entry, gets a 400 that names only its position.
   - `GET /v1/internal/pipeline/traces/:traceId?orgId=&workspaceId=` takes the raw
     trace and tenant fields from a hashed line and returns that trace's events,
     raw ids included.

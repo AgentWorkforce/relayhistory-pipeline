@@ -397,11 +397,19 @@ export class PipelineRecorder {
       traceLogFields(this.telemetryCtx),
     );
     // Every field any caller logs (the recorder's own lines and a handler's
-    // `recorder.log`) passes through the object-key id redaction first.
+    // `recorder.log`) passes through the id redaction first: object-key
+    // segments, and this trace's own raw machine and session ids anywhere.
     const redacted =
       (level: "debug" | "info" | "warn" | "error") =>
       (message: string, fields?: LogFields) =>
-        log[level](message, fields && telemetryFields(fields, key));
+        log[level](
+          message,
+          fields &&
+            telemetryFields(fields, key, {
+              machineId: this.ctx.machineId,
+              sessionId: this.ctx.sessionId,
+            }),
+        );
     this.log = {
       debug: redacted("debug"),
       info: redacted("info"),

@@ -161,8 +161,8 @@ function hasTokenShapedRun(value: string) {
       /[A-Za-z]/.test(run) &&
       /\d/.test(run) &&
       !/^[0-9a-fA-F]+$/.test(run) &&
-      // ULIDs are ids, not tokens (Crockford base32, 26 characters).
-      !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(run)
+      // ULIDs are ids, not tokens (Crockford base32, 26 characters, either case).
+      !/^[0-9A-HJKMNP-TV-Z]{26}$/i.test(run)
     )
       return true;
   return false;
