@@ -177,7 +177,8 @@ collector and points every 96Bulls service at its in-cluster OTLP/HTTP Service.
 The collector stores gzip-compressed, lossless OTLP/JSON trace batches under the
 Locker bucket's encrypted `telemetry/traces/` prefix. It has its own EKS Pod
 Identity role with only `s3:PutObject`, multipart-abort and KMS encrypt/data-key
-permissions; it cannot read or delete telemetry or session objects. The
+permissions (including the bucket-key-required KMS decrypt); it has no
+`s3:GetObject` or delete permission and cannot fetch telemetry or session objects. The
 collector repeats the service allowlist safeguards: it drops content-bearing
 attributes and masks secret-shaped values before persistence.
 

@@ -60,6 +60,7 @@ describe("AWS observability values", () => {
     const policy = telemetryPolicy({ lockerBucketArn: "arn:aws:s3:::locker", lockerKmsKeyArn: "arn:aws:kms:us-west-2:1:key/k" });
     const actions = policy.Statement.flatMap((s) => s.Action);
     expect(actions).toContain("s3:PutObject");
+    expect(actions).toContain("kms:Decrypt");
     expect(actions).not.toContain("s3:GetObject");
     expect(actions).not.toContain("s3:DeleteObject");
     expect(policy.Statement[0]!.Resource).toEqual(["arn:aws:s3:::locker/telemetry/*"]);

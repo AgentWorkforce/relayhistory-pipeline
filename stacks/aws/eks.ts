@@ -62,7 +62,7 @@ export function telemetryPolicy(i: Pick<EksStageInputs, "lockerBucketArn" | "loc
       },
       {
         Effect: "Allow" as const,
-        Action: ["kms:Encrypt", "kms:GenerateDataKey*", "kms:DescribeKey"],
+        Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"],
         Resource: [i.lockerKmsKeyArn],
       },
     ],
