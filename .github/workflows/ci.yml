@@ -25,10 +25,14 @@ jobs:
         run: bun run --filter @96bulls/pipeline typecheck
       - name: Test packages/pipeline (vitest, in-process PGlite; no real database)
         run: bun run --filter @96bulls/pipeline test
+      - name: Build packages/object-store
+        run: bun run --filter @relayhistory/object-store build
+      - name: Test packages/object-store
+        run: bun run --filter @relayhistory/object-store test
+      - name: Typecheck the stack (src, stacks, alchemy.run.ts)
+        run: bunx tsc --noEmit -p tsconfig.json
       - name: Unit tests (stack)
-        # The stack's own tests need the vendored relayhistory-cloud sources for scrub; skipped until the #211 port lands.
-        run: |
-          if [ -f vendor/relayhistory-cloud/package.json ]; then bun test; else echo "stack unit tests skipped: vendored sources not checked out in CI"; fi
+        run: bun test
       - name: Guard - no Helm hooks in any chart or manifest in this repo
         run: |
           # The annotation key is assembled so this file never matches its own guard; .github is excluded as well.

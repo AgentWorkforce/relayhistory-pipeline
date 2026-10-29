@@ -1,18 +1,16 @@
 # 96bulls services image: one image, SERVICE= picks the entry point.
-# Contains this repo and the vendored relayhistory-cloud sources (pinned submodule).
+# The pipeline framework and object store are workspace packages in this repo
+# (packages/pipeline, packages/object-store); no vendored sources are needed.
 FROM oven/bun:1.4.2-slim AS base
 WORKDIR /app
 ENV NODE_ENV=production
-# Vendored deps first (own lockfile), then ours.
-COPY vendor/relayhistory-cloud/package.json vendor/relayhistory-cloud/package-lock.json vendor/relayhistory-cloud/
-COPY vendor/relayhistory-cloud/packages/relayhistory/package.json vendor/relayhistory-cloud/packages/relayhistory/
-COPY vendor/relayhistory-cloud/packages/object-store/package.json vendor/relayhistory-cloud/packages/object-store/
-COPY vendor/relayhistory-cloud/packages/cloud-client/package.json vendor/relayhistory-cloud/packages/cloud-client/
-RUN cd vendor/relayhistory-cloud && bun install --ignore-scripts --no-progress
 COPY package.json bun.lock tsconfig.json ./
-RUN bun install --ignore-scripts --no-progress
-COPY vendor/relayhistory-cloud vendor/relayhistory-cloud
-RUN cd vendor/relayhistory-cloud && bun run --cwd packages/object-store build && bun run --cwd packages/cloud-client build
+COPY packages/pipeline/package.json packages/pipeline/
+COPY packages/object-store/package.json packages/object-store/
+RUN bun install --frozen-lockfile --ignore-scripts --no-progress
+COPY packages packages
+RUN bun run --filter @relayhistory/object-store build
+COPY supabase supabase
 COPY src src
 COPY stacks stacks
 COPY docker/entrypoint.sh /entrypoint.sh

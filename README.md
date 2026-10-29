@@ -30,7 +30,7 @@ One `session_uuid` (UUIDv7, minted once on the client) and one pipeline
 - `alchemy.run.ts`: the stack, every stage. `local` uses the Alchemy Docker provider; `aws-*` is declared and gated (`docs/aws-stage.md`).
 - `stacks/local/topology.ts`: names, ports, images, tenant ids, as data.
 - `src/`: the services (Bun/TypeScript). One image, `SERVICE=` picks the entry (`docker/`).
-- `vendor/relayhistory-cloud`: the upstream pipeline framework and object-store adapters, pinned to the head of relayhistory-cloud PR #211 as a submodule. Never edited here. (PR #1 moves the framework into `packages/pipeline`; the services will switch to it when it lands.)
+- `packages/pipeline`, `packages/object-store`: the pipeline framework and object-store adapters, moved from relayhistory-cloud #210 and #211 (byte-identical; `MOVE_NOTES.md` has the mapping and the few stand-ins). The services import them through `src/shared/vendor.ts`.
 - `vendor/relayhistory`: the `ai-hist` Rust CLI and transcript fixtures, for Concourse.
 - `docs/`, `runbooks/`, `versions.lock.json`.
 
@@ -39,9 +39,9 @@ One `session_uuid` (UUIDv7, minted once on the client) and one pipeline
 Docker, Bun >= 1.4, and a Rust toolchain (>= 1.89) for the one-time `ai-hist` build:
 
 ```
-git submodule update --init --depth 1
+git submodule update --init --depth 1        # vendor/relayhistory: the ai-hist CLI and fixtures
 bun install
-(cd vendor/relayhistory-cloud && npm ci && npm run build -w packages/object-store -w packages/cloud-client)
+bun run --filter @relayhistory/object-store build
 (cd vendor/relayhistory && cargo build --release -p ai-hist-cli)
 ```
 

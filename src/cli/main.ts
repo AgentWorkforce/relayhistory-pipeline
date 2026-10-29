@@ -121,8 +121,8 @@ function preflight() {
   const checks: Array<[string, () => boolean]> = [
     ["docker daemon", () => docker("info", "--format", "{{.ServerVersion}}").status === 0],
     ["alchemy cli", () => existsSync(join(ROOT, "node_modules/alchemy/package.json"))],
-    ["vendored relayhistory-cloud", () => existsSync(join(ROOT, "vendor/relayhistory-cloud/package.json"))],
-    ["vendored deps installed", () => existsSync(join(ROOT, "vendor/relayhistory-cloud/node_modules/hono/package.json"))],
+    ["workspace installed", () => existsSync(join(ROOT, "packages/pipeline/node_modules/hono/package.json"))],
+    ["ai-hist built (vendor/relayhistory)", () => existsSync(join(ROOT, "vendor/relayhistory/target/release/ai-hist")) || Boolean(process.env.AI_HIST_BIN)],
   ];
   for (const [label, ok] of checks) if (!ok()) die(`preflight failed: ${label}`);
   for (const [label, port] of Object.entries(PORTS)) {

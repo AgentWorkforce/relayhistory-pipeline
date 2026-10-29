@@ -1,6 +1,3 @@
-[submodule "relayhistory-cloud"]
-	path = vendor/relayhistory-cloud
-	url = git@github.com:AgentWorkforce/relayhistory-cloud.git
 [submodule "relayhistory"]
 	path = vendor/relayhistory
 	url = git@github.com:AgentWorkforce/relayhistory.git

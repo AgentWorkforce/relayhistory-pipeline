@@ -385,3 +385,30 @@ and leaves them after `down`, which conflicts with this repository's rule that
 no credential-like file lives on disk. The S3/GCS/Azure conformance tests still
 run against emulators started by hand (the MinIO block was exercised that way);
 a cleaner emulator helper can come later if needed.
+
+## Stack switch to the in-repo packages (feat/stack-on-packages)
+
+The services under `src/` now import the pipeline framework and object store
+from `packages/pipeline` and `packages/object-store` (tsconfig paths `@rhc/*`
+and `@rhc-object-store`), and the `vendor/relayhistory-cloud` submodule is
+removed. `vendor/relayhistory` stays: it provides the `ai-hist` Rust CLI and
+the transcript fixtures Concourse is seeded from.
+
+New stand-ins the stack needs, beyond the #210/#211 diffs:
+
+| File | Source | Notes |
+| --- | --- | --- |
+| `packages/pipeline/src/auth/relayauth.ts` | relayhistory-cloud `main` @ 6f6d568 | verbatim plus a one-line provenance header; RS256 JWT verification against `RELAYAUTH_JWKS_URL` |
+| `packages/pipeline/src/auth/analytics-identity.ts` | same | verbatim plus provenance header (relayauth.ts depends on it) |
+| `packages/pipeline/src/middleware/auth.ts` `requireAuth` | written here | the RelayAuth JWT path only; upstream's opaque `rth_at_`/`rth_st_` path needs Neon and is refused with `unsupported_token` |
+| `packages/pipeline/src/env.ts` | upstream `env.ts` | adds the `DEFAULT_RELAYAUTH_*` constants, the RelayAuth bindings, and `historyOrigin`/`sessionId`/`analyticsIdentity` on `AuthContext` |
+
+Not ported, on purpose: upstream `middleware/observability.ts` (needs the
+Worker's request stats and PostHog plumbing) and `routes/health.ts` (needs
+session-analysis). The ingest has its own allowlisted request log, `/health`,
+`/healthz` and `/readyz`.
+
+HoopDb: the runner now reads `supabase/migrations` and records them as
+`upstream:<file>`. `20261025000600_pipeline_queue.sql` changed upstream after the
+old vendored pin, so a database built from that pin stops with
+`legacy_schema` and an instruction to recreate it (`96bulls down <stage> --purge`).

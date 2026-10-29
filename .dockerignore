@@ -1,9 +1,9 @@
 .git
 .gitmodules
 node_modules
-vendor/relayhistory-cloud/node_modules
-vendor/relayhistory-cloud/.git
-vendor/relayhistory
+**/node_modules
+packages/object-store/dist
+vendor
 .alchemy
 .96bulls
 docs

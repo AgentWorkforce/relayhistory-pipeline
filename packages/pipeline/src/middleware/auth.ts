@@ -40,3 +40,31 @@ export function requireScope(scope: string) {
     await next();
   });
 }
+
+/**
+ * 96BullSessions `requireAuth`: the RelayAuth JWT path only (upstream also
+ * resolves `rth_at_`/`rth_st_` tokens against Neon, which this repo does not
+ * have). Enabled by `ALLOW_INTERIM_RELAYAUTH_BEARER=true`; verifies an RS256
+ * JWT against `RELAYAUTH_JWKS_URL` and sets `auth` on the context.
+ */
+import { IdentityError, verifyAgentRelayToken } from "../auth/relayauth.js";
+
+export const requireAuth = createMiddleware<AppEnv>(async (c, next) => {
+  const header = c.req.header("Authorization") ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  const deny = (status: 401 | 403, code: string, message: string) =>
+    c.json({ error: { code, message }, correlationId: c.get("correlationId") ?? "" }, status);
+  if (!token) return deny(401, "missing_authorization", "missing Authorization header");
+  if (token.startsWith("rth_at_") || token.startsWith("rth_st_"))
+    return deny(401, "unsupported_token", "opaque relayhistory tokens are not supported by this deployment");
+  if (c.env?.ALLOW_INTERIM_RELAYAUTH_BEARER !== "true")
+    return deny(401, "auth_not_configured", "bearer auth is not enabled (ALLOW_INTERIM_RELAYAUTH_BEARER)");
+  try {
+    const auth = await verifyAgentRelayToken(token, c.env);
+    c.set("auth", auth);
+  } catch (err) {
+    if (err instanceof IdentityError) return deny(401, err.code, err.message);
+    throw err;
+  }
+  await next();
+});

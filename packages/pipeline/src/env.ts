@@ -16,6 +16,11 @@
  */
 import type { Context } from "hono";
 
+// RelayAuth defaults, as upstream env.ts declares them (needed by auth/relayauth.ts).
+export const DEFAULT_RELAYAUTH_JWKS_URL = "https://relayauth.dev/.well-known/jwks.json";
+export const DEFAULT_RELAYAUTH_ISSUER = "https://relayauth.dev";
+export const DEFAULT_RELAYAUTH_AUDIENCE = "relayhistory";
+
 export interface AuthContext {
   userId: string;
   orgId: string;
@@ -23,9 +28,21 @@ export interface AuthContext {
   tokenSubject: string;
   scopes: string[];
   claims: Record<string, unknown>;
+  /** As upstream env.ts: set when an assertion was accepted for this History's own origin. */
+  historyOrigin?: string;
+  sessionId?: string;
+  /** As upstream env.ts: set only by verified auth boundaries (auth/relayauth.ts). */
+  analyticsIdentity?: import("./auth/analytics-identity.js").AnalyticsIdentity;
 }
 
 export interface Bindings {
+  // RelayAuth JWT verification (auth/relayauth.ts), as upstream env.ts declares them.
+  RELAYAUTH_JWKS_URL?: string;
+  RELAYAUTH_ISSUER?: string;
+  RELAYAUTH_AUDIENCE?: string;
+  RELAYHISTORY_ORIGIN?: string;
+  RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS?: string;
+  ALLOW_INTERIM_RELAYAUTH_BEARER?: string;
   ENVIRONMENT?: string;
   // Request logs leave the Worker only when the key is set (see lib/logger.ts).
   POSTHOG_API_KEY?: string;

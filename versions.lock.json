@@ -26,11 +26,6 @@
     }
   },
   "vendored": {
-    "relayhistory-cloud": {
-      "path": "vendor/relayhistory-cloud",
-      "commit": "6f6d568849c483be8e3a2a5aaeba3da1d4b47de9",
-      "note": "head of PR #211 (stacks on #210); unmerged; never modified here"
-    },
     "relayhistory": {
       "path": "vendor/relayhistory",
       "commit": "be827d1e",
@@ -46,5 +41,15 @@
     "bun": ">=1.4.0",
     "rust": ">=1.89 (object-store crate), 1.98.1 used"
   },
-  "charts": {}
+  "charts": {},
+  "packages": {
+    "@96bulls/pipeline": {
+      "path": "packages/pipeline",
+      "from": "relayhistory-cloud #210 @ f544f6d + #211 @ d9f2ba2 (moved byte-identical; see MOVE_NOTES.md)"
+    },
+    "@relayhistory/object-store": {
+      "path": "packages/object-store",
+      "from": "relayhistory-cloud #211 @ d9f2ba2 (verbatim)"
+    }
+  }
 }
