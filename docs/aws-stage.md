@@ -154,8 +154,16 @@ Bob Costas only, and the stack refuses older chart versions.
 Bob Costas briefly writes the removed `summary` column and fails until it is
 replaced. In local kind, the queue recovered on attempt 3. To avoid burning
 retries on a busy environment, scale it to zero first:
-`kubectl -n 96bulls scale deploy/96bulls-worker-bob-costas --replicas=0`. The
-deploy brings it back with the new image.
+`kubectl -n 96bulls scale deploy/96bulls-worker-bob-costas --replicas=0`.
+**Then, after the deploy, always scale it back and check.** Do not rely on the
+apply to restore it: the stack applies rendered manifests (helm template plus
+server-side apply), and a manual scale may be preserved.
+
+```sh
+kubectl -n 96bulls scale deploy/96bulls-worker-bob-costas --replicas=1
+kubectl -n 96bulls rollout status deploy/96bulls-worker-bob-costas --timeout=300s
+kubectl -n 96bulls get deploy 96bulls-worker-bob-costas -o jsonpath='{.status.readyReplicas}'   # 1
+```
 
 Migration 0004 deletes existing `session_summaries` rows, because they hold
 plaintext. They are derived: Bob Costas's summary sweep (at startup, then every
