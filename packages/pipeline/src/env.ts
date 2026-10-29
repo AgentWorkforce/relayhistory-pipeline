@@ -7,9 +7,12 @@
  * logger's ENVIRONMENT/POSTHOG_* fields, and the PR #210 additions from
  * integration/relayhistory-cloud/packages/relayhistory/src/env.ts.patch verbatim
  * (event store, error tracker, ops secret, telemetry id key, the seven per-stage
- * `Queue<StageMessage>` bindings). `Variables` and `AuthContext` keep the upstream
- * field names; upstream-only auth extras (historyOrigin, sessionId,
- * analyticsIdentity) are left out because nothing here reads them.
+ * `Queue<StageMessage>` bindings), and the PR #211 storage-adapter additions
+ * (PIPELINE_RAW_*, PIPELINE_ORG_*, PIPELINE_KEY_PREFIX, PIPELINE_RECONCILE_*)
+ * verbatim from relayhistory-cloud `git diff f544f6d d9f2ba2 -- env.ts`.
+ * `Variables` and `AuthContext` keep the upstream field names; upstream-only
+ * auth extras (historyOrigin, sessionId, analyticsIdentity) are left out
+ * because nothing here reads them.
  */
 import type { Context } from "hono";
 
@@ -60,6 +63,27 @@ export interface Bindings {
   PIPELINE_FILE_MAINTENANCE?: Queue<
     import("./lib/pipeline/dlq.js").StageMessage
   >;
+  // Storage-notification adapter (lib/pipeline/adapter.ts); inert until set.
+  // The raw store is reached over the S3 API: MinIO for self-host, R2's S3 API
+  // hosted. Credentials are runtime secrets and are never logged.
+  PIPELINE_RAW_PROVIDER?: string;
+  PIPELINE_RAW_S3_BUCKET?: string;
+  PIPELINE_RAW_S3_ENDPOINT?: string;
+  PIPELINE_RAW_S3_REGION?: string;
+  PIPELINE_RAW_S3_ACCESS_KEY_ID?: string;
+  PIPELINE_RAW_S3_SECRET_ACCESS_KEY?: string;
+  /** `AES256` | `aws:kms`: server-side encryption for stores that need it requested (MinIO + KMS). */
+  PIPELINE_RAW_S3_SSE?: string;
+  /** Owner of every raw object (single tenant). */
+  PIPELINE_ORG_ID?: string;
+  /** "true": the org is the last segment of the key's deployment prefix. */
+  PIPELINE_ORG_FROM_PREFIX?: string;
+  /** Deployment prefix raw keys sit under, when the org is not taken from it. */
+  PIPELINE_KEY_PREFIX?: string;
+  /** "true" runs the manifest reconcile job from the minute cron. */
+  PIPELINE_RECONCILE_ENABLED?: string;
+  /** Reconcile look-back window in minutes (default 15). */
+  PIPELINE_RECONCILE_LOOKBACK_MINUTES?: string;
 }
 
 export interface Variables {

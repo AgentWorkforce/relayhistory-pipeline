@@ -1,9 +1,3 @@
-// Provenance: verbatim copy of relayhistory-cloud
-// packages/relayhistory/src/lib/scrub.ts at 8603c141bf7dfcd67687db1e5f02e48c1eb2ef61
-// (last changed upstream in cdc55a6, "feat(scrub): rules v2", #179; identical at the
-// PR #211 head). It exists here because lib/pipeline/trace.ts imports `scrubText`
-// from "../scrub.js". Everything below this header is unchanged; fix it upstream.
-
 const REDACTED = "[REDACTED]";
 
 type Replacement =
