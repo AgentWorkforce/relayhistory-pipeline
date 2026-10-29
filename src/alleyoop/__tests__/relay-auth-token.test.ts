@@ -88,6 +88,25 @@ describe("RelayAuth assertion provider", () => {
     await expect(provider.get()).rejects.toMatchObject({ code: "relayauth_http_403", retryable: false });
     await expect(provider.get()).rejects.not.toThrow(/rak_super_secret|server leaked/);
   });
+
+  test("refuses to send the mint key over remote plain HTTP", () => {
+    expect(() => new RelayAuthAssertionProvider({
+      baseUrl: "http://relayauth.example",
+      historyOrigin: "https://history.example",
+      orgId: "org",
+      workspaceId: "workspace",
+      sponsorId: "user",
+      apiKey: async () => "rak_test_only_not_a_real_key",
+    })).toThrow(/must use https/);
+    expect(() => new RelayAuthAssertionProvider({
+      baseUrl: "http://127.0.0.1:8787",
+      historyOrigin: "https://history.example",
+      orgId: "org",
+      workspaceId: "workspace",
+      sponsorId: "user",
+      apiKey: async () => "rak_test_only_not_a_real_key",
+    })).not.toThrow();
+  });
 });
 
 describe("RelayAuth API key command", () => {

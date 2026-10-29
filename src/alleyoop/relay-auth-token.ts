@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 export interface BearerTokenProvider {
   get(): Promise<string>;
@@ -69,6 +70,9 @@ export class RelayAuthAssertionProvider implements BearerTokenProvider {
     if (baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash) {
       throw new Error("96bulls: RELAYAUTH_URL must not contain credentials, query or fragment");
     }
+    if (baseUrl.protocol !== "https:" && !(baseUrl.protocol === "http:" && LOOPBACK_HOSTS.has(baseUrl.hostname))) {
+      throw new Error("96bulls: RELAYAUTH_URL must use https (plain http is loopback-only)");
+    }
     if (historyOrigin.origin !== cfg.historyOrigin || historyOrigin.pathname !== "/") {
       throw new Error("96bulls: RELAYAUTH_HISTORY_ORIGIN must be an exact bare origin");
     }
@@ -106,6 +110,8 @@ export class RelayAuthAssertionProvider implements BearerTokenProvider {
     const response = await this.#cfg.fetcher(`${this.#cfg.baseUrl}/v1/tokens/relayhistory-assertion`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": apiKey },
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
       body: JSON.stringify({
         orgId: this.#cfg.orgId,
         workspaceId: this.#cfg.workspaceId,
