@@ -15,12 +15,12 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateLocalKeys, mintToken } from "../alleyoop/auth.ts";
 import { seedConcourse } from "../concourse/seed.ts";
-import { HOOPDB_NAME, HOOPDB_USER, NAMES, PORTS, TENANT, summaryKeyPath } from "../../stacks/local/topology.ts";
+import { HOOPDB_NAME, HOOPDB_USER, NAMES, PORTS, SERVICES_CONTAINER_UID, TENANT, summaryKeyAccess, summaryKeyPath } from "../../stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const args = process.argv.slice(2);
@@ -66,9 +66,18 @@ interface Inputs {
  */
 function ensureSummaryKey(stage: string): void {
   const path = summaryKeyPath(stage);
-  if (existsSync(path)) return;
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  writeFileSync(path, `local-${randomBytes(4).toString("hex")}:${randomBytes(32).toString("hex")}\n`, { mode: 0o600 });
+  chmodSync(dirname(path), 0o700);
+  if (!existsSync(path))
+    writeFileSync(path, `local-${randomBytes(4).toString("hex")}:${randomBytes(32).toString("hex")}\n`, { mode: 0o600 });
+  const access = summaryKeyAccess(process.getuid?.() ?? SERVICES_CONTAINER_UID);
+  chmodSync(path, access.mode);
+  if (access.aclReadForUid !== undefined) {
+    // The container user (bun) is not this uid: grant it read with one ACL entry, nothing broader.
+    const r = spawnSync("setfacl", ["-m", `u:${access.aclReadForUid}:r`, path], { stdio: "ignore" });
+    if (r.status !== 0)
+      die(`cannot grant the container user (uid ${access.aclReadForUid}) read access to ${path}: setfacl failed or ACLs are unsupported. Run as uid ${access.aclReadForUid} or install acl; the key is never made world-readable.`);
+  }
 }
 
 function stageDir(stage: string) {
