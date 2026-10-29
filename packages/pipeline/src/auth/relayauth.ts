@@ -1,4 +1,4 @@
-// Copied verbatim from AgentWorkforce/relayhistory-cloud packages/relayhistory/src/auth/relayauth.ts at 6f6d568849c483be8e3a2a5aaeba3da1d4b47de9 (96BullSessions stand-in; see MOVE_NOTES.md).
+// Copied from AgentWorkforce/relayhistory-cloud packages/relayhistory/src/auth/relayauth.ts at 6f6d568849c483be8e3a2a5aaeba3da1d4b47de9 (96BullSessions stand-in; one change: an unknown kid refetches the JWKS, see getJwks; MOVE_NOTES.md).
 import { analyticsFromVerifiedAssertion } from "./analytics-identity.js";
 import type { AuthContext, Bindings } from "../env.js";
 import {
@@ -157,8 +157,15 @@ async function importVerificationKey(
   jwksUrl: string,
   kid: string,
 ): Promise<CryptoKey> {
-  const jwks = await getJwks(jwksUrl);
-  const jwk = jwks.keys?.find((candidate) => candidate.kid === kid);
+  let jwks = await getJwks(jwksUrl);
+  let jwk = jwks.keys?.find((candidate) => candidate.kid === kid);
+  // 96BullSessions change: a kid we have not seen may be a rotated key. Refetch
+  // the set once (rate-limited per URL) instead of rejecting until restart.
+  if (!jwk && Date.now() - (jwksFetchedAt.get(jwksUrl) ?? 0) > JWKS_REFRESH_MIN_MS) {
+    jwksCache.delete(jwksUrl);
+    jwks = await getJwks(jwksUrl);
+    jwk = jwks.keys?.find((candidate) => candidate.kid === kid);
+  }
   if (!jwk) {
     throw new IdentityError("invalid_token", "unknown jwt kid");
   }
@@ -178,6 +185,9 @@ async function importVerificationKey(
   );
 }
 
+const jwksFetchedAt = new Map<string, number>();
+const JWKS_REFRESH_MIN_MS = 30_000;
+
 async function getJwks(jwksUrl: string): Promise<JsonWebKeySet> {
   const cached = jwksCache.get(jwksUrl);
   if (cached) {
@@ -191,6 +201,7 @@ async function getJwks(jwksUrl: string): Promise<JsonWebKeySet> {
     return (await response.json()) as JsonWebKeySet;
   });
   jwksCache.set(jwksUrl, jwksPromise);
+  jwksFetchedAt.set(jwksUrl, Date.now());
   try {
     return await jwksPromise;
   } catch (error) {

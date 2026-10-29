@@ -43,6 +43,10 @@ export async function buildIngestApp() {
     RELAYAUTH_AUDIENCE: optional("AUTH_AUDIENCE", "relayhistory"),
     RELAYAUTH_JWKS_URL: optional("RELAYAUTH_JWKS_URL", `http://127.0.0.1:${port}/.well-known/jwks.json`),
     ...(process.env.PIPELINE_OPS_SECRET ? { PIPELINE_OPS_SECRET: process.env.PIPELINE_OPS_SECRET } : {}),
+    // Hosted/customer installs on a shared RelayAuth issuer: set RELAYHISTORY_ORIGIN so only
+    // assertions minted for this deployment's origin are accepted (legacy shared audience refused).
+    ...(process.env.RELAYHISTORY_ORIGIN ? { RELAYHISTORY_ORIGIN: process.env.RELAYHISTORY_ORIGIN } : {}),
+    ...(process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS ? { RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS: process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS } : {}),
   }) as unknown as Bindings;
   if (!jwks && !process.env.RELAYAUTH_JWKS_URL) throw new Error("96bulls: ingest needs JWKS_JSON, JWT_PRIVATE_KEY_PEM or RELAYAUTH_JWKS_URL");
 

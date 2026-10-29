@@ -3,7 +3,6 @@
 # (packages/pipeline, packages/object-store); no vendored sources are needed.
 FROM oven/bun:1.4.2-slim AS base
 WORKDIR /app
-ENV NODE_ENV=production
 COPY package.json bun.lock tsconfig.json ./
 COPY packages/pipeline/package.json packages/pipeline/
 COPY packages/object-store/package.json packages/object-store/
@@ -14,6 +13,8 @@ COPY supabase supabase
 COPY src src
 COPY stacks stacks
 COPY docker/entrypoint.sh /entrypoint.sh
+# Dev dependencies (tsc) are needed for the object-store build above; production mode starts here.
+ENV NODE_ENV=production
 RUN chmod +x /entrypoint.sh && mkdir -p /telemetry /concourse && chown -R bun:bun /app /telemetry /concourse
 USER bun
 ENV OTEL_EXPORTER_OTLP_ENDPOINT=http://96b-otel-collector:4318

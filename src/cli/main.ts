@@ -13,6 +13,7 @@
  * cleared by Khaliq (docs/aws-stage.md).
  */
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -121,7 +122,15 @@ function preflight() {
   const checks: Array<[string, () => boolean]> = [
     ["docker daemon", () => docker("info", "--format", "{{.ServerVersion}}").status === 0],
     ["alchemy cli", () => existsSync(join(ROOT, "node_modules/alchemy/package.json"))],
-    ["workspace installed", () => existsSync(join(ROOT, "packages/pipeline/node_modules/hono/package.json"))],
+    ["workspace installed", () => {
+      // Resolve as the runtime does: Bun may hoist hono to the root or nest it under the package.
+      try {
+        createRequire(join(ROOT, "packages/pipeline/package.json")).resolve("hono");
+        return true;
+      } catch {
+        return false;
+      }
+    }],
     ["ai-hist built (vendor/relayhistory)", () => existsSync(join(ROOT, "vendor/relayhistory/target/release/ai-hist")) || Boolean(process.env.AI_HIST_BIN)],
   ];
   for (const [label, ok] of checks) if (!ok()) die(`preflight failed: ${label}`);
