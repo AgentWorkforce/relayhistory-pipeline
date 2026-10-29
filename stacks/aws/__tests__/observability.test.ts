@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { OTEL_ENDPOINT, OTEL_SERVICE_ACCOUNT, eksChartValues } from "../eks.ts";
+import { OTEL_ENDPOINT, OTEL_SERVICE_ACCOUNT, eksChartValues, telemetryPolicy } from "../eks.ts";
 
 const values = eksChartValues(
   {
@@ -24,15 +24,29 @@ describe("AWS observability values", () => {
     expect(values.otel.fullnameOverride).toBe(OTEL_SERVICE_ACCOUNT);
   });
 
-  it("exports traces to X-Ray in the environment region", () => {
-    expect(values.otel.config.exporters.awsxray.region).toBe("us-west-2");
+  it("archives lossless OTLP traces under the encrypted telemetry prefix", () => {
+    const exporter = values.otel.config.exporters["awss3/traces"];
+    expect(exporter.s3uploader).toMatchObject({
+      region: "us-west-2",
+      s3_bucket: "96bulls-locker",
+      s3_base_prefix: "telemetry",
+      s3_prefix: "traces",
+    });
+    expect(exporter.marshaler).toBe("otlp_json");
     expect(values.otel.config.service.pipelines.traces).toEqual({
       receivers: ["otlp"],
-      processors: ["memory_limiter", "batch"],
-      exporters: ["awsxray"],
+      processors: ["memory_limiter", "attributes/drop_forbidden", "redaction", "batch"],
+      exporters: ["awss3/traces"],
     });
-    expect(values.otel.config.exporters.awsxray.indexed_attributes).toContain("session_uuid");
-    expect(values.otel.config.exporters.awsxray.indexed_attributes).toContain("stage");
+    expect(JSON.stringify(values.otel.config)).not.toContain("awsxray");
+  });
+
+  it("redacts secret-shaped values and drops content-bearing attributes before persistence", () => {
+    expect(values.otel.config.processors.redaction.allow_all_keys).toBe(true);
+    expect(values.otel.config.processors.redaction.blocked_values).toContain("AKIA[0-9A-Z]{16}");
+    expect(values.otel.config.processors["attributes/drop_forbidden"].actions.map((a) => a.key).sort()).toEqual(
+      ["body", "message", "path", "prompt", "summary"],
+    );
   });
 
   it("does not place runtime secrets or static AWS credentials in chart values", () => {
@@ -40,5 +54,14 @@ describe("AWS observability values", () => {
     expect(rendered).not.toMatch(/access.?key|secret.?access|summary-master-keys/i);
     expect(values.worker.locker.credentials.mode).toBe("podIdentity");
     expect(values.alleyoop.locker.credentials.mode).toBe("podIdentity");
+  });
+
+  it("gives the collector write-only access to telemetry objects", () => {
+    const policy = telemetryPolicy({ lockerBucketArn: "arn:aws:s3:::locker", lockerKmsKeyArn: "arn:aws:kms:us-west-2:1:key/k" });
+    const actions = policy.Statement.flatMap((s) => s.Action);
+    expect(actions).toContain("s3:PutObject");
+    expect(actions).not.toContain("s3:GetObject");
+    expect(actions).not.toContain("s3:DeleteObject");
+    expect(policy.Statement[0]!.Resource).toEqual(["arn:aws:s3:::locker/telemetry/*"]);
   });
 });

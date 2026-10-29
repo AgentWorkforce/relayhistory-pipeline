@@ -10,6 +10,7 @@ import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BasicTracerProvider, BatchSpanProcessor, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { scrubText } from "@rhc/lib/scrub.ts";
 import { ALLOWED_LOG_FIELDS, log } from "./log.ts";
 
 let provider: BasicTracerProvider | undefined;
@@ -55,7 +56,8 @@ export function spanAttrs(fields: Record<string, unknown>): Record<string, strin
   const out: Record<string, string | number | boolean> = {};
   for (const [k, v] of Object.entries(fields)) {
     if (!ALLOWED_LOG_FIELDS.has(k) || v === undefined || v === null) continue;
-    if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") out[k] = v;
+    if (typeof v === "string") out[k] = scrubText(v).slice(0, 256);
+    else if (typeof v === "number" || typeof v === "boolean") out[k] = v;
   }
   return out;
 }

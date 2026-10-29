@@ -174,14 +174,21 @@ summary and rebuilds each as an encrypted object.
 
 The EKS stage enables the umbrella chart's pinned OpenTelemetry contrib
 collector and points every 96Bulls service at its in-cluster OTLP/HTTP Service.
-The collector exports traces to AWS X-Ray. It has its own EKS Pod Identity role
-with only `xray:PutTraceSegments` and `xray:PutTelemetryRecords`; it cannot read
-the Locker bucket or decrypt Locker objects. X-Ray indexes the allowlisted
-customer-safe identifiers needed to follow one trace (`deployment_id`,
-`session_uuid`, `tenant_id`, `workspace_id`, stage/status/error codes).
+The collector stores gzip-compressed, lossless OTLP/JSON trace batches under the
+Locker bucket's encrypted `telemetry/traces/` prefix. It has its own EKS Pod
+Identity role with only `s3:PutObject`, multipart-abort and KMS encrypt/data-key
+permissions; it cannot read or delete telemetry or session objects. The
+collector repeats the service allowlist safeguards: it drops content-bearing
+attributes and masks secret-shaped values before persistence.
 
-The AWS proof must show the exact planted trace in X-Ray as well as the durable
-`pipeline_events` rows in HoopDb. It must also scan the retrieved trace data and
-service logs for the planted secrets, content marker and prompt text, matching
-the local smoke test. Metrics/SLO alarms and a durable hosted stdout log backend
-remain separate follow-up work; do not claim those are present.
+The S3 archive deliberately preserves the canonical UUIDv7 W3C trace id. Do not
+substitute the X-Ray exporter without a separate id mapping: X-Ray interprets a
+trace id's first 32 bits as epoch seconds, which is incompatible with UUIDv7's
+48-bit millisecond prefix.
+
+The AWS proof must retrieve the exact planted UUIDv7 trace from that archive as
+well as the durable `pipeline_events` rows in HoopDb. It must also scan the
+retrieved trace data and service logs for the planted secrets, content marker
+and prompt text, matching the local smoke test. Metrics/SLO alarms and a durable
+hosted stdout log backend remain separate follow-up work; do not claim those
+are present.

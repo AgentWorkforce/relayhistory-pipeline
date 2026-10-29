@@ -51,6 +51,24 @@ export interface EksStageInputs {
 export const OTEL_SERVICE_ACCOUNT = "otel-collector";
 export const OTEL_ENDPOINT = "http://otel-collector:4318";
 
+export function telemetryPolicy(i: Pick<EksStageInputs, "lockerBucketArn" | "lockerKmsKeyArn">) {
+  return {
+    Version: "2012-10-17" as const,
+    Statement: [
+      {
+        Effect: "Allow" as const,
+        Action: ["s3:PutObject", "s3:AbortMultipartUpload"],
+        Resource: [`${i.lockerBucketArn}/telemetry/*`],
+      },
+      {
+        Effect: "Allow" as const,
+        Action: ["kms:Encrypt", "kms:GenerateDataKey*", "kms:DescribeKey"],
+        Resource: [i.lockerKmsKeyArn],
+      },
+    ],
+  };
+}
+
 /**
  * Values kept as a pure function so the AWS observability contract can be
  * tested without loading either the AWS or Kubernetes providers.
@@ -94,14 +112,46 @@ export function eksChartValues(
       config: {
         exporters: {
           nop: {},
-          awsxray: {
-            region: i.lockerRegion,
-            indexed_attributes: ["service.name", "deployment_id", "session_uuid", "tenant_id", "workspace_id", "stage", "status", "error_code"],
+          "awss3/traces": {
+            s3uploader: {
+              region: i.lockerRegion,
+              s3_bucket: i.lockerBucket,
+              s3_base_prefix: "telemetry",
+              s3_prefix: "traces",
+              s3_partition_timezone: "UTC",
+              unique_key_func_name: "uuidv7",
+              compression: "gzip",
+            },
+            marshaler: "otlp_json",
+            timeout: "20s",
+            sending_queue: { enabled: true, num_consumers: 2, queue_size: 100 },
+          },
+        },
+        processors: {
+          "attributes/drop_forbidden": {
+            actions: ["prompt", "summary", "message", "path", "body"].map((key) => ({ key, action: "delete" })),
+          },
+          redaction: {
+            allow_all_keys: true,
+            blocked_values: [
+              "AKIA[0-9A-Z]{16}",
+              "ASIA[0-9A-Z]{16}",
+              "sk-[A-Za-z0-9_-]{16,}",
+              "xox[abpr]-[A-Za-z0-9-]{10,}",
+              "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+              "eyJ[A-Za-z0-9_-]{10,}[.][A-Za-z0-9_-]{10,}[.][A-Za-z0-9_-]{10,}",
+              "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}",
+            ],
+            summary: "silent",
           },
         },
         service: {
           pipelines: {
-            traces: { receivers: ["otlp"], processors: ["memory_limiter", "batch"], exporters: ["awsxray"] },
+            traces: {
+              receivers: ["otlp"],
+              processors: ["memory_limiter", "attributes/drop_forbidden", "redaction", "batch"],
+              exporters: ["awss3/traces"],
+            },
             // The services currently emit traces; keep unused signals explicit and non-exporting.
             metrics: { receivers: ["otlp"], processors: ["memory_limiter", "batch"], exporters: ["nop"] },
             logs: { receivers: ["otlp"], processors: ["memory_limiter", "batch"], exporters: ["nop"] },
@@ -176,20 +226,18 @@ export const eksStage = (i: EksStageInputs) =>
       });
     }
 
-    // A separate role keeps the collector unable to read Locker data. X-Ray's
-    // write APIs do not support resource-level ARNs, so Resource must be "*".
+    // A separate role keeps the collector unable to read Locker data. It can
+    // append encrypted OTLP batches under one telemetry prefix, but cannot read
+    // or delete either telemetry or session objects.
     const telemetryRole = yield* AWS.IAM.Role("telemetry-role", {
       roleName: `96bulls-${i.stage}-telemetry`,
-      description: `96bulls ${i.stage}: OpenTelemetry collector writes traces to X-Ray`,
+      description: `96bulls ${i.stage}: OpenTelemetry collector writes trace batches to S3`,
       assumeRolePolicyDocument: {
         Version: "2012-10-17",
         Statement: [{ Effect: "Allow", Principal: { Service: "pods.eks.amazonaws.com" }, Action: ["sts:AssumeRole", "sts:TagSession"] }],
       },
       inlinePolicies: {
-        xray: {
-          Version: "2012-10-17",
-          Statement: [{ Effect: "Allow", Action: ["xray:PutTraceSegments", "xray:PutTelemetryRecords"], Resource: "*" }],
-        },
+        telemetry: telemetryPolicy(i),
       },
       maxSessionDuration: "1 hour",
       ...(i.permissionsBoundaryArn ? { permissionsBoundary: i.permissionsBoundaryArn } : {}),
