@@ -1000,6 +1000,93 @@ describe("trace summary hardening", () => {
     expect(same.verdict).toBe("indexed");
   });
 
+  it("lets a later manifest decide even when an earlier one has a higher revision", () => {
+    const summary = summarizeTrace("t", [
+      ev(
+        "object-landed",
+        "ok",
+        0,
+        { work_key: "a/manifest.json@v5", revision: 5 },
+        "sa",
+      ),
+      ev(
+        "session-indexed",
+        "ok",
+        10,
+        { work_key: "a/manifest.json@v5", revision: 5 },
+        "ia",
+      ),
+      ev(
+        "object-landed",
+        "ok",
+        20,
+        { work_key: "b/manifest.json@v1", revision: 1 },
+        "sb",
+      ),
+    ]);
+    expect(summary.verdict).toBe("stored");
+    // And its failure is not hidden by the other manifest's success.
+    const failed = summarizeTrace("t", [
+      ev(
+        "object-landed",
+        "ok",
+        0,
+        { work_key: "a/manifest.json@v5", revision: 5 },
+        "sa",
+      ),
+      ev(
+        "session-indexed",
+        "ok",
+        10,
+        { work_key: "a/manifest.json@v5", revision: 5 },
+        "ia",
+      ),
+      ev(
+        "object-landed",
+        "dead_lettered",
+        20,
+        { work_key: "b/manifest.json@v1", revision: 1 },
+        "sb",
+      ),
+    ]);
+    expect(failed.verdict).toBe("failed");
+  });
+
+  it("lets a manifest's next version decide after another manifest's work", () => {
+    // A, then B, then A again: A's newer version is the newest work.
+    const failed = summarizeTrace("t", [
+      ev("object-landed", "ok", 0, { work_key: "a/manifest.json@v1" }, "a1"),
+      ev("object-landed", "ok", 10, { work_key: "b/manifest.json@v1" }, "b1"),
+      ev("session-indexed", "ok", 15, { work_key: "b/manifest.json@v1" }, "ib"),
+      ev(
+        "object-landed",
+        "dead_lettered",
+        20,
+        { work_key: "a/manifest.json@v2" },
+        "a2",
+      ),
+    ]);
+    expect(failed.verdict).toBe("failed");
+    const deleted = summarizeTrace("t", [
+      ev("session-indexed", "ok", 0, { work_key: "a/manifest.json@v1" }, "ia1"),
+      ev(
+        "session-indexed",
+        "ok",
+        10,
+        { work_key: "b/manifest.json@v1" },
+        "ib1",
+      ),
+      ev(
+        "session-indexed",
+        "ok",
+        20,
+        { work_key: "a/manifest.json@deleted", deleted: true },
+        "ia2",
+      ),
+    ]);
+    expect(deleted.verdict).toBe("deleted");
+  });
+
   it("does not report an upload while any chunk's put failed", () => {
     const summary = summarizeTrace("t", [
       ev("deliver.put", "ok", 0, { chunk: "c1" }, "p1"),
@@ -1419,6 +1506,21 @@ describe("client event reports", () => {
     ).toBe(200);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(sink.events[0]!.attrs.destination).toBe("relayhistory");
+  });
+
+  it("flushes each recorder's log export after recording", async () => {
+    const flush = vi.spyOn(PipelineRecorder.prototype, "flush");
+    const { post } = reporter();
+    const traceId = uuidv7();
+    expect(
+      (
+        await post([
+          { traceId, stage: "ingest", status: "ok" },
+          { traceId, stage: "fetch", status: "ok" },
+        ])
+      ).status,
+    ).toBe(200);
+    expect(flush).toHaveBeenCalledTimes(2);
   });
 
   it("writes nothing from a batch that fails validation", async () => {

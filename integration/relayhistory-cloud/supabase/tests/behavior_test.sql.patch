@@ -1,5 +1,5 @@
 diff --git a/supabase/tests/behavior_test.sql b/supabase/tests/behavior_test.sql
-index 43eb6c64..9e70cc14 100644
+index 43eb6c6..9e70cc1 100644
 --- a/supabase/tests/behavior_test.sql
 +++ b/supabase/tests/behavior_test.sql
 @@ -213,20 +213,20 @@ DO $$

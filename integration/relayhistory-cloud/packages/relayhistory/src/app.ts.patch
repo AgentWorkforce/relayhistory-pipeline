@@ -1,5 +1,5 @@
 diff --git a/packages/relayhistory/src/app.ts b/packages/relayhistory/src/app.ts
-index 5d542245..e7085726 100644
+index 5d54224..e708572 100644
 --- a/packages/relayhistory/src/app.ts
 +++ b/packages/relayhistory/src/app.ts
 @@ -2,6 +2,7 @@ import { Hono } from "hono";

@@ -280,14 +280,18 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
         },
       });
     }
-    const recorded = accepted.map(({ ctx, stage, status, options }) =>
-      new PipelineRecorder(ctx, {
-        sink,
-        logger: loggerEnvFromBindings(env),
-      }).record(stage, status, options),
+    const recorders = accepted.map(
+      ({ ctx }) =>
+        new PipelineRecorder(ctx, { sink, logger: loggerEnvFromBindings(env) }),
     );
-    await Promise.all(recorded);
-    return c.json({ recorded: recorded.length });
+    await Promise.all(
+      accepted.map(({ stage, status, options }, index) =>
+        recorders[index]!.record(stage, status, options),
+      ),
+    );
+    // A configured log export must finish after the response, not be cancelled.
+    waitUntil(c, Promise.allSettled(recorders.map((r) => r.flush())));
+    return c.json({ recorded: recorders.length });
   });
 
   return routes;

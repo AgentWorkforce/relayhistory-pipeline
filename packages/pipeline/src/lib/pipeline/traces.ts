@@ -136,21 +136,38 @@ function fold(entry: StageSummary, event: PipelineEvent) {
 }
 
 /**
- * The newest unit of work: highest manifest revision when the events carry one.
- * Without revisions, the one first seen last (insertion order), which is right
- * unless an older version's work starts after a newer one's.
+ * The newest unit of work. Revisions count per manifest, so they only order
+ * versions of one manifest (the work key minus `@<version>`); a version
+ * without a revision is newer if first seen later. Between manifests, the one
+ * whose chosen version first appeared last decides: another machine's
+ * manifest at revision 1 is not older than this one's revision 5, and this
+ * one's next version after it is newer again.
  */
 function newestWork(
   items: StageSummary[],
   revisions: Map<StageSummary, number>,
+  workKeys: Map<StageSummary, string>,
 ): StageSummary {
-  return items.reduce((a, b) => {
-    const ra = revisions.get(a);
-    const rb = revisions.get(b);
-    if (ra !== undefined && rb !== undefined && ra !== rb)
-      return rb > ra ? b : a;
-    return b;
-  });
+  // `items` is in first-seen order: a version's position is when it appeared.
+  const seen = new Map(items.map((item, index) => [item, index]));
+  const byManifest = new Map<string, StageSummary>();
+  for (const item of items) {
+    const manifest = manifestOf(workKeys.get(item) ?? "");
+    const current = byManifest.get(manifest);
+    const ra = current && revisions.get(current);
+    const rb = revisions.get(item);
+    byManifest.set(
+      manifest,
+      current && ra !== undefined && rb !== undefined && ra !== rb && ra > rb
+        ? current
+        : item,
+    );
+  }
+  // Between manifests, by when each one's chosen version appeared (not when
+  // the manifest first did): A@v2 after B@v1 is newer than B@v1.
+  return [...byManifest.values()].reduce((a, b) =>
+    seen.get(b)! > seen.get(a)! ? b : a,
+  );
 }
 
 /** Stages whose failure means the upload did not land. Transform and fetch are not among them. */
@@ -227,7 +244,11 @@ export function summarizeTrace(
     // session work (only its manifest is), so it decides only when it is all
     // there is; any other skip (a disabled transform) is a real, current state.
     const deciding = all.filter((item) => !chunkSkips.has(item));
-    const latest = newestWork(deciding.length ? deciding : all, revisions);
+    const latest = newestWork(
+      deciding.length ? deciding : all,
+      revisions,
+      workKeys,
+    );
     latestWork.set(stage, latest);
     stages[stage] = {
       ...latest,
@@ -294,7 +315,7 @@ export function summarizeTrace(
   else if (ok("session-indexed"))
     // The index's own newest success decides deleted vs indexed: the storage
     // event is best effort and may be missing or behind.
-    verdict = deletes.has(newestWork(indexOk, revisions))
+    verdict = deletes.has(newestWork(indexOk, revisions, workKeys))
       ? "deleted"
       : "indexed";
   else if (deadRequired) verdict = "failed";

@@ -1,5 +1,5 @@
 diff --git a/packages/relayhistory/src/middleware/observability.ts b/packages/relayhistory/src/middleware/observability.ts
-index b2a2a8df..3943119e 100644
+index b2a2a8d..3943119 100644
 --- a/packages/relayhistory/src/middleware/observability.ts
 +++ b/packages/relayhistory/src/middleware/observability.ts
 @@ -118,6 +118,7 @@ export const observability = createMiddleware<AppEnv>(async (c, next) => {

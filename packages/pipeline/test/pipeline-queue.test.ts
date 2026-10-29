@@ -20,6 +20,9 @@ import {
 import type { Bindings } from "../src/env.js";
 import {
   cloudflarePipelineQueue,
+  InMemoryDeadLetterStore,
+  PipelineRecorder,
+  STORE_TIMEOUT_MS,
   InMemoryPipelineEventSink,
   isQueuedStage,
   manifestWorkKey,
@@ -231,6 +234,46 @@ describe("object-landed fan-out", () => {
       reason: "stale_revision",
     });
     expect(seen).toEqual([body.ctx]);
+  });
+});
+
+describe("replay and log exports", () => {
+  it("sends every letter even when a log export stalls, and returns within the deadline", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      vi.spyOn(PipelineRecorder.prototype, "flush").mockImplementation(
+        () => new Promise<void>(() => {}),
+      );
+      const deadLetters = new InMemoryDeadLetterStore();
+      for (const key of ["one", "two", "three"])
+        await deadLetters.quarantine(
+          message("session-indexed", key),
+          new Date(),
+        );
+      const sent: string[] = [];
+      let done = false;
+      const replay = replayDeadLetters(
+        {
+          deadLetters,
+          send: async (_stage, body) => {
+            sent.push(body.workKey);
+          },
+          sink: new InMemoryPipelineEventSink(),
+        },
+        { dryRun: false },
+      ).then((result) => {
+        done = true;
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      // Every send happened while the exports hang.
+      expect(sent.sort()).toEqual(["one", "three", "two"]);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(STORE_TIMEOUT_MS);
+      expect((await replay).sent).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -594,12 +637,12 @@ describe("postgres backend", () => {
     const deps = postgresDeps({ "session-indexed": async () => {} });
     await postgresPipelineQueue(db).send(a);
     await pollPostgresStage({ sql: db, stage: "session-indexed", deps });
+    // Both died in the same millisecond, so list order is not the point.
     expect(
-      (await store.list({})).map((l) => [l.message.ctx.orgId, l.state]),
-    ).toEqual([
-      [ORG, "resolved"],
-      ["org_other", "dead"],
-    ]);
+      Object.fromEntries(
+        (await store.list({})).map((l) => [l.message.ctx.orgId, l.state]),
+      ),
+    ).toEqual({ [ORG]: "resolved", org_other: "dead" });
   });
 
   it("dead-letters a job whose consumers keep dying instead of running it forever", async () => {

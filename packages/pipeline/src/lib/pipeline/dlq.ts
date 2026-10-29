@@ -17,7 +17,11 @@
  * Queue names: `relayhistory-pipeline-<stage with dashes>[-<stage suffix>]`,
  * DLQ `<name>-dlq`. Nothing here creates or changes a live queue.
  */
-import { PipelineRecorder, type PipelineEventSink } from "./events.js";
+import {
+  PipelineRecorder,
+  STORE_TIMEOUT_MS,
+  type PipelineEventSink,
+} from "./events.js";
 import { pipelineErrorInfo, type ErrorReporter } from "./errors.js";
 import type { LoggerEnv } from "../logger.js";
 import {
@@ -462,6 +466,18 @@ export async function handleStageQueue(
   }
 }
 
+/** Waits for `work` to settle, but never longer than `ms`. */
+async function settleWithin(work: Promise<unknown>[], ms: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.allSettled(work),
+    new Promise((resolve) => {
+      timer = setTimeout(resolve, ms);
+    }),
+  ]);
+  clearTimeout(timer);
+}
+
 /** How long a replay claim holds before a plain replay may take the letter again. */
 export const REPLAY_LEASE_MS = 60 * 60 * 1000;
 
@@ -540,6 +556,7 @@ export async function replayDeadLetters(
     skipped: [],
   };
   if (dryRun) return result;
+  const flushes: Promise<void>[] = [];
   for (const letter of letters) {
     let claimed: boolean;
     try {
@@ -590,6 +607,10 @@ export async function replayDeadLetters(
       key: `${letter.message.workKey}:${replayId}`,
       now,
     });
+    flushes.push(recorder.flush());
   }
+  // Log exports never hold up a send: they run beside the loop and get one
+  // bounded wait at the end, so a stalled export cannot stall the replay.
+  await settleWithin(flushes, STORE_TIMEOUT_MS);
   return result;
 }

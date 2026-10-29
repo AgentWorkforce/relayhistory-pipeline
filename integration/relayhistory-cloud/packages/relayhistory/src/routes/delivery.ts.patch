@@ -1,5 +1,5 @@
 diff --git a/packages/relayhistory/src/routes/delivery.ts b/packages/relayhistory/src/routes/delivery.ts
-index b490cbe3..27eed0cc 100644
+index b490cbe..27eed0c 100644
 --- a/packages/relayhistory/src/routes/delivery.ts
 +++ b/packages/relayhistory/src/routes/delivery.ts
 @@ -22,6 +22,7 @@ import {

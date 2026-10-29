@@ -1,5 +1,5 @@
 diff --git a/supabase/tests/run.sh b/supabase/tests/run.sh
-index 5cc0f167..635ca6e5 100755
+index 5cc0f16..635ca6e 100755
 --- a/supabase/tests/run.sh
 +++ b/supabase/tests/run.sh
 @@ -26,6 +26,7 @@ psql_ -d "$db" -f tests/behavior_test.sql

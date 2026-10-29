@@ -1,5 +1,5 @@
 diff --git a/packages/relayhistory/src/routes/ingest.ts b/packages/relayhistory/src/routes/ingest.ts
-index 0d0b0845..ab0bfccd 100644
+index 0d0b084..ab0bfcc 100644
 --- a/packages/relayhistory/src/routes/ingest.ts
 +++ b/packages/relayhistory/src/routes/ingest.ts
 @@ -4,7 +4,11 @@ import type { AppEnv } from "../env.js";

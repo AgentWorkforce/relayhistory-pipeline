@@ -1,5 +1,5 @@
 diff --git a/packages/relayhistory/src/api-worker.ts b/packages/relayhistory/src/api-worker.ts
-index e508f5a4..05f632c5 100644
+index e508f5a..05f632c 100644
 --- a/packages/relayhistory/src/api-worker.ts
 +++ b/packages/relayhistory/src/api-worker.ts
 @@ -13,6 +13,13 @@ import {

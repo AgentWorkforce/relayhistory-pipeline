@@ -224,6 +224,9 @@ describe("pipeline_events on the Supabase schema", () => {
       "SELECT sessions.pipeline_events_maintain(p_months_ahead => 4)",
     );
     const later = new Date();
+    // Mid-month first: from the 29th-31st, adding months can roll into the
+    // month after (Oct 29 + 4 months = "Feb 29" = Mar 1), past the partitions.
+    later.setUTCDate(15);
     later.setUTCMonth(later.getUTCMonth() + 4);
     const sink = postgrestPipelineEventSink(options);
     const traceId = uuidv7();

@@ -86,7 +86,7 @@ edited to get there.
 | `src/lib/scrub.ts` | Verbatim upstream file at `8603c14` (last changed in `cdc55a6`, #179), under a provenance header |
 | `src/middleware/auth.ts` | `getAuth` and `requireScope` copied unchanged, and a re-export of `AuthContext`. No token verification: the host app authenticates and sets `auth` on the context |
 | `src/app.ts` | Minimal `createApp({ auth? })`: the `app.ts.patch` id/trace-id middleware echoing `X-Relay-Trace-Id`, one request log line carrying `trace_id` (the `observability.ts.patch` hunk, without upstream's request stats), `/health`, `pipelineOpsRoutes` under `/v1` outside auth, and `pipelineRoutes` under `/v1` behind `auth`. The default `auth` answers 401 unless `auth` is already set |
-| `supabase/migrations/20261025000{000,100,200,300}_*.sql`, `supabase/tests/supabase_shim.sql` | Verbatim from `8603c14`. See `supabase/migrations/README.md` |
+| `supabase/migrations/20261025000{000,100,200,300}_*.sql`, `supabase/tests/supabase_shim.sql` | Verbatim from `8603c14`. See `supabase/README.md` |
 
 Every stand-in file has a header that names the upstream file it replaces and
 says why it exists.
@@ -220,7 +220,7 @@ drops their constraints `pipeline_events_stage_check` /
 **`20261025000000_sessions_index.sql`** on relayhistory-cloud `main`, merged via
 PR #171 (merge commit `51c313fda3c4288cf75f9927c4004fb39b6cd2ee`). That file is
 not part of the #210 diff. It is now vendored verbatim, together with `000100` to
-`000300` and `supabase_shim.sql` (see `supabase/migrations/README.md`).
+`000300` and `supabase_shim.sql` (see `supabase/README.md`).
 
 On relayhistory-cloud main the migration also sorts after `20261025000100_repo_identity.sql`,
 `20261025000200_scrub_quarantine.sql` and `20261025000300_upsert_keep_on_null.sql`.
