@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# sb: run the Supabase CLI (or any command needing SUPABASE_ACCESS_TOKEN) with the
+# token injected by 1Password at exec time. Nothing is written to disk and no
+# saved CLI login is allowed. PLAN/CODE ONLY until the provisioner token exists.
+#
+#   scripts/sb projects list                 # -> op run ... -- supabase projects list
+#   SB_CMD=alchemy scripts/sb plan --stage aws-dev --config stacks/aws/alchemy.aws.run.ts
+#
+# Required env: SB_TOKEN_REF  (an op:// reference, e.g. op://96Bulls-provisioner/supabase-provisioner/token)
+set -euo pipefail
+if [ -f "$HOME/.supabase/access-token" ]; then
+  echo "sb: refusing to run: a saved Supabase login exists at ~/.supabase/access-token. Remove it; tokens live only in 1Password." >&2; exit 3
+fi
+if grep -rqs 'SUPABASE_ACCESS_TOKEN' .env .env.* 2>/dev/null; then
+  echo "sb: refusing to run: SUPABASE_ACCESS_TOKEN found in a .env file. Remove it; tokens live only in 1Password." >&2; exit 3
+fi
+command -v op >/dev/null || { echo "sb: the 1Password CLI (op) is required" >&2; exit 2; }
+: "${SB_TOKEN_REF:?set SB_TOKEN_REF to an op:// reference for the Supabase token}"
+case "$SB_TOKEN_REF" in op://*) ;; *) echo "sb: SB_TOKEN_REF must be an op:// reference, never a literal token" >&2; exit 2 ;; esac
+cmd="${SB_CMD:-supabase}"
+# Never let the CLI persist a credential: `supabase login` writes ~/.supabase/access-token (or the keychain).
+for a in "$@"; do
+  case "$a" in login|logout) echo "sb: '$a' is not allowed; the token is injected per invocation and never saved" >&2; exit 3 ;; esac
+done
+# op run resolves the reference inside the child's environment only; the shell never sees the value.
+exec env SUPABASE_ACCESS_TOKEN="$SB_TOKEN_REF" op run --no-masking=false -- "$cmd" "$@"
