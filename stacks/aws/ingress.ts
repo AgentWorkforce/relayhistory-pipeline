@@ -29,6 +29,13 @@ export interface IngressInputs {
   servicePort: number;
   /** Kubernetes Secret (in kube-system) holding the Cloudflare DNS token under key `token`. */
   cloudflareTokenSecret: string;
+  /**
+   * ACM's DNS validation record for the certificate. Alchemy's ACM resource captures
+   * domainValidationOptions at create time, before ACM populates them, so the record is
+   * read once from ACM (`aws acm describe-certificate`) and passed in. It is stable for
+   * the life of the certificate.
+   */
+  certValidation?: { name: string; value: string };
   tags: Record<string, string>;
 }
 
@@ -46,8 +53,12 @@ export const ingressStage = (i: IngressInputs) =>
     yield* Cloudflare.DNS.Record("ingest-cert-validation", {
       zoneId: i.cloudflareZoneId,
       type: "CNAME",
-      name: Output.map(cert.domainValidationOptions, (o) => (o?.[0]?.ResourceRecord?.Name ?? "").replace(/\.$/, "")) as unknown as string,
-      content: Output.map(cert.domainValidationOptions, (o) => (o?.[0]?.ResourceRecord?.Value ?? "").replace(/\.$/, "")) as unknown as string,
+      name: (i.certValidation
+        ? i.certValidation.name.replace(/\.$/, "")
+        : Output.map(cert.domainValidationOptions, (o) => (o?.[0]?.ResourceRecord?.Name ?? "").replace(/\.$/, ""))) as unknown as string,
+      content: (i.certValidation
+        ? i.certValidation.value.replace(/\.$/, "")
+        : Output.map(cert.domainValidationOptions, (o) => (o?.[0]?.ResourceRecord?.Value ?? "").replace(/\.$/, ""))) as unknown as string,
       ttl: 300,
       proxied: false,
     } as never);

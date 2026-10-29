@@ -118,7 +118,7 @@ export async function buildIngestApp() {
     try {
       const { rows } = await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations");
       const have = new Set(rows.map((r) => r.name));
-      const missing = expected.filter((n) => !have.has(n));
+      const missing = expected.filter((n) => !n.startsWith("shim:") && !have.has(n));
       if (missing.length) return c.json({ ok: false, reason: "schema_pending", count: missing.length }, 503);
       return c.json({ ok: true });
     } catch {

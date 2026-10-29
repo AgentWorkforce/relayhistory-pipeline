@@ -35,7 +35,7 @@ export interface EksStageInputs {
   /** Sandbox stages: every role we create carries this permissions boundary and the bounded tag. */
   permissionsBoundaryArn?: string;
   /** Public hostname for the ingest (Cloudflare DNS). Omit to keep the ingest cluster-internal. */
-  ingress?: { hostname: string; cloudflareZoneId: string; zoneDomain: string; cloudflareTokenSecret: string };
+  ingress?: { hostname: string; cloudflareZoneId: string; zoneDomain: string; cloudflareTokenSecret: string; certValidation?: { name: string; value: string } };
   tags: Record<string, string>;
 }
 
@@ -143,6 +143,7 @@ export const eksStage = (i: EksStageInputs) =>
           serviceName: "96bulls-alleyoop",
           servicePort: 8080,
           cloudflareTokenSecret: i.ingress.cloudflareTokenSecret,
+          ...(i.ingress.certValidation ? { certValidation: i.ingress.certValidation } : {}),
           tags: i.tags,
         })
       : undefined;

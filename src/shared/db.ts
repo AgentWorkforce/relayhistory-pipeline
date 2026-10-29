@@ -54,7 +54,9 @@ export async function waitForSchema(db: HoopDb, expected: string[], timeoutMs = 
         "SELECT name FROM sessions.__96bulls_migrations",
       );
       const have = new Set(rows.map((r) => r.name));
-      if (expected.every((n) => have.has(n))) return;
+      // The Supabase role shim is an optional prerequisite for plain Postgres, not part of the
+      // schema: Supabase (and CNPG) already have the roles, so it is never required here.
+      if (expected.filter((n) => !n.startsWith("shim:")).every((n) => have.has(n))) return;
     } catch {
       // table not there yet
     }
