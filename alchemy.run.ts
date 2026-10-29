@@ -189,12 +189,16 @@ export default Alchemy.Stack(
       CONCOURSE_DB: `${inputs.concourseDir}/history.db`,
       COURIER_STATE: `${inputs.concourseDir}/.alleyoop-courier.json`,
       INGEST_URL: `http://${name(NAMES.ingest)}:8080`,
-      // Short-lived tokens minted per pass from the stack's own key; no 7-day token in the container.
+      // The courier only talks to AlleyOop now; it never receives Locker credentials.
+      LOCKER_ACCESS_KEY_ID: "",
+      LOCKER_SECRET_ACCESS_KEY: "",
+      // Short-lived tokens minted in memory from the stack's own key; no 7-day token in the container.
       JWT_KID: inputs.jwtKid,
       JWT_PRIVATE_KEY_PEM: inputs.jwtPrivateKeyPem,
       AUTH_ISSUER: TENANT.issuer,
       USER_ID: TENANT.userId,
       MACHINE_ID: inputs.machineId,
+      COURIER_START_MODE: "all",
       COURIER_INTERVAL_MS: "5000",
       COURIER_CLOSE_AFTER_MINUTES: "30",
     }, {

@@ -17,7 +17,7 @@ services, same env contract, same migrations.
 | `96b-hoopdb-indexer` | 96bulls/services | stages `object-landed`, `session-indexed` (our index, fans out), 5-minute manifest reconcile |
 | `96b-referee` | 96bulls/services | stage `status-classify` |
 | `96b-bob-costas` | 96bulls/services | stages `summary-short`, `summary-long` |
-| `96b-alleyoop-courier` | 96bulls/services | watches the seeded Concourse, uploads via the chunk hop, writes manifests |
+| `96b-alleyoop-courier` | 96bulls/services | watches the seeded Concourse and uploads chunks plus validated manifests through AlleyOop |
 | `96b-telemetry-init` | alpine | one-shot: opens the telemetry volume for the collector's uid |
 | `96b-otel-collector` | otel/opentelemetry-collector-contrib | OTLP in; spans to `/telemetry/spans.jsonl` (port 14318) |
 
@@ -35,11 +35,15 @@ uses via `/readyz`).
    `/v1/pipeline/chunks` with `traceparent`. The ingest scrubs record by
    record, zstd-compresses and stores the chunk create-only in the Locker with
    scrub metadata. Unscrubbed bytes never touch the Locker.
-3. The courier writes `manifest.json` (validated with the vendored validator,
-   hash chain and all; `extensions["96bulls"]` carries the session uuid) with
-   `x-amz-meta-session-uuid` and `-trace-id`, then POSTs
-   `/v1/pipeline/manifests`. The ingest re-reads the manifest from storage and
-   enqueues `object-landed` into `sessions.pipeline_jobs` with the ids in `ctx`.
+3. The courier builds `manifest.json` (validated with the vendored validator,
+   hash chain and all; `extensions["96bulls"]` carries the session uuid) and
+   POSTs it to `/v1/pipeline/manifests`. AlleyOop validates it again, writes it
+   create-only (or by compare-and-swap for the same writer's next revision)
+   after verifying every referenced chunk carries the server's scrub metadata,
+   restores identity and keyed telemetry object metadata, re-reads the
+   authoritative copy, and enqueues `object-landed` into
+   `sessions.pipeline_jobs` with the ids in `ctx`. The host courier never
+   receives Locker credentials.
 4. The indexer handles `object-landed` (vendored), then `session-indexed`
    (ours): `sessions.upsert_session_index`, `session_index_ext` (session uuid),
    then fans out `summary-short`, `summary-long`, `status-classify`.
@@ -52,20 +56,29 @@ uses via `/readyz`).
 ## Auth, locally
 
 The vendored middleware accepts an RS256 JWT verified against a JWKS URL. `up`
-mints a key pair; the ingest serves `/.well-known/jwks.json`; the courier token
-is in `.96bulls/local/inputs.json`. Hosted and customer installs point
-`RELAYAUTH_JWKS_URL` at RelayAuth instead. `96bulls token local` mints one for
-manual calls.
+mints a key pair; the ingest serves `/.well-known/jwks.json`; the local courier
+mints short-lived tokens in memory. Hosted and customer installs point
+`RELAYAUTH_JWKS_URL` at RelayAuth instead. A durable host courier sets
+`RELAYAUTH_URL`, the exact `RELAYAUTH_HISTORY_ORIGIN`, and
+`RELAYAUTH_API_KEY_COMMAND_JSON`, a JSON argv array that reads the dedicated
+assertion key from a central broker or secret manager. The command is never run
+through a shell, and neither that key nor minted assertions are saved in the
+courier ledger. `96bulls token local` remains available for manual calls.
 
 ## Ports and credentials
 
 Host ports are bound to `127.0.0.1` only; the ingest API is the boundary, and
 HoopDb and the Locker are never reachable from other machines. The courier
-mints a one-hour token per pass from the stack's own key (no long-lived token
-in a container). Its upload ledger (`.alleyoop-courier.json` beside the
-seeded database) survives `down`: ids stay stable, and on the next `up` the
-courier finds its manifests gone from the fresh Locker and re-uploads with the
-same session uuids and trace ids.
+uses short-lived in-memory auth and sends all storage writes through AlleyOop.
+Its upload ledger (`.alleyoop-courier.json` beside the seeded database)
+survives `down`: ids stay stable, and on the next process start the courier
+checks its manifests through the authenticated ingest API and re-uploads
+missing ones with the same session uuids and trace ids. Host enrollment defaults
+to `COURIER_START_MODE=new`, leaving existing sessions local; `all` is the
+explicit backfill mode and is set explicitly by the fixture stack. Fixed bearer
+tokens require `COURIER_ALLOW_FIXED_TOKEN=1`. `JWT_PRIVATE_KEY_PEM` is local
+fixture auth only and is refused in `new` mode unless
+`COURIER_ALLOW_LOCAL_SIGNING_KEY=1` is explicitly set.
 
 ## Known limits
 
