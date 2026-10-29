@@ -169,3 +169,19 @@ Migration 0004 deletes existing `session_summaries` rows, because they hold
 plaintext. They are derived: Bob Costas's summary sweep (at startup, then every
 `SUMMARY_SWEEP_SECONDS`, default 300) re-queues every indexed session without a
 summary and rebuilds each as an encrypted object.
+
+## AWS observability
+
+The EKS stage enables the umbrella chart's pinned OpenTelemetry contrib
+collector and points every 96Bulls service at its in-cluster OTLP/HTTP Service.
+The collector exports traces to AWS X-Ray. It has its own EKS Pod Identity role
+with only `xray:PutTraceSegments` and `xray:PutTelemetryRecords`; it cannot read
+the Locker bucket or decrypt Locker objects. X-Ray indexes the allowlisted
+customer-safe identifiers needed to follow one trace (`deployment_id`,
+`session_uuid`, `tenant_id`, `workspace_id`, stage/status/error codes).
+
+The AWS proof must show the exact planted trace in X-Ray as well as the durable
+`pipeline_events` rows in HoopDb. It must also scan the retrieved trace data and
+service logs for the planted secrets, content marker and prompt text, matching
+the local smoke test. Metrics/SLO alarms and a durable hosted stdout log backend
+remain separate follow-up work; do not claim those are present.

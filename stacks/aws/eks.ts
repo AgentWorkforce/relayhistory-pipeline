@@ -48,6 +48,72 @@ export interface EksStageInputs {
   tags: Record<string, string>;
 }
 
+export const OTEL_SERVICE_ACCOUNT = "otel-collector";
+export const OTEL_ENDPOINT = "http://otel-collector:4318";
+
+/**
+ * Values kept as a pure function so the AWS observability contract can be
+ * tested without loading either the AWS or Kubernetes providers.
+ */
+export function eksChartValues(
+  i: Pick<EksStageInputs, "stage" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "relayhistoryOrigin" | "imageRepository" | "imageDigest">,
+  sandbox: boolean,
+  authIssuer: string,
+  authJwksUrl: string,
+) {
+  return {
+    global: {
+      imageRegistry: "", // the ECR repository below is fully qualified
+      tenant: { orgId: i.tenantOrgId },
+      otel: { endpoint: OTEL_ENDPOINT },
+    },
+    worker: {
+      image: { repository: i.imageRepository, digest: i.imageDigest },
+      hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
+      locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
+      // Supabase already has anon/authenticated/service_role; the plain-Postgres shim is for in-cluster DBs only.
+      migrations: { supabaseShim: sandbox },
+      // The bucket is created and versioned by IaC; the pods' role has no CreateBucket.
+      lockerInit: { enabled: false },
+      deployment: { name: "hosted", id: i.stage },
+      // Bob Costas alone gets the summary master key (src/shared/keyring.ts): worker 0.4.0 projects
+      // this Secret key as a read-only file into Bob Costas only (SUMMARY_MASTER_KEYS_FILE).
+      summaryEncryption: { existingSecret: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" },
+    },
+    alleyoop: {
+      image: { repository: i.imageRepository, digest: i.imageDigest },
+      hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
+      locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
+      auth: { jwksUrl: authJwksUrl, issuer: authIssuer },
+      extraEnv: [{ name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin }],
+      deployment: { name: "hosted", id: i.stage },
+    },
+    otel: {
+      enabled: true,
+      fullnameOverride: "otel-collector",
+      config: {
+        exporters: {
+          nop: {},
+          awsxray: {
+            region: i.lockerRegion,
+            indexed_attributes: ["service.name", "deployment_id", "session_uuid", "tenant_id", "workspace_id", "stage", "status", "error_code"],
+          },
+        },
+        service: {
+          pipelines: {
+            traces: { receivers: ["otlp"], processors: ["memory_limiter", "batch"], exporters: ["awsxray"] },
+            // The services currently emit traces; keep unused signals explicit and non-exporting.
+            metrics: { receivers: ["otlp"], processors: ["memory_limiter", "batch"], exporters: ["nop"] },
+            logs: { receivers: ["otlp"], processors: ["memory_limiter", "batch"], exporters: ["nop"] },
+          },
+        },
+      },
+    },
+    hoopdb: { enabled: sandbox },
+    locker: { enabled: false },
+  };
+}
+
 export const eksStage = (i: EksStageInputs) =>
   Effect.gen(function* () {
     // Refuse before declaring anything billable.
@@ -110,6 +176,33 @@ export const eksStage = (i: EksStageInputs) =>
       });
     }
 
+    // A separate role keeps the collector unable to read Locker data. X-Ray's
+    // write APIs do not support resource-level ARNs, so Resource must be "*".
+    const telemetryRole = yield* AWS.IAM.Role("telemetry-role", {
+      roleName: `96bulls-${i.stage}-telemetry`,
+      description: `96bulls ${i.stage}: OpenTelemetry collector writes traces to X-Ray`,
+      assumeRolePolicyDocument: {
+        Version: "2012-10-17",
+        Statement: [{ Effect: "Allow", Principal: { Service: "pods.eks.amazonaws.com" }, Action: ["sts:AssumeRole", "sts:TagSession"] }],
+      },
+      inlinePolicies: {
+        xray: {
+          Version: "2012-10-17",
+          Statement: [{ Effect: "Allow", Action: ["xray:PutTraceSegments", "xray:PutTelemetryRecords"], Resource: "*" }],
+        },
+      },
+      maxSessionDuration: "1 hour",
+      ...(i.permissionsBoundaryArn ? { permissionsBoundary: i.permissionsBoundaryArn } : {}),
+      tags: { ...i.tags, ...(i.permissionsBoundaryArn ? { "96bulls:bounded": "true" } : {}) },
+    });
+    yield* AWS.EKS.PodIdentityAssociation("pod-identity-otel", {
+      clusterName: cluster.clusterName,
+      namespace: "96bulls",
+      serviceAccount: OTEL_SERVICE_ACCOUNT,
+      roleArn: telemetryRole.roleArn,
+      tags: i.tags,
+    });
+
     // Self-hosted RelayAuth first, so AlleyOop's issuer and JWKS come from this environment.
     const selfAuth = i.relayauth
       ? yield* relayauthStage({ cluster, chartVersion: i.relayauth.chartVersion, secretName: i.relayauth.secretName, clientNamespace: "96bulls" })
@@ -125,40 +218,7 @@ export const eksStage = (i: EksStageInputs) =>
       releaseName: "96bulls",
       namespace: "96bulls",
       createNamespace: true,
-      // Keys per the released umbrella chart (helm-charts 96bulls 0.1.0; worker/alleyoop 0.2.0).
-      values: {
-        global: {
-          imageRegistry: "", // the ECR repository below is fully qualified
-          tenant: { orgId: i.tenantOrgId },
-        },
-        worker: {
-          image: { repository: i.imageRepository, digest: i.imageDigest },
-          hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
-          locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
-          // Supabase already has anon/authenticated/service_role; the plain-Postgres shim is for in-cluster DBs only.
-          migrations: { supabaseShim: sandbox },
-          // The bucket is created and versioned by IaC; the pods' role has no CreateBucket.
-          lockerInit: { enabled: false },
-          deployment: { name: "hosted", id: i.stage },
-          // Bob Costas alone gets the summary master key (src/shared/keyring.ts): worker 0.4.0 projects
-          // this Secret key as a read-only file into Bob Costas only (SUMMARY_MASTER_KEYS_FILE).
-          summaryEncryption: { existingSecret: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" },
-        },
-        alleyoop: {
-          image: { repository: i.imageRepository, digest: i.imageDigest },
-          hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
-          locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
-          // The chart's issuer default is the local self-signed one; hosted tokens come from RelayAuth.
-          auth: { jwksUrl: authJwksUrl, issuer: authIssuer },
-          // alleyoop 0.3.0 has no relayhistoryOrigin key: the origin rides in extraEnv, so only
-          // assertions minted for this deployment's origin are accepted.
-          extraEnv: [{ name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin }],
-          deployment: { name: "hosted", id: i.stage },
-        },
-        // Sandboxes run HoopDb in-cluster (Khaliq: container Postgres); other stages use Supabase + S3.
-        hoopdb: { enabled: sandbox },
-        locker: { enabled: false },
-      },
+      values: eksChartValues(i, sandbox, authIssuer, authJwksUrl),
     });
     const publicIngest = i.ingress
       ? yield* ingressStage({
