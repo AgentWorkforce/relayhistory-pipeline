@@ -290,6 +290,17 @@ async function main() {
       }));
       return;
     }
+    case "sandbox": {
+      // Plan only until the AWS path is cleared; prints the steps it would take.
+      const { planSandbox } = await import("./sandbox.ts");
+      const sub = args[1] as "up" | "down" | "extend" | "status";
+      const agent = args[2] ?? "";
+      const hours = Number(args[args.indexOf("--hours") + 1]) || undefined;
+      const plan = planSandbox(sub, agent, { hours });
+      console.log(`96bulls sandbox ${plan.command} ${plan.agent} (stage ${plan.stage}) -- PLAN ONLY, nothing executed:`);
+      for (const step of plan.steps) console.log(`  - ${step}`);
+      return;
+    }
     case "smoke": {
       const stage = requireLocalStage(stageArg);
       const { runSmoke } = await import("../smoke/e2e.ts");
@@ -297,7 +308,7 @@ async function main() {
       process.exit(ok ? 0 : 1);
     }
     default:
-      die("usage: 96bulls up|down|status|plan|seed|token|smoke <stage> [--reseed|--purge|--fresh]");
+      die("usage: 96bulls up|down|status|plan|seed|token|smoke <stage> [--reseed|--purge|--fresh] | sandbox up|down|extend|status <agent>");
   }
 }
 
