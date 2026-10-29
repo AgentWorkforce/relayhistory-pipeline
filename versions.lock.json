@@ -26,8 +26,8 @@
     },
     "services": {
       "ref": "ghcr.io/agentworkforce/96bulls-services",
-      "digest": "sha256:46cf380ea95c246bc3f1c08470de2e7f333fa719cef0c6730d0cc660707b149b",
-      "note": "published 2026-10-28 from main 4703c8e with Khaliq's approval (publish-image workflow run 40805279312); linux/amd64+arm64"
+      "digest": "sha256:245a75f9d7abdbd2167108db6e4fa852df844b41a22eaebcd64b4dd7b753b2aa",
+      "note": "republished 2026-10-28 from main db2663d with Khaliq's approval (run 40809226023); includes worker + ingest health; linux/amd64+arm64"
     }
   },
   "vendored": {
