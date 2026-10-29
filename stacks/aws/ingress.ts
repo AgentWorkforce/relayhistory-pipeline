@@ -18,6 +18,8 @@ import * as Output from "alchemy/Output";
 
 export interface IngressInputs {
   stage: string;
+  /** The ALB's region: ACM certificates attach only to load balancers in their own region. */
+  region: string;
   cluster: unknown;
   hostname: string;
   cloudflareZoneId: string;
@@ -36,6 +38,8 @@ export const ingressStage = (i: IngressInputs) =>
     const cert = yield* AWS.ACM.Certificate("ingest-cert", {
       domainName: i.hostname,
       validationMethod: "DNS",
+      // Alchemy defaults ACM to us-east-1 (for CloudFront); an ALB needs the cert in its own region.
+      region: i.region,
       tags: i.tags,
     });
     // ACM's validation CNAME, unproxied, in Cloudflare.
@@ -107,6 +111,8 @@ export const ingressStage = (i: IngressInputs) =>
         domainFilters: [i.zoneDomain],
         policy: "upsert-only",
         txtOwnerId: `96bulls-${i.stage}`,
+        // Cloudflare refuses a TXT record at the same name as a CNAME: keep ownership records on a prefix.
+        txtPrefix: "_externaldns.",
         env: [{ name: "CF_API_TOKEN", valueFrom: { secretKeyRef: { name: i.cloudflareTokenSecret, key: "token" } } }],
         extraArgs: ["--cloudflare-dns-records-per-page=5000"],
       },

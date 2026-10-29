@@ -134,6 +134,7 @@ export const eksStage = (i: EksStageInputs) =>
     const publicIngest = i.ingress
       ? yield* ingressStage({
           stage: i.stage,
+          region: i.lockerRegion,
           cluster,
           hostname: i.ingress.hostname,
           cloudflareZoneId: i.ingress.cloudflareZoneId,
