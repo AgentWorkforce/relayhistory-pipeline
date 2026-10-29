@@ -22,6 +22,7 @@ import * as Layer from "effect/Layer";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const REPO = "AgentWorkforce/96BullSessions";
@@ -41,10 +42,16 @@ interface AwsInputs {
 
 function readInputs(stage: string): AwsInputs {
   const path = join(ROOT, ".96bulls", stage, "aws-inputs.json");
-  const inputs = JSON.parse(readFileSync(path, "utf8")) as AwsInputs;
+  let inputs: AwsInputs;
+  try {
+    inputs = JSON.parse(readFileSync(path, "utf8")) as AwsInputs;
+  } catch {
+    throw new Error(`96bulls: the AWS stage ${stage} is not cleared: ${path} does not exist (see docs/aws-stage.md). Nothing was created.`);
+  }
   if (!inputs.clearedBy?.trim()) throw new Error(`96bulls: ${path} has no clearedBy; the AWS stage is not cleared`);
   if (process.env.NINETY_SIX_BULLS_CONFIRM_ACCOUNT !== inputs.accountId)
     throw new Error("96bulls: set NINETY_SIX_BULLS_CONFIRM_ACCOUNT=<account id> to run the AWS stage; nothing was created");
+  assertRegion(inputs.region);
   return inputs;
 }
 
@@ -101,15 +108,18 @@ export default Alchemy.Stack(
       tags: tags(stage, "cloudtrail"),
     });
 
-    // The budget cap Khaliq sets for the account.
+    // The budget cap: sandbox stages use the settled $50 ceiling with the $25 alarm; other stages what inputs say.
+    const isSandbox = stage.startsWith("aws-sandbox-");
+    const budgetUsd = isSandbox ? SANDBOX_RULES.budgetUsd : inputs.budgetUsd;
+    const alarmUsd = isSandbox ? SANDBOX_RULES.budgetAlarmUsd : Math.round(inputs.budgetUsd * 0.8);
     yield* AWS.Budgets.Budget("budget", {
       budgetName: name("monthly"),
       budgetType: "COST",
       timeUnit: "MONTHLY",
-      budgetLimit: { amount: String(inputs.budgetUsd), unit: "USD" },
+      budgetLimit: { amount: String(budgetUsd), unit: "USD" },
       notifications: [
-        { notificationType: "ACTUAL", comparisonOperator: "GREATER_THAN", threshold: 80, thresholdType: "PERCENTAGE", subscribers: [{ subscriptionType: "EMAIL", address: inputs.budgetEmail }] },
-        { notificationType: "FORECASTED", comparisonOperator: "GREATER_THAN", threshold: 100, thresholdType: "PERCENTAGE", subscribers: [{ subscriptionType: "EMAIL", address: inputs.budgetEmail }] },
+        { notificationType: "ACTUAL", comparisonOperator: "GREATER_THAN", threshold: alarmUsd, thresholdType: "ABSOLUTE_VALUE", subscribers: [{ subscriptionType: "EMAIL", address: inputs.budgetEmail }] },
+        { notificationType: "FORECASTED", comparisonOperator: "GREATER_THAN", threshold: budgetUsd, thresholdType: "ABSOLUTE_VALUE", subscribers: [{ subscriptionType: "EMAIL", address: inputs.budgetEmail }] },
       ],
     });
 
@@ -147,7 +157,9 @@ export default Alchemy.Stack(
         },
       },
       maxSessionDuration: "1 hour",
-      tags: tags(stage, "iam"),
+      // Sandbox accounts: every role we create carries the sandbox boundary (draft in policies/).
+      ...(isSandbox ? { permissionsBoundary: `arn:aws:iam::${inputs.accountId}:policy/${SANDBOX_RULES.permissionsBoundary}` } : {}),
+      tags: { ...tags(stage, "iam"), ...(isSandbox ? { [SANDBOX_RULES.tags.owner]: stage.slice("aws-sandbox-".length), "96bulls:bounded": "true" } : {}) },
     });
 
     return {
