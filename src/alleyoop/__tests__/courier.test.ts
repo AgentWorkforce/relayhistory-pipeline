@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { sessionsForStartMode } from "../courier.ts";
+import { manifestReconciliation, sessionsForStartMode } from "../courier.ts";
 
 describe("courier enrollment", () => {
   const rows = [
@@ -14,5 +14,15 @@ describe("courier enrollment", () => {
 
   test("switching to explicit all mode ignores a persisted enrollment cutoff", () => {
     expect(sessionsForStartMode(rows, "all", new Date(200).toISOString())).toEqual(rows);
+  });
+});
+
+describe("courier manifest reconciliation", () => {
+  test("only a definitive hit or miss can advance the session", () => {
+    expect(manifestReconciliation(204)).toBe("verified");
+    expect(manifestReconciliation(404)).toBe("reset");
+    expect(manifestReconciliation(401)).toBe("defer");
+    expect(manifestReconciliation(503)).toBe("defer");
+    expect(manifestReconciliation()).toBe("defer");
   });
 });

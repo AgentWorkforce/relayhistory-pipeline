@@ -59,6 +59,14 @@ export function sessionsForStartMode<T extends Pick<SessionRow, "first_activity_
     : rows;
 }
 
+export type ManifestReconciliation = "verified" | "reset" | "defer";
+
+export function manifestReconciliation(status?: number): ManifestReconciliation {
+  if (status === 204) return "verified";
+  if (status === 404) return "reset";
+  return "defer";
+}
+
 interface SessionState {
   session_uuid: string;
   trace_id: string;
@@ -219,6 +227,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
   const verified = (cfg.verifiedManifests ??= new Set());
   let uploaded = 0;
   let chunks = 0;
+  const deferred = new Set<string>();
   // The ledger follows the Locker, not the other way round: if a recorded manifest is
   // gone (a fresh stack after `down`), the upload state resets while the ids stay.
   for (const [key, st] of Object.entries(state.sessions)) {
@@ -226,18 +235,21 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
     if (verified.has(st.manifest_key)) continue;
     const q = new URLSearchParams({ key: st.manifest_key });
     const head = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`, { method: "GET" }).catch(() => undefined);
-    if (head?.status === 204) {
+    const reconciliation = manifestReconciliation(head?.status);
+    if (reconciliation === "verified") {
       verified.add(st.manifest_key);
-    } else if (head?.status === 404) {
+    } else if (reconciliation === "reset") {
       log.info("manifest missing in locker; re-uploading with the same ids", { session_uuid: st.session_uuid, trace_id: st.trace_id });
       state.sessions[key] = { ...st, revision: 0, uploaded_offset: 0, chunks: [], closed: false, pending: false, scrub: undefined, manifest_key: undefined };
     } else {
       log.warn("manifest status unavailable; keeping durable upload state", { session_uuid: st.session_uuid, trace_id: st.trace_id, status: head?.status });
+      deferred.add(key);
     }
   }
   for (const row of rows) {
     if (!row.raw_path || !row.first_activity_ms) continue;
     const key = `${row.source}:${row.session_id}`;
+    if (deferred.has(key)) continue;
     const now = new Date();
     let s = state.sessions[key];
     if (!s) {
