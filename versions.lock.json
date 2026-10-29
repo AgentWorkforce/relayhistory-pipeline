@@ -28,11 +28,6 @@
       "ref": "ghcr.io/agentworkforce/96bulls-services",
       "digest": "sha256:245a75f9d7abdbd2167108db6e4fa852df844b41a22eaebcd64b4dd7b753b2aa",
       "note": "republished 2026-10-28 from main db2663d with Khaliq's approval (run 40809226023); includes worker + ingest health; linux/amd64+arm64. GHCR copy stays PRIVATE (Khaliq: hosted service, not public); used for kind/self-host tests with a pull secret."
-    },
-    "services-ecr": {
-      "ref": "<account>.dkr.ecr.<region>.amazonaws.com/96bulls-services",
-      "digest": null,
-      "note": "hosted image; set from the publish-image-ecr run after the AWS stage creates the repository"
     }
   },
   "vendored": {
