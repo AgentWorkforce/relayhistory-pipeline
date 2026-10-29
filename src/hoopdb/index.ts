@@ -84,6 +84,7 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         raw_format: m.raw.format,
         format_version: 1,
         normalized_version: f.normalizedVersion,
+        scrubbed: f.scrubbed,
         manifest_etag: read.etag ?? pointer.manifestVersion ?? null,
         revision: f.manifestRevision,
         trace_id: f.traceId,
