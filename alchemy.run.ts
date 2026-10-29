@@ -160,6 +160,10 @@ export default Alchemy.Stack(
         ...(opts.ports ? { ports: opts.ports } : {}),
         ...(opts.volumes ? { volumes: opts.volumes } : {}),
         labels: { "96bulls.stack": stage, "96bulls.component": serviceName },
+        // Workers serve /healthz on WORKER_HEALTH_PORT (8081); the ingest on 8080. One probe for both.
+        ...(serviceName === "hoopdb-migrate" || serviceName === "locker-init" || serviceName === "alleyoop-courier"
+          ? {}
+          : { healthcheck: { cmd: ["CMD-SHELL", `bun -e "fetch('http://127.0.0.1:${serviceName === "alleyoop-ingest" ? 8080 : 8081}/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"`], interval: "15 seconds", timeout: "5 seconds", retries: 3 } }),
         start: true,
       });
 
