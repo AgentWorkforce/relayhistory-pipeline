@@ -35,6 +35,15 @@ session_id, revision, work_key, error_code, retryable, duration_ms,
 scrub_ruleset, scrub_version, redaction_count, object_sha256, bytes_raw,
 bytes_stored, chunk_count, model_id, tokens_in, tokens_out, state, rule, kind.
 
+The AWS EKS stage runs the pinned contrib collector in-cluster and archives
+lossless OTLP/JSON trace batches under the Locker bucket's encrypted
+`telemetry/traces/` prefix through a dedicated least-privilege EKS Pod
+Identity. The collector can append there but cannot read or delete either
+telemetry or session objects. This preserves the canonical UUIDv7 trace id;
+X-Ray cannot, because it interprets the first 32 bits as epoch seconds.
+Structured stage events and DLQs remain in HoopDb; service logs remain
+structured stdout.
+
 **Not yet built:** metrics and SLO alerts (stage lag, DLQ > 0, scrub refusal),
-tail sampling, per-tenant retention/deletion in the telemetry backend, hosted
-exporters (CloudWatch/X-Ray). Logs are unsampled; errors are never sampled out.
+tail sampling, per-tenant retention/deletion in the telemetry backend, and a
+durable hosted log exporter. Logs are unsampled; errors are never sampled out.
