@@ -20,7 +20,7 @@ import { PLANTED_CONTENT_MARKER, PLANTED_SECRETS, addPlantedSession } from "../c
 import { isUuidV7 } from "../shared/ids.ts";
 import { masterKeyring, parseMasterKeys } from "../shared/keyring.ts";
 import { readSummaryObject } from "../bob-costas/summary-objects.ts";
-import { HOOPDB_NAME, HOOPDB_USER, LOCKER_BUCKET, NAMES, PORTS, TENANT } from "../../stacks/local/topology.ts";
+import { HOOPDB_NAME, HOOPDB_USER, LOCKER_BUCKET, NAMES, PORTS, TENANT, summaryKeyPath } from "../../stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -40,7 +40,7 @@ const FORBIDDEN_IN_TELEMETRY = [
 
 export async function runSmoke(stage: string): Promise<boolean> {
   const dir = join(ROOT, ".96bulls", stage);
-  const inputs = JSON.parse(readFileSync(join(dir, "inputs.json"), "utf8")) as { hoopdbPassword: string; lockerAccessKeyId: string; lockerSecretAccessKey: string; courierToken: string; concourseDir: string; summaryMasterKeys: string };
+  const inputs = JSON.parse(readFileSync(join(dir, "inputs.json"), "utf8")) as { hoopdbPassword: string; lockerAccessKeyId: string; lockerSecretAccessKey: string; courierToken: string; concourseDir: string };
   const seed = JSON.parse(readFileSync(join(dir, "seed.json"), "utf8")) as { sessions: Array<{ sessionId: string; planted: boolean }> };
   // A brand-new session every run, so the whole pipe (and its spans) is exercised now, not replayed from history.
   const fresh = await addPlantedSession({ dir: inputs.concourseDir });
@@ -142,7 +142,7 @@ export async function runSmoke(stage: string): Promise<boolean> {
       "SELECT kind, status, object_key, object_sha256, workspace_id, revision FROM sessions.session_summaries WHERE session_uuid = $1::uuid", [plantedUuid]);
     const columns = await q<{ column_name: string }>("SELECT column_name FROM information_schema.columns WHERE table_schema='sessions' AND table_name='session_summaries'");
     check("HoopDb summaries are pointers only (no summary text or model column)", !columns.some((c) => c.column_name === "summary" || c.column_name === "model_id"));
-    const keyring = await masterKeyring(parseMasterKeys(inputs.summaryMasterKeys));
+    const keyring = await masterKeyring(parseMasterKeys(readFileSync(summaryKeyPath(stage), "utf8").trim()));
     const texts: string[] = [];
     for (const p of pointers) {
       if (p.status !== "ready" || !p.object_key || !p.object_sha256) continue;

@@ -15,9 +15,10 @@
  * been rewritten; removing a master crypto-shreds what it wrote.
  *
  * SUMMARY_MASTER_KEYS = "<id>:<64 hex chars>[,<id>:<64 hex chars>...]", the first
- * one current. It comes from a Secret (1Password), never from code or values.
+ * one current (or SUMMARY_MASTER_KEYS_FILE, a path holding the same value). It comes from a Secret (1Password), never from code or values.
  * Keys are imported non-extractable and are never logged.
  */
+import { readFileSync } from "node:fs";
 import { PipelineError } from "./vendor.ts";
 import type { WorkspaceIds, WorkspaceKeyring } from "../bob-costas/summary-objects.ts";
 
@@ -84,7 +85,9 @@ export async function masterKeyring(keys: Array<{ id: string; bytes: Uint8Array 
 
 /** The keyring from SUMMARY_MASTER_KEYS. Bob Costas refuses to start without one, so no summary is ever stored unencrypted. */
 export async function keyringFromEnv(env: Record<string, string | undefined> = process.env): Promise<WorkspaceKeyring> {
-  const raw = env.SUMMARY_MASTER_KEYS?.trim();
+  // A mounted file (local stack: tmpfs; Kubernetes: a Secret volume) or the env var.
+  const file = env.SUMMARY_MASTER_KEYS_FILE?.trim();
+  const raw = (file ? readFileSync(file, "utf8") : env.SUMMARY_MASTER_KEYS)?.trim();
   if (!raw) throw new Error("96bulls: SUMMARY_MASTER_KEYS is required: summaries are stored encrypted in the Locker (see docs/aws-stage.md)");
   return masterKeyring(parseMasterKeys(raw));
 }

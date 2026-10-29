@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { keyringFromEnv, parseMasterKeys } from "../keyring.ts";
 
 describe("summary keyring config", () => {
@@ -13,6 +16,11 @@ describe("summary keyring config", () => {
     try { parseMasterKeys(`k1:${secret}`); } catch (e) { expect(String(e)).not.toContain(secret); }
     expect(() => parseMasterKeys(`K!:${"a".repeat(64)}`)).toThrow(/invalid id/);
     expect(() => parseMasterKeys(`k1:${"a".repeat(64)},k1:${"b".repeat(64)}`)).toThrow(/repeats/);
+  });
+  it("reads SUMMARY_MASTER_KEYS_FILE (a mounted tmpfs file or Secret volume)", async () => {
+    const f = join(mkdtempSync(join(tmpdir(), "kr-")), "keys");
+    writeFileSync(f, `local-1:${"c".repeat(64)}\n`, { mode: 0o600 });
+    expect((await (await keyringFromEnv({ SUMMARY_MASTER_KEYS_FILE: f })).currentKey({ orgId: "o", workspaceId: "w" })).keyId).toBe("hkdf1:local-1");
   });
   it("refuses to run without SUMMARY_MASTER_KEYS", async () => {
     await expect(keyringFromEnv({})).rejects.toThrow(/SUMMARY_MASTER_KEYS is required/);

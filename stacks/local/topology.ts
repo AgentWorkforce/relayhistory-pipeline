@@ -65,3 +65,14 @@ export const IMAGE_PATHS = {
   telemetry: "/telemetry",
   concourse: "/concourse",
 } as const;
+
+/**
+ * The local summary master key lives in the user's runtime tmpfs (RAM, cleared on
+ * reboot), never in .96bulls/ or Alchemy state: only this path reaches the
+ * container config. Mounted read-only into Bob Costas alone.
+ */
+export function summaryKeyPath(stage: string, uid = process.getuid?.() ?? 1000): string {
+  const runtime = process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`;
+  return `${runtime}/96bulls/${stage}/summary-master-keys`;
+}
+export const SUMMARY_KEY_CONTAINER_PATH = "/run/secrets/summary-master-keys";

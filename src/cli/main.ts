@@ -16,11 +16,11 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateLocalKeys, mintToken } from "../alleyoop/auth.ts";
 import { seedConcourse } from "../concourse/seed.ts";
-import { HOOPDB_NAME, HOOPDB_USER, NAMES, PORTS, TENANT } from "../../stacks/local/topology.ts";
+import { HOOPDB_NAME, HOOPDB_USER, NAMES, PORTS, TENANT, summaryKeyPath } from "../../stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const args = process.argv.slice(2);
@@ -57,8 +57,18 @@ interface Inputs {
   telemetryDir: string;
   deploymentId: string;
   machineId: string;
-  /** SUMMARY_MASTER_KEYS for Bob Costas: summaries are encrypted in the Locker under it. */
-  summaryMasterKeys: string;
+}
+
+/**
+ * The local summary master key in the runtime tmpfs (RAM): created if absent, kept
+ * until reboot. After a reboot a new key is minted and Bob Costas's sweep
+ * re-encrypts every local summary under it (rows under an old key id are re-queued).
+ */
+function ensureSummaryKey(stage: string): void {
+  const path = summaryKeyPath(stage);
+  if (existsSync(path)) return;
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writeFileSync(path, `local-${randomBytes(4).toString("hex")}:${randomBytes(32).toString("hex")}\n`, { mode: 0o600 });
 }
 
 function stageDir(stage: string) {
@@ -96,7 +106,9 @@ function prepareInputs(stage: string): Inputs {
   inputs.telemetryDir ||= join(dir, "telemetry");
   inputs.deploymentId ||= `${stage}-${randomBytes(4).toString("hex")}`;
   inputs.machineId ||= `m-${randomBytes(8).toString("hex")}`;
-  inputs.summaryMasterKeys ||= `local1:${randomBytes(32).toString("hex")}`;
+  // Never persist the summary master key here (AGENTS.md: nothing credential-like on disk).
+  delete (inputs as Record<string, unknown>).summaryMasterKeys;
+  ensureSummaryKey(stage);
   inputs.courierToken = mintToken({ kid: inputs.jwtKid!, privateKeyPem: inputs.jwtPrivateKeyPem }, {
     issuer: TENANT.issuer,
     audience: "relayhistory",
