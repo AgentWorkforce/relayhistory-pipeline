@@ -23,6 +23,11 @@
     "services-base": {
       "ref": "oven/bun:1.4.2-slim",
       "note": "node:sqlite and node:zlib zstd need Bun >= 1.4"
+    },
+    "services": {
+      "ref": "ghcr.io/agentworkforce/96bulls-services",
+      "digest": "sha256:46cf380ea95c246bc3f1c08470de2e7f333fa719cef0c6730d0cc660707b149b",
+      "note": "published 2026-10-28 from main 4703c8e with Khaliq's approval (publish-image workflow run 40805279312); linux/amd64+arm64"
     }
   },
   "vendored": {

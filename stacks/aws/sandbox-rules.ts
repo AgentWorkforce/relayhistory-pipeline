@@ -4,6 +4,8 @@
  * and code only: nothing here creates anything.
  */
 export const SANDBOX_RULES = {
+  /** Sandbox HoopDb (Khaliq, 2026-10-28): Postgres (pgvector) as a container in the sandbox compute; RDS only when a test needs managed Postgres. */
+  databaseDefault: "container" as "container" | "rds",
   /** Regions a 96bulls stage may use; production defaults to us-west-2. */
   regionAllowlist: ["us-east-1", "us-west-1", "us-west-2"] as const,
   productionRegion: "us-west-2",

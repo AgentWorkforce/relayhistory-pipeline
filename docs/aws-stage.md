@@ -19,3 +19,19 @@ non-baseline IAM entities, empty workspace bucket prefix); quiet timeout 3h,
 extensions in 3h blocks with no cap, any activity or deployment resets the
 clock. `96bulls sandbox up|down|extend <agent>` is the planned interface; the
 provisioning API lives in Pippin Tools.
+
+## Decisions (Khaliq, 2026-10-28)
+
+- **Compute:** EKS (Auto Mode) running the `96bulls` umbrella chart from
+  AgentWorkforce/helm-charts, pinned to the published services image digest in
+  `versions.lock.json` (`stacks/aws/eks.ts`).
+- **Dev HoopDb:** a Supabase project in the org the 96Bulls team owns, declared
+  with the `Supabase.Project` resource; its password comes from an `op://`
+  reference at create time only.
+- **Sandbox HoopDb:** Postgres (pgvector) as a container inside the sandbox's own
+  compute; RDS only when a test needs managed Postgres.
+- **Services image:** published `ghcr.io/agentworkforce/96bulls-services@sha256:46cf380e...`
+  from main 4703c8e.
+
+Still gated: nothing here runs until `.96bulls/<stage>/aws-inputs.json` carries
+Khaliq's clearance and the account id is confirmed on the command line.
