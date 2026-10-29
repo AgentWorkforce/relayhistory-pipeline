@@ -12,6 +12,7 @@ import * as AWS from "@alchemy.run/aws";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
 import { ingressStage } from "./ingress.ts";
+import { relayauthStage } from "./relayauth.ts";
 
 export interface EksStageInputs {
   stage: string;
@@ -27,6 +28,12 @@ export interface EksStageInputs {
   relayhistoryOrigin: string;
   /** The `iss` RelayAuth stamps; must match exactly or every token is refused. */
   relayauthIssuer?: string;
+  /**
+   * Self-hosted RelayAuth in this cluster (see relayauth.ts). When set, AlleyOop's
+   * issuer and JWKS URL are the in-cluster RelayAuth and relayauthJwksUrl /
+   * relayauthIssuer must not point elsewhere.
+   */
+  relayauth?: { chartVersion: string; secretName: string };
   /** The account's private ECR repository; nodes pull with their node role, no pull secret. */
   imageRepository: string;
   /** The digest published to this account's repository (per account, from aws-inputs.json). */
@@ -44,6 +51,8 @@ export interface EksStageInputs {
 export const eksStage = (i: EksStageInputs) =>
   Effect.gen(function* () {
     // Refuse before declaring anything billable.
+    if (i.relayauth && i.relayauthIssuer)
+      throw new Error("96bulls: eks.relayauth (self-hosted) and eks.relayauthIssuer are both set; the self-hosted issuer is the in-cluster RelayAuth. Remove relayauthIssuer. Nothing was created.");
     if (!/^sha256:[0-9a-f]{64}$/.test(i.imageDigest ?? ""))
       throw new Error("96bulls: eks.imageDigest is missing or invalid; run publish-image-ecr for this account and put its digest in aws-inputs.json. Nothing was created.");
     const network = yield* AWS.EC2.Network("network", {
@@ -96,6 +105,13 @@ export const eksStage = (i: EksStageInputs) =>
       });
     }
 
+    // Self-hosted RelayAuth first, so AlleyOop's issuer and JWKS come from this environment.
+    const selfAuth = i.relayauth
+      ? yield* relayauthStage({ cluster, chartVersion: i.relayauth.chartVersion, secretName: i.relayauth.secretName, clientNamespace: "96bulls" })
+      : undefined;
+    const authIssuer = selfAuth?.issuer ?? i.relayauthIssuer ?? "https://relayauth.dev";
+    const authJwksUrl = selfAuth?.jwksUrl ?? i.relayauthJwksUrl;
+
     const chart = yield* Kubernetes.HelmChart("96bulls", {
       cluster,
       chart: "96bulls",
@@ -125,7 +141,7 @@ export const eksStage = (i: EksStageInputs) =>
           hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
           locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
           // The chart's issuer default is the local self-signed one; hosted tokens come from RelayAuth.
-          auth: { jwksUrl: i.relayauthJwksUrl, issuer: i.relayauthIssuer ?? "https://relayauth.dev" },
+          auth: { jwksUrl: authJwksUrl, issuer: authIssuer },
           // alleyoop 0.3.0 has no relayhistoryOrigin key: the origin rides in extraEnv, so only
           // assertions minted for this deployment's origin are accepted.
           extraEnv: [{ name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin }],
@@ -152,5 +168,5 @@ export const eksStage = (i: EksStageInputs) =>
           tags: i.tags,
         })
       : undefined;
-    return { clusterName: cluster.clusterName, endpoint: cluster.endpoint, chartRelease: chart.releaseName, hostname: publicIngest?.hostname ?? null };
+    return { clusterName: cluster.clusterName, endpoint: cluster.endpoint, chartRelease: chart.releaseName, hostname: publicIngest?.hostname ?? null, relayauthIssuer: authIssuer };
   });

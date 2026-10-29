@@ -52,3 +52,69 @@ copy stays private for kind and self-host tests.
 Order for the first environment: apply the baseline (creates ECR and the
 deployer role) -> set the two repo variables -> run publish-image-ecr -> put the
 digest in `aws-inputs.json` -> apply again with `eks` inputs.
+
+## Self-hosted RelayAuth (Khaliq, 2026-10-29: "the entire stack self hostable")
+
+Each environment can run its own RelayAuth (helm-charts `relayauth`, one
+replica on an encrypted gp3 volume) instead of trusting hosted relayauth.dev.
+Turn it on with `eks.relayauth` in `aws-inputs.json`:
+
+```json
+"relayauth": { "chartVersion": "0.1.0", "secretName": "relayauth" }
+```
+
+and remove `eks.relayauthIssuer` (the stack refuses both). AlleyOop's issuer and
+JWKS URL then become the in-cluster Service, `http://relayauth.relayauth.svc:8787`,
+whatever `relayauthJwksUrl` says. Neither the token API nor JWKS is public:
+only pods in the `96bulls` namespace may call it (NetworkPolicy, where enforced).
+
+**Keys (once per environment, before the deploy).** They are generated on the
+Mac straight into 1Password and reach the cluster through a pipe, never a file
+on an agent machine. The 1Password item is `<stage> relayauth` in the
+environment's vault (`96Bulls-dev` for sessions-dev), with fields
+`internal-secret`, `signing-key.pem` (unencrypted PKCS#8 RSA 3072,
+`BEGIN PRIVATE KEY`) and `bootstrap-api-key` (`rak_` + 64 hex):
+
+```sh
+# on the Mac (Khaliq approves each op call)
+k=$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 2>/dev/null)
+op item create --vault 96Bulls-dev --category "API Credential" --title "sessions-dev relayauth" \
+  "internal-secret[password]=$(openssl rand -hex 32)" \
+  "bootstrap-api-key[password]=rak_$(openssl rand -hex 32)" \
+  "signing-key.pem[password]=$k"; unset k
+```
+
+```sh
+# from the operator shell, cluster credentials in env vars only
+kubectl create namespace relayauth --dry-run=client -o yaml | kubectl apply -f -
+ssh kjg-lap "zsh -lc 'op item get \"sessions-dev relayauth\" --vault 96Bulls-dev --reveal --format json'" \
+  | jq '{apiVersion:"v1",kind:"Secret",type:"Opaque",metadata:{name:"relayauth",namespace:"relayauth"},
+         stringData:(.fields|map(select(.label|IN("internal-secret","signing-key.pem","bootstrap-api-key")))|map({(.label):.value})|add)}' \
+  | kubectl apply -f -
+```
+
+RelayAuth reads the keys at boot: after changing the Secret, run
+`kubectl -n relayauth rollout restart deploy/relayauth`. Rotation:
+`signingKeyNext` / `signingKeyPrevious` in the chart (helm-charts README).
+
+**Minting a RelayHistory assertion** (the bootstrap key has exactly the scope
+`relayauth:assertion:create:relayhistory`):
+
+```sh
+kubectl -n relayauth port-forward svc/relayauth 18787:8787 &
+curl -s http://127.0.0.1:18787/v1/tokens/relayhistory-assertion \
+  -H "x-api-key: $BOOTSTRAP_KEY" -H 'content-type: application/json' \
+  -d '{"orgId":"org_sessions_dev","workspaceId":"default","sponsorId":"<user id>","scopes":["rth:sync","rth:read"],"expiresIn":3600,"historyOrigin":"https://sessions-dev.agentrelay.com"}'
+# -> 201 {"accessToken": ...}; send it to AlleyOop as Authorization: Bearer <token>
+```
+
+The token's `aud` is exactly `historyOrigin`, which must equal the stage's
+`relayhistoryOrigin` (AlleyOop refuses anything else).
+
+**Transport.** The Service is plain HTTP. That is safe for what crosses it today:
+AlleyOop fetches only the public JWKS, and minting goes through
+`kubectl port-forward`, which tunnels inside the API server's TLS. Pod-to-pod
+traffic on EKS is not encrypted by default, so **nothing may send the bootstrap
+key over the cluster network until RelayAuth has TLS** (a mesh with mTLS, or TLS
+terminated in front of RelayAuth). That applies to an in-cluster courier or
+broker, and to a public token endpoint, which is a separate decision.

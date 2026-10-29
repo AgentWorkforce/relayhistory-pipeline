@@ -33,6 +33,8 @@ jobs:
         run: bunx tsc --noEmit -p tsconfig.json
       - name: Unit tests (stack)
         run: bun test
+      - name: Unit tests (IaC values, stacks/)
+        run: bun test ./stacks
       - name: Guard - no Helm hooks in any chart or manifest in this repo
         run: |
           # The annotation key is assembled so this file never matches its own guard; .github is excluded as well.
