@@ -15,12 +15,12 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateLocalKeys, mintToken } from "../alleyoop/auth.ts";
 import { seedConcourse } from "../concourse/seed.ts";
-import { HOOPDB_NAME, HOOPDB_USER, NAMES, PORTS, TENANT } from "../../stacks/local/topology.ts";
+import { HOOPDB_NAME, HOOPDB_USER, NAMES, PORTS, SERVICES_CONTAINER_UID, TENANT, summaryKeyAccess, summaryKeyPath } from "../../stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const args = process.argv.slice(2);
@@ -59,6 +59,27 @@ interface Inputs {
   machineId: string;
 }
 
+/**
+ * The local summary master key in the runtime tmpfs (RAM): created if absent, kept
+ * until reboot. After a reboot a new key is minted and Bob Costas's sweep
+ * re-encrypts every local summary under it (rows under an old key id are re-queued).
+ */
+function ensureSummaryKey(stage: string): void {
+  const path = summaryKeyPath(stage);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  chmodSync(dirname(path), 0o700);
+  if (!existsSync(path))
+    writeFileSync(path, `local-${randomBytes(4).toString("hex")}:${randomBytes(32).toString("hex")}\n`, { mode: 0o600 });
+  const access = summaryKeyAccess(process.getuid?.() ?? SERVICES_CONTAINER_UID);
+  chmodSync(path, access.mode);
+  if (access.aclReadForUid !== undefined) {
+    // The container user (bun) is not this uid: grant it read with one ACL entry, nothing broader.
+    const r = spawnSync("setfacl", ["-m", `u:${access.aclReadForUid}:r`, path], { stdio: "ignore" });
+    if (r.status !== 0)
+      die(`cannot grant the container user (uid ${access.aclReadForUid}) read access to ${path}: setfacl failed or ACLs are unsupported. Run as uid ${access.aclReadForUid} or install acl; the key is never made world-readable.`);
+  }
+}
+
 function stageDir(stage: string) {
   return join(ROOT, ".96bulls", stage);
 }
@@ -94,6 +115,9 @@ function prepareInputs(stage: string): Inputs {
   inputs.telemetryDir ||= join(dir, "telemetry");
   inputs.deploymentId ||= `${stage}-${randomBytes(4).toString("hex")}`;
   inputs.machineId ||= `m-${randomBytes(8).toString("hex")}`;
+  // Never persist the summary master key here (AGENTS.md: nothing credential-like on disk).
+  delete (inputs as Record<string, unknown>).summaryMasterKeys;
+  ensureSummaryKey(stage);
   inputs.courierToken = mintToken({ kid: inputs.jwtKid!, privateKeyPem: inputs.jwtPrivateKeyPem }, {
     issuer: TENANT.issuer,
     audience: "relayhistory",

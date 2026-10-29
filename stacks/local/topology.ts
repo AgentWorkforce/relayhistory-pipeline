@@ -65,3 +65,28 @@ export const IMAGE_PATHS = {
   telemetry: "/telemetry",
   concourse: "/concourse",
 } as const;
+
+/**
+ * The local summary master key lives in the user's runtime tmpfs (RAM, cleared on
+ * reboot), never in .96bulls/ or Alchemy state: only this path reaches the
+ * container config. Mounted read-only into Bob Costas alone. Directory 0700, file
+ * 0600; when the CLI's uid is not the container's, one POSIX ACL entry grants read
+ * to that uid only (`summaryKeyAccess`).
+ */
+export function summaryKeyPath(stage: string, uid = process.getuid?.() ?? 1000): string {
+  const runtime = process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`;
+  return `${runtime}/96bulls/${stage}/summary-master-keys`;
+}
+export const SUMMARY_KEY_CONTAINER_PATH = "/run/secrets/summary-master-keys";
+
+/** The services image runs as `USER bun` (docker/services.Dockerfile). */
+export const SERVICES_CONTAINER_UID = 1000;
+
+/**
+ * How the tmpfs key file is made readable by the container user without loosening it:
+ * mode 0600 always; if the CLI's uid differs from the container's, add exactly one
+ * ACL entry `u:<containerUid>:r` (fail closed if ACLs are unavailable).
+ */
+export function summaryKeyAccess(hostUid: number, containerUid = SERVICES_CONTAINER_UID): { mode: 0o600; aclReadForUid?: number } {
+  return hostUid === containerUid ? { mode: 0o600 } : { mode: 0o600, aclReadForUid: containerUid };
+}

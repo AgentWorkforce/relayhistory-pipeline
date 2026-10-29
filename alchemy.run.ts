@@ -14,10 +14,10 @@ import { Stage } from "alchemy";
 import * as Docker from "@alchemy.run/docker";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { HOOPDB_NAME, HOOPDB_USER, IMAGES, IMAGE_PATHS, LOCKER_BUCKET, NAMES, PORTS, STACK, TENANT } from "./stacks/local/topology.ts";
+import { HOOPDB_NAME, HOOPDB_USER, IMAGES, IMAGE_PATHS, LOCKER_BUCKET, NAMES, PORTS, STACK, SUMMARY_KEY_CONTAINER_PATH, TENANT, summaryKeyPath } from "./stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 
@@ -182,7 +182,13 @@ export default Alchemy.Stack(
 
     yield* service("hoopdb-indexer", name(NAMES.indexer), "hoopdb-indexer");
     yield* service("referee", name(NAMES.referee), "referee");
-    yield* service("bob-costas", name(NAMES.bobCostas), "bob-costas", { BOB_COSTAS_MODEL: "off" });
+    // Only Bob Costas gets the summary master key, as a read-only file from the runtime tmpfs:
+    // the key never enters .96bulls/ or Alchemy state (only its path does).
+    const summaryKey = summaryKeyPath(stage);
+    if (!existsSync(summaryKey)) throw new Error(`96bulls: ${summaryKey} is missing; run \`bin/96bulls up ${stage}\` instead of alchemy directly`);
+    yield* service("bob-costas", name(NAMES.bobCostas), "bob-costas",
+      { BOB_COSTAS_MODEL: "off", SUMMARY_MASTER_KEYS_FILE: SUMMARY_KEY_CONTAINER_PATH },
+      { volumes: [{ hostPath: summaryKey, containerPath: SUMMARY_KEY_CONTAINER_PATH, readOnly: true }] });
 
     // AlleyOop courier: watches the seeded Concourse (history.db) and uploads.
     yield* service("alleyoop-courier", name(NAMES.courier), "alleyoop-courier", {

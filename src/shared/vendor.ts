@@ -71,6 +71,8 @@ export {
   parseManifest,
   pointerFields,
   objectKey,
+  joinKey,
+  sessionPrefix,
   readAll,
   type ManifestV1,
   type ChunkEntry,
