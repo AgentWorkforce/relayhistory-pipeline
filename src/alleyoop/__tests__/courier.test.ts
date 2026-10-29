@@ -47,7 +47,7 @@ describe("courier manifest reconciliation", () => {
     expect(manifestReconciliation()).toBe("defer");
   });
 
-  test("replays the exact pending manifest when a committed write loses its response", async () => {
+  test("persists identity, recovers a fresh Locker, and replays a lost response exactly", async () => {
     const dir = await mkdtemp(join(tmpdir(), "96bulls-courier-replay-"));
     temporary.push(dir);
     const dbPath = join(dir, "history.db");
@@ -61,15 +61,26 @@ describe("courier manifest reconciliation", () => {
     db.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)").run("session-1", "claude", rawPath, 1_700_000_000_000, 1_700_000_000_100, null, "1.0.0");
     db.close();
 
-    let serverVersion = { eTag: '"v0"' };
+    let serverVersion: { eTag: string } | undefined;
+    let statusCalls = 0;
+    let chunkPosts = 0;
     let manifestPosts = 0;
     const posted: string[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (input, init) => {
       const url = String(input);
-      if (url.includes("/manifests/status"))
-        return Response.json({ version: serverVersion });
+      if (url.includes("/manifests/status")) {
+        statusCalls += 1;
+        return serverVersion ? Response.json({ version: serverVersion }) : new Response(null, { status: 404 });
+      }
       if (url.includes("/pipeline/chunks")) {
+        chunkPosts += 1;
+        if (chunkPosts === 1) {
+          const durable = JSON.parse(await readFile(statePath, "utf8"));
+          expect(durable.sessions["claude:session-1"].session_uuid).toMatch(/^[0-9a-f-]{36}$/);
+          expect(durable.sessions["claude:session-1"].trace_id).toMatch(/^[0-9a-f-]{36}$/);
+          expect(durable.sessions["claude:session-1"].chunks).toEqual([]);
+        }
         const query = new URL(url).searchParams;
         const bytes = Buffer.from(init?.body as Uint8Array);
         const sha = createHash("sha256").update(bytes).digest("hex");
@@ -90,10 +101,15 @@ describe("courier manifest reconciliation", () => {
         manifestPosts += 1;
         posted.push(String(init?.body));
         if (manifestPosts === 1) {
+          // The first manifest did not commit. A fresh Locker must make the
+          // pending revision reconcile as missing and reseal its chunk.
+          return Response.json({ error: { code: "storage_unavailable" } }, { status: 503 });
+        }
+        if (manifestPosts === 2) {
           serverVersion = { eTag: '"v1"' };
           return Response.json({ version: serverVersion }, { status: 202 });
         }
-        if (manifestPosts === 2) {
+        if (manifestPosts === 3) {
           // The store committed revision 2, but notification/response failed.
           serverVersion = { eTag: '"v2"' };
           return Response.json({ error: { code: "storage_unavailable" } }, { status: 503 });
@@ -118,7 +134,13 @@ describe("courier manifest reconciliation", () => {
     });
 
     try {
+      expect(await runCourierOnce(config())).toMatchObject({ uploaded: 0, chunks: 1 });
+      const firstPending = JSON.parse(await readFile(statePath, "utf8"));
+      expect(firstPending.sessions["claude:session-1"]).toMatchObject({ revision: 0, pending: true });
+      expect(firstPending.sessions["claude:session-1"].pending_manifest.revision).toBe(1);
       expect(await runCourierOnce(config())).toMatchObject({ uploaded: 1, chunks: 1 });
+      expect(statusCalls).toBe(1);
+      expect(chunkPosts).toBe(2);
       await appendFile(rawPath, second);
       expect(await runCourierOnce(config())).toMatchObject({ uploaded: 0, chunks: 1 });
       const pending = JSON.parse(await readFile(statePath, "utf8"));
@@ -126,7 +148,7 @@ describe("courier manifest reconciliation", () => {
       expect(pending.sessions["claude:session-1"].pending_manifest.revision).toBe(2);
       expect(pending.sessions["claude:session-1"].pending_previous_version).toEqual({ eTag: '"v1"' });
       expect(await runCourierOnce(config())).toMatchObject({ uploaded: 1, chunks: 0 });
-      expect(posted[2]).toBe(posted[1]);
+      expect(posted[3]).toBe(posted[2]);
       const landed = JSON.parse(await readFile(statePath, "utf8"));
       expect(landed.sessions["claude:session-1"]).toMatchObject({ revision: 2, pending: false, manifest_version: serverVersion });
       expect(landed.sessions["claude:session-1"].pending_manifest).toBeUndefined();

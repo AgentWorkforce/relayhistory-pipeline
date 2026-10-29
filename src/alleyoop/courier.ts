@@ -252,7 +252,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
   // The ledger follows the Locker, not the other way round: if a recorded manifest is
   // gone (a fresh stack after `down`), the upload state resets while the ids stay.
   for (const [key, st] of Object.entries(state.sessions)) {
-    if (!st.manifest_key || st.revision === 0) continue;
+    if (!st.manifest_key || (st.revision === 0 && !st.pending_manifest)) continue;
     if (verified.has(st.manifest_key)) continue;
     const q = new URLSearchParams({ key: st.manifest_key, machine: state.machine_id, writer: state.machine_id });
     const head = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`, { method: "GET" }).catch(() => undefined);
@@ -292,6 +292,10 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
         started_at: startedAt,
       };
       log.info("session first seen; minted ids", { harness: row.source, session_id: row.session_id, session_uuid: s.session_uuid, trace_id: s.trace_id, session_uuid_source: "minted" });
+      // The first sealed chunk is create-only and carries the trace id in its
+      // metadata. Persist identity before any chunk request so a crash cannot
+      // mint a different trace for the same deterministic chunk key.
+      await saveState(cfg.statePath, state);
     }
     const session = s;
     const loc: SessionLocation = {
