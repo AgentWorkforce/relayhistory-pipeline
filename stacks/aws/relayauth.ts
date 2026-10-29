@@ -10,8 +10,10 @@
  * The issuer is the in-cluster Service URL. Only AlleyOop verifies today and it
  * reaches RelayAuth inside the cluster, so neither JWKS nor the token API is
  * public. Minting a RelayHistory assertion needs the bootstrap API key (scope
- * relayauth:assertion:create:relayhistory) and network access to the Service
- * (`kubectl port-forward`, or an in-cluster courier).
+ * relayauth:assertion:create:relayhistory) and access to the Service through
+ * `kubectl port-forward` (inside the API server's TLS). The Service is plain
+ * HTTP: no in-cluster caller may send the key over the pod network until
+ * RelayAuth has TLS (docs/aws-stage.md, "Transport").
  *
  * Key material never passes through IaC: the Secret `secretName` (keys
  * internal-secret, signing-key.pem, bootstrap-api-key) is created from 1Password
