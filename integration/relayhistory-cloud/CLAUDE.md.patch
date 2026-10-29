@@ -1,0 +1,15 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 6efc9d8..6af8e3a 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -5,6 +5,10 @@ Read `AGENTS.md`, `docs/product-direction.md`, and the root README first.
+ ## Architecture
+ 
+ - One hosted service: Cloudflare Workers + Neon/Postgres/pgvector.
++- Approved exception, inactive until configured: the sessions pipeline writes stage
++  events and dead letters to Supabase `sessions` over REST with the service key, tenant
++  filter in code (`docs/pipeline-observability.md`). Neon remains until a later pipeline
++  retires it; no Neon removal.
+ - All history tables live in `sessions`; Cloud's `public` and migration ledger stay intact.
+ - `scripts/apply-neon-migration.mjs` applies one prepared statement per HTTP query
+   within one locked transaction. `sessions.__migrations` tracks checksums. Add migrations;

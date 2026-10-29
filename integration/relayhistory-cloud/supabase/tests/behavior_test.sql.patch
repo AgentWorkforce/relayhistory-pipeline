@@ -1,0 +1,30 @@
+diff --git a/supabase/tests/behavior_test.sql b/supabase/tests/behavior_test.sql
+index 43eb6c6..9e70cc1 100644
+--- a/supabase/tests/behavior_test.sql
++++ b/supabase/tests/behavior_test.sql
+@@ -213,20 +213,20 @@ DO $$
+ BEGIN
+   ASSERT (SELECT count(*) FROM sessions.session_index) = 4, 'service_role bypasses RLS';
+   INSERT INTO sessions.pipeline_events (trace_id, stage, status, attempt, idempotency_key, error) VALUES
+-    ('0199a000-0000-7000-8000-000000000001', 'index.upsert', 'retrying', 2,
+-     '0199a000-0000-7000-8000-000000000001:index.upsert:retrying:2:x',
++    ('0199a000-0000-7000-8000-000000000001', 'session-indexed', 'retrying', 2,
++     '0199a000-0000-7000-8000-000000000001:session-indexed:retrying:2:x',
+      '{"code": "index.conflict", "name": "IndexConflict", "retryable": true}');
+   INSERT INTO sessions.pipeline_dead_letters (id, stage, trace_id, message) VALUES
+-    ('index.upsert:k1', 'index.upsert', '0199a000-0000-7000-8000-000000000001', '{}');
++    ('session-indexed:k1', 'session-indexed', '0199a000-0000-7000-8000-000000000001', '{}');
+   BEGIN
+     INSERT INTO sessions.pipeline_events (trace_id, stage, status, error) VALUES
+-      (gen_random_uuid(), 'index.upsert', 'error', '"raw foreign text"');
++      (gen_random_uuid(), 'session-indexed', 'error', '"raw foreign text"');
+     RAISE EXCEPTION 'error must be an object with a code';
+   EXCEPTION WHEN check_violation THEN NULL;
+   END;
+   BEGIN
+     INSERT INTO sessions.pipeline_events (trace_id, stage, status) VALUES
+-      (gen_random_uuid(), 'index.upsert', 'retry');
++      (gen_random_uuid(), 'session-indexed', 'retry');
+     RAISE EXCEPTION 'unknown status accepted';
+   EXCEPTION WHEN check_violation THEN NULL;
+   END;

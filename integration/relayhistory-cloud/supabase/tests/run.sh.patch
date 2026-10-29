@@ -1,0 +1,12 @@
+diff --git a/supabase/tests/run.sh b/supabase/tests/run.sh
+index 5cc0f16..635ca6e 100755
+--- a/supabase/tests/run.sh
++++ b/supabase/tests/run.sh
+@@ -26,6 +26,7 @@ psql_ -d "$db" -f tests/behavior_test.sql
+ psql_ -d "$db" -f tests/repo_identity_test.sql
+ psql_ -d "$db" -f tests/scrub_quarantine_test.sql
+ psql_ -d "$db" -f tests/keep_on_null_test.sql
++psql_ -d "$db" -f tests/pipeline_queue_test.sql
+ if [ "${SKIP_EXPLAIN:-}" != 1 ]; then
+   psql_ -d "$db" -v rows="${SEED_ROWS:-200000}" -f tests/seed.sql
+   psql -X -v ON_ERROR_STOP=1 -d "$db" -f tests/explain.sql

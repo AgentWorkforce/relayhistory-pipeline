@@ -1,0 +1,18 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 8b1f5c7..9c74dbd 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -8,6 +8,13 @@ Worker backed by the `sessions` schema in Cloud's Neon database. There is no
+ Enterprise/E2E storage mode, D1/R2 binding, AWS deployment dependency, or SST runtime.
+ Historical documents in `docs/archive` do not override this contract.
+ 
++The sessions pipeline redesign is an approved exception, inactive until configured:
++its stage events and dead letters (`sessions.pipeline_events`,
++`sessions.pipeline_dead_letters`) live in Supabase `sessions`, reached over Supabase
++REST with the service key, with the org/workspace tenant filter enforced in code (see
++`docs/pipeline-observability.md`). Neon stays the store for history and delivery until
++a later pipeline stage retires it: do not remove Neon paths, and PR 170 must not merge.
++
+ Keep the standalone repository and independent CI deployment. Cloud owns `public`;
+ History owns `sessions` and its tracked migrations. Do not alter Cloud's tables.
+ 

@@ -1,0 +1,78 @@
+/**
+ * Stand-in for relayhistory-cloud packages/relayhistory/src/env.ts.
+ *
+ * The pipeline framework (PR #210) imports `Bindings`, `AppEnv`, `AppContext` and
+ * `AuthContext` from "../env.js". Upstream that file declares every binding of the
+ * whole relayhistory Worker; this copy keeps only what the framework reads: the
+ * logger's ENVIRONMENT/POSTHOG_* fields, and the PR #210 additions from
+ * integration/relayhistory-cloud/packages/relayhistory/src/env.ts.patch verbatim
+ * (event store, error tracker, ops secret, telemetry id key, the seven per-stage
+ * `Queue<StageMessage>` bindings). `Variables` and `AuthContext` keep the upstream
+ * field names; upstream-only auth extras (historyOrigin, sessionId,
+ * analyticsIdentity) are left out because nothing here reads them.
+ */
+import type { Context } from "hono";
+
+export interface AuthContext {
+  userId: string;
+  orgId: string;
+  workspaceId?: string;
+  tokenSubject: string;
+  scopes: string[];
+  claims: Record<string, unknown>;
+}
+
+export interface Bindings {
+  ENVIRONMENT?: string;
+  // Request logs leave the Worker only when the key is set (see lib/logger.ts).
+  POSTHOG_API_KEY?: string;
+  POSTHOG_HOST?: string;
+  // Session pipeline observability (see lib/pipeline and docs/pipeline-observability.md).
+  // `PIPELINE_EVENTS_URL` is any PostgREST base URL exposing `pipeline_events` and
+  // `pipeline_dead_letters`; with no URL/token, stage events are log lines only.
+  PIPELINE_EVENTS_URL?: string;
+  PIPELINE_EVENTS_TOKEN?: string;
+  PIPELINE_EVENTS_SCHEMA?: string;
+  /** `otlp` (default; console only until an endpoint is set) | `sentry` | `console` | `none`. */
+  PIPELINE_ERROR_TRACKER?: string;
+  OTEL_EXPORTER_OTLP_ENDPOINT?: string;
+  OTEL_EXPORTER_OTLP_HEADERS?: string;
+  SENTRY_DSN?: string;
+  /** Bearer for the operator-only dead letter replay route. Unset: route answers 503. */
+  PIPELINE_OPS_SECRET?: string;
+  /**
+   * Secret (32+ chars) keying the HMAC that replaces machine and session ids in
+   * pipeline telemetry (lib/pipeline/telemetry-ids.ts). Unset: those ids are
+   * left out of telemetry. Never committed; set with `wrangler secret put`.
+   */
+  PIPELINE_TELEMETRY_ID_KEY?: string;
+  PIPELINE_FILE_NORMALIZE_ENABLED?: string;
+  PIPELINE_OBJECT_LANDED?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
+  PIPELINE_SESSION_INDEXED?: Queue<
+    import("./lib/pipeline/dlq.js").StageMessage
+  >;
+  PIPELINE_FILE_NORMALIZE?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
+  PIPELINE_SUMMARY_SHORT?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
+  PIPELINE_SUMMARY_LONG?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
+  PIPELINE_STATUS_CLASSIFY?: Queue<
+    import("./lib/pipeline/dlq.js").StageMessage
+  >;
+  PIPELINE_FILE_MAINTENANCE?: Queue<
+    import("./lib/pipeline/dlq.js").StageMessage
+  >;
+}
+
+export interface Variables {
+  requestId: string;
+  correlationId: string;
+  /** Session pipeline trace id from `X-Relay-Trace-Id` / `traceparent`, when well formed. */
+  traceId?: string;
+  auth?: AuthContext;
+}
+
+export interface AppEnv {
+  Bindings: Bindings;
+  Variables: Variables;
+}
+
+export type AppContext = Context<AppEnv>;

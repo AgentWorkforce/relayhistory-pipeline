@@ -1,0 +1,15 @@
+{
+  "name": "96bulls-root",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "bun run --filter @96bulls/pipeline typecheck",
+    "test": "bun run --filter @96bulls/pipeline test"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

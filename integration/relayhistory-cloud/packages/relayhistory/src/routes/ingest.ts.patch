@@ -1,0 +1,70 @@
+diff --git a/packages/relayhistory/src/routes/ingest.ts b/packages/relayhistory/src/routes/ingest.ts
+index 0d0b084..ab0bfcc 100644
+--- a/packages/relayhistory/src/routes/ingest.ts
++++ b/packages/relayhistory/src/routes/ingest.ts
+@@ -4,7 +4,11 @@ import type { AppEnv } from "../env.js";
+ import { getAuth, requireScope } from "../middleware/auth.js";
+ import { embeddingProviderFromEnv } from "../lib/embed.js";
+ import { applyIngest } from "../lib/ingest.js";
++import { createLogger, loggerEnvFromBindings } from "../lib/logger.js";
++import { exportableCorrelationId } from "../lib/telemetry.js";
+ import type { IngestRequest, IngestResponse } from "../lib/types.js";
++import { isSafeIdentifier, telemetryIdHash } from "../lib/pipeline/index.js";
++import { recordRequestStage } from "./pipeline.js";
+ 
+ const MAX_BATCH_SIZE = 1000;
+ 
+@@ -37,9 +41,53 @@ ingestRoutes.post("/ingest", requireScope("rth:sync"), async (c) => {
+   }
+ 
+   const db = createDb(c.env.DATABASE_URL);
++  const started = Date.now();
+   const outcome = await applyIngest(db, getAuth(c), body, {
+     embeddings: embeddingProviderFromEnv(c.env),
+   });
++  const sessionIds = new Set(body.records.map((record) => record.sessionId));
++  const correlationId = exportableCorrelationId(c.get("correlationId"));
++  const loggerEnv = loggerEnvFromBindings(c.env);
++  const telemetryKey = loggerEnv.telemetryIdKey;
++  const log = createLogger(loggerEnv, "ingest");
++  log.info("ingest batch", {
++    // Telemetry: the machine as its keyed token, never the raw id.
++    ...(isSafeIdentifier(body.machine.id) && telemetryKey
++      ? {
++          machine_id: telemetryIdHash(telemetryKey, "machine", body.machine.id),
++        }
++      : {}),
++    ...(c.get("traceId") ? { trace_id: c.get("traceId") } : {}),
++    ...(correlationId ? { correlation_id: correlationId } : {}),
++    received: outcome.received,
++    accepted: outcome.accepted,
++    sessions: sessionIds.size,
++  });
++  // A configured log export must finish after the response, not be cancelled.
++  try {
++    c.executionCtx.waitUntil(log.flush());
++  } catch {
++    // No execution context (tests, `app.request`): the flush still runs.
++  }
++  recordRequestStage(
++    c,
++    "deliver.put",
++    "ok",
++    {
++      machineId: body.machine.id,
++      ...(sessionIds.size === 1 ? { sessionId: [...sessionIds][0] } : {}),
++    },
++    {
++      attrs: {
++        destination: "relayhistory",
++        route: "ingest",
++        received: outcome.received,
++        accepted: outcome.accepted,
++        duration_ms: Date.now() - started,
++      },
++      key: `relayhistory:${body.batchId}`,
++    },
++  );
+   const response: IngestResponse = {
+     batchId: body.batchId,
+     received: outcome.received,

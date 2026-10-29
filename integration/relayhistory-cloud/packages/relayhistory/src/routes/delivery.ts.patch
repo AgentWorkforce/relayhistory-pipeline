@@ -1,0 +1,45 @@
+diff --git a/packages/relayhistory/src/routes/delivery.ts b/packages/relayhistory/src/routes/delivery.ts
+index b490cbe..27eed0c 100644
+--- a/packages/relayhistory/src/routes/delivery.ts
++++ b/packages/relayhistory/src/routes/delivery.ts
+@@ -22,6 +22,7 @@ import {
+   type BodyRead,
+ } from "../lib/request-body.js";
+ import { snapshotRequestStats } from "../lib/request-stats.js";
++import { recordRequestStage } from "./pipeline.js";
+ import {
+   captureServerEvent,
+   exportableCorrelationId,
+@@ -170,6 +171,32 @@ deliveryRoutes.post(
+       const statsAfter = snapshotRequestStats();
+       const originId = batch?.origin_id;
+       const correlationId = exportableCorrelationId(c.get("correlationId"));
++      // The legacy RelayHistory destination's put, on the caller's pipeline trace.
++      const sessionIds = new Set(
++        batch?.records.map((record) => record.session_id).filter(Boolean),
++      );
++      recordRequestStage(
++        c,
++        "deliver.put",
++        outcome === "accepted" ? "ok" : "error",
++        {
++          ...(originId ? { machineId: originId } : {}),
++          ...(sessionIds.size === 1
++            ? { sessionId: [...sessionIds][0] as string }
++            : {}),
++        },
++        {
++          ...(outcome === "accepted" ? {} : { errorCode: outcome }),
++          attrs: {
++            destination: "relayhistory",
++            route: "delivery.batches",
++            records: batch?.records.length ?? 0,
++            bytes: read.bytes,
++            duration_ms: Date.now() - started,
++          },
++          key: batch?.batch_id ? `relayhistory:${batch.batch_id}` : undefined,
++        },
++      );
+       // Nothing is scheduled past the response unless an export is configured.
+       if (telemetry.posthogApiKey)
+         waitUntil(
