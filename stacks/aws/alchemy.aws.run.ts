@@ -50,7 +50,7 @@ interface AwsInputs {
   hoopdbSecretArn?: string;
   /** Khaliq, 2026-10-28: EKS is the first cloud compute target. Omit to declare the baseline only. */
   eks?: {
-    chartVersion: string; runtimeSecretName: string; tenantOrgId: string; relayauthJwksUrl: string; relayhistoryOrigin: string;
+    chartVersion: string; runtimeSecretName: string; tenantOrgId: string; relayauthJwksUrl: string; relayhistoryOrigin: string; relayauthIssuer?: string;
     /** The digest publish-image-ecr pushed to THIS account's repository (each account builds its own). */
     imageDigest: string;
     /** Public ingest hostname on Cloudflare DNS (needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID at deploy). */
@@ -230,6 +230,7 @@ export default Alchemy.Stack(
           tenantOrgId: inputs.eks.tenantOrgId,
           relayauthJwksUrl: inputs.eks.relayauthJwksUrl,
           relayhistoryOrigin: inputs.eks.relayhistoryOrigin,
+          ...(inputs.eks.relayauthIssuer ? { relayauthIssuer: inputs.eks.relayauthIssuer } : {}),
           imageRepository: ecr.repositoryUri as unknown as string,
           imageDigest: inputs.eks.imageDigest,
           ...(inputs.eks.ingress ? { ingress: inputs.eks.ingress } : {}),

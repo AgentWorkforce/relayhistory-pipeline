@@ -25,6 +25,8 @@ export interface EksStageInputs {
   tenantOrgId: string;
   relayauthJwksUrl: string;
   relayhistoryOrigin: string;
+  /** The `iss` RelayAuth stamps; must match exactly or every token is refused. */
+  relayauthIssuer?: string;
   /** The account's private ECR repository; nodes pull with their node role, no pull secret. */
   imageRepository: string;
   /** The digest published to this account's repository (per account, from aws-inputs.json). */
@@ -122,8 +124,11 @@ export const eksStage = (i: EksStageInputs) =>
           image: { repository: i.imageRepository, digest: i.imageDigest },
           hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
           locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
-          auth: { jwksUrl: i.relayauthJwksUrl },
-          relayhistoryOrigin: i.relayhistoryOrigin,
+          // The chart's issuer default is the local self-signed one; hosted tokens come from RelayAuth.
+          auth: { jwksUrl: i.relayauthJwksUrl, issuer: i.relayauthIssuer ?? "https://relayauth.dev" },
+          // alleyoop 0.3.0 has no relayhistoryOrigin key: the origin rides in extraEnv, so only
+          // assertions minted for this deployment's origin are accepted.
+          extraEnv: [{ name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin }],
           deployment: { name: "hosted", id: i.stage },
         },
         // Sandboxes run HoopDb in-cluster (Khaliq: container Postgres); other stages use Supabase + S3.
