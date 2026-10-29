@@ -7,6 +7,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
+  "dependencies": {
+    "@relayhistory/object-store": "workspace:*"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "4.20260621.1",
     "@electric-sql/pglite": "0.5.3",
