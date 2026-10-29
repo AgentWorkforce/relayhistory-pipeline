@@ -23,7 +23,9 @@
     "smoke:local": "bun run bin/96bulls smoke local"
   },
   "dependencies": {
+    "@96bulls/pipeline": "workspace:*",
     "@alchemy.run/aws": "2.0.0-beta.84",
+    "@alchemy.run/cloudflare": "2.0.0-beta.84",
     "@alchemy.run/docker": "2.0.0-beta.84",
     "@alchemy.run/kubernetes": "2.0.0-beta.84",
     "@effect/platform-bun": "4.0.7",
@@ -33,12 +35,11 @@
     "@opentelemetry/exporter-trace-otlp-http": "0.300.0",
     "@opentelemetry/resources": "3.0.0",
     "@opentelemetry/sdk-trace-base": "2.12.0",
+    "@relayhistory/object-store": "workspace:*",
     "alchemy": "2.0.0-beta.84",
     "effect": "4.0.7",
-    "pg": "8.23.1",
     "hono": "4.12.26",
-    "@96bulls/pipeline": "workspace:*",
-    "@relayhistory/object-store": "workspace:*"
+    "pg": "8.23.1"
   },
   "devDependencies": {
     "@types/bun": "latest",

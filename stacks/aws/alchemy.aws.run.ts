@@ -18,6 +18,7 @@ import * as Alchemy from "alchemy";
 import { Stage } from "alchemy";
 import * as AWS from "@alchemy.run/aws";
 import * as Kubernetes from "@alchemy.run/kubernetes";
+import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { readFileSync } from "node:fs";
@@ -52,6 +53,8 @@ interface AwsInputs {
     chartVersion: string; runtimeSecretName: string; tenantOrgId: string; relayauthJwksUrl: string; relayhistoryOrigin: string;
     /** The digest publish-image-ecr pushed to THIS account's repository (each account builds its own). */
     imageDigest: string;
+    /** Public ingest hostname on Cloudflare DNS (needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID at deploy). */
+    ingress?: { hostname: string; cloudflareZoneId: string; zoneDomain: string; cloudflareTokenSecret: string };
   };
   /** Khaliq, 2026-10-28: dev HoopDb is a Supabase project in the org the 96Bulls team owns. */
   supabase?: { organizationId: string; projectName: string; region: string; plan?: "free" | "pro"; dbPassRef: string };
@@ -77,7 +80,7 @@ const tags = (stage: string, component: string) => ({ "96bulls:stack": stage, "9
 export default Alchemy.Stack(
   "96bulls-aws",
   {
-    providers: Layer.mergeAll(AWS.providers(), Kubernetes.providers(), SupabaseProvider()),
+    providers: Layer.mergeAll(AWS.providers(), Kubernetes.providers(), Cloudflare.providers(), SupabaseProvider()),
     state: AWS.state({ prefix: "96bulls" }),
   },
   Effect.gen(function* () {
@@ -229,6 +232,7 @@ export default Alchemy.Stack(
           relayhistoryOrigin: inputs.eks.relayhistoryOrigin,
           imageRepository: ecr.repositoryUri as unknown as string,
           imageDigest: inputs.eks.imageDigest,
+          ...(inputs.eks.ingress ? { ingress: inputs.eks.ingress } : {}),
           lockerBucketArn: `arn:aws:s3:::${name("locker")}-${inputs.accountId}`,
           lockerKmsKeyArn: key.keyArn as unknown as string,
           ...(isSandbox ? { permissionsBoundaryArn: `arn:aws:iam::${inputs.accountId}:policy/${SANDBOX_RULES.permissionsBoundary}` } : {}),
