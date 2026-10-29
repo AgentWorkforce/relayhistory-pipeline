@@ -992,6 +992,29 @@ describe("POST /v1/pipeline/manifests", () => {
     });
   });
 
+  it("stores an authenticated posted manifest before enqueueing it", async () => {
+    const reader = objectStoreManifestReader(store, {
+      provider: "fs",
+      bucket: "raw-sessions",
+    });
+    const a = app(
+      {
+        manifests: () => reader,
+        rawStore: () => ({ store, provider: "fs", bucket: "raw-sessions" }),
+      },
+      {},
+    );
+    const res = await post(a, { key: SCRUBBED.key, manifest: SCRUBBED.manifest });
+    expect(res.status).toBe(202);
+    expect(await reader.read(SCRUBBED.key)).not.toBeNull();
+    expect(a.sent).toHaveLength(1);
+    expect(a.sent[0]!.payload).toMatchObject({
+      provider: "fs",
+      bucket: "raw-sessions",
+      scrubbed: true,
+    });
+  });
+
   it("validates a posted copy when no store is configured", async () => {
     const a = app({ manifests: () => undefined }, {});
     const res = await post(a, {
@@ -1030,6 +1053,20 @@ describe("POST /v1/pipeline/manifests", () => {
   it("answers 404 for a manifest not in storage", async () => {
     const a = app({ manifests: () => memoryReader(new Map()) }, {});
     expect((await post(a, { key: SCRUBBED.key })).status).toBe(404);
+  });
+});
+
+describe("GET /v1/pipeline/manifests/status", () => {
+  it("probes manifest existence without enqueueing work", async () => {
+    const reader = memoryReader(
+      new Map([[SCRUBBED.key, { manifest: SCRUBBED.manifest, etag: '"s"' }]]),
+    );
+    const a = app({ manifests: () => reader }, {});
+    const found = await a.request(`/v1/pipeline/manifests/status?key=${encodeURIComponent(SCRUBBED.key)}`, { method: "GET" });
+    const missing = await a.request(`/v1/pipeline/manifests/status?key=${encodeURIComponent(SCRUBBED.key.replace("/s=", "/s=missing-"))}`, { method: "GET" });
+    expect(found.status).toBe(204);
+    expect(missing.status).toBe(404);
+    expect(a.sent).toHaveLength(0);
   });
 });
 

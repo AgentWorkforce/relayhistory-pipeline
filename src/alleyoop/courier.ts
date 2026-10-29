@@ -21,14 +21,20 @@ import {
   type SessionLocation,
 } from "../shared/vendor.ts";
 import { flag, integer, optional, required } from "../shared/env.ts";
-import { lockerStore } from "../shared/locker.ts";
 import { mintToken } from "./auth.ts";
 import { hexTraceId, isUuidV7, spanId, uuidv7 } from "../shared/ids.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { flushTelemetry, initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { EXT } from "../shared/enrich.ts";
+import {
+  fixedBearerToken,
+  mintedBearerToken,
+  RelayAuthAssertionProvider,
+  secretCommand,
+  type BearerTokenProvider,
+} from "./relay-auth-token.ts";
 
-export const PLUGIN_VERSION = "96bulls-courier/0.1.0";
+export const PLUGIN_VERSION = "96bulls-courier/0.2.0";
 const MAX_CHUNK_BYTES = 4 * 1024 * 1024;
 
 interface SessionRow {
@@ -59,55 +65,85 @@ interface SessionState {
 interface CourierState {
   machine_id: string;
   sessions: Record<string, SessionState>;
+  /** When set, sessions that already existed before host enrollment stay local. */
+  enrolled_at?: string;
 }
 
 export interface CourierConfig {
   dbPath: string;
   statePath: string;
   ingestUrl: string;
-  /** A fixed bearer token, or a minter for short-lived ones (local stack: the stack's own key). */
-  token: string | (() => string);
+  /** Fixed/local bearer auth or a JIT RelayAuth assertion provider. */
+  token: BearerTokenProvider;
   orgId: string;
   workspaceId: string;
   userId: string;
   machineId?: string;
   harnesses?: string[];
   closeAfterMinutes: number;
+  startMode: "all" | "new";
+  /** Process-local startup checks: persisted upload state is reconciled once, not every pass. */
+  verifiedManifests?: Set<string>;
 }
 
 export function configFromEnv(): CourierConfig {
   const dbPath = required("CONCOURSE_DB");
+  const orgId = required("TENANT_ORG_ID");
+  const workspaceId = optional("WORKSPACE_ID", "default");
+  const userId = optional("USER_ID", "unknown");
+  let token: BearerTokenProvider;
+  if (process.env.RELAYAUTH_URL) {
+    token = new RelayAuthAssertionProvider({
+      baseUrl: required("RELAYAUTH_URL"),
+      historyOrigin: required("RELAYAUTH_HISTORY_ORIGIN"),
+      orgId,
+      workspaceId,
+      sponsorId: userId,
+      apiKey: secretCommand(required("RELAYAUTH_API_KEY_COMMAND_JSON")),
+      expiresInSeconds: integer("RELAYAUTH_ASSERTION_TTL_SECONDS", 60),
+      refreshSkewSeconds: integer("RELAYAUTH_ASSERTION_REFRESH_SKEW_SECONDS", 15),
+    });
+  } else if (process.env.JWT_PRIVATE_KEY_PEM) {
+    token = mintedBearerToken(() =>
+      mintToken({ kid: required("JWT_KID"), privateKeyPem: required("JWT_PRIVATE_KEY_PEM") }, {
+        issuer: optional("AUTH_ISSUER", "https://96bulls.local"),
+        audience: optional("AUTH_AUDIENCE", "relayhistory"),
+        orgId,
+        workspaceId,
+        userId,
+        ttlSeconds: 3600,
+      }));
+  } else {
+    token = fixedBearerToken(required("ALLEYOOP_TOKEN"));
+  }
+  const startMode = optional("COURIER_START_MODE", "all");
+  if (startMode !== "all" && startMode !== "new") throw new Error("96bulls: COURIER_START_MODE must be all or new");
   return {
     dbPath,
     statePath: optional("COURIER_STATE", join(dirname(dbPath), ".alleyoop-courier.json")),
     ingestUrl: required("INGEST_URL").replace(/\/$/, ""),
-    token: process.env.JWT_PRIVATE_KEY_PEM
-      ? () =>
-          mintToken({ kid: required("JWT_KID"), privateKeyPem: required("JWT_PRIVATE_KEY_PEM") }, {
-            issuer: optional("AUTH_ISSUER", "https://96bulls.local"),
-            audience: optional("AUTH_AUDIENCE", "relayhistory"),
-            orgId: required("TENANT_ORG_ID"),
-            workspaceId: optional("WORKSPACE_ID", "default"),
-            userId: optional("USER_ID", "unknown"),
-            ttlSeconds: 3600,
-          })
-      : required("ALLEYOOP_TOKEN"),
-    orgId: required("TENANT_ORG_ID"),
-    workspaceId: optional("WORKSPACE_ID", "default"),
-    userId: optional("USER_ID", "unknown"),
+    token,
+    orgId,
+    workspaceId,
+    userId,
     ...(process.env.MACHINE_ID ? { machineId: process.env.MACHINE_ID } : {}),
     ...(process.env.HARNESSES ? { harnesses: process.env.HARNESSES.split(",").map((s) => s.trim()).filter(Boolean) } : {}),
     closeAfterMinutes: integer("COURIER_CLOSE_AFTER_MINUTES", 30),
+    startMode,
   };
 }
 
-async function loadState(path: string, machineId?: string): Promise<CourierState> {
+async function loadState(path: string, machineId: string | undefined, startMode: "all" | "new"): Promise<CourierState> {
   try {
     const s = JSON.parse(await readFile(path, "utf8")) as CourierState;
     if (machineId && s.machine_id !== machineId) log.warn("machine id differs from state; keeping state's", {});
     return s;
   } catch {
-    return { machine_id: machineId ?? `m-${createHash("sha256").update(uuidv7()).digest("hex").slice(0, 16)}`, sessions: {} };
+    return {
+      machine_id: machineId ?? `m-${createHash("sha256").update(uuidv7()).digest("hex").slice(0, 16)}`,
+      sessions: {},
+      ...(startMode === "new" ? { enrolled_at: new Date().toISOString() } : {}),
+    };
   }
 }
 
@@ -165,20 +201,29 @@ async function readNewRecords(path: string, from: number): Promise<{ ranges: Arr
 }
 
 export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: number; uploaded: number; chunks: number }> {
-  const state = await loadState(cfg.statePath, cfg.machineId);
-  const store = lockerStore().store;
-  const rows = await readSessions(cfg.dbPath, cfg.harnesses);
-  const token = typeof cfg.token === "function" ? cfg.token() : cfg.token;
+  const state = await loadState(cfg.statePath, cfg.machineId, cfg.startMode);
+  const discovered = await readSessions(cfg.dbPath, cfg.harnesses);
+  const enrolledAtMs = state.enrolled_at ? Date.parse(state.enrolled_at) : Number.NaN;
+  const rows = Number.isFinite(enrolledAtMs)
+    ? discovered.filter((row) => row.first_activity_ms !== null && row.first_activity_ms >= enrolledAtMs)
+    : discovered;
+  const verified = (cfg.verifiedManifests ??= new Set());
   let uploaded = 0;
   let chunks = 0;
   // The ledger follows the Locker, not the other way round: if a recorded manifest is
   // gone (a fresh stack after `down`), the upload state resets while the ids stay.
   for (const [key, st] of Object.entries(state.sessions)) {
     if (!st.manifest_key || st.revision === 0) continue;
-    const head = await store.head(st.manifest_key as never).catch(() => undefined);
-    if (!head) {
+    if (verified.has(st.manifest_key)) continue;
+    const q = new URLSearchParams({ key: st.manifest_key });
+    const head = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`, { method: "GET" }).catch(() => undefined);
+    if (head?.status === 204) {
+      verified.add(st.manifest_key);
+    } else if (head?.status === 404) {
       log.info("manifest missing in locker; re-uploading with the same ids", { session_uuid: st.session_uuid, trace_id: st.trace_id });
       state.sessions[key] = { ...st, revision: 0, uploaded_offset: 0, chunks: [], closed: false, pending: false, scrub: undefined, manifest_key: undefined };
+    } else {
+      log.warn("manifest status unavailable; keeping durable upload state", { session_uuid: st.session_uuid, trace_id: st.trace_id, status: head?.status });
     }
   }
   for (const row of rows) {
@@ -236,10 +281,9 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
           format: "jsonl", seq: String(seq), epoch: "0", offset: String(range.start), date: String(loc.startDate),
           machine: loc.machineId, harness: loc.harness, session: loc.sessionId,
         });
-        const res = await fetch(`${cfg.ingestUrl}/v1/pipeline/chunks?${q}`, {
+        const res = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/chunks?${q}`, {
           method: "POST",
           headers: {
-            authorization: `Bearer ${token}`,
             "content-type": "application/octet-stream",
             "x-relay-trace-id": session.trace_id,
             traceparent,
@@ -309,16 +353,11 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
         log.error("manifest invalid", { count: issues.length, reason: issues[0]!.path });
         throw Object.assign(new Error("manifest invalid"), { code: "manifest_invalid", retryable: false });
       }
-      const body = new TextEncoder().encode(JSON.stringify(manifest));
-      await store.put(mKey, body, {
-        contentType: "application/json",
-        metadata: { "session-uuid": session.session_uuid, "trace-id": session.trace_id, revision: String(revision) },
-      });
       session.manifest_key = mKey;
-      const landed = await fetch(`${cfg.ingestUrl}/v1/pipeline/manifests`, {
+      const landed = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests`, {
         method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "x-relay-trace-id": session.trace_id, traceparent },
-        body: JSON.stringify({ key: mKey }),
+        headers: { "content-type": "application/json", "x-relay-trace-id": session.trace_id, traceparent },
+        body: JSON.stringify({ key: mKey, manifest }),
       });
       if (landed.status !== 202) {
         const b = (await landed.json().catch(() => ({}))) as { error?: { code?: string } };
@@ -327,6 +366,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       session.revision = revision;
       session.closed = shouldClose;
       session.pending = false;
+      verified.add(mKey);
       uploaded += 1;
       log.info("manifest landed", {
         stage: "object-landed", revision, chunk_count: session.chunks.length, bytes_raw: manifest.raw.raw_bytes,
@@ -340,6 +380,17 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
   }
   await saveState(cfg.statePath, state);
   return { sessions: rows.length, uploaded, chunks };
+}
+
+async function authorizedFetch(provider: BearerTokenProvider, input: string, init: RequestInit): Promise<Response> {
+  const send = async () => {
+    const headers = new Headers(init.headers);
+    headers.set("authorization", `Bearer ${await provider.get()}`);
+    return fetch(input, { ...init, headers });
+  };
+  const response = await send();
+  if (response.status !== 401 || !provider.invalidate()) return response;
+  return send();
 }
 
 if (import.meta.main) {
