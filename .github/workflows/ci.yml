@@ -1,0 +1,39 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install (root + workspaces)
+        run: bun install --frozen-lockfile
+      - name: Typecheck packages/pipeline
+        run: bun run --filter @96bulls/pipeline typecheck
+      - name: Test packages/pipeline (vitest, in-process PGlite; no real database)
+        run: bun run --filter @96bulls/pipeline test
+      - name: Unit tests (stack)
+        # The stack's own tests need the vendored relayhistory-cloud sources for scrub; skipped until the #211 port lands.
+        run: |
+          if [ -f vendor/relayhistory-cloud/package.json ]; then bun test; else echo "stack unit tests skipped: vendored sources not checked out in CI"; fi
+      - name: Guard - no Helm hooks in any chart or manifest in this repo
+        run: |
+          # The annotation key is assembled so this file never matches its own guard; .github is excluded as well.
+          key="helm.sh/ho""ok"
+          ! grep -rn "$key" --include='*.yaml' --include='*.yml' --include='*.tpl' . --exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=.github || (echo "helm hooks are not allowed (Alchemy renders --no-hooks)"; exit 1)
+      - name: Guard - nothing secret-like committed
+        run: |
+          ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || (echo "secret-like file tracked"; exit 1)
