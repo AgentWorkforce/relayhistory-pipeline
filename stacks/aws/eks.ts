@@ -53,6 +53,11 @@ export const eksStage = (i: EksStageInputs) =>
     // Refuse before declaring anything billable.
     if (i.relayauth && i.relayauthIssuer)
       throw new Error("96bulls: eks.relayauth (self-hosted) and eks.relayauthIssuer are both set; the self-hosted issuer is the in-cluster RelayAuth. Remove relayauthIssuer. Nothing was created.");
+    // Umbrella 0.3.0 (worker 0.4.0) is the first to give Bob Costas the summary key; older
+    // charts would start it without one and it refuses to run.
+    const [maj, min] = i.chartVersion.split(".").map(Number);
+    if (!(maj! > 0 || (maj === 0 && min! >= 3)))
+      throw new Error(`96bulls: eks.chartVersion ${i.chartVersion} is too old; 0.3.0+ (worker 0.4.0) is required for summary encryption. Nothing was created.`);
     if (!/^sha256:[0-9a-f]{64}$/.test(i.imageDigest ?? ""))
       throw new Error("96bulls: eks.imageDigest is missing or invalid; run publish-image-ecr for this account and put its digest in aws-inputs.json. Nothing was created.");
     const network = yield* AWS.EC2.Network("network", {
@@ -135,16 +140,9 @@ export const eksStage = (i: EksStageInputs) =>
           // The bucket is created and versioned by IaC; the pods' role has no CreateBucket.
           lockerInit: { enabled: false },
           deployment: { name: "hosted", id: i.stage },
-          // Bob Costas alone gets the summary master key (src/shared/keyring.ts), from the runtime
-          // Secret, never values. Per-component env, so the indexer and referee never see it.
-          components: {
-            "bob-costas": {
-              env: [
-                { name: "BOB_COSTAS_MODEL", value: "off" },
-                { name: "SUMMARY_MASTER_KEYS", valueFrom: { secretKeyRef: { name: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" } } },
-              ],
-            },
-          },
+          // Bob Costas alone gets the summary master key (src/shared/keyring.ts): worker 0.4.0 projects
+          // this Secret key as a read-only file into Bob Costas only (SUMMARY_MASTER_KEYS_FILE).
+          summaryEncryption: { existingSecret: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" },
         },
         alleyoop: {
           image: { repository: i.imageRepository, digest: i.imageDigest },

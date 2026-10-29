@@ -146,6 +146,25 @@ v=$(ssh kjg-lap "zsh -lc 'op read \"op://96Bulls-dev/sessions-dev hoopdb/summary
 kubectl -n 96bulls patch secret 96bulls-runtime --type merge -p "$(jq -nc --arg v "$(printf %s "$v" | base64 -w0)" '{data:{SUMMARY_MASTER_KEYS:$v}}')"; unset v
 ```
 
+The umbrella chart must be **0.3.0 or later** (worker 0.4.0): its
+`worker.summaryEncryption` projects that Secret key as a read-only file into
+Bob Costas only, and the stack refuses older chart versions.
+
+**Rollout order for 0004.** The migrate Job runs before the new pods, so an old
+Bob Costas briefly writes the removed `summary` column and fails until it is
+replaced. In local kind, the queue recovered on attempt 3. To avoid burning
+retries on a busy environment, scale it to zero first:
+`kubectl -n 96bulls scale deploy/96bulls-worker-bob-costas --replicas=0`.
+**Then, after the deploy, always scale it back and check.** Do not rely on the
+apply to restore it: the stack applies rendered manifests (helm template plus
+server-side apply), and a manual scale may be preserved.
+
+```sh
+kubectl -n 96bulls scale deploy/96bulls-worker-bob-costas --replicas=1
+kubectl -n 96bulls rollout status deploy/96bulls-worker-bob-costas --timeout=300s
+kubectl -n 96bulls get deploy 96bulls-worker-bob-costas -o jsonpath='{.status.readyReplicas}'   # 1
+```
+
 Migration 0004 deletes existing `session_summaries` rows, because they hold
 plaintext. They are derived: Bob Costas's summary sweep (at startup, then every
 `SUMMARY_SWEEP_SECONDS`, default 300) re-queues every indexed session without a
