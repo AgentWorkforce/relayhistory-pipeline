@@ -95,14 +95,22 @@ export async function buildIngestApp() {
   // password once sessions reconnect) /healthz turns 503 so the orchestrator restarts us.
   const health: WorkerHealth = { ready: true, lastTickAt: Date.now(), consecutiveDbFailures: 0 };
   const maxFailures = integer("WORKER_UNHEALTHY_AFTER_FAILURES", 5);
+  const maxTickAgeMs = integer("WORKER_MAX_TICK_AGE_MS", 120_000);
+  // One probe at a time, so results apply in order (a late success can't mask newer failures).
+  let probing = false;
   setInterval(() => {
+    if (probing) return;
+    probing = true;
     db.query("SELECT 1")
       .then(() => (health.consecutiveDbFailures = 0))
       .catch(() => (health.consecutiveDbFailures += 1))
-      .finally(() => (health.lastTickAt = Date.now()));
+      .finally(() => {
+        health.lastTickAt = Date.now();
+        probing = false;
+      });
   }, 10_000).unref();
   app.get("/healthz", (c) => {
-    const v = healthVerdict(health, Date.now(), { maxFailures, maxTickAgeMs: 120_000 });
+    const v = healthVerdict(health, Date.now(), { maxFailures, maxTickAgeMs });
     return c.json(v, v.ok ? 200 : 503);
   });
   // Ready = the schema this image was built for is fully migrated, not just "DB answers".
