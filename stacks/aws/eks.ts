@@ -31,6 +31,8 @@ export interface EksStageInputs {
   /** The Locker bucket ARN and its KMS key ARN, for the pods' Pod Identity role. */
   lockerBucketArn: string;
   lockerKmsKeyArn: string;
+  /** Sandbox stages: every role we create carries this permissions boundary and the bounded tag. */
+  permissionsBoundaryArn?: string;
   tags: Record<string, string>;
 }
 
@@ -76,7 +78,8 @@ export const eksStage = (i: EksStageInputs) =>
         },
       },
       maxSessionDuration: "1 hour",
-      tags: i.tags,
+      ...(i.permissionsBoundaryArn ? { permissionsBoundary: i.permissionsBoundaryArn } : {}),
+      tags: { ...i.tags, ...(i.permissionsBoundaryArn ? { "96bulls:bounded": "true" } : {}) },
     });
     for (const sa of ["96bulls-worker", "96bulls-alleyoop"]) {
       yield* AWS.EKS.PodIdentityAssociation(`pod-identity-${sa}`, {

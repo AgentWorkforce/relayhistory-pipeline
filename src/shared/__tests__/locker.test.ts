@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { credentialSource, podIdentityCredentials } from "../locker.ts";
+import { credentialSource, podIdentityCredentials, trustedCredentialsUri } from "../locker.ts";
 
 describe("locker credentials", () => {
   test("static keys win when both are set", () => {
@@ -25,5 +25,17 @@ describe("locker credentials", () => {
     const c = await podIdentityCredentials({ AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://169.254.170.23/v1/credentials", AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: join(dir, "token") }, fake);
     expect(seenAuth).toBe("tok-123");
     expect(c).toEqual({ accessKeyId: "AK", secretAccessKey: "SK", sessionToken: "ST", expiresAt: new Date("2030-01-01T00:00:00Z") });
+  });
+});
+
+describe("credentials endpoint allowlist", () => {
+  test("accepts the EKS pod identity agent and loopback", () => {
+    expect(trustedCredentialsUri("http://169.254.170.23/v1/credentials")).toBe(true);
+    expect(trustedCredentialsUri("http://[fd00:ec2::23]/v1/credentials")).toBe(true);
+    expect(trustedCredentialsUri("http://127.0.0.1:9000/creds")).toBe(true);
+  });
+  test("refuses arbitrary http hosts", async () => {
+    expect(trustedCredentialsUri("http://evil.example.com/creds")).toBe(false);
+    await expect(podIdentityCredentials({ AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://evil.example.com/creds", AWS_CONTAINER_AUTHORIZATION_TOKEN: "t" })).rejects.toThrow("not a trusted");
   });
 });

@@ -231,6 +231,7 @@ export default Alchemy.Stack(
           imageDigest: inputs.eks.imageDigest,
           lockerBucketArn: `arn:aws:s3:::${name("locker")}-${inputs.accountId}`,
           lockerKmsKeyArn: key.keyArn as unknown as string,
+          ...(isSandbox ? { permissionsBoundaryArn: `arn:aws:iam::${inputs.accountId}:policy/${SANDBOX_RULES.permissionsBoundary}` } : {}),
           tags: tags(stage, "eks"),
         })
       : undefined;

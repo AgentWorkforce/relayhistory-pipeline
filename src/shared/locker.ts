@@ -34,10 +34,28 @@ interface ContainerCredentials {
   Expiration?: string;
 }
 
+/**
+ * The only hosts the credentials token may be sent to: the EKS Pod Identity agent
+ * (169.254.170.23, fd00:ec2::23), the ECS endpoint (169.254.170.2) and loopback.
+ * Mirrors the AWS SDKs' allowlist, so a misconfigured URI can't capture the token.
+ */
+const TRUSTED_CREDENTIAL_HOSTS = new Set(["169.254.170.23", "[fd00:ec2::23]", "169.254.170.2", "127.0.0.1", "localhost", "[::1]"]);
+
+export function trustedCredentialsUri(uri: string): boolean {
+  try {
+    const u = new URL(uri);
+    if (u.protocol === "https:") return true;
+    return u.protocol === "http:" && TRUSTED_CREDENTIAL_HOSTS.has(u.hostname.startsWith("[") ? u.hostname : u.hostname);
+  } catch {
+    return false;
+  }
+}
+
 /** EKS Pod Identity / container credentials endpoint (the same contract the AWS SDKs use). */
 export async function podIdentityCredentials(env: NodeJS.ProcessEnv = process.env, fetcher: typeof fetch = fetch): Promise<AwsCredentials> {
   const uri = env.AWS_CONTAINER_CREDENTIALS_FULL_URI;
   if (!uri) throw new Error("96bulls: AWS_CONTAINER_CREDENTIALS_FULL_URI is not set");
+  if (!trustedCredentialsUri(uri)) throw new Error("96bulls: AWS_CONTAINER_CREDENTIALS_FULL_URI is not a trusted credentials endpoint; refusing to send the token");
   const tokenFile = env.AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE;
   const token = tokenFile ? (await readFile(tokenFile, "utf8")).trim() : env.AWS_CONTAINER_AUTHORIZATION_TOKEN;
   const res = await fetcher(uri, { headers: token ? { authorization: token } : {} });
