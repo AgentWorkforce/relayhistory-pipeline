@@ -47,6 +47,18 @@ interface SessionRow {
   agent_version: string | null;
 }
 
+export function sessionsForStartMode<T extends Pick<SessionRow, "first_activity_ms">>(
+  rows: T[],
+  startMode: "all" | "new",
+  enrolledAt?: string,
+): T[] {
+  if (startMode === "all" || !enrolledAt) return rows;
+  const enrolledAtMs = Date.parse(enrolledAt);
+  return Number.isFinite(enrolledAtMs)
+    ? rows.filter((row) => row.first_activity_ms !== null && row.first_activity_ms >= enrolledAtMs)
+    : rows;
+}
+
 interface SessionState {
   session_uuid: string;
   trace_id: string;
@@ -203,10 +215,7 @@ async function readNewRecords(path: string, from: number): Promise<{ ranges: Arr
 export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: number; uploaded: number; chunks: number }> {
   const state = await loadState(cfg.statePath, cfg.machineId, cfg.startMode);
   const discovered = await readSessions(cfg.dbPath, cfg.harnesses);
-  const enrolledAtMs = state.enrolled_at ? Date.parse(state.enrolled_at) : Number.NaN;
-  const rows = Number.isFinite(enrolledAtMs)
-    ? discovered.filter((row) => row.first_activity_ms !== null && row.first_activity_ms >= enrolledAtMs)
-    : discovered;
+  const rows = sessionsForStartMode(discovered, cfg.startMode, state.enrolled_at);
   const verified = (cfg.verifiedManifests ??= new Set());
   let uploaded = 0;
   let chunks = 0;
