@@ -86,10 +86,21 @@ export interface WorkerHealth {
   consecutiveDbFailures: number;
 }
 
+/**
+ * Liveness. `lastTickAt` is progress, not just loop turns: it moves on every
+ * tick, at the start and end of every handled message, and while the worker
+ * waits for HoopDb or the schema, so a long batch, reconcile or migration is
+ * never mistaken for a stall.
+ */
 export function healthVerdict(h: WorkerHealth, now: number, opts: { maxFailures: number; maxTickAgeMs: number }) {
-  if (now - h.lastTickAt > opts.maxTickAgeMs) return { ok: false, reason: "loop_stalled" };
   if (h.consecutiveDbFailures >= opts.maxFailures) return { ok: false, reason: "hoopdb_unreachable" };
-  return { ok: true, reason: "ok" };
+  if (now - h.lastTickAt > opts.maxTickAgeMs) return { ok: false, reason: "loop_stalled" };
+  return { ok: true, reason: h.ready ? "ok" : "starting" };
+}
+
+/** Readiness: the schema is complete and HoopDb is answering now. */
+export function readyVerdict(h: WorkerHealth, opts: { maxFailures: number }) {
+  return h.ready && h.consecutiveDbFailures < opts.maxFailures;
 }
 
 function serveHealth(health: WorkerHealth, port: number) {
@@ -97,8 +108,9 @@ function serveHealth(health: WorkerHealth, port: number) {
   const maxTickAgeMs = integer("WORKER_MAX_TICK_AGE_MS", 120_000);
   const server = createServer((req, res) => {
     if (req.url === "/readyz") {
-      res.writeHead(health.ready ? 200 : 503, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: health.ready }));
+      const ok = readyVerdict(health, { maxFailures });
+      res.writeHead(ok ? 200 : 503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok }));
       return;
     }
     if (req.url === "/healthz") {
@@ -118,9 +130,13 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   const health: WorkerHealth = { ready: false, lastTickAt: Date.now(), consecutiveDbFailures: 0 };
   serveHealth(health, integer("WORKER_HEALTH_PORT", 8081));
   const db = openHoopDb();
+  // Waiting for HoopDb or a long migration is progress, not a stall.
+  const startupBeat = setInterval(() => (health.lastTickAt = Date.now()), 10_000);
   await waitForHoopDb(db);
   await waitForSchema(db, await expectedMigrationNames());
+  clearInterval(startupBeat);
   health.ready = true;
+  health.lastTickAt = Date.now();
   const env = vendorBindings() as Parameters<typeof pipelineQueueDeps>[0];
   const rawQueue = postgresPipelineQueue(db);
   let current: StageMessage | undefined;
@@ -147,10 +163,12 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
     const h = traced(stage, deps.handlers[stage]!);
     deps.handlers[stage] = async (message, recorder, attempt) => {
       current = message;
+      health.lastTickAt = Date.now(); // progress inside a batch
       try {
         return await h(message, recorder, attempt);
       } finally {
         current = undefined;
+        health.lastTickAt = Date.now();
       }
     };
   }
@@ -189,10 +207,14 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
       }
     }
     if (opts.tick) {
+      // Long side work (reconcile) keeps the progress clock moving while it runs.
+      const tickBeat = setInterval(() => (health.lastTickAt = Date.now()), 10_000);
       try {
         await opts.tick(db, new Date());
       } catch (err) {
         log.error("tick failed", errorFields(err));
+      } finally {
+        clearInterval(tickBeat);
       }
     }
     if (claimed === 0) await sleep(idleMs);
