@@ -11,7 +11,6 @@
 import * as AWS from "@alchemy.run/aws";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
-import versions from "../../versions.lock.json" with { type: "json" };
 
 export interface EksStageInputs {
   stage: string;
@@ -25,11 +24,18 @@ export interface EksStageInputs {
   tenantOrgId: string;
   relayauthJwksUrl: string;
   relayhistoryOrigin: string;
+  /** The account's private ECR repository; nodes pull with their node role, no pull secret. */
+  imageRepository: string;
+  /** The digest published to this account's repository (per account, from aws-inputs.json). */
+  imageDigest: string;
   tags: Record<string, string>;
 }
 
 export const eksStage = (i: EksStageInputs) =>
   Effect.gen(function* () {
+    // Refuse before declaring anything billable.
+    if (!/^sha256:[0-9a-f]{64}$/.test(i.imageDigest ?? ""))
+      throw new Error("96bulls: eks.imageDigest is missing or invalid; run publish-image-ecr for this account and put its digest in aws-inputs.json. Nothing was created.");
     const network = yield* AWS.EC2.Network("network", {
       cidrBlock: "10.42.0.0/16",
       availabilityZones: 2,
@@ -46,7 +52,6 @@ export const eksStage = (i: EksStageInputs) =>
       tags: i.tags,
     });
     const sandbox = i.stage.startsWith("aws-sandbox-");
-    const image = versions.images["services"] as { ref: string; digest: string };
     const chart = yield* Kubernetes.HelmChart("96bulls", {
       cluster,
       chart: "96bulls",
@@ -57,7 +62,8 @@ export const eksStage = (i: EksStageInputs) =>
       createNamespace: true,
       values: {
         global: {
-          image: { repository: image.ref, digest: image.digest },
+          // Digest of the image pushed to ECR by publish-image-ecr (same build as versions.lock.json's digest).
+          image: { repository: i.imageRepository, digest: i.imageDigest },
           existingSecret: i.runtimeSecretName,
           env: {
             TENANT_ORG_ID: i.tenantOrgId,

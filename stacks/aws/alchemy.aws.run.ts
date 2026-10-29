@@ -42,7 +42,11 @@ interface AwsInputs {
   /** Where HoopDb lives (RDS/Supabase URL in Secrets Manager); not created here. */
   hoopdbSecretArn?: string;
   /** Khaliq, 2026-10-28: EKS is the first cloud compute target. Omit to declare the baseline only. */
-  eks?: { chartVersion: string; runtimeSecretName: string; tenantOrgId: string; relayauthJwksUrl: string; relayhistoryOrigin: string };
+  eks?: {
+    chartVersion: string; runtimeSecretName: string; tenantOrgId: string; relayauthJwksUrl: string; relayhistoryOrigin: string;
+    /** The digest publish-image-ecr pushed to THIS account's repository (each account builds its own). */
+    imageDigest: string;
+  };
   /** Khaliq, 2026-10-28: dev HoopDb is a Supabase project in the org the 96Bulls team owns. */
   supabase?: { organizationId: string; projectName: string; region: string; plan?: "free" | "pro"; dbPassRef: string };
 }
@@ -130,6 +134,19 @@ export default Alchemy.Stack(
       ],
     });
 
+    // ECR: the hosted service image lives in the account, private (Khaliq, 2026-10-28: not public).
+    const ecr = yield* AWS.ECR.Repository("services-image", {
+      repositoryName: "96bulls-services",
+      imageTagMutability: "IMMUTABLE",
+      scanOnPush: true,
+      // Expire only untagged leftovers (failed or superseded multi-arch pushes). Published images are
+      // tagged sha-<commit> and never expire automatically, so a pinned, deployed digest is never deleted.
+      lifecyclePolicyText: JSON.stringify({
+        rules: [{ rulePriority: 1, description: "expire untagged images after 14 days", selection: { tagStatus: "untagged", countType: "sinceImagePushed", countUnit: "days", countNumber: 14 }, action: { type: "expire" } }],
+      }),
+      tags: tags(stage, "ecr"),
+    });
+
     // GitHub OIDC: the only way CI deploys. Trusted for this repository alone.
     const oidc = yield* AWS.IAM.OpenIDConnectProvider("github-oidc", {
       url: "https://token.actions.githubusercontent.com",
@@ -148,7 +165,9 @@ export default Alchemy.Stack(
             Action: ["sts:AssumeRoleWithWebIdentity"],
             Condition: {
               StringEquals: { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-              StringLike: { "token.actions.githubusercontent.com:sub": `repo:${REPO}:*` },
+              // Only jobs that run in the gated GitHub environments may assume it: the Khaliq-only
+              // image publish and per-stage deploys. Other workflows in the repo cannot.
+              StringLike: { "token.actions.githubusercontent.com:sub": [`repo:${REPO}:environment:image-publish`, `repo:${REPO}:environment:deploy-${stage}`] },
             },
           },
         ],
@@ -160,6 +179,15 @@ export default Alchemy.Stack(
             { Effect: "Allow", Action: ["s3:ListBucket", "s3:GetBucketLocation", "s3:GetBucketVersioning"], Resource: [`arn:aws:s3:::${name("locker")}-${inputs.accountId}`] },
             { Effect: "Allow", Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:ListBucketVersions"], Resource: [`arn:aws:s3:::${name("locker")}-${inputs.accountId}/*`] },
             { Effect: "Allow", Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"], Resource: [key.keyArn as unknown as string] },
+          ],
+        },
+        // Push the services image to this account's ECR repository only.
+        ecrPush: {
+          Version: "2012-10-17",
+          Statement: [
+            { Effect: "Allow", Action: ["ecr:GetAuthorizationToken"], Resource: "*" },
+            { Effect: "Allow", Action: ["ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:BatchGetImage", "ecr:DescribeImages"],
+              Resource: [`arn:aws:ecr:${inputs.region}:${inputs.accountId}:repository/96bulls-services`] },
           ],
         },
       },
@@ -191,6 +219,8 @@ export default Alchemy.Stack(
           tenantOrgId: inputs.eks.tenantOrgId,
           relayauthJwksUrl: inputs.eks.relayauthJwksUrl,
           relayhistoryOrigin: inputs.eks.relayhistoryOrigin,
+          imageRepository: ecr.repositoryUri as unknown as string,
+          imageDigest: inputs.eks.imageDigest,
           tags: tags(stage, "eks"),
         })
       : undefined;
@@ -202,6 +232,7 @@ export default Alchemy.Stack(
       accountId: inputs.accountId,
       region: inputs.region,
       locker: { bucket: locker.bucketName, kmsKeyArn: key.keyArn },
+      imageRepository: ecr.repositoryUri,
       deployerRoleArn: deployer.roleArn,
       hoopdbSecretArn: inputs.hoopdbSecretArn ?? null,
     };
