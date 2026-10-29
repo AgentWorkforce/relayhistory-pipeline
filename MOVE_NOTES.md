@@ -1,4 +1,9 @@
-# MOVE_NOTES: pipeline framework from relayhistory-cloud PR #210
+# MOVE_NOTES: pipeline framework from relayhistory-cloud PRs #210 and #211
+
+The #210 notes come first; the #211 port (storage adapter and object store)
+is at the end.
+
+# PR #210
 
 Source: https://github.com/AgentWorkforce/relayhistory-cloud/pull/210
 (branch `sp/pipeline-framework`, head `f544f6de80106f7782b48993bb269e0cb152831e`, 11 commits).
@@ -83,13 +88,14 @@ edited to get there.
 | `packages/pipeline/vitest.config.ts` | upstream config minus the cloud-client alias (30 s hook timeout for PGlite) |
 | `src/env.ts` | Types only: `Bindings` with `ENVIRONMENT`, `POSTHOG_*` and the `env.ts.patch` additions copied verbatim (including the seven `Queue<StageMessage>` bindings and `PIPELINE_TELEMETRY_ID_KEY`), `Variables` (with `traceId`), `AppEnv`, `AppContext`, `AuthContext`. The rest of the relayhistory Worker's bindings are left out |
 | `src/lib/logger.ts` | Upstream file at `f544f6d` with `logger.ts.patch` applied |
-| `src/lib/scrub.ts` | Verbatim upstream file at `f544f6d` (last changed in `cdc55a6`, #179), under a provenance header |
+| `src/lib/scrub.ts` | Verbatim upstream file at `f544f6d` (last changed in `cdc55a6`, #179). Since the #211 port it carries no header (see below) |
 | `src/middleware/auth.ts` | `getAuth` and `requireScope` copied unchanged, and a re-export of `AuthContext`. No token verification: the host app authenticates and sets `auth` on the context |
 | `src/app.ts` | Minimal `createApp({ auth? })`: the `app.ts.patch` id/trace-id middleware echoing `X-Relay-Trace-Id`, one request log line carrying `trace_id` (the `observability.ts.patch` hunk, without upstream's request stats), `/health`, `pipelineOpsRoutes` under `/v1` outside auth, and `pipelineRoutes` under `/v1` behind `auth`. The default `auth` answers 401 unless `auth` is already set |
 | `supabase/migrations/20261025000{000,100,200,300}_*.sql`, `supabase/tests/supabase_shim.sql` | Verbatim from `f544f6d`. See `supabase/README.md` |
 
 Every stand-in file has a header that names the upstream file it replaces and
-says why it exists.
+says why it exists, except `src/lib/scrub.ts`, which must stay byte-identical
+(see the #211 section).
 
 ## Commands
 
@@ -220,3 +226,153 @@ patches need the same base schema, and `dblink` for the concurrent-claim case.
 The migration's header comment still names `packages/relayhistory/src/lib/pipeline/registry.ts`.
 Here that file is `packages/pipeline/src/lib/pipeline/registry.ts`. The comment
 was left untouched so the file stays byte-identical.
+
+# PR #211: storage adapter, chunk hop, manifest reconcile, object store
+
+Source: https://github.com/AgentWorkforce/relayhistory-cloud/pull/211
+(branch `sp/rebuild-storage-adapter`, head
+`d9f2ba2bedf8d8e73f3b406f93383d598cb5956f`, checked with
+`gh pr view 211 -R AgentWorkforce/relayhistory-cloud --json headRefOid` on
+2026-10-28; state OPEN). #211 is stacked on #210 (`f544f6d`); its diff against
+`f544f6d` is 17 files. Every one of them is either copied byte-identical here
+or kept as a patch.
+
+Status: inactive, the same as #210. Nothing is wired into a worker, a queue
+binding, an R2 event notification, a cron or a deployment. No migration was
+applied to any database (#211 adds none). Tests use in-process PGlite and an
+in-memory/local-directory object store; the optional MinIO block ran against a
+throwaway local container that was removed afterwards.
+
+## Mapping
+
+| relayhistory-cloud (#211 head `d9f2ba2`) | 96BullSessions | How |
+| --- | --- | --- |
+| `packages/object-store/**` (32 files, incl. `s3.ts` and `test/unit.test.ts` changed by #211) | `packages/object-store/**` | whole package, byte-identical (on relayhistory-cloud `main` since #174/#205, unchanged by #210) |
+| `packages/relayhistory/src/lib/pipeline/{adapter,object-layout,raw-chunks,reconcile}.ts` (added) | `packages/pipeline/src/lib/pipeline/` | byte-identical |
+| `packages/relayhistory/src/lib/pipeline/{events,telemetry-ids,trace}.ts` (changed) | `packages/pipeline/src/lib/pipeline/` | overwritten, byte-identical |
+| `packages/relayhistory/src/routes/pipeline.ts` (changed) | `packages/pipeline/src/routes/pipeline.ts` | overwritten, byte-identical |
+| `packages/relayhistory/test/{pipeline-adapter,scrub-ruleset-version}.test.ts` (added) | `packages/pipeline/test/` | byte-identical |
+| `packages/relayhistory/test/pipeline-observability.test.ts` (changed) | `packages/pipeline/test/` | overwritten, byte-identical |
+| `docs/pipeline-storage-adapter.md` (added), `docs/pipeline-observability.md` (changed) | `docs/` | byte-identical |
+| `packages/relayhistory/src/api-worker.ts` (changed) | `integration/relayhistory-cloud/pr-211/packages/relayhistory/src/api-worker.ts.patch` | patch, not applied |
+| `packages/relayhistory/src/env.ts` (changed) | `integration/relayhistory-cloud/pr-211/packages/relayhistory/src/env.ts.patch`, and the fields in the `src/env.ts` stand-in | patch + stand-in |
+
+After the port, every file under `packages/pipeline/src/lib/pipeline/`,
+`src/routes/pipeline.ts` and `test/` (including `test/support/`) matches its
+blob at `d9f2ba2` (checked with `cmp`), and so does `src/lib/scrub.ts`.
+
+The moved files import the object store by relative path
+(`../../../../object-store/src/index.js` from `lib/pipeline/`,
+`../../object-store/src/...` from `test/`). With `packages/object-store` next
+to `packages/pipeline` those paths resolve exactly as upstream, so no alias was
+needed for the moved files. `packages/pipeline/package.json` also declares
+`"@relayhistory/object-store": "workspace:*"`, so code in this repo can import
+it by package name (`packages/pipeline/node_modules/@relayhistory/object-store`
+is a link to `packages/object-store`). That package's `exports` point at
+`dist/`, so a by-name import needs `bun run build` first; the build output is
+gitignored.
+
+## Stand-in changes
+
+- `packages/pipeline/src/env.ts`: added the twelve #211 bindings verbatim
+  (`PIPELINE_RAW_PROVIDER`, `PIPELINE_RAW_S3_{BUCKET,ENDPOINT,REGION,ACCESS_KEY_ID,SECRET_ACCESS_KEY,SSE}`,
+  `PIPELINE_ORG_ID`, `PIPELINE_ORG_FROM_PREFIX`, `PIPELINE_KEY_PREFIX`,
+  `PIPELINE_RECONCILE_ENABLED`, `PIPELINE_RECONCILE_LOOKBACK_MINUTES`) and
+  mentioned them in the header.
+- `packages/pipeline/src/lib/scrub.ts`: the six-line provenance header was
+  removed, so the file is now byte-identical to upstream `lib/scrub.ts` at
+  `f544f6d` and `d9f2ba2` (blob unchanged since `cdc55a6`, #179).
+  `test/scrub-ruleset-version.test.ts` pins `SCRUB_RULESET_VERSION = 1` to the
+  sha256 of that file (`db9d65c7ab230d67488900203bb78ca8bd3ad16949a0a51b5d3d117d0cff49f8`),
+  so any header fails the test. Provenance is recorded here instead.
+- `src/app.ts`, `src/lib/logger.ts`, `src/middleware/auth.ts`: unchanged. #211
+  does not touch upstream `app.ts`, `logger.ts`, `auth.ts` or
+  `observability.ts`.
+
+## Workspace and package wiring
+
+| Changed | What |
+| --- | --- |
+| root `package.json` | `build` = `bun run --filter @relayhistory/object-store build`; `typecheck` and `test` also run the object-store package |
+| `packages/pipeline/package.json` | `dependencies: { "@relayhistory/object-store": "workspace:*" }` |
+| `bun.lock` | the object-store workspace and its deps (zod 4.6.7, esbuild 0.28.2, prettier 3.9.10; vitest 4.1.9 and typescript 5.9.3 shared). `packages/object-store/package.json` keeps upstream's caret ranges verbatim; the lockfile pins them |
+
+## Integration patches
+
+The twelve #210 patches under `integration/relayhistory-cloud/` are unchanged:
+each still reproduces exactly from `git diff 248fe67 f544f6d -- <file>`, and
+for ten of the twelve files `git diff f544f6d d9f2ba2` is empty. The two files
+#211 changes get stacked patches, generated with
+`git diff f544f6d d9f2ba2 -- <file>`:
+
+- `integration/relayhistory-cloud/pr-211/packages/relayhistory/src/api-worker.ts.patch`:
+  dispatches `OBJECT_EVENTS_QUEUE_PREFIX` batches to `handleObjectEventQueue`
+  (with `r2EventSource`, `manifestReaderFromEnv`, `orgResolverFromEnv`,
+  `prefixAllowed`, `pipelineQueueFromEnv`), and runs `runManifestReconcile` from
+  the scheduled handler.
+- `integration/relayhistory-cloud/pr-211/packages/relayhistory/src/env.ts.patch`:
+  the twelve bindings above.
+
+To reproduce upstream's call sites at the #211 head, apply the #210 patch for a
+file and then the `pr-211/` patch for it.
+
+## Commands
+
+```sh
+bun install
+bun run build                                       # object-store: tsc -p tsconfig.build.json -> packages/object-store/dist
+bun run --filter @96bulls/pipeline typecheck        # tsc --noEmit
+bun run --filter @relayhistory/object-store typecheck
+bun run --filter @96bulls/pipeline test             # vitest, PGlite in process
+bun run --filter @relayhistory/object-store test    # vitest
+
+# optional MinIO block of test/pipeline-adapter.test.ts (and the object-store S3 conformance)
+docker run -d --rm --name p211-minio -p 127.0.0.1:29110:9000 \
+  -e MINIO_ROOT_USER=rh-conformance -e MINIO_ROOT_PASSWORD=rh-conformance-secret \
+  cgr.dev/chainguard/minio:latest server /data
+RH_OBJSTORE_S3_ENDPOINT=http://127.0.0.1:29110 RH_OBJSTORE_S3_ACCESS_KEY_ID=rh-conformance \
+  RH_OBJSTORE_S3_SECRET_ACCESS_KEY=rh-conformance-secret npx vitest run   # in either package
+docker rm -f p211-minio
+```
+
+`packages/object-store/scripts/emulators.sh` is included verbatim but was not
+used: it names its containers `rh-objstore-*`, which are reserved on this
+machine. The commands above start the same MinIO image with the same
+credentials under another name and port.
+
+## Results (2026-10-28)
+
+- `@96bulls/pipeline` typecheck: exit 0.
+- `@relayhistory/object-store` typecheck: exit 0. Build: exit 0.
+- `@96bulls/pipeline` test: 5 files, 161 passed, 1 skipped (162). Per file:
+  `pipeline-adapter` 44 passed + 1 skipped (the MinIO block, no
+  `RH_OBJSTORE_S3_ENDPOINT`), `pipeline-observability` 80, `pipeline-queue` 26,
+  `pipeline-supabase-schema` 10, `scrub-ruleset-version` 1.
+- With the throwaway MinIO: `pipeline-adapter.test.ts` 45 passed (45).
+- `@relayhistory/object-store` test: 6 files, 51 passed, 3 skipped (54). The
+  three skips are the S3, GCS and Azure conformance runs with no emulator. With
+  the throwaway MinIO: 52 passed, 2 skipped (GCS and Azure; no emulators
+  started for them).
+
+Root `bun run typecheck` and `bun run test` start with the stack's own
+`tsc --noEmit` and `bun test` over `src/`. In this worktree those fail before
+reaching the packages, because the `vendor/relayhistory-cloud` submodule is not
+checked out (every error is `Cannot find module '@rhc/...'`). That is
+independent of this port; `src/` was not changed.
+
+## For the stack's import switch (not done here)
+
+Everything `src/shared/vendor.ts` imports from `@rhc/lib/pipeline/*`,
+`@rhc/routes/pipeline.ts`, `@rhc/lib/scrub.ts`, `@rhc/env.ts` and
+`@rhc-object-store` now exists under `packages/pipeline/src` and
+`packages/object-store/src` with the same names. Three imports have no
+counterpart here, because they are relayhistory-cloud `main` modules outside
+both PR diffs: `healthRoutes` (`routes/health.ts`), `requireAuth`
+(`middleware/auth.ts`; the stand-in only has `getAuth`/`requireScope`) and
+`observability` (`middleware/observability.ts`).
+
+The submodule is pinned at `6f6d568`, not at the current #211 head `d9f2ba2`.
+`6f6d568` is not an ancestor of `d9f2ba2` (the branch was rebased), and the
+two differ in 25 files, including the review fixes to `raw-chunks.ts`,
+`telemetry-ids.ts`, `routes/pipeline.ts` and `queue.ts`. Switching the stack to
+these packages also moves it to `d9f2ba2`.
