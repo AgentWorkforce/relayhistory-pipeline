@@ -376,3 +376,12 @@ The submodule is pinned at `6f6d568`, not at the current #211 head `d9f2ba2`.
 two differ in 25 files, including the review fixes to `raw-chunks.ts`,
 `telemetry-ids.ts`, `routes/pipeline.ts` and `queue.ts`. Switching the stack to
 these packages also moves it to `d9f2ba2`.
+
+### Not moved: `packages/object-store/scripts/emulators.sh`
+
+Dropped from the port on review (96BullSessions #6). The upstream script
+generates a throwaway GCS signing key into `gcs-sa.pem`/`gcs-sa.json` on disk
+and leaves them after `down`, which conflicts with this repository's rule that
+no credential-like file lives on disk. The S3/GCS/Azure conformance tests still
+run against emulators started by hand (the MinIO block was exercised that way);
+a cleaner emulator helper can come later if needed.
