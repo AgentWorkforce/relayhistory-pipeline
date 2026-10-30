@@ -53,10 +53,20 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
    ```
    On an empty database each rollout completes immediately. Then run the live
    schema check:
-   `bun run migration:verify --mode=schema --emit-sequence-fence > /secure/t0/schema.json`.
-   `passed` must be `true`. It covers columns and every index (valid only),
-   constraint, function and trigger on Neon, so a missing rollout trigger or
-   search index fails the gate.
+   ```sh
+   bun run migration:verify --mode=schema \
+     --source-role=<neon runtime role> --target-role=<supabase runtime role> > /secure/t0/schema.json
+   ```
+   `passed` must be `true`. It covers columns (type, nullability, default,
+   generated, identity, collation), every valid index, constraint, trigger,
+   full function definition, row security and policies, and types. The Neon
+   runtime role's table, sequence, function and schema privileges must all be
+   held by the Supabase role, which must not be filtered by RLS where the Neon
+   role was not. Only two differences are allowed, both on the shared
+   `machines`: RLS on the target, and the `workspace_id` default. Applying the
+   96Bulls migrations revokes PUBLIC's EXECUTE on `sessions` functions, so the
+   Supabase runtime role needs explicit grants (the runner's runtime-role
+   grants), or this gate fails.
 3. **Measure the copy set (read-only on Neon):**
    `SELECT relname, pg_total_relation_size(oid), n_live_tup FROM pg_stat_user_tables WHERE schemaname = 'sessions'`.
    Decide whether `delivery_origins` and `delivery_receipts` stay in the copy
@@ -70,7 +80,8 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
    bun run migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --chunk-size=1000
    bun run migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --chunk-size=1000 \
      --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq > /secure/t0/precopy.json
-   # apply the sequenceFenceSql statements from /secure/t0/schema.json on Supabase
+   # every Supabase sequence >= Neon's + 1,000,000 (never-used ones from their start)
+   bun run migration:sequence-fence --apply --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq
    ```
 5. **[A5] Deploy the gate and the driver.** The phase stays `neon`. Check that
    `GET /v1/internal/cutover/phase` returns `neon`, and that health, upload and
@@ -101,8 +112,11 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
 10. **Catch up:** run
     `migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq`
     again.
-    Then re-run the schema check and confirm every target sequence is above
-    the source (the `sequences[].ready` field).
+    Then re-apply and re-check the sequence fence against Neon's final values
+    (Supabase has taken no writes yet, so raising is safe), and re-run the
+    schema gate:
+    `bun run migration:sequence-fence --apply --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq`
+    must report `passed: true`.
     **On any failure, abort:** apply `.restore` from `/secure/t0/neon-fence.json`
     on Neon, then move the phase `holding → neon`. The HoldLog replays to Neon.
 11. **Flip:** move the phase `{"from":"holding","to":"supabase"}` and flip
@@ -115,14 +129,15 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
 
 ## After T0
 
-13. **[A8] Backfill.** Copy every legacy table, base and derived, newest key
-    first. The copier's session runs with triggers off
+13. **[A8] Backfill.** Copy every legacy table except the catalog-derived
+    ones, newest first (by an indexed time column, else by key). The copier's session runs with triggers off
     (`session_replication_role = replica`), so history lands exactly as Neon
     has it. No revision feed, analysis wakeups, brief jobs or Cloud messages
     are generated for old sessions. `ON CONFLICT DO NOTHING` keeps every row
     written after T0.
     ```sh
-    # every legacy table except per-database state (__migrations, *_rollout)
+    # every legacy table except per-database state (__migrations, *_rollout) and the
+    # catalog-derived tables (the copier refuses them; step 13b rebuilds them)
     bun run migration:copy --mode=backfill --tables=<legacy tables> \
       --chunk-size=500 --checkpoint=/secure/t0/backfill.json \
       --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq
@@ -145,41 +160,32 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     `session_rollup_dirty` and `onboarding_rollup_dirty`. Their deferred
     triggers rebuild the session from all of its rows, and the tool drops the
     session's `session_timing_cache` rows.
-    **Catalog (no reprojection needed, verified instead).** `session_catalog`,
-    its relationships, markers, commit links and `session_catalog_agents` hold
-    one *winning* record per key, chosen by the highest
-    `delivery_catalog_acceptance.accepted_seq`. They are not aggregates. The
-    sequence fence puts every post-T0 acceptance above every pre-T0 one, so a
-    straddling session's post-T0 winner stays correct after the backfill, and
-    pre-T0-only keys arrive with the backfill. A reprojection would also be a
-    no-op: `project_delivery_catalog_key` keeps the current winner by design.
-    Gate (read-only, must return 0 rows): each catalog row's record has the
-    highest acceptance sequence among the delivery records for its key.
-    ```sql
-    SELECT c.org_id, c.workspace_id, c.source, c.session_id
-      FROM sessions.session_catalog c
-      JOIN sessions.delivery_catalog_acceptance w
-        ON (w.org_id, w.workspace_id, w.origin_id, w.record_id) = (c.org_id, c.workspace_id, c.origin_id, c.record_id)
-     WHERE EXISTS (
-       SELECT 1 FROM sessions.delivery_records d
-         JOIN sessions.delivery_catalog_acceptance a
-           ON (a.org_id, a.workspace_id, a.origin_id, a.record_id) = (d.org_id, d.workspace_id, d.origin_id, d.record_id)
-        WHERE d.org_id = c.org_id AND d.workspace_id = c.workspace_id AND d.kind = 'session'
-          AND sessions.delivery_catalog_key(d.kind, d.source, d.session_id, d.operation, d.payload)
-              = jsonb_build_array('session', c.source, c.session_id)
-          AND a.accepted_seq > w.accepted_seq)
-       AND EXISTS (SELECT 1 FROM sessions.convergence_events e
-                    WHERE e.org_id = c.org_id AND e.session_id = c.session_id AND e.ts >= :t0);
+13b. **Catalog reprojection.** `session_catalog`, `session_relationships`,
+    `session_markers`, `session_commit_links` and `session_catalog_agents` are
+    never copied. A trigger-off copy would resurrect rows that a post-T0
+    tombstone, or a post-T0 winner without an agent name, removed. Once
+    `delivery_records` and `delivery_catalog_acceptance` are backfilled,
+    reproject every key from all records:
+    ```sh
+    bun run migration:reproject --batch=500 \
+      --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq
     ```
+    It covers every live upsert's catalog key plus the key of every existing
+    derived row. Each page is one transaction, under the workspace's
+    delivery-projection lock, through `project_delivery_catalog_key`. It is
+    idempotent: a second run changes no row. It holds workspace locks while it
+    runs, so schedule it off-peak.
     **Residual risk:** a client that re-uploads an *older* revision of a
-    record after T0 is accepted as new, because Supabase doesn't have the newer
-    pre-T0 revision yet, and the backfill then keeps it. Uploaders send forward
-    deltas, and HoldLog replays are newer than Neon, so this needs an unusual
-    client. The gate above catches it for catalog keys.
-14. **[A9]** Remove the Neon read fallback only once
-    `migration:copy --mode=check --tables=<all legacy tables>` exits 0 (no
-    source row missing on Supabase), the straddling rebuild has run, and the
-    catalog winner gate returns no rows.
+    record after T0 is accepted as new and wins the record-key conflict over
+    the backfill. Uploaders send forward deltas, and HoldLog replays are newer
+    than Neon, so this needs an unusual client.
+14. **[A9]** Remove the Neon read fallback only once all of these hold:
+    - `migration:copy --mode=check --tables=<backfilled tables>` exits 0. It
+      counts only rows the backfill should have brought: rows a post-T0
+      tombstone or reset removed don't count as missing.
+    - The straddling rebuild (`migration:rebuild`) and the reprojection
+      (`migration:reproject`) have run.
+    - A second `migration:reproject` dry run reports the same key count.
 
 ## Rehearsal evidence
 
@@ -198,6 +204,14 @@ target equalled the source's: copies, not trigger output.
 - **Before step 11:** abort as in step 10. Nothing has reached Supabase except
   the copy set, which Neon still holds.
 - **After step 11:** do not repoint to Neon. Supabase alone has the writes
-  made since T0. Run a new hold, mirror the rows above the sequence fence back
-  to Neon, apply the fence's `.restore` on Neon, and only then move the Worker back. That
-  needs a reverse gate deploy and its own approval.
+  made since T0. Under a new hold, with its own approval:
+  ```sh
+  # dry run first, then with the guard
+  SUPABASE_SOURCE_URL=... NEON_TARGET_URL=... bun run migration:reverse \
+    --since=<T0 ISO> --tables=<legacy tables> --execute \
+    --expect-supabase-ref=pyamkrhoyszgzirqqffq --expect-neon-host=<neon endpoint host>
+  ```
+  1. It replays on Neon the deletions Supabase recorded after T0.
+  2. It upserts every row written since T0, Supabase winning.
+  3. Then apply the Neon fence's `.restore`, and only then move the Worker
+     back. That needs a reverse gate deploy.
