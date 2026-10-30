@@ -307,13 +307,16 @@ Release boundaries that remain deliberate:
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
   is written.
-- No create, write, read, search, replay, or teardown has run on GCP.
+- No product create, write, read, indexed search, manifest replay, or teardown
+  has run on GCP. A partial substrate apply did run; its incomplete state is
+  recorded below and must be reconciled rather than bootstrapped again.
 
 ## Apply, verify, and teardown
 
-Apply, verify, and teardown have not been executed. Static work does not wait
-on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down` refuse every
-`gcp-*` stage. `bin/96bulls plan gcp-*` calls
+End-to-end apply, verification, and teardown have not completed. A separately
+approved substrate apply did execute partially on 2026-10-30. Static work does
+not wait on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down`
+refuse every `gcp-*` stage. `bin/96bulls plan gcp-*` calls
 `bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
 and is not proof. A non-zero Alchemy status exits the wrapper with that
 status. A child with no status exits 1. The 2026-10-30 missing-bucket run
@@ -350,7 +353,25 @@ missing state bucket fail instead of being created.
 That failed preflight predates the apply-time poster and is not evidence that
 the current exact head plans or applies successfully. The wrapper exited 0
 because it passed `allowFail`. A GCP plan now exits with the Alchemy status
-instead. Do not bootstrap the state bucket, enable APIs, or rerun the plan.
+instead.
+
+Later on 2026-10-30, an approved `gcp-conformance` substrate apply reached 24
+successful resources and five failures. GKE `awf-conformance-gke` completed
+with one node and private endpoint `172.20.0.2`. The failures were Secret
+Manager API propagation, a malformed Private Service Access global-address
+network URL, two Workload Identity bindings racing the workload pool, and the
+downstream PSA connection. A corrective plan then showed five creates, 22
+in-place updates, two gated actions, and no replacement or delete. A subsequent
+live attempt showed Memorystore rejecting a short network name while SQL Admin
+accepted the canonical private network and began creating the private-only
+Cloud SQL instance. No evidence confirms that instance reached `RUNNABLE`.
+PRs #36 and #39 contain the contemporaneous evidence; PR #41 added Redis TLS
+readiness in code and tests only.
+
+Treat the project as partially applied. Do not bootstrap another state bucket,
+blindly enable APIs, or assume the graph is absent. First inventory and adopt
+the existing resources, confirm Cloud SQL state, and reconcile the recorded
+failures. No teardown or database mutation was performed by those attempts.
 
 Read-only preflight:
 
