@@ -9,9 +9,33 @@
 -- This migration installs maintenance only. Existing rows are filled in bounded,
 -- resumable batches by scripts/rollout-session-agent-lookup.mjs; the migration
 -- never scans or rewrites the table in one transaction.
+--
+-- Apply prerequisite: drain or pause delivery writers for this short DDL
+-- transaction. Trigger installation touches all three projection tables. Take
+-- their heavyweight locks up front in the same order as normal writers, before
+-- ALTER TABLE can lock the agent table out of order. The five-second lock_timeout
+-- makes a missed quiet window fail and roll back instead of waiting into a cycle;
+-- retry only after writers are quiet.
+--
+-- This ledger migration is intentionally one-shot, like the rest of this
+-- directory: apply it only through apply-neon-migration.mjs. Do not replay the
+-- raw SQL after the ledger records it; the ADD COLUMN/CREATE objects are not
+-- idempotent. The reviewed incident rollback is
+-- scripts/rollback-session-agent-lookup.sql, not a second execution of 0067.
 
 SELECT set_config('relayhistory.migration_saved_lock_timeout', current_setting('lock_timeout'), true),
        set_config('lock_timeout', '5s', true);
+
+-- The DO wrapper also gives schema-only/autocommit validators a transaction
+-- block. Production's migration runner already wraps every statement in one
+-- transaction, so these locks remain held through all DDL until commit there.
+DO $migration_locks$
+BEGIN
+  EXECUTE 'LOCK TABLE sessions.session_catalog IN SHARE ROW EXCLUSIVE MODE';
+  EXECUTE 'LOCK TABLE sessions.session_rollups IN SHARE ROW EXCLUSIVE MODE';
+  EXECUTE 'LOCK TABLE sessions.session_catalog_agents IN ACCESS EXCLUSIVE MODE';
+END
+$migration_locks$;
 
 ALTER TABLE sessions.session_catalog_agents
   ADD COLUMN agent_name_normalized text,
@@ -21,6 +45,74 @@ ALTER TABLE sessions.session_catalog_agents
 -- On insert (or an identity move), seed recency from the maintained rollup. A
 -- concurrent rollup writer either finishes first and is visible here, or updates
 -- this row after waiting for this transaction's row lock.
+CREATE FUNCTION sessions.lock_session_catalog_agent_lookup()
+RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, sessions, pg_temp AS $lock$
+DECLARE
+  target record;
+  may_wait boolean := TG_TABLE_NAME = 'session_catalog';
+BEGIN
+  -- Managed agent-row writers already hold the session lock: catalog projection
+  -- enters through session_catalog, rollup refresh enters from the rollup
+  -- trigger, and the bounded backfill takes it before FOR UPDATE. A direct
+  -- UPDATE/DELETE on session_catalog_agents has already locked its target tuple
+  -- before this row trigger runs. It must never WAIT for the session lock while
+  -- a rollup writer holds that lock and waits for the same agent tuple; try and
+  -- fail with 55P03 instead. session_catalog may wait: no session-lock holder
+  -- later acquires a catalog row, so that edge has no reverse edge.
+  IF TG_OP = 'UPDATE'
+     AND (OLD.org_id, OLD.session_id) IS DISTINCT FROM (NEW.org_id, NEW.session_id) THEN
+    FOR target IN
+      SELECT DISTINCT org_id, session_id
+        FROM (VALUES (OLD.org_id, OLD.session_id),
+                     (NEW.org_id, NEW.session_id)) AS keys(org_id, session_id)
+       ORDER BY org_id, session_id
+    LOOP
+      IF may_wait THEN
+        PERFORM pg_advisory_xact_lock(
+          sessions.session_rollup_lock_key(target.org_id, target.session_id));
+      ELSIF NOT pg_try_advisory_xact_lock(
+        sessions.session_rollup_lock_key(target.org_id, target.session_id)) THEN
+        RAISE EXCEPTION 'session agent lookup row is busy'
+          USING ERRCODE = '55P03';
+      END IF;
+    END LOOP;
+  ELSIF TG_OP = 'DELETE' THEN
+    IF may_wait THEN
+      PERFORM pg_advisory_xact_lock(
+        sessions.session_rollup_lock_key(OLD.org_id, OLD.session_id));
+    ELSIF NOT pg_try_advisory_xact_lock(
+      sessions.session_rollup_lock_key(OLD.org_id, OLD.session_id)) THEN
+      RAISE EXCEPTION 'session agent lookup row is busy'
+        USING ERRCODE = '55P03';
+    END IF;
+  ELSE
+    IF may_wait THEN
+      PERFORM pg_advisory_xact_lock(
+        sessions.session_rollup_lock_key(NEW.org_id, NEW.session_id));
+    ELSIF NOT pg_try_advisory_xact_lock(
+      sessions.session_rollup_lock_key(NEW.org_id, NEW.session_id)) THEN
+      RAISE EXCEPTION 'session agent lookup row is busy'
+        USING ERRCODE = '55P03';
+    END IF;
+  END IF;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END
+$lock$;
+
+-- PostgreSQL runs same-kind triggers by name; lookup_lock precedes lookup_prepare.
+CREATE TRIGGER session_catalog_agents_lookup_lock
+  BEFORE INSERT OR UPDATE OR DELETE ON sessions.session_catalog_agents
+  FOR EACH ROW EXECUTE FUNCTION sessions.lock_session_catalog_agent_lookup();
+
+-- The delivery projection writes session_catalog before it upserts or deletes
+-- the matching agent row. Take the same lock at that source boundary as well,
+-- before ON CONFLICT or DELETE can acquire an existing agent-row lock.
+CREATE TRIGGER session_catalog_agent_source_lock
+  BEFORE INSERT OR UPDATE OR DELETE ON sessions.session_catalog
+  FOR EACH ROW EXECUTE FUNCTION sessions.lock_session_catalog_agent_lookup();
+
 CREATE FUNCTION sessions.prepare_session_catalog_agent_lookup()
 RETURNS trigger LANGUAGE plpgsql
 SET search_path = pg_catalog, sessions, pg_temp AS $prepare$
@@ -157,6 +249,7 @@ DECLARE
   sources text[];
   ids text[];
   found_count integer;
+  target record;
 BEGIN
   IF p_batch < 1 OR p_batch > 1000 THEN
     RAISE EXCEPTION 'session agent lookup batch must be between 1 and 1000'
@@ -180,6 +273,20 @@ BEGIN
   found_count := coalesce(array_length(orgs, 1), 0);
 
   IF found_count > 0 THEN
+    -- Take every session lock in the same order as session_rollups before any
+    -- FOR UPDATE row lock. The row trigger then takes these locks re-entrantly.
+    FOR target IN
+      SELECT DISTINCT k.org_id, k.session_id
+        FROM unnest(orgs, ids) AS k(org_id, session_id)
+       ORDER BY k.org_id, k.session_id
+    LOOP
+      IF NOT pg_try_advisory_xact_lock(
+        sessions.session_rollup_lock_key(target.org_id, target.session_id)) THEN
+        RAISE EXCEPTION 'session agent lookup row is busy'
+          USING ERRCODE = '55P03';
+      END IF;
+    END LOOP;
+
     -- Yield the whole ordered batch rather than skipping a busy row behind the
     -- cursor; the operator retries after its catalog delivery commits.
     PERFORM 1
