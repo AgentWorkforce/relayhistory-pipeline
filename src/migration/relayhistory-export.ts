@@ -178,6 +178,33 @@ export async function sessionRecords(db: Queryable, key: SessionKey): Promise<De
 }
 
 /**
+ * Events with no delivery record behind them: sessions uploaded through the
+ * ingest API by server-side harnesses (chatgpt, grok-bot, ...), whose content
+ * exists only in convergence_events. They join the stream as
+ * `convergence_event` lines (the whole event row as the payload), and their
+ * machine is the event's own machine_id, so no such session is dropped.
+ */
+export async function undeliveredEvents(db: Queryable, key: SessionKey): Promise<DeliveryRecord[]> {
+  const { rows } = await db.query<{ machine_id: string; event_id: string; created_at: string; row: Record<string, unknown> }>(
+    `SELECT e.machine_id, e.event_id, e.ingested_at::text AS created_at,
+            to_jsonb(e) - 'org_id' - 'workspace_id' AS row
+       FROM sessions.convergence_events e
+      WHERE e.org_id = $1 AND e.session_id = $2 AND e.workspace_id = $3 AND e.source = $4
+        AND e.delivery_record_id IS NULL`,
+    [key.org_id, key.session_id, key.workspace_id, key.source],
+  );
+  return rows.map((row) => ({
+    kind: "convergence_event",
+    origin_id: `machine:${row.machine_id}`,
+    record_id: row.event_id,
+    revision: "1",
+    operation: "upsert" as const,
+    received_at: row.created_at,
+    payload: { ...row.row, ts_ms: Date.parse(String(row.row.ts)) },
+  }));
+}
+
+/**
  * The machine each origin's records came from, read from the session's events
  * (which carry machine_id and link back to their delivery record). An origin
  * with no linked event maps to `unknown-origin-<origin_id>`, so its records
@@ -213,3 +240,110 @@ export function byMachine(
   }
   return groups;
 }
+
+/**
+ * Sessions the export must skip because a user removed them: an upload
+ * tombstone for the session, or a reset of its user's workspace history.
+ * Neon is the source of truth before T0 (S3-first), so the fence is read there.
+ */
+export async function deletionFenced(db: Queryable, key: SessionKey): Promise<boolean> {
+  const { rows } = await db.query<{ fenced: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM sessions.deleted_upload_sessions d
+                     WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.source = $3 AND d.session_id = $4)
+         OR EXISTS (SELECT 1 FROM sessions.session_resets r
+                      JOIN sessions.delivery_records x
+                        ON x.org_id = r.org_id AND x.workspace_id = r.workspace_id AND x.user_id = r.user_id
+                     WHERE r.org_id = $1 AND r.workspace_id = $2 AND x.source = $3 AND x.session_id = $4
+                       AND x.kind = 'session') AS fenced`,
+    [key.org_id, key.workspace_id, key.source, key.session_id],
+  );
+  return rows[0]?.fenced ?? true;
+}
+
+export interface ExportPlanRow {
+  session: Omit<SessionKey, "last_ts">;
+  machine: string;
+  records: number;
+  bytes: number;
+  chunks: number;
+}
+
+/**
+ * What exporting one session would produce, per machine stream. Reads only;
+ * a fenced session yields nothing.
+ */
+export async function planSession(db: Queryable, key: SessionKey): Promise<ExportPlanRow[] | "fenced"> {
+  if (await deletionFenced(db, key)) return "fenced";
+  const [delivered, undelivered, machines] = await Promise.all([
+    sessionRecords(db, key),
+    undeliveredEvents(db, key),
+    originMachines(db, key),
+  ]);
+  const records = [...delivered, ...undelivered];
+  // Undelivered events name their machine directly.
+  for (const event of undelivered) machines.set(event.origin_id, event.origin_id.slice("machine:".length));
+  const { last_ts: _lastTs, ...session } = key;
+  const groups = [...byMachine(records, machines)].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return groups.flatMap(([machine, group]) => {
+    const stream = buildSessionStream(group);
+    if (stream.records === 0) return [];
+    return [{ session, machine, records: stream.records, bytes: stream.bytes.byteLength, chunks: chunkRanges(stream).length }];
+  });
+}
+
+function argument(name: string): string | undefined {
+  return process.argv.find((value) => value.startsWith(`--${name}=`))?.slice(name.length + 3);
+}
+
+/**
+ * Dry run only for now: walks sessions newest first and reports what the
+ * export would write (records, bytes, chunks, fenced sessions). The upload
+ * step lands once the migration identity grant (O2) and KMS keys (P9) exist.
+ *
+ * Usage: RELAYHISTORY_SOURCE_URL=... bun run migration:export --limit=100
+ */
+export async function main() {
+  if (process.argv.includes("--execute"))
+    throw new Error("--execute is not available yet: the upload needs the O2 identity grant and P9 keys");
+  const url = process.env.RELAYHISTORY_SOURCE_URL;
+  if (!url) throw new Error("RELAYHISTORY_SOURCE_URL is required");
+  const limit = Number(argument("limit") ?? 100);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100_000)
+    throw new Error("--limit must be an integer from 1 to 100000");
+  const { default: pg } = await import("pg");
+  const db = new pg.Client({ connectionString: url, application_name: "96bulls-export-dry-run" });
+  await db.connect();
+  try {
+    await db.query("SET default_transaction_read_only = on");
+    const totals = { sessions: 0, fenced: 0, streams: 0, records: 0, bytes: 0, chunks: 0 };
+    let after: SessionKey | null = null;
+    while (totals.sessions < limit) {
+      const page = await sessionsNewestFirst(db, after, Math.min(200, limit - totals.sessions));
+      if (page.length === 0) break;
+      for (const key of page) {
+        totals.sessions += 1;
+        const plan = await planSession(db, key);
+        if (plan === "fenced") {
+          totals.fenced += 1;
+          continue;
+        }
+        for (const row of plan) {
+          totals.streams += 1;
+          totals.records += row.records;
+          totals.bytes += row.bytes;
+          totals.chunks += row.chunks;
+        }
+      }
+      after = page.at(-1)!;
+    }
+    process.stdout.write(`${JSON.stringify({ dryRun: true, ...totals, newestCovered: true }, null, 2)}\n`);
+  } finally {
+    await db.end();
+  }
+}
+
+if (import.meta.main)
+  main().catch((error) => {
+    console.error(`96bulls export failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    process.exit(1);
+  });

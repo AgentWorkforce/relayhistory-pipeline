@@ -11,10 +11,13 @@ import {
   buildSessionStream,
   byMachine,
   chunkRanges,
+  deletionFenced,
   eventTimeMs,
+  planSession,
   originMachines,
   sessionRecords,
   sessionsNewestFirst,
+  undeliveredEvents,
   type DeliveryRecord,
 } from "../../../src/migration/relayhistory-export.js";
 
@@ -139,6 +142,38 @@ describe("Neon reader on the pinned legacy schema", () => {
     expect(first.map((s) => s.session_id)).toEqual(["s-1", "s-other"]);
     const next = await sessionsNewestFirst(db, first.at(-1)!, 2);
     expect(next.map((s) => s.session_id)).toEqual(["s-old"]);
+  });
+
+  it("plans per machine stream, and skips sessions a user deleted or reset", async () => {
+    const [key] = await sessionsNewestFirst(db, null, 1);
+    expect(await planSession(db, key!)).toEqual([
+      expect.objectContaining({ machine: "laptop", records: 1, chunks: 1 }),
+      expect.objectContaining({ machine: "unknown-origin-orig-b", records: 1, chunks: 1 }),
+    ]);
+    await db.exec(`INSERT INTO sessions.deleted_upload_sessions VALUES ('o', 'w', 'u', 'orig-a', 'claude', 's-1')`);
+    expect(await deletionFenced(db, key!)).toBe(true);
+    expect(await planSession(db, key!)).toBe("fenced");
+    await db.exec(`DELETE FROM sessions.deleted_upload_sessions`);
+    const other = (await sessionsNewestFirst(db, null, 2))[1]!;
+    expect(await deletionFenced(db, other)).toBe(false);
+  });
+
+  it("exports sessions whose content exists only as undelivered events (ingest-API harnesses)", async () => {
+    await db.exec(`SET session_replication_role = replica;
+      INSERT INTO sessions.convergence_events
+        (org_id, workspace_id, machine_id, user_id, source, session_id, event_id, kind, type, ts, content, record)
+      VALUES ('o', 'w', 'server', 'u', 'claude', 's-old', 'ev-2', 'assistant', 'message', '2026-09-01T00:00:02Z', 'answer', '{}'),
+             ('o', 'w', 'server', 'u', 'claude', 's-old', 'ev-1', 'user', 'message', '2026-09-01T00:00:01Z', 'question', '{}');
+      SET session_replication_role = origin;`);
+    const key = (await sessionsNewestFirst(db, null, 10)).find((s) => s.session_id === "s-old")!;
+    const plan = await planSession(db, key);
+    expect(plan).toEqual([expect.objectContaining({ machine: "server", records: 2, chunks: 1 })]);
+    const events = await undeliveredEvents(db, key);
+    const stream = buildSessionStream(events);
+    const streamed = lines(stream.bytes);
+    expect(streamed.map((line) => line.record_id)).toEqual(["ev-1", "ev-2"]);
+    expect(streamed[0]).toMatchObject({ kind: "convergence_event", payload: { content: "question", kind: "user" } });
+    expect(streamed[0].payload.org_id).toBeUndefined();
   });
 
   it("reads a session's records and splits them by the machine their events name", async () => {

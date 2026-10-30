@@ -115,8 +115,19 @@ manifest body.
 - **O4:** sessions active across T0. Live delivery after T0 continues the
   session's stream: the export writes epoch 0, and the client opens epoch 1.
   Confirm with the delivery coordinator's owner-fencing rules.
-- **O5:** volume. About 54M records in 161 GB of payload; estimate the
-  exported zstd size and the PUT count per workspace (KMS request cost, P9).
+- **O5 (first measurement):** a read-only dry run over the 50 newest Neon
+  sessions (2026-10-30) gave 50 machine streams, 280,144 records, 560 MB of
+  raw ndjson and 169 chunks, with none fenced. The newest sessions are the
+  largest, so this doesn't extrapolate linearly to 116,117 sessions. A
+  stratified sample is still needed for the total stored size and the PUT
+  count per workspace (KMS request cost, P9).
+- **O6 (resolved): ingest-API sessions.** About 0.3% of events have no
+  delivery record. They come from server-side harnesses (`chatgpt`,
+  `grok-bot`) that upload through the ingest API, and 4 of the 50 newest
+  sessions consist only of such events. The export adds them to the session's
+  stream as `convergence_event` lines (the event row, without tenant
+  columns), on the event's own machine. A delivery-records-only export would
+  have dropped these sessions entirely.
 
 ## Gate
 
