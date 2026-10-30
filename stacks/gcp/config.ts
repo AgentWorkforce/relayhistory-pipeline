@@ -12,6 +12,39 @@ export const GCP_APPROVED_TARGET = {
   region: "us-central1",
 } as const;
 
+/** Published helm index entry relaycast-0.1.0. The image digest is the chart default. */
+export const RELAYCAST_PUBLISHED_CHART = {
+  version: "0.1.0",
+  repository: "ghcr.io/agentworkforce/relaycast-self-host",
+  imageDigest: "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
+  packageDigest: "cdfc41cb6202fd81beb17cb57d5fbbdecaf27fa427f51faa07c5ec0fc116744f",
+} as const;
+
+/** Non-secret client contract. AUTH stays off; TLS is server authentication. No password is accepted. */
+export const GCP_REDIS_CLIENT = {
+  authEnabled: "false",
+  transitEncryption: "SERVER_AUTHENTICATION",
+} as const;
+
+export function isPublishedHelmRepo(repo: string | undefined): boolean {
+  if (!repo) return true;
+  let url: URL;
+  try {
+    url = new URL(repo);
+  } catch {
+    return false;
+  }
+  return (
+    url.protocol === "https:" &&
+    !url.username &&
+    !url.password &&
+    !url.search &&
+    !url.hash &&
+    url.hostname.toLowerCase() === "agentworkforce.github.io" &&
+    url.pathname.replace(/\/$/, "") === "/helm-charts"
+  );
+}
+
 export interface ManagedDataPlaneInputs {
   /**
    * Managed services are provisioned for adapter development and proof only.
@@ -190,6 +223,8 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
 
   if (inputs.relaycast) {
     requireSemver("relaycast.chartVersion", inputs.relaycast.chartVersion);
+    if (inputs.relaycast.chartVersion !== RELAYCAST_PUBLISHED_CHART.version || !isPublishedHelmRepo(inputs.chartRepo))
+      throw new Error("96bulls: relaycast must use published chart 0.1.0 from the AgentWorkforce helm repository. Nothing was created.");
     requirePublicHttpsOrigin("relaycast.baseUrl", inputs.relaycast.baseUrl);
   }
   if (inputs.relayauth) {
@@ -233,10 +268,16 @@ export function assertGcpRuntimeDeployable(inputs: GcpInputs): void {
 }
 
 export function relaycastChartValues(i: RelaycastChartInputs, defaultStorageClass = "standard-rwo") {
+  if (i.chartVersion !== RELAYCAST_PUBLISHED_CHART.version)
+    throw new Error("96bulls: relaycast chart is not the published 0.1.0 contract. Nothing was created.");
   const host = new URL(i.baseUrl).hostname;
   return {
     replicaCount: 1,
     strategy: { type: "Recreate" },
+    image: {
+      repository: RELAYCAST_PUBLISHED_CHART.repository,
+      digest: RELAYCAST_PUBLISHED_CHART.imageDigest,
+    },
     runtime: { backend: "sqlite" },
     baseUrl: i.baseUrl,
     persistence: { storageClass: i.storageClass ?? defaultStorageClass, accessMode: "ReadWriteOnce", size: "20Gi" },
@@ -360,6 +401,8 @@ export function bulls96ReleaseValues(
     { name: "CLOUD_SQL_CONNECTION_NAME", value: managed.cloudSqlConnectionName },
     { name: "REDIS_HOST", value: managed.redisHost },
     { name: "REDIS_PORT", value: redisPort },
+    { name: "REDIS_AUTH_ENABLED", value: GCP_REDIS_CLIENT.authEnabled },
+    { name: "REDIS_TRANSIT_ENCRYPTION", value: GCP_REDIS_CLIENT.transitEncryption },
     { name: "PUBSUB_TOPIC", value: managed.pubsubTopic },
     { name: "PUBSUB_SUBSCRIPTION", value: managed.pubsubSubscription },
     { name: "WORKER_DATA_PATH_PROBE", value: "1" },

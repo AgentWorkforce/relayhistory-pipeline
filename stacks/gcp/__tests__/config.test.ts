@@ -7,6 +7,8 @@ import {
   gcpResourceName,
   pubsubServiceAgent,
   relayauthChartValues,
+  GCP_REDIS_CLIENT,
+  RELAYCAST_PUBLISHED_CHART,
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
@@ -158,10 +160,14 @@ describe("GCP self-host contract", () => {
     expect(rendered).toContain('"gcs"');
     expect(rendered).toContain("CLOUD_SQL_CONNECTION_NAME");
     expect(rendered).toContain("REDIS_HOST");
+    expect(rendered).toContain("REDIS_AUTH_ENABLED");
+    expect(rendered).toContain(GCP_REDIS_CLIENT.authEnabled);
+    expect(rendered).toContain(GCP_REDIS_CLIENT.transitEncryption);
     expect(rendered).toContain("PUBSUB_TOPIC");
     expect(rendered).toContain("WORKER_DATA_PATH_PROBE");
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
-    expect(rendered).not.toContain("REDIS_AUTH");
+    expect(rendered).not.toContain('"REDIS_AUTH"');
+    expect(rendered).not.toContain("REDIS_PASSWORD");
     expect(rendered).not.toMatch(/password|BEGIN |hmac/i);
     expect(() =>
       bulls96ReleaseValues(
@@ -193,6 +199,10 @@ describe("GCP self-host contract", () => {
     });
     expect(values.replicaCount).toBe(1);
     expect(values.strategy).toEqual({ type: "Recreate" });
+    expect(values.image).toEqual({
+      repository: RELAYCAST_PUBLISHED_CHART.repository,
+      digest: RELAYCAST_PUBLISHED_CHART.imageDigest,
+    });
     expect(values.runtime.backend).toBe("sqlite");
     expect(values.persistence.accessMode).toBe("ReadWriteOnce");
     expect(values.ingress.annotations["networking.gke.io/managed-certificates"]).toBe("relaycast");
@@ -216,6 +226,25 @@ describe("GCP self-host contract", () => {
       "service-123456789012@gcp-sa-pubsub.iam.gserviceaccount.com",
     );
     expect(() => pubsubServiceAgent("project-name")).toThrow("projectNumber is invalid");
+  });
+
+  it("rejects an unpublished Relaycast chart version or repository", () => {
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        relaycast: { chartVersion: "0.2.0", baseUrl: "https://relay.gcp.example.com" },
+      }),
+    ).toThrow(/published chart 0\.1\.0/);
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        chartRepo: "https://example.com/charts",
+        relaycast: { chartVersion: "0.1.0", baseUrl: "https://relay.gcp.example.com" },
+      }),
+    ).toThrow(/published chart 0\.1\.0/);
+    expect(() =>
+      relaycastChartValues({ chartVersion: "0.2.0", baseUrl: "https://relay.gcp.example.com" }),
+    ).toThrow(/published 0\.1\.0/);
   });
 
   it("rejects credential-bearing public origins before they reach chart values", () => {

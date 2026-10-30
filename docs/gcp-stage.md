@@ -77,9 +77,16 @@ other name stays unconfigured.
 
 The `bulls96.enabled` values contract turns off in-chart MinIO and
 CloudNativePG, uses pod identity, and passes the bucket, Cloud SQL connection
-name, Redis host, and Pub/Sub names. The release and Cloud SQL proxy consume
+name, Redis host, and Pub/Sub names. The Redis client values are explicit and
+non-secret: `REDIS_AUTH_ENABLED=false` and
+`REDIS_TRANSIT_ENCRYPTION=SERVER_AUTHENTICATION`. `REDIS_AUTH` and
+`REDIS_PASSWORD` stay refused. The release and Cloud SQL proxy consume
 the poster output, so neither can apply before the exact private-only instance
 is confirmed `RUNNABLE`.
+Relaycast, when configured, is pinned to published chart `0.1.0` from
+`https://agentworkforce.github.io/helm-charts` and image
+`ghcr.io/agentworkforce/relaycast-self-host@sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98`.
+That chart is the single-replica SQLite contract. It is not a GCP HA proof.
 `/readyz` also checks that data path when `LOCKER_PROVIDER=gcs` or
 `WORKER_DATA_PATH_PROBE=1`. Production is not this lane: the production
 database is Supabase and production object storage is AWS S3.
@@ -270,7 +277,7 @@ Verify, only after an approved apply and a wired poster:
 
 1. `gcloud sql instances describe INSTANCE --project="$PROJECT" --format='yaml(ipAddresses,settings.ipConfiguration)'` shows `ipv4Enabled: false`, the VPC `privateNetwork`, the PSA `allocatedIpRange`, and no `authorizedNetworks` or public address.
 2. The in-cluster proxy args start with `--private-ip`, and its Workload Identity binding exists only with that proxy.
-3. Redis `authEnabled` is false and `transitEncryptionMode` is `SERVER_AUTHENTICATION`. No `REDIS_AUTH` is in the workload env.
+3. Redis `authEnabled` is false and `transitEncryptionMode` is `SERVER_AUTHENTICATION`. The workload env sets `REDIS_AUTH_ENABLED=false` and `REDIS_TRANSIT_ENCRYPTION=SERVER_AUTHENTICATION`. No `REDIS_AUTH` or `REDIS_PASSWORD` is in the workload env.
 4. Run the object-store suite against the GCS bucket under Workload Identity. Create, write, read, search, and replay one planted session through 96Bulls. `/readyz` and `/datapathz` return 200. Scan objects, traces, and logs for the planted markers.
 5. Pub/Sub redelivery reaches the dead-letter topic. Redis reconnects after a restart.
 
