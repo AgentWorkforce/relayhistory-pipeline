@@ -63,6 +63,23 @@ export function assertLockerSelection(env: NodeJS.ProcessEnv = process.env): voi
       "96bulls: GCS Locker uses Workload Identity, not HMAC keys. Unset LOCKER_ACCESS_KEY_ID and LOCKER_SECRET_ACCESS_KEY.",
     );
   }
+  if (provider === "gcs" && !env.LOCKER_BUCKET?.trim()) {
+    throw new Error("96bulls: LOCKER_PROVIDER=gcs requires LOCKER_BUCKET");
+  }
+  if (provider === "gcs" && env.LOCKER_ENDPOINT) {
+    let endpoint: URL;
+    try {
+      endpoint = new URL(env.LOCKER_ENDPOINT);
+    } catch {
+      throw new Error("96bulls: LOCKER_ENDPOINT must be an absolute http(s) URL");
+    }
+    if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
+      throw new Error("96bulls: LOCKER_ENDPOINT must be an absolute http(s) URL");
+    }
+    if (endpoint.username || endpoint.password) {
+      throw new Error("96bulls: LOCKER_ENDPOINT must not contain credentials");
+    }
+  }
   if (provider === "gcs" && env.LOCKER_GCS_TOKEN_URI && !trustedGcsTokenUri(env.LOCKER_GCS_TOKEN_URI)) {
     throw new Error("96bulls: LOCKER_GCS_TOKEN_URI is not the GKE metadata server or loopback");
   }
