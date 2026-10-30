@@ -323,6 +323,7 @@ export default Alchemy.Stack(
 
     // Keep project-level APIs enabled on destroy because they may be shared by
     // other stacks. Service Usage itself is the one bootstrap prerequisite.
+    const apiGates: Record<string, Output.Output<string>> = {};
     for (const service of [
       "artifactregistry.googleapis.com",
       "compute.googleapis.com",
@@ -335,15 +336,22 @@ export default Alchemy.Stack(
       "servicenetworking.googleapis.com",
       "sqladmin.googleapis.com",
     ]) {
-      yield* GCP.ServiceUsage.ProjectService(`api-${service.split(".")[0]}`, {
+      const api = yield* GCP.ServiceUsage.ProjectService(`api-${service.split(".")[0]}`, {
         project: authorized(i.projectId),
         service,
         disableOnDestroy: false,
       });
+      apiGates[service] = api.state;
     }
+    const afterApi = <T>(service: string, value: T): Input<T> =>
+      Output.map(apiGates[service]!, (state) => {
+        if (state !== "ENABLED")
+          throw new Error(`96bulls: required GCP API ${service} is not enabled. Nothing was created.`);
+        return value;
+      }) as Input<T>;
 
     const network = yield* GCP.Compute.Network("network", {
-      networkName,
+      networkName: afterApi("compute.googleapis.com", networkName),
       autoCreateSubnetworks: false,
       routingMode: "REGIONAL",
       description: authorized(`AgentWorkforce ${stage} private network`),
@@ -362,7 +370,7 @@ export default Alchemy.Stack(
       logConfig: { enable: true, aggregationInterval: "INTERVAL_5_SEC", flowSampling: 0.5, metadata: "INCLUDE_ALL_METADATA" },
     });
     const natAddress = yield* GCP.Compute.Address("nat-address", {
-      addressName: gcpResourceName(stage, "nat", 63),
+      addressName: afterApi("compute.googleapis.com", gcpResourceName(stage, "nat", 63)),
       region: i.region,
       addressType: "EXTERNAL",
       networkTier: "PREMIUM",
@@ -391,7 +399,7 @@ export default Alchemy.Stack(
       address: "10.80.0.0",
       addressType: "INTERNAL",
       purpose: "VPC_PEERING",
-      network: network.networkName,
+      network: network.selfLink.as<string>(),
       prefixLength: 20,
       description: authorized(`AgentWorkforce ${stage} managed-service peering`),
     });
@@ -399,13 +407,14 @@ export default Alchemy.Stack(
     const privateServices = yield* GCP.ServiceNetworking.Connection("private-services", {
       // The network resource already carries the nonce dependency.
       network: network.networkName,
+      service: afterApi("servicenetworking.googleapis.com", "servicenetworking.googleapis.com"),
       reservedPeeringRanges: [psaRange.addressName],
       deletionPolicy: "DELETE",
     });
 
     const nodeAccountId = gcpResourceName(stage, "nodes", 30);
     const nodeIdentity = yield* GCP.IAM.ServiceAccount("node-identity", {
-      accountId: nodeAccountId,
+      accountId: afterApi("iam.googleapis.com", nodeAccountId),
       displayName: `AgentWorkforce ${stage} nodes`,
       description: authorized("Dedicated GKE node identity. No keys."),
     });
@@ -426,7 +435,7 @@ export default Alchemy.Stack(
     });
 
     const cluster = yield* GCP.Container.Cluster("cluster", {
-      clusterId: gcpResourceName(stage, "gke"),
+      clusterId: afterApi("container.googleapis.com", gcpResourceName(stage, "gke")),
       location: i.region,
       description: `AgentWorkforce ${stage}`,
       labels: labels(stage, "gke"),
@@ -475,12 +484,12 @@ export default Alchemy.Stack(
       secretId: authorized(gcpResourceName(stage, "runtime", 63)),
       labels: labels(stage, "runtime"),
       replication: { userManaged: { replicas: [{ location: i.region }] } },
-      versionDestroyTtl: "604800s",
+      versionDestroyTtl: afterApi("secretmanager.googleapis.com", "604800s"),
     });
     const images = yield* GCP.ArtifactRegistry.Repository("images", {
       repositoryId: authorized(gcpResourceName(stage, "images", 63)),
       location: i.region,
-      format: "DOCKER",
+      format: afterApi("artifactregistry.googleapis.com", "DOCKER"),
       description: `AgentWorkforce ${stage} private images`,
       labels: labels(stage, "images"),
       dockerConfig: { immutableTags: true },
@@ -488,7 +497,7 @@ export default Alchemy.Stack(
 
     const runtimeIdentity = yield* GCP.IAM.ServiceAccount("runtime-identity", {
       accountId: runtimeAccountId,
-      displayName: `AgentWorkforce ${stage} runtime`,
+      displayName: afterApi("iam.googleapis.com", `AgentWorkforce ${stage} runtime`),
       description: authorized("Workload Identity target for managed data-plane clients"),
     });
     // email is an Output until deploy. A JS template coerces it and throws.
@@ -504,7 +513,9 @@ export default Alchemy.Stack(
         kind: "iam.serviceAccount",
         name: runtimeIdentity.name,
         role: "roles/iam.workloadIdentityUser",
-        member: authorized(workloadIdentityPrincipal(i, namespace, serviceAccount)),
+        member: Output.map(cluster.workloadPool, () =>
+          authorized(workloadIdentityPrincipal(i, namespace, serviceAccount)),
+        ) as Input<string>,
       });
     }
     yield* GCP.IAM.Member("runtime-locker", {
@@ -547,7 +558,7 @@ export default Alchemy.Stack(
           const redis = yield* GCP.Redis.Instance("redis", {
             instanceId: authorized(gcpResourceName(stage, "redis")),
             location: i.region,
-            displayName: `AgentWorkforce ${stage}`,
+            displayName: afterApi("redis.googleapis.com", `AgentWorkforce ${stage}`),
             labels: labels(stage, "redis"),
             redisVersion: "REDIS_7_2",
             tier: i.managedDataPlane.redisHa ? "STANDARD_HA" : "BASIC",
@@ -566,18 +577,18 @@ export default Alchemy.Stack(
           const deadLetters = yield* GCP.PubSub.Topic("dead-letters", {
             topicId: authorized(gcpResourceName(stage, "dead-letters", 63)),
             labels: labels(stage, "queue"),
-            messageRetentionDuration: "604800s",
+            messageRetentionDuration: afterApi("pubsub.googleapis.com", "604800s"),
           });
           const events = yield* GCP.PubSub.Topic("events", {
             topicId: authorized(eventsTopicId),
             labels: labels(stage, "queue"),
-            messageRetentionDuration: "604800s",
+            messageRetentionDuration: afterApi("pubsub.googleapis.com", "604800s"),
           });
           const subscription = yield* GCP.PubSub.Subscription("events-worker", {
             subscriptionId: authorized(eventsSubscriptionId),
             topic: events.name,
             labels: labels(stage, "queue"),
-            ackDeadlineSeconds: 60,
+            ackDeadlineSeconds: afterApi("pubsub.googleapis.com", 60),
             messageRetentionDuration: "604800s",
             enableExactlyOnceDelivery: true,
             retryPolicy: { minimumBackoff: "10s", maximumBackoff: "600s" },
