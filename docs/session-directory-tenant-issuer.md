@@ -1,8 +1,8 @@
 # Session directory tenant JWT issuer
 
-**Status:** proposed design, awaiting Khaliq's decision. Nothing here is built, deployed or configured.
+**Status:** proposed design. Khaliq has not approved the separate-issuer direction. Nothing here is built, deployed or configured.
 **Resolves:** the activation HOLD on #48 and open question 4 in its RelayHistory #226 contract amendment.
-**Reviewed at:** #48 `99e96d1d`, #38 `71b8ffdd`, relayauth `main` `58a40a2`, relayauth #110/#111, relayhistory-cloud #226 `1610785`.
+**Reviewed at:** #48 `134afa8`, #38 `71b8ffdd`, relayauth `main` `58a40a2`, relayauth #110/#111, relayhistory-cloud #226 `1610785`.
 **External facts:** Supabase and PostgREST behavior below comes from their documentation, read 2026-10-31. Nothing was tested against a live project.
 
 ## Decision
@@ -70,11 +70,50 @@ A token RelayAuth cannot verify is refused, including anything admitted only by 
 - Each mint is audited and rate limited per subject and workspace.
 - If RelayAuth is down, search returns 503. It never falls back to a static credential.
 
-### Required change to #48
+### Proposed pins for #48
 
-Add to the RPC, before the tenant checks: `iss` equals the configured issuer, `aud` equals `session-directory-search`, `exp` and `iat` are numbers, and `exp - iat <= 60`. Any failure raises `42501`.
+The RPC does not check `iss`, `aud` or lifetime today. Supabase's docs say a project trusts every issuer added, and PostgREST skips audience checks unless `jwt-aud` is set. Whether hosted Supabase sets it is unconfirmed. So any other trusted issuer could otherwise satisfy the RPC.
 
-This matters because Supabase's docs say a project trusts every issuer added, and PostgREST skips audience checks unless `jwt-aud` is set. Whether hosted Supabase sets it is unconfirmed. The issuer value differs per environment, so it needs a DB-side setting that only the migration owner can change.
+This is the proposed change, not applied to #48 and not executed. The issuer differs per environment, so it lives in an owner-only table instead of a custom setting. The migration seeds no row, so search stays refused until a row is added for that environment, and adding one is a production change.
+
+```sql
+CREATE TABLE sessions.session_directory_search_token_policy (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  issuer text NOT NULL CHECK (issuer LIKE 'https://%'),
+  audience text NOT NULL CHECK (audience <> ''),
+  max_lifetime_seconds integer NOT NULL DEFAULT 60
+    CHECK (max_lifetime_seconds BETWEEN 1 AND 60)
+);
+ALTER TABLE sessions.session_directory_search_token_policy ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_directory_search_token_policy
+  FROM PUBLIC, anon, authenticated, service_role;
+```
+
+In `sessions.search_session_directory`, declare `v_policy sessions.session_directory_search_token_policy%ROWTYPE;` and add this straight after the existing claims-shape check:
+
+```sql
+SELECT * INTO v_policy
+  FROM sessions.session_directory_search_token_policy WHERE singleton;
+IF NOT FOUND
+   OR (v_claims ->> 'iss') IS DISTINCT FROM v_policy.issuer
+   OR jsonb_typeof(v_claims -> 'aud') IS DISTINCT FROM 'string'
+   OR (v_claims ->> 'aud') IS DISTINCT FROM v_policy.audience
+   OR jsonb_typeof(v_claims -> 'exp') IS DISTINCT FROM 'number'
+   OR jsonb_typeof(v_claims -> 'iat') IS DISTINCT FROM 'number'
+   OR (v_claims ->> 'exp')::numeric - (v_claims ->> 'iat')::numeric
+        NOT BETWEEN 1 AND v_policy.max_lifetime_seconds
+   -- A far-future iat must not stretch the window; 30s allows for clock skew.
+   OR (v_claims ->> 'exp')::numeric - extract(epoch FROM clock_timestamp())
+        > v_policy.max_lifetime_seconds + 30
+   OR jsonb_array_length(v_claims -> 'app_metadata' -> 'workspace_ids') <> 1 THEN
+  RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session search: tenant claims missing or invalid';
+END IF;
+```
+
+- `aud` must be a plain string, which is what this issuer emits. An array is refused.
+- The error message is the existing one, so a refusal does not reveal which pin failed.
+- The rollback drops the table. #48's RPC tests need a seeded policy row, because every hand-set claim set now also needs `iss`, `aud`, `iat` and `exp`.
+- Deleting the policy row stops all search at once, so it is a second kill switch.
 
 ## Keys and rotation
 
@@ -107,13 +146,42 @@ These decide whether the design works as written. All need a non-production proj
 
 | Unknown | Why it matters | If the answer is no |
 | --- | --- | --- |
-| Does hosted Supabase accept a custom `role` from a custom OIDC issuer? Docs describe only `anon` and `authenticated`. | The RPC requires the Worker role. | #48 must change to run as `authenticated` and gate on token claims, with a new review of its grants. |
+| Does hosted Supabase accept a custom `role` from a custom OIDC issuer? Docs describe only `anon` and `authenticated`. | The RPC requires the Worker role. | Use the custom-role fallback below. |
 | Is a path-based issuer accepted? | The issuer is not a bare origin. | Use a dedicated hostname. |
 | Does the gateway accept a publishable `apikey` with this bearer? | #226 sends the same value for both. | Revisit the #226 request shape. |
 | Is `sessions` an exposed schema, and is `statement_timeout` applied? | The RPC and its 2s limit depend on both. | Change project config, or set the limit in the function. |
 | Is custom OIDC available on our plan? | Docs do not say. | Fall back to a key imported into Supabase, which needs a new decision. |
 
 Custom OIDC is not available through the Supabase CLI or `config.toml`, only the dashboard or Management API. It will need a runbook step rather than a migration.
+
+### Checks awaiting their own OK
+
+The custom-role question and the other unknowns above are **non-production checks, and none has been run**. They require adding an issuer to a Supabase project, which needs Khaliq's direct OK even on a non-production project. The custom-role check comes first, because it decides between #48 as drafted and the fallback below.
+
+## Custom-role fallback
+
+Use this only if the check above shows Supabase refuses the custom role. #48 would then run as `authenticated` and gate on claims. It works, but it is weaker, so the primary design stays preferred.
+
+**What changes in #48**
+- The issuer sets `role: authenticated`.
+- `EXECUTE` goes to `authenticated`, and the `session_directory_search_worker` role and `authenticator` grant are dropped.
+- The role guard and the claims check require `authenticated` instead of the Worker.
+- The `iss`, `aud` and lifetime pins above become **required gates**, and activation cannot proceed without them.
+- `aud` stays `session-directory-search`, so an ordinary `authenticated` token fails it.
+
+**What gets weaker**
+
+| Property | Worker role | Fallback |
+| --- | --- | --- |
+| Who can call the RPC | Only the Worker role, enforced by Postgres | Every `authenticated` token. Only the claim pins refuse the others. |
+| Direct table access | None | The token also gets RLS-scoped reads: that workspace's directory and `session_index` pointers, and `sessions.machines` for the whole org. |
+| 2s `statement_timeout` | Role setting | Lost. `authenticated`'s own limit applies. A function-level `SET` is not expected to re-arm a running statement's timer, so it must be measured before anyone relies on it. |
+| Kill switch | `REVOKE` from `authenticator` | Delete the policy row. Revoking `authenticated` would break every other reader. |
+
+**Review and tests**
+- This is a new grants review, not a small edit. #48's authorization tests pin the opposite, including "no role except the Worker can execute".
+- Tests 11 and 12 change: an `authenticated` token without the pinned `iss` and `aud` must be refused by the RPC, and direct table reads with the search token must return only that tenant's permitted rows.
+- Add a test that a real Supabase Auth user token cannot run the RPC.
 
 ## Self-hosted stacks
 
@@ -141,7 +209,7 @@ Hosted Supabase custom OIDC does not cover the self-hosted stacks. `stacks/aws/r
    - expired or not-yet-valid tokens
 7. A correctly shaped token signed by the **general** RelayAuth key is refused.
 8. A validly signed token with wrong `iss`, wrong `aud`, a lifetime over 60s, or a missing `iat` is refused by the RPC.
-9. `app_metadata` claims moved to the top level or given the wrong type are refused.
+9. `app_metadata` claims moved to the top level or given the wrong type are refused, as are an empty policy table, `aud` as an array, two entries in `workspace_ids`, and a far-future `iat`.
 
 **Role boundary**
 
@@ -175,18 +243,18 @@ Hosted Supabase custom OIDC does not cover the self-hosted stacks. `stacks/aws/r
 
 **Hosted, non-production Supabase project**
 
-25. Rerun 1, 2, 6, 7 and 11 through the real gateway, and answer every unknown above. This needs Khaliq's OK to set up.
+25. Rerun 1, 2, 6, 7 and 11 through the real gateway. Depends on the checks awaiting their own OK.
 
 ## What blocks #48 activation
 
 **Decisions**
 1. Khaliq accepts or changes this design.
-2. Supabase unknowns are answered on a non-production project.
+2. Khaliq approves the non-production checks, and they answer the Supabase unknowns. The custom-role result picks the primary design or the fallback.
 
 **Code**
 
 3. RelayAuth: separate issuer, discovery, JWKS, exchange endpoint and its tests.
-4. #48: RPC pins `iss`, `aud` and lifetime. Independent review is still pending.
+4. #48: adopts the proposed pins. Independent review is still pending.
 5. #38 lands first, since #48 is stacked on it.
 6. #226: move to the RPC with the token flow and the rest of #48's contract amendment. It stays frozen until accepted.
 7. A reviewed migration for `GRANT session_directory_search_worker TO authenticator`.
@@ -199,7 +267,7 @@ Hosted Supabase custom OIDC does not cover the self-hosted stacks. `stacks/aws/r
 
 **Needs Khaliq's direct OK when reached**
 - Generating the issuer key and the Worker's API key.
-- Adding the issuer to any Supabase project.
+- Adding the issuer to any Supabase project, including a non-production one.
 - Applying any migration, including the `authenticator` grant.
 - Deploying RelayAuth or RelayHistory.
 - Merging #38, #48 and #226 on exact heads.
