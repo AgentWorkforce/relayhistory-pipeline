@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { createMiddleware } from "hono/factory";
 import type { AppContext, AppEnv, Bindings } from "../env.js";
 import { getAuth, requireScope } from "../middleware/auth.js";
 import { loggerEnvFromBindings } from "../lib/logger.js";
@@ -27,8 +28,18 @@ import {
   type StageMessage,
 } from "../lib/pipeline/index.js";
 import {
+  migrationGrantAllowed,
+  migrationGrantMarked,
+  migrationPairAuthorized,
+  migrationPlanMatches,
+  migrationSourceMatches,
+  storedManifestOwnedByOther,
+  type MigrationAssertionLedger,
+} from "../lib/pipeline/migration-assertions.js";
+import {
   buildObjectLandedMessage,
   manifestReaderFromEnv,
+  objectStoreManifestReader,
   OBJECT_LANDED_STAGE,
   orgResolverFromEnv,
   prefixAllowed,
@@ -40,6 +51,7 @@ import {
 } from "../lib/pipeline/adapter.js";
 import {
   ObjectStoreError,
+  manifestKey,
   parseManifest,
   parseSessionKey,
   RAW_FORMATS,
@@ -80,6 +92,12 @@ export interface PipelineRouteDeps {
     stage: PipelineStage,
     message: StageMessage,
   ): Promise<void>;
+  /**
+   * Single-use ledger for RelayAuth migration assertions. It also performs a
+   * migration commit's enqueue, in the same transaction as the consumption,
+   * in place of `send`. Absent: migration assertions are refused (503).
+   */
+  migrationLedger?(env: Bindings): MigrationAssertionLedger | undefined;
 }
 
 const defaultDeps: PipelineRouteDeps = {
@@ -92,7 +110,7 @@ const defaultDeps: PipelineRouteDeps = {
 
 function error(
   c: AppContext,
-  status: 400 | 401 | 403 | 404 | 413 | 503,
+  status: 400 | 401 | 403 | 404 | 409 | 413 | 503,
   code: string,
   message: string,
 ) {
@@ -189,6 +207,73 @@ export function recordRequestStage(
 
 export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
   const routes = new Hono<AppEnv>();
+
+  /**
+   * Admission for a RelayAuth migration assertion, ahead of any route work:
+   * a configured ledger (else 503), the signed pair (`wks`, `sponsorId`)
+   * equal to the grant pair (`meta.workspaceId`, `meta.sourceUserId`) (else
+   * 403 `migration_workspace_forbidden`), and an assertion not yet consumed
+   * (else 409). The handlers then check the upload's target workspace and,
+   * at the manifest commit, the plan digest. Ordinary tokens pass through.
+   */
+  const migrationAdmission = createMiddleware<AppEnv>(async (c, next) => {
+    const auth = getAuth(c);
+    if (!auth.migration) return next();
+    const env = c.env ?? {};
+    const ledger = deps.migrationLedger?.(env);
+    if (!ledger) return ledgerUnavailable(c);
+    if (!migrationPairAuthorized(auth)) return workspaceForbidden(c);
+    if (!migrationGrantAllowed(env, auth.migration)) return grantForbidden(c);
+    let consumed: boolean;
+    try {
+      consumed = await ledger.consumed(auth.migration);
+    } catch {
+      return ledgerUnavailable(c);
+    }
+    if (consumed) return replayed(c);
+    await next();
+  });
+  // The only routes a migration assertion reaches (requireAuth refuses it on
+  // every other one). Registered ahead of the handlers, so it runs first.
+  routes.use("/pipeline/chunks", migrationAdmission);
+  routes.use("/pipeline/manifests", migrationAdmission);
+  routes.use("/pipeline/manifests/status", migrationAdmission);
+
+  function grantForbidden(c: AppContext) {
+    return error(
+      c,
+      403,
+      "migration_grant_forbidden",
+      "The migration assertion's grant is not accepted here, or its plan is not that grant's plan",
+    );
+  }
+
+  function workspaceForbidden(c: AppContext) {
+    return error(
+      c,
+      403,
+      "migration_workspace_forbidden",
+      "The upload's workspace and user are not the pair this migration assertion was signed for",
+    );
+  }
+
+  function ledgerUnavailable(c: AppContext) {
+    return error(
+      c,
+      503,
+      "migration_ledger_unavailable",
+      "The migration assertion ledger is not configured or not available",
+    );
+  }
+
+  function replayed(c: AppContext) {
+    return error(
+      c,
+      409,
+      "migration_assertion_replayed",
+      "This migration assertion was already used; retry with a fresh assertion",
+    );
+  }
 
   /** "Did my upload land?": every recorded stage of one trace, plus a verdict. */
   routes.get(
@@ -418,10 +503,87 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     }
     if (built.status !== "enqueue")
       return error(c, 400, "bad_request", "key is not a manifest");
-    try {
-      await deps.send(env, OBJECT_LANDED_STAGE, built.message);
-    } catch {
-      return error(c, 503, "not_configured", "Pipeline queue is not available");
+    const auth = getAuth(c);
+    if (auth.migration) {
+      // The target (key and manifest workspace, resolved user) must be the
+      // signed grant pair, and the manifest must commit to the signed plan.
+      if (
+        !migrationPairAuthorized(auth, {
+          workspaceIds: [location.workspaceId, manifest.session.workspace_id],
+        })
+      )
+        return workspaceForbidden(c);
+      if (!migrationSourceMatches(auth.migration, manifest))
+        return workspaceForbidden(c);
+      // The object already at the key (when it is not the copy just read)
+      // must not belong to another user either.
+      const raw = (deps.rawStore ?? defaultDeps.rawStore!)(env);
+      if (!reader && raw) {
+        let stored: Awaited<ReturnType<ManifestReader["read"]>>;
+        try {
+          stored = await objectStoreManifestReader(raw.store, {
+            provider: raw.provider,
+          }).read(key);
+        } catch {
+          return error(
+            c,
+            503,
+            "storage_unavailable",
+            "Object storage is temporarily unavailable",
+          );
+        }
+        if (
+          stored &&
+          storedManifestOwnedByOther(auth.migration, stored.manifest)
+        )
+          return workspaceForbidden(c);
+      }
+      if (!migrationGrantMarked(auth.migration, manifest))
+        return grantForbidden(c);
+      if (!migrationPlanMatches(auth.migration, manifest))
+        return error(
+          c,
+          403,
+          "migration_plan_mismatch",
+          "The manifest does not commit to the export plan this migration assertion was signed for",
+        );
+      // The commit's only durable write is the enqueue: the ledger consumes the
+      // assertion and enqueues as one unit, so neither lands without the other.
+      // A failure leaves nothing consumed, and the upload may be retried.
+      const ledger = deps.migrationLedger?.(env);
+      if (!ledger) return ledgerUnavailable(c);
+      let outcome: "consumed" | "replayed" | "grant_mismatch";
+      try {
+        outcome = await ledger.consume(
+          {
+            jti: auth.migration.jti,
+            nonce: auth.migration.nonce,
+            grantId: auth.migration.grantId,
+            planDigest: auth.migration.planDigest,
+            expiresAt: auth.migration.expiresAt,
+            orgId: scope.orgId,
+            workspaceId: scope.workspaceId,
+            userId: auth.userId,
+          },
+          OBJECT_LANDED_STAGE,
+          built.message,
+        );
+      } catch {
+        return ledgerUnavailable(c);
+      }
+      if (outcome === "replayed") return replayed(c);
+      if (outcome === "grant_mismatch") return grantForbidden(c);
+    } else {
+      try {
+        await deps.send(env, OBJECT_LANDED_STAGE, built.message);
+      } catch {
+        return error(
+          c,
+          503,
+          "not_configured",
+          "Pipeline queue is not available",
+        );
+      }
     }
     return c.json(
       {
@@ -485,6 +647,27 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     // ownership, and with no org mapping configured the write fails closed.
     const owned = await callerOwnsLocation(c, location);
     if (owned !== true) return owned;
+    const migration = getAuth(c).migration;
+    if (migration) {
+      // A token for user A must not add chunks under a session (and so a
+      // machine) whose stored manifest names user B.
+      let stored: Awaited<ReturnType<ManifestReader["read"]>>;
+      try {
+        stored = await objectStoreManifestReader(raw.store, {
+          provider: raw.provider,
+          ...(raw.bucket ? { bucket: raw.bucket } : {}),
+        }).read(manifestKey(location));
+      } catch {
+        return error(
+          c,
+          503,
+          "storage_unavailable",
+          "Object storage is temporarily unavailable",
+        );
+      }
+      if (stored && storedManifestOwnedByOther(migration, stored.manifest))
+        return workspaceForbidden(c);
+    }
     const declared = Number(c.req.header("content-length") ?? NaN);
     if (declared > MAX_CHUNK_BYTES)
       return error(c, 413, "too_large", "chunk exceeds the size limit");
@@ -552,6 +735,12 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
   ) {
     const scope = pipelineScope(c);
     const env = c.env ?? {};
+    const auth = getAuth(c);
+    if (
+      auth.migration &&
+      !migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId] })
+    )
+      return workspaceForbidden(c);
     if (
       location.workspaceId !== scope.workspaceId ||
       !prefixAllowed(env, location.prefix, scope.orgId)

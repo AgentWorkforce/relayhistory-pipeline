@@ -47,16 +47,16 @@ beforeEach(async () => {
 const jti = () => `tok_${randomBytes(16).toString("hex")}`;
 const nonce = () => randomBytes(24).toString("base64url");
 
-type Use = { jti: string; nonce: string; planDigest?: string };
+type Use = { jti: string; nonce: string; planDigest?: string; grantId?: string; expiresAt?: string };
 
 async function insertUse(tx: Transaction | PGlite, use: Use) {
   const { rows } = await tx.query(
     `INSERT INTO sessions.migration_assertion_uses (jti, nonce, grant_id, org_id,
-                                                    workspace_id, user_id, plan_digest)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                                    workspace_id, user_id, plan_digest, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::timestamptz, now() + interval '65 seconds'))
      ON CONFLICT DO NOTHING
      RETURNING jti`,
-    [use.jti, use.nonce, GRANT, ORG, WORKSPACE, USER, use.planDigest ?? PLAN],
+    [use.jti, use.nonce, use.grantId ?? GRANT, ORG, WORKSPACE, USER, use.planDigest ?? PLAN, use.expiresAt ?? null],
   );
   return rows.length === 1;
 }
@@ -136,6 +136,45 @@ describe("sessions.migration_assertion_uses", () => {
     await expect(insertUse(db, { jti: "", nonce: nonce() })).rejects.toThrow(
       /jti/,
     );
+  });
+
+  it("retention: purges only the named grant's rows past expires_at plus the margin", async () => {
+    const live = { jti: jti(), nonce: nonce() };
+    expect(await consume(live)).toBe("consumed");
+    // Expired, but inside the 5 minute clock-drift margin: kept.
+    await insertUse(db, { jti: jti(), nonce: nonce(), expiresAt: new Date(Date.now() - 60_000).toISOString() });
+    // Long expired: purgeable.
+    await insertUse(db, { jti: jti(), nonce: nonce(), expiresAt: new Date(Date.now() - 3_600_000).toISOString() });
+    // Long expired, another grant: untouched by this grant's purge.
+    await insertUse(db, { jti: jti(), nonce: nonce(), grantId: "mgr_other", expiresAt: new Date(Date.now() - 3_600_000).toISOString() });
+    const { rows } = await db.query<{ n: number }>(
+      "SELECT sessions.purge_migration_assertion_uses($1)::int AS n",
+      [GRANT],
+    );
+    expect(rows[0]!.n).toBe(1);
+    expect(await count("sessions.migration_assertion_uses")).toBe(3);
+    // The unexpired assertion is still a replay after the purge.
+    expect(await consume(live)).toBe("replayed");
+  });
+
+  it("requires expires_at, and the purge is service-role only", async () => {
+    await expect(
+      db.query(
+        `INSERT INTO sessions.migration_assertion_uses (jti, nonce, grant_id, org_id, workspace_id, user_id, plan_digest)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [jti(), nonce(), GRANT, ORG, WORKSPACE, USER, PLAN],
+      ),
+    ).rejects.toThrow(/expires_at/);
+    for (const role of ["authenticated", "anon"]) {
+      await db.exec(`RESET ROLE; SET ROLE ${role}`);
+      try {
+        await expect(
+          db.query("SELECT sessions.purge_migration_assertion_uses('x')"),
+        ).rejects.toThrow(/permission denied/);
+      } finally {
+        await db.exec("RESET ROLE; SET ROLE service_role");
+      }
+    }
   });
 
   it("is service-role only: RLS on, no policy, no tenant grant", async () => {

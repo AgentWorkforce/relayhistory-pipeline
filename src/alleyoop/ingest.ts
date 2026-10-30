@@ -20,7 +20,7 @@ import {
   type PipelineStage,
   type StageMessage,
 } from "../shared/vendor.ts";
-import { openHoopDb, waitForHoopDb, waitForSchema } from "../shared/db.ts";
+import { inTransaction, openHoopDb, waitForHoopDb, waitForSchema } from "../shared/db.ts";
 import { enrichMessage, requestIdentity } from "../shared/enrich.ts";
 import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 import { traceparentFor } from "../shared/ids.ts";
@@ -32,7 +32,7 @@ import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedMigrationNames } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
-import { createCourierManifestRoutes } from "./manifests.ts";
+import { courierMigrationLedger, createCourierManifestRoutes } from "./manifests.ts";
 
 export async function buildIngestApp() {
   const port = integer("INGEST_PORT", 8080);
@@ -51,6 +51,10 @@ export async function buildIngestApp() {
     // assertions minted for this deployment's origin are accepted (legacy shared audience refused).
     ...(process.env.RELAYHISTORY_ORIGIN ? { RELAYHISTORY_ORIGIN: process.env.RELAYHISTORY_ORIGIN } : {}),
     ...(process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS ? { RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS: process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS } : {}),
+    // RelayAuth migration assertions (relayauth#110): default off. Grants are
+    // `grantId=planDigest` pairs (ids and public digests only, no secrets).
+    ...(process.env.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS ? { RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS: process.env.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS } : {}),
+    ...(process.env.RELAYHISTORY_MIGRATION_GRANTS ? { RELAYHISTORY_MIGRATION_GRANTS: process.env.RELAYHISTORY_MIGRATION_GRANTS } : {}),
   }) as unknown as Bindings;
   if (!jwks && !process.env.RELAYAUTH_JWKS_URL) throw new Error("96bulls: ingest needs JWKS_JSON, JWT_PRIVATE_KEY_PEM or RELAYAUTH_JWKS_URL");
 
@@ -65,14 +69,23 @@ export async function buildIngestApp() {
     withSpan("enqueue", { traceparent: traceparentFor(message.ctx.traceId), attrs: { stage, trace_id: message.ctx.traceId } }, async () => {
       await queue.send(await enrichMessage({ ...message, stage }, reader));
     });
+  // Migration commits: the ledger row, enrichMessage and the pipeline_jobs
+  // insert in ONE transaction (see manifests.ts).
+  const migrationLedger = courierMigrationLedger(
+    { query: db.query.bind(db), transaction: (work) => inTransaction(db, work) },
+    reader,
+    (stage, message, work) =>
+      withSpan("enqueue", { traceparent: traceparentFor(message.ctx.traceId), attrs: { stage, trace_id: message.ctx.traceId } }, work),
+  );
   const pipeline = createPipelineRoutes({
     manifests: () => reader,
     rawStore: () => lockerStore(),
     sink: () => sink,
     deadLetters: () => deadLetters,
     send,
+    migrationLedger: () => migrationLedger,
   });
-  const courierManifests = createCourierManifestRoutes({ manifests: reader, raw: lockerStore(), send });
+  const courierManifests = createCourierManifestRoutes({ manifests: reader, raw: lockerStore(), send, migrationLedger });
 
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {

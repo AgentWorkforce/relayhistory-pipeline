@@ -1,4 +1,18 @@
 import { Hono, type Context } from "hono";
+import { createMiddleware } from "hono/factory";
+import {
+  migrationGrantAllowed,
+  migrationGrantMarked,
+  migrationPairAuthorized,
+  migrationPlanMatches,
+  migrationSourceMatches,
+  storedManifestOwnedByOther,
+  sqlMigrationAssertionLedger,
+  type TransactionalSqlExecutor,
+  type MigrationAssertionClaims,
+  type MigrationAssertionLedger,
+  type MigrationConsumeResult,
+} from "@rhc/lib/pipeline/migration-assertions.ts";
 import {
   buildObjectLandedMessage,
   isObjectStoreError,
@@ -7,6 +21,7 @@ import {
   orgResolverFromEnv,
   parseManifest,
   parseSessionKey,
+  postgresPipelineQueue,
   prefixAllowed,
   rawChunkKey,
   readCapped,
@@ -17,9 +32,29 @@ import {
   type ManifestReader,
   type ManifestV1,
   type ObjectVersion,
+  type PipelineStage,
   type RawStore,
   type StageMessage,
 } from "../shared/vendor.ts";
+import { enrichMessage } from "../shared/enrich.ts";
+
+/**
+ * The ingest's migration ledger over HoopDb: `sessions.migration_assertion_uses`
+ * insert, enrichMessage, and the `sessions.pipeline_jobs` insert, all on the
+ * same transaction `tx`. `around` wraps the enqueue (the ingest's span).
+ */
+export function courierMigrationLedger(
+  sql: TransactionalSqlExecutor,
+  reader: ManifestReader,
+  around: (stage: PipelineStage, message: StageMessage, work: () => Promise<void>) => Promise<void> = (_stage, _message, work) => work(),
+): MigrationAssertionLedger {
+  return sqlMigrationAssertionLedger(sql, {
+    enqueue: (tx, stage, message) =>
+      around(stage, message, async () => {
+        await postgresPipelineQueue(tx).send(await enrichMessage({ ...message, stage }, reader));
+      }),
+  });
+}
 
 const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -28,6 +63,14 @@ interface ManifestRoutesDeps {
   manifests: ManifestReader;
   raw: RawStore;
   send(env: Bindings, stage: typeof OBJECT_LANDED_STAGE, message: StageMessage): Promise<void>;
+  /**
+   * Single-use ledger for RelayAuth migration assertions (relayauth#110). For
+   * a migration commit it replaces `send`: the ledger row, the enriched
+   * message (enrichMessage) and the `pipeline_jobs` insert run in ONE SQL
+   * transaction (ingest.ts). Absent: migration assertions get 503
+   * `migration_ledger_unavailable`.
+   */
+  migrationLedger?: MigrationAssertionLedger;
 }
 
 interface PostedManifest {
@@ -37,10 +80,13 @@ interface PostedManifest {
 }
 
 type Auth = {
+  userId: string;
   orgId: string;
   workspaceId?: string;
   historyOrigin?: string;
   scopes: string[];
+  claims: Record<string, unknown>;
+  migration?: MigrationAssertionClaims;
 };
 
 const responseError = (c: Context<AppEnv>, status: 400 | 403 | 404 | 409 | 413 | 503, code: string, message: string) =>
@@ -129,11 +175,68 @@ async function storedManifest(raw: RawStore, key: string): Promise<{ manifest: M
 export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   const routes = new Hono<AppEnv>();
 
+  const ledgerUnavailable = (c: Context<AppEnv>) =>
+    responseError(c, 503, "migration_ledger_unavailable", "The migration assertion ledger is not configured or not available");
+  const workspaceForbidden = (c: Context<AppEnv>) =>
+    responseError(c, 403, "migration_workspace_forbidden", "The upload's workspace and user are not the pair this migration assertion was signed for");
+  const grantForbidden = (c: Context<AppEnv>) =>
+    responseError(c, 403, "migration_grant_forbidden", "The migration assertion's grant is not accepted here, or its plan is not that grant's plan");
+  const planMismatch = (c: Context<AppEnv>) =>
+    responseError(c, 403, "migration_plan_mismatch", "The manifest does not commit to the export plan this migration assertion was signed for");
+  const replayed = (c: Context<AppEnv>) =>
+    responseError(c, 409, "migration_assertion_replayed", "This migration assertion was already used; retry with a fresh assertion");
+
+  /**
+   * Migration-assertion admission, the same as relayhistory-cloud's
+   * (routes/pipeline.ts) and with the same codes, ahead of any storage call
+   * on the manifest commit and the status read (any method; requireAuth
+   * already refuses every route but GET status and POST manifests): a ledger
+   * (503), the signed pair (403 migration_workspace_forbidden), an accepted
+   * grant and plan (403 migration_grant_forbidden), and not yet consumed
+   * (409 migration_assertion_replayed; a ledger error is 503). Ordinary
+   * tokens pass through.
+   */
+  const migrationAdmission = createMiddleware<AppEnv>(async (c, next) => {
+    const auth = c.get("auth") as Auth;
+    if (!auth?.migration) return next();
+    const ledger = deps.migrationLedger;
+    if (!ledger) return ledgerUnavailable(c);
+    if (!migrationPairAuthorized(auth)) return workspaceForbidden(c);
+    if (!migrationGrantAllowed(c.env ?? {}, auth.migration)) return grantForbidden(c);
+    let consumed: boolean;
+    try {
+      consumed = await ledger.consumed(auth.migration);
+    } catch {
+      return ledgerUnavailable(c);
+    }
+    if (consumed) return replayed(c);
+    await next();
+  });
+  routes.use("/pipeline/manifests", migrationAdmission);
+  routes.use("/pipeline/manifests/status", migrationAdmission);
+
+  /**
+   * The checks a migration assertion's manifest must pass against its signed
+   * claims: target workspace and source user (403 migration_workspace_forbidden),
+   * the grant it names (403 migration_grant_forbidden) and the plan it commits
+   * to (403 migration_plan_mismatch).
+   */
+  const migrationManifestIssue = (c: Context<AppEnv>, auth: Auth, migration: MigrationAssertionClaims, workspaceId: string, manifest: ManifestV1) => {
+    if (!migrationPairAuthorized(auth, { workspaceIds: [workspaceId, manifest.session.workspace_id] }) ||
+      !migrationSourceMatches(migration, manifest))
+      return workspaceForbidden(c);
+    if (!migrationGrantMarked(migration, manifest)) return grantForbidden(c);
+    if (!migrationPlanMatches(migration, manifest)) return planMismatch(c);
+    return undefined;
+  };
+
   const owns = async (c: Context<AppEnv>, location: NonNullable<ReturnType<typeof parseSessionKey>>) => {
     const auth = c.get("auth") as Auth;
     const env = c.env ?? {};
     if (!auth.scopes.includes("rth:sync"))
       return responseError(c, 403, "forbidden", "rth:sync scope is required");
+    if (auth.migration && !migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId] }))
+      return workspaceForbidden(c);
     const workspaceId = auth.workspaceId || "default";
     if (location.workspaceId !== workspaceId || !prefixAllowed(env, location.prefix, auth.orgId))
       return responseError(c, 403, "forbidden", "key is outside the caller's workspace");
@@ -176,6 +279,12 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     }
     if (c.req.header("X-Session-Id") !== manifest.session.session_id || c.req.header("X-Machine-Id") !== manifest.session.machine_id)
       return responseError(c, 400, "bad_request", "session headers do not match the manifest");
+    const auth = c.get("auth") as Auth;
+    const migration = auth.migration;
+    if (migration) {
+      const issue = migrationManifestIssue(c, auth, migration, location.workspaceId, manifest);
+      if (issue) return issue;
+    }
     const encoded = new TextEncoder().encode(JSON.stringify(manifest));
     if (encoded.byteLength > MAX_MANIFEST_BYTES)
       return responseError(c, 413, "payload_too_large", "manifest is too large");
@@ -183,6 +292,10 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       if (!(await chunksAreServerSealed(deps.raw, manifest)))
         return responseError(c, 409, "chunks_unverified", "manifest chunks are not server-sealed");
       const existing = await storedManifest(deps.raw, key);
+      // A token for user A must not write under a key (and so a machine)
+      // whose stored manifest names user B.
+      if (migration && existing && storedManifestOwnedByOther(migration, existing.manifest))
+        return workspaceForbidden(c);
       let storedVersion: ObjectVersion;
       if (!existing) {
         if (manifest.revision !== 1)
@@ -218,7 +331,33 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         read,
       });
       if (built.status !== "enqueue") return responseError(c, 400, "bad_request", "key is not a manifest");
-      await deps.send(c.env ?? {}, OBJECT_LANDED_STAGE, built.message);
+      if (migration) {
+        // The ledger row and the enriched pipeline_jobs row commit in one SQL
+        // transaction, or neither does (fail closed: 503, nothing consumed).
+        // The object write above is idempotent: a retry of the identical
+        // manifest takes the "identical" branch and enqueues then.
+        const ledger = deps.migrationLedger;
+        if (!ledger) return ledgerUnavailable(c);
+        let outcome: MigrationConsumeResult;
+        try {
+          outcome = await ledger.consume({
+            jti: migration.jti,
+            nonce: migration.nonce,
+            grantId: migration.grantId,
+            planDigest: migration.planDigest,
+            expiresAt: migration.expiresAt,
+            orgId: auth.orgId,
+            workspaceId: location.workspaceId,
+            userId: auth.userId,
+          }, OBJECT_LANDED_STAGE, built.message);
+        } catch {
+          return ledgerUnavailable(c);
+        }
+        if (outcome === "replayed") return replayed(c);
+        if (outcome === "grant_mismatch") return grantForbidden(c);
+      } else {
+        await deps.send(c.env ?? {}, OBJECT_LANDED_STAGE, built.message);
+      }
       return c.json({
         workKey: built.message.workKey,
         traceId: built.message.ctx.traceId,
@@ -239,10 +378,18 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     const location = parseSessionKey(key);
     if (!location || location.rest !== "manifest.json") return c.body(null, 400);
     const owned = await owns(c, location);
-    if (owned !== true) return c.body(null, owned.status as 403 | 503);
+    if (owned !== true)
+      return (c.get("auth") as Auth).migration ? owned : c.body(null, owned.status as 403 | 503);
     try {
       const stored = await storedManifest(deps.raw, key);
       if (!stored) return c.body(null, 404);
+      // A migration assertion reads only the status of a manifest of its own
+      // grant, workspace, source user and plan.
+      const auth = c.get("auth") as Auth;
+      if (auth.migration) {
+        const issue = migrationManifestIssue(c, auth, auth.migration, location.workspaceId, stored.manifest);
+        if (issue) return issue;
+      }
       if (c.req.query("machine") !== stored.manifest.session.machine_id ||
         c.req.query("writer") !== stored.manifest.writer.delivery_instance_id)
         return c.body(null, 403);

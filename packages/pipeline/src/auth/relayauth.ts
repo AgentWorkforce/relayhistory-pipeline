@@ -1,6 +1,7 @@
-// Copied from AgentWorkforce/relayhistory-cloud packages/relayhistory/src/auth/relayauth.ts at 6f6d568849c483be8e3a2a5aaeba3da1d4b47de9 (96BullSessions stand-in; one change: an unknown kid refetches the JWKS, see getJwks; MOVE_NOTES.md).
+// Copied from AgentWorkforce/relayhistory-cloud packages/relayhistory/src/auth/relayauth.ts at 6f6d568849c483be8e3a2a5aaeba3da1d4b47de9 (96BullSessions stand-in; changes: an unknown kid refetches the JWKS, see getJwks; MOVE_NOTES.md; and the migration-assertion verifier ported from relayhistory-cloud feat/migration-assertion-ingest, see #43).
 import { analyticsFromVerifiedAssertion } from "./analytics-identity.js";
 import type { AuthContext, Bindings } from "../env.js";
+import type { MigrationAssertionClaims } from "../lib/pipeline/migration-assertions.js";
 import {
   DEFAULT_RELAYAUTH_AUDIENCE,
   DEFAULT_RELAYAUTH_ISSUER,
@@ -28,6 +29,19 @@ type IdentityErrorCode = "invalid_token" | "invalid_claims";
 
 const TOKEN_PREFIXES = ["relay_pa_", "relay_ws_", "relay_id_", "relay_ag_"];
 const CLOCK_SKEW_SECONDS = 60;
+export const MIGRATION_ASSERTION_SUBJECT = "agent_relayhistory_migration";
+const MIGRATION_ASSERTION_CLASS = "migration_assertion";
+/** RelayAuth caps a migration assertion's lifetime (`exp - iat`) at 60 seconds. */
+const MIGRATION_ASSERTION_MAX_TTL_SECONDS = 60;
+/**
+ * Clock skew tolerated on a migration assertion's `iat`, `nbf` and `exp`
+ * (ordinary tokens keep 60 seconds). With the 60 second lifetime cap, a
+ * migration assertion is accepted for at most `iat + 65` seconds.
+ */
+export const MIGRATION_CLOCK_SKEW_SECONDS = 5;
+const MIGRATION_ID_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const MIGRATION_NONCE_SHAPE = /^[A-Za-z0-9_-]{16,128}$/;
+const PLAN_DIGEST_SHAPE = /^[0-9a-f]{64}$/;
 const jwksCache = new Map<string, Promise<JsonWebKeySet>>();
 const keyCache = new Map<string, Promise<CryptoKey>>();
 
@@ -55,6 +69,7 @@ export async function verifyAgentRelayToken(
     | "RELAYAUTH_AUDIENCE"
     | "RELAYHISTORY_ORIGIN"
     | "RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS"
+    | "RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS"
   >,
 ): Promise<AuthContext> {
   const token = stripRelayTokenPrefix(tokenWithOptionalPrefix.trim());
@@ -86,7 +101,47 @@ export async function verifyAgentRelayToken(
   const historyOrigin = validateClaims(claims, env);
   const auth = extractAuthContext(claims);
   if (historyOrigin) auth.historyOrigin = historyOrigin;
+  if (isMigrationAssertionMarked(claims)) {
+    auth.migration = migrationAssertionClaims(claims);
+    // Tenancy is exactly the asserted user, org and workspace: no alternative
+    // claim name may resolve to something else.
+    if (
+      auth.userId !== stripRelayPrefix(String(claims.sponsorId)) ||
+      auth.orgId !== stripRelayPrefix(String(claims.org)) ||
+      auth.workspaceId !== stripRelayPrefix(String(claims.wks))
+    ) {
+      throw new IdentityError(
+        "invalid_claims",
+        "migration assertion tenancy is ambiguous",
+      );
+    }
+  }
   auth.analyticsIdentity = analyticsFromVerifiedAssertion(auth);
+  return auth;
+}
+
+/**
+ * The dedicated migration-assertion path (`RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS`):
+ * the full RelayAuth verification, then refuses anything that is not of the
+ * migration class. A generic RelayAuth bearer is never admitted here.
+ */
+export async function verifyMigrationAssertion(
+  token: string,
+  env: Parameters<typeof verifyAgentRelayToken>[1],
+): Promise<AuthContext> {
+  if (env.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS !== "true") {
+    throw new IdentityError(
+      "invalid_claims",
+      "migration assertions are not enabled on this History",
+    );
+  }
+  const auth = await verifyAgentRelayToken(token, env);
+  if (!auth.migration || !isMigrationAssertionClass(auth.claims)) {
+    throw new IdentityError(
+      "invalid_token",
+      "only RelayAuth migration assertions are accepted on this path",
+    );
+  }
   return auth;
 }
 
@@ -222,6 +277,7 @@ function validateClaims(
     | "RELAYAUTH_AUDIENCE"
     | "RELAYHISTORY_ORIGIN"
     | "RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS"
+    | "RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS"
   >,
 ): string | undefined {
   const issuer = env.RELAYAUTH_ISSUER?.trim() || DEFAULT_RELAYAUTH_ISSUER;
@@ -229,15 +285,38 @@ function validateClaims(
     throw new IdentityError("invalid_claims", "invalid jwt issuer");
   }
   const historyOrigin = configuredHistoryOrigin(env);
+  const migration = isMigrationAssertionMarked(claims);
+  if (migration && env.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS !== "true") {
+    // Dedicated, default-off switch: the broad interim bearer flag alone
+    // never admits a migration assertion.
+    throw new IdentityError(
+      "invalid_claims",
+      "migration assertions are not enabled on this History",
+    );
+  }
+  if (migration) {
+    // A migration assertion acts for another user, so it is accepted only when
+    // minted for this History's origin, never on the shared legacy audience.
+    if (
+      historyOrigin === undefined ||
+      soleAudience(claims.aud) !== historyOrigin
+    ) {
+      throw new IdentityError(
+        "invalid_claims",
+        "migration assertion must be bound to this History's origin",
+      );
+    }
+  }
   // Only RelayAuth's dedicated assertion endpoint mints for a History origin.
   // Any other token that carries the origin as its audience is not one.
   // Once this History has an origin, every accepted assertion must name
   // exactly one audience: a token that also names another History (or this
   // one next to the shared audience) is ambiguous and refused.
   const boundHere =
-    historyOrigin !== undefined &&
-    soleAudience(claims.aud) === historyOrigin &&
-    isRelayhistoryAssertionClass(claims);
+    migration ||
+    (historyOrigin !== undefined &&
+      soleAudience(claims.aud) === historyOrigin &&
+      isRelayhistoryAssertionClass(claims));
   if (!boundHere) {
     const legacy = env.RELAYAUTH_AUDIENCE?.trim() || DEFAULT_RELAYAUTH_AUDIENCE;
     const legacyAudience =
@@ -250,19 +329,142 @@ function validateClaims(
   }
 
   const now = Math.floor(Date.now() / 1000);
-  if (
-    typeof claims.exp !== "number" ||
-    claims.exp + CLOCK_SKEW_SECONDS <= now
-  ) {
+  const skew = migration ? MIGRATION_CLOCK_SKEW_SECONDS : CLOCK_SKEW_SECONDS;
+  if (typeof claims.exp !== "number" || claims.exp + skew <= now) {
     throw new IdentityError("invalid_claims", "jwt is expired");
   }
-  if (typeof claims.nbf === "number" && claims.nbf - CLOCK_SKEW_SECONDS > now) {
+  if (typeof claims.nbf === "number" && claims.nbf - skew > now) {
     throw new IdentityError("invalid_claims", "jwt is not active yet");
   }
   if (!stringClaim(claims, "sub")) {
     throw new IdentityError("invalid_claims", "missing jwt subject");
   }
+  if (migration) migrationAssertionClaims(claims, now);
   return boundHere ? historyOrigin : undefined;
+}
+
+/**
+ * Either marker of RelayAuth's `/v1/tokens/migration-assertion` class. A token
+ * with only one of them is not ordinary either: it is refused as malformed.
+ */
+function isMigrationAssertionMarked(claims: Record<string, unknown>): boolean {
+  return (
+    claims.sub === MIGRATION_ASSERTION_SUBJECT ||
+    metaOf(claims)?.tokenClass === MIGRATION_ASSERTION_CLASS
+  );
+}
+
+/**
+ * The claims RelayAuth's `/v1/tokens/migration-assertion` alone signs: subject
+ * `agent_relayhistory_migration` and `meta.tokenClass` `migration_assertion`.
+ * Audience is checked separately.
+ */
+export function isMigrationAssertionClass(
+  claims: Record<string, unknown>,
+): boolean {
+  return (
+    claims.sub === MIGRATION_ASSERTION_SUBJECT &&
+    metaOf(claims)?.tokenClass === MIGRATION_ASSERTION_CLASS
+  );
+}
+
+/**
+ * The single-use claims of a migration assertion, after checking its exact
+ * shape: both class markers, an access token whose only scope is `rth:sync`,
+ * a lifetime of at most 60 seconds, well-formed `jti`, nonce, grant and plan
+ * digest, a sponsor chain rooted at the signed `sponsorId`, and well-formed
+ * `meta.sourceUserId` / `meta.workspaceId`.
+ *
+ * Whether the signed pair (`wks`, `sponsorId`) equals the grant pair
+ * (`meta.workspaceId`, `meta.sourceUserId`) and the upload's target is an
+ * authorization decision, not a malformed token: the ingest refuses it with
+ * 403 `migration_workspace_forbidden` (see `migrationPairAuthorized`).
+ */
+function migrationAssertionClaims(
+  claims: Record<string, unknown>,
+  now = Math.floor(Date.now() / 1000),
+): MigrationAssertionClaims {
+  const refuse = (message: string): never => {
+    throw new IdentityError("invalid_claims", `migration assertion ${message}`);
+  };
+  const meta = metaOf(claims);
+  if (!isMigrationAssertionClass(claims) || !meta) refuse("class is malformed");
+  if (claims.token_type !== "access") refuse("must be an access token");
+  const scopes = claims.scopes;
+  if (
+    claims.scope !== undefined ||
+    !Array.isArray(scopes) ||
+    scopes.length !== 1 ||
+    scopes[0] !== "rth:sync"
+  ) {
+    refuse("scopes must be exactly rth:sync");
+  }
+  const iat = claims.iat;
+  const exp = claims.exp;
+  if (
+    typeof iat !== "number" ||
+    typeof exp !== "number" ||
+    exp <= iat ||
+    exp - iat > MIGRATION_ASSERTION_MAX_TTL_SECONDS ||
+    iat - MIGRATION_CLOCK_SKEW_SECONDS > now
+  ) {
+    refuse("lifetime is invalid");
+  }
+  const jti = claims.jti;
+  const { nonce, grantId, planDigest, sourceUserId, workspaceId } = meta!;
+  if (
+    typeof sourceUserId !== "string" ||
+    !MIGRATION_ID_SHAPE.test(sourceUserId)
+  )
+    refuse("sourceUserId is malformed");
+  if (typeof workspaceId !== "string" || !MIGRATION_ID_SHAPE.test(workspaceId))
+    refuse("workspaceId is malformed");
+  if (typeof jti !== "string" || !MIGRATION_ID_SHAPE.test(jti)) {
+    refuse("jti is malformed");
+  }
+  if (typeof nonce !== "string" || !MIGRATION_NONCE_SHAPE.test(nonce)) {
+    refuse("nonce is malformed");
+  }
+  if (typeof grantId !== "string" || !MIGRATION_ID_SHAPE.test(grantId)) {
+    refuse("grantId is malformed");
+  }
+  if (typeof planDigest !== "string" || !PLAN_DIGEST_SHAPE.test(planDigest)) {
+    refuse("planDigest is malformed");
+  }
+  const sponsorId = stringClaim(claims, "sponsorId");
+  const chain = claims.sponsorChain;
+  if (
+    !sponsorId ||
+    !Array.isArray(chain) ||
+    chain.length !== 2 ||
+    chain[0] !== sponsorId ||
+    chain[1] !== MIGRATION_ASSERTION_SUBJECT
+  ) {
+    refuse("sponsor chain is malformed");
+  }
+  if (!stringClaim(claims, "wks") || !stringClaim(claims, "org")) {
+    refuse("workspace or org is missing");
+  }
+  return {
+    jti: jti as string,
+    nonce: nonce as string,
+    grantId: grantId as string,
+    planDigest: planDigest as string,
+    sourceUserId: sourceUserId as string,
+    workspaceId: workspaceId as string,
+    // The ledger must keep this row at least until no clock could still
+    // accept the token (see migration_assertion_uses retention).
+    expiresAt: (exp as number) + MIGRATION_CLOCK_SKEW_SECONDS,
+  };
+}
+
+function metaOf(
+  claims: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const meta = claims.meta;
+  return typeof meta === "object" && meta !== null && !Array.isArray(meta)
+    ? (meta as Record<string, unknown>)
+    : undefined;
 }
 
 /**

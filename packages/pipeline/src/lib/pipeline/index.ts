@@ -31,6 +31,7 @@ import type { PipelineStage } from "./trace.js";
 export * from "./dlq.js";
 export * from "./errors.js";
 export * from "./events.js";
+export * from "./migration-assertions.js";
 export * from "./queue.js";
 export * from "./registry.js";
 export * from "./stages.js";
