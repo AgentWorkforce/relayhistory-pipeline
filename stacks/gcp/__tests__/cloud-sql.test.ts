@@ -99,7 +99,7 @@ describe("Cloud SQL private attachment", () => {
         postPrivateCloudSqlInsert(spec, {
           post: async () => {
             calls += 1;
-            return { operation: "projects/agentworkforce-dev1/operations/op-1" };
+            return { name: "op-1" };
           },
         }),
       ).rejects.toThrow(/Nothing was created/);
@@ -129,10 +129,10 @@ describe("Cloud SQL private attachment", () => {
     const result = await postPrivateCloudSqlInsert(spec, {
       post: async (request) => {
         seen = JSON.stringify(request);
-        return { operation: "projects/agentworkforce-dev1/operations/op-1" };
+        return { name: "op-1" };
       },
     });
-    expect(result).toEqual({ operation: "projects/agentworkforce-dev1/operations/op-1", sent: true });
+    expect(result).toEqual({ operation: "op-1", sent: true });
     expect(spec.posted).toBe(false);
     expect(cloudSqlProxyApplies(spec)).toBe(false);
     expect(seen).toContain("https://sqladmin.googleapis.com/v1/projects/agentworkforce-dev1/instances");
@@ -143,12 +143,20 @@ describe("Cloud SQL private attachment", () => {
           throw new Error(`${token} was refused`);
         },
       }),
-    ).rejects.toThrow(/not accepted/);
+    ).rejects.toThrow(/outcome is uncertain for agentworkforce-dev1\/awf-dev-postgres; reconcile.*before retry or teardown/);
+    await postPrivateCloudSqlInsert(spec, {
+      post: async () => {
+        throw new Error(`${token} was refused`);
+      },
+    }).catch((error: Error) => {
+      expect(error.message).not.toContain(token);
+      expect(error.message).not.toContain("Nothing was created");
+    });
     await expect(
       postPrivateCloudSqlInsert(spec, {
-        post: async () => ({ operation: "https://evil.example/operations/op-1" }),
+        post: async () => ({ name: "https://evil.example/operations/op-1" }),
       }),
-    ).rejects.toThrow(/no operation/);
+    ).rejects.toThrow(/outcome is uncertain/);
   });
 
   test("the Alchemy stack can prepare the insert and cannot post it or call GCP.SQL.Instance", () => {

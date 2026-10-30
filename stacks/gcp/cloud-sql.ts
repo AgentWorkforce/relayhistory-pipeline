@@ -175,7 +175,7 @@ const INSERT_BODY_KEYS = new Set(["name", "region", "databaseVersion", "settings
 const INSERT_SETTINGS_KEYS = new Set(["tier", "availabilityType", "ipConfiguration"]);
 const INSERT_IP_KEYS = new Set(["ipv4Enabled", "privateNetwork", "allocatedIpRange"]);
 const PRIVATE_NETWORK = /^\/projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
-const OPERATION_NAME = /^projects\/[a-z][a-z0-9-]{4,28}[a-z0-9]\/operations\/[A-Za-z0-9_-]{1,128}$/;
+const OPERATION_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 export interface SqlAdminInsertRequest {
   method: "POST";
@@ -189,7 +189,7 @@ export interface SqlAdminInsertRequest {
 
 export interface SqlAdminTransport {
   /** Send `request` as the body. Keep the credential in the transport, not the request. */
-  post(request: SqlAdminInsertRequest): Promise<{ operation: string }>;
+  post(request: SqlAdminInsertRequest): Promise<{ name: string }>;
 }
 
 function exactKeys(value: object, allowed: ReadonlySet<string>, label: string): void {
@@ -252,15 +252,19 @@ export async function postPrivateCloudSqlInsert(
   if (request.sent !== false || Object.keys(request.headers).some((name) => name.toLowerCase() === "authorization"))
     refuse("Cloud SQL insert seam tried to carry a credential.");
   const projectId = PRIVATE_NETWORK.exec(request.body.settings.ipConfiguration.privateNetwork)?.[1];
-  let result: { operation: string };
+  let result: { name: string };
   try {
     result = await transport.post(request);
   } catch {
-    refuse("Cloud SQL Admin insert was not accepted.");
+    throw new Error(
+      `96bulls: Cloud SQL Admin insert outcome is uncertain for ${projectId}/${spec.instanceName}; reconcile that instance before retry or teardown.`,
+    );
   }
-  if (!projectId || !OPERATION_NAME.test(result?.operation ?? "") || !result.operation.startsWith(`projects/${projectId}/operations/`))
-    refuse("Cloud SQL Admin insert returned no operation.");
-  return { operation: result.operation, sent: true };
+  if (!projectId || !OPERATION_ID.test(result?.name ?? ""))
+    throw new Error(
+      `96bulls: Cloud SQL Admin insert outcome is uncertain for ${projectId}/${spec.instanceName}; reconcile that instance before retry or teardown.`,
+    );
+  return { operation: result.name, sent: true };
 }
 
 /** In-cluster proxy. The instance connection name is a positional arg, and `--private-ip` is the first flag. */
