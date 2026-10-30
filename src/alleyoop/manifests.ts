@@ -3,6 +3,8 @@ import {
   backfillWriteIssues,
   buildObjectLandedMessage,
   isObjectStoreError,
+  MANIFEST_EPOCHS_CAPABILITY,
+  writerUnderstandsBackfill,
   objectKey,
   OBJECT_LANDED_STAGE,
   orgResolverFromEnv,
@@ -91,6 +93,25 @@ function migrationWriter(auth: Auth): string | undefined {
   )
     return undefined;
   return `migration:${grantId}`;
+}
+
+/** Every reader that must understand the new epochs before one is written. */
+export const MANIFEST_READERS = ["transform", "session-index", "summaries", "hoopdb", "fetch"] as const;
+
+/**
+ * The activation gate. `MANIFEST_READER_CAPABILITIES` is what each deployed
+ * reader advertises, as `reader=capability` pairs. Unset or partial refuses,
+ * so a backfill can never reach a reader nobody confirmed.
+ */
+function activationIssue(existing: ManifestV1, incoming: ManifestV1, env: Bindings): string | undefined {
+  const adds = incoming.raw.epochs.slice(existing.raw.epochs.length);
+  if (!adds.some((epoch) => epoch.reason === "backfill")) return undefined;
+  if (!writerUnderstandsBackfill(existing)) return "the session's writer lacks the capability";
+  const advertised = new Set(
+    String((env as Record<string, unknown>).MANIFEST_READER_CAPABILITIES ?? "").split(",").map((pair) => pair.trim()),
+  );
+  const missing = MANIFEST_READERS.filter((reader) => !advertised.has(`${reader}=${MANIFEST_EPOCHS_CAPABILITY}`));
+  return missing.length ? `readers lack the capability: ${missing.join(", ")}` : undefined;
 }
 
 function canonical(value: unknown): unknown {
@@ -418,6 +439,8 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           return responseError(c, 409, "revision_conflict", "manifest version or writer does not match");
         if (manifestOwnerIssue(existing.manifest, manifest, c.get("auth") as Auth))
           return responseError(c, 409, "owner_conflict", "manifest owner or append fence does not match");
+        const inactive = activationIssue(existing.manifest, manifest, c.env ?? {});
+        if (inactive) return responseError(c, 409, "activation_required", inactive);
         storedVersion = await putManifestOrReplay(
           deps.raw,
           key,
@@ -455,7 +478,13 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     }
   });
 
-  /** Startup reconciliation: version only, scoped to the stored machine/writer. */
+  /**
+   * Startup reconciliation: version, scoped to the stored machine/writer. With
+   * `manifest=1` also the stored copy from the same read, for a compare-and-swap
+   * retry: a writer that lost a race edits this, never its own local rebuild.
+   * That form is scoped to the machine only, so a client can see that another
+   * writer owns the stream, and fence itself on the stored owner.
+   */
   routes.get("/pipeline/manifests/status", async (c) => {
     const key = c.req.query("key") ?? "";
     const location = parseSessionKey(key);
@@ -465,10 +494,14 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     try {
       const stored = await storedManifest(deps.raw, key);
       if (!stored) return c.body(null, 404);
+      const withManifest = c.req.query("manifest") === "1";
       if (c.req.query("machine") !== stored.manifest.session.machine_id ||
-        c.req.query("writer") !== stored.manifest.writer.delivery_instance_id)
+        (!withManifest && c.req.query("writer") !== stored.manifest.writer.delivery_instance_id))
         return c.body(null, 403);
-      return c.json({ version: stored.version }, 200);
+      return c.json({
+        version: stored.version,
+        ...(withManifest ? { manifest: stored.manifest } : {}),
+      }, 200);
     } catch {
       return c.body(null, 503);
     }

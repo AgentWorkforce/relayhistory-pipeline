@@ -13,12 +13,17 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, stat, writeFile, open } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
+  chunkKeys,
   computeContentSha256,
+  liveEpoch,
+  liveNextOffset,
+  MANIFEST_EPOCHS_CAPABILITY,
   manifestKey,
   validateManifest,
   type ChunkEntry,
   type ManifestV1,
   type ObjectVersion,
+  type RawFormat,
   type SessionLocation,
 } from "../shared/vendor.ts";
 import { flag, integer, optional, required } from "../shared/env.ts";
@@ -37,6 +42,8 @@ import {
 
 export const PLUGIN_VERSION = "96bulls-courier/0.2.0";
 const MAX_CHUNK_BYTES = 4 * 1024 * 1024;
+/** JSON escaping grows a wrapped line, and the transform caps a chunk at 16 MiB. */
+const MAX_ENVELOPE_SOURCE_BYTES = 2 * 1024 * 1024;
 
 interface SessionRow {
   session_id: string;
@@ -79,6 +86,12 @@ interface SessionState {
   scrub?: { ruleset: string; version: number };
   manifest_key?: string;
   manifest_version?: ObjectVersion;
+  /** The stored manifest this session edits: never rebuilt from local state. */
+  base?: ManifestV1;
+  /** Another writer committed first: adopt the stored copy before writing again. */
+  needs_rebase?: boolean;
+  /** Another client owns the raw stream: stop writing; the records stay local. */
+  fenced?: boolean;
   closed?: boolean;
   /** Chunks were sealed but the manifest has not been acknowledged yet. */
   pending?: boolean;
@@ -118,6 +131,8 @@ export interface CourierConfig {
   harnesses?: string[];
   closeAfterMinutes: number;
   startMode: "all" | "new";
+  /** Format of new sessions; a stored manifest's format always wins. Default `jsonl`. */
+  format?: RawFormat;
   /** Process-local startup checks: persisted upload state is reconciled once, not every pass. */
   verifiedManifests?: Set<string>;
 }
@@ -170,6 +185,7 @@ export function configFromEnv(): CourierConfig {
     ...(process.env.HARNESSES ? { harnesses: process.env.HARNESSES.split(",").map((s) => s.trim()).filter(Boolean) } : {}),
     closeAfterMinutes: integer("COURIER_CLOSE_AFTER_MINUTES", 30),
     startMode,
+    ...(optional("COURIER_FORMAT", "jsonl") === "ndjson" ? { format: "ndjson" as const } : {}),
   };
 }
 
@@ -213,7 +229,7 @@ const isoDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 const component = (s: string) => s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128).replace(/^\./, "_");
 
 /** The next contiguous range of whole records after `from`, capped per chunk. */
-async function readNewRecords(path: string, from: number): Promise<{ ranges: Array<{ start: number; bytes: Buffer }>; size: number }> {
+async function readNewRecords(path: string, from: number, maxChunkBytes = MAX_CHUNK_BYTES): Promise<{ ranges: Array<{ start: number; bytes: Buffer }>; size: number }> {
   const size = (await stat(path)).size;
   if (size <= from) return { ranges: [], size };
   const fh = await open(path, "r");
@@ -226,7 +242,7 @@ async function readNewRecords(path: string, from: number): Promise<{ ranges: Arr
     const ranges: Array<{ start: number; bytes: Buffer }> = [];
     let cursor = 0;
     while (cursor < usable.length) {
-      let end = Math.min(cursor + MAX_CHUNK_BYTES, usable.length);
+      let end = Math.min(cursor + maxChunkBytes, usable.length);
       if (end < usable.length) {
         const nl = usable.lastIndexOf(0x0a, end - 1);
         if (nl <= cursor) throw new Error("96bulls: a single record exceeds the chunk size");
@@ -240,6 +256,111 @@ async function readNewRecords(path: string, from: number): Promise<{ ranges: Arr
     await fh.close();
   }
 }
+
+/**
+ * Harness lines as RelayHistory record envelopes, the shape of an `ndjson`
+ * stream: the transform refuses any other line. `record_id` comes from the
+ * line's file offset, so sealing the same range again gives the same records.
+ */
+export function envelopeRange(
+  range: { start: number; bytes: Buffer },
+  ids: { machineId: string; sessionId: string; startedAt: string },
+): Buffer {
+  const lines: string[] = [];
+  let at = 0;
+  while (at < range.bytes.length) {
+    const nl = range.bytes.indexOf(0x0a, at);
+    const end = nl < 0 ? range.bytes.length : nl + 1;
+    const line = range.bytes.subarray(at, end).toString("utf8").replace(/\r?\n$/, "");
+    lines.push(JSON.stringify({
+      kind: "harness_line",
+      origin_id: `machine:${ids.machineId}`,
+      record_id: createHash("sha256").update(`${ids.sessionId}:${range.start + at}`).digest("hex"),
+      revision: "1",
+      operation: "upsert",
+      received_at: lineTime(line) ?? ids.startedAt,
+      payload: { line, source_offset: range.start + at },
+    }));
+    at = end;
+  }
+  return Buffer.from(`${lines.join("\n")}\n`);
+}
+
+function lineTime(line: string): string | undefined {
+  try {
+    const timestamp = (JSON.parse(line) as { timestamp?: unknown } | null)?.timestamp;
+    return typeof timestamp === "string" && Number.isFinite(Date.parse(timestamp))
+      ? new Date(timestamp).toISOString()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+type ChunkWithSource = ChunkEntry & { source_end?: unknown };
+
+/**
+ * Where this client's source file resumes. `start_offset` is the file offset
+ * in `jsonl`. In `ndjson` it is an offset in the wrapped stream, so each chunk
+ * records `source_end`. `undefined` when another format wrote the live stream.
+ */
+export function sourceResumeOffset(manifest: ManifestV1): number | undefined {
+  const tail = chunkKeys(manifest, { currentEpochOnly: true }).at(-1)?.entry as ChunkWithSource | undefined;
+  if (manifest.raw.format !== "ndjson") return liveNextOffset(manifest.raw);
+  if (!tail) return 0;
+  return typeof tail.source_end === "number" ? tail.source_end : undefined;
+}
+
+/** Take the stored manifest as the new base: identity, chunks and position. */
+function adoptManifest(session: SessionState, remote: ManifestV1, version: ObjectVersion, offset: number) {
+  const ext = remote.extensions?.[EXT] as { session_uuid?: unknown } | undefined;
+  if (typeof ext?.session_uuid === "string") session.session_uuid = ext.session_uuid;
+  session.trace_id = remote.trace_id;
+  session.created_at = remote.created_at;
+  session.started_at = remote.session.started_at;
+  session.revision = remote.revision;
+  session.chunks = remote.raw.chunks;
+  session.scrub = remote.raw.scrub;
+  session.base = remote;
+  session.manifest_version = version;
+  session.uploaded_offset = offset;
+  session.closed = remote.raw.state === "closed";
+  session.needs_rebase = false;
+  session.pending = false;
+  session.pending_manifest = undefined;
+  session.pending_previous_version = undefined;
+}
+
+type Rebase = "rebased" | "reset" | "fenced" | "defer";
+
+/**
+ * The compare-and-swap retry: read the stored copy and adopt it. Chunks sealed
+ * for the lost write stay as orphans, and the next pass re-reads the source
+ * from the adopted position under the new `seq`. A pending write that did
+ * commit is in the stored copy, so nothing is uploaded twice.
+ */
+async function rebaseSession(cfg: CourierConfig, machineId: string, session: SessionState, mKey: string): Promise<Rebase> {
+  const q = new URLSearchParams({ key: mKey, machine: machineId, writer: machineId, manifest: "1" });
+  const res = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`, { method: "GET" }).catch(() => undefined);
+  if (res?.status === 404) return "reset";
+  // A 403 here is about the caller's credential, never ownership: only the
+  // stored `raw.owner` may fence a session, because fencing is permanent.
+  if (res?.status !== 200) return "defer";
+  const body = (await res.json().catch(() => ({}))) as { version?: ObjectVersion; manifest?: ManifestV1 };
+  if (!body.manifest || (!body.version?.eTag && !body.version?.version)) return "defer";
+  if ((await validateManifest(body.manifest, mKey)).length > 0) return "defer";
+  if (body.manifest.raw.owner !== machineId) return "fenced";
+  const offset = sourceResumeOffset(body.manifest);
+  if (offset === undefined) return "fenced";
+  adoptManifest(session, body.manifest, body.version, offset);
+  return "rebased";
+}
+
+const blankUpload = {
+  revision: 0, uploaded_offset: 0, chunks: [], closed: false, pending: false, pending_manifest: undefined,
+  pending_previous_version: undefined, scrub: undefined, manifest_key: undefined, manifest_version: undefined,
+  base: undefined, needs_rebase: false,
+};
 
 export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: number; uploaded: number; chunks: number }> {
   const state = await loadState(cfg.statePath, cfg.machineId, cfg.startMode);
@@ -256,6 +377,11 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
     if (verified.has(st.manifest_key)) continue;
     const q = new URLSearchParams({ key: st.manifest_key, machine: state.machine_id, writer: state.machine_id });
     const head = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`, { method: "GET" }).catch(() => undefined);
+    if (head?.status === 403) {
+      // The stored writer differs. The session's rebase reads the owner.
+      st.needs_rebase = true;
+      continue;
+    }
     const reconciliation = manifestReconciliation(head?.status);
     if (reconciliation === "verified") {
       const status = (await head!.json().catch(() => ({}))) as { version?: ObjectVersion };
@@ -267,7 +393,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       verified.add(st.manifest_key);
     } else if (reconciliation === "reset") {
       log.info("manifest missing in locker; re-uploading with the same ids", { session_uuid: st.session_uuid, trace_id: st.trace_id });
-      state.sessions[key] = { ...st, revision: 0, uploaded_offset: 0, chunks: [], closed: false, pending: false, pending_manifest: undefined, pending_previous_version: undefined, scrub: undefined, manifest_key: undefined, manifest_version: undefined };
+      state.sessions[key] = { ...st, ...blankUpload };
     } else {
       log.warn("manifest status unavailable; keeping durable upload state", { session_uuid: st.session_uuid, trace_id: st.trace_id, status: head?.status });
       deferred.add(key);
@@ -297,7 +423,8 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       // mint a different trace for the same deterministic chunk key.
       await saveState(cfg.statePath, state);
     }
-    const session = s;
+    let session = s;
+    if (session.fenced) continue;
     const loc: SessionLocation = {
       workspaceId: cfg.workspaceId,
       machineId: state.machine_id,
@@ -305,6 +432,21 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       sessionId: component(row.session_id),
       startDate: isoDate(startedMs),
     };
+    const mKey = manifestKey(loc);
+    if (session.needs_rebase || (session.revision > 0 && !session.base)) {
+      const rebased = await rebaseSession(cfg, state.machine_id, session, mKey);
+      if (rebased === "defer") continue;
+      if (rebased === "fenced") {
+        session.fenced = true;
+        log.warn("raw stream belongs to another writer; stopping uploads for this session", { session_uuid: session.session_uuid, trace_id: session.trace_id });
+        await saveState(cfg.statePath, state);
+        continue;
+      }
+      if (rebased === "reset") session = state.sessions[key] = { ...session, ...blankUpload };
+      await saveState(cfg.statePath, state);
+    }
+    const uploading = session;
+    const format: RawFormat = uploading.base?.raw.format ?? cfg.format ?? "jsonl";
     const traceparent = `00-${hexTraceId(session.trace_id)}-${spanId()}-01`;
     const idleMinutes = row.last_activity_ms ? (now.getTime() - row.last_activity_ms) / 60_000 : 0;
     const shouldClose = idleMinutes >= cfg.closeAfterMinutes;
@@ -314,7 +456,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       result = { ranges: [], size: session.uploaded_offset };
     } else {
       try {
-        result = await readNewRecords(row.raw_path, session.uploaded_offset);
+        result = await readNewRecords(row.raw_path, session.uploaded_offset, format === "ndjson" ? MAX_ENVELOPE_SOURCE_BYTES : MAX_CHUNK_BYTES);
       } catch (err) {
         log.warn("transcript unreadable", { harness: row.source, session_id: row.session_id, ...errorFields(err) });
         continue;
@@ -333,10 +475,23 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       traceparent,
       attrs: { stage: "ingest", trace_id: session.trace_id, session_uuid: session.session_uuid, tenant_id: cfg.orgId, workspace_id: cfg.workspaceId, harness: row.source, session_id: row.session_id },
     }, async () => {
+      const session = uploading;
+      const base = session.base;
+      // A backfill epoch is sealed: new chunks continue the live offsets in a
+      // `resumed` epoch, opened only when there is something to append.
+      const resuming = !!base && result.ranges.length > 0 && base.raw.epochs.at(-1)?.reason === "backfill";
+      const pendingChunks = session.chunks.slice(base?.raw.chunk_count ?? 0);
+      const epoch = pendingChunks.at(-1)?.epoch ?? (base ? base.raw.epoch + (resuming ? 1 : 0) : 0);
+      let stream = pendingChunks.at(-1)
+        ? pendingChunks.at(-1)!.start_offset + pendingChunks.at(-1)!.bytes
+        : base ? liveNextOffset(base.raw) : 0;
       for (const range of result.ranges) {
         const seq = session.chunks.length;
+        const source = format === "ndjson"
+          ? envelopeRange(range, { machineId: loc.machineId, sessionId: loc.sessionId, startedAt: session.started_at })
+          : range.bytes;
         const q = new URLSearchParams({
-          format: "jsonl", seq: String(seq), epoch: "0", offset: String(range.start), date: String(loc.startDate),
+          format, seq: String(seq), epoch: String(epoch), offset: String(stream), date: String(loc.startDate),
           machine: loc.machineId, harness: loc.harness, session: loc.sessionId,
         });
         const res = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/chunks?${q}`, {
@@ -348,14 +503,18 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
             "x-session-id": loc.sessionId,
             traceparent,
           },
-          body: new Uint8Array(range.bytes),
+          body: new Uint8Array(source),
         });
         if (!res.ok) {
           const body = (await res.json().catch(() => ({}))) as { error?: { code?: string } };
           throw Object.assign(new Error("chunk hop refused"), { code: body.error?.code ?? `http_${res.status}`, retryable: res.status >= 500 });
         }
         const sealed = (await res.json()) as { key: string; entry: ChunkEntry; scrub: { ruleset: string; version: number }; created: boolean };
-        session.chunks.push(sealed.entry);
+        const entry: ChunkEntry = format === "ndjson"
+          ? { ...sealed.entry, source_end: range.start + range.bytes.length }
+          : sealed.entry;
+        session.chunks.push(entry);
+        stream += sealed.entry.bytes;
         session.scrub = session.scrub && session.scrub.version < sealed.scrub.version ? session.scrub : sealed.scrub;
         session.uploaded_offset = range.start + range.bytes.length;
         session.pending = true; // sealed chunks exist that no landed manifest lists yet
@@ -365,7 +524,6 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
           scrub_ruleset: sealed.scrub.ruleset, scrub_version: sealed.scrub.version, trace_id: session.trace_id, session_uuid: session.session_uuid,
         });
       }
-      const mKey = manifestKey(loc);
       // The revision and closed flag advance only once the exact manifest has
       // been acknowledged. Persist it before POST so a committed write whose
       // response is lost can be replayed byte-for-byte after a restart.
@@ -374,7 +532,19 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
         const revision = session.revision + 1;
         const last = session.chunks.at(-1)!;
         const nowIso = new Date().toISOString();
+        const epochs = session.chunks.length > (base?.raw.chunk_count ?? 0) && base?.raw.epochs.at(-1)?.reason === "backfill"
+          ? [...base.raw.epochs, {
+            epoch,
+            opened_at: nowIso,
+            reason: "resumed" as const,
+            first_seq: base.raw.chunk_count,
+            opened_by: state.machine_id,
+            resumes_epoch: liveEpoch(base.raw),
+          }]
+          : base?.raw.epochs ?? [{ epoch: 0, opened_at: session.started_at, reason: "initial" as const, first_seq: 0, opened_by: state.machine_id }];
+        const { ended_at: _ended, ...baseSession } = base?.session ?? {};
         manifest = {
+          ...base,
           schema_v: 1,
           layout: "v1",
           trace_id: session.trace_id,
@@ -382,6 +552,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
           created_at: session.created_at,
           updated_at: nowIso,
           session: {
+            ...baseSession,
             workspace_id: loc.workspaceId,
             machine_id: loc.machineId,
             harness: loc.harness,
@@ -391,24 +562,26 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
             ...(row.agent_version ? { harness_version: row.agent_version } : {}),
             ...(row.cwd ? { cwd_sha256: createHash("sha256").update(row.cwd).digest("hex") } : {}),
           },
-          writer: { delivery_instance_id: state.machine_id, plugin_version: PLUGIN_VERSION },
+          writer: { ...base?.writer, delivery_instance_id: state.machine_id, plugin_version: PLUGIN_VERSION, capabilities: [MANIFEST_EPOCHS_CAPABILITY] },
           raw: {
+            ...base?.raw,
             owner: state.machine_id,
             state: shouldClose ? "closed" : "open",
             updated_at: nowIso,
-            format: "jsonl",
+            format,
             compression: "zstd",
             chunk_count: session.chunks.length,
             raw_bytes: session.chunks.reduce((n, c) => n + c.bytes, 0),
             stored_bytes: session.chunks.reduce((n, c) => n + c.stored_bytes, 0),
             content_sha256: await computeContentSha256(session.chunks),
-            epoch: 0,
-            epochs: [{ epoch: 0, opened_at: session.started_at, reason: "initial", first_seq: 0, opened_by: state.machine_id }],
+            epoch: epochs.length - 1,
+            epochs,
             next_offset: last.start_offset + last.bytes,
             chunks: session.chunks,
             ...(session.scrub ? { scrub: session.scrub } : {}),
           },
           extensions: {
+            ...base?.extensions,
             [EXT]: { session_uuid: session.session_uuid, session_uuid_source: "minted", tenant_id: cfg.orgId, user_id: cfg.userId },
           },
         };
@@ -436,6 +609,13 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       });
       if (landed.status !== 202) {
         const b = (await landed.json().catch(() => ({}))) as { error?: { code?: string } };
+        if (landed.status === 409 && (b.error?.code === "revision_conflict" || b.error?.code === "owner_conflict")) {
+          // Another writer committed first. Replaying these bytes can never
+          // land: adopt the stored copy on the next pass.
+          session.needs_rebase = true;
+          log.info("manifest lost a race; rebasing on the stored copy", { session_uuid: session.session_uuid, trace_id: session.trace_id });
+          return;
+        }
         throw Object.assign(new Error("manifest not accepted"), { code: b.error?.code ?? `http_${landed.status}`, retryable: landed.status >= 500 });
       }
       const landedBody = (await landed.json()) as { version?: ObjectVersion };
@@ -443,6 +623,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
         throw Object.assign(new Error("manifest response omitted its version"), { code: "manifest_version_missing", retryable: true });
       session.revision = manifest.revision;
       session.manifest_version = landedBody.version;
+      session.base = manifest;
       session.closed = manifest.raw.state === "closed";
       session.pending = false;
       session.pending_manifest = undefined;

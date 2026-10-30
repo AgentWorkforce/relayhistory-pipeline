@@ -6,6 +6,7 @@ import { Hono } from "hono";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import {
   computeContentSha256,
+  MANIFEST_EPOCHS_CAPABILITY,
   manifestKey,
   objectKey,
   objectStoreManifestReader,
@@ -15,7 +16,7 @@ import {
   type SessionLocation,
   type StageMessage,
 } from "../../shared/vendor.ts";
-import { createCourierManifestRoutes } from "../manifests.ts";
+import { createCourierManifestRoutes, MANIFEST_READERS } from "../manifests.ts";
 
 const ORG = "org_test";
 const WORKSPACE = "ws_test";
@@ -71,7 +72,7 @@ async function fixture() {
       started_at: AT,
       ...(revision > 1 ? { ended_at: AT } : {}),
     },
-    writer: { delivery_instance_id: writer, plugin_version: "test" },
+    writer: { delivery_instance_id: writer, plugin_version: "test", capabilities: [MANIFEST_EPOCHS_CAPABILITY] },
     raw: {
       owner: MACHINE,
       state: revision > 1 ? "closed" : "open",
@@ -147,6 +148,7 @@ async function fixture() {
     PIPELINE_ORG_ID: ORG,
     RELAYHISTORY_ORIGIN: "https://history.example",
     PIPELINE_TELEMETRY_ID_KEY: TELEMETRY_KEY,
+    MANIFEST_READER_CAPABILITIES: MANIFEST_READERS.map((r) => `${r}=${MANIFEST_EPOCHS_CAPABILITY}`).join(","),
   };
   const post = (body: unknown, explicitAuth?: "live" | "migration" | "malformed") => app.request("/v1/pipeline/manifests", {
     method: "POST",
