@@ -5,6 +5,7 @@ const armed = {
   WORKER_DATA_PATH_PROBE: "1",
   LOCKER_PROVIDER: "gcs",
   LOCKER_BUCKET: "awf-dev-locker",
+  PIPELINE_RAW_PROVIDER: "gcs",
   CLOUD_SQL_CONNECTION_NAME: "agentworkforce-dev1:us-central1:awf-dev-postgres",
   REDIS_HOST: "10.52.0.3",
   REDIS_PORT: "6379",
@@ -27,6 +28,19 @@ describe("data-path readiness", () => {
     if (!hmac.ok) expect(hmac.missing).toContain("LOCKER_HMAC");
     expect(JSON.stringify(hmac)).not.toContain("AKIA_BOUNDARY_KEY");
     expect(JSON.stringify(hmac)).not.toContain("SECRET_BOUNDARY_VALUE");
+    const pipeline = dataPathVerdict({
+      ...armed,
+      PIPELINE_RAW_PROVIDER: "s3",
+      PIPELINE_RAW_S3_ACCESS_KEY_ID: "AKIA_PIPELINE_KEY",
+      PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "PIPELINE_SECRET_VALUE",
+    });
+    expect(pipeline.ok).toBe(false);
+    if (!pipeline.ok) {
+      expect(pipeline.missing).toContain("PIPELINE_RAW_PROVIDER");
+      expect(pipeline.missing).toContain("PIPELINE_HMAC");
+    }
+    expect(JSON.stringify(pipeline)).not.toContain("AKIA_PIPELINE_KEY");
+    expect(JSON.stringify(pipeline)).not.toContain("PIPELINE_SECRET_VALUE");
 
     const dsn = "postgres://hoop:super-secret@127.0.0.1/hoopdb";
     const sql = dataPathVerdict({ ...armed, CLOUD_SQL_CONNECTION_NAME: dsn, REDIS_PASSWORD: "redis-secret" });

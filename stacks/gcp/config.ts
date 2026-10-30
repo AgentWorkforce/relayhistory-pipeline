@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 
 export const GCP_CONFIRM_PROJECT_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT";
@@ -64,6 +65,8 @@ export interface GcpInputs {
     chartVersion: string;
     tenantOrgId: string;
     existingSecretName: string;
+    /** Public HTTPS or the in-cluster RelayAuth service. Alleyoop refuses to render without it. */
+    relayauthJwksUrl: string;
   };
 }
 
@@ -72,6 +75,35 @@ const PROJECT_NUMBER = /^[0-9]{6,20}$/;
 const REGION = /^[a-z]+(?:-[a-z0-9]+)+[0-9]$/;
 const SEMVER = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
 const KUBERNETES_NAME = /^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$/;
+
+/** Keep long stage names distinct while preserving a human-readable suffix. */
+export function gcpResourceName(stage: string, suffix: string, max = 40): string {
+  const stagePart = stage
+    .replace(/^gcp-/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  const suffixPart = suffix
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  const full = `awf-${stagePart}-${suffixPart}`;
+  if (full.length <= max) return full;
+  const digest = createHash("sha256").update(full).digest("hex").slice(0, 8);
+  const fixed = `awf--${digest}-${suffixPart}`;
+  const stageBudget = max - fixed.length;
+  if (stageBudget < 1)
+    throw new Error("96bulls: GCP resource name limit cannot preserve uniqueness and suffix");
+  return `awf-${stagePart.slice(0, stageBudget).replace(/-$/, "")}-${digest}-${suffixPart}`;
+}
+
+export function pubsubServiceAgent(projectNumber: string): string {
+  if (!PROJECT_NUMBER.test(projectNumber))
+    throw new Error("96bulls: gcp projectNumber is invalid");
+  return `service-${projectNumber}@gcp-sa-pubsub.iam.gserviceaccount.com`;
+}
 
 function requireSemver(label: string, version: string): void {
   if (!SEMVER.test(version)) throw new Error(`96bulls: ${label} must be an explicit semantic version`);
@@ -145,11 +177,7 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
   if (inputs.relayfile) {
     requireSemver("relayfile.chartVersion", inputs.relayfile.chartVersion);
     requireSecretName("relayfile.existingSecretName", inputs.relayfile.existingSecretName);
-    const jwks = new URL(inputs.relayfile.relayauthJwksUrl);
-    if (jwks.username || jwks.password)
-      throw new Error("96bulls: relayfile.relayauthJwksUrl must not contain credentials");
-    if (!inputs.relayfile.relayauthJwksUrl.startsWith("https://") && !inputs.relayfile.relayauthJwksUrl.startsWith("http://relayauth."))
-      throw new Error("96bulls: relayfile.relayauthJwksUrl must be public HTTPS or the in-cluster RelayAuth service");
+    requireRelayauthJwksUrl(inputs.relayfile.relayauthJwksUrl);
   }
   if (inputs.relayflows) {
     requireSemver("relayflows.chartVersion", inputs.relayflows.chartVersion);
@@ -168,13 +196,23 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(inputs.bulls96.tenantOrgId))
       throw new Error("96bulls: bulls96.tenantOrgId must be an org id, never a URL or credential");
     requireSecretName("bulls96.existingSecretName", inputs.bulls96.existingSecretName);
+    requireRelayauthJwksUrl(inputs.bulls96.relayauthJwksUrl);
   }
+}
+
+/** Refuse live runtime wiring until the private Cloud SQL body has a reviewed poster. */
+export function assertGcpRuntimeDeployable(inputs: GcpInputs): void {
+  if (inputs.bulls96?.enabled)
+    throw new Error(
+      "96bulls: the GCP 96Bulls release stays disabled until a reviewed resource posts the private-only Cloud SQL body. Nothing was created.",
+    );
 }
 
 export function relaycastChartValues(i: RelaycastChartInputs, defaultStorageClass = "standard-rwo") {
   const host = new URL(i.baseUrl).hostname;
   return {
     replicaCount: 1,
+    strategy: { type: "Recreate" },
     runtime: { backend: "sqlite" },
     baseUrl: i.baseUrl,
     persistence: { storageClass: i.storageClass ?? defaultStorageClass, accessMode: "ReadWriteOnce", size: "20Gi" },
@@ -235,6 +273,30 @@ export interface Bulls96ReleaseOutputs {
 
 const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 
+function requireRelayauthJwksUrl(value: string): void {
+  let jwks: URL;
+  try {
+    jwks = new URL(value);
+  } catch {
+    throw new Error("96bulls: bulls96.relayauthJwksUrl must be public HTTPS or the in-cluster RelayAuth service");
+  }
+  if (jwks.username || jwks.password)
+    throw new Error("96bulls: bulls96.relayauthJwksUrl must not contain credentials");
+  const hostname = jwks.hostname.replace(/\.$/, "").toLowerCase();
+  const inCluster =
+    jwks.protocol === "http:" &&
+    /^relayauth\.[a-z0-9-]+\.svc(?:\.cluster\.local)?$/.test(hostname);
+  const publicHttps =
+    jwks.protocol === "https:" &&
+    hostname.includes(".") &&
+    hostname !== "localhost" &&
+    !hostname.endsWith(".localhost") &&
+    !hostname.endsWith(".local") &&
+    isIP(hostname) === 0;
+  if ((!inCluster && !publicHttps) || jwks.hash)
+    throw new Error("96bulls: bulls96.relayauthJwksUrl must be public HTTPS or the in-cluster RelayAuth service");
+}
+
 function plainSetting(label: string, value: unknown): void {
   if (typeof value !== "string") return;
   if (value.includes("://") || value.includes("@") || value.includes("BEGIN "))
@@ -265,8 +327,9 @@ export function bulls96ReleaseValues(
   if (typeof managed.redisPort === "string" && !/^[0-9]+$/.test(managed.redisPort))
     throw new Error("96bulls: redis port must be numeric. Nothing was created.");
   const redisPort = typeof managed.redisPort === "number" ? String(managed.redisPort) : managed.redisPort;
+  requireRelayauthJwksUrl(i.relayauthJwksUrl);
   const identity = { "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail };
-  const extraEnv = [
+  const dataEnv = () => [
     { name: "LOCKER_PROVIDER", value: "gcs" },
     { name: "PIPELINE_RAW_PROVIDER", value: "gcs" },
     { name: "PIPELINE_RAW_S3_BUCKET", value: managed.bucket },
@@ -277,26 +340,35 @@ export function bulls96ReleaseValues(
     { name: "PUBSUB_SUBSCRIPTION", value: managed.pubsubSubscription },
     { name: "WORKER_DATA_PATH_PROBE", value: "1" },
   ];
-  const app = {
-    existingSecret: i.existingSecretName,
-    hoopdb: { existingSecret: i.existingSecretName, key: "HOOPDB_URL" },
-    locker: {
-      endpoint: "",
-      bucket: managed.bucket,
-      region: managed.region,
-      credentials: { mode: "podIdentity" },
-    },
-    lockerInit: { enabled: false },
-    migrations: { supabaseShim: true },
-    summaryEncryption: { existingSecret: i.existingSecretName, key: "SUMMARY_MASTER_KEYS" },
-    serviceAccount: { annotations: identity },
-    tenant: { orgId: i.tenantOrgId },
-    extraEnv,
+  const locker = {
+    endpoint: "",
+    bucket: managed.bucket,
+    region: managed.region,
+    credentials: { mode: "podIdentity" as const },
   };
+  const hoopdb = { existingSecret: i.existingSecretName, key: "HOOPDB_URL" };
   return {
     global: { tenant: { orgId: i.tenantOrgId } },
-    worker: app,
-    alleyoop: app,
+    worker: {
+      existingSecret: i.existingSecretName,
+      hoopdb,
+      locker,
+      lockerInit: { enabled: false },
+      migrations: { supabaseShim: true },
+      summaryEncryption: { existingSecret: i.existingSecretName, key: "SUMMARY_MASTER_KEYS" },
+      serviceAccount: { annotations: { ...identity } },
+      tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
+      extraEnv: dataEnv(),
+    },
+    alleyoop: {
+      existingSecret: i.existingSecretName,
+      hoopdb,
+      locker,
+      auth: { jwksUrl: i.relayauthJwksUrl },
+      serviceAccount: { annotations: { ...identity } },
+      tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
+      extraEnv: dataEnv(),
+    },
     hoopdb: { enabled: false },
     locker: { enabled: false },
   };

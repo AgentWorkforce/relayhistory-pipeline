@@ -20,6 +20,9 @@ export interface DataPathEnv {
   REDIS_PASSWORD?: string;
   PUBSUB_TOPIC?: string;
   PUBSUB_SUBSCRIPTION?: string;
+  PIPELINE_RAW_PROVIDER?: string;
+  PIPELINE_RAW_S3_ACCESS_KEY_ID?: string;
+  PIPELINE_RAW_S3_SECRET_ACCESS_KEY?: string;
   WORKER_DATA_PATH_PROBE?: string;
 }
 
@@ -39,6 +42,9 @@ export function dataPathVerdict(env: DataPathEnv): DataPathVerdict {
   if (env.LOCKER_PROVIDER?.trim() !== "gcs") missing.push("LOCKER_PROVIDER");
   if (blank(env.LOCKER_BUCKET)) missing.push("LOCKER_BUCKET");
   if (env.LOCKER_ACCESS_KEY_ID || env.LOCKER_SECRET_ACCESS_KEY) missing.push("LOCKER_HMAC");
+  const pipelineProvider = env.PIPELINE_RAW_PROVIDER?.trim();
+  if (pipelineProvider !== "gcs") missing.push("PIPELINE_RAW_PROVIDER");
+  if (env.PIPELINE_RAW_S3_ACCESS_KEY_ID || env.PIPELINE_RAW_S3_SECRET_ACCESS_KEY) missing.push("PIPELINE_HMAC");
   const connection = env.CLOUD_SQL_CONNECTION_NAME?.trim() ?? "";
   if (!connection || connection.includes("://") || connection.includes("@") || connection.includes(" "))
     missing.push("CLOUD_SQL_CONNECTION_NAME");

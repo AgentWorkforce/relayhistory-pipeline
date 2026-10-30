@@ -19,7 +19,10 @@ import { fileURLToPath } from "node:url";
 import {
   GCP_CONFIRM_PROJECT_ENV,
   assertGcpInputs,
+  assertGcpRuntimeDeployable,
   bulls96ReleaseValues,
+  gcpResourceName,
+  pubsubServiceAgent,
   relayauthChartValues,
   relaycastChartValues,
   relayfileChartValues,
@@ -27,7 +30,7 @@ import {
   type GcpInputs,
 } from "./config.ts";
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "./deploy-guard.ts";
-import { ALCHEMY_GCP_BETA_84_SQL, cloudSqlProxyWorkload, privateCloudSqlSpec } from "./cloud-sql.ts";
+import { ALCHEMY_GCP_BETA_84_SQL, cloudSqlProxyApplies, cloudSqlProxyWorkload, privateCloudSqlSpec } from "./cloud-sql.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
@@ -44,9 +47,6 @@ function readInputs(stage: string): GcpInputs {
   assertGcpProjectConfirmation(inputs.projectId, process.env[GCP_CONFIRM_PROJECT_ENV]);
   return inputs;
 }
-
-const compactName = (stage: string, suffix: string, max = 40) =>
-  `awf-${stage.slice("gcp-".length)}-${suffix}`.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").slice(0, max).replace(/-$/, "");
 
 const labels = (stage: string, component: string) => ({
   stack: "agentworkforce",
@@ -73,6 +73,7 @@ export default Alchemy.Stack(
   Effect.gen(function* () {
     const stage = yield* Stage;
     const i = readInputs(stage);
+    assertGcpRuntimeDeployable(i);
     // Before the first resource. Confirmation is operator intent; the resolved
     // GCP environment is the project and region these credentials will use.
     const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
@@ -82,13 +83,13 @@ export default Alchemy.Stack(
     );
     const chartRepo = i.chartRepo ?? DEFAULT_CHART_REPO;
     const storageClass = i.chartStorageClass ?? "standard-rwo";
-    const networkName = compactName(stage, "vpc", 63);
-    const psaName = compactName(stage, "psa", 63);
-    const runtimeAccountId = compactName(stage, "runtime", 30);
+    const networkName = gcpResourceName(stage, "vpc", 63);
+    const psaName = gcpResourceName(stage, "psa", 63);
+    const runtimeAccountId = gcpResourceName(stage, "runtime", 30);
     const runtimeEmail = `${runtimeAccountId}@${i.projectId}.iam.gserviceaccount.com`;
-    const lockerBucket = `${compactName(stage, "locker", 30)}-${i.projectId}`.slice(0, 63).replace(/-$/, "");
-    const eventsTopicId = compactName(stage, "events", 63);
-    const eventsSubscriptionId = compactName(stage, "events-worker", 63);
+    const lockerBucket = `${gcpResourceName(stage, "locker", 30)}-${i.projectId}`.slice(0, 63).replace(/-$/, "");
+    const eventsTopicId = gcpResourceName(stage, "events", 63);
+    const eventsSubscriptionId = gcpResourceName(stage, "events-worker", 63);
     const eventsTopicName = `projects/${i.projectId}/topics/${eventsTopicId}`;
     const eventsSubscriptionName = `projects/${i.projectId}/subscriptions/${eventsSubscriptionId}`;
 
@@ -120,7 +121,7 @@ export default Alchemy.Stack(
       description: `AgentWorkforce ${stage} private network`,
     });
     const subnet = yield* GCP.Compute.Subnetwork("subnet", {
-      subnetworkName: compactName(stage, "private", 63),
+      subnetworkName: gcpResourceName(stage, "private", 63),
       region: i.region,
       network: network.networkName,
       ipCidrRange: "10.52.0.0/20",
@@ -132,13 +133,13 @@ export default Alchemy.Stack(
       logConfig: { enable: true, aggregationInterval: "INTERVAL_5_SEC", flowSampling: 0.5, metadata: "INCLUDE_ALL_METADATA" },
     });
     yield* GCP.Compute.Router("nat", {
-      routerName: compactName(stage, "nat", 63),
+      routerName: gcpResourceName(stage, "nat", 63),
       region: i.region,
       network: network.networkName,
       description: `AgentWorkforce ${stage} private-node egress`,
       nats: [
         {
-          name: compactName(stage, "egress", 63),
+          name: gcpResourceName(stage, "egress", 63),
           sourceSubnetworkIpRangesToNat: "LIST_OF_SUBNETWORKS",
           subnetworks: [{ name: subnet.subnetworkName, sourceIpRangesToNat: ["ALL_IP_RANGES"] }],
           natIpAllocateOption: "AUTO_ONLY",
@@ -162,7 +163,7 @@ export default Alchemy.Stack(
     });
 
     const cluster = yield* GCP.Container.Cluster("cluster", {
-      clusterId: compactName(stage, "gke"),
+      clusterId: gcpResourceName(stage, "gke"),
       location: i.region,
       description: `AgentWorkforce ${stage}`,
       labels: labels(stage, "gke"),
@@ -202,13 +203,13 @@ export default Alchemy.Stack(
       labels: labels(stage, "locker"),
     });
     const runtimeSecret = yield* GCP.SecretManager.Secret("runtime-secret", {
-      secretId: compactName(stage, "runtime", 63),
+      secretId: gcpResourceName(stage, "runtime", 63),
       labels: labels(stage, "runtime"),
       replication: { userManaged: { replicas: [{ location: i.region }] } },
       versionDestroyTtl: "604800s",
     });
     const images = yield* GCP.ArtifactRegistry.Repository("images", {
-      repositoryId: compactName(stage, "images", 63),
+      repositoryId: gcpResourceName(stage, "images", 63),
       location: i.region,
       format: "DOCKER",
       description: `AgentWorkforce ${stage} private images`,
@@ -239,12 +240,6 @@ export default Alchemy.Stack(
       role: "roles/storage.objectUser",
       member: `serviceAccount:${runtimeIdentity.email}`,
     });
-    yield* GCP.IAM.Member("runtime-secret-access", {
-      kind: "secretmanager.secret",
-      name: runtimeSecret.name,
-      role: "roles/secretmanager.secretAccessor",
-      member: `serviceAccount:${runtimeIdentity.email}`,
-    });
     yield* GCP.IAM.Member("runtime-cloudsql", {
       kind: "project",
       name: i.projectId,
@@ -263,14 +258,14 @@ export default Alchemy.Stack(
           const sql = privateCloudSqlSpec({
             projectId: i.projectId,
             region: i.region,
-            instanceName: compactName(stage, "postgres", 63),
+            instanceName: gcpResourceName(stage, "postgres", 63),
             networkName,
             allocatedIpRange: psaName,
             tier: i.managedDataPlane.cloudSqlTier,
             highAvailability: i.managedDataPlane.cloudSqlHa === true,
           });
           const redis = yield* GCP.Redis.Instance("redis", {
-            instanceId: compactName(stage, "redis"),
+            instanceId: gcpResourceName(stage, "redis"),
             location: i.region,
             displayName: `AgentWorkforce ${stage}`,
             labels: labels(stage, "redis"),
@@ -287,7 +282,7 @@ export default Alchemy.Stack(
               : { persistenceMode: "DISABLED" },
           });
           const deadLetters = yield* GCP.PubSub.Topic("dead-letters", {
-            topicId: compactName(stage, "dead-letters", 63),
+            topicId: gcpResourceName(stage, "dead-letters", 63),
             labels: labels(stage, "queue"),
             messageRetentionDuration: "604800s",
           });
@@ -316,6 +311,18 @@ export default Alchemy.Stack(
               name,
               role,
               member: `serviceAccount:${runtimeIdentity.email}`,
+            });
+          }
+          const pubsubAgent = `serviceAccount:${pubsubServiceAgent(i.projectNumber)}`;
+          for (const [id, kind, name, role] of [
+            ["dead-letter-publish", "pubsub.topic", deadLetters.name, "roles/pubsub.publisher"],
+            ["dead-letter-consume", "pubsub.subscription", subscription.name, "roles/pubsub.subscriber"],
+          ] as const) {
+            yield* GCP.IAM.Member(`pubsub-${id}`, {
+              kind,
+              name,
+              role,
+              member: pubsubAgent,
             });
           }
 
@@ -412,10 +419,14 @@ export default Alchemy.Stack(
             cluster,
             manifest: { apiVersion: "v1", kind: "Namespace", metadata: { name: "96bulls" } },
           });
-          const proxy = cloudSqlProxyWorkload(dataPlane.sql, runtimeEmail);
-          yield* Kubernetes.Manifest("cloud-sql-proxy-account", { cluster, manifest: proxy.serviceAccount });
-          yield* Kubernetes.Manifest("cloud-sql-proxy-service", { cluster, manifest: proxy.service });
-          yield* Kubernetes.Manifest("cloud-sql-proxy", { cluster, manifest: proxy.deployment });
+          // The private body is specified. The proxy is rendered by cloudSqlProxyWorkload
+          // and applied only once that body is posted. This pin does not post it.
+          if (cloudSqlProxyApplies(dataPlane.sql)) {
+            const proxy = cloudSqlProxyWorkload(dataPlane.sql, runtimeEmail);
+            yield* Kubernetes.Manifest("cloud-sql-proxy-account", { cluster, manifest: proxy.serviceAccount });
+            yield* Kubernetes.Manifest("cloud-sql-proxy-service", { cluster, manifest: proxy.service });
+            yield* Kubernetes.Manifest("cloud-sql-proxy", { cluster, manifest: proxy.deployment });
+          }
           const release = yield* Kubernetes.HelmChart("96bulls", {
             cluster,
             chart: "96bulls",

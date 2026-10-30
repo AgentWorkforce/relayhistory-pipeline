@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
   assertGcpInputs,
+  assertGcpRuntimeDeployable,
   bulls96ReleaseValues,
+  gcpResourceName,
+  pubsubServiceAgent,
   relayauthChartValues,
   relaycastChartValues,
   relayfileChartValues,
@@ -54,6 +57,7 @@ describe("GCP self-host contract", () => {
       chartVersion: "0.3.0",
       tenantOrgId: "org_123",
       existingSecretName: "bulls96-runtime",
+      relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96 })).toThrow("managedDataPlane.provision");
     expect(() =>
@@ -67,9 +71,30 @@ describe("GCP self-host contract", () => {
       assertGcpInputs("gcp-dev", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, relayauthJwksUrl: "http://user:password@relayauth.relayauth.svc/jwks" },
+      }),
+    ).toThrow("must not contain credentials");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, relayauthJwksUrl: "http://relayauth.attacker.example/jwks" },
+      }),
+    ).toThrow("public HTTPS or the in-cluster RelayAuth service");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96,
       }),
     ).not.toThrow();
+    expect(() =>
+      assertGcpRuntimeDeployable({
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96,
+      }),
+    ).toThrow("private-only Cloud SQL body");
   });
 
   it("wires GCS, SQL, Redis, and Pub/Sub into the Helm release without secrets", () => {
@@ -79,6 +104,7 @@ describe("GCP self-host contract", () => {
         chartVersion: "0.3.0",
         tenantOrgId: "org_123",
         existingSecretName: "bulls96-runtime",
+        relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
       },
       {
         bucket: "awf-dev-locker-agentworkforce-dev1",
@@ -99,6 +125,10 @@ describe("GCP self-host contract", () => {
         locker: { bucket: "awf-dev-locker-agentworkforce-dev1", credentials: { mode: "podIdentity" } },
         hoopdb: { existingSecret: "bulls96-runtime", key: "HOOPDB_URL" },
       },
+      alleyoop: {
+        auth: { jwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json" },
+        locker: { credentials: { mode: "podIdentity" } },
+      },
     });
     expect(rendered).toContain("LOCKER_PROVIDER");
     expect(rendered).toContain('"gcs"');
@@ -116,6 +146,7 @@ describe("GCP self-host contract", () => {
           chartVersion: "0.3.0",
           tenantOrgId: "org_123",
           existingSecretName: "bulls96-runtime",
+          relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
         },
         {
           bucket: "locker",
@@ -137,10 +168,28 @@ describe("GCP self-host contract", () => {
       baseUrl: "https://relay.gcp.example.com",
     });
     expect(values.replicaCount).toBe(1);
+    expect(values.strategy).toEqual({ type: "Recreate" });
     expect(values.runtime.backend).toBe("sqlite");
     expect(values.persistence.accessMode).toBe("ReadWriteOnce");
     expect(values.ingress.annotations["networking.gke.io/managed-certificates"]).toBe("relaycast");
     expect(values.ingress.hosts).toEqual(["relay.gcp.example.com"]);
+  });
+
+  it("keeps shortened resource names unique across long stage suffixes", () => {
+    const one = gcpResourceName("gcp-conformance-integration-dev-one", "runtime", 30);
+    const two = gcpResourceName("gcp-conformance-integration-dev-two", "runtime", 30);
+    expect(one).not.toBe(two);
+    expect(one).toHaveLength(30);
+    expect(two).toHaveLength(30);
+    expect(one.endsWith("-runtime")).toBe(true);
+    expect(two.endsWith("-runtime")).toBe(true);
+  });
+
+  it("uses the Pub/Sub service agent identity for dead-letter IAM", () => {
+    expect(pubsubServiceAgent("123456789012")).toBe(
+      "service-123456789012@gcp-sa-pubsub.iam.gserviceaccount.com",
+    );
+    expect(() => pubsubServiceAgent("project-name")).toThrow("projectNumber is invalid");
   });
 
   it("rejects credential-bearing public origins before they reach chart values", () => {

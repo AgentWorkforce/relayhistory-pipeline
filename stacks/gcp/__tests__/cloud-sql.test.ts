@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ALCHEMY_GCP_BETA_84_SQL, CLOUD_SQL_PROXY_IMAGE, cloudSqlProxyWorkload, privateCloudSqlSpec } from "../cloud-sql.ts";
+import { ALCHEMY_GCP_BETA_84_SQL, CLOUD_SQL_PROXY_IMAGE, cloudSqlProxyApplies, cloudSqlProxyWorkload, privateCloudSqlSpec } from "../cloud-sql.ts";
 
 const input = {
   projectId: "agentworkforce-dev1",
@@ -17,6 +17,7 @@ describe("Cloud SQL private attachment", () => {
   test("builds a private-only insert body and routes the proxy with --private-ip", () => {
     const spec = privateCloudSqlSpec(input);
     expect(spec.posted).toBe(false);
+    expect(cloudSqlProxyApplies(spec)).toBe(false);
     expect(spec.ipv4Enabled).toBe(false);
     expect(spec.connectionName).toBe("agentworkforce-dev1:us-central1:awf-dev-postgres");
     expect(spec.privateNetwork).toBe("/projects/agentworkforce-dev1/global/networks/awf-dev-vpc");

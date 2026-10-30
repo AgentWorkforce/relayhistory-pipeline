@@ -160,6 +160,15 @@ export interface CloudSqlProxyWorkload {
 
 const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 
+/**
+ * Apply the proxy only after a resource posts `insertBody`. The pinned
+ * provider never does, so this stays false and the stack must not create
+ * a proxy for an instance that does not exist.
+ */
+export function cloudSqlProxyApplies(spec: PrivateCloudSqlSpec): boolean {
+  return spec.posted !== false && spec.ipv4Enabled === false && spec.proxyArgs[0] === "--private-ip";
+}
+
 /** In-cluster proxy. The instance connection name is a positional arg, and `--private-ip` is the first flag. */
 export function cloudSqlProxyWorkload(spec: PrivateCloudSqlSpec, workloadIdentityEmail: string): CloudSqlProxyWorkload {
   if (spec.posted !== false || spec.proxyArgs[0] !== "--private-ip" || spec.ipv4Enabled !== false)

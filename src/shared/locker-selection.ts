@@ -12,7 +12,8 @@ export type LockerProvider = "s3" | "gcs";
 const DEFAULT_GCS_TOKEN_URI =
   "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token";
 
-const TRUSTED_GCS_TOKEN_HOSTS = new Set(["169.254.169.254", "127.0.0.1", "localhost", "[::1]"]);
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const TRUSTED_GCS_TOKEN_HOSTS = new Set(["169.254.169.254", ...LOOPBACK_HOSTS]);
 
 export function lockerProvider(env: NodeJS.ProcessEnv = process.env): LockerProvider {
   const raw = env.LOCKER_PROVIDER?.trim() || "s3";
@@ -30,7 +31,30 @@ export function gcsTokenUri(env: NodeJS.ProcessEnv = process.env): string {
 export function trustedGcsTokenUri(uri: string): boolean {
   try {
     const u = new URL(uri);
-    return u.protocol === "http:" && TRUSTED_GCS_TOKEN_HOSTS.has(u.hostname);
+    return (
+      u.protocol === "http:" &&
+      !u.username &&
+      !u.password &&
+      TRUSTED_GCS_TOKEN_HOSTS.has(u.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Never send a metadata-derived bearer token to an operator-chosen remote host. */
+export function trustedGcsEndpoint(uri: string): boolean {
+  try {
+    const u = new URL(uri);
+    if (u.username || u.password || u.search || u.hash) return false;
+    if (LOOPBACK_HOSTS.has(u.hostname))
+      return u.protocol === "http:" || u.protocol === "https:";
+    return (
+      u.protocol === "https:" &&
+      u.hostname === "storage.googleapis.com" &&
+      !u.port &&
+      (u.pathname === "" || u.pathname === "/")
+    );
   } catch {
     return false;
   }
@@ -67,18 +91,10 @@ export function assertLockerSelection(env: NodeJS.ProcessEnv = process.env): voi
     throw new Error("96bulls: LOCKER_PROVIDER=gcs requires LOCKER_BUCKET");
   }
   if (provider === "gcs" && env.LOCKER_ENDPOINT) {
-    let endpoint: URL;
-    try {
-      endpoint = new URL(env.LOCKER_ENDPOINT);
-    } catch {
-      throw new Error("96bulls: LOCKER_ENDPOINT must be an absolute http(s) URL");
-    }
-    if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
-      throw new Error("96bulls: LOCKER_ENDPOINT must be an absolute http(s) URL");
-    }
-    if (endpoint.username || endpoint.password) {
-      throw new Error("96bulls: LOCKER_ENDPOINT must not contain credentials");
-    }
+    if (!trustedGcsEndpoint(env.LOCKER_ENDPOINT))
+      throw new Error(
+        "96bulls: GCS LOCKER_ENDPOINT must be the official HTTPS API or loopback emulator",
+      );
   }
   if (provider === "gcs" && env.LOCKER_GCS_TOKEN_URI && !trustedGcsTokenUri(env.LOCKER_GCS_TOKEN_URI)) {
     throw new Error("96bulls: LOCKER_GCS_TOKEN_URI is not the GKE metadata server or loopback");

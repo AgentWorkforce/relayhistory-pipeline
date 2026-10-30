@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { vendorBindings } from "../env.ts";
 import { buildLockerStore, gcsMetadataToken } from "../locker.ts";
-import { assertLockerSelection, lockerProvider, trustedGcsTokenUri } from "../locker-selection.ts";
+import {
+  assertLockerSelection,
+  lockerProvider,
+  trustedGcsEndpoint,
+  trustedGcsTokenUri,
+} from "../locker-selection.ts";
 
 describe("locker provider selection", () => {
   test("defaults to S3 when the provider is unset, blank, or explicit", () => {
@@ -79,14 +84,21 @@ describe("locker provider selection", () => {
         LOCKER_BUCKET: "locker-proof",
         LOCKER_ENDPOINT: "not a url",
       }),
-    ).toThrow("absolute http(s) URL");
+    ).toThrow("official HTTPS API or loopback emulator");
     expect(() =>
       buildLockerStore({
         LOCKER_PROVIDER: "gcs",
         LOCKER_BUCKET: "locker-proof",
         LOCKER_ENDPOINT: "https://user:password@storage.googleapis.com",
       }),
-    ).toThrow("must not contain credentials");
+    ).toThrow("official HTTPS API or loopback emulator");
+    expect(() =>
+      buildLockerStore({
+        LOCKER_PROVIDER: "gcs",
+        LOCKER_BUCKET: "locker-proof",
+        LOCKER_ENDPOINT: "https://attacker.example/gcs",
+      }),
+    ).toThrow("official HTTPS API or loopback emulator");
     expect(() =>
       buildLockerStore({
         LOCKER_PROVIDER: "gcs",
@@ -99,6 +111,7 @@ describe("locker provider selection", () => {
   test("accepts the metadata server and loopback, and refuses other token hosts", () => {
     expect(trustedGcsTokenUri("http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token")).toBe(true);
     expect(trustedGcsTokenUri("http://127.0.0.1:9/token")).toBe(true);
+    expect(trustedGcsTokenUri("http://user:password@127.0.0.1:9/token")).toBe(false);
     expect(trustedGcsTokenUri("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")).toBe(false);
     expect(trustedGcsTokenUri("https://storage.googleapis.com/token")).toBe(false);
     expect(() =>
@@ -108,6 +121,17 @@ describe("locker provider selection", () => {
         LOCKER_GCS_TOKEN_URI: "http://evil.example/token",
       }),
     ).toThrow("not the GKE metadata server or loopback");
+  });
+
+  test("sends GCS bearer tokens only to the official API or loopback emulators", () => {
+    expect(trustedGcsEndpoint("https://storage.googleapis.com")).toBe(true);
+    expect(trustedGcsEndpoint("http://127.0.0.1:4443/storage/v1")).toBe(true);
+    expect(trustedGcsEndpoint("http://localhost:4443/storage/v1")).toBe(true);
+    expect(trustedGcsEndpoint("https://attacker.example/storage/v1")).toBe(false);
+    expect(trustedGcsEndpoint("http://storage.googleapis.com")).toBe(false);
+    expect(trustedGcsEndpoint("https://storage.googleapis.com.attacker.example")).toBe(false);
+    expect(trustedGcsEndpoint("https://storage.googleapis.com:4443")).toBe(false);
+    expect(trustedGcsEndpoint("https://storage.googleapis.com/?redirect=attacker")).toBe(false);
   });
 
   test("reads a metadata token and does not put it in the error path", async () => {

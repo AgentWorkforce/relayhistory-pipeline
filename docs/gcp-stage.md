@@ -21,17 +21,18 @@ implementations own provider adapters.
   inputs or Alchemy state);
 - a least-privilege runtime Google service account and Workload Identity
   bindings for the known 96Bulls and Cloud SQL proxy service accounts;
-- optionally, Cloud SQL PostgreSQL 17, Memorystore Redis 7.2, Pub/Sub with
-  retry/dead-letter handling, and a two-replica Cloud SQL Auth Proxy service;
+- optionally, a private-only Cloud SQL PostgreSQL 17 specification (not posted),
+  Memorystore Redis 7.2, Pub/Sub with retry/dead-letter handling, and a
+  single-replica Cloud SQL Auth Proxy service;
 - optionally, the Relaycast core chart and RelayAuth, Relayfile, or Relayflows
   charts. Relayflows runs in standalone mode and is not in Relaycast's
   availability path.
 
-Cloud SQL currently has a public address with no authorized network allowlist;
-pods reach it only through the IAM-authenticated, TLS Cloud SQL Auth Proxy.
-The Alchemy provider used here does not yet expose Cloud SQL private-network
-attachment. Moving Cloud SQL onto Private Service Access is a proof blocker,
-not something this stack silently claims.
+Cloud SQL is not created. The stack specifies public IPv4 off, the Private
+Service Access network and range, and `--private-ip` proxy routing, but the
+pinned Alchemy provider drops the private-network field. A supported poster for
+that exact private-only body remains a proof blocker; the stack does not fall
+back to a public instance.
 
 ## Truthful feature gates
 
@@ -62,10 +63,11 @@ choice: unset and `s3` stay S3, `r2` stays R2, and `PIPELINE_RAW_PROVIDER=gcs`
 builds the GCS adapter when the bucket is set and HMAC keys are absent. Any
 other name stays unconfigured.
 
-`bulls96.enabled` installs the chart when the managed data plane is provisioned
-and the chart version, tenant org id, and existing Secret name are set. The
-release turns off in-chart MinIO and CloudNativePG, uses pod identity, and
-passes the bucket, Cloud SQL connection name, Redis host, and Pub/Sub names.
+The static `bulls96.enabled` values contract turns off in-chart MinIO and
+CloudNativePG, uses pod identity, and passes the bucket, Cloud SQL connection
+name, Redis host, and Pub/Sub names. The live stack refuses that flag before
+declaring any resource until a reviewed resource can post the private-only
+Cloud SQL body; it cannot create a knowingly broken release.
 `/readyz` also checks that data path when `LOCKER_PROVIDER=gcs` or
 `WORKER_DATA_PATH_PROBE=1`. Production is not this lane: the production
 database is Supabase and production object storage is AWS S3.
