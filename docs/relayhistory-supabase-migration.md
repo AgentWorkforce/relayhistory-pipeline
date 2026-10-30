@@ -70,31 +70,33 @@ copy-everything-then-switch runbook (linuyc, uncommitted
 
 ## Critical path to T0
 
-| # | Lane | Owner @ machine | State | Exit evidence |
-| --- | --- | --- | --- | --- |
-| 1 | Decision record + this plan | 96-no-bull-migration @ sf-mac-mini | done (local) | 0001 + this file on `feat/supabase-production-migration` |
-| 2 | Schema/index parity test (relayhistory-cloud migrations vs. Supabase, including 0067) | 96-no-bull-migration @ sf-mac-mini | green at relayhistory-cloud 7343404; re-pin when 0067 (#222) lands | `packages/pipeline/test/relayhistory-schema-parity.test.ts` green in both apply orders |
-| 3 | Port migrator + verifier + benchmarks from the linuyc dirty checkout into reviewed commits | 96-no-bull-migration @ sf-mac-mini | todo | Focused tests green on the clean branch |
-| 4 | Worker driver seam: TCP node-postgres behind a flag, Neon HTTP default; pre-T0 read-only Neon fallback; legacy contract suite on PostgreSQL 17 | helm-helper @ linuyc (proposed) | local partial | Contract suite green on PG17 for both drivers |
-| 5 | 0067 agent index (push off `/tmp` as a draft PR), Cloud #5835, filter-to-index contract, read-only target readiness audit | helm-chart-chief @ linuyc (accepted) | in progress | 0067 draft PR; contract agreed with lane 2 |
-| 6 | Durable switch hold + ordered replay covering every writer | 96-no-bull-migration (accountable until assigned) | design | Writer inventory; synthetic-tenant hold/replay proof |
-| 7 | DB/API benchmarks, Neon HTTP vs. Supabase direct TCP | 96-no-bull-migration @ sf-mac-mini | code exists | Supabase p95 no worse than Neon on each critical query |
-| 6a | Cloud: move its direct Neon calls (`request_session_analysis_v1`, the two acks) to Supabase behind a flag; tolerate missing Neon-era event IDs | unassigned (Cloud repo) | todo | Draft Cloud PR; flag off by default |
-| 6b | Migration runner, rollouts and checks reach Supabase over TCP (node-postgres for non-Neon URLs) | 96-no-bull-migration @ sf-mac-mini | in progress | relayhistory-cloud draft PR; runner applies the full schema to PostgreSQL 17 |
-| 6c | T0 copy set (auth tokens, deletion tombstones, cursors, delivery dedupe): measure sizes on Neon read-only, then copy inside the hold | 96-no-bull-migration | todo | Size report; copy rehearsal on a static clone |
-| 8 | T0 runbook + rollback | 96-no-bull-migration @ sf-mac-mini | todo | Reviewed runbook (below) |
+Status as of 2026-10-30 (late). Tool commands and gates are in
+`docs/relayhistory-t0-runbook.md`.
 
-**T0 gate (mandatory):** `relayhistory-schema-parity.test.ts`, which covers
-schema parity in both apply orders and the tenant permission contract on
-`sessions.machines`, must be green against the legacy migrations re-pinned at
-the commit being cut over, including 0067 from #222.
+| # | Lane | Owner | State | Exit evidence |
+| --- | --- | --- | --- | --- |
+| 1 | Decision record + this plan | 96-no-bull-migration | done | 0001 + this file |
+| 2 | Schema parity + live-schema contract | 96-no-bull-migration | done; pinned to relayhistory-cloud #222 `7264a70` (independent PASS) | `relayhistory-schema-parity.test.ts`, `relayhistory-verify-schema.test.ts`; `migration:verify --mode=schema` with role mapping |
+| 3 | Verifier and benchmarks (gate exit codes) | 96-no-bull-migration | done | `src/migration/__tests__` |
+| 4 | Worker driver seam (TCP to Supavisor, read-only Neon fallback client) | helm-helper | relayhistory-cloud #225, on hold | Contract suite on PG17; Supavisor, TLS and cancellation evidence |
+| 5 | 0067 agent index, Cloud #5835, filter-to-index contract | helm-chart-chief | #222 PASS at `7264a70`, not merged or applied | #222, 96BullSessions #27 |
+| 6 | Cutover gate + durable hold/replay | 96-no-bull-migration (code), helm-chart-chief (fix lane) | relayhistory-cloud #224, on hold | Gate and hold tests in Miniflare; per-org ordering, zero-write hold |
+| 6a | Cloud direct Neon calls behind a flag | helm-chart-chief | Cloud #5850, code PASS, held | Draft PR, flag off |
+| 6b | Runner, rollouts and checks over TCP | 96-no-bull-migration | relayhistory-cloud #223, CI green | Runner builds the full schema on PG17 over TCP |
+| 6c | T0 copy set, sequence fence, Neon write fence | 96-no-bull-migration | done (tools); sizes need A1 | `migration:copy --mode=mirror`, `migration:sequence-fence`, `migration:neon-fence` |
+| 8 | T0 runbook + rollback | 96-no-bull-migration | done | Runbook; `migration:reverse` |
+
+**T0 gate (mandatory):** the parity and live-schema tests above, green
+against the legacy migrations pinned at the commit being cut over, plus
+`migration:verify --mode=schema` and `migration:sequence-fence` passing
+against the real databases.
 
 ## After T0
 
 | # | Lane | Owner | Exit evidence |
 | --- | --- | --- | --- |
-| 9 | Resumable backfill (newest first, `ON CONFLICT DO NOTHING`, watermarks, throttled) | 96-no-bull-migration (accountable until assigned) | Per-table range fingerprints equal |
-| 10 | Recompute derived tables for straddling and backfilled sessions | same | Rollup/catalog/search parity on samples |
+| 9 | Resumable backfill (newest first, deletion-fenced, plan-bound checkpoints) | 96-no-bull-migration | `migration:copy --mode=check` exits 0 |
+| 10 | Rebuild straddling rollups; reproject the catalog | 96-no-bull-migration | `migration:rebuild`, `migration:reproject` (idempotent) |
 | 11 | Neon retirement | separate approval | Final verification report archived |
 
 ## Rollback
