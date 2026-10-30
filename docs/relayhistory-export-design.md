@@ -101,10 +101,30 @@ stops the run); at most 256 chunks per assertion, then a fresh mint, and one
 re-mint on 403 `migration_chunk_limit`; bounded backoff on 5xx and lost
 responses, then stop. Any other 401 or 403 (including
 `migration_upload_forbidden`) stops the run; 409 `migration_chunk_conflict`
-fails that manifest. A per-manifest checkpoint (ids, digests and work keys,
+fails that manifest. 503 `migration_storage_read_required` (an ingest that
+cannot read the commit back from storage) stops the run without backoff.
+Each chunk request carries `canonical(plan entry)` in front of its source
+bytes, with the entry's length in `X-Relay-Migration-Plan-Entry-Length`.
+A per-manifest checkpoint (ids, digests and work keys,
 never tokens) keeps a resumed run from re-uploading committed manifests. It is
 tested only against an in-process fake ingest, and the CLI still refuses
 `--execute`.
+
+## Grant shards
+
+One grant holds what relayauth #111 admits: at most 64 distinct source users,
+1,000,000 bytes of canonical plan plus allowed pairs, 1,000 manifests, 4,096
+chunks per manifest and 50,000 chunks per plan.
+`src/migration/relayhistory-export-shards.ts` splits the plan into grants and
+asks #111's own `deriveMigrationGrantPlan` (vendored unchanged) to admit every
+candidate, so whichever limit binds first decides. Sessions never straddle
+grants; a session no grant can hold is reported as `oversized_session` and
+the plan is refused. Shard ids hash the planner version, contract, org,
+`exported_at` and the shard's canonical entries. On a synthetic plan sized
+like the export (116,180 sessions, 122,868 chunks) the 1,000-manifest cap
+binds: 117 grants, each at most about 0.6 MB and 1,200 chunks. A 4,096-chunk
+manifest alone is about 0.6 MB, so the byte cap binds before the 50,000-chunk
+cap ever can.
 
 ## Safety (reused from #28)
 

@@ -56,6 +56,10 @@ interface FakeIngest {
   mintJti?: (n: number) => string | undefined;
   /** Inject a response before the route's own handling (n is per route, 1-based). */
   before?: (route: Route, n: number) => Injected;
+  /** Entry lengths framed in front of each accepted chunk request. */
+  framed: number[];
+  /** False: a deployment that cannot read storage back (503 on commit). */
+  storageRead: boolean;
   /** Chunks the ingest accepts per assertion (contract v1: 256). */
   chunkLimit: number;
   /** The issuer's canonical stored plan: it derives each signed identity from it. */
@@ -111,6 +115,8 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
     queue: [],
     requests: [],
     chunkLimit: 256,
+    framed: [],
+    storageRead: true,
     signed: new Map(),
     usedFor: new Map(),
     signedDigest,
@@ -172,7 +178,26 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
       // Admission: a consumed jti or nonce is a replay, before any storage call.
       if (fake.consumed.has(claims.jti) || fake.consumed.has(claims.meta.nonce)) return refuse(res, 409, "migration_assertion_replayed");
       if (route === "chunk") {
-        const digest = sha(raw);
+        // Contract v1 framing: canonical(entry) then the chunk's source bytes.
+        const entryLength = Number(req.headers["x-relay-migration-plan-entry-length"] ?? NaN);
+        if (!Number.isSafeInteger(entryLength) || entryLength < 2 || entryLength > 1024 * 1024 || raw.byteLength <= entryLength)
+          return refuse(res, 403, "migration_upload_forbidden");
+        const entryText = raw.subarray(0, entryLength).toString("utf8");
+        const source = raw.subarray(entryLength);
+        fake.framed.push(entryLength);
+        let entry: { key: string; session: unknown; chunks: { seq: number; epoch: number; start_offset: number; bytes: number; sha256: string }[] };
+        try {
+          entry = JSON.parse(entryText);
+        } catch {
+          return refuse(res, 403, "migration_upload_forbidden");
+        }
+        const planned = entry.chunks?.find((c) => c.seq === Number(url.searchParams.get("seq")));
+        if (sha(entryText) !== upload.entry_sha256 || canonical(entry) !== entryText || entry.key !== upload.key ||
+          canonical(entry.session) !== canonical(upload.session) || !planned ||
+          planned.epoch !== Number(url.searchParams.get("epoch")) || planned.start_offset !== Number(url.searchParams.get("offset")) ||
+          planned.bytes !== source.byteLength || planned.sha256 !== sha(source))
+          return refuse(res, 403, "migration_upload_forbidden");
+        const digest = sha(source);
         // Ledger: one chunk per (jti, seq); at most chunkLimit per assertion.
         const perJti = (jtiChunks.get(claims.jti) ?? new Map<string, string>());
         jtiChunks.set(claims.jti, perJti);
@@ -193,19 +218,20 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
             seq: Number(url.searchParams.get("seq")),
             epoch: Number(url.searchParams.get("epoch")),
             start_offset: Number(url.searchParams.get("offset")),
-            bytes: raw.byteLength,
+            bytes: source.byteLength,
             sha256: digest,
             sha256_8: digest.slice(0, 8),
-            stored_bytes: raw.byteLength,
+            stored_bytes: source.byteLength,
             stored_sha256: digest,
             compression: "zstd",
-            stored_raw_bytes: raw.byteLength,
+            stored_raw_bytes: source.byteLength,
             raw_sha256: digest,
           },
           scrub: { ruleset: "relayhistory-scrub", version: 1 },
           created,
         });
       }
+      if (!fake.storageRead) return refuse(res, 503, "migration_storage_read_required");
       const posted = JSON.parse(raw.toString()) as { key: string; manifest: { extensions: Record<string, Record<string, unknown>> } };
       const marker = posted.manifest.extensions["client.relayhistory_export"] ?? {};
       if (marker.source_user_id !== claims.meta.sourceUserId) return refuse(res, 403, "migration_workspace_forbidden");
@@ -827,5 +853,42 @@ describe("contract v1 codes", () => {
     expect(fake.mints).toBe(2); // exactly one re-mint
     expect(fake.requests).toHaveLength(2);
     expect(fake.chunkWrites).toBe(0);
+  });
+});
+
+describe("chunk framing and commit-time storage read (#43 @8b6b986e, #228 @47a9fd34)", () => {
+  test("every chunk carries canonical(plan entry) in front, with its length in the header", async () => {
+    const { fake, cfg, plan, chunkCount } = await setup();
+    const result = await runExportUpload(plan, cfg);
+    expect(result.committed).toHaveLength(2);
+    const contract = planContract(plan, GRANT);
+    const lengths = contract.entries.flatMap((e) => e.chunks.map(() => Buffer.byteLength(canonical(e), "utf8")));
+    expect(fake.framed).toEqual(lengths); // the fake refuses any request whose entry is not the signed one
+    expect(fake.framed).toHaveLength(chunkCount);
+    contract.entries.forEach((e, i) => expect(sha(canonical(e))).toBe(contract.uploads[i]!.entry_sha256));
+    expect(contract.uploads.every((u) => u.plan_digest === contract.planDigest)).toBe(true);
+  });
+
+  test("an entry that does not hash to its signed entry_sha256 is refused before any request", async () => {
+    const tampered: PlanContractFn = (input) => {
+      const c = derivePlanContract(input);
+      return { ...c, entries: c.entries.map((e, i) => (i === 0 ? { ...e, raw_bytes: e.raw_bytes + 1 } : e)) };
+    };
+    const { fake, cfg, plan } = await setup({ contract: tampered });
+    await expect(runExportUpload(plan, cfg)).rejects.toMatchObject({ code: "plan_entry_unframeable" });
+    expect(fake.mints).toBe(0);
+    expect(fake.requests).toHaveLength(0);
+  });
+
+  test("503 migration_storage_read_required stops the run at once, no backoff, nothing committed", async () => {
+    const { fake, cfg, plan, sleeps } = await setup();
+    fake.storageRead = false;
+    const result = await runExportUpload(plan, cfg);
+    expect(result.stopped).toMatchObject({ code: "migration_storage_read_required", status: 503 });
+    expect(sleeps).toEqual([]);
+    expect(fake.requests.filter((r) => r.route === "manifest")).toHaveLength(1);
+    expect(fake.queue).toHaveLength(0);
+    const cp = JSON.parse(await readFile(cfg.checkpointPath, "utf8"));
+    expect(Object.values(cp.manifests).every((m) => (m as { status: string }).status !== "committed")).toBe(true);
   });
 });

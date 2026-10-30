@@ -31,7 +31,13 @@
  *   At most `chunksPerAssertion` (256) chunks go under one assertion, then a
  *   fresh mint; a 403 `migration_chunk_limit` anyway re-mints, and a second
  *   one with no progress stops the run. 409 `migration_chunk_conflict` fails
- *   that manifest. 403 `migration_upload_forbidden` stops the run. 503 (and other 5xx, and lost responses): bounded backoff
+ *   that manifest. 403 `migration_upload_forbidden` stops the run, and so
+ *   does 503 `migration_storage_read_required` (the ingest cannot read the
+ *   commit back from storage), without backoff.
+ * - **Chunk framing.** Each chunk request's body is `canonical(plan entry)`
+ *   followed by the chunk's source bytes, with the entry's byte length in
+ *   `X-Relay-Migration-Plan-Entry-Length` (at most 1 MiB); the entry hashes
+ *   to the signed `entry_sha256`. 503 (and other 5xx, and lost responses): bounded backoff
  *   with a fresh assertion each time, then the run stops (fail closed). 401 or
  *   403: the run stops at once, no retry. A lost response after the server
  *   committed is safe to retry: the identical manifest takes the ingest's
@@ -505,6 +511,9 @@ class OutcomeError extends Error {
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const DEFAULT_BACKOFF_MS = [500, 2_000, 8_000] as const;
 export const MAX_CHUNKS_PER_ASSERTION = 256;
+/** Contract v1: header naming the byte length of the plan entry in front of a chunk. */
+export const PLAN_ENTRY_LENGTH_HEADER = "X-Relay-Migration-Plan-Entry-Length";
+export const MAX_PLAN_ENTRY_BYTES = 1024 * 1024;
 
 function classify(status: number, code: string): Outcome {
   if (status === 409 && code === "migration_assertion_replayed") return { kind: "replayed", code, status };
@@ -515,6 +524,9 @@ function classify(status: number, code: string): Outcome {
   if (status === 401 || status === 403) return { kind: "stop", code, status };
   // 409 migration_chunk_conflict (other bytes at a sealed seq) and any other
   // 4xx fall through: that manifest fails and needs a human.
+  // A deployment that cannot read storage back refuses every migration
+  // commit; retrying cannot help, so it stops the run (fail closed).
+  if (status === 503 && code === "migration_storage_read_required") return { kind: "stop", code, status };
   if (status === 429 || status >= 500) return { kind: "transient", code, status };
   return { kind: "failed", code, status };
 }
@@ -601,6 +613,11 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
   for (const [index, m] of plan.manifests.entries()) {
     const entry = entries[index]!;
     const identity = uploads[index]!;
+    // The plan entry every chunk request carries in front of its bytes; its
+    // digest is the signed entry_sha256.
+    const entryBytes = Buffer.from(canonical(entry), "utf8");
+    if (sha256Hex(entryBytes) !== identity.entry_sha256 || entryBytes.byteLength > MAX_PLAN_ENTRY_BYTES)
+      throw Object.assign(new Error("export upload: a plan entry does not frame as its signed digest or is over 1 MiB"), { code: "plan_entry_unframeable" });
     const key = entry.key;
     const prior = cp.manifests[key];
     if (prior?.status === "committed") {
@@ -659,8 +676,10 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
               "x-relay-trace-id": m.traceId,
               "x-machine-id": m.location.machineId,
               "x-session-id": m.location.sessionId,
+              [PLAN_ENTRY_LENGTH_HEADER]: String(entryBytes.byteLength),
             },
-            body: chunk.data as Uint8Array<ArrayBuffer>,
+            // Contract v1 chunk framing: canonical(entry), then the source bytes.
+            body: Buffer.concat([entryBytes, chunk.data]) as Uint8Array<ArrayBuffer>,
           });
           if (res.status !== 200 && res.status !== 201) throw new OutcomeError(classify(res.status, await errorCode(res)));
           const sealed = (await res.json().catch(() => ({}))) as { entry?: ChunkEntry; scrub?: { ruleset: string; version: number } };
