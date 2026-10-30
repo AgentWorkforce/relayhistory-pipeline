@@ -222,7 +222,7 @@ const EnsurePrivateCloudSql = Alchemy.Action<
   Effect.gen(function* () {
     if (!input.privateServiceConnection)
       throw new Error("96bulls: private service connection was not resolved. Nothing was created.");
-    const project = /^\/projects\/([^/]+)\/global\/networks\//.exec(input.spec.privateNetwork)?.[1];
+    const project = /^projects\/([^/]+)\/global\/networks\//.exec(input.spec.privateNetwork)?.[1];
     if (!project || input.authorization.projectId !== project)
       throw new Error("96bulls: Cloud SQL poster project is malformed. Nothing was created.");
     if (input.authorization.expiresAt <= Math.floor(Date.now() / 1000))
