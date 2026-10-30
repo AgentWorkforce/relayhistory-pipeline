@@ -57,9 +57,10 @@ The 96Bulls runtime selects its Locker in `src/shared/locker-selection.ts`.
 Unset `LOCKER_PROVIDER` stays S3, which is local MinIO, production AWS S3, and
 the EKS proof. `LOCKER_PROVIDER=gcs` builds the GCS adapter and takes a token
 from the GKE metadata server. HMAC keys on GCS are refused, and an S3 client
-pointed at `storage.googleapis.com` is refused. That selection is unit-tested.
-It does not change `rawStoreFromEnv`, which still constructs only S3 or R2,
-because the portable AWS/self-host adapter contract is not frozen.
+pointed at `storage.googleapis.com` is refused. That selection is unit-tested. `rawStoreFromEnv` still constructs only S3
+or R2. An unset provider stays S3. `gcs` and any other name return
+unconfigured instead of being relabeled as S3. The GCS store is selected
+only by the Locker runtime, not by that unfrozen pipeline helper.
 
 The GCP stack still does not install 96Bulls. Setting `bulls96.enabled=true`
 fails before any resource is declared. The chart is not given
@@ -116,25 +117,26 @@ the resulting load balancer before certificate issuance can complete.
 
 These are the current code facts. They are not a cloud proof.
 
-Cloud SQL private network, in `stacks/gcp/alchemy.gcp.run.ts` and
+Cloud SQL private network, in `stacks/gcp/cloud-sql.ts` and
 `@alchemy.run/gcp@2.0.0-beta.84` `GCP.SQL.Instance`:
 
 - `InstanceProps` exposes `ipv4Enabled` and does not expose a private network,
   allocated IP range, Private Service Connect, or authorized-network field.
-- The stack sets `ipv4Enabled: true`. The instance therefore has a public IPv4
-  address. No authorized networks are configured because the provider has no
-  such input.
+  The implementation writes only `ipConfiguration.ipv4Enabled`.
+- The stack does not declare a Cloud SQL instance, database, or Auth Proxy.
+  `cloudSqlPlan` returns `declare: false` for this pin. A public instance is
+  refused. `managedDataPlane.sql` is `null`.
+- The supported attachment, used only when a future provider reports
+  `privateNetwork: true`, is `ipv4Enabled: false`, the VPC network, the
+  Private Service Access range name, and proxy args `--private-ip`,
+  `--address=0.0.0.0`, `--port=5432`. Even that branch throws before
+  `GCP.SQL.Instance` because the resource still cannot accept `privateNetwork`.
 - A Private Service Access range is declared (`purpose: "VPC_PEERING"`, prefix
   length 20) and a `GCP.ServiceNetworking.Connection` consumes it. Memorystore
   uses that range (`connectMode: "PRIVATE_SERVICE_ACCESS"`,
-  `reservedIpRange` set to the range name). Cloud SQL does not reference the
-  range or the connection.
-- The Cloud SQL Auth Proxy Deployment args are `--address=0.0.0.0`,
-  `--port=5432`, and the instance connection name. They do not include
-  `--private-ip`. The proxy is IAM-authenticated TLS, not a private-network
-  attachment.
-- This is a proof blocker. The stack must not be described as a private Cloud
-  SQL deployment.
+  `reservedIpRange` set to the range name). Cloud SQL does not.
+- This remains a proof blocker. The lane has no private Cloud SQL path until
+  the provider passes `privateNetwork` through.
 
 Managed services that are declared and not consumed:
 
@@ -142,11 +144,11 @@ Managed services that are declared and not consumed:
   the stack is applied. No 96Bulls workload is rendered, so nothing sets
   `LOCKER_PROVIDER=gcs` or `LOCKER_BUCKET` in-cluster. `charts.bulls96` is
   `null`.
-- Cloud SQL databases `hoopdb` and `relayfile`, Memorystore Redis 7.2, and the
-  Pub/Sub topic, subscription, and dead-letter topic are created only when
-  `managedDataPlane.provision` is true and `acknowledgement` is
-  `adapter-proof-only`. Their names are returned on the stack output and are
-  not passed into the Relaycast, RelayAuth, Relayfile, or Relayflows values.
+- Memorystore Redis 7.2 and the Pub/Sub topic, subscription, and dead-letter
+  topic are created only when `managedDataPlane.provision` is true and
+  `acknowledgement` is `adapter-proof-only`. Their names are returned on the
+  stack output and are not passed into the Relaycast, RelayAuth, Relayfile,
+  or Relayflows values. Cloud SQL is not among them.
 - Relaycast stays `replicaCount: 1`, `runtime.backend: sqlite`, and
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload

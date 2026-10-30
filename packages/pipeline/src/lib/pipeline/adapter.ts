@@ -242,8 +242,17 @@ export function rawStoreFromEnv(
   const accessKeyId = env.PIPELINE_RAW_S3_ACCESS_KEY_ID;
   const secretAccessKey = env.PIPELINE_RAW_S3_SECRET_ACCESS_KEY;
   if (!bucket || !accessKeyId || !secretAccessKey) return undefined;
-  const provider: StorageProvider =
-    env.PIPELINE_RAW_PROVIDER === "r2" ? "r2" : "s3";
+  const requested = env.PIPELINE_RAW_PROVIDER;
+  // Unset stays S3. This helper constructs only the S3-compatible providers.
+  // Any other name, including gcs, must not be relabeled as S3.
+  if (requested && requested !== "s3" && requested !== "r2") {
+    adapterLog("raw store misconfigured", {
+      setting: "PIPELINE_RAW_PROVIDER",
+      expected: "s3 | r2",
+    });
+    return undefined;
+  }
+  const provider: StorageProvider = requested === "r2" ? "r2" : "s3";
   const setting = env.PIPELINE_RAW_S3_SSE;
   const sse =
     setting === "AES256" || setting === "aws:kms" ? setting : undefined;

@@ -25,11 +25,10 @@ import {
   type GcpInputs,
 } from "./config.ts";
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "./deploy-guard.ts";
+import { ALCHEMY_GCP_BETA_84_SQL, cloudSqlPlan } from "./cloud-sql.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
-const CLOUD_SQL_PROXY_IMAGE =
-  "gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.18.2@sha256:fc224915ef435afeb5b2a9421260a0d31986d5c8b7c7f5783c7f5d5885700cd2";
 
 function readInputs(stage: string): GcpInputs {
   const path = join(ROOT, ".96bulls", stage, "gcp-inputs.json");
@@ -244,28 +243,17 @@ export default Alchemy.Stack(
 
     const dataPlane = i.managedDataPlane.provision
       ? yield* Effect.gen(function* () {
-          const sql = yield* GCP.SQL.Instance("postgres", {
-            instanceName: compactName(stage, "postgres", 63),
-            region: i.region,
-            databaseVersion: "POSTGRES_17",
-            tier: i.managedDataPlane.cloudSqlTier ?? "db-custom-2-7680",
-            availabilityType: i.managedDataPlane.cloudSqlHa ? "REGIONAL" : "ZONAL",
-            backupEnabled: true,
-            dataDiskSizeGb: 20,
-            dataDiskType: "PD_SSD",
-            ipv4Enabled: true,
-            deletionProtectionEnabled: stage === "gcp-prod",
-            labels: labels(stage, "postgres"),
-            databaseFlags: [{ name: "cloudsql.iam_authentication", value: "on" }],
-          });
-          const hoopdb = yield* GCP.SQL.Database("hoopdb", {
-            instance: sql.instanceName,
-            databaseName: "hoopdb",
-          });
-          const relayfile = yield* GCP.SQL.Database("relayfile-database", {
-            instance: sql.instanceName,
-            databaseName: "relayfile",
-          });
+          // No Cloud SQL resource. The pinned provider cannot attach a private
+          // network, and this stack will not declare a public instance.
+          const sqlPlan = cloudSqlPlan(
+            { network: network.networkName, allocatedIpRange: psaRange.addressName },
+            ALCHEMY_GCP_BETA_84_SQL,
+          );
+          if (sqlPlan.declare) {
+            throw new Error(
+              "96bulls: private Cloud SQL attachment is specified, but GCP.SQL.Instance cannot accept privateNetwork. Nothing was created.",
+            );
+          }
           const redis = yield* GCP.Redis.Instance("redis", {
             instanceId: compactName(stage, "redis"),
             location: i.region,
@@ -316,33 +304,8 @@ export default Alchemy.Stack(
             });
           }
 
-          yield* Kubernetes.Manifest("system-namespace", {
-            cluster,
-            manifest: { apiVersion: "v1", kind: "Namespace", metadata: { name: "agentworkforce-system" } },
-          });
-          const proxy = yield* Kubernetes.Deployment("cloud-sql-proxy", {
-            cluster,
-            name: "cloud-sql-proxy",
-            namespace: "agentworkforce-system",
-            image: CLOUD_SQL_PROXY_IMAGE,
-            replicas: 2,
-            port: 5432,
-            serviceType: "ClusterIP",
-            args: ["--address=0.0.0.0", "--port=5432", sql.connectionName.as<string>()],
-            identity: { gcpServiceAccount: runtimeIdentity.email },
-            resources: {
-              requests: { cpu: "100m", memory: "128Mi" },
-              limits: { cpu: "1", memory: "512Mi" },
-            },
-            podTemplate: {
-              spec: {
-                automountServiceAccountToken: true,
-                securityContext: { runAsNonRoot: true, seccompProfile: { type: "RuntimeDefault" } },
-              },
-            },
-          });
           return {
-            sql: { connectionName: sql.connectionName, hoopdb: hoopdb.databaseName, relayfile: relayfile.databaseName, proxyService: proxy.serviceName },
+            sql: null,
             redis: { host: redis.host, port: redis.port },
             pubsub: { topic: events.name, subscription: subscription.name, deadLetters: deadLetters.name },
           };

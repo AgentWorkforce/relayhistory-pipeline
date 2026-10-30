@@ -830,7 +830,24 @@ describe("raw store configuration", () => {
     )!;
     await raw.store.put(objectKey("a/b.json"), new Uint8Array([1]));
     expect(seen[0]!.get("x-amz-server-side-encryption")).toBe("AES256");
-    expect(rawStoreFromEnv(base)).toBeDefined();
+    expect(rawStoreFromEnv(base)?.provider).toBe("s3");
+    expect(rawStoreFromEnv({ ...base, PIPELINE_RAW_PROVIDER: "s3" })?.provider).toBe("s3");
+    expect(rawStoreFromEnv({ ...base, PIPELINE_RAW_PROVIDER: "r2" })?.provider).toBe("r2");
+  });
+
+  it("does not relabel a non-S3 provider as S3", () => {
+    const env = {
+      PIPELINE_RAW_S3_BUCKET: "b",
+      PIPELINE_RAW_S3_ACCESS_KEY_ID: "AKIA_BOUNDARY_KEY",
+      PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "SECRET_BOUNDARY_VALUE",
+      PIPELINE_RAW_PROVIDER: "gcs",
+    };
+    expect(rawStoreFromEnv(env)).toBeUndefined();
+    expect(rawStoreFromEnv({ ...env, PIPELINE_RAW_PROVIDER: "azure" })).toBeUndefined();
+    expect(logs.join("\n")).toContain("PIPELINE_RAW_PROVIDER");
+    expect(logs.join("\n")).toContain("s3 | r2");
+    expect(logs.join("\n")).not.toContain("AKIA_BOUNDARY_KEY");
+    expect(logs.join("\n")).not.toContain("SECRET_BOUNDARY_VALUE");
   });
 });
 
