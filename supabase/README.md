@@ -12,6 +12,7 @@ files run is the in-process PGlite inside `packages/pipeline` vitest.
 | `20261025000100_repo_identity.sql` | relayhistory-cloud PR #177 (`7f49063`) |
 | `20261025000200_scrub_quarantine.sql` | relayhistory-cloud PR #185 (`fe89fc3`) |
 | `20261025000300_upsert_keep_on_null.sql` | relayhistory-cloud PR #185 (`fe89fc3`) |
+| `20261030010000_session_directory.sql` | 96BullSessions decision 0002 logical-session metadata contract |
 | `../tests/supabase_shim.sql` | relayhistory-cloud PR #171, merge commit `51c313fda3c4288cf75f9927c4004fb39b6cd2ee` |
 
 Repository: https://github.com/AgentWorkforce/relayhistory-cloud. The `000000` to
@@ -29,3 +30,7 @@ identical at the PR #211 head too. Do not edit them here; change them upstream.
 TypeScript tests apply every file here in name order after
 `supabase/tests/supabase_shim.sql` (which stubs the Supabase roles and `auth`
 functions). So these files are dependencies of `000600`, vendored so the tests run.
+
+`20261030010000_session_directory.sql` is owned by this repository rather than
+vendored. It is an unapplied schema contract only: it creates no projector,
+backfill, trigger, deployment, or production write.

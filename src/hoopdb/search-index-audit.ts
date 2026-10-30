@@ -7,17 +7,17 @@ import {
   type SearchIndexCatalogRow,
 } from "./search-index-contract.ts";
 
-const AGENT_LOOKUP_ROLLOUT_RELATION = "sessions.session_catalog_agent_lookup_rollout";
+const DIRECTORY_ROLLOUT_RELATION = "sessions.session_directory_rollout";
 
-async function agentLookupRolloutComplete(pool: pg.Pool): Promise<boolean> {
+async function directoryProjectionComplete(pool: pg.Pool): Promise<boolean> {
   const exists = await pool.query<{ exists: boolean }>(
     "SELECT to_regclass($1) IS NOT NULL AS exists",
-    [AGENT_LOOKUP_ROLLOUT_RELATION],
+    [DIRECTORY_ROLLOUT_RELATION],
   );
   if (!exists.rows[0]?.exists) return false;
   const result = await pool.query<{ complete: boolean }>(`
     SELECT COALESCE(bool_and(completed_at IS NOT NULL), false) AS complete
-      FROM sessions.session_catalog_agent_lookup_rollout`);
+      FROM sessions.session_directory_rollout`);
   return result.rows[0]?.complete === true;
 }
 
@@ -32,7 +32,7 @@ export async function auditProductionSearchIndexes(url = required("HOOPDB_URL"))
   try {
     const result = await pool.query<SearchIndexCatalogRow>(SEARCH_INDEX_CATALOG_SQL);
     return auditSearchIndexes(result.rows, {
-      agentLookupRolloutComplete: await agentLookupRolloutComplete(pool),
+      directoryProjectionComplete: await directoryProjectionComplete(pool),
     });
   } finally {
     await pool.end();

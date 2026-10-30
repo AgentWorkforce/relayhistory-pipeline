@@ -1,77 +1,109 @@
-# Session search and index contract
+# Logical session directory and search contract
 
-Production uses Supabase for HoopDb and AWS S3 for canonical session objects.
-EKS, Aurora and the other cloud stacks are self-hosting conformance targets, not
-the hosted production data plane. This contract is provider-neutral PostgreSQL;
-the same audit must pass for every self-hosted database adapter.
+Production uses S3 for canonical session content and Supabase for a rebuildable
+metadata index (decision 0002). `sessions.session_index` remains one row per
+physical machine manifest and holds the object pointer. The additive
+`sessions.session_directory` is one row per logical session:
 
-The contract comes from the query surfaces that people already use, not from
-the columns that happen to exist. Cloud's Sessions board, Cloud's shared-session
-MCP and Relay Desktop were inspected together. An index is required only for a
-server-side durable query shape. Relay Desktop's ephemeral/local dimensions stay
-in its SQLite projection and must not add write amplification to Supabase.
+`(org_id, workspace_id, harness, session_id)`.
 
-## Remote query shapes
+That split is required for stable pagination. A session resumed on three machines
+has three manifest pointers but must occur once on a session list. The future
+projector merges the physical rows into the directory; this schema PR does not
+implement or run that projector.
 
-| Consumer | Filter or order | Database shape | Required coverage |
-| --- | --- | --- | --- |
-| Cloud Sessions | newest workspace sessions and opening summaries | `org_id`, `workspace_id`, `last_ts DESC`, stable session/source cursor; oldest nonblank user prompt | workspace rollup recency and opening-prompt lookup |
-| Cloud Sessions | harness/source | workspace + exact source + recency | workspace/source rollup recency |
-| Cloud Sessions | project | workspace + exact project + recency; existing RelayHistory `projectContains` is substring | workspace/project recency and project trigram |
-| Cloud Sessions | agent name | normalized exact name now; prefix is part of the source contract | tenant/workspace/name-prefix/recency agent catalog |
-| `search_shared_sessions` | transcript query | `left(content, 4096) ILIKE` or `task_title ILIKE` | direct-write trigram GIN indexes |
-| `search_shared_sessions` | source, project, since/until | workspace plus optional equality and event time range | workspace event, source event, and project event keysets |
-| `get_shared_session` | session and optional source | workspace-scoped ordered replay | workspace/session/time replay keyset; source stays after the ordered cursor so omitted-source reads remain index ordered |
-| `get_shared_session_context` | query or timestamp window within one session | transcript trigram plus replay/time keyset | both paths above; PostgreSQL may bitmap-combine them |
-| `list_session_timings` | source, project, since/until | same session/event filters, then timing lookup | source/project/time keysets and session-marker lookup |
-| `list_team_activity` | declared session/source latest event | top-one workspace session replay | workspace/session/time replay keyset |
+Cloud must treat agent lookup as a future RelayHistory-advertised metadata
+capability. It must not bind directly to this table or assume an `agent_name` API
+field until that capability is implemented. The scalar stored here is the delivered
+root agent identity; child-agent relationship labels are not session identities.
 
-The executable gate is `bun run audit:search-indexes` with
-`HOOPDB_URL` supplied by the approved runtime secret mechanism. It reads only
-PostgreSQL catalogs plus the agent lookup rollout marker, and prints only
-names/readiness failures, never connection data or session content. Missing,
-invalid, unfinished or structurally different indexes, unexpected partial
-predicates, and an unfinished agent lookup projection rollout fail the command.
+User and machine filters use `session_directory_users` and
+`session_directory_machines`. The arrays on `session_directory` are response
+conveniences, not indexed filter inputs. This avoids GIN-plus-sort plans for
+recent-session pages.
 
-Large-table indexes are not created by that command. They must use the migration
-owner's resumable `CREATE INDEX CONCURRENTLY` rollout. In particular, hot
-transcript GIN indexes require `fastupdate=off`; this bounds delivery work and
-avoids an unbounded pending-list merge.
+## Indexed remote query shapes
 
-## API gaps that need plumbing before an index is justified
+| Filter or lookup | Index strategy |
+| --- | --- |
+| workspace or org recent | partial ordered btree with a total logical-session cursor |
+| harness/source | workspace + harness + activity cursor |
+| exact project or no project | separate partial activity indexes |
+| agent exact or prefix | normalized name with `text_pattern_ops`, then activity cursor |
+| created range | workspace + `created_at` cursor |
+| state | workspace + state + activity cursor |
+| user or machine | normalized membership table + activity cursor |
+| session ID without workspace/harness | org + session ID lookup |
+| project substring | trigram GIN over `project_id` |
+| general metadata substring | trigram GIN over bounded `search_text` |
 
-Cloud currently applies several filters after fetching a bounded page. That can
-produce an incomplete page and means an index alone would be unused:
+The executable definitions live in
+`src/hoopdb/search-index-contract.ts`. `bun run audit:search-indexes` is
+read-only: it checks catalog structure and fails until the singleton
+`session_directory_rollout.completed_at` is set by the future projector/backfill
+lane. It never creates indexes or marks rollout complete.
 
-- `person` on the Sessions board and `user_id` in `list_session_timings` need a
-  server-side filter over the rollup's `user_ids`. Add the API/query first, then
-  add a GIN or source-owned projection proven by its plan.
-- `created` needs a server-side `first_ts` range contract before a created-time
-  index is added.
-- Cloud's `project` text also matches project display metadata not owned by
-  RelayHistory. Keep that join/search separate from exact `project_id`.
-- General dashboard words and agent terms must be split before forwarding so a
-  transcript word never silently changes into an identity lookup.
+## Metadata-only search boundary
 
-Those gaps are cutover correctness work, not permission to index every array or
-text column preemptively.
+`search_text` may contain only title, task title, agent name, project, repository,
+branch, and model metadata. It must never contain transcript text, event content,
+tool payloads, prompts, or responses. Canonical content remains in S3.
 
-## Relay Desktop dimensions that stay local
+Consequently `search_shared_sessions`, `/v1/events?q=`, and dashboard transcript
+search cannot be implemented by silently querying `session_directory`. They remain
+unavailable on this data plane until ClickHouse/ObsessionDB is ready. A product may
+label a separate metadata search, but it must not claim transcript-search parity.
+Do not add a temporary Supabase transcript/tsvector projection based on a claim that
+deleting an S3 or per-workspace KMS key crypto-shreds it: PostgreSQL heap pages,
+indexes, WAL, replicas, and backups have independent persistence. Transcript storage
+requires a recorded, technically viable encryption, deletion, RLS, and backup design
+before it can enter this contract.
 
-Relay Desktop supports `title`, `project`, `harness`/`source`, `path`, `id`,
-`agent`, `is`, `upload`, `updated`, `after`, `before` and free text, plus sorts
-for session, project, status, updated, relay, upload, harness, model, reasoning,
-created, directory and session ID. Its local SQLite projection already provides
-trigram FTS, facet keys and sort indexes.
+The legacy relayhistory-cloud `0067_session_catalog_agent_lookup.sql` projection
+and its `session_catalog_agents` index are not the production contract. Its
+normalization and ordered-prefix lessons remain valid; its event-triggered catalog
+projection and legacy rollout marker do not.
 
-The following remain local by design:
+## Agent prefix and benchmark gate
 
-- `is:active`, `is:inactive`, `is:on-relay`, `is:off-relay`: live relay state;
-- `upload:*`: uploader/pipeline state;
-- path/directory and substring session ID: local filesystem/catalog metadata;
-- model/reasoning and every alternative table sort until a remote API exposes
-  that exact ordered query.
+Exact lookup accepts a complete normalized name. Prefix lookup requires at least
+three Unicode characters after trim/lowercase normalization. Shorter prefixes are
+rejected rather than allowed to scan a large tenant directory.
 
-Agent, source, project, updated time and transcript text have durable remote
-counterparts and are covered by the remote contract above. Local parity does not
-mean the two stores must use the same physical index.
+Before a rollout can be marked complete, run exact and prefix queries against a
+production-shaped population and record p50/p95 latency plus `EXPLAIN (ANALYZE,
+BUFFERS, FORMAT JSON)`. The deterministic gate is:
+
+- page size: 50;
+- exact and representative selective prefixes must use
+  `session_directory_agent_recent_idx` to constrain the name;
+- at least exact, representative three-character, and deliberately broad
+  three-character prefixes are measured;
+- for a deliberately broad prefix PostgreSQL may instead walk
+  `session_directory_workspace_recent_idx` or `session_directory_org_recent_idx`
+  and filter in recency order; actual index rows plus `Rows Removed by Filter`,
+  divided by returned rows, must be at most 100.
+
+If a real three-character prefix fails that gate, do not relax the limit or hide it
+with a faster test host. Raise the minimum prefix, add a proven projection, or move
+agent discovery to a dedicated names table. Timing thresholds are environment
+specific and belong in the release evidence; the row-amplification bound is the
+portable correctness/performance gate.
+
+## Projector decision still required
+
+Before the projector/backfill lane can mark rollout complete, Khaliq must approve
+the precedence rules for a logical session whose machine manifests disagree on
+title, task title, agent name, project, model, or state. The schema can hold the
+result, but it intentionally does not guess whether newest activity, a designated
+owner machine, or another source wins. Usage counters also need an explicit
+sum-versus-deduplicate rule. Until those rules are recorded, the rollout marker
+stays incomplete and the audit fails closed.
+
+## Dimensions that remain local
+
+Relay Desktop also filters local path/directory, upload state, relay presence,
+reasoning, and live active/inactive state. Those are local catalog/runtime
+dimensions and do not belong in Supabase. Model is searchable metadata, but there
+is no remote ordered model-filter contract yet. Adding an API filter requires a
+query-plan test before adding another write-amplifying index.

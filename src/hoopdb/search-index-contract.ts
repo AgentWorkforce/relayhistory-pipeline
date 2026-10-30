@@ -1,8 +1,10 @@
 /**
- * Consumer-driven search index contract for the production Supabase data plane.
+ * Consumer-driven metadata index contract for decision 0002.
  *
- * This module is deliberately read-only. It does not create indexes: large-table
- * indexes must be built with the migration owner's concurrent rollout machinery.
+ * Canonical transcript/event content lives in object storage. This contract only
+ * covers the rebuildable Supabase logical-session directory and its metadata.
+ * Transcript search belongs to ClickHouse/ObsessionDB and MUST NOT be added to
+ * session_directory.search_text.
  */
 export type SearchIndexRequirement = {
   id: string;
@@ -13,162 +15,213 @@ export type SearchIndexRequirement = {
   definitionFragments: readonly string[];
   reloptionFragments?: readonly string[];
   expectedPredicate?: string;
-  requiresAgentLookupRollout?: boolean;
+  requiresDirectoryProjection?: boolean;
 };
+
+/** Prefixes shorter than this are too broad for the ordered btree contract. */
+export const MIN_AGENT_PREFIX_CHARS = 3;
+
+/** Deterministic gate for production-shaped prefix benchmarks. */
+export const AGENT_PREFIX_BENCHMARK_GATE = {
+  pageSize: 50,
+  maxIndexRowsExaminedPerResult: 100,
+} as const;
+
+export const SESSION_DIRECTORY_SEARCH_BOUNDARY = {
+  metadataOnly: true,
+  fields: [
+    "title",
+    "task_title",
+    "agent_name",
+    "project_id",
+    "git_repo",
+    "git_branch",
+    "model",
+  ],
+  excluded: ["transcript content", "event content", "tool payloads"],
+  transcriptBackend: "ClickHouse/ObsessionDB (not yet available)",
+} as const;
+
+export function normalizeAgentName(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+export function isUsefulAgentPrefix(value: string): boolean {
+  return Array.from(normalizeAgentName(value)).length >= MIN_AGENT_PREFIX_CHARS;
+}
+
+export function agentPrefixPattern(value: string): string {
+  const normalized = normalizeAgentName(value);
+  if (Array.from(normalized).length < MIN_AGENT_PREFIX_CHARS) {
+    throw new RangeError(`agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`);
+  }
+  return `${normalized.replace(/[\\%_]/g, "\\$&")}%`;
+}
+
+/** Parameterized definitions shared by plan tests and future API adapters. */
+export const SESSION_DIRECTORY_QUERIES = {
+  workspaceRecent: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2 AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC, harness DESC
+ LIMIT $3`,
+  harnessRecent: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC
+ LIMIT $4`,
+  projectRecent: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2 AND project_id = $3 AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC, harness DESC
+ LIMIT $4`,
+  withoutProjectRecent: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2 AND project_id IS NULL AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC, harness DESC
+ LIMIT $3`,
+  agentExact: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2
+   AND agent_name_normalized = $3 AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC, harness DESC
+ LIMIT $4`,
+  agentPrefix: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2
+   AND agent_name_normalized LIKE $3 ESCAPE '\\' AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC, harness DESC
+ LIMIT $4`,
+  createdRange: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2 AND created_at >= $3
+   AND created_at < $4 AND deleted_at IS NULL
+ ORDER BY created_at DESC, session_id DESC, harness DESC
+ LIMIT $5`,
+  stateRecent: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2 AND state = $3 AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC, harness DESC
+ LIMIT $4`,
+  userRecent: `
+SELECT d.* FROM sessions.session_directory_users AS membership
+ JOIN sessions.session_directory AS d USING (org_id, workspace_id, harness, session_id)
+ WHERE membership.org_id = $1 AND membership.workspace_id = $2
+   AND membership.user_id = $3 AND d.deleted_at IS NULL
+ ORDER BY membership.last_activity_at DESC, membership.session_id DESC, membership.harness DESC
+ LIMIT $4`,
+  machineRecent: `
+SELECT d.* FROM sessions.session_directory_machines AS membership
+ JOIN sessions.session_directory AS d USING (org_id, workspace_id, harness, session_id)
+ WHERE membership.org_id = $1 AND membership.workspace_id = $2
+   AND membership.machine_id = $3 AND d.deleted_at IS NULL
+ ORDER BY membership.last_activity_at DESC, membership.session_id DESC, membership.harness DESC
+ LIMIT $4`,
+  projectContains: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2 AND project_id ILIKE '%' || $3 || '%'
+   AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC, harness DESC
+ LIMIT $4`,
+  metadataContains: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2 AND search_text ILIKE '%' || $3 || '%'
+   AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC, harness DESC
+ LIMIT $4`,
+} as const;
 
 export const REQUIRED_SEARCH_INDEXES = [
   {
-    id: "workspace-recent-sessions",
-    indexName: "session_rollups_workspace_recent_idx",
-    tableName: "session_rollups",
-    consumers: ["Cloud sessions dashboard", "Cloud MCP list_session_timings"],
-    queryShape: "org + workspace equality; newest last_ts keyset page",
-    definitionFragments: [
-      "on sessions.session_rollups",
-      "(org_id, workspace_id, last_ts desc, session_id desc, source desc)",
-    ],
+    id: "workspace-recent-sessions", indexName: "session_directory_workspace_recent_idx",
+    tableName: "session_directory", consumers: ["Cloud Sessions", "Cloud MCP list_session_timings"],
+    queryShape: "org + workspace equality; logical-session activity keyset",
+    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, last_activity_at desc, session_id desc, harness desc)"],
+    expectedPredicate: "(deleted_at IS NULL)", requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-source-recent-sessions",
-    indexName: "session_rollups_workspace_source_recent_idx",
-    tableName: "session_rollups",
-    consumers: ["Cloud sessions dashboard harness/source filter", "Cloud MCP list_session_timings"],
-    queryShape: "org + workspace + source equality; newest last_ts keyset page",
-    definitionFragments: [
-      "on sessions.session_rollups",
-      "(org_id, workspace_id, source, last_ts desc, session_id desc)",
-    ],
+    id: "org-recent-sessions", indexName: "session_directory_org_recent_idx",
+    tableName: "session_directory", consumers: ["Cloud org-wide session list"],
+    queryShape: "org equality; cross-workspace logical-session activity keyset",
+    definitionFragments: ["on sessions.session_directory", "(org_id, last_activity_at desc, session_id desc, harness desc, workspace_id desc)"],
+    expectedPredicate: "(deleted_at IS NULL)", requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-project-recent-sessions",
-    indexName: "session_rollups_workspace_project_recent_idx",
-    tableName: "session_rollups",
-    consumers: ["Cloud sessions dashboard project filter", "Cloud MCP list_session_timings"],
-    queryShape: "org + workspace + project equality; newest last_ts keyset page",
-    definitionFragments: [
-      "on sessions.session_rollups",
-      "(org_id, workspace_id, project_id, last_ts desc, session_id desc, source desc)",
-    ],
+    id: "workspace-harness-recent-sessions", indexName: "session_directory_harness_recent_idx",
+    tableName: "session_directory", consumers: ["Cloud Sessions harness/source filter", "Cloud MCP"],
+    queryShape: "org + workspace + harness equality; activity keyset",
+    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, harness, last_activity_at desc, session_id desc)"],
+    expectedPredicate: "(deleted_at IS NULL)", requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-event-time",
-    indexName: "convergence_events_workspace_recent_idx",
-    tableName: "convergence_events",
-    consumers: ["Cloud MCP search_shared_sessions", "Cloud MCP context timestamp windows"],
-    queryShape: "org + workspace equality; ts range and event keyset order",
-    definitionFragments: [
-      "on sessions.convergence_events",
-      "(org_id, workspace_id, ts desc, event_id desc, machine_id desc, source desc, session_id desc, kind desc)",
-    ],
+    id: "workspace-project-recent-sessions", indexName: "session_directory_project_recent_idx",
+    tableName: "session_directory", consumers: ["Cloud Sessions project filter", "Cloud MCP"],
+    queryShape: "org + workspace + exact project; activity keyset",
+    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, project_id, last_activity_at desc, session_id desc, harness desc)"],
+    expectedPredicate: "((project_id IS NOT NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-source-event-time",
-    indexName: "convergence_events_workspace_source_recent_idx",
-    tableName: "convergence_events",
-    consumers: ["Cloud MCP search_shared_sessions source filter", "Cloud MCP team activity"],
-    queryShape: "org + workspace + source equality; ts range and event keyset order",
-    definitionFragments: [
-      "on sessions.convergence_events",
-      "(org_id, workspace_id, source, ts desc, event_id desc, machine_id desc, session_id desc, kind desc)",
-    ],
+    id: "workspace-no-project-recent-sessions", indexName: "session_directory_no_project_recent_idx",
+    tableName: "session_directory", consumers: ["Cloud Sessions unassigned-project filter"],
+    queryShape: "org + workspace + no project; activity keyset",
+    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, last_activity_at desc, session_id desc, harness desc)"],
+    expectedPredicate: "((project_id IS NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-project-event-time",
-    indexName: "convergence_events_workspace_project_recent_idx",
-    tableName: "convergence_events",
-    consumers: ["Cloud MCP search_shared_sessions project filter", "Cloud MCP list_session_timings"],
-    queryShape: "org + workspace + project equality; ts range and event keyset order",
-    definitionFragments: [
-      "on sessions.convergence_events",
-      "(org_id, workspace_id, project_id, ts desc, event_id desc, machine_id desc, source desc, session_id desc, kind desc)",
-    ],
+    id: "agent-name-exact-or-prefix", indexName: "session_directory_agent_recent_idx",
+    tableName: "session_directory", consumers: ["Cloud Sessions agent filter", "Relay Desktop remote parity"],
+    queryShape: "normalized exact or >=3-character prefix agent name; activity keyset",
+    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, agent_name_normalized text_pattern_ops, last_activity_at desc, session_id desc, harness desc)"],
+    expectedPredicate: "((agent_name_normalized IS NOT NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-session-replay",
-    indexName: "convergence_events_workspace_session_replay_idx",
-    tableName: "convergence_events",
-    consumers: ["Cloud MCP get_shared_session", "Cloud MCP get_shared_session_context", "Cloud MCP team activity"],
-    queryShape: "org + workspace + session equality; optional source filter; ordered transcript replay",
-    definitionFragments: [
-      "on sessions.convergence_events",
-      "(org_id, workspace_id, session_id, ts, event_id, machine_id, source, kind)",
-    ],
+    id: "workspace-created-range", indexName: "session_directory_created_recent_idx",
+    tableName: "session_directory", consumers: ["Cloud Sessions created filter"],
+    queryShape: "org + workspace + created range; created keyset",
+    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, created_at desc, session_id desc, harness desc)"],
+    expectedPredicate: "(deleted_at IS NULL)", requiresDirectoryProjection: true,
   },
   {
-    id: "session-opening-prompt",
-    indexName: "convergence_events_opening_prompt_idx",
-    tableName: "convergence_events",
-    consumers: ["Cloud sessions dashboard summaries"],
-    queryShape: "tenant/session/source/workspace equality; oldest nonblank user prompt",
-    definitionFragments: [
-      "on sessions.convergence_events",
-      "(org_id, session_id, source, workspace_id, ts, event_id)",
-    ],
-    expectedPredicate:
-      "(((kind = ANY (ARRAY['history'::text, 'prompt'::text, 'user'::text])) OR ((kind = 'session_event'::text) AND (actor_role = 'user'::text))) AND (length(TRIM(BOTH FROM COALESCE(content, ''::text))) > 0))",
+    id: "workspace-state-recent", indexName: "session_directory_state_recent_idx",
+    tableName: "session_directory", consumers: ["Cloud Sessions state filter"],
+    queryShape: "org + workspace + state; activity keyset",
+    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, state, last_activity_at desc, session_id desc, harness desc)"],
+    expectedPredicate: "(deleted_at IS NULL)", requiresDirectoryProjection: true,
   },
   {
-    id: "transcript-content-substring",
-    indexName: "convergence_events_content_prefix_trgm_idx",
-    tableName: "convergence_events",
-    consumers: ["Cloud MCP search_shared_sessions", "Cloud MCP get_shared_session_context query"],
-    queryShape: "case-insensitive substring over left(content, 4096)",
-    definitionFragments: [
-      "on sessions.convergence_events using gin",
-      "left(content, 4096)",
-      "gin_trgm_ops",
-    ],
-    reloptionFragments: ["fastupdate=off"],
+    id: "session-id-lookup", indexName: "session_directory_session_lookup_idx",
+    tableName: "session_directory", consumers: ["Cloud session open", "Cloud MCP"],
+    queryShape: "org + session id when workspace and harness are unknown",
+    definitionFragments: ["on sessions.session_directory", "(org_id, session_id)"],
+    requiresDirectoryProjection: true,
   },
   {
-    id: "task-title-substring",
-    indexName: "convergence_events_task_title_direct_trgm_idx",
-    tableName: "convergence_events",
-    consumers: ["Cloud MCP search_shared_sessions", "RelayHistory event search"],
-    queryShape: "case-insensitive substring over task_title",
-    definitionFragments: [
-      "on sessions.convergence_events using gin",
-      "task_title",
-      "gin_trgm_ops",
-    ],
-    reloptionFragments: ["fastupdate=off"],
-    expectedPredicate: "(task_title IS NOT NULL)",
+    id: "project-substring", indexName: "session_directory_project_trgm_idx",
+    tableName: "session_directory", consumers: ["RelayHistory projectContains", "Cloud project search"],
+    queryShape: "case-insensitive project substring (metadata only)",
+    definitionFragments: ["on sessions.session_directory using gin", "project_id", "gin_trgm_ops"],
+    expectedPredicate: "((project_id IS NOT NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
   },
   {
-    id: "project-substring",
-    indexName: "session_rollups_project_id_trgm_idx",
-    tableName: "session_rollups",
-    consumers: ["RelayHistory projectContains", "Cloud sessions project search"],
-    queryShape: "case-insensitive leading-wildcard project_id match",
-    definitionFragments: [
-      "on sessions.session_rollups using gin",
-      "project_id",
-      "gin_trgm_ops",
-    ],
+    id: "metadata-substring", indexName: "session_directory_metadata_trgm_idx",
+    tableName: "session_directory", consumers: ["Cloud metadata search"],
+    queryShape: "case-insensitive substring over bounded metadata-only search_text",
+    definitionFragments: ["on sessions.session_directory using gin", "search_text", "gin_trgm_ops"],
+    expectedPredicate: "((search_text <> ''::text) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
   },
   {
-    id: "session-timing-marker-lookup",
-    indexName: "session_markers_timing_lookup_idx",
-    tableName: "session_markers",
-    consumers: ["Cloud MCP list_session_timings", "Cloud session timing"],
-    queryShape: "tenant + source + session equality during a cold timing-cache fill",
-    definitionFragments: [
-      "on sessions.session_markers",
-      "(org_id, source, session_id)",
-    ],
+    id: "user-membership-recent", indexName: "session_directory_users_recent_idx",
+    tableName: "session_directory_users", consumers: ["Cloud Sessions person filter", "Cloud MCP user filter"],
+    queryShape: "org + workspace + user membership; activity keyset",
+    definitionFragments: ["on sessions.session_directory_users", "(org_id, workspace_id, user_id, last_activity_at desc, session_id desc, harness desc)"],
+    requiresDirectoryProjection: true,
   },
   {
-    id: "agent-name-lookup",
-    indexName: "session_catalog_agents_lookup_idx",
-    tableName: "session_catalog_agents",
-    consumers: ["Cloud sessions agent filter", "Relay Desktop agent-name parity"],
-    queryShape: "tenant/workspace normalized exact or prefix agent name; newest sessions first",
-    definitionFragments: [
-      "on sessions.session_catalog_agents",
-      "(org_id, workspace_id, agent_name_normalized text_pattern_ops, last_ts desc, session_id desc, source desc)",
-    ],
-    expectedPredicate: "((agent_name_normalized IS NOT NULL) AND (last_ts IS NOT NULL))",
-    requiresAgentLookupRollout: true,
+    id: "machine-membership-recent", indexName: "session_directory_machines_recent_idx",
+    tableName: "session_directory_machines", consumers: ["Cloud machine filter"],
+    queryShape: "org + workspace + machine membership; activity keyset",
+    definitionFragments: ["on sessions.session_directory_machines", "(org_id, workspace_id, machine_id, last_activity_at desc, session_id desc, harness desc)"],
+    requiresDirectoryProjection: true,
   },
 ] as const satisfies readonly SearchIndexRequirement[];
 
@@ -198,12 +251,8 @@ SELECT table_rel.relname AS table_name,
  ORDER BY table_rel.relname, index_rel.relname`;
 
 function normalized(value: string | null | undefined): string {
-  return (value ?? "")
-    .toLowerCase()
-    .replace(/["']/g, "")
-    .replace(/\s+/g, " ")
-    .replace(/\s*,\s*/g, ", ")
-    .trim();
+  return (value ?? "").toLowerCase().replace(/["']/g, "").replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ").trim();
 }
 
 function normalizedPredicate(value: string | null | undefined): string {
@@ -211,41 +260,24 @@ function normalizedPredicate(value: string | null | undefined): string {
   let masked = "";
   const input = value ?? "";
   for (let index = 0; index < input.length;) {
-    if (input[index] !== "'") {
-      masked += input[index];
-      index += 1;
-      continue;
-    }
+    if (input[index] !== "'") { masked += input[index]; index += 1; continue; }
     const start = index;
     index += 1;
     while (index < input.length) {
-      if (input[index] !== "'") {
-        index += 1;
-        continue;
-      }
-      if (input[index + 1] === "'") {
-        index += 2;
-        continue;
-      }
+      if (input[index] !== "'") { index += 1; continue; }
+      if (input[index + 1] === "'") { index += 2; continue; }
       index += 1;
       break;
     }
     masked += `\u0001${literals.length}\u0002`;
     literals.push(input.slice(start, index));
   }
-  return masked
-    .toLowerCase()
-    .replace(/"/g, "")
-    .replace(/\s+/g, " ")
-    .replace(/\s*,\s*/g, ", ")
-    .trim()
+  return masked.toLowerCase().replace(/"/g, "").replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ").trim()
     .replace(/\u0001(\d+)\u0002/g, (_marker, offset: string) => literals[Number(offset)] ?? "");
 }
 
-export type SearchIndexReadiness = {
-  agentLookupRolloutComplete: boolean;
-};
-
+export type SearchIndexReadiness = { directoryProjectionComplete: boolean };
 export type SearchIndexAuditItem = {
   id: string;
   indexName: string;
@@ -257,10 +289,7 @@ export type SearchIndexAuditItem = {
 export function auditSearchIndexes(
   rows: readonly SearchIndexCatalogRow[],
   readiness: SearchIndexReadiness,
-): {
-  passed: boolean;
-  indexes: SearchIndexAuditItem[];
-} {
+): { passed: boolean; indexes: SearchIndexAuditItem[] } {
   const byName = new Map(rows.map((row) => [row.index_name, row]));
   const indexes = REQUIRED_SEARCH_INDEXES.map((requirement) => {
     const row = byName.get(requirement.indexName);
@@ -275,33 +304,25 @@ export function auditSearchIndexes(
       for (const fragment of requirement.definitionFragments) {
         if (!definition.includes(normalized(fragment))) reasons.push(`definition missing: ${fragment}`);
       }
-      const expectedPredicate = "expectedPredicate" in requirement
-        ? requirement.expectedPredicate
-        : null;
+      const expectedPredicate = "expectedPredicate" in requirement ? requirement.expectedPredicate : null;
       if (normalizedPredicate(row.predicate) !== normalizedPredicate(expectedPredicate)) {
         reasons.push(expectedPredicate ? "predicate mismatch" : "unexpected predicate");
       }
       const options = normalized(row.reloptions);
-      const reloptionFragments = "reloptionFragments" in requirement
-        ? requirement.reloptionFragments
+      const reloptionFragments: readonly string[] = "reloptionFragments" in requirement
+        ? requirement.reloptionFragments as readonly string[]
         : [];
       for (const fragment of reloptionFragments) {
         if (!options.includes(normalized(fragment))) reasons.push(`option missing: ${fragment}`);
       }
     }
-    if (
-      "requiresAgentLookupRollout" in requirement &&
-      requirement.requiresAgentLookupRollout &&
-      !readiness.agentLookupRolloutComplete
-    ) {
-      reasons.push("agent lookup rollout incomplete");
+    if ("requiresDirectoryProjection" in requirement && requirement.requiresDirectoryProjection &&
+        !readiness.directoryProjectionComplete) {
+      reasons.push("directory projection incomplete");
     }
     return {
-      id: requirement.id,
-      indexName: requirement.indexName,
-      tableName: requirement.tableName,
-      ready: reasons.length === 0,
-      reasons,
+      id: requirement.id, indexName: requirement.indexName, tableName: requirement.tableName,
+      ready: reasons.length === 0, reasons,
     };
   });
   return { passed: indexes.every((index) => index.ready), indexes };

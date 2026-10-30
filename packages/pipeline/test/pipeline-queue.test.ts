@@ -5,6 +5,7 @@
  * queue binding. Synthetic ids only; no hosted database or live queue.
  */
 import { PGlite } from "@electric-sql/pglite";
+import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -341,7 +342,7 @@ describe("cloudflare backend", () => {
 let db: PGlite;
 
 beforeAll(async () => {
-  db = new PGlite();
+  db = new PGlite({ extensions: { pg_trgm } });
   await db.exec(readFileSync(supabaseFile("tests/supabase_shim.sql"), "utf8"));
   for (const file of readdirSync(supabaseFile("migrations/")).sort())
     await db.exec(readFileSync(supabaseFile(`migrations/${file}`), "utf8"));
@@ -855,7 +856,7 @@ describe("postgres backend", () => {
 
 describe("20261025000600 on a database with rows under the old stage names", () => {
   it("renames events and dead letters, ids and messages included", async () => {
-    const old = new PGlite();
+    const old = new PGlite({ extensions: { pg_trgm } });
     try {
       await old.exec(
         readFileSync(supabaseFile("tests/supabase_shim.sql"), "utf8"),
