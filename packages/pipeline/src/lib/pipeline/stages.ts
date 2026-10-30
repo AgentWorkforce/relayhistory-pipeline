@@ -82,6 +82,10 @@ export interface SessionPointerIndex {
 /** The stored normalized object, described from its own bytes. */
 export interface NormalizedOutput {
   outputKey: string;
+  /** The manifest this run read: `contentSha256` is its `raw.content_sha256`. */
+  revision: number;
+  normalizedVersion: number;
+  contentSha256: string;
   /** Lowercase hex SHA-256 of the stored object. */
   outputSha256: string;
   outputBytes: number;
@@ -89,11 +93,29 @@ export interface NormalizedOutput {
   convergenceEventCount: number;
   /** Records with no projection, which leave no line in the object. */
   unprojectedRecords: number;
+  /** The object was already stored, so this run published nothing. */
+  outputReused: boolean;
+  /** Reused, and this run's bytes differ: same input and version, different output. */
+  outputDivergent: boolean;
+}
+
+/** The manifest version a message was enqueued for. */
+export interface NormalizeTarget {
+  revision?: number;
+  workKey?: string;
+}
+
+/** A delayed message: a newer manifest stands, and its own event normalizes it. */
+export interface NormalizeSkipped {
+  skipped: "stale_manifest";
 }
 
 export interface SessionTransform {
   /** Idempotent by input key and transform version. Empty when nothing was normalized. */
-  normalize(pointer: RawPointer): Promise<NormalizedOutput | Record<string, never>>;
+  normalize(
+    pointer: RawPointer,
+    target?: NormalizeTarget,
+  ): Promise<NormalizedOutput | NormalizeSkipped | Record<string, never>>;
 }
 
 export interface StageSenders {
@@ -258,13 +280,19 @@ export function fileNormalizeHandler(
   transform: SessionTransform,
 ): StageHandler {
   return async (message, recorder) => {
-    const output = await transform.normalize(message.payload as RawPointer);
+    const output = await transform.normalize(message.payload as RawPointer, {
+      ...(message.revision !== undefined ? { revision: message.revision } : {}),
+      workKey: message.workKey,
+    });
+    if ("skipped" in output) return { status: "skipped", reason: output.skipped };
     if (output.outputKey)
       recorder.log.info("transform output", {
         output_key: output.outputKey,
         output_bytes: output.outputBytes,
         convergence_event_count: output.convergenceEventCount,
         unprojected_records: output.unprojectedRecords,
+        output_reused: output.outputReused,
+        output_divergent: output.outputDivergent,
       });
   };
 }
