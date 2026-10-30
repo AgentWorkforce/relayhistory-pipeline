@@ -22,6 +22,10 @@ provisioning API lives in Pippin Tools.
 
 ## Decisions (Khaliq, 2026-10-28)
 
+Hosted production is Supabase plus S3 only. Everything on this AWS stage
+beyond S3 exists to prove the self-hosted deployment
+(`docs/decisions/0001-production-data-plane.md`, 2026-10-30).
+
 - **Compute:** EKS (Auto Mode) running the `96bulls` umbrella chart from
   AgentWorkforce/helm-charts, pinned to the published services image digest in
   `versions.lock.json` (`stacks/aws/eks.ts`).
