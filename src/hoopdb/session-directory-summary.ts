@@ -1,0 +1,146 @@
+/**
+ * The only write path for `sessions.session_directory.short_summary` (G6).
+ *
+ * The text is session data derived from transcript content, so it is stored only
+ * after the shared `lib/scrub.ts` scrubber has run over it, and the scrub ruleset
+ * and version it went through are recorded beside it. The writer fails closed:
+ * an over-length summary, a scrub that throws, a scrub that would truncate, or a
+ * scrub that is not stable on its own output is refused and nothing is written.
+ * The database repeats the length and provenance checks
+ * (supabase/migrations/20261030020000_session_directory_short_summary.sql).
+ *
+ * Long summaries stay in object storage (Bob Costas's encrypted summary objects).
+ * No summary text is ever put in a log line, an error message or telemetry.
+ */
+import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
+import { SCRUB_RULESET, SCRUB_RULESET_VERSION, scrubText } from "../shared/vendor.ts";
+
+/** Hard bound, in Unicode code points (PostgreSQL `char_length`). */
+export const SHORT_SUMMARY_MAX_CHARS = 1000;
+
+/** Same shape as `session_summaries.model_id`, prefixed by the producer. */
+const SOURCE_PATTERN = /^[a-z0-9][a-z0-9._/-]{0,63}$/;
+
+export type ShortSummaryRejection =
+  | "empty"
+  | "over_length"
+  | "scrub_failed"
+  | "scrub_unstable"
+  | "invalid_source";
+
+/** Refusal. The message names the reason only, never the text. */
+export class ShortSummaryRejected extends Error {
+  constructor(readonly reason: ShortSummaryRejection) {
+    super(`short_summary rejected: ${reason}`);
+    this.name = "ShortSummaryRejected";
+  }
+}
+
+export type ScrubbedShortSummary = {
+  text: string;
+  scrubRuleset: typeof SCRUB_RULESET;
+  scrubVersion: number;
+};
+
+export type SessionDirectoryKey = {
+  orgId: string;
+  workspaceId: string;
+  harness: string;
+  sessionId: string;
+};
+
+export type ShortSummaryInput = SessionDirectoryKey & {
+  summary: string;
+  /** Producer and version, e.g. `bob-costas/extractive/v1`. */
+  source: string;
+  generatedAt: Date;
+};
+
+const codePoints = (value: string) => Array.from(value).length;
+
+/**
+ * Scrub and bound one summary. `scrub` is the shared scrubber; it is a parameter
+ * only so tests can prove a failing scrub is refused.
+ */
+export function scrubShortSummary(
+  summary: string,
+  scrub: (value: string) => string = scrubText,
+): ScrubbedShortSummary {
+  const trimmed = summary.trim();
+  if (trimmed === "") throw new ShortSummaryRejected("empty");
+  // Refuse rather than truncate: a cut can split a credential below the scrubber's
+  // match length, and a silently shortened summary is not what the producer wrote.
+  if (codePoints(trimmed) > SHORT_SUMMARY_MAX_CHARS) throw new ShortSummaryRejected("over_length");
+  let text: string;
+  try {
+    text = scrub(trimmed);
+    if (typeof text !== "string") throw new ShortSummaryRejected("scrub_failed");
+    // A fixed point proves the stored text is scrubbed under these rules.
+    if (scrub(text) !== text) throw new ShortSummaryRejected("scrub_unstable");
+  } catch (error) {
+    if (error instanceof ShortSummaryRejected) throw error;
+    throw new ShortSummaryRejected("scrub_failed");
+  }
+  text = text.trim();
+  if (text === "") throw new ShortSummaryRejected("empty");
+  if (codePoints(text) > SHORT_SUMMARY_MAX_CHARS) throw new ShortSummaryRejected("over_length");
+  return { text, scrubRuleset: SCRUB_RULESET, scrubVersion: SCRUB_RULESET_VERSION };
+}
+
+/**
+ * Store a summary on a live (not tombstoned) directory row and rebuild its search
+ * document with `sessions.session_directory_search_text`, so the summary is always
+ * searchable through `search_text`. An older `generatedAt` never replaces a newer
+ * summary. Returns whether a row was written.
+ */
+export async function writeShortSummary(
+  db: SqlExecutor,
+  input: ShortSummaryInput,
+  scrub: (value: string) => string = scrubText,
+): Promise<{ written: boolean; scrubVersion: number }> {
+  if (!SOURCE_PATTERN.test(input.source)) throw new ShortSummaryRejected("invalid_source");
+  const scrubbed = scrubShortSummary(input.summary, scrub);
+  const { rows } = await db.query<{ written: boolean }>(
+    `UPDATE sessions.session_directory AS d
+        SET short_summary = $5,
+            short_summary_scrub_ruleset = $6,
+            short_summary_scrub_version = $7,
+            short_summary_source = $8,
+            short_summary_generated_at = $9::timestamptz,
+            search_text = sessions.session_directory_search_text(
+              d.title, d.task_title, d.agent_name, d.project_id,
+              d.git_repo, d.git_branch, d.model, $5),
+            projected_at = now()
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+        AND d.deleted_at IS NULL
+        AND (d.short_summary_generated_at IS NULL OR d.short_summary_generated_at <= $9::timestamptz)
+      RETURNING true AS written`,
+    [
+      input.orgId, input.workspaceId, input.harness, input.sessionId,
+      scrubbed.text, scrubbed.scrubRuleset, scrubbed.scrubVersion, input.source,
+      input.generatedAt.toISOString(),
+    ],
+  );
+  return { written: rows.length > 0, scrubVersion: scrubbed.scrubVersion };
+}
+
+/** Remove a row's summary (and its share of the search document) without a tombstone. */
+export async function clearShortSummary(db: SqlExecutor, key: SessionDirectoryKey): Promise<boolean> {
+  const { rows } = await db.query<{ cleared: boolean }>(
+    `UPDATE sessions.session_directory AS d
+        SET short_summary = NULL,
+            short_summary_scrub_ruleset = NULL,
+            short_summary_scrub_version = NULL,
+            short_summary_source = NULL,
+            short_summary_generated_at = NULL,
+            search_text = CASE WHEN d.deleted_at IS NULL THEN sessions.session_directory_search_text(
+              d.title, d.task_title, d.agent_name, d.project_id,
+              d.git_repo, d.git_branch, d.model, NULL) ELSE '' END,
+            projected_at = now()
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+        AND d.short_summary IS NOT NULL
+      RETURNING true AS cleared`,
+    [key.orgId, key.workspaceId, key.harness, key.sessionId],
+  );
+  return rows.length > 0;
+}

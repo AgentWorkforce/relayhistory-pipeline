@@ -4,7 +4,8 @@
  * Canonical transcript/event content lives in object storage. This contract only
  * covers the rebuildable Supabase logical-session directory and its metadata.
  * Transcript search belongs to ClickHouse/ObsessionDB and MUST NOT be added to
- * session_directory.search_text.
+ * session_directory.search_text. The one derived-content exception is the bounded,
+ * scrubbed short_summary Khaliq approved for V1 (G6).
  */
 export type SearchIndexRequirement = {
   id: string;
@@ -37,8 +38,10 @@ export const SESSION_DIRECTORY_SEARCH_BOUNDARY = {
     "git_repo",
     "git_branch",
     "model",
+    // Scrubbed, <= 1000 characters, written only by session-directory-summary.ts.
+    "short_summary",
   ],
-  excluded: ["transcript content", "event content", "tool payloads"],
+  excluded: ["transcript content", "event content", "tool payloads", "long summary", "embeddings"],
   transcriptBackend: "ClickHouse/ObsessionDB (not yet available)",
 } as const;
 
@@ -56,6 +59,18 @@ export function agentPrefixPattern(value: string): string {
     throw new RangeError(`agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`);
   }
   return `${normalized.replace(/[\\%_]/g, "\\$&")}%`;
+}
+
+/** Trigram search needs at least three characters to use an index. */
+export const MIN_SUMMARY_SEARCH_CHARS = 3;
+
+/** Case-insensitive contains pattern for `summaryContains`, LIKE metacharacters escaped. */
+export function summaryContainsPattern(value: string): string {
+  const trimmed = value.trim();
+  if (Array.from(trimmed).length < MIN_SUMMARY_SEARCH_CHARS) {
+    throw new RangeError(`summary search must contain at least ${MIN_SUMMARY_SEARCH_CHARS} characters`);
+  }
+  return `%${trimmed.replace(/[\\%_]/g, "\\$&")}%`;
 }
 
 /** Parameterized definitions shared by plan tests and future API adapters. */
@@ -126,6 +141,13 @@ SELECT * FROM sessions.session_directory
   metadataContains: `
 SELECT * FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2 AND search_text ILIKE '%' || $3 || '%'
+   AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC, harness DESC
+ LIMIT $4`,
+  summaryContains: `
+SELECT * FROM sessions.session_directory
+ WHERE org_id = $1 AND workspace_id = $2
+   AND short_summary ILIKE $3 ESCAPE '\\' AND short_summary IS NOT NULL
    AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC, harness DESC
  LIMIT $4`,
@@ -208,6 +230,13 @@ export const REQUIRED_SEARCH_INDEXES = [
     queryShape: "case-insensitive substring over bounded metadata-only search_text",
     definitionFragments: ["on sessions.session_directory using gin", "search_text", "gin_trgm_ops"],
     expectedPredicate: "((search_text <> ''::text) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
+  },
+  {
+    id: "summary-substring", indexName: "session_directory_summary_trgm_idx",
+    tableName: "session_directory", consumers: ["Cloud summary search", "Relay Desktop remote free-text search"],
+    queryShape: "org + workspace scoped case-insensitive substring over the scrubbed short_summary",
+    definitionFragments: ["on sessions.session_directory using gin", "(org_id, workspace_id, short_summary", "gin_trgm_ops)"],
+    expectedPredicate: "((short_summary IS NOT NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
   },
   {
     id: "user-membership-recent", indexName: "session_directory_users_recent_idx",

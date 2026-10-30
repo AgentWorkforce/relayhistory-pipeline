@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
+import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import {
   AGENT_PREFIX_BENCHMARK_GATE,
@@ -16,6 +17,10 @@ const migration = readFileSync(
   join(import.meta.dir, "../../../supabase/migrations/20261030010000_session_directory.sql"),
   "utf8",
 );
+const shortSummaryMigration = readFileSync(
+  join(import.meta.dir, "../../../supabase/migrations/20261030020000_session_directory_short_summary.sql"),
+  "utf8",
+);
 const shim = readFileSync(join(import.meta.dir, "../../../supabase/tests/supabase_shim.sql"), "utf8");
 const open: PGlite[] = [];
 
@@ -24,7 +29,7 @@ afterEach(async () => {
 });
 
 async function database(): Promise<PGlite> {
-  const db = new PGlite({ extensions: { pg_trgm } });
+  const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(shim);
   await db.exec(`
@@ -35,6 +40,7 @@ async function database(): Promise<PGlite> {
       LANGUAGE sql IMMUTABLE AS $$ SELECT $1 = ANY ($2) $$;
   `);
   await db.exec(migration);
+  await db.exec(shortSummaryMigration);
   return db;
 }
 

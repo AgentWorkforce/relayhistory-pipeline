@@ -36,6 +36,7 @@ recent-session pages.
 | session ID without workspace/harness | org + session ID lookup |
 | project substring | trigram GIN over `project_id` |
 | general metadata substring | trigram GIN over bounded `search_text` |
+| short summary substring | tenant-scoped trigram GIN `(org_id, workspace_id, short_summary)` (btree_gin) |
 
 The executable definitions live in
 `src/hoopdb/search-index-contract.ts`. `bun run audit:search-indexes` is
@@ -46,8 +47,45 @@ lane. It never creates indexes or marks rollout complete.
 ## Metadata-only search boundary
 
 `search_text` may contain only title, task title, agent name, project, repository,
-branch, and model metadata. It must never contain transcript text, event content,
-tool payloads, prompts, or responses. Canonical content remains in S3.
+branch, and model metadata, plus the scrubbed `short_summary` (below). It must never
+contain transcript text, event content, tool payloads, prompts, or responses.
+Canonical content remains in S3.
+
+### Short summary (G6)
+
+Khaliq approved one bounded piece of derived content on 2026-10-30
+(`docs/session-search-projection.md`): `session_directory.short_summary`, migration
+`20261030020000_session_directory_short_summary.sql`.
+
+- **Bound:** `char_length(short_summary) <= 1000`, a CHECK in the database and the
+  same bound (in code points) in the writer. Over-length text is refused, not cut.
+- **Scrubbed only:** `src/hoopdb/session-directory-summary.ts` is the only write path.
+  It runs the shared `lib/scrub.ts` scrubber, refuses if the scrub throws or is not
+  stable on its own output, and records `short_summary_scrub_ruleset` and
+  `short_summary_scrub_version` (the raw-chunk `SCRUB_RULESET` pair) plus
+  `short_summary_source` and `short_summary_generated_at`. The database rejects a
+  summary without that provenance, and an older `generated_at` never replaces a newer one.
+- **Search document:** `sessions.session_directory_search_text(...)` is the one
+  definition of `search_text`; the summary is its last field. The writer rebuilds
+  `search_text` with it, and the future projector must use the same function.
+  Tenant-scoped summary search is `SESSION_DIRECTORY_QUERIES.summaryContains`, with
+  at least three characters (`summaryContainsPattern`).
+- **Deletion:** a tombstone (`deleted_at` set) clears the summary, its provenance and
+  `search_text` through a trigger, backed by a CHECK. Erasure deletes the row. As
+  below, PostgreSQL WAL, replicas and backups keep their own copies until retention
+  ages them out; that is accepted for this bounded, scrubbed field and is why
+  nothing larger goes here.
+- **Not here:** long summaries (encrypted Locker objects), transcripts, embeddings,
+  pgvector, tsvector.
+- **Rollback:** `supabase/rollbacks/20261030020000_session_directory_short_summary.down.sql`
+  rebuilds `search_text` without the summary, then drops the columns, trigger,
+  functions and index (tested up, down, up).
+- **RLS caveat:** under RLS only LEAKPROOF operators become index conditions, and
+  `ILIKE` is not one. As the `authenticated` role, `summaryContains` (like the
+  existing `metadataContains` and `projectContains`) plans as a sequential scan. The
+  plan test runs as a role that bypasses RLS, with the tenant predicate in the query,
+  as the other plan tests do. A server must run these searches that way (or through a
+  reviewed SECURITY DEFINER function) for the index to apply.
 
 Consequently `search_shared_sessions`, `/v1/events?q=`, and dashboard transcript
 search cannot be implemented by silently querying `session_directory`. They remain
