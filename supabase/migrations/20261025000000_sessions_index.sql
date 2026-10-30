@@ -143,7 +143,11 @@ CREATE INDEX si_session ON sessions.session_index (org_id, session_id);
 -- Pipeline tracing: trace_id -> session.
 CREATE INDEX si_trace ON sessions.session_index (trace_id);
 
-CREATE TABLE sessions.machines (
+-- RelayHistory owns a sessions.machines with the same key (org_id, machine_id)
+-- and complementary columns, and its runner may have created it first on the
+-- shared Supabase project. Create it if absent, then add this product's
+-- columns either way (20261030000000 adds RelayHistory's).
+CREATE TABLE IF NOT EXISTS sessions.machines (
   org_id text NOT NULL,
   machine_id text NOT NULL,
   machine_name text,
@@ -154,6 +158,10 @@ CREATE TABLE sessions.machines (
   last_seen_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT machines_pkey PRIMARY KEY (org_id, machine_id)
 );
+ALTER TABLE sessions.machines
+  ADD COLUMN IF NOT EXISTS machine_name text,
+  ADD COLUMN IF NOT EXISTS hostname_aliases text[] NOT NULL DEFAULT '{}',
+  ADD COLUMN IF NOT EXISTS client_version text;
 
 -- One row per span event of the pipeline, keyed to a session by trace_id. This is
 -- the single event table for both the index and observability/DLQ (W9) work.

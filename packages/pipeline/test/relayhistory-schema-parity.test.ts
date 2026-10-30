@@ -19,11 +19,11 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
-const ROOT = new URL("../../../", import.meta.url);
+const ROOT = new URL("../../../", import.meta.url).href;
 const read = (path: string) =>
-  readFileSync(fileURLToPath(new URL(path, ROOT)), "utf8");
+  readFileSync(fileURLToPath(new URL(path, ROOT).href), "utf8");
 const sqlFiles = (dir: string) =>
-  readdirSync(fileURLToPath(new URL(dir, ROOT)))
+  readdirSync(fileURLToPath(new URL(dir, ROOT).href))
     .filter((file) => file.endsWith(".sql"))
     .sort()
     .map((file) => ({ name: file, sql: read(`${dir}${file}`) }));
@@ -224,6 +224,61 @@ describe("RelayHistory schema on the Supabase sessions project", () => {
       const source = await catalog(await database(legacy));
       const target = await catalog(await database(...sets));
       expect(gaps(source, target)).toEqual([]);
+    },
+    120_000,
+  );
+
+  it.each([
+    ["legacy, then 96Bulls", [legacy, bulls]],
+    ["96Bulls, then legacy", [bulls, legacy]],
+  ] as const)(
+    "%s: both products write the shared machines row; tenants see only pipeline columns",
+    async (_order, sets) => {
+      const db = await database(...sets);
+      await db.query(
+        `INSERT INTO sessions.machines
+           (org_id, workspace_id, machine_id, hostname, label, os, relayhistory_version, cursors_json)
+         VALUES ('org-a', 'ws-a', 'm-1', 'host-1', 'laptop', 'darwin', '1.2.3', '{"claude":"c1"}')`,
+      );
+      await db.query(
+        `SELECT sessions.upsert_machine('org-a', 'm-1', 'laptop', 'host-2', 'darwin', '0.4.0', now())`,
+      );
+      await db.query(
+        `SELECT sessions.upsert_machine('org-a', 'm-2', null, 'host-3', 'linux', '0.4.0', now())`,
+      );
+      const machines = await rows<Record<string, unknown>>(
+        db,
+        `SELECT machine_id, workspace_id, hostname, cursors_json, hostname_aliases, client_version
+           FROM sessions.machines ORDER BY machine_id`,
+      );
+      expect(machines).toEqual([
+        {
+          machine_id: "m-1",
+          workspace_id: "ws-a",
+          hostname: "host-1",
+          cursors_json: { claude: "c1" },
+          hostname_aliases: ["host-2"],
+          client_version: "0.4.0",
+        },
+        {
+          machine_id: "m-2",
+          workspace_id: "default",
+          hostname: null,
+          cursors_json: {},
+          hostname_aliases: ["host-3"],
+          client_version: "0.4.0",
+        },
+      ]);
+      const privilege = async (column: string) =>
+        (
+          await rows<{ ok: boolean }>(
+            db,
+            `SELECT has_column_privilege('authenticated', 'sessions.machines', '${column}', 'SELECT') AS ok`,
+          )
+        )[0]!.ok;
+      expect(await privilege("machine_name")).toBe(true);
+      for (const column of ["cursors_json", "hostname", "label", "workspace_id"])
+        expect(await privilege(column)).toBe(false);
     },
     120_000,
   );
