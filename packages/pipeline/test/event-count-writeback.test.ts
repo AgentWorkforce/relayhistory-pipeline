@@ -194,6 +194,18 @@ describe("around the fence", () => {
     expect((await stored()).event_count).toBe(3);
   });
 
+  it("moves the fence to a new revision with identical content and the same object", async () => {
+    await index(1);
+    await write({ count: 42 });
+    await index(2);
+    expect(await write({ revision: 2, workKey: `${MANIFEST_KEY}@etag-2`, count: 42 })).toBe("applied");
+    expect(await stored()).toMatchObject({
+      event_count: 42,
+      event_count_revision: 2,
+      event_count_work_key: `${MANIFEST_KEY}@etag-2`,
+    });
+  });
+
   it("keeps the count when the index stage sends a chunk sum, then fails the gate until counted", async () => {
     await index(1);
     await write({ count: 42 });
