@@ -845,9 +845,29 @@ describe("raw store configuration", () => {
     expect(rawStoreFromEnv(env)).toBeUndefined();
     expect(rawStoreFromEnv({ ...env, PIPELINE_RAW_PROVIDER: "azure" })).toBeUndefined();
     expect(logs.join("\n")).toContain("PIPELINE_RAW_PROVIDER");
-    expect(logs.join("\n")).toContain("s3 | r2");
+    expect(logs.join("\n")).toContain("gcs without HMAC keys");
+    expect(logs.join("\n")).toContain("s3 | r2 | gcs");
     expect(logs.join("\n")).not.toContain("AKIA_BOUNDARY_KEY");
     expect(logs.join("\n")).not.toContain("SECRET_BOUNDARY_VALUE");
+  });
+
+  it("selects a GCS store when no HMAC key is set", () => {
+    const raw = rawStoreFromEnv({
+      PIPELINE_RAW_S3_BUCKET: "proof-bucket",
+      PIPELINE_RAW_PROVIDER: "gcs",
+    });
+    expect(raw?.provider).toBe("gcs");
+    expect(raw?.bucket).toBe("proof-bucket");
+    expect(raw?.store.backend).toBe("gcs");
+    expect(
+      rawStoreFromEnv({
+        PIPELINE_RAW_S3_BUCKET: "proof-bucket",
+        PIPELINE_RAW_PROVIDER: "gcs",
+        PIPELINE_RAW_GCS_TOKEN_URI: "http://evil.example/token?secret=SUPERSECRET",
+      }),
+    ).toBeUndefined();
+    expect(logs.join("\n")).not.toContain("SUPERSECRET");
+    expect(logs.join("\n")).not.toContain("evil.example");
   });
 });
 

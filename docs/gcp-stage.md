@@ -57,15 +57,18 @@ The 96Bulls runtime selects its Locker in `src/shared/locker-selection.ts`.
 Unset `LOCKER_PROVIDER` stays S3, which is local MinIO, production AWS S3, and
 the EKS proof. `LOCKER_PROVIDER=gcs` builds the GCS adapter and takes a token
 from the GKE metadata server. HMAC keys on GCS are refused, and an S3 client
-pointed at `storage.googleapis.com` is refused. That selection is unit-tested. `rawStoreFromEnv` still constructs only S3
-or R2. An unset provider stays S3. `gcs` and any other name return
-unconfigured instead of being relabeled as S3. The GCS store is selected
-only by the Locker runtime, not by that unfrozen pipeline helper.
+pointed at `storage.googleapis.com` is refused. `rawStoreFromEnv` follows that
+choice: unset and `s3` stay S3, `r2` stays R2, and `PIPELINE_RAW_PROVIDER=gcs`
+builds the GCS adapter when the bucket is set and HMAC keys are absent. Any
+other name stays unconfigured.
 
-The GCP stack still does not install 96Bulls. Setting `bulls96.enabled=true`
-fails before any resource is declared. The chart is not given
-`LOCKER_PROVIDER=gcs` or a Workload Identity binding. Production is not this
-lane: production database is Supabase and production object storage is AWS S3.
+`bulls96.enabled` installs the chart when the managed data plane is provisioned
+and the chart version, tenant org id, and existing Secret name are set. The
+release turns off in-chart MinIO and CloudNativePG, uses pod identity, and
+passes the bucket, Cloud SQL connection name, Redis host, and Pub/Sub names.
+`/readyz` also checks that data path when `LOCKER_PROVIDER=gcs` or
+`WORKER_DATA_PATH_PROBE=1`. Production is not this lane: the production
+database is Supabase and production object storage is AWS S3.
 
 Relayfile and Relayflows remain opt-in add-ons. Relayfile needs its own
 externally populated Kubernetes Secret and database URL. Relayflows needs an
@@ -117,43 +120,32 @@ the resulting load balancer before certificate issuance can complete.
 
 These are the current code facts. They are not a cloud proof.
 
-Cloud SQL private network, in `stacks/gcp/cloud-sql.ts` and
-`@alchemy.run/gcp@2.0.0-beta.84` `GCP.SQL.Instance`:
+Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
 
-- `InstanceProps` exposes `ipv4Enabled` and does not expose a private network,
-  allocated IP range, Private Service Connect, or authorized-network field.
-  The implementation writes only `ipConfiguration.ipv4Enabled`.
-- The stack does not declare a Cloud SQL instance, database, or Auth Proxy.
-  `cloudSqlPlan` returns `declare: false` for this pin. A public instance is
-  refused. `managedDataPlane.sql` is `null`.
-- The supported attachment, used only when a future provider reports
-  `privateNetwork: true`, is `ipv4Enabled: false`, the VPC network, the
-  Private Service Access range name, and proxy args `--private-ip`,
-  `--address=0.0.0.0`, `--port=5432`. Even that branch throws before
-  `GCP.SQL.Instance` because the resource still cannot accept `privateNetwork`.
-- A Private Service Access range is declared (`purpose: "VPC_PEERING"`, prefix
-  length 20) and a `GCP.ServiceNetworking.Connection` consumes it. Memorystore
-  uses that range (`connectMode: "PRIVATE_SERVICE_ACCESS"`,
-  `reservedIpRange` set to the range name). Cloud SQL does not.
-- This remains a proof blocker. The lane has no private Cloud SQL path until
-  the provider passes `privateNetwork` through.
+- `privateCloudSqlSpec` builds the private-only insert body: `ipv4Enabled`
+  false, `privateNetwork` set to `/projects/{project}/global/networks/{name}`,
+  `allocatedIpRange` set to the PSA range name, and no authorized networks.
+  Proxy args are `--private-ip`, `--address=0.0.0.0`, `--port=5432`, and the
+  connection name.
+- `@alchemy.run/gcp@2.0.0-beta.84` `GCP.SQL.Instance` still writes only
+  `ipv4Enabled`. The stack does not call it. `posted` is false, so apply does
+  not create the instance until a resource posts that body.
+- When 96Bulls is installed, the Auth Proxy Deployment uses those args. The
+  PSA range is still shared with Memorystore.
 
-Managed services that are declared and not consumed:
+Release wiring that has not been applied:
 
-- The GCS Locker bucket and `roles/storage.objectUser` binding exist only when
-  the stack is applied. No 96Bulls workload is rendered, so nothing sets
-  `LOCKER_PROVIDER=gcs` or `LOCKER_BUCKET` in-cluster. `charts.bulls96` is
-  `null`.
-- Memorystore Redis 7.2 and the Pub/Sub topic, subscription, and dead-letter
-  topic are created only when `managedDataPlane.provision` is true and
-  `acknowledgement` is `adapter-proof-only`. Their names are returned on the
-  stack output and are not passed into the Relaycast, RelayAuth, Relayfile,
-  or Relayflows values. Cloud SQL is not among them.
+- With `bulls96.enabled`, the Helm release gets the GCS bucket, the Cloud SQL
+  connection name, the Redis host and port, and the Pub/Sub topic and
+  subscription. HMAC keys, Redis AUTH, and the database URL are not in values.
+  `HOOPDB_URL` stays in the named Secret.
+- `/readyz` and `/datapathz` check that data path only when the probe is armed.
+  The S3 default is unchanged.
 - Relaycast stays `replicaCount: 1`, `runtime.backend: sqlite`, and
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
   is written.
-- Relayflows stays standalone and is not on Relaycast's availability path.
+- No create, write, read, search, replay, or teardown has run on GCP.
 
 ## Proof plan
 

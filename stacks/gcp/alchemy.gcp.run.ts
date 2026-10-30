@@ -2,9 +2,10 @@
  * GCP reference lane for the self-hosted AgentWorkforce stack.
  *
  * This is code-only until Khaliq separately clears a project. It deliberately
- * keeps secret payloads out of Alchemy inputs/state and refuses unsupported
- * runtime claims: Relaycast is single-node SQLite, and 96Bulls remains blocked
- * until its service wiring can select the existing GCS object-store adapter.
+ * keeps secret payloads out of Alchemy inputs/state. Relaycast stays
+ * single-node SQLite. 96Bulls installs only as conformance wiring: GCS,
+ * private Cloud SQL (not posted through GCP.SQL.Instance), Redis, and Pub/Sub.
+ * Production stays Supabase and AWS S3.
  */
 import * as Alchemy from "alchemy";
 import { Stage } from "alchemy";
@@ -18,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import {
   GCP_CONFIRM_PROJECT_ENV,
   assertGcpInputs,
+  bulls96ReleaseValues,
   relayauthChartValues,
   relaycastChartValues,
   relayfileChartValues,
@@ -25,7 +27,7 @@ import {
   type GcpInputs,
 } from "./config.ts";
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "./deploy-guard.ts";
-import { ALCHEMY_GCP_BETA_84_SQL, cloudSqlPlan } from "./cloud-sql.ts";
+import { ALCHEMY_GCP_BETA_84_SQL, cloudSqlProxyWorkload, privateCloudSqlSpec } from "./cloud-sql.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
@@ -80,6 +82,15 @@ export default Alchemy.Stack(
     );
     const chartRepo = i.chartRepo ?? DEFAULT_CHART_REPO;
     const storageClass = i.chartStorageClass ?? "standard-rwo";
+    const networkName = compactName(stage, "vpc", 63);
+    const psaName = compactName(stage, "psa", 63);
+    const runtimeAccountId = compactName(stage, "runtime", 30);
+    const runtimeEmail = `${runtimeAccountId}@${i.projectId}.iam.gserviceaccount.com`;
+    const lockerBucket = `${compactName(stage, "locker", 30)}-${i.projectId}`.slice(0, 63).replace(/-$/, "");
+    const eventsTopicId = compactName(stage, "events", 63);
+    const eventsSubscriptionId = compactName(stage, "events-worker", 63);
+    const eventsTopicName = `projects/${i.projectId}/topics/${eventsTopicId}`;
+    const eventsSubscriptionName = `projects/${i.projectId}/subscriptions/${eventsSubscriptionId}`;
 
     // Keep project-level APIs enabled on destroy because they may be shared by
     // other stacks. Service Usage itself is the one bootstrap prerequisite.
@@ -103,7 +114,7 @@ export default Alchemy.Stack(
     }
 
     const network = yield* GCP.Compute.Network("network", {
-      networkName: compactName(stage, "vpc", 63),
+      networkName,
       autoCreateSubnetworks: false,
       routingMode: "REGIONAL",
       description: `AgentWorkforce ${stage} private network`,
@@ -137,7 +148,7 @@ export default Alchemy.Stack(
     });
 
     const psaRange = yield* GCP.Compute.GlobalAddress("private-services-range", {
-      addressName: compactName(stage, "psa", 63),
+      addressName: psaName,
       addressType: "INTERNAL",
       purpose: "VPC_PEERING",
       network: network.networkName,
@@ -182,7 +193,7 @@ export default Alchemy.Stack(
     });
 
     const locker = yield* GCP.Storage.Bucket("locker", {
-      bucketName: `${compactName(stage, "locker", 30)}-${i.projectId}`.slice(0, 63).replace(/-$/, ""),
+      bucketName: lockerBucket,
       location: i.region,
       storageClass: "STANDARD",
       versioning: true,
@@ -206,14 +217,14 @@ export default Alchemy.Stack(
     });
 
     const runtimeIdentity = yield* GCP.IAM.ServiceAccount("runtime-identity", {
-      accountId: compactName(stage, "runtime", 30),
+      accountId: runtimeAccountId,
       displayName: `AgentWorkforce ${stage} runtime`,
       description: "Workload Identity target for managed data-plane clients",
     });
     for (const [namespace, serviceAccount] of [
       ["96bulls", "96bulls-worker"],
       ["96bulls", "96bulls-alleyoop"],
-      ["agentworkforce-system", "cloud-sql-proxy"],
+      ["96bulls", "cloud-sql-proxy"],
     ] as const) {
       yield* GCP.IAM.Member(`workload-identity-${namespace}-${serviceAccount}`, {
         kind: "iam.serviceAccount",
@@ -243,17 +254,21 @@ export default Alchemy.Stack(
 
     const dataPlane = i.managedDataPlane.provision
       ? yield* Effect.gen(function* () {
-          // No Cloud SQL resource. The pinned provider cannot attach a private
-          // network, and this stack will not declare a public instance.
-          const sqlPlan = cloudSqlPlan(
-            { network: network.networkName, allocatedIpRange: psaRange.addressName },
-            ALCHEMY_GCP_BETA_84_SQL,
-          );
-          if (sqlPlan.declare) {
+          // The private body is specified here. GCP.SQL.Instance would drop
+          // privateNetwork, so it is not called and the instance is not posted.
+          if (ALCHEMY_GCP_BETA_84_SQL.privateNetwork)
             throw new Error(
-              "96bulls: private Cloud SQL attachment is specified, but GCP.SQL.Instance cannot accept privateNetwork. Nothing was created.",
+              "96bulls: Alchemy reports privateNetwork support. Review the insert body before posting it. Nothing was created.",
             );
-          }
+          const sql = privateCloudSqlSpec({
+            projectId: i.projectId,
+            region: i.region,
+            instanceName: compactName(stage, "postgres", 63),
+            networkName,
+            allocatedIpRange: psaName,
+            tier: i.managedDataPlane.cloudSqlTier,
+            highAvailability: i.managedDataPlane.cloudSqlHa === true,
+          });
           const redis = yield* GCP.Redis.Instance("redis", {
             instanceId: compactName(stage, "redis"),
             location: i.region,
@@ -277,12 +292,12 @@ export default Alchemy.Stack(
             messageRetentionDuration: "604800s",
           });
           const events = yield* GCP.PubSub.Topic("events", {
-            topicId: compactName(stage, "events", 63),
+            topicId: eventsTopicId,
             labels: labels(stage, "queue"),
             messageRetentionDuration: "604800s",
           });
           const subscription = yield* GCP.PubSub.Subscription("events-worker", {
-            subscriptionId: compactName(stage, "events-worker", 63),
+            subscriptionId: eventsSubscriptionId,
             topic: events.name,
             labels: labels(stage, "queue"),
             ackDeadlineSeconds: 60,
@@ -305,9 +320,13 @@ export default Alchemy.Stack(
           }
 
           return {
-            sql: null,
+            sql,
             redis: { host: redis.host, port: redis.port },
-            pubsub: { topic: events.name, subscription: subscription.name, deadLetters: deadLetters.name },
+            pubsub: {
+              topic: eventsTopicName,
+              subscription: eventsSubscriptionName,
+              deadLetters: deadLetters.name,
+            },
           };
         })
       : null;
@@ -385,6 +404,40 @@ export default Alchemy.Stack(
         })
       : null;
 
+    const bulls96 = i.bulls96?.enabled
+      ? yield* Effect.gen(function* () {
+          if (!dataPlane)
+            throw new Error("96bulls: 96Bulls install requires the managed data plane. Nothing was created.");
+          yield* Kubernetes.Manifest("96bulls-namespace", {
+            cluster,
+            manifest: { apiVersion: "v1", kind: "Namespace", metadata: { name: "96bulls" } },
+          });
+          const proxy = cloudSqlProxyWorkload(dataPlane.sql, runtimeEmail);
+          yield* Kubernetes.Manifest("cloud-sql-proxy-account", { cluster, manifest: proxy.serviceAccount });
+          yield* Kubernetes.Manifest("cloud-sql-proxy-service", { cluster, manifest: proxy.service });
+          yield* Kubernetes.Manifest("cloud-sql-proxy", { cluster, manifest: proxy.deployment });
+          const release = yield* Kubernetes.HelmChart("96bulls", {
+            cluster,
+            chart: "96bulls",
+            repo: chartRepo,
+            version: i.bulls96!.chartVersion,
+            releaseName: "96bulls",
+            namespace: "96bulls",
+            values: bulls96ReleaseValues(i.bulls96!, {
+              bucket: lockerBucket,
+              region: i.region,
+              cloudSqlConnectionName: dataPlane.sql.connectionName,
+              redisHost: dataPlane.redis.host,
+              redisPort: dataPlane.redis.port,
+              pubsubTopic: eventsTopicName,
+              pubsubSubscription: eventsSubscriptionName,
+              workloadIdentityEmail: runtimeEmail,
+            }),
+          });
+          return release.releaseName;
+        })
+      : null;
+
     return {
       stage,
       projectId: i.projectId,
@@ -400,7 +453,7 @@ export default Alchemy.Stack(
         relayauth: relayauth?.releaseName ?? null,
         relayfile: relayfile?.releaseName ?? null,
         relayflows: relayflows?.releaseName ?? null,
-        bulls96: null,
+        bulls96: bulls96 ?? null,
       },
     };
   }),

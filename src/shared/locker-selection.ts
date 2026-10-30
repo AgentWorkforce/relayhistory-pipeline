@@ -3,8 +3,8 @@
  * production AWS S3, and the EKS self-host proof. GCS is selected only by
  * LOCKER_PROVIDER=gcs and uses Workload Identity, never HMAC keys.
  *
- * This does not change the unfrozen pipeline rawStoreFromEnv contract, which
- * still constructs only S3 or R2.
+ * rawStoreFromEnv follows the same choice: unset and s3 stay S3, and gcs builds
+ * the GCS adapter without HMAC keys.
  */
 
 export type LockerProvider = "s3" | "gcs";

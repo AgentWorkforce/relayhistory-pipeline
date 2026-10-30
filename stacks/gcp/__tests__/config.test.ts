@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   assertGcpInputs,
+  bulls96ReleaseValues,
   relayauthChartValues,
   relaycastChartValues,
   relayfileChartValues,
@@ -47,13 +48,87 @@ describe("GCP self-host contract", () => {
     ).toThrow("unsafe or invalid control-plane CIDR");
   });
 
-  it("fails closed when asked to install 96Bulls before GCS is wired into the services", () => {
+  it("installs 96Bulls only with the managed data plane and non-secret chart inputs", () => {
+    const bulls96 = {
+      enabled: true,
+      chartVersion: "0.3.0",
+      tenantOrgId: "org_123",
+      existingSecretName: "bulls96-runtime",
+    };
+    expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96 })).toThrow("managedDataPlane.provision");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
-        bulls96: { enabled: true, chartVersion: "0.3.0" },
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, tenantOrgId: "https://user:password@example.com" },
       }),
-    ).toThrow("does not install the chart");
+    ).toThrow("org id");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96,
+      }),
+    ).not.toThrow();
+  });
+
+  it("wires GCS, SQL, Redis, and Pub/Sub into the Helm release without secrets", () => {
+    const values = bulls96ReleaseValues(
+      {
+        enabled: true,
+        chartVersion: "0.3.0",
+        tenantOrgId: "org_123",
+        existingSecretName: "bulls96-runtime",
+      },
+      {
+        bucket: "awf-dev-locker-agentworkforce-dev1",
+        region: "us-central1",
+        cloudSqlConnectionName: "agentworkforce-dev1:us-central1:awf-dev-postgres",
+        redisHost: "10.52.0.3",
+        redisPort: 6379,
+        pubsubTopic: "projects/agentworkforce-dev1/topics/awf-dev-events",
+        pubsubSubscription: "projects/agentworkforce-dev1/subscriptions/awf-dev-events-worker",
+        workloadIdentityEmail: "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
+      },
+    );
+    const rendered = JSON.stringify(values);
+    expect(values).toMatchObject({
+      hoopdb: { enabled: false },
+      locker: { enabled: false },
+      worker: {
+        locker: { bucket: "awf-dev-locker-agentworkforce-dev1", credentials: { mode: "podIdentity" } },
+        hoopdb: { existingSecret: "bulls96-runtime", key: "HOOPDB_URL" },
+      },
+    });
+    expect(rendered).toContain("LOCKER_PROVIDER");
+    expect(rendered).toContain('"gcs"');
+    expect(rendered).toContain("CLOUD_SQL_CONNECTION_NAME");
+    expect(rendered).toContain("REDIS_HOST");
+    expect(rendered).toContain("PUBSUB_TOPIC");
+    expect(rendered).toContain("WORKER_DATA_PATH_PROBE");
+    expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
+    expect(rendered).not.toContain("REDIS_AUTH");
+    expect(rendered).not.toMatch(/password|BEGIN |hmac/i);
+    expect(() =>
+      bulls96ReleaseValues(
+        {
+          enabled: true,
+          chartVersion: "0.3.0",
+          tenantOrgId: "org_123",
+          existingSecretName: "bulls96-runtime",
+        },
+        {
+          bucket: "locker",
+          region: "us-central1",
+          cloudSqlConnectionName: "postgres://user:secret@127.0.0.1/hoopdb",
+          redisHost: "10.52.0.3",
+          redisPort: 6379,
+          pubsubTopic: "projects/agentworkforce-dev1/topics/events",
+          pubsubSubscription: "projects/agentworkforce-dev1/subscriptions/events",
+          workloadIdentityEmail: "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
+        },
+      ),
+    ).toThrow("Nothing was created.");
   });
 
   it("keeps Relaycast on the released single-writer SQLite profile", () => {

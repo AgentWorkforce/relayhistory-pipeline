@@ -55,8 +55,16 @@ export interface GcpInputs {
   relayauth?: RelayAuthChartInputs;
   relayfile?: RelayfileChartInputs;
   relayflows?: RelayflowsChartInputs;
-  /** Intentionally unsupported until the 96Bulls runtime selects GCS. */
-  bulls96?: { enabled: boolean; chartVersion: string };
+  /**
+   * Conformance install of the 96Bulls chart. Allowed only with the managed
+   * data plane. Secret payloads stay in `existingSecretName`.
+   */
+  bulls96?: {
+    enabled: boolean;
+    chartVersion: string;
+    tenantOrgId: string;
+    existingSecretName: string;
+  };
 }
 
 const PROJECT_ID = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
@@ -148,10 +156,19 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     if (!KUBERNETES_NAME.test(inputs.relayflows.flowConfigMap))
       throw new Error("96bulls: relayflows.flowConfigMap must be a Kubernetes ConfigMap name");
   }
-  if (inputs.bulls96?.enabled)
-    throw new Error(
-      "96bulls: the GCP 96Bulls add-on is blocked: the runtime can select GCS, but this stack does not install the chart or inject LOCKER_PROVIDER=gcs and Workload Identity",
-    );
+  if (inputs.bulls96?.enabled) {
+    if (!inputs.managedDataPlane.provision)
+      throw new Error(
+        "96bulls: bulls96.enabled requires managedDataPlane.provision with acknowledgement=adapter-proof-only",
+      );
+    requireSemver("bulls96.chartVersion", inputs.bulls96.chartVersion);
+    const [major, minor] = inputs.bulls96.chartVersion.split(".").map(Number);
+    if (!(major! > 0 || (major === 0 && minor! >= 3)))
+      throw new Error("96bulls: bulls96.chartVersion must be 0.3.0 or newer so the worker chart accepts pod identity and extraEnv");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(inputs.bulls96.tenantOrgId))
+      throw new Error("96bulls: bulls96.tenantOrgId must be an org id, never a URL or credential");
+    requireSecretName("bulls96.existingSecretName", inputs.bulls96.existingSecretName);
+  }
 }
 
 export function relaycastChartValues(i: RelaycastChartInputs, defaultStorageClass = "standard-rwo") {
@@ -202,6 +219,86 @@ export function relayfileChartValues(i: RelayfileChartInputs) {
     secrets: { existingSecret: i.existingSecretName },
     auth: { jwksUrl: i.relayauthJwksUrl },
     ingress: { enabled: false },
+  };
+}
+
+export interface Bulls96ReleaseOutputs {
+  bucket: unknown;
+  region: string;
+  cloudSqlConnectionName: string;
+  redisHost: unknown;
+  redisPort: unknown;
+  pubsubTopic: unknown;
+  pubsubSubscription: unknown;
+  workloadIdentityEmail: string;
+}
+
+const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
+
+function plainSetting(label: string, value: unknown): void {
+  if (typeof value !== "string") return;
+  if (value.includes("://") || value.includes("@") || value.includes("BEGIN "))
+    throw new Error(`96bulls: ${label} must not carry a URL, credential, or key. Nothing was created.`);
+}
+
+/**
+ * Non-secret outputs for the published 96bulls chart. In-chart MinIO and
+ * CloudNativePG stay off. HOOPDB_URL remains a key in the existing Secret.
+ * Redis AUTH and HMAC keys are not accepted here.
+ */
+export function bulls96ReleaseValues(
+  i: NonNullable<GcpInputs["bulls96"]>,
+  managed: Bulls96ReleaseOutputs,
+): Record<string, unknown> {
+  if (!GSA_EMAIL.test(managed.workloadIdentityEmail))
+    throw new Error("96bulls: workload identity email is not a service-account email. Nothing was created.");
+  for (const [label, value] of [
+    ["bucket", managed.bucket],
+    ["region", managed.region],
+    ["cloudSqlConnectionName", managed.cloudSqlConnectionName],
+    ["redisHost", managed.redisHost],
+    ["pubsubTopic", managed.pubsubTopic],
+    ["pubsubSubscription", managed.pubsubSubscription],
+  ] as const) {
+    plainSetting(label, value);
+  }
+  if (typeof managed.redisPort === "string" && !/^[0-9]+$/.test(managed.redisPort))
+    throw new Error("96bulls: redis port must be numeric. Nothing was created.");
+  const redisPort = typeof managed.redisPort === "number" ? String(managed.redisPort) : managed.redisPort;
+  const identity = { "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail };
+  const extraEnv = [
+    { name: "LOCKER_PROVIDER", value: "gcs" },
+    { name: "PIPELINE_RAW_PROVIDER", value: "gcs" },
+    { name: "PIPELINE_RAW_S3_BUCKET", value: managed.bucket },
+    { name: "CLOUD_SQL_CONNECTION_NAME", value: managed.cloudSqlConnectionName },
+    { name: "REDIS_HOST", value: managed.redisHost },
+    { name: "REDIS_PORT", value: redisPort },
+    { name: "PUBSUB_TOPIC", value: managed.pubsubTopic },
+    { name: "PUBSUB_SUBSCRIPTION", value: managed.pubsubSubscription },
+    { name: "WORKER_DATA_PATH_PROBE", value: "1" },
+  ];
+  const app = {
+    existingSecret: i.existingSecretName,
+    hoopdb: { existingSecret: i.existingSecretName, key: "HOOPDB_URL" },
+    locker: {
+      endpoint: "",
+      bucket: managed.bucket,
+      region: managed.region,
+      credentials: { mode: "podIdentity" },
+    },
+    lockerInit: { enabled: false },
+    migrations: { supabaseShim: true },
+    summaryEncryption: { existingSecret: i.existingSecretName, key: "SUMMARY_MASTER_KEYS" },
+    serviceAccount: { annotations: identity },
+    tenant: { orgId: i.tenantOrgId },
+    extraEnv,
+  };
+  return {
+    global: { tenant: { orgId: i.tenantOrgId } },
+    worker: app,
+    alleyoop: app,
+    hoopdb: { enabled: false },
+    locker: { enabled: false },
   };
 }
 

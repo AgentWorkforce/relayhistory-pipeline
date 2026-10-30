@@ -55,7 +55,7 @@ export function vendorBindings(extra: Record<string, string | undefined> = {}): 
     PIPELINE_RAW_PROVIDER: provider,
     PIPELINE_RAW_S3_BUCKET: locker.bucket,
     // S3 and R2 still consume these names. GCS must not receive HMAC keys;
-    // the pipeline helper then stays unconfigured instead of building an S3 client.
+    // rawStoreFromEnv builds the GCS adapter from the bucket and a metadata token.
     ...(provider === "s3"
       ? {
           PIPELINE_RAW_S3_ENDPOINT: locker.endpoint,
