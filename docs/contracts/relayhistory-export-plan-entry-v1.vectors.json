@@ -1,0 +1,81 @@
+{
+  "contract": "relayhistory-export-plan-entry-v1",
+  "note": "Synthetic ids only. Generated from relayhistory-cloud packages/relayhistory/src/lib/pipeline/migration-assertions.ts; every implementation (#110 RelayAuth, #40 exporter, the ingests) must reproduce these values.",
+  "entry_domain": "relayhistory.export.plan-entry.v1\n",
+  "plan_domain": "relayhistory.export.plan.v1\n",
+  "entries": [
+    {
+      "name": "two-chunk session",
+      "chunks": [
+        {
+          "epoch": 0,
+          "start_offset": 0,
+          "bytes": 4194000,
+          "sha256": "bc94be8d405bbe519e9d806b1ae895b0a07e95f57f2492d312175a588eaeab1c"
+        },
+        {
+          "epoch": 0,
+          "start_offset": 4194000,
+          "bytes": 1234,
+          "sha256": "aeba0a6a51348457def7e70f1a6766d7b655d3e0461f98b7d09d47afd6f1cb82"
+        }
+      ],
+      "entry": {
+        "v": 1,
+        "grant_id": "mgr_00000000000000000000000000000000",
+        "org_id": "org_synthetic",
+        "workspace_id": "ws_synthetic",
+        "source_user_id": "user_synthetic_a",
+        "key": "v1/ws=ws_synthetic/m=machine-a/h=claude/d=2026/10/25/s=session-a/manifest.json",
+        "machine_id": "machine-a",
+        "harness": "claude",
+        "session_id": "session-a",
+        "started_date": "2026-10-25",
+        "content_sha256": "ae06338e9635e6940349cd3996467a103f166db6ee2005151a7512da8c9417c4",
+        "chunk_count": 2,
+        "raw_bytes": 4195234
+      },
+      "canonical_json": "{\"chunk_count\":2,\"content_sha256\":\"ae06338e9635e6940349cd3996467a103f166db6ee2005151a7512da8c9417c4\",\"grant_id\":\"mgr_00000000000000000000000000000000\",\"harness\":\"claude\",\"key\":\"v1/ws=ws_synthetic/m=machine-a/h=claude/d=2026/10/25/s=session-a/manifest.json\",\"machine_id\":\"machine-a\",\"org_id\":\"org_synthetic\",\"raw_bytes\":4195234,\"session_id\":\"session-a\",\"source_user_id\":\"user_synthetic_a\",\"started_date\":\"2026-10-25\",\"v\":1,\"workspace_id\":\"ws_synthetic\"}",
+      "digest_input": "relayhistory.export.plan-entry.v1\n{\"chunk_count\":2,\"content_sha256\":\"ae06338e9635e6940349cd3996467a103f166db6ee2005151a7512da8c9417c4\",\"grant_id\":\"mgr_00000000000000000000000000000000\",\"harness\":\"claude\",\"key\":\"v1/ws=ws_synthetic/m=machine-a/h=claude/d=2026/10/25/s=session-a/manifest.json\",\"machine_id\":\"machine-a\",\"org_id\":\"org_synthetic\",\"raw_bytes\":4195234,\"session_id\":\"session-a\",\"source_user_id\":\"user_synthetic_a\",\"started_date\":\"2026-10-25\",\"v\":1,\"workspace_id\":\"ws_synthetic\"}",
+      "entry_digest": "693e0a065732e7014a1037fd21ac0f6c743ee59d1b8ed6d95f05eca75fb81290",
+      "plan_entry_header": "eyJjaHVua19jb3VudCI6MiwiY29udGVudF9zaGEyNTYiOiJhZTA2MzM4ZTk2MzVlNjk0MDM0OWNkMzk5NjQ2N2ExMDNmMTY2ZGI2ZWUyMDA1MTUxYTc1MTJkYThjOTQxN2M0IiwicmF3X2J5dGVzIjo0MTk1MjM0fQ"
+    },
+    {
+      "name": "one-chunk session, fallback machine id",
+      "chunks": [
+        {
+          "epoch": 0,
+          "start_offset": 0,
+          "bytes": 512,
+          "sha256": "5c294de0de9d05e67c33daec1a2d80576fe47253586e1641ddbf598083d4968e"
+        }
+      ],
+      "entry": {
+        "v": 1,
+        "grant_id": "mgr_00000000000000000000000000000000",
+        "org_id": "org_synthetic",
+        "workspace_id": "ws_synthetic",
+        "source_user_id": "user_synthetic_b",
+        "key": "v1/ws=ws_synthetic/m=unknown-origin-42/h=codex/d=2026/01/02/s=019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18/manifest.json",
+        "machine_id": "unknown-origin-42",
+        "harness": "codex",
+        "session_id": "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
+        "started_date": "2026-01-02",
+        "content_sha256": "972b971dab6ee818f3a033fd9d039fb1d7c2fefcc1dc219c246ff8efe3ae86a0",
+        "chunk_count": 1,
+        "raw_bytes": 512
+      },
+      "canonical_json": "{\"chunk_count\":1,\"content_sha256\":\"972b971dab6ee818f3a033fd9d039fb1d7c2fefcc1dc219c246ff8efe3ae86a0\",\"grant_id\":\"mgr_00000000000000000000000000000000\",\"harness\":\"codex\",\"key\":\"v1/ws=ws_synthetic/m=unknown-origin-42/h=codex/d=2026/01/02/s=019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18/manifest.json\",\"machine_id\":\"unknown-origin-42\",\"org_id\":\"org_synthetic\",\"raw_bytes\":512,\"session_id\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"source_user_id\":\"user_synthetic_b\",\"started_date\":\"2026-01-02\",\"v\":1,\"workspace_id\":\"ws_synthetic\"}",
+      "digest_input": "relayhistory.export.plan-entry.v1\n{\"chunk_count\":1,\"content_sha256\":\"972b971dab6ee818f3a033fd9d039fb1d7c2fefcc1dc219c246ff8efe3ae86a0\",\"grant_id\":\"mgr_00000000000000000000000000000000\",\"harness\":\"codex\",\"key\":\"v1/ws=ws_synthetic/m=unknown-origin-42/h=codex/d=2026/01/02/s=019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18/manifest.json\",\"machine_id\":\"unknown-origin-42\",\"org_id\":\"org_synthetic\",\"raw_bytes\":512,\"session_id\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"source_user_id\":\"user_synthetic_b\",\"started_date\":\"2026-01-02\",\"v\":1,\"workspace_id\":\"ws_synthetic\"}",
+      "entry_digest": "940cbddb6a9cdd365e7a77ff9409916860e4d81c9736a8d0b8203a599e32bab7",
+      "plan_entry_header": "eyJjaHVua19jb3VudCI6MSwiY29udGVudF9zaGEyNTYiOiI5NzJiOTcxZGFiNmVlODE4ZjNhMDMzZmQ5ZDAzOWZiMWQ3YzJmZWZjYzFkYzIxOWMyNDZmZjhlZmUzYWU4NmEwIiwicmF3X2J5dGVzIjo1MTJ9"
+    }
+  ],
+  "plan": {
+    "entry_digests_sorted": [
+      "693e0a065732e7014a1037fd21ac0f6c743ee59d1b8ed6d95f05eca75fb81290",
+      "940cbddb6a9cdd365e7a77ff9409916860e4d81c9736a8d0b8203a599e32bab7"
+    ],
+    "plan_digest": "80fc82ba0b22d939ed9059697c5d1fb47034f585fc84070d91a5e87b21c84d86"
+  }
+}
