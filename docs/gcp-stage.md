@@ -20,10 +20,12 @@ implementations own provider adapters.
 - a regional Secret Manager secret container (metadata only; no payload enters
   inputs or Alchemy state);
 - a least-privilege runtime Google service account and Workload Identity
-  bindings for the known 96Bulls and Cloud SQL proxy service accounts;
+  bindings for the 96Bulls worker and Alleyoop service accounts. The Cloud SQL
+  proxy binding is declared only with the proxy manifests;
 - optionally, a private-only Cloud SQL PostgreSQL 17 specification (not posted),
-  Memorystore Redis 7.2, Pub/Sub with retry/dead-letter handling, and a
-  single-replica Cloud SQL Auth Proxy service;
+  Memorystore Redis 7.2 with AUTH off and TLS server authentication,
+  Pub/Sub with retry/dead-letter handling, and a single-replica Cloud SQL Auth
+  Proxy manifest that is not applied while that instance is unposted;
 - optionally, the Relaycast core chart and RelayAuth, Relayfile, or Relayflows
   charts. Relayflows runs in standalone mode and is not in Relaycast's
   availability path.
@@ -132,15 +134,19 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
 - `@alchemy.run/gcp@2.0.0-beta.84` `GCP.SQL.Instance` still writes only
   `ipv4Enabled`. The stack does not call it. `posted` is false, so apply does
   not create the instance until a resource posts that body.
-- When 96Bulls is installed, the Auth Proxy Deployment uses those args. The
-  PSA range is still shared with Memorystore.
+- The Auth Proxy manifests stay unapplied while `posted` is false. The proxy
+  Workload Identity binding is created with those manifests, not before them.
+  The PSA range is still shared with Memorystore.
+- Stack evaluation throws while `bulls96.enabled` is set. The release values
+  are still a tested pure function. Nothing in that path is applied.
 
 Release wiring that has not been applied:
 
-- With `bulls96.enabled`, the Helm release gets the GCS bucket, the Cloud SQL
-  connection name, the Redis host and port, and the Pub/Sub topic and
-  subscription. HMAC keys, Redis AUTH, and the database URL are not in values.
-  `HOOPDB_URL` stays in the named Secret.
+- The Helm values carry the GCS bucket, the Cloud SQL connection name, the
+  Redis host and port, and the Pub/Sub topic and subscription. Alleyoop gets
+  `auth.jwksUrl`. HMAC keys, Redis AUTH, query strings, and the database URL
+  are not in values. `HOOPDB_URL` stays in the named Secret. Memorystore AUTH
+  is off. The runtime service account is not granted `secretAccessor`.
 - `/readyz` and `/datapathz` check that data path only when the probe is armed.
   The S3 default is unchanged.
 - Relaycast stays `replicaCount: 1`, `runtime.backend: sqlite`, and

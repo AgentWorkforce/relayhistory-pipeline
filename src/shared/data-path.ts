@@ -8,6 +8,8 @@
  * database URL. The verdict names settings only. It does not echo values.
  */
 
+import { trustedGcsEndpoint } from "./locker-selection.ts";
+
 export interface DataPathEnv {
   LOCKER_PROVIDER?: string;
   LOCKER_BUCKET?: string;
@@ -20,7 +22,9 @@ export interface DataPathEnv {
   REDIS_PASSWORD?: string;
   PUBSUB_TOPIC?: string;
   PUBSUB_SUBSCRIPTION?: string;
+  LOCKER_ENDPOINT?: string;
   PIPELINE_RAW_PROVIDER?: string;
+  PIPELINE_RAW_S3_ENDPOINT?: string;
   PIPELINE_RAW_S3_ACCESS_KEY_ID?: string;
   PIPELINE_RAW_S3_SECRET_ACCESS_KEY?: string;
   WORKER_DATA_PATH_PROBE?: string;
@@ -45,6 +49,9 @@ export function dataPathVerdict(env: DataPathEnv): DataPathVerdict {
   const pipelineProvider = env.PIPELINE_RAW_PROVIDER?.trim();
   if (pipelineProvider !== "gcs") missing.push("PIPELINE_RAW_PROVIDER");
   if (env.PIPELINE_RAW_S3_ACCESS_KEY_ID || env.PIPELINE_RAW_S3_SECRET_ACCESS_KEY) missing.push("PIPELINE_HMAC");
+  if (!blank(env.LOCKER_ENDPOINT) && !trustedGcsEndpoint(env.LOCKER_ENDPOINT!)) missing.push("LOCKER_ENDPOINT");
+  if (!blank(env.PIPELINE_RAW_S3_ENDPOINT) && !trustedGcsEndpoint(env.PIPELINE_RAW_S3_ENDPOINT!))
+    missing.push("PIPELINE_RAW_S3_ENDPOINT");
   const connection = env.CLOUD_SQL_CONNECTION_NAME?.trim() ?? "";
   if (!connection || connection.includes("://") || connection.includes("@") || connection.includes(" "))
     missing.push("CLOUD_SQL_CONNECTION_NAME");

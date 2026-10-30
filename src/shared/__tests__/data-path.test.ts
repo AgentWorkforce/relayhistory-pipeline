@@ -41,6 +41,24 @@ describe("data-path readiness", () => {
     }
     expect(JSON.stringify(pipeline)).not.toContain("AKIA_PIPELINE_KEY");
     expect(JSON.stringify(pipeline)).not.toContain("PIPELINE_SECRET_VALUE");
+    const endpoint = dataPathVerdict({
+      ...armed,
+      LOCKER_ENDPOINT: "https://attacker.example/gcs",
+      PIPELINE_RAW_S3_ENDPOINT: "https://storage.googleapis.com/?redirect=attacker",
+    });
+    expect(endpoint.ok).toBe(false);
+    if (!endpoint.ok) {
+      expect(endpoint.missing).toContain("LOCKER_ENDPOINT");
+      expect(endpoint.missing).toContain("PIPELINE_RAW_S3_ENDPOINT");
+    }
+    expect(JSON.stringify(endpoint)).not.toContain("attacker.example");
+    expect(
+      dataPathVerdict({
+        ...armed,
+        LOCKER_ENDPOINT: "https://storage.googleapis.com",
+        PIPELINE_RAW_S3_ENDPOINT: "http://127.0.0.1:4443/storage/v1",
+      }).ok,
+    ).toBe(true);
 
     const dsn = "postgres://hoop:super-secret@127.0.0.1/hoopdb";
     const sql = dataPathVerdict({ ...armed, CLOUD_SQL_CONNECTION_NAME: dsn, REDIS_PASSWORD: "redis-secret" });

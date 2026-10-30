@@ -859,6 +859,13 @@ describe("raw store configuration", () => {
         PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "SUPER_HMAC_VALUE",
       }),
     ).toBeUndefined();
+    expect(
+      rawStoreFromEnv({
+        ...base,
+        PIPELINE_RAW_S3_ENDPOINT: "https://storage.googleapis.com./",
+        PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "SUPER_HMAC_VALUE",
+      }),
+    ).toBeUndefined();
     expect(logs.join("\n")).toContain("PIPELINE_RAW_S3_ENDPOINT");
     expect(logs.join("\n")).not.toContain("SUPER_HMAC_VALUE");
   });
