@@ -19,6 +19,13 @@ import { ctxOf } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { digestRecords, type Summarizer } from "./summarizer.ts";
 import {
+  ShortSummaryRejected,
+  clearShortSummary,
+  writeShortSummary,
+  type SessionDirectoryKey,
+  type ShortSummaryInput,
+} from "../hoopdb/session-directory-summary.ts";
+import {
   clearSummaryObject,
   summaryObjectKey,
   writeSummaryObject,
@@ -35,6 +42,21 @@ export interface BobCostasDeps {
   summarizer: Summarizer;
   keyring: WorkspaceKeyring;
   now?: () => Date;
+  /** The session_directory short_summary projection; defaults to the SQL writer on `db`. */
+  directory?: ShortSummaryDirectory;
+}
+
+/** Where Bob Costas publishes the bounded, scrubbed short summary for search (G6). */
+export interface ShortSummaryDirectory {
+  write(input: ShortSummaryInput): Promise<{ written: boolean }>;
+  clear(key: SessionDirectoryKey): Promise<boolean>;
+}
+
+export function sqlShortSummaryDirectory(db: HoopDb): ShortSummaryDirectory {
+  return {
+    write: (input) => writeShortSummary(db, input),
+    clear: (key) => clearShortSummary(db, key),
+  };
 }
 
 /** SHA-256 of the manifest as indexed: the `summary-manifest` fence for the object. */
@@ -160,6 +182,29 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
       throw err;
     } finally {
       client.release();
+    }
+    // G6: the short summary also feeds the tenant-scoped directory search. The writer
+    // re-scrubs and bounds it and records provenance; a refused summary is logged by
+    // reason only (the encrypted object above is unaffected), and any other summary
+    // status clears a stale one.
+    if (kind === "short") {
+      const directory = deps.directory ?? sqlShortSummaryDirectory(deps.db);
+      const dirKey = { orgId: message.ctx.orgId, workspaceId: s.workspace_id, harness: s.harness, sessionId: s.session_id };
+      if (outcome.status === "ready") {
+        try {
+          await directory.write({
+            ...dirKey,
+            summary: outcome.summary!,
+            source: `bob-costas/${outcome.model}`,
+            generatedAt: new Date(record.built_at),
+          });
+        } catch (err) {
+          if (!(err instanceof ShortSummaryRejected)) throw err;
+          log.info("short summary not projected", { stage: "summary-short", reason: err.reason, trace_id: m.trace_id });
+        }
+      } else {
+        await directory.clear(dirKey);
+      }
     }
     // Ids, counts and statuses only: never the summary or the model's output.
     recorder.log.info("summary written", { kind, status: outcome.status, tokens_in: outcome.tokensIn, tokens_out: outcome.tokensOut });

@@ -17,6 +17,7 @@ REVOKE SELECT ON sessions.session_directory FROM authenticated;
 GRANT SELECT ON sessions.session_directory TO authenticated;
 
 DROP FUNCTION IF EXISTS sessions.search_session_directory(text, text);
+DROP FUNCTION IF EXISTS sessions.session_directory_search_query(text);
 DO $role$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'session_directory_search_worker') THEN

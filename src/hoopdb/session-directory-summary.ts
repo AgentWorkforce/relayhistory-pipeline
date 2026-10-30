@@ -14,6 +14,7 @@
  */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { SCRUB_RULESET, SCRUB_RULESET_VERSION, scrubText } from "../shared/vendor.ts";
+import { meaningfulChars } from "./search-query.ts";
 
 /** Hard bound, in Unicode code points (PostgreSQL `char_length`). */
 export const SHORT_SUMMARY_MAX_CHARS = 1000;
@@ -67,7 +68,9 @@ export function scrubShortSummary(
   scrub: (value: string) => string = scrubText,
 ): ScrubbedShortSummary {
   const trimmed = summary.trim();
-  if (trimmed === "") throw new ShortSummaryRejected("empty");
+  // Blank-looking text (only Unicode spaces, format characters or combining marks)
+  // is empty under the same rule the search query uses.
+  if (meaningfulChars(trimmed) === 0) throw new ShortSummaryRejected("empty");
   // Refuse rather than truncate: a cut can split a credential below the scrubber's
   // match length, and a silently shortened summary is not what the producer wrote.
   if (codePoints(trimmed) > SHORT_SUMMARY_MAX_CHARS) throw new ShortSummaryRejected("over_length");
@@ -82,7 +85,7 @@ export function scrubShortSummary(
     throw new ShortSummaryRejected("scrub_failed");
   }
   text = text.trim();
-  if (text === "") throw new ShortSummaryRejected("empty");
+  if (meaningfulChars(text) === 0) throw new ShortSummaryRejected("empty");
   if (codePoints(text) > SHORT_SUMMARY_MAX_CHARS) throw new ShortSummaryRejected("over_length");
   return { text, scrubRuleset: SCRUB_RULESET, scrubVersion: SCRUB_RULESET_VERSION };
 }

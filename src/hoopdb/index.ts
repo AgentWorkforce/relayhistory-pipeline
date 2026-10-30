@@ -19,6 +19,7 @@ import { ctxOf, enrichMessage, sessionExt } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { uuidv7 } from "../shared/ids.ts";
 import { propagatePointerTombstone } from "./session-directory-summary.ts";
+import { projectSessionDirectory } from "./session-directory-projector.ts";
 
 export const FAN_OUT_STAGES = ["summary-short", "summary-long", "status-classify"] as const;
 
@@ -48,9 +49,10 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         );
         // Propagate to the logical directory: clear the summary now, tombstone the row
         // once no live machine pointer remains.
-        await propagatePointerTombstone(deps.db, {
-          orgId: pk.org_id, workspaceId: pk.workspace_id, harness: pk.harness, sessionId: pk.session_id,
-        });
+        const logical = { orgId: pk.org_id, workspaceId: pk.workspace_id, harness: pk.harness, sessionId: pk.session_id };
+        const tombstone = await propagatePointerTombstone(deps.db, logical);
+        // Other machines still live: re-project their metadata and memberships.
+        if (tombstone.found && !tombstone.tombstoned) await projectSessionDirectory(deps.db, logical);
         return;
       }
       const read = await deps.reader.read(pointer.manifestKey);
@@ -101,6 +103,10 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         [JSON.stringify([row])],
       );
       const applied = rows[0]?.applied ?? false;
+      // Logical-session directory projection (idempotent; never resurrects a tombstone).
+      await projectSessionDirectory(deps.db, {
+        orgId: pk.org_id, workspaceId: pk.workspace_id, harness: pk.harness, sessionId: pk.session_id,
+      });
       const fanoutDone = existing ? Number(existing.fanout_revision) >= f.manifestRevision : false;
       if (!applied && fanoutDone) {
         log.info("session index unchanged", { revision: f.manifestRevision, reason: "stale_or_equal_revision" });

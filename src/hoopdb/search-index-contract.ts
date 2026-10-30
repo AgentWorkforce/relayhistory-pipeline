@@ -141,6 +141,7 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
   args: { p_workspace_id: "text", p_query: "text" },
   workerRole: "session_directory_search_worker",
   claims: { role: "session_directory_search_worker", orgId: "app_metadata.org_id", workspaceIds: "app_metadata.workspace_ids" },
+  /** Meaningful characters after normalizeSearchQuery: not separators, format characters or marks. */
   minQueryChars: 3,
   maxQueryChars: 200,
   /** A page of 50 plus one row that signals more. No cursor in V1. */
@@ -154,7 +155,7 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
   ],
   errors: {
     "42501": "caller is not the Worker role, or tenant claims missing, malformed, for another role, or not covering the workspace",
-    "22023": "query shorter than 3 or longer than 200 characters after trim and NFC",
+    "22023": "fewer than 3 meaningful characters, or more than 200, after normalizeSearchQuery (search-query.ts)",
     "57014": "statement_timeout (2s on the Worker role) exceeded",
   },
 } as const;

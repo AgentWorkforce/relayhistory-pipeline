@@ -5,13 +5,27 @@
  * hosted database is involved. Synthetic ids and text only.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { zstdCompressSync } from "node:zlib";
 import { PGlite } from "@electric-sql/pglite";
 import { auto_explain } from "@electric-sql/pglite/contrib/auto_explain";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
-import { SCRUB_RULESET, SCRUB_RULESET_VERSION } from "../../shared/vendor.ts";
+import { SCRUB_RULESET, SCRUB_RULESET_VERSION, rawChunkKey, type ManifestV1 } from "../../shared/vendor.ts";
+import { createFsStore } from "../../../packages/object-store/src/fs.ts";
+import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
+import { bobCostasHandler } from "../../bob-costas/handler.ts";
+import { extractiveSummarizer } from "../../bob-costas/summarizer.ts";
+import {
+  FORMAT_RANGES,
+  MARK_RANGES,
+  SEPARATOR_RANGES,
+  normalizeSearchQuery,
+  pgClass,
+  searchRpcRequest,
+} from "../search-query.ts";
 import type { HoopDb } from "../../shared/db.ts";
 import { hoopDbSessionIndex } from "../index.ts";
 import {
@@ -51,6 +65,15 @@ async function database(prelude = ""): Promise<PGlite> {
   if (prelude) await db.exec(prelude);
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
+  }
+  return db;
+}
+
+/** The full HoopDb plan (as src/hoopdb/migrate.ts orders it): supabase, then 96bulls. */
+async function hoopDatabase(): Promise<PGlite> {
+  const db = await database();
+  for (const file of readdirSync(join(root, "src/hoopdb/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
+    await db.exec(read(`src/hoopdb/migrations/${file}`));
   }
   return db;
 }
@@ -266,6 +289,17 @@ describe("search RPC authorization", () => {
     }
   });
 
+  test("the Worker role is NOLOGIN, which the RPC's session_user fallback relies on", async () => {
+    // The role guard accepts session_user = the Worker when no SET ROLE is active. That
+    // is only safe while nobody can log in as the Worker directly; PostgREST must reach
+    // it through authenticator's SET ROLE. Changing this to LOGIN needs a new review.
+    const db = await database();
+    const role = await db.query<{ rolcanlogin: boolean }>(
+      "SELECT rolcanlogin FROM pg_roles WHERE rolname = $1", [WORKER],
+    );
+    expect(role.rows).toEqual([{ rolcanlogin: false }]);
+  });
+
   test("no role in pg_roles except the Worker and the owner can execute the search RPC", async () => {
     // Default privileges and a pre-existing runtime role, present before the migration runs.
     const db = await database(`CREATE ROLE relayhistory_app;
@@ -336,25 +370,6 @@ describe("search RPC authorization", () => {
   });
 });
 
-describe("search RPC query bounds", () => {
-  test("1-2 character and over-long queries are refused; input is trimmed, NFC-normalized and literal", async () => {
-    const db = await database();
-    await insertRow(db);
-    await summarize(db, KEY, "Café menu cut 50%_off for the launch");
-    const a = claims("org-a", ["ws-a"]);
-    for (const query of ["", "a", "ab", "  ab  ", "x".repeat(201)]) {
-      await expect(search(db, a, "ws-a", query)).rejects.toThrow("query must be 3 to 200 characters");
-    }
-    expect(await search(db, a, "ws-a", "x".repeat(200))).toEqual([]);
-    // Decomposed e + combining acute matches the composed stored text after NFC.
-    expect(await search(db, a, "ws-a", "  café ")).toHaveLength(1);
-    // % and _ are literal, not wildcards.
-    expect(await search(db, a, "ws-a", "50%_off")).toHaveLength(1);
-    expect(await search(db, a, "ws-a", "5_%")).toEqual([]);
-    expect(await search(db, a, "ws-a", "menu%launch")).toEqual([]);
-  });
-});
-
 type Plan = { [key: string]: unknown; Plans?: Plan[] };
 const walk = (plan: Plan): Plan[] => [plan, ...(plan.Plans ?? []).flatMap(walk)];
 
@@ -385,6 +400,93 @@ async function explainRpc(db: PGlite, claimsJson: string, workspace: string, que
     await db.exec("SET auto_explain.log_min_duration = -1; SET client_min_messages = notice;");
   }
 }
+
+/** Every auto_explain plan logged while the Worker calls the RPC, whether or not it throws. */
+async function capturedStatements(db: PGlite, claimsJson: string, workspace: string, query: string) {
+  await db.exec(`LOAD 'auto_explain';
+    SET auto_explain.log_min_duration = 0; SET auto_explain.log_nested_statements = on;
+    SET auto_explain.log_format = 'json'; SET client_min_messages = log;`);
+  const messages: string[] = [];
+  let error: unknown;
+  try {
+    await search(db, claimsJson, workspace, query, (message) => messages.push(message));
+  } catch (caught) {
+    error = caught;
+  } finally {
+    await db.exec("SET auto_explain.log_min_duration = -1; SET client_min_messages = notice;");
+  }
+  const texts = messages.filter((m) => m.includes("\"Query Text\"")).map((m) =>
+    (JSON.parse(m.slice(m.indexOf("{"))) as { "Query Text": string })["Query Text"].replace(/\s+/g, " ").trim());
+  return { error, ranSearch: texts.includes(SESSION_DIRECTORY_SEARCH_SQL.replace(/\s+/g, " ").trim()) };
+}
+
+describe("search RPC query bounds", () => {
+  // Inputs that look like 3+ characters to btrim/char_length but carry fewer than
+  // three meaningful ones.
+  const INVALID: Array<[string, string]> = [
+    ["empty", ""],
+    ["one char", "a"],
+    ["two chars", "ab"],
+    ["ASCII-padded two", "  ab  "],
+    ["NBSP between two", "a\u00a0b"],
+    ["NBSP padding", "\u00a0\u00a0ab\u00a0"],
+    ["en/em/thin spaces", "\u2002a\u2003b\u2009\u200a"],
+    ["ideographic space", "\u3000ab\u3000"],
+    ["ZWSP", "a\u200bb\u200b"],
+    ["ZWNJ/ZWJ", "\u200ca\u200db\u200d"],
+    ["BOM", "\ufeffab\ufeff"],
+    ["tab/newline", "\ta\nb\r"],
+    ["soft hyphen", "a\u00adb"],
+    ["combining-only", "\u0301\u0301\u0301\u0301"],
+    ["two bases plus marks", "a\u0301\u0302b\u0303\u0304"],
+    ["enclosing marks", "a\u20dd\u20ddb\u20dd"],
+    ["tag characters", "ab\u{e0041}\u{e0042}"],
+    ["over 200", "x".repeat(201)],
+    ["over 200 after collapsing", `${"x ".repeat(100)}y`],
+  ];
+
+  test("TypeScript and SQL refuse the same inputs, with 22023, and the inner query never runs", async () => {
+    const db = await database();
+    await insertRow(db);
+    await summarize(db, KEY, "Caf\u00e9 menu cut 50%_off for the launch");
+    const a = claims("org-a", ["ws-a"]);
+    for (const [name, query] of INVALID) {
+      expect(normalizeSearchQuery(query).ok, name).toBe(false);
+      expect(searchRpcRequest("ws-a", query).ok, name).toBe(false);
+      const sql = await db.query<{ q: string | null }>("SELECT sessions.session_directory_search_query($1) AS q", [query]);
+      expect(sql.rows[0]?.q, name).toBeNull();
+      const { error, ranSearch } = await capturedStatements(db, a, "ws-a", query);
+      expect((error as { code?: string })?.code, name).toBe("22023");
+      expect(ranSearch, name).toBe(false);
+    }
+    // Control: a valid query is captured, so the capture itself works.
+    expect((await capturedStatements(db, a, "ws-a", "menu")).ranSearch).toBe(true);
+  });
+
+  test("valid queries normalize identically in TypeScript and SQL and match literally", async () => {
+    const db = await database();
+    await insertRow(db);
+    await summarize(db, KEY, "Caf\u00e9 menu cut 50%_off for the launch");
+    const a = claims("org-a", ["ws-a"]);
+    for (const query of ["abc", "  cafe\u0301 ", "menu\u00a0cut", "\u200bmenu\u3000cut\ufeff", "50%_off", "x".repeat(200)]) {
+      const ts = normalizeSearchQuery(query);
+      const sql = await db.query<{ q: string | null }>("SELECT sessions.session_directory_search_query($1) AS q", [query]);
+      expect(ts.ok && ts.query, JSON.stringify(query)).toBe(sql.rows[0]!.q!);
+    }
+    expect(await search(db, a, "ws-a", "  cafe\u0301 ")).toHaveLength(1);
+    expect(await search(db, a, "ws-a", "menu\u00a0cut")).toHaveLength(1);
+    expect(await search(db, a, "ws-a", "\u200bmenu\u3000cut\ufeff")).toHaveLength(1);
+    expect(await search(db, a, "ws-a", "50%_off")).toHaveLength(1);
+    expect(await search(db, a, "ws-a", "5_%")).toEqual([]);
+    expect(await search(db, a, "ws-a", "menu%launch")).toEqual([]);
+  });
+
+  test("the migration embeds exactly the TypeScript Unicode classes", () => {
+    expect(UP).toContain(`'[${pgClass(FORMAT_RANGES)}]'`);
+    expect(UP).toContain(`'[${pgClass(SEPARATOR_RANGES)}]+'`);
+    expect(UP).toContain(`'[ ${pgClass(MARK_RANGES)}]'`);
+  });
+});
 
 const sum = (nodes: Plan[], key: string) => nodes.reduce((total, node) => total + Number(node[key] ?? 0), 0);
 
@@ -488,7 +590,10 @@ describe("short_summary deletion propagation", () => {
     expect(current?.deleted_at).toBeNull();
     expect(current?.short_summary).toBeNull();
     expect(current?.short_summary_scrub_version).toBeNull();
-    expect(current?.search_text).toBe("Fix flaky queue test Helm proj-1");
+    // Re-projected from the remaining live pointer (m2 has no title/project), keeping
+    // the agent name, without the summary.
+    expect(current?.machine_ids).toEqual(["m2"]);
+    expect(current?.search_text).toBe("Helm");
     expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "heron")).toEqual([]);
 
     // The last machine deleted: the logical row is tombstoned and holds no text.
@@ -496,7 +601,7 @@ describe("short_summary deletion propagation", () => {
     current = await row(db);
     expect(current?.deleted_at).not.toBeNull();
     expect(current?.search_text).toBe("");
-    expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "flaky")).toEqual([]);
+    expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "Helm")).toEqual([]);
     // The writer never puts a summary back on a tombstone.
     expect((await summarize(db, KEY, "heron again", new Date(AT.getTime() + 1000))).written).toBe(false);
   });
@@ -544,6 +649,90 @@ describe("short_summary deletion propagation", () => {
     );
     expect(left.rows).toEqual([{ session_id: "s-3" }]);
   });
+});
+
+describe("short_summary end to end through the pipeline", () => {
+  const manifest = (): ManifestV1 => ({
+    schema_v: 1, layout: "v1", trace_id: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18", revision: 1,
+    created_at: "2026-10-29T07:00:00.000Z", updated_at: "2026-10-29T07:00:01.000Z",
+    session: { workspace_id: "ws-e2e", machine_id: "m-1", harness: "codex", session_id: "s-e2e", started_at: "2026-10-29T07:00:00.000Z" },
+    writer: { delivery_instance_id: "m-1", plugin_version: "test" },
+    raw: {
+      owner: "m-1", state: "open", updated_at: "2026-10-29T07:00:01.000Z", format: "jsonl", compression: "zstd",
+      chunk_count: 1, raw_bytes: 12, stored_bytes: 10, content_sha256: "1".repeat(64), epoch: 0,
+      epochs: [{ epoch: 0, opened_at: "2026-10-29T07:00:00.000Z", reason: "initial", first_seq: 0, opened_by: "m-1" }],
+      next_offset: 12,
+      chunks: [{ seq: 0, epoch: 0, start_offset: 0, bytes: 12, stored_bytes: 10, sha256: "2".repeat(64),
+        sha256_8: "22222222", stored_sha256: "3".repeat(64), compression: "zstd" }],
+      scrub: { ruleset: "relayhistory-scrub", version: 1 },
+    },
+    extensions: { "96bulls": { session_uuid: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c19", session_uuid_source: "minted" } },
+  }) as unknown as ManifestV1;
+
+  test("indexer projects the row, Bob Costas writes the scrubbed summary, the RPC is tenant-bound, deletion clears it", async () => {
+    const db = await hoopDatabase();
+    const q = async (text: string, params?: unknown[]) => ({ rows: (await db.query(text, params as never)).rows as never[] });
+    const hoop = { query: q, pool: { connect: async () => ({ query: q, release() {} }) }, end: async () => {} } as unknown as HoopDb;
+    const m = manifest();
+    const reader = { provider: "fs", bucket: "locker", read: async () => ({ manifest: m, etag: "e1" }) } as never;
+    const pointer = { traceId: m.trace_id, workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e",
+      manifestKey: "v1/ws=ws-e2e/m=m-1/h=codex/d=2026/10/29/s=s-e2e/manifest.json", provider: "fs", bucket: "locker" };
+    const ctx = { traceId: m.trace_id, orgId: "org-a", workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e" };
+    const sent: unknown[] = [];
+    const index = hoopDbSessionIndex({
+      db: hoop, reader, queue: { backend: "memory", send: async (msg: unknown) => { sent.push(msg); }, sendBatch: async () => {} } as never,
+      current: () => undefined,
+    });
+
+    // 1. Projector create path: the indexer writes session_index and the directory row.
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    let current = await row(db, "s-e2e");
+    expect(current?.org_id).toBe("org-a");
+    expect(current?.machine_ids).toEqual(["m-1"]);
+    expect(current?.short_summary).toBeNull();
+    expect(sent.length).toBeGreaterThan(0);
+    // The same workspace and session ids under another org, to prove the org boundary.
+    await insertRow(db, "org-b", "ws-e2e", "s-e2e-b");
+    await summarize(db, { orgId: "org-b", workspaceId: "ws-e2e", harness: "codex", sessionId: "s-e2e-b" }, "pelican ledger for org b");
+
+    // 2. Bob Costas short summary over the scrubbed raw: the real production callsite.
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "g6-e2e-")) });
+    const line = JSON.stringify({ type: "user", message: { role: "user", content: `Fix the pelican ledger; token ${FAKE_RELAY_TOKEN}` } });
+    await store.put(rawChunkKey({ workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e", startDate: "2026-10-29" },
+      0, 0, "22222222", "jsonl"), zstdCompressSync(Buffer.from(`${line}\n`)));
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    await bobCostasHandler("short", { db: hoop, reader, store, summarizer: extractiveSummarizer, keyring })(
+      { payload: pointer, ctx: { orgId: "org-a" } } as never, { log: { info() {} } } as never);
+    current = await row(db, "s-e2e");
+    expect(String(current?.short_summary)).toContain("pelican ledger");
+    expect(String(current?.short_summary)).not.toContain(FAKE_RELAY_TOKEN);
+    expect(String(current?.search_text)).toContain("pelican ledger");
+    expect(String(current?.search_text)).not.toContain(FAKE_RELAY_TOKEN);
+    expect(current?.short_summary_scrub_ruleset).toBe(SCRUB_RULESET);
+    expect(current?.short_summary_scrub_version).toBe(SCRUB_RULESET_VERSION);
+    expect(current?.short_summary_source).toBe("bob-costas/extractive/v1");
+
+    // 3. The Worker RPC: tenant A finds it; tenant B (same workspace id) sees only its own.
+    const hitsA = await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger");
+    expect(hitsA.map((hit) => [hit.org_id, hit.session_id])).toEqual([["org-a", "s-e2e"]]);
+    const hitsB = await search(db, claims("org-b", ["ws-e2e"]), "ws-e2e", "pelican ledger");
+    expect(hitsB.map((hit) => [hit.org_id, hit.session_id])).toEqual([["org-b", "s-e2e-b"]]);
+
+    // 4. A re-index of the same manifest keeps the summary in search_text.
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    expect(String((await row(db, "s-e2e"))?.search_text)).toContain("pelican ledger");
+
+    // 5. Deletion through the indexer clears it end to end.
+    await index.upsertRawPointer({ ...pointer, deleted: true } as never, ctx as never);
+    current = await row(db, "s-e2e");
+    expect(current?.deleted_at).not.toBeNull();
+    expect(current?.short_summary).toBeNull();
+    expect(current?.search_text).toBe("");
+    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
+    // A later manifest for the deleted session does not resurrect the row.
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    expect((await row(db, "s-e2e"))?.deleted_at).not.toBeNull();
+  }, 60_000);
 });
 
 describe("short_summary rollback", () => {
