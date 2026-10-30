@@ -123,13 +123,21 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     ```
     Resume with the same checkpoint. Throttle by running it off-peak if
     Supabase p95 rises.
-    **Straddling sessions** (rows on both sides of T0): their rollups, timing
-    cache and catalog rows were built after T0 from partial data. After the
-    backfill, mark them dirty through the live triggers, without the replica
-    setting, so the database rebuilds them:
-    insert their keys into `session_rollup_dirty` and `onboarding_rollup_dirty`,
-    and delete their `session_timing_cache` rows. The straddling set is every
-    session with a `convergence_events` row on both sides of T0.
+    **Straddling sessions** (rows on both sides of T0): their rollups and
+    timing cache were built after T0 from partial data. After the backfill,
+    rebuild them through the live triggers (a normal session, small
+    transactions):
+    ```sh
+    bun run migration:rebuild --since=<T0 ISO timestamp> --batch=200
+    ```
+    It marks every session with an event at or after T0 in
+    `session_rollup_dirty` and `onboarding_rollup_dirty`. Their deferred
+    triggers rebuild the session from all of its rows, and the tool drops the
+    session's `session_timing_cache` rows.
+    **Open:** `session_catalog` and `session_catalog_agents` rows that the
+    delivery projection built after T0 for a straddling session reflect only
+    post-T0 records. They need a reprojection pass, owned with the index
+    contract (helm-chart-chief, #27).
 14. **[A9]** Once the backfill verifier passes for every table, remove the
     Neon read fallback.
 

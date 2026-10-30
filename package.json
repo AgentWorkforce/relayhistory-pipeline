@@ -26,6 +26,7 @@
     "benchmark:relayhistory-api": "bun run src/migration/relayhistory-api-benchmark.ts",
     "migration:copy": "bun run src/migration/relayhistory-copy.ts",
     "migration:neon-fence": "bun run src/migration/relayhistory-neon-fence.ts",
+    "migration:rebuild": "bun run src/migration/relayhistory-rebuild.ts",
     "migration:verify": "bun run src/migration/relayhistory-verify.ts"
   },
   "dependencies": {
