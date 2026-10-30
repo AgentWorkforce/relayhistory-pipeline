@@ -338,7 +338,11 @@ describe("AlleyOop courier manifest routes", () => {
       ...cold.extensions,
       "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
     };
-    expect((await f.post({ key, manifest: cold }, "migration")).status).toBe(202);
+    const retries = await Promise.all([
+      f.post({ key, manifest: cold }, "migration"),
+      f.post({ key, manifest: cold }, "migration"),
+    ]);
+    expect(retries.map((response) => response.status)).toEqual([202, 202]);
   });
 
   test("rejects migration rewrites, owner changes, and unbound migration assertions", async () => {
@@ -401,6 +405,35 @@ describe("AlleyOop courier manifest routes", () => {
     const statuses = (await Promise.all([migrationAttempt, liveAttempt])).map((response) => response.status).sort();
     expect(statuses).toEqual([202, 409]);
     expect((await f.reader.read(key))?.manifest.revision).toBe(2);
+  });
+
+  test("treats concurrent byte-identical migration CAS retries as success", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const live = await f.build(1);
+    const first = await f.post({ key, manifest: live });
+    const firstBody = await first.json() as { version: { eTag?: string } };
+    const backfill = await f.appendEpoch(
+      live,
+      "backfill",
+      "migration:mgr_export",
+      '{"kind":"session_event","origin_id":"o","record_id":"old","revision":"1","received_at":"2026-10-01T00:00:00Z","payload":{"ts_ms":1}}',
+    );
+    backfill.extensions = {
+      ...backfill.extensions,
+      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+    };
+
+    const attempts = await Promise.all([
+      f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration"),
+      f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration"),
+    ]);
+    expect(attempts.map((response) => response.status)).toEqual([202, 202]);
+    const bodies = await Promise.all(
+      attempts.map((response) => response.json() as Promise<{ workKey: string; version: { eTag?: string } }>),
+    );
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect((await f.reader.read(key))?.manifest).toEqual(backfill);
   });
 
   test("checks ownership and server-sealed chunks before writing", async () => {

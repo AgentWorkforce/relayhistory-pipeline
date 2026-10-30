@@ -132,7 +132,17 @@ function recordKey(record: RelayhistoryStreamRecord): string {
 }
 
 function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+  const leftPoints = left[Symbol.iterator]();
+  const rightPoints = right[Symbol.iterator]();
+  while (true) {
+    const leftPoint = leftPoints.next();
+    const rightPoint = rightPoints.next();
+    if (leftPoint.done || rightPoint.done)
+      return leftPoint.done === rightPoint.done ? 0 : leftPoint.done ? -1 : 1;
+    const leftValue = leftPoint.value.codePointAt(0)!;
+    const rightValue = rightPoint.value.codePointAt(0)!;
+    if (leftValue !== rightValue) return leftValue < rightValue ? -1 : 1;
+  }
 }
 
 function canonical(value: unknown): unknown {
@@ -212,6 +222,15 @@ export async function readRelayhistoryExport(
   const records: RelayhistoryStreamRecord[] = [];
   for (const chunk of manifest.raw.chunks) {
     if (
+      typeof chunk.records !== "number" ||
+      !Number.isSafeInteger(chunk.records) ||
+      chunk.records < 0
+    )
+      fail(
+        "relayhistory_record_count",
+        "RelayHistory raw chunk record count is required",
+      );
+    if (
       chunk.bytes > MAX_RELAYHISTORY_CHUNK_BYTES ||
       chunk.stored_bytes > MAX_RELAYHISTORY_CHUNK_BYTES ||
       (chunk.stored_raw_bytes ?? 0) > MAX_RELAYHISTORY_CHUNK_BYTES
@@ -261,7 +280,7 @@ export async function readRelayhistoryExport(
       records.push(parseRelayhistoryRecord(line));
       count += 1;
     }
-    if (chunk.records !== undefined && chunk.records !== count)
+    if (chunk.records !== count)
       fail("relayhistory_record_count", "RelayHistory raw chunk record count does not match");
   }
   return normalizeRelayhistoryRecords(records);
