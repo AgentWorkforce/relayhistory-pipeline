@@ -35,50 +35,56 @@
  *   (`unrecognized_origin`).
  *
  * Re-applying the same approved plan is idempotent: shards recorded as created
- * are skipped by shard id, so no duplicate grant. RelayAuth #111 has no
- * idempotency key or list endpoint, so the only unrecoverable window is a
- * create whose response is lost; that leaves the shard `pending` and apply
- * refuses until a human reconciles it.
+ * are skipped by shard id, so no duplicate grant. Each create carries an
+ * `Idempotency-Key` derived from the shard id and the approved plan
+ * version (`shardIdempotencyKey`, never logged or stored). RelayAuth is adding
+ * support in a stacked PR; once a client reports `supportsIdempotencyKey`, a
+ * lost response is recovered by retrying with the same key. Until then a
+ * create whose response is lost leaves the shard `pending` and halts the run
+ * for a human to reconcile.
  *
  * If a create fails partway, apply revokes the grants it created in that same
  * run (compensating revoke) and returns the evidence. `revoke` without shard
  * ids is the rollback (revoke-all) path.
  *
+ * ## Membership contract (helm-chart-chief audit)
+ *
+ * - **Ids:** legacy ids are not assumed to be Cloud ids. Only canonical
+ *   lowercase UUIDs are Cloud ids. `relay_` stripping is never authority for
+ *   membership. A legacy alias counts only through an explicit, reviewed,
+ *   collision-free `IdMappingLedger` (empty by default; `validateIdMapping`).
+ * - **One read:** `MembershipSource.read` must run ONE Cloud transaction,
+ *   `REPEATABLE READ READ ONLY`, and require all of: `workspaces.id` exact,
+ *   `workspaces.organization_id` = the org, `users.id` exact, and an active
+ *   `organization_memberships(org, user)` row. The snapshot id hashes the
+ *   exact rows read, with `read_at`.
+ * - **Blockers:** any invalid, alias, default, inactive, cross-org, unknown
+ *   or ambiguous id or pair is an exception that blocks its shard and the
+ *   whole run.
+ * - **Identity preflight:** every source user must be an active HUMAN
+ *   RelayAuth identity in the same org (`IdentityPreflight`).
+ *
  * ## Membership source (finding, AgentWorkforce/cloud @865ca405, read-only)
  *
  * - **System and tables:** Cloud's Postgres, `organization_memberships`
  *   (`organization_id`, `user_id`, `role`, `status`; primary key
- *   `(organization_id, user_id)`) joined to `workspaces` (`id`,
- *   `organization_id`, `relay_workspace_id`) on `organization_id`
- *   (packages/core/src/db/schema.ts).
+ *   `(organization_id, user_id)`), `workspaces` (`id`, `organization_id`,
+ *   `relay_workspace_id`) and `users` (`id`) (packages/core/src/db/schema.ts).
  * - **Tenancy predicate:** a user may act on a workspace exactly when they
  *   have a `status = 'active'` membership in the organization that owns the
- *   workspace. There is no per-workspace membership table
- *   (packages/web/lib/arelay/org-member.ts, `requireArelayOrgMemberForWorkspace`;
- *   the session's workspace list in lib/auth/store.ts `getAuthContext` is
- *   every workspace of every org with an active membership).
- * - **Writers:** sign-up creates the org, an `owner`/`active` membership and
- *   a default workspace in one transaction (lib/auth/store.ts); invite
- *   acceptance inserts or reactivates a membership (lib/invites/invite-store.ts);
- *   revocation sets `status = 'revoked'` and revokes the member's API token
- *   sessions in the same transaction (lib/members/member-store.ts).
- * - **Deleted or disabled:** memberships are soft-deleted (`revoked`); every
- *   reader filters `status = 'active'`, so anything else is "not a member".
- *   Workspaces are hard-deleted (lib/workspace/app-workspace-deletion.ts), so
- *   a deleted workspace is "unknown". Both are exceptions here.
- * - **Freshness, consistency, snapshot:** not established by Cloud. The
- *   reader this module expects must read all pairs in ONE `REPEATABLE READ,
- *   READ ONLY` transaction, record when it read (`read_at`, the freshness
- *   point), and pin the snapshot id as a digest of the exact rows it read
- *   (`source` + content hash); `FixtureMembershipSource` does exactly that.
- * - **Authority: NOT fully established.** The tables above are what Cloud's
- *   own access checks enforce, so they are the authoritative membership for
- *   Cloud ids. What is not established is that the export's ids are those
- *   ids: Cloud's live RelayHistory assertions sign `sponsorId` = Cloud user
- *   id and `wks` = the app workspace id (lib/relayhistory-session.ts), but
- *   whether the legacy Neon rows use the same ids (rather than, say,
- *   `relay_workspace_id` or another identity) is unverified. Until a human
- *   confirms that mapping, the real reader stays unwired.
+ *   workspace; there is no per-workspace membership table
+ *   (packages/web/lib/arelay/org-member.ts; lib/auth/store.ts `getAuthContext`).
+ * - **Writers:** sign-up (lib/auth/store.ts), invite acceptance and
+ *   reactivation (lib/invites/invite-store.ts), revocation to `revoked` with
+ *   the member's API tokens (lib/members/member-store.ts).
+ * - **Deleted or disabled:** memberships are soft-deleted (`revoked`) and
+ *   every reader filters `active`; workspaces are hard-deleted
+ *   (lib/workspace/app-workspace-deletion.ts).
+ * - **Authority: NOT established for the export's ids.** These tables are
+ *   authoritative for Cloud ids. Cloud's live RelayHistory assertions sign the
+ *   Cloud user and app workspace ids (lib/relayhistory-session.ts), but the
+ *   legacy Neon ids are unverified; any that are not UUIDs need the reviewed
+ *   mapping ledger. The real reader and preflight stay unwired.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -106,70 +112,179 @@ const refuse = (code: string, message: string): never => {
   throw new GrantLifecycleError(code, message);
 };
 
-// ---------------------------------------------------------------- membership
+// ---------------------------------------------------------------- ids
 
-export interface MembershipPair {
-  org_id: string;
-  workspace_id: string;
-  source_user_id: string;
+/** Cloud ids are canonical lowercase UUIDs; nothing else is a Cloud id. */
+const CLOUD_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const isCloudId = (id: string) => CLOUD_UUID.test(id);
+
+export type IdKind = "org" | "workspace" | "user";
+
+/**
+ * The only way a legacy (non-UUID) id may stand for a Cloud id: an explicit,
+ * reviewed, collision-free mapping. Empty by default. No heuristic mapping:
+ * `relay_` stripping, case folding or name matching never apply.
+ */
+export interface IdMappingLedger {
+  version: 1;
+  reviewed_by: string;
+  reviewed_at: string;
+  entries: { kind: IdKind; legacy_id: string; cloud_id: string }[];
 }
 
-export type MembershipVerdict =
-  | "active_member"
-  | "membership_inactive"
-  | "not_member"
-  | "workspace_unknown"
-  | "workspace_other_org";
+export const EMPTY_ID_MAPPING: IdMappingLedger = { version: 1, reviewed_by: "", reviewed_at: "", entries: [] };
+
+/** Refuses a mapping that is unreviewed, malformed or not collision-free. */
+export function validateIdMapping(ledger: IdMappingLedger): IdMappingLedger {
+  const bad = (why: string): never => refuse("id_mapping_invalid", `id mapping ledger: ${why}`);
+  if (ledger.version !== 1) bad("unsupported version");
+  if (!ledger.entries.length) return ledger;
+  if (!ledger.reviewed_by.trim() || !Number.isFinite(Date.parse(ledger.reviewed_at))) bad("entries need reviewed_by and reviewed_at");
+  for (const kind of ["org", "workspace", "user"] as const) {
+    const entries = ledger.entries.filter((e) => e.kind === kind);
+    const legacy = new Set<string>();
+    const cloud = new Set<string>();
+    for (const e of entries) {
+      if (!isCloudId(e.cloud_id)) bad(`${kind} ${e.legacy_id} maps to a non-UUID`);
+      if (!e.legacy_id || isCloudId(e.legacy_id)) bad(`${kind} legacy id must be a non-UUID alias`);
+      if (legacy.has(e.legacy_id)) bad(`${kind} legacy id ${e.legacy_id} is mapped twice`);
+      if (cloud.has(e.cloud_id)) bad(`${kind} Cloud id is the target of two legacy ids`);
+      legacy.add(e.legacy_id);
+      cloud.add(e.cloud_id);
+    }
+  }
+  for (const e of ledger.entries) if (!["org", "workspace", "user"].includes(e.kind)) bad("unknown kind");
+  return ledger;
+}
+
+export type IdResolution =
+  | { ok: true; cloud_id: string; via: "uuid" | "mapping" }
+  | { ok: false; reason: "default_workspace" | "alias_id" | "invalid_id" };
+
+/** A legacy id to its Cloud id: an exact UUID, or an explicit mapping entry. */
+export function resolveCloudId(kind: IdKind, id: string, mapping: IdMappingLedger): IdResolution {
+  const mapped = mapping.entries.find((e) => e.kind === kind && e.legacy_id === id);
+  if (mapped) return { ok: true, cloud_id: mapped.cloud_id, via: "mapping" };
+  if (isCloudId(id)) return { ok: true, cloud_id: id, via: "uuid" };
+  if (kind === "workspace" && id === "default") return { ok: false, reason: "default_workspace" };
+  if (id.startsWith("relay_")) return { ok: false, reason: "alias_id" };
+  return { ok: false, reason: "invalid_id" };
+}
+
+// ---------------------------------------------------------------- membership
+
+/**
+ * The rows one membership read returned. The reader must run ONE Cloud
+ * transaction, `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, selecting
+ * exactly: `workspaces` by exact `id` (with `organization_id`), `users` by
+ * exact `id`, and `organization_memberships` by exact `(organization_id,
+ * user_id)`. The snapshot id hashes these rows; `read_at` is when it read.
+ */
+export interface MembershipRows {
+  workspaces: { id: string; organization_id: string }[];
+  users: { id: string }[];
+  memberships: { organization_id: string; user_id: string; status: string }[];
+}
 
 export interface MembershipSnapshot {
   source: string;
-  snapshot_id: string;
-  /** When the source was read: the freshness point. */
+  isolation: "REPEATABLE READ READ ONLY";
   read_at: string;
-  verdict(pair: MembershipPair): MembershipVerdict;
+  rows: MembershipRows;
 }
 
-/** One consistent, read-only read of the authoritative membership. */
 export interface MembershipSource {
-  read(pairs: readonly MembershipPair[]): Promise<MembershipSnapshot | undefined>;
+  read(request: { organization_id: string; workspace_ids: string[]; user_ids: string[] }): Promise<MembershipSnapshot | undefined>;
+}
+
+export function membershipSnapshotId(s: MembershipSnapshot): string {
+  const rows = {
+    workspaces: [...s.rows.workspaces].sort((a, b) => cmp(`${a.id}\u0000${a.organization_id}`, `${b.id}\u0000${b.organization_id}`)),
+    users: [...s.rows.users].sort((a, b) => cmp(a.id, b.id)),
+    memberships: [...s.rows.memberships].sort((a, b) => cmp(`${a.organization_id}\u0000${a.user_id}\u0000${a.status}`, `${b.organization_id}\u0000${b.user_id}\u0000${b.status}`)),
+  };
+  return `${s.source}:${sha256Hex(canonicalMigrationJson({ isolation: s.isolation, read_at: s.read_at, rows }))}`;
 }
 
 export interface MembershipFixture {
   source: string;
   read_at: string;
-  workspaces: { workspace_id: string; organization_id: string }[];
+  workspaces: { id: string; organization_id: string }[];
+  users: { id: string }[];
   memberships: { organization_id: string; user_id: string; status: string }[];
+  /** Test hook: report another isolation level. */
+  isolation?: string;
 }
 
-/**
- * A fixture shaped like Cloud's tables (organization_memberships joined to
- * workspaces on organization_id). Its snapshot id hashes the exact rows.
- */
+/** Cloud's three tables as a fixture; returns only the rows the exact-id query would. */
 export class FixtureMembershipSource implements MembershipSource {
   constructor(private readonly fixture: MembershipFixture | undefined) {}
 
-  async read(): Promise<MembershipSnapshot | undefined> {
+  async read(request: { organization_id: string; workspace_ids: string[]; user_ids: string[] }): Promise<MembershipSnapshot | undefined> {
     const f = this.fixture;
     if (!f) return undefined;
-    const workspaces = [...f.workspaces].sort((a, b) => cmp(a.workspace_id, b.workspace_id));
-    const memberships = [...f.memberships].sort((a, b) => cmp(`${a.organization_id}\u0000${a.user_id}`, `${b.organization_id}\u0000${b.user_id}`));
-    const snapshotId = `${f.source}:${sha256Hex(canonicalMigrationJson({ workspaces, memberships }))}`;
-    const owner = new Map(workspaces.map((w) => [w.workspace_id, w.organization_id]));
-    const status = new Map(memberships.map((m) => [`${m.organization_id}\u0000${m.user_id}`, m.status]));
+    const ws = new Set(request.workspace_ids);
+    const us = new Set(request.user_ids);
     return {
       source: f.source,
-      snapshot_id: snapshotId,
+      isolation: (f.isolation ?? "REPEATABLE READ READ ONLY") as MembershipSnapshot["isolation"],
       read_at: f.read_at,
-      verdict: (pair) => {
-        const org = owner.get(pair.workspace_id);
-        if (org === undefined) return "workspace_unknown";
-        if (org !== pair.org_id) return "workspace_other_org";
-        const s = status.get(`${org}\u0000${pair.source_user_id}`);
-        if (s === undefined) return "not_member";
-        return s === "active" ? "active_member" : "membership_inactive";
+      rows: {
+        workspaces: f.workspaces.filter((w) => ws.has(w.id)),
+        users: f.users.filter((u) => us.has(u.id)),
+        memberships: f.memberships.filter((m) => m.organization_id === request.organization_id && us.has(m.user_id)),
       },
     };
   }
+}
+
+export type MembershipVerdict =
+  | "active_member"
+  | "workspace_unknown"
+  | "workspace_other_org"
+  | "user_unknown"
+  | "membership_inactive"
+  | "not_member"
+  | "ambiguous";
+
+/** The Cloud predicate, all four required, on exact ids. */
+export function membershipVerdict(rows: MembershipRows, org: string, workspace: string, user: string): MembershipVerdict {
+  const w = rows.workspaces.filter((r) => r.id === workspace);
+  const u = rows.users.filter((r) => r.id === user);
+  const m = rows.memberships.filter((r) => r.organization_id === org && r.user_id === user);
+  if (w.length > 1 || u.length > 1 || m.length > 1) return "ambiguous";
+  if (!w.length) return "workspace_unknown";
+  if (w[0]!.organization_id !== org) return "workspace_other_org";
+  if (!u.length) return "user_unknown";
+  if (!m.length) return "not_member";
+  return m[0]!.status === "active" ? "active_member" : "membership_inactive";
+}
+
+// ---------------------------------------------------------------- identity preflight
+
+export type IdentityVerdict = "active_human" | "inactive" | "not_human" | "other_org" | "unknown";
+
+/** Every source user must be an active HUMAN RelayAuth identity in the grant's org. */
+export interface IdentityPreflight {
+  check(request: { organization_id: string; user_ids: string[] }): Promise<{ source: string; read_at: string; identities: { user_id: string; org_id: string; kind: string; status: string }[] } | undefined>;
+}
+
+export class FixtureIdentityPreflight implements IdentityPreflight {
+  constructor(private readonly fixture: { source: string; read_at: string; identities: { user_id: string; org_id: string; kind: string; status: string }[] } | undefined) {}
+  async check(request: { organization_id: string; user_ids: string[] }) {
+    if (!this.fixture) return undefined;
+    const us = new Set(request.user_ids);
+    return { ...this.fixture, identities: this.fixture.identities.filter((i) => us.has(i.user_id)) };
+  }
+}
+
+function identityVerdict(identities: { user_id: string; org_id: string; kind: string; status: string }[], org: string, user: string): IdentityVerdict {
+  const rows = identities.filter((i) => i.user_id === user);
+  if (rows.length !== 1) return "unknown";
+  const i = rows[0]!;
+  if (i.org_id !== org) return "other_org";
+  if (i.kind !== "human") return "not_human";
+  return i.status === "active" ? "active_human" : "inactive";
 }
 
 // ---------------------------------------------------------------- plan
@@ -183,7 +298,11 @@ export interface GrantParameters {
 }
 
 export type LifecycleException =
-  | { kind: "membership"; verdict: Exclude<MembershipVerdict, "active_member">; org_id: string; workspace_id: string; source_user_id: string; shard_ids: string[] }
+  | { kind: "org"; org_id: string; reason: string }
+  | { kind: "id"; id_kind: IdKind; id: string; reason: "default_workspace" | "alias_id" | "invalid_id"; shard_ids: string[] }
+  | { kind: "ambiguous_id"; id_kind: IdKind; cloud_id: string; legacy_ids: string[]; shard_ids: string[] }
+  | { kind: "membership"; verdict: Exclude<MembershipVerdict, "active_member">; workspace_id: string; source_user_id: string; shard_ids: string[] }
+  | { kind: "identity"; verdict: Exclude<IdentityVerdict, "active_human">; source_user_id: string; shard_ids: string[] }
   | { kind: "oversized_session"; org_id: string; session: string; manifests: number; chunks: number; source_users: number; oracle_code: string };
 
 export interface LifecycleShard {
@@ -195,6 +314,8 @@ export interface LifecycleShard {
   manifests: number;
   chunks: number;
   serialized_bytes: number;
+  /** An exception names this shard: it, and so the run, is blocked. */
+  blocked: boolean;
 }
 
 export interface LifecyclePlan {
@@ -205,52 +326,119 @@ export interface LifecyclePlan {
   exported_at: string;
   grant: { api_key_id: string; audience: string; not_after: string };
   source_snapshot: { source: string; snapshot_id: string; read_at: string };
+  identity_snapshot: { source: string; snapshot_id: string; read_at: string };
+  id_mapping_sha256: string;
   shards: LifecycleShard[];
   pair_counts: { total: number; matched: number; exceptions: number };
   limits: ShardReport["max"];
   exceptions: LifecycleException[];
+  run_blocked: boolean;
   aggregate_digest: string;
 }
-
-const pairKey = (p: MembershipPair) => `${p.org_id}\u0000${p.workspace_id}\u0000${p.source_user_id}`;
 
 interface Built {
   plan: LifecyclePlan;
   shards: Shard[];
 }
 
-async function build(input: { uploads: readonly UploadInput[]; exportedAt: string; grant: GrantParameters; membership: MembershipSource }): Promise<Built> {
-  const orgId = canonicalMigrationId(input.grant.orgId, "organization id");
-  for (const u of input.uploads)
-    if (canonicalMigrationId(u.org_id, "organization id") !== orgId)
-      refuse("org_mismatch", "every upload must belong to the grant's organization (one org per lifecycle run)");
+export interface PlanInput {
+  uploads: readonly UploadInput[];
+  exportedAt: string;
+  grant: GrantParameters;
+  membership: MembershipSource;
+  identities: IdentityPreflight;
+  /** Reviewed legacy-to-Cloud id mapping; empty by default. */
+  idMapping?: IdMappingLedger;
+}
+
+async function build(input: PlanInput): Promise<Built> {
+  const mapping = validateIdMapping(input.idMapping ?? EMPTY_ID_MAPPING);
   const shardPlan = planShards({ exportedAt: input.exportedAt, uploads: input.uploads });
   const report = shardReport(shardPlan);
-  // Every (org, workspace, user) pair, canonical, with the shards it is in.
-  const pairs = new Map<string, { pair: MembershipPair; shards: Set<string> }>();
+  const exceptions: LifecycleException[] = [];
+  const blocked = new Set<string>();
+  const block = (ids: Iterable<string>) => {
+    for (const id of ids) blocked.add(id);
+  };
+
+  // The grant's org must itself be a Cloud id (or explicitly mapped).
+  const orgRes = resolveCloudId("org", input.grant.orgId, mapping);
+  const org = orgRes.ok ? orgRes.cloud_id : undefined;
+  if (!orgRes.ok) exceptions.push({ kind: "org", org_id: input.grant.orgId, reason: orgRes.reason });
+  for (const u of input.uploads)
+    if (u.org_id !== input.grant.orgId) refuse("org_mismatch", "every upload must name the grant's organization id exactly (one org per lifecycle run)");
+
+  // Resolve every legacy id exactly; record which shards each appears in.
+  type Seen = { shards: Set<string>; legacy: Set<string> };
+  const ids = { workspace: new Map<string, Seen>(), user: new Map<string, Seen>() };
+  const bad = new Map<string, { kind: IdKind; id: string; reason: "default_workspace" | "alias_id" | "invalid_id"; shards: Set<string> }>();
+  const pairs = new Map<string, { workspace: string; user: string; shards: Set<string> }>();
   for (const shard of shardPlan.shards)
     for (const m of shard.plan.manifests) {
-      const pair = {
-        org_id: orgId,
-        workspace_id: canonicalMigrationId(m.workspace_id, "workspace id"),
-        source_user_id: canonicalMigrationId(m.source_user_id, "source user id"),
-      };
-      const entry = pairs.get(pairKey(pair)) ?? { pair, shards: new Set<string>() };
-      entry.shards.add(shard.shard_id);
-      pairs.set(pairKey(pair), entry);
+      const resolved: Record<"workspace" | "user", string | undefined> = { workspace: undefined, user: undefined };
+      for (const [kind, raw] of [["workspace", m.workspace_id], ["user", m.source_user_id]] as const) {
+        const r = resolveCloudId(kind, raw, mapping);
+        if (!r.ok) {
+          const k = `${kind}\u0000${raw}`;
+          const e = bad.get(k) ?? { kind, id: raw, reason: r.reason, shards: new Set<string>() };
+          e.shards.add(shard.shard_id);
+          bad.set(k, e);
+          continue;
+        }
+        resolved[kind] = r.cloud_id;
+        const seen = ids[kind].get(r.cloud_id) ?? { shards: new Set<string>(), legacy: new Set<string>() };
+        seen.shards.add(shard.shard_id);
+        seen.legacy.add(raw);
+        ids[kind].set(r.cloud_id, seen);
+      }
+      if (resolved.workspace && resolved.user) {
+        const k = `${resolved.workspace}\u0000${resolved.user}`;
+        const p = pairs.get(k) ?? { workspace: resolved.workspace, user: resolved.user, shards: new Set<string>() };
+        p.shards.add(shard.shard_id);
+        pairs.set(k, p);
+      }
     }
-  const ordered = [...pairs.values()].sort((a, b) => cmp(pairKey(a.pair), pairKey(b.pair)));
-  const snapshot = await input.membership.read(ordered.map((p) => p.pair));
+  for (const e of [...bad.values()].sort((a, b) => cmp(`${a.kind}${a.id}`, `${b.kind}${b.id}`))) {
+    exceptions.push({ kind: "id", id_kind: e.kind, id: e.id, reason: e.reason, shard_ids: [...e.shards].sort() });
+    block(e.shards);
+  }
+  // One Cloud id reached through two legacy forms is ambiguous.
+  for (const kind of ["workspace", "user"] as const)
+    for (const [cloudId, seen] of [...ids[kind]].sort(([a], [b]) => cmp(a, b)))
+      if (seen.legacy.size > 1) {
+        exceptions.push({ kind: "ambiguous_id", id_kind: kind, cloud_id: cloudId, legacy_ids: [...seen.legacy].sort(), shard_ids: [...seen.shards].sort() });
+        block(seen.shards);
+      }
+
+  const orderedPairs = [...pairs.values()].sort((a, b) => cmp(`${a.workspace}\u0000${a.user}`, `${b.workspace}\u0000${b.user}`));
+  const userIds = [...ids.user.keys()].sort();
+  const snapshot = await input.membership.read({ organization_id: org ?? "", workspace_ids: [...ids.workspace.keys()].sort(), user_ids: userIds });
   if (!snapshot) refuse("snapshot_missing", "the membership source returned no snapshot");
-  const exceptions: LifecycleException[] = [];
+  if (snapshot!.isolation !== "REPEATABLE READ READ ONLY") refuse("snapshot_isolation", "the membership read was not one REPEATABLE READ READ ONLY transaction");
   let matched = 0;
-  for (const { pair, shards } of ordered) {
-    const verdict = snapshot!.verdict(pair);
+  for (const p of orderedPairs) {
+    const verdict = org ? membershipVerdict(snapshot!.rows, org, p.workspace, p.user) : "workspace_other_org";
     if (verdict === "active_member") matched += 1;
-    else exceptions.push({ kind: "membership", verdict, ...pair, shard_ids: [...shards].sort() });
+    else {
+      exceptions.push({ kind: "membership", verdict, workspace_id: p.workspace, source_user_id: p.user, shard_ids: [...p.shards].sort() });
+      block(p.shards);
+    }
+  }
+  const idCheck = await input.identities.check({ organization_id: org ?? "", user_ids: userIds });
+  if (!idCheck) refuse("identity_preflight_missing", "the identity preflight returned nothing");
+  for (const user of userIds) {
+    const verdict = org ? identityVerdict(idCheck!.identities, org, user) : "other_org";
+    if (verdict !== "active_human") {
+      exceptions.push({ kind: "identity", verdict, source_user_id: user, shard_ids: [...ids.user.get(user)!.shards].sort() });
+      block(ids.user.get(user)!.shards);
+    }
   }
   for (const u of shardPlan.unshardable)
     exceptions.push({ kind: "oversized_session", org_id: u.org_id, session: u.session, manifests: u.manifests, chunks: u.chunks, source_users: u.source_users, oracle_code: u.oracle_code });
+
+  const snapshotId = membershipSnapshotId(snapshot!);
+  const identitySnapshotId = `${idCheck!.source}:${sha256Hex(canonicalMigrationJson({ read_at: idCheck!.read_at, identities: [...idCheck!.identities].sort((a, b) => cmp(a.user_id, b.user_id)) }))}`;
+  const idMappingSha = sha256Hex(canonicalMigrationJson(mapping));
   const shards: LifecycleShard[] = shardPlan.shards.map((s) => ({
     shard_id: s.shard_id,
     body_sha256: sha256Hex(canonicalMigrationJson(s.plan)),
@@ -259,16 +447,19 @@ async function build(input: { uploads: readonly UploadInput[]; exportedAt: strin
     manifests: s.manifests,
     chunks: s.chunks,
     serialized_bytes: s.serialized_bytes,
+    blocked: blocked.has(s.shard_id) || !orgRes.ok,
   }));
   const grant = { api_key_id: input.grant.apiKeyId, audience: input.grant.audience, not_after: input.grant.notAfter };
   const aggregate_digest = sha256Hex(canonicalMigrationJson({
     v: LIFECYCLE_VERSION,
     contract: PLAN_CONTRACT,
     planner_version: SHARD_PLANNER_VERSION,
-    org_id: orgId,
+    org_id: input.grant.orgId,
     exported_at: input.exportedAt,
     grant,
-    source_snapshot_id: snapshot!.snapshot_id,
+    source_snapshot_id: snapshotId,
+    identity_snapshot_id: identitySnapshotId,
+    id_mapping_sha256: idMappingSha,
     shards: shards.map((s) => ({ shard_id: s.shard_id, body_sha256: s.body_sha256 })),
     exceptions,
   }));
@@ -278,35 +469,44 @@ async function build(input: { uploads: readonly UploadInput[]; exportedAt: strin
       version: LIFECYCLE_VERSION,
       contract: PLAN_CONTRACT,
       planner_version: SHARD_PLANNER_VERSION,
-      org_id: orgId,
+      org_id: input.grant.orgId,
       exported_at: input.exportedAt,
       grant,
-      source_snapshot: { source: snapshot!.source, snapshot_id: snapshot!.snapshot_id, read_at: snapshot!.read_at },
+      source_snapshot: { source: snapshot!.source, snapshot_id: snapshotId, read_at: snapshot!.read_at },
+      identity_snapshot: { source: idCheck!.source, snapshot_id: identitySnapshotId, read_at: idCheck!.read_at },
+      id_mapping_sha256: idMappingSha,
       shards,
-      pair_counts: { total: ordered.length, matched, exceptions: ordered.length - matched },
+      pair_counts: { total: orderedPairs.length, matched, exceptions: orderedPairs.length - matched },
       limits: report.max,
       exceptions,
+      run_blocked: exceptions.length > 0,
       aggregate_digest,
     },
   };
 }
 
 /** `plan`: the approvable document (ids, digests, counts, exceptions only). */
-export async function lifecyclePlan(input: Parameters<typeof build>[0]): Promise<LifecyclePlan> {
+export async function lifecyclePlan(input: PlanInput): Promise<LifecyclePlan> {
   return (await build(input)).plan;
 }
 
 /** `dry-run`: the shard report and the plan summary; writes nothing. */
-export async function lifecycleDryRun(input: Parameters<typeof build>[0]) {
+export async function lifecycleDryRun(input: PlanInput) {
   const { plan } = await build(input);
-  return { dry_run: true as const, aggregate_digest: plan.aggregate_digest, source_snapshot: plan.source_snapshot, shards: plan.shards.length, pair_counts: plan.pair_counts, limits: plan.limits, exceptions: plan.exceptions };
+  return { dry_run: true as const, aggregate_digest: plan.aggregate_digest, source_snapshot: plan.source_snapshot, identity_snapshot: plan.identity_snapshot, shards: plan.shards.length, blocked_shards: plan.shards.filter((s) => s.blocked).length, run_blocked: plan.run_blocked, pair_counts: plan.pair_counts, limits: plan.limits, exceptions: plan.exceptions };
 }
 
 // ---------------------------------------------------------------- RelayAuth
 
 /** The RelayAuth #111 grant routes this command uses (`POST /v1/migration-grants`, `POST /:id/revoke`). */
 export interface GrantClient {
-  createGrant(request: { apiKeyId: string; audience: string; notAfter: string; plan: { exported_at: string; manifests: UploadInput[] } }): Promise<{
+  /**
+   * True once RelayAuth honours `Idempotency-Key` on grant create (a stacked
+   * relayauth PR). Until then a lost create response halts the run.
+   */
+  readonly supportsIdempotencyKey: boolean;
+  /** `idempotencyKey` goes in the `Idempotency-Key` header; never log it. */
+  createGrant(request: { apiKeyId: string; audience: string; notAfter: string; plan: { exported_at: string; manifests: UploadInput[] }; idempotencyKey: string }): Promise<{
     grantId: string;
     orgId: string;
     planDigest: string;
@@ -391,12 +591,24 @@ async function revokeShards(dir: string, ledger: Ledger, client: GrantClient, id
 
 // ---------------------------------------------------------------- apply / revoke
 
-export interface ApplyConfig {
+/**
+ * The grant create's Idempotency-Key for a shard: derived from the shard id,
+ * the approved plan version (its aggregate digest) and the lifecycle,
+ * contract and planner versions. A retry of the same shard under the same
+ * approved plan sends the same key; a re-approved plan (say, another
+ * not-after or audience) gets new keys, so RelayAuth can never answer it with
+ * a grant made under different parameters. Never logged or stored (not in
+ * the ledger, the plan, results or evidence).
+ */
+export function shardIdempotencyKey(shardId: string, aggregateDigest: string): string {
+  return sha256Hex(`relayhistory-export-grant\nlifecycle=${LIFECYCLE_VERSION}\ncontract=${PLAN_CONTRACT}\nplanner=${SHARD_PLANNER_VERSION}\nplan=${aggregateDigest}\nshard=${shardId}`);
+}
+
+/** Retries of a create whose response was lost, with the same key (only when supported). */
+const LOST_RESPONSE_RETRIES = 2;
+
+export interface ApplyConfig extends PlanInput {
   execute: boolean;
-  uploads: readonly UploadInput[];
-  exportedAt: string;
-  grant: GrantParameters;
-  membership: MembershipSource;
   approvedDigest: string;
   approvedSnapshotId: string;
   /** History origins grants may be created for (exact https origins). */
@@ -437,6 +649,9 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
   const now = (cfg.now ?? Date.now)();
   if (!Number.isFinite(readAt) || now - readAt > cfg.maxSnapshotAgeMs || readAt > now)
     refuse("snapshot_stale", "the membership snapshot is too old (or from the future)");
+  const idAt = Date.parse(plan.identity_snapshot.read_at);
+  if (!Number.isFinite(idAt) || now - idAt > cfg.maxSnapshotAgeMs || idAt > now)
+    refuse("snapshot_stale", "the identity preflight is too old (or from the future)");
   if (plan.exceptions.length) refuse("pair_exceptions", `${plan.exceptions.length} exception(s) need human review; nothing applied`);
   if (plan.aggregate_digest !== cfg.approvedDigest) refuse("digest_drift", "the recomputed aggregate digest is not the approved one");
 
@@ -445,7 +660,10 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
   const ledger: Ledger = prior ?? { version: LIFECYCLE_VERSION, aggregate_digest: plan.aggregate_digest, source_snapshot_id: plan.source_snapshot.snapshot_id, shards: {} };
   if (ledger.halted) refuse("previous_run_failed", "an earlier apply failed partway; check its revocation evidence and RelayAuth before going on");
   const states = Object.values(ledger.shards);
-  if (states.some((s) => s.status === "pending")) refuse("partial_shard_state", "a shard's create was started but never recorded; reconcile it in RelayAuth first");
+  // A create that started but was never recorded: with Idempotency-Key the
+  // same key recovers it; without, a human must reconcile it first.
+  if (states.some((s) => s.status === "pending") && !cfg.client.supportsIdempotencyKey)
+    refuse("partial_shard_state", "a shard's create was started but never recorded; reconcile it in RelayAuth first");
   if (states.some((s) => s.status === "revoked")) refuse("plan_rolled_back", "this plan's grants were revoked; approve a new plan to start again");
 
   const runId = randomUUID();
@@ -464,11 +682,21 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
     await saveLedger(cfg.stateDir, ledger);
     let grantId: string | undefined;
     try {
-      const out = await cfg.client.createGrant({ apiKeyId: cfg.grant.apiKeyId, audience: cfg.grant.audience, notAfter: cfg.grant.notAfter, plan: shard.plan });
+      const request = { apiKeyId: cfg.grant.apiKeyId, audience: cfg.grant.audience, notAfter: cfg.grant.notAfter, plan: shard.plan, idempotencyKey: shardIdempotencyKey(shard.shard_id, plan.aggregate_digest) };
+      // A lost response is recovered by retrying with the same key, once
+      // RelayAuth honours it; until then the first failure halts the run.
+      let out: Awaited<ReturnType<GrantClient["createGrant"]>> | undefined;
+      for (let attempt = 0; !out; attempt++) {
+        try {
+          out = await cfg.client.createGrant(request);
+        } catch (e) {
+          if (!cfg.client.supportsIdempotencyKey || attempt >= LOST_RESPONSE_RETRIES) throw e;
+        }
+      }
       grantId = out.grantId;
       // The grant must hold exactly this shard: re-derive with its id.
       const derived = deriveMigrationGrantPlan({ grantId: out.grantId, orgId: plan.org_id, plan: shard.plan });
-      if (out.planDigest !== derived.planDigest || !sameJson(out.allowedPairs, derived.allowedPairs) || out.planEntries !== derived.plan.manifests.length || canonicalMigrationId(out.orgId, "organization id") !== plan.org_id)
+      if (out.planDigest !== derived.planDigest || !sameJson(out.allowedPairs, derived.allowedPairs) || out.planEntries !== derived.plan.manifests.length || out.orgId !== plan.org_id)
         throw new Error("RelayAuth's grant does not match the shard");
       ledger.shards[shard.shard_id] = { status: "created", run_id: runId, grant_id: out.grantId, plan_digest: out.planDigest, created_at: out.createdAt };
       await saveLedger(cfg.stateDir, ledger);
@@ -516,7 +744,7 @@ function argument(name: string): string | undefined {
 /**
  * `bun run src/migration/relayhistory-export-grants.ts <dry-run|plan|apply|revoke>`.
  * dry-run and plan read local files only (`--inputs` plan inputs JSON,
- * `--membership` fixture JSON, `--org`, `--exported-at`, `--api-key-id`,
+ * `--membership` and `--identities` fixture JSON, optional `--id-mapping`, `--org`, `--exported-at`, `--api-key-id`,
  * `--audience`, `--not-after`). apply and revoke refuse: no RelayAuth client
  * or authoritative membership reader is wired.
  */
@@ -538,6 +766,8 @@ export async function main(argv = process.argv.slice(2)) {
       notAfter: argument("not-after") ?? refuse("usage", "--not-after is required"),
     },
     membership: new FixtureMembershipSource((await read("membership")) as MembershipFixture),
+    identities: new FixtureIdentityPreflight(await read("identities")),
+    ...(argument("id-mapping") ? { idMapping: (await read("id-mapping")) as IdMappingLedger } : {}),
   };
   const out = sub === "plan" ? await lifecyclePlan(input) : await lifecycleDryRun(input);
   process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);

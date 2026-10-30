@@ -150,6 +150,22 @@ active `organization_memberships` row for the organization that owns it,
 joined to `workspaces`. There is no per-workspace table. Whether the export's
 ids are Cloud's ids is unverified, so the real reader stays unwired.
 
+- **Ids:** only canonical UUIDs are Cloud ids, and `relay_` is never stripped.
+  A legacy alias counts only through a reviewed, collision-free mapping
+  ledger, which is empty by default.
+- **One read:** a single `REPEATABLE READ READ ONLY` transaction must find all
+  of: `workspaces.id` exact, `workspaces.organization_id` equal to the org,
+  `users.id` exact, and an active membership row. The snapshot id hashes the
+  rows read, together with `read_at`.
+- **Identity preflight:** every user must be an active human RelayAuth
+  identity in the same org.
+- **Blockers:** any invalid, alias, default, inactive, cross-org, unknown or
+  ambiguous id blocks its shard and the run.
+- **Idempotency:** each grant create sends a per-shard `Idempotency-Key`,
+  derived from the shard id and the approved plan (its aggregate
+  digest) and never stored. Until
+  RelayAuth supports it, a lost create response still halts the run.
+
 **Not active:** the CLI refuses `apply` and `revoke`. Activation waits for the
 authoritative membership reader, the E3 HOLDs, and Khaliq's OK.
 
