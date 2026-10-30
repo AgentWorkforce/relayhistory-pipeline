@@ -10,7 +10,8 @@
  *   96bulls plan <stage>              alchemy plan (dry run)
  *
  * Guardrail: stages named aws* refuse to deploy until the AWS account work is
- * cleared by Khaliq (docs/aws-stage.md).
+ * cleared by Khaliq (docs/aws-stage.md). GCP up/down stay refused; `plan` uses
+ * the gated GCP stack and still creates nothing by itself (docs/gcp-stage.md).
  */
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -87,6 +88,7 @@ function stageDir(stage: string) {
 function requireLocalStage(stage: string | undefined): string {
   if (!stage) die("stage is required, e.g. `96bulls up local`");
   if (stage.startsWith("aws")) die("AWS stages are not cleared yet; nothing was created (docs/aws-stage.md)");
+  if (stage.startsWith("gcp")) die("GCP stages are not cleared for up/down; nothing was created (docs/gcp-stage.md)");
   if (stage !== "local" && !stage.startsWith("local-")) die(`unknown stage ${stage}; use local or local-<name>`);
   return stage;
 }
@@ -309,6 +311,11 @@ async function main() {
       if (stageArg.startsWith("aws-")) {
         // Code-only until cleared: plan needs credentials and an aws-inputs.json written by hand.
         return void sh("bunx", ["alchemy", "plan", "--config", "stacks/aws/alchemy.aws.run.ts", "--stage", stageArg, "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: true });
+      }
+      if (stageArg.startsWith("gcp-")) {
+        // Code-only until cleared: plan needs ambient GCP auth and a non-secret gcp-inputs.json.
+        // Do not run this until Khaliq approves cloud changes. Plan is not proof.
+        return void sh("bunx", ["alchemy", "plan", "--config", "stacks/gcp/alchemy.gcp.run.ts", "--stage", stageArg, "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: true });
       }
       return void sh("bunx", ["alchemy", "plan", "--stage", requireLocalStage(stageArg), "--no-input"], { env: { ALCHEMY_PLAIN: "1" } });
     }

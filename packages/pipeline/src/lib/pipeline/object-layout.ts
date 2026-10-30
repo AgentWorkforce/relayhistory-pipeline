@@ -9,6 +9,7 @@ export {
   ObjectStoreError,
   RAW_FORMATS,
   chunkKeys,
+  createGcsStore,
   createS3Store,
   isObjectStoreError,
   isScrubbed,
@@ -27,6 +28,8 @@ export {
   type ObjectMeta,
   type ObjectStore,
   type RawFormat,
+  type GcsConfig,
+  type GcsToken,
   type S3Config,
   type SessionLocation,
 } from "../../../../object-store/src/index.js";

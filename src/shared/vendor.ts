@@ -63,6 +63,7 @@ export type { Bindings, AppEnv } from "@rhc/env.ts";
 
 export {
   createS3Store,
+  createGcsStore,
   manifestKey,
   rawChunkKey,
   parseSessionKey,

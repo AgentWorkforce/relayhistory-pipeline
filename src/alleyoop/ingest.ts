@@ -25,6 +25,7 @@ import { enrichMessage, requestIdentity } from "../shared/enrich.ts";
 import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 import { traceparentFor } from "../shared/ids.ts";
 import { integer, optional, required, vendorBindings } from "../shared/env.ts";
+import { dataPathVerdict } from "../shared/data-path.ts";
 import { healthVerdict, type WorkerHealth } from "../shared/worker.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { initTelemetry, withSpan } from "../shared/telemetry.ts";
@@ -125,6 +126,8 @@ export async function buildIngestApp() {
       const have = new Set(rows.map((r) => r.name));
       const missing = expected.filter((n) => !n.startsWith("shim:") && !have.has(n));
       if (missing.length) return c.json({ ok: false, reason: "schema_pending", count: missing.length }, 503);
+      const data = dataPathVerdict(process.env);
+      if (!data.ok) return c.json({ ok: false, missing: data.missing }, 503);
       return c.json({ ok: true });
     } catch {
       return c.json({ ok: false, reason: "hoopdb_unreachable" }, 503);

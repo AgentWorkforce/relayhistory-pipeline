@@ -81,9 +81,12 @@ export interface Bindings {
     import("./lib/pipeline/dlq.js").StageMessage
   >;
   // Storage-notification adapter (lib/pipeline/adapter.ts); inert until set.
-  // The raw store is reached over the S3 API: MinIO for self-host, R2's S3 API
-  // hosted. Credentials are runtime secrets and are never logged.
+  // Unset uses the S3 API (MinIO or R2). PIPELINE_RAW_PROVIDER=gcs uses the
+  // GCS adapter and a metadata-server token, never HMAC keys. Credentials are
+  // runtime secrets and are never logged.
   PIPELINE_RAW_PROVIDER?: string;
+  /** Override for tests. Defaults to the GKE metadata server. Metadata host or loopback only. */
+  PIPELINE_RAW_GCS_TOKEN_URI?: string;
   PIPELINE_RAW_S3_BUCKET?: string;
   PIPELINE_RAW_S3_ENDPOINT?: string;
   PIPELINE_RAW_S3_REGION?: string;
