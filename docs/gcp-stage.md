@@ -25,22 +25,25 @@ implementations own provider adapters.
 - a least-privilege runtime Google service account and Workload Identity
   bindings for the 96Bulls worker and Alleyoop service accounts. The Cloud SQL
   proxy binding is declared only with the proxy manifests;
-- optionally, a private-only Cloud SQL PostgreSQL 17 specification (not posted),
+- optionally, a private-only Cloud SQL PostgreSQL 17 apply-time poster,
   Memorystore Redis 7.2 with AUTH off and TLS server authentication,
   Pub/Sub with retry/dead-letter handling, and a single-replica Cloud SQL Auth
-  Proxy manifest that is not applied while that instance is unposted;
+  Proxy manifests whose deployment and IAM edge depend on the poster output;
 - optionally, the Relaycast core chart and RelayAuth, Relayfile, or Relayflows
   charts. Relayflows runs in standalone mode and is not in Relaycast's
   availability path.
 
-Cloud SQL is not created. The stack prepares a SQL Admin `instances.insert`
+Cloud SQL has not been created in this lane. On an approved apply, the stack
+prepares a SQL Admin `instances.insert`
 for public IPv4 off, the Private Service Access network and range, and
 `--private-ip` proxy routing. `ensurePrivateCloudSql` gets that instance or
 inserts it only when it is absent, then polls the operation through an
 injected transport. It refuses a public instance, a different existing
 instance, a failed operation, and a timeout. The bearer credential stays in
-the caller and the transport, not in the request or the error text. The stack
-does not call that poster. `GCP.SQL.Instance` is not called, because that
+the caller and the transport, not in Action inputs/state, the request object,
+or error text. An apply-time Alchemy Action calls that poster only after the
+Private Service Access connection resolves; its output gates the proxy IAM,
+deployment, and Helm wiring. `GCP.SQL.Instance` is not called, because that
 resource drops `privateNetwork` and can create a public instance.
 
 ## Truthful feature gates
@@ -72,11 +75,11 @@ choice: unset and `s3` stay S3, `r2` stays R2, and `PIPELINE_RAW_PROVIDER=gcs`
 builds the GCS adapter when the bucket is set and HMAC keys are absent. Any
 other name stays unconfigured.
 
-The static `bulls96.enabled` values contract turns off in-chart MinIO and
+The `bulls96.enabled` values contract turns off in-chart MinIO and
 CloudNativePG, uses pod identity, and passes the bucket, Cloud SQL connection
-name, Redis host, and Pub/Sub names. The live stack refuses that flag before
-declaring any resource until a reviewed resource can post the private-only
-Cloud SQL body; it cannot create a knowingly broken release.
+name, Redis host, and Pub/Sub names. The release and Cloud SQL proxy consume
+the poster output, so neither can apply before the exact private-only instance
+is confirmed `RUNNABLE`.
 `/readyz` also checks that data path when `LOCKER_PROVIDER=gcs` or
 `WORKER_DATA_PATH_PROBE=1`. Production is not this lane: the production
 database is Supabase and production object storage is AWS S3.
@@ -149,14 +152,14 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
   `operations/{id}` until `DONE`, then gets the instance and refuses the
   result unless that private body is `RUNNABLE`. A thrown insert, a failed operation, or a
   timeout says to reconcile and does not say that nothing was created. Error
-  text omits the response body and the bearer. The stack calls the builder
-  and does not call the poster. `@alchemy.run/gcp@2.0.0-beta.84`
+  text omits the response body and the bearer. The apply-time Action calls the
+  poster through an exact-host/path allowlisted transport. `@alchemy.run/gcp@2.0.0-beta.84`
   `GCP.SQL.Instance` is not called.
-- The Auth Proxy manifests stay unapplied while `posted` is false. The proxy
-  Workload Identity binding is created with those manifests, not before them.
+- The Auth Proxy deployment and its Workload Identity binding depend on the
+  successful poster output, rather than a static `posted` flag.
   The PSA range is still shared with Memorystore.
-- Stack evaluation throws while `bulls96.enabled` is set. The release values
-  are still a tested pure function. Nothing in that path is applied.
+- Stack evaluation accepts `bulls96.enabled` only with the acknowledged managed
+  data plane. Nothing in that path has been applied.
 
 Release wiring that has not been applied:
 
@@ -208,6 +211,8 @@ returned 404. The bucket was not created. Lane APIs were not enabled. Compute
 quota was not read because the compute API is disabled. The same describe
 returned 404 again when this note was written. `CI=true` is what makes a
 missing state bucket fail instead of being created.
+That failed preflight predates the apply-time poster and is not evidence that
+the current exact head plans or applies successfully.
 
 Read-only preflight:
 
@@ -239,11 +244,10 @@ container, Artifact Registry, the runtime service account, Workload Identity for
 `96bulls-worker` and `96bulls-alleyoop`, `roles/storage.objectUser`, and
 `roles/cloudsql.client`. With `managedDataPlane.provision`, Memorystore Redis
 7.2 is created with AUTH off and TLS server authentication, and Pub/Sub is
-created with the dead-letter service agent. The Cloud SQL body is prepared as
-`sqlInsert` and is not posted. `ensurePrivateCloudSql` is not called.
+created with the dead-letter service agent. The Cloud SQL body is an Action
+input; `ensurePrivateCloudSql` runs only during an approved apply after the PSA
+connection resolves, and its non-secret output gates the proxy and 96Bulls.
 `GCP.SQL.Instance` must not appear as a resource.
-`bulls96.enabled` still throws before any resource, so this plan cannot install
-96Bulls until a reviewed change posts the insert and then lifts that guard.
 
 Verify, only after an approved apply and a wired poster:
 

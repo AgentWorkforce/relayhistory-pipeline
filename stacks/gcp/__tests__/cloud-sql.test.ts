@@ -3,10 +3,10 @@ import { describe, expect, test } from "bun:test";
 import {
   ALCHEMY_GCP_BETA_84_SQL,
   CLOUD_SQL_PROXY_IMAGE,
-  cloudSqlProxyApplies,
   cloudSqlProxyWorkload,
   ensurePrivateCloudSql,
   privateCloudSqlSpec,
+  sqlAdminFetchTransport,
   sqlAdminInsertRequest,
   type PrivateCloudSqlSpec,
   type SqlAdminCredential,
@@ -31,7 +31,6 @@ describe("Cloud SQL private attachment", () => {
   test("builds a private-only insert body and routes the proxy with --private-ip", () => {
     const spec = privateCloudSqlSpec(input);
     expect(spec.posted).toBe(false);
-    expect(cloudSqlProxyApplies(spec)).toBe(false);
     expect(spec.ipv4Enabled).toBe(false);
     expect(spec.connectionName).toBe("agentworkforce-dev1:us-central1:awf-dev-postgres");
     expect(spec.privateNetwork).toBe("/projects/agentworkforce-dev1/global/networks/awf-dev-vpc");
@@ -68,7 +67,11 @@ describe("Cloud SQL private attachment", () => {
 
   test("renders the proxy with the private args and no secret material", () => {
     const spec = privateCloudSqlSpec(input);
-    const proxy = cloudSqlProxyWorkload(spec, "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com");
+    const proxy = cloudSqlProxyWorkload(
+      spec,
+      "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
+      spec.connectionName,
+    );
     expect(proxy.deployment.spec.template.spec.containers[0]!.image).toBe(CLOUD_SQL_PROXY_IMAGE);
     expect(proxy.deployment.spec.template.spec.containers[0]!.args[0]).toBe("--private-ip");
     expect(proxy.deployment.spec.template.spec.containers[0]!.args.at(-1)).toBe(spec.connectionName);
@@ -76,7 +79,7 @@ describe("Cloud SQL private attachment", () => {
       "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
     );
     expect(JSON.stringify(proxy)).not.toMatch(/password|token|BEGIN /i);
-    expect(() => cloudSqlProxyWorkload(spec, "not-an-email")).toThrow(/Nothing was created/);
+    expect(() => cloudSqlProxyWorkload(spec, "not-an-email", spec.connectionName)).toThrow(/Nothing was created/);
   });
 
   test("builds a SQL Admin insert without sending it", () => {
@@ -93,15 +96,53 @@ describe("Cloud SQL private attachment", () => {
     expect(JSON.stringify(request)).not.toContain("rootPassword");
   });
 
-  test("the Alchemy stack can prepare the insert and cannot post it or call GCP.SQL.Instance", () => {
+  test("the Alchemy stack posts only through the apply-time action and never calls GCP.SQL.Instance", () => {
     const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
     const seam = readFileSync(new URL("../cloud-sql.ts", import.meta.url), "utf8");
-    expect(stack).toContain("sqlAdminInsertRequest");
-    expect(seam).not.toContain("postPrivateCloudSqlInsert");
-    expect(stack).not.toContain("ensurePrivateCloudSql");
+    expect(stack).toContain("Alchemy.Action");
+    expect(stack).toContain("ensurePrivateCloudSql");
+    expect(stack).toContain("sqlAdminFetchTransport");
+    expect(stack).toContain("dataPlane.sqlPoster.connectionName");
     expect(stack).not.toContain("GCP.SQL.Instance(");
-    expect(seam).not.toContain("fetch(");
     expect(seam).not.toContain("console.");
+  });
+
+  test("the live transport attaches the bearer only to the approved SQL Admin origin", async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const transport = sqlAdminFetchTransport(async (url, init) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ state: "RUNNABLE" }), { status: 200 });
+    });
+    await transport.request(
+      {
+        method: "GET",
+        url: "https://sqladmin.googleapis.com/v1/projects/agentworkforce-dev1/instances/awf-dev-postgres",
+      },
+      credential,
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe(
+      "https://sqladmin.googleapis.com/v1/projects/agentworkforce-dev1/instances/awf-dev-postgres",
+    );
+    expect(new Headers(calls[0]!.init.headers).get("authorization")).toBe(`Bearer ${token}`);
+
+    await expect(
+      transport.request(
+        { method: "GET", url: "https://attacker.example/v1/projects/agentworkforce-dev1/instances/awf-dev-postgres" },
+        credential,
+      ),
+    ).rejects.toThrow(/target is not approved.*Nothing was created/);
+    await expect(
+      transport.request(
+        {
+          method: "POST",
+          url: "https://sqladmin.googleapis.com/v1/projects/agentworkforce-dev1/instances/awf-dev-postgres",
+          body: privateCloudSqlSpec(input).insertBody,
+        },
+        credential,
+      ),
+    ).rejects.toThrow(/target is not approved.*Nothing was created/);
+    expect(calls).toHaveLength(1);
   });
 });
 
@@ -222,7 +263,6 @@ describe("SQL Admin idempotent poster", () => {
     expect(JSON.stringify(poster.calls)).not.toContain("evil.example");
     expect(poster.seenBearers.every((value) => value === token)).toBe(true);
     expect(spec.posted).toBe(false);
-    expect(cloudSqlProxyApplies(spec)).toBe(false);
   });
 
   test("treats a 409 race as idempotent when the instance matches", async () => {

@@ -223,12 +223,13 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
   }
 }
 
-/** Refuse live runtime wiring until the private Cloud SQL body has a reviewed poster. */
+/** Defense in depth for runtime wiring; the stack's poster remains apply-only. */
 export function assertGcpRuntimeDeployable(inputs: GcpInputs): void {
-  if (inputs.bulls96?.enabled)
-    throw new Error(
-      "96bulls: the GCP 96Bulls release stays disabled until a reviewed resource posts the private-only Cloud SQL body. Nothing was created.",
-    );
+  if (
+    inputs.bulls96?.enabled &&
+    (!inputs.managedDataPlane.provision || inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
+  )
+    throw new Error("96bulls: GCP runtime wiring requires the acknowledged managed data plane. Nothing was created.");
 }
 
 export function relaycastChartValues(i: RelaycastChartInputs, defaultStorageClass = "standard-rwo") {
@@ -286,7 +287,7 @@ export function relayfileChartValues(i: RelayfileChartInputs) {
 export interface Bulls96ReleaseOutputs {
   bucket: unknown;
   region: string;
-  cloudSqlConnectionName: string;
+  cloudSqlConnectionName: unknown;
   redisHost: unknown;
   redisPort: unknown;
   pubsubTopic: unknown;

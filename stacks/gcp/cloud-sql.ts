@@ -9,8 +9,11 @@
  * `sqlAdminInsertRequest` builds the SQL Admin POST and does not send it.
  * `ensurePrivateCloudSql` gets the instance, inserts only when it is absent,
  * polls the operation, and passes the bearer credential only to that transport.
- * The stack calls the builder and does not call either poster or `GCP.SQL.Instance`.
+ * The stack calls it from an apply-time Alchemy Action; it never calls
+ * `GCP.SQL.Instance` because the pinned provider drops `privateNetwork`.
  */
+
+import type { Input } from "alchemy/Input";
 
 export interface SqlProviderCapabilities {
   /** True only when `GCP.SQL.Instance` accepts `privateNetwork` and passes it to Cloud SQL. */
@@ -31,7 +34,7 @@ export interface CloudSqlIpConfiguration {
 }
 
 export interface PrivateCloudSqlSpec {
-  /** This module does not call Cloud SQL. A later resource must post `insertBody` unchanged. */
+  /** The spec is inert until the apply-time Action posts `insertBody` unchanged. */
   posted: false;
   instanceName: string;
   connectionName: string;
@@ -148,7 +151,7 @@ export interface CloudSqlProxyWorkload {
             {
               name: "cloud-sql-proxy";
               image: typeof CLOUD_SQL_PROXY_IMAGE;
-              args: PrivateCloudSqlSpec["proxyArgs"];
+              args: readonly ["--private-ip", "--address=0.0.0.0", "--port=5432", Input<string>];
               ports: [{ name: "postgres"; containerPort: 5432 }];
               readinessProbe: { tcpSocket: { port: 5432 }; periodSeconds: 10 };
               livenessProbe: { tcpSocket: { port: 5432 }; periodSeconds: 20 };
@@ -162,15 +165,6 @@ export interface CloudSqlProxyWorkload {
 }
 
 const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
-
-/**
- * Apply the proxy only after a resource posts `insertBody`. The pinned
- * provider never does, so this stays false and the stack must not create
- * a proxy for an instance that does not exist.
- */
-export function cloudSqlProxyApplies(spec: PrivateCloudSqlSpec): boolean {
-  return spec.posted !== false && spec.ipv4Enabled === false && spec.proxyArgs[0] === "--private-ip";
-}
 
 const INSERT_BODY_KEYS = new Set(["name", "region", "databaseVersion", "settings"]);
 const INSERT_SETTINGS_KEYS = new Set(["tier", "availabilityType", "ipConfiguration"]);
@@ -263,6 +257,64 @@ export interface SqlAdminEnsureTransport {
     credential: SqlAdminCredential,
     signal?: AbortSignal,
   ): Promise<SqlAdminEnsureResponse>;
+}
+
+type SqlAdminFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+const SQL_ADMIN_ORIGIN = "https://sqladmin.googleapis.com";
+const SQL_ADMIN_INSERT_PATH =
+  /^\/v1\/projects\/[a-z][a-z0-9-]{4,28}[a-z0-9]\/instances$/;
+const SQL_ADMIN_GET_PATH =
+  /^\/v1\/projects\/[a-z][a-z0-9-]{4,28}[a-z0-9]\/(?:instances\/[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?|operations\/[A-Za-z0-9_-]{1,128})$/;
+
+/**
+ * Live SQL Admin transport for the apply-time poster. The bearer is attached
+ * only after the URL passes the exact HTTPS host/path allowlist; neither the
+ * request object nor the returned action output contains it.
+ */
+export function sqlAdminFetchTransport(fetcher: SqlAdminFetch = globalThis.fetch): SqlAdminEnsureTransport {
+  return {
+    async request(call, credential, signal) {
+      let url: URL;
+      try {
+        url = new URL(call.url);
+      } catch {
+        refuse("Cloud SQL Admin target is invalid.");
+      }
+      if (
+        url.origin !== SQL_ADMIN_ORIGIN ||
+        url.username ||
+        url.password ||
+        url.search ||
+        url.hash ||
+        !(
+          (call.method === "GET" && call.body === undefined && SQL_ADMIN_GET_PATH.test(url.pathname)) ||
+          (call.method === "POST" && call.body !== undefined && SQL_ADMIN_INSERT_PATH.test(url.pathname))
+        )
+      )
+        refuse("Cloud SQL Admin target is not approved.");
+      const response = await fetcher(url, {
+        method: call.method,
+        headers: {
+          accept: "application/json",
+          authorization: `Bearer ${credential.bearer}`,
+          ...(call.body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        body: call.body === undefined ? undefined : JSON.stringify(call.body),
+        signal,
+      });
+      const text = await response.text();
+      let body: unknown;
+      if (text.length > 0) {
+        try {
+          body = JSON.parse(text);
+        } catch {
+          body = undefined;
+        }
+      }
+      return { status: response.status, body };
+    },
+  };
 }
 
 export interface SqlAdminPollControl {
@@ -467,7 +519,7 @@ async function ask(
 /**
  * Get the private instance or create it, then poll the insert operation.
  * There is no default transport. A thrown or unreadable insert does not claim
- * the instance is absent. This function is not called by the stack.
+ * the instance is absent. The stack calls this only from an apply-time Action.
  */
 export async function ensurePrivateCloudSql(
   spec: PrivateCloudSqlSpec,
@@ -556,7 +608,11 @@ export async function ensurePrivateCloudSql(
 }
 
 /** In-cluster proxy. The instance connection name is a positional arg, and `--private-ip` is the first flag. */
-export function cloudSqlProxyWorkload(spec: PrivateCloudSqlSpec, workloadIdentityEmail: string): CloudSqlProxyWorkload {
+export function cloudSqlProxyWorkload(
+  spec: PrivateCloudSqlSpec,
+  workloadIdentityEmail: string,
+  postedConnectionName: Input<string>,
+): CloudSqlProxyWorkload {
   if (spec.posted !== false || spec.proxyArgs[0] !== "--private-ip" || spec.ipv4Enabled !== false)
     refuse("Cloud SQL proxy requires the private-only spec.");
   if (!GSA_EMAIL.test(workloadIdentityEmail))
@@ -592,7 +648,7 @@ export function cloudSqlProxyWorkload(spec: PrivateCloudSqlSpec, workloadIdentit
               {
                 name: "cloud-sql-proxy",
                 image: CLOUD_SQL_PROXY_IMAGE,
-                args: spec.proxyArgs,
+                args: ["--private-ip", "--address=0.0.0.0", "--port=5432", postedConnectionName],
                 ports: [{ name: "postgres", containerPort: 5432 }],
                 readinessProbe: { tcpSocket: { port: 5432 }, periodSeconds: 10 },
                 livenessProbe: { tcpSocket: { port: 5432 }, periodSeconds: 20 },

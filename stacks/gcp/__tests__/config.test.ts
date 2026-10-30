@@ -118,7 +118,7 @@ describe("GCP self-host contract", () => {
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96,
       }),
-    ).toThrow("private-only Cloud SQL body");
+    ).not.toThrow();
   });
 
   it("wires GCS, SQL, Redis, and Pub/Sub into the Helm release without secrets", () => {

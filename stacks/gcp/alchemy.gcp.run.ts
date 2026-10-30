@@ -14,6 +14,7 @@ import * as GCP from "@alchemy.run/gcp";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Redacted from "effect/Redacted";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,14 +34,58 @@ import {
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "./deploy-guard.ts";
 import {
   ALCHEMY_GCP_BETA_84_SQL,
-  cloudSqlProxyApplies,
   cloudSqlProxyWorkload,
+  ensurePrivateCloudSql,
   privateCloudSqlSpec,
-  sqlAdminInsertRequest,
+  sqlAdminFetchTransport,
+  type PrivateCloudSqlSpec,
 } from "./cloud-sql.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
+
+interface EnsurePrivateCloudSqlInput {
+  spec: PrivateCloudSqlSpec;
+  /** Resolved PSA output: establishes that the peering exists before the POST. */
+  privateServiceConnection: string;
+  proxyPrincipal: string;
+}
+
+interface EnsurePrivateCloudSqlOutput {
+  connectionName: string;
+  proxyPrincipal: string;
+  created: boolean;
+  operation: string | null;
+}
+
+const EnsurePrivateCloudSql = Alchemy.Action<
+  "96Bulls.GCP.EnsurePrivateCloudSql",
+  EnsurePrivateCloudSqlInput,
+  EnsurePrivateCloudSqlOutput,
+  GCP.GcpEnvironment
+>("96Bulls.GCP.EnsurePrivateCloudSql", (input) =>
+  Effect.gen(function* () {
+    if (!input.privateServiceConnection)
+      throw new Error("96bulls: private service connection was not resolved. Nothing was created.");
+    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
+    const project = /^\/projects\/([^/]+)\/global\/networks\//.exec(input.spec.privateNetwork)?.[1];
+    if (project !== live.project)
+      throw new Error("96bulls: Cloud SQL poster project differs from the resolved GCP project. Nothing was created.");
+    const result = yield* Effect.tryPromise(() =>
+      ensurePrivateCloudSql(
+        input.spec,
+        { bearer: Redacted.value(live.accessToken) },
+        sqlAdminFetchTransport(),
+      ),
+    );
+    return {
+      connectionName: input.spec.connectionName,
+      proxyPrincipal: input.proxyPrincipal,
+      created: result.created,
+      operation: result.operation,
+    };
+  }),
+);
 
 function readInputs(stage: string): GcpInputs {
   const path = join(ROOT, ".96bulls", stage, "gcp-inputs.json");
@@ -163,7 +208,7 @@ export default Alchemy.Stack(
       prefixLength: 20,
       description: `AgentWorkforce ${stage} managed-service peering`,
     });
-    yield* GCP.ServiceNetworking.Connection("private-services", {
+    const privateServices = yield* GCP.ServiceNetworking.Connection("private-services", {
       network: network.networkName,
       reservedPeeringRanges: [psaRange.addressName],
       deletionPolicy: "DELETE",
@@ -261,7 +306,7 @@ export default Alchemy.Stack(
     const dataPlane = i.managedDataPlane.provision
       ? yield* Effect.gen(function* () {
           // GCP.SQL.Instance would drop privateNetwork and can post a public instance.
-          // It is not called. The SQL Admin request is built and not sent.
+          // The apply-time Action below uses the exact private SQL Admin body instead.
           if (ALCHEMY_GCP_BETA_84_SQL.privateNetwork)
             throw new Error(
               "96bulls: Alchemy reports privateNetwork support. Review the insert body before posting it. Nothing was created.",
@@ -275,9 +320,11 @@ export default Alchemy.Stack(
             tier: i.managedDataPlane.cloudSqlTier,
             highAvailability: i.managedDataPlane.cloudSqlHa === true,
           });
-          const sqlInsert = sqlAdminInsertRequest(sql);
-          if (sqlInsert.sent !== false || sqlInsert.method !== "POST")
-            throw new Error("96bulls: Cloud SQL insert seam tried to send. Nothing was created.");
+          const sqlPoster = yield* EnsurePrivateCloudSql("private-cloud-sql", {
+            spec: sql,
+            privateServiceConnection: privateServices.name,
+            proxyPrincipal: workloadIdentityPrincipal(i, "96bulls", "cloud-sql-proxy"),
+          });
           const redis = yield* GCP.Redis.Instance("redis", {
             instanceId: gcpResourceName(stage, "redis"),
             location: i.region,
@@ -344,7 +391,7 @@ export default Alchemy.Stack(
 
           return {
             sql,
-            sqlInsert,
+            sqlPoster,
             redis: { host: redis.host, port: redis.port },
             pubsub: {
               topic: eventsTopicName,
@@ -436,20 +483,23 @@ export default Alchemy.Stack(
             cluster,
             manifest: { apiVersion: "v1", kind: "Namespace", metadata: { name: "96bulls" } },
           });
-          // The private body is specified. The proxy is rendered by cloudSqlProxyWorkload
-          // and applied only once that body is posted. This pin does not post it.
-          if (cloudSqlProxyApplies(dataPlane.sql)) {
-            yield* GCP.IAM.Member("workload-identity-96bulls-cloud-sql-proxy", {
-              kind: "iam.serviceAccount",
-              name: runtimeIdentity.name,
-              role: "roles/iam.workloadIdentityUser",
-              member: workloadIdentityPrincipal(i, "96bulls", "cloud-sql-proxy"),
-            });
-            const proxy = cloudSqlProxyWorkload(dataPlane.sql, runtimeEmail);
-            yield* Kubernetes.Manifest("cloud-sql-proxy-account", { cluster, manifest: proxy.serviceAccount });
-            yield* Kubernetes.Manifest("cloud-sql-proxy-service", { cluster, manifest: proxy.service });
-            yield* Kubernetes.Manifest("cloud-sql-proxy", { cluster, manifest: proxy.deployment });
-          }
+          // The poster output is an explicit dependency: neither this IAM
+          // edge nor the proxy deployment can apply before Cloud SQL is
+          // confirmed RUNNABLE with the exact private-only body.
+          yield* GCP.IAM.Member("workload-identity-96bulls-cloud-sql-proxy", {
+            kind: "iam.serviceAccount",
+            name: runtimeIdentity.name,
+            role: "roles/iam.workloadIdentityUser",
+            member: dataPlane.sqlPoster.proxyPrincipal,
+          });
+          const proxy = cloudSqlProxyWorkload(
+            dataPlane.sql,
+            runtimeEmail,
+            dataPlane.sqlPoster.connectionName,
+          );
+          yield* Kubernetes.Manifest("cloud-sql-proxy-account", { cluster, manifest: proxy.serviceAccount });
+          yield* Kubernetes.Manifest("cloud-sql-proxy-service", { cluster, manifest: proxy.service });
+          yield* Kubernetes.Manifest("cloud-sql-proxy", { cluster, manifest: proxy.deployment });
           const release = yield* Kubernetes.HelmChart("96bulls", {
             cluster,
             chart: "96bulls",
@@ -460,7 +510,7 @@ export default Alchemy.Stack(
             values: bulls96ReleaseValues(i.bulls96!, {
               bucket: lockerBucket,
               region: i.region,
-              cloudSqlConnectionName: dataPlane.sql.connectionName,
+              cloudSqlConnectionName: dataPlane.sqlPoster.connectionName,
               redisHost: dataPlane.redis.host,
               redisPort: dataPlane.redis.port,
               pubsubTopic: eventsTopicName,
