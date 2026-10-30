@@ -8,13 +8,11 @@ owner: mig-cutover-observability. Contract contributor: mig-e4-export-transform.
 | Input | Pin |
 | --- | --- |
 | Implementation base | `main` at `947d361bd1a37ab85bf892b84070f0c5ee18cad6` (carries #42) |
-| #57 output contract | `b2e3de78e9468aa4c32791e7e00434ad0e57e462`, one commit on that base |
+| #57 output contract | Candidate `bd57d4ff5d13cd74b9dafaea9b8b1e1f869e4df7`, on that base. Draft and unreviewed; the coordinator confirms the pin |
 
-**#57 will move:** mig-e4-export-transform owns the version bump and the result
-fields, and is adding them on top of this head. Repin when the coordinator sends
-the new reviewed head. Until then, the migration, function, trigger and their
-tests build on `main` at the pin above. The handler and consumer wait for the
-repin.
+The contract itself is in the #58 comment pinned to that head, and this doc follows
+its names. Until the coordinator confirms the pin, the migration, function, trigger
+and their tests build on `main` at the pin above, and the handler and consumer wait.
 
 ## Problem
 
@@ -29,21 +27,22 @@ has no database access.
 
 `main` (#42) writes record envelopes, and #57 writes `{table, row}` lines. **Both
 use `normalized/v1/relayhistory-{raw.content_sha256}.ndjson`,** with a create-only
-put. An identical retry succeeds, but different bytes at that key are refused. So
-an object left by one format would make the other fail on every retry until it
-dead-letters. A reader also couldn't tell the formats apart from the key.
+put, so an object left by one format would block the other, and a reader couldn't
+tell them apart from the key.
 
 **Decision:**
 
 - `{table, row}` from #57 is the only format. An envelope can't give this count:
   it holds records, not the rows the live triggers leave.
-- #57 sets `RELAYHISTORY_NORMALIZED_VERSION = 2`, so the key becomes
-  `normalized/v2/relayhistory-{raw.content_sha256}.ndjson`.
+- `RELAYHISTORY_NORMALIZED_VERSION = 2`, so the key becomes
+  `normalized/v2/relayhistory-{raw.content_sha256}.ndjson`. Done at the candidate
+  #57 head. An object at that key that isn't `{table, row}` is refused.
 - `normalized/v1` is retired, not supported. No reader may accept it, and nothing
   translates it. No code on `main` constructs the transform, so no worker can have
   written v1. A read-only check of the buckets is on the activation checklist.
-- Any change to projected bytes for the same input bumps the version. Otherwise it
-  hits the same refusal.
+- Any code change to projected bytes for the same input bumps the version. Without
+  a bump the new bytes aren't stored: the existing object is kept and the result is
+  flagged `output_divergent`.
 
 ## Flow
 
@@ -54,33 +53,52 @@ normalized-ready: sessions.record_normalized_event_count(...)
 ```
 
 The object is published first, so a record never names an object that isn't
-there. If the enqueue fails, `file-normalize` fails and retries; the identical put
-succeeds, and the record is sent again. The transform class keeps its object store
+there. If the enqueue fails, `file-normalize` fails and retries; the create hits the
+existing object, and the record is sent again. The transform class keeps its object store
 only. The stage handler around it does the send.
 
 ### Transform output
 
-`normalize()` returns its existing `outputKey` plus what the record needs. Counts
-come from the rows actually written, not from a second read.
+`normalize(pointer, {revision, workKey})` returns one of three results (#57):
+
+- **`NormalizedOutput`:** send the record.
+- **`{skipped: "stale_manifest"}`:** a delayed message. Nothing was published, no
+  record is sent, and that version's own event normalizes it.
+- **`{}`:** nothing to normalize, such as a harness log. No record is sent.
+
+The record, using the contract's names:
 
 ```ts
 interface NormalizedReady {
   v: 1;
-  orgId: string; workspaceId: string; harness: string; sessionId: string; machineId: string;
-  revision: number;            // manifest.revision
-  normalizedVersion: number;   // 2
-  workKey: string;             // the manifest version's work key
-  contentSha256: string;       // manifest.raw.content_sha256
-  objectKey: string;
-  objectSha256: string;        // sha256 of the published bytes
-  convergenceEvents: number;   // lines with table = convergence_events
-  unprojected: number;         // projection.unprojected
+  // From the authenticated TraceContext, never the manifest body.
+  org_id: string; workspace_id: string; harness: string; session_id: string; machine_id: string;
+  // From the stage message, never object metadata.
+  manifest_key: string; manifest_revision: number; work_key: string; trace_id: string;
+  source_content_sha256: string;
+  normalized_version: number;      // 2
+  output_key: string;
+  output_sha256: string;           // of the stored object
+  output_bytes: number;
+  convergence_event_count: number; // table = convergence_events lines in the stored object
+  unprojected_records: number;     // from this run's projection
+  output_reused: boolean;
+  output_divergent: boolean;
 }
 ```
 
+Count and checksum describe the stored object. On a create that's the bytes just
+written, and on a hit the transform reads the object back, so the record is true of
+what readers will see. The key is content-addressed, so a new revision with
+identical content reuses the object, whose metadata names the first revision. That
+is why `manifest_revision` comes from the stage message.
+
+The count is per machine stream, matching the `session_index` key, not per logical
+session. It is exact for projected rows when `unprojected_records > 0`, because
+those records have no `convergence_events` row live either.
+
 The record is parsed strictly at consumption, and an invalid one is not retried.
-Identity comes from `message.ctx` and must match `objectKeyIdentity(objectKey)`,
-never from the payload alone.
+Identity must also match `objectKeyIdentity(manifest_key)`.
 
 ## Schema
 
@@ -117,6 +135,7 @@ sessions.record_normalized_event_count(
   p_org_id, p_workspace_id, p_harness, p_session_id, p_machine_id,
   p_revision bigint, p_normalized_version integer, p_work_key text,
   p_content_sha256 bytea, p_object_sha256 bytea, p_event_count integer)
+-- p_object_sha256 is output_sha256, p_event_count is convergence_event_count
 RETURNS text  -- applied | replayed | stale | deleted
 ```
 
@@ -147,6 +166,9 @@ boundary.
 | 7 | Same revision and version, different object or count | Raise `CN002` |
 | 8 | Otherwise | `applied`: write the count and all provenance |
 
+The #58 contract allows a row at or below `manifest_revision` when the content
+matches. This is stricter on purpose: a row behind the record waits on case 1.
+
 A count is only ever applied to the exact revision the row holds. Index and
 normalize run on separate queues, so case 1 is normal: the count waits on retry
 until the index catches up, and it leaves no orphan rows.
@@ -156,6 +178,12 @@ until the index catches up, and it leaves no orphan rows.
 - **Replays are idempotent:** redelivery and DLQ replay land on 6, or on 3 once a
   newer revision has been indexed.
 - **Late work is harmless:** an older revision lands on 3.
+- **Identical content on a new revision applies** under 8, with the same checksum
+  and the new revision. Otherwise that session would fail the gate.
+- **Divergent output never reaches the function.** The consumer refuses a record
+  with `output_divergent = true` as `count_conflict`. On a hit the checksum is
+  always the stored object's, so rule 7 can't detect this case; it stays as a guard
+  against a replaced object.
 - **`event_count_recorded_at`** is written only on `applied`, so a replay changes
   no row.
 
@@ -193,6 +221,8 @@ same replay path. Only `applied` makes a count authoritative. `file-normalize`
 | Database unavailable | database code | Retries, then DLQ |
 | Bad record | `invalid_normalized_ready` | DLQ at once |
 | Mismatch | `count_conflict` | DLQ at once, and nothing is written |
+| `output_divergent` | `count_conflict` | DLQ at once, and nothing is written. The session fails the gate until a version bump or a fix and replay. Changed runtime Unicode tables can cause this too |
+| Marker missing | `relayhistory_export_marker_missing` | `file-normalize` refuses without retries, so no record exists |
 
 ## Metrics
 
@@ -237,19 +267,15 @@ A reader may ship only when all of these hold:
 If a reader needs this before then, making the column nullable (option B in #50)
 becomes mandatory.
 
+The marker question is closed (#58 contract). `client.relayhistory_export` persists
+across revisions, a backfill without one is refused rather than skipped, and a
+`resumed` epoch always follows a backfill. `resumed` isn't in `main`'s enum until #46.
+
 ## Open questions
 
-1. **Do live revisions keep the export marker?** `RelayhistoryExportTransform`
-   returns nothing unless the manifest carries `client.relayhistory_export`. A
-   post-backfill live revision that drops the marker, or a `resumed` session that
-   never had it, gets no object and no count, so it stays non-authoritative
-   forever. #58 requires every normalized revision to count. For
-   mig-e4-export-transform, this needs a contract answer.
-2. **Which sessions get normalized at all?** A session with no merged stream keeps
+1. **Which sessions get normalized at all?** A harness log gets `{}`, so it keeps
    the chunk sum and no provenance, so it fails the gate permanently. If a reader
    needs those, either they need a normalizer or the gate needs a stated exception.
-3. **Does `unprojected > 0` still count as exact?** Proposed: yes for the projected
-   rows, since that is what the live triggers would leave.
 
 ## Implementation plan
 
@@ -257,7 +283,7 @@ becomes mandatory.
    every migration. They cover each row of the ordering table, a decrease, a
    replay, the sticky trigger against `upsert_session_index`, a non-owner role and
    tenant-role denial.
-2. Repin to the reviewed #57 head once open question 1 is answered.
+2. Repin to the reviewed #57 head when the coordinator confirms it.
 3. Stage registration, handler, typed parser, consumer and the DLQ path, with tests.
 4. The `file-normalize` worker and its queue functions.
 5. Add the stage to the sampler's alert stages once #47 lands.
