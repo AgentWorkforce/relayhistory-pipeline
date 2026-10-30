@@ -27,6 +27,9 @@
     "migration:copy": "bun run src/migration/relayhistory-copy.ts",
     "migration:neon-fence": "bun run src/migration/relayhistory-neon-fence.ts",
     "migration:rebuild": "bun run src/migration/relayhistory-rebuild.ts",
+    "migration:reproject": "bun run src/migration/relayhistory-reproject.ts",
+    "migration:reverse": "bun run src/migration/relayhistory-reverse.ts",
+    "migration:sequence-fence": "bun run src/migration/relayhistory-sequence-fence.ts",
     "migration:verify": "bun run src/migration/relayhistory-verify.ts"
   },
   "dependencies": {
