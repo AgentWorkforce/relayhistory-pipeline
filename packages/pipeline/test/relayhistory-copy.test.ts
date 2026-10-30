@@ -84,6 +84,26 @@ describe("mirror (T0 copy set)", () => {
     expect(again).toMatchObject({ written: 0, deleted: 0, read: 4 });
   });
 
+  it("keeps rows only the target has when the table is shared", async () => {
+    await insert(source, `('a', 1, NULL, NULL, NULL, NULL, NULL, 'from-neon')`);
+    await insert(
+      target,
+      `('a', 1, NULL, NULL, NULL, NULL, NULL, 'stale'),
+       ('p', 7, NULL, NULL, NULL, NULL, NULL, 'pipeline-only')`,
+    );
+    const plan = await planTable(source as Queryable, target as Queryable, "tokens");
+    const result = await copyTable(source as Queryable, target as Queryable, plan, {
+      mode: "mirror",
+      chunkSize: 10,
+      keepTargetOnly: true,
+    });
+    expect(result).toMatchObject({ written: 1, deleted: 0 });
+    expect((await dump(target)).map((row) => row.label)).toEqual([
+      "from-neon",
+      "pipeline-only",
+    ]);
+  });
+
   it("changes nothing on a dry run", async () => {
     await insert(source, `('a', 1, NULL, NULL, NULL, NULL, NULL, 'one')`);
     await insert(target, `('z', 1, NULL, NULL, NULL, NULL, NULL, 'stale')`);

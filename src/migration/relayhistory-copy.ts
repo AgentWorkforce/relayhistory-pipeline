@@ -16,7 +16,7 @@
  *
  * Usage: RELAYHISTORY_SOURCE_URL=... BULLS_TARGET_URL=... \
  *   bun run migration:copy --mode=mirror|backfill --tables=a,b [--chunk-size=500]
- *   [--checkpoint=/secure/path.json] [--dry-run]
+ *   [--checkpoint=/secure/path.json] [--keep-target-only=machines] [--dry-run]
  */
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -173,6 +173,11 @@ export interface CopyOptions {
   mode: CopyMode;
   chunkSize: number;
   dryRun?: boolean;
+  /**
+   * Mirror only: keep target rows the source lacks. For tables another writer
+   * shares on Supabase (sessions.machines: pipeline-only machines).
+   */
+  keepTargetOnly?: boolean;
   /** Resume point from a checkpoint; null starts from the first key. */
   after?: unknown[] | null;
   onPage?: (result: TableResult) => Promise<void>;
@@ -202,7 +207,7 @@ export async function copyTable(
       )
     ).rows[0]!;
     const upper = page.last === null ? null : (JSON.parse(page.last) as string[]);
-    if (options.mode === "mirror") {
+    if (options.mode === "mirror" && !options.keepTargetOnly) {
       // Delete target rows in this key range the source no longer has. With no
       // source page left, the open-ended tail of target-only keys goes too.
       const stale = upper
@@ -247,7 +252,7 @@ export async function copyTable(
     if (page.n < options.chunkSize) {
       result.complete = true;
       // Backfill is done; mirror makes one more pass to clear trailing target-only keys.
-      if (options.mode !== "mirror") return result;
+      if (options.mode !== "mirror" || options.keepTargetOnly) return result;
     }
   }
 }
@@ -314,6 +319,9 @@ export async function main() {
   if (!Number.isInteger(chunkSize) || chunkSize < 1)
     throw new Error("--chunk-size must be a positive integer");
   const dryRun = process.argv.includes("--dry-run");
+  const keepTargetOnly = new Set(
+    (argument("keep-target-only") ?? "").split(",").filter(Boolean),
+  );
   const checkpointPath = argument("checkpoint");
   const checkpoint = await loadCheckpoint(checkpointPath, mode);
   const source = new pg.Pool({ connectionString: sourceUrl, max: 1, application_name: "96bulls-copy-source" });
@@ -335,6 +343,7 @@ export async function main() {
         mode,
         chunkSize,
         dryRun,
+        keepTargetOnly: keepTargetOnly.has(table),
         after: mode === "backfill" ? (previous?.after ?? null) : null,
         onPage: async (progress) => {
           checkpoint.tables[table] = { ...progress };
