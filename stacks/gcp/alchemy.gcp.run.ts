@@ -30,7 +30,13 @@ import {
   type GcpInputs,
 } from "./config.ts";
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "./deploy-guard.ts";
-import { ALCHEMY_GCP_BETA_84_SQL, cloudSqlProxyApplies, cloudSqlProxyWorkload, privateCloudSqlSpec } from "./cloud-sql.ts";
+import {
+  ALCHEMY_GCP_BETA_84_SQL,
+  cloudSqlProxyApplies,
+  cloudSqlProxyWorkload,
+  privateCloudSqlSpec,
+  sqlAdminInsertRequest,
+} from "./cloud-sql.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
@@ -251,8 +257,8 @@ export default Alchemy.Stack(
 
     const dataPlane = i.managedDataPlane.provision
       ? yield* Effect.gen(function* () {
-          // The private body is specified here. GCP.SQL.Instance would drop
-          // privateNetwork, so it is not called and the instance is not posted.
+          // GCP.SQL.Instance would drop privateNetwork and can post a public instance.
+          // It is not called. The SQL Admin request is built and not sent.
           if (ALCHEMY_GCP_BETA_84_SQL.privateNetwork)
             throw new Error(
               "96bulls: Alchemy reports privateNetwork support. Review the insert body before posting it. Nothing was created.",
@@ -266,6 +272,9 @@ export default Alchemy.Stack(
             tier: i.managedDataPlane.cloudSqlTier,
             highAvailability: i.managedDataPlane.cloudSqlHa === true,
           });
+          const sqlInsert = sqlAdminInsertRequest(sql);
+          if (sqlInsert.sent !== false || sqlInsert.method !== "POST")
+            throw new Error("96bulls: Cloud SQL insert seam tried to send. Nothing was created.");
           const redis = yield* GCP.Redis.Instance("redis", {
             instanceId: gcpResourceName(stage, "redis"),
             location: i.region,
@@ -332,6 +341,7 @@ export default Alchemy.Stack(
 
           return {
             sql,
+            sqlInsert,
             redis: { host: redis.host, port: redis.port },
             pubsub: {
               topic: eventsTopicName,

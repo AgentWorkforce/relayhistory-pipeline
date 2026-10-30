@@ -1,5 +1,15 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
-import { ALCHEMY_GCP_BETA_84_SQL, CLOUD_SQL_PROXY_IMAGE, cloudSqlProxyApplies, cloudSqlProxyWorkload, privateCloudSqlSpec } from "../cloud-sql.ts";
+import {
+  ALCHEMY_GCP_BETA_84_SQL,
+  CLOUD_SQL_PROXY_IMAGE,
+  cloudSqlProxyApplies,
+  cloudSqlProxyWorkload,
+  postPrivateCloudSqlInsert,
+  privateCloudSqlSpec,
+  sqlAdminInsertRequest,
+  type PrivateCloudSqlSpec,
+} from "../cloud-sql.ts";
 
 const input = {
   projectId: "agentworkforce-dev1",
@@ -63,5 +73,89 @@ describe("Cloud SQL private attachment", () => {
     );
     expect(JSON.stringify(proxy)).not.toMatch(/password|token|BEGIN /i);
     expect(() => cloudSqlProxyWorkload(spec, "not-an-email")).toThrow(/Nothing was created/);
+  });
+
+  test("builds a SQL Admin insert without sending it", () => {
+    const spec = privateCloudSqlSpec(input);
+    const request = sqlAdminInsertRequest(spec);
+    expect(request.sent).toBe(false);
+    expect(request.method).toBe("POST");
+    expect(request.url).toBe("https://sqladmin.googleapis.com/v1/projects/agentworkforce-dev1/instances");
+    expect(request.headers.authorization).toBe("Bearer");
+    expect(request.body).toEqual(spec.insertBody);
+    expect(spec.posted).toBe(false);
+    expect(JSON.stringify(request)).not.toContain("authorizedNetworks");
+    expect(JSON.stringify(request)).not.toContain("rootPassword");
+  });
+
+  test("refuses a public or secret insert before the transport is called", async () => {
+    const token = "ya29.secret-boundary";
+    async function posts(mutate: (spec: PrivateCloudSqlSpec) => void) {
+      const spec = privateCloudSqlSpec(input);
+      mutate(spec);
+      let calls = 0;
+      await expect(
+        postPrivateCloudSqlInsert(spec, {
+          post: async () => {
+            calls += 1;
+            return { operation: "projects/agentworkforce-dev1/operations/op-1" };
+          },
+        }),
+      ).rejects.toThrow(/Nothing was created/);
+      expect(calls).toBe(0);
+    }
+    await posts((spec) => {
+      (spec.insertBody.settings.ipConfiguration as { ipv4Enabled: boolean }).ipv4Enabled = true;
+    });
+    await posts((spec) => {
+      (spec.insertBody.settings.ipConfiguration as { authorizedNetworks?: unknown }).authorizedNetworks = [{ value: "0.0.0.0/0" }];
+    });
+    await posts((spec) => {
+      (spec.insertBody as { rootPassword?: string }).rootPassword = token;
+    });
+    await posts((spec) => {
+      spec.insertBody.settings.ipConfiguration.privateNetwork = "/projects/other-gcp-dev1/global/networks/awf-dev-vpc";
+    });
+    await posts((spec) => {
+      (spec as { posted: boolean }).posted = true;
+    });
+  });
+
+  test("posts only the private body through an injected transport and does not echo a credential", async () => {
+    const spec = privateCloudSqlSpec(input);
+    const token = "ya29.secret-boundary";
+    let seen = "";
+    const result = await postPrivateCloudSqlInsert(spec, {
+      post: async (request) => {
+        seen = JSON.stringify(request);
+        return { operation: "projects/agentworkforce-dev1/operations/op-1" };
+      },
+    });
+    expect(result).toEqual({ operation: "projects/agentworkforce-dev1/operations/op-1", sent: true });
+    expect(spec.posted).toBe(false);
+    expect(cloudSqlProxyApplies(spec)).toBe(false);
+    expect(seen).toContain("https://sqladmin.googleapis.com/v1/projects/agentworkforce-dev1/instances");
+    expect(seen).not.toContain(token);
+    await expect(
+      postPrivateCloudSqlInsert(spec, {
+        post: async () => {
+          throw new Error(`${token} was refused`);
+        },
+      }),
+    ).rejects.toThrow(/not accepted/);
+    await expect(
+      postPrivateCloudSqlInsert(spec, {
+        post: async () => ({ operation: "https://evil.example/operations/op-1" }),
+      }),
+    ).rejects.toThrow(/no operation/);
+  });
+
+  test("the Alchemy stack can prepare the insert and cannot post it or call GCP.SQL.Instance", () => {
+    const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+    const seam = readFileSync(new URL("../cloud-sql.ts", import.meta.url), "utf8");
+    expect(stack).toContain("sqlAdminInsertRequest");
+    expect(stack).not.toContain("postPrivateCloudSqlInsert");
+    expect(stack).not.toContain("GCP.SQL.Instance(");
+    expect(seam).not.toContain("fetch(");
   });
 });

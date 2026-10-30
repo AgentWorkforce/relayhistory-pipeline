@@ -5,8 +5,10 @@
  * `ipConfiguration.ipv4Enabled`. Extra fields are dropped, so this stack must
  * not call that resource. The body below is the SQL Admin insert shape a
  * later poster has to send: public IPv4 off, the VPC link, the Private
- * Service Access range, and no authorized networks. `posted` stays false
- * until that poster exists. Nothing in this module creates an instance.
+ * Service Access range, and no authorized networks. `posted` stays false.
+ * `sqlAdminInsertRequest` builds the SQL Admin POST and does not send it.
+ * `postPrivateCloudSqlInsert` sends only through an injected transport.
+ * The stack calls the builder and does not call the poster or `GCP.SQL.Instance`.
  */
 
 export interface SqlProviderCapabilities {
@@ -167,6 +169,97 @@ const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.i
  */
 export function cloudSqlProxyApplies(spec: PrivateCloudSqlSpec): boolean {
   return spec.posted !== false && spec.ipv4Enabled === false && spec.proxyArgs[0] === "--private-ip";
+}
+
+const INSERT_BODY_KEYS = new Set(["name", "region", "databaseVersion", "settings"]);
+const INSERT_SETTINGS_KEYS = new Set(["tier", "availabilityType", "ipConfiguration"]);
+const INSERT_IP_KEYS = new Set(["ipv4Enabled", "privateNetwork", "allocatedIpRange"]);
+const PRIVATE_NETWORK = /^\/projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
+const OPERATION_NAME = /^projects\/[a-z][a-z0-9-]{4,28}[a-z0-9]\/operations\/[A-Za-z0-9_-]{1,128}$/;
+
+export interface SqlAdminInsertRequest {
+  method: "POST";
+  url: string;
+  headers: { authorization: "Bearer"; "content-type": "application/json" };
+  body: PrivateCloudSqlSpec["insertBody"];
+  /** Building a request does not send it. */
+  sent: false;
+}
+
+export interface SqlAdminTransport {
+  /** Send `request` as the body. Keep the credential in the transport, not the request. */
+  post(request: SqlAdminInsertRequest): Promise<{ operation: string }>;
+}
+
+function exactKeys(value: object, allowed: ReadonlySet<string>, label: string): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) refuse(`Cloud SQL ${label} has unexpected field ${key}.`);
+  }
+}
+
+/** SQL Admin `instances.insert` for the private-only body. This function does not call the network. */
+export function sqlAdminInsertRequest(spec: PrivateCloudSqlSpec): SqlAdminInsertRequest {
+  if (spec.posted !== false || spec.ipv4Enabled !== false || spec.databaseVersion !== "POSTGRES_17")
+    refuse("Cloud SQL insert seam requires the unposted private-only spec.");
+  if (spec.proxyArgs[0] !== "--private-ip" || spec.proxyArgs.at(-1) !== spec.connectionName)
+    refuse("Cloud SQL insert seam lost --private-ip.");
+  const body = spec.insertBody;
+  exactKeys(body, INSERT_BODY_KEYS, "insert body");
+  exactKeys(body.settings, INSERT_SETTINGS_KEYS, "settings");
+  const ip = body.settings.ipConfiguration as object;
+  exactKeys(ip, INSERT_IP_KEYS, "ipConfiguration");
+  const network = PRIVATE_NETWORK.exec(body.settings.ipConfiguration.privateNetwork);
+  if (!network || body.settings.ipConfiguration.privateNetwork !== spec.privateNetwork)
+    refuse("Cloud SQL insert seam lost the VPC link.");
+  const projectId = network[1]!;
+  if (body.settings.ipConfiguration.ipv4Enabled !== false)
+    refuse("Cloud SQL insert seam would enable public IPv4.");
+  if (
+    body.settings.ipConfiguration.allocatedIpRange !== spec.allocatedIpRange ||
+    !SHORT_NAME.test(body.settings.ipConfiguration.allocatedIpRange)
+  )
+    refuse("Cloud SQL insert seam lost the Private Service Access range.");
+  if (body.name !== spec.instanceName || body.region !== spec.connectionName.split(":")[1])
+    refuse("Cloud SQL insert seam drifted off the instance name.");
+  if (body.databaseVersion !== "POSTGRES_17" || !TIER.test(body.settings.tier))
+    refuse("Cloud SQL insert seam drifted off PostgreSQL 17.");
+  if (body.settings.availabilityType !== "ZONAL" && body.settings.availabilityType !== "REGIONAL")
+    refuse("Cloud SQL insert seam drifted off the availability type.");
+  if (spec.connectionName !== `${projectId}:${body.region}:${body.name}`)
+    refuse("Cloud SQL insert seam drifted off the connection name.");
+  const rendered = JSON.stringify(body);
+  if (rendered.includes("authorizedNetworks") || rendered.includes("rootPassword") || rendered.includes("://") || rendered.includes("BEGIN "))
+    refuse("Cloud SQL insert body carries a public network or secret.");
+  return {
+    method: "POST",
+    url: `https://sqladmin.googleapis.com/v1/projects/${projectId}/instances`,
+    headers: { authorization: "Bearer", "content-type": "application/json" },
+    body: structuredClone(body),
+    sent: false,
+  };
+}
+
+/**
+ * Send the private-only insert through an injected transport.
+ * There is no default transport, and this function is not called by the stack.
+ */
+export async function postPrivateCloudSqlInsert(
+  spec: PrivateCloudSqlSpec,
+  transport: SqlAdminTransport,
+): Promise<{ operation: string; sent: true }> {
+  const request = sqlAdminInsertRequest(spec);
+  if (request.sent !== false || request.headers.authorization !== "Bearer")
+    refuse("Cloud SQL insert seam tried to carry a credential.");
+  const projectId = PRIVATE_NETWORK.exec(request.body.settings.ipConfiguration.privateNetwork)?.[1];
+  let result: { operation: string };
+  try {
+    result = await transport.post(request);
+  } catch {
+    refuse("Cloud SQL Admin insert was not accepted.");
+  }
+  if (!projectId || !OPERATION_NAME.test(result?.operation ?? "") || !result.operation.startsWith(`projects/${projectId}/operations/`))
+    refuse("Cloud SQL Admin insert returned no operation.");
+  return { operation: result.operation, sent: true };
 }
 
 /** In-cluster proxy. The instance connection name is a positional arg, and `--private-ip` is the first flag. */

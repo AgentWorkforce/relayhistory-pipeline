@@ -1,9 +1,9 @@
 # GCP self-hosted reference lane
 
-This lane is a concurrent, code-only implementation of the provider contract
-that will be proven after the AWS adapter contract is stable. Nothing in this
-document is evidence of a GCP deployment. No project, credentials, secret
-payload, DNS record, or cloud resource was created while implementing it.
+This lane is a code-only conformance implementation. Static work does not wait
+on the AWS adapter freeze. Nothing in this document is evidence of a GCP
+deployment. No project, credentials, secret payload, DNS record, or cloud
+resource was created while implementing it.
 
 The stack entry point is `stacks/gcp/alchemy.gcp.run.ts`. It uses the same
 Alchemy + AgentWorkforce Helm boundary as the AWS stack: cloud code declares
@@ -30,11 +30,12 @@ implementations own provider adapters.
   charts. Relayflows runs in standalone mode and is not in Relaycast's
   availability path.
 
-Cloud SQL is not created. The stack specifies public IPv4 off, the Private
-Service Access network and range, and `--private-ip` proxy routing, but the
-pinned Alchemy provider drops the private-network field. A supported poster for
-that exact private-only body remains a proof blocker; the stack does not fall
-back to a public instance.
+Cloud SQL is not created. The stack prepares a SQL Admin `instances.insert`
+for public IPv4 off, the Private Service Access network and range, and
+`--private-ip` proxy routing. `postPrivateCloudSqlInsert` is the only sender,
+it has no default transport, and the stack does not call it. `GCP.SQL.Instance`
+is not called, because that resource drops `privateNetwork` and can create a
+public instance.
 
 ## Truthful feature gates
 
@@ -131,9 +132,10 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
   `allocatedIpRange` set to the PSA range name, and no authorized networks.
   Proxy args are `--private-ip`, `--address=0.0.0.0`, `--port=5432`, and the
   connection name.
-- `@alchemy.run/gcp@2.0.0-beta.84` `GCP.SQL.Instance` still writes only
-  `ipv4Enabled`. The stack does not call it. `posted` is false, so apply does
-  not create the instance until a resource posts that body.
+- `sqlAdminInsertRequest` builds `POST https://sqladmin.googleapis.com/v1/projects/{project}/instances`
+  with that body and `sent: false`. `postPrivateCloudSqlInsert` sends it only
+  through an injected transport. The stack calls the builder and does not call
+  the poster. `@alchemy.run/gcp@2.0.0-beta.84` `GCP.SQL.Instance` is not called.
 - The Auth Proxy manifests stay unapplied while `posted` is false. The proxy
   Workload Identity binding is created with those manifests, not before them.
   The PSA range is still shared with Memorystore.
@@ -155,22 +157,75 @@ Release wiring that has not been applied:
   is written.
 - No create, write, read, search, replay, or teardown has run on GCP.
 
-## Proof plan
+## Apply, verify, and teardown
 
-AWS remains the first complete proof. This lane does not claim that proof.
-Static evidence already in this branch is the deployment-target guard, the
-chart-value contract, and the Locker provider selector. The cloud proof, after
-the AWS adapter contract is frozen and Khaliq approves an exact project, is:
+This runbook has not been executed. Static work does not wait on the AWS
+adapter freeze. No command below has been run. `bin/96bulls up` and
+`bin/96bulls down` refuse every `gcp-*` stage. `bin/96bulls plan gcp-*` calls
+`bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
+and is not proof. Do not run plan, deploy, or destroy until Khaliq names a new
+project in his own words.
 
-1. run the object-store suite against GCS under Workload Identity;
-2. run database migrations and queue/idempotency tests against Cloud SQL;
-3. run pub/sub and Redis reconnect, redelivery, ordering, and failover tests;
-4. run Relaycast core API/WebSocket/file conformance without provider branches;
-5. run a planted session through every enabled 96Bulls stage and retrieve its
-   exact trace and durable records;
-6. scan GCS objects, traces, and logs for the planted PII/secret markers;
-7. restart, node-drain, zone-failure, backup/restore, and secret-rotation tests;
-8. only then mark the GCP profile end-to-end ready.
+Create a new project. Do not reuse a project that is already visible on this
+account, including `agentworkforce-dev1`, `sharp-sled-512718-s4`, `skip-506702`,
+`gen-lang-client-0703389434`, `zeta-bonsai-489905-b1`, `relayroom-503219`,
+`agent-relay-internal`, `hoopsheet`, `file-by-agent-relay`,
+`invertible-vent-493717-j7`, or `gen-lang-client-0251203475`. Link billing to
+the new project. Use region `us-central1`. If `gcloud` asks to enable an API,
+stop and do not answer yes. Set `CLOUDSDK_CORE_DISABLE_PROMPTS=1`. The binary
+on this machine, when it is not on `PATH`, is
+`/home/khaliqgant/google-cloud-sdk/bin/gcloud`.
 
-Until those gates pass, the output is a buildable reference lane, not a fully
-proven self-hosted environment.
+Read-only preflight, after that project exists:
+
+```sh
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+export PROJECT=new-project-id
+export STAGE=gcp-conformance
+gcloud projects describe "$PROJECT" --format='value(projectId,projectNumber)'
+gcloud billing projects describe "$PROJECT" --format='value(billingEnabled,billingAccountName)'
+gcloud compute regions describe us-central1 --project="$PROJECT" --format='yaml(quotas)'
+```
+
+Stop if the project is one of the denied names, billing is off, or the quota
+read fails. Write `.96bulls/$STAGE/gcp-inputs.json` with that new project id,
+its project number, region `us-central1`, and no secret payload. Then:
+
+```sh
+export NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT="$PROJECT"
+bin/96bulls plan "$STAGE"
+```
+
+The plan must show the live project and region matching the inputs before the
+first resource. Resource order after that is: the listed Google APIs with
+`disableOnDestroy: false`, custom VPC, subnet `10.52.0.0/20`, Cloud NAT, a
+`/20` Private Service Access range, the service-networking connection, Autopilot
+GKE with private nodes, the versioned GCS bucket, the empty Secret Manager
+container, Artifact Registry, the runtime service account, Workload Identity for
+`96bulls-worker` and `96bulls-alleyoop`, `roles/storage.objectUser`, and
+`roles/cloudsql.client`. With `managedDataPlane.provision`, Memorystore Redis
+7.2 is created with AUTH off and TLS server authentication, and Pub/Sub is
+created with the dead-letter service agent. The Cloud SQL body is prepared as
+`sqlInsert` and is not posted. `GCP.SQL.Instance` must not appear as a resource.
+`bulls96.enabled` still throws before any resource, so this plan cannot install
+96Bulls until a reviewed change posts the insert and then lifts that guard.
+
+Verify, only after an approved apply and a wired poster:
+
+1. `gcloud sql instances describe INSTANCE --project="$PROJECT" --format='yaml(ipAddresses,settings.ipConfiguration)'` shows `ipv4Enabled: false`, the VPC `privateNetwork`, the PSA `allocatedIpRange`, and no `authorizedNetworks` or public address.
+2. The in-cluster proxy args start with `--private-ip`, and its Workload Identity binding exists only with that proxy.
+3. Redis `authEnabled` is false and `transitEncryptionMode` is `SERVER_AUTHENTICATION`. No `REDIS_AUTH` is in the workload env.
+4. Run the object-store suite against the GCS bucket under Workload Identity. Create, write, read, search, and replay one planted session through 96Bulls. `/readyz` and `/datapathz` return 200. Scan objects, traces, and logs for the planted markers.
+5. Pub/Sub redelivery reaches the dead-letter topic. Redis reconnects after a restart.
+
+Teardown, only after that apply, in this order:
+
+1. Delete the 96Bulls Helm release and the Cloud SQL proxy.
+2. Delete the Cloud SQL instance before the network. The poster is not an Alchemy resource, so `alchemy destroy` will not delete it until a later change puts it in the graph. Delete that instance by the prepared name if it exists.
+3. Delete Redis, Pub/Sub, and the GKE cluster.
+4. Delete the service-networking connection, the PSA range, Cloud NAT, the subnet, and the VPC.
+5. Empty the versioned GCS bucket. `forceDestroy` is false, so destroy fails while objects remain. Then delete the bucket, Artifact Registry repository, empty Secret Manager container, and runtime service account.
+6. `bunx alchemy destroy --config stacks/gcp/alchemy.gcp.run.ts --stage "$STAGE" --no-input` with the same confirm env. APIs stay enabled because the stack sets `disableOnDestroy: false`. On this dedicated project, disable those APIs only after the lists below are empty.
+7. Read-only proof of empty: `gcloud sql instances list`, `gcloud redis instances list --region=us-central1`, `gcloud container clusters list`, `gcloud compute networks list`, and `gcloud storage ls` against `$PROJECT` return no lane resources.
+
+Do not delete the project until those lists are empty, and do not delete it without a separate request from Khaliq. Production remains Supabase and AWS S3. This lane is not end-to-end ready until the verify steps have passed on that new project.
