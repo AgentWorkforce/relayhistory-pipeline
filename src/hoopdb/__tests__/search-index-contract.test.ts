@@ -105,6 +105,26 @@ describe("production search index contract", () => {
     expect(auditSearchIndexes(rows, READY).passed).toBe(true);
   });
 
+  test("normalizes SQL structure without changing string literals", () => {
+    const rows = catalogRows();
+    const row = rows.find((candidate) => candidate.index_name === "convergence_events_opening_prompt_idx")!;
+    row.predicate = row.predicate!
+      .replaceAll("kind", "KIND")
+      .replaceAll("actor_role", "ACTOR_ROLE")
+      .replaceAll("text", "TEXT")
+      .replaceAll("length", "LENGTH")
+      .replaceAll("content", "CONTENT")
+      .replaceAll("coalesce", "COALESCE");
+    expect(auditSearchIndexes(rows, READY).passed).toBe(true);
+
+    row.predicate = row.predicate.replace("'user'::TEXT", "'USER'::TEXT");
+    const report = auditSearchIndexes(rows, READY);
+    expect(report.passed).toBe(false);
+    expect(report.indexes.find((index) => index.indexName === row.index_name)?.reasons).toContain(
+      "predicate mismatch",
+    );
+  });
+
   test("fails until the agent lookup projection rollout is complete", () => {
     const report = auditSearchIndexes(catalogRows(), { agentLookupRolloutComplete: false });
     expect(report.passed).toBe(false);

@@ -207,12 +207,39 @@ function normalized(value: string | null | undefined): string {
 }
 
 function normalizedPredicate(value: string | null | undefined): string {
-  return (value ?? "")
+  const literals: string[] = [];
+  let masked = "";
+  const input = value ?? "";
+  for (let index = 0; index < input.length;) {
+    if (input[index] !== "'") {
+      masked += input[index];
+      index += 1;
+      continue;
+    }
+    const start = index;
+    index += 1;
+    while (index < input.length) {
+      if (input[index] !== "'") {
+        index += 1;
+        continue;
+      }
+      if (input[index + 1] === "'") {
+        index += 2;
+        continue;
+      }
+      index += 1;
+      break;
+    }
+    masked += `\u0001${literals.length}\u0002`;
+    literals.push(input.slice(start, index));
+  }
+  return masked
     .toLowerCase()
     .replace(/"/g, "")
     .replace(/\s+/g, " ")
     .replace(/\s*,\s*/g, ", ")
-    .trim();
+    .trim()
+    .replace(/\u0001(\d+)\u0002/g, (_marker, offset: string) => literals[Number(offset)] ?? "");
 }
 
 export type SearchIndexReadiness = {
