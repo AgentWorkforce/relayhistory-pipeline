@@ -20,6 +20,8 @@ import {
   resolveCloudId,
   revokeGrants,
   shardIdempotencyKey,
+  isValidIdempotencyKey,
+  GrantClientError,
   validateIdMapping,
   EMPTY_ID_MAPPING,
   type ApplyConfig,
@@ -85,30 +87,45 @@ const input = (over: Partial<PlanInput> = {}): PlanInput => ({
   ...over,
 });
 
+/**
+ * RelayAuth #111 + #112 grant routes, in memory: Idempotency-Key is required
+ * and validated; the same key with the same request returns the original
+ * grant (replayed), the same key with another request is 409
+ * idempotency_key_conflict. The raw key is held only to compare, like the
+ * server's receipt hash.
+ */
 class FakeRelayAuth implements GrantClient {
-  grants = new Map<string, { revokedAt: string | null; key: string }>();
+  grants = new Map<string, { revokedAt: string | null; key: string; fingerprint: string; createdAt: string }>();
   creates = 0;
   revokes = 0;
   keys: string[] = [];
-  failCreateAt?: number;
+  replays = 0;
+  /** The n-th create is refused with this answer. */
+  refuseCreateAt?: { n: number; code: string; status: number };
+  /** The n-th create (or every create from n on) lands but its response is lost. */
   loseCreateAt?: number;
-  constructor(readonly supportsIdempotencyKey = false) {}
+  loseFrom?: number;
   async createGrant(req: Parameters<GrantClient["createGrant"]>[0]) {
     this.creates += 1;
     this.keys.push(req.idempotencyKey);
-    if (this.failCreateAt === this.creates) throw new Error("relayauth 503");
-    // With Idempotency-Key support, the same key returns the same grant.
-    const existing = this.supportsIdempotencyKey ? [...this.grants].find(([, g]) => g.key === req.idempotencyKey) : undefined;
+    if (!isValidIdempotencyKey(req.idempotencyKey)) throw new GrantClientError("invalid_idempotency_key", 400);
+    if (this.refuseCreateAt?.n === this.creates) throw new GrantClientError(this.refuseCreateAt.code, this.refuseCreateAt.status);
+    const fingerprint = sha(JSON.stringify({ a: req.apiKeyId, u: req.audience, n: req.notAfter, p: req.plan }));
+    const existing = [...this.grants].find(([, g]) => g.key === req.idempotencyKey);
+    if (existing && existing[1].fingerprint === "") existing[1].fingerprint = fingerprint; // seeded orphan
+    if (existing && existing[1].fingerprint !== fingerprint) throw new GrantClientError("idempotency_key_conflict", 409);
     const grantId = existing?.[0] ?? `mgr_${randomBytes(16).toString("hex")}`;
+    if (!existing) this.grants.set(grantId, { revokedAt: null, key: req.idempotencyKey, fingerprint, createdAt: new Date(NOW).toISOString() });
+    else this.replays += 1;
+    if (this.loseCreateAt === this.creates || (this.loseFrom !== undefined && this.creates >= this.loseFrom)) throw new Error("response lost");
+    const g = this.grants.get(grantId)!;
     const derived = deriveMigrationGrantPlan({ grantId, orgId: ORG, plan: req.plan });
-    if (!existing) this.grants.set(grantId, { revokedAt: null, key: req.idempotencyKey });
-    if (this.loseCreateAt === this.creates) throw new Error("response lost");
-    return { grantId, orgId: ORG, planDigest: derived.planDigest, allowedPairs: derived.allowedPairs, planEntries: derived.plan.manifests.length, createdAt: new Date(NOW).toISOString() };
+    return { grantId, orgId: ORG, planDigest: derived.planDigest, allowedPairs: derived.allowedPairs, planEntries: derived.plan.manifests.length, createdAt: g.createdAt, revokedAt: g.revokedAt, replayed: !!existing };
   }
   async revokeGrant(grantId: string) {
     this.revokes += 1;
     const g = this.grants.get(grantId);
-    if (!g) throw new Error("grant_not_found");
+    if (!g) throw new GrantClientError("grant_not_found", 404);
     g.revokedAt = new Date(NOW + this.revokes).toISOString();
     return { grantId, revokedAt: g.revokedAt };
   }
@@ -312,26 +329,16 @@ describe("apply fails closed", () => {
     expect(client.creates).toBe(0);
   });
 
-  test("without Idempotency-Key support, a lost create response halts the run", async () => {
+  test("retries exhausted on lost responses: halt, compensating revoke, then previous_run_failed", async () => {
     const { cfg, client } = await approved();
-    client.loseCreateAt = 2;
+    client.loseFrom = 2;
     const first = await applyGrants(cfg);
     expect(first.failed).toMatchObject({ error: "response lost" });
+    expect(client.creates).toBe(1 + 4); // shard 2: the first try and 3 retries, all with one key
+    expect(new Set(client.keys.slice(1)).size).toBe(1);
     expect(first.compensation!.revoked).toHaveLength(1);
     expect(first.compensation!.unresolved).toHaveLength(1);
     await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "previous_run_failed" });
-    expect(client.creates).toBe(2);
-  });
-
-  test("a process killed mid-create (pending, no failure recorded) is partial_shard_state", async () => {
-    const { cfg, client, dir } = await approved();
-    const first = await applyGrants({ ...cfg, maxNewShards: 1 });
-    const path = join(dir, "grant-ledger.json");
-    const ledger = JSON.parse(await readFile(path, "utf8"));
-    ledger.shards["f".repeat(32)] = { status: "pending", run_id: "r", started_at: new Date(NOW).toISOString() };
-    await writeFile(path, JSON.stringify(ledger));
-    await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "partial_shard_state" });
-    expect(client.creates).toBe(first.created.length);
   });
 });
 
@@ -341,7 +348,8 @@ describe("Idempotency-Key", () => {
     const keys = plan.shards.map((s) => shardIdempotencyKey(s.shard_id, plan.aggregate_digest));
     expect(keys).toEqual(plan.shards.map((s) => shardIdempotencyKey(s.shard_id, plan.aggregate_digest)));
     expect(new Set(keys).size).toBe(keys.length);
-    expect(keys.every((k) => /^[0-9a-f]{64}$/.test(k))).toBe(true);
+    expect(keys.every(isValidIdempotencyKey)).toBe(true);
+    expect(keys.every((k) => /^[A-Za-z0-9_-]{43}$/.test(k))).toBe(true); // base64url sha256
     // A re-approved plan (another not-after) gets new keys for the same shards.
     const other = await lifecyclePlan(input({ grant: { ...GRANT, notAfter: "2026-12-01T00:00:00.000Z" } }));
     expect(other.shards.map((s) => s.shard_id)).toEqual(plan.shards.map((s) => s.shard_id));
@@ -358,8 +366,8 @@ describe("Idempotency-Key", () => {
     for (const k of client.keys) expect(everything).not.toContain(k);
   });
 
-  test("with support, a lost response is recovered by retrying with the same key: no duplicate, no halt", async () => {
-    const { cfg, client } = await approved({}, new FakeRelayAuth(true));
+  test("a lost response is recovered by retrying with the same key: the original grant is replayed, no duplicate, no halt", async () => {
+    const { cfg, client } = await approved();
     client.loseCreateAt = 2;
     const result = await applyGrants(cfg);
     expect(result.failed).toBeUndefined();
@@ -367,15 +375,74 @@ describe("Idempotency-Key", () => {
     expect(client.creates).toBe(4); // one retry
     expect(client.keys[1]).toBe(client.keys[2]); // same key on the retry
     expect(client.grants.size).toBe(3); // no duplicate grant
+    expect(client.replays).toBe(1); // Idempotent-Replayed on the retry
     expect(client.live()).toBe(3);
   });
 
-  test("with support, a shard left pending by a killed process is resumed with the same key", async () => {
-    const { cfg, client, dir, plan } = await approved({}, new FakeRelayAuth(true));
+  test("409 idempotency_key_conflict halts: no retry, compensating revoke, then previous_run_failed", async () => {
+    const { cfg, client } = await approved();
+    client.refuseCreateAt = { n: 2, code: "idempotency_key_conflict", status: 409 };
+    const result = await applyGrants(cfg);
+    expect(result.failed).toMatchObject({ error: "relayauth refused: idempotency_key_conflict" });
+    expect(client.creates).toBe(2);
+    expect(result.compensation!.revoked).toHaveLength(1);
+    expect(client.live()).toBe(0);
+    await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "previous_run_failed" });
+  });
+
+  test("a real conflict (same key, another request) is refused by the fake and halts the run", async () => {
+    const { cfg, client, plan } = await approved();
+    // Someone used shard 0's key for another request first.
+    client.grants.set(`mgr_${"b".repeat(32)}`, { revokedAt: null, key: shardIdempotencyKey(plan.shards[0]!.shard_id, plan.aggregate_digest), fingerprint: "other", createdAt: new Date(NOW).toISOString() });
+    const result = await applyGrants(cfg);
+    expect(result.failed).toMatchObject({ shard_id: plan.shards[0]!.shard_id, error: "relayauth refused: idempotency_key_conflict" });
+    expect(result.created).toEqual([]);
+  });
+
+  test("a replayed grant that is already revoked halts the run", async () => {
+    const { cfg, client, plan, dir } = await approved();
+    const first = await applyGrants({ ...cfg, maxNewShards: 1 });
+    const id = first.created[0]!.grant_id;
+    client.grants.get(id)!.revokedAt = new Date(NOW).toISOString(); // revoked out of band
+    // The ledger lost its record (pending): the retry replays the revoked grant.
+    const path = join(dir, "grant-ledger.json");
+    const ledger = JSON.parse(await readFile(path, "utf8"));
+    ledger.shards[plan.shards[0]!.shard_id] = { status: "pending", run_id: "dead", started_at: new Date(NOW).toISOString() };
+    await writeFile(path, JSON.stringify(ledger));
+    const result = await applyGrants(cfg);
+    expect(result.failed).toMatchObject({ error: "RelayAuth replayed a grant that is already revoked" });
+  });
+
+  test("the key never appears in stdout, stderr, the ledger, evidence or results", async () => {
+    const { cfg, client, dir, plan } = await approved();
+    client.loseCreateAt = 2;
+    client.refuseCreateAt = { n: 4, code: "idempotency_key_conflict", status: 409 };
+    const written: string[] = [];
+    const out = process.stdout.write.bind(process.stdout);
+    const err = process.stderr.write.bind(process.stderr);
+    process.stdout.write = ((chunk: string | Uint8Array) => (written.push(String(chunk)), true)) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: string | Uint8Array) => (written.push(String(chunk)), true)) as typeof process.stderr.write;
+    let result: unknown;
+    try {
+      result = await applyGrants(cfg);
+      await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest }).catch(() => undefined);
+    } finally {
+      process.stdout.write = out;
+      process.stderr.write = err;
+    }
+    const files = await readdir(dir);
+    const everything = [written.join(""), JSON.stringify(result), ...(await Promise.all(files.map((f) => readFile(join(dir, f), "utf8"))))].join("\n");
+    expect(client.keys.length).toBeGreaterThan(2);
+    for (const k of new Set(client.keys)) expect(everything).not.toContain(k);
+  });
+
+  test("a shard left pending by a killed process is resumed with the same key: the original grant comes back", async () => {
+    const { cfg, client, dir, plan } = await approved();
     // The create landed in RelayAuth, then the process died before recording it.
     const orphan = `mgr_${"a".repeat(32)}`;
     const shard0 = plan.shards[0]!.shard_id;
-    client.grants.set(orphan, { revokedAt: null, key: shardIdempotencyKey(shard0, plan.aggregate_digest) });
+    // Fingerprint "": the fake adopts the first request's (it is that shard's own create).
+    client.grants.set(orphan, { revokedAt: null, key: shardIdempotencyKey(shard0, plan.aggregate_digest), fingerprint: "", createdAt: new Date(NOW).toISOString() });
     await writeFile(join(dir, "grant-ledger.json"), JSON.stringify({ version: 1, aggregate_digest: plan.aggregate_digest, source_snapshot_id: plan.source_snapshot.snapshot_id, shards: { [shard0]: { status: "pending", run_id: "dead", started_at: new Date(NOW).toISOString() } } }));
     const result = await applyGrants(cfg);
     expect(result.created.find((c) => c.shard_id === shard0)?.grant_id).toBe(orphan); // recovered, not duplicated
@@ -398,9 +465,9 @@ describe("apply, idempotency and compensation", () => {
 
   test("a create failing partway revokes the grants created in that run, with evidence", async () => {
     const { cfg, client, dir } = await approved();
-    client.failCreateAt = 3;
+    client.refuseCreateAt = { n: 3, code: "bad_request", status: 400 };
     const result = await applyGrants(cfg);
-    expect(result.failed).toMatchObject({ error: "relayauth 503" });
+    expect(result.failed).toMatchObject({ error: "relayauth refused: bad_request" });
     expect(result.compensation).toMatchObject({ reason: "compensating", unresolved: [{ shard_id: expect.any(String) }], failed: [] });
     expect(result.compensation!.revoked.map((r) => r.grant_id).sort()).toEqual(result.created.map((c) => c.grant_id).sort());
     expect(client.live()).toBe(0);

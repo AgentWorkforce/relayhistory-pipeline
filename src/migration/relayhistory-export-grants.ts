@@ -27,21 +27,22 @@
  * - any pair or session exception (`pair_exceptions`);
  * - digest drift (`digest_drift`);
  * - partial shard state from an earlier run: an apply that failed partway
- *   (`previous_run_failed`), a shard whose create was started but never
- *   recorded (`partial_shard_state`; its grant may exist, so a human
- *   reconciles it), a ledger of another plan (`ledger_mismatch`), or a plan
- *   already rolled back (`plan_rolled_back`);
+ *   (`previous_run_failed`), a ledger of another plan (`ledger_mismatch`), or
+ *   a plan already rolled back (`plan_rolled_back`). A shard whose create
+ *   started but was never recorded is not a blocker any more: it is resumed
+ *   with the same Idempotency-Key, and RelayAuth returns the original grant;
  * - a target origin (audience) not in the configured allow-list
  *   (`unrecognized_origin`).
  *
  * Re-applying the same approved plan is idempotent: shards recorded as created
  * are skipped by shard id, so no duplicate grant. Each create carries an
- * `Idempotency-Key` derived from the shard id and the approved plan
- * version (`shardIdempotencyKey`, never logged or stored). RelayAuth is adding
- * support in a stacked PR; once a client reports `supportsIdempotencyKey`, a
- * lost response is recovered by retrying with the same key. Until then a
- * create whose response is lost leaves the shard `pending` and halts the run
- * for a human to reconcile.
+ * `Idempotency-Key` (relayauth #112 @b4a4c99b, required) derived from the
+ * shard id and the approved plan version (`shardIdempotencyKey`, never logged
+ * or stored). A lost response is recovered by retrying with the same key: the
+ * same key with the same request returns the original grant (201,
+ * `Idempotent-Replayed: true`). A 409 `idempotency_key_conflict`, any other
+ * refusal, a replayed grant that is already revoked, or retries exhausted
+ * halt the run (compensating revoke, then `previous_run_failed`).
  *
  * If a create fails partway, apply revokes the grants it created in that same
  * run (compensating revoke) and returns the evidence. `revoke` without shard
@@ -499,13 +500,27 @@ export async function lifecycleDryRun(input: PlanInput) {
 // ---------------------------------------------------------------- RelayAuth
 
 /** The RelayAuth #111 grant routes this command uses (`POST /v1/migration-grants`, `POST /:id/revoke`). */
+/**
+ * A refusal RelayAuth answered (an HTTP status and error code). Anything else
+ * a client throws (timeout, connection loss) is a lost response.
+ */
+export class GrantClientError extends Error {
+  constructor(readonly code: string, readonly status: number) {
+    super(`relayauth refused: ${code}`);
+    this.name = "GrantClientError";
+  }
+  /** A 5xx or 429 may be retried with the same key; a 4xx answer is final. */
+  get retryable(): boolean {
+    return this.status >= 500 || this.status === 429;
+  }
+}
+
 export interface GrantClient {
   /**
-   * True once RelayAuth honours `Idempotency-Key` on grant create (a stacked
-   * relayauth PR). Until then a lost create response halts the run.
+   * `POST /v1/migration-grants` with `idempotencyKey` in the `Idempotency-Key`
+   * header (never log it). Throws GrantClientError for a refusal; `replayed`
+   * is the `Idempotent-Replayed: true` response header.
    */
-  readonly supportsIdempotencyKey: boolean;
-  /** `idempotencyKey` goes in the `Idempotency-Key` header; never log it. */
   createGrant(request: { apiKeyId: string; audience: string; notAfter: string; plan: { exported_at: string; manifests: UploadInput[] }; idempotencyKey: string }): Promise<{
     grantId: string;
     orgId: string;
@@ -513,6 +528,8 @@ export interface GrantClient {
     allowedPairs: { sourceUserId: string; workspaceId: string }[];
     planEntries: number;
     createdAt: string;
+    revokedAt: string | null;
+    replayed: boolean;
   }>;
   revokeGrant(grantId: string): Promise<{ grantId: string; revokedAt: string }>;
 }
@@ -601,11 +618,22 @@ async function revokeShards(dir: string, ledger: Ledger, client: GrantClient, id
  * the ledger, the plan, results or evidence).
  */
 export function shardIdempotencyKey(shardId: string, aggregateDigest: string): string {
-  return sha256Hex(`relayhistory-export-grant\nlifecycle=${LIFECYCLE_VERSION}\ncontract=${PLAN_CONTRACT}\nplanner=${SHARD_PLANNER_VERSION}\nplan=${aggregateDigest}\nshard=${shardId}`);
+  // base64url(sha256(...)): 43 chars of [A-Za-z0-9_-], as relayauth #112
+  // requires (32-128 chars, at least 8 distinct). Re-derived deterministically
+  // in the (astronomically unlikely) case of too few distinct characters.
+  for (let n = 0; ; n++) {
+    const key = createHash("sha256")
+      .update(`relayhistory-export-grant\nlifecycle=${LIFECYCLE_VERSION}\ncontract=${PLAN_CONTRACT}\nplanner=${SHARD_PLANNER_VERSION}\nplan=${aggregateDigest}\nshard=${shardId}${n ? `\nn=${n}` : ""}`)
+      .digest("base64url");
+    if (isValidIdempotencyKey(key)) return key;
+  }
 }
 
-/** Retries of a create whose response was lost, with the same key (only when supported). */
-const LOST_RESPONSE_RETRIES = 2;
+/** relayauth #112's rule: 32-128 chars of A-Za-z0-9_- with at least 8 distinct. */
+export const isValidIdempotencyKey = (key: string) => /^[A-Za-z0-9_-]{32,128}$/.test(key) && new Set(key).size >= 8;
+
+/** Retries of a create whose response was lost, always with the same key. */
+const LOST_RESPONSE_RETRIES = 3;
 
 export interface ApplyConfig extends PlanInput {
   execute: boolean;
@@ -660,10 +688,8 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
   const ledger: Ledger = prior ?? { version: LIFECYCLE_VERSION, aggregate_digest: plan.aggregate_digest, source_snapshot_id: plan.source_snapshot.snapshot_id, shards: {} };
   if (ledger.halted) refuse("previous_run_failed", "an earlier apply failed partway; check its revocation evidence and RelayAuth before going on");
   const states = Object.values(ledger.shards);
-  // A create that started but was never recorded: with Idempotency-Key the
-  // same key recovers it; without, a human must reconcile it first.
-  if (states.some((s) => s.status === "pending") && !cfg.client.supportsIdempotencyKey)
-    refuse("partial_shard_state", "a shard's create was started but never recorded; reconcile it in RelayAuth first");
+  // A create that started but was never recorded is resumed below with the
+  // same Idempotency-Key; RelayAuth returns the original grant if it exists.
   if (states.some((s) => s.status === "revoked")) refuse("plan_rolled_back", "this plan's grants were revoked; approve a new plan to start again");
 
   const runId = randomUUID();
@@ -683,17 +709,19 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
     let grantId: string | undefined;
     try {
       const request = { apiKeyId: cfg.grant.apiKeyId, audience: cfg.grant.audience, notAfter: cfg.grant.notAfter, plan: shard.plan, idempotencyKey: shardIdempotencyKey(shard.shard_id, plan.aggregate_digest) };
-      // A lost response is recovered by retrying with the same key, once
-      // RelayAuth honours it; until then the first failure halts the run.
+      // A lost response (or a 5xx) is retried with the same key; RelayAuth
+      // answers a retry with the original grant. A 4xx answer (409
+      // idempotency_key_conflict included) is final and halts the run.
       let out: Awaited<ReturnType<GrantClient["createGrant"]>> | undefined;
       for (let attempt = 0; !out; attempt++) {
         try {
           out = await cfg.client.createGrant(request);
         } catch (e) {
-          if (!cfg.client.supportsIdempotencyKey || attempt >= LOST_RESPONSE_RETRIES) throw e;
+          if ((e instanceof GrantClientError && !e.retryable) || attempt >= LOST_RESPONSE_RETRIES) throw e;
         }
       }
       grantId = out.grantId;
+      if (out.revokedAt !== null) throw new Error("RelayAuth replayed a grant that is already revoked");
       // The grant must hold exactly this shard: re-derive with its id.
       const derived = deriveMigrationGrantPlan({ grantId: out.grantId, orgId: plan.org_id, plan: shard.plan });
       if (out.planDigest !== derived.planDigest || !sameJson(out.allowedPairs, derived.allowedPairs) || out.planEntries !== derived.plan.manifests.length || out.orgId !== plan.org_id)

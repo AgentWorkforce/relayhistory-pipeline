@@ -164,10 +164,12 @@ ids are Cloud's ids is unverified, so the real reader stays unwired.
   identity in the same org.
 - **Blockers:** any invalid, alias, default, inactive, cross-org, unknown or
   ambiguous id blocks its shard and the run.
-- **Idempotency:** each grant create sends a per-shard `Idempotency-Key`,
-  derived from the shard id and the approved plan (its aggregate
-  digest) and never stored. Until
-  RelayAuth supports it, a lost create response still halts the run.
+- **Idempotency (relayauth #112):** each grant create sends a per-shard
+  `Idempotency-Key`: base64url of a sha256 over the shard id, the approved
+  aggregate digest and the versions. It is never stored or logged. A lost
+  response is retried with the same key, and RelayAuth replays the original
+  grant. A 409 `idempotency_key_conflict`, any other 4xx, a replayed grant
+  that is already revoked, or retries running out halts the run.
 
 **Not active:** the CLI refuses `apply` and `revoke`. Activation waits for the
 authoritative membership reader, the E3 HOLDs, and Khaliq's OK.
