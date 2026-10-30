@@ -1,7 +1,7 @@
 import { isIP } from "node:net";
 import { connect } from "node:net";
 import type { KubernetesExecutorInputs } from "./config.ts";
-import type { GcpApplyAuthorizationProof } from "./apply-authorization.ts";
+import { assertGcpApplyLeaseActive, type GcpApplyAuthorizationProof } from "./apply-authorization.ts";
 
 const EXECUTOR_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{2,62}$/;
 
@@ -17,8 +17,15 @@ export interface KubernetesReachabilityProof {
   mode: KubernetesExecutorInputs["mode"];
   stage: string;
   projectId: string;
-  nonceDigest: string;
   proof: "private-control-plane-tcp-443";
+}
+
+/** Stable evidence only; a one-use authorization digest must never enter K8s state. */
+export function relaycastProofAnnotations<Executor, Proof>(proof: { executor: Executor; proof: Proof }) {
+  return {
+    "96bulls.agentworkforce.dev/executor": proof.executor,
+    "96bulls.agentworkforce.dev/reachability": proof.proof,
+  };
 }
 
 export type KubernetesEndpointDialer = (host: string, port: number, timeoutMs: number) => Promise<void>;
@@ -53,13 +60,13 @@ export async function provePrivateKubernetesReachability(
   dial: KubernetesEndpointDialer = dialTcp,
   timeoutMs = 5000,
 ): Promise<KubernetesReachabilityProof> {
+  assertGcpApplyLeaseActive(authorization);
   if (
     !EXECUTOR_NAME.test(executor.name) ||
     (executor.mode !== "in-vpc" && executor.mode !== "vpn") ||
     authorization.proof !== "gcp-apply-authorized" ||
     authorization.executor !== executor.name ||
-    authorization.executorIdentity !== executor.identity ||
-    authorization.expiresAt <= Math.floor(Date.now() / 1000)
+    authorization.executorIdentity !== executor.identity
   )
     throw new Error("96bulls: Kubernetes executor identity is invalid. No Kubernetes objects were applied.");
   if (!isPrivateIpv4(endpoint))
@@ -79,7 +86,6 @@ export async function provePrivateKubernetesReachability(
     mode: executor.mode,
     stage: authorization.stage,
     projectId: authorization.projectId,
-    nonceDigest: authorization.nonceDigest,
     proof: "private-control-plane-tcp-443",
   };
 }

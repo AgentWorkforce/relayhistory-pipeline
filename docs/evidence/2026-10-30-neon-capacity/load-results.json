@@ -1,0 +1,119 @@
+{
+ "settings": [
+  {
+   "name": "effective_cache_size",
+   "setting": "6710784"
+  },
+  {
+   "name": "max_connections",
+   "setting": "4000"
+  },
+  {
+   "name": "neon.max_cluster_size",
+   "setting": "16777216"
+  },
+  {
+   "name": "shared_buffers",
+   "setting": "129536"
+  },
+  {
+   "name": "work_mem",
+   "setting": "4096"
+  }
+ ],
+ "activity": [
+  {
+   "state": "idle",
+   "wait_event_type": "Client",
+   "n": 15,
+   "oldest_s": 273
+  },
+  {
+   "state": "active",
+   "wait_event_type": "Extension",
+   "n": 2,
+   "oldest_s": 4
+  },
+  {
+   "state": "active",
+   "wait_event_type": "Lock",
+   "n": 2,
+   "oldest_s": 1
+  },
+  {
+   "state": "active",
+   "wait_event_type": null,
+   "n": 2,
+   "oldest_s": 67
+  },
+  {
+   "state": "idle in transaction",
+   "wait_event_type": "Client",
+   "n": 1,
+   "oldest_s": 1
+  }
+ ],
+ "longRunning": [
+  {
+   "usename": "neondb_owner",
+   "state": "active",
+   "xact_s": 67,
+   "query": " WITH guard AS MATERIALIZED ( SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hasht"
+  }
+ ],
+ "hasStatements": 0,
+ "deadTuples": [
+  {
+   "relname": "delivery_projection_acceptance",
+   "n_live_tup": "50549109",
+   "n_dead_tup": "8855191",
+   "last_autovacuum": "2026-10-27 09:21:37.766632+00",
+   "last_autoanalyze": "2026-10-30 17:11:51.147365+00"
+  },
+  {
+   "relname": "convergence_events",
+   "n_live_tup": "27695389",
+   "n_dead_tup": "3598294",
+   "last_autovacuum": "2026-10-28 23:40:41.898998+00",
+   "last_autoanalyze": "2026-10-30 10:48:13.541615+00"
+  },
+  {
+   "relname": "session_markers",
+   "n_live_tup": "25033821",
+   "n_dead_tup": "2505090",
+   "last_autovacuum": "2026-10-26 20:38:34.132873+00",
+   "last_autoanalyze": "2026-10-30 13:23:44.069595+00"
+  },
+  {
+   "relname": "delivery_records",
+   "n_live_tup": "54038044",
+   "n_dead_tup": "2306700",
+   "last_autovacuum": "2026-10-30 08:53:14.335667+00",
+   "last_autoanalyze": "2026-10-30 13:32:45.008549+00"
+  },
+  {
+   "relname": "delivery_catalog_acceptance",
+   "n_live_tup": "25595814",
+   "n_dead_tup": "2049760",
+   "last_autovacuum": "2026-10-27 03:14:06.071805+00",
+   "last_autoanalyze": "2026-10-30 14:19:44.713308+00"
+  },
+  {
+   "relname": "uploaded_support_identities",
+   "n_live_tup": "54252565",
+   "n_dead_tup": "367473",
+   "last_autovacuum": "2026-10-27 00:21:45.623732+00",
+   "last_autoanalyze": "2026-10-28 16:30:37.017343+00"
+  }
+ ],
+ "dbStats": {
+  "xact_commit": "287493101",
+  "xact_rollback": "169242",
+  "blks_read": "89437770575",
+  "blks_hit": "949700147234",
+  "hit_pct": "91.39",
+  "deadlocks": "56",
+  "temp_bytes": "1347171971554",
+  "stats_reset": null
+ }
+}
