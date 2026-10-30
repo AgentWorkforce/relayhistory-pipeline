@@ -48,9 +48,10 @@ Read-only, structure-only samples from Neon production on 2026-10-30
   then `record_id`. The stream is deterministic, so a re-export produces the
   same chunk hashes.
 - **Chunks:** sealed at a record boundary at 4 MiB uncompressed and
-  compressed with zstd. Each has `records`, `first_ts` and `last_ts`. There is
-  one epoch, and `raw.state` is `closed` unless the session saw activity after
-  T0 started (then `open`, so live delivery can continue it).
+  compressed with zstd. Each has `records`, `first_ts` and `last_ts`. A cold
+  export creates epoch 0. When live delivery created the manifest after T0,
+  the export appends one epoch whose reason is `backfill`; it never rewrites
+  the live epochs.
 - **Scrubbing:** done by the ingest hop (`sealRawChunk`, rule set
   `relayhistory-scrub`), as for live uploads. It sets
   `raw.scrub = {ruleset, version}`. Unscrubbed manifests are quarantined by
@@ -110,11 +111,23 @@ manifest body.
   migration service principal with an audited, org-scoped "act as this user
   for ingest" grant, time-boxed to the export. This is an auth decision for
   the RelayAuth and ingest owners, and Khaliq.
-- **O3:** the transform's normalizer for `client.relayhistory_export`
-  sessions, so replay, briefs and embeddings read them like live sessions.
-- **O4:** sessions active across T0. Live delivery after T0 continues the
-  session's stream: the export writes epoch 0, and the client opens epoch 1.
-  Confirm with the delivery coordinator's owner-fencing rules.
+- **O3 (resolved in E4):** the transform recognizes
+  `client.relayhistory_export`, reads the canonical record envelopes from all
+  live and backfill epochs, keeps the highest numeric revision of each
+  `(origin_id, record_id)`, applies tombstones and orders the survivors by
+  event time. It writes those live records to
+  `normalized/v1/relayhistory-{raw.content_sha256}.ndjson`. The digest in the
+  key makes the object create-only, so a late transform cannot overwrite
+  output for another manifest revision. Post-T0 live chunks use the same
+  record envelope; `operation` is optional for historical upserts and required
+  to carry a live tombstone.
+- **O4 (resolved in E4):** sessions active across T0 are serialized at the
+  manifest CAS boundary. A grant-bound migration assertion may append exactly
+  one `backfill` epoch while preserving `raw.owner`, the delivery writer,
+  session identity and every prior epoch/chunk. Its `opened_by` is
+  `migration:<grantId>`. A live write and export based on the same object
+  version cannot both commit; the loser rereads and rebuilds. Normal live
+  assertions cannot open a `backfill` epoch.
 - **O5:** volume. About 54M records in 161 GB of payload; estimate the
   exported zstd size and the PUT count per workspace (KMS request cost, P9).
 

@@ -101,10 +101,12 @@ after it (in the pipeline). The session's raw stream is append-only:
 - the normalizer orders every record by event time and keeps each record's
   latest revision, so the order chunks arrived in doesn't matter.
 
-**Open:** this needs a manifest epoch reason for backfill, since today's
-reasons are `initial`, `truncated` and `rewritten`, and an owner-fencing rule
-so the exporter and the live writer never race on the manifest's
-compare-and-swap.
+The dedicated historical epoch reason is `backfill`. The ingest boundary
+accepts it only from a grant-bound migration assertion and only as an
+append-only change that preserves the live `raw.owner`, writer, session and
+all prior chunks. Both migration and live writes compare-and-swap the exact
+object version they read, so a straddling session has one manifest order and
+the losing writer must reread before it can continue.
 
 ## Invariants (data loss and dual write)
 

@@ -33,6 +33,7 @@ export * from "./errors.js";
 export * from "./events.js";
 export * from "./queue.js";
 export * from "./registry.js";
+export * from "./relayhistory-transform.js";
 export * from "./stages.js";
 export * from "./telemetry-ids.js";
 export * from "./trace.js";

@@ -110,7 +110,9 @@ export const EpochRecordSchema = z
   .object({
     epoch: uint,
     opened_at: rfc3339,
-    reason: z.enum(["initial", "truncated", "rewritten"]),
+    // `backfill` is an append-only historical stream landed after live
+    // delivery has already opened the session (the switch-first migration).
+    reason: z.enum(["initial", "truncated", "rewritten", "backfill"]),
     first_seq: uint,
     opened_by: z.string().min(1),
   })

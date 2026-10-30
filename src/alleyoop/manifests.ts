@@ -40,7 +40,9 @@ type Auth = {
   orgId: string;
   workspaceId?: string;
   historyOrigin?: string;
+  tokenSubject: string;
   scopes: string[];
+  claims: Record<string, unknown>;
 };
 
 const responseError = (c: Context<AppEnv>, status: 400 | 403 | 404 | 409 | 413 | 503, code: string, message: string) =>
@@ -59,6 +61,181 @@ function sameVersion(expected: ObjectVersion, actual: ObjectVersion | undefined)
   if (expected.eTag && expected.eTag !== actual.eTag) return false;
   if (expected.version && expected.version !== actual.version) return false;
   return Boolean(expected.eTag || expected.version);
+}
+
+const MIGRATION_SUBJECT = "agent_relayhistory_migration";
+const MIGRATION_TOKEN_CLASS = "migration_assertion";
+const MIGRATION_ID = /^[A-Za-z0-9._:-]{1,255}$/;
+const PLAN_DIGEST = /^[0-9a-f]{64}$/;
+
+/**
+ * The manifest identity of a verified RelayAuth migration assertion. The
+ * assertion verifier has already checked the signature, audience and expiry;
+ * this boundary additionally requires the grant and plan bindings E4/O4 uses
+ * to fence a backfill epoch.
+ */
+function migrationWriter(auth: Auth): string | undefined {
+  if (auth.tokenSubject !== MIGRATION_SUBJECT) return undefined;
+  const meta = auth.claims.meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return undefined;
+  const values = meta as Record<string, unknown>;
+  const grantId = values.grantId;
+  const planDigest = values.planDigest;
+  if (
+    values.tokenClass !== MIGRATION_TOKEN_CLASS ||
+    typeof grantId !== "string" ||
+    !MIGRATION_ID.test(grantId) ||
+    typeof planDigest !== "string" ||
+    !PLAN_DIGEST.test(planDigest)
+  )
+    return undefined;
+  return `migration:${grantId}`;
+}
+
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => compareText(a, b))
+        .map(([key, child]) => [key, canonical(child)]),
+    );
+  return value;
+}
+
+/** Locale-independent Unicode code-point order for canonical JSON keys. */
+function compareText(left: string, right: string): number {
+  const leftPoints = left[Symbol.iterator]();
+  const rightPoints = right[Symbol.iterator]();
+  while (true) {
+    const leftPoint = leftPoints.next();
+    const rightPoint = rightPoints.next();
+    if (leftPoint.done || rightPoint.done)
+      return leftPoint.done === rightPoint.done ? 0 : leftPoint.done ? -1 : 1;
+    const leftValue = leftPoint.value.codePointAt(0)!;
+    const rightValue = rightPoint.value.codePointAt(0)!;
+    if (leftValue !== rightValue) return leftValue < rightValue ? -1 : 1;
+  }
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+}
+
+function hasPrefix<T>(before: readonly T[], after: readonly T[]): boolean {
+  return (
+    after.length >= before.length &&
+    before.every((value, index) => sameJson(value, after[index]))
+  );
+}
+
+function exportMarker(manifest: ManifestV1): boolean {
+  const marker = manifest.extensions?.["client.relayhistory_export"];
+  return (
+    !!marker &&
+    typeof marker === "object" &&
+    !Array.isArray(marker) &&
+    (marker as Record<string, unknown>).version === 1 &&
+    (marker as Record<string, unknown>).source === "neon.delivery_records"
+  );
+}
+
+/**
+ * Enforce the raw-owner contract across manifest revisions. Normal live
+ * writers may append only as the existing owner. A migration assertion may
+ * create a cold export, or append exactly one `backfill` epoch while leaving
+ * the live writer's owner token in place. The object-store version remains
+ * the serialization fence for a concurrent live append.
+ */
+function manifestOwnerIssue(
+  existing: ManifestV1 | undefined,
+  incoming: ManifestV1,
+  auth: Auth,
+): string | undefined {
+  const migration = migrationWriter(auth);
+  if (auth.tokenSubject === MIGRATION_SUBJECT && !migration)
+    return "migration assertion is not bound to a grant and plan";
+  const raw = incoming.raw;
+  if (!existing) {
+    if (raw.owner !== incoming.writer.delivery_instance_id)
+      return "raw owner and delivery writer differ";
+    if (migration) {
+      if (raw.owner !== migration) return "cold export is not owned by its migration grant";
+      if (!exportMarker(incoming)) return "cold export marker is missing";
+    }
+    return undefined;
+  }
+
+  if (
+    incoming.trace_id !== existing.trace_id ||
+    incoming.created_at !== existing.created_at ||
+    !sameJson(incoming.server, existing.server) ||
+    raw.owner !== existing.raw.owner ||
+    incoming.writer.delivery_instance_id !== existing.writer.delivery_instance_id ||
+    raw.format !== existing.raw.format ||
+    raw.compression !== existing.raw.compression ||
+    !sameJson(raw.scrub, existing.raw.scrub) ||
+    (exportMarker(existing) && !sameJson(
+      incoming.extensions?.["client.relayhistory_export"],
+      existing.extensions?.["client.relayhistory_export"],
+    )) ||
+    !hasPrefix(existing.raw.epochs, raw.epochs) ||
+    !hasPrefix(existing.raw.chunks, raw.chunks)
+  )
+    return "immutable manifest state changed";
+
+  if (!migration) {
+    if (raw.owner !== incoming.writer.delivery_instance_id)
+      return "live writer does not own the raw stream";
+    if (
+      raw.epochs
+        .slice(existing.raw.epochs.length)
+        .some((epoch) => epoch.reason === "backfill")
+    )
+      return "live writer attempted to open a backfill epoch";
+    return undefined;
+  }
+
+  const addedEpochs = raw.epochs.slice(existing.raw.epochs.length);
+  const addedChunks = raw.chunks.slice(existing.raw.chunks.length);
+  const backfill = addedEpochs[0];
+  if (
+    !sameJson(incoming.session, existing.session) ||
+    !sameJson(incoming.writer, existing.writer) ||
+    raw.state !== existing.raw.state ||
+    existing.raw.epochs.some((epoch) => epoch.reason === "backfill") ||
+    addedEpochs.length !== 1 ||
+    !backfill ||
+    backfill.reason !== "backfill" ||
+    backfill.opened_by !== migration ||
+    backfill.first_seq !== existing.raw.chunk_count ||
+    addedChunks.length === 0 ||
+    addedChunks.some((chunk) => chunk.epoch !== backfill.epoch) ||
+    !exportMarker(incoming)
+  )
+    return "migration is not an append-only backfill epoch";
+
+  for (const [key, value] of Object.entries(existing.extensions ?? {})) {
+    if (key === "client.relayhistory_export") continue;
+    if (!sameJson(value, incoming.extensions?.[key]))
+      return "migration changed another extension owner";
+  }
+  for (const key of Object.keys(incoming.extensions ?? {})) {
+    if (key !== "client.relayhistory_export" && !(key in (existing.extensions ?? {})))
+      return "migration added another extension owner's key";
+  }
+  return undefined;
+}
+
+/** Exact replay is idempotent, but it does not bypass migration identity. */
+function migrationReplayIssue(manifest: ManifestV1, auth: Auth): boolean {
+  const lastEpoch = manifest.raw.epochs.at(-1);
+  const expected = manifest.raw.owner.startsWith("migration:")
+    ? manifest.raw.owner
+    : lastEpoch?.reason === "backfill"
+      ? lastEpoch.opened_by
+      : undefined;
+  return expected !== undefined && migrationWriter(auth) !== expected;
 }
 
 function sessionUuid(manifest: ManifestV1): string | undefined {
@@ -126,6 +303,33 @@ async function storedManifest(raw: RawStore, key: string): Promise<{ manifest: M
   }
 }
 
+/** Reconcile a lost create/CAS race when the winner stored this exact retry. */
+async function putManifestOrReplay(
+  raw: RawStore,
+  key: string,
+  text: string,
+  auth: Auth,
+  put: () => Promise<{ version: ObjectVersion }>,
+): Promise<ObjectVersion> {
+  try {
+    return (await put()).version;
+  } catch (error) {
+    if (
+      !isObjectStoreError(error, "already_exists") &&
+      !isObjectStoreError(error, "precondition_failed")
+    )
+      throw error;
+    const winner = await storedManifest(raw, key);
+    if (
+      !winner ||
+      winner.text !== text ||
+      migrationReplayIssue(winner.manifest, auth)
+    )
+      throw error;
+    return winner.version;
+  }
+}
+
 export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   const routes = new Hono<AppEnv>();
 
@@ -177,6 +381,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     if (c.req.header("X-Session-Id") !== manifest.session.session_id || c.req.header("X-Machine-Id") !== manifest.session.machine_id)
       return responseError(c, 400, "bad_request", "session headers do not match the manifest");
     const encoded = new TextEncoder().encode(JSON.stringify(manifest));
+    const encodedText = new TextDecoder().decode(encoded);
     if (encoded.byteLength > MAX_MANIFEST_BYTES)
       return responseError(c, 413, "payload_too_large", "manifest is too large");
     try {
@@ -187,27 +392,43 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       if (!existing) {
         if (manifest.revision !== 1)
           return responseError(c, 409, "revision_conflict", "the first manifest revision must be 1");
-        const ack = await deps.raw.store.put(objectKey(key), encoded, {
-          ifNoneMatch: true,
-          contentType: "application/json",
-          metadata: manifestMetadata(manifest, c.env ?? {}),
-        });
-        storedVersion = ack.version;
-      } else if (existing.text === new TextDecoder().decode(encoded)) {
+        if (manifestOwnerIssue(undefined, manifest, c.get("auth") as Auth))
+          return responseError(c, 409, "owner_conflict", "manifest owner or append fence does not match");
+        storedVersion = await putManifestOrReplay(
+          deps.raw,
+          key,
+          encodedText,
+          c.get("auth") as Auth,
+          () =>
+            deps.raw.store.put(objectKey(key), encoded, {
+              ifNoneMatch: true,
+              contentType: "application/json",
+              metadata: manifestMetadata(manifest, c.env ?? {}),
+            }),
+        );
+      } else if (existing.text === encodedText) {
+        if (migrationReplayIssue(existing.manifest, c.get("auth") as Auth))
+          return responseError(c, 409, "owner_conflict", "manifest owner or append fence does not match");
         storedVersion = existing.version;
       } else {
         const previous = version(body.previousVersion);
         if (!sameVersion(existing.version, previous) ||
-          existing.manifest.session.machine_id !== manifest.session.machine_id ||
-          existing.manifest.writer.delivery_instance_id !== manifest.writer.delivery_instance_id ||
           manifest.revision !== existing.manifest.revision + 1)
           return responseError(c, 409, "revision_conflict", "manifest version or writer does not match");
-        const ack = await deps.raw.store.put(objectKey(key), encoded, {
-          ifMatch: existing.version,
-          contentType: "application/json",
-          metadata: manifestMetadata(manifest, c.env ?? {}),
-        });
-        storedVersion = ack.version;
+        if (manifestOwnerIssue(existing.manifest, manifest, c.get("auth") as Auth))
+          return responseError(c, 409, "owner_conflict", "manifest owner or append fence does not match");
+        storedVersion = await putManifestOrReplay(
+          deps.raw,
+          key,
+          encodedText,
+          c.get("auth") as Auth,
+          () =>
+            deps.raw.store.put(objectKey(key), encoded, {
+              ifMatch: existing.version,
+              contentType: "application/json",
+              metadata: manifestMetadata(manifest, c.env ?? {}),
+            }),
+        );
       }
       const read = await deps.manifests.read(key);
       if (!read) throw new Error("manifest disappeared after write");
