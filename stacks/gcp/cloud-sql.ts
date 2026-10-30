@@ -357,6 +357,13 @@ export interface SqlAdminPollControl {
   requestTimeoutMs?: number;
 }
 
+/** Fixed apply authorization boundary supplied by the calling Action. */
+export interface SqlAdminMutationLease {
+  expiresAtMs: number;
+  signal?: AbortSignal;
+  now?: () => number;
+}
+
 export interface PrivateCloudSqlEnsureResult {
   /** False when a matching private instance already existed. */
   created: boolean;
@@ -576,6 +583,7 @@ async function ask(
   call: SqlAdminEnsureRequest,
   credential: SqlAdminCredential,
   timeoutMs: number,
+  outerSignal?: AbortSignal,
 ): Promise<SqlAdminEnsureResponse | "thrown" | "timeout"> {
   const controller = new AbortController();
   let timedOut = false;
@@ -587,6 +595,16 @@ async function ask(
       resolve("timeout");
     }, timeoutMs);
   });
+  let resolveInterrupted: ((value: "timeout") => void) | undefined;
+  const interrupted = new Promise<"timeout">((resolve) => {
+    resolveInterrupted = resolve;
+  });
+  const abort = () => {
+    controller.abort();
+    resolveInterrupted?.("timeout");
+  };
+  if (outerSignal?.aborted) abort();
+  else outerSignal?.addEventListener("abort", abort, { once: true });
   try {
     const response = await Promise.race([
       transport.request(call, credential, controller.signal).then(
@@ -594,12 +612,14 @@ async function ask(
         (): "timeout" | "thrown" => (timedOut ? "timeout" : "thrown"),
       ),
       timeout,
+      interrupted,
     ]);
     if (response === "timeout" || response === "thrown") return response;
     if (!response || typeof response.status !== "number" || !Number.isInteger(response.status)) return "thrown";
     return response;
   } finally {
     if (timer) clearTimeout(timer);
+    outerSignal?.removeEventListener("abort", abort);
   }
 }
 
@@ -618,6 +638,27 @@ function requestBudget(clock: ResolvedPoll, deadline: OuterDeadline): number | u
   return Math.min(clock.requestTimeoutMs, remaining);
 }
 
+interface ResolvedMutationLease {
+  expiresAtMs: number;
+  signal?: AbortSignal;
+  now(): number;
+}
+
+function resolveMutationLease(lease?: SqlAdminMutationLease): ResolvedMutationLease | undefined {
+  if (!lease) return;
+  if (!Number.isFinite(lease.expiresAtMs) || lease.expiresAtMs <= 0)
+    refuse("Cloud SQL Admin apply lease is invalid.");
+  return { expiresAtMs: lease.expiresAtMs, signal: lease.signal, now: lease.now ?? Date.now };
+}
+
+function leaseAlive(lease?: ResolvedMutationLease): boolean {
+  return !lease || (!lease.signal?.aborted && lease.now() < lease.expiresAtMs);
+}
+
+function assertLeaseActive(lease?: ResolvedMutationLease): void {
+  if (!leaseAlive(lease)) refuse("Cloud SQL Admin apply authorization expired.");
+}
+
 function deadlineAlive(clock: ResolvedPoll, deadline: OuterDeadline): boolean {
   return remainingMs(clock, deadline) > 0;
 }
@@ -628,13 +669,18 @@ async function askWithinDeadline(
   transport: SqlAdminEnsureTransport,
   call: SqlAdminEnsureRequest,
   credential: SqlAdminCredential,
+  lease?: ResolvedMutationLease,
 ): Promise<SqlAdminEnsureResponse | "thrown" | "timeout"> {
-  const budget = requestBudget(clock, deadline);
+  const pollBudget = requestBudget(clock, deadline);
+  const leaseBudget = lease ? lease.expiresAtMs - lease.now() : Number.POSITIVE_INFINITY;
+  const budget = pollBudget === undefined || leaseBudget <= 0
+    ? undefined
+    : Math.min(pollBudget, leaseBudget);
   if (budget === undefined) return "timeout";
-  const response = await ask(transport, call, credential, budget);
+  const response = await ask(transport, call, credential, budget, lease?.signal);
   // setTimeout cannot preempt synchronous event-loop blocking. The absolute
   // clocks are therefore checked again after every transport continuation.
-  if (!deadlineAlive(clock, deadline)) return "timeout";
+  if (!deadlineAlive(clock, deadline) || !leaseAlive(lease)) return "timeout";
   return response;
 }
 
@@ -667,12 +713,15 @@ export async function ensurePrivateCloudSql(
   credential: SqlAdminCredential,
   transport: SqlAdminEnsureTransport,
   poll?: SqlAdminPollControl,
+  mutationLease?: SqlAdminMutationLease,
 ): Promise<PrivateCloudSqlEnsureResult> {
   const request = sqlAdminInsertRequest(spec);
   if (request.sent !== false || Object.keys(request.headers).some((name) => name.toLowerCase() === "authorization"))
     refuse("Cloud SQL insert seam tried to carry a credential.");
   assertCredential(credential);
   const clock = resolvePoll(poll);
+  const lease = resolveMutationLease(mutationLease);
+  assertLeaseActive(lease);
   // One absolute deadline covers lookup, insert, 409 adoption, operation
   // polling, every sleep, and final confirmation. The real clock prevents a
   // faulty injected test clock from weakening the production wall bound.
@@ -685,7 +734,7 @@ export async function ensurePrivateCloudSql(
   const instanceName = spec.instanceName;
   const instanceUrl = `https://sqladmin.googleapis.com/v1/projects/${projectId}/instances/${instanceName}`;
   const getCall: SqlAdminEnsureRequest = { method: "GET", url: instanceUrl };
-  const existing = await askWithinDeadline(clock, deadline, transport, getCall, credential);
+  const existing = await askWithinDeadline(clock, deadline, transport, getCall, credential, lease);
   if (existing === "timeout") refuse("Cloud SQL Admin instance lookup timed out.");
   if (existing === "thrown") refuse("Cloud SQL Admin instance lookup was not accepted.");
   if (existing.status === 200) {
@@ -700,17 +749,21 @@ export async function ensurePrivateCloudSql(
   }
   if (existing.status !== 404) refuse("Cloud SQL Admin instance lookup was not accepted.");
 
+  // The lookup may consume the remaining apply lease. Recheck immediately at
+  // the mutation boundary so a stale authorization can never start an insert.
+  assertLeaseActive(lease);
   const inserted = await askWithinDeadline(
     clock,
     deadline,
     transport,
     { method: "POST", url: request.url, body: request.body },
     credential,
+    lease,
   );
   if (inserted === "thrown" || inserted === "timeout") uncertain(projectId, instanceName);
   if (inserted.status === 409) {
     for (let attempt = 0; attempt < clock.maxPolls; attempt += 1) {
-      const again = await askWithinDeadline(clock, deadline, transport, getCall, credential);
+      const again = await askWithinDeadline(clock, deadline, transport, getCall, credential, lease);
       if (again === "thrown" || again === "timeout") uncertain(projectId, instanceName);
       if (again.status === 200) {
         const kind = classifyExisting(spec, again.body);
@@ -749,6 +802,7 @@ export async function ensurePrivateCloudSql(
         transport,
         { method: "GET", url: operationUrl },
         credential,
+        lease,
       );
       if (polled === "thrown" || polled === "timeout" || polled.status !== 200) uncertain(projectId, instanceName);
       const state = operationState(polled.body);
@@ -763,7 +817,7 @@ export async function ensurePrivateCloudSql(
     }
     if (!finished) timedOut(projectId, instanceName);
   }
-  const confirmed = await askWithinDeadline(clock, deadline, transport, getCall, credential);
+  const confirmed = await askWithinDeadline(clock, deadline, transport, getCall, credential, lease);
   if (confirmed === "thrown" || confirmed === "timeout" || confirmed.status !== 200) uncertain(projectId, instanceName);
   if (classifyExisting(spec, confirmed.body) !== "match") createdMismatch(projectId, instanceName);
   if (!deadlineAlive(clock, deadline)) timedOut(projectId, instanceName);
