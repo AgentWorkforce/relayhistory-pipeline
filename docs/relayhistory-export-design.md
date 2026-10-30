@@ -105,6 +105,10 @@ fails that manifest. 503 `migration_storage_read_required` (an ingest that
 cannot read the commit back from storage) stops the run without backoff.
 Each chunk request carries `canonical(plan entry)` in front of its source
 bytes, with the entry's length in `X-Relay-Migration-Plan-Entry-Length`.
+The commit's work key must be exactly `upload.key + "@" + upload.entry_sha256`
+(signed fields only), the same under any fresh assertion, and the manifest
+carries the export marker's `grant_id`, `plan_digest` and `source_user_id` and
+`96bulls.user_id`, each equal to the signed values.
 A per-manifest checkpoint (ids, digests and work keys,
 never tokens) keeps a resumed run from re-uploading committed manifests. It is
 tested only against an in-process fake ingest, and the CLI still refuses

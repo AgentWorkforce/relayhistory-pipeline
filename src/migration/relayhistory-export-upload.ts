@@ -136,9 +136,9 @@ export interface PlanEntry extends UploadInput {
  * defines it. The ISSUER (RelayAuth) derives it from the canonical stored
  * plan; the courier derives the same value locally and refuses an assertion
  * whose signed identity differs from what it is about to send. `key` is the
- * manifest key. The ingest's work key is `<key>@<object version>` with the
- * version assigned by storage, so the courier checks the returned work key is
- * of this key rather than binding it in full.
+ * manifest key. The pipeline work key is `migrationWorkKey(identity)`:
+ * `key + "@" + entry_sha256`, signed fields only (#43 @d664d5bb), so a retry
+ * under a fresh assertion has the same work key.
  */
 export interface UploadIdentity {
   grant_id: string;
@@ -151,6 +151,26 @@ export interface UploadIdentity {
   content_sha256: string;
   /** sha256 of the canonical plan entry. */
   entry_sha256: string;
+}
+
+/** The work key of a migration commit: the signed manifest key and entry digest. */
+export const migrationWorkKey = (identity: Pick<UploadIdentity, "key" | "entry_sha256">) =>
+  `${identity.key}@${identity.entry_sha256}`;
+
+/**
+ * The manifest's provenance fields (contract v1): the export marker's
+ * grant_id, plan_digest and source_user_id and 96bulls.user_id, each present
+ * and equal to the signed identity. Returns the first problem, or undefined.
+ */
+export function manifestProvenanceIssue(manifest: ManifestV1, identity: UploadIdentity): string | undefined {
+  const ext = (manifest.extensions ?? {}) as Record<string, Record<string, unknown> | undefined>;
+  const marker = ext[EXPORT_MARKER];
+  const session = ext[SESSION_EXT];
+  if (!marker || marker.grant_id !== identity.grant_id) return "grant_id";
+  if (marker.plan_digest !== identity.plan_digest) return "plan_digest";
+  if (marker.source_user_id !== identity.source_user_id) return "source_user_id";
+  if (!session || session.user_id !== identity.source_user_id) return "96bulls.user_id";
+  return undefined;
 }
 
 /** What a mint asks the issuer for: the planned upload, by manifest key. */
@@ -703,6 +723,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
         const sent = contractFn({ grantId: cfg.grantId, exportedAt: plan.exportedAt, uploads: inputs });
         if (sent.planDigest !== digest || canonical(sent.uploads[index]) !== canonical(identity))
           throw new OutcomeError({ kind: "failed", code: "manifest_plan_mismatch" });
+        if (manifestProvenanceIssue(manifest, identity)) throw new OutcomeError({ kind: "failed", code: "manifest_provenance_mismatch" });
         const issues = await validateManifest(manifest, key);
         if (issues.length) throw new OutcomeError({ kind: "failed", code: "manifest_invalid" });
         const res = await request(await token(), "/v1/pipeline/manifests", {
@@ -719,7 +740,8 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
         const body = (await res.json().catch(() => ({}))) as { workKey?: unknown };
         if (typeof body.workKey !== "string" || !body.workKey)
           throw new OutcomeError({ kind: "transient", code: "work_key_missing" });
-        if (!body.workKey.startsWith(`${key}@`)) throw new OutcomeError({ kind: "failed", code: "work_key_mismatch" });
+        // Exactly the signed key and entry digest; the same under any assertion.
+        if (body.workKey !== migrationWorkKey(identity)) throw new OutcomeError({ kind: "failed", code: "work_key_mismatch" });
         cp.manifests[key] = { status: "committed", work_key: body.workKey, chunks: state.chunks.length };
         await saveCheckpoint(cfg.checkpointPath, cp);
         result.committed.push({ key, workKey: body.workKey });

@@ -22,6 +22,8 @@ import {
   canonical,
   contentSha256,
   derivePlanContract,
+  manifestProvenanceIssue,
+  migrationWorkKey,
   planContract,
   plannedManifestFromRecords,
   runExportUpload,
@@ -56,6 +58,10 @@ interface FakeIngest {
   mintJti?: (n: number) => string | undefined;
   /** Inject a response before the route's own handling (n is per route, 1-based). */
   before?: (route: Route, n: number) => Injected;
+  /** Answer commits with this work key instead (e.g. the old key@version form). */
+  workKeyOverride?: string;
+  /** The manifests the fake committed, by key. */
+  stored: Map<string, string>;
   /** Entry lengths framed in front of each accepted chunk request. */
   framed: number[];
   /** False: a deployment that cannot read storage back (503 on commit). */
@@ -116,6 +122,7 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
     requests: [],
     chunkLimit: 256,
     framed: [],
+    stored: manifests,
     storageRead: true,
     signed: new Map(),
     usedFor: new Map(),
@@ -233,10 +240,12 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
       }
       if (!fake.storageRead) return refuse(res, 503, "migration_storage_read_required");
       const posted = JSON.parse(raw.toString()) as { key: string; manifest: { extensions: Record<string, Record<string, unknown>> } };
-      const marker = posted.manifest.extensions["client.relayhistory_export"] ?? {};
-      if (marker.source_user_id !== claims.meta.sourceUserId) return refuse(res, 403, "migration_workspace_forbidden");
-      if (marker.grant_id !== claims.meta.grantId) return refuse(res, 403, "migration_grant_forbidden");
-      if (marker.plan_digest !== claims.meta.planDigest) return refuse(res, 403, "migration_plan_mismatch");
+      const marker = posted.manifest.extensions?.["client.relayhistory_export"];
+      const ext96 = posted.manifest.extensions?.["96bulls"];
+      // Provenance (#43 @d664d5bb): each present and equal to the signed values.
+      if (!marker || marker.grant_id !== upload.grant_id || marker.plan_digest !== upload.plan_digest ||
+        marker.source_user_id !== upload.source_user_id || !ext96 || ext96.user_id !== upload.source_user_id)
+        return refuse(res, 403, "migration_upload_forbidden");
       // Recompute the entry from the request (never an echoed field).
       const recomputed = derivePlanContract({
         grantId: claims.meta.grantId,
@@ -255,7 +264,8 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
       // The ledger row and the queue row in one unit.
       fake.consumed.add(claims.jti);
       fake.consumed.add(claims.meta.nonce);
-      const workKey = `${posted.key}@"${sha(text).slice(0, 8)}"`; // manifestWorkKey: key@version
+      // Signed fields only: the same work key under any (fresh) assertion.
+      const workKey = fake.workKeyOverride ?? `${upload.key}@${upload.entry_sha256}`;
       fake.queue.push({ workKey, jti: claims.jti });
       commits.n += 1;
       if (fake.afterCommit?.(commits.n) === "hang") return; // committed, response lost
@@ -890,5 +900,95 @@ describe("chunk framing and commit-time storage read (#43 @8b6b986e, #228 @47a9f
     expect(fake.queue).toHaveLength(0);
     const cp = JSON.parse(await readFile(cfg.checkpointPath, "utf8"));
     expect(Object.values(cp.manifests).every((m) => (m as { status: string }).status !== "committed")).toBe(true);
+  });
+});
+
+describe("signed work key and manifest provenance (#43 @d664d5bb)", () => {
+  test("the vectors' work keys are key@entry_sha256 of the derived identities", () => {
+    const v = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "relayhistory-export-plan-entry-v1.vectors.json"), "utf8"));
+    expect(v.work_key_rule).toContain('upload.key + "@" + upload.entry_sha256');
+    const c = derivePlanContract({ grantId: v.grant_id, exportedAt: v.exported_at, uploads: v.inputs });
+    expect(c.uploads.map(migrationWorkKey)).toEqual(v.work_keys.map((w: { work_key: string }) => w.work_key));
+  });
+
+  test("every commit's work key is exactly key@entry_sha256, recorded once", async () => {
+    const { fake, cfg, plan } = await setup();
+    const result = await runExportUpload(plan, cfg);
+    const contract = planContract(plan, GRANT);
+    expect(result.committed.map((c) => c.workKey)).toEqual(contract.uploads.map(migrationWorkKey));
+    const cp = JSON.parse(await readFile(cfg.checkpointPath, "utf8"));
+    for (const u of contract.uploads) expect(cp.manifests[u.key].work_key).toBe(migrationWorkKey(u));
+    expect(fake.queue.map((q) => q.workKey)).toEqual(contract.uploads.map(migrationWorkKey));
+  });
+
+  test("retries under a fresh assertion get the same work key (409 replay and lost response)", async () => {
+    const replay = await setup();
+    replay.fake.before = (route, n) => (route === "manifest" && n === 1 ? { status: 409, code: "migration_assertion_replayed" } : undefined);
+    const r1 = await runExportUpload(replay.plan, replay.cfg);
+    const lost = await setup({ requestTimeoutMs: 300 });
+    lost.fake.afterCommit = (n) => (n === 1 ? "hang" : undefined);
+    const r2 = await runExportUpload(lost.plan, lost.cfg);
+    const expected = planContract(lost.plan, GRANT).uploads.map(migrationWorkKey);
+    expect(r1.committed.map((c) => c.workKey)).toEqual(expected);
+    expect(r2.committed.map((c) => c.workKey)).toEqual(expected);
+    // Lost response: the server queued the same work key under two assertions.
+    expect(lost.fake.queue[0]!.workKey).toBe(lost.fake.queue[1]!.workKey);
+    expect(lost.fake.queue[0]!.jti).not.toBe(lost.fake.queue[1]!.jti);
+  });
+
+  test("a work key of any other form (e.g. key@object-version) fails that manifest", async () => {
+    const { fake, cfg, plan } = await setup();
+    const key = planContract(plan, GRANT).uploads[0]!.key;
+    fake.workKeyOverride = `${key}@"etag1234"`;
+    const result = await runExportUpload(plan, cfg);
+    expect(result.failed.map((f) => f.code)).toEqual(["work_key_mismatch", "work_key_mismatch"]);
+    expect(result.committed).toEqual([]);
+  });
+
+  test("the committed manifest carries grant_id, plan_digest, source_user_id and 96bulls.user_id, all signed values", async () => {
+    const { fake, cfg, plan } = await setup();
+    await runExportUpload(plan, cfg);
+    for (const u of planContract(plan, GRANT).uploads) {
+      const m = JSON.parse(fake.stored.get(u.key)!);
+      expect(m.extensions["client.relayhistory_export"]).toMatchObject({ grant_id: u.grant_id, plan_digest: u.plan_digest, source_user_id: u.source_user_id });
+      expect(m.extensions["96bulls"].user_id).toBe(u.source_user_id);
+    }
+  });
+
+  test("the courier refuses to send a manifest whose provenance is not the signed identity", async () => {
+    const plan = testPlan();
+    const contract = planContract(plan, GRANT);
+    const u = contract.uploads[0]!;
+    const chunks = contract.entries[0]!.chunks.map((c) => ({ ...c, sha256_8: c.sha256.slice(0, 8), stored_bytes: c.bytes, stored_sha256: c.sha256, compression: "zstd" as const, stored_raw_bytes: c.bytes, raw_sha256: c.sha256 }));
+    const manifest = await buildExportManifest(plan, plan.manifests[0]!, chunks, { ruleset: "relayhistory-scrub", version: 1 }, { grantId: GRANT, planDigest: contract.planDigest });
+    expect(manifestProvenanceIssue(manifest, u)).toBeUndefined();
+    const ext = manifest.extensions as Record<string, Record<string, unknown>>;
+    for (const [field, mutate] of [
+      ["grant_id", () => (ext["client.relayhistory_export"]!.grant_id = "mgr_other")],
+      ["plan_digest", () => (ext["client.relayhistory_export"]!.plan_digest = "0".repeat(64))],
+      ["source_user_id", () => (ext["client.relayhistory_export"]!.source_user_id = "user_2")],
+      ["96bulls.user_id", () => delete ext["96bulls"]!.user_id],
+    ] as const) {
+      const saved = JSON.stringify(ext);
+      mutate();
+      expect(manifestProvenanceIssue(manifest, u)).toBe(field);
+      Object.assign(ext, JSON.parse(saved));
+    }
+  });
+
+  test("the fake ingest refuses a commit without 96bulls.user_id (403 migration_upload_forbidden)", async () => {
+    const { fake, plan, cfg } = await setup();
+    await runExportUpload(plan, { ...cfg, checkpointPath: cfg.checkpointPath });
+    const u = planContract(plan, GRANT).uploads[0]!;
+    const m = JSON.parse(fake.stored.get(u.key)!);
+    delete m.extensions["96bulls"].user_id;
+    const assertion = await cfg.assertions.mint(u.source_user_id, u.workspace_id, { key: u.key });
+    const res = await fetch(`${fake.url}/v1/pipeline/manifests`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${assertion.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ key: u.key, manifest: m }),
+    });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("migration_upload_forbidden");
   });
 });
