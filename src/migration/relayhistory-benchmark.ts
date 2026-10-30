@@ -151,7 +151,7 @@ async function runCase(pool: pg.Pool, item: BenchCase, input: BenchInput, warmup
   for (let index = 0; index < warmups; index += 1) await pool.query(item.sql, params);
 
   const timings: number[] = [];
-  let hash = "";
+  const hashes = new Set<string>();
   const started = performance.now();
   let next = 0;
   await Promise.all(Array.from({ length: concurrency }, async () => {
@@ -161,16 +161,54 @@ async function runCase(pool: pg.Pool, item: BenchCase, input: BenchInput, warmup
       const before = performance.now();
       const result = await pool.query(item.sql, params);
       timings.push(performance.now() - before);
-      hash ||= resultHash(result.rows);
+      hashes.add(resultHash(result.rows));
     }
   }));
   const wallMs = performance.now() - started;
   return {
     latency: latencyStats(timings),
     throughputQps: round((runs * 1000) / wallMs),
-    resultHash: hash,
+    resultHash: [...hashes][0] ?? "",
+    // Every run returned the same rows; a live table changing mid-run is not a valid sample.
+    stable: hashes.size === 1,
     plan: await explain(pool, item, input),
   };
+}
+
+export interface CaseResult {
+  latency: LatencyStats;
+  resultHash: string;
+  stable: boolean;
+  plan: { nodes: Array<Record<string, unknown>> };
+}
+
+const INDEXED = /Index|Bitmap/;
+
+/**
+ * The cutover gate over one benchmark run: identical results, stable samples,
+ * target p95 within maxP95Ratio of Neon's, and no sequential scan on a
+ * relation Neon reaches through an index.
+ */
+export function evaluateGate(
+  results: Record<string, { source: CaseResult; target: CaseResult }>,
+  maxP95Ratio: number,
+): { passed: boolean; failures: string[] } {
+  const failures: string[] = [];
+  for (const [name, { source, target }] of Object.entries(results)) {
+    if (source.resultHash !== target.resultHash) failures.push(`${name}: results differ`);
+    if (!source.stable || !target.stable) failures.push(`${name}: results changed between runs`);
+    if (target.latency.p95Ms > source.latency.p95Ms * maxP95Ratio)
+      failures.push(`${name}: target p95 ${target.latency.p95Ms} ms > ${maxP95Ratio} x source ${source.latency.p95Ms} ms`);
+    const indexed = new Set(
+      source.plan.nodes
+        .filter((node) => INDEXED.test(String(node.node)) && node.relation)
+        .map((node) => String(node.relation)),
+    );
+    for (const node of target.plan.nodes)
+      if (node.node === "Seq Scan" && indexed.has(String(node.relation)))
+        failures.push(`${name}: target seq-scans ${String(node.relation)}, which the source reads by index`);
+  }
+  return { passed: failures.length === 0, failures };
 }
 
 async function chooseSession(pool: pg.Pool, orgId: string): Promise<string> {
@@ -206,7 +244,7 @@ export async function main() {
   try {
     const sessionId = process.env.BENCH_SESSION_ID ?? await chooseSession(source, orgId);
     const input = { orgId, query, sessionId };
-    const results: Record<string, unknown> = {};
+    const results: Record<string, { source: CaseResult; target: CaseResult } & Record<string, unknown>> = {};
     for (const item of CASES) {
       const sourceResult = await runCase(source, item, input, warmups, runs, concurrency);
       const targetResult = await runCase(target, item, input, warmups, runs, concurrency);
@@ -221,11 +259,17 @@ export async function main() {
         },
       };
     }
+    const maxP95Ratio = Number(process.env.BENCH_MAX_P95_RATIO ?? 1);
+    if (!(maxP95Ratio > 0)) throw new Error("BENCH_MAX_P95_RATIO must be a positive number");
+    const gate = evaluateGate(results, maxP95Ratio);
     process.stdout.write(`${JSON.stringify({
       generatedAt: new Date().toISOString(),
-      inputs: { orgHash: identityHash(orgId), queryHash: identityHash(query), sessionHash: identityHash(sessionId), runs, warmups, concurrency },
+      inputs: { orgHash: identityHash(orgId), queryHash: identityHash(query), sessionHash: identityHash(sessionId), runs, warmups, concurrency, maxP95Ratio },
+      gate,
       results,
     }, null, 2)}\n`);
+    // A red benchmark fails the step; it is never explained away.
+    if (!gate.passed) process.exitCode = 2;
   } finally {
     await Promise.all([source.end(), target.end()]);
   }

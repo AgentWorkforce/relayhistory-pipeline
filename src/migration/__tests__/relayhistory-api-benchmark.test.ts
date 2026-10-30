@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  evaluateHttpGate,
   httpLatencyStats,
   responseFingerprint,
   runHttpBenchmark,
@@ -91,5 +92,42 @@ describe("relayhistory API benchmark", () => {
     const report = await runHttpBenchmark(config(apiServer("legacy"), apiServer("compatibility", true)));
     const result = report.results.event_text_search as any;
     expect(result.parity).toEqual({ status: true, response: false });
+  });
+});
+
+describe("HTTP benchmark gate", () => {
+  const side = (p95Ms: number, statuses: Record<string, number> = { "200": 10 }, responseStable = true) => ({
+    latency: { minMs: 1, p50Ms: 1, p95Ms, p99Ms: p95Ms, maxMs: p95Ms, meanMs: 1 },
+    statuses,
+    responseStable,
+  });
+  const ok = { status: true, response: true };
+
+  test("passes 2xx-only, matching, stable, no-slower results", () => {
+    expect(
+      evaluateHttpGate({ sessions: { legacy: side(50), compatibility: side(40), parity: ok } }, 1),
+    ).toEqual({ passed: true, failures: [] });
+  });
+
+  test("fails on non-2xx, mismatch, instability or a p95 regression", () => {
+    const gate = evaluateHttpGate(
+      {
+        errors: { legacy: side(50), compatibility: side(40, { "200": 9, "503": 1 }), parity: { status: false, response: true } },
+        drift: { legacy: side(50, { "200": 10 }, false), compatibility: side(40), parity: { status: true, response: false } },
+        slower: { legacy: side(50), compatibility: side(51), parity: ok },
+        both404: { legacy: side(50, { "404": 10 }), compatibility: side(40, { "404": 10 }), parity: ok },
+      },
+      1,
+    );
+    expect(gate.passed).toBe(false);
+    expect(gate.failures).toEqual([
+      "errors: compatibility returned 503",
+      "errors: status mix differs",
+      "drift: legacy responses changed between runs",
+      "drift: responses differ",
+      "slower: compatibility p95 51 ms > 1 x legacy 50 ms",
+      "both404: legacy returned 404",
+      "both404: compatibility returned 404",
+    ]);
   });
 });

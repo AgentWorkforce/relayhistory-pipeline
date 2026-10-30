@@ -201,8 +201,37 @@ function ratio(numerator: number, denominator: number): number | null {
   return denominator === 0 ? null : round(numerator / denominator);
 }
 
+interface PublicEndpoint {
+  latency: HttpLatencyStats;
+  statuses: Record<string, number>;
+  responseStable: boolean;
+}
+
+/**
+ * The cutover gate over one HTTP run: only 2xx on both sides, identical status
+ * mix and response, stable responses, compatibility p95 within maxP95Ratio.
+ */
+export function evaluateHttpGate(
+  results: Record<string, { legacy: PublicEndpoint; compatibility: PublicEndpoint; parity: { status: boolean; response: boolean } }>,
+  maxP95Ratio: number,
+): { passed: boolean; failures: string[] } {
+  const failures: string[] = [];
+  for (const [name, result] of Object.entries(results)) {
+    for (const side of ["legacy", "compatibility"] as const) {
+      const bad = Object.keys(result[side].statuses).filter((status) => !/^2\d\d$/.test(status));
+      if (bad.length) failures.push(`${name}: ${side} returned ${bad.join(", ")}`);
+      if (!result[side].responseStable) failures.push(`${name}: ${side} responses changed between runs`);
+    }
+    if (!result.parity.status) failures.push(`${name}: status mix differs`);
+    if (!result.parity.response) failures.push(`${name}: responses differ`);
+    if (result.compatibility.latency.p95Ms > result.legacy.latency.p95Ms * maxP95Ratio)
+      failures.push(`${name}: compatibility p95 ${result.compatibility.latency.p95Ms} ms > ${maxP95Ratio} x legacy ${result.legacy.latency.p95Ms} ms`);
+  }
+  return { passed: failures.length === 0, failures };
+}
+
 export async function runHttpBenchmark(config: HttpBenchmarkConfig, fetchImpl: Fetch = globalThis.fetch) {
-  const results: Record<string, unknown> = {};
+  const results: Record<string, Parameters<typeof evaluateHttpGate>[0][string] & Record<string, unknown>> = {};
   for (const item of benchmarkCases(config)) {
     // Keep the two systems in the same measurement window. Running every
     // legacy sample first and every compatibility sample second would let
@@ -277,7 +306,12 @@ export function configFromEnv(): HttpBenchmarkConfig {
 
 export async function main() {
   const report = await runHttpBenchmark(configFromEnv());
-  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  const maxP95Ratio = Number(process.env.BENCH_HTTP_MAX_P95_RATIO ?? 1);
+  if (!(maxP95Ratio > 0)) throw new Error("BENCH_HTTP_MAX_P95_RATIO must be a positive number");
+  const gate = evaluateHttpGate(report.results, maxP95Ratio);
+  process.stdout.write(`${JSON.stringify({ ...report, gate: { maxP95Ratio, ...gate } }, null, 2)}\n`);
+  // A red benchmark fails the step; it is never explained away.
+  if (!gate.passed) process.exitCode = 2;
 }
 
 if (import.meta.main) {
