@@ -211,7 +211,10 @@ Apply, verify, and teardown have not been executed. Static work does not wait
 on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down` refuse every
 `gcp-*` stage. `bin/96bulls plan gcp-*` calls
 `bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
-and is not proof. Do not apply, deploy, destroy, or enable an API without a
+and is not proof. A non-zero Alchemy status exits the wrapper with that
+status. A child with no status exits 1. The 2026-10-30 missing-bucket run
+exited 0 only because that wrapper passed `allowFail`. Do not rerun it to
+prove the exit code. Do not apply, deploy, destroy, or enable an API without a
 separate request. If `gcloud` asks to enable an API, stop and do not answer
 yes. Set `CLOUDSDK_CORE_DISABLE_PROMPTS=1`. The binary on this machine, when
 it is not on `PATH`, is `/home/khaliqgant/google-cloud-sdk/bin/gcloud`.
@@ -241,7 +244,9 @@ quota was not read because the compute API is disabled. The same describe
 returned 404 again when this note was written. `CI=true` is what makes a
 missing state bucket fail instead of being created.
 That failed preflight predates the apply-time poster and is not evidence that
-the current exact head plans or applies successfully.
+the current exact head plans or applies successfully. The wrapper exited 0
+because it passed `allowFail`. A GCP plan now exits with the Alchemy status
+instead. Do not bootstrap the state bucket, enable APIs, or rerun the plan.
 
 Read-only preflight:
 

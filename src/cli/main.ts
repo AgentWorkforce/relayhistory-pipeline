@@ -10,8 +10,8 @@
  *   96bulls plan <stage>              alchemy plan (dry run)
  *
  * Guardrail: stages named aws* refuse to deploy until the AWS account work is
- * cleared by Khaliq (docs/aws-stage.md). GCP up/down stay refused; `plan` uses
- * the gated GCP stack and still creates nothing by itself (docs/gcp-stage.md).
+ * cleared by Khaliq (docs/aws-stage.md). GCP up/down stay refused. A GCP plan
+ * uses the gated stack and exits non-zero when Alchemy does (docs/gcp-stage.md).
  */
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -21,6 +21,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateLocalKeys, mintToken } from "../alleyoop/auth.ts";
 import { seedConcourse } from "../concourse/seed.ts";
+import { planChildExitCode, planChildMustFailClosed } from "./plan-exit.ts";
 import { HOOPDB_NAME, HOOPDB_USER, NAMES, PORTS, SERVICES_CONTAINER_UID, TENANT, summaryKeyAccess, summaryKeyPath } from "../../stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -40,7 +41,8 @@ function sh(cmd: string, cmdArgs: string[], opts: { cwd?: string; env?: NodeJS.P
     stdio: opts.quiet ? ["ignore", "pipe", "pipe"] : "inherit",
     encoding: "utf8",
   });
-  if (r.status !== 0 && !opts.allowFail) die(`${cmd} ${cmdArgs.join(" ")} failed (exit ${r.status})`, r.status ?? 1);
+  if (planChildMustFailClosed(opts.allowFail, r.status))
+    die(`${cmd} ${cmdArgs.join(" ")} failed (exit ${r.status})`, planChildExitCode(r.status));
   return r;
 }
 
@@ -313,9 +315,9 @@ async function main() {
         return void sh("bunx", ["alchemy", "plan", "--config", "stacks/aws/alchemy.aws.run.ts", "--stage", stageArg, "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: true });
       }
       if (stageArg.startsWith("gcp-")) {
-        // Code-only until cleared: plan needs ambient GCP auth and a non-secret gcp-inputs.json.
-        // Do not run this until Khaliq approves cloud changes. Plan is not proof.
-        return void sh("bunx", ["alchemy", "plan", "--config", "stacks/gcp/alchemy.gcp.run.ts", "--stage", stageArg, "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: true });
+        // Fail closed. A non-zero Alchemy status exits this process. Do not run a plan,
+        // create the state bucket, or enable APIs until that plan is separately approved.
+        return void sh("bunx", ["alchemy", "plan", "--config", "stacks/gcp/alchemy.gcp.run.ts", "--stage", stageArg, "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: false });
       }
       return void sh("bunx", ["alchemy", "plan", "--stage", requireLocalStage(stageArg), "--no-input"], { env: { ALCHEMY_PLAIN: "1" } });
     }
