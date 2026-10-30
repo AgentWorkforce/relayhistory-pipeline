@@ -15,6 +15,7 @@ import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { SCRUB_RULESET, SCRUB_RULESET_VERSION, objectKey, rawChunkKey, type ManifestV1 } from "../../shared/vendor.ts";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
+import { createHash } from "node:crypto";
 import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
 import { bobCostasHandler } from "../../bob-costas/handler.ts";
 import { extractiveSummarizer } from "../../bob-costas/summarizer.ts";
@@ -693,10 +694,17 @@ describe("short_summary end to end through the pipeline", () => {
     await store.put(rawChunkKey({ workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e", startDate: "2026-10-29" },
       0, 0, "22222222", "jsonl"), zstdCompressSync(Buffer.from(`${line}\n`)));
     const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
-    const summaryShort = (directory?: Parameters<typeof bobCostasHandler>[1]["directory"], storeOverride?: typeof store) =>
-      bobCostasHandler("short", { db: hoop, reader, store: storeOverride ?? store, summarizer: extractiveSummarizer, keyring, ...(directory ? { directory } : {}) })(
+    const summaryShort = (
+      directory?: Parameters<typeof bobCostasHandler>[1]["directory"],
+      storeOverride?: typeof store,
+      keyringOverride?: typeof keyring,
+    ) =>
+      bobCostasHandler("short", {
+        db: hoop, reader, store: storeOverride ?? store, summarizer: extractiveSummarizer,
+        keyring: keyringOverride ?? keyring, ...(directory ? { directory } : {}),
+      })(
         { payload: pointer, ctx: { orgId: "org-a" } } as never, { log: { info() {} } } as never);
-    return { db, hoop, index, pointer, ctx, sent, summaryShort, store };
+    return { db, hoop, index, pointer, ctx, sent, summaryShort, store, keyring };
   }
 
   test("indexer projects the row, Bob Costas writes the scrubbed summary, the RPC is tenant-bound, deletion clears it", async () => {
@@ -888,6 +896,90 @@ describe("short_summary end to end through the pipeline", () => {
     expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
     expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
     // Once the store is back, the retry republishes.
+    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+  }, 60_000);
+
+  /** Captures the service's stderr log lines (warn/error) while `run` executes. */
+  async function stderrLines(run: () => Promise<unknown>): Promise<string[]> {
+    const lines: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await run().catch(() => undefined);
+    } finally {
+      process.stderr.write = original;
+    }
+    return lines.flatMap((chunk) => chunk.split("\n")).filter(Boolean);
+  }
+
+  test("an integrity dead-letter logs session, revision and the object key hash", async () => {
+    const { db, index, pointer, ctx, summaryShort, store } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    await summaryShort();
+    const { object_key } = (await db.query<{ object_key: string }>(
+      "SELECT object_key FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'")).rows[0]!;
+    await store.put(objectKey(object_key), new TextEncoder().encode("not an envelope"));
+    const lines = await stderrLines(() => summaryShort());
+    const line = lines.map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((entry) => entry.error_code === "summary_object_integrity");
+    expect(line).toMatchObject({
+      level: "warn", stage: "summary-short", retryable: false,
+      org_id: "org-a", workspace_id: "ws-e2e", harness: "codex", session_id: "s-e2e", machine_id: "m-1", revision: 1,
+      key_sha256: createHash("sha256").update(object_key).digest("hex"),
+    });
+    // The path itself is never logged.
+    expect(lines.join("\n")).not.toContain(object_key);
+  }, 60_000);
+
+  test("a retired key id on the retry read is non-retryable, clears the summary and cannot loop", async () => {
+    const { db, index, pointer, ctx, summaryShort, keyring } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    await summaryShort();
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+    // The pointer still names hkdf1:k1 as current, but this deployment no longer holds k1
+    // for decryption: keyById comes from the real keyring implementation, built without it.
+    const retiredOnly = await masterKeyring(parseMasterKeys(`k2:${"b".repeat(64)}`));
+    const rotatedAway = { currentKey: keyring.currentKey, keyById: retiredOnly.keyById } as typeof keyring;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const error = await summaryShort(undefined, undefined, rotatedAway).then(() => null, (caught: unknown) => caught) as
+        { code?: string; retryable?: boolean } | null;
+      expect(error?.code).toBe("keyring_unknown_key");
+      expect(error?.retryable).toBe(false);
+    }
+    expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
+    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
+  }, 60_000);
+
+  test("a failing clear after a read failure does not mask the original error", async () => {
+    const { db, index, pointer, ctx, summaryShort, store } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    await summaryShort();
+    const failingStore = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === "getObject") return async () => { throw new Error("store unavailable"); };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const brokenDirectory = {
+      write: async () => ({ written: false }),
+      clear: async () => { throw new Error("directory clear failed"); },
+    };
+    let error: { code?: string; retryable?: boolean; message?: string } | null = null;
+    const lines = await stderrLines(async () => {
+      error = await summaryShort(brokenDirectory, failingStore).then(() => null, (caught: unknown) => caught) as never;
+    });
+    expect(error!.code).toBe("summary_store_unavailable");
+    expect(error!.retryable).toBe(true);
+    const entries = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const readFailed = entries.findIndex((entry) => entry.error_code === "summary_store_unavailable");
+    const clearFailed = entries.findIndex((entry) => entry.error_code === "summary_directory_clear_failed");
+    expect(readFailed).toBeGreaterThanOrEqual(0);
+    expect(clearFailed).toBeGreaterThan(readFailed);
+    // The directory was not cleared (its clear failed), and the retry still repairs it.
     expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
     expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
   }, 60_000);
