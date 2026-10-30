@@ -180,8 +180,29 @@ describe("RelayHistory export transform", () => {
   it("folds one revision that the export and the live client stored at different times", () => {
     const exported = record("same", "7", 1, { received_at: "2026-10-29T00:00:00.000Z" });
     const live = record("same", "7", 1, { received_at: "2026-10-30T00:00:00.000Z" });
-    for (const records of [[exported, live], [live, exported]])
-      expect(normalizeRelayhistoryRecords(records).map((value) => value.record_id)).toEqual(["same"]);
+    // No event time in the payload: `received_at` also decides the sort.
+    const undated = (received_at: string) =>
+      record("undated", "3", 1, { received_at, payload: { text: "no time" } });
+    const between = record("between", "1", Date.parse("2026-10-29T12:00:00.000Z"));
+    const early = undated("2026-10-29T00:00:00.000Z");
+    const late = undated("2026-10-30T00:00:00.000Z");
+    // The same instant written two ways still has one winner.
+    const utc = record("spelled", "1", 1, { received_at: "2026-10-29T00:00:00.000Z" });
+    const offset = record("spelled", "1", 1, { received_at: "2026-10-29T01:00:00.000+01:00" });
+    const orders = [
+      [exported, live, early, late, between, utc, offset],
+      [offset, utc, between, late, early, live, exported],
+    ];
+    const [first, second] = orders.map((records) =>
+      JSON.stringify(normalizeRelayhistoryRecords(records)),
+    );
+    expect(second).toBe(first);
+    expect(normalizeRelayhistoryRecords(orders[0]!).map((value) => [value.record_id, value.received_at])).toEqual([
+      ["same", exported.received_at],
+      ["spelled", utc.received_at],
+      ["undated", early.received_at],
+      ["between", between.received_at],
+    ]);
     expect(() =>
       normalizeRelayhistoryRecords([
         record("same", "7", 1),
