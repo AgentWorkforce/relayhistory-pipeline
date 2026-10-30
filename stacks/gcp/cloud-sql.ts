@@ -29,7 +29,7 @@ export const CLOUD_SQL_PROXY_IMAGE = "gcr.io/cloud-sql-connectors/cloud-sql-prox
 
 export interface CloudSqlIpConfiguration {
   ipv4Enabled: false;
-  /** `/projects/{project}/global/networks/{name}`. */
+  /** `projects/{project}/global/networks/{name}`. */
   privateNetwork: string;
   /** Private Service Access range name, not a CIDR. */
   allocatedIpRange: string;
@@ -98,7 +98,7 @@ export function privateCloudSqlSpec(input: {
     refuse("Cloud SQL private attachment needs an RFC1918 Private Service Access CIDR.");
   const tier = input.tier ?? "db-custom-1-3840";
   if (!TIER.test(tier)) refuse("Cloud SQL tier is not a Cloud SQL tier name.");
-  const privateNetwork = `/projects/${input.projectId}/global/networks/${networkName}`;
+  const privateNetwork = `projects/${input.projectId}/global/networks/${networkName}`;
   const connectionName = `${input.projectId}:${input.region}:${instanceName}`;
   const ipConfiguration: CloudSqlIpConfiguration = {
     ipv4Enabled: false,
@@ -187,7 +187,7 @@ const INSERT_BODY_KEYS = new Set(["name", "region", "databaseVersion", "settings
 const INSERT_SETTINGS_KEYS = new Set(["tier", "edition", "availabilityType", "backupConfiguration", "ipConfiguration"]);
 const INSERT_BACKUP_KEYS = new Set(["enabled", "pointInTimeRecoveryEnabled"]);
 const INSERT_IP_KEYS = new Set(["ipv4Enabled", "privateNetwork", "allocatedIpRange"]);
-const PRIVATE_NETWORK = /^\/projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
+const PRIVATE_NETWORK = /^projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
 const RETURNED_PRIVATE_NETWORK = /^\/?projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
 const OPERATION_ID = /^[A-Za-z0-9_-]{1,128}$/;
 

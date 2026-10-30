@@ -222,7 +222,7 @@ const EnsurePrivateCloudSql = Alchemy.Action<
   Effect.gen(function* () {
     if (!input.privateServiceConnection)
       throw new Error("96bulls: private service connection was not resolved. Nothing was created.");
-    const project = /^\/projects\/([^/]+)\/global\/networks\//.exec(input.spec.privateNetwork)?.[1];
+    const project = /^projects\/([^/]+)\/global\/networks\//.exec(input.spec.privateNetwork)?.[1];
     if (!project || input.authorization.projectId !== project)
       throw new Error("96bulls: Cloud SQL poster project is malformed. Nothing was created.");
     if (input.authorization.expiresAt <= Math.floor(Date.now() / 1000))
@@ -563,7 +563,13 @@ export default Alchemy.Stack(
             redisVersion: "REDIS_7_2",
             tier: i.managedDataPlane.redisHa ? "STANDARD_HA" : "BASIC",
             memorySizeGb: i.managedDataPlane.redisMemoryGb ?? 1,
-            authorizedNetwork: network.networkName,
+            // Memorystore rejects a short network name. Mapping the resolved
+            // network output preserves the resource dependency while emitting
+            // the canonical API resource name required by Redis.
+            authorizedNetwork: Output.map(
+              network.networkName,
+              (name) => `projects/${i.projectId}/global/networks/${name}`,
+            ),
             connectMode: "PRIVATE_SERVICE_ACCESS",
             reservedIpRange: psaRange.addressName,
             // The workload probe rejects an inline AUTH string, and this stack
