@@ -212,8 +212,14 @@ const EnsurePrivateCloudSql = Alchemy.Action<
     const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
     if (project !== live.project)
       throw new Error("96bulls: Cloud SQL poster project differs from the resolved GCP project. Nothing was created.");
-    const result = yield* Effect.tryPromise(() =>
-      ensurePrivateCloudSql(input.spec, { bearer: Redacted.value(live.accessToken) }, sqlAdminFetchTransport()),
+    const result = yield* Effect.tryPromise((signal) =>
+      ensurePrivateCloudSql(
+        input.spec,
+        { bearer: Redacted.value(live.accessToken) },
+        sqlAdminFetchTransport(),
+        undefined,
+        { expiresAtMs: input.authorization.leaseExpiresAt * 1000, signal },
+      ),
     );
     return {
       connectionName: input.spec.connectionName,
