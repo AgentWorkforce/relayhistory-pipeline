@@ -18,8 +18,6 @@ export interface DataPathEnv {
   CLOUD_SQL_CONNECTION_NAME?: string;
   REDIS_HOST?: string;
   REDIS_PORT?: string;
-  REDIS_AUTH_ENABLED?: string;
-  REDIS_TRANSIT_ENCRYPTION?: string;
   REDIS_AUTH?: string;
   REDIS_PASSWORD?: string;
   PUBSUB_TOPIC?: string;
@@ -59,8 +57,6 @@ export function dataPathVerdict(env: DataPathEnv): DataPathVerdict {
     missing.push("CLOUD_SQL_CONNECTION_NAME");
   if (blank(env.REDIS_HOST) || env.REDIS_HOST!.includes("://") || env.REDIS_HOST!.includes("@")) missing.push("REDIS_HOST");
   if (!/^[0-9]+$/.test(env.REDIS_PORT?.trim() ?? "")) missing.push("REDIS_PORT");
-  if (env.REDIS_AUTH_ENABLED !== "false") missing.push("REDIS_AUTH_ENABLED");
-  if (env.REDIS_TRANSIT_ENCRYPTION !== "SERVER_AUTHENTICATION") missing.push("REDIS_TRANSIT_ENCRYPTION");
   if (env.REDIS_AUTH || env.REDIS_PASSWORD) missing.push("REDIS_SECRET");
   if (blank(env.PUBSUB_TOPIC)) missing.push("PUBSUB_TOPIC");
   if (blank(env.PUBSUB_SUBSCRIPTION)) missing.push("PUBSUB_SUBSCRIPTION");

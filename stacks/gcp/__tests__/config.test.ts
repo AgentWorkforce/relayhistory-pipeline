@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "bun:test";
 import {
   assertGcpInputs,
@@ -10,11 +12,11 @@ import {
   gcpResourceName,
   pubsubServiceAgent,
   relayauthChartValues,
-  GCP_REDIS_CLIENT,
   RELAYCAST_PUBLISHED_CHART,
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
+  verifyRelaycastChartPackage,
   type GcpInputs,
 } from "../config.ts";
 
@@ -23,6 +25,11 @@ const base: GcpInputs = {
   controlPlaneAuthorizedCidrs: [{ cidrBlock: "203.0.113.10/32", displayName: "operator" }],
   clearedBy: "Khaliq: code review fixture only, 2026-10-29",
   managedDataPlane: { provision: false },
+  kubernetesExecutor: {
+    name: "gcp-vpn-runner-01",
+    mode: "vpn",
+    applyId: "c05b704a-62d1-4d70-a1f9-a98c9e45bb25",
+  },
 };
 
 describe("GCP self-host contract", () => {
@@ -96,9 +103,13 @@ describe("GCP self-host contract", () => {
         controlPlaneAuthorizedCidrs: [{ cidrBlock: "0.0.0.0/0" }],
       }),
     ).toThrow("unsafe or invalid control-plane CIDR");
+    for (const cidrBlock of ["999.1.1.1/32", "203.0.113.10 /32", "203.0.113.10/33", "not-an-ip/32"])
+      expect(() => assertGcpInputs("gcp-dev", { ...base, controlPlaneAuthorizedCidrs: [{ cidrBlock }] })).toThrow(
+        "unsafe or invalid control-plane CIDR",
+      );
   });
 
-  it("installs 96Bulls only with the managed data plane and non-secret chart inputs", () => {
+  it("validates 96Bulls inputs but holds runtime wiring for the external Redis TLS proof", () => {
     const bulls96 = {
       enabled: true,
       chartVersion: "0.3.0",
@@ -148,55 +159,10 @@ describe("GCP self-host contract", () => {
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96,
       }),
-    ).not.toThrow();
+    ).toThrow(/Redis TLS CA\/client round-trip contract.*Nothing was created/);
   });
 
-  it("wires GCS, SQL, Redis, and Pub/Sub into the Helm release without secrets", () => {
-    const values = bulls96ReleaseValues(
-      {
-        enabled: true,
-        chartVersion: "0.3.0",
-        tenantOrgId: "org_123",
-        existingSecretName: "bulls96-runtime",
-        relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
-      },
-      {
-        bucket: "awf-dev-locker-agentworkforce-dev1",
-        region: "us-central1",
-        cloudSqlConnectionName: "agentworkforce-dev1:us-central1:awf-dev-postgres",
-        redisHost: "10.52.0.3",
-        redisPort: 6379,
-        pubsubTopic: "projects/agentworkforce-dev1/topics/awf-dev-events",
-        pubsubSubscription: "projects/agentworkforce-dev1/subscriptions/awf-dev-events-worker",
-        workloadIdentityEmail: "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
-      },
-    );
-    const rendered = JSON.stringify(values);
-    expect(values).toMatchObject({
-      hoopdb: { enabled: false },
-      locker: { enabled: false },
-      worker: {
-        locker: { bucket: "awf-dev-locker-agentworkforce-dev1", credentials: { mode: "podIdentity" } },
-        hoopdb: { existingSecret: "bulls96-runtime", key: "HOOPDB_URL" },
-      },
-      alleyoop: {
-        auth: { jwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json" },
-        locker: { credentials: { mode: "podIdentity" } },
-      },
-    });
-    expect(rendered).toContain("LOCKER_PROVIDER");
-    expect(rendered).toContain('"gcs"');
-    expect(rendered).toContain("CLOUD_SQL_CONNECTION_NAME");
-    expect(rendered).toContain("REDIS_HOST");
-    expect(rendered).toContain("REDIS_AUTH_ENABLED");
-    expect(rendered).toContain(GCP_REDIS_CLIENT.authEnabled);
-    expect(rendered).toContain(GCP_REDIS_CLIENT.transitEncryption);
-    expect(rendered).toContain("PUBSUB_TOPIC");
-    expect(rendered).toContain("WORKER_DATA_PATH_PROBE");
-    expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
-    expect(rendered).not.toContain('"REDIS_AUTH"');
-    expect(rendered).not.toContain("REDIS_PASSWORD");
-    expect(rendered).not.toMatch(/password|BEGIN |hmac/i);
+  it("never emits static Redis TLS readiness as a substitute for a CA/client proof", () => {
     expect(() =>
       bulls96ReleaseValues(
         {
@@ -209,7 +175,7 @@ describe("GCP self-host contract", () => {
         {
           bucket: "locker",
           region: "us-central1",
-          cloudSqlConnectionName: "postgres://user:secret@127.0.0.1/hoopdb",
+          cloudSqlConnectionName: "agentworkforce-dev1:us-central1:awf-dev-postgres",
           redisHost: "10.52.0.3",
           redisPort: 6379,
           pubsubTopic: "projects/agentworkforce-dev1/topics/events",
@@ -217,7 +183,7 @@ describe("GCP self-host contract", () => {
           workloadIdentityEmail: "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
         },
       ),
-    ).toThrow("Nothing was created.");
+    ).toThrow(/external Redis TLS CA\/client round-trip contract.*Nothing was created/);
   });
 
   it("keeps Relaycast on the released single-writer SQLite profile", () => {
@@ -233,8 +199,9 @@ describe("GCP self-host contract", () => {
     });
     expect(values.runtime.backend).toBe("sqlite");
     expect(values.persistence.accessMode).toBe("ReadWriteOnce");
-    expect(values.ingress.annotations["networking.gke.io/managed-certificates"]).toBe("relaycast");
-    expect(values.ingress.hosts).toEqual(["relay.gcp.example.com"]);
+    expect(values.ingress).toEqual({ enabled: false, className: "", annotations: {}, hosts: [], tls: [] });
+    expect(values.service).toEqual({ type: "ClusterIP", annotations: {} });
+    expect(values.networkPolicy).toEqual({ enabled: true, ingressFrom: [] });
   });
 
   it("keeps shortened resource names unique across long stage suffixes", () => {
@@ -259,20 +226,56 @@ describe("GCP self-host contract", () => {
   it("posts a provider-compatible private runtime shape", () => {
     expect(GCP_RUNTIME_SHAPE.privateEndpoint).toBe(true);
     expect(GCP_RUNTIME_SHAPE.autopilot).toBe(false);
+    expect(GCP_RUNTIME_SHAPE.nodeLocation).toBe("us-central1-a");
     expect(GCP_RUNTIME_SHAPE.natIpAllocateOption).toBe("MANUAL_ONLY");
     expect(GCP_RUNTIME_SHAPE.natLogFilter).toBe("ALL");
-    expect(GCP_NODE_ROLES).not.toContain("roles/editor");
-    expect(GCP_NODE_ROLES).not.toContain("roles/owner");
+    expect(GCP_NODE_ROLES).toEqual(["roles/container.defaultNodeServiceAccount"]);
     const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
     expect(stack).toContain("enablePrivateEndpoint: GCP_RUNTIME_SHAPE.privateEndpoint");
     expect(stack).toContain("autopilot: GCP_RUNTIME_SHAPE.autopilot");
     expect(stack).toContain("serviceAccount: nodeIdentity.email");
+    expect(stack).toContain("nodeLocations: [GCP_RUNTIME_SHAPE.nodeLocation]");
     expect(stack).toContain("natIpAllocateOption: GCP_RUNTIME_SHAPE.natIpAllocateOption");
     expect(stack).toContain("filter: GCP_RUNTIME_SHAPE.natLogFilter");
     expect(stack).toContain("purpose: \"VPC_PEERING\"");
+    expect(stack.indexOf('RequireKubernetesReachability("kubernetes-reachability"')).toBeLessThan(
+      stack.indexOf('Kubernetes.Manifest("relaycast-namespace"'),
+    );
     expect(stack).not.toContain("AUTO_ONLY");
     expect(stack).not.toContain("enablePrivateEndpoint: false");
     expect(stack).not.toContain("Shared VPC");
+  });
+
+  it("requires the named private-route executor before any chart is allowed", () => {
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        kubernetesExecutor: undefined,
+        relaycast: { chartVersion: "0.1.0", baseUrl: "https://relay.gcp.example.com" },
+      }),
+    ).toThrow(/named in-vpc or vpn kubernetesExecutor/);
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        kubernetesExecutor: { name: "gcp-vpn-runner-01", mode: "vpn", applyId: "reused-or-not-a-uuid" },
+      }),
+    ).toThrow(/fresh UUIDv4/);
+  });
+
+  it("rejects a missing or digest-mismatched Relaycast package", () => {
+    const dir = mkdtempSync(join(tmpdir(), "96bulls-chart-test-"));
+    try {
+      const path = join(dir, "relaycast-0.1.0.tgz");
+      expect(() => verifyRelaycastChartPackage(path)).toThrow(/package is missing/);
+      writeFileSync(path, "not-the-published-chart");
+      expect(() => verifyRelaycastChartPackage(path)).toThrow(/digest does not match/);
+      const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+      expect(stack).toContain("verifyRelaycastChartPackage");
+      expect(stack).toContain('chart: relaycastChart!');
+      expect(stack).not.toContain('chart: "relaycast"');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("rejects an unpublished Relaycast chart version or repository", () => {

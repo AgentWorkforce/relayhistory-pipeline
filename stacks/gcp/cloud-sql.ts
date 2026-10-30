@@ -14,6 +14,7 @@
  */
 
 import type { Input } from "alchemy/Input";
+import { isIP } from "node:net";
 
 export interface SqlProviderCapabilities {
   /** True only when `GCP.SQL.Instance` accepts `privateNetwork` and passes it to Cloud SQL. */
@@ -463,7 +464,16 @@ function classifyExisting(spec: PrivateCloudSqlSpec, body: unknown): "match" | "
   const privateAddresses =
     Array.isArray(addresses) &&
     addresses.length > 0 &&
-    addresses.every((entry) => asRecord(entry)?.type === "PRIVATE");
+    addresses.every((entry) => {
+      const address = asRecord(entry);
+      const ipAddress = address?.ipAddress;
+      return (
+        address?.type === "PRIVATE" &&
+        typeof ipAddress === "string" &&
+        ipAddress === ipAddress.trim() &&
+        isIP(ipAddress) !== 0
+      );
+    });
   if (!privateAddresses) return "mismatch";
   return "match";
 }
@@ -541,6 +551,38 @@ async function ask(
   }
 }
 
+interface OuterDeadline {
+  injectedAt: number;
+  wallAt: number;
+}
+
+function remainingMs(clock: ResolvedPoll, deadline: OuterDeadline): number {
+  return Math.min(deadline.injectedAt - clock.now(), deadline.wallAt - Date.now());
+}
+
+function requestBudget(clock: ResolvedPoll, deadline: OuterDeadline): number | undefined {
+  const remaining = remainingMs(clock, deadline);
+  if (remaining <= 0) return;
+  return Math.min(clock.requestTimeoutMs, remaining);
+}
+
+async function sleepWithinDeadline(clock: ResolvedPoll, deadline: OuterDeadline): Promise<boolean> {
+  const remaining = remainingMs(clock, deadline);
+  if (remaining <= 0) return false;
+  const duration = Math.min(clock.intervalMs, remaining);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      clock.sleep(duration).then(() => remainingMs(clock, deadline) > 0),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), remaining);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * Get the private instance or create it, then poll the insert operation.
  * There is no default transport. A thrown or unreadable insert does not claim
@@ -557,12 +599,21 @@ export async function ensurePrivateCloudSql(
     refuse("Cloud SQL insert seam tried to carry a credential.");
   assertCredential(credential);
   const clock = resolvePoll(poll);
+  // One absolute deadline covers lookup, insert, 409 adoption, operation
+  // polling, every sleep, and final confirmation. The real clock prevents a
+  // faulty injected test clock from weakening the production wall bound.
+  const deadline = {
+    injectedAt: clock.now() + clock.deadlineMs,
+    wallAt: Date.now() + clock.deadlineMs,
+  };
   const projectId = PRIVATE_NETWORK.exec(request.body.settings.ipConfiguration.privateNetwork)?.[1];
   if (!projectId) refuse("Cloud SQL insert seam lost the VPC link.");
   const instanceName = spec.instanceName;
   const instanceUrl = `https://sqladmin.googleapis.com/v1/projects/${projectId}/instances/${instanceName}`;
   const getCall: SqlAdminEnsureRequest = { method: "GET", url: instanceUrl };
-  const existing = await ask(transport, getCall, credential, clock.requestTimeoutMs);
+  const lookupBudget = requestBudget(clock, deadline);
+  if (lookupBudget === undefined) refuse("Cloud SQL Admin instance lookup timed out.");
+  const existing = await ask(transport, getCall, credential, lookupBudget);
   if (existing === "timeout") refuse("Cloud SQL Admin instance lookup timed out.");
   if (existing === "thrown") refuse("Cloud SQL Admin instance lookup was not accepted.");
   if (existing.status === 200) {
@@ -574,13 +625,15 @@ export async function ensurePrivateCloudSql(
   }
   if (existing.status !== 404) refuse("Cloud SQL Admin instance lookup was not accepted.");
 
-  const inserted = await ask(transport, { method: "POST", url: request.url, body: request.body }, credential, clock.requestTimeoutMs);
+  const insertBudget = requestBudget(clock, deadline);
+  if (insertBudget === undefined) refuse("Cloud SQL Admin deadline expired before insert.");
+  const inserted = await ask(transport, { method: "POST", url: request.url, body: request.body }, credential, insertBudget);
   if (inserted === "thrown" || inserted === "timeout") uncertain(projectId, instanceName);
   if (inserted.status === 409) {
-    const started = clock.now();
     for (let attempt = 0; attempt < clock.maxPolls; attempt += 1) {
-      if (clock.now() - started >= clock.deadlineMs) timedOut(projectId, instanceName);
-      const again = await ask(transport, getCall, credential, clock.requestTimeoutMs);
+      const budget = requestBudget(clock, deadline);
+      if (budget === undefined) timedOut(projectId, instanceName);
+      const again = await ask(transport, getCall, credential, budget);
       if (again === "thrown" || again === "timeout") uncertain(projectId, instanceName);
       if (again.status === 200) {
         const kind = classifyExisting(spec, again.body);
@@ -588,7 +641,7 @@ export async function ensurePrivateCloudSql(
         // Only the normal create window is worth another GET. FAILED and any
         // other non-RUNNABLE state will not become a private match.
         if (kind === "not-ready" && asRecord(again.body)?.state === "PENDING_CREATE") {
-          await clock.sleep(clock.intervalMs);
+          if (!(await sleepWithinDeadline(clock, deadline))) timedOut(projectId, instanceName);
           continue;
         }
         if (kind === "not-ready") rejectNotReady(projectId, instanceName);
@@ -596,7 +649,7 @@ export async function ensurePrivateCloudSql(
       } else if (again.status !== 404) {
         uncertain(projectId, instanceName);
       }
-      await clock.sleep(clock.intervalMs);
+      if (!(await sleepWithinDeadline(clock, deadline))) timedOut(projectId, instanceName);
     }
     timedOut(projectId, instanceName);
   }
@@ -608,11 +661,11 @@ export async function ensurePrivateCloudSql(
   if (initial === "invalid") malformed(projectId, instanceName);
   if (initial !== "done") {
     const operationUrl = `https://sqladmin.googleapis.com/v1/projects/${projectId}/operations/${operationId}`;
-    const started = clock.now();
     let finished = false;
     for (let attempt = 0; attempt < clock.maxPolls; attempt += 1) {
-      if (clock.now() - started >= clock.deadlineMs) timedOut(projectId, instanceName);
-      const polled = await ask(transport, { method: "GET", url: operationUrl }, credential, clock.requestTimeoutMs);
+      const budget = requestBudget(clock, deadline);
+      if (budget === undefined) timedOut(projectId, instanceName);
+      const polled = await ask(transport, { method: "GET", url: operationUrl }, credential, budget);
       if (polled === "thrown" || polled === "timeout" || polled.status !== 200) uncertain(projectId, instanceName);
       const state = operationState(polled.body);
       if (state === "done") {
@@ -622,11 +675,13 @@ export async function ensurePrivateCloudSql(
       if (state === "failed") failedOperation(projectId, instanceName);
       if (state === "invalid") malformed(projectId, instanceName);
       if (state !== "pending") uncertain(projectId, instanceName);
-      await clock.sleep(clock.intervalMs);
+      if (!(await sleepWithinDeadline(clock, deadline))) timedOut(projectId, instanceName);
     }
     if (!finished) timedOut(projectId, instanceName);
   }
-  const confirmed = await ask(transport, getCall, credential, clock.requestTimeoutMs);
+  const confirmationBudget = requestBudget(clock, deadline);
+  if (confirmationBudget === undefined) timedOut(projectId, instanceName);
+  const confirmed = await ask(transport, getCall, credential, confirmationBudget);
   if (confirmed === "thrown" || confirmed === "timeout" || confirmed.status !== 200) uncertain(projectId, instanceName);
   if (classifyExisting(spec, confirmed.body) !== "match") createdMismatch(projectId, instanceName);
   return { created: true, operation: operationId };

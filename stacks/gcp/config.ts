@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
 
 export const GCP_CONFIRM_PROJECT_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT";
+export const GCP_CONFIRM_SQL_POST_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_SQL_POST";
+export const GCP_CONFIRM_KUBERNETES_APPLY_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_KUBERNETES_APPLY";
 
 /** The only project this lane may plan. Any other id, number, org, billing account, or region is refused. */
 export const GCP_APPROVED_TARGET = {
@@ -20,12 +23,6 @@ export const RELAYCAST_PUBLISHED_CHART = {
   packageDigest: "cdfc41cb6202fd81beb17cb57d5fbbdecaf27fa427f51faa07c5ec0fc116744f",
 } as const;
 
-/** Non-secret client contract. AUTH stays off; TLS is server authentication. No password is accepted. */
-export const GCP_REDIS_CLIENT = {
-  authEnabled: "false",
-  transitEncryption: "SERVER_AUTHENTICATION",
-} as const;
-
 /**
  * Shape the installed Alchemy provider can actually post.
  * Autopilot create omits node pools, so a node service account would not be
@@ -37,6 +34,7 @@ export const GCP_REDIS_CLIENT = {
 export const GCP_RUNTIME_SHAPE = {
   privateEndpoint: true,
   autopilot: false,
+  nodeLocation: "us-central1-a",
   machineType: "e2-medium",
   initialNodeCount: 1,
   natIpAllocateOption: "MANUAL_ONLY",
@@ -46,12 +44,23 @@ export const GCP_RUNTIME_SHAPE = {
 
 /** Node identity only. Not the Workload Identity runtime account, and not a key. */
 export const GCP_NODE_ROLES = [
-  "roles/logging.logWriter",
-  "roles/monitoring.metricWriter",
-  "roles/monitoring.viewer",
-  "roles/stackdriver.resourceMetadata.writer",
-  "roles/artifactregistry.reader",
+  "roles/container.defaultNodeServiceAccount",
 ] as const;
+
+export function verifyRelaycastChartPackage(path: string): string {
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(path);
+  } catch {
+    throw new Error(
+      `96bulls: Relaycast chart package is missing; expected the published 0.1.0 artifact at ${path}. Nothing was created.`,
+    );
+  }
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  if (digest !== RELAYCAST_PUBLISHED_CHART.packageDigest)
+    throw new Error("96bulls: Relaycast chart package digest does not match published 0.1.0. Nothing was created.");
+  return path;
+}
 
 export function isPublishedHelmRepo(repo: string | undefined): boolean {
   if (!repo) return true;
@@ -110,14 +119,25 @@ export interface RelayflowsChartInputs {
   flowConfigMapKey?: string;
 }
 
+export interface KubernetesExecutorInputs {
+  /** A human-auditable runner name, not a credential or address. */
+  name: string;
+  /** The runner must have a route to the cluster's private control plane. */
+  mode: "in-vpc" | "vpn";
+  /** A fresh UUID for each intended Kubernetes apply; persisted Action input prevents stale proof reuse. */
+  applyId: string;
+}
+
 export interface GcpInputs {
   projectId: string;
   projectNumber: string;
   organizationId: string;
   billingAccount: string;
   region: string;
-  /** Operator/VPN egress ranges allowed to reach the public GKE API endpoint. */
+  /** Operator/VPN ranges allowed to reach the private GKE API endpoint. */
   controlPlaneAuthorizedCidrs: Array<{ cidrBlock: string; displayName?: string }>;
+  /** Required before this stack declares any Kubernetes object or Helm chart. */
+  kubernetesExecutor?: KubernetesExecutorInputs;
   /** Khaliq's words and date recording that a real GCP plan/deploy is cleared. */
   clearedBy: string;
   chartRepo?: string;
@@ -230,9 +250,32 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     throw new Error("96bulls: controlPlaneAuthorizedCidrs must allow at least one operator or VPN range");
   for (const { cidrBlock } of inputs.controlPlaneAuthorizedCidrs) {
     const match = /^([0-9A-Fa-f:.]+)\/([0-9]{1,3})$/.exec(cidrBlock);
-    if (!match || Number(match[2]) > (match[1]!.includes(":") ? 128 : 32) || cidrBlock === "0.0.0.0/0" || cidrBlock === "::/0")
+    const family = match ? isIP(match[1]!) : 0;
+    if (
+      !match ||
+      cidrBlock !== cidrBlock.trim() ||
+      family === 0 ||
+      Number(match[2]) > (family === 6 ? 128 : 32) ||
+      cidrBlock === "0.0.0.0/0" ||
+      cidrBlock === "::/0"
+    )
       throw new Error(`96bulls: unsafe or invalid control-plane CIDR ${cidrBlock}`);
   }
+  if (inputs.kubernetesExecutor) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,62}$/.test(inputs.kubernetesExecutor.name))
+      throw new Error("96bulls: kubernetesExecutor.name must identify a named runner, never an address or credential");
+    if (inputs.kubernetesExecutor.mode !== "in-vpc" && inputs.kubernetesExecutor.mode !== "vpn")
+      throw new Error("96bulls: kubernetesExecutor.mode must be in-vpc or vpn");
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(inputs.kubernetesExecutor.applyId))
+      throw new Error("96bulls: kubernetesExecutor.applyId must be a fresh UUIDv4 for this apply");
+  }
+  if (
+    (inputs.relaycast || inputs.relayauth || inputs.relayfile || inputs.relayflows || inputs.bulls96?.enabled) &&
+    !inputs.kubernetesExecutor
+  )
+    throw new Error(
+      "96bulls: Kubernetes charts require a named in-vpc or vpn kubernetesExecutor reachability preflight. Nothing was created.",
+    );
   if (inputs.chartRepo) {
     const repo = new URL(inputs.chartRepo);
     if (repo.protocol !== "https:" || repo.username || repo.password)
@@ -292,12 +335,37 @@ export function assertGcpRuntimeDeployable(inputs: GcpInputs): void {
     (!inputs.managedDataPlane.provision || inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
   )
     throw new Error("96bulls: GCP runtime wiring requires the acknowledged managed data plane. Nothing was created.");
+  if (inputs.bulls96?.enabled)
+    throw new Error(
+      "96bulls: GCP 96Bulls wiring is held until the external Redis TLS CA/client round-trip contract is proven. Nothing was created.",
+    );
+}
+
+export function assertGcpSqlPostConfirmation(
+  projectId: string,
+  instanceName: string,
+  confirmation: string | undefined,
+): void {
+  const expected = `${projectId}/${instanceName}`;
+  if (confirmation !== expected)
+    throw new Error(
+      `96bulls: set ${GCP_CONFIRM_SQL_POST_ENV}=${expected} for the apply-time Cloud SQL insert. Nothing was created.`,
+    );
+}
+
+export function assertGcpKubernetesApplyConfirmation(
+  applyId: string,
+  confirmation: string | undefined,
+): void {
+  if (confirmation !== applyId)
+    throw new Error(
+      `96bulls: set ${GCP_CONFIRM_KUBERNETES_APPLY_ENV}=${applyId} for this Kubernetes apply. No Kubernetes objects were applied.`,
+    );
 }
 
 export function relaycastChartValues(i: RelaycastChartInputs, defaultStorageClass = "standard-rwo") {
   if (i.chartVersion !== RELAYCAST_PUBLISHED_CHART.version)
     throw new Error("96bulls: relaycast chart is not the published 0.1.0 contract. Nothing was created.");
-  const host = new URL(i.baseUrl).hostname;
   return {
     replicaCount: 1,
     strategy: { type: "Recreate" },
@@ -308,17 +376,15 @@ export function relaycastChartValues(i: RelaycastChartInputs, defaultStorageClas
     runtime: { backend: "sqlite" },
     baseUrl: i.baseUrl,
     persistence: { storageClass: i.storageClass ?? defaultStorageClass, accessMode: "ReadWriteOnce", size: "20Gi" },
-    service: { type: "ClusterIP", annotations: { "cloud.google.com/neg": '{"ingress": true}' } },
+    service: { type: "ClusterIP", annotations: {} },
     ingress: {
-      enabled: true,
+      enabled: false,
       className: "",
-      annotations: {
-        "kubernetes.io/ingress.class": "gce",
-        "networking.gke.io/managed-certificates": "relaycast",
-      },
-      hosts: [host],
+      annotations: {},
+      hosts: [],
       tls: [],
     },
+    networkPolicy: { enabled: true, ingressFrom: [] },
   };
 }
 
@@ -363,8 +429,6 @@ export interface Bulls96ReleaseOutputs {
   workloadIdentityEmail: string;
 }
 
-const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
-
 function requireRelayauthJwksUrl(label: string, value: string): void {
   let jwks: URL;
   try {
@@ -389,83 +453,18 @@ function requireRelayauthJwksUrl(label: string, value: string): void {
     throw new Error(`96bulls: ${label} must be public HTTPS or the in-cluster RelayAuth service`);
 }
 
-function plainSetting(label: string, value: unknown): void {
-  if (typeof value !== "string") return;
-  if (value.includes("://") || value.includes("@") || value.includes("BEGIN "))
-    throw new Error(`96bulls: ${label} must not carry a URL, credential, or key. Nothing was created.`);
-}
-
 /**
- * Non-secret outputs for the published 96bulls chart. In-chart MinIO and
- * CloudNativePG stay off. HOOPDB_URL remains a key in the existing Secret.
- * Redis AUTH and HMAC keys are not accepted here.
+ * Fail closed until the application consumes Memorystore's CA and a real
+ * TLS round-trip has passed. Static SERVER_AUTHENTICATION environment values
+ * are not evidence that the Redis client negotiated TLS.
  */
 export function bulls96ReleaseValues(
-  i: NonNullable<GcpInputs["bulls96"]>,
-  managed: Bulls96ReleaseOutputs,
-): Record<string, unknown> {
-  if (!GSA_EMAIL.test(managed.workloadIdentityEmail))
-    throw new Error("96bulls: workload identity email is not a service-account email. Nothing was created.");
-  for (const [label, value] of [
-    ["bucket", managed.bucket],
-    ["region", managed.region],
-    ["cloudSqlConnectionName", managed.cloudSqlConnectionName],
-    ["redisHost", managed.redisHost],
-    ["pubsubTopic", managed.pubsubTopic],
-    ["pubsubSubscription", managed.pubsubSubscription],
-  ] as const) {
-    plainSetting(label, value);
-  }
-  if (typeof managed.redisPort === "string" && !/^[0-9]+$/.test(managed.redisPort))
-    throw new Error("96bulls: redis port must be numeric. Nothing was created.");
-  const redisPort = typeof managed.redisPort === "number" ? String(managed.redisPort) : managed.redisPort;
-  requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", i.relayauthJwksUrl);
-  const identity = { "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail };
-  const dataEnv = () => [
-    { name: "LOCKER_PROVIDER", value: "gcs" },
-    { name: "PIPELINE_RAW_PROVIDER", value: "gcs" },
-    { name: "PIPELINE_RAW_S3_BUCKET", value: managed.bucket },
-    { name: "CLOUD_SQL_CONNECTION_NAME", value: managed.cloudSqlConnectionName },
-    { name: "REDIS_HOST", value: managed.redisHost },
-    { name: "REDIS_PORT", value: redisPort },
-    { name: "REDIS_AUTH_ENABLED", value: GCP_REDIS_CLIENT.authEnabled },
-    { name: "REDIS_TRANSIT_ENCRYPTION", value: GCP_REDIS_CLIENT.transitEncryption },
-    { name: "PUBSUB_TOPIC", value: managed.pubsubTopic },
-    { name: "PUBSUB_SUBSCRIPTION", value: managed.pubsubSubscription },
-    { name: "WORKER_DATA_PATH_PROBE", value: "1" },
-  ];
-  const locker = () => ({
-    endpoint: "",
-    bucket: managed.bucket,
-    region: managed.region,
-    credentials: { mode: "podIdentity" as const },
-  });
-  const hoopdb = () => ({ existingSecret: i.existingSecretName, key: "HOOPDB_URL" });
-  return {
-    global: { tenant: { orgId: i.tenantOrgId } },
-    worker: {
-      existingSecret: i.existingSecretName,
-      hoopdb: hoopdb(),
-      locker: locker(),
-      lockerInit: { enabled: false },
-      migrations: { supabaseShim: true },
-      summaryEncryption: { existingSecret: i.existingSecretName, key: "SUMMARY_MASTER_KEYS" },
-      serviceAccount: { annotations: { ...identity } },
-      tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
-      extraEnv: dataEnv(),
-    },
-    alleyoop: {
-      existingSecret: i.existingSecretName,
-      hoopdb: hoopdb(),
-      locker: locker(),
-      auth: { jwksUrl: i.relayauthJwksUrl },
-      serviceAccount: { annotations: { ...identity } },
-      tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
-      extraEnv: dataEnv(),
-    },
-    hoopdb: { enabled: false },
-    locker: { enabled: false },
-  };
+  _i: NonNullable<GcpInputs["bulls96"]>,
+  _managed: Bulls96ReleaseOutputs,
+): never {
+  throw new Error(
+    "96bulls: GCP 96Bulls wiring is held until the external Redis TLS CA/client round-trip contract is proven. Nothing was created.",
+  );
 }
 
 export function relayflowsChartValues(i: RelayflowsChartInputs, defaultStorageClass = "standard-rwo") {

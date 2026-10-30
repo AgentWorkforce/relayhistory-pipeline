@@ -9,8 +9,6 @@ const armed = {
   CLOUD_SQL_CONNECTION_NAME: "agentworkforce-dev1:us-central1:awf-dev-postgres",
   REDIS_HOST: "10.52.0.3",
   REDIS_PORT: "6379",
-  REDIS_AUTH_ENABLED: "false",
-  REDIS_TRANSIT_ENCRYPTION: "SERVER_AUTHENTICATION",
   PUBSUB_TOPIC: "projects/agentworkforce-dev1/topics/awf-dev-events",
   PUBSUB_SUBSCRIPTION: "projects/agentworkforce-dev1/subscriptions/awf-dev-events-worker",
 };
@@ -71,12 +69,6 @@ describe("data-path readiness", () => {
     }
     expect(JSON.stringify(sql)).not.toContain("super-secret");
     expect(JSON.stringify(sql)).not.toContain("redis-secret");
-    const redis = dataPathVerdict({ ...armed, REDIS_AUTH_ENABLED: "true", REDIS_TRANSIT_ENCRYPTION: "DISABLED" });
-    expect(redis.ok).toBe(false);
-    if (!redis.ok) {
-      expect(redis.missing).toContain("REDIS_AUTH_ENABLED");
-      expect(redis.missing).toContain("REDIS_TRANSIT_ENCRYPTION");
-    }
     expect(workloadReady(true, { ...armed, LOCKER_BUCKET: "  " })).toEqual({ ok: false, missing: ["LOCKER_BUCKET"] });
   });
 });

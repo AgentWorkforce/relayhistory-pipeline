@@ -447,6 +447,19 @@ describe("SQL Admin idempotent poster", () => {
     expect(absent.calls.map((call) => call.method)).toEqual(["GET"]);
   });
 
+  test("rejects PRIVATE labels with malformed or whitespace address values", async () => {
+    const spec = privateCloudSqlSpec(input);
+    for (const ipAddress of ["", "10.52.0.5 ", "not-an-ip", "999.52.0.5"]) {
+      const poster = scripted([
+        { status: 200, body: { ...matchingInstance(spec), ipAddresses: [{ type: "PRIVATE", ipAddress }] } },
+      ]);
+      await expect(ensurePrivateCloudSql(spec, credential, poster.transport, fastPoll())).rejects.toThrow(
+        /does not match the private body/,
+      );
+      expect(poster.calls.map((call) => call.method)).toEqual(["GET"]);
+    }
+  });
+
   test("polls a pending create that has not received an address yet", async () => {
     const spec = privateCloudSqlSpec(input);
     const pending = { ...matchingInstance(spec), state: "PENDING_CREATE" };
@@ -479,6 +492,86 @@ describe("SQL Admin idempotent poster", () => {
       ensurePrivateCloudSql(privateCloudSqlSpec(input), credential, transport, fastPoll({ requestTimeoutMs: 25 })),
     ).rejects.toThrow(/lookup timed out/);
     expect(aborted).toBe(true);
+  });
+
+  test("hard-stops when a transport ignores AbortSignal", async () => {
+    let aborted = false;
+    const started = Date.now();
+    await expect(
+      ensurePrivateCloudSql(
+        privateCloudSqlSpec(input),
+        credential,
+        {
+          request: (_call, _credential, signal) =>
+            new Promise<SqlAdminEnsureResponse>(() => {
+              signal?.addEventListener("abort", () => {
+                aborted = true;
+              });
+            }),
+        },
+        { deadlineMs: 30, requestTimeoutMs: 5000, intervalMs: 5, maxPolls: 10, now: Date.now, sleep: Bun.sleep },
+      ),
+    ).rejects.toThrow(/lookup timed out/);
+    expect(aborted).toBe(true);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  test("uses one outer deadline through lookup, insert, operation, and final confirmation", async () => {
+    const spec = privateCloudSqlSpec(input);
+    let nowMs = 0;
+    const calls: SqlAdminEnsureRequest[] = [];
+    const steps: SqlAdminEnsureResponse[] = [
+      { status: 404 },
+      { status: 200, body: { name: "op-1", status: "PENDING" } },
+      { status: 200, body: { status: "DONE" } },
+      { status: 200, body: matchingInstance(spec) },
+    ];
+    await expect(
+      ensurePrivateCloudSql(
+        spec,
+        credential,
+        {
+          request: async (call) => {
+            calls.push(call);
+            nowMs += 4;
+            return steps.shift()!;
+          },
+        },
+        {
+          now: () => nowMs,
+          sleep: async (ms) => {
+            nowMs += ms;
+          },
+          deadlineMs: 10,
+          requestTimeoutMs: 100,
+          intervalMs: 1,
+          maxPolls: 10,
+        },
+      ),
+    ).rejects.toThrow(/operation timed out/);
+    expect(calls.map((call) => call.method)).toEqual(["GET", "POST", "GET"]);
+  });
+
+  test("hard-bounds a 409 adoption sleep that never resolves", async () => {
+    const spec = privateCloudSqlSpec(input);
+    const poster = scripted([
+      { status: 404 },
+      { status: 409 },
+      { status: 200, body: { ...matchingInstance(spec), state: "PENDING_CREATE" } },
+    ]);
+    const started = Date.now();
+    await expect(
+      ensurePrivateCloudSql(spec, credential, poster.transport, {
+        now: Date.now,
+        sleep: () => new Promise<void>(() => {}),
+        deadlineMs: 30,
+        intervalMs: 5000,
+        maxPolls: 10,
+        requestTimeoutMs: 5000,
+      }),
+    ).rejects.toThrow(/operation timed out/);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(poster.calls.map((call) => call.method)).toEqual(["GET", "POST", "GET"]);
   });
 
   test("rejects invalid poll controls before any request", async () => {

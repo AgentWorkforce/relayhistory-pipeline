@@ -3,11 +3,13 @@
  *
  * This is code-only until Khaliq separately clears a project. It deliberately
  * keeps secret payloads out of Alchemy inputs/state. Relaycast stays
- * single-node SQLite. 96Bulls installs only as conformance wiring: GCS,
- * private Cloud SQL (not posted through GCP.SQL.Instance), Redis, and Pub/Sub.
+ * single-node SQLite. Managed GCS, private Cloud SQL (not posted through
+ * GCP.SQL.Instance), Redis, and Pub/Sub remain adapter-test infrastructure;
+ * 96Bulls installation is held until the Redis TLS client contract is proven.
  * Production stays Supabase and AWS S3.
  */
 import * as Alchemy from "alchemy";
+import type { Input } from "alchemy/Input";
 import { Stage } from "alchemy";
 import * as Output from "alchemy/Output";
 import * as GCP from "@alchemy.run/gcp";
@@ -15,23 +17,29 @@ import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   GCP_CONFIRM_PROJECT_ENV,
+  GCP_CONFIRM_KUBERNETES_APPLY_ENV,
+  GCP_CONFIRM_SQL_POST_ENV,
   GCP_NODE_ROLES,
   GCP_RUNTIME_SHAPE,
   assertGcpInputs,
+  assertGcpKubernetesApplyConfirmation,
   assertGcpRuntimeDeployable,
+  assertGcpSqlPostConfirmation,
   bulls96ReleaseValues,
   gcpResourceName,
   pubsubServiceAgent,
   relayauthChartValues,
-  RELAYCAST_PUBLISHED_CHART,
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
+  verifyRelaycastChartPackage,
   type GcpInputs,
 } from "./config.ts";
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "./deploy-guard.ts";
@@ -43,6 +51,7 @@ import {
   sqlAdminFetchTransport,
   type PrivateCloudSqlSpec,
 } from "./cloud-sql.ts";
+import { provePrivateKubernetesReachability } from "./kubernetes-preflight.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
@@ -61,6 +70,11 @@ interface EnsurePrivateCloudSqlOutput {
   operation: string | null;
 }
 
+interface RequireKubernetesReachabilityInput {
+  endpoint: string;
+  executor: NonNullable<GcpInputs["kubernetesExecutor"]>;
+}
+
 const EnsurePrivateCloudSql = Alchemy.Action<
   "96Bulls.GCP.EnsurePrivateCloudSql",
   EnsurePrivateCloudSqlInput,
@@ -70,8 +84,15 @@ const EnsurePrivateCloudSql = Alchemy.Action<
   Effect.gen(function* () {
     if (!input.privateServiceConnection)
       throw new Error("96bulls: private service connection was not resolved. Nothing was created.");
-    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
     const project = /^\/projects\/([^/]+)\/global\/networks\//.exec(input.spec.privateNetwork)?.[1];
+    if (!project)
+      throw new Error("96bulls: Cloud SQL poster project is malformed. Nothing was created.");
+    assertGcpSqlPostConfirmation(
+      project,
+      input.spec.instanceName,
+      process.env[GCP_CONFIRM_SQL_POST_ENV],
+    );
+    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
     if (project !== live.project)
       throw new Error("96bulls: Cloud SQL poster project differs from the resolved GCP project. Nothing was created.");
     const result = yield* Effect.tryPromise(() =>
@@ -89,6 +110,39 @@ const EnsurePrivateCloudSql = Alchemy.Action<
     };
   }),
 );
+
+const RequireKubernetesReachability = Alchemy.Action<
+  "96Bulls.GCP.RequireKubernetesReachability",
+  RequireKubernetesReachabilityInput,
+  Awaited<ReturnType<typeof provePrivateKubernetesReachability>>,
+  GCP.GcpEnvironment
+>("96Bulls.GCP.RequireKubernetesReachability", (input) =>
+  Effect.tryPromise(() => {
+    assertGcpKubernetesApplyConfirmation(
+      input.executor.applyId,
+      process.env[GCP_CONFIRM_KUBERNETES_APPLY_ENV],
+    );
+    return provePrivateKubernetesReachability(input.endpoint, input.executor);
+  }),
+);
+
+function prepareRelaycastChart(stage: string): string {
+  const artifact = verifyRelaycastChartPackage(
+    join(ROOT, ".96bulls", stage, "artifacts", "relaycast-0.1.0.tgz"),
+  );
+  const extracted = mkdtempSync(join(tmpdir(), "96bulls-relaycast-0.1.0-"));
+  try {
+    execFileSync("tar", ["-xzf", artifact, "-C", extracted], { stdio: "ignore" });
+    const chart = join(extracted, "relaycast");
+    if (!statSync(chart).isDirectory())
+      throw new Error("published package did not contain relaycast/");
+    process.once("exit", () => rmSync(extracted, { recursive: true, force: true }));
+    return chart;
+  } catch {
+    rmSync(extracted, { recursive: true, force: true });
+    throw new Error("96bulls: verified Relaycast package could not be extracted. Nothing was created.");
+  }
+}
 
 function readInputs(stage: string): GcpInputs {
   const path = join(ROOT, ".96bulls", stage, "gcp-inputs.json");
@@ -112,10 +166,19 @@ const labels = (stage: string, component: string) => ({
 const workloadIdentityPrincipal = (i: GcpInputs, namespace: string, serviceAccount: string) =>
   `principal://iam.googleapis.com/projects/${i.projectNumber}/locations/global/workloadIdentityPools/${i.projectId}.svc.id.goog/subject/ns/${namespace}/sa/${serviceAccount}`;
 
-const managedCertificate = (name: string, namespace: string, domain: string) => ({
+const managedCertificate = (
+  name: string,
+  namespace: string,
+  domain: string,
+  reachability: Input<string>,
+) => ({
   apiVersion: "networking.gke.io/v1",
   kind: "ManagedCertificate",
-  metadata: { name, namespace },
+  metadata: {
+    name,
+    namespace,
+    annotations: { "96bulls.agentworkforce.dev/reachability": reachability },
+  },
   spec: { domains: [domain] },
 });
 
@@ -129,6 +192,9 @@ export default Alchemy.Stack(
     const stage = yield* Stage;
     const i = readInputs(stage);
     assertGcpRuntimeDeployable(i);
+    // Verify and freeze the exact published package before provider resolution
+    // or any resource declaration. Helm renders the extracted immutable bytes.
+    const relaycastChart = i.relaycast ? prepareRelaycastChart(stage) : null;
     // Before the first resource. Confirmation is operator intent; the resolved
     // GCP environment is the project and region these credentials will use.
     const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
@@ -270,6 +336,7 @@ export default Alchemy.Stack(
       serviceAccount: nodeIdentity.email,
       machineType: GCP_RUNTIME_SHAPE.machineType,
       initialNodeCount: GCP_RUNTIME_SHAPE.initialNodeCount,
+      nodeLocations: [GCP_RUNTIME_SHAPE.nodeLocation],
       oauthScopes: [GCP_RUNTIME_SHAPE.nodeOauthScope],
       datapathProvider: "ADVANCED_DATAPATH",
       enableShieldedNodes: true,
@@ -436,25 +503,46 @@ export default Alchemy.Stack(
         })
       : null;
 
+    const kubernetesRequested = Boolean(
+      i.relaycast || i.relayauth || i.relayfile || i.relayflows || i.bulls96?.enabled,
+    );
+    // This Action must succeed during apply before execution can advance to
+    // the first Kubernetes resource. It proves this named executor can route
+    // to the concrete private control-plane endpoint; it sends no credential.
+    const kubernetesReachability = kubernetesRequested
+      ? yield* RequireKubernetesReachability("kubernetes-reachability", {
+          endpoint: cluster.endpoint.as<string>(),
+          executor: i.kubernetesExecutor!,
+        })
+      : null;
+
     const relaycastConfig = i.relaycast;
     const relaycast = relaycastConfig
       ? yield* Effect.gen(function* () {
           yield* Kubernetes.Manifest("relaycast-namespace", {
             cluster,
-            manifest: { apiVersion: "v1", kind: "Namespace", metadata: { name: "relaycast" } },
-          });
-          yield* Kubernetes.Manifest("relaycast-certificate", {
-            cluster,
-            manifest: managedCertificate("relaycast", "relaycast", new URL(relaycastConfig.baseUrl).hostname),
+            manifest: {
+              apiVersion: "v1",
+              kind: "Namespace",
+              metadata: {
+                name: "relaycast",
+                annotations: { "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof },
+              },
+            },
           });
           return yield* Kubernetes.HelmChart("relaycast", {
             cluster,
-            chart: "relaycast",
-            repo: chartRepo,
-            version: RELAYCAST_PUBLISHED_CHART.version,
+            chart: relaycastChart!,
             releaseName: "relaycast",
             namespace: "relaycast",
-            values: relaycastChartValues(relaycastConfig, storageClass),
+            values: {
+              ...relaycastChartValues(relaycastConfig, storageClass),
+              podAnnotations: {
+                "96bulls.agentworkforce.dev/executor": kubernetesReachability!.executor,
+                "96bulls.agentworkforce.dev/apply-id": kubernetesReachability!.applyId,
+                "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof,
+              },
+            },
           });
         })
       : null;
@@ -464,12 +552,24 @@ export default Alchemy.Stack(
       ? yield* Effect.gen(function* () {
           yield* Kubernetes.Manifest("relayauth-namespace", {
             cluster,
-            manifest: { apiVersion: "v1", kind: "Namespace", metadata: { name: "relayauth" } },
+            manifest: {
+              apiVersion: "v1",
+              kind: "Namespace",
+              metadata: {
+                name: "relayauth",
+                annotations: { "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof },
+              },
+            },
           });
           if (relayauthConfig.baseUrl)
             yield* Kubernetes.Manifest("relayauth-certificate", {
               cluster,
-              manifest: managedCertificate("relayauth", "relayauth", new URL(relayauthConfig.baseUrl).hostname),
+              manifest: managedCertificate(
+                "relayauth",
+                "relayauth",
+                new URL(relayauthConfig.baseUrl).hostname,
+                kubernetesReachability!.proof,
+              ),
             });
           return yield* Kubernetes.HelmChart("relayauth", {
             cluster,
@@ -477,7 +577,7 @@ export default Alchemy.Stack(
             repo: chartRepo,
             version: relayauthConfig.chartVersion,
             releaseName: "relayauth",
-            namespace: "relayauth",
+            namespace: Output.map(kubernetesReachability!.proof, () => "relayauth"),
             values: relayauthChartValues(relayauthConfig, storageClass),
           });
         })
@@ -490,7 +590,7 @@ export default Alchemy.Stack(
           repo: chartRepo,
           version: i.relayfile.chartVersion,
           releaseName: "relayfile",
-          namespace: "relayfile",
+          namespace: Output.map(kubernetesReachability!.proof, () => "relayfile"),
           createNamespace: true,
           values: relayfileChartValues(i.relayfile),
         })
@@ -503,7 +603,7 @@ export default Alchemy.Stack(
           repo: chartRepo,
           version: i.relayflows.chartVersion,
           releaseName: "relayflows",
-          namespace: "relayflows",
+          namespace: Output.map(kubernetesReachability!.proof, () => "relayflows"),
           createNamespace: true,
           values: relayflowsChartValues(i.relayflows, storageClass),
         })
@@ -515,7 +615,14 @@ export default Alchemy.Stack(
             throw new Error("96bulls: 96Bulls install requires the managed data plane. Nothing was created.");
           yield* Kubernetes.Manifest("96bulls-namespace", {
             cluster,
-            manifest: { apiVersion: "v1", kind: "Namespace", metadata: { name: "96bulls" } },
+            manifest: {
+              apiVersion: "v1",
+              kind: "Namespace",
+              metadata: {
+                name: "96bulls",
+                annotations: { "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof },
+              },
+            },
           });
           // The poster output is an explicit dependency: neither this IAM
           // edge nor the proxy deployment can apply before Cloud SQL is
@@ -531,16 +638,40 @@ export default Alchemy.Stack(
             runtimeEmail,
             dataPlane.sqlPoster.connectionName,
           );
-          yield* Kubernetes.Manifest("cloud-sql-proxy-account", { cluster, manifest: proxy.serviceAccount });
-          yield* Kubernetes.Manifest("cloud-sql-proxy-service", { cluster, manifest: proxy.service });
-          yield* Kubernetes.Manifest("cloud-sql-proxy", { cluster, manifest: proxy.deployment });
+          const reachabilityAnnotation = {
+            "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof,
+          };
+          yield* Kubernetes.Manifest("cloud-sql-proxy-account", {
+            cluster,
+            manifest: {
+              ...proxy.serviceAccount,
+              metadata: {
+                ...proxy.serviceAccount.metadata,
+                annotations: { ...proxy.serviceAccount.metadata.annotations, ...reachabilityAnnotation },
+              },
+            },
+          });
+          yield* Kubernetes.Manifest("cloud-sql-proxy-service", {
+            cluster,
+            manifest: {
+              ...proxy.service,
+              metadata: { ...proxy.service.metadata, annotations: reachabilityAnnotation },
+            },
+          });
+          yield* Kubernetes.Manifest("cloud-sql-proxy", {
+            cluster,
+            manifest: {
+              ...proxy.deployment,
+              metadata: { ...proxy.deployment.metadata, annotations: reachabilityAnnotation },
+            },
+          });
           const release = yield* Kubernetes.HelmChart("96bulls", {
             cluster,
             chart: "96bulls",
             repo: chartRepo,
             version: i.bulls96!.chartVersion,
             releaseName: "96bulls",
-            namespace: "96bulls",
+            namespace: Output.map(kubernetesReachability!.proof, () => "96bulls"),
             values: bulls96ReleaseValues(i.bulls96!, {
               bucket: lockerBucket,
               region: i.region,
