@@ -97,10 +97,25 @@ function canonical(value: unknown): unknown {
   if (value && typeof value === "object")
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .sort(([a], [b]) => a.localeCompare(b))
+        .sort(([a], [b]) => compareText(a, b))
         .map(([key, child]) => [key, canonical(child)]),
     );
   return value;
+}
+
+/** Locale-independent Unicode code-point order for canonical JSON keys. */
+function compareText(left: string, right: string): number {
+  const leftPoints = left[Symbol.iterator]();
+  const rightPoints = right[Symbol.iterator]();
+  while (true) {
+    const leftPoint = leftPoints.next();
+    const rightPoint = rightPoints.next();
+    if (leftPoint.done || rightPoint.done)
+      return leftPoint.done === rightPoint.done ? 0 : leftPoint.done ? -1 : 1;
+    const leftValue = leftPoint.value.codePointAt(0)!;
+    const rightValue = rightPoint.value.codePointAt(0)!;
+    if (leftValue !== rightValue) return leftValue < rightValue ? -1 : 1;
+  }
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
@@ -288,6 +303,33 @@ async function storedManifest(raw: RawStore, key: string): Promise<{ manifest: M
   }
 }
 
+/** Reconcile a lost create/CAS race when the winner stored this exact retry. */
+async function putManifestOrReplay(
+  raw: RawStore,
+  key: string,
+  text: string,
+  auth: Auth,
+  put: () => Promise<{ version: ObjectVersion }>,
+): Promise<ObjectVersion> {
+  try {
+    return (await put()).version;
+  } catch (error) {
+    if (
+      !isObjectStoreError(error, "already_exists") &&
+      !isObjectStoreError(error, "precondition_failed")
+    )
+      throw error;
+    const winner = await storedManifest(raw, key);
+    if (
+      !winner ||
+      winner.text !== text ||
+      migrationReplayIssue(winner.manifest, auth)
+    )
+      throw error;
+    return winner.version;
+  }
+}
+
 export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   const routes = new Hono<AppEnv>();
 
@@ -339,6 +381,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     if (c.req.header("X-Session-Id") !== manifest.session.session_id || c.req.header("X-Machine-Id") !== manifest.session.machine_id)
       return responseError(c, 400, "bad_request", "session headers do not match the manifest");
     const encoded = new TextEncoder().encode(JSON.stringify(manifest));
+    const encodedText = new TextDecoder().decode(encoded);
     if (encoded.byteLength > MAX_MANIFEST_BYTES)
       return responseError(c, 413, "payload_too_large", "manifest is too large");
     try {
@@ -351,13 +394,19 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           return responseError(c, 409, "revision_conflict", "the first manifest revision must be 1");
         if (manifestOwnerIssue(undefined, manifest, c.get("auth") as Auth))
           return responseError(c, 409, "owner_conflict", "manifest owner or append fence does not match");
-        const ack = await deps.raw.store.put(objectKey(key), encoded, {
-          ifNoneMatch: true,
-          contentType: "application/json",
-          metadata: manifestMetadata(manifest, c.env ?? {}),
-        });
-        storedVersion = ack.version;
-      } else if (existing.text === new TextDecoder().decode(encoded)) {
+        storedVersion = await putManifestOrReplay(
+          deps.raw,
+          key,
+          encodedText,
+          c.get("auth") as Auth,
+          () =>
+            deps.raw.store.put(objectKey(key), encoded, {
+              ifNoneMatch: true,
+              contentType: "application/json",
+              metadata: manifestMetadata(manifest, c.env ?? {}),
+            }),
+        );
+      } else if (existing.text === encodedText) {
         if (migrationReplayIssue(existing.manifest, c.get("auth") as Auth))
           return responseError(c, 409, "owner_conflict", "manifest owner or append fence does not match");
         storedVersion = existing.version;
@@ -368,12 +417,18 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           return responseError(c, 409, "revision_conflict", "manifest version or writer does not match");
         if (manifestOwnerIssue(existing.manifest, manifest, c.get("auth") as Auth))
           return responseError(c, 409, "owner_conflict", "manifest owner or append fence does not match");
-        const ack = await deps.raw.store.put(objectKey(key), encoded, {
-          ifMatch: existing.version,
-          contentType: "application/json",
-          metadata: manifestMetadata(manifest, c.env ?? {}),
-        });
-        storedVersion = ack.version;
+        storedVersion = await putManifestOrReplay(
+          deps.raw,
+          key,
+          encodedText,
+          c.get("auth") as Auth,
+          () =>
+            deps.raw.store.put(objectKey(key), encoded, {
+              ifMatch: existing.version,
+              contentType: "application/json",
+              metadata: manifestMetadata(manifest, c.env ?? {}),
+            }),
+        );
       }
       const read = await deps.manifests.read(key);
       if (!read) throw new Error("manifest disappeared after write");

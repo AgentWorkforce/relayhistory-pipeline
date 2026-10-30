@@ -71,7 +71,9 @@ async function fixture() {
   const backfill = ndjson([
     record("changed", "1", 1_000),
     record("deleted", "1", 2_000),
-    record("historical", "1", 500),
+    record("historical", "1", 500, {
+      payload: { ts_ms: 500, "😀": "astral", "\uE000": "private-use" },
+    }),
   ]);
   const chunks: ChunkEntry[] = [];
   for (const [seq, epoch, source] of [
@@ -203,11 +205,13 @@ describe("RelayHistory export transform", () => {
     const body = new TextDecoder().decode(
       await readAll(await f.store.get(objectKey(first.outputKey!))),
     );
-    expect(body.trim().split("\n").map((line) => JSON.parse(line).record_id)).toEqual([
+    const lines = body.trim().split("\n").map((line) => JSON.parse(line));
+    expect(lines.map((line) => line.record_id)).toEqual([
       "historical",
       "changed",
       "live",
     ]);
+    expect(Object.keys(lines[0]!.payload)).toEqual(["ts_ms", "\uE000", "😀"]);
   });
 
   it("refuses a chunk whose stored digest does not match the manifest", async () => {
@@ -220,5 +224,17 @@ describe("RelayHistory export transform", () => {
         (stored) => new Uint8Array(zstdDecompressSync(stored)),
       ),
     ).rejects.toMatchObject({ code: "chunk_digest_mismatch", retryable: false });
+  });
+
+  it("requires every chunk to declare its record count", async () => {
+    const f = await fixture();
+    delete f.manifest.raw.chunks[0]!.records;
+    await expect(
+      readRelayhistoryExport(
+        f.manifest,
+        f.store,
+        (stored) => new Uint8Array(zstdDecompressSync(stored)),
+      ),
+    ).rejects.toMatchObject({ code: "relayhistory_record_count", retryable: false });
   });
 });
