@@ -50,6 +50,18 @@ action.
 6. **[A8]** Remove the Neon fallback once `check` is 0 and the consumer
    tests are green. **[A10]** Retire Neon later, under its own approval.
 
+## Audit findings
+
+- **2026-10-30, migration-number collision on Neon `dev` (read-only
+  evidence):** the `dev` branch (`br-rough-bread-apkej62v`) has
+  `0066_nested_exec_pr_evidence.sql` applied at 2026-10-30 07:08:29 UTC. It is
+  not on relayhistory-cloud `main` or any fetched remote branch, so it came
+  from an unpushed or deleted branch. The applier is unknown. It is left
+  unaltered. #224's unapplied `0066_cutover_database_fence` is being
+  renumbered away from 0066 and from #222's 0067. The same check found #224's
+  `sessions.cutover_fence` absent from all 8 Neon branches and both Supabase
+  projects.
+
 ## Open questions for Khaliq
 
 - Whether a cutover ships with metadata-only search, or waits for P8.
