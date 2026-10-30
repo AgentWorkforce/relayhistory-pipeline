@@ -41,6 +41,10 @@ describe("Cloud SQL private attachment", () => {
     });
     expect(spec.insertBody.settings.edition).toBe("ENTERPRISE");
     expect(spec.insertBody.settings.availabilityType).toBe("ZONAL");
+    expect(spec.insertBody.settings.backupConfiguration).toEqual({
+      enabled: true,
+      pointInTimeRecoveryEnabled: true,
+    });
     expect(spec.proxyArgs).toEqual([
       "--private-ip",
       "--address=0.0.0.0",
@@ -54,7 +58,9 @@ describe("Cloud SQL private attachment", () => {
   });
 
   test("uses a regional availability type only when HA is requested", () => {
-    expect(privateCloudSqlSpec({ ...input, highAvailability: true }).insertBody.settings.availabilityType).toBe("REGIONAL");
+    const settings = privateCloudSqlSpec({ ...input, highAvailability: true }).insertBody.settings;
+    expect(settings.availabilityType).toBe("REGIONAL");
+    expect(settings.backupConfiguration).toEqual({ enabled: true, pointInTimeRecoveryEnabled: true });
   });
 
   test("refuses a public network, a missing range, or a non-name network", () => {
@@ -100,6 +106,10 @@ describe("Cloud SQL private attachment", () => {
     const wrongEdition = privateCloudSqlSpec(input);
     (wrongEdition.insertBody.settings as { edition: string }).edition = "ENTERPRISE_PLUS";
     expect(() => sqlAdminInsertRequest(wrongEdition)).toThrow(/Nothing was created/);
+
+    const backupsDisabled = privateCloudSqlSpec({ ...input, highAvailability: true });
+    (backupsDisabled.insertBody.settings.backupConfiguration as { enabled: boolean }).enabled = false;
+    expect(() => sqlAdminInsertRequest(backupsDisabled)).toThrow(/Nothing was created/);
   });
 
   test("the Alchemy stack posts only through the apply-time action and never calls GCP.SQL.Instance", () => {
@@ -186,6 +196,7 @@ function matchingInstance(spec: PrivateCloudSqlSpec, ipPatch: Record<string, unk
       tier: spec.insertBody.settings.tier,
       edition: spec.insertBody.settings.edition,
       availabilityType: spec.insertBody.settings.availabilityType,
+      backupConfiguration: spec.insertBody.settings.backupConfiguration,
       ipConfiguration,
     },
     ipAddresses: [{ type: "PRIVATE", ipAddress: "10.52.0.5" }],
@@ -347,6 +358,16 @@ describe("SQL Admin idempotent poster", () => {
       {
         ...matchingInstance(spec),
         settings: { ...matchingInstance(spec).settings, edition: "ENTERPRISE_PLUS" },
+      },
+      /does not match/,
+    );
+    await once(
+      {
+        ...matchingInstance(spec),
+        settings: {
+          ...matchingInstance(spec).settings,
+          backupConfiguration: { enabled: true, pointInTimeRecoveryEnabled: false },
+        },
       },
       /does not match/,
     );

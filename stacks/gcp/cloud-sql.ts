@@ -50,6 +50,10 @@ export interface PrivateCloudSqlSpec {
       tier: string;
       edition: "ENTERPRISE";
       availabilityType: "ZONAL" | "REGIONAL";
+      backupConfiguration: {
+        enabled: true;
+        pointInTimeRecoveryEnabled: true;
+      };
       ipConfiguration: CloudSqlIpConfiguration;
     };
   };
@@ -115,6 +119,10 @@ export function privateCloudSqlSpec(input: {
         tier,
         edition: "ENTERPRISE",
         availabilityType: input.highAvailability ? "REGIONAL" : "ZONAL",
+        backupConfiguration: {
+          enabled: true,
+          pointInTimeRecoveryEnabled: true,
+        },
         ipConfiguration,
       },
     },
@@ -169,7 +177,8 @@ export interface CloudSqlProxyWorkload {
 const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 
 const INSERT_BODY_KEYS = new Set(["name", "region", "databaseVersion", "settings"]);
-const INSERT_SETTINGS_KEYS = new Set(["tier", "edition", "availabilityType", "ipConfiguration"]);
+const INSERT_SETTINGS_KEYS = new Set(["tier", "edition", "availabilityType", "backupConfiguration", "ipConfiguration"]);
+const INSERT_BACKUP_KEYS = new Set(["enabled", "pointInTimeRecoveryEnabled"]);
 const INSERT_IP_KEYS = new Set(["ipv4Enabled", "privateNetwork", "allocatedIpRange"]);
 const PRIVATE_NETWORK = /^\/projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
 const RETURNED_PRIVATE_NETWORK = /^\/?projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
@@ -200,6 +209,7 @@ export function sqlAdminInsertRequest(spec: PrivateCloudSqlSpec): SqlAdminInsert
   const body = spec.insertBody;
   exactKeys(body, INSERT_BODY_KEYS, "insert body");
   exactKeys(body.settings, INSERT_SETTINGS_KEYS, "settings");
+  exactKeys(body.settings.backupConfiguration, INSERT_BACKUP_KEYS, "backupConfiguration");
   const ip = body.settings.ipConfiguration as object;
   exactKeys(ip, INSERT_IP_KEYS, "ipConfiguration");
   const network = PRIVATE_NETWORK.exec(body.settings.ipConfiguration.privateNetwork);
@@ -223,6 +233,11 @@ export function sqlAdminInsertRequest(spec: PrivateCloudSqlSpec): SqlAdminInsert
     refuse("Cloud SQL insert seam drifted off PostgreSQL 17.");
   if (body.settings.availabilityType !== "ZONAL" && body.settings.availabilityType !== "REGIONAL")
     refuse("Cloud SQL insert seam drifted off the availability type.");
+  if (
+    body.settings.backupConfiguration.enabled !== true ||
+    body.settings.backupConfiguration.pointInTimeRecoveryEnabled !== true
+  )
+    refuse("Cloud SQL insert seam lost automated backups or point-in-time recovery.");
   if (spec.connectionName !== `${projectId}:${body.region}:${body.name}`)
     refuse("Cloud SQL insert seam drifted off the connection name.");
   const rendered = JSON.stringify(body);
@@ -422,6 +437,7 @@ function samePrivateNetwork(expected: string, actual: unknown): boolean {
 function classifyExisting(spec: PrivateCloudSqlSpec, body: unknown): "match" | "public" | "not-ready" | "mismatch" {
   const record = asRecord(body);
   const settings = asRecord(record?.settings);
+  const backup = asRecord(settings?.backupConfiguration);
   const ip = asRecord(settings?.ipConfiguration);
   const networks = ip?.authorizedNetworks;
   const addresses = record?.ipAddresses;
@@ -436,6 +452,8 @@ function classifyExisting(spec: PrivateCloudSqlSpec, body: unknown): "match" | "
     settings?.tier === spec.insertBody.settings.tier &&
     settings.edition === spec.insertBody.settings.edition &&
     settings.availabilityType === spec.insertBody.settings.availabilityType &&
+    backup?.enabled === true &&
+    backup.pointInTimeRecoveryEnabled === true &&
     ip?.ipv4Enabled === false &&
     samePrivateNetwork(spec.privateNetwork, ip.privateNetwork) &&
     ip.allocatedIpRange === spec.allocatedIpRange &&
