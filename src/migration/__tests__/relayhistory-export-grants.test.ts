@@ -3,7 +3,7 @@
  * source shaped like Cloud's tables, and a fixture identity preflight. No real
  * RelayAuth or Cloud, no minting, no network.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -30,6 +30,9 @@ import {
   type MembershipFixture,
   type PlanInput,
 } from "../relayhistory-export-grants.ts";
+
+// Each test shards 2,500 sessions through the oracle; CI runners are slower.
+setDefaultTimeout(30_000);
 
 const EXPORTED_AT = "2026-10-30T00:00:00.000Z";
 const READ_AT = "2026-10-30T12:00:00.000Z";
