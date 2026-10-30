@@ -180,7 +180,8 @@ const OPERATION_NAME = /^projects\/[a-z][a-z0-9-]{4,28}[a-z0-9]\/operations\/[A-
 export interface SqlAdminInsertRequest {
   method: "POST";
   url: string;
-  headers: { authorization: "Bearer"; "content-type": "application/json" };
+  /** Authentication belongs exclusively to the injected transport. */
+  headers: { "content-type": "application/json" };
   body: PrivateCloudSqlSpec["insertBody"];
   /** Building a request does not send it. */
   sent: false;
@@ -233,7 +234,7 @@ export function sqlAdminInsertRequest(spec: PrivateCloudSqlSpec): SqlAdminInsert
   return {
     method: "POST",
     url: `https://sqladmin.googleapis.com/v1/projects/${projectId}/instances`,
-    headers: { authorization: "Bearer", "content-type": "application/json" },
+    headers: { "content-type": "application/json" },
     body: structuredClone(body),
     sent: false,
   };
@@ -248,7 +249,7 @@ export async function postPrivateCloudSqlInsert(
   transport: SqlAdminTransport,
 ): Promise<{ operation: string; sent: true }> {
   const request = sqlAdminInsertRequest(spec);
-  if (request.sent !== false || request.headers.authorization !== "Bearer")
+  if (request.sent !== false || Object.keys(request.headers).some((name) => name.toLowerCase() === "authorization"))
     refuse("Cloud SQL insert seam tried to carry a credential.");
   const projectId = PRIVATE_NETWORK.exec(request.body.settings.ipConfiguration.privateNetwork)?.[1];
   let result: { operation: string };

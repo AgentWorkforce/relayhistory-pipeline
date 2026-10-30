@@ -81,7 +81,8 @@ describe("Cloud SQL private attachment", () => {
     expect(request.sent).toBe(false);
     expect(request.method).toBe("POST");
     expect(request.url).toBe("https://sqladmin.googleapis.com/v1/projects/agentworkforce-dev1/instances");
-    expect(request.headers.authorization).toBe("Bearer");
+    expect(request.headers).toEqual({ "content-type": "application/json" });
+    expect(JSON.stringify(request)).not.toMatch(/authorization|bearer|token/i);
     expect(request.body).toEqual(spec.insertBody);
     expect(spec.posted).toBe(false);
     expect(JSON.stringify(request)).not.toContain("authorizedNetworks");

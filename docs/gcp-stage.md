@@ -222,10 +222,8 @@ Teardown, only after that apply, in this order:
 
 1. Delete the 96Bulls Helm release and the Cloud SQL proxy.
 2. Delete the Cloud SQL instance before the network. The poster is not an Alchemy resource, so `alchemy destroy` will not delete it until a later change puts it in the graph. Delete that instance by the prepared name if it exists.
-3. Delete Redis, Pub/Sub, and the GKE cluster.
-4. Delete the service-networking connection, the PSA range, Cloud NAT, the subnet, and the VPC.
-5. Empty the versioned GCS bucket. `forceDestroy` is false, so destroy fails while objects remain. Then delete the bucket, Artifact Registry repository, empty Secret Manager container, and runtime service account.
-6. `bunx alchemy destroy --config stacks/gcp/alchemy.gcp.run.ts --stage "$STAGE" --no-input` with the same confirm env. APIs stay enabled because the stack sets `disableOnDestroy: false`. On this dedicated project, disable those APIs only after the lists below are empty.
-7. Read-only proof of empty: `gcloud sql instances list`, `gcloud redis instances list --region=us-central1`, `gcloud container clusters list`, `gcloud compute networks list`, and `gcloud storage ls` against `$PROJECT` return no lane resources.
+3. Empty the versioned GCS bucket. `forceDestroy` is false, so destroy fails while objects remain.
+4. `bunx alchemy destroy --config stacks/gcp/alchemy.gcp.run.ts --stage "$STAGE" --no-input` with the same confirm env. Let Alchemy delete the resources it tracks; do not pre-delete Redis, Pub/Sub, GKE, networking, the bucket, Artifact Registry, Secret Manager, or the runtime service account and leave stale state behind. APIs stay enabled because the stack sets `disableOnDestroy: false`.
+5. Read-only proof of empty: `gcloud sql instances list`, `gcloud redis instances list --region=us-central1`, `gcloud container clusters list`, `gcloud compute networks list`, and `gcloud storage ls` against `$PROJECT` return no lane resources. On this dedicated project, disable the listed APIs only after those checks are empty.
 
 Do not delete the project until those lists are empty, and do not delete it without a separate request from Khaliq. Production remains Supabase and AWS S3. This lane is not end-to-end ready until the verify steps have passed on that new project.
