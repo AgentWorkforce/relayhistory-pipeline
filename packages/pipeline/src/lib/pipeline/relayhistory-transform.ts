@@ -156,11 +156,17 @@ function canonical(value: unknown): unknown {
   return value;
 }
 
+/**
+ * The same revision of one record. `received_at` is excluded: it says when each
+ * path stored the record, so the export and the live client legitimately differ.
+ */
 function sameRecord(
   left: RelayhistoryStreamRecord,
   right: RelayhistoryStreamRecord,
 ): boolean {
-  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+  const content = ({ received_at: _at, ...rest }: RelayhistoryStreamRecord) =>
+    JSON.stringify(canonical(rest));
+  return content(left) === content(right);
 }
 
 /** Latest live records, deterministic regardless of live/backfill arrival order. */
