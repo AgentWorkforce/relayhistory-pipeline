@@ -8,6 +8,7 @@
 import {
   pointerFields,
   type ManifestReader,
+  type ManifestV1,
   type PipelineQueue,
   type RawPointer,
   type SessionPointerIndex,
@@ -27,6 +28,20 @@ export interface IndexDeps {
   queue: PipelineQueue;
   /** The message being handled, so fan-out continues its trace and ids. */
   current: () => StageMessage | undefined;
+}
+
+/**
+ * Chunk `records` count lines, not events, once a backfill merges revisions and
+ * deletes across epochs, and only reading the raw can tell how many survive. So
+ * such a session sends no count: upsert_session_index then keeps the stored one
+ * (0 on a first insert) until the normalized output supplies the real count.
+ */
+export function eventCount(m: ManifestV1): number | null {
+  if (m.raw.epochs.some((epoch) => epoch.reason === "backfill" || epoch.reason === "resumed")) {
+    log.info("event count withheld", { reason: "merged_stream", revision: m.revision, trace_id: m.trace_id });
+    return null;
+  }
+  return m.raw.chunks.reduce((n: number, c: { records?: number }) => n + (c.records ?? 0), 0);
 }
 
 export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
@@ -74,7 +89,7 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         git_branch: null,
         git_commit: null,
         model: null,
-        event_count: m.raw.chunks.reduce((n: number, c: { records?: number }) => n + (c.records ?? 0), 0),
+        event_count: eventCount(m),
         storage_provider: pointer.provider ?? "s3",
         bucket: pointer.bucket ?? deps.reader.bucket ?? "",
         manifest_key: pointer.manifestKey,
