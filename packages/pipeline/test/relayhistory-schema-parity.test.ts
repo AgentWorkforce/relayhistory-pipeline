@@ -232,7 +232,7 @@ describe("RelayHistory schema on the Supabase sessions project", () => {
     ["legacy, then 96Bulls", [legacy, bulls]],
     ["96Bulls, then legacy", [bulls, legacy]],
   ] as const)(
-    "%s: both products write the shared machines row; tenants see only pipeline columns",
+    "%s: both products write the shared machines row; tenants read only pipeline columns",
     async (_order, sets) => {
       const db = await database(...sets);
       await db.query(
@@ -269,16 +269,31 @@ describe("RelayHistory schema on the Supabase sessions project", () => {
           client_version: "0.4.0",
         },
       ]);
-      const privilege = async (column: string) =>
-        (
-          await rows<{ ok: boolean }>(
-            db,
-            `SELECT has_column_privilege('authenticated', 'sessions.machines', '${column}', 'SELECT') AS ok`,
-          )
-        )[0]!.ok;
-      expect(await privilege("machine_name")).toBe(true);
-      for (const column of ["cursors_json", "hostname", "label", "workspace_id"])
-        expect(await privilege(column)).toBe(false);
+      // A signed-in tenant of org-a, through the 96Bulls RLS policy.
+      await db.exec(`SET ROLE authenticated;
+        SELECT set_config('request.jwt.claims', '{"app_metadata":{"org_id":"org-a"}}', false);`);
+      expect(
+        await rows(
+          db,
+          `SELECT org_id, machine_id, machine_name, hostname_aliases, os, client_version
+             FROM sessions.machines ORDER BY machine_id`,
+        ),
+      ).toHaveLength(2);
+      for (const select of [
+        "*",
+        "cursors_json",
+        "hostname",
+        "label",
+        "workspace_id",
+        "relayhistory_version",
+      ])
+        await expect(
+          db.query(`SELECT ${select} FROM sessions.machines`),
+        ).rejects.toThrow(/permission denied/);
+      await expect(
+        db.query(`UPDATE sessions.machines SET machine_name = 'x'`),
+      ).rejects.toThrow(/permission denied/);
+      await db.exec("RESET ROLE");
     },
     120_000,
   );
