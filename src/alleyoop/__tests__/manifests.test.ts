@@ -212,7 +212,8 @@ async function fixture() {
       updated_at: new Date(Date.parse(previous.updated_at) + 1).toISOString(),
       raw: {
         ...structuredClone(previous.raw),
-        updated_at: new Date(Date.parse(previous.raw.updated_at) + 1).toISOString(),
+        // The exporter leaves client activity alone; the owner's write moves it.
+        ...(reason === "backfill" ? {} : { updated_at: new Date(Date.parse(previous.raw.updated_at) + 1).toISOString() }),
         chunk_count: chunks.length,
         raw_bytes: chunks.reduce((sum, chunk) => sum + chunk.bytes, 0),
         stored_bytes: chunks.reduce((sum, chunk) => sum + chunk.stored_bytes, 0),
@@ -319,6 +320,45 @@ describe("AlleyOop courier manifest routes", () => {
       "backfill",
       "rewritten",
     ]);
+  });
+
+  test("refuses a migration write that moves client-owned raw fields", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const first = await f.build(1);
+    const firstBody = (await (await f.post({ key, manifest: first })).json()) as { version: object };
+    const edits: ((m: ManifestV1) => void)[] = [
+      (m) => void (m.raw.updated_at = new Date(Date.parse(m.raw.updated_at) + 1000).toISOString()),
+      (m) => void (m.raw.future = "x"),
+    ];
+    for (const edit of edits) {
+      const backfill = await f.appendEpoch(first, "backfill", "migration:mgr_export", '{"pre":"t0"}');
+      backfill.extensions = {
+        ...backfill.extensions,
+        "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+      };
+      edit(backfill);
+      expect((await f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration")).status).toBe(409);
+    }
+  });
+
+  test("refuses forged and malformed epoch attribution", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const first = await f.build(1);
+    const firstBody = (await (await f.post({ key, manifest: first })).json()) as { version: object };
+    const forged = await f.appendEpoch(first, "rewritten", "migration:mgr_export", '{"live":1}');
+    expect((await f.post({ key, manifest: forged, previousVersion: firstBody.version })).status).toBe(409);
+    const stranger = await f.appendEpoch(first, "rewritten", "someone-else", '{"live":2}');
+    expect((await f.post({ key, manifest: stranger, previousVersion: firstBody.version })).status).toBe(409);
+    for (const openedBy of ["migration:", "migration:bad id", `migration:${"x".repeat(256)}`]) {
+      const malformed = await f.appendEpoch(first, "backfill", openedBy, '{"pre":"t0"}');
+      malformed.extensions = {
+        ...malformed.extensions,
+        "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+      };
+      expect((await f.post({ key, manifest: malformed, previousVersion: firstBody.version }, "migration")).status).toBe(400);
+    }
   });
 
   test("refuses a live write into the sealed backfill epoch, and a backfill on a jsonl stream", async () => {

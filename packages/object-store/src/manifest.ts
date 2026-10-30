@@ -28,6 +28,8 @@ export const MANIFEST_EPOCHS_CAPABILITY = "manifest-epochs-v2";
 /** The exporter's own extension key. */
 export const EXPORT_EXTENSION = "client.relayhistory_export";
 
+/** `migration:{grant_id}`, the shape the ingest boundary mints. */
+const MIGRATION_ID = /^migration:[A-Za-z0-9._:-]{1,255}$/;
 const hex64 = z.string().regex(/^[0-9a-f]{64}$/, "64 lowercase hex chars");
 const rfc3339 = z.iso.datetime({ offset: true });
 const uint = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -357,7 +359,7 @@ function validateBackfillEpochs(
         issue("raw.owner", "an adopted session belongs to its client");
     }
     if (e.reason !== "backfill") return;
-    if (!e.opened_by.startsWith(MIGRATION_ID_PREFIX))
+    if (!MIGRATION_ID.test(e.opened_by))
       issue(
         `${at}.opened_by`,
         `a backfill epoch is opened by ${MIGRATION_ID_PREFIX}{grant_id}`,
@@ -864,6 +866,8 @@ export function backfillWriteIssues(
   if (writer === "live") {
     if (addedEpochs.some((e) => e.reason === "backfill"))
       issues.push("only the exporter opens a backfill epoch");
+    if (addedEpochs.some((e) => e.opened_by !== after.owner))
+      issues.push("the raw owner opens its own epochs");
     const sealed = before.epochs.find((e) => e.reason === "backfill");
     if (sealed && addedChunks.some((c) => c.epoch === sealed.epoch))
       issues.push("the backfill epoch is sealed");
