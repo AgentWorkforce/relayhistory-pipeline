@@ -132,6 +132,10 @@ function readInputs(stage: string): GcpInputs {
 }
 
 function bootstrapStage(): string {
+  if (process.env.CI !== "true")
+    throw new Error(
+      "96bulls: set CI=true so Alchemy cannot create a missing GCP state bucket before apply authorization. Nothing was created.",
+    );
   const stage = process.env.ALCHEMY_STAGE;
   if (!stage)
     throw new Error(

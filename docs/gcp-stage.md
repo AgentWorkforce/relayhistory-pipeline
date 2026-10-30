@@ -201,9 +201,10 @@ export NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT=agentrelay-96bulls-soc2-2610
 bin/96bulls plan gcp-conformance
 ```
 
-Do not pass `--yes`. Without `CI=true`, a missing Alchemy state bucket is
-created. The command above is the same read-only wrapper recorded below, and
-its last result is not an accepted plan.
+Do not pass `--yes`. The stack now refuses before Alchemy construction unless
+`CI=true`, because otherwise a missing state bucket could be created before
+apply authorization. The command above is the same read-only wrapper recorded
+below, and its last result is not an accepted plan.
 
 `plan` resolves the Alchemy GCP environment and refuses before the first
 resource when that live project or region differs from these inputs. The

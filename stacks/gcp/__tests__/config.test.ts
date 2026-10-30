@@ -294,6 +294,7 @@ describe("GCP self-host contract", () => {
       expect(() => captureRelaycastChartPackage(path)).toThrow(/digest does not match/);
       const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
       expect(stack).toContain("captureRelaycastChartPackage");
+      expect(stack).toContain('process.env.CI !== "true"');
       expect(stack).toContain("writeFileSync(artifact, captured.bytes");
       expect(stack).not.toContain("readFileSync(captured.sourcePath");
       expect(stack).toContain("invocationId: APPLY_INVOCATION_ID");
