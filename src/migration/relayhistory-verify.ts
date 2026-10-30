@@ -107,6 +107,11 @@ export function chunkUpperBoundSql(
   ) AS verify_chunk ORDER BY ${keyColumns.map((column) => `${quoteIdent(column)} DESC`).join(", ")} LIMIT 1`;
 }
 
+/** Each database's own ledger and rollout progress: never copied, never compared. */
+export function isPerDatabaseState(table: string): boolean {
+  return table === "__migrations" || table.endsWith("_rollout");
+}
+
 export function selectUsableKey(sourceKey: string[], targetKey: string[]): string[] | null {
   if (sourceKey.length === 0 || sourceKey.length !== targetKey.length) return null;
   return sourceKey.every((column, index) => column === targetKey[index]) ? sourceKey : null;
@@ -381,10 +386,28 @@ export async function main() {
         schema: incompatible.length ? "incompatible" : "compatible",
         ...(incompatible.length ? { incompatible } : {}),
       };
-      if (mode === "full" && incompatible.length === 0) {
+      if (mode === "full" && incompatible.length === 0 && isPerDatabaseState(table)) {
+        Object.assign(result, { data: "skipped", reason: "per-database runner or rollout state" });
+      } else if (mode === "full" && incompatible.length === 0) {
         const [sourceKey, targetKey] = await Promise.all([primaryKey(source, table), primaryKey(target, table)]);
         const keyColumns = selectUsableKey(sourceKey, targetKey);
-        if (!keyColumns) {
+        if (!keyColumns && sourceKey.length === 0 && targetKey.length === 0) {
+          // No primary key (derived tables keyed by a nullable unique index):
+          // compare whole-table fingerprints, which are order-independent sums.
+          const names = sourceColumns.map((column) => column.name);
+          const [sourcePrint, targetPrint] = await Promise.all([
+            source.query<Fingerprint>(fingerprintSql("sessions", table, names)),
+            target.query<Fingerprint>(fingerprintSql("sessions", table, names)),
+          ]);
+          const equal = equalFingerprint(sourcePrint.rows[0]!, targetPrint.rows[0]!);
+          if (!equal) passed = false;
+          Object.assign(result, {
+            data: equal ? "equal" : "different",
+            method: "whole-table fingerprint",
+            source: sourcePrint.rows[0],
+            target: targetPrint.rows[0],
+          });
+        } else if (!keyColumns) {
           passed = false;
           Object.assign(result, {
             data: "unverifiable",

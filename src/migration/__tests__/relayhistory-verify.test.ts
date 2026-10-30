@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  isPerDatabaseState,
   addFingerprint,
   chunkFingerprintSql,
   chunkUpperBoundSql,
@@ -46,5 +47,15 @@ describe("relayhistory migration verifier", () => {
       { count: "9007199254740992", hash1: "9223372036854775807", hash2: "-5" },
       { count: "2", hash1: "10", hash2: "12" },
     )).toEqual({ count: "9007199254740994", hash1: "9223372036854775817", hash2: "7" });
+  });
+});
+
+describe("per-database state", () => {
+  test("skips the runner ledger and rollout progress, nothing else", () => {
+    expect(isPerDatabaseState("__migrations")).toBe(true);
+    expect(isPerDatabaseState("session_rollup_rollout")).toBe(true);
+    expect(isPerDatabaseState("delivery_rollout")).toBe(true);
+    expect(isPerDatabaseState("session_rollups")).toBe(false);
+    expect(isPerDatabaseState("auth_sessions")).toBe(false);
   });
 });

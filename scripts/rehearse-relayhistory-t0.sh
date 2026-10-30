@@ -80,7 +80,7 @@ docker exec "$NAME-src" psql -At -U postgres -c \
 
 TABLES=$(docker exec "$NAME-src" psql -At -U postgres -c \
   "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables
-    WHERE schemaname = 'sessions' AND tablename <> '__migrations'")
+    WHERE schemaname = 'sessions' AND tablename <> '__migrations' AND tablename NOT LIKE '%\\_rollout'")
 COPY_SET=auth_sessions,deleted_upload_sessions,session_resets,upload_cleanup_origins,upload_cleanup_tombstones,machines,probe_connections,project_aliases,github_org_links,delivery_origins,delivery_receipts
 REST=$(printf '%s' "$TABLES" | tr ',' '\n' | grep -v -x -F -f <(printf '%s' "$COPY_SET" | tr ',' '\n') | paste -sd, -)
 
