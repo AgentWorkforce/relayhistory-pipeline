@@ -3,7 +3,10 @@
 This lane is a code-only conformance implementation. Static work does not wait
 on the AWS adapter freeze. Nothing in this document is evidence of a GCP
 deployment. No project, credentials, secret payload, DNS record, or cloud
-resource was created while implementing it.
+resource was created while implementing it. The only eligible target is the
+existing project `agentrelay-96bulls-soc2-2610`, number `955297012355`, parent
+org `929835122282`, region `us-central1`, billing account
+`014D50-E96D1A-DE6360`. Do not create or select another project.
 
 The stack entry point is `stacks/gcp/alchemy.gcp.run.ts`. It uses the same
 Alchemy + AgentWorkforce Helm boundary as the AWS stack: cloud code declares
@@ -172,42 +175,56 @@ Release wiring that has not been applied:
 
 ## Apply, verify, and teardown
 
-This runbook has not been executed. Static work does not wait on the AWS
-adapter freeze. No command below has been run. `bin/96bulls up` and
-`bin/96bulls down` refuse every `gcp-*` stage. `bin/96bulls plan gcp-*` calls
+Apply, verify, and teardown have not been executed. Static work does not wait
+on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down` refuse every
+`gcp-*` stage. `bin/96bulls plan gcp-*` calls
 `bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
-and is not proof. Do not run plan, deploy, or destroy until Khaliq names a new
-project in his own words.
+and is not proof. Do not apply, deploy, destroy, or enable an API without a
+separate request. If `gcloud` asks to enable an API, stop and do not answer
+yes. Set `CLOUDSDK_CORE_DISABLE_PROMPTS=1`. The binary on this machine, when
+it is not on `PATH`, is `/home/khaliqgant/google-cloud-sdk/bin/gcloud`.
 
-Create a new project. Do not reuse a project that is already visible on this
-account, including `agentworkforce-dev1`, `sharp-sled-512718-s4`, `skip-506702`,
-`gen-lang-client-0703389434`, `zeta-bonsai-489905-b1`, `relayroom-503219`,
-`agent-relay-internal`, `hoopsheet`, `file-by-agent-relay`,
-`invertible-vent-493717-j7`, or `gen-lang-client-0251203475`. Link billing to
-the new project. Use region `us-central1`. If `gcloud` asks to enable an API,
-stop and do not answer yes. Set `CLOUDSDK_CORE_DISABLE_PROMPTS=1`. The binary
-on this machine, when it is not on `PATH`, is
-`/home/khaliqgant/google-cloud-sdk/bin/gcloud`.
+Use only `agentrelay-96bulls-soc2-2610`, number `955297012355`, parent org
+`929835122282`, region `us-central1`, billing account `014D50-E96D1A-DE6360`.
+Do not create a project. Do not reuse `agentworkforce-dev1`,
+`sharp-sled-512718-s4`, `skip-506702`, `gen-lang-client-0703389434`,
+`zeta-bonsai-489905-b1`, `relayroom-503219`, `agent-relay-internal`,
+`hoopsheet`, `file-by-agent-relay`, `invertible-vent-493717-j7`, or
+`gen-lang-client-0251203475`.
 
-Read-only preflight, after that project exists:
+On 2026-10-30 a read-only plan was run with `CI=true`,
+`NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT=agentrelay-96bulls-soc2-2610`,
+`GOOGLE_PROJECT_ID=agentrelay-96bulls-soc2-2610`, and no `--yes`:
+
+```sh
+export STAGE=gcp-conformance
+bin/96bulls plan "$STAGE"
+```
+
+Alchemy stopped before a resource table: `Cloud Storage state bucket
+'alchemy-state-agentworkforce-agentrelay-96bulls-soc2-2610' not found.`
+`gcloud storage buckets describe gs://alchemy-state-agentworkforce-agentrelay-96bulls-soc2-2610`
+returned 404. The bucket was not created. Lane APIs were not enabled. Compute
+quota was not read because the compute API is disabled. The same describe
+returned 404 again when this note was written. `CI=true` is what makes a
+missing state bucket fail instead of being created.
+
+Read-only preflight:
 
 ```sh
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
-export PROJECT=new-project-id
+export PROJECT=agentrelay-96bulls-soc2-2610
 export STAGE=gcp-conformance
 gcloud projects describe "$PROJECT" --format='value(projectId,projectNumber)'
 gcloud billing projects describe "$PROJECT" --format='value(billingEnabled,billingAccountName)'
-gcloud compute regions describe us-central1 --project="$PROJECT" --format='yaml(quotas)'
 ```
 
-Stop if the project is one of the denied names, billing is off, or the quota
-read fails. Write `.96bulls/$STAGE/gcp-inputs.json` with that new project id,
-its project number, region `us-central1`, and no secret payload. Then:
-
-```sh
-export NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT="$PROJECT"
-bin/96bulls plan "$STAGE"
-```
+Stop if the project is one of the denied names or billing is off. Do not
+enable `compute.googleapis.com` to read quota. Write
+`.96bulls/$STAGE/gcp-inputs.json` with this project id, number
+`955297012355`, region `us-central1`, and no secret payload. A later plan
+still needs `CI=true` and must not pass `--yes` until the state bucket is
+allowed to exist.
 
 The plan must show the live project and region matching the inputs before the
 first resource. Resource order after that is: the listed Google APIs with
@@ -240,4 +257,4 @@ Teardown, only after that apply, in this order:
 4. `bunx alchemy destroy --config stacks/gcp/alchemy.gcp.run.ts --stage "$STAGE" --no-input` with the same confirm env. Let Alchemy delete the resources it tracks; do not pre-delete Redis, Pub/Sub, GKE, networking, the bucket, Artifact Registry, Secret Manager, or the runtime service account and leave stale state behind. APIs stay enabled because the stack sets `disableOnDestroy: false`.
 5. Read-only proof of empty: `gcloud sql instances list`, `gcloud redis instances list --region=us-central1`, `gcloud container clusters list`, `gcloud compute networks list`, and `gcloud storage ls` against `$PROJECT` return no lane resources. On this dedicated project, disable the listed APIs only after those checks are empty.
 
-Do not delete the project until those lists are empty, and do not delete it without a separate request from Khaliq. Production remains Supabase and AWS S3. This lane is not end-to-end ready until the verify steps have passed on that new project.
+Do not delete the project until those lists are empty, and do not delete it without a separate request from Khaliq. Production remains Supabase and AWS S3. This lane is not end-to-end ready until the verify steps have passed on `agentrelay-96bulls-soc2-2610`.
