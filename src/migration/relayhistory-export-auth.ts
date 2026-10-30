@@ -49,8 +49,14 @@ export class MigrationAssertionClient {
     this.#cfg = { ...cfg, baseUrl: cfg.baseUrl.replace(/\/$/, ""), expiresInSeconds, fetcher: cfg.fetcher ?? fetch };
   }
 
-  /** A fresh single-use assertion for one session upload of `sourceUserId` in `workspaceId`. */
-  async mint(sourceUserId: string, workspaceId: string): Promise<MigrationAssertion> {
+  /**
+   * A fresh single-use assertion for one session upload of `sourceUserId` in
+   * `workspaceId`. `upload` is the per-upload identity (key, content and entry
+   * digests, session) the assertion is to sign, per the contract update on
+   * relayhistory-cloud #228; the RelayAuth request field is provisional until
+   * #43 publishes the shared fixture.
+   */
+  async mint(sourceUserId: string, workspaceId: string, upload?: object): Promise<MigrationAssertion> {
     if (!ID.test(sourceUserId) || !ID.test(workspaceId))
       throw new Error("migration assertion: user or workspace id is malformed");
     const apiKey = await this.#cfg.apiKey();
@@ -67,6 +73,7 @@ export class MigrationAssertionClient {
         workspaceId,
         nonce,
         expiresIn: this.#cfg.expiresInSeconds,
+        ...(upload ? { upload } : {}),
       }),
     });
     if (response.status !== 201)

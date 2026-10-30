@@ -80,6 +80,22 @@ manifest body.
   assert the session's `user_id` from Neon. That needs an explicit, audited
   migration grant in the ingest API. Without it, rows land as `unknown`.
 
+## Upload courier (code only, not enabled)
+
+`src/migration/relayhistory-export-upload.ts` delivers a plan manifest by
+manifest: chunks through `POST /v1/pipeline/chunks`, then `POST
+/v1/pipeline/manifests`, each manifest under its own fresh migration
+assertion. One pure function (`derivePlanContract`) gives the canonical,
+grant-bound plan entries, the plan digest and one per-upload identity per
+manifest; it is swappable for the shared fixture from #43. The courier
+refuses an assertion that signs another plan or upload, re-mints once on 409
+`migration_assertion_replayed` (a second one fails that manifest), backs off a
+bounded number of times on 5xx and lost responses and then stops, and stops
+at once on 401 or 403. A per-manifest checkpoint (ids, digests and work keys,
+never tokens) keeps a resumed run from re-uploading committed manifests. It is
+tested only against an in-process fake ingest, and the CLI still refuses
+`--execute`.
+
 ## Safety (reused from #28)
 
 - **Source:** Neon is read with `relayhistory_readonly` only.

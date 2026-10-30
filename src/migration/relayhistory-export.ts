@@ -4,8 +4,9 @@
  * them into the session's raw stream: one ndjson line per live record, ordered
  * by event time, split at record boundaries into chunks of at most 4 MiB.
  * Upload goes through the courier protocol (ingest scrub hop, v1 manifest,
- * pipeline notification), added once identity (O2) is settled. Nothing here
- * writes anywhere; the reader runs on the read-only Neon role.
+ * pipeline notification) in relayhistory-export-upload.ts, which the CLI does
+ * not reach while `--execute` is refused. Nothing here writes anywhere; the
+ * reader runs on the read-only Neon role.
  */
 export interface Queryable {
   query<T = Record<string, unknown>>(
@@ -298,7 +299,9 @@ function argument(name: string): string | undefined {
 /**
  * Dry run only for now: walks sessions newest first and reports what the
  * export would write (records, bytes, chunks, fenced sessions). The upload
- * step lands once the migration identity grant (O2) and KMS keys (P9) exist.
+ * courier exists (relayhistory-export-upload.ts, tested against a local fake
+ * ingest only) but `--execute` stays refused, fail closed, until the
+ * migration identity grant (O2) and KMS keys (P9) exist.
  *
  * Usage: RELAYHISTORY_SOURCE_URL=... bun run migration:export --limit=100
  */
