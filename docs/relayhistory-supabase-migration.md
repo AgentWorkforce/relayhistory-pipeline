@@ -99,3 +99,18 @@ under a switch hold. Neon is never simply repointed.
   statements; connection counts at peak.
 - Backfill throughput at the chosen Supabase compute, and its impact on live
   p95.
+
+## Driver contract (lane 4 tests and the T0 runbook must make these explicit)
+
+- Supavisor pool mode and port (transaction mode on 6543 vs. session mode on
+  5432), and `sslmode=verify-full` with Supabase's CA.
+- `nodejs_compat` on the Worker, and the connection lifecycle: open one
+  client per request, close it in `ctx.waitUntil`, and never share it across
+  requests.
+- Timeouts and retry: connect and statement timeouts, retrying only
+  idempotent reads, and mapping Neon HTTP's batch `transaction([...])` to real
+  `BEGIN`/`COMMIT`.
+- No named prepared statements under transaction mode.
+- Neon fallback: a read-only Neon client type that has no write methods, plus
+  a runtime guard that rejects any non-`SELECT` statement. The fallback is
+  removed automatically when the verifier reports every pre-T0 range equal.
