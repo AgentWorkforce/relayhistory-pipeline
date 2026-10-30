@@ -17,7 +17,8 @@ action.
   - `sessions` totals 484 GB: `convergence_events` 205 GB,
     `delivery_records` 161 GB, `uploaded_support_identities` 37 GB.
   - Collation is `C.UTF-8` (Supabase is `en_US.UTF-8`). That matters only
-    for queries Supabase still serves, which are metadata only.
+    for queries Supabase still serves: the index and the V1 search projection.
+    Check projection text ordering and prefix search under `en_US`.
   - No resets, and 5 deleted uploads.
 - **Tooling merged in #28** that carries over: the write guards, deletion
   fences, plan-bound checkpoints, the sequence fence, the Neon write fence,
@@ -34,7 +35,9 @@ action.
 | P5 | Agent name: on `session_index` or a companion table, and its index (open; #222/0067 is not applied until this is decided) | helm-chart-chief + Khaliq | Schema decision recorded; index audit passes |
 | P6 | Cutover gate and durable hold (relayhistory-cloud #224, hosted CI green at `1a3d4139`, draft) | helm-chart-chief fix lane | Independent PASS (per-org ordering, zero-write hold, fencing) |
 | P7 | Worker TCP driver to Supavisor (relayhistory-cloud #225, hosted CI green at `5872005b`, draft) | helm-helper | Independent PASS (TLS, cancellation, pooler, role evidence) |
-| P8 | Search store: ClickHouse or ObsessionDB loaded from normalized S3 objects | later | Text/n-gram indexes, S3 ingest, per-org isolation and tombstone propagation all proven |
+| P8a | V1 search projection in Supabase (agent name, short and long summary, full-text stopgap) with RLS; summaries and embeddings built from S3 after the raw content lands | sessionspipelinegrok / pipeline owners | Projection schema and RLS tests; erasure path decided (see 0002) |
+| P8b | V2 search store: ClickHouse or ObsessionDB loaded from normalized S3 objects | later | Text/n-gram indexes, S3 ingest, per-org isolation and tombstone propagation all proven |
+| P9 | S3 encryption: KMS with a key per workspace, key policy and alias scheme, decided before the bulk move (re-encrypting later means rewriting objects) | sessionspipelinegrok + Khaliq | Key design recorded; exporter writes with the workspace key |
 
 ## Sequence
 
@@ -62,7 +65,12 @@ action.
   `sessions.cutover_fence` absent from all 8 Neon branches and both Supabase
   projects.
 
-## Open questions for Khaliq
+## Open questions
 
-- Whether a cutover ships with metadata-only search, or waits for P8.
-- Where the agent name lives (P5).
+- Where the agent name lives (P5). V1 search requires it to be searchable in
+  Supabase.
+- How erasure of search data works on Supabase, versus KMS crypto-shredding
+  in S3 (decision deferred to sessionspipelinegrok, see 0002).
+- Sequencing: S3-first, so P2 (the export) completes before RelayHistory
+  writes through the pipeline, and #224's data-loss fix lands before the bulk
+  move.

@@ -20,10 +20,21 @@ which copied Neon's `sessions` schema, content included, into Supabase Postgres.
 - **The RelayHistory Worker is re-pointed, not rewritten.** Metadata reads use
   `session_index`. Reads of one session's content fetch its objects from S3
   through the pointer.
-- **Full-text search over event content moves to ClickHouse or ObsessionDB**
-  (ClickHouse-compatible, on object storage), loaded from the normalized S3
-  objects. Neither is ready yet. Until one is, transcript search is not
-  served (see Interim below).
+- **Search (V1, Khaliq, 2026-10-30, relayed by sessionspipelinegrok and
+  confirmed in session):** Supabase holds the pointers plus a search
+  projection. Agent name, short summary and long summary are searchable there,
+  and Postgres full-text search is a temporary stopgap. **V2** moves full-text
+  search to ClickHouse or ObsessionDB, loaded from the normalized S3 objects.
+- **Security, defense in depth:**
+  - Raw session content stays in S3 under KMS, with a key per workspace.
+    Deleting that key crypto-shreds the workspace's objects.
+  - The Supabase search projection has row-level security and disk
+    encryption.
+  - Embeddings are backfilled from S3 after the raw content is in place, not
+    at ingest.
+- **Sequencing is S3-first.** All existing Neon raw data moves to S3 before
+  RelayHistory writes through the pipeline, and relayhistory-cloud #224's
+  data-loss fix lands before any Neon-to-S3 bulk move.
 
 ## How each existing query surface is served
 
@@ -36,19 +47,24 @@ The surfaces come from `docs/session-search-index-contract.md`.
 | `get_shared_session_context` (window in one session) | trigram + replay keyset | Read the session's objects and filter in the service (one session at a time) |
 | Briefs and analysis, memory pack, digest | Event rows | The session's objects in S3 |
 | `list_session_timings`, `list_team_activity` | Events, markers, timing cache | `session_index` activity times, plus the manifest for per-session detail |
-| `search_shared_sessions`, `/v1/events?q=`, dashboard transcript search | `ILIKE` over `left(content, 4096)` and `task_title` with trigram GIN | **ClickHouse/ObsessionDB** (deferred). Interim: title and metadata search over `session_index` only |
+| `search_shared_sessions`, `/v1/events?q=`, dashboard transcript search | `ILIKE` over `left(content, 4096)` and `task_title` with trigram GIN | V1: the Supabase search projection (agent name, short and long summary, plus a full-text stopgap), with RLS. V2: ClickHouse or ObsessionDB |
 
-## Interim (until ClickHouse or ObsessionDB is ready)
+## Search before V2, and its open erasure question
 
-Transcript and full-text event search is unavailable on the new data plane.
-Search falls back to the indexed metadata (title, project, repo, agent). This
-is a user-visible regression: a cutover before the search store exists ships
-it, and Khaliq accepts or defers that at cutover time. For the search store
-itself, check before adopting ObsessionDB:
-- that it supports ClickHouse's text, token and n-gram indexes;
-- loading from S3;
-- per-org isolation;
-- that pipeline tombstones propagate to it.
+V1 search is served from the Supabase projection. Before V2:
+- Check ObsessionDB supports ClickHouse's text, token and n-gram indexes.
+- Check it can load from S3.
+- Check it isolates each org.
+- Check pipeline tombstones propagate into it.
+
+**Open (decision deferred to sessionspipelinegrok):** deleting a KMS key
+shreds only the S3 objects encrypted with it. A Postgres full-text projection
+needs plaintext tokens, and Supabase's disk encryption uses Supabase-managed
+keys. Erasing a workspace's search data on Supabase therefore means deleting
+its projection rows (tombstone-driven), with backups and PITR ageing out on
+Supabase's retention. Unless the searchable text moves to a store with
+per-workspace encryption (for example ClickHouse in V2), key deletion alone
+does not erase it.
 
 ## Consequences for the migration
 
