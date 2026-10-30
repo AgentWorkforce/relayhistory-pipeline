@@ -2,11 +2,9 @@ import { Hono, type Context } from "hono";
 import { createMiddleware } from "hono/factory";
 import {
   migrationGrantAllowed,
-  migrationGrantMarked,
   migrationPairAuthorized,
-  migrationPlanMatches,
-  migrationSourceMatches,
-  storedManifestOwnedByOther,
+  migrationSessionMatches,
+  migrationUploadMatches,
   sqlMigrationAssertionLedger,
   type TransactionalSqlExecutor,
   type MigrationAssertionClaims,
@@ -181,8 +179,8 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     responseError(c, 403, "migration_workspace_forbidden", "The upload's workspace and user are not the pair this migration assertion was signed for");
   const grantForbidden = (c: Context<AppEnv>) =>
     responseError(c, 403, "migration_grant_forbidden", "The migration assertion's grant is not accepted here, or its plan is not that grant's plan");
-  const planMismatch = (c: Context<AppEnv>) =>
-    responseError(c, 403, "migration_plan_mismatch", "The manifest does not commit to the export plan this migration assertion was signed for");
+  const uploadForbidden = (c: Context<AppEnv>) =>
+    responseError(c, 403, "migration_upload_forbidden", "The upload is not the one this migration assertion's signed upload identity names");
   const replayed = (c: Context<AppEnv>) =>
     responseError(c, 409, "migration_assertion_replayed", "This migration assertion was already used; retry with a fresh assertion");
 
@@ -192,9 +190,10 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
    * on the manifest commit and the status read (any method; requireAuth
    * already refuses every route but GET status and POST manifests): a ledger
    * (503), the signed pair (403 migration_workspace_forbidden), an accepted
-   * grant and plan (403 migration_grant_forbidden), and not yet consumed
-   * (409 migration_assertion_replayed; a ledger error is 503). Ordinary
-   * tokens pass through.
+   * grant and plan (403 migration_grant_forbidden), the requested key being
+   * the signed upload identity's (status; 403 migration_upload_forbidden),
+   * and not yet consumed (409 migration_assertion_replayed; a ledger error is
+   * 503). Ordinary tokens pass through.
    */
   const migrationAdmission = createMiddleware<AppEnv>(async (c, next) => {
     const auth = c.get("auth") as Auth;
@@ -203,6 +202,11 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     if (!ledger) return ledgerUnavailable(c);
     if (!migrationPairAuthorized(auth)) return workspaceForbidden(c);
     if (!migrationGrantAllowed(c.env ?? {}, auth.migration)) return grantForbidden(c);
+    if (c.req.path.endsWith("/pipeline/manifests/status")) {
+      const location = parseSessionKey(c.req.query("key") ?? "");
+      if (!location || location.rest !== "manifest.json" || !migrationSessionMatches(auth, location))
+        return uploadForbidden(c);
+    }
     let consumed: boolean;
     try {
       consumed = await ledger.consumed(auth.migration);
@@ -216,17 +220,15 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   routes.use("/pipeline/manifests/status", migrationAdmission);
 
   /**
-   * The checks a migration assertion's manifest must pass against its signed
-   * claims: target workspace and source user (403 migration_workspace_forbidden),
-   * the grant it names (403 migration_grant_forbidden) and the plan it commits
-   * to (403 migration_plan_mismatch).
+   * A migration assertion's manifest: the target workspace is the signed pair's
+   * (403 migration_workspace_forbidden), and the upload identity recomputed
+   * from this key and manifest (session, state, chunk list, content hash
+   * chain, entry digest) is the signed one (403 migration_upload_forbidden).
    */
-  const migrationManifestIssue = (c: Context<AppEnv>, auth: Auth, migration: MigrationAssertionClaims, workspaceId: string, manifest: ManifestV1) => {
-    if (!migrationPairAuthorized(auth, { workspaceIds: [workspaceId, manifest.session.workspace_id] }) ||
-      !migrationSourceMatches(migration, manifest))
+  const migrationManifestIssue = async (c: Context<AppEnv>, auth: Auth, location: NonNullable<ReturnType<typeof parseSessionKey>>, manifest: ManifestV1) => {
+    if (!migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId, manifest.session.workspace_id] }))
       return workspaceForbidden(c);
-    if (!migrationGrantMarked(migration, manifest)) return grantForbidden(c);
-    if (!migrationPlanMatches(migration, manifest)) return planMismatch(c);
+    if (!(await migrationUploadMatches(auth, location, manifest))) return uploadForbidden(c);
     return undefined;
   };
 
@@ -282,7 +284,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     const auth = c.get("auth") as Auth;
     const migration = auth.migration;
     if (migration) {
-      const issue = migrationManifestIssue(c, auth, migration, location.workspaceId, manifest);
+      const issue = await migrationManifestIssue(c, auth, location, manifest);
       if (issue) return issue;
     }
     const encoded = new TextEncoder().encode(JSON.stringify(manifest));
@@ -292,10 +294,6 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       if (!(await chunksAreServerSealed(deps.raw, manifest)))
         return responseError(c, 409, "chunks_unverified", "manifest chunks are not server-sealed");
       const existing = await storedManifest(deps.raw, key);
-      // A token for user A must not write under a key (and so a machine)
-      // whose stored manifest names user B.
-      if (migration && existing && storedManifestOwnedByOther(migration, existing.manifest))
-        return workspaceForbidden(c);
       let storedVersion: ObjectVersion;
       if (!existing) {
         if (manifest.revision !== 1)
@@ -345,6 +343,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
             nonce: migration.nonce,
             grantId: migration.grantId,
             planDigest: migration.planDigest,
+            planEntryDigest: migration.upload.entry_sha256,
             expiresAt: migration.expiresAt,
             orgId: auth.orgId,
             workspaceId: location.workspaceId,
@@ -387,7 +386,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       // grant, workspace, source user and plan.
       const auth = c.get("auth") as Auth;
       if (auth.migration) {
-        const issue = migrationManifestIssue(c, auth, auth.migration, location.workspaceId, stored.manifest);
+        const issue = await migrationManifestIssue(c, auth, location, stored.manifest);
         if (issue) return issue;
       }
       if (c.req.query("machine") !== stored.manifest.session.machine_id ||

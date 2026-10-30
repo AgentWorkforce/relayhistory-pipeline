@@ -20,6 +20,18 @@ const WORKSPACE = "ws_1";
 const USER = "user-synthetic-a";
 const PLAN = "a".repeat(64);
 const GRANT = `mgr_${"0".repeat(32)}`;
+/** A canonical upload identity (its derivation is tested against the contract vectors). */
+const UPLOAD = {
+  grant_id: GRANT,
+  plan_digest: PLAN,
+  key: "v1/ws=ws_1/m=mach-1/h=claude/d=2026/10/25/s=s-1/manifest.json",
+  org_id: ORG,
+  workspace_id: WORKSPACE,
+  source_user_id: USER,
+  session: { machine_id: "mach-1", harness: "claude", session_id: "s-1", started_at: "2026-10-25T00:00:00.000Z" },
+  content_sha256: "c".repeat(64),
+  entry_sha256: "d".repeat(64),
+};
 
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const JWKS = { keys: [{ ...publicKey.export({ format: "jwk" }), kid: KID, alg: "RS256" }] };
@@ -58,6 +70,7 @@ function migrationClaims(overrides: Record<string, unknown> = {}, meta: Record<s
       actorId: "actor-synthetic",
       actorOrgId: ORG,
       workspaceId: WORKSPACE,
+      upload: UPLOAD,
       ...meta,
     },
   } as Record<string, unknown>;
@@ -134,6 +147,9 @@ describe("the dedicated migration-assertion flag", () => {
 
   it("never admits a generic RelayAuth bearer through the dedicated path", async () => {
     const request = app();
+    // Only with the explicit interim opt-in does requireAuth verify a generic
+    // RelayAuth JWT at all (dev/tests; buildIngestApp defaults it off, see
+    // src/alleyoop/__tests__/ingest-auth.test.ts).
     expect((await request("/v1/pipeline/manifests", relayhistoryToken())).status).toBe(200);
     const refused = await request("/v1/pipeline/manifests", relayhistoryToken(), { ALLOW_INTERIM_RELAYAUTH_BEARER: undefined });
     expect(refused.status).toBe(401);
@@ -176,20 +192,55 @@ describe("where and for whom a migration token is admitted", () => {
   });
 });
 
+describe("canonical ids and the upload identity shape", () => {
+  it("refuses an identity with a relay_ alias, or none, as malformed; accepts prefixed signed claims", async () => {
+    const request = app();
+    for (const upload of [
+      { ...UPLOAD, source_user_id: `relay_${USER}` },
+      { ...UPLOAD, workspace_id: `relay_${WORKSPACE}` },
+      { ...UPLOAD, plan_digest: undefined },
+      undefined,
+    ]) {
+      const response = await request("/v1/pipeline/manifests", migrationToken({}, { upload }));
+      expect(response.status).toBe(401);
+      expect(await code(response)).toBe("invalid_claims");
+    }
+    const prefixed = migrationToken(
+      { sponsorId: `relay_${USER}`, sponsorChain: [`relay_${USER}`, "agent_relayhistory_migration"], wks: `relay_${WORKSPACE}` },
+      { sourceUserId: `relay_${USER}`, workspaceId: `relay_${WORKSPACE}` },
+    );
+    expect((await request("/v1/pipeline/manifests", prefixed)).status).toBe(200);
+  });
+
+  it("keeps a bad signature terminal (invalid_token), even when also expired", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const [head, body] = migrationToken({ iat: now - 56, exp: now - 6 }).split(".");
+    const response = await app()("/v1/pipeline/manifests", `${head}.${body}.${"A".repeat(342)}`);
+    expect(response.status).toBe(401);
+    expect(await code(response)).toBe("invalid_token");
+  });
+});
+
 describe("migration clock skew (5 seconds)", () => {
   it("accepts within 5 seconds and refuses beyond", async () => {
     const request = app();
     const now = Math.floor(Date.now() / 1000);
     for (const [overrides, status] of [
       [{ iat: now - 57, exp: now - 2 }, 200],
-      [{ iat: now - 56, exp: now - 6 }, 401],
+      [{ iat: now - 56, exp: now - 6 }, "migration_assertion_expired"],
       [{ iat: now + 2, exp: now + 50 }, 200],
-      [{ iat: now + 7, exp: now + 60 }, 401],
-      [{ nbf: now + 7 }, 401],
+      [{ iat: now + 7, exp: now + 60 }, "invalid_claims"],
+      [{ nbf: now + 7 }, "invalid_claims"],
       // Past expires_at plus the purge margin: refused before any ledger
       // lookup, so a purged row can never make the token acceptable again.
-      [{ iat: now - 400, exp: now - 340 }, 401],
-    ] as const)
-      expect((await request("/v1/pipeline/manifests", migrationToken(overrides))).status).toBe(status);
+      [{ iat: now - 400, exp: now - 340 }, "migration_assertion_expired"],
+    ] as const) {
+      const response = await request("/v1/pipeline/manifests", migrationToken(overrides));
+      if (status === 200) expect(response.status).toBe(200);
+      else {
+        expect(response.status).toBe(401);
+        expect(await code(response)).toBe(status);
+      }
+    }
   });
 });

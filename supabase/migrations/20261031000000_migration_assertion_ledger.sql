@@ -13,17 +13,21 @@
 -- Service-role only: RLS on with no policy, and no grant to tenants. Code only:
 -- applying it to a hosted project needs Khaliq's go.
 --
--- Retention (no cron, nothing scheduled; a purge is a deliberate operator call):
---   * Keep every row until its grant is revoked or its export is complete,
---     whichever comes first. Rows are never removed during an export window.
---   * Never remove a row before `expires_at`: the token's `exp` plus the
---     ingest's 5 second migration clock skew. After `expires_at` no verifier
---     accepts the token (it is refused as expired, 401 `invalid_claims`), so
---     removing the row cannot make that `jti` or nonce acceptable again.
---   * `sessions.purge_migration_assertion_uses(grant_id)` is the only purge.
---     The caller asserts that the grant is revoked or its export complete; the
---     function itself still keeps every row whose `expires_at` has not passed
---     by `now()` plus a 5 minute margin for database/ingest clock drift.
+-- Plan binding: `plan_entry_digest` is the signed `meta.planEntryDigest`, the
+-- digest of the one canonical export plan entry this assertion uploaded
+-- (96BullSessions docs/contracts/relayhistory-export-plan-entry-v1.md); the
+-- ingest derived it from the upload itself before inserting.
+--
+-- Chunk uses: `migration_assertion_chunks` holds at most one chunk per
+-- (jti, seq), and the ingest admits only seq < the entry's chunk_count, so one
+-- assertion writes at most chunk_count chunks within its <= 65 s validity.
+--
+-- Retention (no cron, nothing scheduled): every ledger insert first deletes at
+-- most 100 rows (per table) whose `expires_at` passed more than 5 minutes ago.
+-- `expires_at` is the token's exp plus the ingest's 5 second migration skew.
+-- The verifier refuses an expired token before it touches the ledger (401
+-- `invalid_claims`), so deleting a row can never make that `jti` or nonce
+-- acceptable again.
 
 CREATE TABLE sessions.migration_assertion_uses (
   jti text PRIMARY KEY CHECK (length(jti) BETWEEN 1 AND 128),
@@ -33,6 +37,7 @@ CREATE TABLE sessions.migration_assertion_uses (
   workspace_id text NOT NULL,
   user_id text NOT NULL,
   plan_digest text NOT NULL CHECK (plan_digest ~ '^[0-9a-f]{64}$'),
+  plan_entry_digest text NOT NULL CHECK (plan_entry_digest ~ '^[0-9a-f]{64}$'),
   -- The token's exp plus skew: the earliest moment the row may be purged.
   expires_at timestamptz NOT NULL,
   consumed_at timestamptz NOT NULL DEFAULT now()
@@ -45,22 +50,23 @@ ALTER TABLE sessions.migration_assertion_uses ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.migration_assertion_uses FROM PUBLIC, anon, authenticated;
 GRANT ALL ON sessions.migration_assertion_uses TO service_role;
 
--- The only purge (see Retention above). Returns the number of rows removed.
-CREATE FUNCTION sessions.purge_migration_assertion_uses(p_grant_id text)
-RETURNS bigint
-LANGUAGE sql
-SECURITY INVOKER
-SET search_path = pg_catalog, pg_temp
-AS $$
-  WITH purged AS (
-    DELETE FROM sessions.migration_assertion_uses
-     WHERE grant_id = p_grant_id
-       AND expires_at < now() - interval '5 minutes'
-    RETURNING 1
-  )
-  SELECT count(*) FROM purged
-$$;
-REVOKE ALL ON FUNCTION sessions.purge_migration_assertion_uses(text)
-  FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION sessions.purge_migration_assertion_uses(text)
-  TO service_role;
+-- Retention scans.
+CREATE INDEX migration_assertion_uses_expires_idx
+  ON sessions.migration_assertion_uses (expires_at);
+
+-- One chunk per (assertion, seq) while the assertion is live.
+CREATE TABLE sessions.migration_assertion_chunks (
+  jti text NOT NULL CHECK (length(jti) BETWEEN 1 AND 128),
+  seq bigint NOT NULL CHECK (seq >= 0),
+  start_offset bigint NOT NULL CHECK (start_offset >= 0),
+  sha256 text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+  expires_at timestamptz NOT NULL,
+  reserved_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (jti, seq)
+);
+CREATE INDEX migration_assertion_chunks_expires_idx
+  ON sessions.migration_assertion_chunks (expires_at);
+
+ALTER TABLE sessions.migration_assertion_chunks ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.migration_assertion_chunks FROM PUBLIC, anon, authenticated;
+GRANT ALL ON sessions.migration_assertion_chunks TO service_role;

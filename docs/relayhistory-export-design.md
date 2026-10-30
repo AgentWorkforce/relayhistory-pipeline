@@ -111,35 +111,31 @@ manifest body.
   for ingest" grant, time-boxed to the export. This is an auth decision for
   the RelayAuth and ingest owners, and Khaliq.
   Ingest side (E3, #43 with relayhistory-cloud #228; nothing applied or
-  enabled):
-  - **Switch:** `RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS=true` (default off)
-    admits only tokens of the migration class (`sub`
-    `agent_relayhistory_migration`, `meta.tokenClass` `migration_assertion`),
-    never a generic RelayAuth bearer; without it every migration token is 401.
-    `RELAYHISTORY_MIGRATION_GRANTS` lists the accepted `grantId=planDigest`
-    pairs. Clock skew for these tokens is 5 seconds.
-  - **Routes:** `POST /v1/pipeline/chunks`, `POST /v1/pipeline/manifests`,
-    `GET /v1/pipeline/manifests/status` only (else 403
+  enabled). The contract is
+  [docs/contracts/relayhistory-export-plan-entry-v1.md](contracts/relayhistory-export-plan-entry-v1.md):
+  - **Switches:** `RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS=true` (default
+    off) admits only migration-class tokens and never a generic RelayAuth
+    bearer. `RELAYHISTORY_MIGRATION_GRANTS` lists the accepted
+    `grantId=planDigest` pairs. The broad `ALLOW_INTERIM_RELAYAUTH_BEARER` is
+    off unless explicitly set to `true` (the local Docker stack sets it).
+  - **Routes:** only `POST /v1/pipeline/chunks`, `POST /v1/pipeline/manifests`
+    and `GET /v1/pipeline/manifests/status` (anything else is 403
     `migration_assertion_route`).
-  - **Authorization from the signed assertion:** signed `wks` =
-    `meta.workspaceId`, signed `sponsorId` = `meta.sourceUserId`, and the
-    upload's key/manifest workspace and user are that pair (else 403
-    `migration_workspace_forbidden`). No membership lookup.
-  - **Manifest commitments:** `extensions["client.relayhistory_export"]` must
-    carry `grant_id` = `meta.grantId` (else 403 `migration_grant_forbidden`),
-    `plan_digest` = `meta.planDigest` (else 403 `migration_plan_mismatch`) and
-    `source_user_id` = `meta.sourceUserId` (else 403
-    `migration_workspace_forbidden`; also when a manifest already stored at
-    the key names another user). The exporter must write these three fields.
-  - **Single use:** the commit inserts `sessions.migration_assertion_uses` and
-    the enriched `pipeline_jobs` row in one transaction (409
-    `migration_assertion_replayed` on a reused `jti` or nonce; 503
-    `migration_ledger_unavailable` when the ledger is absent or down). A
-    replayed assertion needs a fresh mint; an identical retry is idempotent.
-  - **Retention:** keep rows until the grant is revoked or the export is
-    complete, never before `expires_at` (`exp` + 5 s) plus a 5 minute margin;
-    `sessions.purge_migration_assertion_uses(grant_id)` is the only purge, run
-    by hand, never on a schedule.
+  - **Identity:** the assertion carries an issuer-derived `meta.upload`. The
+    ingest recomputes it from the actual request (key, machine, session,
+    content, entry digest) and compares (else 403
+    `migration_upload_forbidden`). The signed pair must also be the grant
+    pair (else 403 `migration_workspace_forbidden`).
+  - **Expiry:** 60 s plus 5 s skew. An expired token gets 401
+    `migration_assertion_expired`; mint again.
+  - **Single use:** 409 `migration_assertion_replayed` (mint again); 503
+    `migration_ledger_unavailable` fails closed. The ledger row and the
+    enriched `pipeline_jobs` row commit in one transaction.
+  - **Chunks:** one chunk per `(jti, seq)` (409 `migration_chunk_conflict`)
+    and at most 256 chunks per assertion (403 `migration_chunk_limit`).
+  - **Retention:** no cron. Each ledger insert deletes at most 100 rows
+    expired for more than 5 minutes. An expired token is refused before the
+    ledger is read.
 - **O3:** the transform's normalizer for `client.relayhistory_export`
   sessions, so replay, briefs and embeddings read them like live sessions.
 - **O4:** sessions active across T0. Live delivery after T0 continues the

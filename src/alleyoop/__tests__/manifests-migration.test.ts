@@ -4,7 +4,9 @@
  * status read. The admission check, the ledger insert, enrichMessage and the
  * `pipeline_jobs` insert run in ONE SQL transaction: here on local PGlite with
  * every `supabase/migrations` file applied. The error codes are the same as
- * relayhistory-cloud's (routes/pipeline.ts). Synthetic ids only.
+ * relayhistory-cloud's (routes/pipeline.ts). The signed upload identity
+ * (docs/contracts/relayhistory-export-plan-entry-v1.md) is recomputed from the
+ * actual key and manifest. Synthetic ids only.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
@@ -14,7 +16,13 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
-import type { MigrationAssertionLedger, TransactionalSqlExecutor } from "@rhc/lib/pipeline/migration-assertions.ts";
+import {
+  uploadIdentityOf,
+  type MigrationAssertionLedger,
+  type PlanEntry,
+  type TransactionalSqlExecutor,
+  type UploadIdentity,
+} from "@rhc/lib/pipeline/migration-assertions.ts";
 import {
   computeContentSha256,
   manifestKey,
@@ -58,7 +66,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "96bulls-migration-"));
-  await db.exec("TRUNCATE sessions.migration_assertion_uses; TRUNCATE sessions.pipeline_jobs");
+  await db.exec("TRUNCATE sessions.migration_assertion_uses; TRUNCATE sessions.migration_assertion_chunks; TRUNCATE sessions.pipeline_jobs");
 });
 afterEach(async () => {
   await rm(root, { recursive: true, force: true });
@@ -79,8 +87,26 @@ const freshNonce = () => randomBytes(24).toString("base64url");
 
 type TestAuth = Record<string, unknown>;
 
+/** The plan entry the issuer stores for a manifest (built here, independently of the ingest). */
+async function entryOf(key: string, manifest: ManifestV1, overrides: Partial<PlanEntry> = {}): Promise<PlanEntry> {
+  const chunks = manifest.raw.chunks.map((c) => ({
+    seq: c.seq, epoch: c.epoch, start_offset: c.start_offset, bytes: c.bytes, sha256: c.sha256, records: c.records ?? 0,
+  }));
+  return {
+    grant_id: GRANT, key, org_id: ORG, workspace_id: WORKSPACE, source_user_id: USER,
+    session: {
+      machine_id: manifest.session.machine_id, harness: manifest.session.harness,
+      session_id: manifest.session.session_id, started_at: manifest.session.started_at,
+    },
+    state: manifest.raw.state, chunks,
+    content_sha256: await computeContentSha256(chunks),
+    raw_bytes: chunks.reduce((n, c) => n + c.bytes, 0),
+    ...overrides,
+  };
+}
+
 /** The auth context the verifier sets for a migration assertion (auth/relayauth.ts). */
-function migrationAuth(claims: Record<string, unknown> = {}, migration: Record<string, unknown> = {}): TestAuth {
+function migrationAuth(upload: UploadIdentity, claims: Record<string, unknown> = {}, migration: Record<string, unknown> = {}): TestAuth {
   return {
     userId: USER,
     orgId: ORG,
@@ -88,7 +114,7 @@ function migrationAuth(claims: Record<string, unknown> = {}, migration: Record<s
     tokenSubject: "agent_relayhistory_migration",
     scopes: ["rth:sync"],
     historyOrigin: ORIGIN,
-    claims: { sub: "agent_relayhistory_migration", wks: WORKSPACE, sponsorId: USER, ...claims },
+    claims: { sub: "agent_relayhistory_migration", org: ORG, wks: WORKSPACE, sponsorId: USER, ...claims },
     migration: {
       jti: freshJti(),
       nonce: freshNonce(),
@@ -97,6 +123,7 @@ function migrationAuth(claims: Record<string, unknown> = {}, migration: Record<s
       sourceUserId: USER,
       workspaceId: WORKSPACE,
       expiresAt: Math.floor(Date.now() / 1000) + 65,
+      upload,
       ...migration,
     },
   };
@@ -112,18 +139,6 @@ const ordinaryAuth: TestAuth = {
   claims: {},
 };
 
-function marker(overrides: Record<string, unknown> = {}) {
-  return {
-    version: 1,
-    source: "neon.delivery_records",
-    exported_at: AT,
-    grant_id: GRANT,
-    plan_digest: PLAN,
-    source_user_id: USER,
-    ...overrides,
-  };
-}
-
 async function fixture(options: { ledger?: MigrationAssertionLedger | null } = {}) {
   const store = createFsStore({ root });
   const raw = { store, provider: "fs" as const, bucket: "raw" };
@@ -133,9 +148,9 @@ async function fixture(options: { ledger?: MigrationAssertionLedger | null } = {
     location, format: "jsonl", seq: 0, epoch: 0, startOffset: 0,
     source: new TextEncoder().encode('{"type":"user","text":"hello"}\n'), traceId: TRACE,
   });
-  const build = async (exportMarker: Record<string, unknown> | undefined = marker(), ext: Record<string, unknown> = {}): Promise<ManifestV1> => ({
+  const build = async (ext: Record<string, unknown> = {}, session: Partial<ManifestV1["session"]> = {}): Promise<ManifestV1> => ({
     schema_v: 1, layout: "v1", trace_id: TRACE, revision: 1, created_at: AT, updated_at: AT,
-    session: { workspace_id: WORKSPACE, machine_id: MACHINE, harness: "claude", session_id: SESSION, started_at: AT },
+    session: { workspace_id: WORKSPACE, machine_id: MACHINE, harness: "claude", session_id: SESSION, started_at: AT, ...session },
     writer: { delivery_instance_id: MACHINE, plugin_version: "test" },
     raw: {
       owner: MACHINE, state: "open", updated_at: AT, format: "jsonl", compression: "zstd", chunk_count: 1,
@@ -146,9 +161,11 @@ async function fixture(options: { ledger?: MigrationAssertionLedger | null } = {
     },
     extensions: {
       "96bulls": { session_uuid: UUID, session_uuid_source: "minted", ...ext },
-      ...(exportMarker ? { "client.relayhistory_export": exportMarker } : {}),
+      "client.relayhistory_export": { version: 1, source: "neon.delivery_records", exported_at: AT },
     },
   });
+  const key = manifestKey(location);
+  const upload = await uploadIdentityOf(await entryOf(key, await build()), PLAN);
   const sent: StageMessage[] = [];
   const ledger = options.ledger === null ? undefined : (options.ledger ?? courierMigrationLedger(executor(), reader));
   const routes = createCourierManifestRoutes({
@@ -169,20 +186,21 @@ async function fixture(options: { ledger?: MigrationAssertionLedger | null } = {
     RELAYHISTORY_ORIGIN: ORIGIN,
     RELAYHISTORY_MIGRATION_GRANTS: `${GRANT}=${PLAN}`,
   };
-  const key = manifestKey(location);
   const post = async (as: TestAuth, manifest: unknown, at = key, envOverride: Record<string, string | undefined> = {}) => {
     auth = as;
     return app.request("/v1/pipeline/manifests", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-machine-id": MACHINE, "x-session-id": SESSION },
+      headers: { "content-type": "application/json", "x-machine-id": (manifest as ManifestV1).session.machine_id, "x-session-id": (manifest as ManifestV1).session.session_id },
       body: JSON.stringify({ key: at, manifest }),
     }, { ...env, ...envOverride });
   };
-  const status = async (as: TestAuth, envOverride: Record<string, string | undefined> = {}) => {
+  const status = async (as: TestAuth, envOverride: Record<string, string | undefined> = {}, at = key) => {
     auth = as;
-    return app.request(`/v1/pipeline/manifests/status?key=${encodeURIComponent(key)}&machine=${MACHINE}&writer=${MACHINE}`, {}, { ...env, ...envOverride });
+    return app.request(`/v1/pipeline/manifests/status?key=${encodeURIComponent(at)}&machine=${MACHINE}&writer=${MACHINE}`, {}, { ...env, ...envOverride });
   };
-  return { store, reader, location, key, build, sent, post, status };
+  /** A migration auth context for this fixture's planned upload. */
+  const as = (claims: Record<string, unknown> = {}, migration: Record<string, unknown> = {}) => migrationAuth(upload, claims, migration);
+  return { store, reader, location, key, build, sent, post, status, upload, as };
 }
 
 async function code(response: Response) {
@@ -192,7 +210,7 @@ async function code(response: Response) {
 describe("AlleyOop manifest route: migration assertions", () => {
   test("commits the ledger row and the enriched pipeline_jobs row together; a replay is 409 migration_assertion_replayed", async () => {
     const f = await fixture();
-    const auth = migrationAuth();
+    const auth = f.as();
     const manifest = await f.build();
     const first = await f.post(auth, manifest);
     expect(first.status).toBe(202);
@@ -202,15 +220,15 @@ describe("AlleyOop manifest route: migration assertions", () => {
     const { rows } = await db.query<{ message: { ctx: { session_uuid?: string; tenant_id?: string } } }>("SELECT message FROM sessions.pipeline_jobs");
     expect(rows[0]!.message.ctx.session_uuid).toBe(UUID);
     expect(rows[0]!.message.ctx.tenant_id).toBeTruthy();
-    const { rows: uses } = await db.query<Record<string, unknown>>("SELECT grant_id, org_id, workspace_id, user_id, plan_digest FROM sessions.migration_assertion_uses");
-    expect(uses).toEqual([{ grant_id: GRANT, org_id: ORG, workspace_id: WORKSPACE, user_id: USER, plan_digest: PLAN }]);
+    const { rows: uses } = await db.query<Record<string, unknown>>("SELECT grant_id, org_id, workspace_id, user_id, plan_digest, plan_entry_digest FROM sessions.migration_assertion_uses");
+    expect(uses).toEqual([{ grant_id: GRANT, org_id: ORG, workspace_id: WORKSPACE, user_id: USER, plan_digest: PLAN, plan_entry_digest: f.upload.entry_sha256 }]);
     // The route's own send is not used for a migration commit.
     expect(f.sent).toHaveLength(0);
 
     const replay = await f.post(auth, manifest);
     expect(replay.status).toBe(409);
     expect(await code(replay)).toBe("migration_assertion_replayed");
-    const sameNonce = migrationAuth({}, { nonce: (auth.migration as { nonce: string }).nonce });
+    const sameNonce = f.as({}, { nonce: (auth.migration as { nonce: string }).nonce });
     const reused = await f.post(sameNonce, manifest);
     expect(reused.status).toBe(409);
     expect(await code(reused)).toBe("migration_assertion_replayed");
@@ -221,7 +239,7 @@ describe("AlleyOop manifest route: migration assertions", () => {
     expect(await count("sessions.pipeline_jobs")).toBe(1);
 
     // A fresh assertion retries idempotently (the identical-manifest branch).
-    expect((await f.post(migrationAuth(), manifest)).status).toBe(202);
+    expect((await f.post(f.as(), manifest)).status).toBe(202);
     expect(await count("sessions.migration_assertion_uses")).toBe(2);
   });
 
@@ -230,6 +248,7 @@ describe("AlleyOop manifest route: migration assertions", () => {
     const holder: { reader?: ReturnType<typeof objectStoreManifestReader> } = {};
     const crashing: MigrationAssertionLedger = {
       consumed: (claims) => courierMigrationLedger(executor(), holder.reader!).consumed(claims),
+      reserveChunk: (use) => courierMigrationLedger(executor(), holder.reader!).reserveChunk(use),
       consume: (use, stage, message) =>
         courierMigrationLedger(executor(), holder.reader!, async (_stage, _message, work) => {
           await work(); // the real enrich + pipeline_jobs insert on the transaction
@@ -238,7 +257,7 @@ describe("AlleyOop manifest route: migration assertions", () => {
     };
     const f = await fixture({ ledger: crashing });
     holder.reader = f.reader;
-    const auth = migrationAuth();
+    const auth = f.as();
     const manifest = await f.build();
     const failed = await f.post(auth, manifest);
     expect(failed.status).toBe(503);
@@ -254,45 +273,58 @@ describe("AlleyOop manifest route: migration assertions", () => {
 
   test("fails closed with 503 migration_ledger_unavailable when the ledger is absent or down", async () => {
     const none = await fixture({ ledger: null });
-    for (const response of [await none.post(migrationAuth(), await none.build()), await none.status(migrationAuth())]) {
+    for (const response of [await none.post(none.as(), await none.build()), await none.status(none.as())]) {
       expect(response.status).toBe(503);
       expect(await code(response)).toBe("migration_ledger_unavailable");
     }
     const down: MigrationAssertionLedger = {
       consumed: async () => { throw new Error("ledger down"); },
+      reserveChunk: async () => { throw new Error("ledger down"); },
       consume: async () => { throw new Error("ledger down"); },
     };
     const f = await fixture({ ledger: down });
-    for (const response of [await f.post(migrationAuth(), await f.build()), await f.status(migrationAuth())]) {
+    for (const response of [await f.post(f.as(), await f.build()), await f.status(f.as())]) {
       expect(response.status).toBe(503);
       expect(await code(response)).toBe("migration_ledger_unavailable");
     }
-    const commitDown: MigrationAssertionLedger = { consumed: async () => false, consume: async () => { throw new Error("tx failed"); } };
+    const commitDown: MigrationAssertionLedger = {
+      consumed: async () => false,
+      reserveChunk: async () => "reserved",
+      consume: async () => { throw new Error("tx failed"); },
+    };
     const g = await fixture({ ledger: commitDown });
-    const response = await g.post(migrationAuth(), await g.build());
+    const response = await g.post(g.as(), await g.build());
     expect(response.status).toBe(503);
     expect(await code(response)).toBe("migration_ledger_unavailable");
     expect(g.sent).toHaveLength(0);
     // Ordinary tokens are unaffected by the ledger.
-    expect((await none.post(ordinaryAuth, await none.build(undefined))).status).toBe(202);
+    expect((await none.post(ordinaryAuth, await none.build())).status).toBe(202);
     expect(none.sent).toHaveLength(1);
   });
 
-  test("returns the relayhistory-cloud codes: workspace pair, grant, plan and source user", async () => {
+  test("returns the relayhistory-cloud codes: workspace pair, grant, and the recomputed upload identity", async () => {
     const f = await fixture();
     const manifest = await f.build();
-    const cases: [string, TestAuth, unknown, string?, Record<string, string | undefined>?][] = [
-      ["migration_workspace_forbidden", migrationAuth({ wks: "ws_other" }), manifest],
-      ["migration_workspace_forbidden", migrationAuth({ sponsorId: "user_b" }), manifest],
-      ["migration_workspace_forbidden", migrationAuth({}, { workspaceId: "ws_other" }), manifest],
-      ["migration_workspace_forbidden", migrationAuth(), { ...manifest, session: { ...manifest.session, workspace_id: "ws_other" } }, manifestKey({ ...f.location, workspaceId: "ws_other" })],
-      ["migration_workspace_forbidden", migrationAuth(), await f.build(marker({ source_user_id: "user_b" }))],
-      ["migration_workspace_forbidden", migrationAuth(), await f.build(marker(), { user_id: "user_b" })],
-      ["migration_grant_forbidden", migrationAuth(), manifest, undefined, { RELAYHISTORY_MIGRATION_GRANTS: undefined }],
-      ["migration_grant_forbidden", migrationAuth(), manifest, undefined, { RELAYHISTORY_MIGRATION_GRANTS: `${GRANT}=${OTHER_PLAN}` }],
-      ["migration_grant_forbidden", migrationAuth(), await f.build(marker({ grant_id: "mgr_other" }))],
-      ["migration_plan_mismatch", migrationAuth(), await f.build(marker({ plan_digest: OTHER_PLAN }))],
-      ["migration_plan_mismatch", migrationAuth(), await f.build(marker({ plan_digest: undefined }))],
+    const otherKey = manifestKey({ ...f.location, workspaceId: "ws_other" });
+    const freshKey = manifestKey({ ...f.location, machineId: "machine-fresh" });
+    const otherContent = structuredClone(manifest);
+    otherContent.raw.chunks[0]!.records = 41;
+    const bUpload = await uploadIdentityOf(await entryOf(f.key, manifest, { source_user_id: "user_b" }), PLAN);
+    const cases: [string, TestAuth, ManifestV1, string?, Record<string, string | undefined>?][] = [
+      ["migration_workspace_forbidden", f.as({ wks: "ws_other" }), manifest],
+      ["migration_workspace_forbidden", f.as({ sponsorId: "user_b" }), manifest],
+      ["migration_workspace_forbidden", f.as({}, { workspaceId: "ws_other" }), manifest],
+      ["migration_workspace_forbidden", f.as(), { ...manifest, session: { ...manifest.session, workspace_id: "ws_other" } }, otherKey],
+      ["migration_grant_forbidden", f.as(), manifest, undefined, { RELAYHISTORY_MIGRATION_GRANTS: undefined }],
+      ["migration_grant_forbidden", f.as(), manifest, undefined, { RELAYHISTORY_MIGRATION_GRANTS: `${GRANT}=${OTHER_PLAN}` }],
+      // An arbitrary fresh machine key.
+      ["migration_upload_forbidden", f.as(), { ...manifest, session: { ...manifest.session, machine_id: "machine-fresh" } }, freshKey],
+      // Other content (even with every echoed extension field matching).
+      ["migration_upload_forbidden", f.as(), { ...otherContent, extensions: { ...otherContent.extensions, "client.relayhistory_export": { version: 1, source: "neon.delivery_records", exported_at: AT, upload: f.upload } } }],
+      // A user's token carrying another user's identity, and the reverse.
+      ["migration_upload_forbidden", f.as({}, { upload: bUpload }), manifest],
+      ["migration_upload_forbidden", f.as({}, { upload: { ...f.upload, plan_digest: OTHER_PLAN } }), manifest],
+      ["migration_upload_forbidden", f.as({}, { upload: { ...f.upload, grant_id: "mgr_other" } }), manifest],
     ];
     for (const [expected, auth, body, at, envOverride] of cases) {
       const response = await f.post(auth, body, at ?? f.key, envOverride ?? {});
@@ -302,39 +334,36 @@ describe("AlleyOop manifest route: migration assertions", () => {
     expect(await count("sessions.migration_assertion_uses")).toBe(0);
     expect(await count("sessions.pipeline_jobs")).toBe(0);
     expect(await f.store.head(objectKey(f.key))).toBeUndefined();
+    expect(await f.store.head(objectKey(freshKey))).toBeUndefined();
   });
 
-  test("refuses user A's assertion under a key whose stored manifest names user B", async () => {
+  test("normalizes relay_ consistently: prefixed signed claims match the canonical identity", async () => {
     const f = await fixture();
-    // User B's session is already stored at this key (and machine).
-    const theirs = await f.build(marker({ source_user_id: "user_b" }), { user_id: "user_b" });
-    expect((await f.post(ordinaryAuth, theirs)).status).toBe(202);
-    const response = await f.post(migrationAuth(), await f.build());
+    const prefixed = f.as(
+      { sponsorId: `relay_${USER}`, wks: `relay_${WORKSPACE}`, org: `relay_${ORG}` },
+      { sourceUserId: `relay_${USER}`, workspaceId: `relay_${WORKSPACE}` },
+    );
+    expect((await f.post(prefixed, await f.build())).status).toBe(202);
+    // A different id is a mismatch, prefix or not.
+    const other = f.as({ sponsorId: "relay_user_x" }, { sourceUserId: "relay_user_x" });
+    const response = await f.post(other, await f.build());
     expect(response.status).toBe(403);
-    expect(await code(response)).toBe("migration_workspace_forbidden");
-    const read = await f.status(migrationAuth());
-    expect(read.status).toBe(403);
-    expect(await code(read)).toBe("migration_workspace_forbidden");
-    expect(await count("sessions.migration_assertion_uses")).toBe(0);
   });
 
-  test("status: admitted only for the assertion's own grant, workspace, user and plan", async () => {
+  test("status: admitted only for the signed upload's own key and identity", async () => {
     const f = await fixture();
-    expect((await f.status(migrationAuth())).status).toBe(404);
-    expect((await f.post(migrationAuth(), await f.build())).status).toBe(202);
-    const own = await f.status(migrationAuth());
+    expect((await f.status(f.as())).status).toBe(404);
+    expect((await f.post(f.as(), await f.build())).status).toBe(200 + 2);
+    const own = await f.status(f.as());
     expect(own.status).toBe(200);
-    for (const [expected, auth, envOverride] of [
-      // A grant accepted here, but the stored manifest commits to another plan.
-      ["migration_plan_mismatch", migrationAuth({}, { planDigest: OTHER_PLAN }), { RELAYHISTORY_MIGRATION_GRANTS: `${GRANT}=${OTHER_PLAN}` }],
-      // A grant accepted here, but not the grant the stored manifest names.
-      ["migration_grant_forbidden", migrationAuth({}, { grantId: "mgr_other" }), { RELAYHISTORY_MIGRATION_GRANTS: `mgr_other=${PLAN}` }],
-      ["migration_grant_forbidden", migrationAuth({}, { grantId: "mgr_other" }), {}],
-      ["migration_workspace_forbidden", migrationAuth({ wks: "ws_other" }), {}],
-    ] as const) {
-      const response = await f.status(auth, envOverride);
-      expect(response.status).toBe(403);
-      expect(await code(response)).toBe(expected);
-    }
+    const fresh = await f.status(f.as(), {}, manifestKey({ ...f.location, sessionId: "session-fresh" }));
+    expect(fresh.status).toBe(403);
+    expect(await code(fresh)).toBe("migration_upload_forbidden");
+    const otherUpload = await f.status(f.as({}, { upload: { ...f.upload, entry_sha256: "c".repeat(64) } }));
+    expect(otherUpload.status).toBe(403);
+    expect(await code(otherUpload)).toBe("migration_upload_forbidden");
+    const grant = await f.status(f.as({}, { grantId: "mgr_other" }));
+    expect(grant.status).toBe(403);
+    expect(await code(grant)).toBe("migration_grant_forbidden");
   });
 });

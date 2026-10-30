@@ -29,17 +29,16 @@ import {
 } from "../lib/pipeline/index.js";
 import {
   migrationGrantAllowed,
-  migrationGrantMarked,
   migrationPairAuthorized,
-  migrationPlanMatches,
-  migrationSourceMatches,
-  storedManifestOwnedByOther,
+  migrationSessionMatches,
+  migrationUploadMatches,
   type MigrationAssertionLedger,
+  type MigrationChunkResult,
 } from "../lib/pipeline/migration-assertions.js";
+import { sha256Hex } from "../../../object-store/src/crypto.js";
 import {
   buildObjectLandedMessage,
   manifestReaderFromEnv,
-  objectStoreManifestReader,
   OBJECT_LANDED_STAGE,
   orgResolverFromEnv,
   prefixAllowed,
@@ -51,7 +50,6 @@ import {
 } from "../lib/pipeline/adapter.js";
 import {
   ObjectStoreError,
-  manifestKey,
   parseManifest,
   parseSessionKey,
   RAW_FORMATS,
@@ -224,6 +222,16 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     if (!ledger) return ledgerUnavailable(c);
     if (!migrationPairAuthorized(auth)) return workspaceForbidden(c);
     if (!migrationGrantAllowed(env, auth.migration)) return grantForbidden(c);
+    // Status: only the signed upload's own manifest key.
+    if (c.req.path.endsWith("/pipeline/manifests/status")) {
+      const location = parseSessionKey(c.req.query("key") ?? "");
+      if (
+        !location ||
+        location.rest !== "manifest.json" ||
+        !migrationSessionMatches(auth, location)
+      )
+        return uploadForbidden(c);
+    }
     let consumed: boolean;
     try {
       consumed = await ledger.consumed(auth.migration);
@@ -238,6 +246,15 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
   routes.use("/pipeline/chunks", migrationAdmission);
   routes.use("/pipeline/manifests", migrationAdmission);
   routes.use("/pipeline/manifests/status", migrationAdmission);
+
+  function uploadForbidden(c: AppContext) {
+    return error(
+      c,
+      403,
+      "migration_upload_forbidden",
+      "The upload is not the one this migration assertion's signed upload identity names",
+    );
+  }
 
   function grantForbidden(c: AppContext) {
     return error(
@@ -513,40 +530,10 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
         })
       )
         return workspaceForbidden(c);
-      if (!migrationSourceMatches(auth.migration, manifest))
-        return workspaceForbidden(c);
-      // The object already at the key (when it is not the copy just read)
-      // must not belong to another user either.
-      const raw = (deps.rawStore ?? defaultDeps.rawStore!)(env);
-      if (!reader && raw) {
-        let stored: Awaited<ReturnType<ManifestReader["read"]>>;
-        try {
-          stored = await objectStoreManifestReader(raw.store, {
-            provider: raw.provider,
-          }).read(key);
-        } catch {
-          return error(
-            c,
-            503,
-            "storage_unavailable",
-            "Object storage is temporarily unavailable",
-          );
-        }
-        if (
-          stored &&
-          storedManifestOwnedByOther(auth.migration, stored.manifest)
-        )
-          return workspaceForbidden(c);
-      }
-      if (!migrationGrantMarked(auth.migration, manifest))
-        return grantForbidden(c);
-      if (!migrationPlanMatches(auth.migration, manifest))
-        return error(
-          c,
-          403,
-          "migration_plan_mismatch",
-          "The manifest does not commit to the export plan this migration assertion was signed for",
-        );
+      // The signed upload identity, recomputed from this key, the manifest's
+      // session and chunk list, and the content hash chain over it.
+      if (!(await migrationUploadMatches(auth, location, manifest)))
+        return uploadForbidden(c);
       // The commit's only durable write is the enqueue: the ledger consumes the
       // assertion and enqueues as one unit, so neither lands without the other.
       // A failure leaves nothing consumed, and the upload may be retried.
@@ -560,6 +547,7 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
             nonce: auth.migration.nonce,
             grantId: auth.migration.grantId,
             planDigest: auth.migration.planDigest,
+            planEntryDigest: auth.migration.upload.entry_sha256,
             expiresAt: auth.migration.expiresAt,
             orgId: scope.orgId,
             workspaceId: scope.workspaceId,
@@ -647,27 +635,12 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     // ownership, and with no org mapping configured the write fails closed.
     const owned = await callerOwnsLocation(c, location);
     if (owned !== true) return owned;
-    const migration = getAuth(c).migration;
-    if (migration) {
-      // A token for user A must not add chunks under a session (and so a
-      // machine) whose stored manifest names user B.
-      let stored: Awaited<ReturnType<ManifestReader["read"]>>;
-      try {
-        stored = await objectStoreManifestReader(raw.store, {
-          provider: raw.provider,
-          ...(raw.bucket ? { bucket: raw.bucket } : {}),
-        }).read(manifestKey(location));
-      } catch {
-        return error(
-          c,
-          503,
-          "storage_unavailable",
-          "Object storage is temporarily unavailable",
-        );
-      }
-      if (stored && storedManifestOwnedByOther(migration, stored.manifest))
-        return workspaceForbidden(c);
-    }
+    const chunkAuth = getAuth(c);
+    const migration = chunkAuth.migration;
+    // The chunk's session key, machine and date must be the signed upload's,
+    // before the first write (fresh keys included).
+    if (migration && !migrationSessionMatches(chunkAuth, location))
+      return uploadForbidden(c);
     const declared = Number(c.req.header("content-length") ?? NaN);
     if (declared > MAX_CHUNK_BYTES)
       return error(c, 413, "too_large", "chunk exceeds the size limit");
@@ -675,6 +648,38 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     const source = await readCapped(c.req.raw.body, MAX_CHUNK_BYTES);
     if (!source)
       return error(c, 413, "too_large", "chunk exceeds the size limit");
+    if (migration) {
+      // At most one chunk per (assertion, seq): a repeat is idempotent, any
+      // other chunk at this seq is refused; and a strict per-assertion cap.
+      let held: MigrationChunkResult;
+      try {
+        const ledger = deps.migrationLedger?.(env);
+        if (!ledger) return ledgerUnavailable(c);
+        held = await ledger.reserveChunk({
+          jti: migration.jti,
+          seq,
+          startOffset,
+          sha256: await sha256Hex(source),
+          expiresAt: migration.expiresAt,
+        });
+      } catch {
+        return ledgerUnavailable(c);
+      }
+      if (held === "conflict")
+        return error(
+          c,
+          409,
+          "migration_chunk_conflict",
+          "Another chunk was already written at this seq under this migration assertion",
+        );
+      if (held === "limit")
+        return error(
+          c,
+          403,
+          "migration_chunk_limit",
+          "This migration assertion reached its chunk limit; mint a fresh one",
+        );
+    }
     const traceId = c.req.header("X-Relay-Trace-Id");
     try {
       const sealed = await sealRawChunk(raw.store, {

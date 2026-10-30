@@ -10,7 +10,7 @@ Status: **binding proposal, code only** (helm-chart-chief contract decision, E3)
 
 Test vectors: [`relayhistory-export-plan-entry-v1.vectors.json`](relayhistory-export-plan-entry-v1.vectors.json). Every implementation must reproduce every value. They were cross-checked three ways:
 
-- the reference implementation, `packages/pipeline/src/lib/pipeline/migration-assertions.ts`, byte-identical in relayhistory-cloud;
+- the reference implementation, `packages/pipeline/src/lib/pipeline/migration-assertions.ts`: `canonicalJson`, `planEntrySha256`, `exportPlanDigest`, `uploadIdentityOf`, `derivePlanEntry`, `migrationSessionMatches`, `migrationUploadMatches` and `parseUploadIdentity`. It is byte-identical in relayhistory-cloud and tested against these vectors by `packages/pipeline/test/migration-assertion-contract.test.ts`;
 - the #40 courier's `derivePlanContract` at `2f17febc`;
 - an independent Python implementation.
 
@@ -60,6 +60,18 @@ It binds:
 - the machine and session key;
 - the manifest (work) key;
 - the content and source-chunk digest, through `content_sha256` and `entry_sha256`.
+
+## Mint request (courier to issuer)
+
+- The courier sends `upload: {key}` on `POST /v1/tokens/migration-assertion`: the manifest key only, with `grantId`, `sourceUserId`, `workspaceId` and `nonce` as today.
+- The issuer looks the key up in the grant's stored plan. It refuses when there is no such entry, or when the entry's `(source_user_id, workspace_id)` is not the requested pair. Otherwise it derives the whole upload identity above from that entry and signs it as `meta.upload`.
+- The courier never supplies the other identity fields.
+
+## Work key
+
+- The identity's `key` is the **manifest key**.
+- The pipeline work key is `<manifest key>@<object version>`. Storage assigns the version at write time, so no issuer can bind it.
+- The commit response's `workKey` starts with `key + "@"`. The courier may check this. The ingest test `buildIngestApp ... accepted under its full contract` asserts it.
 
 ## What the ingest recomputes (never an echoed field)
 

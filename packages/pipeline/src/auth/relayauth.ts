@@ -1,7 +1,10 @@
 // Copied from AgentWorkforce/relayhistory-cloud packages/relayhistory/src/auth/relayauth.ts at 6f6d568849c483be8e3a2a5aaeba3da1d4b47de9 (96BullSessions stand-in; changes: an unknown kid refetches the JWKS, see getJwks; MOVE_NOTES.md; and the migration-assertion verifier ported from relayhistory-cloud feat/migration-assertion-ingest, see #43).
 import { analyticsFromVerifiedAssertion } from "./analytics-identity.js";
 import type { AuthContext, Bindings } from "../env.js";
-import type { MigrationAssertionClaims } from "../lib/pipeline/migration-assertions.js";
+import {
+  parseUploadIdentity,
+  type MigrationAssertionClaims,
+} from "../lib/pipeline/migration-assertions.js";
 import {
   DEFAULT_RELAYAUTH_AUDIENCE,
   DEFAULT_RELAYAUTH_ISSUER,
@@ -25,7 +28,10 @@ type JsonWebKeySet = {
   keys?: (JsonWebKey & { kid?: string })[];
 };
 
-type IdentityErrorCode = "invalid_token" | "invalid_claims";
+type IdentityErrorCode =
+  | "invalid_token"
+  | "invalid_claims"
+  | "migration_assertion_expired";
 
 const TOKEN_PREFIXES = ["relay_pa_", "relay_ws_", "relay_id_", "relay_ag_"];
 const CLOCK_SKEW_SECONDS = 60;
@@ -331,6 +337,13 @@ function validateClaims(
   const now = Math.floor(Date.now() / 1000);
   const skew = migration ? MIGRATION_CLOCK_SKEW_SECONDS : CLOCK_SKEW_SECONDS;
   if (typeof claims.exp !== "number" || claims.exp + skew <= now) {
+    // A distinct code for an expired migration assertion: the courier
+    // re-mints, while any other 401 stays terminal.
+    if (migration && typeof claims.exp === "number")
+      throw new IdentityError(
+        "migration_assertion_expired",
+        "migration assertion is expired; mint a fresh one",
+      );
     throw new IdentityError("invalid_claims", "jwt is expired");
   }
   if (typeof claims.nbf === "number" && claims.nbf - skew > now) {
@@ -431,6 +444,10 @@ function migrationAssertionClaims(
   if (typeof planDigest !== "string" || !PLAN_DIGEST_SHAPE.test(planDigest)) {
     refuse("planDigest is malformed");
   }
+  // The signed per-upload identity (relayauth#110 amendment), derived by the
+  // issuer from the grant's stored plan.
+  const upload = parseUploadIdentity(meta!.upload);
+  if (!upload) refuse("upload identity is malformed");
   const sponsorId = stringClaim(claims, "sponsorId");
   const chain = claims.sponsorChain;
   if (
@@ -450,6 +467,7 @@ function migrationAssertionClaims(
     nonce: nonce as string,
     grantId: grantId as string,
     planDigest: planDigest as string,
+    upload: upload!,
     sourceUserId: sourceUserId as string,
     workspaceId: workspaceId as string,
     // The ledger must keep this row at least until no clock could still

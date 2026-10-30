@@ -17,12 +17,15 @@ import {
   traceIdFromHeaders,
   type AppEnv,
   type Bindings,
+  objectStoreManifestReader,
   type PipelineStage,
+  type RawStore,
+  type SqlExecutor,
   type StageMessage,
 } from "../shared/vendor.ts";
 import { inTransaction, openHoopDb, waitForHoopDb, waitForSchema } from "../shared/db.ts";
 import { enrichMessage, requestIdentity } from "../shared/enrich.ts";
-import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
+import { lockerStore } from "../shared/locker.ts";
 import { traceparentFor } from "../shared/ids.ts";
 import { integer, optional, required, vendorBindings } from "../shared/env.ts";
 import { liveDataPathVerdict } from "../shared/data-path.ts";
@@ -34,7 +37,25 @@ import { expectedMigrationNames } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
 import { courierMigrationLedger, createCourierManifestRoutes } from "./manifests.ts";
 
-export async function buildIngestApp() {
+/** Test seams for buildIngestApp: an already migrated database and a raw store. */
+export interface IngestOverrides {
+  db?: SqlExecutor & { transaction<T>(work: (tx: SqlExecutor) => Promise<T>): Promise<T> };
+  raw?: RawStore;
+}
+
+/**
+ * The production composition of the AlleyOop ingest. Auth (no bypass):
+ *  - `ALLOW_INTERIM_RELAYAUTH_BEARER` is OFF unless the environment sets it to
+ *    exactly "true" (an explicit dev/test opt-in; the local Docker stack sets
+ *    it). Off, a generic RelayAuth bearer is refused (401).
+ *  - Migration assertions go through the dedicated verifier
+ *    (`RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS=true`, default off), which
+ *    admits only the migration class, under its full contract (signed pair,
+ *    recomputed upload identity, chunk bounds, single-use ledger).
+ *  - With `RELAYHISTORY_ORIGIN` set, the upload routes take only origin-bound
+ *    assertions (or migration assertions), even with the interim bearer on.
+ */
+export async function buildIngestApp(overrides: IngestOverrides = {}) {
   const port = integer("INGEST_PORT", 8080);
   const jwks = process.env.JWKS_JSON
     ? (JSON.parse(process.env.JWKS_JSON) as Record<string, unknown>)
@@ -42,7 +63,8 @@ export async function buildIngestApp() {
       ? jwksFromPrivateKey(process.env.JWT_PRIVATE_KEY_PEM, required("JWT_KID"))
       : undefined;
   const env = vendorBindings({
-    ALLOW_INTERIM_RELAYAUTH_BEARER: "true",
+    // Explicit opt-in only (dev/tests); never defaulted on.
+    ...(process.env.ALLOW_INTERIM_RELAYAUTH_BEARER === "true" ? { ALLOW_INTERIM_RELAYAUTH_BEARER: "true" } : {}),
     RELAYAUTH_ISSUER: optional("AUTH_ISSUER", "https://96bulls.local"),
     RELAYAUTH_AUDIENCE: optional("AUTH_AUDIENCE", "relayhistory"),
     RELAYAUTH_JWKS_URL: optional("RELAYAUTH_JWKS_URL", `http://127.0.0.1:${port}/.well-known/jwks.json`),
@@ -58,11 +80,21 @@ export async function buildIngestApp() {
   }) as unknown as Bindings;
   if (!jwks && !process.env.RELAYAUTH_JWKS_URL) throw new Error("96bulls: ingest needs JWKS_JSON, JWT_PRIVATE_KEY_PEM or RELAYAUTH_JWKS_URL");
 
-  const db = openHoopDb();
-  await waitForHoopDb(db);
-  await waitForSchema(db, await expectedMigrationNames());
+  let db: SqlExecutor;
+  let transaction: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
+  if (overrides.db) {
+    db = overrides.db;
+    transaction = overrides.db.transaction.bind(overrides.db);
+  } else {
+    const hoop = openHoopDb();
+    await waitForHoopDb(hoop);
+    await waitForSchema(hoop, await expectedMigrationNames());
+    db = hoop;
+    transaction = (work) => inTransaction(hoop, work);
+  }
+  const raw = overrides.raw ?? lockerStore();
   const queue = postgresPipelineQueue(db);
-  const reader = lockerManifestReader();
+  const reader = objectStoreManifestReader(raw.store, { provider: raw.provider, ...(raw.bucket ? { bucket: raw.bucket } : {}) });
   const sink = sqlPipelineEventSink(db);
   const deadLetters = postgresDeadLetterStore(db);
   const send = async (_env: Bindings, stage: PipelineStage, message: StageMessage) =>
@@ -72,20 +104,20 @@ export async function buildIngestApp() {
   // Migration commits: the ledger row, enrichMessage and the pipeline_jobs
   // insert in ONE transaction (see manifests.ts).
   const migrationLedger = courierMigrationLedger(
-    { query: db.query.bind(db), transaction: (work) => inTransaction(db, work) },
+    { query: db.query.bind(db), transaction },
     reader,
     (stage, message, work) =>
       withSpan("enqueue", { traceparent: traceparentFor(message.ctx.traceId), attrs: { stage, trace_id: message.ctx.traceId } }, work),
   );
   const pipeline = createPipelineRoutes({
     manifests: () => reader,
-    rawStore: () => lockerStore(),
+    rawStore: () => raw,
     sink: () => sink,
     deadLetters: () => deadLetters,
     send,
     migrationLedger: () => migrationLedger,
   });
-  const courierManifests = createCourierManifestRoutes({ manifests: reader, raw: lockerStore(), send, migrationLedger });
+  const courierManifests = createCourierManifestRoutes({ manifests: reader, raw, send, migrationLedger });
 
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
@@ -148,6 +180,17 @@ export async function buildIngestApp() {
   });
   const v1 = new Hono<AppEnv>();
   v1.use("*", async (c, next) => requireAuth(c as never, next));
+  // Upload routes on an origin-bound deployment: only assertions minted for
+  // this origin (or migration assertions, which are origin-bound by their
+  // verifier), whatever the interim bearer flag says.
+  v1.use("*", async (c, next) => {
+    const path = c.req.path;
+    const upload = path === "/v1/pipeline/chunks" || path === "/v1/pipeline/manifests" || path === "/v1/pipeline/manifests/status";
+    const auth = c.get("auth") as { historyOrigin?: string; migration?: unknown } | undefined;
+    if (upload && env.RELAYHISTORY_ORIGIN && !auth?.migration && !auth?.historyOrigin)
+      return c.json({ error: { code: "origin_bound_assertion_required", message: "upload routes take only assertions minted for this origin" }, correlationId: c.get("correlationId") ?? "" }, 403);
+    await next();
+  });
   // Every send made while handling this request carries the authenticated user.
   v1.use("*", async (c, next) => {
     const auth = c.get("auth") as { userId?: string } | undefined;
