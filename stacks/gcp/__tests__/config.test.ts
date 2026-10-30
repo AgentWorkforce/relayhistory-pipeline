@@ -53,7 +53,7 @@ describe("GCP self-host contract", () => {
         ...base,
         bulls96: { enabled: true, chartVersion: "0.3.0" },
       }),
-    ).toThrow("service Locker wiring is S3-only");
+    ).toThrow("does not install the chart");
   });
 
   it("keeps Relaycast on the released single-writer SQLite profile", () => {

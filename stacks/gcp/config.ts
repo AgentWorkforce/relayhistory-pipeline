@@ -150,7 +150,7 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
   }
   if (inputs.bulls96?.enabled)
     throw new Error(
-      "96bulls: the GCP 96Bulls add-on is blocked: service Locker wiring is S3-only even though the object-store package has a GCS adapter",
+      "96bulls: the GCP 96Bulls add-on is blocked: the runtime can select GCS, but this stack does not install the chart or inject LOCKER_PROVIDER=gcs and Workload Identity",
     );
 }
 
