@@ -27,7 +27,9 @@ One `session_uuid` (UUIDv7, minted once on the client) and one pipeline
 
 ## Layout
 
-- `alchemy.run.ts`: the stack, every stage. `local` uses the Alchemy Docker provider; `aws-*` is declared and gated (`docs/aws-stage.md`).
+- `alchemy.run.ts`: the local stack. Cloud stacks are isolated and gated:
+  `stacks/aws/alchemy.aws.run.ts` (`docs/aws-stage.md`) and
+  `stacks/gcp/alchemy.gcp.run.ts` (`docs/gcp-stage.md`).
 - `stacks/local/topology.ts`: names, ports, images, tenant ids, as data.
 - `src/`: the services (Bun/TypeScript). One image, `SERVICE=` picks the entry (`docker/`).
 - `packages/pipeline`, `packages/object-store`: the pipeline framework and object-store adapters, moved from relayhistory-cloud #210 and #211 (byte-identical; `MOVE_NOTES.md` has the mapping and the few stand-ins). The services import them through `src/shared/vendor.ts`.

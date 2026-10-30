@@ -41,6 +41,7 @@
     "alchemy": "2.0.0-beta.84",
     "@alchemy.run/docker": "2.0.0-beta.84",
     "@alchemy.run/aws": "2.0.0-beta.84",
+    "@alchemy.run/gcp": "2.0.0-beta.84",
     "@alchemy.run/kubernetes": "2.0.0-beta.84",
     "effect": "4.0.7",
     "bun": ">=1.4.0",
