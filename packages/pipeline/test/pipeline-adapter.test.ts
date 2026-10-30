@@ -41,6 +41,7 @@ import {
   type SessionLocation,
 } from "../src/lib/pipeline/object-layout.js";
 import {
+  SCRUB_REFUSAL_CODES,
   SCRUB_RULESET,
   SCRUB_RULESET_VERSION,
   scrubRecords,
@@ -1182,6 +1183,24 @@ describe("POST /v1/pipeline/chunks", () => {
     expect(res.status).toBe(413);
     // Reading stopped at the cap (plus the stream's read-ahead).
     expect(sent).toBeLessThan(20);
+  });
+
+  it("reports a scrub refusal by code and stores nothing", async () => {
+    const refused: string[] = [];
+    const a = app(
+      {
+        rawStore: () => ({ store, provider: "s3", bucket: "b" }),
+        onChunkRefused: (code) => refused.push(code),
+      },
+      {},
+    );
+    const res = await a.request(`/v1/pipeline/chunks?${query}`, {
+      method: "POST",
+      body: new Uint8Array([0xff, 0xfe, 0x00]),
+    });
+    expect(res.status).toBe(400);
+    expect(refused).toEqual(["chunk_not_utf8"]);
+    expect(SCRUB_REFUSAL_CODES.has(refused[0]!)).toBe(true);
   });
 
   it("rejects bad input and answers 503 with no raw store", async () => {

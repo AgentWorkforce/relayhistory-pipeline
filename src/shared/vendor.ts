@@ -17,6 +17,7 @@ export {
 export { postgresDeadLetterStore } from "@rhc/lib/pipeline/postgres-dead-letters.ts";
 export { pipelineQueueDeps, type PipelineImplementations } from "@rhc/lib/pipeline/index.ts";
 export { PipelineError } from "@rhc/lib/pipeline/errors.ts";
+export { SCRUB_REFUSAL_CODES } from "@rhc/lib/pipeline/raw-chunks.ts";
 export {
   handleStageQueue,
   type StageHandler,

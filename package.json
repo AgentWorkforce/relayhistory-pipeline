@@ -22,6 +22,7 @@
     "down:local": "bun run bin/96bulls down local",
     "smoke:local": "bun run bin/96bulls smoke local",
     "audit:search-indexes": "bun run src/hoopdb/search-index-audit.ts",
+    "cutover:metrics": "bun run src/migration/cutover-metrics-run.ts",
     "benchmark:relayhistory": "bun run src/migration/relayhistory-benchmark.ts",
     "benchmark:relayhistory-api": "bun run src/migration/relayhistory-api-benchmark.ts",
     "migration:copy": "bun run src/migration/relayhistory-copy.ts",
