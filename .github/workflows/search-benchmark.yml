@@ -1,0 +1,55 @@
+name: search-benchmark
+# Synthetic data on a disposable local Postgres. No secrets, no hosted service.
+on:
+  pull_request:
+    paths:
+      - benchmarks/session-search/**
+      - supabase/migrations/**
+      - src/hoopdb/search-index-contract.ts
+      - .github/workflows/search-benchmark.yml
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: S, M or L
+        default: S
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        # Supabase's current major.
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: benchmark-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Harness checks (PGlite)
+        run: bun test ./benchmarks
+      - name: Benchmark (fails on any isolation or correctness failure)
+        env:
+          BENCH_PG_URL: postgres://postgres:benchmark-only@127.0.0.1:5432/postgres
+          BENCH_SCALE: ${{ inputs.scale || 'S' }}
+          BENCH_OUT: benchmark-report.json
+        run: bun benchmarks/session-search/run.ts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: search-benchmark-report
+          path: benchmark-report.json
+          if-no-files-found: ignore
