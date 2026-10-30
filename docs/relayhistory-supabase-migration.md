@@ -25,11 +25,13 @@ copy-everything-then-switch runbook (linuyc, uncommitted
 - **Target database:** Supabase `sessions` (`pyamkrhoyszgzirqqffq`). AWS is S3
   only. Aurora/EKS are self-host proof and stay off this path.
 - **API:** the existing Cloudflare Worker. A driver seam swaps its Neon HTTP
-  driver (`packages/relayhistory/src/db/client.ts`) for TCP node-postgres to
-  Supabase. Whether that TCP goes direct to Supavisor via `cloudflare:sockets`
-  or through Hyperdrive is decided by the benchmark. Queues and crons stay on
-  Cloudflare. helm-helper's node-postgres factory and row normalization carry
-  over. The Node/Hono server and the SQLite hold do not.
+  driver (`packages/relayhistory/src/db/client.ts`) for node-postgres over
+  TCP (`cloudflare:sockets`) straight to Supabase's Supavisor pooler.
+  Hyperdrive is not required. It is an optional later optimization (warm
+  pooled connections near the database), adopted only if the benchmark shows
+  direct TCP losing to Neon HTTP on p95. Queues and crons stay on Cloudflare.
+  helm-helper's node-postgres factory and row normalization carry over. The
+  Node/Hono server and the SQLite hold do not.
 
 ## Correctness rules for the split
 
@@ -51,13 +53,15 @@ copy-everything-then-switch runbook (linuyc, uncommitted
 
 ## Decisions still needed
 
-1. **Reads of pre-T0 data during the backfill (open):** fall back to Neon,
-   read-only, when a session or range isn't backfilled yet; or accept that
-   older history appears progressively.
-2. **API transport (open):** direct TCP or Hyperdrive. The benchmark decides.
+1. **Reads of pre-T0 data during the backfill (decided 2026-10-30):** read
+   from Neon. The fallback is read-only and covers only sessions or ranges from
+   before T0 that the backfill hasn't reached yet; no write ever routes to Neon
+   after T0. It is removed once the backfill passes the verifier thresholds.
+2. **API transport (decided 2026-10-30):** direct TCP to Supavisor;
+   Hyperdrive only if the benchmark justifies it.
 3. **Supabase compute and disk size** for the eventual 485.6 GiB plus growth.
-4. **Exact-action approvals**, each at its time: Worker database secret or
-   Hyperdrive config; the sequence fence; T0 cutover; starting the backfill.
+4. **Exact-action approvals**, each at its time: the Worker's Supabase
+   database secret; the sequence fence; T0 cutover; starting the backfill.
 
 ## Critical path to T0
 
@@ -66,10 +70,10 @@ copy-everything-then-switch runbook (linuyc, uncommitted
 | 1 | Decision record + this plan | 96-no-bull-migration @ sf-mac-mini | done (local) | 0001 + this file on `feat/supabase-production-migration` |
 | 2 | Schema/index parity test (relayhistory-cloud migrations vs. Supabase, including 0067) | 96-no-bull-migration @ sf-mac-mini | next | Failing test listing every gap, then green |
 | 3 | Port migrator + verifier + benchmarks from the linuyc dirty checkout into reviewed commits | 96-no-bull-migration @ sf-mac-mini | todo | Focused tests green on the clean branch |
-| 4 | Worker driver seam: TCP node-postgres behind a flag, Neon HTTP default; legacy contract suite on PostgreSQL 17 | helm-helper @ linuyc (proposed) | local partial | Contract suite green on PG17 for both drivers |
+| 4 | Worker driver seam: TCP node-postgres behind a flag, Neon HTTP default; pre-T0 read-only Neon fallback; legacy contract suite on PostgreSQL 17 | helm-helper @ linuyc (proposed) | local partial | Contract suite green on PG17 for both drivers |
 | 5 | 0067 agent index (push off `/tmp` as a draft PR), Cloud #5835, filter-to-index contract, read-only target readiness audit | helm-chart-chief @ linuyc (accepted) | in progress | 0067 draft PR; contract agreed with lane 2 |
 | 6 | Durable switch hold + ordered replay covering every writer | 96-no-bull-migration (accountable until assigned) | design | Writer inventory; synthetic-tenant hold/replay proof |
-| 7 | DB/API benchmarks, Neon vs. Supabase (direct and Hyperdrive) | 96-no-bull-migration @ sf-mac-mini | code exists | Supabase p95 no worse than Neon on each critical query |
+| 7 | DB/API benchmarks, Neon HTTP vs. Supabase direct TCP | 96-no-bull-migration @ sf-mac-mini | code exists | Supabase p95 no worse than Neon on each critical query |
 | 8 | T0 runbook + rollback | 96-no-bull-migration @ sf-mac-mini | todo | Reviewed runbook (below) |
 
 ## After T0
