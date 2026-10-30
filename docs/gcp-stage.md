@@ -1,10 +1,11 @@
 # GCP self-hosted reference lane
 
-This lane is a code-only conformance implementation. Static work does not wait
-on the AWS adapter freeze. Nothing in this document is evidence of a GCP
-deployment. No project, credentials, secret payload, DNS record, or cloud
-resource was created while implementing it. The only eligible target is the
-existing project `agentrelay-96bulls-soc2-2610`, number `955297012355`, parent
+This lane began as a code-only conformance implementation. On 2026-10-30 an
+approved substrate deployment and live in-cluster verification completed on
+merge commit `dac89b587debf0f64fc16cbbde23d8d818901daf`; the exact evidence is
+recorded below. It is not a product-route or Relaycast availability proof.
+The only eligible target is the existing project
+`agentrelay-96bulls-soc2-2610`, number `955297012355`, parent
 org `929835122282`, region `us-central1`, billing account
 `014D50-E96D1A-DE6360`. Do not create or select another project.
 
@@ -47,7 +48,8 @@ translation. Those logs are audit evidence, not an egress allowlist. This lane
 does not claim workload egress restriction or SOC 2 network conformance; a
 separately proven egress proxy/firewall policy is still required.
 
-Cloud SQL has not been created in this lane. On an approved apply, the stack
+Cloud SQL is now present and `RUNNABLE` in this lane. The successful
+reconciliation adopted it rather than inserting another instance. The stack
 prepares a SQL Admin `instances.insert`
 for public IPv4 off, the Private Service Access network and range, and
 `--private-ip` proxy routing. `ensurePrivateCloudSql` gets that instance or
@@ -261,7 +263,7 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
 
 - `privateCloudSqlSpec` builds the private-only insert body: `edition` pinned
   to `ENTERPRISE` for the custom-core tier, `ipv4Enabled` false,
-  `privateNetwork` set to `/projects/{project}/global/networks/{name}`,
+  `privateNetwork` set to `projects/{project}/global/networks/{name}`,
   `allocatedIpRange` set to the PSA range name, automated backups and
   point-in-time recovery enabled, and no authorized networks.
   Proxy args are `--private-ip`, `--address=0.0.0.0`, `--port=5432`, and the
@@ -307,15 +309,17 @@ Release boundaries that remain deliberate:
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
   is written.
-- No product create, write, read, indexed search, manifest replay, or teardown
-  has run on GCP. A partial substrate apply did run; its incomplete state is
-  recorded below and must be reconciled rather than bootstrapped again.
+- No product create, write, read, indexed search, manifest replay, or product
+  teardown has run on GCP. The substrate is reconciled and its provider-path
+  proof is recorded below; that does not close the application gaps.
 
 ## Apply, verify, and teardown
 
-End-to-end apply, verification, and teardown have not completed. A separately
-approved substrate apply did execute partially on 2026-10-30. Static work does
-not wait on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down`
+The substrate deployment and its live provider-path verification completed on
+2026-10-30. The application charts remained disabled, so product create,
+indexed search, manifest replay, application database access, Relaycast
+availability, and full product teardown remain unproved. Static work does not
+wait on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down`
 refuse every `gcp-*` stage. `bin/96bulls plan gcp-*` calls
 `bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
 and is not proof. A non-zero Alchemy status exits the wrapper with that
@@ -364,14 +368,58 @@ downstream PSA connection. A corrective plan then showed five creates, 22
 in-place updates, two gated actions, and no replacement or delete. A subsequent
 live attempt showed Memorystore rejecting a short network name while SQL Admin
 accepted the canonical private network and began creating the private-only
-Cloud SQL instance. No evidence confirms that instance reached `RUNNABLE`.
+Cloud SQL instance. At that point no evidence confirmed that instance reached
+`RUNNABLE`.
 PRs #36 and #39 contain the contemporaneous evidence; PR #41 added Redis TLS
 readiness in code and tests only.
 
-Treat the project as partially applied. Do not bootstrap another state bucket,
-blindly enable APIs, or assume the graph is absent. First inventory and adopt
-the existing resources, confirm Cloud SQL state, and reconcile the recorded
-failures. No teardown or database mutation was performed by those attempts.
+The corrective deployment at `dac89b5` then reconciled this partial state. Its
+detailed plan contained 33 in-place updates and four gated actions, with no
+create, replacement, or delete. The provider rendered stable names and project
+values as `known after apply`, so a following plan still displays those same
+updates; that is not accepted as a no-op claim. The deploy completed 37/37
+operations successfully. The Cloud SQL action adopted the matching existing
+instance (`created: false`, `operation: null`) instead of posting another
+instance. The Redis CA lookup and node `actAs` preflight also passed.
+
+Post-deploy inventory confirmed:
+
+- GKE `awf-conformance-gke` is `RUNNING` with one node, private endpoint
+  `172.20.0.2`, and workload pool
+  `agentrelay-96bulls-soc2-2610.svc.id.goog`;
+- Cloud SQL `awf-conformance-postgres` is `RUNNABLE`, PostgreSQL 17,
+  `ipv4Enabled: false`, with only private address `10.80.0.3`, canonical VPC
+  `awf-conformance-vpc`, and PSA range `awf-conformance-psa`;
+- Memorystore `awf-conformance-redis` is `READY`, Redis 7.2, BASIC 1 GiB,
+  AUTH off, and `SERVER_AUTHENTICATION` on private address `10.80.7.195:6378`;
+- the versioned uniform-access Locker bucket, state bucket, immutable Artifact
+  Registry repository, regional Secret Manager container, Pub/Sub topics and
+  subscription, runtime/node/runner service accounts, VPC, subnet, NAT, and PSA
+  allocation all exist in the approved project.
+
+A short-lived private verifier VM used the named runner identity to create a
+temporary namespace only after proving namespace `96bulls` did not already
+exist. A Job ran as Kubernetes service account `96bulls-worker`, resolving the
+existing runtime Google service account through Workload Identity. From that
+pod it proved all of the following live paths:
+
+1. the metadata identity was exactly
+   `awf-conformance-runtime@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com`;
+2. Redis returned `PONG` over TLS with the exact Redis Admin service CA;
+3. the private Cloud SQL address accepted TCP on port 5432;
+4. the runtime identity wrote, read, and deleted a marker in the Locker bucket;
+5. the runtime identity published, pulled, and acknowledged a marker through
+   the configured Pub/Sub topic and subscription.
+
+The Cloud SQL check established private transport reachability only. It did
+not present database credentials, authenticate, or execute a SQL query.
+
+Verification cleanup completed: the temporary namespace and Job were deleted,
+the GCS marker was deleted, the Pub/Sub marker was acknowledged, the verifier
+VM was deleted, and the temporary `roles/container.developer` binding was
+removed from the runner identity. The managed substrate remains deployed for
+the still-unproved application lane. No secret payload, database credential,
+public endpoint, DNS record, or application chart was introduced.
 
 Read-only preflight:
 
