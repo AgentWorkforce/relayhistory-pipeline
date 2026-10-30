@@ -107,8 +107,10 @@ with SHA-256
 and image
 `ghcr.io/agentworkforce/relaycast-self-host@sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98`.
 The stack verifies the package bytes before provider resolution, extracts those
-verified bytes into a deterministic digest-addressed directory, and renders
-that local chart rather than re-resolving a mutable
+verified bytes into a deterministic digest-addressed directory, validates its
+content manifest before reuse, and never deletes or replaces an active cache.
+Concurrent invocations serialize first population and render that local chart
+rather than re-resolving a mutable
 repository index. Ingress and GKE ManagedCertificate are disabled. The service
 is ClusterIP and the chart NetworkPolicy accepts callers only from its
 namespace. `baseUrl` remains the chart-required signed-URL authority; it does
@@ -175,8 +177,12 @@ records the token digest in both a stage-scoped local ledger and an
 `ifGenerationMatch=0` marker under the existing Alchemy state bucket. The
 state-bucket marker makes the nonce single-use across executors and machines;
 it contains only proof metadata and a digest, never the token. Tokens older
-than five minutes, expiring tokens, wrong-stage/project/identity tokens, and
-replays are refused. The token is read only by the apply-time Action and is not
+than five minutes, tokens with less than twenty minutes remaining,
+wrong-stage/project/identity tokens, and replays are refused. A fifteen-minute
+Effect deadline interrupts the whole stack before the signed mutation lease
+expires; the remaining five minutes are safety margin. Late actAs, Cloud SQL,
+and Kubernetes actions recheck the fixed lease deadline. The token is read
+only by the apply-time Action and is not
 written to Alchemy inputs, outputs, state, annotations, or errors. Its digest
 changes the Action input and gates every declared GCP and Kubernetes mutation.
 Plan does not execute or consume the nonce Action and performs no cloud
@@ -216,7 +222,9 @@ Before evaluating a Relaycast stage, place the exact public release artifact at
 digest-mismatched package before constructing the Alchemy Stack, provider
 layers, or state backend. It reads the source artifact once, verifies those
 captured bytes, and extracts only that buffer to a SHA-256-addressed cache
-path; it never reopens the source between verification and extraction. The
+path; it never reopens the source between verification and extraction. Cache
+population is atomic and serialized, and an existing cache is reused only
+after its extracted content digest validates. The
 pinned 8.0.0 image
 predates later workspace-bootstrap Secret support, so this lane does not pass
 an ineffective Secret setting. There is no Relaycast Ingress, load balancer,
