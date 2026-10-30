@@ -177,6 +177,7 @@ const INSERT_BODY_KEYS = new Set(["name", "region", "databaseVersion", "settings
 const INSERT_SETTINGS_KEYS = new Set(["tier", "availabilityType", "ipConfiguration"]);
 const INSERT_IP_KEYS = new Set(["ipv4Enabled", "privateNetwork", "allocatedIpRange"]);
 const PRIVATE_NETWORK = /^\/projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
+const RETURNED_PRIVATE_NETWORK = /^\/?projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
 const OPERATION_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 export interface SqlAdminInsertRequest {
@@ -373,6 +374,13 @@ function createdMismatch(projectId: string, instanceName: string): never {
   );
 }
 
+function samePrivateNetwork(expected: string, actual: unknown): boolean {
+  if (typeof actual !== "string") return false;
+  const wanted = RETURNED_PRIVATE_NETWORK.exec(expected);
+  const found = RETURNED_PRIVATE_NETWORK.exec(actual);
+  return Boolean(wanted && found && wanted[1] === found[1] && wanted[2] === found[2]);
+}
+
 function classifyExisting(spec: PrivateCloudSqlSpec, body: unknown): "match" | "public" | "not-ready" | "mismatch" {
   const record = asRecord(body);
   const settings = asRecord(record?.settings);
@@ -393,7 +401,7 @@ function classifyExisting(spec: PrivateCloudSqlSpec, body: unknown): "match" | "
     settings?.tier === spec.insertBody.settings.tier &&
     settings.availabilityType === spec.insertBody.settings.availabilityType &&
     ip?.ipv4Enabled === false &&
-    ip.privateNetwork === spec.privateNetwork &&
+    samePrivateNetwork(spec.privateNetwork, ip.privateNetwork) &&
     ip.allocatedIpRange === spec.allocatedIpRange &&
     networksEmpty &&
     addressesPrivate;
@@ -488,12 +496,21 @@ export async function ensurePrivateCloudSql(
   const inserted = await ask(transport, { method: "POST", url: request.url, body: request.body }, credential);
   if (inserted === "thrown") uncertain(projectId, instanceName);
   if (inserted.status === 409) {
-    const again = await ask(transport, getCall, credential);
-    if (again === "thrown" || again.status !== 200) uncertain(projectId, instanceName);
-    const kind = classifyExisting(spec, again.body);
-    if (kind === "match") return { created: false, operation: null };
-    if (kind === "not-ready") rejectNotReady(projectId, instanceName);
-    rejectAdoption(projectId, instanceName);
+    const started = clock.now();
+    for (let attempt = 0; attempt < clock.maxPolls; attempt += 1) {
+      if (clock.now() - started >= clock.deadlineMs) timedOut(projectId, instanceName);
+      const again = await ask(transport, getCall, credential);
+      if (again === "thrown") uncertain(projectId, instanceName);
+      if (again.status === 200) {
+        const kind = classifyExisting(spec, again.body);
+        if (kind === "match") return { created: false, operation: null };
+        if (kind !== "not-ready") rejectAdoption(projectId, instanceName);
+      } else if (again.status !== 404) {
+        uncertain(projectId, instanceName);
+      }
+      await clock.sleep(clock.intervalMs);
+    }
+    timedOut(projectId, instanceName);
   }
   if (inserted.status !== 200) uncertain(projectId, instanceName);
   const operationId = operationIdOf(inserted.body);

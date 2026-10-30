@@ -238,6 +238,12 @@ describe("SQL Admin idempotent poster", () => {
     const spec = privateCloudSqlSpec(input);
     const omitted = scripted([{ status: 200, body: matchingInstance(spec, {}, true) }]);
     const empty = scripted([{ status: 200, body: matchingInstance(spec) }]);
+    const apiPath = scripted([
+      {
+        status: 200,
+        body: matchingInstance(spec, { privateNetwork: spec.privateNetwork.slice(1) }),
+      },
+    ]);
     await expect(ensurePrivateCloudSql(spec, credential, omitted.transport, fastPoll())).resolves.toEqual({
       created: false,
       operation: null,
@@ -246,8 +252,13 @@ describe("SQL Admin idempotent poster", () => {
       created: false,
       operation: null,
     });
+    await expect(ensurePrivateCloudSql(spec, credential, apiPath.transport, fastPoll())).resolves.toEqual({
+      created: false,
+      operation: null,
+    });
     expect(omitted.calls.map((call) => call.method)).toEqual(["GET"]);
     expect(empty.calls.map((call) => call.method)).toEqual(["GET"]);
+    expect(apiPath.calls.map((call) => call.method)).toEqual(["GET"]);
     expect(spec.posted).toBe(false);
     expect(JSON.stringify(omitted.calls)).not.toContain(token);
     expect(omitted.seenBearers).toEqual([token]);
@@ -289,13 +300,32 @@ describe("SQL Admin idempotent poster", () => {
     const poster = scripted([
       { status: 404 },
       { status: 409, body: { error: { message: token } } },
-      { status: 200, body: matchingInstance(spec) },
+      { status: 404 },
+      { status: 200, body: { ...matchingInstance(spec), state: "PENDING_CREATE" } },
+      {
+        status: 200,
+        body: matchingInstance(spec, { privateNetwork: spec.privateNetwork.slice(1) }),
+      },
     ]);
     await expect(ensurePrivateCloudSql(spec, credential, poster.transport, fastPoll())).resolves.toEqual({
       created: false,
       operation: null,
     });
-    expect(poster.calls.map((call) => call.method)).toEqual(["GET", "POST", "GET"]);
+    expect(poster.calls.map((call) => call.method)).toEqual(["GET", "POST", "GET", "GET", "GET"]);
+  });
+
+  test("bounds a 409 race that never becomes runnable", async () => {
+    const spec = privateCloudSqlSpec(input);
+    const poster = scripted([
+      { status: 404 },
+      { status: 409 },
+      { status: 200, body: { ...matchingInstance(spec), state: "PENDING_CREATE" } },
+      { status: 200, body: { ...matchingInstance(spec), state: "PENDING_CREATE" } },
+    ]);
+    await expect(
+      ensurePrivateCloudSql(spec, credential, poster.transport, fastPoll({ maxPolls: 2 })),
+    ).rejects.toThrow(/timed out.*reconcile.*before retry or teardown/);
+    expect(poster.calls.map((call) => call.method)).toEqual(["GET", "POST", "GET", "GET"]);
   });
 
   test("refuses public fallback and a mismatched instance before any insert", async () => {
