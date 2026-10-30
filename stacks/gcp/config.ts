@@ -26,6 +26,33 @@ export const GCP_REDIS_CLIENT = {
   transitEncryption: "SERVER_AUTHENTICATION",
 } as const;
 
+/**
+ * Shape the installed Alchemy provider can actually post.
+ * Autopilot create omits node pools, so a node service account would not be
+ * sent and `disallowDefaultComputeServiceAccount` would deny the cluster.
+ * Standard mode posts that account on the default pool. NAT uses one reserved
+ * address and logs every translation. The control-plane endpoint is private;
+ * operator CIDRs are the only authorized networks.
+ */
+export const GCP_RUNTIME_SHAPE = {
+  privateEndpoint: true,
+  autopilot: false,
+  machineType: "e2-medium",
+  initialNodeCount: 1,
+  natIpAllocateOption: "MANUAL_ONLY",
+  natLogFilter: "ALL",
+  nodeOauthScope: "https://www.googleapis.com/auth/cloud-platform",
+} as const;
+
+/** Node identity only. Not the Workload Identity runtime account, and not a key. */
+export const GCP_NODE_ROLES = [
+  "roles/logging.logWriter",
+  "roles/monitoring.metricWriter",
+  "roles/monitoring.viewer",
+  "roles/stackdriver.resourceMetadata.writer",
+  "roles/artifactregistry.reader",
+] as const;
+
 export function isPublishedHelmRepo(repo: string | undefined): boolean {
   if (!repo) return true;
   let url: URL;

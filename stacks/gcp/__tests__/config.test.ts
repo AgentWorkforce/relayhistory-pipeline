@@ -1,8 +1,11 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "bun:test";
 import {
   assertGcpInputs,
   assertGcpRuntimeDeployable,
   GCP_APPROVED_TARGET,
+  GCP_NODE_ROLES,
+  GCP_RUNTIME_SHAPE,
   bulls96ReleaseValues,
   gcpResourceName,
   pubsubServiceAgent,
@@ -226,6 +229,25 @@ describe("GCP self-host contract", () => {
       "service-123456789012@gcp-sa-pubsub.iam.gserviceaccount.com",
     );
     expect(() => pubsubServiceAgent("project-name")).toThrow("projectNumber is invalid");
+  });
+
+  it("posts a provider-compatible private runtime shape", () => {
+    expect(GCP_RUNTIME_SHAPE.privateEndpoint).toBe(true);
+    expect(GCP_RUNTIME_SHAPE.autopilot).toBe(false);
+    expect(GCP_RUNTIME_SHAPE.natIpAllocateOption).toBe("MANUAL_ONLY");
+    expect(GCP_RUNTIME_SHAPE.natLogFilter).toBe("ALL");
+    expect(GCP_NODE_ROLES).not.toContain("roles/editor");
+    expect(GCP_NODE_ROLES).not.toContain("roles/owner");
+    const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+    expect(stack).toContain("enablePrivateEndpoint: GCP_RUNTIME_SHAPE.privateEndpoint");
+    expect(stack).toContain("autopilot: GCP_RUNTIME_SHAPE.autopilot");
+    expect(stack).toContain("serviceAccount: nodeIdentity.email");
+    expect(stack).toContain("natIpAllocateOption: GCP_RUNTIME_SHAPE.natIpAllocateOption");
+    expect(stack).toContain("filter: GCP_RUNTIME_SHAPE.natLogFilter");
+    expect(stack).toContain("purpose: \"VPC_PEERING\"");
+    expect(stack).not.toContain("AUTO_ONLY");
+    expect(stack).not.toContain("enablePrivateEndpoint: false");
+    expect(stack).not.toContain("Shared VPC");
   });
 
   it("rejects an unpublished Relaycast chart version or repository", () => {

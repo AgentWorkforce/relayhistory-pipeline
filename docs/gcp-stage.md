@@ -15,9 +15,14 @@ implementations own provider adapters.
 
 ## Declared substrate
 
-- regional GKE Autopilot with private nodes, Workload Identity Federation,
-  Dataplane V2, Shielded Nodes, VPC-native pod/service ranges, Cloud NAT, and
-  VPC flow logs;
+- regional standard GKE, not Autopilot. The installed provider omits node
+  pools from an Autopilot create, so a node service account would not be sent
+  and `disallowDefaultComputeServiceAccount` would deny the cluster. Private
+  nodes, a private control-plane endpoint, operator CIDRs only, Workload
+  Identity Federation, Dataplane V2, Shielded Nodes, VPC-native ranges, one
+  reserved NAT address with translation logs, and VPC flow logs. The node
+  identity is a dedicated service account with no key. Private Service Access
+  stays project-local peering, not Shared VPC;
 - versioned GCS Locker bucket with uniform bucket-level access;
 - private Artifact Registry repository with immutable tags;
 - a regional Secret Manager secret container (metadata only; no payload enters
@@ -123,8 +128,9 @@ or secret payload. Example:
 `assertGcpInputs` accepts only those five target fields. `agentworkforce-dev1`
 and any other project, number, org, billing account, or region are refused
 before resources are declared. `203.0.113.10/32` is a documentation address.
-Replace it with the operator or VPN range. That replacement is not clearance
-to apply.
+Replace it with the operator or VPN range that can route to the private
+control-plane endpoint. A public laptop address cannot reach that endpoint.
+That replacement is not clearance to apply.
 
 Before any plan, authenticate with the intended GCP identity and confirm the
 project independently:

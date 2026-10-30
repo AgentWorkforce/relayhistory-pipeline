@@ -20,6 +20,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   GCP_CONFIRM_PROJECT_ENV,
+  GCP_NODE_ROLES,
+  GCP_RUNTIME_SHAPE,
   assertGcpInputs,
   assertGcpRuntimeDeployable,
   bulls96ReleaseValues,
@@ -185,6 +187,14 @@ export default Alchemy.Stack(
       ],
       logConfig: { enable: true, aggregationInterval: "INTERVAL_5_SEC", flowSampling: 0.5, metadata: "INCLUDE_ALL_METADATA" },
     });
+    const natAddress = yield* GCP.Compute.Address("nat-address", {
+      addressName: gcpResourceName(stage, "nat", 63),
+      region: i.region,
+      addressType: "EXTERNAL",
+      networkTier: "PREMIUM",
+      description: `AgentWorkforce ${stage} auditable NAT address`,
+      labels: labels(stage, "nat"),
+    });
     yield* GCP.Compute.Router("nat", {
       routerName: gcpResourceName(stage, "nat", 63),
       region: i.region,
@@ -195,8 +205,9 @@ export default Alchemy.Stack(
           name: gcpResourceName(stage, "egress", 63),
           sourceSubnetworkIpRangesToNat: "LIST_OF_SUBNETWORKS",
           subnetworks: [{ name: subnet.subnetworkName, sourceIpRangesToNat: ["ALL_IP_RANGES"] }],
-          natIpAllocateOption: "AUTO_ONLY",
-          logConfig: { enable: true, filter: "ERRORS_ONLY" },
+          natIpAllocateOption: GCP_RUNTIME_SHAPE.natIpAllocateOption,
+          natIps: [natAddress.selfLink.as<string>()],
+          logConfig: { enable: true, filter: GCP_RUNTIME_SHAPE.natLogFilter },
         },
       ],
     });
@@ -209,11 +220,28 @@ export default Alchemy.Stack(
       prefixLength: 20,
       description: `AgentWorkforce ${stage} managed-service peering`,
     });
+    // Project-local Private Service Access peering for this isolated project.
     const privateServices = yield* GCP.ServiceNetworking.Connection("private-services", {
       network: network.networkName,
       reservedPeeringRanges: [psaRange.addressName],
       deletionPolicy: "DELETE",
     });
+
+    const nodeAccountId = gcpResourceName(stage, "nodes", 30);
+    const nodeIdentity = yield* GCP.IAM.ServiceAccount("node-identity", {
+      accountId: nodeAccountId,
+      displayName: `AgentWorkforce ${stage} nodes`,
+      description: "Dedicated GKE node identity. No keys.",
+    });
+    const nodeMember = Output.interpolate`serviceAccount:${nodeIdentity.email}`;
+    for (const role of GCP_NODE_ROLES) {
+      yield* GCP.IAM.Member(`node-${role.split("/")[1]!.replaceAll(".", "-")}`, {
+        kind: "project",
+        name: i.projectId,
+        role,
+        member: nodeMember,
+      });
+    }
 
     const cluster = yield* GCP.Container.Cluster("cluster", {
       clusterId: gcpResourceName(stage, "gke"),
@@ -229,7 +257,7 @@ export default Alchemy.Stack(
       },
       privateClusterConfig: {
         enablePrivateNodes: true,
-        enablePrivateEndpoint: false,
+        enablePrivateEndpoint: GCP_RUNTIME_SHAPE.privateEndpoint,
         masterIpv4CidrBlock: "172.20.0.0/28",
         masterGlobalAccessConfig: { enabled: false },
       },
@@ -237,7 +265,12 @@ export default Alchemy.Stack(
         enabled: true,
         cidrBlocks: i.controlPlaneAuthorizedCidrs,
       },
-      autopilot: true,
+      // The provider omits node pools when autopilot is true, so this stays false.
+      autopilot: GCP_RUNTIME_SHAPE.autopilot,
+      serviceAccount: nodeIdentity.email,
+      machineType: GCP_RUNTIME_SHAPE.machineType,
+      initialNodeCount: GCP_RUNTIME_SHAPE.initialNodeCount,
+      oauthScopes: [GCP_RUNTIME_SHAPE.nodeOauthScope],
       datapathProvider: "ADVANCED_DATAPATH",
       enableShieldedNodes: true,
       releaseChannel: "STABLE",
