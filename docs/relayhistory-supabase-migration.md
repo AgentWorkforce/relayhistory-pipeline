@@ -1,5 +1,12 @@
 # RelayHistory (Neon) to Supabase: critical path
 
+> **Superseded in part by `docs/decisions/0002-relayhistory-onto-the-pipeline.md`
+> (Khaliq, 2026-10-30).** Session content moves to S3 in the 96Bulls layout,
+> and Supabase holds only the index. The content-table copy, catalog
+> reprojection and rollup rebuild below are no longer the production path.
+> The T0 gate and hold, fences, guards and deletion handling still apply. A
+> revised plan for the export-based backfill follows 0002.
+
 Updated 2026-10-30 by `96-no-bull-migration` (sf-mac-mini). This plan applies
 `docs/decisions/0001-production-data-plane.md` and does not authorize any
 production action. Moving data, changing secrets/IAM/DNS, deploying, merging

@@ -1,5 +1,12 @@
 # RelayHistory T0 runbook: Neon to Supabase
 
+> **Superseded in part by `docs/decisions/0002-relayhistory-onto-the-pipeline.md`.**
+> History is exported to S3 in the pipeline layout, and Supabase holds only the
+> index. Steps that copy content tables into Supabase, reproject the catalog or
+> rebuild rollups (13, 13b and parts of 14) are not the production path. The
+> approvals, gate, hold, fences, drain, flip and rollback structure still apply
+> and will be revised with the export plan.
+
 Owner: `96-no-bull-migration`. Target date: 2026-10-31. The design is in
 `docs/relayhistory-supabase-migration.md` and `docs/relayhistory-t0-write-hold.md`.
 
