@@ -15,6 +15,7 @@ import {
   loadCheckpoint,
   loadFence,
   planHash,
+  prepareGuardedTargetSession,
   prepareTargetSession,
   type Queryable,
 } from "../../../src/migration/relayhistory-copy.js";
@@ -434,6 +435,100 @@ describe("target session", () => {
     };
     await expect(prepareTargetSession(refusing)).rejects.toThrow(
       "could not disable triggers",
+    );
+  });
+});
+
+describe("guarded target session (mirror without session_replication_role)", () => {
+  const GUARD = `CREATE FUNCTION sessions.upload_cleanup_ready() RETURNS boolean LANGUAGE sql AS 'SELECT true';
+    CREATE FUNCTION sessions.guard_delivery_cleanup() RETURNS trigger LANGUAGE plpgsql AS
+      $$ BEGIN IF NOT sessions.upload_cleanup_ready() THEN RAISE EXCEPTION 'upload_cleanup_not_ready'; END IF;
+         RETURN COALESCE(NEW, OLD); END $$;
+    CREATE TABLE sessions.delivery_origins (org_id text NOT NULL, id bigint NOT NULL, PRIMARY KEY (org_id, id));
+    CREATE TRIGGER guard_delivery_origin_cleanup BEFORE INSERT OR UPDATE OR DELETE ON sessions.delivery_origins
+      FOR EACH ROW EXECUTE FUNCTION sessions.guard_delivery_cleanup();`;
+
+  it("accepts tables with no triggers or only reviewed guards, then mirrors with live triggers", async () => {
+    await Promise.all([source.exec(GUARD), target.exec(GUARD)]);
+    await source.exec(`INSERT INTO sessions.delivery_origins VALUES ('a', 1), ('a', 2)`);
+    await target.exec(`INSERT INTO sessions.delivery_origins VALUES ('a', 3)`);
+    await insert(source, `('a', 1, NULL, NULL, NULL, NULL, NULL, 'h')`);
+    await prepareGuardedTargetSession(target as Queryable, ["tokens", "delivery_origins"]);
+    for (const table of ["tokens", "delivery_origins"]) {
+      const plan = await planTable(source as Queryable, target as Queryable, table);
+      await copyTable(source as Queryable, target as Queryable, plan, { mode: "mirror", chunkSize: 10 });
+    }
+    expect((await target.query("SELECT id::text FROM sessions.delivery_origins ORDER BY id")).rows).toEqual([
+      { id: "1" },
+      { id: "2" },
+    ]);
+    expect((await dump(target)).map((row) => row.label)).toEqual(["h"]);
+    expect((await target.query("SHOW session_replication_role")).rows).toEqual([
+      { session_replication_role: "origin" },
+    ]);
+  });
+
+  it("refuses a table with a trigger that is not a reviewed guard", async () => {
+    await target.exec(`CREATE TABLE sessions.wakeups (id bigint);
+      CREATE FUNCTION sessions.wake() RETURNS trigger LANGUAGE plpgsql AS
+        $$ BEGIN INSERT INTO sessions.wakeups VALUES (NEW.id); RETURN NEW; END $$;
+      CREATE TRIGGER wake AFTER INSERT ON sessions.tokens FOR EACH ROW EXECUTE FUNCTION sessions.wake();`);
+    await expect(prepareGuardedTargetSession(target as Queryable, ["tokens"])).rejects.toThrow(
+      "not reviewed guards: tokens.wake",
+    );
+  });
+
+  it("refuses a guard name bound to a different function", async () => {
+    await target.exec(`CREATE FUNCTION sessions.upload_cleanup_ready() RETURNS boolean LANGUAGE sql AS 'SELECT true';
+      CREATE TABLE sessions.delivery_origins (org_id text NOT NULL, id bigint NOT NULL, PRIMARY KEY (org_id, id));
+      CREATE FUNCTION sessions.wake() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+      CREATE TRIGGER guard_delivery_origin_cleanup BEFORE INSERT ON sessions.delivery_origins
+        FOR EACH ROW EXECUTE FUNCTION sessions.wake();`);
+    await expect(
+      prepareGuardedTargetSession(target as Queryable, ["delivery_origins"]),
+    ).rejects.toThrow("not reviewed guards: delivery_origins.guard_delivery_origin_cleanup");
+  });
+
+  it("ignores disabled and replica-only triggers, which do not fire for this session", async () => {
+    await target.exec(`CREATE FUNCTION sessions.wake() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+      CREATE TRIGGER off_t BEFORE INSERT ON sessions.tokens FOR EACH ROW EXECUTE FUNCTION sessions.wake();
+      CREATE TRIGGER replica_t BEFORE INSERT ON sessions.tokens FOR EACH ROW EXECUTE FUNCTION sessions.wake();
+      ALTER TABLE sessions.tokens DISABLE TRIGGER off_t;
+      ALTER TABLE sessions.tokens ENABLE REPLICA TRIGGER replica_t;`);
+    await expect(prepareGuardedTargetSession(target as Queryable, ["tokens"])).resolves.toBeUndefined();
+  });
+
+  it("refuses an ALWAYS trigger, which fires even under replica", async () => {
+    await target.exec(`CREATE FUNCTION sessions.wake() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+      CREATE TRIGGER always_t BEFORE INSERT ON sessions.tokens FOR EACH ROW EXECUTE FUNCTION sessions.wake();
+      ALTER TABLE sessions.tokens ENABLE ALWAYS TRIGGER always_t;`);
+    await expect(prepareGuardedTargetSession(target as Queryable, ["tokens"])).rejects.toThrow(
+      "tokens.always_t",
+    );
+  });
+
+  it("refuses tables that take part in a foreign key, as parent or child", async () => {
+    await target.exec(`CREATE TABLE sessions.children (org_id text, id bigint,
+      FOREIGN KEY (org_id, id) REFERENCES sessions.tokens (org_id, id) ON DELETE CASCADE);`);
+    await expect(prepareGuardedTargetSession(target as Queryable, ["tokens"])).rejects.toThrow(
+      "foreign key: tokens",
+    );
+    await expect(prepareGuardedTargetSession(target as Queryable, ["children"])).rejects.toThrow(
+      "foreign key: children",
+    );
+  });
+
+  it("refuses the guard's table until upload cleanup is ready", async () => {
+    await target.exec(GUARD.replace("'SELECT true'", "'SELECT false'"));
+    await expect(
+      prepareGuardedTargetSession(target as Queryable, ["delivery_origins"]),
+    ).rejects.toThrow("upload cleanup rollout ready");
+  });
+
+  it("refuses a session already in replica", async () => {
+    await target.exec("SET session_replication_role = replica");
+    await expect(prepareGuardedTargetSession(target as Queryable, ["tokens"])).rejects.toThrow(
+      "session_replication_role = origin",
     );
   });
 });
