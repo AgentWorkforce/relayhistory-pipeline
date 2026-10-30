@@ -95,11 +95,13 @@ choice: unset and `s3` stay S3, `r2` stays R2, and `PIPELINE_RAW_PROVIDER=gcs`
 builds the GCS adapter when the bucket is set and HMAC keys are absent. Any
 other name stays unconfigured.
 
-`bulls96.enabled` currently fails closed before the first provider resource.
-Memorystore `SERVER_AUTHENTICATION` needs the service CA, a CA-aware runtime
-client, and an in-VPC TLS round trip; static environment strings are not that
-proof. Managed Redis may be created only as acknowledged external adapter-test
-infrastructure and is not wired into 96Bulls.
+`bulls96.enabled` requires the acknowledged managed data plane, an external
+runtime Secret, and a dockerconfigjson image-pull Secret. After Memorystore is
+`READY`, an apply-time Action reads its public service-CA bundle from the exact
+Redis Admin resource and passes that bundle to the chart. `/readyz` and
+`/datapathz` perform a CA-validated, passwordless Redis `PING`; static
+`SERVER_AUTHENTICATION` environment strings are not accepted as proof. Redis
+is a conformance/readiness dependency here, not the pipeline queue or cache.
 
 Relaycast, when configured, uses the exact published chart `0.1.0` package
 with SHA-256
@@ -151,6 +153,24 @@ or secret payload. Example:
   }
 }
 ```
+
+To request the application release after its external Secrets exist, set
+`managedDataPlane` to the acknowledged provisioned form and add:
+
+```json
+"bulls96": {
+  "enabled": true,
+  "chartVersion": "0.3.0",
+  "tenantOrgId": "org_replace_me",
+  "existingSecretName": "96bulls-runtime",
+  "imagePullSecretName": "ghcr-pull",
+  "imageDigest": "sha256:<digest-built-from-the-reviewed-main-commit>",
+  "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json"
+}
+```
+
+Those are names and identifiers only. Secret payloads never belong in this
+file or Helm values.
 
 `assertGcpInputs` accepts only those five target fields. `agentworkforce-dev1`
 and any other project, number, org, billing account, or region are refused
@@ -261,17 +281,17 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
   successful poster output, rather than a static `posted` flag.
   The PSA range is still shared with Memorystore.
 - An omitted or `enabled: false` bulls96 block does not throw and does not
-  install the release. Stack evaluation rejects `bulls96.enabled` even with the
-  acknowledged managed data plane until the external Redis TLS contract is
-  implemented. Nothing in that path has been applied.
+  install the release. An enabled block emits the release only with the
+  acknowledged managed data plane and named external Secrets. Nothing in that
+  path has been applied by this code change.
 
-Release wiring that remains deliberately blocked:
+Release boundaries that remain deliberate:
 
-- 96Bulls Helm values are not emitted. The Redis CA/client/round-trip gate
-  rejects `bulls96.enabled` before cloud provider resolution. The runtime
-  service account is not granted `secretAccessor`.
-- Existing `/readyz` and `/datapathz` checks do not claim a TLS connection to
-  Memorystore. The S3 default is unchanged.
+- The runtime service account is not granted `secretAccessor`; Kubernetes
+  Secrets remain externally populated. The private image requires the named
+  image-pull Secret.
+- `/readyz` and `/datapathz` require a real CA-validated Redis `PING` only when
+  the GCP data-path probe is armed. The S3 default is unchanged.
 - Relaycast stays `replicaCount: 1`, `runtime.backend: sqlite`, and
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
@@ -371,14 +391,14 @@ Verify, only after an approved apply and a wired poster:
 
 1. `gcloud sql instances describe INSTANCE --project="$PROJECT" --format='yaml(ipAddresses,settings.ipConfiguration)'` shows `ipv4Enabled: false`, the VPC `privateNetwork`, the PSA `allocatedIpRange`, and no `authorizedNetworks` or public address.
 2. The in-cluster proxy args start with `--private-ip`, and its Workload Identity binding exists only with that proxy.
-3. Treat Redis as external and unattached. Before removing the code gate,
-   obtain its CA, implement CA-aware client configuration, and prove a TLS
-   round trip from the workload.
-4. Only after that follow-up code exists, run the object-store suite against
-   GCS under Workload Identity and create, write, read, search, and replay one
-   planted session through 96Bulls.
-5. Prove Pub/Sub redelivery and Redis reconnect behavior only after the runtime
-   adapter gate is removed by reviewed code.
+3. Confirm the Redis Admin CA lookup returned only public certificates, then
+   require `/datapathz` to pass a CA-validated `PING` from every workload. No
+   `REDIS_AUTH`, `REDIS_PASSWORD`, or HMAC value may exist.
+4. Run the object-store suite against GCS under Workload Identity. A separate
+   relayhistory contract is still required before claiming create, indexed
+   search, and manifest replay through product routes.
+5. Prove Pub/Sub redelivery and Redis reconnect behavior. A readiness probe is
+   not evidence that either service is a pipeline business-data adapter.
 
 Teardown, only after that apply, in this order:
 

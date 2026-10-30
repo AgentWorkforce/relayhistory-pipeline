@@ -4,8 +4,9 @@
  * This is code-only until Khaliq separately clears a project. It deliberately
  * keeps secret payloads out of Alchemy inputs/state. Relaycast stays
  * single-node SQLite. Managed GCS, private Cloud SQL (not posted through
- * GCP.SQL.Instance), Redis, and Pub/Sub remain adapter-test infrastructure;
- * 96Bulls installation is held until the Redis TLS client contract is proven.
+ * GCP.SQL.Instance), Redis, and Pub/Sub remain adapter-test infrastructure.
+ * The optional 96Bulls release resolves Memorystore's public CA and requires
+ * a live TLS PING in workload readiness; secret payloads remain external.
  * Production stays Supabase and AWS S3.
  */
 import * as Alchemy from "alchemy";
@@ -62,6 +63,7 @@ import {
   type GcpApplyAuthorizationProof,
 } from "./apply-authorization.ts";
 import { requireServiceAccountActAs, type ServiceAccountActAsProof } from "./iam-preflight.ts";
+import { fetchRedisServerCa, redisAdminFetchTransport } from "./redis-ca.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
@@ -90,6 +92,12 @@ interface RequireKubernetesReachabilityInput {
 interface RequireNodeActAsInput {
   projectId: string;
   serviceAccountEmail: string;
+  authorization: GcpApplyAuthorizationProof;
+}
+interface ResolveRedisServerCaInput {
+  projectId: string;
+  region: string;
+  instanceId: string;
   authorization: GcpApplyAuthorizationProof;
 }
 
@@ -240,6 +248,30 @@ const EnsurePrivateCloudSql = Alchemy.Action<
       created: result.created,
       operation: result.operation,
     };
+  }),
+);
+
+const ResolveRedisServerCa = Alchemy.Action<
+  "96Bulls.GCP.ResolveRedisServerCa",
+  ResolveRedisServerCaInput,
+  Awaited<ReturnType<typeof fetchRedisServerCa>>,
+  GCP.GcpEnvironment
+>("96Bulls.GCP.ResolveRedisServerCa", (input) =>
+  Effect.gen(function* () {
+    if (input.authorization.projectId !== input.projectId)
+      throw new Error("96bulls: Redis service CA lookup project is not authorized. Nothing was created or changed.");
+    if (input.authorization.expiresAt <= Math.floor(Date.now() / 1000))
+      throw new Error("96bulls: GCP apply authorization expired before the Redis service CA lookup. Nothing was created or changed.");
+    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
+    if (live.project !== input.projectId)
+      throw new Error("96bulls: Redis service CA lookup project differs from the resolved GCP project. Nothing was created or changed.");
+    return yield* Effect.tryPromise(() =>
+      fetchRedisServerCa(
+        input,
+        { bearer: Redacted.value(live.accessToken) },
+        redisAdminFetchTransport(),
+      ),
+    );
   }),
 );
 
@@ -580,6 +612,12 @@ export default Alchemy.Stack(
               ? { persistenceMode: "RDB", rdbSnapshotPeriod: "SIX_HOURS" }
               : { persistenceMode: "DISABLED" },
           });
+          const redisCa = yield* ResolveRedisServerCa("redis-service-ca", {
+            projectId: i.projectId,
+            region: i.region,
+            instanceId: redis.instanceId,
+            authorization: applyAuthorization,
+          });
           const deadLetters = yield* GCP.PubSub.Topic("dead-letters", {
             topicId: authorized(gcpResourceName(stage, "dead-letters", 63)),
             labels: labels(stage, "queue"),
@@ -630,7 +668,7 @@ export default Alchemy.Stack(
           return {
             sql,
             sqlPoster,
-            redis: { host: redis.host, port: redis.port },
+            redis: { host: redis.host, port: redis.port, caPem: redisCa.caPem },
             pubsub: {
               topic: eventsTopicName,
               subscription: eventsSubscriptionName,
@@ -816,6 +854,7 @@ export default Alchemy.Stack(
               cloudSqlConnectionName: dataPlane.sqlPoster.connectionName,
               redisHost: dataPlane.redis.host,
               redisPort: dataPlane.redis.port,
+              redisCaPem: dataPlane.redis.caPem,
               pubsubTopic: eventsTopicName,
               pubsubSubscription: eventsSubscriptionName,
               workloadIdentityEmail: runtimeEmail,

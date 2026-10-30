@@ -45,6 +45,8 @@ describe("GCP self-host contract", () => {
       chartVersion: "0.0.1",
       tenantOrgId: "https://user:password@example.com",
       existingSecretName: "not a secret name",
+      imagePullSecretName: "not a pull secret name",
+      imageDigest: "not-a-digest",
       relayauthJwksUrl: "http://user:password@attacker.example/jwks?token=secret",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
@@ -110,12 +112,14 @@ describe("GCP self-host contract", () => {
       );
   });
 
-  it("validates 96Bulls inputs but holds runtime wiring for the external Redis TLS proof", () => {
+  it("validates 96Bulls inputs and allows only the acknowledged managed runtime", () => {
     const bulls96 = {
       enabled: true,
       chartVersion: "0.3.0",
       tenantOrgId: "org_123",
       existingSecretName: "bulls96-runtime",
+      imagePullSecretName: "ghcr-pull",
+      imageDigest: `sha256:${"a".repeat(64)}`,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96 })).toThrow("managedDataPlane.provision");
@@ -126,6 +130,13 @@ describe("GCP self-host contract", () => {
         bulls96: { ...bulls96, tenantOrgId: "https://user:password@example.com" },
       }),
     ).toThrow("org id");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, imageDigest: "main" },
+      }),
+    ).toThrow("immutable sha256 digest");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
@@ -160,17 +171,18 @@ describe("GCP self-host contract", () => {
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96,
       }),
-    ).toThrow(/Redis TLS CA\/client round-trip contract.*Nothing was created/);
+    ).not.toThrow();
   });
 
-  it("never emits static Redis TLS readiness as a substitute for a CA/client proof", () => {
-    expect(() =>
-      bulls96ReleaseValues(
+  it("renders a CA-backed Redis round-trip contract without AUTH or HMAC credentials", () => {
+    const values = bulls96ReleaseValues(
         {
           enabled: true,
           chartVersion: "0.3.0",
           tenantOrgId: "org_123",
           existingSecretName: "bulls96-runtime",
+          imagePullSecretName: "ghcr-pull",
+          imageDigest: `sha256:${"a".repeat(64)}`,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
         },
         {
@@ -179,12 +191,26 @@ describe("GCP self-host contract", () => {
           cloudSqlConnectionName: "agentworkforce-dev1:us-central1:awf-dev-postgres",
           redisHost: "10.52.0.3",
           redisPort: 6379,
+          redisCaPem: "-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n",
           pubsubTopic: "projects/agentworkforce-dev1/topics/events",
           pubsubSubscription: "projects/agentworkforce-dev1/subscriptions/events",
           workloadIdentityEmail: "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
         },
-      ),
-    ).toThrow(/external Redis TLS CA\/client round-trip contract.*Nothing was created/);
+      );
+    const rendered = JSON.stringify(values);
+    expect(rendered).toContain("REDIS_TLS_CA_PEM");
+    expect(rendered).toContain("REDIS_TRANSIT_ENCRYPTION");
+    expect(rendered).toContain("SERVER_AUTHENTICATION");
+    expect(rendered).toContain("ghcr-pull");
+    expect(rendered).not.toContain('"REDIS_AUTH"');
+    expect(rendered).not.toContain("REDIS_PASSWORD");
+    expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
+    expect(values).toMatchObject({
+      worker: { imagePullSecrets: [{ name: "ghcr-pull" }], image: { digest: `sha256:${"a".repeat(64)}` }, locker: { credentials: { mode: "podIdentity" } } },
+      alleyoop: { imagePullSecrets: [{ name: "ghcr-pull" }], image: { digest: `sha256:${"a".repeat(64)}` }, locker: { credentials: { mode: "podIdentity" } } },
+      hoopdb: { enabled: false },
+      locker: { enabled: false },
+    });
   });
 
   it("keeps Relaycast on the released single-writer SQLite profile", () => {
