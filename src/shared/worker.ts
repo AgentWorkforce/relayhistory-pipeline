@@ -17,7 +17,7 @@ import {
 import { openHoopDb, waitForHoopDb, waitForSchema, type HoopDb } from "./db.ts";
 import { ctxOf, enrichMessage } from "./enrich.ts";
 import { vendorBindings, integer } from "./env.ts";
-import { dataPathVerdict, workloadReady } from "./data-path.ts";
+import { liveDataPathVerdict, workloadReadyLive } from "./data-path.ts";
 import { errorFields, log } from "./log.ts";
 import { initTelemetry, shutdownTelemetry, withSpan } from "./telemetry.ts";
 import { createServer } from "node:http";
@@ -112,15 +112,27 @@ function serveHealth(health: WorkerHealth, port: number) {
   const maxTickAgeMs = integer("WORKER_MAX_TICK_AGE_MS", 120_000);
   const server = createServer((req, res) => {
     if (req.url === "/readyz") {
-      const verdict = workloadReady(readyVerdict(health, { maxFailures }), process.env);
-      res.writeHead(verdict.ok ? 200 : 503, { "content-type": "application/json" });
-      res.end(JSON.stringify(verdict));
+      void workloadReadyLive(readyVerdict(health, { maxFailures }), process.env)
+        .then((verdict) => {
+          res.writeHead(verdict.ok ? 200 : 503, { "content-type": "application/json" });
+          res.end(JSON.stringify(verdict));
+        })
+        .catch(() => {
+          res.writeHead(503, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: false, missing: ["REDIS_TLS_ROUND_TRIP"] }));
+        });
       return;
     }
     if (req.url === "/datapathz") {
-      const verdict = dataPathVerdict(process.env);
-      res.writeHead(verdict.ok ? 200 : 503, { "content-type": "application/json" });
-      res.end(JSON.stringify(verdict.ok ? { ok: true, armed: verdict.armed } : { ok: false, missing: verdict.missing }));
+      void liveDataPathVerdict(process.env)
+        .then((verdict) => {
+          res.writeHead(verdict.ok ? 200 : 503, { "content-type": "application/json" });
+          res.end(JSON.stringify(verdict.ok ? { ok: true, armed: verdict.armed } : { ok: false, missing: verdict.missing }));
+        })
+        .catch(() => {
+          res.writeHead(503, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: false, missing: ["REDIS_TLS_ROUND_TRIP"] }));
+        });
       return;
     }
     if (req.url === "/healthz") {
