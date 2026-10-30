@@ -826,6 +826,7 @@ export default Alchemy.Stack(
             values: bulls96ReleaseValues(i.bulls96!, {
               bucket: lockerBucket,
               region: i.region,
+              imageRepository: Output.interpolate`${images.registryUri}/96bulls-services`,
               cloudSqlConnectionName: dataPlane.sqlPoster.connectionName,
               redisHost: dataPlane.redis.host,
               redisPort: dataPlane.redis.port,
