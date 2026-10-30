@@ -122,13 +122,15 @@ export const EpochRecordSchema = z
     opened_at: rfc3339,
     // `backfill` is an append-only historical stream landed after live
     // delivery has already opened the session (the switch-first migration).
-    // `resumed` is the raw owner continuing its source after that epoch.
+    // `resumed` is the raw owner continuing its source after that epoch, and
+    // `adopted` a client taking over a cold export.
     reason: z.enum([
       "initial",
       "truncated",
       "rewritten",
       "backfill",
       "resumed",
+      "adopted",
     ]),
     first_seq: uint,
     opened_by: z.string().min(1),
@@ -332,6 +334,8 @@ function validateBackfillEpochs(
   const { epochs } = raw;
   if (epochs.filter((e) => e.reason === "backfill").length > 1)
     issue("raw.epochs", 'at most one epoch is "backfill"');
+  if (epochs.filter((e) => e.reason === "adopted").length > 1)
+    issue("raw.epochs", 'at most one epoch is "adopted"');
   epochs.forEach((e, i) => {
     const at = `raw.epochs[${i}]`;
     if (e.reason === "resumed") {
@@ -344,6 +348,14 @@ function validateBackfillEpochs(
     }
     if (e.resumes_epoch !== undefined)
       issue(`${at}.resumes_epoch`, 'is only valid on a "resumed" epoch');
+    if (e.reason === "adopted") {
+      if (!epochs[0]!.opened_by.startsWith(MIGRATION_ID_PREFIX))
+        issue(`${at}.reason`, "only a cold export is adopted");
+      if (e.opened_by.startsWith(MIGRATION_ID_PREFIX))
+        issue(`${at}.opened_by`, "an exporter does not adopt");
+      if (raw.owner.startsWith(MIGRATION_ID_PREFIX))
+        issue("raw.owner", "an adopted session belongs to its client");
+    }
     if (e.reason !== "backfill") return;
     if (!e.opened_by.startsWith(MIGRATION_ID_PREFIX))
       issue(
@@ -731,7 +743,13 @@ export async function backfillStatus(
   manifest: ManifestV1,
   digest: string,
 ): Promise<"absent" | "present" | "conflict"> {
-  const epoch = manifest.raw.epochs.find((e) => e.reason === "backfill");
+  // A cold export's epoch 0 is the same content by another path.
+  const { epochs } = manifest.raw;
+  const epoch =
+    epochs.find((e) => e.reason === "backfill") ??
+    (epochs[0]!.opened_by.startsWith(MIGRATION_ID_PREFIX)
+      ? epochs[0]
+      : undefined);
   if (!epoch) return "absent";
   const listed = manifest.raw.chunks.filter((c) => c.epoch === epoch.epoch);
   return (await backfillDigest(listed)) === digest ? "present" : "conflict";
@@ -884,6 +902,57 @@ export function backfillWriteIssues(
   };
   if (!same(others(previous), others(next)))
     issues.push("the exporter changed another extension");
+  return issues;
+}
+
+/**
+ * What a client's takeover of a cold export may not do (spec: "Handover").
+ * It changes `raw.owner` and `writer` and appends one `adopted` epoch; every
+ * exported chunk and everything else stays. Empty when allowed.
+ */
+export function adoptionWriteIssues(
+  previous: ManifestV1,
+  next: ManifestV1,
+): string[] {
+  const issues: string[] = [];
+  const before = previous.raw;
+  const after = next.raw;
+  const owner = after.owner;
+  const added = after.epochs.slice(before.epochs.length);
+  const epoch = added[0];
+  if (!before.owner.startsWith(MIGRATION_ID_PREFIX))
+    issues.push("only a cold export is adopted");
+  if (
+    owner.startsWith(MIGRATION_ID_PREFIX) ||
+    owner !== next.writer.delivery_instance_id
+  )
+    issues.push("the new owner must be the writing client");
+  if (!extendsList(before.epochs, after.epochs))
+    issues.push("an existing epoch changed");
+  if (!extendsList(before.chunks, after.chunks))
+    issues.push("an existing chunk changed");
+  if (
+    added.length !== 1 ||
+    epoch?.reason !== "adopted" ||
+    epoch.opened_by !== owner ||
+    epoch.first_seq !== before.chunk_count
+  )
+    issues.push("a takeover appends exactly one adopted epoch");
+  if (after.chunks.slice(before.chunks.length).some((c) => c.epoch !== epoch?.epoch))
+    issues.push("a takeover appends chunks only to its own epoch");
+  for (const field of ["format", "compression", "scrub"] as const)
+    if (!same(before[field], after[field]))
+      issues.push(`a takeover changed raw.${field}`);
+  for (const section of ["trace_id", "created_at", "server"] as const)
+    if (!same(previous[section], next[section]))
+      issues.push(`a takeover changed ${section}`);
+  if (
+    !same(
+      previous.extensions?.[EXPORT_EXTENSION],
+      next.extensions?.[EXPORT_EXTENSION],
+    )
+  )
+    issues.push("a takeover changed the exporter's extension");
   return issues;
 }
 

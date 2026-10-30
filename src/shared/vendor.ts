@@ -77,6 +77,7 @@ export {
   manifestKey,
   rawChunkKey,
   parseSessionKey,
+  adoptionWriteIssues,
   appendBackfillEpoch,
   backfillDigest,
   backfillStatus,

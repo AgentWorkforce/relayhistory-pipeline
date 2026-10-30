@@ -90,6 +90,8 @@ interface SessionState {
   base?: ManifestV1;
   /** Another writer committed first: adopt the stored copy before writing again. */
   needs_rebase?: boolean;
+  /** The stored manifest is a cold export: the next write takes it over. */
+  adopting?: boolean;
   /** Another client owns the raw stream: stop writing; the records stay local. */
   fenced?: boolean;
   closed?: boolean;
@@ -312,7 +314,8 @@ export function sourceResumeOffset(manifest: ManifestV1): number | undefined {
 }
 
 /** Take the stored manifest as the new base: identity, chunks and position. */
-function adoptManifest(session: SessionState, remote: ManifestV1, version: ObjectVersion, offset: number) {
+function adoptManifest(session: SessionState, remote: ManifestV1, version: ObjectVersion, offset: number, adopting = false) {
+  session.adopting = adopting;
   const ext = remote.extensions?.[EXT] as { session_uuid?: unknown } | undefined;
   if (typeof ext?.session_uuid === "string") session.session_uuid = ext.session_uuid;
   session.trace_id = remote.trace_id;
@@ -349,6 +352,12 @@ async function rebaseSession(cfg: CourierConfig, machineId: string, session: Ses
   const body = (await res.json().catch(() => ({}))) as { version?: ObjectVersion; manifest?: ManifestV1 };
   if (!body.manifest || (!body.version?.eTag && !body.version?.version)) return "defer";
   if ((await validateManifest(body.manifest, mKey)).length > 0) return "defer";
+  if (body.manifest.raw.owner.startsWith("migration:")) {
+    // Nobody holds this stream. Take it over from the start of the source: the
+    // takeover write is the fence, and a lost race lands back here or fenced.
+    adoptManifest(session, body.manifest, body.version, 0, true);
+    return "rebased";
+  }
   if (body.manifest.raw.owner !== machineId) return "fenced";
   const offset = sourceResumeOffset(body.manifest);
   if (offset === undefined) return "fenced";
@@ -359,7 +368,7 @@ async function rebaseSession(cfg: CourierConfig, machineId: string, session: Ses
 const blankUpload = {
   revision: 0, uploaded_offset: 0, chunks: [], closed: false, pending: false, pending_manifest: undefined,
   pending_previous_version: undefined, scrub: undefined, manifest_key: undefined, manifest_version: undefined,
-  base: undefined, needs_rebase: false,
+  base: undefined, needs_rebase: false, adopting: false,
 };
 
 export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: number; uploaded: number; chunks: number }> {
@@ -468,7 +477,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
     }
     const nothingNew = result.ranges.length === 0;
     if (nothingNew && !session.pending) {
-      if (session.revision === 0) continue;
+      if (session.revision === 0 || session.adopting) continue;
       if (session.closed || !shouldClose) continue;
     }
     await withSpan("alleyoop upload", {
@@ -479,12 +488,12 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       const base = session.base;
       // A backfill epoch is sealed: new chunks continue the live offsets in a
       // `resumed` epoch, opened only when there is something to append.
-      const resuming = !!base && result.ranges.length > 0 && base.raw.epochs.at(-1)?.reason === "backfill";
+      const resuming = !!base && result.ranges.length > 0 && (session.adopting || base.raw.epochs.at(-1)?.reason === "backfill");
       const pendingChunks = session.chunks.slice(base?.raw.chunk_count ?? 0);
       const epoch = pendingChunks.at(-1)?.epoch ?? (base ? base.raw.epoch + (resuming ? 1 : 0) : 0);
       let stream = pendingChunks.at(-1)
         ? pendingChunks.at(-1)!.start_offset + pendingChunks.at(-1)!.bytes
-        : base ? liveNextOffset(base.raw) : 0;
+        : base && !session.adopting ? liveNextOffset(base.raw) : 0;
       for (const range of result.ranges) {
         const seq = session.chunks.length;
         const source = format === "ndjson"
@@ -532,7 +541,16 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
         const revision = session.revision + 1;
         const last = session.chunks.at(-1)!;
         const nowIso = new Date().toISOString();
-        const epochs = session.chunks.length > (base?.raw.chunk_count ?? 0) && base?.raw.epochs.at(-1)?.reason === "backfill"
+        const appended = session.chunks.length > (base?.raw.chunk_count ?? 0);
+        const epochs = base && appended && session.adopting
+          ? [...base.raw.epochs, {
+            epoch,
+            opened_at: nowIso,
+            reason: "adopted" as const,
+            first_seq: base.raw.chunk_count,
+            opened_by: state.machine_id,
+          }]
+          : base && appended && base.raw.epochs.at(-1)?.reason === "backfill"
           ? [...base.raw.epochs, {
             epoch,
             opened_at: nowIso,
@@ -624,6 +642,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       session.revision = manifest.revision;
       session.manifest_version = landedBody.version;
       session.base = manifest;
+      session.adopting = false;
       session.closed = manifest.raw.state === "closed";
       session.pending = false;
       session.pending_manifest = undefined;

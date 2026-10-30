@@ -7,6 +7,7 @@ import { Hono } from "hono";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import {
   commitBackfillEpoch,
+  computeContentSha256,
   isObjectStoreError,
   MANIFEST_EPOCHS_CAPABILITY,
   manifestKey,
@@ -138,6 +139,12 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
     ...(options.format ? { format: options.format } : {}),
   });
 
+  const post = (body: unknown, auth?: "migration") => app.request("/v1/pipeline/manifests", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-machine-id": machineId, "x-session-id": sessionId, ...(auth ? { "x-test-auth": auth } : {}) },
+    body: JSON.stringify(body),
+  }, env);
+
   const stored = async (): Promise<{ manifest: ManifestV1; version: ObjectVersion } | undefined> => {
     try {
       const object = await store.getObject(objectKey(key));
@@ -191,6 +198,42 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
     }, { maxAttempts, backoff: async () => new Promise((done) => setTimeout(done, Math.random() * 3)) });
   };
 
+  /** A cold export: the manifest does not exist yet, and the exporter owns it. */
+  const coldExport = async (text: string) => {
+    const { entry, scrub } = await seal(text, 0, 0, TRACE);
+    const at = new Date().toISOString();
+    const manifest: ManifestV1 = {
+      schema_v: 1,
+      layout: "v1",
+      trace_id: TRACE,
+      revision: 1,
+      created_at: at,
+      updated_at: at,
+      session: { workspace_id: WORKSPACE, machine_id: machineId, harness: "claude", session_id: sessionId, started_at: new Date(STARTED).toISOString() },
+      writer: { delivery_instance_id: EXPORTER, plugin_version: "export" },
+      raw: {
+        owner: EXPORTER,
+        state: "closed",
+        updated_at: at,
+        format: "ndjson",
+        compression: "zstd",
+        chunk_count: 1,
+        raw_bytes: entry.bytes,
+        stored_bytes: entry.stored_bytes,
+        content_sha256: await computeContentSha256([entry]),
+        epoch: 0,
+        epochs: [{ epoch: 0, opened_at: at, reason: "initial", first_seq: 0, opened_by: EXPORTER }],
+        next_offset: entry.bytes,
+        chunks: [entry],
+        scrub,
+      },
+      extensions: { "client.relayhistory_export": MARKER },
+    };
+    const res = await post({ key, manifest }, "migration");
+    if (res.status !== 202) throw new Error(`cold export refused: ${res.status}`);
+    return manifest;
+  };
+
   /** Every `harness_line` the merged stream holds, with no folding. */
   const liveRecords = async () => {
     const { manifest } = (await stored())!;
@@ -209,7 +252,7 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
   };
 
   return {
-    app, env, store, key, location, counts, hooks, machineId, statePath, rawPath, stored, seal, exporter, exportText, liveRecords, run,
+    app, env, store, rootDir: root, key, location, counts, hooks, machineId, statePath, rawPath, stored, seal, post, coldExport, exporter, exportText, liveRecords, run,
     write: (line: string) => appendFile(rawPath, `${line}\n`),
     state: async () => JSON.parse(await readFile(statePath, "utf8")),
     close: () => rm(dir, { recursive: true, force: true }),

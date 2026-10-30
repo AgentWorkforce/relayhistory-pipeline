@@ -135,8 +135,9 @@ manifest body.
   backfill. A backfill stays refused (`activation_required`) until the session's
   writer and every reader in `MANIFEST_READER_CAPABILITIES` advertise
   `manifest-epochs-v2`, so an old courier keeps delivering and its backfill
-  waits. Still open: a session cold-exported first and resumed later stays
-  fenced on its client.
+  waits. A session cold-exported first and resumed later is
+  taken over with one `adopted` epoch (`manifest-v1.md`, "Handover"). A client
+  that cannot take over yet is parked beside the export, so it never stalls.
 - **O5:** volume. About 54M records in 161 GB of payload; estimate the
   exported zstd size and the PUT count per workspace (KMS request cost, P9).
 

@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono";
 import {
   backfillWriteIssues,
+  adoptionWriteIssues,
   buildObjectLandedMessage,
   isObjectStoreError,
   MANIFEST_EPOCHS_CAPABILITY,
@@ -105,13 +106,38 @@ export const MANIFEST_READERS = ["transform", "session-index", "summaries", "hoo
  */
 function activationIssue(existing: ManifestV1, incoming: ManifestV1, env: Bindings): string | undefined {
   const adds = incoming.raw.epochs.slice(existing.raw.epochs.length);
-  if (!adds.some((epoch) => epoch.reason === "backfill")) return undefined;
-  if (!writerUnderstandsBackfill(existing)) return "the session's writer lacks the capability";
+  const backfill = adds.some((epoch) => epoch.reason === "backfill");
+  const adoption = adds.some((epoch) => epoch.reason === "adopted");
+  if (!backfill && !adoption) return undefined;
+  if (!writerUnderstandsBackfill(adoption ? incoming : existing)) return "the session's writer lacks the capability";
+  const missing = readersMissing(env);
+  return missing.length ? `readers lack the capability: ${missing.join(", ")}` : undefined;
+}
+
+function readersMissing(env: Bindings): string[] {
   const advertised = new Set(
     String((env as Record<string, unknown>).MANIFEST_READER_CAPABILITIES ?? "").split(",").map((pair) => pair.trim()),
   );
-  const missing = MANIFEST_READERS.filter((reader) => !advertised.has(`${reader}=${MANIFEST_EPOCHS_CAPABILITY}`));
-  return missing.length ? `readers lack the capability: ${missing.join(", ")}` : undefined;
+  return MANIFEST_READERS.filter((reader) => !advertised.has(`${reader}=${MANIFEST_EPOCHS_CAPABILITY}`));
+}
+
+const parkedKey = (key: string, machineId: string) => key.replace(/manifest\.json$/, `parked/${machineId}/manifest.json`);
+
+/**
+ * A live client that meets a cold export but cannot take it over yet: it lacks
+ * the capability, or the gate is closed. It must not stall on 409s or touch
+ * the export, so its manifest is held beside it. Readers never see a parked
+ * manifest: nothing is enqueued, and the session stays the export until a
+ * capable client takes over and re-reads its source.
+ */
+function mustPark(existing: ManifestV1, incoming: ManifestV1, auth: Auth, env: Bindings): boolean {
+  return (
+    existing.raw.owner.startsWith("migration:") &&
+    auth.tokenSubject !== MIGRATION_SUBJECT &&
+    incoming.raw.owner === incoming.writer.delivery_instance_id &&
+    incoming.writer.delivery_instance_id === incoming.session.machine_id &&
+    (!writerUnderstandsBackfill(incoming) || readersMissing(env).length > 0)
+  );
 }
 
 function canonical(value: unknown): unknown {
@@ -187,6 +213,9 @@ function manifestOwnerIssue(
     }
     return undefined;
   }
+
+  if (existing.raw.owner.startsWith("migration:") && raw.owner !== existing.raw.owner)
+    return migration ? "an exporter does not take over" : adoptionWriteIssues(existing, incoming)[0];
 
   if (
     incoming.trace_id !== existing.trace_id ||
@@ -312,9 +341,9 @@ async function chunksAreServerSealed(raw: RawStore, manifest: ManifestV1): Promi
   return true;
 }
 
-async function storedManifest(raw: RawStore, key: string): Promise<{ manifest: ManifestV1; version: ObjectVersion; text: string } | undefined> {
+async function storedManifest(raw: RawStore, key: string, target = key): Promise<{ manifest: ManifestV1; version: ObjectVersion; text: string } | undefined> {
   try {
-    const object = await raw.store.getObject(objectKey(key));
+    const object = await raw.store.getObject(objectKey(target));
     const bytes = await readCapped(object.body, MAX_MANIFEST_BYTES);
     if (!bytes) throw new Error("manifest too large");
     const text = new TextDecoder().decode(bytes);
@@ -410,6 +439,21 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       if (!(await chunksAreServerSealed(deps.raw, manifest)))
         return responseError(c, 409, "chunks_unverified", "manifest chunks are not server-sealed");
       const existing = await storedManifest(deps.raw, key);
+      if (existing && mustPark(existing.manifest, manifest, c.get("auth") as Auth, c.env ?? {})) {
+        const target = parkedKey(key, manifest.session.machine_id);
+        const held = await storedManifest(deps.raw, key, target);
+        if (held && held.text !== encodedText &&
+          (!sameVersion(held.version, version(body.previousVersion)) || manifest.revision !== held.manifest.revision + 1))
+          return responseError(c, 409, "revision_conflict", "parked manifest version does not match");
+        const parked = held?.text === encodedText
+          ? held.version
+          : (await deps.raw.store.put(objectKey(target), encoded, {
+              ...(held ? { ifMatch: held.version } : { ifNoneMatch: true }),
+              contentType: "application/json",
+              metadata: manifestMetadata(manifest, c.env ?? {}),
+            })).version;
+        return c.json({ parked: true, revision: manifest.revision, scrubbed: true, version: parked }, 202);
+      }
       let storedVersion: ObjectVersion;
       if (!existing) {
         if (manifest.revision !== 1)
@@ -495,6 +539,11 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       const stored = await storedManifest(deps.raw, key);
       if (!stored) return c.body(null, 404);
       const withManifest = c.req.query("manifest") === "1";
+      const machine = c.req.query("machine") ?? "";
+      if (!withManifest && machine === stored.manifest.session.machine_id && stored.manifest.raw.owner.startsWith("migration:")) {
+        const held = await storedManifest(deps.raw, key, parkedKey(key, machine));
+        if (held) return c.json({ version: held.version }, 200);
+      }
       if (c.req.query("machine") !== stored.manifest.session.machine_id ||
         (!withManifest && c.req.query("writer") !== stored.manifest.writer.delivery_instance_id))
         return c.body(null, 403);
