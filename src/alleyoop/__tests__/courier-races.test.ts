@@ -2,7 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { MANIFEST_EPOCHS_CAPABILITY, objectKey, type ManifestV1 } from "../../shared/vendor.ts";
 import { MANIFEST_READERS } from "../manifests.ts";
-import { envelopeRange, sourceResumeOffset } from "../courier.ts";
+import { createHash } from "node:crypto";
+import { sourceResumeOffset } from "../courier.ts";
+import { feedRanges, feedRecordId } from "../feed-records.ts";
 import { courierWorld } from "./courier-harness.ts";
 
 type World = Awaited<ReturnType<typeof courierWorld>>;
@@ -16,6 +18,7 @@ afterEach(async () => {
   await Promise.all(worlds.splice(0).map((w) => w.close()));
 });
 
+const ORIGIN = "00000000000000ab";
 const line = (n: number) => JSON.stringify({ type: "user", n, timestamp: new Date(1_761_730_000_000 + n).toISOString() });
 
 /** Live chunks' record count: folding hides a double upload, this does not. */
@@ -108,7 +111,7 @@ describe("courier and exporter races (C1-C3)", () => {
     expect(manifest.raw.epochs[2]).toMatchObject({ reason: "resumed", resumes_epoch: 0, opened_by: w.machineId });
     expect(tail.epoch).toBe(2);
     expect(tail.start_offset).toBe(before.raw.next_offset);
-    expect(sourceResumeOffset(manifest)).toBe(Buffer.byteLength(`${line(0)}\n${line(1)}\n`));
+    expect(sourceResumeOffset(manifest, ORIGIN)).toBe(2);
   });
 
   test("a jsonl session's backfill is refused and the courier carries on", async () => {
@@ -152,7 +155,7 @@ describe("courier edits the stored manifest (C4-C7)", () => {
     expect(m.extensions?.["server.note"]).toBe(1);
   });
 
-  test("C5: ndjson output is a stream the transform reads", async () => {
+  test("C5: ndjson output is feed rows the transform reads", async () => {
     const w = await world({ format: "ndjson" });
     await w.write(line(0));
     await w.write("not json at all");
@@ -160,17 +163,45 @@ describe("courier edits the stored manifest (C4-C7)", () => {
     await w.exporter(w.exportText("pre-t0"));
     const { records, lines } = await w.liveRecords();
     expect(lines.toSorted()).toEqual([line(0), "not json at all"].toSorted());
-    expect(records.find((r) => r.record_id === "pre-t0")).toBeDefined();
-    const live = records.filter((r) => r.kind === "harness_line");
-    expect(new Set(live.map((r) => r.record_id)).size).toBe(2);
-    expect(live.every((r) => r.origin_id === `machine:${w.machineId}`)).toBe(true);
+    const live = records.filter((r) => r.record_id !== "pre-t0");
+    expect(live.map((r) => r.revision)).toEqual(["1", "2"]);
+    expect(live.every((r) => r.origin_id === ORIGIN)).toBe(true);
+    expect(live[0]!.payload).not.toHaveProperty("raw_facts_version");
+    expect(live[0]!.payload).not.toHaveProperty("revision");
   });
 
-  test("C5: sealing the same range twice gives the same records", () => {
-    const bytes = Buffer.from(`${line(0)}\n${line(1)}\n`);
-    const ids = { machineId: "m", sessionId: "s", startedAt: "2026-10-30T00:00:00.000Z" };
-    expect(envelopeRange({ start: 40, bytes }, ids).equals(envelopeRange({ start: 40, bytes }, ids))).toBe(true);
-    expect(envelopeRange({ start: 40, bytes }, ids).equals(envelopeRange({ start: 41, bytes }, ids))).toBe(false);
+  test("C5: a client delete reaches the stream and removes the record", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.write(line(1));
+    await w.run();
+    await w.exporter(w.exportText("pre-t0"));
+    w.tombstone(1);
+    await settle(w);
+    const { lines } = await w.liveRecords();
+    expect(lines).toEqual([line(1)]);
+  });
+
+  test("C5: identity is what the client's export computes", () => {
+    // sha256 of the compact JSON feed key, from relayhistory `make_record`.
+    expect(feedRecordId(["session_event", "claude", "s", "u"])).toBe(createHash("sha256").update('["session_event","claude","s","u"]').digest("hex"));
+    const records = [1, 2, 2, 3].map((revision) => ({ revision, line: "x".repeat(10) }));
+    const ranges = feedRanges(records, 0, 12);
+    expect(ranges.map((r) => [r.start, r.end])).toEqual([[0, 1], [1, 2], [2, 3]]);
+    expect(ranges[1]!.bytes.toString().trim().split("\n")).toHaveLength(2);
+  });
+
+  test("a rebuilt store is a typed condition, and its records are sent under the new origin", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.run();
+    w.setEpoch(173);
+    const { conditions } = await w.run();
+    expect(conditions).toEqual([expect.objectContaining({ type: "feed_epoch_moved", from: ORIGIN, to: "00000000000000ad" })]);
+    await settle(w);
+    await w.exporter(w.exportText("pre-t0"));
+    const { records } = await w.liveRecords();
+    expect(records.filter((r) => r.record_id !== "pre-t0").map((r) => r.origin_id).toSorted()).toEqual(["00000000000000ab", "00000000000000ad"]);
   });
 
   test("C6: state from before this version rebases first, and never rebuilds epoch 0", async () => {

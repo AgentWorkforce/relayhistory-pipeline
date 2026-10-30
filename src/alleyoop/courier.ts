@@ -28,6 +28,7 @@ import {
 } from "../shared/vendor.ts";
 import { flag, integer, optional, required } from "../shared/env.ts";
 import { mintToken } from "./auth.ts";
+import { feedOrigin, feedRanges, readFeedRecords } from "./feed-records.ts";
 import { hexTraceId, isUuidV7, spanId, uuidv7 } from "../shared/ids.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { flushTelemetry, initTelemetry, withSpan } from "../shared/telemetry.ts";
@@ -42,8 +43,6 @@ import {
 
 export const PLUGIN_VERSION = "96bulls-courier/0.2.0";
 const MAX_CHUNK_BYTES = 4 * 1024 * 1024;
-/** JSON escaping grows a wrapped line, and the transform caps a chunk at 16 MiB. */
-const MAX_ENVELOPE_SOURCE_BYTES = 2 * 1024 * 1024;
 
 interface SessionRow {
   session_id: string;
@@ -88,6 +87,8 @@ interface SessionState {
   manifest_version?: ObjectVersion;
   /** The stored manifest this session edits: never rebuilt from local state. */
   base?: ManifestV1;
+  /** The change-feed epoch `uploaded_offset` belongs to, for `ndjson`. */
+  feed_origin?: string;
   /** Another writer committed first: adopt the stored copy before writing again. */
   needs_rebase?: boolean;
   /** Another client owns the raw stream: stop writing; the records stay local. */
@@ -257,59 +258,25 @@ async function readNewRecords(path: string, from: number, maxChunkBytes = MAX_CH
   }
 }
 
-/**
- * Harness lines as RelayHistory record envelopes, the shape of an `ndjson`
- * stream: the transform refuses any other line. `record_id` comes from the
- * line's file offset, so sealing the same range again gives the same records.
- */
-export function envelopeRange(
-  range: { start: number; bytes: Buffer },
-  ids: { machineId: string; sessionId: string; startedAt: string },
-): Buffer {
-  const lines: string[] = [];
-  let at = 0;
-  while (at < range.bytes.length) {
-    const nl = range.bytes.indexOf(0x0a, at);
-    const end = nl < 0 ? range.bytes.length : nl + 1;
-    const line = range.bytes.subarray(at, end).toString("utf8").replace(/\r?\n$/, "");
-    lines.push(JSON.stringify({
-      kind: "harness_line",
-      origin_id: `machine:${ids.machineId}`,
-      record_id: createHash("sha256").update(`${ids.sessionId}:${range.start + at}`).digest("hex"),
-      revision: "1",
-      operation: "upsert",
-      received_at: lineTime(line) ?? ids.startedAt,
-      payload: { line, source_offset: range.start + at },
-    }));
-    at = end;
-  }
-  return Buffer.from(`${lines.join("\n")}\n`);
-}
-
-function lineTime(line: string): string | undefined {
-  try {
-    const timestamp = (JSON.parse(line) as { timestamp?: unknown } | null)?.timestamp;
-    return typeof timestamp === "string" && Number.isFinite(Date.parse(timestamp))
-      ? new Date(timestamp).toISOString()
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-type ChunkWithSource = ChunkEntry & { source_end?: unknown };
+type ChunkWithSource = ChunkEntry & { source_end?: unknown; source_origin?: unknown };
 
 /**
- * Where this client's source file resumes. `start_offset` is the file offset
- * in `jsonl`. In `ndjson` it is an offset in the wrapped stream, so each chunk
- * records `source_end`. `undefined` when another format wrote the live stream.
+ * Where this client's source resumes. `jsonl`: a file offset, `start_offset`.
+ * `ndjson`: a feed revision, recorded per chunk as `source_end` beside its
+ * `source_origin`, because `start_offset` is then an offset in the stream. A
+ * feed whose epoch moved has no position in the stored chunks and resumes at 0
+ * under its new origin. `undefined` when the chunks do not say.
  */
-export function sourceResumeOffset(manifest: ManifestV1): number | undefined {
-  const tail = chunkKeys(manifest, { currentEpochOnly: true }).at(-1)?.entry as ChunkWithSource | undefined;
+export function sourceResumeOffset(manifest: ManifestV1, origin?: string): number | undefined {
   if (manifest.raw.format !== "ndjson") return liveNextOffset(manifest.raw);
+  const tail = chunkKeys(manifest, { currentEpochOnly: true }).at(-1)?.entry as ChunkWithSource | undefined;
   if (!tail) return 0;
-  return typeof tail.source_end === "number" ? tail.source_end : undefined;
+  if (typeof tail.source_end !== "number" || typeof tail.source_origin !== "string") return undefined;
+  return tail.source_origin === origin ? tail.source_end : 0;
 }
+
+/** A condition a person must see; the courier keeps going. */
+export type CourierCondition = { type: "feed_epoch_moved"; session_uuid: string; from: string; to: string };
 
 /** Take the stored manifest as the new base: identity, chunks and position. */
 function adoptManifest(session: SessionState, remote: ManifestV1, version: ObjectVersion, offset: number) {
@@ -349,10 +316,12 @@ async function rebaseSession(cfg: CourierConfig, machineId: string, session: Ses
   const body = (await res.json().catch(() => ({}))) as { version?: ObjectVersion; manifest?: ManifestV1 };
   if (!body.manifest || (!body.version?.eTag && !body.version?.version)) return "defer";
   if ((await validateManifest(body.manifest, mKey)).length > 0) return "defer";
+  const origin = feedOrigin(cfg.dbPath);
   if (body.manifest.raw.owner !== machineId) return "fenced";
-  const offset = sourceResumeOffset(body.manifest);
+  const offset = sourceResumeOffset(body.manifest, origin);
   if (offset === undefined) return "fenced";
   adoptManifest(session, body.manifest, body.version, offset);
+  session.feed_origin = origin;
   return "rebased";
 }
 
@@ -362,13 +331,14 @@ const blankUpload = {
   base: undefined, needs_rebase: false,
 };
 
-export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: number; uploaded: number; chunks: number }> {
+export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: number; uploaded: number; chunks: number; conditions: CourierCondition[] }> {
   const state = await loadState(cfg.statePath, cfg.machineId, cfg.startMode);
   const discovered = await readSessions(cfg.dbPath, cfg.harnesses);
   const rows = sessionsForStartMode(discovered, cfg.startMode, state.enrolled_at);
   const verified = (cfg.verifiedManifests ??= new Set());
   let uploaded = 0;
   let chunks = 0;
+  const conditions: CourierCondition[] = [];
   const deferred = new Set<string>();
   // The ledger follows the Locker, not the other way round: if a recorded manifest is
   // gone (a fresh stack after `down`), the upload state resets while the ids stay.
@@ -450,13 +420,31 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
     const traceparent = `00-${hexTraceId(session.trace_id)}-${spanId()}-01`;
     const idleMinutes = row.last_activity_ms ? (now.getTime() - row.last_activity_ms) / 60_000 : 0;
     const shouldClose = idleMinutes >= cfg.closeAfterMinutes;
-    let result: { ranges: Array<{ start: number; bytes: Buffer }>; size: number };
+    let result: { ranges: Array<{ start: number; end?: number; bytes: Buffer }>; size: number };
     if (session.pending_manifest) {
       // Land the exact already-sealed revision before reading or appending more bytes.
       result = { ranges: [], size: session.uploaded_offset };
     } else {
       try {
-        result = await readNewRecords(row.raw_path, session.uploaded_offset, format === "ndjson" ? MAX_ENVELOPE_SOURCE_BYTES : MAX_CHUNK_BYTES);
+        if (format === "ndjson") {
+          const feed = readFeedRecords(cfg.dbPath, row.source, row.session_id, 0);
+          if (!feed.origin) {
+            log.warn("ndjson needs a change feed; this store has none", { session_uuid: session.session_uuid, trace_id: session.trace_id });
+            continue;
+          }
+          if (session.feed_origin && session.feed_origin !== feed.origin) {
+            // A rebuilt store renumbers its feed: its records share no identity
+            // with what was sent, so they are sent again, and a person must know.
+            conditions.push({ type: "feed_epoch_moved", session_uuid: session.session_uuid, from: session.feed_origin, to: feed.origin });
+            log.warn("change feed epoch moved; re-sending under the new origin", { session_uuid: session.session_uuid, trace_id: session.trace_id, condition: "feed_epoch_moved" });
+            session.uploaded_offset = 0;
+          }
+          session.feed_origin = feed.origin;
+          const after = session.uploaded_offset;
+          result = { ranges: feedRanges(feed.records.filter((record) => record.revision > after), after, MAX_CHUNK_BYTES), size: after };
+        } else {
+          result = await readNewRecords(row.raw_path, session.uploaded_offset);
+        }
       } catch (err) {
         log.warn("transcript unreadable", { harness: row.source, session_id: row.session_id, ...errorFields(err) });
         continue;
@@ -487,9 +475,6 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
         : base ? liveNextOffset(base.raw) : 0;
       for (const range of result.ranges) {
         const seq = session.chunks.length;
-        const source = format === "ndjson"
-          ? envelopeRange(range, { machineId: loc.machineId, sessionId: loc.sessionId, startedAt: session.started_at })
-          : range.bytes;
         const q = new URLSearchParams({
           format, seq: String(seq), epoch: String(epoch), offset: String(stream), date: String(loc.startDate),
           machine: loc.machineId, harness: loc.harness, session: loc.sessionId,
@@ -503,7 +488,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
             "x-session-id": loc.sessionId,
             traceparent,
           },
-          body: new Uint8Array(source),
+          body: new Uint8Array(range.bytes),
         });
         if (!res.ok) {
           const body = (await res.json().catch(() => ({}))) as { error?: { code?: string } };
@@ -511,12 +496,12 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
         }
         const sealed = (await res.json()) as { key: string; entry: ChunkEntry; scrub: { ruleset: string; version: number }; created: boolean };
         const entry: ChunkEntry = format === "ndjson"
-          ? { ...sealed.entry, source_end: range.start + range.bytes.length }
+          ? { ...sealed.entry, source_end: range.end, source_origin: session.feed_origin }
           : sealed.entry;
         session.chunks.push(entry);
         stream += sealed.entry.bytes;
         session.scrub = session.scrub && session.scrub.version < sealed.scrub.version ? session.scrub : sealed.scrub;
-        session.uploaded_offset = range.start + range.bytes.length;
+        session.uploaded_offset = range.end ?? range.start + range.bytes.length;
         session.pending = true; // sealed chunks exist that no landed manifest lists yet
         chunks += 1;
         log.info("chunk sealed", {
@@ -641,7 +626,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
     await saveState(cfg.statePath, state);
   }
   await saveState(cfg.statePath, state);
-  return { sessions: rows.length, uploaded, chunks };
+  return { sessions: rows.length, uploaded, chunks, conditions };
 }
 
 async function authorizedFetch(provider: BearerTokenProvider, input: string, init: RequestInit): Promise<Response> {

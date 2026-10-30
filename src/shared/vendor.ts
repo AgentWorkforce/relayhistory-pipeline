@@ -84,6 +84,7 @@ export {
   chunkKeys,
   commitBackfillEpoch,
   computeContentSha256,
+  exportWatermarks,
   liveEpoch,
   liveNextOffset,
   MANIFEST_EPOCHS_CAPABILITY,
