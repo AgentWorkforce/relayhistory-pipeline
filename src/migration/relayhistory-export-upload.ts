@@ -31,7 +31,10 @@
  *   At most `chunksPerAssertion` (256) chunks go under one assertion, then a
  *   fresh mint; a 403 `migration_chunk_limit` anyway re-mints, and a second
  *   one with no progress stops the run. 409 `migration_chunk_conflict` fails
- *   that manifest. 403 `migration_upload_forbidden` stops the run, and so
+ *   that manifest. 409 `activation_required` (the O4 gate, #51) is neither a
+ *   lost race nor terminal: bounded waits (`activationWaitMs`), then the
+ *   manifest is deferred (re-queued, reported) and the run moves on.
+ *   403 `migration_upload_forbidden` stops the run, and so
  *   does 503 `migration_storage_read_required` (the ingest cannot read the
  *   commit back from storage), without backoff.
  * - **Chunk framing.** Each chunk request's body is `canonical(plan entry)`
@@ -498,6 +501,13 @@ export interface ExportUploadConfig {
   requestTimeoutMs?: number;
   /** Backoff before each retry of a 5xx or lost response; its length is the retry budget. */
   backoffMs?: readonly number[];
+  /**
+   * Waits before re-trying a commit refused with 409 `activation_required`
+   * (O4 gate, #51: the session's reader/writer capability is not active
+   * yet); its length is the budget. When it runs out, the manifest is
+   * deferred (re-queued for a later run), never failed or stopped.
+   */
+  activationWaitMs?: readonly number[];
   /** Chunks sent under one assertion before a fresh mint (contract v1: at most 256). */
   chunksPerAssertion?: number;
   /** A token closer than this to expiry is replaced by a fresh mint before the next request. */
@@ -510,6 +520,8 @@ export interface ExportUploadResult {
   committed: { key: string; workKey: string }[];
   skipped: string[];
   failed: { key: string; code: string }[];
+  /** Re-queued: still `activation_required` after the bounded wait; a later run retries. */
+  deferred: { key: string; code: string; waits: number }[];
   /** Set when the run stopped (401/403, exhausted 5xx budget, plan mismatch). */
   stopped?: { key: string; code: string; status?: number };
 }
@@ -518,6 +530,8 @@ type Outcome =
   | { kind: "replayed"; code: string; status: number }
   | { kind: "expired"; code: string; status: number }
   | { kind: "chunk_limit"; code: string; status: number }
+  | { kind: "activation"; code: string; status: number }
+  | { kind: "deferred"; code: string; status?: number }
   | { kind: "transient"; code: string; status?: number }
   | { kind: "stop"; code: string; status?: number }
   | { kind: "failed"; code: string; status?: number };
@@ -530,6 +544,7 @@ class OutcomeError extends Error {
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const DEFAULT_BACKOFF_MS = [500, 2_000, 8_000] as const;
+const DEFAULT_ACTIVATION_WAIT_MS = [5_000, 15_000, 30_000] as const;
 export const MAX_CHUNKS_PER_ASSERTION = 256;
 /** Contract v1: header naming the byte length of the plan entry in front of a chunk. */
 export const PLAN_ENTRY_LENGTH_HEADER = "X-Relay-Migration-Plan-Entry-Length";
@@ -540,6 +555,8 @@ function classify(status: number, code: string): Outcome {
   // Only this exact code is retried; any other 401 (invalid signature, claims) is terminal.
   if (status === 401 && code === "migration_assertion_expired") return { kind: "expired", code, status };
   if (status === 403 && code === "migration_chunk_limit") return { kind: "chunk_limit", code, status };
+  // The O4 activation gate: not a lost race and not terminal; wait, then re-queue.
+  if (status === 409 && code === "activation_required") return { kind: "activation", code, status };
   // Everything else at 401/403 is terminal, including 403 migration_upload_forbidden.
   if (status === 401 || status === 403) return { kind: "stop", code, status };
   // 409 migration_chunk_conflict (other bytes at a sealed seq) and any other
@@ -616,7 +633,8 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
   if (new Set(keys).size !== keys.length) throw new Error("export upload: the plan lists a manifest key twice");
 
   const cp = await loadCheckpoint(cfg.checkpointPath, { plan_digest: digest, grant_id: cfg.grantId, ingest_origin: base.origin });
-  const result: ExportUploadResult = { committed: [], skipped: [], failed: [] };
+  const result: ExportUploadResult = { committed: [], skipped: [], failed: [], deferred: [] };
+  const activationWait = cfg.activationWaitMs ?? DEFAULT_ACTIVATION_WAIT_MS;
 
   const request = async (token: string, path: string, init: RequestInit): Promise<Response> => {
     const headers = new Headers(init.headers);
@@ -650,6 +668,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
     let replays = 0;
     let expiries = 0;
     let transient = 0;
+    let activationWaits = 0;
     /** Chunks sealed since the last 403 migration_chunk_limit (none: a second one stops). */
     let sealedSinceLimit: number | undefined;
     let outcome: "committed" | Outcome | undefined;
@@ -758,6 +777,10 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
           // Expired before use: one fresh re-mint and retry; a second expiry stops the run.
           if (expiries >= 1) outcome = { ...o, kind: "stop" };
           expiries += 1;
+        } else if (o.kind === "activation") {
+          if (activationWaits >= activationWait.length) outcome = { kind: "deferred", code: o.code, status: o.status };
+          else await sleep(activationWait[activationWaits]!);
+          activationWaits += 1;
         } else if (o.kind === "chunk_limit") {
           // The assertion's chunk budget is spent: mint again for the rest. A
           // second limit with no chunk sealed in between stops the run.
@@ -775,6 +798,12 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
     }
     await saveCheckpoint(cfg.checkpointPath, cp);
     if (outcome === "committed") continue;
+    if (outcome.kind === "deferred") {
+      // Sealed chunks stay in the checkpoint; the next run commits it.
+      result.deferred.push({ key, code: outcome.code, waits: activationWaits - 1 });
+      log.warn("export manifest deferred until activation", { manifest_key_sha256: keyHash(key), error_code: outcome.code, attempt: activationWaits });
+      continue;
+    }
     if (outcome.kind === "failed") {
       result.failed.push({ key, code: outcome.code });
       log.error("export manifest FAILED; needs a human", { manifest_key_sha256: keyHash(key), error_code: outcome.code, status: outcome.status });

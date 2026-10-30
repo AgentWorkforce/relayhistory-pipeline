@@ -58,6 +58,8 @@ interface FakeIngest {
   mintJti?: (n: number) => string | undefined;
   /** Inject a response before the route's own handling (n is per route, 1-based). */
   before?: (route: Route, n: number) => Injected;
+  /** Test flag for the O4 activation gate. */
+  activated?: boolean;
   /** Answer commits with this work key instead (e.g. the old key@version form). */
   workKeyOverride?: string;
   /** The manifests the fake committed, by key. */
@@ -990,5 +992,43 @@ describe("signed work key and manifest provenance (#43 @d664d5bb)", () => {
     });
     expect(res.status).toBe(403);
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe("migration_upload_forbidden");
+  });
+});
+
+describe("409 activation_required (O4 gate, #51)", () => {
+  test("waits a bounded time with fresh assertions, then commits once activation lands", async () => {
+    const { fake, cfg, plan, sleeps, chunkCount } = await setup({ activationWaitMs: [7, 8, 9] });
+    fake.before = (route, n) => (route === "manifest" && n <= 2 ? { status: 409, code: "activation_required" } : undefined);
+    const result = await runExportUpload(plan, cfg);
+    expect(result).toMatchObject({ failed: [], deferred: [] });
+    expect(result.stopped).toBeUndefined();
+    expect(result.committed).toHaveLength(2);
+    expect(sleeps).toEqual([7, 8]);
+    expect(fake.mints).toBe(4); // a fresh assertion per attempt
+    expect(fake.chunkWrites).toBe(chunkCount); // chunks are not resent
+    expect(fake.manifestWrites).toBe(2);
+  });
+
+  test("still inactive after the budget: deferred (re-queued, reported), not failed and not stopped; a later run commits it", async () => {
+    const { fake, cfg, plan, sleeps } = await setup({ activationWaitMs: [7, 8] });
+    const first = planContract(plan, GRANT).uploads[0]!.key;
+    fake.before = (route) => (route === "manifest" && !fake.activated ? { status: 409, code: "activation_required" } : undefined);
+    fake.activated = false;
+    const r1 = await runExportUpload(plan, cfg);
+    expect(r1.failed).toEqual([]);
+    expect(r1.stopped).toBeUndefined();
+    expect(r1.committed).toEqual([]);
+    expect(r1.deferred).toEqual([
+      { key: first, code: "activation_required", waits: 2 },
+      { key: planContract(plan, GRANT).uploads[1]!.key, code: "activation_required", waits: 2 },
+    ]);
+    expect(sleeps).toEqual([7, 8, 7, 8]);
+    const cp = JSON.parse(await readFile(cfg.checkpointPath, "utf8"));
+    expect(cp.manifests[first].status).toBe("sealing");
+    fake.activated = true;
+    fake.requests.length = 0;
+    const r2 = await runExportUpload(plan, cfg);
+    expect(r2.committed).toHaveLength(2);
+    expect(fake.requests.filter((r) => r.route === "chunk")).toHaveLength(0); // sealed chunks reused
   });
 });
