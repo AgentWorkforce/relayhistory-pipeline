@@ -64,7 +64,12 @@ function fail(message: string): never {
 function decodePart(value: string): Buffer {
   if (!JWT_PART.test(value)) fail("GCP apply nonce is malformed.");
   try {
-    return Buffer.from(value, "base64url");
+    const decoded = Buffer.from(value, "base64url");
+    // Node accepts alternate encodings whose unused trailing bits are nonzero.
+    // Require the unique base64url spelling before the raw token is hashed as
+    // the replay-protection nonce.
+    if (decoded.toString("base64url") !== value) fail("GCP apply nonce is malformed.");
+    return decoded;
   } catch {
     fail("GCP apply nonce is malformed.");
   }
@@ -135,13 +140,14 @@ export async function verifyGcpApplyNonce(
   if (header.alg !== "RS256" || typeof header.kid !== "string" || !KID.test(header.kid))
     fail("GCP apply nonce algorithm or key id is not approved.");
   const key = await googleKey(header.kid, fetcher);
+  const signature = decodePart(encodedSignature);
   let valid = false;
   try {
     valid = verifySignature(
       "RSA-SHA256",
       Buffer.from(`${encodedHeader}.${encodedClaims}`),
       createPublicKey({ key: key as NodeJsonWebKey, format: "jwk" }),
-      decodePart(encodedSignature),
+      signature,
     );
   } catch {
     valid = false;

@@ -26,6 +26,7 @@ const nowSeconds = Math.floor(nowMs / 1000);
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const jwk = publicKey.export({ format: "jwk" });
 const kid = "test-google-key";
+const base64urlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 function token(patch: Record<string, unknown> = {}) {
   const header = Buffer.from(JSON.stringify({ alg: "RS256", kid, typ: "JWT" })).toString("base64url");
@@ -43,6 +44,24 @@ function token(patch: Record<string, unknown> = {}) {
   ).toString("base64url");
   const signature = sign("RSA-SHA256", Buffer.from(`${header}.${claims}`), privateKey).toString("base64url");
   return `${header}.${claims}.${signature}`;
+}
+
+function mutateUnusedSignatureBits(value: string): string {
+  const parts = value.split(".");
+  const signature = parts[2]!;
+  const last = signature.at(-1)!;
+  const index = base64urlAlphabet.indexOf(last);
+  const alternate = (index & 0x30) | ((index + 1) & 0x0f);
+  parts[2] = `${signature.slice(0, -1)}${base64urlAlphabet[alternate]}`;
+  return parts.join(".");
+}
+
+function tamperSignature(value: string): string {
+  const parts = value.split(".");
+  const signature = Buffer.from(parts[2]!, "base64url");
+  signature[0] ^= 1;
+  parts[2] = signature.toString("base64url");
+  return parts.join(".");
 }
 
 const fetchKeys = async () =>
@@ -72,10 +91,27 @@ describe("GCP apply authorization", () => {
     await expect(
       verifyGcpApplyNonce(token({ email: "other@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com" }), expected, fetchKeys, nowMs),
     ).rejects.toThrow(/stage, project, or executor identity/);
-    await expect(verifyGcpApplyNonce(`${token()}x`, expected, fetchKeys, nowMs)).rejects.toThrow(/signature/);
+    await expect(verifyGcpApplyNonce(tamperSignature(token()), expected, fetchKeys, nowMs)).rejects.toThrow(
+      /signature/,
+    );
     await expect(
       verifyGcpApplyNonce(token({ iat: nowSeconds - 400, exp: nowSeconds - 1 }), expected, fetchKeys, nowMs),
     ).rejects.toThrow(/expired or outside/);
+  });
+
+  test("rejects a noncanonical signature encoding before hashing it as a nonce", async () => {
+    const canonical = token();
+    const alternate = mutateUnusedSignatureBits(canonical);
+    const canonicalSignature = canonical.split(".")[2]!;
+    const alternateSignature = alternate.split(".")[2]!;
+
+    expect(alternate).not.toBe(canonical);
+    expect(Buffer.from(alternateSignature, "base64url")).toEqual(
+      Buffer.from(canonicalSignature, "base64url"),
+    );
+    await expect(verifyGcpApplyNonce(alternate, expected, fetchKeys, nowMs)).rejects.toThrow(
+      /malformed/,
+    );
   });
 
   test("atomically consumes a verified nonce only once", async () => {
