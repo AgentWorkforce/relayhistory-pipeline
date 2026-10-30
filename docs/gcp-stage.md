@@ -96,11 +96,13 @@ or secret payload. Example:
 
 ```json
 {
-  "projectId": "agentworkforce-dev1",
-  "projectNumber": "123456789012",
+  "projectId": "agentrelay-96bulls-soc2-2610",
+  "projectNumber": "955297012355",
+  "organizationId": "929835122282",
+  "billingAccount": "014D50-E96D1A-DE6360",
   "region": "us-central1",
   "controlPlaneAuthorizedCidrs": [
-    { "cidrBlock": "203.0.113.10/32", "displayName": "operator-vpn" }
+    { "cidrBlock": "203.0.113.10/32", "displayName": "replace-with-operator-or-vpn" }
   ],
   "clearedBy": "Khaliq's exact clearance words, YYYY-MM-DD",
   "managedDataPlane": { "provision": false },
@@ -111,13 +113,24 @@ or secret payload. Example:
 }
 ```
 
+`assertGcpInputs` accepts only those five target fields. `agentworkforce-dev1`
+and any other project, number, org, billing account, or region are refused
+before resources are declared. `203.0.113.10/32` is a documentation address.
+Replace it with the operator or VPN range. That replacement is not clearance
+to apply.
+
 Before any plan, authenticate with the intended GCP identity and confirm the
 project independently:
 
 ```sh
-export NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT=agentworkforce-dev1
-bin/96bulls plan gcp-dev
+export CI=true
+export NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT=agentrelay-96bulls-soc2-2610
+bin/96bulls plan gcp-conformance
 ```
+
+Do not pass `--yes`. Without `CI=true`, a missing Alchemy state bucket is
+created. The command above is the same read-only wrapper recorded below, and
+its last result is not an accepted plan.
 
 `plan` resolves the Alchemy GCP environment and refuses before the first
 resource when that live project or region differs from these inputs. The
@@ -233,8 +246,9 @@ number `955297012355`, parent org `929835122282`, billing account
 the stage unless `organizationId` and `billingAccount` are present and all
 five fields match that target. A denied name or billing that is off is also
 a mismatch. Do not enable `compute.googleapis.com` to read quota. Write
-`.96bulls/$STAGE/gcp-inputs.json` with this project id, number
-`955297012355`, region `us-central1`, and no secret payload. A later plan
+`.96bulls/$STAGE/gcp-inputs.json` with project `agentrelay-96bulls-soc2-2610`,
+number `955297012355`, organization `929835122282`, billing account
+`014D50-E96D1A-DE6360`, region `us-central1`, and no secret payload. A later plan
 still needs `CI=true` and must not pass `--yes` until the state bucket is
 allowed to exist.
 
