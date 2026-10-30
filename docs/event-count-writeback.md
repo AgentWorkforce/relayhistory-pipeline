@@ -10,9 +10,11 @@ owner: mig-cutover-observability. Contract contributor: mig-e4-export-transform.
 | Implementation base | `main` at `947d361bd1a37ab85bf892b84070f0c5ee18cad6` (carries #42) |
 | #57 output contract | `b2e3de78e9468aa4c32791e7e00434ad0e57e462`, one commit on that base |
 
-Implementation stacks on that #57 head. If #57 moves, re-check the contract
-below before continuing. The two changes this design needs from #57 are under
-"Format decision" and "Transform output"; neither is in that head yet.
+**#57 will move:** mig-e4-export-transform owns the version bump and the result
+fields, and is adding them on top of this head. Repin when the coordinator sends
+the new reviewed head. Until then, the migration, function, trigger and their
+tests build on `main` at the pin above. The handler and consumer wait for the
+repin.
 
 ## Problem
 
@@ -39,7 +41,7 @@ dead-letters. A reader also couldn't tell the formats apart from the key.
   `normalized/v2/relayhistory-{raw.content_sha256}.ndjson`.
 - `normalized/v1` is retired, not supported. No reader may accept it, and nothing
   translates it. No code on `main` constructs the transform, so no worker can have
-  written v1. **Confirm before activation that no v1 object exists in any bucket.**
+  written v1. A read-only check of the buckets is on the activation checklist.
 - Any change to projected bytes for the same input bumps the version. Otherwise it
   hits the same refusal.
 
@@ -118,7 +120,8 @@ sessions.record_normalized_event_count(
 RETURNS text  -- applied | replayed | stale | deleted
 ```
 
-SECURITY DEFINER with a fixed `search_path`. It locks exactly one row by the full
+SECURITY DEFINER with a fixed `search_path`. It raises `CN003` if RLS would hide
+the row from it, because that would otherwise read as "index behind". It locks exactly one row by the full
 primary key and touches nothing else. EXECUTE goes only to `session_count_writer`:
 NOLOGIN, no BYPASSRLS, no table privileges, granted to the consuming worker's
 login. PUBLIC, `anon` and `authenticated` get nothing.
@@ -126,7 +129,8 @@ login. PUBLIC, `anon` and `authenticated` get nothing.
 **Limit:** the function can't authenticate a tenant. A holder of the role who
 knows a session's full key, revision and `content_sha256` could write a count for
 it. The tenant boundary is the worker taking identity from `ctx`, plus the match
-on `content_sha256`, not the grant alone.
+on `content_sha256`, not the grant alone. helm-chart-chief is reviewing this
+boundary.
 
 ## Revision ordering
 
@@ -154,6 +158,28 @@ until the index catches up, and it leaves no orphan rows.
 - **Late work is harmless:** an older revision lands on 3.
 - **`event_count_recorded_at`** is written only on `applied`, so a replay changes
   no row.
+
+## The `file-normalize` worker
+
+The pipeline owner owns this worker (ruling, 2026-10-31). It doesn't exist yet.
+Its credential is **queue-limited: claim, ack and retry on `file-normalize`, and
+send to `normalized-ready`, with no table access.**
+
+- **Role:** `file_normalize_worker`, NOLOGIN, no BYPASSRLS, no privileges on any
+  table. No read of `session_index`, no write of it, and no EXECUTE on
+  `record_normalized_event_count`.
+- **Queue access through functions only.** `pollPostgresStage` and
+  `postgresPipelineQueue` run SQL directly on `pipeline_jobs`, so this role can't
+  use them as they stand. SECURITY DEFINER functions take over each operation,
+  with the stage fixed inside the function, not passed by the caller: claim, start,
+  ack and retry on `file-normalize`, and enqueue on `normalized-ready`.
+- **Events and dead letters follow the same rule.** `handleStageQueue` also writes
+  `pipeline_events` and `pipeline_dead_letters`. These need functions fixed to this
+  stage too, or a log-only sink, which would lose quarantine. Quarantine must keep
+  working, so functions are the requirement.
+- **Object store:** its own IAM, separate from this role. Decided with the worker.
+
+This is a spec. Building those functions and the worker is separate work.
 
 ## Failure and DLQ
 
@@ -201,9 +227,11 @@ correct answer while normalization runs or a DLQ waits.
 A reader may ship only when all of these hold:
 
 1. This work is merged and its migration applied, with its own approval.
-2. The reader uses the predicate above and doesn't present other rows as a count.
-3. The `normalized-ready` DLQ is empty, with lag under its alert threshold.
-4. A rehearsal has shown a backfilled session, a later live revision and a
+2. A read-only listing shows no `normalized/v1` object in any bucket. This is a
+   live check, so it needs Khaliq's explicit OK.
+3. The reader uses the predicate above and doesn't present other rows as a count.
+4. The `normalized-ready` DLQ is empty, with lag under its alert threshold.
+5. A rehearsal has shown a backfilled session, a later live revision and a
    delete-driven decrease all reaching the correct count.
 
 If a reader needs this before then, making the column nullable (option B in #50)
@@ -220,20 +248,18 @@ becomes mandatory.
 2. **Which sessions get normalized at all?** A session with no merged stream keeps
    the chunk sum and no provenance, so it fails the gate permanently. If a reader
    needs those, either they need a normalizer or the gate needs a stated exception.
-3. **Which worker owns `file-normalize`?** No worker wires it today. On the Postgres
-   queue, sending needs a credential. It must be limited to the queue, or the rule
-   against broad transform credentials isn't met.
-4. **Does `unprojected > 0` still count as exact?** Proposed: yes for the projected
+3. **Does `unprojected > 0` still count as exact?** Proposed: yes for the projected
    rows, since that is what the live triggers would leave.
 
 ## Implementation plan
 
-1. #57 settles the two contract changes, and open questions 1 and 3 are answered.
-2. Stack on the pinned #57 head: migration, function, trigger and stage registration.
-3. PGlite tests against every migration: each row of the ordering table, a
-   decrease, a replay, the sticky trigger against `upsert_session_index`, a
-   non-owner role, and tenant-role denial.
-4. Handler, typed parser, consumer and the DLQ path, with tests.
+1. On `main` at the pin: migration, function and trigger, with PGlite tests against
+   every migration. They cover each row of the ordering table, a decrease, a
+   replay, the sticky trigger against `upsert_session_index`, a non-owner role and
+   tenant-role denial.
+2. Repin to the reviewed #57 head once open question 1 is answered.
+3. Stage registration, handler, typed parser, consumer and the DLQ path, with tests.
+4. The `file-normalize` worker and its queue functions.
 5. Add the stage to the sampler's alert stages once #47 lands.
 
 Code and draft PR only. Applying the migration, enabling normalization and any
