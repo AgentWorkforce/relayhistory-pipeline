@@ -15,6 +15,7 @@
  * the read-only verifier.
  */
 import { PGlite } from "@electric-sql/pglite";
+import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -76,7 +77,7 @@ type Migration = { name: string; sql: string };
 
 const open: PGlite[] = [];
 async function database(...sets: Migration[][]) {
-  const db = new PGlite({ extensions: { pg_trgm } });
+  const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for (const migration of sets.flat()) {

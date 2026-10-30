@@ -18,6 +18,8 @@ import type { HoopDb } from "../shared/db.ts";
 import { ctxOf, enrichMessage, sessionExt } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { uuidv7 } from "../shared/ids.ts";
+import { propagatePointerTombstone } from "./session-directory-summary.ts";
+import { projectSessionDirectory } from "./session-directory-projector.ts";
 
 export const FAN_OUT_STAGES = ["summary-short", "summary-long", "status-classify"] as const;
 
@@ -45,6 +47,13 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
             WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
           [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id],
         );
+        // Propagate to the logical directory: clear the summary now (it may include this
+        // machine's content), then re-project. With machines still live the projector
+        // rebuilds metadata and memberships; with none left it tombstones the row and
+        // deletes its memberships.
+        const logical = { orgId: pk.org_id, workspaceId: pk.workspace_id, harness: pk.harness, sessionId: pk.session_id };
+        await propagatePointerTombstone(deps.db, logical);
+        await projectSessionDirectory(deps.db, logical);
         return;
       }
       const read = await deps.reader.read(pointer.manifestKey);
@@ -95,6 +104,10 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         [JSON.stringify([row])],
       );
       const applied = rows[0]?.applied ?? false;
+      // Logical-session directory projection (idempotent; never resurrects a tombstone).
+      await projectSessionDirectory(deps.db, {
+        orgId: pk.org_id, workspaceId: pk.workspace_id, harness: pk.harness, sessionId: pk.session_id,
+      });
       const fanoutDone = existing ? Number(existing.fanout_revision) >= f.manifestRevision : false;
       if (!applied && fanoutDone) {
         log.info("session index unchanged", { revision: f.manifestRevision, reason: "stale_or_equal_revision" });

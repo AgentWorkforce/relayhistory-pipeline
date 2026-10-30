@@ -4,7 +4,9 @@
  * Canonical transcript/event content lives in object storage. This contract only
  * covers the rebuildable Supabase logical-session directory and its metadata.
  * Transcript search belongs to ClickHouse/ObsessionDB and MUST NOT be added to
- * session_directory.search_text.
+ * session_directory.search_text. The one derived-content exception is the bounded,
+ * scrubbed short_summary (G6). The helm-chart-chief coordinator recorded the user's
+ * direct approval to implement bounded short_summary work in its controlling session.
  */
 export type SearchIndexRequirement = {
   id: string;
@@ -37,8 +39,10 @@ export const SESSION_DIRECTORY_SEARCH_BOUNDARY = {
     "git_repo",
     "git_branch",
     "model",
+    // Scrubbed, <= 1000 characters, written only by session-directory-summary.ts.
+    "short_summary",
   ],
-  excluded: ["transcript content", "event content", "tool payloads"],
+  excluded: ["transcript content", "event content", "tool payloads", "long summary", "embeddings"],
   transcriptBackend: "ClickHouse/ObsessionDB (not yet available)",
 } as const;
 
@@ -123,13 +127,50 @@ SELECT * FROM sessions.session_directory
    AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC, harness DESC
  LIMIT $4`,
-  metadataContains: `
-SELECT * FROM sessions.session_directory
- WHERE org_id = $1 AND workspace_id = $2 AND search_text ILIKE '%' || $3 || '%'
-   AND deleted_at IS NULL
- ORDER BY last_activity_at DESC, session_id DESC, harness DESC
- LIMIT $4`,
 } as const;
+
+/**
+ * The only search path over search_text (and so over short_summary). Pinned contract
+ * for RelayHistory #226; changing any of it is a contract change.
+ * Call through PostgREST as `POST /rest/v1/rpc/search_session_directory` with
+ * `Content-Profile: sessions` and a JWT whose `role` is the Worker role and whose
+ * `app_metadata` carries `org_id` and `workspace_ids`.
+ */
+export const SESSION_DIRECTORY_SEARCH_RPC = {
+  name: "sessions.search_session_directory",
+  args: { p_workspace_id: "text", p_query: "text" },
+  workerRole: "session_directory_search_worker",
+  claims: { role: "session_directory_search_worker", orgId: "app_metadata.org_id", workspaceIds: "app_metadata.workspace_ids" },
+  /** Meaningful characters after normalizeSearchQuery: not separators, format characters or marks. */
+  minQueryChars: 3,
+  maxQueryChars: 200,
+  /** A page of 50 plus one row that signals more. No cursor in V1. */
+  limit: 51,
+  order: "last_activity_at DESC, session_id DESC, harness DESC",
+  returns: [
+    "org_id", "workspace_id", "harness", "session_id", "created_at", "last_activity_at",
+    "title", "task_title", "agent_name", "project_id", "git_repo", "git_branch", "model", "state",
+    "event_count", "input_tokens", "output_tokens", "cost_usd_micros",
+    "machine_ids", "user_ids", "short_summary", "projected_at",
+  ],
+  errors: {
+    "42501": "caller is not the Worker role, or tenant claims missing, malformed, for another role, or not covering the workspace",
+    "22023": "fewer than 3 meaningful characters, or more than 200, after normalizeSearchQuery (search-query.ts)",
+    "57014": "statement_timeout (2s on the Worker role) exceeded",
+  },
+} as const;
+
+/** The exact SQL the RPC executes; plan tests compare auto_explain's Query Text to it. */
+export const SESSION_DIRECTORY_SEARCH_SQL = `
+SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at,
+       d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state,
+       d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros,
+       d.machine_ids, d.user_ids, d.short_summary, d.projected_at
+  FROM sessions.session_directory AS d
+ WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL
+   AND d.search_text <> '' AND d.search_text ILIKE $3 ESCAPE '\\'
+ ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC
+ LIMIT 51`;
 
 export const REQUIRED_SEARCH_INDEXES = [
   {
@@ -203,10 +244,10 @@ export const REQUIRED_SEARCH_INDEXES = [
     expectedPredicate: "((project_id IS NOT NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
   },
   {
-    id: "metadata-substring", indexName: "session_directory_metadata_trgm_idx",
-    tableName: "session_directory", consumers: ["Cloud metadata search"],
-    queryShape: "case-insensitive substring over bounded metadata-only search_text",
-    definitionFragments: ["on sessions.session_directory using gin", "search_text", "gin_trgm_ops"],
+    id: "tenant-search-substring", indexName: "session_directory_tenant_search_trgm_idx",
+    tableName: "session_directory", consumers: ["sessions.search_session_directory (RelayHistory #226 metadata search)"],
+    queryShape: "org + workspace scoped case-insensitive substring over search_text (metadata plus scrubbed short_summary)",
+    definitionFragments: ["on sessions.session_directory using gin", "(org_id, workspace_id, search_text", "gin_trgm_ops)"],
     expectedPredicate: "((search_text <> ''::text) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
   },
   {

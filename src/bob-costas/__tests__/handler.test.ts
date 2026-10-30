@@ -45,6 +45,9 @@ function manifest(scrubbed: boolean, chunks: unknown[]) {
 const loc = { workspaceId: "w", machineId: "m", harness: "claude", sessionId: "s1", startDate: "2026-10-29" };
 const message = { payload: { manifestKey: "k" }, ctx: { orgId: "o" } } as never;
 const recorder = { log: { info() {} } } as never;
+// These tests cover the encrypted-object path only; the directory projection (G6) is
+// tested end to end in src/hoopdb/__tests__/session-directory-short-summary.test.ts.
+const noDirectory = { write: async () => ({ written: false }), clear: async () => false };
 
 describe("Bob Costas stores summaries as encrypted Locker objects, pointers in HoopDb", () => {
   it("ready: object summary/short.json.enc decrypts; the row has only the pointer; old plaintext rows are gone", async () => {
@@ -55,7 +58,7 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     await store.put(rawChunkKey(loc, 0, 0, "abcdef12", "jsonl"), zstdCompressSync(Buffer.from(line + "\n")));
     const m = manifest(true, [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }]);
     const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
-    const handler = bobCostasHandler("short", { db, reader: { provider: "fs", read: async () => ({ manifest: m }) } as never, store, summarizer: extractiveSummarizer, keyring });
+    const handler = bobCostasHandler("short", { db, reader: { provider: "fs", read: async () => ({ manifest: m }) } as never, store, summarizer: extractiveSummarizer, directory: noDirectory, keyring });
     await handler(message, recorder);
     const row = (await pg.query<Record<string, unknown>>(`SELECT * FROM sessions.session_summaries`)).rows[0]!;
     expect(row.status).toBe("ready");
@@ -71,7 +74,7 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     expect(await handler(message, recorder)).toEqual({ status: "skipped", reason: "summary_current" });
     // After a master rotation the same summary is re-encrypted under the new key, not skipped.
     const rotated = await masterKeyring(parseMasterKeys(`k2:${"b".repeat(64)},k1:${"a".repeat(64)}`));
-    await bobCostasHandler("short", { db, reader: { provider: "fs", read: async () => ({ manifest: m }) } as never, store, summarizer: extractiveSummarizer, keyring: rotated })(message, recorder);
+    await bobCostasHandler("short", { db, reader: { provider: "fs", read: async () => ({ manifest: m }) } as never, store, summarizer: extractiveSummarizer, directory: noDirectory, keyring: rotated })(message, recorder);
     const after = (await pg.query<Record<string, unknown>>(`SELECT key_id, object_sha256 FROM sessions.session_summaries`)).rows[0]!;
     expect(after.key_id).toBe("hkdf1:k2");
     const onlyK2 = await masterKeyring(parseMasterKeys(`k2:${"b".repeat(64)}`));
@@ -83,7 +86,7 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
     const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
     const m = manifest(false, [{ seq: 0, start_offset: 0, sha256_8: "deadbeef" }]); // chunk absent: reading it would throw
-    await bobCostasHandler("long", { db, reader: { provider: "fs", read: async () => ({ manifest: m }) } as never, store, summarizer: extractiveSummarizer, keyring })(message, recorder);
+    await bobCostasHandler("long", { db, reader: { provider: "fs", read: async () => ({ manifest: m }) } as never, store, summarizer: extractiveSummarizer, directory: noDirectory, keyring })(message, recorder);
     const row = (await pg.query<Record<string, unknown>>(`SELECT status, object_key, object_sha256, key_id FROM sessions.session_summaries`)).rows[0]!;
     expect(row).toEqual({ status: "quarantined", object_key: null, object_sha256: null, key_id: null });
     expect(await store.head(objectKey("v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/long.json.enc"))).toBeUndefined();
