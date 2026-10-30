@@ -159,16 +159,26 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
           // already holds a summary: it may be an older revision's text left behind by
           // a failed write. writeShortSummary's generated_at fence makes this idempotent
           // and never lets an older object replace a newer one.
-          const published = row.object_key && row.object_sha256
-            ? await readSummaryObject({
-                store: deps.store, keyring: deps.keyring, ids, key: row.object_key, sha256: row.object_sha256, kind, revision: m.revision,
-              })
-            : null;
-          if (published?.status !== "ready" || !published.summary || !published.model) {
-            // The current object cannot be authenticated: keep no possibly stale text
-            // searchable, and retry.
+          // Integrity failures are permanent: clear first (no possibly stale text stays
+          // searchable), then fail non-retryably so the message goes to the DLQ instead
+          // of retrying forever.
+          const integrity = async (message: string): Promise<never> => {
             await publishShortSummary(directory, dirKey, null, m.trace_id);
-            throw new PipelineError("summary_object_unreadable", "the current short summary object could not be authenticated", true);
+            throw new PipelineError("summary_object_integrity", message, false);
+          };
+          if (!row.object_key || !row.object_sha256) await integrity("a ready short summary pointer has no object");
+          let published: SummaryRecord | null;
+          try {
+            published = await readSummaryObject({
+              store: deps.store, keyring: deps.keyring, ids, key: row.object_key!, sha256: row.object_sha256!, kind, revision: m.revision,
+            });
+          } catch (err) {
+            // A store or keyring error may be transient: clear, then let it retry as raised.
+            await publishShortSummary(directory, dirKey, null, m.trace_id);
+            throw err;
+          }
+          if (published?.status !== "ready" || !published.summary || !published.model) {
+            return await integrity("the current short summary object is missing or cannot be authenticated");
           }
           await publishShortSummary(directory, dirKey,
             { summary: published.summary, model: published.model, generatedAt: new Date(published.built_at) }, m.trace_id);

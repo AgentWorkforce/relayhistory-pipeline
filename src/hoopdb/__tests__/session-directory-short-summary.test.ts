@@ -13,7 +13,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { auto_explain } from "@electric-sql/pglite/contrib/auto_explain";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
-import { SCRUB_RULESET, SCRUB_RULESET_VERSION, rawChunkKey, type ManifestV1 } from "../../shared/vendor.ts";
+import { SCRUB_RULESET, SCRUB_RULESET_VERSION, objectKey, rawChunkKey, type ManifestV1 } from "../../shared/vendor.ts";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
 import { bobCostasHandler } from "../../bob-costas/handler.ts";
@@ -693,10 +693,10 @@ describe("short_summary end to end through the pipeline", () => {
     await store.put(rawChunkKey({ workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e", startDate: "2026-10-29" },
       0, 0, "22222222", "jsonl"), zstdCompressSync(Buffer.from(`${line}\n`)));
     const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
-    const summaryShort = (directory?: Parameters<typeof bobCostasHandler>[1]["directory"]) =>
-      bobCostasHandler("short", { db: hoop, reader, store, summarizer: extractiveSummarizer, keyring, ...(directory ? { directory } : {}) })(
+    const summaryShort = (directory?: Parameters<typeof bobCostasHandler>[1]["directory"], storeOverride?: typeof store) =>
+      bobCostasHandler("short", { db: hoop, reader, store: storeOverride ?? store, summarizer: extractiveSummarizer, keyring, ...(directory ? { directory } : {}) })(
         { payload: pointer, ctx: { orgId: "org-a" } } as never, { log: { info() {} } } as never);
-    return { db, hoop, index, pointer, ctx, sent, summaryShort };
+    return { db, hoop, index, pointer, ctx, sent, summaryShort, store };
   }
 
   test("indexer projects the row, Bob Costas writes the scrubbed summary, the RPC is tenant-bound, deletion clears it", async () => {
@@ -849,6 +849,47 @@ describe("short_summary end to end through the pipeline", () => {
     expect(again?.short_summary).toBe(fixed?.short_summary);
     expect(again?.short_summary_generated_at).toEqual(fixed?.short_summary_generated_at);
     expect(again?.search_text).toBe(fixed?.search_text);
+  }, 60_000);
+
+  test("a corrupt current summary object clears the directory summary and fails non-retryably", async () => {
+    const { db, index, pointer, ctx, summaryShort, store } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    await summaryShort();
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+    const published = (await db.query<{ object_key: string }>(
+      "SELECT object_key FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'")).rows[0]!;
+    await store.put(objectKey(published.object_key), new TextEncoder().encode("not an envelope"));
+
+    const error = await summaryShort().then(() => null, (caught: unknown) => caught) as { code?: string; retryable?: boolean } | null;
+    expect(error?.code).toBe("summary_object_integrity");
+    expect(error?.retryable).toBe(false);
+    expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
+    expect(String((await row(db, "s-e2e"))?.search_text)).not.toContain("pelican");
+    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
+  }, 60_000);
+
+  test("a store error on the retry read clears the directory summary, then rethrows it", async () => {
+    const { db, index, pointer, ctx, summaryShort, store } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    await summaryShort();
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+    const down = new Error("store unavailable");
+    const failingStore = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === "getObject") return async () => { throw down; };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const error = await summaryShort(undefined, failingStore).then(() => null, (caught: unknown) => caught) as
+      { code?: string; retryable?: boolean; message?: string } | null;
+    // readSummaryObject wraps the store failure as the retryable summary_store_unavailable.
+    expect(error?.code).toBe("summary_store_unavailable");
+    expect(error?.retryable).toBe(true);
+    expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
+    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
+    // Once the store is back, the retry republishes.
+    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
   }, 60_000);
 });
 
