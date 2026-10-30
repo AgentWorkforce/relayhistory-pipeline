@@ -11,6 +11,7 @@
  */
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import {
+  isObjectStoreError,
   manifestLocation,
   normalizedKey,
   objectKey,
@@ -27,7 +28,11 @@ import {
   projectRelayhistorySession,
   type ProjectionRow,
 } from "./relayhistory-projection.js";
-import type { RawPointer, SessionTransform } from "./stages.js";
+import type {
+  NormalizedOutput,
+  RawPointer,
+  SessionTransform,
+} from "./stages.js";
 
 export const RELAYHISTORY_NORMALIZED_VERSION = 1;
 export const RELAYHISTORY_EXPORT_EXTENSION = "client.relayhistory_export";
@@ -349,6 +354,31 @@ function encodedRows(rows: readonly ProjectionRow[]): Uint8Array {
 }
 
 /**
+ * The `convergence_events` lines of a stored normalized object. An object in any
+ * other shape, such as the record envelopes earlier builds wrote, is refused:
+ * `{table, row}` is the only normalized format.
+ */
+function convergenceEventLines(stored: Uint8Array): number {
+  let count = 0;
+  for (const line of new TextDecoder().decode(stored).split("\n")) {
+    if (!line) continue;
+    const parsed = parsedLine(line);
+    if (typeof parsed.table !== "string" || !parsed.row || typeof parsed.row !== "object")
+      fail("normalized_object_invalid", "stored normalized object is not {table, row} lines");
+    if (parsed.table === "convergence_events") count += 1;
+  }
+  return count;
+}
+
+function parsedLine(line: string): { table?: unknown; row?: unknown } {
+  try {
+    return (JSON.parse(line) ?? {}) as { table?: unknown; row?: unknown };
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Concrete file-normalize implementation for RelayHistory export manifests.
  * Non-export manifests are left for their harness-specific normalizers.
  */
@@ -361,7 +391,9 @@ export class RelayhistoryExportTransform implements SessionTransform {
     },
   ) {}
 
-  async normalize(pointer: RawPointer): Promise<{ outputKey?: string }> {
+  async normalize(
+    pointer: RawPointer,
+  ): Promise<NormalizedOutput | Record<string, never>> {
     if (pointer.deleted) return {};
     const read = await this.deps.manifests.read(pointer.manifestKey);
     if (!read) return {};
@@ -384,17 +416,33 @@ export class RelayhistoryExportTransform implements SessionTransform {
       RELAYHISTORY_NORMALIZED_VERSION,
       `relayhistory-${manifest.raw.content_sha256}.ndjson`,
     );
-    await this.deps.store.put(objectKey(key), body, {
-      ifNoneMatch: true,
-      contentType: "application/x-ndjson",
-      metadata: {
-        "trace-id": manifest.trace_id,
-        "manifest-revision": String(manifest.revision),
-        "source-content-sha256": manifest.raw.content_sha256,
-        "source-epoch": String(manifest.raw.epoch),
-        "unprojected-records": String(projection.unprojected),
-      },
-    });
-    return { outputKey: key };
+    let created = false;
+    try {
+      const ack = await this.deps.store.put(objectKey(key), body, {
+        ifNoneMatch: true,
+        contentType: "application/x-ndjson",
+        metadata: {
+          "trace-id": manifest.trace_id,
+          "manifest-revision": String(manifest.revision),
+          "source-content-sha256": manifest.raw.content_sha256,
+          "source-epoch": String(manifest.raw.epoch),
+        },
+      });
+      created = ack.created;
+    } catch (error) {
+      if (!isObjectStoreError(error, "already_exists")) throw error;
+    }
+    // Create-only: on a hit the stored object is the output, so it is described
+    // from its own bytes. Its metadata names whichever revision wrote it first.
+    const stored = created
+      ? body
+      : await readAll(await this.deps.store.get(objectKey(key)));
+    return {
+      outputKey: key,
+      outputSha256: await sha256Hex(stored),
+      outputBytes: stored.byteLength,
+      convergenceEventCount: convergenceEventLines(stored),
+      unprojectedRecords: projection.unprojected,
+    };
   }
 }

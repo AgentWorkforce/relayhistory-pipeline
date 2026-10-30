@@ -153,7 +153,10 @@ manifest body.
   as the live projection does. It projects the survivors into the rows the live
   triggers leave (`relayhistory-projection.ts`, held equal to the vendored SQL
   by conformance tests) and writes them, one `{table, row}` per line, to
-  `normalized/v1/relayhistory-{raw.content_sha256}.ndjson`. The digest in the
+  `normalized/v1/relayhistory-{raw.content_sha256}.ndjson`. `{table, row}` is
+  the only normalized format: the record envelopes an earlier transform wrote
+  are superseded, a stored object in that shape is refused, and readers of
+  records read raw through `readRelayhistoryExport`. The digest in the
   key makes the object create-only, so a late transform cannot overwrite
   output for another manifest revision. Post-T0 live chunks use the same
   record envelope; `operation` is optional for historical upserts and required
