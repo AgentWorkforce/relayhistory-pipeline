@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { GCP_CONFIRM_PROJECT_ENV } from "../config.ts";
+import {
+  GCP_CONFIRM_PROJECT_ENV,
+  GCP_CONFIRM_SQL_POST_ENV,
+  assertGcpSqlPostConfirmation,
+} from "../config.ts";
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "../deploy-guard.ts";
 
 describe("GCP deployment target guard", () => {
@@ -36,5 +40,18 @@ describe("GCP deployment target guard", () => {
 
   test("accepts confirmation of the approved project only", () => {
     expect(() => assertGcpProjectConfirmation(expected.projectId, expected.projectId)).not.toThrow();
+  });
+
+  test("requires an exact, separate apply-time Cloud SQL mutation confirmation", () => {
+    const expectedValue = "agentworkforce-dev1/awf-dev-postgres";
+    expect(() => assertGcpSqlPostConfirmation("agentworkforce-dev1", "awf-dev-postgres", undefined)).toThrow(
+      new RegExp(`${GCP_CONFIRM_SQL_POST_ENV}=${expectedValue}.*Nothing was created`),
+    );
+    expect(() =>
+      assertGcpSqlPostConfirmation("agentworkforce-dev1", "awf-dev-postgres", "other/awf-dev-postgres"),
+    ).toThrow(/Nothing was created/);
+    expect(() =>
+      assertGcpSqlPostConfirmation("agentworkforce-dev1", "awf-dev-postgres", expectedValue),
+    ).not.toThrow();
   });
 });

@@ -15,9 +15,18 @@ implementations own provider adapters.
 
 ## Declared substrate
 
-- regional GKE Autopilot with private nodes, Workload Identity Federation,
-  Dataplane V2, Shielded Nodes, VPC-native pod/service ranges, Cloud NAT, and
-  VPC flow logs;
+- regional standard GKE, not Autopilot. The installed provider omits node
+  pools from an Autopilot create, so a node service account would not be sent
+  and `disallowDefaultComputeServiceAccount` would deny the cluster. Private
+  nodes, a private control-plane endpoint, operator CIDRs only, Workload
+  Identity Federation, Dataplane V2, Shielded Nodes, VPC-native ranges, one
+  reserved NAT address with translation logs, and VPC flow logs. The default
+  pool is explicitly limited to one `e2-medium` node in `us-central1-a`; it is
+  not one node per zone. The node identity is a dedicated service account with
+  no key and only `roles/container.defaultNodeServiceAccount`. The deploying
+  principal must separately have `roles/iam.serviceAccountUser` on that node
+  identity so GKE may attach it. Private Service Access
+  stays project-local peering, not Shared VPC;
 - versioned GCS Locker bucket with uniform bucket-level access;
 - private Artifact Registry repository with immutable tags;
 - a regional Secret Manager secret container (metadata only; no payload enters
@@ -33,6 +42,11 @@ implementations own provider adapters.
   charts. Relayflows runs in standalone mode and is not in Relaycast's
   availability path.
 
+Cloud NAT currently permits general workload egress and logs every
+translation. Those logs are audit evidence, not an egress allowlist. This lane
+does not claim workload egress restriction or SOC 2 network conformance; a
+separately proven egress proxy/firewall policy is still required.
+
 Cloud SQL has not been created in this lane. On an approved apply, the stack
 prepares a SQL Admin `instances.insert`
 for public IPv4 off, the Private Service Access network and range, and
@@ -45,6 +59,12 @@ or error text. An apply-time Alchemy Action calls that poster only after the
 Private Service Access connection resolves; its output gates the proxy IAM,
 deployment, and Helm wiring. `GCP.SQL.Instance` is not called, because that
 resource drops `privateNetwork` and can create a public instance.
+
+The Private Service Access allocation is explicitly `10.80.0.0/20`. A
+RUNNABLE Cloud SQL instance is accepted only when every returned address is a
+syntactically valid RFC1918 `PRIVATE` IPv4 inside that exact allocation. A
+public, mislabeled, whitespace-bearing, malformed, or other-private-range
+address is refused.
 
 ## Truthful feature gates
 
@@ -75,11 +95,25 @@ choice: unset and `s3` stay S3, `r2` stays R2, and `PIPELINE_RAW_PROVIDER=gcs`
 builds the GCS adapter when the bucket is set and HMAC keys are absent. Any
 other name stays unconfigured.
 
-The `bulls96.enabled` values contract turns off in-chart MinIO and
-CloudNativePG, uses pod identity, and passes the bucket, Cloud SQL connection
-name, Redis host, and Pub/Sub names. The release and Cloud SQL proxy consume
-the poster output, so neither can apply before the exact private-only instance
-is confirmed `RUNNABLE`.
+`bulls96.enabled` currently fails closed before the first provider resource.
+Memorystore `SERVER_AUTHENTICATION` needs the service CA, a CA-aware runtime
+client, and an in-VPC TLS round trip; static environment strings are not that
+proof. Managed Redis may be created only as acknowledged external adapter-test
+infrastructure and is not wired into 96Bulls.
+
+Relaycast, when configured, uses the exact published chart `0.1.0` package
+with SHA-256
+`cdfc41cb6202fd81beb17cb57d5fbbdecaf27fa427f51faa07c5ec0fc116744f`
+and image
+`ghcr.io/agentworkforce/relaycast-self-host@sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98`.
+The stack verifies the package bytes before provider resolution, extracts those
+verified bytes into a deterministic digest-addressed directory, and renders
+that local chart rather than re-resolving a mutable
+repository index. Ingress and GKE ManagedCertificate are disabled. The service
+is ClusterIP and the chart NetworkPolicy accepts callers only from its
+namespace. `baseUrl` remains the chart-required signed-URL authority; it does
+not create public exposure. This is the single-replica SQLite contract, not a
+GCP HA proof.
 `/readyz` also checks that data path when `LOCKER_PROVIDER=gcs` or
 `WORKER_DATA_PATH_PROBE=1`. Production is not this lane: the production
 database is Supabase and production object storage is AWS S3.
@@ -104,6 +138,11 @@ or secret payload. Example:
   "controlPlaneAuthorizedCidrs": [
     { "cidrBlock": "203.0.113.10/32", "displayName": "replace-with-operator-or-vpn" }
   ],
+  "kubernetesExecutor": {
+    "name": "replace-with-named-vpc-or-vpn-runner",
+    "mode": "vpn",
+    "identity": "gcp-vpn-runner@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com"
+  },
   "clearedBy": "Khaliq's exact clearance words, YYYY-MM-DD",
   "managedDataPlane": { "provision": false },
   "relaycast": {
@@ -116,32 +155,72 @@ or secret payload. Example:
 `assertGcpInputs` accepts only those five target fields. `agentworkforce-dev1`
 and any other project, number, org, billing account, or region are refused
 before resources are declared. `203.0.113.10/32` is a documentation address.
-Replace it with the operator or VPN range. That replacement is not clearance
-to apply.
+Replace it with the operator or VPN range that can route to the private
+control-plane endpoint. A public laptop address cannot reach that endpoint.
+That replacement is not clearance to apply.
+
+Any enabled chart also requires `kubernetesExecutor`. During apply, after GKE
+exists but before the first Kubernetes resource, an apply-time Action requires
+that named `in-vpc` or `vpn` executor to open TCP 443 to GKE's concrete RFC1918
+endpoint within five seconds. Failure stops execution before Kubernetes
+manifests or Helm charts. The probe carries no bearer or kubeconfig credential.
+
+Every apply additionally requires
+`NINETY_SIX_BULLS_GCP_APPLY_NONCE` to contain a fresh Google-signed OIDC ID
+token for that exact executor service account. Its audience must be
+`https://96bulls.agentworkforce.dev/gcp-apply/<project>/<stage>`, and its signed
+email must equal `kubernetesExecutor.identity`. The stack verifies Google's
+signature, issuer, audience, email, issue time, and expiry, then atomically
+records the token digest in both a stage-scoped local ledger and an
+`ifGenerationMatch=0` marker under the existing Alchemy state bucket. The
+state-bucket marker makes the nonce single-use across executors and machines;
+it contains only proof metadata and a digest, never the token. Tokens older
+than five minutes, expiring tokens, wrong-stage/project/identity tokens, and
+replays are refused. The token is read only by the apply-time Action and is not
+written to Alchemy inputs, outputs, state, annotations, or errors. Its digest
+changes the Action input and gates every declared GCP and Kubernetes mutation.
+Plan does not execute or consume the nonce Action and performs no cloud
+mutation.
+
+The principal that mints or impersonates the executor identity needs the
+organization-approved ID-token mechanism (for impersonation, normally
+`roles/iam.serviceAccountTokenCreator` on that executor account). Separately,
+the deploying principal must have `iam.serviceAccounts.actAs`, normally via
+`roles/iam.serviceAccountUser`, on the dedicated GKE node service account. A
+read-only `testIamPermissions` Action proves `actAs` after the node account
+exists and before GKE creation; the cluster depends on that proof. These are
+external IAM prerequisites, not grants made by this stack.
 
 Before any plan, authenticate with the intended GCP identity and confirm the
 project independently:
 
 ```sh
 export CI=true
+export ALCHEMY_STAGE=gcp-conformance
 export NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT=agentrelay-96bulls-soc2-2610
 bin/96bulls plan gcp-conformance
 ```
 
-Do not pass `--yes`. Without `CI=true`, a missing Alchemy state bucket is
-created. The command above is the same read-only wrapper recorded below, and
-its last result is not an accepted plan.
+Do not pass `--yes`. The stack now refuses before Alchemy construction unless
+`CI=true`, because otherwise a missing state bucket could be created before
+apply authorization. The command above is the same read-only wrapper recorded
+below, and its last result is not an accepted plan.
 
 `plan` resolves the Alchemy GCP environment and refuses before the first
 resource when that live project or region differs from these inputs. The
 refusal says `Nothing was created.` Static tests cover that comparison. They
 do not call Google APIs, and they are not a cloud proof.
 
-The Relaycast chart version must be published before a repository-backed plan
-can render it. Its pinned 8.0.0 image predates the later workspace-bootstrap
-Secret support, so this lane does not pass an ineffective Secret setting. A GKE
-ManagedCertificate is declared, but DNS must point the configured hostname at
-the resulting load balancer before certificate issuance can complete.
+Before evaluating a Relaycast stage, place the exact public release artifact at
+`.96bulls/$STAGE/artifacts/relaycast-0.1.0.tgz`. The stack refuses a missing or
+digest-mismatched package before constructing the Alchemy Stack, provider
+layers, or state backend. It reads the source artifact once, verifies those
+captured bytes, and extracts only that buffer to a SHA-256-addressed cache
+path; it never reopens the source between verification and extraction. The
+pinned 8.0.0 image
+predates later workspace-bootstrap Secret support, so this lane does not pass
+an ineffective Secret setting. There is no Relaycast Ingress, load balancer,
+ManagedCertificate, or public DNS claim in this stack.
 
 ## Exact gaps
 
@@ -163,29 +242,36 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
   only on HTTP 404, and follows HTTP 409 with another get. A public address,
   authorized network, disabled backup/PITR, or mismatched name, region,
   version, edition, tier, availability, VPC, or PSA range is refused with no
-  update. A match also requires
-  `state: RUNNABLE`. A finished create polls
+  update. A match also requires `state: RUNNABLE` and one or more syntactically
+  valid `PRIVATE` IP addresses inside the configured `10.80.0.0/20` PSA
+  allocation. A finished create polls
   `operations/{id}` until `DONE`, then gets the instance and refuses the
   result unless that private body is `RUNNABLE`. A thrown insert, a failed operation, or a
-  timeout says to reconcile and does not say that nothing was created. Error
+  timeout says to reconcile and does not say that nothing was created. One
+  absolute monotonic deadline covers lookup, insert, 409 adoption, operation
+  polling, sleeps, and final confirmation. It is checked before and after every
+  request and sleep and before terminal success, including when a transport
+  ignores abort or synchronously blocks the event loop. Error
   text omits the response body and the bearer. The apply-time Action calls the
-  poster through an exact-host/path allowlisted transport. `@alchemy.run/gcp@2.0.0-beta.84`
+  poster through an exact-host/path allowlisted transport and requires the
+  separate exact apply confirmation
+  `NINETY_SIX_BULLS_CONFIRM_GCP_SQL_POST=<project>/<instance>`. `@alchemy.run/gcp@2.0.0-beta.84`
   `GCP.SQL.Instance` is not called.
 - The Auth Proxy deployment and its Workload Identity binding depend on the
   successful poster output, rather than a static `posted` flag.
   The PSA range is still shared with Memorystore.
-- Stack evaluation accepts `bulls96.enabled` only with the acknowledged managed
-  data plane. Nothing in that path has been applied.
+- An omitted or `enabled: false` bulls96 block does not throw and does not
+  install the release. Stack evaluation rejects `bulls96.enabled` even with the
+  acknowledged managed data plane until the external Redis TLS contract is
+  implemented. Nothing in that path has been applied.
 
-Release wiring that has not been applied:
+Release wiring that remains deliberately blocked:
 
-- The Helm values carry the GCS bucket, the Cloud SQL connection name, the
-  Redis host and port, and the Pub/Sub topic and subscription. Alleyoop gets
-  `auth.jwksUrl`. HMAC keys, Redis AUTH, query strings, and the database URL
-  are not in values. `HOOPDB_URL` stays in the named Secret. Memorystore AUTH
-  is off. The runtime service account is not granted `secretAccessor`.
-- `/readyz` and `/datapathz` check that data path only when the probe is armed.
-  The S3 default is unchanged.
+- 96Bulls Helm values are not emitted. The Redis CA/client/round-trip gate
+  rejects `bulls96.enabled` before cloud provider resolution. The runtime
+  service account is not granted `secretAccessor`.
+- Existing `/readyz` and `/datapathz` checks do not claim a TLS connection to
+  Memorystore. The S3 default is unchanged.
 - Relaycast stays `replicaCount: 1`, `runtime.backend: sqlite`, and
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
@@ -198,7 +284,10 @@ Apply, verify, and teardown have not been executed. Static work does not wait
 on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down` refuse every
 `gcp-*` stage. `bin/96bulls plan gcp-*` calls
 `bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
-and is not proof. Do not apply, deploy, destroy, or enable an API without a
+and is not proof. A non-zero Alchemy status exits the wrapper with that
+status. A child with no status exits 1. The 2026-10-30 missing-bucket run
+exited 0 only because that wrapper passed `allowFail`. Do not rerun it to
+prove the exit code. Do not apply, deploy, destroy, or enable an API without a
 separate request. If `gcloud` asks to enable an API, stop and do not answer
 yes. Set `CLOUDSDK_CORE_DISABLE_PROMPTS=1`. The binary on this machine, when
 it is not on `PATH`, is `/home/khaliqgant/google-cloud-sdk/bin/gcloud`.
@@ -228,7 +317,9 @@ quota was not read because the compute API is disabled. The same describe
 returned 404 again when this note was written. `CI=true` is what makes a
 missing state bucket fail instead of being created.
 That failed preflight predates the apply-time poster and is not evidence that
-the current exact head plans or applies successfully.
+the current exact head plans or applies successfully. The wrapper exited 0
+because it passed `allowFail`. A GCP plan now exits with the Alchemy status
+instead. Do not bootstrap the state bucket, enable APIs, or rerun the plan.
 
 Read-only preflight:
 
@@ -255,8 +346,9 @@ allowed to exist.
 The plan must show the live project and region matching the inputs before the
 first resource. Resource order after that is: the listed Google APIs with
 `disableOnDestroy: false`, custom VPC, subnet `10.52.0.0/20`, Cloud NAT, a
-`/20` Private Service Access range, the service-networking connection, Autopilot
-GKE with private nodes, the versioned GCS bucket, the empty Secret Manager
+`/20` Private Service Access range, the service-networking connection, regional
+standard GKE with a one-node default pool in `us-central1-a`, private nodes and
+a private endpoint, the versioned GCS bucket, the empty Secret Manager
 container, Artifact Registry, the runtime service account, Workload Identity for
 `96bulls-worker` and `96bulls-alleyoop`, `roles/storage.objectUser`, and
 `roles/cloudsql.client`. With `managedDataPlane.provision`, Memorystore Redis
@@ -266,13 +358,27 @@ input; `ensurePrivateCloudSql` runs only during an approved apply after the PSA
 connection resolves, and its non-secret output gates the proxy and 96Bulls.
 `GCP.SQL.Instance` must not appear as a resource.
 
+An apply that can insert Cloud SQL additionally needs the exact instance-scoped
+confirmation printed by the refusal, for example:
+
+```sh
+export NINETY_SIX_BULLS_CONFIRM_GCP_SQL_POST=agentrelay-96bulls-soc2-2610/awf-conformance-postgres
+```
+
+Do not set that value for a read-only plan.
+
 Verify, only after an approved apply and a wired poster:
 
 1. `gcloud sql instances describe INSTANCE --project="$PROJECT" --format='yaml(ipAddresses,settings.ipConfiguration)'` shows `ipv4Enabled: false`, the VPC `privateNetwork`, the PSA `allocatedIpRange`, and no `authorizedNetworks` or public address.
 2. The in-cluster proxy args start with `--private-ip`, and its Workload Identity binding exists only with that proxy.
-3. Redis `authEnabled` is false and `transitEncryptionMode` is `SERVER_AUTHENTICATION`. No `REDIS_AUTH` is in the workload env.
-4. Run the object-store suite against the GCS bucket under Workload Identity. Create, write, read, search, and replay one planted session through 96Bulls. `/readyz` and `/datapathz` return 200. Scan objects, traces, and logs for the planted markers.
-5. Pub/Sub redelivery reaches the dead-letter topic. Redis reconnects after a restart.
+3. Treat Redis as external and unattached. Before removing the code gate,
+   obtain its CA, implement CA-aware client configuration, and prove a TLS
+   round trip from the workload.
+4. Only after that follow-up code exists, run the object-store suite against
+   GCS under Workload Identity and create, write, read, search, and replay one
+   planted session through 96Bulls.
+5. Prove Pub/Sub redelivery and Redis reconnect behavior only after the runtime
+   adapter gate is removed by reviewed code.
 
 Teardown, only after that apply, in this order:
 
