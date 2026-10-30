@@ -177,6 +177,19 @@ describe("RelayHistory export transform", () => {
     ).toThrow(/equal RelayHistory revisions/);
   });
 
+  it("folds one revision that the export and the live client stored at different times", () => {
+    const exported = record("same", "7", 1, { received_at: "2026-10-29T00:00:00.000Z" });
+    const live = record("same", "7", 1, { received_at: "2026-10-30T00:00:00.000Z" });
+    for (const records of [[exported, live], [live, exported]])
+      expect(normalizeRelayhistoryRecords(records).map((value) => value.record_id)).toEqual(["same"]);
+    expect(() =>
+      normalizeRelayhistoryRecords([
+        record("same", "7", 1),
+        record("same", "7", 1, { kind: "tool_call" }),
+      ]),
+    ).toThrow(/equal RelayHistory revisions/);
+  });
+
   it("bounds record identities and signed-bigint revisions", () => {
     expect(() =>
       parseRelayhistoryRecord(JSON.stringify(record("id", "9223372036854775808", 1))),
