@@ -23,6 +23,12 @@ Read-only, structure-only samples from Neon production on 2026-10-30
 
 ## Unit and layout
 
+- **Delivery path:** the export is a courier whose source is Neon instead of a
+  local `history.db`. It uses the same protocol as `src/alleyoop/courier.ts`:
+  raw ranges go through the ingest API's server-side scrubbing chunk hop
+  (`sealRawChunk`), then the v1 manifest is written, then the pipeline is
+  notified. Scrubbing, chunk keys, manifest validation and indexing are
+  therefore exactly the live path's, with no second implementation.
 - **One exported session** is one `(workspace_id, machine_id, harness,
   session_id)` in the v1 layout:
   `v1/ws=…/m=…/h=…/d=…/s=…/manifest.json` plus
@@ -45,10 +51,10 @@ Read-only, structure-only samples from Neon production on 2026-10-30
   compressed with zstd. Each has `records`, `first_ts` and `last_ts`. There is
   one epoch, and `raw.state` is `closed` unless the session saw activity after
   T0 started (then `open`, so live delivery can continue it).
-- **Scrubbing:** every chunk goes through the vendored 96Bulls scrub
-  (`lib/scrub.ts`) before it is stored, and `raw.scrub = {ruleset, version}`
-  is set. Unscrubbed manifests are quarantined by every reader, so this is not
-  optional.
+- **Scrubbing:** done by the ingest hop (`sealRawChunk`, rule set
+  `relayhistory-scrub`), as for live uploads. It sets
+  `raw.scrub = {ruleset, version}`. Unscrubbed manifests are quarantined by
+  every reader, so the export never writes chunks directly.
 - **Marker:** `extensions["client.relayhistory_export"] = {version: 1, source:
   "neon.delivery_records", exported_at}`. Its presence tells the transform this
   is the RelayHistory record shape, not a harness log.
@@ -94,10 +100,16 @@ manifest body.
 
 ## Open items
 
-- **O1:** resolve machine identity from `origin_id`, and fix the rule for
-  records whose origin is unknown.
-- **O2:** the authenticated, audited path that lets the export assert
-  `user_id` per session.
+- **O1 (resolved):** `delivery_origins` has no machine column. The machine
+  comes from the session's `convergence_events.machine_id` (99.8% of events
+  link to a delivery record). Records of a session with no event fall back to
+  machine `unknown-origin-<origin_id>`, so they never merge into another
+  machine's stream.
+- **O2:** identity. The ingest API takes `user_id` from the bearer token, as
+  for every courier. The export needs a RelayAuth assertion per Neon user: a
+  migration service principal with an audited, org-scoped "act as this user
+  for ingest" grant, time-boxed to the export. This is an auth decision for
+  the RelayAuth and ingest owners, and Khaliq.
 - **O3:** the transform's normalizer for `client.relayhistory_export`
   sessions, so replay, briefs and embeddings read them like live sessions.
 - **O4:** sessions active across T0. Live delivery after T0 continues the
