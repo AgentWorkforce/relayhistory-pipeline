@@ -332,6 +332,47 @@ describe("SQL Admin idempotent poster", () => {
     expect(spec.posted).toBe(false);
   });
 
+  test("rejects an unsafe 409 follow-up without polling", async () => {
+    const spec = privateCloudSqlSpec(input);
+    const failed = scripted([
+      { status: 404 },
+      { status: 409 },
+      { status: 200, body: { ...matchingInstance(spec), state: "FAILED" } },
+    ]);
+    await expect(ensurePrivateCloudSql(spec, credential, failed.transport, fastPoll())).rejects.toThrow(/not runnable/);
+    expect(failed.calls.map((call) => call.method)).toEqual(["GET", "POST", "GET"]);
+
+    const publicInstance = scripted([
+      { status: 404 },
+      { status: 409, body: { error: { message: token } } },
+      { status: 200, body: matchingInstance(spec, { ipv4Enabled: true }) },
+    ]);
+    let caught: Error | undefined;
+    try {
+      await ensurePrivateCloudSql(spec, credential, publicInstance.transport, fastPoll());
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught?.message).toMatch(/refused to adopt/);
+    expect(caught?.message).not.toContain(token);
+    expect(caught?.message).not.toMatch(/timed out/);
+    expect(publicInstance.calls.map((call) => call.method)).toEqual(["GET", "POST", "GET"]);
+  });
+
+  test("rejects invalid poll controls before any request", async () => {
+    const spec = privateCloudSqlSpec(input);
+    for (const poll of [
+      fastPoll({ deadlineMs: 0 }),
+      fastPoll({ intervalMs: 0 }),
+      fastPoll({ maxPolls: 0 }),
+      fastPoll({ deadlineMs: Number.NaN }),
+    ]) {
+      const poster = scripted([]);
+      await expect(ensurePrivateCloudSql(spec, credential, poster.transport, poll)).rejects.toThrow(/Nothing was created/);
+      expect(poster.calls).toHaveLength(0);
+    }
+  });
+
   test("redacts failed operations, timeouts, and transport errors", async () => {
     async function capture(steps: Array<SqlAdminEnsureResponse | "throw">, pattern: RegExp) {
       const spec = privateCloudSqlSpec(input);
@@ -383,7 +424,7 @@ describe("SQL Admin idempotent poster", () => {
 
     const missingStatus = await capture(
       [{ status: 404 }, { status: 200, body: { name: "op-1" } }],
-      /outcome is uncertain/,
+      /operation is malformed/,
     );
     expect(missingStatus).toEqual([`GET ${instanceUrl}`, `POST ${insertUrl}`]);
 
@@ -444,7 +485,7 @@ describe("SQL Admin idempotent poster", () => {
         { status: 200, body: { name: "op-1", status: "PENDING" } },
         { status: 200, body: {} },
       ],
-      /outcome is uncertain/,
+      /operation is malformed/,
     );
     expect(malformedPoll).toEqual([`GET ${instanceUrl}`, `POST ${insertUrl}`, `GET ${operationUrl}`]);
 

@@ -301,6 +301,12 @@ function uncertain(projectId: string, instanceName: string): never {
   );
 }
 
+function malformed(projectId: string, instanceName: string): never {
+  throw new Error(
+    `96bulls: Cloud SQL Admin operation is malformed for ${projectId}/${instanceName}; reconcile that instance before retry or teardown.`,
+  );
+}
+
 function timedOut(projectId: string, instanceName: string): never {
   throw new Error(
     `96bulls: Cloud SQL Admin operation timed out for ${projectId}/${instanceName}; reconcile that instance before retry or teardown.`,
@@ -471,7 +477,14 @@ export async function ensurePrivateCloudSql(
       if (again.status === 200) {
         const kind = classifyExisting(spec, again.body);
         if (kind === "match") return { created: false, operation: null };
-        if (kind !== "not-ready") rejectAdoption(projectId, instanceName);
+        // Only the normal create window is worth another GET. FAILED and any
+        // other non-RUNNABLE state will not become a private match.
+        if (kind === "not-ready" && asRecord(again.body)?.state === "PENDING_CREATE") {
+          await clock.sleep(clock.intervalMs);
+          continue;
+        }
+        if (kind === "not-ready") rejectNotReady(projectId, instanceName);
+        rejectAdoption(projectId, instanceName);
       } else if (again.status !== 404) {
         uncertain(projectId, instanceName);
       }
@@ -484,7 +497,7 @@ export async function ensurePrivateCloudSql(
   if (!operationId) uncertain(projectId, instanceName);
   const initial = operationState(inserted.body);
   if (initial === "failed") failedOperation(projectId, instanceName);
-  if (initial === "invalid") uncertain(projectId, instanceName);
+  if (initial === "invalid") malformed(projectId, instanceName);
   if (initial !== "done") {
     const operationUrl = `https://sqladmin.googleapis.com/v1/projects/${projectId}/operations/${operationId}`;
     const started = clock.now();
@@ -499,6 +512,7 @@ export async function ensurePrivateCloudSql(
         break;
       }
       if (state === "failed") failedOperation(projectId, instanceName);
+      if (state === "invalid") malformed(projectId, instanceName);
       if (state !== "pending") uncertain(projectId, instanceName);
       await clock.sleep(clock.intervalMs);
     }

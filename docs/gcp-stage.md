@@ -219,8 +219,11 @@ gcloud projects describe "$PROJECT" --format='value(projectId,projectNumber)'
 gcloud billing projects describe "$PROJECT" --format='value(billingEnabled,billingAccountName)'
 ```
 
-Stop if the project is one of the denied names or billing is off. Do not
-enable `compute.googleapis.com` to read quota. Write
+Stop unless every field matches: project `agentrelay-96bulls-soc2-2610`,
+number `955297012355`, parent org `929835122282`, billing account
+`014D50-E96D1A-DE6360`, and region `us-central1`. A denied name, a different
+number, org, billing account, or region, or billing that is off is a
+mismatch. Do not enable `compute.googleapis.com` to read quota. Write
 `.96bulls/$STAGE/gcp-inputs.json` with this project id, number
 `955297012355`, region `us-central1`, and no secret payload. A later plan
 still needs `CI=true` and must not pass `--yes` until the state bucket is
