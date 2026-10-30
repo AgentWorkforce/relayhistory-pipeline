@@ -8,7 +8,6 @@ import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import {
   commitBackfillEpoch,
   isObjectStoreError,
-  MANIFEST_EPOCHS_CAPABILITY,
   manifestKey,
   objectKey,
   objectStoreManifestReader,
@@ -25,7 +24,7 @@ import {
 } from "../../shared/vendor.ts";
 import { runCourierOnce, type CourierConfig } from "../courier.ts";
 import { feedRecordId } from "../feed-records.ts";
-import { createCourierManifestRoutes, MANIFEST_READERS } from "../manifests.ts";
+import { createCourierManifestRoutes } from "../manifests.ts";
 
 const ORG = "org_test";
 const WORKSPACE = "default";
@@ -34,7 +33,7 @@ export const EXPORTER = "migration:mgr_export";
 export const MARKER = { version: 1, source: "neon.delivery_records" };
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 
-const authFor = (kind: string | undefined) => ({
+const authFor = (kind: string | undefined, machineId: string | undefined) => ({
   userId: "user",
   orgId: ORG,
   workspaceId: WORKSPACE,
@@ -42,7 +41,7 @@ const authFor = (kind: string | undefined) => ({
   scopes: ["rth:sync"],
   claims: kind === "migration"
     ? { meta: { tokenClass: "migration_assertion", grantId: "mgr_export", planDigest: "a".repeat(64) } }
-    : {},
+    : machineId ? { meta: { machineId } } : {},
   historyOrigin: "https://history.example",
 });
 
@@ -50,6 +49,7 @@ const authFor = (kind: string | undefined) => ({
 function asLegacyWriter(init: RequestInit): RequestInit {
   const body = JSON.parse(String(init.body)) as { manifest: ManifestV1 };
   delete body.manifest.writer.capabilities;
+  body.manifest.writer.plugin_version = "96bulls-courier/0.2.0";
   return { ...init, body: JSON.stringify(body) };
 }
 
@@ -72,25 +72,26 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
   db.prepare("INSERT INTO sessions (session_id, source, raw_path, first_activity_ms, last_activity_ms, cwd, agent_version) VALUES (?, ?, ?, ?, ?, ?, ?)").run(sessionId, "claude", rawPath, STARTED, STARTED + 100, null, "1.0.0");
   db.close();
 
+  /** The fake issuer and gate: a real token's claim, and attested readers. */
+  const gate = { missing: [] as string[], requeued: [] as { message: unknown; delaySeconds: number }[] };
+  const identity: { machineClaim?: string } = { machineClaim: machineId };
   const store = createFsStore({ root });
   const raw = { store, provider: "fs" as const, bucket: "raw" };
   const routes = createCourierManifestRoutes({
     manifests: objectStoreManifestReader(store, { provider: "fs", bucket: "raw" }),
     raw,
     send: async () => {},
+    missingReaders: async () => gate.missing,
+    requeueBackfill: async (_env, message, delaySeconds) => void gate.requeued.push({ message, delaySeconds }),
   });
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     c.set("correlationId", "test");
-    c.set("auth", authFor(c.req.header("x-test-auth")) as never);
+    c.set("auth", authFor(c.req.header("x-test-auth"), identity.machineClaim) as never);
     await next();
   });
   app.route("/v1", routes);
-  const env: Record<string, string> = {
-    PIPELINE_ORG_ID: ORG,
-    RELAYHISTORY_ORIGIN: "https://history.example",
-    MANIFEST_READER_CAPABILITIES: MANIFEST_READERS.map((r) => `${r}=${MANIFEST_EPOCHS_CAPABILITY}`).join(","),
-  };
+  const env: Record<string, string> = { PIPELINE_ORG_ID: ORG, RELAYHISTORY_ORIGIN: "https://history.example" };
   const location: SessionLocation = {
     workspaceId: WORKSPACE,
     machineId,
@@ -143,6 +144,12 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
     startMode: "all",
     ...(options.format ? { format: options.format } : {}),
   });
+
+  const post = (body: unknown, auth?: "migration") => app.request("/v1/pipeline/manifests", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-machine-id": machineId, "x-session-id": sessionId, ...(auth ? { "x-test-auth": auth } : {}) },
+    body: JSON.stringify(body),
+  }, env);
 
   const stored = async (): Promise<{ manifest: ManifestV1; version: ObjectVersion } | undefined> => {
     try {
@@ -215,7 +222,7 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
   };
 
   return {
-    app, env, store, key, location, counts, hooks, machineId, statePath, rawPath, stored, seal, exporter, exportText, liveRecords, run,
+    app, env, gate, identity, store, key, location, counts, hooks, machineId, statePath, rawPath, stored, seal, post, exporter, exportText, liveRecords, run,
     /** One harness line: in the transcript, and as the row it became. */
     write: async (line: string) => {
       await appendFile(rawPath, `${line}\n`);

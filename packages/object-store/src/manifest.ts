@@ -25,6 +25,15 @@ export const MIGRATION_ID_PREFIX = "migration:";
  * until the session's writer and every reader advertise it.
  */
 export const MANIFEST_EPOCHS_CAPABILITY = "manifest-epochs-v2";
+/**
+ * Client releases known to adopt a backfill and resume after it. Allowlisted
+ * here because `writer.capabilities` is only what a client says of itself.
+ */
+export const KNOWN_CLIENT_RELEASES: Readonly<
+  Record<string, readonly string[]>
+> = {
+  "96bulls-courier/0.3.0": [MANIFEST_EPOCHS_CAPABILITY],
+};
 /** The exporter's own extension key. */
 export const EXPORT_EXTENSION = "client.relayhistory_export";
 
@@ -723,7 +732,9 @@ export function chunkKeys(
 /** The session's last writer can adopt a backfill epoch and resume after it. */
 export function writerUnderstandsBackfill(manifest: ManifestV1): boolean {
   return (
-    manifest.writer.capabilities?.includes(MANIFEST_EPOCHS_CAPABILITY) ?? false
+    KNOWN_CLIENT_RELEASES[manifest.writer.plugin_version]?.includes(
+      MANIFEST_EPOCHS_CAPABILITY,
+    ) ?? false
   );
 }
 

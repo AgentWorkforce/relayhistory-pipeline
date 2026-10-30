@@ -41,7 +41,7 @@ import {
   type BearerTokenProvider,
 } from "./relay-auth-token.ts";
 
-export const PLUGIN_VERSION = "96bulls-courier/0.2.0";
+export const PLUGIN_VERSION = "96bulls-courier/0.3.0";
 const MAX_CHUNK_BYTES = 4 * 1024 * 1024;
 
 interface SessionRow {
@@ -325,11 +325,11 @@ async function rebaseSession(cfg: CourierConfig, machineId: string, session: Ses
   return "rebased";
 }
 
-const blankUpload = {
+const blankUpload = () => ({
   revision: 0, uploaded_offset: 0, chunks: [], closed: false, pending: false, pending_manifest: undefined,
   pending_previous_version: undefined, scrub: undefined, manifest_key: undefined, manifest_version: undefined,
   base: undefined, needs_rebase: false,
-};
+});
 
 export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: number; uploaded: number; chunks: number; conditions: CourierCondition[] }> {
   const state = await loadState(cfg.statePath, cfg.machineId, cfg.startMode);
@@ -363,7 +363,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
       verified.add(st.manifest_key);
     } else if (reconciliation === "reset") {
       log.info("manifest missing in locker; re-uploading with the same ids", { session_uuid: st.session_uuid, trace_id: st.trace_id });
-      state.sessions[key] = { ...st, ...blankUpload };
+      state.sessions[key] = { ...st, ...blankUpload() };
     } else {
       log.warn("manifest status unavailable; keeping durable upload state", { session_uuid: st.session_uuid, trace_id: st.trace_id, status: head?.status });
       deferred.add(key);
@@ -412,7 +412,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
         await saveState(cfg.statePath, state);
         continue;
       }
-      if (rebased === "reset") session = state.sessions[key] = { ...session, ...blankUpload };
+      if (rebased === "reset") session = state.sessions[key] = { ...session, ...blankUpload() };
       await saveState(cfg.statePath, state);
     }
     const uploading = session;

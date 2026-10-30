@@ -15,7 +15,14 @@ import { enrichMessage } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { runWorker } from "../shared/worker.ts";
 import { hoopDbSessionIndex } from "./index.ts";
-import { postgresPipelineQueue } from "../shared/vendor.ts";
+import {
+  backfillActivationHandler,
+  backfillActivationLimits,
+  missingReaders,
+  postgresBackfillReady,
+  postgresPipelineQueue,
+  postgresReadinessStore,
+} from "../shared/vendor.ts";
 import { withSpan } from "../shared/telemetry.ts";
 import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 
@@ -24,7 +31,8 @@ let lastReconcileMinute = -1;
 
 await runWorker({
   service: "hoopdb-indexer",
-  stages: ["object-landed", "session-indexed"],
+  stages: ["object-landed", "session-indexed", "backfill-activation"],
+  attests: ["session-index", "hoopdb"],
   impl: (db, current) => ({
     index: hoopDbSessionIndex({
       db,
@@ -35,6 +43,12 @@ await runWorker({
   }),
   handlers: (db, current) => ({
     // object-landed comes from pipelineQueueDeps; session-indexed from impl.index.
+    "backfill-activation": backfillActivationHandler({
+      missing: () => missingReaders({ key: process.env.MANIFEST_READINESS_KEY, store: postgresReadinessStore(db) }),
+      ready: postgresBackfillReady(db),
+      requeue: (message, delaySeconds) => postgresPipelineQueue(db).send(message, { delaySeconds }),
+      limits: backfillActivationLimits(process.env),
+    }),
   }),
   tick: async (db, now) => {
     const every = integer("RECONCILE_EVERY_MINUTES", 5);

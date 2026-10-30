@@ -46,6 +46,7 @@ export {
   ChunkEntrySchema,
   EXPORT_EXTENSION,
   EpochRecordSchema,
+  KNOWN_CLIENT_RELEASES,
   MANIFEST_EPOCHS_CAPABILITY,
   MIGRATION_ID_PREFIX,
   ScrubMarkerSchema,

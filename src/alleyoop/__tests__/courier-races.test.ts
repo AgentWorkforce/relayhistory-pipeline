@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
-import { MANIFEST_EPOCHS_CAPABILITY, objectKey, type ManifestV1 } from "../../shared/vendor.ts";
-import { MANIFEST_READERS } from "../manifests.ts";
+import { appendBackfillEpoch, MANIFEST_EPOCHS_CAPABILITY, MANIFEST_READERS, objectKey, type ManifestV1 } from "../../shared/vendor.ts";
 import { createHash } from "node:crypto";
 import { sourceResumeOffset } from "../courier.ts";
 import { feedRanges, feedRecordId } from "../feed-records.ts";
@@ -245,23 +244,38 @@ describe("courier edits the stored manifest (C4-C7)", () => {
 describe("activation gate (G1) and old couriers (D1)", () => {
   const refused = { code: "activation_required" };
 
-  test("G1: refuses while any reader lacks the capability, and when unconfigured", async () => {
+  test("G1: refuses while any reader is unattested, and requeues durably", async () => {
     const w = await world({ format: "ndjson" });
     await w.write(line(0));
     await w.run();
-    const all = w.env.MANIFEST_READER_CAPABILITIES!;
     for (const reader of MANIFEST_READERS) {
-      w.env.MANIFEST_READER_CAPABILITIES = all.split(",").filter((p) => !p.startsWith(`${reader}=`)).join(",");
+      w.gate.missing = [reader];
       await expect(w.exporter(w.exportText("pre-t0"))).rejects.toMatchObject(refused);
     }
-    w.env.MANIFEST_READER_CAPABILITIES = all.replace(/-v2/g, "-v1");
-    await expect(w.exporter(w.exportText("pre-t0"))).rejects.toMatchObject(refused);
-    delete w.env.MANIFEST_READER_CAPABILITIES;
-    await expect(w.exporter(w.exportText("pre-t0"))).rejects.toMatchObject(refused);
     expect((await w.stored())!.manifest.raw.epochs).toHaveLength(1);
+    expect(new Set(w.gate.requeued.map((r) => (r.message as { workKey: string }).workKey)).size).toBe(1);
+    expect(w.gate.requeued[0]).toMatchObject({ delaySeconds: 60, message: { stage: "backfill-activation", payload: { attempt: 1, grantId: "mgr_export" } } });
 
-    w.env.MANIFEST_READER_CAPABILITIES = all;
+    w.gate.missing = [];
     expect(await w.exporter(w.exportText("pre-t0"))).toMatchObject({ status: "committed" });
+  });
+
+  test("409 activation_required carries Retry-After", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.run();
+    w.gate.missing = ["transform"];
+    const { manifest, version } = (await w.stored())!;
+    const sealed = await w.seal(w.exportText("pre-t0"), 1, 1, manifest.trace_id);
+    const next = await appendBackfillEpoch(manifest, {
+      openedBy: "migration:mgr_export",
+      openedAt: new Date().toISOString(),
+      chunks: [sealed.entry],
+      marker: { version: 1, source: "neon.delivery_records" },
+    });
+    const res = await w.post({ key: w.key, manifest: next, previousVersion: version }, "migration");
+    expect(res.status).toBe(409);
+    expect(res.headers.get("Retry-After")).toBe("60");
   });
 
   test("G1: refuses a session whose writer lacks the capability", async () => {
@@ -302,5 +316,68 @@ describe("activation gate (G1) and old couriers (D1)", () => {
     const { lines, manifest } = await w.liveRecords();
     expect(lines).toHaveLength(6);
     expect(uploadedRecords(manifest)).toBe(6);
+  });
+});
+
+describe("machine claim", () => {
+  test("rebase needs a claim: without one the full manifest is withheld and the courier defers", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.run();
+    await w.write(line(1));
+    w.hooks.beforeManifest = async () => {
+      w.hooks.beforeManifest = undefined;
+      await w.exporter(w.exportText("pre-t0"));
+      w.identity.machineClaim = undefined;
+    };
+    await w.run();
+    await settle(w);
+    const stuck = (await w.state()).sessions["claude:session-a"];
+    expect(stuck.needs_rebase).toBe(true);
+    expect(stuck.fenced).toBeFalsy();
+    expect((await w.stored())!.manifest.raw.epochs.map((e) => e.reason)).toEqual(["initial", "backfill"]);
+
+    w.identity.machineClaim = w.machineId;
+    await settle(w);
+    expect((await w.liveRecords()).lines).toHaveLength(2);
+  });
+
+  const status = (w: World, query: string) =>
+    w.app.request(`/v1/pipeline/manifests/status?${new URLSearchParams({ key: w.key, ...Object.fromEntries(new URLSearchParams(query)) })}`, {}, w.env);
+
+  test("the query never proves a machine: only the claim returns the manifest", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.run();
+    const q = `machine=${w.machineId}&writer=${w.machineId}&manifest=1`;
+    expect(await (await status(w, q)).json()).toHaveProperty("manifest");
+
+    w.identity.machineClaim = undefined;
+    expect(await (await status(w, q)).json()).not.toHaveProperty("manifest");
+    expect((await status(w, `machine=${w.machineId}&writer=someone&manifest=1`)).status).toBe(403);
+
+    w.identity.machineClaim = "another-machine";
+    expect(await (await status(w, q)).json()).not.toHaveProperty("manifest");
+    expect((await status(w, `machine=another-machine&writer=${w.machineId}&manifest=1`)).status).toBe(403);
+  });
+
+  test("POST refuses a mismatched claim in both modes, and a missing one only when required", async () => {
+    for (const mode of ["compat", "required"]) {
+      const w = await world({ format: "ndjson" });
+      w.env.MANIFEST_MACHINE_CLAIM = mode;
+      await w.write(line(0));
+      w.identity.machineClaim = "another-machine";
+      await w.run();
+      expect(await w.stored()).toBeUndefined();
+
+      w.identity.machineClaim = undefined;
+      await w.run();
+      if (mode === "required") expect(await w.stored()).toBeUndefined();
+      else expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
+
+      w.identity.machineClaim = w.machineId;
+      await settle(w);
+      expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
+    }
   });
 });

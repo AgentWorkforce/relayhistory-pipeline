@@ -16,7 +16,7 @@ import {
   type SessionLocation,
   type StageMessage,
 } from "../../shared/vendor.ts";
-import { createCourierManifestRoutes, MANIFEST_READERS } from "../manifests.ts";
+import { createCourierManifestRoutes } from "../manifests.ts";
 
 const ORG = "org_test";
 const WORKSPACE = "ws_test";
@@ -72,7 +72,7 @@ async function fixture() {
       started_at: AT,
       ...(revision > 1 ? { ended_at: AT } : {}),
     },
-    writer: { delivery_instance_id: writer, plugin_version: "test", capabilities: [MANIFEST_EPOCHS_CAPABILITY] },
+    writer: { delivery_instance_id: writer, plugin_version: "96bulls-courier/0.3.0", capabilities: [MANIFEST_EPOCHS_CAPABILITY] },
     raw: {
       owner: MACHINE,
       state: revision > 1 ? "closed" : "open",
@@ -96,6 +96,7 @@ async function fixture() {
     manifests: reader,
     raw,
     send: async (_env, _stage, message) => void sent.push(message),
+    missingReaders: async () => [],
   });
   const app = new Hono<AppEnv>();
   let auth = {
@@ -148,7 +149,6 @@ async function fixture() {
     PIPELINE_ORG_ID: ORG,
     RELAYHISTORY_ORIGIN: "https://history.example",
     PIPELINE_TELEMETRY_ID_KEY: TELEMETRY_KEY,
-    MANIFEST_READER_CAPABILITIES: MANIFEST_READERS.map((r) => `${r}=${MANIFEST_EPOCHS_CAPABILITY}`).join(","),
   };
   const post = (body: unknown, explicitAuth?: "live" | "migration" | "malformed") => app.request("/v1/pipeline/manifests", {
     method: "POST",

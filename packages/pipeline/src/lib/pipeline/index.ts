@@ -33,6 +33,8 @@ export * from "./errors.js";
 export * from "./events.js";
 export * from "./queue.js";
 export * from "./registry.js";
+export * from "./backfill-activation.js";
+export * from "./manifest-readiness.js";
 export * from "./relayhistory-transform.js";
 export * from "./stages.js";
 export * from "./telemetry-ids.js";

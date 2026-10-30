@@ -19,6 +19,8 @@ import {
   type Bindings,
   type PipelineStage,
   type StageMessage,
+  missingReaders,
+  postgresReadinessStore,
 } from "../shared/vendor.ts";
 import { openHoopDb, waitForHoopDb, waitForSchema } from "../shared/db.ts";
 import { enrichMessage, requestIdentity } from "../shared/enrich.ts";
@@ -72,7 +74,14 @@ export async function buildIngestApp() {
     deadLetters: () => deadLetters,
     send,
   });
-  const courierManifests = createCourierManifestRoutes({ manifests: reader, raw: lockerStore(), send });
+  const readiness = postgresReadinessStore(db);
+  const courierManifests = createCourierManifestRoutes({
+    manifests: reader,
+    raw: lockerStore(),
+    send,
+    missingReaders: () => missingReaders({ key: process.env.MANIFEST_READINESS_KEY, store: readiness }),
+    requeueBackfill: (_env, message, delaySeconds) => queue.send(message, { delaySeconds }),
+  });
 
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
