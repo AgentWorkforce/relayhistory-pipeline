@@ -145,14 +145,41 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     `session_rollup_dirty` and `onboarding_rollup_dirty`. Their deferred
     triggers rebuild the session from all of its rows, and the tool drops the
     session's `session_timing_cache` rows.
-    **Open:** `session_catalog` and `session_catalog_agents` rows that the
-    delivery projection built after T0 for a straddling session reflect only
-    post-T0 records. They need a reprojection pass, owned with the index
-    contract (helm-chart-chief, #27).
+    **Catalog (no reprojection needed, verified instead).** `session_catalog`,
+    its relationships, markers, commit links and `session_catalog_agents` hold
+    one *winning* record per key, chosen by the highest
+    `delivery_catalog_acceptance.accepted_seq`. They are not aggregates. The
+    sequence fence puts every post-T0 acceptance above every pre-T0 one, so a
+    straddling session's post-T0 winner stays correct after the backfill, and
+    pre-T0-only keys arrive with the backfill. A reprojection would also be a
+    no-op: `project_delivery_catalog_key` keeps the current winner by design.
+    Gate (read-only, must return 0 rows): each catalog row's record has the
+    highest acceptance sequence among the delivery records for its key.
+    ```sql
+    SELECT c.org_id, c.workspace_id, c.source, c.session_id
+      FROM sessions.session_catalog c
+      JOIN sessions.delivery_catalog_acceptance w
+        ON (w.org_id, w.workspace_id, w.origin_id, w.record_id) = (c.org_id, c.workspace_id, c.origin_id, c.record_id)
+     WHERE EXISTS (
+       SELECT 1 FROM sessions.delivery_records d
+         JOIN sessions.delivery_catalog_acceptance a
+           ON (a.org_id, a.workspace_id, a.origin_id, a.record_id) = (d.org_id, d.workspace_id, d.origin_id, d.record_id)
+        WHERE d.org_id = c.org_id AND d.workspace_id = c.workspace_id AND d.kind = 'session'
+          AND sessions.delivery_catalog_key(d.kind, d.source, d.session_id, d.operation, d.payload)
+              = jsonb_build_array('session', c.source, c.session_id)
+          AND a.accepted_seq > w.accepted_seq)
+       AND EXISTS (SELECT 1 FROM sessions.convergence_events e
+                    WHERE e.org_id = c.org_id AND e.session_id = c.session_id AND e.ts >= :t0);
+    ```
+    **Residual risk:** a client that re-uploads an *older* revision of a
+    record after T0 is accepted as new, because Supabase doesn't have the newer
+    pre-T0 revision yet, and the backfill then keeps it. Uploaders send forward
+    deltas, and HoldLog replays are newer than Neon, so this needs an unusual
+    client. The gate above catches it for catalog keys.
 14. **[A9]** Remove the Neon read fallback only once
     `migration:copy --mode=check --tables=<all legacy tables>` exits 0 (no
     source row missing on Supabase), the straddling rebuild has run, and the
-    catalog reprojection gate is green.
+    catalog winner gate returns no rows.
 
 ## Rehearsal evidence
 
