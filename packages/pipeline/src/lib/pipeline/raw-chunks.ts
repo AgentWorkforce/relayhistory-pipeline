@@ -41,14 +41,6 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  */
 export const SCRUB_RULESET_VERSION = 1;
 
-/** Codes for a chunk the scrubber could not vouch for: refused, never stored. */
-export const SCRUB_REFUSAL_CODES: ReadonlySet<string> = new Set([
-  "chunk_not_utf8",
-  "chunk_unsegmentable",
-  "chunk_string_too_long",
-  "chunk_stored_unscrubbed",
-]);
-
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";
 export const META_RAW_BYTES = "raw-bytes";

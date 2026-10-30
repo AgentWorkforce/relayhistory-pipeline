@@ -1,8 +1,9 @@
 # Cutover observability: metrics contract and T0 dashboard
 
-Status: contract and read-only sampler. Authorizes no live action. Running the
-sampler against a real database, wiring a backend and every T0 step still need
-Khaliq's explicit OK. The T0 steps are those of
+Status: contract and runbook. The code is in #47. Authorizes no live action.
+Applying its migration, running the sampler against a real database, creating
+the sampler's login or alert token, and every T0 step still need Khaliq's
+explicit OK. The T0 steps are those of
 `docs/relayhistory-switch-first-dag.md`.
 
 **Thresholds are proposals.** None has been measured against production
@@ -13,23 +14,70 @@ readiness 3 and 4), and record the pre-T0 baseline of each counter on the day.
 
 | Part | State |
 | --- | --- |
-| Stage lag, queue depth, DLQ depth, stage outcomes | Built here: `bun run cutover:metrics` |
-| Ingest status by route, scrub refusals | Built here: log lines from `alleyoop-ingest` |
+| Stage lag, queue depth, DLQ depth, stage outcomes | #47: `bun run cutover:metrics` |
+| Ingest status by route, scrub refusals | #47: log lines from `alleyoop-ingest` |
 | Gate phase, HoldLog, held-write replay | Specified here, **implemented in relayhistory-cloud #224** |
 | Read fallback | Specified here, implemented with **G3, which is unowned** |
 | Export coverage | Specified here, implemented with **E1 (96BullSessions #40)** |
 | Neon write fence, Neon load | Operator SQL below, run by hand through a read-only role. Not run against Neon yet |
-| Metrics backend, alert evaluation, dashboard product | **Does not exist.** `docs/observability-contract.md` lists no hosted log exporter either |
+| Alerts | #47 sends four rules through nightcto, see "Alert transport". **Unproven: nothing has been delivered** |
+| Time-series backend, dashboard product | **Not built, and not needed for T0.** Panels are the sampler's log lines |
 
-Until a backend exists, an **alert below means a condition a person on the T0
-bridge checks**, not a page. Nothing will wake anyone. Follow the sampler on a
-terminal:
+Follow the sampler on a terminal. Its login is a member of
+`cutover_metrics_reader`; see "Sampler access".
 
 ```sh
-read -r -s CUTOVER_METRICS_DB_URL < <(op read "op://96Bulls-prod/<service role>/url")
+read -r -s CUTOVER_METRICS_DB_URL < <(op read "op://96Bulls-prod/<cutover metrics login>/url")
 export CUTOVER_METRICS_DB_URL
 bun run cutover:metrics --interval=15 --window=300 2>&1 | jq -c 'select(.metric or .level == "error")'
 ```
+
+## Alert transport
+
+Alerts go through the existing transport, not a new backend: **nightcto's
+evidence webhook**, `POST /webhooks/cloud-runtime`, schema
+`cloud-runtime-evidence/2`. See `docs/alerting-contract.md` and
+`packages/relay-entrypoint/src/cloud-runtime-webhook.ts` in `nightcto`. It runs
+on GCP Cloud Run, so it shares no failure domain with Supabase or Neon. nightcto
+persists the evidence, dedupes on `incidentFingerprint`, suppresses repeats for
+15 minutes, delivers to Slack and records the outcome. The sampler only decides
+what is wrong.
+
+- **Config:** `NIGHTCTO_EVIDENCE_URL` and `NIGHTCTO_EVIDENCE_TOKEN`, from
+  1Password. Neither set means alerts are off, and
+  `cutover.alerts.configured = 0` says so. One set, a placeholder, or any URL
+  that isn't the https webhook stops the sampler.
+- **Dedupe scope:** nightcto isolates evidence with no workspace per occurrence,
+  which would page on every sample. Evidence therefore carries
+  `workspace.relayId = 96bulls-platform`. That is a fixed scope, not a real Relay
+  workspace, so **nightcto's owner should confirm it**.
+- **Recovery:** `outcome: "ok"` on the same fingerprint resolves the incident.
+
+| Rule | Fires when | Severity | Sustained |
+| --- | --- | --- | --- |
+| `metrics_blind` | A source can't be read, including `CM001` | 7 | First sample |
+| `dlq_depth` | `dead` plus `pending` > 0 on any stage | 8 | 2 samples |
+| `stage_lag` | `object-landed` or `session-indexed` lag ≥ 60 s | 6 | 2 samples |
+| `stage_stalled` | Ready jobs on those stages and no `ok` in the window | 8 | 2 samples |
+
+Under the nightcto contract, delivery is **unproven until a person has seen one
+real message** (rule 9). Send one from a rehearsal before relying on it. Payloads
+pass nightcto's validator, run once by hand; nothing pins that in CI.
+
+**NOT COVERED:** these reach no one unless a person is watching them.
+
+- **A dead sampler.** It sends nothing, and nightcto doesn't detect an absent
+  sender, so silence reads as health. During T0, someone must watch for
+  `cutover metric` lines stopping.
+- **Ingest 5xx and scrub refusals,** including `chunk_stored_unscrubbed`. These
+  are log lines.
+- **Gate, HoldLog, fallback and export metrics,** until their owners send evidence
+  under this same transport. Use `service` of the emitter and the same scope.
+- **Neon load and fence.** These are hand-run SQL.
+
+Every other **Alert** cell below is therefore a condition a person on the T0
+bridge checks, not a page. The `dlq_depth` rule has no baseline yet: a stage
+quarantining `stage_not_configured` will fire it.
 
 ## Conventions
 
@@ -54,8 +102,9 @@ bun run cutover:metrics --interval=15 --window=300 2>&1 | jq -c 'select(.metric 
 
 | Metric | Source | Unit | Labels | SLO | Alert | Operator action |
 | --- | --- | --- | --- | --- | --- | --- |
-| `cutover.metrics.read_ok` | `cutover:metrics` | 1 | `kind` = jobs, dead_letters, events, errors | 1 | 0 for 2 samples, or no line for 2 intervals | Treat that panel as blind. During T0 a blind jobs or dead_letters panel stops the flip until restored. `error_code` 57014 on events: raise `--interval`, see "Sampler cost" |
+| `cutover.metrics.read_ok` | `cutover:metrics` | 1 | `kind` = jobs, dead_letters, events, errors | 1 | 0 for 2 samples, or no line for 2 intervals | Treat that panel as blind. During T0 a blind jobs or dead_letters panel stops the flip until restored. `error_code` 57014 on events: raise `--interval`, see "Sampler cost". `CM001`: RLS would hide the rows, see "Sampler access" |
 | `cutover.metrics.window_seconds` | `cutover:metrics` | s | none | n/a | n/a | Reads the window of the counts |
+| `cutover.alerts.configured` | `cutover:metrics` | 1 | none | 1 | 0 during T0 | Alerts are off; the transport isn't configured. Log lines `cutover alert not delivered` carry the HTTP status of a refused send |
 
 ### Gate and hold (relayhistory-cloud #224 emits these)
 
@@ -204,9 +253,21 @@ statement timeout, one connection, and at least 15 s between samples. If
 working. If that happens at real volume, add an index on `at` as a reviewed
 migration rather than lengthening the timeout.
 
-The role must bypass RLS (`service_role`). These tables have RLS on and no
-policy, so another role reads no rows and **every panel reads a healthy zero**.
-Check once that a known row is visible before trusting the panels.
+### Sampler access
+
+The sampler never bypasses RLS. The three tables have RLS on and no policy, so it
+reads through SECURITY DEFINER aggregates, `sessions.cutover_metrics_jobs()`,
+`_dead_letters()`, `_events(window)` and `_errors(window)`, as a login that is a
+member of `cutover_metrics_reader`. That role is NOLOGIN, has no BYPASSRLS and no
+table privileges. The functions return aggregates and closed labels only.
+
+A role reading these tables without access would get no rows, and every panel
+would show a healthy zero. Three things stop that:
+
+- Each function raises `CM001` if RLS would filter it. That means `read_ok = 0`
+  and an immediate `metrics_blind` alert, never a zero.
+- The sampler refuses to start on a role with BYPASSRLS or superuser.
+- `anon` and `authenticated` can't execute these functions.
 
 ## T0 dashboard and runbook
 

@@ -46,11 +46,11 @@ Structured stage events and DLQs remain in HoopDb; service logs remain
 structured stdout.
 
 **Metrics:** `docs/cutover-observability.md` is the contract for the cutover
-metrics. `bun run cutover:metrics` emits the Supabase-derived ones as log lines
-(`message = "cutover metric"`), and the ingest request line and `scrub refused`
-line carry the route and scrub signals.
+metrics. `bun run cutover:metrics` (#47) emits the Supabase-derived ones as log
+lines (`message = "cutover metric"`), and the ingest request line and `scrub
+refused` line carry the route and scrub signals. Alerts use nightcto's evidence
+webhook.
 
-**Not yet built:** a metrics backend and live SLO alerts (the thresholds are
-specified in `docs/cutover-observability.md`, but nothing evaluates them),
-tail sampling, per-tenant retention/deletion in the telemetry backend, and a
+**Not yet built:** a time-series metrics backend, alerts beyond the four rules
+in `docs/cutover-observability.md`, tail sampling, per-tenant retention/deletion in the telemetry backend, and a
 durable hosted log exporter. Logs are unsampled; errors are never sampled out.

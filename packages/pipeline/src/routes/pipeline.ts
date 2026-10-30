@@ -80,8 +80,6 @@ export interface PipelineRouteDeps {
     stage: PipelineStage,
     message: StageMessage,
   ): Promise<void>;
-  /** A chunk the route refused to store; takes the code only, never the message. */
-  onChunkRefused?(code: string): void;
 }
 
 const defaultDeps: PipelineRouteDeps = {
@@ -519,10 +517,8 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     } catch (cause) {
       if (cause instanceof PipelineError && cause.code === "zstd_unavailable")
         return error(c, 503, "not_supported", cause.message);
-      if (cause instanceof PipelineError) {
-        deps.onChunkRefused?.(cause.code);
+      if (cause instanceof PipelineError)
         return error(c, 400, "bad_request", cause.message);
-      }
       // Layout validation (ids) is a client error; its message names only ids.
       if (
         cause instanceof ObjectStoreError &&
