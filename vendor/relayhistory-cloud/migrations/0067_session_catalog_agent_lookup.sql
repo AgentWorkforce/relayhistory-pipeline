@@ -50,7 +50,6 @@ RETURNS trigger LANGUAGE plpgsql
 SET search_path = pg_catalog, sessions, pg_temp AS $lock$
 DECLARE
   target record;
-  may_wait boolean := TG_TABLE_NAME = 'session_catalog';
 BEGIN
   -- Managed agent-row writers already hold the session lock: catalog projection
   -- enters through session_catalog, rollup refresh enters from the rollup
@@ -58,8 +57,11 @@ BEGIN
   -- UPDATE/DELETE on session_catalog_agents has already locked its target tuple
   -- before this row trigger runs. It must never WAIT for the session lock while
   -- a rollup writer holds that lock and waits for the same agent tuple; try and
-  -- fail with 55P03 instead. session_catalog may wait: no session-lock holder
-  -- later acquires a catalog row, so that edge has no reverse edge.
+  -- fail with 55P03 instead. session_catalog also tries without waiting: an
+  -- arbitrary multi-row catalog statement has already locked/projected earlier
+  -- rows in statement order, which need not match the sorted order used by
+  -- rollup writers. Delivered batches pre-acquire every affected session lock
+  -- in sorted order below, so their row triggers succeed re-entrantly.
   IF TG_OP = 'UPDATE'
      AND (OLD.org_id, OLD.session_id) IS DISTINCT FROM (NEW.org_id, NEW.session_id) THEN
     FOR target IN
@@ -68,29 +70,20 @@ BEGIN
                      (NEW.org_id, NEW.session_id)) AS keys(org_id, session_id)
        ORDER BY org_id, session_id
     LOOP
-      IF may_wait THEN
-        PERFORM pg_advisory_xact_lock(
-          sessions.session_rollup_lock_key(target.org_id, target.session_id));
-      ELSIF NOT pg_try_advisory_xact_lock(
+      IF NOT pg_try_advisory_xact_lock(
         sessions.session_rollup_lock_key(target.org_id, target.session_id)) THEN
         RAISE EXCEPTION 'session agent lookup row is busy'
           USING ERRCODE = '55P03';
       END IF;
     END LOOP;
   ELSIF TG_OP = 'DELETE' THEN
-    IF may_wait THEN
-      PERFORM pg_advisory_xact_lock(
-        sessions.session_rollup_lock_key(OLD.org_id, OLD.session_id));
-    ELSIF NOT pg_try_advisory_xact_lock(
+    IF NOT pg_try_advisory_xact_lock(
       sessions.session_rollup_lock_key(OLD.org_id, OLD.session_id)) THEN
       RAISE EXCEPTION 'session agent lookup row is busy'
         USING ERRCODE = '55P03';
     END IF;
   ELSE
-    IF may_wait THEN
-      PERFORM pg_advisory_xact_lock(
-        sessions.session_rollup_lock_key(NEW.org_id, NEW.session_id));
-    ELSIF NOT pg_try_advisory_xact_lock(
+    IF NOT pg_try_advisory_xact_lock(
       sessions.session_rollup_lock_key(NEW.org_id, NEW.session_id)) THEN
       RAISE EXCEPTION 'session agent lookup row is busy'
         USING ERRCODE = '55P03';
@@ -112,6 +105,151 @@ CREATE TRIGGER session_catalog_agents_lookup_lock
 CREATE TRIGGER session_catalog_agent_source_lock
   BEFORE INSERT OR UPDATE OR DELETE ON sessions.session_catalog
   FOR EACH ROW EXECUTE FUNCTION sessions.lock_session_catalog_agent_lookup();
+
+-- A delivery batch projects activity and catalog records in record-id order,
+-- which is not session order. Acquire both every submitted session and every
+-- durable session those records may replace before the first row is projected.
+-- Catalog records with a payload-only identity use delivery_catalog_key's
+-- canonical fallback. The caller has already taken
+-- 0059's user -> org -> origin -> workspace locks and passes that migration's
+-- shared contention deadline, so this new stage cannot extend the wait budget.
+CREATE FUNCTION sessions.delivery_session_agent_locks_within(
+  p_org text, p_workspace text, p_origin text, p_records jsonb,
+  p_contended_until timestamptz
+) RETURNS numeric LANGUAGE plpgsql
+SET search_path = pg_catalog, sessions, pg_temp AS $agent_locks$
+DECLARE
+  target record;
+  waited numeric;
+  total_ms numeric := 0;
+BEGIN
+  FOR target IN
+    WITH submitted AS MATERIALIZED (
+      SELECT value AS item FROM jsonb_array_elements(p_records)
+    ), keys AS (
+      SELECT p_org AS org_id,
+             coalesce(item->>'session_id', sessions.delivery_catalog_key(
+               item->>'kind', item->>'source', item->>'session_id',
+               item->>'operation', NULLIF(item->'payload', 'null'::jsonb))->>2) AS session_id
+        FROM submitted
+      UNION
+      SELECT d.org_id,
+             coalesce(d.session_id, sessions.delivery_catalog_key(
+               d.kind, d.source, d.session_id, d.operation, d.payload)->>2) AS session_id
+        FROM sessions.delivery_records AS d
+        JOIN submitted AS s ON s.item->>'record_id' = d.record_id
+       WHERE d.org_id = p_org AND d.workspace_id = p_workspace
+         AND d.origin_id = p_origin
+    )
+    SELECT DISTINCT org_id, session_id
+      FROM keys
+     WHERE session_id IS NOT NULL
+     ORDER BY org_id, session_id
+  LOOP
+    waited := sessions.delivery_advisory_lock_within(
+      sessions.session_rollup_lock_key(target.org_id, target.session_id),
+      extract(epoch FROM p_contended_until - clock_timestamp()) * 1000);
+    IF waited IS NULL THEN RETURN NULL; END IF;
+    total_ms := total_ms + waited;
+  END LOOP;
+  RETURN total_ms;
+END
+$agent_locks$;
+
+-- 0059's wrapper plus the sorted session-agent lock stage. Keep the same
+-- contention deadline across org/origin/workspace/session locks and report the
+-- new stage independently. A busy session lock is the same retryable 55P03
+-- contract as the four pre-existing delivery locks.
+--
+-- write-hold: sessions.upload_cleanup_ready()
+ALTER FUNCTION sessions.accept_delivery_batch(text,text,text,text,text,text,jsonb,jsonb)
+  RENAME TO accept_delivery_batch_before_session_agent_locks;
+
+CREATE FUNCTION sessions.accept_delivery_batch(
+  p_org text, p_workspace text, p_user text, p_origin text, p_batch text,
+  p_digest text, p_records jsonb, p_receipt jsonb
+) RETURNS jsonb LANGUAGE plpgsql AS $delivery$
+DECLARE
+  started timestamptz := clock_timestamp();
+  step timestamptz;
+  replay jsonb;
+  contended_until timestamptz;
+  saved text;
+  waited numeric;
+  busy text;
+  timing jsonb := '{}'::jsonb;
+  workspace_key bigint := hashtextextended(
+    'relayhistory.delivery_projection' || chr(31) || p_org || chr(31) || p_workspace, 0);
+  result jsonb;
+BEGIN
+  IF sessions.upload_cleanup_ready() THEN
+    SELECT receipt INTO replay FROM sessions.delivery_receipts
+      WHERE org_id=p_org AND workspace_id=p_workspace AND origin_id=p_origin
+        AND batch_id=p_batch AND digest=p_digest;
+    IF FOUND THEN
+      RETURN replay || jsonb_build_object('_delivery_timing', jsonb_build_object(
+        'fast_path', true, 'total_ms', sessions.delivery_elapsed_ms(started)));
+    END IF;
+  END IF;
+  PERFORM set_config('relayhistory.delivery_workspace_lock_ms', '0', true);
+  PERFORM set_config('relayhistory.delivery_workspace_lock_key', '', true);
+  <<locks>>
+  BEGIN
+    waited := sessions.delivery_advisory_lock_within(
+      hashtextextended(jsonb_build_array(p_org,p_workspace,p_user)::text, 0),
+      sessions.delivery_lock_budget_ms('relayhistory.delivery_user_lock_wait_ms', 10000));
+    IF waited IS NULL THEN busy := 'user'; EXIT locks; END IF;
+    timing := timing || jsonb_build_object('user_lock_ms', round(waited::numeric, 1));
+    contended_until := clock_timestamp()
+      + sessions.delivery_lock_budget_ms('relayhistory.delivery_lock_wait_ms', 2000) * interval '1 millisecond';
+    waited := sessions.delivery_advisory_lock_within(
+      hashtextextended('relayhistory.memory_claims:' || p_org,0),
+      extract(epoch FROM contended_until - clock_timestamp()) * 1000);
+    IF waited IS NULL THEN busy := 'org'; EXIT locks; END IF;
+    timing := timing || jsonb_build_object('org_lock_ms', round(waited::numeric, 1));
+    step := clock_timestamp();
+    saved := current_setting('lock_timeout');
+    PERFORM set_config('lock_timeout',
+      GREATEST(1, ceil(extract(epoch FROM contended_until - clock_timestamp()) * 1000))::bigint || 'ms', true);
+    BEGIN
+      INSERT INTO sessions.delivery_origins VALUES (p_org,p_workspace,p_origin) ON CONFLICT DO NOTHING;
+      PERFORM set_config('lock_timeout',
+        GREATEST(1, ceil(extract(epoch FROM contended_until - clock_timestamp()) * 1000))::bigint || 'ms', true);
+      PERFORM 1 FROM sessions.delivery_origins WHERE org_id=p_org AND workspace_id=p_workspace AND origin_id=p_origin FOR UPDATE;
+    EXCEPTION WHEN lock_not_available THEN
+      busy := 'origin';
+    END;
+    PERFORM set_config('lock_timeout', saved, true);
+    IF busy IS NOT NULL THEN EXIT locks; END IF;
+    timing := timing || jsonb_build_object('origin_lock_ms', sessions.delivery_elapsed_ms(step));
+    IF jsonb_array_length(p_records) > 0 THEN
+      waited := sessions.delivery_advisory_lock_within(workspace_key,
+        extract(epoch FROM contended_until - clock_timestamp()) * 1000);
+      IF waited IS NULL THEN busy := 'workspace'; EXIT locks; END IF;
+      PERFORM set_config('relayhistory.delivery_workspace_lock_ms', waited::text, true);
+      PERFORM set_config('relayhistory.delivery_workspace_lock_key', workspace_key::text, true);
+      timing := timing || jsonb_build_object('workspace_lock_ms', round(waited::numeric, 1));
+
+      waited := sessions.delivery_session_agent_locks_within(
+        p_org, p_workspace, p_origin, p_records, contended_until);
+      IF waited IS NULL THEN busy := 'session'; EXIT locks; END IF;
+      timing := timing || jsonb_build_object('session_lock_ms', round(waited::numeric, 1));
+    END IF;
+  END locks;
+  IF busy IS NOT NULL THEN
+    RAISE EXCEPTION 'delivery_busy' USING ERRCODE = '55P03',
+      DETAIL = (timing || jsonb_build_object('fast_path', false, 'busy_lock', busy,
+        'total_ms', sessions.delivery_elapsed_ms(started)))::text;
+  END IF;
+  result := sessions.accept_delivery_batch_before_reset(
+    p_org,p_workspace,p_user,p_origin,p_batch,p_digest,p_records,p_receipt);
+  RETURN result || jsonb_build_object('_delivery_timing', timing || jsonb_build_object(
+    'fast_path', false,
+    'workspace_lock_ms', round(COALESCE(NULLIF(current_setting(
+      'relayhistory.delivery_workspace_lock_ms', true), '')::numeric, 0), 1),
+    'total_ms', sessions.delivery_elapsed_ms(started)));
+END;
+$delivery$;
 
 CREATE FUNCTION sessions.prepare_session_catalog_agent_lookup()
 RETURNS trigger LANGUAGE plpgsql
