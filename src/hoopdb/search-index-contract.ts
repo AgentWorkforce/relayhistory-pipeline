@@ -153,7 +153,7 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     "machine_ids", "user_ids", "short_summary", "projected_at",
   ],
   errors: {
-    "42501": "tenant claims missing, malformed, for another role, or not covering the workspace",
+    "42501": "caller is not the Worker role, or tenant claims missing, malformed, for another role, or not covering the workspace",
     "22023": "query shorter than 3 or longer than 200 characters after trim and NFC",
     "57014": "statement_timeout (2s on the Worker role) exceeded",
   },

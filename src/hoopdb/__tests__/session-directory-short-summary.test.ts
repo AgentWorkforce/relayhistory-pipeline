@@ -44,10 +44,11 @@ afterEach(async () => {
   await Promise.all(open.splice(0).map((db) => db.close()));
 });
 
-async function database(): Promise<PGlite> {
+async function database(prelude = ""): Promise<PGlite> {
   const db = new PGlite({ extensions: { auto_explain, btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
+  if (prelude) await db.exec(prelude);
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
   }
@@ -263,6 +264,47 @@ describe("search RPC authorization", () => {
     } finally {
       await db.exec("RESET ROLE");
     }
+  });
+
+  test("no role in pg_roles except the Worker and the owner can execute the search RPC", async () => {
+    // Default privileges and a pre-existing runtime role, present before the migration runs.
+    const db = await database(`CREATE ROLE relayhistory_app;
+      ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO relayhistory_app;
+      ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`);
+    const executors = await db.query<{ rolname: string }>(
+      `SELECT r.rolname FROM pg_roles AS r, pg_proc AS p
+        WHERE p.oid = 'sessions.search_session_directory(text, text)'::regprocedure
+          AND r.rolname <> $1 AND r.oid <> p.proowner
+          AND has_function_privilege(r.oid, p.oid, 'EXECUTE')
+        ORDER BY r.rolname`,
+      [WORKER],
+    );
+    expect(executors.rows).toEqual([]);
+    const checked = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM pg_roles");
+    expect(checked.rows[0]!.n).toBeGreaterThan(5);
+  });
+
+  test("a runner's later GRANT EXECUTE ON ALL FUNCTIONS is refused at call time by the role guard", async () => {
+    const db = await database();
+    await insertRow(db);
+    await summarize(db, KEY, "osprey summary");
+    // As relayhistory-verify-schema.test.ts's RUNTIME_ROLE grants it, after the migrations.
+    await db.exec(`CREATE ROLE relayhistory_app;
+      GRANT USAGE ON SCHEMA sessions TO relayhistory_app;
+      GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions TO relayhistory_app;`);
+    const granted = await db.query<{ ok: boolean }>(
+      "SELECT has_function_privilege('relayhistory_app', 'sessions.search_session_directory(text, text)', 'EXECUTE') AS ok",
+    );
+    expect(granted.rows[0]?.ok).toBe(true);
+    await db.query("SELECT set_config('request.jwt.claims', $1, false)", [claims("org-a", ["ws-a"])]);
+    await db.exec("SET ROLE relayhistory_app");
+    try {
+      await expect(db.query("SELECT * FROM sessions.search_session_directory('ws-a', 'osprey')"))
+        .rejects.toThrow("caller is not the search worker role");
+    } finally {
+      await db.exec("RESET ROLE");
+    }
+    expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "osprey")).toHaveLength(1);
   });
 
   test("only the Worker role may execute the RPC, and end users cannot filter search_text directly", async () => {

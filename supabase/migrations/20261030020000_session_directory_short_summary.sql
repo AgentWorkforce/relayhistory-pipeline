@@ -126,7 +126,8 @@ GRANT USAGE ON SCHEMA sessions TO session_directory_search_worker;
 -- The only search path. Fixed SQL, fixed ORDER BY, fixed LIMIT 51 (a page of 50
 -- plus one to signal more). The organization comes only from the signed claims;
 -- the workspace must be one the claims list. Errors:
---   42501  claims missing, malformed, for another role, or not covering the workspace
+--   42501  caller is not the Worker role; or claims missing, malformed, for another
+--          role, or not covering the workspace
 --   22023  query shorter than 3 or longer than 200 characters after trim + NFC
 CREATE FUNCTION sessions.search_session_directory(p_workspace_id text, p_query text)
 RETURNS TABLE (
@@ -145,6 +146,13 @@ DECLARE
   v_workspaces text[];
   v_query text;
 BEGIN
+  -- Fail closed on the caller identity itself, whatever EXECUTE grants a later
+  -- runner adds (e.g. GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions TO <app>):
+  -- inside SECURITY DEFINER the `role` setting still names the caller's SET ROLE.
+  IF coalesce(nullif(current_setting('role', true), 'none'), session_user::text)
+       IS DISTINCT FROM 'session_directory_search_worker' THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session search: caller is not the search worker role';
+  END IF;
   BEGIN
     v_claims := nullif(current_setting('request.jwt.claims', true), '')::jsonb;
   EXCEPTION WHEN others THEN
@@ -189,6 +197,30 @@ REVOKE ALL ON FUNCTION sessions.search_session_directory(text, text)
   FROM PUBLIC, anon, authenticated, service_role;
 GRANT EXECUTE ON FUNCTION sessions.search_session_directory(text, text)
   TO session_directory_search_worker;
+-- Remove every other grantee present at creation (ALTER DEFAULT PRIVILEGES, a
+-- pre-existing runtime role such as relayhistory_app), whatever the migration order.
+-- A grant issued after this migration is refused by the role guard in the function.
+DO $revoke$
+DECLARE
+  v_grantee text;
+BEGIN
+  FOR v_grantee IN
+    SELECT r.rolname
+      FROM pg_proc AS p
+      CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) AS a
+      JOIN pg_roles AS r ON r.oid = a.grantee
+     WHERE p.oid = 'sessions.search_session_directory(text, text)'::regprocedure
+       AND a.privilege_type = 'EXECUTE'
+       AND a.grantee <> p.proowner
+       AND r.rolname <> 'session_directory_search_worker'
+  LOOP
+    EXECUTE format('REVOKE ALL ON FUNCTION sessions.search_session_directory(text, text) FROM %I', v_grantee);
+  END LOOP;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'relayhistory_app') THEN
+    REVOKE ALL ON FUNCTION sessions.search_session_directory(text, text) FROM relayhistory_app;
+  END IF;
+END
+$revoke$;
 
 -- No direct search by end-user tokens: `authenticated` keeps RLS-scoped reads of the
 -- listing columns but not search_text or short_summary, so a PostgREST
