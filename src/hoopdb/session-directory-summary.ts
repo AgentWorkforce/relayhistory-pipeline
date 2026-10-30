@@ -144,3 +144,64 @@ export async function clearShortSummary(db: SqlExecutor, key: SessionDirectoryKe
   );
   return rows.length > 0;
 }
+
+/**
+ * Projector deletion path: a machine manifest of this logical session was
+ * tombstoned in `session_index`. The summary was built from content that may
+ * include that machine, so it is cleared at once (with its share of search_text).
+ * When no live pointer remains, the directory row itself is tombstoned, which also
+ * empties search_text (trigger). Called by the HoopDb indexer's deletion branch.
+ */
+export async function propagatePointerTombstone(
+  db: SqlExecutor,
+  key: SessionDirectoryKey,
+): Promise<{ found: boolean; tombstoned: boolean }> {
+  const { rows } = await db.query<{ tombstoned: boolean }>(
+    `UPDATE sessions.session_directory AS d
+        SET short_summary = NULL,
+            short_summary_scrub_ruleset = NULL,
+            short_summary_scrub_version = NULL,
+            short_summary_source = NULL,
+            short_summary_generated_at = NULL,
+            search_text = sessions.session_directory_search_text(
+              d.title, d.task_title, d.agent_name, d.project_id,
+              d.git_repo, d.git_branch, d.model, NULL),
+            deleted_at = CASE
+              WHEN EXISTS (
+                SELECT 1 FROM sessions.session_index AS p
+                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+                   AND p.harness = d.harness AND p.session_id = d.session_id
+                   AND p.deleted_at IS NULL)
+              THEN d.deleted_at
+              ELSE coalesce(d.deleted_at, now()) END,
+            projected_at = now()
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+      RETURNING d.deleted_at IS NOT NULL AS tombstoned`,
+    [key.orgId, key.workspaceId, key.harness, key.sessionId],
+  );
+  return { found: rows.length > 0, tombstoned: rows[0]?.tombstoned === true };
+}
+
+/**
+ * Erasure: hard-delete directory rows (memberships cascade) for one session or a
+ * whole workspace. Returns the number of rows removed.
+ */
+export async function eraseSessionDirectory(
+  db: SqlExecutor,
+  scope: { orgId: string; workspaceId: string } | SessionDirectoryKey,
+): Promise<number> {
+  const session = "sessionId" in scope ? scope : null;
+  const { rows } = await db.query<{ n: number }>(
+    session
+      ? `WITH gone AS (DELETE FROM sessions.session_directory
+           WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 RETURNING 1)
+         SELECT count(*)::int AS n FROM gone`
+      : `WITH gone AS (DELETE FROM sessions.session_directory
+           WHERE org_id = $1 AND workspace_id = $2 RETURNING 1)
+         SELECT count(*)::int AS n FROM gone`,
+    session
+      ? [session.orgId, session.workspaceId, session.harness, session.sessionId]
+      : [scope.orgId, scope.workspaceId],
+  );
+  return rows[0]?.n ?? 0;
+}

@@ -18,6 +18,7 @@ import type { HoopDb } from "../shared/db.ts";
 import { ctxOf, enrichMessage, sessionExt } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { uuidv7 } from "../shared/ids.ts";
+import { propagatePointerTombstone } from "./session-directory-summary.ts";
 
 export const FAN_OUT_STAGES = ["summary-short", "summary-long", "status-classify"] as const;
 
@@ -45,6 +46,11 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
             WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
           [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id],
         );
+        // Propagate to the logical directory: clear the summary now, tombstone the row
+        // once no live machine pointer remains.
+        await propagatePointerTombstone(deps.db, {
+          orgId: pk.org_id, workspaceId: pk.workspace_id, harness: pk.harness, sessionId: pk.session_id,
+        });
         return;
       }
       const read = await deps.reader.read(pointer.manifestKey);

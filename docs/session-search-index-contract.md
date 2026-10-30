@@ -35,8 +35,7 @@ recent-session pages.
 | user or machine | normalized membership table + activity cursor |
 | session ID without workspace/harness | org + session ID lookup |
 | project substring | trigram GIN over `project_id` |
-| general metadata substring | trigram GIN over bounded `search_text` |
-| short summary substring | tenant-scoped trigram GIN `(org_id, workspace_id, short_summary)` (btree_gin) |
+| metadata + short summary substring | `sessions.search_session_directory` RPC only, over tenant-scoped trigram GIN `(org_id, workspace_id, search_text)` (btree_gin) |
 
 The executable definitions live in
 `src/hoopdb/search-index-contract.ts`. `bun run audit:search-indexes` is
@@ -47,14 +46,16 @@ lane. It never creates indexes or marks rollout complete.
 ## Metadata-only search boundary
 
 `search_text` may contain only title, task title, agent name, project, repository,
-branch, and model metadata, plus the scrubbed `short_summary` (below). It must never
+branch, and model metadata, plus the scrubbed `short_summary` (below), and is searched
+only through the tenant-bound RPC. It must never
 contain transcript text, event content, tool payloads, prompts, or responses.
 Canonical content remains in S3.
 
 ### Short summary (G6)
 
-Khaliq approved one bounded piece of derived content on 2026-10-30
-(`docs/session-search-projection.md`): `session_directory.short_summary`, migration
+Provenance of scope: the helm-chart-chief coordinator recorded the user's direct
+approval to implement bounded short_summary work in its controlling session. Draft
+only; applying or merging needs the user's OK on the exact head. Migration:
 `20261030020000_session_directory_short_summary.sql`.
 
 - **Bound:** `char_length(short_summary) <= 1000`, a CHECK in the database and the
@@ -63,29 +64,60 @@ Khaliq approved one bounded piece of derived content on 2026-10-30
   It runs the shared `lib/scrub.ts` scrubber, refuses if the scrub throws or is not
   stable on its own output, and records `short_summary_scrub_ruleset` and
   `short_summary_scrub_version` (the raw-chunk `SCRUB_RULESET` pair) plus
-  `short_summary_source` and `short_summary_generated_at`. The database rejects a
-  summary without that provenance, and an older `generated_at` never replaces a newer one.
+  `short_summary_source` and `short_summary_generated_at`. The database requires those
+  labels (all or none) but cannot prove the text was scrubbed: only the writer enforces
+  that. An older `generated_at` never replaces a newer summary.
 - **Search document:** `sessions.session_directory_search_text(...)` is the one
   definition of `search_text`; the summary is its last field. The writer rebuilds
   `search_text` with it, and the future projector must use the same function.
-  Tenant-scoped summary search is `SESSION_DIRECTORY_QUERIES.summaryContains`, with
-  at least three characters (`summaryContainsPattern`).
-- **Deletion:** a tombstone (`deleted_at` set) clears the summary, its provenance and
-  `search_text` through a trigger, backed by a CHECK. Erasure deletes the row. As
-  below, PostgreSQL WAL, replicas and backups keep their own copies until retention
-  ages them out; that is accepted for this bounded, scrubbed field and is why
-  nothing larger goes here.
-- **Not here:** long summaries (encrypted Locker objects), transcripts, embeddings,
-  pgvector, tsvector.
+- **Deletion:** the HoopDb indexer's pointer-tombstone branch calls
+  `propagatePointerTombstone`: any deleted machine manifest clears the summary (and
+  its share of `search_text`) immediately; when no live pointer remains the directory
+  row is tombstoned. A trigger plus CHECK is the backstop for any other writer that
+  sets `deleted_at`. Erasure (`eraseSessionDirectory`) deletes rows. PostgreSQL WAL,
+  replicas and backups keep their own copies until retention ages them out; that is
+  accepted for this bounded, scrubbed field and is why nothing larger goes here.
 - **Rollback:** `supabase/rollbacks/20261030020000_session_directory_short_summary.down.sql`
-  rebuilds `search_text` without the summary, then drops the columns, trigger,
-  functions and index (tested up, down, up).
-- **RLS caveat:** under RLS only LEAKPROOF operators become index conditions, and
-  `ILIKE` is not one. As the `authenticated` role, `summaryContains` (like the
-  existing `metadataContains` and `projectContains`) plans as a sequential scan. The
-  plan test runs as a role that bypasses RLS, with the tenant predicate in the query,
-  as the other plan tests do. A server must run these searches that way (or through a
-  reviewed SECURITY DEFINER function) for the index to apply.
+  rebuilds `search_text` without the summary, drops the columns, trigger, functions,
+  RPC, Worker role and tenant index, and restores #38's index and grants (tested up,
+  down, up).
+
+### The search RPC (pinned contract)
+
+`search_text`, and therefore `short_summary`, is searchable only through this RPC.
+#38's non-tenant-scoped `session_directory_metadata_trgm_idx` is dropped and replaced
+by `session_directory_tenant_search_trgm_idx` on `(org_id, workspace_id, search_text
+gin_trgm_ops)`. `authenticated` keeps RLS-scoped SELECT on the listing columns but not
+on `search_text` or `short_summary`, so a PostgREST `search_text=ilike.*q*` table
+filter is refused. (Under RLS, ILIKE is not LEAKPROOF and could never use a trigram
+index anyway.) The executable copy is `SESSION_DIRECTORY_SEARCH_RPC` and
+`SESSION_DIRECTORY_SEARCH_SQL` in `src/hoopdb/search-index-contract.ts`.
+
+| Item | Contract |
+| --- | --- |
+| Function | `sessions.search_session_directory(p_workspace_id text, p_query text)`; PostgREST `POST /rest/v1/rpc/search_session_directory`, `Content-Profile: sessions`, body `{"p_workspace_id": ..., "p_query": ...}` |
+| Security | `SECURITY DEFINER`, `search_path = pg_catalog, sessions, pg_temp`, fixed SQL via `EXECUTE ... USING` (one custom plan per call). Runs as the migration owner (table owner, RLS not forced); no BYPASSRLS role is created |
+| Caller | only `session_directory_search_worker`: `NOLOGIN NOINHERIT NOBYPASSRLS`, `statement_timeout = 2s`, `USAGE` on `sessions`, `EXECUTE` on this function, no table or column privileges. `EXECUTE` is revoked from PUBLIC, `anon`, `authenticated` and `service_role`. Binding it to `authenticator` and issuing its credential are a separate, reviewed deployment step |
+| Tenant | from the signed JWT claims only (`request.jwt.claims`, as the RLS helpers read them): `role` must equal `session_directory_search_worker`, `app_metadata.org_id` (string) is the org, and `p_workspace_id` must be one of `app_metadata.workspace_ids` (array of strings). The caller cannot name an org. Signature verification is PostgREST's |
+| Query | `btrim`, then `normalize(..., NFC)`; 3 to 200 characters; `\`, `%`, `_` escaped so the term is literal; matched as `search_text ILIKE '%term%'` (case-insensitive, no `lower` index needed) |
+| Order and size | `ORDER BY last_activity_at DESC, session_id DESC, harness DESC LIMIT 51` (50 plus one meaning "more"). No cursor in V1 |
+| Returns | `org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, task_title, agent_name, project_id, git_repo, git_branch, model, state, event_count, input_tokens, output_tokens, cost_usd_micros, machine_ids, user_ids, short_summary, projected_at`; live rows only |
+| Errors | `42501` tenant claims missing, malformed, for another role, or not covering the workspace; `22023` query length outside 3..200; `57014` the 2 s statement timeout |
+
+Plan evidence (PGlite, 30,000 rows, tenant of 22,500, captured with auto_explain
+ANALYZE/BUFFERS/JSON inside the RPC as called by the Worker role): a selective term is
+a Bitmap Index Scan on `session_directory_tenant_search_trgm_idx` with no recheck
+losses; a common term walks `session_directory_workspace_recent_idx` and stops at 51
+rows. Neither plan has a Seq Scan. Buffer and time gates in the test are indicative
+for PGlite, not production SLOs; the production benchmark gate above still applies.
+
+### Not in V1 Supabase search
+
+FTS/tsvector, embeddings/pgvector, long summaries, transcripts, and project, model or
+reasoning search belong to the V2 search store (ClickHouse/ObsessionDB), as already
+decided. G6 adds none of them. #38's `project_id` trigram index and `projectContains`
+query are untouched here; they are flagged for #38's owner because direct PostgREST
+`project_id=ilike` under RLS cannot use them.
 
 Consequently `search_shared_sessions`, `/v1/events?q=`, and dashboard transcript
 search cannot be implemented by silently querying `session_directory`. They remain
