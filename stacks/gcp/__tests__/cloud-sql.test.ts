@@ -34,10 +34,10 @@ describe("Cloud SQL private attachment", () => {
     expect(spec.posted).toBe(false);
     expect(spec.ipv4Enabled).toBe(false);
     expect(spec.connectionName).toBe("agentworkforce-dev1:us-central1:awf-dev-postgres");
-    expect(spec.privateNetwork).toBe("/projects/agentworkforce-dev1/global/networks/awf-dev-vpc");
+    expect(spec.privateNetwork).toBe("projects/agentworkforce-dev1/global/networks/awf-dev-vpc");
     expect(spec.insertBody.settings.ipConfiguration).toEqual({
       ipv4Enabled: false,
-      privateNetwork: "/projects/agentworkforce-dev1/global/networks/awf-dev-vpc",
+      privateNetwork: "projects/agentworkforce-dev1/global/networks/awf-dev-vpc",
       allocatedIpRange: "awf-dev-psa",
     });
     expect(spec.insertBody.settings.edition).toBe("ENTERPRISE");
@@ -231,7 +231,7 @@ describe("SQL Admin idempotent poster", () => {
     const apiPath = scripted([
       {
         status: 200,
-        body: matchingInstance(spec, { privateNetwork: spec.privateNetwork.slice(1) }),
+        body: matchingInstance(spec, { privateNetwork: `/${spec.privateNetwork}` }),
       },
     ]);
     await expect(ensurePrivateCloudSql(spec, credential, omitted.transport, fastPoll())).resolves.toEqual({
@@ -293,7 +293,7 @@ describe("SQL Admin idempotent poster", () => {
       { status: 200, body: { ...matchingInstance(spec), state: "PENDING_CREATE" } },
       {
         status: 200,
-        body: matchingInstance(spec, { privateNetwork: spec.privateNetwork.slice(1) }),
+        body: matchingInstance(spec, { privateNetwork: `/${spec.privateNetwork}` }),
       },
     ]);
     await expect(ensurePrivateCloudSql(spec, credential, poster.transport, fastPoll())).resolves.toEqual({

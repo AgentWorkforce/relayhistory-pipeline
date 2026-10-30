@@ -563,7 +563,13 @@ export default Alchemy.Stack(
             redisVersion: "REDIS_7_2",
             tier: i.managedDataPlane.redisHa ? "STANDARD_HA" : "BASIC",
             memorySizeGb: i.managedDataPlane.redisMemoryGb ?? 1,
-            authorizedNetwork: network.networkName,
+            // Memorystore rejects a short network name. Mapping the resolved
+            // network output preserves the resource dependency while emitting
+            // the canonical API resource name required by Redis.
+            authorizedNetwork: Output.map(
+              network.networkName,
+              (name) => `projects/${i.projectId}/global/networks/${name}`,
+            ),
             connectMode: "PRIVATE_SERVICE_ACCESS",
             reservedIpRange: psaRange.addressName,
             // The workload probe rejects an inline AUTH string, and this stack
