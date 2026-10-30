@@ -49,6 +49,16 @@ The filters come from `relay-desktop`
 - **Desktop-local dimensions** (path, relay link, upload state) never reach
   Supabase: they stay in the desktop's SQLite projection.
 
+- **`session_index.event_count` is not authoritative for a session with a
+  `backfill` or `resumed` epoch.** The index stage reads manifests, not raw, so
+  it sends no count for such a session and the column keeps what it held: `0`
+  on a first index, otherwise the count from before the backfill. Treat it as a
+  lower bound in practice, not a guarantee: the kept count summed the lines of
+  the live chunks, so superseded revisions or deletes among them can put it above
+  the true count. Nothing may present it as a real count until the write-back
+  from the normalized `convergence_events` count exists. If a reader appears
+  before then, the column must become nullable first.
+
 ## Work
 
 1. **Migration:** add `short_summary`, its `tsvector`, `project_name` and
