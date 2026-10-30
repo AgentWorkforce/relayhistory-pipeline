@@ -20,7 +20,10 @@
     "test": "bun test && bun test ./stacks && bun run --filter @96bulls/pipeline test && bun run --filter @relayhistory/object-store test",
     "up:local": "bun run bin/96bulls up local",
     "down:local": "bun run bin/96bulls down local",
-    "smoke:local": "bun run bin/96bulls smoke local"
+    "smoke:local": "bun run bin/96bulls smoke local",
+    "benchmark:relayhistory": "bun run src/migration/relayhistory-benchmark.ts",
+    "benchmark:relayhistory-api": "bun run src/migration/relayhistory-api-benchmark.ts",
+    "migration:verify": "bun run src/migration/relayhistory-verify.ts"
   },
   "dependencies": {
     "@96bulls/pipeline": "workspace:*",
