@@ -18,7 +18,7 @@ The filters come from `relay-desktop`
 | --- | --- | --- | --- |
 | `agent:` / `@name` (exact, prefix, contains) | yes | `session_directory.agent_name` (#38) | #38: `session_directory_agent_recent_idx` (normalized `text_pattern_ops` plus activity cursor) for exact and prefixes of 3+ chars; contains through `session_directory_metadata_trgm_idx` over a bounded `search_text` |
 | `title:` (contains) and sort "session" | yes | `session_index.title` | trigram GIN on `lower(title)` per org; recency keyset for the sort |
-| short summary (free-text search) | yes | `short_summary`: **planned, not yet in #38's schema** (at most 1,000 chars, scrubbed) | planned: trigram GIN and Postgres FTS, each behind a query-plan test, not claimed until the plan test exists |
+| short summary (free-text search) | yes | `short_summary` on `session_directory`: **approved by Khaliq on 2026-10-30, pending the coordinator's record** (at most about 1,000 chars, scrubbed); built by the G6 owner (sp-w6-supabase-schema) | trigram GIN and Postgres FTS, each behind a query-plan test, not claimed until that test exists |
 | `project:` (contains; exact id) and sort | yes | `project_id` (exact), `project_name` (new) | `si_project` (exact, exists); trigram on `lower(project_name)` |
 | `harness:` / `source:` (exact) and sort | yes | `harness` | `si_harness` (exists) |
 | session state (`active`, `done`, `abandoned`) and sort "status" | yes | `state` (Referee) | `si_state` (exists, for not-done); add a done-inclusive keyset if done must be listed by state |
