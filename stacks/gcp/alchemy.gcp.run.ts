@@ -222,10 +222,12 @@ export default Alchemy.Stack(
       displayName: `AgentWorkforce ${stage} runtime`,
       description: "Workload Identity target for managed data-plane clients",
     });
+    // The proxy Kubernetes service account is created only once Cloud SQL is
+    // posted. Binding it earlier would let a later account of that name assume
+    // the runtime identity.
     for (const [namespace, serviceAccount] of [
       ["96bulls", "96bulls-worker"],
       ["96bulls", "96bulls-alleyoop"],
-      ["96bulls", "cloud-sql-proxy"],
     ] as const) {
       yield* GCP.IAM.Member(`workload-identity-${namespace}-${serviceAccount}`, {
         kind: "iam.serviceAccount",
@@ -275,7 +277,9 @@ export default Alchemy.Stack(
             authorizedNetwork: network.networkName,
             connectMode: "PRIVATE_SERVICE_ACCESS",
             reservedIpRange: psaRange.addressName,
-            authEnabled: true,
+            // The workload probe rejects an inline AUTH string, and this stack
+            // does not write secret payloads. TLS server authentication stays on.
+            authEnabled: false,
             transitEncryptionMode: "SERVER_AUTHENTICATION",
             persistenceConfig: i.managedDataPlane.redisHa
               ? { persistenceMode: "RDB", rdbSnapshotPeriod: "SIX_HOURS" }
@@ -422,6 +426,12 @@ export default Alchemy.Stack(
           // The private body is specified. The proxy is rendered by cloudSqlProxyWorkload
           // and applied only once that body is posted. This pin does not post it.
           if (cloudSqlProxyApplies(dataPlane.sql)) {
+            yield* GCP.IAM.Member("workload-identity-96bulls-cloud-sql-proxy", {
+              kind: "iam.serviceAccount",
+              name: runtimeIdentity.name,
+              role: "roles/iam.workloadIdentityUser",
+              member: workloadIdentityPrincipal(i, "96bulls", "cloud-sql-proxy"),
+            });
             const proxy = cloudSqlProxyWorkload(dataPlane.sql, runtimeEmail);
             yield* Kubernetes.Manifest("cloud-sql-proxy-account", { cluster, manifest: proxy.serviceAccount });
             yield* Kubernetes.Manifest("cloud-sql-proxy-service", { cluster, manifest: proxy.service });

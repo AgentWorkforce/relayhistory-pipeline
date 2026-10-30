@@ -177,7 +177,7 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
   if (inputs.relayfile) {
     requireSemver("relayfile.chartVersion", inputs.relayfile.chartVersion);
     requireSecretName("relayfile.existingSecretName", inputs.relayfile.existingSecretName);
-    requireRelayauthJwksUrl(inputs.relayfile.relayauthJwksUrl);
+    requireRelayauthJwksUrl("relayfile.relayauthJwksUrl", inputs.relayfile.relayauthJwksUrl);
   }
   if (inputs.relayflows) {
     requireSemver("relayflows.chartVersion", inputs.relayflows.chartVersion);
@@ -196,7 +196,7 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(inputs.bulls96.tenantOrgId))
       throw new Error("96bulls: bulls96.tenantOrgId must be an org id, never a URL or credential");
     requireSecretName("bulls96.existingSecretName", inputs.bulls96.existingSecretName);
-    requireRelayauthJwksUrl(inputs.bulls96.relayauthJwksUrl);
+    requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", inputs.bulls96.relayauthJwksUrl);
   }
 }
 
@@ -273,15 +273,15 @@ export interface Bulls96ReleaseOutputs {
 
 const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 
-function requireRelayauthJwksUrl(value: string): void {
+function requireRelayauthJwksUrl(label: string, value: string): void {
   let jwks: URL;
   try {
     jwks = new URL(value);
   } catch {
-    throw new Error("96bulls: bulls96.relayauthJwksUrl must be public HTTPS or the in-cluster RelayAuth service");
+    throw new Error(`96bulls: ${label} must be public HTTPS or the in-cluster RelayAuth service`);
   }
   if (jwks.username || jwks.password)
-    throw new Error("96bulls: bulls96.relayauthJwksUrl must not contain credentials");
+    throw new Error(`96bulls: ${label} must not contain credentials`);
   const hostname = jwks.hostname.replace(/\.$/, "").toLowerCase();
   const inCluster =
     jwks.protocol === "http:" &&
@@ -293,8 +293,8 @@ function requireRelayauthJwksUrl(value: string): void {
     !hostname.endsWith(".localhost") &&
     !hostname.endsWith(".local") &&
     isIP(hostname) === 0;
-  if ((!inCluster && !publicHttps) || jwks.hash)
-    throw new Error("96bulls: bulls96.relayauthJwksUrl must be public HTTPS or the in-cluster RelayAuth service");
+  if ((!inCluster && !publicHttps) || jwks.hash || jwks.search)
+    throw new Error(`96bulls: ${label} must be public HTTPS or the in-cluster RelayAuth service`);
 }
 
 function plainSetting(label: string, value: unknown): void {
@@ -327,7 +327,7 @@ export function bulls96ReleaseValues(
   if (typeof managed.redisPort === "string" && !/^[0-9]+$/.test(managed.redisPort))
     throw new Error("96bulls: redis port must be numeric. Nothing was created.");
   const redisPort = typeof managed.redisPort === "number" ? String(managed.redisPort) : managed.redisPort;
-  requireRelayauthJwksUrl(i.relayauthJwksUrl);
+  requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", i.relayauthJwksUrl);
   const identity = { "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail };
   const dataEnv = () => [
     { name: "LOCKER_PROVIDER", value: "gcs" },
@@ -340,19 +340,19 @@ export function bulls96ReleaseValues(
     { name: "PUBSUB_SUBSCRIPTION", value: managed.pubsubSubscription },
     { name: "WORKER_DATA_PATH_PROBE", value: "1" },
   ];
-  const locker = {
+  const locker = () => ({
     endpoint: "",
     bucket: managed.bucket,
     region: managed.region,
     credentials: { mode: "podIdentity" as const },
-  };
-  const hoopdb = { existingSecret: i.existingSecretName, key: "HOOPDB_URL" };
+  });
+  const hoopdb = () => ({ existingSecret: i.existingSecretName, key: "HOOPDB_URL" });
   return {
     global: { tenant: { orgId: i.tenantOrgId } },
     worker: {
       existingSecret: i.existingSecretName,
-      hoopdb,
-      locker,
+      hoopdb: hoopdb(),
+      locker: locker(),
       lockerInit: { enabled: false },
       migrations: { supabaseShim: true },
       summaryEncryption: { existingSecret: i.existingSecretName, key: "SUMMARY_MASTER_KEYS" },
@@ -362,8 +362,8 @@ export function bulls96ReleaseValues(
     },
     alleyoop: {
       existingSecret: i.existingSecretName,
-      hoopdb,
-      locker,
+      hoopdb: hoopdb(),
+      locker: locker(),
       auth: { jwksUrl: i.relayauthJwksUrl },
       serviceAccount: { annotations: { ...identity } },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },

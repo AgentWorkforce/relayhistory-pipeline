@@ -85,6 +85,13 @@ describe("GCP self-host contract", () => {
       assertGcpInputs("gcp-dev", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, relayauthJwksUrl: "https://relay.example.com/jwks?token=secret-boundary" },
+      }),
+    ).toThrow("public HTTPS or the in-cluster RelayAuth service");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96,
       }),
     ).not.toThrow();
@@ -183,6 +190,8 @@ describe("GCP self-host contract", () => {
     expect(two).toHaveLength(30);
     expect(one.endsWith("-runtime")).toBe(true);
     expect(two.endsWith("-runtime")).toBe(true);
+    expect(one).toMatch(/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/);
+    expect(two).toMatch(/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/);
   });
 
   it("uses the Pub/Sub service agent identity for dead-letter IAM", () => {

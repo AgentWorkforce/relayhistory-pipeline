@@ -260,7 +260,7 @@ function trustedGcsEndpoint(uri: string): boolean {
 function gcsApiHost(endpoint: string | undefined): boolean {
   if (!endpoint) return false;
   try {
-    const host = new URL(endpoint).hostname.toLowerCase();
+    const host = new URL(endpoint).hostname.toLowerCase().replace(/\.$/, "");
     return host === "storage.googleapis.com" || host.endsWith(".storage.googleapis.com") || host === "storage.google.com";
   } catch {
     return false;
