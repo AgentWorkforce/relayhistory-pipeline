@@ -353,10 +353,12 @@ describe("GCP self-host contract", () => {
       writeFileSync(path, "not-the-published-chart");
       expect(() => captureRelaycastChartPackage(path)).toThrow(/digest does not match/);
       const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+      const cache = readFileSync(new URL("../chart-cache.ts", import.meta.url), "utf8");
       expect(stack).toContain("captureRelaycastChartPackage");
       expect(stack).toContain('process.env.CI !== "true"');
-      expect(stack).toContain("writeFileSync(artifact, captured.bytes");
-      expect(stack).not.toContain("readFileSync(captured.sourcePath");
+      expect(cache).toContain("writeFileSync(artifact, captured.bytes");
+      expect(cache).not.toContain("readFileSync(captured.sourcePath");
+      expect(cache).not.toContain("rmSync(extracted");
       expect(stack).toContain("invocationId: APPLY_INVOCATION_ID");
       expect(stack).toContain('chart: relaycastChart!');
       expect(stack).not.toContain('chart: "relaycast"');

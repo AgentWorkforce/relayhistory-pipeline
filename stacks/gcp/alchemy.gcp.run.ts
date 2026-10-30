@@ -18,10 +18,8 @@ import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -41,9 +39,9 @@ import {
   relayfileChartValues,
   relayflowsChartValues,
   captureRelaycastChartPackage,
-  type CapturedRelaycastChartPackage,
   type GcpInputs,
 } from "./config.ts";
+import { prepareRelaycastChart } from "./chart-cache.ts";
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "./deploy-guard.ts";
 import {
   ALCHEMY_GCP_BETA_84_SQL,
@@ -53,9 +51,11 @@ import {
   sqlAdminFetchTransport,
   type PrivateCloudSqlSpec,
 } from "./cloud-sql.ts";
-import { provePrivateKubernetesReachability } from "./kubernetes-preflight.ts";
+import { provePrivateKubernetesReachability, relaycastProofAnnotations } from "./kubernetes-preflight.ts";
 import {
+  assertGcpApplyLeaseActive,
   applyNonceDigest,
+  boundGcpApplyLease,
   consumeGcpApplyNonce,
   consumeGcpApplyNonceGlobally,
   verifyGcpApplyNonce,
@@ -99,31 +99,6 @@ interface ResolveRedisServerCaInput {
   region: string;
   instanceId: string;
   authorization: GcpApplyAuthorizationProof;
-}
-
-function prepareRelaycastChart(captured: CapturedRelaycastChartPackage): string {
-  const cacheRoot = join(tmpdir(), "96bulls-relaycast-charts");
-  const extracted = join(cacheRoot, captured.digest);
-  const staging = join(cacheRoot, `.${captured.digest}.${process.pid}.${randomUUID()}`);
-  mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
-  mkdirSync(staging, { mode: 0o700 });
-  try {
-    const artifact = join(staging, "relaycast-0.1.0.tgz");
-    // This is the captured, already verified Buffer. The source artifact is
-    // never reopened between hashing and extraction.
-    writeFileSync(artifact, captured.bytes, { mode: 0o600 });
-    execFileSync("tar", ["-xzf", artifact, "-C", staging], { stdio: "ignore" });
-    rmSync(artifact, { force: true });
-    const chart = join(staging, "relaycast");
-    if (!statSync(chart).isDirectory())
-      throw new Error("published package did not contain relaycast/");
-    rmSync(extracted, { recursive: true, force: true });
-    renameSync(staging, extracted);
-    return join(extracted, "relaycast");
-  } catch {
-    rmSync(staging, { recursive: true, force: true });
-    throw new Error("96bulls: verified Relaycast package could not be extracted. Nothing was created.");
-  }
 }
 
 function readInputs(stage: string): GcpInputs {
@@ -208,8 +183,7 @@ const RequireNodeActAs = Alchemy.Action<
   Effect.gen(function* () {
     if (input.authorization.projectId !== input.projectId)
       throw new Error("96bulls: node actAs preflight is not bound to this project. GKE was not created or changed.");
-    if (input.authorization.expiresAt <= Math.floor(Date.now() / 1000))
-      throw new Error("96bulls: GCP apply authorization expired before the node actAs preflight. GKE was not created or changed.");
+    assertGcpApplyLeaseActive(input.authorization);
     const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
     return yield* Effect.tryPromise(() =>
       requireServiceAccountActAs(
@@ -233,14 +207,19 @@ const EnsurePrivateCloudSql = Alchemy.Action<
     const project = /^projects\/([^/]+)\/global\/networks\//.exec(input.spec.privateNetwork)?.[1];
     if (!project || input.authorization.projectId !== project)
       throw new Error("96bulls: Cloud SQL poster project is malformed. Nothing was created.");
-    if (input.authorization.expiresAt <= Math.floor(Date.now() / 1000))
-      throw new Error("96bulls: GCP apply authorization expired before the Cloud SQL poster. Nothing was created.");
+    assertGcpApplyLeaseActive(input.authorization);
     assertGcpSqlPostConfirmation(project, input.spec.instanceName, process.env[GCP_CONFIRM_SQL_POST_ENV]);
     const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
     if (project !== live.project)
       throw new Error("96bulls: Cloud SQL poster project differs from the resolved GCP project. Nothing was created.");
-    const result = yield* Effect.tryPromise(() =>
-      ensurePrivateCloudSql(input.spec, { bearer: Redacted.value(live.accessToken) }, sqlAdminFetchTransport()),
+    const result = yield* Effect.tryPromise((signal) =>
+      ensurePrivateCloudSql(
+        input.spec,
+        { bearer: Redacted.value(live.accessToken) },
+        sqlAdminFetchTransport(),
+        undefined,
+        { expiresAtMs: input.authorization.leaseExpiresAt * 1000, signal },
+      ),
     );
     return {
       connectionName: input.spec.connectionName,
@@ -317,7 +296,7 @@ export default Alchemy.Stack(
     providers: Layer.mergeAll(GCP.providers(), Kubernetes.providers()),
     state: GCP.state({ name: "agentworkforce", prefix: "96bulls" }),
   },
-  Effect.gen(function* () {
+  boundGcpApplyLease(Effect.gen(function* () {
     const stage = yield* Stage;
     if (stage !== BOOTSTRAP_STAGE)
       throw new Error("96bulls: Alchemy stage changed after local bootstrap. Nothing was created.");
@@ -713,11 +692,7 @@ export default Alchemy.Stack(
             namespace: "relaycast",
             values: {
               ...relaycastChartValues(relaycastConfig, storageClass),
-              podAnnotations: {
-                "96bulls.agentworkforce.dev/executor": kubernetesReachability!.executor,
-                "96bulls.agentworkforce.dev/apply-nonce": kubernetesReachability!.nonceDigest,
-                "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof,
-              },
+              podAnnotations: relaycastProofAnnotations(kubernetesReachability!),
             },
           });
         })
@@ -882,5 +857,5 @@ export default Alchemy.Stack(
         bulls96: bulls96 ?? null,
       },
     };
-  }),
+  })),
 );
