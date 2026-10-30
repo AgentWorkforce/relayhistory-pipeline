@@ -4,10 +4,14 @@
  * databases standing in for Neon (source) and Supabase (target).
  */
 import { PGlite } from "@electric-sql/pglite";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Two PGlite databases boot per test; parallel files can push past the 5 s default.
+vi.setConfig({ testTimeout: 30_000 });
 import {
   copyTable,
   planTable,
+  deletionLockSql,
   prepareBackfillFence,
   prepareTargetSession,
   type Queryable,
@@ -245,6 +249,63 @@ describe("deletions made on Supabase after T0", () => {
     ).rows.map((row) => row.session_id);
     // Without user columns, u2's sessions are matched through Neon's events.
     expect(rollups).toEqual(["s3"]);
+  });
+});
+
+describe("deletions committed while the backfill runs", () => {
+  it("are honoured by every later page, for user-bearing and session-only tables", async () => {
+    const ddl = `CREATE TABLE sessions.deleted_upload_sessions (
+        org_id text NOT NULL, workspace_id text NOT NULL, user_id text NOT NULL,
+        origin_id text NOT NULL, source text NOT NULL, session_id text NOT NULL,
+        PRIMARY KEY (org_id, workspace_id, user_id, origin_id, source, session_id));
+      CREATE TABLE sessions.session_resets (
+        org_id text NOT NULL, workspace_id text NOT NULL, user_id text NOT NULL,
+        request_id text NOT NULL, deleted bigint NOT NULL,
+        PRIMARY KEY (org_id, workspace_id, user_id, request_id));
+      CREATE TABLE sessions.convergence_events (
+        org_id text NOT NULL, workspace_id text NOT NULL, user_id text NOT NULL,
+        source text NOT NULL, session_id text NOT NULL, event_id text NOT NULL,
+        PRIMARY KEY (org_id, event_id));
+      CREATE TABLE sessions.session_rollups (
+        org_id text NOT NULL, session_id text NOT NULL, n int, PRIMARY KEY (org_id, session_id));`;
+    await Promise.all([source.exec(ddl), target.exec(ddl)]);
+    await source.exec(`INSERT INTO sessions.convergence_events VALUES
+        ('o', 'w', 'u1', 'claude', 's1', 'e1'), ('o', 'w', 'u2', 'claude', 's2', 'e2'),
+        ('o', 'w', 'u3', 'claude', 's3', 'e3');
+      INSERT INTO sessions.session_rollups VALUES ('o', 's1', 1), ('o', 's2', 2), ('o', 's3', 3);`);
+    await prepareTargetSession(target as Queryable);
+    // The fence is prepared with no deletions on Supabase yet...
+    await prepareBackfillFence(source as Queryable, target as Queryable);
+    // ...then, mid-backfill, u2 resets and u1 deletes s1 on Supabase.
+    await target.exec(`INSERT INTO sessions.session_resets VALUES ('o', 'w', 'u2', 'r-late', 1);
+      INSERT INTO sessions.deleted_upload_sessions VALUES ('o', 'w', 'u1', 'origin', 'claude', 's1');`);
+    const sessionsOf = async (table: string) => {
+      const plan = await planTable(source as Queryable, target as Queryable, table);
+      await copyTable(source as Queryable, target as Queryable, plan, {
+        mode: "backfill",
+        chunkSize: 1,
+        fenced: true,
+      });
+      return (
+        await target.query<{ session_id: string }>(
+          `SELECT session_id FROM sessions.${table} ORDER BY session_id`,
+        )
+      ).rows.map((row) => row.session_id);
+    };
+    expect(await sessionsOf("convergence_events")).toEqual(["s3"]);
+    expect(await sessionsOf("session_rollups")).toEqual(["s3"]);
+  });
+
+  it("locks per user for session-only tables too, through their Neon owners", async () => {
+    const plan = {
+      table: "session_rollups",
+      key: ["org_id", "session_id"],
+      order: ['"org_id"', '"session_id"'],
+      nullableKey: false,
+      columns: ["org_id", "session_id", "n"],
+    };
+    expect(deletionLockSql(plan)).toMatch(/pg_advisory_xact_lock[\s\S]*jsonb_to_recordset\(\$1/);
+    expect(deletionLockSql({ ...plan, table: "patterns", columns: ["org_id", "id"] })).toBeNull();
   });
 });
 

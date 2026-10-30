@@ -227,88 +227,103 @@ export function staleKeysSql(plan: TablePlan, hasAfter: boolean): string {
 
 const TOMBSTONE_COLUMNS = ["org_id", "workspace_id", "user_id", "origin_id", "source", "session_id"];
 
+const has = (plan: TablePlan, column: string) => plan.columns.includes(column);
+const hasUser = (plan: TablePlan) =>
+  ["org_id", "workspace_id", "user_id"].every((column) => has(plan, column));
+const hasSession = (plan: TablePlan) => has(plan, "org_id") && has(plan, "session_id");
+
+/**
+ * A reset made on Supabase after T0, for the user in `alias`: a row in the
+ * live sessions.session_resets that Neon (frozen at T0) does not have. Read
+ * inside the page's insert, after its user locks, so a reset committed at any
+ * point during the backfill is honoured.
+ */
+const postT0Reset = (alias: string) =>
+  `EXISTS (SELECT 1 FROM sessions.session_resets r
+     WHERE r.org_id = ${alias}.org_id AND r.workspace_id = ${alias}.workspace_id AND r.user_id = ${alias}.user_id
+       AND NOT EXISTS (SELECT 1 FROM pg_temp.neon_resets n
+             WHERE n.org_id = r.org_id AND n.workspace_id = r.workspace_id
+               AND n.user_id = r.user_id AND n.request_id = r.request_id))`;
+
+const OWNERS = "jsonb_to_recordset($2::jsonb) AS o(org_id text, session_id text, workspace_id text, user_id text)";
+
 /**
  * Backfill must not resurrect what users deleted on Supabase after T0. A hard
  * delete leaves no key to conflict with, so each row is checked against:
  *   - sessions.deleted_upload_sessions, matched on every tombstone column the
- *     table has (it needs at least org_id and session_id);
- *   - resets recorded on Supabase after T0 (pg_temp.backfill_resets): a reset
- *     deletes everything the user had, so none of the user's history returns.
- *     Tables without user columns match the reset users' sessions instead.
+ *     table has (at least org_id and session_id);
+ *   - resets made after T0 (postT0Reset): a reset deletes everything the user
+ *     had, so none of their history returns. Tables without user columns
+ *     match through the page's session owners on Neon ($2).
  */
 export function tombstoneFilter(plan: TablePlan): string {
-  const has = (column: string) => plan.columns.includes(column);
   const parts: string[] = [];
-  if (has("org_id") && has("session_id")) {
-    const match = TOMBSTONE_COLUMNS.filter(has)
+  if (hasSession(plan)) {
+    const match = TOMBSTONE_COLUMNS.filter((column) => has(plan, column))
       .map((column) => `d.${quoteIdent(column)} = s.${quoteIdent(column)}`)
       .join(" AND ");
     parts.push(`NOT EXISTS (SELECT 1 FROM sessions.deleted_upload_sessions d WHERE ${match})`);
   }
-  if (has("org_id") && has("workspace_id") && has("user_id"))
+  if (hasUser(plan)) parts.push(`NOT ${postT0Reset("s")}`);
+  else if (hasSession(plan))
     parts.push(
-      "NOT EXISTS (SELECT 1 FROM pg_temp.backfill_resets r WHERE r.org_id = s.org_id AND r.workspace_id = s.workspace_id AND r.user_id = s.user_id)",
-    );
-  else if (has("org_id") && has("session_id"))
-    parts.push(
-      "NOT EXISTS (SELECT 1 FROM pg_temp.backfill_reset_sessions r WHERE r.org_id = s.org_id AND r.session_id = s.session_id)",
+      `NOT EXISTS (SELECT 1 FROM ${OWNERS} WHERE o.org_id = s.org_id AND o.session_id = s.session_id AND ${postT0Reset("o")})`,
     );
   return parts.length ? ` WHERE ${parts.join(" AND ")}` : "";
 }
 
+/** Whether the page needs its session owners from Neon ($2): session tables without user columns. */
+export const needsOwners = (plan: TablePlan) => !hasUser(plan) && hasSession(plan);
+
 /**
- * The same per-user lock the deletion functions take
- * (set_session_uploads, reset_uploaded_sessions), so a deletion either commits
- * before this page's insert sees the tombstone, or waits and deletes it.
+ * The per-user lock the deletion functions take (set_session_uploads,
+ * reset_uploaded_sessions), for every user in the page, so a deletion either
+ * commits before this page's insert reads the fences, or waits and deletes
+ * what it inserted.
  */
 export function deletionLockSql(plan: TablePlan): string | null {
-  if (!["org_id", "workspace_id", "user_id"].every((column) => plan.columns.includes(column)))
-    return null;
+  const users = hasUser(plan)
+    ? `SELECT DISTINCT org_id, workspace_id, user_id FROM jsonb_populate_recordset(NULL::${qualified(plan.table)}, $1::jsonb)`
+    : needsOwners(plan)
+      ? `SELECT DISTINCT org_id, workspace_id, user_id FROM ${OWNERS.replace("$2", "$1")}`
+      : null;
+  if (!users) return null;
   return `SELECT pg_advisory_xact_lock(hashtextextended(jsonb_build_array(org_id, workspace_id, user_id)::text, 0))
-    FROM (SELECT DISTINCT org_id, workspace_id, user_id
-            FROM jsonb_populate_recordset(NULL::${qualified(plan.table)}, $1::jsonb)
-           ORDER BY 1, 2, 3) AS users`;
+    FROM (${users} ORDER BY 1, 2, 3) AS users`;
+}
+
+/** Owners (workspace, user) on Neon of the sessions in a source page. */
+export async function pageOwners(source: Queryable, plan: TablePlan, rows: string): Promise<string> {
+  const owners = await source.query<{ owners: string }>(
+    `SELECT coalesce(json_agg(DISTINCT jsonb_build_object(
+              'org_id', e.org_id, 'session_id', e.session_id,
+              'workspace_id', e.workspace_id, 'user_id', e.user_id))::text, '[]') AS owners
+       FROM sessions.convergence_events e
+       JOIN (SELECT DISTINCT org_id, session_id
+               FROM jsonb_populate_recordset(NULL::${qualified(plan.table)}, $1::jsonb)) AS k
+         ON e.org_id = k.org_id AND e.session_id = k.session_id`,
+    [rows],
+  );
+  return owners.rows[0]?.owners ?? "[]";
 }
 
 /**
- * Load the backfill's deletion fences into this target session: resets that
- * exist on Supabase but not on Neon were made after T0. Fails closed if the
- * tombstone tables are missing.
+ * Snapshot Neon's resets into this target session. Neon takes no writes after
+ * T0, so this set is fixed; resets on Supabase are always read live.
  */
 export async function prepareBackfillFence(source: Queryable, target: Queryable): Promise<void> {
-  const sourceResets = await source.query<{ keys: string }>(
+  const neon = await source.query<{ keys: string }>(
     `SELECT coalesce(json_agg(json_build_array(org_id, workspace_id, user_id, request_id))::text, '[]') AS keys
        FROM sessions.session_resets`,
   );
-  await target.query(`CREATE TEMP TABLE IF NOT EXISTS backfill_resets (
-    org_id text, workspace_id text, user_id text, PRIMARY KEY (org_id, workspace_id, user_id))`);
-  await target.query(`CREATE TEMP TABLE IF NOT EXISTS backfill_reset_sessions (
-    org_id text, session_id text, PRIMARY KEY (org_id, session_id))`);
-  await target.query("TRUNCATE pg_temp.backfill_resets, pg_temp.backfill_reset_sessions");
-  const resets = await target.query<{ users: string }>(
-    `WITH neon AS (
-       SELECT k->>0 AS org_id, k->>1 AS workspace_id, k->>2 AS user_id, k->>3 AS request_id
-         FROM jsonb_array_elements($1::jsonb) AS k),
-     after_t0 AS (
-       SELECT DISTINCT r.org_id, r.workspace_id, r.user_id FROM sessions.session_resets r
-        WHERE NOT EXISTS (SELECT 1 FROM neon n WHERE n.org_id = r.org_id
-          AND n.workspace_id = r.workspace_id AND n.user_id = r.user_id AND n.request_id = r.request_id)),
-     stored AS (INSERT INTO pg_temp.backfill_resets SELECT * FROM after_t0 ON CONFLICT DO NOTHING RETURNING *)
-     SELECT coalesce(json_agg(json_build_array(org_id, workspace_id, user_id))::text, '[]') AS users FROM stored`,
-    [sourceResets.rows[0]?.keys ?? "[]"],
-  );
-  // Sessions those users owned on Neon, for tables without user columns.
-  const sessions = await source.query<{ keys: string }>(
-    `SELECT coalesce(json_agg(DISTINCT jsonb_build_array(e.org_id, e.session_id))::text, '[]') AS keys
-       FROM sessions.convergence_events e
-       JOIN jsonb_array_elements($1::jsonb) AS u
-         ON e.org_id = u->>0 AND e.workspace_id = u->>1 AND e.user_id = u->>2`,
-    [resets.rows[0]?.users ?? "[]"],
-  );
+  await target.query(`CREATE TEMP TABLE IF NOT EXISTS neon_resets (
+    org_id text, workspace_id text, user_id text, request_id text,
+    PRIMARY KEY (org_id, workspace_id, user_id, request_id))`);
+  await target.query("TRUNCATE pg_temp.neon_resets");
   await target.query(
-    `INSERT INTO pg_temp.backfill_reset_sessions
-     SELECT k->>0, k->>1 FROM jsonb_array_elements($1::jsonb) AS k ON CONFLICT DO NOTHING`,
-    [sessions.rows[0]?.keys ?? "[]"],
+    `INSERT INTO pg_temp.neon_resets
+     SELECT k->>0, k->>1, k->>2, k->>3 FROM jsonb_array_elements($1::jsonb) AS k ON CONFLICT DO NOTHING`,
+    [neon.rows[0]?.keys ?? "[]"],
   );
 }
 
@@ -401,13 +416,14 @@ export async function copyTable(
       result.missing += absent.rows[0]?.n ?? 0;
     } else if (!options.dryRun) {
       const fenced = options.mode === "backfill" && options.fenced === true;
+      const owners = fenced && needsOwners(plan) ? await pageOwners(source, plan, page.rows) : null;
       const lock = fenced ? deletionLockSql(plan) : null;
       if (fenced) await target.query("BEGIN");
       try {
-        if (lock) await target.query(lock, [page.rows]);
+        if (lock) await target.query(lock, [owners ?? page.rows]);
         const written = await target.query<{ n: number }>(
           `WITH written AS (${writeSql(plan, options.mode, fenced)} RETURNING 1) SELECT count(*)::int AS n FROM written`,
-          [page.rows],
+          owners === null ? [page.rows] : [page.rows, owners],
         );
         if (fenced) await target.query("COMMIT");
         result.written += written.rows[0]?.n ?? 0;
