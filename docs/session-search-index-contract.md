@@ -15,7 +15,7 @@ in its SQLite projection and must not add write amplification to Supabase.
 
 | Consumer | Filter or order | Database shape | Required coverage |
 | --- | --- | --- | --- |
-| Cloud Sessions | newest workspace sessions | `org_id`, `workspace_id`, `last_ts DESC`, stable session/source cursor | workspace rollup recency |
+| Cloud Sessions | newest workspace sessions and opening summaries | `org_id`, `workspace_id`, `last_ts DESC`, stable session/source cursor; oldest nonblank user prompt | workspace rollup recency and opening-prompt lookup |
 | Cloud Sessions | harness/source | workspace + exact source + recency | workspace/source rollup recency |
 | Cloud Sessions | project | workspace + exact project + recency; existing RelayHistory `projectContains` is substring | workspace/project recency and project trigram |
 | Cloud Sessions | agent name | normalized exact name now; prefix is part of the source contract | tenant/workspace/name-prefix/recency agent catalog |
@@ -23,14 +23,15 @@ in its SQLite projection and must not add write amplification to Supabase.
 | `search_shared_sessions` | source, project, since/until | workspace plus optional equality and event time range | workspace event, source event, and project event keysets |
 | `get_shared_session` | session and optional source | workspace-scoped ordered replay | workspace/session/time replay keyset; source stays after the ordered cursor so omitted-source reads remain index ordered |
 | `get_shared_session_context` | query or timestamp window within one session | transcript trigram plus replay/time keyset | both paths above; PostgreSQL may bitmap-combine them |
-| `list_session_timings` | source, project, since/until | same session/event filters, then timing lookup | source/project/time keysets |
+| `list_session_timings` | source, project, since/until | same session/event filters, then timing lookup | source/project/time keysets and session-marker lookup |
 | `list_team_activity` | declared session/source latest event | top-one workspace session replay | workspace/session/time replay keyset |
 
 The executable gate is `bun run audit:search-indexes` with
 `HOOPDB_URL` supplied by the approved runtime secret mechanism. It reads only
-PostgreSQL catalogs and prints names/readiness failures, never connection data or
-session content. Missing, invalid, unfinished or structurally different indexes
-fail the command.
+PostgreSQL catalogs plus the agent lookup rollout marker, and prints only
+names/readiness failures, never connection data or session content. Missing,
+invalid, unfinished or structurally different indexes, unexpected partial
+predicates, and an unfinished agent lookup projection rollout fail the command.
 
 Large-table indexes are not created by that command. They must use the migration
 owner's resumable `CREATE INDEX CONCURRENTLY` rollout. In particular, hot
