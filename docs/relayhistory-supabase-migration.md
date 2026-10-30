@@ -19,7 +19,9 @@ copy-everything-then-switch runbook (linuyc, uncommitted
 - **Write fence shrinks to the switch.** Writes are held durably for the
   seconds it takes the Worker to move its database from Neon to Supabase,
   then replayed against Supabase in order. Every current writer is covered, and
-  no single-host store is allowed.
+  no single-host store is allowed. Small write-path state (tokens, deletion
+  tombstones, cursors) is copied inside the hold. See
+  `docs/relayhistory-t0-write-hold.md`.
 - **The 485.6 GiB copy leaves the deadline.** Only the empty schema, indexes
   and the sequence fence have to exist on Supabase before T0.
 - **Target database:** Supabase `sessions` (`pyamkrhoyszgzirqqffq`). AWS is S3
@@ -74,6 +76,9 @@ copy-everything-then-switch runbook (linuyc, uncommitted
 | 5 | 0067 agent index (push off `/tmp` as a draft PR), Cloud #5835, filter-to-index contract, read-only target readiness audit | helm-chart-chief @ linuyc (accepted) | in progress | 0067 draft PR; contract agreed with lane 2 |
 | 6 | Durable switch hold + ordered replay covering every writer | 96-no-bull-migration (accountable until assigned) | design | Writer inventory; synthetic-tenant hold/replay proof |
 | 7 | DB/API benchmarks, Neon HTTP vs. Supabase direct TCP | 96-no-bull-migration @ sf-mac-mini | code exists | Supabase p95 no worse than Neon on each critical query |
+| 6a | Cloud: move its direct Neon calls (`request_session_analysis_v1`, the two acks) to Supabase behind a flag; tolerate missing Neon-era event IDs | unassigned (Cloud repo) | todo | Draft Cloud PR; flag off by default |
+| 6b | Migration runner, rollouts and checks reach Supabase over TCP (node-postgres for non-Neon URLs) | 96-no-bull-migration @ sf-mac-mini | in progress | relayhistory-cloud draft PR; runner applies the full schema to PostgreSQL 17 |
+| 6c | T0 copy set (auth tokens, deletion tombstones, cursors, delivery dedupe): measure sizes on Neon read-only, then copy inside the hold | 96-no-bull-migration | todo | Size report; copy rehearsal on a static clone |
 | 8 | T0 runbook + rollback | 96-no-bull-migration @ sf-mac-mini | todo | Reviewed runbook (below) |
 
 **T0 gate (mandatory):** `relayhistory-schema-parity.test.ts`, which covers
