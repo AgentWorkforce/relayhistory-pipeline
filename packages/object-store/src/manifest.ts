@@ -208,11 +208,7 @@ export type EpochRecord = z.infer<typeof EpochRecordSchema>;
 export type ScrubMarker = z.infer<typeof ScrubMarkerSchema>;
 export type ServerSection = z.infer<typeof ServerSectionSchema>;
 export type EffectiveState =
-  | "closed"
-  | "active"
-  | "idle"
-  | "abandoned"
-  | "archived";
+  "closed" | "active" | "idle" | "abandoned" | "archived";
 
 export interface ManifestIssue {
   path: string;

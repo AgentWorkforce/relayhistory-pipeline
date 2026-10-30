@@ -186,7 +186,10 @@ describe("manifest v1", () => {
     m.raw.next_offset = 100;
     m.raw.content_sha256 = await computeContentSha256(m.raw.chunks);
     await expect(parseManifest(m)).resolves.toMatchObject({
-      raw: { epoch: 1, epochs: [{ reason: "initial" }, { reason: "backfill" }] },
+      raw: {
+        epoch: 1,
+        epochs: [{ reason: "initial" }, { reason: "backfill" }],
+      },
     });
   });
 
