@@ -108,6 +108,12 @@ all prior chunks. Both migration and live writes compare-and-swap the exact
 object version they read, so a straddling session has one manifest order and
 the losing writer must reread before it can continue.
 
+The contract is in relayhistory's `manifest-v1.md`, section "Backfill". A
+backfill epoch is sealed: the live client never appends to it, and continues in
+a `resumed` epoch at its own offset. Re-exporting is a no-op by content digest,
+and a different digest stops for a human. A client truncate or rewrite leaves
+the backfill in the merge.
+
 ## Invariants (data loss and dual write)
 
 - **I1:** every write accepted before the marker is on Neon at the marker LSN,

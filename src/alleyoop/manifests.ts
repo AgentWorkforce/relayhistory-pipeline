@@ -1,5 +1,6 @@
 import { Hono, type Context } from "hono";
 import {
+  backfillWriteIssues,
   buildObjectLandedMessage,
   isObjectStoreError,
   objectKey,
@@ -193,7 +194,7 @@ function manifestOwnerIssue(
         .some((epoch) => epoch.reason === "backfill")
     )
       return "live writer attempted to open a backfill epoch";
-    return undefined;
+    return backfillWriteIssues(existing, incoming, "live")[0];
   }
 
   const addedEpochs = raw.epochs.slice(existing.raw.epochs.length);

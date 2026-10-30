@@ -77,6 +77,7 @@ export {
   manifestKey,
   rawChunkKey,
   parseSessionKey,
+  backfillWriteIssues,
   computeContentSha256,
   validateManifest,
   parseManifest,

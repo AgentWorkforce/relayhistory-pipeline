@@ -49,7 +49,7 @@ async function fixture() {
   };
   const sealed = await sealRawChunk(store, {
     location,
-    format: "jsonl",
+    format: "ndjson",
     seq: 0,
     epoch: 0,
     startOffset: 0,
@@ -76,7 +76,7 @@ async function fixture() {
       owner: MACHINE,
       state: revision > 1 ? "closed" : "open",
       updated_at: AT,
-      format: "jsonl",
+      format: "ndjson",
       compression: "zstd",
       chunk_count: 1,
       raw_bytes: sealed.entry.bytes,
@@ -196,7 +196,7 @@ async function fixture() {
     const seq = previous.raw.chunks.length;
     const sealed = await sealRawChunk(store, {
       location,
-      format: "jsonl",
+      format: "ndjson",
       seq,
       epoch,
       startOffset: 0,
@@ -317,6 +317,47 @@ describe("AlleyOop courier manifest routes", () => {
       "backfill",
       "rewritten",
     ]);
+  });
+
+  test("refuses a live write into the sealed backfill epoch, and a backfill on a jsonl stream", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const first = await f.build(1);
+    const firstBody = (await (await f.post({ key, manifest: first })).json()) as { version: object };
+    const backfill = await f.appendEpoch(first, "backfill", "migration:mgr_export", '{"pre":"t0"}');
+    backfill.extensions = {
+      ...backfill.extensions,
+      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+    };
+    const jsonl = structuredClone(backfill);
+    jsonl.raw.format = "jsonl";
+    expect((await f.post({ key, manifest: jsonl, previousVersion: firstBody.version }, "migration")).status).toBe(400);
+    const appended = await f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration");
+    expect(appended.status).toBe(202);
+    const appendedBody = (await appended.json()) as { version: object };
+
+    // Offsets are contiguous, so only the two-revision check can refuse this.
+    const next = structuredClone(backfill);
+    next.revision += 1;
+    const tail = next.raw.chunks.at(-1)!;
+    const end = tail.start_offset + tail.bytes;
+    const extra = await sealRawChunk(f.store, {
+      location: f.location,
+      format: "ndjson",
+      seq: next.raw.chunks.length,
+      epoch: tail.epoch,
+      startOffset: end,
+      source: new TextEncoder().encode('{"after":"t0"}\n'),
+      traceId: TRACE,
+    });
+    next.raw.chunks.push(extra.entry);
+    next.raw.chunk_count += 1;
+    next.raw.raw_bytes += extra.entry.bytes;
+    next.raw.stored_bytes += extra.entry.stored_bytes;
+    next.raw.next_offset = end + extra.entry.bytes;
+    next.raw.content_sha256 = await computeContentSha256(next.raw.chunks);
+    const refused = await f.post({ key, manifest: next, previousVersion: appendedBody.version });
+    expect(refused.status).toBe(409);
   });
 
   test("creates a cold export only under the migration grant owner", async () => {
