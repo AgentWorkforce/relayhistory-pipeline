@@ -430,14 +430,18 @@ export default Alchemy.Stack(
       description: authorized("Dedicated GKE node identity. No keys."),
     });
     const nodeMember = Output.interpolate`serviceAccount:${nodeIdentity.email}`;
-    for (const role of GCP_NODE_ROLES) {
-      yield* GCP.IAM.Member(`node-${role.split("/")[1]!.replaceAll(".", "-")}`, {
-        kind: "project",
-        name: i.projectId,
-        role: authorized(role),
-        member: nodeMember,
-      });
-    }
+    yield* GCP.IAM.Member("node-container-defaultNodeServiceAccount", {
+      kind: "project",
+      name: i.projectId,
+      role: authorized(GCP_NODE_ROLES[0]),
+      member: nodeMember,
+    });
+    const nodeArtifactRegistryReader = yield* GCP.IAM.Member("node-artifactregistry-reader", {
+      kind: "project",
+      name: i.projectId,
+      role: authorized(GCP_NODE_ROLES[1]),
+      member: nodeMember,
+    });
 
     const nodeActAs = yield* RequireNodeActAs("node-act-as", {
       projectId: i.projectId,
@@ -826,7 +830,12 @@ export default Alchemy.Stack(
             values: bulls96ReleaseValues(i.bulls96!, {
               bucket: lockerBucket,
               region: i.region,
-              imageRepository: Output.interpolate`${images.registryUri}/96bulls-services`,
+              // Resolve the IAM member as part of the repository value so
+              // Helm cannot create image-pulling pods before the reader edge.
+              imageRepository: Output.map(
+                Output.all(images.registryUri, nodeArtifactRegistryReader.role),
+                ([registry]) => `${registry}/96bulls-services`,
+              ),
               cloudSqlConnectionName: dataPlane.sqlPoster.connectionName,
               redisHost: dataPlane.redis.host,
               redisPort: dataPlane.redis.port,

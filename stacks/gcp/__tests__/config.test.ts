@@ -300,6 +300,11 @@ describe("GCP self-host contract", () => {
     expect(stack).toContain("enablePrivateEndpoint: GCP_RUNTIME_SHAPE.privateEndpoint");
     expect(stack).toContain("autopilot: GCP_RUNTIME_SHAPE.autopilot");
     expect(stack).toContain("serviceAccount: nodeActAs.serviceAccountEmail");
+    expect(stack).toContain('GCP.IAM.Member("node-artifactregistry-reader"');
+    expect(stack).toContain("Output.all(images.registryUri, nodeArtifactRegistryReader.role)");
+    expect(stack.indexOf('GCP.IAM.Member("node-artifactregistry-reader"')).toBeLessThan(
+      stack.indexOf('Kubernetes.HelmChart("96bulls"'),
+    );
     expect(stack.indexOf('RequireNodeActAs("node-act-as"')).toBeLessThan(
       stack.indexOf('GCP.Container.Cluster("cluster"'),
     );
