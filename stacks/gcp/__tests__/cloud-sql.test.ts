@@ -119,6 +119,8 @@ describe("Cloud SQL private attachment", () => {
     expect(stack).toContain("Alchemy.Action");
     expect(stack).toContain("ensurePrivateCloudSql");
     expect(stack).toContain("sqlAdminFetchTransport");
+    expect(stack).toContain("input.authorization.leaseExpiresAt * 1000");
+    expect(stack).toContain("Effect.tryPromise((signal)");
     expect(stack).toContain("dataPlane.sqlPoster.connectionName");
     expect(stack).not.toContain("GCP.SQL.Instance(");
     expect(seam).not.toContain("console.");
@@ -588,6 +590,54 @@ describe("SQL Admin idempotent poster", () => {
       ),
     ).rejects.toThrow(/outcome is uncertain/);
     expect(calls.map((call) => call.method)).toEqual(["GET", "POST", "GET"]);
+  });
+
+  test("rechecks the fixed apply lease after lookup and refuses the insert", async () => {
+    const spec = privateCloudSqlSpec(input);
+    let leaseNow = 1_000;
+    const calls: SqlAdminEnsureRequest[] = [];
+    await expect(
+      ensurePrivateCloudSql(
+        spec,
+        credential,
+        {
+          request: async (call) => {
+            calls.push(call);
+            leaseNow = 1_006;
+            return { status: 404 };
+          },
+        },
+        fastPoll(),
+        { expiresAtMs: 1_005, now: () => leaseNow },
+      ),
+    ).rejects.toThrow(/lookup timed out|authorization expired/);
+    expect(calls.map((call) => call.method)).toEqual(["GET"]);
+  });
+
+  test("propagates apply interruption and never reaches the insert", async () => {
+    const spec = privateCloudSqlSpec(input);
+    const controller = new AbortController();
+    const calls: SqlAdminEnsureRequest[] = [];
+    let combinedSignalAborted = false;
+    await expect(
+      ensurePrivateCloudSql(
+        spec,
+        credential,
+        {
+          request: (call, _credential, signal) => new Promise<SqlAdminEnsureResponse>(() => {
+            calls.push(call);
+            signal?.addEventListener("abort", () => {
+              combinedSignalAborted = true;
+            });
+            setTimeout(() => controller.abort(), 1);
+          }),
+        },
+        fastPoll(),
+        { expiresAtMs: Date.now() + 10_000, signal: controller.signal },
+      ),
+    ).rejects.toThrow(/lookup timed out/);
+    expect(combinedSignalAborted).toBe(true);
+    expect(calls.map((call) => call.method)).toEqual(["GET"]);
   });
 
   test("hard-bounds a 409 adoption sleep that never resolves", async () => {

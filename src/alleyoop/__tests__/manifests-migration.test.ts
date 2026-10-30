@@ -17,6 +17,7 @@ import { Hono } from "hono";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import {
+  migrationUploadMatches,
   uploadIdentityOf,
   type MigrationAssertionLedger,
   type PlanEntry,
@@ -114,7 +115,11 @@ function migrationAuth(upload: UploadIdentity, claims: Record<string, unknown> =
     tokenSubject: "agent_relayhistory_migration",
     scopes: ["rth:sync"],
     historyOrigin: ORIGIN,
-    claims: { sub: "agent_relayhistory_migration", org: ORG, wks: WORKSPACE, sponsorId: USER, ...claims },
+    claims: {
+      sub: "agent_relayhistory_migration", org: ORG, wks: WORKSPACE, sponsorId: USER,
+      meta: { tokenClass: "migration_assertion", grantId: GRANT, planDigest: PLAN },
+      ...claims,
+    },
     migration: {
       jti: freshJti(),
       nonce: freshNonce(),
@@ -148,15 +153,16 @@ async function fixture(options: { ledger?: MigrationAssertionLedger | null } = {
     location, format: "jsonl", seq: 0, epoch: 0, startOffset: 0,
     source: new TextEncoder().encode('{"type":"user","text":"hello"}\n'), traceId: TRACE,
   });
-  const build = async (ext: Record<string, unknown> = {}, session: Partial<ManifestV1["session"]> = {}): Promise<ManifestV1> => ({
+  const build = async (ext: Record<string, unknown> = {}, session: Partial<ManifestV1["session"]> = {}, owner = `migration:${GRANT}`): Promise<ManifestV1> => ({
     schema_v: 1, layout: "v1", trace_id: TRACE, revision: 1, created_at: AT, updated_at: AT,
     session: { workspace_id: WORKSPACE, machine_id: MACHINE, harness: "claude", session_id: SESSION, started_at: AT, ...session },
-    writer: { delivery_instance_id: MACHINE, plugin_version: "test" },
+    // A cold export is owned by its migration grant (#42's owner fence).
+    writer: { delivery_instance_id: owner, plugin_version: "test" },
     raw: {
-      owner: MACHINE, state: "open", updated_at: AT, format: "jsonl", compression: "zstd", chunk_count: 1,
+      owner, state: "open", updated_at: AT, format: "jsonl", compression: "zstd", chunk_count: 1,
       raw_bytes: sealed.entry.bytes, stored_bytes: sealed.entry.stored_bytes,
       content_sha256: await computeContentSha256([sealed.entry]), epoch: 0,
-      epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: 0, opened_by: MACHINE }],
+      epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: 0, opened_by: owner }],
       next_offset: sealed.entry.bytes, chunks: [sealed.entry], scrub: sealed.scrub,
     },
     extensions: {
@@ -196,7 +202,7 @@ async function fixture(options: { ledger?: MigrationAssertionLedger | null } = {
   };
   const status = async (as: TestAuth, envOverride: Record<string, string | undefined> = {}, at = key) => {
     auth = as;
-    return app.request(`/v1/pipeline/manifests/status?key=${encodeURIComponent(at)}&machine=${MACHINE}&writer=${MACHINE}`, {}, { ...env, ...envOverride });
+    return app.request(`/v1/pipeline/manifests/status?key=${encodeURIComponent(at)}&machine=${MACHINE}&writer=${encodeURIComponent(`migration:${GRANT}`)}`, {}, { ...env, ...envOverride });
   };
   /** A migration auth context for this fixture's planned upload. */
   const as = (claims: Record<string, unknown> = {}, migration: Record<string, unknown> = {}) => migrationAuth(upload, claims, migration);
@@ -281,6 +287,12 @@ describe("AlleyOop manifest route: migration assertions", () => {
       expect(response.status).toBe(503);
       expect(await code(response)).toBe("migration_ledger_unavailable");
     }
+    // Ordinary (live) tokens are unaffected by the ledger. (Checked first: the
+    // fixtures below share this test's store, and #42's owner fence then
+    // refuses a live write over a migration-owned manifest.)
+    expect((await none.post(ordinaryAuth, await none.build({}, {}, MACHINE))).status).toBe(202);
+    expect(none.sent).toHaveLength(1);
+    await rm(root, { recursive: true, force: true });
     const down: MigrationAssertionLedger = {
       consumed: async () => { throw new Error("ledger down"); },
       reserveChunk: async () => { throw new Error("ledger down"); },
@@ -301,9 +313,6 @@ describe("AlleyOop manifest route: migration assertions", () => {
     expect(response.status).toBe(503);
     expect(await code(response)).toBe("migration_ledger_unavailable");
     expect(g.sent).toHaveLength(0);
-    // Ordinary tokens are unaffected by the ledger.
-    expect((await none.post(ordinaryAuth, await none.build())).status).toBe(202);
-    expect(none.sent).toHaveLength(1);
   });
 
   test("returns the relayhistory-cloud codes: workspace pair, grant, and the recomputed upload identity", async () => {
@@ -376,6 +385,64 @@ describe("AlleyOop manifest route: migration assertions", () => {
     expect(ok.status).toBe(202);
     // The work key is the signed key and entry digest.
     expect(((await ok.json()) as { workKey: string }).workKey).toBe(`${f.upload.key}@${f.upload.entry_sha256}`);
+  });
+
+  test("composes with #42's owner/backfill fence: both must pass, in either order of failure", async () => {
+    const f = await fixture();
+    // Identity valid, but the cold export is owned by the machine, not migration:<grant>: #42 refuses.
+    const machineOwned = await f.build({}, {}, MACHINE);
+    const machineUpload = await uploadIdentityOf(await entryOf(f.key, machineOwned), PLAN);
+    const fenced = await f.post(migrationAuth(machineUpload), machineOwned);
+    expect(fenced.status).toBe(409);
+    expect(await code(fenced)).toBe("owner_conflict");
+    expect(await count("sessions.migration_assertion_uses")).toBe(0);
+    // #42's fence satisfied but the identity is not the signed one: migration admission refuses.
+    const other = await f.post(f.as({}, { upload: { ...f.upload, entry_sha256: "e".repeat(64) } }), await f.build());
+    expect(other.status).toBe(403);
+    expect(await code(other)).toBe("migration_upload_forbidden");
+    // Both satisfied: the cold export commits.
+    expect((await f.post(f.as(), await f.build())).status).toBe(202);
+    // A live (ordinary) writer cannot then take the migration-owned stream over (#42).
+    const live = await f.build({}, {}, MACHINE);
+    const takeover = await f.post(ordinaryAuth, { ...live, revision: 2 });
+    expect(takeover.status).toBe(409);
+    expect(await count("sessions.migration_assertion_uses")).toBe(1);
+  });
+
+  test("a backfill epoch appended to a live manifest (O4 straddling) is refused by the v1 identity", async () => {
+    const f = await fixture();
+    // A live session exists at the key.
+    const live = await f.build({}, {}, MACHINE);
+    expect((await f.post(ordinaryAuth, live)).status).toBe(202);
+    // Same content as a new revision without the CAS version: #42 refuses.
+    const sameContent = await f.post(f.as(), { ...live, revision: 2 } as ManifestV1);
+    expect(sameContent.status).toBe(409);
+    // A real backfill (the live chunks plus a backfill epoch's chunk) is not
+    // the v1 entry the assertion signed (that covers the whole chunk list):
+    // migration admission refuses it before #42's backfill fence.
+    const extra = { ...live.raw.chunks[0]!, seq: 1, epoch: 1, start_offset: live.raw.chunks[0]!.bytes };
+    const chunks = [...live.raw.chunks, extra];
+    const backfill = {
+      ...live,
+      revision: 2,
+      raw: {
+        ...live.raw,
+        chunks,
+        chunk_count: 2,
+        epoch: 1,
+        raw_bytes: live.raw.raw_bytes * 2,
+        stored_bytes: live.raw.stored_bytes * 2,
+        next_offset: extra.start_offset + extra.bytes,
+        content_sha256: await computeContentSha256(chunks),
+        epochs: [...live.raw.epochs, { epoch: 1, opened_at: AT, reason: "backfill", first_seq: 1, opened_by: `migration:${GRANT}` }],
+      },
+    } as unknown as ManifestV1;
+    const response = await f.post(f.as(), backfill);
+    expect([400, 403]).toContain(response.status);
+    if (response.status === 403) expect(await code(response)).toBe("migration_upload_forbidden");
+    expect(await count("sessions.migration_assertion_uses")).toBe(0);
+    // And directly: the recomputed identity of a backfill manifest is not the signed one.
+    expect(await migrationUploadMatches(f.as() as never, { ...f.location, rest: "manifest.json" } as never, backfill)).toBe(false);
   });
 
   test("normalizes relay_ consistently: prefixed signed claims match the canonical identity", async () => {

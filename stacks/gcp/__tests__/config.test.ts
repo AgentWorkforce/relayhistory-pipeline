@@ -119,7 +119,6 @@ describe("GCP self-host contract", () => {
       chartVersion: "0.3.0",
       tenantOrgId: "org_123",
       existingSecretName: "bulls96-runtime",
-      imagePullSecretName: "ghcr-pull",
       imageDigest: `sha256:${"a".repeat(64)}`,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
       relayauthIssuer: "http://relayauth.relayauth.svc:8787",
@@ -198,7 +197,6 @@ describe("GCP self-host contract", () => {
           chartVersion: "0.3.0",
           tenantOrgId: "org_123",
           existingSecretName: "bulls96-runtime",
-          imagePullSecretName: "ghcr-pull",
           imageDigest: `sha256:${"a".repeat(64)}`,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
           relayauthIssuer: "http://relayauth.relayauth.svc:8787",
@@ -206,6 +204,7 @@ describe("GCP self-host contract", () => {
         {
           bucket: "locker",
           region: "us-central1",
+          imageRepository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
           cloudSqlConnectionName: "agentworkforce-dev1:us-central1:awf-dev-postgres",
           redisHost: "10.52.0.3",
           redisPort: 6379,
@@ -219,15 +218,26 @@ describe("GCP self-host contract", () => {
     expect(rendered).toContain("REDIS_TLS_CA_PEM");
     expect(rendered).toContain("REDIS_TRANSIT_ENCRYPTION");
     expect(rendered).toContain("SERVER_AUTHENTICATION");
-    expect(rendered).toContain("ghcr-pull");
+    expect(rendered).toContain("us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services");
+    expect(rendered).not.toContain("ghcr-pull");
     expect(rendered).not.toContain('"REDIS_AUTH"');
     expect(rendered).not.toContain("REDIS_PASSWORD");
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
     expect(values).toMatchObject({
-      worker: { imagePullSecrets: [{ name: "ghcr-pull" }], image: { digest: `sha256:${"a".repeat(64)}` }, locker: { credentials: { mode: "podIdentity" } } },
+      worker: {
+        imagePullSecrets: [],
+        image: {
+          repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
+          digest: `sha256:${"a".repeat(64)}`,
+        },
+        locker: { credentials: { mode: "podIdentity" } },
+      },
       alleyoop: {
-        imagePullSecrets: [{ name: "ghcr-pull" }],
-        image: { digest: `sha256:${"a".repeat(64)}` },
+        imagePullSecrets: [],
+        image: {
+          repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
+          digest: `sha256:${"a".repeat(64)}`,
+        },
         locker: { credentials: { mode: "podIdentity" } },
         auth: {
           jwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
@@ -282,11 +292,19 @@ describe("GCP self-host contract", () => {
     expect(GCP_RUNTIME_SHAPE.nodeLocation).toBe("us-central1-a");
     expect(GCP_RUNTIME_SHAPE.natIpAllocateOption).toBe("MANUAL_ONLY");
     expect(GCP_RUNTIME_SHAPE.natLogFilter).toBe("ALL");
-    expect(GCP_NODE_ROLES).toEqual(["roles/container.defaultNodeServiceAccount"]);
+    expect(GCP_NODE_ROLES).toEqual([
+      "roles/container.defaultNodeServiceAccount",
+      "roles/artifactregistry.reader",
+    ]);
     const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
     expect(stack).toContain("enablePrivateEndpoint: GCP_RUNTIME_SHAPE.privateEndpoint");
     expect(stack).toContain("autopilot: GCP_RUNTIME_SHAPE.autopilot");
     expect(stack).toContain("serviceAccount: nodeActAs.serviceAccountEmail");
+    expect(stack).toContain('GCP.IAM.Member("node-artifactregistry-reader"');
+    expect(stack).toContain("Output.all(images.registryUri, nodeArtifactRegistryReader.role)");
+    expect(stack.indexOf('GCP.IAM.Member("node-artifactregistry-reader"')).toBeLessThan(
+      stack.indexOf('Kubernetes.HelmChart("96bulls"'),
+    );
     expect(stack.indexOf('RequireNodeActAs("node-act-as"')).toBeLessThan(
       stack.indexOf('GCP.Container.Cluster("cluster"'),
     );
@@ -353,10 +371,12 @@ describe("GCP self-host contract", () => {
       writeFileSync(path, "not-the-published-chart");
       expect(() => captureRelaycastChartPackage(path)).toThrow(/digest does not match/);
       const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+      const cache = readFileSync(new URL("../chart-cache.ts", import.meta.url), "utf8");
       expect(stack).toContain("captureRelaycastChartPackage");
       expect(stack).toContain('process.env.CI !== "true"');
-      expect(stack).toContain("writeFileSync(artifact, captured.bytes");
-      expect(stack).not.toContain("readFileSync(captured.sourcePath");
+      expect(cache).toContain("writeFileSync(artifact, captured.bytes");
+      expect(cache).not.toContain("readFileSync(captured.sourcePath");
+      expect(cache).not.toContain("rmSync(extracted");
       expect(stack).toContain("invocationId: APPLY_INVOCATION_ID");
       expect(stack).toContain('chart: relaycastChart!');
       expect(stack).not.toContain('chart: "relaycast"');

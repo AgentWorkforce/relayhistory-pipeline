@@ -1,10 +1,11 @@
 # GCP self-hosted reference lane
 
-This lane is a code-only conformance implementation. Static work does not wait
-on the AWS adapter freeze. Nothing in this document is evidence of a GCP
-deployment. No project, credentials, secret payload, DNS record, or cloud
-resource was created while implementing it. The only eligible target is the
-existing project `agentrelay-96bulls-soc2-2610`, number `955297012355`, parent
+This lane began as a code-only conformance implementation. On 2026-10-30 an
+approved substrate deployment and live in-cluster verification completed on
+merge commit `dac89b587debf0f64fc16cbbde23d8d818901daf`; the exact evidence is
+recorded below. It is not a product-route or Relaycast availability proof.
+The only eligible target is the existing project
+`agentrelay-96bulls-soc2-2610`, number `955297012355`, parent
 org `929835122282`, region `us-central1`, billing account
 `014D50-E96D1A-DE6360`. Do not create or select another project.
 
@@ -47,7 +48,8 @@ translation. Those logs are audit evidence, not an egress allowlist. This lane
 does not claim workload egress restriction or SOC 2 network conformance; a
 separately proven egress proxy/firewall policy is still required.
 
-Cloud SQL has not been created in this lane. On an approved apply, the stack
+Cloud SQL is now present and `RUNNABLE` in this lane. The successful
+reconciliation adopted it rather than inserting another instance. The stack
 prepares a SQL Admin `instances.insert`
 for public IPv4 off, the Private Service Access network and range, and
 `--private-ip` proxy routing. `ensurePrivateCloudSql` gets that instance or
@@ -111,8 +113,10 @@ with SHA-256
 and image
 `ghcr.io/agentworkforce/relaycast-self-host@sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98`.
 The stack verifies the package bytes before provider resolution, extracts those
-verified bytes into a deterministic digest-addressed directory, and renders
-that local chart rather than re-resolving a mutable
+verified bytes into a deterministic digest-addressed directory, validates its
+content manifest before reuse, and never deletes or replaces an active cache.
+Concurrent invocations serialize first population and render that local chart
+rather than re-resolving a mutable
 repository index. Ingress and GKE ManagedCertificate are disabled. The service
 is ClusterIP and the chart NetworkPolicy accepts callers only from its
 namespace. `baseUrl` remains the chart-required signed-URL authority; it does
@@ -165,7 +169,6 @@ To request the application release after its external Secrets exist, set
   "chartVersion": "0.3.0",
   "tenantOrgId": "org_replace_me",
   "existingSecretName": "96bulls-runtime",
-  "imagePullSecretName": "ghcr-pull",
   "imageDigest": "sha256:<digest-built-from-the-reviewed-main-commit>",
   "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
   "relayauthIssuer": "http://relayauth.relayauth.svc:8787"
@@ -173,7 +176,10 @@ To request the application release after its external Secrets exist, set
 ```
 
 Those are names and identifiers only. Secret payloads never belong in this
-file or Helm values.
+file or Helm values. The stage uses its private Artifact Registry repository
+for the digest-pinned services image, and the GKE node identity receives
+read-only Artifact Registry access. No GHCR pull token or dockerconfigjson
+Secret is used or required for that path.
 
 `assertGcpInputs` accepts only those five target fields. `agentworkforce-dev1`
 and any other project, number, org, billing account, or region are refused
@@ -198,8 +204,12 @@ records the token digest in both a stage-scoped local ledger and an
 `ifGenerationMatch=0` marker under the existing Alchemy state bucket. The
 state-bucket marker makes the nonce single-use across executors and machines;
 it contains only proof metadata and a digest, never the token. Tokens older
-than five minutes, expiring tokens, wrong-stage/project/identity tokens, and
-replays are refused. The token is read only by the apply-time Action and is not
+than five minutes, tokens with less than twenty minutes remaining,
+wrong-stage/project/identity tokens, and replays are refused. A fifteen-minute
+Effect deadline interrupts the whole stack before the signed mutation lease
+expires; the remaining five minutes are safety margin. Late actAs, Cloud SQL,
+and Kubernetes actions recheck the fixed lease deadline. The token is read
+only by the apply-time Action and is not
 written to Alchemy inputs, outputs, state, annotations, or errors. Its digest
 changes the Action input and gates every declared GCP and Kubernetes mutation.
 Plan does not execute or consume the nonce Action and performs no cloud
@@ -239,7 +249,9 @@ Before evaluating a Relaycast stage, place the exact public release artifact at
 digest-mismatched package before constructing the Alchemy Stack, provider
 layers, or state backend. It reads the source artifact once, verifies those
 captured bytes, and extracts only that buffer to a SHA-256-addressed cache
-path; it never reopens the source between verification and extraction. The
+path; it never reopens the source between verification and extraction. Cache
+population is atomic and serialized, and an existing cache is reused only
+after its extracted content digest validates. The
 pinned 8.0.0 image
 predates later workspace-bootstrap Secret support, so this lane does not pass
 an ineffective Secret setting. There is no Relaycast Ingress, load balancer,
@@ -253,7 +265,7 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
 
 - `privateCloudSqlSpec` builds the private-only insert body: `edition` pinned
   to `ENTERPRISE` for the custom-core tier, `ipv4Enabled` false,
-  `privateNetwork` set to `/projects/{project}/global/networks/{name}`,
+  `privateNetwork` set to `projects/{project}/global/networks/{name}`,
   `allocatedIpRange` set to the PSA range name, automated backups and
   point-in-time recovery enabled, and no authorized networks.
   Proxy args are `--private-ip`, `--address=0.0.0.0`, `--port=5432`, and the
@@ -299,13 +311,18 @@ Release boundaries that remain deliberate:
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
   is written.
-- No create, write, read, search, replay, or teardown has run on GCP.
+- No product create, write, read, indexed search, manifest replay, or product
+  teardown has run on GCP. The substrate is reconciled and its provider-path
+  proof is recorded below; that does not close the application gaps.
 
 ## Apply, verify, and teardown
 
-Apply, verify, and teardown have not been executed. Static work does not wait
-on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down` refuse every
-`gcp-*` stage. `bin/96bulls plan gcp-*` calls
+The substrate deployment and its live provider-path verification completed on
+2026-10-30. The application charts remained disabled, so product create,
+indexed search, manifest replay, application database access, Relaycast
+availability, and full product teardown remain unproved. Static work does not
+wait on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down`
+refuse every `gcp-*` stage. `bin/96bulls plan gcp-*` calls
 `bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
 and is not proof. A non-zero Alchemy status exits the wrapper with that
 status. A child with no status exits 1. The 2026-10-30 missing-bucket run
@@ -342,7 +359,69 @@ missing state bucket fail instead of being created.
 That failed preflight predates the apply-time poster and is not evidence that
 the current exact head plans or applies successfully. The wrapper exited 0
 because it passed `allowFail`. A GCP plan now exits with the Alchemy status
-instead. Do not bootstrap the state bucket, enable APIs, or rerun the plan.
+instead.
+
+Later on 2026-10-30, an approved `gcp-conformance` substrate apply reached 24
+successful resources and five failures. GKE `awf-conformance-gke` completed
+with one node and private endpoint `172.20.0.2`. The failures were Secret
+Manager API propagation, a malformed Private Service Access global-address
+network URL, two Workload Identity bindings racing the workload pool, and the
+downstream PSA connection. A corrective plan then showed five creates, 22
+in-place updates, two gated actions, and no replacement or delete. A subsequent
+live attempt showed Memorystore rejecting a short network name while SQL Admin
+accepted the canonical private network and began creating the private-only
+Cloud SQL instance. At that point no evidence confirmed that instance reached
+`RUNNABLE`.
+PRs #36 and #39 contain the contemporaneous evidence; PR #41 added Redis TLS
+readiness in code and tests only.
+
+The corrective deployment at `dac89b5` then reconciled this partial state. Its
+detailed plan contained 33 in-place updates and four gated actions, with no
+create, replacement, or delete. The provider rendered stable names and project
+values as `known after apply`, so a following plan still displays those same
+updates; that is not accepted as a no-op claim. The deploy completed 37/37
+operations successfully. The Cloud SQL action adopted the matching existing
+instance (`created: false`, `operation: null`) instead of posting another
+instance. The Redis CA lookup and node `actAs` preflight also passed.
+
+Post-deploy inventory confirmed:
+
+- GKE `awf-conformance-gke` is `RUNNING` with one node, private endpoint
+  `172.20.0.2`, and workload pool
+  `agentrelay-96bulls-soc2-2610.svc.id.goog`;
+- Cloud SQL `awf-conformance-postgres` is `RUNNABLE`, PostgreSQL 17,
+  `ipv4Enabled: false`, with only private address `10.80.0.3`, canonical VPC
+  `awf-conformance-vpc`, and PSA range `awf-conformance-psa`;
+- Memorystore `awf-conformance-redis` is `READY`, Redis 7.2, BASIC 1 GiB,
+  AUTH off, and `SERVER_AUTHENTICATION` on private address `10.80.7.195:6378`;
+- the versioned uniform-access Locker bucket, state bucket, immutable Artifact
+  Registry repository, regional Secret Manager container, Pub/Sub topics and
+  subscription, runtime/node/runner service accounts, VPC, subnet, NAT, and PSA
+  allocation all exist in the approved project.
+
+A short-lived private verifier VM used the named runner identity to create a
+temporary namespace only after proving namespace `96bulls` did not already
+exist. A Job ran as Kubernetes service account `96bulls-worker`, resolving the
+existing runtime Google service account through Workload Identity. From that
+pod it proved all of the following live paths:
+
+1. the metadata identity was exactly
+   `awf-conformance-runtime@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com`;
+2. Redis returned `PONG` over TLS with the exact Redis Admin service CA;
+3. the private Cloud SQL address accepted TCP on port 5432;
+4. the runtime identity wrote, read, and deleted a marker in the Locker bucket;
+5. the runtime identity published, pulled, and acknowledged a marker through
+   the configured Pub/Sub topic and subscription.
+
+The Cloud SQL check established private transport reachability only. It did
+not present database credentials, authenticate, or execute a SQL query.
+
+Verification cleanup completed: the temporary namespace and Job were deleted,
+the GCS marker was deleted, the Pub/Sub marker was acknowledged, the verifier
+VM was deleted, and the temporary `roles/container.developer` binding was
+removed from the runner identity. The managed substrate remains deployed for
+the still-unproved application lane. No secret payload, database credential,
+public endpoint, DNS record, or application chart was introduced.
 
 Read-only preflight:
 

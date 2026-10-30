@@ -14,8 +14,10 @@
  *
  * Rows move as JSON through jsonb_populate_recordset, so every column type
  * (jsonb, arrays, timestamps, bytea, vector) is converted by Postgres itself.
- * Generated columns are skipped. The target session runs with triggers off
- * (prepareTargetSession), so rows land exactly as Neon has them. Keyset pages on the primary key make each run
+ * Generated columns are skipped. The backfill's target session runs with
+ * triggers off (prepareTargetSession), so rows land exactly as Neon has them.
+ * The mirror needs no `session_replication_role`: it lands only on tables whose
+ * triggers are reviewed guards (prepareGuardedTargetSession). Keyset pages on the primary key make each run
  * resumable from a checkpoint. Nothing here prints row contents or URLs.
  *
  * Usage: RELAYHISTORY_SOURCE_URL=... BULLS_TARGET_URL=... \
@@ -530,6 +532,92 @@ export async function prepareTargetSession(target: Queryable): Promise<void> {
     throw new Error("target session could not disable triggers");
 }
 
+/**
+ * The only user triggers allowed to fire while the T0 copy set lands with
+ * triggers on. Each is a guard that raises or passes and writes nothing,
+ * pinned to its table and function. A new trigger on a copy-set table is
+ * refused until it is reviewed and added here. Each guard is also required:
+ * a listed table whose guard is missing or disabled (drift) is refused, since
+ * rows would otherwise land without the protection the guard exists for.
+ */
+export const GUARD_TRIGGERS: ReadonlyArray<{ table: string; trigger: string; fn: string }> = [
+  // 0038/0044: raises upload_cleanup_not_ready until the cleanup rollout is ready.
+  { table: "delivery_origins", trigger: "guard_delivery_origin_cleanup", fn: "sessions.guard_delivery_cleanup" },
+];
+
+/**
+ * The mirror's target session, without `session_replication_role`: the
+ * Supabase admin may not set it. Rows land through the live triggers, so this
+ * is safe only for tables whose enabled user triggers are all guards in
+ * GUARD_TRIGGERS and that take part in no foreign key (a cascade or an
+ * ordering failure would not happen under `replica`). Never disables a
+ * trigger. Fails closed on anything else, before a row is written.
+ */
+export async function prepareGuardedTargetSession(
+  target: Queryable,
+  tables: string[],
+): Promise<void> {
+  const { rows: role } = await target.query<{ session_replication_role: string }>(
+    "SHOW session_replication_role",
+  );
+  if (role[0]?.session_replication_role !== "origin")
+    throw new Error("guarded copy needs session_replication_role = origin");
+  const { rows: triggers } = await target.query<{ table: string; trigger: string; fn: string }>(
+    `SELECT c.relname AS table, t.tgname AS trigger, pn.nspname || '.' || p.proname AS fn
+       FROM pg_trigger t
+       JOIN pg_class c ON c.oid = t.tgrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_proc p ON p.oid = t.tgfoid
+       JOIN pg_namespace pn ON pn.oid = p.pronamespace
+      WHERE n.nspname = $1 AND c.relname = ANY($2::text[])
+        AND NOT t.tgisinternal AND t.tgenabled IN ('O', 'A')
+      ORDER BY 1, 2`,
+    [SCHEMA, tables],
+  );
+  const unsafe = triggers.filter(
+    (row) =>
+      !GUARD_TRIGGERS.some(
+        (guard) => guard.table === row.table && guard.trigger === row.trigger && guard.fn === row.fn,
+      ),
+  );
+  if (unsafe.length > 0)
+    throw new Error(
+      `guarded copy refuses triggers that are not reviewed guards: ${unsafe.map((row) => `${row.table}.${row.trigger}`).join(", ")}`,
+    );
+  const { rows: keys } = await target.query<{ table: string }>(
+    `SELECT DISTINCT c.relname AS table
+       FROM pg_constraint k
+       JOIN pg_class c ON c.oid IN (k.conrelid, k.confrelid)
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE k.contype = 'f' AND n.nspname = $1 AND c.relname = ANY($2::text[])
+      ORDER BY 1`,
+    [SCHEMA, tables],
+  );
+  if (keys.length > 0)
+    throw new Error(
+      `guarded copy refuses tables in a foreign key: ${keys.map((row) => row.table).join(", ")}`,
+    );
+  const missing = GUARD_TRIGGERS.filter(
+    (guard) =>
+      tables.includes(guard.table) &&
+      !triggers.some(
+        (row) => row.table === guard.table && row.trigger === guard.trigger && row.fn === guard.fn,
+      ),
+  );
+  if (missing.length > 0)
+    throw new Error(
+      `guarded copy needs these guards enabled: ${missing.map((guard) => `${guard.table}.${guard.trigger}`).join(", ")}`,
+    );
+  // Required unconditionally for delivery_origins, not only when the guard was found.
+  if (tables.includes("delivery_origins")) {
+    const { rows: ready } = await target.query<{ ready: boolean }>(
+      "SELECT sessions.upload_cleanup_ready() AS ready",
+    );
+    if (ready[0]?.ready !== true)
+      throw new Error("guarded copy needs the upload cleanup rollout ready on the target");
+  }
+}
+
 interface Checkpoint {
   version: 2;
   mode: CopyMode;
@@ -612,9 +700,12 @@ export async function main() {
     await Promise.all([source.connect(), target.connect()]);
     // The source is only ever read.
     await source.query("SET default_transaction_read_only = on");
-    // Dry runs and checks only read; executed copies land with triggers off.
+    // Dry runs and checks only read. The mirror (T0 copy set) lands through
+    // reviewed guard triggers only, and a dry run checks them too; the backfill
+    // lands with triggers off.
     if (dryRun) await target.query("SET default_transaction_read_only = on");
-    else await prepareTargetSession(target);
+    if (mode === "mirror") await prepareGuardedTargetSession(target, tables);
+    else if (!dryRun) await prepareTargetSession(target);
     const fence = mode === "backfill" || mode === "check" ? await loadFence(source) : undefined;
     const results: TableResult[] = [];
     for (const table of tables) {

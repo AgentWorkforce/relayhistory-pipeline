@@ -157,7 +157,7 @@ async function ingest(extra: Record<string, string> = {}) {
 }
 
 /** The planned upload: its chunk entry (as the server seals it), manifest and signed identity. */
-async function planned(LOCATION: SessionLocation = DEFAULT_LOCATION) {
+async function planned(LOCATION: SessionLocation = DEFAULT_LOCATION, owner = `migration:${GRANT}`) {
   const scratch = await mkdtemp(join(tmpdir(), "96bulls-plan-"));
   try {
     const sealed = await sealRawChunk(createFsStore({ root: scratch }), {
@@ -166,12 +166,13 @@ async function planned(LOCATION: SessionLocation = DEFAULT_LOCATION) {
     const manifest = {
       schema_v: 1, layout: "v1", trace_id: TRACE, revision: 1, created_at: AT, updated_at: AT,
       session: { workspace_id: WORKSPACE, machine_id: LOCATION.machineId, harness: LOCATION.harness, session_id: LOCATION.sessionId, started_at: AT },
-      writer: { delivery_instance_id: LOCATION.machineId, plugin_version: "test" },
+      // A cold export is owned by its migration grant (#42's owner fence); a live session by its machine.
+      writer: { delivery_instance_id: owner, plugin_version: "test" },
       raw: {
-        owner: LOCATION.machineId, state: "closed", updated_at: AT, format: "jsonl", compression: "zstd", chunk_count: 1,
+        owner, state: "closed", updated_at: AT, format: "jsonl", compression: "zstd", chunk_count: 1,
         raw_bytes: sealed.entry.bytes, stored_bytes: sealed.entry.stored_bytes,
         content_sha256: await computeContentSha256([sealed.entry]), epoch: 0,
-        epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: 0, opened_by: LOCATION.machineId }],
+        epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: 0, opened_by: owner }],
         next_offset: sealed.entry.bytes, chunks: [sealed.entry], scrub: sealed.scrub,
       },
       // The export's source fields, as the courier writes them; the ingest
@@ -322,7 +323,7 @@ describe("buildIngestApp auth (production composition)", () => {
     expect(migratedKey).toBe(`${upload.key}@${upload.entry_sha256}`);
     // Live upload of another session (origin-bound courier assertion).
     const liveLocation = { ...LOCATION, sessionId: "session-live" };
-    const live = await planned(liveLocation);
+    const live = await planned(liveLocation, liveLocation.machineId);
     const liveManifest = { ...live.manifest, extensions: undefined };
     expect((await i.chunk(liveToken(), liveLocation)).status).toBe(201);
     const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(), {
