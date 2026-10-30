@@ -30,8 +30,10 @@ which copied Neon's `sessions` schema, content included, into Supabase Postgres.
     Deleting that key crypto-shreds the workspace's objects.
   - The Supabase search projection has row-level security and disk
     encryption.
-  - Embeddings are backfilled from S3 after the raw content is in place, not
-    at ingest.
+  - No embeddings in V1, and no pgvector in Supabase. ClickHouse or
+    ObsessionDB native text, token and n-gram search owns transcripts. If a
+    semantic or hybrid layer is adopted later, its embeddings live with that
+    search projection, built from S3, not duplicated into Supabase.
 - **Sequencing is switch-first (Khaliq, 2026-10-30, superseding S3-first).**
   New writes move to the pipeline at T0. History is exported to S3 afterwards,
   and until a session is exported the Worker reads it from Neon, read-only.

@@ -23,6 +23,11 @@ export const RELAYCAST_PUBLISHED_CHART = {
   packageDigest: "cdfc41cb6202fd81beb17cb57d5fbbdecaf27fa427f51faa07c5ec0fc116744f",
 } as const;
 
+export const GCP_REDIS_CLIENT = {
+  authEnabled: "false",
+  transitEncryption: "SERVER_AUTHENTICATION",
+} as const;
+
 /**
  * Shape the installed Alchemy provider can actually post.
  * Autopilot create omits node pools, so a node service account would not be
@@ -163,8 +168,14 @@ export interface GcpInputs {
     chartVersion: string;
     tenantOrgId: string;
     existingSecretName: string;
+    /** Pre-created dockerconfigjson Secret for the private published image. */
+    imagePullSecretName: string;
+    /** Digest of the services image built from the reviewed runtime commit. */
+    imageDigest: string;
     /** Public HTTPS or the in-cluster RelayAuth service. Alleyoop refuses to render without it. */
     relayauthJwksUrl: string;
+    /** Exact token issuer: public HTTPS or the in-cluster RelayAuth service origin. */
+    relayauthIssuer: string;
   };
 }
 
@@ -328,7 +339,13 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(inputs.bulls96.tenantOrgId))
       throw new Error("96bulls: bulls96.tenantOrgId must be an org id, never a URL or credential");
     requireSecretName("bulls96.existingSecretName", inputs.bulls96.existingSecretName);
+    requireSecretName("bulls96.imagePullSecretName", inputs.bulls96.imagePullSecretName);
+    if (!/^sha256:[a-f0-9]{64}$/.test(inputs.bulls96.imageDigest))
+      throw new Error("96bulls: bulls96.imageDigest must be an immutable sha256 digest");
     requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", inputs.bulls96.relayauthJwksUrl);
+    requireRelayauthIssuer("bulls96.relayauthIssuer", inputs.bulls96.relayauthIssuer);
+    if (inputs.relayauth?.baseUrl && inputs.bulls96.relayauthIssuer !== inputs.relayauth.baseUrl)
+      throw new Error("96bulls: bulls96.relayauthIssuer must match relayauth.baseUrl for the in-stage RelayAuth release");
   }
 }
 
@@ -339,10 +356,6 @@ export function assertGcpRuntimeDeployable(inputs: GcpInputs): void {
     (!inputs.managedDataPlane.provision || inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
   )
     throw new Error("96bulls: GCP runtime wiring requires the acknowledged managed data plane. Nothing was created.");
-  if (inputs.bulls96?.enabled)
-    throw new Error(
-      "96bulls: GCP 96Bulls wiring is held until the external Redis TLS CA/client round-trip contract is proven. Nothing was created.",
-    );
 }
 
 export function assertGcpSqlPostConfirmation(
@@ -418,10 +431,14 @@ export interface Bulls96ReleaseOutputs {
   cloudSqlConnectionName: unknown;
   redisHost: unknown;
   redisPort: unknown;
+  /** Public Memorystore service-CA bundle, never a private key or AUTH value. */
+  redisCaPem: unknown;
   pubsubTopic: unknown;
   pubsubSubscription: unknown;
   workloadIdentityEmail: string;
 }
+
+const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 
 function requireRelayauthJwksUrl(label: string, value: string): void {
   let jwks: URL;
@@ -447,18 +464,123 @@ function requireRelayauthJwksUrl(label: string, value: string): void {
     throw new Error(`96bulls: ${label} must be public HTTPS or the in-cluster RelayAuth service`);
 }
 
-/**
- * Fail closed until the application consumes Memorystore's CA and a real
- * TLS round-trip has passed. Static SERVER_AUTHENTICATION environment values
- * are not evidence that the Redis client negotiated TLS.
- */
+function requireRelayauthIssuer(label: string, value: string): void {
+  let issuer: URL;
+  try {
+    issuer = new URL(value);
+  } catch {
+    throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`);
+  }
+  const hostname = issuer.hostname.replace(/\.$/, "").toLowerCase();
+  const inCluster =
+    issuer.protocol === "http:" &&
+    /^relayauth\.[a-z0-9-]+\.svc(?:\.cluster\.local)?$/.test(hostname);
+  const publicHttps =
+    issuer.protocol === "https:" &&
+    hostname.includes(".") &&
+    hostname !== "localhost" &&
+    !hostname.endsWith(".localhost") &&
+    !hostname.endsWith(".local") &&
+    isIP(hostname) === 0;
+  if (
+    issuer.username ||
+    issuer.password ||
+    (!inCluster && !publicHttps) ||
+    issuer.pathname !== "/" ||
+    issuer.search ||
+    issuer.hash
+  ) throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`);
+}
+
+function plainSetting(label: string, value: unknown): void {
+  if (typeof value !== "string") return;
+  if (value.includes("://") || value.includes("@") || value.includes("BEGIN "))
+    throw new Error(`96bulls: ${label} must not carry a URL, credential, or key. Nothing was created.`);
+}
+
+function publicCaBundle(value: unknown): void {
+  if (typeof value !== "string") return;
+  if (
+    value.length > 131_072 ||
+    value.includes("PRIVATE KEY") ||
+    !value.includes("-----BEGIN CERTIFICATE-----") ||
+    !value.includes("-----END CERTIFICATE-----")
+  ) throw new Error("96bulls: Redis service CA bundle is malformed. Nothing was created.");
+}
+
+/** Published chart values backed by pod identity, an external Secret, and a live Redis TLS readiness probe. */
 export function bulls96ReleaseValues(
-  _i: NonNullable<GcpInputs["bulls96"]>,
-  _managed: Bulls96ReleaseOutputs,
-): never {
-  throw new Error(
-    "96bulls: GCP 96Bulls wiring is held until the external Redis TLS CA/client round-trip contract is proven. Nothing was created.",
-  );
+  i: NonNullable<GcpInputs["bulls96"]>,
+  managed: Bulls96ReleaseOutputs,
+): Record<string, unknown> {
+  if (!GSA_EMAIL.test(managed.workloadIdentityEmail))
+    throw new Error("96bulls: workload identity email is not a service-account email. Nothing was created.");
+  for (const [label, value] of [
+    ["bucket", managed.bucket],
+    ["region", managed.region],
+    ["cloudSqlConnectionName", managed.cloudSqlConnectionName],
+    ["redisHost", managed.redisHost],
+    ["pubsubTopic", managed.pubsubTopic],
+    ["pubsubSubscription", managed.pubsubSubscription],
+  ] as const) plainSetting(label, value);
+  publicCaBundle(managed.redisCaPem);
+  if (typeof managed.redisPort === "string" && !/^[0-9]+$/.test(managed.redisPort))
+    throw new Error("96bulls: redis port must be numeric. Nothing was created.");
+  const redisPort = typeof managed.redisPort === "number" ? String(managed.redisPort) : managed.redisPort;
+  requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", i.relayauthJwksUrl);
+  requireRelayauthIssuer("bulls96.relayauthIssuer", i.relayauthIssuer);
+  const identity = { "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail };
+  const dataEnv = () => [
+    { name: "LOCKER_PROVIDER", value: "gcs" },
+    { name: "PIPELINE_RAW_PROVIDER", value: "gcs" },
+    { name: "PIPELINE_RAW_S3_BUCKET", value: managed.bucket },
+    { name: "CLOUD_SQL_CONNECTION_NAME", value: managed.cloudSqlConnectionName },
+    { name: "REDIS_HOST", value: managed.redisHost },
+    { name: "REDIS_PORT", value: redisPort },
+    { name: "REDIS_AUTH_ENABLED", value: GCP_REDIS_CLIENT.authEnabled },
+    { name: "REDIS_TRANSIT_ENCRYPTION", value: GCP_REDIS_CLIENT.transitEncryption },
+    { name: "REDIS_TLS_CA_PEM", value: managed.redisCaPem },
+    { name: "PUBSUB_TOPIC", value: managed.pubsubTopic },
+    { name: "PUBSUB_SUBSCRIPTION", value: managed.pubsubSubscription },
+    { name: "WORKER_DATA_PATH_PROBE", value: "1" },
+  ];
+  const locker = () => ({
+    endpoint: "",
+    bucket: managed.bucket,
+    region: managed.region,
+    credentials: { mode: "podIdentity" as const },
+  });
+  const hoopdb = () => ({ existingSecret: i.existingSecretName, key: "HOOPDB_URL" });
+  const imagePullSecrets = [{ name: i.imagePullSecretName }];
+  return {
+    global: { tenant: { orgId: i.tenantOrgId } },
+    worker: {
+      existingSecret: i.existingSecretName,
+      imagePullSecrets,
+      image: { digest: i.imageDigest },
+      hoopdb: hoopdb(),
+      locker: locker(),
+      lockerInit: { enabled: false },
+      migrations: { supabaseShim: true },
+      summaryEncryption: { existingSecret: i.existingSecretName, key: "SUMMARY_MASTER_KEYS" },
+      serviceAccount: { annotations: { ...identity } },
+      tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
+      extraEnv: dataEnv(),
+    },
+    alleyoop: {
+      existingSecret: i.existingSecretName,
+      imagePullSecrets,
+      image: { digest: i.imageDigest },
+      hoopdb: hoopdb(),
+      locker: locker(),
+      auth: { jwksUrl: i.relayauthJwksUrl, issuer: i.relayauthIssuer },
+      serviceAccount: { annotations: { ...identity } },
+      tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
+      extraEnv: dataEnv(),
+    },
+    hoopdb: { enabled: false },
+    locker: { enabled: false },
+  };
 }
 
 export function relayflowsChartValues(i: RelayflowsChartInputs, defaultStorageClass = "standard-rwo") {

@@ -3,8 +3,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import * as Effect from "effect/Effect";
 import {
+  GCP_APPLY_LEASE_MS,
+  GCP_APPLY_MIN_REMAINING_SECONDS,
   applyNonceDigest,
+  assertGcpApplyLeaseActive,
+  boundGcpApplyLease,
   consumeGcpApplyNonce,
   consumeGcpApplyNonceGlobally,
   gcpApplyAudience,
@@ -38,7 +43,7 @@ function token(patch: Record<string, unknown> = {}) {
       email: executor.identity,
       email_verified: true,
       iat: nowSeconds - 10,
-      exp: nowSeconds + 300,
+      exp: nowSeconds + 3600,
       ...patch,
     }),
   ).toString("base64url");
@@ -81,7 +86,26 @@ describe("GCP apply authorization", () => {
       executor: executor.name,
       executorIdentity: executor.identity,
       nonceDigest: applyNonceDigest(value),
+      leaseExpiresAt: nowSeconds + GCP_APPLY_LEASE_MS / 1000,
     });
+  });
+
+  test("requires enough signed lifetime for the entire bounded mutation lease", async () => {
+    await expect(
+      verifyGcpApplyNonce(
+        token({ exp: nowSeconds + GCP_APPLY_MIN_REMAINING_SECONDS - 1 }),
+        expected,
+        fetchKeys,
+        nowMs,
+      ),
+    ).rejects.toThrow(/expired or outside/);
+
+    const proof = await verifyGcpApplyNonce(token(), expected, fetchKeys, nowMs);
+    expect(() => assertGcpApplyLeaseActive(proof, proof.leaseExpiresAt * 1000 - 1)).not.toThrow();
+    expect(() => assertGcpApplyLeaseActive(proof, proof.leaseExpiresAt * 1000)).toThrow(/mutation lease expired/);
+
+    await expect(Effect.runPromise(boundGcpApplyLease(Effect.never, 1))).rejects.toThrow();
+    expect(() => boundGcpApplyLease(Effect.void, GCP_APPLY_LEASE_MS + 1)).toThrow(/duration is invalid/);
   });
 
   test("rejects replay scope, identity, signature, and expiry mismatches", async () => {

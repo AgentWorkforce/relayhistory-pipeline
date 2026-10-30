@@ -16,9 +16,9 @@ The filters come from `relay-desktop`
 
 | Desktop filter or sort | Server? | Column | Index |
 | --- | --- | --- | --- |
-| `agent:` / `@name` (exact, prefix, contains) | yes | `session_directory.agent_name` (#38) | btree on (org, workspace, lower(agent_name) text_pattern_ops, recency) for exact and prefix; trigram for contains |
+| `agent:` / `@name` (exact, prefix, contains) | yes | `session_directory.agent_name` (#38) | #38: `session_directory_agent_recent_idx` (normalized `text_pattern_ops` plus activity cursor) for exact and prefixes of 3+ chars; contains through `session_directory_metadata_trgm_idx` over a bounded `search_text` |
 | `title:` (contains) and sort "session" | yes | `session_index.title` | trigram GIN on `lower(title)` per org; recency keyset for the sort |
-| short summary (free-text search) | yes | `short_summary` (new, at most 1,000 chars, scrubbed) | trigram GIN, plus Postgres FTS (`tsvector`) as the V1 full-text stopgap |
+| short summary (free-text search) | yes | `short_summary` on `session_directory`: **approved by Khaliq on 2026-10-30, pending the coordinator's record** (at most about 1,000 chars, scrubbed); built by the G6 owner (sp-w6-supabase-schema) | trigram GIN and Postgres FTS, each behind a query-plan test, not claimed until that test exists |
 | `project:` (contains; exact id) and sort | yes | `project_id` (exact), `project_name` (new) | `si_project` (exact, exists); trigram on `lower(project_name)` |
 | `harness:` / `source:` (exact) and sort | yes | `harness` | `si_harness` (exists) |
 | session state (`active`, `done`, `abandoned`) and sort "status" | yes | `state` (Referee) | `si_state` (exists, for not-done); add a done-inclusive keyset if done must be listed by state |
@@ -38,7 +38,8 @@ The filters come from `relay-desktop`
   query is workspace-scoped), and RLS applies to every column above. Desktop
   and Cloud never query across orgs.
 - **Short summaries:** produced by Bob Costas from the S3 content, scrubbed,
-  and length-capped. Embeddings are backfilled later from S3, not at ingest.
+  and length-capped. No embeddings or pgvector in Supabase in V1;
+  transcript search is ClickHouse/ObsessionDB's (V2).
 - **Erasure:** row deletion removes a workspace's projection rows (tombstone
   driven); backups and PITR age out on Supabase retention. Key-deletion
   shredding covers only S3 (see 0002; decision deferred to
