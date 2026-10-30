@@ -28,6 +28,7 @@ import type { StageMessage } from "./dlq.js";
 import { PipelineError } from "./errors.js";
 import {
   ObjectStoreError,
+  createGcsStore,
   createS3Store,
   objectKey,
   parseManifest,
@@ -225,6 +226,116 @@ export interface RawStore {
   bucket: string;
 }
 
+const DEFAULT_GCS_TOKEN_URI =
+  "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token";
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const TRUSTED_GCS_TOKEN_HOSTS = new Set(["169.254.169.254", ...LOOPBACK_HOSTS]);
+
+function trustedGcsTokenUri(uri: string): boolean {
+  try {
+    const url = new URL(uri);
+    return url.protocol === "http:" && !url.username && !url.password && TRUSTED_GCS_TOKEN_HOSTS.has(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function trustedGcsEndpoint(uri: string): boolean {
+  try {
+    const url = new URL(uri);
+    if (url.username || url.password || url.search || url.hash) return false;
+    if (LOOPBACK_HOSTS.has(url.hostname))
+      return url.protocol === "http:" || url.protocol === "https:";
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "storage.googleapis.com" &&
+      !url.port &&
+      (url.pathname === "" || url.pathname === "/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function gcsApiHost(endpoint: string | undefined): boolean {
+  if (!endpoint) return false;
+  try {
+    const host = new URL(endpoint).hostname.toLowerCase();
+    return host === "storage.googleapis.com" || host.endsWith(".storage.googleapis.com") || host === "storage.google.com";
+  } catch {
+    return false;
+  }
+}
+
+async function gcsMetadataToken(uri: string, fetcher: typeof fetch) {
+  const res = await fetcher(uri, { headers: { "Metadata-Flavor": "Google" } });
+  if (!res.ok) throw new Error(`pipeline: GKE metadata token http ${res.status}`);
+  let body: { access_token?: unknown; expires_in?: unknown };
+  try {
+    body = (await res.json()) as { access_token?: unknown; expires_in?: unknown };
+  } catch {
+    throw new Error("pipeline: GKE metadata server returned no access_token");
+  }
+  if (typeof body.access_token !== "string" || !body.access_token)
+    throw new Error("pipeline: GKE metadata server returned no access_token");
+  const expiresAt = typeof body.expires_in === "number" ? new Date(Date.now() + body.expires_in * 1000) : undefined;
+  return { accessToken: body.access_token, ...(expiresAt ? { expiresAt } : {}) };
+}
+
+function gcsRawStoreFromEnv(
+  env: Pick<
+    Bindings,
+    | "PIPELINE_RAW_S3_BUCKET"
+    | "PIPELINE_RAW_S3_ENDPOINT"
+    | "PIPELINE_RAW_S3_ACCESS_KEY_ID"
+    | "PIPELINE_RAW_S3_SECRET_ACCESS_KEY"
+    | "PIPELINE_RAW_S3_SSE"
+    | "PIPELINE_RAW_GCS_TOKEN_URI"
+  >,
+  fetcher?: typeof fetch,
+): RawStore | undefined {
+  const bucket = env.PIPELINE_RAW_S3_BUCKET?.trim();
+  if (!bucket) {
+    adapterLog("raw store misconfigured", { setting: "PIPELINE_RAW_S3_BUCKET", expected: "bucket name" });
+    return undefined;
+  }
+  if (env.PIPELINE_RAW_S3_ACCESS_KEY_ID || env.PIPELINE_RAW_S3_SECRET_ACCESS_KEY) {
+    adapterLog("raw store misconfigured", { setting: "PIPELINE_RAW_PROVIDER", expected: "gcs without HMAC keys" });
+    return undefined;
+  }
+  if (env.PIPELINE_RAW_S3_SSE) {
+    adapterLog("raw store misconfigured", { setting: "PIPELINE_RAW_S3_SSE", expected: "unset for gcs" });
+    return undefined;
+  }
+  const tokenUri = env.PIPELINE_RAW_GCS_TOKEN_URI?.trim() || DEFAULT_GCS_TOKEN_URI;
+  if (!trustedGcsTokenUri(tokenUri)) {
+    adapterLog("raw store misconfigured", { setting: "PIPELINE_RAW_GCS_TOKEN_URI", expected: "metadata server or loopback" });
+    return undefined;
+  }
+  let baseUrl: string | undefined;
+  if (env.PIPELINE_RAW_S3_ENDPOINT) {
+    if (!trustedGcsEndpoint(env.PIPELINE_RAW_S3_ENDPOINT)) {
+      adapterLog("raw store misconfigured", {
+        setting: "PIPELINE_RAW_S3_ENDPOINT",
+        expected: "official GCS HTTPS API or loopback emulator",
+      });
+      return undefined;
+    }
+    baseUrl = env.PIPELINE_RAW_S3_ENDPOINT;
+  }
+  const fetchImpl = fetcher ?? fetch;
+  return {
+    provider: "gcs",
+    bucket,
+    store: createGcsStore({
+      bucket,
+      ...(baseUrl ? { baseUrl } : {}),
+      token: () => gcsMetadataToken(tokenUri, fetchImpl),
+      ...(fetcher ? { fetch: fetcher } : {}),
+    }),
+  };
+}
+
 export function rawStoreFromEnv(
   env: Pick<
     Bindings,
@@ -235,15 +346,32 @@ export function rawStoreFromEnv(
     | "PIPELINE_RAW_S3_SECRET_ACCESS_KEY"
     | "PIPELINE_RAW_S3_SSE"
     | "PIPELINE_RAW_PROVIDER"
+    | "PIPELINE_RAW_GCS_TOKEN_URI"
   >,
   fetcher?: typeof fetch,
 ): RawStore | undefined {
+  const requested = env.PIPELINE_RAW_PROVIDER?.trim() || undefined;
+  if (requested === "gcs") return gcsRawStoreFromEnv(env, fetcher);
   const bucket = env.PIPELINE_RAW_S3_BUCKET;
   const accessKeyId = env.PIPELINE_RAW_S3_ACCESS_KEY_ID;
   const secretAccessKey = env.PIPELINE_RAW_S3_SECRET_ACCESS_KEY;
   if (!bucket || !accessKeyId || !secretAccessKey) return undefined;
-  const provider: StorageProvider =
-    env.PIPELINE_RAW_PROVIDER === "r2" ? "r2" : "s3";
+  // Unset stays S3. gcs is handled above. Any other name must not be relabeled as S3.
+  if (requested && requested !== "s3" && requested !== "r2") {
+    adapterLog("raw store misconfigured", {
+      setting: "PIPELINE_RAW_PROVIDER",
+      expected: "s3 | r2 | gcs",
+    });
+    return undefined;
+  }
+  const provider: StorageProvider = requested === "r2" ? "r2" : "s3";
+  if (gcsApiHost(env.PIPELINE_RAW_S3_ENDPOINT)) {
+    adapterLog("raw store misconfigured", {
+      setting: "PIPELINE_RAW_S3_ENDPOINT",
+      expected: "s3 or r2 endpoint, not the GCS API",
+    });
+    return undefined;
+  }
   const setting = env.PIPELINE_RAW_S3_SSE;
   const sse =
     setting === "AES256" || setting === "aws:kms" ? setting : undefined;

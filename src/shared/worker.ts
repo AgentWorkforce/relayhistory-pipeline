@@ -17,6 +17,7 @@ import {
 import { openHoopDb, waitForHoopDb, waitForSchema, type HoopDb } from "./db.ts";
 import { ctxOf, enrichMessage } from "./enrich.ts";
 import { vendorBindings, integer } from "./env.ts";
+import { dataPathVerdict, workloadReady } from "./data-path.ts";
 import { errorFields, log } from "./log.ts";
 import { initTelemetry, shutdownTelemetry, withSpan } from "./telemetry.ts";
 import { createServer } from "node:http";
@@ -77,6 +78,9 @@ export function traced(stage: QueuedStage, handler: StageHandler): StageHandler 
  *   GET /healthz  200 while the poll loop is ticking and HoopDb answered within
  *                 the last WORKER_UNHEALTHY_AFTER_FAILURES ticks; 503 otherwise.
  *   GET /readyz   200 once HoopDb answers and the schema ledger is complete.
+ *                 A GCS workload (LOCKER_PROVIDER=gcs or WORKER_DATA_PATH_PROBE=1)
+ *                 also requires the data-path settings and refuses HMAC keys.
+ *   GET /datapathz  the data-path verdict alone. Unarmed on the S3 default.
  * A rotated HoopDb password therefore turns the worker unhealthy and lets the
  * orchestrator restart it with the new secret, instead of "Running" forever.
  */
@@ -108,9 +112,15 @@ function serveHealth(health: WorkerHealth, port: number) {
   const maxTickAgeMs = integer("WORKER_MAX_TICK_AGE_MS", 120_000);
   const server = createServer((req, res) => {
     if (req.url === "/readyz") {
-      const ok = readyVerdict(health, { maxFailures });
-      res.writeHead(ok ? 200 : 503, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok }));
+      const verdict = workloadReady(readyVerdict(health, { maxFailures }), process.env);
+      res.writeHead(verdict.ok ? 200 : 503, { "content-type": "application/json" });
+      res.end(JSON.stringify(verdict));
+      return;
+    }
+    if (req.url === "/datapathz") {
+      const verdict = dataPathVerdict(process.env);
+      res.writeHead(verdict.ok ? 200 : 503, { "content-type": "application/json" });
+      res.end(JSON.stringify(verdict.ok ? { ok: true, armed: verdict.armed } : { ok: false, missing: verdict.missing }));
       return;
     }
     if (req.url === "/healthz") {

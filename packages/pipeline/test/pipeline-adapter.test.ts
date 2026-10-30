@@ -830,7 +830,78 @@ describe("raw store configuration", () => {
     )!;
     await raw.store.put(objectKey("a/b.json"), new Uint8Array([1]));
     expect(seen[0]!.get("x-amz-server-side-encryption")).toBe("AES256");
-    expect(rawStoreFromEnv(base)).toBeDefined();
+    expect(rawStoreFromEnv(base)?.provider).toBe("s3");
+    expect(rawStoreFromEnv({ ...base, PIPELINE_RAW_PROVIDER: "s3" })?.provider).toBe("s3");
+    expect(rawStoreFromEnv({ ...base, PIPELINE_RAW_PROVIDER: "r2" })?.provider).toBe("r2");
+  });
+
+  it("does not relabel a non-S3 provider as S3", () => {
+    const env = {
+      PIPELINE_RAW_S3_BUCKET: "b",
+      PIPELINE_RAW_S3_ACCESS_KEY_ID: "AKIA_BOUNDARY_KEY",
+      PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "SECRET_BOUNDARY_VALUE",
+      PIPELINE_RAW_PROVIDER: "gcs",
+    };
+    expect(rawStoreFromEnv(env)).toBeUndefined();
+    expect(rawStoreFromEnv({ ...env, PIPELINE_RAW_PROVIDER: "azure" })).toBeUndefined();
+    expect(logs.join("\n")).toContain("PIPELINE_RAW_PROVIDER");
+    expect(logs.join("\n")).toContain("gcs without HMAC keys");
+    expect(logs.join("\n")).toContain("s3 | r2 | gcs");
+    expect(logs.join("\n")).not.toContain("AKIA_BOUNDARY_KEY");
+    expect(logs.join("\n")).not.toContain("SECRET_BOUNDARY_VALUE");
+  });
+
+  it("does not point the S3 client at the GCS API", () => {
+    expect(
+      rawStoreFromEnv({
+        ...base,
+        PIPELINE_RAW_S3_ENDPOINT: "https://storage.googleapis.com",
+        PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "SUPER_HMAC_VALUE",
+      }),
+    ).toBeUndefined();
+    expect(logs.join("\n")).toContain("PIPELINE_RAW_S3_ENDPOINT");
+    expect(logs.join("\n")).not.toContain("SUPER_HMAC_VALUE");
+  });
+
+  it("selects a GCS store when no HMAC key is set", () => {
+    const raw = rawStoreFromEnv({
+      PIPELINE_RAW_S3_BUCKET: "proof-bucket",
+      PIPELINE_RAW_PROVIDER: "gcs",
+    });
+    expect(raw?.provider).toBe("gcs");
+    expect(raw?.bucket).toBe("proof-bucket");
+    expect(raw?.store.backend).toBe("gcs");
+    expect(
+      rawStoreFromEnv({
+        PIPELINE_RAW_S3_BUCKET: "proof-bucket",
+        PIPELINE_RAW_PROVIDER: "gcs",
+        PIPELINE_RAW_S3_ENDPOINT: "https://storage.googleapis.com",
+      })?.provider,
+    ).toBe("gcs");
+    expect(
+      rawStoreFromEnv({
+        PIPELINE_RAW_S3_BUCKET: "proof-bucket",
+        PIPELINE_RAW_PROVIDER: "gcs",
+        PIPELINE_RAW_S3_ENDPOINT: "http://127.0.0.1:4443/storage/v1",
+      })?.provider,
+    ).toBe("gcs");
+    expect(
+      rawStoreFromEnv({
+        PIPELINE_RAW_S3_BUCKET: "proof-bucket",
+        PIPELINE_RAW_PROVIDER: "gcs",
+        PIPELINE_RAW_S3_ENDPOINT: "https://attacker.example/storage/v1",
+      }),
+    ).toBeUndefined();
+    expect(
+      rawStoreFromEnv({
+        PIPELINE_RAW_S3_BUCKET: "proof-bucket",
+        PIPELINE_RAW_PROVIDER: "gcs",
+        PIPELINE_RAW_GCS_TOKEN_URI: "http://evil.example/token?secret=SUPERSECRET",
+      }),
+    ).toBeUndefined();
+    expect(logs.join("\n")).not.toContain("SUPERSECRET");
+    expect(logs.join("\n")).not.toContain("evil.example");
+    expect(logs.join("\n")).not.toContain("attacker.example");
   });
 });
 

@@ -1,15 +1,22 @@
 /**
- * The Locker (S3) client every service uses. Credentials:
+ * The Locker client every service uses.
+ *
+ * LOCKER_PROVIDER selects the adapter. Unset is S3:
  *   - static keys when LOCKER_ACCESS_KEY_ID/LOCKER_SECRET_ACCESS_KEY are set (local MinIO);
  *   - otherwise EKS Pod Identity: the agent injects AWS_CONTAINER_CREDENTIALS_FULL_URI and
  *     AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE; credentials are short-lived and refreshed
  *     before expiry by the S3 driver's cached provider. No key is stored anywhere.
- * LOCKER_ENDPOINT is optional: unset means AWS S3 in LOCKER_REGION.
+ * LOCKER_ENDPOINT is optional for S3: unset means AWS S3 in LOCKER_REGION.
+ *
+ * LOCKER_PROVIDER=gcs uses the GCS adapter and a GKE metadata-server token.
+ * HMAC keys are refused. Production AWS S3 does not set LOCKER_PROVIDER.
  */
 import { readFile } from "node:fs/promises";
-import { createS3Store, objectStoreManifestReader, type ManifestReader, type RawStore } from "./vendor.ts";
+import { createGcsStore, createS3Store, objectStoreManifestReader, type ManifestReader, type RawStore } from "./vendor.ts";
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
+import type { GcsToken } from "../../packages/object-store/src/gcs.ts";
 import { optional, required } from "./env.ts";
+import { assertLockerSelection, gcsTokenUri, lockerProvider, trustedGcsTokenUri } from "./locker-selection.ts";
 
 export type CredentialSource = "static" | "pod-identity";
 
@@ -75,22 +82,60 @@ export function lockerCredentials(env: NodeJS.ProcessEnv = process.env): AwsCred
     : () => podIdentityCredentials(env);
 }
 
+interface GcsMetadataToken {
+  access_token?: string;
+  expires_in?: number;
+}
+
+/** GKE Workload Identity token. The access token is not logged. */
+export async function gcsMetadataToken(env: NodeJS.ProcessEnv = process.env, fetcher: typeof fetch = fetch): Promise<GcsToken> {
+  const uri = gcsTokenUri(env);
+  if (!trustedGcsTokenUri(uri)) {
+    throw new Error("96bulls: LOCKER_GCS_TOKEN_URI is not the GKE metadata server or loopback");
+  }
+  const res = await fetcher(uri, { headers: { "Metadata-Flavor": "Google" } });
+  if (!res.ok) throw Object.assign(new Error(`96bulls: GKE metadata token: http ${res.status}`), { code: "credentials_unavailable", retryable: true });
+  const body = (await res.json()) as GcsMetadataToken;
+  if (!body.access_token) throw new Error("96bulls: GKE metadata server returned no access_token");
+  const expiresAt = typeof body.expires_in === "number" ? new Date(Date.now() + body.expires_in * 1000) : undefined;
+  return { accessToken: body.access_token, ...(expiresAt ? { expiresAt } : {}) };
+}
+
+/** Build the store described by env. Does not cache and does not read process.env unless env is omitted. */
+export function buildLockerStore(env: NodeJS.ProcessEnv = process.env): RawStore {
+  assertLockerSelection(env);
+  const provider = lockerProvider(env);
+  const bucket = env.LOCKER_BUCKET;
+  if (!bucket) throw new Error("96bulls: missing required env LOCKER_BUCKET");
+  if (provider === "gcs") {
+    return {
+      provider: "gcs",
+      bucket,
+      store: createGcsStore({
+        bucket,
+        ...(env.LOCKER_ENDPOINT ? { baseUrl: env.LOCKER_ENDPOINT } : {}),
+        token: () => gcsMetadataToken(env),
+      }),
+    };
+  }
+  return {
+    provider: "s3",
+    bucket,
+    store: createS3Store({
+      bucket,
+      region: env.LOCKER_REGION || "us-east-1",
+      ...(env.LOCKER_ENDPOINT ? { endpoint: env.LOCKER_ENDPOINT } : {}),
+      credentials: lockerCredentials(env),
+    }),
+  };
+}
+
 let cached: RawStore | undefined;
 
 /** The one Locker store for this process. */
 export function lockerStore(): RawStore {
   if (cached) return cached;
-  const s = lockerSettings();
-  cached = {
-    provider: "s3",
-    bucket: s.bucket,
-    store: createS3Store({
-      bucket: s.bucket,
-      region: s.region,
-      ...(s.endpoint ? { endpoint: s.endpoint } : {}),
-      credentials: lockerCredentials(),
-    }),
-  };
+  cached = buildLockerStore();
   return cached;
 }
 

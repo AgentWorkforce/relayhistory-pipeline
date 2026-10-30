@@ -9,6 +9,7 @@
         "@alchemy.run/aws": "2.0.0-beta.84",
         "@alchemy.run/cloudflare": "2.0.0-beta.84",
         "@alchemy.run/docker": "2.0.0-beta.84",
+        "@alchemy.run/gcp": "2.0.0-beta.84",
         "@alchemy.run/kubernetes": "2.0.0-beta.84",
         "@effect/platform-bun": "4.0.7",
         "@effect/platform-node": "4.0.7",
@@ -72,9 +73,13 @@
 
     "@alchemy.run/docker": ["@alchemy.run/docker@2.0.0-beta.84", "", { "dependencies": { "rolldown": "1.2.13" }, "peerDependencies": { "@effect/platform-bun": "^4.0.5", "alchemy": "2.0.0-beta.84", "effect": "^4.0.5" }, "optionalPeers": ["@effect/platform-bun"] }, "sha512-VaUNlldyPcCrrGDCfFUJD+pvNt3Rpbly+0lzZ4S8AfkpxMD4rZy7GdXcfPzeA26tcDzfsDVax7BGlArzupEc0g=="],
 
+    "@alchemy.run/gcp": ["@alchemy.run/gcp@2.0.0-beta.84", "", { "dependencies": { "@alchemy.run/docker": "2.0.0-beta.84", "@alchemy.run/kubernetes": "2.0.0-beta.84", "@alchemy.run/redis": "2.0.0-beta.84", "@distilled.cloud/core": "1.0.0-rc.17", "@distilled.cloud/gcp": "1.0.0-rc.17", "rolldown": "1.2.13" }, "peerDependencies": { "@effect/platform-bun": "^4.0.5", "@effect/platform-node": "^4.0.5", "alchemy": "2.0.0-beta.84", "effect": "^4.0.5" }, "optionalPeers": ["@effect/platform-bun", "@effect/platform-node"] }, "sha512-oTifY+lY7AnRmrJxc/m4aLxey2zgTcG7ccJAakaN5MA7Lj9lctNFuvQG8gJDEYNEiDXQI5nZp2X/+kOmtd5beA=="],
+
     "@alchemy.run/kubernetes": ["@alchemy.run/kubernetes@2.0.0-beta.84", "", { "dependencies": { "@alchemy.run/docker": "2.0.0-beta.84", "yaml": "^2.9.1" }, "peerDependencies": { "@effect/platform-bun": "^4.0.5", "alchemy": "2.0.0-beta.84", "effect": "^4.0.5" }, "optionalPeers": ["@effect/platform-bun"] }, "sha512-yVDuCrHXq4gH5r7y+e5RyDp1YMQbT9KSRvc7uYGYxh9b5EyEzhbKN/Tpvqldi/tfKSU43yuZu44ErCk48kor3g=="],
 
     "@alchemy.run/node-utils": ["@alchemy.run/node-utils@2.0.0-beta.84", "", { "dependencies": { "chokidar": "^5.0.0", "rolldown": "1.2.13" } }, "sha512-UdvCtwEeLmRNN89gVjkMIQTqzkE+xPQb26dPsQM6JzDdHUyqaTyg64U4RmfUjUul0sWQbbVIeAO475GQYbGELw=="],
+
+    "@alchemy.run/redis": ["@alchemy.run/redis@2.0.0-beta.84", "", { "peerDependencies": { "alchemy": "2.0.0-beta.84", "effect": "^4.0.5" } }, "sha512-8UsBke5PAnCkr9RioSJicudJlNgkkWlWETgIDcT1CtreY42Wsa5wmd6KU8H2c6prRsH0/bSk6z3RZLEjmi1jDQ=="],
 
     "@alchemy.run/sigil": ["@alchemy.run/sigil@0.1.0-alpha.1", "", { "peerDependencies": { "@types/react": ">=19.2.0", "react-devtools-core": ">=6.1.2" }, "optionalPeers": ["@types/react", "react-devtools-core"] }, "sha512-RtHELG2w+GluVewRsuKm66idtPzC+4STptMr/61X1Vy5uBkDzcCzjzV8G6jUa4iBv6Il0hHV7UL6wvv//9nD/Q=="],
 
@@ -103,6 +108,8 @@
     "@distilled.cloud/cloudflare": ["@distilled.cloud/cloudflare@1.0.0-rc.17", "", { "dependencies": { "@distilled.cloud/core": "1.0.0-rc.17" }, "peerDependencies": { "effect": "^4.0.5" } }, "sha512-xT7EFAAUUd9AZetUjXsiwMkpGatdxGNuMZrhuX5cG4MicmJizn9gn5xdqNsojkj4qzv08qIVL9j1XGV20IoYuA=="],
 
     "@distilled.cloud/core": ["@distilled.cloud/core@1.0.0-rc.17", "", { "peerDependencies": { "effect": "^4.0.5" } }, "sha512-BHcVEtqIbyyqU3S3o8DjUtqoAJ4FLnsb4BX3nTK2+mcDARS2Puc+Qak6sn+b+W5CRKOOWyrhltbc+kaYDUwxeQ=="],
+
+    "@distilled.cloud/gcp": ["@distilled.cloud/gcp@1.0.0-rc.17", "", { "dependencies": { "@distilled.cloud/core": "1.0.0-rc.17" }, "peerDependencies": { "effect": "^4.0.5" } }, "sha512-rDT4DXvblL+t2fnb6s34S8EMowIlTah+5qFiXtXHPQq0np4pquK4N2uPvqbIfzJ22ecmaeFjHNVgGuIKYVsQJw=="],
 
     "@distilled.cloud/iceberg": ["@distilled.cloud/iceberg@1.0.0-rc.17", "", { "dependencies": { "@distilled.cloud/core": "1.0.0-rc.17" }, "peerDependencies": { "effect": "^4.0.5" } }, "sha512-hO9Kqc91dq7SLBCagxlr2RDSTbp7/urqjfxNitSNaaOyKIsUr85llsADT/rS6H85ezOsGf2vSP5y1Qk0kQWLCg=="],
 
