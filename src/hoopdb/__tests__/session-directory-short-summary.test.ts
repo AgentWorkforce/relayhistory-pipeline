@@ -792,7 +792,6 @@ describe("short_summary end to end through the pipeline", () => {
     const failing = {
       write: async () => { throw new Error("directory unavailable"); },
       clear: async () => false,
-      hasSummary: async () => false,
     };
     // First run publishes the encrypted object and pointer, then fails on the directory.
     await expect(summaryShort(failing)).rejects.toThrow("directory unavailable");
@@ -813,6 +812,43 @@ describe("short_summary end to end through the pipeline", () => {
     expect(again?.short_summary).toBe(first?.short_summary);
     expect(again?.short_summary_generated_at).toEqual(first?.short_summary_generated_at);
     expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toHaveLength(1);
+  }, 60_000);
+
+  test("a retry replaces an older revision's summary left behind by a failed directory write", async () => {
+    const { db, index, pointer, ctx, summaryShort } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    const key = { orgId: "org-a", workspaceId: "ws-e2e", harness: "codex", sessionId: "s-e2e" };
+    // Revision N-1's summary is in the directory.
+    const older = new Date("2026-10-01T00:00:00Z");
+    await writeShortSummary(db, { ...key, summary: "Stale osprey notes from an older revision", source: "bob-costas/extractive/v0", generatedAt: older });
+    const a = claims("org-a", ["ws-e2e"]);
+    expect(await search(db, a, "ws-e2e", "osprey")).toHaveLength(1);
+
+    // Revision N's object and pointer are published, then the directory write fails.
+    const failing = { write: async () => { throw new Error("directory unavailable"); }, clear: async () => false };
+    await expect(summaryShort(failing)).rejects.toThrow("directory unavailable");
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("osprey");
+
+    // The retry finds the summary current but the row holds the old text: it republishes.
+    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    const fixed = await row(db, "s-e2e");
+    expect(String(fixed?.short_summary)).toContain("pelican ledger");
+    expect(String(fixed?.short_summary)).not.toContain("osprey");
+    expect(String(fixed?.short_summary)).not.toContain(FAKE_RELAY_TOKEN);
+    expect(String(fixed?.search_text)).not.toContain("osprey");
+    expect(fixed?.short_summary_source).toBe("bob-costas/extractive/v1");
+    expect(fixed?.short_summary_scrub_ruleset).toBe(SCRUB_RULESET);
+    expect(fixed?.short_summary_scrub_version).toBe(SCRUB_RULESET_VERSION);
+    expect((fixed?.short_summary_generated_at as Date).getTime()).toBeGreaterThan(older.getTime());
+    expect(await search(db, a, "ws-e2e", "osprey")).toEqual([]);
+    expect(await search(db, a, "ws-e2e", "pelican ledger")).toHaveLength(1);
+
+    // A further retry changes nothing.
+    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    const again = await row(db, "s-e2e");
+    expect(again?.short_summary).toBe(fixed?.short_summary);
+    expect(again?.short_summary_generated_at).toEqual(fixed?.short_summary_generated_at);
+    expect(again?.search_text).toBe(fixed?.search_text);
   }, 60_000);
 });
 
