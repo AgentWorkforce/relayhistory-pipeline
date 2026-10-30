@@ -67,10 +67,11 @@ INSERT INTO sessions.machines (org_id, workspace_id, machine_id, hostname, curso
 SELECT 'org-1', 'ws-1', 'm-' || i, 'host-' || i, jsonb_build_object('claude', i)
   FROM generate_series(1, 5) AS i;
 INSERT INTO sessions.convergence_events (org_id, workspace_id, machine_id, user_id, source,
-  session_id, event_id, kind, type, ts, content, input_tokens)
+  session_id, event_id, kind, type, ts, content, input_tokens, record)
 SELECT 'org-1', 'ws-1', 'm-' || (i % 5 + 1), 'user-1', 'claude', 's-' || (i % 40),
        'e-' || i, 'history', 'message', timestamptz '2026-10-01' + i * interval '1 minute',
-       'event ' || i || ' ' || repeat('x', i % 50), 9007199254740993 - i
+       'event ' || i || ' ' || repeat('x', i % 50), 9007199254740993 - i,
+       jsonb_build_object('i', i, 'nested', jsonb_build_array(i, 'x'))
   FROM generate_series(1, 1200) AS i;
 SQL
 docker exec "$NAME-src" psql -At -U postgres -c \

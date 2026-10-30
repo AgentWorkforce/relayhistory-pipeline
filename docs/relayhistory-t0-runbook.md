@@ -22,6 +22,7 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
 | --- | --- | --- |
 | A1 | Create the Supabase credentials for `sessions` (`pyamkrhoyszgzirqqffq`): a schema-owner role for migrations and a runtime role for the Worker (owner of, or `BYPASSRLS` on, `sessions.machines`), both in 1Password `96Bulls-prod`; plus a read-only Neon role for copy and verify | yes (drop roles) |
 |    | Read-only check on Supabase, required before A3: `SELECT has_parameter_privilege(current_user, 'session_replication_role', 'SET')` must be true for the copy role, or the copier refuses to run | — |
+|    | Read-only check: `SELECT datcollate, datctype, version() FROM pg_database WHERE datname = current_database()` on Neon and Supabase. If the collation differs, add `COLLATE "C"` to the verifier's text-key ranges and re-check that prefix-search plans use their indexes | — |
 | A2 | Size the Supabase compute and disk for the eventual ~486 GiB plus growth | yes |
 | A3 | Apply the schema to Supabase: the 96Bulls migrations (`supabase db push`), then relayhistory-cloud's runner and rollouts with `DATABASE_MIGRATIONS_URL` set to Supabase | empty database: yes (drop schema) |
 | A4 | Pre-copy the T0 copy set (mirror) and apply the sequence fence on Supabase | yes, while Supabase takes no traffic |

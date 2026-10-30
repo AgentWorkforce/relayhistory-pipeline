@@ -35,7 +35,15 @@ export interface Queryable {
 
 export interface TablePlan {
   table: string;
+  /** Conflict target: the primary key, or a unique key that treats NULLs as equal. */
   key: string[];
+  /**
+   * Keyset order as SQL expressions. A nullable key column orders as a text
+   * NULL flag then `coalesce(col::text, '')`, because a plain tuple comparison
+   * would silently skip rows whose key holds a NULL.
+   */
+  order: string[];
+  nullableKey: boolean;
   columns: string[];
 }
 
@@ -53,20 +61,40 @@ const SCHEMA = "sessions";
 const quoteIdent = (value: string) => `"${value.replaceAll('"', '""')}"`;
 const qualified = (table: string) => `${quoteIdent(SCHEMA)}.${quoteIdent(table)}`;
 
-async function keyColumns(db: Queryable, table: string): Promise<string[]> {
-  const { rows } = await db.query<{ name: string }>(
-    `SELECT a.attname AS name
-       FROM pg_index i
-       JOIN pg_class c ON c.oid = i.indrelid
-       JOIN pg_namespace n ON n.oid = c.relnamespace
-       JOIN unnest(i.indkey) WITH ORDINALITY AS k(attnum, position) ON true
-       JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
-      WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary
-        AND k.position <= i.indnkeyatts
+interface KeyInfo {
+  columns: string[];
+  nullable: boolean[];
+}
+
+/**
+ * The primary key, else one unique, non-partial, column-only index that
+ * either has all key columns NOT NULL or treats NULLs as equal (NULLS NOT
+ * DISTINCT). Derived tables such as session_rollups have only the latter.
+ */
+async function keyInfo(db: Queryable, table: string): Promise<KeyInfo> {
+  const { rows } = await db.query<{ index: string; name: string; nullable: boolean }>(
+    `WITH candidate AS (
+       SELECT i.indexrelid, i.indisprimary, i.indkey, i.indnkeyatts, c.oid AS relid
+         FROM pg_index i
+         JOIN pg_class c ON c.oid = i.indrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2 AND i.indisunique AND i.indisvalid
+          AND i.indpred IS NULL AND i.indexprs IS NULL
+          AND (i.indisprimary OR i.indnullsnotdistinct OR NOT EXISTS (
+                SELECT 1 FROM unnest(i.indkey) AS k(attnum)
+                  JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                 WHERE NOT a.attnotnull))
+        ORDER BY i.indisprimary DESC, i.indnkeyatts, i.indexrelid
+        LIMIT 1)
+     SELECT candidate.indexrelid::text AS index, a.attname AS name, NOT a.attnotnull AS nullable
+       FROM candidate
+       JOIN unnest(candidate.indkey) WITH ORDINALITY AS k(attnum, position) ON true
+       JOIN pg_attribute a ON a.attrelid = candidate.relid AND a.attnum = k.attnum
+      WHERE k.position <= candidate.indnkeyatts
       ORDER BY k.position`,
     [SCHEMA, table],
   );
-  return rows.map((row) => row.name);
+  return { columns: rows.map((row) => row.name), nullable: rows.map((row) => row.nullable) };
 }
 
 /** Writable (non-generated, non-dropped) columns, in table order. */
@@ -94,25 +122,43 @@ export async function planTable(
   table: string,
 ): Promise<TablePlan> {
   const [sourceKey, targetKey, sourceColumns, targetColumns] = await Promise.all([
-    keyColumns(source, table),
-    keyColumns(target, table),
+    keyInfo(source, table),
+    keyInfo(target, table),
     writableColumns(source, table),
     writableColumns(target, table),
   ]);
-  if (sourceKey.length === 0)
-    throw new Error(`${table}: no primary key on the source`);
-  if (sourceKey.join("\0") !== targetKey.join("\0"))
-    throw new Error(`${table}: primary keys differ between source and target`);
+  if (sourceKey.columns.length === 0)
+    throw new Error(`${table}: no primary or usable unique key on the source`);
+  if (sourceKey.columns.join("\0") !== targetKey.columns.join("\0"))
+    throw new Error(`${table}: keys differ between source and target`);
   const available = new Set(targetColumns);
   const missing = sourceColumns.filter((column) => !available.has(column));
   if (missing.length)
     throw new Error(`${table}: target lacks ${missing.length} source column(s)`);
-  return { table, key: sourceKey, columns: sourceColumns };
+  const order = sourceKey.columns.flatMap((column, index) =>
+    sourceKey.nullable[index]
+      ? [
+          `(CASE WHEN ${quoteIdent(column)} IS NULL THEN '1' ELSE '0' END)`,
+          `coalesce(${quoteIdent(column)}::text, '')`,
+        ]
+      : [quoteIdent(column)],
+  );
+  return {
+    table,
+    key: sourceKey.columns,
+    order,
+    nullableKey: sourceKey.nullable.some(Boolean),
+    columns: sourceColumns,
+  };
 }
 
 function keyTuple(columns: string[]): string {
   const list = columns.map(quoteIdent).join(", ");
   return columns.length === 1 ? list : `(${list})`;
+}
+
+function orderTuple(order: string[]): string {
+  return order.length === 1 ? order[0]! : `(${order.join(", ")})`;
 }
 
 function keyParams(columns: string[], first: number): string {
@@ -130,11 +176,11 @@ export function pageSql(plan: TablePlan, mode: CopyMode, hasAfter: boolean): str
   const projection = plan.columns.map(quoteIdent).join(", ");
   const forward = mode !== "backfill";
   const where = hasAfter
-    ? ` WHERE ${keyTuple(plan.key)} ${forward ? ">" : "<"} ${keyParams(plan.key, 2)}`
+    ? ` WHERE ${orderTuple(plan.order)} ${forward ? ">" : "<"} ${keyParams(plan.order, 2)}`
     : "";
   const order = (ascending: boolean) =>
-    plan.key.map((column) => `${quoteIdent(column)} ${ascending ? "ASC" : "DESC"}`).join(", ");
-  const lastKey = `json_build_array(${plan.key.map((column) => `${quoteIdent(column)}::text`).join(", ")})::text`;
+    plan.order.map((expression) => `${expression} ${ascending ? "ASC" : "DESC"}`).join(", ");
+  const lastKey = `json_build_array(${plan.order.map((expression) => `${expression}::text`).join(", ")})::text`;
   return `WITH page AS (
     SELECT ${projection} FROM ${qualified(plan.table)}${where} ORDER BY ${order(forward)} LIMIT $1
   )
@@ -190,6 +236,8 @@ export async function copyTable(
   plan: TablePlan,
   options: CopyOptions,
 ): Promise<TableResult> {
+  if (options.mode === "mirror" && plan.nullableKey)
+    throw new Error(`${plan.table}: mirror needs a key without NULLs`);
   const result: TableResult = {
     table: plan.table,
     read: 0,
@@ -341,15 +389,13 @@ export async function main() {
   );
   const checkpointPath = argument("checkpoint");
   const checkpoint = await loadCheckpoint(checkpointPath, mode);
-  const source = new pg.Pool({ connectionString: sourceUrl, max: 1, application_name: "96bulls-copy-source" });
-  // The source is only ever read: every source session is read-only.
-  source.on("connect", (client) => {
-    client.query("SET default_transaction_read_only = on").catch(() => {});
-  });
-  // One target connection for the whole run, so its session settings hold.
+  // One connection per side for the whole run, so session settings hold.
+  const source = new pg.Client({ connectionString: sourceUrl, application_name: "96bulls-copy-source" });
   const target = new pg.Client({ connectionString: targetUrl, application_name: "96bulls-copy-target" });
   try {
-    await target.connect();
+    await Promise.all([source.connect(), target.connect()]);
+    // The source is only ever read.
+    await source.query("SET default_transaction_read_only = on");
     await prepareTargetSession(target);
     const results: TableResult[] = [];
     for (const table of tables) {

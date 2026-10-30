@@ -204,6 +204,46 @@ describe("target session", () => {
   });
 });
 
+describe("tables keyed by a unique index with nullable columns", () => {
+  it("backfills every row, NULL keys included, and refuses to mirror", async () => {
+    const ddl = `CREATE TABLE sessions.rollups (
+      org_id text NOT NULL, session_id text NOT NULL, project_id text, n int);
+      CREATE UNIQUE INDEX rollups_key ON sessions.rollups (org_id, session_id, project_id) NULLS NOT DISTINCT;`;
+    await Promise.all([source.exec(ddl), target.exec(ddl)]);
+    await source.exec(`INSERT INTO sessions.rollups VALUES
+      ('o', 's1', NULL, 1), ('o', 's1', 'p', 2), ('o', 's1', '', 3),
+      ('o', 's2', NULL, 4), ('o', 's3', 'p', 5), ('o', 's3', NULL, 6)`);
+    // Written after T0 with a NULL in its key: must survive.
+    await target.exec(`INSERT INTO sessions.rollups VALUES ('o', 's2', NULL, 40)`);
+    const plan = await planTable(source as Queryable, target as Queryable, "rollups");
+    expect(plan.nullableKey).toBe(true);
+    const result = await copyTable(source as Queryable, target as Queryable, plan, {
+      mode: "backfill",
+      chunkSize: 2,
+    });
+    expect(result).toMatchObject({ read: 6, written: 5 });
+    const rows = (
+      await target.query<{ n: number }>("SELECT n FROM sessions.rollups ORDER BY n")
+    ).rows.map((row) => row.n);
+    expect(rows).toEqual([1, 2, 3, 5, 6, 40]);
+    await expect(
+      copyTable(source as Queryable, target as Queryable, plan, {
+        mode: "mirror",
+        chunkSize: 2,
+      }),
+    ).rejects.toThrow("mirror needs a key without NULLs");
+  });
+
+  it("refuses a table with no usable key", async () => {
+    const ddl = `CREATE TABLE sessions.loose (a text, b text);
+      CREATE UNIQUE INDEX loose_key ON sessions.loose (a, b);`;
+    await Promise.all([source.exec(ddl), target.exec(ddl)]);
+    await expect(
+      planTable(source as Queryable, target as Queryable, "loose"),
+    ).rejects.toThrow("no primary or usable unique key");
+  });
+});
+
 describe("plans fail closed", () => {
   it("refuses a target missing a source column or with a different key", async () => {
     await target.exec("ALTER TABLE sessions.tokens DROP COLUMN tags");
@@ -215,6 +255,6 @@ describe("plans fail closed", () => {
       ALTER TABLE sessions.tokens ADD PRIMARY KEY (id, org_id);`);
     await expect(
       planTable(source as Queryable, target as Queryable, "tokens"),
-    ).rejects.toThrow("primary keys differ");
+    ).rejects.toThrow("keys differ");
   });
 });
