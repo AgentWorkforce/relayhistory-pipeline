@@ -22,6 +22,7 @@ import {
   canonical,
   contentSha256,
   derivePlanContract,
+  exportedOriginRevisions,
   manifestProvenanceIssue,
   migrationWorkKey,
   planContract,
@@ -1030,5 +1031,60 @@ describe("409 activation_required (O4 gate, #51)", () => {
     const r2 = await runExportUpload(plan, cfg);
     expect(r2.committed).toHaveLength(2);
     expect(fake.requests.filter((r) => r.route === "chunk")).toHaveLength(0); // sealed chunks reused
+  });
+});
+
+describe("O4 dedupe watermark: origin_revisions in the export marker", () => {
+  const rec = (origin: string, id: string, revision: string, op: "upsert" | "delete" = "upsert", ts = 1): DeliveryRecord => ({
+    kind: "session_event",
+    origin_id: origin,
+    record_id: id,
+    revision,
+    operation: op,
+    received_at: "2026-10-01T00:00:00Z",
+    payload: op === "delete" ? null : { ts_ms: Date.UTC(2026, 9, 1) + ts, secret_text: `content-${id}` },
+  });
+  const records = [
+    rec("epoch-a", "r1", "3"),
+    rec("epoch-a", "r2", "17", "upsert", 2),
+    rec("epoch-a", "r3", "40", "delete"), // not exported: does not raise the watermark
+    rec("epoch-b", "r4", "9", "upsert", 3),
+    rec("machine:m1", "e1", "1", "upsert", 4), // ingest-API event: not a client feed
+  ];
+  const planned = () =>
+    plannedManifestFromRecords({ orgId: "org_1", workspaceId: "ws_1", source: "claude", sessionId: "wm", machine: "m1", sourceUserId: "user_1", records })!;
+
+  test("equals the max exported revision per origin", () => {
+    expect(exportedOriginRevisions(records)).toEqual({ "epoch-a": 17, "epoch-b": 9 });
+    expect(planned().originRevisions).toEqual({ "epoch-a": 17, "epoch-b": 9 });
+    expect(() => exportedOriginRevisions([rec("x", "r", "99999999999999999")])).toThrow("safe integer");
+  });
+
+  test("is stable across retries: the same marker bytes, committed once", async () => {
+    expect(JSON.stringify(planned().originRevisions)).toBe(JSON.stringify(planned().originRevisions));
+    const plan: ExportPlan = { exportedAt: "2026-10-30T12:00:00.000Z", manifests: [planned()] };
+    const digest = planContract(plan, GRANT).planDigest;
+    const fake = await fakeIngest(digest);
+    fake.storedPlan = planContract(plan, GRANT);
+    fake.before = (route, n) => (route === "manifest" && n === 1 ? { status: 409, code: "migration_assertion_replayed" } : undefined);
+    fake.afterCommit = (n) => (n === 1 ? "hang" : undefined);
+    const dir = await mkdtemp(join(tmpdir(), "export-upload-"));
+    dirs.push(dir);
+    const result = await runExportUpload(plan, {
+      execute: true, ingestUrl: fake.url, grantId: GRANT, expectedPlanDigest: digest,
+      assertions: new MigrationAssertionClient({ baseUrl: fake.url, grantId: GRANT, apiKey: async () => "fake-test-value" }),
+      checkpointPath: join(dir, "cp.json"), backoffMs: [1, 1, 1], sleep: async () => {}, requestTimeoutMs: 300,
+    });
+    expect(result.committed).toHaveLength(1);
+    expect(fake.manifestWrites).toBe(1); // replay and lost-response retries sent identical bytes
+    const stored = JSON.parse(fake.stored.get(planContract(plan, GRANT).uploads[0]!.key)!);
+    expect(stored.extensions["client.relayhistory_export"].origin_revisions).toEqual({ "epoch-a": 17, "epoch-b": 9 });
+  });
+
+  test("contains no record content: origin ids and integers only", () => {
+    const wm = planned().originRevisions!;
+    expect(JSON.stringify(wm)).not.toContain("content-");
+    expect(Object.keys(wm).every((k) => records.some((r) => r.origin_id === k))).toBe(true);
+    expect(Object.values(wm).every((v) => Number.isSafeInteger(v) && v >= 0)).toBe(true);
   });
 });
