@@ -514,8 +514,8 @@ export default Alchemy.Stack(
         name: runtimeIdentity.name,
         role: "roles/iam.workloadIdentityUser",
         member: Output.map(cluster.workloadPool, () =>
-          authorized(workloadIdentityPrincipal(i, namespace, serviceAccount)),
-        ) as Input<string>,
+          workloadIdentityPrincipal(i, namespace, serviceAccount),
+        ),
       });
     }
     yield* GCP.IAM.Member("runtime-locker", {
