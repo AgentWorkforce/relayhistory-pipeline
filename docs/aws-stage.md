@@ -4,6 +4,11 @@ Stages named `aws-*` are declared in `alchemy.run.ts` and refuse to run. Nothing
 in this repository creates a cloud resource, credential or IAM entity until
 Khaliq clears the AWS account work in his own words.
 
+The published portable Relaycast chart has a completed local kind proof; see
+[Relaycast self-hosted conformance evidence](relaycast-self-hosted-conformance.md).
+That proof is local-only and does not clear this AWS stage or change the
+production Supabase and AWS S3 boundary.
+
 What the stage will need (each item needs an explicit OK): a target account
 (per-agent sandbox under the Sandbox OU via Pippin Tools, or a named dev
 account); which credential to use (SSO profile or a `96bulls-deployer` role

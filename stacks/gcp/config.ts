@@ -3,6 +3,15 @@ import { isIP } from "node:net";
 
 export const GCP_CONFIRM_PROJECT_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT";
 
+/** The only project this lane may plan. Any other id, number, org, billing account, or region is refused. */
+export const GCP_APPROVED_TARGET = {
+  projectId: "agentrelay-96bulls-soc2-2610",
+  projectNumber: "955297012355",
+  organizationId: "929835122282",
+  billingAccount: "014D50-E96D1A-DE6360",
+  region: "us-central1",
+} as const;
+
 export interface ManagedDataPlaneInputs {
   /**
    * Managed services are provisioned for adapter development and proof only.
@@ -44,6 +53,8 @@ export interface RelayflowsChartInputs {
 export interface GcpInputs {
   projectId: string;
   projectNumber: string;
+  organizationId: string;
+  billingAccount: string;
   region: string;
   /** Operator/VPN egress ranges allowed to reach the public GKE API endpoint. */
   controlPlaneAuthorizedCidrs: Array<{ cidrBlock: string; displayName?: string }>;
@@ -141,7 +152,19 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
   if (!stage.startsWith("gcp-")) throw new Error(`96bulls: GCP config requires a gcp-* stage, got ${stage}`);
   if (!PROJECT_ID.test(inputs.projectId)) throw new Error("96bulls: gcp projectId is invalid");
   if (!PROJECT_NUMBER.test(inputs.projectNumber)) throw new Error("96bulls: gcp projectNumber is invalid");
+  if (!/^[0-9]{6,20}$/.test(inputs.organizationId)) throw new Error("96bulls: gcp organizationId is invalid");
+  if (!/^[0-9A-F]{6}-[0-9A-F]{6}-[0-9A-F]{6}$/.test(inputs.billingAccount))
+    throw new Error("96bulls: gcp billingAccount is invalid");
   if (!REGION.test(inputs.region)) throw new Error("96bulls: gcp region is invalid");
+  if (
+    inputs.projectId !== GCP_APPROVED_TARGET.projectId ||
+    inputs.projectNumber !== GCP_APPROVED_TARGET.projectNumber ||
+    inputs.organizationId !== GCP_APPROVED_TARGET.organizationId ||
+    inputs.billingAccount !== GCP_APPROVED_TARGET.billingAccount ||
+    inputs.region !== GCP_APPROVED_TARGET.region
+  ) {
+    throw new Error("96bulls: GCP target does not match the approved project. Nothing was created.");
+  }
   if (!inputs.clearedBy?.trim()) throw new Error("96bulls: GCP stage has no clearedBy record; nothing was created");
   if (!inputs.controlPlaneAuthorizedCidrs?.length)
     throw new Error("96bulls: controlPlaneAuthorizedCidrs must allow at least one operator or VPN range");
@@ -200,12 +223,13 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
   }
 }
 
-/** Refuse live runtime wiring until the private Cloud SQL body has a reviewed poster. */
+/** Defense in depth for runtime wiring; the stack's poster remains apply-only. */
 export function assertGcpRuntimeDeployable(inputs: GcpInputs): void {
-  if (inputs.bulls96?.enabled)
-    throw new Error(
-      "96bulls: the GCP 96Bulls release stays disabled until a reviewed resource posts the private-only Cloud SQL body. Nothing was created.",
-    );
+  if (
+    inputs.bulls96?.enabled &&
+    (!inputs.managedDataPlane.provision || inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
+  )
+    throw new Error("96bulls: GCP runtime wiring requires the acknowledged managed data plane. Nothing was created.");
 }
 
 export function relaycastChartValues(i: RelaycastChartInputs, defaultStorageClass = "standard-rwo") {
@@ -263,7 +287,7 @@ export function relayfileChartValues(i: RelayfileChartInputs) {
 export interface Bulls96ReleaseOutputs {
   bucket: unknown;
   region: string;
-  cloudSqlConnectionName: string;
+  cloudSqlConnectionName: unknown;
   redisHost: unknown;
   redisPort: unknown;
   pubsubTopic: unknown;
