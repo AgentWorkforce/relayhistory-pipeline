@@ -87,7 +87,8 @@ TABLES=$(docker exec "$NAME-src" psql -At -U postgres -c \
   "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables
     WHERE schemaname = 'sessions' AND tablename <> '__migrations' AND tablename NOT LIKE '%\\_rollout'")
 COPY_SET=auth_sessions,deleted_upload_sessions,session_resets,upload_cleanup_origins,upload_cleanup_tombstones,machines,probe_connections,project_aliases,github_org_links,delivery_origins,delivery_receipts
-REST=$(printf '%s' "$TABLES" | tr ',' '\n' | grep -v -x -F -f <(printf '%s' "$COPY_SET" | tr ',' '\n') | paste -sd, -)
+REPROJECTED=session_catalog,session_relationships,session_markers,session_commit_links,session_catalog_agents
+REST=$(printf '%s' "$TABLES" | tr ',' '\n' | grep -v -x -F -f <(printf '%s,%s' "$COPY_SET" "$REPROJECTED" | tr ',' '\n') | paste -sd, -)
 
 step "96Bulls tools: verify schema, mirror copy set, backfill the rest, verify data"
 docker run --rm --network "$NAME" -v "$WORK/bulls":/bulls -w /bulls \
@@ -95,17 +96,20 @@ docker run --rm --network "$NAME" -v "$WORK/bulls":/bulls -w /bulls \
   oven/bun:1 sh -c "
   bun install --frozen-lockfile >/dev/null 2>&1
   set -e
-  bun run src/migration/relayhistory-verify.ts --mode=schema > /tmp/schema.json || true
+  bun run src/migration/relayhistory-verify.ts --mode=schema --source-role=postgres --target-role=postgres > /tmp/schema.json || true
   bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/schema.json\",\"utf8\"));console.log(\"schema passed:\",r.passed,\"| incompatible:\",r.tables.filter(t=>t.schema!==\"compatible\").map(t=>t.table).join(\" \")||\"none\",\"| objects checked:\",r.objects.checked,\"missing:\",r.objects.missing.length)'
   bun run src/migration/relayhistory-copy.ts --mode=mirror --tables=$COPY_SET --keep-target-only=machines --chunk-size=7 --execute --expect-target-host=$NAME-dst \
     | bun -e 'const r=JSON.parse(await Bun.stdin.text());console.log(\"mirror:\",r.tables.map(t=>t.table+\"=\"+t.read+\"/\"+t.written).join(\" \"))'
+  bun run src/migration/relayhistory-sequence-fence.ts --apply --execute --expect-target-host=$NAME-dst | bun -e 'const r=JSON.parse(await Bun.stdin.text());console.log(\"sequence fence passed:\",r.passed,\"| sequences:\",r.sequences.length)'
   bun run src/migration/relayhistory-copy.ts --mode=backfill --tables=$REST --chunk-size=97 --checkpoint=/tmp/backfill.json --execute --expect-target-host=$NAME-dst \
     | bun -e 'const r=JSON.parse(await Bun.stdin.text());console.log(\"backfill:\",r.tables.filter(t=>t.read).map(t=>t.table+\"=\"+t.read+\"/\"+t.written).join(\" \"))'
+  bun run src/migration/relayhistory-reproject.ts --batch=13 --execute --expect-target-host=$NAME-dst | bun -e 'const r=JSON.parse(await Bun.stdin.text());console.log(\"reproject keys:\",r.keys,\"batches:\",r.batches)'
   bun run src/migration/relayhistory-copy.ts --mode=check --tables=$REST,$COPY_SET --chunk-size=211 > /tmp/check.json || true
   bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/check.json\",\"utf8\"));console.log(\"check: missing rows\",r.tables.reduce((n,t)=>n+t.missing,0))'
   # Guard: without --execute nothing is written; a swapped target is refused.
   bun run src/migration/relayhistory-copy.ts --mode=backfill --tables=convergence_events > /tmp/dry.json && bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/dry.json\",\"utf8\"));console.log(\"dry run:\",r.dryRun,\"written\",r.tables[0].written)'
   RELAYHISTORY_SOURCE_URL=\"\$BULLS_TARGET_URL\" BULLS_TARGET_URL=\"\$RELAYHISTORY_SOURCE_URL\" bun run src/migration/relayhistory-copy.ts --mode=backfill --tables=convergence_events --execute --expect-target-host=$NAME-dst 2>&1 | grep -o \"refusing to write\" | sed \"s/^/swapped URLs: /\"
+  bun run src/migration/relayhistory-sequence-fence.ts | bun -e 'const r=JSON.parse(await Bun.stdin.text());console.log(\"sequence fence re-check passed:\",r.passed)'
   bun run src/migration/relayhistory-verify.ts --mode=full --chunk-size=113 > /tmp/full.json || true
   bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/full.json\",\"utf8\"));const bad=r.tables.filter(t=>t.data&&t.data!==\"equal\"||t.schema!==\"compatible\");console.log(\"full verify passed:\",r.passed,\"| tables:\",r.tables.length,\"| not equal:\",bad.map(t=>t.table+\":\"+(t.data||t.schema)).join(\" \")||\"none\")'
   # After the faithful-copy check: rebuild intentionally recomputes derived state.
