@@ -131,8 +131,13 @@ manifest body.
   - **Single use:** 409 `migration_assertion_replayed` (mint again); 503
     `migration_ledger_unavailable` fails closed. The ledger row and the
     enriched `pipeline_jobs` row commit in one transaction.
-  - **Chunks:** one chunk per `(jti, seq)` (409 `migration_chunk_conflict`)
-    and at most 256 chunks per assertion (403 `migration_chunk_limit`).
+  - **Chunks:** each request carries its canonical plan entry in front of
+    the bytes. The chunk must be one of the signed entry's chunks, checked
+    against the actual bytes before anything is stored. Also one chunk per
+    `(jti, seq)` (409 `migration_chunk_conflict`) and at most 256 per
+    assertion (403 `migration_chunk_limit`).
+  - **Audit:** one durable, append-only `sessions.migration_ingest_audit` row
+    per commit, in the same transaction as the job.
   - **Retention:** no cron. Each ledger insert deletes at most 100 rows
     expired for more than 5 minutes. An expired token is refused before the
     ledger is read.

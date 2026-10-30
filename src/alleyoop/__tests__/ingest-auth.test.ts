@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
-import { uploadIdentityOf, type PlanEntry, type UploadIdentity } from "@rhc/lib/pipeline/migration-assertions.ts";
+import { canonicalJson, uploadIdentityOf, type PlanEntry, type UploadIdentity } from "@rhc/lib/pipeline/migration-assertions.ts";
 import { computeContentSha256, manifestKey, sealRawChunk, type SessionLocation, type SqlExecutor } from "../../shared/vendor.ts";
 import { buildIngestApp } from "../ingest.ts";
 
@@ -115,10 +115,17 @@ async function ingest(extra: Record<string, string> = {}) {
   const { app, env } = await buildIngestApp({ db: pgExecutor(), raw: { store, provider: "fs", bucket: "raw" } as never });
   const req = (path: string, token: string, init: RequestInit = {}) =>
     app.request(path, { ...init, headers: { authorization: `Bearer ${token}`, ...(init.headers as Record<string, string>) } }, env);
-  const chunk = (token: string, location: SessionLocation = LOCATION) =>
-    req(`/v1/pipeline/chunks?machine=${location.machineId}&harness=${location.harness}&session=${location.sessionId}&date=${location.startDate}&seq=0&epoch=0&offset=0&format=jsonl`, token, {
-      method: "POST", headers: { "x-relay-trace-id": TRACE }, body: SOURCE,
+  /** A chunk request; a migration one carries its plan entry text in front of the bytes. */
+  const chunk = (token: string, location: SessionLocation = LOCATION, opts: { entry?: string; seq?: number; bytes?: Uint8Array } = {}) => {
+    const bytes = opts.bytes ?? SOURCE;
+    const entry = opts.entry === undefined ? undefined : new TextEncoder().encode(opts.entry);
+    const body = entry ? Buffer.concat([entry, bytes]) : bytes;
+    return req(`/v1/pipeline/chunks?machine=${location.machineId}&harness=${location.harness}&session=${location.sessionId}&date=${location.startDate}&seq=${opts.seq ?? 0}&epoch=0&offset=0&format=jsonl`, token, {
+      method: "POST",
+      headers: { "x-relay-trace-id": TRACE, ...(entry ? { "x-relay-migration-plan-entry-length": String(entry.byteLength) } : {}) },
+      body,
     });
+  };
   const commit = (token: string, manifest: Record<string, unknown>, key = manifestKey(LOCATION)) =>
     req("/v1/pipeline/manifests", token, {
       method: "POST",
@@ -160,7 +167,7 @@ async function planned() {
       session: { machine_id: LOCATION.machineId, harness: LOCATION.harness, session_id: LOCATION.sessionId, started_at: AT },
       state: "closed", chunks, content_sha256: await computeContentSha256(chunks), raw_bytes: SOURCE.byteLength,
     };
-    return { manifest, upload: await uploadIdentityOf(entry, PLAN) };
+    return { manifest, entryText: canonicalJson(entry), upload: await uploadIdentityOf(entry, PLAN) };
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
@@ -182,12 +189,12 @@ describe("buildIngestApp auth (production composition)", () => {
   });
 
   test("with the migration flag on (interim off): a generic bearer is still 401, a migration token is accepted under its full contract", async () => {
-    const { upload, manifest } = await planned();
+    const { upload, manifest, entryText } = await planned();
     const i = await ingest(MIGRATION_ON);
     for (const response of [await i.chunk(genericToken()), await i.chunk(genericToken([ORIGIN])), await i.commit(genericToken(), manifest)])
       expect(response.status).toBe(401);
     const token = migrationToken(upload);
-    const chunk = await i.chunk(token);
+    const chunk = await i.chunk(token, LOCATION, { entry: entryText });
     expect(chunk.status).toBe(201);
     const commit = await i.commit(token, manifest);
     expect(commit.status).toBe(202);
@@ -224,20 +231,27 @@ describe("buildIngestApp auth (production composition)", () => {
   });
 
   test("refuses each contract violation end to end", async () => {
-    const { upload, manifest } = await planned();
+    const { upload, manifest, entryText } = await planned();
     const i = await ingest(MIGRATION_ON);
     const fresh = { ...LOCATION, machineId: "machine-fresh" };
     const otherContent = structuredClone(manifest);
     (otherContent.raw.chunks[0] as { records?: number }).records = 42;
     const cases: [string, number, () => Promise<Response>][] = [
       // An arbitrary fresh machine key, on chunks, status and the commit.
-      ["migration_upload_forbidden", 403, () => i.chunk(migrationToken(upload), fresh)],
+      ["migration_upload_forbidden", 403, () => i.chunk(migrationToken(upload), fresh, { entry: entryText })],
+      // Per-chunk: an in-plan key, but bytes or seq outside the signed entry, or no entry.
+      ["migration_upload_forbidden", 403, () => i.chunk(migrationToken(upload), LOCATION, { entry: entryText, bytes: new TextEncoder().encode('{"type":"user","text":"evil"}\n') })],
+      ["migration_upload_forbidden", 403, () => i.chunk(migrationToken(upload), LOCATION, { entry: entryText, seq: 1 })],
+      ["migration_upload_forbidden", 403, () => i.chunk(migrationToken(upload), LOCATION)],
+      ["migration_upload_forbidden", 403, () => i.chunk(migrationToken(upload), LOCATION, { entry: entryText.replace('"closed"', '"open"') })],
+      // Provenance: 96bulls.user_id must be the signed source user.
+      ["migration_upload_forbidden", 403, () => i.commit(migrationToken(upload), { ...manifest, extensions: { "96bulls": { user_id: "user_ingest_b" } } })],
       ["migration_upload_forbidden", 403, () => i.req(`/v1/pipeline/manifests/status?key=${encodeURIComponent(manifestKey(fresh))}`, migrationToken(upload))],
       ["migration_upload_forbidden", 403, () => i.commit(migrationToken(upload), { ...manifest, session: { ...manifest.session, machine_id: "machine-fresh" } }, manifestKey(fresh))],
       // Other content than the signed identity.
       ["migration_upload_forbidden", 403, () => i.commit(migrationToken(upload), otherContent)],
       // Another user's identity under this user's token.
-      ["migration_upload_forbidden", 403, () => i.chunk(migrationToken({ ...upload, source_user_id: "user_ingest_b" }))],
+      ["migration_upload_forbidden", 403, () => i.chunk(migrationToken({ ...upload, source_user_id: "user_ingest_b" }), LOCATION, { entry: entryText })],
       // Signed pair is not the grant pair.
       ["migration_workspace_forbidden", 403, () => i.chunk(migrationToken(upload, {}, { workspaceId: "ws_other" }))],
       // A grant this ingest does not accept.
@@ -261,13 +275,36 @@ describe("buildIngestApp auth (production composition)", () => {
 
     // Replay: the same assertion after its commit is 409 on every route.
     const token = migrationToken(upload);
-    expect((await i.chunk(token)).status).toBe(201);
+    expect((await i.chunk(token, LOCATION, { entry: entryText })).status).toBe(201);
     expect((await i.commit(token, manifest)).status).toBe(202);
-    for (const response of [await i.commit(token, manifest), await i.chunk(token)]) {
+    for (const response of [await i.commit(token, manifest), await i.chunk(token, LOCATION, { entry: entryText })]) {
       expect(response.status).toBe(409);
       expect(await code(response)).toBe("migration_assertion_replayed");
     }
     expect(await count("sessions.migration_assertion_uses")).toBe(1);
     expect(await count("sessions.pipeline_jobs")).toBe(1);
+  });
+
+  test("signed work key and durable audit: posted fields cannot alter the work key; one audit row per commit, no secrets", async () => {
+    const { upload, manifest, entryText } = await planned();
+    const i = await ingest(MIGRATION_ON);
+    const auditBefore = await count("sessions.migration_ingest_audit");
+    const token = migrationToken(upload);
+    expect((await i.chunk(token, LOCATION, { entry: entryText })).status).toBe(201);
+    const commit = await i.req("/v1/pipeline/manifests", token, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-machine-id": LOCATION.machineId, "x-session-id": LOCATION.sessionId },
+      body: JSON.stringify({ key: manifestKey(LOCATION), manifest, etag: "attacker", version: "attacker", previousVersion: { eTag: "attacker" } }),
+    });
+    expect(commit.status).toBe(202);
+    const { workKey, version } = (await commit.json()) as { workKey: string; version: { eTag?: string; version?: string } };
+    expect(workKey.startsWith(`${upload.key}@`)).toBe(true);
+    expect(workKey).not.toContain("attacker");
+    expect(workKey.endsWith(String(version.version ?? version.eTag).replace(/"/g, ""))).toBe(true);
+    expect(await count("sessions.migration_ingest_audit")).toBe(auditBefore + 1);
+    const { rows } = await db.query<Record<string, unknown>>("SELECT * FROM sessions.migration_ingest_audit ORDER BY id DESC LIMIT 1");
+    expect(rows[0]).toMatchObject({ grant_id: GRANT, plan_digest: PLAN, entry_sha256: upload.entry_sha256, work_key: workKey, user_id: USER, result: "committed" });
+    const text = JSON.stringify(rows[0]);
+    for (const secret of [token, token.split(".")[2]!, "eyJ", new TextDecoder().decode(SOURCE).trim()]) expect(text).not.toContain(secret);
   });
 });

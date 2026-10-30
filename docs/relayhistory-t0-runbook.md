@@ -134,6 +134,15 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     fallback). Hold logs are empty, 5xx rates are back to baseline, and
     `/health/ready` is green.
 
+### Export assertions: clock health (before the backfill export starts)
+
+- Migration assertions live at most 60 s, and the ingest allows only 5 s of clock skew (contract: `docs/contracts/relayhistory-export-plan-entry-v1.md`).
+- If the issuer's (RelayAuth's) clock runs **more than 5 s ahead** of the ingest, every assertion is refused as not yet valid: 401 `invalid_claims`. This is terminal; the courier does not re-mint it.
+- If the issuer runs more than 5 s behind, assertions expire early: 401 `migration_assertion_expired`, and the courier re-mints.
+- Before and during the export, the RelayAuth, ingest and courier hosts must run NTP with clock-offset monitoring. Alert at more than 1 s of offset.
+- Do not start the backfill export while any of these hosts reports more than 1 s of offset.
+- A run of `invalid_claims` refusals that starts suddenly during the export means: check the issuer's clock first.
+
 ## After T0
 
 13. **[A8] Backfill.** Copy every legacy table except the catalog-derived

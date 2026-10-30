@@ -1,49 +1,66 @@
 /**
- * RelayAuth migration assertions (`POST /v1/tokens/migration-assertion`,
- * relayauth#110) at the ingest. RelayAuth records neither `jti` nor `nonce`,
- * so this service makes each assertion single-use: chunk requests may reuse it
- * (bounded, see below) until it is consumed, and the manifest commit consumes
- * it exactly once.
+ * RelayAuth migration assertions (`POST /v1/tokens/migration-assertion`;
+ * relayauth #110, with the signed `meta.upload` identity from relayauth #111)
+ * at the ingest. RelayAuth records neither `jti` nor `nonce`, so this service
+ * makes each assertion single-use: chunk requests may reuse it (bounded, see
+ * below) until it is consumed, and the manifest commit consumes it once.
  *
  * Authorization comes from the signed assertion itself, never from echoed
  * request or manifest fields, and never from a membership lookup:
  *  - the signed `wks` equals `meta.workspaceId` and the signed `sponsorId`
  *    equals `meta.sourceUserId` (else 403 `migration_workspace_forbidden`);
- *  - the signed `meta.upload` (an `UploadIdentity` the issuer derives from
- *    the grant's stored plan; contract and vectors in 96BullSessions
+ *  - the signed `meta.upload` (an `UploadIdentity` relayauth #111 derives
+ *    from the grant's stored plan; contract and vectors in 96BullSessions
  *    docs/contracts/relayhistory-export-plan-entry-v1.md) must name the
  *    signed grant, plan digest, org, workspace and user (canonical ids, no
- *    `relay_` alias), and the ingest RECOMPUTES the identity from the actual
- *    request: the key, machine, harness, session and date of the chunk,
- *    status or commit request; at the commit also the session, the chunk
- *    list, the content hash chain and the entry digest of the manifest. Any
- *    difference is 403 `migration_upload_forbidden`. A fresh key, another
- *    machine or session, or other content cannot match;
+ *    `relay_` alias). The ingest RECOMPUTES the identity from the actual
+ *    request; any difference is 403 `migration_upload_forbidden`:
+ *     - chunks: the request carries the plan entry in front of the chunk
+ *       bytes (`X-Relay-Migration-Plan-Entry-Length`); its SHA-256 must be
+ *       the signed `entry_sha256`, its key, tenancy and session must be the
+ *       request's and the signed ones, and the chunk (seq, epoch, offset,
+ *       byte count and the SHA-256 of the actual bytes) must be one of the
+ *       entry's chunks. So seq is always below the entry's chunk count, and
+ *       no chunk outside the entry is stored;
+ *     - status: the requested key, machine, harness, session and date;
+ *     - commit: the plan entry derived from the key and the manifest (chunk
+ *       list, content hash chain, session, state) must hash to the signed
+ *       `entry_sha256`, and the 96Bulls extension's `user_id` must be the
+ *       signed source user (`migrationManifestProvenance`). The work key is
+ *       the signed manifest key plus the storage version the server read
+ *       itself (never a client-posted etag or version);
  *  - the grant and its plan must be one this ingest accepts
  *    (`RELAYHISTORY_MIGRATION_GRANTS`, else 403 `migration_grant_forbidden`).
  *
  * Chunks: at most one chunk per `(jti, seq)` (an identical repeat is
  * idempotent, any other chunk at that seq is 409 `migration_chunk_conflict`)
  * and at most `MAX_CHUNKS_PER_ASSERTION` chunks per assertion (403
- * `migration_chunk_limit`): 256 chunks of at most 4 MiB is 1 GiB, more than a
- * courier can send within an assertion's <= 65 second validity; the courier
- * re-mints for the rest of a session.
+ * `migration_chunk_limit`). The chunk route accepts up to 16 MiB per chunk
+ * (the courier seals at 4 MiB), so 256 chunks is up to 4 GiB per assertion,
+ * far more than a courier can send within its <= 65 second validity; the
+ * courier re-mints for the rest of a session.
  *
- * What is atomic: the ledger row and the manifest commit's durable write, the
- * `object-landed` queue row, are written in one SQL transaction, so a crash
- * leaves both or neither. A Cloudflare Queue send cannot join a Postgres
+ * What is atomic: the ledger row, the manifest commit's durable write (the
+ * `object-landed` queue row) and the durable audit event
+ * (`sessions.migration_ingest_audit`) are written in one SQL transaction, so
+ * a crash leaves all or none. A Cloudflare Queue send cannot join a Postgres
  * transaction, so a deployment that enqueues to Cloudflare has no ledger and
  * refuses migration assertions (503 `migration_ledger_unavailable`).
  *
  * Retention, no cron: every ledger insert first deletes at most
- * `RETENTION_BATCH` rows whose `expires_at` (the token's `exp` plus the 5
- * second skew) passed more than `RETENTION_MARGIN_SECONDS` ago. The verifier
- * refuses an expired token before the ledger is ever consulted, so a purged
- * `jti` or nonce can never be accepted again.
+ * `RETENTION_BATCH` replay rows whose `expires_at` (the token's `exp` plus
+ * the 5 second skew) passed more than `RETENTION_MARGIN_SECONDS` ago. The
+ * verifier refuses an expired token (401 `migration_assertion_expired`, after
+ * its shape is validated) before the ledger is consulted, so a purged token
+ * is never accepted again. Nonce uniqueness, though, holds only within that
+ * window: once a row is purged, a NEW, valid token may carry the same nonce
+ * and is accepted. The audit table is durable and is never purged this way.
  *
  * A retry after an ambiguous failure (the commit landed, the response was
  * lost) uses a fresh assertion and enqueues the same work key again; every
- * stage is idempotent by work key, so it is never applied twice.
+ * stage is idempotent by work key, so it is never applied twice. On a replay
+ * or a grant mismatch the manifest object may already be written while
+ * nothing is enqueued; an idempotent retry with a fresh assertion resolves it.
  */
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import { computeContentSha256 } from "../../../../object-store/src/manifest.js";
@@ -458,9 +475,30 @@ export function parseUploadIdentity(
   const session = record(u?.session);
   const text = (v: unknown, max = 512) =>
     typeof v === "string" && v.length > 0 && v.length <= max;
+  const exactKeys = (v: Record<string, unknown>, keys: string[]) =>
+    Object.keys(v).sort().join(",") === [...keys].sort().join(",");
   if (
     !u ||
     !session ||
+    // Exactly the contract's fields (as relayauth #111 verifies): nothing
+    // unsigned can ride along.
+    !exactKeys(u, [
+      "grant_id",
+      "plan_digest",
+      "key",
+      "org_id",
+      "workspace_id",
+      "source_user_id",
+      "session",
+      "content_sha256",
+      "entry_sha256",
+    ]) ||
+    !exactKeys(session, [
+      "machine_id",
+      "harness",
+      "session_id",
+      "started_at",
+    ]) ||
     !["grant_id", "key", "org_id", "workspace_id", "source_user_id"].every(
       (k) => text(u[k]),
     ) ||
@@ -494,6 +532,149 @@ export function parseUploadIdentity(
     content_sha256: u.content_sha256,
     entry_sha256: u.entry_sha256,
   };
+}
+
+/** The header that carries the plan entry's byte length on a migration chunk request. */
+export const PLAN_ENTRY_LENGTH_HEADER = "X-Relay-Migration-Plan-Entry-Length";
+/** The largest plan entry a chunk request may carry in front of its bytes. */
+export const MAX_PLAN_ENTRY_BYTES = 1024 * 1024;
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  !!v && typeof v === "object" && !Array.isArray(v);
+const exactKeySet = (v: Record<string, unknown>, keys: readonly string[]) =>
+  Object.keys(v).sort().join(",") === [...keys].sort().join(",");
+const uint = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0;
+
+/**
+ * Parses a plan entry carried by a chunk request: its bytes must be exactly
+ * `canonicalJson(entry)` of an entry of exactly the contract's shape.
+ */
+export function parsePlanEntry(text: string): PlanEntry | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(value) || canonicalJson(value) !== text) return undefined;
+  const entryKeys = [
+    "grant_id",
+    "key",
+    "org_id",
+    "workspace_id",
+    "source_user_id",
+    "session",
+    "state",
+    "chunks",
+    "content_sha256",
+    "raw_bytes",
+  ];
+  const chunkKeys = [
+    "seq",
+    "epoch",
+    "start_offset",
+    "bytes",
+    "sha256",
+    "records",
+  ];
+  const session = value.session;
+  const chunks = value.chunks;
+  if (
+    !exactKeySet(value, entryKeys) ||
+    !isRecord(session) ||
+    !exactKeySet(session, [
+      "machine_id",
+      "harness",
+      "session_id",
+      "started_at",
+    ]) ||
+    !Object.values(session).every((v) => typeof v === "string") ||
+    (value.state !== "open" && value.state !== "closed") ||
+    !Array.isArray(chunks) ||
+    !chunks.every(
+      (c) =>
+        isRecord(c) &&
+        exactKeySet(c, chunkKeys) &&
+        ["seq", "epoch", "start_offset", "bytes", "records"].every((k) =>
+          uint(c[k]),
+        ) &&
+        typeof c.sha256 === "string" &&
+        DIGEST_SHAPE.test(c.sha256),
+    ) ||
+    !["grant_id", "key", "org_id", "workspace_id", "source_user_id"].every(
+      (k) => typeof value[k] === "string",
+    ) ||
+    typeof value.content_sha256 !== "string" ||
+    !uint(value.raw_bytes)
+  )
+    return undefined;
+  return value as unknown as PlanEntry;
+}
+
+/**
+ * A migration chunk request, before anything is stored: the carried plan
+ * entry is the signed one (by `entry_sha256`), names this request's key,
+ * session and the signed tenancy, its content summary is consistent, and the
+ * chunk (seq, epoch, offset, bytes, SHA-256 of the actual bytes) is one of
+ * its chunks. Returns the matched chunk, or `undefined`.
+ */
+export async function migrationChunkMatches(
+  auth: Pick<AuthContext, "claims" | "migration">,
+  location: Parameters<typeof sessionManifestKey>[0],
+  chunk: { seq: number; epoch: number; startOffset: number; bytes: Uint8Array },
+  entryText: string,
+): Promise<PlanEntryChunk | undefined> {
+  const upload = auth.migration?.upload;
+  const tenancy = signedTenancy(auth);
+  if (!upload || !tenancy || !migrationSessionMatches(auth, location))
+    return undefined;
+  if ((await sha256Hex(entryText)) !== upload.entry_sha256) return undefined;
+  const entry = parsePlanEntry(entryText);
+  if (
+    !entry ||
+    entry.key !== upload.key ||
+    entry.grant_id !== tenancy.grant_id ||
+    entry.org_id !== tenancy.org_id ||
+    entry.workspace_id !== tenancy.workspace_id ||
+    entry.source_user_id !== tenancy.source_user_id ||
+    canonicalJson(entry.session) !== canonicalJson(upload.session) ||
+    entry.content_sha256 !== upload.content_sha256 ||
+    (await computeContentSha256(entry.chunks)) !== entry.content_sha256 ||
+    entry.raw_bytes !== entry.chunks.reduce((n, c) => n + c.bytes, 0)
+  )
+    return undefined;
+  const planned = entry.chunks.find((c) => c.seq === chunk.seq);
+  if (
+    !planned ||
+    planned.epoch !== chunk.epoch ||
+    planned.start_offset !== chunk.startOffset ||
+    planned.bytes !== chunk.bytes.byteLength ||
+    planned.sha256 !== (await sha256Hex(chunk.bytes))
+  )
+    return undefined;
+  return planned;
+}
+
+/**
+ * Manifest provenance beyond the entry digest: the chunk list, content,
+ * session, state, key, grant, plan and tenancy are already bound by
+ * `migrationUploadMatches` (entry_sha256, sameTenancy). What remains is the
+ * 96Bulls extension's `user_id`, which the pipeline reads as the session's
+ * user: when present it must be the signed canonical source user. Returns
+ * the problem, or `undefined`.
+ */
+export function migrationManifestProvenance(
+  auth: Pick<AuthContext, "claims" | "migration">,
+  manifest: { extensions?: Record<string, unknown> | undefined },
+): string | undefined {
+  const tenancy = signedTenancy(auth);
+  if (!tenancy) return "no signed tenancy";
+  const ext = manifest.extensions?.["96bulls"];
+  if (ext === undefined) return undefined;
+  if (!isRecord(ext)) return "96bulls extension is malformed";
+  if (ext.user_id !== undefined && ext.user_id !== tenancy.source_user_id)
+    return "96bulls.user_id is not the signed source user";
+  return undefined;
 }
 
 /** An executor that can run work in one transaction (a pg Pool client, PGlite). */
@@ -588,6 +769,7 @@ export function sqlMigrationAssertionLedger(
     throw new Error(`bad migration ledger schema ${schema}`);
   const uses = `${schema}.migration_assertion_uses`;
   const chunks = `${schema}.migration_assertion_chunks`;
+  const audit = `${schema}.migration_ingest_audit`;
   const enqueue =
     options.enqueue ??
     ((tx: SqlExecutor, stage: PipelineStage, message: StageMessage) =>
@@ -648,6 +830,11 @@ export function sqlMigrationAssertionLedger(
     consume(use, stage, message) {
       return sql.transaction(async (tx) => {
         await purge(tx, uses, "jti");
+        // Serializes this grant's consumptions, so two first uses with
+        // different plans cannot both pass the consistency check.
+        await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+          `migration-grant:${use.grantId}`,
+        ]);
         // One grant, one org and one plan: a use that disagrees with the
         // grant's earlier uses is refused, and nothing is written.
         const conflict = await tx.query(
@@ -681,6 +868,22 @@ export function sqlMigrationAssertionLedger(
         if (!rows.length) return "replayed" as const;
         // Throwing here rolls the consumption back with the queue row.
         await enqueue(tx, stage, message);
+        // The durable audit event, in the same transaction: ids, digests and
+        // the work key only (never a token, a signature or chunk bytes).
+        await tx.query(
+          `INSERT INTO ${audit} (grant_id, plan_digest, entry_sha256, work_key,
+                                 org_id, workspace_id, user_id, result)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'committed')`,
+          [
+            use.grantId,
+            use.planDigest,
+            use.planEntryDigest,
+            message.workKey,
+            use.orgId,
+            use.workspaceId,
+            use.userId,
+          ],
+        );
         return "consumed" as const;
       });
     },
@@ -695,6 +898,13 @@ export function sqlMigrationAssertionLedger(
 export class InMemoryMigrationAssertionLedger implements MigrationAssertionLedger {
   readonly uses = new Map<string, MigrationAssertionUse>();
   readonly chunks = new Map<string, MigrationChunkUse>();
+  /** The durable audit events (one per committed consumption). */
+  readonly audit: (Omit<
+    MigrationAssertionUse,
+    "jti" | "nonce" | "expiresAt"
+  > & {
+    workKey: string;
+  })[] = [];
   readonly #nonces = new Map<string, string>();
 
   constructor(
@@ -775,6 +985,15 @@ export class InMemoryMigrationAssertionLedger implements MigrationAssertionLedge
       this.#nonces.delete(use.nonce);
       throw cause;
     }
+    this.audit.push({
+      grantId: use.grantId,
+      planDigest: use.planDigest,
+      planEntryDigest: use.planEntryDigest,
+      orgId: use.orgId,
+      workspaceId: use.workspaceId,
+      userId: use.userId,
+      workKey: message.workKey,
+    });
     return "consumed";
   }
 }

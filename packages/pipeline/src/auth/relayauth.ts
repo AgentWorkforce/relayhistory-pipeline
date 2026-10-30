@@ -336,6 +336,10 @@ function validateClaims(
 
   const now = Math.floor(Date.now() / 1000);
   const skew = migration ? MIGRATION_CLOCK_SKEW_SECONDS : CLOCK_SKEW_SECONDS;
+  // A migration token's whole shape is validated first, so a malformed one
+  // stays terminal (invalid_claims) and only a well-formed, expired one gets
+  // the re-mintable migration_assertion_expired.
+  if (migration) migrationAssertionClaims(claims, now);
   if (typeof claims.exp !== "number" || claims.exp + skew <= now) {
     // A distinct code for an expired migration assertion: the courier
     // re-mints, while any other 401 stays terminal.
@@ -352,7 +356,6 @@ function validateClaims(
   if (!stringClaim(claims, "sub")) {
     throw new IdentityError("invalid_claims", "missing jwt subject");
   }
-  if (migration) migrationAssertionClaims(claims, now);
   return boundHere ? historyOrigin : undefined;
 }
 
@@ -444,8 +447,8 @@ function migrationAssertionClaims(
   if (typeof planDigest !== "string" || !PLAN_DIGEST_SHAPE.test(planDigest)) {
     refuse("planDigest is malformed");
   }
-  // The signed per-upload identity (relayauth#110 amendment), derived by the
-  // issuer from the grant's stored plan.
+  // The signed per-upload identity (relayauth #111), derived by the issuer
+  // from the grant's stored plan.
   const upload = parseUploadIdentity(meta!.upload);
   if (!upload) refuse("upload identity is malformed");
   const sponsorId = stringClaim(claims, "sponsorId");

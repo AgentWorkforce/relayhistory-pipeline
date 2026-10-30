@@ -2,7 +2,7 @@
 
 Status: **binding proposal, code only** (helm-chart-chief contract decision, E3). It is shared by:
 
-- **relayauth #110**, the issuer: it stores the plan, derives the upload identity, and signs it.
+- **relayauth #110 with #111**, the issuer. #111 (`fix(migration): bind grants to canonical upload pairs`, at `c55f1b0b`) stores the plan, derives `meta.upload` and signs it. Its `deriveMigrationGrantPlan` and `migrationUploadIdentity` reproduce these vectors' `plan_digest` and every upload identity byte for byte (checked against `c55f1b0b`). Its verifier also accepts exactly these nine identity fields, as the ingests do.
 - **The #40 courier**: `derivePlanContract`, the mint request's `upload`.
 - **Both ingests**, which recompute the identity from the actual request:
   - relayhistory-cloud #228;
@@ -84,16 +84,50 @@ It binds:
 
 Any difference is **403 `migration_upload_forbidden`**. A fresh machine key, a fresh session key, other content, or another user's upload cannot match.
 
+## Chunk requests carry their plan entry
+
+- A migration chunk request carries the canonical plan entry in front of the chunk bytes.
+- The request body is `canonical(entry)` immediately followed by the chunk's source bytes. Header `X-Relay-Migration-Plan-Entry-Length` gives the entry's byte length, at most 1 MiB.
+- Before storing anything, the ingest checks:
+  - `SHA-256(entry bytes) == upload.entry_sha256`, and the entry bytes are exactly canonical;
+  - the entry's key, tenancy and session are the request's and the signed ones;
+  - its `content_sha256` matches its chunk list;
+  - this chunk's `(seq, epoch, start_offset, bytes, SHA-256 of the actual bytes)` is one of the entry's chunks. So `seq` is always below the entry's chunk count.
+- Otherwise: 403 `migration_upload_forbidden`.
+
+## Manifest provenance and the work key
+
+- **Provenance:** the chunk list, digests, session, state, key, grant, plan and tenancy are bound by `entry_sha256` and the signed tenancy. A manifest with an extra or missing chunk cannot match. The 96Bulls extension's `user_id`, when present, must be the signed canonical source user.
+- **Work key:** it is the signed manifest key plus the version the ingest read back from storage itself. A posted `etag`, `version` or `previousVersion` never feeds it, and a deployment that cannot read storage refuses migration commits (503 `migration_storage_read_required`).
+
+## Audit
+
+- Every committed upload appends one row to `sessions.migration_ingest_audit`: grant, plan digest, entry digest, work key, org, workspace, user, result.
+- The row is written in the same transaction as the replay row and the pipeline job.
+- It holds no token, signature, nonce, `jti` or chunk data.
+- It is append-only (a trigger refuses UPDATE and DELETE). Retention: the export's lifetime plus 400 days, removed only by a reviewed owner migration.
+
+## Clocks
+
+- The ingest allows 5 s of skew.
+- **Issuer more than 5 s ahead:** every assertion is refused as not yet valid (401 `invalid_claims`, terminal).
+- **Issuer more than 5 s behind:** assertions expire early (401 `migration_assertion_expired`; re-mint).
+- Clock-offset monitoring on the issuer, ingest and courier hosts is required (see `docs/relayhistory-t0-runbook.md`).
+
 ## Other rules
 
 - **Chunks:**
   - The ledger allows one chunk per `(jti, seq)`. An identical repeat is idempotent; any other chunk at that seq is 409 `migration_chunk_conflict`.
-  - There are at most 256 chunks per assertion (403 `migration_chunk_limit`). 256 chunks of at most 4 MiB is 1 GiB, which is more than a courier can send in an assertion's 65 seconds; mint again for the rest of the session.
-- **Expiry:** an assertion lives at most 60 s, with 5 s of skew. When `exp + 5 <= now`, the response is **401 `migration_assertion_expired`**: re-mint. Every other 401 (`invalid_token`, including a bad signature, and `invalid_claims`) is terminal.
+  - There are at most 256 chunks per assertion (403 `migration_chunk_limit`). The route accepts up to 16 MiB per chunk (the courier seals at 4 MiB), so this is up to 4 GiB, far more than a courier can send in an assertion's 65 seconds. Mint again for the rest of the session.
+- **Expiry:** an assertion lives at most 60 s, with 5 s of skew.
+  - The token's shape is validated first.
+  - A well-formed token with `exp + 5 <= now` gets **401 `migration_assertion_expired`**: re-mint.
+  - Every other 401 is terminal: `invalid_token` (including a bad signature), and `invalid_claims` (including a malformed expired token, or one issued more than 5 s in the future).
 - **Replay:** 409 `migration_assertion_replayed` means mint a fresh assertion; an identical retry is idempotent. 503 `migration_ledger_unavailable` fails closed.
-- **Retention:**
-  - There is no cron. Each ledger insert deletes at most 100 rows whose `expires_at` (`exp + 5 s`) passed more than 5 minutes ago.
-  - An expired token is refused before the ledger is read, so a purged `jti` or nonce is never accepted again.
+- **Replay retention:**
+  - There is no cron. Each ledger insert deletes at most 100 replay rows whose `expires_at` (`exp + 5 s`) passed more than 5 minutes ago.
+  - An expired token is refused before the ledger is read, so a purged token is never accepted again.
+  - Nonce uniqueness holds only within validity plus margin. After a purge, a **new**, valid token may carry the same nonce and is accepted.
 
 ## Known limit
 

@@ -2,6 +2,7 @@ import { Hono, type Context } from "hono";
 import { createMiddleware } from "hono/factory";
 import {
   migrationGrantAllowed,
+  migrationManifestProvenance,
   migrationPairAuthorized,
   migrationSessionMatches,
   migrationUploadMatches,
@@ -223,12 +224,17 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
    * A migration assertion's manifest: the target workspace is the signed pair's
    * (403 migration_workspace_forbidden), and the upload identity recomputed
    * from this key and manifest (session, state, chunk list, content hash
-   * chain, entry digest) is the signed one (403 migration_upload_forbidden).
+   * chain, entry digest) is the signed one, and 96bulls.user_id is the signed
+   * source user (403 migration_upload_forbidden). The work key is the signed
+   * manifest key plus the version the server read back itself (`read`),
+   * never a client-posted value.
    */
   const migrationManifestIssue = async (c: Context<AppEnv>, auth: Auth, location: NonNullable<ReturnType<typeof parseSessionKey>>, manifest: ManifestV1) => {
     if (!migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId, manifest.session.workspace_id] }))
       return workspaceForbidden(c);
     if (!(await migrationUploadMatches(auth, location, manifest))) return uploadForbidden(c);
+    // 96bulls.user_id (the session's user downstream) must be the signed source user.
+    if (migrationManifestProvenance(auth, manifest)) return uploadForbidden(c);
     return undefined;
   };
 

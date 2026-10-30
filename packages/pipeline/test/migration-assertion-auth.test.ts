@@ -212,6 +212,19 @@ describe("canonical ids and the upload identity shape", () => {
     expect((await request("/v1/pipeline/manifests", prefixed)).status).toBe(200);
   });
 
+  it("validates the shape before answering expired: a malformed expired token stays terminal", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    for (const token of [
+      migrationToken({ iat: now - 56, exp: now - 6 }, { nonce: "short" }),
+      migrationToken({ iat: now - 56, exp: now - 6 }, { upload: { ...UPLOAD, extra: "x" } }),
+      migrationToken({ iat: now - 56, exp: now - 6, token_type: "id" }),
+    ]) {
+      const response = await app()("/v1/pipeline/manifests", token);
+      expect(response.status).toBe(401);
+      expect(await code(response)).toBe("invalid_claims");
+    }
+  });
+
   it("keeps a bad signature terminal (invalid_token), even when also expired", async () => {
     const now = Math.floor(Date.now() / 1000);
     const [head, body] = migrationToken({ iat: now - 56, exp: now - 6 }).split(".");

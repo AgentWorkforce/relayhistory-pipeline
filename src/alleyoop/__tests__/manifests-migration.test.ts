@@ -259,14 +259,18 @@ describe("AlleyOop manifest route: migration assertions", () => {
     holder.reader = f.reader;
     const auth = f.as();
     const manifest = await f.build();
+    const auditBefore = await count("sessions.migration_ingest_audit");
     const failed = await f.post(auth, manifest);
     expect(failed.status).toBe(503);
     expect(await code(failed)).toBe("migration_ledger_unavailable");
     expect(await count("sessions.migration_assertion_uses")).toBe(0);
     expect(await count("sessions.pipeline_jobs")).toBe(0);
+    // The durable audit row rolls back with them.
+    expect(await count("sessions.migration_ingest_audit")).toBe(auditBefore);
     crash = false;
     // Nothing was spent: the same assertion commits the identical manifest once.
     expect((await f.post(auth, manifest)).status).toBe(202);
+    expect(await count("sessions.migration_ingest_audit")).toBe(auditBefore + 1);
     expect(await count("sessions.migration_assertion_uses")).toBe(1);
     expect(await count("sessions.pipeline_jobs")).toBe(1);
   });
@@ -325,6 +329,9 @@ describe("AlleyOop manifest route: migration assertions", () => {
       ["migration_upload_forbidden", f.as({}, { upload: bUpload }), manifest],
       ["migration_upload_forbidden", f.as({}, { upload: { ...f.upload, plan_digest: OTHER_PLAN } }), manifest],
       ["migration_upload_forbidden", f.as({}, { upload: { ...f.upload, grant_id: "mgr_other" } }), manifest],
+      // Provenance: 96bulls.user_id must be the signed canonical source user.
+      ["migration_upload_forbidden", f.as(), await f.build({ user_id: "user_b" })],
+      ["migration_upload_forbidden", f.as(), await f.build({ user_id: `relay_${USER}` })],
     ];
     for (const [expected, auth, body, at, envOverride] of cases) {
       const response = await f.post(auth, body, at ?? f.key, envOverride ?? {});
@@ -343,7 +350,7 @@ describe("AlleyOop manifest route: migration assertions", () => {
       { sponsorId: `relay_${USER}`, wks: `relay_${WORKSPACE}`, org: `relay_${ORG}` },
       { sourceUserId: `relay_${USER}`, workspaceId: `relay_${WORKSPACE}` },
     );
-    expect((await f.post(prefixed, await f.build())).status).toBe(202);
+    expect((await f.post(prefixed, await f.build({ user_id: USER }))).status).toBe(202);
     // A different id is a mismatch, prefix or not.
     const other = f.as({ sponsorId: "relay_user_x" }, { sourceUserId: "relay_user_x" });
     const response = await f.post(other, await f.build());

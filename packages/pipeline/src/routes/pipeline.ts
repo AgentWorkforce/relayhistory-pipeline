@@ -28,10 +28,14 @@ import {
   type StageMessage,
 } from "../lib/pipeline/index.js";
 import {
+  MAX_PLAN_ENTRY_BYTES,
+  migrationChunkMatches,
   migrationGrantAllowed,
+  migrationManifestProvenance,
   migrationPairAuthorized,
   migrationSessionMatches,
   migrationUploadMatches,
+  PLAN_ENTRY_LENGTH_HEADER,
   type MigrationAssertionLedger,
   type MigrationChunkResult,
 } from "../lib/pipeline/migration-assertions.js";
@@ -246,6 +250,15 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
   routes.use("/pipeline/chunks", migrationAdmission);
   routes.use("/pipeline/manifests", migrationAdmission);
   routes.use("/pipeline/manifests/status", migrationAdmission);
+
+  function storageReadRequired(c: AppContext) {
+    return error(
+      c,
+      503,
+      "migration_storage_read_required",
+      "A migration commit needs the server to read the manifest from object storage",
+    );
+  }
 
   function uploadForbidden(c: AppContext) {
     return error(
@@ -534,6 +547,12 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
       // session and chunk list, and the content hash chain over it.
       if (!(await migrationUploadMatches(auth, location, manifest)))
         return uploadForbidden(c);
+      if (migrationManifestProvenance(auth, manifest))
+        return uploadForbidden(c);
+      // Signed-only work-key inputs: the key is the signed manifest key, and
+      // the version must be the one the server read from storage, never a
+      // client-posted etag or version.
+      if (!reader) return storageReadRequired(c);
       // The commit's only durable write is the enqueue: the ledger consumes the
       // assertion and enqueues as one unit, so neither lands without the other.
       // A failure leaves nothing consumed, and the upload may be retried.
@@ -641,14 +660,41 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     // before the first write (fresh keys included).
     if (migration && !migrationSessionMatches(chunkAuth, location))
       return uploadForbidden(c);
+    // A migration chunk carries its signed plan entry in front of the bytes.
+    const entryLength = migration
+      ? Number(c.req.header(PLAN_ENTRY_LENGTH_HEADER) ?? NaN)
+      : 0;
+    if (
+      migration &&
+      (!Number.isSafeInteger(entryLength) ||
+        entryLength < 2 ||
+        entryLength > MAX_PLAN_ENTRY_BYTES)
+    )
+      return uploadForbidden(c);
+    const limit = MAX_CHUNK_BYTES + entryLength;
     const declared = Number(c.req.header("content-length") ?? NaN);
-    if (declared > MAX_CHUNK_BYTES)
+    if (declared > limit)
       return error(c, 413, "too_large", "chunk exceeds the size limit");
     // Bounded while reading: the declared length may be absent or wrong.
-    const source = await readCapped(c.req.raw.body, MAX_CHUNK_BYTES);
-    if (!source)
+    const body = await readCapped(c.req.raw.body, limit);
+    if (!body || body.byteLength - entryLength > MAX_CHUNK_BYTES)
       return error(c, 413, "too_large", "chunk exceeds the size limit");
+    if (migration && body.byteLength <= entryLength) return uploadForbidden(c);
+    const source = migration ? body.subarray(entryLength) : body;
     if (migration) {
+      // Before anything is stored: the carried entry is the signed one, and
+      // this chunk (seq, epoch, offset, size, digest of these bytes) is one
+      // of its chunks; so seq < the entry's chunk count.
+      const entryText = new TextDecoder().decode(body.subarray(0, entryLength));
+      if (
+        !(await migrationChunkMatches(
+          chunkAuth,
+          location,
+          { seq, epoch, startOffset, bytes: source },
+          entryText,
+        ))
+      )
+        return uploadForbidden(c);
       // At most one chunk per (assertion, seq): a repeat is idempotent, any
       // other chunk at this seq is refused; and a strict per-assertion cap.
       let held: MigrationChunkResult;
