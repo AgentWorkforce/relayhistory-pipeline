@@ -109,7 +109,8 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     are generated for old sessions. `ON CONFLICT DO NOTHING` keeps every row
     written after T0.
     ```sh
-    bun run migration:copy --mode=backfill --tables=<every legacy table, parents first> \
+    # every legacy table except per-database state (__migrations, *_rollout)
+    bun run migration:copy --mode=backfill --tables=<legacy tables> \
       --chunk-size=500 --checkpoint=/secure/t0/backfill.json
     ```
     Resume with the same checkpoint. Throttle by running it off-peak if
@@ -123,6 +124,18 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     session with a `convergence_events` row on both sides of T0.
 14. **[A9]** Once the backfill verifier passes for every table, remove the
     Neon read fallback.
+
+## Rehearsal evidence
+
+`scripts/rehearse-relayhistory-t0.sh` runs the data path on two throwaway
+PostgreSQL 17 + pgvector containers: both schemas, a seed with live triggers,
+schema verify, copy-set mirror, backfill and full verify. On 2026-10-30 (linuyc,
+relayhistory-cloud `feat/t0-cutover-gate`, this branch) the schema verify
+passed, the mirror copied the copy set, and the backfill copied every remaining
+table (including `session_rollups` and `session_timing_cache` through the
+nullable-key path). Full verify passed on all 55 tables, with the five
+per-database state tables skipped. The outbox and revision-event counts on the
+target equalled the source's: copies, not trigger output.
 
 ## Rollback
 
