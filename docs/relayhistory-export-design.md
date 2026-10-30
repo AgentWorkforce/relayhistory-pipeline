@@ -118,9 +118,14 @@ manifest body.
 - **O5 (first measurement):** a read-only dry run over the 50 newest Neon
   sessions (2026-10-30) gave 50 machine streams, 280,144 records, 560 MB of
   raw ndjson and 169 chunks, with none fenced. The newest sessions are the
-  largest, so this doesn't extrapolate linearly to 116,117 sessions. A
-  stratified sample is still needed for the total stored size and the PUT
-  count per workspace (KMS request cost, P9).
+  largest, so this doesn't extrapolate linearly. A random sample of 120 of
+  the 116,180 sessions (read-only) gave:
+  - mean 0.83 MB per session; p50 175 KB, p90 1.7 MB, p99 11.5 MB, max
+    12 MB; none fenced or empty;
+  - extrapolated across all sessions: about 96.5 GB of raw ndjson in about
+    124k chunks;
+  - after zstd, roughly 12–20 GB stored, and about 240k PUTs including the
+    manifests. That PUT count sizes the KMS request cost (P9).
 - **O6 (resolved): ingest-API sessions.** About 0.3% of events have no
   delivery record. They come from server-side harnesses (`chatgpt`,
   `grok-bot`) that upload through the ingest API, and 4 of the 50 newest
