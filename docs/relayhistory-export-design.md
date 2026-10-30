@@ -103,6 +103,9 @@ responses, then stop. Any other 401 or 403 (including
 `migration_upload_forbidden`) stops the run; 409 `migration_chunk_conflict`
 fails that manifest. 503 `migration_storage_read_required` (an ingest that
 cannot read the commit back from storage) stops the run without backoff.
+409 `activation_required` (the O4 gate, #51) is neither a lost race nor
+terminal: the courier waits a bounded number of times with fresh assertions,
+then defers the manifest (re-queued and reported) and moves on.
 Each chunk request carries `canonical(plan entry)` in front of its source
 bytes, with the entry's length in `X-Relay-Migration-Plan-Entry-Length`.
 The commit's work key must be exactly `upload.key + "@" + upload.entry_sha256`
