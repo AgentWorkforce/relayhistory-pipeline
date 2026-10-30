@@ -39,7 +39,16 @@ action.
 | P8b | V2 search store: ClickHouse or ObsessionDB loaded from normalized S3 objects | later | Text/n-gram indexes, S3 ingest, per-org isolation and tombstone propagation all proven |
 | P9 | S3 encryption: KMS with a key per workspace, key policy and alias scheme, decided before the bulk move (re-encrypting later means rewriting objects) | sessionspipelinegrok + Khaliq | Key design recorded; exporter writes with the workspace key |
 
-## Sequence
+## Sequence (switch-first; see 0002)
+
+Export-only work no longer gates T0: the RelayAuth migration assertion, the
+migration key, single-use ingest, the exporter upload and the transform for
+exported sessions. T0 needs only the gate and hold (#224), the driver (#225),
+the re-pointed reads with the Neon read fallback (P3), the Cloud consumers
+(P4), agent-name placement (P5), the KMS keys for new writes (P9), and the
+search erasure decision (P8a).
+
+The original S3-first order below is kept for reference only.
 
 1. P1 to P5 in code, plus rehearsal. P6 and P7 reach PASS.
 2. **[A3]** Apply the 96Bulls Supabase migrations (index tables) to
@@ -64,6 +73,20 @@ action.
   renumbered away from 0066 and from #222's 0067. The same check found #224's
   `sessions.cutover_fence` absent from all 8 Neon branches and both Supabase
   projects.
+
+## Protecting Neon until it retires
+
+- **Export reads:** from a Neon child branch created at T0 (copy-on-write,
+  separate compute), never from the production compute. Creating it needs
+  Khaliq's OK.
+- **Read fallback:** reads only sessions not yet exported, bounded per
+  request, and removed per session as the export lands.
+- **Load relief available before T0, each needing Khaliq's OK:**
+  - raise the production compute's autoscaling maximum;
+  - install `pg_stat_statements` to find the expensive query shapes;
+  - review `work_mem` given 1.35 TB of temp spill;
+  - schedule vacuum on the bloated tables (e.g. 8.9M dead tuples in
+    `delivery_projection_acceptance`).
 
 ## Open questions
 

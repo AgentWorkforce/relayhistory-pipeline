@@ -32,9 +32,18 @@ which copied Neon's `sessions` schema, content included, into Supabase Postgres.
     encryption.
   - Embeddings are backfilled from S3 after the raw content is in place, not
     at ingest.
-- **Sequencing is S3-first.** All existing Neon raw data moves to S3 before
-  RelayHistory writes through the pipeline, and relayhistory-cloud #224's
-  data-loss fix lands before any Neon-to-S3 bulk move.
+- **Sequencing is switch-first (Khaliq, 2026-10-30, superseding S3-first).**
+  New writes move to the pipeline at T0. History is exported to S3 afterwards,
+  and until a session is exported the Worker reads it from Neon, read-only.
+  No state may be broken: every intermediate state serves complete reads, and
+  the switch can be aborted before the flip. relayhistory-cloud #224's
+  data-loss fix still lands before T0 and before any bulk export.
+- **Neon must not be put at risk.** Today it shows a 91% cache hit rate,
+  1.35 TB of temp spill, millions of dead tuples and 56 deadlocks
+  (read-only check, 2026-10-30). The export therefore reads from a Neon child
+  branch taken at T0, with its own compute, never from the production
+  compute. The read fallback is bounded and drops once a session is exported.
+  After T0, Neon production takes no writes.
 
 ## How each existing query surface is served
 
