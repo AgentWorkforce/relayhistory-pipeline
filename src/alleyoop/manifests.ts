@@ -215,6 +215,8 @@ function manifestOwnerIssue(
     !exportMarker(incoming)
   )
     return "migration is not an append-only backfill epoch";
+  const issue = backfillWriteIssues(existing, incoming, migration)[0];
+  if (issue) return issue;
 
   for (const [key, value] of Object.entries(existing.extensions ?? {})) {
     if (key === "client.relayhistory_export") continue;
