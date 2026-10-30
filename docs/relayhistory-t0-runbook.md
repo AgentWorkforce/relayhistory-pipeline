@@ -54,7 +54,9 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
    On an empty database each rollout completes immediately. Then run the live
    schema check:
    `bun run migration:verify --mode=schema --emit-sequence-fence > /secure/t0/schema.json`.
-   `passed` must be `true`.
+   `passed` must be `true`. It covers columns and every index (valid only),
+   constraint, function and trigger on Neon, so a missing rollout trigger or
+   search index fails the gate.
 3. **Measure the copy set (read-only on Neon):**
    `SELECT relname, pg_total_relation_size(oid), n_live_tup FROM pg_stat_user_tables WHERE schemaname = 'sessions'`.
    Decide whether `delivery_origins` and `delivery_receipts` stay in the copy
@@ -64,7 +66,10 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
    ```sh
    COPY_SET=auth_sessions,deleted_upload_sessions,session_resets,upload_cleanup_origins,upload_cleanup_tombstones,machines,probe_connections,project_aliases,github_org_links,delivery_origins,delivery_receipts
    # machines is shared with the 96Bulls pipeline: never delete its pipeline-only rows
-   bun run migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --chunk-size=1000 > /secure/t0/precopy.json
+   # dry run first (read-only), then the same command with the guard:
+   bun run migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --chunk-size=1000
+   bun run migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --chunk-size=1000 \
+     --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq > /secure/t0/precopy.json
    # apply the sequenceFenceSql statements from /secure/t0/schema.json on Supabase
    ```
 5. **[A5] Deploy the gate and the driver.** The phase stays `neon`. Check that
@@ -94,7 +99,7 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
    function, which catches the `SECURITY DEFINER` writers. Reads and stable
    functions keep working, and Cloud's `public` schema is untouched.
 10. **Catch up:** run
-    `migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines`
+    `migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq`
     again.
     Then re-run the schema check and confirm every target sequence is above
     the source (the `sequences[].ready` field).
@@ -119,8 +124,13 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     ```sh
     # every legacy table except per-database state (__migrations, *_rollout)
     bun run migration:copy --mode=backfill --tables=<legacy tables> \
-      --chunk-size=500 --checkpoint=/secure/t0/backfill.json
+      --chunk-size=500 --checkpoint=/secure/t0/backfill.json \
+      --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq
     ```
+    The backfill never brings back what users deleted on Supabase after T0. It
+    skips rows matching a `deleted_upload_sessions` tombstone, and all history
+    of users with a reset recorded after T0. Each page runs under the same
+    per-user advisory locks as the deletion functions.
     Resume with the same checkpoint. Throttle by running it off-peak if
     Supabase p95 rises.
     **Straddling sessions** (rows on both sides of T0): their rollups and
@@ -128,7 +138,8 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     rebuild them through the live triggers (a normal session, small
     transactions):
     ```sh
-    bun run migration:rebuild --since=<T0 ISO timestamp> --batch=200
+    bun run migration:rebuild --since=<T0 ISO timestamp> --batch=200 \
+      --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq
     ```
     It marks every session with an event at or after T0 in
     `session_rollup_dirty` and `onboarding_rollup_dirty`. Their deferred
@@ -138,8 +149,10 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     delivery projection built after T0 for a straddling session reflect only
     post-T0 records. They need a reprojection pass, owned with the index
     contract (helm-chart-chief, #27).
-14. **[A9]** Once the backfill verifier passes for every table, remove the
-    Neon read fallback.
+14. **[A9]** Remove the Neon read fallback only once
+    `migration:copy --mode=check --tables=<all legacy tables>` exits 0 (no
+    source row missing on Supabase), the straddling rebuild has run, and the
+    catalog reprojection gate is green.
 
 ## Rehearsal evidence
 

@@ -107,6 +107,73 @@ export function chunkUpperBoundSql(
   ) AS verify_chunk ORDER BY ${keyColumns.map((column) => `${quoteIdent(column)} DESC`).join(", ")} LIMIT 1`;
 }
 
+export interface CatalogObjects {
+  indexes: Map<string, string>;
+  constraints: Map<string, string>;
+  functions: Set<string>;
+  triggers: Map<string, string>;
+}
+
+/**
+ * The live sessions schema beyond columns: indexes (including those the runner
+ * builds CONCURRENTLY), constraints, functions and triggers. A missing rollout
+ * trigger or search index would otherwise pass the T0 gate.
+ */
+async function catalogObjects(pool: pg.Pool): Promise<CatalogObjects> {
+  const [indexes, constraints, functions, triggers] = await Promise.all([
+    pool.query<{ name: string; def: string; valid: boolean }>(
+      `SELECT i.indexname AS name, i.indexdef AS def, x.indisvalid AS valid
+         FROM pg_indexes i
+         JOIN pg_class c ON c.relname = i.indexname
+         JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = i.schemaname
+         JOIN pg_index x ON x.indexrelid = c.oid
+        WHERE i.schemaname = 'sessions'`,
+    ),
+    pool.query<{ key: string; def: string }>(
+      `SELECT c.relname || '.' || k.conname AS key, pg_get_constraintdef(k.oid) AS def
+         FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'sessions' AND NOT c.relispartition`,
+    ),
+    pool.query<{ sig: string }>(
+      `SELECT p.oid::regprocedure::text AS sig FROM pg_proc p
+         JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'sessions'`,
+    ),
+    pool.query<{ key: string; def: string }>(
+      `SELECT c.relname || '.' || t.tgname AS key, pg_get_triggerdef(t.oid) AS def
+         FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'sessions' AND NOT t.tgisinternal AND NOT c.relispartition`,
+    ),
+  ]);
+  return {
+    // An INVALID index (interrupted CONCURRENTLY build) does not count as present.
+    indexes: new Map(indexes.rows.filter((row) => row.valid).map((row) => [row.name, row.def])),
+    constraints: new Map(constraints.rows.map((row) => [row.key, row.def])),
+    functions: new Set(functions.rows.map((row) => row.sig)),
+    triggers: new Map(triggers.rows.map((row) => [row.key, row.def])),
+  };
+}
+
+/** Every source object the target lacks or defines differently. */
+export function missingObjects(source: CatalogObjects, target: CatalogObjects): string[] {
+  const out: string[] = [];
+  for (const [kind, from, to] of [
+    ["index", source.indexes, target.indexes],
+    ["constraint", source.constraints, target.constraints],
+    ["trigger", source.triggers, target.triggers],
+  ] as const) {
+    for (const [name, def] of from) {
+      const found = to.get(name);
+      if (found === undefined) out.push(`missing ${kind} ${name}`);
+      else if (found !== def) out.push(`different ${kind} ${name}`);
+    }
+  }
+  for (const signature of source.functions)
+    if (!target.functions.has(signature)) out.push(`missing function ${signature}`);
+  return out.sort();
+}
+
 /** Each database's own ledger and rollout progress: never copied, never compared. */
 export function isPerDatabaseState(table: string): boolean {
   return table === "__migrations" || table.endsWith("_rollout");
@@ -441,6 +508,9 @@ export async function main() {
       }
       results.push(result);
     }
+    const [sourceObjects, targetObjects] = await Promise.all([catalogObjects(source), catalogObjects(target)]);
+    const objectGaps = missingObjects(sourceObjects, targetObjects);
+    if (objectGaps.length) passed = false;
     const [sourceSequences, targetSequences] = await Promise.all([sequences(source), sequences(target)]);
     const targetByName = new Map(targetSequences.map((item) => [item.name, item.lastValue]));
     const sequenceResults = sourceSequences.map((item) => {
@@ -460,6 +530,7 @@ export async function main() {
         completedTables: Object.values(checkpoint.tables).filter((table) => table.complete).length,
       },
       tables: results,
+      objects: { checked: sourceObjects.indexes.size + sourceObjects.constraints.size + sourceObjects.functions.size + sourceObjects.triggers.size, missing: objectGaps },
       sequences: sequenceResults,
     };
     if (process.argv.includes("--emit-sequence-fence")) output.sequenceFenceSql = sequenceFenceSql(sourceSequences);

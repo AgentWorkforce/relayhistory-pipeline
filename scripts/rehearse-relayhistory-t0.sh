@@ -11,6 +11,7 @@
 #      migration:copy backfill (every other table), migration:verify --mode=full
 #
 # Usage: scripts/rehearse-relayhistory-t0.sh [relayhistory-cloud ref] [96BullSessions ref]
+#   BULLS_TARBALL=/path/to.tar  use a local 96BullSessions tree (git archive) instead of cloning
 set -euo pipefail
 RH_REF=${1:-feat/t0-cutover-gate}
 BULLS_REF=${2:-feat/supabase-production-migration}
@@ -29,7 +30,11 @@ trap cleanup EXIT
 step() { printf '\n== %s\n' "$*"; }
 
 git clone -q --depth 1 -b "$RH_REF" git@github.com:AgentWorkforce/relayhistory-cloud.git "$WORK/rh"
-git clone -q --depth 1 -b "$BULLS_REF" git@github.com:AgentWorkforce/96BullSessions.git "$WORK/bulls"
+if [ -n "${BULLS_TARBALL:-}" ]; then
+  mkdir -p "$WORK/bulls" && tar -xf "$BULLS_TARBALL" -C "$WORK/bulls"
+else
+  git clone -q --depth 1 -b "$BULLS_REF" git@github.com:AgentWorkforce/96BullSessions.git "$WORK/bulls"
+fi
 
 docker network create "$NAME" >/dev/null
 for db in src dst; do
@@ -91,11 +96,17 @@ docker run --rm --network "$NAME" -v "$WORK/bulls":/bulls -w /bulls \
   bun install --frozen-lockfile >/dev/null 2>&1
   set -e
   bun run src/migration/relayhistory-verify.ts --mode=schema > /tmp/schema.json || true
-  bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/schema.json\",\"utf8\"));console.log(\"schema passed:\",r.passed,\"| incompatible:\",r.tables.filter(t=>t.schema!==\"compatible\").map(t=>t.table).join(\" \")||\"none\")'
-  bun run src/migration/relayhistory-copy.ts --mode=mirror --tables=$COPY_SET --keep-target-only=machines --chunk-size=7 \
+  bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/schema.json\",\"utf8\"));console.log(\"schema passed:\",r.passed,\"| incompatible:\",r.tables.filter(t=>t.schema!==\"compatible\").map(t=>t.table).join(\" \")||\"none\",\"| objects checked:\",r.objects.checked,\"missing:\",r.objects.missing.length)'
+  bun run src/migration/relayhistory-copy.ts --mode=mirror --tables=$COPY_SET --keep-target-only=machines --chunk-size=7 --execute --expect-target-host=$NAME-dst \
     | bun -e 'const r=JSON.parse(await Bun.stdin.text());console.log(\"mirror:\",r.tables.map(t=>t.table+\"=\"+t.read+\"/\"+t.written).join(\" \"))'
-  bun run src/migration/relayhistory-copy.ts --mode=backfill --tables=$REST --chunk-size=97 --checkpoint=/tmp/backfill.json \
+  bun run src/migration/relayhistory-copy.ts --mode=backfill --tables=$REST --chunk-size=97 --checkpoint=/tmp/backfill.json --execute --expect-target-host=$NAME-dst \
     | bun -e 'const r=JSON.parse(await Bun.stdin.text());console.log(\"backfill:\",r.tables.filter(t=>t.read).map(t=>t.table+\"=\"+t.read+\"/\"+t.written).join(\" \"))'
+  bun run src/migration/relayhistory-copy.ts --mode=check --tables=$REST,$COPY_SET --chunk-size=211 > /tmp/check.json || true
+  bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/check.json\",\"utf8\"));console.log(\"check: missing rows\",r.tables.reduce((n,t)=>n+t.missing,0))'
+  # Guard: without --execute nothing is written; a swapped target is refused.
+  bun run src/migration/relayhistory-copy.ts --mode=backfill --tables=convergence_events > /tmp/dry.json && bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/dry.json\",\"utf8\"));console.log(\"dry run:\",r.dryRun,\"written\",r.tables[0].written)'
+  RELAYHISTORY_SOURCE_URL=\"\$BULLS_TARGET_URL\" BULLS_TARGET_URL=\"\$RELAYHISTORY_SOURCE_URL\" bun run src/migration/relayhistory-copy.ts --mode=backfill --tables=convergence_events --execute --expect-target-host=$NAME-dst 2>&1 | grep -o \"refusing to write\" | sed \"s/^/swapped URLs: /\"
+  bun run src/migration/relayhistory-rebuild.ts --since=2026-10-01T10:00:00Z --batch=7 --execute --expect-target-host=$NAME-dst | bun -e 'const r=JSON.parse(await Bun.stdin.text());console.log(\"rebuild:\",r.sessions,\"sessions\")'
   bun run src/migration/relayhistory-verify.ts --mode=full --chunk-size=113 > /tmp/full.json || true
   bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/full.json\",\"utf8\"));const bad=r.tables.filter(t=>t.data&&t.data!==\"equal\"||t.schema!==\"compatible\");console.log(\"full verify passed:\",r.passed,\"| tables:\",r.tables.length,\"| not equal:\",bad.map(t=>t.table+\":\"+(t.data||t.schema)).join(\" \")||\"none\")'
 "

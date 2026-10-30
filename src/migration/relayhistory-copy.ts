@@ -8,6 +8,9 @@
  *            Supabase has taken no writes of its own.
  *   backfill History after T0. Missing rows are inserted, newest key first;
  *            rows that already exist (written after T0) are never touched.
+ *   check    Read-only: count source rows whose key Supabase lacks. Zero for
+ *            every table is the criterion for removing the Neon read fallback
+ *            (exit status 2 otherwise).
  *
  * Rows move as JSON through jsonb_populate_recordset, so every column type
  * (jsonb, arrays, timestamps, bytea, vector) is converted by Postgres itself.
@@ -16,14 +19,16 @@
  * resumable from a checkpoint. Nothing here prints row contents or URLs.
  *
  * Usage: RELAYHISTORY_SOURCE_URL=... BULLS_TARGET_URL=... \
- *   bun run migration:copy --mode=mirror|backfill --tables=a,b [--chunk-size=500]
- *   [--checkpoint=/secure/path.json] [--keep-target-only=machines] [--dry-run]
+ *   bun run migration:copy --mode=mirror|backfill|check --tables=a,b [--chunk-size=500]
+ *   [--checkpoint=/secure/path.json] [--keep-target-only=machines]
+ *   [--execute --expect-supabase-ref=<ref>]   (without --execute: a read-only dry run)
  */
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import pg from "pg";
+import { guardFromArgv } from "./target-guard.js";
 
-export type CopyMode = "mirror" | "backfill";
+export type CopyMode = "mirror" | "backfill" | "check";
 
 /** The query surface shared by node-postgres and PGlite. */
 export interface Queryable {
@@ -52,6 +57,8 @@ export interface TableResult {
   read: number;
   written: number;
   deleted: number;
+  /** check mode: source rows whose key the target lacks. */
+  missing: number;
   pages: number;
   after: unknown[] | null;
   complete: boolean;
@@ -174,7 +181,7 @@ function keyParams(columns: string[], first: number): string {
  */
 export function pageSql(plan: TablePlan, mode: CopyMode, hasAfter: boolean): string {
   const projection = plan.columns.map(quoteIdent).join(", ");
-  const forward = mode !== "backfill";
+  const forward = mode === "mirror";
   const where = hasAfter
     ? ` WHERE ${orderTuple(plan.order)} ${forward ? ">" : "<"} ${keyParams(plan.order, 2)}`
     : "";
@@ -189,10 +196,12 @@ export function pageSql(plan: TablePlan, mode: CopyMode, hasAfter: boolean): str
          (SELECT ${lastKey} FROM page ORDER BY ${order(!forward)} LIMIT 1) AS last`;
 }
 
-export function writeSql(plan: TablePlan, mode: CopyMode): string {
+export function writeSql(plan: TablePlan, mode: CopyMode, fenced = false): string {
   const columns = plan.columns.map(quoteIdent).join(", ");
   const insert = `INSERT INTO ${qualified(plan.table)} (${columns})
-    SELECT ${columns} FROM jsonb_populate_recordset(NULL::${qualified(plan.table)}, $1::jsonb)`;
+    SELECT ${columns} FROM jsonb_populate_recordset(NULL::${qualified(plan.table)}, $1::jsonb) s${
+      mode === "backfill" && fenced ? tombstoneFilter(plan) : ""
+    }`;
   const conflict = `ON CONFLICT (${plan.key.map(quoteIdent).join(", ")})`;
   if (mode === "backfill") return `${insert} ${conflict} DO NOTHING`;
   const updates = plan.columns.filter((column) => !plan.key.includes(column));
@@ -216,6 +225,103 @@ export function staleKeysSql(plan: TablePlan, hasAfter: boolean): string {
         SELECT ${keys} FROM jsonb_populate_recordset(NULL::${qualified(plan.table)}, $${upperStart + plan.key.length}::jsonb)))`;
 }
 
+const TOMBSTONE_COLUMNS = ["org_id", "workspace_id", "user_id", "origin_id", "source", "session_id"];
+
+/**
+ * Backfill must not resurrect what users deleted on Supabase after T0. A hard
+ * delete leaves no key to conflict with, so each row is checked against:
+ *   - sessions.deleted_upload_sessions, matched on every tombstone column the
+ *     table has (it needs at least org_id and session_id);
+ *   - resets recorded on Supabase after T0 (pg_temp.backfill_resets): a reset
+ *     deletes everything the user had, so none of the user's history returns.
+ *     Tables without user columns match the reset users' sessions instead.
+ */
+export function tombstoneFilter(plan: TablePlan): string {
+  const has = (column: string) => plan.columns.includes(column);
+  const parts: string[] = [];
+  if (has("org_id") && has("session_id")) {
+    const match = TOMBSTONE_COLUMNS.filter(has)
+      .map((column) => `d.${quoteIdent(column)} = s.${quoteIdent(column)}`)
+      .join(" AND ");
+    parts.push(`NOT EXISTS (SELECT 1 FROM sessions.deleted_upload_sessions d WHERE ${match})`);
+  }
+  if (has("org_id") && has("workspace_id") && has("user_id"))
+    parts.push(
+      "NOT EXISTS (SELECT 1 FROM pg_temp.backfill_resets r WHERE r.org_id = s.org_id AND r.workspace_id = s.workspace_id AND r.user_id = s.user_id)",
+    );
+  else if (has("org_id") && has("session_id"))
+    parts.push(
+      "NOT EXISTS (SELECT 1 FROM pg_temp.backfill_reset_sessions r WHERE r.org_id = s.org_id AND r.session_id = s.session_id)",
+    );
+  return parts.length ? ` WHERE ${parts.join(" AND ")}` : "";
+}
+
+/**
+ * The same per-user lock the deletion functions take
+ * (set_session_uploads, reset_uploaded_sessions), so a deletion either commits
+ * before this page's insert sees the tombstone, or waits and deletes it.
+ */
+export function deletionLockSql(plan: TablePlan): string | null {
+  if (!["org_id", "workspace_id", "user_id"].every((column) => plan.columns.includes(column)))
+    return null;
+  return `SELECT pg_advisory_xact_lock(hashtextextended(jsonb_build_array(org_id, workspace_id, user_id)::text, 0))
+    FROM (SELECT DISTINCT org_id, workspace_id, user_id
+            FROM jsonb_populate_recordset(NULL::${qualified(plan.table)}, $1::jsonb)
+           ORDER BY 1, 2, 3) AS users`;
+}
+
+/**
+ * Load the backfill's deletion fences into this target session: resets that
+ * exist on Supabase but not on Neon were made after T0. Fails closed if the
+ * tombstone tables are missing.
+ */
+export async function prepareBackfillFence(source: Queryable, target: Queryable): Promise<void> {
+  const sourceResets = await source.query<{ keys: string }>(
+    `SELECT coalesce(json_agg(json_build_array(org_id, workspace_id, user_id, request_id))::text, '[]') AS keys
+       FROM sessions.session_resets`,
+  );
+  await target.query(`CREATE TEMP TABLE IF NOT EXISTS backfill_resets (
+    org_id text, workspace_id text, user_id text, PRIMARY KEY (org_id, workspace_id, user_id))`);
+  await target.query(`CREATE TEMP TABLE IF NOT EXISTS backfill_reset_sessions (
+    org_id text, session_id text, PRIMARY KEY (org_id, session_id))`);
+  await target.query("TRUNCATE pg_temp.backfill_resets, pg_temp.backfill_reset_sessions");
+  const resets = await target.query<{ users: string }>(
+    `WITH neon AS (
+       SELECT k->>0 AS org_id, k->>1 AS workspace_id, k->>2 AS user_id, k->>3 AS request_id
+         FROM jsonb_array_elements($1::jsonb) AS k),
+     after_t0 AS (
+       SELECT DISTINCT r.org_id, r.workspace_id, r.user_id FROM sessions.session_resets r
+        WHERE NOT EXISTS (SELECT 1 FROM neon n WHERE n.org_id = r.org_id
+          AND n.workspace_id = r.workspace_id AND n.user_id = r.user_id AND n.request_id = r.request_id)),
+     stored AS (INSERT INTO pg_temp.backfill_resets SELECT * FROM after_t0 ON CONFLICT DO NOTHING RETURNING *)
+     SELECT coalesce(json_agg(json_build_array(org_id, workspace_id, user_id))::text, '[]') AS users FROM stored`,
+    [sourceResets.rows[0]?.keys ?? "[]"],
+  );
+  // Sessions those users owned on Neon, for tables without user columns.
+  const sessions = await source.query<{ keys: string }>(
+    `SELECT coalesce(json_agg(DISTINCT jsonb_build_array(e.org_id, e.session_id))::text, '[]') AS keys
+       FROM sessions.convergence_events e
+       JOIN jsonb_array_elements($1::jsonb) AS u
+         ON e.org_id = u->>0 AND e.workspace_id = u->>1 AND e.user_id = u->>2`,
+    [resets.rows[0]?.users ?? "[]"],
+  );
+  await target.query(
+    `INSERT INTO pg_temp.backfill_reset_sessions
+     SELECT k->>0, k->>1 FROM jsonb_array_elements($1::jsonb) AS k ON CONFLICT DO NOTHING`,
+    [sessions.rows[0]?.keys ?? "[]"],
+  );
+}
+
+/** check mode: rows of a source page whose key is absent on the target (NULL-safe). */
+export function missingSql(plan: TablePlan): string {
+  const match = plan.key
+    .map((column) => `t.${quoteIdent(column)} IS NOT DISTINCT FROM s.${quoteIdent(column)}`)
+    .join(" AND ");
+  return `SELECT count(*)::int AS n
+    FROM jsonb_populate_recordset(NULL::${qualified(plan.table)}, $1::jsonb) s
+   WHERE NOT EXISTS (SELECT 1 FROM ${qualified(plan.table)} t WHERE ${match})`;
+}
+
 export interface CopyOptions {
   mode: CopyMode;
   chunkSize: number;
@@ -225,6 +331,8 @@ export interface CopyOptions {
    * shares on Supabase (sessions.machines: pipeline-only machines).
    */
   keepTargetOnly?: boolean;
+  /** backfill: honour deletion tombstones and resets (prepareBackfillFence first). */
+  fenced?: boolean;
   /** Resume point from a checkpoint; null starts from the first key. */
   after?: unknown[] | null;
   onPage?: (result: TableResult) => Promise<void>;
@@ -243,6 +351,7 @@ export async function copyTable(
     read: 0,
     written: 0,
     deleted: 0,
+    missing: 0,
     pages: 0,
     after: options.after ?? null,
     complete: false,
@@ -287,12 +396,25 @@ export async function copyTable(
       await options.onPage?.(result);
       return result;
     }
-    if (!options.dryRun) {
-      const written = await target.query<{ n: number }>(
-        `WITH written AS (${writeSql(plan, options.mode)} RETURNING 1) SELECT count(*)::int AS n FROM written`,
-        [page.rows],
-      );
-      result.written += written.rows[0]?.n ?? 0;
+    if (options.mode === "check") {
+      const absent = await target.query<{ n: number }>(missingSql(plan), [page.rows]);
+      result.missing += absent.rows[0]?.n ?? 0;
+    } else if (!options.dryRun) {
+      const fenced = options.mode === "backfill" && options.fenced === true;
+      const lock = fenced ? deletionLockSql(plan) : null;
+      if (fenced) await target.query("BEGIN");
+      try {
+        if (lock) await target.query(lock, [page.rows]);
+        const written = await target.query<{ n: number }>(
+          `WITH written AS (${writeSql(plan, options.mode, fenced)} RETURNING 1) SELECT count(*)::int AS n FROM written`,
+          [page.rows],
+        );
+        if (fenced) await target.query("COMMIT");
+        result.written += written.rows[0]?.n ?? 0;
+      } catch (error) {
+        if (fenced) await target.query("ROLLBACK").catch(() => {});
+        throw error;
+      }
     }
     result.read += page.n;
     result.pages += 1;
@@ -375,15 +497,17 @@ export async function main() {
   if (!sourceUrl || !targetUrl)
     throw new Error("RELAYHISTORY_SOURCE_URL and BULLS_TARGET_URL are required");
   const mode = argument("mode");
-  if (mode !== "mirror" && mode !== "backfill")
-    throw new Error("--mode must be mirror or backfill");
+  if (mode !== "mirror" && mode !== "backfill" && mode !== "check")
+    throw new Error("--mode must be mirror, backfill or check");
   const tables = (argument("tables") ?? "").split(",").filter(Boolean);
   if (tables.length === 0 || tables.some((table) => !/^[a-z_][a-z0-9_]*$/.test(table)))
     throw new Error("--tables must list sessions table names");
   const chunkSize = Number(argument("chunk-size") ?? 500);
   if (!Number.isInteger(chunkSize) || chunkSize < 1)
     throw new Error("--chunk-size must be a positive integer");
-  const dryRun = process.argv.includes("--dry-run");
+  // Writes need --execute and a positively identified target; check never writes.
+  const dryRun =
+    mode === "check" || guardFromArgv(process.argv, targetUrl, sourceUrl) === "dry-run";
   const keepTargetOnly = new Set(
     (argument("keep-target-only") ?? "").split(",").filter(Boolean),
   );
@@ -396,7 +520,11 @@ export async function main() {
     await Promise.all([source.connect(), target.connect()]);
     // The source is only ever read.
     await source.query("SET default_transaction_read_only = on");
-    await prepareTargetSession(target);
+    // Dry runs and checks only read; executed copies land with triggers off.
+    if (dryRun) await target.query("SET default_transaction_read_only = on");
+    else await prepareTargetSession(target);
+    // Deletion fences need temp tables, which a read-only dry run cannot create.
+    if (mode === "backfill" && !dryRun) await prepareBackfillFence(source, target);
     const results: TableResult[] = [];
     for (const table of tables) {
       const previous = checkpoint.tables[table];
@@ -410,6 +538,7 @@ export async function main() {
         chunkSize,
         dryRun,
         keepTargetOnly: keepTargetOnly.has(table),
+        fenced: mode === "backfill" && !dryRun,
         after: mode === "backfill" ? (previous?.after ?? null) : null,
         onPage: async (progress) => {
           checkpoint.tables[table] = { ...progress };
@@ -421,6 +550,7 @@ export async function main() {
     process.stdout.write(
       `${JSON.stringify({ generatedAt: new Date().toISOString(), mode, dryRun, tables: results.map(({ after: _after, ...rest }) => rest) }, null, 2)}\n`,
     );
+    if (mode === "check" && results.some((result) => result.missing > 0)) process.exitCode = 2;
   } finally {
     await Promise.all([source.end(), target.end()]);
   }

@@ -10,9 +10,11 @@
  * clear the mark. Timing-cache rows are dropped; the next read refills them.
  * This runs as a normal session, with triggers on, in small transactions.
  *
- * Usage: BULLS_TARGET_URL=... bun run migration:rebuild --since=<T0 ISO> [--batch=200] [--dry-run]
+ * Usage: BULLS_TARGET_URL=... bun run migration:rebuild --since=<T0 ISO> [--batch=200]
+ *   [--execute --expect-supabase-ref=<ref>]   (without --execute: a read-only dry run)
  */
 import pg from "pg";
+import { guardFromArgv } from "./target-guard.js";
 
 export interface Queryable {
   query<T = Record<string, unknown>>(
@@ -87,14 +89,13 @@ export async function main() {
   if (Number.isNaN(since.getTime())) throw new Error("--since must be the T0 timestamp (ISO 8601)");
   const batch = Number(argument("batch") ?? 200);
   if (!Number.isInteger(batch) || batch < 1) throw new Error("--batch must be a positive integer");
+  const dryRun = guardFromArgv(process.argv, url) === "dry-run";
   const client = new pg.Client({ connectionString: url, application_name: "96bulls-rebuild-straddling" });
   await client.connect();
   try {
-    const result = await rebuildSince(client, since, {
-      batch,
-      dryRun: process.argv.includes("--dry-run"),
-    });
-    process.stdout.write(`${JSON.stringify({ since: since.toISOString(), ...result }, null, 2)}\n`);
+    if (dryRun) await client.query("SET default_transaction_read_only = on");
+    const result = await rebuildSince(client, since, { batch, dryRun });
+    process.stdout.write(`${JSON.stringify({ since: since.toISOString(), dryRun, ...result }, null, 2)}\n`);
   } finally {
     await client.end();
   }

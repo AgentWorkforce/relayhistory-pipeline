@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   copyTable,
   planTable,
+  prepareBackfillFence,
   prepareTargetSession,
   type Queryable,
 } from "../../../src/migration/relayhistory-copy.js";
@@ -164,6 +165,86 @@ describe("backfill (history after T0)", () => {
     });
     expect(resumed).toMatchObject({ read: 2, written: 2 });
     expect((await dump(target)).map((row) => row.id)).toEqual(["1", "2"]);
+  });
+});
+
+describe("check (Neon fallback removal criterion)", () => {
+  it("counts source rows Supabase lacks, NULL keys included, without writing", async () => {
+    const ddl = `CREATE TABLE sessions.rollups (
+      org_id text NOT NULL, session_id text NOT NULL, project_id text, n int);
+      CREATE UNIQUE INDEX rollups_key ON sessions.rollups (org_id, session_id, project_id) NULLS NOT DISTINCT;`;
+    await Promise.all([source.exec(ddl), target.exec(ddl)]);
+    await source.exec(`INSERT INTO sessions.rollups VALUES
+      ('o', 's1', NULL, 1), ('o', 's2', 'p', 2), ('o', 's3', NULL, 3)`);
+    // Present (a changed value is fine after T0) and one missing NULL-keyed row.
+    await target.exec(`INSERT INTO sessions.rollups VALUES ('o', 's1', NULL, 99), ('o', 's2', 'p', 2)`);
+    const plan = await planTable(source as Queryable, target as Queryable, "rollups");
+    const result = await copyTable(source as Queryable, target as Queryable, plan, {
+      mode: "check",
+      chunkSize: 2,
+    });
+    expect(result).toMatchObject({ read: 3, missing: 1, written: 0 });
+    expect((await target.query("SELECT count(*)::int AS n FROM sessions.rollups")).rows).toEqual([
+      { n: 2 },
+    ]);
+    await copyTable(source as Queryable, target as Queryable, plan, { mode: "backfill", chunkSize: 2 });
+    expect(
+      await copyTable(source as Queryable, target as Queryable, plan, { mode: "check", chunkSize: 2 }),
+    ).toMatchObject({ missing: 0 });
+  });
+});
+
+describe("deletions made on Supabase after T0", () => {
+  const FENCE_DDL = `CREATE TABLE sessions.deleted_upload_sessions (
+      org_id text NOT NULL, workspace_id text NOT NULL, user_id text NOT NULL,
+      origin_id text NOT NULL, source text NOT NULL, session_id text NOT NULL,
+      PRIMARY KEY (org_id, workspace_id, user_id, origin_id, source, session_id));
+    CREATE TABLE sessions.session_resets (
+      org_id text NOT NULL, workspace_id text NOT NULL, user_id text NOT NULL,
+      request_id text NOT NULL, deleted bigint NOT NULL,
+      PRIMARY KEY (org_id, workspace_id, user_id, request_id));
+    CREATE TABLE sessions.convergence_events (
+      org_id text NOT NULL, workspace_id text NOT NULL, user_id text NOT NULL,
+      source text NOT NULL, session_id text NOT NULL, event_id text NOT NULL,
+      PRIMARY KEY (org_id, event_id));
+    CREATE TABLE sessions.session_rollups (
+      org_id text NOT NULL, session_id text NOT NULL, n int, PRIMARY KEY (org_id, session_id));`;
+
+  it("never resurrects a deleted upload or a reset user's history", async () => {
+    await Promise.all([source.exec(FENCE_DDL), target.exec(FENCE_DDL)]);
+    await source.exec(`INSERT INTO sessions.convergence_events VALUES
+        ('o', 'w', 'u1', 'claude', 's1', 'e1'), ('o', 'w', 'u1', 'claude', 's1b', 'e1b'),
+        ('o', 'w', 'u2', 'claude', 's2', 'e2'), ('o', 'w', 'u3', 'claude', 's3', 'e3');
+      INSERT INTO sessions.session_rollups VALUES ('o', 's1', 1), ('o', 's2', 2), ('o', 's3', 3);
+      -- u3 reset before T0: already on both sides; their later history stays.
+      INSERT INTO sessions.session_resets VALUES ('o', 'w', 'u3', 'r-pre', 0);`);
+    await target.exec(`INSERT INTO sessions.session_resets VALUES ('o', 'w', 'u3', 'r-pre', 0);
+      -- After T0 on Supabase: u1 deleted session s1, and u2 reset everything.
+      INSERT INTO sessions.deleted_upload_sessions VALUES ('o', 'w', 'u1', 'origin', 'claude', 's1');
+      INSERT INTO sessions.session_resets VALUES ('o', 'w', 'u2', 'r-post', 1);`);
+    await prepareTargetSession(target as Queryable);
+    await prepareBackfillFence(source as Queryable, target as Queryable);
+    for (const table of ["convergence_events", "session_rollups"]) {
+      const plan = await planTable(source as Queryable, target as Queryable, table);
+      await copyTable(source as Queryable, target as Queryable, plan, {
+        mode: "backfill",
+        chunkSize: 2,
+        fenced: true,
+      });
+    }
+    const events = (
+      await target.query<{ event_id: string }>(
+        "SELECT event_id FROM sessions.convergence_events ORDER BY event_id",
+      )
+    ).rows.map((row) => row.event_id);
+    expect(events).toEqual(["e1b", "e3"]); // s1 deleted, all of u2 reset
+    const rollups = (
+      await target.query<{ session_id: string }>(
+        "SELECT session_id FROM sessions.session_rollups ORDER BY session_id",
+      )
+    ).rows.map((row) => row.session_id);
+    // Without user columns, u2's sessions are matched through Neon's events.
+    expect(rollups).toEqual(["s3"]);
   });
 });
 
