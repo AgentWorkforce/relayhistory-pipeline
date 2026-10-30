@@ -525,6 +525,33 @@ describe("guarded target session (mirror without session_replication_role)", () 
     ).rejects.toThrow("upload cleanup rollout ready");
   });
 
+  it("refuses delivery_origins when its required guard is missing", async () => {
+    await target.exec(GUARD.split("CREATE TRIGGER")[0]);
+    await expect(
+      prepareGuardedTargetSession(target as Queryable, ["delivery_origins"]),
+    ).rejects.toThrow("needs these guards enabled: delivery_origins.guard_delivery_origin_cleanup");
+  });
+
+  it("refuses delivery_origins when its required guard is disabled", async () => {
+    await target.exec(GUARD);
+    await target.exec("ALTER TABLE sessions.delivery_origins DISABLE TRIGGER guard_delivery_origin_cleanup");
+    await expect(
+      prepareGuardedTargetSession(target as Queryable, ["delivery_origins"]),
+    ).rejects.toThrow("needs these guards enabled: delivery_origins.guard_delivery_origin_cleanup");
+  });
+
+  it("refuses delivery_origins when its required guard is replica-only", async () => {
+    await target.exec(GUARD);
+    await target.exec("ALTER TABLE sessions.delivery_origins ENABLE REPLICA TRIGGER guard_delivery_origin_cleanup");
+    await expect(
+      prepareGuardedTargetSession(target as Queryable, ["delivery_origins"]),
+    ).rejects.toThrow("needs these guards enabled");
+  });
+
+  it("does not require the guard for tables it does not belong to", async () => {
+    await expect(prepareGuardedTargetSession(target as Queryable, ["tokens"])).resolves.toBeUndefined();
+  });
+
   it("refuses a session already in replica", async () => {
     await target.exec("SET session_replication_role = replica");
     await expect(prepareGuardedTargetSession(target as Queryable, ["tokens"])).rejects.toThrow(

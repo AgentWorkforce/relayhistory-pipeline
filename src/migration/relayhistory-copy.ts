@@ -536,7 +536,9 @@ export async function prepareTargetSession(target: Queryable): Promise<void> {
  * The only user triggers allowed to fire while the T0 copy set lands with
  * triggers on. Each is a guard that raises or passes and writes nothing,
  * pinned to its table and function. A new trigger on a copy-set table is
- * refused until it is reviewed and added here.
+ * refused until it is reviewed and added here. Each guard is also required:
+ * a listed table whose guard is missing or disabled (drift) is refused, since
+ * rows would otherwise land without the protection the guard exists for.
  */
 export const GUARD_TRIGGERS: ReadonlyArray<{ table: string; trigger: string; fn: string }> = [
   // 0038/0044: raises upload_cleanup_not_ready until the cleanup rollout is ready.
@@ -595,7 +597,19 @@ export async function prepareGuardedTargetSession(
     throw new Error(
       `guarded copy refuses tables in a foreign key: ${keys.map((row) => row.table).join(", ")}`,
     );
-  if (triggers.some((row) => row.trigger === "guard_delivery_origin_cleanup")) {
+  const missing = GUARD_TRIGGERS.filter(
+    (guard) =>
+      tables.includes(guard.table) &&
+      !triggers.some(
+        (row) => row.table === guard.table && row.trigger === guard.trigger && row.fn === guard.fn,
+      ),
+  );
+  if (missing.length > 0)
+    throw new Error(
+      `guarded copy needs these guards enabled: ${missing.map((guard) => `${guard.table}.${guard.trigger}`).join(", ")}`,
+    );
+  // Required unconditionally for delivery_origins, not only when the guard was found.
+  if (tables.includes("delivery_origins")) {
     const { rows: ready } = await target.query<{ ready: boolean }>(
       "SELECT sessions.upload_cleanup_ready() AS ready",
     );
