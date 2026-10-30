@@ -3,7 +3,7 @@
  * the RPC, tenants stay apart, and transcript content stays out of the directory.
  * These tests measure nothing; timings come only from run.ts.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
@@ -14,11 +14,12 @@ import { identity, oracleLaneA, oracleLaneB, SMALL, textQueries, WHALE } from ".
 import { percentile } from "../stats.ts";
 
 const params = SCALES.test!;
-let db: Db & { close?: () => Promise<void> };
+let pg: PGlite;
+let db: Db;
 let corpus: CorpusSession[];
 
 beforeAll(async () => {
-  const pg = new PGlite({ extensions: { btree_gin, pg_trgm } });
+  pg = new PGlite({ extensions: { btree_gin, pg_trgm } });
   db = { query: (s, a) => pg.query(s, a as never) as never, exec: async (s) => void (await pg.exec(s)) };
   await installSchema(db);
   corpus = [...generateCorpus(params)];
@@ -27,6 +28,8 @@ beforeAll(async () => {
     await loadNeonBatch(db, corpus.slice(i, i + 500));
   }
 }, 120_000);
+
+afterAll(() => pg.close());
 
 const laneA = (t: typeof WHALE) => textQueries(t).filter((q) => q.lane === "A");
 
