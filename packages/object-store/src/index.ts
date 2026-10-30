@@ -60,6 +60,7 @@ export {
   chunkKeys,
   commitBackfillEpoch,
   computeContentSha256,
+  exportWatermarks,
   liveEpoch,
   liveNextOffset,
   manifestLocation,
