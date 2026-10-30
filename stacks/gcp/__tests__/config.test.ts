@@ -17,6 +17,7 @@ import {
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
+  requestedAlchemyCommand,
   captureRelaycastChartPackage,
   type GcpInputs,
 } from "../config.ts";
@@ -205,6 +206,27 @@ describe("GCP self-host contract", () => {
         bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
     ).toThrow("not approved for the GCP application proof");
+    const recordedButIneligible = {
+      ...base,
+      managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" as const },
+      bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
+    };
+    expect(() => assertGcpInputs("gcp-dev", recordedButIneligible, "destroy")).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable(recordedButIneligible, "destroy")).not.toThrow();
+    for (const command of ["plan", "deploy"] as const) {
+      expect(() => assertGcpInputs("gcp-dev", recordedButIneligible, command)).toThrow(
+        "not approved for the GCP application proof",
+      );
+      expect(() => assertGcpRuntimeDeployable(recordedButIneligible, command)).toThrow(
+        "not approved for the GCP application proof",
+      );
+    }
+  });
+
+  it("mirrors Alchemy's first-known-command scan for destroy cleanup", () => {
+    expect(requestedAlchemyCommand(["--stage", "gcp-dev", "destroy"])).toBe("destroy");
+    expect(requestedAlchemyCommand(["--stage", "gcp-dev", "plan", "destroy"])).toBe("plan");
+    expect(requestedAlchemyCommand(["--stage", "gcp-dev", "bogus"])).toBeUndefined();
   });
 
   it("renders a CA-backed Redis round-trip contract without AUTH or HMAC credentials", () => {

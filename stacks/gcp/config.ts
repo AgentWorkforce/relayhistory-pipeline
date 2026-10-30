@@ -7,6 +7,36 @@ export const GCP_CONFIRM_PROJECT_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT";
 export const GCP_CONFIRM_SQL_POST_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_SQL_POST";
 export const GCP_APPLY_NONCE_ENV = "NINETY_SIX_BULLS_GCP_APPLY_NONCE";
 
+export type AlchemyStackCommand =
+  | "provider"
+  | "deploy"
+  | "dev"
+  | "destroy"
+  | "plan"
+  | "logs"
+  | "profile"
+  | "state"
+  | "drift"
+  | "unsafe";
+
+const ALCHEMY_STACK_COMMANDS = new Set<AlchemyStackCommand>([
+  "provider",
+  "deploy",
+  "dev",
+  "destroy",
+  "plan",
+  "logs",
+  "profile",
+  "state",
+  "drift",
+  "unsafe",
+]);
+
+/** Mirror Alchemy's first-known-command scan without importing its CLI. */
+export function requestedAlchemyCommand(argv: readonly string[] = process.argv.slice(2)): AlchemyStackCommand | undefined {
+  return argv.find((value): value is AlchemyStackCommand => ALCHEMY_STACK_COMMANDS.has(value as AlchemyStackCommand));
+}
+
 /** The only project this lane may plan. Any other id, number, org, billing account, or region is refused. */
 export const GCP_APPROVED_TARGET = {
   projectId: "agentrelay-96bulls-soc2-2610",
@@ -261,7 +291,11 @@ function requirePublicHttpsOrigin(label: string, value: string): URL {
   return origin;
 }
 
-export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
+export function assertGcpInputs(
+  stage: string,
+  inputs: GcpInputs,
+  requestedCommand?: AlchemyStackCommand,
+): void {
   if (!GCP_STAGE.test(stage)) throw new Error(`96bulls: GCP config requires a safe gcp-* stage, got ${stage}`);
   if (!PROJECT_ID.test(inputs.projectId)) throw new Error("96bulls: gcp projectId is invalid");
   if (!PROJECT_NUMBER.test(inputs.projectNumber)) throw new Error("96bulls: gcp projectNumber is invalid");
@@ -360,7 +394,8 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     requireRelayauthIssuer("bulls96.relayauthIssuer", inputs.bulls96.relayauthIssuer);
     if (inputs.relayauth?.baseUrl && inputs.bulls96.relayauthIssuer !== inputs.relayauth.baseUrl)
       throw new Error("96bulls: bulls96.relayauthIssuer must match relayauth.baseUrl for the in-stage RelayAuth release");
-    requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
+    if (requestedCommand !== "destroy")
+      requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
   }
 }
 
@@ -379,13 +414,13 @@ function requireApprovedGcpServicesImage(digest: string, sourceRevision: string)
 }
 
 /** Defense in depth for runtime wiring; the stack's poster remains apply-only. */
-export function assertGcpRuntimeDeployable(inputs: GcpInputs): void {
+export function assertGcpRuntimeDeployable(inputs: GcpInputs, requestedCommand?: AlchemyStackCommand): void {
   if (
     inputs.bulls96?.enabled &&
     (!inputs.managedDataPlane.provision || inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
   )
     throw new Error("96bulls: GCP runtime wiring requires the acknowledged managed data plane. Nothing was created.");
-  if (inputs.bulls96?.enabled)
+  if (inputs.bulls96?.enabled && requestedCommand !== "destroy")
     requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
 }
 
