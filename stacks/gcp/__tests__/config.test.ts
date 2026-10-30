@@ -242,6 +242,9 @@ describe("GCP self-host contract", () => {
     expect(stack).toContain("natIpAllocateOption: GCP_RUNTIME_SHAPE.natIpAllocateOption");
     expect(stack).toContain("filter: GCP_RUNTIME_SHAPE.natLogFilter");
     expect(stack).toContain("purpose: \"VPC_PEERING\"");
+    expect(stack).toContain("network: network.selfLink.as<string>()");
+    expect(stack).toContain('versionDestroyTtl: afterApi("secretmanager.googleapis.com"');
+    expect(stack).toContain("Output.map(cluster.workloadPool");
     expect(stack.indexOf('RequireKubernetesReachability("kubernetes-reachability"')).toBeLessThan(
       stack.indexOf('Kubernetes.Manifest("relaycast-namespace"'),
     );
