@@ -32,10 +32,13 @@ implementations own provider adapters.
 
 Cloud SQL is not created. The stack prepares a SQL Admin `instances.insert`
 for public IPv4 off, the Private Service Access network and range, and
-`--private-ip` proxy routing. `postPrivateCloudSqlInsert` is the only sender,
-it has no default transport, and the stack does not call it. `GCP.SQL.Instance`
-is not called, because that resource drops `privateNetwork` and can create a
-public instance.
+`--private-ip` proxy routing. `ensurePrivateCloudSql` gets that instance or
+inserts it only when it is absent, then polls the operation through an
+injected transport. It refuses a public instance, a different existing
+instance, a failed operation, and a timeout. The bearer credential stays in
+the caller and the transport, not in the request or the error text. The stack
+does not call that poster. `GCP.SQL.Instance` is not called, because that
+resource drops `privateNetwork` and can create a public instance.
 
 ## Truthful feature gates
 
@@ -133,9 +136,19 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
   Proxy args are `--private-ip`, `--address=0.0.0.0`, `--port=5432`, and the
   connection name.
 - `sqlAdminInsertRequest` builds `POST https://sqladmin.googleapis.com/v1/projects/{project}/instances`
-  with that body and `sent: false`. `postPrivateCloudSqlInsert` sends it only
-  through an injected transport. The stack calls the builder and does not call
-  the poster. `@alchemy.run/gcp@2.0.0-beta.84` `GCP.SQL.Instance` is not called.
+  with that body and `sent: false`. The request has no Authorization header.
+  `ensurePrivateCloudSql` passes the bearer credential only to an injected
+  transport. It returns when the private instance already matches, inserts
+  only on HTTP 404, and follows HTTP 409 with another get. A public address,
+  authorized network, or mismatched name, region, version, tier, availability,
+  VPC, or PSA range is refused with no update. A match also requires
+  `state: RUNNABLE`. A finished create polls
+  `operations/{id}` until `DONE`, then gets the instance and refuses the
+  result unless that private body is `RUNNABLE`. A thrown insert, a failed operation, or a
+  timeout says to reconcile and does not say that nothing was created. Error
+  text omits the response body and the bearer. The stack calls the builder
+  and does not call the poster. `@alchemy.run/gcp@2.0.0-beta.84`
+  `GCP.SQL.Instance` is not called.
 - The Auth Proxy manifests stay unapplied while `posted` is false. The proxy
   Workload Identity binding is created with those manifests, not before them.
   The PSA range is still shared with Memorystore.
@@ -206,7 +219,8 @@ container, Artifact Registry, the runtime service account, Workload Identity for
 `roles/cloudsql.client`. With `managedDataPlane.provision`, Memorystore Redis
 7.2 is created with AUTH off and TLS server authentication, and Pub/Sub is
 created with the dead-letter service agent. The Cloud SQL body is prepared as
-`sqlInsert` and is not posted. `GCP.SQL.Instance` must not appear as a resource.
+`sqlInsert` and is not posted. `ensurePrivateCloudSql` is not called.
+`GCP.SQL.Instance` must not appear as a resource.
 `bulls96.enabled` still throws before any resource, so this plan cannot install
 96Bulls until a reviewed change posts the insert and then lifts that guard.
 

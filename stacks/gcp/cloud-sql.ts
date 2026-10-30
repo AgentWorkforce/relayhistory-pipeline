@@ -7,8 +7,10 @@
  * later poster has to send: public IPv4 off, the VPC link, the Private
  * Service Access range, and no authorized networks. `posted` stays false.
  * `sqlAdminInsertRequest` builds the SQL Admin POST and does not send it.
- * `postPrivateCloudSqlInsert` sends only through an injected transport.
- * The stack calls the builder and does not call the poster or `GCP.SQL.Instance`.
+ * `postPrivateCloudSqlInsert` sends one insert through an injected transport.
+ * `ensurePrivateCloudSql` gets the instance, inserts only when it is absent,
+ * polls the operation, and passes the bearer credential only to that transport.
+ * The stack calls the builder and does not call either poster or `GCP.SQL.Instance`.
  */
 
 export interface SqlProviderCapabilities {
@@ -265,6 +267,263 @@ export async function postPrivateCloudSqlInsert(
       `96bulls: Cloud SQL Admin insert outcome is uncertain for ${projectId}/${spec.instanceName}; reconcile that instance before retry or teardown.`,
     );
   return { operation: result.name, sent: true };
+}
+
+/** Held by the caller for one call. The request object never carries it. */
+export interface SqlAdminCredential {
+  readonly bearer: string;
+}
+
+export interface SqlAdminEnsureRequest {
+  method: "GET" | "POST";
+  url: string;
+  body?: PrivateCloudSqlSpec["insertBody"];
+}
+
+export interface SqlAdminEnsureResponse {
+  status: number;
+  body?: unknown;
+}
+
+export interface SqlAdminEnsureTransport {
+  /**
+   * Set `Authorization` from `credential.bearer` for this call only.
+   * Do not log the credential, the response body, or this request together.
+   */
+  request(call: SqlAdminEnsureRequest, credential: SqlAdminCredential): Promise<SqlAdminEnsureResponse>;
+}
+
+export interface SqlAdminPollControl {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+  deadlineMs?: number;
+  intervalMs?: number;
+  maxPolls?: number;
+}
+
+export interface PrivateCloudSqlEnsureResult {
+  /** False when a matching private instance already existed. */
+  created: boolean;
+  /** Operation id after a finished create. Null when the existing instance matched. */
+  operation: string | null;
+}
+
+interface ResolvedPoll {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+  deadlineMs: number;
+  intervalMs: number;
+  maxPolls: number;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  return value as Record<string, unknown>;
+}
+
+function assertCredential(credential: SqlAdminCredential): void {
+  const bearer = credential?.bearer;
+  if (typeof bearer !== "string" || bearer.length < 16 || bearer.length > 8192 || /\s/.test(bearer))
+    refuse("Cloud SQL Admin credential is missing.");
+}
+
+function uncertain(projectId: string, instanceName: string): never {
+  throw new Error(
+    `96bulls: Cloud SQL Admin insert outcome is uncertain for ${projectId}/${instanceName}; reconcile that instance before retry or teardown.`,
+  );
+}
+
+function timedOut(projectId: string, instanceName: string): never {
+  throw new Error(
+    `96bulls: Cloud SQL Admin operation timed out for ${projectId}/${instanceName}; reconcile that instance before retry or teardown.`,
+  );
+}
+
+function failedOperation(projectId: string, instanceName: string): never {
+  throw new Error(
+    `96bulls: Cloud SQL Admin operation failed for ${projectId}/${instanceName}; reconcile that instance before retry or teardown.`,
+  );
+}
+
+function rejectPublic(projectId: string, instanceName: string): never {
+  throw new Error(`96bulls: Cloud SQL Admin instance ${projectId}/${instanceName} is public. Nothing was changed.`);
+}
+
+function rejectMismatch(projectId: string, instanceName: string): never {
+  throw new Error(
+    `96bulls: Cloud SQL Admin instance ${projectId}/${instanceName} does not match the private body. Nothing was changed.`,
+  );
+}
+
+function rejectNotReady(projectId: string, instanceName: string): never {
+  throw new Error(
+    `96bulls: Cloud SQL Admin instance ${projectId}/${instanceName} is not runnable. Reconcile before retry or teardown.`,
+  );
+}
+
+function rejectAdoption(projectId: string, instanceName: string): never {
+  throw new Error(
+    `96bulls: Cloud SQL Admin refused to adopt ${projectId}/${instanceName}. Reconcile before retry or teardown.`,
+  );
+}
+
+function createdMismatch(projectId: string, instanceName: string): never {
+  throw new Error(
+    `96bulls: Cloud SQL Admin created ${projectId}/${instanceName}, but the instance does not match the private body. Reconcile before retry or teardown.`,
+  );
+}
+
+function classifyExisting(spec: PrivateCloudSqlSpec, body: unknown): "match" | "public" | "not-ready" | "mismatch" {
+  const record = asRecord(body);
+  const settings = asRecord(record?.settings);
+  const ip = asRecord(settings?.ipConfiguration);
+  const networks = ip?.authorizedNetworks;
+  const addresses = record?.ipAddresses;
+  if (ip?.ipv4Enabled === true) return "public";
+  if (Array.isArray(networks) && networks.length > 0) return "public";
+  if (Array.isArray(addresses) && addresses.some((entry) => asRecord(entry)?.type === "PRIMARY")) return "public";
+  const networksEmpty = networks === undefined || (Array.isArray(networks) && networks.length === 0);
+  const addressesPrivate =
+    addresses === undefined ||
+    (Array.isArray(addresses) && addresses.every((entry) => asRecord(entry)?.type === "PRIVATE"));
+  const privateMatch =
+    record?.name === spec.instanceName &&
+    record.region === spec.insertBody.region &&
+    record.databaseVersion === "POSTGRES_17" &&
+    settings?.tier === spec.insertBody.settings.tier &&
+    settings.availabilityType === spec.insertBody.settings.availabilityType &&
+    ip?.ipv4Enabled === false &&
+    ip.privateNetwork === spec.privateNetwork &&
+    ip.allocatedIpRange === spec.allocatedIpRange &&
+    networksEmpty &&
+    addressesPrivate;
+  if (!privateMatch) return "mismatch";
+  if (record?.state !== "RUNNABLE") return "not-ready";
+  return "match";
+}
+
+function operationIdOf(body: unknown): string | undefined {
+  const name = asRecord(body)?.name;
+  if (typeof name !== "string" || name.includes("://") || name.includes("@") || name.includes("?") || name.includes("#"))
+    return;
+  const slash = name.lastIndexOf("/");
+  const id = slash === -1 ? name : name.slice(slash + 1);
+  if (!OPERATION_ID.test(id)) return;
+  return id;
+}
+
+function operationState(body: unknown): "done" | "failed" | "pending" | "invalid" {
+  const record = asRecord(body);
+  if (!record) return "invalid";
+  if (record.status === undefined || record.status === "PENDING" || record.status === "RUNNING") return "pending";
+  if (record.status === "DONE") return record.error == null ? "done" : "failed";
+  return "invalid";
+}
+
+function resolvePoll(poll?: SqlAdminPollControl): ResolvedPoll {
+  const deadlineMs = poll?.deadlineMs ?? 10 * 60 * 1000;
+  const intervalMs = poll?.intervalMs ?? 2000;
+  const maxPolls = poll?.maxPolls ?? 300;
+  if (!Number.isFinite(deadlineMs) || deadlineMs < 1 || deadlineMs > 60 * 60 * 1000)
+    refuse("Cloud SQL Admin poll deadline is invalid.");
+  if (!Number.isInteger(intervalMs) || intervalMs < 1 || intervalMs > 60_000)
+    refuse("Cloud SQL Admin poll interval is invalid.");
+  if (!Number.isInteger(maxPolls) || maxPolls < 1 || maxPolls > 10_000)
+    refuse("Cloud SQL Admin poll limit is invalid.");
+  return {
+    now: poll?.now ?? (() => Date.now()),
+    sleep: poll?.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
+    deadlineMs,
+    intervalMs,
+    maxPolls,
+  };
+}
+
+async function ask(
+  transport: SqlAdminEnsureTransport,
+  call: SqlAdminEnsureRequest,
+  credential: SqlAdminCredential,
+): Promise<SqlAdminEnsureResponse | "thrown"> {
+  try {
+    const response = await transport.request(call, credential);
+    if (!response || typeof response.status !== "number" || !Number.isInteger(response.status)) return "thrown";
+    return response;
+  } catch {
+    return "thrown";
+  }
+}
+
+/**
+ * Get the private instance or create it, then poll the insert operation.
+ * There is no default transport. A thrown or unreadable insert does not claim
+ * the instance is absent. This function is not called by the stack.
+ */
+export async function ensurePrivateCloudSql(
+  spec: PrivateCloudSqlSpec,
+  credential: SqlAdminCredential,
+  transport: SqlAdminEnsureTransport,
+  poll?: SqlAdminPollControl,
+): Promise<PrivateCloudSqlEnsureResult> {
+  const request = sqlAdminInsertRequest(spec);
+  if (request.sent !== false || Object.keys(request.headers).some((name) => name.toLowerCase() === "authorization"))
+    refuse("Cloud SQL insert seam tried to carry a credential.");
+  assertCredential(credential);
+  const clock = resolvePoll(poll);
+  const projectId = PRIVATE_NETWORK.exec(request.body.settings.ipConfiguration.privateNetwork)?.[1];
+  if (!projectId) refuse("Cloud SQL insert seam lost the VPC link.");
+  const instanceName = spec.instanceName;
+  const instanceUrl = `https://sqladmin.googleapis.com/v1/projects/${projectId}/instances/${instanceName}`;
+  const getCall: SqlAdminEnsureRequest = { method: "GET", url: instanceUrl };
+  const existing = await ask(transport, getCall, credential);
+  if (existing === "thrown") refuse("Cloud SQL Admin instance lookup was not accepted.");
+  if (existing.status === 200) {
+    const kind = classifyExisting(spec, existing.body);
+    if (kind === "match") return { created: false, operation: null };
+    if (kind === "public") rejectPublic(projectId, instanceName);
+    if (kind === "not-ready") rejectNotReady(projectId, instanceName);
+    rejectMismatch(projectId, instanceName);
+  }
+  if (existing.status !== 404) refuse("Cloud SQL Admin instance lookup was not accepted.");
+
+  const inserted = await ask(transport, { method: "POST", url: request.url, body: request.body }, credential);
+  if (inserted === "thrown") uncertain(projectId, instanceName);
+  if (inserted.status === 409) {
+    const again = await ask(transport, getCall, credential);
+    if (again === "thrown" || again.status !== 200) uncertain(projectId, instanceName);
+    const kind = classifyExisting(spec, again.body);
+    if (kind === "match") return { created: false, operation: null };
+    if (kind === "not-ready") rejectNotReady(projectId, instanceName);
+    rejectAdoption(projectId, instanceName);
+  }
+  if (inserted.status !== 200) uncertain(projectId, instanceName);
+  const operationId = operationIdOf(inserted.body);
+  if (!operationId) uncertain(projectId, instanceName);
+  const initial = operationState(inserted.body);
+  if (initial === "failed") failedOperation(projectId, instanceName);
+  if (initial === "invalid") uncertain(projectId, instanceName);
+  if (initial !== "done") {
+    const operationUrl = `https://sqladmin.googleapis.com/v1/projects/${projectId}/operations/${operationId}`;
+    const started = clock.now();
+    let finished = false;
+    for (let attempt = 0; attempt < clock.maxPolls; attempt += 1) {
+      if (clock.now() - started >= clock.deadlineMs) timedOut(projectId, instanceName);
+      const polled = await ask(transport, { method: "GET", url: operationUrl }, credential);
+      if (polled === "thrown" || polled.status !== 200) uncertain(projectId, instanceName);
+      const state = operationState(polled.body);
+      if (state === "done") {
+        finished = true;
+        break;
+      }
+      if (state === "failed") failedOperation(projectId, instanceName);
+      if (state !== "pending") uncertain(projectId, instanceName);
+      await clock.sleep(clock.intervalMs);
+    }
+    if (!finished) timedOut(projectId, instanceName);
+  }
+  const confirmed = await ask(transport, getCall, credential);
+  if (confirmed === "thrown" || confirmed.status !== 200) uncertain(projectId, instanceName);
+  if (classifyExisting(spec, confirmed.body) !== "match") createdMismatch(projectId, instanceName);
+  return { created: true, operation: operationId };
 }
 
 /** In-cluster proxy. The instance connection name is a positional arg, and `--private-ip` is the first flag. */
