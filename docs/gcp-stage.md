@@ -411,6 +411,9 @@ pod it proved all of the following live paths:
 5. the runtime identity published, pulled, and acknowledged a marker through
    the configured Pub/Sub topic and subscription.
 
+The Cloud SQL check established private transport reachability only. It did
+not present database credentials, authenticate, or execute a SQL query.
+
 Verification cleanup completed: the temporary namespace and Job were deleted,
 the GCS marker was deleted, the Pub/Sub marker was acknowledged, the verifier
 VM was deleted, and the temporary `roles/container.developer` binding was
