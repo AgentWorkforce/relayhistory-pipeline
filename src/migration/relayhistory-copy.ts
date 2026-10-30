@@ -11,7 +11,8 @@
  *
  * Rows move as JSON through jsonb_populate_recordset, so every column type
  * (jsonb, arrays, timestamps, bytea, vector) is converted by Postgres itself.
- * Generated columns are skipped. Keyset pages on the primary key make each run
+ * Generated columns are skipped. The target session runs with triggers off
+ * (prepareTargetSession), so rows land exactly as Neon has them. Keyset pages on the primary key make each run
  * resumable from a checkpoint. Nothing here prints row contents or URLs.
  *
  * Usage: RELAYHISTORY_SOURCE_URL=... BULLS_TARGET_URL=... \
@@ -269,6 +270,22 @@ function staleSubquery(plan: TablePlan, hasAfter: boolean, bounded: boolean): st
   }`;
 }
 
+/**
+ * Copies replicate rows as they are: user triggers (projections, rollups,
+ * revision feed, analysis wakeups) must not fire, or a backfill would replay
+ * every historical session into the outbox, the brief queue and Cloud's feed.
+ * `replica` disables them for this session only; live traffic keeps them.
+ * Fails closed if the role may not set it.
+ */
+export async function prepareTargetSession(target: Queryable): Promise<void> {
+  await target.query("SET session_replication_role = replica");
+  const { rows } = await target.query<{ session_replication_role: string }>(
+    "SHOW session_replication_role",
+  );
+  if (rows[0]?.session_replication_role !== "replica")
+    throw new Error("target session could not disable triggers");
+}
+
 interface Checkpoint {
   version: 1;
   mode: CopyMode;
@@ -329,8 +346,11 @@ export async function main() {
   source.on("connect", (client) => {
     client.query("SET default_transaction_read_only = on").catch(() => {});
   });
-  const target = new pg.Pool({ connectionString: targetUrl, max: 1, application_name: "96bulls-copy-target" });
+  // One target connection for the whole run, so its session settings hold.
+  const target = new pg.Client({ connectionString: targetUrl, application_name: "96bulls-copy-target" });
   try {
+    await target.connect();
+    await prepareTargetSession(target);
     const results: TableResult[] = [];
     for (const table of tables) {
       const previous = checkpoint.tables[table];

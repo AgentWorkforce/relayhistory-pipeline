@@ -43,9 +43,12 @@ copy-everything-then-switch runbook (linuyc, uncommitted
 2. **Backfill never overwrites fresh data.** It inserts with
    `ON CONFLICT DO NOTHING` on the primary key. Rows written after T0 always
    win.
-3. **Sessions that straddle T0** have rows in both databases. Derived tables
-   (rollups, catalogs, agent index, search projections) are recomputed for
-   every touched session once its history lands, not copied blindly.
+3. **Triggers stay off for copies.** The backfill and the copy set run with
+   `session_replication_role = replica` in their own session, so historical
+   rows fire no projections, revision feed, wakeups or brief jobs. Every
+   table, derived ones included, is copied as Neon has it. Sessions that
+   straddle T0 have their rollups and caches rebuilt afterwards through the
+   live `*_rollup_dirty` triggers.
 4. **Ordering.** Parents are backfilled before children, newest first, so
    recent sessions become complete soonest. A per-table watermark is
    checkpointed so the job can resume.

@@ -21,6 +21,7 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
 | # | Action | Reversible? |
 | --- | --- | --- |
 | A1 | Create the Supabase credentials for `sessions` (`pyamkrhoyszgzirqqffq`): a schema-owner role for migrations and a runtime role for the Worker (owner of, or `BYPASSRLS` on, `sessions.machines`), both in 1Password `96Bulls-prod`; plus a read-only Neon role for copy and verify | yes (drop roles) |
+|    | Read-only check on Supabase, required before A3: `SELECT has_parameter_privilege(current_user, 'session_replication_role', 'SET')` must be true for the copy role, or the copier refuses to run | — |
 | A2 | Size the Supabase compute and disk for the eventual ~486 GiB plus growth | yes |
 | A3 | Apply the schema to Supabase: the 96Bulls migrations (`supabase db push`), then relayhistory-cloud's runner and rollouts with `DATABASE_MIGRATIONS_URL` set to Supabase | empty database: yes (drop schema) |
 | A4 | Pre-copy the T0 copy set (mirror) and apply the sequence fence on Supabase | yes, while Supabase takes no traffic |
@@ -100,11 +101,25 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
 
 ## After T0
 
-13. **[A8] Backfill**, newest first, throttled. Resume it with the same
-    checkpoint:
-    `bun run migration:copy --mode=backfill --tables=<all remaining legacy tables, parents first> --chunk-size=500 --checkpoint=/secure/t0/backfill.json`.
-    Recompute the derived tables per backfilled session (rollups, catalog,
-    agent index) by rerunning the rollout scripts' recompute paths.
+13. **[A8] Backfill.** Copy every legacy table, base and derived, newest key
+    first. The copier's session runs with triggers off
+    (`session_replication_role = replica`), so history lands exactly as Neon
+    has it. No revision feed, analysis wakeups, brief jobs or Cloud messages
+    are generated for old sessions. `ON CONFLICT DO NOTHING` keeps every row
+    written after T0.
+    ```sh
+    bun run migration:copy --mode=backfill --tables=<every legacy table, parents first> \
+      --chunk-size=500 --checkpoint=/secure/t0/backfill.json
+    ```
+    Resume with the same checkpoint. Throttle by running it off-peak if
+    Supabase p95 rises.
+    **Straddling sessions** (rows on both sides of T0): their rollups, timing
+    cache and catalog rows were built after T0 from partial data. After the
+    backfill, mark them dirty through the live triggers, without the replica
+    setting, so the database rebuilds them:
+    insert their keys into `session_rollup_dirty` and `onboarding_rollup_dirty`,
+    and delete their `session_timing_cache` rows. The straddling set is every
+    session with a `convergence_events` row on both sides of T0.
 14. **[A9]** Once the backfill verifier passes for every table, remove the
     Neon read fallback.
 

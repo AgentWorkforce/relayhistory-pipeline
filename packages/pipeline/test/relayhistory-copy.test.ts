@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   copyTable,
   planTable,
+  prepareTargetSession,
   type Queryable,
 } from "../../../src/migration/relayhistory-copy.js";
 
@@ -163,6 +164,43 @@ describe("backfill (history after T0)", () => {
     });
     expect(resumed).toMatchObject({ read: 2, written: 2 });
     expect((await dump(target)).map((row) => row.id)).toEqual(["1", "2"]);
+  });
+});
+
+describe("target session", () => {
+  it("lands rows without firing triggers, so history wakes nothing", async () => {
+    await target.exec(`CREATE TABLE sessions.wakeups (id bigint);
+      CREATE FUNCTION sessions.wake() RETURNS trigger LANGUAGE plpgsql AS
+        $$ BEGIN INSERT INTO sessions.wakeups VALUES (NEW.id); RETURN NEW; END $$;
+      CREATE TRIGGER wake AFTER INSERT ON sessions.tokens
+        FOR EACH ROW EXECUTE FUNCTION sessions.wake();`);
+    await insert(source, `('a', 1, NULL, NULL, NULL, NULL, NULL, 'h')`);
+    await prepareTargetSession(target as Queryable);
+    const plan = await planTable(source as Queryable, target as Queryable, "tokens");
+    await copyTable(source as Queryable, target as Queryable, plan, {
+      mode: "backfill",
+      chunkSize: 10,
+    });
+    expect((await dump(target)).map((row) => row.label)).toEqual(["h"]);
+    expect((await target.query("SELECT * FROM sessions.wakeups")).rows).toEqual([]);
+    // A live session (default role) still fires them.
+    await target.exec("SET session_replication_role = origin");
+    await insert(target, `('b', 2, NULL, NULL, NULL, NULL, NULL, 'live')`);
+    expect((await target.query("SELECT id::text FROM sessions.wakeups")).rows).toEqual([
+      { id: "2" },
+    ]);
+  });
+
+  it("fails closed when triggers cannot be disabled", async () => {
+    const refusing: Queryable = {
+      query: async (sql: string) =>
+        sql.startsWith("SHOW")
+          ? ({ rows: [{ session_replication_role: "origin" }] } as never)
+          : ({ rows: [] } as never),
+    };
+    await expect(prepareTargetSession(refusing)).rejects.toThrow(
+      "could not disable triggers",
+    );
   });
 });
 
