@@ -235,9 +235,9 @@ describe("RelayHistory export transform", () => {
       workspaceId: loc.workspaceId,
       manifestKey: f.key,
     };
-    const first = await transform.normalize(pointer);
+    const first = (await transform.normalize(pointer)) as NormalizedOutput;
     const second = await transform.normalize(pointer);
-    expect(second).toEqual(first);
+    expect(second).toEqual({ ...first, outputReused: true });
     expect(first.outputKey).toContain(f.manifest.raw.content_sha256);
     const body = new TextDecoder().decode(
       await readAll(await f.store.get(objectKey(first.outputKey!))),
@@ -258,7 +258,7 @@ describe("RelayHistory export transform", () => {
       const pointer = { traceId: TRACE, workspaceId: loc.workspaceId, manifestKey: f.key };
       const key = normalizedKey(
         loc,
-        1,
+        2,
         `relayhistory-${f.manifest.raw.content_sha256}.ndjson`,
       );
       return { ...f, transform, pointer, key: objectKey(key) };
@@ -282,7 +282,11 @@ describe("RelayHistory export transform", () => {
         outputBytes: stored.byteLength,
         convergenceEventCount: eventLines(stored),
         unprojectedRecords: 0,
+        revision: f.manifest.revision,
+        normalizedVersion: 2,
+        contentSha256: f.manifest.raw.content_sha256,
       });
+      expect(output.outputKey).toContain("/normalized/v2/");
       expect(output.convergenceEventCount).toBe(3);
     });
 
@@ -322,10 +326,104 @@ describe("RelayHistory export transform", () => {
       expect(await readAll(await f.store.get(f.key))).toEqual(stored);
     });
 
-    it("reports the same output when a run repeats identical content", async () => {
+    it("signals a reused object", async () => {
       const f = await setup();
-      const first = await f.transform.normalize(f.pointer);
-      expect(await f.transform.normalize(f.pointer)).toEqual(first);
+      expect(await f.transform.normalize(f.pointer)).toMatchObject({ outputReused: false, outputDivergent: false });
+      expect(await f.transform.normalize(f.pointer)).toMatchObject({ outputReused: true, outputDivergent: false });
+    });
+
+    it("signals a reused object that differs from this run's output", async () => {
+      const f = await setup();
+      await f.store.put(
+        f.key,
+        new TextEncoder().encode(`${JSON.stringify({ table: "convergence_events", row: { event_id: "x" } })}\n`),
+        { ifNoneMatch: true },
+      );
+      expect(await f.transform.normalize(f.pointer)).toMatchObject({ outputReused: true, outputDivergent: true });
+    });
+
+    const v1Key = (sha: string) => objectKey(normalizedKey(loc, 1, `relayhistory-${sha}.ndjson`));
+
+    it("never reads the retired v1 key", async () => {
+      const f = await setup();
+      const planted = new TextEncoder().encode("not read\n");
+      await f.store.put(v1Key(f.manifest.raw.content_sha256), planted, { ifNoneMatch: true });
+      expect(await f.transform.normalize(f.pointer)).toMatchObject({ outputKey: f.key, normalizedVersion: 2, outputReused: false });
+      expect(await readAll(await f.store.get(v1Key(f.manifest.raw.content_sha256)))).toEqual(planted);
+    });
+
+    it("never writes the retired v1 key", async () => {
+      const f = await setup();
+      await f.transform.normalize(f.pointer);
+      await expect(f.store.get(v1Key(f.manifest.raw.content_sha256))).rejects.toMatchObject({ code: "not_found" });
+    });
+
+    describe("the manifest version it was sent for", () => {
+      const read = { etag: "etag-now" };
+      const bound = async (revision: number) => {
+        const f = await setup();
+        const transform = new RelayhistoryExportTransform({
+          manifests: { ...f.reader, read: async () => ({ manifest: f.manifest, ...read }) } as never,
+          store: f.store,
+        });
+        return { ...f, bound: transform, revision: f.manifest.revision + revision };
+      };
+
+      it("no-ops a delayed message when a newer manifest stands, publishing nothing", async () => {
+        const f = await bound(-1);
+        expect(await f.bound.normalize(f.pointer, { revision: f.revision })).toEqual({ skipped: "stale_manifest" });
+        await expect(f.store.get(f.key)).rejects.toMatchObject({ code: "not_found" });
+      });
+
+      it("no-ops a same-revision message for another object version", async () => {
+        const f = await bound(0);
+        expect(
+          await f.bound.normalize(f.pointer, { revision: f.revision, workKey: `${f.pointer.manifestKey}@etag-then` }),
+        ).toEqual({ skipped: "stale_manifest" });
+        await expect(f.store.get(f.key)).rejects.toMatchObject({ code: "not_found" });
+      });
+
+      it("retries when the read lags the message", async () => {
+        const f = await bound(1);
+        await expect(f.bound.normalize(f.pointer, { revision: f.revision })).rejects.toMatchObject({
+          code: "manifest_behind_message",
+          retryable: true,
+        });
+      });
+
+      it("normalizes the version it was sent for", async () => {
+        const f = await bound(0);
+        expect(
+          await f.bound.normalize(f.pointer, { revision: f.revision, workKey: `${f.pointer.manifestKey}@etag-now` }),
+        ).toMatchObject({ outputKey: f.key, revision: f.revision });
+      });
+    });
+
+    it("caps decompression at the chunk's declared raw size", async () => {
+      const f = await setup();
+      const manifest = structuredClone(f.manifest);
+      manifest.raw.chunks[0]!.stored_raw_bytes = 1;
+      await expect(readRelayhistoryExport(manifest, f.store)).rejects.toMatchObject({
+        code: "chunk_decompress_failed",
+        retryable: false,
+      });
+    });
+
+    it.each([
+      ["a marker it cannot read", { version: 2, source: "neon.delivery_records" }],
+      ["a backfill with no marker", undefined],
+    ])("refuses %s rather than normalizing nothing", async (_name, marker) => {
+      const f = await setup();
+      const manifest = structuredClone(f.manifest);
+      manifest.extensions = marker ? { "client.relayhistory_export": marker } : {};
+      const transform = new RelayhistoryExportTransform({
+        manifests: { ...f.reader, read: async () => ({ manifest }) } as never,
+        store: f.store,
+      });
+      await expect(transform.normalize(f.pointer)).rejects.toMatchObject({
+        code: "relayhistory_export_marker_missing",
+        retryable: false,
+      });
     });
 
     it("refuses a stored object in the superseded envelope format", async () => {

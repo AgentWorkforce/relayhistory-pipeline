@@ -20,7 +20,7 @@ import {
   type ManifestV1,
   type ObjectStore,
 } from "./object-layout.js";
-import type { ManifestReader } from "./adapter.js";
+import type { ManifestRead, ManifestReader } from "./adapter.js";
 import { PipelineError } from "./errors.js";
 import {
   CONVERGENCE_EVENT_KIND,
@@ -29,12 +29,15 @@ import {
   type ProjectionRow,
 } from "./relayhistory-projection.js";
 import type {
+  NormalizeSkipped,
+  NormalizeTarget,
   NormalizedOutput,
   RawPointer,
   SessionTransform,
 } from "./stages.js";
 
-export const RELAYHISTORY_NORMALIZED_VERSION = 1;
+/** Bump with any change to the bytes projected from the same input: the object is create-only. */
+export const RELAYHISTORY_NORMALIZED_VERSION = 2;
 export const RELAYHISTORY_EXPORT_EXTENSION = "client.relayhistory_export";
 const MAX_RELAYHISTORY_CHUNK_BYTES = 16 * 1024 * 1024;
 const MAX_REVISION = 9_223_372_036_854_775_807n;
@@ -63,6 +66,14 @@ function exported(manifest: ManifestV1): boolean {
     !Array.isArray(marker) &&
     (marker as Record<string, unknown>).version === 1 &&
     (marker as Record<string, unknown>).source === "neon.delivery_records"
+  );
+}
+
+function carriesRecords(manifest: ManifestV1): boolean {
+  return (
+    manifest.extensions?.[RELAYHISTORY_EXPORT_EXTENSION] !== undefined ||
+    // A "resumed" epoch only ever follows a backfill.
+    manifest.raw.epochs.some((epoch) => epoch.reason === "backfill")
   );
 }
 
@@ -379,6 +390,31 @@ function parsedLine(line: string): { table?: unknown; row?: unknown } {
 }
 
 /**
+ * Whether `read` is the manifest version a message was enqueued for. Newer means
+ * the message is late, and that version's own event normalizes it. Older means
+ * the read lagged the event, which a retry settles.
+ */
+function currentForTarget(
+  read: ManifestRead,
+  manifestKey: string,
+  target: NormalizeTarget,
+): boolean {
+  const { revision } = read.manifest;
+  if (target.revision !== undefined && revision < target.revision)
+    throw new PipelineError(
+      "manifest_behind_message",
+      "the manifest read is older than the message's revision",
+      true,
+    );
+  if (target.revision !== undefined && revision > target.revision) return false;
+  const prefix = `${manifestKey}@`;
+  const expected = target.workKey?.startsWith(prefix)
+    ? target.workKey.slice(prefix.length)
+    : "";
+  return !expected || expected === read.version || expected === read.etag;
+}
+
+/**
  * Concrete file-normalize implementation for RelayHistory export manifests.
  * Non-export manifests are left for their harness-specific normalizers.
  */
@@ -393,12 +429,17 @@ export class RelayhistoryExportTransform implements SessionTransform {
 
   async normalize(
     pointer: RawPointer,
-  ): Promise<NormalizedOutput | Record<string, never>> {
+    target: NormalizeTarget = {},
+  ): Promise<NormalizedOutput | NormalizeSkipped | Record<string, never>> {
     if (pointer.deleted) return {};
     const read = await this.deps.manifests.read(pointer.manifestKey);
     if (!read) return {};
+    if (!currentForTarget(read, pointer.manifestKey, target))
+      return { skipped: "stale_manifest" };
     const manifest = read.manifest;
-    if (!exported(manifest)) return {};
+    // A harness log is left for its own normalizer. A marker this code cannot
+    // read, or a backfill without one, reaches the refusal in the reader below.
+    if (!carriesRecords(manifest)) return {};
     const records = await readRelayhistoryExport(
       manifest,
       this.deps.store,
@@ -437,12 +478,18 @@ export class RelayhistoryExportTransform implements SessionTransform {
     const stored = created
       ? body
       : await readAll(await this.deps.store.get(objectKey(key)));
+    const outputSha256 = await sha256Hex(stored);
     return {
       outputKey: key,
-      outputSha256: await sha256Hex(stored),
+      revision: manifest.revision,
+      normalizedVersion: RELAYHISTORY_NORMALIZED_VERSION,
+      contentSha256: manifest.raw.content_sha256,
+      outputSha256,
       outputBytes: stored.byteLength,
       convergenceEventCount: convergenceEventLines(stored),
       unprojectedRecords: projection.unprojected,
+      outputReused: !created,
+      outputDivergent: !created && outputSha256 !== (await sha256Hex(body)),
     };
   }
 }

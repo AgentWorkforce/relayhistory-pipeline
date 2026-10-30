@@ -110,10 +110,15 @@ class FakeTransform implements SessionTransform {
     );
     return {
       outputKey: pointer.manifestKey.replace("manifest.json", "normalized/v1/"),
+      revision: 1,
+      normalizedVersion: 2,
+      contentSha256: "0".repeat(64),
       outputSha256: "0".repeat(64),
       outputBytes: 0,
       convergenceEventCount: 0,
       unprojectedRecords: 0,
+      outputReused: false,
+      outputDivergent: false,
     };
   }
 }
