@@ -126,6 +126,29 @@ binds: 117 grants, each at most about 0.6 MB and 1,200 chunks. A 4,096-chunk
 manifest alone is about 0.6 MB, so the byte cap binds before the 50,000-chunk
 cap ever can.
 
+## Grant lifecycle (code only, not wired)
+
+`src/migration/relayhistory-export-grants.ts` has four commands: `dry-run`,
+`plan`, `apply` and `revoke`, with one grant per shard.
+
+- **`plan`:** produces an aggregate digest over the grant parameters, the
+  pinned membership snapshot id, every shard's id and plan-body digest, and
+  the exception list. A human approves that digest plus the snapshot id.
+- **`apply`:** fails closed on a missing, changed or stale snapshot, on any
+  pair exception, on digest drift, on partial shard state, or on an
+  unrecognized origin. It is idempotent per shard id. If it fails partway, it
+  revokes the grants created in that run.
+- **`revoke`:** with no shard ids, this is the rollback, and it writes
+  revocation evidence for each shard.
+
+**Membership:** in Cloud, a user may act on a workspace when they have an
+active `organization_memberships` row for the organization that owns it,
+joined to `workspaces`. There is no per-workspace table. Whether the export's
+ids are Cloud's ids is unverified, so the real reader stays unwired.
+
+**Not active:** the CLI refuses `apply` and `revoke`. Activation waits for the
+authoritative membership reader, the E3 HOLDs, and Khaliq's OK.
+
 ## Safety (reused from #28)
 
 - **Source:** Neon is read with `relayhistory_readonly` only.
