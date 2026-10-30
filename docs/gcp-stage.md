@@ -100,7 +100,9 @@ runtime Secret, and a dockerconfigjson image-pull Secret. After Memorystore is
 `READY`, an apply-time Action reads its public service-CA bundle from the exact
 Redis Admin resource and passes that bundle to the chart. `/readyz` and
 `/datapathz` perform a CA-validated, passwordless Redis `PING`; static
-`SERVER_AUTHENTICATION` environment strings are not accepted as proof. Redis
+`SERVER_AUTHENTICATION` environment strings are not accepted as proof. The
+verified peer chain must terminate at one of the exact per-instance CAs in the
+Admin API rotation bundle; a different valid CA is refused. Redis
 is a conformance/readiness dependency here, not the pipeline queue or cache.
 
 Relaycast, when configured, uses the exact published chart `0.1.0` package
@@ -165,7 +167,8 @@ To request the application release after its external Secrets exist, set
   "existingSecretName": "96bulls-runtime",
   "imagePullSecretName": "ghcr-pull",
   "imageDigest": "sha256:<digest-built-from-the-reviewed-main-commit>",
-  "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json"
+  "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
+  "relayauthIssuer": "http://relayauth.relayauth.svc:8787"
 }
 ```
 

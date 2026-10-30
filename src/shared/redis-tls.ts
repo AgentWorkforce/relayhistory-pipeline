@@ -1,3 +1,4 @@
+import { X509Certificate } from "node:crypto";
 import { connect as tlsConnect, type ConnectionOptions } from "node:tls";
 
 export interface RedisTlsEnv {
@@ -40,7 +41,20 @@ function privateIpv4(value: string): boolean {
     (parts[0] === 192 && parts[1] === 168);
 }
 
-function configured(env: RedisTlsEnv): { host: string; port: number; ca: string } | undefined {
+interface PeerChainCertificate {
+  raw?: Buffer;
+}
+
+function hasExpectedIssuer(cert: PeerChainCertificate, expected: ReadonlySet<string>): boolean {
+  if (!cert.raw) return false;
+  try {
+    return expected.has(new X509Certificate(cert.raw).issuer);
+  } catch {
+    return false;
+  }
+}
+
+function configured(env: RedisTlsEnv): { host: string; port: number; ca: string; caSubjects: ReadonlySet<string> } | undefined {
   const host = env.REDIS_HOST?.trim() ?? "";
   const portText = env.REDIS_PORT?.trim() ?? "";
   const ca = env.REDIS_TLS_CA_PEM?.trim() ?? "";
@@ -62,7 +76,16 @@ function configured(env: RedisTlsEnv): { host: string; port: number; ca: string 
     certificates.length > 4 ||
     remainder.length > 0
   ) return;
-  return { host, port: Number(portText), ca: `${certificates.join("\n")}\n` };
+  try {
+    return {
+      host,
+      port: Number(portText),
+      ca: `${certificates.join("\n")}\n`,
+      caSubjects: new Set(certificates.map((certificate) => new X509Certificate(certificate).subject)),
+    };
+  } catch {
+    return;
+  }
 }
 
 /**
@@ -95,11 +118,14 @@ export async function redisTlsPing(
           port: config.port,
           ca: config.ca,
           rejectUnauthorized: true,
-          // Memorystore exposes a private IP and a unique per-instance CA, not
-          // a DNS name. Google directs clients to authenticate that IP with
-          // the downloaded CA bundle. Chain verification remains mandatory;
-          // only DNS/IP SAN matching is inapplicable to this private endpoint.
-          checkServerIdentity: () => undefined,
+          // Memorystore exposes a private IP and unique per-instance CAs, not
+          // a DNS name. Require the verified peer chain to contain one of the
+          // exact downloaded trust anchors and require the leaf issuer to be
+          // one of those per-instance CAs. DNS/IP SAN matching is inapplicable.
+          checkServerIdentity: (_host, cert) =>
+            hasExpectedIssuer(cert as unknown as PeerChainCertificate, config.caSubjects)
+              ? undefined
+              : new Error("Redis peer does not chain to the expected per-instance CA"),
         },
         () => {
           if (!socket?.authorized) return finish({ ok: false, reason: "tls_failed" });

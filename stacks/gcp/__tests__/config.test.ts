@@ -48,6 +48,7 @@ describe("GCP self-host contract", () => {
       imagePullSecretName: "not a pull secret name",
       imageDigest: "not-a-digest",
       relayauthJwksUrl: "http://user:password@attacker.example/jwks?token=secret",
+      relayauthIssuer: "http://user:password@attacker.example",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
     expect(() => assertGcpRuntimeDeployable({ ...base, bulls96: disabled })).not.toThrow();
@@ -121,6 +122,7 @@ describe("GCP self-host contract", () => {
       imagePullSecretName: "ghcr-pull",
       imageDigest: `sha256:${"a".repeat(64)}`,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
+      relayauthIssuer: "http://relayauth.relayauth.svc:8787",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96 })).toThrow("managedDataPlane.provision");
     expect(() =>
@@ -162,6 +164,21 @@ describe("GCP self-host contract", () => {
       assertGcpInputs("gcp-dev", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, relayauthIssuer: "https://relay.example.com/issuer-path" },
+      }),
+    ).toThrow("RelayAuth origin");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        relayauth: { chartVersion: "0.1.0", existingSecretName: "relayauth-runtime", baseUrl: "https://auth.example.com" },
+        bulls96,
+      }),
+    ).toThrow("must match relayauth.baseUrl");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96,
       }),
     ).not.toThrow();
@@ -184,6 +201,7 @@ describe("GCP self-host contract", () => {
           imagePullSecretName: "ghcr-pull",
           imageDigest: `sha256:${"a".repeat(64)}`,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
+          relayauthIssuer: "http://relayauth.relayauth.svc:8787",
         },
         {
           bucket: "locker",
@@ -207,7 +225,15 @@ describe("GCP self-host contract", () => {
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
     expect(values).toMatchObject({
       worker: { imagePullSecrets: [{ name: "ghcr-pull" }], image: { digest: `sha256:${"a".repeat(64)}` }, locker: { credentials: { mode: "podIdentity" } } },
-      alleyoop: { imagePullSecrets: [{ name: "ghcr-pull" }], image: { digest: `sha256:${"a".repeat(64)}` }, locker: { credentials: { mode: "podIdentity" } } },
+      alleyoop: {
+        imagePullSecrets: [{ name: "ghcr-pull" }],
+        image: { digest: `sha256:${"a".repeat(64)}` },
+        locker: { credentials: { mode: "podIdentity" } },
+        auth: {
+          jwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
+          issuer: "http://relayauth.relayauth.svc:8787",
+        },
+      },
       hoopdb: { enabled: false },
       locker: { enabled: false },
     });

@@ -174,6 +174,8 @@ export interface GcpInputs {
     imageDigest: string;
     /** Public HTTPS or the in-cluster RelayAuth service. Alleyoop refuses to render without it. */
     relayauthJwksUrl: string;
+    /** Exact token issuer: public HTTPS or the in-cluster RelayAuth service origin. */
+    relayauthIssuer: string;
   };
 }
 
@@ -341,6 +343,9 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     if (!/^sha256:[a-f0-9]{64}$/.test(inputs.bulls96.imageDigest))
       throw new Error("96bulls: bulls96.imageDigest must be an immutable sha256 digest");
     requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", inputs.bulls96.relayauthJwksUrl);
+    requireRelayauthIssuer("bulls96.relayauthIssuer", inputs.bulls96.relayauthIssuer);
+    if (inputs.relayauth?.baseUrl && inputs.bulls96.relayauthIssuer !== inputs.relayauth.baseUrl)
+      throw new Error("96bulls: bulls96.relayauthIssuer must match relayauth.baseUrl for the in-stage RelayAuth release");
   }
 }
 
@@ -459,6 +464,34 @@ function requireRelayauthJwksUrl(label: string, value: string): void {
     throw new Error(`96bulls: ${label} must be public HTTPS or the in-cluster RelayAuth service`);
 }
 
+function requireRelayauthIssuer(label: string, value: string): void {
+  let issuer: URL;
+  try {
+    issuer = new URL(value);
+  } catch {
+    throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`);
+  }
+  const hostname = issuer.hostname.replace(/\.$/, "").toLowerCase();
+  const inCluster =
+    issuer.protocol === "http:" &&
+    /^relayauth\.[a-z0-9-]+\.svc(?:\.cluster\.local)?$/.test(hostname);
+  const publicHttps =
+    issuer.protocol === "https:" &&
+    hostname.includes(".") &&
+    hostname !== "localhost" &&
+    !hostname.endsWith(".localhost") &&
+    !hostname.endsWith(".local") &&
+    isIP(hostname) === 0;
+  if (
+    issuer.username ||
+    issuer.password ||
+    (!inCluster && !publicHttps) ||
+    issuer.pathname !== "/" ||
+    issuer.search ||
+    issuer.hash
+  ) throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`);
+}
+
 function plainSetting(label: string, value: unknown): void {
   if (typeof value !== "string") return;
   if (value.includes("://") || value.includes("@") || value.includes("BEGIN "))
@@ -495,6 +528,7 @@ export function bulls96ReleaseValues(
     throw new Error("96bulls: redis port must be numeric. Nothing was created.");
   const redisPort = typeof managed.redisPort === "number" ? String(managed.redisPort) : managed.redisPort;
   requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", i.relayauthJwksUrl);
+  requireRelayauthIssuer("bulls96.relayauthIssuer", i.relayauthIssuer);
   const identity = { "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail };
   const dataEnv = () => [
     { name: "LOCKER_PROVIDER", value: "gcs" },
@@ -539,7 +573,7 @@ export function bulls96ReleaseValues(
       image: { digest: i.imageDigest },
       hoopdb: hoopdb(),
       locker: locker(),
-      auth: { jwksUrl: i.relayauthJwksUrl },
+      auth: { jwksUrl: i.relayauthJwksUrl, issuer: i.relayauthIssuer },
       serviceAccount: { annotations: { ...identity } },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
       extraEnv: dataEnv(),

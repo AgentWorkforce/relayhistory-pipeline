@@ -1,8 +1,10 @@
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
+import { X509Certificate } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import { redisTlsPing, type RedisTlsConnector } from "../redis-tls.ts";
 
-const ca = "-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n";
+const ca = readFileSync(new URL("../../../certs/supabase-prod-ca-2021.crt", import.meta.url), "utf8");
 const valid = {
   REDIS_HOST: "10.80.7.195",
   REDIS_PORT: "6378",
@@ -58,7 +60,16 @@ describe("Redis TLS readiness", () => {
       ca,
       rejectUnauthorized: true,
     });
-    expect(typeof ok.options()?.checkServerIdentity).toBe("function");
+    const checkServerIdentity = ok.options()?.checkServerIdentity as
+      | ((host: string, cert: Record<string, unknown>) => Error | undefined)
+      | undefined;
+    expect(typeof checkServerIdentity).toBe("function");
+    expect(checkServerIdentity?.("10.80.7.195", {
+      raw: new X509Certificate(ca).raw,
+    })).toBeUndefined();
+    expect(checkServerIdentity?.("10.80.7.195", {
+      raw: Buffer.from("wrong-ca"),
+    })).toBeInstanceOf(Error);
 
     expect(await redisTlsPing(valid, connector("-NOAUTH nope\r\n").connect))
       .toEqual({ ok: false, reason: "unexpected_response" });
