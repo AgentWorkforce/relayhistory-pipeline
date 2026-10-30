@@ -317,7 +317,10 @@ async function main() {
       if (stageArg.startsWith("gcp-")) {
         // Fail closed. A non-zero Alchemy status exits this process. Do not run a plan,
         // create the state bucket, or enable APIs until that plan is separately approved.
-        return void sh("bunx", ["alchemy", "plan", "--config", "stacks/gcp/alchemy.gcp.run.ts", "--stage", stageArg, "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: false });
+        return void sh("bunx", ["alchemy", "plan", "--config", "stacks/gcp/alchemy.gcp.run.ts", "--stage", stageArg, "--no-input"], {
+          env: { ALCHEMY_PLAIN: "1", ALCHEMY_STAGE: stageArg },
+          allowFail: false,
+        });
       }
       return void sh("bunx", ["alchemy", "plan", "--stage", requireLocalStage(stageArg), "--no-input"], { env: { ALCHEMY_PLAIN: "1" } });
     }

@@ -1,10 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   GCP_CONFIRM_PROJECT_ENV,
-  GCP_CONFIRM_KUBERNETES_APPLY_ENV,
   GCP_CONFIRM_SQL_POST_ENV,
   assertGcpSqlPostConfirmation,
-  assertGcpKubernetesApplyConfirmation,
 } from "../config.ts";
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "../deploy-guard.ts";
 
@@ -55,13 +53,5 @@ describe("GCP deployment target guard", () => {
     expect(() =>
       assertGcpSqlPostConfirmation("agentworkforce-dev1", "awf-dev-postgres", expectedValue),
     ).not.toThrow();
-  });
-
-  test("requires the fresh apply id before the Kubernetes reachability action runs", () => {
-    const applyId = "c05b704a-62d1-4d70-a1f9-a98c9e45bb25";
-    expect(() => assertGcpKubernetesApplyConfirmation(applyId, undefined)).toThrow(
-      new RegExp(`${GCP_CONFIRM_KUBERNETES_APPLY_ENV}=${applyId}.*No Kubernetes objects were applied`),
-    );
-    expect(() => assertGcpKubernetesApplyConfirmation(applyId, applyId)).not.toThrow();
   });
 });

@@ -21,6 +21,7 @@ const input = {
   instanceName: "awf-dev-postgres",
   networkName: "awf-dev-vpc",
   allocatedIpRange: "awf-dev-psa",
+  allocatedIpCidr: "10.80.0.0/20",
 };
 
 describe("Cloud SQL private attachment", () => {
@@ -199,7 +200,7 @@ function matchingInstance(spec: PrivateCloudSqlSpec, ipPatch: Record<string, unk
       backupConfiguration: spec.insertBody.settings.backupConfiguration,
       ipConfiguration,
     },
-    ipAddresses: [{ type: "PRIVATE", ipAddress: "10.52.0.5" }],
+    ipAddresses: [{ type: "PRIVATE", ipAddress: "10.80.0.5" }],
     state: "RUNNABLE",
   };
 }
@@ -449,7 +450,7 @@ describe("SQL Admin idempotent poster", () => {
 
   test("rejects PRIVATE labels with malformed or whitespace address values", async () => {
     const spec = privateCloudSqlSpec(input);
-    for (const ipAddress of ["", "10.52.0.5 ", "not-an-ip", "999.52.0.5"]) {
+    for (const ipAddress of ["", "10.80.0.5 ", "not-an-ip", "999.52.0.5"]) {
       const poster = scripted([
         { status: 200, body: { ...matchingInstance(spec), ipAddresses: [{ type: "PRIVATE", ipAddress }] } },
       ]);
@@ -458,6 +459,22 @@ describe("SQL Admin idempotent poster", () => {
       );
       expect(poster.calls.map((call) => call.method)).toEqual(["GET"]);
     }
+  });
+
+  test("rejects public, mislabeled, or out-of-PSA addresses", async () => {
+    const spec = privateCloudSqlSpec(input);
+    for (const ipAddress of ["203.0.113.7", "10.52.0.5", "192.168.1.4", "2001:db8::1"]) {
+      const poster = scripted([
+        { status: 200, body: { ...matchingInstance(spec), ipAddresses: [{ type: "PRIVATE", ipAddress }] } },
+      ]);
+      await expect(ensurePrivateCloudSql(spec, credential, poster.transport, fastPoll())).rejects.toThrow(
+        /does not match the private body/,
+      );
+    }
+    expect(() => privateCloudSqlSpec({ ...input, allocatedIpCidr: "203.0.113.0/24" })).toThrow(/RFC1918/);
+    expect(() => privateCloudSqlSpec({ ...input, allocatedIpCidr: "10.80.0.1/20" })).toThrow(/RFC1918/);
+    expect(() => privateCloudSqlSpec({ ...input, allocatedIpCidr: "172.16.0.0/8" })).toThrow(/RFC1918/);
+    expect(() => privateCloudSqlSpec({ ...input, allocatedIpCidr: "192.168.0.0/8" })).toThrow(/RFC1918/);
   });
 
   test("polls a pending create that has not received an address yet", async () => {
@@ -516,6 +533,27 @@ describe("SQL Admin idempotent poster", () => {
     expect(Date.now() - started).toBeLessThan(500);
   });
 
+  test("post-request deadline check catches synchronous event-loop blocking", async () => {
+    const blocker = new Int32Array(new SharedArrayBuffer(4));
+    const started = performance.now();
+    await expect(
+      ensurePrivateCloudSql(
+        privateCloudSqlSpec(input),
+        credential,
+        {
+          request: async () => {
+            // A timer and AbortSignal cannot run while JS is blocked. The
+            // monotonic post-request check must still refuse this response.
+            Atomics.wait(blocker, 0, 0, 25);
+            return { status: 200, body: matchingInstance(privateCloudSqlSpec(input)) };
+          },
+        },
+        { deadlineMs: 10, requestTimeoutMs: 100, intervalMs: 1, maxPolls: 2, now: performance.now, sleep: Bun.sleep },
+      ),
+    ).rejects.toThrow(/lookup timed out/);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
   test("uses one outer deadline through lookup, insert, operation, and final confirmation", async () => {
     const spec = privateCloudSqlSpec(input);
     let nowMs = 0;
@@ -548,7 +586,7 @@ describe("SQL Admin idempotent poster", () => {
           maxPolls: 10,
         },
       ),
-    ).rejects.toThrow(/operation timed out/);
+    ).rejects.toThrow(/outcome is uncertain/);
     expect(calls.map((call) => call.method)).toEqual(["GET", "POST", "GET"]);
   });
 

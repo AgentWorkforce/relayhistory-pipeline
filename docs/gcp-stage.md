@@ -60,6 +60,12 @@ Private Service Access connection resolves; its output gates the proxy IAM,
 deployment, and Helm wiring. `GCP.SQL.Instance` is not called, because that
 resource drops `privateNetwork` and can create a public instance.
 
+The Private Service Access allocation is explicitly `10.80.0.0/20`. A
+RUNNABLE Cloud SQL instance is accepted only when every returned address is a
+syntactically valid RFC1918 `PRIVATE` IPv4 inside that exact allocation. A
+public, mislabeled, whitespace-bearing, malformed, or other-private-range
+address is refused.
+
 ## Truthful feature gates
 
 The released Relaycast self-host runtime is SQLite plus local file storage. Its
@@ -101,7 +107,8 @@ with SHA-256
 and image
 `ghcr.io/agentworkforce/relaycast-self-host@sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98`.
 The stack verifies the package bytes before provider resolution, extracts those
-verified bytes, and renders that local chart rather than re-resolving a mutable
+verified bytes into a deterministic digest-addressed directory, and renders
+that local chart rather than re-resolving a mutable
 repository index. Ingress and GKE ManagedCertificate are disabled. The service
 is ClusterIP and the chart NetworkPolicy accepts callers only from its
 namespace. `baseUrl` remains the chart-required signed-URL authority; it does
@@ -134,7 +141,7 @@ or secret payload. Example:
   "kubernetesExecutor": {
     "name": "replace-with-named-vpc-or-vpn-runner",
     "mode": "vpn",
-    "applyId": "replace-with-a-fresh-uuidv4-for-each-kubernetes-apply"
+    "identity": "gcp-vpn-runner@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com"
   },
   "clearedBy": "Khaliq's exact clearance words, YYYY-MM-DD",
   "managedDataPlane": { "provision": false },
@@ -157,17 +164,39 @@ exists but before the first Kubernetes resource, an apply-time Action requires
 that named `in-vpc` or `vpn` executor to open TCP 443 to GKE's concrete RFC1918
 endpoint within five seconds. Failure stops execution before Kubernetes
 manifests or Helm charts. The probe carries no bearer or kubeconfig credential.
-`applyId` must be a fresh UUIDv4 for every intended Kubernetes apply; changing
-it forces the persisted Action to run again instead of reusing an earlier route
-proof. The apply must also set
-`NINETY_SIX_BULLS_CONFIRM_GCP_KUBERNETES_APPLY` to that exact UUID. Do not set
-that confirmation for a read-only plan.
+
+Every apply additionally requires
+`NINETY_SIX_BULLS_GCP_APPLY_NONCE` to contain a fresh Google-signed OIDC ID
+token for that exact executor service account. Its audience must be
+`https://96bulls.agentworkforce.dev/gcp-apply/<project>/<stage>`, and its signed
+email must equal `kubernetesExecutor.identity`. The stack verifies Google's
+signature, issuer, audience, email, issue time, and expiry, then atomically
+records the token digest in both a stage-scoped local ledger and an
+`ifGenerationMatch=0` marker under the existing Alchemy state bucket. The
+state-bucket marker makes the nonce single-use across executors and machines;
+it contains only proof metadata and a digest, never the token. Tokens older
+than five minutes, expiring tokens, wrong-stage/project/identity tokens, and
+replays are refused. The token is read only by the apply-time Action and is not
+written to Alchemy inputs, outputs, state, annotations, or errors. Its digest
+changes the Action input and gates every declared GCP and Kubernetes mutation.
+Plan does not execute or consume the nonce Action and performs no cloud
+mutation.
+
+The principal that mints or impersonates the executor identity needs the
+organization-approved ID-token mechanism (for impersonation, normally
+`roles/iam.serviceAccountTokenCreator` on that executor account). Separately,
+the deploying principal must have `iam.serviceAccounts.actAs`, normally via
+`roles/iam.serviceAccountUser`, on the dedicated GKE node service account. A
+read-only `testIamPermissions` Action proves `actAs` after the node account
+exists and before GKE creation; the cluster depends on that proof. These are
+external IAM prerequisites, not grants made by this stack.
 
 Before any plan, authenticate with the intended GCP identity and confirm the
 project independently:
 
 ```sh
 export CI=true
+export ALCHEMY_STAGE=gcp-conformance
 export NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT=agentrelay-96bulls-soc2-2610
 bin/96bulls plan gcp-conformance
 ```
@@ -183,7 +212,11 @@ do not call Google APIs, and they are not a cloud proof.
 
 Before evaluating a Relaycast stage, place the exact public release artifact at
 `.96bulls/$STAGE/artifacts/relaycast-0.1.0.tgz`. The stack refuses a missing or
-digest-mismatched package before provider resolution. The pinned 8.0.0 image
+digest-mismatched package before constructing the Alchemy Stack, provider
+layers, or state backend. It reads the source artifact once, verifies those
+captured bytes, and extracts only that buffer to a SHA-256-addressed cache
+path; it never reopens the source between verification and extraction. The
+pinned 8.0.0 image
 predates later workspace-bootstrap Secret support, so this lane does not pass
 an ineffective Secret setting. There is no Relaycast Ingress, load balancer,
 ManagedCertificate, or public DNS claim in this stack.
@@ -209,12 +242,15 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
   authorized network, disabled backup/PITR, or mismatched name, region,
   version, edition, tier, availability, VPC, or PSA range is refused with no
   update. A match also requires `state: RUNNABLE` and one or more syntactically
-  valid `PRIVATE` IP addresses. A finished create polls
+  valid `PRIVATE` IP addresses inside the configured `10.80.0.0/20` PSA
+  allocation. A finished create polls
   `operations/{id}` until `DONE`, then gets the instance and refuses the
   result unless that private body is `RUNNABLE`. A thrown insert, a failed operation, or a
   timeout says to reconcile and does not say that nothing was created. One
-  absolute deadline covers lookup, insert, 409 adoption, operation polling,
-  sleeps, and final confirmation, even when a transport ignores abort. Error
+  absolute monotonic deadline covers lookup, insert, 409 adoption, operation
+  polling, sleeps, and final confirmation. It is checked before and after every
+  request and sleep and before terminal success, including when a transport
+  ignores abort or synchronously blocks the event loop. Error
   text omits the response body and the bearer. The apply-time Action calls the
   poster through an exact-host/path allowlisted transport and requires the
   separate exact apply confirmation

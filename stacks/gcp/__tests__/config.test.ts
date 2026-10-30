@@ -16,7 +16,7 @@ import {
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
-  verifyRelaycastChartPackage,
+  captureRelaycastChartPackage,
   type GcpInputs,
 } from "../config.ts";
 
@@ -28,7 +28,7 @@ const base: GcpInputs = {
   kubernetesExecutor: {
     name: "gcp-vpn-runner-01",
     mode: "vpn",
-    applyId: "c05b704a-62d1-4d70-a1f9-a98c9e45bb25",
+    identity: "gcp-vpn-runner@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com",
   },
 };
 
@@ -36,6 +36,7 @@ describe("GCP self-host contract", () => {
   it("accepts a substrate-only stage without pretending managed services are attached", () => {
     expect(() => assertGcpInputs("gcp-dev", base)).not.toThrow();
     expect(() => assertGcpRuntimeDeployable(base)).not.toThrow();
+    expect(() => assertGcpInputs("gcp-../../outside", base)).toThrow(/safe gcp-\* stage/);
   });
 
   it("does not throw when bulls96 is disabled", () => {
@@ -233,7 +234,10 @@ describe("GCP self-host contract", () => {
     const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
     expect(stack).toContain("enablePrivateEndpoint: GCP_RUNTIME_SHAPE.privateEndpoint");
     expect(stack).toContain("autopilot: GCP_RUNTIME_SHAPE.autopilot");
-    expect(stack).toContain("serviceAccount: nodeIdentity.email");
+    expect(stack).toContain("serviceAccount: nodeActAs.serviceAccountEmail");
+    expect(stack.indexOf('RequireNodeActAs("node-act-as"')).toBeLessThan(
+      stack.indexOf('GCP.Container.Cluster("cluster"'),
+    );
     expect(stack).toContain("nodeLocations: [GCP_RUNTIME_SHAPE.nodeLocation]");
     expect(stack).toContain("natIpAllocateOption: GCP_RUNTIME_SHAPE.natIpAllocateOption");
     expect(stack).toContain("filter: GCP_RUNTIME_SHAPE.natLogFilter");
@@ -246,6 +250,25 @@ describe("GCP self-host contract", () => {
     expect(stack).not.toContain("Shared VPC");
   });
 
+  it("gates the mutation graph on a fresh, globally single-use executor proof", () => {
+    const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+    const applyAuthorization = readFileSync(new URL("../apply-authorization.ts", import.meta.url), "utf8");
+    const authorization = stack.indexOf('RequireGcpApplyAuthorization("apply-authorization"');
+    const firstGcpMutation = stack.indexOf("GCP.ServiceUsage.ProjectService(");
+    expect(authorization).toBeGreaterThan(0);
+    expect(authorization).toBeLessThan(firstGcpMutation);
+    expect(stack).toContain("consumeGcpApplyNonceGlobally(");
+    expect(applyAuthorization).toContain('url.searchParams.set("ifGenerationMatch", "0")');
+    expect(stack).toContain("Output.map(applyAuthorization.proof");
+    expect(stack).toContain("authorization: applyAuthorization");
+    expect(stack.indexOf('RequireNodeActAs("node-act-as"')).toBeLessThan(
+      stack.indexOf('GCP.Container.Cluster("cluster"'),
+    );
+    expect(stack.indexOf('RequireKubernetesReachability("kubernetes-reachability"')).toBeLessThan(
+      stack.indexOf('Kubernetes.Manifest("relaycast-namespace"'),
+    );
+  });
+
   it("requires the named private-route executor before any chart is allowed", () => {
     expect(() =>
       assertGcpInputs("gcp-dev", {
@@ -253,24 +276,27 @@ describe("GCP self-host contract", () => {
         kubernetesExecutor: undefined,
         relaycast: { chartVersion: "0.1.0", baseUrl: "https://relay.gcp.example.com" },
       }),
-    ).toThrow(/named in-vpc or vpn kubernetesExecutor/);
+    ).toThrow(/named executor identity and fresh signed nonce/);
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
-        kubernetesExecutor: { name: "gcp-vpn-runner-01", mode: "vpn", applyId: "reused-or-not-a-uuid" },
+        kubernetesExecutor: { name: "gcp-vpn-runner-01", mode: "vpn", identity: "not-a-service-account" },
       }),
-    ).toThrow(/fresh UUIDv4/);
+    ).toThrow(/Google service-account email/);
   });
 
   it("rejects a missing or digest-mismatched Relaycast package", () => {
     const dir = mkdtempSync(join(tmpdir(), "96bulls-chart-test-"));
     try {
       const path = join(dir, "relaycast-0.1.0.tgz");
-      expect(() => verifyRelaycastChartPackage(path)).toThrow(/package is missing/);
+      expect(() => captureRelaycastChartPackage(path)).toThrow(/package is missing/);
       writeFileSync(path, "not-the-published-chart");
-      expect(() => verifyRelaycastChartPackage(path)).toThrow(/digest does not match/);
+      expect(() => captureRelaycastChartPackage(path)).toThrow(/digest does not match/);
       const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
-      expect(stack).toContain("verifyRelaycastChartPackage");
+      expect(stack).toContain("captureRelaycastChartPackage");
+      expect(stack).toContain("writeFileSync(artifact, captured.bytes");
+      expect(stack).not.toContain("readFileSync(captured.sourcePath");
+      expect(stack).toContain("invocationId: APPLY_INVOCATION_ID");
       expect(stack).toContain('chart: relaycastChart!');
       expect(stack).not.toContain('chart: "relaycast"');
     } finally {

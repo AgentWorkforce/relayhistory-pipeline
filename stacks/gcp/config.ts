@@ -4,7 +4,7 @@ import { isIP } from "node:net";
 
 export const GCP_CONFIRM_PROJECT_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT";
 export const GCP_CONFIRM_SQL_POST_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_SQL_POST";
-export const GCP_CONFIRM_KUBERNETES_APPLY_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_KUBERNETES_APPLY";
+export const GCP_APPLY_NONCE_ENV = "NINETY_SIX_BULLS_GCP_APPLY_NONCE";
 
 /** The only project this lane may plan. Any other id, number, org, billing account, or region is refused. */
 export const GCP_APPROVED_TARGET = {
@@ -47,7 +47,14 @@ export const GCP_NODE_ROLES = [
   "roles/container.defaultNodeServiceAccount",
 ] as const;
 
-export function verifyRelaycastChartPackage(path: string): string {
+export interface CapturedRelaycastChartPackage {
+  readonly bytes: Buffer;
+  readonly digest: string;
+  readonly sourcePath: string;
+}
+
+/** Read once, then verify those exact bytes. Callers must never reopen sourcePath. */
+export function captureRelaycastChartPackage(path: string): CapturedRelaycastChartPackage {
   let bytes: Buffer;
   try {
     bytes = readFileSync(path);
@@ -59,7 +66,7 @@ export function verifyRelaycastChartPackage(path: string): string {
   const digest = createHash("sha256").update(bytes).digest("hex");
   if (digest !== RELAYCAST_PUBLISHED_CHART.packageDigest)
     throw new Error("96bulls: Relaycast chart package digest does not match published 0.1.0. Nothing was created.");
-  return path;
+  return { bytes, digest, sourcePath: path };
 }
 
 export function isPublishedHelmRepo(repo: string | undefined): boolean {
@@ -124,8 +131,8 @@ export interface KubernetesExecutorInputs {
   name: string;
   /** The runner must have a route to the cluster's private control plane. */
   mode: "in-vpc" | "vpn";
-  /** A fresh UUID for each intended Kubernetes apply; persisted Action input prevents stale proof reuse. */
-  applyId: string;
+  /** Google service-account identity whose signed OIDC token authorizes this apply. */
+  identity: string;
 }
 
 export interface GcpInputs {
@@ -137,7 +144,7 @@ export interface GcpInputs {
   /** Operator/VPN ranges allowed to reach the private GKE API endpoint. */
   controlPlaneAuthorizedCidrs: Array<{ cidrBlock: string; displayName?: string }>;
   /** Required before this stack declares any Kubernetes object or Helm chart. */
-  kubernetesExecutor?: KubernetesExecutorInputs;
+  kubernetesExecutor: KubernetesExecutorInputs;
   /** Khaliq's words and date recording that a real GCP plan/deploy is cleared. */
   clearedBy: string;
   chartRepo?: string;
@@ -162,10 +169,12 @@ export interface GcpInputs {
 }
 
 const PROJECT_ID = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
+const GCP_STAGE = /^gcp-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const PROJECT_NUMBER = /^[0-9]{6,20}$/;
 const REGION = /^[a-z]+(?:-[a-z0-9]+)+[0-9]$/;
 const SEMVER = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
 const KUBERNETES_NAME = /^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$/;
+const EXECUTOR_IDENTITY = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 
 /** Keep long stage names distinct while preserving a human-readable suffix. */
 export function gcpResourceName(stage: string, suffix: string, max = 40): string {
@@ -229,7 +238,7 @@ function requirePublicHttpsOrigin(label: string, value: string): URL {
 }
 
 export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
-  if (!stage.startsWith("gcp-")) throw new Error(`96bulls: GCP config requires a gcp-* stage, got ${stage}`);
+  if (!GCP_STAGE.test(stage)) throw new Error(`96bulls: GCP config requires a safe gcp-* stage, got ${stage}`);
   if (!PROJECT_ID.test(inputs.projectId)) throw new Error("96bulls: gcp projectId is invalid");
   if (!PROJECT_NUMBER.test(inputs.projectNumber)) throw new Error("96bulls: gcp projectNumber is invalid");
   if (!/^[0-9]{6,20}$/.test(inputs.organizationId)) throw new Error("96bulls: gcp organizationId is invalid");
@@ -261,21 +270,16 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     )
       throw new Error(`96bulls: unsafe or invalid control-plane CIDR ${cidrBlock}`);
   }
-  if (inputs.kubernetesExecutor) {
+  if (!inputs.kubernetesExecutor)
+    throw new Error("96bulls: every GCP apply requires a named executor identity and fresh signed nonce");
+  {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,62}$/.test(inputs.kubernetesExecutor.name))
       throw new Error("96bulls: kubernetesExecutor.name must identify a named runner, never an address or credential");
     if (inputs.kubernetesExecutor.mode !== "in-vpc" && inputs.kubernetesExecutor.mode !== "vpn")
       throw new Error("96bulls: kubernetesExecutor.mode must be in-vpc or vpn");
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(inputs.kubernetesExecutor.applyId))
-      throw new Error("96bulls: kubernetesExecutor.applyId must be a fresh UUIDv4 for this apply");
+    if (!EXECUTOR_IDENTITY.test(inputs.kubernetesExecutor.identity))
+      throw new Error("96bulls: kubernetesExecutor.identity must be a Google service-account email");
   }
-  if (
-    (inputs.relaycast || inputs.relayauth || inputs.relayfile || inputs.relayflows || inputs.bulls96?.enabled) &&
-    !inputs.kubernetesExecutor
-  )
-    throw new Error(
-      "96bulls: Kubernetes charts require a named in-vpc or vpn kubernetesExecutor reachability preflight. Nothing was created.",
-    );
   if (inputs.chartRepo) {
     const repo = new URL(inputs.chartRepo);
     if (repo.protocol !== "https:" || repo.username || repo.password)
@@ -350,16 +354,6 @@ export function assertGcpSqlPostConfirmation(
   if (confirmation !== expected)
     throw new Error(
       `96bulls: set ${GCP_CONFIRM_SQL_POST_ENV}=${expected} for the apply-time Cloud SQL insert. Nothing was created.`,
-    );
-}
-
-export function assertGcpKubernetesApplyConfirmation(
-  applyId: string,
-  confirmation: string | undefined,
-): void {
-  if (confirmation !== applyId)
-    throw new Error(
-      `96bulls: set ${GCP_CONFIRM_KUBERNETES_APPLY_ENV}=${applyId} for this Kubernetes apply. No Kubernetes objects were applied.`,
     );
 }
 
