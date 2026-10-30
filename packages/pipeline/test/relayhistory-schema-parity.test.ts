@@ -9,9 +9,10 @@
  * with the same types, and no new column a legacy INSERT cannot satisfy. Both
  * migration sets keep shipping after T0, so both apply orders must hold.
  *
- * The legacy migrations are pinned in `vendor/relayhistory-cloud`
- * (`scripts/sync-relayhistory-schema.sh`). Live catalogs (out-of-band indexes,
- * the 0029 rollout) are checked separately by the read-only verifier.
+ * The legacy migrations and the runner's concurrent indexes are pinned in
+ * `vendor/relayhistory-cloud` (`scripts/sync-relayhistory-schema.sh`). Live
+ * catalogs (out-of-band indexes, the 0029 rollout) are checked separately by
+ * the read-only verifier.
  */
 import { PGlite } from "@electric-sql/pglite";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
@@ -47,12 +48,24 @@ CREATE TABLE IF NOT EXISTS sessions.__migrations (
   checksum text NOT NULL,
   applied_at timestamptz NOT NULL DEFAULT now()
 );`;
+// After the migrations commit, the runner builds hot-table indexes CONCURRENTLY
+// (CONCURRENT_INDEXES, extracted by the sync script). They are part of the
+// production schema even though no migration file creates them.
+const runnerIndexes = (
+  JSON.parse(read("vendor/relayhistory-cloud/concurrent-indexes.json")) as {
+    name: string;
+    definition: string;
+  }[]
+)
+  .map((index) => `CREATE INDEX IF NOT EXISTS ${index.name} ${index.definition};`)
+  .join("\n");
 const legacy = [
   { name: "legacy runner prelude", sql: LEGACY_RUNNER },
   ...sqlFiles("vendor/relayhistory-cloud/migrations/").map((m) => ({
     ...m,
     sql: forPglite(m.sql),
   })),
+  { name: "legacy runner concurrent indexes", sql: forPglite(runnerIndexes) },
 ];
 const bulls = sqlFiles("supabase/migrations/").map((m) => ({
   ...m,
@@ -208,11 +221,12 @@ function gaps(source: Catalog, target: Catalog): string[] {
 }
 
 describe("RelayHistory schema on the Supabase sessions project", () => {
-  it("pins a non-empty legacy migration set", () => {
+  it("pins a non-empty legacy migration set and the runner's indexes", () => {
     expect(read("vendor/relayhistory-cloud/SOURCE")).toMatch(
       /^AgentWorkforce\/relayhistory-cloud [0-9a-f]{40}:/,
     );
-    expect(legacy.length).toBeGreaterThan(0);
+    expect(legacy.length).toBeGreaterThan(2);
+    expect(runnerIndexes).toMatch(/convergence_events_content_prefix_trgm_idx/);
   });
 
   it.each([
