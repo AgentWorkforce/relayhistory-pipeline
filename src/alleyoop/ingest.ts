@@ -13,6 +13,7 @@ import {
   postgresDeadLetterStore,
   postgresPipelineQueue,
   requireAuth,
+  SCRUB_REFUSAL_CODES,
   TRACE_ID_HEADER,
   traceIdFromHeaders,
   type AppEnv,
@@ -33,6 +34,7 @@ import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedMigrationNames } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
 import { createCourierManifestRoutes } from "./manifests.ts";
+import { requestLog } from "./request-log.ts";
 
 export async function buildIngestApp() {
   const port = integer("INGEST_PORT", 8080);
@@ -71,6 +73,9 @@ export async function buildIngestApp() {
     sink: () => sink,
     deadLetters: () => deadLetters,
     send,
+    onChunkRefused: (code) => {
+      if (SCRUB_REFUSAL_CODES.has(code)) log.warn("scrub refused", { kind: "scrub_refusal", error_code: code, route: "/v1/pipeline/chunks" });
+    },
   });
   const courierManifests = createCourierManifestRoutes({ manifests: reader, raw: lockerStore(), send });
 
@@ -88,11 +93,7 @@ export async function buildIngestApp() {
     if (traceId) c.header(TRACE_ID_HEADER, traceId);
   });
   // One allowlisted request line per request (method, route status, duration; never bodies or query values).
-  app.use("*", async (c, next) => {
-    const started = Date.now();
-    await next();
-    log.info("request completed", { status: c.res.status, duration_ms: Date.now() - started, trace_id: c.get("traceId") });
-  });
+  app.use("*", requestLog());
   if (jwks) app.get("/.well-known/jwks.json", (c) => c.json(jwks));
   app.get("/health", (c) => c.json({ ok: true, service: "alleyoop-ingest" }));
   // Liveness: same rule as the workers. A background SELECT 1 every 10s; after

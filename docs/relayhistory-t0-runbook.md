@@ -100,6 +100,9 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
 
 ## T0 (target: under 5 minutes of hold)
 
+Watch the panels and apply the abort criteria in
+`docs/cutover-observability.md` ("T0 dashboard and runbook") at every step.
+
 8. **[A7] Hold:**
    `curl -X POST .../v1/internal/cutover/phase -H "authorization: Bearer $CUTOVER_ADMIN_SECRET" -d '{"from":"neon","to":"holding"}'`.
    Buffered uploads queue up, other writes get 503, reads keep working, and

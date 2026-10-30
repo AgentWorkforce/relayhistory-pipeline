@@ -33,7 +33,8 @@ outcome, attempt, trace_id, span_id, traceparent, session_uuid,
 session_uuid_source, tenant_id, org_id, workspace_id, machine_id, harness,
 session_id, revision, work_key, error_code, retryable, duration_ms,
 scrub_ruleset, scrub_version, redaction_count, object_sha256, bytes_raw,
-bytes_stored, chunk_count, model_id, tokens_in, tokens_out, state, rule, kind.
+bytes_stored, chunk_count, model_id, tokens_in, tokens_out, state, rule, kind,
+metric, value, unit, route. `route` is a registered route template, never a URL.
 
 The AWS EKS stage runs the pinned contrib collector in-cluster and archives
 lossless OTLP/JSON trace batches under the Locker bucket's encrypted
@@ -44,6 +45,12 @@ X-Ray cannot, because it interprets the first 32 bits as epoch seconds.
 Structured stage events and DLQs remain in HoopDb; service logs remain
 structured stdout.
 
-**Not yet built:** metrics and SLO alerts (stage lag, DLQ > 0, scrub refusal),
+**Metrics:** `docs/cutover-observability.md` is the contract for the cutover
+metrics. `bun run cutover:metrics` emits the Supabase-derived ones as log lines
+(`message = "cutover metric"`), and the ingest request line and `scrub refused`
+line carry the route and scrub signals.
+
+**Not yet built:** a metrics backend and live SLO alerts (the thresholds are
+specified in `docs/cutover-observability.md`, but nothing evaluates them),
 tail sampling, per-tenant retention/deletion in the telemetry backend, and a
 durable hosted log exporter. Logs are unsampled; errors are never sampled out.
