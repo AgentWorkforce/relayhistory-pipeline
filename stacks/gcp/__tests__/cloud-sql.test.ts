@@ -6,7 +6,6 @@ import {
   cloudSqlProxyApplies,
   cloudSqlProxyWorkload,
   ensurePrivateCloudSql,
-  postPrivateCloudSqlInsert,
   privateCloudSqlSpec,
   sqlAdminInsertRequest,
   type PrivateCloudSqlSpec,
@@ -94,81 +93,11 @@ describe("Cloud SQL private attachment", () => {
     expect(JSON.stringify(request)).not.toContain("rootPassword");
   });
 
-  test("refuses a public or secret insert before the transport is called", async () => {
-    const token = "ya29.secret-boundary";
-    async function posts(mutate: (spec: PrivateCloudSqlSpec) => void) {
-      const spec = privateCloudSqlSpec(input);
-      mutate(spec);
-      let calls = 0;
-      await expect(
-        postPrivateCloudSqlInsert(spec, {
-          post: async () => {
-            calls += 1;
-            return { name: "op-1" };
-          },
-        }),
-      ).rejects.toThrow(/Nothing was created/);
-      expect(calls).toBe(0);
-    }
-    await posts((spec) => {
-      (spec.insertBody.settings.ipConfiguration as { ipv4Enabled: boolean }).ipv4Enabled = true;
-    });
-    await posts((spec) => {
-      (spec.insertBody.settings.ipConfiguration as { authorizedNetworks?: unknown }).authorizedNetworks = [{ value: "0.0.0.0/0" }];
-    });
-    await posts((spec) => {
-      (spec.insertBody as { rootPassword?: string }).rootPassword = token;
-    });
-    await posts((spec) => {
-      spec.insertBody.settings.ipConfiguration.privateNetwork = "/projects/other-gcp-dev1/global/networks/awf-dev-vpc";
-    });
-    await posts((spec) => {
-      (spec as { posted: boolean }).posted = true;
-    });
-  });
-
-  test("posts only the private body through an injected transport and does not echo a credential", async () => {
-    const spec = privateCloudSqlSpec(input);
-    const token = "ya29.secret-boundary";
-    let seen = "";
-    const result = await postPrivateCloudSqlInsert(spec, {
-      post: async (request) => {
-        seen = JSON.stringify(request);
-        return { name: "op-1" };
-      },
-    });
-    expect(result).toEqual({ operation: "op-1", sent: true });
-    expect(spec.posted).toBe(false);
-    expect(cloudSqlProxyApplies(spec)).toBe(false);
-    expect(seen).toContain("https://sqladmin.googleapis.com/v1/projects/agentworkforce-dev1/instances");
-    expect(seen).not.toContain(token);
-    await expect(
-      postPrivateCloudSqlInsert(spec, {
-        post: async () => {
-          throw new Error(`${token} was refused`);
-        },
-      }),
-    ).rejects.toThrow(/outcome is uncertain for agentworkforce-dev1\/awf-dev-postgres; reconcile.*before retry or teardown/);
-    await postPrivateCloudSqlInsert(spec, {
-      post: async () => {
-        throw new Error(`${token} was refused`);
-      },
-    }).catch((error: Error) => {
-      expect(error.message).not.toContain(token);
-      expect(error.message).not.toContain("Nothing was created");
-    });
-    await expect(
-      postPrivateCloudSqlInsert(spec, {
-        post: async () => ({ name: "https://evil.example/operations/op-1" }),
-      }),
-    ).rejects.toThrow(/outcome is uncertain/);
-  });
-
   test("the Alchemy stack can prepare the insert and cannot post it or call GCP.SQL.Instance", () => {
     const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
     const seam = readFileSync(new URL("../cloud-sql.ts", import.meta.url), "utf8");
     expect(stack).toContain("sqlAdminInsertRequest");
-    expect(stack).not.toContain("postPrivateCloudSqlInsert");
+    expect(seam).not.toContain("postPrivateCloudSqlInsert");
     expect(stack).not.toContain("ensurePrivateCloudSql");
     expect(stack).not.toContain("GCP.SQL.Instance(");
     expect(seam).not.toContain("fetch(");
@@ -356,6 +285,23 @@ describe("SQL Admin idempotent poster", () => {
     );
     await once(matchingInstance(spec, { allocatedIpRange: "other-psa" }), /does not match/);
     await once(matchingInstance(spec, { privateNetwork: "/projects/other-gcp-dev1/global/networks/awf-dev-vpc" }), /does not match/);
+    await once({ ...matchingInstance(spec), name: "other-postgres" }, /does not match/);
+    await once({ ...matchingInstance(spec), region: "us-east1" }, /does not match/);
+    await once({ ...matchingInstance(spec), databaseVersion: "POSTGRES_16" }, /does not match/);
+    await once(
+      {
+        ...matchingInstance(spec),
+        settings: { ...matchingInstance(spec).settings, tier: "db-custom-2-7680" },
+      },
+      /does not match/,
+    );
+    await once(
+      {
+        ...matchingInstance(spec),
+        settings: { ...matchingInstance(spec).settings, availabilityType: "REGIONAL" },
+      },
+      /does not match/,
+    );
     await once({ ...matchingInstance(spec), state: "FAILED" }, /not runnable/);
     await once({ ...matchingInstance(spec), state: "PENDING_CREATE" }, /not runnable/);
 
@@ -435,6 +381,18 @@ describe("SQL Admin idempotent poster", () => {
     );
     expect(immediate).toEqual([`GET ${instanceUrl}`, `POST ${insertUrl}`]);
 
+    const missingStatus = await capture(
+      [{ status: 404 }, { status: 200, body: { name: "op-1" } }],
+      /outcome is uncertain/,
+    );
+    expect(missingStatus).toEqual([`GET ${instanceUrl}`, `POST ${insertUrl}`]);
+
+    const invalidOperationName = await capture(
+      [{ status: 404 }, { status: 200, body: { name: `https://evil.example/operations/op-1?t=${token}`, status: "PENDING" } }],
+      /outcome is uncertain/,
+    );
+    expect(invalidOperationName).toEqual([`GET ${instanceUrl}`, `POST ${insertUrl}`]);
+
     const createdPublic = await capture(
       [
         { status: 404 },
@@ -457,9 +415,48 @@ describe("SQL Admin idempotent poster", () => {
     const lookup = await capture(["throw"], /Nothing was created/);
     expect(lookup).toEqual([`GET ${instanceUrl}`]);
 
+    const refusedLookup = await capture([{ status: 403, body: { error: token } }], /Nothing was created/);
+    expect(refusedLookup).toEqual([`GET ${instanceUrl}`]);
+
     const insert = await capture([{ status: 404 }, "throw"], /outcome is uncertain/);
     expect(insert).toEqual([`GET ${instanceUrl}`, `POST ${insertUrl}`]);
     expect(insert.join(" ")).not.toContain(token);
+
+    const refusedInsert = await capture(
+      [{ status: 404 }, { status: 403, body: { error: token } }],
+      /outcome is uncertain/,
+    );
+    expect(refusedInsert).toEqual([`GET ${instanceUrl}`, `POST ${insertUrl}`]);
+
+    const refusedPoll = await capture(
+      [
+        { status: 404 },
+        { status: 200, body: { name: "op-1", status: "PENDING" } },
+        { status: 503, body: { error: token } },
+      ],
+      /outcome is uncertain/,
+    );
+    expect(refusedPoll).toEqual([`GET ${instanceUrl}`, `POST ${insertUrl}`, `GET ${operationUrl}`]);
+
+    const malformedPoll = await capture(
+      [
+        { status: 404 },
+        { status: 200, body: { name: "op-1", status: "PENDING" } },
+        { status: 200, body: {} },
+      ],
+      /outcome is uncertain/,
+    );
+    expect(malformedPoll).toEqual([`GET ${instanceUrl}`, `POST ${insertUrl}`, `GET ${operationUrl}`]);
+
+    const refusedConfirmation = await capture(
+      [
+        { status: 404 },
+        { status: 200, body: { name: "op-1", status: "DONE" } },
+        { status: 404, body: { error: token } },
+      ],
+      /outcome is uncertain/,
+    );
+    expect(refusedConfirmation).toEqual([`GET ${instanceUrl}`, `POST ${insertUrl}`, `GET ${instanceUrl}`]);
 
     await expect(ensurePrivateCloudSql(privateCloudSqlSpec(input), { bearer: "" }, scripted([]).transport, fastPoll())).rejects.toThrow(
       /credential is missing/,

@@ -7,7 +7,6 @@
  * later poster has to send: public IPv4 off, the VPC link, the Private
  * Service Access range, and no authorized networks. `posted` stays false.
  * `sqlAdminInsertRequest` builds the SQL Admin POST and does not send it.
- * `postPrivateCloudSqlInsert` sends one insert through an injected transport.
  * `ensurePrivateCloudSql` gets the instance, inserts only when it is absent,
  * polls the operation, and passes the bearer credential only to that transport.
  * The stack calls the builder and does not call either poster or `GCP.SQL.Instance`.
@@ -190,11 +189,6 @@ export interface SqlAdminInsertRequest {
   sent: false;
 }
 
-export interface SqlAdminTransport {
-  /** Send `request` as the body. Keep the credential in the transport, not the request. */
-  post(request: SqlAdminInsertRequest): Promise<{ name: string }>;
-}
-
 function exactKeys(value: object, allowed: ReadonlySet<string>, label: string): void {
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) refuse(`Cloud SQL ${label} has unexpected field ${key}.`);
@@ -241,33 +235,6 @@ export function sqlAdminInsertRequest(spec: PrivateCloudSqlSpec): SqlAdminInsert
     body: structuredClone(body),
     sent: false,
   };
-}
-
-/**
- * Send the private-only insert through an injected transport.
- * There is no default transport, and this function is not called by the stack.
- */
-export async function postPrivateCloudSqlInsert(
-  spec: PrivateCloudSqlSpec,
-  transport: SqlAdminTransport,
-): Promise<{ operation: string; sent: true }> {
-  const request = sqlAdminInsertRequest(spec);
-  if (request.sent !== false || Object.keys(request.headers).some((name) => name.toLowerCase() === "authorization"))
-    refuse("Cloud SQL insert seam tried to carry a credential.");
-  const projectId = PRIVATE_NETWORK.exec(request.body.settings.ipConfiguration.privateNetwork)?.[1];
-  let result: { name: string };
-  try {
-    result = await transport.post(request);
-  } catch {
-    throw new Error(
-      `96bulls: Cloud SQL Admin insert outcome is uncertain for ${projectId}/${spec.instanceName}; reconcile that instance before retry or teardown.`,
-    );
-  }
-  if (!projectId || !OPERATION_ID.test(result?.name ?? ""))
-    throw new Error(
-      `96bulls: Cloud SQL Admin insert outcome is uncertain for ${projectId}/${spec.instanceName}; reconcile that instance before retry or teardown.`,
-    );
-  return { operation: result.name, sent: true };
 }
 
 /** Held by the caller for one call. The request object never carries it. */
@@ -423,7 +390,7 @@ function operationIdOf(body: unknown): string | undefined {
 function operationState(body: unknown): "done" | "failed" | "pending" | "invalid" {
   const record = asRecord(body);
   if (!record) return "invalid";
-  if (record.status === undefined || record.status === "PENDING" || record.status === "RUNNING") return "pending";
+  if (record.status === "PENDING" || record.status === "RUNNING") return "pending";
   if (record.status === "DONE") return record.error == null ? "done" : "failed";
   return "invalid";
 }
