@@ -65,6 +65,14 @@ The index stage currently leaves title, model, git and agent null, and it
 takes identity only from the authenticated request (`ctx`), never from the
 manifest body.
 
+- **O4 dedupe watermark:** the marker carries
+  `origin_revisions: {<origin_id>: <max exported revision>}`. Each key is a
+  feed origin (the client store's change-feed epoch) and each value is the
+  highest feed revision among the exported records, as a JSON safe integer.
+  Deleted records are not exported, so they don't count. The synthetic
+  `machine:` origins of ingest-API events are left out. A client takeover
+  resumes each origin's feed after its watermark instead of at 0. The field
+  shape is being agreed with the O4 marker validator (#46/#51).
 - **Exporter:** writes the latest `session` record's descriptive fields into
   `extensions["client.relayhistory_export"].catalog`: title, `agent_name`,
   models, git branch, commit and repo, first and last activity, plus Neon

@@ -101,6 +101,8 @@ export interface PlannedManifest {
   endedAt?: string;
   state: "open" | "closed";
   catalog?: Record<string, unknown>;
+  /** Per-origin watermark: feed epoch (origin_id) to the max exported revision. */
+  originRevisions?: Record<string, number>;
   chunks: PlannedChunk[];
 }
 
@@ -340,6 +342,28 @@ const component = (s: string) => s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128
  * exact chunks (record boundaries, at most 4 MiB), deterministic ids. Null
  * when the stream has no live records.
  */
+/**
+ * The O4 dedupe watermark: for each feed origin (`origin_id`, the client
+ * store's change-feed epoch), the highest feed revision this export carries.
+ * Only exported records count (a session's live records, latest revision
+ * each; deletes are not exported), and the synthetic `machine:` origins of
+ * ingest-API events are left out: they are not a client feed. A client
+ * takeover resumes each origin's feed after its watermark instead of at 0.
+ * Ids and integers only; no record content. Deterministic, so a retry sends
+ * the same marker.
+ */
+export function exportedOriginRevisions(records: readonly DeliveryRecord[]): Record<string, number> {
+  const max = new Map<string, number>();
+  for (const r of records) {
+    if (r.operation !== "upsert" || r.payload === null || r.origin_id.startsWith("machine:")) continue;
+    if (!/^\d{1,16}$/.test(r.revision) || !Number.isSafeInteger(Number(r.revision)))
+      throw Object.assign(new Error("export: a feed revision is not a safe integer"), { code: "revision_out_of_range" });
+    const revision = Number(r.revision);
+    if (revision > (max.get(r.origin_id) ?? -1)) max.set(r.origin_id, revision);
+  }
+  return Object.fromEntries([...max].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+}
+
 export function plannedManifestFromRecords(input: {
   orgId: string;
   workspaceId: string;
@@ -372,6 +396,7 @@ export function plannedManifestFromRecords(input: {
     ...(stream.lastMs !== null ? { endedAt: new Date(stream.lastMs).toISOString() } : {}),
     state: input.state ?? "closed",
     ...(input.catalog ? { catalog: input.catalog } : {}),
+    originRevisions: exportedOriginRevisions(input.records),
     chunks: chunkRanges(stream, input.maxChunkBytes).map((range, seq) => ({
       seq,
       epoch: 0,
@@ -437,6 +462,7 @@ export async function buildExportManifest(
         plan_digest: commit.planDigest,
         source_user_id: canonicalId(m.sourceUserId),
         ...(m.catalog ? { catalog: m.catalog } : {}),
+        ...(m.originRevisions ? { origin_revisions: m.originRevisions } : {}),
       },
     },
   } as ManifestV1;
