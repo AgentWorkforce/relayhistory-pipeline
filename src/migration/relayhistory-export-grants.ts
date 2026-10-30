@@ -26,8 +26,9 @@
  *   (`snapshot_changed`), or one older than the allowed age (`snapshot_stale`);
  * - any pair or session exception (`pair_exceptions`);
  * - digest drift (`digest_drift`);
- * - partial shard state from an earlier run: a shard whose create was started
- *   but never recorded (`partial_shard_state`; its grant may exist, so a human
+ * - partial shard state from an earlier run: an apply that failed partway
+ *   (`previous_run_failed`), a shard whose create was started but never
+ *   recorded (`partial_shard_state`; its grant may exist, so a human
  *   reconciles it), a ledger of another plan (`ledger_mismatch`), or a plan
  *   already rolled back (`plan_rolled_back`);
  * - a target origin (audience) not in the configured allow-list
@@ -328,6 +329,8 @@ export interface Ledger {
   aggregate_digest: string;
   source_snapshot_id: string;
   shards: Record<string, ShardState>;
+  /** Set when a run failed partway: apply refuses until a human clears it. */
+  halted?: { run_id: string; shard_id: string; at: string };
 }
 
 const ledgerPath = (dir: string) => join(dir, "grant-ledger.json");
@@ -440,6 +443,7 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
   const prior = await loadLedger(cfg.stateDir);
   if (prior && prior.aggregate_digest !== plan.aggregate_digest) refuse("ledger_mismatch", "the state directory holds another plan's grants");
   const ledger: Ledger = prior ?? { version: LIFECYCLE_VERSION, aggregate_digest: plan.aggregate_digest, source_snapshot_id: plan.source_snapshot.snapshot_id, shards: {} };
+  if (ledger.halted) refuse("previous_run_failed", "an earlier apply failed partway; check its revocation evidence and RelayAuth before going on");
   const states = Object.values(ledger.shards);
   if (states.some((s) => s.status === "pending")) refuse("partial_shard_state", "a shard's create was started but never recorded; reconcile it in RelayAuth first");
   if (states.some((s) => s.status === "revoked")) refuse("plan_rolled_back", "this plan's grants were revoked; approve a new plan to start again");
@@ -474,6 +478,7 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
       // A grant that was created but is wrong is revoked with the rest; a
       // create with no answer stays pending for a human.
       if (grantId) ledger.shards[shard.shard_id] = { status: "created", run_id: runId, grant_id: grantId, plan_digest: "", created_at: new Date(now).toISOString() };
+      ledger.halted = { run_id: runId, shard_id: shard.shard_id, at: new Date(now).toISOString() };
       await saveLedger(cfg.stateDir, ledger);
       result.failed = { shard_id: shard.shard_id, error: e instanceof Error ? e.message.slice(0, 200) : "create failed" };
       result.compensation = await revokeShards(cfg.stateDir, ledger, cfg.client, (_id, s) => s.run_id === runId, "compensating");

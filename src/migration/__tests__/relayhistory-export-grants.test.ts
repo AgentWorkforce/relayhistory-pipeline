@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deriveMigrationGrantPlan } from "../vendor/relayauth-migration-plan.ts";
@@ -189,9 +189,20 @@ describe("apply fails closed", () => {
     expect(first.failed).toMatchObject({ error: "response lost" });
     expect(first.compensation!.revoked).toHaveLength(1); // the grant this run did record
     expect(first.compensation!.unresolved).toHaveLength(1); // the orphan a human must check
-    await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "partial_shard_state" });
+    await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "previous_run_failed" });
     expect(client.creates).toBe(2);
   });
+});
+
+test("a process killed mid-create (pending, no failure recorded) is partial_shard_state", async () => {
+  const { cfg, client, dir } = await approved();
+  const first = await applyGrants({ ...cfg, maxNewShards: 1 });
+  const path = join(dir, "grant-ledger.json");
+  const ledger = JSON.parse(await readFile(path, "utf8"));
+  ledger.shards["f".repeat(32)] = { status: "pending", run_id: "r", started_at: new Date(NOW).toISOString() };
+  await writeFile(path, JSON.stringify(ledger));
+  await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "partial_shard_state" });
+  expect(client.creates).toBe(first.created.length);
 });
 
 describe("apply, idempotency and compensation", () => {
@@ -216,6 +227,8 @@ describe("apply, idempotency and compensation", () => {
     expect(result.compensation!.revoked.every((r) => r.revoked_at)).toBe(true);
     expect(client.live()).toBe(0);
     expect((await readdir(dir)).some((f) => f.startsWith("revocation-compensating-"))).toBe(true);
+    // Even if every compensating revoke had failed, the next apply stops.
+    await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "previous_run_failed" });
   });
 
   test("interrupted between shards, then resumed: every shard once, no duplicate", async () => {
