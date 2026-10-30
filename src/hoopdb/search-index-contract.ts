@@ -12,6 +12,8 @@ export type SearchIndexRequirement = {
   queryShape: string;
   definitionFragments: readonly string[];
   reloptionFragments?: readonly string[];
+  expectedPredicate?: string;
+  requiresAgentLookupRollout?: boolean;
 };
 
 export const REQUIRED_SEARCH_INDEXES = [
@@ -93,6 +95,19 @@ export const REQUIRED_SEARCH_INDEXES = [
     ],
   },
   {
+    id: "session-opening-prompt",
+    indexName: "convergence_events_opening_prompt_idx",
+    tableName: "convergence_events",
+    consumers: ["Cloud sessions dashboard summaries"],
+    queryShape: "tenant/session/source/workspace equality; oldest nonblank user prompt",
+    definitionFragments: [
+      "on sessions.convergence_events",
+      "(org_id, session_id, source, workspace_id, ts, event_id)",
+    ],
+    expectedPredicate:
+      "(((kind = ANY (ARRAY['history'::text, 'prompt'::text, 'user'::text])) OR ((kind = 'session_event'::text) AND (actor_role = 'user'::text))) AND (length(TRIM(BOTH FROM COALESCE(content, ''::text))) > 0))",
+  },
+  {
     id: "transcript-content-substring",
     indexName: "convergence_events_content_prefix_trgm_idx",
     tableName: "convergence_events",
@@ -115,9 +130,9 @@ export const REQUIRED_SEARCH_INDEXES = [
       "on sessions.convergence_events using gin",
       "task_title",
       "gin_trgm_ops",
-      "where (task_title is not null)",
     ],
     reloptionFragments: ["fastupdate=off"],
+    expectedPredicate: "(task_title IS NOT NULL)",
   },
   {
     id: "project-substring",
@@ -132,6 +147,17 @@ export const REQUIRED_SEARCH_INDEXES = [
     ],
   },
   {
+    id: "session-timing-marker-lookup",
+    indexName: "session_markers_timing_lookup_idx",
+    tableName: "session_markers",
+    consumers: ["Cloud MCP list_session_timings", "Cloud session timing"],
+    queryShape: "tenant + source + session equality during a cold timing-cache fill",
+    definitionFragments: [
+      "on sessions.session_markers",
+      "(org_id, source, session_id)",
+    ],
+  },
+  {
     id: "agent-name-lookup",
     indexName: "session_catalog_agents_lookup_idx",
     tableName: "session_catalog_agents",
@@ -140,8 +166,9 @@ export const REQUIRED_SEARCH_INDEXES = [
     definitionFragments: [
       "on sessions.session_catalog_agents",
       "(org_id, workspace_id, agent_name_normalized text_pattern_ops, last_ts desc, session_id desc, source desc)",
-      "where ((agent_name_normalized is not null) and (last_ts is not null))",
     ],
+    expectedPredicate: "((agent_name_normalized IS NOT NULL) AND (last_ts IS NOT NULL))",
+    requiresAgentLookupRollout: true,
   },
 ] as const satisfies readonly SearchIndexRequirement[];
 
@@ -149,6 +176,7 @@ export type SearchIndexCatalogRow = {
   table_name: string;
   index_name: string;
   index_definition: string;
+  predicate: string | null;
   is_valid: boolean;
   is_ready: boolean;
   reloptions: string | null;
@@ -158,6 +186,7 @@ export const SEARCH_INDEX_CATALOG_SQL = `
 SELECT table_rel.relname AS table_name,
        index_rel.relname AS index_name,
        pg_get_indexdef(index_rel.oid) AS index_definition,
+       pg_get_expr(catalog.indpred, catalog.indrelid) AS predicate,
        catalog.indisvalid AS is_valid,
        catalog.indisready AS is_ready,
        array_to_string(index_rel.reloptions, ',') AS reloptions
@@ -177,6 +206,46 @@ function normalized(value: string | null | undefined): string {
     .trim();
 }
 
+function normalizedPredicate(value: string | null | undefined): string {
+  const literals: string[] = [];
+  let masked = "";
+  const input = value ?? "";
+  for (let index = 0; index < input.length;) {
+    if (input[index] !== "'") {
+      masked += input[index];
+      index += 1;
+      continue;
+    }
+    const start = index;
+    index += 1;
+    while (index < input.length) {
+      if (input[index] !== "'") {
+        index += 1;
+        continue;
+      }
+      if (input[index + 1] === "'") {
+        index += 2;
+        continue;
+      }
+      index += 1;
+      break;
+    }
+    masked += `\u0001${literals.length}\u0002`;
+    literals.push(input.slice(start, index));
+  }
+  return masked
+    .toLowerCase()
+    .replace(/"/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ")
+    .trim()
+    .replace(/\u0001(\d+)\u0002/g, (_marker, offset: string) => literals[Number(offset)] ?? "");
+}
+
+export type SearchIndexReadiness = {
+  agentLookupRolloutComplete: boolean;
+};
+
 export type SearchIndexAuditItem = {
   id: string;
   indexName: string;
@@ -185,7 +254,10 @@ export type SearchIndexAuditItem = {
   reasons: string[];
 };
 
-export function auditSearchIndexes(rows: readonly SearchIndexCatalogRow[]): {
+export function auditSearchIndexes(
+  rows: readonly SearchIndexCatalogRow[],
+  readiness: SearchIndexReadiness,
+): {
   passed: boolean;
   indexes: SearchIndexAuditItem[];
 } {
@@ -203,6 +275,12 @@ export function auditSearchIndexes(rows: readonly SearchIndexCatalogRow[]): {
       for (const fragment of requirement.definitionFragments) {
         if (!definition.includes(normalized(fragment))) reasons.push(`definition missing: ${fragment}`);
       }
+      const expectedPredicate = "expectedPredicate" in requirement
+        ? requirement.expectedPredicate
+        : null;
+      if (normalizedPredicate(row.predicate) !== normalizedPredicate(expectedPredicate)) {
+        reasons.push(expectedPredicate ? "predicate mismatch" : "unexpected predicate");
+      }
       const options = normalized(row.reloptions);
       const reloptionFragments = "reloptionFragments" in requirement
         ? requirement.reloptionFragments
@@ -210,6 +288,13 @@ export function auditSearchIndexes(rows: readonly SearchIndexCatalogRow[]): {
       for (const fragment of reloptionFragments) {
         if (!options.includes(normalized(fragment))) reasons.push(`option missing: ${fragment}`);
       }
+    }
+    if (
+      "requiresAgentLookupRollout" in requirement &&
+      requirement.requiresAgentLookupRollout &&
+      !readiness.agentLookupRolloutComplete
+    ) {
+      reasons.push("agent lookup rollout incomplete");
     }
     return {
       id: requirement.id,
