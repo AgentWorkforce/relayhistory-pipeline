@@ -76,6 +76,11 @@ copy-everything-then-switch runbook (linuyc, uncommitted
 | 7 | DB/API benchmarks, Neon HTTP vs. Supabase direct TCP | 96-no-bull-migration @ sf-mac-mini | code exists | Supabase p95 no worse than Neon on each critical query |
 | 8 | T0 runbook + rollback | 96-no-bull-migration @ sf-mac-mini | todo | Reviewed runbook (below) |
 
+**T0 gate (mandatory):** `relayhistory-schema-parity.test.ts`, which covers
+schema parity in both apply orders and the tenant permission contract on
+`sessions.machines`, must be green against the legacy migrations re-pinned at
+the commit being cut over, including 0067 from #222.
+
 ## After T0
 
 | # | Lane | Owner | Exit evidence |
