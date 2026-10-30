@@ -23,6 +23,7 @@
  *   [--checkpoint=/secure/path.json] [--keep-target-only=machines]
  *   [--execute --expect-supabase-ref=<ref>]   (without --execute: a read-only dry run)
  */
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import pg from "pg";
@@ -50,6 +51,8 @@ export interface TablePlan {
   order: string[];
   nullableKey: boolean;
   columns: string[];
+  /** Backfill and check page newest first by this NOT NULL, indexed time column, then key. */
+  timeColumn?: string;
 }
 
 export interface TableResult {
@@ -123,10 +126,35 @@ async function writableColumns(db: Queryable, table: string): Promise<string[]> 
  * Copy the source's columns that the target also has. The same primary key is
  * required on both sides; anything else fails closed before a row moves.
  */
+const TIME_COLUMNS = ["ts", "received_at", "created_at", "updated_at"];
+
+/**
+ * A NOT NULL time column that leads a valid btree index on the source, so
+ * ordering by it is an index walk, not a sort of the whole table.
+ */
+async function indexedTimeColumn(source: Queryable, table: string): Promise<string | null> {
+  const { rows } = await source.query<{ name: string }>(
+    `SELECT a.attname AS name
+       FROM pg_index i
+       JOIN pg_class c ON c.oid = i.indrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_class ic ON ic.oid = i.indexrelid
+       JOIN pg_am am ON am.oid = ic.relam AND am.amname = 'btree'
+       JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = i.indkey[0]
+      WHERE n.nspname = $1 AND c.relname = $2 AND i.indisvalid AND i.indpred IS NULL
+        AND a.attnotnull AND a.attname = ANY ($3::text[])
+      ORDER BY array_position($3::text[], a.attname::text)
+      LIMIT 1`,
+    [SCHEMA, table, TIME_COLUMNS],
+  );
+  return rows[0]?.name ?? null;
+}
+
 export async function planTable(
   source: Queryable,
   target: Queryable,
   table: string,
+  options: { newestByTime?: boolean } = {},
 ): Promise<TablePlan> {
   const [sourceKey, targetKey, sourceColumns, targetColumns] = await Promise.all([
     keyInfo(source, table),
@@ -150,12 +178,14 @@ export async function planTable(
         ]
       : [quoteIdent(column)],
   );
+  const timeColumn = options.newestByTime ? await indexedTimeColumn(source, table) : null;
   return {
     table,
     key: sourceKey.columns,
-    order,
+    order: timeColumn ? [quoteIdent(timeColumn), ...order] : order,
     nullableKey: sourceKey.nullable.some(Boolean),
     columns: sourceColumns,
+    ...(timeColumn ? { timeColumn } : {}),
   };
 }
 
@@ -228,6 +258,12 @@ export function staleKeysSql(plan: TablePlan, hasAfter: boolean): string {
 const TOMBSTONE_COLUMNS = ["org_id", "workspace_id", "user_id", "origin_id", "source", "session_id"];
 
 const has = (plan: TablePlan, column: string) => plan.columns.includes(column);
+// Fenced statements take $1 = page rows, $2 = the page's session owners on Neon,
+// $3 = Neon's resets (fixed after T0).
+// Declares the fence parameters' types even where a table's filter does not use all of them.
+const FENCE_PARAMS = "fence_params AS (SELECT $2::jsonb AS owners, $3::jsonb AS neon_resets)";
+const NEON_RESETS =
+  "jsonb_to_recordset($3::jsonb) AS n(org_id text, workspace_id text, user_id text, request_id text)";
 const hasUser = (plan: TablePlan) =>
   ["org_id", "workspace_id", "user_id"].every((column) => has(plan, column));
 const hasSession = (plan: TablePlan) => has(plan, "org_id") && has(plan, "session_id");
@@ -241,7 +277,7 @@ const hasSession = (plan: TablePlan) => has(plan, "org_id") && has(plan, "sessio
 const postT0Reset = (alias: string) =>
   `EXISTS (SELECT 1 FROM sessions.session_resets r
      WHERE r.org_id = ${alias}.org_id AND r.workspace_id = ${alias}.workspace_id AND r.user_id = ${alias}.user_id
-       AND NOT EXISTS (SELECT 1 FROM pg_temp.neon_resets n
+       AND NOT EXISTS (SELECT 1 FROM ${NEON_RESETS}
              WHERE n.org_id = r.org_id AND n.workspace_id = r.workspace_id
                AND n.user_id = r.user_id AND n.request_id = r.request_id))`;
 
@@ -307,34 +343,50 @@ export async function pageOwners(source: Queryable, plan: TablePlan, rows: strin
   return owners.rows[0]?.owners ?? "[]";
 }
 
-/**
- * Snapshot Neon's resets into this target session. Neon takes no writes after
- * T0, so this set is fixed; resets on Supabase are always read live.
- */
-export async function prepareBackfillFence(source: Queryable, target: Queryable): Promise<void> {
-  const neon = await source.query<{ keys: string }>(
-    `SELECT coalesce(json_agg(json_build_array(org_id, workspace_id, user_id, request_id))::text, '[]') AS keys
-       FROM sessions.session_resets`,
-  );
-  await target.query(`CREATE TEMP TABLE IF NOT EXISTS neon_resets (
-    org_id text, workspace_id text, user_id text, request_id text,
-    PRIMARY KEY (org_id, workspace_id, user_id, request_id))`);
-  await target.query("TRUNCATE pg_temp.neon_resets");
-  await target.query(
-    `INSERT INTO pg_temp.neon_resets
-     SELECT k->>0, k->>1, k->>2, k->>3 FROM jsonb_array_elements($1::jsonb) AS k ON CONFLICT DO NOTHING`,
-    [neon.rows[0]?.keys ?? "[]"],
-  );
+/** The deletion fence's fixed part: Neon's resets, which cannot change after T0. */
+export interface Fence {
+  neonResets: string;
 }
 
-/** check mode: rows of a source page whose key is absent on the target (NULL-safe). */
-export function missingSql(plan: TablePlan): string {
+/**
+ * Read Neon's resets once. Resets on Supabase are always read live, inside
+ * each statement, so a reset committed during the run is honoured.
+ */
+export async function loadFence(source: Queryable): Promise<Fence> {
+  const neon = await source.query<{ keys: string }>(
+    `SELECT coalesce(json_agg(json_build_object('org_id', org_id, 'workspace_id', workspace_id,
+              'user_id', user_id, 'request_id', request_id))::text, '[]') AS keys
+       FROM sessions.session_resets`,
+  );
+  return { neonResets: neon.rows[0]?.keys ?? "[]" };
+}
+
+/**
+ * Tables derived from delivery records by the catalog projection. They are
+ * never copied: a copy would resurrect rows that a post-T0 tombstone or a
+ * post-T0 winner removed. migration:reproject rebuilds them from all records.
+ */
+export const REPROJECTED_TABLES = new Set([
+  "session_catalog",
+  "session_relationships",
+  "session_markers",
+  "session_commit_links",
+  "session_catalog_agents",
+]);
+
+/**
+ * check mode: rows of a source page whose key is absent on the target
+ * (NULL-safe). With a fence, rows a post-T0 deletion removed on purpose are
+ * not counted: only rows the backfill should have brought are.
+ */
+export function missingSql(plan: TablePlan, fenced = false): string {
   const match = plan.key
     .map((column) => `t.${quoteIdent(column)} IS NOT DISTINCT FROM s.${quoteIdent(column)}`)
     .join(" AND ");
-  return `SELECT count(*)::int AS n
+  const fence = fenced ? tombstoneFilter(plan).replace(/^ WHERE /, " AND ") : "";
+  return `${fenced ? `WITH ${FENCE_PARAMS} ` : ""}SELECT count(*)::int AS n
     FROM jsonb_populate_recordset(NULL::${qualified(plan.table)}, $1::jsonb) s
-   WHERE NOT EXISTS (SELECT 1 FROM ${qualified(plan.table)} t WHERE ${match})`;
+   WHERE NOT EXISTS (SELECT 1 FROM ${qualified(plan.table)} t WHERE ${match})${fence}`;
 }
 
 export interface CopyOptions {
@@ -346,8 +398,8 @@ export interface CopyOptions {
    * shares on Supabase (sessions.machines: pipeline-only machines).
    */
   keepTargetOnly?: boolean;
-  /** backfill: honour deletion tombstones and resets (prepareBackfillFence first). */
-  fenced?: boolean;
+  /** backfill and check: honour deletion tombstones and resets (from loadFence). */
+  fence?: Fence;
   /** Resume point from a checkpoint; null starts from the first key. */
   after?: unknown[] | null;
   onPage?: (result: TableResult) => Promise<void>;
@@ -359,6 +411,10 @@ export async function copyTable(
   plan: TablePlan,
   options: CopyOptions,
 ): Promise<TableResult> {
+  if (options.mode !== "check" && REPROJECTED_TABLES.has(plan.table))
+    throw new Error(`${plan.table}: reprojected by migration:reproject, never copied`);
+  if (options.mode === "mirror" && plan.timeColumn)
+    throw new Error(`${plan.table}: mirror pages by key; plan it without newestByTime`);
   if (options.mode === "mirror" && plan.nullableKey)
     throw new Error(`${plan.table}: mirror needs a key without NULLs`);
   const result: TableResult = {
@@ -411,19 +467,21 @@ export async function copyTable(
       await options.onPage?.(result);
       return result;
     }
+    const fence = options.fence;
+    const owners = fence && needsOwners(plan) ? await pageOwners(source, plan, page.rows) : "[]";
+    const fenceParams = fence ? [page.rows, owners, fence.neonResets] : [page.rows];
     if (options.mode === "check") {
-      const absent = await target.query<{ n: number }>(missingSql(plan), [page.rows]);
+      const absent = await target.query<{ n: number }>(missingSql(plan, fence !== undefined), fenceParams);
       result.missing += absent.rows[0]?.n ?? 0;
     } else if (!options.dryRun) {
-      const fenced = options.mode === "backfill" && options.fenced === true;
-      const owners = fenced && needsOwners(plan) ? await pageOwners(source, plan, page.rows) : null;
+      const fenced = options.mode === "backfill" && fence !== undefined;
       const lock = fenced ? deletionLockSql(plan) : null;
       if (fenced) await target.query("BEGIN");
       try {
-        if (lock) await target.query(lock, [owners ?? page.rows]);
+        if (lock) await target.query(lock, [needsOwners(plan) ? owners : page.rows]);
         const written = await target.query<{ n: number }>(
-          `WITH written AS (${writeSql(plan, options.mode, fenced)} RETURNING 1) SELECT count(*)::int AS n FROM written`,
-          owners === null ? [page.rows] : [page.rows, owners],
+          `WITH ${fenced ? `${FENCE_PARAMS}, ` : ""}written AS (${writeSql(plan, options.mode, fenced)} RETURNING 1) SELECT count(*)::int AS n FROM written`,
+          fenced ? fenceParams : [page.rows],
         );
         if (fenced) await target.query("COMMIT");
         result.written += written.rows[0]?.n ?? 0;
@@ -473,23 +531,41 @@ export async function prepareTargetSession(target: Queryable): Promise<void> {
 }
 
 interface Checkpoint {
-  version: 1;
+  version: 2;
   mode: CopyMode;
-  tables: Record<string, TableResult>;
+  /** sha256 of the source and target URLs: a checkpoint never resumes elsewhere. */
+  endpointHash: string;
+  /** Per table: progress plus the hash of the exact plan it was made with. */
+  tables: Record<string, TableResult & { planHash: string }>;
 }
 
-async function loadCheckpoint(path: string | undefined, mode: CopyMode): Promise<Checkpoint> {
-  const empty: Checkpoint = { version: 1, mode, tables: {} };
+const sha256 = (...parts: string[]) =>
+  createHash("sha256").update(parts.join("\0")).digest("hex");
+
+/** Columns, key, keyset order and page size: any change makes a stored position meaningless. */
+export function planHash(plan: TablePlan, chunkSize: number): string {
+  return sha256(JSON.stringify({ table: plan.table, key: plan.key, order: plan.order, columns: plan.columns, chunkSize }));
+}
+
+export async function loadCheckpoint(
+  path: string | undefined,
+  mode: CopyMode,
+  endpointHash: string,
+): Promise<Checkpoint> {
+  const empty: Checkpoint = { version: 2, mode, endpointHash, tables: {} };
   if (!path) return empty;
+  let parsed: Checkpoint;
   try {
-    const parsed = JSON.parse(await readFile(path, "utf8")) as Checkpoint;
-    if (parsed.version !== 1 || parsed.mode !== mode)
-      throw new Error("checkpoint is for a different mode");
-    return parsed;
+    parsed = JSON.parse(await readFile(path, "utf8")) as Checkpoint;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty;
     throw error;
   }
+  if (parsed.version !== 2 || parsed.mode !== mode)
+    throw new Error("checkpoint is for a different version or mode");
+  if (parsed.endpointHash !== endpointHash)
+    throw new Error("checkpoint is for different databases");
+  return parsed;
 }
 
 async function saveCheckpoint(path: string | undefined, checkpoint: Checkpoint) {
@@ -528,7 +604,7 @@ export async function main() {
     (argument("keep-target-only") ?? "").split(",").filter(Boolean),
   );
   const checkpointPath = argument("checkpoint");
-  const checkpoint = await loadCheckpoint(checkpointPath, mode);
+  const checkpoint = await loadCheckpoint(checkpointPath, mode, sha256(sourceUrl, targetUrl));
   // One connection per side for the whole run, so session settings hold.
   const source = new pg.Client({ connectionString: sourceUrl, application_name: "96bulls-copy-source" });
   const target = new pg.Client({ connectionString: targetUrl, application_name: "96bulls-copy-target" });
@@ -539,25 +615,27 @@ export async function main() {
     // Dry runs and checks only read; executed copies land with triggers off.
     if (dryRun) await target.query("SET default_transaction_read_only = on");
     else await prepareTargetSession(target);
-    // Deletion fences need temp tables, which a read-only dry run cannot create.
-    if (mode === "backfill" && !dryRun) await prepareBackfillFence(source, target);
+    const fence = mode === "backfill" || mode === "check" ? await loadFence(source) : undefined;
     const results: TableResult[] = [];
     for (const table of tables) {
+      const plan = await planTable(source, target, table, { newestByTime: mode !== "mirror" });
+      const hash = planHash(plan, chunkSize);
       const previous = checkpoint.tables[table];
+      if (previous && previous.planHash !== hash)
+        throw new Error(`${table}: checkpoint was made with a different plan; start a new checkpoint`);
       if (previous?.complete && mode === "backfill") {
         results.push(previous);
         continue;
       }
-      const plan = await planTable(source, target, table);
       const result = await copyTable(source, target, plan, {
         mode,
         chunkSize,
         dryRun,
         keepTargetOnly: keepTargetOnly.has(table),
-        fenced: mode === "backfill" && !dryRun,
+        ...(fence ? { fence } : {}),
         after: mode === "backfill" ? (previous?.after ?? null) : null,
         onPage: async (progress) => {
-          checkpoint.tables[table] = { ...progress };
+          checkpoint.tables[table] = { ...progress, planHash: hash };
           if (!dryRun) await saveCheckpoint(checkpointPath, checkpoint);
         },
       });

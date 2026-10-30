@@ -12,7 +12,9 @@ import {
   copyTable,
   planTable,
   deletionLockSql,
-  prepareBackfillFence,
+  loadCheckpoint,
+  loadFence,
+  planHash,
   prepareTargetSession,
   type Queryable,
 } from "../../../src/migration/relayhistory-copy.js";
@@ -227,13 +229,13 @@ describe("deletions made on Supabase after T0", () => {
       INSERT INTO sessions.deleted_upload_sessions VALUES ('o', 'w', 'u1', 'origin', 'claude', 's1');
       INSERT INTO sessions.session_resets VALUES ('o', 'w', 'u2', 'r-post', 1);`);
     await prepareTargetSession(target as Queryable);
-    await prepareBackfillFence(source as Queryable, target as Queryable);
+    const fence = await loadFence(source as Queryable);
     for (const table of ["convergence_events", "session_rollups"]) {
       const plan = await planTable(source as Queryable, target as Queryable, table);
       await copyTable(source as Queryable, target as Queryable, plan, {
         mode: "backfill",
         chunkSize: 2,
-        fenced: true,
+        fence,
       });
     }
     const events = (
@@ -275,7 +277,7 @@ describe("deletions committed while the backfill runs", () => {
       INSERT INTO sessions.session_rollups VALUES ('o', 's1', 1), ('o', 's2', 2), ('o', 's3', 3);`);
     await prepareTargetSession(target as Queryable);
     // The fence is prepared with no deletions on Supabase yet...
-    await prepareBackfillFence(source as Queryable, target as Queryable);
+    const fence = await loadFence(source as Queryable);
     // ...then, mid-backfill, u2 resets and u1 deletes s1 on Supabase.
     await target.exec(`INSERT INTO sessions.session_resets VALUES ('o', 'w', 'u2', 'r-late', 1);
       INSERT INTO sessions.deleted_upload_sessions VALUES ('o', 'w', 'u1', 'origin', 'claude', 's1');`);
@@ -284,7 +286,7 @@ describe("deletions committed while the backfill runs", () => {
       await copyTable(source as Queryable, target as Queryable, plan, {
         mode: "backfill",
         chunkSize: 1,
-        fenced: true,
+        fence,
       });
       return (
         await target.query<{ session_id: string }>(
@@ -306,6 +308,96 @@ describe("deletions committed while the backfill runs", () => {
     };
     expect(deletionLockSql(plan)).toMatch(/pg_advisory_xact_lock[\s\S]*jsonb_to_recordset\(\$1/);
     expect(deletionLockSql({ ...plan, table: "patterns", columns: ["org_id", "id"] })).toBeNull();
+  });
+});
+
+describe("check honours intentional deletions; derived catalog tables are not copied", () => {
+  it("does not count rows a post-T0 tombstone or reset removed as missing", async () => {
+    const ddl = `CREATE TABLE sessions.deleted_upload_sessions (
+        org_id text NOT NULL, workspace_id text NOT NULL, user_id text NOT NULL,
+        origin_id text NOT NULL, source text NOT NULL, session_id text NOT NULL,
+        PRIMARY KEY (org_id, workspace_id, user_id, origin_id, source, session_id));
+      CREATE TABLE sessions.session_resets (
+        org_id text NOT NULL, workspace_id text NOT NULL, user_id text NOT NULL,
+        request_id text NOT NULL, deleted bigint NOT NULL,
+        PRIMARY KEY (org_id, workspace_id, user_id, request_id));
+      CREATE TABLE sessions.convergence_events (
+        org_id text NOT NULL, workspace_id text NOT NULL, user_id text NOT NULL,
+        source text NOT NULL, session_id text NOT NULL, event_id text NOT NULL,
+        PRIMARY KEY (org_id, event_id));`;
+    await Promise.all([source.exec(ddl), target.exec(ddl)]);
+    await source.exec(`INSERT INTO sessions.convergence_events VALUES
+      ('o', 'w', 'u1', 'claude', 's1', 'e1'), ('o', 'w', 'u2', 'claude', 's2', 'e2'),
+      ('o', 'w', 'u3', 'claude', 's3', 'e3')`);
+    // After T0: u1 deleted s1, u2 reset; e3 was simply never backfilled.
+    await target.exec(`INSERT INTO sessions.deleted_upload_sessions VALUES ('o', 'w', 'u1', 'origin', 'claude', 's1');
+      INSERT INTO sessions.session_resets VALUES ('o', 'w', 'u2', 'r', 1);`);
+    const plan = await planTable(source as Queryable, target as Queryable, "convergence_events");
+    const fence = await loadFence(source as Queryable);
+    const checked = await copyTable(source as Queryable, target as Queryable, plan, {
+      mode: "check",
+      chunkSize: 2,
+      fence,
+    });
+    expect(checked).toMatchObject({ read: 3, missing: 1 });
+    // Without the fence every absent row counts.
+    expect(
+      await copyTable(source as Queryable, target as Queryable, plan, { mode: "check", chunkSize: 2 }),
+    ).toMatchObject({ missing: 3 });
+  });
+
+  it("refuses to copy catalog-derived tables", async () => {
+    const ddl = "CREATE TABLE sessions.session_catalog_agents (org_id text, session_id text, agent_name text, PRIMARY KEY (org_id, session_id));";
+    await Promise.all([source.exec(ddl), target.exec(ddl)]);
+    const plan = await planTable(source as Queryable, target as Queryable, "session_catalog_agents");
+    for (const mode of ["backfill", "mirror"] as const)
+      await expect(
+        copyTable(source as Queryable, target as Queryable, plan, { mode, chunkSize: 5 }),
+      ).rejects.toThrow("reprojected by migration:reproject");
+  });
+});
+
+describe("newest-first order and bound checkpoints", () => {
+  it("backfills newest first by an indexed time column, else by key", async () => {
+    const ddl = `CREATE TABLE sessions.events (org_id text NOT NULL, id text NOT NULL,
+        ts timestamptz NOT NULL, PRIMARY KEY (org_id, id));
+      CREATE INDEX events_ts ON sessions.events (ts);`;
+    await Promise.all([source.exec(ddl), target.exec(ddl)]);
+    // Key order (a, b, c) is not time order (b newest, then c, then a).
+    await source.exec(`INSERT INTO sessions.events VALUES
+      ('o', 'a', '2026-10-01T00:00:00Z'), ('o', 'b', '2026-10-30T00:00:00Z'), ('o', 'c', '2026-10-15T00:00:00Z')`);
+    const timed = await planTable(source as Queryable, target as Queryable, "events", { newestByTime: true });
+    expect(timed.timeColumn).toBe("ts");
+    const seen: string[] = [];
+    await copyTable(source as Queryable, target as Queryable, timed, {
+      mode: "backfill",
+      chunkSize: 1,
+      onPage: async (progress) => {
+        if (progress.after) seen.push(String(progress.after.at(-1)));
+      },
+    });
+    // Pages arrive newest first; the completion callback repeats the last position.
+    expect(seen.slice(0, 3)).toEqual(["b", "c", "a"]);
+    const keyed = await planTable(source as Queryable, target as Queryable, "events");
+    expect(keyed.timeColumn).toBeUndefined();
+    await expect(
+      copyTable(source as Queryable, target as Queryable, timed, { mode: "mirror", chunkSize: 1 }),
+    ).rejects.toThrow("mirror pages by key");
+  });
+
+  it("binds checkpoints to the databases and the exact plan", async () => {
+    const plan = await planTable(source as Queryable, target as Queryable, "tokens");
+    expect(planHash(plan, 500)).toBe(planHash(plan, 500));
+    expect(planHash(plan, 500)).not.toBe(planHash(plan, 501));
+    expect(planHash(plan, 500)).not.toBe(planHash({ ...plan, columns: plan.columns.slice(1) }, 500));
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const file = join(mkdtempSync(join(tmpdir(), "copy-ckpt-")), "c.json");
+    writeFileSync(file, JSON.stringify({ version: 2, mode: "backfill", endpointHash: "aaa", tables: {} }));
+    await expect(loadCheckpoint(file, "backfill", "bbb")).rejects.toThrow("different databases");
+    await expect(loadCheckpoint(file, "check", "aaa")).rejects.toThrow("different version or mode");
+    expect((await loadCheckpoint(file, "backfill", "aaa")).tables).toEqual({});
   });
 });
 
