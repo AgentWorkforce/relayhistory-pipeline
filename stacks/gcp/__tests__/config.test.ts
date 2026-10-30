@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   assertGcpInputs,
   assertGcpRuntimeDeployable,
+  GCP_APPROVED_TARGET,
   bulls96ReleaseValues,
   gcpResourceName,
   pubsubServiceAgent,
@@ -13,9 +14,7 @@ import {
 } from "../config.ts";
 
 const base: GcpInputs = {
-  projectId: "agentworkforce-dev1",
-  projectNumber: "123456789012",
-  region: "us-central1",
+  ...GCP_APPROVED_TARGET,
   controlPlaneAuthorizedCidrs: [{ cidrBlock: "203.0.113.10/32", displayName: "operator" }],
   clearedBy: "Khaliq: code review fixture only, 2026-10-29",
   managedDataPlane: { provision: false },
@@ -24,6 +23,24 @@ const base: GcpInputs = {
 describe("GCP self-host contract", () => {
   it("accepts a substrate-only stage without pretending managed services are attached", () => {
     expect(() => assertGcpInputs("gcp-dev", base)).not.toThrow();
+  });
+
+  it("rejects any project, number, org, billing account, or region other than the approved target", () => {
+    expect(() => assertGcpInputs("gcp-dev", { ...base, projectId: "agentworkforce-dev1" })).toThrow(
+      /does not match the approved project/,
+    );
+    expect(() => assertGcpInputs("gcp-dev", { ...base, projectNumber: "123456789012" })).toThrow(
+      /does not match the approved project/,
+    );
+    expect(() => assertGcpInputs("gcp-dev", { ...base, organizationId: "123456789012" })).toThrow(
+      /does not match the approved project/,
+    );
+    expect(() => assertGcpInputs("gcp-dev", { ...base, billingAccount: "AAAAAA-BBBBBB-CCCCCC" })).toThrow(
+      /does not match the approved project/,
+    );
+    expect(() => assertGcpInputs("gcp-dev", { ...base, region: "us-east1" })).toThrow(
+      /does not match the approved project/,
+    );
   });
 
   it("requires an explicit adapter-proof acknowledgement before managed services can cost money", () => {

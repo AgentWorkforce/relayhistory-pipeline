@@ -221,9 +221,10 @@ gcloud billing projects describe "$PROJECT" --format='value(billingEnabled,billi
 
 Stop unless every field matches: project `agentrelay-96bulls-soc2-2610`,
 number `955297012355`, parent org `929835122282`, billing account
-`014D50-E96D1A-DE6360`, and region `us-central1`. A denied name, a different
-number, org, billing account, or region, or billing that is off is a
-mismatch. Do not enable `compute.googleapis.com` to read quota. Write
+`014D50-E96D1A-DE6360`, and region `us-central1`. `assertGcpInputs` refuses
+the stage unless `organizationId` and `billingAccount` are present and all
+five fields match that target. A denied name or billing that is off is also
+a mismatch. Do not enable `compute.googleapis.com` to read quota. Write
 `.96bulls/$STAGE/gcp-inputs.json` with this project id, number
 `955297012355`, region `us-central1`, and no secret payload. A later plan
 still needs `CI=true` and must not pass `--yes` until the state bucket is

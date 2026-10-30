@@ -258,7 +258,11 @@ export interface SqlAdminEnsureTransport {
    * Set `Authorization` from `credential.bearer` for this call only.
    * Do not log the credential, the response body, or this request together.
    */
-  request(call: SqlAdminEnsureRequest, credential: SqlAdminCredential): Promise<SqlAdminEnsureResponse>;
+  request(
+    call: SqlAdminEnsureRequest,
+    credential: SqlAdminCredential,
+    signal?: AbortSignal,
+  ): Promise<SqlAdminEnsureResponse>;
 }
 
 export interface SqlAdminPollControl {
@@ -267,6 +271,8 @@ export interface SqlAdminPollControl {
   deadlineMs?: number;
   intervalMs?: number;
   maxPolls?: number;
+  /** Bounds one lookup, insert, or operation GET. The poll deadline does not cancel a hung request. */
+  requestTimeoutMs?: number;
 }
 
 export interface PrivateCloudSqlEnsureResult {
@@ -282,6 +288,7 @@ interface ResolvedPoll {
   deadlineMs: number;
   intervalMs: number;
   maxPolls: number;
+  requestTimeoutMs: number;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -364,9 +371,6 @@ function classifyExisting(spec: PrivateCloudSqlSpec, body: unknown): "match" | "
   if (Array.isArray(networks) && networks.length > 0) return "public";
   if (Array.isArray(addresses) && addresses.some((entry) => asRecord(entry)?.type === "PRIMARY")) return "public";
   const networksEmpty = networks === undefined || (Array.isArray(networks) && networks.length === 0);
-  const addressesPrivate =
-    addresses === undefined ||
-    (Array.isArray(addresses) && addresses.every((entry) => asRecord(entry)?.type === "PRIVATE"));
   const privateMatch =
     record?.name === spec.instanceName &&
     record.region === spec.insertBody.region &&
@@ -376,10 +380,14 @@ function classifyExisting(spec: PrivateCloudSqlSpec, body: unknown): "match" | "
     ip?.ipv4Enabled === false &&
     samePrivateNetwork(spec.privateNetwork, ip.privateNetwork) &&
     ip.allocatedIpRange === spec.allocatedIpRange &&
-    networksEmpty &&
-    addressesPrivate;
+    networksEmpty;
   if (!privateMatch) return "mismatch";
   if (record?.state !== "RUNNABLE") return "not-ready";
+  const privateAddresses =
+    Array.isArray(addresses) &&
+    addresses.length > 0 &&
+    addresses.every((entry) => asRecord(entry)?.type === "PRIVATE");
+  if (!privateAddresses) return "mismatch";
   return "match";
 }
 
@@ -405,18 +413,22 @@ function resolvePoll(poll?: SqlAdminPollControl): ResolvedPoll {
   const deadlineMs = poll?.deadlineMs ?? 10 * 60 * 1000;
   const intervalMs = poll?.intervalMs ?? 2000;
   const maxPolls = poll?.maxPolls ?? 300;
+  const requestTimeoutMs = poll?.requestTimeoutMs ?? 30_000;
   if (!Number.isFinite(deadlineMs) || deadlineMs < 1 || deadlineMs > 60 * 60 * 1000)
     refuse("Cloud SQL Admin poll deadline is invalid.");
   if (!Number.isInteger(intervalMs) || intervalMs < 1 || intervalMs > 60_000)
     refuse("Cloud SQL Admin poll interval is invalid.");
   if (!Number.isInteger(maxPolls) || maxPolls < 1 || maxPolls > 10_000)
     refuse("Cloud SQL Admin poll limit is invalid.");
+  if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 120_000)
+    refuse("Cloud SQL Admin request timeout is invalid.");
   return {
     now: poll?.now ?? (() => Date.now()),
     sleep: poll?.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     deadlineMs,
     intervalMs,
     maxPolls,
+    requestTimeoutMs,
   };
 }
 
@@ -424,13 +436,31 @@ async function ask(
   transport: SqlAdminEnsureTransport,
   call: SqlAdminEnsureRequest,
   credential: SqlAdminCredential,
-): Promise<SqlAdminEnsureResponse | "thrown"> {
+  timeoutMs: number,
+): Promise<SqlAdminEnsureResponse | "thrown" | "timeout"> {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      resolve("timeout");
+    }, timeoutMs);
+  });
   try {
-    const response = await transport.request(call, credential);
+    const response = await Promise.race([
+      transport.request(call, credential, controller.signal).then(
+        (value) => value,
+        (): "timeout" | "thrown" => (timedOut ? "timeout" : "thrown"),
+      ),
+      timeout,
+    ]);
+    if (response === "timeout" || response === "thrown") return response;
     if (!response || typeof response.status !== "number" || !Number.isInteger(response.status)) return "thrown";
     return response;
-  } catch {
-    return "thrown";
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -455,7 +485,8 @@ export async function ensurePrivateCloudSql(
   const instanceName = spec.instanceName;
   const instanceUrl = `https://sqladmin.googleapis.com/v1/projects/${projectId}/instances/${instanceName}`;
   const getCall: SqlAdminEnsureRequest = { method: "GET", url: instanceUrl };
-  const existing = await ask(transport, getCall, credential);
+  const existing = await ask(transport, getCall, credential, clock.requestTimeoutMs);
+  if (existing === "timeout") refuse("Cloud SQL Admin instance lookup timed out.");
   if (existing === "thrown") refuse("Cloud SQL Admin instance lookup was not accepted.");
   if (existing.status === 200) {
     const kind = classifyExisting(spec, existing.body);
@@ -466,14 +497,14 @@ export async function ensurePrivateCloudSql(
   }
   if (existing.status !== 404) refuse("Cloud SQL Admin instance lookup was not accepted.");
 
-  const inserted = await ask(transport, { method: "POST", url: request.url, body: request.body }, credential);
-  if (inserted === "thrown") uncertain(projectId, instanceName);
+  const inserted = await ask(transport, { method: "POST", url: request.url, body: request.body }, credential, clock.requestTimeoutMs);
+  if (inserted === "thrown" || inserted === "timeout") uncertain(projectId, instanceName);
   if (inserted.status === 409) {
     const started = clock.now();
     for (let attempt = 0; attempt < clock.maxPolls; attempt += 1) {
       if (clock.now() - started >= clock.deadlineMs) timedOut(projectId, instanceName);
-      const again = await ask(transport, getCall, credential);
-      if (again === "thrown") uncertain(projectId, instanceName);
+      const again = await ask(transport, getCall, credential, clock.requestTimeoutMs);
+      if (again === "thrown" || again === "timeout") uncertain(projectId, instanceName);
       if (again.status === 200) {
         const kind = classifyExisting(spec, again.body);
         if (kind === "match") return { created: false, operation: null };
@@ -504,8 +535,8 @@ export async function ensurePrivateCloudSql(
     let finished = false;
     for (let attempt = 0; attempt < clock.maxPolls; attempt += 1) {
       if (clock.now() - started >= clock.deadlineMs) timedOut(projectId, instanceName);
-      const polled = await ask(transport, { method: "GET", url: operationUrl }, credential);
-      if (polled === "thrown" || polled.status !== 200) uncertain(projectId, instanceName);
+      const polled = await ask(transport, { method: "GET", url: operationUrl }, credential, clock.requestTimeoutMs);
+      if (polled === "thrown" || polled === "timeout" || polled.status !== 200) uncertain(projectId, instanceName);
       const state = operationState(polled.body);
       if (state === "done") {
         finished = true;
@@ -518,8 +549,8 @@ export async function ensurePrivateCloudSql(
     }
     if (!finished) timedOut(projectId, instanceName);
   }
-  const confirmed = await ask(transport, getCall, credential);
-  if (confirmed === "thrown" || confirmed.status !== 200) uncertain(projectId, instanceName);
+  const confirmed = await ask(transport, getCall, credential, clock.requestTimeoutMs);
+  if (confirmed === "thrown" || confirmed === "timeout" || confirmed.status !== 200) uncertain(projectId, instanceName);
   if (classifyExisting(spec, confirmed.body) !== "match") createdMismatch(projectId, instanceName);
   return { created: true, operation: operationId };
 }
