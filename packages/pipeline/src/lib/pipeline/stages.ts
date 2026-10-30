@@ -79,9 +79,21 @@ export interface SessionPointerIndex {
   ): Promise<void | { status: "skipped"; reason: string }>;
 }
 
+/** The stored normalized object, described from its own bytes. */
+export interface NormalizedOutput {
+  outputKey: string;
+  /** Lowercase hex SHA-256 of the stored object. */
+  outputSha256: string;
+  outputBytes: number;
+  /** The object's `convergence_events` lines. */
+  convergenceEventCount: number;
+  /** Records with no projection, which leave no line in the object. */
+  unprojectedRecords: number;
+}
+
 export interface SessionTransform {
-  /** Idempotent by input key and transform version. */
-  normalize(pointer: RawPointer): Promise<{ outputKey?: string }>;
+  /** Idempotent by input key and transform version. Empty when nothing was normalized. */
+  normalize(pointer: RawPointer): Promise<NormalizedOutput | Record<string, never>>;
 }
 
 export interface StageSenders {
@@ -248,6 +260,11 @@ export function fileNormalizeHandler(
   return async (message, recorder) => {
     const output = await transform.normalize(message.payload as RawPointer);
     if (output.outputKey)
-      recorder.log.info("transform output", { output_key: output.outputKey });
+      recorder.log.info("transform output", {
+        output_key: output.outputKey,
+        output_bytes: output.outputBytes,
+        convergence_event_count: output.convergenceEventCount,
+        unprojected_records: output.unprojectedRecords,
+      });
   };
 }

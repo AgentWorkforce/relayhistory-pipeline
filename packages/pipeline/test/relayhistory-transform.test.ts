@@ -8,6 +8,7 @@ import { sha256Hex } from "../../object-store/src/crypto.js";
 import {
   computeContentSha256,
   manifestKey,
+  normalizedKey,
   objectKey,
   rawChunkKey,
   readAll,
@@ -16,6 +17,8 @@ import {
   type SessionLocation,
 } from "../src/lib/pipeline/object-layout.js";
 import { objectStoreManifestReader } from "../src/lib/pipeline/adapter.js";
+import { projectRelayhistorySession } from "../src/lib/pipeline/relayhistory-projection.js";
+import type { NormalizedOutput } from "../src/lib/pipeline/stages.js";
 import {
   RelayhistoryExportTransform,
   normalizeRelayhistoryRecords,
@@ -246,6 +249,93 @@ describe("RelayHistory export transform", () => {
       "live",
     ]);
     expect(Object.keys(lines[0]!.row.record.payload)).toEqual(["ts_ms", "\uE000", "😀"]);
+  });
+
+  describe("the output it reports", () => {
+    const setup = async () => {
+      const f = await fixture();
+      const transform = new RelayhistoryExportTransform({ manifests: f.reader, store: f.store });
+      const pointer = { traceId: TRACE, workspaceId: loc.workspaceId, manifestKey: f.key };
+      const key = normalizedKey(
+        loc,
+        1,
+        `relayhistory-${f.manifest.raw.content_sha256}.ndjson`,
+      );
+      return { ...f, transform, pointer, key: objectKey(key) };
+    };
+    const reported = (output: Awaited<ReturnType<RelayhistoryExportTransform["normalize"]>>) =>
+      output as NormalizedOutput;
+    const eventLines = (bytes: Uint8Array) =>
+      new TextDecoder()
+        .decode(bytes)
+        .trim()
+        .split("\n")
+        .filter((line) => JSON.parse(line).table === "convergence_events").length;
+
+    it("describes the stored bytes: count, digest and size", async () => {
+      const f = await setup();
+      const output = reported(await f.transform.normalize(f.pointer));
+      const stored = await readAll(await f.store.get(f.key));
+      expect(output).toMatchObject({
+        outputKey: f.key,
+        outputSha256: await sha256Hex(stored),
+        outputBytes: stored.byteLength,
+        convergenceEventCount: eventLines(stored),
+        unprojectedRecords: 0,
+      });
+      expect(output.convergenceEventCount).toBe(3);
+    });
+
+    it("counts only convergence_events lines, and reports records with no projection", () => {
+      expect(
+        projectRelayhistorySession(
+          [
+            record("event", "1", 1),
+            record("catalog", "1", 2, { kind: "session", payload: { title: "t" } }),
+            record("presence", "1", 3, { kind: "presence" }),
+          ],
+          { workspaceId: "workspace", source: "claude", sessionId: "session" },
+        ),
+      ).toMatchObject({ unprojected: 1 });
+    });
+
+    it("on a content-addressed hit describes the existing object, not this run or its metadata", async () => {
+      const f = await setup();
+      const stored = new TextEncoder().encode(
+        [
+          { table: "session_catalog", row: { title: "t" } },
+          { table: "convergence_events", row: { event_id: "only" } },
+        ]
+          .map((line) => `${JSON.stringify(line)}\n`)
+          .join(""),
+      );
+      await f.store.put(f.key, stored, {
+        ifNoneMatch: true,
+        metadata: { "convergence-event-count": "99", "manifest-revision": "1" },
+      });
+      expect(await f.transform.normalize(f.pointer)).toMatchObject({
+        outputKey: f.key,
+        outputSha256: await sha256Hex(stored),
+        outputBytes: stored.byteLength,
+        convergenceEventCount: 1,
+      });
+      expect(await readAll(await f.store.get(f.key))).toEqual(stored);
+    });
+
+    it("reports the same output when a run repeats identical content", async () => {
+      const f = await setup();
+      const first = await f.transform.normalize(f.pointer);
+      expect(await f.transform.normalize(f.pointer)).toEqual(first);
+    });
+
+    it("refuses a stored object in the superseded envelope format", async () => {
+      const f = await setup();
+      await f.store.put(f.key, ndjson([record("old", "1", 1)]), { ifNoneMatch: true });
+      await expect(f.transform.normalize(f.pointer)).rejects.toMatchObject({
+        code: "normalized_object_invalid",
+        retryable: false,
+      });
+    });
   });
 
   it("refuses a chunk whose stored digest does not match the manifest", async () => {
