@@ -13,11 +13,11 @@
  */
 import { createHash } from "node:crypto";
 import { zstdDecompressSync } from "node:zlib";
-import { PipelineError, rawChunkKey, readAll, type ManifestReader, type ManifestV1, type ObjectStore, type RawPointer, type StageHandler } from "../shared/vendor.ts";
+import { PipelineError, RELAYHISTORY_EXPORT_EXTENSION, rawChunkKey, readAll, readRelayhistoryExport, type ManifestReader, type ManifestV1, type ObjectStore, type RawPointer, type StageHandler } from "../shared/vendor.ts";
 import type { HoopDb } from "../shared/db.ts";
 import { ctxOf } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
-import { digestRecords, type Summarizer } from "./summarizer.ts";
+import { digestExportRecords, digestRecords, type SessionDigest, type Summarizer } from "./summarizer.ts";
 import {
   clearSummaryObject,
   summaryObjectKey,
@@ -51,11 +51,22 @@ interface Outcome {
   records: number;
 }
 
-async function buildOutcome(kind: SummaryKind, m: ManifestV1, deps: BobCostasDeps): Promise<Outcome> {
-  const none = { tokensIn: 0, tokensOut: 0, records: 0 };
-  // Scrub quarantine: an unscrubbed session is never read.
-  if (!m.raw.scrub) return { status: "quarantined", ...none };
-  if (m.raw.format === "sqlite-rows") return { status: "unsupported", ...none };
+/**
+ * Records with revisions: an exported session, or any session a backfill reached.
+ * These are read only through `readRelayhistoryExport`, which merges every epoch
+ * (manifest v1, "Reading": highest revision, deletes applied, event order) and
+ * refuses, without retry, a marker version or format it cannot merge. Concatenating
+ * them would count revisions twice and bring deleted records back.
+ */
+function mergedStream(m: ManifestV1): boolean {
+  return (
+    m.extensions?.[RELAYHISTORY_EXPORT_EXTENSION] !== undefined ||
+    m.raw.epochs?.some((epoch) => epoch.reason === "backfill" || epoch.reason === "resumed") === true
+  );
+}
+
+/** A harness log: one source's lines, in chunk order. */
+async function digestChunks(m: ManifestV1, deps: BobCostasDeps): Promise<SessionDigest> {
   const s = m.session;
   const loc = { workspaceId: s.workspace_id, machineId: s.machine_id, harness: s.harness, sessionId: s.session_id, startDate: s.started_at.slice(0, 10) };
   const lines: string[] = [];
@@ -70,7 +81,15 @@ async function buildOutcome(kind: SummaryKind, m: ManifestV1, deps: BobCostasDep
     }
     lines.push(...zstdDecompressSync(Buffer.from(stored)).toString("utf8").split("\n"));
   }
-  const digest = digestRecords(s.harness, lines);
+  return digestRecords(s.harness, lines);
+}
+
+async function buildOutcome(kind: SummaryKind, m: ManifestV1, deps: BobCostasDeps): Promise<Outcome> {
+  const none = { tokensIn: 0, tokensOut: 0, records: 0 };
+  // Scrub quarantine: an unscrubbed session is never read.
+  if (!m.raw.scrub) return { status: "quarantined", ...none };
+  if (m.raw.format === "sqlite-rows") return { status: "unsupported", ...none };
+  const digest = mergedStream(m) ? digestExportRecords(m.session.harness, await readRelayhistoryExport(m, deps.store)) : await digestChunks(m, deps);
   if (digest.records === 0) return { status: "empty", ...none };
   const summary = await deps.summarizer.summarize(kind, digest);
   return { status: "ready", summary: summary.text, model: summary.modelId, tokensIn: summary.tokensIn, tokensOut: summary.tokensOut, records: digest.records };

@@ -4,7 +4,7 @@
  * summariser plugs in behind the same interface; its telemetry carries model
  * id and token counts only, never prompts or outputs.
  */
-import { scrubText } from "../shared/vendor.ts";
+import { scrubText, type RelayhistoryStreamRecord } from "../shared/vendor.ts";
 
 export interface SessionDigest {
   harness: string;
@@ -58,6 +58,44 @@ export function digestRecords(harness: string, lines: string[]): SessionDigest {
       if (Array.isArray(content))
         for (const part of content as Record<string, unknown>[])
           if (part?.type === "tool_use" && typeof part.name === "string") d.toolCalls[part.name] = (d.toolCalls[part.name] ?? 0) + 1;
+    }
+  }
+  return d;
+}
+
+const isSet = (value: unknown) => value === 1 || value === "1" || value === true || value === "true";
+
+/**
+ * The digest of merged RelayHistory records, in event order. Control rows and
+ * sidechain user rows are plumbing, as in the delivery projection. `history`
+ * rows repeat the session's user events, so only events make turns.
+ */
+export function digestExportRecords(harness: string, records: readonly RelayhistoryStreamRecord[]): SessionDigest {
+  const d: SessionDigest = { harness, records: 0, userTurns: [], assistantTurns: 0, toolCalls: {}, models: [] };
+  const turn = (role: unknown, text: unknown, model: unknown) => {
+    if (role === "user" && typeof text === "string" && text) d.userTurns.push(text);
+    if (role !== "assistant") return;
+    d.assistantTurns += 1;
+    if (typeof model === "string" && model && !d.models.includes(model)) d.models.push(model);
+  };
+  const tool = (name: unknown) => {
+    if (typeof name === "string" && name) d.toolCalls[name] = (d.toolCalls[name] ?? 0) + 1;
+  };
+  for (const record of records) {
+    const p = record.payload ?? {};
+    d.records += 1;
+    const at = typeof p.ts_ms === "number" ? new Date(p.ts_ms).toISOString() : undefined;
+    if (at) {
+      d.firstTs ??= at;
+      d.lastTs = at;
+    }
+    if (record.kind === "session_event") {
+      if (p.control_kind || isSet(p.is_meta) || (p.role === "user" && isSet(p.is_sidechain))) continue;
+      turn(p.role, p.text, p.model);
+    } else if (record.kind === "tool_call") tool(p.name);
+    else if (record.kind === "convergence_event") {
+      turn(p.actor_role ?? p.type, p.content, p.model);
+      tool(p.tool_name);
     }
   }
   return d;
