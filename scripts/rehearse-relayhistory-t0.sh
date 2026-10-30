@@ -106,9 +106,10 @@ docker run --rm --network "$NAME" -v "$WORK/bulls":/bulls -w /bulls \
   # Guard: without --execute nothing is written; a swapped target is refused.
   bun run src/migration/relayhistory-copy.ts --mode=backfill --tables=convergence_events > /tmp/dry.json && bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/dry.json\",\"utf8\"));console.log(\"dry run:\",r.dryRun,\"written\",r.tables[0].written)'
   RELAYHISTORY_SOURCE_URL=\"\$BULLS_TARGET_URL\" BULLS_TARGET_URL=\"\$RELAYHISTORY_SOURCE_URL\" bun run src/migration/relayhistory-copy.ts --mode=backfill --tables=convergence_events --execute --expect-target-host=$NAME-dst 2>&1 | grep -o \"refusing to write\" | sed \"s/^/swapped URLs: /\"
-  bun run src/migration/relayhistory-rebuild.ts --since=2026-10-01T10:00:00Z --batch=7 --execute --expect-target-host=$NAME-dst | bun -e 'const r=JSON.parse(await Bun.stdin.text());console.log(\"rebuild:\",r.sessions,\"sessions\")'
   bun run src/migration/relayhistory-verify.ts --mode=full --chunk-size=113 > /tmp/full.json || true
   bun -e 'const r=JSON.parse(require(\"fs\").readFileSync(\"/tmp/full.json\",\"utf8\"));const bad=r.tables.filter(t=>t.data&&t.data!==\"equal\"||t.schema!==\"compatible\");console.log(\"full verify passed:\",r.passed,\"| tables:\",r.tables.length,\"| not equal:\",bad.map(t=>t.table+\":\"+(t.data||t.schema)).join(\" \")||\"none\")'
+  # After the faithful-copy check: rebuild intentionally recomputes derived state.
+  bun run src/migration/relayhistory-rebuild.ts --since=2026-10-01T10:00:00Z --batch=7 --execute --expect-target-host=$NAME-dst | bun -e 'const r=JSON.parse(await Bun.stdin.text());console.log(\"rebuild:\",r.sessions,\"sessions\")'
 "
 step "target: no wakeups or revision events from history"
 docker exec "$NAME-dst" psql -At -U postgres -c \
