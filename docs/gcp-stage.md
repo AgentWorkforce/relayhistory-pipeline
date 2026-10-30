@@ -171,6 +171,7 @@ To request the application release after its external Secrets exist, set
   "existingSecretName": "96bulls-runtime",
   "imagePullSecretName": "ghcr-pull",
   "imageDigest": "sha256:<digest-built-from-the-reviewed-main-commit>",
+  "imageSourceRevision": "<full-40-character-reviewed-main-commit>",
   "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
   "relayauthIssuer": "http://relayauth.relayauth.svc:8787"
 }
@@ -178,6 +179,13 @@ To request the application release after its external Secrets exist, set
 
 Those are names and identifiers only. Secret payloads never belong in this
 file or Helm values.
+
+The digest and source revision must exactly match the structured services
+release in `versions.lock.json`, and that release must set
+`gcpProofEligible: true`. The currently recorded `db2663d` image is explicitly
+ineligible. A services image release updates the digest, full source revision,
+and eligibility together only after the image build and review complete; an
+arbitrary or merely well-formed digest cannot enable this stage.
 
 `assertGcpInputs` accepts only those five target fields. `agentworkforce-dev1`
 and any other project, number, org, billing account, or region are refused

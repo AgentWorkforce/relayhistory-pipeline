@@ -6,6 +6,7 @@ import {
   assertGcpInputs,
   assertGcpRuntimeDeployable,
   GCP_APPROVED_TARGET,
+  GCP_APPROVED_SERVICES_IMAGE,
   GCP_NODE_ROLES,
   GCP_RUNTIME_SHAPE,
   bulls96ReleaseValues,
@@ -47,6 +48,7 @@ describe("GCP self-host contract", () => {
       existingSecretName: "not a secret name",
       imagePullSecretName: "not a pull secret name",
       imageDigest: "not-a-digest",
+      imageSourceRevision: "not-a-revision",
       relayauthJwksUrl: "http://user:password@attacker.example/jwks?token=secret",
       relayauthIssuer: "http://user:password@attacker.example",
     };
@@ -121,6 +123,7 @@ describe("GCP self-host contract", () => {
       existingSecretName: "bulls96-runtime",
       imagePullSecretName: "ghcr-pull",
       imageDigest: `sha256:${"a".repeat(64)}`,
+      imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
       relayauthIssuer: "http://relayauth.relayauth.svc:8787",
     };
@@ -139,6 +142,20 @@ describe("GCP self-host contract", () => {
         bulls96: { ...bulls96, imageDigest: "main" },
       }),
     ).toThrow("immutable sha256 digest");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, imageSourceRevision: "db2663d" },
+      }),
+    ).toThrow("full Git commit SHA");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96,
+      }),
+    ).toThrow("does not match the reviewed release");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
@@ -179,16 +196,16 @@ describe("GCP self-host contract", () => {
       assertGcpInputs("gcp-dev", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
-        bulls96,
+        bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
-    ).not.toThrow();
+    ).toThrow("not approved for the GCP application proof");
     expect(() =>
       assertGcpRuntimeDeployable({
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
-        bulls96,
+        bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
-    ).not.toThrow();
+    ).toThrow("not approved for the GCP application proof");
   });
 
   it("renders a CA-backed Redis round-trip contract without AUTH or HMAC credentials", () => {
@@ -200,6 +217,7 @@ describe("GCP self-host contract", () => {
           existingSecretName: "bulls96-runtime",
           imagePullSecretName: "ghcr-pull",
           imageDigest: `sha256:${"a".repeat(64)}`,
+          imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
           relayauthIssuer: "http://relayauth.relayauth.svc:8787",
         },

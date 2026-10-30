@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
+import versionsLock from "../../versions.lock.json";
 
 export const GCP_CONFIRM_PROJECT_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT";
 export const GCP_CONFIRM_SQL_POST_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_SQL_POST";
@@ -21,6 +22,17 @@ export const RELAYCAST_PUBLISHED_CHART = {
   repository: "ghcr.io/agentworkforce/relaycast-self-host",
   imageDigest: "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
   packageDigest: "cdfc41cb6202fd81beb17cb57d5fbbdecaf27fa427f51faa07c5ec0fc116744f",
+} as const;
+
+/**
+ * The only services image the GCP proof may run. Updating a digest alone is
+ * insufficient: the release commit must record the exact source revision and
+ * explicitly make that pair eligible after its image build succeeds.
+ */
+export const GCP_APPROVED_SERVICES_IMAGE = {
+  digest: versionsLock.images.services.digest,
+  sourceRevision: versionsLock.images.services.sourceRevision,
+  eligible: versionsLock.images.services.gcpProofEligible,
 } as const;
 
 export const GCP_REDIS_CLIENT = {
@@ -172,6 +184,8 @@ export interface GcpInputs {
     imagePullSecretName: string;
     /** Digest of the services image built from the reviewed runtime commit. */
     imageDigest: string;
+    /** Full Git revision from which imageDigest was built. Must match versions.lock.json. */
+    imageSourceRevision: string;
     /** Public HTTPS or the in-cluster RelayAuth service. Alleyoop refuses to render without it. */
     relayauthJwksUrl: string;
     /** Exact token issuer: public HTTPS or the in-cluster RelayAuth service origin. */
@@ -342,11 +356,28 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     requireSecretName("bulls96.imagePullSecretName", inputs.bulls96.imagePullSecretName);
     if (!/^sha256:[a-f0-9]{64}$/.test(inputs.bulls96.imageDigest))
       throw new Error("96bulls: bulls96.imageDigest must be an immutable sha256 digest");
+    if (!/^[a-f0-9]{40}$/.test(inputs.bulls96.imageSourceRevision))
+      throw new Error("96bulls: bulls96.imageSourceRevision must be a full Git commit SHA");
     requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", inputs.bulls96.relayauthJwksUrl);
     requireRelayauthIssuer("bulls96.relayauthIssuer", inputs.bulls96.relayauthIssuer);
     if (inputs.relayauth?.baseUrl && inputs.bulls96.relayauthIssuer !== inputs.relayauth.baseUrl)
       throw new Error("96bulls: bulls96.relayauthIssuer must match relayauth.baseUrl for the in-stage RelayAuth release");
+    requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
   }
+}
+
+function requireApprovedGcpServicesImage(digest: string, sourceRevision: string): void {
+  if (
+    digest !== GCP_APPROVED_SERVICES_IMAGE.digest ||
+    sourceRevision !== GCP_APPROVED_SERVICES_IMAGE.sourceRevision
+  )
+    throw new Error(
+      "96bulls: GCP runtime image digest/source revision does not match the reviewed release in versions.lock.json. Nothing was created.",
+    );
+  if (!GCP_APPROVED_SERVICES_IMAGE.eligible)
+    throw new Error(
+      "96bulls: the recorded services image is not approved for the GCP application proof. Publish and review a current image first. Nothing was created.",
+    );
 }
 
 /** Defense in depth for runtime wiring; the stack's poster remains apply-only. */
@@ -356,6 +387,8 @@ export function assertGcpRuntimeDeployable(inputs: GcpInputs): void {
     (!inputs.managedDataPlane.provision || inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
   )
     throw new Error("96bulls: GCP runtime wiring requires the acknowledged managed data plane. Nothing was created.");
+  if (inputs.bulls96?.enabled)
+    requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
 }
 
 export function assertGcpSqlPostConfirmation(
