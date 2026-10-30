@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +32,7 @@ import {
   type PlanContract,
   type PlanContractFn,
   type UploadIdentity,
+  type UploadInput,
 } from "../relayhistory-export-upload.ts";
 
 const GRANT = "mgr_test";
@@ -54,6 +56,8 @@ interface FakeIngest {
   mintJti?: (n: number) => string | undefined;
   /** Inject a response before the route's own handling (n is per route, 1-based). */
   before?: (route: Route, n: number) => Injected;
+  /** Chunks the ingest accepts per assertion (contract v1: 256). */
+  chunkLimit: number;
   /** The issuer's canonical stored plan: it derives each signed identity from it. */
   storedPlan?: PlanContract;
   /** Override the upload identity the n-th mint signs (default: the stored plan's). */
@@ -85,6 +89,7 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
   const manifests = new Map<string, string>();
   const counts: Record<Route, number> = { chunk: 0, manifest: 0 };
   const commits = { n: 0 };
+  const jtiChunks = new Map<string, Map<string, string>>();
   const send = (res: ServerResponse, status: number, value: unknown) => {
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify(value));
@@ -105,6 +110,7 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
     manifestWrites: 0,
     queue: [],
     requests: [],
+    chunkLimit: 256,
     signed: new Map(),
     usedFor: new Map(),
     signedDigest,
@@ -119,11 +125,11 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
       const raw = await body(req);
       if (req.method === "POST" && url.pathname === "/v1/tokens/migration-assertion") {
         fake.mints += 1;
-        const input = JSON.parse(raw.toString()) as { nonce: string; grantId: string; sourceUserId: string; workspaceId: string; upload: { manifest_key: string } };
+        const input = JSON.parse(raw.toString()) as { nonce: string; grantId: string; sourceUserId: string; workspaceId: string; upload: { key: string } };
         const jti = fake.mintJti?.(fake.mints) ?? `jti_${randomUUID()}`;
         const exp = Math.floor(Date.now() / 1000) + 60;
         // The issuer derives the identity from its stored plan, never from the request.
-        const derived = fake.storedPlan?.uploads.find((u) => u.manifest_key === input.upload?.manifest_key);
+        const derived = fake.storedPlan?.uploads.find((u) => u.key === input.upload?.key);
         if (!derived || derived.source_user_id !== input.sourceUserId || derived.workspace_id !== input.workspaceId)
           return refuse(res, 403, "migration_grant_forbidden");
         const upload = fake.signUpload?.(fake.mints, derived) ?? derived;
@@ -154,15 +160,27 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
         });
       fake.requests.push({ route, key, jti: claims.jti });
       fake.usedFor.set(claims.jti, (fake.usedFor.get(claims.jti) ?? new Set()).add(key));
-      // Provisional per-upload binding (contract update on #228): the request's
-      // target must be the upload the assertion signs.
-      if (key !== upload.manifest_key) return refuse(res, 403, "migration_upload_forbidden");
+      // Contract v1: the request's key and session must be the signed upload's.
+      if (key !== upload.key) return refuse(res, 403, "migration_upload_forbidden");
+      if (route === "chunk" && (url.searchParams.get("machine") !== upload.session.machine_id ||
+        url.searchParams.get("harness") !== upload.session.harness ||
+        url.searchParams.get("session") !== upload.session.session_id ||
+        url.searchParams.get("date") !== upload.session.started_at.slice(0, 10)))
+        return refuse(res, 403, "migration_upload_forbidden");
       if (injected === "hang") return; // never answers
       if (injected) return refuse(res, injected.status, injected.code);
       // Admission: a consumed jti or nonce is a replay, before any storage call.
       if (fake.consumed.has(claims.jti) || fake.consumed.has(claims.meta.nonce)) return refuse(res, 409, "migration_assertion_replayed");
       if (route === "chunk") {
         const digest = sha(raw);
+        // Ledger: one chunk per (jti, seq); at most chunkLimit per assertion.
+        const perJti = (jtiChunks.get(claims.jti) ?? new Map<string, string>());
+        jtiChunks.set(claims.jti, perJti);
+        const seq = url.searchParams.get("seq") ?? "";
+        const prior = perJti.get(seq);
+        if (prior !== undefined && prior !== digest) return refuse(res, 409, "migration_chunk_conflict");
+        if (prior === undefined && perJti.size >= fake.chunkLimit) return refuse(res, 403, "migration_chunk_limit");
+        perJti.set(seq, digest);
         const chunkKey = `${url.searchParams.get("machine")}/${url.searchParams.get("session")}/${url.searchParams.get("seq")}-${url.searchParams.get("offset")}-${digest.slice(0, 8)}`;
         const created = !chunks.has(chunkKey);
         if (created) {
@@ -193,8 +211,15 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
       if (marker.source_user_id !== claims.meta.sourceUserId) return refuse(res, 403, "migration_workspace_forbidden");
       if (marker.grant_id !== claims.meta.grantId) return refuse(res, 403, "migration_grant_forbidden");
       if (marker.plan_digest !== claims.meta.planDigest) return refuse(res, 403, "migration_plan_mismatch");
-      const m = posted.manifest as unknown as { raw: { content_sha256: string } };
-      if (m.raw.content_sha256 !== upload.content_sha256) return refuse(res, 403, "migration_upload_forbidden");
+      // Recompute the entry from the request (never an echoed field).
+      const recomputed = derivePlanContract({
+        grantId: claims.meta.grantId,
+        exportedAt: "unused",
+        uploads: [uploadFromManifest(posted.key, posted.manifest as never)],
+      }).uploads[0]!;
+      if (recomputed.entry_sha256 !== upload.entry_sha256 || recomputed.content_sha256 !== upload.content_sha256 ||
+        canonical(recomputed.session) !== canonical(upload.session))
+        return refuse(res, 403, "migration_upload_forbidden");
       const text = JSON.stringify(posted.manifest);
       const existing = manifests.get(posted.key);
       if (existing === undefined) {
@@ -278,9 +303,9 @@ describe("export plan digest", () => {
     // Pure: the same input gives the same output; the grant is bound in.
     expect(canonical(planContract(testPlan(), GRANT))).toBe(canonical(contract));
     expect(planContract(plan, "mgr_other").planDigest).not.toBe(digest);
-    expect(contract.uploads.map((u) => u.manifest_key)).toEqual(contract.entries.map((e) => e.key));
+    expect(contract.uploads.map((u) => u.key)).toEqual(contract.entries.map((e) => e.key));
     expect(contract.uploads.every((u) => u.plan_digest === digest && u.grant_id === GRANT)).toBe(true);
-    expect(new Set(contract.uploads.map((u) => u.source_chunks_sha256)).size).toBe(2);
+    expect(new Set(contract.uploads.map((u) => u.entry_sha256)).size).toBe(2);
     // One byte changed in one chunk changes the digest and that upload's identity only.
     const tampered = testPlan();
     const data = new Uint8Array(tampered.manifests[1]!.chunks[0]!.data);
@@ -388,12 +413,12 @@ describe("export upload courier", () => {
       expect(fake.signed.size).toBe(3); // 2 uploads + 1 re-mint
       for (const [jti, used] of fake.usedFor) {
         const signed = fake.signed.get(jti)!;
-        expect([...used]).toEqual([signed.manifest_key]); // never presented for another key
+        expect([...used]).toEqual([signed.key]); // never presented for another key
         expect(contract.uploads.map((u) => canonical(u))).toContain(canonical(signed));
       }
       // Every committed queue row was committed under an assertion signing that upload.
-      for (const q of fake.queue) expect(fake.signed.get(q.jti)!.manifest_key).toBe(result.committed.find((c) => c.workKey === q.workKey)!.key);
-      expect(fake.requests.every((r) => r.key === fake.signed.get(r.jti)!.manifest_key)).toBe(true);
+      for (const q of fake.queue) expect(fake.signed.get(q.jti)!.key).toBe(result.committed.find((c) => c.workKey === q.workKey)!.key);
+      expect(fake.requests.every((r) => r.key === fake.signed.get(r.jti)!.key)).toBe(true);
     });
 
     test("refuses an assertion that signs another upload's identity, before sending any bytes", async () => {
@@ -407,7 +432,9 @@ describe("export upload courier", () => {
     });
 
     test.each([
-      ["source-chunk digest", { source_chunks_sha256: "0".repeat(64) }],
+      ["entry digest", { entry_sha256: "0".repeat(64) }],
+      ["key", { key: "v1/ws=ws_1/m=m2/h=claude/d=2026/10/01/s=sess-a/manifest.json" }],
+      ["workspace", { workspace_id: "ws_2" }],
       ["content digest", { content_sha256: "0".repeat(64) }],
       ["plan digest", { plan_digest: "0".repeat(64) }],
       ["grant", { grant_id: "mgr_other" }],
@@ -679,5 +706,126 @@ describe("export upload courier", () => {
       await writeFile(cfg.checkpointPath, JSON.stringify({ ...cp, plan_digest: "1".repeat(64) }));
       await expect(runExportUpload(plan, cfg)).rejects.toMatchObject({ code: "checkpoint_mismatch" });
     });
+  });
+});
+
+describe("contract v1 vectors (#43 docs/contracts/relayhistory-export-plan-entry-v1, at 15127919)", () => {
+  // Copied byte for byte from the fixture commit; see fixtures/.
+  const vectors = JSON.parse(
+    readFileSync(join(import.meta.dir, "fixtures", "relayhistory-export-plan-entry-v1.vectors.json"), "utf8"),
+  ) as {
+    grant_id: string;
+    exported_at: string;
+    inputs: UploadInput[];
+    entries: { entry: Record<string, unknown>; canonical_json: string; entry_sha256: string }[];
+    plan: { canonical_json: string; plan_digest: string };
+    upload_identities: UploadIdentity[];
+    negative: { name: string; upload: UploadIdentity; request_key?: string; sponsor_id?: string; expect: string }[];
+  };
+  const contract = derivePlanContract({ grantId: vectors.grant_id, exportedAt: vectors.exported_at, uploads: vectors.inputs });
+
+  test("derivePlanContract reproduces every entry byte for byte", () => {
+    expect(contract.entries).toHaveLength(vectors.entries.length);
+    contract.entries.forEach((entry, i) => {
+      expect(canonical(entry)).toBe(vectors.entries[i]!.canonical_json);
+      expect(entry).toEqual(vectors.entries[i]!.entry as never);
+      expect(sha(canonical(entry))).toBe(vectors.entries[i]!.entry_sha256);
+    });
+  });
+
+  test("the plan digest is the vector's, over the vector's canonical plan", () => {
+    expect(sha(vectors.plan.canonical_json)).toBe(vectors.plan.plan_digest);
+    expect(contract.planDigest).toBe(vectors.plan.plan_digest);
+  });
+
+  test("the upload identities are the vector's, byte for byte", () => {
+    expect(contract.uploads).toEqual(vectors.upload_identities);
+    contract.uploads.forEach((u, i) => expect(canonical(u)).toBe(canonical(vectors.upload_identities[i]!)));
+  });
+
+  test("relay_ aliases in the input derive the canonical vectors", () => {
+    const aliased = vectors.inputs.map((u) => ({ ...u, org_id: `relay_${u.org_id}`, source_user_id: `relay_${u.source_user_id}` }));
+    const again = derivePlanContract({ grantId: vectors.grant_id, exportedAt: vectors.exported_at, uploads: aliased });
+    expect(again.planDigest).toBe(vectors.plan.plan_digest);
+    expect(again.uploads).toEqual(vectors.upload_identities);
+  });
+
+  test.each(["relay_ alias in source_user_id (not canonical)", "relay_ alias in workspace_id (not canonical)"])(
+    "negative vector %p: the courier's identity check refuses it",
+    (name) => {
+      const neg = vectors.negative.find((n) => n.name === name)!;
+      expect(neg.expect).toBe("invalid_claims");
+      expect(canonical(neg.upload)).not.toBe(canonical(contract.uploads[0]!));
+    },
+  );
+
+  test("negative vectors for another key or user never match what the courier presents", () => {
+    for (const neg of vectors.negative.filter((n) => n.expect === "migration_upload_forbidden")) {
+      if (neg.request_key) expect(neg.request_key).not.toBe(neg.upload.key); // the courier sends only to upload.key
+      if (neg.sponsor_id) expect(neg.sponsor_id).not.toBe(neg.upload.source_user_id); // it mints as upload.source_user_id
+    }
+  });
+});
+
+describe("contract v1 codes", () => {
+  test("a signed identity with a relay_ alias workspace is refused before any byte", async () => {
+    const { fake, cfg, plan } = await setup();
+    fake.signUpload = (_n, derived) => ({ ...derived, workspace_id: `relay_${derived.workspace_id}` });
+    const result = await runExportUpload(plan, cfg);
+    expect(result.stopped).toMatchObject({ code: "assertion_upload_mismatch" });
+    expect(fake.requests).toHaveLength(0);
+  });
+
+  test("403 migration_upload_forbidden stops the run, no retry", async () => {
+    const { fake, cfg, plan } = await setup();
+    fake.before = (route) => (route === "manifest" ? { status: 403, code: "migration_upload_forbidden" } : undefined);
+    const result = await runExportUpload(plan, cfg);
+    expect(result.stopped).toMatchObject({ code: "migration_upload_forbidden", status: 403 });
+    expect(fake.mints).toBe(1);
+  });
+
+  test("409 migration_chunk_conflict fails that manifest and the run moves on", async () => {
+    const { fake, cfg, plan } = await setup();
+    fake.before = (route, n) => (route === "chunk" && n === 1 ? { status: 409, code: "migration_chunk_conflict" } : undefined);
+    const result = await runExportUpload(plan, cfg);
+    expect(result.failed).toEqual([{ key: expect.stringContaining("s=sess-a"), code: "migration_chunk_conflict" }]);
+    expect(result.committed).toHaveLength(1);
+    expect(fake.mints).toBe(2); // no re-mint for a conflict
+  });
+
+  test("at most chunksPerAssertion chunks go under one assertion, then a fresh mint", async () => {
+    const { fake, cfg, plan, chunkCount } = await setup({ chunksPerAssertion: 1 });
+    fake.chunkLimit = 1;
+    const result = await runExportUpload(plan, cfg);
+    expect(result.committed).toHaveLength(2);
+    expect(result.failed).toEqual([]);
+    expect(fake.mints).toBe(chunkCount); // one assertion per chunk; the manifest reuses the last
+    // Proactive: the ingest never had to refuse a chunk for the limit.
+    expect(fake.requests.filter((r) => r.route === "chunk")).toHaveLength(chunkCount);
+    expect(fake.requests.some((r) => r.route === "chunk" && fake.signed.get(r.jti) === undefined)).toBe(false);
+    for (const [, used] of fake.usedFor) expect(used.size).toBe(1);
+    expect(fake.chunkWrites).toBe(chunkCount);
+    expect(fake.manifestWrites).toBe(2);
+  });
+
+  test("403 migration_chunk_limit re-mints and continues; sealed chunks are not resent", async () => {
+    const { fake, cfg, plan, chunkCount } = await setup();
+    fake.chunkLimit = 1; // the ingest is stricter than the courier's budget
+    const result = await runExportUpload(plan, cfg);
+    expect(result.committed).toHaveLength(2);
+    expect(fake.chunkWrites).toBe(chunkCount);
+    expect(fake.manifestWrites).toBe(2);
+    const sealedPosts = fake.requests.filter((r) => r.route === "chunk").length;
+    expect(sealedPosts).toBe(chunkCount + (chunkCount - plan.manifests.length)); // one refused post per extra chunk
+  });
+
+  test("a second 403 migration_chunk_limit with no progress stops the run", async () => {
+    const { fake, cfg, plan } = await setup();
+    fake.before = (route) => (route === "chunk" ? { status: 403, code: "migration_chunk_limit" } : undefined);
+    const result = await runExportUpload(plan, cfg);
+    expect(result.stopped).toMatchObject({ code: "migration_chunk_limit", status: 403 });
+    expect(fake.mints).toBe(2); // exactly one re-mint
+    expect(fake.requests).toHaveLength(2);
+    expect(fake.chunkWrites).toBe(0);
   });
 });

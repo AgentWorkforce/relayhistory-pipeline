@@ -87,16 +87,21 @@ manifest: chunks through `POST /v1/pipeline/chunks`, then `POST
 /v1/pipeline/manifests`, each manifest under its own fresh migration
 assertion. One pure function (`derivePlanContract`) gives the canonical,
 grant-bound plan entries, the plan digest and one per-upload identity per
-manifest; it is swappable for the shared fixture from #43. RelayAuth derives
-the signed identity (grant, plan digest, org, workspace, canonical source
-user, machine/session key, manifest key, content and source-chunk digests)
-from its stored plan; a mint names only the manifest key, and the courier
-refuses an assertion whose signed plan or identity differs from what it is
-about to send. User ids have one canonical form, without the `relay_` prefix.
-The courier re-mints once on 409 `migration_assertion_replayed` (a second one
-fails that manifest) and once on exactly 401 `migration_assertion_expired` (a
-second one stops the run). It backs off a bounded number of times on 5xx and
-lost responses and then stops, and stops at once on any other 401 or a 403. A per-manifest checkpoint (ids, digests and work keys,
+manifest, exactly as `docs/contracts/relayhistory-export-plan-entry-v1.md`
+(#43) defines them; a test reproduces the contract's vectors byte for byte.
+RelayAuth derives the signed `meta.upload` (grant, plan digest, manifest key,
+org, workspace, source user, session, content and entry digests) from its
+stored plan; a mint names only the manifest key, and the courier refuses an
+assertion whose signed plan or identity differs from what it is about to
+send. Ids have one canonical form, without the `relay_` prefix.
+
+Retries: one re-mint on 409 `migration_assertion_replayed` (a second fails
+that manifest) and on exactly 401 `migration_assertion_expired` (a second
+stops the run); at most 256 chunks per assertion, then a fresh mint, and one
+re-mint on 403 `migration_chunk_limit`; bounded backoff on 5xx and lost
+responses, then stop. Any other 401 or 403 (including
+`migration_upload_forbidden`) stops the run; 409 `migration_chunk_conflict`
+fails that manifest. A per-manifest checkpoint (ids, digests and work keys,
 never tokens) keeps a resumed run from re-uploading committed manifests. It is
 tested only against an in-process fake ingest, and the CLI still refuses
 `--execute`.

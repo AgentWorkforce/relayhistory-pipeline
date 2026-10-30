@@ -20,12 +20,18 @@
  *   assertion whose signed plan or identity differs from its own derivation,
  *   and never uses it for another upload. Before each commit it re-runs the
  *   same function over the exact manifest about to be sent.
- * - **User ids.** One canonical form (`canonicalUserId`: no `relay_` prefix)
- *   in the plan, the mint, the manifest and the identity.
+ * - **Ids.** One canonical form (`canonicalId`: no `relay_` prefix) for org,
+ *   workspace and source user, in the plan, the mint, the manifest and the
+ *   identity. Contract: docs/contracts/relayhistory-export-plan-entry-v1.md
+ *   (#43 at 15127919); its vectors are reproduced byte for byte in the tests.
  * - **Errors.** 409 `migration_assertion_replayed`: one fresh re-mint, same
  *   content (sealed chunks are not resent); a second replay fails that
  *   manifest loudly. 401 `migration_assertion_expired` (exactly): one fresh
- *   re-mint and retry; a second expiry, or any other 401, stops the run. 503 (and other 5xx, and lost responses): bounded backoff
+ *   re-mint and retry; a second expiry, or any other 401, stops the run.
+ *   At most `chunksPerAssertion` (256) chunks go under one assertion, then a
+ *   fresh mint; a 403 `migration_chunk_limit` anyway re-mints, and a second
+ *   one with no progress stops the run. 409 `migration_chunk_conflict` fails
+ *   that manifest. 403 `migration_upload_forbidden` stops the run. 503 (and other 5xx, and lost responses): bounded backoff
  *   with a fresh assertion each time, then the run stops (fail closed). 401 or
  *   403: the run stops at once, no retry. A lost response after the server
  *   committed is safe to retry: the identical manifest takes the ingest's
@@ -119,46 +125,45 @@ export interface PlanEntry extends UploadInput {
 }
 
 /**
- * The per-upload identity an assertion signs. The ISSUER (RelayAuth) derives
- * it from the canonical stored plan; the courier derives the same value
- * locally and refuses an assertion whose signed identity differs from what it
- * is about to send. It binds the grant and plan, the tenancy (org, workspace,
- * canonical source user), the machine/session key, the manifest key, and the
- * content and source-chunk digests. The work key is not bound in full: the
- * ingest's work key is `<manifest key>@<object version>`, and the version is
- * assigned by storage at write time, so the courier checks that the returned
- * work key is of this manifest key instead.
+ * The per-upload identity an assertion signs, `meta.upload`, exactly as
+ * docs/contracts/relayhistory-export-plan-entry-v1.md (#43 at 15127919)
+ * defines it. The ISSUER (RelayAuth) derives it from the canonical stored
+ * plan; the courier derives the same value locally and refuses an assertion
+ * whose signed identity differs from what it is about to send. `key` is the
+ * manifest key. The ingest's work key is `<key>@<object version>` with the
+ * version assigned by storage, so the courier checks the returned work key is
+ * of this key rather than binding it in full.
  */
 export interface UploadIdentity {
   grant_id: string;
   plan_digest: string;
+  key: string;
   org_id: string;
   workspace_id: string;
   source_user_id: string;
   session: UploadInput["session"];
-  manifest_key: string;
   content_sha256: string;
-  /** sha256 of the canonical source-chunk list (seq, epoch, offset, bytes, sha256). */
-  source_chunks_sha256: string;
+  /** sha256 of the canonical plan entry. */
+  entry_sha256: string;
 }
 
 /** What a mint asks the issuer for: the planned upload, by manifest key. */
 export interface UploadSelector {
-  manifest_key: string;
+  key: string;
 }
 
 const RELAY_PREFIX = "relay_";
-const USER_ID = /^[A-Za-z0-9._:-]{1,255}$/;
+const ID = /^[A-Za-z0-9._:-]{1,255}$/;
 
 /**
- * The one canonical user-id form: without RelayAuth's `relay_` prefix (the
- * form the ingest's auth context carries). `relay_u1` and `u1` are the same
- * user; anything malformed is refused. Pending #43's shared fixture.
+ * The one canonical id form (contract v1): without RelayAuth's `relay_`
+ * prefix, which is stripped once. `relay_u1` and `u1` are the same id;
+ * anything malformed (or still prefixed) is refused.
  */
-export function canonicalUserId(id: string): string {
+export function canonicalId(id: string, what = "source user id"): string {
   const bare = id.startsWith(RELAY_PREFIX) ? id.slice(RELAY_PREFIX.length) : id;
-  if (!USER_ID.test(bare) || bare.startsWith(RELAY_PREFIX))
-    throw Object.assign(new Error("export upload: source user id is malformed"), { code: "user_id_malformed" });
+  if (!ID.test(bare) || bare.startsWith(RELAY_PREFIX))
+    throw Object.assign(new Error(`export upload: ${what} is malformed`), { code: "id_malformed" });
   return bare;
 }
 
@@ -207,13 +212,20 @@ export function contentSha256(chunks: readonly { epoch: number; start_offset: nu
 }
 
 export const derivePlanContract: PlanContractFn = ({ grantId, exportedAt, uploads }) => {
-  const entries: PlanEntry[] = uploads.map((u) => ({
+  const entries: PlanEntry[] = uploads.map((u) => {
+    const workspace = canonicalId(u.workspace_id, "workspace id");
+    if (!u.key.startsWith(`v1/ws=${workspace}/`))
+      throw Object.assign(new Error("export upload: the key is not in the canonical workspace"), { code: "id_malformed" });
+    return {
     ...u,
-    source_user_id: canonicalUserId(u.source_user_id),
+    org_id: canonicalId(u.org_id, "org id"),
+    workspace_id: workspace,
+    source_user_id: canonicalId(u.source_user_id),
     grant_id: grantId,
     content_sha256: contentSha256(u.chunks),
     raw_bytes: u.chunks.reduce((n, c) => n + c.bytes, 0),
-  }));
+    };
+  });
   const sorted = [...entries].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   const planDigest = sha256Hex(canonical({ v: 1, grant_id: grantId, exported_at: exportedAt, manifests: sorted }));
   return {
@@ -222,13 +234,13 @@ export const derivePlanContract: PlanContractFn = ({ grantId, exportedAt, upload
     uploads: entries.map((e) => ({
       grant_id: e.grant_id,
       plan_digest: planDigest,
+      key: e.key,
       org_id: e.org_id,
       workspace_id: e.workspace_id,
       source_user_id: e.source_user_id,
       session: e.session,
-      manifest_key: e.key,
       content_sha256: e.content_sha256,
-      source_chunks_sha256: sha256Hex(canonical(e.chunks.map(({ seq, epoch, start_offset, bytes, sha256 }) => ({ seq, epoch, start_offset, bytes, sha256 })))),
+      entry_sha256: sha256Hex(canonical(e)),
     })),
   };
 };
@@ -314,16 +326,16 @@ export function plannedManifestFromRecords(input: {
   const stream = buildSessionStream(input.records);
   if (stream.records === 0 || stream.firstMs === null) return null;
   const location: PlannedManifest["location"] = {
-    workspaceId: input.workspaceId,
+    workspaceId: canonicalId(input.workspaceId, "workspace id"),
     machineId: component(input.machine),
     harness: component(input.source),
     sessionId: component(input.sessionId),
     startDate: new Date(stream.firstMs).toISOString().slice(0, 10),
   };
-  const seed = `${input.orgId}\n${input.workspaceId}\n${location.machineId}\n${location.harness}\n${location.sessionId}`;
+  const seed = `${canonicalId(input.orgId, "org id")}\n${location.workspaceId}\n${location.machineId}\n${location.harness}\n${location.sessionId}`;
   return {
     location,
-    orgId: input.orgId,
+    orgId: canonicalId(input.orgId, "org id"),
     sourceUserId: input.sourceUserId,
     traceId: derivedUuidV7(`trace\n${seed}`, stream.firstMs),
     sessionUuid: derivedUuidV7(`session\n${seed}`, stream.firstMs),
@@ -387,14 +399,14 @@ export async function buildExportManifest(
       ...(scrub ? { scrub } : {}),
     },
     extensions: {
-      [SESSION_EXT]: { session_uuid: m.sessionUuid, session_uuid_source: "minted", tenant_id: m.orgId, user_id: canonicalUserId(m.sourceUserId) },
+      [SESSION_EXT]: { session_uuid: m.sessionUuid, session_uuid_source: "minted", tenant_id: canonicalId(m.orgId, "org id"), user_id: canonicalId(m.sourceUserId) },
       [EXPORT_MARKER]: {
         version: 1,
         source: "neon.delivery_records",
         exported_at: plan.exportedAt,
         grant_id: commit.grantId,
         plan_digest: commit.planDigest,
-        source_user_id: canonicalUserId(m.sourceUserId),
+        source_user_id: canonicalId(m.sourceUserId),
         ...(m.catalog ? { catalog: m.catalog } : {}),
       },
     },
@@ -460,6 +472,8 @@ export interface ExportUploadConfig {
   requestTimeoutMs?: number;
   /** Backoff before each retry of a 5xx or lost response; its length is the retry budget. */
   backoffMs?: readonly number[];
+  /** Chunks sent under one assertion before a fresh mint (contract v1: at most 256). */
+  chunksPerAssertion?: number;
   /** A token closer than this to expiry is replaced by a fresh mint before the next request. */
   refreshMarginMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -477,6 +491,7 @@ export interface ExportUploadResult {
 type Outcome =
   | { kind: "replayed"; code: string; status: number }
   | { kind: "expired"; code: string; status: number }
+  | { kind: "chunk_limit"; code: string; status: number }
   | { kind: "transient"; code: string; status?: number }
   | { kind: "stop"; code: string; status?: number }
   | { kind: "failed"; code: string; status?: number };
@@ -489,12 +504,17 @@ class OutcomeError extends Error {
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const DEFAULT_BACKOFF_MS = [500, 2_000, 8_000] as const;
+export const MAX_CHUNKS_PER_ASSERTION = 256;
 
 function classify(status: number, code: string): Outcome {
   if (status === 409 && code === "migration_assertion_replayed") return { kind: "replayed", code, status };
   // Only this exact code is retried; any other 401 (invalid signature, claims) is terminal.
   if (status === 401 && code === "migration_assertion_expired") return { kind: "expired", code, status };
+  if (status === 403 && code === "migration_chunk_limit") return { kind: "chunk_limit", code, status };
+  // Everything else at 401/403 is terminal, including 403 migration_upload_forbidden.
   if (status === 401 || status === 403) return { kind: "stop", code, status };
+  // 409 migration_chunk_conflict (other bytes at a sealed seq) and any other
+  // 4xx fall through: that manifest fails and needs a human.
   if (status === 429 || status >= 500) return { kind: "transient", code, status };
   return { kind: "failed", code, status };
 }
@@ -548,6 +568,9 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
   const sleep = cfg.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = cfg.now ?? Date.now;
   const refreshMarginMs = cfg.refreshMarginMs ?? 15_000;
+  const chunksPerAssertion = cfg.chunksPerAssertion ?? MAX_CHUNKS_PER_ASSERTION;
+  if (!Number.isInteger(chunksPerAssertion) || chunksPerAssertion < 1 || chunksPerAssertion > MAX_CHUNKS_PER_ASSERTION)
+    throw new Error(`export upload: chunksPerAssertion must be 1 to ${MAX_CHUNKS_PER_ASSERTION}`);
 
   const contractFn = cfg.contract ?? derivePlanContract;
   const contract = planContract(plan, cfg.grantId, contractFn);
@@ -590,13 +613,18 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
     let replays = 0;
     let expiries = 0;
     let transient = 0;
+    /** Chunks sealed since the last 403 migration_chunk_limit (none: a second one stops). */
+    let sealedSinceLimit: number | undefined;
     let outcome: "committed" | Outcome | undefined;
     while (!outcome) {
       let assertion: MigrationAssertion | undefined;
-      const token = async (): Promise<string> => {
-        if (assertion && assertion.expiresAt.getTime() - now() > refreshMarginMs) return assertion.token;
+      let chunksOnAssertion = 0;
+      const token = async (forChunk = false): Promise<string> => {
+        const full = forChunk && chunksOnAssertion >= chunksPerAssertion;
+        if (assertion && !full && assertion.expiresAt.getTime() - now() > refreshMarginMs) return assertion.token;
+        chunksOnAssertion = 0;
         try {
-          assertion = await cfg.assertions.mint(identity.source_user_id, identity.workspace_id, { manifest_key: identity.manifest_key });
+          assertion = await cfg.assertions.mint(identity.source_user_id, identity.workspace_id, { key: identity.key });
         } catch (error) {
           const e = error as { code?: unknown; retryable?: unknown };
           const code = typeof e.code === "string" ? e.code : "mint_failed";
@@ -624,7 +652,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
             harness: m.location.harness,
             session: m.location.sessionId,
           });
-          const res = await request(await token(), `/v1/pipeline/chunks?${q}`, {
+          const res = await request(await token(true), `/v1/pipeline/chunks?${q}`, {
             method: "POST",
             headers: {
               "content-type": "application/octet-stream",
@@ -641,6 +669,8 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
           if (!got || got.seq !== planned.seq || got.epoch !== planned.epoch || got.start_offset !== planned.start_offset ||
             got.bytes !== planned.bytes || got.sha256 !== planned.sha256 || !sealed.scrub)
             throw new OutcomeError({ kind: "failed", code: "sealed_chunk_mismatch" });
+          chunksOnAssertion += 1;
+          if (sealedSinceLimit !== undefined) sealedSinceLimit += 1;
           state.chunks.push({ ...got, records: planned.records });
           state.chunks.sort((a, b) => a.seq - b.seq);
           state.scrub = state.scrub && state.scrub.version <= sealed.scrub.version ? state.scrub : sealed.scrub;
@@ -687,6 +717,11 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
           // Expired before use: one fresh re-mint and retry; a second expiry stops the run.
           if (expiries >= 1) outcome = { ...o, kind: "stop" };
           expiries += 1;
+        } else if (o.kind === "chunk_limit") {
+          // The assertion's chunk budget is spent: mint again for the rest. A
+          // second limit with no chunk sealed in between stops the run.
+          if (sealedSinceLimit === 0) outcome = { ...o, kind: "stop" };
+          sealedSinceLimit = 0;
         } else if (o.kind === "transient") {
           if (transient >= backoff.length) outcome = { kind: "stop", code: o.code, ...(o.status ? { status: o.status } : {}) };
           else await sleep(backoff[transient]!);
