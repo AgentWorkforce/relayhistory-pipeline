@@ -68,7 +68,7 @@ copy-everything-then-switch runbook (linuyc, uncommitted
 | # | Lane | Owner @ machine | State | Exit evidence |
 | --- | --- | --- | --- | --- |
 | 1 | Decision record + this plan | 96-no-bull-migration @ sf-mac-mini | done (local) | 0001 + this file on `feat/supabase-production-migration` |
-| 2 | Schema/index parity test (relayhistory-cloud migrations vs. Supabase, including 0067) | 96-no-bull-migration @ sf-mac-mini | next | Failing test listing every gap, then green |
+| 2 | Schema/index parity test (relayhistory-cloud migrations vs. Supabase, including 0067) | 96-no-bull-migration @ sf-mac-mini | green at relayhistory-cloud 7343404; re-pin when 0067 (#222) lands | `packages/pipeline/test/relayhistory-schema-parity.test.ts` green in both apply orders |
 | 3 | Port migrator + verifier + benchmarks from the linuyc dirty checkout into reviewed commits | 96-no-bull-migration @ sf-mac-mini | todo | Focused tests green on the clean branch |
 | 4 | Worker driver seam: TCP node-postgres behind a flag, Neon HTTP default; pre-T0 read-only Neon fallback; legacy contract suite on PostgreSQL 17 | helm-helper @ linuyc (proposed) | local partial | Contract suite green on PG17 for both drivers |
 | 5 | 0067 agent index (push off `/tmp` as a draft PR), Cloud #5835, filter-to-index contract, read-only target readiness audit | helm-chart-chief @ linuyc (accepted) | in progress | 0067 draft PR; contract agreed with lane 2 |
@@ -92,6 +92,15 @@ back first: the same copier run in reverse for keys above the sequence fence,
 under a switch hold. Neon is never simply repointed.
 
 ## Open technical checks
+
+- The Worker's Supabase role: `sessions.machines` has RLS (96Bulls policy), so
+  the RelayHistory runtime role must own the table or have `BYPASSRLS`, and it
+  needs the grants relayhistory-cloud's runner issues to its runtime role.
+- Machines that only the pipeline has seen get `workspace_id = 'default'`, so
+  RelayHistory's workspace-scoped reads don't list them.
+- Live catalog parity, including out-of-band indexes and the 0029 rollout
+  triggers, is checked by the read-only verifier and helm-chart-chief's #27,
+  not by the offline test.
 
 - Writer inventory: every Worker route, queue consumer and cron that writes,
   plus any non-Worker writer to Neon.
