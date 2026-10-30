@@ -84,10 +84,13 @@ catch-up pass inside the hold.
   replay result and returns the real response. On timeout it returns `503`
   with `Retry-After`. The entry stays durable, and a retry with the same key
   resolves to the replay result.
-- **Neon fail-closed:** at the start of the drain, revoke `INSERT`, `UPDATE`
-  and `DELETE` on `sessions` from the Worker and Cloud runtime roles on Neon.
-  A stale route that still reaches Neon then fails in the database and is
-  mapped to the hold. This changes the production database, so it needs
+- **Neon fail-closed:** after the drain, `migration:neon-fence` revokes table
+  DML on `sessions`, and `EXECUTE` on every volatile `sessions` function, from
+  the runtime role and PUBLIC. The `SECURITY DEFINER` writers run as their
+  owner, so table privileges alone would not stop them. The Worker reuses
+  Cloud's runtime role, so role-wide read-only would break Cloud's `public`
+  writes. A stale route that still reaches Neon then fails with 42501, and
+  the restore script re-grants exactly what was removed. This changes the production database, so it needs
   Khaliq's OK at cutover. Reads are unaffected, so the pre-T0 read fallback
   keeps working.
 - **Sequence fence:** every Supabase sequence starts above Neon's final value,

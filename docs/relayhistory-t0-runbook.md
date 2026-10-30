@@ -83,15 +83,23 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
    crons and consumers pause.
 9. **Drain.** Wait until Neon's `pg_stat_activity` shows no active non-idle
    session for the Worker or Cloud runtime roles, up to the 125 s statement
-   ceiling. Then revoke writes on Neon:
-   `REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA sessions FROM <worker_role>, <cloud_role>;`
+   ceiling. Then fence `sessions` on Neon. The Worker reuses Cloud's runtime
+   role, so this is scoped to the schema, never role-wide read-only. Plan it
+   ahead, review it, and apply the `fence` statements as the schema owner:
+   ```sh
+   bun run migration:neon-fence --roles=<runtime_role> > /secure/t0/neon-fence.json
+   # apply .fence now; keep .restore for the abort path
+   ```
+   The fence revokes table DML and `EXECUTE` on every volatile `sessions`
+   function, which catches the `SECURITY DEFINER` writers. Reads and stable
+   functions keep working, and Cloud's `public` schema is untouched.
 10. **Catch up:** run
     `migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines`
     again.
     Then re-run the schema check and confirm every target sequence is above
     the source (the `sequences[].ready` field).
-    **On any failure, abort:** move the phase `holding → neon`, re-grant
-    writes on Neon, and the HoldLog replays to Neon.
+    **On any failure, abort:** apply `.restore` from `/secure/t0/neon-fence.json`
+    on Neon, then move the phase `holding → neon`. The HoldLog replays to Neon.
 11. **Flip:** move the phase `{"from":"holding","to":"supabase"}` and flip
     Cloud's flag. The HoldLogs replay in order against Supabase, and crons
     and consumers resume.
@@ -143,5 +151,5 @@ target equalled the source's: copies, not trigger output.
   the copy set, which Neon still holds.
 - **After step 11:** do not repoint to Neon. Supabase alone has the writes
   made since T0. Run a new hold, mirror the rows above the sequence fence back
-  to Neon, re-grant writes on Neon, and only then move the Worker back. That
+  to Neon, apply the fence's `.restore` on Neon, and only then move the Worker back. That
   needs a reverse gate deploy and its own approval.
