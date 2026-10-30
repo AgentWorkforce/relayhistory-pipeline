@@ -938,7 +938,11 @@ export function adoptionWriteIssues(
     epoch.first_seq !== before.chunk_count
   )
     issues.push("a takeover appends exactly one adopted epoch");
-  if (after.chunks.slice(before.chunks.length).some((c) => c.epoch !== epoch?.epoch))
+  if (
+    after.chunks
+      .slice(before.chunks.length)
+      .some((c) => c.epoch !== epoch?.epoch)
+  )
     issues.push("a takeover appends chunks only to its own epoch");
   for (const field of ["format", "compression", "scrub"] as const)
     if (!same(before[field], after[field]))
