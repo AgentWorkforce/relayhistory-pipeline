@@ -28,6 +28,7 @@ import {
   uploadFromPlanned,
   type ExportPlan,
   type ExportUploadConfig,
+  type PlanContract,
   type PlanContractFn,
   type UploadIdentity,
 } from "../relayhistory-export-upload.ts";
@@ -53,8 +54,10 @@ interface FakeIngest {
   mintJti?: (n: number) => string | undefined;
   /** Inject a response before the route's own handling (n is per route, 1-based). */
   before?: (route: Route, n: number) => Injected;
-  /** Override the upload identity the n-th mint signs (default: the one requested). */
-  signUpload?: (n: number, requested: UploadIdentity) => UploadIdentity;
+  /** The issuer's canonical stored plan: it derives each signed identity from it. */
+  storedPlan?: PlanContract;
+  /** Override the upload identity the n-th mint signs (default: the stored plan's). */
+  signUpload?: (n: number, derived: UploadIdentity) => UploadIdentity;
   /** The upload identity each jti signs, and every key it was presented for. */
   signed: Map<string, UploadIdentity>;
   usedFor: Map<string, Set<string>>;
@@ -116,10 +119,14 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
       const raw = await body(req);
       if (req.method === "POST" && url.pathname === "/v1/tokens/migration-assertion") {
         fake.mints += 1;
-        const input = JSON.parse(raw.toString()) as { nonce: string; grantId: string; sourceUserId: string; workspaceId: string; upload: UploadIdentity };
+        const input = JSON.parse(raw.toString()) as { nonce: string; grantId: string; sourceUserId: string; workspaceId: string; upload: { manifest_key: string } };
         const jti = fake.mintJti?.(fake.mints) ?? `jti_${randomUUID()}`;
         const exp = Math.floor(Date.now() / 1000) + 60;
-        const upload = fake.signUpload?.(fake.mints, input.upload) ?? input.upload;
+        // The issuer derives the identity from its stored plan, never from the request.
+        const derived = fake.storedPlan?.uploads.find((u) => u.manifest_key === input.upload?.manifest_key);
+        if (!derived || derived.source_user_id !== input.sourceUserId || derived.workspace_id !== input.workspaceId)
+          return refuse(res, 403, "migration_grant_forbidden");
+        const upload = fake.signUpload?.(fake.mints, derived) ?? derived;
         fake.signed.set(jti, upload);
         const meta = { tokenClass: "migration_assertion", nonce: input.nonce, grantId: input.grantId, planDigest: fake.signedDigest, sourceUserId: input.sourceUserId, workspaceId: input.workspaceId, upload };
         return send(res, 201, {
@@ -149,7 +156,7 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
       fake.usedFor.set(claims.jti, (fake.usedFor.get(claims.jti) ?? new Set()).add(key));
       // Provisional per-upload binding (contract update on #228): the request's
       // target must be the upload the assertion signs.
-      if (key !== upload.key) return refuse(res, 403, "migration_upload_forbidden");
+      if (key !== upload.manifest_key) return refuse(res, 403, "migration_upload_forbidden");
       if (injected === "hang") return; // never answers
       if (injected) return refuse(res, injected.status, injected.code);
       // Admission: a consumed jti or nonce is a replay, before any storage call.
@@ -197,7 +204,7 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
       // The ledger row and the queue row in one unit.
       fake.consumed.add(claims.jti);
       fake.consumed.add(claims.meta.nonce);
-      const workKey = `object-landed:${sha(posted.key).slice(0, 16)}:r1`;
+      const workKey = `${posted.key}@"${sha(text).slice(0, 8)}"`; // manifestWorkKey: key@version
       fake.queue.push({ workKey, jti: claims.jti });
       commits.n += 1;
       if (fake.afterCommit?.(commits.n) === "hang") return; // committed, response lost
@@ -241,6 +248,7 @@ async function setup(overrides: Partial<ExportUploadConfig> = {}) {
   const plan = testPlan();
   const digest = await planDigest(plan);
   const fake = await fakeIngest(digest);
+  fake.storedPlan = planContract(plan, GRANT);
   const dir = await mkdtemp(join(tmpdir(), "export-upload-"));
   dirs.push(dir);
   const sleeps: number[] = [];
@@ -270,8 +278,9 @@ describe("export plan digest", () => {
     // Pure: the same input gives the same output; the grant is bound in.
     expect(canonical(planContract(testPlan(), GRANT))).toBe(canonical(contract));
     expect(planContract(plan, "mgr_other").planDigest).not.toBe(digest);
-    expect(contract.uploads.map((u) => u.key)).toEqual(contract.entries.map((e) => e.key));
-    expect(new Set(contract.uploads.map((u) => u.entry_sha256)).size).toBe(2);
+    expect(contract.uploads.map((u) => u.manifest_key)).toEqual(contract.entries.map((e) => e.key));
+    expect(contract.uploads.every((u) => u.plan_digest === digest && u.grant_id === GRANT)).toBe(true);
+    expect(new Set(contract.uploads.map((u) => u.source_chunks_sha256)).size).toBe(2);
     // One byte changed in one chunk changes the digest and that upload's identity only.
     const tampered = testPlan();
     const data = new Uint8Array(tampered.manifests[1]!.chunks[0]!.data);
@@ -279,7 +288,8 @@ describe("export plan digest", () => {
     tampered.manifests[1]!.chunks[0]!.data = data;
     const t = planContract(tampered, GRANT);
     expect(t.planDigest).not.toBe(digest);
-    expect(t.uploads[0]).toEqual(contract.uploads[0]!);
+    // The other upload's identity changes only in the plan digest it binds.
+    expect(t.uploads[0]).toEqual({ ...contract.uploads[0]!, plan_digest: t.planDigest });
     expect(t.uploads[1]!.content_sha256).not.toBe(contract.uploads[1]!.content_sha256);
     // The sync content digest is object-store's.
     const chunks = contract.entries[0]!.chunks;
@@ -378,12 +388,12 @@ describe("export upload courier", () => {
       expect(fake.signed.size).toBe(3); // 2 uploads + 1 re-mint
       for (const [jti, used] of fake.usedFor) {
         const signed = fake.signed.get(jti)!;
-        expect([...used]).toEqual([signed.key]); // never presented for another key
+        expect([...used]).toEqual([signed.manifest_key]); // never presented for another key
         expect(contract.uploads.map((u) => canonical(u))).toContain(canonical(signed));
       }
       // Every committed queue row was committed under an assertion signing that upload.
-      for (const q of fake.queue) expect(fake.signed.get(q.jti)!.key).toBe(result.committed.find((c) => c.workKey === q.workKey)!.key);
-      expect(fake.requests.every((r) => r.key === fake.signed.get(r.jti)!.key)).toBe(true);
+      for (const q of fake.queue) expect(fake.signed.get(q.jti)!.manifest_key).toBe(result.committed.find((c) => c.workKey === q.workKey)!.key);
+      expect(fake.requests.every((r) => r.key === fake.signed.get(r.jti)!.manifest_key)).toBe(true);
     });
 
     test("refuses an assertion that signs another upload's identity, before sending any bytes", async () => {
@@ -396,9 +406,16 @@ describe("export upload courier", () => {
       expect(fake.queue).toHaveLength(0);
     });
 
-    test("refuses an assertion whose signed identity differs in any field (entry digest)", async () => {
+    test.each([
+      ["source-chunk digest", { source_chunks_sha256: "0".repeat(64) }],
+      ["content digest", { content_sha256: "0".repeat(64) }],
+      ["plan digest", { plan_digest: "0".repeat(64) }],
+      ["grant", { grant_id: "mgr_other" }],
+      ["org", { org_id: "org_2" }],
+      ["session key", { session: { machine_id: "m2", harness: "claude", session_id: "sess-a", started_at: "2026-10-01T00:00:00.000Z" } }],
+    ])("refuses an assertion whose signed identity differs in the %s", async (_field, change) => {
       const { fake, cfg, plan } = await setup();
-      fake.signUpload = (_n, requested) => ({ ...requested, entry_sha256: "0".repeat(64) });
+      fake.signUpload = (_n, derived) => ({ ...derived, ...change });
       const result = await runExportUpload(plan, cfg);
       expect(result.stopped).toMatchObject({ code: "assertion_upload_mismatch" });
       expect(fake.requests).toHaveLength(0);
@@ -479,6 +496,93 @@ describe("export upload courier", () => {
       expect(fake.requests.filter((r) => r.route === "manifest")).toHaveLength(4); // 1 + 3 retries
       expect(new Set(fake.requests.map((r) => r.key).filter((k) => k.includes("sess-b")))).toEqual(new Set()); // second manifest never attempted
       expect(fake.queue).toHaveLength(0);
+    });
+  });
+
+  describe("401 migration_assertion_expired", () => {
+    test("re-mints once and the retry succeeds, no double write", async () => {
+      const { fake, cfg, plan, chunkCount, sleeps } = await setup();
+      fake.before = (route, n) => (route === "manifest" && n === 1 ? { status: 401, code: "migration_assertion_expired" } : undefined);
+      const result = await runExportUpload(plan, cfg);
+      expect(result.stopped).toBeUndefined();
+      expect(result.failed).toEqual([]);
+      expect(result.committed).toHaveLength(2);
+      expect(fake.mints).toBe(3); // 2 manifests + 1 re-mint
+      const posts = fake.requests.filter((r) => r.route === "manifest");
+      expect(posts[0]!.key).toBe(posts[1]!.key);
+      expect(posts[0]!.jti).not.toBe(posts[1]!.jti);
+      expect(fake.chunkWrites).toBe(chunkCount);
+      expect(fake.manifestWrites).toBe(2);
+      expect(fake.queue).toHaveLength(2);
+      expect(sleeps).toEqual([]);
+    });
+
+    test("a second expiry with the fresh assertion stops the run", async () => {
+      const { fake, cfg, plan } = await setup();
+      fake.before = (route) => (route === "manifest" ? { status: 401, code: "migration_assertion_expired" } : undefined);
+      const result = await runExportUpload(plan, cfg);
+      expect(result.stopped).toMatchObject({ code: "migration_assertion_expired", status: 401 });
+      expect(fake.mints).toBe(2);
+      expect(fake.requests.filter((r) => r.route === "manifest")).toHaveLength(2);
+      expect(fake.queue).toHaveLength(0);
+    });
+
+    test.each([
+      [401, "invalid_token"], // e.g. invalid signature
+      [401, "invalid_claims"], // generic "jwt is expired" from the verifier
+      [401, "missing_authorization"],
+      [401, "http_401"], // no error code at all
+    ])("a generic %i %s is terminal: no re-mint", async (status, code) => {
+      const { fake, cfg, plan } = await setup();
+      fake.before = (route) => (route === "manifest" ? { status, code } : undefined);
+      const result = await runExportUpload(plan, cfg);
+      expect(result.stopped).toMatchObject({ code, status });
+      expect(fake.mints).toBe(1);
+      expect(fake.requests.filter((r) => r.route === "manifest")).toHaveLength(1);
+    });
+  });
+
+  describe("canonical user id", () => {
+    const withUser = (plan: ExportPlan, ids: string[]) => {
+      plan.manifests.forEach((m, i) => (m.sourceUserId = ids[i]!));
+      return plan;
+    };
+
+    test("relay_ aliases normalize to one form in the plan, mint and manifest", async () => {
+      const bare = planContract(withUser(testPlan(), ["user_1", "user_1"]), GRANT);
+      const aliased = planContract(withUser(testPlan(), ["relay_user_1", "user_1"]), GRANT);
+      expect(canonical(aliased)).toBe(canonical(bare));
+      expect(aliased.uploads.every((u) => u.source_user_id === "user_1")).toBe(true);
+      const { fake, cfg } = await setup();
+      const minted: string[] = [];
+      const inner = cfg.assertions;
+      const result = await runExportUpload(withUser(testPlan(), ["relay_user_1", "relay_user_1"]), {
+        ...cfg,
+        assertions: { mint: (u, w, s) => (minted.push(u), inner.mint(u, w, s)) },
+      });
+      expect(result.committed).toHaveLength(2);
+      expect(minted).toEqual(["user_1", "user_1"]);
+      expect(fake.manifestWrites).toBe(2);
+    });
+
+    test("refuses a signed identity that carries the relay_ alias instead of the canonical form", async () => {
+      const { fake, cfg, plan } = await setup();
+      fake.signUpload = (_n, derived) => ({ ...derived, source_user_id: `relay_${derived.source_user_id}` });
+      const result = await runExportUpload(plan, cfg);
+      expect(result.stopped).toMatchObject({ code: "assertion_upload_mismatch" });
+      expect(fake.requests).toHaveLength(0);
+    });
+
+    test("refuses a signed identity for another user", async () => {
+      const { fake, cfg, plan } = await setup();
+      fake.signUpload = (_n, derived) => ({ ...derived, source_user_id: "user_2" });
+      const result = await runExportUpload(plan, cfg);
+      expect(result.stopped).toMatchObject({ code: "assertion_upload_mismatch" });
+      expect(fake.requests).toHaveLength(0);
+    });
+
+    test.each(["relay_", "relay_relay_user_1", "bad user", ""])("refuses a malformed user id %p", (id) => {
+      expect(() => planContract(withUser(testPlan(), [id, "user_1"]), GRANT)).toThrow("malformed");
     });
   });
 

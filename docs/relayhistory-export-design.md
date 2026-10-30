@@ -87,11 +87,16 @@ manifest: chunks through `POST /v1/pipeline/chunks`, then `POST
 /v1/pipeline/manifests`, each manifest under its own fresh migration
 assertion. One pure function (`derivePlanContract`) gives the canonical,
 grant-bound plan entries, the plan digest and one per-upload identity per
-manifest; it is swappable for the shared fixture from #43. The courier
-refuses an assertion that signs another plan or upload, re-mints once on 409
-`migration_assertion_replayed` (a second one fails that manifest), backs off a
-bounded number of times on 5xx and lost responses and then stops, and stops
-at once on 401 or 403. A per-manifest checkpoint (ids, digests and work keys,
+manifest; it is swappable for the shared fixture from #43. RelayAuth derives
+the signed identity (grant, plan digest, org, workspace, canonical source
+user, machine/session key, manifest key, content and source-chunk digests)
+from its stored plan; a mint names only the manifest key, and the courier
+refuses an assertion whose signed plan or identity differs from what it is
+about to send. User ids have one canonical form, without the `relay_` prefix.
+The courier re-mints once on 409 `migration_assertion_replayed` (a second one
+fails that manifest) and once on exactly 401 `migration_assertion_expired` (a
+second one stops the run). It backs off a bounded number of times on 5xx and
+lost responses and then stops, and stops at once on any other 401 or a 403. A per-manifest checkpoint (ids, digests and work keys,
 never tokens) keeps a resumed run from re-uploading committed manifests. It is
 tested only against an in-process fake ingest, and the CLI still refuses
 `--execute`.

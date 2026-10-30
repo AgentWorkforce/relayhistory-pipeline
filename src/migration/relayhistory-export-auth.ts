@@ -51,10 +51,10 @@ export class MigrationAssertionClient {
 
   /**
    * A fresh single-use assertion for one session upload of `sourceUserId` in
-   * `workspaceId`. `upload` is the per-upload identity (key, content and entry
-   * digests, session) the assertion is to sign, per the contract update on
-   * relayhistory-cloud #228; the RelayAuth request field is provisional until
-   * #43 publishes the shared fixture.
+   * `workspaceId`. `upload` names the planned upload (its manifest key);
+   * RelayAuth derives and signs the full per-upload identity from its stored
+   * plan (contract decision on #40/#228). The request field is provisional
+   * until #43 publishes the shared fixture.
    */
   async mint(sourceUserId: string, workspaceId: string, upload?: object): Promise<MigrationAssertion> {
     if (!ID.test(sourceUserId) || !ID.test(workspaceId))

@@ -12,17 +12,20 @@
  *   consumes it. One about to expire is replaced by another fresh mint.
  * - **Plan contract.** One pure function (`derivePlanContract`, swappable via
  *   `ExportUploadConfig.contract` for #43's shared fixture) turns the plan into
- *   canonical, grant-bound entries (key, user, session, exact chunk set), the
- *   plan digest (`RELAYHISTORY_MIGRATION_GRANTS` registers `grantId=planDigest`
- *   today) and one signed per-upload identity per manifest. Each mint asks for
- *   the identity of the one upload it is for; the courier refuses, before any
- *   byte is sent, an assertion that signs another plan or another upload, and
- *   never uses it for anything else. Before each commit it re-runs the same
- *   function over the exact manifest about to be sent and refuses to send
- *   unless the digest and identity are unchanged.
+ *   canonical, grant-bound entries (key, canonical user, session, exact chunk
+ *   set), the plan digest (`RELAYHISTORY_MIGRATION_GRANTS` registers
+ *   `grantId=planDigest` today) and one per-upload identity per manifest. The
+ *   issuer derives the signed identity from its stored plan; a mint names
+ *   only the manifest key. The courier refuses, before any byte is sent, an
+ *   assertion whose signed plan or identity differs from its own derivation,
+ *   and never uses it for another upload. Before each commit it re-runs the
+ *   same function over the exact manifest about to be sent.
+ * - **User ids.** One canonical form (`canonicalUserId`: no `relay_` prefix)
+ *   in the plan, the mint, the manifest and the identity.
  * - **Errors.** 409 `migration_assertion_replayed`: one fresh re-mint, same
  *   content (sealed chunks are not resent); a second replay fails that
- *   manifest loudly. 503 (and other 5xx, and lost responses): bounded backoff
+ *   manifest loudly. 401 `migration_assertion_expired` (exactly): one fresh
+ *   re-mint and retry; a second expiry, or any other 401, stops the run. 503 (and other 5xx, and lost responses): bounded backoff
  *   with a fresh assertion each time, then the run stops (fail closed). 401 or
  *   403: the run stops at once, no retry. A lost response after the server
  *   committed is safe to retry: the identical manifest takes the ingest's
@@ -116,19 +119,47 @@ export interface PlanEntry extends UploadInput {
 }
 
 /**
- * The per-upload identity an assertion signs (contract update on #228): the
- * upload's key, its content and entry digests, and its session identity.
+ * The per-upload identity an assertion signs. The ISSUER (RelayAuth) derives
+ * it from the canonical stored plan; the courier derives the same value
+ * locally and refuses an assertion whose signed identity differs from what it
+ * is about to send. It binds the grant and plan, the tenancy (org, workspace,
+ * canonical source user), the machine/session key, the manifest key, and the
+ * content and source-chunk digests. The work key is not bound in full: the
+ * ingest's work key is `<manifest key>@<object version>`, and the version is
+ * assigned by storage at write time, so the courier checks that the returned
+ * work key is of this manifest key instead.
  */
 export interface UploadIdentity {
   grant_id: string;
-  key: string;
+  plan_digest: string;
   org_id: string;
   workspace_id: string;
   source_user_id: string;
   session: UploadInput["session"];
+  manifest_key: string;
   content_sha256: string;
-  /** sha256 of the canonical plan entry: the manifest's plan-determined content. */
-  entry_sha256: string;
+  /** sha256 of the canonical source-chunk list (seq, epoch, offset, bytes, sha256). */
+  source_chunks_sha256: string;
+}
+
+/** What a mint asks the issuer for: the planned upload, by manifest key. */
+export interface UploadSelector {
+  manifest_key: string;
+}
+
+const RELAY_PREFIX = "relay_";
+const USER_ID = /^[A-Za-z0-9._:-]{1,255}$/;
+
+/**
+ * The one canonical user-id form: without RelayAuth's `relay_` prefix (the
+ * form the ingest's auth context carries). `relay_u1` and `u1` are the same
+ * user; anything malformed is refused. Pending #43's shared fixture.
+ */
+export function canonicalUserId(id: string): string {
+  const bare = id.startsWith(RELAY_PREFIX) ? id.slice(RELAY_PREFIX.length) : id;
+  if (!USER_ID.test(bare) || bare.startsWith(RELAY_PREFIX))
+    throw Object.assign(new Error("export upload: source user id is malformed"), { code: "user_id_malformed" });
+  return bare;
 }
 
 export interface PlanContract {
@@ -178,23 +209,26 @@ export function contentSha256(chunks: readonly { epoch: number; start_offset: nu
 export const derivePlanContract: PlanContractFn = ({ grantId, exportedAt, uploads }) => {
   const entries: PlanEntry[] = uploads.map((u) => ({
     ...u,
+    source_user_id: canonicalUserId(u.source_user_id),
     grant_id: grantId,
     content_sha256: contentSha256(u.chunks),
     raw_bytes: u.chunks.reduce((n, c) => n + c.bytes, 0),
   }));
   const sorted = [...entries].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const planDigest = sha256Hex(canonical({ v: 1, grant_id: grantId, exported_at: exportedAt, manifests: sorted }));
   return {
     entries,
-    planDigest: sha256Hex(canonical({ v: 1, grant_id: grantId, exported_at: exportedAt, manifests: sorted })),
+    planDigest,
     uploads: entries.map((e) => ({
       grant_id: e.grant_id,
-      key: e.key,
+      plan_digest: planDigest,
       org_id: e.org_id,
       workspace_id: e.workspace_id,
       source_user_id: e.source_user_id,
       session: e.session,
+      manifest_key: e.key,
       content_sha256: e.content_sha256,
-      entry_sha256: sha256Hex(canonical(e)),
+      source_chunks_sha256: sha256Hex(canonical(e.chunks.map(({ seq, epoch, start_offset, bytes, sha256 }) => ({ seq, epoch, start_offset, bytes, sha256 })))),
     })),
   };
 };
@@ -353,14 +387,14 @@ export async function buildExportManifest(
       ...(scrub ? { scrub } : {}),
     },
     extensions: {
-      [SESSION_EXT]: { session_uuid: m.sessionUuid, session_uuid_source: "minted", tenant_id: m.orgId, user_id: m.sourceUserId },
+      [SESSION_EXT]: { session_uuid: m.sessionUuid, session_uuid_source: "minted", tenant_id: m.orgId, user_id: canonicalUserId(m.sourceUserId) },
       [EXPORT_MARKER]: {
         version: 1,
         source: "neon.delivery_records",
         exported_at: plan.exportedAt,
         grant_id: commit.grantId,
         plan_digest: commit.planDigest,
-        source_user_id: m.sourceUserId,
+        source_user_id: canonicalUserId(m.sourceUserId),
         ...(m.catalog ? { catalog: m.catalog } : {}),
       },
     },
@@ -406,7 +440,7 @@ async function saveCheckpoint(path: string, cp: UploadCheckpoint): Promise<void>
 
 export interface AssertionSource {
   /** A fresh assertion that signs `upload`, the one upload it may be used for. */
-  mint(sourceUserId: string, workspaceId: string, upload: UploadIdentity): Promise<MigrationAssertion>;
+  mint(sourceUserId: string, workspaceId: string, upload: UploadSelector): Promise<MigrationAssertion>;
 }
 
 export interface ExportUploadConfig {
@@ -442,6 +476,7 @@ export interface ExportUploadResult {
 
 type Outcome =
   | { kind: "replayed"; code: string; status: number }
+  | { kind: "expired"; code: string; status: number }
   | { kind: "transient"; code: string; status?: number }
   | { kind: "stop"; code: string; status?: number }
   | { kind: "failed"; code: string; status?: number };
@@ -457,6 +492,8 @@ const DEFAULT_BACKOFF_MS = [500, 2_000, 8_000] as const;
 
 function classify(status: number, code: string): Outcome {
   if (status === 409 && code === "migration_assertion_replayed") return { kind: "replayed", code, status };
+  // Only this exact code is retried; any other 401 (invalid signature, claims) is terminal.
+  if (status === 401 && code === "migration_assertion_expired") return { kind: "expired", code, status };
   if (status === 401 || status === 403) return { kind: "stop", code, status };
   if (status === 429 || status >= 500) return { kind: "transient", code, status };
   return { kind: "failed", code, status };
@@ -551,6 +588,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
       prior?.status === "sealing" ? prior : { status: "sealing", chunks: [] };
     cp.manifests[key] = state;
     let replays = 0;
+    let expiries = 0;
     let transient = 0;
     let outcome: "committed" | Outcome | undefined;
     while (!outcome) {
@@ -558,7 +596,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
       const token = async (): Promise<string> => {
         if (assertion && assertion.expiresAt.getTime() - now() > refreshMarginMs) return assertion.token;
         try {
-          assertion = await cfg.assertions.mint(m.sourceUserId, m.location.workspaceId, identity);
+          assertion = await cfg.assertions.mint(identity.source_user_id, identity.workspace_id, { manifest_key: identity.manifest_key });
         } catch (error) {
           const e = error as { code?: unknown; retryable?: unknown };
           const code = typeof e.code === "string" ? e.code : "mint_failed";
@@ -632,10 +670,11 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
         const body = (await res.json().catch(() => ({}))) as { workKey?: unknown };
         if (typeof body.workKey !== "string" || !body.workKey)
           throw new OutcomeError({ kind: "transient", code: "work_key_missing" });
+        if (!body.workKey.startsWith(`${key}@`)) throw new OutcomeError({ kind: "failed", code: "work_key_mismatch" });
         cp.manifests[key] = { status: "committed", work_key: body.workKey, chunks: state.chunks.length };
         await saveCheckpoint(cfg.checkpointPath, cp);
         result.committed.push({ key, workKey: body.workKey });
-        log.info("export manifest committed", { manifest_key_sha256: keyHash(key), work_key: body.workKey, chunk_count: state.chunks.length, attempt: replays + transient + 1 });
+        log.info("export manifest committed", { manifest_key_sha256: keyHash(key), work_key: body.workKey, chunk_count: state.chunks.length, attempt: replays + expiries + transient + 1 });
         outcome = "committed";
       } catch (error) {
         if (!(error instanceof OutcomeError)) throw error;
@@ -644,6 +683,10 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
           // A replay means this assertion was spent; one fresh mint, same content.
           if (replays >= 1) outcome = { ...o, kind: "failed" };
           replays += 1;
+        } else if (o.kind === "expired") {
+          // Expired before use: one fresh re-mint and retry; a second expiry stops the run.
+          if (expiries >= 1) outcome = { ...o, kind: "stop" };
+          expiries += 1;
         } else if (o.kind === "transient") {
           if (transient >= backoff.length) outcome = { kind: "stop", code: o.code, ...(o.status ? { status: o.status } : {}) };
           else await sleep(backoff[transient]!);
@@ -651,7 +694,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
         } else {
           outcome = o;
         }
-        if (!outcome) log.warn("export manifest retrying with a fresh assertion", { manifest_key_sha256: keyHash(key), error_code: o.code, status: o.status, attempt: replays + transient });
+        if (!outcome) log.warn("export manifest retrying with a fresh assertion", { manifest_key_sha256: keyHash(key), error_code: o.code, status: o.status, attempt: replays + expiries + transient });
       }
     }
     await saveCheckpoint(cfg.checkpointPath, cp);
