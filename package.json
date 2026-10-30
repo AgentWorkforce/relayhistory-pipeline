@@ -20,7 +20,8 @@
     "test": "bun test && bun test ./stacks && bun run --filter @96bulls/pipeline test && bun run --filter @relayhistory/object-store test",
     "up:local": "bun run bin/96bulls up local",
     "down:local": "bun run bin/96bulls down local",
-    "smoke:local": "bun run bin/96bulls smoke local"
+    "smoke:local": "bun run bin/96bulls smoke local",
+    "audit:search-indexes": "bun run src/hoopdb/search-index-audit.ts"
   },
   "dependencies": {
     "@96bulls/pipeline": "workspace:*",
