@@ -9,6 +9,7 @@
  */
 import * as Alchemy from "alchemy";
 import { Stage } from "alchemy";
+import * as Output from "alchemy/Output";
 import * as GCP from "@alchemy.run/gcp";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
@@ -228,6 +229,8 @@ export default Alchemy.Stack(
       displayName: `AgentWorkforce ${stage} runtime`,
       description: "Workload Identity target for managed data-plane clients",
     });
+    // email is an Output until deploy. A JS template coerces it and throws.
+    const runtimeMember = Output.interpolate`serviceAccount:${runtimeIdentity.email}`;
     // The proxy Kubernetes service account is created only once Cloud SQL is
     // posted. Binding it earlier would let a later account of that name assume
     // the runtime identity.
@@ -246,13 +249,13 @@ export default Alchemy.Stack(
       kind: "storage.bucket",
       name: locker.bucketName,
       role: "roles/storage.objectUser",
-      member: `serviceAccount:${runtimeIdentity.email}`,
+      member: runtimeMember,
     });
     yield* GCP.IAM.Member("runtime-cloudsql", {
       kind: "project",
       name: i.projectId,
       role: "roles/cloudsql.client",
-      member: `serviceAccount:${runtimeIdentity.email}`,
+      member: runtimeMember,
     });
 
     const dataPlane = i.managedDataPlane.provision
@@ -323,7 +326,7 @@ export default Alchemy.Stack(
               kind,
               name,
               role,
-              member: `serviceAccount:${runtimeIdentity.email}`,
+              member: runtimeMember,
             });
           }
           const pubsubAgent = `serviceAccount:${pubsubServiceAgent(i.projectNumber)}`;
