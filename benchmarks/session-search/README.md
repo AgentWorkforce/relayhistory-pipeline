@@ -42,12 +42,16 @@ left out, so nothing here says how the production hybrid ranking behaves.
 
 | Lane | Question | Neon baseline | 2a: directory, no summary | 2b: directory + short_summary (#48) | ClickHouse/ObsessionDB |
 | --- | --- | --- | --- | --- | --- |
-| A | Text in title, summary, metadata | Brief keyword pool | Measured | Measured | NOT MEASURED |
-| B | Text in transcript content | `/v1/events?q=` | UNSUPPORTED | UNSUPPORTED | NOT MEASURED |
+| A | Text in title, summary, metadata | Brief keyword pool | Measured | Measured | Not applicable to the gates |
+| B | Text in transcript content | `/v1/events?q=` | UNSUPPORTED | UNSUPPORTED | Vanilla ClickHouse gates only |
 | C | Filter-only listing | NOT MEASURED | Same indexes as 2b | Measured under RLS | NOT MEASURED |
 
-UNSUPPORTED is a contract boundary, not a miss. `clickhouse-proposed.sql` is PROPOSED
-and is not run: no schema, version or deployment exists.
+UNSUPPORTED is a contract boundary, not a miss. `clickhouse-proposed.sql` is PROPOSED:
+no schema, version or deployment exists.
+
+`clickhouse-gates.ts` covers gates 1 to 7 of relayhistory-cloud #233 on vanilla ClickHouse
+26.8 with the corpus's events. It is not comparable with the Postgres arms: it answers
+store-design questions, and says nothing about ObsessionDB.
 
 Lane A rows do not compare directly on recall. Neon briefs exist only for sessions with
 a summary, so Neon's Lane A recall mostly restates `summaryReadyShare`, an assumption.
@@ -96,8 +100,7 @@ content into the summary, and leaving tombstones live each turned the tests red.
 | Resources | Table and index bytes | No dollar figure |
 
 Not measured, also listed in every report: cache-cold latency, pipeline landed-to-searchable
-freshness, failure recovery and manifest replay, Neon filter listing, ClickHouse/ObsessionDB,
-and dollar cost. The first three need a proof stack, which needs Khaliq's direct OK.
+freshness, failure recovery and manifest replay, Neon filter listing, ObsessionDB, and dollar cost. The first three need a proof stack, which needs Khaliq's direct OK.
 
 ## Stand-in limits
 

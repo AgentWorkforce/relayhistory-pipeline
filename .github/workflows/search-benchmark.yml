@@ -57,3 +57,42 @@ jobs:
           name: search-benchmark-report-${{ matrix.scale }}
           path: benchmark-report.json
           if-no-files-found: ignore
+
+  clickhouse-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: benchmark-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password benchmark-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: ClickHouse gates (fails on gate 3 or 4)
+        env:
+          BENCH_CH_URL: http://127.0.0.1:8123
+          BENCH_CH_PASSWORD: benchmark-only
+          BENCH_CH_SHELL: docker exec ${{ job.services.clickhouse.id }} sh -c
+          BENCH_SCALE: S
+          BENCH_OUT: clickhouse-report.json
+        run: bun benchmarks/session-search/clickhouse-gates.ts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clickhouse-gates-report
+          path: clickhouse-report.json
+          if-no-files-found: ignore

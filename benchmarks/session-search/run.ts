@@ -271,7 +271,7 @@ const report = {
     "landed-to-searchable freshness through the pipeline (needs a proof stack)",
     "failure recovery and replay from manifests",
     "Neon filter-only listing (session_rollups is not in the stand-in)",
-    "ClickHouse/ObsessionDB: no schema or deployment exists; clickhouse-proposed.sql is not run",
+    "ClickHouse/ObsessionDB in this report; see clickhouse-gates.ts for vanilla ClickHouse",
     "dollar cost (sizes are the only resource input)",
     ...(pgUrl ? [] : ["throughput (PGlite has one connection)"]),
   ],

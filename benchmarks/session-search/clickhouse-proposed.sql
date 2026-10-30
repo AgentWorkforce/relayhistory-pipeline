@@ -1,7 +1,6 @@
 -- PROPOSED, NOT CONTRACT. No ClickHouse or ObsessionDB schema, version or deployment
--- exists. Nothing in this harness runs this file and no result in this packet comes
--- from it. Syntax follows the ClickHouse text index docs for 26.2+, unverified on a
--- server. ngrams(3) is the candidate for ILIKE-equivalent substring search; a token
+-- exists. clickhouse-gates.ts builds its own tables in this shape on vanilla
+-- ClickHouse; this file is not applied as is. ngrams(3) is the candidate for ILIKE-equivalent substring search; a token
 -- tokenizer would be cheaper but would not match `%depl%`.
 --
 -- Open: tenant isolation has no RLS equivalent here, so every read needs a row policy
