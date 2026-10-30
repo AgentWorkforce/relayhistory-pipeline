@@ -48,6 +48,7 @@ export interface PrivateCloudSqlSpec {
     databaseVersion: "POSTGRES_17";
     settings: {
       tier: string;
+      edition: "ENTERPRISE";
       availabilityType: "ZONAL" | "REGIONAL";
       ipConfiguration: CloudSqlIpConfiguration;
     };
@@ -112,6 +113,7 @@ export function privateCloudSqlSpec(input: {
       databaseVersion: "POSTGRES_17",
       settings: {
         tier,
+        edition: "ENTERPRISE",
         availabilityType: input.highAvailability ? "REGIONAL" : "ZONAL",
         ipConfiguration,
       },
@@ -167,7 +169,7 @@ export interface CloudSqlProxyWorkload {
 const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 
 const INSERT_BODY_KEYS = new Set(["name", "region", "databaseVersion", "settings"]);
-const INSERT_SETTINGS_KEYS = new Set(["tier", "availabilityType", "ipConfiguration"]);
+const INSERT_SETTINGS_KEYS = new Set(["tier", "edition", "availabilityType", "ipConfiguration"]);
 const INSERT_IP_KEYS = new Set(["ipv4Enabled", "privateNetwork", "allocatedIpRange"]);
 const PRIVATE_NETWORK = /^\/projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
 const RETURNED_PRIVATE_NETWORK = /^\/?projects\/([a-z][a-z0-9-]{4,28}[a-z0-9])\/global\/networks\/([a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)$/;
@@ -213,7 +215,11 @@ export function sqlAdminInsertRequest(spec: PrivateCloudSqlSpec): SqlAdminInsert
     refuse("Cloud SQL insert seam lost the Private Service Access range.");
   if (body.name !== spec.instanceName || body.region !== spec.connectionName.split(":")[1])
     refuse("Cloud SQL insert seam drifted off the instance name.");
-  if (body.databaseVersion !== "POSTGRES_17" || !TIER.test(body.settings.tier))
+  if (
+    body.databaseVersion !== "POSTGRES_17" ||
+    body.settings.edition !== "ENTERPRISE" ||
+    !TIER.test(body.settings.tier)
+  )
     refuse("Cloud SQL insert seam drifted off PostgreSQL 17.");
   if (body.settings.availabilityType !== "ZONAL" && body.settings.availabilityType !== "REGIONAL")
     refuse("Cloud SQL insert seam drifted off the availability type.");
@@ -428,6 +434,7 @@ function classifyExisting(spec: PrivateCloudSqlSpec, body: unknown): "match" | "
     record.region === spec.insertBody.region &&
     record.databaseVersion === "POSTGRES_17" &&
     settings?.tier === spec.insertBody.settings.tier &&
+    settings.edition === spec.insertBody.settings.edition &&
     settings.availabilityType === spec.insertBody.settings.availabilityType &&
     ip?.ipv4Enabled === false &&
     samePrivateNetwork(spec.privateNetwork, ip.privateNetwork) &&

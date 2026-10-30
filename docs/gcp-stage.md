@@ -136,8 +136,9 @@ These are the current code facts. They are not a cloud proof.
 
 Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
 
-- `privateCloudSqlSpec` builds the private-only insert body: `ipv4Enabled`
-  false, `privateNetwork` set to `/projects/{project}/global/networks/{name}`,
+- `privateCloudSqlSpec` builds the private-only insert body: `edition` pinned
+  to `ENTERPRISE` for the custom-core tier, `ipv4Enabled` false,
+  `privateNetwork` set to `/projects/{project}/global/networks/{name}`,
   `allocatedIpRange` set to the PSA range name, and no authorized networks.
   Proxy args are `--private-ip`, `--address=0.0.0.0`, `--port=5432`, and the
   connection name.
@@ -146,8 +147,8 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
   `ensurePrivateCloudSql` passes the bearer credential only to an injected
   transport. It returns when the private instance already matches, inserts
   only on HTTP 404, and follows HTTP 409 with another get. A public address,
-  authorized network, or mismatched name, region, version, tier, availability,
-  VPC, or PSA range is refused with no update. A match also requires
+  authorized network, or mismatched name, region, version, edition, tier,
+  availability, VPC, or PSA range is refused with no update. A match also requires
   `state: RUNNABLE`. A finished create polls
   `operations/{id}` until `DONE`, then gets the instance and refuses the
   result unless that private body is `RUNNABLE`. A thrown insert, a failed operation, or a

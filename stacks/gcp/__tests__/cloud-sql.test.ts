@@ -39,6 +39,7 @@ describe("Cloud SQL private attachment", () => {
       privateNetwork: "/projects/agentworkforce-dev1/global/networks/awf-dev-vpc",
       allocatedIpRange: "awf-dev-psa",
     });
+    expect(spec.insertBody.settings.edition).toBe("ENTERPRISE");
     expect(spec.insertBody.settings.availabilityType).toBe("ZONAL");
     expect(spec.proxyArgs).toEqual([
       "--private-ip",
@@ -89,11 +90,16 @@ describe("Cloud SQL private attachment", () => {
     expect(request.method).toBe("POST");
     expect(request.url).toBe("https://sqladmin.googleapis.com/v1/projects/agentworkforce-dev1/instances");
     expect(request.headers).toEqual({ "content-type": "application/json" });
+    expect(request.body.settings.edition).toBe("ENTERPRISE");
     expect(JSON.stringify(request)).not.toMatch(/authorization|bearer|token/i);
     expect(request.body).toEqual(spec.insertBody);
     expect(spec.posted).toBe(false);
     expect(JSON.stringify(request)).not.toContain("authorizedNetworks");
     expect(JSON.stringify(request)).not.toContain("rootPassword");
+
+    const wrongEdition = privateCloudSqlSpec(input);
+    (wrongEdition.insertBody.settings as { edition: string }).edition = "ENTERPRISE_PLUS";
+    expect(() => sqlAdminInsertRequest(wrongEdition)).toThrow(/Nothing was created/);
   });
 
   test("the Alchemy stack posts only through the apply-time action and never calls GCP.SQL.Instance", () => {
@@ -178,6 +184,7 @@ function matchingInstance(spec: PrivateCloudSqlSpec, ipPatch: Record<string, unk
     databaseVersion: spec.databaseVersion,
     settings: {
       tier: spec.insertBody.settings.tier,
+      edition: spec.insertBody.settings.edition,
       availabilityType: spec.insertBody.settings.availabilityType,
       ipConfiguration,
     },
@@ -333,6 +340,13 @@ describe("SQL Admin idempotent poster", () => {
       {
         ...matchingInstance(spec),
         settings: { ...matchingInstance(spec).settings, tier: "db-custom-2-7680" },
+      },
+      /does not match/,
+    );
+    await once(
+      {
+        ...matchingInstance(spec),
+        settings: { ...matchingInstance(spec).settings, edition: "ENTERPRISE_PLUS" },
       },
       /does not match/,
     );
