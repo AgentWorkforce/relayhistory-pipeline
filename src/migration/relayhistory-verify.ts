@@ -12,6 +12,9 @@
  * Required env: RELAYHISTORY_SOURCE_URL, BULLS_TARGET_URL.
  * Usage: bun run migration:verify [--mode=schema|full] [--chunk-size=10000]
  *   [--checkpoint=/safe/path/checkpoint.json] [--emit-sequence-fence]
+ *   [--source-role=<Neon runtime role> --target-role=<Supabase runtime role>]
+ * Schema mode does not pass without both roles: the target role must hold every
+ * privilege the source role holds in `sessions`.
  */
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -107,61 +110,301 @@ export function chunkUpperBoundSql(
   ) AS verify_chunk ORDER BY ${keyColumns.map((column) => `${quoteIdent(column)} DESC`).join(", ")} LIMIT 1`;
 }
 
+/** One database session: a pg.PoolClient or a PGlite. Never a pool (see readCatalog). */
+export interface Queryable {
+  query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
+}
+
+/** A column as pg_attribute/pg_attrdef define it; "" means none for generated and identity. */
+export interface ColumnDefinition {
+  type: string;
+  notNull: boolean;
+  default: string | null;
+  generated: string;
+  identity: string;
+  collation: string | null;
+}
+
+export interface TableSecurity {
+  rowSecurity: boolean;
+  forceRowSecurity: boolean;
+}
+
 export interface CatalogObjects {
   indexes: Map<string, string>;
   constraints: Map<string, string>;
   functions: Set<string>;
   triggers: Map<string, string>;
+  /** table → column → definition. */
+  columns: Map<string, Map<string, ColumnDefinition>>;
+  /** Signature → pg_get_functiondef, for plain functions and procedures. */
+  functionDefinitions: Map<string, string>;
+  /** table → row-level security flags. */
+  tables: Map<string, TableSecurity>;
+  /** table.policy → canonical definition. */
+  policies: Map<string, string>;
+  /** User-defined enum, composite, domain and range types → canonical definition. */
+  types: Map<string, string>;
 }
 
+/** What a runtime role may do in `sessions`, by has_*_privilege (so grants to PUBLIC and inherited roles count). */
+export interface RoleAccess {
+  name: string;
+  exists: boolean;
+  /** "<privilege> on <kind> <name>", e.g. "SELECT on table machines". */
+  privileges: Set<string>;
+  /** Tables whose row security this role bypasses (superuser, BYPASSRLS, or owner without FORCE). */
+  rowSecurityExempt: Set<string>;
+}
+
+const TABLE_PRIVILEGES = ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"];
+const SEQUENCE_PRIVILEGES = ["USAGE", "SELECT", "UPDATE"];
+
 /**
- * The live sessions schema beyond columns: indexes (including those the runner
- * builds CONCURRENTLY), constraints, functions and triggers. A missing rollout
- * trigger or search index would otherwise pass the T0 gate.
+ * The live sessions schema beyond the table list: column definitions, indexes
+ * (including those the runner builds CONCURRENTLY), constraints, functions and
+ * their full definitions, triggers, row security and policies, and types. A
+ * missing rollout trigger or search index would otherwise pass the T0 gate.
+ *
+ * `db` must be a single session: everything is read in one read-only snapshot
+ * with search_path pinned to pg_catalog, so deparsed definitions qualify every
+ * other schema identically on both sides whatever each server's default path is.
+ * With `role`, also reads that role's privileges (see RoleAccess).
  */
-async function catalogObjects(pool: pg.Pool): Promise<CatalogObjects> {
-  const [indexes, constraints, functions, triggers] = await Promise.all([
-    pool.query<{ name: string; def: string; valid: boolean }>(
-      `SELECT i.indexname AS name, i.indexdef AS def, x.indisvalid AS valid
-         FROM pg_indexes i
-         JOIN pg_class c ON c.relname = i.indexname
-         JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = i.schemaname
-         JOIN pg_index x ON x.indexrelid = c.oid
-        WHERE i.schemaname = 'sessions'`,
-    ),
-    pool.query<{ key: string; def: string }>(
-      `SELECT c.relname || '.' || k.conname AS key, pg_get_constraintdef(k.oid) AS def
-         FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'sessions' AND NOT c.relispartition`,
-    ),
-    pool.query<{ sig: string }>(
-      `SELECT p.oid::regprocedure::text AS sig FROM pg_proc p
-         JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'sessions'`,
-    ),
-    pool.query<{ key: string; def: string }>(
-      `SELECT c.relname || '.' || t.tgname AS key, pg_get_triggerdef(t.oid) AS def
-         FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'sessions' AND NOT t.tgisinternal AND NOT c.relispartition`,
-    ),
-  ]);
+export async function readCatalog(
+  db: Queryable,
+  role?: string,
+): Promise<{ objects: CatalogObjects; role: RoleAccess | null }> {
+  await db.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+  try {
+    await db.query("SET LOCAL search_path = pg_catalog");
+    const objects = await catalogObjects(db);
+    return { objects, role: role ? await roleAccess(db, role) : null };
+  } finally {
+    await db.query("ROLLBACK");
+  }
+}
+
+async function catalogObjects(db: Queryable): Promise<CatalogObjects> {
+  // Sequential: one session runs one query at a time anyway.
+  const indexes = await db.query<{ name: string; def: string; valid: boolean }>(
+    `SELECT i.indexname AS name, i.indexdef AS def, x.indisvalid AS valid
+       FROM pg_indexes i
+       JOIN pg_class c ON c.relname = i.indexname
+       JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = i.schemaname
+       JOIN pg_index x ON x.indexrelid = c.oid
+      WHERE i.schemaname = 'sessions'`,
+  );
+  const constraints = await db.query<{ key: string; def: string }>(
+    `SELECT c.relname || '.' || k.conname AS key, pg_get_constraintdef(k.oid) AS def
+       FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'sessions' AND NOT c.relispartition`,
+  );
+  // pg_get_functiondef rejects aggregates and window functions; their signatures still count.
+  const functions = await db.query<{ sig: string; def: string | null }>(
+    `SELECT p.oid::regprocedure::text AS sig,
+            CASE WHEN p.prokind IN ('f', 'p') THEN pg_get_functiondef(p.oid) END AS def
+       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'sessions'`,
+  );
+  const triggers = await db.query<{ key: string; def: string }>(
+    `SELECT c.relname || '.' || t.tgname AS key, pg_get_triggerdef(t.oid) AS def
+       FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'sessions' AND NOT t.tgisinternal AND NOT c.relispartition`,
+  );
+  const tables = await db.query<{ name: string; rls: boolean; force: boolean }>(
+    `SELECT c.relname::text AS name, c.relrowsecurity AS rls, c.relforcerowsecurity AS force
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'sessions' AND c.relkind IN ('r', 'p') AND NOT c.relispartition`,
+  );
+  const columns = await db.query<{
+    table: string;
+    column: string;
+    type: string;
+    not_null: boolean;
+    default: string | null;
+    generated: string;
+    identity: string;
+    collation: string | null;
+  }>(
+    `SELECT c.relname::text AS table, a.attname::text AS column,
+            format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS not_null,
+            pg_get_expr(d.adbin, d.adrelid) AS default,
+            a.attgenerated::text AS generated, a.attidentity::text AS identity,
+            co.collname::text AS collation
+       FROM pg_attribute a
+       JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+       LEFT JOIN pg_collation co ON co.oid = a.attcollation
+      WHERE n.nspname = 'sessions' AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+        AND a.attnum > 0 AND NOT a.attisdropped`,
+  );
+  const policies = await db.query<{
+    key: string;
+    permissive: string;
+    roles: string[];
+    cmd: string;
+    qual: string | null;
+    with_check: string | null;
+  }>(
+    `SELECT tablename || '.' || policyname AS key, permissive, roles::text[] AS roles,
+            cmd, qual, with_check
+       FROM pg_policies WHERE schemaname = 'sessions'`,
+  );
+  const types = await db.query<{
+    name: string;
+    kind: string;
+    base: string | null;
+    not_null: boolean;
+    default: string | null;
+    collation: string | null;
+    labels: string[];
+    attributes: string[];
+    constraints: string[];
+  }>(
+    `SELECT t.typname::text AS name, t.typtype::text AS kind,
+            CASE t.typtype
+              WHEN 'd' THEN format_type(t.typbasetype, t.typtypmod)
+              WHEN 'r' THEN (SELECT format_type(r.rngsubtype, NULL) FROM pg_range r WHERE r.rngtypid = t.oid)
+            END AS base,
+            t.typnotnull AS not_null, pg_get_expr(t.typdefaultbin, 0) AS default,
+            (SELECT co.collname::text FROM pg_collation co WHERE co.oid = t.typcollation) AS collation,
+            ARRAY(SELECT e.enumlabel::text FROM pg_enum e WHERE e.enumtypid = t.oid
+                   ORDER BY e.enumsortorder) AS labels,
+            ARRAY(SELECT a.attname::text || ' ' || format_type(a.atttypid, a.atttypmod)
+                         || coalesce(' COLLATE ' || co.collname::text, '')
+                    FROM pg_attribute a LEFT JOIN pg_collation co ON co.oid = a.attcollation
+                   WHERE a.attrelid = t.typrelid AND a.attnum > 0 AND NOT a.attisdropped
+                   ORDER BY a.attnum) AS attributes,
+            ARRAY(SELECT k.conname::text || ' ' || pg_get_constraintdef(k.oid)
+                    FROM pg_constraint k WHERE k.contypid = t.oid ORDER BY k.conname) AS constraints
+       FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+      WHERE n.nspname = 'sessions'
+        AND (t.typtype IN ('e', 'd', 'r')
+             OR (t.typtype = 'c' AND (SELECT c.relkind FROM pg_class c WHERE c.oid = t.typrelid) = 'c'))`,
+  );
+  const columnsByTable = new Map<string, Map<string, ColumnDefinition>>();
+  for (const row of columns.rows) {
+    const table = columnsByTable.get(row.table) ?? new Map<string, ColumnDefinition>();
+    table.set(row.column, {
+      type: row.type,
+      notNull: row.not_null,
+      default: row.default,
+      generated: row.generated,
+      identity: row.identity,
+      collation: row.collation,
+    });
+    columnsByTable.set(row.table, table);
+  }
   return {
     // An INVALID index (interrupted CONCURRENTLY build) does not count as present.
     indexes: new Map(indexes.rows.filter((row) => row.valid).map((row) => [row.name, row.def])),
     constraints: new Map(constraints.rows.map((row) => [row.key, row.def])),
     functions: new Set(functions.rows.map((row) => row.sig)),
     triggers: new Map(triggers.rows.map((row) => [row.key, row.def])),
+    columns: columnsByTable,
+    functionDefinitions: new Map(
+      functions.rows.flatMap((row) => (row.def === null ? [] : [[row.sig, row.def] as [string, string]])),
+    ),
+    tables: new Map(tables.rows.map((row) => [row.name, { rowSecurity: row.rls, forceRowSecurity: row.force }])),
+    policies: new Map(policies.rows.map((row) => [row.key, JSON.stringify({
+      cmd: row.cmd,
+      permissive: row.permissive,
+      roles: [...row.roles].sort(),
+      qual: row.qual,
+      withCheck: row.with_check,
+    })])),
+    types: new Map(types.rows.map((row) => [row.name, JSON.stringify({
+      kind: row.kind,
+      base: row.base,
+      notNull: row.not_null,
+      default: row.default,
+      collation: row.collation,
+      labels: row.labels,
+      attributes: row.attributes,
+      constraints: row.constraints,
+    })])),
   };
 }
 
-/** Every source object the target lacks or defines differently. */
-export function missingObjects(source: CatalogObjects, target: CatalogObjects): string[] {
+async function roleAccess(db: Queryable, name: string): Promise<RoleAccess> {
+  const found = await db.query(`SELECT 1 FROM pg_roles WHERE rolname = $1`, [name]);
+  if (found.rows.length === 0) return { name, exists: false, privileges: new Set(), rowSecurityExempt: new Set() };
+  const privileges = await db.query<{ key: string }>(
+    `WITH role AS (SELECT oid FROM pg_roles WHERE rolname = $1),
+          sessions AS (SELECT oid FROM pg_namespace WHERE nspname = 'sessions')
+     SELECT 'USAGE on schema sessions' AS key FROM role CROSS JOIN sessions
+      WHERE has_schema_privilege(role.oid, sessions.oid, 'USAGE')
+     UNION ALL
+     SELECT p.privilege || ' on table ' || c.relname
+       FROM role CROSS JOIN sessions JOIN pg_class c ON c.relnamespace = sessions.oid
+       CROSS JOIN unnest($2::text[]) AS p(privilege)
+      WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition
+        AND has_table_privilege(role.oid, c.oid, p.privilege)
+     UNION ALL
+     SELECT p.privilege || ' on sequence ' || c.relname
+       FROM role CROSS JOIN sessions JOIN pg_class c ON c.relnamespace = sessions.oid
+       CROSS JOIN unnest($3::text[]) AS p(privilege)
+      WHERE c.relkind = 'S' AND has_sequence_privilege(role.oid, c.oid, p.privilege)
+     UNION ALL
+     SELECT 'EXECUTE on function ' || f.oid::regprocedure::text
+       FROM role CROSS JOIN sessions JOIN pg_proc f ON f.pronamespace = sessions.oid
+      WHERE has_function_privilege(role.oid, f.oid, 'EXECUTE')`,
+    [name, TABLE_PRIVILEGES, SEQUENCE_PRIVILEGES],
+  );
+  const exempt = await db.query<{ name: string }>(
+    `SELECT c.relname::text AS name
+       FROM pg_roles r CROSS JOIN pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE r.rolname = $1 AND n.nspname = 'sessions' AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+        AND (r.rolsuper OR r.rolbypassrls
+             OR (pg_has_role(r.oid, c.relowner, 'USAGE') AND NOT c.relforcerowsecurity))`,
+    [name],
+  );
+  return {
+    name,
+    exists: true,
+    privileges: new Set(privileges.rows.map((row) => row.key)),
+    rowSecurityExempt: new Set(exempt.rows.map((row) => row.name)),
+  };
+}
+
+/**
+ * Intentional, reviewed differences between Neon and the Supabase target, as
+ * the exact gap text schemaDifferences reports. Keep this minimal: nothing else
+ * may differ. Objects only the target has (the 96Bulls columns on machines, the
+ * machines_member_read policy, pipeline tables) need no entry: a superset passes.
+ */
+export const ALLOWED_SCHEMA_DIFFERENCES: ReadonlySet<string> = new Set([
+  // 20261025000000_sessions_index.sql: tenants read their org's machines through
+  // the machines_member_read policy. The runtime-role check still requires the
+  // RelayHistory role to bypass it (missingPrivileges).
+  "different row security machines: source disabled, target enabled",
+  // 20261030000000_relayhistory_machines_compat.sql: sessions.upsert_machine
+  // inserts machines rows without a workspace.
+  "different column default machines.workspace_id: source none, target 'default'::text",
+]);
+
+const orNone = (value: string | null) => (value === null || value === "" ? "none" : value);
+const COLUMN_ATTRIBUTES: Array<[string, (column: ColumnDefinition) => string]> = [
+  ["type", (column) => column.type],
+  ["nullability", (column) => (column.notNull ? "NOT NULL" : "nullable")],
+  ["default", (column) => orNone(column.default)],
+  ["generated", (column) => orNone(column.generated)],
+  ["identity", (column) => orNone(column.identity)],
+  ["collation", (column) => orNone(column.collation)],
+];
+
+/** Every way the target is not a superset of the source with identical definitions, allowlisted ones included. */
+export function schemaDifferences(source: CatalogObjects, target: CatalogObjects): string[] {
   const out: string[] = [];
   for (const [kind, from, to] of [
     ["index", source.indexes, target.indexes],
     ["constraint", source.constraints, target.constraints],
     ["trigger", source.triggers, target.triggers],
+    ["policy", source.policies, target.policies],
+    ["type", source.types, target.types],
   ] as const) {
     for (const [name, def] of from) {
       const found = to.get(name);
@@ -171,6 +414,74 @@ export function missingObjects(source: CatalogObjects, target: CatalogObjects): 
   }
   for (const signature of source.functions)
     if (!target.functions.has(signature)) out.push(`missing function ${signature}`);
+  for (const [signature, def] of source.functionDefinitions) {
+    const found = target.functionDefinitions.get(signature);
+    if (found !== undefined && found !== def) out.push(`different function definition ${signature}`);
+  }
+  const flag = (on: boolean) => (on ? "enabled" : "disabled");
+  for (const [table, security] of source.tables) {
+    const found = target.tables.get(table);
+    if (!found) {
+      out.push(`missing table ${table}`);
+      continue;
+    }
+    if (found.rowSecurity !== security.rowSecurity)
+      out.push(`different row security ${table}: source ${flag(security.rowSecurity)}, target ${flag(found.rowSecurity)}`);
+    if (found.forceRowSecurity !== security.forceRowSecurity)
+      out.push(`different forced row security ${table}: source ${flag(security.forceRowSecurity)}, target ${flag(found.forceRowSecurity)}`);
+  }
+  for (const [table, columns] of source.columns) {
+    const targetColumns = target.columns.get(table);
+    if (!targetColumns) continue; // reported as a missing table
+    for (const [name, column] of columns) {
+      const found = targetColumns.get(name);
+      if (!found) {
+        out.push(`missing column ${table}.${name}`);
+        continue;
+      }
+      for (const [attribute, read] of COLUMN_ATTRIBUTES) {
+        if (read(found) !== read(column))
+          out.push(`different column ${attribute} ${table}.${name}: source ${read(column)}, target ${read(found)}`);
+      }
+    }
+  }
+  return out.sort();
+}
+
+/** Every source object the target lacks or defines differently, less the reviewed allowlist. */
+export function missingObjects(source: CatalogObjects, target: CatalogObjects): string[] {
+  return schemaDifferences(source, target).filter((gap) => !ALLOWED_SCHEMA_DIFFERENCES.has(gap));
+}
+
+/** The allowlisted differences actually present, reported so a reviewer sees them. */
+export function allowedDifferences(source: CatalogObjects, target: CatalogObjects): string[] {
+  return schemaDifferences(source, target).filter((gap) => ALLOWED_SCHEMA_DIFFERENCES.has(gap));
+}
+
+/**
+ * Every privilege the source runtime role holds that the target runtime role
+ * lacks, and every table where the target role would be filtered by row
+ * security that never filtered the source role (an RLS-enabled table with no
+ * policy for the role reads as empty and rejects writes).
+ */
+export function missingPrivileges(
+  sourceRole: RoleAccess,
+  targetRole: RoleAccess,
+  source: CatalogObjects,
+  target: CatalogObjects,
+): string[] {
+  const out: string[] = [];
+  if (!sourceRole.exists) out.push(`source role ${sourceRole.name} does not exist`);
+  if (!targetRole.exists) out.push(`target role ${targetRole.name} does not exist`);
+  if (out.length) return out;
+  for (const privilege of sourceRole.privileges)
+    if (!targetRole.privileges.has(privilege)) out.push(`target role ${targetRole.name} lacks ${privilege}`);
+  const filtered = (objects: CatalogObjects, role: RoleAccess, table: string) =>
+    objects.tables.get(table)?.rowSecurity === true && !role.rowSecurityExempt.has(table);
+  for (const table of source.tables.keys()) {
+    if (target.tables.has(table) && !filtered(source, sourceRole, table) && filtered(target, targetRole, table))
+      out.push(`target role ${targetRole.name} is subject to row security on ${table}; source role ${sourceRole.name} is not`);
+  }
   return out.sort();
 }
 
@@ -292,6 +603,19 @@ async function sequences(pool: pg.Pool): Promise<SequenceValue[]> {
     SELECT sequencename, last_value::text
       FROM pg_sequences WHERE schemaname = 'sessions' ORDER BY sequencename`);
   return result.rows.map((row) => ({ name: row.sequencename, lastValue: row.last_value }));
+}
+
+/** readCatalog on one pooled connection; a broken session is discarded, not reused. */
+async function catalogFrom(pool: pg.Pool, role: string | undefined) {
+  const client = await pool.connect();
+  try {
+    const catalog = await readCatalog(client, role);
+    client.release();
+    return catalog;
+  } catch (error) {
+    client.release(true);
+    throw error;
+  }
 }
 
 function argument(name: string): string | undefined {
@@ -508,9 +832,38 @@ export async function main() {
       }
       results.push(result);
     }
-    const [sourceObjects, targetObjects] = await Promise.all([catalogObjects(source), catalogObjects(target)]);
+    const sourceRoleName = argument("source-role");
+    const targetRoleName = argument("target-role");
+    const [sourceCatalog, targetCatalog] = await Promise.all([
+      catalogFrom(source, sourceRoleName),
+      catalogFrom(target, targetRoleName),
+    ]);
+    const sourceObjects = sourceCatalog.objects;
+    const targetObjects = targetCatalog.objects;
     const objectGaps = missingObjects(sourceObjects, targetObjects);
     if (objectGaps.length) passed = false;
+    let roles: Record<string, unknown>;
+    if (sourceCatalog.role && targetCatalog.role) {
+      const roleGaps = missingPrivileges(sourceCatalog.role, targetCatalog.role, sourceObjects, targetObjects);
+      if (roleGaps.length) passed = false;
+      roles = {
+        checked: true,
+        source: sourceCatalog.role.name,
+        target: targetCatalog.role.name,
+        sourcePrivileges: sourceCatalog.role.privileges.size,
+        missing: roleGaps,
+      };
+    } else {
+      // The target must grant the RelayHistory runtime role what Neon grants it,
+      // so schema mode (the T0 gate) cannot pass without the mapping.
+      if (mode === "schema") passed = false;
+      roles = {
+        checked: false,
+        reason: mode === "schema"
+          ? "--source-role and --target-role are required in schema mode"
+          : "pass --source-role and --target-role to check runtime-role grants",
+      };
+    }
     const [sourceSequences, targetSequences] = await Promise.all([sequences(source), sequences(target)]);
     const targetByName = new Map(targetSequences.map((item) => [item.name, item.lastValue]));
     const sequenceResults = sourceSequences.map((item) => {
@@ -530,7 +883,14 @@ export async function main() {
         completedTables: Object.values(checkpoint.tables).filter((table) => table.complete).length,
       },
       tables: results,
-      objects: { checked: sourceObjects.indexes.size + sourceObjects.constraints.size + sourceObjects.functions.size + sourceObjects.triggers.size, missing: objectGaps },
+      objects: {
+        checked: sourceObjects.indexes.size + sourceObjects.constraints.size + sourceObjects.functions.size +
+          sourceObjects.triggers.size + sourceObjects.tables.size + sourceObjects.policies.size + sourceObjects.types.size +
+          [...sourceObjects.columns.values()].reduce((sum, table) => sum + table.size, 0),
+        missing: objectGaps,
+        allowed: allowedDifferences(sourceObjects, targetObjects),
+      },
+      roles,
       sequences: sequenceResults,
     };
     if (process.argv.includes("--emit-sequence-fence")) output.sequenceFenceSql = sequenceFenceSql(sourceSequences);
