@@ -26,6 +26,7 @@ import {
   type TraceContext,
   type TraceScope,
   type StageMessage,
+  type ObjectLandedPayload,
 } from "../lib/pipeline/index.js";
 import {
   MAX_PLAN_ENTRY_BYTES,
@@ -554,6 +555,10 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
       // just verified); the work key is then derived from signed fields only.
       if (!reader) return storageReadRequired(c);
       built.message.workKey = migrationWorkKey(auth.migration.upload);
+      (built.message.payload as ObjectLandedPayload).migration = {
+        key: auth.migration.upload.key,
+        entry_sha256: auth.migration.upload.entry_sha256,
+      };
       // The commit's only durable write is the enqueue: the ledger consumes the
       // assertion and enqueues as one unit, so neither lands without the other.
       // A failure leaves nothing consumed, and the upload may be retried.

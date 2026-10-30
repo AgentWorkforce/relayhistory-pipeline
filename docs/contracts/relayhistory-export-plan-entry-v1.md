@@ -11,7 +11,7 @@ Status: **binding proposal, code only** (helm-chart-chief contract decision, E3)
 Test vectors: [`relayhistory-export-plan-entry-v1.vectors.json`](relayhistory-export-plan-entry-v1.vectors.json). Every implementation must reproduce every value. They were cross-checked three ways:
 
 - the reference implementation, `packages/pipeline/src/lib/pipeline/migration-assertions.ts`: `canonicalJson`, `planEntrySha256`, `exportPlanDigest`, `uploadIdentityOf`, `derivePlanEntry`, `migrationSessionMatches`, `migrationUploadMatches` and `parseUploadIdentity`. It is byte-identical in relayhistory-cloud and tested against these vectors by `packages/pipeline/test/migration-assertion-contract.test.ts`;
-- the #40 courier's `derivePlanContract` at `2f17febc`;
+- the courier's `derivePlanContract`, now on #55 at `e6af180a757dd7a41b3e46977b0b1542383608d9`. Re-checked by running it against this file: `plan_digest`, `entry_sha256`, `content_sha256` and the complete upload identities, **including `plan_digest`**, match byte for byte. #55's fixture copy is the same JSON. The earlier #40 commit `2f17febc` matched the entry, content and plan digests, but its `UploadIdentity` did not yet carry `plan_digest` (added from `19d5c799`). The vectors file's `note` still names `2f17febc`, so that every copy of the file stays byte-identical;
 - an independent Python implementation.
 
 ## Canonical form
@@ -75,6 +75,11 @@ It binds:
 - A posted `etag`, `version` or `previousVersion` never feeds the work key.
 - A retry of the same planned upload, even under a fresh assertion, has the same work key.
 - **The courier:** the commit response's `workKey` equals `upload.key + "@" + upload.entry_sha256`, exactly. The vectors list it under `work_keys`.
+- **The consumer:** the ingest also sets `payload.migration = {key, entry_sha256}` on the `object-landed` job. `objectLandedWorkKey` (in `stages.ts`) then expects the signed work key, and accepts it only when `migration.key` is exactly this object's key without its deployment prefix and the digest is 64 lowercase hex.
+  - **Live jobs** carry no `migration` field and keep `manifestWorkKey`: key@version.
+  - **No fallback:** a malformed `migration` field is refused (`invalid_work_key`), never treated as live.
+  - **Why this is safe:** only the ingest writes queue jobs, so a client cannot set the field.
+  - **Tested end to end:** route, enqueue, consume `object-landed`, then `session-indexed`, for both kinds of job.
 
 ## What the ingest recomputes (never an echoed field)
 

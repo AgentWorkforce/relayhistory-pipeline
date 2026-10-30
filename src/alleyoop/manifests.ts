@@ -32,6 +32,7 @@ import {
   type ManifestReader,
   type ManifestV1,
   type ObjectVersion,
+  type ObjectLandedPayload,
   type PipelineStage,
   type RawStore,
   type StageMessage,
@@ -343,7 +344,15 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       });
       if (built.status !== "enqueue") return responseError(c, 400, "bad_request", "key is not a manifest");
       // Signed-only work key for a migration commit: the signed key and entry digest.
-      if (migration) built.message.workKey = migrationWorkKey(migration.upload);
+      // Signed-only work key; the payload's `migration` field tells the
+      // object-landed consumer to expect it (stages.ts objectLandedWorkKey).
+      if (migration) {
+        built.message.workKey = migrationWorkKey(migration.upload);
+        (built.message.payload as ObjectLandedPayload).migration = {
+          key: migration.upload.key,
+          entry_sha256: migration.upload.entry_sha256,
+        };
+      }
       if (migration) {
         // The ledger row and the enriched pipeline_jobs row commit in one SQL
         // transaction, or neither does (fail closed: 503, nothing consumed).

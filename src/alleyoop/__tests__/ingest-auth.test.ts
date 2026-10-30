@@ -14,7 +14,19 @@ import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { canonicalJson, uploadIdentityOf, type PlanEntry, type UploadIdentity } from "@rhc/lib/pipeline/migration-assertions.ts";
-import { computeContentSha256, manifestKey, sealRawChunk, type SessionLocation, type SqlExecutor } from "../../shared/vendor.ts";
+import {
+  computeContentSha256,
+  manifestKey,
+  pipelineQueueDeps,
+  pollPostgresStage,
+  postgresDeadLetterStore,
+  postgresPipelineQueue,
+  sealRawChunk,
+  type Bindings,
+  type SessionLocation,
+  type SqlExecutor,
+} from "../../shared/vendor.ts";
+import { sqlPipelineEventSink } from "../../hoopdb/sink.ts";
 import { buildIngestApp } from "../ingest.ts";
 
 const ORIGIN = "https://history.example.test";
@@ -30,6 +42,7 @@ const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const AT = "2026-10-29T10:00:00.000Z";
 const SOURCE = new TextEncoder().encode('{"type":"user","text":"hello"}\n');
 const LOCATION: SessionLocation = { workspaceId: WORKSPACE, machineId: "machine-a", harness: "claude", sessionId: "session-a", startDate: "2026-10-29" };
+const DEFAULT_LOCATION = LOCATION;
 const ROOT_DIR = join(import.meta.dir, "../../..");
 
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -57,6 +70,10 @@ function migrationToken(upload: UploadIdentity, overrides: Record<string, unknow
     },
   });
 }
+
+/** An origin-bound courier assertion (live delivery), as relayauth mints for this History. */
+const liveToken = () =>
+  sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { tokenClass: "relayhistory_assertion" } });
 
 /** A generic RelayAuth bearer: a valid JWT of no assertion class (like a relay_pa_ token's JWT). */
 const genericToken = (aud: string[] = ["relayhistory"]) =>
@@ -140,7 +157,7 @@ async function ingest(extra: Record<string, string> = {}) {
 }
 
 /** The planned upload: its chunk entry (as the server seals it), manifest and signed identity. */
-async function planned() {
+async function planned(LOCATION: SessionLocation = DEFAULT_LOCATION) {
   const scratch = await mkdtemp(join(tmpdir(), "96bulls-plan-"));
   try {
     const sealed = await sealRawChunk(createFsStore({ root: scratch }), {
@@ -291,6 +308,53 @@ describe("buildIngestApp auth (production composition)", () => {
     }
     expect(await count("sessions.migration_assertion_uses")).toBe(1);
     expect(await count("sessions.pipeline_jobs")).toBe(1);
+  });
+
+  test("E2E: route, enqueue, consume object-landed, then session-indexed, for a migration job and a live job", async () => {
+    const i = await ingest({ ...MIGRATION_ON, ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
+    // Migration upload.
+    const { upload, manifest, entryText } = await planned();
+    const token = migrationToken(upload);
+    expect((await i.chunk(token, LOCATION, { entry: entryText })).status).toBe(201);
+    const migrated = await i.commit(token, manifest);
+    expect(migrated.status).toBe(202);
+    const migratedKey = ((await migrated.json()) as { workKey: string }).workKey;
+    expect(migratedKey).toBe(`${upload.key}@${upload.entry_sha256}`);
+    // Live upload of another session (origin-bound courier assertion).
+    const liveLocation = { ...LOCATION, sessionId: "session-live" };
+    const live = await planned(liveLocation);
+    const liveManifest = { ...live.manifest, extensions: undefined };
+    expect((await i.chunk(liveToken(), liveLocation)).status).toBe(201);
+    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-machine-id": liveLocation.machineId, "x-session-id": liveLocation.sessionId },
+      body: JSON.stringify({ key: manifestKey(liveLocation), manifest: liveManifest }),
+    });
+    expect(liveCommit.status).toBe(202);
+    const liveKey = ((await liveCommit.json()) as { workKey: string }).workKey;
+    expect(liveKey.startsWith(`${manifestKey(liveLocation)}@`)).toBe(true);
+    expect(liveKey).not.toBe(`${manifestKey(liveLocation)}@${upload.entry_sha256}`);
+
+    // Consume both through the real stage handlers on the same Postgres queue.
+    const sql = pgExecutor();
+    const indexed: string[] = [];
+    const deadLetters = postgresDeadLetterStore(sql);
+    const deps = pipelineQueueDeps({} as Bindings, {
+      queue: postgresPipelineQueue(sql),
+      sink: sqlPipelineEventSink(sql),
+      deadLetters,
+      index: { upsertRawPointer: async (pointer: { manifestKey: string }) => void indexed.push(pointer.manifestKey) } as never,
+    });
+    expect(await pollPostgresStage({ sql, stage: "object-landed", deps })).toMatchObject({ claimed: 2, acked: 2, retried: 0, exhausted: 0 });
+    const { rows } = await db.query<{ stage: string; work_key: string }>("SELECT stage, work_key FROM sessions.pipeline_jobs ORDER BY id");
+    expect(rows.map((r) => r.stage)).toEqual(["session-indexed", "session-indexed"]);
+    expect(rows.map((r) => r.work_key).sort()).toEqual([migratedKey, liveKey].sort());
+    expect(await pollPostgresStage({ sql, stage: "session-indexed", deps })).toMatchObject({ claimed: 2, acked: 2, exhausted: 0 });
+    expect(indexed.sort()).toEqual([manifestKey(LOCATION), manifestKey(liveLocation)].sort());
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+    expect(await deadLetters.list({ stage: "object-landed" })).toEqual([]);
+    const { rows: errors } = await db.query("SELECT 1 FROM sessions.pipeline_events WHERE error->>'code' = 'invalid_work_key' OR status IN ('error', 'dead_lettered')");
+    expect(errors).toHaveLength(0);
   });
 
   test("signed work key and durable audit: posted fields cannot alter the work key; one audit row per commit, no secrets", async () => {
