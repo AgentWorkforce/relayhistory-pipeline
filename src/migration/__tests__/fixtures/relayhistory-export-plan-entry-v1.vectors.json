@@ -271,5 +271,18 @@
       },
       "expect": "migration_upload_forbidden"
     }
-  ]
+  ],
+  "work_keys": [
+    {
+      "key": "v1/ws=ws_synthetic/m=machine-a/h=claude/d=2026/10/25/s=session-a/manifest.json",
+      "entry_sha256": "89619b0b561b6867ac663a71748855c50b9f1cebc47941e9ae6bc066bdbbdb79",
+      "work_key": "v1/ws=ws_synthetic/m=machine-a/h=claude/d=2026/10/25/s=session-a/manifest.json@89619b0b561b6867ac663a71748855c50b9f1cebc47941e9ae6bc066bdbbdb79"
+    },
+    {
+      "key": "v1/ws=ws_synthetic/m=unknown-origin-42/h=codex/d=2026/01/02/s=019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18/manifest.json",
+      "entry_sha256": "b9b2c7501e295fe40d2b22be791ab99a22746800233f37b8f8104bd001c7676a",
+      "work_key": "v1/ws=ws_synthetic/m=unknown-origin-42/h=codex/d=2026/01/02/s=019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18/manifest.json@b9b2c7501e295fe40d2b22be791ab99a22746800233f37b8f8104bd001c7676a"
+    }
+  ],
+  "work_key_rule": "work_key = upload.key + \"@\" + upload.entry_sha256 (signed fields only; never the storage version or a posted value)"
 }
