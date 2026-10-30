@@ -9,7 +9,7 @@ import {
   copyTable,
   planTable,
   type Queryable,
-} from "../../../src/migration/relayhistory-copy.ts";
+} from "../../../src/migration/relayhistory-copy.js";
 
 const DDL = `CREATE SCHEMA sessions;
 CREATE TABLE sessions.tokens (
@@ -42,7 +42,7 @@ const insert = (db: PGlite, rows: string) =>
   );
 const dump = async (db: PGlite) =>
   (
-    await db.query(
+    await db.query<Record<string, unknown>>(
       `SELECT org_id, id::text, encode(secret, 'hex') AS secret, seen_local::text,
               seen_at::text, meta, tags, label, label_upper
          FROM sessions.tokens ORDER BY org_id, id`,

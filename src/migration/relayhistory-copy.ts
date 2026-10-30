@@ -21,7 +21,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import pg from "pg";
-import { quoteIdent } from "./relayhistory-verify.ts";
 
 export type CopyMode = "mirror" | "backfill";
 
@@ -50,6 +49,7 @@ export interface TableResult {
 }
 
 const SCHEMA = "sessions";
+const quoteIdent = (value: string) => `"${value.replaceAll('"', '""')}"`;
 const qualified = (table: string) => `${quoteIdent(SCHEMA)}.${quoteIdent(table)}`;
 
 async function keyColumns(db: Queryable, table: string): Promise<string[]> {
