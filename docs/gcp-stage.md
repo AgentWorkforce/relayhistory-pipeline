@@ -188,7 +188,9 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
   successful poster output, rather than a static `posted` flag.
   The PSA range is still shared with Memorystore.
 - Stack evaluation accepts `bulls96.enabled` only with the acknowledged managed
-  data plane. Nothing in that path has been applied.
+  data plane. An omitted or `enabled: false` bulls96 block does not throw and
+  does not install the release. `posted` stays false; the private Cloud SQL
+  body is sent only by the apply-time Action. Nothing in that path has been applied.
 
 Release wiring that has not been applied:
 

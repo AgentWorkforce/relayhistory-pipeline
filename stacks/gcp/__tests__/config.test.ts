@@ -28,6 +28,31 @@ const base: GcpInputs = {
 describe("GCP self-host contract", () => {
   it("accepts a substrate-only stage without pretending managed services are attached", () => {
     expect(() => assertGcpInputs("gcp-dev", base)).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable(base)).not.toThrow();
+  });
+
+  it("does not throw when bulls96 is disabled", () => {
+    const disabled = {
+      enabled: false,
+      chartVersion: "0.0.1",
+      tenantOrgId: "https://user:password@example.com",
+      existingSecretName: "not a secret name",
+      relayauthJwksUrl: "http://user:password@attacker.example/jwks?token=secret",
+    };
+    expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable({ ...base, bulls96: disabled })).not.toThrow();
+    expect(() =>
+      assertGcpRuntimeDeployable({
+        ...base,
+        bulls96: { ...disabled, enabled: true },
+      }),
+    ).toThrow(/acknowledged managed data plane/);
+    const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+    const start = stack.indexOf("const bulls96 = i.bulls96?.enabled");
+    const gate = stack.slice(start, stack.indexOf("return {", start));
+    expect(gate.startsWith("const bulls96 = i.bulls96?.enabled")).toBe(true);
+    expect(gate).toContain("96Bulls install requires the managed data plane");
+    expect(gate.trimEnd().endsWith(": null;")).toBe(true);
   });
 
   it("rejects any project, number, org, billing account, or region other than the approved target", () => {
