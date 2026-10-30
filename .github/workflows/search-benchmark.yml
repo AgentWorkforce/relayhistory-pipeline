@@ -18,6 +18,10 @@ jobs:
   benchmark:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scale: ${{ fromJSON(inputs.scale && format('["{0}"]', inputs.scale) || '["S", "M"]') }}
     services:
       postgres:
         # Supabase's current major.
@@ -44,12 +48,12 @@ jobs:
       - name: Benchmark (fails on any isolation or correctness failure)
         env:
           BENCH_PG_URL: postgres://postgres:benchmark-only@127.0.0.1:5432/postgres
-          BENCH_SCALE: ${{ inputs.scale || 'S' }}
+          BENCH_SCALE: ${{ matrix.scale }}
           BENCH_OUT: benchmark-report.json
         run: bun benchmarks/session-search/run.ts
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: search-benchmark-report
+          name: search-benchmark-report-${{ matrix.scale }}
           path: benchmark-report.json
           if-no-files-found: ignore

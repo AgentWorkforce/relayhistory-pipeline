@@ -14,7 +14,7 @@ BENCH_SCALE=S bun benchmarks/session-search/run.ts
 BENCH_PG_URL=postgres://postgres:pw@127.0.0.1:5432/postgres BENCH_SCALE=M bun benchmarks/session-search/run.ts
 ```
 
-The `search-benchmark` workflow runs scale S on Postgres 17 and uploads the report.
+The `search-benchmark` workflow runs scales S and M on Postgres 17 and uploads each report.
 
 ## Corpus
 
