@@ -6,6 +6,7 @@ import {
   migrationPairAuthorized,
   migrationSessionMatches,
   migrationUploadMatches,
+  migrationWorkKey,
   sqlMigrationAssertionLedger,
   type TransactionalSqlExecutor,
   type MigrationAssertionClaims,
@@ -224,10 +225,11 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
    * A migration assertion's manifest: the target workspace is the signed pair's
    * (403 migration_workspace_forbidden), and the upload identity recomputed
    * from this key and manifest (session, state, chunk list, content hash
-   * chain, entry digest) is the signed one, and 96bulls.user_id is the signed
-   * source user (403 migration_upload_forbidden). The work key is the signed
-   * manifest key plus the version the server read back itself (`read`),
-   * never a client-posted value.
+   * chain, entry digest) is the signed one, and the export marker's grant_id,
+   * plan_digest, source_user_id and 96bulls.user_id are present and equal to
+   * the signed values (403 migration_upload_forbidden). The copy the server
+   * reads back must pass the same checks; the work key is then
+   * `migrationWorkKey`: the signed key and entry digest.
    */
   const migrationManifestIssue = async (c: Context<AppEnv>, auth: Auth, location: NonNullable<ReturnType<typeof parseSessionKey>>, manifest: ManifestV1) => {
     if (!migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId, manifest.session.workspace_id] }))
@@ -328,6 +330,11 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       }
       const read = await deps.manifests.read(key);
       if (!read) throw new Error("manifest disappeared after write");
+      // The authoritative storage read must agree with what was verified.
+      if (migration) {
+        const issue = await migrationManifestIssue(c, auth, location, read.manifest);
+        if (issue) return issue;
+      }
       const built = buildObjectLandedMessage({
         landed: { key, provider: deps.manifests.provider, ...(deps.manifests.bucket ? { bucket: deps.manifests.bucket } : {}) },
         orgId: (c.get("auth") as Auth).orgId,
@@ -335,6 +342,8 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         read,
       });
       if (built.status !== "enqueue") return responseError(c, 400, "bad_request", "key is not a manifest");
+      // Signed-only work key for a migration commit: the signed key and entry digest.
+      if (migration) built.message.workKey = migrationWorkKey(migration.upload);
       if (migration) {
         // The ledger row and the enriched pipeline_jobs row commit in one SQL
         // transaction, or neither does (fail closed: 503, nothing consumed).

@@ -157,6 +157,12 @@ async function planned() {
         epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: 0, opened_by: LOCATION.machineId }],
         next_offset: sealed.entry.bytes, chunks: [sealed.entry], scrub: sealed.scrub,
       },
+      // The export's source fields, as the courier writes them; the ingest
+      // requires each to equal the signed values.
+      extensions: {
+        "96bulls": { session_uuid: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c19", session_uuid_source: "minted", tenant_id: ORG, user_id: USER },
+        "client.relayhistory_export": { version: 1, source: "neon.delivery_records", exported_at: AT, grant_id: GRANT, plan_digest: PLAN, source_user_id: USER },
+      },
     };
     const chunks = [{
       seq: 0, epoch: 0, start_offset: 0, bytes: SOURCE.byteLength,
@@ -199,8 +205,8 @@ describe("buildIngestApp auth (production composition)", () => {
     const commit = await i.commit(token, manifest);
     expect(commit.status).toBe(202);
     const body = (await commit.json()) as { workKey: string };
-    // The work key is <manifest key>@<object version>: the identity binds the manifest key.
-    expect(body.workKey.startsWith(`${upload.key}@`)).toBe(true);
+    // The work key is <signed manifest key>@<signed entry_sha256>.
+    expect(body.workKey).toBe(`${upload.key}@${upload.entry_sha256}`);
     expect(await count("sessions.migration_assertion_uses")).toBe(1);
     expect(await count("sessions.pipeline_jobs")).toBe(1);
     expect(await count("sessions.migration_assertion_chunks")).toBe(1);
@@ -245,7 +251,9 @@ describe("buildIngestApp auth (production composition)", () => {
       ["migration_upload_forbidden", 403, () => i.chunk(migrationToken(upload), LOCATION)],
       ["migration_upload_forbidden", 403, () => i.chunk(migrationToken(upload), LOCATION, { entry: entryText.replace('"closed"', '"open"') })],
       // Provenance: 96bulls.user_id must be the signed source user.
-      ["migration_upload_forbidden", 403, () => i.commit(migrationToken(upload), { ...manifest, extensions: { "96bulls": { user_id: "user_ingest_b" } } })],
+      ["migration_upload_forbidden", 403, () => i.commit(migrationToken(upload), { ...manifest, extensions: { ...manifest.extensions, "96bulls": { user_id: "user_ingest_b" } } })],
+      ["migration_upload_forbidden", 403, () => i.commit(migrationToken(upload), { ...manifest, extensions: undefined })],
+      ["migration_upload_forbidden", 403, () => i.commit(migrationToken(upload), { ...manifest, extensions: { "96bulls": manifest.extensions["96bulls"] } })],
       ["migration_upload_forbidden", 403, () => i.req(`/v1/pipeline/manifests/status?key=${encodeURIComponent(manifestKey(fresh))}`, migrationToken(upload))],
       ["migration_upload_forbidden", 403, () => i.commit(migrationToken(upload), { ...manifest, session: { ...manifest.session, machine_id: "machine-fresh" } }, manifestKey(fresh))],
       // Other content than the signed identity.
@@ -298,9 +306,10 @@ describe("buildIngestApp auth (production composition)", () => {
     });
     expect(commit.status).toBe(202);
     const { workKey, version } = (await commit.json()) as { workKey: string; version: { eTag?: string; version?: string } };
-    expect(workKey.startsWith(`${upload.key}@`)).toBe(true);
+    // Signed-only: the signed key and entry digest, not the storage version.
+    expect(workKey).toBe(`${upload.key}@${upload.entry_sha256}`);
     expect(workKey).not.toContain("attacker");
-    expect(workKey.endsWith(String(version.version ?? version.eTag).replace(/"/g, ""))).toBe(true);
+    expect(workKey).not.toContain(String(version.version ?? version.eTag).replace(/"/g, ""));
     expect(await count("sessions.migration_ingest_audit")).toBe(auditBefore + 1);
     const { rows } = await db.query<Record<string, unknown>>("SELECT * FROM sessions.migration_ingest_audit ORDER BY id DESC LIMIT 1");
     expect(rows[0]).toMatchObject({ grant_id: GRANT, plan_digest: PLAN, entry_sha256: upload.entry_sha256, work_key: workKey, user_id: USER, result: "committed" });

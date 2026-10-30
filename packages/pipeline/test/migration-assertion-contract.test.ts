@@ -13,6 +13,7 @@ import {
   derivePlanEntry,
   exportPlanDigest,
   migrationSessionMatches,
+  migrationWorkKey,
   normalizeRelayId,
   parseUploadIdentity,
   planEntrySha256,
@@ -35,6 +36,7 @@ const vectors = JSON.parse(
   plan: { canonical_json: string; plan_digest: string };
   upload_identities: UploadIdentity[];
   negative: { name: string; upload: UploadIdentity; request_key?: string; sponsor_id?: string; expect: string }[];
+  work_keys: { key: string; entry_sha256: string; work_key: string }[];
 };
 
 /** The auth context the verifier would set for an assertion signing `upload`. */
@@ -48,7 +50,7 @@ function authFor(upload: UploadIdentity, sponsorId = upload.source_user_id) {
   };
 }
 
-describe("export plan entry contract v1 (vectors)", () => {
+describe("export plan entry contract v1 (vectors; relayauth #111 @2adf414a reproduces them)", () => {
   it("reproduces every entry, identity and the plan digest", async () => {
     for (const [i, vector] of vectors.entries.entries()) {
       expect(await computeContentSha256(vector.entry.chunks)).toBe(vector.entry.content_sha256);
@@ -89,6 +91,15 @@ describe("export plan entry contract v1 (vectors)", () => {
       }
       const location = parseSessionKey(negative.request_key ?? negative.upload.key)!;
       expect(migrationSessionMatches(authFor(negative.upload, negative.sponsor_id), location), negative.name).toBe(false);
+    }
+  });
+
+  it("derives the work key from signed fields only: <key>@<entry_sha256>", () => {
+    expect(vectors.work_keys).toHaveLength(vectors.upload_identities.length);
+    for (const [i, w] of vectors.work_keys.entries()) {
+      const upload = vectors.upload_identities[i]!;
+      expect(w).toEqual({ key: upload.key, entry_sha256: upload.entry_sha256, work_key: `${upload.key}@${upload.entry_sha256}` });
+      expect(migrationWorkKey(upload)).toBe(w.work_key);
     }
   });
 

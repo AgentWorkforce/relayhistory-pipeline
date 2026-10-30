@@ -160,8 +160,8 @@ async function fixture(options: { ledger?: MigrationAssertionLedger | null } = {
       next_offset: sealed.entry.bytes, chunks: [sealed.entry], scrub: sealed.scrub,
     },
     extensions: {
-      "96bulls": { session_uuid: UUID, session_uuid_source: "minted", ...ext },
-      "client.relayhistory_export": { version: 1, source: "neon.delivery_records", exported_at: AT },
+      "96bulls": { session_uuid: UUID, session_uuid_source: "minted", user_id: USER, ...ext },
+      "client.relayhistory_export": { version: 1, source: "neon.delivery_records", exported_at: AT, grant_id: GRANT, plan_digest: PLAN, source_user_id: USER },
     },
   });
   const key = manifestKey(location);
@@ -342,6 +342,40 @@ describe("AlleyOop manifest route: migration assertions", () => {
     expect(await count("sessions.pipeline_jobs")).toBe(0);
     expect(await f.store.head(objectKey(f.key))).toBeUndefined();
     expect(await f.store.head(objectKey(freshKey))).toBeUndefined();
+  });
+
+  test("provenance: the export marker's grant_id, plan_digest, source_user_id and 96bulls.user_id are required and equal to the signed values", async () => {
+    const f = await fixture();
+    const good = await f.build();
+    const marker = good.extensions!["client.relayhistory_export"] as Record<string, unknown>;
+    const ext96 = good.extensions!["96bulls"] as Record<string, unknown>;
+    const without = (r: Record<string, unknown>, k: string) => { const c = { ...r }; delete c[k]; return c; };
+    const cases: [string, Record<string, unknown> | undefined][] = [
+      ["no extensions", undefined],
+      ["no export marker", { "96bulls": ext96 }],
+      ["marker without grant_id", { "96bulls": ext96, "client.relayhistory_export": without(marker, "grant_id") }],
+      ["marker without plan_digest", { "96bulls": ext96, "client.relayhistory_export": without(marker, "plan_digest") }],
+      ["marker without source_user_id", { "96bulls": ext96, "client.relayhistory_export": without(marker, "source_user_id") }],
+      ["marker with another grant_id", { "96bulls": ext96, "client.relayhistory_export": { ...marker, grant_id: `mgr_${"f".repeat(32)}` } }],
+      ["marker with another plan_digest", { "96bulls": ext96, "client.relayhistory_export": { ...marker, plan_digest: OTHER_PLAN } }],
+      ["marker with another source_user_id", { "96bulls": ext96, "client.relayhistory_export": { ...marker, source_user_id: "user_b" } }],
+      ["no 96bulls extension", { "client.relayhistory_export": marker }],
+      ["96bulls without user_id", { "client.relayhistory_export": marker, "96bulls": without(ext96, "user_id") }],
+      ["96bulls with another user_id", { "client.relayhistory_export": marker, "96bulls": { ...ext96, user_id: "user_b" } }],
+    ];
+    for (const [name, extensions] of cases) {
+      const manifest = { ...good } as Record<string, unknown>;
+      if (extensions === undefined) delete manifest.extensions;
+      else manifest.extensions = extensions;
+      const response = await f.post(f.as(), manifest);
+      expect(`${name}: ${response.status} ${await code(response)}`).toBe(`${name}: 403 migration_upload_forbidden`);
+    }
+    expect(await count("sessions.migration_assertion_uses")).toBe(0);
+    expect(await f.store.head(objectKey(f.key))).toBeUndefined();
+    const ok = await f.post(f.as(), good);
+    expect(ok.status).toBe(202);
+    // The work key is the signed key and entry digest.
+    expect(((await ok.json()) as { workKey: string }).workKey).toBe(`${f.upload.key}@${f.upload.entry_sha256}`);
   });
 
   test("normalizes relay_ consistently: prefixed signed claims match the canonical identity", async () => {

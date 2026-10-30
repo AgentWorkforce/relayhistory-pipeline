@@ -1,12 +1,16 @@
 /**
  * RelayAuth migration assertions (`POST /v1/tokens/migration-assertion`;
- * relayauth #110, with the signed `meta.upload` identity from relayauth #111)
+ * relayauth #110, with the signed `meta.upload` identity from relayauth #111
+ * @2adf414a7767d8cc3e268c6a4bb790d27447e9e4)
  * at the ingest. RelayAuth records neither `jti` nor `nonce`, so this service
  * makes each assertion single-use: chunk requests may reuse it (bounded, see
  * below) until it is consumed, and the manifest commit consumes it once.
  *
  * Authorization comes from the signed assertion itself, never from echoed
- * request or manifest fields, and never from a membership lookup:
+ * request or manifest fields, and never from a membership lookup. Live
+ * workspace membership is NOT checked here: the grant operator checks it when
+ * creating the grant, and relayauth #111 (pinned @2adf414a) mints only for
+ * the grant's stored (source user, workspace) pairs:
  *  - the signed `wks` equals `meta.workspaceId` and the signed `sponsorId`
  *    equals `meta.sourceUserId` (else 403 `migration_workspace_forbidden`);
  *  - the signed `meta.upload` (an `UploadIdentity` relayauth #111 derives
@@ -25,10 +29,12 @@
  *     - status: the requested key, machine, harness, session and date;
  *     - commit: the plan entry derived from the key and the manifest (chunk
  *       list, content hash chain, session, state) must hash to the signed
- *       `entry_sha256`, and the 96Bulls extension's `user_id` must be the
- *       signed source user (`migrationManifestProvenance`). The work key is
- *       the signed manifest key plus the storage version the server read
- *       itself (never a client-posted etag or version);
+ *       `entry_sha256`, and the manifest's export marker (`grant_id`,
+ *       `plan_digest`, `source_user_id`) and `96bulls.user_id` must be present
+ *       and equal to the signed values (`migrationManifestProvenance`). The
+ *       server reads the manifest back from storage and verifies that copy;
+ *       the work key is `migrationWorkKey`: the signed key and entry digest
+ *       (never the storage version or a client-posted value);
  *  - the grant and its plan must be one this ingest accepts
  *    (`RELAYHISTORY_MIGRATION_GRANTS`, else 403 `migration_grant_forbidden`).
  *
@@ -656,23 +662,47 @@ export async function migrationChunkMatches(
 }
 
 /**
- * Manifest provenance beyond the entry digest: the chunk list, content,
- * session, state, key, grant, plan and tenancy are already bound by
- * `migrationUploadMatches` (entry_sha256, sameTenancy). What remains is the
- * 96Bulls extension's `user_id`, which the pipeline reads as the session's
- * user: when present it must be the signed canonical source user. Returns
- * the problem, or `undefined`.
+ * The pipeline work key of a migration commit: the SIGNED manifest key and
+ * the SIGNED entry digest, `${upload.key}@${upload.entry_sha256}`. Nothing
+ * client-posted and not the storage version feed it (the server still reads
+ * the manifest back and verifies it before enqueueing). A retry of the same
+ * planned upload with a fresh assertion has the same work key.
+ */
+export function migrationWorkKey(
+  upload: Pick<UploadIdentity, "key" | "entry_sha256">,
+): string {
+  return `${upload.key}@${upload.entry_sha256}`;
+}
+
+/**
+ * Manifest provenance beyond the entry digest (which already binds the chunk
+ * list, content, session, state, key, grant, plan and tenancy): the manifest's
+ * own source fields must be present and equal to the signed values.
+ *  - `extensions["client.relayhistory_export"]`: `grant_id` = the signed
+ *    grant, `plan_digest` = the signed plan digest, `source_user_id` = the
+ *    signed canonical source user;
+ *  - `extensions["96bulls"].user_id` (the session's user downstream) = the
+ *    signed canonical source user.
+ * Missing or different is a refusal. Returns the problem, or `undefined`.
  */
 export function migrationManifestProvenance(
   auth: Pick<AuthContext, "claims" | "migration">,
   manifest: { extensions?: Record<string, unknown> | undefined },
 ): string | undefined {
   const tenancy = signedTenancy(auth);
-  if (!tenancy) return "no signed tenancy";
+  const upload = auth.migration?.upload;
+  if (!tenancy || !upload) return "no signed tenancy";
+  const marker = manifest.extensions?.["client.relayhistory_export"];
+  if (!isRecord(marker)) return "the export marker is missing";
+  if (marker.grant_id !== upload.grant_id)
+    return "export marker grant_id is not the signed grant";
+  if (marker.plan_digest !== upload.plan_digest)
+    return "export marker plan_digest is not the signed plan";
+  if (marker.source_user_id !== tenancy.source_user_id)
+    return "export marker source_user_id is not the signed source user";
   const ext = manifest.extensions?.["96bulls"];
-  if (ext === undefined) return undefined;
-  if (!isRecord(ext)) return "96bulls extension is malformed";
-  if (ext.user_id !== undefined && ext.user_id !== tenancy.source_user_id)
+  if (!isRecord(ext)) return "the 96bulls extension is missing";
+  if (ext.user_id !== tenancy.source_user_id)
     return "96bulls.user_id is not the signed source user";
   return undefined;
 }

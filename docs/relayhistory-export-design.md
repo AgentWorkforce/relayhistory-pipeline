@@ -121,7 +121,10 @@ manifest body.
   - **Routes:** only `POST /v1/pipeline/chunks`, `POST /v1/pipeline/manifests`
     and `GET /v1/pipeline/manifests/status` (anything else is 403
     `migration_assertion_route`).
-  - **Identity:** the assertion carries an issuer-derived `meta.upload`. The
+  - **Membership:** the ingest does not look up live workspace membership.
+    The grant operator checks it when creating the grant, and relayauth
+    #111 (@2adf414a) mints only for the grant's stored pairs.
+  - **Identity:** the assertion carries an issuer-derived `meta.upload` (relayauth #111 @2adf414a). The
     ingest recomputes it from the actual request (key, machine, session,
     content, entry digest) and compares (else 403
     `migration_upload_forbidden`). The signed pair must also be the grant

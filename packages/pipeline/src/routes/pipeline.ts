@@ -35,6 +35,7 @@ import {
   migrationPairAuthorized,
   migrationSessionMatches,
   migrationUploadMatches,
+  migrationWorkKey,
   PLAN_ENTRY_LENGTH_HEADER,
   type MigrationAssertionLedger,
   type MigrationChunkResult,
@@ -549,10 +550,10 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
         return uploadForbidden(c);
       if (migrationManifestProvenance(auth, manifest))
         return uploadForbidden(c);
-      // Signed-only work-key inputs: the key is the signed manifest key, and
-      // the version must be the one the server read from storage, never a
-      // client-posted etag or version.
+      // The manifest must be the copy the server read from storage (the one
+      // just verified); the work key is then derived from signed fields only.
       if (!reader) return storageReadRequired(c);
+      built.message.workKey = migrationWorkKey(auth.migration.upload);
       // The commit's only durable write is the enqueue: the ledger consumes the
       // assertion and enqueues as one unit, so neither lands without the other.
       // A failure leaves nothing consumed, and the upload may be retried.

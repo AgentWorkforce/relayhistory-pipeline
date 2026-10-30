@@ -2,7 +2,7 @@
 
 Status: **binding proposal, code only** (helm-chart-chief contract decision, E3). It is shared by:
 
-- **relayauth #110 with #111**, the issuer. #111 (`fix(migration): bind grants to canonical upload pairs`, at `c55f1b0b`) stores the plan, derives `meta.upload` and signs it. Its `deriveMigrationGrantPlan` and `migrationUploadIdentity` reproduce these vectors' `plan_digest` and every upload identity byte for byte (checked against `c55f1b0b`). Its verifier also accepts exactly these nine identity fields, as the ingests do.
+- **relayauth #110 with #111**, the issuer, pinned at **#111 @ `2adf414a7767d8cc3e268c6a4bb790d27447e9e4`** (SOC2 code/control pass). #111 stores the plan, derives `meta.upload` and signs it. Its `deriveMigrationGrantPlan` and `migrationUploadIdentity` at that head reproduce these vectors' `plan_digest` and every upload identity byte for byte (checked by running them against this file). Its verifier also accepts exactly these nine identity fields, as the ingests do.
 - **The #40 courier**: `derivePlanContract`, the mint request's `upload`.
 - **Both ingests**, which recompute the identity from the actual request:
   - relayhistory-cloud #228;
@@ -67,11 +67,14 @@ It binds:
 - The issuer looks the key up in the grant's stored plan. It refuses when there is no such entry, or when the entry's `(source_user_id, workspace_id)` is not the requested pair. Otherwise it derives the whole upload identity above from that entry and signs it as `meta.upload`.
 - The courier never supplies the other identity fields.
 
-## Work key
+## Work key (changed)
 
-- The identity's `key` is the **manifest key**.
-- The pipeline work key is `<manifest key>@<object version>`. Storage assigns the version at write time, so no issuer can bind it.
-- The commit response's `workKey` starts with `key + "@"`. The courier may check this. The ingest test `buildIngestApp ... accepted under its full contract` asserts it.
+- The pipeline work key of a migration commit is **`upload.key + "@" + upload.entry_sha256`**: the signed manifest key and the signed entry digest. Both come from `meta.upload`.
+- It is **not** the storage version. It used to be `<manifest key>@<object version>`; that changed.
+- The server still reads the manifest back from storage. That copy must pass the same identity and provenance checks before anything is enqueued, but its version is not an identity input.
+- A posted `etag`, `version` or `previousVersion` never feeds the work key.
+- A retry of the same planned upload, even under a fresh assertion, has the same work key.
+- **The courier:** the commit response's `workKey` equals `upload.key + "@" + upload.entry_sha256`, exactly. The vectors list it under `work_keys`.
 
 ## What the ingest recomputes (never an echoed field)
 
@@ -83,6 +86,18 @@ It binds:
 | `POST /v1/pipeline/manifests` | the plan entry derived from the key and the validated manifest (session, state, chunk list, content recomputed over the chunks) | `upload.session`, `content_sha256`, `entry_sha256` |
 
 Any difference is **403 `migration_upload_forbidden`**. A fresh machine key, a fresh session key, other content, or another user's upload cannot match.
+
+## What the ingest checks, and what it does not
+
+- The ingest authorizes **only from the signed assertion**:
+  - signature, issuer, origin-bound audience, class, scope, lifetime and 5 s skew;
+  - signed `wks` and `sponsorId` equal to the grant pair `meta.workspaceId` and `meta.sourceUserId`;
+  - the grant and plan listed in `RELAYHISTORY_MIGRATION_GRANTS`;
+  - the signed `meta.upload` identity recomputed from the actual request;
+  - single use.
+- It does **not** look up live workspace membership.
+- Whether the source user belongs to the workspace is the **grant operator's responsibility when the grant is created**. RelayAuth #111 then mints only for the exact `(source_user_id, workspace_id)` pairs stored in that grant's plan.
+- A membership change after the grant is created is not seen by the ingest. Revoking the grant (or removing it from `RELAYHISTORY_MIGRATION_GRANTS`) is the control.
 
 ## Chunk requests carry their plan entry
 
@@ -97,8 +112,13 @@ Any difference is **403 `migration_upload_forbidden`**. A fresh machine key, a f
 
 ## Manifest provenance and the work key
 
-- **Provenance:** the chunk list, digests, session, state, key, grant, plan and tenancy are bound by `entry_sha256` and the signed tenancy. A manifest with an extra or missing chunk cannot match. The 96Bulls extension's `user_id`, when present, must be the signed canonical source user.
-- **Work key:** it is the signed manifest key plus the version the ingest read back from storage itself. A posted `etag`, `version` or `previousVersion` never feeds it, and a deployment that cannot read storage refuses migration commits (503 `migration_storage_read_required`).
+- **Provenance:** the chunk list, digests, session, state, key, grant, plan and tenancy are bound by `entry_sha256` and the signed tenancy. A manifest with an extra or missing chunk cannot match.
+- **Required source fields:** the manifest must carry:
+  - `extensions["client.relayhistory_export"]` with `grant_id`, `plan_digest` and `source_user_id`;
+  - `extensions["96bulls"].user_id`.
+
+  Each must be present and equal to the signed grant, plan digest and canonical source user. Missing or different is 403 `migration_upload_forbidden`.
+- **Work key:** see "Work key (changed)" above. A deployment that cannot read storage refuses migration commits (503 `migration_storage_read_required`).
 
 ## Audit
 
