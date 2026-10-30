@@ -62,6 +62,7 @@ export const GCP_RUNTIME_SHAPE = {
 /** Node identity only. Not the Workload Identity runtime account, and not a key. */
 export const GCP_NODE_ROLES = [
   "roles/container.defaultNodeServiceAccount",
+  "roles/artifactregistry.reader",
 ] as const;
 
 export interface CapturedRelaycastChartPackage {
@@ -180,8 +181,6 @@ export interface GcpInputs {
     chartVersion: string;
     tenantOrgId: string;
     existingSecretName: string;
-    /** Pre-created dockerconfigjson Secret for the private published image. */
-    imagePullSecretName: string;
     /** Digest of the services image built from the reviewed runtime commit. */
     imageDigest: string;
     /** Full Git revision from which imageDigest was built. Must match versions.lock.json. */
@@ -353,7 +352,6 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(inputs.bulls96.tenantOrgId))
       throw new Error("96bulls: bulls96.tenantOrgId must be an org id, never a URL or credential");
     requireSecretName("bulls96.existingSecretName", inputs.bulls96.existingSecretName);
-    requireSecretName("bulls96.imagePullSecretName", inputs.bulls96.imagePullSecretName);
     if (!/^sha256:[a-f0-9]{64}$/.test(inputs.bulls96.imageDigest))
       throw new Error("96bulls: bulls96.imageDigest must be an immutable sha256 digest");
     if (!/^[a-f0-9]{40}$/.test(inputs.bulls96.imageSourceRevision))
@@ -461,6 +459,8 @@ export function relayfileChartValues(i: RelayfileChartInputs) {
 export interface Bulls96ReleaseOutputs {
   bucket: unknown;
   region: string;
+  /** Digest-pinned repository in the stage's private Artifact Registry. */
+  imageRepository: unknown;
   cloudSqlConnectionName: unknown;
   redisHost: unknown;
   redisPort: unknown;
@@ -551,6 +551,7 @@ export function bulls96ReleaseValues(
   for (const [label, value] of [
     ["bucket", managed.bucket],
     ["region", managed.region],
+    ["imageRepository", managed.imageRepository],
     ["cloudSqlConnectionName", managed.cloudSqlConnectionName],
     ["redisHost", managed.redisHost],
     ["pubsubTopic", managed.pubsubTopic],
@@ -584,13 +585,14 @@ export function bulls96ReleaseValues(
     credentials: { mode: "podIdentity" as const },
   });
   const hoopdb = () => ({ existingSecret: i.existingSecretName, key: "HOOPDB_URL" });
-  const imagePullSecrets = [{ name: i.imagePullSecretName }];
+  const imagePullSecrets: Array<{ name: string }> = [];
+  const image = { repository: managed.imageRepository, digest: i.imageDigest };
   return {
     global: { tenant: { orgId: i.tenantOrgId } },
     worker: {
       existingSecret: i.existingSecretName,
       imagePullSecrets,
-      image: { digest: i.imageDigest },
+      image,
       hoopdb: hoopdb(),
       locker: locker(),
       lockerInit: { enabled: false },
@@ -603,7 +605,7 @@ export function bulls96ReleaseValues(
     alleyoop: {
       existingSecret: i.existingSecretName,
       imagePullSecrets,
-      image: { digest: i.imageDigest },
+      image,
       hoopdb: hoopdb(),
       locker: locker(),
       auth: { jwksUrl: i.relayauthJwksUrl, issuer: i.relayauthIssuer },

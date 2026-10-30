@@ -169,7 +169,6 @@ To request the application release after its external Secrets exist, set
   "chartVersion": "0.3.0",
   "tenantOrgId": "org_replace_me",
   "existingSecretName": "96bulls-runtime",
-  "imagePullSecretName": "ghcr-pull",
   "imageDigest": "sha256:<digest-built-from-the-reviewed-main-commit>",
   "imageSourceRevision": "<full-40-character-reviewed-main-commit>",
   "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
@@ -178,7 +177,10 @@ To request the application release after its external Secrets exist, set
 ```
 
 Those are names and identifiers only. Secret payloads never belong in this
-file or Helm values.
+file or Helm values. The stage uses its private Artifact Registry repository
+for the digest-pinned services image, and the GKE node identity receives
+read-only Artifact Registry access. No GHCR pull token or dockerconfigjson
+Secret is used or required for that path.
 
 The digest and source revision must exactly match the structured services
 release in `versions.lock.json`, and that release must set
