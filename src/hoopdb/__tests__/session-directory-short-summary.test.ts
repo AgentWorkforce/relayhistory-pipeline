@@ -28,6 +28,7 @@ import {
 } from "../search-query.ts";
 import type { HoopDb } from "../../shared/db.ts";
 import { hoopDbSessionIndex } from "../index.ts";
+import { projectSessionDirectory } from "../session-directory-projector.ts";
 import {
   SESSION_DIRECTORY_SEARCH_BOUNDARY,
   SESSION_DIRECTORY_SEARCH_RPC,
@@ -669,12 +670,16 @@ describe("short_summary end to end through the pipeline", () => {
     extensions: { "96bulls": { session_uuid: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c19", session_uuid_source: "minted" } },
   }) as unknown as ManifestV1;
 
-  test("indexer projects the row, Bob Costas writes the scrubbed summary, the RPC is tenant-bound, deletion clears it", async () => {
+  async function pipeline() {
     const db = await hoopDatabase();
     const q = async (text: string, params?: unknown[]) => ({ rows: (await db.query(text, params as never)).rows as never[] });
     const hoop = { query: q, pool: { connect: async () => ({ query: q, release() {} }) }, end: async () => {} } as unknown as HoopDb;
     const m = manifest();
-    const reader = { provider: "fs", bucket: "locker", read: async () => ({ manifest: m, etag: "e1" }) } as never;
+    // A second machine of the same logical session has its own manifest and uuid.
+    const m2 = { ...m, session: { ...m.session, machine_id: "m-2" },
+      extensions: { "96bulls": { session_uuid: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c1a", session_uuid_source: "minted" } } } as unknown as ManifestV1;
+    const reader = { provider: "fs", bucket: "locker",
+      read: async (key: string) => ({ manifest: key.includes("/m=m-2/") ? m2 : m, etag: "e1" }) } as never;
     const pointer = { traceId: m.trace_id, workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e",
       manifestKey: "v1/ws=ws-e2e/m=m-1/h=codex/d=2026/10/29/s=s-e2e/manifest.json", provider: "fs", bucket: "locker" };
     const ctx = { traceId: m.trace_id, orgId: "org-a", workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e" };
@@ -683,7 +688,19 @@ describe("short_summary end to end through the pipeline", () => {
       db: hoop, reader, queue: { backend: "memory", send: async (msg: unknown) => { sent.push(msg); }, sendBatch: async () => {} } as never,
       current: () => undefined,
     });
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "g6-e2e-")) });
+    const line = JSON.stringify({ type: "user", message: { role: "user", content: `Fix the pelican ledger; token ${FAKE_RELAY_TOKEN}` } });
+    await store.put(rawChunkKey({ workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e", startDate: "2026-10-29" },
+      0, 0, "22222222", "jsonl"), zstdCompressSync(Buffer.from(`${line}\n`)));
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    const summaryShort = (directory?: Parameters<typeof bobCostasHandler>[1]["directory"]) =>
+      bobCostasHandler("short", { db: hoop, reader, store, summarizer: extractiveSummarizer, keyring, ...(directory ? { directory } : {}) })(
+        { payload: pointer, ctx: { orgId: "org-a" } } as never, { log: { info() {} } } as never);
+    return { db, hoop, index, pointer, ctx, sent, summaryShort };
+  }
 
+  test("indexer projects the row, Bob Costas writes the scrubbed summary, the RPC is tenant-bound, deletion clears it", async () => {
+    const { db, index, pointer, ctx, sent, summaryShort } = await pipeline();
     // 1. Projector create path: the indexer writes session_index and the directory row.
     await index.upsertRawPointer(pointer as never, ctx as never);
     let current = await row(db, "s-e2e");
@@ -696,13 +713,7 @@ describe("short_summary end to end through the pipeline", () => {
     await summarize(db, { orgId: "org-b", workspaceId: "ws-e2e", harness: "codex", sessionId: "s-e2e-b" }, "pelican ledger for org b");
 
     // 2. Bob Costas short summary over the scrubbed raw: the real production callsite.
-    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "g6-e2e-")) });
-    const line = JSON.stringify({ type: "user", message: { role: "user", content: `Fix the pelican ledger; token ${FAKE_RELAY_TOKEN}` } });
-    await store.put(rawChunkKey({ workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e", startDate: "2026-10-29" },
-      0, 0, "22222222", "jsonl"), zstdCompressSync(Buffer.from(`${line}\n`)));
-    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
-    await bobCostasHandler("short", { db: hoop, reader, store, summarizer: extractiveSummarizer, keyring })(
-      { payload: pointer, ctx: { orgId: "org-a" } } as never, { log: { info() {} } } as never);
+    await summaryShort();
     current = await row(db, "s-e2e");
     expect(String(current?.short_summary)).toContain("pelican ledger");
     expect(String(current?.short_summary)).not.toContain(FAKE_RELAY_TOKEN);
@@ -732,6 +743,76 @@ describe("short_summary end to end through the pipeline", () => {
     // A later manifest for the deleted session does not resurrect the row.
     await index.upsertRawPointer(pointer as never, ctx as never);
     expect((await row(db, "s-e2e"))?.deleted_at).not.toBeNull();
+  }, 60_000);
+
+  test("deleting every pointer tombstones the row, deletes memberships, and the RPC returns nothing", async () => {
+    const { db, index, pointer, ctx, summaryShort } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    const second = { ...pointer, machineId: "m-2", manifestKey: pointer.manifestKey.replace("/m=m-1/", "/m=m-2/") };
+    await index.upsertRawPointer(second as never, { ...ctx, machineId: "m-2" } as never);
+    await summaryShort();
+    let current = await row(db, "s-e2e");
+    expect(current?.machine_ids).toEqual(["m-1", "m-2"]);
+    expect(String(current?.short_summary)).toContain("pelican ledger");
+    const members = async () => (await db.query(
+      `SELECT 'u' FROM sessions.session_directory_users WHERE session_id = 's-e2e'
+       UNION ALL SELECT 'm' FROM sessions.session_directory_machines WHERE session_id = 's-e2e'`)).rows.length;
+    expect(await members()).toBe(3); // one user ("unknown"), two machines
+    const a = claims("org-a", ["ws-e2e"]);
+    expect(await search(db, a, "ws-e2e", "pelican")).toHaveLength(1);
+
+    await index.upsertRawPointer({ ...pointer, deleted: true } as never, ctx as never);
+    current = await row(db, "s-e2e");
+    expect(current?.deleted_at).toBeNull();
+    expect(current?.short_summary).toBeNull();
+    expect(current?.machine_ids).toEqual(["m-2"]);
+    expect(await search(db, a, "ws-e2e", "pelican")).toEqual([]);
+
+    await index.upsertRawPointer({ ...second, deleted: true } as never, { ...ctx, machineId: "m-2" } as never);
+    current = await row(db, "s-e2e");
+    expect(current?.deleted_at).not.toBeNull();
+    expect(current?.short_summary).toBeNull();
+    expect(current?.search_text).toBe("");
+    expect(current?.machine_ids).toEqual([]);
+    expect(current?.user_ids).toEqual([]);
+    expect(await members()).toBe(0);
+    for (const term of ["pelican", "ledger", "codex", "s-e2e"]) expect(await search(db, a, "ws-e2e", term)).toEqual([]);
+
+    // The projector alone also tombstones when no live pointer remains.
+    await insertRow(db, "org-a", "ws-e2e", "s-orphan");
+    expect(await projectSessionDirectory(db, { orgId: "org-a", workspaceId: "ws-e2e", harness: "codex", sessionId: "s-orphan" }))
+      .toEqual({ projected: false, tombstoned: true });
+    expect((await row(db, "s-orphan"))?.deleted_at).not.toBeNull();
+    expect(await search(db, a, "ws-e2e", "flaky")).toEqual([]);
+  }, 60_000);
+
+  test("re-running summary-short after directory.write throws is idempotent", async () => {
+    const { db, index, pointer, ctx, summaryShort } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    const failing = {
+      write: async () => { throw new Error("directory unavailable"); },
+      clear: async () => false,
+      hasSummary: async () => false,
+    };
+    // First run publishes the encrypted object and pointer, then fails on the directory.
+    await expect(summaryShort(failing)).rejects.toThrow("directory unavailable");
+    expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
+    const pointers = await db.query("SELECT status FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'");
+    expect(pointers.rows).toEqual([{ status: "ready" }]);
+
+    // The retry sees a current summary and reconciles the directory from the object.
+    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    const first = await row(db, "s-e2e");
+    expect(String(first?.short_summary)).toContain("pelican ledger");
+    expect(String(first?.short_summary)).not.toContain(FAKE_RELAY_TOKEN);
+    expect(String(first?.search_text)).toContain("pelican ledger");
+
+    // Further reruns change nothing.
+    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    const again = await row(db, "s-e2e");
+    expect(again?.short_summary).toBe(first?.short_summary);
+    expect(again?.short_summary_generated_at).toEqual(first?.short_summary_generated_at);
+    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toHaveLength(1);
   }, 60_000);
 });
 

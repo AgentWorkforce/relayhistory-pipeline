@@ -27,6 +27,7 @@ import {
 } from "../hoopdb/session-directory-summary.ts";
 import {
   clearSummaryObject,
+  readSummaryObject,
   summaryObjectKey,
   writeSummaryObject,
   type SummaryKind,
@@ -50,13 +51,46 @@ export interface BobCostasDeps {
 export interface ShortSummaryDirectory {
   write(input: ShortSummaryInput): Promise<{ written: boolean }>;
   clear(key: SessionDirectoryKey): Promise<boolean>;
+  /** Whether the live directory row already holds a short summary. */
+  hasSummary(key: SessionDirectoryKey): Promise<boolean>;
 }
 
 export function sqlShortSummaryDirectory(db: HoopDb): ShortSummaryDirectory {
   return {
     write: (input) => writeShortSummary(db, input),
     clear: (key) => clearShortSummary(db, key),
+    async hasSummary(key) {
+      const { rows } = await db.query<{ present: boolean }>(
+        `SELECT true AS present FROM sessions.session_directory
+          WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4
+            AND deleted_at IS NULL AND short_summary IS NOT NULL`,
+        [key.orgId, key.workspaceId, key.harness, key.sessionId],
+      );
+      return rows.length > 0;
+    },
   };
+}
+
+/**
+ * Publish (or clear) the directory short summary. Idempotent: writeShortSummary only
+ * replaces an older-or-equal generated_at, clearShortSummary is a no-op when empty.
+ */
+async function publishShortSummary(
+  directory: ShortSummaryDirectory,
+  key: SessionDirectoryKey,
+  ready: { summary: string; model: string; generatedAt: Date } | null,
+  traceId: string,
+): Promise<void> {
+  if (!ready) {
+    await directory.clear(key);
+    return;
+  }
+  try {
+    await directory.write({ ...key, summary: ready.summary, source: `bob-costas/${ready.model}`, generatedAt: ready.generatedAt });
+  } catch (err) {
+    if (!(err instanceof ShortSummaryRejected)) throw err;
+    log.info("short summary not projected", { stage: "summary-short", reason: err.reason, trace_id: traceId });
+  }
 }
 
 /** SHA-256 of the manifest as indexed: the `summary-manifest` fence for the object. */
@@ -108,8 +142,11 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
     const m = read.manifest;
     const s = m.session;
     const pk = [message.ctx.orgId, s.workspace_id, s.harness, s.session_id, s.machine_id];
-    const existing = await deps.db.query<{ content_sha256: string; revision: string; status: string; key_id: string | null }>(
-      `SELECT content_sha256, revision, status, key_id FROM sessions.session_summaries
+    const existing = await deps.db.query<{
+      content_sha256: string; revision: string; status: string; key_id: string | null;
+      object_key: string | null; object_sha256: string | null;
+    }>(
+      `SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries
         WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
       [...pk, kind],
     );
@@ -119,8 +156,26 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
     // Current only if it is the same revision and content and, when ready, under the current key
     // (after a rotation the summary is re-encrypted rather than stranded on the old key).
     const currentKeyId = (await deps.keyring.currentKey(ids)).keyId;
-    if (row && Number(row.revision) === m.revision && row.content_sha256 === m.raw.content_sha256 && (row.status !== "ready" || row.key_id === currentKeyId))
+    if (row && Number(row.revision) === m.revision && row.content_sha256 === m.raw.content_sha256 && (row.status !== "ready" || row.key_id === currentKeyId)) {
+      // The encrypted object and pointer are current, but a previous run may have
+      // failed after COMMIT and before the directory write. Reconcile the directory
+      // from the published object so a retry is idempotent.
+      if (kind === "short") {
+        const directory = deps.directory ?? sqlShortSummaryDirectory(deps.db);
+        const dirKey = { orgId: message.ctx.orgId, workspaceId: s.workspace_id, harness: s.harness, sessionId: s.session_id };
+        if (row.status !== "ready") {
+          await publishShortSummary(directory, dirKey, null, m.trace_id);
+        } else if (!(await directory.hasSummary(dirKey)) && row.object_key && row.object_sha256) {
+          const published = await readSummaryObject({
+            store: deps.store, keyring: deps.keyring, ids, key: row.object_key, sha256: row.object_sha256, kind, revision: m.revision,
+          });
+          if (published?.status === "ready" && published.summary && published.model)
+            await publishShortSummary(directory, dirKey,
+              { summary: published.summary, model: published.model, generatedAt: new Date(published.built_at) }, m.trace_id);
+        }
+      }
       return { status: "skipped", reason: "summary_current" };
+    }
 
     const outcome = await buildOutcome(kind, m, deps);
     const loc = { workspaceId: s.workspace_id, machineId: s.machine_id, harness: s.harness, sessionId: s.session_id, startDate: s.started_at.slice(0, 10) };
@@ -190,21 +245,9 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
     if (kind === "short") {
       const directory = deps.directory ?? sqlShortSummaryDirectory(deps.db);
       const dirKey = { orgId: message.ctx.orgId, workspaceId: s.workspace_id, harness: s.harness, sessionId: s.session_id };
-      if (outcome.status === "ready") {
-        try {
-          await directory.write({
-            ...dirKey,
-            summary: outcome.summary!,
-            source: `bob-costas/${outcome.model}`,
-            generatedAt: new Date(record.built_at),
-          });
-        } catch (err) {
-          if (!(err instanceof ShortSummaryRejected)) throw err;
-          log.info("short summary not projected", { stage: "summary-short", reason: err.reason, trace_id: m.trace_id });
-        }
-      } else {
-        await directory.clear(dirKey);
-      }
+      await publishShortSummary(directory, dirKey,
+        outcome.status === "ready" ? { summary: outcome.summary!, model: outcome.model!, generatedAt: new Date(record.built_at) } : null,
+        m.trace_id);
     }
     // Ids, counts and statuses only: never the summary or the model's output.
     recorder.log.info("summary written", { kind, status: outcome.status, tokens_in: outcome.tokensIn, tokens_out: outcome.tokensOut });

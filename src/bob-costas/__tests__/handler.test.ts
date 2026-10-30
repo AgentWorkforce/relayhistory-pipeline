@@ -47,7 +47,7 @@ const message = { payload: { manifestKey: "k" }, ctx: { orgId: "o" } } as never;
 const recorder = { log: { info() {} } } as never;
 // These tests cover the encrypted-object path only; the directory projection (G6) is
 // tested end to end in src/hoopdb/__tests__/session-directory-short-summary.test.ts.
-const noDirectory = { write: async () => ({ written: false }), clear: async () => false };
+const noDirectory = { write: async () => ({ written: false }), clear: async () => false, hasSummary: async () => true };
 
 describe("Bob Costas stores summaries as encrypted Locker objects, pointers in HoopDb", () => {
   it("ready: object summary/short.json.enc decrypts; the row has only the pointer; old plaintext rows are gone", async () => {

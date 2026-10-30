@@ -13,7 +13,9 @@
  *   - task_title, agent_name and short_summary are not in session_index and are kept
  *     as already projected (short_summary is written only by writeShortSummary).
  *
- * A tombstoned directory row is never resurrected: deleted sessions do not come back.
+ * When no live pointer remains, the row is tombstoned here (summary and search_text
+ * cleared by the trigger, memberships deleted). A tombstoned directory row is never
+ * resurrected: deleted sessions do not come back.
  * search_text is always rebuilt with sessions.session_directory_search_text, so the
  * scrubbed short_summary stays part of it.
  */
@@ -23,7 +25,7 @@ import type { SessionDirectoryKey } from "./session-directory-summary.ts";
 export async function projectSessionDirectory(
   db: SqlExecutor,
   key: SessionDirectoryKey,
-): Promise<{ projected: boolean }> {
+): Promise<{ projected: boolean; tombstoned: boolean }> {
   const params = [key.orgId, key.workspaceId, key.harness, key.sessionId];
   const { rows } = await db.query<{ projected: boolean }>(
     `WITH live AS (
@@ -74,7 +76,33 @@ export async function projectSessionDirectory(
      RETURNING true AS projected`,
     params,
   );
-  if (rows.length === 0) return { projected: false };
+  if (rows.length === 0) {
+    // No live pointer left (the last machine manifest was tombstoned), or the row is
+    // already a tombstone. Tombstone it (the trigger clears short_summary and
+    // search_text), empty the membership arrays and delete the membership rows. A row
+    // that still has a live pointer is a tombstone being re-sent and is left alone.
+    const gone = await db.query<{ tombstoned: boolean }>(
+      `UPDATE sessions.session_directory AS d
+          SET deleted_at = coalesce(d.deleted_at, now()),
+              machine_ids = '{}', user_ids = '{}', projected_at = now()
+        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+          AND NOT EXISTS (
+            SELECT 1 FROM sessions.session_index AS p
+             WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness
+               AND p.session_id = d.session_id AND p.deleted_at IS NULL)
+        RETURNING true AS tombstoned`,
+      params,
+    );
+    if (gone.rows.length === 0) return { projected: false, tombstoned: false };
+    for (const table of ["session_directory_users", "session_directory_machines"] as const) {
+      await db.query(
+        `DELETE FROM sessions.${table}
+          WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4`,
+        params,
+      );
+    }
+    return { projected: false, tombstoned: true };
+  }
   // Membership companions: exactly the live pointers' users and machines.
   for (const [table, column] of [
     ["session_directory_users", "user_id"],
@@ -100,5 +128,5 @@ export async function projectSessionDirectory(
       params,
     );
   }
-  return { projected: true };
+  return { projected: true, tombstoned: false };
 }

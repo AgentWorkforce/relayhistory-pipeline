@@ -47,12 +47,13 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
             WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
           [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id],
         );
-        // Propagate to the logical directory: clear the summary now, tombstone the row
-        // once no live machine pointer remains.
+        // Propagate to the logical directory: clear the summary now (it may include this
+        // machine's content), then re-project. With machines still live the projector
+        // rebuilds metadata and memberships; with none left it tombstones the row and
+        // deletes its memberships.
         const logical = { orgId: pk.org_id, workspaceId: pk.workspace_id, harness: pk.harness, sessionId: pk.session_id };
-        const tombstone = await propagatePointerTombstone(deps.db, logical);
-        // Other machines still live: re-project their metadata and memberships.
-        if (tombstone.found && !tombstone.tombstoned) await projectSessionDirectory(deps.db, logical);
+        await propagatePointerTombstone(deps.db, logical);
+        await projectSessionDirectory(deps.db, logical);
         return;
       }
       const read = await deps.reader.read(pointer.manifestKey);
