@@ -240,12 +240,12 @@ describe("RelayHistory export transform", () => {
       await readAll(await f.store.get(objectKey(first.outputKey!))),
     );
     const lines = body.trim().split("\n").map((line) => JSON.parse(line));
-    expect(lines.map((line) => line.record_id)).toEqual([
+    expect(lines.map((line) => line.row.delivery_record_id)).toEqual([
       "historical",
       "changed",
       "live",
     ]);
-    expect(Object.keys(lines[0]!.payload)).toEqual(["ts_ms", "\uE000", "😀"]);
+    expect(Object.keys(lines[0]!.row.record.payload)).toEqual(["ts_ms", "\uE000", "😀"]);
   });
 
   it("refuses a chunk whose stored digest does not match the manifest", async () => {

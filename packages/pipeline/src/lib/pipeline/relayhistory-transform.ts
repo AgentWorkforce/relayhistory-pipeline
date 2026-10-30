@@ -5,8 +5,9 @@
  * stream. The export is a dedicated `backfill` epoch, so arrival order is not
  * semantic: this reader takes the highest numeric revision of each
  * `(origin_id, record_id)`, applies tombstones, and then orders the surviving
- * records by event time. The resulting object is content-addressed by the
- * raw manifest digest; a later manifest cannot overwrite an earlier result.
+ * records by event time, and projects them as the live triggers would
+ * (`relayhistory-projection.ts`). The resulting object is content-addressed by
+ * the raw manifest digest; a later manifest cannot overwrite an earlier result.
  */
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import {
@@ -20,6 +21,12 @@ import {
 } from "./object-layout.js";
 import type { ManifestReader } from "./adapter.js";
 import { PipelineError } from "./errors.js";
+import {
+  CONVERGENCE_EVENT_KIND,
+  canonicalTimestamp,
+  projectRelayhistorySession,
+  type ProjectionRow,
+} from "./relayhistory-projection.js";
 import type { RawPointer, SessionTransform } from "./stages.js";
 
 export const RELAYHISTORY_NORMALIZED_VERSION = 1;
@@ -179,6 +186,31 @@ function receivedFirst(
   );
 }
 
+/**
+ * record_id is origin-independent, and the live projection keeps one row for it:
+ * the newest write from any origin, so a newest tombstone removes the record
+ * whichever origin wrote the upsert. `received_at`, then origin, is the order
+ * the projection itself falls back to for writes with no acceptance ledger.
+ */
+function newestAcrossOrigins(
+  records: Iterable<RelayhistoryStreamRecord>,
+): RelayhistoryStreamRecord[] {
+  const newest = new Map<string, RelayhistoryStreamRecord>();
+  const out: RelayhistoryStreamRecord[] = [];
+  const rank = (record: RelayhistoryStreamRecord) =>
+    `${canonicalTimestamp(record.received_at)}\0${record.origin_id}`;
+  for (const record of records) {
+    if (record.kind === CONVERGENCE_EVENT_KIND) {
+      out.push(record);
+      continue;
+    }
+    const held = newest.get(record.record_id);
+    if (!held || compareText(rank(record), rank(held)) > 0)
+      newest.set(record.record_id, record);
+  }
+  return [...out, ...newest.values()];
+}
+
 /** Latest live records, deterministic regardless of live/backfill arrival order. */
 export function normalizeRelayhistoryRecords(
   records: readonly RelayhistoryStreamRecord[],
@@ -201,7 +233,7 @@ export function normalizeRelayhistoryRecords(
     // so the output bytes do not depend on arrival order.
     if (receivedFirst(record, previous)) latest.set(key, record);
   }
-  return [...latest.values()]
+  return newestAcrossOrigins(latest.values())
     .filter((record) => record.operation === "upsert" && record.payload !== null)
     .sort(
       (left, right) =>
@@ -211,12 +243,15 @@ export function normalizeRelayhistoryRecords(
     );
 }
 
-async function defaultDecompress(stored: Uint8Array): Promise<Uint8Array> {
+async function defaultDecompress(
+  stored: Uint8Array,
+  maxOutputLength: number,
+): Promise<Uint8Array> {
   try {
     const zlib = await import("node:zlib");
     if (typeof zlib.zstdDecompressSync !== "function")
       fail("zstd_unavailable", "this runtime cannot zstd-decompress raw chunks");
-    return new Uint8Array(zlib.zstdDecompressSync(stored));
+    return new Uint8Array(zlib.zstdDecompressSync(stored, { maxOutputLength }));
   } catch (error) {
     if (error instanceof PipelineError) throw error;
     fail("chunk_decompress_failed", "a RelayHistory raw chunk is not valid zstd");
@@ -275,7 +310,12 @@ export async function readRelayhistoryExport(
       fail("chunk_digest_mismatch", "a RelayHistory raw chunk has the wrong stored digest");
     let raw: Uint8Array;
     try {
-      raw = decompress ? decompress(stored) : await defaultDecompress(stored);
+      raw = decompress
+        ? decompress(stored)
+        : await defaultDecompress(
+            stored,
+            chunk.stored_raw_bytes ?? MAX_RELAYHISTORY_CHUNK_BYTES,
+          );
     } catch (error) {
       if (error instanceof PipelineError) throw error;
       fail("chunk_decompress_failed", "a RelayHistory raw chunk is not valid zstd");
@@ -303,17 +343,8 @@ export async function readRelayhistoryExport(
   return normalizeRelayhistoryRecords(records);
 }
 
-function encodedRecords(records: readonly RelayhistoryStreamRecord[]): Uint8Array {
-  const lines = records.map((record) =>
-    JSON.stringify({
-      kind: record.kind,
-      origin_id: record.origin_id,
-      record_id: record.record_id,
-      revision: record.revision,
-      received_at: record.received_at,
-      payload: canonical(record.payload),
-    }),
-  );
+function encodedRows(rows: readonly ProjectionRow[]): Uint8Array {
+  const lines = rows.map((row) => JSON.stringify(canonical(row)));
   return new TextEncoder().encode(lines.length ? `${lines.join("\n")}\n` : "");
 }
 
@@ -341,9 +372,15 @@ export class RelayhistoryExportTransform implements SessionTransform {
       this.deps.store,
       this.deps.decompress,
     );
-    const body = encodedRecords(records);
+    const location = manifestLocation(manifest);
+    const projection = projectRelayhistorySession(records, {
+      workspaceId: location.workspaceId,
+      source: location.harness,
+      sessionId: location.sessionId,
+    });
+    const body = encodedRows(projection.rows);
     const key = normalizedKey(
-      manifestLocation(manifest),
+      location,
       RELAYHISTORY_NORMALIZED_VERSION,
       `relayhistory-${manifest.raw.content_sha256}.ndjson`,
     );
@@ -355,6 +392,7 @@ export class RelayhistoryExportTransform implements SessionTransform {
         "manifest-revision": String(manifest.revision),
         "source-content-sha256": manifest.raw.content_sha256,
         "source-epoch": String(manifest.raw.epoch),
+        "unprojected-records": String(projection.unprojected),
       },
     });
     return { outputKey: key };

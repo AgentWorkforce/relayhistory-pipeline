@@ -52,6 +52,8 @@ export interface ReprojectResult {
   workspaceLocks: number;
   /** session_catalog_agents rows removed because their catalog key has no row. */
   orphanAgentRowsRemoved: number;
+  /** Rows whose normalized name is not the target's `lower(agent_name)`. Must be 0. */
+  agentNameMismatches: number;
   before: CatalogCounts;
   /** Null on a dry run. */
   after: CatalogCounts | null;
@@ -114,6 +116,18 @@ export async function catalogCounts(db: Queryable): Promise<CatalogCounts> {
   return Object.fromEntries(CATALOG_TABLES.map((table) => [table, Number(row[table])])) as CatalogCounts;
 }
 
+/**
+ * The lookup trigger owns agent_name_normalized, so any row that differs got
+ * past it (or predates the 0067 fill). NULL counts as a mismatch.
+ */
+export async function countAgentNameMismatches(db: Queryable): Promise<number> {
+  const { rows } = await db.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM sessions.session_catalog_agents
+      WHERE agent_name_normalized IS DISTINCT FROM lower(agent_name)`,
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
 export async function reprojectCatalog(
   db: Queryable,
   options: { batch: number; dryRun?: boolean },
@@ -125,6 +139,7 @@ export async function reprojectCatalog(
     batches: 0,
     workspaceLocks: 0,
     orphanAgentRowsRemoved: 0,
+    agentNameMismatches: 0,
     before: await catalogCounts(db),
     after: null,
   };
@@ -187,6 +202,7 @@ export async function reprojectCatalog(
     after = [last.org_id, last.workspace_id, last.key_text];
   }
   if (!options.dryRun) result.after = await catalogCounts(db);
+  result.agentNameMismatches = await countAgentNameMismatches(db);
   return result;
 }
 
@@ -206,6 +222,8 @@ export async function main() {
     if (dryRun) await client.query("SET default_transaction_read_only = on");
     const result = await reprojectCatalog(client, { batch, dryRun });
     process.stdout.write(`${JSON.stringify({ dryRun, ...result }, null, 2)}\n`);
+    if (result.agentNameMismatches > 0)
+      throw new Error(`${result.agentNameMismatches} agent names differ from lower(agent_name)`);
   } finally {
     await client.end();
   }
