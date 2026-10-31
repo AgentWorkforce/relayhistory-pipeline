@@ -87,6 +87,11 @@
       "ref": "nginxinc/nginx-unprivileged:1.29.3-alpine",
       "digest": "sha256:5aea7cc516b419e3526f47dd1531be31a56a046cfe44754d94f9383e13e2ee99",
       "note": "stacks/aws/relayauth-tls.ts TLS_PROXY_IMAGE; resolved from Docker Hub on 2026-10-30"
+    },
+    "external-dns": {
+      "ref": "registry.k8s.io/external-dns/external-dns:v0.23.0",
+      "digest": "sha256:1854499e2b08cee47c40a08e356bff20dcb192dbcfde8378fc3f900f12cad5a3",
+      "note": "external-dns chart 1.23.0 appVersion; holds the Cloudflare DNS token, so pinned by digest (stacks/aws/proof-addons.ts EXTERNAL_DNS_IMAGE); multi-arch index digest resolved from registry.k8s.io on 2026-10-31"
     }
   },
   "vendored": {
@@ -126,6 +131,11 @@
       "repo": "https://charts.jetstack.io",
       "version": "v1.21.3",
       "note": "stacks/aws/relayauth-tls.ts; images pinned by digest there"
+    },
+    "external-dns": {
+      "repo": "https://kubernetes-sigs.github.io/external-dns",
+      "version": "1.23.0",
+      "note": "stacks/aws/proof-addons.ts EXTERNAL_DNS_CHART"
     }
   },
   "packages": {

@@ -239,3 +239,17 @@ describe("proof teardown leaves nothing behind", () => {
     expect(eks).toContain('storageClassManifest(i.purgeOnDestroy ? "Delete" : "Retain")');
   });
 });
+
+describe("external-dns image", () => {
+  it("runs by digest (it holds the Cloudflare token), matching versions.lock.json and rendering repo:tag@digest", () => {
+    const { EXTERNAL_DNS_IMAGE, externalDnsImageValues } = require("../proof-addons.ts") as typeof import("../proof-addons.ts");
+    expect(EXTERNAL_DNS_IMAGE.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const v = externalDnsImageValues();
+    // Chart 1.23.0: printf "%s:%s" repository tag.
+    expect(`${v.repository}:${v.tag}`).toBe(`registry.k8s.io/external-dns/external-dns:v0.23.0@${EXTERNAL_DNS_IMAGE.digest}`);
+    const lock = JSON.parse(readFileSync(fileURLToPath(new URL("../../../versions.lock.json", import.meta.url)), "utf8")) as { images: Record<string, { digest: string }> };
+    expect(lock.images["external-dns"]!.digest).toBe(EXTERNAL_DNS_IMAGE.digest);
+    const ingress = readFileSync(fileURLToPath(new URL("../ingress.ts", import.meta.url)), "utf8");
+    expect(ingress).toContain("image: externalDnsImageValues(),");
+  });
+});

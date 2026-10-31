@@ -285,6 +285,23 @@ export interface IngestExposureInput {
 }
 
 export const DEFAULT_INGEST_RATE_LIMIT = 2000;
+
+/**
+ * external-dns holds the Cloudflare DNS token, so it runs a pinned image, not
+ * the chart's tag default. Chart 1.23.0 renders `<repository>:<tag>`; a
+ * `tag@digest` tag pins the bytes. Multi-arch index digest of v0.23.0 (the
+ * chart's appVersion), resolved from registry.k8s.io on 2026-10-31.
+ */
+export const EXTERNAL_DNS_CHART = { repo: "https://kubernetes-sigs.github.io/external-dns", chart: "external-dns", version: "1.23.0" } as const;
+export const EXTERNAL_DNS_IMAGE = {
+  repository: "registry.k8s.io/external-dns/external-dns",
+  tag: "v0.23.0",
+  digest: "sha256:1854499e2b08cee47c40a08e356bff20dcb192dbcfde8378fc3f900f12cad5a3",
+} as const;
+
+export function externalDnsImageValues() {
+  return { repository: EXTERNAL_DNS_IMAGE.repository, tag: `${EXTERNAL_DNS_IMAGE.tag}@${EXTERNAL_DNS_IMAGE.digest}`, pullPolicy: "IfNotPresent" };
+}
 export const INGEST_LISTEN_PORTS = '[{"HTTPS":443}]';
 export const INGEST_SSL_POLICY = "ELBSecurityPolicy-TLS13-1-2-2021-06";
 

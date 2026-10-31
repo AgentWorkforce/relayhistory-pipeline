@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { alchemyStateBucket, alchemyStatePrefix } from "../../stacks/aws/preflight.ts";
 import { STACK_SOURCE_PATHS, currentObjects, provenanceMismatches, sanitizeInputs, sanitizePlan, sha256, versionsDigest, type Observed, type Provenance, type VersionListing } from "./plan-provenance.ts";
 import type { StateSnapshot } from "../../stacks/aws/state-snapshot.ts";
+import { inputsDigest } from "../../stacks/aws/deploy-guard.ts";
 import { tmpdir } from "node:os";
 import { mkdtempSync, rmSync } from "node:fs";
 import { awsInvocation } from "./aws.ts";
@@ -114,7 +115,8 @@ export function capturePlan(root: string, stage: string, env: Record<string, str
     generatedAt: new Date().toISOString(),
     target: { accountId: inputs.accountId, region: inputs.region, callerArn: caller.Arn },
     source: { commit: src.commit, stackSourceSha256: src.stackSourceSha256, clean: true },
-    inputs: { sha256: sha256(rawInputs), sanitizedPath: `docs/plans/${stage}.inputs.sanitized.json`, sanitizedSha256: sha256(sanitized) },
+    // Excludes the approval record, which names this capture (deploy-guard.ts inputsDigest).
+    inputs: { sha256: inputsDigest(rawInputs), sanitizedPath: `docs/plans/${stage}.inputs.sanitized.json`, sanitizedSha256: sha256(sanitized) },
     state: {
       bucket: state.bucket,
       prefix: state.prefix,
@@ -159,7 +161,7 @@ export function verifyCapturedPlan(root: string, stage: string) {
     commit: src.commit,
     stackSourceSha256: src.stackSourceSha256,
     clean: src.clean,
-    inputsSha256: sha256(readFileSync(join(root, ".96bulls", stage, "aws-inputs.json"), "utf8")),
+    inputsSha256: inputsDigest(readFileSync(join(root, ".96bulls", stage, "aws-inputs.json"), "utf8")),
     state: (({ versioning, versionsDigest, versionEntries }) => ({ versioning, versionsDigest, versionEntries }))(observeState(root, inputs.accountId, inputs.region, stage)),
     planSha256: sha256(readFileSync(p.plan, "utf8")),
     detailedSha256: sha256(readFileSync(p.detailed, "utf8")),

@@ -515,7 +515,13 @@ The stack itself refuses, before declaring anything and whatever started it
   message verbatim>" }`. `decision` must be exactly `"approved"`; anything
   else refuses. The date must be a real calendar day, not in the future, at
   most 30 days old; `operations`, `stage`, `accountId` and `region` must match
-  exactly. `quote` is kept for the audit trail and never interpreted. The
+  exactly. `quote` is kept for the audit trail and never interpreted. A
+  deploy approval also names the reviewed capture it is for:
+  `"capture": { "provenanceSha256", "planSha256", "inputsSha256",
+  "sourceCommit" }` (the sha256 of `docs/plans/<stage>.provenance.json` and
+  `.plan.txt`, and the provenance's `inputs.sha256` and `source.commit`). A
+  recapture, a changed plan or inputs, or another commit refuses, even with
+  the same words; `inputs.sha256` excludes the approval record itself. The
   free-text `clearedBy` field is informational only;
 - deploy without `NINETY_SIX_BULLS_CONFIRM_STAGE=<stage>`; destroy without
   `NINETY_SIX_BULLS_CONFIRM_DESTROY=<stage>`, and destroy of `aws-sessions-dev`

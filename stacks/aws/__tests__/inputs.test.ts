@@ -9,7 +9,7 @@ const approved = lock.images["services-aws"].approved;
 const example = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-proof.inputs.example.json", import.meta.url)), "utf8")) as AwsInputs;
 const filled = (patch: (i: AwsInputs) => void = () => {}) => {
   const i = structuredClone(example);
-  i.approval = { ...i.approval!, decision: "approved", date: "2026-10-30", quote: "approved applying stage A (aws-proof, create-only)" };
+  i.approval = { ...i.approval!, decision: "approved", date: "2026-10-30", quote: "approved applying stage A (aws-proof, create-only)", capture: { provenanceSha256: "a".repeat(64), planSha256: "b".repeat(64), inputsSha256: "c".repeat(64), sourceCommit: "d".repeat(40) } };
   i.eks!.apiAccess = { publicAccessCidrs: ["203.0.113.7/32"] };
   patch(i);
   return i;
@@ -26,7 +26,7 @@ describe("aws-proof: a fresh, fully hardened stage beside sessions-dev", () => {
   });
 
   it("refuses the example as committed: every <...> placeholder is named", () => {
-    expect(() => validateAwsInputs("aws-proof", example)).toThrow(/\$\.approval\.decision, \$\.approval\.date, \$\.approval\.quote, \$\.eks\.apiAccess\.publicAccessCidrs\[0\]/);
+    expect(() => validateAwsInputs("aws-proof", example)).toThrow(/\$\.approval\.decision, \$\.approval\.date, \$\.approval\.quote, \$\.approval\.capture\.provenanceSha256, \$\.approval\.capture\.planSha256, \$\.approval\.capture\.inputsSha256, \$\.approval\.capture\.sourceCommit, \$\.eks\.apiAccess\.publicAccessCidrs\[0\]/);
     expect(() => validateAwsInputs("aws-proof", filled((i) => (i.$comment = "fill <this>")))).toThrow(/\$\.\$comment/);
   });
 
@@ -43,6 +43,11 @@ describe("aws-proof: a fresh, fully hardened stage beside sessions-dev", () => {
     const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
     expect(stack.match(/\.\.\.\(purge \? \{ forceDestroy: true \} : \{\}\)/g)).toHaveLength(2); // locker + trail
     expect(readFileSync(fileURLToPath(new URL("../ingress.ts", import.meta.url)), "utf8")).toContain("...(i.purgeOnDestroy ? { forceDestroy: true } : {})");
+  });
+
+  it("never purges buckets on a production-looking stage, even one matching the proof/sandbox pattern", () => {
+    for (const stage of ["aws-proof-prod", "aws-production", "aws-sandbox-prod"])
+      expect(() => validateAwsInputs(stage, filled((i) => { delete i.eks!.hoopdb; }), approved)).toThrow(/never allowed on a production-looking stage/);
   });
 
   it("refuses a boolean NetworkPolicy enforcement switch: phase 2 needs a verification record", () => {

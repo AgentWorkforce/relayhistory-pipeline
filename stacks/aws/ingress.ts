@@ -21,7 +21,7 @@ import * as Output from "alchemy/Output";
 import { denyInsecureTransport } from "./hardening.ts";
 import { spawnSync } from "node:child_process";
 import { validationRecordOverride, waitForValidationRecord, type ValidationRecord } from "./cert-validation.ts";
-import { INGEST_LISTEN_PORTS, INGEST_SSL_POLICY, albLogDeliveryPolicy, ingestWafIdentity, ingestLoadBalancerAttributes, ingestWafRules, ingressExposure, type IngestExposureInput } from "./proof-addons.ts";
+import { EXTERNAL_DNS_CHART, INGEST_LISTEN_PORTS, INGEST_SSL_POLICY, albLogDeliveryPolicy, externalDnsImageValues, ingestWafIdentity, ingestLoadBalancerAttributes, ingestWafRules, ingressExposure, type IngestExposureInput } from "./proof-addons.ts";
 
 export interface IngressInputs {
   stage: string;
@@ -162,12 +162,14 @@ export const ingressStage = (i: IngressInputs) =>
     // external-dns: Cloudflare provider, only this zone, only records it owns.
     yield* Kubernetes.HelmChart("external-dns", {
       cluster,
-      chart: "external-dns",
-      repo: "https://kubernetes-sigs.github.io/external-dns",
-      version: "1.23.0",
+      chart: EXTERNAL_DNS_CHART.chart,
+      repo: EXTERNAL_DNS_CHART.repo,
+      version: EXTERNAL_DNS_CHART.version,
       releaseName: "external-dns",
       namespace: "kube-system",
       values: {
+        // It holds the Cloudflare token: pinned by digest, never the chart's tag default.
+        image: externalDnsImageValues(),
         provider: { name: "cloudflare" },
         sources: ["ingress"],
         domainFilters: [i.zoneDomain],

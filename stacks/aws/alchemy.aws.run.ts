@@ -31,7 +31,7 @@ import { SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
 import { eksStage } from "./eks.ts";
 import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy } from "./hardening.ts";
 import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "./inputs.ts";
-import { assertAwsDeploymentTarget, assertClearance, awsMode, type AwsMode } from "./deploy-guard.ts";
+import { assertApprovalBinding, assertAwsDeploymentTarget, assertClearance, awsMode, type AwsMode } from "./deploy-guard.ts";
 import { snapshotStateLayer } from "./state-snapshot.ts";
 import { alchemyStateBucket, alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
 import { networkPolicies } from "./proof-addons.ts";
@@ -52,8 +52,10 @@ const OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/96BullSessions@1437714333
 function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
   const path = join(ROOT, ".96bulls", stage, "aws-inputs.json");
   let inputs: AwsInputs;
+  let inputsText: string;
   try {
-    inputs = JSON.parse(readFileSync(path, "utf8")) as AwsInputs;
+    inputsText = readFileSync(path, "utf8");
+    inputs = JSON.parse(inputsText) as AwsInputs;
   } catch {
     throw new Error(`96bulls: the AWS stage ${stage} is not cleared: ${path} does not exist (see docs/aws-stage.md). Nothing was created.`);
   }
@@ -63,6 +65,18 @@ function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
     throw new Error(`96bulls: NINETY_SIX_BULLS_STATE_SNAPSHOT is for plans only; a ${mode} must use the live state. Nothing was changed.`);
   // Placeholders anywhere, the typed account (and stage), Khaliq's approval record, destroyable stage.
   assertClearance(mode, stage, inputs, process.env);
+  // A deploy approval is for one reviewed capture (docs/plans/<stage>.*), not for any plan.
+  if (mode === "deploy") {
+    const plans = join(ROOT, "docs", "plans");
+    let provenanceText: string, planText: string;
+    try {
+      provenanceText = readFileSync(join(plans, `${stage}.provenance.json`), "utf8");
+      planText = readFileSync(join(plans, `${stage}.plan.txt`), "utf8");
+    } catch {
+      throw new Error(`96bulls: deploy needs the reviewed capture docs/plans/${stage}.{provenance.json,plan.txt}. Nothing was changed.`);
+    }
+    assertApprovalBinding(inputs.approval?.capture, { provenanceText, planText, inputsText });
+  }
   assertRegion(inputs.region);
   const lock = JSON.parse(readFileSync(join(ROOT, "versions.lock.json"), "utf8")) as { images: { "services-aws"?: { approved: ApprovedServicesImage[] } } };
   validateAwsInputs(stage, inputs, lock.images["services-aws"]?.approved ?? []);

@@ -7,7 +7,7 @@
  */
 import { assertServicesImage, clusterEndpointAccess, hoopdbBackend, lockerLifecycleRules, type HoopDbBackend } from "./hardening.ts";
 import { findPlaceholders, type Approval } from "./deploy-guard.ts";
-import { CNPG_STAGE_RE } from "./hardening.ts";
+import { isDisposableStage, isProductionLike } from "./hardening.ts";
 import { resolveTenantOrgs } from "./tenants.ts";
 
 /** versions.lock.json `images.services-aws.approved`: the services images an AWS stage may run. */
@@ -96,7 +96,9 @@ export interface AwsInputs {
 
 /** Everything the EKS stage would refuse, checked up front. Returns the resolved choices. */
 export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImages?: ApprovedServicesImage[]) {
-  if (inputs.teardown && !CNPG_STAGE_RE.test(stage))
+  if (inputs.teardown && isProductionLike(stage))
+    throw new Error(`96bulls: teardown.purgeBucketsOnDestroy is never allowed on a production-looking stage (${stage}). Nothing was created.`);
+  if (inputs.teardown && !isDisposableStage(stage))
     throw new Error(`96bulls: teardown.purgeBucketsOnDestroy is only for proof and sandbox stages, not ${stage}. Nothing was created.`);
   if (inputs.teardown && inputs.teardown.purgeBucketsOnDestroy !== true) throw new Error("96bulls: teardown.purgeBucketsOnDestroy must be true when teardown is set. Nothing was created.");
   if (!/^\d{12}$/.test(inputs.accountId ?? "")) throw new Error("96bulls: accountId must be a 12-digit AWS account id. Nothing was created.");

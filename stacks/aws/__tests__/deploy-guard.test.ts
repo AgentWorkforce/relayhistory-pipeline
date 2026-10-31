@@ -104,3 +104,46 @@ describe("AWS deploy guards", () => {
     expect(stack).toContain("assertClearance(mode, stage, inputs, process.env);");
   });
 });
+
+describe("a deploy approval is bound to the reviewed capture (B1)", () => {
+  const { assertApprovalBinding, inputsDigest } = require("../deploy-guard.ts") as typeof import("../deploy-guard.ts");
+  const { createHash } = require("node:crypto") as typeof import("node:crypto");
+  const h = (s: string) => createHash("sha256").update(s).digest("hex");
+  const inputsText = JSON.stringify({ accountId: "500268966557", region: "us-west-2", eks: { imageDigest: "d" }, approval: { decision: "approved" } });
+  const planText = "Plan: 3 to update\n[96bulls] update\n";
+  const provenance = (o: { commit?: string; generatedAt?: string; inputs?: string; plan?: string } = {}) =>
+    JSON.stringify({ generatedAt: o.generatedAt ?? "2026-10-31T06:00:00Z", source: { commit: o.commit ?? "c".repeat(40) }, inputs: { sha256: o.inputs ?? inputsDigest(inputsText) }, outputs: { plan: { sha256: o.plan ?? h(planText) } } });
+  const provenanceText = provenance();
+  const capture = { provenanceSha256: h(provenanceText), planSha256: h(planText), inputsSha256: inputsDigest(inputsText), sourceCommit: "c".repeat(40) };
+  const ok = { provenanceText, planText, inputsText };
+
+  it("passes only for the exact capture it names", () => {
+    expect(() => assertApprovalBinding(capture, ok)).not.toThrow();
+    // Editing only the approval inside the inputs does not change what was captured.
+    expect(() => assertApprovalBinding(capture, { ...ok, inputsText: JSON.stringify({ ...JSON.parse(inputsText), approval: { decision: "approved", quote: "x" } }) })).not.toThrow();
+  });
+
+  it("refuses a recapture with the same quote (new provenance, same plan)", () => {
+    expect(() => assertApprovalBinding(capture, { ...ok, provenanceText: provenance({ generatedAt: "2026-10-31T07:00:00Z" }) })).toThrow(/provenanceSha256/);
+  });
+
+  it("refuses a changed plan, changed inputs, another commit, or no binding at all", () => {
+    expect(() => assertApprovalBinding(capture, { ...ok, planText: planText + "[worker-role] update\n" })).toThrow(/planSha256/);
+    const otherInputs = JSON.stringify({ ...JSON.parse(inputsText), eks: { imageDigest: "e" } });
+    expect(() => assertApprovalBinding(capture, { ...ok, inputsText: otherInputs })).toThrow(/inputsSha256/);
+    const other = provenance({ commit: "d".repeat(40) });
+    expect(() => assertApprovalBinding({ ...capture, provenanceSha256: h(other) }, { ...ok, provenanceText: other })).toThrow(/sourceCommit/);
+    expect(() => assertApprovalBinding(undefined, ok)).toThrow(/approval.capture is missing/);
+  });
+
+  it("refuses a provenance record that describes other inputs or another plan file", () => {
+    const stale = provenance({ inputs: "0".repeat(64) });
+    expect(() => assertApprovalBinding({ ...capture, provenanceSha256: h(stale) }, { ...ok, provenanceText: stale })).toThrow(/other inputs/);
+  });
+
+  it("the stack checks the binding on every deploy, before the account check", () => {
+    const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
+    expect(stack).toContain("assertApprovalBinding(inputs.approval?.capture, { provenanceText, planText, inputsText });");
+    expect(stack.indexOf("assertApprovalBinding(inputs.approval")).toBeLessThan(stack.indexOf("assertAwsDeploymentTarget("));
+  });
+});

@@ -3,6 +3,65 @@
  * resource, whatever started it (bin/96bulls or a direct `alchemy` command).
  * Pure, so they are unit-tested (stacks/aws/__tests__/deploy-guard.test.ts).
  */
+import { createHash } from "node:crypto";
+
+const sha256Hex = (s: string) => createHash("sha256").update(s).digest("hex");
+function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v && typeof v === "object")
+    return `{${Object.keys(v as object).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson((v as Record<string, unknown>)[k])}`).join(",")}}`;
+  return JSON.stringify(v);
+}
+
+/**
+ * The inputs digest a capture records and an approval binds: every input
+ * except the approval record itself (which names the capture, so it cannot be
+ * part of what the capture hashes).
+ */
+export function inputsDigest(inputsText: string): string {
+  const { approval: _approval, ...rest } = JSON.parse(inputsText) as Record<string, unknown>;
+  return sha256Hex(canonicalJson(rest));
+}
+
+/** The reviewed capture a deploy approval is for (docs/plans/<stage>.*). */
+export interface ApprovedCapture {
+  /** sha256 of docs/plans/<stage>.provenance.json, byte for byte. */
+  provenanceSha256: string;
+  /** sha256 of docs/plans/<stage>.plan.txt. */
+  planSha256: string;
+  /** inputsDigest() of the inputs the plan was captured from. */
+  inputsSha256: string;
+  /** The commit the capture was taken at. */
+  sourceCommit: string;
+}
+
+/**
+ * A deploy approval is for one reviewed capture: the exact provenance record,
+ * plan text, inputs and source commit. A recapture (new provenance), a changed
+ * plan or inputs, or another commit refuses, even with the same words.
+ */
+export function assertApprovalBinding(
+  capture: ApprovedCapture | undefined,
+  observed: { provenanceText: string; planText: string; inputsText: string },
+): void {
+  const refuse = (why: string): never => {
+    throw new Error(`96bulls: deploy is not approved for this plan: ${why}. Nothing was changed.`);
+  };
+  if (!capture) return refuse("approval.capture is missing (the reviewed capture's provenanceSha256, planSha256, inputsSha256, sourceCommit)");
+  const prov = JSON.parse(observed.provenanceText) as { source?: { commit?: string }; inputs?: { sha256?: string }; outputs?: { plan?: { sha256?: string } } };
+  const want = {
+    provenanceSha256: sha256Hex(observed.provenanceText),
+    planSha256: sha256Hex(observed.planText),
+    inputsSha256: inputsDigest(observed.inputsText),
+    sourceCommit: prov.source?.commit,
+  };
+  for (const k of ["provenanceSha256", "planSha256", "inputsSha256", "sourceCommit"] as const)
+    if (capture[k] !== want[k]) refuse(`approval.capture.${k} is ${JSON.stringify(capture[k])}, the committed capture has ${JSON.stringify(want[k])}`);
+  // The capture must describe exactly these inputs and this plan text.
+  if (prov.inputs?.sha256 !== want.inputsSha256) refuse("the captured provenance was taken from other inputs");
+  if (prov.outputs?.plan?.sha256 !== want.planSha256) refuse("the plan file differs from the one the provenance records");
+}
+
 export interface AwsDeploymentTarget {
   accountId: string;
   region: string;
@@ -70,6 +129,8 @@ export function parseCalendarDate(s: string | undefined): Date | undefined {
  */
 export interface Approval {
   decision: string;
+  /** Required for deploy: the reviewed capture this approval is for (assertApprovalBinding). */
+  capture?: ApprovedCapture;
   by: string;
   /** YYYY-MM-DD, a real date, not in the future, at most APPROVAL_MAX_AGE_DAYS old. */
   date: string;

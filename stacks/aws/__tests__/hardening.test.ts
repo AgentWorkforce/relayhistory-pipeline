@@ -193,6 +193,11 @@ describe("HoopDb backend", () => {
     // sessions-dev must never be switched to an empty in-cluster database.
     expect(() => hoopdbBackend("aws-sessions-dev", "cnpg")).toThrow(/keeps its external HoopDb/);
   });
+  it("refuses CNPG on every production-looking stage before the proof/sandbox allowlist", () => {
+    for (const stage of ["aws-proof-prod", "aws-production", "aws-sandbox-prod-agent", "aws-proof-preprod", "aws-PROD"])
+      expect(() => hoopdbBackend(stage, "cnpg")).toThrow(/looks like production/);
+  });
+
   it("refuses in-cluster CNPG for any production-looking stage, and unknown backends", () => {
     expect(() => hoopdbBackend("aws-prod", "cnpg")).toThrow(/Supabase/);
     expect(() => hoopdbBackend("aws-sessions-prod", "cnpg")).toThrow(/Supabase/);

@@ -344,13 +344,23 @@ export type HoopDbBackend = "external" | "cnpg";
 /** Stages that may run the disposable in-cluster HoopDb: isolated proof stages and sandboxes. */
 export const CNPG_STAGE_RE = /^aws-(proof(-[a-z0-9-]+)?|sandbox-[a-z0-9-]+)$/;
 
+/**
+ * Production-looking stages (any "prod", including "production" and
+ * "aws-proof-prod"). Checked FIRST and unconditionally: no allowlist pattern
+ * may let such a stage run the disposable database or purge its buckets.
+ */
+export const isProductionLike = (stage: string) => /prod/i.test(stage);
+
+/** Proof and sandbox stages that may run disposable state; never production-looking. */
+export const isDisposableStage = (stage: string) => !isProductionLike(stage) && CNPG_STAGE_RE.test(stage);
+
 export function hoopdbBackend(stage: string, backend: string | undefined): HoopDbBackend {
   const b = backend ?? "external";
   if (b !== "external" && b !== "cnpg") throw new Error(`96bulls: eks.hoopdb.backend must be "external" or "cnpg", got ${JSON.stringify(backend)}. Nothing was created.`);
-  if (b === "cnpg" && /prod/.test(stage) && !CNPG_STAGE_RE.test(stage))
+  if (b === "cnpg" && isProductionLike(stage))
     throw new Error(`96bulls: stage ${stage} looks like production; production HoopDb is Supabase (docs/decisions/0001-production-data-plane.md), never in-cluster CNPG. Nothing was created.`);
   // A live stage (sessions-dev) switching to CNPG would start on an empty database.
-  if (b === "cnpg" && !CNPG_STAGE_RE.test(stage))
+  if (b === "cnpg" && !isDisposableStage(stage))
     throw new Error(`96bulls: eks.hoopdb.backend "cnpg" is only for isolated proof and sandbox stages (aws-proof*, aws-sandbox-*); ${stage} keeps its external HoopDb. Nothing was created.`);
   return b;
 }

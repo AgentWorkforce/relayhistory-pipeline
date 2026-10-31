@@ -12,7 +12,13 @@
     "stage": "aws-proof",
     "accountId": "500268966557",
     "region": "us-west-2",
-    "quote": "<Khaliq's message, verbatim>"
+    "quote": "<Khaliq's message, verbatim>",
+    "capture": {
+      "provenanceSha256": "<sha256 of docs/plans/aws-proof.provenance.json>",
+      "planSha256": "<sha256 of docs/plans/aws-proof.plan.txt>",
+      "inputsSha256": "<provenance inputs.sha256>",
+      "sourceCommit": "<provenance source.commit>"
+    }
   },
   "budgetUsd": 300,
   "budgetEmail": "aws-budgets@agentrelay.com",
