@@ -38,9 +38,9 @@ python3 -I - "$out/pg/package" <<'PY'
 import json, os, sys
 base = sys.argv[1]
 for link in json.load(open(os.path.join(base, "native/pg-symlinks.json"))):
-    path = os.path.join(base, link["source"])
+    path = os.path.join(base, link["target"])
     if not os.path.lexists(path):
-        os.symlink(os.path.relpath(os.path.join(base, link["target"]), os.path.dirname(path)), path)
+        os.symlink(os.path.relpath(os.path.join(base, link["source"]), os.path.dirname(path)), path)
 PY
 
 abs=$(cd "$out" && pwd)
