@@ -92,80 +92,43 @@ export function agentExactValue(value: string): string {
 }
 
 /**
- * Whether `value` can be served by the direct bounded prefix query. A predicate: it
- * never throws. Non-ASCII input is not useful there (agentPrefixRange refuses it; use
- * the RPC), so it returns false.
+ * Agent prefix search is RPC-only (helm-chart-chief ruling on #38). The tenant-bound RPC
+ * first counts the prefix's candidates, stopping after this budget + 1, and refuses a
+ * broader prefix as `agent_prefix_too_broad` (SQLSTATE 54000) instead of reading the
+ * whole tenant. It equals the page size times the row-amplification gate.
+ */
+export const AGENT_PREFIX_CANDIDATE_BUDGET =
+  AGENT_PREFIX_BENCHMARK_GATE.pageSize *
+  AGENT_PREFIX_BENCHMARK_GATE.maxIndexRowsExaminedPerResult;
+
+/** A direct (authenticated, PostgREST table) agent prefix: never served directly. */
+export class AgentPrefixRequiresRpcError extends RangeError {
+  readonly code = "agent_prefix_requires_rpc";
+  constructor() {
+    super(
+      "agent prefix search is served only by sessions.search_session_directory " +
+        "(p_agent_match => 'prefix'); the direct list surface takes exact agent names only",
+    );
+    this.name = "AgentPrefixRequiresRpcError";
+  }
+}
+
+/**
+ * The direct list surface's answer to every agent prefix: a typed requires-RPC refusal.
+ * It runs no SQL. Exact agent filters stay direct (agentExactValue).
+ */
+export function directAgentPrefix(value: string): never {
+  void value;
+  throw new AgentPrefixRequiresRpcError();
+}
+
+/**
+ * Whether `value` is long enough to send to the RPC as an agent prefix (3 or more
+ * characters after trim). A predicate: it never throws. Breadth is decided by the
+ * RPC's candidate budget, not here.
  */
 export function isUsefulAgentPrefix(value: string): boolean {
-  if (NON_ASCII.test(value)) return false;
-  return Array.from(normalizeAgentName(value)).length >= MIN_AGENT_PREFIX_CHARS;
-}
-
-export function agentPrefixPattern(value: string): string {
-  if (NON_ASCII.test(value)) throw new NonAsciiAgentPrefixError();
-  const normalized = normalizeAgentName(value);
-  if (Array.from(normalized).length < MIN_AGENT_PREFIX_CHARS) {
-    throw new RangeError(
-      `agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`,
-    );
-  }
-  return `${normalized.replace(/[\\%_]/g, "\\$&")}%`;
-}
-
-/**
- * The text_pattern_ops (byte-order) upper bound of every string that starts with
- * `prefix`: the last code point incremented, skipping the surrogate gap (U+D7FF goes
- * to U+E000), with trailing U+10FFFF dropped and carried into the previous code
- * point. A prefix of only U+10FFFF has no finite bound and is refused.
- */
-export function textPatternUpperBound(prefix: string): string {
-  const points = Array.from(prefix);
-  for (let index = points.length - 1; index >= 0; index -= 1) {
-    const point = points[index]!.codePointAt(0)!;
-    if (point >= 0x10ffff) continue;
-    const next = point + 1 === 0xd800 ? 0xe000 : point + 1;
-    return `${points.slice(0, index).join("")}${String.fromCodePoint(next)}`;
-  }
-  throw new RangeError(
-    "agent prefix has no finite text_pattern_ops upper bound",
-  );
-}
-
-/** A direct prefix the bounded query cannot serve exactly; use the RPC instead. */
-export class NonAsciiAgentPrefixError extends NonAsciiAgentFilterError {
-  constructor() {
-    super("prefix");
-    this.name = "NonAsciiAgentPrefixError";
-  }
-}
-
-/**
- * Leakproof byte-order bounds for an authenticated RLS prefix query. PostgreSQL
- * cannot push the non-leakproof LIKE operator below an RLS security barrier, so
- * the text_pattern_ops range must be explicit and LIKE remains the exact recheck.
- *
- * The stored agent_name_normalized is PostgreSQL's lower(btrim(agent_name)), whose
- * non-ASCII case folding depends on the server collation, while these bounds are
- * computed here. Only ASCII input is accepted, where both agree exactly; anything
- * else is refused (NonAsciiAgentPrefixError) rather than silently missing rows.
- */
-export function agentPrefixRange(value: string): {
-  lower: string;
-  upper: string;
-  pattern: string;
-} {
-  if (NON_ASCII.test(value)) throw new NonAsciiAgentPrefixError();
-  const lower = normalizeAgentName(value);
-  if (Array.from(lower).length < MIN_AGENT_PREFIX_CHARS) {
-    throw new RangeError(
-      `agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`,
-    );
-  }
-  return {
-    lower,
-    upper: textPatternUpperBound(lower),
-    pattern: agentPrefixPattern(value),
-  };
+  return Array.from(value.trim()).length >= MIN_AGENT_PREFIX_CHARS;
 }
 
 /**
@@ -234,13 +197,6 @@ SELECT ${listColumns} FROM sessions.session_directory
    AND agent_name_normalized = $3 AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC, harness DESC
  LIMIT $4`,
-  agentPrefix: `
-SELECT ${listColumns} FROM sessions.session_directory
- WHERE org_id = $1 AND workspace_id = $2
-   AND agent_name_normalized ~>=~ $3 AND agent_name_normalized ~<~ $4
-   AND agent_name_normalized LIKE $5 ESCAPE '\\' AND deleted_at IS NULL
- ORDER BY last_activity_at DESC, session_id DESC, harness DESC
- LIMIT $6`,
   createdRange: `
 SELECT ${listColumns} FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2 AND created_at >= $3
@@ -359,6 +315,8 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     "22023":
       "an invalid value: text under the meaningful-character rule, limit, state, agent match, harness, cursor, since > until, or a contradictory pair",
     "0A000": "an intentionally unsupported combination (see unsupported)",
+    "54000":
+      "agent_prefix_too_broad: more than AGENT_PREFIX_CANDIDATE_BUDGET (5000) sessions match the agent prefix; use a longer prefix or an exact agent",
     "57014": "statement_timeout (2s on the Worker role) exceeded",
   },
   /** Returned as 0A000, never as empty results. */
@@ -651,7 +609,7 @@ function normalizedPredicate(value: string | null | undefined): string {
   const literals: string[] = [];
   let masked = "";
   const input = value ?? "";
-  for (let index = 0; index < input.length; ) {
+  for (let index = 0; index < input.length;) {
     if (input[index] !== "'") {
       masked += input[index];
       index += 1;

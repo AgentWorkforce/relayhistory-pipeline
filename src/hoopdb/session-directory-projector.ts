@@ -16,9 +16,12 @@
  *     each membership row carrying the directory row's last_activity_at;
  *   - tombstone when no live pointer remains (the trigger clears short_summary and
  *     search_text; memberships are deleted);
- *   - resurrection when a later live pointer appears: a live pointer indexed after
- *     the tombstone's deleted_at brings the row back, still with the historical
- *     created_at and with no summary until Bob Costas writes one;
+ *   - resurrection only for a genuinely new pointer revision (decision 0002: a deleted
+ *     upload or pointer never comes back): a live pointer whose revision is strictly
+ *     above its machine's resurrection fence (recorded when the row was tombstoned), or
+ *     from a machine with no fence. Re-sent, stale or un-deleted revisions stay fenced.
+ *     The row comes back with the historical created_at and no summary until Bob
+ *     Costas writes one;
  *   - task_title, agent_name and short_summary are not in session_index and are kept
  *     as already projected (short_summary is written only by writeShortSummary).
  *
@@ -81,10 +84,17 @@ export async function projectSessionDirectory(
        projected_at = now()
      WHERE d.deleted_at IS NULL
         OR EXISTS (
+          -- Resurrection only for a genuinely new pointer revision: live, and strictly
+          -- above its machine's fence (or a machine with no fence at all).
           SELECT 1 FROM sessions.session_index AS later
            WHERE later.org_id = d.org_id AND later.workspace_id = d.workspace_id
              AND later.harness = d.harness AND later.session_id = d.session_id
-             AND later.deleted_at IS NULL AND later.indexed_at > d.deleted_at)
+             AND later.deleted_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM sessions.session_directory_resurrection_fences AS f
+                WHERE f.org_id = later.org_id AND f.workspace_id = later.workspace_id
+                  AND f.harness = later.harness AND f.session_id = later.session_id
+                  AND f.machine_id = later.machine_id AND f.revision >= later.revision))
      RETURNING true AS projected`,
     params,
   );

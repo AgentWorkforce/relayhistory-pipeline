@@ -3,23 +3,20 @@
 ## Findings from this run (PostgreSQL 15.19 and 17.11)
 
 - **Leakproof flags.** `textlike` (`~~`) and `texticlike` (`~~*`) are not LEAKPROOF; `texteq` and the
-  text_pattern_ops bounds `text_pattern_ge`/`text_pattern_lt` are. RLS is enabled on
+  text_pattern_ops operators `text_pattern_ge`/`text_pattern_lt` are. RLS is enabled on
   `sessions.session_directory` without FORCE, so the SECURITY DEFINER owner is not subject to it.
 - **Direct `project_id` ILIKE as `authenticated`.** Only the leakproof tenant keys reach the
-  `session_directory_tenant_project_trgm_idx` Index Cond. The ILIKE stays a Filter, so the whole
+  `session_directory_tenant_project_trgm_idx` Index Cond; the ILIKE stays a Filter, so the whole
   tenant (30,000 rows) is read for 40 results. That is the surface the contract phase closes.
-  Inside the RPC, the same substring is a Bitmap Index Scan with the ILIKE in the Index Cond
-  (40 rows read for 40).
-- **Direct agent filters as `authenticated`.**
-  - Exact: an Index Cond on `session_directory_agent_recent_idx`.
-  - Selective bounded prefix: the bounds are the Index Cond (2,000 rows read for 50, 40x).
-- **Open finding: broad bounded prefix.** `age`, which here matches every tenant row, is a Seq
-  Scan plus top-N sort on both versions: 30,000 rows read for 50, past the 100x gate. The likely
-  cause is that the planner treats the redundant bounds and the LIKE recheck as independent, so
-  it underestimates matches and avoids the ordered index walk. In-process PGlite chose the walk
-  at a 51% match rate, which is why the CI test passes. The RPC's prefix path (LIKE only, as
-  owner) walks `session_directory_workspace_recent_idx` (725 rows filtered for 51). Needs a
-  reviewer decision.
+  Inside the RPC the same substring is a Bitmap Index Scan with the ILIKE in the Index Cond.
+- **Agent prefix is RPC-only.**
+  - The direct surface refuses every prefix (`agent_prefix_requires_rpc`) before any SQL.
+  - Worst case `age` (every tenant row matches): the RPC's budget probe is an Index Only Scan on
+    `session_directory_agent_recent_idx` that stops at exactly 5,001 rows, and the RPC returns
+    `54000 agent_prefix_too_broad`. The page query never runs and no tenant-wide scan happens.
+  - Selective prefix: the probe reads 800 index rows, then the page returns 51.
+  - This replaces the previous run's direct bounded-prefix Seq Scan finding.
+- **Direct agent exact as `authenticated`:** an Index Cond on `session_directory_agent_recent_idx`.
 - **`short_summary` as `authenticated`:** `42501` on both versions.
 - **Pointer function:** an Index Scan on `session_index_pkey` with the full key as Index Cond.
 
@@ -65,58 +62,6 @@ Planning:
   Buffers: shared hit=106
 ```
 
-### authenticated: direct agent prefix (selective, bounded)
-
-```
-Limit (actual rows=50 loops=1)
-  Buffers: shared hit=1181
-  InitPlan 1 (returns $0)
-    ->  Result (actual rows=1 loops=1)
-  InitPlan 2 (returns $1)
-    ->  Result (actual rows=1 loops=1)
-  ->  Sort (actual rows=50 loops=1)
-        Sort Key: session_directory.last_activity_at DESC, session_directory.session_id DESC, session_directory.harness DESC
-        Sort Method: top-N heapsort  Memory: 51kB
-        Buffers: shared hit=1181
-        ->  Result (actual rows=2000 loops=1)
-              One-Time Filter: ($0 = 'org-0'::text)
-              Buffers: shared hit=1181
-              ->  Bitmap Heap Scan on session_directory (actual rows=2000 loops=1)
-                    Recheck Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~>=~ 'agent-ledger-1'::text) AND (agent_name_normalized ~<~ 'agent-ledger-2'::text) AND (deleted_at IS NULL))
-                    Filter: (sessions.member_of(workspace_id, $1) AND (agent_name_normalized ~~ 'agent-ledger-1%'::text))
-                    Heap Blocks: exact=1145
-                    Buffers: shared hit=1181
-                    ->  Bitmap Index Scan on session_directory_agent_recent_idx (actual rows=2000 loops=1)
-                          Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~>=~ 'agent-ledger-1'::text) AND (agent_name_normalized ~<~ 'agent-ledger-2'::text))
-                          Buffers: shared hit=36
-Planning:
-  Buffers: shared hit=24
-```
-
-### authenticated: direct agent prefix (broad, bounded)
-
-```
-Limit (actual rows=50 loops=1)
-  Buffers: shared hit=2650
-  InitPlan 1 (returns $0)
-    ->  Result (actual rows=1 loops=1)
-  InitPlan 2 (returns $1)
-    ->  Result (actual rows=1 loops=1)
-  ->  Sort (actual rows=50 loops=1)
-        Sort Key: session_directory.last_activity_at DESC, session_directory.session_id DESC, session_directory.harness DESC
-        Sort Method: top-N heapsort  Memory: 51kB
-        Buffers: shared hit=2650
-        ->  Result (actual rows=30000 loops=1)
-              One-Time Filter: ($0 = 'org-0'::text)
-              Buffers: shared hit=2650
-              ->  Seq Scan on session_directory (actual rows=30000 loops=1)
-                    Filter: ((deleted_at IS NULL) AND sessions.member_of(workspace_id, $1) AND (agent_name_normalized ~>=~ 'age'::text) AND (agent_name_normalized ~<~ 'agf'::text) AND (org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~~ 'age%'::text))
-                    Rows Removed by Filter: 10000
-                    Buffers: shared hit=2650
-Planning:
-  Buffers: shared hit=1
-```
-
 ### authenticated: direct project_id ILIKE (the surface the contract phase closes)
 
 ```
@@ -148,44 +93,77 @@ Planning:
 
 authenticated `SELECT short_summary`: 42501 (42501 expected).
 
+direct agent prefix: agent_prefix_requires_rpc (typed refusal before any SQL; there is no direct prefix query).
+
 ### Worker RPC: p_project_contains (tenant project trigram index inside the RPC)
 
 ```
-duration: 0.189 ms  plan:
+-- result: ok, 40 rows
+duration: 0.213 ms  plan:
 Query Text: SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at, d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state, d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros, d.machine_ids, d.user_ids, d.short_summary, d.projected_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.deleted_at IS NULL AND d.workspace_id = $2 AND d.project_id ILIKE $7 ESCAPE '\' ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC LIMIT $19
-Limit  (cost=259.15..259.20 rows=22 width=344) (actual rows=40 loops=1)
+Limit  (cost=262.79..262.85 rows=23 width=344) (actual rows=40 loops=1)
   Buffers: shared hit=86
-  ->  Sort  (cost=259.15..259.20 rows=22 width=344) (actual rows=40 loops=1)
+  ->  Sort  (cost=262.79..262.85 rows=23 width=344) (actual rows=40 loops=1)
         Sort Key: last_activity_at DESC, session_id DESC, harness DESC
         Sort Method: quicksort  Memory: 35kB
         Buffers: shared hit=86
-        ->  Bitmap Heap Scan on session_directory d  (cost=176.29..258.66 rows=22 width=344) (actual rows=40 loops=1)
+        ->  Bitmap Heap Scan on session_directory d  (cost=176.30..262.27 rows=23 width=344) (actual rows=40 loops=1)
               Recheck Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (project_id ~~* '%zebra-cross%'::text) AND (deleted_at IS NULL))
               Heap Blocks: exact=40
               Buffers: shared hit=86
-              ->  Bitmap Index Scan on session_directory_tenant_project_trgm_idx  (cost=0.00..176.28 rows=22 width=0) (actual rows=40 loops=1)
+              ->  Bitmap Index Scan on session_directory_tenant_project_trgm_idx  (cost=0.00..176.29 rows=23 width=0) (actual rows=40 loops=1)
                     Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (project_id ~~* '%zebra-cross%'::text))
                     Buffers: shared hit=46
 ```
 
-### Worker RPC: p_agent prefix
+### Worker RPC: worst-case agent prefix 'age' (budget probe, then agent_prefix_too_broad)
 
 ```
-duration: 0.116 ms  plan:
+-- result: 54000: session search: agent_prefix_too_broad: more than 5000 sessions match this agent prefix
+duration: 1.706 ms  plan:
+Query Text: SELECT count(*) FROM (SELECT 1 FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL AND d.agent_name_normalized IS NOT NULL AND d.agent_name_normalized LIKE $3 ESCAPE '\' ORDER BY d.agent_name_normalized USING ~<~ LIMIT 5001) AS c
+Aggregate  (cost=1599.49..1599.50 rows=1 width=8) (actual rows=1 loops=1)
+  Buffers: shared hit=5087
+  ->  Limit  (cost=0.41..1536.98 rows=5001 width=19) (actual rows=5001 loops=1)
+        Buffers: shared hit=5087
+        ->  Index Only Scan using session_directory_agent_recent_idx on session_directory d  (cost=0.41..6938.78 rows=22582 width=19) (actual rows=5001 loops=1)
+              Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~>=~ 'age'::text) AND (agent_name_normalized ~<~ 'agf'::text))
+              Filter: (agent_name_normalized ~~ 'age%'::text)
+              Heap Fetches: 4999
+              Buffers: shared hit=5087
+```
+
+### Worker RPC: selective agent prefix (budget probe, then the page)
+
+```
+-- result: ok, 51 rows
+duration: 0.291 ms  plan:
+Query Text: SELECT count(*) FROM (SELECT 1 FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL AND d.agent_name_normalized IS NOT NULL AND d.agent_name_normalized LIKE $3 ESCAPE '\' ORDER BY d.agent_name_normalized USING ~<~ LIMIT 5001) AS c
+Aggregate  (cost=787.02..787.03 rows=1 width=8) (actual rows=1 loops=1)
+  Buffers: shared hit=816
+  ->  Limit  (cost=0.41..781.37 rows=452 width=19) (actual rows=800 loops=1)
+        Buffers: shared hit=816
+        ->  Index Only Scan using session_directory_agent_recent_idx on session_directory d  (cost=0.41..781.37 rows=452 width=19) (actual rows=800 loops=1)
+              Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~>=~ 'agent-ledger-11'::text) AND (agent_name_normalized ~<~ 'agent-ledger-12'::text))
+              Filter: (agent_name_normalized ~~ 'agent-ledger-11%'::text)
+              Heap Fetches: 799
+              Buffers: shared hit=816
+duration: 0.230 ms  plan:
 Query Text: SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at, d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state, d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros, d.machine_ids, d.user_ids, d.short_summary, d.projected_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.deleted_at IS NULL AND d.workspace_id = $2 AND d.agent_name_normalized LIKE $8 ESCAPE '\' ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC LIMIT $19
-Limit  (cost=0.41..407.88 rows=51 width=344) (actual rows=51 loops=1)
-  Buffers: shared hit=51
-  ->  Index Scan using session_directory_workspace_recent_idx on session_directory d  (cost=0.41..10626.37 rows=1330 width=344) (actual rows=51 loops=1)
+Limit  (cost=0.41..1199.32 rows=51 width=344) (actual rows=51 loops=1)
+  Buffers: shared hit=120
+  ->  Index Scan using session_directory_workspace_recent_idx on session_directory d  (cost=0.41..10626.01 rows=452 width=344) (actual rows=51 loops=1)
         Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text))
-        Filter: (agent_name_normalized ~~ 'agent-ledger-1%'::text)
-        Rows Removed by Filter: 725
-        Buffers: shared hit=51
+        Filter: (agent_name_normalized ~~ 'agent-ledger-11%'::text)
+        Rows Removed by Filter: 1854
+        Buffers: shared hit=120
 ```
 
 ### Worker RPC: p_query selective
 
 ```
-duration: 0.334 ms  plan:
+-- result: ok, 40 rows
+duration: 0.307 ms  plan:
 Query Text: SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at, d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state, d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros, d.machine_ids, d.user_ids, d.short_summary, d.projected_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.deleted_at IS NULL AND d.workspace_id = $2 AND d.search_text <> '' AND d.search_text ILIKE $4 ESCAPE '\' ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC LIMIT $19
 Limit  (cost=139.91..139.92 rows=2 width=344) (actual rows=40 loops=1)
   Buffers: shared hit=103
@@ -205,6 +183,7 @@ Limit  (cost=139.91..139.92 rows=2 width=344) (actual rows=40 loops=1)
 ### Worker RPC: pointers
 
 ```
+-- result: ok, 3 rows
 duration: 0.008 ms  plan:
 Query Text: SELECT p.org_id, p.workspace_id, p.harness, p.session_id, p.machine_id, p.user_id,
            p.storage_provider, p.bucket, p.manifest_key, p.content_sha256,
@@ -259,58 +238,6 @@ Planning:
   Buffers: shared hit=106
 ```
 
-### authenticated: direct agent prefix (selective, bounded)
-
-```
-Limit (actual rows=50 loops=1)
-  Buffers: shared hit=1181
-  InitPlan 1
-    ->  Result (actual rows=1 loops=1)
-  InitPlan 2
-    ->  Result (actual rows=1 loops=1)
-  ->  Sort (actual rows=50 loops=1)
-        Sort Key: session_directory.last_activity_at DESC, session_directory.session_id DESC, session_directory.harness DESC
-        Sort Method: top-N heapsort  Memory: 51kB
-        Buffers: shared hit=1181
-        ->  Result (actual rows=2000 loops=1)
-              One-Time Filter: ((InitPlan 1).col1 = 'org-0'::text)
-              Buffers: shared hit=1181
-              ->  Bitmap Heap Scan on session_directory (actual rows=2000 loops=1)
-                    Recheck Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~>=~ 'agent-ledger-1'::text) AND (agent_name_normalized ~<~ 'agent-ledger-2'::text) AND (deleted_at IS NULL))
-                    Filter: (sessions.member_of(workspace_id, (InitPlan 2).col1) AND (agent_name_normalized ~~ 'agent-ledger-1%'::text))
-                    Heap Blocks: exact=1145
-                    Buffers: shared hit=1181
-                    ->  Bitmap Index Scan on session_directory_agent_recent_idx (actual rows=2000 loops=1)
-                          Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~>=~ 'agent-ledger-1'::text) AND (agent_name_normalized ~<~ 'agent-ledger-2'::text))
-                          Buffers: shared hit=36
-Planning:
-  Buffers: shared hit=24
-```
-
-### authenticated: direct agent prefix (broad, bounded)
-
-```
-Limit (actual rows=50 loops=1)
-  Buffers: shared hit=2650
-  InitPlan 1
-    ->  Result (actual rows=1 loops=1)
-  InitPlan 2
-    ->  Result (actual rows=1 loops=1)
-  ->  Sort (actual rows=50 loops=1)
-        Sort Key: session_directory.last_activity_at DESC, session_directory.session_id DESC, session_directory.harness DESC
-        Sort Method: top-N heapsort  Memory: 51kB
-        Buffers: shared hit=2650
-        ->  Result (actual rows=30000 loops=1)
-              One-Time Filter: ((InitPlan 1).col1 = 'org-0'::text)
-              Buffers: shared hit=2650
-              ->  Seq Scan on session_directory (actual rows=30000 loops=1)
-                    Filter: ((deleted_at IS NULL) AND sessions.member_of(workspace_id, (InitPlan 2).col1) AND (agent_name_normalized ~>=~ 'age'::text) AND (agent_name_normalized ~<~ 'agf'::text) AND (org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~~ 'age%'::text))
-                    Rows Removed by Filter: 10000
-                    Buffers: shared hit=2650
-Planning:
-  Buffers: shared hit=1
-```
-
 ### authenticated: direct project_id ILIKE (the surface the contract phase closes)
 
 ```
@@ -342,46 +269,81 @@ Planning:
 
 authenticated `SELECT short_summary`: 42501 (42501 expected).
 
+direct agent prefix: agent_prefix_requires_rpc (typed refusal before any SQL; there is no direct prefix query).
+
 ### Worker RPC: p_project_contains (tenant project trigram index inside the RPC)
 
 ```
-duration: 0.188 ms  plan:
+-- result: ok, 40 rows
+duration: 0.210 ms  plan:
 Query Text: SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at, d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state, d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros, d.machine_ids, d.user_ids, d.short_summary, d.projected_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.deleted_at IS NULL AND d.workspace_id = $2 AND d.project_id ILIKE $7 ESCAPE '\' ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC LIMIT $19
 Query Parameters: $1 = 'org-0', $2 = 'ws-0', $3 = '{ws-0}', $4 = NULL, $5 = NULL, $6 = NULL, $7 = '%zebra-cross%', $8 = NULL, $9 = NULL, $10 = NULL, $11 = NULL, $12 = NULL, $13 = NULL, $14 = NULL, $15 = NULL, $16 = NULL, $17 = NULL, $18 = NULL, $19 = '51'
-Limit  (cost=265.42..265.48 rows=21 width=344) (actual rows=40 loops=1)
+Limit  (cost=261.77..261.82 rows=20 width=344) (actual rows=40 loops=1)
   Buffers: shared hit=86
-  ->  Sort  (cost=265.42..265.48 rows=21 width=344) (actual rows=40 loops=1)
+  ->  Sort  (cost=261.77..261.82 rows=20 width=344) (actual rows=40 loops=1)
         Sort Key: last_activity_at DESC, session_id DESC, harness DESC
         Sort Method: quicksort  Memory: 35kB
         Buffers: shared hit=86
-        ->  Bitmap Heap Scan on session_directory d  (cost=186.20..264.96 rows=21 width=344) (actual rows=40 loops=1)
+        ->  Bitmap Heap Scan on session_directory d  (cost=186.20..261.34 rows=20 width=344) (actual rows=40 loops=1)
               Recheck Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (project_id ~~* '%zebra-cross%'::text) AND (deleted_at IS NULL))
               Heap Blocks: exact=40
               Buffers: shared hit=86
-              ->  Bitmap Index Scan on session_directory_tenant_project_trgm_idx  (cost=0.00..186.20 rows=21 width=0) (actual rows=40 loops=1)
+              ->  Bitmap Index Scan on session_directory_tenant_project_trgm_idx  (cost=0.00..186.19 rows=20 width=0) (actual rows=40 loops=1)
                     Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (project_id ~~* '%zebra-cross%'::text))
                     Buffers: shared hit=46
 ```
 
-### Worker RPC: p_agent prefix
+### Worker RPC: worst-case agent prefix 'age' (budget probe, then agent_prefix_too_broad)
 
 ```
-duration: 0.098 ms  plan:
+-- result: 54000: session search: agent_prefix_too_broad: more than 5000 sessions match this agent prefix
+duration: 1.315 ms  plan:
+Query Text: SELECT count(*) FROM (SELECT 1 FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL AND d.agent_name_normalized IS NOT NULL AND d.agent_name_normalized LIKE $3 ESCAPE '\' ORDER BY d.agent_name_normalized USING ~<~ LIMIT 5001) AS c
+Query Parameters: $1 = 'org-0', $2 = 'ws-0', $3 = 'age%'
+Aggregate  (cost=1597.93..1597.94 rows=1 width=8) (actual rows=1 loops=1)
+  Buffers: shared hit=5087
+  ->  Limit  (cost=0.41..1535.42 rows=5001 width=19) (actual rows=5001 loops=1)
+        Buffers: shared hit=5087
+        ->  Index Only Scan using session_directory_agent_recent_idx on session_directory d  (cost=0.41..6932.35 rows=22584 width=19) (actual rows=5001 loops=1)
+              Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~>=~ 'age'::text) AND (agent_name_normalized ~<~ 'agf'::text))
+              Filter: (agent_name_normalized ~~ 'age%'::text)
+              Heap Fetches: 4999
+              Buffers: shared hit=5087
+```
+
+### Worker RPC: selective agent prefix (budget probe, then the page)
+
+```
+-- result: ok, 51 rows
+duration: 0.220 ms  plan:
+Query Text: SELECT count(*) FROM (SELECT 1 FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL AND d.agent_name_normalized IS NOT NULL AND d.agent_name_normalized LIKE $3 ESCAPE '\' ORDER BY d.agent_name_normalized USING ~<~ LIMIT 5001) AS c
+Query Parameters: $1 = 'org-0', $2 = 'ws-0', $3 = 'agent-ledger-11%'
+Aggregate  (cost=779.19..779.20 rows=1 width=8) (actual rows=1 loops=1)
+  Buffers: shared hit=816
+  ->  Limit  (cost=0.41..773.59 rows=448 width=19) (actual rows=800 loops=1)
+        Buffers: shared hit=816
+        ->  Index Only Scan using session_directory_agent_recent_idx on session_directory d  (cost=0.41..773.59 rows=448 width=19) (actual rows=800 loops=1)
+              Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~>=~ 'agent-ledger-11'::text) AND (agent_name_normalized ~<~ 'agent-ledger-12'::text))
+              Filter: (agent_name_normalized ~~ 'agent-ledger-11%'::text)
+              Heap Fetches: 799
+              Buffers: shared hit=816
+duration: 0.201 ms  plan:
 Query Text: SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at, d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state, d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros, d.machine_ids, d.user_ids, d.short_summary, d.projected_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.deleted_at IS NULL AND d.workspace_id = $2 AND d.agent_name_normalized LIKE $8 ESCAPE '\' ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC LIMIT $19
-Query Parameters: $1 = 'org-0', $2 = 'ws-0', $3 = '{ws-0}', $4 = NULL, $5 = NULL, $6 = NULL, $7 = NULL, $8 = 'agent-ledger-1%', $9 = NULL, $10 = NULL, $11 = NULL, $12 = NULL, $13 = NULL, $14 = NULL, $15 = NULL, $16 = NULL, $17 = NULL, $18 = NULL, $19 = '51'
-Limit  (cost=0.41..400.00 rows=51 width=344) (actual rows=51 loops=1)
-  Buffers: shared hit=51
-  ->  Index Scan using session_directory_workspace_recent_idx on session_directory d  (cost=0.41..10632.49 rows=1357 width=344) (actual rows=51 loops=1)
+Query Parameters: $1 = 'org-0', $2 = 'ws-0', $3 = '{ws-0}', $4 = NULL, $5 = NULL, $6 = NULL, $7 = NULL, $8 = 'agent-ledger-11%', $9 = NULL, $10 = NULL, $11 = NULL, $12 = NULL, $13 = NULL, $14 = NULL, $15 = NULL, $16 = NULL, $17 = NULL, $18 = NULL, $19 = '51'
+Limit  (cost=0.41..1208.66 rows=51 width=344) (actual rows=51 loops=1)
+  Buffers: shared hit=120
+  ->  Index Scan using session_directory_workspace_recent_idx on session_directory d  (cost=0.41..10614.01 rows=448 width=344) (actual rows=51 loops=1)
         Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text))
-        Filter: (agent_name_normalized ~~ 'agent-ledger-1%'::text)
-        Rows Removed by Filter: 725
-        Buffers: shared hit=51
+        Filter: (agent_name_normalized ~~ 'agent-ledger-11%'::text)
+        Rows Removed by Filter: 1854
+        Buffers: shared hit=120
 ```
 
 ### Worker RPC: p_query selective
 
 ```
-duration: 0.316 ms  plan:
+-- result: ok, 40 rows
+duration: 0.310 ms  plan:
 Query Text: SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at, d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state, d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros, d.machine_ids, d.user_ids, d.short_summary, d.projected_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.deleted_at IS NULL AND d.workspace_id = $2 AND d.search_text <> '' AND d.search_text ILIKE $4 ESCAPE '\' ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC LIMIT $19
 Query Parameters: $1 = 'org-0', $2 = 'ws-0', $3 = '{ws-0}', $4 = '%zebra-crossing%', $5 = NULL, $6 = NULL, $7 = NULL, $8 = NULL, $9 = NULL, $10 = NULL, $11 = NULL, $12 = NULL, $13 = NULL, $14 = NULL, $15 = NULL, $16 = NULL, $17 = NULL, $18 = NULL, $19 = '51'
 Limit  (cost=150.15..150.15 rows=2 width=344) (actual rows=40 loops=1)
@@ -402,6 +364,7 @@ Limit  (cost=150.15..150.15 rows=2 width=344) (actual rows=40 loops=1)
 ### Worker RPC: pointers
 
 ```
+-- result: ok, 3 rows
 duration: 0.008 ms  plan:
 Query Text: SELECT p.org_id, p.workspace_id, p.harness, p.session_id, p.machine_id, p.user_id,
            p.storage_provider, p.bucket, p.manifest_key, p.content_sha256,

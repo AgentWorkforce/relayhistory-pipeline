@@ -7,4 +7,7 @@ BEGIN;
 DROP FUNCTION IF EXISTS sessions.session_directory_readiness();
 DROP FUNCTION IF EXISTS sessions.session_directory_pointers(text, text, text);
 DROP FUNCTION IF EXISTS sessions.session_directory_worker_scope(text);
+DROP TRIGGER IF EXISTS session_directory_record_fences ON sessions.session_directory;
+DROP FUNCTION IF EXISTS sessions.session_directory_record_fences();
+DROP TABLE IF EXISTS sessions.session_directory_resurrection_fences;
 COMMIT;

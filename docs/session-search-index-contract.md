@@ -26,18 +26,18 @@ recent-session pages.
 
 ## Indexed remote query shapes
 
-| Filter or lookup                     | Index strategy                                                                                                                                                                                                                   |
-| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| workspace or org recent              | partial ordered btree with a total logical-session cursor                                                                                                                                                                        |
-| harness/source                       | workspace + harness + activity cursor                                                                                                                                                                                            |
-| exact project or no project          | separate partial activity indexes                                                                                                                                                                                                |
-| agent exact or prefix                | normalized name with `text_pattern_ops`, then activity cursor; served through the RPC so the prefix is an index condition (under RLS `LIKE` is not LEAKPROOF and was only a filter: 1409x row amplification at benchmark size M) |
-| created range                        | workspace + `created_at` cursor                                                                                                                                                                                                  |
-| state                                | workspace + state + activity cursor                                                                                                                                                                                              |
-| user or machine                      | normalized membership table + activity cursor                                                                                                                                                                                    |
-| session ID without workspace/harness | org + session ID lookup                                                                                                                                                                                                          |
-| project substring                    | `sessions.search_session_directory` RPC only, over tenant-scoped trigram GIN `(org_id, workspace_id, project_id)` (replaces #38's `session_directory_project_trgm_idx`)                                                          |
-| metadata + short summary substring   | `sessions.search_session_directory` RPC only, over tenant-scoped trigram GIN `(org_id, workspace_id, search_text)` (btree_gin)                                                                                                   |
+| Filter or lookup                     | Index strategy                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| workspace or org recent              | partial ordered btree with a total logical-session cursor                                                                                                                                                                                                                                                                                     |
+| harness/source                       | workspace + harness + activity cursor                                                                                                                                                                                                                                                                                                         |
+| exact project or no project          | separate partial activity indexes                                                                                                                                                                                                                                                                                                             |
+| agent exact or prefix                | exact: normalized name with `text_pattern_ops`, then activity cursor, direct or through the RPC. Prefix: RPC only (the direct surface refuses it, `AgentPrefixRequiresRpcError`), with a candidate budget of 5,000 checked by an ordered walk of `session_directory_agent_recent_idx`; a broader prefix is `agent_prefix_too_broad` (`54000`) |
+| created range                        | workspace + `created_at` cursor                                                                                                                                                                                                                                                                                                               |
+| state                                | workspace + state + activity cursor                                                                                                                                                                                                                                                                                                           |
+| user or machine                      | normalized membership table + activity cursor                                                                                                                                                                                                                                                                                                 |
+| session ID without workspace/harness | org + session ID lookup                                                                                                                                                                                                                                                                                                                       |
+| project substring                    | `sessions.search_session_directory` RPC only, over tenant-scoped trigram GIN `(org_id, workspace_id, project_id)` (replaces #38's `session_directory_project_trgm_idx`)                                                                                                                                                                       |
+| metadata + short summary substring   | `sessions.search_session_directory` RPC only, over tenant-scoped trigram GIN `(org_id, workspace_id, search_text)` (btree_gin)                                                                                                                                                                                                                |
 
 The executable definitions live in
 `src/hoopdb/search-index-contract.ts`. `bun run audit:search-indexes` is
@@ -170,31 +170,32 @@ and its `session_catalog_agents` index are not the production contract. Its
 normalization and ordered-prefix lessons remain valid; its event-triggered catalog
 projection and legacy rollout marker do not.
 
-## Agent prefix and benchmark gate
+## Agent prefix: RPC only, with a candidate budget
 
-Exact lookup accepts a complete normalized name. Prefix lookup requires at least
-three Unicode characters after trim/lowercase normalization. Shorter prefixes are
-rejected rather than allowed to scan a large tenant directory.
+Exact lookup accepts a complete normalized name, on the direct list surface or through
+the RPC. Direct exact input must be ASCII (`NonAsciiAgentFilterError` otherwise).
 
-Before a rollout can be marked complete, run exact and prefix queries against a
-production-shaped population and record p50/p95 latency plus `EXPLAIN (ANALYZE,
-BUFFERS, FORMAT JSON)`. The deterministic gate is:
+Prefix lookup is served only by `sessions.search_session_directory`
+(`p_agent_match => 'prefix'`). On the direct surface every prefix is a typed
+`AgentPrefixRequiresRpcError` (`directAgentPrefix`), raised before any SQL, and there is
+no direct prefix query. Under RLS the direct path could not bound a broad prefix: its
+bounds and LIKE recheck are estimated as independent, and PostgreSQL 15 and 17 chose a
+Seq Scan of the whole tenant (`docs/evidence/session-directory-plans.md`).
 
-- page size: 50;
-- exact and representative selective prefixes must use
-  `session_directory_agent_recent_idx` to constrain the name;
-- at least exact, representative three-character, and deliberately broad
-  three-character prefixes are measured;
-- for a deliberately broad prefix PostgreSQL may instead walk
-  `session_directory_workspace_recent_idx` or `session_directory_org_recent_idx`
-  and filter in recency order; actual index rows plus `Rows Removed by Filter`,
-  divided by returned rows, must be at most 100.
+In the RPC, a prefix needs at least three meaningful characters (`22023` otherwise).
+Before the page runs, the RPC counts the prefix's candidates, stopping after 5,001:
 
-If a real three-character prefix fails that gate, do not relax the limit or hide it
-with a faster test host. Raise the minimum prefix, add a proven projection, or move
-agent discovery to a dedicated names table. Timing thresholds are environment
-specific and belong in the release evidence; the row-amplification bound is the
-portable correctness/performance gate.
+- the count is an ordered walk of `session_directory_agent_recent_idx` (an Index Only
+  Scan; seqscan, bitmapscan and sort are disabled for that one statement and restored
+  after);
+- more than `AGENT_PREFIX_CANDIDATE_BUDGET` (5,000 = page size 50 x the 100x gate) is
+  refused as `agent_prefix_too_broad` (`54000`), asking for a longer prefix or an exact
+  agent;
+- so no prefix, however broad, reads more than 5,001 index entries or scans the tenant.
+  Raising the minimum length alone would not bound it.
+
+The release evidence still records p50/p95 and plans on a production-shaped
+population. The budget, not a test host's speed, is the bound.
 
 ## Direct surface: expand then contract
 
@@ -219,6 +220,8 @@ cosmetic index is added. The surface closes in two phases.
   too: the `session_directory_search_token_policy` issuer and audience, the lifetime
   bound, and 1 to 64 valid workspace ids. EXECUTE goes to
   `session_directory_search_worker` only, and both apply the same call-time role guard.
+- `sessions.session_directory_resurrection_fences` and its trigger implement the
+  decision 0002 resurrection rule (see "Projector precedence").
 - Nothing is revoked. `short_summary` is unchanged. There is no `service_role` fallback.
 
 **Contract (later, separate, not applied here)**
@@ -247,10 +250,16 @@ applies, and `session-directory-precedence.test.ts` pins:
   LIVE pointers. Each membership row carries the directory row's `last_activity_at`.
 - **Tombstone:** when no live pointer remains. The trigger clears `short_summary` and
   `search_text`, and memberships are deleted.
-- **Resurrection:** when a later live pointer appears, meaning a live pointer whose
-  `indexed_at` is after the row's `deleted_at`. The row comes back with the historical
-  `created_at` and no summary until Bob Costas writes one. Re-sending a stale manifest
-  revision does not resurrect, because `upsert_session_index` fences it.
+- **Resurrection:** only for a genuinely new pointer revision (helm-chart-chief's
+  ruling on decision 0002, below):
+  - When a row becomes a tombstone, the trigger `session_directory_record_fences`
+    records every pointer's highest revision in
+    `session_directory_resurrection_fences` (expand migration `20261031001000`).
+  - The row comes back only for a live pointer whose revision is strictly above its
+    machine's fence, or from a machine with no fence. It returns with the historical
+    `created_at` and no summary until Bob Costas writes one.
+  - Re-sent, stale or un-deleted pointer revisions stay fenced permanently. Fences only
+    rise, and erasure deletes them with the row.
 - **Unchanged:** `task_title`, `agent_name` and `short_summary` are kept as projected.
 
 Provenance of the approval, recorded verbatim so it can be judged and reverted:
@@ -263,10 +272,16 @@ Provenance of the approval, recorded verbatim so it can be judged and reverted:
 - It was relayed to this lane by the 96-no-bull-migration coordinator. The
   implementing agent did not see that session firsthand.
 
-Resurrection sits alongside decision 0002's "deleted uploads and resets never come
-back", which concerns what the migration exporter copies. A later live pointer means
-the client uploaded again after the deletion; reviewers should confirm that
-interpretation. The rollout marker is still set only by the backfill lane.
+Decision 0002 and resurrection (helm-chart-chief's ruling):
+
+- A deleted upload or pointer never comes back. Its revision is fenced, so un-deleting it,
+  re-sending it, or sending an older or equal revision cannot revive anything.
+- A logical session may be resurrected, but only by a genuinely new live pointer with a
+  strictly newer admissible revision (a new upload after the deletion).
+
+`session-directory-precedence.test.ts` covers all three: a deleted pointer never
+revives, a stale or equal revision cannot, and a new higher revision (or a machine with
+no prior pointer) can. The rollout marker is still set only by the backfill lane.
 
 ## Dimensions that remain local
 
