@@ -141,6 +141,9 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
   args: { p_workspace_id: "text", p_query: "text" },
   workerRole: "session_directory_search_worker",
   claims: { role: "session_directory_search_worker", orgId: "app_metadata.org_id", workspaceIds: "app_metadata.workspace_ids" },
+  /** `iss` comes from sessions.session_directory_search_token_policy, per environment. */
+  audience: "session-directory-search",
+  maxTokenLifetimeSeconds: 60,
   /** Meaningful characters after normalizeSearchQuery: not separators, format characters or marks. */
   minQueryChars: 3,
   maxQueryChars: 200,
@@ -154,7 +157,7 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     "machine_ids", "user_ids", "short_summary", "projected_at",
   ],
   errors: {
-    "42501": "caller is not the Worker role, or tenant claims missing, malformed, for another role, or not covering the workspace",
+    "42501": "caller is not the Worker role, or tenant claims missing, malformed, for another role, from another issuer or audience, too long-lived, or not covering exactly the workspace",
     "22023": "fewer than 3 meaningful characters, or more than 200, after normalizeSearchQuery (search-query.ts)",
     "57014": "statement_timeout (2s on the Worker role) exceeded",
   },

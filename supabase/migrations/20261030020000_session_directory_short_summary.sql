@@ -158,6 +158,21 @@ $query$;
 --          role, or not covering the workspace
 --   22023  fewer than 3 meaningful characters, or over 200, after
 --          sessions.session_directory_search_query normalization
+-- The one issuer and audience the RPC accepts. PostgREST verifies the signature, but
+-- a project can trust several keys and may not check `aud`, so the RPC pins both.
+-- No row is seeded: search is refused until an environment adds its own, and adding
+-- it is a deployment step. Only the owner reads this table, through the RPC.
+CREATE TABLE sessions.session_directory_search_token_policy (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  issuer text NOT NULL CHECK (issuer ~ '^https?://'),
+  audience text NOT NULL CHECK (audience <> ''),
+  max_lifetime_seconds integer NOT NULL DEFAULT 60
+    CHECK (max_lifetime_seconds BETWEEN 1 AND 60)
+);
+ALTER TABLE sessions.session_directory_search_token_policy ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_directory_search_token_policy
+  FROM PUBLIC, anon, authenticated, service_role;
+
 CREATE FUNCTION sessions.search_session_directory(p_workspace_id text, p_query text)
 RETURNS TABLE (
   org_id text, workspace_id text, harness text, session_id text,
@@ -171,6 +186,7 @@ LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $search$
 DECLARE
   v_claims jsonb;
+  v_policy sessions.session_directory_search_token_policy%ROWTYPE;
   v_org text;
   v_workspaces text[];
   v_query text;
@@ -192,6 +208,22 @@ BEGIN
      OR jsonb_typeof(v_claims -> 'app_metadata') IS DISTINCT FROM 'object'
      OR jsonb_typeof(v_claims -> 'app_metadata' -> 'org_id') IS DISTINCT FROM 'string'
      OR jsonb_typeof(v_claims -> 'app_metadata' -> 'workspace_ids') IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session search: tenant claims missing or invalid';
+  END IF;
+  SELECT * INTO v_policy
+    FROM sessions.session_directory_search_token_policy WHERE singleton;
+  IF NOT FOUND
+     OR (v_claims ->> 'iss') IS DISTINCT FROM v_policy.issuer
+     OR jsonb_typeof(v_claims -> 'aud') IS DISTINCT FROM 'string'
+     OR (v_claims ->> 'aud') IS DISTINCT FROM v_policy.audience
+     OR jsonb_typeof(v_claims -> 'exp') IS DISTINCT FROM 'number'
+     OR jsonb_typeof(v_claims -> 'iat') IS DISTINCT FROM 'number'
+     OR (v_claims ->> 'exp')::numeric - (v_claims ->> 'iat')::numeric
+          NOT BETWEEN 1 AND v_policy.max_lifetime_seconds
+     -- A far-future iat must not stretch the window; 30s allows for clock skew.
+     OR (v_claims ->> 'exp')::numeric - extract(epoch FROM clock_timestamp())
+          > v_policy.max_lifetime_seconds + 30
+     OR jsonb_array_length(v_claims -> 'app_metadata' -> 'workspace_ids') <> 1 THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session search: tenant claims missing or invalid';
   END IF;
   v_org := v_claims -> 'app_metadata' ->> 'org_id';

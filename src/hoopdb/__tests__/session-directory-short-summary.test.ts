@@ -49,6 +49,7 @@ const MIGRATION = "20261030020000_session_directory_short_summary.sql";
 const DOWN = read(`supabase/rollbacks/${MIGRATION.replace(/\.sql$/, ".down.sql")}`);
 const UP = read(`supabase/migrations/${MIGRATION}`);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
+const TOKEN_ISSUER = "https://issuer.test/session-directory";
 
 // Synthetic secret-shaped values, assembled at runtime so no literal sits on disk.
 const FAKE_RELAY_TOKEN = ["relay", "ag", "x".repeat(24)].join("_");
@@ -67,6 +68,10 @@ async function database(prelude = ""): Promise<PGlite> {
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
   }
+  await db.query(
+    `INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)`,
+    [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],
+  );
   return db;
 }
 
@@ -105,8 +110,23 @@ async function row(db: PGlite, session = "s-1"): Promise<Row | undefined> {
   )).rows[0];
 }
 
-const claims = (org: string, workspaces: string[], role: string = WORKER) =>
-  JSON.stringify({ role, app_metadata: { org_id: org, workspace_ids: workspaces } });
+const claims = (
+  org: string,
+  workspaces: string[],
+  role: string = WORKER,
+  overrides: Record<string, unknown> = {},
+) => {
+  const iat = Math.floor(Date.now() / 1000);
+  return JSON.stringify({
+    role,
+    iss: TOKEN_ISSUER,
+    aud: SESSION_DIRECTORY_SEARCH_RPC.audience,
+    iat,
+    exp: iat + 60,
+    app_metadata: { org_id: org, workspace_ids: workspaces },
+    ...overrides,
+  });
+};
 
 /** Calls the RPC exactly as PostgREST would: SET ROLE to the Worker, claims GUC set. */
 async function search(
@@ -130,6 +150,69 @@ async function search(
     await db.query("SELECT set_config('request.jwt.claims', '', false)");
   }
 }
+
+describe("search token pins", () => {
+  const now = () => Math.floor(Date.now() / 1000);
+  const refused = async (db: PGlite, claimsJson: string) => {
+    await expect(search(db, claimsJson, "ws-a", "flaky")).rejects.toMatchObject({ code: "42501" });
+  };
+
+  test("accepts a token from the pinned issuer and audience", async () => {
+    const db = await database();
+    await insertRow(db);
+    expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "flaky")).toHaveLength(1);
+  });
+
+  test("refuses another issuer or audience, including an array audience", async () => {
+    const db = await database();
+    await insertRow(db);
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { iss: "https://relayauth.dev" }));
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { iss: undefined }));
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { aud: "relayhistory" }));
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { aud: undefined }));
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { aud: [SESSION_DIRECTORY_SEARCH_RPC.audience] }));
+  });
+
+  test("refuses a missing, malformed, long or zero lifetime, and a far-future iat", async () => {
+    const db = await database();
+    await insertRow(db);
+    const t = now();
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { exp: undefined }));
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { iat: undefined }));
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { exp: String(t + 60) }));
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { iat: t, exp: t + 61 }));
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { iat: t, exp: t }));
+    await refused(db, claims("org-a", ["ws-a"], WORKER, { iat: t + 3600, exp: t + 3660 }));
+  });
+
+  test("refuses more than one workspace, even when the requested one is listed", async () => {
+    const db = await database();
+    await insertRow(db);
+    await refused(db, claims("org-a", ["ws-a", "ws-b"]));
+  });
+
+  test("refuses everything when no policy row exists, and the migration seeds none", async () => {
+    const db = await database();
+    await insertRow(db);
+    await db.query("DELETE FROM sessions.session_directory_search_token_policy");
+    await refused(db, claims("org-a", ["ws-a"]));
+    expect(UP).not.toMatch(/INSERT INTO sessions\.session_directory_search_token_policy/);
+  });
+
+  test("the policy has one row and no role but the owner can read it", async () => {
+    const db = await database();
+    await expect(db.query(
+      "INSERT INTO sessions.session_directory_search_token_policy (singleton, issuer, audience) VALUES (false, 'https://x', 'y')",
+    )).rejects.toThrow();
+    for (const role of ["anon", "authenticated", "service_role", WORKER]) {
+      const allowed = await db.query<{ ok: boolean }>(
+        "SELECT has_table_privilege($1, 'sessions.session_directory_search_token_policy', 'SELECT') AS ok",
+        [role],
+      );
+      expect(allowed.rows[0]!.ok).toBe(false);
+    }
+  });
+});
 
 describe("short_summary writer", () => {
   test("stores only scrubbed text and records the scrub ruleset and version", async () => {
@@ -918,6 +1001,10 @@ describe("short_summary rollback", () => {
     expect((await row(db))?.search_text).toBe("Fix flaky queue test Helm proj-1");
 
     await db.exec(UP);
+    await db.query(
+      "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
+      [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],
+    );
     await summarize(db, KEY, "pelican again");
     expect((await row(db))?.short_summary).toBe("pelican again");
     expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "pelican")).toHaveLength(1);
