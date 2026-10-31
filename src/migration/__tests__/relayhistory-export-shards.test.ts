@@ -274,6 +274,11 @@ describe("indivisible sessions", () => {
 
 describe("resume per shard", () => {
   const uploads = Array.from({ length: 2100 }, (_, i) => upload({ session: `s${String(i).padStart(4, "0")}` }));
+  /** A complete courier result for a shard: every manifest committed. */
+  const complete = (shard: { shard_id: string; plan: { manifests: { key: string }[] } }) => ({
+    grantId: `mgr_${shard.shard_id}`,
+    result: { committed: shard.plan.manifests.map((m) => ({ key: m.key, workKey: `${m.key}@x` })), skipped: [], failed: [], deferred: [] },
+  });
 
   test("a crash re-runs only unfinished shards, each with its own checkpoint", async () => {
     const dir = await mkdtemp(join(tmpdir(), "shards-"));
@@ -281,16 +286,16 @@ describe("resume per shard", () => {
     const plan = planShards({ exportedAt: EXPORTED_AT, uploads });
     expect(plan.shards).toHaveLength(3);
     const calls: { id: string; checkpoint: string }[] = [];
-    const crashing = async ({ shard, checkpointPath }: { shard: { shard_id: string }; checkpointPath: string }) => {
+    const crashing = async ({ shard, checkpointPath }: { shard: Parameters<typeof complete>[0]; checkpointPath: string }) => {
       calls.push({ id: shard.shard_id, checkpoint: checkpointPath });
       if (calls.length === 2) throw new Error("crash");
-      return { grantId: `mgr_${shard.shard_id}` };
+      return complete(shard);
     };
     await expect(runShards(plan, { stateDir: dir, runShard: crashing })).rejects.toThrow("crash");
     calls.length = 0;
     const second = await runShards(plan, { stateDir: dir, runShard: async ({ shard, checkpointPath }) => {
       calls.push({ id: shard.shard_id, checkpoint: checkpointPath });
-      return { grantId: `mgr_${shard.shard_id}` };
+      return complete(shard);
     } });
     expect(second.skipped).toEqual([plan.shards[0]!.shard_id]);
     expect(second.ran).toEqual([plan.shards[1]!.shard_id, plan.shards[2]!.shard_id]);
@@ -299,7 +304,7 @@ describe("resume per shard", () => {
     const third = await runShards(plan, { stateDir: dir, runShard: async () => {
       throw new Error("must not run");
     } });
-    expect(third).toEqual({ ran: [], skipped: ids(plan) });
+    expect(third).toEqual({ ran: [], skipped: ids(plan), incomplete: [] });
     expect((await readdir(dir)).filter((f) => f.endsWith(".done.json"))).toHaveLength(3);
   });
 
@@ -308,8 +313,29 @@ describe("resume per shard", () => {
     dirs.push(dir);
     const plan = planShards({ exportedAt: EXPORTED_AT, uploads: [...uploads.slice(0, 5), upload({ session: "big", chunks: 4097 })] });
     let ran = 0;
-    await expect(runShards(plan, { stateDir: dir, runShard: async () => (ran++, { grantId: "x" }) })).rejects.toMatchObject({ code: "oversized_session" });
+    await expect(runShards(plan, { stateDir: dir, runShard: async ({ shard }) => (ran++, complete(shard)) })).rejects.toMatchObject({ code: "oversized_session" });
     expect(ran).toBe(0);
+  });
+
+  test("a shard is recorded done only when every manifest committed: failed, deferred, missing or stopped results re-run", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "shards-"));
+    dirs.push(dir);
+    const plan = planShards({ exportedAt: EXPORTED_AT, uploads });
+    const [a, b, c] = plan.shards;
+    const partial = (shard: typeof a, over: object) => ({ grantId: "g", result: { ...complete(shard!).result, ...over } });
+    const first = await runShards(plan, { stateDir: dir, runShard: async ({ shard }) =>
+      shard.shard_id === a!.shard_id ? partial(shard, { failed: [{ key: shard.plan.manifests[0]!.key, code: "x" }] })
+        : shard.shard_id === b!.shard_id ? partial(shard, { deferred: [{ key: shard.plan.manifests[0]!.key, code: "straddling_session", waits: 0 }] })
+          : partial(shard, { committed: complete(shard).result.committed.slice(1) }) });
+    expect(first.ran).toEqual([]);
+    expect(first.incomplete.map((i) => i.reason)).toEqual(["1 failed", "1 deferred", "1 manifest(s) not committed"]);
+    expect((await readdir(dir)).filter((f) => f.endsWith(".done.json"))).toHaveLength(0);
+    // A stopped upload stops the run.
+    const stopped = await runShards(plan, { stateDir: dir, runShard: async ({ shard }) => partial(shard, { stopped: { key: "k", code: "invalid_claims", status: 401 } }) });
+    expect(stopped).toMatchObject({ ran: [], stopped: a!.shard_id, incomplete: [{ shard_id: a!.shard_id, reason: "stopped: invalid_claims" }] });
+    // Complete results (some skipped by the courier checkpoint) are done.
+    const done = await runShards(plan, { stateDir: dir, runShard: async ({ shard }) => ({ grantId: "g", result: { committed: [], skipped: shard.plan.manifests.map((m) => m.key), failed: [], deferred: [] } }) });
+    expect(done.ran).toEqual([a!.shard_id, b!.shard_id, c!.shard_id]);
   });
 });
 

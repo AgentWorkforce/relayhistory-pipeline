@@ -46,7 +46,7 @@ import {
   migrationGrantSerializedBytes,
   MigrationPlanError,
 } from "./vendor/relayauth-migration-plan.ts";
-import type { ExportPlan, UploadInput } from "./relayhistory-export-upload.ts";
+import type { ExportPlan, ExportUploadResult, UploadInput } from "./relayhistory-export-upload.ts";
 import { manifestKey } from "@rhc-object-store";
 
 export const SHARD_PLANNER_VERSION = 1;
@@ -307,18 +307,40 @@ export interface ShardRunContext {
   checkpointPath: string;
 }
 
+/** What a shard run must report: the courier's result for this shard's grant. */
+export interface ShardRunResult {
+  grantId: string;
+  result: Pick<ExportUploadResult, "committed" | "skipped" | "failed" | "deferred" | "stopped">;
+}
+
 /**
- * Run shards in plan order, each once: a shard recorded done is skipped, so a
- * crash re-runs only unfinished shards (whose own courier checkpoints then
- * skip their committed manifests). Refuses an unshardable plan.
+ * Whether a shard's upload is complete: nothing failed, deferred or stopped,
+ * and every one of the shard's manifests is committed (now or in a prior run).
+ * Returns the reason it is not, or undefined.
+ */
+export function shardIncomplete(shard: Shard, r: ShardRunResult["result"]): string | undefined {
+  if (r.stopped) return `stopped: ${r.stopped.code}`;
+  if (r.failed.length) return `${r.failed.length} failed`;
+  if (r.deferred.length) return `${r.deferred.length} deferred`;
+  const done = new Set([...r.committed.map((c) => c.key), ...r.skipped]);
+  const missing = shard.plan.manifests.filter((m) => !done.has(m.key)).length;
+  return missing ? `${missing} manifest(s) not committed` : undefined;
+}
+
+/**
+ * Run shards in plan order. A shard is recorded done only when its upload
+ * result is complete (`shardIncomplete`); a done shard is skipped on a rerun,
+ * an incomplete one runs again (its courier checkpoint skips what committed).
+ * A stopped upload stops the run. Refuses an unshardable plan.
  */
 export async function runShards(
   plan: ShardPlan,
-  opts: { stateDir: string; runShard: (ctx: ShardRunContext) => Promise<{ grantId: string }> },
-): Promise<{ ran: string[]; skipped: string[] }> {
+  opts: { stateDir: string; runShard: (ctx: ShardRunContext) => Promise<ShardRunResult> },
+): Promise<{ ran: string[]; skipped: string[]; incomplete: { shard_id: string; reason: string }[]; stopped?: string }> {
   requireShardable(plan);
   const ran: string[] = [];
   const skipped: string[] = [];
+  const incomplete: { shard_id: string; reason: string }[] = [];
   await mkdir(opts.stateDir, { recursive: true });
   for (const shard of plan.shards) {
     const donePath = join(opts.stateDir, `${shard.shard_id}.done.json`);
@@ -330,12 +352,18 @@ export async function runShards(
       skipped.push(shard.shard_id);
       continue;
     }
-    const { grantId } = await opts.runShard({ shard, checkpointPath: join(opts.stateDir, `${shard.shard_id}.checkpoint.json`) });
-    const record: ShardRecord = { shard_id: shard.shard_id, grant_id: grantId, status: "done" };
+    const out = await opts.runShard({ shard, checkpointPath: join(opts.stateDir, `${shard.shard_id}.checkpoint.json`) });
+    const reason = shardIncomplete(shard, out.result);
+    if (reason) {
+      incomplete.push({ shard_id: shard.shard_id, reason });
+      if (out.result.stopped) return { ran, skipped, incomplete, stopped: shard.shard_id };
+      continue;
+    }
+    const record: ShardRecord = { shard_id: shard.shard_id, grant_id: out.grantId, status: "done" };
     await mkdir(dirname(donePath), { recursive: true });
     await writeFile(`${donePath}.tmp`, JSON.stringify(record), { mode: 0o600 });
     await rename(`${donePath}.tmp`, donePath);
     ran.push(shard.shard_id);
   }
-  return { ran, skipped };
+  return { ran, skipped, incomplete };
 }

@@ -74,7 +74,13 @@ import {
 import type { MigrationAssertion } from "./relayhistory-export-auth.ts";
 
 export const EXPORT_PLUGIN_VERSION = "96bulls-relayhistory-export/0.1.0";
-export const EXPORT_WRITER_ID = "relayhistory-export";
+/**
+ * The owner and writer of a cold export: `migration:<grantId>`, as merged
+ * #43's owner fence (manifestOwnerIssue, c6ebf872) requires: raw.owner must
+ * equal writer.delivery_instance_id, and a migration's cold export must be
+ * owned by its grant.
+ */
+export const migrationOwner = (grantId: string) => `migration:${grantId}`;
 export const EXPORT_MARKER = "client.relayhistory_export";
 const SESSION_EXT = "96bulls";
 const RAW_FORMAT = "ndjson" as const;
@@ -175,6 +181,23 @@ export function manifestProvenanceIssue(manifest: ManifestV1, identity: UploadId
   if (marker.plan_digest !== identity.plan_digest) return "plan_digest";
   if (marker.source_user_id !== identity.source_user_id) return "source_user_id";
   if (!session || session.user_id !== identity.source_user_id) return "96bulls.user_id";
+  return undefined;
+}
+
+/**
+ * Whether a manifest's watermark and per-chunk resume marks are exactly what
+ * the chunk bytes give. The courier checks it before sending; an ingest that
+ * holds the source bytes can run the same check. Returns the first problem.
+ */
+export function sourceMarksIssue(manifest: ManifestV1, chunkBytes: readonly Uint8Array[]): string | undefined {
+  const marks = sourceMarksFromChunks(chunkBytes);
+  const marker = (manifest.extensions as Record<string, Record<string, unknown> | undefined> | undefined)?.[EXPORT_MARKER];
+  if (canonical(marker?.origin_revisions) !== canonical(marks.origin_revisions)) return "origin_revisions";
+  for (const [i, c] of manifest.raw.chunks.entries()) {
+    const want = marks.chunks[i];
+    const got = c as { source_origin?: unknown; source_end?: unknown };
+    if ((want?.source_origin ?? undefined) !== got.source_origin || (want?.source_end ?? undefined) !== got.source_end) return `chunk ${c.seq}`;
+  }
   return undefined;
 }
 
@@ -364,6 +387,47 @@ export function exportedOriginRevisions(records: readonly DeliveryRecord[]): Rec
   return Object.fromEntries([...max].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 }
 
+/** A feed origin's line: its origin and feed revision (other fields are never read into the result). */
+function lineSource(line: string): { origin: string; revision: number } | undefined {
+  const r = JSON.parse(line) as { origin_id?: unknown; revision?: unknown };
+  if (typeof r.origin_id !== "string" || r.origin_id.startsWith("machine:")) return undefined;
+  const text = String(r.revision);
+  if (!/^\d{1,16}$/.test(text) || !Number.isSafeInteger(Number(text)))
+    throw Object.assign(new Error("export: a feed revision is not a safe integer"), { code: "revision_out_of_range" });
+  return { origin: r.origin_id, revision: Number(text) };
+}
+
+/**
+ * The O4 watermark and per-chunk resume marks, derived from the exact chunk
+ * bytes (the ndjson record lines), so they are bound by each chunk's signed
+ * sha256 and any ingest can recompute them from the source bytes it holds:
+ *
+ * - `origin_revisions`: every feed origin to its max revision in the stream;
+ * - per chunk, `source_origin` (the origin of the chunk's last feed line) and
+ *   `source_end` (that origin's max revision through this chunk), the fields
+ *   #51's takeover resume reads from the tail chunk. A chunk with no feed
+ *   line carries neither.
+ */
+export function sourceMarksFromChunks(chunks: readonly Uint8Array[]): {
+  origin_revisions: Record<string, number>;
+  chunks: ({ source_origin: string; source_end: number } | undefined)[];
+} {
+  const decoder = new TextDecoder();
+  const max = new Map<string, number>();
+  const marks = chunks.map((bytes) => {
+    let last: string | undefined;
+    for (const line of decoder.decode(bytes).split("\n")) {
+      if (!line) continue;
+      const src = lineSource(line);
+      if (!src) continue;
+      if (src.revision > (max.get(src.origin) ?? -1)) max.set(src.origin, src.revision);
+      last = src.origin;
+    }
+    return last === undefined ? undefined : { source_origin: last, source_end: max.get(last)! };
+  });
+  return { origin_revisions: Object.fromEntries([...max].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))), chunks: marks };
+}
+
 export function plannedManifestFromRecords(input: {
   orgId: string;
   workspaceId: string;
@@ -397,6 +461,7 @@ export function plannedManifestFromRecords(input: {
     state: input.state ?? "closed",
     ...(input.catalog ? { catalog: input.catalog } : {}),
     originRevisions: exportedOriginRevisions(input.records),
+
     chunks: chunkRanges(stream, input.maxChunkBytes).map((range, seq) => ({
       seq,
       epoch: 0,
@@ -420,6 +485,7 @@ export async function buildExportManifest(
   commit: { grantId: string; planDigest: string },
 ): Promise<ManifestV1> {
   const last = sealed.at(-1)!;
+  const marks = sourceMarksFromChunks(m.chunks.map((c) => c.data));
   return {
     schema_v: 1,
     layout: "v1",
@@ -435,9 +501,9 @@ export async function buildExportManifest(
       started_at: m.startedAt,
       ...(m.state === "closed" && m.endedAt ? { ended_at: m.endedAt } : {}),
     },
-    writer: { delivery_instance_id: EXPORT_WRITER_ID, plugin_version: EXPORT_PLUGIN_VERSION },
+    writer: { delivery_instance_id: migrationOwner(commit.grantId), plugin_version: EXPORT_PLUGIN_VERSION },
     raw: {
-      owner: m.location.machineId,
+      owner: migrationOwner(commit.grantId),
       state: m.state,
       updated_at: plan.exportedAt,
       format: RAW_FORMAT,
@@ -447,9 +513,13 @@ export async function buildExportManifest(
       stored_bytes: sealed.reduce((n, c) => n + c.stored_bytes, 0),
       content_sha256: await computeContentSha256(sealed),
       epoch: 0,
-      epochs: [{ epoch: 0, opened_at: m.startedAt, reason: "initial", first_seq: 0, opened_by: EXPORT_WRITER_ID }],
+      epochs: [{ epoch: 0, opened_at: m.startedAt, reason: "initial", first_seq: 0, opened_by: migrationOwner(commit.grantId) }],
       next_offset: last.start_offset + last.bytes,
-      chunks: [...sealed],
+      // #51 resume marks on each chunk, from the exact bytes.
+      chunks: sealed.map((c) => {
+        const mark = marks.chunks[m.chunks.findIndex((p) => p.seq === c.seq)];
+        return mark ? { ...c, ...mark } : { ...c };
+      }),
       ...(scrub ? { scrub } : {}),
     },
     extensions: {
@@ -462,7 +532,8 @@ export async function buildExportManifest(
         plan_digest: commit.planDigest,
         source_user_id: canonicalId(m.sourceUserId),
         ...(m.catalog ? { catalog: m.catalog } : {}),
-        ...(m.originRevisions ? { origin_revisions: m.originRevisions } : {}),
+        // The watermark from the bytes; always present ({} when no feed line).
+        origin_revisions: marks.origin_revisions,
       },
     },
   } as ManifestV1;
@@ -595,8 +666,9 @@ function classify(status: number, code: string): Outcome {
 }
 
 async function errorCode(response: Response): Promise<string> {
-  const body = (await response.json().catch(() => ({}))) as { error?: { code?: unknown } };
-  return typeof body.error?.code === "string" ? body.error.code : `http_${response.status}`;
+  // An empty or non-JSON body (main's status route answers 403 with none).
+  const body = (await response.json().catch(() => undefined)) as { error?: { code?: unknown } } | null | undefined;
+  return typeof body?.error?.code === "string" ? body.error.code : `http_${response.status}`;
 }
 
 /**
@@ -695,6 +767,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
     let expiries = 0;
     let transient = 0;
     let activationWaits = 0;
+    let preflighted = false;
     /** Chunks sealed since the last 403 migration_chunk_limit (none: a second one stops). */
     let sealedSinceLimit: number | undefined;
     let outcome: "committed" | Outcome | undefined;
@@ -722,6 +795,22 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
       };
       try {
         await token();
+        if (!preflighted) {
+          // Is there already a manifest at this key? A cold export may only
+          // create one; a live session's manifest (a straddling session)
+          // needs a backfill epoch over the exported records, which contract
+          // v1 cannot sign yet ("Known limit"), so it is deferred, not sent.
+          const q = new URLSearchParams({ key, machine: m.location.machineId, writer: migrationOwner(cfg.grantId) });
+          const res = await request(await token(), `/v1/pipeline/manifests/status?${q}`, { method: "GET" });
+          if (res.status === 403) {
+            const code = await errorCode(res);
+            if (code === "http_403" || code === "migration_upload_forbidden")
+              throw new OutcomeError({ kind: "deferred", code: "straddling_session" });
+            throw new OutcomeError(classify(403, code));
+          }
+          if (res.status !== 404 && res.status !== 200) throw new OutcomeError(classify(res.status, await errorCode(res)));
+          preflighted = true;
+        }
         for (const chunk of m.chunks) {
           if (state.chunks.some((c) => c.seq === chunk.seq)) continue; // sealed before a retry or crash
           const q = new URLSearchParams({
@@ -747,7 +836,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
             body: Buffer.concat([entryBytes, chunk.data]) as Uint8Array<ArrayBuffer>,
           });
           if (res.status !== 200 && res.status !== 201) throw new OutcomeError(classify(res.status, await errorCode(res)));
-          const sealed = (await res.json().catch(() => ({}))) as { entry?: ChunkEntry; scrub?: { ruleset: string; version: number } };
+          const sealed = ((await res.json().catch(() => undefined)) ?? {}) as { entry?: ChunkEntry; scrub?: { ruleset: string; version: number } };
           const planned = entry.chunks.find((c) => c.seq === chunk.seq)!;
           const got = sealed.entry;
           if (!got || got.seq !== planned.seq || got.epoch !== planned.epoch || got.start_offset !== planned.start_offset ||
@@ -769,6 +858,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
         if (sent.planDigest !== digest || canonical(sent.uploads[index]) !== canonical(identity))
           throw new OutcomeError({ kind: "failed", code: "manifest_plan_mismatch" });
         if (manifestProvenanceIssue(manifest, identity)) throw new OutcomeError({ kind: "failed", code: "manifest_provenance_mismatch" });
+        if (sourceMarksIssue(manifest, m.chunks.map((c) => c.data))) throw new OutcomeError({ kind: "failed", code: "manifest_source_marks_mismatch" });
         const issues = await validateManifest(manifest, key);
         if (issues.length) throw new OutcomeError({ kind: "failed", code: "manifest_invalid" });
         const res = await request(await token(), "/v1/pipeline/manifests", {
@@ -782,7 +872,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
           body: JSON.stringify({ key, manifest }),
         });
         if (res.status !== 202) throw new OutcomeError(classify(res.status, await errorCode(res)));
-        const body = (await res.json().catch(() => ({}))) as { workKey?: unknown };
+        const body = ((await res.json().catch(() => undefined)) ?? {}) as { workKey?: unknown };
         if (typeof body.workKey !== "string" || !body.workKey)
           throw new OutcomeError({ kind: "transient", code: "work_key_missing" });
         // Exactly the signed key and entry digest; the same under any assertion.
@@ -795,7 +885,9 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
       } catch (error) {
         if (!(error instanceof OutcomeError)) throw error;
         const o = error.outcome;
-        if (o.kind === "replayed") {
+        if (o.kind === "deferred") {
+          outcome = o;
+        } else if (o.kind === "replayed") {
           // A replay means this assertion was spent; one fresh mint, same content.
           if (replays >= 1) outcome = { ...o, kind: "failed" };
           replays += 1;
@@ -826,8 +918,8 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
     if (outcome === "committed") continue;
     if (outcome.kind === "deferred") {
       // Sealed chunks stay in the checkpoint; the next run commits it.
-      result.deferred.push({ key, code: outcome.code, waits: activationWaits - 1 });
-      log.warn("export manifest deferred until activation", { manifest_key_sha256: keyHash(key), error_code: outcome.code, attempt: activationWaits });
+      result.deferred.push({ key, code: outcome.code, waits: Math.max(0, activationWaits - 1) });
+      log.warn("export manifest deferred (re-queued for a later run)", { manifest_key_sha256: keyHash(key), error_code: outcome.code, attempt: activationWaits });
       continue;
     }
     if (outcome.kind === "failed") {

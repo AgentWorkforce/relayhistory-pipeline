@@ -67,13 +67,17 @@ takes identity only from the authenticated request (`ctx`), never from the
 manifest body.
 
 - **O4 dedupe watermark:** the marker carries
-  `origin_revisions: {<origin_id>: <max exported revision>}`. Each key is a
-  feed origin (the client store's change-feed epoch) and each value is the
-  highest feed revision among the exported records, as a JSON safe integer.
-  Deleted records are not exported, so they don't count. The synthetic
-  `machine:` origins of ingest-API events are left out. A client takeover
-  resumes each origin's feed after its watermark instead of at 0. The field
-  shape is being agreed with the O4 marker validator (#46/#51).
+  `origin_revisions: {<origin_id>: <max exported revision>}`, and each chunk
+  carries `source_origin` and `source_end`, which are what #51's takeover
+  resume reads from the tail chunk. All of them are derived from the exact
+  chunk bytes (the ndjson record lines), so each chunk's signed sha256 binds
+  them, and an ingest that holds the source bytes can recompute them. The
+  courier checks them before sending, and the fake ingest recomputes them.
+  The shape was confirmed with mig-o4:
+  - values are safe integers of 0 or more;
+  - an empty `{}` is kept;
+  - `machine:` origins are left out;
+  - an absent field is read as `{}`.
 - **Exporter:** writes the latest `session` record's descriptive fields into
   `extensions["client.relayhistory_export"].catalog`: title, `agent_name`,
   models, git branch, commit and repo, first and last activity, plus Neon
@@ -125,6 +129,18 @@ A per-manifest checkpoint (ids, digests and work keys,
 never tokens) keeps a resumed run from re-uploading committed manifests. It is
 tested only against an in-process fake ingest, and the CLI still refuses
 `--execute`.
+
+## Cold-export ownership and straddling sessions
+
+- A cold export's `raw.owner`, `writer.delivery_instance_id` and initial
+  `opened_by` are all `migration:<grantId>`, as merged #43's owner fence
+  (`manifestOwnerIssue`) requires. An end-to-end test runs the courier
+  against main's real ingest routes.
+- Before sending chunks, the courier reads the manifest status. If a live
+  session already has a manifest at the key, the export is deferred as
+  `straddling_session`: contract v1 cannot sign a backfill entry yet. So the
+  exporter never sends a backfill, and #51's `activation_required` gate is
+  not reachable from it.
 
 ## Grant shards
 
