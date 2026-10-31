@@ -1,28 +1,31 @@
 {
   "schema": 1,
   "stage": "aws-proof",
-  "generatedAt": "2026-10-31T01:32:53.897Z",
+  "generatedAt": "2026-10-31T04:58:37.391Z",
   "target": {
     "accountId": "500268966557",
     "region": "us-west-2",
     "callerArn": "arn:aws:sts::500268966557:assumed-role/AWSReservedSSO_AdministratorAccess_fafac944cdc114d8/khaliq@agentrelay.com"
   },
   "source": {
-    "commit": "e1bfac0ebcfeef21fb65f8979ed459c9f7fee9fe",
-    "stackSourceSha256": "673a9ba6a8596fde1fc1eab57f142627db09cebad6481d116e4c877f97dcc3fc",
+    "commit": "fc08c1f2add5071adf44cdab852b9079e5cc6c57",
+    "stackSourceSha256": "72cec1a2d069f951f40cb1b4f38887f6229a7568131c28bc9d7c9ca0dbeb7ee5",
     "clean": true
   },
   "inputs": {
-    "sha256": "a9f7f74895c85b596b950452e2bea0797996f99fe593bebb77699a1373e6fdaf",
+    "sha256": "49960d297d03d4cf174b56a00abd92b5a4df83f495de025c7e741c4501e06999",
     "sanitizedPath": "docs/plans/aws-proof.inputs.sanitized.json",
-    "sanitizedSha256": "a40aae3c0f690cc7cd8e1666f53735bb7283c260675c7e14f367d582d15998c0"
+    "sanitizedSha256": "6935770f3b4147c10388192cb1790647676d170761a527befb96ac3948e1e9a6"
   },
   "state": {
     "bucket": "alchemy-state-500268966557-us-west-2-an",
     "prefix": "96bulls/96bulls-aws/aws-proof/",
-    "bucketExisted": true,
-    "objects": 0,
-    "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    "versioning": "Enabled",
+    "method": "snapshot",
+    "objects": 78,
+    "snapshotSha256": "51047ec73f25fb39a4cc9459e33253ca3c70e8b52687a6d37d35a90436daf2da",
+    "versionsDigest": "5e743b621a9b2cb35d036cc7163776037b04e87115d606f18a02c5e3422e5688",
+    "versionEntries": 343
   },
   "tools": {
     "alchemy": "2.0.0-beta.84",
@@ -35,13 +38,13 @@
   "outputs": {
     "plan": {
       "path": "docs/plans/aws-proof.plan.txt",
-      "sha256": "65c6c9268c641ec59d2e8545c078327f9be835d479b544d682bf34ec04e8677f"
+      "sha256": "b1b526fad3c74c584b9122c6247fd193434626e2d8623f5db8455f601b6c4e9d"
     },
     "detailed": {
       "path": "docs/plans/aws-proof.plan.detailed.txt",
-      "sha256": "ed3de7ee9af64270e0b3d69fe8484433b97fc02945eb26272f6ae0048fea221c"
+      "sha256": "d762e729e3c8f450afc984d18a632679ebfa80ded6fb84e90a31b423bb2c20aa"
     }
   },
-  "summary": "Plan: 78 to create",
-  "note": "Read-only alchemy plan (state bucket existed; state digest unchanged across the run). Verified again by `96bulls up` before any change."
+  "summary": "Plan: 4 to create, 1 to replace",
+  "note": "Planned against a read-only snapshot of the state (GETs pinned to version ids, in-memory Alchemy state): no state-bucket writes, no lease. The version listing (all versions and delete markers) was identical before and after. AWS provider reads only (Describe/List/Get). `96bulls up` re-checks everything before any change."
 }

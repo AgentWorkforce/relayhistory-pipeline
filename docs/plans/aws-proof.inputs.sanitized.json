@@ -3,6 +3,7 @@
   "accountId": "500268966557",
   "region": "us-west-2",
   "approval": {
+    "decision": "approved",
     "by": "Khaliq Gant",
     "date": "2026-10-30",
     "operations": [
@@ -11,7 +12,7 @@
     "stage": "aws-proof",
     "accountId": "500268966557",
     "region": "us-west-2",
-    "words": "\"yes u have OK for everything\" / \"Yes, apply A now\" / \"Apply A now, fix in parallel\""
+    "quote": "\"yes u have OK for everything\" / \"Yes, apply A now\" / \"Apply A now, fix in parallel\""
   },
   "budgetUsd": 300,
   "budgetEmail": "aws-budgets@agentrelay.com",
@@ -56,7 +57,11 @@
       "zoneDomain": "agentrelay.com",
       "cloudflareTokenSecret": "cloudflare-dns",
       "scheme": "internet-facing",
-      "rateLimitPer5Min": 2000
+      "rateLimitPer5Min": 2000,
+      "certValidation": {
+        "name": "_5f1f48a8dcad926249c2cc9deccebefa.proof-sessions.agentrelay.com.",
+        "value": "_deff05b5ef3939e09f6480c3a254cbe7.wzccmgtwzk.acm-validations.aws."
+      }
     }
   },
   "clearedBy": "Khaliq, 2026-10-30, in the self-hosted-lead session: \"yes u have OK for everything\" and \"Yes, apply A now\""
