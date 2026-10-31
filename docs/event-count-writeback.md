@@ -173,8 +173,83 @@ itself can't execute the function directly.
   must be able to `SET ROLE session_count_writer`, through `service_role` or directly.
 - This stage works only on the Postgres queue, because the capability is a queue job.
   On another backend it quarantines as `count_no_job_lease`.
-- A holder of the role who also holds a lease can only apply that job. Whoever can
-  write `pipeline_jobs` directly controls the record; `service_role` still can.
+
+## Guard (A-prime)
+
+helm-chart-chief's ruling for V1: services keep their shared login, a guard closes the
+forge and delete paths, and per-workload logins follow after T0.
+
+`normalized_ready_writer` is NOLOGIN, and no login is a member of it. It owns the guard
+and every narrow function, so no workload can replace them. The guard is an invoker
+trigger function with a fixed `search_path`, and it admits only that role and
+superusers. It names the role rather than the table owner, because this repo can't
+tell which role a workload login is, and "is the owner" would fail open.
+
+| Target | Refused for every other role |
+| --- | --- |
+| `pipeline_jobs`, stage `normalized-ready` | INSERT, DELETE, TRUNCATE while one exists, any UPDATE beyond `lease_id`, `visible_at`, `attempts` and `dlq`, and changing another stage into it |
+| `pipeline_dead_letters`, same stage | INSERT, UPDATE, TRUNCATE while one exists, DELETE unless `resolved` (retention's sweep) |
+| `session_index` | DELETE, TRUNCATE, and direct writes of `revision`, `content_sha256` and provenance, by revoked grants |
+
+Legitimate writes go only through narrow functions:
+
+- **Create:** `file_normalize_enqueue_ready`, from a held `file-normalize` job.
+- **Apply and ack:** `record_normalized_event_count`.
+- **Quarantine:** `normalized_ready_quarantine` moves the held job to a letter in one
+  transaction, built from the job's row.
+- **Replay:** `normalized_ready_replay` queues `file-normalize` for the same manifest
+  version, so the count is recomputed from the object. A stored count is never re-sent.
+- **Index:** `upsert_session_index` is now SECURITY DEFINER, so the index stage still
+  sets `revision` and `content_sha256`.
+
+**Consequences for other work:**
+
+- A migration replacing `upsert_session_index` must restate `SECURITY DEFINER`, or
+  index writes fail closed. `CREATE OR REPLACE` resets it.
+- On the Postgres queue only the `file-normalize` worker can send `normalized-ready`.
+  `pipelineQueueDeps`' direct send is refused by the guard.
+
+**What remains, stated plainly:**
+
+- **Everything rests on the login audit, which isn't done.** If the shared login is
+  the table owner it can disable these triggers, and if it's a superuser the guard
+  admits it. If it created `normalized_ready_writer`, Postgres 16 and later may leave
+  it an admin membership the migration's REVOKE doesn't remove. Tests model a non-owner.
+- **`upsert_session_index` still takes any row.** The shared login can raise a revision
+  or change a hash through it. That makes a count non-authoritative, so it's denial,
+  not forgery: it still can't create a job or a provenance row.
+- **Lease columns stay writable,** so the login can stall a job, or lease one and apply
+  its true count. It can't change what the count is.
+- **A compromised `file-normalize` worker** can send a wrong count for a session it
+  holds a job for. The database can't recompute it.
+- **Non-superuser migration is untested.** PGlite runs migrations as a superuser, so
+  the `GRANT`, `ALTER ... OWNER` and `REVOKE` around ownership haven't run on Supabase.
+
+## Kill switch and rollback
+
+`PIPELINE_FILE_NORMALIZE_ENABLED` stays off, and nothing in these PRs changes it.
+
+**Kill switch:** unset `PIPELINE_FILE_NORMALIZE_ENABLED` on the indexer and stop the
+`file-normalize` worker, which refuses to start without it. `object-landed` then stops
+sending work. Queued `normalized-ready` jobs may still apply: each is a true count for
+a real revision, and none needs stopping. Counts stay non-authoritative for later
+revisions, which readers' gate reports correctly. Index writes aren't affected.
+
+**Rollback, in order. Each step is a live change needing Khaliq's OK:**
+
+1. Pull the kill switch and let `normalized-ready` drain, or leave it queued.
+2. To disable the guard, as the table owner:
+   `ALTER TABLE sessions.pipeline_jobs DISABLE TRIGGER pipeline_jobs_normalized_ready_guard`,
+   and the same for the other three triggers. Nothing else needs them while the feature
+   is off.
+3. If `service_role` needs its grants back:
+   `GRANT INSERT, UPDATE, DELETE, TRUNCATE ON sessions.session_index TO service_role`,
+   then `ALTER FUNCTION sessions.upsert_session_index(jsonb) SECURITY INVOKER`.
+4. Leave the columns and functions in place. Provenance columns are nullable and unread,
+   and dropping them gains nothing. A NULL `event_count_revision` means not authoritative.
+
+No reader exists, so a rollback changes nothing users see. The sticky trigger keeps a
+stored count from being overwritten; with no provenance, the chunk sum behaves as before.
 
 ## Revision ordering
 
@@ -275,6 +350,7 @@ reason.
 | `normalized-ready` lag and depth | `pipeline_jobs` | Lag ≥ 300 s |
 | `normalized-ready` DLQ depth | `pipeline_dead_letters` | Any. Add the stage to the sampler's alert stages |
 | `count_conflict` | `pipeline.stage.errors` | Any: a broken determinism or version rule |
+| `CN005` guard refusals | Caller logs, `error_code` | Any: something tried to write a protected row |
 | `stale` rate | `skipped` events with that reason | Diagnostic |
 | `unprojected` > 0 | Stage event | Diagnostic: dropped records are excluded from the count |
 | Sessions not authoritative | Gate query below | Must reach 0 before activation |
@@ -325,8 +401,8 @@ functions, poller adapter and entrypoint.
 Remaining:
 
 1. Repin to the reviewed #57 head by replaying these commits (coordinator approved).
-2. Confirm the login in `HOOPDB_URL` can take `session_count_writer`. Applying the
-   grant is a live change and needs Khaliq's OK.
+2. The read-only audit of the login in `HOOPDB_URL`. It's live, so it needs Khaliq's OK,
+   and the guard's guarantees depend on it.
 3. Add the stage to the sampler's alert stages once #47 lands.
 
 Code and draft PR only. Applying the migration, enabling normalization and any
