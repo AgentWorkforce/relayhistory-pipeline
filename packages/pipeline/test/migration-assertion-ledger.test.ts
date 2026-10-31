@@ -43,7 +43,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await db.exec(
-    "TRUNCATE sessions.migration_assertion_uses; TRUNCATE sessions.pipeline_jobs",
+    "TRUNCATE sessions.migration_assertion_uses; TRUNCATE sessions.migration_base_read_uses; TRUNCATE sessions.pipeline_jobs",
   );
 });
 
@@ -227,6 +227,109 @@ describe("sessions.migration_assertion_uses", () => {
         await db.exec("RESET ROLE; SET ROLE service_role");
       }
     }
+  });
+
+  it("cross-ledger grant binding (blocker 3): a base read binds grant, org and plan for later commits, and a commit binds them for later base reads", async () => {
+    const ledger = sqlMigrationAssertionLedger({
+      query: async (text, params) => ({
+        rows: (await db.query(text, params)).rows as never[],
+      }),
+      transaction: (work) =>
+        db.transaction((tx) =>
+          work({
+            query: async (text, params) => ({
+              rows: (await tx.query(text, params)).rows as never[],
+            }),
+          }),
+        ),
+    });
+    const message = {
+      v: 1,
+      stage: "object-landed",
+      ctx: { traceId: TRACE, orgId: ORG, workspaceId: WORKSPACE },
+      workKey: WORK_KEY,
+      payload: {},
+    } as never;
+    const useOf = (o: Record<string, unknown> = {}) => ({
+      jti: jti(),
+      nonce: nonce(),
+      grantId: GRANT,
+      planDigest: PLAN,
+      planEntryDigest: PLAN,
+      orgId: ORG,
+      workspaceId: WORKSPACE,
+      userId: USER,
+      expiresAt: Math.floor(Date.now() / 1000) + 65,
+      ...o,
+    });
+    const baseReadOf = (o: Record<string, unknown> = {}) =>
+      useOf({ jti: `mbr_${randomBytes(16).toString("hex")}`, ...o });
+    // A base read first binds the grant to (PLAN, ORG) ...
+    expect(await ledger.consumeBaseRead(baseReadOf(), "k@base_read@r1")).toBe(
+      "consumed",
+    );
+    // ... so a commit under the same grant with another plan, or another org, is refused,
+    expect(
+      await ledger.consume(
+        useOf({ planDigest: "b".repeat(64) }),
+        "object-landed",
+        message,
+      ),
+    ).toBe("grant_mismatch");
+    expect(
+      await ledger.consume(
+        useOf({ orgId: "org_other" }),
+        "object-landed",
+        message,
+      ),
+    ).toBe("grant_mismatch");
+    // ... and nothing was written by the refused commits.
+    expect(await count("sessions.migration_assertion_uses")).toBe(0);
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+    // A matching commit is accepted.
+    expect(await ledger.consume(useOf(), "object-landed", message)).toBe(
+      "consumed",
+    );
+    // The other direction: commits bind a second grant, and a base read with another plan or org is refused.
+    const grant2 = `mgr_${"2".repeat(32)}`;
+    expect(
+      await ledger.consume(
+        useOf({ grantId: grant2 }),
+        "object-landed",
+        message,
+      ),
+    ).toBe("consumed");
+    expect(
+      await ledger.consumeBaseRead(
+        baseReadOf({ grantId: grant2, planDigest: "c".repeat(64) }),
+        "k@base_read@r1",
+      ),
+    ).toBe("grant_mismatch");
+    expect(
+      await ledger.consumeBaseRead(
+        baseReadOf({ grantId: grant2, orgId: "org_other" }),
+        "k@base_read@r1",
+      ),
+    ).toBe("grant_mismatch");
+    expect(await count("sessions.migration_base_read_uses")).toBe(1);
+    // Separate replay namespaces: the same nonce in both ledgers is not a replay across them.
+    const shared = nonce();
+    expect(
+      await ledger.consumeBaseRead(
+        baseReadOf({ nonce: shared }),
+        "k@base_read@r1",
+      ),
+    ).toBe("consumed");
+    expect(
+      await ledger.consume(useOf({ nonce: shared }), "object-landed", message),
+    ).toBe("consumed");
+    // But within one ledger it is.
+    expect(
+      await ledger.consumeBaseRead(
+        baseReadOf({ nonce: shared }),
+        "k@base_read@r1",
+      ),
+    ).toBe("replayed");
   });
 
   it("is service-role only: RLS on, no policy, no tenant grant", async () => {
