@@ -128,7 +128,10 @@ export function objectLandedWorkKey(
     typeof migration.entry_sha256 !== "string" ||
     !/^[0-9a-f]{64}$/.test(migration.entry_sha256) ||
     (migration.base_revision !== undefined &&
-      !(Number.isSafeInteger(migration.base_revision) && migration.base_revision >= 1)) ||
+      !(
+        Number.isSafeInteger(migration.base_revision) &&
+        migration.base_revision >= 1
+      )) ||
     unprefixed === undefined ||
     migration.key !== unprefixed
   )

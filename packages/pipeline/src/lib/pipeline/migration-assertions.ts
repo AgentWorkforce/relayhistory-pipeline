@@ -460,7 +460,11 @@ export async function migrationUploadMatches(
 ): Promise<boolean> {
   const upload = auth.migration?.upload;
   // v1 only: a backfill (v2) identity never matches a whole-session commit.
-  if (!upload || isBackfillIdentity(upload) || !migrationSessionMatches(auth, location))
+  if (
+    !upload ||
+    isBackfillIdentity(upload) ||
+    !migrationSessionMatches(auth, location)
+  )
     return false;
   const entry = await derivePlanEntry(auth, location, manifest);
   if (!entry) return false;
@@ -722,7 +726,6 @@ export function migrationManifestProvenance(
   return undefined;
 }
 
-
 // --- Plan entry v2: one backfill epoch on a live manifest -----------------
 //
 // docs/contracts/relayhistory-export-plan-entry-v2.md in 96BullSessions, with
@@ -803,7 +806,10 @@ export function isBackfillIdentity(
 
 /** #46's `backfillDigest`: the content hash chain with every epoch set to 0. */
 export function backfillSha256(
-  chunks: readonly Pick<BackfillEntryChunk, "start_offset" | "bytes" | "sha256">[],
+  chunks: readonly Pick<
+    BackfillEntryChunk,
+    "start_offset" | "bytes" | "sha256"
+  >[],
 ): Promise<string> {
   return computeContentSha256(
     chunks.map((c) => ({
@@ -903,12 +909,17 @@ function parseUploadIdentityV2(
     u.kind !== "backfill" ||
     !exactKeySet(u, V2_IDENTITY_KEYS) ||
     !isRecord(session) ||
-    !exactKeySet(session, ["machine_id", "harness", "session_id", "started_at"]) ||
+    !exactKeySet(session, [
+      "machine_id",
+      "harness",
+      "session_id",
+      "started_at",
+    ]) ||
     !Object.values(session).every((v) => text(v, 256)) ||
     !isRecord(base) ||
     !exactKeySet(base, BASE_KEYS) ||
-    !["grant_id", "key", "org_id", "workspace_id", "source_user_id"].every((k) =>
-      text(u[k]),
+    !["grant_id", "key", "org_id", "workspace_id", "source_user_id"].every(
+      (k) => text(u[k]),
     ) ||
     ["org_id", "workspace_id", "source_user_id"].some(
       (k) => normalizeRelayId(u[k] as string) !== u[k],
@@ -960,7 +971,12 @@ export function parsePlanEntryV2(text: string): PlanEntryV2 | undefined {
       "raw_bytes",
     ]) ||
     !isRecord(session) ||
-    !exactKeySet(session, ["machine_id", "harness", "session_id", "started_at"]) ||
+    !exactKeySet(session, [
+      "machine_id",
+      "harness",
+      "session_id",
+      "started_at",
+    ]) ||
     !Array.isArray(chunks) ||
     chunks.length === 0 ||
     !chunks.every(
@@ -995,7 +1011,10 @@ export function parsePlanEntryV2(text: string): PlanEntryV2 | undefined {
 function entryV2MatchesIdentity(
   entry: PlanEntryV2,
   upload: UploadIdentityV2,
-  tenancy: Pick<UploadIdentity, "grant_id" | "org_id" | "workspace_id" | "source_user_id">,
+  tenancy: Pick<
+    UploadIdentity,
+    "grant_id" | "org_id" | "workspace_id" | "source_user_id"
+  >,
 ): boolean {
   return (
     entry.key === upload.key &&
@@ -1068,12 +1087,15 @@ export function backfillBaseVersion(version: {
 export async function migrationBackfillIssue(
   auth: Pick<AuthContext, "claims" | "migration">,
   location: Parameters<typeof sessionManifestKey>[0],
-  stored: { manifest: ManifestV1; version: { eTag?: string; version?: string } } | undefined,
+  stored:
+    | { manifest: ManifestV1; version: { eTag?: string; version?: string } }
+    | undefined,
   incoming: ManifestV1,
 ): Promise<string | undefined> {
   const upload = auth.migration?.upload;
   const tenancy = signedTenancy(auth);
-  if (!upload || !isBackfillIdentity(upload) || !tenancy) return "not a backfill identity";
+  if (!upload || !isBackfillIdentity(upload) || !tenancy)
+    return "not a backfill identity";
   if (!migrationSessionMatches(auth, location)) return "not the signed session";
   if (!stored) return "no live manifest to append to";
   const { base } = upload;
@@ -1089,7 +1111,7 @@ export async function migrationBackfillIssue(
     raw.chunks.length !== base.chunk_count ||
     raw.epoch !== base.epoch ||
     raw.content_sha256 !== base.content_sha256 ||
-    raw.epochs.some((e) => e.reason === "backfill")
+    raw.epochs.some((e) => (e.reason as string) === "backfill")
   )
     return "the stored manifest is not the signed base";
   const next = incoming.raw;
@@ -1104,10 +1126,11 @@ export async function migrationBackfillIssue(
     next.format !== "ndjson" ||
     next.epoch !== epoch ||
     canonicalJson(prefix) !== canonicalJson(raw.chunks) ||
-    canonicalJson(next.epochs.slice(0, raw.epochs.length)) !== canonicalJson(raw.epochs) ||
+    canonicalJson(next.epochs.slice(0, raw.epochs.length)) !==
+      canonicalJson(raw.epochs) ||
     opened.length !== 1 ||
     opened[0]!.epoch !== epoch ||
-    opened[0]!.reason !== "backfill" ||
+    (opened[0]!.reason as string) !== "backfill" ||
     opened[0]!.first_seq !== base.chunk_count ||
     opened[0]!.opened_by !== `migration:${tenancy.grant_id}` ||
     added.length === 0 ||
