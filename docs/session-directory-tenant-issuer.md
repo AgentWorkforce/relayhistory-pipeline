@@ -211,12 +211,12 @@ The count limit is not enough. 64 IDs of 128 characters make a signed token of a
 
 Tokens use the real Postgres and policy row, on a non-production project or throwaway cluster. The hosted path needs Khaliq's OK first.
 
-**Sweep.** Authorization header sizes of 2, 4, 6, 8, 12, 16, 24 and 32 KB, built by growing `workspace_ids`, with 100 requests at each size, sequentially and then at 20 concurrent.
+**Sweep.** Sizes of 2, 4, 6, 8, 12, 16, 24 and 32 KB, measured as the complete `Authorization: Bearer` header on the wire: the encoded JWT with its header, claims and signature. They are not raw workspace-claim bytes. Grow `workspace_ids` to reach each size, and keep the proxy headers each hop normally adds. Send 100 requests at each size, sequentially and then at concurrency 20.
 
 **Pass at a size, all of:**
-- All 100 requests return 200 with the expected rows.
-- No 400, 413, 431 or 5xx, connection reset or truncated header at any hop.
-- p95 latency is within 20% of a one-workspace token on the same path.
+- 100 of 100 authenticated requests return 200 with the correct tenant's rows, both sequentially and at concurrency 20.
+- No 400, 413, 431 or 5xx, upstream reset or truncated header at any hop.
+- p95 latency is within 20% of the 2 KB baseline on the same path.
 
 Any miss fails that size and all larger ones.
 
