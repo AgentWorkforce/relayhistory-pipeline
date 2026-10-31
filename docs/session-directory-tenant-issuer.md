@@ -69,7 +69,7 @@ A token RelayAuth cannot verify is refused, including anything admitted only by 
 ```
 
 - Header: `alg: RS256` and a `kid`.
-- `exp - iat` is at most 60 seconds, and `workspace_ids` always has exactly one element.
+- `exp - iat` is at most 60 seconds, and this endpoint always emits exactly one workspace, the subject's. The RPC accepts up to 64, for the issuer described under Multi-workspace tokens.
 - The Worker may reuse a token in memory for up to 30 seconds, keyed by subject token hash and workspace. It never persists one.
 - Each mint is audited and rate limited per subject and workspace.
 - If RelayAuth is down, search returns 503. It never falls back to a static credential.
@@ -80,39 +80,12 @@ The RPC does not check `iss`, `aud` or lifetime today. Supabase's docs say a pro
 
 Implemented in #72, stacked on #48. The issuer differs per environment, so it lives in an owner-only table instead of a custom setting. The migration seeds no row, so search stays refused until a row is added for that environment, and adding one is a production change.
 
-```sql
-CREATE TABLE sessions.session_directory_search_token_policy (
-  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-  issuer text NOT NULL CHECK (issuer ~ '^https?://'),
-  audience text NOT NULL CHECK (audience <> ''),
-  max_lifetime_seconds integer NOT NULL DEFAULT 60
-    CHECK (max_lifetime_seconds BETWEEN 1 AND 60)
-);
-ALTER TABLE sessions.session_directory_search_token_policy ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON sessions.session_directory_search_token_policy
-  FROM PUBLIC, anon, authenticated, service_role;
-```
+The RPC refuses with `42501` unless:
 
-In `sessions.search_session_directory`, declare `v_policy sessions.session_directory_search_token_policy%ROWTYPE;` and add this straight after the existing claims-shape check:
-
-```sql
-SELECT * INTO v_policy
-  FROM sessions.session_directory_search_token_policy WHERE singleton;
-IF NOT FOUND
-   OR (v_claims ->> 'iss') IS DISTINCT FROM v_policy.issuer
-   OR jsonb_typeof(v_claims -> 'aud') IS DISTINCT FROM 'string'
-   OR (v_claims ->> 'aud') IS DISTINCT FROM v_policy.audience
-   OR jsonb_typeof(v_claims -> 'exp') IS DISTINCT FROM 'number'
-   OR jsonb_typeof(v_claims -> 'iat') IS DISTINCT FROM 'number'
-   OR (v_claims ->> 'exp')::numeric - (v_claims ->> 'iat')::numeric
-        NOT BETWEEN 1 AND v_policy.max_lifetime_seconds
-   -- A far-future iat must not stretch the window; 30s allows for clock skew.
-   OR (v_claims ->> 'exp')::numeric - extract(epoch FROM clock_timestamp())
-        > v_policy.max_lifetime_seconds + 30
-   OR jsonb_array_length(v_claims -> 'app_metadata' -> 'workspace_ids') <> 1 THEN
-  RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session search: tenant claims missing or invalid';
-END IF;
-```
+- `iss` and `aud` equal the policy row, and `aud` is a plain string.
+- `exp` and `iat` are numbers, `exp - iat` is 1 to 60 seconds, and `exp` is at most 90 seconds away.
+- `workspace_ids` holds 1 to 64 unique strings of 1 to 128 non-space, non-control characters. One bad entry refuses the whole claim.
+- A non-NULL `p_workspace_id` is in the claim. NULL searches only the claimed set, never the whole org.
 
 - `aud` must be a plain string, which is what this issuer emits. An array is refused.
 - The error message is the existing one, so a refusal does not reveal which pin failed.
@@ -187,9 +160,41 @@ Use this only if the check above shows Supabase refuses the custom role. #48 wou
 - Tests 11 and 12 change: an `authenticated` token without the pinned `iss` and `aud` must be refused by the RPC, and direct table reads with the search token must return only that tenant's permitted rows.
 - Add a test that a real Supabase Auth user token cannot run the RPC.
 
+## Multi-workspace tokens
+
+**Status:** proposed, for review by helm-chart-chief and sessionspipelinegrok before any code. Nothing here is built. relayauth #116 stays single-workspace.
+
+An org-wide search needs a token claiming several workspaces, but #116's subject tokens hold one `wks`, and Cloud's RelayHistory assertions are minted per workspace. A one-workspace token must never become a wider one.
+
+### Proposal
+
+- **A separate endpoint:** `POST /v1/tokens/session-directory-search-bulk`, with its own API key and literal scope, off by default. It shares the search issuer and key, and it is not a mode of #116's endpoint.
+- **Who authorizes:** RelayAuth asks Cloud. RelayAuth has no workspace membership data; Cloud holds it. For the verified subject's user and org, RelayAuth fetches the member workspaces over an authenticated server-to-server call. The caller's list is only a request.
+- **Refusal:** every requested workspace must be in that server-side set, or the whole request is refused. A failed or empty lookup refuses, with no cached fallback and no partial token.
+- **Subject:** a subject carrying a `wks` is refused. It needs a new, org-level subject class with a short lifetime, so no existing one-workspace token qualifies.
+- **Limits:** 1 to 64 workspaces per token, 60-second lifetime, audited with the full list.
+
+### More than 64 workspaces
+
+Cloud, not the issuer or the RPC, handles the split. There is no token per workspace.
+
+1. Sort the member workspaces and split them into chunks of at most 64.
+2. Mint one token per chunk, and call the RPC with `p_workspace_id` NULL and each chunk's token, in parallel with a concurrency cap.
+3. Merge by the org-wide order, `last_activity_at, session_id, harness, workspace_id`, all descending, and return the top 51.
+4. Encode one position per chunk in the page cursor, because each chunk pages separately.
+5. If any chunk fails, the page fails. A partial result would silently hide sessions.
+
+### Open questions
+
+1. Which token is the org-level subject? I found none today, so Cloud would mint a new class. That class is itself an any-workspace-in-org credential, so its minting needs review.
+2. Which Cloud endpoint and credential serve the membership lookup? Cloud's membership tables need confirming against current code, because I read a two-week-old checkout.
+3. Revocation: membership removal can take up to 60 seconds to reach search, the token lifetime. Is that acceptable?
+4. Header size: 64 IDs of 128 characters make a signed token of about 12 KB, which must fit PostgREST's and any proxy's header limits. UUIDs would be about 4 KB. Test before relying on it.
+5. Self-hosted: there is no Cloud in that stack, so another membership source is needed.
+
 ## Self-hosted stacks
 
-The AWS proof uses self-hosted PostgREST on in-cluster CloudNativePG, not hosted Supabase. The token shape, exchange and RPC pins are the same. The differences are in `stacks/aws/session-directory-postgrest/README.md`:
+The AWS proof uses self-hosted PostgREST on in-cluster CloudNativePG, not hosted Supabase. self-hosted-lead ran #73 at `22ac514` on CNPG 1.30.1, Postgres 17.11 and PostgREST 16.5, and all 47 tests passed. The token shape, exchange and RPC pins are the same. The differences are in `stacks/aws/session-directory-postgrest/README.md`:
 
 - PostgREST reads the JWKS from a file through `jwt-secret`, so RelayAuth's OIDC discovery is not needed, and the Supabase unknowns above do not apply.
 - The issuer may be the `http://` in-cluster Service URL, because the policy only compares it. The TLS precondition above still applies to the exchange.
@@ -218,7 +223,7 @@ The AWS proof uses self-hosted PostgREST on in-cluster CloudNativePG, not hosted
    - expired or not-yet-valid tokens
 7. A correctly shaped token signed by the **general** RelayAuth key is refused.
 8. A validly signed token with wrong `iss`, wrong `aud`, a lifetime over 60s, or a missing `iat` is refused by the RPC.
-9. `app_metadata` claims moved to the top level or given the wrong type are refused, as are an empty policy table, `aud` as an array, two entries in `workspace_ids`, and a far-future `iat`.
+9. `app_metadata` claims moved to the top level or given the wrong type are refused, as are an empty policy table, `aud` as an array, a far-future `iat`, and a `workspace_ids` that is empty, has 65 entries or duplicates, or holds a non-string, empty or oversized entry.
 
 **Role boundary**
 
@@ -257,7 +262,7 @@ The AWS proof uses self-hosted PostgREST on in-cluster CloudNativePG, not hosted
 ## What blocks #48 activation
 
 **Decisions**
-1. Khaliq accepts or changes this design.
+1. Khaliq accepts or changes this design. Multi-workspace tokens need their own review and do not block single-workspace search.
 2. Khaliq approves the non-production checks, and they answer the Supabase unknowns. The custom-role result picks the primary design or the fallback.
 
 **Code**
