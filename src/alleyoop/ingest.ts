@@ -77,6 +77,8 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     // `grantId=planDigest` pairs (ids and public digests only, no secrets).
     ...(process.env.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS ? { RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS: process.env.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS } : {}),
     ...(process.env.RELAYHISTORY_MIGRATION_GRANTS ? { RELAYHISTORY_MIGRATION_GRANTS: process.env.RELAYHISTORY_MIGRATION_GRANTS } : {}),
+    // The v2 pre-mint base read: its own default-off gate (issuer spec section 9).
+    ...(process.env.RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ === "true" ? { RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ: "true" } : {}),
   }) as unknown as Bindings;
   if (!jwks && !process.env.RELAYAUTH_JWKS_URL) throw new Error("96bulls: ingest needs JWKS_JSON, JWT_PRIVATE_KEY_PEM or RELAYAUTH_JWKS_URL");
 

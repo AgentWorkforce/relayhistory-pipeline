@@ -13,7 +13,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
-import { canonicalJson, uploadIdentityOf, type PlanEntry, type UploadIdentity } from "@rhc/lib/pipeline/migration-assertions.ts";
+import {
+  backfillSha256,
+  baseReadIdentityOf,
+  canonicalJson,
+  planEntryV2Sha256,
+  uploadIdentityOf,
+  uploadIdentityV2Of,
+  type BackfillBase,
+  type PlanEntry,
+  type PlanEntryV2,
+  type UploadIdentity,
+  type UploadIdentityBaseRead,
+  type UploadIdentityV2,
+} from "@rhc/lib/pipeline/migration-assertions.ts";
 import {
   computeContentSha256,
   manifestKey,
@@ -63,7 +76,7 @@ function sign(claims: Record<string, unknown>) {
 
 const now = () => Math.floor(Date.now() / 1000);
 
-function migrationToken(upload: UploadIdentity, overrides: Record<string, unknown> = {}, meta: Record<string, unknown> = {}) {
+function migrationToken(upload: UploadIdentity | UploadIdentityV2, overrides: Record<string, unknown> = {}, meta: Record<string, unknown> = {}) {
   return sign({
     sub: "agent_relayhistory_migration", org: ORG, wks: WORKSPACE, scopes: ["rth:sync"], sponsorId: USER,
     sponsorChain: [USER, "agent_relayhistory_migration"], token_type: "access", iss: ISSUER, aud: [ORIGIN],
@@ -77,6 +90,21 @@ function migrationToken(upload: UploadIdentity, overrides: Record<string, unknow
 }
 
 /** An origin-bound courier assertion (live delivery), as relayauth mints for this History. */
+/** The v2 base-read capability (issuer spec section 3): its own class, scope, audience, TTL, meta.read and jti namespace. */
+function baseReadToken(read: UploadIdentityBaseRead, overrides: Record<string, unknown> = {}, meta: Record<string, unknown> = {}) {
+  return sign({
+    sub: "agent_relayhistory_migration_base_read", org: ORG, wks: WORKSPACE, scopes: ["rth:migration_base_read"], sponsorId: USER,
+    sponsorChain: [USER, "agent_relayhistory_migration_base_read"], token_type: "access", iss: ISSUER,
+    aud: [`${ORIGIN}/v1/pipeline/manifests/base`],
+    iat: now(), exp: now() + 30, jti: `mbr_${randomBytes(16).toString("hex")}`,
+    ...overrides,
+    meta: {
+      tokenClass: "migration_base_read", grantId: GRANT, planDigest: PLAN, nonce: randomBytes(24).toString("base64url"),
+      sourceUserId: USER, actorId: "actor", actorOrgId: ORG, workspaceId: WORKSPACE, read, ...meta,
+    },
+  });
+}
+
 const liveToken = () =>
   sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { tokenClass: "relayhistory_assertion" } });
 
@@ -104,7 +132,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "96bulls-ingest-auth-"));
-  await db.exec("TRUNCATE sessions.migration_assertion_uses; TRUNCATE sessions.migration_assertion_chunks; TRUNCATE sessions.pipeline_jobs");
+  await db.exec("TRUNCATE sessions.migration_assertion_uses; TRUNCATE sessions.migration_assertion_chunks; TRUNCATE sessions.migration_base_read_uses; TRUNCATE sessions.pipeline_jobs");
 });
 afterEach(async () => {
   for (const k of Object.keys(process.env)) if (!(k in savedEnv)) delete process.env[k];
@@ -138,11 +166,11 @@ async function ingest(extra: Record<string, string> = {}) {
   const req = (path: string, token: string, init: RequestInit = {}) =>
     app.request(path, { ...init, headers: { authorization: `Bearer ${token}`, ...(init.headers as Record<string, string>) } }, env);
   /** A chunk request; a migration one carries its plan entry text in front of the bytes. */
-  const chunk = (token: string, location: SessionLocation = LOCATION, opts: { entry?: string; seq?: number; bytes?: Uint8Array } = {}) => {
+  const chunk = (token: string, location: SessionLocation = LOCATION, opts: { entry?: string; seq?: number; bytes?: Uint8Array; epoch?: number; offset?: number; format?: string } = {}) => {
     const bytes = opts.bytes ?? SOURCE;
     const entry = opts.entry === undefined ? undefined : new TextEncoder().encode(opts.entry);
     const body = entry ? Buffer.concat([entry, bytes]) : bytes;
-    return req(`/v1/pipeline/chunks?machine=${location.machineId}&harness=${location.harness}&session=${location.sessionId}&date=${location.startDate}&seq=${opts.seq ?? 0}&epoch=0&offset=0&format=jsonl`, token, {
+    return req(`/v1/pipeline/chunks?machine=${location.machineId}&harness=${location.harness}&session=${location.sessionId}&date=${location.startDate}&seq=${opts.seq ?? 0}&epoch=${opts.epoch ?? 0}&offset=${opts.offset ?? 0}&format=${opts.format ?? "jsonl"}`, token, {
       method: "POST",
       headers: { "x-relay-trace-id": TRACE, ...(entry ? { "x-relay-migration-plan-entry-length": String(entry.byteLength) } : {}) },
       body,
@@ -638,6 +666,299 @@ describe("buildIngestApp auth (production composition)", () => {
     });
     expect(sent.map((m) => m.payload.key)).toEqual([keys.exact]);
     expect(result.enqueued).toBe(1);
+  });
+
+  // ---- Plan entry v2: the base read, then a backfill epoch (issuer spec #86) ----
+
+  const BASE_READ_ON = { ...MIGRATION_ON, ALLOW_INTERIM_RELAYAUTH_BEARER: "true", RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ: "true" };
+  const straddle = { ...LOCATION, sessionId: "session-straddle" };
+  const ndjsonRecord = (n: number) =>
+    new TextEncoder().encode(`${JSON.stringify({ kind: "event", record_id: `r${n}`, origin_id: "o1", revision: 1, received_at: AT, payload: { n } })}\n`);
+
+  /** A live ndjson session at `straddle`, its manifest and version, plus the plan's v2 entry for two backfill chunks. */
+  async function liveSessionWithPlan(i: Awaited<ReturnType<typeof ingest>>, location = straddle) {
+    const key = manifestKey(location);
+    const liveChunk = await i.chunk(liveToken(), location, { bytes: ndjsonRecord(1), format: "ndjson" });
+    expect(liveChunk.status).toBe(201);
+    const liveSealed = (await liveChunk.json()) as { entry: Record<string, unknown> & { bytes: number; stored_bytes: number }; scrub: unknown };
+    const liveManifest = {
+      schema_v: 1, layout: "v1", trace_id: TRACE, revision: 1, created_at: AT, updated_at: AT,
+      session: { workspace_id: WORKSPACE, machine_id: location.machineId, harness: location.harness, session_id: location.sessionId, started_at: AT },
+      writer: { delivery_instance_id: location.machineId, plugin_version: "test" },
+      raw: {
+        owner: location.machineId, state: "open", updated_at: AT, format: "ndjson", compression: "zstd", chunk_count: 1,
+        raw_bytes: liveSealed.entry.bytes, stored_bytes: liveSealed.entry.stored_bytes,
+        content_sha256: await computeContentSha256([liveSealed.entry as never]), epoch: 0,
+        epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: 0, opened_by: location.machineId }],
+        next_offset: liveSealed.entry.bytes, chunks: [liveSealed.entry], scrub: liveSealed.scrub,
+      },
+      extensions: { "96bulls": { session_uuid: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c19", session_uuid_source: "minted", tenant_id: ORG, user_id: USER } },
+    };
+    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-machine-id": location.machineId, "x-session-id": location.sessionId },
+      body: JSON.stringify({ key, manifest: liveManifest }),
+    });
+    expect(liveCommit.status).toBe(202);
+    const liveVersion = ((await liveCommit.json()) as { version: { eTag?: string; version?: string } }).version;
+    const sources = [ndjsonRecord(100), ndjsonRecord(101)];
+    const chunks = sources.map((b, n) => ({
+      start_offset: n === 0 ? 0 : sources[0]!.byteLength,
+      bytes: b.byteLength,
+      sha256: createHash("sha256").update(b).digest("hex"),
+      records: 1,
+    }));
+    const entry: PlanEntryV2 = {
+      v: 2, kind: "backfill", grant_id: GRANT, key, org_id: ORG, workspace_id: WORKSPACE, source_user_id: USER,
+      session: { machine_id: location.machineId, harness: location.harness, session_id: location.sessionId, started_at: AT },
+      format: "ndjson", chunks, backfill_sha256: await backfillSha256(chunks),
+      raw_bytes: sources.reduce((n, b) => n + b.byteLength, 0),
+    };
+    return { key, liveManifest, liveSealed, liveVersion, sources, chunks, entry, entryText: canonicalJson(entry), read: await baseReadIdentityOf(entry, PLAN) };
+  }
+
+  const getBase = (i: Awaited<ReturnType<typeof ingest>>, token: string, key: string, query = "") =>
+    i.req(`/v1/pipeline/manifests/base?key=${encodeURIComponent(key)}${query}`, token);
+
+  test("v2 base read: exactly the 7 base fields, single use (replay 409), exactly one concurrent winner, audited without the key", async () => {
+    const i = await ingest(BASE_READ_ON);
+    const p = await liveSessionWithPlan(i);
+    const auditBefore = await count("sessions.migration_ingest_audit");
+    const token = baseReadToken(p.read);
+    const [a, b, c2] = await Promise.all([getBase(i, token, p.key), getBase(i, token, p.key), getBase(i, token, p.key)]);
+    const statuses = [a.status, b.status, c2.status].sort();
+    expect(statuses).toEqual([200, 409, 409]);
+    const winner = [a, b, c2].find((r) => r.status === 200)!;
+    const { base } = (await winner.json()) as { base: BackfillBase };
+    expect(Object.keys(base).sort()).toEqual(["chunk_count", "content_sha256", "epoch", "owner", "revision", "version", "writer"]);
+    expect(base).toEqual({
+      revision: 1, version: String(p.liveVersion.version ?? p.liveVersion.eTag), owner: straddle.machineId, writer: straddle.machineId,
+      chunk_count: 1, epoch: 0, content_sha256: p.liveManifest.raw.content_sha256,
+    });
+    for (const r of [a, b, c2].filter((r) => r.status === 409)) expect(await code(r)).toBe("migration_assertion_replayed");
+    // A later replay too.
+    expect((await getBase(i, token, p.key)).status).toBe(409);
+    // One durable audit row, result base_read, the key's digest instead of the key.
+    expect(await count("sessions.migration_ingest_audit")).toBe(auditBefore + 1);
+    const { rows } = await db.query<Record<string, unknown>>("SELECT * FROM sessions.migration_ingest_audit ORDER BY id DESC LIMIT 1");
+    expect(rows[0]).toMatchObject({ result: "base_read", grant_id: GRANT, plan_digest: PLAN, entry_sha256: p.read.entry_sha256, user_id: USER });
+    expect(String(rows[0]!.work_key)).toBe(`${createHash("sha256").update(p.key).digest("hex")}@base_read@r1`);
+    expect(JSON.stringify(rows[0])).not.toContain(straddle.machineId);
+    expect(JSON.stringify(rows[0])).not.toContain(token.split(".")[2]!);
+    // Its own replay namespace.
+    const { rows: own } = await db.query("SELECT 1 FROM sessions.migration_base_read_uses");
+    expect(own).toHaveLength(1);
+  });
+
+  test("v2 base read refusals: default-off gate, cross-tenant, wrong key, query variants, missing or unusable base (nothing consumed)", async () => {
+    // Default off: the capability does not verify, and the route is not served.
+    const off = await ingest({ ...MIGRATION_ON, ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
+    const p0 = await liveSessionWithPlan(off);
+    const offRead = await getBase(off, baseReadToken(p0.read), p0.key);
+    expect(offRead.status).toBe(401);
+    expect((await getBase(off, liveToken(), p0.key)).status).toBe(404);
+    await db.exec("TRUNCATE sessions.pipeline_jobs");
+
+    const i = await ingest(BASE_READ_ON);
+    const p = await liveSessionWithPlan(i, { ...straddle, sessionId: "session-straddle-2" });
+    const read = p.read;
+    const cases: [string, () => Promise<Response>, number][] = [
+      ["another org's tenancy", () => getBase(i, baseReadToken({ ...read, org_id: "org_other" })), 403],
+      ["another user's capability", () => getBase(i, baseReadToken({ ...read, source_user_id: "user_other" }), p.key), 403],
+      ["another workspace", () => getBase(i, baseReadToken(read, {}, { workspaceId: "ws_other" }), p.key), 403],
+      ["a key other than the signed one", () => getBase(i, baseReadToken(read), manifestKey(LOCATION)), 403],
+      ["a second query parameter", () => getBase(i, baseReadToken(read), p.key, "&machine=x"), 400],
+      ["a client-chosen prefix", () => getBase(i, baseReadToken(read), `deploy-x/${p.key}`), 403],
+      ["a grant this ingest does not accept", () => getBase(i, baseReadToken({ ...read, grant_id: `mgr_${"9".repeat(32)}` }, {}, { grantId: `mgr_${"9".repeat(32)}` }), p.key), 403],
+      ["a malformed meta.read (extra key)", () => getBase(i, baseReadToken({ ...read, extra: 1 } as never), p.key), 401],
+      ["meta.upload on a base-read token", () => getBase(i, baseReadToken(read, {}, { upload: read }), p.key), 401],
+      ["the upload audience on a base-read token", () => getBase(i, baseReadToken(read, { aud: [ORIGIN] }), p.key), 401],
+      ["a TTL above 30 s", () => getBase(i, baseReadToken(read, { exp: now() + 45 }), p.key), 401],
+      ["an upload-namespace jti", () => getBase(i, baseReadToken(read, { jti: `tok_${randomBytes(8).toString("hex")}` }), p.key), 401],
+      ["a base-read identity inside an upload token's meta.upload", () => i.chunk(migrationToken(read as never), straddle, { entry: p.entryText, seq: 1, epoch: 1, format: "ndjson" }), 401],
+      ["a base-read jti (mbr_) on an upload token", async () => i.chunk(migrationToken((await planned()).upload, { jti: `mbr_${randomBytes(8).toString("hex")}` }), LOCATION, { entry: (await planned()).entryText }), 401],
+    ];
+    for (const [name, run, status] of cases) {
+      const r = await run();
+      expect(`${name}: ${r.status}`).toBe(`${name}: ${status}`);
+    }
+    // No manifest yet at a planned key: 404, nothing consumed.
+    const fresh = { ...straddle, sessionId: "session-not-live" };
+    const freshEntry = { ...p.entry, key: manifestKey(fresh), session: { ...p.entry.session, session_id: fresh.sessionId } };
+    expect((await getBase(i, baseReadToken(await baseReadIdentityOf(freshEntry, PLAN)), manifestKey(fresh))).status).toBe(404);
+    // A migration-owned (cold-export) session cannot take a backfill: 409 migration_base_unusable.
+    const cold = await planned();
+    expect((await i.chunk(migrationToken(cold.upload), LOCATION, { entry: cold.entryText })).status).toBe(201);
+    expect((await i.commit(migrationToken(cold.upload), cold.manifest)).status).toBe(202);
+    const coldEntry = { ...p.entry, key: manifestKey(LOCATION), session: { machine_id: LOCATION.machineId, harness: LOCATION.harness, session_id: LOCATION.sessionId, started_at: AT } };
+    const unusable = await getBase(i, baseReadToken(await baseReadIdentityOf(coldEntry, PLAN)), manifestKey(LOCATION));
+    expect(unusable.status).toBe(409);
+    expect(await code(unusable)).toBe("migration_base_unusable");
+    const { rows } = await db.query("SELECT 1 FROM sessions.migration_base_read_uses");
+    expect(rows).toHaveLength(0);
+  });
+
+  test("v2 route matrix: a base-read capability reaches only /base; upload, commit and live tokens never reach /base; method, slash and path variants do not widen", async () => {
+    const i = await ingest(BASE_READ_ON);
+    const p = await liveSessionWithPlan(i, { ...straddle, sessionId: "session-matrix" });
+    const read = p.read;
+    const commitUpload = await uploadIdentityV2Of(p.entry, PLAN, { revision: 1, version: '"v"', owner: straddle.machineId, writer: straddle.machineId, chunk_count: 1, epoch: 0, content_sha256: p.liveManifest.raw.content_sha256 });
+    const expectStatus = async (name: string, r: Promise<Response>, status: number, errorCode?: string) => {
+      const res = await r;
+      expect(`${name}: ${res.status}`).toBe(`${name}: ${status}`);
+      if (errorCode) expect(`${name}: ${await code(res)}`).toBe(`${name}: ${errorCode}`);
+    };
+    // A base-read capability on every other route.
+    await expectStatus("base-read on chunks", i.chunk(baseReadToken(read), straddle, { entry: p.entryText, seq: 1, epoch: 1, bytes: p.sources[0], format: "ndjson" }), 403, "migration_token_class_forbidden");
+    await expectStatus("base-read on commit", i.commit(baseReadToken(read), p.liveManifest, p.key), 403, "migration_token_class_forbidden");
+    await expectStatus("base-read on status", i.req(`/v1/pipeline/manifests/status?key=${encodeURIComponent(p.key)}`, baseReadToken(read)), 403, "migration_token_class_forbidden");
+    await expectStatus("base-read on events", i.req("/v1/pipeline/events", baseReadToken(read), { method: "POST", body: "{}" }), 403, "migration_assertion_route");
+    // Upload, v2 commit and live tokens on /base.
+    await expectStatus("v1 upload on /base", getBase(i, migrationToken((await planned()).upload), p.key), 403, "migration_token_class_forbidden");
+    await expectStatus("v2 commit on /base", getBase(i, migrationToken(commitUpload), p.key), 403, "migration_token_class_forbidden");
+    await expectStatus("live token on /base", getBase(i, liveToken(), p.key), 403, "migration_token_class_forbidden");
+    // Method, slash and path variants.
+    for (const [name, path, method] of [
+      ["HEAD /base", `/v1/pipeline/manifests/base?key=${encodeURIComponent(p.key)}`, "HEAD"],
+      ["POST /base", `/v1/pipeline/manifests/base?key=${encodeURIComponent(p.key)}`, "POST"],
+      ["/base//", `/v1/pipeline/manifests/base//?key=${encodeURIComponent(p.key)}`, "GET"],
+      ["/base/x", `/v1/pipeline/manifests/base/x?key=${encodeURIComponent(p.key)}`, "GET"],
+      ["/status/../base", `/v1/pipeline/manifests/status/x?key=${encodeURIComponent(p.key)}`, "GET"],
+    ] as const) {
+      const r = await i.req(path, baseReadToken(read), { method });
+      expect(`${name}: ${r.status}`).toBe(`${name}: 403`);
+    }
+    // One trailing slash is tolerated (the same rule for every route).
+    // ...but no handler widens to it: never a 200 with a base.
+    expect([403, 404]).toContain((await i.req(`/v1/pipeline/manifests/base/?key=${encodeURIComponent(p.key)}`, baseReadToken(read))).status);
+    const { rows } = await db.query("SELECT 1 FROM sessions.migration_base_read_uses");
+    expect(rows.length).toBeLessThanOrEqual(1);
+  });
+
+  test("v2 backfill end to end: base read, then the backfill epoch on exactly that base, consumed through session-indexed; a base change between read and commit is refused", async () => {
+    const i = await ingest(BASE_READ_ON);
+    const p = await liveSessionWithPlan(i);
+    // 1. The base read.
+    const readRes = await getBase(i, baseReadToken(p.read), p.key);
+    expect(readRes.status).toBe(200);
+    const { base } = (await readRes.json()) as { base: BackfillBase };
+    // 2. The commit assertion with exactly that base.
+    const upload = await uploadIdentityV2Of(p.entry, PLAN, base);
+    expect(upload.entry_sha256).toBe(await planEntryV2Sha256(p.entry));
+    expect(upload.entry_sha256).toBe(p.read.entry_sha256);
+    const token = migrationToken(upload);
+    // Chunk negatives (seq/epoch from the signed base; bytes digested).
+    for (const [name, opts] of [
+      ["seq inside the live range", { seq: 0, epoch: 1, bytes: p.sources[0] }],
+      ["epoch not base.epoch + 1", { seq: 1, epoch: 0, bytes: p.sources[0] }],
+      ["other bytes", { seq: 1, epoch: 1, bytes: ndjsonRecord(999) }],
+      ["chunk 1 at chunk 0's seq", { seq: 1, epoch: 1, bytes: p.sources[1], offset: 0 }],
+    ] as const) {
+      const r = await i.chunk(token, straddle, { entry: p.entryText, format: "ndjson", ...opts });
+      expect(`${name}: ${r.status}`).toBe(`${name}: 403`);
+    }
+    const sealed: Record<string, unknown>[] = [];
+    for (const [n, bytes] of p.sources.entries()) {
+      const r = await i.chunk(token, straddle, { entry: p.entryText, seq: base.chunk_count + n, epoch: base.epoch + 1, offset: p.chunks[n]!.start_offset, bytes, format: "ndjson" });
+      expect(r.status).toBe(201);
+      sealed.push(((await r.json()) as { entry: Record<string, unknown> }).entry);
+    }
+    const added = sealed as unknown as { bytes: number; stored_bytes: number; start_offset: number }[];
+    const appended = {
+      ...p.liveManifest,
+      revision: 2,
+      raw: {
+        ...p.liveManifest.raw,
+        chunk_count: 3,
+        raw_bytes: p.liveManifest.raw.raw_bytes + added.reduce((n, c) => n + c.bytes, 0),
+        stored_bytes: p.liveManifest.raw.stored_bytes + added.reduce((n, c) => n + c.stored_bytes, 0),
+        content_sha256: await computeContentSha256([p.liveSealed.entry, ...sealed] as never),
+        epoch: 1,
+        epochs: [...p.liveManifest.raw.epochs, { epoch: 1, opened_at: AT, reason: "backfill", first_seq: 1, opened_by: `migration:${GRANT}` }],
+        next_offset: added.at(-1)!.start_offset + added.at(-1)!.bytes,
+        chunks: [p.liveSealed.entry, ...sealed],
+      },
+      extensions: {
+        ...p.liveManifest.extensions,
+        "client.relayhistory_export": { version: 1, source: "neon.delivery_records", exported_at: AT, grant_id: GRANT, plan_digest: PLAN, source_user_id: USER },
+      },
+    };
+    const post = (t: string, manifest: unknown, previousVersion: unknown = p.liveVersion) =>
+      i.req("/v1/pipeline/manifests", t, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-machine-id": straddle.machineId, "x-session-id": straddle.sessionId },
+        body: JSON.stringify({ key: p.key, manifest, previousVersion }),
+      });
+    // Commit negatives: a base other than the stored one; missing records; a stale CAS.
+    const wrongBase = async (b: Partial<BackfillBase>) => migrationToken(await uploadIdentityV2Of(p.entry, PLAN, { ...base, ...b }));
+    for (const [name, t] of [
+      ["base revision", await wrongBase({ revision: 2 })],
+      ["base version", await wrongBase({ version: '"stale"' })],
+      ["base chunk_count", await wrongBase({ chunk_count: 0 })],
+      ["base owner", await wrongBase({ owner: "machine-other" })],
+      ["base content", await wrongBase({ content_sha256: "c".repeat(64) })],
+    ] as const) {
+      const r = await post(t, appended);
+      expect(`${name}: ${r.status}`).toBe(`${name}: 403`);
+    }
+    const noRecords = structuredClone(appended);
+    delete (noRecords.raw.chunks[2] as { records?: number }).records;
+    const r0 = await post(token, noRecords);
+    expect([400, 403]).toContain(r0.status);
+    expect((await post(token, appended, { eTag: '"stale"' })).status).toBe(409);
+    expect(await count("sessions.migration_assertion_uses")).toBe(0);
+    // The commit on exactly the read base.
+    const commit = await post(token, appended);
+    expect(commit.status).toBe(202);
+    expect(((await commit.json()) as { workKey: string }).workKey).toBe(`${p.key}@${upload.entry_sha256}@r2`);
+    // Replay of the commit assertion: 409.
+    expect((await post(token, appended)).status).toBe(409);
+
+    const sql = pgExecutor();
+    const indexed: string[] = [];
+    const deadLetters = postgresDeadLetterStore(sql);
+    const deps = pipelineQueueDeps({} as Bindings, {
+      queue: postgresPipelineQueue(sql), sink: sqlPipelineEventSink(sql), deadLetters,
+      index: { upsertRawPointer: async (pointer: { manifestKey: string }) => void indexed.push(pointer.manifestKey) } as never,
+    });
+    expect(await pollPostgresStage({ sql, stage: "object-landed", deps })).toMatchObject({ claimed: 2, acked: 2, exhausted: 0 });
+    expect(await pollPostgresStage({ sql, stage: "session-indexed", deps })).toMatchObject({ claimed: 2, acked: 2, exhausted: 0 });
+    expect(indexed).toEqual([p.key, p.key]);
+  });
+
+  test("v2 race: a live write between the base read and the commit makes the read base stale, and the commit is refused", async () => {
+    const i = await ingest(BASE_READ_ON);
+    const location = { ...straddle, sessionId: "session-race" };
+    const p = await liveSessionWithPlan(i, location);
+    const { base } = (await (await getBase(i, baseReadToken(p.read), p.key)).json()) as { base: BackfillBase };
+    // The live client appends (revision 2) after the base read.
+    const second = await i.chunk(liveToken(), location, { bytes: ndjsonRecord(2), format: "ndjson", seq: 1, offset: p.liveSealed.entry.bytes });
+    expect(second.status).toBe(201);
+    const secondEntry = ((await second.json()) as { entry: Record<string, unknown> & { bytes: number; stored_bytes: number } }).entry;
+    const liveV2 = {
+      ...p.liveManifest, revision: 2,
+      raw: { ...p.liveManifest.raw, chunk_count: 2, raw_bytes: p.liveManifest.raw.raw_bytes + secondEntry.bytes, stored_bytes: p.liveManifest.raw.stored_bytes + secondEntry.stored_bytes,
+        content_sha256: await computeContentSha256([p.liveSealed.entry, secondEntry] as never), next_offset: p.liveSealed.entry.bytes + secondEntry.bytes, chunks: [p.liveSealed.entry, secondEntry] },
+    };
+    const liveWrite = await i.req("/v1/pipeline/manifests", liveToken(), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-machine-id": location.machineId, "x-session-id": location.sessionId },
+      body: JSON.stringify({ key: p.key, manifest: liveV2, previousVersion: p.liveVersion }),
+    });
+    expect(liveWrite.status).toBe(202);
+    // A commit on the stale base: refused before any write, nothing consumed.
+    const token = migrationToken(await uploadIdentityV2Of(p.entry, PLAN, base));
+    const appended = { ...liveV2, revision: 3 };
+    const r = await i.req("/v1/pipeline/manifests", token, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-machine-id": location.machineId, "x-session-id": location.sessionId },
+      body: JSON.stringify({ key: p.key, manifest: appended, previousVersion: p.liveVersion }),
+    });
+    expect([403, 409]).toContain(r.status);
+    expect(await count("sessions.migration_assertion_uses")).toBe(0);
+    // A fresh base read now returns revision 2.
+    const again = await getBase(i, baseReadToken(p.read), p.key);
+    expect(((await again.json()) as { base: BackfillBase }).base.revision).toBe(2);
   });
 
   test("signed work key and durable audit: posted fields cannot alter the work key; one audit row per commit, no secrets", async () => {

@@ -53,6 +53,7 @@ import {
   verifyMigrationAssertion,
 } from "../auth/relayauth.js";
 import {
+  migrationKindAllowsRoute,
   migrationPairAuthorized,
   migrationRouteAllowed,
 } from "../lib/pipeline/migration-assertions.js";
@@ -80,6 +81,8 @@ export const requireAuth = createMiddleware<AppEnv>(async (c, next) => {
     if (err instanceof IdentityError) return deny(401, err.code, err.message);
     throw err;
   }
+  if (auth.migration && migrationRouteAllowed(c.req.method, c.req.path) && !migrationKindAllowsRoute(auth.migration.upload, c.req.method, c.req.path))
+    return deny(403, "migration_token_class_forbidden", "this migration token class does not reach this route");
   if (auth.migration && !migrationRouteAllowed(c.req.method, c.req.path))
     return deny(403, "migration_assertion_route", "migration assertions are accepted only by the pipeline upload routes");
   if (auth.migration && !migrationPairAuthorized(auth))

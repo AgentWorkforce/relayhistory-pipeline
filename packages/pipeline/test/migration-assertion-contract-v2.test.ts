@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   backfillSha256,
+  baseReadIdentityOf,
   canonicalJson,
   exportPlanDigest,
   exportPlanDigestV2,
@@ -35,6 +36,8 @@ const v2 = read("relayhistory-export-plan-entry-v2.vectors.json") as {
   plan: { canonical_json: string; plan_digest: string };
   base: UploadIdentityV2["base"];
   upload_identity: UploadIdentityV2;
+  base_read_identity: Record<string, unknown>;
+  legacy_plan_digests: { absent: string; empty: string; v1_vectors_plan_digest: string };
   work_key: string;
   appended_chunks: { seq: number; epoch: number }[];
   appended_epoch: { epoch: number; first_seq: number; opened_by: string };
@@ -63,6 +66,11 @@ describe("export plan entry contract v2 (backfill epoch)", () => {
     expect(await uploadIdentityV2Of(e, v2.plan.plan_digest, v2.base)).toEqual(v2.upload_identity);
     expect(parseUploadIdentity(v2.upload_identity)).toEqual(v2.upload_identity);
     expect(migrationWorkKey(v2.upload_identity)).toBe(v2.work_key);
+    // The base-read capability's meta.read, and the legacy conditional.
+    expect(await baseReadIdentityOf(e, v2.plan.plan_digest)).toEqual(v2.base_read_identity);
+    expect(parseUploadIdentity(v2.base_read_identity)).toEqual(v2.base_read_identity);
+    expect(v2.legacy_plan_digests.absent).toBe(v1.plan.plan_digest);
+    expect(v2.legacy_plan_digests.empty).toBe(v1.plan.plan_digest);
     expect(v2.appended_chunks.map((c) => c.seq)).toEqual(e.chunks.map((_, i) => v2.base.chunk_count + i));
     expect(v2.appended_epoch).toMatchObject({ epoch: v2.base.epoch + 1, first_seq: v2.base.chunk_count, opened_by: `migration:${v2.grant_id}` });
   });
@@ -77,6 +85,11 @@ describe("export plan entry contract v2 (backfill epoch)", () => {
       { ...u, base: { ...u.base, revision: 0 } },
       { ...u, base: { ...u.base, extra: 1 } },
       { ...u, base: { ...u.base, content_sha256: "x" } },
+      { ...u, base: { ...u.base, revision: Number.MAX_SAFE_INTEGER } },
+      { ...u, base: { ...u.base, chunk_count: Number.MAX_SAFE_INTEGER - 4095 } },
+      { ...u, base: { ...u.base, epoch: 4294967295 } },
+      { ...u, base: { ...u.base, revision: 1.5 } },
+      { ...u, base: { ...u.base, chunk_count: "4" } },
     ])
       expect(parseUploadIdentity(bad)).toBeUndefined();
     const e = v2.backfill_entry;
@@ -86,6 +99,9 @@ describe("export plan entry contract v2 (backfill epoch)", () => {
       { ...e, chunks: [{ ...e.chunks[0]!, start_offset: 5 }, ...e.chunks.slice(1)] },
       { ...e, raw_bytes: e.raw_bytes + 1 },
       { ...e, chunks: e.chunks.map((c) => ({ ...c, seq: 0 })) },
+      // records is mandatory.
+      { ...e, chunks: e.chunks.map(({ records: _r, ...c }) => c) },
+      { ...e, chunks: [{ ...e.chunks[0]!, bytes: Number.MAX_SAFE_INTEGER }, ...e.chunks.slice(1)] },
     ])
       expect(parsePlanEntryV2(canonicalJson(bad))).toBeUndefined();
     expect(parsePlanEntryV2(JSON.stringify(e, null, 1))).toBeUndefined();

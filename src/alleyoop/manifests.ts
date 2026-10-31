@@ -1,7 +1,9 @@
 import { Hono, type Context } from "hono";
 import { createMiddleware } from "hono/factory";
 import {
+  backfillBaseOf,
   isBackfillIdentity,
+  isBaseReadIdentity,
   migrationBackfillIssue,
   migrationGrantAllowed,
   migrationManifestProvenance,
@@ -40,6 +42,9 @@ import {
   type StageMessage,
 } from "../shared/vendor.ts";
 import { enrichMessage } from "../shared/enrich.ts";
+import { createHash } from "node:crypto";
+
+const sha256Hex = async (text: string) => createHash("sha256").update(text).digest("hex");
 
 /**
  * The ingest's migration ledger over HoopDb: `sessions.migration_assertion_uses`
@@ -608,11 +613,12 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   const owns = async (
     c: Context<AppEnv>,
     location: NonNullable<ReturnType<typeof parseSessionKey>>,
+    scope = "rth:sync",
   ) => {
     const auth = c.get("auth") as Auth;
     const env = c.env ?? {};
-    if (!auth.scopes.includes("rth:sync"))
-      return responseError(c, 403, "forbidden", "rth:sync scope is required");
+    if (!auth.scopes.includes(scope))
+      return responseError(c, 403, "forbidden", `${scope} scope is required`);
     if (
       auth.migration &&
       !migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId] })
@@ -906,6 +912,79 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   });
 
   /** Startup reconciliation: version only, scoped to the stored machine/writer. */
+  /**
+   * The v2 pre-mint base read (issuer spec section 4): only the base-read
+   * capability, only exactly `GET ...?key=<signed unprefixed key>`, default
+   * off (`RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ`). One storage snapshot,
+   * validated, then ONE transaction consumes the capability and appends the
+   * audit row; the 7 base fields are returned only after it commits.
+   */
+  routes.get("/pipeline/manifests/base", async (c) => {
+    const env = c.env ?? {};
+    if (env.RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ !== "true")
+      return responseError(c, 404, "not_found", "no route");
+    const auth = c.get("auth") as Auth;
+    const migration = auth?.migration;
+    if (!migration || !isBaseReadIdentity(migration.upload))
+      return responseError(c, 403, "migration_token_class_forbidden", "only a migration base-read capability may read a base");
+    const read = migration.upload;
+    const params = [...new URL(c.req.url).searchParams.keys()];
+    if (params.length !== 1 || params[0] !== "key")
+      return responseError(c, 400, "bad_request", "exactly one query parameter, key, is allowed");
+    if (c.req.query("key") !== read.key) return uploadForbidden(c);
+    const ledger = deps.migrationLedger;
+    if (!ledger) return ledgerUnavailable(c);
+    if (!migrationPairAuthorized(auth)) return workspaceForbidden(c);
+    if (!migrationGrantAllowed(env, migration)) return grantForbidden(c);
+    const key = storageKey(c, read.key);
+    const location = parseSessionKey(key);
+    if (!location || location.rest !== "manifest.json") return uploadForbidden(c);
+    if (!migrationSessionMatches(auth, location)) return uploadForbidden(c);
+    const owned = await owns(c, location, "rth:migration_base_read");
+    if (owned !== true) return owned;
+    let snapshot: Awaited<ReturnType<typeof storedManifest>>;
+    try {
+      snapshot = await storedManifest(deps.raw, key);
+    } catch {
+      return responseError(c, 503, "storage_unavailable", "Object storage is temporarily unavailable");
+    }
+    if (!snapshot) return responseError(c, 404, "not_found", "no live manifest at this key");
+    const session = snapshot.manifest.session;
+    if (
+      session.machine_id !== read.session.machine_id ||
+      session.harness !== read.session.harness ||
+      session.session_id !== read.session.session_id ||
+      session.started_at !== read.session.started_at
+    )
+      return uploadForbidden(c);
+    const base = backfillBaseOf(snapshot);
+    if (typeof base === "string")
+      return responseError(c, 409, "migration_base_unusable", base);
+    let outcome: MigrationConsumeResult;
+    try {
+      outcome = await ledger.consumeBaseRead(
+        {
+          jti: migration.jti,
+          nonce: migration.nonce,
+          grantId: migration.grantId,
+          planDigest: migration.planDigest,
+          planEntryDigest: read.entry_sha256,
+          orgId: auth.orgId,
+          workspaceId: location.workspaceId,
+          userId: auth.userId,
+          expiresAt: migration.expiresAt,
+        },
+        // Minimized: the key's digest, never its machine or session ids.
+        `${await sha256Hex(read.key)}@base_read@r${base.revision}`,
+      );
+    } catch {
+      return ledgerUnavailable(c);
+    }
+    if (outcome === "replayed") return replayed(c);
+    if (outcome === "grant_mismatch") return grantForbidden(c);
+    return c.json({ base }, 200);
+  });
+
   routes.get("/pipeline/manifests/status", async (c) => {
     const key = storageKey(c, c.req.query("key") ?? "");
     const location = parseSessionKey(key);

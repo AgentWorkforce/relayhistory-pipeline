@@ -23,7 +23,7 @@ v2 splits the identity into two parts:
 | `key` | the live session's v1 manifest key, without any deployment prefix |
 | `session` | `{machine_id, harness, session_id, started_at}` of the live session |
 | `format` | `"ndjson"` (a backfill epoch needs an ndjson stream, #46) |
-| `chunks` | `[{start_offset, bytes, sha256, records}]`: `sha256` is the SHA-256 of the chunk's **source** bytes; `start_offset` runs contiguously from 0; at least one chunk |
+| `chunks` | `[{start_offset, bytes, sha256, records}]`: `sha256` is the SHA-256 of the chunk's **source** bytes; `start_offset` runs contiguously from 0; 1 to 4096 chunks; **`records` is mandatory** (#46's optional `records` must be filled in before planning; a manifest chunk without it is refused at commit); safe-integer bounds as in the issuer spec |
 | `backfill_sha256` | #46's `backfillDigest`: the manifest v1 content hash chain over `chunks` with every `epoch` set to 0 |
 | `raw_bytes` | the sum of `chunks[].bytes`, which equals the end offset |
 
@@ -57,16 +57,25 @@ The `base` fields describe the stored live manifest at mint time:
 | `epoch` | its `raw.epoch`; the backfill epoch is `epoch + 1` |
 | `content_sha256` | its `raw.content_sha256` |
 
-## What relayauth must sign (and check before signing)
+## Issuer, base read and route matrix
 
-- **The mint request:** `upload: {key, base}` with the seven `base` fields above, as the courier read them from `GET /v1/pipeline/manifests/status` and the stored manifest. The courier supplies no other identity field.
-- **Checks before signing:**
-  - the key is a `backfills` entry of the grant's stored plan;
-  - that entry's `(source_user_id, workspace_id)` is the requested pair;
-  - the `base` fields are well-formed: `revision` at least 1, `chunk_count` and `epoch` at least 0, `owner` not `migration:*`, `content_sha256` 64 hex, `version` non-empty.
-- **What it signs:** the v2 identity, with every field except `base` derived from the stored entry, and `base` copied from the request.
-- **The base is a binding, not something trusted:** the issuer cannot verify it. The ingest checks it against storage, and a wrong base is refused there.
-- **Exact field list for `meta.upload` v2:** `v`, `kind`, `grant_id`, `plan_digest`, `key`, `org_id`, `workspace_id`, `source_user_id`, `session.{machine_id, harness, session_id, started_at}`, `backfill_sha256`, `entry_sha256`, and `base.{revision, version, owner, writer, chunk_count, epoch, content_sha256}`. Nothing else may appear; the ingest refuses any extra key.
+These are normative in [`relayhistory-export-plan-entry-v2-issuer.md`](relayhistory-export-plan-entry-v2-issuer.md) (96BullSessions #86, contract review), which has its own vectors. In summary:
+
+- **Plan with backfills:**
+  - The issuer stores the plan, and checks `records` (mandatory), contiguous offsets and safe-integer bounds on every backfill chunk.
+  - It derives `backfill_sha256` and `raw_bytes` itself.
+  - With absent or empty `backfills`, the plan is the exact v1 plan.
+- **The base comes from the pre-mint base read:**
+  1. The courier mints a **base-read capability**: its own token class `migration_base_read`, scope `rth:migration_base_read`, audience `<origin>/v1/pipeline/manifests/base`, TTL of 30 s or less, `meta.read`, a `jti` starting `mbr_`, and its own replay table.
+  2. It calls `GET /v1/pipeline/manifests/base?key=<signed unprefixed key>`.
+  3. The ingest takes one storage snapshot and validates it. Then, in one transaction, it consumes the capability and appends an audit row (`result = base_read`, and the key's digest instead of the key). Only then does it return exactly the 7 base fields.
+  4. The courier mints the v2 commit assertion with `upload: {key, base}`, copying that base verbatim.
+- **The commit compares the exact returned base with storage,** including the `previousVersion` compare-and-swap. A base that changed is refused: 403, or 409 on the version.
+- **Route matrix:**
+  - a base-read capability reaches only `/base`;
+  - every upload or ordinary token is refused on `/base` (403 `migration_token_class_forbidden`);
+  - matching is exact (method case, one trailing slash, no other normalization).
+- **The base read is default-off** (`RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ`). When off, `/base` gives 404, and a base-read capability fails verification.
 
 ## What the ingest checks
 
@@ -76,7 +85,7 @@ The `base` fields describe the stored live manifest at mint time:
   - The request carries the canonical v2 entry in front of the bytes (`X-Relay-Migration-Plan-Entry-Length`), and the entry must hash to the signed `entry_sha256`.
   - Its key, tenancy, session and `backfill_sha256` are the signed ones.
   - The chunk's position comes from the **signed base**: `seq = base.chunk_count + i`, `epoch = base.epoch + 1`. Its offset, size and the SHA-256 of the actual bytes must equal the entry's chunk `i`.
-- **Status:** a v2 token reads only its own session's status, which is how the courier gets the base version.
+- **Status:** a v2 commit token reads only its own session's status (its version). The base comes from the base read, not from status.
 - **Commit (`POST /v1/pipeline/manifests`).** Every condition below must hold, else 403 `migration_upload_forbidden`:
   - The **stored** manifest is exactly the signed base: same `revision`, version, `raw.owner`, writer, `chunk_count` (equal to the chunk list length), `raw.epoch` and `content_sha256`, and it has no backfill epoch yet. `previousVersion` must be the stored version, else 409 `revision_conflict`.
   - The **incoming** manifest is the base plus exactly one epoch: `revision = base.revision + 1`, the same owner and writer, `raw.format = ndjson`, and `raw.epoch = base.epoch + 1`.

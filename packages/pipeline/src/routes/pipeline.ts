@@ -30,7 +30,9 @@ import {
 } from "../lib/pipeline/index.js";
 import {
   isBackfillIdentity,
+  isV2Identity,
   MAX_PLAN_ENTRY_BYTES,
+  migrationKindAllowsRoute,
   migrationChunkMatches,
   migrationGrantAllowed,
   migrationManifestProvenance,
@@ -235,12 +237,20 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     const ledger = deps.migrationLedger?.(env);
     if (!ledger) return ledgerUnavailable(c);
     if (!migrationPairAuthorized(auth)) return workspaceForbidden(c);
-    if (isBackfillIdentity(auth.migration.upload) && !deps.migrationBackfill)
+    if (isV2Identity(auth.migration.upload) && !deps.migrationBackfill)
       return error(
         c,
         403,
         "migration_backfill_unsupported",
         "This deployment does not accept backfill-epoch (v2) migration assertions",
+      );
+    // A base-read capability reaches only the base read, and nothing else does.
+    if (!migrationKindAllowsRoute(auth.migration.upload, c.req.method, c.req.path))
+      return error(
+        c,
+        403,
+        "migration_token_class_forbidden",
+        "This migration token class does not reach this route",
       );
     if (!migrationGrantAllowed(env, auth.migration)) return grantForbidden(c);
     // Status: only the signed upload's own manifest key.
@@ -272,6 +282,17 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
   routes.use("/pipeline/chunks", migrationAdmission);
   routes.use("/pipeline/manifests", migrationAdmission);
   routes.use("/pipeline/manifests/status", migrationAdmission);
+  routes.use("/pipeline/manifests/base", migrationAdmission);
+  // This deployment serves no base read (only one with migrationBackfill and
+  // a base-fenced commit does): every other token is refused here too.
+  routes.get("/pipeline/manifests/base", (c) =>
+    error(
+      c,
+      403,
+      "migration_token_class_forbidden",
+      "Only a migration base-read capability reaches the base read",
+    ),
+  );
 
   function storageReadRequired(c: AppContext) {
     return error(

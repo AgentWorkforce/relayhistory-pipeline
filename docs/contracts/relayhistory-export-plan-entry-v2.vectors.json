@@ -51,6 +51,29 @@
     "epoch": 0,
     "content_sha256": "0f0d280d26f82b57da5f44bac5284c5941b62479ad959a44dff869f24d3904e1"
   },
+  "legacy_plan_digests": {
+    "note": "absent or [] backfills: the exact v1 stored plan and digest (issuer spec section 1)",
+    "absent": "a6682d4deeb479a42d8abf4c0dae89ddf39744916a0d4148bdb40ec702c20df1",
+    "empty": "a6682d4deeb479a42d8abf4c0dae89ddf39744916a0d4148bdb40ec702c20df1",
+    "v1_vectors_plan_digest": "a6682d4deeb479a42d8abf4c0dae89ddf39744916a0d4148bdb40ec702c20df1"
+  },
+  "base_read_identity": {
+    "v": 2,
+    "kind": "backfill_base_read",
+    "grant_id": "mgr_00000000000000000000000000000000",
+    "plan_digest": "f29e6cc4ec6c95c25ccd000a9c783de370f160a9387a0e3277ae2f8dd0407dbe",
+    "key": "v1/ws=ws_synthetic/m=machine-live/h=claude/d=2026/10/30/s=session-straddle/manifest.json",
+    "org_id": "org_synthetic",
+    "workspace_id": "ws_synthetic",
+    "source_user_id": "user_synthetic_a",
+    "session": {
+      "machine_id": "machine-live",
+      "harness": "claude",
+      "session_id": "session-straddle",
+      "started_at": "2026-10-30T08:00:00.000Z"
+    },
+    "entry_sha256": "bf81f5b9de1f9e2d881d6c230828dacbd74e12eb0cc361589bab6498d3ed9c35"
+  },
   "upload_identity": {
     "v": 2,
     "kind": "backfill",

@@ -49,6 +49,8 @@ export interface Bindings {
   RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS?: string;
   /** As upstream env.ts: the dedicated, default-off migration-assertion switch. */
   RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS?: string;
+  /** The v2 pre-mint base read's own default-off activation gate. */
+  RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ?: string;
   /** As upstream env.ts: accepted grants, comma-separated `grantId=planDigest`. */
   RELAYHISTORY_MIGRATION_GRANTS?: string;
   ALLOW_INTERIM_RELAYAUTH_BEARER?: string;

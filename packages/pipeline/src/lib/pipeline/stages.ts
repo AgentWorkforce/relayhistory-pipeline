@@ -67,7 +67,7 @@ export interface RawPointer {
   /** The manifest was deleted: remove the pointer rather than upsert it. */
   deleted?: boolean;
   /** Migration work: see `ObjectLandedPayload.migration`. */
-  migration?: { key: string; entry_sha256: string };
+  migration?: ObjectLandedPayload["migration"];
 }
 
 export interface SessionPointerIndex {
