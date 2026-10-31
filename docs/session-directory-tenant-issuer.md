@@ -200,7 +200,27 @@ One typed contract, answering whether a user in an org belongs to each named wor
 The count limit is not enough. 64 IDs of 128 characters make a signed token of about 12 KB; UUIDs make about 4 KB. So:
 
 - Set a conservative limit on the total bytes of the serialized workspace claim, and chunk by it as well as by count.
-- Set the limit from a test of real tokens through the real proxy and PostgREST header limits, in both hosted and self-hosted paths. No figure is chosen yet.
+- No figure is chosen yet. The test below sets it, and it must pass before any bulk code ships.
+
+**Test topology.** Real signed tokens through every hop a request crosses, with default limits, not a direct PostgREST connection:
+
+| Path | Hops |
+| --- | --- |
+| Hosted | RelayHistory Worker, then the Supabase API gateway, then PostgREST |
+| Self-hosted | RelayHistory, then the cluster ingress or Service in front of PostgREST, then PostgREST |
+
+Tokens use the real Postgres and policy row, on a non-production project or throwaway cluster. The hosted path needs Khaliq's OK first.
+
+**Sweep.** Authorization header sizes of 2, 4, 6, 8, 12, 16, 24 and 32 KB, built by growing `workspace_ids`, with 100 requests at each size, sequentially and then at 20 concurrent.
+
+**Pass at a size, all of:**
+- All 100 requests return 200 with the expected rows.
+- No 400, 413, 431 or 5xx, connection reset or truncated header at any hop.
+- p95 latency is within 20% of a one-workspace token on the same path.
+
+Any miss fails that size and all larger ones.
+
+**Setting the limit.** Take the largest size that passes on every path. The full Authorization header limit is half of that, and never above 8 KB. The claim byte limit is whatever fits inside it after the other claims, the header and the signature. If a path fails at 4 KB, bulk does not ship on that path. Any new hop reruns the test.
 
 ### More than 64 workspaces
 
