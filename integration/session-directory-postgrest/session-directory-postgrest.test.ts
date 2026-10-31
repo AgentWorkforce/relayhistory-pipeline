@@ -272,6 +272,23 @@ describe("tenant isolation", () => {
     await refused(await selfHosted.search(token("org-a", "ws-a1"), "ws-b1"), [403], "42501");
   });
 
+  test("a multi-workspace claim searches only its set, and never another org", async () => {
+    const bearer = token("org-a", "ws-a1", {
+      app_metadata: { org_id: "org-a", workspace_ids: ["ws-a1", "ws-shared"] },
+    });
+    const claimed = await rows(await selfHosted.call(RPC, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Profile": "sessions",
+        Authorization: `Bearer ${bearer}`,
+      },
+      body: JSON.stringify({ p_query: TERM }),
+    }));
+    expect(keysOf(claimed).sort()).toEqual(["org-a/ws-a1", "org-a/ws-shared"]);
+    await refused(await selfHosted.search(bearer, "ws-a2"), [403], "42501");
+  });
+
   test("a token for an org that does not own the workspace returns nothing of it", async () => {
     expect(await rows(await selfHosted.search(token("org-a", "ws-b1"), "ws-b1"))).toEqual([]);
   });
@@ -323,7 +340,11 @@ describe("forgery", () => {
     ["array aud", () => ({ aud: [AUDIENCE] })],
     ["missing iat", () => ({ iat: undefined })],
     ["lifetime over 60s", () => ({ exp: Math.floor(Date.now() / 1000) + 61 })],
-    ["two workspaces", () => ({ app_metadata: { org_id: "org-a", workspace_ids: ["ws-a1", "ws-a2"] } })],
+    ["duplicate workspaces", () => ({ app_metadata: { org_id: "org-a", workspace_ids: ["ws-a1", "ws-a1"] } })],
+    ["65 workspaces", () => ({ app_metadata: { org_id: "org-a", workspace_ids: ["ws-a1", ...Array.from({ length: 64 }, (_, i) => `ws-${i}`)] } })],
+    ["an empty workspace list", () => ({ app_metadata: { org_id: "org-a", workspace_ids: [] } })],
+    ["a non-string workspace", () => ({ app_metadata: { org_id: "org-a", workspace_ids: ["ws-a1", 7] } })],
+    ["an oversized workspace", () => ({ app_metadata: { org_id: "org-a", workspace_ids: ["ws-a1", "x".repeat(129)] } })],
     ["top-level tenant claims", () => ({ app_metadata: undefined, org_id: "org-a", workspace_ids: ["ws-a1"] })],
     ["string workspace_ids", () => ({ app_metadata: { org_id: "org-a", workspace_ids: "ws-a1" } })],
     ["array org_id", () => ({ app_metadata: { org_id: ["org-a"], workspace_ids: ["ws-a1"] } })],
