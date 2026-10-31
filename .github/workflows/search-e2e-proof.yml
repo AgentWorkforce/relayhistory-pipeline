@@ -136,10 +136,10 @@ jobs:
           BENCH_CH_PASSWORD: benchmark-only
           BENCH_SCALE: M
           BENCH_SHAPE_FILE: benchmarks/session-search/e2e/shape-2026-10-31.json
-          BENCH_OUT: compare-report.json
-        run: bun benchmarks/session-search/e2e/compare.ts
+          BENCH_OUT: ab-report.json
+        run: bun benchmarks/session-search/e2e/ab-ingest.ts
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: compare-report
-          path: compare-report.json
+          name: ab-report
+          path: ab-report.json
