@@ -23,9 +23,9 @@ deploying, or activating rollout."
 Every observation made under an authorized audit goes in a row of this table. One table
 per audit session, kept with the activation record:
 
-| id  | query or command (verbatim) | expected | observed | timestamp (UTC) | operator | connected as (role name only) |
-| --- | --------------------------- | -------- | -------- | --------------- | -------- | ----------------------------- |
-| P1  | `SHOW server_version_num;`  | see 1.2  | NOT OBSERVED | —           | —        | —                             |
+| id  | query or command (verbatim) | expected | observed     | timestamp (UTC) | operator | connected as (role name only) |
+| --- | --------------------------- | -------- | ------------ | --------------- | -------- | ----------------------------- |
+| P1  | `SHOW server_version_num;`  | see 1.2  | NOT OBSERVED | —               | —        | —                             |
 
 Rules for the record:
 
@@ -36,16 +36,20 @@ Rules for the record:
 
 ### Fields that are NOT OBSERVED
 
-| field | status | how to fill it once Khaliq authorizes it (read-only) | section |
-| ----- | ------ | --------------------------------------------------- | ------- |
-| Server version | **NOT OBSERVED** | P1 | 1, 4 |
-| Live role identity of the bootstrap and migrator connections | **NOT OBSERVED** | P2 | 3, 4 |
-| Effective privileges (role attributes, worker role, grants, runtime role SELECT on the ledger and marker) | **NOT OBSERVED** | P2, P3, P4, P5, P13 | 3, 4 |
-| Installed migration state: the `sessions.__96bulls_migrations` ledger | **NOT OBSERVED** | P6, P7 | 2, 4 |
-| Installed migration state: the `sessions.__96bulls_role_validation` marker | **NOT OBSERVED** | P8 | 4, 8 |
-| Installed migration state: any Supabase CLI ledger | **NOT OBSERVED** | P9 | 2, 9 |
-| Lock observations (live sessions, held locks, migrator advisory lock, table sizes) | **NOT OBSERVED** | P14, P15, P16, P17 | 6 |
-| Runtime secret target (which 1Password item and which env var the services use) | **NOT OBSERVED** | R1, R2 | 3.4 |
+| field                                                                                                              | status           | how to fill it once Khaliq authorizes it (read-only) | section |
+| ------------------------------------------------------------------------------------------------------------------ | ---------------- | ---------------------------------------------------- | ------- |
+| Server version                                                                                                     | **NOT OBSERVED** | P1                                                   | 1, 4    |
+| Live role identity of the bootstrap and migrator connections                                                       | **NOT OBSERVED** | P2                                                   | 3, 4    |
+| Live runtime HOOPDB identity (the role the services connect as)                                                    | **NOT OBSERVED** | RT1 (or R1 + R2)                                     | 3.4     |
+| Whether that runtime identity can run the live validator read-only                                                 | **NOT OBSERVED** | RT2, RT3, RT4, RT5                                   | 3.4     |
+| Effective privileges (role attributes, ACLs, default ACLs, RLS, dependencies and ownership for each role involved) | **NOT OBSERVED** | P2, P3, P3b, P4, A1 to A10                           | 3, 4.1  |
+| Installed migration state: the `sessions.__96bulls_migrations` ledger                                              | **NOT OBSERVED** | P6, P7                                               | 2, 4    |
+| Installed migration state: the `sessions.__96bulls_role_validation` marker                                         | **NOT OBSERVED** | P8                                                   | 4, 8    |
+| Installed migration state: any Supabase CLI ledger                                                                 | **NOT OBSERVED** | P9                                                   | 2, 9    |
+| Lock observations (live sessions, held locks, migrator advisory lock, table sizes)                                 | **NOT OBSERVED** | P14, P15, P16, P17                                   | 6       |
+| Runtime secret target (which Kubernetes Secret and key, and which 1Password item, the services use)                | **NOT OBSERVED** | R1, R2                                               | 3.4     |
+| Backup and PITR availability for the project                                                                       | **NOT OBSERVED** | S1                                                   | 7.1     |
+| Orchestrator readiness behavior for ingest and workers (which probe path, what traffic does on 503)                | **NOT OBSERVED** | O1                                                   | 6.4     |
 
 ## 1. Target and observed server version
 
@@ -89,27 +93,27 @@ The version also changes three checks at run time: phase 1, the migration guard 
 
 ### 1.3 Decision options by observed version
 
-| observed `server_version_num` | bootstrap caller | what the repo says happens | options for Khaliq |
-| ----------------------------- | ---------------- | -------------------------- | ------------------ |
-| `< 160000` (PostgreSQL 15) | `postgres` with CREATEROLE (P2 must show `rolcreaterole = t`) | Creating the role grants `postgres` nothing; phase 1 creates it to spec. | (a) Approve running phase 1 as `postgres`. (b) Defer G6 activation. |
-| `>= 160000` (PostgreSQL 16, 17 or later) | `postgres` (not a superuser) | Phase 1 refuses with `42501`. The runbook calls this "an open blocker, not a step to work around." | (a) Have a superuser run phase 1 through Supabase support. Who does it, and how, is unknown. (b) Make an explicit, reviewed change to the role spec, and to the guard and verifier, so they accept the creator's ADMIN grant. The repo has no such change, and its safety is unknown. (c) Defer G6 activation. Do not grant ADMIN by hand, and do not edit the guard in place. |
-| any | a real superuser | Phase 1 creates the role with no membership. | Applies only if a superuser connection is available and approved. Availability on this project is unknown. |
+| observed `server_version_num`            | bootstrap caller                                              | what the repo says happens                                                                         | options for Khaliq                                                                                                                                                                                                                                                                                                                                                             |
+| ---------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `< 160000` (PostgreSQL 15)               | `postgres` with CREATEROLE (P2 must show `rolcreaterole = t`) | Creating the role grants `postgres` nothing; phase 1 creates it to spec.                           | (a) Approve running phase 1 as `postgres`. (b) Defer G6 activation.                                                                                                                                                                                                                                                                                                            |
+| `>= 160000` (PostgreSQL 16, 17 or later) | `postgres` (not a superuser)                                  | Phase 1 refuses with `42501`. The runbook calls this "an open blocker, not a step to work around." | (a) Have a superuser run phase 1 through Supabase support. Who does it, and how, is unknown. (b) Make an explicit, reviewed change to the role spec, and to the guard and verifier, so they accept the creator's ADMIN grant. The repo has no such change, and its safety is unknown. (c) Defer G6 activation. Do not grant ADMIN by hand, and do not edit the guard in place. |
+| any                                      | a real superuser                                              | Phase 1 creates the role with no membership.                                                       | Applies only if a superuser connection is available and approved. Availability on this project is unknown.                                                                                                                                                                                                                                                                     |
 
 ## 2. Exact migration inventory and order
 
 ### 2.1 What #38 and #96 changed (from `git show --stat 9688d63e 28a8f0d`)
 
-| file | added or changed by | role |
-| ---- | ------------------- | ---- |
-| `supabase/migrations/20261030010000_session_directory.sql` | #38 (added) | migration, expand |
-| `supabase/migrations/20261030020000_session_directory_short_summary.sql` | #38 (added); also changed by #72 (`0904999`) and #96 (`28a8f0d`) | migration, expand |
-| `supabase/migrations/20261031001000_session_directory_reads_expand.sql` | #38 (added); also changed by #72 | migration, expand only |
-| `supabase/rollbacks/20261030020000_session_directory_short_summary.down.sql` | #38; changed by #72 and #96 | rollback (not run by the migrator) |
-| `supabase/rollbacks/20261031001000_session_directory_reads_expand.down.sql` | #38 | rollback (not run by the migrator) |
-| `supabase/bootstrap/session_directory_search_worker.sql` | #96 | phase 1 (not ledgered) |
-| `supabase/bootstrap/session_directory_search_worker_verify.sql` | #96 | phase 2 and the live gate (not ledgered) |
-| `supabase/bootstrap/session_directory_search_worker_mark_pass.sql` | #96 | external verifier (not ledgered) |
-| `src/hoopdb/migrate.ts`, `src/shared/db.ts`, `src/shared/worker.ts`, `src/alleyoop/ingest.ts` | #96 | runner, marker, live gate, `/readyz` |
+| file                                                                                          | added or changed by                                              | role                                     |
+| --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------- |
+| `supabase/migrations/20261030010000_session_directory.sql`                                    | #38 (added)                                                      | migration, expand                        |
+| `supabase/migrations/20261030020000_session_directory_short_summary.sql`                      | #38 (added); also changed by #72 (`0904999`) and #96 (`28a8f0d`) | migration, expand                        |
+| `supabase/migrations/20261031001000_session_directory_reads_expand.sql`                       | #38 (added); also changed by #72                                 | migration, expand only                   |
+| `supabase/rollbacks/20261030020000_session_directory_short_summary.down.sql`                  | #38; changed by #72 and #96                                      | rollback (not run by the migrator)       |
+| `supabase/rollbacks/20261031001000_session_directory_reads_expand.down.sql`                   | #38                                                              | rollback (not run by the migrator)       |
+| `supabase/bootstrap/session_directory_search_worker.sql`                                      | #96                                                              | phase 1 (not ledgered)                   |
+| `supabase/bootstrap/session_directory_search_worker_verify.sql`                               | #96                                                              | phase 2 and the live gate (not ledgered) |
+| `supabase/bootstrap/session_directory_search_worker_mark_pass.sql`                            | #96                                                              | external verifier (not ledgered)         |
+| `src/hoopdb/migrate.ts`, `src/shared/db.ts`, `src/shared/worker.ts`, `src/alleyoop/ingest.ts` | #96                                                              | runner, marker, live gate, `/readyz`     |
 
 ### 2.2 What `bun src/hoopdb/migrate.ts` would run, in order
 
@@ -137,26 +141,26 @@ applied"). A ledger name starting with `vendor:` fails the run with `legacy_sche
 Full set at `28a8f0d`, with sha256 values computed offline from the repo files (they
 match what `migrate.ts` computes over the same UTF-8 text):
 
-| # | ledger name | sha256 | origin | expand or contract | applied on target? |
-| - | ----------- | ------ | ------ | ------------------ | ------------------ |
-| 1 | `upstream:20261025000000_sessions_index.sql` | `6bfdb4c3…8874a3` | relayhistory-cloud #171, #28 | base schema | NOT OBSERVED |
-| 2 | `upstream:20261025000100_repo_identity.sql` | `3b1d74f6…28c13a` | relayhistory-cloud #177 | base | NOT OBSERVED |
-| 3 | `upstream:20261025000200_scrub_quarantine.sql` | `97ec2f03…0c7f4398` | relayhistory-cloud #185 | base | NOT OBSERVED |
-| 4 | `upstream:20261025000300_upsert_keep_on_null.sql` | `17539224…5a649910` | relayhistory-cloud #185 | base | NOT OBSERVED |
-| 5 | `upstream:20261025000600_pipeline_queue.sql` | `41f16006…44177042` | relayhistory-cloud #210 | base | NOT OBSERVED |
-| 6 | `upstream:20261030000000_relayhistory_machines_compat.sql` | `22fe48a3…29f227` | #28 | expand | NOT OBSERVED |
-| 7 | `upstream:20261030010000_session_directory.sql` | `2427948e…48fa2f8` | **#38** | expand | NOT OBSERVED |
-| 8 | `upstream:20261030020000_session_directory_short_summary.sql` | `c223b77e…5918de4` | **#38 / #72 / #96** | expand (it also replaces two of #38's indexes and narrows `authenticated` to column grants) | NOT OBSERVED |
-| 9 | `upstream:20261031000000_migration_assertion_ledger.sql` | `0683aca3…20d40689` | #43 | not G6 | NOT OBSERVED |
-| 10 | `upstream:20261031000100_manifest_readiness.sql` | `1ff02258…242242d6` | #51 / #52 | not G6 | NOT OBSERVED |
-| 11 | `upstream:20261031001000_session_directory_reads_expand.sql` | `6957cd17…20ec15` | **#38 / #72** | **expand only** | NOT OBSERVED |
-| 12 | `upstream:20261101000000_migration_ingest_audit_base_read.sql` | `44813425…98acea` | #79 | not G6 | NOT OBSERVED |
-| 13 | `upstream:20261101000200_claimless_window_activations.sql` | `6dde3342…bd5d1a` | #52 | not G6 | NOT OBSERVED |
-| 14 | `96bulls:0001_96bulls_observability.sql` | `b9d059c4…a430a8` | 96bulls | not G6 | NOT OBSERVED |
-| 15 | `96bulls:0002_session_ext_and_summaries.sql` | `2fee02ab…25568` | 96bulls | not G6 | NOT OBSERVED |
-| 16 | `96bulls:0003_fanout_ledger.sql` | `cccdd28c…18c7` | 96bulls | not G6 | NOT OBSERVED |
-| 17 | `96bulls:0004_summary_pointers.sql` | `fe351f30…94b2e94` | 96bulls | not G6; **destructive** (see 6.3) | NOT OBSERVED |
-| — | `verify:session_directory_search_worker` (not ledgered) | `b974b099…c3a968f` | #96 | phase 2 | — |
+| #   | ledger name                                                    | sha256              | origin                       | expand or contract                                                                          | applied on target? |
+| --- | -------------------------------------------------------------- | ------------------- | ---------------------------- | ------------------------------------------------------------------------------------------- | ------------------ |
+| 1   | `upstream:20261025000000_sessions_index.sql`                   | `6bfdb4c3…8874a3`   | relayhistory-cloud #171, #28 | base schema                                                                                 | NOT OBSERVED       |
+| 2   | `upstream:20261025000100_repo_identity.sql`                    | `3b1d74f6…28c13a`   | relayhistory-cloud #177      | base                                                                                        | NOT OBSERVED       |
+| 3   | `upstream:20261025000200_scrub_quarantine.sql`                 | `97ec2f03…0c7f4398` | relayhistory-cloud #185      | base                                                                                        | NOT OBSERVED       |
+| 4   | `upstream:20261025000300_upsert_keep_on_null.sql`              | `17539224…5a649910` | relayhistory-cloud #185      | base                                                                                        | NOT OBSERVED       |
+| 5   | `upstream:20261025000600_pipeline_queue.sql`                   | `41f16006…44177042` | relayhistory-cloud #210      | base                                                                                        | NOT OBSERVED       |
+| 6   | `upstream:20261030000000_relayhistory_machines_compat.sql`     | `22fe48a3…29f227`   | #28                          | expand                                                                                      | NOT OBSERVED       |
+| 7   | `upstream:20261030010000_session_directory.sql`                | `2427948e…48fa2f8`  | **#38**                      | expand                                                                                      | NOT OBSERVED       |
+| 8   | `upstream:20261030020000_session_directory_short_summary.sql`  | `c223b77e…5918de4`  | **#38 / #72 / #96**          | expand (it also replaces two of #38's indexes and narrows `authenticated` to column grants) | NOT OBSERVED       |
+| 9   | `upstream:20261031000000_migration_assertion_ledger.sql`       | `0683aca3…20d40689` | #43                          | not G6                                                                                      | NOT OBSERVED       |
+| 10  | `upstream:20261031000100_manifest_readiness.sql`               | `1ff02258…242242d6` | #51 / #52                    | not G6                                                                                      | NOT OBSERVED       |
+| 11  | `upstream:20261031001000_session_directory_reads_expand.sql`   | `6957cd17…20ec15`   | **#38 / #72**                | **expand only**                                                                             | NOT OBSERVED       |
+| 12  | `upstream:20261101000000_migration_ingest_audit_base_read.sql` | `44813425…98acea`   | #79                          | not G6                                                                                      | NOT OBSERVED       |
+| 13  | `upstream:20261101000200_claimless_window_activations.sql`     | `6dde3342…bd5d1a`   | #52                          | not G6                                                                                      | NOT OBSERVED       |
+| 14  | `96bulls:0001_96bulls_observability.sql`                       | `b9d059c4…a430a8`   | 96bulls                      | not G6                                                                                      | NOT OBSERVED       |
+| 15  | `96bulls:0002_session_ext_and_summaries.sql`                   | `2fee02ab…25568`    | 96bulls                      | not G6                                                                                      | NOT OBSERVED       |
+| 16  | `96bulls:0003_fanout_ledger.sql`                               | `cccdd28c…18c7`     | 96bulls                      | not G6                                                                                      | NOT OBSERVED       |
+| 17  | `96bulls:0004_summary_pointers.sql`                            | `fe351f30…94b2e94`  | 96bulls                      | not G6; **destructive** (see 6.3)                                                           | NOT OBSERVED       |
+| —   | `verify:session_directory_search_worker` (not ledgered)        | `b974b099…c3a968f`  | #96                          | phase 2                                                                                     | —                  |
 
 Full sha256 values for the G6 files:
 
@@ -178,7 +182,8 @@ image the readers run. That command reads only local files and makes no connecti
 **Scope warning.** `migrate.ts` has no way to apply only the G6 files. Against a target
 whose `__96bulls_migrations` ledger is missing or partial, it applies every unledgered
 file above, rows 1 to 17 included, in that order. The ledger contents are NOT OBSERVED
-(P6, P7), so which files a production run would apply is unknown. See blocker B3.
+(P6, P7), so which files a production run would apply is unknown. See blocker B3, and
+section 6.3 for the impact of each file.
 
 ### 2.3 What each G6 file does
 
@@ -186,7 +191,7 @@ file above, rows 1 to 17 included, in that order. The ledger contents are NOT OB
 `CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;`. Creates
 `sessions.session_directory` (primary key `(org_id, workspace_id, harness, session_id)`),
 `sessions.session_directory_users` and `sessions.session_directory_machines` (foreign keys
-to the directory, `ON DELETE CASCADE`), and 14 non-concurrent `CREATE INDEX` statements,
+to the directory, `ON DELETE CASCADE`), and 13 non-concurrent `CREATE INDEX` statements,
 two of them GIN `public.gin_trgm_ops` (`session_directory_project_trgm_idx`,
 `session_directory_metadata_trgm_idx`). Creates `sessions.session_directory_rollout`, a
 singleton seeded with `completed_at` NULL. Enables RLS on all four tables, with
@@ -205,17 +210,17 @@ In order:
 2. `CREATE EXTENSION IF NOT EXISTS btree_gin WITH SCHEMA public;`
 3. `ALTER TABLE sessions.session_directory ADD COLUMN short_summary …`, plus four
    provenance columns with CHECKs, then `ADD CONSTRAINT
-   session_directory_short_summary_provenance` and
+session_directory_short_summary_provenance` and
    `session_directory_short_summary_not_on_tombstone`.
 4. Functions `sessions.session_directory_search_text(...)` (IMMUTABLE),
    `sessions.session_directory_tombstone_clears_summary()` with its `BEFORE INSERT OR
-   UPDATE` trigger, and `sessions.session_directory_search_query(text)`.
+UPDATE` trigger, and `sessions.session_directory_search_query(text)`.
 5. `DROP INDEX sessions.session_directory_metadata_trgm_idx;` then `CREATE INDEX
-   session_directory_tenant_search_trgm_idx … USING gin (org_id, workspace_id,
-   search_text public.gin_trgm_ops)`. Next, `DROP INDEX
-   sessions.session_directory_project_trgm_idx;` then `CREATE INDEX
-   session_directory_tenant_project_trgm_idx … USING gin (org_id, workspace_id,
-   project_id public.gin_trgm_ops)`. Both builds are non-concurrent.
+session_directory_tenant_search_trgm_idx … USING gin (org_id, workspace_id,
+search_text public.gin_trgm_ops)`. Next, `DROP INDEX
+sessions.session_directory_project_trgm_idx;` then `CREATE INDEX
+session_directory_tenant_project_trgm_idx … USING gin (org_id, workspace_id,
+project_id public.gin_trgm_ops)`. Both builds are non-concurrent.
 6. `GRANT USAGE ON SCHEMA sessions TO session_directory_search_worker;`
 7. `CREATE TABLE sessions.session_directory_search_token_policy`: a singleton with RLS
    on, `REVOKE ALL … FROM PUBLIC, anon, authenticated, service_role`, and **no row
@@ -274,15 +279,15 @@ Phase 2 runs only after the whole set is applied, because its allowlist includes
 
 ### 3.1 The worker role spec (phase 1, the guard and phase 2 all enforce it)
 
-| item | required value (from the SQL) |
-| ---- | ----------------------------- |
-| name | `session_directory_search_worker` |
-| attributes | `NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION` (`rolcanlogin`, `rolinherit`, `rolbypassrls`, `rolsuper`, `rolcreaterole`, `rolcreatedb` and `rolreplication` all `f`) |
-| `pg_db_role_setting` | exactly one row: `setdatabase = 0`, `setconfig = ARRAY['statement_timeout=2s']`. `2000ms`, `2000`, any extra setting and any per-database row are refused. |
-| membership (as member) | none |
-| members (of it) | none until the separately approved binding. The only allowed member is `authenticator`, with `rolinherit = f`, `admin_option = f`, and on 16+ `inherit_option = f`. |
-| owned objects | none (`pg_class`, `pg_proc`, `pg_namespace`, `pg_type`, `pg_database`) |
-| explicit privileges before `20261030020000` | none, except `USAGE` on `sessions`, which the migration grants |
+| item                                        | required value (from the SQL)                                                                                                                                                                            |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| name                                        | `session_directory_search_worker`                                                                                                                                                                        |
+| attributes                                  | `NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION` (`rolcanlogin`, `rolinherit`, `rolbypassrls`, `rolsuper`, `rolcreaterole`, `rolcreatedb` and `rolreplication` all `f`) |
+| `pg_db_role_setting`                        | exactly one row: `setdatabase = 0`, `setconfig = ARRAY['statement_timeout=2s']`. `2000ms`, `2000`, any extra setting and any per-database row are refused.                                               |
+| membership (as member)                      | none                                                                                                                                                                                                     |
+| members (of it)                             | none until the separately approved binding. The only allowed member is `authenticator`, with `rolinherit = f`, `admin_option = f`, and on 16+ `inherit_option = f`.                                      |
+| owned objects                               | none (`pg_class`, `pg_proc`, `pg_namespace`, `pg_type`, `pg_database`)                                                                                                                                   |
+| explicit privileges before `20261030020000` | none, except `USAGE` on `sessions`, which the migration grants                                                                                                                                           |
 
 Phase 1 creates the role with:
 
@@ -294,13 +299,13 @@ ALTER ROLE session_directory_search_worker SET statement_timeout = '2s';
 
 ### 3.2 Who must run each step
 
-| step | must run as | live identity on target |
-| ---- | ----------- | ----------------------- |
-| phase 1 (create) | a superuser; or, only below 160000, a CREATEROLE role | **NOT OBSERVED** (P2) |
-| phase 1 (role already exists) | any role that can read `pg_roles`, `pg_db_role_setting` and `pg_auth_members` (verify only) | **NOT OBSERVED** |
-| migrations (`migrate.ts`) | the schema owner. The T0 runbook (A1) describes "a schema-owner role for migrations". It must be able to create in `sessions`, create extensions and grant to `authenticated`, `service_role` and the worker. | **NOT OBSERVED** (P2, P5) |
-| phase 2 and `mark_pass.sql` | any role that can read the catalogs ("the migration owner (`hoop`, or Supabase `postgres`) is enough"). `mark_pass.sql` also needs UPDATE on `sessions.__96bulls_role_validation`. | **NOT OBSERVED** |
-| live gate (`schemaVerdict`) | the service's own `HOOPDB_URL` role | **NOT OBSERVED** (R1, P13) |
+| step                          | must run as                                                                                                                                                                                                   | live identity on target               |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| phase 1 (create)              | a superuser; or, only below 160000, a CREATEROLE role                                                                                                                                                         | **NOT OBSERVED** (P2)                 |
+| phase 1 (role already exists) | any role that can read `pg_roles`, `pg_db_role_setting` and `pg_auth_members` (verify only)                                                                                                                   | **NOT OBSERVED**                      |
+| migrations (`migrate.ts`)     | the schema owner. The T0 runbook (A1) describes "a schema-owner role for migrations". It must be able to create in `sessions`, create extensions and grant to `authenticated`, `service_role` and the worker. | **NOT OBSERVED** (P2, P5)             |
+| phase 2 and `mark_pass.sql`   | any role that can read the catalogs ("the migration owner (`hoop`, or Supabase `postgres`) is enough"). `mark_pass.sql` also needs UPDATE on `sessions.__96bulls_role_validation`.                            | **NOT OBSERVED**                      |
+| live gate (`schemaVerdict`)   | the service's own `HOOPDB_URL` role                                                                                                                                                                           | **NOT OBSERVED** (RT1 to RT5, R1, R2) |
 
 ### 3.3 Least-privilege allowlist that phase 2 enforces
 
@@ -318,45 +323,207 @@ names and another signature, fails. Any other `pg_shdepend` reference to the rol
 database of the cluster (ownership, ACL, policy, initial privilege) fails. PUBLIC grants
 are ignored. On failure it raises `55000` naming every violation, and changes nothing.
 
-### 3.4 Runtime role needs, and the runtime secret target
+### 3.4 Runtime HOOPDB identity, the live validator, and the runtime secret target
 
-The live gate (`schemaVerdict`, `src/shared/db.ts`) runs as the role in `HOOPDB_URL`, in
-one `READ ONLY`, `READ COMMITTED` transaction with `SET LOCAL statement_timeout` from
-`HOOPDB_ROLE_GATE_TIMEOUT_MS` (default 2000, allowed 1..10000). That role needs:
+#### What the live validator needs
 
-- `SELECT` on `sessions.__96bulls_migrations`;
-- `SELECT` on `sessions.__96bulls_role_validation`;
-- read access to `pg_roles`, `pg_auth_members`, `pg_db_role_setting`, `pg_shdepend`,
-  `pg_namespace`, `pg_proc`, `pg_database` and `pg_default_acl` (the runbook calls these
-  "PUBLIC-readable catalogs"; that they are readable on this project is NOT OBSERVED);
-- `USAGE` on schema `sessions`.
+The live gate (`schemaVerdict`, `src/shared/db.ts`) runs as the role in `HOOPDB_URL` on
+every ingest `/readyz`, every worker `/readyz` and before every worker claim. It is one
+transaction with these statements, in this order:
 
-**Gap found in the repo:** `migrate.ts` creates both tables as the migrator and runs
-`REVOKE ALL ON sessions.__96bulls_role_validation FROM PUBLIC`. No file in the repository
-grants `SELECT` on either table to any runtime role. If the runtime role is not the
-migrator, and has no other path to those tables (ownership, membership or default
-privileges; `BYPASSRLS` does not grant table privileges), the gate fails with `42501`.
-It then reports `role_validation_failed`, and `/readyz` returns 503. Whether the runtime
-role has that access is NOT OBSERVED (P13). How the grant should be provisioned is
-unknown; see blocker B6.
+1. `SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY`
+2. `SET LOCAL statement_timeout = <HOOPDB_ROLE_GATE_TIMEOUT_MS>`, default 2000, allowed
+   1..10000
+3. `SELECT name FROM sessions.__96bulls_migrations`
+4. `SELECT generation, status FROM sessions.__96bulls_role_validation WHERE name = $1`
+5. the full text of `supabase/bootstrap/session_directory_search_worker_verify.sql`
+6. statement 4 again
+
+So the runtime role needs:
+
+- `USAGE` on schema `sessions`;
+- `SELECT` on `sessions.__96bulls_migrations` and `sessions.__96bulls_role_validation`;
+- `SELECT` on `pg_roles`, `pg_auth_members`, `pg_db_role_setting`, `pg_shdepend`,
+  `pg_namespace`, `pg_proc`, `pg_database` and `pg_default_acl`;
+- `EXECUTE` on `aclexplode(aclitem[])`, `pg_describe_object(oid, oid, integer)`,
+  `to_regprocedure(text)` and `to_regnamespace(text)`, which phase 2 calls.
+
+The runbook calls the catalogs "PUBLIC-readable". Whether that holds on this project is
+NOT OBSERVED.
+
+**Gap at `28a8f0d`:** `migrate.ts` creates both tables as the migrator and runs
+`REVOKE ALL ON sessions.__96bulls_role_validation FROM PUBLIC`. No file on `main` grants
+`SELECT` on either table to a runtime role. Unless the runtime role is the migrator, or
+has access some other way (ownership, membership or default privileges; `BYPASSRLS` does
+not grant table privileges), the gate fails with `42501`. It then reports
+`role_validation_failed`, and `/readyz` returns 503.
+
+**Pending, not merged: draft PR #99** (`fix/g6-supabase-mode-runtime-grants`, head
+`6ce9066`, under review). It changes `src/hoopdb/migrate.ts`:
+
+- `HOOPDB_DB_MODE` becomes required (`local`, `selfhosted` or `supabase`).
+- In `supabase` mode it refuses the shim (`shim_forbidden`) and a forced bootstrap
+  (`bootstrap_forbidden`).
+- `HOOPDB_RUNTIME_ROLE` becomes required. In `supabase` mode the runtime role must be a
+  dedicated role, not the migrator (`runtime_role_unsafe`). It must not be a superuser,
+  `BYPASSRLS` or the search Worker.
+- It grants that role `USAGE` on schema `sessions` and `SELECT` on the ledger and the
+  marker, nothing else.
+- Before any write, it adds authority preflights: `mixed_migration_authority`,
+  `unledgered_schema` and `ledger_gap`.
+
+#99 changes no SQL file under `supabase/`, so it does not change the generation. Until it
+merges, this dossier describes `main` at `28a8f0d`, and the gap above stands (blocker
+B6).
+
+#### Proving that the runtime identity can run the validator read-only
+
+**Observed runtime identity: NOT OBSERVED. Observed validator result for that identity:
+NOT OBSERVED.** Each query below is read-only and needs Khaliq's explicit OK. Results go
+in this evidence table:
+
+| id  | query / command                                                    | expected                                | observed     | timestamp (UTC) | operator | connected as |
+| --- | ------------------------------------------------------------------ | --------------------------------------- | ------------ | --------------- | -------- | ------------ |
+| RT1 | identify the runtime role from live connections (admin connection) | one `usename` per service               | NOT OBSERVED | —               | —        | —            |
+| RT2 | runtime role attributes                                            | not superuser, not `BYPASSRLS`, `LOGIN` | NOT OBSERVED | —               | —        | —            |
+| RT3 | privilege matrix for the runtime role                              | all `t`                                 | NOT OBSERVED | —               | —        | —            |
+| RT4 | the live validator, run as the runtime role, read-only             | completes; `ROLLBACK`                   | NOT OBSERVED | —               | —        | —            |
+| RT5 | the service's own `/readyz` body                                   | `{"ok":true}`, or a typed reason        | NOT OBSERVED | —               | —        | —            |
+
+**RT1: identify the role without reading any secret.** `openHoopDb` sets
+`application_name` to `OTEL_SERVICE_NAME`. The repo's defaults are `alleyoop-ingest`,
+`alleyoop-courier`, `hoopdb-indexer`, `bob-costas` and `referee`; `alchemy.run.ts` sets
+`OTEL_SERVICE_NAME` to the service name. What the production chart sets is unknown. Run
+on an admin connection:
+
+```sql
+SELECT usename, application_name, count(*) AS connections
+  FROM pg_stat_activity
+ WHERE datname = current_database()
+   AND application_name IN ('alleyoop-ingest', 'alleyoop-courier', 'hoopdb-indexer',
+                            'bob-costas', 'referee')
+ GROUP BY 1, 2
+ ORDER BY 1, 2;
+```
+
+If no service is connected yet, RT1 is empty, and R1 plus R2 identify the role instead.
+
+**RT2: attributes** (any connection; `<runtime role>` is the RT1 or R2 name):
+
+```sql
+SELECT rolname, rolsuper, rolbypassrls, rolinherit, rolcanlogin, rolcreaterole, rolcreatedb
+  FROM pg_roles WHERE rolname = '<runtime role>';
+```
+
+**RT3: privilege matrix** (any connection):
+
+```sql
+SELECT
+  has_schema_privilege('<runtime role>', 'sessions', 'USAGE')                              AS sessions_usage,
+  has_table_privilege('<runtime role>', 'sessions.__96bulls_migrations', 'SELECT')         AS ledger_select,
+  has_table_privilege('<runtime role>', 'sessions.__96bulls_role_validation', 'SELECT')    AS marker_select,
+  has_table_privilege('<runtime role>', 'sessions.__96bulls_role_validation', 'UPDATE')    AS marker_update_must_be_f,
+  has_table_privilege('<runtime role>', 'pg_catalog.pg_roles', 'SELECT')                   AS pg_roles,
+  has_table_privilege('<runtime role>', 'pg_catalog.pg_auth_members', 'SELECT')            AS pg_auth_members,
+  has_table_privilege('<runtime role>', 'pg_catalog.pg_db_role_setting', 'SELECT')         AS pg_db_role_setting,
+  has_table_privilege('<runtime role>', 'pg_catalog.pg_shdepend', 'SELECT')                AS pg_shdepend,
+  has_table_privilege('<runtime role>', 'pg_catalog.pg_namespace', 'SELECT')               AS pg_namespace,
+  has_table_privilege('<runtime role>', 'pg_catalog.pg_proc', 'SELECT')                    AS pg_proc,
+  has_table_privilege('<runtime role>', 'pg_catalog.pg_database', 'SELECT')                AS pg_database,
+  has_table_privilege('<runtime role>', 'pg_catalog.pg_default_acl', 'SELECT')             AS pg_default_acl,
+  has_function_privilege('<runtime role>', 'pg_catalog.aclexplode(aclitem[])', 'EXECUTE')  AS aclexplode,
+  has_function_privilege('<runtime role>', 'pg_catalog.pg_describe_object(oid, oid, integer)', 'EXECUTE') AS describe_object,
+  has_function_privilege('<runtime role>', 'pg_catalog.to_regprocedure(text)', 'EXECUTE')  AS to_regprocedure,
+  has_function_privilege('<runtime role>', 'pg_catalog.to_regnamespace(text)', 'EXECUTE')  AS to_regnamespace;
+```
+
+Expected: every column `t`, except `marker_update_must_be_f`, which is `f`. A `f` on
+`ledger_select` or `marker_select` is blocker B6. The two `sessions.__96bulls_*` checks
+error with `42P01` if P6 found the tables absent; record that.
+
+**RT4: run the validator as the runtime identity, exactly as `schemaVerdict` does.** It
+needs the runtime credential, injected at exec time by the approved mechanism and never
+written or recorded. It writes nothing: the transaction is `READ ONLY` and ends in
+`ROLLBACK`. Run from the repository root at `28a8f0d`:
+
+```sh
+psql -v ON_ERROR_STOP=1 -X -d "<runtime connection, injected at exec time>" <<'SQL'
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY;
+SET LOCAL statement_timeout = 2000;
+SELECT current_user, session_user, current_setting('transaction_read_only') AS read_only;
+SELECT count(*) AS ledger_rows FROM sessions.__96bulls_migrations;
+SELECT generation, status FROM sessions.__96bulls_role_validation
+ WHERE name = 'session_directory_search_worker';
+\i supabase/bootstrap/session_directory_search_worker_verify.sql
+SELECT generation, status FROM sessions.__96bulls_role_validation
+ WHERE name = 'session_directory_search_worker';
+ROLLBACK;
+SQL
+```
+
+Expected: `current_user` is the RT1 or R2 role and `read_only` is `on`. Both `SELECT`s
+return. The `DO $verify$` block completes, after the migrations. `ROLLBACK` follows.
+Before the migrations, the verifier is expected to fail with `55000` ("the role does not
+exist", or "approved RPC missing"). That still proves the identity can read the catalogs.
+A `42501` anywhere means blocker B6.
+
+**RT5: in-cluster probe, no credential handling.** The `/readyz` body is the
+`schemaVerdict` JSON. On failure it carries `reason`, plus `error_code` for
+`role_validation_failed`. Ingest listens on `INGEST_PORT` (default 8080). Workers serve
+health on `WORKER_HEALTH_PORT` (default 8081). Production namespace, deployment names and
+cluster context are NOT OBSERVED, and so is whether the image contains `wget` or `curl`.
+
+```sh
+kubectl --context <prod context> -n <namespace> exec deploy/<ingest deployment> -- \
+  wget -qO- http://127.0.0.1:8080/readyz
+kubectl --context <prod context> -n <namespace> exec deploy/<worker deployment> -- \
+  wget -qO- http://127.0.0.1:8081/readyz
+```
+
+#### Runtime secret target (R1, R2)
 
 **Runtime secret target: NOT OBSERVED.** What the repo says, with no values:
 
-- The services read `HOOPDB_URL` (`openHoopDb` in `src/shared/db.ts`).
-- On AWS, `stacks/aws/eks.ts` takes it from the Kubernetes Secret named by
-  `runtimeSecretName`, key `HOOPDB_URL` ("`external` (default): HOOPDB_URL from
-  runtimeSecretName (Supabase)"). On GCP, `stacks/gcp/config.ts` takes it from
-  `existingSecretName`, key `HOOPDB_URL`.
-- `docs/relayhistory-t0-runbook.md` (A1) says the Supabase migration and runtime
-  credentials live in the 1Password vault `96Bulls-prod`. Which item, and which role it
-  names, is not stated for the 96Bulls services.
+- The services read `HOOPDB_URL` (`openHoopDb`, `src/shared/db.ts`).
+- AWS: `stacks/aws/eks.ts` maps it to `{ existingSecret: i.runtimeSecretName, key:
+"HOOPDB_URL" }`. `runtimeSecretName` is `96bulls-runtime` in
+  `stacks/aws/examples/aws-proof.inputs.example.json`,
+  `docs/plans/aws-sessions-dev.inputs.sanitized.json` and
+  `docs/plans/aws-proof.inputs.sanitized.json`.
+- GCP: `stacks/gcp/config.ts` maps it to `{ existingSecret: i.existingSecretName, key:
+"HOOPDB_URL" }`, and `docs/gcp-stage.md` shows `"existingSecretName":
+"96bulls-runtime"`.
+- `stacks/aws/eks.ts`: the Secret is "created by the secrets sync, not by IaC".
+  `docs/aws-stage.md` creates the Secrets "from 1Password".
+  `docs/relayhistory-t0-runbook.md` (A1) puts the Supabase migration and runtime roles in
+  the 1Password vault `96Bulls-prod`. The repo names no production stage inputs file and
+  no 1Password item for the 96Bulls services' `HOOPDB_URL`, so both are unknown.
 
-To fill it (each needs Khaliq's OK; record names only, never values):
+**R1** (needs Khaliq's OK; prints names only, never values): which Secret and key each
+production workload reads `HOOPDB_URL` from, and which keys that Secret holds.
 
-| id | command | record |
-| -- | ------- | ------ |
-| R1 | the reviewed deploy inputs for the production stage: the `runtimeSecretName` or `existingSecretName` value, plus the secret-sync mapping from that Kubernetes Secret key `HOOPDB_URL` to its 1Password item | Secret name, key name, 1Password vault and item title |
-| R2 | Khaliq confirms which database role that item's URL connects as. Only the role name is recorded. | role name |
+```sh
+kubectl --context <prod context> -n <namespace> get deploy,statefulset,job -o jsonpath='{range .items[*]}{.kind}/{.metadata.name}{"\t"}{range .spec.template.spec.containers[*].env[?(@.name=="HOOPDB_URL")]}{.valueFrom.secretKeyRef.name}/{.valueFrom.secretKeyRef.key}{end}{"\n"}{end}'
+kubectl --context <prod context> -n <namespace> get secret 96bulls-runtime \
+  -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}'
+```
+
+Expected: every workload line shows `96bulls-runtime/HOOPDB_URL` (or the production
+equivalent), and the key list includes `HOOPDB_URL`. The go-template prints key names
+only.
+
+**R2** (needs Khaliq's OK; titles and field labels only, never values): which 1Password
+item the secrets sync uses for that key, and which database role it connects as.
+
+```sh
+op item list --vault 96Bulls-prod --format json | jq -r '.[].title'
+op item get "<item title from the secrets-sync mapping>" --vault 96Bulls-prod --format json \
+  | jq -r '.fields[].label'
+```
+
+Then Khaliq states the role name, or RT1 confirms it from live connections. Record the
+vault, the item title, the field label and the role name. Never record the field value.
 
 ## 4. Preflight queries (read-only; each needs Khaliq's explicit OK before it runs)
 
@@ -364,27 +531,313 @@ Run these as the connection that will run the migrator, unless the row says othe
 None of them writes. The "expected" column is what a safe go looks like; anything else
 stops the activation and goes to Khaliq.
 
-| id | purpose | query | expected for go |
-| -- | ------- | ----- | --------------- |
-| P1 | server version | `SHOW server_version_num; SELECT version();` | a number. Then choose the 1.3 row. |
-| P2 | live identity and attributes of this connection | `SELECT current_user, session_user, r.rolsuper, r.rolcreaterole, r.rolbypassrls, r.rolinherit FROM pg_roles r WHERE r.rolname = current_user;` | Bootstrap connection: `rolsuper = t`, or `rolcreaterole = t` with P1 `< 160000`. Migrator: unknown spec; record it. |
-| P3 | does the worker role exist, and is it to spec | `SELECT oid, rolcanlogin, rolinherit, rolbypassrls, rolsuper, rolcreaterole, rolcreatedb, rolreplication FROM pg_roles WHERE rolname = 'session_directory_search_worker';` | 0 rows (phase 1 will create it), or 1 row with every attribute `f` |
-| P3b | its settings and memberships (only if P3 found a row) | the runbook "Checks" block: `SELECT setdatabase, setconfig FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole WHERE r.rolname = 'session_directory_search_worker';` and `SELECT g.rolname AS role, u.rolname AS member, m.admin_option FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid JOIN pg_roles u ON u.oid = m.member WHERE 'session_directory_search_worker' IN (g.rolname, u.rolname);` | exactly `0 \| {statement_timeout=2s}`; no membership rows |
-| P4 | existing references to the role (only if P3 found a row) | `SELECT d.deptype, d.dbid, pg_describe_object(d.classid, d.objid, d.objsubid) FROM pg_shdepend d WHERE d.refclassid = 'pg_authid'::regclass AND d.refobjid = 'session_directory_search_worker'::regrole;` | before `20261030020000`: 0 rows. After the full set: only `a` rows for schema `sessions` and the three approved functions. |
-| P5 | existing grants on G6 objects | `SELECT table_name, grantee, privilege_type FROM information_schema.role_table_grants WHERE table_schema = 'sessions' AND table_name LIKE 'session_directory%' ORDER BY 1, 2, 3;` and `SELECT rolname FROM pg_roles WHERE rolname IN ('authenticator', 'authenticated', 'anon', 'service_role', 'relayhistory_app');` | before #38: 0 grant rows. The role list is recorded as found. |
-| P6 | do the ledger and marker tables exist | `SELECT to_regclass('sessions.__96bulls_migrations') AS ledger, to_regclass('sessions.__96bulls_role_validation') AS marker;` | record. NULL means `migrate.ts` has never run here. |
-| P7 | ledger contents (only if P6 found the ledger) | `SELECT name, sha256, applied_at FROM sessions.__96bulls_migrations ORDER BY name;` | every applied row's sha256 equals the 2.2 table; no `vendor:` names. Any mismatch makes the run fail by design: stop. |
-| P8 | marker (only if P6 found the marker) | `SELECT name, generation, status, updated_at FROM sessions.__96bulls_role_validation;` | record. A `'pass'` for another generation is expected to flip to `'pending'` on the next migrate (see 6.4). |
-| P9 | other migration ledgers on the target | `SELECT to_regclass('supabase_migrations.schema_migrations');` and, if not NULL, `SELECT version, name FROM supabase_migrations.schema_migrations ORDER BY version;` | record. Non-empty means `scripts/sb db push` was used: see blocker B3. |
-| P10 | which schema objects already exist | `SELECT n, to_regclass(n) FROM unnest(ARRAY['sessions.session_index', 'sessions.machines', 'sessions.pipeline_events', 'sessions.pipeline_jobs', 'sessions.session_summaries', 'sessions.session_directory', 'sessions.session_directory_rollout', 'sessions.session_directory_search_token_policy', 'sessions.session_directory_resurrection_fences']) AS n;` | consistent with P7. Objects present without ledger rows means blocker B3. |
-| P11 | extensions | `SELECT e.extname, e.extversion, n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname IN ('pg_trgm', 'btree_gin');` and `SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name IN ('pg_trgm', 'btree_gin');` | both available. If `pg_trgm` is already installed, it must be in schema `public`: the migrations reference `public.gin_trgm_ops` explicitly, and `CREATE EXTENSION IF NOT EXISTS … WITH SCHEMA public` does not move an existing install. `btree_gin` is used through default opclasses, so its schema is not referenced. The repo does not say whether the migrator may create extensions on this project: unknown. |
-| P12 | leakproof flags (G6's RLS design depends on them) | `SELECT proname, proleakproof FROM pg_proc WHERE pronamespace = 'pg_catalog'::regnamespace AND proname IN ('texteq', 'textlike', 'texticlike', 'text_pattern_lt', 'text_pattern_ge') ORDER BY 1;` | as in `docs/evidence/session-directory-plans.md`: `texteq`, `text_pattern_lt` and `text_pattern_ge` true; `textlike` and `texticlike` false |
-| P13 | runtime role access for the live gate (replace `<runtime role>` with the R2 name) | `SELECT has_schema_privilege('<runtime role>', 'sessions', 'USAGE'), has_table_privilege('<runtime role>', 'sessions.__96bulls_migrations', 'SELECT'), has_table_privilege('<runtime role>', 'sessions.__96bulls_role_validation', 'SELECT');` (only if P6 found both tables) | all `t`. Otherwise see blocker B6. |
-| P14 | table sizes for the lock analysis | `SELECT c.oid::regclass, c.reltuples::bigint AS est_rows, pg_total_relation_size(c.oid) AS bytes FROM pg_class c WHERE c.oid IN (SELECT to_regclass(x) FROM unnest(ARRAY['sessions.session_directory', 'sessions.session_index', 'sessions.machines', 'sessions.pipeline_events', 'sessions.pipeline_dead_letters', 'sessions.pipeline_jobs', 'sessions.session_summaries', 'sessions.migration_ingest_audit']) AS x WHERE to_regclass(x) IS NOT NULL);` | record. `reltuples` is a planner estimate, not a count. |
-| P15 | current activity on the database (no query text) | `SELECT pid, usename, application_name, backend_type, state, wait_event_type, xact_start FROM pg_stat_activity WHERE datname = current_database() AND state <> 'idle';` | record. Long-running transactions must be resolved before any `ACCESS EXCLUSIVE` step. |
-| P16 | locks held on the affected tables | `SELECT l.pid, l.relation::regclass, l.mode, l.granted FROM pg_locks l WHERE l.relation IN (SELECT to_regclass(x) FROM unnest(ARRAY['sessions.session_directory', 'sessions.session_index', 'sessions.machines', 'sessions.pipeline_events', 'sessions.pipeline_dead_letters', 'sessions.pipeline_jobs', 'sessions.session_summaries']) AS x WHERE to_regclass(x) IS NOT NULL);` | record |
-| P17 | is a migrator already running (the advisory lock 961996, 1) | `SELECT pid, granted FROM pg_locks WHERE locktype = 'advisory' AND classid = 961996 AND objid = 1 AND objsubid = 2;` | 0 rows |
-| P18 | timeouts that apply to the migrator session | `SHOW statement_timeout; SHOW lock_timeout; SHOW idle_in_transaction_session_timeout;` | record. `migrate.ts` sets none of them. |
+| id  | purpose                                                                           | query                                                                                                                                                                                                                                                                                                                                                                                                                                                    | expected for go                                                                                                                                                                                                                                                                                                                                                                                                      |
+| --- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1  | server version                                                                    | `SHOW server_version_num; SELECT version();`                                                                                                                                                                                                                                                                                                                                                                                                             | a number. Then choose the 1.3 row.                                                                                                                                                                                                                                                                                                                                                                                   |
+| P2  | live identity and attributes of this connection                                   | `SELECT current_user, session_user, r.rolsuper, r.rolcreaterole, r.rolbypassrls, r.rolinherit FROM pg_roles r WHERE r.rolname = current_user;`                                                                                                                                                                                                                                                                                                           | Bootstrap connection: `rolsuper = t`, or `rolcreaterole = t` with P1 `< 160000`. Migrator: unknown spec; record it.                                                                                                                                                                                                                                                                                                  |
+| P3  | does the worker role exist, and is it to spec                                     | `SELECT oid, rolcanlogin, rolinherit, rolbypassrls, rolsuper, rolcreaterole, rolcreatedb, rolreplication FROM pg_roles WHERE rolname = 'session_directory_search_worker';`                                                                                                                                                                                                                                                                               | 0 rows (phase 1 will create it), or 1 row with every attribute `f`                                                                                                                                                                                                                                                                                                                                                   |
+| P3b | its settings and memberships (only if P3 found a row)                             | the runbook "Checks" block: `SELECT setdatabase, setconfig FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole WHERE r.rolname = 'session_directory_search_worker';` and `SELECT g.rolname AS role, u.rolname AS member, m.admin_option FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid JOIN pg_roles u ON u.oid = m.member WHERE 'session_directory_search_worker' IN (g.rolname, u.rolname);`                                    | exactly `0 \| {statement_timeout=2s}`; no membership rows                                                                                                                                                                                                                                                                                                                                                            |
+| P4  | existing references to the role (only if P3 found a row)                          | `SELECT d.deptype, d.dbid, pg_describe_object(d.classid, d.objid, d.objsubid) FROM pg_shdepend d WHERE d.refclassid = 'pg_authid'::regclass AND d.refobjid = 'session_directory_search_worker'::regrole;`                                                                                                                                                                                                                                                | before `20261030020000`: 0 rows. After the full set: only `a` rows for schema `sessions` and the three approved functions.                                                                                                                                                                                                                                                                                           |
+| P5  | existing grants, ACLs, default ACLs, RLS and dependencies for every role involved | the exhaustive catalog audit A0 to A10 in 4.1 (not `information_schema`, which shows only what the current role can see)                                                                                                                                                                                                                                                                                                                                 | see each query in 4.1                                                                                                                                                                                                                                                                                                                                                                                                |
+| P6  | do the ledger and marker tables exist                                             | `SELECT to_regclass('sessions.__96bulls_migrations') AS ledger, to_regclass('sessions.__96bulls_role_validation') AS marker;`                                                                                                                                                                                                                                                                                                                            | record. NULL means `migrate.ts` has never run here.                                                                                                                                                                                                                                                                                                                                                                  |
+| P7  | ledger contents (only if P6 found the ledger)                                     | `SELECT name, sha256, applied_at FROM sessions.__96bulls_migrations ORDER BY name;`                                                                                                                                                                                                                                                                                                                                                                      | every applied row's sha256 equals the 2.2 table; no `vendor:` names. Any mismatch makes the run fail by design: stop.                                                                                                                                                                                                                                                                                                |
+| P8  | marker (only if P6 found the marker)                                              | `SELECT name, generation, status, updated_at FROM sessions.__96bulls_role_validation;`                                                                                                                                                                                                                                                                                                                                                                   | record. A `'pass'` for another generation is expected to flip to `'pending'` on the next migrate (see 6.4).                                                                                                                                                                                                                                                                                                          |
+| P9  | other migration ledgers on the target                                             | `SELECT to_regclass('supabase_migrations.schema_migrations');` and, if not NULL, `SELECT version, name FROM supabase_migrations.schema_migrations ORDER BY version;`                                                                                                                                                                                                                                                                                     | record. Non-empty means `scripts/sb db push` was used: see blocker B3.                                                                                                                                                                                                                                                                                                                                               |
+| P10 | which schema objects already exist                                                | `SELECT n, to_regclass(n) FROM unnest(ARRAY['sessions.session_index', 'sessions.machines', 'sessions.pipeline_events', 'sessions.pipeline_jobs', 'sessions.session_summaries', 'sessions.session_directory', 'sessions.session_directory_rollout', 'sessions.session_directory_search_token_policy', 'sessions.session_directory_resurrection_fences']) AS n;`                                                                                           | consistent with P7. Objects present without ledger rows means blocker B3.                                                                                                                                                                                                                                                                                                                                            |
+| P11 | extensions                                                                        | `SELECT e.extname, e.extversion, n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname IN ('pg_trgm', 'btree_gin');` and `SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name IN ('pg_trgm', 'btree_gin');`                                                                                                                                                                    | both available. If `pg_trgm` is already installed, it must be in schema `public`: the migrations reference `public.gin_trgm_ops` explicitly, and `CREATE EXTENSION IF NOT EXISTS … WITH SCHEMA public` does not move an existing install. `btree_gin` is used through default opclasses, so its schema is not referenced. The repo does not say whether the migrator may create extensions on this project: unknown. |
+| P12 | leakproof flags (G6's RLS design depends on them)                                 | `SELECT proname, proleakproof FROM pg_proc WHERE pronamespace = 'pg_catalog'::regnamespace AND proname IN ('texteq', 'textlike', 'texticlike', 'text_pattern_lt', 'text_pattern_ge') ORDER BY 1;`                                                                                                                                                                                                                                                        | as in `docs/evidence/session-directory-plans.md`: `texteq`, `text_pattern_lt` and `text_pattern_ge` true; `textlike` and `texticlike` false                                                                                                                                                                                                                                                                          |
+| P13 | runtime role access for the live gate                                             | RT2 and RT3 in 3.4, then RT4 as the runtime identity                                                                                                                                                                                                                                                                                                                                                                                                     | as stated for RT2 to RT4. Otherwise see blocker B6.                                                                                                                                                                                                                                                                                                                                                                  |
+| P14 | table sizes for the lock analysis                                                 | `SELECT c.oid::regclass, c.reltuples::bigint AS est_rows, pg_total_relation_size(c.oid) AS bytes FROM pg_class c WHERE c.oid IN (SELECT to_regclass(x) FROM unnest(ARRAY['sessions.session_directory', 'sessions.session_index', 'sessions.machines', 'sessions.pipeline_events', 'sessions.pipeline_dead_letters', 'sessions.pipeline_jobs', 'sessions.session_summaries', 'sessions.migration_ingest_audit']) AS x WHERE to_regclass(x) IS NOT NULL);` | record. `reltuples` is a planner estimate, not a count.                                                                                                                                                                                                                                                                                                                                                              |
+| P15 | current activity on the database (no query text)                                  | `SELECT pid, usename, application_name, backend_type, state, wait_event_type, xact_start FROM pg_stat_activity WHERE datname = current_database() AND state <> 'idle';`                                                                                                                                                                                                                                                                                  | record. Long-running transactions must be resolved before any `ACCESS EXCLUSIVE` step.                                                                                                                                                                                                                                                                                                                               |
+| P16 | locks held on the affected tables                                                 | `SELECT l.pid, l.relation::regclass, l.mode, l.granted FROM pg_locks l WHERE l.relation IN (SELECT to_regclass(x) FROM unnest(ARRAY['sessions.session_directory', 'sessions.session_index', 'sessions.machines', 'sessions.pipeline_events', 'sessions.pipeline_dead_letters', 'sessions.pipeline_jobs', 'sessions.session_summaries']) AS x WHERE to_regclass(x) IS NOT NULL);`                                                                         | record                                                                                                                                                                                                                                                                                                                                                                                                               |
+| P17 | is a migrator already running (the advisory lock 961996, 1)                       | `SELECT pid, granted FROM pg_locks WHERE locktype = 'advisory' AND classid = 961996 AND objid = 1 AND objsubid = 2;`                                                                                                                                                                                                                                                                                                                                     | 0 rows                                                                                                                                                                                                                                                                                                                                                                                                               |
+| P18 | timeouts that apply to the migrator session                                       | `SHOW statement_timeout; SHOW lock_timeout; SHOW idle_in_transaction_session_timeout;`                                                                                                                                                                                                                                                                                                                                                                   | record. `migrate.ts` sets none of them.                                                                                                                                                                                                                                                                                                                                                                              |
+
+### 4.1 Grants and ownership audit (read-only; replaces a grants-view summary)
+
+`information_schema` views show only privileges visible to the current role, and they
+omit default ACLs, policies and dependencies. So the audit reads the catalogs directly.
+
+**Roles involved.** Use this list in every query below:
+
+- `session_directory_search_worker`;
+- `authenticator`, `authenticated`, `anon` and `service_role`;
+- `relayhistory_app` (named in the `20261030020000` revoke);
+- `postgres`;
+- `<migrator role>` (P2) and `<runtime role>` (RT1 or R2).
+
+Record every result in the section 0 format. "Expected" below gives the state before #38
+and after a full apply. Rows not covered by it go to Khaliq. They are not fixed during
+the audit.
+
+**A0: role inventory**
+
+```sql
+SELECT rolname, oid, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin,
+       rolreplication, rolbypassrls
+  FROM pg_roles
+ WHERE rolname IN ('session_directory_search_worker', 'authenticator', 'authenticated', 'anon',
+                   'service_role', 'relayhistory_app', 'postgres', '<migrator role>', '<runtime role>')
+ ORDER BY rolname;
+```
+
+**A1: relation ACLs and owners (`pg_class.relacl`)** in `sessions`. A NULL `relacl` means
+the default: owner only. The query shows both the raw and the effective entries.
+
+```sql
+SELECT c.oid::regclass AS relation, c.relkind, pg_get_userbyid(c.relowner) AS owner,
+       c.relacl IS NULL AS default_acl,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END AS grantee,
+       pg_get_userbyid(a.grantor) AS grantor, a.privilege_type, a.is_grantable
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,
+         acldefault(CASE WHEN c.relkind = 'S' THEN 's'::"char" ELSE 'r'::"char" END, c.relowner))) a
+ WHERE n.nspname = 'sessions' AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+ ORDER BY 1, 5, 7;
+```
+
+Expected after the apply, for the G6 tables, from the migrations:
+
+- `session_directory`: `authenticated` has no table-level `SELECT` (column grants only;
+  see A2). `service_role` has all privileges. Nothing for `anon` or `PUBLIC`.
+- `session_directory_users` and `session_directory_machines`: `SELECT` for
+  `authenticated`; all privileges for `service_role`.
+- `session_directory_rollout` and `session_directory_resurrection_fences`: all privileges
+  for `service_role` only.
+- `session_directory_search_token_policy`: owner only.
+- `__96bulls_role_validation`: no `PUBLIC` (with #99: `SELECT` for the runtime role).
+- `session_directory_search_worker` appears on **no** relation.
+
+**A2: column ACLs (`pg_attribute.attacl`)**
+
+```sql
+SELECT c.oid::regclass AS relation, att.attname,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END AS grantee,
+       pg_get_userbyid(a.grantor) AS grantor, a.privilege_type, a.is_grantable
+  FROM pg_attribute att
+  JOIN pg_class c ON c.oid = att.attrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  CROSS JOIN LATERAL aclexplode(att.attacl) a
+ WHERE n.nspname = 'sessions' AND att.attnum > 0 AND NOT att.attisdropped AND att.attacl IS NOT NULL
+ ORDER BY 1, 3, 2;
+```
+
+Expected after the apply:
+
+- `authenticated` has `SELECT` on exactly the 24 `session_directory` columns listed in
+  `20261030020000`. None of `search_text`, `short_summary`,
+  `short_summary_scrub_ruleset`, `short_summary_scrub_version`, `short_summary_source` or
+  `short_summary_generated_at` is among them.
+- `authenticated` has `SELECT` on the 8 `machines` columns listed in `20261030000000`.
+- No column ACL names `session_directory_search_worker`.
+
+**A3: schema ACLs and owners (`pg_namespace.nspacl`)**
+
+```sql
+SELECT n.nspname, pg_get_userbyid(n.nspowner) AS owner, n.nspacl IS NULL AS default_acl,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END AS grantee,
+       pg_get_userbyid(a.grantor) AS grantor, a.privilege_type, a.is_grantable
+  FROM pg_namespace n
+  CROSS JOIN LATERAL aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a
+ WHERE n.nspname IN ('sessions', 'public', 'extensions')
+ ORDER BY 1, 4, 6;
+```
+
+Expected after the apply: `session_directory_search_worker` has exactly `USAGE` on
+`sessions`, not grantable. With #99, the runtime role also has `USAGE` on `sessions`.
+
+**A4: function ACLs, owners and security (`pg_proc.proacl`)**
+
+```sql
+SELECT p.oid::regprocedure AS function, pg_get_userbyid(p.proowner) AS owner,
+       p.prosecdef AS security_definer, p.proconfig, p.proacl IS NULL AS default_acl,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END AS grantee,
+       a.privilege_type, a.is_grantable
+  FROM pg_proc p
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+  CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+ WHERE n.nspname = 'sessions'
+ ORDER BY 1, 6;
+```
+
+Expected after the apply. The three approved RPCs are `search_session_directory(...)`,
+`session_directory_pointers(text, text, text)` and `session_directory_readiness()`:
+
+- On each approved RPC, `EXECUTE` goes to the owner and `session_directory_search_worker`
+  only. `security_definer = t`, and `proconfig` pins `search_path`.
+- `session_directory_worker_scope(text)` has `EXECUTE` for the owner only.
+- `session_directory_record_fences()` has the owner only.
+- `session_directory_search_text(...)` has the owner plus `service_role`.
+- `session_directory_search_query(text)` and `session_directory_tombstone_clears_summary()`
+  have the owner only (PUBLIC revoked).
+- No other function names `session_directory_search_worker`.
+
+**A5: default privileges (`pg_default_acl`)**
+
+```sql
+SELECT pg_get_userbyid(d.defaclrole) AS for_objects_created_by, n.nspname AS in_schema,
+       d.defaclobjtype,
+       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END AS grantee,
+       a.privilege_type, a.is_grantable
+  FROM pg_default_acl d
+  LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
+  CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+ ORDER BY 1, 2, 3, 4, 5;
+```
+
+Expected: no row where `for_objects_created_by` or `grantee` is
+`session_directory_search_worker`, since phase 1, the guard and phase 2 all refuse that.
+Record every row whose `for_objects_created_by` is `<migrator role>`. Those grants land on
+every object the migrations create. The `DO $revoke$` blocks strip them from the RPCs but
+not from tables.
+
+**A6: RLS flags and policies (`pg_class.relrowsecurity`, `relforcerowsecurity`,
+`pg_policy`)**
+
+```sql
+SELECT c.oid::regclass AS relation, c.relrowsecurity, c.relforcerowsecurity
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'sessions' AND c.relkind IN ('r', 'p')
+ ORDER BY 1;
+
+SELECT pol.polrelid::regclass AS relation, pol.polname, pol.polcmd, pol.polpermissive,
+       ARRAY(SELECT CASE WHEN r = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(r) END
+               FROM unnest(pol.polroles) AS r) AS roles,
+       pg_get_expr(pol.polqual, pol.polrelid) AS using_expr,
+       pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check_expr
+  FROM pg_policy pol
+  JOIN pg_class c ON c.oid = pol.polrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'sessions'
+ ORDER BY 1, 2;
+```
+
+Expected after the apply:
+
+- `relrowsecurity = t` on all six `session_directory*` tables.
+- `relforcerowsecurity = f`. The plan evidence records "FORCE=false. Without FORCE the
+  owner (the RPCs' definer) is not subject to RLS", and the RPCs depend on that.
+- Exactly three G6 policies: `session_directory_member_read`,
+  `session_directory_users_member_read` and `session_directory_machines_member_read`.
+  Each is `SELECT` (`polcmd = 'r'`), permissive, `TO authenticated`.
+- No policy names `session_directory_search_worker`.
+
+**A7: shared dependencies and ownership, per role (`pg_shdepend`)**
+
+```sql
+SELECT r.rolname, d.deptype, d.dbid, db.datname, d.classid::regclass AS catalog,
+       CASE WHEN d.dbid IN (0, (SELECT oid FROM pg_database WHERE datname = current_database()))
+            THEN pg_describe_object(d.classid, d.objid, d.objsubid) END AS object
+  FROM pg_shdepend d
+  JOIN pg_roles r ON r.oid = d.refobjid
+  LEFT JOIN pg_database db ON db.oid = d.dbid
+ WHERE d.refclassid = 'pg_authid'::regclass
+   AND r.rolname IN ('session_directory_search_worker', 'authenticator', 'authenticated', 'anon',
+                     'service_role', 'relayhistory_app', 'postgres', '<migrator role>', '<runtime role>')
+ ORDER BY 1, 2, 6;
+```
+
+`deptype`: `o` owner, `a` ACL, `r` policy, `i` initial privilege. PostgreSQL records no
+`pg_shdepend` rows for objects owned by the bootstrap superuser, so ownership by that
+role shows only in A1 and A4.
+
+Expected for `session_directory_search_worker`:
+
+- before #38: no rows;
+- after the apply: only `a` rows, in this database, for schema `sessions` and the three
+  approved functions. That is what phase 2 enforces.
+
+Rows in another `datname` fail phase 2 ("keep one migrated database per cluster").
+
+**A8: object dependencies (`pg_depend`).** What depends on the G6 tables (foreign keys,
+triggers, policies, views, rules), and the extension members the migrations reference:
+
+```sql
+SELECT pg_describe_object(d.classid, d.objid, d.objsubid) AS dependent,
+       pg_describe_object(d.refclassid, d.refobjid, d.refobjsubid) AS referenced, d.deptype
+  FROM pg_depend d
+ WHERE d.refclassid = 'pg_class'::regclass
+   AND d.refobjid IN (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                       WHERE n.nspname = 'sessions'
+                         AND c.relname IN ('session_directory', 'session_directory_users',
+                                           'session_directory_machines', 'session_directory_rollout',
+                                           'session_directory_resurrection_fences', 'session_index'))
+   AND d.classid <> 'pg_class'::regclass
+ ORDER BY 2, 1;
+
+SELECT e.extname, n.nspname AS ext_schema, oc.opcname, ocn.nspname AS opclass_schema
+  FROM pg_depend d
+  JOIN pg_extension e ON e.oid = d.refobjid
+  JOIN pg_namespace n ON n.oid = e.extnamespace
+  JOIN pg_opclass oc ON oc.oid = d.objid
+  JOIN pg_namespace ocn ON ocn.oid = oc.opcnamespace
+ WHERE d.refclassid = 'pg_extension'::regclass AND d.classid = 'pg_opclass'::regclass
+   AND d.deptype = 'e' AND e.extname IN ('pg_trgm', 'btree_gin') AND oc.opcmethod = (SELECT oid FROM pg_am WHERE amname = 'gin')
+ ORDER BY 1, 3;
+```
+
+Expected:
+
+- Before #38, the first query lists only `session_index`'s dependents. Record them: a
+  dependent that is not in the repo (a view, say) blocks a later contract revoke and a
+  down.
+- If `pg_trgm` is installed, `gin_trgm_ops` is in schema `public`.
+
+**A9: role memberships (`pg_auth_members`)**, PostgreSQL 16+ form; on 15, drop the two
+`*_option` columns other than `admin_option`:
+
+```sql
+SELECT g.rolname AS role, u.rolname AS member, gr.rolname AS grantor,
+       m.admin_option, m.inherit_option, m.set_option
+  FROM pg_auth_members m
+  JOIN pg_roles g ON g.oid = m.roleid
+  JOIN pg_roles u ON u.oid = m.member
+  LEFT JOIN pg_roles gr ON gr.oid = m.grantor
+ WHERE g.rolname IN ('session_directory_search_worker', 'authenticator', 'authenticated', 'anon',
+                     'service_role', 'relayhistory_app', 'postgres', '<migrator role>', '<runtime role>')
+    OR u.rolname IN ('session_directory_search_worker', 'authenticator', 'authenticated', 'anon',
+                     'service_role', 'relayhistory_app', 'postgres', '<migrator role>', '<runtime role>')
+ ORDER BY 1, 2;
+```
+
+Expected:
+
+- `session_directory_search_worker` is a member of nothing.
+- Its only member, and only after the separate binding step, is `authenticator`, with
+  `admin_option = f` and `inherit_option = f`.
+- `<runtime role>` is not a member of `session_directory_search_worker`, `service_role`
+  or any `BYPASSRLS` role. With #99 this is refused only for the runtime role itself;
+  membership is not checked by #99 (unknown whether it should be).
+
+**A10: effective privilege matrix** (what each role can actually do, memberships
+included):
+
+```sql
+SELECT r.rolname, o.obj,
+       has_table_privilege(r.oid, o.obj, 'SELECT') AS sel,
+       has_table_privilege(r.oid, o.obj, 'INSERT') AS ins,
+       has_table_privilege(r.oid, o.obj, 'UPDATE') AS upd,
+       has_table_privilege(r.oid, o.obj, 'DELETE') AS del
+  FROM pg_roles r
+  CROSS JOIN unnest(ARRAY['sessions.session_directory', 'sessions.session_directory_users',
+                          'sessions.session_directory_machines', 'sessions.session_directory_rollout',
+                          'sessions.session_directory_resurrection_fences',
+                          'sessions.session_directory_search_token_policy', 'sessions.session_index',
+                          'sessions.__96bulls_migrations', 'sessions.__96bulls_role_validation']) AS o(obj)
+ WHERE r.rolname IN ('session_directory_search_worker', 'authenticator', 'authenticated', 'anon',
+                     'service_role', 'relayhistory_app', '<runtime role>')
+   AND to_regclass(o.obj) IS NOT NULL
+ ORDER BY 1, 2;
+```
+
+Expected after the apply:
+
+- `session_directory_search_worker` is `f` everywhere.
+- `anon` is `f` everywhere.
+- `authenticated` has `sel = f` on `session_directory` at table level. `has_table_privilege`
+  is false when only column grants exist; A2 shows those.
+- The runtime role has `sel = t` on both `__96bulls_*` tables and `upd = f`.
 
 ## 5. Apply sequence (placeholders only; every step needs Khaliq's explicit OK)
 
@@ -443,12 +896,19 @@ document.
    - `HOOPDB_ROLE_VERIFY=true` (the default): phase 2 and `'pass'` happen in-process.
    - The equivalent container or Job (`96b-hoopdb-migrate`) needs the same three flags.
      Whether production runs the binary or a Job is unknown.
+   - **If draft PR #99 merges first** (pending, not merged): the profile is resolved before any
+     connection. `HOOPDB_DB_MODE=supabase` becomes required, `HOOPDB_SUPABASE_SHIM` must be
+     unset or `false`, `HOOPDB_ROLE_BOOTSTRAP` must not be forced on, and
+     `HOOPDB_RUNTIME_ROLE=<runtime role>` (the RT1 or R2 name) becomes required. That role is
+     then granted `USAGE` on `sessions` and `SELECT` on the ledger and the marker. The run
+     also refuses `mixed_migration_authority`, `unledgered_schema` and `ledger_gap`. Rerun
+     RT3 and RT4 after the migrate.
    - Expected log lines: `role validation pending` → `migration applied` for each
      unledgered file → `role validation passed` → `hoopdb migrations complete`.
 
 5. **External verifier path.** Only if step 4 ran with `HOOPDB_ROLE_VERIFY=false`. The
    log then says `role validation left pending: in-process verifier disabled; an
-   external verifier must pass it`. From the repository root (psql 12+, `\ir` resolves
+external verifier must pass it`. From the repository root (psql 12+, `\ir` resolves
    the verifier next to the script):
 
    ```sh
@@ -490,22 +950,22 @@ session (unknown; see blocker B7).
 
 ### 6.1 G6 files
 
-| file | statement | lock on existing objects | blocks | timing |
-| ---- | --------- | ------------------------ | ------ | ------ |
-| `20261030010000` | `CREATE EXTENSION IF NOT EXISTS pg_trgm` | none on sessions tables | — | unknown |
-| | `CREATE TABLE` ×4 (`session_directory*`, `_rollout`) | new tables. The `_users` and `_machines` foreign keys reference a table created in the same transaction. | nothing outside the transaction | unknown; expected small (new objects) |
-| | 14 × `CREATE INDEX` (non-concurrent; two GIN trigram) | `SHARE` on the new tables only | nothing outside the transaction (the tables are empty and not yet visible) | unknown; expected small (empty tables) |
-| | `ENABLE ROW LEVEL SECURITY`, `CREATE POLICY`, `GRANT` / `REVOKE` | new tables only | — | unknown |
-| `20261030020000` | `DO $role_guard$` | catalog reads | — | unknown |
-| | `ALTER TABLE sessions.session_directory ADD COLUMN …` with CHECKs, then `ADD CONSTRAINT … CHECK` ×2 (validated, not `NOT VALID`) | **`ACCESS EXCLUSIVE` on `sessions.session_directory`**, held to COMMIT. The validated CHECKs scan the table. | all reads and writes of the directory | **unknown**: depends on row count (P14, NOT OBSERVED). If `20261030010000` applies in the same run, the table is empty. |
-| | `CREATE TRIGGER session_directory_tombstone_clears_summary` | `SHARE ROW EXCLUSIVE` (already covered by the `ACCESS EXCLUSIVE` above) | — | unknown |
-| | `DROP INDEX sessions.session_directory_metadata_trgm_idx`, `DROP INDEX sessions.session_directory_project_trgm_idx` (non-concurrent) | `ACCESS EXCLUSIVE` on the directory | all access | unknown |
-| | `CREATE INDEX session_directory_tenant_search_trgm_idx`, `…_tenant_project_trgm_idx` (GIN, **non-concurrent**) | `SHARE` (already inside the `ACCESS EXCLUSIVE`) | all access, until COMMIT | **unknown**: proportional to directory rows and `search_text` size. GIN trigram builds over a populated table are the largest timing risk in G6. |
-| | `REVOKE SELECT … FROM authenticated` / column `GRANT SELECT (...)` | catalog update; lock level not stated in the repo | unknown | unknown |
-| | functions, the token-policy table, grants on functions | new objects | — | unknown |
-| `20261031001000` | `CREATE TABLE sessions.session_directory_resurrection_fences` with a foreign key to the directory | `SHARE ROW EXCLUSIVE` on `sessions.session_directory` | writes to the directory | unknown; expected short (no scan) |
-| | `CREATE TRIGGER session_directory_record_fences` | `SHARE ROW EXCLUSIVE` on the directory | writes | unknown |
-| | functions, the `DO $revoke$` grant loop | new objects | — | unknown |
+| file             | statement                                                                                                                            | lock on existing objects                                                                                     | blocks                                                                     | timing                                                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `20261030010000` | `CREATE EXTENSION IF NOT EXISTS pg_trgm`                                                                                             | none on sessions tables                                                                                      | —                                                                          | unknown                                                                                                                                          |
+|                  | `CREATE TABLE` ×4 (`session_directory*`, `_rollout`)                                                                                 | new tables. The `_users` and `_machines` foreign keys reference a table created in the same transaction.     | nothing outside the transaction                                            | unknown; expected small (new objects)                                                                                                            |
+|                  | 14 × `CREATE INDEX` (non-concurrent; two GIN trigram)                                                                                | `SHARE` on the new tables only                                                                               | nothing outside the transaction (the tables are empty and not yet visible) | unknown; expected small (empty tables)                                                                                                           |
+|                  | `ENABLE ROW LEVEL SECURITY`, `CREATE POLICY`, `GRANT` / `REVOKE`                                                                     | new tables only                                                                                              | —                                                                          | unknown                                                                                                                                          |
+| `20261030020000` | `DO $role_guard$`                                                                                                                    | catalog reads                                                                                                | —                                                                          | unknown                                                                                                                                          |
+|                  | `ALTER TABLE sessions.session_directory ADD COLUMN …` with CHECKs, then `ADD CONSTRAINT … CHECK` ×2 (validated, not `NOT VALID`)     | **`ACCESS EXCLUSIVE` on `sessions.session_directory`**, held to COMMIT. The validated CHECKs scan the table. | all reads and writes of the directory                                      | **unknown**: depends on row count (P14, NOT OBSERVED). If `20261030010000` applies in the same run, the table is empty.                          |
+|                  | `CREATE TRIGGER session_directory_tombstone_clears_summary`                                                                          | `SHARE ROW EXCLUSIVE` (already covered by the `ACCESS EXCLUSIVE` above)                                      | —                                                                          | unknown                                                                                                                                          |
+|                  | `DROP INDEX sessions.session_directory_metadata_trgm_idx`, `DROP INDEX sessions.session_directory_project_trgm_idx` (non-concurrent) | `ACCESS EXCLUSIVE` on the directory                                                                          | all access                                                                 | unknown                                                                                                                                          |
+|                  | `CREATE INDEX session_directory_tenant_search_trgm_idx`, `…_tenant_project_trgm_idx` (GIN, **non-concurrent**)                       | `SHARE` (already inside the `ACCESS EXCLUSIVE`)                                                              | all access, until COMMIT                                                   | **unknown**: proportional to directory rows and `search_text` size. GIN trigram builds over a populated table are the largest timing risk in G6. |
+|                  | `REVOKE SELECT … FROM authenticated` / column `GRANT SELECT (...)`                                                                   | catalog update; lock level not stated in the repo                                                            | unknown                                                                    | unknown                                                                                                                                          |
+|                  | functions, the token-policy table, grants on functions                                                                               | new objects                                                                                                  | —                                                                          | unknown                                                                                                                                          |
+| `20261031001000` | `CREATE TABLE sessions.session_directory_resurrection_fences` with a foreign key to the directory                                    | `SHARE ROW EXCLUSIVE` on `sessions.session_directory`                                                        | writes to the directory                                                    | unknown; expected short (no scan)                                                                                                                |
+|                  | `CREATE TRIGGER session_directory_record_fences`                                                                                     | `SHARE ROW EXCLUSIVE` on the directory                                                                       | writes                                                                     | unknown                                                                                                                                          |
+|                  | functions, the `DO $revoke$` grant loop                                                                                              | new objects                                                                                                  | —                                                                          | unknown                                                                                                                                          |
 
 ### 6.2 When the G6 lock risk is low
 
@@ -518,85 +978,219 @@ If P7 shows `20261030010000` already applied and P14 shows a populated directory
 `20261030020000` transaction blocks every directory read and write for an unknown
 duration. That needs a maintenance-window decision (blocker B7).
 
-### 6.3 Non-G6 files that the same run may apply (only if unledgered; NOT OBSERVED)
+### 6.3 Per-file impact, all 17 migrations
 
-| file | risky statement | lock or effect | note |
-| ---- | --------------- | -------------- | ---- |
-| `20261030000000_relayhistory_machines_compat.sql` | `ALTER TABLE sessions.machines ADD COLUMN IF NOT EXISTS workspace_id text NOT NULL DEFAULT 'default'`, … | `ACCESS EXCLUSIVE` on `sessions.machines` | constant defaults; scan or rewrite cost not stated in the repo: unknown |
-| `20261031000100_manifest_readiness.sql` | `ALTER TABLE sessions.pipeline_events DROP CONSTRAINT …; ADD CONSTRAINT pipeline_events_stage_check CHECK (…)`, and the same for `pipeline_dead_letters` and `pipeline_jobs` | `ACCESS EXCLUSIVE` on each table, plus a full validation scan (not `NOT VALID`) | **risky on populated pipeline tables**; sizes NOT OBSERVED (P14) |
-| `20261101000000_migration_ingest_audit_base_read.sql` | `ALTER TABLE sessions.migration_ingest_audit DROP CONSTRAINT …; ADD CONSTRAINT … CHECK (result IN ('committed', 'base_read'))` | `ACCESS EXCLUSIVE` plus a validation scan | size NOT OBSERVED |
-| `0004_summary_pointers.sql` | `DELETE FROM sessions.session_summaries;` then `ALTER TABLE sessions.session_summaries DROP COLUMN IF EXISTS summary, …` | **deletes every row**, plus `ACCESS EXCLUSIVE` | intended ("derived data … re-queues"), but destructive on a populated table. It needs its own explicit OK. |
+Read this table with these definitions:
 
-### 6.4 Readiness flip during migrate
+- **Existing tables touched**: tables the file changes that an earlier file created.
+  These are the only places a backlog run can contend with live traffic.
+- **Strongest lock**: the strongest documented lock any statement in the file takes on an
+  existing table. It is held until the file's `COMMIT`.
+- **Rows touched**: DML the file runs at migrate time.
+- **Destructive**: the file drops or deletes data, or drops an object that is not
+  recreated.
+- **Fresh run**: every table the file touches was created earlier in the same run. Rows
+  are then 0 and nothing contends.
+- **Backlog run**: the file applies to a database where earlier files were applied
+  earlier and their tables hold production rows. Row counts are NOT OBSERVED (P14).
 
-`MARKER_PENDING_SQL` upserts the single row `name = 'session_directory_search_worker'` to
-`('pending', <new GEN>)` before any step. Any reader already running an image that
-carries the marker check (#96 or later) requires `status = 'pass' AND generation = <its
-own GEN>`. From that moment until the run's phase 2 passes, every such reader reports
-`/readyz` 503 and its worker claims nothing. After the pass, readers on an older
-generation stay non-ready until they are replaced. Whether any #96+ reader is running
-against this target is NOT OBSERVED.
+Timing is **unknown** for every file on a backlog run: no row counts are observed, and
+the repo has no timing evidence against production-shaped data.
+
+| #   | file                                                               | creates (new)                                                                                                                                                                                                                                                                                                                                                                            | existing tables touched (statements)                                                                                                                                                                                                                                                                                                                          | strongest lock on existing tables                                                                                            | rows touched at migrate time                                                                                                                                                                                                                                                                                                                         | destructive?                                                                                                                                   | backlog effect if earlier files hold production rows                                                                                                                                                                           |
+| --- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | `20261025000000_sessions_index.sql`                                | schema `sessions` (`IF NOT EXISTS`); `session_index` + 9 indexes; `machines` (`IF NOT EXISTS`); `pipeline_events` (partitioned by `at`) + default partition + 2 indexes; `pipeline_dead_letters` + 2 indexes; functions (`pipeline_events_maintain`, `upsert_session_index`, `set_session_state`, `upsert_machine`, `jwt_org_id`, `jwt_workspace_ids`, `member_of`, …); RLS + 2 policies | `sessions.machines` only if it already exists (`ALTER TABLE … ADD COLUMN IF NOT EXISTS machine_name, hostname_aliases text[] NOT NULL DEFAULT '{}', client_version`)                                                                                                                                                                                          | `ACCESS EXCLUSIVE` on `machines` (only if it exists)                                                                         | `DO $$ BEGIN PERFORM sessions.pipeline_events_maintain(); END $$;` runs at migrate time. It creates monthly partitions, `DROP TABLE`s expired partitions, `DELETE FROM sessions.pipeline_events_default WHERE at < v_cutoff`, and `DELETE FROM sessions.pipeline_dead_letters WHERE state = 'resolved' AND resolved_at < now() - interval '30 days'` | **yes, on a backlog run** (retention deletes and partition drops). On a fresh run, no (the tables are new and empty).                          | Cannot apply on a backlog: `CREATE TABLE sessions.session_index` has no `IF NOT EXISTS`, so it fails with `42P07` and rolls back. That is the B3 case.                                                                         |
+| 2   | `20261025000100_repo_identity.sql`                                 | `repos`, `repo_names` + indexes; repo functions; replaces `upsert_session_index`; RLS + 2 policies                                                                                                                                                                                                                                                                                       | `session_index`: `ADD COLUMN git_remote_url`, `git_root_commit … CHECK (…)`, `repo_id`; `CREATE INDEX si_remote`, `CREATE INDEX si_repo` (non-concurrent)                                                                                                                                                                                                     | `ACCESS EXCLUSIVE` on `session_index` (`ADD COLUMN` with `CHECK`), then `SHARE` for the two index builds, all held to COMMIT | none (the backfill functions are created, not run)                                                                                                                                                                                                                                                                                                   | no                                                                                                                                             | **High risk:** two non-concurrent index builds plus a validated `CHECK` on `session_index`, the physical manifest table, all under `ACCESS EXCLUSIVE`. Blocks every read and write of `session_index` for an unknown duration. |
+| 3   | `20261025000200_scrub_quarantine.sql`                              | trigger function `session_index_scrub_sticky`; replaces `upsert_session_index`                                                                                                                                                                                                                                                                                                           | `session_index`: `ADD COLUMN scrubbed boolean NOT NULL DEFAULT false`, `ADD COLUMN scrub_quarantined boolean NOT NULL DEFAULT false`, `COMMENT ON COLUMN` ×2, `CREATE TRIGGER session_index_scrub_sticky`                                                                                                                                                     | `ACCESS EXCLUSIVE` on `session_index`                                                                                        | none                                                                                                                                                                                                                                                                                                                                                 | no                                                                                                                                             | `ACCESS EXCLUSIVE` on `session_index`. Constant defaults; whether this rewrites the table is not stated in the repo, so the cost is unknown.                                                                                   |
+| 4   | `20261025000300_upsert_keep_on_null.sql`                           | —                                                                                                                                                                                                                                                                                                                                                                                        | none (`CREATE OR REPLACE FUNCTION sessions.upsert_session_index`)                                                                                                                                                                                                                                                                                             | none on tables (function replace only)                                                                                       | none                                                                                                                                                                                                                                                                                                                                                 | no                                                                                                                                             | Changes upsert semantics for live writers immediately at COMMIT.                                                                                                                                                               |
+| 5   | `20261025000600_pipeline_queue.sql`                                | `pipeline_jobs` + 3 indexes                                                                                                                                                                                                                                                                                                                                                              | `pipeline_events`: `DROP CONSTRAINT` / `ADD CONSTRAINT pipeline_events_stage_check` (validated), and `UPDATE … SET stage = …`. `pipeline_dead_letters`: the same constraint swap, `UPDATE … SET stage, id, message`, `ADD COLUMN session_id, machine_id`, and `CREATE INDEX pipeline_dead_letters_session_idx` (non-concurrent)                               | `ACCESS EXCLUSIVE` on `pipeline_events` (every partition) and `pipeline_dead_letters`                                        | `UPDATE` of every `pipeline_events` row with stage `storage.event`, `index.upsert` or `transform`; `UPDATE` of the matching `pipeline_dead_letters` rows, **rewriting their primary key `id`**                                                                                                                                                       | data rewrite (stage renames, dead-letter ids rewritten), no deletes                                                                            | Full validation scans of both tables, plus an index build, under `ACCESS EXCLUSIVE`. Blocks pipeline writes.                                                                                                                   |
+| 6   | `20261030000000_relayhistory_machines_compat.sql`                  | —                                                                                                                                                                                                                                                                                                                                                                                        | `machines`: `ADD COLUMN IF NOT EXISTS workspace_id text NOT NULL DEFAULT 'default'`, `hostname`, `label`, `relayhistory_version`, `cursors_json jsonb NOT NULL DEFAULT '{}'::jsonb`; `ALTER COLUMN workspace_id SET DEFAULT 'default'`; `REVOKE SELECT … FROM authenticated` plus a column `GRANT SELECT`                                                     | `ACCESS EXCLUSIVE` on `machines`                                                                                             | none                                                                                                                                                                                                                                                                                                                                                 | no                                                                                                                                             | **Narrows `authenticated`** to 8 columns of `machines`. Any tenant reader that selects other columns starts getting `42501`.                                                                                                   |
+| 7   | `20261030010000_session_directory.sql` (#38)                       | `session_directory`, `_users`, `_machines`, `_rollout`; **13** indexes; RLS + 3 policies; grants                                                                                                                                                                                                                                                                                         | none                                                                                                                                                                                                                                                                                                                                                          | none on existing tables                                                                                                      | `INSERT INTO sessions.session_directory_rollout (singleton) VALUES (true)`                                                                                                                                                                                                                                                                           | no                                                                                                                                             | none (all new objects)                                                                                                                                                                                                         |
+| 8   | `20261030020000_session_directory_short_summary.sql` (#38/#72/#96) | 3 functions + the search RPC; `session_directory_search_token_policy` (empty); 2 GIN indexes; grants                                                                                                                                                                                                                                                                                     | `session_directory`: `ADD COLUMN` ×5 with CHECKs, `ADD CONSTRAINT` ×2, `CREATE TRIGGER`, `DROP INDEX` ×2, `CREATE INDEX` ×2 (GIN, non-concurrent), `REVOKE` / column `GRANT`                                                                                                                                                                                  | `ACCESS EXCLUSIVE` on `session_directory`                                                                                    | none                                                                                                                                                                                                                                                                                                                                                 | drops `session_directory_metadata_trgm_idx` and `session_directory_project_trgm_idx`, replaced in the same transaction                         | If `session_directory` is populated: full scans and two GIN builds under `ACCESS EXCLUSIVE`. `authenticated` loses `search_text` and `short_summary` (`42501` for any reader of those columns).                                |
+| 9   | `20261031000000_migration_assertion_ledger.sql`                    | `migration_assertion_uses`, `migration_assertion_chunks`, `migration_ingest_audit` + indexes; an append-only trigger; grants                                                                                                                                                                                                                                                             | none                                                                                                                                                                                                                                                                                                                                                          | none                                                                                                                         | none                                                                                                                                                                                                                                                                                                                                                 | no                                                                                                                                             | none (new objects)                                                                                                                                                                                                             |
+| 10  | `20261031000100_manifest_readiness.sql`                            | `manifest_readiness`, `backfill_activation_ready`, `export_deferred_sessions`, `claimless_uses` (`IF NOT EXISTS`); grants                                                                                                                                                                                                                                                                | `pipeline_events`, `pipeline_dead_letters`, `pipeline_jobs`: `DROP CONSTRAINT …_stage_check` then `ADD CONSTRAINT …_stage_check CHECK (…)` (validated)                                                                                                                                                                                                        | `ACCESS EXCLUSIVE` on all three pipeline tables                                                                              | none                                                                                                                                                                                                                                                                                                                                                 | no                                                                                                                                             | **High risk:** three full validation scans under `ACCESS EXCLUSIVE` on the queue and event tables. Blocks ingest writes and worker claims.                                                                                     |
+| 11  | `20261031001000_session_directory_reads_expand.sql` (#38/#72)      | `session_directory_resurrection_fences`; 4 functions; grants                                                                                                                                                                                                                                                                                                                             | `session_directory`: a foreign key from the new table; `CREATE TRIGGER session_directory_record_fences`                                                                                                                                                                                                                                                       | `SHARE ROW EXCLUSIVE` on `session_directory`                                                                                 | none                                                                                                                                                                                                                                                                                                                                                 | no                                                                                                                                             | Blocks directory writes briefly; no scan.                                                                                                                                                                                      |
+| 12  | `20261101000000_migration_ingest_audit_base_read.sql`              | `migration_base_read_uses` + index; grants                                                                                                                                                                                                                                                                                                                                               | `migration_ingest_audit`: `DROP CONSTRAINT` / `ADD CONSTRAINT migration_ingest_audit_result_check` (validated)                                                                                                                                                                                                                                                | `ACCESS EXCLUSIVE` on `migration_ingest_audit`                                                                               | none                                                                                                                                                                                                                                                                                                                                                 | no                                                                                                                                             | Validation scan of the audit table.                                                                                                                                                                                            |
+| 13  | `20261101000200_claimless_window_activations.sql`                  | `claimless_window_activations`; an append-only function and 2 triggers; grants                                                                                                                                                                                                                                                                                                           | none                                                                                                                                                                                                                                                                                                                                                          | none                                                                                                                         | none                                                                                                                                                                                                                                                                                                                                                 | no                                                                                                                                             | none (new objects)                                                                                                                                                                                                             |
+| 14  | `0001_96bulls_observability.sql`                                   | 2 trigger functions; `pipeline_jobs_session_uuid_idx`                                                                                                                                                                                                                                                                                                                                    | `pipeline_jobs`: `ADD COLUMN IF NOT EXISTS session_uuid, tenant_id, traceparent … CHECK (…)`, `DROP TRIGGER IF EXISTS` / `CREATE TRIGGER pipeline_jobs_observability`, `CREATE INDEX IF NOT EXISTS pipeline_jobs_session_uuid_idx` (non-concurrent). `pipeline_dead_letters`: `ADD COLUMN IF NOT EXISTS session_uuid, traceparent`, and the trigger replaced. | `ACCESS EXCLUSIVE` on `pipeline_jobs` and `pipeline_dead_letters`                                                            | none                                                                                                                                                                                                                                                                                                                                                 | drops and recreates its own triggers                                                                                                           | Blocks claims on `pipeline_jobs` for a `CHECK` scan plus an index build.                                                                                                                                                       |
+| 15  | `0002_session_ext_and_summaries.sql`                               | `session_index_ext`, `session_summaries`, `session_verdicts` (`IF NOT EXISTS`); RLS; grants                                                                                                                                                                                                                                                                                              | none, unless the tables pre-exist (then the `CREATE … IF NOT EXISTS` statements are no-ops)                                                                                                                                                                                                                                                                   | none                                                                                                                         | none                                                                                                                                                                                                                                                                                                                                                 | no                                                                                                                                             | none                                                                                                                                                                                                                           |
+| 16  | `0003_fanout_ledger.sql`                                           | —                                                                                                                                                                                                                                                                                                                                                                                        | `session_index_ext`: `ADD COLUMN IF NOT EXISTS fanout_revision bigint NOT NULL DEFAULT 0`                                                                                                                                                                                                                                                                     | `ACCESS EXCLUSIVE` on `session_index_ext`                                                                                    | none                                                                                                                                                                                                                                                                                                                                                 | no                                                                                                                                             | Constant default; rewrite cost unknown.                                                                                                                                                                                        |
+| 17  | `0004_summary_pointers.sql`                                        | —                                                                                                                                                                                                                                                                                                                                                                                        | `session_summaries`: **`DELETE FROM sessions.session_summaries;`**, `DROP COLUMN IF EXISTS summary, model_id`, `ADD COLUMN IF NOT EXISTS status text NOT NULL CHECK (…)`, `object_key`, `object_sha256 … CHECK`, `key_id`, `DROP` / `ADD CONSTRAINT session_summaries_pointer`                                                                                | `ACCESS EXCLUSIVE` on `session_summaries`                                                                                    | **deletes every row**                                                                                                                                                                                                                                                                                                                                | **yes**: all rows deleted, columns `summary` and `model_id` dropped. The file says the rows are derived data that Bob Costas's sweep rebuilds. | On a backlog run, every stored summary is gone until the sweep rebuilds it. That needs its own explicit OK (B8).                                                                                                               |
+
+The G6-only statement detail is in 6.1. Lock levels are PostgreSQL's documented levels
+for each statement type, not observations.
+
+### 6.4 Readiness outage: NOT zero-downtime
+
+**This activation is not zero-downtime.** The readiness outage covers every ingest
+replica and every worker at once. How much traffic it costs depends on how the
+orchestrator reacts to `/readyz` 503, which is NOT OBSERVED.
+
+Why it is not zero-downtime, from the code:
+
+- `MARKER_PENDING_SQL` upserts the single row `name = 'session_directory_search_worker'`
+  to `('pending', <new GEN>)` before any migration step.
+- Every reader on #96 or later (ingest `/readyz`, worker `/readyz`, worker claim gate)
+  requires `status = 'pass' AND generation = <its own GEN>`.
+- So from the pending write until phase 2 passes, **every** #96+ ingest replica returns
+  `/readyz` 503 (`validation_pending`). Every worker returns 503 and claims nothing ("worker
+  paused: live role validation gate closed; claiming nothing").
+- After the pass, any reader whose image has a different generation (an older #96+
+  image) stays 503 until it is replaced by an image of the new generation.
+- On top of that, the `ACCESS EXCLUSIVE` locks in 6.1 and 6.3 block reads and writes on
+  the affected tables for the duration of each file, whatever `/readyz` says.
+
+Outage window ≈ the migrate duration (unknown) + the time to roll every reader to the new
+generation (unknown).
+
+What happens to traffic during that window is decided by the orchestrator, which the
+repo does not configure for the 96Bulls services. The chart is external, and no
+`readinessProbe` for ingest or workers appears in this repo. All of the following is
+**unknown**:
+
+| orchestrator behavior                                                    | effect during the window                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Kubernetes `readinessProbe` on `/readyz` (port 8080 ingest, 8081 worker) | All ingest pods are removed from Service endpoints at the same time. Ingest is **unavailable**: clients see connection errors or load-balancer 5xx. Workers stay running but idle, and the queue grows. A newly started ingest pod also blocks in `waitForSchema` (`src/alleyoop/ingest.ts`, timeout 300 s, then exits), so it may restart repeatedly until the marker passes. |
+| probe on a TCP port or `/healthz`, or no probe                           | Pods keep receiving traffic. Request handling during `validation_pending` is not gated by `/readyz` in the code reviewed here, but writes block on the `ACCESS EXCLUSIVE` locks. Workers still pause, because the claim gate is in-process.                                                                                                                                    |
+| rolling update gated on readiness                                        | A new pod that is not ready stalls the rollout. With `maxUnavailable` > 0, old pods may already be gone. The rollout parameters are unknown.                                                                                                                                                                                                                                   |
+
+**O1** (needs Khaliq's OK; reads the spec only):
+
+```sh
+kubectl --context <prod context> -n <namespace> get deploy -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.template.spec.containers[*]}{.readinessProbe}{"\t"}{.livenessProbe}{end}{"\t"}{.spec.strategy}{"\n"}{end}'
+```
+
+Record the probe path, port and timing, and the rollout strategy, for each deployment.
+Plan the window on the result (blocker B13).
 
 ## 7. Rollback and forward recovery
 
-| step | rollback in the repo | what it does | what it does not do | forward recovery |
-| ---- | -------------------- | ------------ | ------------------- | ---------------- |
-| phase 1 | none (manual) | — | — | The runbook's removal step, as a superuser, after every down that references the role: `DROP OWNED BY session_directory_search_worker; DROP ROLE session_directory_search_worker;` "in each database". Needs its own OK. |
-| `20261030010000` | **none in `supabase/rollbacks/`** | — | — | unknown. No down path exists; dropping the four tables by hand would be an unreviewed operation. |
-| `20261030020000` | `supabase/rollbacks/20261030020000_session_directory_short_summary.down.sql` (`BEGIN` … `COMMIT`) | restores full-table `GRANT SELECT` to `authenticated`; drops the search RPC, the token-policy table and `session_directory_search_query`; revokes the worker's `sessions` access; drops both tenant GIN indexes and the tombstone trigger and function; rebuilds `search_text` without the summary; drops the `short_summary*` columns and constraints; recreates `session_directory_project_trgm_idx` and `session_directory_metadata_trgm_idx` (non-concurrent, inside the transaction) | **does not drop the role** ("It does not drop the role: the migration never created it"); does not drop `btree_gin`; does not touch the ledger or the marker | Run it only after the `20261031001000` down ("Run later downs first, in reverse migration order"). Its `UPDATE` and index builds take `ACCESS EXCLUSIVE` on a possibly populated directory; timing unknown. |
-| `20261031001000` | `supabase/rollbacks/20261031001000_session_directory_reads_expand.down.sql` | drops `session_directory_readiness()`, `session_directory_pointers(...)`, `session_directory_worker_scope(text)`, the fences trigger and function, and the fences table | does not touch the role, the ledger or the marker | — |
-| ledger after a down | **no repo procedure** | — | The down files leave the `upstream:…` rows in `sessions.__96bulls_migrations`. | A later `migrate.ts` run skips the reverted files as already applied. Phase 2 then fails (`approved RPC missing`) and every reader stays closed. Re-applying needs ledger rows removed by hand, an operation the repo does not describe: unknown, needs a decision. |
-| marker after a down | — | — | — | Phase 2 fails on the next live check, so `/readyz` is 503 and claims stop (fail closed). That is the intended safe state. |
-| failed migrate mid-run | automatic | The failing file's transaction rolls back; earlier files stay committed and ledgered; the marker stays `'pending'`. | — | Fix the cause, then rerun `migrate.ts`. It skips the ledgered files and restarts at `'pending'`. |
-| failed phase 2 | automatic | rolls back; the marker stays `'pending'` | — | "Revoke or restore by hand (an operator decision), then rerun." |
+| step                   | rollback in the repo                                                                              | what it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | what it does not do                                                                                                                                          | forward recovery                                                                                                                                                                                                                                                    |
+| ---------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| phase 1                | none (manual)                                                                                     | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | —                                                                                                                                                            | The runbook's removal step, as a superuser, after every down that references the role: `DROP OWNED BY session_directory_search_worker; DROP ROLE session_directory_search_worker;` "in each database". Needs its own OK.                                            |
+| `20261030010000`       | **none in `supabase/rollbacks/`**                                                                 | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | —                                                                                                                                                            | forward-only or snapshot recovery (7.1). No down path exists; dropping the four tables by hand would be an unreviewed operation.                                                                                                                                    |
+| `20261030020000`       | `supabase/rollbacks/20261030020000_session_directory_short_summary.down.sql` (`BEGIN` … `COMMIT`) | restores full-table `GRANT SELECT` to `authenticated`; drops the search RPC, the token-policy table and `session_directory_search_query`; revokes the worker's `sessions` access; drops both tenant GIN indexes and the tombstone trigger and function; rebuilds `search_text` without the summary; drops the `short_summary*` columns and constraints; recreates `session_directory_project_trgm_idx` and `session_directory_metadata_trgm_idx` (non-concurrent, inside the transaction) | **does not drop the role** ("It does not drop the role: the migration never created it"); does not drop `btree_gin`; does not touch the ledger or the marker | Run it only after the `20261031001000` down ("Run later downs first, in reverse migration order"). Its `UPDATE` and index builds take `ACCESS EXCLUSIVE` on a possibly populated directory; timing unknown.                                                         |
+| `20261031001000`       | `supabase/rollbacks/20261031001000_session_directory_reads_expand.down.sql`                       | drops `session_directory_readiness()`, `session_directory_pointers(...)`, `session_directory_worker_scope(text)`, the fences trigger and function, and the fences table                                                                                                                                                                                                                                                                                                                   | does not touch the role, the ledger or the marker                                                                                                            | —                                                                                                                                                                                                                                                                   |
+| ledger after a down    | **no repo procedure**                                                                             | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | The down files leave the `upstream:…` rows in `sessions.__96bulls_migrations`.                                                                               | A later `migrate.ts` run skips the reverted files as already applied. Phase 2 then fails (`approved RPC missing`) and every reader stays closed. Re-applying needs ledger rows removed by hand, an operation the repo does not describe: unknown, needs a decision. |
+| marker after a down    | —                                                                                                 | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | —                                                                                                                                                            | Phase 2 fails on the next live check, so `/readyz` is 503 and claims stop (fail closed). That is the intended safe state.                                                                                                                                           |
+| failed migrate mid-run | automatic                                                                                         | The failing file's transaction rolls back; earlier files stay committed and ledgered; the marker stays `'pending'`.                                                                                                                                                                                                                                                                                                                                                                       | —                                                                                                                                                            | Fix the cause, then rerun `migrate.ts`. It skips the ledgered files and restarts at `'pending'`.                                                                                                                                                                    |
+| failed phase 2         | automatic                                                                                         | rolls back; the marker stays `'pending'`                                                                                                                                                                                                                                                                                                                                                                                                                                                  | —                                                                                                                                                            | "Revoke or restore by hand (an operator decision), then rerun."                                                                                                                                                                                                     |
 
 Erasure caveat (from the contract): "PostgreSQL WAL, replicas and backups keep their own
 copies until retention ages them out." A rollback does not purge `short_summary` text
 from those.
 
+### 7.1 Forward-only and snapshot recovery for the 15 files with no down
+
+Only `20261030020000` and `20261031001000` have down files (`supabase/rollbacks/`). These
+15 have **no down file**. Each one can be undone only by a new forward migration or by
+restoring a snapshot:
+
+1. `20261025000000_sessions_index.sql`
+2. `20261025000100_repo_identity.sql`
+3. `20261025000200_scrub_quarantine.sql`
+4. `20261025000300_upsert_keep_on_null.sql`
+5. `20261025000600_pipeline_queue.sql`
+6. `20261030000000_relayhistory_machines_compat.sql`
+7. `20261030010000_session_directory.sql`
+8. `20261031000000_migration_assertion_ledger.sql`
+9. `20261031000100_manifest_readiness.sql`
+10. `20261101000000_migration_ingest_audit_base_read.sql`
+11. `20261101000200_claimless_window_activations.sql`
+12. `0001_96bulls_observability.sql`
+13. `0002_session_ext_and_summaries.sql`
+14. `0003_fanout_ledger.sql`
+15. `0004_summary_pointers.sql`
+
+**Forward-only recovery (the default).** The ledger forbids editing an applied file
+("changed after it was applied; add a new migration instead"). A defect in any of the 15
+is fixed by a new, reviewed migration with a later name, applied by `migrate.ts` under its
+own OK. It changes the generation, so readers need an image built with it. What forward-only
+recovery cannot undo:
+
+- data that a file deleted or rewrote: `0004` (`DELETE FROM sessions.session_summaries`,
+  dropped `summary` and `model_id`); `20261025000000`'s `pipeline_events_maintain()` run
+  (dropped partitions, retention deletes); `20261025000600` (stage renames and rewritten
+  dead-letter ids);
+- grants that a file narrowed: `20261030000000` (`machines` column grants) and
+  `20261030020000` (`session_directory` column grants). A forward migration can re-grant
+  these, but anything denied in the meantime stays denied until it runs.
+
+**Snapshot recovery (PITR or a pre-apply backup).** This is the only way to get back data
+destroyed by the three files above, or to undo a set that cannot be fixed going forward.
+It is a whole-database operation. It also discards every write made after the restore
+point, in every schema, including writes from RelayHistory's Worker and the T0 hold/replay
+path (`docs/relayhistory-supabase-migration.md`). It therefore needs its own decision from
+Khaliq, separate from the apply. **Availability is NOT OBSERVED:**
+
+| id  | evidence                                                                                                          | how to fill it (needs Khaliq's OK)                                                                                                                                                                                                                                                                                                                           | expected for go                                                                                                                      |
+| --- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| S1  | Is PITR enabled on `pyamkrhoyszgzirqqffq`, what is the retention window, and when was the latest physical backup? | the Supabase dashboard (Database, then Backups) for the project, read by Khaliq. The repo has no CLI or API command for this: unknown.                                                                                                                                                                                                                       | PITR enabled, with a window that covers the apply plus the verification period, or a fresh backup taken immediately before the apply |
+| S2  | A restore point, recorded immediately before step 4 of section 5                                                  | `SELECT now() AS restore_point, pg_current_wal_lsn() AS lsn;` on the migrator connection, just before the migrator starts. Whether `pg_current_wal_lsn()` is executable by that role is NOT OBSERVED.                                                                                                                                                        | a timestamp and an LSN in the evidence record                                                                                        |
+| S3  | Optional logical pre-apply backup of the tables the destructive files touch                                       | `pg_dump --format=custom --data-only --table='sessions.session_summaries' --table='sessions.pipeline_events*' --table='sessions.pipeline_dead_letters' -d "<connection, injected at exec time>" -f <secure path>`. It reads tenant data, so the output is sensitive. Where it may be stored is unknown; the T0 runbook uses `/secure/t0/` for its artifacts. | a dump file, its sha256 and its row counts recorded. Never commit it.                                                                |
+
+A restore also returns `sessions.__96bulls_migrations` and the marker to their pre-apply
+state. Readers built for the new generation then stay non-ready (`schema_pending` or
+`validation_pending`), and the previous image must be redeployed. The role
+`session_directory_search_worker` is cluster-wide. Whether a project restore keeps or
+removes it on Supabase is unknown, so run phase 1 again (verify only) after any restore.
+
 ## 8. Post-apply readiness evidence
 
 Record each item in the section 0 format.
 
-| id | check | command or query | expected |
-| -- | ----- | ---------------- | -------- |
-| E1 | the ledger is complete | `SELECT name, sha256 FROM sessions.__96bulls_migrations ORDER BY name;` | all 17 schema names in 2.2, with the listed sha256 values (plus `shim:supabase_roles` only if it was already present; it must not be added by this run) |
-| E2 | the marker is pass for this generation | `SELECT generation, status, updated_at FROM sessions.__96bulls_role_validation WHERE name = 'session_directory_search_worker';` | `status = 'pass'`, `generation = $GEN` from step 0 |
-| E3 | phase 2 passes on its own | `psql -v ON_ERROR_STOP=1 -X -d "<…>" -f supabase/bootstrap/session_directory_search_worker_verify.sql` | exit 0 |
-| E4 | role references | P4 | only `a` rows: schema `sessions` plus the three approved functions |
-| E5 | the live gate is ok | `schemaVerdict` result, as logged by a reader on this generation (the log line `live role validation gate closed` must be absent) | `{ ok: true }` |
-| E6 | worker `/readyz` | `curl -fsS -o /dev/null -w '%{http_code}' <worker health endpoint>/readyz` | `200`. Needs a deployed image on this generation, so it requires its own deploy OK. |
-| E7 | ingest `/readyz` | `curl -sS <ingest endpoint>/readyz` | `200` with `{"ok":true}`. Same deploy dependency. |
-| E8 | `authenticated` cannot read summary columns | as an `authenticated` JWT in a **non-prod** rehearsal: select `short_summary` from the directory | `42501` |
-| E9 | negative drift check, **non-prod only** | in a disposable rehearsal database on the same generation: `GRANT SELECT ON sessions.session_directory TO session_directory_search_worker;` → probe `/readyz` → `REVOKE SELECT ON sessions.session_directory FROM session_directory_search_worker;` → probe `/readyz` | First probe 503, `role_validation_failed`, `error_code` `55000`. Second probe 200. **Never run this against `pyamkrhoyszgzirqqffq`.** |
+| id  | check                                       | command or query                                                                                                                                                                                                                                                      | expected                                                                                                                                                |
+| --- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| E1  | the ledger is complete                      | `SELECT name, sha256 FROM sessions.__96bulls_migrations ORDER BY name;`                                                                                                                                                                                               | all 17 schema names in 2.2, with the listed sha256 values (plus `shim:supabase_roles` only if it was already present; it must not be added by this run) |
+| E2  | the marker is pass for this generation      | `SELECT generation, status, updated_at FROM sessions.__96bulls_role_validation WHERE name = 'session_directory_search_worker';`                                                                                                                                       | `status = 'pass'`, `generation = $GEN` from step 0                                                                                                      |
+| E3  | phase 2 passes on its own                   | `psql -v ON_ERROR_STOP=1 -X -d "<…>" -f supabase/bootstrap/session_directory_search_worker_verify.sql`                                                                                                                                                                | exit 0                                                                                                                                                  |
+| E4  | role references                             | P4                                                                                                                                                                                                                                                                    | only `a` rows: schema `sessions` plus the three approved functions                                                                                      |
+| E5  | the live gate is ok                         | `schemaVerdict` result, as logged by a reader on this generation (the log line `live role validation gate closed` must be absent)                                                                                                                                     | `{ ok: true }`                                                                                                                                          |
+| E6  | worker `/readyz`                            | `curl -fsS -o /dev/null -w '%{http_code}' <worker health endpoint>/readyz`                                                                                                                                                                                            | `200`. Needs a deployed image on this generation, so it requires its own deploy OK.                                                                     |
+| E7  | ingest `/readyz`                            | `curl -sS <ingest endpoint>/readyz`                                                                                                                                                                                                                                   | `200` with `{"ok":true}`. Same deploy dependency.                                                                                                       |
+| E8  | `authenticated` cannot read summary columns | as an `authenticated` JWT in a **non-prod** rehearsal: select `short_summary` from the directory                                                                                                                                                                      | `42501`                                                                                                                                                 |
+| E9  | negative drift check, **non-prod only**     | in a disposable rehearsal database on the same generation: `GRANT SELECT ON sessions.session_directory TO session_directory_search_worker;` → probe `/readyz` → `REVOKE SELECT ON sessions.session_directory FROM session_directory_search_worker;` → probe `/readyz` | First probe 503, `role_validation_failed`, `error_code` `55000`. Second probe 200. **Never run this against `pyamkrhoyszgzirqqffq`.**                   |
 
 The repo has no automated "post-apply evidence" script that produces E1 to E9 against a
 hosted target: unknown.
 
 ## 9. Open decisions and blockers for Khaliq
 
-| # | decision or blocker | source |
-| - | ------------------- | ------ |
-| B1 | **The PG16+ path.** The server version is NOT OBSERVED. On 160000 or later, phase 1 refuses Supabase `postgres` (`42501`). Options are in 1.3: a superuser run through Supabase support, a reviewed spec change, or deferral. Each needs an explicit choice; the runbook says it is "not a step to work around." | phase 1 SQL; runbook |
-| B2 | **#226 cutover before the contract revoke.** The expand migration revokes nothing. The contract migration (revoking direct SELECT on `session_directory`, `_users`, `_machines`, `session_index` and `session_directory_rollout` from `authenticated` and from the static reader's role) does not exist yet. It may be written and applied only after #226 cuts over behind a flag with shadow parity, and logs prove zero direct reads over an agreed window. | contract doc; `20261031001000` header |
-| B3 | **Which migration runner and ledger the target uses.** `docs/relayhistory-t0-runbook.md` (A3) applies `supabase/migrations` with `scripts/sb db push` (Supabase CLI). That path writes no `sessions.__96bulls_migrations` ledger, runs neither phase 1 nor phase 2, and writes no marker, so no #96+ reader ever becomes ready. `migrate.ts` on a target built that way would try to reapply `20261025000000_sessions_index.sql` (`CREATE TABLE sessions.session_index` with no `IF NOT EXISTS`), and that fails. Separately, `migrate.ts` applies every unledgered file (rows 1 to 17), not just G6. A decision is needed on the runner and on how existing state is adopted into the ledger. The repo provides no adoption procedure: unknown. | T0 runbook; `migrate.ts`; `supabase/README.md` ("Nothing in this directory has been applied to any database") |
-| B4 | **Images built from `main` need these migrations applied before they are deployed.** The #38 merge says: "Required before any image built from this main is deployed: the migrations applied, with Khaliq's OK." With #96, a reader on generation `$GEN` is not ready until the ledger holds every schema step and the marker is `'pass'` for `$GEN`. Deploying first leaves `/readyz` at 503 and the worker claiming nothing. Migrating first flips any running #96+ reader to non-ready until it is replaced (6.4). Order: migrate (with OK), then deploy (with a separate OK), in one planned window. | #38 merge body; `src/shared/db.ts`; `src/shared/worker.ts`; `src/alleyoop/ingest.ts` |
-| B5 | Other activation blockers listed in the #38 merge: the #89 write-path issues; #74's `probes.ts:68` old 2-arg RPC check; #72's `worker_scope` token pins; the pointer and readiness consumer migration; Relay Desktop (UNOWNED). This dossier does not check their current status: unknown. | #38 merge body |
-| B6 | **Runtime role access to the ledger and marker.** No repo file grants `SELECT` on `sessions.__96bulls_migrations` or `sessions.__96bulls_role_validation` to the service role, and `migrate.ts` revokes PUBLIC on the marker. Unless the runtime role is the migrator, or otherwise has access (P13), the live gate fails with `42501`. Decide on the provisioning, which is a privilege change and needs its own OK. | `src/hoopdb/migrate.ts`; `src/shared/db.ts` |
-| B7 | **Locks.** Every index build is non-concurrent and inside a transaction, and there is no `lock_timeout`. If the directory or pipeline tables are populated (P14), `20261030020000`, `20261031000100` and `20261101000000` hold `ACCESS EXCLUSIVE` for unknown durations. Decide on a maintenance window or write fence, and on a session `lock_timeout` mechanism. The repo has none: unknown. | 6.1, 6.3 |
-| B8 | **Destructive non-G6 step.** `0004_summary_pointers.sql` runs `DELETE FROM sessions.session_summaries;` if unledgered. It needs explicit confirmation before any run that would include it. | 6.3 |
-| B9 | **Post-apply deployment steps that the migration does not do:** seeding `session_directory_search_token_policy` (the RPCs refuse every call until then), the `authenticator` binding and worker credential, and the rollout marker. Values and owners: unknown. | `20261030020000`; contract doc |
-| B10 | **Rollback limits.** No down for `20261030010000`. The downs leave ledger rows behind, and the repo has no procedure for re-applying after a down. The role is removed only by the separate superuser step. | 7 |
-| B11 | **Stale documentation to fix before activation** (docs only, not schema): (a) `docs/session-search-index-contract.md`, the "Caller" row of the search RPC table, still says "the migration's first statement creates the role … fails closed with `42710` … The down path drops the role it owns". Its "Rollback" bullet also says the down drops the "Worker role". Both contradict #96, where the migration never creates the role, failures are `42704` and `55000`, and the down never drops it. (b) The runbook ("Rehearsal databases") gives the new sha256 of `20261030020000` as `f86e5dc9...0d66`. The file at `28a8f0d` hashes to `c223b77e…5918de4`. | contract doc; runbook |
-| B12 | **Authorization for every step above, in Khaliq's own words:** the read-only audit (section 4 and R1/R2), phase 1, migrate, any external verifier run, any deploy, and the B6/B9 privilege and credential steps. | `AGENTS.md` |
+| #   | decision or blocker                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | source                                                                                                        |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| B1  | **The PG16+ path.** The server version is NOT OBSERVED. On 160000 or later, phase 1 refuses Supabase `postgres` (`42501`). Options are in 1.3: a superuser run through Supabase support, a reviewed spec change, or deferral. Each needs an explicit choice; the runbook says it is "not a step to work around."                                                                                                                                                                                                                                                                                                                                                                                                                                 | phase 1 SQL; runbook                                                                                          |
+| B2  | **#226 cutover before the contract revoke.** The expand migration revokes nothing. The contract migration (revoking direct SELECT on `session_directory`, `_users`, `_machines`, `session_index` and `session_directory_rollout` from `authenticated` and from the static reader's role) does not exist yet. It may be written and applied only after #226 cuts over behind a flag with shadow parity, and logs prove zero direct reads over an agreed window.                                                                                                                                                                                                                                                                                   | contract doc; `20261031001000` header                                                                         |
+| B3  | **Which migration runner and ledger the target uses.** `docs/relayhistory-t0-runbook.md` (A3) applies `supabase/migrations` with `scripts/sb db push` (Supabase CLI). That path writes no `sessions.__96bulls_migrations` ledger, runs neither phase 1 nor phase 2, and writes no marker, so no #96+ reader ever becomes ready. `migrate.ts` on a target built that way would try to reapply `20261025000000_sessions_index.sql` (`CREATE TABLE sessions.session_index` with no `IF NOT EXISTS`), and that fails. Separately, `migrate.ts` applies every unledgered file (rows 1 to 17), not just G6. A decision is needed on the runner and on how existing state is adopted into the ledger. The repo provides no adoption procedure: unknown. | T0 runbook; `migrate.ts`; `supabase/README.md` ("Nothing in this directory has been applied to any database") |
+| B4  | **Images built from `main` need these migrations applied before they are deployed.** The #38 merge says: "Required before any image built from this main is deployed: the migrations applied, with Khaliq's OK." With #96, a reader on generation `$GEN` is not ready until the ledger holds every schema step and the marker is `'pass'` for `$GEN`. Deploying first leaves `/readyz` at 503 and the worker claiming nothing. Migrating first flips any running #96+ reader to non-ready until it is replaced (6.4). Order: migrate (with OK), then deploy (with a separate OK), in one planned window.                                                                                                                                         | #38 merge body; `src/shared/db.ts`; `src/shared/worker.ts`; `src/alleyoop/ingest.ts`                          |
+| B5  | Other activation blockers listed in the #38 merge: the #89 write-path issues; #74's `probes.ts:68` old 2-arg RPC check; #72's `worker_scope` token pins; the pointer and readiness consumer migration; Relay Desktop (UNOWNED). This dossier does not check their current status: unknown.                                                                                                                                                                                                                                                                                                                                                                                                                                                       | #38 merge body                                                                                                |
+| B6  | **Runtime role access to the ledger and marker.** No repo file grants `SELECT` on `sessions.__96bulls_migrations` or `sessions.__96bulls_role_validation` to the service role, and `migrate.ts` revokes PUBLIC on the marker. Unless the runtime role is the migrator, or otherwise has access (P13), the live gate fails with `42501`. Draft PR #99 (head `6ce9066`, pending, not merged) adds that grant through `HOOPDB_RUNTIME_ROLE` and requires a dedicated runtime role in `supabase` mode. Until it merges, decide on the provisioning, which is a privilege change and needs its own OK. Either way, prove it with RT1 to RT5.                                                                                                          | `src/hoopdb/migrate.ts`; `src/shared/db.ts`                                                                   |
+| B7  | **Locks.** Every index build is non-concurrent and inside a transaction, and there is no `lock_timeout`. If the directory or pipeline tables are populated (P14), `20261030020000`, `20261031000100` and `20261101000000` hold `ACCESS EXCLUSIVE` for unknown durations. Decide on a maintenance window or write fence, and on a session `lock_timeout` mechanism. The repo has none: unknown.                                                                                                                                                                                                                                                                                                                                                   | 6.1, 6.3                                                                                                      |
+| B8  | **Destructive non-G6 step.** `0004_summary_pointers.sql` runs `DELETE FROM sessions.session_summaries;` if unledgered. It needs explicit confirmation before any run that would include it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 6.3                                                                                                           |
+| B9  | **Post-apply deployment steps that the migration does not do:** seeding `session_directory_search_token_policy` (the RPCs refuse every call until then), the `authenticator` binding and worker credential, and the rollout marker. Values and owners: unknown.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `20261030020000`; contract doc                                                                                |
+| B10 | **Rollback limits.** No down for `20261030010000`. The downs leave ledger rows behind, and the repo has no procedure for re-applying after a down. The role is removed only by the separate superuser step.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 7                                                                                                             |
+| B11 | **Stale documentation to fix before activation** (docs only, not schema): (a) `docs/session-search-index-contract.md`, the "Caller" row of the search RPC table, still says "the migration's first statement creates the role … fails closed with `42710` … The down path drops the role it owns". Its "Rollback" bullet also says the down drops the "Worker role". Both contradict #96, where the migration never creates the role, failures are `42704` and `55000`, and the down never drops it. (b) The runbook ("Rehearsal databases") gives the new sha256 of `20261030020000` as `f86e5dc9...0d66`. The file at `28a8f0d` hashes to `c223b77e…5918de4`. Draft PR #99 (pending) corrects the runbook value and pins it with a test.       | contract doc; runbook                                                                                         |
+| B12 | **Authorization for every step above, in Khaliq's own words:** the read-only audit (section 4, 4.1, RT1 to RT5, R1, R2, O1, S1 to S3), phase 1, migrate, any external verifier run, any deploy, and the B6/B9 privilege and credential steps.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `AGENTS.md`                                                                                                   |
+| B13 | **Readiness outage is NOT zero-downtime.** From the pending marker write until phase 2 passes, and until every reader runs the new generation, all ingest replicas and all workers are not ready at once. On top of that, the `ACCESS EXCLUSIVE` locks in 6.3 apply. The traffic impact depends on the orchestrator's readiness behavior (O1, NOT OBSERVED). Khaliq must accept an outage window or decide on a write hold.                                                                                                                                                                                                                                                                                                                      | 6.4                                                                                                           |
+| B14 | **Snapshot recovery decision.** 15 of the 17 files have no down file (7.1). Three of them destroy or rewrite data on a backlog run. PITR and backup availability are NOT OBSERVED (S1). Decide whether a fresh backup or a recorded PITR restore point (S2) is a precondition for the apply.                                                                                                                                                                                                                                                                                                                                                                                                                                                     | 7.1                                                                                                           |
 
 ## Review and validation of this document
 
 - Built only from the repository at `28a8f0d` (`git fetch`, then `git show --stat
-  9688d63e 28a8f0d` and `git log --first-parent` per file). No database connection, no
+9688d63e 28a8f0d` and `git log --first-parent` per file). No database connection, no
   `op`, no credential read, no deploy.
 - The sha256 values and the generation were computed offline from the repo files with
   the `generation()` algorithm. They must be reconfirmed with `bun src/hoopdb/migrate.ts
-  --generation` from the deploy image.
+--generation` from the deploy image.
 - PostgreSQL lock levels are the documented levels for each statement type. They were
   not observed on the target.
+- Revision 2, after helm-chart-chief's HOLD on `d5b0d9d`:
+  - per-file impact for all 17 migrations (6.3);
+  - a runtime-identity proof for the live validator (RT1 to RT5), with draft PR #99
+    referenced as pending;
+  - the readiness outage stated as NOT zero-downtime and orchestrator-dependent (6.4,
+    B13);
+  - forward-only and snapshot recovery for the 15 files with no down (7.1, B14);
+  - the exhaustive catalog grants audit (4.1);
+  - the index count corrected to 13;
+  - exact R1 and R2.
+    Formatted with the locked Prettier 3.9.10 (`--no-config`).
