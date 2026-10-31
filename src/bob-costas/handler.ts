@@ -51,23 +51,12 @@ export interface BobCostasDeps {
 export interface ShortSummaryDirectory {
   write(input: ShortSummaryInput): Promise<{ written: boolean }>;
   clear(key: SessionDirectoryKey): Promise<boolean>;
-  /** Whether the live directory row already holds a short summary. */
-  hasSummary(key: SessionDirectoryKey): Promise<boolean>;
 }
 
 export function sqlShortSummaryDirectory(db: HoopDb): ShortSummaryDirectory {
   return {
     write: (input) => writeShortSummary(db, input),
     clear: (key) => clearShortSummary(db, key),
-    async hasSummary(key) {
-      const { rows } = await db.query<{ present: boolean }>(
-        `SELECT true AS present FROM sessions.session_directory
-          WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4
-            AND deleted_at IS NULL AND short_summary IS NOT NULL`,
-        [key.orgId, key.workspaceId, key.harness, key.sessionId],
-      );
-      return rows.length > 0;
-    },
   };
 }
 
@@ -159,19 +148,40 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
     if (row && Number(row.revision) === m.revision && row.content_sha256 === m.raw.content_sha256 && (row.status !== "ready" || row.key_id === currentKeyId)) {
       // The encrypted object and pointer are current, but a previous run may have
       // failed after COMMIT and before the directory write. Reconcile the directory
-      // from the published object so a retry is idempotent.
+      // from the published object on every retry.
       if (kind === "short") {
         const directory = deps.directory ?? sqlShortSummaryDirectory(deps.db);
         const dirKey = { orgId: message.ctx.orgId, workspaceId: s.workspace_id, harness: s.harness, sessionId: s.session_id };
         if (row.status !== "ready") {
           await publishShortSummary(directory, dirKey, null, m.trace_id);
-        } else if (!(await directory.hasSummary(dirKey)) && row.object_key && row.object_sha256) {
-          const published = await readSummaryObject({
-            store: deps.store, keyring: deps.keyring, ids, key: row.object_key, sha256: row.object_sha256, kind, revision: m.revision,
-          });
-          if (published?.status === "ready" && published.summary && published.model)
-            await publishShortSummary(directory, dirKey,
-              { summary: published.summary, model: published.model, generatedAt: new Date(published.built_at) }, m.trace_id);
+        } else {
+          // Always authenticate and republish the current object, even when the row
+          // already holds a summary: it may be an older revision's text left behind by
+          // a failed write. writeShortSummary's generated_at fence makes this idempotent
+          // and never lets an older object replace a newer one.
+          // Integrity failures are permanent: clear first (no possibly stale text stays
+          // searchable), then fail non-retryably so the message goes to the DLQ instead
+          // of retrying forever.
+          const integrity = async (message: string): Promise<never> => {
+            await publishShortSummary(directory, dirKey, null, m.trace_id);
+            throw new PipelineError("summary_object_integrity", message, false);
+          };
+          if (!row.object_key || !row.object_sha256) await integrity("a ready short summary pointer has no object");
+          let published: SummaryRecord | null;
+          try {
+            published = await readSummaryObject({
+              store: deps.store, keyring: deps.keyring, ids, key: row.object_key!, sha256: row.object_sha256!, kind, revision: m.revision,
+            });
+          } catch (err) {
+            // A store or keyring error may be transient: clear, then let it retry as raised.
+            await publishShortSummary(directory, dirKey, null, m.trace_id);
+            throw err;
+          }
+          if (published?.status !== "ready" || !published.summary || !published.model) {
+            return await integrity("the current short summary object is missing or cannot be authenticated");
+          }
+          await publishShortSummary(directory, dirKey,
+            { summary: published.summary, model: published.model, generatedAt: new Date(published.built_at) }, m.trace_id);
         }
       }
       return { status: "skipped", reason: "summary_current" };
