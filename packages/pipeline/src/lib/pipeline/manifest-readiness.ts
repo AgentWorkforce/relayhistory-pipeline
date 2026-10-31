@@ -5,7 +5,11 @@
  * parse the fixture manifests, then records its build's `RELEASE_SHA`, signed
  * with a server key. Nobody can open the gate by editing configuration.
  */
-import { hmacSha256, toHex, utf8 } from "../../../../object-store/src/crypto.js";
+import {
+  hmacSha256,
+  toHex,
+  utf8,
+} from "../../../../object-store/src/crypto.js";
 import {
   MANIFEST_EPOCHS_CAPABILITY,
   computeContentSha256,
@@ -51,7 +55,10 @@ export interface ReadinessStore {
   put(row: ReadinessRow): Promise<void>;
 }
 
-async function mac(key: string, row: Omit<ReadinessRow, "hmac">): Promise<string> {
+async function mac(
+  key: string,
+  row: Omit<ReadinessRow, "hmac">,
+): Promise<string> {
   const text = JSON.stringify([
     row.reader,
     row.capability,
@@ -138,7 +145,13 @@ export async function selfCheckManifestEpochs(): Promise<void> {
     raw_sha256: hex("b"),
     compression: "zstd" as const,
   });
-  const epoch = (n: number, reason: ManifestV1["raw"]["epochs"][number]["reason"], first: number, by: string, resumes?: number) => ({
+  const epoch = (
+    n: number,
+    reason: ManifestV1["raw"]["epochs"][number]["reason"],
+    first: number,
+    by: string,
+    resumes?: number,
+  ) => ({
     epoch: n,
     opened_at: at,
     reason,
@@ -146,7 +159,11 @@ export async function selfCheckManifestEpochs(): Promise<void> {
     opened_by: by,
     ...(resumes === undefined ? {} : { resumes_epoch: resumes }),
   });
-  const session = (owner: string, epochs: ManifestV1["raw"]["epochs"], chunks: ReturnType<typeof chunk>[]) =>
+  const session = (
+    owner: string,
+    epochs: ManifestV1["raw"]["epochs"],
+    chunks: ReturnType<typeof chunk>[],
+  ) =>
     ({
       schema_v: 1,
       layout: "v1",
@@ -154,7 +171,13 @@ export async function selfCheckManifestEpochs(): Promise<void> {
       revision: 3,
       created_at: at,
       updated_at: at,
-      session: { workspace_id: "w", machine_id: "m", harness: "h", session_id: "s", started_at: at },
+      session: {
+        workspace_id: "w",
+        machine_id: "m",
+        harness: "h",
+        session_id: "s",
+        started_at: at,
+      },
       writer: { delivery_instance_id: owner, plugin_version: "self-check" },
       raw: {
         owner,
@@ -175,11 +198,17 @@ export async function selfCheckManifestEpochs(): Promise<void> {
   for (const manifest of [
     session(
       "client",
-      [epoch(0, "initial", 0, "client"), epoch(1, "backfill", 1, exporter), epoch(2, "resumed", 2, "client", 0)],
+      [
+        epoch(0, "initial", 0, "client"),
+        epoch(1, "backfill", 1, exporter),
+        epoch(2, "resumed", 2, "client", 0),
+      ],
       [chunk(0, 0, 0), chunk(1, 1, 0), chunk(2, 2, 10)],
     ),
   ]) {
-    manifest.raw.content_sha256 = await computeContentSha256(manifest.raw.chunks);
+    manifest.raw.content_sha256 = await computeContentSha256(
+      manifest.raw.chunks,
+    );
     await parseManifest(manifest);
   }
 }

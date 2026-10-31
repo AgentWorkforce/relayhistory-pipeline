@@ -84,7 +84,11 @@ interface ManifestRoutesDeps {
   /** Readers with no valid attestation. Absent means none are ready: fail closed. */
   missingReaders?: () => Promise<string[]>;
   /** Durable delayed requeue of a refused backfill. */
-  requeueBackfill?: (env: Bindings, message: StageMessage, delaySeconds: number) => Promise<void>;
+  requeueBackfill?: (
+    env: Bindings,
+    message: StageMessage,
+    delaySeconds: number,
+  ) => Promise<void>;
   /**
    * Single-use ledger for RelayAuth migration assertions (relayauth#110). For
    * a migration commit it replaces `send`: the ledger row, the enriched
@@ -183,7 +187,8 @@ const MACHINE_CLAIM = "meta.machineId";
 /** The machine a live token is bound to, from a signed claim. */
 function machineClaim(auth: Auth): string | undefined {
   const meta = auth.claims.meta;
-  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return undefined;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta))
+    return undefined;
   const value = (meta as Record<string, unknown>).machineId;
   return typeof value === "string" && value ? value : undefined;
 }
@@ -194,25 +199,40 @@ function machineClaim(auth: Auth): string | undefined {
  * `MANIFEST_MACHINE_CLAIM=required` flips after the issuer ships it. Migration
  * assertions are bound to a grant instead.
  */
-function machineClaimIssue(manifest: ManifestV1, auth: Auth, env: Bindings, required = false): string | undefined {
+function machineClaimIssue(
+  manifest: ManifestV1,
+  auth: Auth,
+  env: Bindings,
+  required = false,
+): string | undefined {
   if (auth.tokenSubject === MIGRATION_SUBJECT) return undefined;
   const claim = machineClaim(auth);
   if (claim === undefined) {
-    const strict = required || (env as Record<string, unknown>).MANIFEST_MACHINE_CLAIM === "required";
+    const strict =
+      required ||
+      (env as Record<string, unknown>).MANIFEST_MACHINE_CLAIM === "required";
     return strict ? `${MACHINE_CLAIM} is required` : undefined;
   }
-  return claim === manifest.session.machine_id && claim === manifest.writer.delivery_instance_id
+  return claim === manifest.session.machine_id &&
+    claim === manifest.writer.delivery_instance_id
     ? undefined
     : `${MACHINE_CLAIM} does not match the manifest`;
 }
 
 /** The session's writer and every reader must be ready for the new epochs. */
-async function activationIssue(existing: ManifestV1, incoming: ManifestV1, missing: () => Promise<string[]>): Promise<string | undefined> {
+async function activationIssue(
+  existing: ManifestV1,
+  incoming: ManifestV1,
+  missing: () => Promise<string[]>,
+): Promise<string | undefined> {
   const adds = incoming.raw.epochs.slice(existing.raw.epochs.length);
   if (!adds.some((epoch) => epoch.reason === "backfill")) return undefined;
-  if (!writerUnderstandsBackfill(existing)) return "the session's writer is not a known release";
+  if (!writerUnderstandsBackfill(existing))
+    return "the session's writer is not a known release";
   const readers = await missing();
-  return readers.length ? `readers are not attested: ${readers.join(", ")}` : undefined;
+  return readers.length
+    ? `readers are not attested: ${readers.join(", ")}`
+    : undefined;
 }
 
 function canonical(value: unknown): unknown {
@@ -380,13 +400,23 @@ function migrationReplayIssue(manifest: ManifestV1, auth: Auth): boolean {
 }
 
 /** Ids and keys only: the exporter holds the manifest and rebuilds it. */
-function activationMessage(key: string, manifest: ManifestV1, auth: Auth): StageMessage {
+function activationMessage(
+  key: string,
+  manifest: ManifestV1,
+  auth: Auth,
+): StageMessage {
   const grantId = (migrationWriter(auth) ?? "").slice("migration:".length);
-  const planDigest = String((auth.claims.meta as Record<string, unknown>).planDigest);
+  const planDigest = String(
+    (auth.claims.meta as Record<string, unknown>).planDigest,
+  );
   return {
     v: 1,
     stage: BACKFILL_ACTIVATION_STAGE,
-    ctx: { traceId: manifest.trace_id.replace(/-/g, ""), orgId: auth.orgId, workspaceId: manifest.session.workspace_id },
+    ctx: {
+      traceId: manifest.trace_id.replace(/-/g, ""),
+      orgId: auth.orgId,
+      workspaceId: manifest.session.workspace_id,
+    },
     workKey: backfillActivationWorkKey(key, grantId),
     revision: manifest.revision,
     payload: { manifestKey: key, grantId, planDigest, attempt: 1 },
@@ -768,7 +798,12 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       if (issue) return issue;
     }
     if (machineClaimIssue(manifest, auth, c.env ?? {}))
-      return responseError(c, 403, "machine_claim_refused", "the token is not bound to this machine and writer");
+      return responseError(
+        c,
+        403,
+        "machine_claim_refused",
+        "the token is not bound to this machine and writer",
+      );
     const encoded = new TextEncoder().encode(JSON.stringify(manifest));
     const encodedText = new TextDecoder().decode(encoded);
     if (encoded.byteLength > MAX_MANIFEST_BYTES)
@@ -845,11 +880,21 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
             "owner_conflict",
             "manifest owner or append fence does not match",
           );
-        const inactive = await activationIssue(existing.manifest, manifest, deps.missingReaders ?? (async () => ["unconfigured"]));
+        const inactive = await activationIssue(
+          existing.manifest,
+          manifest,
+          deps.missingReaders ?? (async () => ["unconfigured"]),
+        );
         if (inactive) {
-          const limits = backfillActivationLimits((c.env ?? {}) as Record<string, unknown>);
+          const limits = backfillActivationLimits(
+            (c.env ?? {}) as Record<string, unknown>,
+          );
           const delay = backfillActivationDelay(1, limits);
-          await deps.requeueBackfill?.(c.env ?? {}, activationMessage(key, manifest, c.get("auth") as Auth), delay);
+          await deps.requeueBackfill?.(
+            c.env ?? {},
+            activationMessage(key, manifest, c.get("auth") as Auth),
+            delay,
+          );
           c.header("Retry-After", String(delay));
           return responseError(c, 409, "activation_required", inactive);
         }
@@ -995,16 +1040,24 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         if (issue) return issue;
       }
       const machine = c.req.query("machine");
-      if (machine !== stored.manifest.session.machine_id) return c.body(null, 403);
+      if (machine !== stored.manifest.session.machine_id)
+        return c.body(null, 403);
       // The full manifest needs a verified machine claim, never the query's
       // word for it. Without one this stays the version-only, writer-scoped form.
-      const bound = c.req.query("manifest") === "1" && machineClaim(auth) === machine;
-      if (!bound && c.req.query("writer") !== stored.manifest.writer.delivery_instance_id)
+      const bound =
+        c.req.query("manifest") === "1" && machineClaim(auth) === machine;
+      if (
+        !bound &&
+        c.req.query("writer") !== stored.manifest.writer.delivery_instance_id
+      )
         return c.body(null, 403);
-      return c.json({
-        version: stored.version,
-        ...(bound ? { manifest: stored.manifest } : {}),
-      }, 200);
+      return c.json(
+        {
+          version: stored.version,
+          ...(bound ? { manifest: stored.manifest } : {}),
+        },
+        200,
+      );
     } catch {
       return c.body(null, 503);
     }

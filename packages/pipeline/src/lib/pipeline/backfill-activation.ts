@@ -24,7 +24,10 @@ export interface BackfillActivationPayload {
 }
 
 /** One item per manifest and grant: repeated refusals share a work key. */
-export function backfillActivationWorkKey(manifestKey: string, grantId: string) {
+export function backfillActivationWorkKey(
+  manifestKey: string,
+  grantId: string,
+) {
   return `${BACKFILL_ACTIVATION_STAGE}:${manifestKey}:${grantId}`;
 }
 

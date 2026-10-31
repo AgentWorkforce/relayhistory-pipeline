@@ -276,15 +276,16 @@ type ChunkWithSource = ChunkEntry & { source_end?: unknown; source_origin?: unkn
  * Where this client's source resumes. `jsonl`: a file offset, `start_offset`.
  * `ndjson`: a feed revision, recorded per chunk as `source_end` beside its
  * `source_origin`, because `start_offset` is then an offset in the stream. A
- * feed whose epoch moved has no position in the stored chunks and resumes at 0
- * under its new origin. `undefined` when the chunks do not say.
+ * feed whose epoch moved has no position in the stored chunks,
+ * and is held, not resumed: see `feed_epoch_moved`. `undefined` when the chunks
+ * do not say.
  */
-export function sourceResumeOffset(manifest: ManifestV1, origin?: string): number | undefined {
+export function sourceResumeOffset(manifest: ManifestV1): number | undefined {
   if (manifest.raw.format !== "ndjson") return liveNextOffset(manifest.raw);
   const tail = chunkKeys(manifest, { currentEpochOnly: true }).at(-1)?.entry as ChunkWithSource | undefined;
   if (!tail) return 0;
   if (typeof tail.source_end !== "number" || typeof tail.source_origin !== "string") return undefined;
-  return tail.source_origin === origin ? tail.source_end : 0;
+  return tail.source_end;
 }
 
 /** A condition a person must see; the courier keeps going. */
@@ -330,10 +331,12 @@ async function rebaseSession(cfg: CourierConfig, machineId: string, session: Ses
   if ((await validateManifest(body.manifest, mKey)).length > 0) return "defer";
   const origin = feedOrigin(cfg.dbPath);
   if (body.manifest.raw.owner !== machineId) return "fenced";
-  const offset = sourceResumeOffset(body.manifest, origin);
+  const offset = sourceResumeOffset(body.manifest);
   if (offset === undefined) return "fenced";
   adoptManifest(session, body.manifest, body.version, offset);
-  session.feed_origin = origin;
+  const tail = chunkKeys(body.manifest, { currentEpochOnly: true }).at(-1)?.entry as ChunkWithSource | undefined;
+  // What the stored chunks say, not this store's: a moved epoch must be seen.
+  session.feed_origin = typeof tail?.source_origin === "string" ? tail.source_origin : origin;
   return "rebased";
 }
 
@@ -449,11 +452,13 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
             continue;
           }
           if (session.feed_origin && session.feed_origin !== feed.origin) {
-            // A rebuilt store renumbers its feed: its records share no identity
-            // with what was sent, so they are sent again, and a person must know.
+            // A rebuilt store renumbers its feed but keeps its record ids. The
+            // same record under two origins has no order the transform can
+            // settle, and fails the session for good, so nothing is sent: the
+            // session holds here until a person decides.
             conditions.push({ type: "feed_epoch_moved", session_uuid: session.session_uuid, from: session.feed_origin, to: feed.origin });
-            log.warn("change feed epoch moved; re-sending under the new origin", { session_uuid: session.session_uuid, trace_id: session.trace_id, condition: "feed_epoch_moved" });
-            session.uploaded_offset = 0;
+            log.warn("change feed epoch moved; holding this session", { session_uuid: session.session_uuid, trace_id: session.trace_id, condition: "feed_epoch_moved" });
+            continue;
           }
           session.feed_origin = feed.origin;
           const after = session.uploaded_offset;
