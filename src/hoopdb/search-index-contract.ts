@@ -603,7 +603,7 @@ function normalizedPredicate(value: string | null | undefined): string {
   const literals: string[] = [];
   let masked = "";
   const input = value ?? "";
-  for (let index = 0; index < input.length; ) {
+  for (let index = 0; index < input.length;) {
     if (input[index] !== "'") {
       masked += input[index];
       index += 1;

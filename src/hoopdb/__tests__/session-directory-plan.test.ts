@@ -110,8 +110,7 @@ async function explain(
     params,
   );
   const envelope = result.rows[0]?.["QUERY PLAN"] as
-    | Array<{ Plan: Plan }>
-    | undefined;
+    Array<{ Plan: Plan }> | undefined;
   if (!envelope?.[0]?.Plan) throw new Error("PostgreSQL returned no JSON plan");
   return envelope[0].Plan;
 }
