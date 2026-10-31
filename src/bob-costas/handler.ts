@@ -97,8 +97,8 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
     const m = read.manifest;
     const s = m.session;
     const pk = [message.ctx.orgId, s.workspace_id, s.harness, s.session_id, s.machine_id];
-    const existing = await deps.db.query<{ content_sha256: string; revision: string; status: string; key_id: string | null }>(
-      `SELECT content_sha256, revision, status, key_id FROM sessions.session_summaries
+    const existing = await deps.db.query<{ content_sha256: string; revision: string; status: string; key_id: string | null; object_key: string | null }>(
+      `SELECT content_sha256, revision, status, key_id, object_key FROM sessions.session_summaries
         WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
       [...pk, kind],
     );
@@ -106,9 +106,12 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
     if (row && Number(row.revision) > m.revision) return { status: "skipped", reason: "stale_revision" };
     const ids = { orgId: message.ctx.orgId, workspaceId: s.workspace_id };
     // Current only if it is the same revision and content and, when ready, under the current key
-    // (after a rotation the summary is re-encrypted rather than stranded on the old key).
+    // (after a rotation the summary is re-encrypted rather than stranded on the old key) and at
+    // the object key beside this manifest (a session moved under a prefix is rebuilt there).
     const currentKeyId = (await deps.keyring.currentKey(ids)).keyId;
-    if (row && Number(row.revision) === m.revision && row.content_sha256 === m.raw.content_sha256 && (row.status !== "ready" || row.key_id === currentKeyId))
+    const expectedKey = summaryObjectKey(sessionLocation(m, pointer.manifestKey), kind);
+    if (row && Number(row.revision) === m.revision && row.content_sha256 === m.raw.content_sha256 &&
+      (row.status !== "ready" || (row.key_id === currentKeyId && row.object_key === expectedKey)))
       return { status: "skipped", reason: "summary_current" };
 
     const outcome = await buildOutcome(kind, m, deps, pointer.manifestKey);
