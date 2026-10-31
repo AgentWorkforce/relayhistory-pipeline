@@ -225,7 +225,7 @@ async function gate3Parts() {
   const tableDir = await ch(`SELECT data_paths[1] FROM system.tables WHERE database = currentDatabase() AND name = '${table}'`);
   const script = `cd '${tableDir}' && find . -type f | while read f; do
     if grep -qaE 'secretpart' "$f"; then echo "raw $f"; fi
-    case "$f" in *skp_idx*) if ${compressor} -d < "$f" 2>/dev/null | grep -qaE 'secretpart'; then echo "decompressed $f"; fi;; esac
+    case "$f" in *.bin|*skp_idx*) if ${compressor} -d < "$f" 2>/dev/null | grep -qaE 'secretpart'; then echo "decompressed $f"; fi;; esac
   done`;
   const scan = () => { const r = beside(script); return r.ok ? r.stdout.split("\n").filter(Boolean) : null; };
   const active = async () => JSON.parse((await ch(`SELECT groupArray(name) FROM system.parts WHERE table = '${table}' AND active FORMAT JSONEachRow`)).split("\n")[0]!.replace(/^{"groupArray\(name\)":/, "").replace(/}$/, "")) as string[];

@@ -53,6 +53,9 @@ no schema, version or deployment exists.
 26.8 with the corpus's events. It is not comparable with the Postgres arms: it answers
 store-design questions, and says nothing about ObsessionDB.
 
+`clickhouse-replicated-purge.ts` times gate 3 on two local replicas at default cleanup.
+It needs both data directories on one host, so it runs by hand, not in CI.
+
 Lane A rows do not compare directly on recall. Neon briefs exist only for sessions with
 a summary, so Neon's Lane A recall mostly restates `summaryReadyShare`, an assumption.
 
