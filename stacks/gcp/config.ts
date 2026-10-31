@@ -600,10 +600,12 @@ function requireRelayhistoryOrigin(label: string, value: string): void {
     !hostname.endsWith(".localhost") &&
     !hostname.endsWith(".local") &&
     isIP(hostname) === 0;
+  const canonical = value.replace(/\/$/, "").toLowerCase() === origin.origin;
   if (
     origin.username ||
     origin.password ||
     (!inCluster && !publicHttps) ||
+    !canonical ||
     origin.pathname !== "/" ||
     origin.search ||
     origin.hash

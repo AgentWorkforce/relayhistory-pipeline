@@ -200,6 +200,7 @@ describe("GCP self-host contract", () => {
       "http://user:password@bulls96-alleyoop.96bulls.svc:8080",
       "http://attacker.example",
       "https://history.example.com/path",
+      "https://history.example.com:443",
     ])
       expect(() =>
         assertGcpInputs("gcp-dev", {
