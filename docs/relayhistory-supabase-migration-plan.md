@@ -18,6 +18,12 @@ today's stack (a Cloudflare Worker on Neon) to the 96Bulls pipeline:
 write switch until new sessions are transcript-searchable on ObsessionDB.**
 
 - K-28 makes ObsessionDB the **intended** store. It is **conditional** on the ObsessionDB evidence gate (G-T0E, section 6).
+- K-39 takes it **off the hot path**. Hosted search merges a Postgres
+  adapter, holding a bounded recent transcript window in Supabase, with a
+  store-agnostic history adapter for full history. The candidates are
+  ObsessionDB (intended, conditional), ClickHouse Cloud and Amazon
+  OpenSearch Service (K-40). When the
+  latter fails, results are labelled partial rather than failing.
 - K-33 placed it in AWS `us-east-1`.
 - K-34, narrowed by K-36 ("No embeddings pre-T0"), adds the dashboard's ranked search to the same gate, as keyword ranking over ObsessionDB full-text. There are no vector pools before T0.
 
@@ -55,12 +61,14 @@ cutover.
 | 2026-10-31 | K-36 | "No embeddings pre-T0" | Khaliq, lead session (final ruling). **helm-chart-chief now records it as directly approved.** | **Supersedes K-34 as written.** G-T8 becomes keyword-ranked dashboard search on ObsessionDB full-text over complete transcripts, with **no vector pools before T0**. The nDCG@10 benchmark against legacy hybrid stays as the gate. If it shows a real loss, embeddings come back as a follow-up decision (section 17). Embedding versioning, K-35, Q19 and Q20 move to section 17. |
 | 2026-10-31 | K-37 | Synthetic trials approved: **ClickHouse Cloud with a $50 hard cap**, and the **ObsessionDB free dev service (eu-central, functional testing only)** | Khaliq, direct approval, confirmed 2026-10-31 | Synthetic data only. **A trial approval is not production provisioning approval** (K-29 stays separate). Trial results feed G-T0E. ObsessionDB's dev service is outside `us-east-1`, so it cannot prove performance or region. |
 | 2026-10-31 | K-38 | Counts-only, read-only shape extraction from production is approved; **no corpus movement** | Khaliq, direct approval, confirmed 2026-10-31 | Allows aggregate counts and sizes (per-org session/event counts, size distributions, table sizes) to answer Q7, Q9 and Q11 and to shape the synthetic corpus. No content, query text or identifiers leave production. |
+| 2026-10-31 | K-39 | "ObsessionDB off the hot path" | Khaliq, direct, lead session | Restructures search (section 6, "Search architecture").<br>- S3 is the source of truth, and ObsessionDB is a derived, rebuildable index fed by an async indexer. Ingest never waits on it.<br>- One search interface with two adapters. The Postgres adapter is the self-host default; on hosted it serves a **bounded recent window** of transcript text in Supabase (trigram/FTS) plus metadata and summary search. The ObsessionDB adapter (any ClickHouse-protocol store) serves full history.<br>- Hosted search queries both and merges. ObsessionDB gets a roughly 1-2 s budget. On its error or timeout, the response returns the Postgres results labelled "partial: older history unavailable": never an unlabelled empty result, and never a 5xx for that case.<br>- Recent-window freshness no longer depends on the indexer.<br>- This lowers the stakes of the conditional K-28.<br>- A draft amendment to 0002 is in this PR, and the Supabase disk sizing for the window is folded into K-32. |
+| 2026-10-31 | K-40 | **Amazon OpenSearch Service is a third candidate** for the full-history transcript index, alongside ObsessionDB (conditional, K-28) and ClickHouse Cloud (trial, K-37). A **synthetic-only OpenSearch trial is approved in the proof account 500268966557 / `us-west-2`, about $50 cap.** | Khaliq, direct, 2026-10-31 | The store is decided by the same benchmark and evidence gate for every candidate: G-T0E is generalised (section 6). OpenSearch is expected to score E4, E5 and E6 through AWS VPC, IAM and compliance, and to be weaker on the cost of substring indexing (E1). The history adapter interface is **store-agnostic**, not just ClickHouse-protocol. A trial is not production provisioning. |
 | 2026-10-31 | K-22 | "Forward-only after flip" | Khaliq, lead session, relayed by the coordinator | Option R2 (section 11). T0 can be aborted up to the flip. After the flip there is no data rollback to Neon, and no reverse-sync (G-V) is built. |
 
 **Relay status.** helm-chart-chief records relayed rulings as **PROPOSED**
 until Khaliq confirms them in its own session.
 - **Confirmed directly (2026-10-31):** K-28 (restated as conditional), K-36,
-  K-37 and K-38.
+  K-37, K-38, K-39 and K-40.
 - The other rows were relayed by the coordinator from Khaliq's lead
   session. They stay proposed in that sense until helm-chart-chief records
   them as confirmed.
@@ -78,12 +86,23 @@ every step in section 15 still needs its own OK.
    Supabase holds only the index, directory and summaries, plus a small set
    of legacy state tables. There is no Neon logical replication, and no
    content table is copied into Supabase.
-2. **Transcript search comes first (K-27).** T0 waits until the
-   ObsessionDB feed (AWS `us-east-1`) is live and new sessions are
-   transcript-searchable on it, with parity to legacy MCP search. The
-   dashboard's ranked search must also work on it, keyword-ranked with no
-   embeddings before T0 (K-36) (gate G-T, section 6). Pre-T0 history is served from the frozen Neon T0 child branch
-   (K-6). Results across T0 are merged by a written spec.
+2. **Transcript search comes first (K-27), structured by K-39.** There is one
+   search interface with two adapters:
+   - **Postgres (Supabase):** a bounded recent window of transcript text,
+     plus metadata and summary search. It is fed in the pipeline, so its
+     freshness does not depend on the history indexer.
+   - **History store, store-agnostic:** full history. The candidates are
+     ObsessionDB (intended, K-28 conditional), ClickHouse Cloud and Amazon
+     OpenSearch Service (K-40). The choice is made by one benchmark and
+     evidence gate (G-T0E). An async indexer fills it from S3, and ingest never waits
+     on it.
+
+   Hosted search queries both and merges them. If the history store errors
+   or exceeds its roughly 1-2 s budget, the response returns the Postgres
+   results labelled "partial: older history unavailable". Pre-T0 history is
+   served from the frozen Neon T0 child branch (K-6) until it is loaded.
+   The dashboard's ranked search is keyword-only before T0 (K-36). Gate
+   G-T, section 6.
 3. **Per-tenant phases happen around a single write flip** (section 7):
    - **Before T0, per tenant:** export a rehearsal snapshot of the internal
      orgs to a staging Supabase project and staging bucket, and check parity
@@ -94,19 +113,19 @@ every step in section 15 still needs its own OK.
      fallback and enabling V1 search, one wave at a time. Each wave has its
      own rollback.
 4. **Critical-path gates**, in order:
-   0. **G-T: transcript search for new sessions is live on ObsessionDB**
-      (`us-east-1`). That covers:
-      - the ingest feed;
-      - `search_shared_sessions` excerpts;
-      - the `get_shared_session_context` in-session window;
+   0. **G-T: transcript search for new sessions is live**, on the K-39
+      shape. That covers:
+      - the Postgres recent-window adapter;
+      - the async indexer into the chosen history store (store-agnostic adapter; G-T0E picks among ObsessionDB, ClickHouse Cloud and OpenSearch);
+      - the merge with labelled-partial fallback;
+      - MCP excerpts and the in-session window;
       - recall parity;
-      - **keyword-ranked dashboard search** on ObsessionDB full-text over
-        complete transcripts, gated by nDCG@10 against legacy hybrid
-        (K-34 as narrowed by K-36: no embeddings before T0);
-      - the cross-T0 merge, ordering and dedup spec (section 6).
+      - keyword-ranked dashboard search (K-36);
+      - the cross-T0 spec.
 
-      This is the longest pole. The 0001 amendment is drafted here but not
-      yet merged. No ObsessionDB benchmark has run.
+      This is the longest pole. Two items are still to decide: the window
+      length, which waits on the K-38 counts, and the 0001 and 0002
+      amendments, both drafted here and not merged.
    1. SEC-01 is fixed in production: cloud #5886 has been promoted and
       deployed, and the deployed SHA is verified.
    2. The production S3 bucket, per-workspace KMS keys (P9) and the Worker's
@@ -166,6 +185,10 @@ must hold transcript text for every post-T0 session, and eventually for
 exported history. No embeddings before T0 (K-36). Size that
 store from the same measurement (Q16).
 
+The **Supabase recent window** (K-39) holds bounded transcript text in
+Supabase. Its size depends on the window length chosen (section 6, window
+sizing) and is folded into K-32.
+
 ---
 
 ## 2. Target architecture
@@ -198,7 +221,7 @@ store from the same measurement (Q16).
 | Worker to Supabase | Direct TCP through Supavisor (relayhistory-cloud #225), one client per request. Metadata reads go through PostgREST (#226). Hyperdrive only if the benchmark justifies it. | `docs/relayhistory-supabase-migration.md` |
 | Worker to S3 | The S3 API with `PIPELINE_RAW_S3_{ENDPOINT,REGION,BUCKET,ACCESS_KEY_ID,SECRET_ACCESS_KEY,SSE}`. A Worker cannot use IAM roles, so this is a long-lived IAM access key. Security gate S5 covers it. | relayhistory-cloud `lib/pipeline/adapter.ts` |
 | Auth | Hosted RelayAuth (cloud `packages/relayauth`, Cloudflare Worker + D1), `@relayauth/server` 0.2.35 on cloud `trunk` (#5886). A **separate** search issuer and key (relayauth #116, draft). Supabase trusts only that issuer for `session_directory_search_worker`. | #63, #72, #73, relayauth #116 |
-| Transcript search, post-T0 sessions | **ObsessionDB, intended and conditional on G-T0E (K-28), in AWS `us-east-1` (K-33)**, loaded from the pipeline's normalized S3 objects. It serves lexical transcript search and keyword-ranked dashboard search over complete transcripts (K-34 as narrowed by K-36: no vector pools before T0), and must be live before T0 (K-27, G-T). 0001 is amended (drafted in this PR) to add it to the production data plane. Proof service: `relay-transcript-proof`, `us-west-2`. Unknowns: hosting model and account (Q21). | relayhistory-cloud #233 (draft; no benchmark has run) |
+| Transcript search: one interface, two adapters (K-39) | **Postgres adapter.** On hosted it uses Supabase `sessions`: a **bounded recent window** of scrubbed transcript text with trigram and FTS indexes, plus `session_directory` metadata and summary search. On self-host it is the default, with an unbounded window. **History adapter:** store-agnostic interface. The candidates are ObsessionDB (intended, K-28, conditional), ClickHouse Cloud, and Amazon OpenSearch Service (K-40), chosen by G-T0E, in AWS `us-east-1` (K-33). It holds full history and is fed by an **async indexer** from S3 normalized objects; ingest never waits on it. Hosted search queries both and merges, and gives the history store a roughly 1-2 s budget, falling back to labelled partial results. Proof service: `relay-transcript-proof`, `us-west-2`. Open: hosting and account (Q21). | K-39; 0002 Amendment 1 (draft) |
 | Transcript search, pre-T0 sessions | Legacy `ILIKE`/trigram, run on the frozen T0 child branch (K-6) | 0002; #226 currently fails it closed, which G3 must change |
 | Neon after T0 | `sessions` is fenced read-only. A child branch at the T0 LSN serves bounded fallback reads and the export. Cloud's `public` schema stays on Neon, so "Neon retirement" (A10) means retiring the `sessions` schema, **not** deleting the project. | switch-first I6 |
 
@@ -283,15 +306,72 @@ hold.
 **Decisions.**
 - **K-27** (2026-10-31, "Transcript search before T0"): no T0 write switch
   until new sessions are transcript-searchable on ClickHouse or ObsessionDB.
-  K-28 then made ObsessionDB the intended store, conditional on G-T0E.
+  K-28 then made ObsessionDB the intended store, conditional on G-T0E. K-40 added Amazon OpenSearch Service as a candidate on the same gate.
 - **K-6** (2026-10-31, "Serve old sessions from T0 branch"): pre-T0 history
   is served by legacy transcript search on the frozen Neon T0 child branch.
 
+- **K-39** (2026-10-31, "ObsessionDB off the hot path"): one interface,
+  two adapters, and labelled partial fallback (below).
+
 So after T0:
-- post-T0 sessions are searched on the new store;
-- pre-T0 sessions are searched on the child branch, until each has been
-  exported and loaded into the new store;
-- V1 (Supabase) covers metadata and short_summary for everything.
+- **Recent post-T0 sessions:** searched in the Supabase recent window.
+- **Full history:** searched in the chosen history store.
+- **Pre-T0 sessions:** searched on the child branch until loaded.
+- **Metadata and short_summary:** V1, for everything.
+
+### Search architecture (K-39)
+
+```
+ ingest → S3 (source of truth) ─┬─ pipeline stage ─► Supabase recent window (trigram/FTS, bounded)  ← Postgres adapter
+                                └─ async indexer ──► history store (full history; store-agnostic)  ← history adapter
+ query → search interface ─┬─ Postgres adapter (recent window + metadata/summary) ─┐
+                           ├─ history adapter (budget ~1-2 s)                       ├─► merge (G-T5) ─► response (+ partial label)
+                           └─ Neon T0 child (pre-T0, until loaded; K-6)             ┘
+```
+
+- **The hot path is ingest → S3 → recent window.** The history indexer is
+  asynchronous, so its lag or outage never blocks ingest and never delays
+  recent-window freshness.
+- **The recent window** is fed by a pipeline stage from the same normalized
+  objects, idempotent by content hash. It holds scrubbed event text with a
+  4 KB-per-event prefix for legacy parity *(proposed)*, and only within the
+  window. A daily retention job deletes rows older than the window.
+  Tombstones and resets delete immediately. RLS applies, there are no
+  embeddings, and erasure follows the 0002 Amendment 1 rules.
+- **Store-agnostic history adapter (K-39, K-40):** one interface, defined
+  by the search contract (section 6, items 1 to 9), not by any wire
+  protocol. It covers query by org and workspace scope, keyword and
+  substring match, excerpts, a composite cursor, tombstone deletes and bulk
+  rebuild.
+  - The implementations are a ClickHouse-protocol driver (ObsessionDB,
+    ClickHouse Cloud or self-run ClickHouse) and an OpenSearch driver.
+  - The candidate that passes G-T0E is what gets provisioned. Losing a
+    vendor changes a driver, not the design.
+- **Self-host:** the Postgres adapter with an unbounded window is the
+  default. The history adapter is optional.
+
+### Recent-window sizing (input to K-32; the window length is decided after K-38)
+
+Window size ≈ (scrubbed text bytes per day, 4 KB-per-event prefix) × days ×
+(1 + index overhead). Trigram GIN plus FTS overhead is typically 1.5-3× the
+text; measure it on the phase 2 snapshot.
+
+The per-day bytes come from the K-38 counts-only extraction: an aggregate
+of `sum(least(octet_length(content), 4096))` and the event count per day
+for the last 30 days, per org and in total. Only aggregates leave
+production.
+
+| Option | Text | With indexes (1.5-3×) | Notes |
+| --- | --- | --- | --- |
+| 7 days | 7 × D | 17.5-30 × D | smallest disk; more queries depend on the history store |
+| **14 days (proposed default)** | 14 × D | 35-60 × D | covers two working weeks |
+| 30 days | 30 × D | 75-120 × D | matches legacy's 30-day keyword-pool window (`KEYWORD_POOL_WINDOW_MS`), so parity is easiest |
+
+D, the bytes per day, is **unknown until K-38 runs**. Khaliq picks the
+window from this table once D is filled in (K-42). The Supabase disk
+(K-32) is then sized as window size + metadata + copy set + 50% headroom.
+
+
 
 Earlier options T1 (fail closed), T2 alone (post-T0 sessions metadata-only) and T4
 are rejected. T3 (delay T0 until V2) is in effect for post-T0 content.
@@ -352,86 +432,102 @@ proven on the phase 2 snapshot and with the live-protocol writer.
 
 | # | Requirement | Exit evidence |
 | --- | --- | --- |
-| G-T0 | **Store: ObsessionDB, intended and conditional (K-28), AWS `us-east-1` (K-33).** It is confirmed only when **G-T0E** (below) passes. Also required: the 0001 amendment merged, and hosting and account settled (Q21). | G-T0E evidence pack reviewed. Khaliq confirms ObsessionDB in his own words. #233 updated. |
-| G-T1 | **Ingest feed.** Pipeline normalized objects (the file-normalize / E4 transform stage) load into the store per session revision. It is idempotent by content hash, handles tombstones and resets, and has its own queue, DLQ and replay. It is enabled in production before T0 so the first post-T0 write is indexed (K-30). | Feed tests. Replay from S3 rebuilds the store. Freshness within the section 10 SLO on the live-protocol writer. |
+| G-T0 | **History store: store-agnostic (K-39, K-40).** The candidates are ObsessionDB (intended, conditional, K-28), ClickHouse Cloud and Amazon OpenSearch Service, all in AWS `us-east-1` for production (K-33). The choice is made by **G-T0E** and section 10, applied the same way to every candidate. The 0001 and 0002 amendments are merged. | G-T0E evidence pack per candidate; Khaliq chooses and confirms the store; #233 updated |
+| G-T1 | **Async history indexer.** Pipeline normalized objects (the file-normalize / E4 stage) load into the history store per session revision, **off the hot path**: ingest never waits on it. It is idempotent by content hash, handles tombstones and resets, and has its own queue, DLQ and replay. Enabled before T0 (K-30). | Feed tests; replay from S3 rebuilds the store; indexer lag within SLO row 8b; an ingest test proves no ingest latency change when the indexer is stopped |
+| G-T1R | **Recent-window writer and adapter (K-39).** A pipeline stage writes scrubbed event text into the Supabase recent window (trigram/FTS), with the daily retention job and immediate tombstone/reset deletes. The Postgres adapter serves it plus metadata and summary search. | Migration plus RLS tests; retention-job tests; freshness within SLO row 8a with the history indexer stopped |
+| G-T1M | **Merge and labelled fallback (K-39).** Hosted queries both adapters (and the T0 child for pre-T0). The history adapter has a hard budget of about 1-2 s *(1.5 s proposed)*. On its error or timeout, the response returns the Postgres results labelled "partial: older history unavailable": never an unlabelled empty result, and never a 5xx for that case. | Fault-injection tests (history store down, slow, erroring) and SLO rows 14 and 15 |
 | G-T2 | **`search_shared_sessions` parity.** Same request contract: query length 1-500, filters, cursor, limit ≤20. Same response: event excerpts (`max_content`), `citation_url`, newest-first order. Same workspace confirmation that Cloud enforces. | The Cloud MCP contract tests pass unchanged against the new backend |
-| G-T3 | **`get_shared_session_context` in-session window.** Find the latest match inside one session, then return the event window around it, for post-T0 sessions (store plus S3 read path). | Contract tests; window equality against legacy on the snapshot |
+| G-T3 | **`get_shared_session_context` in-session window.** For post-T0 sessions it reads that session's S3 objects and filters in the service, one session at a time (0002's surface table), so it **does not depend on the history store**. For pre-T0 sessions it uses the child branch. | Contract tests; window equality against legacy on the snapshot |
 | G-T4 | **Recall parity** against legacy on the frozen snapshot | The section 10 recall thresholds |
-| G-T5 | **Cross-T0 merge, ordering and dedup spec**, written, reviewed and implemented (below) | Spec doc plus tests for straddling sessions, duplicate hits, paging across sources and one-source failure |
+| G-T5 | **Merge, ordering and dedup spec across adapters and T0**, written, reviewed and implemented (below) | Spec doc plus tests for straddling sessions, duplicate hits, paging across sources and one-source failure |
 | G-T6 | **Isolation and erasure.** Per-org isolation proven with planted canaries. Tombstone and reset propagation. Erasure semantics recorded (0002 open item; per-workspace encryption if the store supports it). | Zero cross-tenant rows; tombstone tests |
-| G-T7 | **Recall consumers.** The memory-pack lexical and `files_touched` pools read ObsessionDB for post-T0 sessions. | Consumer tests |
-| G-T8 | **Dashboard ranked search, keyword only (K-34 as narrowed by K-36).** `sessions?q=&ranking=hybrid` is served on the new stack for post-T0 sessions by ObsessionDB full-text over **complete transcripts**, not only the 4 KB prefix. It fuses the remaining legacy keyword pools (`event_keyword`, `brief_keyword`) per the serving contract, with snippets ≤ 320 chars. There are **no vector pools before T0**. The response says which pools were offered, so the missing semantic pools are not reported as a failure. | Hybrid benchmark lane (section 10, SLO rows 12 and 13) **against legacy hybrid, semantic pools included**; the dashboard read-API contract tests pass |
+| G-T7 | **Recall consumers.** The memory-pack lexical and `files_touched` pools go through the search interface: recent window plus history adapter. | Consumer tests |
+| G-T8 | **Dashboard ranked search, keyword only (K-34 as narrowed by K-36).** `sessions?q=&ranking=hybrid` is served on the new stack for post-T0 sessions through the search interface: the recent window (Postgres trigram/FTS) merged with the history store's full-text over **complete transcripts**, with the same partial fallback. It fuses the remaining legacy keyword pools (`event_keyword`, `brief_keyword`) per the serving contract, with snippets ≤ 320 chars. There are **no vector pools before T0**. The response says which pools were offered, so the missing semantic pools are not reported as a failure. | Hybrid benchmark lane (section 10, SLO rows 12 and 13) **against legacy hybrid, semantic pools included**; the dashboard read-API contract tests pass |
 
-### Gate G-T0E: ObsessionDB capability and security evidence (before K-29)
+### Gate G-T0E: history-store capability and security evidence, for every candidate (before K-29)
 
-ObsessionDB is confirmed as the production store only when every item has
-evidence. If any item fails, the store choice goes back to Khaliq.
+The full-history store is chosen only from candidates with evidence for
+every item. The same benchmark (section 10) and the same evidence items
+apply to each one. If no candidate passes, the choice goes back to Khaliq.
+ObsessionDB is the intended choice (K-28), but it is confirmed only through
+this gate.
 
-Trials (K-37) use synthetic data only:
-- **ObsessionDB free dev service (eu-central):** functional checks only.
-- **ClickHouse Cloud trial ($50 hard cap):** engine-level performance
-  comparison on ClickHouse's text indexes.
+**Trials.** All are synthetic data only, and **none is approval to
+provision production** (K-29 stays separate).
 
-**Neither trial is approval to provision production.** Items that need a
-`us-east-1` or production-shaped deployment are marked "vendor evidence or
-a later approved test".
-
-| # | Evidence item | How it is shown | Where |
+| Candidate | Trial | Scope | Approval |
 | --- | --- | --- | --- |
-| E1 | Full-text and **substring** performance at production scale: legacy-style `%term%` on content, tokens and n-grams; common, selective and no-match terms; whale-org shape | p50/p95/p99 at 1/8/32 clients against the section 10 thresholds, on a synthetic corpus shaped by K-38 counts (scale M and the whale shape at least) | ClickHouse Cloud trial for engine behaviour; ObsessionDB at scale needs vendor evidence or a later approved test, because the dev service is functional only |
-| E2 | Tenant isolation through **row policies** (or equivalent), so a query credential cannot read another org | Planted cross-tenant canaries; zero rows through every query path, including misconfigured-claim negatives | ObsessionDB dev service (functional) |
-| E3 | Erasure and delete semantics: tombstone, reset and workspace erasure remove rows, and the time to physical removal (merges, backups) is documented | Delete tests plus the documented physical-deletion window | dev service plus vendor documentation |
-| E4 | Network: IP allowlisting and **private networking** (PrivateLink or equivalent) from the Worker or ingest path in `us-east-1` | Vendor documentation, confirmed by config on the production tier | vendor |
-| E5 | Security posture: SOC 2 (Type II), encryption at rest and in transit, access audit logs, and a data-processing agreement | Reports and DPA on file | vendor |
-| E6 | `us-east-1` availability of the production tier, with SLAs | Vendor confirmation | vendor |
-| E7 | Backup and **rebuild from S3**: a store emptied and reloaded from S3 normalized objects reaches parity (P-1, P-3), with the duration recorded | A rebuild run on synthetic objects | dev service plus the ClickHouse Cloud trial |
-| E8 | The functional contract: excerpts, the in-session window, keyword pools, cursors (G-T2, G-T3, G-T8) | Contract tests against the dev service | dev service |
+| ObsessionDB | free dev service, eu-central | functional only (no performance or region evidence) | K-37 |
+| ClickHouse Cloud | trial, **$50 hard cap** | engine performance on ClickHouse text indexes | K-37 |
+| Amazon OpenSearch Service | proof account **500268966557 / `us-west-2`**, **about $50 cap** | functional, plus performance at trial scale | K-40 |
+
+**Evidence items.** The "expected" column is a prior assumption to verify,
+not evidence.
+
+| # | Evidence item | How it is shown | ObsessionDB (expected) | ClickHouse Cloud (expected) | OpenSearch (expected) |
+| --- | --- | --- | --- | --- | --- |
+| E1 | Full-text and **substring** performance at production scale: legacy-style `%term%`, tokens, n-grams; common, selective and no-match terms; whale shape | p50/p95/p99 at 1/8/32 clients against section 10, on a synthetic corpus shaped by K-38 counts (scale M plus the whale shape at least) | dev service is functional only; scale needs vendor evidence or a later approved test | trial measures engine behaviour | **weaker on substring cost:** needs n-gram or wildcard fields, with index size and indexing cost to measure; trial measures it |
+| E2 | Tenant isolation (row policies, document-level security, or equivalent); a query credential cannot read another org | Planted cross-tenant canaries; zero rows on every path, including misconfigured-claim negatives | row policies | row policies | document-level security / per-tenant index or alias, via IAM / fine-grained access control |
+| E3 | Erasure and delete semantics, and the time to physical removal (merges, segments, snapshots) | Delete tests plus the documented window | to verify | to verify | delete-by-query plus the segment-merge and snapshot window |
+| E4 | IP allowlisting and **private networking** from the Worker or ingest path in `us-east-1` | Config on the production tier | vendor docs | PrivateLink (vendor) | **VPC domain plus IAM** (expected strong) |
+| E5 | SOC 2 Type II, encryption at rest and in transit, audit logs, DPA | Reports on file | vendor | vendor | **AWS compliance programmes** (expected strong) |
+| E6 | `us-east-1` availability of the production tier, with SLA | Confirmation | vendor | vendor | **native AWS region** (expected strong) |
+| E7 | Backup and **rebuild from S3** to parity (P-1, P-3), with the duration recorded | Rebuild run on synthetic objects | dev service | trial | trial (plus snapshot restore) |
+| E8 | The functional contract: excerpts, keyword pools, cursor, tombstones (G-T2, G-T8) | Contract tests through the adapter | dev service | trial | trial |
+
+**Decision rule** *(proposed)*:
+- A candidate must pass E2 to E8 outright and meet the section 10 SLOs
+  (rows 4, 12 to 15) on E1.
+- Among passing candidates, Khaliq chooses on cost and operations.
+- Because the store is off the hot path (K-39), a later swap is a rebuild
+  from S3, not a migration.
 
 The corpus is synthetic, sized and shaped from K-38's counts-only
-extraction. No production content moves, and both trials stay inside
-their approved scope and cap.
+extraction. No production content moves, and every trial stays inside its
+approved scope, account and cap.
 
-### Cross-T0 merge, ordering and dedup spec (G-T5, minimum contents)
+### Merge, ordering and dedup spec across adapters and T0 (G-T5, minimum contents)
 
-1. **Source selection, per session.**
-   - A session whose events are all after T0 is served from the new store
-     only.
-   - A pre-T0 session not yet loaded is served from the child branch only.
-   - A straddling session is served from both: events at or before the
-     marker timestamp/LSN come from the child, later events from the store.
-   - Once a session's export is loaded into the store (coverage marker set),
-     only the store serves it.
+1. **Source selection, per query:**
+   - **Recent window (Postgres):** post-T0 events inside the window.
+   - **History store:** every loaded event, post-T0 and exported pre-T0.
+   - **T0 child branch:** pre-T0 sessions not yet loaded (coverage marker
+     unset).
+
+   A straddling session draws on all of these. Events at or before the
+   marker come from the child or the history store, later events from the
+   window and the history store.
 2. **Dedup key:** `(org, workspace, session, record id, revision)`. On a
-   duplicate, keep the highest revision; if revisions are equal, prefer the
-   store. A post-T0 tombstone suppresses the hit from both sources.
-3. **Order:** event time descending, then a stable tiebreak (source record
-   id). This matches legacy's newest-first, unranked order.
+   duplicate, keep the highest revision. With equal revisions the recent
+   window wins over the history store (it is fresher), and the history
+   store wins over the child. A post-T0 tombstone suppresses the hit from
+   every source.
+3. **Order (MCP):** event time descending, with a stable tiebreak on the
+   source record id. This matches legacy.
 4. **Paging:** a composite opaque cursor carrying each source's position.
-   The limit applies after the merge, so a page never exceeds the limit or
-   skips hits.
-5. **Excerpts:** identical shape from both sources (4 KB content prefix
+   The limit applies after the merge.
+5. **Excerpts:** identical shape from every source (4 KB content prefix
    rule, `max_content`, `citation_url`).
-6. **Partial failure:** if one source fails or trips its breaker, return the
-   other source's hits with an explicit degraded marker. Never silently
-   return partial results as complete.
-7. **Budgets:** per-source timeouts that fit inside Cloud's 25 s MCP
-   timeout, and the child branch's breaker (section 8).
-8. **Ranked dashboard queries (K-36):** a ranked result, not
-   time-ordered.
-   - Post-T0 sessions come from ObsessionDB `event_keyword` and
-     `brief_keyword`.
-   - Pre-T0 sessions come from the child branch's legacy `event_keyword`
-     and `brief_keyword` only. **For a merged query, the child's semantic
-     pools are not used**, so that both sides rank with the same pool set
-     and pre-T0 sessions are not boosted by vector matches that post-T0
-     sessions cannot get. *(Proposed.)*
-   - A query whose whole window is before T0 may use full legacy hybrid on
-     the child. *(Proposed; Khaliq to confirm.)*
-   - The two lists are merged by reciprocal-rank fusion (k=60) with the
-     legacy keyword weights (event 1, brief 3), deduped by the rule-2 key
-     before the cut.
-
----
+6. **Partial results (K-39):**
+   - **History store errors or exceeds its budget:** return the recent
+     window's results (plus the child's for pre-T0) with
+     `partial: "older_history_unavailable"`. This is never an unlabelled
+     empty result and never a 5xx.
+   - **Child branch down:** label `partial: "pre_t0_history_unavailable"`.
+   - **Postgres adapter down:** this is the hot-path store, so search fails
+     with a retryable 503. V1 metadata is in the same database and is down
+     too.
+7. **Budgets:**
+   - the history adapter: about 1-2 s (1.5 s proposed);
+   - the child branch: its breaker and a 6 s pool budget;
+   - the whole request: within legacy's 12 s and Cloud's 15 s / 25 s.
+8. **Ranked dashboard queries (K-36):** RRF (k=60) over `event_keyword`
+   (weight 1) and `brief_keyword` (weight 3). Each pool's candidates are the
+   deduped union of the window, the history store and the child.
+   - For merged queries the child's semantic pools are not used.
+     *(Proposed.)*
+   - A query whose whole window is pre-T0 may use full legacy hybrid on the
+     child. *(Proposed; Khaliq to confirm.)*
 
 ### Search serving contract (reviewer requirements, G-T)
 
@@ -493,21 +589,23 @@ variant, and adopted only with Khaliq's OK (it changes recall).
   summary, short and long. That puts summary plaintext into ObsessionDB.
   Q22 covers this.
 
-**4. Degraded-pool behaviour.**
+**4. Degraded behaviour (K-39).**
 
-| Failure | Dashboard hybrid | MCP `search_shared_sessions` | MCP `get_shared_session_context` | V1 metadata |
+| Failure | Dashboard ranked search | MCP `search_shared_sessions` | MCP `get_shared_session_context` | V1 metadata |
 | --- | --- | --- | --- | --- |
-| Semantic pools (none before T0, K-36) | Not offered. The response lists `pools_offered: ["event_keyword","brief_keyword"]`, and the semantic pools are **not** reported in `degradedPools`, so no permanent degraded banner appears. The UI labels the mode "Keyword search". | n/a | n/a | unaffected |
-| ObsessionDB is down, for a query that includes post-T0 time | Serve the child-branch pools for pre-T0 sessions. `degradedPools` lists every post-T0 pool. The UI shows "Recent sessions unavailable." | Return child results with `complete: false` and `degraded_sources: ["post_t0_transcripts"]`, and add a line to the tool's text output saying the results are incomplete | **Fail closed** for a post-T0 session: retryable `503 transcript_search_unavailable` | unaffected |
-| The child branch is down or its breaker is open | The mirror image: ObsessionDB pools only, with pre-T0 marked degraded | Mirror image: `degraded_sources: ["pre_t0_transcripts"]` | Fail closed for a pre-T0 session | unaffected |
-| Every source for the requested window is down | **Fail closed:** retryable 503, never an empty 200 | Fail closed: retryable 503 | Fail closed | unaffected |
-| The total budget is exceeded | `503 search_timeout` (legacy) | same | same | — |
+| Semantic pools (none before T0, K-36) | Not offered. `pools_offered: ["event_keyword","brief_keyword"]`, and they are not counted as degraded. The UI labels the mode "Keyword search". | n/a | n/a | unaffected |
+| **History store errors or times out (budget about 1-2 s)** | Postgres results plus child results (pre-T0), banner **"Partial: older history unavailable"**. Never empty without that label, never 5xx. | Postgres results plus child results, `partial: "older_history_unavailable"`, plus a line in the tool's text output | unaffected (S3 read path for post-T0) | unaffected |
+| History indexer lagging (store up) | Recent sessions are covered by the window. No label unless lag exceeds the window. | same | unaffected | unaffected |
+| Child branch down or breaker open | Results without pre-T0 sessions, labelled "Partial: pre-cutover history unavailable" | `partial: "pre_t0_history_unavailable"` | for a pre-T0 session: retryable `503` | unaffected |
+| Supabase (Postgres adapter) down | Retryable 503 | Retryable 503 | Post-T0 sessions are still served from S3 if the pointer lookup is cached; otherwise 503 | down |
+| Whole request budget exceeded | `503 search_timeout` (legacy) | same | same | — |
 
-The new response fields (`complete`, `degraded_sources`) need a Cloud MCP
-schema change in P4. Nothing may return partial results without a label.
+The new response fields (`partial`, `pools_offered`) need a Cloud MCP and
+dashboard schema change (P4). Nothing returns partial results without a
+label.
 
-**5. Cross-T0 federation.** See the merge, ordering and dedup spec above
-(G-T5, items 1 to 8):
+**5. Federation across adapters and T0.** See the merge spec above (G-T5,
+items 1 to 8):
 - which source serves each session;
 - dedup;
 - newest-first order for MCP, and RRF for hybrid;
@@ -515,7 +613,7 @@ schema change in P4. Nothing may return partial results without a label.
 - partial failure (also item 4 above);
 - budgets.
 
-**6. Relevance gates.** These are section 10 rows 2, 4, 5, 12 and 13:
+**6. Relevance gates.** These are section 10 rows 2, 4, 5, 12, 13 and 14:
 - recall@10 and recall@20 against legacy per query class: at least 95% on
   lexical queries;
 - recall tasks hit at k=5 and k=10 wherever legacy hits;
@@ -525,25 +623,29 @@ schema change in P4. Nothing may return partial results without a label.
 - V1 lexical overlap at least 95%.
 
 **7. Freshness per pool.** Measured from the transcript write on the desktop
-to the first hit; *proposed*.
+to the first hit; *proposed*. K-39 makes recent freshness independent of
+the history indexer.
 
 | Pool or surface | p95 | p99 |
 | --- | --- | --- |
 | V1 metadata (list and filters) | 60 s | 120 s |
 | V1 short_summary | 5 min | 10 min |
-| MCP transcript keyword (`event_keyword`, ObsessionDB) | 60 s | 120 s |
+| **Recent window**, transcript keyword (Postgres adapter) | 60 s | 120 s |
 | `brief_keyword` (needs a summary) | 5 min | 10 min |
+| **History store**, indexer lag (not user-visible inside the window) | 15 min | 60 min |
 
 Sessions not yet in a pool still appear through the faster pools, so
 freshness is per pool, not per session.
 
 **8. Rollback for search.**
 - **Before T0:** any red G-T result holds T0. Every search component is
-  dark, so it can be switched off, or ObsessionDB rebuilt from S3, without
-  user impact.
-- **After T0:** forward-only (K-22, section 11). The levers are:
-  - rebuild ObsessionDB by replaying the S3 normalized objects;
-  - degrade to keyword-only per item 4;
+  dark, and the recent window and history store can each be rebuilt from S3
+  without user impact.
+- **After T0:** forward-only (K-22, section 11). The levers:
+  - **turn the history adapter off.** Search then serves the recent window
+    plus the child, labelled partial (K-39);
+  - rebuild the history store from S3, on the chosen candidate or another one that passed G-T0E;
+  - rebuild the recent window from S3 for the window period;
   - the G-F write freeze.
 
   There is never a return to Neon for post-T0 sessions.
@@ -553,21 +655,23 @@ freshness is per pool, not per session.
 | Store or service | Region | Holds transcript content? | Status |
 | --- | --- | --- | --- |
 | Neon production and the T0 child branch | AWS `us-east-1` | yes (rows) | exists |
-| Supabase `sessions` | AWS `us-east-1` (K-33; verify) | metadata, bounded short_summary; no transcripts or embeddings (0002) | exists, empty |
+| Supabase `sessions` | AWS `us-east-1` (K-33; verify) | metadata, bounded short_summary, and **a bounded recent window of scrubbed transcript text** (K-39; 0002 Amendment 1); no embeddings | exists, empty |
 | Production S3 bucket | **must be `us-east-1`** (required by this boundary) | yes (canonical) | not created (K-2) |
-| ObsessionDB production | AWS `us-east-1` (K-33) | yes (full-text projection; no embeddings before T0) | not provisioned. K-29 comes only after G-T0E. |
+| History store production (store-agnostic; ObsessionDB intended, ClickHouse Cloud or OpenSearch per G-T0E) | AWS `us-east-1` (K-33) | yes (full-history full-text projection, derived from S3; no embeddings before T0) | not provisioned. K-29 comes only after G-T0E. |
 | RelayHistory Worker, Queues | Cloudflare edge (global) | in transit only; no persistent copy | exists |
 | Summary model provider (embeddings only after section 17) | provider's region (unknown) | in transit to the provider; retention per its terms | summary-short enablement (K-13); embeddings K-35 |
 | `relay-transcript-proof` | AWS `us-west-2` | **synthetic data only** | proof |
 | ObsessionDB free dev service | eu-central | **synthetic data only**, functional only (K-37) | trial |
 | ClickHouse Cloud trial | trial region (unknown) | **synthetic data only**, $50 hard cap (K-37) | trial |
+| Amazon OpenSearch Service trial | AWS `us-west-2`, proof account 500268966557 | **synthetic data only**, about $50 cap (K-40) | trial |
 | `aws-proof` EKS stack | AWS `us-west-2` (500268966557) | synthetic orgs (`org_aws_proof_*`) only | proof |
 
 **Rules:**
 - No production transcript content is copied out of `us-east-1`, except in
   transit through Cloudflare or the model provider.
-- The `us-west-2` proof services and the K-37 trials (eu-central
-  ObsessionDB dev, ClickHouse Cloud) take only synthetic data. Exporting or
+- The `us-west-2` proof services and the K-37 and K-40 trials (eu-central
+  ObsessionDB dev, ClickHouse Cloud, OpenSearch in 500268966557 /
+  `us-west-2`) take only synthetic data. Exporting or
   loading a real org into them is forbidden.
 - The K-38 shape extraction moves aggregate counts only, never content.
 - Staging stores for phase 2 hold real W0 data (K-12), so they must also be
@@ -601,7 +705,7 @@ Each item's exit gate is its own two-pass review plus CI. Every merge is K-1.
     0066 and 0067);
   - #225 (TCP seam);
   - #227 then #231 (pointer index activation, flag-gated);
-  - #226 (G3: terminal reads; it must route transcript search to the child branch for pre-T0 sessions and to the new store for post-T0 sessions, per the G-T5 spec, instead of failing closed);
+  - #226 (G3: terminal reads; it must route transcript search to the child branch for pre-T0 sessions and to the search interface (recent window + history store, K-39) for post-T0 sessions, per the G-T5 spec, instead of failing closed);
   - #222 or its replacement (P5).
 - 96BullSessions:
   - #38 (directory), #48 (short_summary, already merged into the #38
@@ -652,7 +756,7 @@ Approvals K-2, K-3, K-7 to K-10.
 - **Rollback:** drop the empty schema and bucket, and revoke the keys. No
   user data exists yet.
 
-**Also in phase 1 (K-29, K-32), after G-T0E passes and Khaliq confirms ObsessionDB:** resize the Supabase disk from 2 GB.
+**Also in phase 1 (K-29, K-32), after G-T0E passes and Khaliq confirms the history store:** resize the Supabase disk from 2 GB.
 Provision the transcript search store, production and staging, with
 per-org isolation and credentials held as Worker secrets.
 
@@ -827,7 +931,7 @@ under 0002 are in **bold**.
    - the child answers read-only queries.
 7. **Flip.** Move `holding → supabase`. At the same moment:
    - **enable the post-T0 ingress and `PIPELINE_SESSION_INDEX_ENABLED`**;
-   - **route post-T0 transcript search to the new store, per the G-T5
+   - **route post-T0 transcript search to the search interface (K-39), per the G-T5
      spec**;
    - flip cloud #5850's flag.
 
@@ -836,7 +940,7 @@ under 0002 are in **bold**.
 8. **Verify.** Run canaries for: login, ingest, delivery batch, turns,
    session list, V1 search, replay of a post-T0 session from S3, replay of a
    pre-T0 session through the child, transcript search through the child
-   (K-6), transcript search on a post-T0 session in the new store (G-T),
+   (K-6), transcript search on a post-T0 session through the search interface, plus a forced history-store timeout returning a labelled partial (G-T, G-T1M),
    a cross-T0 merged query (G-T5), brief, and a Cloud revision event (G-R1).
 
 **Abort.** Steps 2 to 6 can be aborted:
@@ -891,7 +995,7 @@ live client's protocol, and on W0 after T0.
 This adopts the design and proposed SLOs from
 `~/selfhost-proof/notes/search-recall-comparison-2026-10-31.md` §5. Two
 changes are made to it:
-1. Transcript lanes for the new store are added (K-27).
+1. Transcript lanes for the search interface are added (K-27): each adapter alone, merged, and fallback (K-39).
 2. **V1 is measured on staging Supabase, which is production-shaped,** not
    on EKS/CNPG. EKS numbers are self-host evidence only (0001).
 
@@ -953,7 +1057,7 @@ changes are made to it:
     and goes to Khaliq as the section 17 follow-up decision: accept the
     loss, or bring embeddings back.
 - Hits lost to V1's transcript boundary are reported separately as a
-  product cost. Under K-27 the new store must close that gap.
+  product cost. Under K-27 the search interface must close that gap.
 
 **Latency and load:** p50/p95/p99 and the error and timeout rate, both cold
 (after a restart) and warm, at 1, 8 and 32 concurrent clients, while
@@ -963,6 +1067,13 @@ production-like ingest runs at the same time.
 hit, measured separately for metadata, short_summary and transcript text.
 
 **Isolation:** planted canary sessions per tenant; zero cross-tenant rows.
+
+**Adapter lanes (K-39).** Each lane runs separately and then merged:
+- Postgres recent-window adapter alone;
+- history adapter alone;
+- the merged interface;
+- **fallback:** the history store is stopped, slowed past its budget, and
+  made to return errors, while load runs.
 
 **Search contract.** Parity runs reproduce legacy fusion exactly (section
 6, "Search serving contract", item 1): RRF k=60, weights 1/1/3/3,
@@ -977,16 +1088,18 @@ pass.
 | 1 | V1 metadata/summary search | p95 ≤ legacy p95, **and** ≤ 300 ms DB / ≤ 1 s end to end; p99 ≤ 2 s; errors < 0.1% |
 | 2 | V1 lexical overlap on metadata queries | ≥ 95% |
 | 3 | V1 agent-prefix gate under RLS | passes (today it is red: 1409× rows read at M) |
-| 4 | **New-store transcript search** (`search_shared_sessions` on post-T0 sessions) | Same latency SLO as row 1. Recall@10 ≥ 95% against legacy on lexical queries. Every recall task hits at k=10 where legacy hits. *(The recall threshold is proposed here; the report sets only the overlap figure.)* |
+| 4 | **Transcript search through the interface** (`search_shared_sessions`; each adapter alone and merged) | Same latency SLO as row 1. Recall@10 ≥ 95% against legacy on lexical queries. Every recall task hits at k=10 where legacy hits. *(The recall threshold is proposed here; the report sets only the overlap figure.)* |
 | 5 | **New-store `get_shared_session_context`** | The window equals legacy on the snapshot; latency SLO as row 1 |
 | 6 | Legacy transcript on the child branch (K-6) | child p95 ≤ 1.25× production p95, and within Cloud's 25 s MCP timeout at p99 |
 | 7 | Cross-T0 merged query (G-T5) | No duplicates, correct order, no skipped hits when paging; latency ≤ the slower source + 20% |
-| 8 | Freshness | metadata p95 ≤ 60 s; summary p95 ≤ 5 min; **transcript p95 ≤ 60 s** *(proposed here)* |
-| 9 | Isolation | zero cross-tenant rows across V1, the new store and the merge |
+| 8 | Freshness | **8a** recent window: transcript p95 ≤ 60 s with the history indexer stopped. **8b** history indexer lag: p95 ≤ 15 min. Also metadata p95 ≤ 60 s and summary p95 ≤ 5 min. *(Proposed.)* |
+| 9 | Isolation | zero cross-tenant rows across V1, the recent window, the history store and the merge |
 | 10 | Replay of one session (S3) | p95 ≤ legacy p95 for size deciles 1 to 9; decile 10 within 1.5× |
-| 11 | Capacity | ≥ 30% CPU headroom on Supabase and the store; no temp-spill regression; Supavisor connections ≤ 70% of the pool |
+| 11 | Capacity | ≥ 30% CPU headroom on Supabase (including the recent window) and the history store; no temp-spill regression; Supavisor connections ≤ 70% of the pool |
 | 12 | **Hybrid relevance (G-T8)** | New nDCG@10 ≥ legacy nDCG@10 − 0.02 on the hybrid query set. Conceptual recall tasks hit at k=10 at least as often as legacy. *(Proposed here.)* |
 | 13 | **Hybrid latency and degradation (G-T8)** | p95 ≤ legacy hybrid p95, and ≤ 1.5 s end to end; p99 ≤ 3 s. Rate of `degradedPools` responses ≤ legacy. *(Proposed here.)* |
+| 14 | **Fallback (G-T1M)** | With the history store down, slow or erroring: **zero 5xx** for that case; 100% of responses labelled partial; p95 ≤ the Postgres-only p95 + the history budget; recall inside the window unchanged |
+| 15 | **Postgres recent-window adapter alone** | p95 ≤ 300 ms DB / ≤ 1 s end to end at the chosen window length (largest org); recall@10 ≥ 95% against legacy for queries whose targets fall inside the window |
 
 Not measured, and not gating unless Khaliq adds them: dollar cost and
 scale L (1M sessions). Ranked-search relevance against legacy hybrid is
@@ -1088,7 +1201,9 @@ hosted backend. Build them before phase 3.
 | Export coverage and throughput per wave | `migration:export` checkpoint | stalled > 30 min |
 | Supabase CPU, connections, temp, replication/PITR health | Supabase metrics | CPU > 70% for 15 min; connections > 70% of the pool |
 | S3 4xx/5xx and KMS throttling | CloudWatch (the bucket's account) | any `AccessDenied` from the Worker identity; KMS throttle > 0 |
-| Search-store feed lag, DLQ depth and load errors (G-T1) | the feed's queue and the store | transcript freshness p95 > SLO; DLQ > 0 for 15 min |
+| History indexer lag, DLQ depth and load errors (G-T1) | indexer queue and store | lag p95 > 15 min; DLQ > 0 for 15 min |
+| History-adapter partial rate and timeouts (G-T1M) | Worker | partial responses > 1% for 10 min |
+| Recent-window writer lag, retention-job failures (G-T1R) | pipeline, Supabase | freshness p95 > 60 s; the retention job did not run in 26 h |
 | Cross-T0 merge degraded responses (G-T5) | Worker | any degraded marker for 5 min |
 | Write-freeze state (G-F) | Worker | any change without an approval record |
 | Shadow-read mismatches | Worker (G-S) | > 0 on frozen sessions |
@@ -1150,16 +1265,20 @@ ids (A#) are shown where they apply.
 | K-25 | Each post-flip fix-forward action (Worker rollback within phase `supabase`, flags; write freeze is K-31) | — | depends on the action |
 | K-26 | Any Neon load relief before T0: compute, `work_mem`, vacuum | — | yes |
 | K-27 | Transcript search before T0. **Decided 2026-10-31: "Transcript search before T0".** No T0 until new sessions are transcript-searchable on ClickHouse or ObsessionDB. | — | — |
-| K-28 | Store choice. **Approved 2026-10-31 as "intended, conditional":** ObsessionDB is confirmed only after G-T0E. Merging the 0001 amendment is still K-1. | — | — |
-| K-29 | Provision production ObsessionDB in `us-east-1` and staging, and their credentials. **Only after G-T0E and confirmation. K-37 trial approval does not cover this.** | — | yes, while empty |
+| K-28 | Store choice. **Approved 2026-10-31 as "intended, conditional":** ObsessionDB is confirmed only after G-T0E. K-40 adds OpenSearch as a candidate on the same gate. Merging the 0001 amendment is still K-1. | — | — |
+| K-29 | Provision the **chosen** production history store in `us-east-1` and staging, and their credentials. **Only after G-T0E and Khaliq's choice. The K-37 and K-40 trial approvals do not cover this.** | — | yes, while empty |
 | K-30 | Enable the G-T1 feed into the production store (dark, canaries only, before T0) | — | disable the feed |
 | K-31 | Each use of the G-F write freeze, including the phase 3 canary proof | — | unfreeze |
-| K-32 | Resize the Supabase `sessions` disk from 2 GB | — | grow only |
+| K-32 | Resize the Supabase `sessions` disk from 2 GB. **Includes the K-39 recent window**: window size + metadata + copy set + 50% headroom (section 6, window sizing). | — | grow only |
 | K-33 | Transcript-search region. **Decided 2026-10-31: AWS `us-east-1`.** | — | — |
 | K-34 | Ranked dashboard search in the T0 gate. **Decided 2026-10-31: "Include it in the T0 gate", superseded as written by K-36.** | — | — |
 | K-36 | **Decided 2026-10-31: "No embeddings pre-T0"** (helm-chart-chief: directly approved). G-T8 is keyword-ranked; nDCG@10 against legacy hybrid is the gate. | — | — |
 | K-37 | Synthetic trials. **Approved 2026-10-31:** ClickHouse Cloud with a $50 hard cap, and the ObsessionDB free dev service (eu-central, functional only). Synthetic data only; not production provisioning. | — | delete the trial services |
 | K-38 | **Approved 2026-10-31:** counts-only, read-only shape extraction from production. No corpus movement. | — | n/a (read-only) |
+| K-39 | **Decided 2026-10-31: "ObsessionDB off the hot path".** Two adapters, async indexer, labelled partial fallback. | — | — |
+| K-40 | **Decided 2026-10-31:** Amazon OpenSearch Service is a third history-store candidate. Synthetic-only trial approved in 500268966557 / `us-west-2`, about $50 cap. Not production provisioning. | — | delete the trial domain |
+| K-42 | Choose the recent-window length (7, 14 or 30 days) after the K-38 counts | — | the window can shrink or grow via retention and backfill from S3 |
+| K-43 | Apply the recent-window migration and RLS to Supabase, and enable the writer stage and retention job | — | drop the table, disable the stage |
 
 Read-only work needs no approval beyond normal access: catalog queries,
 `neonctl` reads, `scripts/sb` reads, benchmarks on staging, and drafting PRs.
@@ -1201,6 +1320,11 @@ Read-only work needs no approval beyond normal access: catalog queries,
   are covered in section 17.
 - **Q17.** Resolved by K-34 and K-36: keyword-ranked dashboard search is in the T0 gate (G-T8).
 - **Q19, Q20:** moved to section 17.
+- **Q23.** The recent window's per-event text: a 4 KB prefix (proposed, for
+  legacy parity) or complete text. Complete text increases disk, which is
+  measured via K-38.
+- **Q24.** The history-adapter budget: 1 s or 2 s (1.5 s proposed). Set it
+  from the trials (ClickHouse Cloud, OpenSearch) and G-T0E E1.
 - **Q22.** The brief pools' text on the new stack: the pipeline's short and
   long summaries in ObsessionDB as plaintext, with erasure through
   tombstones? Legacy briefs are LLM output stored in Neon.
@@ -1298,7 +1422,7 @@ Either way, adding embeddings is a new decision with its own approvals.
   `search-recall-comparison-2026-10-31.md` (sections 6 and 10 copy its
   tables, benchmark design and proposed SLOs).
 - Coordinator relay, 2026-10-31:
-  - Khaliq's decisions K-6, K-22, K-27, K-28 (restated), K-33, K-34, K-36, K-37 and K-38;
+  - Khaliq's decisions K-6, K-22, K-27, K-28 (restated), K-33, K-34, K-36, K-37, K-38, K-39 and K-40;
   - storage facts: `sessions` 494 GB, `convergence_events` 210 GB, no
     production S3 bucket, R2 `relayhistory-content` empty, Supabase Pro /
     Large / 2 GB disk / empty.

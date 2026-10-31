@@ -67,7 +67,18 @@ relayed rulings as PROPOSED until Khaliq confirms them in its session. This text
 ### Decision
 
 - **Production data plane, once confirmed:** Supabase (database) + AWS S3
-  (objects) + **ObsessionDB (transcript search store)**.
+  (objects) + **ObsessionDB (transcript history search store)**.
+- **Off the hot path (K-39, "ObsessionDB off the hot path"):**
+  - It is a derived, rebuildable index, fed asynchronously from S3.
+    Ingest never waits on it.
+  - The search interface reaches it through a **store-agnostic** adapter
+    (K-39, K-40). The candidates are ObsessionDB (intended), ClickHouse
+    Cloud and Amazon OpenSearch Service. All are chosen on the same
+    benchmark and evidence gate, so a failed candidate changes the driver,
+    not the design.
+  - Recent transcripts are also served from a bounded window in Supabase
+    (0002 Amendment 1). If the store is unavailable, search returns those
+    results labelled partial.
 - **ObsessionDB's role:**
   - lexical transcript search for the MCP tools (`search_shared_sessions`
     excerpts, the `get_shared_session_context` window);
@@ -104,7 +115,7 @@ relayed rulings as PROPOSED until Khaliq confirms them in its session. This text
 
 ### Still needs Khaliq's explicit OK for each exact action
 
-- confirming ObsessionDB after G-T0E;
+- confirming the history store (ObsessionDB, or another candidate that passes G-T0E);
 - provisioning ObsessionDB (production and staging) and its credentials;
 - enabling the feed into it;
 - any later embedding stage, including the model, provider and budget

@@ -103,3 +103,54 @@ does not erase it.
   4. the search store, later.
 - **Still needs Khaliq's explicit OK, each separately:** writing exported
   objects to the production bucket; deploys; the cutover; and retiring Neon.
+
+## Amendment 1: a bounded recent transcript window in Supabase (DRAFT)
+
+**Status:** draft in 96BullSessions #90. It takes effect when that PR
+merges. Source: Khaliq, 2026-10-31, lead session, K-39 ("ObsessionDB off
+the hot path").
+**Amends:** "Supabase holds the index only" and the V1 search bullet
+above. **Does not change:** S3 as the source of truth; no embeddings or
+pgvector in Supabase.
+
+### Decision
+
+- Supabase may hold a **bounded recent window** of scrubbed session
+  transcript text in the `sessions` schema, with trigram and FTS indexes.
+  It serves the Postgres adapter of the search interface on hosted.
+  - Full history is served by the store-agnostic history store (0001
+    Amendment 1).
+  - Self-host may run the window unbounded.
+- **Window length:** 7, 14 or 30 days. It is chosen by Khaliq (K-42) after
+  the counts-only shape extraction (K-38) sizes each option.
+- **Content rules:**
+  - The text is scrubbed before storage, through the same scrub hop as S3
+    raw.
+  - Per-event text is capped, with a 4 KB prefix proposed for legacy
+    parity.
+  - No embeddings.
+  - RLS on every row, and every index leads with `org_id`.
+
+### Retention and erasure
+
+- **Retention:**
+  - A daily job deletes every row older than the window.
+  - The retention job's success is alarmed: it must have run within 26 h.
+  - Rows are rebuildable from S3, so the window can be shrunk or regrown.
+- **Erasure:**
+  - Tombstones, session resets and workspace erasure delete matching rows
+    immediately, through the same tombstone path as the V1 projection.
+  - KMS crypto-shredding covers only S3. In Supabase, erasure is by row
+    deletion.
+  - Supabase backups and PITR then age out within Supabase's retention, so
+    the backup/PITR retention period **is the erasure tail** and must be
+    documented with the plan tier (plan Q3).
+- **Disk:** the Supabase disk sizing for the window is part of K-32.
+
+### Still needs Khaliq's explicit OK for each exact action
+
+- choosing the window length (K-42);
+- applying the migration and enabling the writer and retention job (K-43);
+- resizing the disk (K-32).
+
+This amendment is not that approval.
