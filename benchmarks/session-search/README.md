@@ -53,6 +53,13 @@ no schema, version or deployment exists.
 26.8 with the corpus's events. It is not comparable with the Postgres arms: it answers
 store-design questions, and says nothing about ObsessionDB.
 
+`BENCH_CH_ONLY=workload` runs gate 7 with server-side scheduling. The workload is a CONST
+setting on each class's user, so a client cannot choose it; one shared user cannot give
+that. Quiet and noisy phases interleave on one server. A variant is INVALID if quiet p95
+drifts over 1.5x, and passes only under 2x its quiet p95 and under an absolute victim p95
+ceiling (30 ms, proposed). It needs `cpu_slot_preemption`. Declaring a CPU resource
+disables `concurrent_threads_soft_limit_num`. Memory and IO isolation are not tested.
+
 `clickhouse-replicated-purge.ts` times gate 3 on two local replicas at default cleanup.
 It needs both data directories on one host, so it runs by hand, not in CI.
 

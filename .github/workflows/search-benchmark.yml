@@ -131,6 +131,13 @@ jobs:
         with:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
+      - name: Enable CPU slot preemption
+        env:
+          ID: ${{ job.services.clickhouse.id }}
+        run: |
+          docker exec "$ID" sh -c 'echo "<clickhouse><cpu_slot_preemption>true</cpu_slot_preemption></clickhouse>" > /etc/clickhouse-server/config.d/benchmark-preemption.xml'
+          docker restart "$ID"
+          until curl -sf http://127.0.0.1:8123/ping; do sleep 1; done
       - name: Gate 7 with server-side scheduling
         env:
           BENCH_CH_URL: http://127.0.0.1:8123

@@ -413,53 +413,104 @@ async function gate7(table: string) {
     verdict: (capped.p95 ?? Infinity) < line ? "PASS" : "FAIL", victim, noisy };
 }
 
+/** Declared before any run. Over the bound, the variant is INVALID, not a pass or a fail. */
+const QUIET_DRIFT_LIMIT = 1.5;
+/** So an inflated quiet run cannot pass on ratio alone. A proposal until the owners set it. */
+const VICTIM_P95_CEILING_MS = Number(process.env.BENCH_VICTIM_P95_CEILING_MS ?? 30);
+const RATIO_LIMIT = 2;
+
+function coreEvidence() {
+  const r = beside("nproc 2>/dev/null || sysctl -n hw.ncpu; cat /sys/fs/cgroup/cpu.max 2>/dev/null; cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null");
+  return r.stdout.trim().split("\n");
+}
+
 /**
- * Gate 7 with server-side scheduling on one shared user: the client names a workload per
- * query, so a tenant's class travels with its query. CPU scheduling only; IO is not limited.
+ * Gate 7 with server-side scheduling. The workload comes from the tenant's user as a
+ * CONST setting, so it is fixed by authenticated identity and a client cannot pick it.
+ * Quiet and noisy phases interleave on one server. CPU only: memory and IO are unmet.
  */
 async function gate7Workload(table: string) {
   const victim = pageSql(table, SMALL_ORG, SMALL_WS, "refactor");
   const noisy = pageSql(table, WHALE_ORG, WHALE_WS, "refactor");
+  const search: Auth = { user: "bench_search_u", password: "local-only" };
+  const heavy: Auth = { user: "bench_noisy_u", password: "local-only" };
+  for (const d of ["DROP WORKLOAD IF EXISTS bench_noisy", "DROP WORKLOAD IF EXISTS bench_search", "DROP WORKLOAD IF EXISTS all", "DROP RESOURCE IF EXISTS bench_master", "DROP RESOURCE IF EXISTS bench_worker"]) await ch(d);
   const ddl = [
-    "CREATE RESOURCE bench_cpu (MASTER THREAD, WORKER THREAD)",
-    "CREATE WORKLOAD all",
-    "CREATE WORKLOAD bench_search IN all SETTINGS weight = 9",
-    "CREATE WORKLOAD bench_noisy IN all SETTINGS weight = 1",
+    "CREATE RESOURCE bench_master (MASTER THREAD)", "CREATE RESOURCE bench_worker (WORKER THREAD)",
+    "CREATE WORKLOAD all", "CREATE WORKLOAD bench_search IN all", "CREATE WORKLOAD bench_noisy IN all",
   ];
-  for (const d of ["DROP WORKLOAD IF EXISTS bench_noisy", "DROP WORKLOAD IF EXISTS bench_search", "DROP WORKLOAD IF EXISTS all", "DROP RESOURCE IF EXISTS bench_cpu"]) await ch(d);
   for (const d of ddl) await ch(d);
-  const quietRun = async (s: Record<string, string | number>) => {
-    const t: number[] = [];
-    for (let i = 0; i < 50; i++) { const a = performance.now(); await ch(victim, s); t.push(performance.now() - a); }
-    return summarize(t);
+  for (const [auth, workload] of [[search, "bench_search"], [heavy, "bench_noisy"]] as const) {
+    await ch(`DROP USER IF EXISTS ${auth.user}`);
+    await ch(`CREATE USER ${auth.user} IDENTIFIED WITH plaintext_password BY '${auth.password}' SETTINGS workload = '${workload}' CONST`);
+    await ch(`GRANT SELECT ON ${table} TO ${auth.user}`);
+  }
+  const samples = async (auth: Auth, n: number) => {
+    const out: number[] = [];
+    for (let i = 0; i < n; i++) { const a = performance.now(); await ch(victim, {}, auth); out.push(performance.now() - a); }
+    return out;
   };
-  // Warm first: cold samples would inflate quiet p95, and with it the pass line.
-  await quietRun({});
-  const quiet = await quietRun({});
-  const line = (quiet.p95 ?? 0) * 2;
-  const under = async (connections: number, noisySettings: Record<string, string | number>, victimSettings: Record<string, string | number>, setup?: string) => {
-    if (setup) await ch(setup);
-    let stop = false, noisyDone = 0;
-    const load = Array.from({ length: connections }, async () => { while (!stop) { await ch(noisy, noisySettings); noisyDone++; } });
-    const started = performance.now();
-    const result = await quietRun(victimSettings);
-    const seconds = (performance.now() - started) / 1000;
-    stop = true;
-    await Promise.all(load);
-    return { connections, noisySettings, victimSettings, setup, victimLatency: result, noisyQueriesPerSecond: Math.round(noisyDone / seconds),
-      ratioToQuiet: Math.round(((result.p95 ?? 0) / (quiet.p95 || 1)) * 100) / 100, verdict: (result.p95 ?? Infinity) < line ? "PASS" : "FAIL" };
+  // The client must not be able to pick its class.
+  const override = await attempt(() => ch(`${noisy} SETTINGS workload = 'bench_search'`, {}, heavy));
+  const urlOverride = await attempt(() => ch(noisy, { workload: "bench_search" }, heavy));
+  await samples(search, 30); // warm-up, discarded
+
+  const ROUNDS = 3, PHASE = 30;
+  const run = async (connections: number, setup: string[], useWorkloads = true) => {
+    for (const d of setup) await ch(d);
+    const victimAuth = useWorkloads ? search : admin, noisyAuth = useWorkloads ? heavy : admin;
+    const quiet: number[] = [], loaded: number[] = [], quietP95s: (number | null)[] = [];
+    const measure = async () => { const q = await samples(victimAuth, PHASE); quiet.push(...q); quietP95s.push(summarize(q).p95); };
+    let noisyDone = 0, seconds = 0;
+    for (let r = 0; r < ROUNDS; r++) {
+      await measure();
+      let stop = false;
+      const load = Array.from({ length: connections }, async () => { while (!stop) { await ch(noisy, {}, noisyAuth); noisyDone++; } });
+      const started = performance.now();
+      loaded.push(...await samples(victimAuth, PHASE));
+      seconds += (performance.now() - started) / 1000;
+      stop = true;
+      await Promise.all(load);
+    }
+    await measure();
+    const q = summarize(quiet), l = summarize(loaded);
+    const p95s = quietP95s.filter((v): v is number => v !== null);
+    const drift = Math.max(...p95s) / Math.min(...p95s);
+    const ratio = (l.p95 ?? 0) / (q.p95 || 1);
+    const verdict = drift > QUIET_DRIFT_LIMIT ? "INVALID: quiet drift" : ratio < RATIO_LIMIT && (l.p95 ?? Infinity) < VICTIM_P95_CEILING_MS ? "PASS" : "FAIL";
+    return { connections, setup, quiet: q, loaded: l, ratio: Math.round(ratio * 100) / 100, quietP95s, drift: Math.round(drift * 100) / 100,
+      noisyQueriesPerSecond: Math.round(noisyDone / seconds), victimQueriesPerSecond: Math.round(loaded.length / seconds), verdict };
   };
-  const s = { workload: "bench_search" }, n = { workload: "bench_noisy" };
+  const set = (searchS: string, noisyS: string) => [
+    `CREATE OR REPLACE WORKLOAD bench_search IN all${searchS && ` SETTINGS ${searchS}`}`,
+    `CREATE OR REPLACE WORKLOAD bench_noisy IN all${noisyS && ` SETTINGS ${noisyS}`}`,
+  ];
   const variants = {
-    none: await under(6, {}, {}),
-    weights9to1: await under(6, n, s),
-    weightsCap2: await under(2, n, s),
-    noisyThreadLimit2: await under(6, n, s, "CREATE OR REPLACE WORKLOAD bench_noisy IN all SETTINGS weight = 1, max_concurrent_threads = 2"),
-    noisyThreadLimit2Cap2: await under(2, n, s),
-    noisyThreadLimit1: await under(6, n, s, "CREATE OR REPLACE WORKLOAD bench_noisy IN all SETTINGS weight = 1, max_concurrent_threads = 1"),
-    maxThreads2Cap2: await under(2, { max_threads: 2 }, {}),
+    none: await run(6, [], false),
+    weights9to1: await run(6, set("weight = 9", "weight = 1")),
+    priority: await run(6, set("priority = -1", "priority = 0")),
+    priorityMaxCpus2: await run(6, set("priority = -1", "priority = 0, max_cpus = 2")),
+    maxCpus1: await run(6, set("", "max_cpus = 1")),
+    priorityCap2: await run(2, set("priority = -1", "priority = 0")),
+    priorityMaxCpus1Cap2: await run(2, set("priority = -1", "priority = 0, max_cpus = 1")),
   };
-  return { note: "One shared user, workload named per query. Also read noisyQueriesPerSecond: a tighter limit slows the whale.", passLine: "victim p95 under 2x quiet", cores: await ch("SELECT count() FROM system.asynchronous_metrics WHERE metric LIKE 'CPUFrequencyMHz_%'"), ddl, quiet, variants, victim, noisy };
+  await ch("SYSTEM FLUSH LOGS");
+  const assigned = await ch(`SELECT user, Settings['workload'] AS w, count() FROM system.query_log
+    WHERE user LIKE 'bench_%_u' AND type = 'QueryFinish' AND event_time > now() - INTERVAL 2 HOUR GROUP BY 1, 2 ORDER BY 1, 2 FORMAT TSV`);
+  return {
+    limits: { ratio: RATIO_LIMIT, victimP95CeilingMs: VICTIM_P95_CEILING_MS, quietDrift: QUIET_DRIFT_LIMIT, ceilingStatus: "proposed" },
+    cores: coreEvidence(),
+    clickhouse: await ch("SELECT metric, value FROM system.asynchronous_metrics WHERE metric ILIKE '%CGroup%CPU%' OR metric ILIKE '%NumberOfCPU%' OR metric ILIKE '%NumberOfPhysicalCPU%' FORMAT TSV"),
+    serverSettings: await ch("SELECT name, value FROM system.server_settings WHERE name IN ('cpu_slot_preemption', 'concurrent_threads_soft_limit_num', 'concurrent_threads_scheduler') FORMAT TSV"),
+    assignment: {
+      method: "CREATE USER ... SETTINGS workload = '...' CONST, one user per class",
+      clientOverrideInSql: override.error ? `REFUSED: ${override.error}` : "ALLOWED",
+      clientOverrideInUrl: urlOverride.error ? `REFUSED: ${urlOverride.error}` : "ALLOWED",
+      queryLog: assigned,
+    },
+    unmet: "Memory and IO isolation are not tested. A shared user cannot satisfy this: the client would name the workload.",
+    ddl, variants, victim, noisy,
+  };
 }
 
 async function bm25() {
