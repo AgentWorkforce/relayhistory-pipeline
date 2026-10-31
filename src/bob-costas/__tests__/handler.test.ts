@@ -117,4 +117,25 @@ describe("Bob Costas under org-derived key prefixes (PIPELINE_ORG_FROM_PREFIX)",
     const rec = await readSummaryObject({ store, keyring, ids: { orgId: "org_aws_proof_1", workspaceId: "w" }, key: String(row.object_key), sha256: String(row.object_sha256), kind: "short", revision: 2 });
     expect(rec?.summary).toContain("PLANTED-PROMPT");
   }, 30_000);
+
+  it("rebuilds a ready summary whose pointer is outside the manifest's current prefix (moved session)", async () => {
+    const { pg, db } = await setup();
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
+    const line = JSON.stringify({ type: "user", message: { role: "user", content: "PLANTED-PROMPT moved" } });
+    const prefixed = { ...loc, prefix: "96bulls/org_aws_proof_1" };
+    for (const l of [loc, prefixed]) await store.put(rawChunkKey(l, 0, 0, "abcdef12", "jsonl"), zstdCompressSync(Buffer.from(line + "\n")));
+    const m = manifest(true, [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }]);
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    const deps = { db, reader: { provider: "fs", read: async () => ({ manifest: m }) } as never, store, summarizer: extractiveSummarizer, keyring };
+    const at = (manifestKey: string) => ({ payload: { manifestKey }, ctx: { orgId: "org_aws_proof_1" } }) as never;
+    const unprefixed = "v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/manifest.json";
+    await bobCostasHandler("short", deps)(at(unprefixed), recorder);
+    // Same revision and content, now under the tenant prefix: not "current", rebuilt beside the new manifest.
+    const moved = await bobCostasHandler("short", deps)(at(`96bulls/org_aws_proof_1/${unprefixed}`), recorder);
+    expect(moved).not.toEqual({ status: "skipped", reason: "summary_current" });
+    const row = (await pg.query<Record<string, unknown>>(`SELECT object_key FROM sessions.session_summaries WHERE org_id = 'org_aws_proof_1'`)).rows[0]!;
+    expect(row.object_key).toBe("96bulls/org_aws_proof_1/v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/short.json.enc");
+    // And a replay at the same place is current again.
+    expect(await bobCostasHandler("short", deps)(at(`96bulls/org_aws_proof_1/${unprefixed}`), recorder)).toEqual({ status: "skipped", reason: "summary_current" });
+  }, 30_000);
 });
