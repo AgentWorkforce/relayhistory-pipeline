@@ -42,7 +42,13 @@ export const SESSION_DIRECTORY_SEARCH_BOUNDARY = {
     // Scrubbed, <= 1000 characters, written only by session-directory-summary.ts.
     "short_summary",
   ],
-  excluded: ["transcript content", "event content", "tool payloads", "long summary", "embeddings"],
+  excluded: [
+    "transcript content",
+    "event content",
+    "tool payloads",
+    "long summary",
+    "embeddings",
+  ],
   transcriptBackend: "ClickHouse/ObsessionDB (not yet available)",
 } as const;
 
@@ -57,7 +63,9 @@ export function isUsefulAgentPrefix(value: string): boolean {
 export function agentPrefixPattern(value: string): string {
   const normalized = normalizeAgentName(value);
   if (Array.from(normalized).length < MIN_AGENT_PREFIX_CHARS) {
-    throw new RangeError(`agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`);
+    throw new RangeError(
+      `agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`,
+    );
   }
   return `${normalized.replace(/[\\%_]/g, "\\$&")}%`;
 }
@@ -67,10 +75,16 @@ export function agentPrefixPattern(value: string): string {
  * cannot push the non-leakproof LIKE operator below an RLS security barrier, so
  * the text_pattern_ops range must be explicit and LIKE remains the exact recheck.
  */
-export function agentPrefixRange(value: string): { lower: string; upper: string; pattern: string } {
+export function agentPrefixRange(value: string): {
+  lower: string;
+  upper: string;
+  pattern: string;
+} {
   const lower = normalizeAgentName(value);
   if (Array.from(lower).length < MIN_AGENT_PREFIX_CHARS) {
-    throw new RangeError(`agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`);
+    throw new RangeError(
+      `agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`,
+    );
   }
   const points = Array.from(lower);
   for (let index = points.length - 1; index >= 0; index -= 1) {
@@ -83,7 +97,9 @@ export function agentPrefixRange(value: string): { lower: string; upper: string;
       pattern: agentPrefixPattern(value),
     };
   }
-  throw new RangeError("agent prefix has no finite text_pattern_ops upper bound");
+  throw new RangeError(
+    "agent prefix has no finite text_pattern_ops upper bound",
+  );
 }
 
 /**
@@ -120,7 +136,9 @@ export const SESSION_DIRECTORY_LIST_COLUMNS = [
 ] as const;
 
 const listColumns = SESSION_DIRECTORY_LIST_COLUMNS.join(", ");
-const joinedListColumns = SESSION_DIRECTORY_LIST_COLUMNS.map((column) => `d.${column}`).join(", ");
+const joinedListColumns = SESSION_DIRECTORY_LIST_COLUMNS.map(
+  (column) => `d.${column}`,
+).join(", ");
 
 /** Parameterized definitions shared by plan tests and future API adapters. */
 export const SESSION_DIRECTORY_QUERIES = {
@@ -196,8 +214,10 @@ SELECT ${joinedListColumns} FROM sessions.session_directory_machines AS membersh
 export const SESSION_DIRECTORY_SEARCH_RPC = {
   name: "sessions.search_session_directory",
   args: {
-    p_workspace_id: "text, NULL = organization-wide over the claimed workspaces",
-    p_query: "text: substring of search_text (metadata + scrubbed short_summary)",
+    p_workspace_id:
+      "text, NULL = organization-wide over the claimed workspaces",
+    p_query:
+      "text: substring of search_text (metadata + scrubbed short_summary)",
     p_harness: "text: exact harness (the read API's `source`)",
     p_project_id: "text: exact project",
     p_project_contains: "text: case-insensitive project substring",
@@ -208,14 +228,23 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     p_user_id: "text: user membership",
     p_machine_id: "text: machine membership",
     p_since: "timestamptz: last_activity_at >= since",
-    p_until: "timestamptz: created_at <= until (activity interval overlaps the window)",
+    p_until:
+      "timestamptz: created_at <= until (activity interval overlaps the window)",
     p_session_id: "text: exact session id",
-    p_cursor_last_activity_at: "timestamptz", p_cursor_session_id: "text", p_cursor_harness: "text",
-    p_cursor_workspace_id: "text: required for organization-wide pages, else equal to p_workspace_id or NULL",
-    p_limit: "integer 1..50 (default 50); the RPC returns up to p_limit + 1 rows",
+    p_cursor_last_activity_at: "timestamptz",
+    p_cursor_session_id: "text",
+    p_cursor_harness: "text",
+    p_cursor_workspace_id:
+      "text: required for organization-wide pages, else equal to p_workspace_id or NULL",
+    p_limit:
+      "integer 1..50 (default 50); the RPC returns up to p_limit + 1 rows",
   },
   workerRole: "session_directory_search_worker",
-  claims: { role: "session_directory_search_worker", orgId: "app_metadata.org_id", workspaceIds: "app_metadata.workspace_ids" },
+  claims: {
+    role: "session_directory_search_worker",
+    orgId: "app_metadata.org_id",
+    workspaceIds: "app_metadata.workspace_ids",
+  },
   /** Meaningful characters after normalizeSearchQuery: not separators, format characters or marks. */
   minQueryChars: 3,
   maxQueryChars: 200,
@@ -224,17 +253,39 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
   maxLimit: 50,
   /** At most maxLimit + 1 rows: a full page plus one row that signals more. */
   maxRows: 51,
-  order: "last_activity_at DESC, session_id DESC, harness DESC (organization-wide: then workspace_id DESC)",
-  cursor: "(last_activity_at, session_id, harness[, workspace_id]) of the last returned row; strictly older rows follow",
+  order:
+    "last_activity_at DESC, session_id DESC, harness DESC (organization-wide: then workspace_id DESC)",
+  cursor:
+    "(last_activity_at, session_id, harness[, workspace_id]) of the last returned row; strictly older rows follow",
   returns: [
-    "org_id", "workspace_id", "harness", "session_id", "created_at", "last_activity_at",
-    "title", "task_title", "agent_name", "project_id", "git_repo", "git_branch", "model", "state",
-    "event_count", "input_tokens", "output_tokens", "cost_usd_micros",
-    "machine_ids", "user_ids", "short_summary", "projected_at",
+    "org_id",
+    "workspace_id",
+    "harness",
+    "session_id",
+    "created_at",
+    "last_activity_at",
+    "title",
+    "task_title",
+    "agent_name",
+    "project_id",
+    "git_repo",
+    "git_branch",
+    "model",
+    "state",
+    "event_count",
+    "input_tokens",
+    "output_tokens",
+    "cost_usd_micros",
+    "machine_ids",
+    "user_ids",
+    "short_summary",
+    "projected_at",
   ],
   errors: {
-    "42501": "caller is not the Worker role, or tenant claims missing, malformed, for another role, or not covering the workspace",
-    "22023": "an invalid value: text under the meaningful-character rule, limit, state, agent match, harness, cursor, since > until, or a contradictory pair",
+    "42501":
+      "caller is not the Worker role, or tenant claims missing, malformed, for another role, or not covering the workspace",
+    "22023":
+      "an invalid value: text under the meaningful-character rule, limit, state, agent match, harness, cursor, since > until, or a contradictory pair",
     "0A000": "an intentionally unsupported combination (see unsupported)",
     "57014": "statement_timeout (2s on the Worker role) exceeded",
   },
@@ -245,7 +296,10 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     "ordering other than recency",
   ],
   /** Returned as 22023. */
-  contradictory: ["p_no_project with p_project_id or p_project_contains", "p_since later than p_until"],
+  contradictory: [
+    "p_no_project with p_project_id or p_project_contains",
+    "p_since later than p_until",
+  ],
 } as const;
 
 /**
@@ -265,94 +319,178 @@ SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_a
 
 export const REQUIRED_SEARCH_INDEXES = [
   {
-    id: "workspace-recent-sessions", indexName: "session_directory_workspace_recent_idx",
-    tableName: "session_directory", consumers: ["Cloud Sessions", "Cloud MCP list_session_timings"],
+    id: "workspace-recent-sessions",
+    indexName: "session_directory_workspace_recent_idx",
+    tableName: "session_directory",
+    consumers: ["Cloud Sessions", "Cloud MCP list_session_timings"],
     queryShape: "org + workspace equality; logical-session activity keyset",
-    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, last_activity_at desc, session_id desc, harness desc)"],
-    expectedPredicate: "(deleted_at IS NULL)", requiresDirectoryProjection: true,
+    definitionFragments: [
+      "on sessions.session_directory",
+      "(org_id, workspace_id, last_activity_at desc, session_id desc, harness desc)",
+    ],
+    expectedPredicate: "(deleted_at IS NULL)",
+    requiresDirectoryProjection: true,
   },
   {
-    id: "org-recent-sessions", indexName: "session_directory_org_recent_idx",
-    tableName: "session_directory", consumers: ["Cloud org-wide session list"],
+    id: "org-recent-sessions",
+    indexName: "session_directory_org_recent_idx",
+    tableName: "session_directory",
+    consumers: ["Cloud org-wide session list"],
     queryShape: "org equality; cross-workspace logical-session activity keyset",
-    definitionFragments: ["on sessions.session_directory", "(org_id, last_activity_at desc, session_id desc, harness desc, workspace_id desc)"],
-    expectedPredicate: "(deleted_at IS NULL)", requiresDirectoryProjection: true,
+    definitionFragments: [
+      "on sessions.session_directory",
+      "(org_id, last_activity_at desc, session_id desc, harness desc, workspace_id desc)",
+    ],
+    expectedPredicate: "(deleted_at IS NULL)",
+    requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-harness-recent-sessions", indexName: "session_directory_harness_recent_idx",
-    tableName: "session_directory", consumers: ["Cloud Sessions harness/source filter", "Cloud MCP"],
+    id: "workspace-harness-recent-sessions",
+    indexName: "session_directory_harness_recent_idx",
+    tableName: "session_directory",
+    consumers: ["Cloud Sessions harness/source filter", "Cloud MCP"],
     queryShape: "org + workspace + harness equality; activity keyset",
-    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, harness, last_activity_at desc, session_id desc)"],
-    expectedPredicate: "(deleted_at IS NULL)", requiresDirectoryProjection: true,
+    definitionFragments: [
+      "on sessions.session_directory",
+      "(org_id, workspace_id, harness, last_activity_at desc, session_id desc)",
+    ],
+    expectedPredicate: "(deleted_at IS NULL)",
+    requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-project-recent-sessions", indexName: "session_directory_project_recent_idx",
-    tableName: "session_directory", consumers: ["Cloud Sessions project filter", "Cloud MCP"],
+    id: "workspace-project-recent-sessions",
+    indexName: "session_directory_project_recent_idx",
+    tableName: "session_directory",
+    consumers: ["Cloud Sessions project filter", "Cloud MCP"],
     queryShape: "org + workspace + exact project; activity keyset",
-    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, project_id, last_activity_at desc, session_id desc, harness desc)"],
-    expectedPredicate: "((project_id IS NOT NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
+    definitionFragments: [
+      "on sessions.session_directory",
+      "(org_id, workspace_id, project_id, last_activity_at desc, session_id desc, harness desc)",
+    ],
+    expectedPredicate: "((project_id IS NOT NULL) AND (deleted_at IS NULL))",
+    requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-no-project-recent-sessions", indexName: "session_directory_no_project_recent_idx",
-    tableName: "session_directory", consumers: ["Cloud Sessions unassigned-project filter"],
+    id: "workspace-no-project-recent-sessions",
+    indexName: "session_directory_no_project_recent_idx",
+    tableName: "session_directory",
+    consumers: ["Cloud Sessions unassigned-project filter"],
     queryShape: "org + workspace + no project; activity keyset",
-    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, last_activity_at desc, session_id desc, harness desc)"],
-    expectedPredicate: "((project_id IS NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
+    definitionFragments: [
+      "on sessions.session_directory",
+      "(org_id, workspace_id, last_activity_at desc, session_id desc, harness desc)",
+    ],
+    expectedPredicate: "((project_id IS NULL) AND (deleted_at IS NULL))",
+    requiresDirectoryProjection: true,
   },
   {
-    id: "agent-name-exact-or-prefix", indexName: "session_directory_agent_recent_idx",
-    tableName: "session_directory", consumers: ["Cloud Sessions agent filter", "Relay Desktop remote parity"],
-    queryShape: "normalized exact or >=3-character prefix agent name; activity keyset",
-    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, agent_name_normalized text_pattern_ops, last_activity_at desc, session_id desc, harness desc)"],
-    expectedPredicate: "((agent_name_normalized IS NOT NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
+    id: "agent-name-exact-or-prefix",
+    indexName: "session_directory_agent_recent_idx",
+    tableName: "session_directory",
+    consumers: ["Cloud Sessions agent filter", "Relay Desktop remote parity"],
+    queryShape:
+      "normalized exact or >=3-character prefix agent name; activity keyset",
+    definitionFragments: [
+      "on sessions.session_directory",
+      "(org_id, workspace_id, agent_name_normalized text_pattern_ops, last_activity_at desc, session_id desc, harness desc)",
+    ],
+    expectedPredicate:
+      "((agent_name_normalized IS NOT NULL) AND (deleted_at IS NULL))",
+    requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-created-range", indexName: "session_directory_created_recent_idx",
-    tableName: "session_directory", consumers: ["Cloud Sessions created filter"],
+    id: "workspace-created-range",
+    indexName: "session_directory_created_recent_idx",
+    tableName: "session_directory",
+    consumers: ["Cloud Sessions created filter"],
     queryShape: "org + workspace + created range; created keyset",
-    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, created_at desc, session_id desc, harness desc)"],
-    expectedPredicate: "(deleted_at IS NULL)", requiresDirectoryProjection: true,
+    definitionFragments: [
+      "on sessions.session_directory",
+      "(org_id, workspace_id, created_at desc, session_id desc, harness desc)",
+    ],
+    expectedPredicate: "(deleted_at IS NULL)",
+    requiresDirectoryProjection: true,
   },
   {
-    id: "workspace-state-recent", indexName: "session_directory_state_recent_idx",
-    tableName: "session_directory", consumers: ["Cloud Sessions state filter"],
+    id: "workspace-state-recent",
+    indexName: "session_directory_state_recent_idx",
+    tableName: "session_directory",
+    consumers: ["Cloud Sessions state filter"],
     queryShape: "org + workspace + state; activity keyset",
-    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, state, last_activity_at desc, session_id desc, harness desc)"],
-    expectedPredicate: "(deleted_at IS NULL)", requiresDirectoryProjection: true,
+    definitionFragments: [
+      "on sessions.session_directory",
+      "(org_id, workspace_id, state, last_activity_at desc, session_id desc, harness desc)",
+    ],
+    expectedPredicate: "(deleted_at IS NULL)",
+    requiresDirectoryProjection: true,
   },
   {
-    id: "session-id-lookup", indexName: "session_directory_session_lookup_idx",
-    tableName: "session_directory", consumers: ["Cloud session open", "Cloud MCP"],
+    id: "session-id-lookup",
+    indexName: "session_directory_session_lookup_idx",
+    tableName: "session_directory",
+    consumers: ["Cloud session open", "Cloud MCP"],
     queryShape: "org + session id when workspace and harness are unknown",
-    definitionFragments: ["on sessions.session_directory", "(org_id, session_id)"],
+    definitionFragments: [
+      "on sessions.session_directory",
+      "(org_id, session_id)",
+    ],
     requiresDirectoryProjection: true,
   },
   {
-    id: "tenant-project-substring", indexName: "session_directory_tenant_project_trgm_idx",
-    tableName: "session_directory", consumers: ["sessions.search_session_directory p_project_contains (RelayHistory projectContains)"],
+    id: "tenant-project-substring",
+    indexName: "session_directory_tenant_project_trgm_idx",
+    tableName: "session_directory",
+    consumers: [
+      "sessions.search_session_directory p_project_contains (RelayHistory projectContains)",
+    ],
     queryShape: "org + workspace scoped case-insensitive project substring",
-    definitionFragments: ["on sessions.session_directory using gin", "(org_id, workspace_id, project_id", "gin_trgm_ops)"],
-    expectedPredicate: "((project_id IS NOT NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
-  },
-  {
-    id: "tenant-search-substring", indexName: "session_directory_tenant_search_trgm_idx",
-    tableName: "session_directory", consumers: ["sessions.search_session_directory (RelayHistory #226 metadata search)"],
-    queryShape: "org + workspace scoped case-insensitive substring over search_text (metadata plus scrubbed short_summary)",
-    definitionFragments: ["on sessions.session_directory using gin", "(org_id, workspace_id, search_text", "gin_trgm_ops)"],
-    expectedPredicate: "((search_text <> ''::text) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
-  },
-  {
-    id: "user-membership-recent", indexName: "session_directory_users_recent_idx",
-    tableName: "session_directory_users", consumers: ["Cloud Sessions person filter", "Cloud MCP user filter"],
-    queryShape: "org + workspace + user membership; activity keyset",
-    definitionFragments: ["on sessions.session_directory_users", "(org_id, workspace_id, user_id, last_activity_at desc, session_id desc, harness desc)"],
+    definitionFragments: [
+      "on sessions.session_directory using gin",
+      "(org_id, workspace_id, project_id",
+      "gin_trgm_ops)",
+    ],
+    expectedPredicate: "((project_id IS NOT NULL) AND (deleted_at IS NULL))",
     requiresDirectoryProjection: true,
   },
   {
-    id: "machine-membership-recent", indexName: "session_directory_machines_recent_idx",
-    tableName: "session_directory_machines", consumers: ["Cloud machine filter"],
+    id: "tenant-search-substring",
+    indexName: "session_directory_tenant_search_trgm_idx",
+    tableName: "session_directory",
+    consumers: [
+      "sessions.search_session_directory (RelayHistory #226 metadata search)",
+    ],
+    queryShape:
+      "org + workspace scoped case-insensitive substring over search_text (metadata plus scrubbed short_summary)",
+    definitionFragments: [
+      "on sessions.session_directory using gin",
+      "(org_id, workspace_id, search_text",
+      "gin_trgm_ops)",
+    ],
+    expectedPredicate: "((search_text <> ''::text) AND (deleted_at IS NULL))",
+    requiresDirectoryProjection: true,
+  },
+  {
+    id: "user-membership-recent",
+    indexName: "session_directory_users_recent_idx",
+    tableName: "session_directory_users",
+    consumers: ["Cloud Sessions person filter", "Cloud MCP user filter"],
+    queryShape: "org + workspace + user membership; activity keyset",
+    definitionFragments: [
+      "on sessions.session_directory_users",
+      "(org_id, workspace_id, user_id, last_activity_at desc, session_id desc, harness desc)",
+    ],
+    requiresDirectoryProjection: true,
+  },
+  {
+    id: "machine-membership-recent",
+    indexName: "session_directory_machines_recent_idx",
+    tableName: "session_directory_machines",
+    consumers: ["Cloud machine filter"],
     queryShape: "org + workspace + machine membership; activity keyset",
-    definitionFragments: ["on sessions.session_directory_machines", "(org_id, workspace_id, machine_id, last_activity_at desc, session_id desc, harness desc)"],
+    definitionFragments: [
+      "on sessions.session_directory_machines",
+      "(org_id, workspace_id, machine_id, last_activity_at desc, session_id desc, harness desc)",
+    ],
     requiresDirectoryProjection: true,
   },
 ] as const satisfies readonly SearchIndexRequirement[];
@@ -383,30 +521,51 @@ SELECT table_rel.relname AS table_name,
  ORDER BY table_rel.relname, index_rel.relname`;
 
 function normalized(value: string | null | undefined): string {
-  return (value ?? "").toLowerCase().replace(/["']/g, "").replace(/\s+/g, " ")
-    .replace(/\s*,\s*/g, ", ").trim();
+  return (value ?? "")
+    .toLowerCase()
+    .replace(/["']/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ")
+    .trim();
 }
 
 function normalizedPredicate(value: string | null | undefined): string {
   const literals: string[] = [];
   let masked = "";
   const input = value ?? "";
-  for (let index = 0; index < input.length;) {
-    if (input[index] !== "'") { masked += input[index]; index += 1; continue; }
+  for (let index = 0; index < input.length; ) {
+    if (input[index] !== "'") {
+      masked += input[index];
+      index += 1;
+      continue;
+    }
     const start = index;
     index += 1;
     while (index < input.length) {
-      if (input[index] !== "'") { index += 1; continue; }
-      if (input[index + 1] === "'") { index += 2; continue; }
+      if (input[index] !== "'") {
+        index += 1;
+        continue;
+      }
+      if (input[index + 1] === "'") {
+        index += 2;
+        continue;
+      }
       index += 1;
       break;
     }
     masked += `\u0001${literals.length}\u0002`;
     literals.push(input.slice(start, index));
   }
-  return masked.toLowerCase().replace(/"/g, "").replace(/\s+/g, " ")
-    .replace(/\s*,\s*/g, ", ").trim()
-    .replace(/\u0001(\d+)\u0002/g, (_marker, offset: string) => literals[Number(offset)] ?? "");
+  return masked
+    .toLowerCase()
+    .replace(/"/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ")
+    .trim()
+    .replace(
+      /\u0001(\d+)\u0002/g,
+      (_marker, offset: string) => literals[Number(offset)] ?? "",
+    );
 }
 
 export type SearchIndexReadiness = { directoryProjectionComplete: boolean };
@@ -434,27 +593,44 @@ export function auditSearchIndexes(
       if (!row.is_ready) reasons.push("not ready");
       const definition = normalized(row.index_definition);
       for (const fragment of requirement.definitionFragments) {
-        if (!definition.includes(normalized(fragment))) reasons.push(`definition missing: ${fragment}`);
+        if (!definition.includes(normalized(fragment)))
+          reasons.push(`definition missing: ${fragment}`);
       }
-      const expectedPredicate = "expectedPredicate" in requirement ? requirement.expectedPredicate : null;
-      if (normalizedPredicate(row.predicate) !== normalizedPredicate(expectedPredicate)) {
-        reasons.push(expectedPredicate ? "predicate mismatch" : "unexpected predicate");
+      const expectedPredicate =
+        "expectedPredicate" in requirement
+          ? requirement.expectedPredicate
+          : null;
+      if (
+        normalizedPredicate(row.predicate) !==
+        normalizedPredicate(expectedPredicate)
+      ) {
+        reasons.push(
+          expectedPredicate ? "predicate mismatch" : "unexpected predicate",
+        );
       }
       const options = normalized(row.reloptions);
-      const reloptionFragments: readonly string[] = "reloptionFragments" in requirement
-        ? requirement.reloptionFragments as readonly string[]
-        : [];
+      const reloptionFragments: readonly string[] =
+        "reloptionFragments" in requirement
+          ? (requirement.reloptionFragments as readonly string[])
+          : [];
       for (const fragment of reloptionFragments) {
-        if (!options.includes(normalized(fragment))) reasons.push(`option missing: ${fragment}`);
+        if (!options.includes(normalized(fragment)))
+          reasons.push(`option missing: ${fragment}`);
       }
     }
-    if ("requiresDirectoryProjection" in requirement && requirement.requiresDirectoryProjection &&
-        !readiness.directoryProjectionComplete) {
+    if (
+      "requiresDirectoryProjection" in requirement &&
+      requirement.requiresDirectoryProjection &&
+      !readiness.directoryProjectionComplete
+    ) {
       reasons.push("directory projection incomplete");
     }
     return {
-      id: requirement.id, indexName: requirement.indexName, tableName: requirement.tableName,
-      ready: reasons.length === 0, reasons,
+      id: requirement.id,
+      indexName: requirement.indexName,
+      tableName: requirement.tableName,
+      ready: reasons.length === 0,
+      reasons,
     };
   });
   return { passed: indexes.every((index) => index.ready), indexes };

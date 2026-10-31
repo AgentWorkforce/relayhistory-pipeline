@@ -30,7 +30,11 @@ describe("decision 0002 search index contract", () => {
     const report = auditSearchIndexes(catalogRows(), READY);
     expect(report.passed).toBe(true);
     expect(report.indexes.every((index) => index.ready)).toBe(true);
-    expect(report.indexes.every((index) => index.tableName.startsWith("session_directory"))).toBe(true);
+    expect(
+      report.indexes.every((index) =>
+        index.tableName.startsWith("session_directory"),
+      ),
+    ).toBe(true);
   });
 
   test("fails closed when an index is absent", () => {
@@ -38,7 +42,10 @@ describe("decision 0002 search index contract", () => {
     const missing = rows.pop()!;
     const report = auditSearchIndexes(rows, READY);
     expect(report.passed).toBe(false);
-    expect(report.indexes.find((index) => index.indexName === missing.index_name)?.reasons).toEqual(["missing"]);
+    expect(
+      report.indexes.find((index) => index.indexName === missing.index_name)
+        ?.reasons,
+    ).toEqual(["missing"]);
   });
 
   test("rejects invalid, unfinished, or structurally different indexes", () => {
@@ -47,35 +54,57 @@ describe("decision 0002 search index contract", () => {
       ...rows[0]!,
       is_valid: false,
       is_ready: false,
-      index_definition: "CREATE INDEX wrong ON sessions.session_directory (org_id)",
+      index_definition:
+        "CREATE INDEX wrong ON sessions.session_directory (org_id)",
     };
     const report = auditSearchIndexes(rows, READY);
     expect(report.passed).toBe(false);
     expect(report.indexes[0]!.reasons).toContain("invalid");
     expect(report.indexes[0]!.reasons).toContain("not ready");
-    expect(report.indexes[0]!.reasons.some((reason) => reason.startsWith("definition missing:"))).toBe(true);
+    expect(
+      report.indexes[0]!.reasons.some((reason) =>
+        reason.startsWith("definition missing:"),
+      ),
+    ).toBe(true);
   });
 
   test("rejects an unexpected or changed partial predicate", () => {
     const rows = catalogRows();
-    const row = rows.find((candidate) => candidate.index_name === "session_directory_agent_recent_idx")!;
+    const row = rows.find(
+      (candidate) =>
+        candidate.index_name === "session_directory_agent_recent_idx",
+    )!;
     row.predicate = `(${row.predicate} AND false)`;
-    expect(auditSearchIndexes(rows, READY).indexes.find((index) => index.indexName === row.index_name)?.reasons)
-      .toContain("predicate mismatch");
+    expect(
+      auditSearchIndexes(rows, READY).indexes.find(
+        (index) => index.indexName === row.index_name,
+      )?.reasons,
+    ).toContain("predicate mismatch");
   });
 
   test("fails until the logical-session projector and backfill declare completion", () => {
-    const report = auditSearchIndexes(catalogRows(), { directoryProjectionComplete: false });
+    const report = auditSearchIndexes(catalogRows(), {
+      directoryProjectionComplete: false,
+    });
     expect(report.passed).toBe(false);
-    expect(report.indexes.every((index) => index.reasons.includes("directory projection incomplete"))).toBe(true);
+    expect(
+      report.indexes.every((index) =>
+        index.reasons.includes("directory projection incomplete"),
+      ),
+    ).toBe(true);
   });
 
   test("defines an explicit metadata-only search boundary", () => {
     expect(SESSION_DIRECTORY_SEARCH_BOUNDARY.metadataOnly).toBe(true);
     expect(SESSION_DIRECTORY_SEARCH_BOUNDARY.fields).toContain("agent_name");
-    expect(SESSION_DIRECTORY_SEARCH_BOUNDARY.excluded).toContain("transcript content");
-    expect(REQUIRED_SEARCH_INDEXES.some((requirement) => requirement.tableName === "convergence_events"))
-      .toBe(false);
+    expect(SESSION_DIRECTORY_SEARCH_BOUNDARY.excluded).toContain(
+      "transcript content",
+    );
+    expect(
+      REQUIRED_SEARCH_INDEXES.some(
+        (requirement) => requirement.tableName === "convergence_events",
+      ),
+    ).toBe(false);
   });
 });
 
@@ -103,6 +132,8 @@ describe("agent-name lookup contract", () => {
       upper: "ac",
       pattern: `ab${String.fromCodePoint(0x10ffff)}%`,
     });
-    expect(() => agentPrefixRange(String.fromCodePoint(0x10ffff).repeat(3))).toThrow(RangeError);
+    expect(() =>
+      agentPrefixRange(String.fromCodePoint(0x10ffff).repeat(3)),
+    ).toThrow(RangeError);
   });
 });
