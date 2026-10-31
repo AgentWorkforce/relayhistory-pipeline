@@ -1186,7 +1186,6 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   routes.get("/pipeline/manifests/base", baseRead);
   routes.get("/pipeline/manifests/base/", baseRead);
 
-
   /**
    * Startup reconciliation: version, scoped to the stored machine/writer. With
    * `manifest=1` also the stored copy from the same read, for a compare-and-swap

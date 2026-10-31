@@ -396,7 +396,10 @@ async function planned(
         started_at: AT,
       },
       // A cold export is owned by its migration grant (#42's owner fence); a live session by its machine.
-      writer: { delivery_instance_id: owner, plugin_version: "96bulls-courier/0.3.0" },
+      writer: {
+        delivery_instance_id: owner,
+        plugin_version: "96bulls-courier/0.3.0",
+      },
       raw: {
         owner,
         state: "closed",
