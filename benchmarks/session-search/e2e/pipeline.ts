@@ -28,7 +28,7 @@ const KID = "search-proof";
 const INGEST = "http://ingest.test";
 
 export interface SessionInput { id: string; lines: string[] }
-export interface Pointer { orgId: string; manifest: ManifestV1; key: string }
+export interface Pointer { orgId: string; manifest: ManifestV1; key: string; keyPrefix: string }
 
 export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointer) => Promise<void>) {
   const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -50,7 +50,7 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
   const sql = { ...wrap(db), transaction: <T>(work: (tx: SqlExecutor) => Promise<T>) => db.transaction((tx) => work(wrap(tx))) };
   const root = await mkdtemp(join(tmpdir(), "96bulls-search-proof-"));
   Object.assign(process.env, {
-    LOCKER_BUCKET: "raw", TENANT_ORG_ID: orgIdForStack, TENANT_ORG_IDS: `${orgIdForStack},org-e2e-b`, AUTH_ISSUER: ISSUER, RELAYAUTH_JWKS_URL: JWKS_URL,
+    LOCKER_BUCKET: "raw", TENANT_ORG_ID: orgIdForStack, TENANT_ORG_IDS: `${orgIdForStack},org-e2e-b`, PIPELINE_ORG_FROM_PREFIX: "true", AUTH_ISSUER: ISSUER, RELAYAUTH_JWKS_URL: JWKS_URL,
     RELAYHISTORY_ORIGIN: ORIGIN, ALLOW_INTERIM_RELAYAUTH_BEARER: "true",
   });
   const store = createFsStore({ root });
@@ -63,12 +63,12 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
     return realFetch(input, init);
   }) as typeof fetch;
 
-  const deps = pipelineQueueDeps({} as Bindings, {
+  const deps = pipelineQueueDeps({ PIPELINE_ORG_FROM_PREFIX: "true" } as Bindings, {
     queue: postgresPipelineQueue(sql), sink: sqlPipelineEventSink(sql), deadLetters: postgresDeadLetterStore(sql),
     index: {
       upsertRawPointer: async (pointer: { manifestKey: string }, ctx: { orgId: string }) => {
         const manifest = JSON.parse(new TextDecoder().decode(await readAll(await store.get(objectKey(pointer.manifestKey))))) as ManifestV1;
-        await onIndexed({ orgId: ctx.orgId, manifest, key: pointer.manifestKey });
+        await onIndexed({ orgId: ctx.orgId, manifest, key: pointer.manifestKey, keyPrefix: pointer.manifestKey.slice(0, pointer.manifestKey.indexOf("v1/")) });
       },
     } as never,
   });

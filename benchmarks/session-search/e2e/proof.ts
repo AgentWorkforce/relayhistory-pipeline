@@ -57,7 +57,7 @@ const countRows = async (where: string) => Number((await admin.run(`SELECT count
 async function g1() {
   const deps: IndexDeps = { store: null as never, search, optedOutWorkspaces: new Set(["ws-optout"]), watermarks: new Map() };
   const outcomes: string[] = [];
-  const pipeline = await startPipeline("org-e2e-a", async (p: Pointer) => { outcomes.push(await indexManifest(p.orgId, p.manifest, deps)); last = p; });
+  const pipeline = await startPipeline("org-e2e-a", async (p: Pointer) => { outcomes.push(await indexManifest(p.orgId, p.manifest, deps, p.keyPrefix)); last = p; });
   let last: Pointer | undefined;
   deps.store = pipeline.store as never;
   const secret = Object.values(PLANTED_SECRETS)[0]!;
@@ -87,9 +87,9 @@ async function g1() {
   const rowsBefore = await countRows("org_id = 'org-e2e-a'");
   // A retried delivery with the watermark lost: the dedup token keeps one copy.
   deps.watermarks.clear();
-  const retry = await indexManifest(last!.orgId, last!.manifest, deps);
+  const retry = await indexManifest(last!.orgId, last!.manifest, deps, last!.keyPrefix);
   const rowsAfterRetry = await countRows("org_id = 'org-e2e-a'");
-  const stale = await indexManifest(last!.orgId, last!.manifest, deps);
+  const stale = await indexManifest(last!.orgId, last!.manifest, deps, last!.keyPrefix);
   const quarantined = await indexManifest("org-e2e-a", { ...last!.manifest, revision: 99, raw: { ...last!.manifest.raw, scrub: undefined } } as never, deps);
   await pipeline.courier("org-e2e-a", "ws-optout", [{ id: "s-e2e-2", lines: [line("optoutmarker", 1)] }]);
   const optOutRows = await countRows("workspace_id = 'ws-optout'");
@@ -101,13 +101,15 @@ async function g1() {
   };
   const claimAbsentRefused = await refused("s-e2e-noclaim", null);
   const claimMismatchRefused = await refused("s-e2e-wrongclaim", { machineId: "machine-other" });
-  // Measured, not gated: a second org through the real ingest under TENANT_ORG_IDS (#94).
+  // A second org through the real ingest: org-derived prefixes with TENANT_ORG_IDS (#94).
   const orgB = await pipeline.courier("org-e2e-b", "ws-e2e-b", [{ id: "s-e2e-b", lines: [line("orgbmarker", 1)] }]);
   const multiOrg = {
     uploaded: orgB.result.uploaded,
     ownOrgHits: (await search.search(scopeOf("org-e2e-b", ["ws-e2e-b"]), { query: "orgbmarker" })).hits.length,
     otherOrgHits: (await search.search(scopeOf("org-e2e-a", ["ws-e2e-b"]), { query: "orgbmarker" })).hits.length,
   };
+  const unlisted = await pipeline.courier("org-e2e-c", "ws-e2e-c", [{ id: "s-e2e-c", lines: [line("orgcmarker", 1)] }]);
+  const unlistedRows = await countRows("org_id = 'org-e2e-c'");
   await pipeline.stop();
   gate("G1_courier_to_search", {
     realCourierUploaded: first.result.uploaded === 1 && second.result.uploaded === 1,
@@ -123,6 +125,9 @@ async function g1() {
     optOutSkipped: optOutRows === 0,
     machineClaimAbsentRefused: claimAbsentRefused,
     machineClaimMismatchRefused: claimMismatchRefused,
+    secondOrgIndexed: multiOrg.uploaded === 1 && multiOrg.ownOrgHits === 1,
+    secondOrgHiddenFromFirst: multiOrg.otherOrgHits === 0,
+    unlistedOrgRefused: unlisted.result.uploaded === 0 && unlisted.landed.claimed === 0 && unlistedRows === 0,
   }, { firstHitMs: Math.round(firstHitMs), rowsBefore, rowsAfterRetry, outcomes, multiOrg, note: "the search-index step is proof code called from session-indexed; no such queue stage exists" });
   return true;
 }

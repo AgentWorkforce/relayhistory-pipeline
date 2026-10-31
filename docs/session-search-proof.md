@@ -37,7 +37,7 @@ are relative. Check this PR's CI at its exact head for current logic gate result
 | Gate | Result | Evidence and limits |
 | --- | --- | --- |
 | G0 Negative controls | PASS | Removing the org predicate, the substring recheck or the dedup token each changes the answer; a wrong result scores recall below 1 |
-| G1 Courier to search | PASS | First hit, planted secret absent with a positive control, append, retry dedup, stale, quarantine, opt-out. Uploads carry the signed machine claim; absent and mismatched claims are refused with no job, pointer or row, and a refusal reports G1 BLOCKED. Second org through the real ingest under `TENANT_ORG_IDS` (#94) is reported as a measurement in `multiOrg`, not a gate |
+| G1 Courier to search | PASS | First hit, planted secret absent with a positive control, append, retry dedup, stale, quarantine, opt-out. Uploads carry the signed machine claim; absent and mismatched claims are refused with no job, pointer or row, and a refusal reports G1 BLOCKED. A second org runs through the real ingest with `PIPELINE_ORG_FROM_PREFIX` and `TENANT_ORG_IDS`, stays hidden from the first, and an unlisted org is refused |
 | G2 Lexical recall | PASS | Recall@5 and @10 of 1.0 and exact counts against the generator on 12 query classes in 2 orgs: phrase, error, path, PR number, case, substring, CJK, accents, 2-character, punctuation, past 4 KB, common |
 | G3 Context | PASS | Window contains the match, focus finds the event, chronological, snippets at most 320 characters, citations, cursors do not repeat |
 | G4 Federation | PASS on a small fixture | Before and after T0, straddling session and backfilled copy once each, pagination, each pool down is named. Event ids are shared by construction; the real legacy-to-store id mapping is unproven. Pre-T0 text past 4 KB stays unsearchable without a backfill |
@@ -100,9 +100,10 @@ same probe at several points while parts merge, and log parts and merges with it
 recurs on the target, throttle backfills to bound active parts and hold reads on a
 backfilling tenant to the legacy pool until merges settle.
 
-**Ingest orgs.** #94 added `TENANT_ORG_IDS`. If `multiOrg` shows the second org indexed
-under its own org id, the limit is closed for fixed sets; otherwise trace `ctx.orgId`
-through `session-indexed`. Then repeat G5 through the real ingest.
+**Ingest orgs.** The earlier refusal was a harness error, not a product limit:
+`TENANT_ORG_IDS` applies with `PIPELINE_ORG_FROM_PREFIX=true`, and the proof had a static
+`PIPELINE_ORG_ID`, so ownership correctly refused the second org. Repeat G5 through the
+real ingest next.
 
 ## Not proven
 

@@ -15,7 +15,7 @@ export interface SearchHit {
   workspace_id: string; harness: string; session_id: string; machine_id: string;
   event_id: string; ts: string; snippet: string; citation: string;
 }
-export interface SearchOptions { query: string; limit?: number; since?: string; until?: string; source?: string; cursor?: string }
+export interface SearchOptions { query: string; limit?: number; since?: string; until?: string; source?: string; cursor?: string; tag?: string }
 export interface ContextEvent { event_id: string; ts: string; kind: string; text: string; is_match: 0 | 1 }
 
 const MAX_LIMIT = 20;
@@ -112,7 +112,7 @@ export class SessionSearchStore {
         toString(toUnixTimestamp64Milli(ts)) AS at,
         substringUTF8(text, greatest(positionCaseInsensitiveUTF8(text, {q:String}) - 80, 1), ${SNIPPET_CHARS}) AS snippet
       FROM ${TABLE} WHERE ${filters.join(" AND ")}
-      ORDER BY ts DESC, event_id DESC LIMIT ${limit + 1}`, bound, settings);
+      ORDER BY ts DESC, event_id DESC LIMIT ${limit + 1}`, bound, { ...settings, ...(o.tag ? { log_comment: o.tag } : {}) });
     const page = rows.slice(0, limit).map(({ at, ...r }) => ({ ...r, ts: iso(at) }));
     const last = page.at(-1);
     return {

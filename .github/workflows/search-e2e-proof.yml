@@ -7,6 +7,11 @@ on:
       - src/alleyoop/**
       - .github/workflows/search-e2e-proof.yml
   workflow_dispatch:
+    inputs:
+      diagnose:
+        description: Also run the per-class saturation sweep
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -53,3 +58,42 @@ jobs:
         with:
           name: e2e-proof-report-${{ matrix.scale }}
           path: e2e-report.json
+  diagnose:
+    if: ${{ inputs.diagnose }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: benchmark-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password benchmark-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Run saturation sweep
+        env:
+          BENCH_CH_URL: http://127.0.0.1:8123
+          BENCH_CH_USER: default
+          BENCH_CH_PASSWORD: benchmark-only
+          BENCH_SCALE: M
+          BENCH_SHAPE_FILE: benchmarks/session-search/e2e/shape-2026-10-31.json
+          BENCH_OUT: diagnose-report.json
+        run: bun benchmarks/session-search/e2e/diagnose.ts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnose-report
+          path: diagnose-report.json

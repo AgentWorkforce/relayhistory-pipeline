@@ -36,7 +36,8 @@ export function recordText(line: string): { text: string; kind: string; ts: stri
   return { text: out.join(" "), kind: typeof o.type === "string" ? o.type : "record", ts: typeof o.timestamp === "string" ? o.timestamp : null };
 }
 
-export async function indexManifest(orgId: string, m: ManifestV1, deps: IndexDeps): Promise<IndexOutcome> {
+/** `keyPrefix` is the deployment or org prefix the object store holds this session under. */
+export async function indexManifest(orgId: string, m: ManifestV1, deps: IndexDeps, keyPrefix = ""): Promise<IndexOutcome> {
   const s = m.session;
   const key = `${orgId}/${s.workspace_id}/${s.harness}/${s.session_id}/${s.machine_id}`;
   const mark = deps.watermarks.get(key);
@@ -48,7 +49,7 @@ export async function indexManifest(orgId: string, m: ManifestV1, deps: IndexDep
   const fresh = m.raw.chunks.slice(mark?.chunks ?? 0);
   if (!fresh.length) { deps.watermarks.set(key, { revision: m.revision, chunks: mark?.chunks ?? 0 }); return "skipped_no_new"; }
   for (const chunk of fresh) {
-    const stored = await readAll(await deps.store.get(rawChunkKey(loc, chunk.seq, chunk.start_offset, chunk.sha256_8, m.raw.format)));
+    const stored = await readAll(await deps.store.get(`${keyPrefix}${rawChunkKey(loc, chunk.seq, chunk.start_offset, chunk.sha256_8, m.raw.format)}` as never));
     if (createHash("sha256").update(stored).digest("hex") !== chunk.stored_sha256) throw new Error("chunk_hash_mismatch");
     const lines = zstdDecompressSync(Buffer.from(stored)).toString("utf8").split("\n").filter(Boolean);
     const records: SearchRecord[] = lines.map((line, i) => {
