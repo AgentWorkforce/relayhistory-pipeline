@@ -9,6 +9,53 @@ The only eligible target is the existing project
 org `929835122282`, region `us-central1`, billing account
 `014D50-E96D1A-DE6360`. Do not create or select another project.
 
+## Live 96Bulls application proof
+
+The full base application path completed on merge
+`9aa77fc70374b2e8578cf44881e51e9896f7d2c8`. The synthetic manifest landed at
+`2026-10-31T03:40:51Z` (`2026-10-30 20:40 PDT`), and the downstream stages
+completed in the following seconds. The release used chart
+`96bulls-0.3.1` and the eligible services image built from
+`09293c8d649f912aa2f4414e31a3ad7fca6eceee`, digest
+`sha256:8d77de9be0b5e5e47dda75986da882e577aafb9e28e510c844e8134fea372425`.
+Alchemy reconciled 47 of 47 operations successfully. Cloud SQL was adopted
+with `created=false`; it was not recreated.
+
+The proof used synthetic session `gcp-e2e-20261031`, UUIDv7
+`01a1900b-b96c-7abb-8d12-29c30ff197f2`, and trace
+`01a1900b-b96c-7f47-826d-631632c6c32e`. It established all of the following:
+
+- RelayAuth minted a 60-second assertion bound to the exact internal AlleyOop
+  origin. The target tenant's trace request returned HTTP 200 with verdict
+  `indexed`; the same trace under another tenant returned HTTP 404 with no
+  stages, and an assertion bound to a different internal origin returned HTTP
+  401 `invalid_claims`.
+- AlleyOop sealed one `relayhistory-scrub` version 1 chunk and landed a closed
+  revision-1 manifest. GCS contains that manifest, the compressed raw chunk,
+  and encrypted `summary/{short,long}.json.enc` objects. The decompressed raw
+  retained the non-secret content marker while the planted AWS-key-shaped
+  value was absent.
+- HoopDB recorded the exact tenant, workspace, machine, harness, session UUID,
+  and trace with state `done`, `scrubbed=true`, and
+  `scrub_quarantined=false`. `object-landed`, `session-indexed`,
+  `summary-short`, `summary-long`, and `status-classify` completed `ok`; the
+  classifier wrote `done/raw_closed`, and the tenant had zero dead letters.
+- The authorized Bob Costas workload opened both encrypted summary objects;
+  both pointers and decrypted records were `ready`, retained the content
+  marker, and contained no planted AWS-key-shaped value. No key or summary
+  text was printed or persisted by the verifier.
+- The four runtime deployments and Cloud SQL proxy were ready with zero
+  restarts after the migration job completed. The planted secret and content
+  marker were absent from application container logs.
+
+The verifier read the pre-existing Kubernetes Secrets only through the API,
+kept proof-only bearer/API-key material in process memory, terminated its
+short-lived port-forwards, and did not create a persistent credential file.
+This evidence covers the base GCP 96Bulls auth, ingest, scrub, GCS, HoopDB,
+summary, classification, and trace path. It does not claim Relaycast HA or the
+separately gated V1 search projection/API, which requires its own eligible
+runtime image and proof.
+
 The stack entry point is `stacks/gcp/alchemy.gcp.run.ts`. It uses the same
 Alchemy + AgentWorkforce Helm boundary as the AWS stack: cloud code declares
 provider resources and passes non-secret endpoints/names into charts; runtime
