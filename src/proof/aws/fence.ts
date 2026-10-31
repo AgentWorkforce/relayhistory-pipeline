@@ -180,4 +180,3 @@ export function proofConfigIssues(c: FenceSource & Record<string, unknown>): str
   }
   return issues;
 }
-
