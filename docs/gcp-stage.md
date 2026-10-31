@@ -274,7 +274,10 @@ is refused outside the `gcp-conformance` stage. Substrate-only stages and
 destroy cleanup remain available. A services image release updates the digest,
 full source revision, and eligibility together only after the image build and
 review complete; an arbitrary or merely well-formed digest cannot enable this
-stage.
+stage. Dispatching `.github/workflows/publish-image-ar.yml` pushes only an
+immutable `sha-<full-revision>` tag of `96bulls-services` into
+`awf-conformance-images` and does not change `versions.lock.json` or
+`gcpProofEligible`.
 
 `assertGcpInputs` accepts only those five target fields. `agentworkforce-dev1`
 and any other project, number, org, billing account, or region are refused

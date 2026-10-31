@@ -1,0 +1,279 @@
+# Publishes the 96bulls services image to the conformance Artifact Registry
+# repository only. Manual dispatch. Khaliq must be the actor, the ref must be
+# main, and the confirmation phrase must match. This file does not create
+# Workload Identity, IAM, GitHub variables, or credentials, and it does not
+# edit versions.lock.json or gcpProofEligible.
+# The job fails closed unless the GitHub variables equal the pinned publisher:
+#   projects/955297012355/locations/global/workloadIdentityPools/github-actions/providers/github
+#   awf-ar-publisher@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com
+# Those same literals are checked again inside the helper before a stub or a network call.
+# google-github-actions/auth is intentionally absent. Its access_token output
+# is written to the runner's GITHUB_OUTPUT file. The credential helper below
+# exchanges the GitHub OIDC token for a registry token in memory and prints
+# that token only to stdout.
+name: publish-image-ar
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "publish 96bulls-services to artifact registry" to confirm Khaliq approved this publish'
+        required: true
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.actor == 'khaliqgant' && github.ref == 'refs/heads/main' && github.event.inputs.confirm == 'publish 96bulls-services to artifact registry' }}
+    environment: image-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: false
+      - name: Configure in-memory registry auth
+        env:
+          WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          WIF_SERVICE_ACCOUNT: ${{ vars.GCP_AR_PUBLISHER_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          fstype=$(findmnt -n -o FSTYPE /dev/shm)
+          if [ "$fstype" != tmpfs ]; then
+            echo "refusing registry auth because /dev/shm is not tmpfs" >&2
+            exit 1
+          fi
+          command -v python3 >/dev/null
+          pinned_provider="projects/955297012355/locations/global/workloadIdentityPools/github-actions/providers/github"
+          pinned_service_account="awf-ar-publisher@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com"
+          if [ "$WIF_PROVIDER" != "$pinned_provider" ]; then
+            echo "workload identity provider does not match the pinned value" >&2
+            exit 1
+          fi
+          if [ "$WIF_SERVICE_ACCOUNT" != "$pinned_service_account" ]; then
+            echo "service account does not match the pinned value" >&2
+            exit 1
+          fi
+          auth_dir=$(mktemp -d /dev/shm/ar-docker.XXXXXX)
+          chmod 700 "$auth_dir"
+          python3 - "$auth_dir/wif.json" <<'PY'
+          import json, os, sys
+          path, = sys.argv[1:]
+          with open(path, "w", encoding="utf-8") as fh:
+              json.dump(
+                  {
+                      "provider": os.environ.get("WIF_PROVIDER", ""),
+                      "service_account": os.environ.get("WIF_SERVICE_ACCOUNT", ""),
+                  },
+                  fh,
+              )
+              fh.write("\n")
+          PY
+          chmod 600 "$auth_dir/wif.json"
+          cat > "$auth_dir/docker-credential-ar-mem" <<'EOF'
+          #!/usr/bin/env python3
+          import json, os, sys, urllib.parse, urllib.request
+
+          REGISTRY = "us-central1-docker.pkg.dev"
+          ALLOWED = {
+              REGISTRY,
+              "https://" + REGISTRY,
+              "https://" + REGISTRY + "/",
+              "https://" + REGISTRY + "/v2/",
+          }
+          STS = "https://sts.googleapis.com/v1/token"
+          IAM = "https://iamcredentials.googleapis.com/v1"
+          PROVIDER_RE = r"projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]{1,32}/providers/[a-z0-9-]{1,32}"
+          SERVICE_ACCOUNT_RE = r"[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]+\.iam\.gserviceaccount\.com"
+          PINNED_PROVIDER = "projects/955297012355/locations/global/workloadIdentityPools/github-actions/providers/github"
+          PINNED_SERVICE_ACCOUNT = "awf-ar-publisher@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com"
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise RuntimeError("refusing redirect")
+
+          def fail(msg):
+              sys.stderr.write(msg + "\n")
+              raise SystemExit(1)
+
+          def opener():
+              return urllib.request.build_opener(NoRedirect)
+
+          def read_json(resp):
+              try:
+                  return json.loads(resp.read().decode())
+              except Exception:
+                  fail("token exchange failed")
+
+          def github_jwt(audience):
+              request_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN") or ""
+              request_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL") or ""
+              if not request_token or not request_url:
+                  fail("github oidc request is unavailable")
+              parsed = urllib.parse.urlsplit(request_url)
+              query = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if k != "audience"]
+              query.append(("audience", audience))
+              full = urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
+              req = urllib.request.Request(full, headers={"Authorization": "Bearer " + request_token})
+              try:
+                  with opener().open(req, timeout=30) as resp:
+                      body = read_json(resp)
+              except SystemExit:
+                  raise
+              except Exception:
+                  fail("github oidc request failed")
+              value = body.get("value") if isinstance(body, dict) else None
+              if not isinstance(value, str) or not value:
+                  fail("github oidc request failed")
+              return value
+
+          def post_json(url, payload, headers):
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode(),
+                  headers={"Content-Type": "application/json", **headers},
+                  method="POST",
+              )
+              try:
+                  with opener().open(req, timeout=30) as resp:
+                      return read_json(resp)
+              except SystemExit:
+                  raise
+              except Exception:
+                  fail("token exchange failed")
+
+          def exchange(cfg):
+              import re
+              provider = cfg.get("provider") if isinstance(cfg, dict) else ""
+              service_account = cfg.get("service_account") if isinstance(cfg, dict) else ""
+              if provider != PINNED_PROVIDER:
+                  fail("workload identity provider does not match the pinned value")
+              if service_account != PINNED_SERVICE_ACCOUNT:
+                  fail("service account does not match the pinned value")
+              if not isinstance(provider, str) or not re.fullmatch(PROVIDER_RE, provider):
+                  fail("workload identity provider is invalid")
+              if not isinstance(service_account, str) or not re.fullmatch(SERVICE_ACCOUNT_RE, service_account):
+                  fail("service account is invalid")
+              stub = os.environ.get("AR_EXCHANGE_STUB") or ""
+              if stub:
+                  if os.environ.get("AR_ALLOW_EXCHANGE_STUB") != "1":
+                      fail("refusing exchange stub")
+                  return stub
+              jwt = github_jwt("https://iam.googleapis.com/" + provider)
+              sts = post_json(
+                  STS,
+                  {
+                      "audience": "//iam.googleapis.com/" + provider,
+                      "grantType": "urn:ietf:params:oauth:grant-type:token-exchange",
+                      "requestedTokenType": "urn:ietf:params:oauth:token-type:access_token",
+                      "scope": "https://www.googleapis.com/auth/cloud-platform",
+                      "subjectTokenType": "urn:ietf:params:oauth:token-type:jwt",
+                      "subjectToken": jwt,
+                  },
+                  {},
+              )
+              federated = sts.get("access_token") if isinstance(sts, dict) else None
+              if not isinstance(federated, str) or not federated:
+                  fail("token exchange failed")
+              minted = post_json(
+                  IAM + "/projects/-/serviceAccounts/" + urllib.parse.quote(service_account, safe="") + ":generateAccessToken",
+                  {"scope": ["https://www.googleapis.com/auth/cloud-platform"]},
+                  {"Authorization": "Bearer " + federated},
+              )
+              access = minted.get("accessToken") if isinstance(minted, dict) else None
+              if not isinstance(access, str) or not access:
+                  fail("token exchange failed")
+              return access
+
+          def main():
+              cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+              if cmd != "get":
+                  sys.stdin.read()
+                  return
+              server = sys.stdin.readline().strip()
+              if server not in ALLOWED:
+                  fail("refusing credential for unexpected registry")
+              cfg_path = os.environ.get("AR_WIF_CONFIG") or ""
+              if not cfg_path.startswith("/dev/shm/"):
+                  fail("refusing workload identity config off tmpfs")
+              with open(cfg_path, "r", encoding="utf-8") as fh:
+                  cfg = json.load(fh)
+              access = exchange(cfg)
+              json.dump({"Username": "oauth2accesstoken", "Secret": access}, sys.stdout)
+              sys.stdout.write("\n")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          chmod 700 "$auth_dir/docker-credential-ar-mem"
+          printf '%s\n' '{"credHelpers":{"us-central1-docker.pkg.dev":"ar-mem"}}' > "$auth_dir/config.json"
+          chmod 600 "$auth_dir/config.json"
+          echo "$auth_dir" >> "$GITHUB_PATH"
+          echo "DOCKER_CONFIG=$auth_dir" >> "$GITHUB_ENV"
+          echo "AR_DOCKER_AUTH_DIR=$auth_dir" >> "$GITHUB_ENV"
+          echo "AR_WIF_CONFIG=$auth_dir/wif.json" >> "$GITHUB_ENV"
+      - name: Prove the auth directory stores no token
+        env:
+          AR_EXCHANGE_STUB: probe-token-not-a-credential
+          AR_ALLOW_EXCHANGE_STUB: "1"
+        run: |
+          set -euo pipefail
+          helper="$AR_DOCKER_AUTH_DIR/docker-credential-ar-mem"
+          out=$(printf '%s\n' 'us-central1-docker.pkg.dev' | "$helper" get)
+          printf '%s' "$out" | python3 -c 'import json,sys; body=json.load(sys.stdin); raise SystemExit(0 if body=={"Username":"oauth2accesstoken","Secret":"probe-token-not-a-credential"} else 1)'
+          if grep -R -F -q 'probe-token-not-a-credential' "$AR_DOCKER_AUTH_DIR"; then
+            echo "probe token was written into the auth directory" >&2
+            exit 1
+          fi
+          if printf '%s\n' 'stored-token-not-a-credential' | "$helper" store; then
+            if grep -R -F -q 'stored-token-not-a-credential' "$AR_DOCKER_AUTH_DIR"; then
+              echo "store wrote a token into the auth directory" >&2
+              exit 1
+            fi
+          else
+            echo "store failed" >&2
+            exit 1
+          fi
+          if printf '%s\n' 'ghcr.io' | "$helper" get >/dev/null 2>&1; then
+            echo "helper returned a token for an unexpected registry" >&2
+            exit 1
+          fi
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push (amd64 + arm64)
+        id: build
+        uses: docker/build-push-action@v6
+        env:
+          AR_EXCHANGE_STUB: ""
+          AR_ALLOW_EXCHANGE_STUB: "0"
+        with:
+          context: .
+          file: docker/services.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/AgentWorkforce/96BullSessions
+            org.opencontainers.image.revision=${{ github.sha }}
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/AgentWorkforce/96BullSessions
+            index:org.opencontainers.image.revision=${{ github.sha }}
+            manifest:org.opencontainers.image.source=https://github.com/AgentWorkforce/96BullSessions
+            manifest:org.opencontainers.image.revision=${{ github.sha }}
+      - name: Digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: printf '%s\n' "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Remove in-memory registry auth
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${AR_DOCKER_AUTH_DIR:-}" ]; then
+            if [ -f "$AR_DOCKER_AUTH_DIR/config.json" ] && python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); raise SystemExit(0 if data.get("auths") else 1)' "$AR_DOCKER_AUTH_DIR/config.json"; then
+              rm -rf -- "$AR_DOCKER_AUTH_DIR"
+              echo "registry config stored an auth entry" >&2
+              exit 1
+            fi
+            rm -rf -- "$AR_DOCKER_AUTH_DIR"
+          fi
