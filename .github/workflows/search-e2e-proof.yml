@@ -92,7 +92,7 @@ jobs:
           BENCH_SCALE: M
           BENCH_SHAPE_FILE: benchmarks/session-search/e2e/shape-2026-10-31.json
           BENCH_OUT: diagnose-report.json
-        run: BENCH_OUT=variants-report.json bun benchmarks/session-search/e2e/diagnose-variants.ts 
+        run: BENCH_DIAG_S=4 bun benchmarks/session-search/e2e/diagnose.ts
       - uses: actions/upload-artifact@v4
         if: always()
         with:

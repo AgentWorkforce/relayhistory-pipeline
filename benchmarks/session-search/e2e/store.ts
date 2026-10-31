@@ -21,6 +21,8 @@ export interface ContextEvent { event_id: string; ts: string; kind: string; text
 const MAX_LIMIT = 20;
 const MAX_QUERY = 500;
 const SNIPPET_CHARS = 320;
+const CANDIDATE_LIMIT = 200;
+const MAX_CANDIDATE_ROUNDS = 5;
 const TABLE = "session_search_records";
 const COLUMNS = ["org_id", "workspace_id", "harness", "session_id", "machine_id", "event_id", "revision", "chunk_seq", "record_seq", "ts", "kind", "scrub_version", "text"];
 
@@ -87,37 +89,59 @@ export class SessionSearchStore {
   }
 
   /**
-   * Newest first, event level, like search_shared_sessions. ngrams(3) cannot serve a
-   * term under three characters, so that form narrows by tenant only and scans.
-   * The substring check is in this phase: hasAllTokens proves grams, not adjacency.
+   * Newest first, event level, like search_shared_sessions. The index gives candidates
+   * without reading `text`, and only those rows get the substring check: hasAllTokens
+   * proves grams, not adjacency, and reading `text` for every surviving granule was
+   * most of a query's CPU. Rounds continue until a page is full, so a false match cannot
+   * shorten one. ngrams(3) cannot serve under three characters, so that form narrows by
+   * tenant only and scans.
    */
   async search(scope: Scope, o: SearchOptions): Promise<{ hits: SearchHit[]; nextCursor: string | null }> {
     const q = o.query;
     if (!q || [...q].length > MAX_QUERY) throw new Error("invalid_query");
     const { params, settings } = this.guard(scope);
     const limit = Math.min(o.limit ?? 10, MAX_LIMIT);
-    const filters = ["org_id = {org:String}", "workspace_id IN {ws:Array(String)}", "positionCaseInsensitiveUTF8(text, {q:String}) > 0"];
+    const tag = { ...settings, ...(o.tag ? { log_comment: o.tag } : {}) };
+    const tenant = "org_id = {org:String} AND workspace_id IN {ws:Array(String)}";
+    const filters = [tenant];
     const bound: Record<string, string | number> = { ...params, q };
-    if ([...q].length >= 3) filters.push("hasAllTokens(text, {q:String})");
     if (o.since) { filters.push("ts >= parseDateTime64BestEffort({since:String}, 3)"); bound.since = o.since; }
     if (o.until) { filters.push("ts <= parseDateTime64BestEffort({until:String}, 3)"); bound.until = o.until; }
     if (o.source) { filters.push("harness = {source:String}"); bound.source = o.source; }
-    if (o.cursor) {
-      const [ts, id] = JSON.parse(Buffer.from(o.cursor, "base64url").toString()) as [string, string];
-      filters.push("(ts, event_id) < (parseDateTime64BestEffort({cts:String}, 3), {cid:String})");
-      bound.cts = ts; bound.cid = id;
+    const after = "(ts, event_id) < (parseDateTime64BestEffort({cts:String}, 3), {cid:String})";
+    const decode = (c: string) => JSON.parse(Buffer.from(c, "base64url").toString()) as [string, string];
+    const encode = (ts: string, id: string) => Buffer.from(JSON.stringify([ts, id])).toString("base64url");
+    const select = `SELECT workspace_id, harness, session_id, machine_id, event_id, toString(toUnixTimestamp64Milli(ts)) AS at,
+        substringUTF8(text, greatest(positionCaseInsensitiveUTF8(text, {q:String}) - 80, 1), ${SNIPPET_CHARS}) AS snippet`;
+    let rows: Array<Omit<SearchHit, "citation" | "ts"> & { at: string }> = [];
+    let position = o.cursor ? decode(o.cursor) : null;
+    if ([...q].length < 3) {
+      const page = await this.reader.rows<(typeof rows)[number]>(`${select} FROM ${TABLE}
+        WHERE ${[...filters, ...(position ? [after] : []), "positionCaseInsensitiveUTF8(text, {q:String}) > 0"].join(" AND ")}
+        ORDER BY ts DESC, event_id DESC LIMIT ${limit + 1}`, { ...bound, ...(position ? { cts: position[0], cid: position[1] } : {}) }, tag);
+      rows = page;
+    } else {
+      for (let round = 0; round < MAX_CANDIDATE_ROUNDS && rows.length <= limit; round++) {
+        const candidates = await this.reader.rows<{ id: string; ms: string }>(`
+          SELECT event_id AS id, toString(toUnixTimestamp64Milli(ts)) AS ms FROM ${TABLE}
+          WHERE ${[...filters, ...(position ? [after] : []), "hasAllTokens(text, {q:String})"].join(" AND ")}
+          ORDER BY ts DESC, event_id DESC LIMIT ${CANDIDATE_LIMIT}`, { ...bound, ...(position ? { cts: position[0], cid: position[1] } : {}) }, tag);
+        if (!candidates.length) break;
+        const first = candidates[0]!, last = candidates.at(-1)!;
+        const checked = await this.reader.rows<(typeof rows)[number]>(`${select} FROM ${TABLE}
+          WHERE ${filters.join(" AND ")} AND ts BETWEEN fromUnixTimestamp64Milli(toInt64({lo:String})) AND fromUnixTimestamp64Milli(toInt64({hi:String}))
+            AND event_id IN {ids:Array(String)} AND positionCaseInsensitiveUTF8(text, {q:String}) > 0
+          ORDER BY ts DESC, event_id DESC`, { ...bound, lo: last.ms, hi: first.ms, ids: arrayLiteral(candidates.map((c) => c.id)) }, tag);
+        rows.push(...checked);
+        if (candidates.length < CANDIDATE_LIMIT) break;
+        position = [iso(last.ms), last.id];
+      }
     }
-    const rows = await this.reader.rows<Omit<SearchHit, "citation" | "ts"> & { at: string }>(`
-      SELECT workspace_id, harness, session_id, machine_id, event_id,
-        toString(toUnixTimestamp64Milli(ts)) AS at,
-        substringUTF8(text, greatest(positionCaseInsensitiveUTF8(text, {q:String}) - 80, 1), ${SNIPPET_CHARS}) AS snippet
-      FROM ${TABLE} WHERE ${filters.join(" AND ")}
-      ORDER BY ts DESC, event_id DESC LIMIT ${limit + 1}`, bound, { ...settings, ...(o.tag ? { log_comment: o.tag } : {}) });
     const page = rows.slice(0, limit).map(({ at, ...r }) => ({ ...r, ts: iso(at) }));
-    const last = page.at(-1);
+    const lastHit = page.at(-1);
     return {
       hits: page.map((r) => ({ ...r, citation: `/sessions/${encodeURIComponent(r.session_id)}?source=${encodeURIComponent(r.harness)}` })),
-      nextCursor: rows.length > limit && last ? Buffer.from(JSON.stringify([last.ts, last.event_id])).toString("base64url") : null,
+      nextCursor: rows.length > limit && lastHit ? encode(lastHit.ts, lastHit.event_id) : null,
     };
   }
 

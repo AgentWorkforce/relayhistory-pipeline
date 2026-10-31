@@ -306,12 +306,14 @@ async function g7g8() {
   const scope = scopeOf("org-fresh", ["ws-fresh"]);
   for (const clients of [1, 8, 32]) {
     let stop = false, errors = 0;
+    const errorCodes: Record<string, number> = {};
     const lat: number[] = [];
     const worker = async (id: number) => {
       for (let i = id; !stop; i++) {
         const m = mix[i % mix.length]!;
         const s = performance.now();
-        try { await search.search(m.scope, { query: m.q }); lat.push(performance.now() - s); } catch { errors++; }
+        try { await search.search(m.scope, { query: m.q }); lat.push(performance.now() - s); }
+        catch (e) { errors++; const c = /Code: (\d+)/.exec(String(e))?.[1] ?? "other"; errorCodes[c] = (errorCodes[c] ?? 0) + 1; }
       }
     };
     const ingest = async () => {
@@ -333,7 +335,7 @@ async function g7g8() {
     stop = true;
     await Promise.all(running);
     const seconds = (performance.now() - started) / 1000;
-    levels.push({ clients, qps: Math.round(lat.length / seconds), errors, errorRate: errors / Math.max(1, errors + lat.length), ...pct(lat) });
+    levels.push({ clients, qps: Math.round(lat.length / seconds), errors, errorCodes, errorRate: errors / Math.max(1, errors + lat.length), ...pct(lat) });
   }
   report.G7_latency_load = { status: "RELATIVE", detail: { engine: "vanilla ClickHouse, one local node", coldMs: pct(cold), warmMs: pct(warm), levels } };
   report.G8_freshness = { status: "RELATIVE", detail: { insertToFirstHitMs: pct(freshness), note: "store only; pipeline queue latency is in G1 firstHitMs" } };
