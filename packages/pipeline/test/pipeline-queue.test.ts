@@ -99,7 +99,7 @@ afterEach(() => {
 });
 
 describe("stage registry", () => {
-  it("registers the seven queued stages, two of them implemented", () => {
+  it("registers the eight queued stages, two of them implemented", () => {
     expect(QUEUED_STAGES).toEqual([
       "object-landed",
       "session-indexed",
@@ -108,6 +108,7 @@ describe("stage registry", () => {
       "status-classify",
       "file-normalize",
       "file-maintenance",
+      "normalized-ready",
     ]);
     expect(
       QUEUED_STAGES.filter((stage) => STAGE_REGISTRY[stage].implemented),

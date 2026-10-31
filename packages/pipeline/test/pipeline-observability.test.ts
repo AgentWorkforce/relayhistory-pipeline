@@ -139,7 +139,7 @@ function pipeline(options: { transformEnabled?: boolean } = {}) {
         transformEnabled: options.transformEnabled ?? true,
       }),
       "session-indexed": sessionIndexedHandler(index),
-      "file-normalize": fileNormalizeHandler(transform),
+      "file-normalize": fileNormalizeHandler(transform, queues),
     },
   };
   return { queues, sink, deadLetters, index, transform, deps };

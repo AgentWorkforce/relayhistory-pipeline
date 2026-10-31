@@ -12,7 +12,7 @@ files run is the in-process PGlite inside `packages/pipeline` vitest.
 | `20261025000100_repo_identity.sql` | relayhistory-cloud PR #177 (`7f49063`) |
 | `20261025000200_scrub_quarantine.sql` | relayhistory-cloud PR #185 (`fe89fc3`) |
 | `20261025000300_upsert_keep_on_null.sql` | relayhistory-cloud PR #185 (`fe89fc3`) |
-| `20261031000000_event_count_writeback.sql` | This repo: `docs/event-count-writeback.md` |
+| `20261031000300_event_count_writeback.sql` | This repo: `docs/event-count-writeback.md` |
 | `../tests/supabase_shim.sql` | relayhistory-cloud PR #171, merge commit `51c313fda3c4288cf75f9927c4004fb39b6cd2ee` |
 
 Repository: https://github.com/AgentWorkforce/relayhistory-cloud. The `000000` to

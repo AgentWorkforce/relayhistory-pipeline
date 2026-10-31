@@ -4,7 +4,8 @@
  *   object-landed ─┬→ session-indexed ─┬→ summary-short
  *                  │                   ├→ summary-long
  *                  │                   └→ status-classify
- *                  └→ file-normalize  ──→ file-maintenance
+ *                  └→ file-normalize ─┬→ file-maintenance
+ *                                     └→ normalized-ready
  *
  * Every stage has its own queue and DLQ (`stageQueueName`), the same message
  * shape (`StageMessage`) and the same consumer (`handleStageQueue`), whichever
@@ -27,6 +28,7 @@ export const QUEUED_STAGES = [
   "status-classify",
   "file-normalize",
   "file-maintenance",
+  "normalized-ready",
 ] as const satisfies readonly PipelineStage[];
 export type QueuedStage = (typeof QUEUED_STAGES)[number];
 
@@ -91,7 +93,7 @@ export const STAGE_REGISTRY: { readonly [S in QueuedStage]: StageDefinition } =
       summary: "Normalize raw chunks into the derived file layout",
       implemented: false,
       binding: "PIPELINE_FILE_NORMALIZE",
-      next: ["file-maintenance"],
+      next: ["file-maintenance", "normalized-ready"],
       maxAttempts: 6,
     },
     "file-maintenance": {
@@ -101,6 +103,14 @@ export const STAGE_REGISTRY: { readonly [S in QueuedStage]: StageDefinition } =
       binding: "PIPELINE_FILE_MAINTENANCE",
       next: [],
       maxAttempts: 4,
+    },
+    "normalized-ready": {
+      stage: "normalized-ready",
+      summary: "Write the normalized object's exact event count to the sessions index",
+      implemented: false,
+      binding: "PIPELINE_NORMALIZED_READY",
+      next: [],
+      maxAttempts: 6,
     },
   };
 

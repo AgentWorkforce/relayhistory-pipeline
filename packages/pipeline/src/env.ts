@@ -81,6 +81,7 @@ export interface Bindings {
     import("./lib/pipeline/dlq.js").StageMessage
   >;
   PIPELINE_FILE_NORMALIZE?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
+  PIPELINE_NORMALIZED_READY?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
   PIPELINE_SUMMARY_SHORT?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
   PIPELINE_SUMMARY_LONG?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
   PIPELINE_STATUS_CLASSIFY?: Queue<

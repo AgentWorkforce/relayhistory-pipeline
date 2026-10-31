@@ -13,6 +13,7 @@
  * The concrete pointer index (Supabase `sessions`) and transform live with their
  * owning workstreams; here they are interfaces.
  */
+import { buildNormalizedReady } from "./normalized-ready.js";
 import { PipelineError } from "./errors.js";
 import type { DeadLetter, StageHandler, StageMessage } from "./dlq.js";
 import {
@@ -276,8 +277,10 @@ export function sessionIndexedHandler(
     index.upsertRawPointer(message.payload as RawPointer, message.ctx);
 }
 
+/** Publishes the object, then sends its count. A failed send retries the stage. */
 export function fileNormalizeHandler(
   transform: SessionTransform,
+  senders: StageSenders,
 ): StageHandler {
   return async (message, recorder) => {
     const output = await transform.normalize(message.payload as RawPointer, {
@@ -285,7 +288,15 @@ export function fileNormalizeHandler(
       workKey: message.workKey,
     });
     if ("skipped" in output) return { status: "skipped", reason: output.skipped };
-    if (output.outputKey)
+    if (output.outputKey) {
+      await senders.send("normalized-ready", {
+        v: 1,
+        stage: "normalized-ready",
+        ctx: message.ctx,
+        workKey: message.workKey,
+        revision: output.revision,
+        payload: buildNormalizedReady(message, output as NormalizedOutput),
+      });
       recorder.log.info("transform output", {
         output_key: output.outputKey,
         output_bytes: output.outputBytes,
@@ -294,5 +305,6 @@ export function fileNormalizeHandler(
         output_reused: output.outputReused,
         output_divergent: output.outputDivergent,
       });
+    }
   };
 }

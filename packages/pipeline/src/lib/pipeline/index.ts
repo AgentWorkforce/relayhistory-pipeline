@@ -26,6 +26,10 @@ import {
   type SessionPointerIndex,
   type SessionTransform,
 } from "./stages.js";
+import {
+  normalizedReadyHandler,
+  type NormalizedCountStore,
+} from "./normalized-ready.js";
 import type { PipelineStage } from "./trace.js";
 
 export * from "./dlq.js";
@@ -35,6 +39,7 @@ export * from "./migration-assertions.js";
 export * from "./queue.js";
 export * from "./registry.js";
 export * from "./relayhistory-projection.js";
+export * from "./normalized-ready.js";
 export * from "./relayhistory-transform.js";
 export * from "./stages.js";
 export * from "./telemetry-ids.js";
@@ -42,6 +47,7 @@ export * from "./trace.js";
 export * from "./traces.js";
 export { postgrestDeadLetterStore } from "./postgrest-dead-letters.js";
 export { postgresDeadLetterStore } from "./postgres-dead-letters.js";
+export { postgresNormalizedCountStore } from "./postgres-normalized-counts.js";
 
 /** Daily, at this UTC minute of the day, off the hour so it avoids other jobs. */
 export const PIPELINE_MAINTAIN_MINUTE_UTC = 3 * 60 + 17;
@@ -141,6 +147,7 @@ export interface PipelineImplementations {
   deadLetters?: DeadLetterStore;
   index?: SessionPointerIndex;
   transform?: SessionTransform;
+  normalizedCounts?: NormalizedCountStore;
   sink?: PipelineEventSink;
   /** Replaces a stage's handler, e.g. a stub stage wired ahead of release. */
   handlers?: Partial<Record<QueuedStage, StageHandler>>;
@@ -177,7 +184,14 @@ export function pipelineQueueDeps(
         ? { "session-indexed": sessionIndexedHandler(impl.index) }
         : {}),
       ...(impl.transform && transformEnabled
-        ? { "file-normalize": fileNormalizeHandler(impl.transform) }
+        ? {
+            "file-normalize": fileNormalizeHandler(impl.transform, {
+              send: (stage, message) => queue.send({ ...message, stage }),
+            }),
+          }
+        : {}),
+      ...(impl.normalizedCounts
+        ? { "normalized-ready": normalizedReadyHandler(impl.normalizedCounts) }
         : {}),
       ...impl.handlers,
     },
