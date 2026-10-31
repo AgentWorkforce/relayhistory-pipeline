@@ -222,11 +222,7 @@ export type EpochRecord = z.infer<typeof EpochRecordSchema>;
 export type ScrubMarker = z.infer<typeof ScrubMarkerSchema>;
 export type ServerSection = z.infer<typeof ServerSectionSchema>;
 export type EffectiveState =
-  | "closed"
-  | "active"
-  | "idle"
-  | "abandoned"
-  | "archived";
+  "closed" | "active" | "idle" | "abandoned" | "archived";
 
 export interface ManifestIssue {
   path: string;
@@ -329,8 +325,7 @@ const MACHINE_ORIGIN = "machine:";
  */
 export function exportWatermarks(manifest: ManifestV1): Record<string, number> {
   const marker = manifest.extensions?.[EXPORT_EXTENSION] as
-    | { origin_revisions?: Record<string, number> }
-    | undefined;
+    { origin_revisions?: Record<string, number> } | undefined;
   return marker?.origin_revisions ?? {};
 }
 
@@ -340,8 +335,7 @@ function validateExportMarker(
 ): void {
   const value = (
     manifest.extensions?.[EXPORT_EXTENSION] as
-      | { origin_revisions?: unknown }
-      | undefined
+      { origin_revisions?: unknown } | undefined
   )?.origin_revisions;
   if (value === undefined) return;
   const path = `extensions.${EXPORT_EXTENSION}.origin_revisions`;
