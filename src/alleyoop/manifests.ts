@@ -444,15 +444,16 @@ function activationMessage(
   manifest: ManifestV1,
   auth: Auth,
 ): StageMessage {
-  const grantId = (migrationWriter(auth) ?? "").slice("migration:".length);
-  const planDigest = String(
-    (auth.claims.meta as Record<string, unknown>).planDigest,
-  );
+  const meta = auth.claims.meta as Record<string, unknown>;
+  const grantId =
+    auth.migration?.grantId ??
+    (migrationWriter(auth) ?? "").slice("migration:".length);
+  const planDigest = auth.migration?.planDigest ?? String(meta.planDigest);
   return {
     v: 1,
     stage: BACKFILL_ACTIVATION_STAGE,
     ctx: {
-      traceId: manifest.trace_id.replace(/-/g, ""),
+      traceId: manifest.trace_id,
       orgId: auth.orgId,
       workspaceId: manifest.session.workspace_id,
     },
