@@ -46,3 +46,12 @@ A refused backfill is retried by the `backfill-activation` stage:
 `BACKFILL_ACTIVATION_MAX_DELAY_SECONDS` (default 3600), then the DLQ. When the
 gate opens, the item lands in `sessions.backfill_activation_ready` for the
 exporter.
+
+## Export completion
+
+`assertExportComplete` refuses authoritative coverage while a session is filed
+under both a real machine and `unknown-origin-*`, or
+`sessions.export_deferred_sessions` holds an open row. The exporter records a
+deferred session with `recordExportDeferred` and clears it with
+`resolveExportDeferred` once its records land. A straddling session stays
+deferred until plan-entry v2 can sign its backfill.

@@ -116,9 +116,16 @@ export {
   parkedManifestKey,
 } from "@rhc/lib/pipeline/parked.ts";
 export {
-  assertNoMachineSplits,
+  assertExportComplete,
+  detectExportDeferred,
   detectMachineSplits,
+  EXPORT_DEFERRED,
+  exportCompletionIssues,
+  recordExportDeferred,
+  resolveExportDeferred,
   SESSION_MACHINE_SPLIT,
+  type ExportDeferred,
+  type ExportIncomplete,
   type SessionMachineSplit,
 } from "@rhc/lib/pipeline/session-split.ts";
 export {

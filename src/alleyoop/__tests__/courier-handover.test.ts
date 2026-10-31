@@ -10,7 +10,7 @@ import {
   readAll,
   type ManifestV1,
 } from "../../shared/vendor.ts";
-import { assertNoMachineSplits, detectMachineSplits, SESSION_MACHINE_SPLIT } from "../../shared/vendor.ts";
+import { assertExportComplete, detectMachineSplits, SESSION_MACHINE_SPLIT } from "../../shared/vendor.ts";
 import { courierWorld, EXPORTER, MARKER } from "./courier-harness.ts";
 
 type World = Awaited<ReturnType<typeof courierWorld>>;
@@ -241,11 +241,11 @@ describe("machine splits", () => {
       { type: SESSION_MACHINE_SPLIT, orgId: "o", workspaceId: "w", harness: "claude", sessionId: "s", machineIds: ["machine-a", "unknown-origin-7"] },
     ]);
     expect(found.seen[0]).toEqual(["o", null]);
-    await expect(assertNoMachineSplits(found, { orgId: "o", workspaceId: "w" })).rejects.toMatchObject({
-      code: SESSION_MACHINE_SPLIT,
-      splits: [{ sessionId: "s" }],
+    await expect(assertExportComplete(found, { orgId: "o", workspaceId: "w" })).rejects.toMatchObject({
+      code: "export_incomplete",
+      issues: expect.arrayContaining([expect.objectContaining({ type: SESSION_MACHINE_SPLIT, sessionId: "s" })]),
     });
-    await expect(assertNoMachineSplits(db([]), { orgId: "o" })).resolves.toBeUndefined();
+    await expect(assertExportComplete(db([]), { orgId: "o" })).resolves.toBeUndefined();
   });
 });
 

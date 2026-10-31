@@ -47,18 +47,95 @@ export async function detectMachineSplits(
   }));
 }
 
+export const EXPORT_DEFERRED = "export_deferred" as const;
+
+export interface ExportDeferred {
+  type: typeof EXPORT_DEFERRED;
+  workspaceId: string;
+  manifestKey: string;
+  reason: string;
+}
+
 /**
- * The completion check. Throws while a split exists: "every session exported"
- * is not authoritative for a session whose records sit in two places.
+ * The exporter could not finish this session, e.g. `straddling_session`: a
+ * live manifest exists and no signed entry can append to it yet. Repeating
+ * keeps the first deferral and reopens one that was resolved.
  */
-export async function assertNoMachineSplits(
+export async function recordExportDeferred(
+  db: SqlExecutor,
+  item: { orgId: string; workspaceId: string; manifestKey: string; reason: string },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO sessions.export_deferred_sessions
+       (org_id, workspace_id, manifest_key, reason)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (org_id, manifest_key) DO UPDATE
+       SET reason = excluded.reason, resolved_at = NULL`,
+    [item.orgId, item.workspaceId, item.manifestKey, item.reason],
+  );
+}
+
+/** The session's pre-T0 records landed, e.g. its backfill epoch committed. */
+export async function resolveExportDeferred(
+  db: SqlExecutor,
+  item: { orgId: string; manifestKey: string },
+): Promise<void> {
+  await db.query(
+    `UPDATE sessions.export_deferred_sessions SET resolved_at = now()
+      WHERE org_id = $1 AND manifest_key = $2 AND resolved_at IS NULL`,
+    [item.orgId, item.manifestKey],
+  );
+}
+
+export async function detectExportDeferred(
+  db: SqlExecutor,
+  scope: { orgId: string; workspaceId?: string },
+): Promise<ExportDeferred[]> {
+  const { rows } = await db.query<{
+    workspace_id: string;
+    manifest_key: string;
+    reason: string;
+  }>(
+    `SELECT workspace_id, manifest_key, reason
+       FROM sessions.export_deferred_sessions
+      WHERE org_id = $1 AND ($2::text IS NULL OR workspace_id = $2)
+        AND resolved_at IS NULL
+      ORDER BY manifest_key`,
+    [scope.orgId, scope.workspaceId ?? null],
+  );
+  return rows.map((row) => ({
+    type: EXPORT_DEFERRED,
+    workspaceId: row.workspace_id,
+    manifestKey: row.manifest_key,
+    reason: row.reason,
+  }));
+}
+
+export type ExportIncomplete = SessionMachineSplit | ExportDeferred;
+
+/** Why the export is not yet authoritative; empty when it is. */
+export async function exportCompletionIssues(
+  db: SqlExecutor,
+  scope: { orgId: string; workspaceId?: string },
+): Promise<ExportIncomplete[]> {
+  return [
+    ...(await detectMachineSplits(db, scope)),
+    ...(await detectExportDeferred(db, scope)),
+  ];
+}
+
+/**
+ * The completion check. "Every session exported" is not authoritative while a
+ * session's records sit in two places or its pre-T0 records have not landed.
+ */
+export async function assertExportComplete(
   db: SqlExecutor,
   scope: { orgId: string; workspaceId?: string },
 ): Promise<void> {
-  const splits = await detectMachineSplits(db, scope);
-  if (splits.length > 0)
+  const issues = await exportCompletionIssues(db, scope);
+  if (issues.length > 0)
     throw Object.assign(
-      new Error(`${splits.length} sessions are split across machines`),
-      { code: SESSION_MACHINE_SPLIT, splits },
+      new Error(`${issues.length} sessions keep the export incomplete`),
+      { code: "export_incomplete", issues },
     );
 }
