@@ -4,8 +4,9 @@
  * This is code-only until Khaliq separately clears a project. It deliberately
  * keeps secret payloads out of Alchemy inputs/state. Relaycast stays
  * single-node SQLite. Managed GCS, private Cloud SQL (not posted through
- * GCP.SQL.Instance), Redis, and Pub/Sub remain adapter-test infrastructure;
- * 96Bulls installation is held until the Redis TLS client contract is proven.
+ * GCP.SQL.Instance), Redis, and Pub/Sub remain adapter-test infrastructure.
+ * The optional 96Bulls release resolves Memorystore's public CA and requires
+ * a live TLS PING in workload readiness; secret payloads remain external.
  * Production stays Supabase and AWS S3.
  */
 import * as Alchemy from "alchemy";
@@ -17,16 +18,15 @@ import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   GCP_CONFIRM_PROJECT_ENV,
   GCP_CONFIRM_SQL_POST_ENV,
   GCP_APPLY_NONCE_ENV,
+  GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS,
   GCP_NODE_ROLES,
   GCP_RUNTIME_SHAPE,
   assertGcpInputs,
@@ -39,10 +39,11 @@ import {
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
+  requestedAlchemyCommand,
   captureRelaycastChartPackage,
-  type CapturedRelaycastChartPackage,
   type GcpInputs,
 } from "./config.ts";
+import { prepareRelaycastChart } from "./chart-cache.ts";
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "./deploy-guard.ts";
 import {
   ALCHEMY_GCP_BETA_84_SQL,
@@ -52,9 +53,11 @@ import {
   sqlAdminFetchTransport,
   type PrivateCloudSqlSpec,
 } from "./cloud-sql.ts";
-import { provePrivateKubernetesReachability } from "./kubernetes-preflight.ts";
+import { provePrivateKubernetesReachability, relaycastProofAnnotations } from "./kubernetes-preflight.ts";
 import {
+  assertGcpApplyLeaseActive,
   applyNonceDigest,
+  boundGcpApplyLease,
   consumeGcpApplyNonce,
   consumeGcpApplyNonceGlobally,
   verifyGcpApplyNonce,
@@ -62,6 +65,7 @@ import {
   type GcpApplyAuthorizationProof,
 } from "./apply-authorization.ts";
 import { requireServiceAccountActAs, type ServiceAccountActAsProof } from "./iam-preflight.ts";
+import { fetchRedisServerCa, redisAdminFetchTransport } from "./redis-ca.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
@@ -92,33 +96,14 @@ interface RequireNodeActAsInput {
   serviceAccountEmail: string;
   authorization: GcpApplyAuthorizationProof;
 }
-
-function prepareRelaycastChart(captured: CapturedRelaycastChartPackage): string {
-  const cacheRoot = join(tmpdir(), "96bulls-relaycast-charts");
-  const extracted = join(cacheRoot, captured.digest);
-  const staging = join(cacheRoot, `.${captured.digest}.${process.pid}.${randomUUID()}`);
-  mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
-  mkdirSync(staging, { mode: 0o700 });
-  try {
-    const artifact = join(staging, "relaycast-0.1.0.tgz");
-    // This is the captured, already verified Buffer. The source artifact is
-    // never reopened between hashing and extraction.
-    writeFileSync(artifact, captured.bytes, { mode: 0o600 });
-    execFileSync("tar", ["-xzf", artifact, "-C", staging], { stdio: "ignore" });
-    rmSync(artifact, { force: true });
-    const chart = join(staging, "relaycast");
-    if (!statSync(chart).isDirectory())
-      throw new Error("published package did not contain relaycast/");
-    rmSync(extracted, { recursive: true, force: true });
-    renameSync(staging, extracted);
-    return join(extracted, "relaycast");
-  } catch {
-    rmSync(staging, { recursive: true, force: true });
-    throw new Error("96bulls: verified Relaycast package could not be extracted. Nothing was created.");
-  }
+interface ResolveRedisServerCaInput {
+  projectId: string;
+  region: string;
+  instanceId: string;
+  authorization: GcpApplyAuthorizationProof;
 }
 
-function readInputs(stage: string): GcpInputs {
+function readInputs(stage: string, requestedCommand: ReturnType<typeof requestedAlchemyCommand>): GcpInputs {
   const path = join(ROOT, ".96bulls", stage, "gcp-inputs.json");
   let inputs: GcpInputs;
   try {
@@ -126,7 +111,7 @@ function readInputs(stage: string): GcpInputs {
   } catch {
     throw new Error(`96bulls: GCP stage ${stage} is not cleared: ${path} does not exist. Nothing was created.`);
   }
-  assertGcpInputs(stage, inputs);
+  assertGcpInputs(stage, inputs, requestedCommand);
   assertGcpProjectConfirmation(inputs.projectId, process.env[GCP_CONFIRM_PROJECT_ENV]);
   return inputs;
 }
@@ -147,8 +132,9 @@ function bootstrapStage(): string {
 // Synchronous, local-only bootstrap runs before any Alchemy Action, provider,
 // or state construction below. It captures the chart bytes exactly once.
 const BOOTSTRAP_STAGE = bootstrapStage();
-const BOOTSTRAP_INPUTS = readInputs(BOOTSTRAP_STAGE);
-assertGcpRuntimeDeployable(BOOTSTRAP_INPUTS);
+const BOOTSTRAP_COMMAND = requestedAlchemyCommand();
+const BOOTSTRAP_INPUTS = readInputs(BOOTSTRAP_STAGE, BOOTSTRAP_COMMAND);
+assertGcpRuntimeDeployable(BOOTSTRAP_STAGE, BOOTSTRAP_INPUTS, BOOTSTRAP_COMMAND);
 // This value is deliberately not persisted between invocations. It prevents
 // Alchemy from reusing a prior successful Action output for the same token;
 // the atomic ledger then rejects that token as already consumed.
@@ -200,8 +186,7 @@ const RequireNodeActAs = Alchemy.Action<
   Effect.gen(function* () {
     if (input.authorization.projectId !== input.projectId)
       throw new Error("96bulls: node actAs preflight is not bound to this project. GKE was not created or changed.");
-    if (input.authorization.expiresAt <= Math.floor(Date.now() / 1000))
-      throw new Error("96bulls: GCP apply authorization expired before the node actAs preflight. GKE was not created or changed.");
+    assertGcpApplyLeaseActive(input.authorization);
     const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
     return yield* Effect.tryPromise(() =>
       requireServiceAccountActAs(
@@ -222,17 +207,22 @@ const EnsurePrivateCloudSql = Alchemy.Action<
   Effect.gen(function* () {
     if (!input.privateServiceConnection)
       throw new Error("96bulls: private service connection was not resolved. Nothing was created.");
-    const project = /^\/projects\/([^/]+)\/global\/networks\//.exec(input.spec.privateNetwork)?.[1];
+    const project = /^projects\/([^/]+)\/global\/networks\//.exec(input.spec.privateNetwork)?.[1];
     if (!project || input.authorization.projectId !== project)
       throw new Error("96bulls: Cloud SQL poster project is malformed. Nothing was created.");
-    if (input.authorization.expiresAt <= Math.floor(Date.now() / 1000))
-      throw new Error("96bulls: GCP apply authorization expired before the Cloud SQL poster. Nothing was created.");
+    assertGcpApplyLeaseActive(input.authorization);
     assertGcpSqlPostConfirmation(project, input.spec.instanceName, process.env[GCP_CONFIRM_SQL_POST_ENV]);
     const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
     if (project !== live.project)
       throw new Error("96bulls: Cloud SQL poster project differs from the resolved GCP project. Nothing was created.");
-    const result = yield* Effect.tryPromise(() =>
-      ensurePrivateCloudSql(input.spec, { bearer: Redacted.value(live.accessToken) }, sqlAdminFetchTransport()),
+    const result = yield* Effect.tryPromise((signal) =>
+      ensurePrivateCloudSql(
+        input.spec,
+        { bearer: Redacted.value(live.accessToken) },
+        sqlAdminFetchTransport(),
+        undefined,
+        { expiresAtMs: input.authorization.leaseExpiresAt * 1000, signal },
+      ),
     );
     return {
       connectionName: input.spec.connectionName,
@@ -240,6 +230,30 @@ const EnsurePrivateCloudSql = Alchemy.Action<
       created: result.created,
       operation: result.operation,
     };
+  }),
+);
+
+const ResolveRedisServerCa = Alchemy.Action<
+  "96Bulls.GCP.ResolveRedisServerCa",
+  ResolveRedisServerCaInput,
+  Awaited<ReturnType<typeof fetchRedisServerCa>>,
+  GCP.GcpEnvironment
+>("96Bulls.GCP.ResolveRedisServerCa", (input) =>
+  Effect.gen(function* () {
+    if (input.authorization.projectId !== input.projectId)
+      throw new Error("96bulls: Redis service CA lookup project is not authorized. Nothing was created or changed.");
+    if (input.authorization.expiresAt <= Math.floor(Date.now() / 1000))
+      throw new Error("96bulls: GCP apply authorization expired before the Redis service CA lookup. Nothing was created or changed.");
+    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
+    if (live.project !== input.projectId)
+      throw new Error("96bulls: Redis service CA lookup project differs from the resolved GCP project. Nothing was created or changed.");
+    return yield* Effect.tryPromise(() =>
+      fetchRedisServerCa(
+        input,
+        { bearer: Redacted.value(live.accessToken) },
+        redisAdminFetchTransport(),
+      ),
+    );
   }),
 );
 
@@ -285,7 +299,7 @@ export default Alchemy.Stack(
     providers: Layer.mergeAll(GCP.providers(), Kubernetes.providers()),
     state: GCP.state({ name: "agentworkforce", prefix: "96bulls" }),
   },
-  Effect.gen(function* () {
+  boundGcpApplyLease(Effect.gen(function* () {
     const stage = yield* Stage;
     if (stage !== BOOTSTRAP_STAGE)
       throw new Error("96bulls: Alchemy stage changed after local bootstrap. Nothing was created.");
@@ -419,14 +433,18 @@ export default Alchemy.Stack(
       description: authorized("Dedicated GKE node identity. No keys."),
     });
     const nodeMember = Output.interpolate`serviceAccount:${nodeIdentity.email}`;
-    for (const role of GCP_NODE_ROLES) {
-      yield* GCP.IAM.Member(`node-${role.split("/")[1]!.replaceAll(".", "-")}`, {
-        kind: "project",
-        name: i.projectId,
-        role: authorized(role),
-        member: nodeMember,
-      });
-    }
+    yield* GCP.IAM.Member("node-container-defaultNodeServiceAccount", {
+      kind: "project",
+      name: i.projectId,
+      role: authorized(GCP_NODE_ROLES[0]),
+      member: nodeMember,
+    });
+    const nodeArtifactRegistryReader = yield* GCP.IAM.Member("node-artifactregistry-reader", {
+      kind: "project",
+      name: i.projectId,
+      role: authorized(GCP_NODE_ROLES[1]),
+      member: nodeMember,
+    });
 
     const nodeActAs = yield* RequireNodeActAs("node-act-as", {
       projectId: i.projectId,
@@ -505,11 +523,11 @@ export default Alchemy.Stack(
     // The proxy Kubernetes service account is created only once Cloud SQL is
     // posted. Binding it earlier would let a later account of that name assume
     // the runtime identity.
-    for (const [namespace, serviceAccount] of [
-      ["96bulls", "96bulls-worker"],
-      ["96bulls", "96bulls-alleyoop"],
+    for (const [logicalName, namespace, serviceAccount] of [
+      ["96bulls-worker", "96bulls", GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.worker],
+      ["96bulls-alleyoop", "96bulls", GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.alleyoop],
     ] as const) {
-      yield* GCP.IAM.Member(`workload-identity-${namespace}-${serviceAccount}`, {
+      yield* GCP.IAM.Member(`workload-identity-${namespace}-${logicalName}`, {
         kind: "iam.serviceAccount",
         name: runtimeIdentity.name,
         role: "roles/iam.workloadIdentityUser",
@@ -563,7 +581,13 @@ export default Alchemy.Stack(
             redisVersion: "REDIS_7_2",
             tier: i.managedDataPlane.redisHa ? "STANDARD_HA" : "BASIC",
             memorySizeGb: i.managedDataPlane.redisMemoryGb ?? 1,
-            authorizedNetwork: network.networkName,
+            // Memorystore rejects a short network name. Mapping the resolved
+            // network output preserves the resource dependency while emitting
+            // the canonical API resource name required by Redis.
+            authorizedNetwork: Output.map(
+              network.networkName,
+              (name) => `projects/${i.projectId}/global/networks/${name}`,
+            ),
             connectMode: "PRIVATE_SERVICE_ACCESS",
             reservedIpRange: psaRange.addressName,
             // The workload probe rejects an inline AUTH string, and this stack
@@ -573,6 +597,12 @@ export default Alchemy.Stack(
             persistenceConfig: i.managedDataPlane.redisHa
               ? { persistenceMode: "RDB", rdbSnapshotPeriod: "SIX_HOURS" }
               : { persistenceMode: "DISABLED" },
+          });
+          const redisCa = yield* ResolveRedisServerCa("redis-service-ca", {
+            projectId: i.projectId,
+            region: i.region,
+            instanceId: redis.instanceId,
+            authorization: applyAuthorization,
           });
           const deadLetters = yield* GCP.PubSub.Topic("dead-letters", {
             topicId: authorized(gcpResourceName(stage, "dead-letters", 63)),
@@ -624,7 +654,7 @@ export default Alchemy.Stack(
           return {
             sql,
             sqlPoster,
-            redis: { host: redis.host, port: redis.port },
+            redis: { host: redis.host, port: redis.port, caPem: redisCa.caPem },
             pubsub: {
               topic: eventsTopicName,
               subscription: eventsSubscriptionName,
@@ -669,11 +699,7 @@ export default Alchemy.Stack(
             namespace: "relaycast",
             values: {
               ...relaycastChartValues(relaycastConfig, storageClass),
-              podAnnotations: {
-                "96bulls.agentworkforce.dev/executor": kubernetesReachability!.executor,
-                "96bulls.agentworkforce.dev/apply-nonce": kubernetesReachability!.nonceDigest,
-                "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof,
-              },
+              podAnnotations: relaycastProofAnnotations(kubernetesReachability!),
             },
           });
         })
@@ -807,9 +833,16 @@ export default Alchemy.Stack(
             values: bulls96ReleaseValues(i.bulls96!, {
               bucket: lockerBucket,
               region: i.region,
+              // Resolve the IAM member as part of the repository value so
+              // Helm cannot create image-pulling pods before the reader edge.
+              imageRepository: Output.map(
+                Output.all(images.registryUri, nodeArtifactRegistryReader.role),
+                ([registry]) => `${registry}/96bulls-services`,
+              ),
               cloudSqlConnectionName: dataPlane.sqlPoster.connectionName,
               redisHost: dataPlane.redis.host,
               redisPort: dataPlane.redis.port,
+              redisCaPem: dataPlane.redis.caPem,
               pubsubTopic: eventsTopicName,
               pubsubSubscription: eventsSubscriptionName,
               workloadIdentityEmail: runtimeEmail,
@@ -837,5 +870,5 @@ export default Alchemy.Stack(
         bulls96: bulls96 ?? null,
       },
     };
-  }),
+  })),
 );

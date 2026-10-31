@@ -49,7 +49,11 @@ export function vendorBindings(extra: Record<string, string | undefined> = {}): 
   assertLockerSelection();
   const locker = lockerEnv();
   const provider = lockerProvider();
-  const tenant = tenantEnv();
+  // Org-derived key prefixes (`<PIPELINE_KEY_PREFIX>/<org>/v1/...`): the org
+  // comes from each object's prefix, so no static PIPELINE_ORG_ID may be set
+  // (it would win in orgResolverFromEnv and pin every object to one org).
+  const orgFromPrefix = process.env.PIPELINE_ORG_FROM_PREFIX === "true";
+  const tenant = orgFromPrefix ? undefined : tenantEnv();
   return {
     ENVIRONMENT: optional("ENVIRONMENT", "local"),
     PIPELINE_RAW_PROVIDER: provider,
@@ -64,7 +68,7 @@ export function vendorBindings(extra: Record<string, string | undefined> = {}): 
           PIPELINE_RAW_S3_SECRET_ACCESS_KEY: locker.secretAccessKey,
         }
       : {}),
-    PIPELINE_ORG_ID: tenant.orgId,
+    ...(orgFromPrefix ? { PIPELINE_ORG_FROM_PREFIX: "true" } : { PIPELINE_ORG_ID: tenant!.orgId }),
     PIPELINE_RECONCILE_ENABLED: optional("PIPELINE_RECONCILE_ENABLED", "true"),
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: optional("PIPELINE_RECONCILE_LOOKBACK_MINUTES", "15"),
     ...(process.env.PIPELINE_KEY_PREFIX ? { PIPELINE_KEY_PREFIX: process.env.PIPELINE_KEY_PREFIX } : {}),

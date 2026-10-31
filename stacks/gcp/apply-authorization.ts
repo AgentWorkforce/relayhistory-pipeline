@@ -6,12 +6,19 @@ import {
 } from "node:crypto";
 import { mkdirSync, openSync, closeSync, realpathSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import type { Effect } from "effect/Effect";
+import { catchTag, die, timeout } from "effect/Effect";
 import { GCP_APPLY_NONCE_ENV, type KubernetesExecutorInputs } from "./config.ts";
 
 const GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs";
 const GOOGLE_ISSUERS = new Set(["accounts.google.com", "https://accounts.google.com"]);
 const JWT_PART = /^[A-Za-z0-9_-]+$/;
 const KID = /^[A-Za-z0-9_-]{1,256}$/;
+
+/** Hard upper bound for one authorized mutation run. */
+export const GCP_APPLY_LEASE_MS = 15 * 60 * 1000;
+/** Leaves five minutes of signed-token lifetime beyond the hard lease. */
+export const GCP_APPLY_MIN_REMAINING_SECONDS = GCP_APPLY_LEASE_MS / 1000 + 5 * 60;
 
 export interface GcpApplyAuthorizationInput {
   stage: string;
@@ -30,6 +37,35 @@ export interface GcpApplyAuthorizationProof {
   executorIdentity: string;
   nonceDigest: string;
   expiresAt: number;
+  leaseExpiresAt: number;
+}
+
+export function assertGcpApplyLeaseActive(
+  proof: GcpApplyAuthorizationProof,
+  nowMs = Date.now(),
+): GcpApplyAuthorizationProof {
+  const nowSeconds = Math.floor(nowMs / 1000);
+  if (
+    proof.proof !== "gcp-apply-authorized" ||
+    !Number.isInteger(proof.expiresAt) ||
+    !Number.isInteger(proof.leaseExpiresAt) ||
+    proof.leaseExpiresAt > proof.expiresAt ||
+    proof.leaseExpiresAt <= nowSeconds
+  )
+    fail("GCP apply mutation lease expired.");
+  return proof;
+}
+
+/** Interrupts the stack Effect before the signed mutation lease can expire. */
+export function boundGcpApplyLease<A, E, R>(program: Effect<A, E, R>, durationMs = GCP_APPLY_LEASE_MS) {
+  if (!Number.isInteger(durationMs) || durationMs < 1 || durationMs > GCP_APPLY_LEASE_MS)
+    throw new Error("96bulls: GCP apply mutation lease duration is invalid. Nothing was created.");
+  return program.pipe(
+    timeout(durationMs),
+    catchTag("TimeoutError", () =>
+      die(new Error("96bulls: GCP apply mutation lease expired. No further mutations were scheduled.")),
+    ),
+  );
 }
 
 interface GoogleJwk {
@@ -172,7 +208,7 @@ export async function verifyGcpApplyNonce(
     !Number.isInteger(claims.exp) ||
     claims.iat > nowSeconds + 30 ||
     claims.iat < nowSeconds - 5 * 60 ||
-    claims.exp <= nowSeconds ||
+    claims.exp < nowSeconds + GCP_APPLY_MIN_REMAINING_SECONDS ||
     claims.exp > nowSeconds + 60 * 60 ||
     claims.exp <= claims.iat
   )
@@ -187,6 +223,7 @@ export async function verifyGcpApplyNonce(
     nonceDigest,
     nonceId: nonceDigest,
     expiresAt: claims.exp,
+    leaseExpiresAt: nowSeconds + GCP_APPLY_LEASE_MS / 1000,
   };
 }
 
@@ -235,6 +272,7 @@ export function consumeGcpApplyNonce(
         executorIdentity: proof.executorIdentity,
         nonceDigest: proof.nonceDigest,
         expiresAt: proof.expiresAt,
+        leaseExpiresAt: proof.leaseExpiresAt,
       }),
       { encoding: "utf8" },
     );
@@ -290,6 +328,7 @@ export async function consumeGcpApplyNonceGlobally(
         executorIdentity: proof.executorIdentity,
         nonceDigest: proof.nonceDigest,
         expiresAt: proof.expiresAt,
+        leaseExpiresAt: proof.leaseExpiresAt,
       }),
       redirect: "error",
     });

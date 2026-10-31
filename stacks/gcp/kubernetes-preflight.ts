@@ -1,7 +1,7 @@
 import { isIP } from "node:net";
 import { connect } from "node:net";
 import type { KubernetesExecutorInputs } from "./config.ts";
-import type { GcpApplyAuthorizationProof } from "./apply-authorization.ts";
+import { assertGcpApplyLeaseActive, type GcpApplyAuthorizationProof } from "./apply-authorization.ts";
 
 const EXECUTOR_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{2,62}$/;
 
@@ -11,14 +11,45 @@ function isPrivateIpv4(value: string): boolean {
   return a === 10 || (a === 172 && b! >= 16 && b! <= 31) || (a === 192 && b === 168);
 }
 
+function privateIpv4Host(value: string): string | undefined {
+  if (isPrivateIpv4(value)) return value;
+  if (value !== value.trim()) return undefined;
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname;
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username !== "" ||
+      parsed.password !== "" ||
+      parsed.port !== "" ||
+      parsed.pathname !== "/" ||
+      parsed.search !== "" ||
+      parsed.hash !== "" ||
+      (value !== `https://${host}` && value !== `https://${host}/`) ||
+      !isPrivateIpv4(host)
+    )
+      return undefined;
+    return host;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface KubernetesReachabilityProof {
   executor: string;
   executorIdentity: string;
   mode: KubernetesExecutorInputs["mode"];
   stage: string;
   projectId: string;
-  nonceDigest: string;
   proof: "private-control-plane-tcp-443";
+}
+
+/** Stable evidence only; a one-use authorization digest must never enter K8s state. */
+export function relaycastProofAnnotations<Executor, Proof>(proof: { executor: Executor; proof: Proof }) {
+  return {
+    "96bulls.agentworkforce.dev/executor": proof.executor,
+    "96bulls.agentworkforce.dev/reachability": proof.proof,
+  };
 }
 
 export type KubernetesEndpointDialer = (host: string, port: number, timeoutMs: number) => Promise<void>;
@@ -53,21 +84,22 @@ export async function provePrivateKubernetesReachability(
   dial: KubernetesEndpointDialer = dialTcp,
   timeoutMs = 5000,
 ): Promise<KubernetesReachabilityProof> {
+  assertGcpApplyLeaseActive(authorization);
   if (
     !EXECUTOR_NAME.test(executor.name) ||
     (executor.mode !== "in-vpc" && executor.mode !== "vpn") ||
     authorization.proof !== "gcp-apply-authorized" ||
     authorization.executor !== executor.name ||
-    authorization.executorIdentity !== executor.identity ||
-    authorization.expiresAt <= Math.floor(Date.now() / 1000)
+    authorization.executorIdentity !== executor.identity
   )
     throw new Error("96bulls: Kubernetes executor identity is invalid. No Kubernetes objects were applied.");
-  if (!isPrivateIpv4(endpoint))
+  const endpointHost = privateIpv4Host(endpoint);
+  if (!endpointHost)
     throw new Error("96bulls: GKE control-plane endpoint is not a concrete private IPv4 address. No Kubernetes objects were applied.");
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000)
     throw new Error("96bulls: Kubernetes reachability deadline is invalid. No Kubernetes objects were applied.");
   try {
-    await dial(endpoint, 443, timeoutMs);
+    await dial(endpointHost, 443, timeoutMs);
   } catch {
     throw new Error(
       `96bulls: named ${executor.mode} executor ${executor.name} cannot reach the private GKE control plane. No Kubernetes objects were applied.`,
@@ -79,7 +111,6 @@ export async function provePrivateKubernetesReachability(
     mode: executor.mode,
     stage: authorization.stage,
     projectId: authorization.projectId,
-    nonceDigest: authorization.nonceDigest,
     proof: "private-control-plane-tcp-443",
   };
 }
