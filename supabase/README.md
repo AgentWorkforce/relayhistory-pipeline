@@ -5,14 +5,16 @@ files run is the in-process PGlite inside `packages/pipeline` vitest.
 
 ## Provenance
 
-| File | Source |
-| --- | --- |
-| `20261025000600_pipeline_queue.sql` | relayhistory-cloud PR #210 (the framework this repo moved in) |
-| `20261025000000_sessions_index.sql` | relayhistory-cloud PR #171, merge commit `51c313fda3c4288cf75f9927c4004fb39b6cd2ee` |
-| `20261025000100_repo_identity.sql` | relayhistory-cloud PR #177 (`7f49063`) |
-| `20261025000200_scrub_quarantine.sql` | relayhistory-cloud PR #185 (`fe89fc3`) |
-| `20261025000300_upsert_keep_on_null.sql` | relayhistory-cloud PR #185 (`fe89fc3`) |
-| `../tests/supabase_shim.sql` | relayhistory-cloud PR #171, merge commit `51c313fda3c4288cf75f9927c4004fb39b6cd2ee` |
+| File                                                 | Source                                                                               |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `20261025000600_pipeline_queue.sql`                  | relayhistory-cloud PR #210 (the framework this repo moved in)                        |
+| `20261025000000_sessions_index.sql`                  | relayhistory-cloud PR #171, merge commit `51c313fda3c4288cf75f9927c4004fb39b6cd2ee`  |
+| `20261025000100_repo_identity.sql`                   | relayhistory-cloud PR #177 (`7f49063`)                                               |
+| `20261025000200_scrub_quarantine.sql`                | relayhistory-cloud PR #185 (`fe89fc3`)                                               |
+| `20261025000300_upsert_keep_on_null.sql`             | relayhistory-cloud PR #185 (`fe89fc3`)                                               |
+| `20261030010000_session_directory.sql`               | 96BullSessions decision 0002 logical-session metadata contract                       |
+| `20261030020000_session_directory_short_summary.sql` | 96BullSessions G6: bounded, scrubbed `short_summary` and the tenant-bound search RPC |
+| `../tests/supabase_shim.sql`                         | relayhistory-cloud PR #171, merge commit `51c313fda3c4288cf75f9927c4004fb39b6cd2ee`  |
 
 Repository: https://github.com/AgentWorkforce/relayhistory-cloud. The `000000` to
 `000300` files and `supabase_shim.sql` are verbatim copies of the blobs at
@@ -29,3 +31,16 @@ identical at the PR #211 head too. Do not edit them here; change them upstream.
 TypeScript tests apply every file here in name order after
 `supabase/tests/supabase_shim.sql` (which stubs the Supabase roles and `auth`
 functions). So these files are dependencies of `000600`, vendored so the tests run.
+
+`20261030010000_session_directory.sql` is owned by this repository rather than
+vendored. It is an unapplied schema contract only: it creates no projector,
+backfill, trigger, deployment, or production write.
+
+`20261030020000_session_directory_short_summary.sql` is also owned here. Provenance
+of scope: the helm-chart-chief coordinator recorded the user's direct approval to
+implement bounded short_summary work in its controlling session. Draft only. Its down
+path is `../rollbacks/20261030020000_session_directory_short_summary.down.sql`, kept
+out of this directory because the tests apply every file here in name order. The
+migration needs the `btree_gin` extension (available on Supabase) for its
+tenant-scoped trigram index, and creates the NOLOGIN role
+`session_directory_search_worker`; PGlite tests load `btree_gin` alongside `pg_trgm`.

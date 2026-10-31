@@ -1,6 +1,8 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
+import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
+import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   assertExportComplete,
@@ -24,7 +26,7 @@ const key = (s: string) =>
 const scope = { orgId: "o" };
 
 beforeAll(async () => {
-  pg = new PGlite();
+  pg = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await pg.exec(readFileSync(supabase("tests/supabase_shim.sql"), "utf8"));
   for (const file of readdirSync(supabase("migrations/")).sort())
     await pg.exec(readFileSync(supabase(`migrations/${file}`), "utf8"));
