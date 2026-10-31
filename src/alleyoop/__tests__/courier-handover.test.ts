@@ -220,6 +220,7 @@ describe("handover from a cold export (H1-H5)", () => {
 
     // In every mode a takeover needs the claim, and it must match.
     w.identity.machineClaim = undefined;
+    w.openClaimlessWindow();
     expect(
       (
         await w.post({

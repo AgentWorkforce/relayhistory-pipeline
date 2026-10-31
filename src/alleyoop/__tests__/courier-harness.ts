@@ -25,7 +25,7 @@ import {
 } from "../../shared/vendor.ts";
 import { runCourierOnce, type CourierConfig } from "../courier.ts";
 import { feedRecordId } from "../feed-records.ts";
-import { createCourierManifestRoutes } from "../manifests.ts";
+import { createCourierManifestRoutes, type ClaimlessUse } from "../manifests.ts";
 
 const ORG = "org_test";
 const WORKSPACE = "default";
@@ -115,6 +115,8 @@ export async function courierWorld(
   const gate = {
     missing: [] as string[],
     requeued: [] as { message: unknown; delaySeconds: number }[],
+    claimless: [] as ClaimlessUse[],
+    auditDown: false,
   };
   const identity: { machineClaim?: string } = { machineClaim: machineId };
   const store = createFsStore({ root });
@@ -127,6 +129,10 @@ export async function courierWorld(
     raw,
     send: async () => {},
     missingReaders: async () => gate.missing,
+    recordClaimless: async (use) => {
+      if (gate.auditDown) throw new Error("audit unavailable");
+      gate.claimless.push(use);
+    },
     requeueBackfill: async (_env, message, delaySeconds) =>
       void gate.requeued.push({ message, delaySeconds }),
   });
@@ -437,6 +443,11 @@ export async function courierWorld(
       ).run(sessionId, `uid-${revision}`, STARTED + revision, line, revision);
       rw.close();
       return revision;
+    },
+    /** The legacy window, open until `until`. */
+    openClaimlessWindow: (until = new Date(Date.now() + 60_000)) => {
+      env.MANIFEST_MACHINE_CLAIM = "compat";
+      env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = until.toISOString();
     },
     setEpoch: (epoch: number) => {
       const rw = new DatabaseSync(dbPath);

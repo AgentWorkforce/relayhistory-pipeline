@@ -131,6 +131,11 @@ async function ingest(extra: Record<string, string> = {}) {
     RELAYHISTORY_ORIGIN: ORIGIN,
     ...extra,
   });
+  // The legacy machine-claim window: these tokens predate the claim.
+  if (extra.CLAIMLESS_WINDOW !== "shut") {
+    process.env.MANIFEST_MACHINE_CLAIM = "compat";
+    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = "2099-01-01T00:00:00.000Z";
+  }
   delete process.env.ALLOW_INTERIM_RELAYAUTH_BEARER;
   if (extra.ALLOW_INTERIM_RELAYAUTH_BEARER) process.env.ALLOW_INTERIM_RELAYAUTH_BEARER = extra.ALLOW_INTERIM_RELAYAUTH_BEARER;
   const store = createFsStore({ root });
@@ -209,6 +214,13 @@ async function code(response: Response) {
 const MIGRATION_ON = { RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS: "true", RELAYHISTORY_MIGRATION_GRANTS: `${GRANT}=${PLAN}` };
 
 describe("buildIngestApp auth (production composition)", () => {
+  test("the claim switch reaches the route from the real environment, and defaults shut", async () => {
+    const shut = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true", CLAIMLESS_WINDOW: "shut" });
+    const { manifest } = await planned();
+    expect((await shut.commit(liveToken(), manifest)).status).toBe(403);
+    expect(await count("sessions.claimless_uses")).toBe(0);
+  });
+
   test("default config: a generic RelayAuth bearer is refused (401) on every upload route, and so is a migration token", async () => {
     const { upload, manifest } = await planned();
     const i = await ingest();

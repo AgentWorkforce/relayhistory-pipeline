@@ -325,7 +325,7 @@ type Rebase = "rebased" | "reset" | "fenced" | "defer";
  */
 async function rebaseSession(cfg: CourierConfig, machineId: string, session: SessionState, mKey: string): Promise<Rebase> {
   const q = new URLSearchParams({ key: mKey, machine: machineId, writer: machineId, manifest: "1" });
-  const res = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`, { method: "GET" }).catch(() => undefined);
+  const res = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`, { method: "GET", headers: { "x-relay-client": PLUGIN_VERSION } }).catch(() => undefined);
   if (res?.status === 404) return "reset";
   // A 403 here is about the caller's credential, never ownership: only the
   // stored `raw.owner` may fence a session, because fencing is permanent.
@@ -381,7 +381,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
     if (!st.manifest_key || (st.revision === 0 && !st.pending_manifest)) continue;
     if (verified.has(st.manifest_key)) continue;
     const q = new URLSearchParams({ key: st.manifest_key, machine: state.machine_id, writer: state.machine_id });
-    const head = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`, { method: "GET" }).catch(() => undefined);
+    const head = await authorizedFetch(cfg.token, `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`, { method: "GET", headers: { "x-relay-client": PLUGIN_VERSION } }).catch(() => undefined);
     if (head?.status === 403) {
       // The stored writer differs. The session's rebase reads the owner.
       st.needs_rebase = true;
@@ -522,6 +522,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
             "content-type": "application/octet-stream",
             "x-relay-trace-id": session.trace_id,
             "x-machine-id": loc.machineId,
+            "x-relay-client": PLUGIN_VERSION,
             "x-session-id": loc.sessionId,
             traceparent,
           },
@@ -633,6 +634,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: nu
           "content-type": "application/json",
           "x-relay-trace-id": session.trace_id,
           "x-machine-id": loc.machineId,
+            "x-relay-client": PLUGIN_VERSION,
           "x-session-id": loc.sessionId,
           traceparent,
         },

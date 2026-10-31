@@ -88,6 +88,8 @@ interface ManifestRoutesDeps {
   ): Promise<void>;
   /** Readers with no valid attestation. Absent means none are ready: fail closed. */
   missingReaders?: () => Promise<string[]>;
+  /** The audit and meter for the claimless window. Absent: the window stays shut. */
+  recordClaimless?: (use: ClaimlessUse) => Promise<void>;
   /** Durable delayed requeue of a refused backfill. */
   requeueBackfill?: (
     env: Bindings,
@@ -102,6 +104,35 @@ interface ManifestRoutesDeps {
    * `migration_ledger_unavailable`.
    */
   migrationLedger?: MigrationAssertionLedger;
+}
+
+/** One use of the claimless window, by caller and client version. */
+export interface ClaimlessUse {
+  surface: "status" | "write";
+  orgId: string;
+  caller: string;
+  clientVersion: string;
+}
+
+async function auditClaimless(
+  deps: ManifestRoutesDeps,
+  surface: ClaimlessUse["surface"],
+  auth: Auth,
+  manifest: ManifestV1,
+  client: string | undefined,
+): Promise<boolean> {
+  if (!deps.recordClaimless) return false;
+  try {
+    await deps.recordClaimless({
+      surface,
+      orgId: auth.orgId,
+      caller: `${auth.tokenSubject}:${auth.userId}`,
+      clientVersion: (client ?? manifest.writer.plugin_version).slice(0, 128),
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 interface PostedManifest {
@@ -198,8 +229,20 @@ function machineClaim(auth: Auth): string | undefined {
   return typeof value === "string" && value ? value : undefined;
 }
 
-const claimRequired = (env: Bindings) =>
-  (env as Record<string, unknown>).MANIFEST_MACHINE_CLAIM === "required";
+/**
+ * The legacy window for couriers from before the machine claim. Closed unless
+ * a deployment opts in with `MANIFEST_MACHINE_CLAIM=compat` and a future
+ * `MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL`, so a new deployment requires the claim,
+ * unsetting either is the kill switch, and the window closes itself at the
+ * sunset. While it is open the system is not machine-bound. Delete this and its
+ * callers when the sunset passes.
+ */
+export function claimlessWindowOpen(env: Bindings, now = new Date()): boolean {
+  const vars = env as Record<string, unknown>;
+  if (vars.MANIFEST_MACHINE_CLAIM !== "compat") return false;
+  const until = Date.parse(String(vars.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL));
+  return Number.isFinite(until) && now.getTime() < until;
+}
 
 /**
  * A live write's machine binding: claim, key `m=` and writer agree. A mismatch
@@ -216,7 +259,7 @@ function machineClaimIssue(
   if (auth.tokenSubject === MIGRATION_SUBJECT) return undefined;
   const claim = machineClaim(auth);
   if (claim === undefined) {
-    const strict = required || claimRequired(env);
+    const strict = required || !claimlessWindowOpen(env);
     return strict ? `${MACHINE_CLAIM} is required` : undefined;
   }
   return claim === manifest.session.machine_id &&
@@ -844,6 +887,9 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         "machine_claim_refused",
         "the token is not bound to this machine and writer",
       );
+    if (auth.tokenSubject !== MIGRATION_SUBJECT && machineClaim(auth) === undefined &&
+      !(await auditClaimless(deps, "write", auth, manifest, c.req.header("X-Relay-Client"))))
+      return responseError(c, 503, "claimless_audit_unavailable", "this write cannot be recorded");
     const encoded = new TextEncoder().encode(JSON.stringify(manifest));
     const encodedText = new TextDecoder().decode(encoded);
     if (encoded.byteLength > MAX_MANIFEST_BYTES)
@@ -1165,10 +1211,13 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         (claim !== undefined && claim !== machine)
       )
         return c.body(null, 403);
-      // The claimless window is for couriers from before the claim. It closes
-      // with the switch, and the `compat` branch goes when `required` is default.
-      if (claim === undefined && !auth.migration && claimRequired(c.env ?? {}))
-        return c.body(null, 403);
+      // Without a claim, the legacy window gives the version alone, and only
+      // if the read is on the record: an unaudited read is refused.
+      if (claim === undefined && !auth.migration) {
+        if (!claimlessWindowOpen(c.env ?? {})) return c.body(null, 403);
+        if (!(await auditClaimless(deps, "status", auth, stored.manifest, c.req.header("X-Relay-Client"))))
+          return c.body(null, 503);
+      }
       // A migration assertion never reads a client's parked manifest.
       if (
         auth.tokenSubject !== MIGRATION_SUBJECT &&

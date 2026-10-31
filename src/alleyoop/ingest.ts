@@ -37,7 +37,7 @@ import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedMigrationNames } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
-import { courierMigrationLedger, createCourierManifestRoutes } from "./manifests.ts";
+import { courierMigrationLedger, createCourierManifestRoutes, type ClaimlessUse } from "./manifests.ts";
 
 /** Test seams for buildIngestApp: an already migrated database and a raw store. */
 export interface IngestOverrides {
@@ -57,6 +57,17 @@ export interface IngestOverrides {
  *  - With `RELAYHISTORY_ORIGIN` set, the upload routes take only origin-bound
  *    assertions (or migration assertions), even with the interim bearer on.
  */
+/** One row per day, org, surface, caller and client version. */
+function recordClaimlessUse(db: SqlExecutor, use: ClaimlessUse) {
+  return db.query(
+    `INSERT INTO sessions.claimless_uses (day, org_id, surface, caller, client_version)
+     VALUES (current_date, $1, $2, $3, $4)
+     ON CONFLICT (day, org_id, surface, caller, client_version)
+     DO UPDATE SET uses = sessions.claimless_uses.uses + 1, last_at = now()`,
+    [use.orgId, use.surface, use.caller, use.clientVersion],
+  ).then(() => undefined);
+}
+
 export async function buildIngestApp(overrides: IngestOverrides = {}) {
   const port = integer("INGEST_PORT", 8080);
   const jwks = process.env.JWKS_JSON
@@ -74,6 +85,10 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     // Hosted/customer installs on a shared RelayAuth issuer: set RELAYHISTORY_ORIGIN so only
     // assertions minted for this deployment's origin are accepted (legacy shared audience refused).
     ...(process.env.RELAYHISTORY_ORIGIN ? { RELAYHISTORY_ORIGIN: process.env.RELAYHISTORY_ORIGIN } : {}),
+    ...(process.env.MANIFEST_MACHINE_CLAIM ? { MANIFEST_MACHINE_CLAIM: process.env.MANIFEST_MACHINE_CLAIM } : {}),
+    ...(process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL ? { MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL } : {}),
+    ...(process.env.BACKFILL_ACTIVATION_MAX_ATTEMPTS ? { BACKFILL_ACTIVATION_MAX_ATTEMPTS: process.env.BACKFILL_ACTIVATION_MAX_ATTEMPTS } : {}),
+    ...(process.env.BACKFILL_ACTIVATION_MAX_DELAY_SECONDS ? { BACKFILL_ACTIVATION_MAX_DELAY_SECONDS: process.env.BACKFILL_ACTIVATION_MAX_DELAY_SECONDS } : {}),
     ...(process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS ? { RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS: process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS } : {}),
     // RelayAuth migration assertions (relayauth#110): default off. Grants are
     // `grantId=planDigest` pairs (ids and public digests only, no secrets).
@@ -126,6 +141,7 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     send,
     migrationLedger,
     missingReaders: () => missingReaders({ key: process.env.MANIFEST_READINESS_KEY, store: readiness }),
+    recordClaimless: (use) => recordClaimlessUse(db, use),
     requeueBackfill: (_env, message, delaySeconds) => queue.send(message, { delaySeconds }),
   });
 

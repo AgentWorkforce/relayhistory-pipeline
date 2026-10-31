@@ -25,14 +25,29 @@ identity.
 
 ## Machine claim
 
-`MANIFEST_MACHINE_CLAIM` is `compat` by default: a live write or a version-only
-status read with no `meta.machineId` is allowed. Set it to `required` once the issuer ships the
-claim. A mismatched claim is refused in both modes. A takeover and
-`status?manifest=1` need the claim in both modes, so **production rebase and
-takeover stay blocked until the claim ships**.
+**The default requires the claim.** Every live write and status read needs a
+`meta.machineId` matching the key's machine and the writer. **A deployment whose
+couriers have no claim yet must opt in before it takes this release, or its live
+delivery stops with 403.** Opting in takes both:
 
-When `required` becomes the default, delete the `compat` branch and the claimless
-status window rather than leaving them switched off.
+- `MANIFEST_MACHINE_CLAIM=compat`
+- `MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL=<RFC 3339>`, the sunset
+
+The window then closes itself at the sunset, and a bad or missing date keeps it
+shut. Unsetting either variable, or setting `required`, is the kill switch. Both
+are read through the ingest's environment.
+
+While the window is open **this system is not machine-bound**. A claimless read
+gets the object version alone and writes nothing. A claimless write stays
+possible, as it is today. Both are recorded per day, org, surface, caller and
+client version in `sessions.claimless_uses`, and a use that cannot be recorded is
+refused. Check that table is empty before closing the window. The client version
+is self-reported, so treat it as a guide. Takeover and `status?manifest=1` always
+need the claim, so **production rebase and takeover stay blocked until it ships**.
+A mismatched claim is refused whether the window is open or not.
+
+After the sunset, delete `claimlessWindowOpen` and its callers rather than
+leaving them shut.
 
 The courier gets a claim only through Cloud: set `CLOUD_URL`,
 `CLOUD_TOKEN_COMMAND_JSON` and `MACHINE_ID` (its claimed fleet node id). The

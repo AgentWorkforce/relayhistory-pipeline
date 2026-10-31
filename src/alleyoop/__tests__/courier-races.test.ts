@@ -468,6 +468,7 @@ describe("machine claim", () => {
       w.hooks.beforeManifest = undefined;
       await w.exporter(w.exportText("pre-t0"));
       w.identity.machineClaim = undefined;
+      w.openClaimlessWindow();
     };
     await w.run();
     await settle(w);
@@ -498,6 +499,7 @@ describe("machine claim", () => {
     expect(await (await status(w, q)).json()).toHaveProperty("manifest");
 
     w.identity.machineClaim = undefined;
+    w.openClaimlessWindow();
     expect(await (await status(w, q)).json()).not.toHaveProperty("manifest");
     expect(
       (await status(w, `machine=${w.machineId}&writer=someone&manifest=1`))
@@ -516,52 +518,113 @@ describe("machine claim", () => {
     ).toBe(403);
   });
 
-  test("the claimless status window closes with the switch, on every form", async () => {
-    const w = await world({ format: "ndjson" });
-    await w.write(line(0));
-    await w.run();
-    const version = `machine=${w.machineId}&writer=${w.machineId}`;
-    w.identity.machineClaim = undefined;
-    expect((await status(w, version)).status).toBe(200);
-    expect((await status(w, `${version}&manifest=1`)).status).toBe(200);
-
-    w.env.MANIFEST_MACHINE_CLAIM = "required";
-    expect((await status(w, version)).status).toBe(403);
-    expect((await status(w, `${version}&manifest=1`)).status).toBe(403);
-
-    w.identity.machineClaim = w.machineId;
-    expect(await (await status(w, `${version}&manifest=1`)).json()).toHaveProperty("manifest");
-  });
-
-  test("the courier stays safe when the window closes on it: it defers, never fences", async () => {
-    const w = await world({ format: "ndjson" });
-    await w.write(line(0));
-    await w.run();
-    await w.exporter(w.exportText("pre-t0"));
-    w.env.MANIFEST_MACHINE_CLAIM = "required";
-    w.identity.machineClaim = undefined;
-    await w.write(line(1));
-    await settle(w);
-    expect((await w.state()).sessions["claude:session-a"].fenced).toBeFalsy();
-    w.identity.machineClaim = w.machineId;
-    await settle(w);
-    expect((await w.liveRecords()).lines).toHaveLength(2);
-  });
-
-  test("POST refuses a mismatched claim in both modes, and a missing one only when required", async () => {
-    for (const mode of ["compat", "required"]) {
+  describe("the claimless window", () => {
+    const setup = async () => {
       const w = await world({ format: "ndjson" });
-      w.env.MANIFEST_MACHINE_CLAIM = mode;
+      await w.write(line(0));
+      await w.run();
+      w.identity.machineClaim = undefined;
+      return { w, version: `machine=${w.machineId}&writer=${w.machineId}` };
+    };
+
+    test("is shut by default: a new deployment requires the claim everywhere", async () => {
+      const { w, version } = await setup();
+      for (const q of [version, `${version}&manifest=1`])
+        expect((await status(w, q)).status).toBe(403);
+      await w.write(line(1));
+      await w.run();
+      expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
+      expect(w.gate.claimless).toEqual([]);
+    });
+
+    test("open, it gives exactly the version, and audits caller and client", async () => {
+      const { w, version } = await setup();
+      w.openClaimlessWindow();
+      for (const q of [version, `${version}&manifest=1`]) {
+        const res = await status(w, q);
+        expect(res.status).toBe(200);
+        expect(Object.keys((await res.json()) as object)).toEqual(["version"]);
+      }
+      expect(w.gate.claimless).toHaveLength(2);
+      expect(w.gate.claimless[0]).toEqual({
+        surface: "status",
+        orgId: "org_test",
+        caller: "agent_relayhistory_assertion:user",
+        clientVersion: "96bulls-courier/0.3.0",
+      });
+    });
+
+    test("a write through it is audited", async () => {
+      const { w } = await setup();
+      w.openClaimlessWindow();
+      await w.write(line(1));
+      await w.run();
+      expect((await w.stored())!.manifest.raw.chunk_count).toBe(2);
+      expect(w.gate.claimless.some((use) => use.surface === "write")).toBe(true);
+    });
+
+    test("an unaudited use is refused, not waved through", async () => {
+      const { w, version } = await setup();
+      w.openClaimlessWindow();
+      w.gate.auditDown = true;
+      expect((await status(w, version)).status).toBe(503);
+      await w.write(line(1));
+      await w.run();
+      expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
+    });
+
+    test("a present, mismatched claim is refused on every form, window open or not", async () => {
+      const { w, version } = await setup();
+      w.openClaimlessWindow();
+      w.identity.machineClaim = "another-machine";
+      for (const q of [version, `${version}&manifest=1`])
+        expect((await status(w, q)).status).toBe(403);
+      expect(w.gate.claimless).toEqual([]);
+    });
+
+    test("closes completely: at the sunset, with a bad date, and on the kill switch", async () => {
+      const closers: ((w: World) => void)[] = [
+        (w) => w.openClaimlessWindow(new Date(Date.now() - 1000)),
+        (w) => void (w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = "not a date"),
+        (w) => void delete w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL,
+        (w) => void delete w.env.MANIFEST_MACHINE_CLAIM,
+        (w) => void (w.env.MANIFEST_MACHINE_CLAIM = "required"),
+      ];
+      for (const close of closers) {
+        const { w, version } = await setup();
+        w.openClaimlessWindow();
+        expect((await status(w, version)).status).toBe(200);
+        close(w);
+        const before = w.gate.claimless.length;
+        for (const q of [version, `${version}&manifest=1`])
+          expect((await status(w, q)).status).toBe(403);
+        await w.write(line(1));
+        await w.run();
+        expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
+        expect(w.gate.claimless).toHaveLength(before);
+      }
+    });
+
+    test("the courier stays safe when it closes: it defers, never fences", async () => {
+      const { w } = await setup();
+      await w.exporter(w.exportText("pre-t0"));
+      await w.write(line(1));
+      await settle(w);
+      expect((await w.state()).sessions["claude:session-a"].fenced).toBeFalsy();
+      w.identity.machineClaim = w.machineId;
+      await settle(w);
+      expect((await w.liveRecords()).lines).toHaveLength(2);
+    });
+  });
+
+  test("POST refuses a mismatched claim with the window open or shut", async () => {
+    for (const open of [false, true]) {
+      const w = await world({ format: "ndjson" });
+      if (open) w.openClaimlessWindow();
       await w.write(line(0));
       w.identity.machineClaim = "another-machine";
       await w.run();
       expect(await w.stored()).toBeUndefined();
-
-      w.identity.machineClaim = undefined;
-      await w.run();
-      if (mode === "required") expect(await w.stored()).toBeUndefined();
-      else expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
-
       w.identity.machineClaim = w.machineId;
       await settle(w);
       expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);

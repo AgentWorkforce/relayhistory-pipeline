@@ -117,6 +117,7 @@ async function fixture() {
     raw,
     send: async (_env, _stage, message) => void sent.push(message),
     missingReaders: async () => [],
+    recordClaimless: async () => {},
   });
   const app = new Hono<AppEnv>();
   let auth = {
@@ -178,6 +179,8 @@ async function fixture() {
     PIPELINE_ORG_ID: ORG,
     RELAYHISTORY_ORIGIN: "https://history.example",
     PIPELINE_TELEMETRY_ID_KEY: TELEMETRY_KEY,
+    MANIFEST_MACHINE_CLAIM: "compat",
+    MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: "2099-01-01T00:00:00.000Z",
   };
   const post = (
     body: unknown,
