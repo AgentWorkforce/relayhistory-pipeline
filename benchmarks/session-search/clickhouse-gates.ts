@@ -8,6 +8,7 @@
  *   BENCH_CH_SHELL how to run a command beside the server's data, e.g.
  *                  "docker exec <id> sh -c" (default: run locally)
  *   BENCH_CH_COMPRESSOR  clickhouse-compressor command (default clickhouse compressor)
+ *   BENCH_CH_PURGE_LIMIT_S  how long gate 3 waits for default cleanup (default 900)
  *   BENCH_OUT      report path
  *
  * Every result carries the statements and settings that produced it. Exits 1 if gate 3
@@ -169,18 +170,116 @@ async function gate4() {
   };
 }
 
+/** Gate 4 with the policy keyed on a custom setting, as #233 proposes. */
+async function gate4Setting() {
+  const table = "gate4s", user = "bench_app";
+  const auth: Auth = { user, password: "local-only" };
+  const policies = {
+    getSetting: "org_id = getSetting('SQL_bench_org')",
+    getSettingOrDefault: "org_id = getSettingOrDefault('SQL_bench_org', '')",
+  };
+  await ch(`DROP USER IF EXISTS ${user}`);
+  await ch(`CREATE USER ${user} IDENTIFIED WITH plaintext_password BY '${auth.password}'`);
+  const results: Record<string, unknown> = {};
+  for (const [form, using] of Object.entries(policies)) {
+    await ch(`DROP TABLE IF EXISTS ${table} SYNC`);
+    await ch(`DROP ROW POLICY IF EXISTS gate4s_p ON ${table}`);
+    await ch(seedTable(table)); await ch(seedRows(table, "secretzebra")); await ch(`OPTIMIZE TABLE ${table} FINAL`);
+    await ch(`CREATE ROW POLICY gate4s_p ON ${table} USING ${using} TO ${user}`);
+    await ch(`GRANT SELECT ON ${table} TO ${user}`);
+    const run = async (term: string, setting: string | null) => Object.fromEntries(await Promise.all(Object.entries(READS).map(async ([name, s]) => {
+      const r = await attempt(() => num(`SELECT count() FROM ${table} WHERE hasAllTokens(content, '${term}')`,
+        { ...s, ...(setting === null ? {} : { SQL_bench_org: setting }) }, auth));
+      return [name, r.error ? `refused: ${r.error.slice(0, 80)}` : r.value] as const;
+    })));
+    const a = { own: await run("orgaterm", "org-a"), other: await run("orgbterm", "org-a"), shared: await run("alpha", "org-a") };
+    const omitted = { term: await run("alpha", null), trivialCount: await attempt(() => num(`SELECT count() FROM ${table}`, {}, auth)) };
+    // Whoever sets the value picks the tenant, so the setting must never reach a caller.
+    const spoofed = await run("orgbterm", "org-b");
+    const reads = Object.values(a.own).every((n) => n === 25_000) && Object.values(a.other).every((n) => n === 0)
+      && Object.values(a.shared).every((n) => n === 25_000);
+    const failClosed = Object.values(omitted.term).every((v) => v === 0 || String(v).startsWith("refused"))
+      && (omitted.trivialCount.error !== null || omitted.trivialCount.value === 0);
+    results[form] = { policy: using, reads: reads ? "PASS" : "FAIL", omittedFailsClosed: failClosed ? "PASS" : "FAIL", a, omitted, spoofed };
+  }
+  const side = await attempt(() => ch(`SELECT count() FROM mergeTreeTextIndex(currentDatabase(), ${table}, t)`, { SQL_bench_org: "org-a" }, auth));
+  return { readSettings: READS, sideDoor: side.error ? "REFUSED" : "FAIL: read the index around the policy", results,
+    trustNote: "`spoofed` shows what a caller who can set SQL_bench_org reads. The value is a capability, not an identity." };
+}
+
+/** Gate 3 with several parts and sessions, no OPTIMIZE, default part lifetime. */
+async function gate3Parts() {
+  const table = "gate3p", parts = 5, perPart = 2;
+  const secret = (p: number, n: number) => `secretpart${"abcde"[p]}${"xy"[n]}`;
+  await ch(`DROP TABLE IF EXISTS ${table} SYNC`);
+  await ch(`CREATE TABLE ${table} (org_id String, session_id String, event_id String, content String,
+    INDEX t content TYPE text(tokenizer = splitByNonAlpha, preprocessor = lower(content)))
+    ENGINE = MergeTree ORDER BY (org_id, session_id, event_id)`);
+  const statements = [`DELETE FROM ${table} WHERE session_id IN (<deleted sessions>)`, `ALTER TABLE ${table} APPLY DELETED MASK`];
+  const deleted: string[] = [];
+  for (let p = 0; p < parts; p++) {
+    for (let n = 0; n < perPart; n++) deleted.push(`'p${p}-doomed${n}'`);
+    await ch(`INSERT INTO ${table} SELECT 'org-a', if(number < ${perPart}, concat('p${p}-doomed', toString(number)), concat('p${p}-keep', toString(number % 50))),
+      toString(number), concat('alpha beta ', multiIf(number = 0, '${secret(p, 0)}', number = 1, '${secret(p, 1)}', 'plain'), ' gamma') FROM numbers(5000)`);
+  }
+  const tableDir = await ch(`SELECT data_paths[1] FROM system.tables WHERE database = currentDatabase() AND name = '${table}'`);
+  const script = `cd '${tableDir}' && find . -type f | while read f; do
+    if grep -qaE 'secretpart' "$f"; then echo "raw $f"; fi
+    case "$f" in *skp_idx*) if ${compressor} -d < "$f" 2>/dev/null | grep -qaE 'secretpart'; then echo "decompressed $f"; fi;; esac
+  done`;
+  const scan = () => { const r = beside(script); return r.ok ? r.stdout.split("\n").filter(Boolean) : null; };
+  const active = async () => JSON.parse((await ch(`SELECT groupArray(name) FROM system.parts WHERE table = '${table}' AND active FORMAT JSONEachRow`)).split("\n")[0]!.replace(/^{"groupArray\(name\)":/, "").replace(/}$/, "")) as string[];
+  const dirOf = (f: string) => f.split("/")[1]!;
+  const before = scan() ?? [];
+  await ch(`DELETE FROM ${table} WHERE session_id IN (${deleted.join(",")})`, { lightweight_deletes_sync: 2 });
+  const afterDelete = { files: scan(), active: await active() };
+  await ch(statements[1]!, { mutations_sync: 2 });
+  const start = performance.now();
+  const activeAfterMask = await active();
+  const afterMask = scan() ?? [];
+  const lifetime = await ch(`SELECT value FROM system.merge_tree_settings WHERE name = 'old_parts_lifetime'`);
+  const terms = Array.from({ length: parts }, (_, p) => [secret(p, 0), secret(p, 1)]).flat();
+  const counts: Record<string, Record<string, number>> = {};
+  for (const term of terms) counts[term] = await countAllReads(table, term);
+  let holding = afterMask;
+  const limit = Number(process.env.BENCH_CH_PURGE_LIMIT_S ?? 900) * 1000;
+  while (holding.length && performance.now() - start < limit) {
+    await Bun.sleep(5_000);
+    holding = scan() ?? holding;
+  }
+  return {
+    parts, deletedSessions: deleted.length, oldPartsLifetimeSeconds: Number(lifetime), statements,
+    scanControl: before.some((f) => f.includes("skp_idx")) ? "PASS" : "NOT MEASURED: the scan found no term before delete",
+    activePartsAfterMask: activeAfterMask,
+    activePartsHoldingTermAfterMask: afterMask.filter((f) => activeAfterMask.includes(dirOf(f))),
+    inactivePartsHoldingTermAfterMask: [...new Set(afterMask.map(dirOf))].filter((d) => !activeAfterMask.includes(d)),
+    afterLightweightDelete: afterDelete,
+    readsAfterMask: Object.values(counts).every((c) => Object.values(c).every((n) => n === 0)) ? "PASS" : "FAIL",
+    purgeSecondsAtDefaults: holding.length ? null : Math.round((performance.now() - start) / 1000),
+    stillHoldingAtLimit: holding,
+    limitSeconds: limit / 1000,
+  };
+}
+
 const TOKENIZERS = { splitByNonAlpha: "splitByNonAlpha", ngrams3: "ngrams(3)", sparseGrams: "sparseGrams" } as const;
 /** Gate 2's terms, planted beside the corpus text so corpus hashes stay stable. */
 const G2_TERMS = [
   { id: "identifier", term: "handle_webhook_v2" }, { id: "camelCase", term: "parseSessionToken" },
   { id: "path", term: "src/lib/session-search.ts" }, { id: "substring", term: "webho" },
   { id: "word", term: TERMS.selective }, { id: "non-english", term: TERMS.nonAscii }, { id: "cjk", term: TERMS.cjk },
+  // Every 3-gram of the term is planted, apart, so hasAllTokens can match without the term.
+  { id: "scattered-grams", term: "zqxwvu" },
+  // Every word is planted, out of order, so a token match is not the phrase.
+  { id: "scattered-phrase", term: "ochre tundra lantern" },
 ];
-const PLANTS = ["handle_webhook_v2", "parseSessionToken", "src/lib/session-search.ts", TERMS.nonAscii, TERMS.cjk];
+/** Exact substring check on top of the index, for tokenizers that overmatch. */
+const VERIFY_TERM = "zqxwvu";
+const PLANTS = ["handle_webhook_v2", "parseSessionToken", "src/lib/session-search.ts", TERMS.nonAscii, TERMS.cjk,
+  "zqxa bqxwc dxwve fwvug", "lantern tundra ochre"];
 
 const eventRow = (s: CorpusSession, n: number) => {
   const e = s.events[n]!;
-  const plant = n === 0 && parseInt(s.sessionId.slice(2), 36) % 20 === 0 ? PLANTS[parseInt(s.sessionId.slice(2), 36) % 100 / 20 | 0]! : "";
+  const plant = n === 0 && parseInt(s.sessionId.slice(2), 36) % 20 === 0 ? PLANTS[parseInt(s.sessionId.slice(2), 36) % 140 / 20 | 0]! : "";
   return { org_id: s.orgId, workspace_id: s.workspaceId, harness: s.harness, session_id: s.sessionId, event_id: e.eventId,
     ts: Math.floor(e.ts.getTime() / 1000), revision: 1, content: plant ? `${e.content} ${plant} ${TERMS.selective}` : e.content };
 };
@@ -227,7 +326,8 @@ async function gate2(raw: number) {
       terms[id] = { term, truth, returned: got.value, error: got.error,
         recall: truth && missed.value !== null ? (truth - Number(missed.value)) / truth : null, falsePositives: extra };
     }
-    results[name] = { tokenizer: spec, indexBytes: Number(size), indexBytesPerContentByte: Number(size) / raw, terms };
+    const verified = await attempt(() => num(`SELECT count() FROM ${table} WHERE hasAllTokens(content, '${VERIFY_TERM}') AND positionCaseInsensitiveUTF8(content, '${VERIFY_TERM}') > 0`));
+    results[name] = { tokenizer: spec, withSubstringCheck: { term: VERIFY_TERM, returned: verified.value, error: verified.error }, indexBytes: Number(size), indexBytesPerContentByte: Number(size) / raw, terms };
   }
   return { query: "hasAllTokens(content, lower(term)); truth is positionCaseInsensitiveUTF8 on an unindexed table", results };
 }
@@ -296,12 +396,20 @@ async function gate7(table: string) {
   const victim = pageSql(table, SMALL_ORG, SMALL_WS, "refactor");
   const noisy = pageSql(table, WHALE_ORG, WHALE_WS, "refactor");
   const quiet = await timed(victim, 50);
-  let stop = false;
-  const load = Array.from({ length: 6 }, async () => { while (!stop) await ch(noisy); });
-  const underLoad = await timed(victim, 50);
-  stop = true;
-  await Promise.all(load);
-  return { note: "6 connections loop the whale's common term; no quotas or workload scheduling set", quiet, underLoad, victim, noisy };
+  const under = async (connections: number) => {
+    let stop = false;
+    const load = Array.from({ length: connections }, async () => { while (!stop) await ch(noisy); });
+    const result = await timed(victim, 50);
+    stop = true;
+    await Promise.all(load);
+    return result;
+  };
+  const uncapped = await under(6);
+  const capped = await under(2);
+  const line = (quiet.p95 ?? 0) * 2;
+  return { note: "The whale loops its common term. Cap is client-side, 2 in flight per org; no server quotas or workload scheduling.",
+    passLine: "capped victim p95 under 2x quiet", quiet, underLoad: uncapped, cappedAt2: capped,
+    verdict: (capped.p95 ?? Infinity) < line ? "PASS" : "FAIL", victim, noisy };
 }
 
 async function bm25() {
@@ -313,7 +421,9 @@ const version = await ch("SELECT version()");
 const report: Record<string, unknown> = { version, scale, warning: "Vanilla ClickHouse, synthetic data, relative numbers. Not ObsessionDB and not an e2e proof." };
 report.bm25 = await bm25();
 report.gate3 = await gate3();
+report.gate3Parts = await gate3Parts();
 report.gate4 = await gate4();
+report.gate4Setting = await gate4Setting();
 const { rawContentBytes } = await loadEvents("events_probe", "");
 report.gate2 = await gate2(rawContentBytes);
 report.gate1 = { splitByNonAlpha: await gate1("events_splitByNonAlpha"), ngrams3: await gate1("events_ngrams3") };
@@ -329,5 +439,8 @@ writeFileSync(out, JSON.stringify(report, null, 2));
 console.log(JSON.stringify(report, (k, v) => (k === "statements" || k === "readSettings" ? undefined : v), 1));
 const g3 = report.gate3 as { reads: string; purgedIndexFiles: string };
 const g4 = report.gate4 as { reads: string; sideDoor: string };
-if (g3.reads === "FAIL" || g3.purgedIndexFiles === "FAIL" || g4.reads === "FAIL" || g4.sideDoor.startsWith("FAIL")) process.exit(1);
+const g3p = report.gate3Parts as { readsAfterMask: string };
+const g4s = report.gate4Setting as { sideDoor: string; results: Record<string, { reads: string; omittedFailsClosed: string }> };
+const settingFailed = g4s.sideDoor.startsWith("FAIL") || Object.values(g4s.results).some((r) => r.reads === "FAIL");
+if (g3.reads === "FAIL" || g3.purgedIndexFiles === "FAIL" || g3p.readsAfterMask === "FAIL" || g4.reads === "FAIL" || g4.sideDoor.startsWith("FAIL") || settingFailed) process.exit(1);
 process.exit(0);

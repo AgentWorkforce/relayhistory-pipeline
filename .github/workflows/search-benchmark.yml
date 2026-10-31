@@ -60,7 +60,11 @@ jobs:
 
   clickhouse-gates:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        scale: [S, M]
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:26.8.34.13
@@ -87,12 +91,12 @@ jobs:
           BENCH_CH_URL: http://127.0.0.1:8123
           BENCH_CH_PASSWORD: benchmark-only
           BENCH_CH_SHELL: docker exec ${{ job.services.clickhouse.id }} sh -c
-          BENCH_SCALE: S
+          BENCH_SCALE: ${{ matrix.scale }}
           BENCH_OUT: clickhouse-report.json
         run: bun benchmarks/session-search/clickhouse-gates.ts
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: clickhouse-gates-report
+          name: clickhouse-gates-report-${{ matrix.scale }}
           path: clickhouse-report.json
           if-no-files-found: ignore
