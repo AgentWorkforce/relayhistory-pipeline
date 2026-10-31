@@ -16,6 +16,9 @@ import {
   SESSION_DIRECTORY_LIST_COLUMNS,
   SESSION_DIRECTORY_QUERIES,
   agentPrefixRange,
+  agentPrefixPattern,
+  NonAsciiAgentPrefixError,
+  textPatternUpperBound,
 } from "../search-index-contract.ts";
 
 const root = join(import.meta.dir, "../../..");
@@ -72,6 +75,57 @@ const prefixArgs = (value: string, limit = 50) => {
   const range = agentPrefixRange(value);
   return ["o", "w", range.lower, range.upper, range.pattern, limit];
 };
+
+/**
+ * The bounded query with bounds computed straight from an already-normalized
+ * (lowercase) prefix, bypassing agentPrefixRange's ASCII-only guard: exercises the
+ * byte-order carry on stored Unicode names.
+ */
+async function rawBoundHits(db: PGlite, lower: string): Promise<string[]> {
+  const rows = await asAuthenticated(
+    db,
+    async () =>
+      (
+        await db.query<{ agent_name_normalized: string }>(
+          SESSION_DIRECTORY_QUERIES.agentPrefix,
+          [
+            "o",
+            "w",
+            lower,
+            textPatternUpperBound(lower),
+            agentPrefixPattern(lower),
+            50,
+          ],
+        )
+      ).rows,
+  );
+  return rows.map((r) => r.agent_name_normalized).sort();
+}
+
+/** The tenant-bound RPC as PostgREST would call it for the same tenant. */
+async function rpcAgentHits(
+  db: PGlite,
+  agent: string,
+  match: "exact" | "prefix",
+): Promise<string[]> {
+  await db.query("SELECT set_config('request.jwt.claims', $1, false)", [
+    JSON.stringify({
+      role: "session_directory_search_worker",
+      app_metadata: { org_id: "o", workspace_ids: ["w"] },
+    }),
+  ]);
+  await db.exec("SET ROLE session_directory_search_worker");
+  try {
+    const { rows } = await db.query<{ agent_name: string }>(
+      "SELECT * FROM sessions.search_session_directory(p_workspace_id => 'w', p_agent => $1, p_agent_match => $2)",
+      [agent, match],
+    );
+    return rows.map((r) => r.agent_name).sort();
+  } finally {
+    await db.exec("RESET ROLE");
+    await db.query("SELECT set_config('request.jwt.claims', '', false)");
+  }
+}
 
 async function prefixHits(db: PGlite, value: string): Promise<string[]> {
   const rows = await asAuthenticated(
@@ -175,6 +229,10 @@ describe("agent prefix bounds and recheck", () => {
     "cafг",
     "日本語-agent",
     "日本-x",
+    "Ägent-Nord",
+    "ägent-süd",
+    "ΟΔΟΣ-Agent",
+    "İstanbul-X",
   ];
   beforeAll(async () => {
     db = await database();
@@ -215,22 +273,67 @@ describe("agent prefix bounds and recheck", () => {
   });
 
   test("Unicode: a trailing U+10FFFF carries into the previous code point; the surrogate gap is skipped", async () => {
-    expect(agentPrefixRange(`ab${MAX}`).upper).toBe("ac");
-    expect(await prefixHits(db, `ab${MAX}`)).toEqual(
+    // The byte-order carry on stored Unicode names (raw lowercase bounds).
+    expect(textPatternUpperBound(`ab${MAX}`)).toBe("ac");
+    expect(await rawBoundHits(db, `ab${MAX}`)).toEqual(
       [`ab${MAX}`, `ab${MAX}z`].sort(),
     );
     const d7ff = `ab${String.fromCodePoint(0xd7ff)}`;
-    expect(agentPrefixRange(d7ff).upper).toBe(
+    expect(textPatternUpperBound(d7ff)).toBe(
       `ab${String.fromCodePoint(0xe000)}`,
     );
-    expect(await prefixHits(db, d7ff)).toEqual([`${d7ff}q`]);
-    expect(await prefixHits(db, "日本語")).toEqual(["日本語-agent"]);
+    expect(await rawBoundHits(db, d7ff)).toEqual([`${d7ff}q`]);
+    expect(await rawBoundHits(db, "日本語")).toEqual(["日本語-agent"]);
+    // ASCII prefixes still match stored non-ASCII names exactly.
     expect(await prefixHits(db, "caf")).toEqual(
       ["cafe-two", "café-one", "cafг"].sort(),
+    );
+    // The direct helper refuses every non-ASCII prefix instead of guessing.
+    for (const value of [`ab${MAX}`, d7ff, "日本語", "café"]) {
+      expect(() => agentPrefixRange(value)).toThrow(NonAsciiAgentPrefixError);
+    }
+  });
+
+  test("an uppercase non-ASCII prefix finds its rows through the RPC, never through the bounded query", async () => {
+    // Where PostgreSQL lower() and JavaScript toLowerCase() disagree (Greek final
+    // sigma, dotted capital I), bounds computed in TypeScript would silently miss
+    // the stored row. Prove the disagreement on this engine, so the case is real.
+    for (const [name, prefix] of [
+      ["ΟΔΟΣ-Agent", "ΟΔΟΣ"],
+      ["İstanbul-X", "İSTANBUL"],
+    ] as const) {
+      const sqlLower = (
+        await db.query<{ v: string }>("SELECT lower(btrim($1)) AS v", [prefix])
+      ).rows[0]!.v;
+      expect(sqlLower, name).not.toBe(prefix.trim().toLowerCase());
+      const naive = await rawBoundHits(db, prefix.trim().toLowerCase());
+      expect(
+        naive.some((n) => n === name.toLowerCase() || n.startsWith(sqlLower)),
+        name,
+      ).toBe(false);
+      // The direct bounded path refuses it, pointing at the RPC...
+      expect(() => agentPrefixRange(prefix)).toThrow(NonAsciiAgentPrefixError);
+      expect(() => agentPrefixRange(prefix)).toThrow(
+        /search_session_directory/,
+      );
+      // ...and the RPC, which lowers the input with the same SQL lower() as the
+      // stored value, finds the row.
+      expect(await rpcAgentHits(db, prefix, "prefix"), name).toEqual([name]);
+      expect(
+        await rpcAgentHits(db, ` ${name.toUpperCase()} `, "exact"),
+        name,
+      ).toEqual([name]);
+    }
+    // Where the two agree (Ä here), the direct path still refuses: agreement is
+    // collation-dependent, so the bounded query never takes non-ASCII input.
+    expect(() => agentPrefixRange("ÄGENT")).toThrow(NonAsciiAgentPrefixError);
+    expect(await rpcAgentHits(db, "ÄGENT", "prefix")).toEqual(
+      ["Ägent-Nord", "ägent-süd"].sort(),
     );
   });
 
   test("refuses the all-max prefix and an empty or short prefix", () => {
+    expect(() => textPatternUpperBound(MAX.repeat(3))).toThrow(RangeError);
     expect(() => agentPrefixRange(MAX.repeat(3))).toThrow(RangeError);
     expect(() => agentPrefixRange("")).toThrow(RangeError);
     expect(() => agentPrefixRange("   ")).toThrow(RangeError);
@@ -250,6 +353,7 @@ describe("agent prefix bounds and recheck", () => {
       String.fromCodePoint(0xd7ff),
       "z",
     ];
+    const ascii = (v: string) => /^[\u0000-\u007f]*$/.test(v);
     let seed = 42;
     const rand = () => {
       seed = (seed * 1103515245 + 12345) % 2 ** 31;
@@ -274,7 +378,20 @@ describe("agent prefix bounds and recheck", () => {
       expect(prefixes.length).toBeGreaterThan(40);
       let nonEmpty = 0;
       for (const prefix of prefixes) {
-        const range = agentPrefixRange(prefix);
+        // ASCII prefixes go through the direct helper; non-ASCII ones are refused
+        // there and checked with raw lowercase bounds (the generated names are
+        // already lowercase, so both normalizations agree on them).
+        if (!ascii(prefix))
+          expect(() => agentPrefixRange(prefix)).toThrow(
+            NonAsciiAgentPrefixError,
+          );
+        const range = ascii(prefix)
+          ? agentPrefixRange(prefix)
+          : {
+              lower: prefix,
+              upper: textPatternUpperBound(prefix),
+              pattern: agentPrefixPattern(prefix),
+            };
         const bounded = (
           await asAuthenticated(
             prop,

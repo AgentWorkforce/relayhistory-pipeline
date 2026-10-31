@@ -5,6 +5,8 @@ import {
   SESSION_DIRECTORY_SEARCH_BOUNDARY,
   agentPrefixPattern,
   agentPrefixRange,
+  NonAsciiAgentPrefixError,
+  textPatternUpperBound,
   auditSearchIndexes,
   isUsefulAgentPrefix,
   normalizeAgentName,
@@ -127,13 +129,25 @@ describe("agent-name lookup contract", () => {
       upper: "helm_100&",
       pattern: "helm\\_100\\%%",
     });
-    expect(agentPrefixRange(`ab${String.fromCodePoint(0x10ffff)}`)).toEqual({
-      lower: `ab${String.fromCodePoint(0x10ffff)}`,
-      upper: "ac",
-      pattern: `ab${String.fromCodePoint(0x10ffff)}%`,
-    });
+    // The carry itself, on the shared byte-order helper.
+    expect(textPatternUpperBound(`ab${String.fromCodePoint(0x10ffff)}`)).toBe(
+      "ac",
+    );
+    expect(textPatternUpperBound(`ab${String.fromCodePoint(0xd7ff)}`)).toBe(
+      `ab${String.fromCodePoint(0xe000)}`,
+    );
     expect(() =>
-      agentPrefixRange(String.fromCodePoint(0x10ffff).repeat(3)),
+      textPatternUpperBound(String.fromCodePoint(0x10ffff).repeat(3)),
     ).toThrow(RangeError);
+    // The direct bounded path accepts ASCII only and points elsewhere for the rest.
+    for (const value of [
+      `ab${String.fromCodePoint(0x10ffff)}`,
+      "ÄGENT",
+      "café",
+      "日本語",
+    ]) {
+      expect(() => agentPrefixRange(value)).toThrow(NonAsciiAgentPrefixError);
+    }
+    expect(() => agentPrefixRange("ÄGENT")).toThrow(/search_session_directory/);
   });
 });

@@ -71,35 +71,64 @@ export function agentPrefixPattern(value: string): string {
 }
 
 /**
+ * The text_pattern_ops (byte-order) upper bound of every string that starts with
+ * `prefix`: the last code point incremented, skipping the surrogate gap (U+D7FF goes
+ * to U+E000), with trailing U+10FFFF dropped and carried into the previous code
+ * point. A prefix of only U+10FFFF has no finite bound and is refused.
+ */
+export function textPatternUpperBound(prefix: string): string {
+  const points = Array.from(prefix);
+  for (let index = points.length - 1; index >= 0; index -= 1) {
+    const point = points[index]!.codePointAt(0)!;
+    if (point >= 0x10ffff) continue;
+    const next = point + 1 === 0xd800 ? 0xe000 : point + 1;
+    return `${points.slice(0, index).join("")}${String.fromCodePoint(next)}`;
+  }
+  throw new RangeError(
+    "agent prefix has no finite text_pattern_ops upper bound",
+  );
+}
+
+/** A direct prefix the bounded query cannot serve exactly; use the RPC instead. */
+export class NonAsciiAgentPrefixError extends RangeError {
+  constructor() {
+    super(
+      "agent prefix contains non-ASCII characters: the direct bounded query cannot " +
+        "normalize them the way PostgreSQL lower() does, so it could miss rows. Use " +
+        "sessions.search_session_directory with p_agent_match => 'prefix'.",
+    );
+    this.name = "NonAsciiAgentPrefixError";
+  }
+}
+
+/**
  * Leakproof byte-order bounds for an authenticated RLS prefix query. PostgreSQL
  * cannot push the non-leakproof LIKE operator below an RLS security barrier, so
  * the text_pattern_ops range must be explicit and LIKE remains the exact recheck.
+ *
+ * The stored agent_name_normalized is PostgreSQL's lower(btrim(agent_name)), whose
+ * non-ASCII case folding depends on the server collation, while these bounds are
+ * computed here. Only ASCII input is accepted, where both agree exactly; anything
+ * else is refused (NonAsciiAgentPrefixError) rather than silently missing rows.
  */
 export function agentPrefixRange(value: string): {
   lower: string;
   upper: string;
   pattern: string;
 } {
+  // eslint-disable-next-line no-control-regex
+  if (/[^\u0000-\u007f]/.test(value)) throw new NonAsciiAgentPrefixError();
   const lower = normalizeAgentName(value);
   if (Array.from(lower).length < MIN_AGENT_PREFIX_CHARS) {
     throw new RangeError(
       `agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`,
     );
   }
-  const points = Array.from(lower);
-  for (let index = points.length - 1; index >= 0; index -= 1) {
-    const point = points[index]!.codePointAt(0)!;
-    if (point >= 0x10ffff) continue;
-    const next = point + 1 === 0xd800 ? 0xe000 : point + 1;
-    return {
-      lower,
-      upper: `${points.slice(0, index).join("")}${String.fromCodePoint(next)}`,
-      pattern: agentPrefixPattern(value),
-    };
-  }
-  throw new RangeError(
-    "agent prefix has no finite text_pattern_ops upper bound",
-  );
+  return {
+    lower,
+    upper: textPatternUpperBound(lower),
+    pattern: agentPrefixPattern(value),
+  };
 }
 
 /**
