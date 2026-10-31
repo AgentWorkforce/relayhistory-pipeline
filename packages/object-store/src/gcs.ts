@@ -149,6 +149,17 @@ class GcsTransport implements Transport {
     throw errorForStatus(BACKEND, key, res.status, text);
   }
 
+  async delete(key: ObjectKey): Promise<void> {
+    const res = await this.#request(
+      key,
+      "DELETE",
+      this.#objectUrl(key),
+      new Headers(),
+    );
+    if (!res.ok && res.status !== 404)
+      throw errorForStatus(BACKEND, key, res.status, "");
+  }
+
   async head(key: ObjectKey): Promise<ObjectMeta | undefined> {
     const res = await this.#request(
       key,

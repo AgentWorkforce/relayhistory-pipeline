@@ -27,6 +27,7 @@ export const QUEUED_STAGES = [
   "status-classify",
   "file-normalize",
   "file-maintenance",
+  "backfill-activation",
 ] as const satisfies readonly PipelineStage[];
 export type QueuedStage = (typeof QUEUED_STAGES)[number];
 
@@ -99,6 +100,14 @@ export const STAGE_REGISTRY: { readonly [S in QueuedStage]: StageDefinition } =
       summary: "Compact and expire derived files",
       implemented: false,
       binding: "PIPELINE_FILE_MAINTENANCE",
+      next: [],
+      maxAttempts: 4,
+    },
+    "backfill-activation": {
+      stage: "backfill-activation",
+      summary: "Re-check the activation gate for a refused backfill",
+      implemented: true,
+      binding: "PIPELINE_BACKFILL_ACTIVATION",
       next: [],
       maxAttempts: 4,
     },
