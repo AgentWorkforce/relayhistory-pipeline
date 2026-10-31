@@ -554,7 +554,7 @@ describe("gate and old couriers on a cold export (G1, D1)", () => {
     expect(asExporter.status).toBe(403);
   });
 
-  test("D1: an old courier never stalls on a cold export, and an upgrade delivers everything", async () => {
+  test("D1: a claim-bound client on an unknown release never stalls on a cold export, and an upgrade delivers everything", async () => {
     const w = await world({ format: "ndjson" });
     const cold = await w.coldExport(w.exportText("pre-t0"));
     w.hooks.legacyWriter = true;
@@ -580,5 +580,29 @@ describe("gate and old couriers on a cold export (G1, D1)", () => {
     expect(after.manifest.raw.owner).toBe(w.machineId);
     expect(after.lines).toHaveLength(4);
     expect(liveCount(after.manifest)).toBe(4);
+  });
+
+  test("a truly claimless courier is refused before parking, and writes nothing", async () => {
+    for (const open of [false, true]) {
+      const w = await world({ format: "ndjson" });
+      const cold = await w.coldExport(w.exportText("pre-t0"));
+      w.hooks.legacyWriter = true;
+      w.identity.machineClaim = undefined;
+      if (open) w.openClaimlessWindow();
+      await w.write(line(0));
+      await w.run();
+      await w.run();
+      expect((await w.stored())!.manifest).toEqual(cold);
+      await expect(held(w)).rejects.toMatchObject({ code: "not_found" });
+
+      const refused = await w.post({
+        key: w.key,
+        manifest: { ...cold, revision: 2 },
+      });
+      expect(refused.status).toBe(403);
+      expect(
+        ((await refused.json()) as { error: { code: string } }).error.code,
+      ).toBe("machine_claim_refused");
+    }
   });
 });
