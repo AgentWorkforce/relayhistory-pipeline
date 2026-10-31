@@ -181,6 +181,7 @@ export function configFromEnv(): CourierConfig {
       historyOrigin: required("RELAYAUTH_HISTORY_ORIGIN"),
       orgId,
       workspaceId,
+      machineId: required("MACHINE_ID"),
       sponsorId: userId,
       apiKey: secretCommand(required("RELAYAUTH_API_KEY_COMMAND_JSON")),
       expiresInSeconds: integer("RELAYAUTH_ASSERTION_TTL_SECONDS", 60),
