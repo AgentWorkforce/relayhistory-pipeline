@@ -12,7 +12,12 @@ import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/p
 import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { schemaVerdict, type Transact } from "../../shared/db.ts";
-import { inventoryOf } from "../migrate-guards.ts";
+import {
+  inventoryOf,
+  sessionsFunctionAcl,
+  SESSIONS_FUNCTION_EVENT_TRIGGER,
+} from "../migrate-guards.ts";
+import { gateOpen } from "../../shared/worker.ts";
 import {
   MIGRATION_SENTINELS,
   NON_CREATE_STEPS,
@@ -557,6 +562,16 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       "EXECUTE on g6_definer()",
     ],
     [
+      "USAGE on another schema through PUBLIC",
+      "CREATE SCHEMA g6_extra; GRANT USAGE ON SCHEMA g6_extra TO PUBLIC",
+      "USAGE on schema g6_extra (only sessions and public are accepted)",
+    ],
+    [
+      "MAINTAIN on a relation (PostgreSQL 17+)",
+      "GRANT MAINTAIN ON sessions.session_index TO g6_bad",
+      "MAINTAIN on sessions.session_index",
+    ],
+    [
       "default privileges in sessions granting PUBLIC",
       "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO PUBLIC",
       "default privileges in schema sessions grant PUBLIC",
@@ -955,4 +970,157 @@ test("the runbook's sentinel table documents every schema step", async () => {
   );
   for (const name of Object.keys(MIGRATION_SENTINELS))
     expect(runbook, name).toContain(`| \`${name}\``);
+});
+
+describe("function boundary: ACL manifest, residual, activation gate", () => {
+  const MANIFEST = JSON.parse(
+    readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8"),
+  ).functions;
+
+  test("ACL manifest regression: every sessions function's ACL after a clean migrate is exactly the committed manifest", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    expect(await sessionsFunctionAcl(client(db))).toEqual(MANIFEST);
+    for (const entries of Object.values(MANIFEST) as string[][])
+      expect(
+        entries.some((e) => e.startsWith("PUBLIC") || e === "<default>"),
+      ).toBe(false);
+  });
+
+  test("residual: a sessions function created after PASS, outside the migrator, IS directly invocable (not prevented); the live gate gives 55000 and claims stop", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const expected = await expectedSchema();
+    const health = {
+      schemaReady: async () => (await schemaVerdict(expected, transact(db))).ok,
+    };
+    expect(await gateOpen(health)).toBe(true);
+    await db.exec(`CREATE FUNCTION sessions.g6_late() RETURNS int LANGUAGE sql AS 'SELECT 42';
+      CREATE ROLE g6_unrel NOLOGIN; GRANT authenticated TO g6_unrel;`);
+    await db.exec("SET ROLE g6_unrel");
+    const direct = (
+      await db.query<{ v: number }>("SELECT sessions.g6_late() AS v")
+    ).rows[0]?.v;
+    await db.exec("RESET ROLE");
+    expect(direct).toBe(42); // the residual: PostgreSQL's built-in PUBLIC EXECUTE
+    const v = await schemaVerdict(expected, transact(db));
+    expect(v).toEqual({
+      ok: false,
+      reason: "role_validation_failed",
+      error_code: "55000",
+    });
+    expect(await gateOpen(health)).toBe(false); // the worker claims nothing
+    await runMigrations(client(db), { profile: LOCAL }); // the next migrate revokes it
+    expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: true });
+  });
+
+  /** A Supabase-shaped database: platform roles and the Worker pre-provisioned, a dedicated runtime role, no PUBLIC TEMP. */
+  async function supabaseLike(): Promise<PGlite> {
+    const db = await fresh();
+    await db.exec(
+      readFileSync(join(root, "supabase/tests/supabase_shim.sql"), "utf8"),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
+    return db;
+  }
+  const SUPA: MigrationProfile = {
+    mode: "supabase",
+    shim: false,
+    bootstrap: false,
+    verify: true,
+    runtimeRole: "g6_rt",
+    runtimeLogin: false,
+  };
+
+  test("supabase activation gate: refused before any write without an approved durable function boundary; evidence is names and booleans", async () => {
+    const db = await supabaseLike();
+    const none = await failure(runMigrations(client(db), { profile: SUPA }));
+    expect(none?.code).toBe("function_boundary_unproven");
+    const evidence = JSON.parse(none!.message!.match(/(\{.*\})/)![1]!);
+    expect(evidence).toEqual({
+      migration_owner: "postgres",
+      sessions_unexposed_and_no_untrusted_usage: false,
+      global_function_default_revokes_public: false,
+      event_trigger_present: false,
+      approval: "none",
+      satisfied: false,
+    });
+    for (const v of Object.values(evidence))
+      expect(["string", "boolean"]).toContain(typeof v);
+    // Approved but absent: still refused.
+    expect(
+      (
+        await failure(
+          runMigrations(client(db), {
+            profile: { ...SUPA, functionBoundary: "global-default-revoke" },
+          }),
+        )
+      )?.code,
+    ).toBe("function_boundary_unproven");
+    expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
+  });
+
+  test("supabase activation gate (A): an owner-scoped global default revoke, approved, passes; new owner functions are no longer PUBLIC-executable", async () => {
+    const db = await supabaseLike();
+    await db.exec(
+      "ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+    );
+    expect(
+      await failure(
+        runMigrations(client(db), {
+          profile: { ...SUPA, functionBoundary: "global-default-revoke" },
+        }),
+      ),
+    ).toBeNull();
+    await db.exec(
+      "CREATE FUNCTION sessions.g6_after() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+    );
+    expect(
+      (
+        await db.query<{ e: boolean }>(
+          "SELECT has_function_privilege('g6_rt', 'sessions.g6_after()', 'EXECUTE') AS e",
+        )
+      ).rows[0]?.e,
+    ).toBe(false);
+    // Blast radius: the owner's global default reaches every schema (why approval is required).
+    await db.exec(
+      "CREATE FUNCTION public.g6_elsewhere() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+    );
+    expect(
+      (
+        await db.query<{ e: boolean }>(
+          "SELECT has_function_privilege('g6_rt', 'public.g6_elsewhere()', 'EXECUTE') AS e",
+        )
+      ).rows[0]?.e,
+    ).toBe(false);
+  });
+
+  test("supabase activation gate (E): the reviewed event trigger, approved, passes", async () => {
+    const db = await supabaseLike();
+    await db
+      .exec(
+        `CREATE FUNCTION public.g6_revoke_sessions_public() RETURNS event_trigger LANGUAGE plpgsql AS $f$
+      BEGIN EXECUTE 'REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC'; END $f$;
+      CREATE EVENT TRIGGER ${SESSIONS_FUNCTION_EVENT_TRIGGER} ON ddl_command_end WHEN TAG IN ('CREATE FUNCTION')
+        EXECUTE FUNCTION public.g6_revoke_sessions_public();`,
+      )
+      .catch((e) => {
+        throw new Error(
+          `event triggers unsupported here: ${(e as Error).message}`,
+        );
+      });
+    expect(
+      await failure(
+        runMigrations(client(db), {
+          profile: { ...SUPA, functionBoundary: "event-trigger" },
+        }),
+      ),
+    ).toBeNull();
+  });
 });

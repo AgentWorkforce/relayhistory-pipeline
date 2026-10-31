@@ -248,6 +248,41 @@ export async function runtimeRoleViolations(
     )
   ).rows)
     out.push(`CREATE on schema ${sc.nspname}`);
+  // Schema USAGE: an exact allowlist. sessions is approved; public is PostgreSQL's own
+  // PUBLIC default (non-mutating: it only lets the role resolve names there, and every
+  // object in public is checked above and below). Any other non-system schema is refused.
+  // Type USAGE through PUBLIC (PostgreSQL's default for every type) is accepted as
+  // non-mutating; a type grant naming the role is a pg_shdepend reference, refused above.
+  for (const sc of (
+    await client.query<{ nspname: string }>(
+      `SELECT n.nspname FROM pg_namespace n WHERE ${NONSYSTEM} AND n.nspname NOT IN ('sessions', 'public')
+          AND has_schema_privilege($1::oid, n.oid, 'USAGE') ORDER BY 1`,
+      [role.oid],
+    )
+  ).rows)
+    out.push(
+      `USAGE on schema ${sc.nspname} (only sessions and public are accepted)`,
+    );
+  // PostgreSQL 17+ MAINTAIN (VACUUM, ANALYZE, REINDEX, REFRESH, CLUSTER, LOCK): refused on
+  // any relation. The privilege does not exist before 17, so the check is version-guarded.
+  if (
+    Number(
+      (
+        await client.query<{ v: string }>(
+          "SELECT current_setting('server_version_num') AS v",
+        )
+      ).rows[0]?.v,
+    ) >= 170000
+  )
+    for (const m of (
+      await client.query<{ rel: string }>(
+        `SELECT c.oid::regclass::text AS rel FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE ${NONSYSTEM} AND c.relkind IN ('r', 'p', 'm')
+            AND CASE WHEN c.relkind IN ('r', 'p', 'm') THEN has_table_privilege($1::oid, c.oid, 'MAINTAIN') ELSE false END ORDER BY 1`,
+        [role.oid],
+      )
+    ).rows)
+      out.push(`MAINTAIN on ${m.rel}`);
   for (const t of (
     await client.query<{ rel: string; privs: string }>(
       `SELECT c.oid::regclass::text AS rel,
@@ -289,6 +324,11 @@ export async function runtimeRoleViolations(
     )
   ).rows)
     out.push(`EXECUTE on ${fnr.fn}`);
+  // Detection only: a per-schema default-privileges GRANT in sessions naming PUBLIC or the
+  // role is refused. This is NOT a schema-scoped fix for PostgreSQL's built-in PUBLIC
+  // EXECUTE on new functions: per-schema ALTER DEFAULT PRIVILEGES cannot revoke a global
+  // or built-in default. That residual is handled by the per-run revoke, the live gate
+  // and the activation gate (runbook "Function boundary").
   for (const d of (
     await client.query<{ objtype: string }>(
       `SELECT d.defaclobjtype::text AS objtype FROM pg_default_acl d, aclexplode(d.defaclacl) a
@@ -554,4 +594,102 @@ export async function sequencePreflight(
       "unledgered_schema",
       `objects of unrecorded migrations already exist: ${found.slice(0, 5).join("; ")}${found.length > 5 ? `; and ${found.length - 5} more` : ""}. Nothing is imported or marked, see the runbook decision point`,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Durable function boundary (activation gate)
+// ---------------------------------------------------------------------------
+
+/** The reviewed event trigger an equivalent control must use, if chosen. */
+export const SESSIONS_FUNCTION_EVENT_TRIGGER =
+  "sessions_function_public_revoke";
+export type FunctionBoundaryApproval =
+  "global-default-revoke" | "event-trigger";
+
+/** Names and booleans only. */
+export interface FunctionBoundaryEvidence {
+  migration_owner: string;
+  /**
+   * (B) is false by design in this repository: the search Worker's RPCs are called
+   * through PostgREST with Content-Profile sessions (src/proof/aws/checks.ts, #73), so
+   * sessions is an exposed schema, and authenticated and service_role hold USAGE on it.
+   */
+  sessions_unexposed_and_no_untrusted_usage: false;
+  global_function_default_revokes_public: boolean;
+  event_trigger_present: boolean;
+  approval: FunctionBoundaryApproval | "none";
+  satisfied: boolean;
+}
+
+/**
+ * PostgreSQL gives every new function PUBLIC EXECUTE by built-in default, and a
+ * per-schema ALTER DEFAULT PRIVILEGES cannot revoke that. So a function created in
+ * sessions after a migrate, outside the migrator, is directly invocable by any role with
+ * USAGE on sessions (authenticated, service_role, and through PostgREST RPC) until the
+ * next migrate's revoke; the live gate only turns readiness off. Activation therefore
+ * needs one durable control, present AND approved (blast radius reviewed):
+ *   (A) "global-default-revoke": ALTER DEFAULT PRIVILEGES FOR ROLE <migration owner>
+ *       REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC. On Supabase the owner is postgres, so
+ *       this changes every future postgres-created function in every schema.
+ *   (E) "event-trigger": an enabled ddl_command_end event trigger named
+ *       SESSIONS_FUNCTION_EVENT_TRIGGER that revokes PUBLIC EXECUTE on sessions functions.
+ * (B) cannot be claimed here (see the evidence field). Follow-up: a dedicated sessions
+ * object owner, which needs an ownership transfer of live objects (activation dossier #98).
+ */
+export async function functionBoundaryEvidence(
+  client: GuardClient,
+  approval: FunctionBoundaryApproval | undefined,
+): Promise<FunctionBoundaryEvidence> {
+  const r = (
+    await client.query<{
+      owner: string;
+      global_revoke: boolean;
+      event_trigger: boolean;
+    }>(
+      `SELECT current_user AS owner,
+              EXISTS (SELECT 1 FROM pg_default_acl d
+                       WHERE d.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+                         AND d.defaclnamespace = 0 AND d.defaclobjtype = 'f'
+                         AND NOT EXISTS (SELECT 1 FROM aclexplode(d.defaclacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')) AS global_revoke,
+              EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = $1 AND evtenabled <> 'D' AND evtevent = 'ddl_command_end') AS event_trigger`,
+      [SESSIONS_FUNCTION_EVENT_TRIGGER],
+    )
+  ).rows[0]!;
+  const satisfied =
+    (approval === "global-default-revoke" && r.global_revoke) ||
+    (approval === "event-trigger" && r.event_trigger);
+  return {
+    migration_owner: r.owner,
+    sessions_unexposed_and_no_untrusted_usage: false,
+    global_function_default_revokes_public: r.global_revoke,
+    event_trigger_present: r.event_trigger,
+    approval: approval ?? "none",
+    satisfied,
+  };
+}
+
+/**
+ * Every sessions function's ACL after a migrate, normalized for comparison with the
+ * committed manifest (src/hoopdb/sessions-function-acl.json): grantee names (PUBLIC for
+ * the pseudo-role; <owner> for the function owner), privilege, "*" for GRANT OPTION.
+ * A NULL ACL (built-in default: owner plus PUBLIC EXECUTE) is reported as ["<default>"].
+ */
+export async function sessionsFunctionAcl(
+  client: GuardClient,
+): Promise<Record<string, string[]>> {
+  const rows = (
+    await client.query<{ fn: string; entries: string[] | null }>(
+      `SELECT p.oid::regprocedure::text AS fn,
+              CASE WHEN p.proacl IS NULL THEN NULL ELSE (
+                SELECT array_agg(
+                         CASE WHEN a.grantee = 0 THEN 'PUBLIC' WHEN a.grantee = p.proowner THEN '<owner>' ELSE (SELECT rolname FROM pg_roles WHERE oid = a.grantee) END
+                         || ':' || a.privilege_type || CASE WHEN a.is_grantable THEN '*' ELSE '' END ORDER BY 1)
+                  FROM aclexplode(p.proacl) a) END AS entries
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'sessions' ORDER BY 1`,
+    )
+  ).rows;
+  return Object.fromEntries(
+    rows.map((r) => [r.fn, r.entries ?? ["<default>"]]),
+  );
 }

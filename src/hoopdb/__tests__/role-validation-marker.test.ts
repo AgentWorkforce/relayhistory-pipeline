@@ -11,6 +11,7 @@ import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pg
 import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
 import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import type { AddressInfo } from "node:net";
+import { SESSIONS_FUNCTION_GATE_SQL } from "../../shared/db.ts";
 import {
   ROLE_VALIDATION_TABLE,
   ROLE_VERIFY_SQL_PATH,
@@ -399,8 +400,9 @@ describe("the live gate: the marker is never the sole authority", () => {
     );
     expect(seen[3]).toStartWith("SELECT generation, status FROM");
     expect(seen[4]).toBe(VERIFY);
-    expect(seen[5]).toStartWith("SELECT generation, status FROM"); // the final read
-    expect(seen).toHaveLength(6);
+    expect(seen[5]).toBe(SESSIONS_FUNCTION_GATE_SQL); // the live sessions-function boundary
+    expect(seen[6]).toStartWith("SELECT generation, status FROM"); // the final read
+    expect(seen).toHaveLength(7);
     // No advisory lock anywhere on the probe path.
     expect(seen.some((q) => /advisory/i.test(q))).toBe(false);
     // One source: the migrator's verify step and mark_pass.sql use the same file.

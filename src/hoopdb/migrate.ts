@@ -11,7 +11,12 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runtimeRoleViolations, sequencePreflight } from "./migrate-guards.ts";
+import {
+  functionBoundaryEvidence,
+  runtimeRoleViolations,
+  sequencePreflight,
+  type FunctionBoundaryApproval,
+} from "./migrate-guards.ts";
 import { openHoopDb, waitForHoopDb, ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE, ROLE_VERIFY_SQL_PATH, type ExpectedSchema } from "../shared/db.ts";
 import { log } from "../shared/log.ts";
 import { optional } from "../shared/env.ts";
@@ -65,6 +70,8 @@ export interface MigrationProfile {
   runtimeLogin?: boolean;
   /** HOOPDB_RUNTIME_WORKLOAD_ROLE: the one role allowed to be a member of the runtime role. */
   workloadRole?: string;
+  /** HOOPDB_FUNCTION_BOUNDARY_APPROVED: the reviewed durable function boundary (supabase activation gate). */
+  functionBoundary?: FunctionBoundaryApproval;
 }
 
 function profileError(code: string, message: string): Error {
@@ -101,7 +108,15 @@ export function migrationProfile(env: Record<string, string | undefined> = proce
   const workloadRole = env.HOOPDB_RUNTIME_WORKLOAD_ROLE || undefined;
   if (workloadRole !== undefined && !ident.test(workloadRole))
     throw profileError("db_profile_invalid", "HOOPDB_RUNTIME_WORKLOAD_ROLE must be a role name");
-  const runtime = { runtimeRole, ...(runtimeLogin === undefined ? {} : { runtimeLogin }), ...(workloadRole ? { workloadRole } : {}) };
+  const fb = env.HOOPDB_FUNCTION_BOUNDARY_APPROVED || undefined;
+  if (fb !== undefined && fb !== "global-default-revoke" && fb !== "event-trigger")
+    throw profileError("db_profile_invalid", "HOOPDB_FUNCTION_BOUNDARY_APPROVED must be global-default-revoke or event-trigger");
+  const runtime = {
+    runtimeRole,
+    ...(runtimeLogin === undefined ? {} : { runtimeLogin }),
+    ...(workloadRole ? { workloadRole } : {}),
+    ...(fb ? { functionBoundary: fb as FunctionBoundaryApproval } : {}),
+  };
   if (mode === "supabase") {
     if (shim) throw profileError("shim_forbidden", "the plain-Postgres role shim never runs in supabase mode");
     if (bootstrap) throw profileError("bootstrap_forbidden", "the privileged role bootstrap never runs from the migrator in supabase mode");
@@ -205,6 +220,12 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
       );
     }
     const runtime = await runtimeRolePreflight(client, profile);
+    // Supabase activation gate: a durable function boundary must be present and approved.
+    if (profile.mode === "supabase") {
+      const evidence = await functionBoundaryEvidence(client, profile.functionBoundary);
+      if (!evidence.satisfied)
+        throw profileError("function_boundary_unproven", `no approved durable function boundary: ${JSON.stringify(evidence)}; see the runbook "Function boundary"`);
+    }
     await cliHistoryPreflight(client, schema);
     await sequencePreflight(client, schema, ledger);
     await client.query("CREATE SCHEMA IF NOT EXISTS sessions");
@@ -398,6 +419,11 @@ async function cliHistoryPreflight(client: MigrationClient, schema: Step[]): Pro
   }
 }
 
+function migrationProfileApproval(): FunctionBoundaryApproval | undefined {
+  const v = process.env.HOOPDB_FUNCTION_BOUNDARY_APPROVED;
+  return v === "global-default-revoke" || v === "event-trigger" ? v : undefined;
+}
+
 export async function migrate(): Promise<{ applied: number; skipped: number }> {
   // Before any connection: an invalid profile fails here, having written nothing.
   const profile = migrationProfile();
@@ -414,7 +440,23 @@ export async function migrate(): Promise<{ applied: number; skipped: number }> {
 
 if (import.meta.main) {
   process.env.OTEL_SERVICE_NAME ||= "hoopdb-migrate";
-  if (process.argv.includes("--generation")) {
+  if (process.argv.includes("--activation-check")) {
+    // For an operator or the activation dossier: the function-boundary evidence (names and
+    // booleans only) for HOOPDB_URL and HOOPDB_FUNCTION_BOUNDARY_APPROVED. Exit 1 if unproven.
+    const db = openHoopDb();
+    const approval = migrationProfileApproval();
+    functionBoundaryEvidence(db, approval)
+      .then(async (e) => {
+        console.log(JSON.stringify(e));
+        await db.end();
+        process.exit(e.satisfied ? 0 : 1);
+      })
+      .catch(async (err) => {
+        console.error((err as { code?: string }).code ?? "activation_check_failed");
+        await db.end();
+        process.exit(1);
+      });
+  } else if (process.argv.includes("--generation")) {
     // For an external verifier: the generation its PASS record must name.
     generation().then((g) => {
       console.log(g);

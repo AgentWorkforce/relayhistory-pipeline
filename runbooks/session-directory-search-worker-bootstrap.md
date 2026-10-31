@@ -20,7 +20,7 @@ deploy runs two separate checks:
 Nothing here runs automatically against a real database. Every apply needs Khaliq's
 explicit OK.
 
-## Interface (stable; the deploy-time provisioning is wired against this outside this repository)
+## Interface (stable; deploy-time provisioning is not wired yet: helm-charts #24 owns the Job)
 
 **Deploy order:** phase 1 (superuser), then `hoopdb-migrate` (which runs phase 2 and records PASS; see the readiness marker below). Each step uses
 `psql -v ON_ERROR_STOP=1 -X -f <file>` against the HoopDb or Supabase database, and the
@@ -51,7 +51,7 @@ Phase 2, `session_directory_search_worker_verify.sql`:
 | Required direct grants             | exactly: `USAGE` on schema `sessions`, and `EXECUTE` on each approved RPC, none `WITH GRANT OPTION`.                                                                                                                                                                                                                                                                                                                        |
 | Approved RPCs (this migration set) | `sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)` (from `20261030020000`); `sessions.session_directory_pointers(text, text, text)` and `sessions.session_directory_readiness()` (from `20261031001000`). A migration that adds, removes or re-signs one updates the list in the same change. |
 | Missing or redefined               | an approved RPC that is missing, or a function of the same name with another signature, fails. The allowlist never shrinks to match the database.                                                                                                                                                                                                                                                                           |
-| Everything else                    | nothing else may reference the role in any database of the cluster (`pg_shdepend`): no owned objects; no table, column, sequence, function, schema, database, type, language, large object, parameter, foreign server or tablespace privileges; no default privileges; no RLS policies.                                                                                                                                     |
+| Everything else                    | no direct reference to the role (`pg_shdepend`) in any database of the cluster; effective privileges are checked in the current database only: no owned objects; no table, column, sequence, function, schema, database, type, language, large object, parameter, foreign server or tablespace privileges; no default privileges; no RLS policies.                                                                          |
 | One database per cluster           | roles are cluster-wide, and phase 2 can't see other databases' catalogs. So any reference to the role from another database of the same cluster (for example a second migrated copy) fails closed. Keep the migration set in one database per cluster, as the CNPG HoopDb cluster and a Supabase project do.                                                                                                                |
 | PUBLIC                             | only aclitems that name this role count. Privileges it gets through PUBLIC are not its own grants and are ignored.                                                                                                                                                                                                                                                                                                          |
 | Success                            | exit 0. It changes nothing.                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -81,7 +81,9 @@ and pinned to `READ COMMITTED`, in this order:
 1. the ledger (`schema_pending` if incomplete);
 2. the marker (`validation_pending` unless `'pass'` for this generation; phase 2 is
    then skipped, so nothing becomes ready without it);
-3. phase 2 (`role_validation_failed` with its SQLSTATE on any error);
+3. phase 2 (`role_validation_failed` with its SQLSTATE on any error); then the live
+   `sessions` function boundary: no function EXECUTE-able through PUBLIC or by the runtime
+   role (`55000`; see "Function boundary");
 4. the marker again, as the **final read** (`validation_pending` unless still `'pass'`
    for this generation).
 
@@ -218,18 +220,26 @@ violation is named:
   without its caller holding EXECUTE (a real PostgreSQL test shows it), so there is no
   exemption. In the same transaction as phase 2 and the PASS write, the migrator runs
   `REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC` on every run. That is
-  idempotent and also covers functions a later migration adds with the default PUBLIC
-  EXECUTE. If validation fails, the revoke rolls back with it; a test proves the state is
-  unchanged. Default privileges in `sessions` that grant PUBLIC or the runtime role are
-  refused. The global default (PUBLIC EXECUTE on new functions) is left alone, because on
-  Supabase it would change every future function the owner creates in any schema; the
-  per-run revoke and the post-migration check cover `sessions` instead.
+  idempotent; if validation fails, the revoke rolls back with it (a test proves the state is
+  unchanged). It fixes existing functions only, not future ones; see "Function boundary"
+  below for the residual and how activation fails closed on it. A per-schema
+  default-privileges GRANT in `sessions` naming PUBLIC or the runtime role is detected and
+  refused. That is detection only, not a fix: per-schema ALTER DEFAULT PRIVILEGES cannot
+  revoke PostgreSQL's global or built-in PUBLIC EXECUTE.
+- **Schema and type USAGE:** effective USAGE is accepted only on `sessions` (approved) and
+  `public`. `public` gets it from PostgreSQL's own PUBLIC default; it is non-mutating,
+  because it only lets the role resolve names, and every object in `public` is checked
+  above. USAGE on any other non-system schema is refused, PUBLIC-derived included. Type
+  USAGE through PUBLIC (PostgreSQL's default for every type, needed to read typed columns)
+  is accepted as non-mutating; a type grant naming the role is a direct reference, refused.
+- **MAINTAIN (PostgreSQL 17+)** on any relation, directly or through PUBLIC, is refused.
+  The check is version-guarded, because MAINTAIN does not exist on 15.
 - **Coverage, stated exactly:**
   - In the current database: effective privileges in every non-system schema. That covers
     tables, views and sequences (any privilege), EXECUTE on SECURITY DEFINER functions
     anywhere, EXECUTE on every `sessions` function, CREATE on any schema, and CREATE,
     TEMPORARY and CONNECT on the database. PUBLIC-derived grants are included.
-  - In every database: direct references naming the role (`pg_shdepend`): ownership, ACL
+  - In every database, direct references only: those naming the role (`pg_shdepend`): ownership, ACL
     entries, default ACLs, policies.
   - **Not covered:** PUBLIC-derived privileges in other databases (for example CONNECT to
     another database through PUBLIC: keep one HoopDb database per cluster, or revoke
@@ -320,6 +330,71 @@ these is an explicit operator decision, recorded in the activation dossier (#98)
 `scripts/pg-proof/role-proof.ts` on the exact head against real PostgreSQL 15 and 17
 service containers. It uploads `pg-proof-pg15` and `pg-proof-pg17` artifacts, each a JSON
 file (head, server version, each case's pass/fail) plus its log.
+
+## Function boundary (threat, residual, activation gate)
+
+**Threat.** PostgreSQL gives every new function PUBLIC EXECUTE by built-in default, and a
+per-schema `ALTER DEFAULT PRIVILEGES` cannot revoke that. So a function created in
+`sessions` after a migrate, outside the migrator (a hand-run DDL, a future tool), is
+**directly invocable** until the next migrate's revoke. Anyone with USAGE on `sessions`
+can call it, by database credential or through PostgREST RPC. This repository does
+**not** prevent that; a real PostgreSQL test shows an unrelated role calling such a
+function.
+
+**What does fail closed.**
+
+- **The live gate** (`SESSIONS_FUNCTION_GATE_SQL` in `src/shared/db.ts`, part of every
+  readiness check and every worker claim) refuses with `55000` when any `sessions`
+  function is EXECUTE-able through PUBLIC, or by the runtime role unless it owns the
+  function (owner-run local). Readiness goes 503 at the next probe and the worker stops
+  claiming (tested on PG15 and PG17).
+- **The ACL manifest** (`src/hoopdb/sessions-function-acl.json`) is the exact expected
+  ACL of every `sessions` function after a clean migrate. CI compares it on PGlite and on
+  real PostgreSQL 15 and 17.
+
+**Who reaches `sessions`, by which path** (from the repository, not from a live query):
+
+| Path                                                                            | Roles                                                                                                                                                                                                                                                                                                          | Evidence                                                                              |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| PostgREST RPC, `Content-Profile: sessions` (so `sessions` is an exposed schema) | the search Worker, via `authenticator` role switching                                                                                                                                                                                                                                                          | `src/proof/aws/checks.ts` (`/rpc/search_session_directory`), #73 real-PostgREST tests |
+| `authenticator` memberships                                                     | `session_directory_search_worker` (NOINHERIT, no ADMIN: the Worker contract); on Supabase also the platform's `anon`, `authenticated`, `service_role`                                                                                                                                                          | migration 20261030020000 role guard; Supabase platform defaults                       |
+| USAGE on `sessions`                                                             | `authenticated`, `service_role` (20261025000000), `session_directory_search_worker` (20261030020000); `anon` has none                                                                                                                                                                                          | the migrations; PGlite mapping                                                        |
+| EXECUTE (effective, after a clean migrate)                                      | Worker: only `search_session_directory`, `session_directory_pointers`, `session_directory_readiness`. `authenticated`: `jwt_org_id`, `jwt_workspace_ids`, `member_of`, `repo_group`, `repo_live`, `repo_visibility_ids`. `service_role`: every function except the Worker's three. `anon`: none. PUBLIC: none. | `src/hoopdb/sessions-function-acl.json` (exact, CI-checked)                           |
+
+So the "(B) `sessions` is unexposed and no untrusted role has USAGE" alternative **cannot
+hold**: exposure is by design, and `authenticated` holds USAGE. Exposure is not the
+problem. The problem is PUBLIC EXECUTE on future functions. Each intended RPC has explicit
+grants to the exact API roles and PUBLIC stays revoked.
+
+**Activation gate (supabase mode, machine-checked).** Before any write, the migrator
+refuses with `function_boundary_unproven` unless one durable control is both present and
+approved. `HOOPDB_FUNCTION_BOUNDARY_APPROVED` records the blast-radius approval.
+
+- **(A) `global-default-revoke`:**
+  `ALTER DEFAULT PRIVILEGES FOR ROLE <migration owner> REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`.
+  On Supabase the owner is `postgres`, so this changes every future postgres-created
+  function in every schema. That is why it needs explicit approval (#98).
+- **(E) `event-trigger`:** an enabled `ddl_command_end` event trigger named
+  `sessions_function_public_revoke` that revokes PUBLIC EXECUTE on `sessions` functions,
+  reviewed.
+
+The evidence is names and booleans only:
+
+- `migration_owner`;
+- `sessions_unexposed_and_no_untrusted_usage`, always false here;
+- `global_function_default_revokes_public`;
+- `event_trigger_present`;
+- `approval`;
+- `satisfied`.
+
+`bun src/hoopdb/migrate.ts --activation-check` prints it and exits 1 if unproven. Neither
+control is applied by this repository. Selfhosted production with PostgREST has the same
+residual; run the same check there before activation.
+
+**Durable follow-up (open):** a dedicated `sessions` object owner, so an owner-scoped
+global default revoke has no blast radius outside HoopDb. That needs an ownership transfer
+of live objects, so it is out of scope for #99. Or schema-specific event-trigger
+enforcement, reviewed. Tracked in #98.
 
 ## CNPG (self-hosted HoopDb)
 

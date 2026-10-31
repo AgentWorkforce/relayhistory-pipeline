@@ -32,6 +32,8 @@ import {
   MARKER_PENDING_SQL,
 } from "../../src/hoopdb/migrate.ts";
 import { NON_CREATE_STEPS } from "../../src/hoopdb/migration-sentinels.ts";
+import { sessionsFunctionAcl } from "../../src/hoopdb/migrate-guards.ts";
+import { gateOpen } from "../../src/shared/worker.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const HOST = process.env.PGPROOF_HOST ?? "127.0.0.1";
@@ -247,6 +249,13 @@ async function check(
 }
 const fmt = (o: unknown) => JSON.stringify(o);
 
+const MAJOR =
+  (Number(
+    (await sql("postgres", "SHOW server_version_num")).rows[0]
+      .server_version_num,
+  ) /
+    10000) |
+  0;
 const version = (await sql("postgres", "SHOW server_version")).rows[0]
   .server_version as string;
 console.log(
@@ -270,6 +279,7 @@ for (const r of [
   "g6_never",
   "g6_other",
   "g6_caller",
+  "g6_unrel",
 ]) {
   for (const d of (
     await sql("postgres", "SELECT datname FROM pg_database WHERE datallowconn")
@@ -548,6 +558,10 @@ const HOSTILE: Array<[string, string]> = [
     "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO PUBLIC",
   ],
   [
+    "USAGE on another schema through PUBLIC",
+    "CREATE SCHEMA g6_extra; GRANT USAGE ON SCHEMA g6_extra TO PUBLIC",
+  ],
+  [
     "a default ACL",
     "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO g6_bad",
   ],
@@ -579,6 +593,7 @@ for (const [name, setup] of HOSTILE)
         "DROP SEQUENCE IF EXISTS public.g6_pub_seq",
         "DROP FUNCTION IF EXISTS public.g6_definer()",
         "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions REVOKE SELECT ON TABLES FROM PUBLIC",
+        "DROP SCHEMA IF EXISTS g6_extra",
       ])
         await attempt("g6_rt_db", undo);
       await attempt(
@@ -719,6 +734,106 @@ await check(
 );
 await attempt("postgres", "DROP DATABASE IF EXISTS g6_seq");
 
+await check(
+  "PostgreSQL 17+: a runtime role with MAINTAIN on a relation is refused (version-guarded; MAINTAIN does not exist on 15)",
+  async () => {
+    if (MAJOR < 17)
+      return [true, `skipped: PostgreSQL ${MAJOR} has no MAINTAIN privilege`];
+    psql("g6_rt_db", [
+      "-v",
+      "runtime_role=g6_bad",
+      "-v",
+      "runtime_login=true",
+      "-f",
+      RUNTIME_BOOT,
+    ]);
+    await sql("g6_rt_db", "GRANT MAINTAIN ON sessions.session_index TO g6_bad");
+    const before = await snapshot("g6_rt_db");
+    const m = migrate("g6_rt_db", { ...SELF, HOOPDB_RUNTIME_ROLE: "g6_bad" });
+    const same = (await snapshot("g6_rt_db")) === before;
+    await attempt("g6_rt_db", "DROP OWNED BY g6_bad");
+    await attempt("postgres", "DROP ROLE g6_bad");
+    return [
+      m.code === "runtime_role_unsafe" && same,
+      `${fmt(m)} unchanged=${same}`,
+    ];
+  },
+);
+await check(
+  "ACL manifest regression: every sessions function's ACL is exactly the committed manifest",
+  async () => {
+    const want = JSON.parse(
+      readFileSync(join(ROOT, "src/hoopdb/sessions-function-acl.json"), "utf8"),
+    ).functions;
+    const h = openHoopDb(url("hoop", "g6_rt_db"));
+    try {
+      const got = await sessionsFunctionAcl(h);
+      const diff = Object.keys({ ...want, ...got }).filter(
+        (k) => fmt(want[k]) !== fmt(got[k]),
+      );
+      return [
+        diff.length === 0,
+        diff.length
+          ? `differs: ${diff.join(", ")}`
+          : `${Object.keys(got).length} functions match`,
+      ];
+    } finally {
+      await h.end();
+    }
+  },
+);
+await check(
+  "residual (not prevented): a sessions function created after PASS without the migrator is directly invocable; the live gate gives 55000 and claims stop",
+  async () => {
+    const expected = await expectedSchema();
+    const rt = openHoopDb(url("g6_rt", "g6_rt_db"));
+    const health = {
+      schemaReady: async () =>
+        (await schemaVerdict(expected, (w) => inTransaction(rt, w))).ok,
+    };
+    try {
+      const openBefore = await gateOpen(health);
+      await sql(
+        "g6_rt_db",
+        "CREATE FUNCTION sessions.g6_late() RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        "hoop",
+      );
+      await sql(
+        "postgres",
+        "DO $x$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'g6_unrel') THEN CREATE ROLE g6_unrel LOGIN; END IF; END $x$; GRANT authenticated TO g6_unrel",
+      );
+      await sql("g6_rt_db", "GRANT CONNECT ON DATABASE g6_rt_db TO g6_unrel");
+      const direct = (
+        await sql("g6_rt_db", "SELECT sessions.g6_late() AS v", "g6_unrel")
+      ).rows[0].v;
+      const v = await schemaVerdict(expected, (w) => inTransaction(rt, w));
+      const openAfter = await gateOpen(health);
+      await sql("g6_rt_db", "DROP FUNCTION sessions.g6_late()", "hoop");
+      const recovered = await schemaVerdict(expected, (w) =>
+        inTransaction(rt, w),
+      );
+      await attempt(
+        "g6_rt_db",
+        "REVOKE CONNECT ON DATABASE g6_rt_db FROM g6_unrel",
+      );
+      await attempt("postgres", "DROP ROLE IF EXISTS g6_unrel");
+      const ok =
+        openBefore &&
+        direct === 42 &&
+        !v.ok &&
+        "error_code" in v &&
+        v.error_code === "55000" &&
+        !openAfter &&
+        recovered.ok;
+      return [
+        ok,
+        `gate_before=${openBefore} direct_call=${direct} verdict=${fmt(v)} gate_after=${openAfter} recovered=${fmt(recovered)}`,
+      ];
+    } finally {
+      await rt.end();
+    }
+  },
+);
 await check(
   "selfhosted bootstrap revokes TEMPORARY from PUBLIC: an unrelated role loses it database-wide; the owner keeps it",
   async () => {
@@ -985,6 +1100,60 @@ await check(
     return [
       waiting > 0 && !killed.ok && restart.exit === 0 && ready.ok,
       `blocked=${waiting} killed=${fmt(killed)} restart=${fmt(restart)} ready=${fmt(ready)}`,
+    ];
+  },
+);
+
+await check(
+  "supabase activation gate: refused without an approved durable boundary (names and booleans); (A) owner-scoped global revoke, approved, passes",
+  async () => {
+    await fresh("g6_supa", ["g6_rt2"]);
+    const SUPA = {
+      HOOPDB_DB_MODE: "supabase",
+      HOOPDB_RUNTIME_ROLE: "g6_rt2",
+      HOOPDB_RUNTIME_ROLE_LOGIN: "true",
+    };
+    const none = migrate("g6_supa", SUPA);
+    const absent = (await snapshot("g6_supa")) === "absent";
+    await sql(
+      "g6_supa",
+      "ALTER DEFAULT PRIVILEGES FOR ROLE hoop REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+    );
+    const unapproved = migrate("g6_supa", SUPA);
+    const approved = migrate("g6_supa", {
+      ...SUPA,
+      HOOPDB_FUNCTION_BOUNDARY_APPROVED: "global-default-revoke",
+    });
+    const check = spawnSync(
+      "bun",
+      ["src/hoopdb/migrate.ts", "--activation-check"],
+      {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOOPDB_URL: url("hoop", "g6_supa"),
+          HOOPDB_FUNCTION_BOUNDARY_APPROVED: "global-default-revoke",
+        },
+      },
+    );
+    const evidence = JSON.parse(check.stdout.trim().split("\n").at(-1) ?? "{}");
+    await attempt("postgres", "DROP DATABASE IF EXISTS g6_supa WITH (FORCE)");
+    const ok =
+      none.code === "function_boundary_unproven" &&
+      absent &&
+      unapproved.code === "function_boundary_unproven" &&
+      approved.exit === 0 &&
+      check.status === 0 &&
+      evidence.satisfied === true &&
+      evidence.global_function_default_revokes_public === true &&
+      evidence.sessions_unexposed_and_no_untrusted_usage === false &&
+      Object.values(evidence).every((x) =>
+        ["string", "boolean"].includes(typeof x),
+      );
+    return [
+      ok,
+      `none=${fmt(none)} nothing_written=${absent} unapproved=${fmt(unapproved)} approved=${fmt(approved)} evidence=${fmt(evidence)}`,
     ];
   },
 );

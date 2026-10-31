@@ -106,6 +106,33 @@ export const ROLE_VERIFY_SQL_PATH = fileURLToPath(
 );
 const ROLE_VERIFY_SQL = readFileSync(ROLE_VERIFY_SQL_PATH, "utf8");
 
+/**
+ * Live sessions-function boundary, read-only, part of every readiness check: no sessions
+ * function may be EXECUTE-able through PUBLIC, nor by the connected (runtime) role unless
+ * it owns the function (owner-run local mode) or is a superuser. The migrator revokes
+ * PUBLIC EXECUTE on every migrate, but a function created in sessions after a migrate,
+ * outside the migrator, is PUBLIC-executable by PostgreSQL's built-in default until the
+ * next migrate; this check turns readiness (and worker claiming) off at the next probe
+ * instead (55000).
+ */
+export const SESSIONS_FUNCTION_GATE_SQL = `DO $sessions_fn_gate$
+DECLARE v text;
+BEGIN
+  SELECT string_agg(p.oid::regprocedure::text, ', ' ORDER BY 1) INTO v
+    FROM pg_proc p
+   WHERE p.pronamespace = coalesce(to_regnamespace('sessions')::oid, 0)
+     AND (p.proacl IS NULL
+          OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')
+          OR (has_function_privilege(current_user, p.oid, 'EXECUTE')
+              AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+              AND NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)));
+  IF v IS NOT NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = 'live gate: sessions functions executable by PUBLIC or the runtime role: ' || v;
+  END IF;
+END
+$sessions_fn_gate$`;
+
 /** Runs `work` in one transaction on one connection (inTransaction, or a test double). */
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 
@@ -172,6 +199,7 @@ export async function schemaVerdict(
       if (!(await passed())) return { ok: false, reason: "validation_pending" };
       stage = "verify";
       await tx.query(ROLE_VERIFY_SQL);
+      await tx.query(SESSIONS_FUNCTION_GATE_SQL);
       if (opts.afterVerify) await opts.afterVerify(); // test seam: a concurrent flip lands here
       stage = "final";
       if (!(await passed())) return { ok: false, reason: "validation_pending" };
