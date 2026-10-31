@@ -52,8 +52,42 @@ export const SESSION_DIRECTORY_SEARCH_BOUNDARY = {
   transcriptBackend: "ClickHouse/ObsessionDB (not yet available)",
 } as const;
 
+/**
+ * A direct agent filter whose input the JavaScript normalization cannot match to the
+ * stored PostgreSQL lower(btrim(agent_name)) exactly; use the RPC instead.
+ */
+export class NonAsciiAgentFilterError extends RangeError {
+  constructor(readonly match: "exact" | "prefix") {
+    super(
+      `agent ${match === "exact" ? "name" : "prefix"} contains non-ASCII characters: ` +
+        "the direct query normalizes it in JavaScript, which can disagree with " +
+        "PostgreSQL lower() on the stored name, so it could miss rows. Use " +
+        `sessions.search_session_directory with p_agent_match => '${match}'.`,
+    );
+    this.name = "NonAsciiAgentFilterError";
+  }
+}
+
+const NON_ASCII = /[^\u0000-\u007f]/;
+
+/**
+ * The JavaScript normalization of a direct agent filter (exact or prefix): trim and
+ * lowercase. It accepts ASCII only, where it equals PostgreSQL lower(btrim()) on every
+ * collation; any other input throws NonAsciiAgentFilterError rather than risk a
+ * silent false negative.
+ */
 export function normalizeAgentName(value: string): string {
+  if (NON_ASCII.test(value)) throw new NonAsciiAgentFilterError("exact");
   return value.trim().toLowerCase();
+}
+
+/** The `$3` of SESSION_DIRECTORY_QUERIES.agentExact: ASCII only, non-empty. */
+export function agentExactValue(value: string): string {
+  const normalized = normalizeAgentName(value);
+  if (normalized === "" || normalized.length > 200) {
+    throw new RangeError("agent name must be 1 to 200 characters");
+  }
+  return normalized;
 }
 
 export function isUsefulAgentPrefix(value: string): boolean {
@@ -61,6 +95,7 @@ export function isUsefulAgentPrefix(value: string): boolean {
 }
 
 export function agentPrefixPattern(value: string): string {
+  if (NON_ASCII.test(value)) throw new NonAsciiAgentPrefixError();
   const normalized = normalizeAgentName(value);
   if (Array.from(normalized).length < MIN_AGENT_PREFIX_CHARS) {
     throw new RangeError(
@@ -90,13 +125,9 @@ export function textPatternUpperBound(prefix: string): string {
 }
 
 /** A direct prefix the bounded query cannot serve exactly; use the RPC instead. */
-export class NonAsciiAgentPrefixError extends RangeError {
+export class NonAsciiAgentPrefixError extends NonAsciiAgentFilterError {
   constructor() {
-    super(
-      "agent prefix contains non-ASCII characters: the direct bounded query cannot " +
-        "normalize them the way PostgreSQL lower() does, so it could miss rows. Use " +
-        "sessions.search_session_directory with p_agent_match => 'prefix'.",
-    );
+    super("prefix");
     this.name = "NonAsciiAgentPrefixError";
   }
 }
@@ -117,7 +148,7 @@ export function agentPrefixRange(value: string): {
   pattern: string;
 } {
   // eslint-disable-next-line no-control-regex
-  if (/[^\u0000-\u007f]/.test(value)) throw new NonAsciiAgentPrefixError();
+  if (NON_ASCII.test(value)) throw new NonAsciiAgentPrefixError();
   const lower = normalizeAgentName(value);
   if (Array.from(lower).length < MIN_AGENT_PREFIX_CHARS) {
     throw new RangeError(

@@ -16,7 +16,9 @@ import {
   SESSION_DIRECTORY_LIST_COLUMNS,
   SESSION_DIRECTORY_QUERIES,
   agentPrefixRange,
-  agentPrefixPattern,
+  normalizeAgentName,
+  agentExactValue,
+  NonAsciiAgentFilterError,
   NonAsciiAgentPrefixError,
   textPatternUpperBound,
 } from "../search-index-contract.ts";
@@ -76,6 +78,9 @@ const prefixArgs = (value: string, limit = 50) => {
   return ["o", "w", range.lower, range.upper, range.pattern, limit];
 };
 
+/** LIKE prefix pattern for an already-normalized value, escaping % _ and backslash. */
+const likePrefix = (value: string) => `${value.replace(/[\\%_]/g, "\\$&")}%`;
+
 /**
  * The bounded query with bounds computed straight from an already-normalized
  * (lowercase) prefix, bypassing agentPrefixRange's ASCII-only guard: exercises the
@@ -93,7 +98,7 @@ async function rawBoundHits(db: PGlite, lower: string): Promise<string[]> {
             "w",
             lower,
             textPatternUpperBound(lower),
-            agentPrefixPattern(lower),
+            likePrefix(lower),
             50,
           ],
         )
@@ -332,6 +337,57 @@ describe("agent prefix bounds and recheck", () => {
     );
   });
 
+  test("exact: a non-ASCII name is refused on the direct path and found through the RPC", async () => {
+    for (const [name, input] of [
+      ["ΟΔΟΣ-Agent", "ΟΔΟΣ-AGENT"],
+      ["İstanbul-X", "İSTANBUL-X"],
+    ] as const) {
+      const sqlLower = (
+        await db.query<{ v: string }>("SELECT lower(btrim($1)) AS v", [input])
+      ).rows[0]!.v;
+      const jsLower = input.trim().toLowerCase();
+      expect(sqlLower, name).not.toBe(jsLower);
+      // A JavaScript-normalized exact value would silently miss the stored row.
+      const naive = await asAuthenticated(
+        db,
+        async () =>
+          (
+            await db.query(SESSION_DIRECTORY_QUERIES.agentExact, [
+              "o",
+              "w",
+              jsLower,
+              50,
+            ])
+          ).rows,
+      );
+      expect(naive, name).toEqual([]);
+      // So the direct helpers refuse it, pointing at the RPC's exact match...
+      expect(() => agentExactValue(input)).toThrow(NonAsciiAgentFilterError);
+      expect(() => agentExactValue(input)).toThrow(/p_agent_match => 'exact'/);
+      expect(() => normalizeAgentName(input)).toThrow(NonAsciiAgentFilterError);
+      // ...which finds it, because it lowers with the same SQL lower() as storage.
+      expect(await rpcAgentHits(db, input, "exact"), name).toEqual([name]);
+      // And the SQL-lowered value is what the stored column holds.
+      const exact = await asAuthenticated(
+        db,
+        async () =>
+          (
+            await db.query<{ agent_name: string }>(
+              SESSION_DIRECTORY_QUERIES.agentExact,
+              ["o", "w", sqlLower, 50],
+            )
+          ).rows,
+      );
+      expect(
+        exact.map((r) => r.agent_name),
+        name,
+      ).toEqual([name]);
+    }
+    // ASCII exact values pass straight through.
+    expect(agentExactValue("  Helm-Chief ")).toBe("helm-chief");
+    expect(() => agentExactValue("   ")).toThrow(RangeError);
+  });
+
   test("refuses the all-max prefix and an empty or short prefix", () => {
     expect(() => textPatternUpperBound(MAX.repeat(3))).toThrow(RangeError);
     expect(() => agentPrefixRange(MAX.repeat(3))).toThrow(RangeError);
@@ -390,7 +446,7 @@ describe("agent prefix bounds and recheck", () => {
           : {
               lower: prefix,
               upper: textPatternUpperBound(prefix),
-              pattern: agentPrefixPattern(prefix),
+              pattern: likePrefix(prefix),
             };
         const bounded = (
           await asAuthenticated(

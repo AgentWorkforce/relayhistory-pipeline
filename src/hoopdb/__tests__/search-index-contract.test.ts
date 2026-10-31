@@ -6,6 +6,8 @@ import {
   agentPrefixPattern,
   agentPrefixRange,
   NonAsciiAgentPrefixError,
+  NonAsciiAgentFilterError,
+  agentExactValue,
   textPatternUpperBound,
   auditSearchIndexes,
   isUsefulAgentPrefix,
@@ -113,6 +115,11 @@ describe("decision 0002 search index contract", () => {
 describe("agent-name lookup contract", () => {
   test("normalizes exact names and requires a useful prefix", () => {
     expect(normalizeAgentName("  Helm-Chart-Chief ")).toBe("helm-chart-chief");
+    for (const value of ["ΟΔΟΣ", "İstanbul", "Ägent", "日本語"]) {
+      expect(() => normalizeAgentName(value)).toThrow(NonAsciiAgentFilterError);
+      expect(() => agentExactValue(value)).toThrow(/p_agent_match => 'exact'/);
+      expect(() => agentPrefixPattern(value)).toThrow(NonAsciiAgentPrefixError);
+    }
     expect(MIN_AGENT_PREFIX_CHARS).toBe(3);
     expect(isUsefulAgentPrefix("he")).toBe(false);
     expect(isUsefulAgentPrefix("hel")).toBe(true);
