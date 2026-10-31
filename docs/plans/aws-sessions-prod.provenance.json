@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "stage": "aws-sessions-prod",
+  "generatedAt": "2026-10-31T14:50:04.060Z",
+  "target": {
+    "accountId": "941433935742",
+    "region": "us-east-1",
+    "callerArn": "arn:aws:sts::941433935742:assumed-role/AWSReservedSSO_AdministratorAccess_267543ee54f72723/khaliq@agentrelay.com"
+  },
+  "source": {
+    "commit": "f4f025bab4ce86a4eae3cdcfea8bfcdb1f9340d0",
+    "stackSourceSha256": "cf3ee7ab8affaecadd7956646ef984b0d4e5490001fa79af52d508ece78bbc95",
+    "clean": true
+  },
+  "inputs": {
+    "sha256": "8f5ddaae9613a60aa174f3bdb9127a62ffd7de0f3cdba67601b29f78de52f12b",
+    "sanitizedPath": "docs/plans/aws-sessions-prod.inputs.sanitized.json",
+    "sanitizedSha256": "9ed897371176477dd60970336ae3d58ee139d5b91f7d185b5b103516856adadc"
+  },
+  "state": {
+    "bucket": "alchemy-state-941433935742-us-east-1-an",
+    "prefix": "96bulls/96bulls-aws/aws-sessions-prod/",
+    "versioning": "Enabled",
+    "method": "snapshot",
+    "objects": 0,
+    "snapshotSha256": "18679a68cd373cf4698a1530517071502565424240b488db681ad9fc6be877df",
+    "versionsDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "versionEntries": 0
+  },
+  "tools": {
+    "alchemy": "2.0.0-beta.84",
+    "@alchemy.run/aws": "2.0.0-beta.84",
+    "@alchemy.run/kubernetes": "2.0.0-beta.84",
+    "bun": "1.4.2",
+    "aws-cli": "aws-cli/2.36.46 Python/3.14.6 Linux/7.2.3-arch1-3 exe/x86_64.omarchy.4",
+    "helm": "v3.22.0+g144ca65"
+  },
+  "outputs": {
+    "plan": {
+      "path": "docs/plans/aws-sessions-prod.plan.txt",
+      "sha256": "6e3c907a867a6efe220183e4bd3fd324629e93c7416ce419a50f1c2939a99df1"
+    },
+    "detailed": {
+      "path": "docs/plans/aws-sessions-prod.plan.detailed.txt",
+      "sha256": "f4a4b4d5b82dad218199eba041141252727f76b7c47d3e1e881f51de9f23d0b1"
+    }
+  },
+  "summary": "Plan: 12 to create",
+  "note": "Planned against a read-only snapshot of the state (GETs pinned to version ids, in-memory Alchemy state): no state-bucket writes, no lease. The version listing (all versions and delete markers) was identical before and after. AWS provider reads only (Describe/List/Get). `96bulls up` re-checks everything before any change."
+}
