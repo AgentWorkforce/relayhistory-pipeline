@@ -40,16 +40,66 @@ jobs:
           create_credentials_file: 'false'
           export_environment_variables: 'false'
           access_token_scopes: 'https://www.googleapis.com/auth/cloud-platform'
-      - uses: docker/login-action@v3
-        with:
-          registry: us-central1-docker.pkg.dev
-          username: oauth2accesstoken
-          password: ${{ steps.auth.outputs.access_token }}
-          ecr: 'false'
+      - name: Configure in-memory registry auth
+        run: |
+          set -euo pipefail
+          fstype=$(findmnt -n -o FSTYPE /dev/shm)
+          if [ "$fstype" != tmpfs ]; then
+            echo "refusing registry auth because /dev/shm is not tmpfs" >&2
+            exit 1
+          fi
+          command -v jq >/dev/null
+          auth_dir=$(mktemp -d /dev/shm/ar-docker.XXXXXX)
+          chmod 700 "$auth_dir"
+          cat > "$auth_dir/docker-credential-ar-env" <<'EOF'
+          #!/bin/sh
+          set -eu
+          if [ "${1:-}" != get ]; then
+            exit 0
+          fi
+          read -r server || true
+          case "$server" in
+            us-central1-docker.pkg.dev|https://us-central1-docker.pkg.dev|https://us-central1-docker.pkg.dev/|https://us-central1-docker.pkg.dev/v2/)
+              ;;
+            *)
+              echo "refusing credential for unexpected registry" >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "${AR_TOKEN:-}" ]; then
+            echo "registry access token is absent" >&2
+            exit 1
+          fi
+          jq -nc '{Username:"oauth2accesstoken", Secret:env.AR_TOKEN}'
+          EOF
+          chmod 700 "$auth_dir/docker-credential-ar-env"
+          printf '%s\n' '{"credHelpers":{"us-central1-docker.pkg.dev":"ar-env"}}' > "$auth_dir/config.json"
+          chmod 600 "$auth_dir/config.json"
+          echo "$auth_dir" >> "$GITHUB_PATH"
+          echo "DOCKER_CONFIG=$auth_dir" >> "$GITHUB_ENV"
+          echo "AR_DOCKER_AUTH_DIR=$auth_dir" >> "$GITHUB_ENV"
+      - name: Prove the auth directory stores no token
+        env:
+          AR_TOKEN: probe-token-not-a-credential
+        run: |
+          set -euo pipefail
+          helper="$AR_DOCKER_AUTH_DIR/docker-credential-ar-env"
+          out=$(printf '%s\n' 'us-central1-docker.pkg.dev' | "$helper" get)
+          printf '%s' "$out" | jq -e '.Username == "oauth2accesstoken" and .Secret == "probe-token-not-a-credential"' >/dev/null
+          if grep -R -F -q 'probe-token-not-a-credential' "$AR_DOCKER_AUTH_DIR"; then
+            echo "probe token was written into the auth directory" >&2
+            exit 1
+          fi
+          if printf '%s\n' 'ghcr.io' | "$helper" get >/dev/null 2>&1; then
+            echo "helper returned a token for an unexpected registry" >&2
+            exit 1
+          fi
       - uses: docker/setup-buildx-action@v3
       - name: Build and push (amd64 + arm64)
         id: build
         uses: docker/build-push-action@v6
+        env:
+          AR_TOKEN: ${{ steps.auth.outputs.access_token }}
         with:
           context: .
           file: docker/services.Dockerfile
@@ -72,3 +122,15 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: printf '%s\n' "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Remove in-memory registry auth
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${AR_DOCKER_AUTH_DIR:-}" ]; then
+            if [ -f "$AR_DOCKER_AUTH_DIR/config.json" ] && jq -e '(.auths // {}) | length > 0' "$AR_DOCKER_AUTH_DIR/config.json" >/dev/null; then
+              rm -rf -- "$AR_DOCKER_AUTH_DIR"
+              echo "registry config stored an auth entry" >&2
+              exit 1
+            fi
+            rm -rf -- "$AR_DOCKER_AUTH_DIR"
+          fi
