@@ -9,6 +9,7 @@
  *                  "docker exec <id> sh -c" (default: run locally)
  *   BENCH_CH_COMPRESSOR  clickhouse-compressor command (default clickhouse compressor)
  *   BENCH_CH_PURGE_LIMIT_S  how long gate 3 waits for default cleanup (default 900)
+ *   BENCH_CH_ONLY  "workload" runs only gate 7 with server-side scheduling
  *   BENCH_OUT      report path
  *
  * Every result carries the statements and settings that produced it. Exits 1 if gate 3
@@ -412,12 +413,69 @@ async function gate7(table: string) {
     verdict: (capped.p95 ?? Infinity) < line ? "PASS" : "FAIL", victim, noisy };
 }
 
+/**
+ * Gate 7 with server-side scheduling on one shared user: the client names a workload per
+ * query, so a tenant's class travels with its query. CPU scheduling only; IO is not limited.
+ */
+async function gate7Workload(table: string) {
+  const victim = pageSql(table, SMALL_ORG, SMALL_WS, "refactor");
+  const noisy = pageSql(table, WHALE_ORG, WHALE_WS, "refactor");
+  const ddl = [
+    "CREATE RESOURCE bench_cpu (MASTER THREAD, WORKER THREAD)",
+    "CREATE WORKLOAD all",
+    "CREATE WORKLOAD bench_search IN all SETTINGS weight = 9",
+    "CREATE WORKLOAD bench_noisy IN all SETTINGS weight = 1",
+  ];
+  for (const d of ["DROP WORKLOAD IF EXISTS bench_noisy", "DROP WORKLOAD IF EXISTS bench_search", "DROP WORKLOAD IF EXISTS all", "DROP RESOURCE IF EXISTS bench_cpu"]) await ch(d);
+  for (const d of ddl) await ch(d);
+  const quietRun = async (s: Record<string, string | number>) => {
+    const t: number[] = [];
+    for (let i = 0; i < 50; i++) { const a = performance.now(); await ch(victim, s); t.push(performance.now() - a); }
+    return summarize(t);
+  };
+  // Warm first: cold samples would inflate quiet p95, and with it the pass line.
+  await quietRun({});
+  const quiet = await quietRun({});
+  const line = (quiet.p95 ?? 0) * 2;
+  const under = async (connections: number, noisySettings: Record<string, string | number>, victimSettings: Record<string, string | number>, setup?: string) => {
+    if (setup) await ch(setup);
+    let stop = false, noisyDone = 0;
+    const load = Array.from({ length: connections }, async () => { while (!stop) { await ch(noisy, noisySettings); noisyDone++; } });
+    const started = performance.now();
+    const result = await quietRun(victimSettings);
+    const seconds = (performance.now() - started) / 1000;
+    stop = true;
+    await Promise.all(load);
+    return { connections, noisySettings, victimSettings, setup, victimLatency: result, noisyQueriesPerSecond: Math.round(noisyDone / seconds),
+      ratioToQuiet: Math.round(((result.p95 ?? 0) / (quiet.p95 || 1)) * 100) / 100, verdict: (result.p95 ?? Infinity) < line ? "PASS" : "FAIL" };
+  };
+  const s = { workload: "bench_search" }, n = { workload: "bench_noisy" };
+  const variants = {
+    none: await under(6, {}, {}),
+    weights9to1: await under(6, n, s),
+    weightsCap2: await under(2, n, s),
+    noisyThreadLimit2: await under(6, n, s, "CREATE OR REPLACE WORKLOAD bench_noisy IN all SETTINGS weight = 1, max_concurrent_threads = 2"),
+    noisyThreadLimit2Cap2: await under(2, n, s),
+    noisyThreadLimit1: await under(6, n, s, "CREATE OR REPLACE WORKLOAD bench_noisy IN all SETTINGS weight = 1, max_concurrent_threads = 1"),
+    maxThreads2Cap2: await under(2, { max_threads: 2 }, {}),
+  };
+  return { note: "One shared user, workload named per query. Also read noisyQueriesPerSecond: a tighter limit slows the whale.", passLine: "victim p95 under 2x quiet", cores: await ch("SELECT count() FROM system.asynchronous_metrics WHERE metric LIKE 'CPUFrequencyMHz_%'"), ddl, quiet, variants, victim, noisy };
+}
+
 async function bm25() {
   const fns = await ch("SELECT groupArray(name) FROM system.functions WHERE name ILIKE '%bm25%' OR name ILIKE '%relevance%'");
   return { functionsMatching: fns, verdict: fns === "[]" ? "No BM25 function in system.functions" : "See functions" };
 }
 
 const version = await ch("SELECT version()");
+if (process.env.BENCH_CH_ONLY === "workload") {
+  await loadEvents("events_ngrams3", TOKENIZERS.ngrams3);
+  const report = { head: process.env.BENCH_HEAD_SHA ?? "unrecorded", corpusSha256: corpusHash(SCALES[scale]!), version, scale, gate7Workload: await gate7Workload("events_ngrams3") };
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(out, JSON.stringify(report, null, 2));
+  console.log(JSON.stringify(report.gate7Workload.variants, null, 1));
+  process.exit(0);
+}
 const report: Record<string, unknown> = { head: process.env.BENCH_HEAD_SHA ?? "unrecorded", corpusSha256: corpusHash(SCALES[scale]!), version, scale, warning: "Vanilla ClickHouse, synthetic data, relative numbers. Not ObsessionDB and not an e2e proof." };
 report.bm25 = await bm25();
 report.gate3 = await gate3();
