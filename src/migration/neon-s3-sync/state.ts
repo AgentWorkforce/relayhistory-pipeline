@@ -195,11 +195,12 @@ export class SyncState {
       `UPDATE exported SET revision = -2, exported_at = 0
         WHERE org_id = ? AND session_id = ? AND error IS NULL AND keys <> '[]' AND revision <> -2`,
     );
-    // A failed group (even past its attempt cap) retries at once.
+    // A failed group past its attempt cap is revived (once per cap); others
+    // keep their backoff, which already retries them.
     const failed = this.db.prepare(
       `UPDATE exported SET failed_revision = -2, attempts = 0, next_try = 0
         WHERE org_id = ? AND session_id = ? AND error IS NOT NULL AND keys <> '[]'
-          AND coalesce(failed_revision, 0) <> -2`,
+          AND attempts >= 6 AND error <> 'eraser_unavailable'`,
     );
     let n = 0;
     this.#tx(() => {
