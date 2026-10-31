@@ -1,14 +1,10 @@
-# READ-ONLY alchemy plan for aws-proof (account 500268966557, us-west-2), generated 2026-10-30 from PR #75 by:
-#   AWS_REGION=us-west-2 NINETY_SIX_BULLS_CONFIRM_ACCOUNT=500268966557 bin/96bulls plan aws-proof   (+ --detailed for *.detailed.txt)
-# Inputs: .96bulls/aws-proof/aws-inputs.json (gitignored). Sanitized: timestamps, cluster CA data and the operator IP removed. Nothing was applied.
-
 Plan · aws-proof
 Importing stack module
 Resolving stack services
-AWS: using environment variables (SSO session exported to env)
+AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
 Loading stack state
 Computing plan
-Plan ready (3.8s)
+Plan ready (4.8s)
 Plan: 78 to create
 
 [96bulls] create
@@ -214,6 +210,7 @@ Plan: 78 to create
     bucketName: 96bulls-aws-proof-alb-logs-500268966557
     encryption:
       sseAlgorithm: AES256
+    forceDestroy: true
     lifecycleRules:
       - Expiration:
           Days: 90
@@ -390,7 +387,7 @@ Plan: 78 to create
       endpointPrivateAccess: true
       endpointPublicAccess: true
       publicAccessCidrs:
-        - <operator-ip>/32
+        - operator-address-redacted/32
       subnetIds:
         - (known after apply)
         - (known after apply)
@@ -631,6 +628,7 @@ Plan: 78 to create
       bucketKeyEnabled: true
       kmsMasterKeyId: (known after apply)
       sseAlgorithm: aws:kms
+    forceDestroy: true
     lifecycleRules:
       - Filter:
           Prefix: ""
@@ -1780,7 +1778,7 @@ Plan: 78 to create
         encrypted: "true"
         type: gp3
       provisioner: ebs.csi.eks.amazonaws.com
-      reclaimPolicy: Retain
+      reclaimPolicy: Delete
       volumeBindingMode: WaitForFirstConsumer
 
 [telemetry-role] create
@@ -1865,6 +1863,7 @@ Plan: 78 to create
       bucketKeyEnabled: true
       kmsMasterKeyId: (known after apply)
       sseAlgorithm: aws:kms
+    forceDestroy: true
     policy:
       - Action:
           - s3:*

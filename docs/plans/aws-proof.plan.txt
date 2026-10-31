@@ -1,14 +1,10 @@
-# READ-ONLY alchemy plan for aws-proof (account 500268966557, us-west-2), generated 2026-10-30 from PR #75 by:
-#   AWS_REGION=us-west-2 NINETY_SIX_BULLS_CONFIRM_ACCOUNT=500268966557 bin/96bulls plan aws-proof   (+ --detailed for *.detailed.txt)
-# Inputs: .96bulls/aws-proof/aws-inputs.json (gitignored). Sanitized: timestamps, cluster CA data and the operator IP removed. Nothing was applied.
-
 Plan · aws-proof
 Importing stack module
 Resolving stack services
-AWS: using environment variables (SSO session exported to env)
+AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
 Loading stack state
 Computing plan
-Plan ready (4.6s)
+Plan ready (14.2s)
 Plan: 78 to create
 [96bulls] create
 [alb-ingressclass] create

@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "stage": "aws-proof",
+  "generatedAt": "2026-10-31T01:22:44.752Z",
+  "target": {
+    "accountId": "500268966557",
+    "region": "us-west-2",
+    "callerArn": "arn:aws:sts::500268966557:assumed-role/AWSReservedSSO_AdministratorAccess_fafac944cdc114d8/khaliq@agentrelay.com"
+  },
+  "source": {
+    "commit": "a378b2fe11919c533ce595677b6c12c0fdaa139b",
+    "stackSourceSha256": "586a7550c1fb66227e6849e9c8712cb33a9e260eaf4d895f9f36907c7c28defb",
+    "clean": true
+  },
+  "inputs": {
+    "sha256": "c65374a67766831ebc86bc7772003886bca8588db810aa1678f833da9b7aaddf",
+    "sanitizedPath": "docs/plans/aws-proof.inputs.sanitized.json",
+    "sanitizedSha256": "f244b5f5c3ae031ea4361ce9fda06d9fe5f14537e14e28008ddcf1f2aee2b455"
+  },
+  "state": {
+    "bucket": "alchemy-state-500268966557-us-west-2-an",
+    "prefix": "96bulls/96bulls-aws/aws-proof/",
+    "bucketExisted": true,
+    "objects": 0,
+    "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "tools": {
+    "alchemy": "2.0.0-beta.84",
+    "@alchemy.run/aws": "2.0.0-beta.84",
+    "@alchemy.run/kubernetes": "2.0.0-beta.84",
+    "bun": "1.4.2",
+    "aws-cli": "aws-cli/2.36.46 Python/3.14.6 Linux/7.2.3-arch1-3 exe/x86_64.omarchy.4",
+    "helm": "v3.22.0+g144ca65"
+  },
+  "outputs": {
+    "plan": {
+      "path": "docs/plans/aws-proof.plan.txt",
+      "sha256": "bd06649bb0b2bf24e973b78aaa02f8d16c32b7920e440038cbaa9a2ba91fc442"
+    },
+    "detailed": {
+      "path": "docs/plans/aws-proof.plan.detailed.txt",
+      "sha256": "3fa1700e7b2cfb9ee04f541a29cb7b96cb481c27c3a6e85dece57d54eb68ba23"
+    }
+  },
+  "summary": "Plan: 78 to create",
+  "note": "Read-only alchemy plan (state bucket existed; state digest unchanged across the run). Verified again by `96bulls up` before any change."
+}

@@ -1,0 +1,10 @@
+# Stack-level destroy guard, exercised against the live account with `alchemy destroy --dry-run`
+# (no --yes, so Alchemy computes a plan only and never writes state). Source a378b2fe1191, 2026-10-30.
+# Both runs bypass bin/96bulls and call Alchemy directly; the stack refuses while evaluating.
+
+$ bunx alchemy destroy --config stacks/aws/alchemy.aws.run.ts --stage aws-sessions-dev --dry-run --no-input
+ERROR: 96bulls: `alchemy destroy` needs NINETY_SIX_BULLS_AWS_MODE=destroy (use `bin/96bulls down <stage>`). Nothing was changed.
+
+$ NINETY_SIX_BULLS_AWS_MODE=destroy NINETY_SIX_BULLS_CONFIRM_DESTROY=aws-sessions-dev \
+  bunx alchemy destroy --config stacks/aws/alchemy.aws.run.ts --stage aws-sessions-dev --dry-run --no-input
+ERROR: 96bulls: aws-sessions-dev is never destroyed; revert the change and deploy again. Nothing was changed.

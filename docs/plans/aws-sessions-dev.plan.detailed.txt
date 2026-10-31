@@ -1,14 +1,10 @@
-# READ-ONLY alchemy plan for aws-sessions-dev (account 500268966557, us-west-2), generated 2026-10-30 from PR #75 by:
-#   AWS_REGION=us-west-2 NINETY_SIX_BULLS_CONFIRM_ACCOUNT=500268966557 bin/96bulls plan aws-sessions-dev   (+ --detailed for *.detailed.txt)
-# Inputs: .96bulls/aws-sessions-dev/aws-inputs.json (gitignored). Sanitized: timestamps, cluster CA data and the operator IP removed. Nothing was applied.
-
 Plan · aws-sessions-dev
 Importing stack module
 Resolving stack services
-AWS: using environment variables (SSO session exported to env)
+AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
 Loading stack state
 Computing plan
-Plan ready (3.0s)
+Plan ready (3.7s)
 Plan: 33 to create, 15 to update, 1 to adopted
 
 [96bulls] update
@@ -17,7 +13,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -   cluster:
   -     accessConfig:
   -       authenticationMode: API
-  -     certificateAuthorityData: <public cluster CA, omitted>
+  -     certificateAuthorityData: <public cluster CA omitted>
   -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
   -     clusterName: 96bulls-aws-sessions-dev
   -     computeConfig:
@@ -31,7 +27,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -         clusterName: 96bulls-aws-sessions-dev
   -         kind: aws-eks
   -         region: us-west-2
-  -       certificateAuthorityData: <public cluster CA, omitted>
+  -       certificateAuthorityData: <public cluster CA omitted>
   -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
   -     deletionProtection: false
   -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
@@ -239,7 +235,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -   cluster:
   -     accessConfig:
   -       authenticationMode: API
-  -     certificateAuthorityData: <public cluster CA, omitted>
+  -     certificateAuthorityData: <public cluster CA omitted>
   -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
   -     clusterName: 96bulls-aws-sessions-dev
   -     computeConfig:
@@ -253,7 +249,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -         clusterName: 96bulls-aws-sessions-dev
   -         kind: aws-eks
   -         region: us-west-2
-  -       certificateAuthorityData: <public cluster CA, omitted>
+  -       certificateAuthorityData: <public cluster CA omitted>
   -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
   -     deletionProtection: false
   -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
@@ -320,7 +316,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -   cluster:
   -     accessConfig:
   -       authenticationMode: API
-  -     certificateAuthorityData: <public cluster CA, omitted>
+  -     certificateAuthorityData: <public cluster CA omitted>
   -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
   -     clusterName: 96bulls-aws-sessions-dev
   -     computeConfig:
@@ -334,7 +330,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -         clusterName: 96bulls-aws-sessions-dev
   -         kind: aws-eks
   -         region: us-west-2
-  -       certificateAuthorityData: <public cluster CA, omitted>
+  -       certificateAuthorityData: <public cluster CA omitted>
   -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
   -     deletionProtection: false
   -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
@@ -560,7 +556,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   +     endpointPrivateAccess: true
   +     endpointPublicAccess: true
   +     publicAccessCidrs:
-  +       - <operator-ip>/32
+  +       - operator-address-redacted/32
       subnetIds:
         - subnet-0bef62a2d4aa5ee55
         - subnet-0edd96e6b40736edb
@@ -679,7 +675,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -   cluster:
   -     accessConfig:
   -       authenticationMode: API
-  -     certificateAuthorityData: <public cluster CA, omitted>
+  -     certificateAuthorityData: <public cluster CA omitted>
   -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
   -     clusterName: 96bulls-aws-sessions-dev
   -     computeConfig:
@@ -693,7 +689,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -         clusterName: 96bulls-aws-sessions-dev
   -         kind: aws-eks
   -         region: us-west-2
-  -       certificateAuthorityData: <public cluster CA, omitted>
+  -       certificateAuthorityData: <public cluster CA omitted>
   -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
   -     deletionProtection: false
   -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
@@ -777,7 +773,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -   cluster:
   -     accessConfig:
   -       authenticationMode: API
-  -     certificateAuthorityData: <public cluster CA, omitted>
+  -     certificateAuthorityData: <public cluster CA omitted>
   -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
   -     clusterName: 96bulls-aws-sessions-dev
   -     computeConfig:
@@ -791,7 +787,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -         clusterName: 96bulls-aws-sessions-dev
   -         kind: aws-eks
   -         region: us-west-2
-  -       certificateAuthorityData: <public cluster CA, omitted>
+  -       certificateAuthorityData: <public cluster CA omitted>
   -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
   -     deletionProtection: false
   -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
@@ -1519,7 +1515,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -   cluster:
   -     accessConfig:
   -       authenticationMode: API
-  -     certificateAuthorityData: <public cluster CA, omitted>
+  -     certificateAuthorityData: <public cluster CA omitted>
   -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
   -     clusterName: 96bulls-aws-sessions-dev
   -     computeConfig:
@@ -1533,7 +1529,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -         clusterName: 96bulls-aws-sessions-dev
   -         kind: aws-eks
   -         region: us-west-2
-  -       certificateAuthorityData: <public cluster CA, omitted>
+  -       certificateAuthorityData: <public cluster CA omitted>
   -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
   -     deletionProtection: false
   -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
@@ -1935,7 +1931,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -   cluster:
   -     accessConfig:
   -       authenticationMode: API
-  -     certificateAuthorityData: <public cluster CA, omitted>
+  -     certificateAuthorityData: <public cluster CA omitted>
   -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
   -     clusterName: 96bulls-aws-sessions-dev
   -     computeConfig:
@@ -1949,7 +1945,7 @@ Plan: 33 to create, 15 to update, 1 to adopted
   -         clusterName: 96bulls-aws-sessions-dev
   -         kind: aws-eks
   -         region: us-west-2
-  -       certificateAuthorityData: <public cluster CA, omitted>
+  -       certificateAuthorityData: <public cluster CA omitted>
   -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
   -     deletionProtection: false
   -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
