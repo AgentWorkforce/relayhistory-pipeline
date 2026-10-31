@@ -20,7 +20,8 @@ import { join } from "node:path";
 import { Client } from "pg";
 import {
   SESSION_DIRECTORY_QUERIES,
-  agentPrefixRange,
+  AgentPrefixRequiresRpcError,
+  directAgentPrefix,
 } from "../src/hoopdb/search-index-contract.ts";
 
 const root = join(import.meta.dir, "..");
@@ -155,23 +156,11 @@ async function evidence(adminUrl: string) {
       log("```");
     };
 
-    const prefix = agentPrefixRange("agent-ledger-1");
-    const broad = agentPrefixRange("age");
     for (const [title, sql, args] of [
       [
         "authenticated: direct agent exact",
         SESSION_DIRECTORY_QUERIES.agentExact,
         ["org-0", "ws-0", "agent-ledger-21", 50],
-      ],
-      [
-        "authenticated: direct agent prefix (selective, bounded)",
-        SESSION_DIRECTORY_QUERIES.agentPrefix,
-        ["org-0", "ws-0", prefix.lower, prefix.upper, prefix.pattern, 50],
-      ],
-      [
-        "authenticated: direct agent prefix (broad, bounded)",
-        SESSION_DIRECTORY_QUERIES.agentPrefix,
-        ["org-0", "ws-0", broad.lower, broad.upper, broad.pattern, 50],
       ],
       [
         "authenticated: direct project_id ILIKE (the surface the contract phase closes)",
@@ -193,12 +182,22 @@ async function evidence(adminUrl: string) {
     );
     log();
     log(`authenticated \`SELECT short_summary\`: ${denied} (42501 expected).`);
+    let refused = "not refused";
+    try {
+      directAgentPrefix("age");
+    } catch (e) {
+      if (e instanceof AgentPrefixRequiresRpcError) refused = e.code;
+    }
+    log();
+    log(
+      `direct agent prefix: ${refused} (typed refusal before any SQL; there is no direct prefix query).`,
+    );
 
     // The RPCs' inner statements, as executed by the Worker, via auto_explain.
     await c.query(`LOAD 'auto_explain'; SET auto_explain.log_min_duration = 0; SET auto_explain.log_analyze = on;
       SET auto_explain.log_buffers = on; SET auto_explain.log_timing = off; SET auto_explain.log_format = 'text';
       SET auto_explain.log_nested_statements = on; SET client_min_messages = log`);
-    const asWorker = async (sql: string, args: unknown[]) => {
+    const asWorker = async (sql: string, args: unknown[], pick: RegExp) => {
       notices.length = 0;
       await c.query("SELECT set_config('request.jwt.claims', $1, false)", [
         JSON.stringify({
@@ -207,44 +206,61 @@ async function evidence(adminUrl: string) {
         }),
       ]);
       await c.query(`SET ROLE ${WORKER}`);
+      let outcome = "ok";
       try {
-        await c.query(sql, args);
+        const r = await c.query(sql, args);
+        outcome = `ok, ${r.rows.length} rows`;
+      } catch (e) {
+        const err = e as { code?: string; message?: string };
+        outcome = `${err.code}: ${err.message}`;
       } finally {
         await c.query("RESET ROLE");
       }
-      // The inner statement's plan: its Query Text reads a table, not an RPC.
-      const inner = notices.find((m) => {
-        const text = /Query Text: ([^\n]*)/.exec(m)?.[1] ?? "";
-        return (
-          /FROM sessions\.(session_directory|session_index) AS /.test(m) &&
-          !/search_session_directory\(|session_directory_pointers\(/.test(text)
-        );
-      });
-      return (inner ?? "no inner plan captured").split("\n");
+      // The inner statements' plans, chosen by their Query Text.
+      const inner = notices.filter((m) =>
+        pick.test(/Query Text: ([^\n]*)/.exec(m)?.[1] ?? ""),
+      );
+      return [
+        `-- result: ${outcome}`,
+        ...(inner.length ? inner : ["no inner plan captured"]).flatMap((m) =>
+          m.split("\n"),
+        ),
+      ];
     };
-    for (const [title, sql, args] of [
+    const PAGE = /^SELECT d\.org_id/;
+    for (const [title, sql, args, pick] of [
       [
         "Worker RPC: p_project_contains (tenant project trigram index inside the RPC)",
         "SELECT * FROM sessions.search_session_directory(p_workspace_id => $1, p_project_contains => $2)",
         ["ws-0", "zebra-cross"],
+        PAGE,
       ],
       [
-        "Worker RPC: p_agent prefix",
+        "Worker RPC: worst-case agent prefix 'age' (budget probe, then agent_prefix_too_broad)",
         "SELECT * FROM sessions.search_session_directory(p_workspace_id => $1, p_agent => $2, p_agent_match => 'prefix')",
-        ["ws-0", "agent-ledger-1"],
+        ["ws-0", "age"],
+        /^SELECT (count|d\.org_id)/,
+      ],
+      [
+        "Worker RPC: selective agent prefix (budget probe, then the page)",
+        "SELECT * FROM sessions.search_session_directory(p_workspace_id => $1, p_agent => $2, p_agent_match => 'prefix')",
+        ["ws-0", "agent-ledger-11"],
+        /^SELECT (count|d\.org_id)/,
       ],
       [
         "Worker RPC: p_query selective",
         "SELECT * FROM sessions.search_session_directory($1, $2)",
         ["ws-0", "zebra-crossing"],
+        PAGE,
       ],
       [
         "Worker RPC: pointers",
         "SELECT * FROM sessions.session_directory_pointers($1, 'codex', 's-1')",
         ["ws-0"],
+        /^SELECT p\.org_id/,
       ],
     ] as const) {
-      block(title, await asWorker(sql, [...args]));
+      block(title, await asWorker(sql, [...args], pick));
     }
     await c.query(
       "SET auto_explain.log_min_duration = -1; SET client_min_messages = notice",

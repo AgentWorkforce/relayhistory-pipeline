@@ -259,6 +259,7 @@ $query$;
 --          state, agent match or harness format, an incomplete or mismatched cursor,
 --          since after until, or a contradictory filter pair
 --   0A000  an intentionally unsupported combination (named in the message)
+--   54000  agent_prefix_too_broad: more than 5000 candidates for an agent prefix
 CREATE FUNCTION sessions.search_session_directory(
   p_workspace_id text DEFAULT NULL,
   p_query text DEFAULT NULL,
@@ -303,6 +304,10 @@ DECLARE
   v_where text;
   v_order text;
   v_sql text;
+  v_candidates bigint;
+  v_enable_seqscan text;
+  v_enable_bitmapscan text;
+  v_enable_sort text;
 BEGIN
   -- Fail closed on the caller identity itself, whatever EXECUTE grants a later
   -- runner adds (e.g. GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions TO <app>):
@@ -390,6 +395,39 @@ BEGIN
        OR coalesce(p_no_project, false) OR p_user_id IS NOT NULL OR p_machine_id IS NOT NULL) THEN
     RAISE EXCEPTION USING ERRCODE = '0A000',
       MESSAGE = 'session search: unsupported combination: agent, project, no_project, user and machine filters need p_workspace_id';
+  END IF;
+
+  -- Agent prefix candidate budget: count the prefix's candidates in the tenant-scoped
+  -- agent index, stopping after 5001, before running the page. More than 5000 (the page of
+  -- 50 x the 100x row-amplification gate) is refused as agent_prefix_too_broad (54000)
+  -- instead of reading the whole tenant. A longer prefix or an exact agent is needed.
+  IF v_agent IS NOT NULL AND p_agent_match = 'prefix' THEN
+    -- The probe must be an ordered walk of the agent index whatever the planner's
+    -- estimate, so the bound holds by construction: no table scan, no bitmap that
+    -- materializes every match, no sort. Restored before the page query.
+    v_enable_seqscan := current_setting('enable_seqscan');
+    v_enable_bitmapscan := current_setting('enable_bitmapscan');
+    v_enable_sort := current_setting('enable_sort');
+    PERFORM set_config('enable_seqscan', 'off', true), set_config('enable_bitmapscan', 'off', true),
+            set_config('enable_sort', 'off', true);
+    EXECUTE 'SELECT count(*) FROM (SELECT 1 FROM sessions.session_directory AS d'
+      || ' WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL'
+      || ' AND d.agent_name_normalized IS NOT NULL'
+      || ' AND d.agent_name_normalized LIKE $3 ESCAPE ''\'''
+      -- text_pattern_ops order: only the tenant-scoped agent index supplies it, so the
+      -- probe walks that index and stops after 5001 entries (never a table scan).
+      || ' ORDER BY d.agent_name_normalized USING ~<~ LIMIT 5001) AS c'
+      INTO v_candidates
+      USING v_org, p_workspace_id,
+            replace(replace(replace(v_agent, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+    PERFORM set_config('enable_seqscan', v_enable_seqscan, true),
+            set_config('enable_bitmapscan', v_enable_bitmapscan, true),
+            set_config('enable_sort', v_enable_sort, true);
+    IF v_candidates > 5000 THEN
+      RAISE EXCEPTION USING ERRCODE = '54000',
+        MESSAGE = 'session search: agent_prefix_too_broad: more than 5000 sessions match this agent prefix',
+        HINT = 'Use a longer agent prefix, or p_agent_match => ''exact''.';
+    END IF;
   END IF;
 
   -- Statement. Membership filters drive from their ordered membership index, whose

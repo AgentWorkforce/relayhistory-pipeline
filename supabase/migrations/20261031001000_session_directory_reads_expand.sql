@@ -1,6 +1,7 @@
 -- G6 expand phase: claim-bound replacements for the last direct reads RelayHistory #226
--- makes (pointers on session_index, and the directory readiness marker). ADDITIVE ONLY:
--- it revokes nothing, adds no index and does not change sessions.search_session_directory.
+-- makes (pointers on session_index, and the directory readiness marker), and the
+-- resurrection fences of decision 0002. ADDITIVE ONLY: it revokes nothing, adds no index
+-- and does not change sessions.search_session_directory.
 --
 -- Expand/contract (docs/session-search-index-contract.md, "Direct surface: expand then
 -- contract"): this migration only adds the RPC capabilities. Direct grants are revoked in a
@@ -14,6 +15,51 @@
 --
 -- Code only; nothing here is applied by this repository. Down path:
 -- supabase/rollbacks/20261031001000_session_directory_reads_expand.down.sql.
+
+-- Resurrection fences (decision 0002: a deleted upload or pointer never comes back).
+-- When a logical row becomes a tombstone, record every pointer's highest revision at
+-- that moment. The projector may resurrect the row only for a live pointer whose revision
+-- is strictly above its machine's fence, or a machine with no pointer at tombstone time.
+-- Re-sent, stale or un-deleted pointer revisions stay fenced permanently. Fences are
+-- history: a later tombstone only raises them. Erasure deletes them with the row.
+CREATE TABLE sessions.session_directory_resurrection_fences (
+  org_id text NOT NULL,
+  workspace_id text NOT NULL,
+  harness text NOT NULL,
+  session_id text NOT NULL,
+  machine_id text NOT NULL,
+  revision bigint NOT NULL CHECK (revision >= 1),
+  fenced_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (org_id, workspace_id, harness, session_id, machine_id),
+  FOREIGN KEY (org_id, workspace_id, harness, session_id)
+    REFERENCES sessions.session_directory (org_id, workspace_id, harness, session_id)
+    ON DELETE CASCADE
+);
+ALTER TABLE sessions.session_directory_resurrection_fences ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_directory_resurrection_fences FROM PUBLIC, anon, authenticated;
+GRANT ALL ON sessions.session_directory_resurrection_fences TO service_role;
+
+CREATE FUNCTION sessions.session_directory_record_fences()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $fences$
+BEGIN
+  INSERT INTO sessions.session_directory_resurrection_fences AS f
+    (org_id, workspace_id, harness, session_id, machine_id, revision)
+  SELECT p.org_id, p.workspace_id, p.harness, p.session_id, p.machine_id, p.revision
+    FROM sessions.session_index AS p
+   WHERE p.org_id = NEW.org_id AND p.workspace_id = NEW.workspace_id
+     AND p.harness = NEW.harness AND p.session_id = NEW.session_id
+  ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id)
+  DO UPDATE SET revision = greatest(f.revision, excluded.revision), fenced_at = now();
+  RETURN NULL;
+END
+$fences$;
+
+CREATE TRIGGER session_directory_record_fences
+  AFTER INSERT OR UPDATE OF deleted_at ON sessions.session_directory
+  FOR EACH ROW WHEN (NEW.deleted_at IS NOT NULL)
+  EXECUTE FUNCTION sessions.session_directory_record_fences();
+REVOKE ALL ON FUNCTION sessions.session_directory_record_fences() FROM PUBLIC, anon, authenticated, service_role;
 
 -- The Worker's tenant from the signed claims, refusing everything else (42501). With a
 -- workspace, it must be one the claims list; without one, the claims must list at least

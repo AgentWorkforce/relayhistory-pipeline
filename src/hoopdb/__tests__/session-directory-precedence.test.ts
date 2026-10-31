@@ -230,40 +230,139 @@ describe("V1 projector precedence", () => {
     expect((await members(db, "machines")).map((m) => m.v)).toEqual(["m1"]);
   });
 
-  test("tombstone when no live pointer remains; resurrection when a later live pointer appears", async () => {
+  /** Tombstone the logical row by deleting every pointer, then return its fences. */
+  async function tombstoneAll(db: PGlite, machines: string[]) {
+    for (const m of machines) await tombstonePointer(db, m);
+    expect(await projectSessionDirectory(db, KEY)).toEqual({
+      projected: false,
+      tombstoned: true,
+    });
+    return (
+      await db.query<{ machine_id: string; revision: string }>(
+        `SELECT machine_id, revision::text FROM sessions.session_directory_resurrection_fences
+          WHERE session_id = 's' ORDER BY machine_id`,
+      )
+    ).rows.map((r) => [r.machine_id, Number(r.revision)]);
+  }
+
+  test("tombstone when no live pointer remains, recording each pointer's revision as a fence", async () => {
     const db = await database();
     await upsertPointer(db, {
       machine: "m1",
       user: "u1",
       created: "2026-10-01T10:00:00Z",
       last: "2026-10-01T12:00:00Z",
-      indexed: "2026-10-30T10:00:00Z",
+      revision: 4,
+    });
+    await upsertPointer(db, {
+      machine: "m2",
+      user: "u2",
+      created: "2026-10-01T10:00:00Z",
+      last: "2026-10-01T11:00:00Z",
+      revision: 2,
     });
     await projectSessionDirectory(db, KEY);
-    await tombstonePointer(db, "m1", "'2026-10-30T11:00:00Z'::timestamptz");
-    expect(await projectSessionDirectory(db, KEY)).toEqual({
-      projected: false,
-      tombstoned: true,
-    });
-    let current = (await row(db))!;
+    expect(await tombstoneAll(db, ["m1", "m2"])).toEqual([
+      ["m1", 4],
+      ["m2", 2],
+    ]);
+    const current = (await row(db))!;
     expect(current.deleted_at).not.toBeNull();
-    const tombstonedAt = (current.deleted_at as Date).getTime();
     expect([
       current.user_ids,
       current.machine_ids,
       current.search_text,
     ]).toEqual([[], [], ""]);
     expect(await members(db, "users")).toEqual([]);
+  });
 
-    // A later live pointer (indexed after the tombstone) brings the row back, keeping
-    // the historical created_at and holding no summary until one is written.
+  test("a deleted pointer never revives: un-deleting it at its fenced revision does not resurrect", async () => {
+    const db = await database();
     await upsertPointer(db, {
-      machine: "m3",
-      user: "u3",
-      created: "2026-10-31T09:00:00Z",
+      machine: "m1",
+      created: "2026-10-01T10:00:00Z",
+      last: "2026-10-01T12:00:00Z",
+      revision: 3,
+    });
+    await projectSessionDirectory(db, KEY);
+    await tombstoneAll(db, ["m1"]);
+    // The same pointer row cleared of its tombstone, even re-indexed later, is still revision 3.
+    await db.query(`UPDATE sessions.session_index SET deleted_at = NULL, indexed_at = now() + interval '1 hour'
+      WHERE session_id = 's' AND machine_id = 'm1'`);
+    expect(await projectSessionDirectory(db, KEY)).toEqual({
+      projected: false,
+      tombstoned: false,
+    });
+    expect((await row(db))!.deleted_at).not.toBeNull();
+  });
+
+  test("a stale or equal revision cannot revive", async () => {
+    const db = await database();
+    await upsertPointer(db, {
+      machine: "m1",
+      created: "2026-10-01T10:00:00Z",
+      last: "2026-10-01T12:00:00Z",
+      revision: 5,
+    });
+    await projectSessionDirectory(db, KEY);
+    await tombstoneAll(db, ["m1"]);
+    for (const revision of [4, 5]) {
+      await upsertPointer(db, {
+        machine: "m1",
+        created: "2026-10-01T10:00:00Z",
+        last: "2026-10-02T12:00:00Z",
+        revision,
+        indexed: "2099-01-01T00:00:00Z",
+      });
+      expect(
+        await projectSessionDirectory(db, KEY),
+        `revision ${revision}`,
+      ).toEqual({ projected: false, tombstoned: false });
+      expect(
+        (await row(db))!.deleted_at,
+        `revision ${revision}`,
+      ).not.toBeNull();
+    }
+  });
+
+  test("a new, strictly higher revision resurrects; so does a machine that had no pointer", async () => {
+    const db = await database();
+    await upsertPointer(db, {
+      machine: "m1",
+      user: "u1",
+      created: "2026-10-01T10:00:00Z",
+      last: "2026-10-01T12:00:00Z",
+      revision: 5,
+    });
+    await projectSessionDirectory(db, KEY);
+    await tombstoneAll(db, ["m1"]);
+    await upsertPointer(db, {
+      machine: "m1",
+      user: "u1",
+      created: "2026-10-01T10:00:00Z",
       last: "2026-10-31T09:30:00Z",
+      revision: 6,
       title: "back again",
-      indexed: new Date(tombstonedAt + 1000).toISOString(),
+    });
+    expect(await projectSessionDirectory(db, KEY)).toEqual({
+      projected: true,
+      tombstoned: false,
+    });
+    let current = (await row(db))!;
+    expect(current.deleted_at).toBeNull();
+    expect(current.title).toBe("back again");
+    expect(iso(current.created_at)).toBe("2026-10-01T10:00:00.000Z");
+    expect(current.short_summary).toBeNull();
+    expect((await members(db, "users")).map((m) => m.v)).toEqual(["u1"]);
+
+    // Tombstoned again: the fence rises to 6; then a machine with no fence comes back.
+    expect(await tombstoneAll(db, ["m1"])).toEqual([["m1", 6]]);
+    await upsertPointer(db, {
+      machine: "m9",
+      user: "u9",
+      created: "2026-11-01T09:00:00Z",
+      last: "2026-11-01T09:30:00Z",
+      revision: 1,
     });
     expect(await projectSessionDirectory(db, KEY)).toEqual({
       projected: true,
@@ -271,42 +370,28 @@ describe("V1 projector precedence", () => {
     });
     current = (await row(db))!;
     expect(current.deleted_at).toBeNull();
-    expect(current.title).toBe("back again");
+    expect(current.machine_ids).toEqual(["m9"]);
     expect(iso(current.created_at)).toBe("2026-10-01T10:00:00.000Z");
-    expect(current.short_summary).toBeNull();
-    expect(current.user_ids).toEqual(["u3"]);
-    expect((await members(db, "users")).map((m) => m.v)).toEqual(["u3"]);
   });
 
-  test("a live pointer indexed before the tombstone does not resurrect it", async () => {
+  test("erasure deletes the fences with the row", async () => {
     const db = await database();
     await upsertPointer(db, {
       machine: "m1",
       created: "2026-10-01T10:00:00Z",
       last: "2026-10-01T12:00:00Z",
-      indexed: "2026-10-30T10:00:00Z",
     });
     await projectSessionDirectory(db, KEY);
-    // The directory row is tombstoned directly at a time after the pointer's last write.
+    await tombstoneAll(db, ["m1"]);
     await db.query(
-      "UPDATE sessions.session_directory SET deleted_at = '2026-10-30T12:00:00Z' WHERE session_id = 's'",
+      "DELETE FROM sessions.session_directory WHERE session_id = 's'",
     );
-    expect(await projectSessionDirectory(db, KEY)).toEqual({
-      projected: false,
-      tombstoned: false,
-    });
-    expect(iso((await row(db))!.deleted_at)).toBe("2026-10-30T12:00:00.000Z");
-    // The same pointer re-indexed later does resurrect it.
-    await upsertPointer(db, {
-      machine: "m1",
-      created: "2026-10-01T10:00:00Z",
-      last: "2026-10-01T12:30:00Z",
-      indexed: "2026-10-30T13:00:00Z",
-    });
-    expect(await projectSessionDirectory(db, KEY)).toEqual({
-      projected: true,
-      tombstoned: false,
-    });
-    expect((await row(db))!.deleted_at).toBeNull();
+    expect(
+      (
+        await db.query(
+          "SELECT 1 FROM sessions.session_directory_resurrection_fences",
+        )
+      ).rows,
+    ).toEqual([]);
   });
 });

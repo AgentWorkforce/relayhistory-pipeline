@@ -9,8 +9,9 @@ import {
   SEARCH_INDEX_CATALOG_SQL,
   SESSION_DIRECTORY_LIST_COLUMNS,
   SESSION_DIRECTORY_QUERIES,
-  agentPrefixPattern,
-  agentPrefixRange,
+  AGENT_PREFIX_CANDIDATE_BUDGET,
+  AgentPrefixRequiresRpcError,
+  directAgentPrefix,
   auditSearchIndexes,
   type SearchIndexCatalogRow,
 } from "../search-index-contract.ts";
@@ -284,7 +285,7 @@ describe("session_directory query plans", () => {
     }
   });
 
-  test("uses the ordered agent index through authenticated RLS for exact and useful-prefix lookups", async () => {
+  test("uses the ordered agent index through authenticated RLS for exact lookups; prefixes need the RPC", async () => {
     const db = await database();
     await db.exec(`
       INSERT INTO sessions.session_directory
@@ -315,28 +316,16 @@ describe("session_directory query plans", () => {
         ),
       ).toBe(true);
 
-      const selective = agentPrefixRange("helm-99");
-      const prefix = walk(
-        await explain(db, SESSION_DIRECTORY_QUERIES.agentPrefix, [
-          "o",
-          "w",
-          selective.lower,
-          selective.upper,
-          selective.pattern,
-          50,
-        ]),
+      // Prefix is RPC-only: the direct surface refuses it before any SQL.
+      expect(() => directAgentPrefix("helm-99")).toThrow(
+        AgentPrefixRequiresRpcError,
       );
-      expect(
-        prefix.some(
-          (node) => node["Index Name"] === "session_directory_agent_recent_idx",
-        ),
-      ).toBe(true);
     } finally {
       await leaveAuthenticated(db);
     }
   });
 
-  test("keeps a deliberately broad three-character prefix within the row-amplification gate", async () => {
+  test("the RPC refuses a broad three-character prefix by its candidate budget instead of scanning", async () => {
     const db = await database();
     await db.exec(`
       INSERT INTO sessions.session_directory
@@ -350,32 +339,36 @@ describe("session_directory query plans", () => {
         FROM generate_series(1, 10000) AS n;
       ANALYZE sessions.session_directory;
     `);
-    await enterAuthenticated(db);
-    const broad = agentPrefixRange("age");
-    const nodes = await explain(db, SESSION_DIRECTORY_QUERIES.agentPrefix, [
-      "o",
-      "w",
-      broad.lower,
-      broad.upper,
-      broad.pattern,
-      AGENT_PREFIX_BENCHMARK_GATE.pageSize,
-    ])
-      .then(walk)
-      .finally(() => leaveAuthenticated(db));
-    const indexNode = nodes.find(
-      (node) =>
-        node["Index Name"] === "session_directory_agent_recent_idx" ||
-        node["Index Name"] === "session_directory_workspace_recent_idx" ||
-        node["Index Name"] === "session_directory_org_recent_idx",
+    const asWorker = async (agent: string) => {
+      await db.query("SELECT set_config('request.jwt.claims', $1, false)", [
+        JSON.stringify({
+          role: "session_directory_search_worker",
+          app_metadata: { org_id: "o", workspace_ids: ["w"] },
+        }),
+      ]);
+      await db.exec("SET ROLE session_directory_search_worker");
+      try {
+        return await db.query(
+          "SELECT * FROM sessions.search_session_directory(p_workspace_id => 'w', p_agent => $1, p_agent_match => 'prefix')",
+          [agent],
+        );
+      } finally {
+        await db.exec("RESET ROLE");
+      }
+    };
+    // 5,100 candidates exceed the 5,000 budget: a typed refusal, not a tenant scan.
+    const error = (await asWorker("age").then(
+      () => null,
+      (e: unknown) => e,
+    )) as { code?: string; message?: string } | null;
+    expect(error?.code).toBe("54000");
+    expect(error?.message).toMatch(/agent_prefix_too_broad/);
+    expect(AGENT_PREFIX_CANDIDATE_BUDGET).toBe(
+      AGENT_PREFIX_BENCHMARK_GATE.pageSize *
+        AGENT_PREFIX_BENCHMARK_GATE.maxIndexRowsExaminedPerResult,
     );
-    expect(indexNode).toBeDefined();
-    const returned = Number(nodes[0]?.["Actual Rows"] ?? 0);
-    const examined =
-      Number(indexNode?.["Actual Rows"] ?? Number.POSITIVE_INFINITY) +
-      Number(indexNode?.["Rows Removed by Filter"] ?? 0);
-    expect(returned).toBe(AGENT_PREFIX_BENCHMARK_GATE.pageSize);
-    expect(examined / returned).toBeLessThanOrEqual(
-      AGENT_PREFIX_BENCHMARK_GATE.maxIndexRowsExaminedPerResult,
-    );
+    // A longer prefix within the budget is served.
+    const served = await asWorker("age-51");
+    expect(served.rows.length).toBeGreaterThan(0);
   });
 });

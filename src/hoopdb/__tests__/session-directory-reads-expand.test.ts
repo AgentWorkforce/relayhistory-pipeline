@@ -279,11 +279,20 @@ describe("expand migration", () => {
     );
     expect(granted.rows[0]!.ok).toBe(true);
     const sql = UP.replace(/--[^\n]*/g, "");
-    expect(sql).not.toMatch(
-      /\bREVOKE\s+(SELECT|ALL)\s+ON\s+(TABLE\s+)?sessions\./i,
-    );
+    // Table revokes touch only the table this migration creates (its default lockdown).
+    expect(
+      [
+        ...sql.matchAll(
+          /\bREVOKE\s+(?:SELECT|ALL)\s+ON\s+(?:TABLE\s+)?(sessions\.\w+)/gi,
+        ),
+      ].map((r) => r[1]),
+    ).toEqual(["sessions.session_directory_resurrection_fences"]);
     expect(sql).not.toMatch(/\bCREATE\s+INDEX\b/i);
-    expect(sql).not.toMatch(/\b(ALTER|DROP)\b/i);
+    expect(sql).not.toMatch(/\bDROP\b/i);
+    // The only ALTER enables RLS on the table this migration creates.
+    expect(sql.match(/\bALTER\s+\w+\s+[\w.]+/gi)).toEqual([
+      "ALTER TABLE sessions.session_directory_resurrection_fences",
+    ]);
     expect(sql).not.toMatch(/search_session_directory/);
   });
 
