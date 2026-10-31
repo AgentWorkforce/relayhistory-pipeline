@@ -1,35 +1,33 @@
 /**
  * `96bulls plan|up|down aws-<stage>`: the gated AWS stage (stacks/aws/alchemy.aws.run.ts).
  *
- * The stack itself refuses, before declaring anything, unless the inputs carry
- * no placeholders, NINETY_SIX_BULLS_CONFIRM_ACCOUNT equals their account, the
- * live STS caller and provider region equal their account and region, and (up
- * and down) `clearedBy` holds Khaliq's dated words. This file adds the typed
- * stage confirmation and keeps destroy away from long-lived stages.
+ * The stack itself refuses, before declaring anything and whatever started it
+ * (stacks/aws/deploy-guard.ts): placeholders, account confirmation, live STS
+ * account/region, Khaliq's approval record for the exact operation, typed
+ * stage, and destroy of a long-lived stage. This wrapper checks the same typed
+ * confirmations early and binds `up` to a captured, verified plan.
  *
- *   plan  read only; fails closed on any error
- *   up    alchemy deploy;  needs NINETY_SIX_BULLS_CONFIRM_STAGE=<stage>
- *   down  alchemy destroy; needs NINETY_SIX_BULLS_CONFIRM_DESTROY=<stage>; refused
- *         for aws-sessions-dev and any *prod* stage (roll those back by reverting
- *         and running `up` again)
+ *   plan [--detailed] [--capture]   read only; --capture writes docs/plans/ with provenance
+ *   up    verifies docs/plans/<stage>.provenance.json, then alchemy deploy
+ *   down  alchemy destroy (refused for aws-sessions-dev and *prod*)
  */
-export const AWS_CONFIG = "stacks/aws/alchemy.aws.run.ts";
+import { NON_DESTROYABLE } from "../../stacks/aws/deploy-guard.ts";
 
-/** Stages whose state carries data or live users: never destroyed from the CLI. */
-export const NON_DESTROYABLE = (stage: string) => stage === "aws-sessions-dev" || /prod/.test(stage);
+export { NON_DESTROYABLE };
+export const AWS_CONFIG = "stacks/aws/alchemy.aws.run.ts";
 
 export interface AwsInvocation {
   args: string[];
   env: Record<string, string>;
 }
 
-export function awsInvocation(verb: "plan" | "up" | "down", stage: string, env: Record<string, string | undefined>): AwsInvocation {
+export function awsInvocation(verb: "plan" | "up" | "down", stage: string, env: Record<string, string | undefined>, flags: { detailed?: boolean } = {}): AwsInvocation {
   if (!/^aws-[a-z0-9-]+$/.test(stage)) throw new Error(`not an AWS stage: ${stage}`);
   if (!env.NINETY_SIX_BULLS_CONFIRM_ACCOUNT) throw new Error("set NINETY_SIX_BULLS_CONFIRM_ACCOUNT=<account id>; nothing was run");
   if (!env.AWS_REGION && !env.AWS_DEFAULT_REGION) throw new Error("set AWS_REGION explicitly (it must equal the inputs' region); nothing was run");
   const common = ["--config", AWS_CONFIG, "--stage", stage, "--no-input"];
   const childEnv = { ALCHEMY_PLAIN: "1" };
-  if (verb === "plan") return { args: ["alchemy", "plan", ...common], env: { ...childEnv, NINETY_SIX_BULLS_AWS_MODE: "plan" } };
+  if (verb === "plan") return { args: ["alchemy", "plan", ...common, ...(flags.detailed ? ["--detailed"] : [])], env: { ...childEnv, NINETY_SIX_BULLS_AWS_MODE: "plan" } };
   if (verb === "up") {
     if (env.NINETY_SIX_BULLS_CONFIRM_STAGE !== stage) throw new Error(`set NINETY_SIX_BULLS_CONFIRM_STAGE=${stage} to apply; nothing was run`);
     return { args: ["alchemy", "deploy", ...common, "--yes"], env: { ...childEnv, NINETY_SIX_BULLS_AWS_MODE: "deploy" } };

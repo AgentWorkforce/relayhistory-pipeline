@@ -98,6 +98,8 @@ export interface EksStageInputs {
   networkPolicyEnforcement?: boolean;
   /** "keep": keep the old shared pods role (unattached) until the per-SA roles are verified. */
   legacyPodsRole?: "keep";
+  /** Proof/sandbox teardown: buckets emptied and volumes deleted on destroy (alchemy.aws.run.ts gates it). */
+  purgeOnDestroy?: boolean;
   /** The Locker bucket ARN and its KMS key ARN, for the pods' Pod Identity role. */
   lockerBucketArn: string;
   lockerKmsKeyArn: string;
@@ -316,7 +318,7 @@ export const eksStage = (i: EksStageInputs) =>
 
     // Encrypted gp3 for every in-cluster volume (RelayAuth, HoopDb, Relaycast).
     const inClusterVolumes = Boolean(i.relayauth) || backend === "cnpg" || Boolean(i.relaycast) || sandbox;
-    if (inClusterVolumes) yield* Kubernetes.Manifest("storageclass-gp3", { cluster: cluster as never, manifest: storageClassManifest() });
+    if (inClusterVolumes) yield* Kubernetes.Manifest("storageclass-gp3", { cluster: cluster as never, manifest: storageClassManifest(i.purgeOnDestroy ? "Delete" : "Retain") });
 
     // Rollback window for the IAM split: the old shared role stays (attached to nothing) until the
     // per-SA roles are verified, and goes in a later, separate apply that drops `legacyPodsRole`.
@@ -387,6 +389,7 @@ export const eksStage = (i: EksStageInputs) =>
       ? yield* ingressStage({
           stage: i.stage,
           accountId: i.accountId,
+          ...(i.purgeOnDestroy ? { purgeOnDestroy: true } : {}),
           region: i.lockerRegion,
           cluster,
           hostname: i.ingress.hostname,

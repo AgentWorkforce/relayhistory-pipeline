@@ -302,10 +302,21 @@ function status(stage: string) {
   console.log(r.stdout || "(no containers)");
 }
 
-function aws(verb: "plan" | "up" | "down", stage: string) {
+async function aws(verb: "plan" | "up" | "down", stage: string) {
   let inv;
   try {
-    inv = awsInvocation(verb, stage, process.env);
+    inv = awsInvocation(verb, stage, process.env, { detailed: flags.has("--detailed") });
+    if (verb === "plan" && flags.has("--capture")) {
+      const { capturePlan } = await import("./aws-provenance-io.ts");
+      const rec = capturePlan(ROOT, stage, process.env);
+      console.log(`96bulls: captured ${rec.summary} for ${stage} at ${rec.source.commit} -> docs/plans/${stage}.provenance.json`);
+      return;
+    }
+    if (verb === "up") {
+      const { verifyCapturedPlan } = await import("./aws-provenance-io.ts");
+      const rec = verifyCapturedPlan(ROOT, stage);
+      console.log(`96bulls: captured plan verified (${rec.summary}, source ${rec.source.commit.slice(0, 12)}, state ${rec.state.digest.slice(0, 12)})`);
+    }
   } catch (err) {
     die((err as Error).message);
   }
@@ -314,7 +325,7 @@ function aws(verb: "plan" | "up" | "down", stage: string) {
 }
 
 async function main() {
-  if (stageArg?.startsWith("aws-") && (command === "plan" || command === "up" || command === "down")) return aws(command, stageArg);
+  if (stageArg?.startsWith("aws-") && (command === "plan" || command === "up" || command === "down")) return await aws(command, stageArg);
   switch (command) {
     case "up":
       return up(requireLocalStage(stageArg));

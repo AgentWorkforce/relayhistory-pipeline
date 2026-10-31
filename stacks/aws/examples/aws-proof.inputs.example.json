@@ -1,14 +1,27 @@
 {
-  "$comment": "Fresh isolated proof stage (cluster 96bulls-aws-proof) beside aws-sessions-dev in the same account. Copy to .96bulls/aws-proof/aws-inputs.json (gitignored) and replace every <...> value; the stage refuses any left. accountId is an input: for a fresh account (e.g. a Pippen sandbox) drop accountShared, set pippenSandbox and, without a publish there, eks.imageRepository. Nothing here is secret: Secrets are created out of band from 1Password (docs/aws-stage.md).",
+  "$comment": "Fresh isolated proof stage (cluster 96bulls-aws-proof) beside aws-sessions-dev in the same account. Copy to .96bulls/aws-proof/aws-inputs.json (gitignored) and fill every angle-bracket placeholder value; the stage refuses any that are left. Write the approval record before capturing the plan (bin/96bulls plan aws-proof --capture). accountId is an input: for a fresh account (e.g. a Pippen sandbox) drop accountShared, set pippenSandbox and, without a publish there, eks.imageRepository. Nothing here is secret: Secrets are created out of band from 1Password (docs/aws-stage.md).",
   "accountId": "500268966557",
   "region": "us-west-2",
-  "clearedBy": "<Khaliq's words, verbatim, with the date>",
+  "approval": {
+    "by": "Khaliq Gant",
+    "date": "<YYYY-MM-DD of the approval>",
+    "operations": [
+      "deploy"
+    ],
+    "stage": "aws-proof",
+    "accountId": "500268966557",
+    "region": "us-west-2",
+    "words": "<Khaliq's message, verbatim>"
+  },
   "budgetUsd": 300,
   "budgetEmail": "aws-budgets@agentrelay.com",
   "accountShared": {
     "ownerStage": "aws-sessions-dev"
   },
   "lockerNoncurrentVersionDays": 90,
+  "teardown": {
+    "purgeBucketsOnDestroy": true
+  },
   "eks": {
     "chartVersion": "0.3.0",
     "runtimeSecretName": "96bulls-runtime",
@@ -19,14 +32,13 @@
       "chartVersion": "0.1.0",
       "secretName": "relayauth"
     },
-    "imageDigest": "<sha256 digest publish-image-ecr pushed to 96bulls-services>",
-    "imageSourceRevision": "<40-hex commit that image was built from>",
+    "imageDigest": "sha256:c13b879a668984f905e30e38b05764ec712532e8395b256d416ba1602f6c6726",
+    "imageSourceRevision": "ffb7ef0f684a92c129bbf14c2da2066fbe6fe6b2",
     "apiAccess": {
       "publicAccessCidrs": [
         "<operator IP>/32"
       ]
     },
-    "networkPolicyEnforcement": false,
     "hoopdb": {
       "backend": "cnpg"
     },

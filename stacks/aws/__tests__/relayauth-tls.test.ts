@@ -43,6 +43,12 @@ describe("RelayAuth in-cluster TLS", () => {
     expect(spec.containers[0].image).toBe(`nginxinc/nginx-unprivileged:1.29.3-alpine@${TLS_PROXY_IMAGE.digest}`);
   });
 
+  it("records the cert-manager and proxy digests in versions.lock.json", () => {
+    const lock = JSON.parse(require("node:fs").readFileSync(new URL("../../../versions.lock.json", import.meta.url), "utf8")) as { images: Record<string, { digest: string }> };
+    for (const [k, d] of Object.entries(CERT_MANAGER_DIGESTS)) expect(lock.images[`cert-manager-${k}`]!.digest).toBe(d);
+    expect(lock.images["relayauth-tls-proxy"]!.digest).toBe(TLS_PROXY_IMAGE.digest);
+  });
+
   it("pins every cert-manager image by digest", () => {
     const v = certManagerValues();
     expect([v.image.digest, v.webhook.image.digest, v.cainjector.image.digest, v.acmesolver.image.digest]).toEqual(Object.values(CERT_MANAGER_DIGESTS));

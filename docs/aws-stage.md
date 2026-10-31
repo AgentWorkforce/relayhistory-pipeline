@@ -321,13 +321,22 @@ in-cluster traffic cannot reach the ingest around the WAF. (An `internal` ALB
 shares the private subnets with pods; that scheme cannot make this
 distinction.)
 
-Enforcement is a **separate, later apply**. Step 1 applies every policy while
-Auto Mode still ignores them (`eks.networkPolicyEnforcement` absent or false).
-Check them (`kubectl get networkpolicy -A`), then step 2 sets
-`eks.networkPolicyEnforcement: true`, which writes `kube-system/amazon-vpc-cni`
-`enable-network-policy-controller: "true"`. An interrupted step 1 therefore can
-never leave workloads behind a partial deny. Undo step 2 by setting it back to
-false and applying (or deleting that ConfigMap).
+Enforcement is a **separate, later apply**, and the stack enforces the order.
+Step 1 applies every policy while Auto Mode still ignores them
+(`eks.networkPolicyEnforcement` absent). Check them (`kubectl get networkpolicy
+-A`, the workloads still healthy), then step 2 sets a verification record:
+
+```json
+"networkPolicyEnforcement": { "policySetSha256": "<hash>", "verifiedBy": "<who checked>", "verifiedOn": "YYYY-MM-DD" }
+```
+
+The stack refuses step 2 (stacks/aws/preflight.ts) unless the hash names the
+exact current policy set (a wrong hash is refused with the right one in the
+message) **and** Alchemy state for the stage already holds every one of those
+policies as applied, with the same spec. A fresh stage, or a policy changed
+since step 1, cannot enable enforcement. Step 2 writes
+`kube-system/amazon-vpc-cni` `enable-network-policy-controller: "true"`; undo it
+by removing the record and applying (or deleting that ConfigMap).
 
 ### Ingest exposure (public contract)
 
@@ -455,27 +464,62 @@ the first apply, create its Secrets from 1Password as for sessions-dev
 
 ### Apply, verify and roll back
 
-Every AWS run goes through the CLI and fails closed. The stack refuses before
-declaring anything unless: no input holds a placeholder (`<...>`, TODO, ...);
-`NINETY_SIX_BULLS_CONFIRM_ACCOUNT` equals `accountId`; the live STS caller's
-account and the provider's region equal `accountId` and `region`; and, for
-`up`/`down`, `clearedBy` holds Khaliq's words with the date. Credentials stay in
-environment variables (exported from the SSO session), never on disk:
+The stack itself refuses, before declaring anything and whatever started it
+(`bin/96bulls` or a direct `alchemy` command; stacks/aws/deploy-guard.ts):
+
+- a placeholder anywhere in the inputs, `$comment` included;
+- `NINETY_SIX_BULLS_CONFIRM_ACCOUNT` other than `accountId`; a live STS caller
+  or provider region other than `accountId`/`region`;
+- for deploy and destroy, a missing or mismatched **approval record**:
+  `{ "by": "Khaliq Gant", "date": "YYYY-MM-DD", "operations": ["deploy"],
+  "stage", "accountId", "region", "words": "<his message verbatim>" }`. The
+  date must be a real calendar day, not in the future, at most 30 days old;
+  `operations`, `stage`, `accountId` and `region` must match exactly; `words`
+  that countermand ("do not", "hold", "wait", "not yet", ...) are refused. The
+  free-text `clearedBy` field is informational only;
+- deploy without `NINETY_SIX_BULLS_CONFIRM_STAGE=<stage>`; destroy without
+  `NINETY_SIX_BULLS_CONFIRM_DESTROY=<stage>`, and destroy of `aws-sessions-dev`
+  or any `*prod*` stage at all. The operation comes from Alchemy's own argv, so
+  a direct `alchemy destroy` cannot pass as a deploy;
+- (plan and deploy) a services image that is not an approved
+  `images.services-aws` entry in versions.lock.json (digest + source commit +
+  repository), or whose ECR tags do not include `sha-<imageSourceRevision>`; an
+  `accountShared.ownerStage` that does not own the account's ECR repository.
+
+Credentials stay in environment variables, exported from the SSO session:
 
 ```sh
 export AWS_REGION=us-west-2 NINETY_SIX_BULLS_CONFIRM_ACCOUNT=500268966557
 eval "$(aws configure export-credentials --profile sessions-dev --format env)"
-bin/96bulls plan aws-proof                                    # read only
+bin/96bulls plan aws-proof [--detailed]                       # read only
+bin/96bulls plan aws-proof --capture                          # writes docs/plans/aws-proof.*
 NINETY_SIX_BULLS_CONFIRM_STAGE=aws-proof bin/96bulls up aws-proof
-NINETY_SIX_BULLS_CONFIRM_DESTROY=aws-proof bin/96bulls down aws-proof   # rollback of a fresh stage
+NINETY_SIX_BULLS_CONFIRM_DESTROY=aws-proof bin/96bulls down aws-proof   # rollback of a proof stage
 ```
 
-`down` is refused for `aws-sessions-dev` and any `*prod*` stage: roll those
-back by reverting the change and running `up` again. Read-only plans for both
-stages are in `docs/plans/`.
+**Captured plans.** `plan --capture` writes the plan, the `--detailed` plan,
+sanitized inputs and `<stage>.provenance.json` to `docs/plans/`. The record
+holds the commit and a sha256 of the committed stack source (stacks, src,
+packages, supabase, package.json, bun.lock, versions.lock.json, tsconfig.json;
+capture refuses uncommitted changes there), the inputs file sha256, the
+stage's Alchemy state (object count and a digest of keys and ETags, read before
+and after planning), the STS caller, account and region, the alchemy, provider,
+bun, aws CLI and helm versions, and the sha256 of each plan file. Capture
+refuses if the Alchemy state bucket does not exist, because Alchemy would
+create it on first use; with the bucket present, planning only reads.
+`up` re-reads all of it and refuses unless every value still matches: a
+reviewed plan is what gets applied, or nothing. Write the approval record into
+the inputs before capturing (it is part of the inputs hash).
 
 Reversibility:
 
+- **Proof teardown.** `teardown.purgeBucketsOnDestroy` (proof and sandbox
+  stages only) sets `forceDestroy` on the Locker, trail and ALB-log buckets, so
+  `down` empties every version and delete marker and completes; it also makes
+  the StorageClass delete volumes with their claims. It must be applied before
+  the `down` (Alchemy reads it from the bucket's state). Without it a non-empty
+  bucket stops `down` with BucketNotEmpty, by design. Everything in a proof
+  stage is disposable; nothing is recoverable after `down`.
 - **IAM split.** With `eks.legacyPodsRole: "keep"` the old `…-pods` role stays,
   unattached and unchanged, while the associations move to the per-SA roles.
   Roll back by pointing the associations back
@@ -487,7 +531,12 @@ Reversibility:
   the proof stage sets it; sessions-dev does not.
 - **sessions-dev never moves to CNPG** (it would start on an empty database):
   the stack allows `eks.hoopdb.backend: "cnpg"` only on `aws-proof*` and
-  `aws-sandbox-*` stages.
+  `aws-sandbox-*` stages. `aws-sessions-dev` is never destroyed: roll it back by
+  reverting and running `up`.
+
+CI checks out the literal PR head commit (not the merge ref) and records it.
+A mutation check (`bun scripts/aws-hardening-mutations.ts`, also in CI) reverts
+each control in turn and requires a named test to fail with an assertion.
 
 ### aws-inputs.json additions (proof stage)
 
@@ -496,7 +545,6 @@ Reversibility:
   "imageDigest": "sha256:<digest publish-image-ecr pushed to this account>",
   "imageSourceRevision": "<40-hex commit it was built from>",
   "apiAccess": { "publicAccessCidrs": ["<operator IP>/32"] },
-  "networkPolicyEnforcement": false,
   "legacyPodsRole": "keep",
   "hoopdb": { "backend": "cnpg" },
   "sessionDirectory": { "enabled": false },

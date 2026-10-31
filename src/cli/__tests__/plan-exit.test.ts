@@ -25,7 +25,7 @@ describe("gcp plan exit", () => {
     expect(gcp).toContain("allowFail: false");
     expect(gcp).not.toContain("allowFail: true");
     // AWS: dispatched before the switch; the runner never sets allowFail.
-    expect(cli).toContain('if (stageArg?.startsWith("aws-") && (command === "plan" || command === "up" || command === "down")) return aws(command, stageArg);');
+    expect(cli).toContain('if (stageArg?.startsWith("aws-") && (command === "plan" || command === "up" || command === "down")) return await aws(command, stageArg);');
     const runner = cli.slice(cli.indexOf("function aws("), cli.indexOf("async function main()"));
     expect(runner).toContain("sh(\"bunx\", inv.args, { env: inv.env });");
     expect(runner).not.toContain("allowFail");

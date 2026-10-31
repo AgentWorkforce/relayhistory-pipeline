@@ -10,9 +10,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # Check out the literal PR head commit, not GitHub's synthetic merge ref, so a green
+      # run is evidence about the exact SHA under review.
       - uses: actions/checkout@v4
         with:
           submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED)" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2

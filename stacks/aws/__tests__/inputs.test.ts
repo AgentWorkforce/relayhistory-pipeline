@@ -1,15 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { sharedServicesRepository, validateAwsInputs, type AwsInputs } from "../inputs.ts";
+import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "../inputs.ts";
+
+const lock = JSON.parse(readFileSync(fileURLToPath(new URL("../../../versions.lock.json", import.meta.url)), "utf8")) as { images: { "services-aws": { approved: ApprovedServicesImage[] } } };
+const approved = lock.images["services-aws"].approved;
 
 const example = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-proof.inputs.example.json", import.meta.url)), "utf8")) as AwsInputs;
 const filled = (patch: (i: AwsInputs) => void = () => {}) => {
   const i = structuredClone(example);
-  i.clearedBy = "Khaliq Gant, 2026-10-30: approved applying stage A (aws-proof, create-only)";
+  i.approval = { ...i.approval!, date: "2026-10-30", words: "approved applying stage A (aws-proof, create-only)" };
   i.eks!.tenantOrgId = "org_aws_proof";
-  i.eks!.imageDigest = `sha256:${"c".repeat(64)}`;
-  i.eks!.imageSourceRevision = "d".repeat(40);
   i.eks!.apiAccess = { publicAccessCidrs: ["203.0.113.7/32"] };
   patch(i);
   return i;
@@ -17,7 +18,7 @@ const filled = (patch: (i: AwsInputs) => void = () => {}) => {
 
 describe("aws-proof: a fresh, fully hardened stage beside sessions-dev", () => {
   it("validates once the placeholders are filled, with every hardening default on", () => {
-    const r = validateAwsInputs("aws-proof", filled());
+    const r = validateAwsInputs("aws-proof", filled(), approved);
     expect(r.hoopdb).toBe("cnpg");
     expect(r.endpointAccess).toEqual({ endpointPrivateAccess: true, endpointPublicAccess: true, publicAccessCidrs: ["203.0.113.7/32"] });
     expect(example.eks!.relayauth).toBeDefined(); // RelayAuth with in-cluster TLS
@@ -26,8 +27,27 @@ describe("aws-proof: a fresh, fully hardened stage beside sessions-dev", () => {
   });
 
   it("refuses the example as committed: every <...> placeholder is named", () => {
-    expect(() => validateAwsInputs("aws-proof", example)).toThrow(/\$\.clearedBy, \$\.eks\.tenantOrgId, \$\.eks\.imageDigest, \$\.eks\.imageSourceRevision, \$\.eks\.apiAccess\.publicAccessCidrs\[0\]/);
-    expect(() => validateAwsInputs("aws-proof", filled((i) => (i.clearedBy = "<Khaliq's words, verbatim, with the date>")))).toThrow(/placeholder/);
+    expect(() => validateAwsInputs("aws-proof", example)).toThrow(/\$\.approval\.date, \$\.approval\.words, \$\.eks\.tenantOrgId, \$\.eks\.apiAccess\.publicAccessCidrs\[0\]/);
+    expect(() => validateAwsInputs("aws-proof", filled((i) => (i.$comment = "fill <this>")))).toThrow(/\$\.\$comment/);
+  });
+
+  it("pins the services image to an approved versions.lock.json entry (digest + source commit + repository)", () => {
+    expect(approved).toContainEqual(expect.objectContaining({ digest: example.eks!.imageDigest, sourceRevision: example.eks!.imageSourceRevision }));
+    expect(() => validateAwsInputs("aws-proof", filled((i) => (i.eks!.imageDigest = `sha256:${"c".repeat(64)}`)), approved)).toThrow(/not an approved services-aws entry/);
+    expect(() => validateAwsInputs("aws-proof", filled((i) => (i.eks!.imageSourceRevision = "d".repeat(40))), approved)).toThrow(/not an approved services-aws entry/);
+    expect(() => validateAwsInputs("aws-proof", filled((i) => (i.eks!.imageRepository = "111122223333.dkr.ecr.us-west-2.amazonaws.com/96bulls-services")), approved)).toThrow(/not an approved services-aws entry/);
+  });
+
+  it("allows bucket purge on destroy only for proof and sandbox stages", () => {
+    expect(example.teardown).toEqual({ purgeBucketsOnDestroy: true });
+    expect(() => validateAwsInputs("aws-sessions-dev", filled((i) => { i.eks!.hoopdb = { backend: "external" }; }), approved)).toThrow(/purgeBucketsOnDestroy is only for proof and sandbox/);
+    const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
+    expect(stack.match(/\.\.\.\(purge \? \{ forceDestroy: true \} : \{\}\)/g)).toHaveLength(2); // locker + trail
+    expect(readFileSync(fileURLToPath(new URL("../ingress.ts", import.meta.url)), "utf8")).toContain("...(i.purgeOnDestroy ? { forceDestroy: true } : {})");
+  });
+
+  it("refuses a boolean NetworkPolicy enforcement switch: phase 2 needs a verification record", () => {
+    expect(() => validateAwsInputs("aws-proof", filled((i) => ((i.eks as Record<string, unknown>).networkPolicyEnforcement = true)))).toThrow(/verification record, not a boolean/);
   });
 
   it("also fits a fresh Pippen sandbox account: own ECR/OIDC skipped, boundary and sweeper tag on", () => {
@@ -52,7 +72,7 @@ describe("aws-proof: a fresh, fully hardened stage beside sessions-dev", () => {
 
   it("is refused if it would expose the API to the internet or run CNPG on production", () => {
     expect(() => validateAwsInputs("aws-proof", filled((i) => (i.eks!.apiAccess = { publicAccessCidrs: ["0.0.0.0/0"] })))).toThrow(/broader than/);
-    expect(() => validateAwsInputs("aws-prod", filled())).toThrow(/Supabase/);
+    expect(() => validateAwsInputs("aws-prod", filled((i) => delete i.teardown))).toThrow(/Supabase/);
     expect(() => validateAwsInputs("aws-proof", filled((i) => (i.eks!.relayauthIssuer = "https://relayauth.dev")))).toThrow(/both set/);
   });
 

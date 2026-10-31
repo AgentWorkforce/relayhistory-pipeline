@@ -230,3 +230,12 @@ describe("session directory PostgREST slot (#73)", () => {
     expect(JSON.stringify(without.find((p) => p.metadata.name === "allow-hoopdb-from-apps"))).not.toContain("postgrest");
   });
 });
+
+describe("proof teardown leaves nothing behind", () => {
+  it("deletes volumes only when a proof stage asks for it; Retain stays the default", () => {
+    expect(storageClassManifest().reclaimPolicy).toBe("Retain");
+    expect(storageClassManifest("Delete").reclaimPolicy).toBe("Delete");
+    const eks = readFileSync(fileURLToPath(new URL("../eks.ts", import.meta.url)), "utf8");
+    expect(eks).toContain('storageClassManifest(i.purgeOnDestroy ? "Delete" : "Retain")');
+  });
+});

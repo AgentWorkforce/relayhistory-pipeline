@@ -25,6 +25,8 @@ export interface IngressInputs {
   stage: string;
   /** For the access-log bucket name and its delivery policy. */
   accountId: string;
+  /** Proof/sandbox teardown: destroy empties the access-log bucket. */
+  purgeOnDestroy?: boolean;
   /** The ALB's region: ACM certificates attach only to load balancers in their own region. */
   region: string;
   cluster: unknown;
@@ -67,6 +69,7 @@ export const ingressStage = (i: IngressInputs) =>
     const logBucketArn = `arn:aws:s3:::${logBucketName}`;
     const albLogs = yield* AWS.S3.Bucket("alb-logs", {
       bucketName: logBucketName,
+      ...(i.purgeOnDestroy ? { forceDestroy: true } : {}),
       versioning: "Enabled",
       encryption: { sseAlgorithm: "AES256" },
       publicAccessBlock: { blockPublicAcls: true, ignorePublicAcls: true, blockPublicPolicy: true, restrictPublicBuckets: true },

@@ -15,7 +15,8 @@ import { relayauthTlsNetworkPolicies } from "./relayauth-tls.ts";
 /** Encrypted gp3 (EBS, AWS-managed KMS key). Shared by RelayAuth, HoopDb and Relaycast. */
 export const STORAGE_CLASS = "96bulls-gp3";
 
-export function storageClassManifest() {
+/** Retain everywhere except proof/sandbox teardown, where a destroyed stage leaves no volumes behind. */
+export function storageClassManifest(reclaimPolicy: "Retain" | "Delete" = "Retain") {
   return {
     apiVersion: "storage.k8s.io/v1",
     kind: "StorageClass",
@@ -23,7 +24,7 @@ export function storageClassManifest() {
     provisioner: "ebs.csi.eks.amazonaws.com",
     volumeBindingMode: "WaitForFirstConsumer",
     allowVolumeExpansion: true,
-    reclaimPolicy: "Retain",
+    reclaimPolicy,
     parameters: { type: "gp3", encrypted: "true" },
   };
 }

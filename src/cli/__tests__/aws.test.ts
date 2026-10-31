@@ -32,3 +32,15 @@ describe("96bulls plan|up|down aws-*", () => {
     expect(() => awsInvocation("plan", "aws-proof", { NINETY_SIX_BULLS_CONFIRM_ACCOUNT: "500268966557" })).toThrow(/AWS_REGION/);
   });
 });
+
+describe("plan --detailed", () => {
+  test("is forwarded to alchemy plan (the documented detailed command really runs)", () => {
+    expect(awsInvocation("plan", "aws-proof", base, { detailed: true }).args).toEqual(["alchemy", "plan", "--config", "stacks/aws/alchemy.aws.run.ts", "--stage", "aws-proof", "--no-input", "--detailed"]);
+  });
+  test("up verifies the captured plan before deploying", () => {
+    const cli = require("node:fs").readFileSync(new URL("../main.ts", import.meta.url), "utf8") as string;
+    const runner = cli.slice(cli.indexOf("async function aws("), cli.indexOf("async function main()"));
+    expect(runner.indexOf("verifyCapturedPlan(ROOT, stage)")).toBeGreaterThan(0);
+    expect(runner.indexOf("verifyCapturedPlan(ROOT, stage)")).toBeLessThan(runner.indexOf('sh("bunx", inv.args'));
+  });
+});

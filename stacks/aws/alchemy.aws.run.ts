@@ -30,8 +30,12 @@ import { fileURLToPath } from "node:url";
 import { SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
 import { eksStage } from "./eks.ts";
 import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy } from "./hardening.ts";
-import { sharedServicesRepository, validateAwsInputs, type AwsInputs } from "./inputs.ts";
-import { assertAwsDeploymentTarget, assertClearance, awsMode } from "./deploy-guard.ts";
+import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "./inputs.ts";
+import { assertAwsDeploymentTarget, assertClearance, awsMode, type AwsMode } from "./deploy-guard.ts";
+import { alchemyStateBucket, alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
+import { networkPolicies } from "./proof-addons.ts";
+import { hoopdbBackend } from "./hardening.ts";
+import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -44,7 +48,7 @@ const REPO = "AgentWorkforce/96BullSessions";
 const OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/96BullSessions@1437714333";
 
 /** Written by hand (not by the CLI) once Khaliq clears the account: see docs/aws-stage.md and stacks/aws/inputs.ts. */
-function readInputs(stage: string): AwsInputs {
+function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
   const path = join(ROOT, ".96bulls", stage, "aws-inputs.json");
   let inputs: AwsInputs;
   try {
@@ -52,11 +56,14 @@ function readInputs(stage: string): AwsInputs {
   } catch {
     throw new Error(`96bulls: the AWS stage ${stage} is not cleared: ${path} does not exist (see docs/aws-stage.md). Nothing was created.`);
   }
-  // Placeholders anywhere, the typed account confirmation, and (deploy/destroy) Khaliq's dated clearance.
-  assertClearance(awsMode(process.env), inputs, process.env);
+  // The operation comes from Alchemy's own argv, so a direct `alchemy destroy` is gated too.
+  const mode = awsMode(process.env, process.argv);
+  // Placeholders anywhere, the typed account (and stage), Khaliq's approval record, destroyable stage.
+  assertClearance(mode, stage, inputs, process.env);
   assertRegion(inputs.region);
-  validateAwsInputs(stage, inputs);
-  return inputs;
+  const lock = JSON.parse(readFileSync(join(ROOT, "versions.lock.json"), "utf8")) as { images: { "services-aws"?: { approved: ApprovedServicesImage[] } } };
+  validateAwsInputs(stage, inputs, lock.images["services-aws"]?.approved ?? []);
+  return { ...inputs, mode };
 }
 
 /** Pippen Tools' sweeper deletes what carries `pippen:sandbox=true` (pippen-tools docs/architecture.md). */
@@ -80,6 +87,33 @@ export default Alchemy.Stack(
     const liveCredentials = yield* awsEnvironment.credentials.pipe(Effect.orDie);
     const callerAccountId = yield* getAccountId(liveCredentials as never).pipe(Effect.orDie);
     assertAwsDeploymentTarget({ accountId: inputs.accountId, region: inputs.region }, { accountId: callerAccountId as string, region: awsEnvironment.region as string });
+    // Read-only AWS checks with the same exported credentials (preflight.ts). Skipped on destroy:
+    // tearing down must not depend on the image or the policy phase still being valid.
+    if (inputs.mode !== "destroy") {
+      const aws = awsCliRunner((cmd, args) => spawnSync(cmd, args, { encoding: "utf8", env: process.env }));
+      if (inputs.eks)
+        verifyServicesImage(aws, {
+          repositoryUri: inputs.eks.imageRepository ?? sharedServicesRepository(inputs.accountId, inputs.region),
+          imageDigest: inputs.eks.imageDigest,
+          imageSourceRevision: inputs.eks.imageSourceRevision,
+        });
+      if (inputs.accountShared) verifyAccountOwner(aws, { accountId: inputs.accountId, region: inputs.region, ownerStage: inputs.accountShared.ownerStage });
+      if (inputs.eks?.networkPolicyEnforcement)
+        verifyNetworkPolicyPhase(aws, {
+          stateBucket: alchemyStateBucket(inputs.accountId, inputs.region),
+          statePrefix: alchemyStatePrefix(stage),
+          region: inputs.region,
+          policies: networkPolicies({
+            hoopdb: hoopdbBackend(stage, inputs.eks.hoopdb?.backend),
+            relayauth: Boolean(inputs.eks.relayauth),
+            relaycast: Boolean(inputs.eks.relaycast),
+            sessionDirectory: Boolean(inputs.eks.sessionDirectory?.enabled),
+            ingestScheme: inputs.eks.ingress?.scheme ?? "internet-facing",
+          }),
+          record: inputs.eks.networkPolicyEnforcement,
+        });
+    }
+    const purge = inputs.teardown?.purgeBucketsOnDestroy === true;
     const name = (base: string) => `96bulls-${stage}-${base}`;
 
     // Account baseline: one KMS key for everything we store.
@@ -94,6 +128,8 @@ export default Alchemy.Stack(
     // Locker: S3 behind the adapter. Versioned, encrypted, never public.
     const locker = yield* AWS.S3.Bucket("locker", {
       bucketName: `${name("locker")}-${inputs.accountId}`,
+      // Proof/sandbox stages with teardown.purgeBucketsOnDestroy only: destroy empties every version.
+      ...(purge ? { forceDestroy: true } : {}),
       versioning: "Enabled",
       encryption: { sseAlgorithm: "aws:kms", kmsMasterKeyId: key.keyArn, bucketKeyEnabled: true },
       publicAccessBlock: { blockPublicAcls: true, ignorePublicAcls: true, blockPublicPolicy: true, restrictPublicBuckets: true },
@@ -115,6 +151,7 @@ export default Alchemy.Stack(
     yield* AWS.KMS.Alias("trail-key-alias", { aliasName: `alias/${name("trail")}`, targetKeyId: trailKey.keyId });
     const trailBucket = yield* AWS.S3.Bucket("trail-logs", {
       bucketName: `${name("trail")}-${inputs.accountId}`,
+      ...(purge ? { forceDestroy: true } : {}),
       versioning: "Enabled",
       encryption: { sseAlgorithm: "aws:kms", kmsMasterKeyId: trailKey.keyArn, bucketKeyEnabled: true },
       publicAccessBlock: { blockPublicAcls: true, ignorePublicAcls: true, blockPublicPolicy: true, restrictPublicBuckets: true },
@@ -216,6 +253,7 @@ export default Alchemy.Stack(
           ...(inputs.eks.relayauth ? { relayauth: inputs.eks.relayauth } : {}),
           imageRepository: inputs.eks.imageRepository ?? (ecr ? (ecr.repositoryUri as unknown as string) : sharedServicesRepository(inputs.accountId, inputs.region)),
           ...(inputs.eks.networkPolicyEnforcement ? { networkPolicyEnforcement: true } : {}),
+          ...(purge ? { purgeOnDestroy: true } : {}),
           ...(inputs.eks.legacyPodsRole ? { legacyPodsRole: inputs.eks.legacyPodsRole } : {}),
           imageDigest: inputs.eks.imageDigest,
           imageSourceRevision: inputs.eks.imageSourceRevision,

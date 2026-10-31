@@ -45,6 +45,42 @@
       "ref": "ghcr.io/agentworkforce/relaycast-self-host",
       "digest": "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
       "note": "Relaycast 8.0.0, pinned by helm-charts relaycast 0.1.0 values.yaml; the AWS stage takes chartVersion + imageDigest as inputs so 0.2.0 slots in"
+    },
+    "services-aws": {
+      "note": "Services images an AWS stage may run (stacks/aws/inputs.ts): eks.imageDigest + eks.imageSourceRevision must equal one entry, and at plan/deploy the stack checks ECR tags the digest sha-<sourceRevision>. Add an entry in a reviewed commit when publish-image-ecr pushes a new image.",
+      "approved": [
+        {
+          "repository": "500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services",
+          "digest": "sha256:c13b879a668984f905e30e38b05764ec712532e8395b256d416ba1602f6c6726",
+          "sourceRevision": "ffb7ef0f684a92c129bbf14c2da2066fbe6fe6b2",
+          "note": "running in aws-sessions-dev; ECR tag sha-ffb7ef0f684a92c129bbf14c2da2066fbe6fe6b2, pushed 2026-10-29"
+        }
+      ]
+    },
+    "cert-manager-controller": {
+      "ref": "quay.io/jetstack/cert-manager-controller:v1.21.3",
+      "digest": "sha256:9f4f96a33c7774cef24466fcd85031997531a03a8d117f151126baa8d1290dcc",
+      "note": "stacks/aws/relayauth-tls.ts CERT_MANAGER_DIGESTS; resolved from quay.io on 2026-10-30"
+    },
+    "cert-manager-webhook": {
+      "ref": "quay.io/jetstack/cert-manager-webhook:v1.21.3",
+      "digest": "sha256:055ac8e9de6a0ba6763794838fe38944acc650f68ebe1b01dd8be079e580f458",
+      "note": "stacks/aws/relayauth-tls.ts CERT_MANAGER_DIGESTS; resolved from quay.io on 2026-10-30"
+    },
+    "cert-manager-cainjector": {
+      "ref": "quay.io/jetstack/cert-manager-cainjector:v1.21.3",
+      "digest": "sha256:083d0e906f8eb44e255fe4ff817ae54e49f9ed82e22f1011bb4e9e4f4b8a641f",
+      "note": "stacks/aws/relayauth-tls.ts CERT_MANAGER_DIGESTS; resolved from quay.io on 2026-10-30"
+    },
+    "cert-manager-acmesolver": {
+      "ref": "quay.io/jetstack/cert-manager-acmesolver:v1.21.3",
+      "digest": "sha256:c8c1225bb2fe8ab37a330b77f0d8c2ee6a41210fcb54fc07ca606ab9a022b8b7",
+      "note": "stacks/aws/relayauth-tls.ts CERT_MANAGER_DIGESTS; resolved from quay.io on 2026-10-30"
+    },
+    "relayauth-tls-proxy": {
+      "ref": "nginxinc/nginx-unprivileged:1.29.3-alpine",
+      "digest": "sha256:5aea7cc516b419e3526f47dd1531be31a56a046cfe44754d94f9383e13e2ee99",
+      "note": "stacks/aws/relayauth-tls.ts TLS_PROXY_IMAGE; resolved from Docker Hub on 2026-10-30"
     }
   },
   "vendored": {
