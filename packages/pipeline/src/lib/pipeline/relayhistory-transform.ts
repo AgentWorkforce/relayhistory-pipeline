@@ -651,7 +651,10 @@ async function isPlannedEntry(
   if (migration.base_revision !== undefined) {
     if (manifest.revision !== migration.base_revision + 1) return false;
     const backfill = await backfillEntryFor(tenancy, location, manifest);
-    return !!backfill && (await planEntryV2Sha256(backfill)) === migration.entry_sha256;
+    return (
+      !!backfill &&
+      (await planEntryV2Sha256(backfill)) === migration.entry_sha256
+    );
   }
   const entry = await planEntryFor(tenancy, location, manifest);
   return !!entry && (await planEntrySha256(entry)) === migration.entry_sha256;

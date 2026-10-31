@@ -88,7 +88,9 @@ function migrationClassOf(
   claims: Record<string, unknown>,
 ): MigrationClassDef | null | undefined {
   const tokenClass = metaOf(claims)?.tokenClass;
-  const bySub = [UPLOAD_CLASS, BASE_READ_CLASS].find((c) => c.sub === claims.sub);
+  const bySub = [UPLOAD_CLASS, BASE_READ_CLASS].find(
+    (c) => c.sub === claims.sub,
+  );
   const byClass = [UPLOAD_CLASS, BASE_READ_CLASS].find(
     (c) => c.tokenClass === tokenClass,
   );
@@ -282,7 +284,10 @@ async function importVerificationKey(
   let jwk = jwks.keys?.find((candidate) => candidate.kid === kid);
   // 96BullSessions change: a kid we have not seen may be a rotated key. Refetch
   // the set once (rate-limited per URL) instead of rejecting until restart.
-  if (!jwk && Date.now() - (jwksFetchedAt.get(jwksUrl) ?? 0) > JWKS_REFRESH_MIN_MS) {
+  if (
+    !jwk &&
+    Date.now() - (jwksFetchedAt.get(jwksUrl) ?? 0) > JWKS_REFRESH_MIN_MS
+  ) {
     jwksCache.delete(jwksUrl);
     jwks = await getJwks(jwksUrl);
     jwk = jwks.keys?.find((candidate) => candidate.kid === kid);
@@ -449,7 +454,9 @@ export function isMigrationAssertionClass(
   claims: Record<string, unknown>,
 ): boolean {
   const c = migrationClassOf(claims);
-  return !!c && claims.sub === c.sub && metaOf(claims)?.tokenClass === c.tokenClass;
+  return (
+    !!c && claims.sub === c.sub && metaOf(claims)?.tokenClass === c.tokenClass
+  );
 }
 
 /**
@@ -509,7 +516,8 @@ function migrationAssertionClaims(
     typeof jti !== "string" ||
     !MIGRATION_ID_SHAPE.test(jti) ||
     // Separate jti namespaces: only a base-read capability starts with mbr_.
-    jti.startsWith(MIGRATION_BASE_READ_JTI_PREFIX) !== (def!.kind === "base_read")
+    jti.startsWith(MIGRATION_BASE_READ_JTI_PREFIX) !==
+      (def!.kind === "base_read")
   ) {
     refuse("jti is malformed");
   }

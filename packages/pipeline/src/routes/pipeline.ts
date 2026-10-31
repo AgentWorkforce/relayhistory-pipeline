@@ -245,7 +245,9 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
         "This deployment does not accept backfill-epoch (v2) migration assertions",
       );
     // A base-read capability reaches only the base read, and nothing else does.
-    if (!migrationKindAllowsRoute(auth.migration.upload, c.req.method, c.req.path))
+    if (
+      !migrationKindAllowsRoute(auth.migration.upload, c.req.method, c.req.path)
+    )
       return error(
         c,
         403,

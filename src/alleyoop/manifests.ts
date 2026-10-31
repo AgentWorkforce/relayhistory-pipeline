@@ -44,7 +44,8 @@ import {
 import { enrichMessage } from "../shared/enrich.ts";
 import { createHash } from "node:crypto";
 
-const sha256Hex = async (text: string) => createHash("sha256").update(text).digest("hex");
+const sha256Hex = async (text: string) =>
+  createHash("sha256").update(text).digest("hex");
 
 /**
  * The ingest's migration ledger over HoopDb: `sessions.migration_assertion_uses`
@@ -579,7 +580,10 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       return workspaceForbidden(c);
     // v1: the whole session must be the signed entry. v2 (a backfill epoch)
     // is checked against the stored base once it has been read (POST).
-    if (!isBackfillIdentity(auth.migration!.upload) && !(await migrationUploadMatches(auth, location, manifest)))
+    if (
+      !isBackfillIdentity(auth.migration!.upload) &&
+      !(await migrationUploadMatches(auth, location, manifest))
+    )
       return uploadForbidden(c);
     // 96bulls.user_id (the session's user downstream) must be the signed source user.
     if (migrationManifestProvenance(auth, manifest)) return uploadForbidden(c);
@@ -735,9 +739,18 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       // A v2 (backfill) assertion appends exactly one signed backfill epoch
       // to exactly the signed live base; #42's owner fence below still runs.
       if (migration && isBackfillIdentity(migration.upload)) {
-        if (await migrationBackfillIssue(auth, location, existing, manifest)) return uploadForbidden(c);
-        if (!existing || !sameVersion(existing.version, version(body.previousVersion)))
-          return responseError(c, 409, "revision_conflict", "manifest version or writer does not match");
+        if (await migrationBackfillIssue(auth, location, existing, manifest))
+          return uploadForbidden(c);
+        if (
+          !existing ||
+          !sameVersion(existing.version, version(body.previousVersion))
+        )
+          return responseError(
+            c,
+            409,
+            "revision_conflict",
+            "manifest version or writer does not match",
+          );
       }
       let storedVersion: ObjectVersion;
       if (!existing) {
@@ -822,8 +835,11 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         );
         if (issue) return issue;
         // v2: the stored copy is the appended manifest just written.
-        if (isBackfillIdentity(migration.upload) &&
-          (read.manifest.revision !== manifest.revision || read.manifest.raw.content_sha256 !== manifest.raw.content_sha256))
+        if (
+          isBackfillIdentity(migration.upload) &&
+          (read.manifest.revision !== manifest.revision ||
+            read.manifest.raw.content_sha256 !== manifest.raw.content_sha256)
+        )
           return uploadForbidden(c);
       }
       const built = buildObjectLandedMessage({
@@ -846,7 +862,9 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         (built.message.payload as ObjectLandedPayload).migration = {
           key: migration.upload.key,
           entry_sha256: migration.upload.entry_sha256,
-          ...(isBackfillIdentity(migration.upload) ? { base_revision: migration.upload.base.revision } : {}),
+          ...(isBackfillIdentity(migration.upload)
+            ? { base_revision: migration.upload.base.revision }
+            : {}),
         };
       }
       if (migration) {
@@ -926,11 +944,21 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     const auth = c.get("auth") as Auth;
     const migration = auth?.migration;
     if (!migration || !isBaseReadIdentity(migration.upload))
-      return responseError(c, 403, "migration_token_class_forbidden", "only a migration base-read capability may read a base");
+      return responseError(
+        c,
+        403,
+        "migration_token_class_forbidden",
+        "only a migration base-read capability may read a base",
+      );
     const read = migration.upload;
     const params = [...new URL(c.req.url).searchParams.keys()];
     if (params.length !== 1 || params[0] !== "key")
-      return responseError(c, 400, "bad_request", "exactly one query parameter, key, is allowed");
+      return responseError(
+        c,
+        400,
+        "bad_request",
+        "exactly one query parameter, key, is allowed",
+      );
     if (c.req.query("key") !== read.key) return uploadForbidden(c);
     const ledger = deps.migrationLedger;
     if (!ledger) return ledgerUnavailable(c);
@@ -938,7 +966,8 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     if (!migrationGrantAllowed(env, migration)) return grantForbidden(c);
     const key = storageKey(c, read.key);
     const location = parseSessionKey(key);
-    if (!location || location.rest !== "manifest.json") return uploadForbidden(c);
+    if (!location || location.rest !== "manifest.json")
+      return uploadForbidden(c);
     if (!migrationSessionMatches(auth, location)) return uploadForbidden(c);
     const owned = await owns(c, location, "rth:migration_base_read");
     if (owned !== true) return owned;
@@ -946,9 +975,15 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     try {
       snapshot = await storedManifest(deps.raw, key);
     } catch {
-      return responseError(c, 503, "storage_unavailable", "Object storage is temporarily unavailable");
+      return responseError(
+        c,
+        503,
+        "storage_unavailable",
+        "Object storage is temporarily unavailable",
+      );
     }
-    if (!snapshot) return responseError(c, 404, "not_found", "no live manifest at this key");
+    if (!snapshot)
+      return responseError(c, 404, "not_found", "no live manifest at this key");
     const session = snapshot.manifest.session;
     if (
       session.machine_id !== read.session.machine_id ||
@@ -1005,7 +1040,14 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       // session, grant and tenancy are already its own; the base has no
       // export marker yet).
       if (auth.migration && isBackfillIdentity(auth.migration.upload)) {
-        if (!migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId, stored.manifest.session.workspace_id] }))
+        if (
+          !migrationPairAuthorized(auth, {
+            workspaceIds: [
+              location.workspaceId,
+              stored.manifest.session.workspace_id,
+            ],
+          })
+        )
           return workspaceForbidden(c);
       } else if (auth.migration) {
         const issue = await migrationManifestIssue(

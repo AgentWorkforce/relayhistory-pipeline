@@ -17,7 +17,8 @@
 import type { Context } from "hono";
 
 // RelayAuth defaults, as upstream env.ts declares them (needed by auth/relayauth.ts).
-export const DEFAULT_RELAYAUTH_JWKS_URL = "https://relayauth.dev/.well-known/jwks.json";
+export const DEFAULT_RELAYAUTH_JWKS_URL =
+  "https://relayauth.dev/.well-known/jwks.json";
 export const DEFAULT_RELAYAUTH_ISSUER = "https://relayauth.dev";
 export const DEFAULT_RELAYAUTH_AUDIENCE = "relayhistory";
 

@@ -15,17 +15,17 @@ v2 splits the identity into two parts:
 
 ## The v2 plan entry (stored under the plan's `backfills`)
 
-| field | value |
-|---|---|
-| `v` | integer `2` |
-| `kind` | `"backfill"` |
-| `grant_id`, `org_id`, `workspace_id`, `source_user_id` | as in v1 (canonical ids, no `relay_` prefix) |
-| `key` | the live session's v1 manifest key, without any deployment prefix |
-| `session` | `{machine_id, harness, session_id, started_at}` of the live session |
-| `format` | `"ndjson"` (a backfill epoch needs an ndjson stream, #46) |
-| `chunks` | `[{start_offset, bytes, sha256, records}]`: `sha256` is the SHA-256 of the chunk's **source** bytes; `start_offset` runs contiguously from 0; 1 to 4096 chunks; **`records` is mandatory** (#46's optional `records` must be filled in before planning; a manifest chunk without it is refused at commit); safe-integer bounds as in the issuer spec |
-| `backfill_sha256` | #46's `backfillDigest`: the manifest v1 content hash chain over `chunks` with every `epoch` set to 0 |
-| `raw_bytes` | the sum of `chunks[].bytes`, which equals the end offset |
+| field                                                  | value                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `v`                                                    | integer `2`                                                                                                                                                                                                                                                                                                                                          |
+| `kind`                                                 | `"backfill"`                                                                                                                                                                                                                                                                                                                                         |
+| `grant_id`, `org_id`, `workspace_id`, `source_user_id` | as in v1 (canonical ids, no `relay_` prefix)                                                                                                                                                                                                                                                                                                         |
+| `key`                                                  | the live session's v1 manifest key, without any deployment prefix                                                                                                                                                                                                                                                                                    |
+| `session`                                              | `{machine_id, harness, session_id, started_at}` of the live session                                                                                                                                                                                                                                                                                  |
+| `format`                                               | `"ndjson"` (a backfill epoch needs an ndjson stream, #46)                                                                                                                                                                                                                                                                                            |
+| `chunks`                                               | `[{start_offset, bytes, sha256, records}]`: `sha256` is the SHA-256 of the chunk's **source** bytes; `start_offset` runs contiguously from 0; 1 to 4096 chunks; **`records` is mandatory** (#46's optional `records` must be filled in before planning; a manifest chunk without it is refused at commit); safe-integer bounds as in the issuer spec |
+| `backfill_sha256`                                      | #46's `backfillDigest`: the manifest v1 content hash chain over `chunks` with every `epoch` set to 0                                                                                                                                                                                                                                                 |
+| `raw_bytes`                                            | the sum of `chunks[].bytes`, which equals the end offset                                                                                                                                                                                                                                                                                             |
 
 - **`entry_sha256`** = lowercase hex `SHA-256(canonical(entry))`, with the same canonical JSON as v1.
 
@@ -47,19 +47,19 @@ v2 splits the identity into two parts:
 
 The `base` fields describe the stored live manifest at mint time:
 
-| `base` field | meaning |
-|---|---|
-| `revision` | its `revision` (1 or more); the backfill commits `revision + 1` |
-| `version` | its object version id, or else its ETag exactly as the store returns it; the commit's compare-and-swap version |
-| `owner` | its `raw.owner`, the live owner, which must not start with `migration:` and is unchanged by the append |
-| `writer` | its `writer.delivery_instance_id`, unchanged |
-| `chunk_count` | its `raw.chunk_count`; the backfill epoch's `first_seq` |
-| `epoch` | its `raw.epoch`; the backfill epoch is `epoch + 1` |
-| `content_sha256` | its `raw.content_sha256` |
+| `base` field     | meaning                                                                                                        |
+| ---------------- | -------------------------------------------------------------------------------------------------------------- |
+| `revision`       | its `revision` (1 or more); the backfill commits `revision + 1`                                                |
+| `version`        | its object version id, or else its ETag exactly as the store returns it; the commit's compare-and-swap version |
+| `owner`          | its `raw.owner`, the live owner, which must not start with `migration:` and is unchanged by the append         |
+| `writer`         | its `writer.delivery_instance_id`, unchanged                                                                   |
+| `chunk_count`    | its `raw.chunk_count`; the backfill epoch's `first_seq`                                                        |
+| `epoch`          | its `raw.epoch`; the backfill epoch is `epoch + 1`                                                             |
+| `content_sha256` | its `raw.content_sha256`                                                                                       |
 
 ## Issuer, base read and route matrix
 
-These are normative in [`relayhistory-export-plan-entry-v2-issuer.md`](relayhistory-export-plan-entry-v2-issuer.md) (96BullSessions #86, contract review), which has its own vectors. In summary:
+These are normative in [`relayhistory-export-plan-entry-v2-issuer.md`](relayhistory-export-plan-entry-v2-issuer.md), the **spec of record on main at `f67f741`** (96BullSessions #86, which passed contract review). It has its own vectors. In summary:
 
 - **Plan with backfills:**
   - The issuer stores the plan, and checks `records` (mandatory), contiguous offsets and safe-integer bounds on every backfill chunk.

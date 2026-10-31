@@ -837,7 +837,10 @@ export interface UploadIdentityBaseRead {
   entry_sha256: string;
 }
 
-type AnyUploadIdentity = UploadIdentity | UploadIdentityV2 | UploadIdentityBaseRead;
+type AnyUploadIdentity =
+  | UploadIdentity
+  | UploadIdentityV2
+  | UploadIdentityBaseRead;
 
 /** Any v2 identity: a backfill commit or a base-read capability. */
 export function isV2Identity(
@@ -847,12 +850,16 @@ export function isV2Identity(
 }
 
 /** A v2 backfill COMMIT identity (with its signed base). */
-export function isBackfillIdentity(upload: AnyUploadIdentity): upload is UploadIdentityV2 {
+export function isBackfillIdentity(
+  upload: AnyUploadIdentity,
+): upload is UploadIdentityV2 {
   return isV2Identity(upload) && upload.kind === "backfill";
 }
 
 /** The v2 pre-mint base-read capability. */
-export function isBaseReadIdentity(upload: AnyUploadIdentity): upload is UploadIdentityBaseRead {
+export function isBaseReadIdentity(
+  upload: AnyUploadIdentity,
+): upload is UploadIdentityBaseRead {
   return isV2Identity(upload) && upload.kind === "backfill_base_read";
 }
 
@@ -869,7 +876,8 @@ export function migrationKindAllowsRoute(
   method: string,
   path: string,
 ): boolean {
-  const baseRead = method === "GET" && normalizeRoutePath(path) === MANIFEST_BASE_PATH;
+  const baseRead =
+    method === "GET" && normalizeRoutePath(path) === MANIFEST_BASE_PATH;
   return isBaseReadIdentity(upload) ? baseRead : !baseRead;
 }
 
@@ -904,7 +912,8 @@ export function backfillBaseOf(stored: {
   const raw = manifest.raw;
   const version = backfillBaseVersion(stored.version);
   if (!version) return "the stored manifest has no version";
-  if (raw.owner.startsWith("migration:")) return "the session is owned by a migration grant";
+  if (raw.owner.startsWith("migration:"))
+    return "the session is owned by a migration grant";
   if (raw.epochs.some((e) => (e.reason as string) === "backfill"))
     return "the session already has a backfill epoch";
   if (raw.format !== "ndjson") return "a backfill needs an ndjson stream";
@@ -926,14 +935,20 @@ export function backfillBaseOf(stored: {
  * no single backfill epoch or a chunk lacks `records`.
  */
 export async function backfillEntryFor(
-  tenancy: Pick<UploadIdentity, "grant_id" | "org_id" | "workspace_id" | "source_user_id">,
+  tenancy: Pick<
+    UploadIdentity,
+    "grant_id" | "org_id" | "workspace_id" | "source_user_id"
+  >,
   location: Parameters<typeof sessionManifestKey>[0],
   manifest: Pick<ManifestV1, "session" | "raw">,
 ): Promise<PlanEntryV2 | undefined> {
-  const epochs = manifest.raw.epochs.filter((e) => (e.reason as string) === "backfill");
+  const epochs = manifest.raw.epochs.filter(
+    (e) => (e.reason as string) === "backfill",
+  );
   if (epochs.length !== 1) return undefined;
   const added = manifest.raw.chunks.filter((c) => c.epoch === epochs[0]!.epoch);
-  if (added.length === 0 || added.some((c) => !Number.isSafeInteger(c.records))) return undefined;
+  if (added.length === 0 || added.some((c) => !Number.isSafeInteger(c.records)))
+    return undefined;
   const chunks: BackfillEntryChunk[] = added.map((c) => ({
     start_offset: c.start_offset,
     bytes: c.bytes,
@@ -1089,7 +1104,10 @@ function parseUploadIdentityV2(
       (base.revision as number) >= 1 &&
       (base.revision as number) <= Number.MAX_SAFE_INTEGER - 1
     ) ||
-    !(uint(base.chunk_count) && (base.chunk_count as number) <= Number.MAX_SAFE_INTEGER - 4096) ||
+    !(
+      uint(base.chunk_count) &&
+      (base.chunk_count as number) <= Number.MAX_SAFE_INTEGER - 4096
+    ) ||
     !(uint(base.epoch) && (base.epoch as number) <= 4294967294) ||
     !text(base.version) ||
     !text(base.owner) ||
@@ -1111,11 +1129,21 @@ function parseBaseReadIdentity(
   if (
     u.v !== 2 ||
     u.kind !== "backfill_base_read" ||
-    !exactKeySet(u, V2_IDENTITY_KEYS.filter((k) => k !== "backfill_sha256" && k !== "base")) ||
+    !exactKeySet(
+      u,
+      V2_IDENTITY_KEYS.filter((k) => k !== "backfill_sha256" && k !== "base"),
+    ) ||
     !isRecord(session) ||
-    !exactKeySet(session, ["machine_id", "harness", "session_id", "started_at"]) ||
+    !exactKeySet(session, [
+      "machine_id",
+      "harness",
+      "session_id",
+      "started_at",
+    ]) ||
     !Object.values(session).every((v) => text(v, 256)) ||
-    !["grant_id", "key", "org_id", "workspace_id", "source_user_id"].every((k) => text(u[k])) ||
+    !["grant_id", "key", "org_id", "workspace_id", "source_user_id"].every(
+      (k) => text(u[k]),
+    ) ||
     ["org_id", "workspace_id", "source_user_id"].some(
       (k) => normalizeRelayId(u[k] as string) !== u[k],
     ) ||
@@ -1423,7 +1451,10 @@ export interface MigrationAssertionLedger {
    * (result `base_read`, `auditKey` as its work key) in one transaction;
    * nothing is enqueued. Same replay and grant rules as `consume`.
    */
-  consumeBaseRead(use: MigrationAssertionUse, auditKey: string): Promise<MigrationConsumeResult>;
+  consumeBaseRead(
+    use: MigrationAssertionUse,
+    auditKey: string,
+  ): Promise<MigrationConsumeResult>;
 }
 
 /**
@@ -1509,7 +1540,9 @@ export function sqlMigrationAssertionLedger(
       });
     },
     consume(use, stage, message) {
-      return spend(uses, use, message.workKey, "committed", (tx) => enqueue(tx, stage, message));
+      return spend(uses, use, message.workKey, "committed", (tx) =>
+        enqueue(tx, stage, message),
+      );
     },
     consumeBaseRead(use, auditKey) {
       // Its own replay namespace: a base-read jti or nonce never collides
@@ -1525,65 +1558,65 @@ export function sqlMigrationAssertionLedger(
     result: "committed" | "base_read",
     effect: (tx: SqlExecutor) => Promise<void>,
   ): Promise<MigrationConsumeResult> {
-      return sql.transaction(async (tx) => {
-        await purge(tx, table, "jti");
-        // Serializes this grant's consumptions, so two first uses with
-        // different plans cannot both pass the consistency check.
-        await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
-          `migration-grant:${use.grantId}`,
-        ]);
-        // One grant, one org and one plan: a use that disagrees with the
-        // grant's earlier uses is refused, and nothing is written.
-        const conflict = await tx.query(
-          `SELECT 1 FROM ${uses}
+    return sql.transaction(async (tx) => {
+      await purge(tx, table, "jti");
+      // Serializes this grant's consumptions, so two first uses with
+      // different plans cannot both pass the consistency check.
+      await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+        `migration-grant:${use.grantId}`,
+      ]);
+      // One grant, one org and one plan: a use that disagrees with the
+      // grant's earlier uses is refused, and nothing is written.
+      const conflict = await tx.query(
+        `SELECT 1 FROM ${uses}
             WHERE grant_id = $1 AND (plan_digest <> $2 OR org_id <> $3)
             LIMIT 1`,
-          [use.grantId, use.planDigest, use.orgId],
-        );
-        if (conflict.rows.length) return "grant_mismatch" as const;
-        // Insert-if-absent on both keys. A concurrent consumer of the same jti
-        // or nonce waits on the unique index, then sees the winner's row.
-        const { rows } = await tx.query(
-          `INSERT INTO ${table} (jti, nonce, grant_id, org_id, workspace_id,
+        [use.grantId, use.planDigest, use.orgId],
+      );
+      if (conflict.rows.length) return "grant_mismatch" as const;
+      // Insert-if-absent on both keys. A concurrent consumer of the same jti
+      // or nonce waits on the unique index, then sees the winner's row.
+      const { rows } = await tx.query(
+        `INSERT INTO ${table} (jti, nonce, grant_id, org_id, workspace_id,
                                 user_id, plan_digest, plan_entry_digest,
                                 expires_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9))
            ON CONFLICT DO NOTHING
            RETURNING jti`,
-          [
-            use.jti,
-            use.nonce,
-            use.grantId,
-            use.orgId,
-            use.workspaceId,
-            use.userId,
-            use.planDigest,
-            use.planEntryDigest,
-            use.expiresAt,
-          ],
-        );
-        if (!rows.length) return "replayed" as const;
-        // Throwing here rolls the consumption back with the queue row.
-        await effect(tx);
-        // The durable audit event, in the same transaction: ids, digests and
-        // the work key only (never a token, a signature or chunk bytes).
-        await tx.query(
-          `INSERT INTO ${audit} (grant_id, plan_digest, entry_sha256, work_key,
+        [
+          use.jti,
+          use.nonce,
+          use.grantId,
+          use.orgId,
+          use.workspaceId,
+          use.userId,
+          use.planDigest,
+          use.planEntryDigest,
+          use.expiresAt,
+        ],
+      );
+      if (!rows.length) return "replayed" as const;
+      // Throwing here rolls the consumption back with the queue row.
+      await effect(tx);
+      // The durable audit event, in the same transaction: ids, digests and
+      // the work key only (never a token, a signature or chunk bytes).
+      await tx.query(
+        `INSERT INTO ${audit} (grant_id, plan_digest, entry_sha256, work_key,
                                  org_id, workspace_id, user_id, result)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [
-            use.grantId,
-            use.planDigest,
-            use.planEntryDigest,
-            workKey,
-            use.orgId,
-            use.workspaceId,
-            use.userId,
-            result,
-          ],
-        );
-        return "consumed" as const;
-      });
+        [
+          use.grantId,
+          use.planDigest,
+          use.planEntryDigest,
+          workKey,
+          use.orgId,
+          use.workspaceId,
+          use.userId,
+          result,
+        ],
+      );
+      return "consumed" as const;
+    });
   }
 }
 
@@ -1663,7 +1696,8 @@ export class InMemoryMigrationAssertionLedger implements MigrationAssertionLedge
     auditKey: string,
   ): Promise<MigrationConsumeResult> {
     this.#purge();
-    if (this.uses.has(use.jti) || this.#nonces.has(use.nonce)) return "replayed";
+    if (this.uses.has(use.jti) || this.#nonces.has(use.nonce))
+      return "replayed";
     for (const earlier of this.uses.values())
       if (
         earlier.grantId === use.grantId &&
