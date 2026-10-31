@@ -30,7 +30,8 @@ store, but the MCP server was not run.
 
 ## Gates
 
-Local run at corpus 4.04M events, whale 1.28M, on a Mac mini. Timings are relative.
+Local run at corpus 4.04M events, whale 1.28M, on a Mac mini with data on an external
+drive. Logic gates also passed in CI at scales S and M. Timings are relative.
 
 | Gate | Result | Evidence and limits |
 | --- | --- | --- |
@@ -53,17 +54,21 @@ Local run at corpus 4.04M events, whale 1.28M, on a Mac mini. Timings are relati
 | 8 | 90 | 75.5 | 157.7 | 378.1 | 0 |
 | 32 | 144 | 219.0 | 342.5 | 420.8 | 0 |
 
-The proposed DB p95 of 300 ms is exceeded at 32 clients, on a shared local machine, so
-treat this as a warning, not a result.
+The GitHub runner, at the same corpus and small enough to be CPU-bound, was much slower:
+1 clients 11 QPS, p95 149 ms; 8 clients 11 QPS, p95 1156.4 ms; 32 clients 12 QPS, p95 4376 ms, errors 0.
+It misses the proposed DB p95 of 300 ms from 8 clients. Local misses it at 32. Neither
+machine is the target, so neither passes or fails G7; the target-service run decides.
 
 ### Search right after a bulk load
 
-The first search after loading took 8.9 s at 2.4M events and 13.4 s at 4.04M, over the
-5 s query limit, with 99 and 119 active parts. At 2.4M a recall query failed with a
-timeout in an earlier run. After merges settled to 48 parts and a server restart, the
-same query took 341 ms. So a backfill can cause timeouts until merges settle. The exact
-cause was not isolated, and OS-cache-cold latency is unmeasured: the proof's "cold" row
-drops ClickHouse caches only.
+Local first search after loading: 8.9 s at 2.4M events and 13.4 s at 4.04M, over the 5 s
+query limit, with 99 and 119 active parts. One local recall query timed out at 2.4M.
+After merges settled, the same query took 341 ms.
+
+**CI does not reproduce this:** at 4.04M events with 49 active parts it took 435 ms. The
+local data directory is on an external drive, which is the likely difference, but this
+was not isolated. Treat a post-backfill timeout as a risk to check on the target
+service, not a measured property of the store.
 
 ## Not proven
 
