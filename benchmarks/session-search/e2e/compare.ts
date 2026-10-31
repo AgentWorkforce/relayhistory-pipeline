@@ -42,7 +42,7 @@ async function page(table: string, q: string, tag: string, range?: [number | nul
   { q }, { SQL_relay_org: "org-0", max_execution_time: 5, log_comment: tag });
 }
 const single = (table: string) => async (q: string, tag: string) => ({ rows: await page(table, q, tag), rounds: 1 });
-async function windowed(q: string, tag: string) {
+const windowedOn = (table: string) => async (q: string, tag: string) => {
   const edges = [null, ...WINDOW_DAYS.map((d) => now - d * DAY)];
   const ranges: Array<[number | null, number | null]> = WINDOW_DAYS.map((_, i) => [edges[i + 1]!, edges[i] ?? null]);
   ranges.push([null, now - WINDOW_DAYS.at(-1)! * DAY]);
@@ -50,20 +50,19 @@ async function windowed(q: string, tag: string) {
   let rounds = 0;
   for (const r of ranges) {
     rounds++;
-    rows.push(...await page("session_search_records", q, tag, r));
+    rows.push(...await page(table, q, tag, r));
     if (rows.length > LIMIT) break;
   }
   return { rows, rounds };
-}
+};
 
 await installSchema(admin, pw);
 const oracle = new Oracle();
 let loaded = 0;
 for (const batch of transcriptBatches(params, oracle)) { await store.insert(batch); loaded += batch.length; }
 const copies: Record<string, string> = {
-  gran_1024: schemaSql().replace("session_search_records", "t_gran_1024").replace("non_replicated_deduplication_window = 1000", "index_granularity = 1024"),
+  base: schemaSql().replace("session_search_records", "t_base"),
   gran_256: schemaSql().replace("session_search_records", "t_gran_256").replace("non_replicated_deduplication_window = 1000", "index_granularity = 256"),
-  session_order: schemaSql().replace("session_search_records", "t_session_order").replace("ORDER BY (org_id, workspace_id, ts, session_id, chunk_seq, record_seq)", "ORDER BY (org_id, workspace_id, session_id, ts, chunk_seq, record_seq)"),
 };
 const tableOf = (name: string) => `t_${name}`;
 for (const [name, ddl] of Object.entries(copies)) {
@@ -75,17 +74,18 @@ for (const [name, ddl] of Object.entries(copies)) {
   await admin.run(`DROP ROW POLICY IF EXISTS p_${name} ON ${t}`);
   await admin.run(`CREATE ROW POLICY p_${name} ON ${t} USING org_id = getSetting('SQL_relay_org') TO search_reader`);
 }
+await admin.run("OPTIMIZE TABLE t_base FINAL", {}, { max_execution_time: 900 });
+await admin.run("OPTIMIZE TABLE t_gran_256 FINAL", {}, { max_execution_time: 900 });
 await Bun.sleep(30_000);
 const sizes = await admin.rows("SELECT table, count() AS parts, sum(rows) AS rows, sum(data_compressed_bytes) AS data, sum(secondary_indices_compressed_bytes) AS indexes FROM system.parts WHERE active AND (table = 'session_search_records' OR table LIKE 't\\_%') GROUP BY table");
 
 const VARIANTS: Record<string, (q: string, tag: string) => Promise<{ rows: Hit[]; rounds: number }>> = {
-  baseline: single("session_search_records"),
-  windowed,
-  gran_1024: single(tableOf("gran_1024")),
+  baseline: single(tableOf("base")),
+  windowed: windowedOn(tableOf("base")),
   gran_256: single(tableOf("gran_256")),
-  session_order: single(tableOf("session_order")),
+  windowed_gran_256: windowedOn(tableOf("gran_256")),
 };
-const CLASSES = ["pr", "phrase", "error", "tail", "short", "common"];
+const CLASSES = ["ultra", "absent", "pr", "phrase", "short", "common"];
 
 async function counters(tag: string) {
   await admin.run("SYSTEM FLUSH LOGS");
@@ -100,8 +100,8 @@ for (const id of CLASSES) {
   const truth = oracle.newest(oracleKey("org-0", id)).map((h) => h.eventId);
   for (const [name, run] of Object.entries(VARIANTS)) {
     const got = (await run(n.query, `cmp:${id}:${name}:recall`)).rows.slice(0, LIMIT).map((r) => r.event_id);
-    const recall = truth.slice(0, LIMIT).filter((e, i) => got[i] === e).length / Math.min(LIMIT, truth.length);
-    for (const clients of [1, 8]) {
+    const recall = truth.length ? truth.slice(0, LIMIT).filter((e, i) => got[i] === e).length / Math.min(LIMIT, truth.length) : got.length === 0 ? 1 : 0;
+    for (const clients of [1, 8, 32]) {
       const tag = `cmp:${id}:${name}:${clients}`;
       const lat: number[] = [];
       const errors: Record<string, number> = {};
@@ -110,7 +110,7 @@ for (const id of CLASSES) {
       const worker = async () => {
         while (!stop) {
           const s = performance.now();
-          try { rounds += (await run(n.query, tag)).rounds; lat.push(performance.now() - s); }
+          try { const r = await run(n.query, tag); rounds += r.rounds; lat.push(performance.now() - s); }
           catch (e) { const c = /Code: (\d+)|clickhouse (\d+)/.exec(String(e)); const k = c?.[1] ?? c?.[2] ?? "other"; errors[k] = (errors[k] ?? 0) + 1; }
         }
       };

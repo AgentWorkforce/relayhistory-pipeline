@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { generateCorpus, PLANTED_SECRET, tenantCanary, type CorpusParams } from "../corpus.ts";
 import type { SearchRecord } from "./store.ts";
 
-export const QUERY_SET_VERSION = "2026-10-31.1";
+export const QUERY_SET_VERSION = "2026-10-31.2";
 const LONG_PAD = 5_000;
 
 /** class, query as typed, text planted, share of sessions. `beyondPrefix` sits past 4 KB. */
@@ -22,6 +22,8 @@ export const NEEDLES = [
   { id: "short", cls: "short_term", query: "q7", plant: "flag q7 set", share: 0.002 },
   { id: "punct", cls: "punctuation", query: "100%_done", plant: "stage 100%_done reached", share: 0.002 },
   { id: "tail", cls: "beyond_4kb", query: "tailbeacon", plant: "tailbeacon", share: 0.004, beyondPrefix: true },
+  { id: "ultra", cls: "ultra_rare", query: "wombatlantern", plant: "wombatlantern", share: 0.00006 },
+  { id: "absent", cls: "zero_hits", query: "nosuchtermanywhere", plant: "", share: 0 },
   { id: "common", cls: "common", query: "deploy", plant: "deploy finished", share: 0.25 },
 ] as const;
 export type Needle = (typeof NEEDLES)[number];
@@ -50,7 +52,7 @@ export function* transcriptBatches(p: CorpusParams, oracle: Oracle, size = 20_00
   let batch: SearchRecord[] = [];
   for (const s of generateCorpus(p)) {
     if (s.deleted) continue;
-    const hits = NEEDLES.filter((n) => unit(s.sessionId, n.id) < n.share);
+    const hits = NEEDLES.filter((n) => n.share > 0 && unit(s.sessionId, n.id) < n.share);
     const canary = unit(s.sessionId, "canary") < 0.02 ? tenantCanary(s.orgId, s.workspaceId) : null;
     s.events.forEach((e, n) => {
       const parts = [e.content.replace(PLANTED_SECRET, "")];
