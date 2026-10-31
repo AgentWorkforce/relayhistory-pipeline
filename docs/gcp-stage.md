@@ -12,8 +12,9 @@ org `929835122282`, region `us-central1`, billing account
 ## Live 96Bulls application proof
 
 The full base application path completed on merge
-`9aa77fc70374b2e8578cf44881e51e9896f7d2c8` at
-`2026-10-31T03:40:51Z` (`2026-10-30 20:40 PDT`). The release used chart
+`9aa77fc70374b2e8578cf44881e51e9896f7d2c8`. The synthetic manifest landed at
+`2026-10-31T03:40:51Z` (`2026-10-30 20:40 PDT`), and the downstream stages
+completed in the following seconds. The release used chart
 `96bulls-0.3.1` and the eligible services image built from
 `09293c8d649f912aa2f4414e31a3ad7fca6eceee`, digest
 `sha256:8d77de9be0b5e5e47dda75986da882e577aafb9e28e510c844e8134fea372425`.
@@ -47,11 +48,13 @@ The proof used synthetic session `gcp-e2e-20261031`, UUIDv7
   restarts after the migration job completed. The planted secret and content
   marker were absent from application container logs.
 
-Credentials remained in process memory and short-lived port-forward streams;
-none were written to a persistent filesystem. This evidence covers the base
-GCP 96Bulls auth, ingest, scrub, GCS, HoopDB, summary, classification, and
-trace path. It does not claim Relaycast HA or the separately gated V1 search
-projection/API, which requires its own eligible runtime image and proof.
+The verifier read the pre-existing Kubernetes Secrets only through the API,
+kept proof-only bearer/API-key material in process memory, terminated its
+short-lived port-forwards, and did not create a persistent credential file.
+This evidence covers the base GCP 96Bulls auth, ingest, scrub, GCS, HoopDB,
+summary, classification, and trace path. It does not claim Relaycast HA or the
+separately gated V1 search projection/API, which requires its own eligible
+runtime image and proof.
 
 The stack entry point is `stacks/gcp/alchemy.gcp.run.ts`. It uses the same
 Alchemy + AgentWorkforce Helm boundary as the AWS stack: cloud code declares
