@@ -211,6 +211,29 @@ describe("short_summary writer", () => {
     expect(older.written).toBe(false);
     expect((await row(db))?.short_summary).toBe("newer");
   });
+
+  test("a rejected newer summary clears the older one; a rejected older one leaves a newer one", async () => {
+    const db = await database();
+    await insertRow(db);
+    await summarize(db, KEY, "Old heron migration notes");
+    const a = claims("org-a", ["ws-a"]);
+    expect(await search(db, a, "ws-a", "heron")).toHaveLength(1);
+    const later = new Date(AT.getTime() + 1000);
+    await expect(summarize(db, KEY, "y".repeat(SHORT_SUMMARY_MAX_CHARS + 1), later))
+      .rejects.toThrow("short_summary rejected: over_length");
+    const cleared = await row(db);
+    expect(cleared?.short_summary).toBeNull();
+    expect(cleared?.short_summary_source).toBeNull();
+    expect(cleared?.search_text).toBe("Fix flaky queue test Helm proj-1");
+    expect(await search(db, a, "ws-a", "heron")).toEqual([]);
+
+    // The fence: a refused summary older than the stored one does not clear it.
+    await summarize(db, KEY, "Fresh egret notes", later);
+    await expect(writeShortSummary(db, { ...KEY, summary: "   ", source: "bob-costas/v1", generatedAt: AT }))
+      .rejects.toThrow("short_summary rejected: empty");
+    expect((await row(db))?.short_summary).toBe("Fresh egret notes");
+    expect(await search(db, a, "ws-a", "egret")).toHaveLength(1);
+  });
 });
 
 describe("short_summary in search_text", () => {
@@ -698,9 +721,10 @@ describe("short_summary end to end through the pipeline", () => {
       directory?: Parameters<typeof bobCostasHandler>[1]["directory"],
       storeOverride?: typeof store,
       keyringOverride?: typeof keyring,
+      summarizerOverride?: typeof extractiveSummarizer,
     ) =>
       bobCostasHandler("short", {
-        db: hoop, reader, store: storeOverride ?? store, summarizer: extractiveSummarizer,
+        db: hoop, reader, store: storeOverride ?? store, summarizer: summarizerOverride ?? extractiveSummarizer,
         keyring: keyringOverride ?? keyring, ...(directory ? { directory } : {}),
       })(
         { payload: pointer, ctx: { orgId: "org-a" } } as never, { log: { info() {} } } as never);
@@ -898,6 +922,25 @@ describe("short_summary end to end through the pipeline", () => {
     // Once the store is back, the retry republishes.
     expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
     expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+  }, 60_000);
+
+  test("Bob Costas: a rejected new summary clears the older searchable one", async () => {
+    const { db, index, pointer, ctx, summaryShort } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    const key = { orgId: "org-a", workspaceId: "ws-e2e", harness: "codex", sessionId: "s-e2e" };
+    await writeShortSummary(db, { ...key, summary: "Stale osprey notes", source: "bob-costas/extractive/v0", generatedAt: new Date("2026-10-01T00:00:00Z") });
+    const a = claims("org-a", ["ws-e2e"]);
+    expect(await search(db, a, "ws-e2e", "osprey")).toHaveLength(1);
+    const overLong = {
+      ...extractiveSummarizer,
+      summarize: async () => ({ text: "z".repeat(SHORT_SUMMARY_MAX_CHARS + 1), modelId: "extractive/v1", tokensIn: 0, tokensOut: 0 }),
+    } as typeof extractiveSummarizer;
+    // The refusal is logged by reason and the stage completes (the encrypted object is published).
+    await summaryShort(undefined, undefined, undefined, overLong);
+    const current = await row(db, "s-e2e");
+    expect(current?.short_summary).toBeNull();
+    expect(String(current?.search_text)).not.toContain("osprey");
+    expect(await search(db, a, "ws-e2e", "osprey")).toEqual([]);
   }, 60_000);
 
   /** Captures the service's stderr log lines (warn/error) while `run` executes. */

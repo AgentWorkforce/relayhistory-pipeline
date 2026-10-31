@@ -68,7 +68,7 @@ only; applying or merging needs the user's OK on the exact head. Migration:
   `short_summary_scrub_version` (the raw-chunk `SCRUB_RULESET` pair) plus
   `short_summary_source` and `short_summary_generated_at`. The database requires those
   labels (all or none) but cannot prove the text was scrubbed: only the writer enforces
-  that. An older `generated_at` never replaces a newer summary.
+  that. An older `generated_at` never replaces a newer summary. A refused summary (`ShortSummaryRejected`) clears any older stored summary and its share of `search_text`, under the same fence, so an older summary never stays searchable after a newer one was refused; a refused older summary leaves a newer one in place.
 - **Search document:** `sessions.session_directory_search_text(...)` is the one
   definition of `search_text`; the summary is its last field. The writer rebuilds
   `search_text` with it, and the future projector must use the same function.
