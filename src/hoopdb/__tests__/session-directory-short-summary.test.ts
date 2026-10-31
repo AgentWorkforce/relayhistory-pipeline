@@ -445,6 +445,75 @@ async function capturedStatements(db: PGlite, claimsJson: string, workspace: str
   return { error, ranSearch: texts.includes(SESSION_DIRECTORY_SEARCH_SQL.replace(/\s+/g, " ").trim()) };
 }
 
+describe("migration role collision", () => {
+  /** Every migration before G6, so a pre-existing role can be prepared against real tables. */
+  async function beforeG6(): Promise<PGlite> {
+    const db = new PGlite({ extensions: { auto_explain, btree_gin, pg_trgm } });
+    open.push(db);
+    await db.exec(read("supabase/tests/supabase_shim.sql"));
+    for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
+      if (file !== MIGRATION) await db.exec(read(`supabase/migrations/${file}`));
+    }
+    return db;
+  }
+  const applied = async (db: PGlite) => (await db.query(
+    `SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'sessions' AND table_name = 'session_directory' AND column_name = 'short_summary'`)).rows.length > 0;
+
+  test("a pre-existing role equal to what the migration creates is reused and reasserted", async () => {
+    const db = await beforeG6();
+    await db.exec(`CREATE ROLE ${WORKER} NOLOGIN NOINHERIT NOBYPASSRLS;
+      CREATE ROLE authenticator NOLOGIN NOINHERIT; GRANT ${WORKER} TO authenticator;`);
+    await db.exec(UP);
+    expect(await applied(db)).toBe(true);
+    const role = (await db.query<Row>(
+      "SELECT rolcanlogin, rolinherit, rolbypassrls, rolconfig FROM pg_roles WHERE rolname = $1", [WORKER])).rows[0];
+    expect(role).toEqual({ rolcanlogin: false, rolinherit: false, rolbypassrls: false, rolconfig: ["statement_timeout=2s"] });
+  });
+
+  const UNSAFE: Array<[string, string, string]> = [
+    ["LOGIN", `CREATE ROLE ${WORKER} LOGIN NOINHERIT`, "LOGIN"],
+    ["INHERIT", `CREATE ROLE ${WORKER} NOLOGIN INHERIT`, "INHERIT"],
+    ["BYPASSRLS", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT BYPASSRLS`, "BYPASSRLS"],
+    ["SUPERUSER", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT SUPERUSER`, "SUPERUSER"],
+    ["CREATEROLE", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT CREATEROLE`, "CREATEROLE"],
+    ["CREATEDB", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT CREATEDB`, "CREATEDB"],
+    ["REPLICATION", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT REPLICATION`, "REPLICATION"],
+    ["extra role setting", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET search_path = public`,
+      "role settings other than statement_timeout"],
+    ["member of another role", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT service_role TO ${WORKER}`, "member of service_role"],
+    ["granted to an inheriting role", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE ROLE app_reader NOLOGIN INHERIT;
+      GRANT ${WORKER} TO app_reader`, "granted to app_reader"],
+    ["granted to an INHERIT authenticator", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE ROLE authenticator NOLOGIN INHERIT;
+      GRANT ${WORKER} TO authenticator`, "granted to authenticator"],
+    ["owns an object", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE TABLE public.g6_owned (x int);
+      ALTER TABLE public.g6_owned OWNER TO ${WORKER}`, "owns objects"],
+    ["table privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT SELECT ON sessions.session_index TO ${WORKER}`,
+      "table, view or sequence privileges"],
+    ["column privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT SELECT (org_id) ON sessions.session_directory TO ${WORKER}`,
+      "column privileges"],
+    ["function privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO ${WORKER}`,
+      "function privileges"],
+    ["schema privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT CREATE ON SCHEMA sessions TO ${WORKER}`, "schema privileges"],
+    ["database privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT;
+      DO $g$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO ${WORKER}', current_database()); END $g$`, "database privileges"],
+    ["default privileges", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO ${WORKER}`, "default privileges"],
+  ];
+  for (const [name, setup, problem] of UNSAFE) {
+    test(`fails closed, applying nothing, when the pre-existing role has: ${name}`, async () => {
+      const db = await beforeG6();
+      await db.exec(setup);
+      const error = await db.exec(UP).then(() => null, (caught: unknown) => caught) as { code?: string; message?: string } | null;
+      expect(error?.code).toBe("42710");
+      expect(error?.message).toContain("session_directory_search_worker already exists and is unsafe to reuse");
+      expect(error?.message).toContain(problem);
+      expect(await applied(db)).toBe(false);
+      expect((await db.query("SELECT 1 FROM pg_proc WHERE proname = 'search_session_directory'")).rows).toEqual([]);
+    });
+  }
+});
+
 describe("search RPC query bounds", () => {
   // Inputs that look like 3+ characters to btrim/char_length but carry fewer than
   // three meaningful ones.

@@ -28,6 +28,95 @@
 -- Code only; nothing here is applied by this repository. The down path is
 -- supabase/rollbacks/20261030020000_session_directory_short_summary.down.sql.
 
+-- Role guard, first so that a failure leaves nothing applied. The migration owns
+-- one role, session_directory_search_worker. If it already exists it is reused only
+-- when it is exactly what this migration would create: no LOGIN, INHERIT, BYPASSRLS,
+-- SUPERUSER, CREATEROLE, CREATEDB or REPLICATION; a member of no role; no member
+-- except `authenticator` with NOINHERIT; no owned objects; no explicit privileges
+-- (tables, columns, sequences, functions, schemas, databases, default privileges);
+-- no role setting other than statement_timeout. Anything else fails closed with
+-- SQLSTATE 42710 naming every violation. It never silently reuses a dangerous role.
+DO $role_guard$
+DECLARE
+  v_oid oid;
+  v_problems text[] := '{}';
+  v_row record;
+BEGIN
+  SELECT oid INTO v_oid FROM pg_roles WHERE rolname = 'session_directory_search_worker';
+  IF v_oid IS NULL THEN
+    CREATE ROLE session_directory_search_worker NOLOGIN NOINHERIT NOBYPASSRLS;
+    RETURN;
+  END IF;
+
+  SELECT * INTO v_row FROM pg_roles WHERE oid = v_oid;
+  IF v_row.rolcanlogin THEN v_problems := array_append(v_problems, 'LOGIN'::text); END IF;
+  IF v_row.rolinherit THEN v_problems := array_append(v_problems, 'INHERIT'::text); END IF;
+  IF v_row.rolbypassrls THEN v_problems := array_append(v_problems, 'BYPASSRLS'::text); END IF;
+  IF v_row.rolsuper THEN v_problems := array_append(v_problems, 'SUPERUSER'::text); END IF;
+  IF v_row.rolcreaterole THEN v_problems := array_append(v_problems, 'CREATEROLE'::text); END IF;
+  IF v_row.rolcreatedb THEN v_problems := array_append(v_problems, 'CREATEDB'::text); END IF;
+  IF v_row.rolreplication THEN v_problems := array_append(v_problems, 'REPLICATION'::text); END IF;
+  IF EXISTS (SELECT 1 FROM unnest(coalesce(v_row.rolconfig, '{}')) AS c(setting)
+              WHERE c.setting NOT LIKE 'statement\_timeout=%') THEN
+    v_problems := array_append(v_problems, 'role settings other than statement_timeout'::text);
+  END IF;
+
+  -- Memberships: it may belong to no role, and only a NOINHERIT authenticator may
+  -- belong to it (an inheriting member would gain its EXECUTE through membership).
+  FOR v_row IN SELECT r.rolname FROM pg_auth_members AS m JOIN pg_roles AS r ON r.oid = m.roleid
+                WHERE m.member = v_oid LOOP
+    v_problems := array_append(v_problems, format('member of %I', v_row.rolname)::text);
+  END LOOP;
+  FOR v_row IN SELECT r.rolname, r.rolinherit FROM pg_auth_members AS m JOIN pg_roles AS r ON r.oid = m.member
+                WHERE m.roleid = v_oid LOOP
+    IF v_row.rolname <> 'authenticator' OR v_row.rolinherit THEN
+      v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+    END IF;
+  END LOOP;
+
+  -- Owned objects.
+  IF EXISTS (SELECT 1 FROM pg_class WHERE relowner = v_oid)
+     OR EXISTS (SELECT 1 FROM pg_proc WHERE proowner = v_oid)
+     OR EXISTS (SELECT 1 FROM pg_namespace WHERE nspowner = v_oid)
+     OR EXISTS (SELECT 1 FROM pg_type WHERE typowner = v_oid)
+     OR EXISTS (SELECT 1 FROM pg_database WHERE datdba = v_oid) THEN
+    v_problems := array_append(v_problems, 'owns objects'::text);
+  END IF;
+
+  -- Explicit privileges anywhere (PUBLIC grants are not the role's own).
+  IF EXISTS (SELECT 1 FROM pg_class AS c, aclexplode(c.relacl) AS a WHERE a.grantee = v_oid) THEN
+    v_problems := array_append(v_problems, 'table, view or sequence privileges'::text);
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_attribute AS t, aclexplode(t.attacl) AS a WHERE a.grantee = v_oid) THEN
+    v_problems := array_append(v_problems, 'column privileges'::text);
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_proc AS p, aclexplode(p.proacl) AS a WHERE a.grantee = v_oid) THEN
+    v_problems := array_append(v_problems, 'function privileges'::text);
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_namespace AS n, aclexplode(n.nspacl) AS a
+              WHERE a.grantee = v_oid
+                AND NOT (n.nspname = 'sessions' AND a.privilege_type = 'USAGE')) THEN
+    v_problems := array_append(v_problems, 'schema privileges'::text);
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_database AS d, aclexplode(d.datacl) AS a WHERE a.grantee = v_oid) THEN
+    v_problems := array_append(v_problems, 'database privileges'::text);
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_default_acl AS d, aclexplode(d.defaclacl) AS a WHERE a.grantee = v_oid)
+     OR EXISTS (SELECT 1 FROM pg_default_acl WHERE defaclrole = v_oid) THEN
+    v_problems := array_append(v_problems, 'default privileges'::text);
+  END IF;
+
+  IF cardinality(v_problems) > 0 THEN
+    RAISE EXCEPTION USING ERRCODE = '42710',
+      MESSAGE = 'role session_directory_search_worker already exists and is unsafe to reuse: '
+                || array_to_string(v_problems, ', '),
+      HINT = 'Drop or fix the role, then rerun. The migration never reuses a role with these attributes.';
+  END IF;
+  -- Safe to own: reassert the attributes so the state is exactly what we created.
+  ALTER ROLE session_directory_search_worker NOLOGIN NOINHERIT NOBYPASSRLS;
+END
+$role_guard$;
+
 CREATE EXTENSION IF NOT EXISTS btree_gin WITH SCHEMA public;
 
 ALTER TABLE sessions.session_directory
@@ -113,13 +202,8 @@ CREATE INDEX session_directory_tenant_search_trgm_idx
 -- separately reviewed deployment step. No table privileges, no BYPASSRLS; it can
 -- only execute the search RPC. PostgREST (>= v12) applies role-level settings, so
 -- the timeout bounds every request made as this role.
-DO $role$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'session_directory_search_worker') THEN
-    CREATE ROLE session_directory_search_worker NOLOGIN NOINHERIT NOBYPASSRLS;
-  END IF;
-END
-$role$;
+-- (The role is created or validated at the top of this migration; see
+-- session_directory_search_worker role guard.)
 ALTER ROLE session_directory_search_worker SET statement_timeout = '2s';
 GRANT USAGE ON SCHEMA sessions TO session_directory_search_worker;
 
