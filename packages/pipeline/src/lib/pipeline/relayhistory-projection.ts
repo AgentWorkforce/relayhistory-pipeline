@@ -63,15 +63,28 @@ const MAX_TIME_MS = 8_640_000_000_000_000;
 const MAX_COUNT = 9_223_372_036_854_775_807n;
 
 /**
- * Every timestamp in the output: UTC to the microsecond, so strings sort by
- * time. Accepts Postgres text (`2026-10-30 12:00:00.123456+00`) and ISO.
+ * Every timestamp in the output: UTC to the microsecond, as Postgres writes it.
+ * Accepts Postgres text (`2026-10-30 12:00:00.123456+00`, or a year past 9999,
+ * which it writes bare) and ISO. Throws on anything else.
  */
 export function canonicalTimestamp(value: string): string {
-  const parsed = Date.parse(value);
+  const year = /^(\d{5,6})-/.exec(value)?.[1];
+  const parseable = year
+    ? `+${year.padStart(6, "0")}${value.slice(year.length).replace(" ", "T")}`
+    : value;
+  const parsed = Date.parse(parseable);
   if (!Number.isFinite(parsed)) throw new Error("invalid timestamp");
   const fraction = /:\d{2}\.(\d+)/.exec(value)?.[1] ?? "";
-  const seconds = new Date(parsed).toISOString().slice(0, 19);
+  const seconds = new Date(parsed)
+    .toISOString()
+    .replace(/\.\d+Z$/, "")
+    .replace(/^\+0*/, "");
   return `${seconds}.${fraction.slice(0, 6).padEnd(6, "0")}Z`;
+}
+
+/** Order of two canonical timestamps: a longer year is a later one. */
+function compareTimes(left: string, right: string): number {
+  return left.length - right.length || compareStrings(left, right);
 }
 
 /** A whole-millisecond epoch time; the client's `*_ms` columns are integers. */
@@ -83,7 +96,11 @@ function timeFromMs(ms: number): string {
 function text(payload: Json, key: string): string | null {
   const value = payload[key];
   if (value === undefined || value === null) return null;
-  return typeof value === "object" ? JSON.stringify(value) : String(value);
+  return typeof value === "object"
+    ? JSON.stringify(value, (_key, child: unknown) =>
+        typeof child === "bigint" ? child.toString() : child,
+      )
+    : String(value);
 }
 
 function nullIfEmpty(value: string | null): string | null {
@@ -111,7 +128,7 @@ export function lowerAgentName(name: string): string {
 
 /** sessions.delivery_catalog_text */
 function catalogText(value: unknown): string | null {
-  return ["string", "number", "boolean"].includes(typeof value)
+  return ["string", "number", "bigint", "boolean"].includes(typeof value)
     ? nullIfEmpty(String(value))
     : null;
 }
@@ -197,6 +214,7 @@ function exact(value: bigint): number | bigint {
 function activityMs(payload: Json): number | null {
   for (const key of ["updated_ms", "ts_ms", "timestamp_ms", "last_activity_ms"]) {
     const value = payload[key];
+    if (typeof value === "bigint") return null;
     if (typeof value === "number")
       return value >= 0 && value <= MAX_TIME_MS ? value : null;
   }
@@ -524,7 +542,7 @@ function settleToolTimes(events: Json[]) {
     const toolUse = text(payloadOf(event), "tool_use_id");
     if (event.kind !== "session_event" || toolUse === null) continue;
     const seen = parents.get(toolUse);
-    if (seen === undefined || (event.ts as string) < seen)
+    if (seen === undefined || compareTimes(event.ts as string, seen) < 0)
       parents.set(toolUse, event.ts as string);
   }
   for (const event of events) {
@@ -753,11 +771,19 @@ function directEvent(record: RelayhistoryStreamRecord, context: ProjectionContex
       "a convergence_event line is not this session's",
       false,
     );
-  return {
-    ...row,
-    ts: canonicalTimestamp(String(row.ts)),
-    ingested_at: canonicalTimestamp(String(row.ingested_at ?? record.received_at)),
-  };
+  try {
+    return {
+      ...row,
+      ts: canonicalTimestamp(String(row.ts)),
+      ingested_at: canonicalTimestamp(String(row.ingested_at ?? record.received_at)),
+    };
+  } catch {
+    throw new PipelineError(
+      "relayhistory_event_invalid",
+      "a convergence_event line has a malformed timestamp",
+      false,
+    );
+  }
 }
 
 function compareStrings(left: string, right: string): number {
@@ -796,7 +822,7 @@ export function projectRelayhistorySession(
   settleRequests(events, context.source);
   const ordered = [...events, ...direct].sort(
     (a, b) =>
-      compareStrings(a.ts as string, b.ts as string) ||
+      compareTimes(a.ts as string, b.ts as string) ||
       compareStrings(a.event_id as string, b.event_id as string),
   );
   return {

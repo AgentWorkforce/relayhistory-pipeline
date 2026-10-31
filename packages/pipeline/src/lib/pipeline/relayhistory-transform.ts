@@ -15,13 +15,18 @@ import {
   manifestLocation,
   normalizedKey,
   objectKey,
+  parseSessionKey,
   rawChunkKey,
-  readAll,
   type ManifestV1,
   type ObjectStore,
 } from "./object-layout.js";
-import type { ManifestRead, ManifestReader } from "./adapter.js";
+import { readCapped, type ManifestRead, type ManifestReader } from "./adapter.js";
 import { PipelineError } from "./errors.js";
+import {
+  normalizeRelayId,
+  planEntryFor,
+  planEntrySha256,
+} from "./migration-assertions.js";
 import {
   CONVERGENCE_EVENT_KIND,
   projectRelayhistorySession,
@@ -41,6 +46,8 @@ export const RELAYHISTORY_EXPORT_EXTENSION = "client.relayhistory_export";
 const MAX_RELAYHISTORY_CHUNK_BYTES = 16 * 1024 * 1024;
 /** Everything is held in memory to fold it, so a session past this is refused. */
 export const MAX_RELAYHISTORY_SESSION_BYTES = 256 * 1024 * 1024;
+/** Projected rows repeat their payloads beside typed columns, so an object can outgrow its raw. */
+const NORMALIZED_GROWTH = 4;
 const MAX_REVISION = 9_223_372_036_854_775_807n;
 
 export interface RelayhistoryStreamRecord {
@@ -124,10 +131,23 @@ function stringField(
   return fieldValue;
 }
 
+/** JSON.parse, with an integer past a double's precision kept exact as a bigint. */
+function parseExact(line: string): unknown {
+  return (JSON.parse as (text: string, reviver: unknown) => unknown)(
+    line,
+    (_key: string, value: unknown, context: { source: string }) =>
+      typeof value === "number" &&
+      !Number.isSafeInteger(value) &&
+      /^-?\d+$/.test(context.source)
+        ? BigInt(context.source)
+        : value,
+  );
+}
+
 export function parseRelayhistoryRecord(line: string): RelayhistoryStreamRecord {
   let value: unknown;
   try {
-    value = JSON.parse(line);
+    value = parseExact(line);
   } catch {
     fail("relayhistory_record_invalid", "RelayHistory export contains invalid JSON");
   }
@@ -237,7 +257,7 @@ function sameRecord(
     received_at: _at,
     accepted_seq: _seq,
     ...rest
-  }: RelayhistoryStreamRecord) => JSON.stringify(canonical(rest));
+  }: RelayhistoryStreamRecord) => encoded(canonical(rest));
   return content(left) === content(right);
 }
 
@@ -311,6 +331,15 @@ export function normalizeRelayhistoryRecords(
       );
     // One record stored twice: the earlier copy wins whichever arrived first,
     // so the output bytes do not depend on arrival order.
+    if (
+      record.accepted_seq !== undefined &&
+      previous.accepted_seq !== undefined &&
+      BigInt(record.accepted_seq) !== BigInt(previous.accepted_seq)
+    )
+      fail(
+        "relayhistory_acceptance_conflict",
+        "copies of one RelayHistory record name different acceptance seats",
+      );
     const first = receivedFirst(record, previous) ? record : previous;
     const seq = record.accepted_seq ?? previous.accepted_seq;
     latest.set(key, seq === undefined ? first : { ...first, accepted_seq: seq });
@@ -345,8 +374,9 @@ export async function readRelayhistoryExport(
   manifest: ManifestV1,
   store: ObjectStore,
   decompress?: ZstdDecompress,
-  maxSessionBytes: number = MAX_RELAYHISTORY_SESSION_BYTES,
+  options: { maxSessionBytes?: number; prefix?: string } = {},
 ): Promise<RelayhistoryStreamRecord[]> {
+  const maxSessionBytes = options.maxSessionBytes ?? MAX_RELAYHISTORY_SESSION_BYTES;
   relayhistoryExportProvenance(manifest);
   if (!manifest.raw.scrub)
     fail("relayhistory_export_quarantined", "RelayHistory export is not scrubbed");
@@ -358,7 +388,7 @@ export async function readRelayhistoryExport(
   );
   if (declared > maxSessionBytes)
     fail("relayhistory_session_too_large", "RelayHistory session exceeds the transform limit");
-  const loc = manifestLocation(manifest);
+  const loc = manifestLocation(manifest, options.prefix);
   const records: RelayhistoryStreamRecord[] = [];
   for (const chunk of manifest.raw.chunks) {
     if (
@@ -383,15 +413,16 @@ export async function readRelayhistoryExport(
       chunk.sha256,
       manifest.raw.format,
     );
-    let stored: Uint8Array;
+    let stored: Uint8Array | null;
     try {
-      stored = await readAll(await store.get(key));
+      stored = await readCapped(await store.get(key), chunk.stored_bytes);
     } catch (error) {
       if ((error as { code?: unknown } | null)?.code === "not_found")
         throw new PipelineError("chunk_missing", "a listed raw chunk is missing", true);
       throw error;
     }
     if (
+      !stored ||
       stored.byteLength !== chunk.stored_bytes ||
       (await sha256Hex(stored)) !== chunk.stored_sha256
     )
@@ -482,6 +513,7 @@ function currentForTarget(
   read: ManifestRead,
   manifestKey: string,
   target: NormalizeTarget,
+  migration: RawPointer["migration"],
 ): boolean {
   const { revision } = read.manifest;
   if (target.revision !== undefined && revision < target.revision)
@@ -491,11 +523,41 @@ function currentForTarget(
       true,
     );
   if (target.revision !== undefined && revision > target.revision) return false;
+  // Migration work is keyed by its plan entry, which is not an object version.
+  if (migration) return true;
   const prefix = `${manifestKey}@`;
   const expected = target.workKey?.startsWith(prefix)
     ? target.workKey.slice(prefix.length)
     : "";
   return !expected || expected === read.version || expected === read.etag;
+}
+
+/** Whether a migration message's signed plan entry is this manifest's. */
+async function isPlannedEntry(
+  manifest: ManifestV1,
+  migration: NonNullable<RawPointer["migration"]>,
+  orgId: string | undefined,
+): Promise<boolean> {
+  if (orgId === undefined)
+    fail("relayhistory_export_provenance", "migration work names no org");
+  const provenance = relayhistoryExportProvenance(manifest);
+  const entry = await planEntryFor(
+    {
+      grant_id: provenance.grantId,
+      org_id: normalizeRelayId(orgId),
+      workspace_id: normalizeRelayId(manifest.session.workspace_id),
+      source_user_id: normalizeRelayId(provenance.sourceUserId),
+    },
+    {
+      workspaceId: manifest.session.workspace_id,
+      machineId: manifest.session.machine_id,
+      harness: manifest.session.harness,
+      sessionId: manifest.session.session_id,
+      startDate: new Date(manifest.session.started_at).toISOString().slice(0, 10),
+    },
+    manifest,
+  );
+  return !!entry && (await planEntrySha256(entry)) === migration.entry_sha256;
 }
 
 /**
@@ -519,19 +581,30 @@ export class RelayhistoryExportTransform implements SessionTransform {
     if (pointer.deleted) return {};
     const read = await this.deps.manifests.read(pointer.manifestKey);
     if (!read) return {};
-    if (!currentForTarget(read, pointer.manifestKey, target))
+    if (!currentForTarget(read, pointer.manifestKey, target, pointer.migration))
       return { skipped: "stale_manifest" };
     const manifest = read.manifest;
     // A harness log is left for its own normalizer. A marker this code cannot
     // read, or a backfill without one, reaches the refusal in the reader below.
     if (!carriesRecords(manifest)) return {};
+    if (
+      pointer.migration &&
+      !(await isPlannedEntry(manifest, pointer.migration, target.orgId))
+    )
+      return { skipped: "stale_manifest" };
+    const prefix = parseSessionKey(pointer.manifestKey)?.prefix;
     const records = await readRelayhistoryExport(
       manifest,
       this.deps.store,
       this.deps.decompress,
-      this.deps.maxSessionBytes,
+      {
+        ...(this.deps.maxSessionBytes !== undefined
+          ? { maxSessionBytes: this.deps.maxSessionBytes }
+          : {}),
+        ...(prefix ? { prefix } : {}),
+      },
     );
-    const location = manifestLocation(manifest);
+    const location = manifestLocation(manifest, prefix);
     const projection = projectRelayhistorySession(records, {
       workspaceId: location.workspaceId,
       source: location.harness,
@@ -565,7 +638,13 @@ export class RelayhistoryExportTransform implements SessionTransform {
     // from its own bytes. Its metadata names whichever revision wrote it first.
     const stored = created
       ? body
-      : await readAll(await this.deps.store.get(objectKey(key)));
+      : await readCapped(
+          await this.deps.store.get(objectKey(key)),
+          NORMALIZED_GROWTH *
+            (this.deps.maxSessionBytes ?? MAX_RELAYHISTORY_SESSION_BYTES),
+        );
+    if (!stored)
+      fail("normalized_object_too_large", "stored normalized object exceeds the limit");
     const outputSha256 = await sha256Hex(stored);
     return {
       outputKey: key,

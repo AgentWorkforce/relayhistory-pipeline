@@ -66,6 +66,8 @@ export interface RawPointer {
   scrubbed?: boolean;
   /** The manifest was deleted: remove the pointer rather than upsert it. */
   deleted?: boolean;
+  /** Migration work: see `ObjectLandedPayload.migration`. */
+  migration?: { key: string; entry_sha256: string };
 }
 
 export interface SessionPointerIndex {
@@ -103,6 +105,7 @@ export interface NormalizedOutput {
 export interface NormalizeTarget {
   revision?: number;
   workKey?: string;
+  orgId?: string;
 }
 
 /** A delayed message: a newer manifest stands, and its own event normalizes it. */
@@ -205,6 +208,7 @@ export function objectLandedHandler(deps: {
         ? { scrubbed: payload.scrubbed }
         : {}),
       ...(deleted ? { deleted: true } : {}),
+      ...(payload.migration ? { migration: payload.migration } : {}),
     };
     const workKey = objectLandedWorkKey(payload);
     // The trace verdict matches index success to manifest work by this key, so
@@ -283,6 +287,7 @@ export function fileNormalizeHandler(
     const output = await transform.normalize(message.payload as RawPointer, {
       ...(message.revision !== undefined ? { revision: message.revision } : {}),
       workKey: message.workKey,
+      orgId: message.ctx.orgId,
     });
     if ("skipped" in output) return { status: "skipped", reason: output.skipped };
     if (output.outputKey)

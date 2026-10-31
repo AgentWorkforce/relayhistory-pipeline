@@ -482,6 +482,17 @@ describe("acceptance order, not delivery time, settles contenders", () => {
     ).toThrow(expect.objectContaining({ code: "relayhistory_acceptance_missing", retryable: false }));
   });
 
+  it("refuses copies of one write naming different seats, in either order", () => {
+    const seat = (accepted_seq: string) => ({
+      ...line("x", "session_event", { role: "user", ts_ms: T }),
+      accepted_seq,
+    });
+    for (const order of [[seat("7"), seat("8")], [seat("8"), seat("7")]])
+      expect(() =>
+        normalizeRelayhistoryRecords(order.map((value) => parseRelayhistoryRecord(JSON.stringify(value)))),
+      ).toThrow(expect.objectContaining({ code: "relayhistory_acceptance_conflict", retryable: false }));
+  });
+
   it("does not let a re-exported copy lose its ledger seat", () => {
     const seated = { ...line("x", "session_event", { role: "user", ts_ms: T }), accepted_seq: "7" };
     const plain = line("x", "session_event", { role: "user", ts_ms: T }, { received_at: EARLIER });
@@ -538,6 +549,36 @@ describe("usage counters past a double's precision", () => {
       context(),
     ).rows;
     expect(String(row!.row.cost_usd_micros)).toBe(rows[0]!.cost);
+  });
+});
+
+describe("timestamps at Postgres's edge", () => {
+  const MAX_MS = 8_640_000_000_000_000;
+
+  it("writes the largest accepted time as Postgres does, and sorts it last", async () => {
+    const { rows } = await expectLiveEqual([
+      line("edge", "session_event", { role: "user", ts_ms: MAX_MS }),
+      line("past", "session_event", { role: "user", ts_ms: MAX_MS + 1 }),
+      line("zero", "session_event", { role: "user", ts_ms: 0 }),
+      line("now", "session_event", { role: "user", ts_ms: T }),
+      line("s", "session", { first_activity_ms: MAX_MS, last_activity_ms: MAX_MS + 1 }),
+    ]);
+    const events = byTable(rows, "convergence_events");
+    expect(events.map((row) => row.delivery_record_id)).toEqual(["zero", "now", "past", "edge"]);
+    expect(events.at(-1)!.ts).toBe("275760-09-13T00:00:00.000000Z");
+    expect(byTable(rows, "session_catalog")[0]).toMatchObject({
+      first_activity_at: "275760-09-13T00:00:00.000000Z",
+      last_activity_at: null,
+    });
+  });
+
+  it("settles a tool to a parent past year 9999 by time, not text", async () => {
+    await expectLiveEqual([
+      line("tool", "tool_call", { name: "Read", tool_use_id: "t1" }),
+      // Year 10000 and year 9999: as text the later one sorts first.
+      line("late", "session_event", { role: "assistant", tool_use_id: "t1", ts_ms: 253402300800000 }),
+      line("early", "session_event", { role: "assistant", tool_use_id: "t1", ts_ms: 253402300799000 }),
+    ]);
   });
 });
 
@@ -678,6 +719,27 @@ describe("export projection", () => {
         session,
       ),
     ).toThrow(expect.objectContaining({ code: "relayhistory_event_identity" }));
+  });
+
+  it("keeps a direct row's bigint columns exact through the object", async () => {
+    const MAX = "9223372036854775807";
+    const row = `{"machine_id":"machine:1","user_id":"u","source":"chatgpt","session_id":"${SESSION}","event_id":"ev","ts":"2026-10-30T12:00:00Z","input_tokens":${MAX},"cost_usd_micros":9007199254740993}`;
+    const text = `{"kind":"convergence_event","origin_id":"machine:machine:1","record_id":"ev","revision":"1","received_at":"${RECEIVED}","payload":${row}}`;
+    const { rows } = projectRelayhistorySession(
+      normalizeRelayhistoryRecords([parseRelayhistoryRecord(text), parseRelayhistoryRecord(text)]),
+      session,
+    );
+    expect(rows[0]!.row).toMatchObject({ input_tokens: BigInt(MAX), cost_usd_micros: 9007199254740993n });
+  });
+
+  it("refuses a direct row with a malformed timestamp, without retry", () => {
+    const row = { machine_id: session.machineId, user_id: session.userId, source: session.source, session_id: SESSION, event_id: "ev", ts: "not a time" };
+    expect(() =>
+      projectRelayhistorySession(
+        [parseRelayhistoryRecord(JSON.stringify({ ...line("ev", "convergence_event", row), origin_id: `machine:${session.machineId}` }))],
+        session,
+      ),
+    ).toThrow(expect.objectContaining({ code: "relayhistory_event_invalid", retryable: false }));
   });
 
   it("emits nothing for a stream with no deletes to apply and no records", () => {

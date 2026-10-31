@@ -18,6 +18,7 @@ import {
   type SessionLocation,
 } from "../src/lib/pipeline/object-layout.js";
 import { objectStoreManifestReader } from "../src/lib/pipeline/adapter.js";
+import { planEntryFor, planEntrySha256 } from "../src/lib/pipeline/migration-assertions.js";
 import { projectRelayhistorySession } from "../src/lib/pipeline/relayhistory-projection.js";
 import type { NormalizedOutput } from "../src/lib/pipeline/stages.js";
 import {
@@ -65,7 +66,7 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-async function fixture() {
+async function fixture(location: SessionLocation = loc) {
   const store = createFsStore({ root });
   const live = ndjson([
     record("changed", "2", 3_000),
@@ -102,7 +103,7 @@ async function fixture() {
     };
     chunks.push(entry);
     await store.put(
-      rawChunkKey(loc, seq, 0, sourceSha, "ndjson"),
+      rawChunkKey(location, seq, 0, sourceSha, "ndjson"),
       stored,
       { ifNoneMatch: true },
     );
@@ -152,7 +153,7 @@ async function fixture() {
       "96bulls": { user_id: "user-1" },
     },
   };
-  const key = manifestKey(loc);
+  const key = manifestKey(location);
   await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)), {
     ifNoneMatch: true,
     contentType: "application/json",
@@ -323,6 +324,116 @@ describe("RelayHistory export transform", () => {
     });
   });
 
+  describe("migration work", () => {
+    const entrySha = async (manifest: ManifestV1) =>
+      planEntrySha256(
+        (await planEntryFor(
+          { grant_id: "mgr_test", org_id: "org", workspace_id: "workspace", source_user_id: "user-1" },
+          loc as never,
+          manifest,
+        ))!,
+      );
+    const prefixed: SessionLocation = { ...loc, prefix: "tenant/acme" };
+    const run = async (location: SessionLocation, digest?: string) => {
+      const f = await fixture(location);
+      const entry_sha256 = digest ?? (await entrySha(f.manifest));
+      const signedKey = manifestKey(loc);
+      const transform = new RelayhistoryExportTransform({ manifests: f.reader, store: f.store });
+      const output = await transform.normalize(
+        {
+          traceId: TRACE,
+          workspaceId: loc.workspaceId,
+          manifestKey: f.key,
+          migration: { key: signedKey, entry_sha256 },
+        },
+        { revision: f.manifest.revision, workKey: `${signedKey}@${entry_sha256}`, orgId: "org" },
+      );
+      return { f, output };
+    };
+
+    it.each([
+      ["an unprefixed key", loc],
+      ["a deployment-prefixed key", prefixed],
+    ])("normalizes its own plan entry on %s, reading and writing under that key", async (_name, location) => {
+      const { f, output } = await run(location);
+      const expected = normalizedKey(location, 2, `relayhistory-${f.manifest.raw.content_sha256}.ndjson`);
+      expect(output).toMatchObject({ outputKey: expected, revision: f.manifest.revision });
+      expect(await readAll(await f.store.get(objectKey(expected)))).toBeDefined();
+    });
+
+    it("skips a manifest that is not the signed plan entry", async () => {
+      const { output } = await run(loc, "0".repeat(64));
+      expect(output).toEqual({ skipped: "stale_manifest" });
+    });
+
+    it("refuses migration work that names no org", async () => {
+      const f = await fixture();
+      const transform = new RelayhistoryExportTransform({ manifests: f.reader, store: f.store });
+      await expect(
+        transform.normalize(
+          { traceId: TRACE, workspaceId: loc.workspaceId, manifestKey: f.key, migration: { key: manifestKey(loc), entry_sha256: "0".repeat(64) } },
+          { revision: f.manifest.revision },
+        ),
+      ).rejects.toMatchObject({ code: "relayhistory_export_provenance", retryable: false });
+    });
+
+    it("still treats live work's key suffix as an object version", async () => {
+      const f = await fixture();
+      const transform = new RelayhistoryExportTransform({ manifests: f.reader, store: f.store });
+      expect(
+        await transform.normalize(
+          { traceId: TRACE, workspaceId: loc.workspaceId, manifestKey: f.key },
+          { workKey: `${f.key}@${"0".repeat(64)}` },
+        ),
+      ).toEqual({ skipped: "stale_manifest" });
+    });
+  });
+
+  describe("reads are capped by what the manifest declares", () => {
+    const counted = (store: ObjectStore, bytes: number) => {
+      let pulled = 0;
+      const capped: ObjectStore = Object.create(store);
+      capped.get = async () =>
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            pulled += 1024;
+            if (pulled > bytes) controller.close();
+            else controller.enqueue(new Uint8Array(1024));
+          },
+        });
+      return { capped, pulled: () => pulled };
+    };
+
+    it("stops reading a chunk larger than declared", async () => {
+      const f = await fixture();
+      const { capped, pulled } = counted(f.store, 64 * 1024 * 1024);
+      await expect(readRelayhistoryExport(f.manifest, capped)).rejects.toMatchObject({ code: "chunk_digest_mismatch" });
+      expect(pulled()).toBeLessThan(1024 * 1024);
+    });
+
+    it("refuses a reused normalized object past its bound without reading it all", async () => {
+      const f = await fixture();
+      const total = f.manifest.raw.chunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+      const key = objectKey(normalizedKey(loc, 2, `relayhistory-${f.manifest.raw.content_sha256}.ndjson`));
+      await f.store.put(key, new TextEncoder().encode("x"), { ifNoneMatch: true });
+      const { capped, pulled } = counted(f.store, 64 * 1024 * 1024);
+      const store = new Proxy(f.store, {
+        get(target, name) {
+          if (name === "get")
+            return async (k: typeof key, range?: never) =>
+              k === key ? capped.get(k, range) : target.get(k, range);
+          const value = Reflect.get(target, name, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const transform = new RelayhistoryExportTransform({ manifests: f.reader, store, maxSessionBytes: total });
+      await expect(
+        transform.normalize({ traceId: TRACE, workspaceId: loc.workspaceId, manifestKey: f.key }),
+      ).rejects.toMatchObject({ code: "normalized_object_too_large", retryable: false });
+      expect(pulled()).toBeLessThan(1024 * 1024);
+    });
+  });
+
   describe("session size", () => {
     it("refuses a session past its total before reading any chunk", async () => {
       const f = await fixture();
@@ -333,7 +444,7 @@ describe("RelayHistory export transform", () => {
         return f.store.get(...args);
       };
       const total = f.manifest.raw.chunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
-      await expect(readRelayhistoryExport(f.manifest, store, undefined, total - 1)).rejects.toMatchObject({
+      await expect(readRelayhistoryExport(f.manifest, store, undefined, { maxSessionBytes: total - 1 })).rejects.toMatchObject({
         code: "relayhistory_session_too_large",
         retryable: false,
       });
@@ -343,7 +454,7 @@ describe("RelayHistory export transform", () => {
     it("reads a session exactly at its total", async () => {
       const f = await fixture();
       const total = f.manifest.raw.chunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
-      await expect(readRelayhistoryExport(f.manifest, f.store, undefined, total)).resolves.toHaveLength(3);
+      await expect(readRelayhistoryExport(f.manifest, f.store, undefined, { maxSessionBytes: total })).resolves.toHaveLength(3);
     });
   });
 
