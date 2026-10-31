@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { RelayAuthAssertionProvider, secretCommand } from "../relay-auth-token.ts";
+import { CloudSessionAssertionProvider, RelayAuthAssertionProvider, secretCommand } from "../relay-auth-token.ts";
 
 describe("RelayAuth assertion provider", () => {
   test("mints an exact-origin assertion and caches it only until the refresh window", async () => {
