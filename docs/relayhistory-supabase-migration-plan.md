@@ -31,6 +31,16 @@ prove now"). Section 6 covers what that deferral means at T0.
 | `docs/relayhistory-pipeline-migration.md` | In force. Lanes P1 to P9 are referenced by number below. |
 | `docs/relayhistory-supabase-migration.md` | Its content-copy parts were superseded by 0002. Its correctness rules and driver contract still apply. |
 
+## Decision log
+
+| Date | Id | Decision (chosen option, verbatim) | Source | Effect on this plan |
+| --- | --- | --- | --- | --- |
+| 2026-10-31 | K-6 | "Serve old sessions from T0 branch" | Khaliq, lead session, relayed by the coordinator | Option T2 (section 6). Pre-T0 sessions keep legacy transcript search, served from the frozen Neon T0 child branch. Post-T0 sessions get V1 metadata and short_summary search only, until ClickHouse or ObsessionDB is proven. |
+| 2026-10-31 | K-22 | "Forward-only after flip" | Khaliq, lead session, relayed by the coordinator | Option R2 (section 11). T0 can be aborted up to the flip. After the flip there is no data rollback to Neon, and no reverse-sync (G-V) is built. |
+
+These records capture decisions. They do not approve any action:
+every step in section 15 still needs its own OK.
+
 ---
 
 ## 0. Recommended path in one page
@@ -62,8 +72,10 @@ prove now"). Section 6 covers what that deferral means at T0.
    5. G1 to G8 have merged and been deployed dark (relayhistory-cloud #223,
       #224, #225, #226 and #231; cloud #5850).
    6. The rehearsal benchmark is green.
-   7. The reverse path has been rehearsed.
-   8. Khaliq has decided the transcript-search degradation (section 6).
+   7. The T0 abort path has been rehearsed. After the flip the system is
+      forward-only (K-22, decided), so the abort boundary is the only data
+      rollback.
+   8. The child-branch transcript search (K-6, decided: T2) passes metric 1b.
 
 ---
 
@@ -199,7 +211,7 @@ budget.
 | **A. Logical replication** | Publication on Neon, subscription on Supabase, `copy_data=true`, WAL stream, flip at zero lag | Whole `sessions` schema, ~484 GiB | **High.** The setting is irreversible and restarts endpoints. WAL retention and replication-slot load fall on a compute already at 16/16 CU. | Seconds, with a durable hold | Needs a reverse stream | **No.** It copies content into Supabase, which 0002 forbids. |
 | **B. Dump/restore** | `pg_dump` from a frozen source, `pg_restore` into Supabase | ~484 GiB | Medium. A long read on production compute, unless run on a branch. | **Hours.** Writes are frozen for the whole dump and restore. | Repoint, because Neon is unchanged | **No.** Same content problem, plus the downtime. |
 | **C. Dual-write plus backfill** | The Worker writes both Neon and the pipeline, history is backfilled, reads switch per tenant | Index only | Medium. Neon keeps every write and gains a second write path. | None | Easy: stop writing to the pipeline | Partly. It **breaks invariant I2** (no RelayHistory write reaches the pipeline before the flip), and it needs a dual-write reconciler for divergence on partial failure. No PR for it exists. |
-| **D. Switch-first plus export (recommended)** | Durable hold, Neon fence, an immutable marker and a child branch at the marker's LSN, then the flip. History is exported from the child to S3 afterwards, with bounded read-only fallback to the child. | Index plus the small copy set | **Lowest.** No logical replication. Production compute takes no RelayHistory reads or writes after T0, and the export uses the child's own compute. | The hold only (target under 5 minutes; replay-safe uploads are buffered, other writes get 503 with `Retry-After`) | Before the flip: abort to `neon`, and the HoldLog replays to Neon. After the flip: a new hold plus a reverse copy (section 11). | **Yes.** It is the design Khaliq approved on 2026-10-30. |
+| **D. Switch-first plus export (recommended)** | Durable hold, Neon fence, an immutable marker and a child branch at the marker's LSN, then the flip. History is exported from the child to S3 afterwards, with bounded read-only fallback to the child. | Index plus the small copy set | **Lowest.** No logical replication. Production compute takes no RelayHistory reads or writes after T0, and the export uses the child's own compute. | The hold only (target under 5 minutes; replay-safe uploads are buffered, other writes get 503 with `Retry-After`) | Before the flip: abort to `neon`, and the HoldLog replays to Neon. After the flip: forward-only (K-22, section 11). | **Yes.** It is the design Khaliq approved on 2026-10-30. |
 
 **Recommendation: D.** It is already the decided design, and three things
 make it the right one under the Supabase decision:
@@ -218,7 +230,7 @@ hold.
 
 ---
 
-## 6. Transcript search across T0: a decision is needed
+## 6. Transcript search across T0 (decided: T2)
 
 Two things conflict:
 
@@ -237,15 +249,26 @@ dashboard transcript search) for every session.
 | T3. Delay T0 until V2 is proven | full (on Neon) | full | T0 waits on ClickHouse. Neon stays under stress for longer. |
 | T4. Keep writing post-T0 transcript rows to Neon or Supabase | full | full | Violates I2 and I6, or 0002 (no content in Supabase). **Rejected.** |
 
-**Recommendation: T2, but only with Khaliq's explicit acceptance (approval
-K-6)** that content written after T0 is searchable by title, agent, summary
-and metadata only, until V2 lands.
+**Decided: T2 (K-6, Khaliq, 2026-10-31: "Serve old sessions from T0
+branch").**
+
+- Pre-T0 sessions keep legacy transcript search, served from the frozen
+  Neon T0 child branch.
+- Post-T0 sessions get V1 metadata and short_summary search only, until
+  ClickHouse or ObsessionDB is proven.
+- Search responses must say which coverage applies, so a missing post-T0
+  transcript hit does not look like a real "no match".
+- Tell users before T0 that content written after the cutover is not
+  searchable by transcript text until V2 (Q14).
 
 - **Prerequisite:** the child branch's compute must pass the transcript-query
   benchmark (section 10, metric 1b).
+- **If metric 1b fails:** the decision does not cover T1 or T3. Size the
+  child's compute within Neon plan limits (Q12), or go back to Khaliq.
 - **Consequence:** the export does not remove the child branch while
   transcript search depends on it. A9 (fallback removal) becomes "removed for
-  replay and metadata", and the child stays until V2.
+  replay and metadata", and the child stays until V2. Its compute is a
+  running cost for that whole period.
 
 ---
 
@@ -291,8 +314,8 @@ Each item's exit gate is its own two-pass review plus CI. Every merge is K-1.
   - **G-P:** the `session_directory` projector from `session_index` and
     manifests. #38 has "no projector", and its merge-precedence rule needs
     Khaliq (K-4).
-  - **G-V:** a reverse path from the pipeline into delivery-record form for
-    post-flip rollback (section 11). Not built.
+  - ~~G-V~~: the reverse path is **not built**. K-22 decided forward-only
+    after the flip.
   - **G-S:** shadow-read compare mode in the Worker (section 9).
   - **G-H:** a hosted creation path for the search-issuer API key and
     signing key (section 14, S3).
@@ -335,8 +358,9 @@ Approvals K-11 and K-12.
    Legacy is measured on the rehearsal branch and the new path on staging,
    both against **the same snapshot**, so parity is exact, not approximate.
 4. Rehearse T0 end to end against staging: hold, fence on a scratch branch,
-   marker, child, flip, and the abort path. Then rehearse the reverse path
-   (G-V).
+   marker, child, flip, and the abort path. The abort path is the only data
+   rollback (K-22), so rehearse it at least twice, including an abort taken
+   at step 6 (child branch validation fails).
 
 - **Exit:** every parity check is exact, the benchmark gate is green, and
   the T0 and abort rehearsals are green. **A red result does not proceed and
@@ -373,7 +397,8 @@ Approval K-16; each step is K-17. See section 8.
 back at baseline; a fresh W0 session is visible in V1 search within the
 freshness SLO.
 
-**Rollback:** before the flip, abort. After it, see section 11.
+**Rollback:** before the flip, abort. After the flip the system is
+forward-only (K-22): fix forward (section 11).
 
 ### Phase 5: per-tenant export waves W0 to W3
 
@@ -397,7 +422,9 @@ Approval K-19, once per wave.
 
 - For each wave, drop the replay and metadata fallback for those orgs (A9,
   scoped per org) and enable V1 search as the primary search path.
-- Transcript search stays on the child branch (T2).
+- Pre-T0 transcript search stays on the child branch (T2, K-6). Removing
+  the replay and metadata fallback for a wave does not remove transcript
+  search from that wave.
 - **Rollback:** turn the per-org fallback back on. This is a config change,
   and the child branch still exists.
 
@@ -445,7 +472,8 @@ under 0002 are in **bold**.
    - section 10 is green;
    - phase 2's rehearsal is green;
    - G-R1 is deployed;
-   - K-6 is decided;
+   - the T2 child-branch transcript route (K-6) passes metric 1b;
+   - the abort path has been rehearsed (K-22: no rollback after the flip);
    - the NTP offset is under 1 s on the RelayAuth, ingest and courier hosts
      (runbook "Export assertions: clock health").
 2. **Hold.** Move the gate `neon → holding` (compare-and-set,
@@ -550,7 +578,7 @@ conclusion.
 | # | Metric | Legacy measured on | New measured on | Proposed threshold (Khaliq to set, K-5) |
 | --- | --- | --- | --- | --- |
 | 1a | Metadata/V1 search: p50, p95, p99 | Neon rehearsal branch, legacy ILIKE on title and agent, through the API | staging Supabase `search_session_directory` through the API | new p95 ≤ legacy p95 on every critical query, and p99 ≤ 1.5× legacy p99 |
-| 1b | Transcript search on the child (T2): p50, p95, p99 | Neon production (read-only, off-peak, only with K-12) | the rehearsal child branch's compute | child p95 ≤ 1.25× production p95. Otherwise size the child's compute, or choose T1 or T3. |
+| 1b | Transcript search on the child (T2): p50, p95, p99 | Neon production (read-only, off-peak, only with K-12) | the rehearsal child branch's compute | child p95 ≤ 1.25× production p95. Otherwise size the child's compute; T1 and T3 need a new decision from Khaliq. |
 | 2 | Session list and filters: p50, p95, p99 | legacy API | new API | new p95 ≤ legacy p95 |
 | 3 | Replay of one session: p50, p95, p99, by session-size decile | legacy keyset | S3 objects plus normalization | p95 ≤ legacy p95 for deciles 1 to 9; decile 10 within 1.5× |
 | 4 | Ingest-to-searchable freshness (accepted upload → visible in list or V1 search) | legacy: upload → visible in `search_shared_sessions` | manifest POST → `session_index` → `session_directory` | metadata p95 ≤ 60 s, p99 ≤ 120 s. short_summary p95 ≤ 5 min (it depends on the model). |
@@ -564,31 +592,38 @@ add them.
 
 ---
 
-## 11. Rollback and the reverse-data decision
+## 11. Rollback (decided: forward-only after the flip)
+
+**K-22, Khaliq, 2026-10-31: "Forward-only after flip".** T0 can be aborted
+up to the flip. After the flip there is no data rollback to Neon, and no
+reverse-sync is built (G-V is dropped).
 
 | Point | Rollback | Data |
 | --- | --- | --- |
 | Phases 0 to 3 | Unset flags, redeploy, drop empty staging | No user data on the new side |
 | T0, steps 2 to 6 | Abort (section 8) | The HoldLog replays to Neon. Nothing was lost or duplicated (I3). |
-| After the flip | **Never just repoint.** After the flip, Supabase and S3 hold the only copy of post-T0 writes. | A new hold, then **reverse** the post-T0 pipeline records into Neon in delivery-record form, then apply `.restore`, then move the gate back. That needs a reverse gate deploy. |
+| After the flip | **No data rollback. Fix forward.** Supabase and S3 hold the only copy of post-T0 writes. Never repoint to Neon. | Neon `sessions` stays fenced and intact until A10, as an audit and export source, not as a rollback target. |
 | Phases 5 and 6, per wave | Stop the export, or turn the per-org fallback back on | No data movement |
 
-**The reverse-data decision (K-22, must be made before T0).**
+**What forward-only means for the gates.**
+- Every pre-flip gate is now the last chance to stop. A red or amber result
+  at section 8 step 1, or at any of steps 2 to 6, means abort, not "flip
+  and fix".
+- `migration:reverse` (from #28) stays in the repo as self-host and history
+  tooling only. It is not part of the production rollback.
 
-`migration:reverse` (from #28) copies legacy Supabase tables back to Neon.
-Under 0002, post-T0 content lives in S3 in pipeline form, not in legacy
-tables, so **`migration:reverse` does not cover it.** The pipeline-to-
-delivery-record reverse (G-V) does not exist. Choose one:
+**Fix-forward levers after the flip**, each needing its own OK (K-25):
+- **Code:** roll the Worker back to an earlier build that is still in phase
+  `supabase`. #224's gate is forward-only, so no build can return to `neon`.
+- **Pipeline:** replay DLQs (`scripts/pipeline-dlq-replay.mjs`) and run the
+  reconcile job to re-index from S3 (#216).
+- **Features:** route-level feature flags, for example to disable V1 search
+  for one org or turn the child fallback back on.
+- **Writes:** a write freeze if writes are corrupting data. **Unknown:**
+  #224 allows no `supabase → holding` move, so a post-flip freeze needs a
+  separate mechanism, such as a route flag returning 503. That mechanism
+  needs a design before T0 (Q15).
 
-- **R1 (recommended).** Build G-V. Rehearse it in phase 2, and keep it valid
-  for a fixed rollback window, for example 72 h after T0. After the window,
-  the system is forward-only.
-- **R2.** Accept that after the flip the system is forward-only: fix
-  forward, with abort before the flip as the only rollback. This is simpler,
-  but the flip becomes irreversible for data.
-
-Neon `sessions` stays fenced and intact, without being retired, for the
-whole rollback window under either choice.
 
 ---
 
@@ -677,7 +712,7 @@ ids (A#) are shown where they apply.
 | K-3 | Apply the 96Bulls migrations plus #38/#48/#72 to Supabase `sessions`, and seed the search token policy row | A3 | while empty, drop the schema |
 | K-4 | #38's logical-session merge-precedence rule, and sum vs deduplicate for usage | — | design |
 | K-5 | Set the benchmark thresholds in section 10 | — | — |
-| K-6 | Accept the transcript-search behaviour across T0 (T1, T2 or T3) | — | — |
+| K-6 | Transcript-search behaviour across T0. **Decided 2026-10-31: T2, "Serve old sessions from T0 branch".** | — | — |
 | K-7 | Approve the separate search-issuer direction (#63) | — | — |
 | K-8 | Release relayauth with #116 and bump hosted RelayAuth (cloud PR, train) | — | revert or redeploy |
 | K-9 | Create the hosted search-issuer API key and signing key (G-H), and configure Supabase to trust the issuer | — | revoke or rotate |
@@ -693,10 +728,10 @@ ids (A#) are shown where they apply.
 | K-19 | Remove the fallback and enable V1 search per wave | A9 | turn the fallback back on |
 | K-20 | Remove the T0 child branch (ends T2 transcript search) | — | **no** |
 | K-21 | Drop Neon `sessions` after the final snapshot | A10 | **no** |
-| K-22 | The reverse-data decision (R1 or R2) and the rollback window | — | — |
+| K-22 | The reverse-data decision. **Decided 2026-10-31: R2, "Forward-only after flip". No reverse-sync is built.** | — | — |
 | K-23 | The negative security probe against hosted RelayAuth production (S1) | — | — |
 | K-24 | The SEC-10 workspace-boundary decision | — | — |
-| K-25 | Any post-flip rollback (a new hold plus G-V reverse) | — | — |
+| K-25 | Each post-flip fix-forward action (Worker rollback within phase `supabase`, write freeze, flags) | — | depends on the action |
 | K-26 | Any Neon load relief before T0: compute, `work_mem`, vacuum | — | yes |
 
 Read-only work needs no approval beyond normal access: catalog queries,
@@ -730,7 +765,11 @@ Read-only work needs no approval beyond normal access: catalog queries,
   re-measured with checked-in output (section 1).
 - **Q12.** Whether T2 child-branch transcript search can meet metric 1b
   within Neon plan limits (16 CU maximum).
-- **Q13.** Owners for the unowned items G-R1, G-P, G-V, G-S and G-H.
+- **Q13.** Owners for the unowned items G-R1, G-P, G-S and G-H.
+- **Q14.** Who announces the post-T0 transcript-search limit (K-6) to users,
+  and how.
+- **Q15.** The post-flip write-freeze mechanism, given that #224 allows no
+  `supabase → holding` move (section 11).
 
 ---
 

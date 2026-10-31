@@ -32,8 +32,8 @@ Section numbers refer to the plan.
 | Cutover gate, hold, driver, terminal reads, index activation (relayhistory-cloud #223, #224, #225, #226, #227, #231) | relayhistory-cloud lanes | drafts / open | Independent PASS; merged; deployed dark in phase `neon` (K-13) |
 | Cloud consumers and post-T0 write gating (cloud #5850) | helm-chart-chief | open, `merge-train:hold` | Deployed with the flag off (K-14) |
 | Revision feed to Cloud after T0 (G-R1) | **unowned** | missing | A pipeline producer for `relayhistory-project-events` |
-| Reverse path from the pipeline to Neon (G-V), and the reverse-data decision | **unowned** | missing | Built and rehearsed (R1), or forward-only accepted (R2) (K-22) |
-| Transcript search across T0 | Khaliq | decision needed | T1, T2 or T3 chosen (K-6) |
+| Rollback after the flip (K-22) | Khaliq | **decided 2026-10-31: "Forward-only after flip"** (abortable up to T0; no reverse-sync) | T0 abort path rehearsed in phase 2 |
+| Transcript search across T0 (K-6) | Khaliq | **decided 2026-10-31: "Serve old sessions from T0 branch"** (post-T0: V1 metadata/short_summary only until V2) | Child-branch transcript route passes metric 1b |
 | Rehearsal snapshot, parity and benchmark (phase 2) | migration lane | not started | P-1 to P-7 exact; section 10 thresholds (K-5) green |
 | Backup and restore drill (section 12) | migration lane | not started | RTO/RPO report under `docs/evidence/` |
 | Observability and SLO alarms (section 13) | unassigned | backend undecided | Alarms live before phase 3 |
