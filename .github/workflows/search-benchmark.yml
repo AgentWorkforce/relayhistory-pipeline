@@ -102,3 +102,46 @@ jobs:
           name: clickhouse-gates-report-${{ matrix.scale }}
           path: clickhouse-report.json
           if-no-files-found: ignore
+  e2e-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        scale: ["S", "M"]
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: benchmark-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password benchmark-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun test ./benchmarks/session-search/e2e
+      - name: Run proof
+        env:
+          BENCH_CH_URL: http://127.0.0.1:8123
+          BENCH_CH_USER: default
+          BENCH_CH_PASSWORD: benchmark-only
+          BENCH_SCALE: ${{ matrix.scale }}
+          BENCH_SHAPE_FILE: ${{ matrix.scale == 'M' && 'benchmarks/session-search/e2e/shape-2026-10-31.json' || '' }}
+          BENCH_OUT: e2e-report.json
+        run: bun benchmarks/session-search/e2e/proof.ts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-proof-report-${{ matrix.scale }}
+          path: e2e-report.json

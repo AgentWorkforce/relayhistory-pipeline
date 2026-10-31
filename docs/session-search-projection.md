@@ -3,8 +3,8 @@
 Khaliq, 2026-10-30. Supabase holds the pointers plus filterable, indexed
 session metadata. That covers short summaries, agent name, projects and
 session state, together with the other fields people filter and sort on.
-Full transcript text stays in S3 until the V2 search store (ClickHouse or
-ObsessionDB). This doc maps every filter and sort Relay Desktop offers to a
+Full transcript text stays in S3, and V1 transcript search uses a ClickHouse
+text index (ClickHouse or ObsessionDB). This doc maps every filter and sort Relay Desktop offers to a
 column and index. It builds on `session_index` and the logical
 `session_directory` (agent name, draft #38) rather than adding a third table.
 
@@ -39,7 +39,7 @@ The filters come from `relay-desktop`
   and Cloud never query across orgs.
 - **Short summaries:** produced by Bob Costas from the S3 content, scrubbed,
   and length-capped. No embeddings or pgvector in Supabase in V1;
-  transcript search is ClickHouse/ObsessionDB's (V2).
+  transcript search is ClickHouse/ObsessionDB's (V1).
 - **Erasure:** row deletion removes a workspace's projection rows (tombstone
   driven); backups and PITR age out on Supabase retention. Key-deletion
   shredding covers only S3 (see 0002; decision deferred to
