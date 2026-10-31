@@ -15,6 +15,10 @@
     `session_directory_agent_recent_idx` that stops at exactly 5,001 rows, and the RPC returns
     `54000 agent_prefix_too_broad`. The page query never runs and no tenant-wide scan happens.
   - Selective prefix: the probe reads 800 index rows, then the page returns 51.
+  - The page plan for a selective prefix is not fixed on PG15. A rerun at 9264674 picked a
+    Bitmap Index Scan on `session_directory_agent_recent_idx` (800 candidates, then a top-N
+    heapsort to 51) instead of the retained workspace_recent_idx shape. Both plans are bounded,
+    and both are recorded below. PG17 picked the retained shape in both runs.
   - This replaces the previous run's direct bounded-prefix Seq Scan finding.
 - **Direct agent exact as `authenticated`:** an Index Cond on `session_directory_agent_recent_idx`.
 - **`short_summary` as `authenticated`:** `42501` on both versions.
@@ -157,6 +161,26 @@ Limit  (cost=0.41..1199.32 rows=51 width=344) (actual rows=51 loops=1)
         Filter: (agent_name_normalized ~~ 'agent-ledger-11%'::text)
         Rows Removed by Filter: 1854
         Buffers: shared hit=120
+```
+
+Alternate PG15 page plan from the 9264674 rerun. The probe was identical (an Index Only Scan, 800
+rows). The planner then chose:
+
+```
+Limit  (cost=1160.31..1160.44 rows=51 width=344) (actual rows=51 loops=1)
+  Buffers: shared hit=816
+  ->  Sort  (cost=1160.31..1161.35 rows=417 width=344) (actual rows=51 loops=1)
+        Sort Key: last_activity_at DESC, session_id DESC, harness DESC
+        Sort Method: top-N heapsort  Memory: 52kB
+        Buffers: shared hit=816
+        ->  Bitmap Heap Scan on session_directory d  (cost=34.77..1146.40 rows=417 width=344) (actual rows=800 loops=1)
+              Recheck Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (deleted_at IS NULL))
+              Filter: (agent_name_normalized ~~ 'agent-ledger-11%'::text)
+              Heap Blocks: exact=800
+              Buffers: shared hit=816
+              ->  Bitmap Index Scan on session_directory_agent_recent_idx  (cost=0.00..34.67 rows=417 width=0) (actual rows=800 loops=1)
+                    Index Cond: ((org_id = 'org-0'::text) AND (workspace_id = 'ws-0'::text) AND (agent_name_normalized ~>=~ 'agent-ledger-11'::text) AND (agent_name_normalized ~<~ 'agent-ledger-12'::text))
+                    Buffers: shared hit=16
 ```
 
 ### Worker RPC: p_query selective
