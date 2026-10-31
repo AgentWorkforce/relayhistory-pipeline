@@ -147,8 +147,9 @@ choice: unset and `s3` stay S3, `r2` stays R2, and `PIPELINE_RAW_PROVIDER=gcs`
 builds the GCS adapter when the bucket is set and HMAC keys are absent. Any
 other name stays unconfigured.
 
-`bulls96.enabled` requires the acknowledged managed data plane, an external
-runtime Secret, and a dockerconfigjson image-pull Secret. After Memorystore is
+`bulls96.enabled` requires the acknowledged managed data plane and an external
+runtime Secret. The GKE node identity pulls the private Artifact Registry image
+without a dockerconfigjson Secret. After Memorystore is
 `READY`, an apply-time Action reads its public service-CA bundle from the exact
 Redis Admin resource and passes that bundle to the chart. `/readyz` and
 `/datapathz` perform a CA-validated, passwordless Redis `PING`; static
@@ -371,12 +372,14 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
 - An omitted or `enabled: false` bulls96 block does not throw and does not
   install the release. An enabled block emits the release only with the
   acknowledged managed data plane and named external Secrets. Nothing in that
-  path has been applied by this code change.
+  path is declarative; the later live application proof is recorded at the top
+  of this guide.
 
 Release boundaries that remain deliberate:
 
 - The runtime service account is not granted `secretAccessor`; Kubernetes
-  Secrets remain externally populated. The private image requires the named
+  Secrets remain externally populated. The services image is pulled from the
+  stage's private Artifact Registry by the GKE node identity, without an
   image-pull Secret.
 - `/readyz` and `/datapathz` require a real CA-validated Redis `PING` only when
   the GCP data-path probe is armed. The S3 default is unchanged.
@@ -384,17 +387,20 @@ Release boundaries that remain deliberate:
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
   is written.
-- No product create, write, read, indexed search, manifest replay, or product
-  teardown has run on GCP. The substrate is reconciled and its provider-path
-  proof is recorded below; that does not close the application gaps.
+- The initial 2026-10-30 substrate run did not exercise product routes. The
+  later 2026-10-31 application proof recorded above exercised authenticated
+  ingest, scrubbed object landing, Cloud SQL indexing/classification, encrypted
+  summary readback, and tenant-isolated trace reads. V1 indexed search,
+  manifest replay through a product route, Relaycast HA, and full product
+  teardown remain unproved.
 
 ## Apply, verify, and teardown
 
 The substrate deployment and its live provider-path verification completed on
-2026-10-30. The application charts remained disabled, so product create,
-indexed search, manifest replay, application database access, Relaycast
-availability, and full product teardown remain unproved. Static work does not
-wait on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down`
+2026-10-30. The base application proof completed on 2026-10-31 as recorded at
+the top of this guide. V1 indexed search, manifest replay through a product
+route, Relaycast HA, and full product teardown remain unproved. Static work
+does not wait on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down`
 refuse every `gcp-*` stage. `bin/96bulls plan gcp-*` calls
 `bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
 and is not proof. A non-zero Alchemy status exits the wrapper with that
