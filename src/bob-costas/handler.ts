@@ -15,6 +15,7 @@ import { createHash } from "node:crypto";
 import { zstdDecompressSync } from "node:zlib";
 import {
   PipelineError,
+  parseSessionKey,
   rawChunkKey,
   readAll,
   type ManifestReader,
@@ -114,23 +115,36 @@ interface Outcome {
   records: number;
 }
 
-async function buildOutcome(
-  kind: SummaryKind,
-  m: ManifestV1,
-  deps: BobCostasDeps,
-): Promise<Outcome> {
-  const none = { tokensIn: 0, tokensOut: 0, records: 0 };
-  // Scrub quarantine: an unscrubbed session is never read.
-  if (!m.raw.scrub) return { status: "quarantined", ...none };
-  if (m.raw.format === "sqlite-rows") return { status: "unsupported", ...none };
+/**
+ * The session's location, including the deployment prefix the manifest lives
+ * under (`<PIPELINE_KEY_PREFIX>[/<org>]`, E3): chunks and the summary object
+ * sit beside the manifest, never at the unprefixed `v1/...` key.
+ */
+function sessionLocation(m: ManifestV1, manifestKey: string) {
   const s = m.session;
-  const loc = {
+  const prefix = parseSessionKey(manifestKey)?.prefix;
+  return {
+    ...(prefix ? { prefix } : {}),
     workspaceId: s.workspace_id,
     machineId: s.machine_id,
     harness: s.harness,
     sessionId: s.session_id,
     startDate: s.started_at.slice(0, 10),
   };
+}
+
+async function buildOutcome(
+  kind: SummaryKind,
+  m: ManifestV1,
+  deps: BobCostasDeps,
+  manifestKey: string,
+): Promise<Outcome> {
+  const none = { tokensIn: 0, tokensOut: 0, records: 0 };
+  // Scrub quarantine: an unscrubbed session is never read.
+  if (!m.raw.scrub) return { status: "quarantined", ...none };
+  if (m.raw.format === "sqlite-rows") return { status: "unsupported", ...none };
+  const s = m.session;
+  const loc = sessionLocation(m, manifestKey);
   const lines: string[] = [];
   for (const chunk of m.raw.chunks) {
     const key = rawChunkKey(
@@ -209,13 +223,19 @@ export function bobCostasHandler(
       return { status: "skipped", reason: "stale_revision" };
     const ids = { orgId: message.ctx.orgId, workspaceId: s.workspace_id };
     // Current only if it is the same revision and content and, when ready, under the current key
-    // (after a rotation the summary is re-encrypted rather than stranded on the old key).
+    // (after a rotation the summary is re-encrypted rather than stranded on the old key) and at
+    // the object key beside this manifest (a session moved under a prefix is rebuilt there).
     const currentKeyId = (await deps.keyring.currentKey(ids)).keyId;
+    const expectedKey = summaryObjectKey(
+      sessionLocation(m, pointer.manifestKey),
+      kind,
+    );
     if (
       row &&
       Number(row.revision) === m.revision &&
       row.content_sha256 === m.raw.content_sha256 &&
-      (row.status !== "ready" || row.key_id === currentKeyId)
+      (row.status !== "ready" ||
+        (row.key_id === currentKeyId && row.object_key === expectedKey))
     ) {
       // The encrypted object and pointer are current, but a previous run may have
       // failed after COMMIT and before the directory write. Reconcile the directory
@@ -324,14 +344,8 @@ export function bobCostasHandler(
       return { status: "skipped", reason: "summary_current" };
     }
 
-    const outcome = await buildOutcome(kind, m, deps);
-    const loc = {
-      workspaceId: s.workspace_id,
-      machineId: s.machine_id,
-      harness: s.harness,
-      sessionId: s.session_id,
-      startDate: s.started_at.slice(0, 10),
-    };
+    const outcome = await buildOutcome(kind, m, deps, pointer.manifestKey);
+    const loc = sessionLocation(m, pointer.manifestKey);
     const key = summaryObjectKey(loc, kind);
     const current = { revision: m.revision, manifestSha256: manifestSha256(m) };
     const record: SummaryRecord = {
