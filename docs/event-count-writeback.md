@@ -231,9 +231,12 @@ NOLOGIN, has no BYPASSRLS and has no privilege on any table.
   Tenant identity comes from that job's row, and enqueue accepts only a
   `normalized-ready` record matching it. The role can claim any tenant's job, and
   after that can write only about that session.
-- **Still to build:** `pollPostgresStage`, `postgresPipelineQueue` and the stores use
-  the tables directly, so a poller adapter must call these functions instead. The
-  worker, its login and its object-store IAM are also separate work.
+- **Consumer:** `pollFileNormalize` matches `pollPostgresStage` step for step, and
+  `src/normalizer/main.ts` runs it. It refuses a login with table access, or
+  normalization switched off. It can't use `runWorker`, which reads the ledger and
+  tables directly.
+- **Still to do:** the worker's login and object-store IAM, and an image and stack to
+  run it. None of that is deployed.
 
 ## Failure and DLQ
 
@@ -251,6 +254,14 @@ same replay path. Only `applied` makes a count authoritative. `file-normalize`
 | Mismatch | `count_conflict` | DLQ at once, and nothing is written |
 | `output_divergent` | `count_conflict` | DLQ at once, and nothing is written. The session fails the gate until a version bump or a fix and replay. Changed runtime Unicode tables can cause this too |
 | Marker missing | `relayhistory_export_marker_missing` | `file-normalize` refuses without retries, so no record exists |
+| Acceptance missing | `relayhistory_acceptance_missing` | Same |
+| Export provenance | `relayhistory_export_provenance` | Same |
+| Event identity | `relayhistory_event_identity` | Same |
+| Session too large | `relayhistory_session_too_large` | Same |
+
+Each of the `relayhistory_*` refusals goes to the `file-normalize` DLQ. No record
+exists, so the session has no count and fails the gate until it's fixed and replayed.
+These four need confirming once the repin to #57's reviewed head lands.
 
 ## Metrics
 
@@ -309,11 +320,11 @@ across revisions, a backfill without one is refused rather than skipped, and a
 
 Done in #64: the migration, function, trigger, stage registration, typed record,
 handlers, consumer and DLQ path, with tests. Done in #71: the worker's queue
-functions.
+functions, poller adapter and entrypoint.
 
 Remaining:
 
-1. The poller adapter and the `file-normalize` worker.
+1. Repin to the reviewed #57 head by replaying these commits (coordinator approved).
 2. Confirm the login in `HOOPDB_URL` can take `session_count_writer`. Applying the
    grant is a live change and needs Khaliq's OK.
 3. Add the stage to the sampler's alert stages once #47 lands.
