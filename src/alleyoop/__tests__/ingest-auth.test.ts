@@ -36,6 +36,10 @@ import {
   type Bindings,
   type SessionLocation,
   type SqlExecutor,
+  attestReader,
+  MANIFEST_READERS,
+  postgresReadinessStore,
+  selfCheckManifestEpochs,
 } from "../../shared/vendor.ts";
 import { sqlPipelineEventSink } from "../../hoopdb/sink.ts";
 import { buildIngestApp } from "../ingest.ts";
@@ -687,7 +691,7 @@ describe("buildIngestApp auth (production composition)", () => {
     const liveManifest = {
       schema_v: 1, layout: "v1", trace_id: TRACE, revision: 1, created_at: AT, updated_at: AT,
       session: { workspace_id: WORKSPACE, machine_id: live.machineId, harness: live.harness, session_id: live.sessionId, started_at: AT },
-      writer: { delivery_instance_id: live.machineId, plugin_version: "test" },
+      writer: { delivery_instance_id: live.machineId, plugin_version: "96bulls-courier/0.3.0" },
       raw: {
         owner: live.machineId, state: "open", updated_at: AT, format: "ndjson", compression: "zstd", chunk_count: 1,
         raw_bytes: liveSealed.entry.bytes, stored_bytes: liveSealed.entry.stored_bytes,
@@ -789,7 +793,24 @@ describe("buildIngestApp auth (production composition)", () => {
     expect((await post(token, appended, { eTag: '"stale"' })).status).toBe(409);
     expect(await count("sessions.migration_assertion_uses")).toBe(0);
 
+    // The activation gate, on the real queue and ledger: closed, the commit is
+    // refused with a retry time, a job waits, and the assertion stays unspent.
+    process.env.MANIFEST_READINESS_KEY = "test-readiness-key";
+    const closed = await post(token, appended);
+    expect(closed.status).toBe(409);
+    expect(((await closed.json()) as { error: { code: string } }).error.code).toBe("activation_required");
+    expect(closed.headers.get("Retry-After")).toBe("60");
+    expect(await count("sessions.migration_assertion_uses")).toBe(0);
+    const waiting = await pgExecutor().query<{ work_key: string }>(
+      "SELECT work_key FROM sessions.pipeline_jobs WHERE stage = 'backfill-activation'",
+    );
+    expect(waiting.rows.map((row) => row.work_key)).toEqual([`backfill-activation:${key}:${upload.grant_id}`]);
+
+    // Readers attest, and the same commit lands.
+    for (const reader of MANIFEST_READERS)
+      await attestReader({ reader, key: "test-readiness-key", store: postgresReadinessStore(pgExecutor()), selfCheck: selfCheckManifestEpochs, releaseSha: "abc123" });
     const commit = await post(token, appended);
+    delete process.env.MANIFEST_READINESS_KEY;
     expect(commit.status).toBe(202);
     const workKey = ((await commit.json()) as { workKey: string }).workKey;
     expect(workKey).toBe(`${key}@${upload.entry_sha256}@r2`);
