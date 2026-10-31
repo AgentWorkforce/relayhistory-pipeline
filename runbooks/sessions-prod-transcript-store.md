@@ -19,7 +19,7 @@ recorded in the inputs' `approval` record where the stack checks it
 | Resource | Name | Settings |
 | --- | --- | --- |
 | S3 bucket | `96bulls-aws-sessions-prod-transcripts-941433935742` | Versioned. SSE-KMS with its own CMK, **S3 Bucket Key off**, SSE-C blocked. Block Public Access (all four). BucketOwnerEnforced. Object Lock **off**. Server access logs to the log bucket. Lifecycle: noncurrent versions expire after 1 day, expired delete markers removed, incomplete multipart uploads aborted after 1 day. |
-| Bucket policy | (on the bucket) | Deny non-TLS; deny TLS < 1.2; deny `DeleteObject`/`DeleteObjectVersion` to everyone but the eraser; deny a PUT naming non-KMS encryption or another KMS key. No Allow statements. |
+| Bucket policy | (on the bucket) | Deny non-TLS; deny TLS < 1.2; deny `DeleteObject`/`DeleteObjectVersion` to everyone but the eraser; deny a PUT whose encryption header is anything but SSE-KMS naming this key (including `aws:kms` with no key id, which S3 would encrypt with the AWS managed `aws/s3` key). A PUT with no encryption header gets the bucket default. No Allow statements. |
 | KMS key + alias | `alias/96bulls-aws-sessions-prod-transcripts` | Rotation on, 30-day deletion window. Root administers but cannot use. Writer: `GenerateDataKey` + `Decrypt`; reader: `Decrypt`; both only via `s3.us-east-1.amazonaws.com`, from this account, for objects under `96bulls/` in this bucket (encryption context `aws:s3:arn`). |
 | S3 bucket | `96bulls-aws-sessions-prod-access-logs-941433935742` | Versioned, SSE-S3 (server access logs cannot be delivered to an SSE-KMS bucket), Block Public Access, owner-enforced, TLS only. Accepts logs only from the transcripts bucket. Logs expire after 90 days. |
 | CloudTrail | `96bulls-aws-sessions-prod-trail` | Multi-region, log file validation, own KMS key (`alias/96bulls-aws-sessions-prod-trail`) and versioned bucket (`96bulls-aws-sessions-prod-trail-941433935742`, 365-day retention). Management events plus **S3 data events for the transcripts bucket only**. The account had no trail before this stage. |
@@ -97,6 +97,27 @@ without stopping an attacker who also runs a Worker.
 Separate users per job (writer, reader, eraser) follow S5. The Worker holds only
 the writer key. Reader and eraser keys are created only when their consumers
 exist (the history indexer; the erasure job), each with its own approval.
+
+### Residual risks (accepted, with detection)
+
+- **The writer key covers every org.** One Worker serves every tenant, so its
+  key can put under any `96bulls/<org>/` prefix. Tenant isolation for writes is
+  the Worker's: the org comes from the verified RelayAuth token and
+  `prefixAllowed` binds the key prefix to it. Per-org IAM users would mean one
+  key per org held by the same Worker, which gains nothing. A leaked key cannot
+  delete or read old versions. An overwrite leaves the previous version
+  noncurrent for about a day (the erasure-SLA trade-off), and every PUT is in
+  the CloudTrail data events with its access key id. Follow-up: once the
+  Worker's conditional headers are confirmed end to end (it sends
+  `If-None-Match: *` on creates, relayhistory-cloud `object-store/src/s3.ts`),
+  make `raw/` and `summary/` create-only in the bucket policy
+  (`s3:if-none-match`), so even the writer cannot overwrite a chunk.
+- **Key administrators can grant themselves decryption.** The root statement
+  keeps `kms:PutKeyPolicy` so the key cannot be locked out; the
+  `AdministratorAccess` SSO role can therefore edit the policy. That is a
+  logged, deliberate act (`PutKeyPolicy` is a CloudTrail management event), not
+  a silent read path. Review `PutKeyPolicy` and `CreateGrant` events on this key
+  with the trail.
 
 ### Erasure (K-45: logical delete immediately, physical purge within 48 h)
 
@@ -232,7 +253,7 @@ The Worker (relayhistory-cloud, production environment) reads:
 | `PIPELINE_RAW_PROVIDER` | `s3` | var |
 | `PIPELINE_RAW_S3_BUCKET` | `96bulls-aws-sessions-prod-transcripts-941433935742` | var |
 | `PIPELINE_RAW_S3_REGION` | `us-east-1` | var |
-| `PIPELINE_RAW_S3_SSE` | `aws:kms` (the bucket default key applies; do not name a key) | var |
+| `PIPELINE_RAW_S3_SSE` | **unset**. The bucket default (this CMK) applies. `aws:kms` would send the header without a key id, which means the AWS managed `aws/s3` key, and the bucket policy refuses it with 403. | (none) |
 | `PIPELINE_KEY_PREFIX` | `96bulls` | var |
 | `PIPELINE_ORG_FROM_PREFIX` | `true` | var |
 | `PIPELINE_RAW_S3_ACCESS_KEY_ID` | from 1Password | secret |
@@ -296,7 +317,7 @@ gated by A6 and K-2) writes into this bucket:
   without them it is a dry run;
 - to `96bulls/<org>/v1/...`, create-only (`If-None-Match: *`), idempotent by
   `raw.content_sha256`, newest sessions first;
-- with SSE-KMS by the bucket default (the bucket policy refuses another key);
+- with SSE-KMS by the bucket default: no encryption header, or `aws:kms` with the key ARN (the bucket policy refuses any other);
 - from a host in `us-east-1`, so transcript content does not leave the region
   (regional boundaries).
 

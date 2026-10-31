@@ -104,9 +104,21 @@ describe("transcript store: bucket hardening", () => {
     expect(d.Condition).toEqual({ ArnNotEquals: { "aws:PrincipalArn": eraserArn } });
   });
 
-  it("refuses a PUT that names other encryption or another KMS key (only when the header is present)", () => {
+  it("refuses a PUT that names other encryption, another KMS key, or aws:kms with no key id (aws/s3)", () => {
     expect(sid("DenyOtherEncryption").Condition).toEqual({ StringNotEquals: { "s3:x-amz-server-side-encryption": "aws:kms" }, Null: { "s3:x-amz-server-side-encryption": "false" } });
-    expect(sid("DenyOtherKmsKey").Condition).toEqual({ StringNotEquals: { "s3:x-amz-server-side-encryption-aws-kms-key-id": KEY }, Null: { "s3:x-amz-server-side-encryption-aws-kms-key-id": "false" } });
+    const k = sid("SseHeaderMustNameThisKey");
+    expect(k.Effect).toBe("Deny");
+    expect(k.Action).toEqual(["s3:PutObject"]);
+    expect(k.Condition).toEqual({ Null: { "s3:x-amz-server-side-encryption": "false" }, StringNotEqualsIfExists: { "s3:x-amz-server-side-encryption-aws-kms-key-id": KEY } });
+    // Evaluate the condition for the three request shapes that matter.
+    const denies = (headers: Record<string, string>) => {
+      const sseSent = "s3:x-amz-server-side-encryption" in headers;
+      const keyId = headers["s3:x-amz-server-side-encryption-aws-kms-key-id"];
+      return sseSent && (keyId === undefined || keyId !== KEY);
+    };
+    expect(denies({})).toBe(false); // bucket default: this key
+    expect(denies({ "s3:x-amz-server-side-encryption": "aws:kms" })).toBe(true); // would be aws/s3
+    expect(denies({ "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": KEY })).toBe(false);
   });
 
   it("is versioned, SSE-KMS with its own key and no bucket key, SSE-C blocked, all public access blocked, owner-enforced, Object Lock off, logged", () => {

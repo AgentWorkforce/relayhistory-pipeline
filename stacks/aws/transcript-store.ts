@@ -158,9 +158,10 @@ export function trailLifecycleRules() {
 
 /**
  * Bucket policy for the transcripts bucket (statements only, as AWS.S3.Bucket takes them):
- * TLS (1.2+) only; only the eraser deletes objects or versions; a PUT that names
- * any encryption other than SSE-KMS with this bucket's key is refused (SSE-C is
- * blocked separately by the encryption configuration).
+ * TLS (1.2+) only; only the eraser deletes objects or versions; a PUT that sends
+ * any encryption header other than SSE-KMS naming this bucket's key is refused,
+ * including `aws:kms` without a key id (S3 would use `aws/s3`). SSE-C is blocked
+ * separately by the encryption configuration.
  */
 export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string }) {
   return [
@@ -190,12 +191,16 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
       Condition: { StringNotEquals: { "s3:x-amz-server-side-encryption": "aws:kms" }, Null: { "s3:x-amz-server-side-encryption": "false" } },
     },
     {
-      Sid: "DenyOtherKmsKey",
+      // A request that sends `x-amz-server-side-encryption` overrides the bucket default. With
+      // `aws:kms` and no key id S3 uses the AWS managed `aws/s3` key, which this key policy does
+      // not govern, so any SSE header must also name this key. A PUT with no SSE header gets the
+      // bucket default (this key): that is how the Worker writes (PIPELINE_RAW_S3_SSE unset).
+      Sid: "SseHeaderMustNameThisKey",
       Effect: "Deny" as const,
       Principal: "*",
       Action: ["s3:PutObject"],
       Resource: [`${i.bucketArn}/*`],
-      Condition: { StringNotEquals: { "s3:x-amz-server-side-encryption-aws-kms-key-id": i.keyArn }, Null: { "s3:x-amz-server-side-encryption-aws-kms-key-id": "false" } },
+      Condition: { Null: { "s3:x-amz-server-side-encryption": "false" }, StringNotEqualsIfExists: { "s3:x-amz-server-side-encryption-aws-kms-key-id": i.keyArn } },
     },
   ];
 }
