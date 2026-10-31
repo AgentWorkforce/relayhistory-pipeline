@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { eksChartValues } from "../aws/eks.ts";
 import {
   claimlessWindowEnv,
@@ -8,6 +9,7 @@ import {
   bulls96ReleaseValues,
   GCP_APPROVED_SERVICES_IMAGE,
 } from "../gcp/config.ts";
+import { localClaimEnv } from "../local/topology.ts";
 
 describe("claimlessWindowEnv", () => {
   const from = "2026-11-01T00:00:00.000Z";
@@ -103,6 +105,29 @@ const compositions: [string, (window?: ClaimlessWindow) => Rendered][] = [
       ) as unknown as Rendered,
   ],
 ];
+
+describe("the local composition", () => {
+  const from = "2026-11-01T00:00:00.000Z";
+  const until = "2026-11-04T00:00:00.000Z";
+
+  test("is off by default", () => {
+    expect(localClaimEnv(undefined)).toEqual({});
+  });
+
+  test("propagates a configured window to the ingest", () => {
+    expect(localClaimEnv({ from, until })).toEqual({
+      MANIFEST_MACHINE_CLAIM: "compat",
+      MANIFEST_MACHINE_CLAIM_COMPAT_FROM: from,
+      MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: until,
+    });
+    expect(() => localClaimEnv({ from, until: "2026-11-05T00:00:00.000Z" })).toThrow(/72 hours/);
+  });
+
+  test("alchemy.run.ts composes the ingest through it", () => {
+    const stack = readFileSync(new URL("../../alchemy.run.ts", import.meta.url), "utf8");
+    expect(stack).toContain("...localClaimEnv(inputs.claimlessWindow)");
+  });
+});
 
 describe.each(compositions)("the rendered %s composition", (_name, render) => {
   const from = "2026-11-01T00:00:00.000Z";

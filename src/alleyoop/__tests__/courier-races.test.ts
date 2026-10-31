@@ -669,27 +669,10 @@ describe("machine claim", () => {
         ).toBe(false);
       });
 
-      test("a restated FROM cannot extend it: the first activation decides", async () => {
-        // Each pair is within 72 hours of itself, and past the first activation's.
-        const restated = env(hours(48), hours(100));
-        expect(await claimlessWindowOpen(restated, first, at(hours(50)))).toBe(
-          false,
-        );
-        expect(
-          await claimlessWindowOpen(
-            env(hours(70), hours(140)),
-            first,
-            at(hours(71)),
-          ),
-        ).toBe(false);
-        // Inside the first window, a restatement is still fine.
-        expect(
-          await claimlessWindowOpen(
-            env(hours(1), hours(60)),
-            first,
-            at(hours(2)),
-          ),
-        ).toBe(true);
+      test("a second activation with a different FROM is refused", async () => {
+        expect(await claimlessWindowOpen(env(hours(48), hours(100)), first, at(hours(50)))).toBe(false);
+        expect(await claimlessWindowOpen(env(hours(1), hours(60)), first, at(hours(2)))).toBe(false);
+        expect(await claimlessWindowOpen(env(0, hours(60)), first, at(hours(2)))).toBe(true);
       });
 
       test("fails closed without the record", async () => {
@@ -709,14 +692,14 @@ describe("machine claim", () => {
         w.openClaimlessWindow();
         expect((await status(w, version)).status).toBe(200);
         const fixed = w.gate.firstActivation!;
-        w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
-          Date.now() - 1000,
-        ).toISOString();
-        w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = new Date(
-          Date.parse(fixed) + hours(72) + 60_000,
-        ).toISOString();
+        const until = w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL;
+        w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(Date.now() - 1000).toISOString();
         expect((await status(w, version)).status).toBe(403);
         expect(w.gate.firstActivation).toBe(fixed);
+
+        w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = fixed;
+        expect(w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL).toBe(until);
+        expect((await status(w, version)).status).toBe(200);
 
         w.gate.activationDown = true;
         w.openClaimlessWindow();

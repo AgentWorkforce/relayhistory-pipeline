@@ -53,6 +53,7 @@ import {
   verifyMigrationAssertion,
 } from "../auth/relayauth.js";
 import {
+  migrationKindAllowsRoute,
   migrationPairAuthorized,
   migrationRouteAllowed,
 } from "../lib/pipeline/migration-assertions.js";
@@ -61,29 +62,62 @@ export const requireAuth = createMiddleware<AppEnv>(async (c, next) => {
   const header = c.req.header("Authorization") ?? "";
   const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
   const deny = (status: 401 | 403, code: string, message: string) =>
-    c.json({ error: { code, message }, correlationId: c.get("correlationId") ?? "" }, status);
-  if (!token) return deny(401, "missing_authorization", "missing Authorization header");
+    c.json(
+      { error: { code, message }, correlationId: c.get("correlationId") ?? "" },
+      status,
+    );
+  if (!token)
+    return deny(401, "missing_authorization", "missing Authorization header");
   if (token.startsWith("rth_at_") || token.startsWith("rth_st_"))
-    return deny(401, "unsupported_token", "opaque relayhistory tokens are not supported by this deployment");
+    return deny(
+      401,
+      "unsupported_token",
+      "opaque relayhistory tokens are not supported by this deployment",
+    );
   // As upstream: the broad interim bearer verifies any RelayAuth JWT; the
   // dedicated, default-off RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS path
   // admits only migration assertions, and a migration assertion needs that
   // flag on either path (auth/relayauth.ts).
   const interim = c.env?.ALLOW_INTERIM_RELAYAUTH_BEARER === "true";
-  const migrationOnly = !interim && c.env?.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS === "true";
+  const migrationOnly =
+    !interim && c.env?.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS === "true";
   if (!interim && !migrationOnly)
-    return deny(401, "auth_not_configured", "bearer auth is not enabled (ALLOW_INTERIM_RELAYAUTH_BEARER)");
+    return deny(
+      401,
+      "auth_not_configured",
+      "bearer auth is not enabled (ALLOW_INTERIM_RELAYAUTH_BEARER)",
+    );
   let auth: AuthContext;
   try {
-    auth = interim ? await verifyAgentRelayToken(token, c.env) : await verifyMigrationAssertion(token, c.env);
+    auth = interim
+      ? await verifyAgentRelayToken(token, c.env)
+      : await verifyMigrationAssertion(token, c.env);
   } catch (err) {
     if (err instanceof IdentityError) return deny(401, err.code, err.message);
     throw err;
   }
+  if (
+    auth.migration &&
+    migrationRouteAllowed(c.req.method, c.req.path) &&
+    !migrationKindAllowsRoute(auth.migration.upload, c.req.method, c.req.path)
+  )
+    return deny(
+      403,
+      "migration_token_class_forbidden",
+      "this migration token class does not reach this route",
+    );
   if (auth.migration && !migrationRouteAllowed(c.req.method, c.req.path))
-    return deny(403, "migration_assertion_route", "migration assertions are accepted only by the pipeline upload routes");
+    return deny(
+      403,
+      "migration_assertion_route",
+      "migration assertions are accepted only by the pipeline upload routes",
+    );
   if (auth.migration && !migrationPairAuthorized(auth))
-    return deny(403, "migration_workspace_forbidden", "the migration assertion's signed workspace and user are not its grant pair");
+    return deny(
+      403,
+      "migration_workspace_forbidden",
+      "the migration assertion's signed workspace and user are not its grant pair",
+    );
   c.set("auth", auth);
   await next();
 });

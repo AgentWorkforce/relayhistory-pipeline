@@ -1,9 +1,12 @@
--- When each deployment first opened the legacy machine-claim window. The 72-hour
--- cap counts from here, so restating the window's dates cannot extend it: rows
--- are written once and never change. Applying this to a real database needs
--- Khaliq's explicit OK; see runbooks/manifest-activation.md.
+-- When the legacy machine-claim window first opened. There is one identity per
+-- compat class for the whole database, not one per deployment: a new deployment
+-- label must not open a new window, so stages sharing a database share it. The
+-- row is written once and never changes, so the window's dates cannot be
+-- restated. Applying this to a real database needs Khaliq's explicit OK; see
+-- runbooks/manifest-activation.md.
 create table sessions.claimless_window_activations (
-  deployment_id text primary key,
+  compat_class text primary key
+    check (compat_class = 'manifest_machine_claim_compat_v1'),
   first_activation timestamptz not null,
   recorded_at timestamptz not null default now()
 );

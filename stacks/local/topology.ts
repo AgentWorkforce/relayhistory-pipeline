@@ -8,6 +8,8 @@
  * adapter, HoopDb = Postgres, Referee = session-state classifier, Bob Costas =
  * summaries.
  */
+import { claimlessWindowEnv, type ClaimlessWindow } from "../claimless-window.ts";
+
 export const STACK = "96bulls";
 
 /** Images pinned by tag now; digests go into versions.lock.json on first release. */
@@ -89,4 +91,9 @@ export const SERVICES_CONTAINER_UID = 1000;
  */
 export function summaryKeyAccess(hostUid: number, containerUid = SERVICES_CONTAINER_UID): { mode: 0o600; aclReadForUid?: number } {
   return hostUid === containerUid ? { mode: 0o600 } : { mode: 0o600, aclReadForUid: containerUid };
+}
+
+/** The ingest's env for a local stage. Default off: its tokens carry the claim. */
+export function localClaimEnv(window: ClaimlessWindow | undefined): Record<string, string> {
+  return Object.fromEntries(claimlessWindowEnv(window).map(({ name, value }) => [name, value]));
 }

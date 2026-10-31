@@ -91,7 +91,12 @@ export const GCP_RUNTIME_SHAPE = {
   autopilot: false,
   nodeLocation: "us-central1-a",
   machineType: "e2-medium",
-  initialNodeCount: 1,
+  // One e2-medium exposes only ~940m allocatable CPU after GKE reservations;
+  // system pods plus RelayAuth consume ~921m before the 96Bulls release starts.
+  // Each additional node also carries GKE DaemonSet reservations, so three
+  // nodes are the minimum shape that can schedule the migration and four
+  // runtime Deployments together.
+  initialNodeCount: 3,
   natIpAllocateOption: "MANUAL_ONLY",
   natLogFilter: "ALL",
   nodeOauthScope: "https://www.googleapis.com/auth/cloud-platform",
@@ -490,6 +495,10 @@ export function relayauthChartValues(i: RelayAuthChartInputs, defaultStorageClas
   return {
     replicaCount: 1,
     existingSecret: i.existingSecretName,
+    // The conformance History origin is an in-cluster HTTP service. RelayAuth
+    // remains fail-closed for public HTTP origins; this chart switch permits
+    // only its private/internal-host validation path.
+    relayhistory: { allowPrivateHttpOrigin: true },
     ...(i.baseUrl ? { baseUrl: i.baseUrl, issuer: i.baseUrl } : {}),
     persistence: { storageClass: i.storageClass ?? defaultStorageClass },
     jwksIngress: i.baseUrl

@@ -51,10 +51,12 @@ It does not let it deliver:
 - `until` is at most 72 hours after `from`. A longer window fails closed, at
   composition and in ingest, and so does a bad or missing date. It shuts itself at
   `until`.
-- The 72 hours count from this deployment's **first activation**, written once
-  to `sessions.claimless_window_activations` and never changed. A database
-  trigger refuses updates and deletes. Restating `from` and `until` cannot extend
-  the window, and a deployment gets one window. If that record cannot be read,
+- There is **one activation for the whole database**, written once to
+  `sessions.claimless_window_activations` as
+  `manifest_machine_claim_compat_v1`. A database trigger refuses updates, deletes
+  and truncates. `from` must equal it and `until` stay within 72 hours of it, so
+  there is one window, ever: restated dates and new deployment labels open
+  nothing, and stages sharing a database share it. If the record cannot be read,
   the window stays shut.
 - While it is open **this system is not machine-bound**. A read gets the object
   version and nothing else.
