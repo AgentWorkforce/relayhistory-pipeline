@@ -17,7 +17,7 @@
  */
 import { spawnSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
@@ -31,6 +31,7 @@ import {
   generation,
   MARKER_PENDING_SQL,
 } from "../../src/hoopdb/migrate.ts";
+import { NON_CREATE_STEPS } from "../../src/hoopdb/migration-sentinels.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const HOST = process.env.PGPROOF_HOST ?? "127.0.0.1";
@@ -134,9 +135,63 @@ function migrate(
   ].map((m) => m[1]!);
   return { exit: r.status ?? -1, code: codes.at(-1) ?? "" };
 }
-async function fresh(db: string): Promise<void> {
-  await sql("postgres", `DROP DATABASE IF EXISTS ${db}`);
+/** A fresh database owned by hoop; the selfhosted runtime-role bootstrap runs IN it for each role (it revokes TEMPORARY from PUBLIC there and grants the role CONNECT). */
+async function fresh(db: string, runtimeRoles: string[] = []): Promise<void> {
+  await sql("postgres", `DROP DATABASE IF EXISTS ${db} WITH (FORCE)`);
   await sql("postgres", `CREATE DATABASE ${db} OWNER hoop`);
+  for (const r of runtimeRoles) {
+    const b = psql(db, [
+      "-v",
+      `runtime_role=${r}`,
+      "-v",
+      "runtime_login=true",
+      "-f",
+      RUNTIME_BOOT,
+    ]);
+    if (!b.ok) throw new Error(`runtime bootstrap failed in ${db}: ${b.out}`);
+  }
+}
+const SCHEMA_FILES = [
+  ...readdirSync(join(ROOT, "supabase/migrations"))
+    .filter((f) => f.endsWith(".sql"))
+    .sort()
+    .map((f) => ({
+      name: `upstream:${f}`,
+      path: join(ROOT, "supabase/migrations", f),
+    })),
+  ...readdirSync(join(ROOT, "src/hoopdb/migrations"))
+    .filter((f) => f.endsWith(".sql"))
+    .sort()
+    .map((f) => ({
+      name: `96bulls:${f}`,
+      path: join(ROOT, "src/hoopdb/migrations", f),
+    })),
+];
+/** Applies schema steps [0, upTo] as hoop and writes ledger rows for [0, ledgered). */
+async function prefixDb(
+  db: string,
+  upTo: number,
+  ledgered: number,
+): Promise<void> {
+  for (let i = 0; i <= upTo; i++) {
+    const r = psql(db, ["-1", "-f", SCHEMA_FILES[i]!.path], "hoop");
+    if (!r.ok) throw new Error(`applying ${SCHEMA_FILES[i]!.name}: ${r.out}`);
+  }
+  await sql(
+    db,
+    "CREATE TABLE sessions.__96bulls_migrations (name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())",
+    "hoop",
+  );
+  for (let i = 0; i < ledgered; i++) {
+    const sha = createHash("sha256")
+      .update(readFileSync(SCHEMA_FILES[i]!.path, "utf8"))
+      .digest("hex");
+    await sql(
+      db,
+      `INSERT INTO sessions.__96bulls_migrations (name, sha256) VALUES ('${SCHEMA_FILES[i]!.name}', '${sha}')`,
+      "hoop",
+    );
+  }
 }
 /** Ledger + marker + grants on the approved objects, or "absent". */
 async function snapshot(db: string): Promise<string> {
@@ -206,7 +261,16 @@ for (const d of (
   )
 ).rows)
   await sql("postgres", `DROP DATABASE ${d.datname} WITH (FORCE)`);
-for (const r of ["g6_rt", "g6_rt2", "g6_bad", "g6_m", "g6_never"]) {
+for (const r of [
+  "g6_rt",
+  "g6_rt2",
+  "g6_rt3",
+  "g6_bad",
+  "g6_m",
+  "g6_never",
+  "g6_other",
+  "g6_caller",
+]) {
   for (const d of (
     await sql("postgres", "SELECT datname FROM pg_database WHERE datallowconn")
   ).rows)
@@ -231,10 +295,11 @@ if (
 if (!psql("postgres", ["-f", BOOT]).ok)
   throw new Error("worker bootstrap failed");
 
+await fresh("g6_boot");
 await check(
   "runtime-role bootstrap creates a dedicated role and is idempotent",
   async () => {
-    const a = psql("postgres", [
+    const a = psql("g6_boot", [
       "-v",
       "runtime_role=g6_rt",
       "-v",
@@ -242,7 +307,7 @@ await check(
       "-f",
       RUNTIME_BOOT,
     ]);
-    const b = psql("postgres", [
+    const b = psql("g6_boot", [
       "-v",
       "runtime_role=g6_rt",
       "-v",
@@ -276,7 +341,7 @@ await check(
   "runtime-role bootstrap refuses a non-superuser creator (42501)",
   async () => {
     const r = psql(
-      "postgres",
+      "g6_boot",
       [
         "-v",
         "runtime_role=g6_never",
@@ -293,6 +358,9 @@ await check(
     ];
   },
 );
+
+// Its CONNECT grant on g6_boot would be a reference from another database (refused by design).
+await attempt("postgres", "DROP DATABASE IF EXISTS g6_boot WITH (FORCE)");
 
 // (a) Database mode, before any connection writes.
 await fresh("g6_mode");
@@ -336,7 +404,7 @@ for (const [name, env, code] of [
 await check(
   "migrate fails closed (42704) when the Worker role is absent",
   async () => {
-    await fresh("g6_w");
+    await fresh("g6_w", ["g6_rt"]);
     for (const d of (
       await sql(
         "postgres",
@@ -369,7 +437,7 @@ await check(
 await check(
   "migrate fails closed (55000) on a Worker role with wrong attributes",
   async () => {
-    await fresh("g6_w");
+    await fresh("g6_w", ["g6_rt"]);
     await sql("postgres", `ALTER ROLE ${W} INHERIT`);
     const m = migrate("g6_w", SELF);
     await sql("postgres", `ALTER ROLE ${W} NOINHERIT`);
@@ -383,7 +451,7 @@ await attempt("postgres", "DROP DATABASE IF EXISTS g6_w");
 await attempt("postgres", "DROP DATABASE IF EXISTS g6_mode");
 
 // (b) Runtime role: required, existing, dedicated, exact least privilege.
-await fresh("g6_rt_db");
+await fresh("g6_rt_db", ["g6_rt"]);
 await check(
   "clean migrate as hoop with the dedicated runtime role",
   async () => {
@@ -452,8 +520,32 @@ const HOSTILE: Array<[string, string]> = [
     "GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO g6_bad",
   ],
   [
-    "EXECUTE through PUBLIC",
-    "GRANT EXECUTE ON FUNCTION sessions.repo_visibility_ids(text, uuid) TO PUBLIC",
+    "EXECUTE on a trigger function (no exemption)",
+    "GRANT EXECUTE ON FUNCTION sessions.pipeline_jobs_observability() TO g6_bad",
+  ],
+  [
+    "effective TEMPORARY through PUBLIC",
+    "GRANT TEMPORARY ON DATABASE g6_rt_db TO PUBLIC",
+  ],
+  [
+    "no effective CONNECT",
+    "REVOKE CONNECT ON DATABASE g6_rt_db FROM PUBLIC; REVOKE CONNECT ON DATABASE g6_rt_db FROM g6_bad",
+  ],
+  [
+    "a PUBLIC table privilege outside sessions",
+    "CREATE TABLE public.g6_pub (x int); GRANT SELECT ON public.g6_pub TO PUBLIC",
+  ],
+  [
+    "a PUBLIC sequence privilege outside sessions",
+    "CREATE SEQUENCE public.g6_pub_seq; GRANT USAGE ON SEQUENCE public.g6_pub_seq TO PUBLIC",
+  ],
+  [
+    "EXECUTE on a SECURITY DEFINER function outside sessions (PUBLIC)",
+    "CREATE FUNCTION public.g6_definer() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+  ],
+  [
+    "default privileges in sessions granting PUBLIC",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO PUBLIC",
   ],
   [
     "a default ACL",
@@ -468,7 +560,7 @@ for (const [name, setup] of HOSTILE)
   await check(
     `hostile runtime role with ${name}: refused, ledger/marker/grants unchanged`,
     async () => {
-      psql("postgres", [
+      psql("g6_rt_db", [
         "-v",
         "runtime_role=g6_bad",
         "-v",
@@ -480,10 +572,15 @@ for (const [name, setup] of HOSTILE)
       const before = await snapshot("g6_rt_db");
       const m = migrate("g6_rt_db", { ...SELF, HOOPDB_RUNTIME_ROLE: "g6_bad" });
       const same = (await snapshot("g6_rt_db")) === before;
-      await attempt(
-        "g6_rt_db",
-        "REVOKE EXECUTE ON FUNCTION sessions.repo_visibility_ids(text, uuid) FROM PUBLIC",
-      );
+      for (const undo of [
+        "REVOKE TEMPORARY ON DATABASE g6_rt_db FROM PUBLIC",
+        "GRANT CONNECT ON DATABASE g6_rt_db TO PUBLIC",
+        "DROP TABLE IF EXISTS public.g6_pub",
+        "DROP SEQUENCE IF EXISTS public.g6_pub_seq",
+        "DROP FUNCTION IF EXISTS public.g6_definer()",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions REVOKE SELECT ON TABLES FROM PUBLIC",
+      ])
+        await attempt("g6_rt_db", undo);
       await attempt(
         "g6_rt_db",
         "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions REVOKE SELECT ON TABLES FROM g6_bad",
@@ -552,19 +649,11 @@ await check(
 // (2) The full ordered sequence: one contiguous prefix, no unledgered footprint. These run
 // in their own database with their own runtime role (g6_rt already holds approved grants
 // in g6_rt_db, and a reference from another database is refused by design).
-psql("postgres", [
-  "-v",
-  "runtime_role=g6_rt2",
-  "-v",
-  "runtime_login=true",
-  "-f",
-  RUNTIME_BOOT,
-]);
 const SEQ = { ...SELF, HOOPDB_RUNTIME_ROLE: "g6_rt2" };
 await check(
   "helm (a): only session_directory present: refused before any write",
   async () => {
-    await fresh("g6_seq");
+    await fresh("g6_seq", ["g6_rt2"]);
     await sql(
       "g6_seq",
       "CREATE SCHEMA sessions AUTHORIZATION hoop; CREATE TABLE sessions.session_directory (x int); ALTER TABLE sessions.session_directory OWNER TO hoop",
@@ -579,7 +668,7 @@ await check(
 await check(
   "helm (b): a 96bulls ledger row without upstream rows: refused, never backfilled",
   async () => {
-    await fresh("g6_seq");
+    await fresh("g6_seq", ["g6_rt2"]);
     await sql("g6_seq", `CREATE SCHEMA sessions AUTHORIZATION hoop`);
     await sql(
       "g6_seq",
@@ -598,7 +687,7 @@ await check(
 await check(
   "a recorded prefix whose later steps were applied unrecorded: refused, nothing marked",
   async () => {
-    await fresh("g6_seq");
+    await fresh("g6_seq", ["g6_rt2"]);
     migrate("g6_seq", SEQ);
     await sql(
       "g6_seq",
@@ -615,7 +704,7 @@ await check(
 await check(
   "supabase db push history naming these migrations: mixed_migration_authority",
   async () => {
-    await fresh("g6_seq");
+    await fresh("g6_seq", ["g6_rt2"]);
     await sql(
       "g6_seq",
       "CREATE SCHEMA supabase_migrations; CREATE TABLE supabase_migrations.schema_migrations (version text PRIMARY KEY); INSERT INTO supabase_migrations.schema_migrations VALUES ('20261025000000'); GRANT USAGE ON SCHEMA supabase_migrations TO hoop; GRANT SELECT ON supabase_migrations.schema_migrations TO hoop",
@@ -629,6 +718,133 @@ await check(
   },
 );
 await attempt("postgres", "DROP DATABASE IF EXISTS g6_seq");
+
+await check(
+  "selfhosted bootstrap revokes TEMPORARY from PUBLIC: an unrelated role loses it database-wide; the owner keeps it",
+  async () => {
+    await fresh("g6_tmp");
+    await attempt("postgres", "CREATE ROLE g6_other LOGIN");
+    const q = async () =>
+      (
+        await sql(
+          "g6_tmp",
+          "SELECT has_database_privilege('g6_other', 'g6_tmp', 'TEMPORARY') AS other, has_database_privilege('hoop', 'g6_tmp', 'TEMPORARY') AS owner, has_database_privilege('g6_rt3', 'g6_tmp', 'CONNECT') AS rt_connect",
+        ).catch(async () =>
+          sql(
+            "g6_tmp",
+            "SELECT has_database_privilege('g6_other', 'g6_tmp', 'TEMPORARY') AS other, has_database_privilege('hoop', 'g6_tmp', 'TEMPORARY') AS owner, null::boolean AS rt_connect",
+          ),
+        )
+      ).rows[0];
+    const before = await q();
+    const b = psql("g6_tmp", [
+      "-v",
+      "runtime_role=g6_rt3",
+      "-v",
+      "runtime_login=true",
+      "-f",
+      RUNTIME_BOOT,
+    ]);
+    const after = await q();
+    await attempt("postgres", "DROP DATABASE IF EXISTS g6_tmp WITH (FORCE)");
+    await attempt("postgres", "DROP ROLE IF EXISTS g6_other");
+    await attempt("postgres", "DROP ROLE IF EXISTS g6_rt3");
+    return [
+      b.ok &&
+        before.other === true &&
+        after.other === false &&
+        after.owner === true &&
+        after.rt_connect === true,
+      `before=${fmt(before)} after=${fmt(after)}`,
+    ];
+  },
+);
+await check(
+  "PUBLIC EXECUTE on sessions functions is revoked in the validation transaction; a trigger still fires for a caller without EXECUTE",
+  async () => {
+    await sql(
+      "g6_rt_db",
+      "GRANT EXECUTE ON FUNCTION sessions.repo_visibility_ids(text, uuid) TO PUBLIC",
+    );
+    const m = migrate("g6_rt_db", SELF);
+    const pub = (
+      await sql(
+        "g6_rt_db",
+        "SELECT count(*)::int AS n FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'sessions' AND (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0))",
+      )
+    ).rows[0].n;
+    await sql(
+      "g6_rt_db",
+      `CREATE TABLE public.g6_audit (x int);
+    CREATE TRIGGER g6_append_only BEFORE UPDATE OR DELETE ON public.g6_audit FOR EACH ROW EXECUTE FUNCTION sessions.migration_ingest_audit_append_only();
+    INSERT INTO public.g6_audit VALUES (1);
+    DO $x$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'g6_caller') THEN CREATE ROLE g6_caller LOGIN; END IF; END $x$;
+    GRANT CONNECT ON DATABASE g6_rt_db TO g6_caller; GRANT DELETE, SELECT ON public.g6_audit TO g6_caller`,
+    );
+    const exec = (
+      await sql(
+        "g6_rt_db",
+        "SELECT has_function_privilege('g6_caller', 'sessions.migration_ingest_audit_append_only()', 'EXECUTE') AS e",
+      )
+    ).rows[0].e;
+    const fired = await attempt(
+      "g6_rt_db",
+      "DELETE FROM public.g6_audit",
+      "g6_caller",
+    );
+    const left = (
+      await sql("g6_rt_db", "SELECT count(*)::int AS n FROM public.g6_audit")
+    ).rows[0].n;
+    await attempt("g6_rt_db", "DROP TABLE public.g6_audit");
+    await attempt("g6_rt_db", "DROP OWNED BY g6_caller");
+    await attempt("postgres", "DROP ROLE IF EXISTS g6_caller");
+    return [
+      m.exit === 0 &&
+        pub === 0 &&
+        exec === false &&
+        fired !== "ok" &&
+        left === 1,
+      `${fmt(m)} public_exec_fns=${pub} caller_exec=${exec} delete=${fired} rows_left=${left}`,
+    ];
+  },
+);
+await check(
+  "guardrail: a validation failure rolls the in-transaction revoke back (state unchanged)",
+  async () => {
+    await sql(
+      "g6_rt_db",
+      "GRANT EXECUTE ON FUNCTION sessions.pipeline_jobs_observability() TO PUBLIC",
+    );
+    await sql("g6_rt_db", `GRANT SELECT ON sessions.session_index TO ${W}`);
+    const acl = async () =>
+      (
+        await sql(
+          "g6_rt_db",
+          "SELECT proacl::text AS a FROM pg_proc WHERE oid = 'sessions.pipeline_jobs_observability()'::regprocedure",
+        )
+      ).rows[0].a as string;
+    const ledger = async () =>
+      (
+        await sql(
+          "g6_rt_db",
+          "SELECT md5(string_agg(name || sha256, ',' ORDER BY name)) AS l FROM sessions.__96bulls_migrations",
+        )
+      ).rows[0].l as string;
+    const before = { acl: await acl(), ledger: await ledger() };
+    const m = migrate("g6_rt_db", SELF);
+    const after = { acl: await acl(), ledger: await ledger() };
+    await sql("g6_rt_db", `REVOKE SELECT ON sessions.session_index FROM ${W}`);
+    const fixed = migrate("g6_rt_db", SELF);
+    const revoked = (await acl()) !== before.acl;
+    return [
+      m.code === "55000" &&
+        fmt(after) === fmt(before) &&
+        fixed.exit === 0 &&
+        revoked,
+      `${fmt(m)} unchanged=${fmt(after) === fmt(before)} fixed=${fmt(fixed)} revoked_after_fix=${revoked}`,
+    ];
+  },
+);
 
 // Readiness: live gate, race, verifier off + mark_pass, crash.
 await check(
@@ -727,7 +943,7 @@ await attempt("postgres", "DROP DATABASE IF EXISTS g6_rt_db");
 await check(
   "crash (SIGKILL) mid-migration: not ready; a restart passes",
   async () => {
-    await fresh("g6_crash");
+    await fresh("g6_crash", ["g6_rt2"]);
     const locker = new pg.Client({ connectionString: url(SUPER, "g6_crash") });
     await locker.connect();
     await locker.query(
@@ -772,6 +988,34 @@ await check(
     ];
   },
 );
+
+for (const name of NON_CREATE_STEPS) {
+  const i = SCHEMA_FILES.findIndex((st) => st.name === name);
+  await check(
+    `sentinel ${name}: applied and ledgered is accepted (no false positive)`,
+    async () => {
+      await fresh("g6_sent", ["g6_rt2"]);
+      await prefixDb("g6_sent", i, i + 1);
+      const m = migrate("g6_sent", SEQ);
+      return [i > 0 && m.exit === 0, fmt(m)];
+    },
+  );
+  await check(
+    `sentinel ${name}: applied but unledgered is refused before any write`,
+    async () => {
+      await fresh("g6_sent", ["g6_rt2"]);
+      await prefixDb("g6_sent", i, i);
+      const before = await snapshot("g6_sent");
+      const m = migrate("g6_sent", SEQ);
+      const same = (await snapshot("g6_sent")) === before;
+      return [
+        m.code === "unledgered_schema" && same,
+        `${fmt(m)} unchanged=${same}`,
+      ];
+    },
+  );
+  await attempt("postgres", "DROP DATABASE IF EXISTS g6_sent WITH (FORCE)");
+}
 
 await attempt("postgres", "DROP DATABASE IF EXISTS g6_rt_db");
 await attempt("postgres", "DROP DATABASE IF EXISTS g6_mode");

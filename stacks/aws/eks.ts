@@ -61,7 +61,8 @@ export { telemetryPolicy } from "./hardening.ts";
  * HOOPDB_DB_MODE, an explicit shim choice and the dedicated runtime role for the
  * migrator. There is no runtime-role default in either mode: in-cluster (selfhosted) the
  * role is created by the privileged supabase/bootstrap/hoopdb_runtime_role.sql step, run
- * as the CNPG superuser before migrate (#75 wires it); external (supabase) it is
+ * as the CNPG superuser before migrate (NOT wired here: the privileged bootstrap Job is the
+ * Helm side's, helm-charts #24; GCP is pending too); external (supabase) it is
  * pre-provisioned by an operator. Unset, the migrator refuses to run.
  */
 export function hoopdbModeEnv(inCluster: boolean, runtimeRole?: string, runtimeLogin = true): Array<{ name: string; value: string }> {

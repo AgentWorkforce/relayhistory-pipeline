@@ -18,9 +18,20 @@
 -- the role exists it only verifies those attributes, a member of no role and no owned
 -- objects (55000 otherwise, nothing changed). The migrator checks the rest.
 --
+-- Database ACL (run it connected to the HoopDb database itself):
+--   REVOKE TEMPORARY ON DATABASE <this database> FROM PUBLIC, and
+--   GRANT CONNECT ON DATABASE <this database> TO <runtime role>.
+-- The migrator refuses a runtime role with effective TEMPORARY, and PUBLIC holds
+-- TEMPORARY by default, so revoking it from the role alone is not enough.
+-- DATABASE-WIDE SIDE EFFECT: every role in this database that relied on PUBLIC for
+-- TEMPORARY loses it (the database owner and superusers keep it). No HoopDb service
+-- uses temporary objects (docs/evidence/runtime-temp-usage.md). Grant TEMPORARY
+-- explicitly to any other role that needs it. Supabase mode never runs this: the
+-- operator owns that database's ACL, and the migrator only detects and refuses.
+--
 -- Usage:
 --   psql -v ON_ERROR_STOP=1 -X -v runtime_role=bulls96_runtime -v runtime_login=true \
---     -f supabase/bootstrap/hoopdb_runtime_role.sql
+--     -d <the HoopDb database> -f supabase/bootstrap/hoopdb_runtime_role.sql
 \set ON_ERROR_STOP 1
 SELECT set_config('hoopdb.runtime_role', :'runtime_role', false) AS runtime_role,
        set_config('hoopdb.runtime_login', :'runtime_login', false) AS runtime_login;
@@ -72,3 +83,9 @@ BEGIN
   END IF;
 END
 $runtime$;
+DO $db$
+BEGIN
+  EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), current_setting('hoopdb.runtime_role'));
+END
+$db$;

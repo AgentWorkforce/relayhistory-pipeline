@@ -14,6 +14,10 @@ import { tmpdir } from "node:os";
 import { schemaVerdict, type Transact } from "../../shared/db.ts";
 import { inventoryOf } from "../migrate-guards.ts";
 import {
+  MIGRATION_SENTINELS,
+  NON_CREATE_STEPS,
+} from "../migration-sentinels.ts";
+import {
   expectedSchema,
   migrate,
   migrationProfile,
@@ -25,6 +29,9 @@ import {
 
 setDefaultTimeout(60_000);
 const root = join(import.meta.dir, "../../..");
+/** What the selfhosted runtime-role bootstrap does to the database ACL. */
+const NO_PUBLIC_TEMP =
+  "DO $t$ BEGIN EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database()); END $t$";
 const LOCAL: MigrationProfile = {
   mode: "local",
   shim: true,
@@ -285,7 +292,7 @@ describe("runtime role: required, existing, SELECT only", () => {
 
   test("a dedicated runtime role gets SELECT on the ledger and marker only: no DML, no DDL, owns nothing, NOBYPASSRLS, and the live gate passes as it", async () => {
     const db = await fresh();
-    await db.exec("CREATE ROLE g6_rt NOLOGIN");
+    await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
     await runMigrations(client(db), {
       profile: { ...LOCAL, runtimeRole: "g6_rt", runtimeLogin: false },
     });
@@ -446,7 +453,7 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
   /** A database migrated with a good dedicated role, so hostile variants run against the full schema. */
   async function migrated(): Promise<PGlite> {
     const db = await fresh();
-    await db.exec("CREATE ROLE g6_rt NOLOGIN");
+    await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
     await runMigrations(client(db), { profile: { ...GOOD, mode: "local" } });
     return db;
   }
@@ -515,9 +522,44 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       "EXECUTE on sessions.upsert_session_index(jsonb)",
     ],
     [
-      "unapproved EXECUTE (through PUBLIC)",
-      "GRANT EXECUTE ON FUNCTION sessions.repo_visibility_ids(text, uuid) TO PUBLIC",
-      "EXECUTE on sessions.repo_visibility_ids(text,uuid)",
+      "EXECUTE on a trigger function (no exemption)",
+      "GRANT EXECUTE ON FUNCTION sessions.pipeline_jobs_observability() TO g6_bad",
+      "EXECUTE on sessions.pipeline_jobs_observability()",
+    ],
+    [
+      "effective TEMPORARY (PUBLIC TEMP restored)",
+      "DO $g$ BEGIN EXECUTE format('GRANT TEMPORARY ON DATABASE %I TO PUBLIC', current_database()); END $g$",
+      "TEMPORARY on the database",
+    ],
+    [
+      "TEMPORARY granted to the role itself",
+      "DO $g$ BEGIN EXECUTE format('GRANT TEMPORARY ON DATABASE %I TO g6_bad', current_database()); END $g$",
+      "TEMPORARY is not approved",
+    ],
+    [
+      "no effective CONNECT",
+      "DO $g$ BEGIN EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', current_database()); END $g$",
+      "no CONNECT on the database (required)",
+    ],
+    [
+      "a PUBLIC table privilege outside sessions",
+      "CREATE TABLE public.g6_pub (x int); GRANT SELECT ON public.g6_pub TO PUBLIC",
+      "SELECT on g6_pub",
+    ],
+    [
+      "a PUBLIC sequence privilege outside sessions",
+      "CREATE SEQUENCE public.g6_pub_seq; GRANT USAGE ON SEQUENCE public.g6_pub_seq TO PUBLIC",
+      "privileges on sequence g6_pub_seq",
+    ],
+    [
+      "EXECUTE on a SECURITY DEFINER function outside sessions (through PUBLIC)",
+      "CREATE FUNCTION public.g6_definer() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+      "EXECUTE on g6_definer()",
+    ],
+    [
+      "default privileges in sessions granting PUBLIC",
+      "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO PUBLIC",
+      "default privileges in schema sessions grant PUBLIC",
     ],
     [
       "a default ACL naming it",
@@ -580,12 +622,12 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
     expect(await state(db)).toEqual(before);
   });
 
-  test("checked again after the last migration: a step that leaves the role EXECUTE on a new function keeps PASS unwritten", async () => {
+  test("checked again after the last migration: a step that grants the role EXECUTE on a new function keeps PASS unwritten", async () => {
     const db = await migrated();
     const dir = mkdtempSync(join(tmpdir(), "g6-exec-"));
     writeFileSync(
       join(dir, "9999_public_fn.sql"),
-      "CREATE FUNCTION sessions.g6_public_fn() RETURNS int LANGUAGE sql AS 'SELECT 1';",
+      "CREATE FUNCTION sessions.g6_public_fn() RETURNS int LANGUAGE sql AS 'SELECT 1'; GRANT EXECUTE ON FUNCTION sessions.g6_public_fn() TO g6_rt;",
     );
     const steps = await plan(GOOD);
     const withFn = [
@@ -593,6 +635,7 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       {
         name: "96bulls:9999_public_fn.sql",
         path: join(dir, "9999_public_fn.sql"),
+        sentinel: { evidence: "test step", sql: "SELECT false AS applied" },
       },
       ...steps.slice(-1),
     ];
@@ -726,4 +769,190 @@ describe("the full ordered migration sequence: one contiguous prefix, no unledge
     expect(missing).toEqual([]);
     expect(live.length).toBeGreaterThan(40);
   });
+});
+
+describe("PUBLIC EXECUTE in sessions: revoked inside the validation transaction", () => {
+  const publicExec = async (db: PGlite, fn: string) =>
+    (
+      await db.query<{ p: boolean }>(
+        `SELECT p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE') AS p
+           FROM pg_proc p WHERE p.oid = $1::regprocedure`,
+        [fn],
+      )
+    ).rows[0]?.p;
+
+  test("a clean run leaves no sessions function PUBLIC-executable, trigger functions included; triggers still fire for a caller without EXECUTE", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const anyPublic = (
+      await db.query<{ fn: string }>(
+        `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+          WHERE n.nspname = 'sessions' AND (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0))`,
+      )
+    ).rows;
+    expect(anyPublic).toEqual([]);
+    // A caller with no EXECUTE on the trigger function still fires it.
+    await db.exec(`CREATE TABLE public.g6_audit (x int);
+      CREATE TRIGGER g6_append_only BEFORE UPDATE OR DELETE ON public.g6_audit
+        FOR EACH ROW EXECUTE FUNCTION sessions.migration_ingest_audit_append_only();
+      INSERT INTO public.g6_audit VALUES (1);
+      CREATE ROLE g6_caller NOLOGIN; GRANT DELETE, SELECT ON public.g6_audit TO g6_caller;`);
+    expect(
+      (
+        await db.query<{ e: boolean }>(
+          "SELECT has_function_privilege('g6_caller', 'sessions.migration_ingest_audit_append_only()', 'EXECUTE') AS e",
+        )
+      ).rows[0]?.e,
+    ).toBe(false);
+    await db.exec("SET ROLE g6_caller");
+    const fired = await failure(db.exec("DELETE FROM public.g6_audit"));
+    await db.exec("RESET ROLE");
+    expect(fired).not.toBeNull(); // the append-only trigger refused the delete
+    expect((await db.query("SELECT 1 FROM public.g6_audit")).rows).toHaveLength(
+      1,
+    );
+  });
+
+  test("a PUBLIC EXECUTE grant on a sessions function is revoked on the next run (default-ACL protection)", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.repo_visibility_ids(text, uuid) TO PUBLIC",
+    );
+    expect(
+      await publicExec(db, "sessions.repo_visibility_ids(text, uuid)"),
+    ).toBe(true);
+    await runMigrations(client(db), { profile: LOCAL });
+    expect(
+      await publicExec(db, "sessions.repo_visibility_ids(text, uuid)"),
+    ).toBe(false);
+  });
+
+  test("guardrail: when validation fails, the revoke rolls back with it (state unchanged)", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.pipeline_jobs_observability() TO PUBLIC",
+    );
+    await db.exec(
+      "GRANT SELECT ON sessions.session_index TO session_directory_search_worker",
+    ); // phase 2 drift
+    const acl = async () =>
+      (
+        await db.query<{ a: string }>(
+          "SELECT proacl::text AS a FROM pg_proc WHERE oid = 'sessions.pipeline_jobs_observability()'::regprocedure",
+        )
+      ).rows[0]?.a;
+    const before = { acl: await acl(), ledger: (await snapshot(db)).ledger };
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error?.code).toBe("55000");
+    expect({ acl: await acl(), ledger: (await snapshot(db)).ledger }).toEqual(
+      before,
+    );
+    expect(await publicExec(db, "sessions.pipeline_jobs_observability()")).toBe(
+      true,
+    );
+  });
+});
+
+describe("per-step catalog sentinels", () => {
+  /** Shim, Worker bootstrap, then the schema steps [0, upTo] applied directly, and the ledger holding [0, ledgered). */
+  async function prefix(upTo: number, ledgered: number): Promise<PGlite> {
+    const db = await fresh();
+    const steps = (await plan(LOCAL)).filter(
+      (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+    );
+    await db.exec(
+      readFileSync(join(root, "supabase/tests/supabase_shim.sql"), "utf8"),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      ),
+    );
+    for (let i = 0; i <= upTo; i++)
+      await db.exec(readFileSync(steps[i]!.path, "utf8"));
+    await db.exec(`CREATE SCHEMA IF NOT EXISTS sessions; CREATE TABLE sessions.__96bulls_migrations (
+      name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`);
+    for (let i = 0; i < ledgered; i++)
+      await db.query(
+        "INSERT INTO sessions.__96bulls_migrations (name, sha256) VALUES ($1, $2)",
+        [
+          steps[i]!.name,
+          createHash("sha256")
+            .update(readFileSync(steps[i]!.path, "utf8"))
+            .digest("hex"),
+        ],
+      );
+    return db;
+  }
+  const sentinel = async (db: PGlite, name: string) =>
+    (await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[name]!.sql))
+      .rows[0]?.applied;
+
+  test("the table names every schema step, and nothing else", async () => {
+    const steps = (await plan(LOCAL))
+      .filter(
+        (st) =>
+          st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+      )
+      .map((st) => st.name);
+    expect(Object.keys(MIGRATION_SENTINELS).sort()).toEqual([...steps].sort());
+    for (const n of NON_CREATE_STEPS) expect(steps).toContain(n);
+  });
+
+  test("each sentinel is false before its step and true from it on", async () => {
+    const steps = (await plan(LOCAL)).filter(
+      (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+    );
+    const db = await fresh();
+    await db.exec(
+      readFileSync(join(root, "supabase/tests/supabase_shim.sql"), "utf8"),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      ),
+    );
+    for (const st of steps) {
+      expect(await sentinel(db, st.name), `${st.name} before`).toBe(false);
+      await db.exec(readFileSync(st.path, "utf8"));
+      expect(await sentinel(db, st.name), `${st.name} after`).toBe(true);
+    }
+    for (const st of steps)
+      expect(await sentinel(db, st.name), `${st.name} at the end`).toBe(true);
+  });
+
+  for (const name of NON_CREATE_STEPS)
+    test(`${name}: applied and ledgered is accepted; applied but unledgered is refused before any write`, async () => {
+      const steps = (await plan(LOCAL)).filter(
+        (st) =>
+          st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+      );
+      const i = steps.findIndex((st) => st.name === name);
+      expect(i).toBeGreaterThan(0);
+      const honest = await prefix(i, i + 1);
+      expect(
+        await failure(runMigrations(client(honest), { profile: LOCAL })),
+      ).toBeNull();
+      const hidden = await prefix(i, i);
+      const before = await snapshot(hidden);
+      const error = await failure(
+        runMigrations(client(hidden), { profile: LOCAL }),
+      );
+      expect(error?.code).toBe("unledgered_schema");
+      expect(error?.message).toContain(`(${name})`);
+      expect(await snapshot(hidden)).toEqual(before);
+    });
+});
+
+test("the runbook's sentinel table documents every schema step", async () => {
+  const runbook = readFileSync(
+    join(root, "runbooks/session-directory-search-worker-bootstrap.md"),
+    "utf8",
+  );
+  for (const name of Object.keys(MIGRATION_SENTINELS))
+    expect(runbook, name).toContain(`| \`${name}\``);
 });

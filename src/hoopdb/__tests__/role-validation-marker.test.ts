@@ -216,7 +216,11 @@ describe("Worker role validation marker", () => {
     writeFileSync(join(dir, "9999_broken.sql"), "SELECT 1 / 0;");
     const broken = [
       ...steps.slice(0, -1),
-      { name: "96bulls:9999_broken.sql", path: join(dir, "9999_broken.sql") },
+      {
+        name: "96bulls:9999_broken.sql",
+        path: join(dir, "9999_broken.sql"),
+        sentinel: { evidence: "test step", sql: "SELECT false AS applied" },
+      },
       ...steps.slice(-1),
     ];
     expect(

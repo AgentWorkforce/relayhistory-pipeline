@@ -20,7 +20,7 @@ deploy runs two separate checks:
 Nothing here runs automatically against a real database. Every apply needs Khaliq's
 explicit OK.
 
-## Interface (stable; #75 wires the deploy-time provisioning against this)
+## Interface (stable; the deploy-time provisioning is wired against this outside this repository)
 
 **Deploy order:** phase 1 (superuser), then `hoopdb-migrate` (which runs phase 2 and records PASS; see the readiness marker below). Each step uses
 `psql -v ON_ERROR_STOP=1 -X -f <file>` against the HoopDb or Supabase database, and the
@@ -188,7 +188,10 @@ phase 2 can mark PASS.
     `supabase/bootstrap/hoopdb_runtime_role.sql`, run as a superuser (CNPG `postgres`)
     before migrate on every deploy, like the Worker bootstrap. It is idempotent, creates
     the role with no privileges and never sets a password; the credential is provisioned
-    separately. #75 wires it for AWS CNPG; GCP needs the same step.
+    separately. **Not wired in this repository:** the privileged bootstrap Job that runs it before
+    migrate is the Helm side's (helm-charts #24). Current Helm main has no runtime-role
+    bootstrap Job, so AWS CNPG and GCP stay pending until it lands and the stacks pass
+    `hoopdbRuntimeRole`.
   - `supabase`: pre-provisioned by an operator and verified by the migrator. On
     PostgreSQL 16+ the creator-ADMIN caveat of the Worker applies here too: a role
     created by Supabase's non-superuser `postgres` would carry ADMIN for `postgres` and
@@ -201,26 +204,61 @@ violation is named:
   NOCREATEROLE, NOREPLICATION, NOBYPASSRLS.
 - A member of no role. Its only member may be `HOOPDB_RUNTIME_WORKLOAD_ROLE`, without
   ADMIN OPTION.
-- Owns nothing, in any database. No CREATE on any schema or on the database, however it
-  is obtained (PUBLIC or memberships included).
-- **Approved, and nothing else:**
-  - `USAGE` on schema `sessions`;
-  - `SELECT` on `sessions.__96bulls_migrations` and `sessions.__96bulls_role_validation`,
-    with no GRANT OPTION;
-  - `CONNECT` / `TEMPORARY` on the database;
-  - EXECUTE only on `sessions` trigger functions, which cannot be called directly.
-
-  Any other direct reference in any database (`pg_shdepend`) is refused: table, column,
-  sequence or function privileges, default ACLs, policies. So is any effective table,
-  column or sequence privilege, or EXECUTE on any callable `sessions` function, because
-  the role now has schema USAGE.
-
+- Owns nothing. No CREATE on any schema or on the database, however it is obtained
+  (PUBLIC or memberships included).
+- **CONNECT is required** (effective) for the runtime role, and for the workload role
+  when one is configured. A LOGIN role that can't connect is refused.
+- **TEMPORARY is refused** (effective). PUBLIC holds it by default, so revoking it from
+  the role alone is not enough. No service uses temporary objects; see
+  `docs/evidence/runtime-temp-usage.md` for the searched roots, commands and results.
+- **Approved, and nothing else:** `USAGE` on schema `sessions`; `SELECT` on
+  `sessions.__96bulls_migrations` and `sessions.__96bulls_role_validation`, with no GRANT
+  OPTION; `CONNECT` on the database.
+- **No EXECUTE on any `sessions` function, trigger functions included.** A trigger fires
+  without its caller holding EXECUTE (a real PostgreSQL test shows it), so there is no
+  exemption. In the same transaction as phase 2 and the PASS write, the migrator runs
+  `REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC` on every run. That is
+  idempotent and also covers functions a later migration adds with the default PUBLIC
+  EXECUTE. If validation fails, the revoke rolls back with it; a test proves the state is
+  unchanged. Default privileges in `sessions` that grant PUBLIC or the runtime role are
+  refused. The global default (PUBLIC EXECUTE on new functions) is left alone, because on
+  Supabase it would change every future function the owner creates in any schema; the
+  per-run revoke and the post-migration check cover `sessions` instead.
+- **Coverage, stated exactly:**
+  - In the current database: effective privileges in every non-system schema. That covers
+    tables, views and sequences (any privilege), EXECUTE on SECURITY DEFINER functions
+    anywhere, EXECUTE on every `sessions` function, CREATE on any schema, and CREATE,
+    TEMPORARY and CONNECT on the database. PUBLIC-derived grants are included.
+  - In every database: direct references naming the role (`pg_shdepend`): ownership, ACL
+    entries, default ACLs, policies.
+  - **Not covered:** PUBLIC-derived privileges in other databases (for example CONNECT to
+    another database through PUBLIC: keep one HoopDb database per cluster, or revoke
+    PUBLIC CONNECT on the others); and SECURITY INVOKER functions outside `sessions`,
+    which run with the caller's own (already validated) privileges. Extension functions
+    are reviewed with the extension.
 - **Out of scope here:** the services' own runtime DML grants (ingest, workers) belong to
   #98. A runtime role holding them is refused until this allowlist is extended in a
   reviewed change.
 
 The migrator grants exactly `USAGE` on `sessions` and `SELECT` on the two tables,
 idempotently.
+
+**Database ACL contract.**
+
+- **selfhosted:** `hoopdb_runtime_role.sql`, run connected to the HoopDb database, also
+  runs `REVOKE TEMPORARY ON DATABASE <db> FROM PUBLIC` and
+  `GRANT CONNECT ON DATABASE <db> TO <runtime role>`.
+  - **Database-wide side effect:** every unrelated role in that database that relied on
+    PUBLIC for TEMPORARY loses it. The owner and superusers keep it. A real PostgreSQL
+    test shows an unrelated role losing it.
+  - Grant TEMPORARY explicitly to any other role that needs it.
+- **supabase:** the migrator never changes the database ACL; it detects and refuses. Before
+  the first migrate, the operator must leave the project database with:
+  - PUBLIC holding no TEMPORARY: `REVOKE TEMPORARY ON DATABASE postgres FROM PUBLIC`,
+    reviewed for its effect on Supabase's own roles first;
+  - the runtime role holding CONNECT.
+
+  This is a decision point in #98.
 
 **One migration authority and the full ordered sequence (decision point).** Also under the
 lock and before any write, the migrator refuses:
@@ -232,12 +270,41 @@ lock and before any write, the migrator refuses:
 - `ledger_gap`: the ledger is not one contiguous prefix of the ordered steps (upstream,
   then 96bulls). A first 96bulls row with no upstream rows is refused, never backfilled.
 - `migration_changed`: a recorded step's file changed.
-- `unledgered_schema`: an object that an unrecorded step creates already exists. The
+- `unledgered_schema`: the catalog sentinel of an unrecorded step is already true, or an object that an unrecorded step creates already exists. The
   inventory is every table, view, sequence, index, function, trigger, policy and role in
   the migration files' CREATE statements (`inventoryOf`; a test proves it covers
   everything a full migration leaves in `sessions`). So a database where only
   `sessions.session_directory` exists is refused before any write, not after seven
   ledger rows.
+
+**Per-step sentinels** (`src/hoopdb/migration-sentinels.ts`). Each step has one
+read-only catalog predicate, false before the step and true from it on. This catches
+ALTER-only and replacement steps that the CREATE inventory can't see. Tests prove the table
+names every step, and that each sentinel is false before its step and true after it.
+
+| Step                                                           | Sentinel                                                                                                                |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `upstream:20261025000000_sessions_index.sql`                   | table sessions.session_index                                                                                            |
+| `upstream:20261025000100_repo_identity.sql`                    | table sessions.repos                                                                                                    |
+| `upstream:20261025000200_scrub_quarantine.sql`                 | function sessions.session_index_scrub_sticky                                                                            |
+| `upstream:20261025000300_upsert_keep_on_null.sql`              | replacement: sessions.upsert_session_index keeps stored values on NULL (its body has coalesce(excluded.title, s.title)) |
+| `upstream:20261025000600_pipeline_queue.sql`                   | table sessions.pipeline_jobs                                                                                            |
+| `upstream:20261030000000_relayhistory_machines_compat.sql`     | ALTER-only: column sessions.machines.cursors_json                                                                       |
+| `upstream:20261030010000_session_directory.sql`                | table sessions.session_directory                                                                                        |
+| `upstream:20261030020000_session_directory_short_summary.sql`  | column sessions.session_directory.short_summary                                                                         |
+| `upstream:20261031000000_migration_assertion_ledger.sql`       | table sessions.migration_assertion_uses                                                                                 |
+| `upstream:20261031000100_manifest_readiness.sql`               | table sessions.manifest_readiness                                                                                       |
+| `upstream:20261031001000_session_directory_reads_expand.sql`   | table sessions.session_directory_resurrection_fences                                                                    |
+| `upstream:20261101000000_migration_ingest_audit_base_read.sql` | table sessions.migration_base_read_uses                                                                                 |
+| `upstream:20261101000200_claimless_window_activations.sql`     | table sessions.claimless_window_activations                                                                             |
+| `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
+| `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
+| `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
+| `96bulls:0004_summary_pointers.sql`                            | DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)                                          |
+
+For each ALTER or replacement step (`20261025000300`, `20261030000000`, `0003`, `0004`),
+real PostgreSQL 15 and 17 tests cover two states. Honestly applied and ledgered is
+accepted with no false positive. Applied but unledgered is refused before any write.
 
 It never imports a backlog into the ledger and never marks a step applied. Resolving any of
 these is an explicit operator decision, recorded in the activation dossier (#98):

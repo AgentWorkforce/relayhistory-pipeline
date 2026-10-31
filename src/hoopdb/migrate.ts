@@ -36,6 +36,7 @@ export const MIGRATION_LEDGER = "sessions.__96bulls_migrations";
 interface Step {
   name: string;
   path: string;
+  sentinel?: { evidence: string; sql: string };
 }
 
 /**
@@ -235,9 +236,14 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
     // After the last migration, before phase 2 can mark PASS: the runtime role holds
     // exactly the approved grants against the full schema (e.g. no EXECUTE gained on a
     // function a migration just created).
-    const postCheck = async () => {
+    // Inside the validation transaction (with phase 2 and the PASS write): revoke PUBLIC
+    // EXECUTE on every sessions function (idempotent; triggers still fire, PostgreSQL
+    // does not check EXECUTE on a trigger function at fire time), then check the runtime
+    // role against the full schema. Any failure rolls all of it back.
+    const hardenAndCheck = async () => {
+      await client.query("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC");
       if (runtime !== "dedicated") return;
-      const violations = await runtimeRoleViolations(client, runtimeCfg(profile), RUNTIME_TABLES);
+      const violations = await runtimeRoleViolations(client, runtimeCfg(profile), RUNTIME_TABLES, "post");
       if (violations.length)
         throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`);
     };
@@ -248,13 +254,11 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
       // its own transaction, and are never recorded in the ledger.
       if (step.name.startsWith("bootstrap:") || step.name.startsWith("verify:")) {
         const verify = step.name.startsWith("verify:");
-        if (verify) {
-          await postCheck();
-          postChecked = true;
-        }
+        if (verify) postChecked = true;
         if (verify && opts.beforeVerify) await opts.beforeVerify();
         await client.query("BEGIN");
         try {
+          if (verify) await hardenAndCheck();
           await client.query(sql);
           if (verify) {
             const passed = await client.query(
@@ -296,7 +300,17 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
       applied += 1;
       log.info("migration applied", { reason: step.name });
     }
-    if (!postChecked) await postCheck();
+    if (!postChecked) {
+      // In-process verifier off: the same hardening and runtime check, in one transaction.
+      await client.query("BEGIN");
+      try {
+        await hardenAndCheck();
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      }
+    }
     if (!steps.some((s) => s.name.startsWith("verify:")))
       log.info("role validation left pending: in-process verifier disabled; an external verifier must pass it", { reason: gen });
   } finally {
@@ -338,7 +352,7 @@ async function runtimeRolePreflight(client: MigrationClient, profile: MigrationP
     return "owner";
   }
   if (r.rolname === ROLE_VALIDATION_NAME) throw profileError("runtime_role_unsafe", "HOOPDB_RUNTIME_ROLE must not be the search Worker");
-  const violations = await runtimeRoleViolations(client, runtimeCfg(profile), RUNTIME_TABLES);
+  const violations = await runtimeRoleViolations(client, runtimeCfg(profile), RUNTIME_TABLES, "pre");
   if (violations.length)
     throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`);
   return "dedicated";

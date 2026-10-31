@@ -7,6 +7,7 @@
  */
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { MIGRATION_SENTINELS } from "./migration-sentinels.ts";
 
 export interface GuardClient {
   query<R = Record<string, unknown>>(
@@ -17,6 +18,8 @@ export interface GuardClient {
 export interface GuardStep {
   name: string;
   path: string;
+  /** A step's own sentinel (test-injected steps); otherwise MIGRATION_SENTINELS[name]. */
+  sentinel?: { evidence: string; sql: string };
 }
 
 export function guardError(code: string, message: string): Error {
@@ -44,8 +47,27 @@ export interface RuntimeTables {
 /**
  * Approved for the runtime role, and nothing else:
  *   USAGE on schema sessions; SELECT on the ledger and the readiness marker;
- *   CONNECT / TEMPORARY on the current database;
- *   EXECUTE only on sessions trigger functions (not callable directly).
+ *   CONNECT on the current database, which is REQUIRED (effective), as it is for the
+ *   workload role when one is configured.
+ * Refused, among everything else: effective TEMPORARY on the database (PUBLIC has it by
+ * default; see the runbook), and EXECUTE on any sessions function, trigger functions
+ * included (a trigger fires without its caller holding EXECUTE).
+ *
+ * Coverage, stated exactly:
+ *   current database  effective privileges in every non-system schema: tables, views,
+ *                     sequences (any privilege), SECURITY DEFINER functions (EXECUTE),
+ *                     every sessions function (EXECUTE), CREATE on any schema, CREATE
+ *                     and TEMPORARY on the database; default privileges in sessions.
+ *   every database    direct references naming the role (pg_shdepend): ownership,
+ *                     ACL entries, default ACLs, policies.
+ *   not covered       PUBLIC-derived privileges in other databases (for example
+ *                     CONNECT to another database through PUBLIC: keep one database
+ *                     per cluster, or revoke PUBLIC CONNECT there), and SECURITY INVOKER
+ *                     functions outside sessions, which run with the caller's own
+ *                     privileges (extension functions are reviewed with the extension).
+ * phase "pre" (before any write) ignores PUBLIC-derived EXECUTE on sessions functions:
+ * the migrator revokes that in the same transaction as validation. phase "post" counts
+ * every EXECUTE.
  * The services' other runtime table grants are out of scope here (activation dossier
  * #98): a role holding them is refused until this allowlist is extended in a reviewed
  * change.
@@ -54,6 +76,7 @@ export async function runtimeRoleViolations(
   client: GuardClient,
   cfg: RuntimeRoleConfig,
   tables: RuntimeTables,
+  phase: "pre" | "post" = "post",
 ): Promise<string[]> {
   const out: string[] = [];
   const role = (
@@ -176,7 +199,7 @@ export async function runtimeRoleViolations(
       WHERE c.oid IN (coalesce(to_regclass($2), 0), coalesce(to_regclass($3), 0)) AND a.grantee = $1::oid
      UNION ALL
      SELECT 'database ' || d.datname, a.privilege_type, a.is_grantable FROM pg_database d, aclexplode(d.datacl) a
-      WHERE d.datname = current_database() AND a.grantee = $1`,
+      WHERE d.datname = current_database() AND a.grantee = $1::oid`,
     [role.oid, tables.ledger, tables.marker],
   );
   for (const p of direct.rows) {
@@ -184,68 +207,98 @@ export async function runtimeRoleViolations(
       p.what === "schema sessions"
         ? p.privilege_type === "USAGE"
         : p.what.startsWith("database ")
-          ? p.privilege_type === "CONNECT" || p.privilege_type === "TEMPORARY"
+          ? p.privilege_type === "CONNECT"
           : p.privilege_type === "SELECT";
     if (!ok || p.is_grantable)
       out.push(
         `${p.what}: ${p.privilege_type}${p.is_grantable ? " WITH GRANT OPTION" : ""} is not approved`,
       );
   }
-  // Effective privileges, however obtained (PUBLIC, memberships, defaults).
-  for (const s of (
+  // Effective privileges, however obtained (PUBLIC, memberships, defaults), in every
+  // non-system schema of the current database.
+  const NONSYSTEM = `n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%'`;
+  const db = (
+    await client.query<{
+      create: boolean;
+      temp: boolean;
+      connect: boolean;
+      wl_connect: boolean | null;
+    }>(
+      `SELECT has_database_privilege($1::oid, current_database(), 'CREATE') AS create,
+              has_database_privilege($1::oid, current_database(), 'TEMPORARY') AS temp,
+              has_database_privilege($1::oid, current_database(), 'CONNECT') AS connect,
+              (SELECT has_database_privilege(r.oid, current_database(), 'CONNECT') FROM pg_roles r WHERE r.rolname = $2) AS wl_connect`,
+      [role.oid, cfg.workload ?? null],
+    )
+  ).rows[0]!;
+  if (db.create) out.push("CREATE on the database");
+  if (db.temp)
+    out.push(
+      "TEMPORARY on the database (PUBLIC has it by default: revoke it from PUBLIC, see the runbook)",
+    );
+  if (!db.connect) out.push("no CONNECT on the database (required)");
+  if (cfg.workload && db.wl_connect !== true)
+    out.push(
+      `workload role ${cfg.workload} has no CONNECT on the database (required)`,
+    );
+  for (const sc of (
     await client.query<{ nspname: string }>(
-      `SELECT nspname FROM pg_namespace
-        WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND nspname NOT LIKE 'pg\\_toast%' AND nspname NOT LIKE 'pg\\_temp%'
-          AND has_schema_privilege($1::oid, oid, 'CREATE') ORDER BY 1`,
+      `SELECT n.nspname FROM pg_namespace n WHERE ${NONSYSTEM} AND has_schema_privilege($1::oid, n.oid, 'CREATE') ORDER BY 1`,
       [role.oid],
     )
   ).rows)
-    out.push(`CREATE on schema ${s.nspname}`);
-  if (
-    (
-      await client.query<{ c: boolean }>(
-        "SELECT has_database_privilege($1::oid, current_database(), 'CREATE') AS c",
-        [role.oid],
-      )
-    ).rows[0]?.c
-  )
-    out.push("CREATE on the database");
-  if (ids.sessions !== null) {
-    for (const t of (
-      await client.query<{ rel: string; privs: string }>(
-        `SELECT c.oid::regclass::text AS rel,
-                concat_ws(',', CASE WHEN has_table_privilege($1::oid, c.oid, 'SELECT') AND c.oid NOT IN (coalesce(to_regclass($2), 0), coalesce(to_regclass($3), 0)) THEN 'SELECT' END,
-                  CASE WHEN has_table_privilege($1::oid, c.oid, 'INSERT') THEN 'INSERT' END,
-                  CASE WHEN has_table_privilege($1::oid, c.oid, 'UPDATE') THEN 'UPDATE' END,
-                  CASE WHEN has_table_privilege($1::oid, c.oid, 'DELETE') THEN 'DELETE' END,
-                  CASE WHEN has_table_privilege($1::oid, c.oid, 'TRUNCATE') THEN 'TRUNCATE' END,
-                  CASE WHEN has_table_privilege($1::oid, c.oid, 'REFERENCES') THEN 'REFERENCES' END,
-                  CASE WHEN has_table_privilege($1::oid, c.oid, 'TRIGGER') THEN 'TRIGGER' END,
-                  CASE WHEN NOT has_table_privilege($1::oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES') AND has_any_column_privilege($1::oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES') THEN 'column' END) AS privs
-           FROM pg_class c WHERE c.relnamespace = $4 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') ORDER BY 1`,
-        [role.oid, tables.ledger, tables.marker, ids.sessions],
-      )
-    ).rows)
-      if (t.privs) out.push(`${t.privs} on ${t.rel}`);
-    for (const q of (
-      await client.query<{ rel: string }>(
-        `SELECT c.oid::regclass::text AS rel FROM pg_class c
-          WHERE c.relnamespace = $2 AND c.relkind = 'S'
-            -- CASE: AND order is not guaranteed, and the function errors on a non-sequence.
-            AND CASE WHEN c.relkind = 'S' THEN has_sequence_privilege($1::oid, c.oid, 'USAGE, SELECT, UPDATE') ELSE false END ORDER BY 1`,
-        [role.oid, ids.sessions],
-      )
-    ).rows)
-      out.push(`privileges on sequence ${q.rel}`);
-    for (const f of (
-      await client.query<{ fn: string }>(
-        `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
-          WHERE p.pronamespace = $2 AND p.prorettype <> 'trigger'::regtype AND has_function_privilege($1::oid, p.oid, 'EXECUTE') ORDER BY 1`,
-        [role.oid, ids.sessions],
-      )
-    ).rows)
-      out.push(`EXECUTE on ${f.fn}`);
-  }
+    out.push(`CREATE on schema ${sc.nspname}`);
+  for (const t of (
+    await client.query<{ rel: string; privs: string }>(
+      `SELECT c.oid::regclass::text AS rel,
+              concat_ws(',', CASE WHEN has_table_privilege($1::oid, c.oid, 'SELECT') AND c.oid NOT IN (coalesce(to_regclass($2), 0), coalesce(to_regclass($3), 0)) THEN 'SELECT' END,
+                CASE WHEN has_table_privilege($1::oid, c.oid, 'INSERT') THEN 'INSERT' END,
+                CASE WHEN has_table_privilege($1::oid, c.oid, 'UPDATE') THEN 'UPDATE' END,
+                CASE WHEN has_table_privilege($1::oid, c.oid, 'DELETE') THEN 'DELETE' END,
+                CASE WHEN has_table_privilege($1::oid, c.oid, 'TRUNCATE') THEN 'TRUNCATE' END,
+                CASE WHEN has_table_privilege($1::oid, c.oid, 'REFERENCES') THEN 'REFERENCES' END,
+                CASE WHEN has_table_privilege($1::oid, c.oid, 'TRIGGER') THEN 'TRIGGER' END,
+                CASE WHEN NOT has_table_privilege($1::oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES') AND has_any_column_privilege($1::oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES') THEN 'column' END) AS privs
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE ${NONSYSTEM} AND c.relkind IN ('r', 'p', 'v', 'm', 'f') ORDER BY 1`,
+      [role.oid, tables.ledger, tables.marker],
+    )
+  ).rows)
+    if (t.privs) out.push(`${t.privs} on ${t.rel}`);
+  for (const q of (
+    await client.query<{ rel: string }>(
+      `SELECT c.oid::regclass::text AS rel FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE ${NONSYSTEM} AND c.relkind = 'S'
+          -- CASE: AND order is not guaranteed, and the function errors on a non-sequence.
+          AND CASE WHEN c.relkind = 'S' THEN has_sequence_privilege($1::oid, c.oid, 'USAGE, SELECT, UPDATE') ELSE false END ORDER BY 1`,
+      [role.oid],
+    )
+  ).rows)
+    out.push(`privileges on sequence ${q.rel}`);
+  for (const fnr of (
+    await client.query<{ fn: string }>(
+      `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE ${NONSYSTEM} AND (n.nspname = 'sessions' OR p.prosecdef)
+          AND has_function_privilege($1::oid, p.oid, 'EXECUTE')
+          -- Before any write, PUBLIC-derived EXECUTE on sessions functions is left to the
+          -- revoke that runs in the validation transaction.
+          AND NOT ($2 = 'pre' AND n.nspname = 'sessions'
+                   AND (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')))
+        ORDER BY 1`,
+      [role.oid, phase],
+    )
+  ).rows)
+    out.push(`EXECUTE on ${fnr.fn}`);
+  for (const d of (
+    await client.query<{ objtype: string }>(
+      `SELECT d.defaclobjtype::text AS objtype FROM pg_default_acl d, aclexplode(d.defaclacl) a
+        WHERE d.defaclnamespace = coalesce(to_regnamespace('sessions')::oid, 0) AND a.grantee IN (0, $1::oid) ORDER BY 1`,
+      [role.oid],
+    )
+  ).rows)
+    out.push(
+      `default privileges in schema sessions grant PUBLIC or the runtime role (${d.objtype})`,
+    );
   return out;
 }
 
@@ -476,6 +529,25 @@ export async function sequencePreflight(
           `${o.kind} ${o.name}${o.on ? ` on ${o.on}` : ""} (${names[i]})`,
         );
     }
+  }
+  // Per-step catalog sentinels: they see ALTER-only and replacement steps too.
+  for (let i = k; i < names.length; i++) {
+    const sentinel = schemaSteps[i]!.sentinel ?? MIGRATION_SENTINELS[names[i]!];
+    if (!sentinel)
+      throw guardError(
+        "sentinel_missing",
+        `${names[i]} has no catalog sentinel (src/hoopdb/migration-sentinels.ts); refusing`,
+      );
+    let applied: boolean;
+    try {
+      applied = Boolean(
+        (await client.query<{ applied: boolean }>(sentinel.sql)).rows[0]
+          ?.applied,
+      );
+    } catch {
+      applied = true; // can't look: fail closed, as if the step had run
+    }
+    if (applied) found.push(`sentinel ${sentinel.evidence} (${names[i]})`);
   }
   if (found.length)
     throw guardError(
