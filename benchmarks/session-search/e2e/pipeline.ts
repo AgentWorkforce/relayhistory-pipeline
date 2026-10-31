@@ -50,7 +50,7 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
   const sql = { ...wrap(db), transaction: <T>(work: (tx: SqlExecutor) => Promise<T>) => db.transaction((tx) => work(wrap(tx))) };
   const root = await mkdtemp(join(tmpdir(), "96bulls-search-proof-"));
   Object.assign(process.env, {
-    LOCKER_BUCKET: "raw", TENANT_ORG_ID: orgIdForStack, AUTH_ISSUER: ISSUER, RELAYAUTH_JWKS_URL: JWKS_URL,
+    LOCKER_BUCKET: "raw", TENANT_ORG_ID: orgIdForStack, TENANT_ORG_IDS: `${orgIdForStack},org-e2e-b`, AUTH_ISSUER: ISSUER, RELAYAUTH_JWKS_URL: JWKS_URL,
     RELAYHISTORY_ORIGIN: ORIGIN, ALLOW_INTERIM_RELAYAUTH_BEARER: "true",
   });
   const store = createFsStore({ root });
@@ -73,7 +73,7 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
     } as never,
   });
 
-  async function courier(orgId: string, workspaceId: string, sessions: SessionInput[], dir?: string) {
+  async function courier(orgId: string, workspaceId: string, sessions: SessionInput[], dir?: string, claim: { machineId?: string } | null = {}) {
     const work = dir ?? await mkdtemp(join(tmpdir(), "96bulls-courier-"));
     const dbPath = join(work, "history.db");
     const hist = new DatabaseSync(dbPath);
@@ -87,13 +87,16 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
     }
     hist.close();
     const now = () => Math.floor(Date.now() / 1000);
+    const machineId = `${workspaceId}-m1`;
+    // A signed machine claim is required for uploads; null omits it for the refusal test.
+    const signedMachine = claim === null ? {} : { machineId: claim.machineId ?? machineId };
     const token = () => sign({
       sub: "agent_relayhistory_assertion", org: orgId, wks: workspaceId, sponsorId: "u1", scopes: ["rth:sync"], token_type: "access",
-      iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { tokenClass: "relayhistory_assertion" },
+      iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { ...signedMachine, tokenClass: "relayhistory_assertion" },
     });
     const result = await runCourierOnce({
       dbPath, statePath: join(work, "state.json"), ingestUrl: INGEST, token: { get: async () => token(), invalidate: () => false },
-      orgId, workspaceId, userId: "u1", machineId: `${workspaceId}-m1`, harnesses: ["claude"], closeAfterMinutes: 1_000_000, startMode: "all",
+      orgId, workspaceId, userId: "u1", machineId, harnesses: ["claude"], closeAfterMinutes: 1_000_000, startMode: "all",
     });
     const landed = await pollPostgresStage({ sql, stage: "object-landed", deps });
     const indexed = await pollPostgresStage({ sql, stage: "session-indexed", deps });

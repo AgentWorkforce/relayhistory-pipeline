@@ -30,13 +30,14 @@ store, but the MCP server was not run.
 
 ## Gates
 
-Local run at corpus 4.04M events, whale 1.28M, on a Mac mini with data on an external
-drive. Logic gates also passed in CI at scales S and M. Timings are relative.
+Numbers are from the local run and CI on superseded head `60507a8`, before the machine
+claim change, at 4.04M events, whale 1.28M. Local data was on an external drive. Timings
+are relative. Check this PR's CI at its exact head for current logic gate results.
 
 | Gate | Result | Evidence and limits |
 | --- | --- | --- |
 | G0 Negative controls | PASS | Removing the org predicate, the substring recheck or the dedup token each changes the answer; a wrong result scores recall below 1 |
-| G1 Courier to search | PASS | First hit, planted secret absent with a positive control, append, retry dedup, stale, quarantine, opt-out. One org per stack: the ingest refused a second org with 403 without `PIPELINE_ORG_FROM_PREFIX` |
+| G1 Courier to search | PASS | First hit, planted secret absent with a positive control, append, retry dedup, stale, quarantine, opt-out. Uploads carry the signed machine claim; absent and mismatched claims are refused with no job, pointer or row, and a refusal reports G1 BLOCKED. Second org through the real ingest under `TENANT_ORG_IDS` (#94) is reported as a measurement in `multiOrg`, not a gate |
 | G2 Lexical recall | PASS | Recall@5 and @10 of 1.0 and exact counts against the generator on 12 query classes in 2 orgs: phrase, error, path, PR number, case, substring, CJK, accents, 2-character, punctuation, past 4 KB, common |
 | G3 Context | PASS | Window contains the match, focus finds the event, chronological, snippets at most 320 characters, citations, cursors do not repeat |
 | G4 Federation | PASS on a small fixture | Before and after T0, straddling session and backfilled copy once each, pagination, each pool down is named. Event ids are shared by construction; the real legacy-to-store id mapping is unproven. Pre-T0 text past 4 KB stays unsearchable without a backfill |
@@ -69,6 +70,39 @@ After merges settled, the same query took 341 ms.
 local data directory is on an external drive, which is the likely difference, but this
 was not isolated. Treat a post-backfill timeout as a risk to check on the target
 service, not a measured property of the store.
+
+## Acceptance contract
+
+helm-chart-chief's contract of 2026-10-31. Nothing here is met for T0.
+
+| Requirement | State |
+| --- | --- |
+| 1. Separate e2e for engine and full product | Engine: G0, G2, G5, G7. Product path covers courier to store only; **no product e2e through the MCP server, Cloud API or dashboard** |
+| 2. Same Supabase and Neon baseline for every comparison | **Not met.** The legacy pool is a PGlite model of one rule; #59 has the Postgres arms but on a separate red stack |
+| 3. Server-side tenant isolation | Store chokepoint and reader user tested. Real server auth to scope, and Supabase hydrate, not exercised |
+| 4. Every Cloud, desktop and MCP filter plus compound queries | **Not met.** Store has workspace, since, until, source, cursor. Project, agent, kind, task ref, tag and machine filters are missing, and compound queries are untested |
+| 5. Plain text first, embeddings optional | Met by design; embeddings are not built |
+| 6. Synthetic corpus measured to match production | PARTIAL. Two event totals only |
+| 7. Heavy tenant and quota tests | **Not met.** G9 inherited FAIL; quotas in #233 are not implemented |
+
+## Proposed fixes (proposals only)
+
+**p95 miss.** CI saturated at about 12 QPS regardless of clients, so the first step is to
+find the limit: run the 12 classes singly to see which drives it, since `deploy`
+and the unindexed 2-character form read far more rows than the rest. Candidates: rank by
+recency within a `ts` window that widens on demand instead of scanning all history; add a
+minimum length or a stricter cap for under-three-character terms; separate snippet
+fetching into a second phase as #233 specifies; size per-org quotas from the result.
+Rerun on the target service, because a small runner says little about capacity.
+
+**First search after load.** Not reproduced in CI (435 ms). Run the load on CI with the
+same probe at several points while parts merge, and log parts and merges with it. If it
+recurs on the target, throttle backfills to bound active parts and hold reads on a
+backfilling tenant to the legacy pool until merges settle.
+
+**Ingest orgs.** #94 added `TENANT_ORG_IDS`. If `multiOrg` shows the second org indexed
+under its own org id, the limit is closed for fixed sets; otherwise trace `ctx.orgId`
+through `session-indexed`. Then repeat G5 through the real ingest.
 
 ## Not proven
 

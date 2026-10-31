@@ -40,7 +40,7 @@ const reader = new ClickHouseHttp(url, "search_reader", pw);
 const writer = new ClickHouseHttp(url, "search_writer", pw);
 const search = new SessionSearchStore(reader, writer);
 
-type Status = "PASS" | "FAIL" | "PARTIAL" | "RELATIVE" | "NOT_RUN" | "INHERITED_FAIL";
+type Status = "PASS" | "FAIL" | "BLOCKED" | "PARTIAL" | "RELATIVE" | "NOT_RUN" | "INHERITED_FAIL";
 const SHAPE_FIDELITY = "PARTIAL: sanitized aggregate anchors only, not a fresh production-derived shape artifact. Not production-scale parity; cannot close T0.";
 console.log(`SHAPE FIDELITY: ${SHAPE_FIDELITY}`);
 const report: Record<string, { status: Status; checks?: Record<string, boolean>; detail?: unknown }> = {};
@@ -67,6 +67,12 @@ async function g1() {
   const first = await pipeline.courier("org-e2e-a", "ws-e2e-a", [{ id: "s-e2e-1", lines: [
     line(`${PLANTED_CONTENT_MARKER} e2emarkeralpha fix packages/foo/bar.ts`, 1), line(`key ${secret} e2esecretline`, 2),
   ] }]);
+  if (first.result.uploaded !== 1) {
+    await pipeline.stop();
+    report.G1_courier_to_search = { status: "BLOCKED", detail: { upload: first.result, reason: "the real ingest refused the courier upload; downstream gates would prove nothing" } };
+    console.error("BLOCKED   G1_courier_to_search: upload refused");
+    return false;
+  }
   let hit = await search.search(a, { query: "e2emarkeralpha" });
   const firstHitMs = performance.now() - started;
   const secretProbe = secret.split("\n")[0]!.slice(0, 24);
@@ -87,6 +93,21 @@ async function g1() {
   const quarantined = await indexManifest("org-e2e-a", { ...last!.manifest, revision: 99, raw: { ...last!.manifest.raw, scrub: undefined } } as never, deps);
   await pipeline.courier("org-e2e-a", "ws-optout", [{ id: "s-e2e-2", lines: [line("optoutmarker", 1)] }]);
   const optOutRows = await countRows("workspace_id = 'ws-optout'");
+  // Refused uploads leave no job, no pointer and no searchable row.
+  const refused = async (id: string, claim: { machineId?: string } | null) => {
+    const seen = outcomes.length;
+    const r = await pipeline.courier("org-e2e-a", "ws-e2e-a", [{ id, lines: [line(`refusedmarker ${id}`, 1)] }], undefined, claim);
+    return r.result.uploaded === 0 && r.landed.claimed === 0 && outcomes.length === seen && (await countRows(`session_id = '${id}'`)) === 0;
+  };
+  const claimAbsentRefused = await refused("s-e2e-noclaim", null);
+  const claimMismatchRefused = await refused("s-e2e-wrongclaim", { machineId: "machine-other" });
+  // Measured, not gated: a second org through the real ingest under TENANT_ORG_IDS (#94).
+  const orgB = await pipeline.courier("org-e2e-b", "ws-e2e-b", [{ id: "s-e2e-b", lines: [line("orgbmarker", 1)] }]);
+  const multiOrg = {
+    uploaded: orgB.result.uploaded,
+    ownOrgHits: (await search.search(scopeOf("org-e2e-b", ["ws-e2e-b"]), { query: "orgbmarker" })).hits.length,
+    otherOrgHits: (await search.search(scopeOf("org-e2e-a", ["ws-e2e-b"]), { query: "orgbmarker" })).hits.length,
+  };
   await pipeline.stop();
   gate("G1_courier_to_search", {
     realCourierUploaded: first.result.uploaded === 1 && second.result.uploaded === 1,
@@ -100,7 +121,10 @@ async function g1() {
     staleSkipped: stale === "skipped_stale",
     quarantineSkipped: quarantined === "skipped_quarantined",
     optOutSkipped: optOutRows === 0,
-  }, { firstHitMs: Math.round(firstHitMs), rowsBefore, rowsAfterRetry, outcomes, note: "the search-index step is proof code called from session-indexed; no such queue stage exists" });
+    machineClaimAbsentRefused: claimAbsentRefused,
+    machineClaimMismatchRefused: claimMismatchRefused,
+  }, { firstHitMs: Math.round(firstHitMs), rowsBefore, rowsAfterRetry, outcomes, multiOrg, note: "the search-index step is proof code called from session-indexed; no such queue stage exists" });
+  return true;
 }
 
 function recallAt(k: number, got: string[], want: string[]) {
@@ -350,31 +374,36 @@ async function g0Controls() {
 
 await installSchema(admin, pw);
 await g0Controls();
-await g1();
-const oracle = new Oracle();
+const reachedStore = await g1();
 let loaded = 0;
-const loadStart = performance.now();
-for (const batch of transcriptBatches(params, oracle)) { await search.insert(batch); loaded += batch.length; }
-console.log(`loaded ${loaded} events in ${Math.round((performance.now() - loadStart) / 1000)}s`);
-// The first search after a bulk load, without the 5 s limit, so a miss has a number.
-const parts = Number((await admin.run("SELECT count() FROM system.parts WHERE table = 'session_search_records' AND active")).trim());
-const probeStart = performance.now();
-await admin.run(`SELECT count() FROM session_search_records WHERE org_id = 'org-0' AND hasAllTokens(text, 'flaky retry loop') AND positionCaseInsensitiveUTF8(text, 'flaky retry loop') > 0`, {}, { max_execution_time: 120 });
-const firstQueryAfterLoad = { activeParts: parts, ms: Math.round(performance.now() - probeStart), over5sLimit: performance.now() - probeStart > 5000 };
-console.log("first query after load", JSON.stringify(firstQueryAfterLoad));
-await g2(oracle);
-await g3(oracle);
-await g4();
-await g5();
-await g6(loaded);
-await g7g8();
-await g10();
+let firstQueryAfterLoad: unknown = null;
+if (reachedStore) {
+  const oracle = new Oracle();
+  const loadStart = performance.now();
+  for (const batch of transcriptBatches(params, oracle)) { await search.insert(batch); loaded += batch.length; }
+  console.log(`loaded ${loaded} events in ${Math.round((performance.now() - loadStart) / 1000)}s`);
+  // The first search after a bulk load, without the 5 s limit, so a miss has a number.
+  const parts = Number((await admin.run("SELECT count() FROM system.parts WHERE table = 'session_search_records' AND active")).trim());
+  const probeStart = performance.now();
+  await admin.run(`SELECT count() FROM session_search_records WHERE org_id = 'org-0' AND hasAllTokens(text, 'flaky retry loop') AND positionCaseInsensitiveUTF8(text, 'flaky retry loop') > 0`, {}, { max_execution_time: 120 });
+  firstQueryAfterLoad = { activeParts: parts, ms: Math.round(performance.now() - probeStart), over5sLimit: performance.now() - probeStart > 5000 };
+  console.log("first query after load", JSON.stringify(firstQueryAfterLoad));
+  await g2(oracle);
+  await g3(oracle);
+  await g4();
+  await g5();
+  await g6(loaded);
+  await g7g8();
+  await g10();
+}
 report.G9_noisy_neighbour = { status: "INHERITED_FAIL", detail: "#233 gate 7 fails against 2x; not rerun here" };
 report.G11_cost_teardown = { status: "NOT_RUN", detail: "plan in docs/session-search-proof.md; no account exists" };
+for (const id of ["G2_lexical_recall", "G3_context_recall", "G4_federation", "G5_tenant_isolation", "G7_latency_load", "G8_freshness", "G10_delete_logical"])
+  report[id] ??= { status: "NOT_RUN", detail: "G1 blocked" };
 const summary = { shapeFidelity: SHAPE_FIDELITY, firstQueryAfterLoad, scale: scaleName, corpus: corpusHash(params), querySet: QUERY_SET_VERSION, engine: (await admin.run("SELECT version()")).trim(), loaded, gates: report };
 mkdirSync(dirname(out), { recursive: true });
 writeFileSync(out, JSON.stringify(summary, null, 2));
 console.log(`report: ${out}`);
-const failed = Object.entries(report).filter(([, g]) => g.status === "FAIL").map(([k]) => k);
+const failed = Object.entries(report).filter(([, g]) => g.status === "FAIL" || g.status === "BLOCKED").map(([k]) => k);
 if (failed.length) { console.error(`failed: ${failed.join(", ")}`); process.exit(1); }
 process.exit(0);
