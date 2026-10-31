@@ -356,8 +356,7 @@ type ChunkWithSource = ChunkEntry & {
 export function sourceResumeOffset(manifest: ManifestV1): number | undefined {
   if (manifest.raw.format !== "ndjson") return liveNextOffset(manifest.raw);
   const tail = chunkKeys(manifest, { currentEpochOnly: true }).at(-1)?.entry as
-    | ChunkWithSource
-    | undefined;
+    ChunkWithSource | undefined;
   if (!tail) return 0;
   if (
     typeof tail.source_end !== "number" ||
@@ -385,8 +384,7 @@ function adoptManifest(
 ) {
   session.adopting = adopting;
   const ext = remote.extensions?.[EXT] as
-    | { session_uuid?: unknown }
-    | undefined;
+    { session_uuid?: unknown } | undefined;
   if (typeof ext?.session_uuid === "string")
     session.session_uuid = ext.session_uuid;
   session.trace_id = remote.trace_id;

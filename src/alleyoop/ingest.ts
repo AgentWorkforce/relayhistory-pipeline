@@ -368,8 +368,7 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
       path === "/v1/pipeline/manifests" ||
       path === "/v1/pipeline/manifests/status";
     const auth = c.get("auth") as
-      | { historyOrigin?: string; migration?: unknown }
-      | undefined;
+      { historyOrigin?: string; migration?: unknown } | undefined;
     if (
       upload &&
       env.RELAYHISTORY_ORIGIN &&
