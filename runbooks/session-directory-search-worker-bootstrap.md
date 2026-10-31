@@ -165,36 +165,79 @@ marker: a reader started early, or a migrator that died, simply stays non-ready.
 `src/hoopdb/migrate.ts` resolves an explicit profile **before opening any connection**. It
 never infers anything from the hostname. An invalid profile writes nothing anywhere.
 
-| Variable                | Contract                                                                                                                                                                                                                                   |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `HOOPDB_DB_MODE`        | required, no default: `local` (Docker stack), `selfhosted` (CNPG, Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                              |
-| `HOOPDB_SUPABASE_SHIM`  | `local` and `selfhosted`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project. |
-| `HOOPDB_ROLE_BOOTSTRAP` | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                               |
-| `HOOPDB_RUNTIME_ROLE`   | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                         |
+| Variable                       | Contract                                                                                                                                                                                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `HOOPDB_DB_MODE`               | required, no default: `local` (Docker stack), `selfhosted` (CNPG, Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                              |
+| `HOOPDB_SUPABASE_SHIM`         | `local` and `selfhosted`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project. |
+| `HOOPDB_ROLE_BOOTSTRAP`        | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                               |
+| `HOOPDB_RUNTIME_ROLE`          | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                         |
+| `HOOPDB_RUNTIME_ROLE_LOGIN`    | required in `selfhosted` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                 |
+| `HOOPDB_RUNTIME_WORKLOAD_ROLE` | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                  |
 
-**Runtime role.** Checked under the migrator's advisory lock, before any write: before the
-pending marker upsert, before any step, and before the ledger or marker tables are
-created.
+**Runtime role: dedicated, exact least privilege.** It is checked under the migrator's
+advisory lock before any write (before the ledger and marker tables are created, before
+the pending marker upsert, before any step), and again after the last migration, before
+phase 2 can mark PASS.
 
 - **Missing role:** `runtime_role_missing`.
-- **The migrator itself (owner-run):** accepted in `local` and `selfhosted`, refused in
-  `supabase` (`runtime_role_unsafe`).
-- **Any other role:** must not be a superuser, BYPASSRLS or the search Worker
+- **The migrator itself (owner-as-runtime):** accepted only in `local` (the Docker
+  stack, where one superuser runs everything). Refused in `selfhosted` and `supabase`
   (`runtime_role_unsafe`).
+- **Who creates the dedicated role:**
+  - `selfhosted` (CNPG, Cloud SQL): the privileged
+    `supabase/bootstrap/hoopdb_runtime_role.sql`, run as a superuser (CNPG `postgres`)
+    before migrate on every deploy, like the Worker bootstrap. It is idempotent, creates
+    the role with no privileges and never sets a password; the credential is provisioned
+    separately. #75 wires it for AWS CNPG; GCP needs the same step.
+  - `supabase`: pre-provisioned by an operator and verified by the migrator. On
+    PostgreSQL 16+ the creator-ADMIN caveat of the Worker applies here too: a role
+    created by Supabase's non-superuser `postgres` would carry ADMIN for `postgres` and
+    be refused. This is a decision point in #98.
 
-A dedicated role gets exactly `USAGE` on schema `sessions` (to reach the tables; it
-creates nothing) and `SELECT` on `sessions.__96bulls_migrations` and
-`sessions.__96bulls_role_validation`. Nothing else: no DML, no DDL, no ownership. The grant
-is idempotent. The services' other table grants are outside this step (#98).
+**The allowlist** (`runtimeRoleViolations` in `src/hoopdb/migrate-guards.ts`). Every
+violation is named:
 
-**One migration authority (decision point).** Also under the lock and before any write,
-the migrator refuses:
+- LOGIN or NOLOGIN exactly as `HOOPDB_RUNTIME_ROLE_LOGIN` says. NOSUPERUSER, NOCREATEDB,
+  NOCREATEROLE, NOREPLICATION, NOBYPASSRLS.
+- A member of no role. Its only member may be `HOOPDB_RUNTIME_WORKLOAD_ROLE`, without
+  ADMIN OPTION.
+- Owns nothing, in any database. No CREATE on any schema or on the database, however it
+  is obtained (PUBLIC or memberships included).
+- **Approved, and nothing else:**
+  - `USAGE` on schema `sessions`;
+  - `SELECT` on `sessions.__96bulls_migrations` and `sessions.__96bulls_role_validation`,
+    with no GRANT OPTION;
+  - `CONNECT` / `TEMPORARY` on the database;
+  - EXECUTE only on `sessions` trigger functions, which cannot be called directly.
+
+  Any other direct reference in any database (`pg_shdepend`) is refused: table, column,
+  sequence or function privileges, default ACLs, policies. So is any effective table,
+  column or sequence privilege, or EXECUTE on any callable `sessions` function, because
+  the role now has schema USAGE.
+
+- **Out of scope here:** the services' own runtime DML grants (ingest, workers) belong to
+  #98. A runtime role holding them is refused until this allowlist is extended in a
+  reviewed change.
+
+The migrator grants exactly `USAGE` on `sessions` and `SELECT` on the two tables,
+idempotently.
+
+**One migration authority and the full ordered sequence (decision point).** Also under the
+lock and before any write, the migrator refuses:
 
 - `mixed_migration_authority`: `supabase_migrations.schema_migrations` (the
-  `supabase db push` history) records any of these migrations.
-- `unledgered_schema`: `sessions.session_index` exists, but the ledger does not record
-  the first migration.
-- `ledger_gap`: the ledger skips a step that a later recorded step follows.
+  `supabase db push` history) records any of these migrations, or exists but can't be
+  read.
+- `ledger_unknown_step`: the ledger names a schema step this image doesn't have.
+- `ledger_gap`: the ledger is not one contiguous prefix of the ordered steps (upstream,
+  then 96bulls). A first 96bulls row with no upstream rows is refused, never backfilled.
+- `migration_changed`: a recorded step's file changed.
+- `unledgered_schema`: an object that an unrecorded step creates already exists. The
+  inventory is every table, view, sequence, index, function, trigger, policy and role in
+  the migration files' CREATE statements (`inventoryOf`; a test proves it covers
+  everything a full migration leaves in `sessions`). So a database where only
+  `sessions.session_directory` exists is refused before any write, not after seven
+  ledger rows.
 
 It never imports a backlog into the ledger and never marks a step applied. Resolving any of
 these is an explicit operator decision, recorded in the activation dossier (#98):
@@ -205,6 +248,11 @@ these is an explicit operator decision, recorded in the activation dossier (#98)
    or verify each object against the file and have the owner write ledger rows in a
    reviewed change;
 3. only then rerun the migrator.
+
+**Evidence.** The `pg-proof` workflow (`.github/workflows/pg-proof.yml`) runs
+`scripts/pg-proof/role-proof.ts` on the exact head against real PostgreSQL 15 and 17
+service containers. It uploads `pg-proof-pg15` and `pg-proof-pg17` artifacts, each a JSON
+file (head, server version, each case's pass/fail) plus its log.
 
 ## CNPG (self-hosted HoopDb)
 

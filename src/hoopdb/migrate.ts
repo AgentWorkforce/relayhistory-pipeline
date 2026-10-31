@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runtimeRoleViolations, sequencePreflight } from "./migrate-guards.ts";
 import { openHoopDb, waitForHoopDb, ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE, ROLE_VERIFY_SQL_PATH, type ExpectedSchema } from "../shared/db.ts";
 import { log } from "../shared/log.ts";
 import { optional } from "../shared/env.ts";
@@ -59,6 +60,10 @@ export interface MigrationProfile {
   bootstrap: boolean;
   verify: boolean;
   runtimeRole: string;
+  /** HOOPDB_RUNTIME_ROLE_LOGIN; required in selfhosted and supabase (the role is dedicated there). */
+  runtimeLogin?: boolean;
+  /** HOOPDB_RUNTIME_WORKLOAD_ROLE: the one role allowed to be a member of the runtime role. */
+  workloadRole?: string;
 }
 
 function profileError(code: string, message: string): Error {
@@ -80,17 +85,30 @@ export function migrationProfile(env: Record<string, string | undefined> = proce
   const shim = strictFlag(env, "HOOPDB_SUPABASE_SHIM");
   const bootstrap = strictFlag(env, "HOOPDB_ROLE_BOOTSTRAP");
   const verify = strictFlag(env, "HOOPDB_ROLE_VERIFY") ?? true;
+  if (mode === "supabase" && shim) throw profileError("shim_forbidden", "the plain-Postgres role shim never runs in supabase mode");
+  if (mode === "supabase" && bootstrap)
+    throw profileError("bootstrap_forbidden", "the privileged role bootstrap never runs from the migrator in supabase mode");
+  if (mode !== "supabase" && shim === undefined)
+    throw profileError("shim_unset", `HOOPDB_SUPABASE_SHIM must be set explicitly in ${mode} mode`);
+  const ident = /^[A-Za-z_][A-Za-z0-9_$-]{0,62}$/;
   const runtimeRole = env.HOOPDB_RUNTIME_ROLE ?? "";
-  if (!/^[A-Za-z_][A-Za-z0-9_$-]{0,62}$/.test(runtimeRole))
+  if (!ident.test(runtimeRole))
     throw profileError("runtime_role_unset", "HOOPDB_RUNTIME_ROLE must name the role the services connect as");
+  const runtimeLogin = strictFlag(env, "HOOPDB_RUNTIME_ROLE_LOGIN");
+  if (mode !== "local" && runtimeLogin === undefined)
+    throw profileError("runtime_role_login_unset", `HOOPDB_RUNTIME_ROLE_LOGIN must be set explicitly in ${mode} mode`);
+  const workloadRole = env.HOOPDB_RUNTIME_WORKLOAD_ROLE || undefined;
+  if (workloadRole !== undefined && !ident.test(workloadRole))
+    throw profileError("db_profile_invalid", "HOOPDB_RUNTIME_WORKLOAD_ROLE must be a role name");
+  const runtime = { runtimeRole, ...(runtimeLogin === undefined ? {} : { runtimeLogin }), ...(workloadRole ? { workloadRole } : {}) };
   if (mode === "supabase") {
     if (shim) throw profileError("shim_forbidden", "the plain-Postgres role shim never runs in supabase mode");
     if (bootstrap) throw profileError("bootstrap_forbidden", "the privileged role bootstrap never runs from the migrator in supabase mode");
-    return { mode, shim: false, bootstrap: false, verify, runtimeRole };
+    return { mode, shim: false, bootstrap: false, verify, ...runtime };
   }
   if (shim === undefined)
     throw profileError("shim_unset", `HOOPDB_SUPABASE_SHIM must be set explicitly in ${mode} mode`);
-  return { mode, shim, bootstrap: bootstrap ?? shim, verify, runtimeRole };
+  return { mode, shim, bootstrap: bootstrap ?? shim, verify, ...runtime };
 }
 
 async function schemaSteps(): Promise<Step[]> {
@@ -174,9 +192,20 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
   await client.query("SELECT pg_advisory_lock(961996, 1)");
   try {
     const steps = opts.steps ?? (await plan(profile));
-    // Read-only preflight: nothing below writes until both checks pass.
+    const schema = steps.filter((st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"));
+    // Read-only preflight, all under the lock: nothing below writes until every check passes.
+    const ledger = await readLedger(client);
+    // A HoopDb built from the old vendored pin cannot be moved forward in place:
+    // upstream changed 20261025000600 after it was applied there. Say so plainly.
+    if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
+      throw Object.assign(
+        new Error("96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)"),
+        { code: "legacy_schema" },
+      );
+    }
     const runtime = await runtimeRolePreflight(client, profile);
-    await authorityPreflight(client, steps);
+    await cliHistoryPreflight(client, schema);
+    await sequencePreflight(client, schema, ledger);
     await client.query("CREATE SCHEMA IF NOT EXISTS sessions");
     await client.query(`CREATE TABLE IF NOT EXISTS ${MIGRATION_LEDGER} (
       name text PRIMARY KEY,
@@ -203,25 +232,26 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
     // Pending first: committed before any migration can become visible.
     await client.query(MARKER_PENDING_SQL, [ROLE_VALIDATION_NAME, gen]);
     log.info("role validation pending", { reason: gen });
-    const ledger = new Map<string, string>(
-      (await client.query<{ name: string; sha256: string }>(`SELECT name, sha256 FROM ${MIGRATION_LEDGER}`)).rows.map(
-        (r) => [r.name, r.sha256],
-      ),
-    );
-    // A HoopDb built from the old vendored pin cannot be moved forward in place:
-    // upstream changed 20261025000600 after it was applied there. Say so plainly.
-    if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
-      throw Object.assign(
-        new Error("96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)"),
-        { code: "legacy_schema" },
-      );
-    }
+    // After the last migration, before phase 2 can mark PASS: the runtime role holds
+    // exactly the approved grants against the full schema (e.g. no EXECUTE gained on a
+    // function a migration just created).
+    const postCheck = async () => {
+      if (runtime !== "dedicated") return;
+      const violations = await runtimeRoleViolations(client, runtimeCfg(profile), RUNTIME_TABLES);
+      if (violations.length)
+        throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`);
+    };
+    let postChecked = false;
     for (const step of steps) {
       const sql = await readFile(step.path, "utf8");
       // The role checks (phase 1 bootstrap, phase 2 verify) run on every migrate, each in
       // its own transaction, and are never recorded in the ledger.
       if (step.name.startsWith("bootstrap:") || step.name.startsWith("verify:")) {
         const verify = step.name.startsWith("verify:");
+        if (verify) {
+          await postCheck();
+          postChecked = true;
+        }
         if (verify && opts.beforeVerify) await opts.beforeVerify();
         await client.query("BEGIN");
         try {
@@ -250,6 +280,7 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
         continue;
       }
       if (seen && seen !== sha) {
+        // Unreachable after sequencePreflight; kept as a second line of defense.
         throw new Error(`96bulls: migration ${step.name} changed after it was applied; add a new migration instead`);
       }
       await client.query("BEGIN");
@@ -265,6 +296,7 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
       applied += 1;
       log.info("migration applied", { reason: step.name });
     }
+    if (!postChecked) await postCheck();
     if (!steps.some((s) => s.name.startsWith("verify:")))
       log.info("role validation left pending: in-process verifier disabled; an external verifier must pass it", { reason: gen });
   } finally {
@@ -274,44 +306,53 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
   return { applied, skipped };
 }
 
+const RUNTIME_TABLES = { ledger: MIGRATION_LEDGER, marker: ROLE_VALIDATION_TABLE };
+const runtimeCfg = (p: MigrationProfile) => ({
+  mode: p.mode,
+  role: p.runtimeRole,
+  ...(p.runtimeLogin === undefined ? {} : { login: p.runtimeLogin }),
+  ...(p.workloadRole ? { workload: p.workloadRole } : {}),
+});
+
+async function readLedger(client: MigrationClient): Promise<Map<string, string>> {
+  const there = (await client.query<{ r: string | null }>("SELECT to_regclass($1)::text AS r", [MIGRATION_LEDGER])).rows[0]?.r;
+  if (!there) return new Map();
+  return new Map(
+    (await client.query<{ name: string; sha256: string }>(`SELECT name, sha256 FROM ${MIGRATION_LEDGER}`)).rows.map((r) => [r.name, r.sha256]),
+  );
+}
+
 /**
- * The runtime role must exist. Either it is the migrator itself (owner-run; local and
- * selfhosted only), or it is a dedicated role that is not a superuser, not BYPASSRLS and
- * not the search Worker. It then gets SELECT on the ledger and the marker. Anything else
- * fails closed before any write.
+ * The runtime role must exist and be dedicated: the migrator itself (owner-run) is
+ * accepted only in local mode. A dedicated role must pass the exact least-privilege
+ * allowlist (runtimeRoleViolations). Otherwise it fails closed before any write.
  */
 async function runtimeRolePreflight(client: MigrationClient, profile: MigrationProfile): Promise<"owner" | "dedicated"> {
   const r = (
-    await client.query<{ rolname: string; rolsuper: boolean; rolbypassrls: boolean; me: string }>(
-      "SELECT rolname, rolsuper, rolbypassrls, current_user AS me FROM pg_roles WHERE rolname = $1",
-      [profile.runtimeRole],
-    )
+    await client.query<{ rolname: string; me: string }>("SELECT rolname, current_user AS me FROM pg_roles WHERE rolname = $1", [profile.runtimeRole])
   ).rows[0];
   if (!r) throw profileError("runtime_role_missing", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} does not exist; nothing was written`);
   if (r.rolname === r.me) {
-    if (profile.mode === "supabase")
-      throw profileError("runtime_role_unsafe", "in supabase mode the services need a dedicated runtime role, not the migration owner");
+    if (profile.mode !== "local")
+      throw profileError("runtime_role_unsafe", `in ${profile.mode} mode the services need a dedicated runtime role, not the migration owner`);
     return "owner";
   }
-  if (r.rolsuper || r.rolbypassrls || r.rolname === ROLE_VALIDATION_NAME)
-    throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${r.rolname} must not be a superuser, BYPASSRLS or the search Worker`);
+  if (r.rolname === ROLE_VALIDATION_NAME) throw profileError("runtime_role_unsafe", "HOOPDB_RUNTIME_ROLE must not be the search Worker");
+  const violations = await runtimeRoleViolations(client, runtimeCfg(profile), RUNTIME_TABLES);
+  if (violations.length)
+    throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`);
   return "dedicated";
 }
 
 /**
- * One migration authority. Refuses, before any write, when:
- * - Supabase's CLI history (supabase_migrations.schema_migrations) records any of these
- *   migrations, meaning `supabase db push` was used as well (mixed_migration_authority);
- * - the sessions schema exists (sessions.session_index) without a ledger that records it
- *   (unledgered_schema);
- * - the ledger skips a step that a later recorded step depends on (ledger_gap).
- * Nothing is ever imported into, or marked in, the ledger. Resolving it is the decision
- * point in runbooks/session-directory-search-worker-bootstrap.md ("One migration authority").
+ * Refuses, before any write, when Supabase's CLI history
+ * (supabase_migrations.schema_migrations) records any of these migrations, or exists
+ * but can't be read: `supabase db push` and this migrator must never both apply them
+ * (mixed_migration_authority). See the runbook decision point.
  */
-async function authorityPreflight(client: MigrationClient, steps: Step[]): Promise<void> {
+async function cliHistoryPreflight(client: MigrationClient, schema: Step[]): Promise<void> {
   const reg = async (name: string) =>
     (await client.query<{ r: string | null }>("SELECT to_regclass($1)::text AS r", [name])).rows[0]?.r ?? null;
-  const schema = steps.filter((st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"));
   let cliHistory: string | null;
   try {
     cliHistory = await reg("supabase_migrations.schema_migrations");
@@ -340,18 +381,6 @@ async function authorityPreflight(client: MigrationClient, steps: Step[]): Promi
     }
     if (hit.length)
       throw profileError("mixed_migration_authority", `supabase db push recorded ${hit.map((h) => h.version).join(", ")}; one authority only, see the runbook decision point`);
-  }
-  const ledgered = (await reg(MIGRATION_LEDGER))
-    ? new Set((await client.query<{ name: string }>(`SELECT name FROM ${MIGRATION_LEDGER}`)).rows.map((r) => r.name))
-    : new Set<string>();
-  const firstUpstream = schema.find((st) => st.name.startsWith("upstream:"));
-  if ((await reg("sessions.session_index")) && firstUpstream && !ledgered.has(firstUpstream.name))
-    throw profileError("unledgered_schema", "sessions schema exists without a ledger that records it; nothing is imported, see the runbook decision point");
-  for (const group of ["upstream:", "96bulls:"]) {
-    const names = schema.filter((st) => st.name.startsWith(group)).map((st) => st.name);
-    const lastLedgered = names.map((n) => ledgered.has(n)).lastIndexOf(true);
-    const gap = lastLedgered > 0 ? names.slice(0, lastLedgered).find((n) => !ledgered.has(n)) : undefined;
-    if (gap) throw profileError("ledger_gap", `${gap} is not recorded but a later step is; nothing is marked, see the runbook decision point`);
   }
 }
 

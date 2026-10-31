@@ -4,7 +4,8 @@
  * Runs the real migrator (runMigrations) on in-process PGlite.
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
 import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
@@ -210,12 +211,12 @@ describe("Worker role validation marker", () => {
     const db = await fresh();
     await runMigrations(client(db), { profile: LOCAL });
     const steps = await plan(LOCAL);
+    // A real file whose SQL fails when applied, after the recorded prefix.
+    const dir = mkdtempSync(join(tmpdir(), "g6-broken-"));
+    writeFileSync(join(dir, "9999_broken.sql"), "SELECT 1 / 0;");
     const broken = [
       ...steps.slice(0, -1),
-      {
-        name: "96bulls:9999_broken.sql",
-        path: join(root, "supabase/tests/does-not-exist.sql"),
-      },
+      { name: "96bulls:9999_broken.sql", path: join(dir, "9999_broken.sql") },
       ...steps.slice(-1),
     ];
     expect(

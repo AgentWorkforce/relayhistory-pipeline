@@ -241,10 +241,13 @@ export interface GcpInputs {
     tenantOrgId: string;
     existingSecretName: string;
     /**
-     * HOOPDB_RUNTIME_ROLE: the Cloud SQL role the services connect as. No default: unset,
-     * the migrator refuses to run (src/hoopdb/migrate.ts).
+     * HOOPDB_RUNTIME_ROLE: the dedicated, non-owner Cloud SQL role the services connect as,
+     * created by supabase/bootstrap/hoopdb_runtime_role.sql as a privileged step before
+     * migrate. No default: unset, the migrator refuses to run (src/hoopdb/migrate.ts).
      */
     hoopdbRuntimeRole?: string;
+    /** HOOPDB_RUNTIME_ROLE_LOGIN: whether that role logs in itself (default true). */
+    hoopdbRuntimeRoleLogin?: boolean;
     /** Digest of the services image built from the reviewed runtime commit. */
     imageDigest: string;
     /** Full Git revision from which imageDigest was built. Must match versions.lock.json. */
@@ -898,7 +901,13 @@ export function bulls96ReleaseValues(
         { name: "HOOPDB_DB_MODE", value: "selfhosted" },
         { name: "HOOPDB_SUPABASE_SHIM", value: "true" },
         ...(i.hoopdbRuntimeRole
-          ? [{ name: "HOOPDB_RUNTIME_ROLE", value: i.hoopdbRuntimeRole }]
+          ? [
+              { name: "HOOPDB_RUNTIME_ROLE", value: i.hoopdbRuntimeRole },
+              {
+                name: "HOOPDB_RUNTIME_ROLE_LOGIN",
+                value: i.hoopdbRuntimeRoleLogin === false ? "false" : "true",
+              },
+            ]
           : []),
       ],
     },

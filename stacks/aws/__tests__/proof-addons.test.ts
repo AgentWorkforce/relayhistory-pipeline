@@ -69,12 +69,17 @@ describe("CloudNativePG proof HoopDb", () => {
     const modeEnv = (v: { worker: { extraEnv?: Array<{ name: string; value: string }> } }) =>
       Object.fromEntries((v.worker.extraEnv ?? []).filter((e) => e.name.startsWith("HOOPDB_")).map((e) => [e.name, e.value]));
     expect(modeEnv(external as never)).toEqual({ HOOPDB_DB_MODE: "supabase", HOOPDB_SUPABASE_SHIM: "false" });
-    expect(modeEnv(cnpg as never)).toEqual({ HOOPDB_DB_MODE: "selfhosted", HOOPDB_SUPABASE_SHIM: "true", HOOPDB_RUNTIME_ROLE: "hoop" });
+    // No runtime-role default anywhere: the owner `hoop` is refused in selfhosted, so CNPG needs the bootstrap-created role.
+    expect(modeEnv(cnpg as never)).toEqual({ HOOPDB_DB_MODE: "selfhosted", HOOPDB_SUPABASE_SHIM: "true" });
     expect(modeEnv(eksChartValues({ ...base, hoopdbRuntimeRole: "bulls96_runtime" }, false, "i", "j") as never)).toEqual({
       HOOPDB_DB_MODE: "supabase",
       HOOPDB_SUPABASE_SHIM: "false",
       HOOPDB_RUNTIME_ROLE: "bulls96_runtime",
+      HOOPDB_RUNTIME_ROLE_LOGIN: "true",
     });
+    expect(
+      modeEnv(eksChartValues({ ...base, hoopdbRuntimeRole: "bulls96_runtime", hoopdbRuntimeRoleLogin: false }, false, "i", "j", { operatorRelease: "cnpg" }) as never),
+    ).toEqual({ HOOPDB_DB_MODE: "selfhosted", HOOPDB_SUPABASE_SHIM: "true", HOOPDB_RUNTIME_ROLE: "bulls96_runtime", HOOPDB_RUNTIME_ROLE_LOGIN: "false" });
     expect(cnpg.hoopdb).toMatchObject({ enabled: true, cluster: { storage: { storageClass: STORAGE_CLASS } } });
   });
 });
