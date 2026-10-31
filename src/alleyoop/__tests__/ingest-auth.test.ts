@@ -62,6 +62,7 @@ import { sqlPipelineEventSink } from "../../hoopdb/sink.ts";
 import { buildIngestApp } from "../ingest.ts";
 import { mintToken } from "../auth.ts";
 import { runCourierOnce, type CourierConfig } from "../courier.ts";
+import { mintTenantToken } from "../../proof/aws/ingest.ts";
 import { DatabaseSync } from "node:sqlite";
 import { writeFile } from "node:fs/promises";
 import { indexerReconcileRoot } from "../../hoopdb/reconcile-root.ts";
@@ -501,6 +502,87 @@ const MIGRATION_ON = {
 };
 
 describe("buildIngestApp auth (production composition)", () => {
+  test("PROOF MINT + REAL ROUTE: RelayAuth request, signed machine claim and zero-side-effect refusals agree", async () => {
+    let request:
+      | { url: string; body: Record<string, unknown>; key: string | null }
+      | undefined;
+    const token = await mintTenantToken({
+      relayauthUrl: "https://relayauth.example.test",
+      bootstrapKey: "synthetic-proof-key",
+      orgId: ORG,
+      workspaceId: WORKSPACE,
+      machineId: LOCATION.machineId,
+      sponsorId: USER,
+      historyOrigin: ORIGIN,
+      fetch: async (url, init) => {
+        const body = JSON.parse(String(init?.body)) as { machineId: string };
+        request = {
+          url,
+          body,
+          key: new Headers(init?.headers).get("x-api-key"),
+        };
+        return Response.json(
+          { accessToken: liveToken(body.machineId) },
+          { status: 201 },
+        );
+      },
+    });
+    expect(request).toEqual({
+      url: "https://relayauth.example.test/v1/tokens/relayhistory-assertion",
+      key: "synthetic-proof-key",
+      body: {
+        orgId: ORG,
+        workspaceId: WORKSPACE,
+        machineId: LOCATION.machineId,
+        sponsorId: USER,
+        scopes: ["rth:sync", "rth:read"],
+        expiresIn: 3600,
+        historyOrigin: ORIGIN,
+      },
+    });
+    const claims = JSON.parse(
+      Buffer.from(token.split(".")[1]!, "base64url").toString("utf8"),
+    ) as { meta?: { machineId?: string } };
+    expect(claims.meta?.machineId).toBe(LOCATION.machineId);
+
+    const i = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
+    const objects = async (location: SessionLocation) =>
+      (await i.store.list(objectKey(sessionPrefix(location)))).items.length;
+    expect((await i.chunk(token, LOCATION)).status).toBe(201);
+    expect(await objects(LOCATION)).toBe(1);
+
+    const other = {
+      ...LOCATION,
+      machineId: "machine-b",
+      sessionId: "session-b",
+    };
+    const claimless = sign({
+      sub: "agent_relayhistory_assertion",
+      org: ORG,
+      wks: WORKSPACE,
+      sponsorId: USER,
+      scopes: ["rth:sync"],
+      token_type: "access",
+      iss: ISSUER,
+      aud: [ORIGIN],
+      iat: now(),
+      exp: now() + 600,
+      meta: { tokenClass: "relayhistory_assertion" },
+    });
+    for (const denied of [claimless, token]) {
+      const response = await i.chunk(denied, other);
+      expect(response.status).toBe(403);
+      expect(await code(response)).toBe("machine_claim_refused");
+    }
+    expect(await objects(other)).toBe(0);
+    for (const table of [
+      "sessions.pipeline_jobs",
+      "sessions.claimless_uses",
+      "sessions.migration_assertion_uses",
+    ])
+      expect(await count(table)).toBe(0);
+  });
+
   test("REAL ROUTE: a live chunk POST without a matching machine claim is refused and writes nothing", async () => {
     const i = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
     const claimless = sign({

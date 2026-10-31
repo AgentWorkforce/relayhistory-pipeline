@@ -117,12 +117,14 @@ RelayAuth reads the keys at boot: after changing the Secret, run
 kubectl -n relayauth port-forward svc/relayauth 18787:8787 &
 curl -s http://127.0.0.1:18787/v1/tokens/relayhistory-assertion \
   -H "x-api-key: $BOOTSTRAP_KEY" -H 'content-type: application/json' \
-  -d '{"orgId":"org_sessions_dev","workspaceId":"default","sponsorId":"<user id>","scopes":["rth:sync","rth:read"],"expiresIn":3600,"historyOrigin":"https://sessions-dev.agentrelay.com"}'
+  -d '{"orgId":"org_sessions_dev","workspaceId":"default","machineId":"<exact courier MACHINE_ID>","sponsorId":"<user id>","scopes":["rth:sync","rth:read"],"expiresIn":3600,"historyOrigin":"https://sessions-dev.agentrelay.com"}'
 # -> 201 {"accessToken": ...}; send it to AlleyOop as Authorization: Bearer <token>
 ```
 
 The token's `aud` is exactly `historyOrigin`, which must equal the stage's
-`relayhistoryOrigin` (AlleyOop refuses anything else).
+`relayhistoryOrigin` (AlleyOop refuses anything else). RelayAuth also signs the
+canonical request `machineId` as `meta.machineId`; it must equal the courier's
+persisted `MACHINE_ID`. Never reuse the assertion for another machine.
 
 **Transport.** The Service is plain HTTP. That is safe for what crosses it today:
 AlleyOop fetches only the public JWKS, and minting goes through

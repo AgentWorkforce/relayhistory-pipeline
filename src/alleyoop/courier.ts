@@ -168,6 +168,7 @@ export function configFromEnv(): CourierConfig {
     throw new Error("96bulls: COURIER_START_MODE must be all or new");
   let token: BearerTokenProvider;
   const cloudSession = !!process.env.CLOUD_URL;
+  const relayAuthSession = !!process.env.RELAYAUTH_URL;
   if (cloudSession) {
     token = new CloudSessionAssertionProvider({
       baseUrl: required("CLOUD_URL"),
@@ -175,12 +176,13 @@ export function configFromEnv(): CourierConfig {
       machineId: required("MACHINE_ID"),
       cloudToken: secretCommand(required("CLOUD_TOKEN_COMMAND_JSON")),
     });
-  } else if (process.env.RELAYAUTH_URL) {
+  } else if (relayAuthSession) {
     token = new RelayAuthAssertionProvider({
       baseUrl: required("RELAYAUTH_URL"),
       historyOrigin: required("RELAYAUTH_HISTORY_ORIGIN"),
       orgId,
       workspaceId,
+      machineId: required("MACHINE_ID"),
       sponsorId: userId,
       apiKey: secretCommand(required("RELAYAUTH_API_KEY_COMMAND_JSON")),
       expiresInSeconds: integer("RELAYAUTH_ASSERTION_TTL_SECONDS", 60),
@@ -230,7 +232,7 @@ export function configFromEnv(): CourierConfig {
     workspaceId,
     userId,
     ...(process.env.MACHINE_ID ? { machineId: process.env.MACHINE_ID } : {}),
-    ...(cloudSession || process.env.JWT_PRIVATE_KEY_PEM
+    ...(cloudSession || relayAuthSession || process.env.JWT_PRIVATE_KEY_PEM
       ? { machineBound: true }
       : {}),
     ...(process.env.HARNESSES
