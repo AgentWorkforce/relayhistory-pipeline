@@ -1,0 +1,36 @@
+{
+  "accountId": "500268966557",
+  "region": "us-west-2",
+  "clearedBy": "Khaliq Gant, 2026-10-28 ~10:00 PM PT, in Claude Code session: 'go ahead' (deploy the 96Bulls AWS stage into sessions-dev)",
+  "budgetUsd": 300,
+  "budgetEmail": "aws-budgets@agentrelay.com",
+  "eks": {
+    "chartVersion": "0.3.0",
+    "runtimeSecretName": "96bulls-runtime",
+    "tenantOrgId": "org_sessions_dev",
+    "relayauthJwksUrl": "https://relayauth.dev/.well-known/jwks.json",
+    "relayhistoryOrigin": "https://sessions-dev.agentrelay.com",
+    "imageDigest": "sha256:c13b879a668984f905e30e38b05764ec712532e8395b256d416ba1602f6c6726",
+    "ingress": {
+      "hostname": "sessions-dev.agentrelay.com",
+      "cloudflareZoneId": "34afb0e8fc19f2b6fd025668e880a889",
+      "zoneDomain": "agentrelay.com",
+      "cloudflareTokenSecret": "cloudflare-dns",
+      "certValidation": {
+        "name": "_4e881d15441c8dd831aa7bbe4aa6dccb.sessions-dev.agentrelay.com.",
+        "value": "_b8ac292fee3edb37e5a4f3f6c790f066.wzccmgtwzk.acm-validations.aws."
+      }
+    },
+    "relayauth": {
+      "chartVersion": "0.1.0",
+      "secretName": "relayauth"
+    },
+    "imageSourceRevision": "ffb7ef0f684a92c129bbf14c2da2066fbe6fe6b2",
+    "apiAccess": {
+      "publicAccessCidrs": [
+        "operator-address-redacted/32"
+      ]
+    },
+    "legacyPodsRole": "keep"
+  }
+}
