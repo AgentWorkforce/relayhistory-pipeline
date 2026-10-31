@@ -34,6 +34,13 @@ const shim = readFileSync(
   join(import.meta.dir, "../../../supabase/tests/supabase_shim.sql"),
   "utf8",
 );
+const bootstrap = readFileSync(
+  join(
+    import.meta.dir,
+    "../../../supabase/bootstrap/session_directory_search_worker.sql",
+  ),
+  "utf8",
+);
 const open: PGlite[] = [];
 
 afterEach(async () => {
@@ -44,6 +51,7 @@ async function database(): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(shim);
+  await db.exec(bootstrap);
   await db.exec(`
     CREATE SCHEMA sessions;
     CREATE FUNCTION sessions.jwt_org_id() RETURNS text LANGUAGE sql STABLE AS $$

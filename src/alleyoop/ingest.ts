@@ -30,6 +30,7 @@ import {
   openHoopDb,
   waitForHoopDb,
   waitForSchema,
+  isPrerequisiteStep,
 } from "../shared/db.ts";
 import { enrichMessage, requestIdentity } from "../shared/enrich.ts";
 import { lockerStore } from "../shared/locker.ts";
@@ -328,7 +329,7 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
       );
       const have = new Set(rows.map((r) => r.name));
       const missing = expected.filter(
-        (n) => !n.startsWith("shim:") && !have.has(n),
+        (n) => !isPrerequisiteStep(n) && !have.has(n),
       );
       if (missing.length)
         return c.json(

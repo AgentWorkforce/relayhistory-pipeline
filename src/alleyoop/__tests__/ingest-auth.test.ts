@@ -225,6 +225,12 @@ beforeAll(async () => {
   await db.exec(
     await readFile(join(ROOT_DIR, "supabase/tests/supabase_shim.sql"), "utf8"),
   );
+  await db.exec(
+    await readFile(
+      join(ROOT_DIR, "supabase/bootstrap/session_directory_search_worker.sql"),
+      "utf8",
+    ),
+  );
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
     for (const file of (await readdir(join(ROOT_DIR, dir)))
       .filter((f) => f.endsWith(".sql"))

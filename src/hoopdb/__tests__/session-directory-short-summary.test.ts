@@ -80,6 +80,7 @@ async function database(prelude = ""): Promise<PGlite> {
   const db = new PGlite({ extensions: { auto_explain, btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
+  await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
   if (prelude) await db.exec(prelude);
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
@@ -700,136 +701,288 @@ describe("migration role collision", () => {
       )
     ).rows.length > 0;
 
-  test("a pre-existing role equal to what the migration creates is reused unaltered", async () => {
+  const BOOTSTRAP = read(
+    "supabase/bootstrap/session_directory_search_worker.sql",
+  );
+  /** The role exactly as the bootstrap makes it. */
+  const SPEC = `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET statement_timeout = '2s';`;
+  const failure = async (run: Promise<unknown>) =>
+    (await run.then(
+      () => null,
+      (caught: unknown) => caught,
+    )) as { code?: string; message?: string } | null;
+  const nothingApplied = async (db: PGlite) => {
+    expect(await applied(db)).toBe(false);
+    expect(
+      (
+        await db.query(
+          "SELECT 1 FROM pg_proc WHERE proname = 'search_session_directory'",
+        )
+      ).rows,
+    ).toEqual([]);
+    // The extension is the migration's first DDL after the guard.
+    expect(
+      (await db.query("SELECT 1 FROM pg_extension WHERE extname = 'btree_gin'"))
+        .rows,
+    ).toEqual([]);
+  };
+  const settings = async (db: PGlite) =>
+    (
+      await db.query<Row>(
+        `SELECT s.setdatabase, s.setconfig FROM pg_db_role_setting AS s
+          JOIN pg_roles AS r ON r.oid = s.setrole WHERE r.rolname = $1`,
+        [WORKER],
+      )
+    ).rows;
+  const memberships = async (db: PGlite) =>
+    (
+      await db.query<Row>(
+        `SELECT g.rolname AS role, u.rolname AS member, m.admin_option
+           FROM pg_auth_members AS m
+           JOIN pg_roles AS g ON g.oid = m.roleid
+           JOIN pg_roles AS u ON u.oid = m.member
+          WHERE g.rolname = $1 OR u.rolname = $1`,
+        [WORKER],
+      )
+    ).rows;
+
+  test("an absent role fails closed with 42704 before any DDL; the migration never creates it", async () => {
     const db = await beforeG6();
-    await db.exec(`CREATE ROLE ${WORKER} NOLOGIN NOINHERIT NOBYPASSRLS;
+    const error = await failure(db.exec(UP));
+    expect(error?.code).toBe("42704");
+    expect(error?.message).toContain(
+      "role session_directory_search_worker does not exist; this migration does not create it",
+    );
+    await nothingApplied(db);
+    expect(
+      (await db.query("SELECT 1 FROM pg_roles WHERE rolname = $1", [WORKER]))
+        .rows,
+    ).toEqual([]);
+  });
+
+  test("the bootstrap creates the role exactly to spec and is idempotent; the migration then applies and leaves no membership or ADMIN OPTION", async () => {
+    const db = await beforeG6();
+    await db.exec(BOOTSTRAP);
+    await db.exec(BOOTSTRAP);
+    const spec = async () =>
+      (
+        await db.query<Row>(
+          `SELECT rolcanlogin, rolinherit, rolbypassrls, rolsuper, rolcreaterole, rolcreatedb, rolreplication
+             FROM pg_roles WHERE rolname = $1`,
+          [WORKER],
+        )
+      ).rows;
+    const expected = [
+      {
+        rolcanlogin: false,
+        rolinherit: false,
+        rolbypassrls: false,
+        rolsuper: false,
+        rolcreaterole: false,
+        rolcreatedb: false,
+        rolreplication: false,
+      },
+    ];
+    const timeout = [{ setdatabase: 0, setconfig: ["statement_timeout=2s"] }];
+    expect(await spec()).toEqual(expected);
+    expect(await settings(db)).toEqual(timeout);
+    expect(await memberships(db)).toEqual([]);
+
+    await db.exec(UP);
+    await db.exec(EXPAND_UP);
+    expect(await applied(db)).toBe(true);
+    // Neither the migration owner nor anyone else holds membership or ADMIN OPTION.
+    expect(await memberships(db)).toEqual([]);
+    expect(await spec()).toEqual(expected);
+    expect(await settings(db)).toEqual(timeout);
+    // Bootstrap again after the migration: still a no-op that verifies.
+    await db.exec(BOOTSTRAP);
+    expect(await memberships(db)).toEqual([]);
+  });
+
+  test("the bootstrap refuses an existing role that differs (55000) and changes nothing", async () => {
+    const db = await beforeG6();
+    await db.exec(
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET statement_timeout = '2000ms';`,
+    );
+    const error = await failure(db.exec(BOOTSTRAP));
+    expect(error?.code).toBe("55000");
+    expect(error?.message).toContain(
+      "role settings must be exactly statement_timeout=2s (found: statement_timeout=2000ms)",
+    );
+    expect(await settings(db)).toEqual([
+      { setdatabase: 0, setconfig: ["statement_timeout=2000ms"] },
+    ]);
+  });
+
+  test("the bootstrap refuses a non-superuser creator on PostgreSQL 16+ (42501) and creates nothing", async () => {
+    const db = await beforeG6();
+    const version = (
+      await db.query<{ v: number }>(
+        "SELECT current_setting('server_version_num')::int AS v",
+      )
+    ).rows[0]!.v;
+    await db.exec(
+      "CREATE ROLE g6_bootstrapper NOLOGIN CREATEROLE; SET ROLE g6_bootstrapper",
+    );
+    const error = await failure(db.exec(BOOTSTRAP));
+    await db.exec("RESET ROLE");
+    if (version >= 160000) {
+      expect(error?.code).toBe("42501");
+      expect(error?.message).toContain("g6_bootstrapper may not create it");
+      expect(
+        (await db.query("SELECT 1 FROM pg_roles WHERE rolname = $1", [WORKER]))
+          .rows,
+      ).toEqual([]);
+    } else {
+      expect(error).toBeNull();
+      expect(await memberships(db)).toEqual([]);
+    }
+  });
+
+  test("a bootstrapped role with a NOINHERIT authenticator is reused unaltered", async () => {
+    const db = await beforeG6();
+    await db.exec(`${SPEC}
       CREATE ROLE authenticator NOLOGIN NOINHERIT; GRANT ${WORKER} TO authenticator;`);
     await db.exec(UP);
     expect(await applied(db)).toBe(true);
-    const role = (
-      await db.query<Row>(
-        "SELECT rolcanlogin, rolinherit, rolbypassrls, rolconfig FROM pg_roles WHERE rolname = $1",
-        [WORKER],
-      )
-    ).rows[0];
-    expect(role).toEqual({
-      rolcanlogin: false,
-      rolinherit: false,
-      rolbypassrls: false,
-      rolconfig: ["statement_timeout=2s"],
-    });
+    expect(await settings(db)).toEqual([
+      { setdatabase: 0, setconfig: ["statement_timeout=2s"] },
+    ]);
+    expect(await memberships(db)).toEqual([
+      {
+        role: WORKER,
+        member: "authenticator",
+        admin_option: false,
+      },
+    ]);
   });
 
+  const SETTINGS = "role settings must be exactly statement_timeout=2s";
   const UNSAFE: Array<[string, string, string]> = [
-    ["LOGIN", `CREATE ROLE ${WORKER} LOGIN NOINHERIT`, "LOGIN"],
-    ["INHERIT", `CREATE ROLE ${WORKER} NOLOGIN INHERIT`, "INHERIT"],
+    ["LOGIN", `${SPEC} ALTER ROLE ${WORKER} LOGIN`, "LOGIN"],
+    ["INHERIT", `${SPEC} ALTER ROLE ${WORKER} INHERIT`, "INHERIT"],
+    ["BYPASSRLS", `${SPEC} ALTER ROLE ${WORKER} BYPASSRLS`, "BYPASSRLS"],
+    ["SUPERUSER", `${SPEC} ALTER ROLE ${WORKER} SUPERUSER`, "SUPERUSER"],
+    ["CREATEROLE", `${SPEC} ALTER ROLE ${WORKER} CREATEROLE`, "CREATEROLE"],
+    ["CREATEDB", `${SPEC} ALTER ROLE ${WORKER} CREATEDB`, "CREATEDB"],
+    ["REPLICATION", `${SPEC} ALTER ROLE ${WORKER} REPLICATION`, "REPLICATION"],
     [
-      "BYPASSRLS",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT BYPASSRLS`,
-      "BYPASSRLS",
+      "no statement_timeout",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT`,
+      `${SETTINGS} (found: none)`,
     ],
     [
-      "SUPERUSER",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT SUPERUSER`,
-      "SUPERUSER",
+      "an equivalent spelling, 2000ms",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET statement_timeout = '2000ms'`,
+      `${SETTINGS} (found: statement_timeout=2000ms)`,
     ],
     [
-      "CREATEROLE",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT CREATEROLE`,
-      "CREATEROLE",
+      "an equivalent spelling, bare 2000",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET statement_timeout = 2000`,
+      `${SETTINGS} (found: statement_timeout=2000)`,
     ],
     [
-      "CREATEDB",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT CREATEDB`,
-      "CREATEDB",
+      "a different timeout",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET statement_timeout = '5s'`,
+      `${SETTINGS} (found: statement_timeout=5s)`,
     ],
     [
-      "REPLICATION",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT REPLICATION`,
-      "REPLICATION",
+      "an extra role setting",
+      `${SPEC} ALTER ROLE ${WORKER} SET search_path = public`,
+      `${SETTINGS} (found: statement_timeout=2s, search_path=public)`,
     ],
     [
-      "extra role setting",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET search_path = public`,
-      "role settings other than statement_timeout",
+      "a database-specific setting",
+      `${SPEC}
+      DO $g$ BEGIN EXECUTE format('ALTER ROLE ${WORKER} IN DATABASE %I SET work_mem = ''64kB''', current_database()); END $g$`,
+      SETTINGS,
     ],
     [
       "member of another role",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT service_role TO ${WORKER}`,
+      `${SPEC} GRANT service_role TO ${WORKER}`,
       "member of service_role",
     ],
     [
       "granted to an inheriting role",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE ROLE app_reader NOLOGIN INHERIT;
+      `${SPEC} CREATE ROLE app_reader NOLOGIN INHERIT;
       GRANT ${WORKER} TO app_reader`,
       "granted to app_reader",
     ],
     [
       "granted to an INHERIT authenticator",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE ROLE authenticator NOLOGIN INHERIT;
+      `${SPEC} CREATE ROLE authenticator NOLOGIN INHERIT;
       GRANT ${WORKER} TO authenticator`,
       "granted to authenticator",
     ],
     [
+      "granted to authenticator WITH ADMIN OPTION",
+      `${SPEC} CREATE ROLE authenticator NOLOGIN NOINHERIT;
+      GRANT ${WORKER} TO authenticator WITH ADMIN OPTION`,
+      "granted to authenticator",
+    ],
+    [
+      "ADMIN OPTION held by a migration owner (the PG16+ CREATEROLE creator grant)",
+      `${SPEC} CREATE ROLE hoop NOLOGIN NOINHERIT;
+      GRANT ${WORKER} TO hoop WITH ADMIN OPTION, INHERIT FALSE, SET FALSE`,
+      "granted to hoop",
+    ],
+    [
+      "an inheriting grant to a NOINHERIT authenticator (PG16+)",
+      `${SPEC} CREATE ROLE authenticator NOLOGIN NOINHERIT;
+      GRANT ${WORKER} TO authenticator WITH INHERIT TRUE`,
+      "granted WITH INHERIT to authenticator",
+    ],
+    [
       "owns an object",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE TABLE public.g6_owned (x int);
+      `${SPEC} CREATE TABLE public.g6_owned (x int);
       ALTER TABLE public.g6_owned OWNER TO ${WORKER}`,
       "owns objects",
     ],
     [
       "table privilege",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT SELECT ON sessions.session_index TO ${WORKER}`,
+      `${SPEC} GRANT SELECT ON sessions.session_index TO ${WORKER}`,
       "table, view or sequence privileges",
     ],
     [
       "column privilege",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT SELECT (org_id) ON sessions.session_directory TO ${WORKER}`,
+      `${SPEC} GRANT SELECT (org_id) ON sessions.session_directory TO ${WORKER}`,
       "column privileges",
     ],
     [
       "function privilege",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO ${WORKER}`,
+      `${SPEC} GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO ${WORKER}`,
       "function privileges",
     ],
     [
       "schema privilege",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT CREATE ON SCHEMA sessions TO ${WORKER}`,
+      `${SPEC} GRANT CREATE ON SCHEMA sessions TO ${WORKER}`,
       "schema privileges",
     ],
     [
       "database privilege",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT;
+      `${SPEC}
       DO $g$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO ${WORKER}', current_database()); END $g$`,
       "database privileges",
     ],
     [
       "default privileges",
-      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT;
+      `${SPEC}
       ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO ${WORKER}`,
       "default privileges",
     ],
   ];
   for (const [name, setup, problem] of UNSAFE) {
-    test(`fails closed, applying nothing, when the pre-existing role has: ${name}`, async () => {
+    test(`fails closed with 55000, before any DDL, when the pre-existing role has: ${name}`, async () => {
       const db = await beforeG6();
       await db.exec(setup);
-      const error = (await db.exec(UP).then(
-        () => null,
-        (caught: unknown) => caught,
-      )) as { code?: string; message?: string } | null;
-      expect(error?.code).toBe("42710");
+      const error = await failure(db.exec(UP));
+      expect(error?.code).toBe("55000");
       expect(error?.message).toContain(
-        "session_directory_search_worker already exists and is unsafe to reuse",
+        "role session_directory_search_worker does not match the bootstrap spec",
       );
       expect(error?.message).toContain(problem);
-      expect(await applied(db)).toBe(false);
-      expect(
-        (
-          await db.query(
-            "SELECT 1 FROM pg_proc WHERE proname = 'search_session_directory'",
-          )
-        ).rows,
-      ).toEqual([]);
+      await nothingApplied(db);
     });
   }
 });
@@ -1995,7 +2148,7 @@ describe("short_summary end to end through the pipeline", () => {
 });
 
 describe("short_summary rollback", () => {
-  test("down removes every summary column, copy, the RPC and the role, and up applies again", async () => {
+  test("down removes every summary column, copy and the RPC, keeps the bootstrapped role at its spec, and up applies again", async () => {
     const db = await database();
     await insertRow(db);
     await summarize(db, KEY, "pelican rollback check");
@@ -2011,11 +2164,21 @@ describe("short_summary rollback", () => {
       `SELECT 1 FROM pg_class WHERE relname = 'session_directory_tenant_search_trgm_idx'
        UNION ALL SELECT 1 FROM pg_proc WHERE proname IN
          ('session_directory_search_text', 'session_directory_tombstone_clears_summary', 'search_session_directory')
-       UNION ALL SELECT 1 FROM pg_trigger WHERE tgname = 'session_directory_tombstone_clears_summary'
-       UNION ALL SELECT 1 FROM pg_roles WHERE rolname = $1`,
-      [WORKER],
+       UNION ALL SELECT 1 FROM pg_trigger WHERE tgname = 'session_directory_tombstone_clears_summary'`,
     );
     expect(objects.rows).toEqual([]);
+    // The migration never created the role, so its down does not drop it; it only
+    // revokes what the up granted, leaving the role exactly as the bootstrap made it.
+    expect(
+      (
+        await db.query<Row>(
+          `SELECT has_schema_privilege($1, 'sessions', 'USAGE') AS usage,
+                  (SELECT setconfig FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole
+                    WHERE r.rolname = $1) AS setconfig`,
+          [WORKER],
+        )
+      ).rows,
+    ).toEqual([{ usage: false, setconfig: ["statement_timeout=2s"] }]);
     expect(
       (
         await db.query(

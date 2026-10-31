@@ -1,6 +1,6 @@
 /**
- * HoopDb migrations, in order: the Supabase role shim (plain Postgres only),
- * the vendored relayhistory-cloud `sessions` migrations exactly as pinned, then
+ * HoopDb migrations, in order: the Supabase role shim and the search Worker role
+ * bootstrap (plain Postgres only; the migrator is that database's superuser), the vendored relayhistory-cloud `sessions` migrations exactly as pinned, then
  * the 96bulls migrations. Each file is recorded with its sha256 in a ledger and
  * never re-applied; a changed applied file fails the run.
  *
@@ -19,6 +19,10 @@ const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 // The relayhistory-cloud sessions migrations, moved into this repo by #1/#6 (provenance: supabase/README.md).
 const UPSTREAM_MIGRATIONS = join(ROOT, "supabase/migrations");
 const SHIM = join(ROOT, "supabase/tests/supabase_shim.sql");
+// Privileged and idempotent. On Supabase and CNPG a deploy step runs it as a superuser
+// before migrate (runbooks/session-directory-search-worker-bootstrap.md); here it then
+// only verifies the role, and fails closed if it is absent or differs.
+const WORKER_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_directory_search_worker.sql");
 const OURS = join(ROOT, "src/hoopdb/migrations");
 
 export const MIGRATION_LEDGER = "sessions.__96bulls_migrations";
@@ -33,6 +37,9 @@ export async function plan(): Promise<Step[]> {
   const ours = (await readdir(OURS)).filter((f) => f.endsWith(".sql")).sort();
   return [
     ...(flag("HOOPDB_SUPABASE_SHIM", true) ? [{ name: "shim:supabase_roles", path: SHIM }] : []),
+    ...(flag("HOOPDB_ROLE_BOOTSTRAP", flag("HOOPDB_SUPABASE_SHIM", true))
+      ? [{ name: "bootstrap:session_directory_search_worker", path: WORKER_BOOTSTRAP }]
+      : []),
     ...upstream.map((f) => ({ name: `upstream:${f}`, path: join(UPSTREAM_MIGRATIONS, f) })),
     ...ours.map((f) => ({ name: `96bulls:${f}`, path: join(OURS, f) })),
   ];

@@ -70,6 +70,12 @@ async function evidence(adminUrl: string) {
     await c.query(
       readFileSync(join(root, "supabase/tests/supabase_shim.sql"), "utf8"),
     );
+    await c.query(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      ),
+    );
     for (const f of readdirSync(join(root, "supabase/migrations")).sort()) {
       await c.query(readFileSync(join(root, "supabase/migrations", f), "utf8"));
     }

@@ -67,6 +67,11 @@ export async function waitForHoopDb(db: HoopDb, timeoutMs = 120_000): Promise<vo
   }
 }
 
+/** Ledger steps that provision roles on plain Postgres only (`shim:`, `bootstrap:`), never schema. */
+export function isPrerequisiteStep(name: string): boolean {
+  return name.startsWith("shim:") || name.startsWith("bootstrap:");
+}
+
 /**
  * Blocks until the schema this build needs is present: the vendored sessions
  * migrations and every 96bulls migration recorded in `sessions.__96bulls_migrations`.
@@ -80,9 +85,10 @@ export async function waitForSchema(db: HoopDb, expected: string[], timeoutMs = 
         "SELECT name FROM sessions.__96bulls_migrations",
       );
       const have = new Set(rows.map((r) => r.name));
-      // The Supabase role shim is an optional prerequisite for plain Postgres, not part of the
-      // schema: Supabase (and CNPG) already have the roles, so it is never required here.
-      if (expected.filter((n) => !n.startsWith("shim:")).every((n) => have.has(n))) return;
+      // The Supabase role shim and the role bootstrap are optional prerequisites for plain
+      // Postgres, not part of the schema: elsewhere the roles are provisioned outside the
+      // migrator, so they are never required here.
+      if (expected.filter((n) => !isPrerequisiteStep(n)).every((n) => have.has(n))) return;
     } catch {
       // table not there yet
     }

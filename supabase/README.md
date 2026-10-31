@@ -42,5 +42,9 @@ implement bounded short_summary work in its controlling session. Draft only. Its
 path is `../rollbacks/20261030020000_session_directory_short_summary.down.sql`, kept
 out of this directory because the tests apply every file here in name order. The
 migration needs the `btree_gin` extension (available on Supabase) for its
-tenant-scoped trigram index, and creates the NOLOGIN role
-`session_directory_search_worker`; PGlite tests load `btree_gin` alongside `pg_trgm`.
+tenant-scoped trigram index. It does not create the NOLOGIN role
+`session_directory_search_worker`: the privileged, idempotent
+`../bootstrap/session_directory_search_worker.sql` provisions it first, and the
+migration verifies it exactly or fails closed before any DDL (runbook:
+`runbooks/session-directory-search-worker-bootstrap.md`). The tests run the shim, then
+the bootstrap, then every migration; PGlite tests load `btree_gin` alongside `pg_trgm`.
