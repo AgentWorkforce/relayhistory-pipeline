@@ -89,7 +89,7 @@ async function gate3() {
     // Index files are compressed; decompress each, and read the raw bytes too.
     const script = `cd '${tableDir}' && find . -type f | while read f; do
       if grep -qa '${secret}' "$f"; then echo "raw $f"; fi
-      case "$f" in *skp_idx*) if ${compressor} -d < "$f" 2>/dev/null | grep -qa '${secret}'; then echo "decompressed $f"; fi;; esac
+      case "$f" in *.bin|*skp_idx*) if ${compressor} -d < "$f" 2>/dev/null | grep -qa '${secret}'; then echo "decompressed $f"; fi;; esac
     done`;
     const r = beside(script);
     return r.ok ? r.stdout.split("\n").filter(Boolean) : null;
@@ -125,7 +125,7 @@ async function gate3() {
   const after = ["afterLightweightDelete", "afterApplyDeletedMask", "afterOptimizeFinal"];
   const reads = control && after.every((ph) => Object.values(p[ph]!.rareTerm).every((n) => n === 0)
     && Object.values(p[ph]!.commonTerm).every((n) => n === 49_999));
-  const scanControl = (p.beforeDelete!.filesHoldingTerm ?? []).some((f) => f.includes("skp_idx"));
+  const scanControl = (p.beforeDelete!.filesHoldingTerm ?? []).some((f) => f.startsWith("decompressed") && f.includes("skp_idx"));
   const active = String((phases.afterOptimizeFinal as { activeParts: string }).activeParts).replace(/[\[\]']/g, "");
   const inActivePart = (p.afterOptimizeFinal!.filesHoldingTerm ?? []).filter((f) => f.includes(`/${active}/`));
   return {
