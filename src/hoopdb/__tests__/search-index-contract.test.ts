@@ -4,6 +4,7 @@ import {
   REQUIRED_SEARCH_INDEXES,
   SESSION_DIRECTORY_SEARCH_BOUNDARY,
   agentPrefixPattern,
+  agentPrefixRange,
   auditSearchIndexes,
   isUsefulAgentPrefix,
   normalizeAgentName,
@@ -89,5 +90,19 @@ describe("agent-name lookup contract", () => {
   test("escapes LIKE metacharacters without changing prefix semantics", () => {
     expect(agentPrefixPattern("Helm_100%")).toBe("helm\\_100\\%%");
     expect(() => agentPrefixPattern("ab")).toThrow(RangeError);
+  });
+
+  test("builds finite text-pattern bounds for leakproof RLS prefix planning", () => {
+    expect(agentPrefixRange("Helm_100%")).toEqual({
+      lower: "helm_100%",
+      upper: "helm_100&",
+      pattern: "helm\\_100\\%%",
+    });
+    expect(agentPrefixRange(`ab${String.fromCodePoint(0x10ffff)}`)).toEqual({
+      lower: `ab${String.fromCodePoint(0x10ffff)}`,
+      upper: "ac",
+      pattern: `ab${String.fromCodePoint(0x10ffff)}%`,
+    });
+    expect(() => agentPrefixRange(String.fromCodePoint(0x10ffff).repeat(3))).toThrow(RangeError);
   });
 });
