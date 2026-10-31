@@ -17,10 +17,16 @@ describe("self-hosted RelayAuth values", () => {
     expect(v.jwksIngress.enabled).toBe(false);
   });
 
-  it("admits only the client namespace and stores SQLite on the encrypted gp3 class", () => {
+  it("admits plain HTTP only from the TLS proxy and AlleyOop, and stores SQLite on the encrypted gp3 class", () => {
     expect(v.networkPolicy).toEqual({
       enabled: true,
-      ingressFrom: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "96bulls" } } }],
+      ingressFrom: [
+        { podSelector: { matchLabels: { "app.kubernetes.io/name": "relayauth-tls", "app.kubernetes.io/part-of": "relayauth" } } },
+        {
+          namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "96bulls" } },
+          podSelector: { matchLabels: { "app.kubernetes.io/instance": "96bulls", "app.kubernetes.io/name": "alleyoop" } },
+        },
+      ],
     });
     expect(v.persistence.storageClass).toBe("96bulls-gp3");
   });

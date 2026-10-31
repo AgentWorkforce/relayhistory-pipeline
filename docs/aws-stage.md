@@ -13,7 +13,8 @@ What the stage will need (each item needs an explicit OK): a target account
 (per-agent sandbox under the Sandbox OU via Pippin Tools, or a named dev
 account); which credential to use (SSO profile or a `96bulls-deployer` role
 with GitHub OIDC trust scoped to this repo); an Alchemy state bucket; HoopDb
-(RDS Postgres 17 + pgvector, or Supabase); RelayAuth JWKS + issuer; image push
+(Supabase for hosted production; in-cluster CloudNativePG for the isolated
+proof stage); RelayAuth JWKS + issuer; image push
 rights (GHCR/ECR, by digest); compute (ECS Fargate first, EKS via the
 `96bulls-worker` chart later); secrets names in 1Password; a budget cap.
 
@@ -31,16 +32,26 @@ Hosted production is Supabase plus S3 only. Everything on this AWS stage
 beyond S3 exists to prove the self-hosted deployment
 (`docs/decisions/0001-production-data-plane.md`, 2026-10-30).
 
+- **Production HoopDb:** Supabase, with AWS S3 as the only AWS service in the
+  hosted production data plane (Khaliq, 2026-10-30;
+  `docs/decisions/0001-production-data-plane.md`). Production is not Aurora,
+  RDS or an in-cluster database; the stack refuses `eks.hoopdb.backend: "cnpg"`
+  on any stage whose name contains `prod`.
+- **Proof-stage HoopDb:** in-cluster CloudNativePG (Postgres 17) on the
+  encrypted gp3 class, for the isolated AWS proof stage only
+  (`eks.hoopdb.backend: "cnpg"`; see "Proof-stage hardening" below). It is
+  disposable proof data and never holds production data.
 - **Compute:** EKS (Auto Mode) running the `96bulls` umbrella chart from
-  AgentWorkforce/helm-charts, pinned to the published services image digest in
-  `versions.lock.json` (`stacks/aws/eks.ts`).
+  AgentWorkforce/helm-charts, pinned to the published services image digest
+  (`eks.imageDigest` + `eks.imageSourceRevision`, `stacks/aws/eks.ts`).
 - **Dev HoopDb:** a Supabase project in the org the 96Bulls team owns, declared
   with the `Supabase.Project` resource; its password comes from an `op://`
   reference at create time only.
 - **Sandbox HoopDb:** Postgres (pgvector) as a container inside the sandbox's own
   compute; RDS only when a test needs managed Postgres.
-- **Services image:** published `ghcr.io/agentworkforce/96bulls-services@sha256:46cf380e...`
-  from main 4703c8e.
+- **Services image:** each account's ECR digest (`eks.imageDigest`) with the
+  full commit it was built from (`eks.imageSourceRevision`). The stage refuses
+  tag-only references and an image without a source commit.
 
 Still gated: nothing here runs until `.96bulls/<stage>/aws-inputs.json` carries
 Khaliq's clearance and the account id is confirmed on the command line.
@@ -54,8 +65,9 @@ push, last 50 images kept); EKS nodes pull from it with their node role. The
 `AWS_DEPLOYER_ROLE_ARN`, `AWS_REGION`), manual and Khaliq-only. The EKS stage refuses
 to declare anything until `aws-inputs.json` carries `eks.imageDigest`, the digest
 published to that account's repository (each account builds its own). Only
-jobs in the `image-publish` and `deploy-<stage>` GitHub environments can assume
-the deployer role. The GHCR
+jobs in the `image-publish` GitHub environment can assume the deployer role,
+and it can only push to that ECR repository (no Locker or KMS access).
+Sandbox stages create neither the OIDC provider nor the role. The GHCR
 copy stays private for kind and self-host tests.
 
 Order for the first environment: apply the baseline (creates ECR and the
@@ -75,7 +87,9 @@ Turn it on with `eks.relayauth` in `aws-inputs.json`:
 and remove `eks.relayauthIssuer` (the stack refuses both). AlleyOop's issuer and
 JWKS URL then become the in-cluster Service, `http://relayauth.relayauth.svc:8787`,
 whatever `relayauthJwksUrl` says. Neither the token API nor JWKS is public:
-only pods in the `96bulls` namespace may call it (NetworkPolicy, where enforced).
+on plain HTTP only AlleyOop's pods and the TLS proxy may call it, and secret-
+bearing calls use the TLS endpoint (see "Transport" below; NetworkPolicy is
+enforced, see "NetworkPolicies").
 
 **Keys (once per environment, before the deploy).** They are generated on the
 Mac straight into 1Password and reach the cluster through a pipe, never a file
@@ -120,13 +134,38 @@ curl -s http://127.0.0.1:18787/v1/tokens/relayhistory-assertion \
 The token's `aud` is exactly `historyOrigin`, which must equal the stage's
 `relayhistoryOrigin` (AlleyOop refuses anything else).
 
-**Transport.** The Service is plain HTTP. That is safe for what crosses it today:
-AlleyOop fetches only the public JWKS, and minting goes through
-`kubectl port-forward`, which tunnels inside the API server's TLS. Pod-to-pod
-traffic on EKS is not encrypted by default, so **nothing may send the bootstrap
-key over the cluster network until RelayAuth has TLS** (a mesh with mTLS, or TLS
-terminated in front of RelayAuth). That applies to an in-cluster courier or
-broker, and to a public token endpoint, which is a separate decision.
+**Transport.** The chart's Service is plain HTTP and now admits only
+AlleyOop (which fetches the public JWKS) and the TLS proxy. Anything that
+carries a key or a user token, such as the relayauth #116 tenant search-token
+exchange (API key plus user token) or an in-cluster minting client, must call
+`https://relayauth-tls.relayauth.svc:8443` instead:
+
+- **TLS 1.3 only**, terminated by a digest-pinned `nginx-unprivileged` proxy
+  that is required to run on RelayAuth's node, so the plaintext hop never
+  crosses the VPC (`stacks/aws/relayauth-tls.ts`). Chart 0.1.0 cannot serve TLS
+  or take a sidecar; the proxy goes once a chart can.
+- **Private CA** from cert-manager v1.21.3 (images by digest, CRDs kept,
+  namespace-scoped `Issuer`s only, no ACME, no `ClusterIssuer`). The Service
+  certificate is ECDSA P-256 for `relayauth-tls.relayauth.svc`, 90 days,
+  renewed 30 days early; the proxy loads it per handshake, so rotation needs no
+  restart. The CA key stays in the `relayauth-ca` Secret; the proxy mounts only
+  the leaf key and chain.
+- **Who may connect:** pods labelled `relayauth.agentrelay.com/client: tls` in
+  the `96bulls` or `relayhistory` namespaces (NetworkPolicy both ways).
+- **Trusting the CA.** A caller trusts the public CA certificate only, never the
+  `relayauth-ca` Secret. Publish it to the caller's namespace as a ConfigMap
+  and point the runtime at it (`NODE_EXTRA_CA_CERTS`, or `SSL_CERT_FILE`):
+
+  ```sh
+  kubectl -n relayauth get secret relayauth-tls -o jsonpath='{.data.ca\.crt}' | base64 -d \
+    | kubectl -n 96bulls create configmap relayauth-ca --from-file=ca.crt=/dev/stdin --dry-run=client -o yaml | kubectl apply -f -
+  ```
+
+  Re-run it when the CA renews (yearly). Automating this (trust-manager) is a
+  follow-up.
+
+Minting through `kubectl port-forward` (above) stays as it is: it tunnels inside
+the API server's TLS.
 
 ## Summary encryption key (Bob Costas)
 
@@ -204,3 +243,199 @@ retrieved trace data and service logs for the planted secrets, content marker
 and prompt text, matching the local smoke test. Metrics/SLO alarms and a durable
 hosted stdout log backend remain separate follow-up work; do not claim those
 are present.
+
+## Proof-stage hardening (2026-10-30)
+
+Pure contracts: `stacks/aws/hardening.ts` and `stacks/aws/proof-addons.ts`,
+tested in `stacks/aws/__tests__/`. Every check below runs before the stage
+declares a resource.
+
+### EKS API access
+
+The private endpoint is always on. The public endpoint is **off** unless
+`eks.apiAccess.publicAccessCidrs` lists operator addresses. There is no
+`0.0.0.0/0` default; it, anything broader than `/16`, and malformed entries are
+refused. Alchemy applies the charts and manifests through the API server, so
+the apply itself must run from an address that can reach it:
+
+- **Allowlist the operator's IP** (simplest): add `"<your public IP>/32"`
+  (`curl -s https://checkip.amazonaws.com`) to `publicAccessCidrs`, apply, then
+  `aws eks update-kubeconfig --name 96bulls-<stage> --region <region>`. Remove
+  the entry when the window closes and apply again.
+- **Private only (no public endpoint):** run kubectl and the apply from inside
+  the VPC, for example an SSM-managed instance in a private subnet with no
+  inbound rules (`aws ssm start-session --target <instance id>`). Its security
+  group must be allowed to reach the cluster security group on 443. This stage
+  does not create that instance; it is a separate, reviewed addition.
+
+Because the default is private only, a stage whose live cluster already
+allows an operator CIDR must list it in `publicAccessCidrs`; otherwise the next
+apply turns the public endpoint off and the apply loses its own route to the
+API server.
+
+Endpoint changes are `UpdateClusterConfig` calls, applied in place (no cluster
+replacement, no workload restart); the control plane stays available while
+EKS updates.
+
+### Control-plane logs
+
+All five types (`api`, `audit`, `authenticator`, `controllerManager`,
+`scheduler`) go to `/aws/eks/96bulls-<stage>/cluster`. The stage declares that
+log group first with 90-day retention, so EKS never creates it with no expiry.
+It uses CloudWatch's default encryption; a customer-managed key would need a
+key-policy grant for the Logs service, which is a separate decision.
+
+### Pod roles (EKS Pod Identity), one per service account
+
+Derived from the code that uses the Locker (key layout `v1/ws=…/s=…/`); no
+role has `s3:DeleteObject` because the object store has no delete.
+
+| Service account | S3 | KMS (via S3 only) |
+| --- | --- | --- |
+| `96bulls-worker` (indexer, referee, Bob Costas, migrate) | ListBucket; GetObject `v1/*`; PutObject `v1/*/summary/*` | Decrypt, GenerateDataKey |
+| `96bulls-alleyoop` | ListBucket; GetObject `v1/*`; PutObject `v1/*/raw/*`, `v1/*/manifest.json` | Decrypt, GenerateDataKey |
+| `96bulls-search-worker` | explicit Deny `s3:*` on the Locker | explicit Deny `kms:*` on its key |
+| `otel-collector` | PutObject, AbortMultipartUpload `telemetry/traces/*` only | unchanged |
+
+`s3:ListBucket` is unconditioned on purpose: S3 returns 404 for a missing key
+only to callers that hold it (403 otherwise), and both conditional writers HEAD
+first. Trust is bound to the account and the cluster ARN. Worker 0.4.0 runs all
+worker components under one service account, so that is the finest split Pod
+Identity can express until the chart gives each component its own.
+
+### NetworkPolicies
+
+Default deny (ingress and egress) in `96bulls`, `relayauth` (when self-hosted)
+and `relaycast` (when enabled),
+with explicit allows: DNS by port (Auto Mode serves DNS from the node), the Pod
+Identity agent, HTTPS egress (S3 through the gateway endpoint, the EKS API,
+JWKS) to anywhere except instance metadata, OTLP inside the namespace, the ALB
+to AlleyOop's port and health-only ports from the VPC CIDR (pod IPs are VPC
+addresses, so no data port is opened by CIDR; kubelet probes from a pod's own
+node are admitted by the VPC CNI agent), AlleyOop to RelayAuth (JWKS), labelled
+callers to the RelayAuth TLS endpoint, apps to HoopDb
+(CNPG: in-namespace only, plus the operator; external: Postgres/pooler ports),
+and `96bulls` to Relaycast. The stage also writes `kube-system/amazon-vpc-cni`
+`enable-network-policy-controller: "true"`; without it Auto Mode accepts the
+policies and enforces nothing.
+
+### Ingest exposure (public contract)
+
+Customers and their bots reach the ingest from the internet, so the ALB is
+**internet-facing** by default (`eks.ingress.scheme`, `"internal"` keeps it in
+the VPC). The public contract, enforced by the stack and by tests:
+
+- **TLS only.** One HTTPS :443 listener, `ELBSecurityPolicy-TLS13-1-2-2021-06`,
+  ACM certificate. No :80 listener and no redirect.
+- **Authentication on every route except health.** Only `/health`, `/healthz`,
+  `/readyz` and the public `/.well-known/jwks.json` answer without credentials
+  (`src/alleyoop/routes.ts` `PUBLIC_INGEST_PATHS`). Every `/v1` route requires a
+  RelayAuth JWT; the operator routes under `/v1/internal/pipeline/*` require
+  `PIPELINE_OPS_SECRET` (503 where it is unset).
+  `src/alleyoop/__tests__/routes-auth.test.ts` enumerates every mounted route
+  and requires 401 without a token and with a non-JWT bearer.
+- **WAFv2 web ACL** on the ALB (`alb.ingress.kubernetes.io/wafv2-acl-arn`):
+  `AWSManagedRulesAmazonIpReputationList`, `AWSManagedRulesKnownBadInputsRuleSet`,
+  `AWSManagedRulesCommonRuleSet`, a per-IP rate limit (default 2000 requests per
+  5 minutes, `eks.ingress.rateLimitPer5Min`), and a block on `/v1/internal/` so
+  operator routes are reachable only through `kubectl port-forward`. Managed
+  rules that inspect request **bodies** count instead of block: bodies are
+  authenticated session transcripts and chunks, which legitimately contain code,
+  paths, URLs and more than 8 KB. URI, query, header and reputation rules block.
+  Watch the `Count` metrics after the first apply before tightening further.
+
+The ALB also writes access logs to its own bucket
+(`96bulls-<stage>-alb-logs-<account>`, SSE-S3 because ALB log delivery does not
+support KMS keys, TLS only, 90 days) and drops header fields that are not valid
+HTTP names (`routing.http.drop_invalid_header_fields.enabled`).
+
+The internet-facing class keeps its name `alb-public`, so applying this to a
+live stage changes the Ingress annotations (WAF association) and does not
+replace the ALB.
+
+### Proof HoopDb (CloudNativePG)
+
+With `eks.hoopdb.backend: "cnpg"` the stage installs the CloudNativePG operator
+(chart 0.29.1, operator 1.30.1 by digest) in `cnpg-system`, then enables the
+umbrella chart's `hoopdb` Cluster: one Postgres 17.11 instance
+(`postgresql:17-standard-trixie` by digest, `vector` + `pg_trgm`), 20 GiB on
+`96bulls-gp3`. The apps then read `hoopdb-app/uri`, which CNPG generates.
+Backups to S3 are **not** enabled: the pinned `standard` image ships no
+barman-cloud, so they need the Barman Cloud plugin and cert-manager. The proof
+database is disposable; recreating it re-runs the migrations on an empty
+database.
+
+### Relaycast
+
+`eks.relaycast` installs the released `relaycast` chart: one replica,
+`ClusterIP`, ingress off, SQLite on a 10 GiB `96bulls-gp3` volume, only the
+`96bulls` namespace admitted. `chartVersion` and `imageDigest` are inputs so a
+later chart (0.2.0) needs no code change. Chart 0.1.0 (Relaycast 8.0.0)
+accepts no secret material; if a later chart does, it must come from an
+existing Secret by name.
+
+### CloudTrail and buckets
+
+The trail bucket is versioned and encrypted with the trail's own KMS key
+(rotation on). Its key policy is least privilege: the account root may
+administer the key (including `PutKeyPolicy`, so there is no lockout) but not
+use it; CloudTrail may generate data keys for this trail only; account
+principals may decrypt trail log files. The Locker key keeps the default
+account policy for now (its users are IAM roles conditioned on S3).
+
+Every bucket (Locker, trail, ALB logs) denies requests without TLS
+(`aws:SecureTransport`). The Locker expires noncurrent versions after 90 days
+(superseded manifests; nothing reads old versions) and incomplete multipart
+uploads after 7.
+
+### GitHub image publisher
+
+The `96bulls-<stage>-deployer` role is ECR push only, trusted for this
+repository's jobs in the `image-publish` environment. The workflow's
+`github.actor` check is not a security boundary (any branch can edit it), so
+the `image-publish` environment must carry a required reviewer and a
+deployment branch policy of `main`; that is a GitHub setting, not IaC, and is
+currently **not** set.
+
+### Collector pod
+
+The OpenTelemetry collector runs by digest, with no Kubernetes API token
+(`automountServiceAccountToken: false`; EKS Pod Identity mounts its own
+audience-bound token), non-root, read-only root filesystem, all capabilities
+dropped, `RuntimeDefault` seccomp.
+
+### Sandbox permissions boundary
+
+`stacks/aws/policies/sandbox-boundary.draft.json` no longer allows
+`iam:UpdateAssumeRolePolicy` or creating identity providers, and denies both
+explicitly: a sandbox role's trust is fixed when it is created.
+
+### Session directory search path (slot for #73)
+
+The session-directory PostgREST profile (96BullSessions #73, stacked on #72 and
+#48) is not deployed by this stage yet. `eks.sessionDirectory.enabled` applies
+its fence ahead of time: search callers (label
+`96bulls.agentrelay.com/search-client: "true"`) may reach PostgREST
+(`app.kubernetes.io/name: session-directory-postgrest`, port 3000), and
+PostgREST may reach the CNPG HoopDb; nothing else. The stage refuses it unless
+`eks.hoopdb.backend` is `cnpg` and RelayAuth is self-hosted with in-cluster TLS
+(the search-token exchange carries an API key and a user token). Wiring the
+PostgREST Deployment is a follow-up once #48, #72 and #73 land.
+
+### aws-inputs.json additions (proof stage)
+
+```json
+"eks": {
+  "imageDigest": "sha256:<digest publish-image-ecr pushed to this account>",
+  "imageSourceRevision": "<40-hex commit it was built from>",
+  "apiAccess": { "publicAccessCidrs": ["<operator IP>/32"] },
+  "hoopdb": { "backend": "cnpg" },
+  "sessionDirectory": { "enabled": false },
+  "relaycast": {
+    "chartVersion": "0.1.0",
+    "imageDigest": "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
+    "baseUrl": "https://relaycast.sessions-dev.agentrelay.com"
+  },
+  "ingress": { "...": "unchanged", "scheme": "internet-facing", "rateLimitPer5Min": 2000 }
+}
+```

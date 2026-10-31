@@ -13,7 +13,7 @@
     "otel-collector": {
       "ref": "otel/opentelemetry-collector-contrib:0.163.2",
       "digest": "sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849",
-      "note": "matches the upstream opentelemetry-collector chart 0.178.0 used by the EKS stage"
+      "note": "matches the upstream opentelemetry-collector chart 0.178.0 used by the EKS stage; the AWS stage pulls it by this digest (stacks/aws/hardening.ts PINNED_IMAGES), digest re-resolved from Docker Hub for tag 0.163.2 on 2026-10-30"
     },
     "init": {
       "ref": "alpine:3.20",
@@ -30,6 +30,21 @@
       "sourceRevision": "09293c8d649f912aa2f4414e31a3ad7fca6eceee",
       "gcpProofEligible": true,
       "note": "published 2026-10-30 from main 09293c8; immutable Artifact Registry tag sha-09293c8d649f912aa2f4414e31a3ad7fca6eceee; OCI index includes linux/amd64+arm64; image labels identify the exact source repository and revision; attestation manifests include SPDX SBOM and SLSA provenance."
+    },
+    "cnpg-operator": {
+      "ref": "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1",
+      "digest": "sha256:923c267ec29636db3bee20f993d0ec4973fa22998e1adad37da79e4d32b5bc07",
+      "note": "CloudNativePG operator for the AWS proof stage's in-cluster HoopDb (helm-charts deps/pins.txt: cloudnative-pg chart 0.29.1); multi-arch index digest resolved from ghcr.io on 2026-10-30"
+    },
+    "cnpg-postgres": {
+      "ref": "ghcr.io/cloudnative-pg/postgresql:17-standard-trixie",
+      "digest": "sha256:ed6923f9ba2399cf9070379a353c710c29ced8a294be73986a2c3dae7e599ce3",
+      "note": "PG 17.11 with vector and pg_trgm; same digest as helm-charts deps/cnpg-cluster-values.yaml and the 96bulls 0.3.0 umbrella default"
+    },
+    "relaycast": {
+      "ref": "ghcr.io/agentworkforce/relaycast-self-host",
+      "digest": "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
+      "note": "Relaycast 8.0.0, pinned by helm-charts relaycast 0.1.0 values.yaml; the AWS stage takes chartVersion + imageDigest as inputs so 0.2.0 slots in"
     }
   },
   "vendored": {
@@ -49,7 +64,28 @@
     "bun": ">=1.4.0",
     "rust": ">=1.89 (object-store crate), 1.98.1 used"
   },
-  "charts": {},
+  "charts": {
+    "96bulls": {
+      "repo": "https://AgentWorkforce.github.io/helm-charts",
+      "version": "0.3.0",
+      "note": "version is the per-stage eks.chartVersion input; 0.3.0+ required"
+    },
+    "cloudnative-pg": {
+      "repo": "https://cloudnative-pg.github.io/charts",
+      "version": "0.29.1",
+      "note": "stacks/aws/proof-addons.ts CNPG_OPERATOR_CHART"
+    },
+    "relaycast": {
+      "repo": "https://AgentWorkforce.github.io/helm-charts",
+      "version": "0.1.0",
+      "note": "per-stage eks.relaycast.chartVersion input"
+    },
+    "cert-manager": {
+      "repo": "https://charts.jetstack.io",
+      "version": "v1.21.3",
+      "note": "stacks/aws/relayauth-tls.ts; images pinned by digest there"
+    }
+  },
   "packages": {
     "@96bulls/pipeline": {
       "path": "packages/pipeline",
