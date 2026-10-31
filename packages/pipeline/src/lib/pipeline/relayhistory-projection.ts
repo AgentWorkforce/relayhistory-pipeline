@@ -212,7 +212,12 @@ function exact(value: bigint): number | bigint {
 
 /** sessions.delivery_activity_ms */
 function activityMs(payload: Json): number | null {
-  for (const key of ["updated_ms", "ts_ms", "timestamp_ms", "last_activity_ms"]) {
+  for (const key of [
+    "updated_ms",
+    "ts_ms",
+    "timestamp_ms",
+    "last_activity_ms",
+  ]) {
     const value = payload[key];
     if (typeof value === "bigint") return null;
     if (typeof value === "number")
@@ -223,10 +228,14 @@ function activityMs(payload: Json): number | null {
 
 /** sessions.delivery_project_id */
 function projectId(payload: Json): string | null {
-  const key = nullIfEmpty(text(payload, "project_key")?.replace(/^ +| +$/g, "") ?? null);
+  const key = nullIfEmpty(
+    text(payload, "project_key")?.replace(/^ +| +$/g, "") ?? null,
+  );
   if (
     key !== null &&
-    !["path", "path_fallback"].includes(text(payload, "project_key_method") ?? "") &&
+    !["path", "path_fallback"].includes(
+      text(payload, "project_key_method") ?? "",
+    ) &&
     /^[^/~.\\:\s][^\\:\s]*\/[^\\:\s]+$/.test(key)
   )
     return /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\/[^/]+\/./s.test(key)
@@ -242,13 +251,15 @@ function projectId(payload: Json): string | null {
 /** sessions.delivery_usage_counter: throws where it raises. */
 function usageCounter(value: unknown): bigint | null {
   if (value === undefined || value === null) return null;
-  if (!(value instanceof JsonNumber)) throw new Error("USAGE_NON_INTEGER_COUNTER");
+  if (!(value instanceof JsonNumber))
+    throw new Error("USAGE_NON_INTEGER_COUNTER");
   const { negative, digits, power } = decimalParts(value.text);
   if (negative) throw new Error("USAGE_NON_INTEGER_COUNTER");
   let count: bigint;
   if (power >= 0 || digits === 0n) count = scaled(digits, Math.max(power, 0));
   else {
-    const divisor = 10n ** BigInt(Math.min(-power, digits.toString().length + 1));
+    const divisor =
+      10n ** BigInt(Math.min(-power, digits.toString().length + 1));
     if (digits % divisor !== 0n) throw new Error("USAGE_NON_INTEGER_COUNTER");
     count = digits / 10n ** BigInt(-power);
   }
@@ -308,7 +319,9 @@ function normalizedUsage(source: string, blob: string | null): Usage | null {
   try {
     output = usageCounter(token.output_tokens);
     reasoning = usageCounter(
-      source === "muse" ? token.reasoning_tokens : token.reasoning_output_tokens,
+      source === "muse"
+        ? token.reasoning_tokens
+        : token.reasoning_output_tokens,
     );
     const total = usageCounter(token.total_tokens);
     reported = output !== null || reasoning !== null || total !== null;
@@ -319,7 +332,8 @@ function normalizedUsage(source: string, blob: string | null): Usage | null {
         cacheWrite = usageCounter(token.cache_write_input_tokens);
       } else {
         cacheRead =
-          usageCounter(token.cache_read_tokens) ?? usageCounter(token.cached_tokens);
+          usageCounter(token.cache_read_tokens) ??
+          usageCounter(token.cached_tokens);
         cacheWrite = usageCounter(token.cache_write_tokens);
       }
       reported ||= input !== null || cacheRead !== null || cacheWrite !== null;
@@ -344,10 +358,15 @@ function normalizedUsage(source: string, blob: string | null): Usage | null {
       if (!Object.hasOwn(token, "usage")) return null;
       const breakdown = token.usage;
       if (!isObject(breakdown)) return null;
-      const first = (...keys: string[]) => usageCounter(usageFirst(breakdown, keys));
+      const first = (...keys: string[]) =>
+        usageCounter(usageFirst(breakdown, keys));
       input = first("inputTokens", "input_tokens", "promptTokens");
       output = first("outputTokens", "output_tokens", "completionTokens");
-      cacheRead = first("cachedReadTokens", "cacheReadTokens", "cache_read_input_tokens");
+      cacheRead = first(
+        "cachedReadTokens",
+        "cacheReadTokens",
+        "cache_read_input_tokens",
+      );
       cacheWrite = first(
         "cachedWriteTokens",
         "cacheWriteTokens",
@@ -373,12 +392,21 @@ function normalizedUsage(source: string, blob: string | null): Usage | null {
   }
   const cost = usageFirst(token, ["cost_usd", "costUSD", "total_cost_usd"]);
   if (cost !== undefined) {
-    if (!(cost instanceof JsonNumber) || decimalParts(cost.text).negative) return null;
+    if (!(cost instanceof JsonNumber) || decimalParts(cost.text).negative)
+      return null;
     reported = true;
   }
   if (!reported) return null;
-  const costUsdMicros = cost === undefined ? null : scaledRound(cost as JsonNumber, 6);
-  for (const count of [input, output, reasoning, cacheRead, cacheWrite, costUsdMicros])
+  const costUsdMicros =
+    cost === undefined ? null : scaledRound(cost as JsonNumber, 6);
+  for (const count of [
+    input,
+    output,
+    reasoning,
+    cacheRead,
+    cacheWrite,
+    costUsdMicros,
+  ])
     if ((count ?? 0n) > MAX_COUNT) return null;
   return {
     input: input ?? 0n,
@@ -434,7 +462,11 @@ function contentText(kind: string, payload: Json): string | null {
 
 function requestIdentity(kind: string, payload: Json): string | null {
   const recordId = nullIfEmpty(text(payload, "message_id"));
-  if (kind !== "session_event" || text(payload, "role") !== "assistant" || !recordId)
+  if (
+    kind !== "session_event" ||
+    text(payload, "role") !== "assistant" ||
+    !recordId
+  )
     return null;
   const field = (key: string) => nullIfEmpty(text(payload, key));
   const requestId = field("request_id");
@@ -481,8 +513,12 @@ function activityEvent(
   const received = canonicalTimestamp(record.received_at);
   const machine = deliveryMachine(context.workspaceId, record.origin_id);
   const ms = activityMs(p);
-  const tool = kind === "tool_call" ? toolCall(p, nullIfEmpty(text(p, "tool_use_id"))) : null;
-  const filePath = kind === "file_edit" ? nullIfEmpty(text(p, "file_path")) : null;
+  const tool =
+    kind === "tool_call"
+      ? toolCall(p, nullIfEmpty(text(p, "tool_use_id")))
+      : null;
+  const filePath =
+    kind === "file_edit" ? nullIfEmpty(text(p, "file_path")) : null;
   return {
     machine_id: machine,
     source: context.source,
@@ -577,16 +613,21 @@ function settleRequests(events: Json[], source: string) {
         .map((event) => text(payloadOf(event), "token_json"))
         .filter((blob) => blob !== null),
     );
-    if (blobs.size !== 1 || (source === "claude" && key.startsWith("record-id:")))
+    if (
+      blobs.size !== 1 ||
+      (source === "claude" && key.startsWith("record-id:"))
+    )
       continue;
     const usage = normalizedUsage(source, [...blobs][0]!);
     if (!usage) continue;
     const carrier = group.reduce((least, event) =>
-      (event.delivery_record_id as string) < (least.delivery_record_id as string)
+      (event.delivery_record_id as string) <
+      (least.delivery_record_id as string)
         ? event
         : least,
     );
-    const nullable = (value: bigint | null) => (value === null ? null : exact(value));
+    const nullable = (value: bigint | null) =>
+      value === null ? null : exact(value);
     Object.assign(carrier, {
       input_tokens: exact(usage.input),
       output_tokens: exact(usage.output),
@@ -729,7 +770,9 @@ function catalogRows(
             branch: catalogText(p.branch),
             note_ref: catalogText(p.note_ref),
             confidence_basis_points:
-              typeof confidence === "number" && confidence >= 0 && confidence <= 1
+              typeof confidence === "number" &&
+              confidence >= 0 &&
+              confidence <= 1
                 ? Number(scaledRound(confidence, 4))
                 : null,
             files: catalogJson(p.files_json),
@@ -750,7 +793,10 @@ function catalogRows(
  * its identity must be the session the manifest and its provenance name. Only
  * its times are canonicalized.
  */
-function directEvent(record: RelayhistoryStreamRecord, context: ProjectionContext): Json {
+function directEvent(
+  record: RelayhistoryStreamRecord,
+  context: ProjectionContext,
+): Json {
   const {
     org_id: _org,
     workspace_id: _workspace,
@@ -775,7 +821,9 @@ function directEvent(record: RelayhistoryStreamRecord, context: ProjectionContex
     return {
       ...row,
       ts: canonicalTimestamp(String(row.ts)),
-      ingested_at: canonicalTimestamp(String(row.ingested_at ?? record.received_at)),
+      ingested_at: canonicalTimestamp(
+        String(row.ingested_at ?? record.received_at),
+      ),
     };
   } catch {
     throw new PipelineError(
@@ -804,7 +852,8 @@ export function projectRelayhistorySession(
   let unprojected = 0;
   for (const record of records) {
     const p = record.payload!;
-    if (record.kind === CONVERGENCE_EVENT_KIND) direct.push(directEvent(record, context));
+    if (record.kind === CONVERGENCE_EVENT_KIND)
+      direct.push(directEvent(record, context));
     else if (ACTIVITY_KINDS.has(record.kind)) {
       if (!controlRow(record.kind, p) && !sidechainUserRow(record.kind, p))
         events.push(activityEvent(record, context));
@@ -827,7 +876,9 @@ export function projectRelayhistorySession(
   );
   return {
     rows: [
-      ...[...catalog.values()].flatMap((record) => catalogRows(record, context)),
+      ...[...catalog.values()].flatMap((record) =>
+        catalogRows(record, context),
+      ),
       ...ordered.map((row) => ({ table: "convergence_events" as const, row })),
     ],
     unprojected,

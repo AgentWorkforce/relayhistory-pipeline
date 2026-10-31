@@ -289,7 +289,8 @@ export function fileNormalizeHandler(
       workKey: message.workKey,
       orgId: message.ctx.orgId,
     });
-    if ("skipped" in output) return { status: "skipped", reason: output.skipped };
+    if ("skipped" in output)
+      return { status: "skipped", reason: output.skipped };
     if (output.outputKey)
       recorder.log.info("transform output", {
         output_key: output.outputKey,

@@ -30,7 +30,7 @@ Read-only, structure-only samples from Neon production on 2026-10-30
   notified. Scrubbing, chunk keys, manifest validation and indexing are
   therefore exactly the live path's, with no second implementation.
 - **One exported session** is one `(workspace_id, machine_id, harness,
-  session_id)` in the v1 layout:
+session_id)` in the v1 layout:
   `v1/ws=…/m=…/h=…/d=…/s=…/manifest.json` plus
   `raw/{seq:010}-{offset}-{sha8}.ndjson.zst`.
 - **Harness** is the record `source`. **Machine** comes from the record's
@@ -57,7 +57,7 @@ Read-only, structure-only samples from Neon production on 2026-10-30
   `raw.scrub = {ruleset, version}`. Unscrubbed manifests are quarantined by
   every reader, so the export never writes chunks directly.
 - **Marker:** `extensions["client.relayhistory_export"] = {version: 1, source:
-  "neon.delivery_records", exported_at}`. Its presence tells the transform this
+"neon.delivery_records", exported_at}`. Its presence tells the transform this
   is the RelayHistory record shape, not a harness log.
 
 ## Metadata for `session_index` and V1 search
@@ -77,7 +77,7 @@ manifest body.
   them.
 - **Identity (open item O2):** `user_id` must come from an authenticated
   path. The export delivers each manifest through `POST
-  /v1/pipeline/manifests` with an org-scoped migration credential allowed to
+/v1/pipeline/manifests` with an org-scoped migration credential allowed to
   assert the session's `user_id` from Neon. That needs an explicit, audited
   migration grant in the ingest API. Without it, rows land as `unknown`.
 

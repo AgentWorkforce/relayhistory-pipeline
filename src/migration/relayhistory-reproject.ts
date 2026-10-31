@@ -59,7 +59,8 @@ export interface ReprojectResult {
   after: CatalogCounts | null;
 }
 
-const CONTENDER_KINDS = "('session', 'relationship', 'session_marker', 'commit_link')";
+const CONTENDER_KINDS =
+  "('session', 'relationship', 'session_marker', 'commit_link')";
 
 // Every key, tagged with whether a live upsert contends for it. Built from the
 // same key function the projection uses; derived rows map back to the key shape
@@ -113,7 +114,9 @@ export async function catalogCounts(db: Queryable): Promise<CatalogCounts> {
     `SELECT ${CATALOG_TABLES.map((table) => `(SELECT count(*)::int FROM sessions.${table}) AS ${table}`).join(", ")}`,
   );
   const row = rows[0]!;
-  return Object.fromEntries(CATALOG_TABLES.map((table) => [table, Number(row[table])])) as CatalogCounts;
+  return Object.fromEntries(
+    CATALOG_TABLES.map((table) => [table, Number(row[table])]),
+  ) as CatalogCounts;
 }
 
 /**
@@ -132,7 +135,8 @@ export async function reprojectCatalog(
   db: Queryable,
   options: { batch: number; dryRun?: boolean },
 ): Promise<ReprojectResult> {
-  if (!Number.isInteger(options.batch) || options.batch < 1) throw new Error("batch must be a positive integer");
+  if (!Number.isInteger(options.batch) || options.batch < 1)
+    throw new Error("batch must be a positive integer");
   const result: ReprojectResult = {
     keys: 0,
     keysWithoutContender: 0,
@@ -154,18 +158,30 @@ export async function reprojectCatalog(
     if (page.rows.length === 0) break;
     // Workspaces in page order, which is sorted: concurrent runs take them in the
     // same order, and a live delivery only ever holds one.
-    const workspaces = new Map<string, { org: string; workspace: string; keys: unknown[] }>();
+    const workspaces = new Map<
+      string,
+      { org: string; workspace: string; keys: unknown[] }
+    >();
     for (const row of page.rows) {
       const id = JSON.stringify([row.org_id, row.workspace_id]);
-      const group = workspaces.get(id) ?? { org: row.org_id, workspace: row.workspace_id, keys: [] };
-      group.keys.push(typeof row.key === "string" ? JSON.parse(row.key) : row.key);
+      const group = workspaces.get(id) ?? {
+        org: row.org_id,
+        workspace: row.workspace_id,
+        keys: [],
+      };
+      group.keys.push(
+        typeof row.key === "string" ? JSON.parse(row.key) : row.key,
+      );
       workspaces.set(id, group);
     }
     if (!options.dryRun) {
       await db.query("BEGIN");
       try {
         for (const { org, workspace, keys } of workspaces.values()) {
-          await db.query("SELECT sessions.delivery_projection_lock_timed($1, $2)", [org, workspace]);
+          await db.query(
+            "SELECT sessions.delivery_projection_lock_timed($1, $2)",
+            [org, workspace],
+          );
           await db.query(
             `SELECT sessions.project_delivery_catalog_key($1, $2, k.key)
                FROM jsonb_array_elements($3::jsonb) WITH ORDINALITY AS k(key, n) ORDER BY k.n`,
@@ -207,23 +223,31 @@ export async function reprojectCatalog(
 }
 
 function argument(name: string): string | undefined {
-  return process.argv.find((value) => value.startsWith(`--${name}=`))?.slice(name.length + 3);
+  return process.argv
+    .find((value) => value.startsWith(`--${name}=`))
+    ?.slice(name.length + 3);
 }
 
 export async function main() {
   const url = process.env.BULLS_TARGET_URL;
   if (!url) throw new Error("BULLS_TARGET_URL is required");
   const batch = Number(argument("batch") ?? 500);
-  if (!Number.isInteger(batch) || batch < 1) throw new Error("--batch must be a positive integer");
+  if (!Number.isInteger(batch) || batch < 1)
+    throw new Error("--batch must be a positive integer");
   const dryRun = guardFromArgv(process.argv, url) === "dry-run";
-  const client = new pg.Client({ connectionString: url, application_name: "96bulls-reproject-catalog" });
+  const client = new pg.Client({
+    connectionString: url,
+    application_name: "96bulls-reproject-catalog",
+  });
   await client.connect();
   try {
     if (dryRun) await client.query("SET default_transaction_read_only = on");
     const result = await reprojectCatalog(client, { batch, dryRun });
     process.stdout.write(`${JSON.stringify({ dryRun, ...result }, null, 2)}\n`);
     if (result.agentNameMismatches > 0)
-      throw new Error(`${result.agentNameMismatches} agent names differ from lower(agent_name)`);
+      throw new Error(
+        `${result.agentNameMismatches} agent names differ from lower(agent_name)`,
+      );
   } finally {
     await client.end();
   }
@@ -231,6 +255,8 @@ export async function main() {
 
 if (import.meta.main)
   main().catch((error) => {
-    console.error(`96bulls reproject failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    console.error(
+      `96bulls reproject failed: ${error instanceof Error ? error.message : "unknown error"}`,
+    );
     process.exit(1);
   });

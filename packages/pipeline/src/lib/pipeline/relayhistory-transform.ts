@@ -20,7 +20,11 @@ import {
   type ManifestV1,
   type ObjectStore,
 } from "./object-layout.js";
-import { readCapped, type ManifestRead, type ManifestReader } from "./adapter.js";
+import {
+  readCapped,
+  type ManifestRead,
+  type ManifestReader,
+} from "./adapter.js";
 import { PipelineError } from "./errors.js";
 import {
   normalizeRelayId,
@@ -87,9 +91,20 @@ export function relayhistoryExportProvenance(manifest: ManifestV1): {
   sourceUserId: string;
 } {
   const marker = manifest.extensions?.[RELAYHISTORY_EXPORT_EXTENSION];
-  if (!isObject(marker) || marker.version !== 1 || marker.source !== "neon.delivery_records")
-    fail("relayhistory_export_marker_missing", "manifest is not a RelayHistory export");
-  const { grant_id: grantId, plan_digest: planDigest, source_user_id: sourceUserId } = marker;
+  if (
+    !isObject(marker) ||
+    marker.version !== 1 ||
+    marker.source !== "neon.delivery_records"
+  )
+    fail(
+      "relayhistory_export_marker_missing",
+      "manifest is not a RelayHistory export",
+    );
+  const {
+    grant_id: grantId,
+    plan_digest: planDigest,
+    source_user_id: sourceUserId,
+  } = marker;
   const bulls = manifest.extensions?.["96bulls"];
   if (
     typeof grantId !== "string" ||
@@ -101,7 +116,10 @@ export function relayhistoryExportProvenance(manifest: ManifestV1): {
     !isObject(bulls) ||
     bulls.user_id !== sourceUserId
   )
-    fail("relayhistory_export_provenance", "export marker has no signed provenance");
+    fail(
+      "relayhistory_export_provenance",
+      "export marker has no signed provenance",
+    );
   const migration = `migration:${grantId}`;
   if (
     manifest.raw.owner !== migration &&
@@ -109,7 +127,10 @@ export function relayhistoryExportProvenance(manifest: ManifestV1): {
       (epoch) => epoch.reason === "backfill" && epoch.opened_by === migration,
     )
   )
-    fail("relayhistory_export_provenance", "export marker is not on a stream its grant opened");
+    fail(
+      "relayhistory_export_provenance",
+      "export marker is not on a stream its grant opened",
+    );
   return { grantId, sourceUserId };
 }
 
@@ -121,13 +142,13 @@ function carriesRecords(manifest: ManifestV1): boolean {
   );
 }
 
-function stringField(
-  value: Record<string, unknown>,
-  field: string,
-): string {
+function stringField(value: Record<string, unknown>, field: string): string {
   const fieldValue = value[field];
   if (typeof fieldValue !== "string" || !fieldValue || fieldValue.length > 1024)
-    fail("relayhistory_record_invalid", `RelayHistory record ${field} is missing`);
+    fail(
+      "relayhistory_record_invalid",
+      `RelayHistory record ${field} is missing`,
+    );
   return fieldValue;
 }
 
@@ -144,15 +165,23 @@ function parseExact(line: string): unknown {
   );
 }
 
-export function parseRelayhistoryRecord(line: string): RelayhistoryStreamRecord {
+export function parseRelayhistoryRecord(
+  line: string,
+): RelayhistoryStreamRecord {
   let value: unknown;
   try {
     value = parseExact(line);
   } catch {
-    fail("relayhistory_record_invalid", "RelayHistory export contains invalid JSON");
+    fail(
+      "relayhistory_record_invalid",
+      "RelayHistory export contains invalid JSON",
+    );
   }
   if (!value || typeof value !== "object" || Array.isArray(value))
-    fail("relayhistory_record_invalid", "RelayHistory export record is not an object");
+    fail(
+      "relayhistory_record_invalid",
+      "RelayHistory export record is not an object",
+    );
   const record = value as Record<string, unknown>;
   const revision = stringField(record, "revision");
   const receivedAt = stringField(record, "received_at");
@@ -162,9 +191,15 @@ export function parseRelayhistoryRecord(line: string): RelayhistoryStreamRecord 
     !/^(?:0|[1-9][0-9]{0,18})$/.test(revision) ||
     BigInt(revision) > MAX_REVISION
   )
-    fail("relayhistory_record_invalid", "RelayHistory record revision is not numeric");
+    fail(
+      "relayhistory_record_invalid",
+      "RelayHistory record revision is not numeric",
+    );
   if (!Number.isFinite(Date.parse(receivedAt)))
-    fail("relayhistory_record_invalid", "RelayHistory record received_at is invalid");
+    fail(
+      "relayhistory_record_invalid",
+      "RelayHistory record received_at is invalid",
+    );
   const acceptedSeq = record.accepted_seq;
   if (
     acceptedSeq !== undefined &&
@@ -172,14 +207,23 @@ export function parseRelayhistoryRecord(line: string): RelayhistoryStreamRecord 
       !/^(?:0|[1-9][0-9]{0,18})$/.test(acceptedSeq) ||
       BigInt(acceptedSeq) > MAX_REVISION)
   )
-    fail("relayhistory_record_invalid", "RelayHistory record accepted_seq is not numeric");
+    fail(
+      "relayhistory_record_invalid",
+      "RelayHistory record accepted_seq is not numeric",
+    );
   if (operation !== "upsert" && operation !== "delete")
-    fail("relayhistory_record_invalid", "RelayHistory record operation is invalid");
+    fail(
+      "relayhistory_record_invalid",
+      "RelayHistory record operation is invalid",
+    );
   if (
     payload !== null &&
     (typeof payload !== "object" || Array.isArray(payload))
   )
-    fail("relayhistory_record_invalid", "RelayHistory record payload is invalid");
+    fail(
+      "relayhistory_record_invalid",
+      "RelayHistory record payload is invalid",
+    );
   if (operation === "upsert" && payload === null)
     fail("relayhistory_record_invalid", "RelayHistory upsert has no payload");
   return {
@@ -293,8 +337,7 @@ function newestAcrossOrigins(
     if (group) group.push(record);
     else contenders.set(record.record_id, [record]);
   }
-  for (const group of contenders.values())
-    out.push(group.reduce(lastAccepted));
+  for (const group of contenders.values()) out.push(group.reduce(lastAccepted));
   return out;
 }
 
@@ -342,10 +385,15 @@ export function normalizeRelayhistoryRecords(
       );
     const first = receivedFirst(record, previous) ? record : previous;
     const seq = record.accepted_seq ?? previous.accepted_seq;
-    latest.set(key, seq === undefined ? first : { ...first, accepted_seq: seq });
+    latest.set(
+      key,
+      seq === undefined ? first : { ...first, accepted_seq: seq },
+    );
   }
   return newestAcrossOrigins(latest.values())
-    .filter((record) => record.operation === "upsert" && record.payload !== null)
+    .filter(
+      (record) => record.operation === "upsert" && record.payload !== null,
+    )
     .sort(
       (left, right) =>
         eventTime(left) - eventTime(right) ||
@@ -361,11 +409,17 @@ async function defaultDecompress(
   try {
     const zlib = await import("node:zlib");
     if (typeof zlib.zstdDecompressSync !== "function")
-      fail("zstd_unavailable", "this runtime cannot zstd-decompress raw chunks");
+      fail(
+        "zstd_unavailable",
+        "this runtime cannot zstd-decompress raw chunks",
+      );
     return new Uint8Array(zlib.zstdDecompressSync(stored, { maxOutputLength }));
   } catch (error) {
     if (error instanceof PipelineError) throw error;
-    fail("chunk_decompress_failed", "a RelayHistory raw chunk is not valid zstd");
+    fail(
+      "chunk_decompress_failed",
+      "a RelayHistory raw chunk is not valid zstd",
+    );
   }
 }
 
@@ -376,18 +430,26 @@ export async function readRelayhistoryExport(
   decompress?: ZstdDecompress,
   options: { maxSessionBytes?: number; prefix?: string } = {},
 ): Promise<RelayhistoryStreamRecord[]> {
-  const maxSessionBytes = options.maxSessionBytes ?? MAX_RELAYHISTORY_SESSION_BYTES;
+  const maxSessionBytes =
+    options.maxSessionBytes ?? MAX_RELAYHISTORY_SESSION_BYTES;
   relayhistoryExportProvenance(manifest);
   if (!manifest.raw.scrub)
-    fail("relayhistory_export_quarantined", "RelayHistory export is not scrubbed");
+    fail(
+      "relayhistory_export_quarantined",
+      "RelayHistory export is not scrubbed",
+    );
   if (manifest.raw.format !== "ndjson")
     fail("relayhistory_export_format", "RelayHistory export must use ndjson");
   const declared = manifest.raw.chunks.reduce(
-    (total, chunk) => total + Math.max(chunk.bytes, chunk.stored_raw_bytes ?? 0),
+    (total, chunk) =>
+      total + Math.max(chunk.bytes, chunk.stored_raw_bytes ?? 0),
     0,
   );
   if (declared > maxSessionBytes)
-    fail("relayhistory_session_too_large", "RelayHistory session exceeds the transform limit");
+    fail(
+      "relayhistory_session_too_large",
+      "RelayHistory session exceeds the transform limit",
+    );
   const loc = manifestLocation(manifest, options.prefix);
   const records: RelayhistoryStreamRecord[] = [];
   for (const chunk of manifest.raw.chunks) {
@@ -405,7 +467,10 @@ export async function readRelayhistoryExport(
       chunk.stored_bytes > MAX_RELAYHISTORY_CHUNK_BYTES ||
       (chunk.stored_raw_bytes ?? 0) > MAX_RELAYHISTORY_CHUNK_BYTES
     )
-      fail("relayhistory_chunk_too_large", "RelayHistory raw chunk exceeds the transform limit");
+      fail(
+        "relayhistory_chunk_too_large",
+        "RelayHistory raw chunk exceeds the transform limit",
+      );
     const key = rawChunkKey(
       loc,
       chunk.seq,
@@ -418,7 +483,11 @@ export async function readRelayhistoryExport(
       stored = await readCapped(await store.get(key), chunk.stored_bytes);
     } catch (error) {
       if ((error as { code?: unknown } | null)?.code === "not_found")
-        throw new PipelineError("chunk_missing", "a listed raw chunk is missing", true);
+        throw new PipelineError(
+          "chunk_missing",
+          "a listed raw chunk is missing",
+          true,
+        );
       throw error;
     }
     if (
@@ -426,7 +495,10 @@ export async function readRelayhistoryExport(
       stored.byteLength !== chunk.stored_bytes ||
       (await sha256Hex(stored)) !== chunk.stored_sha256
     )
-      fail("chunk_digest_mismatch", "a RelayHistory raw chunk has the wrong stored digest");
+      fail(
+        "chunk_digest_mismatch",
+        "a RelayHistory raw chunk has the wrong stored digest",
+      );
     let raw: Uint8Array;
     try {
       raw = decompress
@@ -437,16 +509,24 @@ export async function readRelayhistoryExport(
           );
     } catch (error) {
       if (error instanceof PipelineError) throw error;
-      fail("chunk_decompress_failed", "a RelayHistory raw chunk is not valid zstd");
+      fail(
+        "chunk_decompress_failed",
+        "a RelayHistory raw chunk is not valid zstd",
+      );
     }
     if (
       raw.byteLength !== chunk.stored_raw_bytes ||
       (await sha256Hex(raw)) !== chunk.raw_sha256
     )
-      fail("chunk_digest_mismatch", "a RelayHistory raw chunk has the wrong raw digest");
+      fail(
+        "chunk_digest_mismatch",
+        "a RelayHistory raw chunk has the wrong raw digest",
+      );
     let text: string;
     try {
-      text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw);
+      text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+        raw,
+      );
     } catch {
       fail("relayhistory_record_invalid", "RelayHistory export is not UTF-8");
     }
@@ -457,7 +537,10 @@ export async function readRelayhistoryExport(
       count += 1;
     }
     if (chunk.records !== count)
-      fail("relayhistory_record_count", "RelayHistory raw chunk record count does not match");
+      fail(
+        "relayhistory_record_count",
+        "RelayHistory raw chunk record count does not match",
+      );
   }
   return normalizeRelayhistoryRecords(records);
 }
@@ -489,8 +572,15 @@ function convergenceEventLines(stored: Uint8Array): number {
   for (const line of new TextDecoder().decode(stored).split("\n")) {
     if (!line) continue;
     const parsed = parsedLine(line);
-    if (typeof parsed.table !== "string" || !parsed.row || typeof parsed.row !== "object")
-      fail("normalized_object_invalid", "stored normalized object is not {table, row} lines");
+    if (
+      typeof parsed.table !== "string" ||
+      !parsed.row ||
+      typeof parsed.row !== "object"
+    )
+      fail(
+        "normalized_object_invalid",
+        "stored normalized object is not {table, row} lines",
+      );
     if (parsed.table === "convergence_events") count += 1;
   }
   return count;
@@ -553,7 +643,9 @@ async function isPlannedEntry(
       machineId: manifest.session.machine_id,
       harness: manifest.session.harness,
       sessionId: manifest.session.session_id,
-      startDate: new Date(manifest.session.started_at).toISOString().slice(0, 10),
+      startDate: new Date(manifest.session.started_at)
+        .toISOString()
+        .slice(0, 10),
     },
     manifest,
   );
@@ -644,7 +736,10 @@ export class RelayhistoryExportTransform implements SessionTransform {
             (this.deps.maxSessionBytes ?? MAX_RELAYHISTORY_SESSION_BYTES),
         );
     if (!stored)
-      fail("normalized_object_too_large", "stored normalized object exceeds the limit");
+      fail(
+        "normalized_object_too_large",
+        "stored normalized object exceeds the limit",
+      );
     const outputSha256 = await sha256Hex(stored);
     return {
       outputKey: key,

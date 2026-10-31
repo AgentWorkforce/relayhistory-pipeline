@@ -8,10 +8,14 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { countAgentNameMismatches, reprojectCatalog } from "../../../src/migration/relayhistory-reproject.js";
+import {
+  countAgentNameMismatches,
+  reprojectCatalog,
+} from "../../../src/migration/relayhistory-reproject.js";
 
 const MIGRATIONS = fileURLToPath(
-  new URL("../../../vendor/relayhistory-cloud/migrations/", import.meta.url).href,
+  new URL("../../../vendor/relayhistory-cloud/migrations/", import.meta.url)
+    .href,
 );
 const forPglite = (sql: string) =>
   sql
@@ -28,13 +32,16 @@ beforeAll(async () => {
     CREATE SCHEMA IF NOT EXISTS sessions;
     CREATE TABLE IF NOT EXISTS sessions.__migrations (
       name text PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now());`);
-  for (const file of readdirSync(MIGRATIONS).filter((name) => name.endsWith(".sql")).sort())
+  for (const file of readdirSync(MIGRATIONS)
+    .filter((name) => name.endsWith(".sql"))
+    .sort())
     await db.exec(forPglite(readFileSync(MIGRATIONS + file, "utf8")));
   // Production's catalog stage (0029): its key index, then the live triggers.
   const { rows } = await db.query<{ index_name: string; definition: string }>(
     "SELECT index_name, definition FROM sessions.delivery_rollout_indexes() WHERE stage = 'catalog'",
   );
-  for (const index of rows) await db.exec(`CREATE INDEX ${index.index_name} ${index.definition}`);
+  for (const index of rows)
+    await db.exec(`CREATE INDEX ${index.index_name} ${index.definition}`);
   await db.exec("SELECT sessions.activate_delivery_catalog()");
   // Production finished the 0038 upload-cleanup rollout, which lifts the
   // delivery write hold (its checkpoint guard only allows the rollout step).
@@ -69,7 +76,12 @@ const record = (
     ON CONFLICT DO NOTHING`;
 };
 /** The backfilled acceptance order of a pre-T0 record: below every live (post-T0) seq. */
-const acceptance = (origin: string, recordId: string, seq: number, workspace = WS) =>
+const acceptance = (
+  origin: string,
+  recordId: string,
+  seq: number,
+  workspace = WS,
+) =>
   `INSERT INTO sessions.delivery_catalog_acceptance (org_id, workspace_id, origin_id, record_id, accepted_seq)
    VALUES ('${ORG}', '${workspace}', '${origin}', '${recordId}', ${seq}) ON CONFLICT DO NOTHING`;
 const triggersOff = async (sql: string) => {
@@ -83,7 +95,11 @@ const triggersOff = async (sql: string) => {
 
 const catalog = async (session: string) =>
   (
-    await db.query<{ record_id: string; origin_id: string; title: string | null }>(
+    await db.query<{
+      record_id: string;
+      origin_id: string;
+      title: string | null;
+    }>(
       "SELECT record_id, origin_id, title FROM sessions.session_catalog WHERE session_id = $1",
       [session],
     )
@@ -124,7 +140,16 @@ it("sets up the T0 + backfill state the reprojection repairs", async () => {
   expect(await catalog("s-b")).toMatchObject([{ record_id: "b-post" }]);
   expect(await agents("s-b")).toEqual([]);
   //  a live key in a second workspace, untouched by the backfill.
-  await db.exec(record("o-1", "w2-live", "session", "s-w2", { title: "w2", agent_name: "beta" }, "ws-2"));
+  await db.exec(
+    record(
+      "o-1",
+      "w2-live",
+      "session",
+      "s-w2",
+      { title: "w2", agent_name: "beta" },
+      "ws-2",
+    ),
+  );
 
   // The backfill: base records and their acceptance, triggers off, existing rows kept.
   await triggersOff(`
@@ -143,7 +168,11 @@ it("sets up the T0 + backfill state the reprojection repairs", async () => {
   `);
   // The delete revision kept its key: the pre-T0 upsert did not replace it.
   expect(
-    (await db.query("SELECT operation FROM sessions.delivery_records WHERE record_id = 'a-r'")).rows,
+    (
+      await db.query(
+        "SELECT operation FROM sessions.delivery_records WHERE record_id = 'a-r'",
+      )
+    ).rows,
   ).toEqual([{ operation: "delete" }]);
 
   // What a trigger-off copy of the derived tables would have resurrected.
@@ -170,7 +199,12 @@ it("(e) a dry run reports the keys and writes nothing, even read-only", async ()
   try {
     const dry = await reprojectCatalog(db, { batch: 2, dryRun: true });
     // s-a, s-b, s-c, rel u-1, marker m-1, commit abc123, s-orphan, rel u-x (ws-1); s-w2 (ws-2).
-    expect(dry).toMatchObject({ keys: 9, keysWithoutContender: 3, batches: 5, after: null });
+    expect(dry).toMatchObject({
+      keys: 9,
+      keysWithoutContender: 3,
+      batches: 5,
+      after: null,
+    });
     expect(dry.before.session_catalog_agents).toBe(4);
   } finally {
     await db.exec("SET default_transaction_read_only = off");
@@ -180,7 +214,12 @@ it("(e) a dry run reports the keys and writes nothing, even read-only", async ()
 
 it("(a)(b)(c) reprojects every key: tombstones and lost agent names stay removed, pre-T0-only keys appear", async () => {
   const result = await reprojectCatalog(db, { batch: 2 });
-  expect(result).toMatchObject({ keys: 9, keysWithoutContender: 3, batches: 5, orphanAgentRowsRemoved: 1 });
+  expect(result).toMatchObject({
+    keys: 9,
+    keysWithoutContender: 3,
+    batches: 5,
+    orphanAgentRowsRemoved: 1,
+  });
   // Pages of 2 over 8 ws-1 keys and 1 ws-2 key: the 5th page holds ws-2 only.
   expect(result.workspaceLocks).toBe(5);
 
@@ -188,27 +227,59 @@ it("(a)(b)(c) reprojects every key: tombstones and lost agent names stay removed
   expect(await catalog("s-a")).toEqual([]);
   expect(await agents("s-a")).toEqual([]);
   // (b) the post-T0 winner holds the key and its missing name removes the old one.
-  expect(await catalog("s-b")).toMatchObject([{ record_id: "b-post", origin_id: "o-2", title: "post" }]);
+  expect(await catalog("s-b")).toMatchObject([
+    { record_id: "b-post", origin_id: "o-2", title: "post" },
+  ]);
   expect(await agents("s-b")).toEqual([]);
   // (c) the pre-T0-only key is projected, with its name and its other kinds.
-  expect(await catalog("s-c")).toMatchObject([{ record_id: "c-pre", title: "only pre" }]);
-  expect(await agents("s-c")).toMatchObject([{ agent_name: "gamma", record_id: "c-pre" }]);
+  expect(await catalog("s-c")).toMatchObject([
+    { record_id: "c-pre", title: "only pre" },
+  ]);
+  expect(await agents("s-c")).toMatchObject([
+    { agent_name: "gamma", record_id: "c-pre" },
+  ]);
   expect(
-    (await db.query("SELECT relationship_uid, child_session_id, spawn_depth FROM sessions.session_relationships WHERE parent_session_id = 's-c'")).rows,
-  ).toEqual([{ relationship_uid: "u-1", child_session_id: "s-c-child", spawn_depth: 1 }]);
+    (
+      await db.query(
+        "SELECT relationship_uid, child_session_id, spawn_depth FROM sessions.session_relationships WHERE parent_session_id = 's-c'",
+      )
+    ).rows,
+  ).toEqual([
+    { relationship_uid: "u-1", child_session_id: "s-c-child", spawn_depth: 1 },
+  ]);
   expect(
-    (await db.query("SELECT marker_uid, marker_kind FROM sessions.session_markers WHERE session_id = 's-c'")).rows,
+    (
+      await db.query(
+        "SELECT marker_uid, marker_kind FROM sessions.session_markers WHERE session_id = 's-c'",
+      )
+    ).rows,
   ).toEqual([{ marker_uid: "m-1", marker_kind: "compaction" }]);
   expect(
-    (await db.query("SELECT commit_sha, match_method, confidence_basis_points FROM sessions.session_commit_links WHERE session_id = 's-c'")).rows,
-  ).toEqual([{ commit_sha: "abc123", match_method: "trailer", confidence_basis_points: 5000 }]);
+    (
+      await db.query(
+        "SELECT commit_sha, match_method, confidence_basis_points FROM sessions.session_commit_links WHERE session_id = 's-c'",
+      )
+    ).rows,
+  ).toEqual([
+    {
+      commit_sha: "abc123",
+      match_method: "trailer",
+      confidence_basis_points: 5000,
+    },
+  ]);
   // Orphaned derived rows with no contender are gone.
   expect(await agents("s-orphan")).toEqual([]);
   expect(
-    (await db.query("SELECT 1 FROM sessions.session_relationships WHERE parent_session_id = 's-orphan'")).rows,
+    (
+      await db.query(
+        "SELECT 1 FROM sessions.session_relationships WHERE parent_session_id = 's-orphan'",
+      )
+    ).rows,
   ).toEqual([]);
   // The live key in the other workspace is unchanged.
-  expect(await catalog("s-w2")).toMatchObject([{ record_id: "w2-live", title: "w2" }]);
+  expect(await catalog("s-w2")).toMatchObject([
+    { record_id: "w2-live", title: "w2" },
+  ]);
   expect(await agents("s-w2")).toMatchObject([{ agent_name: "beta" }]);
   expect(result.after).toEqual({
     session_catalog: 3,
@@ -222,13 +293,20 @@ it("(a)(b)(c) reprojects every key: tombstones and lost agent names stay removed
 it("(d) a second run changes nothing", async () => {
   const before = await snapshot();
   const again = await reprojectCatalog(db, { batch: 3 });
-  expect(again).toMatchObject({ keys: 6, keysWithoutContender: 0, orphanAgentRowsRemoved: 0, agentNameMismatches: 0 });
+  expect(again).toMatchObject({
+    keys: 6,
+    keysWithoutContender: 0,
+    orphanAgentRowsRemoved: 0,
+    agentNameMismatches: 0,
+  });
   expect(again.after).toEqual(again.before);
   expect(await snapshot()).toEqual(before);
 }, 60_000);
 
 it("counts agent names that got past the lookup trigger, NULL included", async () => {
-  const { rows } = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.session_catalog_agents");
+  const { rows } = await db.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM sessions.session_catalog_agents",
+  );
   expect(rows[0]!.n).toBeGreaterThan(1);
   expect(await countAgentNameMismatches(db)).toBe(0);
   await db.exec(`SET session_replication_role = replica;
@@ -238,13 +316,17 @@ it("counts agent names that got past the lookup trigger, NULL included", async (
      WHERE session_id = (SELECT max(session_id) FROM sessions.session_catalog_agents);
     SET session_replication_role = origin;`);
   expect(await countAgentNameMismatches(db)).toBe(2);
-  await db.exec("UPDATE sessions.session_catalog_agents SET agent_name = agent_name");
+  await db.exec(
+    "UPDATE sessions.session_catalog_agents SET agent_name = agent_name",
+  );
   expect(await countAgentNameMismatches(db)).toBe(0);
 });
 
 it("leaves the workspace locks released and live delivery working afterwards", async () => {
   // A live upsert after reprojection still projects (the lock is free, triggers on).
   await db.exec(record("o-3", "c-newer", "session", "s-c", { title: "newer" }));
-  expect(await catalog("s-c")).toMatchObject([{ record_id: "c-newer", title: "newer" }]);
+  expect(await catalog("s-c")).toMatchObject([
+    { record_id: "c-newer", title: "newer" },
+  ]);
   expect(await agents("s-c")).toEqual([]);
 });
