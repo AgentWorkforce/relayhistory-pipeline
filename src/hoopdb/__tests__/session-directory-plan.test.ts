@@ -7,8 +7,10 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import {
   AGENT_PREFIX_BENCHMARK_GATE,
   SEARCH_INDEX_CATALOG_SQL,
+  SESSION_DIRECTORY_LIST_COLUMNS,
   SESSION_DIRECTORY_QUERIES,
   agentPrefixPattern,
+  agentPrefixRange,
   auditSearchIndexes,
   type SearchIndexCatalogRow,
 } from "../search-index-contract.ts";
@@ -34,14 +36,38 @@ async function database(): Promise<PGlite> {
   await db.exec(shim);
   await db.exec(`
     CREATE SCHEMA sessions;
-    CREATE FUNCTION sessions.jwt_org_id() RETURNS text LANGUAGE sql STABLE AS $$ SELECT NULL::text $$;
-    CREATE FUNCTION sessions.jwt_workspace_ids() RETURNS text[] LANGUAGE sql STABLE AS $$ SELECT '{}'::text[] $$;
+    CREATE FUNCTION sessions.jwt_org_id() RETURNS text LANGUAGE sql STABLE AS $$
+      SELECT nullif(current_setting('request.jwt.claims', true), '')::jsonb
+        #>> '{app_metadata,org_id}'
+    $$;
+    CREATE FUNCTION sessions.jwt_workspace_ids() RETURNS text[] LANGUAGE sql STABLE AS $$
+      SELECT coalesce(array_agg(value #>> '{}'), '{}'::text[])
+        FROM jsonb_array_elements(coalesce(
+          nullif(current_setting('request.jwt.claims', true), '')::jsonb
+            #> '{app_metadata,workspace_ids}',
+          '[]'::jsonb
+        ))
+    $$;
     CREATE FUNCTION sessions.member_of(text, text[]) RETURNS boolean
       LANGUAGE sql IMMUTABLE AS $$ SELECT $1 = ANY ($2) $$;
+    -- 20261025000000_sessions_index.sql establishes this prerequisite before
+    -- either directory migration runs in production.
+    GRANT USAGE ON SCHEMA sessions TO authenticated;
   `);
   await db.exec(migration);
   await db.exec(shortSummaryMigration);
   return db;
+}
+
+async function enterAuthenticated(db: PGlite, org = "o", workspaces = ["w"]): Promise<void> {
+  await db.query("SELECT set_config('request.jwt.claims', $1, false)", [
+    JSON.stringify({ role: "authenticated", app_metadata: { org_id: org, workspace_ids: workspaces } }),
+  ]);
+  await db.exec("SET ROLE authenticated");
+}
+
+async function leaveAuthenticated(db: PGlite): Promise<void> {
+  await db.exec("RESET ROLE");
 }
 
 type Plan = {
@@ -102,6 +128,36 @@ describe("session_directory migration", () => {
       VALUES ('o', 'w', 'codex', 'bad', now(), now(), 'Mixed', 'MIXED')
     `)).rejects.toThrow();
   });
+
+  test("authenticated list queries expose only their column-granted metadata contract", async () => {
+    const db = await database();
+    await db.exec(`
+      INSERT INTO sessions.session_directory
+        (org_id, workspace_id, harness, session_id, created_at, last_activity_at,
+         agent_name, agent_name_normalized, search_text)
+      VALUES
+        ('o', 'w', 'codex', 's', '2026-10-30T00:00:00Z', '2026-10-30T01:00:00Z',
+         'Helm-Chief', 'helm-chief', 'private rpc-only text');
+    `);
+
+    for (const sql of Object.values(SESSION_DIRECTORY_QUERIES)) {
+      expect(sql).not.toMatch(/\b(?:d\.)?\*/);
+    }
+
+    await enterAuthenticated(db);
+    try {
+      const result = await db.query<Record<string, unknown>>(
+        SESSION_DIRECTORY_QUERIES.workspaceRecent,
+        ["o", "w", 50],
+      );
+      expect(result.rows).toHaveLength(1);
+      expect(Object.keys(result.rows[0] ?? {})).toEqual([...SESSION_DIRECTORY_LIST_COLUMNS]);
+      await expect(db.query("SELECT short_summary FROM sessions.session_directory")).rejects.toThrow();
+      await expect(db.query("SELECT search_text FROM sessions.session_directory")).rejects.toThrow();
+    } finally {
+      await leaveAuthenticated(db);
+    }
+  });
 });
 
 describe("session_directory query plans", () => {
@@ -146,7 +202,7 @@ describe("session_directory query plans", () => {
     }
   });
 
-  test("uses the ordered agent index for exact and useful-prefix lookups", async () => {
+  test("uses the ordered agent index through authenticated RLS for exact and useful-prefix lookups", async () => {
     const db = await database();
     await db.exec(`
       INSERT INTO sessions.session_directory
@@ -161,13 +217,19 @@ describe("session_directory query plans", () => {
       ANALYZE sessions.session_directory;
     `);
 
-    const exact = walk(await explain(db, SESSION_DIRECTORY_QUERIES.agentExact, ["o", "w", "helm-9999", 50]));
-    expect(exact.some((node) => node["Index Name"] === "session_directory_agent_recent_idx")).toBe(true);
+    await enterAuthenticated(db);
+    try {
+      const exact = walk(await explain(db, SESSION_DIRECTORY_QUERIES.agentExact, ["o", "w", "helm-9999", 50]));
+      expect(exact.some((node) => node["Index Name"] === "session_directory_agent_recent_idx")).toBe(true);
 
-    const prefix = walk(await explain(db, SESSION_DIRECTORY_QUERIES.agentPrefix, [
-      "o", "w", agentPrefixPattern("helm-99"), 50,
-    ]));
-    expect(prefix.some((node) => node["Index Name"] === "session_directory_agent_recent_idx")).toBe(true);
+      const selective = agentPrefixRange("helm-99");
+      const prefix = walk(await explain(db, SESSION_DIRECTORY_QUERIES.agentPrefix, [
+        "o", "w", selective.lower, selective.upper, selective.pattern, 50,
+      ]));
+      expect(prefix.some((node) => node["Index Name"] === "session_directory_agent_recent_idx")).toBe(true);
+    } finally {
+      await leaveAuthenticated(db);
+    }
   });
 
   test("keeps a deliberately broad three-character prefix within the row-amplification gate", async () => {
@@ -184,9 +246,11 @@ describe("session_directory query plans", () => {
         FROM generate_series(1, 10000) AS n;
       ANALYZE sessions.session_directory;
     `);
-    const nodes = walk(await explain(db, SESSION_DIRECTORY_QUERIES.agentPrefix, [
-      "o", "w", agentPrefixPattern("age"), AGENT_PREFIX_BENCHMARK_GATE.pageSize,
-    ]));
+    await enterAuthenticated(db);
+    const broad = agentPrefixRange("age");
+    const nodes = await explain(db, SESSION_DIRECTORY_QUERIES.agentPrefix, [
+      "o", "w", broad.lower, broad.upper, broad.pattern, AGENT_PREFIX_BENCHMARK_GATE.pageSize,
+    ]).then(walk).finally(() => leaveAuthenticated(db));
     const indexNode = nodes.find((node) =>
       node["Index Name"] === "session_directory_agent_recent_idx" ||
       node["Index Name"] === "session_directory_workspace_recent_idx" ||

@@ -62,60 +62,121 @@ export function agentPrefixPattern(value: string): string {
   return `${normalized.replace(/[\\%_]/g, "\\$&")}%`;
 }
 
+/**
+ * Leakproof byte-order bounds for an authenticated RLS prefix query. PostgreSQL
+ * cannot push the non-leakproof LIKE operator below an RLS security barrier, so
+ * the text_pattern_ops range must be explicit and LIKE remains the exact recheck.
+ */
+export function agentPrefixRange(value: string): { lower: string; upper: string; pattern: string } {
+  const lower = normalizeAgentName(value);
+  if (Array.from(lower).length < MIN_AGENT_PREFIX_CHARS) {
+    throw new RangeError(`agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`);
+  }
+  const points = Array.from(lower);
+  for (let index = points.length - 1; index >= 0; index -= 1) {
+    const point = points[index]!.codePointAt(0)!;
+    if (point >= 0x10ffff) continue;
+    const next = point + 1 === 0xd800 ? 0xe000 : point + 1;
+    return {
+      lower,
+      upper: `${points.slice(0, index).join("")}${String.fromCodePoint(next)}`,
+      pattern: agentPrefixPattern(value),
+    };
+  }
+  throw new RangeError("agent prefix has no finite text_pattern_ops upper bound");
+}
+
+/**
+ * Columns exposed by the authenticated metadata-list surface. Keep this list in
+ * lockstep with the column grant in the short-summary migration: search_text,
+ * short_summary and its provenance are deliberately available only through the
+ * tenant-bound RPC.
+ */
+export const SESSION_DIRECTORY_LIST_COLUMNS = [
+  "org_id",
+  "workspace_id",
+  "harness",
+  "session_id",
+  "created_at",
+  "last_activity_at",
+  "title",
+  "task_title",
+  "agent_name",
+  "agent_name_normalized",
+  "project_id",
+  "git_repo",
+  "git_branch",
+  "model",
+  "state",
+  "event_count",
+  "input_tokens",
+  "output_tokens",
+  "cost_usd_micros",
+  "machine_ids",
+  "user_ids",
+  "projection_version",
+  "projected_at",
+  "deleted_at",
+] as const;
+
+const listColumns = SESSION_DIRECTORY_LIST_COLUMNS.join(", ");
+const joinedListColumns = SESSION_DIRECTORY_LIST_COLUMNS.map((column) => `d.${column}`).join(", ");
+
 /** Parameterized definitions shared by plan tests and future API adapters. */
 export const SESSION_DIRECTORY_QUERIES = {
   workspaceRecent: `
-SELECT * FROM sessions.session_directory
+SELECT ${listColumns} FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2 AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC, harness DESC
  LIMIT $3`,
   harnessRecent: `
-SELECT * FROM sessions.session_directory
+SELECT ${listColumns} FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC
  LIMIT $4`,
   projectRecent: `
-SELECT * FROM sessions.session_directory
+SELECT ${listColumns} FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2 AND project_id = $3 AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC, harness DESC
  LIMIT $4`,
   withoutProjectRecent: `
-SELECT * FROM sessions.session_directory
+SELECT ${listColumns} FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2 AND project_id IS NULL AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC, harness DESC
  LIMIT $3`,
   agentExact: `
-SELECT * FROM sessions.session_directory
+SELECT ${listColumns} FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2
    AND agent_name_normalized = $3 AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC, harness DESC
  LIMIT $4`,
   agentPrefix: `
-SELECT * FROM sessions.session_directory
+SELECT ${listColumns} FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2
-   AND agent_name_normalized LIKE $3 ESCAPE '\\' AND deleted_at IS NULL
+   AND agent_name_normalized ~>=~ $3 AND agent_name_normalized ~<~ $4
+   AND agent_name_normalized LIKE $5 ESCAPE '\\' AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC, harness DESC
- LIMIT $4`,
+ LIMIT $6`,
   createdRange: `
-SELECT * FROM sessions.session_directory
+SELECT ${listColumns} FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2 AND created_at >= $3
    AND created_at < $4 AND deleted_at IS NULL
  ORDER BY created_at DESC, session_id DESC, harness DESC
  LIMIT $5`,
   stateRecent: `
-SELECT * FROM sessions.session_directory
+SELECT ${listColumns} FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2 AND state = $3 AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC, harness DESC
  LIMIT $4`,
   userRecent: `
-SELECT d.* FROM sessions.session_directory_users AS membership
+SELECT ${joinedListColumns} FROM sessions.session_directory_users AS membership
  JOIN sessions.session_directory AS d USING (org_id, workspace_id, harness, session_id)
  WHERE membership.org_id = $1 AND membership.workspace_id = $2
    AND membership.user_id = $3 AND d.deleted_at IS NULL
  ORDER BY membership.last_activity_at DESC, membership.session_id DESC, membership.harness DESC
  LIMIT $4`,
   machineRecent: `
-SELECT d.* FROM sessions.session_directory_machines AS membership
+SELECT ${joinedListColumns} FROM sessions.session_directory_machines AS membership
  JOIN sessions.session_directory AS d USING (org_id, workspace_id, harness, session_id)
  WHERE membership.org_id = $1 AND membership.workspace_id = $2
    AND membership.machine_id = $3 AND d.deleted_at IS NULL
