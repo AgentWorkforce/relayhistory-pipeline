@@ -23,6 +23,8 @@
     "smoke:local": "bun run bin/96bulls smoke local",
     "audit:search-indexes": "bun run src/hoopdb/search-index-audit.ts",
     "benchmark:relayhistory": "bun run src/migration/relayhistory-benchmark.ts",
+    "proof:aws": "bun run src/proof/aws/cli.ts",
+    "proof:aws:teardown": "bun run src/proof/aws/cli.ts teardown",
     "benchmark:relayhistory-api": "bun run src/migration/relayhistory-api-benchmark.ts",
     "migration:copy": "bun run src/migration/relayhistory-copy.ts",
     "migration:neon-fence": "bun run src/migration/relayhistory-neon-fence.ts",

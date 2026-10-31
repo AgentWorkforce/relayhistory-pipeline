@@ -9,6 +9,10 @@ The published portable Relaycast chart has a completed local kind proof; see
 That proof is local-only and does not clear this AWS stage or change the
 production Supabase and AWS S3 boundary.
 
+The proof harness for an isolated self-host E2E on this account
+(`aws-proof`, account 500268966557) is in [AWS self-host E2E proof](aws-e2e-proof.md).
+It defaults to a dry run and has not been run against AWS.
+
 What the stage will need (each item needs an explicit OK): a target account
 (per-agent sandbox under the Sandbox OU via Pippin Tools, or a named dev
 account); which credential to use (SSO profile or a `96bulls-deployer` role
