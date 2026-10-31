@@ -25,7 +25,7 @@ export interface WorkItem {
   org_id: string;
   session_id: string;
   revision: number;
-  kind: "delete" | "changed" | "recent" | "history" | "retry";
+  kind: "delete" | "changed" | "recent" | "history" | "retry" | "reverify";
   events: number;
 }
 
@@ -57,6 +57,7 @@ export class SyncState {
         org_id TEXT NOT NULL, session_id TEXT NOT NULL,
         revision INTEGER NOT NULL, exported_at INTEGER NOT NULL, keys TEXT NOT NULL,
         error TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_try INTEGER NOT NULL DEFAULT 0,
+        failed_revision INTEGER,
         PRIMARY KEY (org_id, session_id));
       CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
@@ -132,24 +133,46 @@ export class SyncState {
         `INSERT INTO exported (org_id, session_id, revision, exported_at, keys, error, attempts, next_try)
          VALUES (?, ?, ?, ?, ?, NULL, 0, 0)
          ON CONFLICT (org_id, session_id) DO UPDATE SET revision = excluded.revision,
-           exported_at = excluded.exported_at, keys = excluded.keys, error = NULL, attempts = 0, next_try = 0`,
+           exported_at = excluded.exported_at, keys = excluded.keys, error = NULL, attempts = 0, next_try = 0,
+           failed_revision = NULL`,
       )
       .run(org, session, revision, at, JSON.stringify([...keys].sort()));
   }
 
-  /** A failed export keeps its old keys and revision, and is retried with backoff. */
-  markFailed(org: string, session: string, code: string, at = Date.now()) {
+  /**
+   * A failed export keeps its old keys plus every key it may have written
+   * before failing (so a later erasure still finds them), and is retried with
+   * a backoff of at most 4 h, or at once when Neon's revision moves again.
+   */
+  markFailed(org: string, session: string, code: string, keys: string[], revision: number, at = Date.now()) {
     const prior = this.exported(org, session);
     const attempts = (prior?.attempts ?? 0) + 1;
-    const nextTry = at + Math.min(24, 2 ** (attempts - 1)) * 60 * 60 * 1000;
+    const nextTry = at + Math.min(4, 2 ** (attempts - 1)) * 60 * 60 * 1000;
+    const all = JSON.stringify([...new Set([...(prior?.keys ?? []), ...keys])].sort());
     this.db
       .prepare(
-        `INSERT INTO exported (org_id, session_id, revision, exported_at, keys, error, attempts, next_try)
-         VALUES (?, ?, -1, 0, ?, ?, ?, ?)
-         ON CONFLICT (org_id, session_id) DO UPDATE SET error = excluded.error, attempts = excluded.attempts,
-           next_try = excluded.next_try`,
+        `INSERT INTO exported (org_id, session_id, revision, exported_at, keys, error, attempts, next_try, failed_revision)
+         VALUES (?, ?, -1, 0, ?, ?, ?, ?, ?)
+         ON CONFLICT (org_id, session_id) DO UPDATE SET keys = excluded.keys, error = excluded.error,
+           attempts = excluded.attempts, next_try = excluded.next_try, failed_revision = excluded.failed_revision`,
       )
-      .run(org, session, JSON.stringify(prior?.keys ?? []), code, attempts, nextTry);
+      .run(org, session, all, code, attempts, nextTry, revision);
+  }
+
+  /**
+   * A deletion fence (tombstone or reset) changed without bumping the
+   * session's revision: make the exported group look changed, past its debounce.
+   */
+  forceChanged(groups: { org_id: string; session_id: string }[]): number {
+    const q = this.db.prepare(
+      `UPDATE exported SET revision = -2, exported_at = 0
+        WHERE org_id = ? AND session_id = ? AND error IS NULL AND keys <> '[]' AND revision <> -2`,
+    );
+    let n = 0;
+    this.#tx(() => {
+      for (const g of groups) n += Number(q.run(g.org_id, g.session_id).changes);
+    });
+    return n;
   }
 
   /**
@@ -158,9 +181,10 @@ export class SyncState {
    *  2. changed since their export and past their debounce (bigger sessions wait longer, at most 24 h);
    *  3. never exported, active in the last `recentMs`, newest first;
    *  4. never exported, the rest of history, newest first;
-   *  5. failed ones due for a retry.
+   *  5. failed ones due for a retry, or whose revision moved since;
+   *  6. when nothing else waits, exports older than `reverifyMs`, oldest first.
    */
-  nextWork(now: number, recentMs: number, limit: number): WorkItem[] {
+  nextWork(now: number, recentMs: number, limit: number, reverifyMs = 0): WorkItem[] {
     const out: WorkItem[] = [];
     const take = (sql: string, kind: WorkItem["kind"], ...params: (number | string)[]) => {
       if (out.length >= limit) return;
@@ -176,7 +200,7 @@ export class SyncState {
     );
     take(
       `SELECT g.org_id, g.session_id, g.revision, g.events FROM groups g JOIN exported e USING (org_id, session_id)
-        WHERE e.error IS NULL AND g.revision > e.revision
+        WHERE e.error IS NULL AND g.revision <> e.revision
           AND e.exported_at + min(86400000, 1800000 + g.events * 600) <= ?
         ORDER BY g.last_ms DESC NULLS FIRST LIMIT ?`,
       "changed",
@@ -199,10 +223,22 @@ export class SyncState {
     );
     take(
       `SELECT g.org_id, g.session_id, g.revision, g.events FROM groups g JOIN exported e USING (org_id, session_id)
-        WHERE e.error IS NOT NULL AND e.next_try <= ? AND e.attempts < 6 ORDER BY e.next_try LIMIT ?`,
+        WHERE e.error IS NOT NULL
+          AND ((e.next_try <= ? AND e.attempts < 6) OR g.revision <> coalesce(e.failed_revision, g.revision))
+        ORDER BY e.next_try LIMIT ?`,
       "retry",
       now,
     );
+    // Last: a rolling re-read of old exports, for changes Neon records without a
+    // revision bump (delivery records that never project to an event). Only when
+    // nothing else is waiting; a re-read of an unchanged session writes nothing.
+    if (out.length === 0 && reverifyMs > 0)
+      take(
+        `SELECT g.org_id, g.session_id, g.revision, g.events FROM groups g JOIN exported e USING (org_id, session_id)
+          WHERE e.error IS NULL AND e.exported_at < ? ORDER BY e.exported_at LIMIT ?`,
+        "reverify",
+        now - reverifyMs,
+      );
     // A group can match two queries only across them (e.g. never twice); dedupe defensively.
     const seen = new Set<string>();
     return out.filter((w) => {
@@ -228,7 +264,7 @@ export class SyncState {
       now - recentMs,
     );
     const [changed] = one(
-      `SELECT count(*) FROM groups g JOIN exported e USING (org_id, session_id) WHERE e.error IS NULL AND g.revision > e.revision`,
+      `SELECT count(*) FROM groups g JOIN exported e USING (org_id, session_id) WHERE e.error IS NULL AND g.revision <> e.revision`,
     );
     const [errored] = one(`SELECT count(*) FROM exported WHERE error IS NOT NULL`);
     const [pendingDeletes] = one(

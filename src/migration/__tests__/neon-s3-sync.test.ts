@@ -26,7 +26,7 @@ import {
 import { chunksAreServerSealed } from "../../alleyoop/manifests.ts";
 import { buildSessionStream, type DeliveryRecord, type Queryable } from "../relayhistory-export.ts";
 import { deleteExported, exportUnit, orgPrefix, type ExportTarget } from "../neon-s3-sync/export-session.ts";
-import { boundStrings, MAX_STRING_TOKEN, neonUnitSource, readOnly, sessionUnits, type SessionUnit, type StreamLine, type UnitSource } from "../neon-s3-sync/neon-reader.ts";
+import { boundStrings, fencedGroups, MAX_STRING_TOKEN, neonUnitSource, readOnly, sessionUnits, type SessionUnit, type StreamLine, type UnitSource } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { Syncer, DEFAULT_SYNC_CONFIG } from "../neon-s3-sync/sync.ts";
 import { Throttle, parseWindows } from "../neon-s3-sync/throttle.ts";
@@ -305,6 +305,74 @@ describe("delete propagation", () => {
   });
 });
 
+describe("ownership and failure bookkeeping", () => {
+  test("a failed run records the keys it wrote under, so a later erasure still removes them", async () => {
+    const { store } = await countingStore();
+    const t = target(store);
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const failing: UnitSource = {
+      fenced: async () => false,
+      async *lines() {
+        for (let i = 0; i < 3; i++)
+          yield { machine: "delivery:m1", bytes: buildSessionStream([rec("session_event", "o", `e${i}`, { x: "y".repeat(150) })]).bytes, userId: "u" };
+        throw Object.assign(new Error("boom"), { code: "57014" });
+      },
+    };
+    const syncer = new Syncer(fakeDb([unit("org-a")]), state, { ...t, maxChunkBytes: 200 }, fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => failing);
+    state.seeRevisions(1, [{ org_id: "org-a", session_id: "sess:with:colons-1", revision: "1" }]);
+    expect(await syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 1, kind: "recent", events: 3 })).toBe(false);
+    const row = state.exported("org-a", "sess:with:colons-1")!;
+    expect(row.error).toBe("57014");
+    expect(row.keys).toHaveLength(1);
+    expect((await allKeys(store)).length).toBeGreaterThan(0); // sealed chunks, no manifest
+    // Neon then hard-deletes the session: both sweeps miss it, the delete work erases the prefix.
+    state.dropUnseen(2, 2);
+    const work = state.nextWork(Date.now() + 5 * 3_600_000, 14 * 86_400_000, 10);
+    expect(work[0]).toMatchObject({ kind: "delete" });
+    expect(await syncer.processGroup(work[0]!)).toBe(true);
+    expect(await allKeys(store)).toEqual([]);
+    state.close();
+  });
+
+  test("a failed group is retried at once when its revision moves; a fence forces a re-export", async () => {
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const now = Date.now();
+    state.seeRevisions(1, [{ org_id: "o", session_id: "s", revision: "3" }, { org_id: "o", session_id: "f", revision: "1" }]);
+    state.seeActivity(1, [{ org_id: "o", session_id: "s", last_ms: String(now), events: "1" }, { org_id: "o", session_id: "f", last_ms: String(now), events: "1" }]);
+    state.markFailed("o", "s", "57014", [], 3, now);
+    state.markExported("o", "f", 1, ["96bulls/o/v1/k/manifest.json"], now);
+    expect(state.nextWork(now, 86_400_000, 10)).toEqual([]);
+    state.seeRevisions(2, [{ org_id: "o", session_id: "s", revision: "4" }]);
+    expect(state.nextWork(now, 86_400_000, 10).map((w) => `${w.kind}:${w.session_id}`)).toEqual(["retry:s"]);
+    expect(state.forceChanged([{ org_id: "o", session_id: "f" }])).toBe(1);
+    expect(state.nextWork(now, 86_400_000, 10).map((w) => `${w.kind}:${w.session_id}`)).toEqual(["changed:f", "retry:s"]);
+    state.close();
+  });
+
+  test("a manifest the exporter does not own is neither overwritten nor cleaned up", async () => {
+    const { store } = await countingStore();
+    const t = target(store);
+    const r = await exportUnit(t, unit("org-a"), fixedSource(baseRecords().slice(0, 1)));
+    const key = r.manifests[0]!.manifestKey;
+    const manifest = JSON.parse(await readText(store, key));
+    manifest.raw.owner = manifest.writer.delivery_instance_id = "client-courier-1";
+    await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)));
+    const before = await allKeys(store);
+    await expect(exportUnit(t, unit("org-a"), fixedSource(baseRecords()))).rejects.toMatchObject({ code: "foreign_manifest" });
+    await expect(deleteExported(t, "org-a", key)).rejects.toMatchObject({ code: "foreign_manifest" });
+    expect(await allKeys(store)).toEqual(before);
+  });
+
+  test("two Neon sessions whose ids sanitize to one key do not overwrite each other", async () => {
+    const { store } = await countingStore();
+    const t = target(store);
+    await exportUnit(t, unit("org-a", { sessionId: "a:b" }), fixedSource(baseRecords().slice(0, 1)));
+    await expect(exportUnit(t, unit("org-a", { sessionId: "a_b" }), fixedSource(baseRecords()))).rejects.toMatchObject({
+      code: "key_collision",
+    });
+  });
+});
+
 describe("prefixes and tenant isolation", () => {
   test("the org prefix is one safe path segment under the key root", () => {
     expect(orgPrefix("96bulls", "4cb2aaaa-0000-4000-8000-000000000000")).toBe("96bulls/4cb2aaaa-0000-4000-8000-000000000000");
@@ -505,10 +573,13 @@ describe("Neon reader SQL (Neon-shaped PGlite)", () => {
     await pg.query(`INSERT INTO sessions.deleted_upload_sessions VALUES ('o1', $1, 'u1', 'oa', 'claude', 's1')`, [ws]);
     // the fence is cached for two minutes; a fresh source reads it again
     expect(await neonUnitSource(db, async () => {}).fenced(units[0]!)).toBe(true);
+    expect(await fencedGroups(db)).toEqual([{ org_id: "o1", session_id: "s1" }]);
     // a reset in the workspace falls back to #40's per-session query (no session record of that user here)
     await pg.query(`DELETE FROM sessions.deleted_upload_sessions`);
     await pg.query(`INSERT INTO sessions.session_resets VALUES ('o1', $1, 'u1', 'r1', 1)`, [ws]);
     expect(await neonUnitSource(db, async () => {}).fenced(units[0]!)).toBe(true);
+    expect(await source.fenced(units[0]!, true)).toBe(true); // fresh: bypasses the cached "not fenced"
+    expect(await fencedGroups(db)).toEqual([{ org_id: "o1", session_id: "s1" }]);
     await pg.close();
   });
 });
@@ -582,5 +653,29 @@ describe.skipIf(!minio)("against a real S3 API (MinIO, S3X_TEST_MINIO_*)", () =>
     expect(deletes).toBeGreaterThan(0);
     for (const m of first.manifests) await deleteExported(t, org, m.manifestKey);
     expect(await allKeys(store, `96bulls/${org}`)).toEqual([]);
+  });
+});
+
+describe("SSE-KMS key id (sessions-prod bucket policy)", () => {
+  test("every put names aws:kms and the key ARN, signed", async () => {
+    const { createS3Store } = await import("../../shared/vendor.ts");
+    const seen: Headers[] = [];
+    const key = "arn:aws:kms:us-east-1:941433935742:key/c74376a5-f6ff-4ef0-9a26-543c940094ba";
+    const store = createS3Store({
+      bucket: "b",
+      region: "us-east-1",
+      credentials: { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "x" },
+      serverSideEncryption: "aws:kms",
+      sseKmsKeyId: key,
+      fetch: (async (_url: unknown, init?: RequestInit) => {
+        seen.push(new Headers(init?.headers));
+        return new Response("", { status: 200, headers: { etag: '"e"' } });
+      }) as typeof fetch,
+    });
+    await store.put(objectKey("96bulls/o/v1/x/raw/a.ndjson.zst"), new Uint8Array([1]), { ifNoneMatch: true });
+    const h = seen.at(-1)!;
+    expect(h.get("x-amz-server-side-encryption")).toBe("aws:kms");
+    expect(h.get("x-amz-server-side-encryption-aws-kms-key-id")).toBe(key);
+    expect(h.get("authorization")).toContain("x-amz-server-side-encryption-aws-kms-key-id");
   });
 });

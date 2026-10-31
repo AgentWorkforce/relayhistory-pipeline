@@ -138,7 +138,11 @@ class MachineStream {
   }
 
   existing() {
-    this.#existing ??= readManifest(this.target.store, this.key);
+    this.#existing ??= readManifest(this.target.store, this.key).then((found) => {
+      const issue = found && ownershipIssue(found.manifest, this.target.grantId, unitIdentity(this.unit));
+      if (issue) throw coded(issue, "the stored manifest is not this exporter's export of this session");
+      return found;
+    });
     return this.#existing;
   }
 
@@ -170,7 +174,11 @@ class MachineStream {
     const sha256 = sha256Hex(data);
     const seq = this.#seq;
     const startOffset = this.#offset;
-    const prior = (await this.existing())?.manifest.raw.chunks[seq];
+    const stored = (await this.existing())?.manifest;
+    const prior =
+      stored?.raw.scrub?.ruleset === SCRUB_RULESET && stored.raw.scrub.version === SCRUB_RULESET_VERSION
+        ? stored.raw.chunks[seq]
+        : undefined;
     let entry: ChunkEntry;
     if (
       prior &&
@@ -221,22 +229,50 @@ async function readManifest(
   store: ObjectStore,
   key: string,
 ): Promise<{ manifest: ManifestV1; version: ObjectVersion } | null> {
+  let text: string;
+  let version: ObjectVersion;
   try {
     const object = await store.getObject(objectKey(key));
-    const text = new TextDecoder().decode(await readAll(object.body));
-    try {
-      return { manifest: await parseManifest(text, key), version: object.meta.version };
-    } catch {
-      // An invalid stored manifest is replaced (compare-and-swap on its version), never read.
-      return {
-        manifest: { revision: 0, raw: { chunks: [] } } as unknown as ManifestV1,
-        version: object.meta.version,
-      };
-    }
+    text = new TextDecoder().decode(await readAll(object.body));
+    version = object.meta.version;
   } catch (error) {
     if (isObjectStoreError(error, "not_found")) return null;
     throw error;
   }
+  try {
+    return { manifest: await parseManifest(text, key), version };
+  } catch {
+    // Not ours to replace: something else wrote an invalid manifest here.
+    throw coded("foreign_manifest_invalid", "the stored manifest is invalid");
+  }
+}
+
+const coded = (code: string, message: string) => Object.assign(new Error(message), { code });
+
+/** The Neon identity an exported manifest records, to tell two groups apart when their keys collide. */
+export function exportIdentity(manifest: ManifestV1): string | undefined {
+  const marker = manifest.extensions?.[EXPORT_MARKER] as { catalog?: Record<string, unknown> } | undefined;
+  const bulls = manifest.extensions?.[SESSION_EXT] as { tenant_id?: unknown } | undefined;
+  const c = marker?.catalog;
+  if (!c) return undefined;
+  return JSON.stringify([bulls?.tenant_id, c.neon_workspace_id, c.neon_source, c.neon_session_id]);
+}
+
+const unitIdentity = (unit: SessionUnit) =>
+  JSON.stringify([unit.orgId, unit.workspaceId, unit.source, unit.sessionId]);
+
+/**
+ * The exporter only rewrites or deletes what it wrote itself for this Neon
+ * session: owner `migration:{grantId}`, one `initial` epoch, same identity.
+ * Anything else (a live client's manifest, an adopted or backfilled session,
+ * another session whose ids sanitize to the same key) is refused.
+ */
+export function ownershipIssue(manifest: ManifestV1, grantId: string, identity?: string): string | undefined {
+  const owner = `migration:${grantId}`;
+  if (manifest.raw.owner !== owner || manifest.writer.delivery_instance_id !== owner) return "foreign_manifest";
+  if (manifest.raw.epochs.length !== 1 || manifest.raw.epochs[0]!.reason !== "initial") return "foreign_manifest_epochs";
+  if (identity !== undefined && exportIdentity(manifest) !== identity) return "key_collision";
+  return undefined;
 }
 
 /** The manifest without the fields that change on every write. */
@@ -366,12 +402,22 @@ export async function deleteExported(target: ExportTarget, orgId: string, key: s
   const loc = parseSessionKey(key);
   if (!loc || loc.prefix !== prefix || loc.rest !== "manifest.json")
     throw new Error("refusing to delete a key outside this org's export prefix");
+  const found = await readManifest(target.store, key);
+  const issue = found && ownershipIssue(found.manifest, target.grantId);
+  if (issue) throw coded(issue, "refusing to erase a manifest this exporter does not own");
+  if (found && (found.manifest.extensions?.[SESSION_EXT] as { tenant_id?: unknown } | undefined)?.tenant_id !== orgId)
+    throw coded("key_collision", "refusing to erase another org's manifest");
   return deleteUnder(target.store, key.slice(0, -"manifest.json".length));
 }
 
 /** Export one unit. Returns the manifest keys it now owns (none when fenced or empty). */
-export async function exportUnit(target: ExportTarget, unit: SessionUnit, source: UnitSource): Promise<UnitResult> {
-  if (await source.fenced(unit)) return { fenced: true, manifests: [], lines: 0 };
+export async function exportUnit(
+  target: ExportTarget,
+  unit: SessionUnit,
+  source: UnitSource,
+  opts: { freshFence?: boolean; onKey?: (manifestKey: string) => void } = {},
+): Promise<UnitResult> {
+  if (await source.fenced(unit, opts.freshFence)) return { fenced: true, manifests: [], lines: 0 };
   const streams = new Map<string, MachineStream>();
   let lines = 0;
   for await (const line of source.lines(unit)) {
@@ -384,6 +430,9 @@ export async function exportUnit(target: ExportTarget, unit: SessionUnit, source
         if (other.key === stream.key)
           throw Object.assign(new Error("two machines map to one key"), { code: "machine_key_collision" });
       streams.set(line.machine, stream);
+      // Recorded before anything is written under this prefix, so a failed run
+      // still leaves the key in the watermark for a later erasure.
+      opts.onKey?.(stream.key);
     }
     await stream.push(line);
   }

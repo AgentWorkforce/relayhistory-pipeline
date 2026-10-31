@@ -7,6 +7,7 @@ import type { Queryable } from "../relayhistory-export.ts";
 import { deleteExported, exportUnit, type ExportTarget } from "./export-session.ts";
 import {
   activityPage,
+  fencedGroups,
   lockWaiters,
   neonUnitSource,
   revisionsPage,
@@ -30,6 +31,8 @@ export interface SyncConfig {
   actSweepEveryMs: number;
   progressEveryMs: number;
   idleSleepMs: number;
+  /** Re-read exports older than this when idle (0 = never). */
+  reverifyMs: number;
   lockGuard: LockGuard;
 }
 
@@ -39,6 +42,7 @@ export const DEFAULT_SYNC_CONFIG: SyncConfig = {
   actSweepEveryMs: 30 * 60 * 1000,
   progressEveryMs: 60 * 1000,
   idleSleepMs: 30 * 1000,
+  reverifyMs: 14 * 24 * 60 * 60 * 1000,
   lockGuard: { maxNonAdvisory: 3, maxTotal: 25, pauseMs: 2 * 60 * 1000, checkEveryMs: 30 * 1000 },
 };
 
@@ -152,6 +156,9 @@ export class Syncer {
       after = rows.at(-1)!;
     }
     if (this.stopped()) return;
+    // Fences change without a revision bump: re-export (erase) what they now cover.
+    const forced = this.state.forceChanged(await fencedGroups(this.db));
+    if (forced) this.log({ message: "fenced after export", count: forced });
     this.state.setMeta("rev_sweep_done", String(id));
     this.state.setMeta("rev_sweep_at", String(this.throttle.now()));
     this.#dropUnseen();
@@ -196,19 +203,24 @@ export class Syncer {
   async processGroup(work: WorkItem, lane = this.lanes[0]!): Promise<boolean> {
     const prior = this.state.exported(work.org_id, work.session_id);
     const t0 = this.throttle.now();
+    // Every key this run may write under, recorded before the write.
+    const touched = new Set<string>();
     try {
       const keys: string[] = [];
       if (work.kind !== "delete") {
         const units = await sessionUnits(lane.db, work.org_id, work.session_id);
         await this.hook(units.length, 0);
         for (const unit of units) {
-          const r = await exportUnit(this.target, unit, lane.source);
+          const r = await exportUnit(this.target, unit, lane.source, {
+            // Work driven by a change must see a fence written with that change.
+            freshFence: work.kind !== "recent" && work.kind !== "history",
+            onKey: (k) => touched.add(k),
+          });
           if (r.fenced) this.counters.fenced += 1;
           for (const m of r.manifests) {
             keys.push(m.manifestKey);
-            if (m.written) {
-              this.counters.manifestsWritten += 1;
-            } else this.counters.manifestsUnchanged += 1;
+            if (m.written) this.counters.manifestsWritten += 1;
+            else this.counters.manifestsUnchanged += 1;
             this.counters.chunksSealed += m.chunksSealed;
             this.counters.chunksReused += m.chunksReused;
             this.counters.objectsDeleted += m.deletedObjects;
@@ -219,7 +231,7 @@ export class Syncer {
         }
       }
       const keep = new Set(keys);
-      for (const key of prior?.keys ?? [])
+      for (const key of new Set([...(prior?.keys ?? []), ...touched]))
         if (!keep.has(key)) this.counters.objectsDeleted += await deleteExported(this.target, work.org_id, key);
       this.state.markExported(work.org_id, work.session_id, work.revision, keys);
       this.counters.groups += 1;
@@ -229,7 +241,7 @@ export class Syncer {
       return true;
     } catch (error) {
       const code = errorCode(error);
-      this.state.markFailed(work.org_id, work.session_id, code);
+      this.state.markFailed(work.org_id, work.session_id, code, [...touched], work.revision);
       this.counters.groupsFailed += 1;
       this.log({ message: "group failed", error_code: code, kind: work.kind });
       if (isConnectionError(error)) throw error;
@@ -268,7 +280,7 @@ export class Syncer {
     let done = 0;
     while (!this.stopped()) {
       await this.sweepsIfDue();
-      const work = this.state.nextWork(this.throttle.now(), this.cfg.recentMs, 25);
+      const work = this.state.nextWork(this.throttle.now(), this.cfg.recentMs, 25, this.cfg.reverifyMs);
       if (work.length === 0) {
         this.progress();
         if (opts.once) break;

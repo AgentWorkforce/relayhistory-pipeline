@@ -12,10 +12,10 @@
  *   S3X_CREDS_FILE       writer/exporter key: {"accessKeyId","secretAccessKey","sessionToken"?}
  *                        (else AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN)
  *   S3X_ERASER_CREDS_FILE  the eraser key, same shape: the only principal allowed to delete
- *                        (required with --execute; erasure is part of the contract)
+ *                        (without it, a group needing a delete fails with eraser_unavailable and is retried)
  *   S3X_BUCKET, S3X_EXPECT_BUCKET, S3X_REGION (us-east-1), S3X_ENDPOINT (MinIO)
- *   S3X_SSE              unset for sessions-prod (bucket default SSE-KMS; its policy refuses
- *                        `aws:kms` without the key id). aws:kms | AES256 for other stores.
+ *   S3X_SSE              aws:kms | AES256; for sessions-prod `aws:kms` with S3X_SSE_KMS_KEY_ID
+ *   S3X_SSE_KMS_KEY_ID   the bucket's key ARN (its policy refuses `aws:kms` without it)
  *   S3X_KEY_ROOT         96bulls
  *   S3X_GRANT_ID         neon-s3-sync
  *   S3X_STATE            SQLite watermark path
@@ -27,7 +27,7 @@
  * Logs are JSON lines of counts and codes only: never content, ids of
  * sessions, keys or credentials.
  */
-import { readFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { createS3Store, objectKey, ObjectStoreError, type ObjectStore } from "../../shared/vendor.ts";
 import type { Queryable } from "../relayhistory-export.ts";
@@ -78,7 +78,7 @@ function credentialsFrom(file: string | undefined, fallbackEnv: boolean) {
     if (!c.accessKeyId || !c.secretAccessKey) throw new Error("a credentials file lacks accessKeyId/secretAccessKey");
     return { accessKeyId: c.accessKeyId, secretAccessKey: c.secretAccessKey, ...(c.sessionToken ? { sessionToken: c.sessionToken } : {}) };
   }
-  if (!fallbackEnv) throw new Error("S3X_ERASER_CREDS_FILE is required with --execute");
+  if (!fallbackEnv) return undefined;
   const accessKeyId = env("AWS_ACCESS_KEY_ID");
   const secretAccessKey = env("AWS_SECRET_ACCESS_KEY");
   if (!accessKeyId || !secretAccessKey) throw new Error("no S3 credentials (S3X_CREDS_FILE or AWS_* env)");
@@ -94,18 +94,30 @@ function storeFromEnv(execute: boolean): ObjectStore {
   const sse = env("S3X_SSE");
   if (sse && sse !== "aws:kms" && sse !== "AES256") throw new Error("S3X_SSE must be aws:kms or AES256");
   const endpoint = env("S3X_ENDPOINT");
-  const store = (credentials: ReturnType<typeof credentialsFrom>) =>
+  const kmsKey = env("S3X_SSE_KMS_KEY_ID");
+  if (kmsKey && !/^arn:aws:kms:[a-z0-9-]+:\d{12}:key\/[0-9a-f-]{36}$/.test(kmsKey))
+    throw new Error("S3X_SSE_KMS_KEY_ID must be a KMS key ARN");
+  const store = (credentials: NonNullable<ReturnType<typeof credentialsFrom>>) =>
     createS3Store({
       bucket,
       region: env("S3X_REGION", "us-east-1")!,
       ...(endpoint ? { endpoint } : {}),
       credentials,
       ...(sse ? { serverSideEncryption: sse as "aws:kms" | "AES256" } : {}),
+      ...(kmsKey ? { sseKmsKeyId: kmsKey } : {}),
     });
-  return splitStore(
-    store(credentialsFrom(env("S3X_CREDS_FILE"), true)),
-    store(credentialsFrom(env("S3X_ERASER_CREDS_FILE"), false)),
-  );
+  const writer = store(credentialsFrom(env("S3X_CREDS_FILE"), true)!);
+  const eraserCreds = credentialsFrom(env("S3X_ERASER_CREDS_FILE"), false);
+  // Without the eraser key, a delete fails the group with `eraser_unavailable`:
+  // its keys stay in the watermark and it is retried once the key is supplied.
+  const eraser = eraserCreds
+    ? store(eraserCreds)
+    : ({
+        delete: async () => {
+          throw Object.assign(new Error("no eraser key"), { code: "eraser_unavailable" });
+        },
+      } as Pick<ObjectStore, "delete"> as ObjectStore);
+  return splitStore(writer, eraser);
 }
 
 export async function main() {
@@ -115,6 +127,24 @@ export async function main() {
   if (!url) throw new Error("NEON_URL_FILE (or NEON_URL) is required");
   const store = storeFromEnv(execute);
   const statePath = env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state${execute ? "" : "-dry"}.sqlite`)!;
+  // One exporter per watermark: two would delete each other's freshly sealed chunks.
+  const lockPath = `${statePath}.lock`;
+  let lockFd: number;
+  try {
+    lockFd = openSync(lockPath, "wx", 0o600);
+  } catch {
+    const pid = Number(readFileSync(lockPath, "utf8").trim());
+    let alive = false;
+    try {
+      process.kill(pid, 0);
+      alive = Number.isInteger(pid) && pid > 0;
+    } catch {}
+    if (alive) throw Object.assign(new Error("another exporter holds the state lock"), { code: "state_locked" });
+    unlinkSync(lockPath);
+    lockFd = openSync(lockPath, "wx", 0o600);
+  }
+  writeSync(lockFd, String(process.pid));
+  closeSync(lockFd);
   const state = new SyncState(statePath);
   const throttle = new Throttle({
     rowsPerSec: Number(env("S3X_ROWS_PER_SEC", "1500")),
@@ -159,6 +189,9 @@ export async function main() {
     await syncer.run({ once: flag("once"), ...(maxGroups ? { maxGroups: Number(maxGroups) } : {}) });
   } finally {
     state.close();
+    try {
+      unlinkSync(lockPath);
+    } catch {}
     for (const c of clients) await c.end().catch(() => undefined);
   }
 }

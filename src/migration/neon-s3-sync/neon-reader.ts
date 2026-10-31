@@ -232,7 +232,8 @@ export interface StreamLine {
 }
 
 export interface UnitSource {
-  fenced(unit: SessionUnit): Promise<boolean>;
+  /** `fresh` bypasses the fence cache (a changed session must see a tombstone written with its change). */
+  fenced(unit: SessionUnit, fresh?: boolean): Promise<boolean>;
   lines(unit: SessionUnit): AsyncIterable<StreamLine>;
 }
 
@@ -320,32 +321,51 @@ export const SMALL_SESSION_ROWS = 4000;
  * `deletionFenced` query.
  */
 function fenceCache(db: Queryable, ttlMs = 120_000) {
+  const LIMIT = 1_000_000;
   let loaded = 0;
   let tombstones = new Set<string>();
   let resets = new Set<string>();
   const k = (...parts: string[]) => JSON.stringify(parts);
-  return async (unit: SessionUnit): Promise<boolean> => {
-    if (Date.now() - loaded > ttlMs) {
-      const t = await db.query<{ org_id: string; workspace_id: string; source: string; session_id: string }>(
-        "SELECT org_id, workspace_id, source, session_id FROM sessions.deleted_upload_sessions LIMIT 1000000",
-      );
-      const r = await db.query<{ org_id: string; workspace_id: string }>(
-        "SELECT DISTINCT org_id, workspace_id FROM sessions.session_resets LIMIT 1000000",
-      );
-      tombstones = new Set(t.rows.map((x) => k(x.org_id, x.workspace_id, x.source, x.session_id)));
-      resets = new Set(r.rows.map((x) => k(x.org_id, x.workspace_id)));
-      loaded = Date.now();
-    }
-    if (tombstones.has(k(unit.orgId, unit.workspaceId, unit.source, unit.sessionId))) return true;
-    if (!resets.has(k(unit.orgId, unit.workspaceId))) return false;
-    return deletionFenced(db, {
+  const perSession = (unit: SessionUnit) =>
+    deletionFenced(db, {
       org_id: unit.orgId,
       workspace_id: unit.workspaceId,
       source: unit.source,
       session_id: unit.sessionId,
       last_ts: "",
     });
+  return async (unit: SessionUnit, fresh = false): Promise<boolean> => {
+    if (fresh) return perSession(unit);
+    if (Date.now() - loaded > ttlMs) {
+      const t = await db.query<{ org_id: string; workspace_id: string; source: string; session_id: string }>(
+        `SELECT org_id, workspace_id, source, session_id FROM sessions.deleted_upload_sessions LIMIT ${LIMIT + 1}`,
+      );
+      const r = await db.query<{ org_id: string; workspace_id: string }>(
+        `SELECT DISTINCT org_id, workspace_id FROM sessions.session_resets LIMIT ${LIMIT + 1}`,
+      );
+      // Fail closed rather than miss a fence past the cap.
+      if (t.rows.length > LIMIT || r.rows.length > LIMIT) return perSession(unit);
+      tombstones = new Set(t.rows.map((x) => k(x.org_id, x.workspace_id, x.source, x.session_id)));
+      resets = new Set(r.rows.map((x) => k(x.org_id, x.workspace_id)));
+      loaded = Date.now();
+    }
+    if (tombstones.has(k(unit.orgId, unit.workspaceId, unit.source, unit.sessionId))) return true;
+    if (!resets.has(k(unit.orgId, unit.workspaceId))) return false;
+    return perSession(unit);
   };
+}
+
+/** Every `(org, session)` a deletion fence covers: the sweep re-exports (erases) the exported ones. */
+export async function fencedGroups(db: Queryable): Promise<{ org_id: string; session_id: string }[]> {
+  const { rows } = await db.query<{ org_id: string; session_id: string }>(
+    `SELECT DISTINCT org_id, session_id FROM sessions.deleted_upload_sessions
+     UNION
+     SELECT DISTINCT x.org_id, x.session_id FROM sessions.session_resets r
+       JOIN sessions.delivery_records x
+         ON x.org_id = r.org_id AND x.workspace_id = r.workspace_id AND x.user_id = r.user_id AND x.kind = 'session'
+     LIMIT 100000`,
+  );
+  return rows;
 }
 
 interface SmallRow extends DeliveryRow {
@@ -384,7 +404,11 @@ export function neonUnitSource(
       // Fast path: a session of at most SMALL_SESSION_ROWS delivery rows in one
       // statement (the common case; Neon is ~80 ms away, so round trips dominate).
       const small = await db.query<SmallRow>(
-        `SELECT d.kind, d.origin_id, d.record_id, d.revision::text AS revision, d.operation,
+        `WITH d AS MATERIALIZED (
+           SELECT * FROM sessions.delivery_records
+            WHERE org_id = $1 AND workspace_id = $2 AND kind = ANY ($3::text[]) AND source = $4 AND session_id = $5
+            LIMIT $6)
+         SELECT d.kind, d.origin_id, d.record_id, d.revision::text AS revision, d.operation,
                 d.received_at::text AS received_at,
                 CASE WHEN d.operation = 'upsert' THEN d.payload::text END AS payload_json,
                 d.user_id,
@@ -402,11 +426,8 @@ export function neonUnitSource(
                            WHERE e.org_id = d.org_id AND e.workspace_id = d.workspace_id
                              AND e.delivery_record_id = d.record_id
                              AND e.machine_id = ${DELIVERY_MACHINE_SQL}) END AS has_event
-           FROM sessions.delivery_records d
-          WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.kind = ANY ($3::text[])
-            AND d.source = $4 AND d.session_id = $5
-          ORDER BY array_position($3::text[], d.kind), d.origin_id, d.record_id
-          LIMIT $6`,
+           FROM d
+          ORDER BY array_position($3::text[], d.kind), d.origin_id, d.record_id`,
         [unit.orgId, unit.workspaceId, [...RECORD_KINDS], unit.source, unit.sessionId, smallRows + 1, [...CATALOG_KINDS]],
       );
       await onPage(small.rows.length, small.rows.reduce((n, r) => n + (r.payload_json?.length ?? 0), 0));
@@ -537,7 +558,8 @@ async function* undelivered(
   pageRows: number,
 ): AsyncIterable<StreamLine> {
   const select = `SELECT e.machine_id, e.kind, e.event_id, e.user_id, e.ingested_at::text AS created_at,
-            ((to_jsonb(e) - 'org_id' - 'workspace_id')
+            ((to_jsonb(e) - 'org_id' - 'workspace_id' - 'embedding' - 'embedding_model' - 'embedding_dim'
+                - 'content_hash' - 'generated_at' - 'embedding_skip_reason')
               || jsonb_build_object('ts_ms', floor(extract(epoch FROM e.ts) * 1000)::bigint))::text AS row_json
        FROM sessions.convergence_events e`;
   const emit = (row: EventRow): StreamLine => {
