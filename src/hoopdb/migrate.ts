@@ -21,8 +21,12 @@ const UPSTREAM_MIGRATIONS = join(ROOT, "supabase/migrations");
 const SHIM = join(ROOT, "supabase/tests/supabase_shim.sql");
 // Privileged and idempotent. On Supabase and CNPG a deploy step runs it as a superuser
 // before migrate (runbooks/session-directory-search-worker-bootstrap.md); here it then
-// only verifies the role, and fails closed if it is absent or differs.
+// only verifies the bare role spec, on every run (never ledgered), and fails closed if
+// the role is absent or differs.
 const WORKER_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_directory_search_worker.sql");
+// Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
+// role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
+const WORKER_VERIFY = join(ROOT, "supabase/bootstrap/session_directory_search_worker_verify.sql");
 const OURS = join(ROOT, "src/hoopdb/migrations");
 
 export const MIGRATION_LEDGER = "sessions.__96bulls_migrations";
@@ -42,6 +46,9 @@ export async function plan(): Promise<Step[]> {
       : []),
     ...upstream.map((f) => ({ name: `upstream:${f}`, path: join(UPSTREAM_MIGRATIONS, f) })),
     ...ours.map((f) => ({ name: `96bulls:${f}`, path: join(OURS, f) })),
+    ...(flag("HOOPDB_ROLE_VERIFY", true)
+      ? [{ name: "verify:session_directory_search_worker", path: WORKER_VERIFY }]
+      : []),
   ];
 }
 
@@ -80,6 +87,21 @@ export async function migrate(): Promise<{ applied: number; skipped: number }> {
     }
     for (const step of await plan()) {
       const sql = await readFile(step.path, "utf8");
+      // The role checks (phase 1 bootstrap, phase 2 verify) run on every migrate, each in
+      // its own transaction, and are never recorded in the ledger.
+      if (step.name.startsWith("bootstrap:") || step.name.startsWith("verify:")) {
+        await client.query("BEGIN");
+        try {
+          await client.query(sql);
+          await client.query("COMMIT");
+        } catch (err) {
+          await client.query("ROLLBACK");
+          log.error("role check failed", { reason: step.name, error_code: (err as { code?: string }).code ?? "role_check_failed" });
+          throw err;
+        }
+        log.info("role check passed", { reason: step.name });
+        continue;
+      }
       const sha = createHash("sha256").update(sql).digest("hex");
       const seen = ledger.get(step.name);
       if (seen === sha) {

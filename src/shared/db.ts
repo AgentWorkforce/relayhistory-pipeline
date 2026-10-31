@@ -67,9 +67,9 @@ export async function waitForHoopDb(db: HoopDb, timeoutMs = 120_000): Promise<vo
   }
 }
 
-/** Ledger steps that provision roles on plain Postgres only (`shim:`, `bootstrap:`), never schema. */
+/** Plan steps that provision or check roles (`shim:`, `bootstrap:`, `verify:`): never schema, never awaited. */
 export function isPrerequisiteStep(name: string): boolean {
-  return name.startsWith("shim:") || name.startsWith("bootstrap:");
+  return name.startsWith("shim:") || name.startsWith("bootstrap:") || name.startsWith("verify:");
 }
 
 /**

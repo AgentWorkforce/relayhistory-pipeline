@@ -2199,3 +2199,178 @@ describe("short_summary rollback", () => {
     ).toHaveLength(1);
   });
 });
+
+describe("Worker role validation in two phases", () => {
+  const PHASE1 = read("supabase/bootstrap/session_directory_search_worker.sql");
+  const PHASE2 = read(
+    "supabase/bootstrap/session_directory_search_worker_verify.sql",
+  );
+  const outcome = async (db: PGlite, sql: string) =>
+    (await db.exec(sql).then(
+      () => null,
+      (caught: unknown) => caught,
+    )) as { code?: string; message?: string } | null;
+  const PHASE2_PREFIX =
+    "verify session_directory_search_worker: the role does not match the approved grants";
+
+  test("phase 1 alone: the bare role passes before any schema object or grant exists", async () => {
+    const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+    open.push(db);
+    await db.exec(read("supabase/tests/supabase_shim.sql"));
+    expect(await outcome(db, PHASE1)).toBeNull();
+    expect(await outcome(db, PHASE1)).toBeNull();
+    expect(
+      (await db.query("SELECT 1 FROM pg_namespace WHERE nspname = 'sessions'"))
+        .rows,
+    ).toEqual([]);
+  });
+
+  test("phase 2 alone, before the migrations: fails, naming every missing RPC and grant", async () => {
+    const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+    open.push(db);
+    await db.exec(read("supabase/tests/supabase_shim.sql"));
+    await db.exec(PHASE1);
+    await db.exec("CREATE SCHEMA sessions");
+    const error = await outcome(db, PHASE2);
+    expect(error?.code).toBe("55000");
+    expect(error?.message).toContain(PHASE2_PREFIX);
+    for (const sig of [
+      RPC_SIGNATURE,
+      "sessions.session_directory_pointers(text, text, text)",
+      "sessions.session_directory_readiness()",
+    ])
+      expect(error?.message).toContain(`approved RPC missing: ${sig}`);
+    expect(error?.message).toContain("missing USAGE on schema sessions");
+  });
+
+  test("phase 2 after the full migration: the approved grants pass, both phases rerun cleanly, and the role holds exactly them", async () => {
+    const db = await hoopDatabase();
+    expect(await outcome(db, PHASE2)).toBeNull();
+    expect(await outcome(db, PHASE1)).toBeNull();
+    expect(await outcome(db, PHASE2)).toBeNull();
+    const fns = await db.query<{ fn: string }>(
+      `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p, aclexplode(p.proacl) a
+        JOIN pg_roles r ON r.oid = a.grantee WHERE r.rolname = $1 ORDER BY 1`,
+      [WORKER],
+    );
+    const approved = await db.query<{ fn: string }>(
+      `SELECT unnest(ARRAY[
+         to_regprocedure($1)::text,
+         'sessions.session_directory_pointers(text,text,text)',
+         'sessions.session_directory_readiness()']) AS fn ORDER BY 1`,
+      [RPC_SIGNATURE],
+    );
+    expect(fns.rows).toEqual(approved.rows);
+    expect(fns.rows).toHaveLength(3);
+  });
+
+  test("phase 2 ignores PUBLIC-derived EXECUTE: only aclitems naming the role count", async () => {
+    const db = await hoopDatabase();
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.session_directory_worker_scope(text) TO PUBLIC",
+    );
+    expect(await outcome(db, PHASE2)).toBeNull();
+  });
+
+  test("phase 2 accepts the separately approved authenticator binding, and only that shape", async () => {
+    const db = await hoopDatabase();
+    await db.exec(
+      `CREATE ROLE authenticator NOLOGIN NOINHERIT; GRANT ${WORKER} TO authenticator`,
+    );
+    expect(await outcome(db, PHASE2)).toBeNull();
+    await db.exec(`REVOKE ${WORKER} FROM authenticator`);
+    await db.exec(`GRANT ${WORKER} TO authenticator WITH ADMIN OPTION`);
+    const error = await outcome(db, PHASE2);
+    expect(error?.code).toBe("55000");
+    expect(error?.message).toContain("granted to authenticator");
+  });
+
+  const DRIFT: Array<[string, string, string]> = [
+    [
+      "an unapproved table privilege",
+      `GRANT SELECT ON sessions.session_directory TO ${WORKER}`,
+      "has privileges on table sessions.session_directory",
+    ],
+    [
+      "a column privilege",
+      `GRANT SELECT (org_id) ON sessions.session_directory TO ${WORKER}`,
+      "has privileges on column org_id of table sessions.session_directory",
+    ],
+    [
+      "EXECUTE on a non-approved function",
+      `GRANT EXECUTE ON FUNCTION sessions.session_directory_worker_scope(text) TO ${WORKER}`,
+      "has privileges on function sessions.session_directory_worker_scope(text)",
+    ],
+    [
+      "a default privilege",
+      `ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO ${WORKER}`,
+      "has privileges on default privileges",
+    ],
+    [
+      "a sequence privilege",
+      `CREATE SEQUENCE sessions.g6_drift_seq; GRANT USAGE ON SEQUENCE sessions.g6_drift_seq TO ${WORKER}`,
+      "has privileges on sequence sessions.g6_drift_seq",
+    ],
+    [
+      "a privilege on schema sessions other than USAGE",
+      `GRANT CREATE ON SCHEMA sessions TO ${WORKER}`,
+      "schema sessions: privileges other than USAGE",
+    ],
+    [
+      "an approved RPC WITH GRANT OPTION",
+      `GRANT EXECUTE ON FUNCTION sessions.session_directory_readiness() TO ${WORKER} WITH GRANT OPTION`,
+      "sessions.session_directory_readiness(): privileges other than EXECUTE",
+    ],
+    [
+      "an owned object",
+      `CREATE TABLE public.g6_drift (x int); ALTER TABLE public.g6_drift OWNER TO ${WORKER}`,
+      "owns table g6_drift",
+    ],
+    [
+      "a database privilege",
+      `DO $g$ BEGIN EXECUTE format('GRANT CONNECT ON DATABASE %I TO ${WORKER}', current_database()); END $g$`,
+      "has privileges on database",
+    ],
+    [
+      "an RLS policy naming the role",
+      `CREATE POLICY g6_drift ON sessions.session_directory FOR SELECT TO ${WORKER} USING (true)`,
+      "is named in policy",
+    ],
+    [
+      "a missing approved RPC",
+      "DROP FUNCTION sessions.session_directory_readiness()",
+      "approved RPC missing: sessions.session_directory_readiness()",
+    ],
+    [
+      "a redefined approved RPC (a different signature)",
+      `DROP FUNCTION sessions.session_directory_pointers(text, text, text);
+      CREATE FUNCTION sessions.session_directory_pointers(p_workspace_id text, p_session_id text)
+        RETURNS integer LANGUAGE sql AS 'SELECT 1';
+      GRANT EXECUTE ON FUNCTION sessions.session_directory_pointers(text, text) TO ${WORKER}`,
+      "approved RPC redefined: sessions.session_directory_pointers(text,text)",
+    ],
+    [
+      "a revoked approved grant",
+      `REVOKE EXECUTE ON FUNCTION sessions.session_directory_readiness() FROM ${WORKER}`,
+      "missing EXECUTE on sessions.session_directory_readiness()",
+    ],
+    [
+      "a revoked schema USAGE",
+      `REVOKE USAGE ON SCHEMA sessions FROM ${WORKER}`,
+      "missing USAGE on schema sessions",
+    ],
+  ];
+  for (const [name, change, problem] of DRIFT) {
+    test(`phase 2 after the full migration fails closed (55000) on ${name}; phase 1 does not look at grants`, async () => {
+      const db = await hoopDatabase();
+      expect(await outcome(db, PHASE2)).toBeNull();
+      await db.exec(change);
+      const error = await outcome(db, PHASE2);
+      expect(error?.code).toBe("55000");
+      expect(error?.message).toContain(PHASE2_PREFIX);
+      expect(error?.message).toContain(problem);
+      // Phase 1 is the bare-role check; grants are phase 2's.
+      expect(await outcome(db, PHASE1)).toBeNull();
+    });
+  }
+});

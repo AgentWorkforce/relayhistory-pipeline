@@ -1,4 +1,13 @@
--- Privileged bootstrap for the session directory search Worker role.
+-- Phase 1: privileged bootstrap for the session directory search Worker role.
+--
+-- Two phases, run by every deploy:
+--   phase 1 (this file)  before migrate: provision the bare role, or verify that it
+--                        matches the role spec. It does not look at grants: before
+--                        20261030020000 there are none, and afterwards they belong to
+--                        phase 2.
+--   phase 2              after all migrations:
+--                        supabase/bootstrap/session_directory_search_worker_verify.sql
+--                        checks the role spec plus the exact direct-grant allowlist.
 --
 -- Interface (stable; the deploy-time provisioning in self-hosted-lead's #75 runs this):
 --   role      session_directory_search_worker
@@ -12,10 +21,9 @@
 --             role is accepted only on PostgreSQL 15 and older, where creating a role
 --             grants the creator nothing. On 16+ it would get ADMIN OPTION on the role,
 --             which the migration's role guard refuses, so this file refuses it first.
---   when      before the migration run that first applies
---             supabase/migrations/20261030020000_session_directory_short_summary.sql
---             (the migration fails closed, 42704, if the role is absent). It is safe
---             to run again before every migrate.
+--   when      before every migrate. It must run before the migration run that first
+--             applies supabase/migrations/20261030020000_session_directory_short_summary.sql
+--             (the migration fails closed, 42704, if the role is absent).
 --   exit      success: the role exists exactly as specified (created now or already).
 --             failure: SQLSTATE 42501 (caller may not create it) or 55000 (an existing
 --             role differs; nothing is changed). It never alters an existing role.

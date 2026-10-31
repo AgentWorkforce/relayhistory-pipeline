@@ -45,6 +45,8 @@ migration needs the `btree_gin` extension (available on Supabase) for its
 tenant-scoped trigram index. It does not create the NOLOGIN role
 `session_directory_search_worker`: the privileged, idempotent
 `../bootstrap/session_directory_search_worker.sql` provisions it first, and the
-migration verifies it exactly or fails closed before any DDL (runbook:
+migration verifies it exactly or fails closed before any DDL. After all migrations,
+`../bootstrap/session_directory_search_worker_verify.sql` checks its exact grants on every deploy
+(runbook:
 `runbooks/session-directory-search-worker-bootstrap.md`). The tests run the shim, then
 the bootstrap, then every migration; PGlite tests load `btree_gin` alongside `pg_trgm`.
