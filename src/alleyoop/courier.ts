@@ -491,9 +491,7 @@ const blankUpload = () => ({
   adopting: false,
 });
 
-export async function runCourierOnce(
-  cfg: CourierConfig,
-): Promise<{
+export async function runCourierOnce(cfg: CourierConfig): Promise<{
   sessions: number;
   uploaded: number;
   chunks: number;
