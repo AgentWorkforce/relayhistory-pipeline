@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { dataPathVerdict, workloadReady } from "../data-path.ts";
+import { dataPathVerdict, liveDataPathVerdict, workloadReady, workloadReadyLive } from "../data-path.ts";
 
 const armed = {
   WORKER_DATA_PATH_PROBE: "1",
@@ -9,6 +9,9 @@ const armed = {
   CLOUD_SQL_CONNECTION_NAME: "agentworkforce-dev1:us-central1:awf-dev-postgres",
   REDIS_HOST: "10.52.0.3",
   REDIS_PORT: "6379",
+  REDIS_AUTH_ENABLED: "false",
+  REDIS_TRANSIT_ENCRYPTION: "SERVER_AUTHENTICATION",
+  REDIS_TLS_CA_PEM: "-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n",
   PUBSUB_TOPIC: "projects/agentworkforce-dev1/topics/awf-dev-events",
   PUBSUB_SUBSCRIPTION: "projects/agentworkforce-dev1/subscriptions/awf-dev-events-worker",
 };
@@ -70,5 +73,13 @@ describe("data-path readiness", () => {
     expect(JSON.stringify(sql)).not.toContain("super-secret");
     expect(JSON.stringify(sql)).not.toContain("redis-secret");
     expect(workloadReady(true, { ...armed, LOCKER_BUCKET: "  " })).toEqual({ ok: false, missing: ["LOCKER_BUCKET"] });
+  });
+
+  test("requires a successful live TLS round trip when armed", async () => {
+    expect(await liveDataPathVerdict(armed, async () => ({ ok: true }))).toEqual({ ok: true, armed: true });
+    expect(await liveDataPathVerdict(armed, async () => ({ ok: false, reason: "tls_failed" })))
+      .toEqual({ ok: false, armed: true, missing: ["REDIS_TLS_ROUND_TRIP"] });
+    expect(await workloadReadyLive(true, armed, async () => ({ ok: true }))).toEqual({ ok: true });
+    expect(await workloadReadyLive(false, armed, async () => ({ ok: true }))).toEqual({ ok: false });
   });
 });

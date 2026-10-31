@@ -1,10 +1,42 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
+import versionsLock from "../../versions.lock.json";
 
 export const GCP_CONFIRM_PROJECT_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT";
 export const GCP_CONFIRM_SQL_POST_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_SQL_POST";
 export const GCP_APPLY_NONCE_ENV = "NINETY_SIX_BULLS_GCP_APPLY_NONCE";
+export const GCP_APPLICATION_PROOF_STAGE = "gcp-conformance";
+
+export type AlchemyStackCommand =
+  | "provider"
+  | "deploy"
+  | "dev"
+  | "destroy"
+  | "plan"
+  | "logs"
+  | "profile"
+  | "state"
+  | "drift"
+  | "unsafe";
+
+const ALCHEMY_STACK_COMMANDS = new Set<AlchemyStackCommand>([
+  "provider",
+  "deploy",
+  "dev",
+  "destroy",
+  "plan",
+  "logs",
+  "profile",
+  "state",
+  "drift",
+  "unsafe",
+]);
+
+/** Mirror Alchemy's first-known-command scan without importing its CLI. */
+export function requestedAlchemyCommand(argv: readonly string[] = process.argv.slice(2)): AlchemyStackCommand | undefined {
+  return argv.find((value): value is AlchemyStackCommand => ALCHEMY_STACK_COMMANDS.has(value as AlchemyStackCommand));
+}
 
 /** The only project this lane may plan. Any other id, number, org, billing account, or region is refused. */
 export const GCP_APPROVED_TARGET = {
@@ -21,6 +53,22 @@ export const RELAYCAST_PUBLISHED_CHART = {
   repository: "ghcr.io/agentworkforce/relaycast-self-host",
   imageDigest: "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
   packageDigest: "cdfc41cb6202fd81beb17cb57d5fbbdecaf27fa427f51faa07c5ec0fc116744f",
+} as const;
+
+/**
+ * The only services image the GCP proof may run. Updating a digest alone is
+ * insufficient: the release commit must record the exact source revision and
+ * explicitly make that pair eligible after its image build succeeds.
+ */
+export const GCP_APPROVED_SERVICES_IMAGE = {
+  digest: versionsLock.images.services.digest,
+  sourceRevision: versionsLock.images.services.sourceRevision,
+  eligible: versionsLock.images.services.gcpProofEligible,
+} as const;
+
+export const GCP_REDIS_CLIENT = {
+  authEnabled: "false",
+  transitEncryption: "SERVER_AUTHENTICATION",
 } as const;
 
 /**
@@ -45,6 +93,7 @@ export const GCP_RUNTIME_SHAPE = {
 /** Node identity only. Not the Workload Identity runtime account, and not a key. */
 export const GCP_NODE_ROLES = [
   "roles/container.defaultNodeServiceAccount",
+  "roles/artifactregistry.reader",
 ] as const;
 
 export interface CapturedRelaycastChartPackage {
@@ -163,8 +212,14 @@ export interface GcpInputs {
     chartVersion: string;
     tenantOrgId: string;
     existingSecretName: string;
+    /** Digest of the services image built from the reviewed runtime commit. */
+    imageDigest: string;
+    /** Full Git revision from which imageDigest was built. Must match versions.lock.json. */
+    imageSourceRevision: string;
     /** Public HTTPS or the in-cluster RelayAuth service. Alleyoop refuses to render without it. */
     relayauthJwksUrl: string;
+    /** Exact token issuer: public HTTPS or the in-cluster RelayAuth service origin. */
+    relayauthIssuer: string;
   };
 }
 
@@ -237,7 +292,11 @@ function requirePublicHttpsOrigin(label: string, value: string): URL {
   return origin;
 }
 
-export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
+export function assertGcpInputs(
+  stage: string,
+  inputs: GcpInputs,
+  requestedCommand?: AlchemyStackCommand,
+): void {
   if (!GCP_STAGE.test(stage)) throw new Error(`96bulls: GCP config requires a safe gcp-* stage, got ${stage}`);
   if (!PROJECT_ID.test(inputs.projectId)) throw new Error("96bulls: gcp projectId is invalid");
   if (!PROJECT_NUMBER.test(inputs.projectNumber)) throw new Error("96bulls: gcp projectNumber is invalid");
@@ -328,21 +387,54 @@ export function assertGcpInputs(stage: string, inputs: GcpInputs): void {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(inputs.bulls96.tenantOrgId))
       throw new Error("96bulls: bulls96.tenantOrgId must be an org id, never a URL or credential");
     requireSecretName("bulls96.existingSecretName", inputs.bulls96.existingSecretName);
+    if (!/^sha256:[a-f0-9]{64}$/.test(inputs.bulls96.imageDigest))
+      throw new Error("96bulls: bulls96.imageDigest must be an immutable sha256 digest");
+    if (!/^[a-f0-9]{40}$/.test(inputs.bulls96.imageSourceRevision))
+      throw new Error("96bulls: bulls96.imageSourceRevision must be a full Git commit SHA");
     requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", inputs.bulls96.relayauthJwksUrl);
+    requireRelayauthIssuer("bulls96.relayauthIssuer", inputs.bulls96.relayauthIssuer);
+    if (inputs.relayauth?.baseUrl && inputs.bulls96.relayauthIssuer !== inputs.relayauth.baseUrl)
+      throw new Error("96bulls: bulls96.relayauthIssuer must match relayauth.baseUrl for the in-stage RelayAuth release");
+    if (requestedCommand !== "destroy" && stage !== GCP_APPLICATION_PROOF_STAGE)
+      throw new Error(
+        `96bulls: the approved services image is published only for ${GCP_APPLICATION_PROOF_STAGE}; ${stage} cannot install 96Bulls. Nothing was created.`,
+      );
+    if (requestedCommand !== "destroy")
+      requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
   }
 }
 
+function requireApprovedGcpServicesImage(digest: string, sourceRevision: string): void {
+  if (
+    digest !== GCP_APPROVED_SERVICES_IMAGE.digest ||
+    sourceRevision !== GCP_APPROVED_SERVICES_IMAGE.sourceRevision
+  )
+    throw new Error(
+      "96bulls: GCP runtime image digest/source revision does not match the reviewed release in versions.lock.json. Nothing was created.",
+    );
+  if (!GCP_APPROVED_SERVICES_IMAGE.eligible)
+    throw new Error(
+      "96bulls: the recorded services image is not approved for the GCP application proof. Publish and review a current image first. Nothing was created.",
+    );
+}
+
 /** Defense in depth for runtime wiring; the stack's poster remains apply-only. */
-export function assertGcpRuntimeDeployable(inputs: GcpInputs): void {
+export function assertGcpRuntimeDeployable(
+  stage: string,
+  inputs: GcpInputs,
+  requestedCommand?: AlchemyStackCommand,
+): void {
   if (
     inputs.bulls96?.enabled &&
     (!inputs.managedDataPlane.provision || inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
   )
     throw new Error("96bulls: GCP runtime wiring requires the acknowledged managed data plane. Nothing was created.");
-  if (inputs.bulls96?.enabled)
+  if (inputs.bulls96?.enabled && requestedCommand !== "destroy" && stage !== GCP_APPLICATION_PROOF_STAGE)
     throw new Error(
-      "96bulls: GCP 96Bulls wiring is held until the external Redis TLS CA/client round-trip contract is proven. Nothing was created.",
+      `96bulls: the approved services image is published only for ${GCP_APPLICATION_PROOF_STAGE}; ${stage} cannot install 96Bulls. Nothing was created.`,
     );
+  if (inputs.bulls96?.enabled && requestedCommand !== "destroy")
+    requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
 }
 
 export function assertGcpSqlPostConfirmation(
@@ -415,13 +507,19 @@ export function relayfileChartValues(i: RelayfileChartInputs) {
 export interface Bulls96ReleaseOutputs {
   bucket: unknown;
   region: string;
+  /** Digest-pinned repository in the stage's private Artifact Registry. */
+  imageRepository: unknown;
   cloudSqlConnectionName: unknown;
   redisHost: unknown;
   redisPort: unknown;
+  /** Public Memorystore service-CA bundle, never a private key or AUTH value. */
+  redisCaPem: unknown;
   pubsubTopic: unknown;
   pubsubSubscription: unknown;
   workloadIdentityEmail: string;
 }
+
+const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 
 function requireRelayauthJwksUrl(label: string, value: string): void {
   let jwks: URL;
@@ -447,18 +545,125 @@ function requireRelayauthJwksUrl(label: string, value: string): void {
     throw new Error(`96bulls: ${label} must be public HTTPS or the in-cluster RelayAuth service`);
 }
 
-/**
- * Fail closed until the application consumes Memorystore's CA and a real
- * TLS round-trip has passed. Static SERVER_AUTHENTICATION environment values
- * are not evidence that the Redis client negotiated TLS.
- */
+function requireRelayauthIssuer(label: string, value: string): void {
+  let issuer: URL;
+  try {
+    issuer = new URL(value);
+  } catch {
+    throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`);
+  }
+  const hostname = issuer.hostname.replace(/\.$/, "").toLowerCase();
+  const inCluster =
+    issuer.protocol === "http:" &&
+    /^relayauth\.[a-z0-9-]+\.svc(?:\.cluster\.local)?$/.test(hostname);
+  const publicHttps =
+    issuer.protocol === "https:" &&
+    hostname.includes(".") &&
+    hostname !== "localhost" &&
+    !hostname.endsWith(".localhost") &&
+    !hostname.endsWith(".local") &&
+    isIP(hostname) === 0;
+  if (
+    issuer.username ||
+    issuer.password ||
+    (!inCluster && !publicHttps) ||
+    issuer.pathname !== "/" ||
+    issuer.search ||
+    issuer.hash
+  ) throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`);
+}
+
+function plainSetting(label: string, value: unknown): void {
+  if (typeof value !== "string") return;
+  if (value.includes("://") || value.includes("@") || value.includes("BEGIN "))
+    throw new Error(`96bulls: ${label} must not carry a URL, credential, or key. Nothing was created.`);
+}
+
+function publicCaBundle(value: unknown): void {
+  if (typeof value !== "string") return;
+  if (
+    value.length > 131_072 ||
+    value.includes("PRIVATE KEY") ||
+    !value.includes("-----BEGIN CERTIFICATE-----") ||
+    !value.includes("-----END CERTIFICATE-----")
+  ) throw new Error("96bulls: Redis service CA bundle is malformed. Nothing was created.");
+}
+
+/** Published chart values backed by pod identity, an external Secret, and a live Redis TLS readiness probe. */
 export function bulls96ReleaseValues(
-  _i: NonNullable<GcpInputs["bulls96"]>,
-  _managed: Bulls96ReleaseOutputs,
-): never {
-  throw new Error(
-    "96bulls: GCP 96Bulls wiring is held until the external Redis TLS CA/client round-trip contract is proven. Nothing was created.",
-  );
+  i: NonNullable<GcpInputs["bulls96"]>,
+  managed: Bulls96ReleaseOutputs,
+): Record<string, unknown> {
+  if (!GSA_EMAIL.test(managed.workloadIdentityEmail))
+    throw new Error("96bulls: workload identity email is not a service-account email. Nothing was created.");
+  for (const [label, value] of [
+    ["bucket", managed.bucket],
+    ["region", managed.region],
+    ["imageRepository", managed.imageRepository],
+    ["cloudSqlConnectionName", managed.cloudSqlConnectionName],
+    ["redisHost", managed.redisHost],
+    ["pubsubTopic", managed.pubsubTopic],
+    ["pubsubSubscription", managed.pubsubSubscription],
+  ] as const) plainSetting(label, value);
+  publicCaBundle(managed.redisCaPem);
+  if (typeof managed.redisPort === "string" && !/^[0-9]+$/.test(managed.redisPort))
+    throw new Error("96bulls: redis port must be numeric. Nothing was created.");
+  const redisPort = typeof managed.redisPort === "number" ? String(managed.redisPort) : managed.redisPort;
+  requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", i.relayauthJwksUrl);
+  requireRelayauthIssuer("bulls96.relayauthIssuer", i.relayauthIssuer);
+  const identity = { "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail };
+  const dataEnv = () => [
+    { name: "LOCKER_PROVIDER", value: "gcs" },
+    { name: "PIPELINE_RAW_PROVIDER", value: "gcs" },
+    { name: "PIPELINE_RAW_S3_BUCKET", value: managed.bucket },
+    { name: "CLOUD_SQL_CONNECTION_NAME", value: managed.cloudSqlConnectionName },
+    { name: "REDIS_HOST", value: managed.redisHost },
+    { name: "REDIS_PORT", value: redisPort },
+    { name: "REDIS_AUTH_ENABLED", value: GCP_REDIS_CLIENT.authEnabled },
+    { name: "REDIS_TRANSIT_ENCRYPTION", value: GCP_REDIS_CLIENT.transitEncryption },
+    { name: "REDIS_TLS_CA_PEM", value: managed.redisCaPem },
+    { name: "PUBSUB_TOPIC", value: managed.pubsubTopic },
+    { name: "PUBSUB_SUBSCRIPTION", value: managed.pubsubSubscription },
+    { name: "WORKER_DATA_PATH_PROBE", value: "1" },
+  ];
+  const locker = () => ({
+    endpoint: "",
+    bucket: managed.bucket,
+    region: managed.region,
+    credentials: { mode: "podIdentity" as const },
+  });
+  const hoopdb = () => ({ existingSecret: i.existingSecretName, key: "HOOPDB_URL" });
+  const imagePullSecrets: Array<{ name: string }> = [];
+  const image = { repository: managed.imageRepository, digest: i.imageDigest };
+  return {
+    global: { tenant: { orgId: i.tenantOrgId } },
+    worker: {
+      existingSecret: i.existingSecretName,
+      imagePullSecrets,
+      image,
+      hoopdb: hoopdb(),
+      locker: locker(),
+      lockerInit: { enabled: false },
+      migrations: { supabaseShim: true },
+      summaryEncryption: { existingSecret: i.existingSecretName, key: "SUMMARY_MASTER_KEYS" },
+      serviceAccount: { annotations: { ...identity } },
+      tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
+      extraEnv: dataEnv(),
+    },
+    alleyoop: {
+      existingSecret: i.existingSecretName,
+      imagePullSecrets,
+      image,
+      hoopdb: hoopdb(),
+      locker: locker(),
+      auth: { jwksUrl: i.relayauthJwksUrl, issuer: i.relayauthIssuer },
+      serviceAccount: { annotations: { ...identity } },
+      tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
+      extraEnv: dataEnv(),
+    },
+    hoopdb: { enabled: false },
+    locker: { enabled: false },
+  };
 }
 
 export function relayflowsChartValues(i: RelayflowsChartInputs, defaultStorageClass = "standard-rwo") {

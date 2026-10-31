@@ -97,9 +97,41 @@ async function fixture() {
     send: async (_env, _stage, message) => void sent.push(message),
   });
   const app = new Hono<AppEnv>();
+  let auth = {
+    userId: "user",
+    orgId: ORG,
+    workspaceId: WORKSPACE,
+    tokenSubject: "agent_relayhistory_assertion",
+    scopes: ["rth:sync"],
+    claims: {},
+    historyOrigin: "https://history.example",
+  };
   app.use("*", async (c, next) => {
     c.set("correlationId", "test");
-    c.set("auth", {
+    const explicit = c.req.header("x-test-auth");
+    c.set("auth", explicit === "migration" ? {
+      userId: "user",
+      orgId: ORG,
+      workspaceId: WORKSPACE,
+      tokenSubject: "agent_relayhistory_migration",
+      scopes: ["rth:sync"],
+      claims: {
+        meta: {
+          tokenClass: "migration_assertion",
+          grantId: "mgr_export",
+          planDigest: "a".repeat(64),
+        },
+      },
+      historyOrigin: "https://history.example",
+    } : explicit === "malformed" ? {
+      userId: "user",
+      orgId: ORG,
+      workspaceId: WORKSPACE,
+      tokenSubject: "agent_relayhistory_migration",
+      scopes: ["rth:sync"],
+      claims: { meta: { tokenClass: "migration_assertion" } },
+      historyOrigin: "https://history.example",
+    } : explicit === "live" ? {
       userId: "user",
       orgId: ORG,
       workspaceId: WORKSPACE,
@@ -107,7 +139,7 @@ async function fixture() {
       scopes: ["rth:sync"],
       claims: {},
       historyOrigin: "https://history.example",
-    });
+    } : auth);
     await next();
   });
   app.route("/v1", routes);
@@ -116,12 +148,84 @@ async function fixture() {
     RELAYHISTORY_ORIGIN: "https://history.example",
     PIPELINE_TELEMETRY_ID_KEY: TELEMETRY_KEY,
   };
-  const post = (body: unknown) => app.request("/v1/pipeline/manifests", {
+  const post = (body: unknown, explicitAuth?: "live" | "migration" | "malformed") => app.request("/v1/pipeline/manifests", {
     method: "POST",
-    headers: { "content-type": "application/json", "x-machine-id": MACHINE, "x-session-id": SESSION },
+    headers: {
+      "content-type": "application/json",
+      "x-machine-id": MACHINE,
+      "x-session-id": SESSION,
+      ...(explicitAuth ? { "x-test-auth": explicitAuth } : {}),
+    },
     body: JSON.stringify(body),
   }, env);
-  return { store, reader, location, build, sent, app, env, post };
+  const asLive = () => {
+    auth = {
+      userId: "user",
+      orgId: ORG,
+      workspaceId: WORKSPACE,
+      tokenSubject: "agent_relayhistory_assertion",
+      scopes: ["rth:sync"],
+      claims: {},
+      historyOrigin: "https://history.example",
+    };
+  };
+  const asMigration = () => {
+    auth = {
+      userId: "user",
+      orgId: ORG,
+      workspaceId: WORKSPACE,
+      tokenSubject: "agent_relayhistory_migration",
+      scopes: ["rth:sync"],
+      claims: {
+        meta: {
+          tokenClass: "migration_assertion",
+          grantId: "mgr_export",
+          planDigest: "a".repeat(64),
+        },
+      },
+      historyOrigin: "https://history.example",
+    };
+  };
+  const appendEpoch = async (
+    previous: ManifestV1,
+    reason: "backfill" | "rewritten",
+    openedBy: string,
+    text: string,
+  ): Promise<ManifestV1> => {
+    const epoch = previous.raw.epoch + 1;
+    const seq = previous.raw.chunks.length;
+    const sealed = await sealRawChunk(store, {
+      location,
+      format: "jsonl",
+      seq,
+      epoch,
+      startOffset: 0,
+      source: new TextEncoder().encode(`${text}\n`),
+      traceId: TRACE,
+    });
+    const chunks = [...previous.raw.chunks, sealed.entry];
+    return {
+      ...structuredClone(previous),
+      revision: previous.revision + 1,
+      updated_at: new Date(Date.parse(previous.updated_at) + 1).toISOString(),
+      raw: {
+        ...structuredClone(previous.raw),
+        updated_at: new Date(Date.parse(previous.raw.updated_at) + 1).toISOString(),
+        chunk_count: chunks.length,
+        raw_bytes: chunks.reduce((sum, chunk) => sum + chunk.bytes, 0),
+        stored_bytes: chunks.reduce((sum, chunk) => sum + chunk.stored_bytes, 0),
+        content_sha256: await computeContentSha256(chunks),
+        epoch,
+        epochs: [
+          ...structuredClone(previous.raw.epochs),
+          { epoch, opened_at: AT, reason, first_seq: seq, opened_by: openedBy },
+        ],
+        next_offset: sealed.entry.bytes,
+        chunks,
+      },
+    };
+  };
+  return { store, reader, location, build, sent, app, env, post, asLive, asMigration, appendEpoch };
 }
 
 describe("AlleyOop courier manifest routes", () => {
@@ -160,6 +264,176 @@ describe("AlleyOop courier manifest routes", () => {
     expect(update.status).toBe(202);
     const stored = await f.reader.read(key);
     expect(stored?.manifest.revision).toBe(2);
+  });
+
+  test("appends one migration-fenced backfill epoch without taking the live owner", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const live = await f.build(1);
+    const first = await f.post({ key, manifest: live });
+    const firstBody = await first.json() as { version: { eTag?: string } };
+
+    f.asMigration();
+    const backfill = await f.appendEpoch(
+      live,
+      "backfill",
+      "migration:mgr_export",
+      '{"kind":"session_event","origin_id":"o","record_id":"old","revision":"1","received_at":"2026-10-01T00:00:00Z","payload":{"ts_ms":1}}',
+    );
+    backfill.extensions = {
+      ...backfill.extensions,
+      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+    };
+    const appended = await f.post({ key, manifest: backfill, previousVersion: firstBody.version });
+    expect(appended.status).toBe(202);
+    const appendedBody = await appended.json() as { version: { eTag?: string } };
+    const stored = (await f.reader.read(key))!.manifest;
+    expect(stored.raw.owner).toBe(MACHINE);
+    expect(stored.writer.delivery_instance_id).toBe(MACHINE);
+    expect(stored.raw.epochs.at(-1)).toMatchObject({
+      reason: "backfill",
+      opened_by: "migration:mgr_export",
+    });
+
+    // Exact replay stays idempotent, but cannot be used to bypass the
+    // migration assertion and enqueue the export under a live identity.
+    f.asLive();
+    expect((await f.post({ key, manifest: backfill })).status).toBe(409);
+    f.asMigration();
+    expect((await f.post({ key, manifest: backfill })).status).toBe(202);
+
+    // The live owner can continue only from the exact post-backfill version.
+    f.asLive();
+    const resumed = await f.appendEpoch(
+      stored,
+      "rewritten",
+      MACHINE,
+      '{"type":"assistant","text":"after T0"}',
+    );
+    const response = await f.post({ key, manifest: resumed, previousVersion: appendedBody.version });
+    expect(response.status).toBe(202);
+    expect((await f.reader.read(key))?.manifest.raw.epochs.map((epoch) => epoch.reason)).toEqual([
+      "initial",
+      "backfill",
+      "rewritten",
+    ]);
+  });
+
+  test("creates a cold export only under the migration grant owner", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const wrongOwner = await f.build(1, "migration:another_grant");
+    wrongOwner.raw.owner = "migration:another_grant";
+    wrongOwner.raw.epochs[0]!.opened_by = "migration:another_grant";
+    wrongOwner.extensions = {
+      ...wrongOwner.extensions,
+      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+    };
+    expect((await f.post({ key, manifest: wrongOwner }, "migration")).status).toBe(409);
+
+    const cold = await f.build(1, "migration:mgr_export");
+    cold.raw.owner = "migration:mgr_export";
+    cold.raw.epochs[0]!.opened_by = "migration:mgr_export";
+    cold.extensions = {
+      ...cold.extensions,
+      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+    };
+    const retries = await Promise.all([
+      f.post({ key, manifest: cold }, "migration"),
+      f.post({ key, manifest: cold }, "migration"),
+    ]);
+    expect(retries.map((response) => response.status)).toEqual([202, 202]);
+  });
+
+  test("rejects migration rewrites, owner changes, and unbound migration assertions", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const live = await f.build(1);
+    const first = await f.post({ key, manifest: live });
+    const firstBody = await first.json() as { version: { eTag?: string } };
+    f.asMigration();
+    const backfill = await f.appendEpoch(
+      live,
+      "backfill",
+      "migration:mgr_export",
+      '{"kind":"session_event","origin_id":"o","record_id":"old","revision":"1","received_at":"2026-10-01T00:00:00Z","payload":{"ts_ms":1}}',
+    );
+    backfill.extensions = {
+      ...backfill.extensions,
+      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+    };
+    const changedOwner = structuredClone(backfill);
+    changedOwner.raw.owner = "migration:mgr_export";
+    expect((await f.post({ key, manifest: changedOwner, previousVersion: firstBody.version })).status).toBe(409);
+    const rewritten = structuredClone(backfill);
+    rewritten.raw.chunks[0]!.records = 999;
+    expect((await f.post({ key, manifest: rewritten, previousVersion: firstBody.version })).status).toBe(409);
+
+    // A normal rth:sync assertion cannot use the migration-only epoch reason.
+    f.asLive();
+    expect((await f.post({ key, manifest: backfill, previousVersion: firstBody.version })).status).toBe(409);
+    expect((await f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "malformed")).status).toBe(409);
+  });
+
+  test("serializes a live append and backfill append on the same object version", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const live = await f.build(1);
+    const first = await f.post({ key, manifest: live });
+    const firstBody = await first.json() as { version: { eTag?: string } };
+    const backfill = await f.appendEpoch(
+      live,
+      "backfill",
+      "migration:mgr_export",
+      '{"kind":"session_event","origin_id":"o","record_id":"old","revision":"1","received_at":"2026-10-01T00:00:00Z","payload":{"ts_ms":1}}',
+    );
+    backfill.extensions = {
+      ...backfill.extensions,
+      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+    };
+    const liveAppend = await f.appendEpoch(
+      live,
+      "rewritten",
+      MACHINE,
+      '{"type":"assistant","text":"live"}',
+    );
+
+    // Drive the two authenticated attempts concurrently. Exactly one CAS can
+    // replace the version they both read; the loser must reread and rebuild.
+    const migrationAttempt = f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration");
+    const liveAttempt = f.post({ key, manifest: liveAppend, previousVersion: firstBody.version }, "live");
+    const statuses = (await Promise.all([migrationAttempt, liveAttempt])).map((response) => response.status).sort();
+    expect(statuses).toEqual([202, 409]);
+    expect((await f.reader.read(key))?.manifest.revision).toBe(2);
+  });
+
+  test("treats concurrent byte-identical migration CAS retries as success", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const live = await f.build(1);
+    const first = await f.post({ key, manifest: live });
+    const firstBody = await first.json() as { version: { eTag?: string } };
+    const backfill = await f.appendEpoch(
+      live,
+      "backfill",
+      "migration:mgr_export",
+      '{"kind":"session_event","origin_id":"o","record_id":"old","revision":"1","received_at":"2026-10-01T00:00:00Z","payload":{"ts_ms":1}}',
+    );
+    backfill.extensions = {
+      ...backfill.extensions,
+      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+    };
+
+    const attempts = await Promise.all([
+      f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration"),
+      f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration"),
+    ]);
+    expect(attempts.map((response) => response.status)).toEqual([202, 202]);
+    const bodies = await Promise.all(
+      attempts.map((response) => response.json() as Promise<{ workKey: string; version: { eTag?: string } }>),
+    );
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect((await f.reader.read(key))?.manifest).toEqual(backfill);
   });
 
   test("checks ownership and server-sealed chunks before writing", async () => {

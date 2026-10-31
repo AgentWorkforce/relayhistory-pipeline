@@ -47,7 +47,15 @@ export function requireScope(scope: string) {
  * have). Enabled by `ALLOW_INTERIM_RELAYAUTH_BEARER=true`; verifies an RS256
  * JWT against `RELAYAUTH_JWKS_URL` and sets `auth` on the context.
  */
-import { IdentityError, verifyAgentRelayToken } from "../auth/relayauth.js";
+import {
+  IdentityError,
+  verifyAgentRelayToken,
+  verifyMigrationAssertion,
+} from "../auth/relayauth.js";
+import {
+  migrationPairAuthorized,
+  migrationRouteAllowed,
+} from "../lib/pipeline/migration-assertions.js";
 
 export const requireAuth = createMiddleware<AppEnv>(async (c, next) => {
   const header = c.req.header("Authorization") ?? "";
@@ -57,14 +65,25 @@ export const requireAuth = createMiddleware<AppEnv>(async (c, next) => {
   if (!token) return deny(401, "missing_authorization", "missing Authorization header");
   if (token.startsWith("rth_at_") || token.startsWith("rth_st_"))
     return deny(401, "unsupported_token", "opaque relayhistory tokens are not supported by this deployment");
-  if (c.env?.ALLOW_INTERIM_RELAYAUTH_BEARER !== "true")
+  // As upstream: the broad interim bearer verifies any RelayAuth JWT; the
+  // dedicated, default-off RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS path
+  // admits only migration assertions, and a migration assertion needs that
+  // flag on either path (auth/relayauth.ts).
+  const interim = c.env?.ALLOW_INTERIM_RELAYAUTH_BEARER === "true";
+  const migrationOnly = !interim && c.env?.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS === "true";
+  if (!interim && !migrationOnly)
     return deny(401, "auth_not_configured", "bearer auth is not enabled (ALLOW_INTERIM_RELAYAUTH_BEARER)");
+  let auth: AuthContext;
   try {
-    const auth = await verifyAgentRelayToken(token, c.env);
-    c.set("auth", auth);
+    auth = interim ? await verifyAgentRelayToken(token, c.env) : await verifyMigrationAssertion(token, c.env);
   } catch (err) {
     if (err instanceof IdentityError) return deny(401, err.code, err.message);
     throw err;
   }
+  if (auth.migration && !migrationRouteAllowed(c.req.method, c.req.path))
+    return deny(403, "migration_assertion_route", "migration assertions are accepted only by the pipeline upload routes");
+  if (auth.migration && !migrationPairAuthorized(auth))
+    return deny(403, "migration_workspace_forbidden", "the migration assertion's signed workspace and user are not its grant pair");
+  c.set("auth", auth);
   await next();
 });
