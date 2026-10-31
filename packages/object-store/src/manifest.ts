@@ -19,6 +19,21 @@ import {
 export const MANIFEST_SCHEMA_VERSION = 1;
 /** `opened_by` of a backfill epoch: `migration:{grant_id}`. */
 export const MIGRATION_ID_PREFIX = "migration:";
+/**
+ * A writer or reader that understands `backfill` and `resumed` epochs. Bump the
+ * suffix on any change an older one would misread. A backfill stays refused
+ * until the session's writer and every reader advertise it.
+ */
+export const MANIFEST_EPOCHS_CAPABILITY = "manifest-epochs-v2";
+/**
+ * Client releases known to adopt a backfill and resume after it. Allowlisted
+ * here because `writer.capabilities` is only what a client says of itself.
+ */
+export const KNOWN_CLIENT_RELEASES: Readonly<
+  Record<string, readonly string[]>
+> = {
+  "96bulls-courier/0.3.0": [MANIFEST_EPOCHS_CAPABILITY],
+};
 /** The exporter's own extension key. */
 export const EXPORT_EXTENSION = "client.relayhistory_export";
 
@@ -191,6 +206,7 @@ export const ManifestV1Schema = z
         delivery_instance_id: z.string().min(1),
         plugin_version: z.string().min(1),
         host_version: z.string().optional(),
+        capabilities: z.array(z.string().min(1)).optional(),
       })
       .loose(),
     raw: z
@@ -705,6 +721,15 @@ export function chunkKeys(
         manifest.raw.format,
       ),
     }));
+}
+
+/** The session's last writer can adopt a backfill epoch and resume after it. */
+export function writerUnderstandsBackfill(manifest: ManifestV1): boolean {
+  return (
+    KNOWN_CLIENT_RELEASES[manifest.writer.plugin_version]?.includes(
+      MANIFEST_EPOCHS_CAPABILITY,
+    ) ?? false
+  );
 }
 
 /** A chunk of a backfill before it has a place in the manifest. */

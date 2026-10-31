@@ -99,7 +99,7 @@ afterEach(() => {
 });
 
 describe("stage registry", () => {
-  it("registers the seven queued stages, two of them implemented", () => {
+  it("registers the queued stages", () => {
     expect(QUEUED_STAGES).toEqual([
       "object-landed",
       "session-indexed",
@@ -108,10 +108,11 @@ describe("stage registry", () => {
       "status-classify",
       "file-normalize",
       "file-maintenance",
+      "backfill-activation",
     ]);
     expect(
       QUEUED_STAGES.filter((stage) => STAGE_REGISTRY[stage].implemented),
-    ).toEqual(["object-landed", "session-indexed"]);
+    ).toEqual(["object-landed", "session-indexed", "backfill-activation"]);
     const bindings = new Set<string>();
     for (const stage of QUEUED_STAGES) {
       const definition = STAGE_REGISTRY[stage];

@@ -13,6 +13,10 @@ import {
   type StageHandler,
   type StageMessage,
   type StageQueueDeps,
+  attestReader,
+  postgresReadinessStore,
+  selfCheckManifestEpochs,
+  type ManifestReaderName,
 } from "./vendor.ts";
 import { openHoopDb, waitForHoopDb, waitForSchema, type HoopDb } from "./db.ts";
 import { ctxOf, enrichMessage } from "./enrich.ts";
@@ -28,48 +32,110 @@ export interface WorkerOptions {
   service: string;
   stages: QueuedStage[];
   /** Builds the handlers once the database is open. */
-  handlers: (db: HoopDb, current: () => StageMessage | undefined) => Partial<Record<QueuedStage, StageHandler>>;
+  handlers: (
+    db: HoopDb,
+    current: () => StageMessage | undefined,
+  ) => Partial<Record<QueuedStage, StageHandler>>;
   /** Extra vendored implementations (e.g. the session index). */
-  impl?: (db: HoopDb, current: () => StageMessage | undefined) => Omit<PipelineImplementations, "handlers" | "queue" | "deadLetters" | "sink">;
+  impl?: (
+    db: HoopDb,
+    current: () => StageMessage | undefined,
+  ) => Omit<
+    PipelineImplementations,
+    "handlers" | "queue" | "deadLetters" | "sink"
+  >;
+  /** Manifest readers in this process. They attest at startup, once the key exists. */
+  attests?: ManifestReaderName[];
   /** Runs once per loop tick, for side loops such as reconcile. */
   tick?: (db: HoopDb, now: Date) => Promise<void>;
+}
+
+/**
+ * Attest each reader this process hosts. An unattested reader only keeps the
+ * gate closed, so a failure here is logged and never stops the worker.
+ */
+async function attestReaders(readers: ManifestReaderName[], db: HoopDb) {
+  const key = process.env.MANIFEST_READINESS_KEY;
+  if (!key) return;
+  const store = postgresReadinessStore(db);
+  for (const reader of readers) {
+    try {
+      await attestReader({
+        reader,
+        key,
+        store,
+        selfCheck: selfCheckManifestEpochs,
+      });
+      log.info("manifest reader attested", { reader });
+    } catch (err) {
+      log.warn("manifest reader did not attest", {
+        reader,
+        ...errorFields(err),
+      });
+    }
+  }
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Wraps a handler so its work runs in a span on the message's trace, with allowlisted attrs. */
-export function traced(stage: QueuedStage, handler: StageHandler): StageHandler {
+export function traced(
+  stage: QueuedStage,
+  handler: StageHandler,
+): StageHandler {
   return async (message, recorder, attempt) => {
     const ctx = ctxOf(message);
-    return withSpan(`stage ${stage}`, {
-      traceparent: ctx.traceparent,
-      attrs: {
-        stage,
-        attempt,
-        trace_id: message.ctx.traceId,
-        session_uuid: ctx.session_uuid,
-        tenant_id: ctx.tenant_id ?? message.ctx.orgId,
-        workspace_id: message.ctx.workspaceId,
-        harness: message.ctx.harness,
-        revision: message.revision,
+    return withSpan(
+      `stage ${stage}`,
+      {
+        traceparent: ctx.traceparent,
+        attrs: {
+          stage,
+          attempt,
+          trace_id: message.ctx.traceId,
+          session_uuid: ctx.session_uuid,
+          tenant_id: ctx.tenant_id ?? message.ctx.orgId,
+          workspace_id: message.ctx.workspaceId,
+          harness: message.ctx.harness,
+          revision: message.revision,
+        },
       },
-    }, async (span) => {
-      const started = Date.now();
-      try {
-        const out = await handler(message, recorder, attempt);
-        span.setAttribute("outcome", out && typeof out === "object" && out.status === "skipped" ? "skipped" : "ok");
-        log.info("stage handled", {
-          stage, attempt, outcome: out && typeof out === "object" ? out.status : "ok",
-          trace_id: message.ctx.traceId, session_uuid: ctx.session_uuid, duration_ms: Date.now() - started,
-        });
-        return out;
-      } catch (err) {
-        const fields = errorFields(err);
-        span.setAttribute("outcome", fields.retryable === false ? "quarantined" : "retry");
-        log.warn("stage failed", { stage, attempt, trace_id: message.ctx.traceId, session_uuid: ctx.session_uuid, ...fields });
-        throw err;
-      }
-    });
+      async (span) => {
+        const started = Date.now();
+        try {
+          const out = await handler(message, recorder, attempt);
+          span.setAttribute(
+            "outcome",
+            out && typeof out === "object" && out.status === "skipped"
+              ? "skipped"
+              : "ok",
+          );
+          log.info("stage handled", {
+            stage,
+            attempt,
+            outcome: out && typeof out === "object" ? out.status : "ok",
+            trace_id: message.ctx.traceId,
+            session_uuid: ctx.session_uuid,
+            duration_ms: Date.now() - started,
+          });
+          return out;
+        } catch (err) {
+          const fields = errorFields(err);
+          span.setAttribute(
+            "outcome",
+            fields.retryable === false ? "quarantined" : "retry",
+          );
+          log.warn("stage failed", {
+            stage,
+            attempt,
+            trace_id: message.ctx.traceId,
+            session_uuid: ctx.session_uuid,
+            ...fields,
+          });
+          throw err;
+        }
+      },
+    );
   };
 }
 
@@ -96,9 +162,15 @@ export interface WorkerHealth {
  * waits for HoopDb or the schema, so a long batch, reconcile or migration is
  * never mistaken for a stall.
  */
-export function healthVerdict(h: WorkerHealth, now: number, opts: { maxFailures: number; maxTickAgeMs: number }) {
-  if (h.consecutiveDbFailures >= opts.maxFailures) return { ok: false, reason: "hoopdb_unreachable" };
-  if (now - h.lastTickAt > opts.maxTickAgeMs) return { ok: false, reason: "loop_stalled" };
+export function healthVerdict(
+  h: WorkerHealth,
+  now: number,
+  opts: { maxFailures: number; maxTickAgeMs: number },
+) {
+  if (h.consecutiveDbFailures >= opts.maxFailures)
+    return { ok: false, reason: "hoopdb_unreachable" };
+  if (now - h.lastTickAt > opts.maxTickAgeMs)
+    return { ok: false, reason: "loop_stalled" };
   return { ok: true, reason: h.ready ? "ok" : "starting" };
 }
 
@@ -114,46 +186,72 @@ function serveHealth(health: WorkerHealth, port: number) {
     if (req.url === "/readyz") {
       void workloadReadyLive(readyVerdict(health, { maxFailures }), process.env)
         .then((verdict) => {
-          res.writeHead(verdict.ok ? 200 : 503, { "content-type": "application/json" });
+          res.writeHead(verdict.ok ? 200 : 503, {
+            "content-type": "application/json",
+          });
           res.end(JSON.stringify(verdict));
         })
         .catch(() => {
           res.writeHead(503, { "content-type": "application/json" });
-          res.end(JSON.stringify({ ok: false, missing: ["REDIS_TLS_ROUND_TRIP"] }));
+          res.end(
+            JSON.stringify({ ok: false, missing: ["REDIS_TLS_ROUND_TRIP"] }),
+          );
         });
       return;
     }
     if (req.url === "/datapathz") {
       void liveDataPathVerdict(process.env)
         .then((verdict) => {
-          res.writeHead(verdict.ok ? 200 : 503, { "content-type": "application/json" });
-          res.end(JSON.stringify(verdict.ok ? { ok: true, armed: verdict.armed } : { ok: false, missing: verdict.missing }));
+          res.writeHead(verdict.ok ? 200 : 503, {
+            "content-type": "application/json",
+          });
+          res.end(
+            JSON.stringify(
+              verdict.ok
+                ? { ok: true, armed: verdict.armed }
+                : { ok: false, missing: verdict.missing },
+            ),
+          );
         })
         .catch(() => {
           res.writeHead(503, { "content-type": "application/json" });
-          res.end(JSON.stringify({ ok: false, missing: ["REDIS_TLS_ROUND_TRIP"] }));
+          res.end(
+            JSON.stringify({ ok: false, missing: ["REDIS_TLS_ROUND_TRIP"] }),
+          );
         });
       return;
     }
     if (req.url === "/healthz") {
-      const v = healthVerdict(health, Date.now(), { maxFailures, maxTickAgeMs });
+      const v = healthVerdict(health, Date.now(), {
+        maxFailures,
+        maxTickAgeMs,
+      });
       res.writeHead(v.ok ? 200 : 503, { "content-type": "application/json" });
       res.end(JSON.stringify(v));
       return;
     }
     res.writeHead(404).end();
   });
-  server.listen(port, "0.0.0.0", () => log.info("worker health listening", { port }));
+  server.listen(port, "0.0.0.0", () =>
+    log.info("worker health listening", { port }),
+  );
 }
 
 export async function runWorker(opts: WorkerOptions): Promise<never> {
   process.env.OTEL_SERVICE_NAME ||= opts.service;
   initTelemetry(opts.service);
-  const health: WorkerHealth = { ready: false, lastTickAt: Date.now(), consecutiveDbFailures: 0 };
+  const health: WorkerHealth = {
+    ready: false,
+    lastTickAt: Date.now(),
+    consecutiveDbFailures: 0,
+  };
   serveHealth(health, integer("WORKER_HEALTH_PORT", 8081));
   const db = openHoopDb();
   // Waiting for HoopDb or a long migration is progress, not a stall.
-  const startupBeat = setInterval(() => (health.lastTickAt = Date.now()), 10_000);
+  const startupBeat = setInterval(
+    () => (health.lastTickAt = Date.now()),
+    10_000,
+  );
   await waitForHoopDb(db);
   await waitForSchema(db, await expectedMigrationNames());
   clearInterval(startupBeat);
@@ -166,9 +264,18 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   // Everything sent from inside a stage carries the ids of the message being handled.
   const queue = {
     backend: rawQueue.backend,
-    send: async (m: StageMessage, options?: Parameters<typeof rawQueue.send>[1]) => rawQueue.send(await enrichMessage(m), options),
-    sendBatch: async (ms: readonly StageMessage[], options?: Parameters<typeof rawQueue.sendBatch>[1]) =>
-      rawQueue.sendBatch(await Promise.all(ms.map((m) => enrichMessage(m))), options),
+    send: async (
+      m: StageMessage,
+      options?: Parameters<typeof rawQueue.send>[1],
+    ) => rawQueue.send(await enrichMessage(m), options),
+    sendBatch: async (
+      ms: readonly StageMessage[],
+      options?: Parameters<typeof rawQueue.sendBatch>[1],
+    ) =>
+      rawQueue.sendBatch(
+        await Promise.all(ms.map((m) => enrichMessage(m))),
+        options,
+      ),
   };
   const impl = opts.impl?.(db, currentRef) ?? {};
   const handlers = opts.handlers(db, currentRef);
@@ -194,6 +301,7 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
       }
     };
   }
+  await attestReaders(opts.attests ?? [], db);
   const idleMs = integer("WORKER_IDLE_MS", 1_000);
   const batchSize = integer("WORKER_BATCH_SIZE", 10);
   const leaseSeconds = integer("WORKER_LEASE_SECONDS", 300);
@@ -216,21 +324,40 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
       health.consecutiveDbFailures = 0;
     } catch (err) {
       health.consecutiveDbFailures += 1;
-      log.warn("hoopdb probe failed", { count: health.consecutiveDbFailures, ...errorFields(err) });
+      log.warn("hoopdb probe failed", {
+        count: health.consecutiveDbFailures,
+        ...errorFields(err),
+      });
     }
     health.lastTickAt = Date.now();
     for (const stage of opts.stages) {
       try {
-        const r = await pollPostgresStage({ sql: db, stage, deps, batchSize, leaseSeconds });
+        const r = await pollPostgresStage({
+          sql: db,
+          stage,
+          deps,
+          batchSize,
+          leaseSeconds,
+        });
         claimed += r.claimed;
-        if (r.claimed) log.info("poll", { stage, claimed: r.claimed, acked: r.acked, retried: r.retried, exhausted: r.exhausted });
+        if (r.claimed)
+          log.info("poll", {
+            stage,
+            claimed: r.claimed,
+            acked: r.acked,
+            retried: r.retried,
+            exhausted: r.exhausted,
+          });
       } catch (err) {
         log.error("poll failed", { stage, ...errorFields(err) });
       }
     }
     if (opts.tick) {
       // Long side work (reconcile) keeps the progress clock moving while it runs.
-      const tickBeat = setInterval(() => (health.lastTickAt = Date.now()), 10_000);
+      const tickBeat = setInterval(
+        () => (health.lastTickAt = Date.now()),
+        10_000,
+      );
       try {
         await opts.tick(db, new Date());
       } catch (err) {

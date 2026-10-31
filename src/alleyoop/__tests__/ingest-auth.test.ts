@@ -51,6 +51,9 @@ import {
   type Bindings,
   type SessionLocation,
   type SqlExecutor,
+  attestReader,
+  MANIFEST_READERS,
+  postgresReadinessStore,
 } from "../../shared/vendor.ts";
 import { sqlPipelineEventSink } from "../../hoopdb/sink.ts";
 import { buildIngestApp } from "../ingest.ts";
@@ -283,6 +286,16 @@ async function ingest(
     process.env.ALLOW_INTERIM_RELAYAUTH_BEARER =
       extra.ALLOW_INTERIM_RELAYAUTH_BEARER;
   const store = (opts.wrapStore ?? ((s) => s))(createFsStore({ root }));
+  // Every reader attests: the gate has its own tests, these are about the ingest.
+  process.env.MANIFEST_READINESS_KEY = "test-readiness-key";
+  for (const reader of MANIFEST_READERS)
+    await attestReader({
+      reader,
+      key: "test-readiness-key",
+      store: postgresReadinessStore(pgExecutor()),
+      selfCheck: async () => {},
+      releaseSha: "abc123",
+    });
   const { app, env } = await buildIngestApp({
     db: pgExecutor(),
     raw: { store, provider: "fs", bucket: "raw" } as never,
@@ -383,7 +396,10 @@ async function planned(
         started_at: AT,
       },
       // A cold export is owned by its migration grant (#42's owner fence); a live session by its machine.
-      writer: { delivery_instance_id: owner, plugin_version: "test" },
+      writer: {
+        delivery_instance_id: owner,
+        plugin_version: "96bulls-courier/0.3.0",
+      },
       raw: {
         owner,
         state: "closed",
@@ -1311,7 +1327,7 @@ describe("buildIngestApp auth (production composition)", () => {
       },
       writer: {
         delivery_instance_id: location.machineId,
-        plugin_version: "test",
+        plugin_version: "96bulls-courier/0.3.0",
       },
       raw: {
         owner: location.machineId,

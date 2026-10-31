@@ -22,11 +22,14 @@ export function fixedBearerToken(token: string): BearerTokenProvider {
   };
 }
 
-export function mintedBearerToken(mint: () => string | Promise<string>): BearerTokenProvider {
+export function mintedBearerToken(
+  mint: () => string | Promise<string>,
+): BearerTokenProvider {
   return {
     async get() {
       const token = await mint();
-      if (!token) throw new Error("96bulls: bearer token minter returned an empty token");
+      if (!token)
+        throw new Error("96bulls: bearer token minter returned an empty token");
       return token;
     },
     invalidate() {
@@ -60,21 +63,44 @@ interface RelayAuthAssertionResponse {
  * broker, secret manager, or other non-persistent source.
  */
 export class RelayAuthAssertionProvider implements BearerTokenProvider {
-  readonly #cfg: Required<Pick<RelayAuthAssertionConfig, "expiresInSeconds" | "refreshSkewSeconds" | "fetcher" | "now">> & RelayAuthAssertionConfig;
+  readonly #cfg: Required<
+    Pick<
+      RelayAuthAssertionConfig,
+      "expiresInSeconds" | "refreshSkewSeconds" | "fetcher" | "now"
+    >
+  > &
+    RelayAuthAssertionConfig;
   #cached?: { token: string; expiresAtMs: number };
   #minting?: Promise<string>;
 
   constructor(cfg: RelayAuthAssertionConfig) {
     const baseUrl = new URL(cfg.baseUrl);
     const historyOrigin = new URL(cfg.historyOrigin);
-    if (baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash) {
-      throw new Error("96bulls: RELAYAUTH_URL must not contain credentials, query or fragment");
+    if (
+      baseUrl.username ||
+      baseUrl.password ||
+      baseUrl.search ||
+      baseUrl.hash
+    ) {
+      throw new Error(
+        "96bulls: RELAYAUTH_URL must not contain credentials, query or fragment",
+      );
     }
-    if (baseUrl.protocol !== "https:" && !(baseUrl.protocol === "http:" && LOOPBACK_HOSTS.has(baseUrl.hostname))) {
-      throw new Error("96bulls: RELAYAUTH_URL must use https (plain http is loopback-only)");
+    if (
+      baseUrl.protocol !== "https:" &&
+      !(baseUrl.protocol === "http:" && LOOPBACK_HOSTS.has(baseUrl.hostname))
+    ) {
+      throw new Error(
+        "96bulls: RELAYAUTH_URL must use https (plain http is loopback-only)",
+      );
     }
-    if (historyOrigin.origin !== cfg.historyOrigin || historyOrigin.pathname !== "/") {
-      throw new Error("96bulls: RELAYAUTH_HISTORY_ORIGIN must be an exact bare origin");
+    if (
+      historyOrigin.origin !== cfg.historyOrigin ||
+      historyOrigin.pathname !== "/"
+    ) {
+      throw new Error(
+        "96bulls: RELAYAUTH_HISTORY_ORIGIN must be an exact bare origin",
+      );
     }
     this.#cfg = {
       ...cfg,
@@ -85,17 +111,26 @@ export class RelayAuthAssertionProvider implements BearerTokenProvider {
       now: cfg.now ?? Date.now,
     };
     if (this.#cfg.expiresInSeconds < 30 || this.#cfg.expiresInSeconds > 300) {
-      throw new Error("96bulls: RelayAuth assertion lifetime must be between 30 and 300 seconds");
+      throw new Error(
+        "96bulls: RelayAuth assertion lifetime must be between 30 and 300 seconds",
+      );
     }
-    if (this.#cfg.refreshSkewSeconds < 0 || this.#cfg.refreshSkewSeconds >= this.#cfg.expiresInSeconds) {
-      throw new Error("96bulls: RelayAuth refresh skew must be shorter than the assertion lifetime");
+    if (
+      this.#cfg.refreshSkewSeconds < 0 ||
+      this.#cfg.refreshSkewSeconds >= this.#cfg.expiresInSeconds
+    ) {
+      throw new Error(
+        "96bulls: RelayAuth refresh skew must be shorter than the assertion lifetime",
+      );
     }
   }
 
   async get(): Promise<string> {
     const usableUntil = this.#cfg.now() + this.#cfg.refreshSkewSeconds * 1_000;
-    if (this.#cached && this.#cached.expiresAtMs > usableUntil) return this.#cached.token;
-    if (!this.#minting) this.#minting = this.#mint().finally(() => (this.#minting = undefined));
+    if (this.#cached && this.#cached.expiresAtMs > usableUntil)
+      return this.#cached.token;
+    if (!this.#minting)
+      this.#minting = this.#mint().finally(() => (this.#minting = undefined));
     return this.#minting;
   }
 
@@ -106,34 +141,173 @@ export class RelayAuthAssertionProvider implements BearerTokenProvider {
 
   async #mint(): Promise<string> {
     const apiKey = await this.#cfg.apiKey();
-    if (!apiKey) throw new Error("96bulls: RelayAuth API key source returned an empty value");
-    const response = await this.#cfg.fetcher(`${this.#cfg.baseUrl}/v1/tokens/relayhistory-assertion`, {
+    if (!apiKey)
+      throw new Error(
+        "96bulls: RelayAuth API key source returned an empty value",
+      );
+    const response = await this.#cfg.fetcher(
+      `${this.#cfg.baseUrl}/v1/tokens/relayhistory-assertion`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": apiKey },
+        redirect: "error",
+        signal: AbortSignal.timeout(10_000),
+        body: JSON.stringify({
+          orgId: this.#cfg.orgId,
+          workspaceId: this.#cfg.workspaceId,
+          sponsorId: this.#cfg.sponsorId,
+          scopes: ["rth:sync", "rth:read"],
+          expiresIn: this.#cfg.expiresInSeconds,
+          historyOrigin: this.#cfg.historyOrigin,
+        }),
+      },
+    );
+    if (response.status !== 201) {
+      throw Object.assign(
+        new Error("96bulls: RelayAuth assertion mint refused"),
+        {
+          code: `relayauth_http_${response.status}`,
+          retryable: response.status === 429 || response.status >= 500,
+        },
+      );
+    }
+    const body = (await response.json()) as RelayAuthAssertionResponse;
+    const expiresAtMs =
+      typeof body.accessTokenExpiresAt === "string"
+        ? Date.parse(body.accessTokenExpiresAt)
+        : Number.NaN;
+    if (
+      body.tokenType !== "Bearer" ||
+      typeof body.accessToken !== "string" ||
+      !body.accessToken ||
+      !Number.isFinite(expiresAtMs)
+    ) {
+      throw Object.assign(
+        new Error("96bulls: RelayAuth returned an invalid assertion"),
+        {
+          code: "relayauth_invalid_response",
+          retryable: false,
+        },
+      );
+    }
+    this.#cached = { token: body.accessToken, expiresAtMs };
+    return body.accessToken;
+  }
+}
+
+export interface CloudSessionConfig {
+  /** Cloud's origin, e.g. `https://agentrelay.com/cloud`. */
+  baseUrl: string;
+  workspaceId: string;
+  /** The claimed fleet node id: `meta.machineId` on every assertion. */
+  machineId: string;
+  /** The enrolled user's Cloud credential. */
+  cloudToken: () => Promise<string>;
+  refreshSkewSeconds?: number;
+  fetcher?: typeof fetch;
+  now?: () => number;
+}
+
+/**
+ * An assertion brokered by Cloud, which checks that the caller owns the machine
+ * before RelayAuth signs `meta.machineId` onto it. Self-minting cannot carry
+ * that claim: nothing there proves ownership. A refusal for the machine itself
+ * is not retryable, because no retry changes who owns it.
+ */
+export class CloudSessionAssertionProvider implements BearerTokenProvider {
+  readonly #cfg: CloudSessionConfig;
+  readonly #url: string;
+  readonly #fetch: typeof fetch;
+  readonly #now: () => number;
+  readonly #skewMs: number;
+  #cached?: { token: string; expiresAtMs: number };
+  #minting?: Promise<string>;
+
+  constructor(cfg: CloudSessionConfig) {
+    const base = new URL(cfg.baseUrl);
+    if (base.username || base.password || base.search || base.hash)
+      throw new Error(
+        "96bulls: CLOUD_URL must not contain credentials, query or fragment",
+      );
+    if (
+      base.protocol !== "https:" &&
+      !(base.protocol === "http:" && LOOPBACK_HOSTS.has(base.hostname))
+    )
+      throw new Error(
+        "96bulls: CLOUD_URL must use https (plain http is loopback-only)",
+      );
+    if (!cfg.machineId)
+      throw new Error(
+        "96bulls: a Cloud session needs MACHINE_ID, the claimed fleet node id",
+      );
+    this.#cfg = cfg;
+    const workspace = encodeURIComponent(cfg.workspaceId);
+    this.#url = `${cfg.baseUrl.replace(/\/$/, "")}/api/v1/workspaces/${workspace}/relayhistory/session`;
+    this.#fetch = cfg.fetcher ?? fetch;
+    this.#now = cfg.now ?? Date.now;
+    this.#skewMs = (cfg.refreshSkewSeconds ?? 15) * 1_000;
+  }
+
+  async get(): Promise<string> {
+    if (this.#cached && this.#cached.expiresAtMs > this.#now() + this.#skewMs)
+      return this.#cached.token;
+    if (!this.#minting)
+      this.#minting = this.#mint().finally(() => (this.#minting = undefined));
+    return this.#minting;
+  }
+
+  invalidate(): boolean {
+    this.#cached = undefined;
+    return true;
+  }
+
+  async #mint(): Promise<string> {
+    const credential = await this.#cfg.cloudToken();
+    if (!credential)
+      throw new Error(
+        "96bulls: the Cloud credential source returned an empty value",
+      );
+    const response = await this.#fetch(this.#url, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": apiKey },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${credential}`,
+      },
       redirect: "error",
       signal: AbortSignal.timeout(10_000),
       body: JSON.stringify({
-        orgId: this.#cfg.orgId,
-        workspaceId: this.#cfg.workspaceId,
-        sponsorId: this.#cfg.sponsorId,
-        scopes: ["rth:sync", "rth:read"],
-        expiresIn: this.#cfg.expiresInSeconds,
-        historyOrigin: this.#cfg.historyOrigin,
+        mode: "sync",
+        label: "courier",
+        machine_id: this.#cfg.machineId,
       }),
     });
-    if (response.status !== 201) {
-      throw Object.assign(new Error("96bulls: RelayAuth assertion mint refused"), {
-        code: `relayauth_http_${response.status}`,
+    if (response.status !== 200) {
+      const body = (await response.json().catch(() => ({}))) as {
+        code?: unknown;
+      };
+      throw Object.assign(new Error("96bulls: Cloud refused the session"), {
+        code:
+          typeof body.code === "string"
+            ? body.code
+            : `cloud_http_${response.status}`,
         retryable: response.status === 429 || response.status >= 500,
       });
     }
     const body = (await response.json()) as RelayAuthAssertionResponse;
-    const expiresAtMs = typeof body.accessTokenExpiresAt === "string" ? Date.parse(body.accessTokenExpiresAt) : Number.NaN;
-    if (body.tokenType !== "Bearer" || typeof body.accessToken !== "string" || !body.accessToken || !Number.isFinite(expiresAtMs)) {
-      throw Object.assign(new Error("96bulls: RelayAuth returned an invalid assertion"), {
-        code: "relayauth_invalid_response",
-        retryable: false,
-      });
+    const expiresAtMs =
+      typeof body.accessTokenExpiresAt === "string"
+        ? Date.parse(body.accessTokenExpiresAt)
+        : Number.NaN;
+    if (
+      body.tokenType !== "Bearer" ||
+      typeof body.accessToken !== "string" ||
+      !body.accessToken ||
+      !Number.isFinite(expiresAtMs)
+    ) {
+      throw Object.assign(
+        new Error("96bulls: Cloud returned an invalid session"),
+        { code: "cloud_invalid_response", retryable: false },
+      );
     }
     this.#cached = { token: body.accessToken, expiresAtMs };
     return body.accessToken;
@@ -149,23 +323,40 @@ export function secretCommand(commandJson: string): () => Promise<string> {
   try {
     command = JSON.parse(commandJson);
   } catch {
-    throw new Error("96bulls: RELAYAUTH_API_KEY_COMMAND_JSON must be a JSON argv array");
+    throw new Error(
+      "96bulls: RELAYAUTH_API_KEY_COMMAND_JSON must be a JSON argv array",
+    );
   }
-  if (!Array.isArray(command) || command.length === 0 || command.length > 32 || command.some((part) => typeof part !== "string" || !part)) {
-    throw new Error("96bulls: RELAYAUTH_API_KEY_COMMAND_JSON must contain 1-32 non-empty strings");
+  if (
+    !Array.isArray(command) ||
+    command.length === 0 ||
+    command.length > 32 ||
+    command.some((part) => typeof part !== "string" || !part)
+  ) {
+    throw new Error(
+      "96bulls: RELAYAUTH_API_KEY_COMMAND_JSON must contain 1-32 non-empty strings",
+    );
   }
   const [file, ...args] = command as string[];
   return async () => {
     try {
-      const { stdout } = await execFileAsync(file!, args, { encoding: "utf8", timeout: 10_000, maxBuffer: 16 * 1024 });
+      const { stdout } = await execFileAsync(file!, args, {
+        encoding: "utf8",
+        timeout: 10_000,
+        maxBuffer: 16 * 1024,
+      });
       const secret = stdout.trim();
-      if (!secret || /\s/.test(secret)) throw new Error("invalid secret output");
+      if (!secret || /\s/.test(secret))
+        throw new Error("invalid secret output");
       return secret;
     } catch {
-      throw Object.assign(new Error("96bulls: RelayAuth API key command failed"), {
-        code: "relayauth_api_key_source_failed",
-        retryable: true,
-      });
+      throw Object.assign(
+        new Error("96bulls: RelayAuth API key command failed"),
+        {
+          code: "relayauth_api_key_source_failed",
+          retryable: true,
+        },
+      );
     }
   };
 }

@@ -171,10 +171,15 @@ manifest body.
   version cannot both commit; the loser rereads and rebuilds. Normal live
   assertions cannot open a `backfill` epoch.
   The epoch is sealed, and the client continues in a `resumed` epoch at its
-  own offset (`manifest-v1.md`, "Backfill"). Still open: a backfill needs an
-  `ndjson` live stream, so the courier's `jsonl` sessions cannot take one, and
-  the courier rebuilds `raw` from local state. A session cold-exported first
-  and resumed later stays fenced on its client.
+  own offset (`manifest-v1.md`, "Backfill"). The courier edits the stored
+  manifest, adopts it after a lost race, and with `COURIER_FORMAT=ndjson` sends
+  its change feed's rows, whose `origin_id`, `record_id` and `revision` equal the
+  Neon records'. A `jsonl` session still cannot take a
+  backfill. A backfill stays refused (`activation_required`) until the session's
+  writer and every reader in `MANIFEST_READER_CAPABILITIES` advertise
+  `manifest-epochs-v2`, so an old courier keeps delivering and its backfill
+  waits. Still open: a session cold-exported first and resumed later stays
+  fenced on its client.
 - **O5:** volume. About 54M records in 161 GB of payload; estimate the
   exported zstd size and the PUT count per workspace (KMS request cost, P9).
 

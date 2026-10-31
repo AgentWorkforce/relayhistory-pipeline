@@ -22,6 +22,8 @@ import {
   type RawStore,
   type SqlExecutor,
   type StageMessage,
+  missingReaders,
+  postgresReadinessStore,
 } from "../shared/vendor.ts";
 import {
   inTransaction,
@@ -181,11 +183,19 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     // The courier route verifies a v2 (backfill) commit against the stored base.
     migrationBackfill: true,
   });
+  const readiness = postgresReadinessStore(db);
   const courierManifests = createCourierManifestRoutes({
     manifests: reader,
     raw,
     send,
     migrationLedger,
+    missingReaders: () =>
+      missingReaders({
+        key: process.env.MANIFEST_READINESS_KEY,
+        store: readiness,
+      }),
+    requeueBackfill: (_env, message, delaySeconds) =>
+      queue.send(message, { delaySeconds }),
   });
 
   const app = new Hono<AppEnv>();
@@ -289,8 +299,7 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
       path === "/v1/pipeline/manifests" ||
       path === "/v1/pipeline/manifests/status";
     const auth = c.get("auth") as
-      | { historyOrigin?: string; migration?: unknown }
-      | undefined;
+      { historyOrigin?: string; migration?: unknown } | undefined;
     if (
       upload &&
       env.RELAYHISTORY_ORIGIN &&

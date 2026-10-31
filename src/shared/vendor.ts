@@ -35,6 +35,7 @@ export {
   type StageMessage,
   type StageQueueDeps,
   type DeadLetterStore,
+  isStageMessage,
 } from "@rhc/lib/pipeline/dlq.ts";
 export {
   type PipelineEvent,
@@ -102,8 +103,18 @@ export {
   manifestKey,
   rawChunkKey,
   parseSessionKey,
+  appendBackfillEpoch,
+  backfillDigest,
+  backfillStatus,
   backfillWriteIssues,
+  chunkKeys,
+  commitBackfillEpoch,
   computeContentSha256,
+  exportWatermarks,
+  liveEpoch,
+  liveNextOffset,
+  MANIFEST_EPOCHS_CAPABILITY,
+  writerUnderstandsBackfill,
   validateManifest,
   parseManifest,
   pointerFields,
@@ -111,6 +122,8 @@ export {
   joinKey,
   sessionPrefix,
   readAll,
+  type BackfillChunk,
+  type BackfillIO,
   type ManifestV1,
   type ChunkEntry,
   type SessionLocation,
@@ -120,3 +133,22 @@ export {
   type RawFormat,
 } from "@rhc-object-store";
 export { ObjectStoreError, isObjectStoreError } from "@rhc-object-store";
+export {
+  BACKFILL_ACTIVATION_STAGE,
+  backfillActivationDelay,
+  backfillActivationHandler,
+  backfillActivationLimits,
+  backfillActivationWorkKey,
+  postgresBackfillReady,
+  type BackfillActivationPayload,
+} from "@rhc/lib/pipeline/backfill-activation.ts";
+export {
+  attestReader,
+  MANIFEST_READERS,
+  missingReaders,
+  postgresReadinessStore,
+  selfCheckManifestEpochs,
+  type ManifestReader as ManifestReaderName,
+  type ReadinessRow,
+  type ReadinessStore,
+} from "@rhc/lib/pipeline/manifest-readiness.ts";
