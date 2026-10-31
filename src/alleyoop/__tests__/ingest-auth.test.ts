@@ -148,7 +148,19 @@ function migrationToken(
 
 /** An origin-bound courier assertion (live delivery), as relayauth mints for this History. */
 const liveToken = (machineId = LOCATION.machineId) =>
-  sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { machineId, tokenClass: "relayhistory_assertion" } });
+  sign({
+    sub: "agent_relayhistory_assertion",
+    org: ORG,
+    wks: WORKSPACE,
+    sponsorId: USER,
+    scopes: ["rth:sync"],
+    token_type: "access",
+    iss: ISSUER,
+    aud: [ORIGIN],
+    iat: now(),
+    exp: now() + 600,
+    meta: { machineId, tokenClass: "relayhistory_assertion" },
+  });
 
 /** The v2 base-read capability (issuer spec section 3): its own class, scope, audience, TTL, meta.read and jti namespace. */
 function baseReadToken(
@@ -393,7 +405,10 @@ async function planned(
         started_at: AT,
       },
       // A cold export is owned by its migration grant (#42's owner fence); a live session by its machine.
-      writer: { delivery_instance_id: owner, plugin_version: "96bulls-courier/0.3.0" },
+      writer: {
+        delivery_instance_id: owner,
+        plugin_version: "96bulls-courier/0.3.0",
+      },
       raw: {
         owner,
         state: "closed",
@@ -486,7 +501,19 @@ const MIGRATION_ON = {
 describe("buildIngestApp auth (production composition)", () => {
   test("REAL ROUTE: a live chunk POST without a matching machine claim is refused and writes nothing", async () => {
     const i = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
-    const claimless = sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { tokenClass: "relayhistory_assertion" } });
+    const claimless = sign({
+      sub: "agent_relayhistory_assertion",
+      org: ORG,
+      wks: WORKSPACE,
+      sponsorId: USER,
+      scopes: ["rth:sync"],
+      token_type: "access",
+      iss: ISSUER,
+      aud: [ORIGIN],
+      iat: now(),
+      exp: now() + 600,
+      meta: { tokenClass: "relayhistory_assertion" },
+    });
     const objects = async () => {
       const prefix = objectKey(sessionPrefix(LOCATION));
       return (await i.store.list(prefix)).items.length;
@@ -497,16 +524,26 @@ describe("buildIngestApp auth (production composition)", () => {
     ] as const) {
       const res = await i.chunk(token, LOCATION);
       expect(`${name}: ${res.status}`).toBe(`${name}: 403`);
-      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("machine_claim_refused");
+      expect(
+        ((await res.json()) as { error: { code: string } }).error.code,
+      ).toBe("machine_claim_refused");
       expect(await objects()).toBe(0);
     }
-    for (const table of ["sessions.pipeline_jobs", "sessions.claimless_uses", "sessions.migration_assertion_uses"])
+    for (const table of [
+      "sessions.pipeline_jobs",
+      "sessions.claimless_uses",
+      "sessions.migration_assertion_uses",
+    ])
       expect(await count(table)).toBe(0);
 
     // Nor with the legacy window open: it is read-only.
     process.env.MANIFEST_MACHINE_CLAIM = "compat";
-    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(Date.now() - 1000).toISOString();
-    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = new Date(Date.now() + 60_000).toISOString();
+    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+      Date.now() - 1000,
+    ).toISOString();
+    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = new Date(
+      Date.now() + 60_000,
+    ).toISOString();
     const open = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
     expect((await open.chunk(claimless, LOCATION)).status).toBe(403);
     expect(await objects()).toBe(0);
@@ -523,7 +560,19 @@ describe("buildIngestApp auth (production composition)", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ machineId, events: [] }),
       });
-    const claimless = sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { tokenClass: "relayhistory_assertion" } });
+    const claimless = sign({
+      sub: "agent_relayhistory_assertion",
+      org: ORG,
+      wks: WORKSPACE,
+      sponsorId: USER,
+      scopes: ["rth:sync"],
+      token_type: "access",
+      iss: ISSUER,
+      aud: [ORIGIN],
+      iat: now(),
+      exp: now() + 600,
+      meta: { tokenClass: "relayhistory_assertion" },
+    });
     const before = await count("sessions.pipeline_events");
     expect((await post(claimless, LOCATION.machineId)).status).toBe(403);
     expect((await post(liveToken(), "another-machine")).status).toBe(403);
@@ -534,26 +583,62 @@ describe("buildIngestApp auth (production composition)", () => {
 
   test("REAL ROUTE: a mutating path nobody listed is denied without a claim", async () => {
     const i = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
-    const claimless = sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { tokenClass: "relayhistory_assertion" } });
+    const claimless = sign({
+      sub: "agent_relayhistory_assertion",
+      org: ORG,
+      wks: WORKSPACE,
+      sponsorId: USER,
+      scopes: ["rth:sync"],
+      token_type: "access",
+      iss: ISSUER,
+      aud: [ORIGIN],
+      iat: now(),
+      exp: now() + 600,
+      meta: { tokenClass: "relayhistory_assertion" },
+    });
     for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
-      const res = await i.req("/v1/pipeline/some-new-route", claimless, { method });
+      const res = await i.req("/v1/pipeline/some-new-route", claimless, {
+        method,
+      });
       expect(`${method}: ${res.status}`).toBe(`${method}: 403`);
     }
   });
 
   test("a locally minted token delivers with the window shut: local dev needs no compat", async () => {
     // As alchemy.run.ts composes a local stage: no origin, the interim bearer on.
-    const i = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true", RELAYHISTORY_ORIGIN: "" });
-    const keys = { kid: KID, privateKeyPem: String(privateKey.export({ type: "pkcs8", format: "pem" })) };
+    const i = await ingest({
+      ALLOW_INTERIM_RELAYAUTH_BEARER: "true",
+      RELAYHISTORY_ORIGIN: "",
+    });
+    const keys = {
+      kid: KID,
+      privateKeyPem: String(
+        privateKey.export({ type: "pkcs8", format: "pem" }),
+      ),
+    };
     const local = { ...LOCATION, sessionId: "session-local" };
     const mint = (machineId?: string) =>
-      mintToken(keys, { issuer: ISSUER, audience: "relayhistory", orgId: ORG, workspaceId: WORKSPACE, userId: USER, ...(machineId ? { machineId } : {}) });
+      mintToken(keys, {
+        issuer: ISSUER,
+        audience: "relayhistory",
+        orgId: ORG,
+        workspaceId: WORKSPACE,
+        userId: USER,
+        ...(machineId ? { machineId } : {}),
+      });
     const body = await planned(local, local.machineId);
     const post = (token: string) =>
       i.req("/v1/pipeline/manifests", token, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-machine-id": local.machineId, "x-session-id": local.sessionId },
-        body: JSON.stringify({ key: manifestKey(local), manifest: { ...body.manifest, extensions: undefined } }),
+        headers: {
+          "content-type": "application/json",
+          "x-machine-id": local.machineId,
+          "x-session-id": local.sessionId,
+        },
+        body: JSON.stringify({
+          key: manifestKey(local),
+          manifest: { ...body.manifest, extensions: undefined },
+        }),
       });
     expect((await i.chunk(mint(local.machineId), local)).status).toBe(201);
     expect((await post(mint())).status).toBe(403);
@@ -565,14 +650,30 @@ describe("buildIngestApp auth (production composition)", () => {
   test("the claim switch reaches the route from the real environment, and defaults shut", async () => {
     const shut = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
     const { manifest } = await planned();
-    const claimless = sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { tokenClass: "relayhistory_assertion" } });
+    const claimless = sign({
+      sub: "agent_relayhistory_assertion",
+      org: ORG,
+      wks: WORKSPACE,
+      sponsorId: USER,
+      scopes: ["rth:sync"],
+      token_type: "access",
+      iss: ISSUER,
+      aud: [ORIGIN],
+      iat: now(),
+      exp: now() + 600,
+      meta: { tokenClass: "relayhistory_assertion" },
+    });
     expect((await shut.commit(claimless, manifest)).status).toBe(403);
     expect(await count("sessions.claimless_uses")).toBe(0);
 
     // The real migrations, composition and meter: a read through an open window.
     process.env.MANIFEST_MACHINE_CLAIM = "compat";
-    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(Date.now() - 1000).toISOString();
-    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = new Date(Date.now() + 60_000).toISOString();
+    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+      Date.now() - 1000,
+    ).toISOString();
+    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = new Date(
+      Date.now() + 60_000,
+    ).toISOString();
     const open = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
     const liveLocation = { ...LOCATION, sessionId: "session-claimless" };
     const liveKey = manifestKey(liveLocation);
@@ -580,34 +681,74 @@ describe("buildIngestApp auth (production composition)", () => {
     expect((await open.chunk(liveToken(), liveLocation)).status).toBe(201);
     const committed = await open.req("/v1/pipeline/manifests", liveToken(), {
       method: "POST",
-      headers: { "content-type": "application/json", "x-machine-id": liveLocation.machineId, "x-session-id": liveLocation.sessionId },
-      body: JSON.stringify({ key: liveKey, manifest: { ...live.manifest, extensions: undefined } }),
+      headers: {
+        "content-type": "application/json",
+        "x-machine-id": liveLocation.machineId,
+        "x-session-id": liveLocation.sessionId,
+      },
+      body: JSON.stringify({
+        key: liveKey,
+        manifest: { ...live.manifest, extensions: undefined },
+      }),
     });
     expect(committed.status).toBe(202);
-    const q = new URLSearchParams({ key: liveKey, machine: liveLocation.machineId, writer: liveLocation.machineId });
-    expect((await open.req(`/v1/pipeline/manifests/status?${q}`, claimless)).status).toBe(200);
+    const q = new URLSearchParams({
+      key: liveKey,
+      machine: liveLocation.machineId,
+      writer: liveLocation.machineId,
+    });
+    expect(
+      (await open.req(`/v1/pipeline/manifests/status?${q}`, claimless)).status,
+    ).toBe(200);
     expect(await count("sessions.claimless_uses")).toBe(1);
 
     // One row for the whole database, append-only, on the real table: a restart
     // with restated dates finds the window shut, and so does a new label.
-    const recorded = await db.query<{ first_activation: Date; compat_class: string }>(
+    const recorded = await db.query<{
+      first_activation: Date;
+      compat_class: string;
+    }>(
       "SELECT first_activation, compat_class FROM sessions.claimless_window_activations",
     );
     expect(recorded.rows).toHaveLength(1);
-    expect(recorded.rows[0]!.compat_class).toBe("manifest_machine_claim_compat_v1");
+    expect(recorded.rows[0]!.compat_class).toBe(
+      "manifest_machine_claim_compat_v1",
+    );
     const openFrom = process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM;
     process.env.DEPLOYMENT_ID = "a-new-stage";
     const relabelled = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
-    expect((await relabelled.req(`/v1/pipeline/manifests/status?${q}`, claimless)).status).toBe(200);
-    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(Date.now() + 1000 - 2000).toISOString();
+    expect(
+      (await relabelled.req(`/v1/pipeline/manifests/status?${q}`, claimless))
+        .status,
+    ).toBe(200);
+    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+      Date.now() + 1000 - 2000,
+    ).toISOString();
     const restated = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
-    expect((await restated.req(`/v1/pipeline/manifests/status?${q}`, claimless)).status).toBe(403);
-    expect((await db.query("SELECT 1 FROM sessions.claimless_window_activations")).rows).toHaveLength(1);
+    expect(
+      (await restated.req(`/v1/pipeline/manifests/status?${q}`, claimless))
+        .status,
+    ).toBe(403);
+    expect(
+      (await db.query("SELECT 1 FROM sessions.claimless_window_activations"))
+        .rows,
+    ).toHaveLength(1);
     expect(openFrom).toBeDefined();
-    await expect(db.query("UPDATE sessions.claimless_window_activations SET first_activation = now()")).rejects.toThrow(/append-only/);
-    await expect(db.query("DELETE FROM sessions.claimless_window_activations")).rejects.toThrow(/append-only/);
-    await expect(db.query("TRUNCATE sessions.claimless_window_activations")).rejects.toThrow(/append-only/);
-    expect((await db.query("SELECT 1 FROM sessions.claimless_window_activations")).rows).toHaveLength(1);
+    await expect(
+      db.query(
+        "UPDATE sessions.claimless_window_activations SET first_activation = now()",
+      ),
+    ).rejects.toThrow(/append-only/);
+    await expect(
+      db.query("DELETE FROM sessions.claimless_window_activations"),
+    ).rejects.toThrow(/append-only/);
+    await expect(
+      db.query("TRUNCATE sessions.claimless_window_activations"),
+    ).rejects.toThrow(/append-only/);
+    expect(
+      (await db.query("SELECT 1 FROM sessions.claimless_window_activations"))
+        .rows,
+    ).toHaveLength(1);
   });
 
   test("default config: a generic RelayAuth bearer is refused (401) on every upload route, and so is a migration token", async () => {
@@ -898,19 +1039,25 @@ describe("buildIngestApp auth (production composition)", () => {
     const liveLocation = { ...LOCATION, sessionId: "session-live" };
     const live = await planned(liveLocation, liveLocation.machineId);
     const liveManifest = { ...live.manifest, extensions: undefined };
-    expect((await i.chunk(liveToken(liveLocation.machineId), liveLocation)).status).toBe(201);
-    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(liveLocation.machineId), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-machine-id": liveLocation.machineId,
-        "x-session-id": liveLocation.sessionId,
+    expect(
+      (await i.chunk(liveToken(liveLocation.machineId), liveLocation)).status,
+    ).toBe(201);
+    const liveCommit = await i.req(
+      "/v1/pipeline/manifests",
+      liveToken(liveLocation.machineId),
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-machine-id": liveLocation.machineId,
+          "x-session-id": liveLocation.sessionId,
+        },
+        body: JSON.stringify({
+          key: manifestKey(liveLocation),
+          manifest: liveManifest,
+        }),
       },
-      body: JSON.stringify({
-        key: manifestKey(liveLocation),
-        manifest: liveManifest,
-      }),
-    });
+    );
     expect(liveCommit.status).toBe(202);
     const liveKey = ((await liveCommit.json()) as { workKey: string }).workKey;
     expect(liveKey.startsWith(`${manifestKey(liveLocation)}@`)).toBe(true);
@@ -995,19 +1142,25 @@ describe("buildIngestApp auth (production composition)", () => {
     // A live session under the same prefix.
     const liveLocation = { ...LOCATION, sessionId: "session-live" };
     const live = await planned(liveLocation, liveLocation.machineId);
-    expect((await i.chunk(liveToken(liveLocation.machineId), liveLocation)).status).toBe(201);
-    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(liveLocation.machineId), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-machine-id": liveLocation.machineId,
-        "x-session-id": liveLocation.sessionId,
+    expect(
+      (await i.chunk(liveToken(liveLocation.machineId), liveLocation)).status,
+    ).toBe(201);
+    const liveCommit = await i.req(
+      "/v1/pipeline/manifests",
+      liveToken(liveLocation.machineId),
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-machine-id": liveLocation.machineId,
+          "x-session-id": liveLocation.sessionId,
+        },
+        body: JSON.stringify({
+          key: `${PREFIX}/${manifestKey(liveLocation)}`,
+          manifest: { ...live.manifest, extensions: undefined },
+        }),
       },
-      body: JSON.stringify({
-        key: `${PREFIX}/${manifestKey(liveLocation)}`,
-        manifest: { ...live.manifest, extensions: undefined },
-      }),
-    });
+    );
     expect(liveCommit.status).toBe(202);
 
     const sql = pgExecutor();
@@ -1300,7 +1453,10 @@ describe("buildIngestApp auth (production composition)", () => {
           dbPath,
           statePath: join(dir, "state.json"),
           ingestUrl,
-          token: { get: async () => liveToken("machine-c"), invalidate: () => false },
+          token: {
+            get: async () => liveToken("machine-c"),
+            invalidate: () => false,
+          },
           orgId: ORG,
           workspaceId: WORKSPACE,
           userId: USER,

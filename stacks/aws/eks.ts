@@ -8,7 +8,10 @@
  * services image digest. Secrets reach the pods through an existing Kubernetes
  * Secret synced from 1Password/Secrets Manager, never through chart values.
  */
-import { claimlessWindowEnv, type ClaimlessWindow } from "../claimless-window.ts";
+import {
+  claimlessWindowEnv,
+  type ClaimlessWindow,
+} from "../claimless-window.ts";
 import * as AWS from "@alchemy.run/aws";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
@@ -47,14 +50,25 @@ export interface EksStageInputs {
   /** Sandbox stages: every role we create carries this permissions boundary and the bounded tag. */
   permissionsBoundaryArn?: string;
   /** Public hostname for the ingest (Cloudflare DNS). Omit to keep the ingest cluster-internal. */
-  ingress?: { hostname: string; cloudflareZoneId: string; zoneDomain: string; cloudflareTokenSecret: string; certValidation?: { name: string; value: string } };
+  ingress?: {
+    hostname: string;
+    cloudflareZoneId: string;
+    zoneDomain: string;
+    cloudflareTokenSecret: string;
+    certValidation?: { name: string; value: string };
+  };
   tags: Record<string, string>;
 }
 
 export const OTEL_SERVICE_ACCOUNT = "otel-collector";
 export const OTEL_ENDPOINT = "http://otel-collector:4318";
 
-export function telemetryPolicy(i: Pick<EksStageInputs, "lockerBucketArn" | "lockerKmsKeyArn" | "lockerRegion">) {
+export function telemetryPolicy(
+  i: Pick<
+    EksStageInputs,
+    "lockerBucketArn" | "lockerKmsKeyArn" | "lockerRegion"
+  >,
+) {
   return {
     Version: "2012-10-17" as const,
     Statement: [
@@ -65,9 +79,18 @@ export function telemetryPolicy(i: Pick<EksStageInputs, "lockerBucketArn" | "loc
       },
       {
         Effect: "Allow" as const,
-        Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"],
+        Action: [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey",
+        ],
         Resource: [i.lockerKmsKeyArn],
-        Condition: { StringEquals: { "kms:ViaService": `s3.${i.lockerRegion}.amazonaws.com` } },
+        Condition: {
+          StringEquals: {
+            "kms:ViaService": `s3.${i.lockerRegion}.amazonaws.com`,
+          },
+        },
       },
     ],
   };
@@ -78,7 +101,18 @@ export function telemetryPolicy(i: Pick<EksStageInputs, "lockerBucketArn" | "loc
  * tested without loading either the AWS or Kubernetes providers.
  */
 export function eksChartValues(
-  i: Pick<EksStageInputs, "stage" | "claimlessWindow" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "relayhistoryOrigin" | "imageRepository" | "imageDigest">,
+  i: Pick<
+    EksStageInputs,
+    | "stage"
+    | "claimlessWindow"
+    | "runtimeSecretName"
+    | "lockerBucket"
+    | "lockerRegion"
+    | "tenantOrgId"
+    | "relayhistoryOrigin"
+    | "imageRepository"
+    | "imageDigest"
+  >,
   sandbox: boolean,
   authIssuer: string,
   authJwksUrl: string,
@@ -91,8 +125,15 @@ export function eksChartValues(
     },
     worker: {
       image: { repository: i.imageRepository, digest: i.imageDigest },
-      hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
-      locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
+      hoopdb: sandbox
+        ? {}
+        : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
+      locker: {
+        endpoint: "",
+        bucket: i.lockerBucket,
+        region: i.lockerRegion,
+        credentials: { mode: "podIdentity" },
+      },
       // Supabase already has anon/authenticated/service_role; the plain-Postgres shim is for in-cluster DBs only.
       migrations: { supabaseShim: sandbox },
       // The bucket is created and versioned by IaC; the pods' role has no CreateBucket.
@@ -100,12 +141,22 @@ export function eksChartValues(
       deployment: { name: "hosted", id: i.stage },
       // Bob Costas alone gets the summary master key (src/shared/keyring.ts): worker 0.4.0 projects
       // this Secret key as a read-only file into Bob Costas only (SUMMARY_MASTER_KEYS_FILE).
-      summaryEncryption: { existingSecret: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" },
+      summaryEncryption: {
+        existingSecret: i.runtimeSecretName,
+        key: "SUMMARY_MASTER_KEYS",
+      },
     },
     alleyoop: {
       image: { repository: i.imageRepository, digest: i.imageDigest },
-      hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
-      locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
+      hoopdb: sandbox
+        ? {}
+        : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
+      locker: {
+        endpoint: "",
+        bucket: i.lockerBucket,
+        region: i.lockerRegion,
+        credentials: { mode: "podIdentity" },
+      },
       auth: { jwksUrl: authJwksUrl, issuer: authIssuer },
       extraEnv: [
         { name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin },
@@ -136,7 +187,9 @@ export function eksChartValues(
         },
         processors: {
           "attributes/drop_forbidden": {
-            actions: ["prompt", "summary", "message", "path", "body"].map((key) => ({ key, action: "delete" })),
+            actions: ["prompt", "summary", "message", "path", "body"].map(
+              (key) => ({ key, action: "delete" }),
+            ),
           },
           redaction: {
             allow_all_keys: true,
@@ -156,12 +209,25 @@ export function eksChartValues(
           pipelines: {
             traces: {
               receivers: ["otlp"],
-              processors: ["memory_limiter", "attributes/drop_forbidden", "redaction", "batch"],
+              processors: [
+                "memory_limiter",
+                "attributes/drop_forbidden",
+                "redaction",
+                "batch",
+              ],
               exporters: ["awss3/traces"],
             },
             // The services currently emit traces; keep unused signals explicit and non-exporting.
-            metrics: { receivers: ["otlp"], processors: ["memory_limiter", "batch"], exporters: ["nop"] },
-            logs: { receivers: ["otlp"], processors: ["memory_limiter", "batch"], exporters: ["nop"] },
+            metrics: {
+              receivers: ["otlp"],
+              processors: ["memory_limiter", "batch"],
+              exporters: ["nop"],
+            },
+            logs: {
+              receivers: ["otlp"],
+              processors: ["memory_limiter", "batch"],
+              exporters: ["nop"],
+            },
           },
         },
       },
@@ -175,14 +241,20 @@ export const eksStage = (i: EksStageInputs) =>
   Effect.gen(function* () {
     // Refuse before declaring anything billable.
     if (i.relayauth && i.relayauthIssuer)
-      throw new Error("96bulls: eks.relayauth (self-hosted) and eks.relayauthIssuer are both set; the self-hosted issuer is the in-cluster RelayAuth. Remove relayauthIssuer. Nothing was created.");
+      throw new Error(
+        "96bulls: eks.relayauth (self-hosted) and eks.relayauthIssuer are both set; the self-hosted issuer is the in-cluster RelayAuth. Remove relayauthIssuer. Nothing was created.",
+      );
     // Umbrella 0.3.0 (worker 0.4.0) is the first to give Bob Costas the summary key; older
     // charts would start it without one and it refuses to run.
     const [maj, min] = i.chartVersion.split(".").map(Number);
     if (!(maj! > 0 || (maj === 0 && min! >= 3)))
-      throw new Error(`96bulls: eks.chartVersion ${i.chartVersion} is too old; 0.3.0+ (worker 0.4.0) is required for summary encryption. Nothing was created.`);
+      throw new Error(
+        `96bulls: eks.chartVersion ${i.chartVersion} is too old; 0.3.0+ (worker 0.4.0) is required for summary encryption. Nothing was created.`,
+      );
     if (!/^sha256:[0-9a-f]{64}$/.test(i.imageDigest ?? ""))
-      throw new Error("96bulls: eks.imageDigest is missing or invalid; run publish-image-ecr for this account and put its digest in aws-inputs.json. Nothing was created.");
+      throw new Error(
+        "96bulls: eks.imageDigest is missing or invalid; run publish-image-ecr for this account and put its digest in aws-inputs.json. Nothing was created.",
+      );
     const network = yield* AWS.EC2.Network("network", {
       cidrBlock: "10.42.0.0/16",
       availabilityZones: 2,
@@ -207,21 +279,57 @@ export const eksStage = (i: EksStageInputs) =>
       description: `96bulls ${i.stage}: worker and ingest pods (EKS Pod Identity)`,
       assumeRolePolicyDocument: {
         Version: "2012-10-17",
-        Statement: [{ Effect: "Allow", Principal: { Service: "pods.eks.amazonaws.com" }, Action: ["sts:AssumeRole", "sts:TagSession"] }],
+        Statement: [
+          {
+            Effect: "Allow",
+            Principal: { Service: "pods.eks.amazonaws.com" },
+            Action: ["sts:AssumeRole", "sts:TagSession"],
+          },
+        ],
       },
       inlinePolicies: {
         locker: {
           Version: "2012-10-17",
           Statement: [
-            { Effect: "Allow", Action: ["s3:ListBucket", "s3:GetBucketLocation", "s3:GetBucketVersioning"], Resource: [i.lockerBucketArn] },
-            { Effect: "Allow", Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject"], Resource: [`${i.lockerBucketArn}/*`] },
-            { Effect: "Allow", Action: ["kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"], Resource: [i.lockerKmsKeyArn] },
+            {
+              Effect: "Allow",
+              Action: [
+                "s3:ListBucket",
+                "s3:GetBucketLocation",
+                "s3:GetBucketVersioning",
+              ],
+              Resource: [i.lockerBucketArn],
+            },
+            {
+              Effect: "Allow",
+              Action: [
+                "s3:GetObject",
+                "s3:GetObjectVersion",
+                "s3:PutObject",
+                "s3:DeleteObject",
+              ],
+              Resource: [`${i.lockerBucketArn}/*`],
+            },
+            {
+              Effect: "Allow",
+              Action: [
+                "kms:Decrypt",
+                "kms:GenerateDataKey*",
+                "kms:DescribeKey",
+              ],
+              Resource: [i.lockerKmsKeyArn],
+            },
           ],
         },
       },
       maxSessionDuration: "1 hour",
-      ...(i.permissionsBoundaryArn ? { permissionsBoundary: i.permissionsBoundaryArn } : {}),
-      tags: { ...i.tags, ...(i.permissionsBoundaryArn ? { "96bulls:bounded": "true" } : {}) },
+      ...(i.permissionsBoundaryArn
+        ? { permissionsBoundary: i.permissionsBoundaryArn }
+        : {}),
+      tags: {
+        ...i.tags,
+        ...(i.permissionsBoundaryArn ? { "96bulls:bounded": "true" } : {}),
+      },
     });
     for (const sa of ["96bulls-worker", "96bulls-alleyoop"]) {
       yield* AWS.EKS.PodIdentityAssociation(`pod-identity-${sa}`, {
@@ -241,14 +349,25 @@ export const eksStage = (i: EksStageInputs) =>
       description: `96bulls ${i.stage}: OpenTelemetry collector writes trace batches to S3`,
       assumeRolePolicyDocument: {
         Version: "2012-10-17",
-        Statement: [{ Effect: "Allow", Principal: { Service: "pods.eks.amazonaws.com" }, Action: ["sts:AssumeRole", "sts:TagSession"] }],
+        Statement: [
+          {
+            Effect: "Allow",
+            Principal: { Service: "pods.eks.amazonaws.com" },
+            Action: ["sts:AssumeRole", "sts:TagSession"],
+          },
+        ],
       },
       inlinePolicies: {
         telemetry: telemetryPolicy(i),
       },
       maxSessionDuration: "1 hour",
-      ...(i.permissionsBoundaryArn ? { permissionsBoundary: i.permissionsBoundaryArn } : {}),
-      tags: { ...i.tags, ...(i.permissionsBoundaryArn ? { "96bulls:bounded": "true" } : {}) },
+      ...(i.permissionsBoundaryArn
+        ? { permissionsBoundary: i.permissionsBoundaryArn }
+        : {}),
+      tags: {
+        ...i.tags,
+        ...(i.permissionsBoundaryArn ? { "96bulls:bounded": "true" } : {}),
+      },
     });
     yield* AWS.EKS.PodIdentityAssociation("pod-identity-otel", {
       clusterName: cluster.clusterName,
@@ -260,9 +379,15 @@ export const eksStage = (i: EksStageInputs) =>
 
     // Self-hosted RelayAuth first, so AlleyOop's issuer and JWKS come from this environment.
     const selfAuth = i.relayauth
-      ? yield* relayauthStage({ cluster, chartVersion: i.relayauth.chartVersion, secretName: i.relayauth.secretName, clientNamespace: "96bulls" })
+      ? yield* relayauthStage({
+          cluster,
+          chartVersion: i.relayauth.chartVersion,
+          secretName: i.relayauth.secretName,
+          clientNamespace: "96bulls",
+        })
       : undefined;
-    const authIssuer = selfAuth?.issuer ?? i.relayauthIssuer ?? "https://relayauth.dev";
+    const authIssuer =
+      selfAuth?.issuer ?? i.relayauthIssuer ?? "https://relayauth.dev";
     const authJwksUrl = selfAuth?.jwksUrl ?? i.relayauthJwksUrl;
 
     const chart = yield* Kubernetes.HelmChart("96bulls", {
@@ -287,9 +412,17 @@ export const eksStage = (i: EksStageInputs) =>
           serviceName: "96bulls-alleyoop",
           servicePort: 8080,
           cloudflareTokenSecret: i.ingress.cloudflareTokenSecret,
-          ...(i.ingress.certValidation ? { certValidation: i.ingress.certValidation } : {}),
+          ...(i.ingress.certValidation
+            ? { certValidation: i.ingress.certValidation }
+            : {}),
           tags: i.tags,
         })
       : undefined;
-    return { clusterName: cluster.clusterName, endpoint: cluster.endpoint, chartRelease: chart.releaseName, hostname: publicIngest?.hostname ?? null, relayauthIssuer: authIssuer };
+    return {
+      clusterName: cluster.clusterName,
+      endpoint: cluster.endpoint,
+      chartRelease: chart.releaseName,
+      hostname: publicIngest?.hostname ?? null,
+      relayauthIssuer: authIssuer,
+    };
   });

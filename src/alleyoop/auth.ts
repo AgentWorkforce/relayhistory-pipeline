@@ -5,7 +5,13 @@
  * the public key at `/.well-known/jwks.json`, and the courier gets a token.
  * Hosted and customer installs point `RELAYAUTH_JWKS_URL` at RelayAuth instead.
  */
-import { createPrivateKey, createPublicKey, createSign, generateKeyPairSync, randomUUID } from "node:crypto";
+import {
+  createPrivateKey,
+  createPublicKey,
+  createSign,
+  generateKeyPairSync,
+  randomUUID,
+} from "node:crypto";
 
 export interface LocalKeys {
   kid: string;
@@ -14,18 +20,28 @@ export interface LocalKeys {
 }
 
 export function generateLocalKeys(): LocalKeys {
-  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  });
   const kid = randomUUID();
   const jwk = publicKey.export({ format: "jwk" }) as Record<string, unknown>;
   return {
     kid,
-    privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }) as string,
+    privateKeyPem: privateKey.export({
+      type: "pkcs8",
+      format: "pem",
+    }) as string,
     jwks: { keys: [{ ...jwk, kid, alg: "RS256", use: "sig" }] },
   };
 }
 
-export function jwksFromPrivateKey(privateKeyPem: string, kid: string): LocalKeys["jwks"] {
-  const jwk = createPublicKey(createPrivateKey(privateKeyPem)).export({ format: "jwk" }) as Record<string, unknown>;
+export function jwksFromPrivateKey(
+  privateKeyPem: string,
+  kid: string,
+): LocalKeys["jwks"] {
+  const jwk = createPublicKey(createPrivateKey(privateKeyPem)).export({
+    format: "jwk",
+  }) as Record<string, unknown>;
   return { keys: [{ ...jwk, kid, alg: "RS256", use: "sig" }] };
 }
 
@@ -44,7 +60,11 @@ export interface TokenInput {
 }
 
 /** An RS256 JWT with the claims the vendored `extractAuthContext` reads. */
-export function mintToken(keys: Pick<LocalKeys, "kid" | "privateKeyPem">, input: TokenInput, now = Math.floor(Date.now() / 1000)): string {
+export function mintToken(
+  keys: Pick<LocalKeys, "kid" | "privateKeyPem">,
+  input: TokenInput,
+  now = Math.floor(Date.now() / 1000),
+): string {
   const header = { alg: "RS256", typ: "JWT", kid: keys.kid };
   const claims = {
     iss: input.issuer,
@@ -61,6 +81,8 @@ export function mintToken(keys: Pick<LocalKeys, "kid" | "privateKeyPem">, input:
     ...(input.machineId ? { meta: { machineId: input.machineId } } : {}),
   };
   const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(claims))}`;
-  const signature = createSign("RSA-SHA256").update(signingInput).sign(createPrivateKey(keys.privateKeyPem));
+  const signature = createSign("RSA-SHA256")
+    .update(signingInput)
+    .sign(createPrivateKey(keys.privateKeyPem));
   return `${signingInput}.${b64url(signature)}`;
 }

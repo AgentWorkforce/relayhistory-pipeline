@@ -125,18 +125,32 @@ interface ManifestRoutesDeps {
  * bound to a grant and checked by their own admission. The manifest route also
  * checks the claim against the manifest's key and writer.
  */
-export const liveWriteMachineGate: MiddlewareHandler<AppEnv> = async (c, next) => {
+export const liveWriteMachineGate: MiddlewareHandler<AppEnv> = async (
+  c,
+  next,
+) => {
   if (c.req.method === "GET" || c.req.method === "HEAD") return next();
   const auth = c.get("auth") as Auth | undefined;
   if (auth?.migration) return next();
   const claim = auth ? machineClaim(auth) : undefined;
   const refused = () =>
-    responseError(c, 403, "machine_claim_refused", "the token is not bound to this machine");
+    responseError(
+      c,
+      403,
+      "machine_claim_refused",
+      "the token is not bound to this machine",
+    );
   if (claim === undefined) return refused();
-  if (c.req.path.endsWith("/pipeline/chunks") && c.req.query("machine") !== claim)
+  if (
+    c.req.path.endsWith("/pipeline/chunks") &&
+    c.req.query("machine") !== claim
+  )
     return refused();
   if (c.req.path.endsWith("/pipeline/events")) {
-    const body = (await c.req.raw.clone().json().catch(() => null)) as { machineId?: unknown } | null;
+    const body = (await c.req.raw
+      .clone()
+      .json()
+      .catch(() => null)) as { machineId?: unknown } | null;
     if (body?.machineId !== claim) return refused();
   }
   return next();
@@ -1395,7 +1409,6 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   };
   routes.get("/pipeline/manifests/base", baseRead);
   routes.get("/pipeline/manifests/base/", baseRead);
-
 
   /**
    * Startup reconciliation: version, scoped to the stored machine/writer. With

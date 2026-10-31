@@ -84,7 +84,10 @@ function recordClaimlessUse(db: SqlExecutor, use: ClaimlessUse) {
 }
 
 /** One row for the whole database, written once: later dates never replace it. */
-async function firstClaimlessActivation(db: SqlExecutor, from: string): Promise<string> {
+async function firstClaimlessActivation(
+  db: SqlExecutor,
+  from: string,
+): Promise<string> {
   const compatClass = "manifest_machine_claim_compat_v1";
   await db.query(
     `INSERT INTO sessions.claimless_window_activations (compat_class, first_activation)
@@ -121,13 +124,42 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
       : {}),
     // Hosted/customer installs on a shared RelayAuth issuer: set RELAYHISTORY_ORIGIN so only
     // assertions minted for this deployment's origin are accepted (legacy shared audience refused).
-    ...(process.env.RELAYHISTORY_ORIGIN ? { RELAYHISTORY_ORIGIN: process.env.RELAYHISTORY_ORIGIN } : {}),
-    ...(process.env.MANIFEST_MACHINE_CLAIM ? { MANIFEST_MACHINE_CLAIM: process.env.MANIFEST_MACHINE_CLAIM } : {}),
-    ...(process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM ? { MANIFEST_MACHINE_CLAIM_COMPAT_FROM: process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM } : {}),
-    ...(process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL ? { MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL } : {}),
-    ...(process.env.BACKFILL_ACTIVATION_MAX_ATTEMPTS ? { BACKFILL_ACTIVATION_MAX_ATTEMPTS: process.env.BACKFILL_ACTIVATION_MAX_ATTEMPTS } : {}),
-    ...(process.env.BACKFILL_ACTIVATION_MAX_DELAY_SECONDS ? { BACKFILL_ACTIVATION_MAX_DELAY_SECONDS: process.env.BACKFILL_ACTIVATION_MAX_DELAY_SECONDS } : {}),
-    ...(process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS ? { RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS: process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS } : {}),
+    ...(process.env.RELAYHISTORY_ORIGIN
+      ? { RELAYHISTORY_ORIGIN: process.env.RELAYHISTORY_ORIGIN }
+      : {}),
+    ...(process.env.MANIFEST_MACHINE_CLAIM
+      ? { MANIFEST_MACHINE_CLAIM: process.env.MANIFEST_MACHINE_CLAIM }
+      : {}),
+    ...(process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM
+      ? {
+          MANIFEST_MACHINE_CLAIM_COMPAT_FROM:
+            process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM,
+        }
+      : {}),
+    ...(process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL
+      ? {
+          MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL:
+            process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL,
+        }
+      : {}),
+    ...(process.env.BACKFILL_ACTIVATION_MAX_ATTEMPTS
+      ? {
+          BACKFILL_ACTIVATION_MAX_ATTEMPTS:
+            process.env.BACKFILL_ACTIVATION_MAX_ATTEMPTS,
+        }
+      : {}),
+    ...(process.env.BACKFILL_ACTIVATION_MAX_DELAY_SECONDS
+      ? {
+          BACKFILL_ACTIVATION_MAX_DELAY_SECONDS:
+            process.env.BACKFILL_ACTIVATION_MAX_DELAY_SECONDS,
+        }
+      : {}),
+    ...(process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS
+      ? {
+          RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS:
+            process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS,
+        }
+      : {}),
     // RelayAuth migration assertions (relayauth#110): default off. Grants are
     // `grantId=planDigest` pairs (ids and public digests only, no secrets).
     ...(process.env.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS
@@ -215,16 +247,24 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
   const readiness = postgresReadinessStore(db);
   // Activation starts at the first start with a window set, used or not.
   const window = claimlessWindowDates(env);
-  if (window) await firstClaimlessActivation(db, window.from).catch((err) => log.warn("claimless window activation not recorded", errorFields(err)));
+  if (window)
+    await firstClaimlessActivation(db, window.from).catch((err) =>
+      log.warn("claimless window activation not recorded", errorFields(err)),
+    );
   const courierManifests = createCourierManifestRoutes({
     manifests: reader,
     raw,
     send,
     migrationLedger,
-    missingReaders: () => missingReaders({ key: process.env.MANIFEST_READINESS_KEY, store: readiness }),
+    missingReaders: () =>
+      missingReaders({
+        key: process.env.MANIFEST_READINESS_KEY,
+        store: readiness,
+      }),
     recordClaimless: (use) => recordClaimlessUse(db, use),
     firstClaimlessActivation: (from) => firstClaimlessActivation(db, from),
-    requeueBackfill: (_env, message, delaySeconds) => queue.send(message, { delaySeconds }),
+    requeueBackfill: (_env, message, delaySeconds) =>
+      queue.send(message, { delaySeconds }),
   });
 
   const app = new Hono<AppEnv>();

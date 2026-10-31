@@ -120,11 +120,16 @@ describe("the local composition", () => {
       MANIFEST_MACHINE_CLAIM_COMPAT_FROM: from,
       MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: until,
     });
-    expect(() => localClaimEnv({ from, until: "2026-11-05T00:00:00.000Z" })).toThrow(/72 hours/);
+    expect(() =>
+      localClaimEnv({ from, until: "2026-11-05T00:00:00.000Z" }),
+    ).toThrow(/72 hours/);
   });
 
   test("alchemy.run.ts composes the ingest through it", () => {
-    const stack = readFileSync(new URL("../../alchemy.run.ts", import.meta.url), "utf8");
+    const stack = readFileSync(
+      new URL("../../alchemy.run.ts", import.meta.url),
+      "utf8",
+    );
     expect(stack).toContain("...localClaimEnv(inputs.claimlessWindow)");
   });
 });

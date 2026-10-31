@@ -19,7 +19,19 @@ import * as Layer from "effect/Layer";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { HOOPDB_NAME, HOOPDB_USER, IMAGES, IMAGE_PATHS, LOCKER_BUCKET, NAMES, PORTS, STACK, SUMMARY_KEY_CONTAINER_PATH, TENANT, summaryKeyPath } from "./stacks/local/topology.ts";
+import {
+  HOOPDB_NAME,
+  HOOPDB_USER,
+  IMAGES,
+  IMAGE_PATHS,
+  LOCKER_BUCKET,
+  NAMES,
+  PORTS,
+  STACK,
+  SUMMARY_KEY_CONTAINER_PATH,
+  TENANT,
+  summaryKeyPath,
+} from "./stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 
@@ -44,7 +56,9 @@ function readInputs(stage: string): LocalInputs {
   try {
     return JSON.parse(readFileSync(path, "utf8")) as LocalInputs;
   } catch {
-    throw new Error(`96bulls: ${path} is missing; run \`bin/96bulls up ${stage}\` instead of alchemy directly`);
+    throw new Error(
+      `96bulls: ${path} is missing; run \`bin/96bulls up ${stage}\` instead of alchemy directly`,
+    );
   }
 }
 
@@ -57,19 +71,29 @@ export default Alchemy.Stack(
   Effect.gen(function* () {
     const stage = yield* Stage;
     if (stage.startsWith("aws")) {
-      throw new Error("96bulls: AWS stages are not cleared yet (see docs/aws-stage.md); nothing was created");
+      throw new Error(
+        "96bulls: AWS stages are not cleared yet (see docs/aws-stage.md); nothing was created",
+      );
     }
     if (stage !== "local" && !stage.startsWith("local-")) {
-      throw new Error(`96bulls: unknown stage ${stage}; use local or local-<name>`);
+      throw new Error(
+        `96bulls: unknown stage ${stage}; use local or local-<name>`,
+      );
     }
     const inputs = readInputs(stage);
     const suffix = stage === "local" ? "" : `-${stage.slice("local-".length)}`;
     const name = (base: string) => `${base}${suffix}`;
 
     const net = yield* Docker.Network("net", { name: name(NAMES.network) });
-    const hoopdbData = yield* Docker.Volume("hoopdb-data", { name: name(NAMES.hoopdbData) });
-    const lockerData = yield* Docker.Volume("locker-data", { name: name(NAMES.lockerData) });
-    const telemetry = yield* Docker.Volume("telemetry", { name: name(NAMES.telemetry) });
+    const hoopdbData = yield* Docker.Volume("hoopdb-data", {
+      name: name(NAMES.hoopdbData),
+    });
+    const lockerData = yield* Docker.Volume("locker-data", {
+      name: name(NAMES.lockerData),
+    });
+    const telemetry = yield* Docker.Volume("telemetry", {
+      name: name(NAMES.telemetry),
+    });
 
     const hoopdbUrlInCluster = `postgres://${HOOPDB_USER}:${inputs.hoopdbPassword}@${name(NAMES.hoopdb)}:5432/${HOOPDB_NAME}`;
     const lockerEndpointInCluster = `http://${name(NAMES.locker)}:9000`;
@@ -79,11 +103,25 @@ export default Alchemy.Stack(
     const hoopdb = yield* Docker.Container("hoopdb", {
       name: name(NAMES.hoopdb),
       image: IMAGES.hoopdb,
-      environment: { POSTGRES_DB: HOOPDB_NAME, POSTGRES_USER: HOOPDB_USER, POSTGRES_PASSWORD: inputs.hoopdbPassword },
+      environment: {
+        POSTGRES_DB: HOOPDB_NAME,
+        POSTGRES_USER: HOOPDB_USER,
+        POSTGRES_PASSWORD: inputs.hoopdbPassword,
+      },
       ports: [{ external: `127.0.0.1:${PORTS.hoopdb}`, internal: 5432 }], // loopback only: the ingest API is the boundary
-      volumes: [{ hostPath: hoopdbData.name, containerPath: "/var/lib/postgresql/data" }],
+      volumes: [
+        {
+          hostPath: hoopdbData.name,
+          containerPath: "/var/lib/postgresql/data",
+        },
+      ],
       networks: [{ name: net.name, aliases: [name(NAMES.hoopdb)] }],
-      healthcheck: { cmd: ["CMD-SHELL", `pg_isready -U ${HOOPDB_USER} -d ${HOOPDB_NAME}`], interval: "5 seconds", timeout: "3 seconds", retries: 20 },
+      healthcheck: {
+        cmd: ["CMD-SHELL", `pg_isready -U ${HOOPDB_USER} -d ${HOOPDB_NAME}`],
+        interval: "5 seconds",
+        timeout: "3 seconds",
+        retries: 20,
+      },
       restart: "unless-stopped",
       labels: { "96bulls.stack": stage, "96bulls.component": "hoopdb" },
       start: true,
@@ -94,11 +132,23 @@ export default Alchemy.Stack(
       name: name(NAMES.locker),
       image: IMAGES.locker,
       command: ["server", "/data", "--address", ":9000"],
-      environment: { MINIO_ROOT_USER: inputs.lockerAccessKeyId, MINIO_ROOT_PASSWORD: inputs.lockerSecretAccessKey, MINIO_BROWSER: "off" },
+      environment: {
+        MINIO_ROOT_USER: inputs.lockerAccessKeyId,
+        MINIO_ROOT_PASSWORD: inputs.lockerSecretAccessKey,
+        MINIO_BROWSER: "off",
+      },
       ports: [{ external: `127.0.0.1:${PORTS.locker}`, internal: 9000 }],
       volumes: [{ hostPath: lockerData.name, containerPath: "/data" }],
       networks: [{ name: net.name, aliases: [name(NAMES.locker)] }],
-      healthcheck: { cmd: ["CMD-SHELL", 'mc alias set h http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 && mc ready h >/dev/null 2>&1'], interval: "5 seconds", timeout: "4 seconds", retries: 20 },
+      healthcheck: {
+        cmd: [
+          "CMD-SHELL",
+          'mc alias set h http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 && mc ready h >/dev/null 2>&1',
+        ],
+        interval: "5 seconds",
+        timeout: "4 seconds",
+        retries: 20,
+      },
       restart: "unless-stopped",
       labels: { "96bulls.stack": stage, "96bulls.component": "locker" },
       start: true,
@@ -108,8 +158,14 @@ export default Alchemy.Stack(
     const telemetryInit = yield* Docker.Container("telemetry-init", {
       name: name(NAMES.telemetryInit),
       image: IMAGES.init,
-      command: ["sh", "-c", `chmod 0777 ${IMAGE_PATHS.telemetry} && echo telemetry volume ready`],
-      volumes: [{ hostPath: telemetry.name, containerPath: IMAGE_PATHS.telemetry }],
+      command: [
+        "sh",
+        "-c",
+        `chmod 0777 ${IMAGE_PATHS.telemetry} && echo telemetry volume ready`,
+      ],
+      volumes: [
+        { hostPath: telemetry.name, containerPath: IMAGE_PATHS.telemetry },
+      ],
       restart: "no",
       labels: { "96bulls.stack": stage, "96bulls.component": "telemetry-init" },
       start: true,
@@ -122,12 +178,20 @@ export default Alchemy.Stack(
       command: ["--config=/etc/otelcol/config.yaml"],
       ports: [{ external: `127.0.0.1:${PORTS.otelHttp}`, internal: 4318 }],
       volumes: [
-        { hostPath: join(ROOT, "docker/otel-collector.yaml"), containerPath: "/etc/otelcol/config.yaml", readOnly: true },
+        {
+          hostPath: join(ROOT, "docker/otel-collector.yaml"),
+          containerPath: "/etc/otelcol/config.yaml",
+          readOnly: true,
+        },
         { hostPath: telemetry.name, containerPath: IMAGE_PATHS.telemetry },
       ],
       networks: [{ name: net.name, aliases: [name(NAMES.otel)] }],
       restart: "unless-stopped",
-      labels: { "96bulls.stack": stage, "96bulls.component": "otel-collector", "96bulls.after": telemetryInit.name },
+      labels: {
+        "96bulls.stack": stage,
+        "96bulls.component": "otel-collector",
+        "96bulls.after": telemetryInit.name,
+      },
       start: true,
     });
 
@@ -136,7 +200,10 @@ export default Alchemy.Stack(
       name: "96bulls/services",
       tag: stage,
       skipPush: true,
-      build: { context: ROOT, dockerfile: join(ROOT, "docker/services.Dockerfile") },
+      build: {
+        context: ROOT,
+        dockerfile: join(ROOT, "docker/services.Dockerfile"),
+      },
     });
 
     const common = {
@@ -153,80 +220,172 @@ export default Alchemy.Stack(
       DEPLOYMENT_ID: inputs.deploymentId,
       ENVIRONMENT: "local",
     };
-    const service = (id: string, containerName: string, serviceName: string, extra: Record<string, string> = {}, opts: { ports?: Array<{ external: number | string; internal: number }>; volumes?: Array<{ hostPath: string; containerPath: string; readOnly?: boolean }>; restart?: "no" | "unless-stopped" } = {}) =>
+    const service = (
+      id: string,
+      containerName: string,
+      serviceName: string,
+      extra: Record<string, string> = {},
+      opts: {
+        ports?: Array<{ external: number | string; internal: number }>;
+        volumes?: Array<{
+          hostPath: string;
+          containerPath: string;
+          readOnly?: boolean;
+        }>;
+        restart?: "no" | "unless-stopped";
+      } = {},
+    ) =>
       Docker.Container(id, {
         name: containerName,
         image: services,
-        environment: { ...common, SERVICE: serviceName, OTEL_SERVICE_NAME: serviceName, ...extra },
+        environment: {
+          ...common,
+          SERVICE: serviceName,
+          OTEL_SERVICE_NAME: serviceName,
+          ...extra,
+        },
         networks: [{ name: net.name, aliases: [containerName] }],
         restart: opts.restart ?? "unless-stopped",
         ...(opts.ports ? { ports: opts.ports } : {}),
         ...(opts.volumes ? { volumes: opts.volumes } : {}),
         labels: { "96bulls.stack": stage, "96bulls.component": serviceName },
         // Workers serve /healthz on WORKER_HEALTH_PORT (8081); the ingest on 8080. One probe for both.
-        ...(serviceName === "hoopdb-migrate" || serviceName === "locker-init" || serviceName === "alleyoop-courier"
+        ...(serviceName === "hoopdb-migrate" ||
+        serviceName === "locker-init" ||
+        serviceName === "alleyoop-courier"
           ? {}
-          : { healthcheck: { cmd: ["CMD-SHELL", `bun -e "fetch('http://127.0.0.1:${serviceName === "alleyoop-ingest" ? 8080 : 8081}/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"`], interval: "15 seconds", timeout: "5 seconds", retries: 3 } }),
+          : {
+              healthcheck: {
+                cmd: [
+                  "CMD-SHELL",
+                  `bun -e "fetch('http://127.0.0.1:${serviceName === "alleyoop-ingest" ? 8080 : 8081}/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"`,
+                ],
+                interval: "15 seconds",
+                timeout: "5 seconds",
+                retries: 3,
+              },
+            }),
         start: true,
       });
 
     // Locker init: the bucket, created once (SigV4, no SDK); retries until MinIO answers. A Job in every stage.
-    yield* service("locker-init", name(NAMES.lockerInit), "locker-init", {}, { restart: "no" });
+    yield* service(
+      "locker-init",
+      name(NAMES.lockerInit),
+      "locker-init",
+      {},
+      { restart: "no" },
+    );
 
     // HoopDb migrations: one-shot, idempotent, no hooks. Exits 0 when the ledger is complete.
-    yield* service("hoopdb-migrate", name(NAMES.hoopdbMigrate), "hoopdb-migrate", {}, { restart: "no" });
+    yield* service(
+      "hoopdb-migrate",
+      name(NAMES.hoopdbMigrate),
+      "hoopdb-migrate",
+      {},
+      { restart: "no" },
+    );
 
     // AlleyOop ingest (Technical Foul runs inside it, before any byte reaches the Locker).
-    const ingest = yield* service("alleyoop-ingest", name(NAMES.ingest), "alleyoop-ingest", {
-      INGEST_PORT: "8080",
-      JWKS_JSON: inputs.jwksJson,
-      AUTH_ISSUER: TENANT.issuer,
-      // Local Docker dev stack only: the courier's tokens are minted from this
-      // stack's own key, so the broad interim bearer is an explicit opt-in here.
-      // The ingest defaults it off (src/alleyoop/ingest.ts).
-      ALLOW_INTERIM_RELAYAUTH_BEARER: "true",
-      // Default off: a local stage's tokens carry the claim, so it needs no window.
-      ...localClaimEnv(inputs.claimlessWindow),
-    }, { ports: [{ external: `127.0.0.1:${PORTS.ingest}`, internal: 8080 }] });
+    const ingest = yield* service(
+      "alleyoop-ingest",
+      name(NAMES.ingest),
+      "alleyoop-ingest",
+      {
+        INGEST_PORT: "8080",
+        JWKS_JSON: inputs.jwksJson,
+        AUTH_ISSUER: TENANT.issuer,
+        // Local Docker dev stack only: the courier's tokens are minted from this
+        // stack's own key, so the broad interim bearer is an explicit opt-in here.
+        // The ingest defaults it off (src/alleyoop/ingest.ts).
+        ALLOW_INTERIM_RELAYAUTH_BEARER: "true",
+        // Default off: a local stage's tokens carry the claim, so it needs no window.
+        ...localClaimEnv(inputs.claimlessWindow),
+      },
+      { ports: [{ external: `127.0.0.1:${PORTS.ingest}`, internal: 8080 }] },
+    );
 
     yield* service("hoopdb-indexer", name(NAMES.indexer), "hoopdb-indexer");
     yield* service("referee", name(NAMES.referee), "referee");
     // Only Bob Costas gets the summary master key, as a read-only file from the runtime tmpfs:
     // the key never enters .96bulls/ or Alchemy state (only its path does).
     const summaryKey = summaryKeyPath(stage);
-    if (!existsSync(summaryKey)) throw new Error(`96bulls: ${summaryKey} is missing; run \`bin/96bulls up ${stage}\` instead of alchemy directly`);
-    yield* service("bob-costas", name(NAMES.bobCostas), "bob-costas",
-      { BOB_COSTAS_MODEL: "off", SUMMARY_MASTER_KEYS_FILE: SUMMARY_KEY_CONTAINER_PATH },
-      { volumes: [{ hostPath: summaryKey, containerPath: SUMMARY_KEY_CONTAINER_PATH, readOnly: true }] });
+    if (!existsSync(summaryKey))
+      throw new Error(
+        `96bulls: ${summaryKey} is missing; run \`bin/96bulls up ${stage}\` instead of alchemy directly`,
+      );
+    yield* service(
+      "bob-costas",
+      name(NAMES.bobCostas),
+      "bob-costas",
+      {
+        BOB_COSTAS_MODEL: "off",
+        SUMMARY_MASTER_KEYS_FILE: SUMMARY_KEY_CONTAINER_PATH,
+      },
+      {
+        volumes: [
+          {
+            hostPath: summaryKey,
+            containerPath: SUMMARY_KEY_CONTAINER_PATH,
+            readOnly: true,
+          },
+        ],
+      },
+    );
 
     // AlleyOop courier: watches the seeded Concourse (history.db) and uploads.
-    yield* service("alleyoop-courier", name(NAMES.courier), "alleyoop-courier", {
-      CONCOURSE_DB: `${inputs.concourseDir}/history.db`,
-      COURIER_STATE: `${inputs.concourseDir}/.alleyoop-courier.json`,
-      INGEST_URL: `http://${name(NAMES.ingest)}:8080`,
-      // The courier only talks to AlleyOop now; it never receives Locker credentials.
-      LOCKER_ACCESS_KEY_ID: "",
-      LOCKER_SECRET_ACCESS_KEY: "",
-      // Short-lived tokens minted in memory from the stack's own key; no 7-day token in the container.
-      JWT_KID: inputs.jwtKid,
-      JWT_PRIVATE_KEY_PEM: inputs.jwtPrivateKeyPem,
-      AUTH_ISSUER: TENANT.issuer,
-      USER_ID: TENANT.userId,
-      MACHINE_ID: inputs.machineId,
-      COURIER_START_MODE: "all",
-      COURIER_INTERVAL_MS: "5000",
-      COURIER_CLOSE_AFTER_MINUTES: "30",
-    }, {
-      // Mounted at the same absolute path so raw_path values in history.db stay valid.
-      volumes: [{ hostPath: inputs.concourseDir, containerPath: inputs.concourseDir }],
-    });
+    yield* service(
+      "alleyoop-courier",
+      name(NAMES.courier),
+      "alleyoop-courier",
+      {
+        CONCOURSE_DB: `${inputs.concourseDir}/history.db`,
+        COURIER_STATE: `${inputs.concourseDir}/.alleyoop-courier.json`,
+        INGEST_URL: `http://${name(NAMES.ingest)}:8080`,
+        // The courier only talks to AlleyOop now; it never receives Locker credentials.
+        LOCKER_ACCESS_KEY_ID: "",
+        LOCKER_SECRET_ACCESS_KEY: "",
+        // Short-lived tokens minted in memory from the stack's own key; no 7-day token in the container.
+        JWT_KID: inputs.jwtKid,
+        JWT_PRIVATE_KEY_PEM: inputs.jwtPrivateKeyPem,
+        AUTH_ISSUER: TENANT.issuer,
+        USER_ID: TENANT.userId,
+        MACHINE_ID: inputs.machineId,
+        COURIER_START_MODE: "all",
+        COURIER_INTERVAL_MS: "5000",
+        COURIER_CLOSE_AFTER_MINUTES: "30",
+      },
+      {
+        // Mounted at the same absolute path so raw_path values in history.db stay valid.
+        volumes: [
+          { hostPath: inputs.concourseDir, containerPath: inputs.concourseDir },
+        ],
+      },
+    );
 
     return {
       stage,
-      hoopdb: { host: "127.0.0.1", port: PORTS.hoopdb, database: HOOPDB_NAME, user: HOOPDB_USER, container: hoopdb.name },
-      locker: { endpoint: `http://127.0.0.1:${PORTS.locker}`, bucket: LOCKER_BUCKET, container: locker.name },
-      ingest: { url: `http://127.0.0.1:${PORTS.ingest}`, container: ingest.name },
-      otel: { endpoint: `http://127.0.0.1:${PORTS.otelHttp}`, container: otel.name, telemetryVolume: telemetry.name },
+      hoopdb: {
+        host: "127.0.0.1",
+        port: PORTS.hoopdb,
+        database: HOOPDB_NAME,
+        user: HOOPDB_USER,
+        container: hoopdb.name,
+      },
+      locker: {
+        endpoint: `http://127.0.0.1:${PORTS.locker}`,
+        bucket: LOCKER_BUCKET,
+        container: locker.name,
+      },
+      ingest: {
+        url: `http://127.0.0.1:${PORTS.ingest}`,
+        container: ingest.name,
+      },
+      otel: {
+        endpoint: `http://127.0.0.1:${PORTS.otelHttp}`,
+        container: otel.name,
+        telemetryVolume: telemetry.name,
+      },
     };
   }),
 );

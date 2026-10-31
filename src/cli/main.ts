@@ -16,13 +16,29 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateLocalKeys, mintToken } from "../alleyoop/auth.ts";
 import { seedConcourse } from "../concourse/seed.ts";
 import { planChildExitCode, planChildMustFailClosed } from "./plan-exit.ts";
-import { HOOPDB_NAME, HOOPDB_USER, NAMES, PORTS, SERVICES_CONTAINER_UID, TENANT, summaryKeyAccess, summaryKeyPath } from "../../stacks/local/topology.ts";
+import {
+  HOOPDB_NAME,
+  HOOPDB_USER,
+  NAMES,
+  PORTS,
+  SERVICES_CONTAINER_UID,
+  TENANT,
+  summaryKeyAccess,
+  summaryKeyPath,
+} from "../../stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const args = process.argv.slice(2);
@@ -34,7 +50,16 @@ function die(message: string, code = 2): never {
   process.exit(code);
 }
 
-function sh(cmd: string, cmdArgs: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv; quiet?: boolean; allowFail?: boolean } = {}) {
+function sh(
+  cmd: string,
+  cmdArgs: string[],
+  opts: {
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    quiet?: boolean;
+    allowFail?: boolean;
+  } = {},
+) {
   const r = spawnSync(cmd, cmdArgs, {
     cwd: opts.cwd ?? ROOT,
     env: { ...process.env, ...opts.env },
@@ -42,11 +67,15 @@ function sh(cmd: string, cmdArgs: string[], opts: { cwd?: string; env?: NodeJS.P
     encoding: "utf8",
   });
   if (planChildMustFailClosed(opts.allowFail, r.status))
-    die(`${cmd} ${cmdArgs.join(" ")} failed (exit ${r.status})`, planChildExitCode(r.status));
+    die(
+      `${cmd} ${cmdArgs.join(" ")} failed (exit ${r.status})`,
+      planChildExitCode(r.status),
+    );
   return r;
 }
 
-const docker = (...a: string[]) => sh("docker", a, { quiet: true, allowFail: true });
+const docker = (...a: string[]) =>
+  sh("docker", a, { quiet: true, allowFail: true });
 
 interface Inputs {
   hoopdbPassword: string;
@@ -72,14 +101,24 @@ function ensureSummaryKey(stage: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   chmodSync(dirname(path), 0o700);
   if (!existsSync(path))
-    writeFileSync(path, `local-${randomBytes(4).toString("hex")}:${randomBytes(32).toString("hex")}\n`, { mode: 0o600 });
+    writeFileSync(
+      path,
+      `local-${randomBytes(4).toString("hex")}:${randomBytes(32).toString("hex")}\n`,
+      { mode: 0o600 },
+    );
   const access = summaryKeyAccess(process.getuid?.() ?? SERVICES_CONTAINER_UID);
   chmodSync(path, access.mode);
   if (access.aclReadForUid !== undefined) {
     // The container user (bun) is not this uid: grant it read with one ACL entry, nothing broader.
-    const r = spawnSync("setfacl", ["-m", `u:${access.aclReadForUid}:r`, path], { stdio: "ignore" });
+    const r = spawnSync(
+      "setfacl",
+      ["-m", `u:${access.aclReadForUid}:r`, path],
+      { stdio: "ignore" },
+    );
     if (r.status !== 0)
-      die(`cannot grant the container user (uid ${access.aclReadForUid}) read access to ${path}: setfacl failed or ACLs are unsupported. Run as uid ${access.aclReadForUid} or install acl; the key is never made world-readable.`);
+      die(
+        `cannot grant the container user (uid ${access.aclReadForUid}) read access to ${path}: setfacl failed or ACLs are unsupported. Run as uid ${access.aclReadForUid} or install acl; the key is never made world-readable.`,
+      );
   }
 }
 
@@ -89,9 +128,16 @@ function stageDir(stage: string) {
 
 function requireLocalStage(stage: string | undefined): string {
   if (!stage) die("stage is required, e.g. `96bulls up local`");
-  if (stage.startsWith("aws")) die("AWS stages are not cleared yet; nothing was created (docs/aws-stage.md)");
-  if (stage.startsWith("gcp")) die("GCP stages are not cleared for up/down; nothing was created (docs/gcp-stage.md)");
-  if (stage !== "local" && !stage.startsWith("local-")) die(`unknown stage ${stage}; use local or local-<name>`);
+  if (stage.startsWith("aws"))
+    die(
+      "AWS stages are not cleared yet; nothing was created (docs/aws-stage.md)",
+    );
+  if (stage.startsWith("gcp"))
+    die(
+      "GCP stages are not cleared for up/down; nothing was created (docs/gcp-stage.md)",
+    );
+  if (stage !== "local" && !stage.startsWith("local-"))
+    die(`unknown stage ${stage}; use local or local-<name>`);
   return stage;
 }
 
@@ -105,7 +151,8 @@ function prepareInputs(stage: string): Inputs {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, "inputs.json");
   let inputs: Partial<Inputs> = {};
-  if (existsSync(path)) inputs = JSON.parse(readFileSync(path, "utf8")) as Inputs;
+  if (existsSync(path))
+    inputs = JSON.parse(readFileSync(path, "utf8")) as Inputs;
   if (!inputs.jwtPrivateKeyPem) {
     const keys = generateLocalKeys();
     inputs.jwtPrivateKeyPem = keys.privateKeyPem;
@@ -122,15 +169,18 @@ function prepareInputs(stage: string): Inputs {
   // Never persist the summary master key here (AGENTS.md: nothing credential-like on disk).
   delete (inputs as Record<string, unknown>).summaryMasterKeys;
   ensureSummaryKey(stage);
-  inputs.courierToken = mintToken({ kid: inputs.jwtKid!, privateKeyPem: inputs.jwtPrivateKeyPem }, {
-    issuer: TENANT.issuer,
-    audience: "relayhistory",
-    orgId: TENANT.orgId,
-    workspaceId: TENANT.workspaceId,
-    userId: TENANT.userId,
-    machineId: inputs.machineId,
-    ttlSeconds: 7 * 24 * 3600,
-  });
+  inputs.courierToken = mintToken(
+    { kid: inputs.jwtKid!, privateKeyPem: inputs.jwtPrivateKeyPem },
+    {
+      issuer: TENANT.issuer,
+      audience: "relayhistory",
+      orgId: TENANT.orgId,
+      workspaceId: TENANT.workspaceId,
+      userId: TENANT.userId,
+      machineId: inputs.machineId,
+      ttlSeconds: 7 * 24 * 3600,
+    },
+  );
   mkdirSync(inputs.concourseDir, { recursive: true });
   mkdirSync(inputs.telemetryDir, { recursive: true });
   writeFileSync(path, JSON.stringify(inputs, null, 2), { mode: 0o600 });
@@ -139,7 +189,8 @@ function prepareInputs(stage: string): Inputs {
 
 export function loadInputs(stage: string): Inputs {
   const path = join(stageDir(stage), "inputs.json");
-  if (!existsSync(path)) die(`${path} is missing; run \`96bulls up ${stage}\` first`);
+  if (!existsSync(path))
+    die(`${path} is missing; run \`96bulls up ${stage}\` first`);
   return JSON.parse(readFileSync(path, "utf8")) as Inputs;
 }
 
@@ -149,32 +200,65 @@ export function hostHoopDbUrl(stage: string, inputs = loadInputs(stage)) {
 
 function preflight() {
   const checks: Array<[string, () => boolean]> = [
-    ["docker daemon", () => docker("info", "--format", "{{.ServerVersion}}").status === 0],
-    ["alchemy cli", () => existsSync(join(ROOT, "node_modules/alchemy/package.json"))],
-    ["workspace installed", () => {
-      // Resolve as the runtime does: Bun may hoist hono to the root or nest it under the package.
-      try {
-        createRequire(join(ROOT, "packages/pipeline/package.json")).resolve("hono");
-        return true;
-      } catch {
-        return false;
-      }
-    }],
-    ["ai-hist built (vendor/relayhistory)", () => existsSync(join(ROOT, "vendor/relayhistory/target/release/ai-hist")) || Boolean(process.env.AI_HIST_BIN)],
+    [
+      "docker daemon",
+      () => docker("info", "--format", "{{.ServerVersion}}").status === 0,
+    ],
+    [
+      "alchemy cli",
+      () => existsSync(join(ROOT, "node_modules/alchemy/package.json")),
+    ],
+    [
+      "workspace installed",
+      () => {
+        // Resolve as the runtime does: Bun may hoist hono to the root or nest it under the package.
+        try {
+          createRequire(join(ROOT, "packages/pipeline/package.json")).resolve(
+            "hono",
+          );
+          return true;
+        } catch {
+          return false;
+        }
+      },
+    ],
+    [
+      "ai-hist built (vendor/relayhistory)",
+      () =>
+        existsSync(join(ROOT, "vendor/relayhistory/target/release/ai-hist")) ||
+        Boolean(process.env.AI_HIST_BIN),
+    ],
   ];
-  for (const [label, ok] of checks) if (!ok()) die(`preflight failed: ${label}`);
+  for (const [label, ok] of checks)
+    if (!ok()) die(`preflight failed: ${label}`);
   for (const [label, port] of Object.entries(PORTS)) {
-    const r = spawnSync("sh", ["-c", `ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ':${port}$'`]);
+    const r = spawnSync("sh", [
+      "-c",
+      `ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ':${port}$'`,
+    ]);
     if (r.status === 0) {
-      const mine = docker("ps", "--filter", `label=96bulls.stack`, "--format", "{{.Ports}}").stdout?.includes(`:${port}->`);
-      if (!mine) die(`preflight failed: host port ${port} (${label}) is in use by something that is not this stack`);
+      const mine = docker(
+        "ps",
+        "--filter",
+        `label=96bulls.stack`,
+        "--format",
+        "{{.Ports}}",
+      ).stdout?.includes(`:${port}->`);
+      if (!mine)
+        die(
+          `preflight failed: host port ${port} (${label}) is in use by something that is not this stack`,
+        );
     }
   }
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function waitFor(label: string, check: () => boolean | Promise<boolean>, timeoutMs: number) {
+async function waitFor(
+  label: string,
+  check: () => boolean | Promise<boolean>,
+  timeoutMs: number,
+) {
   const started = Date.now();
   process.stdout.write(`  waiting for ${label} `);
   for (;;) {
@@ -191,8 +275,17 @@ async function waitFor(label: string, check: () => boolean | Promise<boolean>, t
   }
 }
 
-function containerState(name: string): { status?: string; health?: string; exit?: number } {
-  const r = docker("inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.State.ExitCode}}", name);
+function containerState(name: string): {
+  status?: string;
+  health?: string;
+  exit?: number;
+} {
+  const r = docker(
+    "inspect",
+    "--format",
+    "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.State.ExitCode}}",
+    name,
+  );
   if (r.status !== 0) return {};
   const [status, health, exit] = (r.stdout ?? "").trim().split(" ");
   return { status, health, exit: Number(exit) };
@@ -200,32 +293,65 @@ function containerState(name: string): { status?: string; health?: string; exit?
 
 async function readiness(stage: string) {
   const n = (b: string) => suffixed(stage, b);
-  await waitFor("hoopdb", () => containerState(n(NAMES.hoopdb)).health === "healthy", 120_000);
-  await waitFor("locker", () => containerState(n(NAMES.locker)).health === "healthy", 120_000);
-  await waitFor("locker bucket", () => {
-    const s = containerState(n(NAMES.lockerInit));
-    return s.status === "exited" && s.exit === 0;
-  }, 120_000);
-  await waitFor("hoopdb migrations", () => {
-    const s = containerState(n(NAMES.hoopdbMigrate));
-    if (s.status === "exited" && s.exit !== 0) die(`migrations failed; see: docker logs ${n(NAMES.hoopdbMigrate)}`);
-    return s.status === "exited" && s.exit === 0;
-  }, 600_000);
-  await waitFor("alleyoop ingest /readyz", async () => {
-    try {
-      return (await fetch(`http://127.0.0.1:${PORTS.ingest}/readyz`)).status === 200;
-    } catch {
-      return false;
-    }
-  }, 180_000);
-  for (const c of [NAMES.indexer, NAMES.referee, NAMES.bobCostas, NAMES.courier, NAMES.otel])
+  await waitFor(
+    "hoopdb",
+    () => containerState(n(NAMES.hoopdb)).health === "healthy",
+    120_000,
+  );
+  await waitFor(
+    "locker",
+    () => containerState(n(NAMES.locker)).health === "healthy",
+    120_000,
+  );
+  await waitFor(
+    "locker bucket",
+    () => {
+      const s = containerState(n(NAMES.lockerInit));
+      return s.status === "exited" && s.exit === 0;
+    },
+    120_000,
+  );
+  await waitFor(
+    "hoopdb migrations",
+    () => {
+      const s = containerState(n(NAMES.hoopdbMigrate));
+      if (s.status === "exited" && s.exit !== 0)
+        die(`migrations failed; see: docker logs ${n(NAMES.hoopdbMigrate)}`);
+      return s.status === "exited" && s.exit === 0;
+    },
+    600_000,
+  );
+  await waitFor(
+    "alleyoop ingest /readyz",
+    async () => {
+      try {
+        return (
+          (await fetch(`http://127.0.0.1:${PORTS.ingest}/readyz`)).status ===
+          200
+        );
+      } catch {
+        return false;
+      }
+    },
+    180_000,
+  );
+  for (const c of [
+    NAMES.indexer,
+    NAMES.referee,
+    NAMES.bobCostas,
+    NAMES.courier,
+    NAMES.otel,
+  ])
     await waitFor(c, () => containerState(n(c)).status === "running", 60_000);
 }
 
 async function seed(stage: string, fresh: boolean) {
   const inputs = loadInputs(stage);
   const r = await seedConcourse({ dir: inputs.concourseDir, fresh });
-  writeFileSync(join(stageDir(stage), "seed.json"), JSON.stringify({ seededAt: new Date().toISOString(), ...r }, null, 2));
+  writeFileSync(
+    join(stageDir(stage), "seed.json"),
+    JSON.stringify({ seededAt: new Date().toISOString(), ...r }, null, 2),
+  );
   console.log(`  concourse: ${r.sessions.length} sessions in ${r.dbPath}`);
 }
 
@@ -234,15 +360,28 @@ async function up(stage: string) {
   console.log(`96bulls up ${stage}`);
   const inputs = prepareInputs(stage);
   const seedPath = join(stageDir(stage), "seed.json");
-  if (flags.has("--reseed") || !existsSync(seedPath) || !existsSync(join(inputs.concourseDir, "history.db"))) await seed(stage, true);
-  sh("bunx", ["alchemy", "deploy", "--stage", stage, "--yes", "--no-input"], { env: { ALCHEMY_PLAIN: "1" } });
+  if (
+    flags.has("--reseed") ||
+    !existsSync(seedPath) ||
+    !existsSync(join(inputs.concourseDir, "history.db"))
+  )
+    await seed(stage, true);
+  sh("bunx", ["alchemy", "deploy", "--stage", stage, "--yes", "--no-input"], {
+    env: { ALCHEMY_PLAIN: "1" },
+  });
   await readiness(stage);
   console.log("\n96bulls is up:");
-  console.log(`  hoopdb   postgres://${HOOPDB_USER}:***@127.0.0.1:${PORTS.hoopdb}/${HOOPDB_NAME}`);
+  console.log(
+    `  hoopdb   postgres://${HOOPDB_USER}:***@127.0.0.1:${PORTS.hoopdb}/${HOOPDB_NAME}`,
+  );
   console.log(`  locker   http://127.0.0.1:${PORTS.locker}  bucket=locker`);
-  console.log(`  ingest   http://127.0.0.1:${PORTS.ingest}  (/healthz, /readyz, /v1/pipeline/*)`);
+  console.log(
+    `  ingest   http://127.0.0.1:${PORTS.ingest}  (/healthz, /readyz, /v1/pipeline/*)`,
+  );
   console.log(`  otel     http://127.0.0.1:${PORTS.otelHttp}`);
-  console.log(`  secrets  ${join(stageDir(stage), "inputs.json")} (mode 600, gitignored)`);
+  console.log(
+    `  secrets  ${join(stageDir(stage), "inputs.json")} (mode 600, gitignored)`,
+  );
   console.log(`\nnext: 96bulls smoke ${stage}`);
 }
 
@@ -251,53 +390,110 @@ async function down(stage: string) {
   // Stop everything first so destroy only has to remove stopped containers. A
   // forced removal of a running container under a busy daemon has been seen to
   // sit in "removal in progress" for 20+ minutes on this machine.
-  const running = (docker("ps", "-q", "--filter", `label=96bulls.stack=${stage}`).stdout ?? "").split("\n").filter(Boolean);
+  const running = (
+    docker("ps", "-q", "--filter", `label=96bulls.stack=${stage}`).stdout ?? ""
+  )
+    .split("\n")
+    .filter(Boolean);
   if (running.length) docker("stop", "-t", "15", ...running);
   if (!existsSync(join(stageDir(stage), "inputs.json"))) {
-    console.log("  nothing recorded for this stage; removing any leftover containers by label");
+    console.log(
+      "  nothing recorded for this stage; removing any leftover containers by label",
+    );
   } else {
-    sh("bunx", ["alchemy", "destroy", "--stage", stage, "--yes", "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: true });
+    sh(
+      "bunx",
+      ["alchemy", "destroy", "--stage", stage, "--yes", "--no-input"],
+      { env: { ALCHEMY_PLAIN: "1" }, allowFail: true },
+    );
   }
-  await waitFor("container removal", () => {
-    const left = (docker("ps", "-aq", "--filter", `label=96bulls.stack=${stage}`).stdout ?? "").split("\n").filter(Boolean);
-    if (!left.length) return true;
-    // Only force what destroy left and is not already being removed.
-    for (const id of left) {
-      const st = (docker("inspect", "--format", "{{.State.Status}} {{.State.Removing}}", id).stdout ?? "").trim();
-      if (!st.includes("true") && !st.startsWith("dead")) docker("rm", "-f", id);
-    }
-    return false;
-  }, 600_000);
+  await waitFor(
+    "container removal",
+    () => {
+      const left = (
+        docker("ps", "-aq", "--filter", `label=96bulls.stack=${stage}`)
+          .stdout ?? ""
+      )
+        .split("\n")
+        .filter(Boolean);
+      if (!left.length) return true;
+      // Only force what destroy left and is not already being removed.
+      for (const id of left) {
+        const st = (
+          docker(
+            "inspect",
+            "--format",
+            "{{.State.Status}} {{.State.Removing}}",
+            id,
+          ).stdout ?? ""
+        ).trim();
+        if (!st.includes("true") && !st.startsWith("dead"))
+          docker("rm", "-f", id);
+      }
+      return false;
+    },
+    600_000,
+  );
   // The courier's ledger is kept: ids stay stable, and the courier re-uploads on its
   // own when it finds its manifests gone from a fresh Locker.
-  await waitFor("container removal", () => {
-    const left = (docker("ps", "-aq", "--filter", `label=96bulls.stack=${stage}`).stdout ?? "").split("\n").filter(Boolean);
-    if (!left.length) return true;
-    // Only force what destroy left and is not already being removed.
-    for (const id of left) {
-      const st = (docker("inspect", "--format", "{{.State.Status}} {{.State.Removing}}", id).stdout ?? "").trim();
-      if (!st.includes("true") && !st.startsWith("dead")) docker("rm", "-f", id);
-    }
-    return false;
-  }, 600_000);
+  await waitFor(
+    "container removal",
+    () => {
+      const left = (
+        docker("ps", "-aq", "--filter", `label=96bulls.stack=${stage}`)
+          .stdout ?? ""
+      )
+        .split("\n")
+        .filter(Boolean);
+      if (!left.length) return true;
+      // Only force what destroy left and is not already being removed.
+      for (const id of left) {
+        const st = (
+          docker(
+            "inspect",
+            "--format",
+            "{{.State.Status}} {{.State.Removing}}",
+            id,
+          ).stdout ?? ""
+        ).trim();
+        if (!st.includes("true") && !st.startsWith("dead"))
+          docker("rm", "-f", id);
+      }
+      return false;
+    },
+    600_000,
+  );
   // The courier's upload ledger belongs to the stack that is gone: a fresh stack re-ingests Concourse.
   try {
     const inputs = loadInputs(stage);
-    rmSync(join(inputs.concourseDir, ".alleyoop-courier.json"), { force: true });
+    rmSync(join(inputs.concourseDir, ".alleyoop-courier.json"), {
+      force: true,
+    });
   } catch {
     /* no inputs: nothing to reset */
   }
   if (flags.has("--purge")) {
-    for (const v of [NAMES.hoopdbData, NAMES.lockerData, NAMES.telemetry]) docker("volume", "rm", "-f", suffixed(stage, v));
+    for (const v of [NAMES.hoopdbData, NAMES.lockerData, NAMES.telemetry])
+      docker("volume", "rm", "-f", suffixed(stage, v));
     rmSync(stageDir(stage), { recursive: true, force: true });
-    rmSync(join(ROOT, ".alchemy", "state", "96bulls", stage), { recursive: true, force: true });
+    rmSync(join(ROOT, ".alchemy", "state", "96bulls", stage), {
+      recursive: true,
+      force: true,
+    });
     console.log("  purged secrets, seed and volumes");
   }
   console.log("  down");
 }
 
 function status(stage: string) {
-  const r = docker("ps", "-a", "--filter", `label=96bulls.stack=${stage}`, "--format", "table {{.Names}}\t{{.Status}}\t{{.Ports}}");
+  const r = docker(
+    "ps",
+    "-a",
+    "--filter",
+    `label=96bulls.stack=${stage}`,
+    "--format",
+    "table {{.Names}}\t{{.Status}}\t{{.Ports}}",
+  );
   console.log(r.stdout || "(no containers)");
 }
 
@@ -313,17 +509,51 @@ async function main() {
       if (!stageArg) die("stage is required");
       if (stageArg.startsWith("aws-")) {
         // Code-only until cleared: plan needs credentials and an aws-inputs.json written by hand.
-        return void sh("bunx", ["alchemy", "plan", "--config", "stacks/aws/alchemy.aws.run.ts", "--stage", stageArg, "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: true });
+        return void sh(
+          "bunx",
+          [
+            "alchemy",
+            "plan",
+            "--config",
+            "stacks/aws/alchemy.aws.run.ts",
+            "--stage",
+            stageArg,
+            "--no-input",
+          ],
+          { env: { ALCHEMY_PLAIN: "1" }, allowFail: true },
+        );
       }
       if (stageArg.startsWith("gcp-")) {
         // Fail closed. A non-zero Alchemy status exits this process. Do not run a plan,
         // create the state bucket, or enable APIs until that plan is separately approved.
-        return void sh("bunx", ["alchemy", "plan", "--config", "stacks/gcp/alchemy.gcp.run.ts", "--stage", stageArg, "--no-input"], {
-          env: { ALCHEMY_PLAIN: "1", ALCHEMY_STAGE: stageArg },
-          allowFail: false,
-        });
+        return void sh(
+          "bunx",
+          [
+            "alchemy",
+            "plan",
+            "--config",
+            "stacks/gcp/alchemy.gcp.run.ts",
+            "--stage",
+            stageArg,
+            "--no-input",
+          ],
+          {
+            env: { ALCHEMY_PLAIN: "1", ALCHEMY_STAGE: stageArg },
+            allowFail: false,
+          },
+        );
       }
-      return void sh("bunx", ["alchemy", "plan", "--stage", requireLocalStage(stageArg), "--no-input"], { env: { ALCHEMY_PLAIN: "1" } });
+      return void sh(
+        "bunx",
+        [
+          "alchemy",
+          "plan",
+          "--stage",
+          requireLocalStage(stageArg),
+          "--no-input",
+        ],
+        { env: { ALCHEMY_PLAIN: "1" } },
+      );
     }
     case "seed":
       requireLocalStage(stageArg);
@@ -331,10 +561,20 @@ async function main() {
       return seed(stageArg!, flags.has("--fresh"));
     case "token": {
       const inputs = loadInputs(requireLocalStage(stageArg));
-      console.log(mintToken({ kid: inputs.jwtKid, privateKeyPem: inputs.jwtPrivateKeyPem }, {
-        machineId: inputs.machineId,
-        issuer: TENANT.issuer, audience: "relayhistory", orgId: TENANT.orgId, workspaceId: TENANT.workspaceId, userId: TENANT.userId, ttlSeconds: 3600,
-      }));
+      console.log(
+        mintToken(
+          { kid: inputs.jwtKid, privateKeyPem: inputs.jwtPrivateKeyPem },
+          {
+            machineId: inputs.machineId,
+            issuer: TENANT.issuer,
+            audience: "relayhistory",
+            orgId: TENANT.orgId,
+            workspaceId: TENANT.workspaceId,
+            userId: TENANT.userId,
+            ttlSeconds: 3600,
+          },
+        ),
+      );
       return;
     }
     case "sandbox": {
@@ -344,7 +584,9 @@ async function main() {
       const agent = args[2] ?? "";
       const hours = Number(args[args.indexOf("--hours") + 1]) || undefined;
       const plan = planSandbox(sub, agent, { hours });
-      console.log(`96bulls sandbox ${plan.command} ${plan.agent} (stage ${plan.stage}) -- PLAN ONLY, nothing executed:`);
+      console.log(
+        `96bulls sandbox ${plan.command} ${plan.agent} (stage ${plan.stage}) -- PLAN ONLY, nothing executed:`,
+      );
       for (const step of plan.steps) console.log(`  - ${step}`);
       return;
     }
@@ -355,7 +597,9 @@ async function main() {
       process.exit(ok ? 0 : 1);
     }
     default:
-      die("usage: 96bulls up|down|status|plan|seed|token|smoke <stage> [--reseed|--purge|--fresh] | sandbox up|down|extend|status <agent>");
+      die(
+        "usage: 96bulls up|down|status|plan|seed|token|smoke <stage> [--reseed|--purge|--fresh] | sandbox up|down|extend|status <agent>",
+      );
   }
 }
 

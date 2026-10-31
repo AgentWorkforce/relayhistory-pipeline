@@ -203,7 +203,10 @@ describe("manifest v1", () => {
     m.raw.content_sha256 = await computeContentSha256(m.raw.chunks);
     m.raw.format = "ndjson";
     await expect(parseManifest(m)).resolves.toMatchObject({
-      raw: { epoch: 1, epochs: [{ reason: "initial" }, { reason: "backfill" }] },
+      raw: {
+        epoch: 1,
+        epochs: [{ reason: "initial" }, { reason: "backfill" }],
+      },
     });
   });
 
@@ -550,12 +553,11 @@ describe("backfill epochs", () => {
       [0, 700],
       [700, 300],
     ].entries()) {
-      const { seq: _seq, epoch: _epoch, ...c } = await chunk(
-        100 + i,
-        0,
-        start!,
-        bytes!,
-      );
+      const {
+        seq: _seq,
+        epoch: _epoch,
+        ...c
+      } = await chunk(100 + i, 0, start!, bytes!);
       out.push(c);
     }
     return out;
@@ -630,14 +632,12 @@ describe("backfill epochs", () => {
       );
       expect(liveChunks.map((c) => c.bytes).slice(3)).toEqual(liveBytes);
       expect(liveNextOffset(m.raw)).toBe(9437184 + 60);
-      expect(await backfillStatus(m, await backfillDigest(payload.chunks))).toBe(
-        "present",
-      );
+      expect(
+        await backfillStatus(m, await backfillDigest(payload.chunks)),
+      ).toBe("present");
       // The live chunks contiguous across `resumed`, whatever the interleaving.
       digests.add(
-        await computeContentSha256(
-          liveChunks.map((c) => ({ ...c, epoch: 0 })),
-        ),
+        await computeContentSha256(liveChunks.map((c) => ({ ...c, epoch: 0 }))),
       );
     }
     expect(digests.size).toBe(1);
@@ -750,7 +750,10 @@ describe("backfill epochs", () => {
   });
 
   it("survives a client truncate or rewrite, in either order", async () => {
-    const truncate = async (m: ManifestV1, reason: "truncated" | "rewritten") => {
+    const truncate = async (
+      m: ManifestV1,
+      reason: "truncated" | "rewritten",
+    ) => {
       const n = structuredClone(m);
       n.raw.epochs.push({
         epoch: n.raw.epoch + 1,
@@ -809,9 +812,9 @@ describe("backfill epochs", () => {
     for (const [needle, f] of refusals)
       expect(edit(f).join("; ")).toContain(needle);
 
-    expect(
-      backfillWriteIssues(good, good, EXPORTER).join("; "),
-    ).toContain("already has a backfill");
+    expect(backfillWriteIssues(good, good, EXPORTER).join("; ")).toContain(
+      "already has a backfill",
+    );
 
     // The live side: a backfill epoch is not its to open, grow or drop.
     expect(backfillWriteIssues(m, good, "live").join("; ")).toContain(
@@ -832,7 +835,11 @@ describe("backfill epochs", () => {
     ).toEqual([]);
 
     await expect(
-      commitBackfillEpoch(cell(m).io, await backfill("dest_not_a_grant"), noWait),
+      commitBackfillEpoch(
+        cell(m).io,
+        await backfill("dest_not_a_grant"),
+        noWait,
+      ),
     ).rejects.toMatchObject({ code: "invalid_argument" });
   });
 
@@ -842,10 +849,19 @@ describe("backfill epochs", () => {
       await backfill(),
     );
     const cases: [string, (n: ManifestV1) => void][] = [
-      ["raw.epochs[1].opened_by", (n) => void (n.raw.epochs[1]!.opened_by = "x")],
+      [
+        "raw.epochs[1].opened_by",
+        (n) => void (n.raw.epochs[1]!.opened_by = "x"),
+      ],
       ["raw.format", (n) => void (n.raw.format = "jsonl")],
-      ["raw.epochs[0].resumes_epoch", (n) => void (n.raw.epochs[0]!.resumes_epoch = 0)],
-      ["raw.epochs[1].resumes_epoch", (n) => void (n.raw.epochs[1]!.resumes_epoch = 0)],
+      [
+        "raw.epochs[0].resumes_epoch",
+        (n) => void (n.raw.epochs[0]!.resumes_epoch = 0),
+      ],
+      [
+        "raw.epochs[1].resumes_epoch",
+        (n) => void (n.raw.epochs[1]!.resumes_epoch = 0),
+      ],
     ];
     for (const [path, f] of cases) {
       const n = structuredClone(good);
@@ -955,9 +971,9 @@ describe("backfill epochs", () => {
       { o: 1.5 },
       { o: Number.MAX_SAFE_INTEGER + 1 },
     ])
-      expect((await validateManifest(marked(bad))).map((i) => i.path)).toContain(
-        path,
-      );
+      expect(
+        (await validateManifest(marked(bad))).map((i) => i.path),
+      ).toContain(path);
   });
 
   it("accepts a Rust-produced backfilled and resumed manifest", async () => {

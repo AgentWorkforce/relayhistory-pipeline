@@ -670,9 +670,23 @@ describe("machine claim", () => {
       });
 
       test("a second activation with a different FROM is refused", async () => {
-        expect(await claimlessWindowOpen(env(hours(48), hours(100)), first, at(hours(50)))).toBe(false);
-        expect(await claimlessWindowOpen(env(hours(1), hours(60)), first, at(hours(2)))).toBe(false);
-        expect(await claimlessWindowOpen(env(0, hours(60)), first, at(hours(2)))).toBe(true);
+        expect(
+          await claimlessWindowOpen(
+            env(hours(48), hours(100)),
+            first,
+            at(hours(50)),
+          ),
+        ).toBe(false);
+        expect(
+          await claimlessWindowOpen(
+            env(hours(1), hours(60)),
+            first,
+            at(hours(2)),
+          ),
+        ).toBe(false);
+        expect(
+          await claimlessWindowOpen(env(0, hours(60)), first, at(hours(2))),
+        ).toBe(true);
       });
 
       test("fails closed without the record", async () => {
@@ -693,7 +707,9 @@ describe("machine claim", () => {
         expect((await status(w, version)).status).toBe(200);
         const fixed = w.gate.firstActivation!;
         const until = w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL;
-        w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(Date.now() - 1000).toISOString();
+        w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+          Date.now() - 1000,
+        ).toISOString();
         expect((await status(w, version)).status).toBe(403);
         expect(w.gate.firstActivation).toBe(fixed);
 
