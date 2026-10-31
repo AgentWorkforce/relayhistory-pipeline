@@ -270,3 +270,14 @@ describe("collector pod", () => {
     expect(v.otel.podSecurityContext.runAsNonRoot).toBe(true);
   });
 });
+
+describe("Locker key layout the pod roles assume", () => {
+  it("the AWS stage sets no deployment key prefix, so session keys start at v1/ (pod-role globs depend on it)", () => {
+    const v = eksChartValues(
+      { stage: "aws-proof", runtimeSecretName: "rt", lockerBucket: "b", lockerRegion: "us-west-2", tenantOrgId: "o", relayhistoryOrigin: "https://x.example.com", imageRepository: "r", imageDigest: DIGEST },
+      false, "https://iss", "https://iss/jwks",
+    );
+    // E3 (#69) makes `<PIPELINE_KEY_PREFIX>/<org>/v1/...` possible; adopting it here means changing workerPolicy/alleyoopPolicy first.
+    expect(JSON.stringify(v)).not.toMatch(/PIPELINE_KEY_PREFIX|PIPELINE_ORG_FROM_PREFIX/);
+  });
+});
