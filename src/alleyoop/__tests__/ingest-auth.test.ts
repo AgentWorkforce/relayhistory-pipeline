@@ -256,6 +256,18 @@ describe("buildIngestApp auth (production composition)", () => {
     const q = new URLSearchParams({ key: liveKey, machine: liveLocation.machineId, writer: liveLocation.machineId });
     expect((await open.req(`/v1/pipeline/manifests/status?${q}`, claimless)).status).toBe(200);
     expect(await count("sessions.claimless_uses")).toBe(1);
+
+    // Durable and append-only, on the real table: a restart with restated dates
+    // finds the window shut, and the record cannot be changed or removed.
+    const recorded = await db.query<{ first_activation: Date }>("SELECT first_activation FROM sessions.claimless_window_activations");
+    expect(recorded.rows).toHaveLength(1);
+    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(Date.now() - 1000).toISOString();
+    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = new Date(Date.parse(String(recorded.rows[0]!.first_activation)) + 72 * 3_600_000 + 60_000).toISOString();
+    const restated = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
+    expect((await restated.req(`/v1/pipeline/manifests/status?${q}`, claimless)).status).toBe(403);
+    await expect(db.query("UPDATE sessions.claimless_window_activations SET first_activation = now()")).rejects.toThrow(/append-only/);
+    await expect(db.query("DELETE FROM sessions.claimless_window_activations")).rejects.toThrow(/append-only/);
+    expect((await db.query("SELECT 1 FROM sessions.claimless_window_activations")).rows).toHaveLength(1);
   });
 
   test("default config: a generic RelayAuth bearer is refused (401) on every upload route, and so is a migration token", async () => {

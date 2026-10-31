@@ -7,7 +7,7 @@ automatically. Each step needs Khaliq's explicit OK.
 1. Create the `MANIFEST_READINESS_KEY` credential in 1Password. It signs reader
    attestations; never put it on disk.
 2. Apply `supabase/migrations/20261031000100_manifest_readiness.sql` and
-   `20261101000100_claimless_uses_read_only.sql`.
+   `20261101000200_claimless_window_activations.sql`.
 3. Build each reader with `--define __RELEASE_SHA__='"<commit>"'`. A build without
    it reports `unreleased` and cannot attest. The value is a build-time constant
    so a running process cannot claim another build.
@@ -50,7 +50,12 @@ It does not let it deliver:
   default. Set it for the affected stage only.
 - `until` is at most 72 hours after `from`. A longer window fails closed, at
   composition and in ingest, and so does a bad or missing date. It shuts itself at
-  `until`. Restating `from` to extend it is a decision, not a retry.
+  `until`.
+- The 72 hours count from this deployment's **first activation**, written once
+  to `sessions.claimless_window_activations` and never changed. A database
+  trigger refuses updates and deletes. Restating `from` and `until` cannot extend
+  the window, and a deployment gets one window. If that record cannot be read,
+  the window stays shut.
 - While it is open **this system is not machine-bound**. A read gets the object
   version and nothing else.
 - Watch `sessions.claimless_uses`, which records each read by day, org, caller
@@ -59,6 +64,10 @@ It does not let it deliver:
   setting `MANIFEST_MACHINE_CLAIM=required`, is the kill switch.
 
 Local stages need none of this: their tokens carry the claim.
+
+**Activation gate:** a run of `96bulls up local` on a machine with Docker, showing
+delivery with the window off. The local claim is proven through the real app and
+verifier, but the actual composition has not run yet.
 
 `client_version` is self-reported. It is for this meter only, and must never
 influence identity, authorization, limits or trust.

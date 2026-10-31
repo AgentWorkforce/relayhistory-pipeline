@@ -88,6 +88,8 @@ interface ManifestRoutesDeps {
   ): Promise<void>;
   /** Readers with no valid attestation. Absent means none are ready: fail closed. */
   missingReaders?: () => Promise<string[]>;
+  /** Records this deployment's first activation once, and returns it. Absent: shut. */
+  firstClaimlessActivation?: FirstClaimlessActivation;
   /** The audit and meter for the claimless window. Absent: the window stays shut. */
   recordClaimless?: (use: ClaimlessUse) => Promise<void>;
   /** Durable delayed requeue of a refused backfill. */
@@ -105,6 +107,8 @@ interface ManifestRoutesDeps {
    */
   migrationLedger?: MigrationAssertionLedger;
 }
+
+export type FirstClaimlessActivation = (from: string) => Promise<string>;
 
 /**
  * One read through the claimless window. `clientVersion` is what the client
@@ -233,27 +237,54 @@ function machineClaim(auth: Auth): string | undefined {
 export const CLAIMLESS_WINDOW_MAX_MS = 72 * 60 * 60 * 1000;
 
 /**
- * The legacy window for couriers from before the machine claim. Shut unless a
+ * The window's configured dates, if it is configured at all. Shut unless a
  * deployment sets `MANIFEST_MACHINE_CLAIM=compat` with
  * `MANIFEST_MACHINE_CLAIM_COMPAT_FROM` and `_UNTIL` at most 72 hours apart, so a
- * new deployment requires the claim, unsetting any of them is the kill switch,
- * a longer window fails closed, and it shuts itself at the expiry. It is
- * read-only and version-only: no write passes through it. While it is open the
- * system is not machine-bound. Delete this and its callers after the rollout.
+ * new deployment requires the claim and unsetting any of them is the kill switch.
  */
-export function claimlessWindowOpen(env: Bindings, now = new Date()): boolean {
+export function claimlessWindowDates(
+  env: Bindings,
+): { from: string; until: string } | undefined {
   const vars = env as Record<string, unknown>;
-  if (vars.MANIFEST_MACHINE_CLAIM !== "compat") return false;
-  const from = Date.parse(String(vars.MANIFEST_MACHINE_CLAIM_COMPAT_FROM));
-  const until = Date.parse(String(vars.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL));
+  if (vars.MANIFEST_MACHINE_CLAIM !== "compat") return undefined;
+  const from = String(vars.MANIFEST_MACHINE_CLAIM_COMPAT_FROM);
+  const until = String(vars.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL);
+  const start = Date.parse(from);
+  const end = Date.parse(until);
+  return Number.isFinite(start) &&
+    Number.isFinite(end) &&
+    end - start <= CLAIMLESS_WINDOW_MAX_MS
+    ? { from, until }
+    : undefined;
+}
+
+/**
+ * The legacy window for couriers from before the machine claim. It is read-only
+ * and version-only: no write passes through it. The 72 hours count from this
+ * deployment's first activation, recorded once, so restating the dates cannot
+ * extend it, and if that record cannot be read the window stays shut. While it
+ * is open the system is not machine-bound. Delete this and its callers after
+ * the rollout.
+ */
+export async function claimlessWindowOpen(
+  env: Bindings,
+  firstActivation: FirstClaimlessActivation | undefined,
+  now = new Date(),
+): Promise<boolean> {
+  const dates = claimlessWindowDates(env);
+  if (!dates || !firstActivation) return false;
   const at = now.getTime();
-  return (
-    Number.isFinite(from) &&
-    Number.isFinite(until) &&
-    until - from <= CLAIMLESS_WINDOW_MAX_MS &&
-    from <= at &&
-    at < until
-  );
+  if (at < Date.parse(dates.from) || at >= Date.parse(dates.until))
+    return false;
+  try {
+    const first = Date.parse(await firstActivation(dates.from));
+    return (
+      Number.isFinite(first) &&
+      Date.parse(dates.until) <= first + CLAIMLESS_WINDOW_MAX_MS
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1206,7 +1237,13 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       // Without a claim, the legacy window gives the version alone, and only
       // if the read is on the record: an unaudited read is refused.
       if (claim === undefined && !auth.migration) {
-        if (!claimlessWindowOpen(c.env ?? {})) return c.body(null, 403);
+        if (
+          !(await claimlessWindowOpen(
+            c.env ?? {},
+            deps.firstClaimlessActivation,
+          ))
+        )
+          return c.body(null, 403);
         if (
           !(await auditClaimless(
             deps,

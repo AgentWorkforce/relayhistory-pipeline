@@ -642,21 +642,86 @@ describe("machine claim", () => {
       }
     });
 
-    test("72 hours is the cap, to the millisecond", () => {
+    describe("the 72-hour cap", () => {
       const from = new Date("2026-11-01T00:00:00.000Z");
       const at = (ms: number) => new Date(from.getTime() + ms);
-      const env = (hours: number, ms = 0) =>
+      const hours = (n: number) => n * 3_600_000;
+      const env = (start: number, end: number) =>
         ({
           MANIFEST_MACHINE_CLAIM: "compat",
-          MANIFEST_MACHINE_CLAIM_COMPAT_FROM: from.toISOString(),
-          MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: at(
-            hours * 3_600_000 + ms,
-          ).toISOString(),
+          MANIFEST_MACHINE_CLAIM_COMPAT_FROM: at(start).toISOString(),
+          MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: at(end).toISOString(),
         }) as never;
-      expect(claimlessWindowOpen(env(72), at(1000))).toBe(true);
-      expect(claimlessWindowOpen(env(72, 1), at(1000))).toBe(false);
-      expect(claimlessWindowOpen(env(720), at(1000))).toBe(false);
-      expect(claimlessWindowOpen(env(72), at(72 * 3_600_000))).toBe(false);
+      const first = async () => from.toISOString();
+
+      test("holds to the millisecond", async () => {
+        expect(
+          await claimlessWindowOpen(env(0, hours(72)), first, at(1000)),
+        ).toBe(true);
+        expect(
+          await claimlessWindowOpen(env(0, hours(72) + 1), first, at(1000)),
+        ).toBe(false);
+        expect(
+          await claimlessWindowOpen(env(0, hours(720)), first, at(1000)),
+        ).toBe(false);
+        expect(
+          await claimlessWindowOpen(env(0, hours(72)), first, at(hours(72))),
+        ).toBe(false);
+      });
+
+      test("a restated FROM cannot extend it: the first activation decides", async () => {
+        // Each pair is within 72 hours of itself, and past the first activation's.
+        const restated = env(hours(48), hours(100));
+        expect(await claimlessWindowOpen(restated, first, at(hours(50)))).toBe(
+          false,
+        );
+        expect(
+          await claimlessWindowOpen(
+            env(hours(70), hours(140)),
+            first,
+            at(hours(71)),
+          ),
+        ).toBe(false);
+        // Inside the first window, a restatement is still fine.
+        expect(
+          await claimlessWindowOpen(
+            env(hours(1), hours(60)),
+            first,
+            at(hours(2)),
+          ),
+        ).toBe(true);
+      });
+
+      test("fails closed without the record", async () => {
+        expect(
+          await claimlessWindowOpen(env(0, hours(1)), undefined, at(1)),
+        ).toBe(false);
+        const down = async () => {
+          throw new Error("down");
+        };
+        expect(await claimlessWindowOpen(env(0, hours(1)), down, at(1))).toBe(
+          false,
+        );
+      });
+
+      test("through the route: the first use fixes it, and a restatement finds it shut", async () => {
+        const { w, version } = await setup();
+        w.openClaimlessWindow();
+        expect((await status(w, version)).status).toBe(200);
+        const fixed = w.gate.firstActivation!;
+        w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+          Date.now() - 1000,
+        ).toISOString();
+        w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = new Date(
+          Date.parse(fixed) + hours(72) + 60_000,
+        ).toISOString();
+        expect((await status(w, version)).status).toBe(403);
+        expect(w.gate.firstActivation).toBe(fixed);
+
+        w.gate.activationDown = true;
+        w.openClaimlessWindow();
+        expect((await status(w, version)).status).toBe(403);
+      });
     });
 
     test("the courier stays safe when it closes: it defers, never fences", async () => {

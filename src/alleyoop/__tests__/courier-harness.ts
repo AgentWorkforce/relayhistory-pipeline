@@ -120,6 +120,8 @@ export async function courierWorld(
     requeued: [] as { message: unknown; delaySeconds: number }[],
     claimless: [] as ClaimlessUse[],
     auditDown: false,
+    activationDown: false,
+    firstActivation: undefined as string | undefined,
   };
   const identity: { machineClaim?: string } = { machineClaim: machineId };
   const store = createFsStore({ root });
@@ -132,6 +134,11 @@ export async function courierWorld(
     raw,
     send: async () => {},
     missingReaders: async () => gate.missing,
+    firstClaimlessActivation: async (from) => {
+      if (gate.activationDown) throw new Error("activation unavailable");
+      gate.firstActivation ??= from;
+      return gate.firstActivation;
+    },
     recordClaimless: async (use) => {
       if (gate.auditDown) throw new Error("audit unavailable");
       gate.claimless.push(use);
