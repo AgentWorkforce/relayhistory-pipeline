@@ -15,8 +15,8 @@
  *
  * In-process actions (`HTTP`, `PROBE`) are never spawned; their hosts are fenced.
  */
-import { FORBIDDEN_NAME, PROOF_CHART_REPO, PROOF_CORE_DEPLOYMENTS, PROOF_INGEST_SERVICE, PROOF_LOCKER_BUCKET, PROOF_RELEASE, URL_USERINFO, type Fence } from "./fence.ts";
-import { PROOF_ACCOUNT_ID, PROOF_REGION, PROOF_STAGE } from "./guard.ts";
+import { FORBIDDEN_NAME, PROOF_CHART_REPO, PROOF_CORE_DEPLOYMENTS, PROOF_INGEST_SERVICE, PROOF_LOCKER_BUCKET, PROOF_POSTGREST, PROOF_PROBE_IMAGES, PROOF_RELEASE, URL_USERINFO, type Fence } from "./fence.ts";
+import { PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_REGION, PROOF_STAGE } from "./guard.ts";
 
 export type Admission = { ok: true; mutating: boolean; op: string } | { ok: false; code: string };
 
@@ -36,7 +36,7 @@ interface NsRules {
 }
 
 const PROOF_NS: Record<string, NsRules> = {
-  "96bulls": { deployments: PROOF_CORE_DEPLOYMENTS, services: [PROOF_INGEST_SERVICE], pods: /^hoopdb(-restore-proof)?-\d+$/ },
+  "96bulls": { deployments: PROOF_CORE_DEPLOYMENTS, services: [PROOF_INGEST_SERVICE, PROOF_POSTGREST.service], pods: /^hoopdb(-restore-proof)?-\d+$/ },
   relayauth: { deployments: ["relayauth"], services: ["relayauth"], pods: /^$/ },
   relaycast: { deployments: ["relaycast"], services: ["relaycast"], pods: /^proof-relaycast-aws-proof$/ },
   "cnpg-system": { deployments: [], services: [], pods: /^$/ },
@@ -57,45 +57,133 @@ const CNPG_BACKUP = "backups.postgresql.cnpg.io";
 const BACKUP_NAME = /^proof-[a-z0-9-]{1,40}$/;
 const DIGEST_IMAGE = /^[a-z0-9.-]+(:\d+)?\/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$/;
 
-/** Flags that change the target or credentials of a tool. Never admitted. */
-const DANGEROUS_FLAGS = /^(-A|--all-namespaces|--kubeconfig|--server|-s|--token|--as|--as-group|--as-uid|--user|--cluster|--namespace|--dbname|--profile|--endpoint-url|--no-verify-ssl|--insecure-skip-tls-verify|--kube-apiserver|--kube-token|--kube-as-user|--kubeconfig)(=|$)/;
+/* ------------------------------------------------------------- flag normalization */
+
+/**
+ * Every tool's argv is normalized before any check: `--x v`, `--x=v`, `-n v`,
+ * `-nv` and `-n=v` all become one canonical flag, aliases (`--namespace`,
+ * `--selector`, ...) map to it, and then:
+ *   - a flag that can retarget the tool (server, cluster, user, token,
+ *     impersonation, kubeconfig, CA/TLS overrides, profiles, endpoints) is
+ *     refused outright, in any spelling;
+ *   - any canonical flag appearing twice is refused (no last-wins);
+ *   - any flag not in the tool's allowlist is refused.
+ */
+interface FlagSpec {
+  /** canonical name -> takes a value */
+  known: Record<string, "value" | "bool" | "either">;
+  aliases: Record<string, string>;
+  /** single-letter flags that take a value (`-nX`, `-n=X`, `-n X`) */
+  shortValued: ReadonlySet<string>;
+  shortBool: ReadonlySet<string>;
+  retarget: ReadonlySet<string>;
+}
+
+const KUBECTL_RETARGET = ["kubeconfig", "server", "s", "cluster", "user", "token", "as", "as-group", "as-uid", "certificate-authority", "client-certificate", "client-key", "insecure-skip-tls-verify", "tls-server-name", "username", "password", "all-namespaces", "A", "request-timeout", "cache-dir", "profile"];
+
+const KUBECTL: FlagSpec = {
+  known: {
+    context: "value", n: "value", l: "value", o: "value", c: "value", f: "value", overrides: "value",
+    image: "value", restart: "value", labels: "value", env: "value", for: "value", timeout: "value", since: "value",
+    wait: "either", "all-containers": "bool", prefix: "bool", "ignore-not-found": "bool", command: "bool", i: "bool",
+  },
+  aliases: { namespace: "n", selector: "l", output: "o", container: "c", filename: "f", stdin: "i" },
+  shortValued: new Set(["n", "l", "o", "c", "f"]),
+  shortBool: new Set(["i"]),
+  retarget: new Set(KUBECTL_RETARGET),
+};
+
+const HELM: FlagSpec = {
+  known: { "kube-context": "value", n: "value", o: "value", repo: "value", version: "value", timeout: "value", "reuse-values": "bool", wait: "bool" },
+  aliases: { namespace: "n", output: "o" },
+  shortValued: new Set(["n", "o"]),
+  shortBool: new Set(),
+  retarget: new Set(["kubeconfig", "kube-apiserver", "kube-token", "kube-as-user", "kube-as-group", "kube-ca-file", "kube-insecure-skip-tls-verify", "kube-tls-server-name", "registry-config", "repository-config", "repository-cache", "username", "password", "ca-file", "cert-file", "key-file", "insecure-skip-tls-verify", "pass-credentials", "post-renderer"]),
+};
+
+const AWS: FlagSpec = {
+  known: { region: "value", bucket: "value", key: "value", prefix: "value", query: "value", output: "value", "load-balancer-arn": "value", names: "value", "resource-arn": "value", "key-id": "value", "tag-filters": "value", name: "value" },
+  aliases: {},
+  shortValued: new Set(),
+  shortBool: new Set(),
+  retarget: new Set(["profile", "endpoint-url", "no-verify-ssl", "ca-bundle", "no-sign-request", "cli-input-json", "cli-input-yaml", "cli-binary-format", "debug"]),
+};
+
+export interface Tokens {
+  flags: Map<string, string | true>;
+  pos: string[];
+  tail?: string[];
+}
+
+export function tokenize(args: readonly string[], spec: FlagSpec): Tokens | { error: string } {
+  const flags = new Map<string, string | true>();
+  const pos: string[] = [];
+  let tail: string[] | undefined;
+  const set = (raw: string, value: string | true): string | undefined => {
+    const name = spec.aliases[raw] ?? raw;
+    if (spec.retarget.has(raw) || spec.retarget.has(name)) return raw === "A" || name === "all-namespaces" ? "all_namespaces_refused" : "retarget_flag_refused";
+    const kind = spec.known[name];
+    if (!kind) return "flag_not_allowlisted";
+    if (flags.has(name)) return "flag_repeated";
+    if (kind === "bool" && value !== true) return "flag_value_not_allowed";
+    if (kind === "value" && value === true) return "flag_value_missing";
+    flags.set(name, value);
+    return undefined;
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--") {
+      tail = args.slice(i + 1);
+      break;
+    }
+    let err: string | undefined;
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const raw = eq >= 0 ? a.slice(2, eq) : a.slice(2);
+      if (eq >= 0) err = set(raw, a.slice(eq + 1));
+      else {
+        const name = spec.aliases[raw] ?? raw;
+        const kind = spec.known[name];
+        if (kind === "value" && !spec.retarget.has(raw)) {
+          if (args[i + 1] === undefined) return { error: "flag_value_missing" };
+          err = set(raw, args[++i]!);
+        } else err = set(raw, true);
+      }
+    } else if (a.startsWith("-") && a.length > 1) {
+      const letter = a[1]!;
+      const rest = a.slice(2);
+      if (spec.shortValued.has(letter)) {
+        const v = rest.startsWith("=") ? rest.slice(1) : rest;
+        if (v) err = set(letter, v);
+        else {
+          if (args[i + 1] === undefined) return { error: "flag_value_missing" };
+          err = set(letter, args[++i]!);
+        }
+      } else if (spec.shortBool.has(letter) && rest === "") err = set(letter, true);
+      else err = spec.retarget.has(letter) ? (letter === "A" ? "all_namespaces_refused" : "retarget_flag_refused") : "flag_not_allowlisted";
+    } else pos.push(a);
+    if (err) return { error: err };
+  }
+  return { flags, pos, ...(tail ? { tail } : {}) };
+}
 
 /* ------------------------------------------------------------- kubectl */
 
-/** Split kubectl args (after `--context X`) into -n, label, positionals, the `--` tail, and other flags. */
-function parseKubectl(rest: readonly string[]) {
-  const ns: string[] = [];
-  const labels: string[] = [];
-  const pos: string[] = [];
-  const flags: string[] = [];
-  let tail: string[] | undefined;
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i]!;
-    if (a === "--") {
-      tail = rest.slice(i + 1);
-      break;
-    }
-    if (a === "-n") ns.push(rest[++i] ?? "");
-    else if (a === "-l") labels.push(rest[++i] ?? "");
-    else if (a === "-o" || a === "-c" || a === "-f" || a === "--overrides") flags.push(`${a}=${rest[++i] ?? ""}`);
-    else if (a.startsWith("-")) flags.push(a);
-    else pos.push(a);
-  }
-  return { ns, labels, pos, flags, tail };
-}
-
 function admitKubectl(argv: readonly string[], f: Fence, ph: boolean, stdin: string | undefined): Admission {
-  if (argv[1] !== "--context" || argv[2] !== f.context) return refuse(argv[1] === "--context" ? "context_outside_fence" : "context_missing");
-  const { ns: nss, labels, pos, flags, tail } = parseKubectl(argv.slice(3));
-  if (argv.slice(3).includes("--context")) return refuse("context_repeated");
+  const t = tokenize(argv.slice(1), KUBECTL);
+  if ("error" in t) return refuse(t.error);
+  const fl = t.flags;
+  const ctx = fl.get("context");
+  if (ctx === undefined) return refuse("context_missing");
+  if (ctx !== f.context) return refuse("context_outside_fence");
   const rules = f.target === "proof" ? PROOF_NS : KIND_NS;
-  if (nss.length > 1) return refuse("namespace_repeated");
-  const ns = nss[0];
+  const ns = fl.get("n") as string | undefined;
   if (ns !== undefined && !rules[ns]) return refuse("namespace_outside_fence");
   const r = ns ? rules[ns]! : undefined;
   const name = (v: string | undefined, okv: (x: string) => boolean) => v !== undefined && (okv(v) || (ph && PLACEHOLDER.test(v)));
-  const [verb, ...args] = pos;
-  const label = labels.length === 0 ? undefined : labels.length === 1 ? labels[0] : "multiple";
+  const [verb, ...args] = t.pos;
+  const tail = t.tail;
+  const label = fl.get("l") as string | undefined;
   if (label !== undefined && label !== PROOF_LABEL) return refuse("label_outside_fence");
 
   // --- the kind fence: reads of pods only.
@@ -109,6 +197,7 @@ function admitKubectl(argv: readonly string[], f: Fence, ph: boolean, stdin: str
     if (!ns && args[0] === "namespace" && args[1] === "96bulls" && args.length === 2) return read("get namespace");
     if (!r) return refuse("namespace_required");
     if (args.length === 1 && (args[0] === "pods" || args[0] === "ingress")) return read(`get ${args[0]}`);
+    if (args.length === 2 && args[0] === "service" && r.services.includes(args[1]!)) return read("get service");
     if (args[0] === CNPG_CLUSTER && args.length === 2 && name(args[1], (x) => x === "hoopdb" || x === "hoopdb-restore-proof") && ns === "96bulls") return read("get cnpg cluster");
     if (args.length === 1 && args[0]!.startsWith(`${CNPG_BACKUP}/`) && name(args[0]!.slice(CNPG_BACKUP.length + 1), (b) => BACKUP_NAME.test(b)) && ns === "96bulls") return read("get backup");
     if (args.length === 1 && args[0] === `all,pvc,${CNPG_BACKUP},${CNPG_CLUSTER}` && label === PROOF_LABEL && (ns === "96bulls" || ns === "relaycast")) return read("get proof objects");
@@ -136,7 +225,7 @@ function admitKubectl(argv: readonly string[], f: Fence, ph: boolean, stdin: str
     return r.services.includes(args[0]!.slice(4)) ? read("port-forward") : refuse("service_outside_fence");
   if (verb === "exec" && args.length === 1 && tail) {
     if (!name(args[0], (p) => r.pods.test(p))) return refuse("pod_outside_fence");
-    if (ns === "96bulls" && tail.join(" ") === PSQL.join(" ") && flags.includes("-c=postgres")) return read("psql");
+    if (ns === "96bulls" && tail.join(" ") === PSQL.join(" ") && fl.get("c") === "postgres") return read("psql");
     if (ns === "relaycast" && args[0] === PROBE_POD && tail.length === 4 && tail.slice(0, 3).join(" ") === "bun run -" && (tail[3] === "before" || tail[3] === "after"))
       return write(`relaycast probe ${tail[3]}`);
     return refuse("exec_command_not_allowlisted");
@@ -144,13 +233,15 @@ function admitKubectl(argv: readonly string[], f: Fence, ph: boolean, stdin: str
   // --- mutations: exact entries only. relayauth never reaches here except rollout restart above.
   if (ns === "relayauth") return refuse("relayauth_read_only");
   if (verb === "run" && ns === "relaycast" && args.length === 1 && args[0] === PROBE_POD) {
-    const image = flags.find((x) => x.startsWith("--image="))?.slice("--image=".length) ?? "";
-    if (!(DIGEST_IMAGE.test(image) || (ph && PLACEHOLDER.test(image)))) return refuse("probe_image_not_digest_pinned");
+    const image = (fl.get("image") as string | undefined) ?? "";
+    // Not any digest-pinned image: only the allowlisted probe images.
+    if (!(PROOF_PROBE_IMAGES.includes(image) || (ph && PLACEHOLDER.test(image)))) return refuse(DIGEST_IMAGE.test(image) ? "probe_image_not_allowlisted" : "probe_image_not_digest_pinned");
     if (tail?.join(" ") !== "sleep 7200") return refuse("probe_command_not_allowlisted");
-    for (const e of flags.filter((x) => x.startsWith("--env="))) if (e !== "--env=RC_URL=http://relaycast.relaycast.svc:8787") return refuse("probe_env_not_allowlisted");
-    const ov = flags.find((x) => x.startsWith("--overrides="));
+    const env = fl.get("env");
+    if (env !== undefined && env !== "RC_URL=http://relaycast.relaycast.svc:8787") return refuse("probe_env_not_allowlisted");
+    const ov = fl.get("overrides") as string | undefined;
     if (ov) {
-      const o = JSON.parse(ov.slice("--overrides=".length)) as { spec?: { containers?: Array<{ image?: string }> } };
+      const o = JSON.parse(ov) as { spec?: { containers?: Array<{ image?: string }> } };
       if ((o.spec?.containers ?? []).some((c) => c.image !== image)) return refuse("probe_override_image_mismatch");
     }
     return write("run probe pod");
@@ -163,7 +254,7 @@ function admitKubectl(argv: readonly string[], f: Fence, ph: boolean, stdin: str
     if ((ns === "96bulls" || ns === "relaycast") && args.length === 1 && args[0] === `${CNPG_BACKUP},${CNPG_CLUSTER},pods` && label === PROOF_LABEL) return write("delete proof objects");
     return refuse("delete_not_allowlisted");
   }
-  if (verb === "apply" && args.length === 0 && flags.includes("-f=-") && ns === "96bulls") {
+  if (verb === "apply" && args.length === 0 && fl.get("f") === "-" && ns === "96bulls") {
     let m: { apiVersion?: string; kind?: string; metadata?: { name?: string; namespace?: string; labels?: Record<string, string> }; spec?: Record<string, unknown> };
     try {
       m = JSON.parse(stdin ?? "");
@@ -181,26 +272,33 @@ function admitKubectl(argv: readonly string[], f: Fence, ph: boolean, stdin: str
 /* ------------------------------------------------------------- helm */
 
 function admitHelm(argv: readonly string[], f: Fence, ph: boolean): Admission {
-  if (argv[1] === "show") {
-    if (argv[2] === "values" && ["96bulls", "relayauth", "relaycast"].includes(argv[3] ?? "") && argv[4] === "--repo" && argv[5] === PROOF_CHART_REPO && argv[6] === "--version" && /^\d+\.\d+\.\d+$/.test(argv[7] ?? "") && argv.length === 8)
+  const t = tokenize(argv.slice(1), HELM);
+  if ("error" in t) return refuse(t.error);
+  if (t.tail) return refuse("helm_operation_not_allowlisted");
+  const fl = t.flags;
+  const only = (...keys: string[]) => [...fl.keys()].every((k) => keys.includes(k)) && keys.every((k) => fl.has(k));
+  const ver = (v: unknown) => typeof v === "string" && (/^\d+\.\d+\.\d+$/.test(v) || (ph && PLACEHOLDER.test(v)));
+  const [sub, ...rest] = t.pos;
+  if (sub === "show") {
+    if (rest[0] === "values" && rest.length === 2 && ["96bulls", "relayauth", "relaycast"].includes(rest[1]!) && only("repo", "version") && fl.get("repo") === PROOF_CHART_REPO && ver(fl.get("version")))
       return read("helm show values");
     return refuse("helm_operation_not_allowlisted");
   }
-  if (argv[1] !== "--kube-context" || argv[2] !== f.context) return refuse(argv[1] === "--kube-context" ? "context_outside_fence" : "context_missing");
-  if (argv[3] !== "-n") return refuse("namespace_required");
-  const ns = argv[4]!;
-  const [sub, ...rest] = argv.slice(5);
+  const ctx = fl.get("kube-context");
+  if (ctx === undefined) return refuse("context_missing");
+  if (ctx !== f.context) return refuse("context_outside_fence");
+  const ns = fl.get("n");
+  if (typeof ns !== "string") return refuse("namespace_required");
   const nsOk = f.target === "proof" ? Object.keys(PROOF_NS).includes(ns) : Object.keys(KIND_NS).includes(ns);
   if (!nsOk) return refuse("namespace_outside_fence");
-  if (sub === "list" && rest.join(" ") === "-o json") return read("helm list");
+  if (sub === "list" && rest.length === 0 && only("kube-context", "n", "o") && fl.get("o") === "json") return read("helm list");
   if (f.target !== "proof" || ns !== "96bulls") return refuse("helm_operation_not_allowlisted");
   if (rest[0] !== PROOF_RELEASE) return refuse("release_outside_fence");
-  const tail = rest.slice(1).join(" ");
-  if ((sub === "history" || sub === "status") && tail === "-o json") return read(`helm ${sub}`);
-  if (sub === "upgrade" && rest[1] === "96bulls" && rest[2] === "--repo" && rest[3] === PROOF_CHART_REPO && rest[4] === "--version" && (/^\d+\.\d+\.\d+$/.test(rest[5] ?? "") || (ph && PLACEHOLDER.test(rest[5] ?? ""))) && rest.slice(6).join(" ") === "--reuse-values --wait --timeout 10m")
+  if ((sub === "history" || sub === "status") && rest.length === 1 && only("kube-context", "n", "o") && fl.get("o") === "json") return read(`helm ${sub}`);
+  if (sub === "upgrade" && rest.length === 2 && rest[1] === "96bulls" && only("kube-context", "n", "repo", "version", "reuse-values", "wait", "timeout") && fl.get("repo") === PROOF_CHART_REPO && ver(fl.get("version")) && fl.get("timeout") === "10m")
     return write("helm upgrade");
-  if (sub === "rollback" && (/^\d+$/.test(rest[1] ?? "") || (ph && PLACEHOLDER.test(rest[1] ?? ""))) && rest.slice(2).join(" ") === "--wait --timeout 10m") return write("helm rollback");
-  if (sub === "uninstall" && tail === "--wait") return write("helm uninstall");
+  if (sub === "rollback" && rest.length === 2 && (/^\d+$/.test(rest[1]!) || (ph && PLACEHOLDER.test(rest[1]!))) && only("kube-context", "n", "wait", "timeout") && fl.get("timeout") === "10m") return write("helm rollback");
+  if (sub === "uninstall" && rest.length === 1 && only("kube-context", "n", "wait")) return write("helm uninstall");
   return refuse("helm_operation_not_allowlisted");
 }
 
@@ -216,34 +314,36 @@ function arnOk(v: string, ph: boolean): boolean {
 
 function admitAws(argv: readonly string[], f: Fence, ph: boolean): Admission {
   if (f.target !== "proof") return refuse("aws_outside_fence");
-  const region = argv.flatMap((a, i) => (a === "--region" ? [argv[i + 1]] : a.startsWith("--region=") ? [a.slice(9)] : []));
-  if (region.length !== 1) return refuse(region.length ? "region_repeated" : "region_missing");
-  if (region[0] !== PROOF_REGION) return refuse("region_outside_fence");
-  const opt = (flag: string) => {
-    const i = argv.indexOf(flag);
-    return i >= 0 ? argv[i + 1] : undefined;
-  };
-  const [svc, cmd] = [argv[1], argv[2]];
-  const bucket = opt("--bucket");
+  const t = tokenize(argv.slice(1), AWS);
+  if ("error" in t) return refuse(t.error);
+  if (t.tail) return refuse("aws_operation_not_allowlisted");
+  const fl = t.flags;
+  const region = fl.get("region");
+  if (region === undefined) return refuse("region_missing");
+  if (region !== PROOF_REGION) return refuse("region_outside_fence");
+  const opt = (flag: string) => fl.get(flag) as string | undefined;
+  const [svc, cmd, ...args] = t.pos;
+  const bucket = opt("bucket");
   const buckets = f.buckets;
   if (svc === "s3api") {
     if (!bucket || !buckets.has(bucket)) return refuse("bucket_outside_fence");
     if (cmd === "list-objects-v2" || cmd === "head-object" || cmd === "get-bucket-versioning") return read(`s3api ${cmd}`);
-    if (cmd === "delete-object" && bucket === PROOF_LOCKER_BUCKET && /^(v1\/ws=[^/]+\/m=proof-[a-z0-9]+-m\d+\/h=claude\/d=\d{4}\/\d{2}\/\d{2}\/s=[0-9a-f-]{36}\/summary\/short\.json\.enc)$/.test(opt("--key") ?? ""))
+    if (cmd === "delete-object" && bucket === PROOF_LOCKER_BUCKET && /^(v1\/ws=[^/]+\/m=proof-[a-z0-9]+-m\d+\/h=claude\/d=\d{4}\/\d{2}\/\d{2}\/s=[0-9a-f-]{36}\/summary\/short\.json\.enc)$/.test(opt("key") ?? ""))
       return write("delete summary object");
     return refuse("aws_operation_not_allowlisted");
   }
-  if (svc === "s3" && cmd === "cp" && argv[argv.length - 1] === "-") {
-    const src = argv.find((a) => a.startsWith("s3://")) ?? "";
+  if (svc === "s3" && cmd === "cp" && args.length === 2 && args[1] === "-") {
+    const src = args[0]!;
     const m = /^s3:\/\/([^/]+)\/(telemetry\/traces\/.+)$/.exec(src);
     return m && m[1] === PROOF_LOCKER_BUCKET ? read("s3 cp trace batch") : refuse("bucket_outside_fence");
   }
   if (svc === "elbv2" && (cmd === "describe-load-balancers" || cmd === "describe-ssl-policies")) return read(`elbv2 ${cmd}`);
-  if (svc === "elbv2" && cmd === "describe-listeners") return arnOk(opt("--load-balancer-arn") ?? "", ph) ? read("elbv2 describe-listeners") : refuse("arn_outside_fence");
-  if (svc === "wafv2" && cmd === "get-web-acl-for-resource") return arnOk(opt("--resource-arn") ?? "", ph) ? read("wafv2 get-web-acl-for-resource") : refuse("arn_outside_fence");
-  if (svc === "kms" && cmd === "describe-key") return arnOk(opt("--key-id") ?? "", ph) ? read("kms describe-key") : refuse("arn_outside_fence");
+  if (svc === "elbv2" && cmd === "describe-listeners") return arnOk(opt("load-balancer-arn") ?? "", ph) ? read("elbv2 describe-listeners") : refuse("arn_outside_fence");
+  if (svc === "wafv2" && cmd === "get-web-acl-for-resource") return arnOk(opt("resource-arn") ?? "", ph) ? read("wafv2 get-web-acl-for-resource") : refuse("arn_outside_fence");
+  if (svc === "kms" && cmd === "describe-key") return arnOk(opt("key-id") ?? "", ph) ? read("kms describe-key") : refuse("arn_outside_fence");
   if (svc === "eks" && cmd === "list-clusters") return read("eks list-clusters");
-  if (svc === "resourcegroupstaggingapi" && cmd === "get-resources" && opt("--tag-filters") === `Key=96bulls:stack,Values=${PROOF_STAGE}`) return read("tagged resources");
+  if (svc === "eks" && cmd === "describe-cluster" && opt("name") === PROOF_CLUSTER) return read("eks describe-cluster");
+  if (svc === "resourcegroupstaggingapi" && cmd === "get-resources" && opt("tag-filters") === `Key=96bulls:stack,Values=${PROOF_STAGE}`) return read("tagged resources");
   return refuse("aws_operation_not_allowlisted");
 }
 
@@ -270,7 +370,6 @@ export function admitStep(step: { argv: readonly string[]; stdin?: string; mutat
   for (const a of argv) {
     if (FORBIDDEN_NAME.test(a)) return refuse("production_shaped_target");
     if (URL_USERINFO.test(a)) return refuse("url_credentials");
-    if (DANGEROUS_FLAGS.test(a)) return refuse(a === "-A" || a.startsWith("--all-namespaces") ? "all_namespaces_refused" : "target_override_flag");
   }
   let a: Admission;
   switch (argv[0]) {

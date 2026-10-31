@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { PROV } from "./prov.ts";
 import { newCtx, transcriptSearch } from "../checks.ts";
 import { defaultConfig, validateConfig, type ProofConfig } from "../config.ts";
 import { Runner } from "../exec.ts";
@@ -12,7 +13,7 @@ import { buildReport } from "../report.ts";
 import { backendLabel, clickhouseBackend, credentialsFromEnv, validateTranscriptConfig, type TranscriptBackend } from "../transcript.ts";
 
 const ARN = `arn:aws:eks:us-west-2:${PROOF_ACCOUNT_ID}:cluster/${PROOF_CLUSTER}`;
-const identity = { confirmLive: true, accountId: PROOF_ACCOUNT_ID, clusterName: PROOF_CLUSTER, kubeContext: ARN, kubeContextCluster: ARN };
+const identity = { confirmLive: true, accountId: PROOF_ACCOUNT_ID, clusterName: PROOF_CLUSTER, kubeContext: ARN, kubeContextCluster: ARN, clusterBound: true };
 
 const configured = (): ProofConfig => ({
   ...defaultConfig(),
@@ -38,7 +39,7 @@ function fakeBackend(enforceTenancy: boolean): TranscriptBackend & { rows: Array
 }
 
 async function run(cfg: ProofConfig, backend?: TranscriptBackend, mode: "live" | "dry-run" = "live") {
-  const ctx = newCtx(cfg, new Runner({ mode, identity, print: () => {}, fence: TEST_FENCE }), "aws-proof-test-run-0001", {});
+  const ctx = newCtx(cfg, new Runner({ kubeconfigPath: "/test/kubeconfig.json", mode, identity, print: () => {}, fence: TEST_FENCE }), "aws-proof-test-run-0001", {});
   ctx.print = () => {};
   if (backend) ctx.transcriptBackend = backend;
   return { ctx, result: await transcriptSearch(ctx) };
@@ -49,7 +50,7 @@ describe("transcript-search gate", () => {
     const { result } = await run({ ...defaultConfig(), sessions: 4 });
     expect(result.status).toBe("blocked");
     expect(result.metrics.backend).toBe("none");
-    const r = buildReport({ runId: "x", mode: "live", backends: { metadata: "HoopDb Postgres", transcript: "none" }, target: { stage: "aws-proof", clusterName: PROOF_CLUSTER, kubeContext: ARN }, checks: [result] });
+    const r = buildReport({ provenance: PROV, runId: "x", mode: "live", backends: { metadata: "HoopDb Postgres", transcript: "none" }, target: { stage: "aws-proof", clusterName: PROOF_CLUSTER, kubeContext: ARN }, checks: [result] });
     expect(r.verdict).toBe("incomplete");
     expect(r.searchGates.transcript.backend).toBe("none");
   });

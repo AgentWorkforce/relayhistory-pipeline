@@ -45,13 +45,15 @@ export interface ProofConfig {
   /** Sessions per tenant re-ingested for the #38 stale-summary case. */
   staleSessionsPerTenant: number;
   /**
-   * How V1 search is reached. `rpc-sql`: call sessions.search_session_directory
-   * inside the CNPG primary as the Worker role with claims set by the harness
-   * (tenant binding is exercised; JWT signatures are not, see #63).
-   * `postgrest`: POST /rest/v1/rpc/search_session_directory with a per-tenant
-   * JWT supplied by env (#63 issuer). `absent`: search checks are blocked.
+   * How V1 search is reached.
+   * `postgrest-jwt` (default, the only gate evidence): the tenant's RelayAuth
+   * token is exchanged for a search token (RelayAuth #116) and PostgREST runs
+   * the RPC (#73). Blocked until that path is deployed.
+   * `rpc-sql`: diagnostic only. psql inside the CNPG primary as the Worker role
+   * with harness-set claims; checks that rely on it can never pass.
+   * `absent`: search checks are blocked.
    */
-  search: { mode: "rpc-sql" | "postgrest" | "absent"; url?: string };
+  search: { mode: "postgrest-jwt" | "rpc-sql" | "absent" };
   /** The transcript-search gate's V2 backend (ClickHouse or ObsessionDB). "none" leaves the proof INCOMPLETE. */
   transcriptSearch: TranscriptConfig;
   /** Digest-pinned image for in-cluster probes (curl + sh). Required for the Relaycast roundtrip. */
@@ -91,7 +93,7 @@ export function defaultConfig(): ProofConfig {
     ],
     sessions: 100,
     staleSessionsPerTenant: 2,
-    search: { mode: "rpc-sql" },
+    search: { mode: "postgrest-jwt" },
     transcriptSearch: { backend: "none", feed: "harness-synthetic", credentials: { tenants: "PROOF_TRANSCRIPT_TENANT_CREDENTIALS", writer: "PROOF_TRANSCRIPT_WRITER" } },
     extractiveSummaries: true,
     pollIntervalMs: 2_000,
@@ -123,7 +125,7 @@ export function validateConfig(c: ProofConfig): string[] {
   for (const [repo, digest] of Object.entries(c.expectedImages))
     if (!/^sha256:[0-9a-f]{64}$/.test(digest)) issues.push(`expectedImages.${repo} must be sha256:<64 hex>`);
   if (c.probeImage && !DIGEST_REF.test(c.probeImage)) issues.push("probeImage must be digest-pinned (@sha256:...)");
-  if (c.search.mode === "postgrest" && !c.search.url) issues.push("search.url is required for postgrest mode");
+  if (!["postgrest-jwt", "rpc-sql", "absent"].includes(c.search.mode)) issues.push("search.mode must be postgrest-jwt, rpc-sql (diagnostic only) or absent");
   if (!/^https:\/\//.test(c.historyOrigin)) issues.push("historyOrigin must be https");
   if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(c.ingress.hostname)) issues.push("ingress.hostname must be a DNS name");
   issues.push(...validateTranscriptConfig(c.transcriptSearch));

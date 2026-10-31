@@ -32,6 +32,47 @@ action, writes a report with every check `planned`, and touches nothing.
 | `--confirm-live` | live | every step the guard allows, mutating steps included |
 | `--target kind-readonly --read-only` | read-only | `fresh-install` only, on `kind-96bulls-e2e` |
 
+**Stage plan binding** (`src/proof/aws/provenance.ts`). A live or read-only
+run on the proof target refuses to start unless the captured Stage A
+create-only plan from #75 is present and verifies:
+
+- `docs/plans/aws-proof.provenance.json`, `aws-proof.plan.txt` and
+  `aws-proof.inputs.sanitized.json` must all be present.
+- Each file's SHA-256 must equal the one recorded in the provenance file.
+- The provenance must be captured from a clean commit, for stage `aws-proof`,
+  account `500268966557` and region `us-west-2`.
+- The plan must create `96bulls-aws-proof`.
+- The inputs must name `proof-sessions.agentrelay.com` and pin the services and
+  Relaycast image digests.
+
+The live cluster must also be the one that plan created. `describe-cluster`
+must show it was created after the plan was captured, and `fresh-install`
+requires the running images to include the plan's digests. Plan digests take
+precedence over chart defaults and operator inputs. On this branch the plan
+files are on #75, so live runs refuse until #75 lands.
+
+**Cluster identity is bound to live AWS** (`src/proof/aws/cluster-binding.ts`).
+Before the guard runs, the harness makes these reads:
+
+1. It runs `aws sts get-caller-identity`.
+2. It runs `aws eks describe-cluster --name 96bulls-aws-proof --region
+   us-west-2`, but only when the caller is in the proof account.
+3. It runs `kubectl config view --raw -o json`, parsed in memory only.
+
+The described cluster must be the proof ARN, `ACTIVE`, an EKS endpoint in
+`us-west-2`, and carry a CA. The operator's kube context must point at exactly
+that server with exactly that `certificate-authority-data`, and with no TLS
+override or proxy. Otherwise the run is `cluster_unbound` and refused. The
+cluster ARN the guard checks comes from AWS, not from how a kubeconfig names it.
+
+Every kubectl and helm step then runs with `KUBECONFIG` set to a kubeconfig the
+harness generates from the describe result. That file has one cluster, one
+context and `aws eks get-token` exec credentials. It is written to the run
+directory with mode 0600 and deleted after the run. The operator's kubeconfig
+is never used by a step. `HELM_KUBE*` and `AWS_ENDPOINT_URL*` are stripped from
+every tool's environment. A kubectl or helm step without the generated
+kubeconfig is refused with `kubeconfig_unbound`.
+
 **The guard** (`src/proof/aws/guard.ts`) runs before the first step and again
 before every step. It has no override. Any non-dry run against AWS needs all of
 the following:
@@ -56,6 +97,8 @@ Changing a target means a reviewed code change to `fence.ts`.
 | --- | --- |
 | account and region | `500268966557`, `us-west-2` |
 | kube context | `arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-proof` |
+| PostgREST (V1 search, #73) | `96bulls/session-directory-postgrest:3000` |
+| probe images | `PROOF_PROBE_IMAGES` (Stage A services image) |
 | ingest host and origin | `proof-sessions.agentrelay.com`, `https://proof-sessions.agentrelay.com` |
 | buckets | `96bulls-aws-proof-locker-500268966557`, `96bulls-aws-proof-hoopdb-backups-500268966557` |
 | release and chart repo | `96bulls`, `https://AgentWorkforce.github.io/helm-charts` |
@@ -85,6 +128,17 @@ The fence applies twice:
     `sh -c`, `bash -c`, `env`, absolute paths and every other program are
     refused, so nothing can hide inside a wrapper. In-process `HTTP` and
     `PROBE` actions are never spawned, and their hosts are fenced.
+  - **Flag normalization.** Every argv is normalized first:
+    - `--x v`, `--x=v`, `-n v`, `-nv` and `-n=v` all become one canonical
+      flag, and aliases such as `--namespace` and `--selector` map to it.
+    - Any canonical flag that appears twice is refused, so last-wins forms
+      like `--context A --context=B` or `-n 96bulls -n=x` cannot sneak through.
+    - Unknown flags and combined short flags (`-it`) are refused.
+    - Flags that can retarget a tool are refused outright, in any spelling:
+      - kubectl: `--server`/`-s`, `--cluster`, `--user`, `--token`, `--as*`,
+        `--kubeconfig`, CA/TLS overrides, `--username`/`--password`;
+      - helm: `--kube-*`, `--kubeconfig`;
+      - aws: `--profile`, `--endpoint-url`, `--no-verify-ssl`, `--ca-bundle`.
   - **Target flags.**
     - kubectl must start with exactly `--context` and the proof cluster ARN. A
       missing, other or repeated context is refused.
@@ -104,7 +158,10 @@ The fence applies twice:
     - `delete namespace 96bulls`;
     - `apply` of a proof-labelled CNPG `Backup` (cluster `hoopdb`) or the
       restore `Cluster`, with the manifest checked;
-    - `run` and `exec` of the digest-pinned Relaycast probe;
+    - `run` and `exec` of the Relaycast probe. The image must be in the
+      hardcoded allowlist `PROOF_PROBE_IMAGES` (the Stage A services image),
+      not just any digest-pinned image, and must be the stage plan's services
+      digest;
     - `helm upgrade`, `rollback` and `uninstall` of release `96bulls`;
     - `delete-object` of a planted session's `summary/short.json.enc` in the
       Locker bucket.
@@ -323,6 +380,25 @@ An empty trace archive fails the scan, because a scan of nothing proves nothing.
 | R | `HTTP GET <ingest>/v1/pipeline/traces/<id>` and `/v1/pipeline/manifests/status?key=…` with each tenant's token | AlleyOop (read) |
 | R | `kubectl <ctx> -n <ns> logs deployment/<d> --all-containers --since=3h --prefix` for each core deployment and RelayAuth | logs |
 | R | `aws s3api list-objects-v2 --prefix telemetry/traces/`, then `aws s3 cp s3://…/<key> - \| gzip -dcf` for each batch in the window | trace archive (read) |
+
+### V1 search evidence
+
+The only V1 search evidence that counts toward a gate is the path a customer's
+request takes:
+
+1. The tenant's RelayAuth token is exchanged at `POST
+   /v1/tokens/session-directory-search` (RelayAuth #116). The `x-api-key` comes
+   from `PROOF_SEARCH_EXCHANGE_KEY`, through `kubectl port-forward` only.
+2. The exchange returns a 60-second tenant search token.
+3. With that token, the harness calls `POST /rpc/search_session_directory` on
+   the self-hosted PostgREST (#73), with `Content-Profile: sessions`. This is
+   `search.mode: "postgrest-jwt"`, the default.
+
+Stage A has `sessionDirectory.enabled: false`, so PostgREST is not deployed.
+Every check that needs search is therefore BLOCKED, never PASS.
+`search.mode: "rpc-sql"` (psql `SET ROLE` with claims set by the harness)
+remains as a diagnostic. Any check that used it is downgraded to BLOCKED,
+prefixed "diagnostic only".
 
 ### 5. v1-search-scope (metadata gate)
 
@@ -555,6 +631,21 @@ teardown run, produces one report whose verdict covers both.
 - `bin/96bulls down aws-proof`.
 
 ## Report
+
+**Provenance.** Every report records:
+- the harness commit and dirty bit;
+- the SHA-256 of `inputs.json` (or of the defaults when there is none) and of
+  the effective config;
+- the bound stage plan: its provenance digest, plan digest, `generatedAt` and
+  commit;
+- the chart package digest for each deployed chart version, from the chart
+  repository's `index.yaml`.
+
+A run whose checks all pass is still INCOMPLETE until provenance is complete:
+a clean tree, a known commit, a bound stage plan, and every chart digest. Any
+gap is listed in `verdictGaps`. A prior report merges only if it has the same
+harness commit and the same stage plan as the current run.
+
 
 `.96bulls/aws-proof/<run id>/report.json` is gitignored and written with mode
 0600. Its schema is `96bulls.aws-e2e-proof/v1`, defined in

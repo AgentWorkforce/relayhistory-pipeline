@@ -24,14 +24,16 @@
  * Exit code: 0 pass, 1 fail, 2 usage/guard refusal, 3 incomplete.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { uuidv7 } from "../../shared/ids.ts";
 import { CHECKS, newCtx } from "./checks.ts";
 import { loadConfig, validateConfig, type ProofConfig } from "./config.ts";
 import { Runner } from "./exec.ts";
-import { fenceFor, PROOF_CONTEXT, PROOF_REGION } from "./fence.ts";
+import { fenceFor, PROOF_CHART_REPO, PROOF_CONTEXT, PROOF_POSTGREST, PROOF_REGION } from "./fence.ts";
+import { bindKubeconfig, parseDescribeCluster, proofKubeconfig, toolEnv, type DescribedCluster } from "./cluster-binding.ts";
+import { bindStagePlan, chartDigests, gitProvenance, loadStagePlan, sha256Hex, type ReportProvenance, type StagePlan } from "./provenance.ts";
 import { assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, type Identity, type Mode } from "./guard.ts";
 import { allCanaries } from "./corpus.ts";
 import { backendLabel } from "./transcript.ts";
@@ -88,18 +90,33 @@ export function parseArgs(argv: readonly string[]): Args {
   return { checks: checks.length ? [...new Set(checks)] : [...CHECK_IDS], mode, confirmLive, target, inputs, sessions, out, ...(priorReport ? { priorReport } : {}) };
 }
 
-/** Observed identity: who the AWS CLI is, and which cluster the kube context points at. */
-export function observeIdentity(cfg: ProofConfig, run = (argv: string[]) => spawnSync(argv[0]!, argv.slice(1), { encoding: "utf8" })): Identity {
+type Run = (argv: string[]) => { stdout: string; status: number | null };
+const defaultRun: Run = (argv) => {
+  const r = spawnSync(argv[0]!, argv.slice(1), { encoding: "utf8", shell: false, env: argv[0] === "aws" ? toolEnv(process.env, undefined) : process.env });
+  return { stdout: r.stdout ?? "", status: r.status };
+};
+
+/**
+ * Observed identity, bound to live AWS: who the AWS CLI is (sts), what the
+ * proof cluster is (describe-cluster), and whether the operator's kube context
+ * reaches exactly that endpoint with exactly that CA. These four reads are the
+ * only commands that run before the guard; none mutates anything.
+ */
+export function observeIdentity(cfg: ProofConfig, run: Run = defaultRun): { identity: Identity; cluster?: DescribedCluster; bindError?: string } {
   const sts = run(["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"]);
-  const kc = run(["kubectl", "config", "view", "-o", "json"]);
-  let kubeContextCluster: string | undefined;
-  try {
-    const conf = JSON.parse(kc.stdout ?? "{}") as { contexts?: Array<{ name: string; context: { cluster: string } }> };
-    kubeContextCluster = conf.contexts?.find((x) => x.name === cfg.kubeContext)?.context.cluster;
-  } catch {
-    kubeContextCluster = undefined;
-  }
-  return { accountId: sts.status === 0 ? sts.stdout.trim() : undefined, clusterName: cfg.clusterName, kubeContext: cfg.kubeContext, kubeContextCluster };
+  const accountId = sts.status === 0 ? sts.stdout.trim() : undefined;
+  const base: Identity = { accountId, clusterName: cfg.clusterName, kubeContext: cfg.kubeContext, clusterBound: false };
+  // Only ask AWS about the cluster once the caller is the proof account.
+  if (accountId !== PROOF_ACCOUNT_ID) return { identity: base, bindError: "caller is not the proof account" };
+  const d = run(["aws", "eks", "describe-cluster", "--name", PROOF_CLUSTER, "--region", PROOF_REGION, "--output", "json"]);
+  if (d.status !== 0) return { identity: base, bindError: "describe-cluster failed" };
+  const cluster = parseDescribeCluster(d.stdout);
+  if ("error" in cluster) return { identity: base, bindError: cluster.error };
+  const view = run(["kubectl", "config", "view", "--raw", "-o", "json"]);
+  const bound = view.status === 0 ? bindKubeconfig(view.stdout, cfg.kubeContext, cluster) : { error: "kubectl config view failed" };
+  // The cluster ARN comes from AWS, not from the kubeconfig's naming.
+  const identity: Identity = { ...base, kubeContextCluster: cluster.arn, clusterBound: "ok" in bound };
+  return { identity, cluster, ...("error" in bound ? { bindError: bound.error } : {}) };
 }
 
 export async function main(argv: readonly string[], env: Record<string, string | undefined> = process.env): Promise<number> {
@@ -150,22 +167,48 @@ export async function main(argv: readonly string[], env: Record<string, string |
     }
     prior = admitted;
   }
-  const identity: Identity =
-    args.mode === "dry-run" || args.target === "kind-readonly"
-      ? { clusterName: cfg.clusterName, kubeContext: cfg.kubeContext }
-      : observeIdentity(cfg);
+  // The captured Stage A create-only plan. Live runs on the proof target refuse without it.
+  const plan = args.target === "proof" ? loadStagePlan(ROOT) : undefined;
+  if (args.mode !== "dry-run" && args.target === "proof" && (!plan || "error" in plan)) {
+    console.error(`aws-proof: refusing: ${plan && "error" in plan ? plan.error : "no stage plan"}`);
+    return 2;
+  }
+  const stagePlan = plan && !("error" in plan) ? plan : undefined;
+  if (stagePlan && cfg.probeImage && !cfg.probeImage.endsWith(`@${stagePlan.servicesDigest}`)) {
+    console.error("aws-proof: refusing: probeImage is not the stage plan's services image");
+    return 2;
+  }
+  let identity: Identity = { clusterName: cfg.clusterName, kubeContext: cfg.kubeContext };
+  let cluster: DescribedCluster | undefined;
   if (args.mode !== "dry-run" && args.target === "proof") {
+    const o = observeIdentity(cfg);
+    identity = o.identity;
+    cluster = o.cluster;
+    if (o.bindError) console.error(`aws-proof: cluster binding: ${o.bindError}`);
     try {
       assertProofTarget({ ...identity, confirmLive: args.confirmLive });
     } catch (e) {
       console.error(`aws-proof: ${e instanceof GuardError ? `${e.code}: ` : ""}${(e as Error).message}`);
       return 2;
     }
+    const b = bindStagePlan(stagePlan!, cluster!);
+    if ("error" in b) {
+      console.error(`aws-proof: refusing: ${b.error}`);
+      return 2;
+    }
   }
-  // The prior report is read and validated before anything runs, so a bad merge input never costs a live run.
   const runId = `aws-proof-${uuidv7()}`;
-  const runner = new Runner({ mode: args.mode, identity: { ...identity, confirmLive: args.confirmLive }, fence: fenceFor(args.target) });
+  const dir = args.out ?? join(ROOT, ".96bulls/aws-proof", runId);
+  mkdirSync(dir, { recursive: true });
+  // Every kubectl/helm step uses this kubeconfig, generated from describe-cluster; the operator's is never consulted.
+  let kubeconfigPath: string | undefined;
+  if (cluster) {
+    kubeconfigPath = join(dir, "kubeconfig.json");
+    writeFileSync(kubeconfigPath, proofKubeconfig(cluster, cfg.kubeContext), { mode: 0o600 });
+  }
+  const runner = new Runner({ mode: args.mode, identity: { ...identity, confirmLive: args.confirmLive }, fence: fenceFor(args.target), ...(kubeconfigPath ? { kubeconfigPath } : {}) });
   const ctx = newCtx(cfg, runner, runId, env);
+  if (stagePlan) ctx.stagePlan = stagePlan;
   console.log(`aws-proof ${runId}: mode=${args.mode} target=${args.target} context=${cfg.kubeContext} checks=${args.checks.join(",")}`);
   if (args.mode === "dry-run") console.log("DRY RUN: nothing below runs. MUTATE* steps need --confirm-live and Khaliq's direct OK.");
   const results: CheckResult[] = [];
@@ -178,11 +221,16 @@ export async function main(argv: readonly string[], env: Record<string, string |
       results.push({ check: id, status: "fail", startedAt: now, finishedAt: now, summary: `harness error (${code})`, metrics: {}, failures: [`harness error: ${code}`], evidence: [], steps: [] });
     }
   }
-  const metadataBackend = cfg.search.mode === "absent" ? "none" : `HoopDb Postgres (CNPG ${cfg.namespace}/${cfg.hoopdb.cluster}, ${cfg.search.mode === "rpc-sql" ? "sessions.search_session_directory via psql as the Worker role" : `PostgREST ${cfg.search.url}`})`;
+  const metadataBackend =
+    cfg.search.mode === "absent" ? "none"
+    : cfg.search.mode === "rpc-sql" ? `diagnostic only: HoopDb Postgres (CNPG ${cfg.namespace}/${cfg.hoopdb.cluster}) via psql SET ROLE; not gate evidence`
+    : `HoopDb Postgres via PostgREST ${PROOF_POSTGREST.namespace}/${PROOF_POSTGREST.service} with RelayAuth session-directory-search tokens`;
   const transcriptBackend = ctx.transcriptBackend?.label ?? backendLabel(cfg.transcriptSearch);
   // A dry run exercises nothing; say so rather than implying the backend was hit.
   const exercised = (b: string) => (args.mode === "dry-run" && b !== "none" ? `planned, not exercised: ${b}` : b);
-  const own = buildReport({ runId, mode: args.mode, backends: { metadata: exercised(metadataBackend), transcript: exercised(transcriptBackend) }, target: { stage: cfg.stage, clusterName: cfg.clusterName, kubeContext: cfg.kubeContext, region: cfg.region, ...(identity.accountId ? { accountId: identity.accountId } : {}) }, checks: results });
+  if (kubeconfigPath) rmSync(kubeconfigPath, { force: true });
+  const provenance = await reportProvenance(cfg, args, stagePlan);
+  const own = buildReport({ runId, mode: args.mode, provenance, backends: { metadata: exercised(metadataBackend), transcript: exercised(transcriptBackend) }, target: { stage: cfg.stage, clusterName: cfg.clusterName, kubeContext: cfg.kubeContext, region: cfg.region, ...(identity.accountId ? { accountId: identity.accountId } : {}) }, checks: results });
   let report = own;
   if (prior) {
     const merged = mergeReports(prior, own);
@@ -194,8 +242,6 @@ export async function main(argv: readonly string[], env: Record<string, string |
     console.log(`merged prior report ${prior.report.runId} (sha256 ${prior.sha256}); verdict covers ${report.phases.length} phase(s)`);
   }
   const problems = validateReport(report, { canaries: allCanaries(ctx.corpus), secrets: ctx.secrets });
-  const dir = args.out ?? join(ROOT, ".96bulls/aws-proof", runId);
-  mkdirSync(dir, { recursive: true });
   if (problems.length) {
     // Never write a report that fails its own secret/canary self-check.
     console.error(`aws-proof: report failed validation; not written:\n  ${problems.join("\n  ")}`);
@@ -210,3 +256,31 @@ export async function main(argv: readonly string[], env: Record<string, string |
 }
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));
+
+/** Report provenance. Chart digests are read from the public chart index only on non-dry runs. */
+async function reportProvenance(cfg: ProofConfig, args: Args, plan: StagePlan | undefined): Promise<ReportProvenance> {
+  const inputsPath = args.inputs ?? join(ROOT, ".96bulls/aws-proof/inputs.json");
+  const inputsBytes = existsSync(inputsPath) ? readFileSync(inputsPath) : undefined;
+  const wanted = plan
+    ? Object.entries(plan.chartVersions).map(([name, version]) => ({ name, version }))
+    : [{ name: "96bulls", version: cfg.chartVersion }];
+  let charts: ReportProvenance["charts"] = wanted.map((w) => ({ ...w, digest: null }));
+  if (args.mode !== "dry-run") {
+    try {
+      const res = await fetch(`${PROOF_CHART_REPO}/index.yaml`);
+      if (res.ok) charts = chartDigests(await res.text(), wanted);
+    } catch {
+      /* digests stay null: the verdict cannot pass */
+    }
+  }
+  return {
+    harness: gitProvenance((argv) => {
+      const r = spawnSync(argv[0]!, argv.slice(1), { cwd: ROOT, encoding: "utf8", shell: false });
+      return { stdout: r.stdout ?? "", status: r.status };
+    }),
+    inputs: inputsBytes ? { sha256: sha256Hex(inputsBytes), source: "file" } : { sha256: sha256Hex(JSON.stringify(cfg)), source: "defaults" },
+    configSha256: sha256Hex(JSON.stringify(cfg)),
+    stagePlan: plan ? { provenanceSha256: plan.provenanceSha256, generatedAt: plan.generatedAt, commit: plan.commit, planSha256: plan.planSha256 } : null,
+    charts,
+  };
+}

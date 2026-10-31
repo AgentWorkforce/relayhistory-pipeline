@@ -31,6 +31,7 @@ export class GuardError extends Error {
       | "wrong_account"
       | "wrong_cluster"
       | "wrong_region"
+      | "cluster_unbound"
       | "context_mismatch"
       | "production_name"
       | "local_is_read_only"
@@ -52,8 +53,13 @@ export interface Identity {
   clusterName: string;
   /** The kube context the harness will pass as --context. */
   kubeContext: string;
-  /** The current context's cluster server/ARN as `kubectl config view` reports it. */
+  /** The cluster ARN as `aws eks describe-cluster` reports it (not as a kubeconfig names it). */
   kubeContextCluster?: string;
+  /**
+   * True only when describe-cluster succeeded for the proof cluster and the
+   * kube context's server and CA equal its endpoint and CA (cluster-binding.ts).
+   */
+  clusterBound?: boolean;
 }
 
 export interface GuardInput extends Identity {
@@ -100,6 +106,7 @@ export function assertProofTarget(g: Omit<GuardInput, "mode" | "mutating">): voi
   if (!arn || arn.accountId !== PROOF_ACCOUNT_ID || arn.clusterName !== PROOF_CLUSTER)
     throw new GuardError("context_mismatch", `refusing: kube context '${g.kubeContext}' does not point at ${PROOF_CLUSTER} in ${PROOF_ACCOUNT_ID}`);
   if (arn.region !== PROOF_REGION) throw new GuardError("wrong_region", `refusing: kube context cluster is in ${arn.region}, not ${PROOF_REGION}`);
+  if (g.clusterBound !== true) throw new GuardError("cluster_unbound", "refusing: the kube context is not bound to the live cluster's endpoint and CA (describe-cluster)");
   // The context name itself, when it is an EKS ARN, must agree too.
   const named = parseEksArn(g.kubeContext);
   if (named && (named.region !== PROOF_REGION || named.accountId !== PROOF_ACCOUNT_ID || named.clusterName !== PROOF_CLUSTER))

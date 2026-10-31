@@ -8,6 +8,7 @@ import { spawnSync } from "node:child_process";
 import { assertMayRun, GuardError, type GuardInput, type Mode } from "./guard.ts";
 import type { Fence } from "./fence.ts";
 import { admitStep } from "./ops.ts";
+import { toolEnv } from "./cluster-binding.ts";
 import { sanitize, type Approval, type StepRecord } from "./report.ts";
 
 export interface Step {
@@ -30,11 +31,11 @@ export interface StepOutcome {
   ok: boolean;
 }
 
-export type Spawn = (argv: string[], stdin: string | undefined, timeoutMs: number, binary?: boolean) => { stdout: string; status: number | null; error?: Error };
+export type Spawn = (argv: string[], stdin: string | undefined, timeoutMs: number, binary: boolean | undefined, env: Record<string, string>) => { stdout: string; status: number | null; error?: Error };
 
-const defaultSpawn: Spawn = (argv, stdin, timeoutMs, binary) => {
+const defaultSpawn: Spawn = (argv, stdin, timeoutMs, binary, env) => {
   // No shell: argv goes straight to execve. stderr is dropped on purpose: tools echo request bodies and credentials into it.
-  const r = spawnSync(argv[0]!, argv.slice(1), { input: stdin, timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, shell: false });
+  const r = spawnSync(argv[0]!, argv.slice(1), { input: stdin, timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, shell: false, env });
   const out = r.stdout ?? Buffer.alloc(0);
   return { stdout: binary ? out.toString("base64") : out.toString("utf8"), status: r.status, error: r.error };
 };
@@ -49,6 +50,13 @@ export interface RunnerOptions {
   identity: Omit<GuardInput, "mode" | "mutating">;
   /** Every step's argv must stay inside this fence, in every mode (dry-run included). */
   fence: Fence;
+  /**
+   * The kubeconfig generated from describe-cluster (cluster-binding.ts). On the
+   * proof target every non-dry kubectl/helm step requires it; the operator's
+   * kubeconfig is never used.
+   */
+  kubeconfigPath?: string;
+  baseEnv?: Record<string, string | undefined>;
   spawn?: Spawn;
   print?: (line: string) => void;
 }
@@ -59,6 +67,10 @@ export class Runner {
 
   get mode(): Mode {
     return this.o.mode;
+  }
+
+  get hasKubeconfig(): boolean {
+    return !!this.o.kubeconfigPath;
   }
 
   /**
@@ -104,8 +116,9 @@ export class Runner {
     if (!g.allowed) return this.push(g.record, "", false);
     // In-process actions are gated here but performed by the caller; they are never spawned.
     if (step.argv[0] === "HTTP" || step.argv[0] === "PROBE") return this.push({ ...g.record, status: "refused", code: "in_process_not_spawnable" }, "", false);
+    if (this.needsKubeconfig(step.argv) && !this.o.kubeconfigPath) return this.push({ ...g.record, status: "refused", code: "kubeconfig_unbound" }, "", false);
     const started = Date.now();
-    const r = (this.o.spawn ?? defaultSpawn)(step.argv, step.stdin, step.timeoutMs ?? 120_000, step.binary);
+    const r = (this.o.spawn ?? defaultSpawn)(step.argv, step.stdin, step.timeoutMs ?? 120_000, step.binary, this.env());
     const durationMs = Date.now() - started;
     const ok = !r.error && r.status === 0;
     return this.push({ ...g.record, status: ok ? "ran" : "failed", exitCode: r.status ?? -1, durationMs, ...(ok ? {} : { code: r.error ? "spawn_error" : `exit_${r.status}` }) }, r.stdout, ok);
@@ -116,6 +129,16 @@ export class Runner {
     const g = this.gate(step);
     this.records.push(g.record);
     return g.allowed;
+  }
+
+  /** kubectl and helm (except `helm show`, which reads the chart repo only) talk to the cluster. */
+  needsKubeconfig(argv: readonly string[]): boolean {
+    return this.o.fence.target === "proof" && (argv[0] === "kubectl" || (argv[0] === "helm" && argv[1] !== "show"));
+  }
+
+  /** The environment every spawned tool gets: the generated kubeconfig, no retargeting variables. */
+  env(): Record<string, string> {
+    return toolEnv(this.o.baseEnv ?? process.env, this.o.kubeconfigPath);
   }
 
   /** Record an in-process action that `gate` allowed, with its outcome. */

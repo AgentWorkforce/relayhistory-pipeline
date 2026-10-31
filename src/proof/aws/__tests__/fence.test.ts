@@ -1,14 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { PROV } from "./prov.ts";
 import { parseArgs } from "../cli.ts";
 import { defaultConfig, kindReadOnlyConfig, validateConfig, type ProofConfig } from "../config.ts";
 import { Runner } from "../exec.ts";
 import { fenceFor, PROOF_HOST, PROOF_LOCKER_BUCKET,  } from "../fence.ts";
+import { PROOF_PROBE_IMAGES } from "../fence.ts";
 import { admitStep, stepFenceIssue } from "../ops.ts";
 import { PROOF_ACCOUNT_ID, PROOF_CLUSTER } from "../guard.ts";
 import { admitPrior, buildReport, canonicalReportBytes, mergeReports, sanitize, sha256, validateReport, type CheckResult, type ProofReport } from "../report.ts";
 
 const ARN = `arn:aws:eks:us-west-2:${PROOF_ACCOUNT_ID}:cluster/${PROOF_CLUSTER}`;
-const identity = { confirmLive: true, accountId: PROOF_ACCOUNT_ID, clusterName: PROOF_CLUSTER, kubeContext: ARN, kubeContextCluster: ARN };
+const identity = { confirmLive: true, accountId: PROOF_ACCOUNT_ID, clusterName: PROOF_CLUSTER, kubeContext: ARN, kubeContextCluster: ARN, clusterBound: true };
 const cfg = (over: Partial<ProofConfig> = {}): ProofConfig => ({ ...defaultConfig(), ...over });
 const issues = (over: Partial<ProofConfig>) => validateConfig(cfg(over));
 
@@ -55,7 +57,7 @@ describe("fix 1: every target is fenced to the proof stage", () => {
     expect(stepFenceIssue(k("-n", "96bulls", "rollout", "restart", "deployment/other"), fence)).toBe("deployment_outside_fence");
     expect(stepFenceIssue(["PROBE", "GET https://example.com/healthz"], fence)).toBe("host_outside_fence");
     expect(stepFenceIssue(["PROBE", `GET https://${PROOF_HOST}/healthz`], fence)).toBeUndefined();
-    const img = `--image=ghcr.io/x@sha256:${"a".repeat(64)}`;
+    const img = `--image=${PROOF_PROBE_IMAGES[0]}`;
     expect(stepFenceIssue(k("-n", "relaycast", "run", "proof-relaycast-aws-proof", img, "--env=RC_URL=http://relaycast.relaycast.svc:8787", "--command", "--", "sleep", "7200"), fence)).toBeUndefined();
     expect(stepFenceIssue(k("-n", "relaycast", "run", "proof-relaycast-aws-proof", img, "--env=RC_URL=http://db.kube-system.svc:8787", "--command", "--", "sleep", "7200"), fence)).toBe("probe_env_not_allowlisted");
     expect(stepFenceIssue(k("-n", "relaycast", "run", "x", img), fence)).toBe("kubectl_operation_not_allowlisted");
@@ -64,7 +66,7 @@ describe("fix 1: every target is fenced to the proof stage", () => {
   test("the runner refuses an out-of-fence step in every mode, dry-run included, and never spawns", () => {
     for (const mode of ["dry-run", "read-only", "live"] as const) {
       let spawned = 0;
-      const r = new Runner({ mode, identity, fence, print: () => {}, spawn: () => (spawned++, { stdout: "", status: 0 }) });
+      const r = new Runner({ kubeconfigPath: "/test/kubeconfig.json", mode, identity, fence, print: () => {}, spawn: () => (spawned++, { stdout: "", status: 0 }) });
       const out = r.run({ id: "x", argv: ["aws", "s3api", "delete-object", "--region", "us-west-2", "--bucket", "victim", "--key", "k"], mutating: true, touches: [], approval: "khaliq" });
       expect(out.record).toMatchObject({ status: "refused", code: "bucket_outside_fence" });
       expect(spawned).toBe(0);
@@ -85,7 +87,7 @@ describe("fix 2: URL credentials are rejected and never printed", () => {
   });
   test("a step carrying userinfo is refused and its recorded/printed command is sanitized, in dry-run too", () => {
     const printed: string[] = [];
-    const r = new Runner({ mode: "dry-run", identity, fence: fenceFor("proof"), print: (l) => printed.push(l) });
+    const r = new Runner({ kubeconfigPath: "/test/kubeconfig.json", mode: "dry-run", identity, fence: fenceFor("proof"), print: (l) => printed.push(l) });
     const out = r.run({ id: "x", argv: ["curl", "https://reader:hunter2@abc.clickhouse.cloud/"], mutating: false, touches: ["https://reader:hunter2@abc"], approval: "operator" });
     expect(out.record.code).toBe("url_credentials");
     expect(JSON.stringify(out.record)).not.toContain("hunter2");
@@ -107,8 +109,8 @@ describe("fix 3: the two teardown phases merge into one reproducible, bound repo
   const step = (status: "ran" | "planned") => ({ id: "s", command: "kubectl get pods", mutating: false, touches: [], approval: "operator" as const, status });
   const res = (check: CheckResult["check"], status: CheckResult["status"], at: string, stepStatus: "ran" | "planned" = "ran"): CheckResult => ({ check, status, startedAt: at, finishedAt: at, summary: status, metrics: {}, failures: status === "fail" ? ["x"] : [], evidence: [], steps: [step(stepStatus)] });
   const ids = ["fresh-install", "planted-trace", "public-ingress", "tenant-isolation", "v1-search-scope", "transcript-search", "stale-summary", "restart-persistence", "upgrade-rollback", "backup-restore", "teardown"] as const;
-  const phase1 = buildReport({ runId: "aws-proof-run-1", generatedAt: T(1), mode: "live", target, backends: { metadata: "HoopDb Postgres", transcript: CH }, checks: ids.map((id) => res(id, id === "v1-search-scope" ? "unsupported" : id === "teardown" ? "blocked" : "pass", T(0))) });
-  const phase2 = buildReport({ runId: "aws-proof-run-2", generatedAt: T(31), mode: "live", target, backends: { metadata: "HoopDb Postgres", transcript: "none" }, checks: [res("teardown", "pass", T(30))] });
+  const phase1 = buildReport({ provenance: PROV, runId: "aws-proof-run-1", generatedAt: T(1), mode: "live", target, backends: { metadata: "HoopDb Postgres", transcript: CH }, checks: ids.map((id) => res(id, id === "v1-search-scope" ? "unsupported" : id === "teardown" ? "blocked" : "pass", T(0))) });
+  const phase2 = buildReport({ provenance: PROV, runId: "aws-proof-run-2", generatedAt: T(31), mode: "live", target, backends: { metadata: "HoopDb Postgres", transcript: "none" }, checks: [res("teardown", "pass", T(30))] });
   const bytes = (r: unknown) => canonicalReportBytes(r as Parameters<typeof canonicalReportBytes>[0]);
   test("phase 1 alone is incomplete; phase 2 alone is incomplete; merged is PASS and binds the prior's digest", () => {
     expect(phase1.verdict).toBe("incomplete");
@@ -150,14 +152,14 @@ describe("fix 3: the two teardown phases merge into one reproducible, bound repo
     const eu = { ...target, region: "eu-west-1" };
     expect(merge(bytes({ ...phase1, target: eu }), { ...phase2, target: eu })).toEqual({ error: "prior report region is not the proof target" });
     expect(merge(bytes(phase1), { ...phase2, mode: "dry-run", phases: [{ ...phase2.phases[0]!, mode: "dry-run" }] })).toEqual({ error: "current run must be a single live phase" });
-    const early = buildReport({ runId: "aws-proof-run-2", generatedAt: T(31), mode: "live", target, backends: { metadata: "m", transcript: "none" }, checks: [res("teardown", "pass", T(0))] });
+    const early = buildReport({ provenance: PROV, runId: "aws-proof-run-2", generatedAt: T(31), mode: "live", target, backends: { metadata: "m", transcript: "none" }, checks: [res("teardown", "pass", T(0))] });
     expect(merge(bytes(phase1), early)).toMatchObject({ error: expect.stringMatching(/started before the prior report/) });
     expect(merge(bytes({ ...phase1, phases: [{ ...phase1.phases[0]!, runId: "other" }] }), phase2)).toMatchObject({ error: expect.stringMatching(/phases must end with this run|prior phase does not match/) });
     const merged = merge(bytes(phase1), phase2) as { report: ProofReport };
     expect(merge(bytes(merged.report), { ...phase2, runId: "aws-proof-run-3", phases: [{ ...phase2.phases[0]!, runId: "aws-proof-run-3", generatedAt: T(59) }], generatedAt: T(59) })).toEqual({ error: "prior report must be a single unmerged phase" });
   });
   test("a fail carried from phase 1 keeps the merged report failing", () => {
-    const failing = buildReport({ runId: "aws-proof-run-1", generatedAt: T(1), mode: "live", target, backends: { metadata: "m", transcript: CH }, checks: [res("backup-restore", "fail", T(0))] });
+    const failing = buildReport({ provenance: PROV, runId: "aws-proof-run-1", generatedAt: T(1), mode: "live", target, backends: { metadata: "m", transcript: CH }, checks: [res("backup-restore", "fail", T(0))] });
     const m = merge(bytes(failing), phase2);
     expect("report" in m && m.report.verdict).toBe("fail");
   });
@@ -209,7 +211,7 @@ describe("re-review counterexamples: the fence is hardcoded, not derived from co
   });
   test("every planned step of every check stays inside the fence (no -A anywhere)", async () => {
     const { teardownSteps, teardownVerifySteps, backupRestoreSteps, restoreCleanupSteps, rolloutRestartSteps, failoverSteps, relaycastProbeSteps, upgradeRollbackSteps } = await import("../lifecycle.ts");
-    const c = { ...defaultConfig(), candidateChartVersion: "0.3.1", probeImage: `ghcr.io/x@sha256:${"a".repeat(64)}` };
+    const c = { ...defaultConfig(), candidateChartVersion: "0.3.1", probeImage: PROOF_PROBE_IMAGES[0]! };
     const all = [...teardownSteps(c), ...teardownVerifySteps(c), ...backupRestoreSteps(c, "proof-x"), ...restoreCleanupSteps(c, "proof-x"), ...rolloutRestartSteps(c), ...failoverSteps(c, "hoopdb-1"),
       ...relaycastProbeSteps(c, "start"), ...relaycastProbeSteps(c, "before"), ...relaycastProbeSteps(c, "after"), ...relaycastProbeSteps(c, "delete"), ...upgradeRollbackSteps(c, "3")];
     for (const s of all) {

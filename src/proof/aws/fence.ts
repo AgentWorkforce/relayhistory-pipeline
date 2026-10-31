@@ -37,6 +37,20 @@ export const PROOF_INGEST_SERVICE = "96bulls-alleyoop";
 export const PROOF_CORE_DEPLOYMENTS = ["96bulls-alleyoop-ingest", "96bulls-worker-hoopdb-indexer", "96bulls-worker-referee", "96bulls-worker-bob-costas"] as const;
 export const PROOF_HOOPDB = { cluster: "hoopdb", database: "hoopdb" } as const;
 export const PROOF_RESTORE_CLUSTER = "hoopdb-restore-proof";
+/**
+ * The self-hosted PostgREST of #73's profile (session directory search over
+ * HTTP). Not deployed in Stage A (sessionDirectory.enabled=false), so the
+ * metadata search gate is BLOCKED until it is; the service name is fixed here.
+ */
+export const PROOF_POSTGREST = { namespace: "96bulls", service: "session-directory-postgrest", port: 3000 } as const;
+/**
+ * The only images the in-cluster probe pod may run: the Stage A services image
+ * (versions.lock.json images.services-aws.approved on #75, publish-image-ecr
+ * run 41154325003, source 2fb88cd). It ships bun, which the probe needs.
+ */
+export const PROOF_PROBE_IMAGES: readonly string[] = [
+  "500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services@sha256:59d9468551ded11f3c6f5d36558ab7ef87c3e50e99772de352cc309823cb00e0",
+];
 /** Namespaces that hold objects the proof creates (and teardown may delete). */
 export const PROOF_WRITABLE_NAMESPACES = [PROOF_NAMESPACE, PROOF_RELAYCAST.namespace] as const;
 
@@ -83,7 +97,7 @@ export const PROOF_FENCE: Fence = Object.freeze({
   deleteNamespaces: new Set(PROOF_WRITABLE_NAMESPACES),
   buckets: new Set([PROOF_LOCKER_BUCKET, PROOF_BACKUP_BUCKET]),
   deployments: new Set([...PROOF_CORE_DEPLOYMENTS, PROOF_RELAYAUTH.service, PROOF_RELAYCAST.service]),
-  services: new Set([PROOF_INGEST_SERVICE, PROOF_RELAYAUTH.service, PROOF_RELAYCAST.service]),
+  services: new Set([PROOF_INGEST_SERVICE, PROOF_POSTGREST.service, PROOF_RELAYAUTH.service, PROOF_RELAYCAST.service]),
   pgClusters: new Set([PROOF_HOOPDB.cluster, PROOF_RESTORE_CLUSTER]),
   databases: new Set([PROOF_HOOPDB.database]),
   releases: new Set([PROOF_RELEASE]),
@@ -125,6 +139,7 @@ interface FenceSource {
   ingress: { hostname: string };
   historyOrigin: string;
   transcriptSearch: { backend: string; endpoint?: string; database?: string; table?: string };
+  probeImage?: string;
 }
 
 /** Every string anywhere in a value, with its path. */
@@ -166,6 +181,7 @@ export function proofConfigIssues(c: FenceSource & Record<string, unknown>): str
   want("hoopdb", { cluster: c.hoopdb.cluster, database: c.hoopdb.database }, PROOF_HOOPDB);
   want("locker.bucket", c.locker.bucket, PROOF_LOCKER_BUCKET);
   if (c.backupBucket !== undefined) want("backupBucket", c.backupBucket, PROOF_BACKUP_BUCKET);
+  if (c.probeImage !== undefined && !PROOF_PROBE_IMAGES.includes(c.probeImage as string)) issues.push(`probeImage must be one of the allowlisted images (fence.ts PROOF_PROBE_IMAGES)`);
   want("relayauth", { namespace: c.relayauth.namespace, service: c.relayauth.service }, PROOF_RELAYAUTH);
   want("relaycast", { namespace: c.relaycast.namespace, service: c.relaycast.service }, PROOF_RELAYCAST);
   want("ingest.service", c.ingest.service, PROOF_INGEST_SERVICE);

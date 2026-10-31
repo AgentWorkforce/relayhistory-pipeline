@@ -18,10 +18,13 @@ import {
   relaycastVerdict, restoreCleanupSteps, RESTORE_CLUSTER, rolloutRestartSteps, evaluateBackup, STAGE_DESTROY_COMMAND, teardownResidue, teardownSteps, clusterGone, PROOF_TAG,
   teardownVerifySteps, upgradeRollbackSteps, versioningEnabled,
 } from "./lifecycle.ts";
-import { directorySql, indexStateSql, jsonLines, kubectl, lastJson, primaryStep, s3ListStep, searchBatchSql, sqlStep, stageTimesSql, type SearchResultLine } from "./probes.ts";
+import { directorySql, indexStateSql, jsonLines, kubectl, lastJson, primaryStep, s3ListStep, searchBatchSql, sqlStep, stageTimesSql, type SearchResultLine, type SearchRow } from "./probes.ts";
 import { evidence, type CheckId, type CheckResult, type Evidence, type Status } from "./report.ts";
 import { summarize } from "./stats.ts";
 import { manifestKey, scrubText } from "../../shared/vendor.ts";
+import { PROOF_POSTGREST } from "./fence.ts";
+import { exchangeSearchToken, postgrestSearch, SEARCH_EXCHANGE_KEY_ENV } from "./search-http.ts";
+import { planImageIssues, type StagePlan } from "./provenance.ts";
 import { backendLabel, clickhouseBackend, credentialsFromEnv, evaluateTranscriptGate, type TranscriptBackend, type TranscriptObservation } from "./transcript.ts";
 import {
   burstPlan, evaluateBurst, evaluateListeners, evaluateRoutes, evaluateTls, evaluateWafConfig, hostIsProofAlb, ingestRoutes, probeTls, rateRules, resolveAll,
@@ -45,6 +48,12 @@ export interface Ctx {
   env: Record<string, string | undefined>;
   /** Override for tests; otherwise built from cfg.transcriptSearch and the environment. */
   transcriptBackend?: TranscriptBackend;
+  /** The captured Stage A plan the live cluster was bound to (provenance.ts). */
+  stagePlan?: StagePlan;
+  /** Searches served by the psql diagnostic path. Checks that used it cannot pass. */
+  diagnosticSearches: number;
+  /** Override for tests: the authenticated HTTP search (exchange + PostgREST). */
+  httpSearch?: (t: Tenant, q: string) => Promise<{ rows: SearchRow[]; ms: number }>;
 }
 
 export function newCtx(cfg: ProofConfig, runner: Runner, runId: string, env: Record<string, string | undefined> = process.env): Ctx {
@@ -55,6 +64,7 @@ export function newCtx(cfg: ProofConfig, runner: Runner, runId: string, env: Rec
     corpus: plantCorpus({ runId, sessions: cfg.sessions, tenants: cfg.tenants }),
     uploads: new Map(),
     tokens: new Map(),
+    diagnosticSearches: 0,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     now: () => Date.now(),
   };
@@ -68,18 +78,26 @@ class Result {
   readonly evidence: Evidence[] = [];
   readonly metrics: Record<string, unknown> = {};
   private readonly firstStep: number;
+  private readonly firstDiagnostic: number;
   constructor(private readonly ctx: Ctx, readonly check: CheckId) {
     this.startedAt = ctx.now();
     this.firstStep = ctx.runner.records.length;
+    this.firstDiagnostic = ctx.diagnosticSearches;
     ctx.print(`\n== ${check} (${ctx.runner.mode})`);
   }
   ev(label: string, raw: string, withExcerpt = true) {
     this.evidence.push(evidence(label, raw, { secrets: this.ctx.secrets, canaries: allCanaries(this.ctx.corpus) }, withExcerpt));
   }
-  done(status: Status, summary: string): CheckResult {
+  done(status: Status, summaryIn: string): CheckResult {
+    let summary = summaryIn;
     const steps = this.ctx.runner.records.slice(this.firstStep);
     // A pass with recorded failures is a fail; a fail needs at least one stated reason.
-    const final: Status = status === "pass" && this.failures.length ? "fail" : status;
+    let final: Status = status === "pass" && this.failures.length ? "fail" : status;
+    // Search evidence from the psql diagnostic path is never gate evidence.
+    if ((final === "pass" || final === "unsupported") && this.ctx.diagnosticSearches > this.firstDiagnostic) {
+      final = "blocked";
+      summary = `diagnostic only (psql SET ROLE), not gate evidence; the authenticated tenant-JWT search path must be proven. ${summary}`;
+    }
     if (final === "fail" && !this.failures.length) this.failures.push(summary);
     this.ctx.print(`   -> ${final.toUpperCase()}: ${summary}`);
     return { check: this.check, status: final, startedAt: iso(this.startedAt), finishedAt: iso(Math.max(this.ctx.now(), this.startedAt)), summary, metrics: this.metrics, failures: this.failures, evidence: this.evidence, steps };
@@ -130,9 +148,16 @@ export async function freshInstall(ctx: Ctx): Promise<CheckResult> {
     else unavailable.push(`${ch.name}-${ch.version}`);
   }
   if (unavailable.length) r.metrics.chartValuesUnavailable = unavailable;
-  const expected = { ...released, ...c.expectedImages };
+  // The bound stage plan's digests win over chart defaults and operator inputs.
+  const plan = ctx.stagePlan;
+  const expected = {
+    ...released, ...c.expectedImages,
+    ...(plan ? { "500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services": plan.servicesDigest, "ghcr.io/agentworkforce/relaycast-self-host": plan.relaycastDigest } : {}),
+  };
   const v = evaluateFreshInstall(merged, releases, expected);
   r.failures.push(...v.failures);
+  if (plan) r.failures.push(...planImageIssues(plan, v.images.map((i) => i.specDigest ?? "")));
+  else if (c.stage === "aws-proof") r.failures.push("no stage plan bound; the running images cannot be matched to the captured plan");
   r.metrics.charts = v.charts;
   r.metrics.images = v.images.map(({ namespace, pod, container, image, specDigest, runningDigest }) => ({ namespace, pod, container, image, specDigest: specDigest ?? null, runningDigest: runningDigest ?? null }));
   r.metrics.expectedRepositories = Object.keys(expected).length;
@@ -253,9 +278,10 @@ interface Forward {
 async function portForward(ctx: Ctx, ns: string, svc: string, port: number, localPort: number): Promise<Forward | undefined> {
   const argv = kubectl(ctx.cfg, "-n", ns, "port-forward", `svc/${svc}`, `${localPort}:${port}`);
   const g = ctx.runner.gate({ id: `port-forward.${svc}`, argv, mutating: false, touches: [`k8s:${ns}/svc/${svc} (tunnel through the API server)`], approval: "operator" });
-  ctx.runner.note(g.record);
-  if (!g.allowed) return undefined;
-  const child: ChildProcess = spawn(argv[0]!, argv.slice(1), { stdio: ["ignore", "pipe", "ignore"] });
+  const unbound = g.allowed && ctx.runner.needsKubeconfig(argv) && !ctx.runner.hasKubeconfig;
+  ctx.runner.note(unbound ? { ...g.record, status: "refused", code: "kubeconfig_unbound" } : g.record);
+  if (!g.allowed || unbound) return undefined;
+  const child: ChildProcess = spawn(argv[0]!, argv.slice(1), { stdio: ["ignore", "pipe", "ignore"], env: ctx.runner.env(), shell: false });
   await new Promise<void>((resolve) => {
     const t = setTimeout(resolve, 5_000);
     child.stdout?.on("data", (d: Buffer) => {
@@ -278,22 +304,79 @@ function sql<T>(ctx: Ctx, id: string, pod: string, text: string): T | undefined 
   return o.ok ? lastJson<T>(o.stdout) : undefined;
 }
 
-/** Search every query for one tenant in one psql session. */
-function searchTenant(ctx: Ctx, pod: string, t: Tenant, queries: Array<{ tag: string; q: string }>, id: string): Map<string, SearchResultLine> | undefined {
+/**
+ * Search every query for one tenant. `postgrest-jwt` (gate evidence): the
+ * tenant's RelayAuth token is exchanged for a search token and each query goes
+ * to PostgREST. `rpc-sql`: one psql session as the Worker role, counted as a
+ * diagnostic so the check using it cannot pass.
+ */
+async function searchTenant(ctx: Ctx, pod: string, t: Tenant, queries: Array<{ tag: string; q: string }>, id: string): Promise<Map<string, SearchResultLine> | undefined> {
   if (queries.length === 0) return new Map();
-  const o = ctx.runner.run(sqlStep(ctx.cfg, id, pod, searchBatchSql(t, queries)));
-  if (!o.ok) return undefined;
-  return new Map(jsonLines<SearchResultLine>(o.stdout).filter((l) => typeof l.tag === "string").map((l) => [l.tag, l]));
+  if (ctx.cfg.search.mode === "rpc-sql") {
+    ctx.diagnosticSearches += 1;
+    const o = ctx.runner.run(sqlStep(ctx.cfg, id, pod, searchBatchSql(t, queries)));
+    if (!o.ok) return undefined;
+    return new Map(jsonLines<SearchResultLine>(o.stdout).filter((l) => typeof l.tag === "string").map((l) => [l.tag, l]));
+  }
+  if (ctx.cfg.search.mode !== "postgrest-jwt") return undefined;
+  const search = ctx.httpSearch ?? (await openHttpSearch(ctx, id));
+  if (!search) return undefined;
+  const out = new Map<string, SearchResultLine>();
+  for (const { tag, q } of queries) {
+    try {
+      const r = await search(t, q);
+      out.set(tag, { tag, rows: r.rows, ms: r.ms });
+    } catch {
+      /* missing line = search error for that query */
+    }
+  }
+  return out;
+}
+
+/** Port-forward RelayAuth and PostgREST, and search through the token exchange. Tokens live in memory only. */
+async function openHttpSearch(ctx: Ctx, id: string): Promise<((t: Tenant, q: string) => Promise<{ rows: SearchRow[]; ms: number }>) | undefined> {
+  const key = ctx.env[SEARCH_EXCHANGE_KEY_ENV];
+  if (!key) return undefined;
+  ctx.secrets.push(key);
+  const ra = await portForward(ctx, ctx.cfg.relayauth.namespace, ctx.cfg.relayauth.service, ctx.cfg.relayauth.port, 18797);
+  const pg = await portForward(ctx, PROOF_POSTGREST.namespace, PROOF_POSTGREST.service, PROOF_POSTGREST.port, 18300);
+  if (!ra || !pg) {
+    ra?.stop();
+    pg?.stop();
+    return undefined;
+  }
+  const g = ctx.runner.gate({ id, argv: ["HTTP", "POST", "http://127.0.0.1:18797/v1/tokens/session-directory-search", "+", "http://127.0.0.1:18300/rpc/search_session_directory"], mutating: false, touches: [`relayauth:${ctx.cfg.relayauth.namespace} (search token exchange)`, `postgrest:${PROOF_POSTGREST.namespace}/${PROOF_POSTGREST.service} (read)`], approval: "operator" });
+  ctx.runner.note(g.record);
+  if (!g.allowed) {
+    ra.stop();
+    pg.stop();
+    return undefined;
+  }
+  const cache = new Map<string, { token: string; at: number }>();
+  // Stopped when the process exits; each check re-opens its own tunnels.
+  setTimeout(() => (ra.stop(), pg.stop()), 120_000).unref?.();
+  return async (t, q) => {
+    const subject = ctx.tokens.get(tenantKey(t));
+    if (!subject) throw new Error("no tenant token");
+    let c = cache.get(tenantKey(t));
+    if (!c || ctx.now() - c.at > 30_000) {
+      const token = await exchangeSearchToken({ relayauthUrl: ra.url, exchangeKey: key, subjectToken: subject, workspaceId: t.workspaceId });
+      ctx.secrets.push(token);
+      c = { token, at: ctx.now() };
+      cache.set(tenantKey(t), c);
+    }
+    return postgrestSearch({ postgrestUrl: pg.url, token: c.token, workspaceId: t.workspaceId, q });
+  };
 }
 
 const tagOf = (p: PlantedSession, kind: string) => `${kind}_${p.sessionId.replace(/-/g, "")}`;
 
 /** Search each planted session's summaryTerm as its own tenant; returns found + latency per session. */
-function searchOwn(ctx: Ctx, pod: string, sessions: readonly PlantedSession[], label: string) {
+async function searchOwn(ctx: Ctx, pod: string, sessions: readonly PlantedSession[], label: string) {
   const out = new Map<string, { found: boolean; ms?: number; summaries: Array<string | null>; error?: string }>();
   for (const t of ctx.cfg.tenants) {
     const mine = sessions.filter((p) => tenantKey(p.tenant) === tenantKey(t));
-    const res = searchTenant(ctx, pod, t, mine.map((p) => ({ tag: tagOf(p, "own"), q: p.summaryTerm })), `search.${label}.${t.orgId}`);
+    const res = await searchTenant(ctx, pod, t, mine.map((p) => ({ tag: tagOf(p, "own"), q: p.summaryTerm })), `search.${label}.${t.orgId}`);
     for (const p of mine) {
       const line = res?.get(tagOf(p, "own"));
       if (!line) out.set(p.sessionId, { found: false, summaries: [], error: res ? "no_result_line" : "search_failed" });
@@ -453,11 +536,13 @@ export async function plantedTrace(ctx: Ctx): Promise<CheckResult> {
   if (!db) return r.done("blocked", "HoopDb probes failed");
   const s3 = s3Present(ctx);
   if (!s3) r.failures.push("S3 listing failed");
-  const searchChecked = db.directoryPresent && db.searchRpcPresent && c.search.mode === "rpc-sql";
+  // Gate evidence needs the authenticated path deployed: PostgREST in front of the RPC, plus the exchange key.
+  const httpPath = c.search.mode === "postgrest-jwt" && (!!ctx.httpSearch || (ctx.runner.run({ id: "search.postgrest-service", argv: kubectl(c, "-n", PROOF_POSTGREST.namespace, "get", "service", PROOF_POSTGREST.service, "-o", "name"), mutating: false, touches: [`k8s:${PROOF_POSTGREST.namespace}/service/${PROOF_POSTGREST.service}`], approval: "operator" }).ok && !!ctx.env[SEARCH_EXCHANGE_KEY_ENV]));
+  const searchChecked = db.directoryPresent && db.searchRpcPresent && (c.search.mode === "rpc-sql" || httpPath);
   r.metrics.directoryPresent = db.directoryPresent;
   r.metrics.searchRpcPresent = db.searchRpcPresent;
   r.metrics.searchMode = c.search.mode;
-  const found = searchChecked ? searchOwn(ctx, pod, ctx.corpus, "own") : new Map();
+  const found = searchChecked ? await searchOwn(ctx, pod, ctx.corpus, "own") : new Map();
   const expected = new Map<string, string>();
   if (c.extractiveSummaries) for (const p of ctx.corpus) expected.set(p.sessionId, await expectedShortSummary(p, 1));
   const obs = new Map<string, SessionObservation>();
@@ -484,7 +569,10 @@ export async function plantedTrace(ctx: Ctx): Promise<CheckResult> {
   Object.assign(r.metrics, v.metrics);
   ctx.searchable = new Set([...found].filter(([, f]) => f.found).map(([id]) => id));
   if (!db.directoryPresent) return r.done(r.failures.length ? "fail" : "blocked", "session_directory.short_summary is absent in this HoopDb (#38/#48 migrations not applied); summary and search stages not observable");
-  if (!searchChecked) return r.done(r.failures.length ? "fail" : "blocked", `V1 search not reachable (search.mode=${c.search.mode}, rpc present=${db.searchRpcPresent})`);
+  if (!searchChecked)
+    return r.done(r.failures.length ? "fail" : "blocked", c.search.mode === "postgrest-jwt"
+      ? "the authenticated V1 search path (RelayAuth session-directory-search exchange -> PostgREST) is not deployed or the exchange key is missing; search gate BLOCKED"
+      : `V1 search not reachable (search.mode=${c.search.mode}, rpc present=${db.searchRpcPresent})`);
   return r.done(r.failures.length ? "fail" : "pass", `${v.metrics.stageCounts.search}/${ctx.corpus.length} planted sessions traced S3 -> index -> summary -> search`);
 }
 
@@ -514,7 +602,7 @@ export async function tenantIsolation(ctx: Ctx): Promise<CheckResult> {
     const others = ctx.corpus.filter((p) => tenantKey(p.tenant) !== tenantKey(t)).slice(0, 20);
     const qs = [...new Set(others.map((p) => p.tenantCanary))].map((q, i) => ({ tag: `canary_${i}`, q }))
       .concat(others.map((p) => ({ tag: tagOf(p, "x"), q: p.summaryTerm })), [{ tag: "list_run", q: tag }]);
-    const res = searchTenant(ctx, pod, t, qs, `isolation.search.${t.orgId}`);
+    const res = await searchTenant(ctx, pod, t, qs, `isolation.search.${t.orgId}`);
     if (!res) r.failures.push(`isolation search failed for ${t.orgId}`);
     for (const line of res?.values() ?? []) probes.push({ surface: line.tag === "list_run" ? "list" : "search", caller: t, status: 200, sessionIds: line.rows.map((x) => x.session_id), body: JSON.stringify(line.rows) });
     const own = res?.get("list_run")?.rows.filter((x) => owner.get(x.session_id) && tenantKey(owner.get(x.session_id)!) === tenantKey(t)).length ?? 0;
@@ -610,7 +698,7 @@ export async function v1SearchScope(ctx: Ctx): Promise<CheckResult> {
   const probes: Array<{ hits: number; error?: string }> = [];
   for (const t of ctx.cfg.tenants) {
     const mine = ctx.corpus.filter((p) => tenantKey(p.tenant) === tenantKey(t)).slice(0, 10);
-    const res = searchTenant(ctx, pod, t, mine.map((p) => ({ tag: tagOf(p, "tx"), q: p.transcriptCanary })), `scope.transcript.${t.orgId}`);
+    const res = await searchTenant(ctx, pod, t, mine.map((p) => ({ tag: tagOf(p, "tx"), q: p.transcriptCanary })), `scope.transcript.${t.orgId}`);
     for (const p of mine) {
       const line = res?.get(tagOf(p, "tx"));
       probes.push(line ? { hits: line.rows.length } : { hits: 0, error: res ? "no_result_line" : "search_failed" });
@@ -743,7 +831,7 @@ export async function staleSummary(ctx: Ctx): Promise<CheckResult> {
   const verdicts = new Map<string, ReturnType<typeof evaluateStaleSummary>>();
   while (true) {
     const now = readDb(ctx, pod, chosen, "stale.poll");
-    const search = searchOwn(ctx, pod, chosen, "stale");
+    const search = await searchOwn(ctx, pod, chosen, "stale");
     const reached = ctx.now() >= deadline;
     for (const p of chosen) {
       const b = before.directory.get(p.sessionId);
@@ -803,7 +891,7 @@ export async function restartPersistence(ctx: Ctx): Promise<CheckResult> {
   if (!va.ok) r.failures.push(...va.failures.map((f) => `relaycast after restart: ${f}`));
   const pod = primary(ctx);
   const baseline = ctx.corpus.filter((p) => ctx.searchable!.has(p.sessionId));
-  const found = searchOwn(ctx, pod, baseline, "after-restart");
+  const found = await searchOwn(ctx, pod, baseline, "after-restart");
   const lost = baseline.filter((p) => !found.get(p.sessionId)?.found);
   if (lost.length) r.failures.push(`${lost.length}/${baseline.length} planted sessions no longer searchable after restarts; first: ${lost.slice(0, 5).map((p) => p.sessionId).join(", ")}`);
   r.metrics.searchableAfter = baseline.length - lost.length;
@@ -830,16 +918,16 @@ export async function upgradeRollback(ctx: Ctx): Promise<CheckResult> {
   if (!prior) return r.done("blocked", "could not read the current helm revision");
   const baseline = ctx.corpus.filter((p) => ctx.searchable!.has(p.sessionId));
   const steps = upgradeRollbackSteps(c, prior);
-  const verify = (label: string) => {
-    const found = searchOwn(ctx, primary(ctx), baseline, label);
+  const verify = async (label: string) => {
+    const found = await searchOwn(ctx, primary(ctx), baseline, label);
     const lost = baseline.filter((p) => !found.get(p.sessionId)?.found).length;
     r.metrics[`searchable.${label}`] = baseline.length - lost;
     if (lost) r.failures.push(`${lost}/${baseline.length} sessions not searchable after ${label}`);
   };
   for (const s of steps.slice(0, 2)) if (!ctx.runner.run(s).ok) r.failures.push(`${s.id} failed`);
-  verify("upgrade");
+  await verify("upgrade");
   for (const s of steps.slice(2)) if (!ctx.runner.run(s).ok) r.failures.push(`${s.id} failed`);
-  verify("rollback");
+  await verify("rollback");
   const after = ctx.runner.run(helmHistoryStep(c));
   r.ev("helm-history.json", after.stdout);
   return r.done(r.failures.length ? "fail" : "pass", `upgraded to ${c.candidateChartVersion} and rolled back to revision ${prior}; data intact`);

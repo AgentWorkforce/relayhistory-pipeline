@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { PROV } from "./prov.ts";
 import { buildReport, canaryTag, CHECK_IDS, evidence, REPORT_SCHEMA, sanitize, validateReport, verdictOf, type CheckResult } from "../report.ts";
 
 const T = "2026-10-30T12:00:00.000Z";
@@ -6,7 +7,7 @@ const ran = [{ id: "s", command: "kubectl get pods", mutating: false, touches: [
 const check = (over: Partial<CheckResult> = {}): CheckResult => ({ check: "fresh-install", status: "pass", startedAt: T, finishedAt: T, summary: "ok", metrics: {}, failures: [], evidence: [], steps: ran, ...over });
 const CH = "ClickHouse Cloud abc.us-west-2.aws.clickhouse.cloud (proof.transcripts; feed: harness-synthetic)";
 const report = (checks: CheckResult[], transcript = CH) =>
-  buildReport({ runId: "aws-proof-test", generatedAt: T, mode: "dry-run", backends: { metadata: "HoopDb Postgres (CNPG 96bulls/hoopdb)", transcript }, target: { stage: "aws-proof", clusterName: "96bulls-aws-proof", kubeContext: "ctx" }, checks });
+  buildReport({ provenance: PROV, runId: "aws-proof-test", generatedAt: T, mode: "dry-run", backends: { metadata: "HoopDb Postgres (CNPG 96bulls/hoopdb)", transcript }, target: { stage: "aws-proof", clusterName: "96bulls-aws-proof", kubeContext: "ctx" }, checks });
 
 describe("report schema", () => {
   test("a built report validates, states the V1 scope, and names each search gate's backend", () => {

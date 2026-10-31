@@ -8,6 +8,7 @@
  */
 import { createHash } from "node:crypto";
 import type { Mode } from "./guard.ts";
+import { provenanceGaps, type ReportProvenance } from "./provenance.ts";
 
 export const REPORT_SCHEMA = "96bulls.aws-e2e-proof/v1";
 
@@ -95,6 +96,10 @@ export interface ProofReport {
    * --prior-report, and the verdict is computed over the merged checks.
    */
   phases: Phase[];
+  /** Harness commit + dirty bit, input/config digests, the bound stage plan, chart package digests. */
+  provenance: ReportProvenance;
+  /** Why a run whose checks all passed is still incomplete (provenance gaps). */
+  verdictGaps: string[];
   verdict: "pass" | "fail" | "incomplete";
 }
 
@@ -198,9 +203,18 @@ export const executed = (c: CheckResult) => c.steps.length > 0 && c.steps.every(
 /** The exact bytes the CLI writes for a report; the prior-report digest is taken over these. */
 export const canonicalReportBytes = (r: ProofReport) => JSON.stringify(r, null, 2) + "\n";
 
+/** The overall verdict: check verdicts, then provenance. A clean, fully bound provenance is required for PASS. */
+export function finalVerdict(checks: readonly CheckResult[], transcriptBackend: string, provenance: ReportProvenance | undefined): { verdict: ProofReport["verdict"]; gaps: string[] } {
+  const v = verdictOf(checks, transcriptBackend);
+  if (v !== "pass") return { verdict: v, gaps: [] };
+  const gaps = provenanceGaps(provenance);
+  return { verdict: gaps.length ? "incomplete" : "pass", gaps };
+}
+
 export function buildReport(
-  input: Omit<ProofReport, "schema" | "scope" | "searchGates" | "verdict" | "generatedAt" | "phases"> & { generatedAt?: string; backends: { metadata: string; transcript: string } },
+  input: Omit<ProofReport, "schema" | "scope" | "searchGates" | "verdict" | "verdictGaps" | "generatedAt" | "phases"> & { generatedAt?: string; backends: { metadata: string; transcript: string } },
 ): ProofReport {
+  const fv = finalVerdict(input.checks, input.backends.transcript, input.provenance);
   return {
     schema: REPORT_SCHEMA,
     runId: input.runId,
@@ -214,7 +228,9 @@ export function buildReport(
     },
     checks: input.checks,
     phases: [{ runId: input.runId, generatedAt: input.generatedAt ?? new Date().toISOString(), mode: input.mode, checks: input.checks.map((c) => c.check) }],
-    verdict: verdictOf(input.checks, input.backends.transcript),
+    provenance: input.provenance,
+    verdictGaps: fv.gaps,
+    verdict: fv.verdict,
   };
 }
 
@@ -273,6 +289,8 @@ export function mergeReports(prior: AdmittedPrior, current: ProofReport): { repo
   for (const k of ["stage", "clusterName", "kubeContext", "accountId", "region"] as const)
     if (p.target[k] !== current.target[k]) return { error: `prior report targets a different ${k}` };
   if (p.runId === current.runId) return { error: "prior report is this run" };
+  if (p.provenance.harness.commit !== current.provenance.harness.commit) return { error: "prior report was produced by a different harness commit" };
+  if ((p.provenance.stagePlan?.provenanceSha256 ?? null) !== (current.provenance.stagePlan?.provenanceSha256 ?? null)) return { error: "prior report is bound to a different stage plan" };
   for (const c of current.checks) if (c.startedAt <= p.generatedAt) return { error: `current check ${c.check} started before the prior report was generated` };
   const ran = new Set(current.checks.map((c) => c.check));
   const checks = CHECK_IDS.flatMap((id) => current.checks.filter((c) => c.check === id).concat(ran.has(id) ? [] : p.checks.filter((c) => c.check === id)));
@@ -282,7 +300,8 @@ export function mergeReports(prior: AdmittedPrior, current: ProofReport): { repo
     transcript: ranAny(current.searchGates.transcript.checks) ? current.searchGates.transcript : p.searchGates.transcript,
   };
   const phases = [{ ...p.phases[0]!, reportSha256: prior.sha256 }, ...current.phases];
-  return { report: { ...current, checks, searchGates, phases, verdict: verdictOf(checks, searchGates.transcript.backend) } };
+  const fv = finalVerdict(checks, searchGates.transcript.backend, current.provenance);
+  return { report: { ...current, checks, searchGates, phases, verdictGaps: fv.gaps, verdict: fv.verdict } };
 }
 
 /* ------------------------------------------------------------------ validate */
@@ -333,8 +352,11 @@ export function validateReport(r: unknown, known: { canaries?: readonly string[]
     if (c.status === "unsupported" && c.check !== "v1-search-scope") issues.push(`${at} only v1-search-scope may be unsupported`);
     for (const e of c.evidence ?? []) if (!/^[0-9a-f]{64}$/.test(e.sha256) || !Number.isInteger(e.bytes)) issues.push(`${at} evidence '${e.label}' lacks sha256/bytes`);
   }
+  const prov = rep.provenance;
+  if (!prov || typeof prov.harness?.commit !== "string" || typeof prov.harness?.dirty !== "boolean" || !/^[0-9a-f]{64}$/.test(prov.configSha256 ?? "") || !/^[0-9a-f]{64}$/.test(prov.inputs?.sha256 ?? "") || !Array.isArray(prov.charts))
+    issues.push("provenance incomplete (harness commit/dirty, inputs and config sha256, charts)");
   if (rep.checks && gates?.transcript?.backend !== undefined) {
-    const want = verdictOf(rep.checks, gates.transcript.backend);
+    const want = finalVerdict(rep.checks, gates.transcript.backend, prov).verdict;
     if (rep.verdict !== want) issues.push(`verdict must be ${want}`);
   }
   const text = JSON.stringify(r);
