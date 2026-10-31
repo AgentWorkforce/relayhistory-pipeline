@@ -505,7 +505,7 @@ describe("machine claim", () => {
     ).toBe(403);
 
     w.identity.machineClaim = "another-machine";
-    expect(await (await status(w, q)).json()).not.toHaveProperty("manifest");
+    expect((await status(w, q)).status).toBe(403);
     expect(
       (
         await status(

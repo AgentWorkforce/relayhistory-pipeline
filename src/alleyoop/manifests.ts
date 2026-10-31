@@ -1154,8 +1154,15 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         );
         if (issue) return issue;
       }
-      const machine = c.req.query("machine");
-      if (machine !== stored.manifest.session.machine_id)
+      const machine = stored.manifest.session.machine_id;
+      // The machine comes from the stored manifest and the signed claim. The
+      // query only has to agree: it proves nothing, and a token bound to
+      // another machine learns nothing here.
+      const claim = machineClaim(auth);
+      if (
+        c.req.query("machine") !== machine ||
+        (claim !== undefined && claim !== machine)
+      )
         return c.body(null, 403);
       // A migration assertion never reads a client's parked manifest.
       if (
@@ -1172,8 +1179,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       }
       // The full manifest needs a verified machine claim, never the query's
       // word for it. Without one this stays the version-only, writer-scoped form.
-      const bound =
-        c.req.query("manifest") === "1" && machineClaim(auth) === machine;
+      const bound = c.req.query("manifest") === "1" && claim === machine;
       if (
         !bound &&
         c.req.query("writer") !== stored.manifest.writer.delivery_instance_id
