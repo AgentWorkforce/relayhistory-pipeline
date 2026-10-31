@@ -61,3 +61,35 @@ test("the rpc-sql search batch passes the RPC's token pins and stays in its tena
     .find((r) => r.json_build_object?.tag === "own")!.json_build_object!;
   expect(line.rows.map((r) => r.org_id)).toEqual(["org_a"]);
 }, 60_000);
+
+test("claims honour a stricter policy lifetime and take iat/exp from one capture", async () => {
+  const db = await database();
+  await db.query(
+    "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience, max_lifetime_seconds) VALUES ('https://issuer.test/sd', 'session-directory-search', 10)",
+  );
+  await db.query(
+    `INSERT INTO sessions.session_index
+       (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
+        title, storage_provider, bucket, manifest_key, trace_id, revision)
+     VALUES ('org_a', 'default', 'claude', 's-a', 'm', 'u', now(), now(), 'zqterm alpha', 's3', 'b', 'k/a',
+             '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1)`,
+  );
+  await projectSessionDirectory(db as never, { orgId: "org_a", workspaceId: "default", harness: "claude", sessionId: "s-a" });
+  const sql = asSql(searchBatchSql({ orgId: "org_a", workspaceId: "default" } as never, [{ tag: "own", q: "zqterm" }]));
+  // The claim statement alone, then read back what it set.
+  const claimStmt = sql.split("\n").slice(1).join("\n").split("SET LOCAL ROLE")[0]!;
+  for (let i = 0; i < 20; i += 1) {
+    await db.exec(`BEGIN; ${claimStmt}`);
+    const c = (await db.query<{ c: { iat: number; exp: number; iss: string; aud: string } }>(
+      "SELECT current_setting('request.jwt.claims')::json AS c",
+    )).rows[0]!.c;
+    await db.exec("ROLLBACK");
+    expect(c.exp - c.iat).toBe(10);
+    expect([c.iss, c.aud]).toEqual(["https://issuer.test/sd", "session-directory-search"]);
+  }
+  const results = await db.exec(sql);
+  const line = results
+    .flatMap((r) => r.rows as Array<{ json_build_object?: { tag: string; rows: Array<{ org_id: string }> } }>)
+    .find((r) => r.json_build_object?.tag === "own")!.json_build_object!;
+  expect(line.rows.map((r) => r.org_id)).toEqual(["org_a"]);
+}, 60_000);
