@@ -71,6 +71,12 @@ export const GCP_REDIS_CLIENT = {
   transitEncryption: "SERVER_AUTHENTICATION",
 } as const;
 
+/** DNS-1035-safe names shared by Helm rendering and Workload Identity IAM. */
+export const GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS = {
+  worker: "bulls96-worker",
+  alleyoop: "bulls96-alleyoop",
+} as const;
+
 /**
  * Shape the installed Alchemy provider can actually post.
  * Autopilot create omits node pools, so a node service account would not be
@@ -638,6 +644,7 @@ export function bulls96ReleaseValues(
   return {
     global: { tenant: { orgId: i.tenantOrgId } },
     worker: {
+      fullnameOverride: GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.worker,
       existingSecret: i.existingSecretName,
       imagePullSecrets,
       image,
@@ -651,6 +658,7 @@ export function bulls96ReleaseValues(
       extraEnv: dataEnv(),
     },
     alleyoop: {
+      fullnameOverride: GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.alleyoop,
       existingSecret: i.existingSecretName,
       imagePullSecrets,
       image,
