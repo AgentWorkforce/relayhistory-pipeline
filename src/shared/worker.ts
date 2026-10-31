@@ -73,6 +73,21 @@ export function traced(stage: QueuedStage, handler: StageHandler): StageHandler 
   };
 }
 
+/** Tracks the message in flight around a handler, passing every argument through. */
+export function instrumented(
+  handler: StageHandler,
+  on: { start(message: StageMessage): void; end(): void },
+): StageHandler {
+  return async (message, recorder, attempt, job) => {
+    on.start(message);
+    try {
+      return await handler(message, recorder, attempt, job);
+    } finally {
+      on.end();
+    }
+  };
+}
+
 /**
  * Worker health, for container and Kubernetes probes (workers have no other port).
  *   GET /healthz  200 while the poll loop is ticking and HoopDb answered within
@@ -182,17 +197,16 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   // Every handler, ours or vendored, runs in a span on the message's trace, and
   // the message in flight is tracked so fan-out continues that trace.
   for (const stage of Object.keys(deps.handlers) as QueuedStage[]) {
-    const h = traced(stage, deps.handlers[stage]!);
-    deps.handlers[stage] = async (message, recorder, attempt) => {
-      current = message;
-      health.lastTickAt = Date.now(); // progress inside a batch
-      try {
-        return await h(message, recorder, attempt);
-      } finally {
+    deps.handlers[stage] = instrumented(traced(stage, deps.handlers[stage]!), {
+      start: (message) => {
+        current = message;
+        health.lastTickAt = Date.now(); // progress inside a batch
+      },
+      end: () => {
         current = undefined;
         health.lastTickAt = Date.now();
-      }
-    };
+      },
+    });
   }
   const idleMs = integer("WORKER_IDLE_MS", 1_000);
   const batchSize = integer("WORKER_BATCH_SIZE", 10);
