@@ -33,6 +33,7 @@ import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLi
 import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "./inputs.ts";
 import { assertApprovalBinding, assertAwsDeploymentTarget, assertClearance, awsMode, type AwsMode } from "./deploy-guard.ts";
 import { snapshotStateLayer } from "./state-snapshot.ts";
+import { verifyDeployCapture } from "./capture-verify.ts";
 import { alchemyStateBucket, alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
 import { networkPolicies } from "./proof-addons.ts";
 import { hoopdbBackend } from "./hardening.ts";
@@ -76,6 +77,21 @@ function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
       throw new Error(`96bulls: deploy needs the reviewed capture docs/plans/${stage}.{provenance.json,plan.txt}. Nothing was changed.`);
     }
     assertApprovalBinding(inputs.approval?.capture, { provenanceText, planText, inputsText });
+    // And this deploy really is that capture: source commit and tree, live state, plan files,
+    // inputs. Here, not only in bin/96bulls, so a direct `alchemy deploy` is held to it too.
+    verifyDeployCapture(
+      {
+        root: ROOT,
+        run: (cmd, args) => {
+          const r = spawnSync(cmd, args, { cwd: ROOT, encoding: "utf8", env: process.env, maxBuffer: 256 * 1024 * 1024 });
+          if (r.status !== 0) throw new Error(`${cmd} ${args.slice(0, 2).join(" ")} failed: ${(r.stderr || "").trim().split("\n").pop()}`);
+          return r.stdout;
+        },
+        readFile: (path) => { try { return readFileSync(path, "utf8"); } catch { return undefined; } },
+      },
+      stage,
+      inputsText,
+    );
   }
   assertRegion(inputs.region);
   const lock = JSON.parse(readFileSync(join(ROOT, "versions.lock.json"), "utf8")) as { images: { "services-aws"?: { approved: ApprovedServicesImage[] } } };
