@@ -35,15 +35,15 @@ therefore an intended reader in reviewed draft source, not an observed productio
 - **Token-dependent rows** (H1, H3, H4, H5, and the indirect routes that reach them) are
   classified **unknown pending provenance**: `SESSION_READS_TOKEN`'s PostgreSQL role is
   not recorded in code or config.
-- **Unowned consumers**: relayhistory-cloud #226 and Relay Desktop have no recorded
-  owning lane.
+- **Unowned consumer**: Relay Desktop has no owning lane (helm-chart-chief: it stays
+  UNOWNED).
 
 ## Routes
 
 Columns: **Path** = direct table read, RPC, indirect (through #226) or write. **Token**
 = the credential class the read runs under.
 
-### relayhistory-cloud #226 (`packages/relayhistory/src/lib/read-plane/`), owner: UNOWNED
+### relayhistory-cloud #226 (`packages/relayhistory/src/lib/read-plane/`), owner: own_rhc_226_fix lane
 
 | Id  | Route                                                                        | Path                                                                 | Token                                                                                                                                         | Query, filters, projection                                                                                                                                                                                          | Fields needed                                                    | Order, pagination                                                                                                            | SLO                              | Flags                           |
 | --- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ------------------------------- |
@@ -88,17 +88,17 @@ touches Supabase. Owners: cloud.
 
 ### 96BullSessions
 
-| Id  | Consumer                                                                                  | Ref and state        | Path                    | Token               | Notes                                                                                                                                | Owner                    |
-| --- | ----------------------------------------------------------------------------------------- | -------------------- | ----------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
-| B1  | Bob Costas `summary-short` (`src/bob-costas/handler.ts`)                                  | #38 `07a5724`, draft | write                   | HoopDb owner        | `writeShortSummary` / `clearShortSummary` by full key                                                                                | 96BS (G6)                |
-| B2  | HoopDb indexer projector (`src/hoopdb/index.ts`, `session-directory-projector.ts`)        | #38                  | write                   | HoopDb owner        | INSERT/UPDATE of directory and memberships                                                                                           | 96BS (G6)                |
-| B3  | Search index audit (`src/hoopdb/search-index-audit.ts`)                                   | #38                  | catalog, rollout        | operator connection | read-only CLI                                                                                                                        | 96BS (G6)                |
-| B4  | `SESSION_DIRECTORY_QUERIES` (`src/hoopdb/search-index-contract.ts`)                       | #38                  | direct table, as tested | `authenticated`     | imported only by `session-directory-plan`, `-rls-prefix` and `-search-parity` tests                                                  | 96BS (G6)                |
-| B5  | Benchmark Lane C (`benchmarks/session-search/queries.ts` `listQueries`, `run.ts` `laneC`) | #59 `4102156`, open  | direct table            | `authenticated`     | Lane A uses the RPC and `SESSION_DIRECTORY_SEARCH_SQL` as owner                                                                      | #59 (miyaontherelay)     |
-| B6  | AWS proof probes (`src/proof/aws/probes.ts:66-100`)                                       | #74 `9b4fc6b`, draft | owner read + RPC        | operator; Worker    | **broken:** `:68` checks `to_regprocedure('sessions.search_session_directory(text,text)')`, a signature the 19-argument RPC replaced | UNOWNED (shared account) |
-| B7  | AWS hardening service account (`stacks/aws/hardening.ts:141`)                             | #75 `5c1ee5e`, draft | RPC (declaration)       | Worker              | —                                                                                                                                    | UNOWNED (shared account) |
-| B8  | Real-PostgREST isolation tests                                                            | #73 `2a75466`, draft | RPC                     | Worker              | self-hosted profile: the authenticator can assume only the Worker; direct table reads refused                                        | #73 (miyaontherelay)     |
-| B9  | Token pins                                                                                | #72 `f3141b6`, draft | RPC                     | Worker              | issuer, audience, lifetime                                                                                                           | sp-w6-supabase-schema    |
+| Id  | Consumer                                                                                  | Ref and state        | Path                    | Token               | Notes                                                                                                                                | Owner                 |
+| --- | ----------------------------------------------------------------------------------------- | -------------------- | ----------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------- |
+| B1  | Bob Costas `summary-short` (`src/bob-costas/handler.ts`)                                  | #38 `07a5724`, draft | write                   | HoopDb owner        | `writeShortSummary` / `clearShortSummary` by full key                                                                                | 96BS (G6)             |
+| B2  | HoopDb indexer projector (`src/hoopdb/index.ts`, `session-directory-projector.ts`)        | #38                  | write                   | HoopDb owner        | INSERT/UPDATE of directory and memberships                                                                                           | 96BS (G6)             |
+| B3  | Search index audit (`src/hoopdb/search-index-audit.ts`)                                   | #38                  | catalog, rollout        | operator connection | read-only CLI                                                                                                                        | 96BS (G6)             |
+| B4  | `SESSION_DIRECTORY_QUERIES` (`src/hoopdb/search-index-contract.ts`)                       | #38                  | direct table, as tested | `authenticated`     | imported only by `session-directory-plan`, `-rls-prefix` and `-search-parity` tests                                                  | 96BS (G6)             |
+| B5  | Benchmark Lane C (`benchmarks/session-search/queries.ts` `listQueries`, `run.ts` `laneC`) | #59 `4102156`, open  | direct table            | `authenticated`     | Lane A uses the RPC and `SESSION_DIRECTORY_SEARCH_SQL` as owner                                                                      | #59 (miyaontherelay)  |
+| B6  | AWS proof probes (`src/proof/aws/probes.ts:66-100`)                                       | #74 `9b4fc6b`, draft | owner read + RPC        | operator; Worker    | **broken:** `:68` checks `to_regprocedure('sessions.search_session_directory(text,text)')`, a signature the 19-argument RPC replaced | self-hosted-lead      |
+| B7  | AWS hardening service account (`stacks/aws/hardening.ts:141`)                             | #75 `5c1ee5e`, draft | RPC (declaration)       | Worker              | —                                                                                                                                    | self-hosted-lead      |
+| B8  | Real-PostgREST isolation tests                                                            | #73 `2a75466`, draft | RPC                     | Worker              | self-hosted profile: the authenticator can assume only the Worker; direct table reads refused                                        | #73 (miyaontherelay)  |
+| B9  | Token pins                                                                                | #72 `f3141b6`, draft | RPC                     | Worker              | issuer, audience, lifetime                                                                                                           | sp-w6-supabase-schema |
 
 ## Semantic gaps between today's direct reads and the RPC
 
@@ -149,14 +149,24 @@ The output is one word, and no credential material leaves the process.
 2. `sessionSummary` (`routes.ts:511-550`) sets `summary: row.task_title ?? row.title` and
    `summarySource: row.task_title ? "task_title" : null`. It never reads `short_summary`.
 3. So no #226 response carries the scrubbed short summary.
-4. The public schema pins `summarySource` to `z.enum(["task_title", "first_user_turn"])`
-   (relayhistory-cloud `packages/cloud-client/src/contract/recall.ts:75,127`). Surfacing
-   it needs one of:
-   - an enum value `"short_summary"`, with `summary: row.short_summary ?? row.task_title ?? row.title`;
-   - or a separate nullable `shortSummary` field.
+4. **Ruling (helm-chart-chief): an additive, nullable `shortSummary`, end to end.**
+   - `summarySource` and its provenance are unchanged. It stays
+     `z.enum(["task_title", "first_user_turn"])` (relayhistory-cloud
+     `packages/cloud-client/src/contract/recall.ts:75,127`), and `summary` keeps its
+     current derivation.
+   - #226's API row: `DirectoryRow` gains `short_summary: string | null`. The direct
+     projection, while it exists, selects it where the grant allows; the RPC already
+     returns it.
+   - #226's adapter response: `sessionSummary` adds `shortSummary: row.short_summary ?? null`.
+   - cloud-client contract: the session schema adds `shortSummary: z.string().nullable()`
+     as an additive field.
+   - Consumers may prefer `shortSummary` for display and fall back to `task_title` /
+     `first_user_turn` (the existing `summary`).
+   - Tests: a response with `shortSummary` present, with `shortSummary: null`, and a
+     legacy response without the field, each accepted by the contract and rendered
+     with the right fallback. An RPC-row-to-response parity test covers the field.
 
-   Either way, the cloud-client contract, #226's `DirectoryRow` and `sessionSummary`, and
-   an RPC-row-to-response parity test are needed. Owner: UNOWNED (#226 and cloud-client).
+   Owner: own_rhc_226_fix lane (#226 and the cloud-client contract).
 
 ## Compatibility plan (proposed; nothing applied or activated)
 
@@ -197,9 +207,13 @@ fixed SQL with binds, EXECUTE only to `session_directory_search_worker`)
 2. Then flip #226's flag back to the direct paths.
 3. The RPCs stay in place throughout, so either step can be repeated.
 
-## Owners to nominate
+## Owners
 
-- **UNOWNED:** relayhistory-cloud #226 (H1 to H5) and the cloud-client `summarySource` contract.
-- **UNOWNED:** Relay Desktop (D1, D2). Nothing changes there today, but iPad search lands on a refused route.
-- **UNOWNED:** AWS proof harness and hardening (#74, #75; B6, B7).
-- **UNOWNED:** the new pointer and readiness functions. 96BullSessions can author them if assigned.
+- **own_rhc_226_fix lane:** relayhistory-cloud #226 (H1 to H5) and the cloud-client
+  `shortSummary` contract change.
+- **self-hosted-lead:** AWS proof harness and hardening (#74, #75; B6, B7), including the
+  B6 presence-probe fix.
+- **96BullSessions database-contract lane:** the new `session_directory_pointers` and
+  `session_directory_readiness` functions.
+- **UNOWNED:** Relay Desktop (D1, D2). Nothing changes there today, but iPad search lands on
+  a refused route.
