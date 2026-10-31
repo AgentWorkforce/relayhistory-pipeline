@@ -28,6 +28,7 @@ import {
 } from "../../shared/vendor.ts";
 import { sqlPipelineEventSink } from "../../hoopdb/sink.ts";
 import { buildIngestApp } from "../ingest.ts";
+import { mintToken } from "../auth.ts";
 import { runCourierOnce, type CourierConfig } from "../courier.ts";
 import { DatabaseSync } from "node:sqlite";
 import { writeFile } from "node:fs/promises";
@@ -209,6 +210,27 @@ async function code(response: Response) {
 const MIGRATION_ON = { RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS: "true", RELAYHISTORY_MIGRATION_GRANTS: `${GRANT}=${PLAN}` };
 
 describe("buildIngestApp auth (production composition)", () => {
+  test("a locally minted token delivers with the window shut: local dev needs no compat", async () => {
+    // As alchemy.run.ts composes a local stage: no origin, the interim bearer on.
+    const i = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true", RELAYHISTORY_ORIGIN: "" });
+    const keys = { kid: KID, privateKeyPem: String(privateKey.export({ type: "pkcs8", format: "pem" })) };
+    const local = { ...LOCATION, sessionId: "session-local" };
+    const mint = (machineId?: string) =>
+      mintToken(keys, { issuer: ISSUER, audience: "relayhistory", orgId: ORG, workspaceId: WORKSPACE, userId: USER, ...(machineId ? { machineId } : {}) });
+    const body = await planned(local, local.machineId);
+    const post = (token: string) =>
+      i.req("/v1/pipeline/manifests", token, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-machine-id": local.machineId, "x-session-id": local.sessionId },
+        body: JSON.stringify({ key: manifestKey(local), manifest: { ...body.manifest, extensions: undefined } }),
+      });
+    expect((await i.chunk(mint(local.machineId), local)).status).toBe(201);
+    expect((await post(mint())).status).toBe(403);
+    expect((await post(mint("another-machine"))).status).toBe(403);
+    expect((await post(mint(local.machineId))).status).toBe(202);
+    expect(await count("sessions.claimless_uses")).toBe(0);
+  });
+
   test("the claim switch reaches the route from the real environment, and defaults shut", async () => {
     const shut = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
     const { manifest } = await planned();
