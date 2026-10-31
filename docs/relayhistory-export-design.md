@@ -142,6 +142,18 @@ tested only against an in-process fake ingest, and the CLI still refuses
   exporter never sends a backfill, and #51's `activation_required` gate is
   not reachable from it.
 
+## One set of Cloud ids
+
+`src/migration/relayhistory-export-ids.ts` holds the shared id rules: only
+canonical UUIDs are Cloud ids, and a legacy alias counts only through a
+reviewed, collision-free mapping ledger. Both sides apply the same rewrite:
+- the grant lifecycle, with `canonicalizeUploads`;
+- the courier, with `canonicalizeExportPlan`, which `runExportUpload` applies
+  with `idMapping` (shard selection does the same).
+
+So the grant's plan, every create request and every manifest the courier
+writes carry the same Cloud ids and the same plan digest.
+
 ## Grant shards
 
 One grant holds what relayauth #111 admits: at most 64 distinct source users,

@@ -96,6 +96,14 @@ import {
   deriveMigrationGrantPlan,
 } from "./vendor/relayauth-migration-plan.ts";
 import type { UploadInput } from "./relayhistory-export-upload.ts";
+import {
+  canonicalizeUploads,
+  EMPTY_ID_MAPPING,
+  resolveCloudId,
+  validateIdMapping,
+  type IdKind,
+  type IdMappingLedger,
+} from "./relayhistory-export-ids.ts";
 import { planShards, shardReport, PLAN_CONTRACT, SHARD_PLANNER_VERSION, type Shard, type ShardReport } from "./relayhistory-export-shards.ts";
 
 export const LIFECYCLE_VERSION = 1;
@@ -115,62 +123,17 @@ const refuse = (code: string, message: string): never => {
 
 // ---------------------------------------------------------------- ids
 
-/** Cloud ids are canonical lowercase UUIDs; nothing else is a Cloud id. */
-const CLOUD_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-export const isCloudId = (id: string) => CLOUD_UUID.test(id);
-
-export type IdKind = "org" | "workspace" | "user";
-
-/**
- * The only way a legacy (non-UUID) id may stand for a Cloud id: an explicit,
- * reviewed, collision-free mapping. Empty by default. No heuristic mapping:
- * `relay_` stripping, case folding or name matching never apply.
- */
-export interface IdMappingLedger {
-  version: 1;
-  reviewed_by: string;
-  reviewed_at: string;
-  entries: { kind: IdKind; legacy_id: string; cloud_id: string }[];
-}
-
-export const EMPTY_ID_MAPPING: IdMappingLedger = { version: 1, reviewed_by: "", reviewed_at: "", entries: [] };
-
-/** Refuses a mapping that is unreviewed, malformed or not collision-free. */
-export function validateIdMapping(ledger: IdMappingLedger): IdMappingLedger {
-  const bad = (why: string): never => refuse("id_mapping_invalid", `id mapping ledger: ${why}`);
-  if (ledger.version !== 1) bad("unsupported version");
-  if (!ledger.entries.length) return ledger;
-  if (!ledger.reviewed_by.trim() || !Number.isFinite(Date.parse(ledger.reviewed_at))) bad("entries need reviewed_by and reviewed_at");
-  for (const kind of ["org", "workspace", "user"] as const) {
-    const entries = ledger.entries.filter((e) => e.kind === kind);
-    const legacy = new Set<string>();
-    const cloud = new Set<string>();
-    for (const e of entries) {
-      if (!isCloudId(e.cloud_id)) bad(`${kind} ${e.legacy_id} maps to a non-UUID`);
-      if (!e.legacy_id || isCloudId(e.legacy_id)) bad(`${kind} legacy id must be a non-UUID alias`);
-      if (legacy.has(e.legacy_id)) bad(`${kind} legacy id ${e.legacy_id} is mapped twice`);
-      if (cloud.has(e.cloud_id)) bad(`${kind} Cloud id is the target of two legacy ids`);
-      legacy.add(e.legacy_id);
-      cloud.add(e.cloud_id);
-    }
-  }
-  for (const e of ledger.entries) if (!["org", "workspace", "user"].includes(e.kind)) bad("unknown kind");
-  return ledger;
-}
-
-export type IdResolution =
-  | { ok: true; cloud_id: string; via: "uuid" | "mapping" }
-  | { ok: false; reason: "default_workspace" | "alias_id" | "invalid_id" };
-
-/** A legacy id to its Cloud id: an exact UUID, or an explicit mapping entry. */
-export function resolveCloudId(kind: IdKind, id: string, mapping: IdMappingLedger): IdResolution {
-  const mapped = mapping.entries.find((e) => e.kind === kind && e.legacy_id === id);
-  if (mapped) return { ok: true, cloud_id: mapped.cloud_id, via: "mapping" };
-  if (isCloudId(id)) return { ok: true, cloud_id: id, via: "uuid" };
-  if (kind === "workspace" && id === "default") return { ok: false, reason: "default_workspace" };
-  if (id.startsWith("relay_")) return { ok: false, reason: "alias_id" };
-  return { ok: false, reason: "invalid_id" };
-}
+// The id rules are shared with the courier (one set of Cloud ids end to end).
+export {
+  canonicalizeUploads,
+  EMPTY_ID_MAPPING,
+  isCloudId,
+  resolveCloudId,
+  validateIdMapping,
+  type IdKind,
+  type IdMappingLedger,
+  type IdResolution,
+} from "./relayhistory-export-ids.ts";
 
 // ---------------------------------------------------------------- membership
 
@@ -350,33 +313,6 @@ export interface PlanInput {
   identities: IdentityPreflight;
   /** Reviewed legacy-to-Cloud id mapping; empty by default. */
   idMapping?: IdMappingLedger;
-}
-
-/**
- * The uploads with every id the mapping (or an exact UUID) resolves rewritten
- * to its Cloud id: `org_id`, `workspace_id`, `source_user_id`, and the key's
- * `ws=` segment. Shards, the plan sent to RelayAuth and the export courier's
- * plan all use these, so a reviewed alias binds the signed plan and the
- * request, not only the membership check. An id that does not resolve stays
- * as it is; it is an exception and blocks its shard.
- */
-export function canonicalizeUploads(uploads: readonly UploadInput[], mapping: IdMappingLedger = EMPTY_ID_MAPPING): UploadInput[] {
-  const m = validateIdMapping(mapping);
-  const to = (kind: IdKind, id: string) => {
-    const r = resolveCloudId(kind, id, m);
-    return r.ok ? r.cloud_id : id;
-  };
-  return uploads.map((u) => {
-    const ws = to("workspace", u.workspace_id);
-    const prefix = `v1/ws=${u.workspace_id}/`;
-    return {
-      ...u,
-      org_id: to("org", u.org_id),
-      workspace_id: ws,
-      source_user_id: to("user", u.source_user_id),
-      key: u.key.startsWith(prefix) ? `v1/ws=${ws}/${u.key.slice(prefix.length)}` : u.key,
-    };
-  });
 }
 
 async function build(input: PlanInput): Promise<Built> {

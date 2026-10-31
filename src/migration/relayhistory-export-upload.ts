@@ -72,6 +72,7 @@ import {
   type DeliveryRecord,
 } from "./relayhistory-export.ts";
 import type { MigrationAssertion } from "./relayhistory-export-auth.ts";
+import { canonicalizeExportPlan, EMPTY_ID_MAPPING, type IdMappingLedger } from "./relayhistory-export-ids.ts";
 
 export const EXPORT_PLUGIN_VERSION = "96bulls-relayhistory-export/0.1.0";
 /**
@@ -592,6 +593,13 @@ export interface ExportUploadConfig {
   /** Fresh single-use assertions (MigrationAssertionClient). */
   assertions: AssertionSource;
   checkpointPath: string;
+  /**
+   * The reviewed legacy-to-Cloud id mapping the grant lifecycle used (empty by
+   * default). The courier runs on `canonicalizeExportPlan(plan, idMapping)`,
+   * so its plan digest, expected identities and manifests carry the same
+   * Cloud ids as the grant's plan and create requests.
+   */
+  idMapping?: IdMappingLedger;
   /** The plan contract (default derivePlanContract); swap in #43's shared fixture. */
   contract?: PlanContractFn;
   fetcher?: typeof fetch;
@@ -700,7 +708,7 @@ const keyHash = (key: string) => sha256Hex(key).slice(0, 16);
  * guard, a plan that does not hash to the grant's digest, or a checkpoint of
  * another plan.
  */
-export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig): Promise<ExportUploadResult> {
+export async function runExportUpload(input: ExportPlan, cfg: ExportUploadConfig): Promise<ExportUploadResult> {
   if (cfg.execute !== true)
     throw Object.assign(new Error("export upload: refused without --execute (dry run writes nothing)"), { code: "execute_required" });
   const base = new URL(cfg.ingestUrl);
@@ -719,6 +727,7 @@ export async function runExportUpload(plan: ExportPlan, cfg: ExportUploadConfig)
   if (!Number.isInteger(chunksPerAssertion) || chunksPerAssertion < 1 || chunksPerAssertion > MAX_CHUNKS_PER_ASSERTION)
     throw new Error(`export upload: chunksPerAssertion must be 1 to ${MAX_CHUNKS_PER_ASSERTION}`);
 
+  const plan = canonicalizeExportPlan(input, cfg.idMapping ?? EMPTY_ID_MAPPING);
   const contractFn = cfg.contract ?? derivePlanContract;
   const contract = planContract(plan, cfg.grantId, contractFn);
   const { entries, uploads } = contract;

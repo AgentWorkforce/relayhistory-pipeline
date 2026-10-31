@@ -16,6 +16,7 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { MigrationAssertionClient } from "../relayhistory-export-auth.ts";
 import type { DeliveryRecord } from "../relayhistory-export.ts";
+import { canonicalizeExportPlan, type IdMappingLedger } from "../relayhistory-export-ids.ts";
 import { computeContentSha256, manifestKey } from "@rhc-object-store";
 import {
   buildExportManifest,
@@ -1184,4 +1185,46 @@ test("the committed watermark comes from the chunk bytes, never from a (possibly
     const stored = JSON.parse(fake.stored.get(u.key)!);
     expect(stored.extensions["client.relayhistory_export"].origin_revisions).toEqual(sourceMarksFromChunks(plan.manifests[i]!.chunks.map((c) => c.data)).origin_revisions);
   }
+});
+
+test("with the reviewed id mapping, the courier's manifests carry only Cloud ids", async () => {
+  const uuid = (label: string) => {
+    const h = sha(label);
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
+  };
+  const [ORG, WS, USER] = [uuid("org"), uuid("ws"), uuid("user")];
+  const mapping: IdMappingLedger = {
+    version: 1, reviewed_by: "reviewer", reviewed_at: "2026-10-30T12:00:00.000Z",
+    entries: [
+      { kind: "org", legacy_id: "org_legacy", cloud_id: ORG },
+      { kind: "workspace", legacy_id: "ws_legacy", cloud_id: WS },
+      { kind: "user", legacy_id: "user_legacy", cloud_id: USER },
+    ],
+  };
+  const plan: ExportPlan = {
+    exportedAt: "2026-10-30T12:00:00.000Z",
+    manifests: [plannedManifestFromRecords({ orgId: "org_legacy", workspaceId: "ws_legacy", source: "claude", sessionId: "aliased", machine: "m1", sourceUserId: "user_legacy", records: [0, 1, 2].map((i) => record(i, "aliased")), maxChunkBytes: 600 })!],
+  };
+  // The issuer signs the canonical plan (what the lifecycle granted).
+  const contract = planContract(canonicalizeExportPlan(plan, mapping), GRANT);
+  const fake = await fakeIngest(contract.planDigest);
+  fake.storedPlan = contract;
+  const dir = await mkdtemp(join(tmpdir(), "export-upload-"));
+  dirs.push(dir);
+  const result = await runExportUpload(plan, {
+    execute: true, ingestUrl: fake.url, grantId: GRANT, expectedPlanDigest: contract.planDigest, idMapping: mapping,
+    assertions: new MigrationAssertionClient({ baseUrl: fake.url, grantId: GRANT, apiKey: async () => "fake-test-value" }),
+    checkpointPath: join(dir, "cp.json"), backoffMs: [1], sleep: async () => {},
+  });
+  expect(result.failed).toEqual([]);
+  expect(result.committed.map((c) => c.key)).toEqual([contract.uploads[0]!.key]);
+  const stored = fake.stored.get(contract.uploads[0]!.key)!;
+  for (const alias of ["org_legacy", "ws_legacy", "user_legacy"]) expect(stored).not.toContain(alias);
+  const m = JSON.parse(stored);
+  expect(m.session.workspace_id).toBe(WS);
+  expect(m.extensions["96bulls"]).toMatchObject({ tenant_id: ORG, user_id: USER });
+  expect(m.extensions["client.relayhistory_export"].source_user_id).toBe(USER);
+  // Without the mapping the courier's plan is not the granted one: refused before any request.
+  await expect(runExportUpload(plan, { execute: true, ingestUrl: fake.url, grantId: GRANT, expectedPlanDigest: contract.planDigest,
+    assertions: new MigrationAssertionClient({ baseUrl: fake.url, grantId: GRANT, apiKey: async () => "x" }), checkpointPath: join(dir, "cp2.json") })).rejects.toMatchObject({ code: "plan_digest_mismatch" });
 });
