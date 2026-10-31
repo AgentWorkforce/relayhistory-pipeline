@@ -41,6 +41,14 @@ export interface ObjectLandedPayload {
    * the adapter gives each delete its own `version` (`deleted:<id>`).
    */
   deleted?: boolean;
+  /**
+   * Set only by the ingest for a RelayAuth migration commit (relayauth #111;
+   * `migration-assertions.ts`): the signed manifest key (without any
+   * deployment prefix) and the signed plan entry digest. Its work key is then
+   * `${key}@${entry_sha256}` instead of `manifestWorkKey`. Only the ingest
+   * writes queue messages, so this cannot come from a client.
+   */
+  migration?: { key: string; entry_sha256: string };
 }
 
 export type ObjectStoreProvider = "r2" | "s3" | "gcs" | "azure" | "fs";
@@ -93,6 +101,39 @@ export function manifestWorkKey(payload: ObjectLandedPayload) {
   return `${payload.key}@${version}`;
 }
 
+const UNPREFIXED_MANIFEST_KEY =
+  /(?:^|\/)(v1\/ws=[^/]+\/m=[^/]+\/h=[^/]+\/d=\d{4}\/\d{2}\/\d{2}\/s=[^/]+\/manifest\.json)$/;
+
+/**
+ * The work key an `object-landed` message must carry. Live work (no
+ * `migration` field): `manifestWorkKey`, the object key and its version.
+ * Migration work: the signed `${migration.key}@${migration.entry_sha256}`,
+ * only when `migration.key` is exactly this object's key without its
+ * deployment prefix and the digest is 64 lowercase hex; anything else is
+ * `undefined` (refused). A message cannot be both: the field decides, and a
+ * migration message with a malformed field never falls back to the live rule.
+ */
+export function objectLandedWorkKey(
+  payload: ObjectLandedPayload,
+): string | undefined {
+  const migration = payload.migration;
+  if (migration === undefined) return manifestWorkKey(payload);
+  const unprefixed = UNPREFIXED_MANIFEST_KEY.exec(payload.key)?.[1];
+  if (
+    !migration ||
+    typeof migration !== "object" ||
+    payload.kind !== "manifest" ||
+    payload.deleted === true ||
+    typeof migration.key !== "string" ||
+    typeof migration.entry_sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(migration.entry_sha256) ||
+    unprefixed === undefined ||
+    migration.key !== unprefixed
+  )
+    return undefined;
+  return `${migration.key}@${migration.entry_sha256}`;
+}
+
 export function objectLandedHandler(deps: {
   senders: StageSenders;
   /** Where a transform that cannot be enqueued waits for replay. */
@@ -131,13 +172,14 @@ export function objectLandedHandler(deps: {
         : {}),
       ...(deleted ? { deleted: true } : {}),
     };
-    const workKey = manifestWorkKey(payload);
+    const workKey = objectLandedWorkKey(payload);
     // The trace verdict matches index success to manifest work by this key, so
-    // the storage event must carry it (see `manifestWorkKey`).
-    if (message.workKey !== workKey)
+    // the storage event must carry it (see `objectLandedWorkKey`: live work
+    // by object version, migration work by its signed key and entry digest).
+    if (workKey === undefined || message.workKey !== workKey)
       throw new PipelineError(
         "invalid_work_key",
-        "storage event workKey must be manifestWorkKey(payload)",
+        "storage event workKey must be objectLandedWorkKey(payload)",
         false,
       );
     const revision = Number.isSafeInteger(payload.revision)

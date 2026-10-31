@@ -111,6 +111,40 @@ manifest body.
   migration service principal with an audited, org-scoped "act as this user
   for ingest" grant, time-boxed to the export. This is an auth decision for
   the RelayAuth and ingest owners, and Khaliq.
+  Ingest side (E3, #43 with relayhistory-cloud #228; nothing applied or
+  enabled). The contract is
+  [docs/contracts/relayhistory-export-plan-entry-v1.md](contracts/relayhistory-export-plan-entry-v1.md):
+  - **Switches:** `RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS=true` (default
+    off) admits only migration-class tokens and never a generic RelayAuth
+    bearer. `RELAYHISTORY_MIGRATION_GRANTS` lists the accepted
+    `grantId=planDigest` pairs. The broad `ALLOW_INTERIM_RELAYAUTH_BEARER` is
+    off unless explicitly set to `true` (the local Docker stack sets it).
+  - **Routes:** only `POST /v1/pipeline/chunks`, `POST /v1/pipeline/manifests`
+    and `GET /v1/pipeline/manifests/status` (anything else is 403
+    `migration_assertion_route`).
+  - **Membership:** the ingest does not look up live workspace membership.
+    The grant operator checks it when creating the grant, and relayauth
+    #111 (@2adf414a) mints only for the grant's stored pairs.
+  - **Identity:** the assertion carries an issuer-derived `meta.upload` (relayauth #111 @2adf414a). The
+    ingest recomputes it from the actual request (key, machine, session,
+    content, entry digest) and compares (else 403
+    `migration_upload_forbidden`). The signed pair must also be the grant
+    pair (else 403 `migration_workspace_forbidden`).
+  - **Expiry:** 60 s plus 5 s skew. An expired token gets 401
+    `migration_assertion_expired`; mint again.
+  - **Single use:** 409 `migration_assertion_replayed` (mint again); 503
+    `migration_ledger_unavailable` fails closed. The ledger row and the
+    enriched `pipeline_jobs` row commit in one transaction.
+  - **Chunks:** each request carries its canonical plan entry in front of
+    the bytes. The chunk must be one of the signed entry's chunks, checked
+    against the actual bytes before anything is stored. Also one chunk per
+    `(jti, seq)` (409 `migration_chunk_conflict`) and at most 256 per
+    assertion (403 `migration_chunk_limit`).
+  - **Audit:** one durable, append-only `sessions.migration_ingest_audit` row
+    per commit, in the same transaction as the job.
+  - **Retention:** no cron. Each ledger insert deletes at most 100 rows
+    expired for more than 5 minutes. An expired token is refused before the
+    ledger is read.
 - **O3 (resolved in E4):** the transform recognizes
   `client.relayhistory_export`, reads the canonical record envelopes from all
   live and backfill epochs, keeps the highest numeric revision of each
