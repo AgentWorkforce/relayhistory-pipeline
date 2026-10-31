@@ -176,6 +176,61 @@ describe("Neon reader on the pinned legacy schema", () => {
     expect(streamed[0].payload.org_id).toBeUndefined();
   });
 
+  describe("the write the live projection keeps", () => {
+    const LATER = "2026-10-01T00:00:09Z";
+    const EARLIER = "2026-10-01T00:00:01Z";
+    const key = { org_id: "o", workspace_id: "w", source: "claude", session_id: "s-ledger" } as never;
+    beforeAll(async () => {
+      const put = (origin: string, record: string, kind: string, operation: string, payload: string, at: string) =>
+        `('o', 'w', '${origin}', '${record}', 'v1', 1, 'd', '${kind}', 'claude', 's-ledger', '${operation}', ${payload}, 'u', '${at}')`;
+      const seat = (origin: string, record: string, seq: number) => `('o', 'w', '${origin}', '${record}', ${seq})`;
+      await db.exec(`SET session_replication_role = replica;
+        INSERT INTO sessions.delivery_records
+          (org_id, workspace_id, origin_id, record_id, revision_id, revision, digest, kind, source, session_id, operation, payload, user_id, received_at)
+        VALUES
+          ${put("a", "kept", "session_event", "upsert", `'{"ts_ms": 1, "text": "first"}'`, LATER)},
+          ${put("b", "kept", "session_event", "upsert", `'{"ts_ms": 1, "text": "last"}'`, EARLIER)},
+          ${put("a", "gone", "session_event", "upsert", `'{"ts_ms": 1, "text": "x"}'`, LATER)},
+          ${put("b", "gone", "session_event", "delete", "NULL", EARLIER)},
+          ${put("a", "unseated", "session_event", "upsert", `'{"ts_ms": 1, "text": "projected"}'`, EARLIER)},
+          ${put("b", "unseated", "session_event", "upsert", `'{"ts_ms": 1, "text": "later"}'`, LATER)},
+          ${put("a", "cat", "session", "upsert", `'{"title": "first"}'`, LATER)},
+          ${put("b", "cat", "session", "upsert", `'{"title": "last"}'`, EARLIER)};
+        INSERT INTO sessions.delivery_projection_acceptance (org_id, workspace_id, origin_id, record_id, accepted_seq) VALUES
+          ${seat("a", "kept", 1)}, ${seat("b", "kept", 2)}, ${seat("a", "gone", 3)}, ${seat("b", "gone", 4)},
+          ${seat("a", "cat", 9)}, ${seat("b", "cat", 1)};
+        INSERT INTO sessions.delivery_catalog_acceptance (org_id, workspace_id, origin_id, record_id, accepted_seq) VALUES
+          ${seat("a", "cat", 1)}, ${seat("b", "cat", 2)};
+        INSERT INTO sessions.convergence_events
+          (org_id, workspace_id, machine_id, user_id, source, session_id, event_id, kind, type, ts, record, delivery_record_id)
+        VALUES ('o', 'w', 'delivery:' || md5(jsonb_build_array('w', 'a')::text), 'u', 'claude', 's-ledger', 'e-u', 'session_event', 'user', now(), '{}', 'unseated');
+        SET session_replication_role = origin;`);
+    });
+    const records = () => sessionRecords(db, key);
+    const held = async (id: string) => (await records()).filter((record) => record.record_id === id);
+
+    it("keeps the origin accepted last, whatever received_at says", async () => {
+      expect((await held("kept")).map((r) => [r.origin_id, r.accepted_seq])).toEqual([["b", "2"]]);
+    });
+
+    it("lets a tombstone accepted last remove the other origin's copy", async () => {
+      const kept = await records();
+      expect((await held("gone")).map((r) => [r.origin_id, r.operation])).toEqual([["b", "delete"]]);
+      const stream = buildSessionStream(kept);
+      expect(lines(stream.bytes).map((line) => line.record_id)).not.toContain("gone");
+    });
+
+    it("settles a catalog record by the catalog ledger, and carries its seat", async () => {
+      expect((await held("cat")).map((r) => [r.origin_id, r.accepted_seq])).toEqual([["b", "2"]]);
+      const stream = buildSessionStream(await held("cat"));
+      expect(lines(stream.bytes)[0]).toMatchObject({ accepted_seq: "2" });
+    });
+
+    it("falls back to the projected row for a record with no seat", async () => {
+      expect((await held("unseated")).map((r) => r.origin_id)).toEqual(["a"]);
+    });
+  });
+
   it("reads a session's records and splits them by the machine their events name", async () => {
     const [key] = await sessionsNewestFirst(db, null, 1);
     const records = await sessionRecords(db, key!);

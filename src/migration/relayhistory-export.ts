@@ -39,6 +39,12 @@ export interface DeliveryRecord {
   operation: "upsert" | "delete";
   received_at: string;
   payload: Record<string, unknown> | null;
+  /**
+   * The record's seat in the source's acceptance ledger, which is the order the
+   * live projection settles contenders in. The transform needs it for a catalog
+   * key that two records contend for, and refuses contenders without it.
+   */
+  accepted_seq?: string | null;
 }
 
 /** Event time of a record, in ms: the payload's own clock, else when it was received. */
@@ -90,6 +96,7 @@ export function buildSessionStream(records: readonly DeliveryRecord[]): SessionS
         revision: record.revision,
         received_at: record.received_at,
         payload: record.payload,
+        ...(record.accepted_seq ? { accepted_seq: record.accepted_seq } : {}),
       })}\n`,
     );
     lineStarts.push(length);
@@ -166,13 +173,43 @@ export async function sessionsNewestFirst(
   return rows;
 }
 
-/** A session's delivery records (one row per record: its latest revision). */
+/**
+ * A session's delivery records: one row per logical record, the write the live
+ * projection keeps. record_id is origin-independent, and the last write accepted
+ * from any origin wins, so a tombstone accepted last removes it everywhere. Only
+ * the acceptance ledgers know that order (`received_at` is transaction start), so
+ * it is settled here, before records split into per-machine streams that no later
+ * reader could compare. A record with no ledger seat falls back to the order 0038
+ * seeds one in: its projected row, then receipt, then origin.
+ */
 export async function sessionRecords(db: Queryable, key: SessionKey): Promise<DeliveryRecord[]> {
   const { rows } = await db.query<DeliveryRecord>(
-    `SELECT kind, origin_id, record_id, revision::text, operation, received_at::text, payload
-       FROM sessions.delivery_records
-      WHERE org_id = $1 AND workspace_id = $2 AND kind = ANY ($3::text[])
-        AND source = $4 AND session_id = $5`,
+    `SELECT kind, origin_id, record_id, revision, operation, received_at, payload, accepted_seq FROM (
+       SELECT d.kind, d.origin_id, d.record_id, d.revision::text AS revision, d.operation,
+              d.received_at::text AS received_at, d.payload,
+              s.seq::text AS accepted_seq,
+              row_number() OVER (
+                PARTITION BY d.record_id
+                ORDER BY s.seq DESC NULLS LAST,
+                  EXISTS (SELECT 1 FROM sessions.convergence_events e
+                           WHERE e.org_id = d.org_id AND e.workspace_id = d.workspace_id
+                             AND e.delivery_record_id = d.record_id
+                             AND e.machine_id = 'delivery:' || md5(jsonb_build_array(d.workspace_id, d.origin_id)::text)) DESC,
+                  d.received_at DESC, d.origin_id DESC
+              ) AS place
+         FROM sessions.delivery_records d
+         LEFT JOIN sessions.delivery_projection_acceptance p
+           ON p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+          AND p.origin_id = d.origin_id AND p.record_id = d.record_id
+         LEFT JOIN sessions.delivery_catalog_acceptance c
+           ON c.org_id = d.org_id AND c.workspace_id = d.workspace_id
+          AND c.origin_id = d.origin_id AND c.record_id = d.record_id
+        CROSS JOIN LATERAL (
+          SELECT CASE WHEN d.kind IN ('session', 'relationship', 'session_marker', 'commit_link')
+                      THEN c.accepted_seq ELSE p.accepted_seq END AS seq) AS s
+        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.kind = ANY ($3::text[])
+          AND d.source = $4 AND d.session_id = $5
+     ) AS ranked WHERE place = 1`,
     [key.org_id, key.workspace_id, [...RECORD_KINDS], key.source, key.session_id],
   );
   return rows;
