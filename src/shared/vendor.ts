@@ -23,6 +23,7 @@ export {
   type StageMessage,
   type StageQueueDeps,
   type DeadLetterStore,
+  isStageMessage,
 } from "@rhc/lib/pipeline/dlq.ts";
 export {
   type PipelineEvent,

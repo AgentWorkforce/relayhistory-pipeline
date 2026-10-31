@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import {
   appendBackfillEpoch,
+  isStageMessage,
   MANIFEST_EPOCHS_CAPABILITY,
   MANIFEST_READERS,
   objectKey,
@@ -353,6 +354,8 @@ describe("activation gate (G1) and old couriers (D1)", () => {
         w.gate.requeued.map((r) => (r.message as { workKey: string }).workKey),
       ).size,
     ).toBe(1);
+    // The real queue refuses anything else, which a fake here would not show.
+    expect(isStageMessage(w.gate.requeued[0]!.message)).toBe(true);
     expect(w.gate.requeued[0]).toMatchObject({
       delaySeconds: 60,
       message: {
