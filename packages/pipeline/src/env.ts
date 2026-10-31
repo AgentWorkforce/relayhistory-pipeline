@@ -17,7 +17,8 @@
 import type { Context } from "hono";
 
 // RelayAuth defaults, as upstream env.ts declares them (needed by auth/relayauth.ts).
-export const DEFAULT_RELAYAUTH_JWKS_URL = "https://relayauth.dev/.well-known/jwks.json";
+export const DEFAULT_RELAYAUTH_JWKS_URL =
+  "https://relayauth.dev/.well-known/jwks.json";
 export const DEFAULT_RELAYAUTH_ISSUER = "https://relayauth.dev";
 export const DEFAULT_RELAYAUTH_AUDIENCE = "relayhistory";
 
@@ -49,6 +50,8 @@ export interface Bindings {
   RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS?: string;
   /** As upstream env.ts: the dedicated, default-off migration-assertion switch. */
   RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS?: string;
+  /** The v2 pre-mint base read's own default-off activation gate. */
+  RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ?: string;
   /** As upstream env.ts: accepted grants, comma-separated `grantId=planDigest`. */
   RELAYHISTORY_MIGRATION_GRANTS?: string;
   ALLOW_INTERIM_RELAYAUTH_BEARER?: string;
@@ -84,6 +87,9 @@ export interface Bindings {
   PIPELINE_SUMMARY_SHORT?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
   PIPELINE_SUMMARY_LONG?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
   PIPELINE_STATUS_CLASSIFY?: Queue<
+    import("./lib/pipeline/dlq.js").StageMessage
+  >;
+  PIPELINE_BACKFILL_ACTIVATION?: Queue<
     import("./lib/pipeline/dlq.js").StageMessage
   >;
   PIPELINE_FILE_MAINTENANCE?: Queue<

@@ -1,3 +1,7 @@
+import {
+  claimlessWindowEnv,
+  type ClaimlessWindow,
+} from "../claimless-window.ts";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
@@ -34,8 +38,12 @@ const ALCHEMY_STACK_COMMANDS = new Set<AlchemyStackCommand>([
 ]);
 
 /** Mirror Alchemy's first-known-command scan without importing its CLI. */
-export function requestedAlchemyCommand(argv: readonly string[] = process.argv.slice(2)): AlchemyStackCommand | undefined {
-  return argv.find((value): value is AlchemyStackCommand => ALCHEMY_STACK_COMMANDS.has(value as AlchemyStackCommand));
+export function requestedAlchemyCommand(
+  argv: readonly string[] = process.argv.slice(2),
+): AlchemyStackCommand | undefined {
+  return argv.find((value): value is AlchemyStackCommand =>
+    ALCHEMY_STACK_COMMANDS.has(value as AlchemyStackCommand),
+  );
 }
 
 /** The only project this lane may plan. Any other id, number, org, billing account, or region is refused. */
@@ -51,8 +59,10 @@ export const GCP_APPROVED_TARGET = {
 export const RELAYCAST_PUBLISHED_CHART = {
   version: "0.1.0",
   repository: "ghcr.io/agentworkforce/relaycast-self-host",
-  imageDigest: "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
-  packageDigest: "cdfc41cb6202fd81beb17cb57d5fbbdecaf27fa427f51faa07c5ec0fc116744f",
+  imageDigest:
+    "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
+  packageDigest:
+    "cdfc41cb6202fd81beb17cb57d5fbbdecaf27fa427f51faa07c5ec0fc116744f",
 } as const;
 
 /**
@@ -90,7 +100,12 @@ export const GCP_RUNTIME_SHAPE = {
   autopilot: false,
   nodeLocation: "us-central1-a",
   machineType: "e2-medium",
-  initialNodeCount: 1,
+  // One e2-medium exposes only ~940m allocatable CPU after GKE reservations;
+  // system pods plus RelayAuth consume ~921m before the 96Bulls release starts.
+  // Each additional node also carries GKE DaemonSet reservations, so three
+  // nodes are the minimum shape that can schedule the migration and four
+  // runtime Deployments together.
+  initialNodeCount: 3,
   natIpAllocateOption: "MANUAL_ONLY",
   natLogFilter: "ALL",
   nodeOauthScope: "https://www.googleapis.com/auth/cloud-platform",
@@ -109,7 +124,9 @@ export interface CapturedRelaycastChartPackage {
 }
 
 /** Read once, then verify those exact bytes. Callers must never reopen sourcePath. */
-export function captureRelaycastChartPackage(path: string): CapturedRelaycastChartPackage {
+export function captureRelaycastChartPackage(
+  path: string,
+): CapturedRelaycastChartPackage {
   let bytes: Buffer;
   try {
     bytes = readFileSync(path);
@@ -120,7 +137,9 @@ export function captureRelaycastChartPackage(path: string): CapturedRelaycastCha
   }
   const digest = createHash("sha256").update(bytes).digest("hex");
   if (digest !== RELAYCAST_PUBLISHED_CHART.packageDigest)
-    throw new Error("96bulls: Relaycast chart package digest does not match published 0.1.0. Nothing was created.");
+    throw new Error(
+      "96bulls: Relaycast chart package digest does not match published 0.1.0. Nothing was created.",
+    );
   return { bytes, digest, sourcePath: path };
 }
 
@@ -197,7 +216,10 @@ export interface GcpInputs {
   billingAccount: string;
   region: string;
   /** Operator/VPN ranges allowed to reach the private GKE API endpoint. */
-  controlPlaneAuthorizedCidrs: Array<{ cidrBlock: string; displayName?: string }>;
+  controlPlaneAuthorizedCidrs: Array<{
+    cidrBlock: string;
+    displayName?: string;
+  }>;
   /** Required before this stack declares any Kubernetes object or Helm chart. */
   kubernetesExecutor: KubernetesExecutorInputs;
   /** Khaliq's words and date recording that a real GCP plan/deploy is cleared. */
@@ -226,6 +248,10 @@ export interface GcpInputs {
     relayauthJwksUrl: string;
     /** Exact token issuer: public HTTPS or the in-cluster RelayAuth service origin. */
     relayauthIssuer: string;
+    /** Exact History origin placed in RelayAuth assertion audiences and enforced by AlleyOop. */
+    relayhistoryOrigin: string;
+    /** Default off. See runbooks/manifest-activation.md. */
+    claimlessWindow?: ClaimlessWindow;
   };
 }
 
@@ -235,10 +261,15 @@ const PROJECT_NUMBER = /^[0-9]{6,20}$/;
 const REGION = /^[a-z]+(?:-[a-z0-9]+)+[0-9]$/;
 const SEMVER = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
 const KUBERNETES_NAME = /^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$/;
-const EXECUTOR_IDENTITY = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
+const EXECUTOR_IDENTITY =
+  /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 
 /** Keep long stage names distinct while preserving a human-readable suffix. */
-export function gcpResourceName(stage: string, suffix: string, max = 40): string {
+export function gcpResourceName(
+  stage: string,
+  suffix: string,
+  max = 40,
+): string {
   const stagePart = stage
     .replace(/^gcp-/, "")
     .toLowerCase()
@@ -256,7 +287,9 @@ export function gcpResourceName(stage: string, suffix: string, max = 40): string
   const fixed = `awf--${digest}-${suffixPart}`;
   const stageBudget = max - fixed.length;
   if (stageBudget < 1)
-    throw new Error("96bulls: GCP resource name limit cannot preserve uniqueness and suffix");
+    throw new Error(
+      "96bulls: GCP resource name limit cannot preserve uniqueness and suffix",
+    );
   return `awf-${stagePart.slice(0, stageBudget).replace(/-$/, "")}-${digest}-${suffixPart}`;
 }
 
@@ -267,12 +300,15 @@ export function pubsubServiceAgent(projectNumber: string): string {
 }
 
 function requireSemver(label: string, version: string): void {
-  if (!SEMVER.test(version)) throw new Error(`96bulls: ${label} must be an explicit semantic version`);
+  if (!SEMVER.test(version))
+    throw new Error(`96bulls: ${label} must be an explicit semantic version`);
 }
 
 function requireSecretName(label: string, name: string): void {
   if (!KUBERNETES_NAME.test(name) || name.length > 253)
-    throw new Error(`96bulls: ${label} must be a Kubernetes Secret name, never secret material`);
+    throw new Error(
+      `96bulls: ${label} must be a Kubernetes Secret name, never secret material`,
+    );
 }
 
 function requirePublicHttpsOrigin(label: string, value: string): URL {
@@ -285,7 +321,9 @@ function requirePublicHttpsOrigin(label: string, value: string): URL {
     origin.search ||
     origin.hash
   )
-    throw new Error(`96bulls: ${label} must be an HTTPS origin without credentials, path, query, or fragment`);
+    throw new Error(
+      `96bulls: ${label} must be an HTTPS origin without credentials, path, query, or fragment`,
+    );
   const hostname = origin.hostname.replace(/\.$/, "").toLowerCase();
   if (
     !hostname.includes(".") ||
@@ -294,7 +332,9 @@ function requirePublicHttpsOrigin(label: string, value: string): URL {
     hostname.endsWith(".local") ||
     isIP(hostname) !== 0
   )
-    throw new Error(`96bulls: ${label} must use a public multi-label DNS hostname`);
+    throw new Error(
+      `96bulls: ${label} must use a public multi-label DNS hostname`,
+    );
   return origin;
 }
 
@@ -303,13 +343,20 @@ export function assertGcpInputs(
   inputs: GcpInputs,
   requestedCommand?: AlchemyStackCommand,
 ): void {
-  if (!GCP_STAGE.test(stage)) throw new Error(`96bulls: GCP config requires a safe gcp-* stage, got ${stage}`);
-  if (!PROJECT_ID.test(inputs.projectId)) throw new Error("96bulls: gcp projectId is invalid");
-  if (!PROJECT_NUMBER.test(inputs.projectNumber)) throw new Error("96bulls: gcp projectNumber is invalid");
-  if (!/^[0-9]{6,20}$/.test(inputs.organizationId)) throw new Error("96bulls: gcp organizationId is invalid");
+  if (!GCP_STAGE.test(stage))
+    throw new Error(
+      `96bulls: GCP config requires a safe gcp-* stage, got ${stage}`,
+    );
+  if (!PROJECT_ID.test(inputs.projectId))
+    throw new Error("96bulls: gcp projectId is invalid");
+  if (!PROJECT_NUMBER.test(inputs.projectNumber))
+    throw new Error("96bulls: gcp projectNumber is invalid");
+  if (!/^[0-9]{6,20}$/.test(inputs.organizationId))
+    throw new Error("96bulls: gcp organizationId is invalid");
   if (!/^[0-9A-F]{6}-[0-9A-F]{6}-[0-9A-F]{6}$/.test(inputs.billingAccount))
     throw new Error("96bulls: gcp billingAccount is invalid");
-  if (!REGION.test(inputs.region)) throw new Error("96bulls: gcp region is invalid");
+  if (!REGION.test(inputs.region))
+    throw new Error("96bulls: gcp region is invalid");
   if (
     inputs.projectId !== GCP_APPROVED_TARGET.projectId ||
     inputs.projectNumber !== GCP_APPROVED_TARGET.projectNumber ||
@@ -317,11 +364,18 @@ export function assertGcpInputs(
     inputs.billingAccount !== GCP_APPROVED_TARGET.billingAccount ||
     inputs.region !== GCP_APPROVED_TARGET.region
   ) {
-    throw new Error("96bulls: GCP target does not match the approved project. Nothing was created.");
+    throw new Error(
+      "96bulls: GCP target does not match the approved project. Nothing was created.",
+    );
   }
-  if (!inputs.clearedBy?.trim()) throw new Error("96bulls: GCP stage has no clearedBy record; nothing was created");
+  if (!inputs.clearedBy?.trim())
+    throw new Error(
+      "96bulls: GCP stage has no clearedBy record; nothing was created",
+    );
   if (!inputs.controlPlaneAuthorizedCidrs?.length)
-    throw new Error("96bulls: controlPlaneAuthorizedCidrs must allow at least one operator or VPN range");
+    throw new Error(
+      "96bulls: controlPlaneAuthorizedCidrs must allow at least one operator or VPN range",
+    );
   for (const { cidrBlock } of inputs.controlPlaneAuthorizedCidrs) {
     const match = /^([0-9A-Fa-f:.]+)\/([0-9]{1,3})$/.exec(cidrBlock);
     const family = match ? isIP(match[1]!) : 0;
@@ -333,53 +387,95 @@ export function assertGcpInputs(
       cidrBlock === "0.0.0.0/0" ||
       cidrBlock === "::/0"
     )
-      throw new Error(`96bulls: unsafe or invalid control-plane CIDR ${cidrBlock}`);
+      throw new Error(
+        `96bulls: unsafe or invalid control-plane CIDR ${cidrBlock}`,
+      );
   }
   if (!inputs.kubernetesExecutor)
-    throw new Error("96bulls: every GCP apply requires a named executor identity and fresh signed nonce");
+    throw new Error(
+      "96bulls: every GCP apply requires a named executor identity and fresh signed nonce",
+    );
   {
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,62}$/.test(inputs.kubernetesExecutor.name))
-      throw new Error("96bulls: kubernetesExecutor.name must identify a named runner, never an address or credential");
-    if (inputs.kubernetesExecutor.mode !== "in-vpc" && inputs.kubernetesExecutor.mode !== "vpn")
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{2,62}$/.test(inputs.kubernetesExecutor.name)
+    )
+      throw new Error(
+        "96bulls: kubernetesExecutor.name must identify a named runner, never an address or credential",
+      );
+    if (
+      inputs.kubernetesExecutor.mode !== "in-vpc" &&
+      inputs.kubernetesExecutor.mode !== "vpn"
+    )
       throw new Error("96bulls: kubernetesExecutor.mode must be in-vpc or vpn");
     if (!EXECUTOR_IDENTITY.test(inputs.kubernetesExecutor.identity))
-      throw new Error("96bulls: kubernetesExecutor.identity must be a Google service-account email");
+      throw new Error(
+        "96bulls: kubernetesExecutor.identity must be a Google service-account email",
+      );
   }
   if (inputs.chartRepo) {
     const repo = new URL(inputs.chartRepo);
     if (repo.protocol !== "https:" || repo.username || repo.password)
-      throw new Error("96bulls: chartRepo must be HTTPS and must not contain credentials");
+      throw new Error(
+        "96bulls: chartRepo must be HTTPS and must not contain credentials",
+      );
   }
-  if (inputs.chartStorageClass && !KUBERNETES_NAME.test(inputs.chartStorageClass))
-    throw new Error("96bulls: chartStorageClass is not a valid Kubernetes name");
+  if (
+    inputs.chartStorageClass &&
+    !KUBERNETES_NAME.test(inputs.chartStorageClass)
+  )
+    throw new Error(
+      "96bulls: chartStorageClass is not a valid Kubernetes name",
+    );
 
-  if (inputs.managedDataPlane.provision && inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
+  if (
+    inputs.managedDataPlane.provision &&
+    inputs.managedDataPlane.acknowledgement !== "adapter-proof-only"
+  )
     throw new Error(
       "96bulls: managedDataPlane.provision requires acknowledgement=adapter-proof-only because Relaycast HA is not released",
     );
   if ((inputs.managedDataPlane.redisMemoryGb ?? 1) < 1)
-    throw new Error("96bulls: managedDataPlane.redisMemoryGb must be at least 1");
+    throw new Error(
+      "96bulls: managedDataPlane.redisMemoryGb must be at least 1",
+    );
 
   if (inputs.relaycast) {
     requireSemver("relaycast.chartVersion", inputs.relaycast.chartVersion);
-    if (inputs.relaycast.chartVersion !== RELAYCAST_PUBLISHED_CHART.version || !isPublishedHelmRepo(inputs.chartRepo))
-      throw new Error("96bulls: relaycast must use published chart 0.1.0 from the AgentWorkforce helm repository. Nothing was created.");
+    if (
+      inputs.relaycast.chartVersion !== RELAYCAST_PUBLISHED_CHART.version ||
+      !isPublishedHelmRepo(inputs.chartRepo)
+    )
+      throw new Error(
+        "96bulls: relaycast must use published chart 0.1.0 from the AgentWorkforce helm repository. Nothing was created.",
+      );
     requirePublicHttpsOrigin("relaycast.baseUrl", inputs.relaycast.baseUrl);
   }
   if (inputs.relayauth) {
     requireSemver("relayauth.chartVersion", inputs.relayauth.chartVersion);
-    requireSecretName("relayauth.existingSecretName", inputs.relayauth.existingSecretName);
-    if (inputs.relayauth.baseUrl) requirePublicHttpsOrigin("relayauth.baseUrl", inputs.relayauth.baseUrl);
+    requireSecretName(
+      "relayauth.existingSecretName",
+      inputs.relayauth.existingSecretName,
+    );
+    if (inputs.relayauth.baseUrl)
+      requirePublicHttpsOrigin("relayauth.baseUrl", inputs.relayauth.baseUrl);
   }
   if (inputs.relayfile) {
     requireSemver("relayfile.chartVersion", inputs.relayfile.chartVersion);
-    requireSecretName("relayfile.existingSecretName", inputs.relayfile.existingSecretName);
-    requireRelayauthJwksUrl("relayfile.relayauthJwksUrl", inputs.relayfile.relayauthJwksUrl);
+    requireSecretName(
+      "relayfile.existingSecretName",
+      inputs.relayfile.existingSecretName,
+    );
+    requireRelayauthJwksUrl(
+      "relayfile.relayauthJwksUrl",
+      inputs.relayfile.relayauthJwksUrl,
+    );
   }
   if (inputs.relayflows) {
     requireSemver("relayflows.chartVersion", inputs.relayflows.chartVersion);
     if (!KUBERNETES_NAME.test(inputs.relayflows.flowConfigMap))
-      throw new Error("96bulls: relayflows.flowConfigMap must be a Kubernetes ConfigMap name");
+      throw new Error(
+        "96bulls: relayflows.flowConfigMap must be a Kubernetes ConfigMap name",
+      );
   }
   if (inputs.bulls96?.enabled) {
     if (!inputs.managedDataPlane.provision)
@@ -389,28 +485,60 @@ export function assertGcpInputs(
     requireSemver("bulls96.chartVersion", inputs.bulls96.chartVersion);
     const [major, minor] = inputs.bulls96.chartVersion.split(".").map(Number);
     if (!(major! > 0 || (major === 0 && minor! >= 3)))
-      throw new Error("96bulls: bulls96.chartVersion must be 0.3.0 or newer so the worker chart accepts pod identity and extraEnv");
+      throw new Error(
+        "96bulls: bulls96.chartVersion must be 0.3.0 or newer so the worker chart accepts pod identity and extraEnv",
+      );
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(inputs.bulls96.tenantOrgId))
-      throw new Error("96bulls: bulls96.tenantOrgId must be an org id, never a URL or credential");
-    requireSecretName("bulls96.existingSecretName", inputs.bulls96.existingSecretName);
+      throw new Error(
+        "96bulls: bulls96.tenantOrgId must be an org id, never a URL or credential",
+      );
+    requireSecretName(
+      "bulls96.existingSecretName",
+      inputs.bulls96.existingSecretName,
+    );
     if (!/^sha256:[a-f0-9]{64}$/.test(inputs.bulls96.imageDigest))
-      throw new Error("96bulls: bulls96.imageDigest must be an immutable sha256 digest");
+      throw new Error(
+        "96bulls: bulls96.imageDigest must be an immutable sha256 digest",
+      );
     if (!/^[a-f0-9]{40}$/.test(inputs.bulls96.imageSourceRevision))
-      throw new Error("96bulls: bulls96.imageSourceRevision must be a full Git commit SHA");
-    requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", inputs.bulls96.relayauthJwksUrl);
-    requireRelayauthIssuer("bulls96.relayauthIssuer", inputs.bulls96.relayauthIssuer);
-    if (inputs.relayauth?.baseUrl && inputs.bulls96.relayauthIssuer !== inputs.relayauth.baseUrl)
-      throw new Error("96bulls: bulls96.relayauthIssuer must match relayauth.baseUrl for the in-stage RelayAuth release");
+      throw new Error(
+        "96bulls: bulls96.imageSourceRevision must be a full Git commit SHA",
+      );
+    requireRelayauthJwksUrl(
+      "bulls96.relayauthJwksUrl",
+      inputs.bulls96.relayauthJwksUrl,
+    );
+    requireRelayauthIssuer(
+      "bulls96.relayauthIssuer",
+      inputs.bulls96.relayauthIssuer,
+    );
+    requireRelayhistoryOrigin(
+      "bulls96.relayhistoryOrigin",
+      inputs.bulls96.relayhistoryOrigin,
+    );
+    if (
+      inputs.relayauth?.baseUrl &&
+      inputs.bulls96.relayauthIssuer !== inputs.relayauth.baseUrl
+    )
+      throw new Error(
+        "96bulls: bulls96.relayauthIssuer must match relayauth.baseUrl for the in-stage RelayAuth release",
+      );
     if (requestedCommand !== "destroy" && stage !== GCP_APPLICATION_PROOF_STAGE)
       throw new Error(
         `96bulls: the approved services image is published only for ${GCP_APPLICATION_PROOF_STAGE}; ${stage} cannot install 96Bulls. Nothing was created.`,
       );
     if (requestedCommand !== "destroy")
-      requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
+      requireApprovedGcpServicesImage(
+        inputs.bulls96.imageDigest,
+        inputs.bulls96.imageSourceRevision,
+      );
   }
 }
 
-function requireApprovedGcpServicesImage(digest: string, sourceRevision: string): void {
+function requireApprovedGcpServicesImage(
+  digest: string,
+  sourceRevision: string,
+): void {
   if (
     digest !== GCP_APPROVED_SERVICES_IMAGE.digest ||
     sourceRevision !== GCP_APPROVED_SERVICES_IMAGE.sourceRevision
@@ -432,15 +560,25 @@ export function assertGcpRuntimeDeployable(
 ): void {
   if (
     inputs.bulls96?.enabled &&
-    (!inputs.managedDataPlane.provision || inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
+    (!inputs.managedDataPlane.provision ||
+      inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
   )
-    throw new Error("96bulls: GCP runtime wiring requires the acknowledged managed data plane. Nothing was created.");
-  if (inputs.bulls96?.enabled && requestedCommand !== "destroy" && stage !== GCP_APPLICATION_PROOF_STAGE)
+    throw new Error(
+      "96bulls: GCP runtime wiring requires the acknowledged managed data plane. Nothing was created.",
+    );
+  if (
+    inputs.bulls96?.enabled &&
+    requestedCommand !== "destroy" &&
+    stage !== GCP_APPLICATION_PROOF_STAGE
+  )
     throw new Error(
       `96bulls: the approved services image is published only for ${GCP_APPLICATION_PROOF_STAGE}; ${stage} cannot install 96Bulls. Nothing was created.`,
     );
   if (inputs.bulls96?.enabled && requestedCommand !== "destroy")
-    requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
+    requireApprovedGcpServicesImage(
+      inputs.bulls96.imageDigest,
+      inputs.bulls96.imageSourceRevision,
+    );
 }
 
 export function assertGcpSqlPostConfirmation(
@@ -455,9 +593,14 @@ export function assertGcpSqlPostConfirmation(
     );
 }
 
-export function relaycastChartValues(i: RelaycastChartInputs, defaultStorageClass = "standard-rwo") {
+export function relaycastChartValues(
+  i: RelaycastChartInputs,
+  defaultStorageClass = "standard-rwo",
+) {
   if (i.chartVersion !== RELAYCAST_PUBLISHED_CHART.version)
-    throw new Error("96bulls: relaycast chart is not the published 0.1.0 contract. Nothing was created.");
+    throw new Error(
+      "96bulls: relaycast chart is not the published 0.1.0 contract. Nothing was created.",
+    );
   return {
     replicaCount: 1,
     strategy: { type: "Recreate" },
@@ -467,7 +610,11 @@ export function relaycastChartValues(i: RelaycastChartInputs, defaultStorageClas
     },
     runtime: { backend: "sqlite" },
     baseUrl: i.baseUrl,
-    persistence: { storageClass: i.storageClass ?? defaultStorageClass, accessMode: "ReadWriteOnce", size: "20Gi" },
+    persistence: {
+      storageClass: i.storageClass ?? defaultStorageClass,
+      accessMode: "ReadWriteOnce",
+      size: "20Gi",
+    },
     service: { type: "ClusterIP", annotations: {} },
     ingress: {
       enabled: false,
@@ -480,10 +627,17 @@ export function relaycastChartValues(i: RelaycastChartInputs, defaultStorageClas
   };
 }
 
-export function relayauthChartValues(i: RelayAuthChartInputs, defaultStorageClass = "standard-rwo") {
+export function relayauthChartValues(
+  i: RelayAuthChartInputs,
+  defaultStorageClass = "standard-rwo",
+) {
   return {
     replicaCount: 1,
     existingSecret: i.existingSecretName,
+    // The conformance History origin is an in-cluster HTTP service. RelayAuth
+    // remains fail-closed for public HTTP origins; this chart switch permits
+    // only its private/internal-host validation path.
+    relayhistory: { allowPrivateHttpOrigin: true },
     ...(i.baseUrl ? { baseUrl: i.baseUrl, issuer: i.baseUrl } : {}),
     persistence: { storageClass: i.storageClass ?? defaultStorageClass },
     jwksIngress: i.baseUrl
@@ -525,14 +679,17 @@ export interface Bulls96ReleaseOutputs {
   workloadIdentityEmail: string;
 }
 
-const GSA_EMAIL = /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
+const GSA_EMAIL =
+  /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 
 function requireRelayauthJwksUrl(label: string, value: string): void {
   let jwks: URL;
   try {
     jwks = new URL(value);
   } catch {
-    throw new Error(`96bulls: ${label} must be public HTTPS or the in-cluster RelayAuth service`);
+    throw new Error(
+      `96bulls: ${label} must be public HTTPS or the in-cluster RelayAuth service`,
+    );
   }
   if (jwks.username || jwks.password)
     throw new Error(`96bulls: ${label} must not contain credentials`);
@@ -548,7 +705,9 @@ function requireRelayauthJwksUrl(label: string, value: string): void {
     !hostname.endsWith(".local") &&
     isIP(hostname) === 0;
   if ((!inCluster && !publicHttps) || jwks.hash || jwks.search)
-    throw new Error(`96bulls: ${label} must be public HTTPS or the in-cluster RelayAuth service`);
+    throw new Error(
+      `96bulls: ${label} must be public HTTPS or the in-cluster RelayAuth service`,
+    );
 }
 
 function requireRelayauthIssuer(label: string, value: string): void {
@@ -556,7 +715,9 @@ function requireRelayauthIssuer(label: string, value: string): void {
   try {
     issuer = new URL(value);
   } catch {
-    throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`);
+    throw new Error(
+      `96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`,
+    );
   }
   const hostname = issuer.hostname.replace(/\.$/, "").toLowerCase();
   const inCluster =
@@ -576,13 +737,55 @@ function requireRelayauthIssuer(label: string, value: string): void {
     issuer.pathname !== "/" ||
     issuer.search ||
     issuer.hash
-  ) throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`);
+  )
+    throw new Error(
+      `96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`,
+    );
+}
+
+function requireRelayhistoryOrigin(label: string, value: string): void {
+  let origin: URL;
+  try {
+    origin = new URL(value);
+  } catch {
+    throw new Error(
+      `96bulls: ${label} must be a public HTTPS or in-cluster Kubernetes origin`,
+    );
+  }
+  const hostname = origin.hostname.replace(/\.$/, "").toLowerCase();
+  const inCluster =
+    origin.protocol === "http:" &&
+    /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\.svc(?:\.cluster\.local)?$/.test(
+      hostname,
+    );
+  const publicHttps =
+    origin.protocol === "https:" &&
+    hostname.includes(".") &&
+    hostname !== "localhost" &&
+    !hostname.endsWith(".localhost") &&
+    !hostname.endsWith(".local") &&
+    isIP(hostname) === 0;
+  const canonical = value.replace(/\/$/, "").toLowerCase() === origin.origin;
+  if (
+    origin.username ||
+    origin.password ||
+    (!inCluster && !publicHttps) ||
+    !canonical ||
+    origin.pathname !== "/" ||
+    origin.search ||
+    origin.hash
+  )
+    throw new Error(
+      `96bulls: ${label} must be a public HTTPS or in-cluster Kubernetes origin`,
+    );
 }
 
 function plainSetting(label: string, value: unknown): void {
   if (typeof value !== "string") return;
   if (value.includes("://") || value.includes("@") || value.includes("BEGIN "))
-    throw new Error(`96bulls: ${label} must not carry a URL, credential, or key. Nothing was created.`);
+    throw new Error(
+      `96bulls: ${label} must not carry a URL, credential, or key. Nothing was created.`,
+    );
 }
 
 function publicCaBundle(value: unknown): void {
@@ -592,7 +795,10 @@ function publicCaBundle(value: unknown): void {
     value.includes("PRIVATE KEY") ||
     !value.includes("-----BEGIN CERTIFICATE-----") ||
     !value.includes("-----END CERTIFICATE-----")
-  ) throw new Error("96bulls: Redis service CA bundle is malformed. Nothing was created.");
+  )
+    throw new Error(
+      "96bulls: Redis service CA bundle is malformed. Nothing was created.",
+    );
 }
 
 /** Published chart values backed by pod identity, an external Secret, and a live Redis TLS readiness probe. */
@@ -601,7 +807,9 @@ export function bulls96ReleaseValues(
   managed: Bulls96ReleaseOutputs,
 ): Record<string, unknown> {
   if (!GSA_EMAIL.test(managed.workloadIdentityEmail))
-    throw new Error("96bulls: workload identity email is not a service-account email. Nothing was created.");
+    throw new Error(
+      "96bulls: workload identity email is not a service-account email. Nothing was created.",
+    );
   for (const [label, value] of [
     ["bucket", managed.bucket],
     ["region", managed.region],
@@ -610,23 +818,41 @@ export function bulls96ReleaseValues(
     ["redisHost", managed.redisHost],
     ["pubsubTopic", managed.pubsubTopic],
     ["pubsubSubscription", managed.pubsubSubscription],
-  ] as const) plainSetting(label, value);
+  ] as const)
+    plainSetting(label, value);
   publicCaBundle(managed.redisCaPem);
-  if (typeof managed.redisPort === "string" && !/^[0-9]+$/.test(managed.redisPort))
-    throw new Error("96bulls: redis port must be numeric. Nothing was created.");
-  const redisPort = typeof managed.redisPort === "number" ? String(managed.redisPort) : managed.redisPort;
+  if (
+    typeof managed.redisPort === "string" &&
+    !/^[0-9]+$/.test(managed.redisPort)
+  )
+    throw new Error(
+      "96bulls: redis port must be numeric. Nothing was created.",
+    );
+  const redisPort =
+    typeof managed.redisPort === "number"
+      ? String(managed.redisPort)
+      : managed.redisPort;
   requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", i.relayauthJwksUrl);
   requireRelayauthIssuer("bulls96.relayauthIssuer", i.relayauthIssuer);
-  const identity = { "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail };
+  requireRelayhistoryOrigin("bulls96.relayhistoryOrigin", i.relayhistoryOrigin);
+  const identity = {
+    "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail,
+  };
   const dataEnv = () => [
     { name: "LOCKER_PROVIDER", value: "gcs" },
     { name: "PIPELINE_RAW_PROVIDER", value: "gcs" },
     { name: "PIPELINE_RAW_S3_BUCKET", value: managed.bucket },
-    { name: "CLOUD_SQL_CONNECTION_NAME", value: managed.cloudSqlConnectionName },
+    {
+      name: "CLOUD_SQL_CONNECTION_NAME",
+      value: managed.cloudSqlConnectionName,
+    },
     { name: "REDIS_HOST", value: managed.redisHost },
     { name: "REDIS_PORT", value: redisPort },
     { name: "REDIS_AUTH_ENABLED", value: GCP_REDIS_CLIENT.authEnabled },
-    { name: "REDIS_TRANSIT_ENCRYPTION", value: GCP_REDIS_CLIENT.transitEncryption },
+    {
+      name: "REDIS_TRANSIT_ENCRYPTION",
+      value: GCP_REDIS_CLIENT.transitEncryption,
+    },
     { name: "REDIS_TLS_CA_PEM", value: managed.redisCaPem },
     { name: "PUBSUB_TOPIC", value: managed.pubsubTopic },
     { name: "PUBSUB_SUBSCRIPTION", value: managed.pubsubSubscription },
@@ -638,7 +864,10 @@ export function bulls96ReleaseValues(
     region: managed.region,
     credentials: { mode: "podIdentity" as const },
   });
-  const hoopdb = () => ({ existingSecret: i.existingSecretName, key: "HOOPDB_URL" });
+  const hoopdb = () => ({
+    existingSecret: i.existingSecretName,
+    key: "HOOPDB_URL",
+  });
   const imagePullSecrets: Array<{ name: string }> = [];
   const image = { repository: managed.imageRepository, digest: i.imageDigest };
   return {
@@ -652,7 +881,10 @@ export function bulls96ReleaseValues(
       locker: locker(),
       lockerInit: { enabled: false },
       migrations: { supabaseShim: true },
-      summaryEncryption: { existingSecret: i.existingSecretName, key: "SUMMARY_MASTER_KEYS" },
+      summaryEncryption: {
+        existingSecret: i.existingSecretName,
+        key: "SUMMARY_MASTER_KEYS",
+      },
       serviceAccount: { annotations: { ...identity } },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
       extraEnv: dataEnv(),
@@ -667,14 +899,25 @@ export function bulls96ReleaseValues(
       auth: { jwksUrl: i.relayauthJwksUrl, issuer: i.relayauthIssuer },
       serviceAccount: { annotations: { ...identity } },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
-      extraEnv: dataEnv(),
+      extraEnv: [
+        ...dataEnv(),
+        // This enables the RelayAuth JWT verifier, not the legacy audience:
+        // RELAYHISTORY_ORIGIN below makes the verifier accept only the
+        // dedicated origin-bound assertion class by default.
+        { name: "ALLOW_INTERIM_RELAYAUTH_BEARER", value: "true" },
+        { name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin },
+        ...claimlessWindowEnv(i.claimlessWindow),
+      ],
     },
     hoopdb: { enabled: false },
     locker: { enabled: false },
   };
 }
 
-export function relayflowsChartValues(i: RelayflowsChartInputs, defaultStorageClass = "standard-rwo") {
+export function relayflowsChartValues(
+  i: RelayflowsChartInputs,
+  defaultStorageClass = "standard-rwo",
+) {
   return {
     mode: "standalone",
     standalone: {

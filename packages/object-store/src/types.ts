@@ -80,6 +80,8 @@ export interface ObjectStore {
   presignGet(key: ObjectKey, ttlSeconds: number): Promise<URL>;
   /** Single-request put with create / compare-and-swap semantics. */
   put(key: ObjectKey, body: Uint8Array, opts?: PutOpts): Promise<PutAck>;
+  /** Remove an object. Deleting one that does not exist succeeds. */
+  delete(key: ObjectKey): Promise<void>;
 }
 
 /** Body and whole-object attributes from one `getObject` response. */

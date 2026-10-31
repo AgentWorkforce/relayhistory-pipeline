@@ -8,6 +8,7 @@
 import type { Hono, MiddlewareHandler } from "hono";
 import { pipelineOpsRoutes, requireAuth, type AppEnv } from "../shared/vendor.ts";
 import { requestIdentity } from "../shared/enrich.ts";
+import { liveWriteMachineGate } from "./manifests.ts";
 
 /** Paths served without authentication. The public ALB contract depends on this list staying this small. */
 export const PUBLIC_INGEST_PATHS = ["/.well-known/jwks.json", "/health", "/healthz", "/readyz"] as const;
@@ -48,6 +49,8 @@ export function mountIngestApi(
       return c.json({ error: { code: "origin_bound_assertion_required", message: "upload routes take only assertions minted for this origin" }, correlationId: c.get("correlationId") ?? "" }, 403);
     await next();
   });
+  // A live write must be bound to its machine before any route stores anything.
+  v1.use("*", liveWriteMachineGate);
   // Every send made while handling this request carries the authenticated user.
   v1.use("*", async (c, next) => {
     const auth = c.get("auth") as { userId?: string } | undefined;

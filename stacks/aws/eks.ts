@@ -13,6 +13,7 @@
  * from 1Password, never through chart values. Pure contracts: hardening.ts and
  * proof-addons.ts.
  */
+import { claimlessWindowEnv, type ClaimlessWindow } from "../claimless-window.ts";
 import * as AWS from "@alchemy.run/aws";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
@@ -73,6 +74,8 @@ export interface EksStageInputs {
   tenantOrgIds?: string[];
   relayauthJwksUrl: string;
   relayhistoryOrigin: string;
+  /** Default off. See runbooks/manifest-activation.md. */
+  claimlessWindow?: ClaimlessWindow;
   /** The `iss` RelayAuth stamps; must match exactly or every token is refused. */
   relayauthIssuer?: string;
   /**
@@ -125,7 +128,7 @@ export const OTEL_ENDPOINT = "http://otel-collector:4318";
  * tested without loading either the AWS or Kubernetes providers.
  */
 export function eksChartValues(
-  i: Pick<EksStageInputs, "stage" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "tenantOrgIds" | "relayhistoryOrigin" | "imageRepository" | "imageDigest">,
+  i: Pick<EksStageInputs, "stage" | "claimlessWindow" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "tenantOrgIds" | "relayhistoryOrigin" | "imageRepository" | "imageDigest">,
   sandbox: boolean,
   authIssuer: string,
   authJwksUrl: string,
@@ -161,7 +164,7 @@ export function eksChartValues(
       hoopdb: inCluster ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
       locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
       auth: { jwksUrl: authJwksUrl, issuer: authIssuer },
-      extraEnv: [{ name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin }, ...tenants.extraEnv],
+      extraEnv: [{ name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin }, ...claimlessWindowEnv(i.claimlessWindow), ...tenants.extraEnv],
       deployment: { name: "hosted", id: i.stage },
     },
     otel: {
