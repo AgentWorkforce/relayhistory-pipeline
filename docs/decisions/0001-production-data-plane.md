@@ -38,3 +38,53 @@ This record is not that approval. Each of these needs it separately:
 - deploying;
 - merging migration PRs that change production behaviour;
 - cutover and rollback.
+
+## Amendment 1: ObsessionDB as the transcript search store (DRAFT)
+
+**Status:** decided by Khaliq on 2026-10-31 in the lead session, relayed by
+the coordinator. The decisions are K-28 ("Yes, add ObsessionDB"), K-33
+(region) and K-34 ("Include it in the T0 gate"). This text is a draft in
+96BullSessions #90 and takes effect when that PR merges.
+**Amends:** "Decision" and "Consequences" above.
+
+### Decision
+
+- **Production data plane:** Supabase (database) + AWS S3 (objects) +
+  **ObsessionDB (transcript search store)**.
+- **ObsessionDB's role:**
+  - lexical transcript search for the MCP tools (`search_shared_sessions`
+    excerpts, the `get_shared_session_context` window);
+  - the dashboard's semantic/hybrid search (keyword + vector, ranked);
+  - the memory-pack lexical and `files_touched` pools.
+
+  It is a derived projection, loaded from the pipeline's normalized S3
+  objects. S3 stays the system of record, so ObsessionDB can be rebuilt by
+  replay.
+- **Region:** the production ObsessionDB service runs in AWS `us-east-1`,
+  next to Neon production and Supabase `sessions`. The proof service
+  `relay-transcript-proof` (`us-west-2`) is evidence only and never holds
+  production data.
+- **Supabase still holds no transcript text and no embeddings**, as 0002
+  requires. Embeddings, if used, live with the ObsessionDB projection.
+
+### Consequences
+
+- The production migration's T0 write switch waits until new sessions are
+  transcript-searchable on ObsessionDB, including hybrid search (K-27 and
+  K-34; `docs/relayhistory-supabase-migration-plan.md` gate G-T).
+- Pre-T0 history keeps legacy transcript and hybrid search on the frozen
+  Neon T0 child branch until it is loaded into ObsessionDB (K-6).
+- ClickHouse is no longer a production candidate. relayhistory-cloud #233
+  should be updated to match.
+- The "AWS is S3 only" rule above still applies to resources we operate,
+  with one exception: the ObsessionDB service in `us-east-1`. Its hosting
+  model and account are open (plan Q21).
+
+### Still needs Khaliq's explicit OK for each exact action
+
+- provisioning ObsessionDB (production and staging) and its credentials;
+- enabling the feed into it;
+- enabling the embedding stage, including the model, provider and budget;
+- every step in the plan's approval list.
+
+This amendment is not that approval.
