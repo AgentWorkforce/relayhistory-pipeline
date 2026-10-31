@@ -23,7 +23,8 @@ write switch until new sessions are transcript-searchable on ObsessionDB.**
   store-agnostic history adapter for full history. The candidates are
   ObsessionDB (intended, conditional), ClickHouse Cloud and Amazon
   OpenSearch Service (K-40). When the
-  latter fails, results are labelled partial rather than failing.
+  latter fails, search returns the Postgres results as a **silent partial**:
+  no user-facing label, with internal coverage metadata (K-46).
 - K-33 placed it in AWS `us-east-1`.
 - K-34, narrowed by K-36 ("No embeddings pre-T0"), adds the dashboard's ranked search to the same gate, as keyword ranking over ObsessionDB full-text. There are no vector pools before T0.
 
@@ -61,15 +62,18 @@ cutover.
 | 2026-10-31 | K-36 | "No embeddings pre-T0" | Khaliq, lead session (final ruling). **helm-chart-chief now records it as directly approved.** | **Supersedes K-34 as written.** G-T8 becomes keyword-ranked dashboard search on ObsessionDB full-text over complete transcripts, with **no vector pools before T0**. The nDCG@10 benchmark against legacy hybrid stays as the gate. If it shows a real loss, embeddings come back as a follow-up decision (section 17). Embedding versioning, K-35, Q19 and Q20 move to section 17. |
 | 2026-10-31 | K-37 | Synthetic trials approved: **ClickHouse Cloud with a $50 hard cap**, and the **ObsessionDB free dev service (eu-central, functional testing only)** | Khaliq, direct approval, confirmed 2026-10-31 | Synthetic data only. **A trial approval is not production provisioning approval** (K-29 stays separate). Trial results feed G-T0E. ObsessionDB's dev service is outside `us-east-1`, so it cannot prove performance or region. |
 | 2026-10-31 | K-38 | Counts-only, read-only shape extraction from production is approved; **no corpus movement** | Khaliq, direct approval, confirmed 2026-10-31 | Allows aggregate counts and sizes (per-org session/event counts, size distributions, table sizes) to answer Q7, Q9 and Q11 and to shape the synthetic corpus. No content, query text or identifiers leave production. **Done 2026-10-31 07:13-07:25 UTC**; results in `~/selfhost-proof/notes/prod-shape-2026-10-31.md` (section 1). |
-| 2026-10-31 | K-39 | "ObsessionDB off the hot path" | Khaliq, direct, lead session | Restructures search (section 6, "Search architecture").<br>- S3 is the source of truth, and ObsessionDB is a derived, rebuildable index fed by an async indexer. Ingest never waits on it.<br>- One search interface with two adapters. The Postgres adapter is the self-host default; on hosted it serves a **bounded recent window** of transcript text in Supabase (trigram/FTS) plus metadata and summary search. The ObsessionDB adapter (any ClickHouse-protocol store) serves full history.<br>- Hosted search queries both and merges. ObsessionDB gets a roughly 1-2 s budget. On its error or timeout, the response returns the Postgres results labelled "partial: older history unavailable": never an unlabelled empty result, and never a 5xx for that case.<br>- Recent-window freshness no longer depends on the indexer.<br>- This lowers the stakes of the conditional K-28.<br>- A draft amendment to 0002 is in this PR, and the Supabase disk sizing for the window is folded into K-32. |
+| 2026-10-31 | K-39 | "ObsessionDB off the hot path" | Khaliq, direct, lead session | Restructures search (section 6, "Search architecture").<br>- S3 is the source of truth, and ObsessionDB is a derived, rebuildable index fed by an async indexer. Ingest never waits on it.<br>- One search interface with two adapters. The Postgres adapter is the self-host default; on hosted it serves a **bounded recent window** of transcript text in Supabase (trigram/FTS) plus metadata and summary search. The ObsessionDB adapter (any ClickHouse-protocol store) serves full history.<br>- Hosted search queries both and merges. ObsessionDB gets a roughly 1-2 s budget. On its error or timeout, the response returns the Postgres results labelled "partial: older history unavailable": never an unlabelled empty result, and never a 5xx for that case. **The user-facing label is superseded by K-46 (silent partial).**<br>- Recent-window freshness no longer depends on the indexer.<br>- This lowers the stakes of the conditional K-28.<br>- A draft amendment to 0002 is in this PR, and the Supabase disk sizing for the window is folded into K-32. |
 | 2026-10-31 | K-40 | **Amazon OpenSearch Service is a third candidate** for the full-history transcript index, alongside ObsessionDB (conditional, K-28) and ClickHouse Cloud (trial, K-37). A **synthetic-only OpenSearch trial is approved in the proof account 500268966557 / `us-west-2`, about $50 cap.** | Khaliq, direct, 2026-10-31 | The store is decided by the same benchmark and evidence gate for every candidate: G-T0E is generalised (section 6). OpenSearch is expected to score E4, E5 and E6 through AWS VPC, IAM and compliance, and to be weaker on the cost of substring indexing (E1). The history adapter interface is **store-agnostic**, not just ClickHouse-protocol. A trial is not production provisioning. |
 | 2026-10-31 | K-42 | **Window = 14 days**; **complete event text** in the window, not a 4 KB prefix (closes Q23); **history-store budget = 1.5 s** (closes Q24) | Khaliq, direct, 2026-10-31 | Recent window = the last 14 days of complete scrubbed event text. The final byte size is still to be measured by the K-38 counts-only extraction before the disk resize (K-32). The merge/fallback (G-T1M) uses a 1.5 s hard budget for the history store. |
+| 2026-10-31 | K-44 | Transcript-store isolation: **application-layer scoping is primary, with a DB row-policy backstop.** Ask the vendor to enable row policies and user creation. **The gate requires both.** | Khaliq, direct, 2026-10-31 | G-T6, G-T0E E2 and S11 updated. |
+| 2026-10-31 | K-45 | Erasure SLA: **logical delete immediately; physical purge within 48 h**, including ObsessionDB's 24 h time travel | Khaliq, direct, 2026-10-31 | E3, G-T6, the 0001 and 0002 amendments and the S3 lifecycle updated. Backup and PITR tails are open (Q27). |
+| 2026-10-31 | K-46 | Degraded search returns **silent partial results**: no user-facing "older history unavailable" label in the UI or in MCP text. An **internal coverage field** is kept in response metadata, logs and metrics, with an alarm on the partial-response rate. | Khaliq, direct, 2026-10-31 | Supersedes K-39's labelling as written. The degraded-behaviour table, G-T1M, the merge spec, SLO row 14 and the alarms are updated. |
 | 2026-10-31 | K-22 | "Forward-only after flip" | Khaliq, lead session, relayed by the coordinator | Option R2 (section 11). T0 can be aborted up to the flip. After the flip there is no data rollback to Neon, and no reverse-sync (G-V) is built. |
 
 **Relay status.** helm-chart-chief records relayed rulings as **PROPOSED**
 until Khaliq confirms them in its own session.
 - **Confirmed directly (2026-10-31):** K-28 (restated as conditional), K-36,
-  K-37, K-38, K-39, K-40 and K-42.
+  K-37, K-38, K-39, K-40, K-42, K-44, K-45 and K-46.
 - The other rows were relayed by the coordinator from Khaliq's lead
   session. They stay proposed in that sense until helm-chart-chief records
   them as confirmed.
@@ -100,7 +104,8 @@ every step in section 15 still needs its own OK.
 
    Hosted search queries both and merges them. If the history store errors
    or exceeds its **1.5 s** budget (K-42), the response returns the Postgres
-   results labelled "partial: older history unavailable". Pre-T0 history is
+   results as a **silent partial**: no user-facing label, but internal
+   coverage metadata, logs, metrics and an alarm (K-46). Pre-T0 history is
    served from the frozen Neon T0 child branch (K-6) until it is loaded.
    The dashboard's ranked search is keyword-only before T0 (K-36). Gate
    G-T, section 6.
@@ -118,7 +123,7 @@ every step in section 15 still needs its own OK.
       shape. That covers:
       - the Postgres recent-window adapter;
       - the async indexer into the chosen history store (store-agnostic adapter; G-T0E picks among ObsessionDB, ClickHouse Cloud and OpenSearch);
-      - the merge with labelled-partial fallback;
+      - the merge with silent-partial fallback (K-46);
       - MCP excerpts and the in-session window;
       - recall parity;
       - keyword-ranked dashboard search (K-36);
@@ -254,7 +259,7 @@ sizing) and is folded into K-32.
 | Worker to Supabase | Direct TCP through Supavisor (relayhistory-cloud #225), one client per request. Metadata reads go through PostgREST (#226). Hyperdrive only if the benchmark justifies it. | `docs/relayhistory-supabase-migration.md` |
 | Worker to S3 | The S3 API with `PIPELINE_RAW_S3_{ENDPOINT,REGION,BUCKET,ACCESS_KEY_ID,SECRET_ACCESS_KEY,SSE}`. A Worker cannot use IAM roles, so this is a long-lived IAM access key. Security gate S5 covers it. | relayhistory-cloud `lib/pipeline/adapter.ts` |
 | Auth | Hosted RelayAuth (cloud `packages/relayauth`, Cloudflare Worker + D1), `@relayauth/server` 0.2.35 on cloud `trunk` (#5886). A **separate** search issuer and key (relayauth #116, draft). Supabase trusts only that issuer for `session_directory_search_worker`. | #63, #72, #73, relayauth #116 |
-| Transcript search: one interface, two adapters (K-39) | **Postgres adapter.** On hosted it uses Supabase `sessions`: a **bounded recent window** of scrubbed transcript text with trigram and FTS indexes, plus `session_directory` metadata and summary search. On self-host it is the default, with an unbounded window. **History adapter:** store-agnostic interface. The candidates are ObsessionDB (intended, K-28, conditional), ClickHouse Cloud, and Amazon OpenSearch Service (K-40), chosen by G-T0E, in AWS `us-east-1` (K-33). It holds full history and is fed by an **async indexer** from S3 normalized objects; ingest never waits on it. Hosted search queries both and merges, and gives the history store a 1.5 s budget (K-42), falling back to labelled partial results. Proof service: `relay-transcript-proof`, `us-west-2`. Open: hosting and account (Q21). | K-39; 0002 Amendment 1 (draft) |
+| Transcript search: one interface, two adapters (K-39) | **Postgres adapter.** On hosted it uses Supabase `sessions`: a **bounded recent window** of scrubbed transcript text with trigram and FTS indexes, plus `session_directory` metadata and summary search. On self-host it is the default, with an unbounded window. **History adapter:** store-agnostic interface. The candidates are ObsessionDB (intended, K-28, conditional), ClickHouse Cloud, and Amazon OpenSearch Service (K-40), chosen by G-T0E, in AWS `us-east-1` (K-33). It holds full history and is fed by an **async indexer** from S3 normalized objects; ingest never waits on it. Hosted search queries both and merges, and gives the history store a 1.5 s budget (K-42), falling back to silent partial results with internal coverage metadata (K-46). Design and prototype: relayhistory-cloud #236 (draft). Proof service: `relay-transcript-proof`, `us-west-2`. Open: hosting and account (Q21). | K-39; 0002 Amendment 1 (draft) |
 | Transcript search, pre-T0 sessions | Legacy `ILIKE`/trigram, run on the frozen T0 child branch (K-6) | 0002; #226 currently fails it closed, which G3 must change |
 | Neon after T0 | `sessions` is fenced read-only. A child branch at the T0 LSN serves bounded fallback reads and the export. Cloud's `public` schema stays on Neon, so "Neon retirement" (A10) means retiring the `sessions` schema, **not** deleting the project. | switch-first I6 |
 
@@ -345,7 +350,8 @@ hold.
   is served by legacy transcript search on the frozen Neon T0 child branch.
 
 - **K-39** (2026-10-31, "ObsessionDB off the hot path"): one interface,
-  two adapters, and labelled partial fallback (below).
+  two adapters, and partial fallback (below). K-46 made the partial silent
+  to users.
 
 So after T0:
 - **Recent post-T0 sessions:** searched in the Supabase recent window.
@@ -359,7 +365,7 @@ So after T0:
  ingest → S3 (source of truth) ─┬─ pipeline stage ─► Supabase recent window (trigram/FTS, bounded)  ← Postgres adapter
                                 └─ async indexer ──► history store (full history; store-agnostic)  ← history adapter
  query → search interface ─┬─ Postgres adapter (recent window + metadata/summary) ─┐
-                           ├─ history adapter (budget 1.5 s, K-42)                  ├─► merge (G-T5) ─► response (+ partial label)
+                           ├─ history adapter (budget 1.5 s, K-42)                  ├─► merge (G-T5) ─► response (+ internal coverage metadata)
                            └─ Neon T0 child (pre-T0, until loaded; K-6)             ┘
 ```
 
@@ -486,12 +492,12 @@ proven on the phase 2 snapshot and with the live-protocol writer.
 | G-T0 | **History store: store-agnostic (K-39, K-40).** The candidates are ObsessionDB (intended, conditional, K-28), ClickHouse Cloud and Amazon OpenSearch Service, all in AWS `us-east-1` for production (K-33). The choice is made by **G-T0E** and section 10, applied the same way to every candidate. The 0001 and 0002 amendments are merged. | G-T0E evidence pack per candidate; Khaliq chooses and confirms the store; #233 updated |
 | G-T1 | **Async history indexer.** Pipeline normalized objects (the file-normalize / E4 stage) load into the history store per session revision, **off the hot path**: ingest never waits on it. It is idempotent by content hash, handles tombstones and resets, and has its own queue, DLQ and replay. Enabled before T0 (K-30). | Feed tests; replay from S3 rebuilds the store; indexer lag within SLO row 8b; an ingest test proves no ingest latency change when the indexer is stopped |
 | G-T1R | **Recent-window writer and adapter (K-39).** A pipeline stage writes scrubbed event text into the Supabase recent window (trigram/FTS), with the daily retention job and immediate tombstone/reset deletes. The Postgres adapter serves it plus metadata and summary search. | Migration plus RLS tests; retention-job tests; freshness within SLO row 8a with the history indexer stopped |
-| G-T1M | **Merge and labelled fallback (K-39, K-42).** Hosted queries both adapters (and the T0 child for pre-T0). The history adapter has a **hard 1.5 s budget** (K-42). On its error or timeout, the response returns the Postgres results (14-day window, complete text) labelled "partial: older history unavailable": never an unlabelled empty result, and never a 5xx for that case. | Fault-injection tests (history store down, slow past 1.5 s, erroring) and SLO rows 14 and 15 |
+| G-T1M | **Merge and silent-partial fallback (K-39, K-42, K-46).** Hosted queries both adapters (and the T0 child for pre-T0). The history adapter has a **hard 1.5 s budget**. On its error or timeout, the response returns the Postgres results (14-day window, complete text) **with no user-facing label in the UI or MCP text**, and never a 5xx for that case. An **internal coverage field** goes in the response metadata, for example `coverage: {history: "unavailable", reason: "timeout"}`, not rendered. It is also recorded in logs and metrics, with an alarm on the partial-response rate. | Fault-injection tests (history store down, slow past 1.5 s, erroring); UI and MCP snapshot tests showing no partial text; metric and alarm fire tests; SLO rows 14 and 15 |
 | G-T2 | **`search_shared_sessions` parity.** Same request contract: query length 1-500, filters, cursor, limit ≤20. Same response: event excerpts (`max_content`), `citation_url`, newest-first order. Same workspace confirmation that Cloud enforces. | The Cloud MCP contract tests pass unchanged against the new backend |
 | G-T3 | **`get_shared_session_context` in-session window.** For post-T0 sessions it reads that session's S3 objects and filters in the service, one session at a time (0002's surface table), so it **does not depend on the history store**. For pre-T0 sessions it uses the child branch. | Contract tests; window equality against legacy on the snapshot |
 | G-T4 | **Recall parity** against legacy on the frozen snapshot | The section 10 recall thresholds |
 | G-T5 | **Merge, ordering and dedup spec across adapters and T0**, written, reviewed and implemented (below) | Spec doc plus tests for straddling sessions, duplicate hits, paging across sources and one-source failure |
-| G-T6 | **Isolation and erasure.** Per-org isolation proven with planted canaries. Tombstone and reset propagation. Erasure semantics recorded (0002 open item; per-workspace encryption if the store supports it). | Zero cross-tenant rows; tombstone tests |
+| G-T6 | **Isolation and erasure (K-44, K-45).** **Isolation needs both layers:** application-layer scoping as the primary control (every adapter query is bound to org and workspace from the verified claims), plus a **DB row-policy backstop** on a per-tenant or scoped DB user, so the store itself refuses cross-tenant rows. Ask the vendor to enable row policies and user creation. **Erasure:** a logical delete (tombstone, reset, workspace erasure) hides rows **immediately**, and **physical purge is complete within 48 h**, including ObsessionDB's 24 h time travel. | Planted canaries: zero cross-tenant rows **with the app-layer filter deliberately removed** (proving the backstop) and through the app layer. Erasure tests: immediate invisibility; physical absence confirmed by 48 h, including after the time-travel window. |
 | G-T7 | **Recall consumers.** The memory-pack lexical and `files_touched` pools go through the search interface: recent window plus history adapter. | Consumer tests |
 | G-T8 | **Dashboard ranked search, keyword only (K-34 as narrowed by K-36).** `sessions?q=&ranking=hybrid` is served on the new stack for post-T0 sessions through the search interface: the recent window (Postgres trigram/FTS) merged with the history store's full-text over **complete transcripts**, with the same partial fallback. It fuses the remaining legacy keyword pools (`event_keyword`, `brief_keyword`) per the serving contract, with snippets ≤ 320 chars. There are **no vector pools before T0**. The response says which pools were offered, so the missing semantic pools are not reported as a failure. | Hybrid benchmark lane (section 10, SLO rows 12 and 13) **against legacy hybrid, semantic pools included**; the dashboard read-API contract tests pass |
 
@@ -518,8 +524,8 @@ not evidence.
 | # | Evidence item | How it is shown | ObsessionDB (expected) | ClickHouse Cloud (expected) | OpenSearch (expected) |
 | --- | --- | --- | --- | --- | --- |
 | E1 | Full-text and **substring** performance at production scale: legacy-style `%term%`, tokens, n-grams; common, selective and no-match terms; whale shape | p50/p95/p99 at 1/8/32 clients against section 10, on a synthetic corpus shaped by K-38 counts (scale M plus the whale shape at least) | dev service is functional only; scale needs vendor evidence or a later approved test | trial measures engine behaviour | **weaker on substring cost:** needs n-gram or wildcard fields, with index size and indexing cost to measure; trial measures it |
-| E2 | Tenant isolation (row policies, document-level security, or equivalent); a query credential cannot read another org | Planted cross-tenant canaries; zero rows on every path, including misconfigured-claim negatives | row policies | row policies | document-level security / per-tenant index or alias, via IAM / fine-grained access control |
-| E3 | Erasure and delete semantics, and the time to physical removal (merges, segments, snapshots) | Delete tests plus the documented window | to verify | to verify | delete-by-query plus the segment-merge and snapshot window |
+| E2 | Tenant isolation, **both layers (K-44):** application-layer scoping (primary), and a DB-level backstop through row policies on scoped users (document-level security on OpenSearch). The vendor must enable row policies and user creation. | Planted cross-tenant canaries: zero rows through the app path **and** with the app filter removed (backstop alone); misconfigured-claim negatives | row policies + user creation: **request from vendor** | row policies (native) | document-level security / fine-grained access control via IAM |
+| E3 | Erasure **SLA (K-45):** logical delete immediately; **physical purge within 48 h**, including time travel, merges, segments and snapshots | Delete tests; the documented and observed physical-removal time ≤ 48 h | 24 h time travel must fit inside 48 h; merge timing to verify | `ALTER … DELETE` or lightweight delete, plus merge timing | delete-by-query plus segment merge; snapshot retention ≤ 48 h or excluded |
 | E4 | IP allowlisting and **private networking** from the Worker or ingest path in `us-east-1` | Config on the production tier | vendor docs | PrivateLink (vendor) | **VPC domain plus IAM** (expected strong) |
 | E5 | SOC 2 Type II, encryption at rest and in transit, audit logs, DPA | Reports on file | vendor | vendor | **AWS compliance programmes** (expected strong) |
 | E6 | `us-east-1` availability of the production tier, with SLA | Confirmation | vendor | vendor | **native AWS region** (expected strong) |
@@ -564,10 +570,12 @@ approved scope, account and cap.
    extra hits are reported as additive in parity runs.
 6. **Partial results (K-39):**
    - **History store errors or exceeds its budget:** return the recent
-     window's results (plus the child's for pre-T0) with
-     `partial: "older_history_unavailable"`. This is never an unlabelled
-     empty result and never a 5xx.
-   - **Child branch down:** label `partial: "pre_t0_history_unavailable"`.
+     window's results (plus the child's for pre-T0) as a **silent partial**
+     (K-46). Users see no label in the UI or MCP text. The response
+     metadata carries the internal `coverage` field, and the case is logged,
+     metered and alarmed. It is never a 5xx.
+   - **Child branch down:** also a silent partial, with
+     `coverage.pre_t0 = "unavailable"`.
    - **Postgres adapter down:** this is the hot-path store, so search fails
      with a retryable 503. V1 metadata is in the same database and is down
      too.
@@ -648,15 +656,24 @@ variant, and adopted only with Khaliq's OK (it changes recall).
 | Failure | Dashboard ranked search | MCP `search_shared_sessions` | MCP `get_shared_session_context` | V1 metadata |
 | --- | --- | --- | --- | --- |
 | Semantic pools (none before T0, K-36) | Not offered. `pools_offered: ["event_keyword","brief_keyword"]`, and they are not counted as degraded. The UI labels the mode "Keyword search". | n/a | n/a | unaffected |
-| **History store errors or times out (1.5 s budget, K-42)** | Postgres results plus child results (pre-T0), banner **"Partial: older history unavailable"**. Never empty without that label, never 5xx. | Postgres results plus child results, `partial: "older_history_unavailable"`, plus a line in the tool's text output | unaffected (S3 read path for post-T0) | unaffected |
-| History indexer lagging (store up) | Recent sessions are covered by the window. No label unless lag exceeds the window. | same | unaffected | unaffected |
-| Child branch down or breaker open | Results without pre-T0 sessions, labelled "Partial: pre-cutover history unavailable" | `partial: "pre_t0_history_unavailable"` | for a pre-T0 session: retryable `503` | unaffected |
+| **History store errors or times out (1.5 s budget, K-42)** | Postgres results plus child results (pre-T0), **with no banner or label** (K-46). Internal `coverage.history = "unavailable"` in the response metadata, not rendered. Never 5xx. | Postgres results plus child results, **with no partial text in the tool output** (K-46). Internal `coverage` in the structured metadata only. | unaffected (S3 read path for post-T0) | unaffected |
+| History indexer lagging (store up) | Recent sessions are covered by the window. Internal `coverage.history_lag_s` is recorded; nothing is shown to users. | same | unaffected | unaffected |
+| Child branch down or breaker open | Results without pre-T0 sessions, **silent partial** (K-46), with internal `coverage.pre_t0 = "unavailable"` | same, with no partial text | for a pre-T0 session: retryable `503` (single-session read, not a search) | unaffected |
 | Supabase (Postgres adapter) down | Retryable 503 | Retryable 503 | Post-T0 sessions are still served from S3 if the pointer lookup is cached; otherwise 503 | down |
 | Whole request budget exceeded | `503 search_timeout` (legacy) | same | same | — |
 
-The new response fields (`partial`, `pools_offered`) need a Cloud MCP and
-dashboard schema change (P4). Nothing returns partial results without a
-label.
+The new metadata fields (`coverage`, `pools_offered`) need a Cloud MCP
+and dashboard schema change (P4). They are **metadata only and never
+rendered** (K-46).
+
+**Every partial response must:**
+- carry `coverage`;
+- emit a structured log line with codes only;
+- increment `search_partial_total{reason,surface}`.
+
+The partial-response-rate alarm is in section 13. The "Keyword search" mode
+label for the missing semantic pools describes the mode, not a
+degradation; whether to keep it is for Khaliq (Q28).
 
 **5. Federation across adapters and T0.** See the merge spec above (G-T5,
 items 1 to 8):
@@ -697,7 +714,7 @@ freshness is per pool, not per session.
   without user impact.
 - **After T0:** forward-only (K-22, section 11). The levers:
   - **turn the history adapter off.** Search then serves the recent window
-    plus the child, labelled partial (K-39);
+    plus the child, as a silent partial (K-39, K-46);
   - rebuild the history store from S3, on the chosen candidate or another one that passed G-T0E;
   - rebuild the recent window from S3 for the window period;
   - the G-F write freeze.
@@ -1000,7 +1017,7 @@ under 0002 are in **bold**.
 8. **Verify.** Run canaries for: login, ingest, delivery batch, turns,
    session list, V1 search, replay of a post-T0 session from S3, replay of a
    pre-T0 session through the child, transcript search through the child
-   (K-6), transcript search on a post-T0 session through the search interface, plus a forced history-store timeout returning a labelled partial (G-T, G-T1M),
+   (K-6), transcript search on a post-T0 session through the search interface, plus a forced history-store timeout returning a silent partial with internal coverage metadata and the metric incremented (G-T, G-T1M, K-46),
    a cross-T0 merged query (G-T5), brief, and a Cloud revision event (G-R1).
 
 **Abort.** Steps 2 to 6 can be aborted:
@@ -1066,7 +1083,15 @@ changes are made to it:
   concurrency figures.
 - **V1:** synthetic data on GitHub-runner Postgres only (#59). Its own
   agent-prefix gate is red at 1409× read amplification.
-- **The new transcript store:** none ("No benchmark has run", #233).
+- **The new transcript store:** relayhistory-cloud **#236** (draft: design
+  plus prototype, "transcript search on ObsessionDB, off the hot path").
+  Its numbers are **indicative only, not gate evidence**:
+  - local prototype at 10M events: p95 ≤ 105 ms;
+  - ObsessionDB free dev service: 200-470 ms (eu-central, functional tier);
+  - ClickHouse Cloud trial: 60-305 ms;
+  - **Postgres recent window, selective queries: 3.1 s p95.** This is a
+    **known gap being fixed**, and SLO row 15 (≤ 300 ms DB / ≤ 1 s end to
+    end) is red until it is.
 - **Recall and freshness:** none, on either side.
 
 **Data.**
@@ -1158,7 +1183,7 @@ pass.
 | 11 | Capacity | ≥ 30% CPU headroom on Supabase (including the recent window) and the history store; no temp-spill regression; Supavisor connections ≤ 70% of the pool |
 | 12 | **Hybrid relevance (G-T8)** | New nDCG@10 ≥ legacy nDCG@10 − 0.02 on the hybrid query set. Conceptual recall tasks hit at k=10 at least as often as legacy. *(Proposed here.)* |
 | 13 | **Hybrid latency and degradation (G-T8)** | p95 ≤ legacy hybrid p95, and ≤ 1.5 s end to end; p99 ≤ 3 s. Rate of `degradedPools` responses ≤ legacy. *(Proposed here.)* |
-| 14 | **Fallback (G-T1M)** | With the history store down, slow or erroring: **zero 5xx** for that case; 100% of responses labelled partial; p95 ≤ the Postgres-only p95 + the history budget; recall inside the window unchanged |
+| 14 | **Fallback (G-T1M, K-46)** | With the history store down, slow or erroring: **zero 5xx** for that case; **zero user-visible partial text** in the UI or MCP output; 100% of these responses carry internal `coverage` and increment the partial metric; the alarm fires; p95 ≤ the Postgres-only p95 + 1.5 s; recall inside the window unchanged |
 | 15 | **Postgres recent-window adapter alone** | p95 ≤ 300 ms DB / ≤ 1 s end to end at the chosen window length (largest org); recall@10 ≥ 95% against legacy for queries whose targets fall inside the window |
 
 Not measured, and not gating unless Khaliq adds them: dollar cost and
@@ -1262,7 +1287,7 @@ hosted backend. Build them before phase 3.
 | Supabase CPU, connections, temp, replication/PITR health | Supabase metrics | CPU > 70% for 15 min; connections > 70% of the pool |
 | S3 4xx/5xx and KMS throttling | CloudWatch (the bucket's account) | any `AccessDenied` from the Worker identity; KMS throttle > 0 |
 | History indexer lag, DLQ depth and load errors (G-T1) | indexer queue and store | lag p95 > 15 min; DLQ > 0 for 15 min |
-| History-adapter partial rate and timeouts (G-T1M) | Worker | partial responses > 1% for 10 min |
+| **Partial-response rate (K-46)**: `search_partial_total` / searches, by reason and surface; history-adapter timeouts | Worker metrics, from internal `coverage` | partial rate > 1% for 10 min (page); any partial rate above 0.1% sustained for 1 h (ticket) |
 | Recent-window writer lag, retention-job failures (G-T1R) | pipeline, Supabase | freshness p95 > 60 s; the retention job did not run in 26 h |
 | Cross-T0 merge degraded responses (G-T5) | Worker | any degraded marker for 5 min |
 | Write-freeze state (G-F) | Worker | any change without an approval record |
@@ -1281,11 +1306,11 @@ hosted backend. Build them before phase 3.
 | S3 | **Hosted search issuer key creation** | #116 creates the first key only at boot (`RELAYAUTH_SESSION_DIRECTORY_BOOTSTRAP_API_KEY`). Hosted RelayAuth is a Worker with no boot step. | G-H: a reviewed, one-shot, Khaliq-run path. Either an admin route that requires the existing bootstrap scope and is idempotent, or a reviewed D1 insert of a hashed key. Plus the signing key as a secret (if it is an SST secret, that is the six-place change in cloud `CLAUDE.md`). Plus the `current`/`next`/`previous` rotation runbook. Supabase trusts **only** this issuer. #116 has no OIDC discovery, and hosted Supabase may need it (#63 unknown: whether third-party tokens can carry a custom Postgres `role`). |
 | S4 | **Tenant isolation proof** | PGlite and real-PostgREST suites: #73, 52/52 locally on PostgREST 16.5. **The hosted Supabase PostgREST version is unconfirmed, and test 25 needs a hosted project and has not run.** | #73's suite against staging Supabase (hosted). P-7 cross-org and cross-workspace probes through the Worker's API. A leak scan of logs, traces and summaries for planted markers (#74 pattern). Zero cross-tenant rows. |
 | S5 | Worker S3 identity | Not created | Separate IAM identities per write role (raw and manifest; summary), plus read. Least-privilege prefixes like #75's pod roles. No `DeleteObject` except for the reviewed purge path. Stored as Worker secrets. A rotation runbook. CloudTrail data events on the bucket. |
-| S6 | S3 bucket hardening | Not created | SEC-08 items: TLS-only deny, lifecycle, explicit KMS key policy, per-workspace keys (P9) |
+| S6 | S3 bucket hardening | Not created | SEC-08 items: TLS-only deny, a lifecycle rule expiring noncurrent versions within the K-45 48 h purge SLA (for example 1 day, allowing for S3 lifecycle lag), explicit KMS key policy, per-workspace keys (P9) |
 | S7 | Supabase RLS and roles | Runtime role has BYPASSRLS (A1) | Only the documented exceptions (`machines`). The search RPC refuses without a policy row (#72). The service-role key is not in the Worker. |
 | S8 | Erasure path for the V1 projection | 0002 open item, deferred to sessionspipelinegrok | Recorded decision. A tombstone-driven row delete is tested. The Supabase backup and PITR retention is documented as the erasure tail. |
 | S9 | SEC-10 (workspace scoping) and SEC-11 (365-day service tokens) | Open | Decision recorded (K-24). The new read path must not widen either. |
-| S11 | ObsessionDB isolation and erasure (G-T6), `us-east-1` | Not provisioned | Per-org isolation proof. Tombstone and reset propagation. Least-privilege feed and query credentials. Erasure decision recorded. Store is TLS only and encrypted at rest. |
+| S11 | History-store isolation and erasure (G-T6), `us-east-1` | Not provisioned | **Both isolation layers (K-44)**: app-layer scoping plus DB row policies on scoped users, with vendor enablement of row policies and user creation requested. Tombstone and reset propagation. **Erasure SLA (K-45):** logical delete immediately, physical purge ≤ 48 h, including time travel. Least-privilege credentials. TLS only; encrypted at rest. |
 | S10 | Dependency CVEs on the History Worker | SEC-16: critical `tar`, high `axios` and `follow-redirects` | Bumped. For axios, avoid 1.20 under workerd. |
 
 ---
@@ -1335,9 +1360,12 @@ ids (A#) are shown where they apply.
 | K-36 | **Decided 2026-10-31: "No embeddings pre-T0"** (helm-chart-chief: directly approved). G-T8 is keyword-ranked; nDCG@10 against legacy hybrid is the gate. | — | — |
 | K-37 | Synthetic trials. **Approved 2026-10-31:** ClickHouse Cloud with a $50 hard cap, and the ObsessionDB free dev service (eu-central, functional only). Synthetic data only; not production provisioning. | — | delete the trial services |
 | K-38 | **Approved 2026-10-31:** counts-only, read-only shape extraction from production. No corpus movement. | — | n/a (read-only) |
-| K-39 | **Decided 2026-10-31: "ObsessionDB off the hot path".** Two adapters, async indexer, labelled partial fallback. | — | — |
+| K-39 | **Decided 2026-10-31: "ObsessionDB off the hot path".** Two adapters, async indexer, partial fallback (made silent by K-46). | — | — |
 | K-40 | **Decided 2026-10-31:** Amazon OpenSearch Service is a third history-store candidate. Synthetic-only trial approved in 500268966557 / `us-west-2`, about $50 cap. Not production provisioning. | — | delete the trial domain |
 | K-42 | **Decided 2026-10-31:** a 14-day window, complete event text, and a 1.5 s history-store budget. K-38 measured ~16.5 GB of text, 52-56 GB with indexes and ~70 GB at the peak rate. | — | the window can shrink or grow via retention and backfill from S3 |
+| K-44 | **Decided 2026-10-31:** app-layer isolation plus a DB row-policy backstop; the gate needs both. Asking the vendor to enable row policies and user creation is a vendor contact, so Khaliq or the account owner sends it. | — | — |
+| K-45 | **Decided 2026-10-31:** logical delete immediately, physical purge ≤ 48 h, including ObsessionDB's 24 h time travel | — | — |
+| K-46 | **Decided 2026-10-31:** silent partial results; internal coverage metadata, logs, metrics and alarm only | — | — |
 | K-43 | Apply the recent-window migration and RLS to Supabase, and enable the writer stage and retention job | — | drop the table, disable the stage |
 
 Read-only work needs no approval beyond normal access: catalog queries,
@@ -1380,6 +1408,17 @@ Read-only work needs no approval beyond normal access: catalog queries,
   are covered in section 17.
 - **Q17.** Resolved by K-34 and K-36: keyword-ranked dashboard search is in the T0 gate (G-T8).
 - **Q19, Q20:** moved to section 17.
+- **Q27.** The backup tails against the 48 h purge SLA (K-45):
+  - Supabase daily backups and PITR typically retain at least 7 days;
+  - Neon's child branch and snapshot are kept until A10;
+  - S3 noncurrent versions are covered by a ≤ 1-day lifecycle rule.
+
+  Do the backups fall under the 48 h SLA, or is the SLA for live stores
+  with documented backup expiry? If they fall under it, Supabase retention
+  must be ≤ 48 h, or erased rows must be excluded at restore.
+- **Q28.** Keep or drop the UI's "Keyword search" mode label (the semantic
+  pools are absent before T0). It is not a degradation label, but K-46's
+  intent may cover it.
 - **Q25.** The ~90 GB of acceptance and identity bookkeeping
   (`uploaded_support_identities`, `delivery_projection_acceptance`,
   `delivery_catalog_acceptance`, `delivery_receipts`): **move it to
@@ -1478,6 +1517,7 @@ Either way, adding embeddings is a new decision with its own approvals.
 - Uncommitted files on linuyc: `docs/relayhistory-cutover.md` and
   `docs/relayhistory-migration-status.md` (both 2026-10-29), and the local
   `docs/aws-stage.md` diff (Aurora wording).
+- relayhistory-cloud #236 (draft, head `380b756e`): transcript-search design and prototype (K-39 shape).
 - relayhistory-cloud `origin/main` `45d53b1`: `db/client.ts`,
   `lib/pipeline/*`, `docs/pipeline-summary-short.md`. PRs #211, #212, #213,
   #214, #216, #222, #223, #224, #225, #226, #227, #228, #231 and #233.

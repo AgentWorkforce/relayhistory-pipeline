@@ -46,8 +46,8 @@ This record is not that approval. Each of these needs it separately:
 capability and security evidence**: gate G-T0E in
 `docs/relayhistory-supabase-migration-plan.md`. That covers:
 - full-text and substring performance at scale;
-- tenant isolation via row policies;
-- erasure and delete semantics;
+- tenant isolation: app-layer primary plus a DB row-policy backstop (K-44);
+- erasure and delete semantics, meeting the 48 h physical-purge SLA (K-45);
 - IP allowlisting and private networking;
 - SOC 2 and security posture;
 - `us-east-1` availability;
@@ -78,7 +78,13 @@ relayed rulings as PROPOSED until Khaliq confirms them in its session. This text
     not the design.
   - Recent transcripts are also served from a bounded window in Supabase
     (0002 Amendment 1). If the store is unavailable, search returns those
-    results labelled partial.
+    results as a **silent partial**: no user-facing label, with internal
+    coverage metadata, metrics and an alarm (K-46).
+- **Isolation (K-44):** application-layer scoping is primary, with DB row
+  policies on scoped users as a backstop. Both are required, and the
+  vendor must enable row policies and user creation.
+- **Erasure (K-45):** a logical delete immediately, and physical purge
+  within 48 h, including ObsessionDB's 24 h time travel.
 - **ObsessionDB's role:**
   - lexical transcript search for the MCP tools (`search_shared_sessions`
     excerpts, the `get_shared_session_context` window);

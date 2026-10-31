@@ -139,14 +139,20 @@ pgvector in Supabase.
   - A daily job deletes every row older than the window.
   - The retention job's success is alarmed: it must have run within 26 h.
   - Rows are rebuildable from S3, so the window can be shrunk or regrown.
-- **Erasure:**
-  - Tombstones, session resets and workspace erasure delete matching rows
-    immediately, through the same tombstone path as the V1 projection.
+- **Erasure SLA (K-45, Khaliq, 2026-10-31):** a **logical delete
+  immediately**, and **physical purge within 48 h**, in every store that
+  holds transcript text (this window, the history store including
+  ObsessionDB's 24 h time travel, and S3 noncurrent versions).
+  - Tombstones, session resets and workspace erasure delete or hide
+    matching rows immediately, through the same tombstone path as the V1
+    projection. Vacuum and the S3 lifecycle complete physical removal
+    within 48 h.
   - KMS crypto-shredding covers only S3. In Supabase, erasure is by row
     deletion.
-  - Supabase backups and PITR then age out within Supabase's retention, so
-    the backup/PITR retention period **is the erasure tail** and must be
-    documented with the plan tier (plan Q3).
+  - Supabase backups and PITR age out within Supabase's retention, which
+    is typically at least 7 days. **Whether backups fall under the 48 h SLA
+    is open (plan Q27).** Until it is decided, the backup retention period
+    is documented as the backup erasure tail.
 - **Disk:** the Supabase disk sizing for the window is part of K-32.
 
 ### Still needs Khaliq's explicit OK for each exact action
