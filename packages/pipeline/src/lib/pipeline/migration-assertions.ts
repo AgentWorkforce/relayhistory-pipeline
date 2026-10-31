@@ -380,7 +380,18 @@ export async function derivePlanEntry(
   manifest: Pick<ManifestV1, "session" | "raw">,
 ): Promise<PlanEntry | undefined> {
   const tenancy = signedTenancy(auth);
-  if (!tenancy) return undefined;
+  return tenancy && planEntryFor(tenancy, location, manifest);
+}
+
+/** The plan entry of a manifest under a known tenancy. */
+export async function planEntryFor(
+  tenancy: Pick<
+    UploadIdentity,
+    "grant_id" | "org_id" | "workspace_id" | "source_user_id"
+  >,
+  location: Parameters<typeof sessionManifestKey>[0],
+  manifest: Pick<ManifestV1, "session" | "raw">,
+): Promise<PlanEntry | undefined> {
   const raw = manifest.raw;
   const content = await computeContentSha256(raw.chunks);
   if (content !== raw.content_sha256 || raw.chunks.length !== raw.chunk_count)

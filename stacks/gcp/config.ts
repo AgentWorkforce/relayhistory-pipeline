@@ -90,7 +90,12 @@ export const GCP_RUNTIME_SHAPE = {
   autopilot: false,
   nodeLocation: "us-central1-a",
   machineType: "e2-medium",
-  initialNodeCount: 1,
+  // One e2-medium exposes only ~940m allocatable CPU after GKE reservations;
+  // system pods plus RelayAuth consume ~921m before the 96Bulls release starts.
+  // Each additional node also carries GKE DaemonSet reservations, so three
+  // nodes are the minimum shape that can schedule the migration and four
+  // runtime Deployments together.
+  initialNodeCount: 3,
   natIpAllocateOption: "MANUAL_ONLY",
   natLogFilter: "ALL",
   nodeOauthScope: "https://www.googleapis.com/auth/cloud-platform",
@@ -226,6 +231,8 @@ export interface GcpInputs {
     relayauthJwksUrl: string;
     /** Exact token issuer: public HTTPS or the in-cluster RelayAuth service origin. */
     relayauthIssuer: string;
+    /** Exact History origin placed in RelayAuth assertion audiences and enforced by AlleyOop. */
+    relayhistoryOrigin: string;
   };
 }
 
@@ -399,6 +406,7 @@ export function assertGcpInputs(
       throw new Error("96bulls: bulls96.imageSourceRevision must be a full Git commit SHA");
     requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", inputs.bulls96.relayauthJwksUrl);
     requireRelayauthIssuer("bulls96.relayauthIssuer", inputs.bulls96.relayauthIssuer);
+    requireRelayhistoryOrigin("bulls96.relayhistoryOrigin", inputs.bulls96.relayhistoryOrigin);
     if (inputs.relayauth?.baseUrl && inputs.bulls96.relayauthIssuer !== inputs.relayauth.baseUrl)
       throw new Error("96bulls: bulls96.relayauthIssuer must match relayauth.baseUrl for the in-stage RelayAuth release");
     if (requestedCommand !== "destroy" && stage !== GCP_APPLICATION_PROOF_STAGE)
@@ -484,6 +492,10 @@ export function relayauthChartValues(i: RelayAuthChartInputs, defaultStorageClas
   return {
     replicaCount: 1,
     existingSecret: i.existingSecretName,
+    // The conformance History origin is an in-cluster HTTP service. RelayAuth
+    // remains fail-closed for public HTTP origins; this chart switch permits
+    // only its private/internal-host validation path.
+    relayhistory: { allowPrivateHttpOrigin: true },
     ...(i.baseUrl ? { baseUrl: i.baseUrl, issuer: i.baseUrl } : {}),
     persistence: { storageClass: i.storageClass ?? defaultStorageClass },
     jwksIngress: i.baseUrl
@@ -579,6 +591,36 @@ function requireRelayauthIssuer(label: string, value: string): void {
   ) throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster RelayAuth origin`);
 }
 
+function requireRelayhistoryOrigin(label: string, value: string): void {
+  let origin: URL;
+  try {
+    origin = new URL(value);
+  } catch {
+    throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster Kubernetes origin`);
+  }
+  const hostname = origin.hostname.replace(/\.$/, "").toLowerCase();
+  const inCluster =
+    origin.protocol === "http:" &&
+    /^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?\.svc(?:\.cluster\.local)?$/.test(hostname);
+  const publicHttps =
+    origin.protocol === "https:" &&
+    hostname.includes(".") &&
+    hostname !== "localhost" &&
+    !hostname.endsWith(".localhost") &&
+    !hostname.endsWith(".local") &&
+    isIP(hostname) === 0;
+  const canonical = value.replace(/\/$/, "").toLowerCase() === origin.origin;
+  if (
+    origin.username ||
+    origin.password ||
+    (!inCluster && !publicHttps) ||
+    !canonical ||
+    origin.pathname !== "/" ||
+    origin.search ||
+    origin.hash
+  ) throw new Error(`96bulls: ${label} must be a public HTTPS or in-cluster Kubernetes origin`);
+}
+
 function plainSetting(label: string, value: unknown): void {
   if (typeof value !== "string") return;
   if (value.includes("://") || value.includes("@") || value.includes("BEGIN "))
@@ -617,6 +659,7 @@ export function bulls96ReleaseValues(
   const redisPort = typeof managed.redisPort === "number" ? String(managed.redisPort) : managed.redisPort;
   requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", i.relayauthJwksUrl);
   requireRelayauthIssuer("bulls96.relayauthIssuer", i.relayauthIssuer);
+  requireRelayhistoryOrigin("bulls96.relayhistoryOrigin", i.relayhistoryOrigin);
   const identity = { "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail };
   const dataEnv = () => [
     { name: "LOCKER_PROVIDER", value: "gcs" },
@@ -667,7 +710,14 @@ export function bulls96ReleaseValues(
       auth: { jwksUrl: i.relayauthJwksUrl, issuer: i.relayauthIssuer },
       serviceAccount: { annotations: { ...identity } },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
-      extraEnv: dataEnv(),
+      extraEnv: [
+        ...dataEnv(),
+        // This enables the RelayAuth JWT verifier, not the legacy audience:
+        // RELAYHISTORY_ORIGIN below makes the verifier accept only the
+        // dedicated origin-bound assertion class by default.
+        { name: "ALLOW_INTERIM_RELAYAUTH_BEARER", value: "true" },
+        { name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin },
+      ],
     },
     hoopdb: { enabled: false },
     locker: { enabled: false },
