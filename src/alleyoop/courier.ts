@@ -35,6 +35,7 @@ import { errorFields, log } from "../shared/log.ts";
 import { flushTelemetry, initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { EXT } from "../shared/enrich.ts";
 import {
+  CloudSessionAssertionProvider,
   fixedBearerToken,
   mintedBearerToken,
   RelayAuthAssertionProvider,
@@ -135,6 +136,8 @@ export interface CourierConfig {
   harnesses?: string[];
   closeAfterMinutes: number;
   startMode: "all" | "new";
+  /** Tokens carry `meta.machineId`, so `machineId` is an identity, not a label. */
+  machineBound?: boolean;
   /** Format of new sessions; a stored manifest's format always wins. Default `jsonl`. */
   format?: RawFormat;
   /** Process-local startup checks: persisted upload state is reconciled once, not every pass. */
@@ -149,7 +152,15 @@ export function configFromEnv(): CourierConfig {
   const startMode = optional("COURIER_START_MODE", "new");
   if (startMode !== "all" && startMode !== "new") throw new Error("96bulls: COURIER_START_MODE must be all or new");
   let token: BearerTokenProvider;
-  if (process.env.RELAYAUTH_URL) {
+  const cloudSession = !!process.env.CLOUD_URL;
+  if (cloudSession) {
+    token = new CloudSessionAssertionProvider({
+      baseUrl: required("CLOUD_URL"),
+      workspaceId,
+      machineId: required("MACHINE_ID"),
+      cloudToken: secretCommand(required("CLOUD_TOKEN_COMMAND_JSON")),
+    });
+  } else if (process.env.RELAYAUTH_URL) {
     token = new RelayAuthAssertionProvider({
       baseUrl: required("RELAYAUTH_URL"),
       historyOrigin: required("RELAYAUTH_HISTORY_ORIGIN"),
@@ -186,6 +197,7 @@ export function configFromEnv(): CourierConfig {
     workspaceId,
     userId,
     ...(process.env.MACHINE_ID ? { machineId: process.env.MACHINE_ID } : {}),
+    ...(cloudSession ? { machineBound: true } : {}),
     ...(process.env.HARNESSES ? { harnesses: process.env.HARNESSES.split(",").map((s) => s.trim()).filter(Boolean) } : {}),
     closeAfterMinutes: integer("COURIER_CLOSE_AFTER_MINUTES", 30),
     startMode,
@@ -345,6 +357,10 @@ const blankUpload = () => ({
 
 export async function runCourierOnce(cfg: CourierConfig): Promise<{ sessions: number; uploaded: number; chunks: number; conditions: CourierCondition[] }> {
   const state = await loadState(cfg.statePath, cfg.machineId, cfg.startMode);
+  // Every key and writer embeds the state's id, and a bound token only matches
+  // the claimed one, so continuing would fail each session forever.
+  if (cfg.machineBound && state.machine_id !== cfg.machineId)
+    throw Object.assign(new Error("96bulls: the state's machine id is not the claimed MACHINE_ID"), { code: "machine_id_mismatch", retryable: false });
   const discovered = await readSessions(cfg.dbPath, cfg.harnesses);
   const rows = sessionsForStartMode(discovered, cfg.startMode, state.enrolled_at);
   const verified = (cfg.verifiedManifests ??= new Set());

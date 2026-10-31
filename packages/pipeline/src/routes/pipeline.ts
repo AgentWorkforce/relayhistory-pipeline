@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { createMiddleware } from "hono/factory";
 import type { AppContext, AppEnv, Bindings } from "../env.js";
 import { getAuth, requireScope } from "../middleware/auth.js";
 import { loggerEnvFromBindings } from "../lib/logger.js";
@@ -25,7 +26,22 @@ import {
   type TraceContext,
   type TraceScope,
   type StageMessage,
+  type ObjectLandedPayload,
 } from "../lib/pipeline/index.js";
+import {
+  MAX_PLAN_ENTRY_BYTES,
+  migrationChunkMatches,
+  migrationGrantAllowed,
+  migrationManifestProvenance,
+  migrationPairAuthorized,
+  migrationSessionMatches,
+  migrationUploadMatches,
+  migrationWorkKey,
+  PLAN_ENTRY_LENGTH_HEADER,
+  type MigrationAssertionLedger,
+  type MigrationChunkResult,
+} from "../lib/pipeline/migration-assertions.js";
+import { sha256Hex } from "../../../object-store/src/crypto.js";
 import {
   buildObjectLandedMessage,
   manifestReaderFromEnv,
@@ -80,6 +96,12 @@ export interface PipelineRouteDeps {
     stage: PipelineStage,
     message: StageMessage,
   ): Promise<void>;
+  /**
+   * Single-use ledger for RelayAuth migration assertions. It also performs a
+   * migration commit's enqueue, in the same transaction as the consumption,
+   * in place of `send`. Absent: migration assertions are refused (503).
+   */
+  migrationLedger?(env: Bindings): MigrationAssertionLedger | undefined;
 }
 
 const defaultDeps: PipelineRouteDeps = {
@@ -92,7 +114,7 @@ const defaultDeps: PipelineRouteDeps = {
 
 function error(
   c: AppContext,
-  status: 400 | 401 | 403 | 404 | 413 | 503,
+  status: 400 | 401 | 403 | 404 | 409 | 413 | 503,
   code: string,
   message: string,
 ) {
@@ -189,6 +211,101 @@ export function recordRequestStage(
 
 export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
   const routes = new Hono<AppEnv>();
+
+  /**
+   * Admission for a RelayAuth migration assertion, ahead of any route work:
+   * a configured ledger (else 503), the signed pair (`wks`, `sponsorId`)
+   * equal to the grant pair (`meta.workspaceId`, `meta.sourceUserId`) (else
+   * 403 `migration_workspace_forbidden`), and an assertion not yet consumed
+   * (else 409). The handlers then check the upload's target workspace and,
+   * at the manifest commit, the plan digest. Ordinary tokens pass through.
+   */
+  const migrationAdmission = createMiddleware<AppEnv>(async (c, next) => {
+    const auth = getAuth(c);
+    if (!auth.migration) return next();
+    const env = c.env ?? {};
+    const ledger = deps.migrationLedger?.(env);
+    if (!ledger) return ledgerUnavailable(c);
+    if (!migrationPairAuthorized(auth)) return workspaceForbidden(c);
+    if (!migrationGrantAllowed(env, auth.migration)) return grantForbidden(c);
+    // Status: only the signed upload's own manifest key.
+    if (c.req.path.endsWith("/pipeline/manifests/status")) {
+      const location = parseSessionKey(c.req.query("key") ?? "");
+      if (
+        !location ||
+        location.rest !== "manifest.json" ||
+        !migrationSessionMatches(auth, location)
+      )
+        return uploadForbidden(c);
+    }
+    let consumed: boolean;
+    try {
+      consumed = await ledger.consumed(auth.migration);
+    } catch {
+      return ledgerUnavailable(c);
+    }
+    if (consumed) return replayed(c);
+    await next();
+  });
+  // The only routes a migration assertion reaches (requireAuth refuses it on
+  // every other one). Registered ahead of the handlers, so it runs first.
+  routes.use("/pipeline/chunks", migrationAdmission);
+  routes.use("/pipeline/manifests", migrationAdmission);
+  routes.use("/pipeline/manifests/status", migrationAdmission);
+
+  function storageReadRequired(c: AppContext) {
+    return error(
+      c,
+      503,
+      "migration_storage_read_required",
+      "A migration commit needs the server to read the manifest from object storage",
+    );
+  }
+
+  function uploadForbidden(c: AppContext) {
+    return error(
+      c,
+      403,
+      "migration_upload_forbidden",
+      "The upload is not the one this migration assertion's signed upload identity names",
+    );
+  }
+
+  function grantForbidden(c: AppContext) {
+    return error(
+      c,
+      403,
+      "migration_grant_forbidden",
+      "The migration assertion's grant is not accepted here, or its plan is not that grant's plan",
+    );
+  }
+
+  function workspaceForbidden(c: AppContext) {
+    return error(
+      c,
+      403,
+      "migration_workspace_forbidden",
+      "The upload's workspace and user are not the pair this migration assertion was signed for",
+    );
+  }
+
+  function ledgerUnavailable(c: AppContext) {
+    return error(
+      c,
+      503,
+      "migration_ledger_unavailable",
+      "The migration assertion ledger is not configured or not available",
+    );
+  }
+
+  function replayed(c: AppContext) {
+    return error(
+      c,
+      409,
+      "migration_assertion_replayed",
+      "This migration assertion was already used; retry with a fresh assertion",
+    );
+  }
 
   /** "Did my upload land?": every recorded stage of one trace, plus a verdict. */
   routes.get(
@@ -418,10 +535,68 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     }
     if (built.status !== "enqueue")
       return error(c, 400, "bad_request", "key is not a manifest");
-    try {
-      await deps.send(env, OBJECT_LANDED_STAGE, built.message);
-    } catch {
-      return error(c, 503, "not_configured", "Pipeline queue is not available");
+    const auth = getAuth(c);
+    if (auth.migration) {
+      // The target (key and manifest workspace, resolved user) must be the
+      // signed grant pair, and the manifest must commit to the signed plan.
+      if (
+        !migrationPairAuthorized(auth, {
+          workspaceIds: [location.workspaceId, manifest.session.workspace_id],
+        })
+      )
+        return workspaceForbidden(c);
+      // The signed upload identity, recomputed from this key, the manifest's
+      // session and chunk list, and the content hash chain over it.
+      if (!(await migrationUploadMatches(auth, location, manifest)))
+        return uploadForbidden(c);
+      if (migrationManifestProvenance(auth, manifest))
+        return uploadForbidden(c);
+      // The manifest must be the copy the server read from storage (the one
+      // just verified); the work key is then derived from signed fields only.
+      if (!reader) return storageReadRequired(c);
+      built.message.workKey = migrationWorkKey(auth.migration.upload);
+      (built.message.payload as ObjectLandedPayload).migration = {
+        key: auth.migration.upload.key,
+        entry_sha256: auth.migration.upload.entry_sha256,
+      };
+      // The commit's only durable write is the enqueue: the ledger consumes the
+      // assertion and enqueues as one unit, so neither lands without the other.
+      // A failure leaves nothing consumed, and the upload may be retried.
+      const ledger = deps.migrationLedger?.(env);
+      if (!ledger) return ledgerUnavailable(c);
+      let outcome: "consumed" | "replayed" | "grant_mismatch";
+      try {
+        outcome = await ledger.consume(
+          {
+            jti: auth.migration.jti,
+            nonce: auth.migration.nonce,
+            grantId: auth.migration.grantId,
+            planDigest: auth.migration.planDigest,
+            planEntryDigest: auth.migration.upload.entry_sha256,
+            expiresAt: auth.migration.expiresAt,
+            orgId: scope.orgId,
+            workspaceId: scope.workspaceId,
+            userId: auth.userId,
+          },
+          OBJECT_LANDED_STAGE,
+          built.message,
+        );
+      } catch {
+        return ledgerUnavailable(c);
+      }
+      if (outcome === "replayed") return replayed(c);
+      if (outcome === "grant_mismatch") return grantForbidden(c);
+    } else {
+      try {
+        await deps.send(env, OBJECT_LANDED_STAGE, built.message);
+      } catch {
+        return error(
+          c,
+          503,
+          "not_configured",
+          "Pipeline queue is not available",
+        );
+      }
     }
     return c.json(
       {
@@ -485,13 +660,78 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     // ownership, and with no org mapping configured the write fails closed.
     const owned = await callerOwnsLocation(c, location);
     if (owned !== true) return owned;
+    const chunkAuth = getAuth(c);
+    const migration = chunkAuth.migration;
+    // The chunk's session key, machine and date must be the signed upload's,
+    // before the first write (fresh keys included).
+    if (migration && !migrationSessionMatches(chunkAuth, location))
+      return uploadForbidden(c);
+    // A migration chunk carries its signed plan entry in front of the bytes.
+    const entryLength = migration
+      ? Number(c.req.header(PLAN_ENTRY_LENGTH_HEADER) ?? NaN)
+      : 0;
+    if (
+      migration &&
+      (!Number.isSafeInteger(entryLength) ||
+        entryLength < 2 ||
+        entryLength > MAX_PLAN_ENTRY_BYTES)
+    )
+      return uploadForbidden(c);
+    const limit = MAX_CHUNK_BYTES + entryLength;
     const declared = Number(c.req.header("content-length") ?? NaN);
-    if (declared > MAX_CHUNK_BYTES)
+    if (declared > limit)
       return error(c, 413, "too_large", "chunk exceeds the size limit");
     // Bounded while reading: the declared length may be absent or wrong.
-    const source = await readCapped(c.req.raw.body, MAX_CHUNK_BYTES);
-    if (!source)
+    const body = await readCapped(c.req.raw.body, limit);
+    if (!body || body.byteLength - entryLength > MAX_CHUNK_BYTES)
       return error(c, 413, "too_large", "chunk exceeds the size limit");
+    if (migration && body.byteLength <= entryLength) return uploadForbidden(c);
+    const source = migration ? body.subarray(entryLength) : body;
+    if (migration) {
+      // Before anything is stored: the carried entry is the signed one, and
+      // this chunk (seq, epoch, offset, size, digest of these bytes) is one
+      // of its chunks; so seq < the entry's chunk count.
+      const entryText = new TextDecoder().decode(body.subarray(0, entryLength));
+      if (
+        !(await migrationChunkMatches(
+          chunkAuth,
+          location,
+          { seq, epoch, startOffset, bytes: source },
+          entryText,
+        ))
+      )
+        return uploadForbidden(c);
+      // At most one chunk per (assertion, seq): a repeat is idempotent, any
+      // other chunk at this seq is refused; and a strict per-assertion cap.
+      let held: MigrationChunkResult;
+      try {
+        const ledger = deps.migrationLedger?.(env);
+        if (!ledger) return ledgerUnavailable(c);
+        held = await ledger.reserveChunk({
+          jti: migration.jti,
+          seq,
+          startOffset,
+          sha256: await sha256Hex(source),
+          expiresAt: migration.expiresAt,
+        });
+      } catch {
+        return ledgerUnavailable(c);
+      }
+      if (held === "conflict")
+        return error(
+          c,
+          409,
+          "migration_chunk_conflict",
+          "Another chunk was already written at this seq under this migration assertion",
+        );
+      if (held === "limit")
+        return error(
+          c,
+          403,
+          "migration_chunk_limit",
+          "This migration assertion reached its chunk limit; mint a fresh one",
+        );
+    }
     const traceId = c.req.header("X-Relay-Trace-Id");
     try {
       const sealed = await sealRawChunk(raw.store, {
@@ -552,6 +792,12 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
   ) {
     const scope = pipelineScope(c);
     const env = c.env ?? {};
+    const auth = getAuth(c);
+    if (
+      auth.migration &&
+      !migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId] })
+    )
+      return workspaceForbidden(c);
     if (
       location.workspaceId !== scope.workspaceId ||
       !prefixAllowed(env, location.prefix, scope.orgId)
