@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { newCtx, transcriptSearch } from "../checks.ts";
 import { defaultConfig, validateConfig, type ProofConfig } from "../config.ts";
 import { Runner } from "../exec.ts";
-import { fenceFor } from "../fence.ts";
+import { PROOF_FENCE } from "../fence.ts";
+
+// Tests only: the proof fence plus the fake transcript host. Production code never widens the fence.
+const TEST_FENCE = { ...PROOF_FENCE, hosts: new Set([...PROOF_FENCE.hosts, "abc.us-west-2.aws.clickhouse.cloud"]) };
 import { PROOF_ACCOUNT_ID, PROOF_CLUSTER } from "../guard.ts";
 import { tenantKey, type Tenant } from "../leak-scan.ts";
 import { buildReport } from "../report.ts";
@@ -35,7 +38,7 @@ function fakeBackend(enforceTenancy: boolean): TranscriptBackend & { rows: Array
 }
 
 async function run(cfg: ProofConfig, backend?: TranscriptBackend, mode: "live" | "dry-run" = "live") {
-  const ctx = newCtx(cfg, new Runner({ mode, identity, print: () => {}, fence: fenceFor(cfg) }), "aws-proof-test-run-0001", {});
+  const ctx = newCtx(cfg, new Runner({ mode, identity, print: () => {}, fence: TEST_FENCE }), "aws-proof-test-run-0001", {});
   ctx.print = () => {};
   if (backend) ctx.transcriptBackend = backend;
   return { ctx, result: await transcriptSearch(ctx) };
@@ -96,7 +99,8 @@ describe("transcript backend config and labels", () => {
     expect(validateTranscriptConfig({ ...configured().transcriptSearch, endpoint: "http://plain" })).toContain("transcriptSearch.endpoint must be https");
     expect(validateTranscriptConfig({ ...configured().transcriptSearch, table: "t; DROP" })).toContain("transcriptSearch database/table must be plain identifiers");
     expect(validateTranscriptConfig({ ...configured().transcriptSearch, credentials: { tenants: "user:pw" } }).length).toBeGreaterThan(0);
-    expect(validateConfig(configured())).toEqual([]);
+    // The fake host is not in the hardcoded allowlist, so the real config validator refuses it.
+    expect(validateConfig(configured()).some((i) => i.includes("not an allowlisted proof transcript host"))).toBe(true);
   });
   test("credentialsFromEnv reads only the named variables and reports them as run secrets", () => {
     const a = { orgId: "org_proof_a", workspaceId: "default" };

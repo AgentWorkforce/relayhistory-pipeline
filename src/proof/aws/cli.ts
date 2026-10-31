@@ -31,11 +31,11 @@ import { uuidv7 } from "../../shared/ids.ts";
 import { CHECKS, newCtx } from "./checks.ts";
 import { loadConfig, validateConfig, type ProofConfig } from "./config.ts";
 import { Runner } from "./exec.ts";
-import { fenceFor } from "./fence.ts";
-import { assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, type Identity, type Mode } from "./guard.ts";
+import { fenceFor, PROOF_REGION } from "./fence.ts";
+import { assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, type Identity, type Mode } from "./guard.ts";
 import { allCanaries } from "./corpus.ts";
 import { backendLabel } from "./transcript.ts";
-import { buildReport, CHECK_IDS, mergeReports, sha256, validateReport, type CheckId, type CheckResult, type ProofReport } from "./report.ts";
+import { buildReport, canonicalReportBytes, CHECK_IDS, mergeReports, validateReport, type CheckId, type CheckResult, type ProofReport } from "./report.ts";
 
 const ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 
@@ -141,21 +141,25 @@ export async function main(argv: readonly string[], env: Record<string, string |
     }
   }
   // The prior report is read and validated before anything runs, so a bad merge input never costs a live run.
-  let prior: { report: ProofReport; sha256: string } | undefined;
+  let prior: { bytes: string; report: ProofReport } | undefined;
   if (args.priorReport) {
+    if (args.mode !== "live") {
+      console.error("aws-proof: --prior-report merges live runs only (needs --confirm-live without --read-only)");
+      return 2;
+    }
     try {
-      const text = readFileSync(args.priorReport, "utf8");
-      const report = JSON.parse(text) as ProofReport;
+      const bytes = readFileSync(args.priorReport, "utf8");
+      const report = JSON.parse(bytes) as ProofReport;
       const bad = validateReport(report);
       if (bad.length) throw new Error(bad[0]);
-      prior = { report, sha256: sha256(text) };
+      prior = { bytes, report };
     } catch (e) {
       console.error(`aws-proof: --prior-report unusable: ${(e as Error).message}`);
       return 2;
     }
   }
   const runId = `aws-proof-${uuidv7()}`;
-  const runner = new Runner({ mode: args.mode, identity: { ...identity, confirmLive: args.confirmLive }, fence: fenceFor(cfg) });
+  const runner = new Runner({ mode: args.mode, identity: { ...identity, confirmLive: args.confirmLive }, fence: fenceFor(args.target) });
   const ctx = newCtx(cfg, runner, runId, env);
   console.log(`aws-proof ${runId}: mode=${args.mode} target=${args.target} context=${cfg.kubeContext} checks=${args.checks.join(",")}`);
   if (args.mode === "dry-run") console.log("DRY RUN: nothing below runs. MUTATE* steps need --confirm-live and Khaliq's direct OK.");
@@ -176,13 +180,13 @@ export async function main(argv: readonly string[], env: Record<string, string |
   const own = buildReport({ runId, mode: args.mode, backends: { metadata: exercised(metadataBackend), transcript: exercised(transcriptBackend) }, target: { stage: cfg.stage, clusterName: cfg.clusterName, kubeContext: cfg.kubeContext, region: cfg.region, ...(identity.accountId ? { accountId: identity.accountId } : {}) }, checks: results });
   let report = own;
   if (prior) {
-    const merged = mergeReports(prior.report, prior.sha256, own);
+    const merged = mergeReports(prior.bytes, own, { accountId: PROOF_ACCOUNT_ID, region: PROOF_REGION });
     if ("error" in merged) {
       console.error(`aws-proof: cannot merge --prior-report: ${merged.error}`);
       return 2;
     }
     report = merged.report;
-    console.log(`merged prior report ${prior.report.runId} (sha256 ${prior.sha256.slice(0, 12)}…); verdict covers ${report.phases.length} phase(s)`);
+    console.log(`merged prior report ${prior.report.runId} (sha256 ${report.phases[0]!.reportSha256}); verdict covers ${report.phases.length} phase(s)`);
   }
   const problems = validateReport(report, { canaries: allCanaries(ctx.corpus), secrets: ctx.secrets });
   const dir = args.out ?? join(ROOT, ".96bulls/aws-proof", runId);
@@ -192,7 +196,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
     console.error(`aws-proof: report failed validation; not written:\n  ${problems.join("\n  ")}`);
     return 1;
   }
-  writeFileSync(join(dir, "report.json"), JSON.stringify(report, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(join(dir, "report.json"), canonicalReportBytes(report), { mode: 0o600 });
   console.log(`\n${report.scope.reason}`);
   console.log(`search gates: metadata=${report.searchGates.metadata.backend}; transcript=${report.searchGates.transcript.backend}`);
   console.log(`verdict: ${report.verdict.toUpperCase()}  (${report.checks.map((r) => `${r.check}=${r.status}`).join(" ")})`);

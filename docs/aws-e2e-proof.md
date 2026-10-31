@@ -46,31 +46,49 @@ the following:
   `sessions-dev`, `hosted` or `live` as a segment is refused.
 
 **The target fence** (`src/proof/aws/fence.ts`) checks *what* each step
-touches, not just who runs it. It applies twice:
+touches, not just who runs it. Every allowed target is hardcoded there for the
+aws-proof stage, and nothing in the fence is derived from `inputs.json`.
+Changing a target means a reviewed code change to `fence.ts`.
 
-- **On the config, before anything is planned.** The values must be the proof
-  stage's own:
-  - ingest host `proof-sessions.agentrelay.com`, and origin
-    `https://proof-sessions.agentrelay.com`;
-  - Locker bucket `96bulls-aws-proof-locker-500268966557`, and any backup bucket
-    `96bulls-aws-proof-<name>-500268966557`;
-  - release `96bulls` and the AgentWorkforce chart repository;
-  - namespaces from the fixed set that `stacks/aws` creates (`96bulls`,
-    `relayauth`, `relaycast`, `cnpg-system`);
-  - deployments that belong to the `96bulls` release;
-  - a transcript database whose name starts with `proof`.
+| Target | Allowed value |
+| --- | --- |
+| account and region | `500268966557`, `us-west-2` |
+| kube context | `arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-proof` |
+| ingest host and origin | `proof-sessions.agentrelay.com`, `https://proof-sessions.agentrelay.com` |
+| buckets | `96bulls-aws-proof-locker-500268966557`, `96bulls-aws-proof-hoopdb-backups-500268966557` |
+| release and chart repo | `96bulls`, `https://AgentWorkforce.github.io/helm-charts` |
+| namespaces | `96bulls`, `relayauth`, `relaycast`, `cnpg-system` |
+| namespaces a delete may name | `96bulls`, `relaycast` |
+| services | `96bulls-alleyoop`, `relayauth`, `relaycast` |
+| deployments | the four `96bulls-*` core deployments, `relayauth`, `relaycast` |
+| CNPG clusters | `hoopdb`, `hoopdb-restore-proof` |
+| psql databases | `hoopdb` |
+| transcript backend | `PROOF_TRANSCRIPT_HOSTS` (empty), table `proof.transcripts` |
 
-  The config is also rejected if any string in it is production- or
-  shared-shaped (`prod`, `production`, `sessions-prod`, `sessions-dev`,
-  `staging`, `hosted`), or if any URL carries userinfo (`https://user:pass@host`).
-  This applies even inside the proof account.
+The transcript host list is empty until the synthetic ClickHouse Cloud host is
+added in a reviewed commit, so until then the transcript gate is refused and the
+proof stays INCOMPLETE.
+
+The fence applies twice:
+
+- **On the config.** Every target field must equal its constant. The config is
+  also refused if any string in it is production- or shared-shaped (`prod`,
+  `production`, `sessions-prod`, `sessions-dev`, `staging`, `hosted`), or if
+  any URL carries userinfo (`https://user:pass@host`). This applies even in the
+  proof account.
 - **On every step's argv, in every mode including dry-run.** These must be
   inside the fence:
-  - context, region, namespace and bucket flags;
-  - `s3://` URLs;
-  - `deployment/` names;
-  - HTTP hosts, including in-cluster `<svc>.<ns>.svc` names;
-  - account ids in ARNs.
+  - the context and region, including `--region` inside `sh -c` strings (every
+    `aws` call must carry `--region us-west-2`);
+  - namespaces and buckets, including `s3://` URLs;
+  - `deployment/` and `svc/` names, and in-cluster `<svc>.<ns>.svc` hosts;
+  - CNPG cluster names, psql `-d` databases and Helm release names;
+  - HTTP hosts;
+  - the account and region in every ARN.
+
+  `-A` and `--all-namespaces` are refused for every command. A `kubectl delete`
+  must name exactly one allowlisted namespace, and a namespace delete must
+  target one of them.
 
   A step outside the fence is recorded `refused` and never spawned. Every
   printed or recorded command is sanitized, so a credential never appears in
@@ -115,7 +133,7 @@ run, the stage needs:
    CloudTrail, ECR, the deployer role) and EKS with the `96bulls` umbrella chart.
 2. In-cluster HoopDb through CloudNativePG, with `hoopdb.cluster.instances >= 2`
    (failover needs a replica; the chart default is 1) and
-   `hoopdb.cluster.backup.barmanObjectStore` pointing at a backup bucket (the
+   `hoopdb.cluster.backup.barmanObjectStore` pointing at `96bulls-aws-proof-hoopdb-backups-500268966557` (the
    chart default has backups off).
 3. The session directory migrations from #38/#48 applied to that HoopDb
    (`sessions.session_directory.short_summary` and
@@ -184,7 +202,7 @@ compare against.
 | | Command | Touches |
 | --- | --- | --- |
 | R | `kubectl <ctx> -n {96bulls,relayauth,relaycast,cnpg-system} get pods -o json` | pod lists |
-| R | `helm --kube-context <ctx> list -A -o json` | release list |
+| R | `helm --kube-context <ctx> -n <ns> list -o json` for each proof namespace | release lists |
 | R | `helm show values <chart> --repo https://AgentWorkforce.github.io/helm-charts --version <v>` for each deployed chart | public chart repo |
 
 ### 2. planted-trace
@@ -407,6 +425,11 @@ restored cluster and measures two numbers:
 Afterwards it deletes the restored cluster and the `Backup` CR. The backup
 objects stay under the bucket's retention.
 
+Writes are compared by identity: the planted trace id plus its server
+timestamp, kept through the restore query. The source and restore samples are
+compared as multisets, so two sessions that land in the same millisecond are
+two writes, and any missing or unmatched row fails.
+
 The check fails, and never reports an RPO of 0, in any of these cases:
 
 - no planted write exists in the source before the backup stopped;
@@ -417,8 +440,8 @@ The check fails, and never reports an RPO of 0, in any of these cases:
 | | Command | Touches |
 | --- | --- | --- |
 | R | `aws s3api get-bucket-versioning`, `kubectl … get cluster hoopdb -o jsonpath={.spec.backup.barmanObjectStore.destinationPath}` | config (read) |
-| M* | `kubectl <ctx> apply -f -` Backup (stdin) + `wait` | backup bucket (base backup + WAL) |
-| M* | `kubectl <ctx> apply -f -` Cluster `hoopdb-restore-proof` (recovery) + `wait` | new 10Gi PVC |
+| M* | `kubectl <ctx> -n 96bulls apply -f -` Backup (stdin) + `wait` | backup bucket (base backup + WAL) |
+| M* | `kubectl <ctx> -n 96bulls apply -f -` Cluster `hoopdb-restore-proof` (recovery) + `wait` | new 10Gi PVC |
 | M* | `kubectl … delete clusters.postgresql.cnpg.io hoopdb-restore-proof`, `delete backups… <name>` | cleanup |
 
 ### 11. teardown
@@ -434,27 +457,33 @@ The teardown runs in two phases:
    The check is then `blocked` and lists the tagged AWS resources that are
    still pending.
 2. **After Khaliq runs `bin/96bulls down aws-proof`** (an Alchemy destroy, which
-   this harness never runs), rerun the teardown and pass it the report of the
-   full run:
-   `bun run proof:aws:teardown --confirm-live --read-only --prior-report .96bulls/aws-proof/<run id>/report.json`. The check passes only if `aws eks list-clusters` no longer
+   this harness never runs), rerun the teardown live and pass it the report of the full run:
+   `bun run proof:aws:teardown --confirm-live --prior-report .96bulls/aws-proof/<run id>/report.json`.
+   Once the cluster is gone, this run only lists and verifies. The check passes only if `aws eks list-clusters` no longer
    names the cluster and no resource tagged `96bulls:stack=aws-proof` remains.
    A KMS key in `PendingDeletion` (the 30-day window) is the expected end state.
 
 A failed cluster listing never counts as "gone".
 
-**One report for the whole proof.** `--prior-report` merges an earlier report of
-the same proof into this run's report, and the merge is deterministic:
+**One report for the whole proof.** `--prior-report` merges an earlier report
+of the same proof, and it trusts nothing in that report:
 
-- for each check, this run's result replaces the prior's;
-- the prior's file SHA-256 and run id are recorded in `phases`;
-- the verdict is recomputed over the merged checks.
+- The prior is read as exact bytes. Its SHA-256 is computed over them, and the
+  bytes must be the canonical serialization the CLI writes, so an edited or
+  reformatted prior is refused.
+- It must validate, and it must be a single unmerged phase. Its run id,
+  timestamp, mode and check list must match its phase.
+- Both runs must be live. The prior must target the same stage, cluster,
+  context, account `500268966557` and region `us-west-2`.
+- Every prior check must finish before the prior's `generatedAt`, which must
+  precede every check of the current run.
+- A carried `pass` or `unsupported` result must have executed: at least one
+  step, and every step `ran`. A planned-only result never counts toward a PASS,
+  in a merge or in any report.
 
-The merge is refused when the prior report:
-
-- targets another stage, cluster, context, account or region;
-- is a dry run being carried into a live run;
-- is newer than this run;
-- does not validate.
+Checks merge in a fixed order, with the current run's result winning. The
+verdict is recomputed, never carried, and the prior's digest is recorded in
+`phases`.
 
 So the full live run (with teardown `blocked`), merged with the phase-2
 teardown run, produces one report whose verdict covers both.
@@ -462,10 +491,10 @@ teardown run, produces one report whose verdict covers both.
 | | Command | Touches |
 | --- | --- | --- |
 | R | `aws eks list-clusters` | EKS (list) |
-| M* | `kubectl <ctx> delete backups…,clusters…,pods -A -l 96bulls.proof=true` | proof objects |
+| M* | `kubectl <ctx> -n {96bulls,relaycast} delete backups…,clusters…,pods -l 96bulls.proof=true` (one per namespace, never `-A`) | proof objects |
 | M* | `helm --kube-context <ctx> -n 96bulls uninstall 96bulls --wait` | release |
 | M* | `kubectl <ctx> delete namespace 96bulls --wait=true` | namespace and PVCs |
-| R | `kubectl … get all,pvc,backups…,clusters… -A -l 96bulls.proof=true`, `get namespace 96bulls` | verify |
+| R | `kubectl … -n {96bulls,relaycast} get all,pvc,backups…,clusters… -l 96bulls.proof=true`, `get namespace 96bulls` | verify |
 | R | `aws resourcegroupstaggingapi get-resources --tag-filters Key=96bulls:stack,Values=aws-proof`, `aws kms describe-key` | verify |
 | Khaliq | `bin/96bulls down aws-proof` | the whole stage; printed, never run |
 

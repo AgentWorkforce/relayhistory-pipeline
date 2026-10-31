@@ -161,10 +161,23 @@ describe("lifecycle plans and verdicts", () => {
     expect(failoverVerdict("hoopdb-1", "hoopdb-1", 2)).toMatchObject({ ok: false, blocked: false });
     expect(failoverVerdict("hoopdb-1", "hoopdb-2", 2)).toMatchObject({ ok: true });
   });
-  test("RPO is 0 when every pre-backup write is restored; the loss window otherwise; RTO is request to ready", () => {
-    expect(rpoRto({ plantedWritesMs: [100, 200, 300, 900], presentInRestoreMs: [100, 200, 300], backupStoppedMs: 500, restoreRequestedMs: 1000, restoreReadyMs: 61_000 })).toEqual({ rpoMs: 0, rtoMs: 60_000, lostWrites: 0 });
-    expect(rpoRto({ plantedWritesMs: [100, 200, 300, 400], presentInRestoreMs: [100, 200], backupStoppedMs: 500, restoreRequestedMs: 0, restoreReadyMs: 5 })).toEqual({ rpoMs: 200, rtoMs: 5, lostWrites: 2 });
-    expect(() => rpoRto({ plantedWritesMs: [], presentInRestoreMs: [], backupStoppedMs: 0, restoreRequestedMs: 10, restoreReadyMs: 5 })).toThrow();
+  const w = (id: string, atMs: number) => ({ id, atMs });
+  test("RPO is 0 when every pre-backup write is restored by identity; the loss window otherwise; RTO is request to ready", () => {
+    expect(rpoRto({ source: [w("a", 100), w("b", 200), w("c", 300), w("d", 900)], restored: [w("a", 100), w("b", 200), w("c", 300)], backupStoppedMs: 500, restoreRequestedMs: 1000, restoreReadyMs: 61_000 })).toMatchObject({ rpoMs: 0, rtoMs: 60_000, lostWrites: 0 });
+    expect(rpoRto({ source: [w("a", 100), w("b", 200), w("c", 300), w("d", 400)], restored: [w("a", 100), w("b", 200)], backupStoppedMs: 500, restoreRequestedMs: 0, restoreReadyMs: 5 })).toMatchObject({ rpoMs: 200, rtoMs: 5, lostWrites: 2 });
+    expect(() => rpoRto({ source: [], restored: [], backupStoppedMs: 0, restoreRequestedMs: 10, restoreReadyMs: 5 })).toThrow();
+  });
+  test("review counterexample: source [100,100] vs restore [100] is a lost write, not RPO 0", () => {
+    const base = { backupStoppedMs: 500, restoreRequestedMs: 1000, restoreReadyMs: 2000, cleanup: [{ id: "restore.delete", ok: true }] };
+    const v = evaluateBackup({ ...base, source: [w("trace-a", 100), w("trace-b", 100)], restored: [w("trace-a", 100)] });
+    expect(v.metrics.lostWrites).toBe(1);
+    expect(v.failures[0]).toMatch(/^1 planted write\(s\) committed before the backup are missing from the restore.*trace-b/);
+    // Same timestamps, wrong identity: also a loss plus an unexpected row.
+    const swapped = evaluateBackup({ ...base, source: [w("trace-a", 100), w("trace-b", 100)], restored: [w("trace-a", 100), w("trace-x", 100)] });
+    expect(swapped.failures).toEqual([expect.stringMatching(/missing from the restore/), "1 restored row(s) match no source write identity"]);
+    // A restore that duplicates one row cannot cover another.
+    expect(evaluateBackup({ ...base, source: [w("trace-a", 100), w("trace-b", 100)], restored: [w("trace-a", 100), w("trace-a", 100)] }).metrics.lostWrites).toBe(1);
+    expect(evaluateBackup({ ...base, source: [w("trace-a", 100), w("trace-a", 200)], restored: [w("trace-a", 100), w("trace-a", 200)] }).failures).toContain("source sample has duplicate write identities; the comparison would be ambiguous");
   });
   test("relaycast: every assertion must PASS in each phase; partial, failed, missing or unrun is FAIL", () => {
     const pass = (phase: "before" | "after") => RELAYCAST_ASSERTIONS[phase].map((x) => `PASS ${phase} ${x}`).join("\n");
@@ -180,14 +193,15 @@ describe("lifecycle plans and verdicts", () => {
   });
   test("backup: empty source or restore samples and failed cleanup are FAIL, never RPO 0", () => {
     const base = { backupStoppedMs: 500, restoreRequestedMs: 1000, restoreReadyMs: 2000, cleanup: [{ id: "restore.delete", ok: true }, { id: "backup.delete", ok: true }] };
-    expect(evaluateBackup({ ...base, plantedWritesMs: [100, 200], presentInRestoreMs: [100, 200] })).toEqual({ failures: [], metrics: { rpoMs: 0, rtoMs: 1000, lostWrites: 0, plantedBeforeBackup: 2, presentInRestore: 2 } });
-    const empty = evaluateBackup({ ...base, plantedWritesMs: [], presentInRestoreMs: [] });
+    const w = (id: string, atMs: number) => ({ id, atMs });
+    expect(evaluateBackup({ ...base, source: [w("a", 100), w("b", 200)], restored: [w("a", 100), w("b", 200)] })).toEqual({ failures: [], metrics: { rpoMs: 0, rtoMs: 1000, lostWrites: 0, plantedBeforeBackup: 2, presentInRestore: 2 } });
+    const empty = evaluateBackup({ ...base, source: [], restored: [] });
     expect(empty.metrics.rpoMs).toBeNull();
     expect(empty.failures).toEqual(["no planted writes found in the source cluster; nothing to measure RPO against", "the restored cluster holds none of the planted sessions"]);
-    expect(evaluateBackup({ ...base, plantedWritesMs: [900], presentInRestoreMs: [900] }).failures[0]).toMatch(/before the backup stopped/);
-    expect(evaluateBackup({ ...base, plantedWritesMs: [100], presentInRestoreMs: undefined }).failures).toEqual(["could not query the restored cluster"]);
-    expect(evaluateBackup({ ...base, plantedWritesMs: [100], presentInRestoreMs: [100], cleanup: [{ id: "restore.delete", ok: false }] }).failures).toEqual(["cleanup step restore.delete failed; restore resources may remain"]);
-    expect(evaluateBackup({ ...base, plantedWritesMs: [100], presentInRestoreMs: [100], cleanup: [] }).failures).toEqual(["cleanup did not run"]);
+    expect(evaluateBackup({ ...base, source: [w("a", 900)], restored: [w("a", 900)] }).failures[0]).toMatch(/before the backup stopped/);
+    expect(evaluateBackup({ ...base, source: [w("a", 100)], restored: undefined }).failures).toEqual(["could not query the restored cluster"]);
+    expect(evaluateBackup({ ...base, source: [w("a", 100)], restored: [w("a", 100)], cleanup: [{ id: "restore.delete", ok: false }] }).failures).toEqual(["cleanup step restore.delete failed; restore resources may remain"]);
+    expect(evaluateBackup({ ...base, source: [w("a", 100)], restored: [w("a", 100)], cleanup: [] }).failures).toEqual(["cleanup did not run"]);
   });
   test("teardown residue: in-cluster leftovers while the cluster exists; every tagged resource once it is gone", () => {
     const k8s = JSON.stringify({ items: [{ kind: "Pod", metadata: { namespace: "relaycast", name: "proof-relaycast-aws-proof" } }] });

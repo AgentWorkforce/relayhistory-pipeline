@@ -11,6 +11,7 @@ import type { ProofConfig } from "./config.ts";
 import type { Step } from "./exec.ts";
 import { PROOF_STAGE } from "./guard.ts";
 import { kubectl } from "./probes.ts";
+import { PROOF_WRITABLE_NAMESPACES } from "./fence.ts";
 
 const mut = (id: string, argv: string[], touches: string[], timeoutMs?: number): Step => ({ id, argv, mutating: true, touches, approval: "khaliq", ...(timeoutMs ? { timeoutMs } : {}) });
 const read = (id: string, argv: string[], touches: string[], timeoutMs?: number): Step => ({ id, argv, mutating: false, touches, approval: "operator", ...(timeoutMs ? { timeoutMs } : {}) });
@@ -171,10 +172,10 @@ export function backupRestoreSteps(c: ProofConfig, backupName: string): Step[] {
   return [
     read("backup.s3-versioning", ["aws", "s3api", "get-bucket-versioning", "--region", c.region, "--bucket", c.locker.bucket, "--output", "json"], [`s3:${c.locker.bucket} (versioning config)`]),
     read("backup.cluster-config", kubectl(c, "-n", c.namespace, "get", "clusters.postgresql.cnpg.io", c.hoopdb.cluster, "-o", "jsonpath={.spec.backup.barmanObjectStore.destinationPath}"), [`k8s:${c.namespace}/cnpg-cluster/${c.hoopdb.cluster}`]),
-    { ...mut("backup.create", kubectl(c, "apply", "-f", "-"), [`k8s:${c.namespace}/backup/${backupName} (created)`, `s3:${c.backupBucket ?? "<backup bucket>"} (base backup + WAL written)`]), stdin: JSON.stringify(backup) },
+    { ...mut("backup.create", kubectl(c, "-n", c.namespace, "apply", "-f", "-"), [`k8s:${c.namespace}/backup/${backupName} (created)`, `s3:${c.backupBucket ?? "<backup bucket>"} (base backup + WAL written)`]), stdin: JSON.stringify(backup) },
     read("backup.wait", kubectl(c, "-n", c.namespace, "wait", "--for=jsonpath={.status.phase}=completed", `backups.postgresql.cnpg.io/${backupName}`, "--timeout=1200s"), [`k8s:${c.namespace}/backup/${backupName}`], 1_220_000),
     read("backup.status", kubectl(c, "-n", c.namespace, "get", `backups.postgresql.cnpg.io/${backupName}`, "-o", "json"), [`k8s:${c.namespace}/backup/${backupName}`]),
-    { ...mut("restore.create", kubectl(c, "apply", "-f", "-"), [`k8s:${c.namespace}/cnpg-cluster/${RESTORE_CLUSTER} (created, 10Gi PVC)`]), stdin: JSON.stringify(restore) },
+    { ...mut("restore.create", kubectl(c, "-n", c.namespace, "apply", "-f", "-"), [`k8s:${c.namespace}/cnpg-cluster/${RESTORE_CLUSTER} (created, 10Gi PVC)`]), stdin: JSON.stringify(restore) },
     read("restore.wait", kubectl(c, "-n", c.namespace, "wait", "--for=condition=Ready", `clusters.postgresql.cnpg.io/${RESTORE_CLUSTER}`, "--timeout=1800s"), [`k8s:${c.namespace}/cnpg-cluster/${RESTORE_CLUSTER}`], 1_820_000),
   ];
 }
@@ -186,64 +187,92 @@ export function restoreCleanupSteps(c: ProofConfig, backupName: string): Step[] 
   ];
 }
 
+/** One planted write as the proof identifies it: the planted trace id plus its server timestamp. */
+export interface WriteRow {
+  id: string;
+  atMs: number;
+}
+
+const rowKey = (r: WriteRow) => `${r.id}@${r.atMs}`;
+
 /**
- * RPO and RTO from observed timestamps (ms).
- *
- * RPO is the data-loss window: zero when every planted write committed before
- * the backup stopped is present in the restore; otherwise the span from the
- * last write recovered before the first lost one (or the first lost write, if
- * none was recovered) to the newest write that should have been recovered.
- * RTO is restore requested -> restored cluster Ready.
+ * Compare source and restored writes as multisets of full identities (id +
+ * timestamp), never as bare timestamps: two different sessions landing in the
+ * same millisecond are two writes, and losing one of them is a loss.
  */
-export function rpoRto(o: {
-  plantedWritesMs: readonly number[];
-  presentInRestoreMs: readonly number[];
-  backupStoppedMs: number;
-  restoreRequestedMs: number;
-  restoreReadyMs: number;
-}): { rpoMs: number; rtoMs: number; lostWrites: number } {
-  if (o.restoreReadyMs < o.restoreRequestedMs) throw new RangeError("restore ready before it was requested");
-  const due = o.plantedWritesMs.filter((t) => t <= o.backupStoppedMs);
-  const present = new Set(o.presentInRestoreMs);
-  const lost = due.filter((t) => !present.has(t));
-  let rpoMs = 0;
-  if (lost.length) {
-    const firstLost = Math.min(...lost);
-    const recoveredBefore = o.presentInRestoreMs.filter((t) => t < firstLost);
-    const from = recoveredBefore.length ? Math.max(...recoveredBefore) : firstLost;
-    rpoMs = Math.max(...due) - from;
+export function compareWrites(source: readonly WriteRow[], restored: readonly WriteRow[]): { missing: WriteRow[]; unexpected: WriteRow[] } {
+  const remaining = new Map<string, number>();
+  for (const r of restored) remaining.set(rowKey(r), (remaining.get(rowKey(r)) ?? 0) + 1);
+  const missing: WriteRow[] = [];
+  for (const r of source) {
+    const n = remaining.get(rowKey(r)) ?? 0;
+    if (n > 0) remaining.set(rowKey(r), n - 1);
+    else missing.push(r);
   }
-  return { rpoMs, rtoMs: o.restoreReadyMs - o.restoreRequestedMs, lostWrites: lost.length };
+  const unexpected: WriteRow[] = [];
+  for (const r of restored) {
+    const n = remaining.get(rowKey(r)) ?? 0;
+    if (n > 0) {
+      unexpected.push(r);
+      remaining.set(rowKey(r), n - 1);
+    }
+  }
+  return { missing, unexpected };
+}
+
+/**
+ * RPO and RTO. RPO is the data-loss window: zero when every source write
+ * committed before the backup stopped is present in the restore (by identity);
+ * otherwise the span from the last write recovered before the first lost one
+ * (or the first lost write) to the newest write that should have been
+ * recovered. RTO is restore requested -> restored cluster Ready.
+ */
+export function rpoRto(o: { source: readonly WriteRow[]; restored: readonly WriteRow[]; backupStoppedMs: number; restoreRequestedMs: number; restoreReadyMs: number }): { rpoMs: number; rtoMs: number; lostWrites: number; lost: WriteRow[] } {
+  if (o.restoreReadyMs < o.restoreRequestedMs) throw new RangeError("restore ready before it was requested");
+  const due = o.source.filter((r) => r.atMs <= o.backupStoppedMs);
+  const { missing } = compareWrites(due, o.restored);
+  let rpoMs = 0;
+  if (missing.length) {
+    const firstLost = Math.min(...missing.map((r) => r.atMs));
+    const recoveredBefore = o.restored.filter((r) => r.atMs < firstLost).map((r) => r.atMs);
+    rpoMs = Math.max(...due.map((r) => r.atMs)) - (recoveredBefore.length ? Math.max(...recoveredBefore) : firstLost);
+  }
+  return { rpoMs, rtoMs: o.restoreReadyMs - o.restoreRequestedMs, lostWrites: missing.length, lost: missing };
 }
 
 /**
  * The backup verdict. Empty samples prove nothing: no planted write in the
  * source before the backup, or nothing readable in the restore, is a failure,
- * never an RPO of 0. Cleanup (restore cluster + Backup CR) must succeed too.
+ * never an RPO of 0. Every source write before the backup must be restored by
+ * identity; restored rows matching no source write are also a failure. Cleanup
+ * (restore cluster + Backup CR) must succeed too.
  */
 export function evaluateBackup(o: {
-  plantedWritesMs: readonly number[];
+  source: readonly WriteRow[];
   /** undefined when the restored cluster could not be queried. */
-  presentInRestoreMs: readonly number[] | undefined;
+  restored: readonly WriteRow[] | undefined;
   backupStoppedMs: number;
   restoreRequestedMs: number;
   restoreReadyMs: number;
   cleanup: ReadonlyArray<{ id: string; ok: boolean }>;
 }): { failures: string[]; metrics: { rpoMs: number | null; rtoMs: number | null; lostWrites: number | null; plantedBeforeBackup: number; presentInRestore: number } } {
   const failures: string[] = [];
-  const due = o.plantedWritesMs.filter((t) => t <= o.backupStoppedMs);
-  if (o.plantedWritesMs.length === 0) failures.push("no planted writes found in the source cluster; nothing to measure RPO against");
+  const due = o.source.filter((r) => r.atMs <= o.backupStoppedMs);
+  if (o.source.length === 0) failures.push("no planted writes found in the source cluster; nothing to measure RPO against");
   else if (due.length === 0) failures.push("no planted write was committed before the backup stopped; RPO is unmeasured");
-  if (o.presentInRestoreMs === undefined) failures.push("could not query the restored cluster");
-  else if (o.presentInRestoreMs.length === 0) failures.push("the restored cluster holds none of the planted sessions");
+  if (new Set(o.source.map((r) => r.id)).size !== o.source.length) failures.push("source sample has duplicate write identities; the comparison would be ambiguous");
+  if (o.restored === undefined) failures.push("could not query the restored cluster");
+  else if (o.restored.length === 0) failures.push("the restored cluster holds none of the planted sessions");
   for (const c of o.cleanup) if (!c.ok) failures.push(`cleanup step ${c.id} failed; restore resources may remain`);
   if (o.cleanup.length === 0) failures.push("cleanup did not run");
   let m: ReturnType<typeof rpoRto> | undefined;
-  if (due.length && o.presentInRestoreMs?.length) {
-    m = rpoRto({ plantedWritesMs: o.plantedWritesMs, presentInRestoreMs: o.presentInRestoreMs, backupStoppedMs: o.backupStoppedMs, restoreRequestedMs: o.restoreRequestedMs, restoreReadyMs: o.restoreReadyMs });
-    if (m.lostWrites) failures.push(`${m.lostWrites} planted write(s) committed before the backup are missing from the restore (RPO ${m.rpoMs} ms)`);
+  if (due.length && o.restored?.length) {
+    m = rpoRto({ source: o.source, restored: o.restored, backupStoppedMs: o.backupStoppedMs, restoreRequestedMs: o.restoreRequestedMs, restoreReadyMs: o.restoreReadyMs });
+    if (m.lostWrites) failures.push(`${m.lostWrites} planted write(s) committed before the backup are missing from the restore (RPO ${m.rpoMs} ms); first: ${m.lost.slice(0, 5).map((r) => r.id).join(", ")}`);
+    const { unexpected } = compareWrites(o.source, o.restored);
+    if (unexpected.length) failures.push(`${unexpected.length} restored row(s) match no source write identity`);
   }
-  return { failures, metrics: { rpoMs: m?.rpoMs ?? null, rtoMs: m?.rtoMs ?? null, lostWrites: m?.lostWrites ?? null, plantedBeforeBackup: due.length, presentInRestore: o.presentInRestoreMs?.length ?? 0 } };
+  return { failures, metrics: { rpoMs: m?.rpoMs ?? null, rtoMs: m?.rtoMs ?? null, lostWrites: m?.lostWrites ?? null, plantedBeforeBackup: due.length, presentInRestore: o.restored?.length ?? 0 } };
 }
 
 export function versioningEnabled(getBucketVersioningJson: string): boolean {
@@ -268,7 +297,8 @@ export const PROOF_TAG = { key: "96bulls:stack", value: PROOF_STAGE } as const;
 export function teardownSteps(c: ProofConfig): Step[] {
   return [
     ...relaycastProbeSteps(c, "delete"),
-    mut("teardown.proof-objects", kubectl(c, "delete", "backups.postgresql.cnpg.io,clusters.postgresql.cnpg.io,pods", "-A", "-l", "96bulls.proof=true", "--ignore-not-found", "--wait=true"), ["k8s:* objects labelled 96bulls.proof=true (deleted)"], 600_000),
+    // One delete per writable proof namespace, each named explicitly; never -A.
+    ...PROOF_WRITABLE_NAMESPACES.map((ns) => mut(`teardown.proof-objects.${ns}`, kubectl(c, "-n", ns, "delete", "backups.postgresql.cnpg.io,clusters.postgresql.cnpg.io,pods", "-l", "96bulls.proof=true", "--ignore-not-found", "--wait=true"), [`k8s:${ns} objects labelled 96bulls.proof=true (deleted)`], 600_000)),
     mut("teardown.helm-uninstall", ["helm", "--kube-context", c.kubeContext, "-n", c.namespace, "uninstall", c.release, "--wait"], [`helm:${c.namespace}/${c.release} (uninstalled)`], 600_000),
     mut("teardown.namespace", kubectl(c, "delete", "namespace", c.namespace, "--ignore-not-found", "--wait=true", "--timeout=600s"), [`k8s:namespace/${c.namespace} (deleted, PVCs included)`], 620_000),
   ];
@@ -277,7 +307,7 @@ export function teardownSteps(c: ProofConfig): Step[] {
 export function teardownVerifySteps(c: ProofConfig): Step[] {
   return [
     read("teardown.verify.cluster", ["aws", "eks", "list-clusters", "--region", c.region, "--query", "clusters", "--output", "json"], [`aws:eks clusters in ${c.region} (list)`]),
-    read("teardown.verify.k8s", kubectl(c, "get", "all,pvc,backups.postgresql.cnpg.io,clusters.postgresql.cnpg.io", "-A", "-l", "96bulls.proof=true", "-o", "json"), ["k8s:* (list, labelled)"]),
+    ...PROOF_WRITABLE_NAMESPACES.map((ns) => read(`teardown.verify.k8s.${ns}`, kubectl(c, "-n", ns, "get", "all,pvc,backups.postgresql.cnpg.io,clusters.postgresql.cnpg.io", "-l", "96bulls.proof=true", "-o", "json"), [`k8s:${ns} (list, labelled)`])),
     read("teardown.verify.namespace", kubectl(c, "get", "namespace", c.namespace, "--ignore-not-found", "-o", "name"), [`k8s:namespace/${c.namespace}`]),
     read("teardown.verify.aws-tagged", ["aws", "resourcegroupstaggingapi", "get-resources", "--region", c.region, "--tag-filters", `Key=${PROOF_TAG.key},Values=${PROOF_TAG.value}`, "--output", "json"], [`aws:${c.region} resources tagged ${PROOF_TAG.key}=${PROOF_TAG.value} (list)`]),
   ];

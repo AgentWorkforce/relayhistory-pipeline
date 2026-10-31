@@ -10,7 +10,7 @@ import { fenceFor } from "../fence.ts";
 import { assertMayRun, assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, type GuardInput } from "../guard.ts";
 
 const ARN = `arn:aws:eks:us-west-2:${PROOF_ACCOUNT_ID}:cluster/${PROOF_CLUSTER}`;
-const fence = fenceFor(defaultConfig());
+const fence = fenceFor("proof");
 const ok: GuardInput = { mode: "live", confirmLive: true, mutating: true, accountId: PROOF_ACCOUNT_ID, clusterName: PROOF_CLUSTER, kubeContext: ARN, kubeContextCluster: ARN };
 
 const code = (f: () => void) => {
@@ -69,7 +69,7 @@ describe("runner: refusals never spawn", () => {
     const spawn: Spawn = (argv) => (calls.push(argv), { stdout: "out", status: 0 });
     return { calls, spawn };
   };
-  const step = { id: "x", argv: ["kubectl", "--context", ARN, "delete", "ns", "96bulls"], mutating: true, touches: ["k8s"], approval: "khaliq" as const };
+  const step = { id: "x", argv: ["kubectl", "--context", ARN, "-n", "96bulls", "delete", "pod", "x"], mutating: true, touches: ["k8s"], approval: "khaliq" as const };
 
   test("dry-run plans and does not spawn", () => {
     const s = spy();

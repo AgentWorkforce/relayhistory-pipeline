@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { buildReport, canaryTag, CHECK_IDS, evidence, REPORT_SCHEMA, sanitize, validateReport, verdictOf, type CheckResult } from "../report.ts";
 
 const T = "2026-10-30T12:00:00.000Z";
-const check = (over: Partial<CheckResult> = {}): CheckResult => ({ check: "fresh-install", status: "pass", startedAt: T, finishedAt: T, summary: "ok", metrics: {}, failures: [], evidence: [], steps: [], ...over });
+const ran = [{ id: "s", command: "kubectl get pods", mutating: false, touches: [], approval: "operator" as const, status: "ran" as const }];
+const check = (over: Partial<CheckResult> = {}): CheckResult => ({ check: "fresh-install", status: "pass", startedAt: T, finishedAt: T, summary: "ok", metrics: {}, failures: [], evidence: [], steps: ran, ...over });
 const CH = "ClickHouse Cloud abc.us-west-2.aws.clickhouse.cloud (proof.transcripts; feed: harness-synthetic)";
 const report = (checks: CheckResult[], transcript = CH) =>
   buildReport({ runId: "aws-proof-test", generatedAt: T, mode: "dry-run", backends: { metadata: "HoopDb Postgres (CNPG 96bulls/hoopdb)", transcript }, target: { stage: "aws-proof", clusterName: "96bulls-aws-proof", kubeContext: "ctx" }, checks });
@@ -52,6 +53,11 @@ describe("verdict", () => {
     expect(verdictOf(all("pass"), "none")).toBe("incomplete");
     const blocked = all("pass").map((c) => (c.check === "transcript-search" ? { ...c, status: "blocked" as const } : c));
     expect(report(blocked, "none").verdict).toBe("incomplete");
+  });
+  test("a PASS backed only by planned steps never counts", () => {
+    const planned = all("pass").map((c) => (c.check === "teardown" ? { ...c, steps: [{ ...ran[0]!, status: "planned" as const }] } : c));
+    expect(verdictOf(planned, CH)).toBe("incomplete");
+    expect(verdictOf(all("pass").map((c) => (c.check === "teardown" ? { ...c, steps: [] } : c)), CH)).toBe("incomplete");
   });
   test("V1's UNSUPPORTED label alone never yields PASS: transcript-search must itself pass", () => {
     const noTranscript = all("pass").filter((c) => c.check !== "transcript-search");

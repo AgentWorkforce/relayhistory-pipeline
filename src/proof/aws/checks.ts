@@ -101,7 +101,9 @@ export async function freshInstall(ctx: Ctx): Promise<CheckResult> {
   const c = ctx.cfg;
   const nss = [...new Set([c.namespace, c.relayauth.namespace, c.relaycast.namespace, "cnpg-system"])];
   const pods = nss.map((ns) => ctx.runner.run({ id: `pods.${ns}`, argv: kubectl(c, "-n", ns, "get", "pods", "-o", "json"), mutating: false, touches: [`k8s:${ns}/pods (list)`], approval: "operator" }));
-  const helm = ctx.runner.run({ id: "helm.list", argv: ["helm", "--kube-context", c.kubeContext, "list", "-A", "-o", "json"], mutating: false, touches: ["helm:* releases (list)"], approval: "operator" });
+  // Per namespace, never -A.
+  const helmLists = nss.map((ns) => ctx.runner.run({ id: `helm.list.${ns}`, argv: ["helm", "--kube-context", c.kubeContext, "-n", ns, "list", "-o", "json"], mutating: false, touches: [`helm:${ns} releases (list)`], approval: "operator" }));
+  const helm = { ok: helmLists.every((h) => h.ok), stdout: JSON.stringify(helmLists.flatMap((h) => (h.ok ? (JSON.parse(h.stdout || "[]") as unknown[]) : []))), record: helmLists.find((h) => !h.ok)?.record ?? helmLists[0]!.record };
   const showValues = (name: string, version: string) => ctx.runner.run({ id: `helm.show-values.${name}-${version}`, argv: ["helm", "show", "values", name, "--repo", c.chartRepo, "--version", version], mutating: false, touches: [`chart repo ${c.chartRepo} (read)`], approval: "operator" });
   if (dry(ctx)) {
     showValues("96bulls", c.chartVersion);
@@ -855,7 +857,11 @@ export async function backupRestore(ctx: Ctx): Promise<CheckResult> {
   if (!dest.stdout.trim()) return r.done(r.failures.length ? "fail" : "blocked", "the CNPG cluster has no barmanObjectStore backup configured");
   if (ctx.runner.mode === "read-only") return notRun(ctx, r, "backup and restore create resources");
   const before = readDb(ctx, primary(ctx), ctx.corpus, "backup.source");
-  const plantedWrites = ctx.corpus.map((p) => before?.times.get(p.sessionId)?.objectLanded).filter((t): t is number => t !== undefined);
+  // Identity = planted trace id + server timestamp, kept through the restore query.
+  const source = ctx.corpus.flatMap((p) => {
+    const at = before?.times.get(p.sessionId)?.objectLanded;
+    return at === undefined ? [] : [{ id: p.traceId, atMs: at }];
+  });
   for (const s of steps.slice(2, 4)) if (!ctx.runner.run(s).ok) r.failures.push(`${s.id} failed`);
   const statusOut = ctx.runner.run(steps[4]!);
   const status = statusOut.ok ? statusOut.stdout : "";
@@ -864,9 +870,9 @@ export async function backupRestore(ctx: Ctx): Promise<CheckResult> {
   for (const s of steps.slice(5)) if (!ctx.runner.run(s).ok) r.failures.push(`${s.id} failed`);
   const ready = ctx.now();
   const restored = sql<Array<{ trace_id: string; stage: string; at_ms: number }>>(ctx, "restore.count", `${RESTORE_CLUSTER}-1`, stageTimesSql(ctx.corpus.map((p) => p.traceId)));
-  const present = restored?.filter((x) => x.stage === "object-landed").map((x) => Number(x.at_ms));
+  const present = restored?.filter((x) => x.stage === "object-landed").map((x) => ({ id: x.trace_id, atMs: Number(x.at_ms) }));
   const cleanup = restoreCleanupSteps(c, name).map((s) => ({ id: s.id, ok: ctx.runner.run(s).ok }));
-  const v = evaluateBackup({ plantedWritesMs: plantedWrites, presentInRestoreMs: present, backupStoppedMs: stopped, restoreRequestedMs: requested, restoreReadyMs: ready, cleanup });
+  const v = evaluateBackup({ source, restored: present, backupStoppedMs: stopped, restoreRequestedMs: requested, restoreReadyMs: ready, cleanup });
   r.failures.push(...v.failures);
   Object.assign(r.metrics, v.metrics);
   return r.done(r.failures.length ? "fail" : "pass", `restore complete: RPO ${v.metrics.rpoMs} ms, RTO ${v.metrics.rtoMs} ms, versioning ${r.metrics.s3Versioning}`);
@@ -888,9 +894,11 @@ export async function teardown(ctx: Ctx): Promise<CheckResult> {
       if (!o.ok && o.record.status === "failed") r.failures.push(`${s.id} failed`);
     }
   // Once the cluster is gone there is nothing in-cluster to list; only the account is checked.
-  const k8s = gone ? undefined : ctx.runner.run(verify[1]!);
-  const ns = gone ? undefined : ctx.runner.run(verify[2]!);
-  const tagged = ctx.runner.run(verify[3]!);
+  const byId = (prefix: string) => verify.filter((v) => v.id.startsWith(prefix));
+  const k8sRuns = gone ? undefined : byId("teardown.verify.k8s.").map((v) => ctx.runner.run(v));
+  const k8s = k8sRuns && { ok: k8sRuns.every((x) => x.ok), stdout: JSON.stringify({ items: k8sRuns.flatMap((x) => (x.ok ? ((JSON.parse(x.stdout || "{}") as { items?: unknown[] }).items ?? []) : [])) }) };
+  const ns = gone ? undefined : ctx.runner.run(byId("teardown.verify.namespace")[0]!);
+  const tagged = ctx.runner.run(byId("teardown.verify.aws-tagged")[0]!);
   if (dry(ctx)) return r.done("planned", `removes proof-labelled objects, uninstalls the release, deletes the namespace, verifies nothing labelled remains; after \`96bulls down ${c.stage}\` (Khaliq), verifies zero ${PROOF_TAG.key}=${PROOF_TAG.value} resources`);
   if (!tagged.ok) r.failures.push("tagged-resource listing failed");
   if (k8s && !k8s.ok) r.failures.push("in-cluster listing failed");

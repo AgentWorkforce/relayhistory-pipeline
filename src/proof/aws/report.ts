@@ -187,10 +187,16 @@ export function verdictOf(checks: readonly CheckResult[], transcriptBackend: str
   if (checks.some((c) => c.status === "fail")) return "fail";
   if (transcriptBackend === "none") return "incomplete";
   const complete = CHECK_IDS.every((id) =>
-    checks.some((c) => c.check === id && (c.status === "pass" || (id === "v1-search-scope" && c.status === "unsupported"))),
+    checks.some((c) => c.check === id && executed(c) && (c.status === "pass" || (id === "v1-search-scope" && c.status === "unsupported"))),
   );
   return complete ? "pass" : "incomplete";
 }
+
+/** A verdict counts only if the check actually ran: at least one step, every step `ran`. Planned-only results never count. */
+export const executed = (c: CheckResult) => c.steps.length > 0 && c.steps.every((s) => s.status === "ran");
+
+/** The exact bytes the CLI writes for a report; the prior-report digest is taken over these. */
+export const canonicalReportBytes = (r: ProofReport) => JSON.stringify(r, null, 2) + "\n";
 
 export function buildReport(
   input: Omit<ProofReport, "schema" | "scope" | "searchGates" | "verdict" | "generatedAt" | "phases"> & { generatedAt?: string; backends: { metadata: string; transcript: string } },
@@ -213,23 +219,46 @@ export function buildReport(
 }
 
 /**
- * Merge a prior run's report into the current one, deterministically: for each
- * check id (in CHECK_IDS order) the current run's result wins, otherwise the
- * prior's is carried. Both runs must target the same stage, cluster, context
- * and observed account; a live merge cannot carry dry-run results; the prior
- * must itself validate and be older. Each search gate's backend comes from the
- * run that produced that gate's checks. The verdict is recomputed over the
- * merged set, so one report can carry the whole proof including both teardown
- * phases.
+ * Merge a prior run's report into the current one. The prior is taken as the
+ * exact file bytes and nothing in it is trusted:
+ *
+ *   - its SHA-256 is computed here over those bytes, which must be the
+ *     canonical serialization (so the digest is reproducible from the report);
+ *   - it must validate, be a single unmerged live phase whose run id,
+ *     timestamp and check list match the report, and target the proof
+ *     account, region, stage, cluster and context exactly as the current run;
+ *   - every check timestamp must precede its generatedAt, which must precede
+ *     every check of the current run;
+ *   - every carried pass/unsupported result must have executed (steps, all `ran`).
+ *
+ * Both runs must be live. Checks are merged in CHECK_IDS order (the current
+ * run's result wins) and the verdict is recomputed, never carried.
  */
-export function mergeReports(prior: ProofReport, priorSha256: string, current: ProofReport): { report: ProofReport } | { error: string } {
+export function mergeReports(priorBytes: string, current: ProofReport, proof: { accountId: string; region: string }): { report: ProofReport } | { error: string } {
+  let prior: ProofReport;
+  try {
+    prior = JSON.parse(priorBytes) as ProofReport;
+  } catch {
+    return { error: "prior report is not JSON" };
+  }
+  if (canonicalReportBytes(prior) !== priorBytes) return { error: "prior report bytes are not the canonical serialization (edited or reformatted)" };
+  const priorSha256 = sha256(priorBytes);
   const issues = validateReport(prior);
   if (issues.length) return { error: `prior report invalid: ${issues[0]}` };
+  if (prior.mode !== "live" || current.mode !== "live") return { error: "only live reports merge" };
+  if (prior.phases.length !== 1) return { error: "prior report must be a single unmerged phase" };
+  const ph = prior.phases[0]!;
+  if (ph.mode !== "live" || ph.runId !== prior.runId || ph.generatedAt !== prior.generatedAt || ph.reportSha256 !== undefined || JSON.stringify(ph.checks) !== JSON.stringify(prior.checks.map((c) => c.check)))
+    return { error: "prior phase does not match the report (mode, run id, timestamp or checks)" };
+  if (current.phases.length !== 1 || current.phases[0]!.mode !== "live") return { error: "current run must be a single live phase" };
   for (const k of ["stage", "clusterName", "kubeContext", "accountId", "region"] as const)
     if (prior.target[k] !== current.target[k]) return { error: `prior report targets a different ${k}` };
-  if (current.mode !== "dry-run" && prior.mode === "dry-run") return { error: "a live or read-only run cannot carry dry-run results" };
-  if (prior.generatedAt > current.generatedAt) return { error: "prior report is newer than the current run" };
-  if (prior.phases.some((p) => p.runId === current.runId)) return { error: "prior report already contains this run" };
+  if (current.target.accountId !== proof.accountId || current.target.region !== proof.region) return { error: "reports must target the proof account and region" };
+  if (prior.runId === current.runId) return { error: "prior report is this run" };
+  for (const c of prior.checks) if (c.finishedAt > prior.generatedAt) return { error: `prior check ${c.check} finished after its report was generated` };
+  for (const c of current.checks) if (c.startedAt <= prior.generatedAt) return { error: `current check ${c.check} started before the prior report was generated` };
+  for (const c of prior.checks)
+    if ((c.status === "pass" || c.status === "unsupported") && !executed(c)) return { error: `prior check ${c.check} reports ${c.status} without executed steps` };
   const ran = new Set(current.checks.map((c) => c.check));
   const checks = CHECK_IDS.flatMap((id) => current.checks.filter((c) => c.check === id).concat(ran.has(id) ? [] : prior.checks.filter((c) => c.check === id)));
   const ranAny = (ids: readonly CheckId[]) => ids.some((id) => ran.has(id));
@@ -237,7 +266,7 @@ export function mergeReports(prior: ProofReport, priorSha256: string, current: P
     metadata: ranAny(current.searchGates.metadata.checks) ? current.searchGates.metadata : prior.searchGates.metadata,
     transcript: ranAny(current.searchGates.transcript.checks) ? current.searchGates.transcript : prior.searchGates.transcript,
   };
-  const phases = [...prior.phases.map((p, i) => (i === prior.phases.length - 1 && !p.reportSha256 ? { ...p, reportSha256: priorSha256 } : p)), ...current.phases];
+  const phases = [{ ...ph, reportSha256: priorSha256 }, ...current.phases];
   return { report: { ...current, checks, searchGates, phases, verdict: verdictOf(checks, searchGates.transcript.backend) } };
 }
 
@@ -264,6 +293,12 @@ export function validateReport(r: unknown, known: { canaries?: readonly string[]
     issues.push("transcript-search cannot pass with no transcript backend");
   if (!Array.isArray(rep.checks)) issues.push("checks must be an array");
   if (!Array.isArray(rep.phases) || rep.phases.length === 0 || rep.phases.at(-1)?.runId !== rep.runId) issues.push("phases must end with this run");
+  for (const [i, ph] of (Array.isArray(rep.phases) ? rep.phases : []).entries()) {
+    if (!["dry-run", "read-only", "live"].includes(ph.mode) || !ISO.test(ph.generatedAt ?? "") || typeof ph.runId !== "string") issues.push(`phases[${i}] incomplete`);
+    if (ph.reportSha256 !== undefined && !/^[0-9a-f]{64}$/.test(ph.reportSha256)) issues.push(`phases[${i}].reportSha256 is not a SHA-256`);
+    if (i > 0 && ph.generatedAt <= rep.phases![i - 1]!.generatedAt) issues.push("phases must be in strictly increasing time order");
+    if (rep.mode === "live" && ph.mode !== "live") issues.push(`phases[${i}] is ${ph.mode} inside a live report`);
+  }
   const seen = new Set<string>();
   for (const [i, c] of (rep.checks ?? []).entries()) {
     const at = `checks[${i}]`;
@@ -276,6 +311,7 @@ export function validateReport(r: unknown, known: { canaries?: readonly string[]
     if (!Array.isArray(c.failures) || !Array.isArray(c.evidence) || !Array.isArray(c.steps)) issues.push(`${at} failures/evidence/steps must be arrays`);
     if (c.status === "fail" && !c.failures?.length) issues.push(`${at} fails without a stated failure`);
     if (c.status === "pass" && c.failures?.length) issues.push(`${at} passes with failures recorded`);
+    if (rep.mode !== "dry-run" && (c.status === "pass" || c.status === "unsupported") && Array.isArray(c.steps) && !executed(c)) issues.push(`${at} reports ${c.status} without executed steps`);
     if (c.status === "unsupported" && c.check !== "v1-search-scope") issues.push(`${at} only v1-search-scope may be unsupported`);
     for (const e of c.evidence ?? []) if (!/^[0-9a-f]{64}$/.test(e.sha256) || !Number.isInteger(e.bytes)) issues.push(`${at} evidence '${e.label}' lacks sha256/bytes`);
   }
