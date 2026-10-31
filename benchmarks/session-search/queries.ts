@@ -7,6 +7,7 @@
  *         reported as such, never as a miss or as equivalent.
  * Lane C: filter-only listing, no text term.
  */
+import { agentPrefixPattern, normalizeAgentName, SESSION_DIRECTORY_QUERIES } from "../../src/hoopdb/search-index-contract.ts";
 import { TERMS, searchDocument, tenantCanary, type CorpusSession } from "./corpus.ts";
 
 export interface Tenant { orgId: string; workspaceId: string }
@@ -57,21 +58,57 @@ function compareNewest(a: CorpusSession, b: CorpusSession): number {
     || (a.harness < b.harness ? 1 : a.harness > b.harness ? -1 : 0);
 }
 
-/** Lane C shapes from docs/session-search-index-contract.md "Indexed remote query shapes". */
-export const listQueries = (t: Tenant) => {
-  const base = "d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL";
-  const order = "ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC LIMIT 50";
-  const cols = "SELECT d.session_id FROM sessions.session_directory AS d";
-  const args = [t.orgId, t.workspaceId];
-  return [
-    { id: "workspace-recent", sql: `${cols} WHERE ${base} ${order}`, args },
-    { id: "harness", sql: `${cols} WHERE ${base} AND d.harness = 'codex' ORDER BY d.last_activity_at DESC, d.session_id DESC LIMIT 50`, args },
-    { id: "project", sql: `${cols} WHERE ${base} AND d.project_id = $3 ${order}`, args: [...args, `${t.orgId}-project-1`] },
-    { id: "no-project", sql: `${cols} WHERE ${base} AND d.project_id IS NULL ${order}`, args },
-    { id: "state", sql: `${cols} WHERE ${base} AND d.state = 'active' ${order}`, args },
-    { id: "agent-exact", sql: `${cols} WHERE ${base} AND d.agent_name_normalized = 'agent-queue-7' ${order}`, args, agent: true },
-    { id: "agent-prefix-selective", sql: `${cols} WHERE ${base} AND d.agent_name_normalized LIKE 'agent-queue-1%' ${order}`, args, agent: true },
-    { id: "agent-prefix-broad", sql: `${cols} WHERE ${base} AND d.agent_name_normalized LIKE 'age%' ${order}`, args, agent: true },
-    { id: "user", sql: `SELECT u.session_id FROM sessions.session_directory_users AS u WHERE u.org_id = $1 AND u.workspace_id = $2 AND u.user_id = $3 ORDER BY u.last_activity_at DESC, u.session_id DESC LIMIT 50`, args: [...args, `${t.orgId}-u1`] },
-  ];
+export interface ListQuery {
+  id: string; sql: string; args: unknown[];
+  /** The contract's index for this shape; at small scale the planner may pick another. */
+  index: string;
+  agent?: "exact" | "selective-prefix" | "broad-prefix";
+}
+
+/** The contract's texts. Only the projection changes: `authenticated` may not read `search_text`. */
+const contract = (name: keyof typeof SESSION_DIRECTORY_QUERIES) => SESSION_DIRECTORY_QUERIES[name]
+  .replace("SELECT d.*", "SELECT d.session_id, d.harness").replace("SELECT *", "SELECT session_id, harness");
+
+const newest = <T>(sessions: CorpusSession[], value: (s: CorpusSession) => T | null | undefined): T => {
+  for (const s of sessions) {
+    const v = value(s);
+    if (v !== null && v !== undefined) return v;
+  }
+  throw new Error("corpus has no value for this filter");
 };
+
+/**
+ * Every shape in "Indexed remote query shapes". Filter values come from the tenant's own
+ * rows, so each query has something to return. The contract has no text for org-recent
+ * or session-ID lookup; those two are written from REQUIRED_SEARCH_INDEXES.
+ */
+export function listQueries(corpus: readonly CorpusSession[], t: Tenant): ListQuery[] {
+  const live = corpus.filter((s) => s.orgId === t.orgId && s.workspaceId === t.workspaceId && !s.deleted)
+    .sort((a, b) => b.lastActivityAt.getTime() - a.lastActivityAt.getTime());
+  const tenant = [t.orgId, t.workspaceId];
+  const agent = newest(live, (s) => s.agentName)!;
+  const project = newest(live, (s) => s.projectId)!;
+  const middle = live[Math.floor(live.length / 2)]!.createdAt.getTime();
+  return [
+    { id: "workspace-recent", sql: contract("workspaceRecent"), args: [...tenant, PAGE], index: "session_directory_workspace_recent_idx" },
+    { id: "org-recent", index: "session_directory_org_recent_idx", args: [t.orgId, PAGE], sql: `
+SELECT session_id, harness FROM sessions.session_directory
+ WHERE org_id = $1 AND deleted_at IS NULL
+ ORDER BY last_activity_at DESC, session_id DESC, harness DESC, workspace_id DESC
+ LIMIT $2` },
+    { id: "harness", sql: contract("harnessRecent"), args: [...tenant, newest(live, (s) => s.harness), PAGE], index: "session_directory_harness_recent_idx" },
+    { id: "project", sql: contract("projectRecent"), args: [...tenant, project, PAGE], index: "session_directory_project_recent_idx" },
+    { id: "no-project", sql: contract("withoutProjectRecent"), args: [...tenant, PAGE], index: "session_directory_no_project_recent_idx" },
+    { id: "agent-exact", agent: "exact", sql: contract("agentExact"), args: [...tenant, normalizeAgentName(agent), PAGE], index: "session_directory_agent_recent_idx" },
+    { id: "agent-prefix-selective", agent: "selective-prefix", sql: contract("agentPrefix"), args: [...tenant, agentPrefixPattern(agent.slice(0, -1)), PAGE], index: "session_directory_agent_recent_idx" },
+    { id: "agent-prefix-broad", agent: "broad-prefix", sql: contract("agentPrefix"), args: [...tenant, agentPrefixPattern("age"), PAGE], index: "session_directory_agent_recent_idx" },
+    { id: "created-range", sql: contract("createdRange"), args: [...tenant, new Date(middle - 7 * 86_400_000), new Date(middle + 7 * 86_400_000), PAGE], index: "session_directory_created_recent_idx" },
+    { id: "state", sql: contract("stateRecent"), args: [...tenant, newest(live, (s) => s.state), PAGE], index: "session_directory_state_recent_idx" },
+    { id: "session-id", index: "session_directory_session_lookup_idx", args: [t.orgId, live[0]!.sessionId], sql: `
+SELECT session_id, harness FROM sessions.session_directory
+ WHERE org_id = $1 AND session_id = $2` },
+    { id: "user", sql: contract("userRecent"), args: [...tenant, newest(live, (s) => s.userIds[0]), PAGE], index: "session_directory_users_recent_idx" },
+    { id: "machine", sql: contract("machineRecent"), args: [...tenant, newest(live, (s) => s.machineIds[0]), PAGE], index: "session_directory_machines_recent_idx" },
+    { id: "project-substring", sql: contract("projectContains"), args: [...tenant, project.slice(-9), PAGE], index: "session_directory_project_trgm_idx" },
+  ];
+}

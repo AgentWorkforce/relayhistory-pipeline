@@ -82,6 +82,14 @@ These fail the run. The oracle reads the generator, never an engine.
 - Transcript-only terms and a planted secret reach no directory column. This covers the
   loader and RPC only: `short_summary` here is synthetic, so it does not test the scrubber.
 - Queries under 3 characters are refused.
+- Every Lane C shape returns rows, for both tenants and both identities. Filter values
+  come from the tenant's own rows; a query that returns nothing is not a measurement.
+- The agent gate passes as `authenticated` and as owner.
+
+Lane C runs the contract's `SESSION_DIRECTORY_QUERIES` texts with only the projection
+changed, because `authenticated` cannot read `search_text`. The contract has no text for
+org-recent or session-ID lookup, so those are written from `REQUIRED_SEARCH_INDEXES`.
+Reports record the head SHA and corpus hash.
 
 Mutation controls run by hand: removing the RPC's tenant predicate, copying event
 content into the summary, and leaving tombstones live each turned the tests red.
@@ -93,8 +101,8 @@ content into the summary, and leaving tombstones live each turned the tests red.
 | Cold p50/p95/p99 | First run on a new connection | Connection-cold only; server buffers stay warm |
 | Warm p50/p95/p99 | `BENCH_REPEATS` runs on one connection | |
 | Throughput | 8 connections for 10 s, mixed Lane A, whale | Postgres only |
-| Query plans | `EXPLAIN (ANALYZE, BUFFERS)` | The RPC's SQL run as owner; the Worker cannot read the table |
-| Agent prefix gate | Contract's row amplification at most 100 | |
+| Query plans | `EXPLAIN (ANALYZE, BUFFERS)` | The RPC's SQL run as owner; the Worker cannot read the table. Lane C runs as `authenticated` under RLS and as owner, since a definer path sees what owner sees |
+| Agent gate | Name in an `Index Cond` for exact and selective prefix; broad prefix within 100x | Empty plans are NOT MEASURED and fail the run |
 | Freshness | `writeShortSummary` call to first RPC hit | Database only, excludes the pipeline |
 | Rebuild | Reload and `REINDEX` of the tenant index | Stands in for replay; manifests are not replayed |
 | Resources | Table and index bytes | No dollar figure |

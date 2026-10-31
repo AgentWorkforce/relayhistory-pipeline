@@ -45,10 +45,11 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Harness checks (PGlite)
         run: bun test ./benchmarks
-      - name: Benchmark (fails on any isolation or correctness failure)
+      - name: Benchmark (fails on isolation, correctness, an empty plan or the agent gate)
         env:
           BENCH_PG_URL: postgres://postgres:benchmark-only@127.0.0.1:5432/postgres
           BENCH_SCALE: ${{ matrix.scale }}
+          BENCH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           BENCH_OUT: benchmark-report.json
         run: bun benchmarks/session-search/run.ts
       - uses: actions/upload-artifact@v4
@@ -88,6 +89,7 @@ jobs:
           BENCH_CH_PASSWORD: benchmark-only
           BENCH_CH_SHELL: docker exec ${{ job.services.clickhouse.id }} sh -c
           BENCH_SCALE: S
+          BENCH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           BENCH_OUT: clickhouse-report.json
         run: bun benchmarks/session-search/clickhouse-gates.ts
       - uses: actions/upload-artifact@v4
