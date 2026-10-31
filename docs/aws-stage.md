@@ -104,8 +104,13 @@ k=$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 2>/dev/null)
 op item create --vault 96Bulls-dev --category "API Credential" --title "sessions-dev relayauth" \
   "internal-secret[password]=$(openssl rand -hex 32)" \
   "bootstrap-api-key[password]=rak_$(openssl rand -hex 32)" \
-  "signing-key.pem[password]=$k"; unset k
+  "signing-key\.pem[password]=$k"; unset k
 ```
+
+`op` assignment syntax reads an unescaped `.` as `section.field`, so the field
+name is written `signing-key\.pem` (double quotes keep `$k` expanding and the
+backslash literal). Without it, `op` creates section `signing-key` with field
+`pem`, and the extraction below finds no `signing-key.pem`.
 
 ```sh
 # from the operator shell, cluster credentials in env vars only
