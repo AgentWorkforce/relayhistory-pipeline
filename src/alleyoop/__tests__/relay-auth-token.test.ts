@@ -15,6 +15,7 @@ describe("RelayAuth assertion provider", () => {
       historyOrigin: "https://sessions-dev.agentrelay.com",
       orgId: "org_kind",
       workspaceId: "ws_kind",
+      machineId: "machine-kind",
       sponsorId: "user_kind",
       apiKey: async () => {
         keyReads += 1;
@@ -48,6 +49,7 @@ describe("RelayAuth assertion provider", () => {
     expect(JSON.parse(String(requests[0]!.init.body))).toEqual({
       orgId: "org_kind",
       workspaceId: "ws_kind",
+      machineId: "machine-kind",
       sponsorId: "user_kind",
       scopes: ["rth:sync", "rth:read"],
       expiresIn: 60,
@@ -66,6 +68,7 @@ describe("RelayAuth assertion provider", () => {
       historyOrigin: "https://history.example",
       orgId: "org",
       workspaceId: "workspace",
+      machineId: "machine-a",
       sponsorId: "user",
       apiKey: async () => "rak_test_only_not_a_real_key",
       fetcher: async () => {
@@ -97,6 +100,7 @@ describe("RelayAuth assertion provider", () => {
       historyOrigin: "https://history.example",
       orgId: "org",
       workspaceId: "workspace",
+      machineId: "machine-a",
       sponsorId: "user",
       apiKey: async () => "rak_super_secret",
       fetcher: async () =>
@@ -120,6 +124,7 @@ describe("RelayAuth assertion provider", () => {
           historyOrigin: "https://history.example",
           orgId: "org",
           workspaceId: "workspace",
+          machineId: "machine-a",
           sponsorId: "user",
           apiKey: async () => "rak_test_only_not_a_real_key",
         }),
@@ -131,10 +136,40 @@ describe("RelayAuth assertion provider", () => {
           historyOrigin: "https://history.example",
           orgId: "org",
           workspaceId: "workspace",
+          machineId: "machine-a",
           sponsorId: "user",
           apiKey: async () => "rak_test_only_not_a_real_key",
         }),
     ).not.toThrow();
+  });
+
+  test("refuses a non-canonical machine id before reading the mint key", async () => {
+    let keyReads = 0;
+    for (const machineId of [
+      "",
+      ".hidden",
+      "has space",
+      "relay_reserved",
+      "é",
+      "x".repeat(129),
+    ]) {
+      expect(
+        () =>
+          new RelayAuthAssertionProvider({
+            baseUrl: "https://relayauth.example",
+            historyOrigin: "https://history.example",
+            orgId: "org",
+            workspaceId: "workspace",
+            machineId,
+            sponsorId: "user",
+            apiKey: async () => {
+              keyReads += 1;
+              return "rak_test_only_not_a_real_key";
+            },
+          }),
+      ).toThrow(/MACHINE_ID/);
+    }
+    expect(keyReads).toBe(0);
   });
 });
 

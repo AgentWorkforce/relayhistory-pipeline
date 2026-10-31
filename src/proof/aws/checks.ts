@@ -41,7 +41,10 @@ export interface Ctx {
   secrets: string[];
   corpus: PlantedSession[];
   uploads: Map<string, UploadState>;
+  /** One token per tenant (its first machine's), for reads and probes. */
   tokens: Map<string, string>;
+  /** One RelayAuth assertion per planted machine, used only for that machine's writes. */
+  machineTokens: Map<string, string>;
   /** Set by planted-trace: sessions confirmed searchable, the baseline later checks compare to. */
   searchable?: Set<string>;
   sleep: (ms: number) => Promise<void>;
@@ -67,6 +70,7 @@ export function newCtx(cfg: ProofConfig, runner: Runner, runId: string, env: Rec
     corpus: plantCorpus({ runId, sessions: cfg.sessions, tenants: cfg.tenants, ...(cfg.objectKeyPrefixBase ? { keyPrefixBase: cfg.objectKeyPrefixBase } : {}) }),
     uploads: new Map(),
     tokens: new Map(),
+    machineTokens: new Map(),
     diagnosticSearches: 0,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     now: () => Date.now(),
@@ -434,26 +438,33 @@ async function withForwards<T>(ctx: Ctx, fn: (ingest: Forward, relayauth: Forwar
   }
 }
 
-async function tokensFor(ctx: Ctx, relayauthUrl: string): Promise<string | undefined> {
+export async function tokensFor(ctx: Ctx, relayauthUrl: string, f?: Fetch): Promise<string | undefined> {
   const bootstrapKey = ctx.env.PROOF_RELAYAUTH_BOOTSTRAP_KEY;
   const sponsorId = ctx.env.PROOF_SPONSOR_ID ?? "proof-operator";
   if (!bootstrapKey) return "PROOF_RELAYAUTH_BOOTSTRAP_KEY is not set (pipe it from 1Password; never a file)";
-  ctx.secrets.push(bootstrapKey);
-  for (const t of ctx.cfg.tenants) {
-    if (ctx.tokens.has(tenantKey(t))) continue;
-    const g = ctx.runner.gate({ id: `relayauth.mint.${t.orgId}`, argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`], mutating: true, touches: [`relayauth:${ctx.cfg.relayauth.namespace} (1h tenant token minted for ${t.orgId})`], approval: "khaliq" });
+  if (!ctx.secrets.includes(bootstrapKey)) ctx.secrets.push(bootstrapKey);
+  const machines = new Map<string, Tenant>();
+  for (const p of ctx.corpus) {
+    const existing = machines.get(p.machineId);
+    if (existing && tenantKey(existing) !== tenantKey(p.tenant)) return `machine ${p.machineId} is planted for two tenants`;
+    machines.set(p.machineId, p.tenant);
+  }
+  for (const [machineId, t] of machines) {
+    if (ctx.machineTokens.has(machineId)) continue;
+    const g = ctx.runner.gate({ id: `relayauth.mint.${t.orgId}.${machineId}`, argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`], mutating: true, touches: [`relayauth:${ctx.cfg.relayauth.namespace} (1h token for ${t.orgId}, bound to ${machineId})`], approval: "khaliq" });
     if (!g.allowed) {
       ctx.runner.note(g.record);
       return "token minting not allowed in this mode";
     }
     try {
-      const tok = await mintTenantToken({ relayauthUrl, bootstrapKey, orgId: t.orgId, workspaceId: t.workspaceId, sponsorId, historyOrigin: ctx.cfg.historyOrigin });
+      const tok = await mintTenantToken({ relayauthUrl, bootstrapKey, orgId: t.orgId, workspaceId: t.workspaceId, machineId, sponsorId, historyOrigin: ctx.cfg.historyOrigin, ...(f ? { fetch: f } : {}) });
       ctx.secrets.push(tok);
-      ctx.tokens.set(tenantKey(t), tok);
+      ctx.machineTokens.set(machineId, tok);
+      if (!ctx.tokens.has(tenantKey(t))) ctx.tokens.set(tenantKey(t), tok);
       ctx.runner.note(g.record);
     } catch (e) {
       ctx.runner.note({ ...g.record, status: "failed", code: e instanceof IngestError ? e.code : "mint_error" });
-      return `token mint failed for ${t.orgId}: ${e instanceof IngestError ? e.code : "error"}`;
+      return `token mint failed for ${t.orgId}/${machineId}: ${e instanceof IngestError ? e.code : "error"}`;
     }
   }
   return undefined;
@@ -472,7 +483,7 @@ export async function unlistedOrgProbe(ctx: Ctx, relayauthUrl: string, ingestUrl
   if (!g.allowed) return { status: 0, code: "not_allowed_in_mode" };
   let tok: string;
   try {
-    tok = await mintTenantToken({ relayauthUrl, bootstrapKey, orgId: PROOF_UNLISTED_ORG, workspaceId: "default", sponsorId: ctx.env.PROOF_SPONSOR_ID ?? "proof-operator", historyOrigin: ctx.cfg.historyOrigin, fetch: f });
+    tok = await mintTenantToken({ relayauthUrl, bootstrapKey, orgId: PROOF_UNLISTED_ORG, workspaceId: "default", machineId: "proof-unlisted-m0", sponsorId: ctx.env.PROOF_SPONSOR_ID ?? "proof-operator", historyOrigin: ctx.cfg.historyOrigin, fetch: f });
   } catch (e) {
     return { status: 0, code: e instanceof IngestError ? `mint_${e.code}` : "mint_error" };
   }
@@ -496,7 +507,9 @@ async function plantRevision(ctx: Ctx, ingestUrl: string, sessions: readonly Pla
     ctx.uploads.set(p.sessionId, st);
     if (st.landed.length >= revision) return;
     try {
-      await plantNextRevision({ ingestUrl }, p, ctx.tokens.get(tenantKey(p.tenant))!, st);
+      const token = ctx.machineTokens.get(p.machineId);
+      if (!token) throw new IngestError("no_machine_token", 0);
+      await plantNextRevision({ ingestUrl }, p, token, st);
     } catch (e) {
       errors.push(`${p.sessionId}: ${e instanceof IngestError ? e.code : "plant_error"}`);
     }
@@ -558,7 +571,7 @@ export async function plantedTrace(ctx: Ctx): Promise<CheckResult> {
   r.metrics.planted = ctx.corpus.length;
   r.metrics.tenants = c.tenants.map(tenantKey);
   if (dry(ctx)) {
-    ctx.runner.record({ id: "relayauth.mint", argv: ["HTTP", "POST", "<relayauth port-forward>/v1/tokens/relayhistory-assertion", `x${c.tenants.length}`], mutating: true, touches: ["relayauth (tenant tokens)"], approval: "khaliq" });
+    ctx.runner.record({ id: "relayauth.mint", argv: ["HTTP", "POST", "<relayauth port-forward>/v1/tokens/relayhistory-assertion", `x${new Set(ctx.corpus.map((p) => p.machineId)).size}`], mutating: true, touches: ["relayauth (machine-bound tenant tokens)"], approval: "khaliq" });
     ctx.runner.record({ id: "ingest.plant.rev1", argv: ["HTTP", "POST", "<ingest port-forward>/v1/pipeline/chunks", "+", "/v1/pipeline/manifests", `x${ctx.corpus.length}`], mutating: true, touches: [`s3:${c.locker.bucket}`, `hoopdb:${c.hoopdb.cluster}`], approval: "khaliq" });
     for (const s of [primaryStep(c), sqlStep(c, "hoopdb.index", "", indexStateSql(ctx.corpus.map((p) => p.sessionId))), sqlStep(c, "hoopdb.stage-times", "", stageTimesSql(ctx.corpus.map((p) => p.traceId))), s3ListStep(c, "<run machine prefix>")]) ctx.runner.run(s);
     ctx.runner.run(sqlStep(c, "search.own", "", searchBatchSql(c.tenants[0]!, [{ tag: "example", q: ctx.corpus[0]!.summaryTerm }])));

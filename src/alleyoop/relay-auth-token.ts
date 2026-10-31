@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const MACHINE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 export interface BearerTokenProvider {
   get(): Promise<string>;
@@ -43,6 +44,8 @@ export interface RelayAuthAssertionConfig {
   historyOrigin: string;
   orgId: string;
   workspaceId: string;
+  /** Canonical fleet node id RelayAuth signs as `meta.machineId`. */
+  machineId: string;
   sponsorId: string;
   apiKey: () => Promise<string>;
   expiresInSeconds?: number;
@@ -102,6 +105,10 @@ export class RelayAuthAssertionProvider implements BearerTokenProvider {
         "96bulls: RELAYAUTH_HISTORY_ORIGIN must be an exact bare origin",
       );
     }
+    if (!MACHINE_ID.test(cfg.machineId) || cfg.machineId.startsWith("relay_"))
+      throw new Error(
+        "96bulls: MACHINE_ID must be 1-128 canonical ASCII characters",
+      );
     this.#cfg = {
       ...cfg,
       baseUrl: cfg.baseUrl.replace(/\/$/, ""),
@@ -155,6 +162,7 @@ export class RelayAuthAssertionProvider implements BearerTokenProvider {
         body: JSON.stringify({
           orgId: this.#cfg.orgId,
           workspaceId: this.#cfg.workspaceId,
+          machineId: this.#cfg.machineId,
           sponsorId: this.#cfg.sponsorId,
           scopes: ["rth:sync", "rth:read"],
           expiresIn: this.#cfg.expiresInSeconds,

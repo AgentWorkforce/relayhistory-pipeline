@@ -9,10 +9,6 @@ import type { ProofConfig } from "./config.ts";
 import type { Step } from "./exec.ts";
 import type { Tenant } from "./leak-scan.ts";
 
-/** The deployed search RPC's exact signature (to_regprocedure matches it exactly). */
-export const SESSION_DIRECTORY_SEARCH_SIGNATURE =
-  "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
-
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const IDENT = /^[A-Za-z0-9_.:-]{1,128}$/;
 const TERM = /^[a-z0-9]{3,200}$/;
@@ -62,6 +58,23 @@ export function stageTimesSql(traceIds: readonly string[]): string {
    GROUP BY 1, 2) r;`;
 }
 
+/**
+ * Is the V1 search RPC callable the way the proof calls it, positionally as
+ * (p_workspace_id text, p_query text)? Matched by name and leading arguments,
+ * not by an exact signature: the session-directory contract
+ * (SESSION_DIRECTORY_SEARCH_RPC, #38) defines 19 arguments with every one after
+ * the first two defaulted, and an exact `(text,text)` lookup never matched it.
+ * A function whose first two inputs are not (p_workspace_id text, p_query text),
+ * or that has a later argument without a default, does not count.
+ */
+export const SEARCH_RPC_PRESENT_SQL = `EXISTS (
+    SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'sessions' AND p.proname = 'search_session_directory'
+       AND p.pronargs >= 2
+       AND p.proargtypes[0] = 'pg_catalog.text'::pg_catalog.regtype AND p.proargtypes[1] = 'pg_catalog.text'::pg_catalog.regtype
+       AND p.proargnames[1:2] = ARRAY['p_workspace_id', 'p_query']::text[]
+       AND p.pronargdefaults >= p.pronargs - 2)`;
+
 /** HoopDb index rows and directory summaries for the planted sessions. */
 export function indexStateSql(sessionIds: readonly string[]): string {
   return `SELECT json_build_object(
@@ -69,7 +82,7 @@ export function indexStateSql(sessionIds: readonly string[]): string {
               FROM sessions.session_index WHERE session_id = ANY(${sqlList(sessionIds, "text")})),
   'directory_present', to_regclass('sessions.session_directory') IS NOT NULL
     AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'sessions' AND table_name = 'session_directory' AND column_name = 'short_summary'),
-  'search_rpc_present', to_regprocedure('${SESSION_DIRECTORY_SEARCH_SIGNATURE}') IS NOT NULL);`;
+  'search_rpc_present', ${SEARCH_RPC_PRESENT_SQL});`;
 }
 
 /** Separate query: it references session_directory, which may not exist (then indexStateSql says so first). */
@@ -93,13 +106,19 @@ export function searchBatchSql(t: Tenant, queries: ReadonlyArray<{ tag: string; 
   if (queries.length === 0) throw new Error("empty search batch");
   // The RPC pins iss/aud/lifetime to sessions.session_directory_search_token_policy,
   // which only the owner can read, so the claims are built from it before SET ROLE.
+  // One policy row and one captured epoch: exp = iat + the policy's own
+  // max_lifetime_seconds (1..60), so a stricter policy is honoured and the
+  // lifetime cannot straddle a second boundary.
   const claims = `SELECT set_config('request.jwt.claims', json_build_object(
   'role', 'session_directory_search_worker',
-  'iss', (SELECT issuer FROM sessions.session_directory_search_token_policy WHERE singleton),
-  'aud', (SELECT audience FROM sessions.session_directory_search_token_policy WHERE singleton),
-  'iat', floor(extract(epoch FROM clock_timestamp()))::bigint,
-  'exp', floor(extract(epoch FROM clock_timestamp()))::bigint + 60,
-  'app_metadata', json_build_object('org_id', '${t.orgId}', 'workspace_ids', json_build_array('${t.workspaceId}')))::text, true) \\g /dev/null`;
+  'iss', p.issuer,
+  'aud', p.audience,
+  'iat', n.iat,
+  'exp', n.iat + p.max_lifetime_seconds,
+  'app_metadata', json_build_object('org_id', '${t.orgId}', 'workspace_ids', json_build_array('${t.workspaceId}')))::text, true)
+  FROM sessions.session_directory_search_token_policy AS p,
+       (SELECT floor(extract(epoch FROM clock_timestamp()))::bigint AS iat) AS n
+ WHERE p.singleton \\g /dev/null`;
   const body = queries.map(({ tag, q }) => {
     if (!TERM.test(q)) throw new Error("refusing unsafe search term");
     if (!IDENT.test(tag)) throw new Error("refusing unsafe tag");
