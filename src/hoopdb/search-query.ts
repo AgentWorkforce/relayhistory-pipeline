@@ -529,7 +529,8 @@ export function searchRpcRequest(request: SessionSearchRequest):
   }
   const agentMatch = request.agentMatch ?? "exact";
   if (request.agent !== undefined) {
-    const agent = request.agent.trim().toLowerCase();
+    // Same as the RPC's lower(btrim(p_agent)): btrim strips spaces only, not tabs.
+    const agent = request.agent.replace(/^ +| +$/g, "").toLowerCase();
     if (agent === "" || Array.from(agent).length > 200)
       return refuse("22023", "agent must be 1 to 200 characters");
     if (agentMatch === "prefix" && !normalizeSearchQuery(request.agent).ok)
@@ -550,6 +551,14 @@ export function searchRpcRequest(request: SessionSearchRequest):
       return refuse("22023", "state is invalid");
     body.p_state = request.state;
   }
+  // An unparseable timestamp would reach PostgREST and fail its cast with 22007,
+  // which is outside the documented error contract; refuse it as an invalid value.
+  for (const [name, value] of [
+    ["since", request.since],
+    ["until", request.until],
+  ] as const)
+    if (value !== undefined && Number.isNaN(Date.parse(value)))
+      return refuse("22023", `${name} is not a timestamp`);
   if (request.since !== undefined) body.p_since = request.since;
   if (request.until !== undefined) body.p_until = request.until;
   if (
