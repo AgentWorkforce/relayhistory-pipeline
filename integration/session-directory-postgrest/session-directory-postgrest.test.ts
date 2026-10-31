@@ -4,7 +4,11 @@
  * Keys are generated per run and only live in a temp directory. No hosted database.
  *
  * Needs PG_BIN_DIR (initdb, pg_ctl, postgres) and POSTGREST_BIN, which
- * scripts/fetch-postgrest-test-bins.sh provides. Two PostgREST
+ * scripts/fetch-postgrest-test-bins.sh provides. To use a throwaway server instead of
+ * a local one, such as CloudNativePG on a local cluster, set SD_TEST_PG_ADMIN_URL to a
+ * superuser URL and SD_TEST_PG_DISPOSABLE=yes; PG_BIN_DIR is then not needed. The suite
+ * refuses a database that already has a `sessions` schema, and it leaves its roles
+ * behind, so each run needs a fresh cluster. Two PostgREST
  * instances run against one database:
  * - `selfHosted` loads stacks/aws/session-directory-postgrest unchanged.
  * - `broad` is shaped like a project with weaker settings: anon, service_role and a
@@ -24,7 +28,13 @@ const read = (path: string) => readFileSync(join(root, path), "utf8");
 const PROFILE = "stacks/aws/session-directory-postgrest";
 const PG_BIN_DIR = process.env.PG_BIN_DIR;
 const POSTGREST_BIN = process.env.POSTGREST_BIN;
-if (!PG_BIN_DIR || !POSTGREST_BIN) throw new Error("PG_BIN_DIR and POSTGREST_BIN must be set");
+const EXTERNAL_PG_URL = process.env.SD_TEST_PG_ADMIN_URL;
+if (EXTERNAL_PG_URL && process.env.SD_TEST_PG_DISPOSABLE !== "yes") {
+  throw new Error("SD_TEST_PG_ADMIN_URL runs migrations and needs SD_TEST_PG_DISPOSABLE=yes");
+}
+if ((!PG_BIN_DIR && !EXTERNAL_PG_URL) || !POSTGREST_BIN) {
+  throw new Error("POSTGREST_BIN and either PG_BIN_DIR or SD_TEST_PG_ADMIN_URL must be set");
+}
 
 const WORKER = "session_directory_search_worker";
 const ISSUER = "http://relayauth.relayauth.svc:8787/session-directory";
@@ -114,13 +124,19 @@ const freePort = () =>
       server.close(() => resolve(port));
     });
   });
+function loginUrl(adminUrl: string, role: string, password: string) {
+  const url = new URL(adminUrl);
+  url.username = role;
+  url.password = password;
+  return url.toString();
+}
 async function runOk(command: string[]) {
   const proc = spawn(command, { stdout: "pipe", stderr: "pipe" });
   if ((await proc.exited) !== 0) throw new Error(`${command[0]}: ${await new Response(proc.stderr).text()}`);
 }
 
 let dir: string;
-let dataDir: string;
+let dataDir: string | undefined;
 let admin: SQL;
 let selfHosted: Instance;
 let broad: Instance;
@@ -155,14 +171,20 @@ async function insertRows(org: string, workspace: string, count: number, label: 
 
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "sd-pgrst-"));
-  dataDir = join(dir, "data");
-  const pgPort = await freePort();
-  await runOk([join(PG_BIN_DIR!, "initdb"), "-D", dataDir, "-U", "postgres", "--auth=trust", "-E", "UTF8", "--locale=C"]);
-  await runOk([
-    join(PG_BIN_DIR!, "pg_ctl"), "start", "-w", "-D", dataDir, "-l", join(dir, "pg.log"),
-    "-o", `-p ${pgPort} -c listen_addresses=127.0.0.1 -k ${dir}`,
-  ]);
-  admin = new SQL(`postgres://postgres@127.0.0.1:${pgPort}/postgres`);
+  let adminUrl = EXTERNAL_PG_URL;
+  if (!adminUrl) {
+    dataDir = join(dir, "data");
+    const pgPort = await freePort();
+    await runOk([join(PG_BIN_DIR!, "initdb"), "-D", dataDir, "-U", "postgres", "--auth=trust", "-E", "UTF8", "--locale=C"]);
+    await runOk([
+      join(PG_BIN_DIR!, "pg_ctl"), "start", "-w", "-D", dataDir, "-l", join(dir, "pg.log"),
+      "-o", `-p ${pgPort} -c listen_addresses=127.0.0.1 -k ${dir}`,
+    ]);
+    adminUrl = `postgres://postgres@127.0.0.1:${pgPort}/postgres`;
+  }
+  admin = new SQL(adminUrl);
+  const [{ present }] = await admin.unsafe("SELECT to_regnamespace('sessions') IS NOT NULL AS present");
+  if (present) throw new Error("refusing a database that already has a sessions schema");
   await admin.unsafe(read("supabase/tests/supabase_shim.sql")).simple();
   const migrations = readdirSync(join(root, "supabase/migrations")).sort();
   for (const file of migrations) await admin.unsafe(read(`supabase/migrations/${file}`)).simple();
@@ -175,6 +197,10 @@ beforeAll(async () => {
     "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
     [ISSUER, AUDIENCE],
   );
+  const loginPassword = crypto.randomUUID().replaceAll("-", "");
+  for (const role of ["session_directory_authenticator", "broad_authenticator"]) {
+    await admin.unsafe(`ALTER ROLE ${role} PASSWORD '${loginPassword}'`);
+  }
 
   await insertRows("org-a", "ws-a1", 3, "alpha");
   await insertRows("org-a", "ws-a2", 2, "alphatwo");
@@ -195,7 +221,7 @@ beforeAll(async () => {
     writeFileSync(
       conf,
       `${profile
-        .replace("$(PGRST_DB_URI)", `postgres://${role}@127.0.0.1:${pgPort}/postgres`)
+        .replace("$(PGRST_DB_URI)", loginUrl(adminUrl, role, loginPassword))
         .replace("/etc/postgrest/session-directory-jwks.json", jwksPath)
         .replace("server-port = 3000", `server-port = ${port}`)
         .replace("admin-server-port = 3001", `admin-server-port = ${adminPort}`)}\ndb-pool = 2\n${extra}`,

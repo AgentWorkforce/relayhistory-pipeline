@@ -5,6 +5,15 @@ Design: `docs/session-directory-tenant-issuer.md`. These files hold no keys or s
 and nothing here has been deployed. The suite in `integration/session-directory-postgrest`
 runs these exact files against real Postgres 17 and PostgREST 16.5.
 
+## Run the suite against a throwaway cluster
+
+Set `POSTGREST_BIN`, `SD_TEST_PG_DISPOSABLE=yes` and `SD_TEST_PG_ADMIN_URL` to a superuser URL
+that PostgREST can reach too, then run
+`bun test ./integration/session-directory-postgrest --timeout 40000`. Optionally set
+`RELAYAUTH_DIR` to include tokens minted by RelayAuth. The suite refuses a database with a
+`sessions` schema and leaves its roles behind, so use a fresh cluster each run. Never point it
+at a real environment.
+
 ## Hard precondition: TLS before the token exchange
 
 The exchange request carries RelayHistory's minting API key and the caller's token.
