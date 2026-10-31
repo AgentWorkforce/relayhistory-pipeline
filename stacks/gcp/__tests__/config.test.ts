@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "bun:test";
+import versionsLock from "../../../versions.lock.json";
 import {
   assertGcpInputs,
   assertGcpRuntimeDeployable,
@@ -35,9 +36,18 @@ const base: GcpInputs = {
 };
 
 describe("GCP self-host contract", () => {
+  it("pins the reviewed multi-architecture services image for the GCP proof", () => {
+    expect(versionsLock.images.services).toMatchObject({
+      ref: "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services",
+      digest: "sha256:8d77de9be0b5e5e47dda75986da882e577aafb9e28e510c844e8134fea372425",
+      sourceRevision: "09293c8d649f912aa2f4414e31a3ad7fca6eceee",
+      gcpProofEligible: true,
+    });
+  });
+
   it("accepts a substrate-only stage without pretending managed services are attached", () => {
     expect(() => assertGcpInputs("gcp-dev", base)).not.toThrow();
-    expect(() => assertGcpRuntimeDeployable(base)).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", base)).not.toThrow();
     expect(() => assertGcpInputs("gcp-../../outside", base)).toThrow(/safe gcp-\* stage/);
   });
 
@@ -52,11 +62,12 @@ describe("GCP self-host contract", () => {
       imageSourceRevision: "not-a-revision",
       relayauthJwksUrl: "http://user:password@attacker.example/jwks?token=secret",
       relayauthIssuer: "http://user:password@attacker.example",
+      relayhistoryOrigin: "http://user:password@attacker.example",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
-    expect(() => assertGcpRuntimeDeployable({ ...base, bulls96: disabled })).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
     expect(() =>
-      assertGcpRuntimeDeployable({
+      assertGcpRuntimeDeployable("gcp-dev", {
         ...base,
         bulls96: { ...disabled, enabled: true },
       }),
@@ -89,7 +100,7 @@ describe("GCP self-host contract", () => {
 
   it("requires an explicit adapter-proof acknowledgement before managed services can cost money", () => {
     expect(() =>
-      assertGcpInputs("gcp-dev", {
+      assertGcpInputs("gcp-conformance", {
         ...base,
         managedDataPlane: { provision: true },
       }),
@@ -126,6 +137,7 @@ describe("GCP self-host contract", () => {
       imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
       relayauthIssuer: "http://relayauth.relayauth.svc:8787",
+      relayhistoryOrigin: "http://bulls96-alleyoop.96bulls.svc:8080",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96 })).toThrow("managedDataPlane.provision");
     expect(() =>
@@ -150,7 +162,7 @@ describe("GCP self-host contract", () => {
       }),
     ).toThrow("full Git commit SHA");
     expect(() =>
-      assertGcpInputs("gcp-dev", {
+      assertGcpInputs("gcp-conformance", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96,
@@ -184,6 +196,19 @@ describe("GCP self-host contract", () => {
         bulls96: { ...bulls96, relayauthIssuer: "https://relay.example.com/issuer-path" },
       }),
     ).toThrow("RelayAuth origin");
+    for (const relayhistoryOrigin of [
+      "http://user:password@bulls96-alleyoop.96bulls.svc:8080",
+      "http://attacker.example",
+      "https://history.example.com/path",
+      "https://history.example.com:443",
+    ])
+      expect(() =>
+        assertGcpInputs("gcp-dev", {
+          ...base,
+          managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+          bulls96: { ...bulls96, relayhistoryOrigin },
+        }),
+      ).toThrow("in-cluster Kubernetes origin");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
@@ -193,32 +218,47 @@ describe("GCP self-host contract", () => {
       }),
     ).toThrow("must match relayauth.baseUrl");
     expect(() =>
-      assertGcpInputs("gcp-dev", {
+      assertGcpInputs("gcp-conformance", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
-    ).toThrow("not approved for the GCP application proof");
+    ).not.toThrow();
     expect(() =>
-      assertGcpRuntimeDeployable({
+      assertGcpRuntimeDeployable("gcp-conformance", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
-    ).toThrow("not approved for the GCP application proof");
-    const recordedButIneligible = {
+    ).not.toThrow();
+    const approvedRuntime = {
       ...base,
       managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" as const },
       bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
     };
+    expect(() => assertGcpInputs("gcp-dev", approvedRuntime, "plan")).toThrow("published only for gcp-conformance");
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", approvedRuntime, "deploy")).toThrow(
+      "published only for gcp-conformance",
+    );
+    expect(() => assertGcpInputs("gcp-dev", approvedRuntime, "destroy")).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", approvedRuntime, "destroy")).not.toThrow();
+    const recordedButIneligible = {
+      ...base,
+      managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" as const },
+      bulls96: {
+        ...bulls96,
+        imageDigest: "sha256:245a75f9d7abdbd2167108db6e4fa852df844b41a22eaebcd64b4dd7b753b2aa",
+        imageSourceRevision: "db2663d05b327b945f1db40fd3b8aec13726fcef",
+      },
+    };
     expect(() => assertGcpInputs("gcp-dev", recordedButIneligible, "destroy")).not.toThrow();
-    expect(() => assertGcpRuntimeDeployable(recordedButIneligible, "destroy")).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", recordedButIneligible, "destroy")).not.toThrow();
     for (const command of ["plan", "deploy"] as const) {
-      expect(() => assertGcpInputs("gcp-dev", recordedButIneligible, command)).toThrow(
-        "not approved for the GCP application proof",
+      expect(() => assertGcpInputs("gcp-conformance", recordedButIneligible, command)).toThrow(
+        "does not match the reviewed release",
       );
-      expect(() => assertGcpRuntimeDeployable(recordedButIneligible, command)).toThrow(
-        "not approved for the GCP application proof",
+      expect(() => assertGcpRuntimeDeployable("gcp-conformance", recordedButIneligible, command)).toThrow(
+        "does not match the reviewed release",
       );
     }
   });
@@ -240,6 +280,7 @@ describe("GCP self-host contract", () => {
           imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
           relayauthIssuer: "http://relayauth.relayauth.svc:8787",
+          relayhistoryOrigin: "http://bulls96-alleyoop.96bulls.svc:8080",
         },
         {
           bucket: "locker",
@@ -265,6 +306,7 @@ describe("GCP self-host contract", () => {
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
     expect(values).toMatchObject({
       worker: {
+        fullnameOverride: "bulls96-worker",
         imagePullSecrets: [],
         image: {
           repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
@@ -273,6 +315,7 @@ describe("GCP self-host contract", () => {
         locker: { credentials: { mode: "podIdentity" } },
       },
       alleyoop: {
+        fullnameOverride: "bulls96-alleyoop",
         imagePullSecrets: [],
         image: {
           repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
@@ -283,6 +326,16 @@ describe("GCP self-host contract", () => {
           jwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
           issuer: "http://relayauth.relayauth.svc:8787",
         },
+        extraEnv: expect.arrayContaining([
+          {
+            name: "ALLOW_INTERIM_RELAYAUTH_BEARER",
+            value: "true",
+          },
+          {
+            name: "RELAYHISTORY_ORIGIN",
+            value: "http://bulls96-alleyoop.96bulls.svc:8080",
+          },
+        ]),
       },
       hoopdb: { enabled: false },
       locker: { enabled: false },

@@ -172,9 +172,19 @@ To request the application release after its external Secrets exist, set
   "imageDigest": "sha256:<digest-built-from-the-reviewed-main-commit>",
   "imageSourceRevision": "<full-40-character-reviewed-main-commit>",
   "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
-  "relayauthIssuer": "http://relayauth.relayauth.svc:8787"
+  "relayauthIssuer": "http://relayauth.relayauth.svc:8787",
+  "relayhistoryOrigin": "http://bulls96-alleyoop.96bulls.svc:8080"
 }
 ```
+
+`relayhistoryOrigin` is the exact audience RelayAuth places in a courier
+assertion. AlleyOop receives the same value as `RELAYHISTORY_ORIGIN`, so it
+accepts only RelayAuth's origin-bound assertion class and refuses the legacy
+shared audience. The release also enables AlleyOop's RelayAuth JWT verifier;
+that switch does not reopen the legacy audience while the origin is present.
+A verifier may reach the ClusterIP through a local
+port-forward, but it must still ask RelayAuth to bind the token to this stable
+in-cluster origin.
 
 Those are names and identifiers only. Secret payloads never belong in this
 file or Helm values. The stage uses its private Artifact Registry repository
@@ -184,10 +194,13 @@ Secret is used or required for that path.
 
 The digest and source revision must exactly match the structured services
 release in `versions.lock.json`, and that release must set
-`gcpProofEligible: true`. The currently recorded `db2663d` image is explicitly
-ineligible. A services image release updates the digest, full source revision,
-and eligibility together only after the image build and review complete; an
-arbitrary or merely well-formed digest cannot enable this stage.
+`gcpProofEligible: true`. The currently recorded `09293c8` image is published
+only in the `awf-conformance-images` repository, so an enabled 96Bulls release
+is refused outside the `gcp-conformance` stage. Substrate-only stages and
+destroy cleanup remain available. A services image release updates the digest,
+full source revision, and eligibility together only after the image build and
+review complete; an arbitrary or merely well-formed digest cannot enable this
+stage.
 
 `assertGcpInputs` accepts only those five target fields. `agentworkforce-dev1`
 and any other project, number, org, billing account, or region are refused
@@ -460,7 +473,7 @@ first resource. Resource order after that is: the listed Google APIs with
 standard GKE with a one-node default pool in `us-central1-a`, private nodes and
 a private endpoint, the versioned GCS bucket, the empty Secret Manager
 container, Artifact Registry, the runtime service account, Workload Identity for
-`96bulls-worker` and `96bulls-alleyoop`, `roles/storage.objectUser`, and
+`bulls96-worker` and `bulls96-alleyoop`, `roles/storage.objectUser`, and
 `roles/cloudsql.client`. With `managedDataPlane.provision`, Memorystore Redis
 7.2 is created with AUTH off and TLS server authentication, and Pub/Sub is
 created with the dead-letter service agent. The Cloud SQL body is an Action

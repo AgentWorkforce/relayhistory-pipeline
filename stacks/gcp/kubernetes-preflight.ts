@@ -11,6 +11,30 @@ function isPrivateIpv4(value: string): boolean {
   return a === 10 || (a === 172 && b! >= 16 && b! <= 31) || (a === 192 && b === 168);
 }
 
+function privateIpv4Host(value: string): string | undefined {
+  if (isPrivateIpv4(value)) return value;
+  if (value !== value.trim()) return undefined;
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname;
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username !== "" ||
+      parsed.password !== "" ||
+      parsed.port !== "" ||
+      parsed.pathname !== "/" ||
+      parsed.search !== "" ||
+      parsed.hash !== "" ||
+      (value !== `https://${host}` && value !== `https://${host}/`) ||
+      !isPrivateIpv4(host)
+    )
+      return undefined;
+    return host;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface KubernetesReachabilityProof {
   executor: string;
   executorIdentity: string;
@@ -69,12 +93,13 @@ export async function provePrivateKubernetesReachability(
     authorization.executorIdentity !== executor.identity
   )
     throw new Error("96bulls: Kubernetes executor identity is invalid. No Kubernetes objects were applied.");
-  if (!isPrivateIpv4(endpoint))
+  const endpointHost = privateIpv4Host(endpoint);
+  if (!endpointHost)
     throw new Error("96bulls: GKE control-plane endpoint is not a concrete private IPv4 address. No Kubernetes objects were applied.");
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000)
     throw new Error("96bulls: Kubernetes reachability deadline is invalid. No Kubernetes objects were applied.");
   try {
-    await dial(endpoint, 443, timeoutMs);
+    await dial(endpointHost, 443, timeoutMs);
   } catch {
     throw new Error(
       `96bulls: named ${executor.mode} executor ${executor.name} cannot reach the private GKE control plane. No Kubernetes objects were applied.`,
