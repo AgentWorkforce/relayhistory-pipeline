@@ -124,6 +124,28 @@ REVOKE ALL ON FUNCTION sessions.record_normalized_event_count(text, text, text, 
 GRANT EXECUTE ON FUNCTION sessions.record_normalized_event_count(text, text, text, text, text, bigint,
   integer, text, bytea, bytea, integer) TO session_count_writer;
 
+-- Only record_normalized_event_count may write provenance. service_role holds GRANT
+-- ALL, and a column REVOKE doesn't subtract from a table grant, so the table-level
+-- INSERT and UPDATE go and every other column is granted back. A column added later
+-- is unwritable by service_role until a migration grants it. The owner, a superuser
+-- and members of pg_write_all_data aren't limited by this; the sticky trigger is
+-- what still protects the count from them.
+REVOKE INSERT, UPDATE ON sessions.session_index FROM service_role;
+DO $$
+DECLARE
+  v_columns text;
+BEGIN
+  SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) INTO v_columns
+    FROM pg_attribute
+   WHERE attrelid = 'sessions.session_index'::regclass AND attnum > 0 AND NOT attisdropped
+     AND attgenerated = ''
+     AND attname NOT IN ('event_count_revision', 'event_count_normalized_version',
+                         'event_count_work_key', 'event_count_object_sha256',
+                         'event_count_recorded_at');
+  EXECUTE format('GRANT INSERT (%1$s), UPDATE (%1$s) ON sessions.session_index TO service_role', v_columns);
+END
+$$;
+
 -- The stage that consumes the typed normalized-ready record.
 -- NOT VALID: every new row is checked, and pipeline_events isn't scanned under
 -- this lock. Each list only grows, so existing rows already satisfy it.

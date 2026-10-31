@@ -252,6 +252,69 @@ describe("access", () => {
     }
   });
 
+  describe("provenance columns", () => {
+    const PROVENANCE = [
+      "event_count_revision",
+      "event_count_normalized_version",
+      "event_count_work_key",
+      "event_count_object_sha256",
+      "event_count_recorded_at",
+    ];
+    const asService = async <T>(run: () => Promise<T>) => {
+      await db.exec("SET ROLE service_role");
+      try {
+        return await run();
+      } finally {
+        await db.exec("RESET ROLE");
+      }
+    };
+
+    it("no login or API role can write them, which the owner and superusers are outside of", async () => {
+      const { rows } = await db.query<{ rolname: string; attname: string; priv: string }>(
+        `SELECT r.rolname, a.attname, p.priv
+           FROM pg_roles r
+           CROSS JOIN pg_attribute a
+           CROSS JOIN (VALUES ('INSERT'), ('UPDATE')) AS p (priv)
+          WHERE a.attrelid = 'sessions.session_index'::regclass
+            AND a.attname = ANY($1::text[])
+            AND NOT r.rolsuper AND r.rolname NOT LIKE 'pg\\_%'
+            AND r.oid <> (SELECT relowner FROM pg_class WHERE oid = 'sessions.session_index'::regclass)
+            AND has_column_privilege(r.oid, a.attrelid, a.attnum, p.priv)`,
+        [PROVENANCE],
+      );
+      expect(rows).toEqual([]);
+    });
+
+    it("service_role can't set them by UPDATE or INSERT, or through any column of them", async () => {
+      await index(1);
+      for (const column of PROVENANCE) {
+        const value = column === "event_count_recorded_at" ? "now()" : column === "event_count_object_sha256" ? "NULL::bytea" : column === "event_count_work_key" ? "'x'" : "1";
+        await expect(
+          asService(() => db.query(`UPDATE sessions.session_index SET ${column} = ${value}`)),
+        ).rejects.toMatchObject({ code: "42501" });
+      }
+      await expect(
+        asService(() =>
+          db.query(
+            `INSERT INTO sessions.session_index (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at, event_count_revision)
+             VALUES ('o', 'w', 'claude', 's-x', 'm', 'u', now(), now(), 1)`,
+          ),
+        ),
+      ).rejects.toMatchObject({ code: "42501" });
+      expect((await stored()).event_count_revision).toBeNull();
+    });
+
+    it("service_role keeps every other column, and the real upsert still works as it", async () => {
+      await asService(() => index(1, { eventCount: 5 }));
+      await asService(() => index(2, { eventCount: 6 }));
+      expect((await stored()).event_count).toBe(6);
+      await asService(() => db.query("UPDATE sessions.session_index SET title = 't'"));
+      expect(await write({ revision: 2 })).toBe("applied");
+      await asService(() => index(3, { eventCount: 999 }));
+      expect(await stored()).toMatchObject({ event_count: 42, event_count_revision: 2 });
+    });
+  });
+
   it("tenants and the API roles can't call it", async () => {
     await index(1);
     for (const role of ["anon", "authenticated"])
