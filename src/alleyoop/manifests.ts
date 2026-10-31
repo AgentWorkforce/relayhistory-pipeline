@@ -766,7 +766,6 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       }
       const machine = c.req.query("machine");
       if (machine !== stored.manifest.session.machine_id) return c.body(null, 403);
-      const auth = c.get("auth") as Auth;
       // A migration assertion never reads a client's parked manifest.
       if (auth.tokenSubject !== MIGRATION_SUBJECT && stored.manifest.raw.owner.startsWith("migration:") && c.req.query("manifest") !== "1") {
         const held = await storedManifest(deps.raw, key, parkedKey(key, machine));

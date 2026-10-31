@@ -167,6 +167,33 @@ describe("handover from a cold export (H1-H5)", () => {
     expect((await w.post({ key: w.key, manifest: second, previousVersion: now })).status).toBeGreaterThanOrEqual(400);
   });
 
+  test("a live write that moves the owner is refused as owner_conflict, not a stale version", async () => {
+    const code = async (res: Response) => ((await res.json()) as { error?: { code?: string } }).error?.code;
+    const w = await world();
+    const cold = await w.coldExport(w.exportText("pre-t0"));
+    const { version } = (await w.stored())!;
+
+    // Takeover with the current version, so only ownership can refuse it.
+    const noEpoch = await takeover(w, cold, w.machineId, '{"x":1}\n', (m) => void (m.raw.owner = "someone-else"));
+    noEpoch.writer.delivery_instance_id = w.machineId;
+    const refused = await w.post({ key: w.key, manifest: noEpoch, previousVersion: version });
+    expect(refused.status).toBe(409);
+    expect(await code(refused)).toBe("owner_conflict");
+    const omitted = await w.post({ key: w.key, manifest: noEpoch });
+    expect(omitted.status).toBe(409);
+    expect(await code(omitted)).toBe("revision_conflict");
+
+    const won = await takeover(w, cold, w.machineId, '{"x":2}\n');
+    expect((await w.post({ key: w.key, manifest: won, previousVersion: version })).status).toBe(202);
+    const held = (await w.stored())!;
+    const moved = structuredClone(held.manifest);
+    moved.revision += 1;
+    moved.raw.owner = "someone-else";
+    const live = await w.post({ key: w.key, manifest: moved, previousVersion: held.version });
+    expect(live.status).toBe(409);
+    expect(await code(live)).toBe("owner_conflict");
+  });
+
   test("a takeover resumes after the watermark, so exported rows are not sent again", async () => {
     const w = await world();
     const rows = [0, 1].map((n) => w.exportedRow(n + 1, line(n))).join("");

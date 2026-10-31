@@ -28,6 +28,7 @@ import {
   computeContentSha256,
   manifestKey,
   objectKey,
+  readAll,
   objectStoreManifestReader,
   sealRawChunk,
   type AppEnv,
@@ -402,10 +403,15 @@ describe("AlleyOop manifest route: migration assertions", () => {
     expect(await code(other)).toBe("migration_upload_forbidden");
     // Both satisfied: the cold export commits.
     expect((await f.post(f.as(), await f.build())).status).toBe(202);
-    // A live (ordinary) writer cannot then take the migration-owned stream over (#42).
+    // A live (ordinary) writer cannot then take the migration-owned stream
+    // over: with the gate closed it is parked beside the export (#52), so the
+    // client does not stall and the stored owner does not move.
     const live = await f.build({}, {}, MACHINE);
     const takeover = await f.post(ordinaryAuth, { ...live, revision: 2 });
-    expect(takeover.status).toBe(409);
+    expect(takeover.status).toBe(202);
+    expect(await takeover.json()).toMatchObject({ parked: true });
+    const stored = JSON.parse(new TextDecoder().decode(await readAll(await f.store.get(objectKey(f.key)))));
+    expect(stored.raw.owner).toMatch(/^migration:/);
     expect(await count("sessions.migration_assertion_uses")).toBe(1);
   });
 
