@@ -429,7 +429,9 @@ export const eksStage = (i: EksStageInputs) =>
         tenantOrgIds: resolveTenantOrgs(i),
         // Secret-bearing RelayAuth calls (relayauth #116 exchange) go here, TLS 1.3, never to the plain Service.
         relayauthTls: selfAuth
-          ? { service: RELAYAUTH_TLS_SERVICE, namespace: RELAYAUTH_TLS_NAMESPACE, port: RELAYAUTH_TLS_PORT, url: RELAYAUTH_TLS_URL, clientLabel: RELAYAUTH_TLS_CLIENT_LABEL, caConfigMap: "relayauth-ca" }
+          ? { service: RELAYAUTH_TLS_SERVICE, namespace: RELAYAUTH_TLS_NAMESPACE, port: RELAYAUTH_TLS_PORT, url: RELAYAUTH_TLS_URL, clientLabel: RELAYAUTH_TLS_CLIENT_LABEL,
+              // Not created by the stack: the operator publishes it from the relayauth-tls Secret (docs/aws-stage.md, "Transport").
+              caConfigMap: { name: "relayauth-ca", key: "ca.crt", namespace: NAMESPACE, publishedBy: "operator" } }
           : null,
         sessionDirectoryPostgrest: sessionDirectory
           ? { service: SESSION_DIRECTORY_POSTGREST.service, namespace: SESSION_DIRECTORY_POSTGREST.namespace, port: SESSION_DIRECTORY_POSTGREST.port, url: SESSION_DIRECTORY_POSTGREST.url, clientLabel: SEARCH_CLIENT_LABEL }

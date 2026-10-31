@@ -95,3 +95,26 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
                            VALUES ('o','w','claude','x','m','short','01a188e1-ef86-7b16-938a-e91b6b78643b',1,'${"e".repeat(64)}','ready')`)).rejects.toThrow(/session_summaries_pointer/);
   }, 30_000);
 });
+
+describe("Bob Costas under org-derived key prefixes (PIPELINE_ORG_FROM_PREFIX)", () => {
+  it("reads the chunks and writes the summary under the manifest's own <base>/<org> prefix", async () => {
+    const { pg, db } = await setup();
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
+    const prefixed = { ...loc, prefix: "96bulls/org_aws_proof_1" };
+    const line = JSON.stringify({ type: "user", message: { role: "user", content: "PLANTED-PROMPT tenant one" } });
+    // Only the prefixed chunk exists, exactly where the ingest stores it.
+    await store.put(rawChunkKey(prefixed, 0, 0, "abcdef12", "jsonl"), zstdCompressSync(Buffer.from(line + "\n")));
+    const m = manifest(true, [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }]);
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    const msg = { payload: { manifestKey: "96bulls/org_aws_proof_1/v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/manifest.json" }, ctx: { orgId: "org_aws_proof_1" } } as never;
+    const handler = bobCostasHandler("short", { db, reader: { provider: "fs", read: async () => ({ manifest: m }) } as never, store, summarizer: extractiveSummarizer, keyring });
+    // Before the fix this threw chunk_missing: the chunk was looked up at the unprefixed key.
+    const outcome = await handler(msg, recorder).then(() => "ok", (e: { code?: string }) => e.code ?? String(e));
+    expect(outcome).toBe("ok");
+    const row = (await pg.query<Record<string, unknown>>(`SELECT * FROM sessions.session_summaries WHERE org_id = 'org_aws_proof_1'`)).rows[0]!;
+    expect(row.status).toBe("ready");
+    expect(row.object_key).toBe("96bulls/org_aws_proof_1/v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/short.json.enc");
+    const rec = await readSummaryObject({ store, keyring, ids: { orgId: "org_aws_proof_1", workspaceId: "w" }, key: String(row.object_key), sha256: String(row.object_sha256), kind: "short", revision: 2 });
+    expect(rec?.summary).toContain("PLANTED-PROMPT");
+  }, 30_000);
+});

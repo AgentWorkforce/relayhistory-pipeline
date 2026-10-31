@@ -70,6 +70,7 @@ describe("harness endpoints", () => {
     expect(SESSION_DIRECTORY_POSTGREST).toMatchObject({ service: "session-directory-postgrest", namespace: "96bulls", port: 3000, url: "http://session-directory-postgrest.96bulls.svc:3000" });
     const eks = readFileSync(fileURLToPath(new URL("../eks.ts", import.meta.url)), "utf8");
     expect(eks).toContain("relayauthTls: selfAuth");
+    expect(eks).toContain('caConfigMap: { name: "relayauth-ca", key: "ca.crt", namespace: NAMESPACE, publishedBy: "operator" }');
     expect(eks).toContain("sessionDirectoryPostgrest: sessionDirectory");
   });
 });
