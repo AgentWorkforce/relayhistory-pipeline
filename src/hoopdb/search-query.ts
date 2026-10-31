@@ -588,6 +588,9 @@ export function searchRpcRequest(request: SessionSearchRequest):
         : c.workspaceId !== undefined && c.workspaceId !== request.workspaceId
     )
       return refuse("22023", "cursor is incomplete or for another scope");
+    // As for since/until: an unparseable timestamp would fail PostgREST's cast (22007).
+    if (Number.isNaN(Date.parse(c.lastActivityAt)))
+      return refuse("22023", "cursor lastActivityAt is not a timestamp");
     body.p_cursor_last_activity_at = c.lastActivityAt;
     body.p_cursor_session_id = c.sessionId;
     body.p_cursor_harness = c.harness;

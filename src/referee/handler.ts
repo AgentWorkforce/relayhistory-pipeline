@@ -10,6 +10,7 @@ import type { HoopDb } from "../shared/db.ts";
 import { ctxOf } from "../shared/enrich.ts";
 import { integer } from "../shared/env.ts";
 import { log } from "../shared/log.ts";
+import { projectSessionDirectory } from "../hoopdb/session-directory-projector.ts";
 
 export type Verdict = { state: "active" | "done" | "abandoned" | "unknown"; rule: string };
 
@@ -45,6 +46,15 @@ export function refereeHandler(deps: { db: HoopDb; reader: ManifestReader; now?:
       "SELECT sessions.set_session_state($1,$2,$3,$4,$5,$6,$7::timestamptz)",
       [message.ctx.orgId, s.workspace_id, s.harness, s.session_id, s.machine_id, verdict.state, classifiedAt.toISOString()],
     );
+    // set_session_state updates only the pointer; re-project the logical session so
+    // the directory's state (and its p_state filter) follows the classification.
+    if (rows[0]?.set_session_state)
+      await projectSessionDirectory(deps.db, {
+        orgId: message.ctx.orgId,
+        workspaceId: s.workspace_id,
+        harness: s.harness,
+        sessionId: s.session_id,
+      });
     await deps.db.query(
       `INSERT INTO sessions.session_verdicts
          (org_id, workspace_id, harness, session_id, machine_id, session_uuid, trace_id, revision, state, rule, model_id, classified_at)

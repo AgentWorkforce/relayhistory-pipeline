@@ -867,6 +867,15 @@ describe("typed refusals, never empty results", () => {
     );
   });
 
+  test("an unparseable cursor timestamp is a typed 22023 in TypeScript", () => {
+    const built = searchRpcRequest({
+      workspaceId: "ws-a",
+      cursor: { lastActivityAt: "bad-date", sessionId: "s", harness: "codex" },
+    });
+    expect(built.ok).toBe(false);
+    expect(!built.ok && built.code).toBe("22023");
+  });
+
   test("an unparseable since or until is a typed 22023 in TypeScript", () => {
     for (const field of ["since", "until"] as const) {
       const built = searchRpcRequest({
