@@ -48,7 +48,7 @@ export interface ObjectLandedPayload {
    * `${key}@${entry_sha256}` instead of `manifestWorkKey`. Only the ingest
    * writes queue messages, so this cannot come from a client.
    */
-  migration?: { key: string; entry_sha256: string };
+  migration?: { key: string; entry_sha256: string; base_revision?: number };
 }
 
 export type ObjectStoreProvider = "r2" | "s3" | "gcs" | "azure" | "fs";
@@ -67,7 +67,7 @@ export interface RawPointer {
   /** The manifest was deleted: remove the pointer rather than upsert it. */
   deleted?: boolean;
   /** Migration work: see `ObjectLandedPayload.migration`. */
-  migration?: { key: string; entry_sha256: string };
+  migration?: ObjectLandedPayload["migration"];
 }
 
 export interface SessionPointerIndex {
@@ -164,11 +164,19 @@ export function objectLandedWorkKey(
     typeof migration.key !== "string" ||
     typeof migration.entry_sha256 !== "string" ||
     !/^[0-9a-f]{64}$/.test(migration.entry_sha256) ||
+    (migration.base_revision !== undefined &&
+      !(
+        Number.isSafeInteger(migration.base_revision) &&
+        migration.base_revision >= 1
+      )) ||
     unprefixed === undefined ||
     migration.key !== unprefixed
   )
     return undefined;
-  return `${migration.key}@${migration.entry_sha256}`;
+  // A v2 backfill names the base revision it appended to (migrationWorkKey).
+  return migration.base_revision === undefined
+    ? `${migration.key}@${migration.entry_sha256}`
+    : `${migration.key}@${migration.entry_sha256}@r${migration.base_revision + 1}`;
 }
 
 export function objectLandedHandler(deps: {
