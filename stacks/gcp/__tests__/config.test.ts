@@ -535,6 +535,7 @@ describe("GCP self-host contract", () => {
     expect(rendered).toContain("relayauth-runtime");
     expect(rendered).toContain("relayfile-runtime");
     expect(rendered).not.toMatch(/PRIVATE KEY|password|token/i);
+    expect(auth.relayhistory).toEqual({ allowPrivateHttpOrigin: true });
   });
 
   it("keeps Relayflows standalone and optional", () => {

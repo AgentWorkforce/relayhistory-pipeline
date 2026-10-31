@@ -492,6 +492,10 @@ export function relayauthChartValues(i: RelayAuthChartInputs, defaultStorageClas
   return {
     replicaCount: 1,
     existingSecret: i.existingSecretName,
+    // The conformance History origin is an in-cluster HTTP service. RelayAuth
+    // remains fail-closed for public HTTP origins; this chart switch permits
+    // only its private/internal-host validation path.
+    relayhistory: { allowPrivateHttpOrigin: true },
     ...(i.baseUrl ? { baseUrl: i.baseUrl, issuer: i.baseUrl } : {}),
     persistence: { storageClass: i.storageClass ?? defaultStorageClass },
     jwksIngress: i.baseUrl

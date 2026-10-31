@@ -187,7 +187,9 @@ shared audience. The release also enables AlleyOop's RelayAuth JWT verifier;
 that switch does not reopen the legacy audience while the origin is present.
 A verifier may reach the ClusterIP through a local
 port-forward, but it must still ask RelayAuth to bind the token to this stable
-in-cluster origin.
+in-cluster origin. The GCP RelayAuth values enable its private/internal HTTP
+origin policy so this exact `.svc` origin can be minted; public HTTP origins
+remain refused by RelayAuth.
 
 Those are names and identifiers only. Secret payloads never belong in this
 file or Helm values. The stage uses its private Artifact Registry repository
