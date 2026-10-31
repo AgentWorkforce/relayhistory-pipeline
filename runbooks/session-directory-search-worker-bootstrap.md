@@ -61,13 +61,41 @@ Phase 1 creates no membership when a superuser runs it. On PostgreSQL 16+, a non
 CREATEROLE creator is automatically granted ADMIN OPTION on the new role. The migration
 refuses that grant, so phase 1 refuses such a caller up front (`42501`).
 
-## Readiness marker (what makes a reader ready)
+## Readiness (what makes a reader ready)
 
-The ledger alone never makes HoopDb ready. Migrations commit and enter the ledger before
-phase 2 runs, so a ledger-only check would turn ready even when phase 2 failed. Readers
-therefore also require a PASS record for their own migration-set generation in
-`sessions.__96bulls_role_validation`. That covers `waitForSchema`, worker startup, the
-worker's `/readyz` (re-read on every probe) and the ingest's `/readyz`.
+A reader is ready only when all three hold:
+
+1. the ledger is complete;
+2. the marker in `sessions.__96bulls_role_validation` is `'pass'` for the reader's own
+   migration-set generation;
+3. phase 2 passes **live**, on this check.
+
+The marker is generation, coordination and audit evidence, never the sole authority. A
+grant added after a PASS fails the next check with no migrator involved. The same rule
+gates `waitForSchema` (startup), worker startup, every worker `/readyz` probe, every
+ingest `/readyz` probe, and the worker's claim loop before it takes new work.
+
+The live check (`liveRoleGate` in `src/shared/db.ts`):
+
+- **One source:** it executes `supabase/bootstrap/session_directory_search_worker_verify.sql`,
+  the same file the migrator runs and `mark_pass.sql` includes with `\ir`.
+- **Read-only and bounded:** one `READ ONLY` transaction with its own
+  `statement_timeout` (`HOOPDB_ROLE_GATE_TIMEOUT_MS`, default 2000).
+- **No lock, no cache:** it never takes the migrator's advisory lock, so a long migrate
+  never blocks a probe, and it runs on every probe and every claim tick.
+- **Its own role:** it runs as the role the service connects as (`HOOPDB_URL`). That
+  role needs SELECT on the ledger and the marker table. Phase 2 reads only PUBLIC-readable
+  catalogs: `pg_roles`, `pg_auth_members`, `pg_db_role_setting`, `pg_shdepend`,
+  `pg_namespace`, `pg_proc`, `pg_database` and `pg_default_acl`.
+- **Fails closed:** any error closes the gate, is logged with its SQLSTATE (`live role
+validation gate closed`) and makes the reader not ready. That covers a violation
+  (`55000`), an unreadable catalog (`42501`), a timeout (`57014`) and a lost connection.
+
+**The worker while the gate is closed:** the claim loop checks the gate before each
+tick, and while it is closed the worker claims nothing and runs no side tick. Work
+claimed before the gate closed has already finished inside its poll call (acked, retried
+or dead-lettered). A batch cut short by a crash is redelivered when its lease expires.
+The worker resumes claiming on the first tick after the gate reopens.
 
 Record format, the contract for #75's external verifier:
 

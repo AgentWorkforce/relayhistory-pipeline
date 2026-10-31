@@ -19,6 +19,7 @@ import {
   type ManifestReaderName,
 } from "./vendor.ts";
 import {
+  inTransaction,
   openHoopDb,
   schemaVerdict,
   waitForHoopDb,
@@ -184,12 +185,27 @@ export function healthVerdict(
   return { ok: true, reason: h.ready ? "ok" : "starting" };
 }
 
+/**
+ * The claim gate: the same live check as /readyz (ledger, marker and phase 2). Closed
+ * when it is unset, false, or throws. Logged when closed so a paused worker is visible.
+ */
+export async function gateOpen(
+  h: Pick<WorkerHealth, "schemaReady">,
+): Promise<boolean> {
+  const open = h.schemaReady ? await h.schemaReady().catch(() => false) : false;
+  if (!open)
+    log.warn(
+      "worker paused: live role validation gate closed; claiming nothing",
+    );
+  return open;
+}
+
 /** Readiness: the schema is complete and HoopDb is answering now. */
 export function readyVerdict(h: WorkerHealth, opts: { maxFailures: number }) {
   return h.ready && h.consecutiveDbFailures < opts.maxFailures;
 }
 
-function serveHealth(health: WorkerHealth, port: number) {
+export function serveHealth(health: WorkerHealth, port: number) {
   const maxFailures = integer("WORKER_UNHEALTHY_AFTER_FAILURES", 5);
   const maxTickAgeMs = integer("WORKER_MAX_TICK_AGE_MS", 120_000);
   const server = createServer((req, res) => {
@@ -252,6 +268,7 @@ function serveHealth(health: WorkerHealth, port: number) {
   server.listen(port, "0.0.0.0", () =>
     log.info("worker health listening", { port }),
   );
+  return server;
 }
 
 export async function runWorker(opts: WorkerOptions): Promise<never> {
@@ -272,7 +289,9 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   await waitForHoopDb(db);
   const expected = await expectedSchema();
   await waitForSchema(db, expected);
-  health.schemaReady = async () => (await schemaVerdict(db, expected)).ok;
+  // Live on every /readyz probe and before every claim: ledger, marker AND phase 2 now.
+  health.schemaReady = async () =>
+    (await schemaVerdict(db, expected, (work) => inTransaction(db, work))).ok;
   clearInterval(startupBeat);
   health.ready = true;
   health.lastTickAt = Date.now();
@@ -349,6 +368,14 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
       });
     }
     health.lastTickAt = Date.now();
+    // The live gate, before any new work is claimed. While it is closed the worker
+    // claims nothing (and runs no side tick); work claimed earlier has already
+    // finished inside its pollPostgresStage call (acked, retried or dead-lettered),
+    // and a batch cut short by a crash is re-delivered when its lease expires.
+    if (!(await gateOpen(health))) {
+      await sleep(idleMs);
+      continue;
+    }
     for (const stage of opts.stages) {
       try {
         const r = await pollPostgresStage({

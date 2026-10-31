@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { openHoopDb, waitForHoopDb, ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE, type ExpectedSchema } from "../shared/db.ts";
+import { openHoopDb, waitForHoopDb, ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE, ROLE_VERIFY_SQL_PATH, type ExpectedSchema } from "../shared/db.ts";
 import { log } from "../shared/log.ts";
 import { flag, optional } from "../shared/env.ts";
 
@@ -26,7 +26,8 @@ const SHIM = join(ROOT, "supabase/tests/supabase_shim.sql");
 const WORKER_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_directory_search_worker.sql");
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
-const WORKER_VERIFY = join(ROOT, "supabase/bootstrap/session_directory_search_worker_verify.sql");
+// The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
+const WORKER_VERIFY = ROLE_VERIFY_SQL_PATH;
 const OURS = join(ROOT, "src/hoopdb/migrations");
 
 export const MIGRATION_LEDGER = "sessions.__96bulls_migrations";

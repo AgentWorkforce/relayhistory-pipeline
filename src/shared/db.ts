@@ -1,8 +1,10 @@
 /** HoopDb access: a pg Pool that satisfies the vendored SqlExecutor, plus readiness gates. */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { log } from "./log.ts";
-import { required } from "./env.ts";
+import { integer, required } from "./env.ts";
 
 export interface HoopDb extends SqlExecutor {
   pool: pg.Pool;
@@ -91,10 +93,49 @@ export interface ExpectedSchema {
 export type SchemaVerdict =
   | { ok: true }
   | { ok: false; reason: "schema_pending"; count: number }
-  | { ok: false; reason: "validation_pending" };
+  | { ok: false; reason: "validation_pending" }
+  | { ok: false; reason: "role_validation_failed"; error_code: string };
 
 /**
- * Is HoopDb ready for this image? Missing ledger rows: schema_pending. A marker that
+ * The one phase 2 source. The migrator (src/hoopdb/migrate.ts), the external
+ * verifier (supabase/bootstrap/session_directory_search_worker_mark_pass.sql, via
+ * \ir) and the live readiness gate below all execute this same file.
+ */
+export const ROLE_VERIFY_SQL_PATH = fileURLToPath(
+  new URL("../../supabase/bootstrap/session_directory_search_worker_verify.sql", import.meta.url),
+);
+const ROLE_VERIFY_SQL = readFileSync(ROLE_VERIFY_SQL_PATH, "utf8");
+
+/** Runs `work` in one transaction on one connection (inTransaction, or a test double). */
+export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
+
+/**
+ * The live gate: phase 2 itself, now, as the runtime's own role. One READ ONLY
+ * transaction with its own statement_timeout (HOOPDB_ROLE_GATE_TIMEOUT_MS, default
+ * 2000), no advisory lock (a long migrate never blocks a probe), never cached. Any
+ * error (a violation, 55000; an unreadable catalog, 42501; a timeout, 57014; a lost
+ * connection) closes the gate and is logged with its SQLSTATE: it never fails open.
+ */
+export async function liveRoleGate(transact: Transact): Promise<{ ok: true } | { ok: false; error_code: string }> {
+  const timeoutMs = Math.max(1, integer("HOOPDB_ROLE_GATE_TIMEOUT_MS", 2_000));
+  try {
+    await transact(async (tx) => {
+      await tx.query("SET TRANSACTION READ ONLY");
+      await tx.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
+      await tx.query(ROLE_VERIFY_SQL);
+    });
+    return { ok: true };
+  } catch (err) {
+    const error_code = (err as { code?: string }).code ?? "role_gate_error";
+    log.warn("live role validation gate closed", { error_code });
+    return { ok: false, error_code };
+  }
+}
+
+/**
+ * Is HoopDb ready for this image? All three must hold: the ledger is complete, the
+ * marker is 'pass' for this generation, and phase 2 passes live (liveRoleGate).
+ * Missing ledger rows: schema_pending. A marker that
  * is absent, 'pending', or 'pass' for any other generation: validation_pending. Only
  * 'pass' for exactly `expected.generation` is ready. Fails closed: a missing ledger is
  * schema_pending and a missing marker table validation_pending; other errors propagate (callers treat them as
@@ -103,6 +144,7 @@ export type SchemaVerdict =
 export async function schemaVerdict(
   db: { query<R = Record<string, unknown>>(text: string, params?: unknown[]): Promise<{ rows: R[] }> },
   expected: ExpectedSchema,
+  transact: Transact,
 ): Promise<SchemaVerdict> {
   let rows: { name: string }[];
   try {
@@ -130,6 +172,10 @@ export async function schemaVerdict(
   }
   if (!marker || marker.status !== "pass" || marker.generation !== expected.generation)
     return { ok: false, reason: "validation_pending" };
+  // The marker is generation, coordination and audit evidence; it is never the sole
+  // authority. Ready also needs phase 2 to pass live, now.
+  const gate = await liveRoleGate(transact);
+  if (!gate.ok) return { ok: false, reason: "role_validation_failed", error_code: gate.error_code };
   return { ok: true };
 }
 
@@ -144,7 +190,7 @@ export async function waitForSchema(db: HoopDb, expected: ExpectedSchema, timeou
   let reason = "unreachable";
   for (;;) {
     try {
-      const v = await schemaVerdict(db, expected);
+      const v = await schemaVerdict(db, expected, (work) => inTransaction(db, work));
       if (v.ok) return;
       reason = v.reason;
     } catch {

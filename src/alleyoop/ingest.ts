@@ -319,12 +319,13 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     const v = healthVerdict(health, Date.now(), { maxFailures, maxTickAgeMs });
     return c.json(v, v.ok ? 200 : 503);
   });
-  // Ready = the schema this image was built for is fully migrated AND the Worker role
-  // validation is PASS for this image's generation, not just "DB answers".
+  // Ready = the schema this image was built for is fully migrated, the Worker role
+  // validation marker is PASS for this image's generation, AND phase 2 passes live on
+  // this probe (read-only, bounded, uncached), not just "DB answers".
   const expected = await expectedSchema();
   app.get("/readyz", async (c) => {
     try {
-      const schema = await schemaVerdict(db, expected);
+      const schema = await schemaVerdict(db, expected, transaction);
       if (!schema.ok) return c.json(schema, 503);
       const data = await liveDataPathVerdict(process.env);
       if (!data.ok) return c.json({ ok: false, missing: data.missing }, 503);

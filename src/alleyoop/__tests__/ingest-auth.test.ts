@@ -554,8 +554,24 @@ describe("buildIngestApp auth (production composition)", () => {
         "UPDATE sessions.__96bulls_role_validation SET generation = $1, status = 'pass'",
         [gen],
       );
-      // Past the schema gate: whatever /readyz says next, it is not the marker.
+      // Past the schema gate: whatever /readyz says next, it is not the marker or phase 2.
       expect((await ready()).body.reason).not.toBe("validation_pending");
+      expect((await ready()).body.reason).not.toBe("role_validation_failed");
+      // Post-PASS drift with no migrator: the live gate closes /readyz on the next probe.
+      await db.exec(
+        "GRANT SELECT ON sessions.session_index TO session_directory_search_worker",
+      );
+      try {
+        expect(await ready()).toMatchObject({
+          status: 503,
+          body: { reason: "role_validation_failed", error_code: "55000" },
+        });
+      } finally {
+        await db.exec(
+          "REVOKE SELECT ON sessions.session_index FROM session_directory_search_worker",
+        );
+      }
+      expect((await ready()).body.reason).not.toBe("role_validation_failed");
     } finally {
       await db.exec(
         "DROP TABLE sessions.__96bulls_role_validation; DROP TABLE sessions.__96bulls_migrations",
