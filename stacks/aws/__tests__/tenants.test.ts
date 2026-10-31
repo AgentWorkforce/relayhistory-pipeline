@@ -15,10 +15,15 @@ const base = { stage: "aws-proof", runtimeSecretName: "rt", lockerBucket: "b", l
 const env = (v: { extraEnv?: { name: string; value: string }[] }) => Object.fromEntries((v.extraEnv ?? []).map((e) => [e.name, e.value]));
 
 describe("tenant orgs", () => {
-  it("keeps the single-org shape byte for byte (sessions-dev values do not change)", () => {
+  it("keeps the single-org shape (sessions-dev values change only by the explicit database-mode env)", () => {
     const v = eksChartValues({ ...base, tenantOrgId: "org_sessions_dev" }, false, "i", "j");
     expect(v.global.tenant.orgId).toBe("org_sessions_dev");
-    expect("extraEnv" in v.worker).toBe(false);
+    // External (Supabase): supabase mode, the shim off, and no runtime role default, so the
+    // migrator refuses to run until hoopdbRuntimeRole is set.
+    expect(v.worker.extraEnv).toEqual([
+      { name: "HOOPDB_DB_MODE", value: "supabase" },
+      { name: "HOOPDB_SUPABASE_SHIM", value: "false" },
+    ]);
     expect(v.alleyoop.extraEnv).toEqual([{ name: "RELAYHISTORY_ORIGIN", value: "https://proof-sessions.agentrelay.com" }]);
     expect(eksChartValues({ ...base, tenantOrgIds: ["org_sessions_dev"] }, false, "i", "j")).toEqual(v);
   });
@@ -27,7 +32,7 @@ describe("tenant orgs", () => {
     const v = eksChartValues({ ...base, tenantOrgIds: ["org_aws_proof_1", "org_aws_proof_2"] }, false, "i", "j");
     expect(v.global.tenant.orgId).toBe("org_aws_proof_1");
     const want = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: TENANT_KEY_BASE, TENANT_ORG_IDS: "org_aws_proof_1,org_aws_proof_2" };
-    expect(env(v.worker as never)).toEqual(want);
+    expect(env(v.worker as never)).toEqual({ HOOPDB_DB_MODE: "supabase", HOOPDB_SUPABASE_SHIM: "false", ...want });
     expect(env(v.alleyoop)).toEqual({ RELAYHISTORY_ORIGIN: "https://proof-sessions.agentrelay.com", ...want });
   });
 

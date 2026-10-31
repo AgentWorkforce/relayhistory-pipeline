@@ -65,6 +65,16 @@ describe("CloudNativePG proof HoopDb", () => {
     expect(cnpg.worker.hoopdb).toEqual({});
     expect(cnpg.alleyoop.hoopdb).toEqual({});
     expect(cnpg.worker.migrations.supabaseShim).toBe(true);
+    // The migrator's explicit database-mode contract: never inferred from the host.
+    const modeEnv = (v: { worker: { extraEnv?: Array<{ name: string; value: string }> } }) =>
+      Object.fromEntries((v.worker.extraEnv ?? []).filter((e) => e.name.startsWith("HOOPDB_")).map((e) => [e.name, e.value]));
+    expect(modeEnv(external as never)).toEqual({ HOOPDB_DB_MODE: "supabase", HOOPDB_SUPABASE_SHIM: "false" });
+    expect(modeEnv(cnpg as never)).toEqual({ HOOPDB_DB_MODE: "selfhosted", HOOPDB_SUPABASE_SHIM: "true", HOOPDB_RUNTIME_ROLE: "hoop" });
+    expect(modeEnv(eksChartValues({ ...base, hoopdbRuntimeRole: "bulls96_runtime" }, false, "i", "j") as never)).toEqual({
+      HOOPDB_DB_MODE: "supabase",
+      HOOPDB_SUPABASE_SHIM: "false",
+      HOOPDB_RUNTIME_ROLE: "bulls96_runtime",
+    });
     expect(cnpg.hoopdb).toMatchObject({ enabled: true, cluster: { storage: { storageClass: STORAGE_CLASS } } });
   });
 });

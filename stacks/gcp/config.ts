@@ -240,6 +240,11 @@ export interface GcpInputs {
     chartVersion: string;
     tenantOrgId: string;
     existingSecretName: string;
+    /**
+     * HOOPDB_RUNTIME_ROLE: the Cloud SQL role the services connect as. No default: unset,
+     * the migrator refuses to run (src/hoopdb/migrate.ts).
+     */
+    hoopdbRuntimeRole?: string;
     /** Digest of the services image built from the reviewed runtime commit. */
     imageDigest: string;
     /** Full Git revision from which imageDigest was built. Must match versions.lock.json. */
@@ -887,7 +892,15 @@ export function bulls96ReleaseValues(
       },
       serviceAccount: { annotations: { ...identity } },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
-      extraEnv: dataEnv(),
+      // Cloud SQL is plain Postgres: selfhosted mode, the shim on, an explicit runtime role.
+      extraEnv: [
+        ...dataEnv(),
+        { name: "HOOPDB_DB_MODE", value: "selfhosted" },
+        { name: "HOOPDB_SUPABASE_SHIM", value: "true" },
+        ...(i.hoopdbRuntimeRole
+          ? [{ name: "HOOPDB_RUNTIME_ROLE", value: i.hoopdbRuntimeRole }]
+          : []),
+      ],
     },
     alleyoop: {
       fullnameOverride: GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.alleyoop,

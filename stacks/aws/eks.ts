@@ -57,6 +57,16 @@ import {
 
 export { telemetryPolicy } from "./hardening.ts";
 
+/** HOOPDB_DB_MODE, an explicit shim choice and HOOPDB_RUNTIME_ROLE for the migrator. */
+export function hoopdbModeEnv(inCluster: boolean, runtimeRole?: string): Array<{ name: string; value: string }> {
+  const role = runtimeRole ?? (inCluster ? "hoop" : undefined);
+  return [
+    { name: "HOOPDB_DB_MODE", value: inCluster ? "selfhosted" : "supabase" },
+    { name: "HOOPDB_SUPABASE_SHIM", value: inCluster ? "true" : "false" },
+    ...(role ? [{ name: "HOOPDB_RUNTIME_ROLE", value: role }] : []),
+  ];
+}
+
 export interface EksStageInputs {
   stage: string;
   /** The account the stage deploys into; Pod Identity trust is bound to it. */
@@ -66,6 +76,12 @@ export interface EksStageInputs {
   chartVersion: string;
   /** Kubernetes Secret holding HOOPDB_URL, LOCKER_* and the JWKS settings; created by the secrets sync, not by IaC. */
   runtimeSecretName: string;
+  /**
+   * HOOPDB_RUNTIME_ROLE: the database role the services connect as. In-cluster it
+   * defaults to the chart's owner `hoop` (owner-run). External (Supabase) has no default:
+   * unset, the migrator refuses to run (src/hoopdb/migrate.ts).
+   */
+  hoopdbRuntimeRole?: string;
   lockerBucket: string;
   lockerRegion: string;
   /** One tenant org (single-tenant mode). */
@@ -128,7 +144,7 @@ export const OTEL_ENDPOINT = "http://otel-collector:4318";
  * tested without loading either the AWS or Kubernetes providers.
  */
 export function eksChartValues(
-  i: Pick<EksStageInputs, "stage" | "claimlessWindow" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "tenantOrgIds" | "relayhistoryOrigin" | "imageRepository" | "imageDigest">,
+  i: Pick<EksStageInputs, "stage" | "claimlessWindow" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "tenantOrgIds" | "relayhistoryOrigin" | "imageRepository" | "imageDigest" | "hoopdbRuntimeRole">,
   sandbox: boolean,
   authIssuer: string,
   authJwksUrl: string,
@@ -157,7 +173,8 @@ export function eksChartValues(
       // Bob Costas alone gets the summary master key (src/shared/keyring.ts): worker 0.4.0 projects
       // this Secret key as a read-only file into Bob Costas only (SUMMARY_MASTER_KEYS_FILE).
       summaryEncryption: { existingSecret: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" },
-      ...(tenants.extraEnv.length ? { extraEnv: tenants.extraEnv } : {}),
+      // The migrator's explicit database-mode contract (src/hoopdb/migrate.ts); never inferred from the host.
+      extraEnv: [...hoopdbModeEnv(inCluster, i.hoopdbRuntimeRole), ...tenants.extraEnv],
     },
     alleyoop: {
       image: { repository: i.imageRepository, digest: i.imageDigest },

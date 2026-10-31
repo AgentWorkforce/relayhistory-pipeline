@@ -160,6 +160,52 @@ Otherwise it fails with `55000` and changes nothing.
 Kubernetes Job and pod ordering is defense in depth only. Correctness rests on the
 marker: a reader started early, or a migrator that died, simply stays non-ready.
 
+## Database mode, runtime role and one migration authority
+
+`src/hoopdb/migrate.ts` resolves an explicit profile **before opening any connection**. It
+never infers anything from the hostname. An invalid profile writes nothing anywhere.
+
+| Variable                | Contract                                                                                                                                                                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `HOOPDB_DB_MODE`        | required, no default: `local` (Docker stack), `selfhosted` (CNPG, Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                              |
+| `HOOPDB_SUPABASE_SHIM`  | `local` and `selfhosted`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project. |
+| `HOOPDB_ROLE_BOOTSTRAP` | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                               |
+| `HOOPDB_RUNTIME_ROLE`   | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                         |
+
+**Runtime role.** Checked under the migrator's advisory lock, before any write: before the
+pending marker upsert, before any step, and before the ledger or marker tables are
+created.
+
+- **Missing role:** `runtime_role_missing`.
+- **The migrator itself (owner-run):** accepted in `local` and `selfhosted`, refused in
+  `supabase` (`runtime_role_unsafe`).
+- **Any other role:** must not be a superuser, BYPASSRLS or the search Worker
+  (`runtime_role_unsafe`).
+
+A dedicated role gets exactly `USAGE` on schema `sessions` (to reach the tables; it
+creates nothing) and `SELECT` on `sessions.__96bulls_migrations` and
+`sessions.__96bulls_role_validation`. Nothing else: no DML, no DDL, no ownership. The grant
+is idempotent. The services' other table grants are outside this step (#98).
+
+**One migration authority (decision point).** Also under the lock and before any write,
+the migrator refuses:
+
+- `mixed_migration_authority`: `supabase_migrations.schema_migrations` (the
+  `supabase db push` history) records any of these migrations.
+- `unledgered_schema`: `sessions.session_index` exists, but the ledger does not record
+  the first migration.
+- `ledger_gap`: the ledger skips a step that a later recorded step follows.
+
+It never imports a backlog into the ledger and never marks a step applied. Resolving any of
+these is an explicit operator decision, recorded in the activation dossier (#98):
+
+1. choose one authority for this database (`hoopdb-migrate`, or the Supabase CLI, never
+   both);
+2. reconcile by hand and review the result: for example, recreate a disposable database;
+   or verify each object against the file and have the owner write ledger rows in a
+   reviewed change;
+3. only then rerun the migrator.
+
 ## CNPG (self-hosted HoopDb)
 
 - **Phase 1, every deploy (required for existing clusters):** a Job ordered before
@@ -181,8 +227,8 @@ role-level `statement_timeout`, so it is not enough on its own.
 records either in the ledger:
 
 - **Phase 1** is the `bootstrap:session_directory_search_worker` step, which runs before
-  the migrations whenever the Supabase role shim is enabled (`HOOPDB_ROLE_BOOTSTRAP`,
-  default `HOOPDB_SUPABASE_SHIM`). As non-superuser `hoop`, it only verifies an
+  the migrations when the profile enables it (`HOOPDB_ROLE_BOOTSTRAP`, default the
+  explicit `HOOPDB_SUPABASE_SHIM` choice; never in `supabase` mode, see below). As non-superuser `hoop`, it only verifies an
   already-provisioned role and fails closed with `42501` if the role is absent, so the
   deploy Job above must run first. On the local Docker stack, the migrator is the database
   superuser and the step creates the role.
@@ -244,5 +290,6 @@ The HoopDb ledger records each migration's sha256. This hotfix changes
 `20261030020000`, so a rehearsal database that already applied the old file fails with
 "changed after it was applied". Recreate any such disposable database. This includes a
 local Docker stack: run `96bulls down <stage> --purge`, then `up`. The old file was never
-applied to a real one. The sha256 of `20261030020000` changes from `ef41a4aa...679f` to
-`f86e5dc9...0d66`.
+applied to a real one. The sha256 of `20261030020000` as merged (#96, after #72's token pins) is
+`c223b77e4c875cbc36499e6ca1c8e521b564ebf25facd87313b3e58335918de4`. The earlier draft value
+`f86e5dc9...0d66` was superseded before merge. A test pins the checksum.

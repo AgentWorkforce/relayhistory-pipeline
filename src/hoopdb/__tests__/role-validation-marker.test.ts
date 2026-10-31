@@ -29,7 +29,17 @@ import {
   plan,
   runMigrations,
   type MigrationClient,
+  type MigrationProfile,
 } from "../migrate.ts";
+
+/** The local Docker profile, as PGlite (its superuser runs everything). */
+const LOCAL: MigrationProfile = {
+  mode: "local",
+  shim: true,
+  bootstrap: true,
+  verify: true,
+  runtimeRole: "postgres",
+};
 
 setDefaultTimeout(60_000);
 const root = join(import.meta.dir, "../../..");
@@ -99,23 +109,25 @@ describe("Worker role validation marker", () => {
       ok: false,
       reason: "schema_pending",
     }); // no ledger yet
-    const first = await runMigrations(client(db));
+    const first = await runMigrations(client(db), { profile: LOCAL });
     expect(first.applied).toBeGreaterThan(0);
     expect(await marker(db)).toEqual([
       { generation: await generation(), status: "pass" },
     ]);
     expect(await verdict(db)).toEqual({ ok: true });
-    const again = await runMigrations(client(db));
+    const again = await runMigrations(client(db), { profile: LOCAL });
     expect(again.applied).toBe(0);
     expect(await verdict(db)).toEqual({ ok: true });
   });
 
   test("after phase 2 fails, readiness stays false across retries until the drift is fixed and phase 2 passes", async () => {
     const db = await fresh();
-    await runMigrations(client(db));
+    await runMigrations(client(db), { profile: LOCAL });
     await db.exec(`GRANT SELECT ON sessions.session_directory TO ${WORKER}`);
     for (let attempt = 0; attempt < 2; attempt++) {
-      const error = await failure(runMigrations(client(db)));
+      const error = await failure(
+        runMigrations(client(db), { profile: LOCAL }),
+      );
       expect(error?.code).toBe("55000");
       expect(error?.message).toContain(
         "has privileges on table sessions.session_directory",
@@ -127,13 +139,13 @@ describe("Worker role validation marker", () => {
       expect((await marker(db))[0]?.status).toBe("pending");
     }
     await db.exec(`REVOKE SELECT ON sessions.session_directory FROM ${WORKER}`);
-    await runMigrations(client(db));
+    await runMigrations(client(db), { profile: LOCAL });
     expect(await verdict(db)).toEqual({ ok: true });
   });
 
   test("an earlier PASS can't mask a later failing validator: the next migrator invalidates it first", async () => {
     const db = await fresh();
-    await runMigrations(client(db)); // process A: PASS
+    await runMigrations(client(db), { profile: LOCAL }); // process A: PASS
     expect(await verdict(db)).toEqual({ ok: true });
     await db.exec(
       `GRANT SELECT (org_id) ON sessions.session_directory TO ${WORKER}`,
@@ -142,6 +154,7 @@ describe("Worker role validation marker", () => {
     let seenMidRun: unknown;
     const error = await failure(
       runMigrations(client(db), {
+        profile: LOCAL,
         beforeVerify: async () => {
           seenMidRun = await verdict(db);
         },
@@ -157,7 +170,7 @@ describe("Worker role validation marker", () => {
 
   test("a stale PASS from another generation is not ready, for either side", async () => {
     const db = await fresh();
-    await runMigrations(client(db));
+    await runMigrations(client(db), { profile: LOCAL });
     await db.exec(
       `UPDATE ${ROLE_VALIDATION_TABLE} SET generation = '${"0".repeat(64)}'`,
     );
@@ -166,7 +179,7 @@ describe("Worker role validation marker", () => {
       reason: "validation_pending",
     });
     // And a reader built from a different migration set never accepts this PASS.
-    await runMigrations(client(db));
+    await runMigrations(client(db), { profile: LOCAL });
     const other = { ...(await expectedSchema()), generation: "f".repeat(64) };
     expect(await schemaVerdict(other, transact(db))).toEqual({
       ok: false,
@@ -179,6 +192,7 @@ describe("Worker role validation marker", () => {
     const db = await fresh();
     const error = await failure(
       runMigrations(client(db), {
+        profile: LOCAL,
         beforeVerify: async () => {
           throw Object.assign(new Error("injected crash"), { code: "XXINJ" });
         },
@@ -194,8 +208,8 @@ describe("Worker role validation marker", () => {
 
   test("a migration failure mid-run leaves readiness false, even after an earlier PASS", async () => {
     const db = await fresh();
-    await runMigrations(client(db));
-    const steps = await plan();
+    await runMigrations(client(db), { profile: LOCAL });
+    const steps = await plan(LOCAL);
     const broken = [
       ...steps.slice(0, -1),
       {
@@ -205,7 +219,9 @@ describe("Worker role validation marker", () => {
       ...steps.slice(-1),
     ];
     expect(
-      await failure(runMigrations(client(db), { steps: broken })),
+      await failure(
+        runMigrations(client(db), { profile: LOCAL, steps: broken }),
+      ),
     ).not.toBeNull();
     expect(await verdict(db)).toEqual({
       ok: false,
@@ -215,8 +231,10 @@ describe("Worker role validation marker", () => {
 
   test("with the in-process verifier off the migrator never marks itself ready; only an external PASS for this generation does", async () => {
     const db = await fresh();
-    const steps = (await plan()).filter((s) => !s.name.startsWith("verify:"));
-    await runMigrations(client(db), { steps });
+    const steps = (await plan(LOCAL)).filter(
+      (s) => !s.name.startsWith("verify:"),
+    );
+    await runMigrations(client(db), { profile: LOCAL, steps });
     expect((await marker(db))[0]).toEqual({
       generation: await generation(),
       status: "pending",
@@ -236,8 +254,10 @@ describe("Worker role validation marker", () => {
 
   test("waitForSchema refuses to report ready while the marker is pending", async () => {
     const db = await fresh();
-    const steps = (await plan()).filter((s) => !s.name.startsWith("verify:"));
-    await runMigrations(client(db), { steps });
+    const steps = (await plan(LOCAL)).filter(
+      (s) => !s.name.startsWith("verify:"),
+    );
+    await runMigrations(client(db), { profile: LOCAL, steps });
     const error = await failure(
       waitForSchema(hoopLike(db), await expectedSchema(), 0),
     );
@@ -254,7 +274,7 @@ describe("the live gate: the marker is never the sole authority", () => {
 
   test("post-PASS drift with no migrator: schemaVerdict, waitForSchema and worker /readyz all fail, and recover when fixed", async () => {
     const db = await fresh();
-    await runMigrations(client(db));
+    await runMigrations(client(db), { profile: LOCAL });
     expect(await verdict(db)).toEqual({ ok: true });
     expect((await marker(db))[0]?.status).toBe("pass"); // the marker still says PASS
     await db.exec(`GRANT SELECT ON sessions.session_directory TO ${WORKER}`);
@@ -290,7 +310,7 @@ describe("the live gate: the marker is never the sole authority", () => {
 
   test("the worker stops claiming when drift appears mid-run, and resumes once it is fixed", async () => {
     const db = await fresh();
-    await runMigrations(client(db));
+    await runMigrations(client(db), { profile: LOCAL });
     const expected = await expectedSchema();
     const health = {
       schemaReady: async () => (await schemaVerdict(expected, transact(db))).ok,
@@ -326,7 +346,7 @@ describe("the live gate: the marker is never the sole authority", () => {
 
   test("an unreadable catalog fails closed (42501), never open", async () => {
     const db = await fresh();
-    await runMigrations(client(db));
+    await runMigrations(client(db), { profile: LOCAL });
     await db.exec(`CREATE ROLE g6_runtime NOLOGIN;
       GRANT USAGE ON SCHEMA sessions TO g6_runtime;
       GRANT SELECT ON sessions.__96bulls_migrations, ${ROLE_VALIDATION_TABLE} TO g6_runtime;`);
@@ -380,7 +400,7 @@ describe("the live gate: the marker is never the sole authority", () => {
     expect(seen.some((q) => /advisory/i.test(q))).toBe(false);
     // One source: the migrator's verify step and mark_pass.sql use the same file.
     expect(
-      (await plan()).find((st) => st.name.startsWith("verify:"))?.path,
+      (await plan(LOCAL)).find((st) => st.name.startsWith("verify:"))?.path,
     ).toBe(ROLE_VERIFY_SQL_PATH);
     expect(MARK_PASS).toContain(
       "\\ir session_directory_search_worker_verify.sql",
@@ -416,7 +436,7 @@ describe("the live gate: the marker is never the sole authority", () => {
 
   test("race: the marker flips to pending after phase 2 and before the final read: not ready", async () => {
     const db = await fresh();
-    await runMigrations(client(db));
+    await runMigrations(client(db), { profile: LOCAL });
     const state = {
       flipTo: undefined as string | undefined,
       markerReads: 0,
@@ -433,7 +453,7 @@ describe("the live gate: the marker is never the sole authority", () => {
 
   test("race, reverse: pending at the first read and pass afterwards never reports ready without the live check", async () => {
     const db = await fresh();
-    await runMigrations(client(db));
+    await runMigrations(client(db), { profile: LOCAL });
     const state = {
       flipTo: "pending" as string | undefined,
       markerReads: 0,
@@ -464,7 +484,7 @@ describe("the live gate: the marker is never the sole authority", () => {
 
   test("HOOPDB_ROLE_GATE_TIMEOUT_MS above the cap (or invalid) closes the gate instead of running unbounded", async () => {
     const db = await fresh();
-    await runMigrations(client(db));
+    await runMigrations(client(db), { profile: LOCAL });
     const saved = process.env.HOOPDB_ROLE_GATE_TIMEOUT_MS;
     try {
       for (const bad of ["10001", "0", "abc", "1.5"]) {
@@ -508,8 +528,10 @@ describe("the live gate: the marker is never the sole authority", () => {
 
   test("mark_pass.sql, run as written: wrong generation, drift and already-pass are refused; only this generation's pending row passes", async () => {
     const db = await fresh();
-    const steps = (await plan()).filter((st) => !st.name.startsWith("verify:"));
-    await runMigrations(client(db), { steps });
+    const steps = (await plan(LOCAL)).filter(
+      (st) => !st.name.startsWith("verify:"),
+    );
+    await runMigrations(client(db), { profile: LOCAL, steps });
     const gen = await generation();
     expect((await runMarkPass(db, "f".repeat(64)))?.message).toContain(
       "no pending role validation for generation",
