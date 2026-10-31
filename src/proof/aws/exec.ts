@@ -23,21 +23,28 @@ export interface Step {
   timeoutMs?: number;
   /** Binary stdout (e.g. a gzip object): returned base64-encoded instead of as text. */
   binary?: boolean;
+  /**
+   * Patterns to classify stderr by (e.g. ResourceNotFoundException). Only the
+   * booleans are returned; stderr text is never kept, logged or recorded.
+   */
+  stderrPatterns?: RegExp[];
 }
 
 export interface StepOutcome {
   record: StepRecord;
   stdout: string;
   ok: boolean;
+  /** One boolean per Step.stderrPatterns entry. */
+  stderrMatches?: boolean[];
 }
 
-export type Spawn = (argv: string[], stdin: string | undefined, timeoutMs: number, binary: boolean | undefined, env: Record<string, string>) => { stdout: string; status: number | null; error?: Error };
+export type Spawn = (argv: string[], stdin: string | undefined, timeoutMs: number, binary: boolean | undefined, env: Record<string, string>) => { stdout: string; status: number | null; error?: Error; stderr?: string };
 
 const defaultSpawn: Spawn = (argv, stdin, timeoutMs, binary, env) => {
   // No shell: argv goes straight to execve. stderr is dropped on purpose: tools echo request bodies and credentials into it.
   const r = spawnSync(argv[0]!, argv.slice(1), { input: stdin, timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, shell: false, env });
   const out = r.stdout ?? Buffer.alloc(0);
-  return { stdout: binary ? out.toString("base64") : out.toString("utf8"), status: r.status, error: r.error };
+  return { stdout: binary ? out.toString("base64") : out.toString("utf8"), status: r.status, error: r.error, stderr: (r.stderr ?? Buffer.alloc(0)).toString("utf8") };
 };
 
 /** POSIX single-quote each argument that needs it, so the printed command is exactly what would run. */
@@ -50,6 +57,8 @@ export interface RunnerOptions {
   identity: Omit<GuardInput, "mode" | "mutating">;
   /** Every step's argv must stay inside this fence, in every mode (dry-run included). */
   fence: Fence;
+  /** Post-destroy verification: only aws (and in-process) steps; there is no cluster to talk to. */
+  awsOnly?: boolean;
   /**
    * The kubeconfig generated from describe-cluster (cluster-binding.ts). On the
    * proof target every non-dry kubectl/helm step requires it; the operator's
@@ -116,12 +125,15 @@ export class Runner {
     if (!g.allowed) return this.push(g.record, "", false);
     // In-process actions are gated here but performed by the caller; they are never spawned.
     if (step.argv[0] === "HTTP" || step.argv[0] === "PROBE") return this.push({ ...g.record, status: "refused", code: "in_process_not_spawnable" }, "", false);
+    if (this.o.awsOnly && step.argv[0] !== "aws") return this.push({ ...g.record, status: "refused", code: "post_destroy_aws_only" }, "", false);
     if (this.needsKubeconfig(step.argv) && !this.o.kubeconfigPath) return this.push({ ...g.record, status: "refused", code: "kubeconfig_unbound" }, "", false);
     const started = Date.now();
     const r = (this.o.spawn ?? defaultSpawn)(step.argv, step.stdin, step.timeoutMs ?? 120_000, step.binary, this.env());
     const durationMs = Date.now() - started;
     const ok = !r.error && r.status === 0;
-    return this.push({ ...g.record, status: ok ? "ran" : "failed", exitCode: r.status ?? -1, durationMs, ...(ok ? {} : { code: r.error ? "spawn_error" : `exit_${r.status}` }) }, r.stdout, ok);
+    const out = this.push({ ...g.record, status: ok ? "ran" : "failed", exitCode: r.status ?? -1, durationMs, ...(ok ? {} : { code: r.error ? "spawn_error" : `exit_${r.status}` }) }, r.stdout, ok);
+    if (step.stderrPatterns) out.stderrMatches = step.stderrPatterns.map((re) => re.test(r.stderr ?? ""));
+    return out;
   }
 
   /** gate() and record the decision in one call; for planned in-process actions. */

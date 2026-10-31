@@ -90,6 +90,13 @@ export function proofKubeconfig(d: DescribedCluster, contextName: string): strin
               apiVersion: "client.authentication.k8s.io/v1beta1",
               command: "aws",
               args: ["eks", "get-token", "--cluster-name", PROOF_CLUSTER, "--region", PROOF_REGION, "--output", "json"],
+              // Inherits the minimal tool env; these repeat the pins in case a kubectl ever adds its own.
+              env: [
+                { name: "AWS_CONFIG_FILE", value: "/dev/null" },
+                { name: "AWS_SHARED_CREDENTIALS_FILE", value: "/dev/null" },
+                { name: "AWS_STS_REGIONAL_ENDPOINTS", value: "regional" },
+                { name: "AWS_REGION", value: PROOF_REGION },
+              ],
               interactiveMode: "Never",
             },
           },
@@ -104,14 +111,48 @@ export function proofKubeconfig(d: DescribedCluster, contextName: string): strin
   );
 }
 
-/** Environment for every spawned tool: the generated kubeconfig, and nothing that retargets helm or the AWS CLI. */
+/**
+ * The complete environment of every spawned aws/kubectl/helm (and the
+ * kubeconfig's exec plugin, which inherits it). Built from scratch, never
+ * filtered from the operator's environment, so nothing can retarget a call:
+ *
+ *   - AWS credentials only as explicit env vars (AWS_ACCESS_KEY_ID,
+ *     AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN), copied by name;
+ *   - AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE are /dev/null, so no
+ *     profile, endpoint_url, ca_bundle, credential_process, role chain or
+ *     sso session from a config file applies; no AWS_PROFILE;
+ *   - region pinned; regional STS; no FIPS/dual-stack; no instance metadata;
+ *     no endpoint, CA-bundle or proxy variables at all;
+ *   - KUBECONFIG is the generated file (or absent: kubectl/helm are refused);
+ *   - only PATH, HOME, LANG, TMPDIR pass through for the tools to start.
+ */
+export const TOOL_ENV_PASSTHROUGH = ["PATH", "HOME", "LANG", "TMPDIR"] as const;
+export const AWS_CREDENTIAL_VARS = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"] as const;
+
 export function toolEnv(base: Record<string, string | undefined>, kubeconfigPath: string | undefined): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(base)) {
-    if (v === undefined) continue;
-    if (k === "KUBECONFIG" || k.startsWith("HELM_KUBE") || k === "HELM_KUBECONTEXT" || k.startsWith("AWS_ENDPOINT_URL") || k === "AWS_CA_BUNDLE" || k === "KUBECTL_EXTERNAL_DIFF") continue;
-    env[k] = v;
+  for (const k of [...TOOL_ENV_PASSTHROUGH, ...AWS_CREDENTIAL_VARS]) {
+    const v = base[k];
+    if (v !== undefined && v !== "") env[k] = v;
   }
+  Object.assign(env, {
+    AWS_CONFIG_FILE: "/dev/null",
+    AWS_SHARED_CREDENTIALS_FILE: "/dev/null",
+    AWS_REGION: PROOF_REGION,
+    AWS_DEFAULT_REGION: PROOF_REGION,
+    AWS_STS_REGIONAL_ENDPOINTS: "regional",
+    AWS_USE_FIPS_ENDPOINT: "false",
+    AWS_USE_DUALSTACK_ENDPOINT: "false",
+    AWS_EC2_METADATA_DISABLED: "true",
+    AWS_PAGER: "",
+  });
   if (kubeconfigPath) env.KUBECONFIG = kubeconfigPath;
   return env;
+}
+
+/** Live runs need explicit credentials: the minimal env deliberately ignores profiles and config files. */
+export function credentialIssue(base: Record<string, string | undefined>): string | undefined {
+  if (!base.AWS_ACCESS_KEY_ID || !base.AWS_SECRET_ACCESS_KEY)
+    return "AWS credentials must be explicit env vars (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY[/AWS_SESSION_TOKEN]), e.g. `eval \"$(aws configure export-credentials --format env)\"`; profiles and config files are ignored";
+  return undefined;
 }

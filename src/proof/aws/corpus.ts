@@ -35,6 +35,8 @@ export interface PlantedSession {
   transcriptCanary: string;
   /** JSONL records per manifest revision; revision 2 appends to revision 1. */
   revisions: string[][];
+  /** Object key prefix the ingest derives for this tenant (`<base>/<org>`, PIPELINE_ORG_FROM_PREFIX), or none. */
+  keyPrefix?: string;
 }
 
 export interface CorpusOptions {
@@ -42,6 +44,8 @@ export interface CorpusOptions {
   sessions: number;
   tenants: readonly Tenant[];
   now?: number;
+  /** With a base, keys are `<base>/<org>/v1/...` as the proof stage's ingest writes them. */
+  keyPrefixBase?: string;
 }
 
 /** Terms are lowercase ASCII with no separators the query normalizer would collapse. */
@@ -79,6 +83,7 @@ export function plantCorpus(o: CorpusOptions): PlantedSession[] {
       tenantCanary: `zq${tag}t${ti}tenantcanary`,
       transcriptCanary: `zq${tag}t${ti}s${i}transcriptonly`,
       revisions: [],
+      ...(o.keyPrefixBase ? { keyPrefix: `${o.keyPrefixBase}/${tenant.orgId}` } : {}),
     };
     const first = transcript(p, at, 1);
     p.revisions = [first, [...first, ...transcript(p, at, 2)]];

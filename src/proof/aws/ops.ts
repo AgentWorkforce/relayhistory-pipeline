@@ -15,7 +15,7 @@
  *
  * In-process actions (`HTTP`, `PROBE`) are never spawned; their hosts are fenced.
  */
-import { FORBIDDEN_NAME, PROOF_CHART_REPO, PROOF_CORE_DEPLOYMENTS, PROOF_INGEST_SERVICE, PROOF_LOCKER_BUCKET, PROOF_POSTGREST, PROOF_PROBE_IMAGES, PROOF_RELEASE, URL_USERINFO, type Fence } from "./fence.ts";
+import { FORBIDDEN_NAME, PROOF_RELAYAUTH_TLS, PROOF_SEARCH_CLIENT_POD, PROOF_KEY_PREFIX_BASE, PROOF_TENANT_ORGS, PROOF_CHART_REPO, PROOF_CORE_DEPLOYMENTS, PROOF_INGEST_SERVICE, PROOF_LOCKER_BUCKET, PROOF_POSTGREST, PROOF_PROBE_IMAGES, PROOF_RELEASE, URL_USERINFO, type Fence } from "./fence.ts";
 import { PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_REGION, PROOF_STAGE } from "./guard.ts";
 
 export type Admission = { ok: true; mutating: boolean; op: string } | { ok: false; code: string };
@@ -36,7 +36,7 @@ interface NsRules {
 }
 
 const PROOF_NS: Record<string, NsRules> = {
-  "96bulls": { deployments: PROOF_CORE_DEPLOYMENTS, services: [PROOF_INGEST_SERVICE, PROOF_POSTGREST.service], pods: /^hoopdb(-restore-proof)?-\d+$/ },
+  "96bulls": { deployments: PROOF_CORE_DEPLOYMENTS, services: [PROOF_INGEST_SERVICE, PROOF_POSTGREST.service], pods: /^(hoopdb(-restore-proof)?-\d+|proof-search-client)$/ },
   relayauth: { deployments: ["relayauth"], services: ["relayauth"], pods: /^$/ },
   relaycast: { deployments: ["relaycast"], services: ["relaycast"], pods: /^proof-relaycast-aws-proof$/ },
   "cnpg-system": { deployments: [], services: [], pods: /^$/ },
@@ -167,6 +167,31 @@ export function tokenize(args: readonly string[], spec: FlagSpec): Tokens | { er
   return { flags, pos, ...(tail ? { tail } : {}) };
 }
 
+/* ------------------------------------------------------------- probe pods */
+
+export const RELAYCAST_PROBE_URL = "http://relaycast.relaycast.svc:8787";
+
+/**
+ * The exact pod specs the harness may create. `kubectl run` is admitted only
+ * when its --labels and --overrides equal these byte for byte, so no volume,
+ * privilege or extra container can be smuggled in through the override.
+ */
+export function probePod(kind: "relaycast" | "search", image: string): { name: string; namespace: string; labels: string; overrides: string } {
+  if (kind === "relaycast")
+    return {
+      name: PROBE_POD,
+      namespace: "relaycast",
+      labels: PROOF_LABEL,
+      overrides: JSON.stringify({ spec: { volumes: [{ name: "probe", emptyDir: { medium: "Memory" } }], containers: [{ name: PROBE_POD, image, command: ["sleep", "7200"], env: [{ name: "RC_URL", value: RELAYCAST_PROBE_URL }], volumeMounts: [{ name: "probe", mountPath: "/probe" }] }] } }),
+    };
+  return {
+    name: PROOF_SEARCH_CLIENT_POD,
+    namespace: PROOF_POSTGREST.namespace,
+    labels: [PROOF_LABEL, PROOF_RELAYAUTH_TLS.clientLabel.join("="), PROOF_POSTGREST.clientLabel.join("=")].join(","),
+    overrides: JSON.stringify({ spec: { volumes: [{ name: "ca", configMap: { name: PROOF_RELAYAUTH_TLS.caConfigMap } }], containers: [{ name: PROOF_SEARCH_CLIENT_POD, image, command: ["sleep", "7200"], volumeMounts: [{ name: "ca", mountPath: "/ca", readOnly: true }] }] } }),
+  };
+}
+
 /* ------------------------------------------------------------- kubectl */
 
 function admitKubectl(argv: readonly string[], f: Fence, ph: boolean, stdin: string | undefined): Admission {
@@ -210,6 +235,7 @@ function admitKubectl(argv: readonly string[], f: Fence, ph: boolean, stdin: str
   if (verb === "wait" && args.length === 1 && !tail) {
     const t = args[0]!;
     if (ns === "relaycast" && t === `pod/${PROBE_POD}`) return read("wait probe pod");
+    if (ns === PROOF_POSTGREST.namespace && t === `pod/${PROOF_SEARCH_CLIENT_POD}`) return read("wait search client");
     if (ns === "96bulls" && (t === `${CNPG_CLUSTER}/hoopdb` || t === `${CNPG_CLUSTER}/hoopdb-restore-proof`)) return read("wait cnpg cluster");
     if (ns === "96bulls" && t.startsWith(`${CNPG_BACKUP}/`) && BACKUP_NAME.test(t.slice(CNPG_BACKUP.length + 1))) return read("wait backup");
     return refuse("kubectl_operation_not_allowlisted");
@@ -228,23 +254,24 @@ function admitKubectl(argv: readonly string[], f: Fence, ph: boolean, stdin: str
     if (ns === "96bulls" && tail.join(" ") === PSQL.join(" ") && fl.get("c") === "postgres") return read("psql");
     if (ns === "relaycast" && args[0] === PROBE_POD && tail.length === 4 && tail.slice(0, 3).join(" ") === "bun run -" && (tail[3] === "before" || tail[3] === "after"))
       return write(`relaycast probe ${tail[3]}`);
+    // The in-cluster search client: exchange at RelayAuth TLS, then the PostgREST RPC. Reads only.
+    if (ns === PROOF_POSTGREST.namespace && args[0] === PROOF_SEARCH_CLIENT_POD && tail.join(" ") === "bun run -") return read("in-cluster search");
     return refuse("exec_command_not_allowlisted");
   }
   // --- mutations: exact entries only. relayauth never reaches here except rollout restart above.
   if (ns === "relayauth") return refuse("relayauth_read_only");
-  if (verb === "run" && ns === "relaycast" && args.length === 1 && args[0] === PROBE_POD) {
+  if (verb === "run" && args.length === 1 && ((ns === "relaycast" && args[0] === PROBE_POD) || (ns === PROOF_POSTGREST.namespace && args[0] === PROOF_SEARCH_CLIENT_POD))) {
     const image = (fl.get("image") as string | undefined) ?? "";
     // Not any digest-pinned image: only the allowlisted probe images.
     if (!(PROOF_PROBE_IMAGES.includes(image) || (ph && PLACEHOLDER.test(image)))) return refuse(DIGEST_IMAGE.test(image) ? "probe_image_not_allowlisted" : "probe_image_not_digest_pinned");
     if (tail?.join(" ") !== "sleep 7200") return refuse("probe_command_not_allowlisted");
+    const want = probePod(args[0] === PROBE_POD ? "relaycast" : "search", image);
+    if (fl.get("labels") !== want.labels) return refuse("probe_labels_not_allowlisted");
+    if (fl.get("overrides") !== want.overrides) return refuse("probe_overrides_not_allowlisted");
+    if (fl.get("restart") !== "Never") return refuse("probe_restart_not_allowlisted");
     const env = fl.get("env");
-    if (env !== undefined && env !== "RC_URL=http://relaycast.relaycast.svc:8787") return refuse("probe_env_not_allowlisted");
-    const ov = fl.get("overrides") as string | undefined;
-    if (ov) {
-      const o = JSON.parse(ov) as { spec?: { containers?: Array<{ image?: string }> } };
-      if ((o.spec?.containers ?? []).some((c) => c.image !== image)) return refuse("probe_override_image_mismatch");
-    }
-    return write("run probe pod");
+    if (env !== undefined && !(args[0] === PROBE_POD && env === `RC_URL=${RELAYCAST_PROBE_URL}`)) return refuse("probe_env_not_allowlisted");
+    return write(`run ${args[0]}`);
   }
   if (verb === "delete") {
     if (tail) return refuse("delete_not_allowlisted");
@@ -304,6 +331,9 @@ function admitHelm(argv: readonly string[], f: Fence, ph: boolean): Admission {
 
 /* ------------------------------------------------------------- aws */
 
+/** A planted session's short summary object, under a proof tenant's `96bulls/<org>/` prefix. */
+const SUMMARY_KEY = new RegExp(`^${PROOF_KEY_PREFIX_BASE}/(${PROOF_TENANT_ORGS.join("|")})/v1/ws=[^/]+/m=proof-[a-z0-9]+-m\\d+/h=claude/d=\\d{4}/\\d{2}/\\d{2}/s=[0-9a-f-]{36}/summary/short\\.json\\.enc$`);
+
 const ARN = /^arn:aws:([a-z0-9-]+):([a-z0-9-]*):(\d{12})?:(.+)$/;
 
 function arnOk(v: string, ph: boolean): boolean {
@@ -327,8 +357,8 @@ function admitAws(argv: readonly string[], f: Fence, ph: boolean): Admission {
   const buckets = f.buckets;
   if (svc === "s3api") {
     if (!bucket || !buckets.has(bucket)) return refuse("bucket_outside_fence");
-    if (cmd === "list-objects-v2" || cmd === "head-object" || cmd === "get-bucket-versioning") return read(`s3api ${cmd}`);
-    if (cmd === "delete-object" && bucket === PROOF_LOCKER_BUCKET && /^(v1\/ws=[^/]+\/m=proof-[a-z0-9]+-m\d+\/h=claude\/d=\d{4}\/\d{2}\/\d{2}\/s=[0-9a-f-]{36}\/summary\/short\.json\.enc)$/.test(opt("key") ?? ""))
+    if (cmd === "list-objects-v2" || cmd === "head-object" || cmd === "get-bucket-versioning" || cmd === "head-bucket") return read(`s3api ${cmd}`);
+    if (cmd === "delete-object" && bucket === PROOF_LOCKER_BUCKET && SUMMARY_KEY.test(opt("key") ?? ""))
       return write("delete summary object");
     return refuse("aws_operation_not_allowlisted");
   }

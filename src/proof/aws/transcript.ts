@@ -11,11 +11,12 @@
  * NO tenant predicate. A row policy (or equivalent) must keep tenant A's
  * credentials from reading tenant B's rows; if it does not, the gate fails.
  *
- * Feed: `pipeline` waits for the product to project planted transcripts into the
+ * Feed: `pipeline` (the only gate evidence) waits for the product to project
+ * planted transcripts, ingested through the authenticated ingest, into the
  * backend (no V2 projector exists in this repository yet, so this times out
- * honestly); `harness-synthetic` inserts the planted transcript text itself
- * with a separate writer credential, and the report labels it as such. Either
- * way, freshness is measured from the session's landed time to first searchable.
+ * honestly). `harness-synthetic` inserts the planted transcript text itself
+ * with a separate writer credential: a diagnostic of the backend only, so the
+ * gate is BLOCKED, never PASS. Freshness is measured from landed to searchable.
  */
 import type { PlantedSession } from "./corpus.ts";
 import type { Fetch } from "./ingest.ts";

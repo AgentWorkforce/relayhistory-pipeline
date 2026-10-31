@@ -45,8 +45,21 @@ create-only plan from #75 is present and verifies:
 - The inputs must name `proof-sessions.agentrelay.com` and pin the services and
   Relaycast image digests.
 
+The plan text is also parsed: its `Plan: …` summary, and every
+`[resource] op` line. Only `create` and `noop` are accepted, and the summary
+must agree with the lines. An unknown line, a missing `[cluster]`, or any
+`update`, `replace`, `delete`, `import` or `adopt` is refused, even when the
+cluster appears. For example, the #75 continuation capture at `ecf70fd` (one
+`replace` of a never-created record) is refused, as intended. A reviewed stage
+change may carry `update`, but only for a resource listed in
+`REVIEWED_PLAN_UPDATES` (`96bulls` and `alleyoop-role`, for the two-tenant
+change), and only when it is named with `--allow-plan-update <resource>`. Even
+then, `replace` and the other operations stay refused.
+
 The live cluster must also be the one that plan created. `describe-cluster`
-must show it was created after the plan was captured, and `fresh-install`
+must show the cluster was created after the plan was captured when the plan
+creates it, or before the capture when the plan leaves it as `noop` (a
+continuation plan), and `fresh-install`
 requires the running images to include the plan's digests. Plan digests take
 precedence over chart defaults and operator inputs. On this branch the plan
 files are on #75, so live runs refuse until #75 lands.
@@ -69,8 +82,21 @@ Every kubectl and helm step then runs with `KUBECONFIG` set to a kubeconfig the
 harness generates from the describe result. That file has one cluster, one
 context and `aws eks get-token` exec credentials. It is written to the run
 directory with mode 0600 and deleted after the run. The operator's kubeconfig
-is never used by a step. `HELM_KUBE*` and `AWS_ENDPOINT_URL*` are stripped from
-every tool's environment. A kubectl or helm step without the generated
+is never used by a step.
+
+Every aws, kubectl and helm call, and the kubeconfig's exec plugin, gets an
+environment built from scratch, not filtered from the operator's:
+
+- AWS credentials only as the explicit `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` variables. A live run without
+  them is refused; use `eval "$(aws configure export-credentials --format env)"`.
+- `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` set to `/dev/null`, so no
+  profile, `endpoint_url`, `ca_bundle`, `credential_process` or role chain from
+  a file can apply.
+- The region pinned to `us-west-2`, regional STS, FIPS and dual-stack off, and
+  instance metadata disabled.
+- No `AWS_PROFILE`, `AWS_ENDPOINT_URL*`, `AWS_CA_BUNDLE`, proxy, `HELM_KUBE*` or
+  operator `KUBECONFIG`. Only `PATH`, `HOME`, `LANG` and `TMPDIR` pass through. A kubectl or helm step without the generated
 kubeconfig is refused with `kubeconfig_unbound`.
 
 **The guard** (`src/proof/aws/guard.ts`) runs before the first step and again
@@ -394,6 +420,25 @@ request takes:
    the self-hosted PostgREST (#73), with `Content-Profile: sessions`. This is
    `search.mode: "postgrest-jwt"`, the default.
 
+The exchange runs inside the cluster, from the search client pod
+`96bulls/proof-search-client`, and goes to RelayAuth's TLS Service:
+
+- **Labels.** The pod carries both caller labels,
+  `relayauth.agentrelay.com/client=tls` and
+  `96bulls.agentrelay.com/search-client=true`.
+- **Trust.** It mounts ConfigMap `relayauth-ca` and calls
+  `https://relayauth-tls.relayauth.svc:8443` with that CA. It never calls the
+  plain `relayauth:8787`.
+- **PostgREST.** It then calls
+  `http://session-directory-postgrest.96bulls.svc:3000`.
+- **Secrets.** The exchange key and the tenant's token reach the pod only on
+  stdin over `kubectl exec`.
+- **Exact spec.** The pod spec, labels and override are pinned exactly, so an
+  extra volume or a privileged container is refused.
+
+The `--stack-outputs <file>` option reads `eks.harness` from the stack's
+outputs. Its values must equal the hardcoded fence, and they never widen it.
+
 Stage A has `sessionDirectory.enabled: false`, so PostgREST is not deployed.
 Every check that needs search is therefore BLOCKED, never PASS.
 `search.mode: "rpc-sql"` (psql `SET ROLE` with claims set by the harness)
@@ -408,7 +453,15 @@ This check labels V1, honestly. Full-transcript search is UNSUPPORTED on V1
 transcript-only canaries through V1 and must get zero rows. Any hit is a
 failure, because it means transcript text reached `search_text`.
 
-### 6. transcript-search (transcript gate)
+### 6. transcript-search (transcript gate, DEFERRED)
+
+Khaliq deferred this gate for this AWS proof on 2026-10-31. With no backend
+configured, the check reports `deferred` with the reason "deferred by owner
+2026-10-31". A deferred gate does not block the overall verdict and is never
+reported as PASS. The code below stays in place. Only the `pipeline` feed
+(product ingest → index → transcript search) can pass. A `harness-synthetic`
+direct insert is a diagnostic only and always yields BLOCKED. The V1
+metadata/short_summary search gate remains mandatory.
 
 This gate runs full-transcript search end to end against a configured
 ClickHouse or ObsessionDB backend over the ClickHouse HTTP interface. It
@@ -561,9 +614,19 @@ The teardown runs in two phases:
    The check is then `blocked` and lists the tagged AWS resources that are
    still pending.
 2. **After Khaliq runs `bin/96bulls down aws-proof`** (an Alchemy destroy, which
-   this harness never runs), rerun the teardown live and pass it the report of the full run:
-   `bun run proof:aws:teardown --confirm-live --prior-report .96bulls/aws-proof/<run id>/report.json`.
-   Once the cluster is gone, this run only lists and verifies. The check passes only if `aws eks list-clusters` no longer
+   this harness never runs), verify absence with the post-destroy path:
+   `bun run proof:aws:teardown --post-destroy --confirm-live --prior-report .96bulls/aws-proof/<run id>/report.json`.
+   - **No live cluster needed.** There is no describe preflight, no kube
+     context and no kubectl or helm. Identity is the STS account, the region is
+     pinned on every call, and the target comes from the admitted prior report.
+   - **What it checks.** `aws eks describe-cluster` must answer
+     `ResourceNotFoundException`, and `list-clusters` must not name the cluster.
+     No resource tagged `96bulls:stack=aws-proof` may remain; a KMS key in
+     `PendingDeletion` is the expected end state. Both proof buckets must
+     answer `head-bucket` 404.
+   - **What counts as gone.** Only the matching error class counts. The
+     harness reads stderr only for that match and never keeps it. AccessDenied,
+     a 403 or a network error is "absence unproven", never gone. The check passes only if `aws eks list-clusters` no longer
    names the cluster and no resource tagged `96bulls:stack=aws-proof` remains.
    A KMS key in `PendingDeletion` (the 30-day window) is the expected end state.
 
@@ -632,6 +695,12 @@ teardown run, produces one report whose verdict covers both.
 
 ## Report
 
+Every report states the phase-1 limitation: **NetworkPolicy is not enforced in
+phase 1**. The stage declares NetworkPolicies, but this proof does not show
+that the cluster's network plugin enforces them, so isolation between pods
+rests on authentication.
+
+
 **Provenance.** Every report records:
 - the harness commit and dirty bit;
 - the SHA-256 of `inputs.json` (or of the defaults when there is none) and of
@@ -694,6 +763,14 @@ shows that the check distinguishes tag references from pinned digests.
 - **`proof-sessions.agentrelay.com`.** The record and its ACM certificate must
   exist and point at the proof ALB. Until they do, the DNS guard refuses the
   active ingress probes.
-- **Multi-org ingest.** AlleyOop's org resolver (`PIPELINE_ORG_ID` and prefix
-  ownership) must map both proof tenants on this stage. A single-org
-  configuration makes tenant B's planting fail with 403, which the report shows.
+- **Tenants.** The tenants are `org_aws_proof_1` and `org_aws_proof_2` (#75
+  `eks.tenantOrgIds`), with objects under `96bulls/<org>/v1/...`. planted-trace
+  also mints a token for `org_aws_proof_unlisted` and requires 403
+  `org_not_allowed` from the ingest. The probe sends an empty chunk, so it
+  cannot store a byte.
+- **A finding on this branch's `main`.** `chunksAreServerSealed`
+  (`src/alleyoop/manifests.ts`) appears to rebuild chunk keys without the key
+  prefix. With `PIPELINE_ORG_FROM_PREFIX`, a prefixed manifest then fails with
+  409 `chunks_unverified`. #75 needs to cover this before planting can pass.
+- **The `eks.harness` output shape** is the harness's expectation of #75. Any
+  difference refuses the run.

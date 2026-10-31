@@ -11,7 +11,7 @@ import { defaultConfig, validateConfig } from "../config.ts";
 import { Runner, type Spawn } from "../exec.ts";
 import { PROOF_CONTEXT, PROOF_FENCE, PROOF_PROBE_IMAGES } from "../fence.ts";
 import { assertProofTarget, GuardError, PROOF_ACCOUNT_ID, PROOF_CLUSTER } from "../guard.ts";
-import { stepFenceIssue } from "../ops.ts";
+import { probePod, stepFenceIssue } from "../ops.ts";
 import { bindStagePlan, chartDigests, gitProvenance, loadStagePlan, planImageIssues, provenanceGaps, sha256Hex, STAGE_PLAN_FILES } from "../provenance.ts";
 import { buildReport, CHECK_IDS, finalVerdict, validateReport, type CheckResult } from "../report.ts";
 import { exchangeSearchToken, postgrestSearch } from "../search-http.ts";
@@ -104,7 +104,8 @@ describe("(2) identity is bound to live AWS, not to kubeconfig naming", () => {
     // Credentials come only from the exec plugin: no static token, password or client key.
     expect(Object.keys(kc.users[0].user)).toEqual(["exec"]);
     const env = toolEnv({ KUBECONFIG: "/home/op/.kube/config", HELM_KUBECONTEXT: "x", HELM_KUBEAPISERVER: "x", AWS_ENDPOINT_URL: "x", PATH: "/bin" }, "/run/kubeconfig.json");
-    expect(env).toEqual({ PATH: "/bin", KUBECONFIG: "/run/kubeconfig.json" });
+    expect(env).toMatchObject({ PATH: "/bin", KUBECONFIG: "/run/kubeconfig.json", AWS_CONFIG_FILE: "/dev/null" });
+    expect(env.HELM_KUBECONTEXT ?? env.HELM_KUBEAPISERVER ?? env.AWS_ENDPOINT_URL).toBeUndefined();
     const seen: Array<Record<string, string>> = [];
     const spawn: Spawn = (_a, _s, _t, _b, e) => (seen.push(e), { stdout: "", status: 0 });
     const identity = { confirmLive: true, accountId: PROOF_ACCOUNT_ID, clusterName: PROOF_CLUSTER, kubeContext: ARN, kubeContextCluster: ARN, clusterBound: true };
@@ -152,7 +153,7 @@ describe("(a) report provenance", () => {
 });
 
 describe("(b) the probe pod runs only allowlisted images", () => {
-  const run = (image: string) => k("-n", "relaycast", "run", "proof-relaycast-aws-proof", `--image=${image}`, "--restart=Never", "--labels=96bulls.proof=true", "--env=RC_URL=http://relaycast.relaycast.svc:8787", "--command", "--", "sleep", "7200");
+  const run = (image: string) => k("-n", "relaycast", "run", "proof-relaycast-aws-proof", `--image=${image}`, "--restart=Never", `--labels=${probePod("relaycast", image).labels}`, "--env=RC_URL=http://relaycast.relaycast.svc:8787", "--overrides", probePod("relaycast", image).overrides, "--command", "--", "sleep", "7200");
   test("any other digest-pinned image, from any registry, is refused", () => {
     expect(stepFenceIssue(run(PROOF_PROBE_IMAGES[0]!), PROOF_FENCE)).toBeUndefined();
     expect(stepFenceIssue(run(`docker.io/attacker/tool@sha256:${"a".repeat(64)}`), PROOF_FENCE)).toBe("probe_image_not_allowlisted");
@@ -166,7 +167,7 @@ describe("(b) the probe pod runs only allowlisted images", () => {
 });
 
 describe("(c) the harness binds to the captured Stage A create-only plan", () => {
-  const planText = "Plan: 78 to create\n+ AWS.EKS.Cluster cluster (96bulls-aws-proof)\n";
+  const planText = "Plan · aws-proof\nComputing plan\nPlan ready (4.2s)\nPlan: 2 to create\n[cluster] create\n[locker] create\n";
   const inputs = JSON.stringify({ accountId: PROOF_ACCOUNT_ID, region: "us-west-2", eks: { chartVersion: "0.3.0", imageDigest: `sha256:${"5".repeat(64)}`, relayhistoryOrigin: "https://proof-sessions.agentrelay.com", ingress: { hostname: "proof-sessions.agentrelay.com" }, relayauth: { chartVersion: "0.1.0" }, relaycast: { chartVersion: "0.1.0", imageDigest: `sha256:${"6".repeat(64)}` }, sessionDirectory: { enabled: false } } });
   const prov = (over: Record<string, unknown> = {}) => JSON.stringify({ stage: "aws-proof", generatedAt: "2026-10-31T01:32:53.897Z", target: { accountId: PROOF_ACCOUNT_ID, region: "us-west-2" }, source: { commit: "e".repeat(40), clean: true }, inputs: { sanitizedPath: STAGE_PLAN_FILES.inputs, sanitizedSha256: sha256Hex(inputs) }, outputs: { plan: { path: STAGE_PLAN_FILES.plan, sha256: sha256Hex(planText) } }, ...over });
   const files = (o: Partial<Record<keyof typeof STAGE_PLAN_FILES, string>> = {}) => (p: string) =>

@@ -28,13 +28,13 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { uuidv7 } from "../../shared/ids.ts";
-import { CHECKS, newCtx } from "./checks.ts";
+import { CHECKS, newCtx, postDestroyTeardown } from "./checks.ts";
 import { loadConfig, validateConfig, type ProofConfig } from "./config.ts";
 import { Runner } from "./exec.ts";
-import { fenceFor, PROOF_CHART_REPO, PROOF_CONTEXT, PROOF_POSTGREST, PROOF_REGION } from "./fence.ts";
-import { bindKubeconfig, parseDescribeCluster, proofKubeconfig, toolEnv, type DescribedCluster } from "./cluster-binding.ts";
+import { fenceFor, harnessOutputIssues, PROOF_CHART_REPO, PROOF_CONTEXT, PROOF_POSTGREST, PROOF_REGION } from "./fence.ts";
+import { bindKubeconfig, credentialIssue, parseDescribeCluster, proofKubeconfig, toolEnv, type DescribedCluster } from "./cluster-binding.ts";
 import { bindStagePlan, chartDigests, gitProvenance, loadStagePlan, sha256Hex, type ReportProvenance, type StagePlan } from "./provenance.ts";
-import { assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, type Identity, type Mode } from "./guard.ts";
+import { assertPostDestroyTarget, assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, type Identity, type Mode } from "./guard.ts";
 import { allCanaries } from "./corpus.ts";
 import { backendLabel } from "./transcript.ts";
 import { admitPrior, buildReport, canonicalReportBytes, CHECK_IDS, mergeReports, validateReport, type AdmittedPrior, type CheckId, type CheckResult, type ProofReport } from "./report.ts";
@@ -51,6 +51,12 @@ export interface Args {
   out?: string;
   /** A previous report of this proof (e.g. pre-teardown) to merge into this run's report. */
   priorReport?: string;
+  /** Verify absence after `96bulls down aws-proof`: no cluster binding, aws reads only. */
+  postDestroy?: boolean;
+  /** Reviewed plan updates to accept (provenance.ts REVIEWED_PLAN_UPDATES). */
+  allowPlanUpdates: string[];
+  /** The stack's outputs JSON; `eks.harness` must equal the hardcoded fence. */
+  stackOutputs?: string;
 }
 
 export function parseArgs(argv: readonly string[]): Args {
@@ -62,6 +68,9 @@ export function parseArgs(argv: readonly string[]): Args {
   let sessions: number | undefined;
   let out: string | undefined;
   let priorReport: string | undefined;
+  let postDestroy = false;
+  const allowPlanUpdates: string[] = [];
+  let stackOutputs: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     const val = () => {
@@ -81,18 +90,28 @@ export function parseArgs(argv: readonly string[]): Args {
       if (!Number.isInteger(sessions) || sessions < 2 || sessions > 10_000) throw new Error("--sessions must be an integer in [2, 10000]");
     } else if (a === "--out") out = val();
     else if (a === "--prior-report") priorReport = val();
+    else if (a === "--post-destroy") postDestroy = true;
+    else if (a === "--allow-plan-update") allowPlanUpdates.push(val());
+    else if (a === "--stack-outputs") stackOutputs = val();
     else if (a === "all") checks.push(...CHECK_IDS);
     else if ((CHECK_IDS as readonly string[]).includes(a)) checks.push(a as CheckId);
     else throw new Error(`unknown argument ${a}`);
   }
   if (target === "kind-readonly" && confirmLive && !readOnly) throw new Error("kind-readonly never runs mutating steps; drop --confirm-live or add --read-only");
   const mode: Mode = readOnly ? "read-only" : confirmLive ? "live" : "dry-run";
-  return { checks: checks.length ? [...new Set(checks)] : [...CHECK_IDS], mode, confirmLive, target, inputs, sessions, out, ...(priorReport ? { priorReport } : {}) };
+  if (postDestroy) {
+    if (target !== "proof") throw new Error("--post-destroy is for the proof target only");
+    if (checks.length !== 1 || checks[0] !== "teardown") throw new Error("--post-destroy runs the teardown check only");
+    if (mode === "live" && !priorReport) throw new Error("--post-destroy needs --prior-report: the pre-teardown report carries the run's identity and evidence");
+  }
+  return { checks: checks.length ? [...new Set(checks)] : [...CHECK_IDS], mode, confirmLive, target, inputs, sessions, out, allowPlanUpdates, ...(stackOutputs ? { stackOutputs } : {}), ...(priorReport ? { priorReport } : {}), ...(postDestroy ? { postDestroy } : {}) };
 }
 
 type Run = (argv: string[]) => { stdout: string; status: number | null };
 const defaultRun: Run = (argv) => {
-  const r = spawnSync(argv[0]!, argv.slice(1), { encoding: "utf8", shell: false, env: argv[0] === "aws" ? toolEnv(process.env, undefined) : process.env });
+  // The same minimal env as every step. Only `kubectl config view` (which execs nothing) reads the operator's kubeconfig.
+  const env = toolEnv(process.env, argv[0] === "kubectl" ? process.env.KUBECONFIG : undefined);
+  const r = spawnSync(argv[0]!, argv.slice(1), { encoding: "utf8", shell: false, env });
   return { stdout: r.stdout ?? "", status: r.status };
 };
 
@@ -167,8 +186,22 @@ export async function main(argv: readonly string[], env: Record<string, string |
     }
     prior = admitted;
   }
+  if (args.stackOutputs) {
+    let text: string;
+    try {
+      text = readFileSync(args.stackOutputs, "utf8");
+    } catch {
+      console.error("aws-proof: --stack-outputs unreadable");
+      return 2;
+    }
+    const bad = harnessOutputIssues(text);
+    if (bad.length) {
+      console.error(`aws-proof: refusing: stack outputs disagree with the fence:\n  ${bad.join("\n  ")}`);
+      return 2;
+    }
+  }
   // The captured Stage A create-only plan. Live runs on the proof target refuse without it.
-  const plan = args.target === "proof" ? loadStagePlan(ROOT) : undefined;
+  const plan = args.target === "proof" ? loadStagePlan(ROOT, undefined, args.allowPlanUpdates) : undefined;
   if (args.mode !== "dry-run" && args.target === "proof" && (!plan || "error" in plan)) {
     console.error(`aws-proof: refusing: ${plan && "error" in plan ? plan.error : "no stage plan"}`);
     return 2;
@@ -180,7 +213,27 @@ export async function main(argv: readonly string[], env: Record<string, string |
   }
   let identity: Identity = { clusterName: cfg.clusterName, kubeContext: cfg.kubeContext };
   let cluster: DescribedCluster | undefined;
-  if (args.mode !== "dry-run" && args.target === "proof") {
+  if (args.mode !== "dry-run" && args.target === "proof" && args.postDestroy) {
+    // No cluster to bind: identity is the STS account (region pinned per step); the prior report carries the target.
+    const cred = credentialIssue(env);
+    if (cred) {
+      console.error(`aws-proof: refusing: ${cred}`);
+      return 2;
+    }
+    const sts = defaultRun(["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"]);
+    identity = { clusterName: cfg.clusterName, kubeContext: cfg.kubeContext, postDestroy: true, ...(sts.status === 0 ? { accountId: sts.stdout.trim() } : {}) };
+    try {
+      assertPostDestroyTarget({ ...identity, confirmLive: args.confirmLive });
+    } catch (e) {
+      console.error(`aws-proof: ${e instanceof GuardError ? `${e.code}: ` : ""}${(e as Error).message}`);
+      return 2;
+    }
+  } else if (args.mode !== "dry-run" && args.target === "proof") {
+    const cred = credentialIssue(env);
+    if (cred) {
+      console.error(`aws-proof: refusing: ${cred}`);
+      return 2;
+    }
     const o = observeIdentity(cfg);
     identity = o.identity;
     cluster = o.cluster;
@@ -206,7 +259,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
     kubeconfigPath = join(dir, "kubeconfig.json");
     writeFileSync(kubeconfigPath, proofKubeconfig(cluster, cfg.kubeContext), { mode: 0o600 });
   }
-  const runner = new Runner({ mode: args.mode, identity: { ...identity, confirmLive: args.confirmLive }, fence: fenceFor(args.target), ...(kubeconfigPath ? { kubeconfigPath } : {}) });
+  const runner = new Runner({ mode: args.mode, identity: { ...identity, confirmLive: args.confirmLive }, fence: fenceFor(args.target), baseEnv: env, ...(kubeconfigPath ? { kubeconfigPath } : {}), ...(args.postDestroy ? { awsOnly: true } : {}) });
   const ctx = newCtx(cfg, runner, runId, env);
   if (stagePlan) ctx.stagePlan = stagePlan;
   console.log(`aws-proof ${runId}: mode=${args.mode} target=${args.target} context=${cfg.kubeContext} checks=${args.checks.join(",")}`);
@@ -214,7 +267,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
   const results: CheckResult[] = [];
   for (const id of CHECK_IDS.filter((c) => args.checks.includes(c))) {
     try {
-      results.push(await CHECKS[id](ctx));
+      results.push(await (args.postDestroy && id === "teardown" ? postDestroyTeardown(ctx) : CHECKS[id](ctx)));
     } catch (e) {
       const now = new Date().toISOString();
       const code = e instanceof GuardError ? e.code : "harness_error";
@@ -280,7 +333,7 @@ async function reportProvenance(cfg: ProofConfig, args: Args, plan: StagePlan | 
     }),
     inputs: inputsBytes ? { sha256: sha256Hex(inputsBytes), source: "file" } : { sha256: sha256Hex(JSON.stringify(cfg)), source: "defaults" },
     configSha256: sha256Hex(JSON.stringify(cfg)),
-    stagePlan: plan ? { provenanceSha256: plan.provenanceSha256, generatedAt: plan.generatedAt, commit: plan.commit, planSha256: plan.planSha256 } : null,
+    stagePlan: plan ? { provenanceSha256: plan.provenanceSha256, generatedAt: plan.generatedAt, commit: plan.commit, planSha256: plan.planSha256, allowedUpdates: plan.allowedUpdates } : null,
     charts,
   };
 }

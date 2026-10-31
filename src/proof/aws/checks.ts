@@ -11,7 +11,7 @@ import { allCanaries, expectedShortSummary, FAKE_AWS_KEY_ID, plantCorpus, teleme
 import { evaluatePlantedTrace, evaluateStaleSummary, evaluateV1Scope, type SessionObservation, type StaleObservation } from "./evaluate.ts";
 import type { Runner, Step } from "./exec.ts";
 import { evaluateFreshInstall, expectedFromValues, parseChartRef, type HelmRelease, type PodList } from "./fresh-install.ts";
-import { IngestError, locationOf, mintTenantToken, newUploadState, plantNextRevision, type UploadState } from "./ingest.ts";
+import { IngestError, locationOf, mintTenantToken, newUploadState, plantNextRevision, type Fetch, type UploadState } from "./ingest.ts";
 import { crossTenantHits, refusedAsExpected, scanForCanaries, tenantKey, type ProbeObservation, type Tenant } from "./leak-scan.ts";
 import {
   backupRestoreSteps, cnpgInstancesStep, failoverSteps, failoverVerdict, helmHistoryStep, relaycastProbeSteps, relaycastRestartSteps,
@@ -19,11 +19,12 @@ import {
   teardownVerifySteps, upgradeRollbackSteps, versioningEnabled,
 } from "./lifecycle.ts";
 import { directorySql, indexStateSql, jsonLines, kubectl, lastJson, primaryStep, s3ListStep, searchBatchSql, sqlStep, stageTimesSql, type SearchResultLine, type SearchRow } from "./probes.ts";
-import { evidence, type CheckId, type CheckResult, type Evidence, type Status } from "./report.ts";
+import { evidence, TRANSCRIPT_GATE_DEFERRAL, type CheckId, type CheckResult, type Evidence, type Status } from "./report.ts";
 import { summarize } from "./stats.ts";
 import { manifestKey, scrubText } from "../../shared/vendor.ts";
-import { PROOF_POSTGREST } from "./fence.ts";
-import { exchangeSearchToken, postgrestSearch, SEARCH_EXCHANGE_KEY_ENV } from "./search-http.ts";
+import { PROOF_BACKUP_BUCKET, PROOF_POSTGREST, PROOF_RELAYAUTH_TLS, PROOF_SEARCH_CLIENT_POD, PROOF_UNLISTED_ORG } from "./fence.ts";
+import { SEARCH_EXCHANGE_KEY_ENV } from "./search-http.ts";
+import { probePod } from "./ops.ts";
 import { planImageIssues, type StagePlan } from "./provenance.ts";
 import { backendLabel, clickhouseBackend, credentialsFromEnv, evaluateTranscriptGate, type TranscriptBackend, type TranscriptObservation } from "./transcript.ts";
 import {
@@ -52,6 +53,8 @@ export interface Ctx {
   stagePlan?: StagePlan;
   /** Searches served by the psql diagnostic path. Checks that used it cannot pass. */
   diagnosticSearches: number;
+  /** The in-cluster search client pod is up. */
+  searchClientReady?: boolean;
   /** Override for tests: the authenticated HTTP search (exchange + PostgREST). */
   httpSearch?: (t: Tenant, q: string) => Promise<{ rows: SearchRow[]; ms: number }>;
 }
@@ -61,7 +64,7 @@ export function newCtx(cfg: ProofConfig, runner: Runner, runId: string, env: Rec
     cfg, runner, runId, env,
     print: (l) => console.log(l),
     secrets: [],
-    corpus: plantCorpus({ runId, sessions: cfg.sessions, tenants: cfg.tenants }),
+    corpus: plantCorpus({ runId, sessions: cfg.sessions, tenants: cfg.tenants, ...(cfg.objectKeyPrefixBase ? { keyPrefixBase: cfg.objectKeyPrefixBase } : {}) }),
     uploads: new Map(),
     tokens: new Map(),
     diagnosticSearches: 0,
@@ -319,8 +322,8 @@ async function searchTenant(ctx: Ctx, pod: string, t: Tenant, queries: Array<{ t
     return new Map(jsonLines<SearchResultLine>(o.stdout).filter((l) => typeof l.tag === "string").map((l) => [l.tag, l]));
   }
   if (ctx.cfg.search.mode !== "postgrest-jwt") return undefined;
-  const search = ctx.httpSearch ?? (await openHttpSearch(ctx, id));
-  if (!search) return undefined;
+  if (!ctx.httpSearch) return inClusterSearch(ctx, t, queries, id);
+  const search = ctx.httpSearch;
   const out = new Map<string, SearchResultLine>();
   for (const { tag, q } of queries) {
     try {
@@ -333,40 +336,64 @@ async function searchTenant(ctx: Ctx, pod: string, t: Tenant, queries: Array<{ t
   return out;
 }
 
-/** Port-forward RelayAuth and PostgREST, and search through the token exchange. Tokens live in memory only. */
-async function openHttpSearch(ctx: Ctx, id: string): Promise<((t: Tenant, q: string) => Promise<{ rows: SearchRow[]; ms: number }>) | undefined> {
+/**
+ * The in-cluster search client. NetworkPolicy admits only labelled callers to
+ * RelayAuth's TLS Service and to PostgREST, and the exchange must never use the
+ * plain relayauth:8787, so the search runs from a pod carrying both caller
+ * labels and trusting the relayauth-ca ConfigMap. The exchange key and subject
+ * token reach it on stdin over `kubectl exec` (API server TLS), embedded in the
+ * script; they are never in argv, env, a file, or the report.
+ */
+export const SEARCH_CLIENT_SOURCE = String.raw`
+const fs = await import("node:fs");
+const out = (o) => console.log(JSON.stringify(o));
+let ca;
+try { ca = fs.readFileSync("/ca/ca.crt", "utf8"); } catch { for (const q of INPUT.queries) out({ tag: q.tag, error: "ca_missing" }); process.exit(0); }
+const ex = await fetch("https://${PROOF_RELAYAUTH_TLS.service}.${PROOF_RELAYAUTH_TLS.namespace}.svc:${PROOF_RELAYAUTH_TLS.port}/v1/tokens/session-directory-search", {
+  method: "POST", headers: { "x-api-key": INPUT.exchangeKey, "content-type": "application/json" },
+  body: JSON.stringify({ subjectToken: INPUT.subjectToken, workspaceId: INPUT.workspaceId }), tls: { ca },
+}).catch(() => null);
+if (!ex || ex.status !== 201) { for (const q of INPUT.queries) out({ tag: q.tag, error: "exchange_" + (ex ? ex.status : "unreachable") }); process.exit(0); }
+const { accessToken } = await ex.json();
+for (const q of INPUT.queries) {
+  const t0 = performance.now();
+  const r = await fetch("http://${PROOF_POSTGREST.service}.${PROOF_POSTGREST.namespace}.svc:${PROOF_POSTGREST.port}/rpc/search_session_directory", {
+    method: "POST", headers: { authorization: "Bearer " + accessToken, "content-profile": "sessions", "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ p_workspace_id: INPUT.workspaceId, p_query: q.q }),
+  }).catch(() => null);
+  const ms = performance.now() - t0;
+  if (!r || r.status !== 200) { out({ tag: q.tag, error: "postgrest_" + (r ? r.status : "unreachable"), ms }); continue; }
+  const rows = (await r.json()).map((x) => ({ session_id: String(x.session_id), org_id: String(x.org_id), short_summary: typeof x.short_summary === "string" ? x.short_summary : null }));
+  out({ tag: q.tag, rows, ms });
+}
+`;
+
+export function searchClientSteps(c: ProofConfig): Step[] {
+  const img = c.probeImage ?? "<allowlisted probe image>";
+  const spec = probePod("search", img);
+  return [
+    { id: "search-client.pod", argv: kubectl(c, "-n", spec.namespace, "run", spec.name, `--image=${img}`, "--restart=Never", `--labels=${spec.labels}`, "--overrides", spec.overrides, "--command", "--", "sleep", "7200"), mutating: true, touches: [`k8s:${spec.namespace}/pod/${spec.name} (created; RelayAuth TLS + PostgREST caller labels)`], approval: "khaliq" },
+    { id: "search-client.ready", argv: kubectl(c, "-n", spec.namespace, "wait", "--for=condition=Ready", `pod/${spec.name}`, "--timeout=180s"), mutating: false, touches: [`k8s:${spec.namespace}/pod/${spec.name}`], approval: "operator", timeoutMs: 200_000 },
+  ];
+}
+
+/** One tenant's queries through the in-cluster client; undefined when the path is unavailable. */
+async function inClusterSearch(ctx: Ctx, t: Tenant, queries: Array<{ tag: string; q: string }>, id: string): Promise<Map<string, SearchResultLine> | undefined> {
   const key = ctx.env[SEARCH_EXCHANGE_KEY_ENV];
-  if (!key) return undefined;
-  ctx.secrets.push(key);
-  const ra = await portForward(ctx, ctx.cfg.relayauth.namespace, ctx.cfg.relayauth.service, ctx.cfg.relayauth.port, 18797);
-  const pg = await portForward(ctx, PROOF_POSTGREST.namespace, PROOF_POSTGREST.service, PROOF_POSTGREST.port, 18300);
-  if (!ra || !pg) {
-    ra?.stop();
-    pg?.stop();
-    return undefined;
+  const subject = ctx.tokens.get(tenantKey(t));
+  if (!key || !subject) return undefined;
+  if (!ctx.secrets.includes(key)) ctx.secrets.push(key);
+  if (!ctx.searchClientReady) {
+    for (const s of searchClientSteps(ctx.cfg)) if (!ctx.runner.run(s).ok) return undefined;
+    ctx.searchClientReady = true;
   }
-  const g = ctx.runner.gate({ id, argv: ["HTTP", "POST", "http://127.0.0.1:18797/v1/tokens/session-directory-search", "+", "http://127.0.0.1:18300/rpc/search_session_directory"], mutating: false, touches: [`relayauth:${ctx.cfg.relayauth.namespace} (search token exchange)`, `postgrest:${PROOF_POSTGREST.namespace}/${PROOF_POSTGREST.service} (read)`], approval: "operator" });
-  ctx.runner.note(g.record);
-  if (!g.allowed) {
-    ra.stop();
-    pg.stop();
-    return undefined;
-  }
-  const cache = new Map<string, { token: string; at: number }>();
-  // Stopped when the process exits; each check re-opens its own tunnels.
-  setTimeout(() => (ra.stop(), pg.stop()), 120_000).unref?.();
-  return async (t, q) => {
-    const subject = ctx.tokens.get(tenantKey(t));
-    if (!subject) throw new Error("no tenant token");
-    let c = cache.get(tenantKey(t));
-    if (!c || ctx.now() - c.at > 30_000) {
-      const token = await exchangeSearchToken({ relayauthUrl: ra.url, exchangeKey: key, subjectToken: subject, workspaceId: t.workspaceId });
-      ctx.secrets.push(token);
-      c = { token, at: ctx.now() };
-      cache.set(tenantKey(t), c);
-    }
-    return postgrestSearch({ postgrestUrl: pg.url, token: c.token, workspaceId: t.workspaceId, q });
-  };
+  const input = { exchangeKey: key, subjectToken: subject, workspaceId: t.workspaceId, queries };
+  const o = ctx.runner.run({ id, argv: kubectl(ctx.cfg, "-n", PROOF_POSTGREST.namespace, "exec", "-i", PROOF_SEARCH_CLIENT_POD, "--", "bun", "run", "-"), stdin: `const INPUT = ${JSON.stringify(input)};\n${SEARCH_CLIENT_SOURCE}`, mutating: false, touches: [`relayauth-tls (search token exchange)`, `postgrest:${PROOF_POSTGREST.namespace}/${PROOF_POSTGREST.service} (read)`], approval: "operator", timeoutMs: 180_000 });
+  if (!o.ok) return undefined;
+  const out = new Map<string, SearchResultLine>();
+  for (const l of jsonLines<{ tag?: string; rows?: SearchRow[]; ms?: number; error?: string }>(o.stdout))
+    if (typeof l.tag === "string" && Array.isArray(l.rows)) out.set(l.tag, { tag: l.tag, rows: l.rows, ms: Number(l.ms ?? 0) });
+  return out;
 }
 
 const tagOf = (p: PlantedSession, kind: string) => `${kind}_${p.sessionId.replace(/-/g, "")}`;
@@ -432,6 +459,31 @@ async function tokensFor(ctx: Ctx, relayauthUrl: string): Promise<string | undef
   return undefined;
 }
 
+/**
+ * Mint a token for an org the proof stage does not list and send it an empty
+ * chunk under that org's prefix. The ingest must refuse it with 403
+ * org_not_allowed; an empty body means even a broken check cannot store a byte.
+ */
+export async function unlistedOrgProbe(ctx: Ctx, relayauthUrl: string, ingestUrl: string, f: Fetch = fetch): Promise<{ status: number; code: string }> {
+  const bootstrapKey = ctx.env.PROOF_RELAYAUTH_BOOTSTRAP_KEY;
+  if (!bootstrapKey) return { status: 0, code: "no_bootstrap_key" };
+  const g = ctx.runner.gate({ id: "ingest.unlisted-org", argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`, "+", `${ingestUrl}/v1/pipeline/chunks`], mutating: true, touches: [`relayauth (1h token for unlisted ${PROOF_UNLISTED_ORG})`, "alleyoop-ingest (empty chunk, expected refusal)"], approval: "khaliq" });
+  ctx.runner.note(g.record);
+  if (!g.allowed) return { status: 0, code: "not_allowed_in_mode" };
+  let tok: string;
+  try {
+    tok = await mintTenantToken({ relayauthUrl, bootstrapKey, orgId: PROOF_UNLISTED_ORG, workspaceId: "default", sponsorId: ctx.env.PROOF_SPONSOR_ID ?? "proof-operator", historyOrigin: ctx.cfg.historyOrigin, fetch: f });
+  } catch (e) {
+    return { status: 0, code: e instanceof IngestError ? `mint_${e.code}` : "mint_error" };
+  }
+  ctx.secrets.push(tok);
+  const q = new URLSearchParams({ format: "jsonl", seq: "0", epoch: "0", offset: "0", date: "2026-10-31", machine: "proof-unlisted-m0", harness: "claude", session: "unlisted-0" });
+  const res = await f(`${ingestUrl}/v1/pipeline/chunks?${q}`, { method: "POST", headers: { authorization: `Bearer ${tok}`, "content-type": "application/octet-stream", "x-machine-id": "proof-unlisted-m0", "x-session-id": "unlisted-0" }, body: new Uint8Array() });
+  const body = (await res.json().catch(() => ({}))) as { error?: { code?: unknown }; code?: unknown };
+  const code = typeof body.error?.code === "string" ? body.error.code : typeof body.code === "string" ? body.code : `http_${res.status}`;
+  return { status: res.status, code };
+}
+
 async function plantRevision(ctx: Ctx, ingestUrl: string, sessions: readonly PlantedSession[], revision: 1 | 2): Promise<string[]> {
   const errors: string[] = [];
   const g = ctx.runner.gate({ id: `ingest.plant.rev${revision}`, argv: ["HTTP", "POST", `${ingestUrl}/v1/pipeline/chunks`, "+", `${ingestUrl}/v1/pipeline/manifests`, `x${sessions.length}`], mutating: true, touches: [`s3:${ctx.cfg.locker.bucket} (${sessions.length} synthetic sessions, revision ${revision})`, `hoopdb:${ctx.cfg.hoopdb.cluster} (index rows via the pipeline)`], approval: "khaliq" });
@@ -489,12 +541,12 @@ function s3Present(ctx: Ctx): Set<string> | undefined {
   const present = new Set<string>();
   const prefixes = new Set(ctx.corpus.map((p) => manifestKey(locationOf(p)).split("/h=")[0]! + "/"));
   for (const prefix of prefixes) {
-    const o = ctx.runner.run(s3ListStep(ctx.cfg, `${ctx.cfg.locker.prefix}${prefix}`));
+    const o = ctx.runner.run(s3ListStep(ctx.cfg, prefix));
     if (!o.ok) return undefined;
     for (const obj of (JSON.parse(o.stdout || "null") as Array<{ Key: string }> | null) ?? []) present.add(obj.Key);
   }
   const out = new Set<string>();
-  for (const p of ctx.corpus) if (present.has(`${ctx.cfg.locker.prefix}${manifestKey(locationOf(p))}`)) out.add(p.sessionId);
+  for (const p of ctx.corpus) if (present.has(manifestKey(locationOf(p)))) out.add(p.sessionId);
   return out;
 }
 
@@ -516,6 +568,10 @@ export async function plantedTrace(ctx: Ctx): Promise<CheckResult> {
   const outcome = await withForwards(ctx, async (ingest, ra) => {
     const tokenIssue = await tokensFor(ctx, ra.url);
     if (tokenIssue) return tokenIssue;
+    // Negative: an org the stage does not list must be refused at ingest with 403 org_not_allowed.
+    const neg = await unlistedOrgProbe(ctx, ra.url, ingest.url);
+    r.metrics.unlistedOrg = neg;
+    if (neg.status !== 403 || neg.code !== "org_not_allowed") r.failures.push(`unlisted org ${PROOF_UNLISTED_ORG}: ingest answered ${neg.status} ${neg.code}, expected 403 org_not_allowed`);
     const errs = await plantRevision(ctx, ingest.url, ctx.corpus, 1);
     r.metrics.plantErrors = errs.length;
     if (errs.length) r.failures.push(`${errs.length} session(s) not accepted by ingest; first: ${errs.slice(0, 5).join("; ")}`);
@@ -718,7 +774,10 @@ export async function transcriptSearch(ctx: Ctx): Promise<CheckResult> {
   const label = ctx.transcriptBackend?.label ?? backendLabel(tc);
   r.metrics.backend = label;
   r.metrics.feed = tc.feed;
-  if (label === "none") return r.done("blocked", "no transcript-search backend configured (transcriptSearch.backend=none); the proof stays INCOMPLETE");
+  if (label === "none")
+    return TRANSCRIPT_GATE_DEFERRAL.deferred
+      ? r.done("deferred", `transcript-search ${TRANSCRIPT_GATE_DEFERRAL.reason}; not run, does not block the verdict, never PASS`)
+      : r.done("blocked", "no transcript-search backend configured (transcriptSearch.backend=none); the proof stays INCOMPLETE");
   const insertStep: Step = { id: "transcript.feed.synthetic-insert", argv: ["HTTP", "POST", `${tc.endpoint ?? "<endpoint>"}/?query=INSERT INTO ${tc.database}.${tc.table} FORMAT JSONEachRow`, `x${ctx.corpus.length}`], mutating: true, touches: [`${label} (synthetic planted transcripts written)`], approval: "khaliq" };
   const searchStep: Step = { id: "transcript.search", argv: ["HTTP", "POST", `${tc.endpoint ?? "<endpoint>"}/?param_q=<canary>&readonly=1`, "(per-tenant credentials; no tenant predicate)"], mutating: false, touches: [`${label} (read)`], approval: "operator" };
   if (dry(ctx)) {
@@ -793,7 +852,11 @@ export async function transcriptSearch(ctx: Ctx): Promise<CheckResult> {
   const v = evaluateTranscriptGate(label, tc.feed, ctx.corpus, obs, cross);
   r.failures.push(...v.failures);
   Object.assign(r.metrics, v.metrics);
-  return r.done(r.failures.length ? "fail" : "pass", `${label}: ${v.metrics.searchable}/${v.metrics.planted} transcripts searchable by their own tenant; ${v.metrics.crossTenantProbes} cross-tenant probes, ${v.metrics.crossTenantHits} hits`);
+  const summary = `${label}: ${v.metrics.searchable}/${v.metrics.planted} transcripts searchable by their own tenant; ${v.metrics.crossTenantProbes} cross-tenant probes, ${v.metrics.crossTenantHits} hits`;
+  if (r.failures.length) return r.done("fail", summary);
+  // A row the harness wrote straight into the backend proves the backend, not the product: ingest -> index -> search.
+  if (tc.feed === "harness-synthetic") return r.done("blocked", `diagnostic only (harness-synthetic insert), not gate evidence; the product ingest -> index -> transcript search path must be proven. ${summary}`);
+  return r.done("pass", summary);
 }
 
 /* ================================================================ #38 HOLD: stale summary */
@@ -803,7 +866,7 @@ export async function staleSummary(ctx: Ctx): Promise<CheckResult> {
   const c = ctx.cfg;
   const chosen = c.tenants.flatMap((t) => ctx.corpus.filter((p) => tenantKey(p.tenant) === tenantKey(t)).slice(0, c.staleSessionsPerTenant));
   const invalidate = chosen.filter((_, i) => i % 2 === 0);
-  const summaryKey = (p: PlantedSession) => `${c.locker.prefix}${manifestKey(locationOf(p)).replace(/manifest\.json$/, "summary/short.json.enc")}`;
+  const summaryKey = (p: PlantedSession) => manifestKey(locationOf(p)).replace(/manifest\.json$/, "summary/short.json.enc");
   const deleteStep = (p: PlantedSession): Step => ({ id: `stale.invalidate.${p.sessionId}`, argv: ["aws", "s3api", "delete-object", "--region", c.region, "--bucket", c.locker.bucket, "--key", summaryKey(p)], mutating: true, touches: [`s3:${c.locker.bucket}/${summaryKey(p)} (delete marker; versioned)`], approval: "khaliq" });
   r.metrics.sessions = chosen.length;
   r.metrics.invalidatedObjects = invalidate.length;
@@ -1017,6 +1080,48 @@ export async function teardown(ctx: Ctx): Promise<CheckResult> {
   }
   if (r.failures.length) return r.done("fail", "proof objects remain in the cluster");
   return r.done("blocked", `in-cluster proof objects removed; ${res.tagged.length} tagged AWS resource(s) remain until \`96bulls down ${c.stage}\` (Khaliq), then rerun teardown to verify zero`);
+}
+
+/* ================================================================ teardown, post-destroy */
+
+const NOT_FOUND = /ResourceNotFoundException/;
+const BUCKET_GONE = /\(404\)|Not Found|NoSuchBucket/;
+
+/**
+ * After `bin/96bulls down aws-proof`, verify absence without a cluster:
+ * describe-cluster answers ResourceNotFound, list-clusters does not name it,
+ * no resource tagged for the stage remains (a KMS key in PendingDeletion is the
+ * expected end state), and both proof buckets answer 404. A failed or
+ * ambiguous call (403, throttling, network) is never "gone".
+ */
+export async function postDestroyTeardown(ctx: Ctx): Promise<CheckResult> {
+  const r = new Result(ctx, "teardown");
+  const c = ctx.cfg;
+  const aws = (id: string, args: string[], patterns?: RegExp[]): Step => ({ id, argv: ["aws", ...args, "--region", c.region, "--output", "json"], mutating: false, touches: [`aws:${args.slice(0, 2).join(" ")} (read)`], approval: "operator", ...(patterns ? { stderrPatterns: patterns } : {}) });
+  const describe = ctx.runner.run(aws("post-destroy.describe-cluster", ["eks", "describe-cluster", "--name", c.clusterName], [NOT_FOUND]));
+  const list = ctx.runner.run(aws("post-destroy.list-clusters", ["eks", "list-clusters"]));
+  const tagged = ctx.runner.run(aws("post-destroy.tagged", ["resourcegroupstaggingapi", "get-resources", "--tag-filters", `Key=${PROOF_TAG.key},Values=${PROOF_TAG.value}`]));
+  const buckets = [...new Set([c.locker.bucket, PROOF_BACKUP_BUCKET])].map((b) => ({ b, o: ctx.runner.run(aws(`post-destroy.head-bucket.${b}`, ["s3api", "head-bucket", "--bucket", b], [BUCKET_GONE])) }));
+  if (dry(ctx)) return r.done("planned", "post-destroy: describe-cluster must answer ResourceNotFound, list-clusters must not name it, no tagged resources, both buckets 404");
+  const clusterGoneDescribe = describe.record.status === "failed" && describe.stderrMatches?.[0] === true;
+  if (!clusterGoneDescribe) r.failures.push(describe.ok ? "describe-cluster still finds the cluster" : "describe-cluster failed without ResourceNotFound; absence unproven");
+  const gone = clusterGone(list.ok, list.stdout, c.clusterName);
+  if (gone !== true) r.failures.push(gone === false ? "list-clusters still names the cluster" : "list-clusters failed; absence unproven");
+  for (const { b, o } of buckets) if (!(o.record.status === "failed" && o.stderrMatches?.[0] === true)) r.failures.push(o.ok ? `bucket ${b} still exists` : `head-bucket ${b} failed without 404; absence unproven`);
+  if (!tagged.ok) r.failures.push("tagged-resource listing failed");
+  else {
+    const res = teardownResidue({ clusterGone: true, k8sJson: "{}", namespaceOut: "", taggedJson: tagged.stdout });
+    const pending: string[] = [];
+    for (const t of res.tagged.filter((x) => x.startsWith("aws arn:aws:kms:"))) {
+      const arn = t.slice(4);
+      const k = ctx.runner.run({ id: "post-destroy.kms", argv: ["aws", "kms", "describe-key", "--region", c.region, "--key-id", arn, "--query", "KeyMetadata.KeyState", "--output", "text"], mutating: false, touches: [`aws:${arn} (describe)`], approval: "operator" });
+      if (k.ok && k.stdout.trim() === "PendingDeletion") pending.push(arn);
+    }
+    r.metrics.kmsPendingDeletion = pending;
+    r.failures.push(...res.tagged.filter((x) => !pending.includes(x.slice(4))).map((x) => `still present after stage destroy: ${x}`));
+  }
+  r.metrics.postDestroy = true;
+  return r.done(r.failures.length ? "fail" : "pass", "post-destroy: cluster, tagged resources and buckets are gone");
 }
 
 export const CHECKS: Record<CheckId, (ctx: Ctx) => Promise<CheckResult>> = {

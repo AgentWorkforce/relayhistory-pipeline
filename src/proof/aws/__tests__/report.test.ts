@@ -14,7 +14,8 @@ describe("report schema", () => {
     const r = report([check()]);
     expect(r.schema).toBe(REPORT_SCHEMA);
     expect(r.scope.v1FullTranscriptSearch).toBe("UNSUPPORTED");
-    expect(r.scope.reason).toMatch(/UNSUPPORTED on V1.*INCOMPLETE, never PASS/);
+    expect(r.scope.reason).toMatch(/UNSUPPORTED on V1.*DEFERRED \(deferred by owner 2026-10-31\).*never reported as PASS/);
+    expect(r.limitations[0]).toMatch(/^NetworkPolicy is not enforced in phase 1/);
     expect(r.searchGates.metadata.backend).toMatch(/^HoopDb Postgres/);
     expect(r.searchGates.transcript.backend).toBe(CH);
     expect(validateReport(r)).toEqual([]);

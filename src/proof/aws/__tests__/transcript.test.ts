@@ -46,18 +46,39 @@ async function run(cfg: ProofConfig, backend?: TranscriptBackend, mode: "live" |
 }
 
 describe("transcript-search gate", () => {
-  test("unconfigured backend: the check is blocked and the overall verdict is INCOMPLETE", async () => {
+  test("unconfigured backend: the gate is DEFERRED by the owner, never PASS", async () => {
     const { result } = await run({ ...defaultConfig(), sessions: 4 });
-    expect(result.status).toBe("blocked");
+    expect(result.status).toBe("deferred");
+    expect(result.summary).toMatch(/deferred by owner 2026-10-31/);
     expect(result.metrics.backend).toBe("none");
     const r = buildReport({ provenance: PROV, runId: "x", mode: "live", backends: { metadata: "HoopDb Postgres", transcript: "none" }, target: { stage: "aws-proof", clusterName: PROOF_CLUSTER, kubeContext: ARN }, checks: [result] });
     expect(r.verdict).toBe("incomplete");
-    expect(r.searchGates.transcript.backend).toBe("none");
+    expect(r.searchGates.transcript).toMatchObject({ backend: "none", deferred: "deferred by owner 2026-10-31" });
+  });
+  test("a harness-synthetic insert is diagnostic only: BLOCKED even when every probe is clean", async () => {
+    const { result } = await run(configured(), fakeBackend(true));
+    expect(result.status).toBe("blocked");
+    expect(result.summary).toMatch(/^diagnostic only \(harness-synthetic insert\)/);
+  });
+  test("the product pipeline feed (ingest -> index -> search) is what can PASS", async () => {
+    const cfg = { ...configured(), transcriptSearch: { ...configured().transcriptSearch, feed: "pipeline" as const } };
+    const b = fakeBackend(true);
+    const ctx = newCtx(cfg, new Runner({ kubeconfigPath: "/test/kubeconfig.json", mode: "live", identity, print: () => {}, fence: TEST_FENCE }), "aws-proof-test-run-0002", {});
+    ctx.print = () => {};
+    ctx.transcriptBackend = b;
+    // As if planted-trace had landed each session through the authenticated ingest and the product projected it.
+    for (const p of ctx.corpus) {
+      ctx.uploads.set(p.sessionId, { chunks: [], offset: 0, landed: [{ revision: 1, manifestKey: "k", version: { eTag: "e" }, landedAtMs: Date.now() - 1000 }] });
+      b.rows.push({ org_id: p.tenant.orgId, session_id: p.sessionId, content: p.transcriptCanary });
+    }
+    const result = await transcriptSearch(ctx);
+    expect(result.status).toBe("pass");
+    expect(result.metrics).toMatchObject({ feed: "pipeline", searchable: cfg.sessions, crossTenantHits: 0 });
   });
 
   test("backend that enforces tenancy: every transcript found by its own tenant, no cross-tenant hits, latency recorded", async () => {
     const { result } = await run(configured(), fakeBackend(true));
-    expect(result.status).toBe("pass");
+    expect(result.status).toBe("blocked");
     expect(result.metrics).toMatchObject({ planted: 6, searchable: 6, crossTenantHits: 0, feed: "harness-synthetic" });
     expect((result.metrics.queryMs as { n: number; p95: number; errorRate: number }).errorRate).toBe(0);
     expect((result.metrics.landedToSearchableMs as { n: number }).n).toBe(6);

@@ -5,7 +5,7 @@ import { defaultConfig, kindReadOnlyConfig, validateConfig, type ProofConfig } f
 import { Runner } from "../exec.ts";
 import { fenceFor, PROOF_HOST, PROOF_LOCKER_BUCKET,  } from "../fence.ts";
 import { PROOF_PROBE_IMAGES } from "../fence.ts";
-import { admitStep, stepFenceIssue } from "../ops.ts";
+import { admitStep, probePod, stepFenceIssue } from "../ops.ts";
 import { PROOF_ACCOUNT_ID, PROOF_CLUSTER } from "../guard.ts";
 import { admitPrior, buildReport, canonicalReportBytes, mergeReports, sanitize, sha256, validateReport, type CheckResult, type ProofReport } from "../report.ts";
 
@@ -58,8 +58,10 @@ describe("fix 1: every target is fenced to the proof stage", () => {
     expect(stepFenceIssue(["PROBE", "GET https://example.com/healthz"], fence)).toBe("host_outside_fence");
     expect(stepFenceIssue(["PROBE", `GET https://${PROOF_HOST}/healthz`], fence)).toBeUndefined();
     const img = `--image=${PROOF_PROBE_IMAGES[0]}`;
-    expect(stepFenceIssue(k("-n", "relaycast", "run", "proof-relaycast-aws-proof", img, "--env=RC_URL=http://relaycast.relaycast.svc:8787", "--command", "--", "sleep", "7200"), fence)).toBeUndefined();
-    expect(stepFenceIssue(k("-n", "relaycast", "run", "proof-relaycast-aws-proof", img, "--env=RC_URL=http://db.kube-system.svc:8787", "--command", "--", "sleep", "7200"), fence)).toBe("probe_env_not_allowlisted");
+    const spec = probePod("relaycast", PROOF_PROBE_IMAGES[0]!);
+    const runArgs = (env: string) => k("-n", "relaycast", "run", "proof-relaycast-aws-proof", img, "--restart=Never", `--labels=${spec.labels}`, env, "--overrides", spec.overrides, "--command", "--", "sleep", "7200");
+    expect(stepFenceIssue(runArgs("--env=RC_URL=http://relaycast.relaycast.svc:8787"), fence)).toBeUndefined();
+    expect(stepFenceIssue(runArgs("--env=RC_URL=http://db.kube-system.svc:8787"), fence)).toBe("probe_env_not_allowlisted");
     expect(stepFenceIssue(k("-n", "relaycast", "run", "x", img), fence)).toBe("kubectl_operation_not_allowlisted");
     expect(stepFenceIssue(["aws", "wafv2", "get-web-acl-for-resource", "--region", "us-west-2", "--resource-arn", "arn:aws:elasticloadbalancing:us-west-2:111111111111:loadbalancer/app/x/y"], fence)).toBe("arn_outside_fence");
   });

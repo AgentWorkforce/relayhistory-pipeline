@@ -9,7 +9,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE } from "./guard.ts";
 import type { Tenant } from "./leak-scan.ts";
 import { validateTranscriptConfig, type TranscriptConfig } from "./transcript.ts";
-import { PROOF_CHART_REPO, PROOF_HOST, PROOF_LOCKER_BUCKET, PROOF_ORIGIN, proofConfigIssues } from "./fence.ts";
+import { PROOF_CHART_REPO, PROOF_HOST, PROOF_KEY_PREFIX_BASE, PROOF_LOCKER_BUCKET, PROOF_ORIGIN, PROOF_TENANT_ORGS, proofConfigIssues } from "./fence.ts";
 
 export interface ProofConfig {
   stage: string;
@@ -27,7 +27,9 @@ export interface ProofConfig {
   expectedImages: Record<string, string>;
   coreDeployments: string[];
   hoopdb: { cluster: string; database: string };
-  locker: { bucket: string; prefix: string };
+  locker: { bucket: string };
+  /** The ingest derives `<base>/<org>` key prefixes (PIPELINE_KEY_PREFIX + PIPELINE_ORG_FROM_PREFIX). */
+  objectKeyPrefixBase: string;
   /** Bucket holding CNPG barman backups; required for the backup drill. */
   backupBucket?: string;
   relayauth: { namespace: string; service: string; port: number };
@@ -81,20 +83,19 @@ export function defaultConfig(): ProofConfig {
     coreDeployments: ["96bulls-alleyoop-ingest", "96bulls-worker-hoopdb-indexer", "96bulls-worker-referee", "96bulls-worker-bob-costas"],
     hoopdb: { cluster: "hoopdb", database: "hoopdb" },
     // stacks/aws/alchemy.aws.run.ts: `96bulls-<stage>-locker-<account>`, versioned, KMS-encrypted.
-    locker: { bucket: PROOF_LOCKER_BUCKET, prefix: "" },
+    locker: { bucket: PROOF_LOCKER_BUCKET },
+    objectKeyPrefixBase: PROOF_KEY_PREFIX_BASE,
     relayauth: { namespace: "relayauth", service: "relayauth", port: 8787 },
     relaycast: { namespace: "relaycast", service: "relaycast", port: 8787 },
     ingest: { service: "96bulls-alleyoop", port: 8080 },
     ingress: { hostname: PROOF_HOST, burst: {} },
     historyOrigin: PROOF_ORIGIN,
-    tenants: [
-      { orgId: "org_proof_a", workspaceId: "default" },
-      { orgId: "org_proof_b", workspaceId: "default" },
-    ],
+    // #75 eks.tenantOrgIds; the fence allowlists exactly these.
+    tenants: PROOF_TENANT_ORGS.map((orgId) => ({ orgId, workspaceId: "default" })),
     sessions: 100,
     staleSessionsPerTenant: 2,
     search: { mode: "postgrest-jwt" },
-    transcriptSearch: { backend: "none", feed: "harness-synthetic", credentials: { tenants: "PROOF_TRANSCRIPT_TENANT_CREDENTIALS", writer: "PROOF_TRANSCRIPT_WRITER" } },
+    transcriptSearch: { backend: "none", feed: "pipeline", credentials: { tenants: "PROOF_TRANSCRIPT_TENANT_CREDENTIALS", writer: "PROOF_TRANSCRIPT_WRITER" } },
     extractiveSummaries: true,
     pollIntervalMs: 2_000,
     stageDeadlineMs: 300_000,

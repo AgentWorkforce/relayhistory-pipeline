@@ -12,6 +12,7 @@ import type { Step } from "./exec.ts";
 import { PROOF_STAGE } from "./guard.ts";
 import { kubectl } from "./probes.ts";
 import { PROOF_WRITABLE_NAMESPACES } from "./fence.ts";
+import { probePod, RELAYCAST_PROBE_URL } from "./ops.ts";
 
 const mut = (id: string, argv: string[], touches: string[], timeoutMs?: number): Step => ({ id, argv, mutating: true, touches, approval: "khaliq", ...(timeoutMs ? { timeoutMs } : {}) });
 const read = (id: string, argv: string[], touches: string[], timeoutMs?: number): Step => ({ id, argv, mutating: false, touches, approval: "operator", ...(timeoutMs ? { timeoutMs } : {}) });
@@ -96,10 +97,12 @@ if (phase === "before" && st) { st.before = marker; fs.writeFileSync(f, JSON.str
 
 export function relaycastProbeSteps(c: ProofConfig, phase: "start" | "before" | "after" | "delete"): Step[] {
   const ns = c.relaycast.namespace;
-  const url = `http://${c.relaycast.service}.${ns}.svc:${c.relaycast.port}`;
+  const url = RELAYCAST_PROBE_URL;
+  const img = c.probeImage ?? "<allowlisted probe image>";
+  const spec = probePod("relaycast", img);
   if (phase === "start")
     return [
-      mut("relaycast.probe-pod", kubectl(c, "-n", ns, "run", RELAYCAST_PROBE_POD, `--image=${c.probeImage ?? "<digest-pinned probe image>"}`, "--restart=Never", "--labels=96bulls.proof=true", `--env=RC_URL=${url}`, "--overrides", JSON.stringify({ spec: { volumes: [{ name: "probe", emptyDir: { medium: "Memory" } }], containers: [{ name: RELAYCAST_PROBE_POD, image: c.probeImage ?? "<digest-pinned probe image>", command: ["sleep", "7200"], env: [{ name: "RC_URL", value: url }], volumeMounts: [{ name: "probe", mountPath: "/probe" }] }] } }), "--command", "--", "sleep", "7200"), [`k8s:${ns}/pod/${RELAYCAST_PROBE_POD} (created)`]),
+      mut("relaycast.probe-pod", kubectl(c, "-n", ns, "run", RELAYCAST_PROBE_POD, `--image=${img}`, "--restart=Never", `--labels=${spec.labels}`, `--env=RC_URL=${url}`, "--overrides", spec.overrides, "--command", "--", "sleep", "7200"), [`k8s:${ns}/pod/${RELAYCAST_PROBE_POD} (created)`]),
       read("relaycast.probe-ready", kubectl(c, "-n", ns, "wait", "--for=condition=Ready", `pod/${RELAYCAST_PROBE_POD}`, "--timeout=180s"), [`k8s:${ns}/pod/${RELAYCAST_PROBE_POD}`], 200_000),
     ];
   if (phase === "delete") return [mut("relaycast.probe-delete", kubectl(c, "-n", ns, "delete", "pod", RELAYCAST_PROBE_POD, "--ignore-not-found"), [`k8s:${ns}/pod/${RELAYCAST_PROBE_POD} (deleted)`])];

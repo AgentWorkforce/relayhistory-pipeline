@@ -41,7 +41,7 @@ export class IngestError extends Error {
 const date = (iso: string) => iso.slice(0, 10);
 
 export function locationOf(p: PlantedSession) {
-  return { workspaceId: p.tenant.workspaceId, machineId: p.machineId, harness: p.harness, sessionId: p.sessionId, startDate: date(p.startedAt) };
+  return { ...(p.keyPrefix ? { prefix: p.keyPrefix } : {}), workspaceId: p.tenant.workspaceId, machineId: p.machineId, harness: p.harness, sessionId: p.sessionId, startDate: date(p.startedAt) };
 }
 
 async function errorCode(res: Response): Promise<string> {

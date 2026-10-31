@@ -52,7 +52,7 @@ describe("planting through the real manifest route", () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  function server(orgId: string) {
+  function server(orgId: string, keyPrefix?: string) {
     const store = createFsStore({ root });
     const raw = { store, provider: "fs" as const, bucket: "raw" };
     const sent: StageMessage[] = [];
@@ -66,14 +66,17 @@ describe("planting through the real manifest route", () => {
     app.post("/v1/pipeline/chunks", async (c) => {
       const q = c.req.query();
       const sealed = await sealRawChunk(store, {
-        location: { workspaceId: "default", machineId: q.machine!, harness: q.harness!, sessionId: q.session!, startDate: q.date! },
+        location: { ...(keyPrefix ? { prefix: `${keyPrefix}/${orgId}` } : {}), workspaceId: "default", machineId: q.machine!, harness: q.harness!, sessionId: q.session!, startDate: q.date! },
         format: "jsonl", seq: Number(q.seq), epoch: Number(q.epoch), startOffset: Number(q.offset),
         source: new Uint8Array(await c.req.arrayBuffer()), traceId: c.req.header("x-relay-trace-id"),
       });
       return c.json(sealed);
     });
     app.route("/v1", createCourierManifestRoutes({ manifests: objectStoreManifestReader(store, { provider: "fs", bucket: "raw" }), raw, send: async (_e, _s, m) => void sent.push(m) }));
-    const env = { PIPELINE_ORG_ID: "org_proof_a", RELAYHISTORY_ORIGIN: "https://history.example", PIPELINE_TELEMETRY_ID_KEY: "test-telemetry-key-at-least-32-bytes-long" };
+    const env = {
+      ...(keyPrefix ? { PIPELINE_KEY_PREFIX: keyPrefix, PIPELINE_ORG_FROM_PREFIX: "true" } : { PIPELINE_ORG_ID: "org_proof_a" }),
+      RELAYHISTORY_ORIGIN: "https://history.example", PIPELINE_TELEMETRY_ID_KEY: "test-telemetry-key-at-least-32-bytes-long",
+    };
     const fetch = async (input: string, init?: RequestInit) => app.request(input.replace("http://ingest", ""), init, env);
     return { fetch, sent, store };
   }
@@ -104,5 +107,28 @@ describe("planting through the real manifest route", () => {
     const err = await plantNextRevision({ ingestUrl: "http://ingest", fetch: s.fetch }, p!, "tok", newUploadState()).catch((e) => e);
     expect(err).toBeInstanceOf(IngestError);
     expect((err as IngestError).status).toBe(403);
+  });
+
+  // Not run against the real manifest route: on this branch's main, chunksAreServerSealed
+  // (src/alleyoop/manifests.ts) rebuilds chunk keys without the key prefix, so with
+  // PIPELINE_ORG_FROM_PREFIX a prefixed manifest fails with 409 chunks_unverified.
+  // Reported on the PR; the harness side is checked here.
+  test("proof-stage manifests are keyed 96bulls/<org>/v1/... and validate", async () => {
+    const tenants2 = [{ orgId: "org_aws_proof_1", workspaceId: "default" }, { orgId: "org_aws_proof_2", workspaceId: "default" }];
+    const [p] = plantCorpus({ runId: "aws-proof-ingest-0003", sessions: 2, tenants: tenants2, keyPrefixBase: "96bulls" });
+    const store = createFsStore({ root });
+    const bodies: unknown[] = [];
+    const fetch = async (url: string, init?: RequestInit) => {
+      if (url.includes("/v1/pipeline/chunks")) {
+        const q = new URL(url).searchParams;
+        const sealed = await sealRawChunk(store, { location: { prefix: "96bulls/org_aws_proof_1", workspaceId: "default", machineId: q.get("machine")!, harness: q.get("harness")!, sessionId: q.get("session")!, startDate: q.get("date")! }, format: "jsonl", seq: 0, epoch: 0, startOffset: 0, source: new Uint8Array(init!.body as Uint8Array) });
+        return new Response(JSON.stringify(sealed));
+      }
+      bodies.push(JSON.parse(String(init!.body)));
+      return new Response(JSON.stringify({ version: { eTag: "e1" } }), { status: 202 });
+    };
+    const r1 = await plantNextRevision({ ingestUrl: "http://ingest", fetch }, p!, "tok", newUploadState());
+    expect(r1.manifestKey).toMatch(/^96bulls\/org_aws_proof_1\/v1\/ws=default\//);
+    expect((bodies[0] as { key: string }).key).toBe(r1.manifestKey);
   });
 });

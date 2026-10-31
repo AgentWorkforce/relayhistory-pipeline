@@ -33,7 +33,20 @@ export type CheckId = (typeof CHECK_IDS)[number];
  * is missing (an unapplied migration, one CNPG instance), so nothing was
  * concluded. `planned` is a dry run. `skipped` is a mutating step in read-only.
  */
-export const STATUSES = ["pass", "fail", "unsupported", "blocked", "planned", "skipped"] as const;
+export const STATUSES = ["pass", "fail", "unsupported", "blocked", "planned", "skipped", "deferred"] as const;
+
+/**
+ * Owner decision (Khaliq, 2026-10-31): the transcript-search gate is deferred
+ * for this AWS proof. A `deferred` transcript-search does not block the overall
+ * verdict and is never reported as PASS. Only transcript-search may be deferred,
+ * and only with this exact reason. Removing the deferral is a reviewed change.
+ */
+export const TRANSCRIPT_GATE_DEFERRAL = { deferred: true, reason: "deferred by owner 2026-10-31" } as const;
+
+/** Stated on every report: what this phase-1 proof does not establish. */
+export const PHASE1_LIMITATIONS = [
+  "NetworkPolicy is not enforced in phase 1: the stage declares NetworkPolicies, but this proof does not establish that the cluster's network plugin enforces them, so pod-to-pod isolation rests on authentication, not on the network.",
+] as const;
 export type Status = (typeof STATUSES)[number];
 
 export type Approval = "khaliq" | "operator";
@@ -87,7 +100,7 @@ export interface ProofReport {
    */
   searchGates: {
     metadata: { checks: ["planted-trace", "v1-search-scope"]; backend: string };
-    transcript: { checks: ["transcript-search"]; backend: string };
+    transcript: { checks: ["transcript-search"]; backend: string; deferred?: string };
   };
   checks: CheckResult[];
   /**
@@ -98,6 +111,8 @@ export interface ProofReport {
   phases: Phase[];
   /** Harness commit + dirty bit, input/config digests, the bound stage plan, chart package digests. */
   provenance: ReportProvenance;
+  /** Explicit phase-1 limitations (PHASE1_LIMITATIONS). */
+  limitations: string[];
   /** Why a run whose checks all passed is still incomplete (provenance gaps). */
   verdictGaps: string[];
   verdict: "pass" | "fail" | "incomplete";
@@ -115,7 +130,8 @@ export interface Phase {
 export const V1_SCOPE_STATEMENT =
   "Full-transcript search is UNSUPPORTED on V1 (HoopDb Postgres): V1 search covers session_directory metadata and the " +
   "scrubbed short_summary only, and full transcripts stay in S3. Transcript search is a separate gate (transcript-search) " +
-  "against a V2 backend; without one configured the proof is INCOMPLETE, never PASS.";
+  "against a V2 backend; for this AWS proof it is DEFERRED (deferred by owner 2026-10-31): it does not block the verdict " +
+  "and is never reported as PASS. The V1 metadata/short_summary search gate is mandatory.";
 
 /* ------------------------------------------------------------------ sanitize */
 
@@ -190,9 +206,10 @@ export function evidence(label: string, raw: string, known: Parameters<typeof sa
  */
 export function verdictOf(checks: readonly CheckResult[], transcriptBackend: string): ProofReport["verdict"] {
   if (checks.some((c) => c.status === "fail")) return "fail";
-  if (transcriptBackend === "none") return "incomplete";
+  const transcriptDeferred = checks.some((c) => c.check === "transcript-search" && c.status === "deferred");
+  if (!transcriptDeferred && transcriptBackend === "none") return "incomplete";
   const complete = CHECK_IDS.every((id) =>
-    checks.some((c) => c.check === id && executed(c) && (c.status === "pass" || (id === "v1-search-scope" && c.status === "unsupported"))),
+    checks.some((c) => c.check === id && ((id === "transcript-search" && c.status === "deferred") || (executed(c) && (c.status === "pass" || (id === "v1-search-scope" && c.status === "unsupported"))))),
   );
   return complete ? "pass" : "incomplete";
 }
@@ -212,7 +229,7 @@ export function finalVerdict(checks: readonly CheckResult[], transcriptBackend: 
 }
 
 export function buildReport(
-  input: Omit<ProofReport, "schema" | "scope" | "searchGates" | "verdict" | "verdictGaps" | "generatedAt" | "phases"> & { generatedAt?: string; backends: { metadata: string; transcript: string } },
+  input: Omit<ProofReport, "schema" | "scope" | "searchGates" | "verdict" | "verdictGaps" | "generatedAt" | "phases" | "limitations"> & { generatedAt?: string; backends: { metadata: string; transcript: string } },
 ): ProofReport {
   const fv = finalVerdict(input.checks, input.backends.transcript, input.provenance);
   return {
@@ -224,8 +241,12 @@ export function buildReport(
     scope: { v1FullTranscriptSearch: "UNSUPPORTED", reason: V1_SCOPE_STATEMENT },
     searchGates: {
       metadata: { checks: ["planted-trace", "v1-search-scope"], backend: input.backends.metadata },
-      transcript: { checks: ["transcript-search"], backend: input.backends.transcript },
+      transcript: {
+        checks: ["transcript-search"], backend: input.backends.transcript,
+        ...(input.checks.some((c) => c.check === "transcript-search" && c.status === "deferred") ? { deferred: TRANSCRIPT_GATE_DEFERRAL.reason } : {}),
+      },
     },
+    limitations: [...PHASE1_LIMITATIONS],
     checks: input.checks,
     phases: [{ runId: input.runId, generatedAt: input.generatedAt ?? new Date().toISOString(), mode: input.mode, checks: input.checks.map((c) => c.check) }],
     provenance: input.provenance,
@@ -350,8 +371,11 @@ export function validateReport(r: unknown, known: { canaries?: readonly string[]
     if (c.status === "pass" && c.failures?.length) issues.push(`${at} passes with failures recorded`);
     if (rep.mode !== "dry-run" && (c.status === "pass" || c.status === "unsupported") && Array.isArray(c.steps) && !executed(c)) issues.push(`${at} reports ${c.status} without executed steps`);
     if (c.status === "unsupported" && c.check !== "v1-search-scope") issues.push(`${at} only v1-search-scope may be unsupported`);
+    if (c.status === "deferred" && (c.check !== "transcript-search" || !TRANSCRIPT_GATE_DEFERRAL.deferred || !c.summary.includes(TRANSCRIPT_GATE_DEFERRAL.reason)))
+      issues.push(`${at} only transcript-search may be deferred, with the owner's recorded reason`);
     for (const e of c.evidence ?? []) if (!/^[0-9a-f]{64}$/.test(e.sha256) || !Number.isInteger(e.bytes)) issues.push(`${at} evidence '${e.label}' lacks sha256/bytes`);
   }
+  for (const l of PHASE1_LIMITATIONS) if (!rep.limitations?.includes(l)) issues.push("limitations must state every phase-1 limitation");
   const prov = rep.provenance;
   if (!prov || typeof prov.harness?.commit !== "string" || typeof prov.harness?.dirty !== "boolean" || !/^[0-9a-f]{64}$/.test(prov.configSha256 ?? "") || !/^[0-9a-f]{64}$/.test(prov.inputs?.sha256 ?? "") || !Array.isArray(prov.charts))
     issues.push("provenance incomplete (harness commit/dirty, inputs and config sha256, charts)");

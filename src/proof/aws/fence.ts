@@ -42,7 +42,9 @@ export const PROOF_RESTORE_CLUSTER = "hoopdb-restore-proof";
  * HTTP). Not deployed in Stage A (sessionDirectory.enabled=false), so the
  * metadata search gate is BLOCKED until it is; the service name is fixed here.
  */
-export const PROOF_POSTGREST = { namespace: "96bulls", service: "session-directory-postgrest", port: 3000 } as const;
+export const PROOF_POSTGREST = { namespace: "96bulls", service: "session-directory-postgrest", port: 3000, clientLabel: ["96bulls.agentrelay.com/search-client", "true"] } as const;
+/** The in-cluster search client pod: carries both caller labels, so NetworkPolicy admits it to RelayAuth TLS and PostgREST. */
+export const PROOF_SEARCH_CLIENT_POD = "proof-search-client";
 /**
  * The only images the in-cluster probe pod may run: the Stage A services image
  * (versions.lock.json images.services-aws.approved on #75, publish-image-ecr
@@ -51,6 +53,18 @@ export const PROOF_POSTGREST = { namespace: "96bulls", service: "session-directo
 export const PROOF_PROBE_IMAGES: readonly string[] = [
   "500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services@sha256:59d9468551ded11f3c6f5d36558ab7ef87c3e50e99772de352cc309823cb00e0",
 ];
+/** The proof stage's tenants (#75 eks.tenantOrgIds). Any other org must get 403 org_not_allowed at ingest. */
+export const PROOF_TENANT_ORGS = ["org_aws_proof_1", "org_aws_proof_2"] as const;
+/** A deliberately unlisted org for the negative ingest check. */
+export const PROOF_UNLISTED_ORG = "org_aws_proof_unlisted";
+/** Object keys land under `96bulls/<org>/v1/...` (#75). */
+export const PROOF_KEY_PREFIX_BASE = "96bulls";
+/**
+ * RelayAuth's TLS Service (#75). The search-token exchange must go here, from a
+ * caller pod labelled relayauth.agentrelay.com/client=tls that trusts the CA in
+ * ConfigMap relayauth-ca. Never the plain relayauth:8787.
+ */
+export const PROOF_RELAYAUTH_TLS = { namespace: "relayauth", service: "relayauth-tls", port: 8443, caConfigMap: "relayauth-ca", clientLabel: ["relayauth.agentrelay.com/client", "tls"] } as const;
 /** Namespaces that hold objects the proof creates (and teardown may delete). */
 export const PROOF_WRITABLE_NAMESPACES = [PROOF_NAMESPACE, PROOF_RELAYCAST.namespace] as const;
 
@@ -187,6 +201,8 @@ export function proofConfigIssues(c: FenceSource & Record<string, unknown>): str
   want("ingest.service", c.ingest.service, PROOF_INGEST_SERVICE);
   want("ingress.hostname", c.ingress.hostname, PROOF_HOST);
   want("historyOrigin", c.historyOrigin, PROOF_ORIGIN);
+  want("tenants", (c as { tenants?: Array<{ orgId: string }> }).tenants?.map((t) => t.orgId), PROOF_TENANT_ORGS);
+  want("objectKeyPrefixBase", (c as { objectKeyPrefixBase?: string }).objectKeyPrefixBase, PROOF_KEY_PREFIX_BASE);
   const t = c.transcriptSearch;
   if (t.backend !== "none") {
     const h = hostOf(t.endpoint);
@@ -194,5 +210,34 @@ export function proofConfigIssues(c: FenceSource & Record<string, unknown>): str
       issues.push(`transcriptSearch.endpoint host ${h ?? "?"} is not an allowlisted proof transcript host (fence.ts PROOF_TRANSCRIPT_HOSTS: ${PROOF_TRANSCRIPT_HOSTS.join(", ") || "none yet"})`);
     want("transcriptSearch database/table", { database: t.database, table: t.table }, PROOF_TRANSCRIPT_TABLE);
   }
+  return issues;
+}
+
+/**
+ * The stack's `eks.harness` outputs (#75) restate the harness endpoints. They
+ * are read and must equal the hardcoded fence; they never widen it. The shape
+ * below is the harness's expectation of #75's output; any difference refuses.
+ */
+export const EXPECTED_HARNESS_OUTPUTS = {
+  relayauthExchangeUrl: `https://${PROOF_RELAYAUTH_TLS.service}.${PROOF_RELAYAUTH_TLS.namespace}.svc:${PROOF_RELAYAUTH_TLS.port}`,
+  relayauthCaConfigMap: PROOF_RELAYAUTH_TLS.caConfigMap,
+  relayauthClientLabel: PROOF_RELAYAUTH_TLS.clientLabel.join("="),
+  postgrestUrl: `http://${PROOF_POSTGREST.service}.${PROOF_POSTGREST.namespace}.svc:${PROOF_POSTGREST.port}`,
+  searchClientLabel: PROOF_POSTGREST.clientLabel.join("="),
+  tenantOrgIds: [...PROOF_TENANT_ORGS],
+  objectKeyPrefix: PROOF_KEY_PREFIX_BASE,
+} as const;
+
+export function harnessOutputIssues(outputsJson: string): string[] {
+  let h: Record<string, unknown> | undefined;
+  try {
+    h = (JSON.parse(outputsJson) as { eks?: { harness?: Record<string, unknown> } }).eks?.harness;
+  } catch {
+    return ["stack outputs are not JSON"];
+  }
+  if (!h) return ["stack outputs have no eks.harness"];
+  const issues: string[] = [];
+  for (const [k, want] of Object.entries(EXPECTED_HARNESS_OUTPUTS))
+    if (JSON.stringify(h[k]) !== JSON.stringify(want)) issues.push(`eks.harness.${k} is ${JSON.stringify(h[k])}, the fence requires ${JSON.stringify(want)}`);
   return issues;
 }

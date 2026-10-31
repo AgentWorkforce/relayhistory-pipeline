@@ -32,6 +32,7 @@ export class GuardError extends Error {
       | "wrong_cluster"
       | "wrong_region"
       | "cluster_unbound"
+      | "post_destroy_read_only"
       | "context_mismatch"
       | "production_name"
       | "local_is_read_only"
@@ -55,6 +56,8 @@ export interface Identity {
   kubeContext: string;
   /** The cluster ARN as `aws eks describe-cluster` reports it (not as a kubeconfig names it). */
   kubeContextCluster?: string;
+  /** Post-destroy verification: identity is the STS account (+ the pinned region), there is no cluster to bind. */
+  postDestroy?: boolean;
   /**
    * True only when describe-cluster succeeded for the proof cluster and the
    * kube context's server and CA equal its endpoint and CA (cluster-binding.ts).
@@ -84,6 +87,10 @@ export function parseEksArn(arn: string | undefined): { region: string; accountI
  */
 export function assertMayRun(g: GuardInput): void {
   if (g.mode === "dry-run") return;
+  if (g.postDestroy) {
+    if (g.mutating) throw new GuardError("post_destroy_read_only", "refusing: post-destroy verification only reads");
+    return assertPostDestroyTarget(g);
+  }
   if (g.kubeContext === LOCAL_READONLY_CONTEXT) {
     if (g.mutating || g.mode === "live")
       throw new GuardError("local_is_read_only", `refusing: ${LOCAL_READONLY_CONTEXT} is read-only for this harness; nothing was changed`);
@@ -111,4 +118,17 @@ export function assertProofTarget(g: Omit<GuardInput, "mode" | "mutating">): voi
   const named = parseEksArn(g.kubeContext);
   if (named && (named.region !== PROOF_REGION || named.accountId !== PROOF_ACCOUNT_ID || named.clusterName !== PROOF_CLUSTER))
     throw new GuardError("wrong_region", `refusing: kube context name ${g.kubeContext} is not the proof cluster in ${PROOF_REGION}`);
+}
+
+/**
+ * The post-destroy guard: --confirm-live and the sts-observed proof account.
+ * Region is pinned per step by the fence; the target identity (stage, cluster,
+ * context) comes from the admitted prior report, whose target is the exact
+ * proof constant. No kube context is involved: the cluster is meant to be gone.
+ */
+export function assertPostDestroyTarget(g: { confirmLive: boolean; accountId?: string; clusterName: string }): void {
+  if (!g.confirmLive) throw new GuardError("missing_confirm_live", "refusing: live targets need --confirm-live; nothing was run");
+  if (!g.accountId) throw new GuardError("unverified_identity", "refusing: caller account not verified with sts get-caller-identity");
+  if (g.accountId !== PROOF_ACCOUNT_ID) throw new GuardError("wrong_account", `refusing: caller account ${g.accountId} is not the proof account ${PROOF_ACCOUNT_ID}`);
+  if (g.clusterName !== PROOF_CLUSTER) throw new GuardError("wrong_cluster", `refusing: cluster '${g.clusterName}' is not the proof cluster '${PROOF_CLUSTER}'`);
 }
