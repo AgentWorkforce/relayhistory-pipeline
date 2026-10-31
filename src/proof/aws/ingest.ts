@@ -146,16 +146,23 @@ export async function plantNextRevision(t: IngestTarget, p: PlantedSession, toke
 }
 
 /**
- * Mint a short-lived per-tenant token from the in-cluster RelayAuth (reached by
+ * Mint a short-lived per-machine token from the in-cluster RelayAuth (reached by
  * port-forward). The bootstrap key comes from the environment, piped from
  * 1Password by the operator; it is never written to disk or the report.
+ *
+ * RelayAuth #113 signs the canonical `machineId` as `meta.machineId`. A token
+ * therefore belongs to exactly one planted machine and cannot be reused for a
+ * different courier writer.
  */
-export async function mintTenantToken(o: { relayauthUrl: string; bootstrapKey: string; orgId: string; workspaceId: string; sponsorId: string; historyOrigin: string; fetch?: Fetch }): Promise<string> {
+const MACHINE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+export async function mintTenantToken(o: { relayauthUrl: string; bootstrapKey: string; orgId: string; workspaceId: string; machineId: string; sponsorId: string; historyOrigin: string; fetch?: Fetch }): Promise<string> {
+  if (!MACHINE_ID.test(o.machineId) || o.machineId.startsWith("relay_")) throw new IngestError("machine_id_invalid", 0);
   const f = o.fetch ?? fetch;
   const res = await f(`${o.relayauthUrl}/v1/tokens/relayhistory-assertion`, {
     method: "POST",
     headers: { "x-api-key": o.bootstrapKey, "content-type": "application/json" },
-    body: JSON.stringify({ orgId: o.orgId, workspaceId: o.workspaceId, sponsorId: o.sponsorId, scopes: ["rth:sync", "rth:read"], expiresIn: 3600, historyOrigin: o.historyOrigin }),
+    body: JSON.stringify({ orgId: o.orgId, workspaceId: o.workspaceId, machineId: o.machineId, sponsorId: o.sponsorId, scopes: ["rth:sync", "rth:read"], expiresIn: 3600, historyOrigin: o.historyOrigin }),
   });
   if (res.status !== 201) throw new IngestError(await errorCode(res), res.status);
   const { accessToken } = (await res.json()) as { accessToken?: string };

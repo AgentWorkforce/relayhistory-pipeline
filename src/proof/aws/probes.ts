@@ -9,10 +9,6 @@ import type { ProofConfig } from "./config.ts";
 import type { Step } from "./exec.ts";
 import type { Tenant } from "./leak-scan.ts";
 
-/** The deployed search RPC's exact signature (to_regprocedure matches it exactly). */
-export const SESSION_DIRECTORY_SEARCH_SIGNATURE =
-  "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
-
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const IDENT = /^[A-Za-z0-9_.:-]{1,128}$/;
 const TERM = /^[a-z0-9]{3,200}$/;
@@ -62,6 +58,23 @@ export function stageTimesSql(traceIds: readonly string[]): string {
    GROUP BY 1, 2) r;`;
 }
 
+/**
+ * Is the V1 search RPC callable the way the proof calls it, positionally as
+ * (p_workspace_id text, p_query text)? Matched by name and leading arguments,
+ * not by an exact signature: the session-directory contract
+ * (SESSION_DIRECTORY_SEARCH_RPC, #38) defines 19 arguments with every one after
+ * the first two defaulted, and an exact `(text,text)` lookup never matched it.
+ * A function whose first two inputs are not (p_workspace_id text, p_query text),
+ * or that has a later argument without a default, does not count.
+ */
+export const SEARCH_RPC_PRESENT_SQL = `EXISTS (
+    SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'sessions' AND p.proname = 'search_session_directory'
+       AND p.pronargs >= 2
+       AND p.proargtypes[0] = 'pg_catalog.text'::pg_catalog.regtype AND p.proargtypes[1] = 'pg_catalog.text'::pg_catalog.regtype
+       AND p.proargnames[1:2] = ARRAY['p_workspace_id', 'p_query']::text[]
+       AND p.pronargdefaults >= p.pronargs - 2)`;
+
 /** HoopDb index rows and directory summaries for the planted sessions. */
 export function indexStateSql(sessionIds: readonly string[]): string {
   return `SELECT json_build_object(
@@ -69,7 +82,7 @@ export function indexStateSql(sessionIds: readonly string[]): string {
               FROM sessions.session_index WHERE session_id = ANY(${sqlList(sessionIds, "text")})),
   'directory_present', to_regclass('sessions.session_directory') IS NOT NULL
     AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'sessions' AND table_name = 'session_directory' AND column_name = 'short_summary'),
-  'search_rpc_present', to_regprocedure('${SESSION_DIRECTORY_SEARCH_SIGNATURE}') IS NOT NULL);`;
+  'search_rpc_present', ${SEARCH_RPC_PRESENT_SQL});`;
 }
 
 /** Separate query: it references session_directory, which may not exist (then indexStateSql says so first). */
