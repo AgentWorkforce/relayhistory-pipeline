@@ -24,6 +24,9 @@ Section numbers refer to the plan.
 
 | Gate | Owner | State | Evidence required to close |
 | --- | --- | --- | --- |
+| **Transcript search for new sessions live (G-T, K-27): hard pre-T0 gate, critical path** | unassigned | not started: store not chosen (#233 draft), no benchmark run, 0001 amendment needed | Feed live; MCP `search_shared_sessions` and `get_shared_session_context` parity; recall SLOs (plan, section 10); cross-T0 merge spec implemented |
+| Post-flip write-freeze lever (G-F) | unassigned | missing (#224 has no `supabase → holding`) | Built, rehearsed, canary-proven before T0 |
+| Supabase disk resize (K-32) | Khaliq | Pro/Large, 2 GB disk, empty | Resized before A3 |
 | SEC-01 fixed in hosted RelayAuth (S1) | cloud lane | cloud #5886 merged to `trunk`; promotion to `main` and the deploy are unverified | Deployed SHA verified; negative cross-org mint probe (K-23) |
 | Production S3 bucket, per-workspace KMS keys, Worker S3 identity (S5, S6, P9) | unassigned | not created | Reviewed plan; Khaliq-approved apply (K-2) |
 | Supabase schema: index, directory, short_summary, token pins (#38, #48, #72) | 96Bulls lanes | drafts | Merged; applied (K-3); `audit:search-indexes` green |
@@ -33,7 +36,7 @@ Section numbers refer to the plan.
 | Cloud consumers and post-T0 write gating (cloud #5850) | helm-chart-chief | open, `merge-train:hold` | Deployed with the flag off (K-14) |
 | Revision feed to Cloud after T0 (G-R1) | **unowned** | missing | A pipeline producer for `relayhistory-project-events` |
 | Rollback after the flip (K-22) | Khaliq | **decided 2026-10-31: "Forward-only after flip"** (abortable up to T0; no reverse-sync) | T0 abort path rehearsed in phase 2 |
-| Transcript search across T0 (K-6) | Khaliq | **decided 2026-10-31: "Serve old sessions from T0 branch"** (post-T0: V1 metadata/short_summary only until V2) | Child-branch transcript route passes metric 1b |
+| Transcript search across T0 (K-6, K-27) | Khaliq | **decided 2026-10-31:** "Serve old sessions from T0 branch" for pre-T0 history, plus "Transcript search before T0" (no T0 until new sessions are transcript-searchable on ClickHouse/ObsessionDB) | Child-branch route passes SLO row 6; G-T green |
 | Rehearsal snapshot, parity and benchmark (phase 2) | migration lane | not started | P-1 to P-7 exact; section 10 thresholds (K-5) green |
 | Backup and restore drill (section 12) | migration lane | not started | RTO/RPO report under `docs/evidence/` |
 | Observability and SLO alarms (section 13) | unassigned | backend undecided | Alarms live before phase 3 |
