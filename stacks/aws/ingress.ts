@@ -19,7 +19,9 @@ import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
 import * as Output from "alchemy/Output";
 import { denyInsecureTransport } from "./hardening.ts";
-import { INGEST_LISTEN_PORTS, INGEST_SSL_POLICY, albLogDeliveryPolicy, ingestLoadBalancerAttributes, ingestWafRules, ingressExposure, type IngestExposureInput } from "./proof-addons.ts";
+import { spawnSync } from "node:child_process";
+import { validationRecordOverride, waitForValidationRecord, type ValidationRecord } from "./cert-validation.ts";
+import { INGEST_LISTEN_PORTS, INGEST_SSL_POLICY, albLogDeliveryPolicy, ingestWafIdentity, ingestLoadBalancerAttributes, ingestWafRules, ingressExposure, type IngestExposureInput } from "./proof-addons.ts";
 
 export interface IngressInputs {
   stage: string;
@@ -56,12 +58,12 @@ export const ingressStage = (i: IngressInputs) =>
     // Validate before declaring anything.
     const expose = ingressExposure(i.exposure ?? {});
     const waf = yield* AWS.WAFv2.WebACL("ingest-waf", {
-      webAclName: `96bulls-${i.stage}-ingest`,
+      webAclName: ingestWafIdentity(i.stage).webAclName,
       scope: "REGIONAL",
       defaultAction: { Allow: {} },
-      description: `96bulls ${i.stage}: ingest ALB (managed rules, per-IP rate limit, operator routes blocked)`,
+      description: ingestWafIdentity(i.stage).description,
       rules: ingestWafRules(expose.rateLimit) as never,
-      visibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: `96bulls-${i.stage}-ingest` },
+      visibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: ingestWafIdentity(i.stage).metricName },
       tags: i.tags,
     });
     // ALB access logs: SSE-S3 (ALB log delivery does not support KMS keys), TLS only, 90 days.
@@ -86,16 +88,26 @@ export const ingressStage = (i: IngressInputs) =>
       region: i.region,
       tags: i.tags,
     });
-    // ACM's validation CNAME, unproxied, in Cloudflare.
+    // ACM's validation CNAME, unproxied, in Cloudflare. Never an empty name: the override is
+    // checked, and otherwise the record is polled from ACM until populated (cert-validation.ts).
+    const record = i.certValidation
+      ? validationRecordOverride(i.certValidation)
+      : (Output.mapEffect((arn: string) =>
+          waitForValidationRecord(
+            () => {
+              const r = spawnSync("aws", ["acm", "describe-certificate", "--certificate-arn", arn, "--region", i.region, "--output", "json"], { encoding: "utf8", env: process.env });
+              if (r.status !== 0) return undefined;
+              return (JSON.parse(r.stdout) as { Certificate?: { DomainValidationOptions?: never[] } }).Certificate?.DomainValidationOptions;
+            },
+            i.hostname,
+            arn,
+          ),
+        )(cert.certificateArn as never) as unknown as ValidationRecord);
     yield* Cloudflare.DNS.Record("ingest-cert-validation", {
       zoneId: i.cloudflareZoneId,
       type: "CNAME",
-      name: (i.certValidation
-        ? i.certValidation.name.replace(/\.$/, "")
-        : Output.map(cert.domainValidationOptions, (o) => (o?.[0]?.ResourceRecord?.Name ?? "").replace(/\.$/, ""))) as unknown as string,
-      content: (i.certValidation
-        ? i.certValidation.value.replace(/\.$/, "")
-        : Output.map(cert.domainValidationOptions, (o) => (o?.[0]?.ResourceRecord?.Value ?? "").replace(/\.$/, ""))) as unknown as string,
+      name: (i.certValidation ? (record as ValidationRecord).name : Output.map(record as never, (r: ValidationRecord) => r.name)) as unknown as string,
+      content: (i.certValidation ? (record as ValidationRecord).value : Output.map(record as never, (r: ValidationRecord) => r.value)) as unknown as string,
       ttl: 300,
       proxied: false,
     } as never);

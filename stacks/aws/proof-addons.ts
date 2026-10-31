@@ -313,6 +313,19 @@ export const INGEST_WAF_BODY_RULES_COUNTED = {
   AWSManagedRulesKnownBadInputsRuleSet: ["Log4JRCE_BODY", "JavaDeserializationRCE_BODY"],
 } as const;
 
+/**
+ * The web ACL's name, description and metric name. WAFv2 restricts all three
+ * (no parentheses in a description): see the charset test in
+ * stacks/aws/__tests__/aws-names.test.ts.
+ */
+export function ingestWafIdentity(stage: string) {
+  return {
+    webAclName: `96bulls-${stage}-ingest`,
+    description: `96bulls ${stage}: ingest ALB, managed rules, per-IP rate limit, operator routes blocked`,
+    metricName: `96bulls-${stage}-ingest`,
+  };
+}
+
 export function ingestWafRules(rateLimit: number) {
   return [
     managed("AWSManagedRulesAmazonIpReputationList", 0),
