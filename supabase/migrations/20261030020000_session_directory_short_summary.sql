@@ -198,6 +198,14 @@ CREATE INDEX session_directory_tenant_search_trgm_idx
   USING gin (org_id, workspace_id, search_text public.gin_trgm_ops)
   WHERE search_text <> '' AND deleted_at IS NULL;
 
+-- Tenant-scoped project substring. Replaces #38's session_directory_project_trgm_idx
+-- for the same reason; project_contains is served only through the RPC.
+DROP INDEX sessions.session_directory_project_trgm_idx;
+CREATE INDEX session_directory_tenant_project_trgm_idx
+  ON sessions.session_directory
+  USING gin (org_id, workspace_id, project_id public.gin_trgm_ops)
+  WHERE project_id IS NOT NULL AND deleted_at IS NULL;
+
 -- The dedicated Worker identity. NOLOGIN: the authenticator/credential binding is a
 -- separately reviewed deployment step. No table privileges, no BYPASSRLS; it can
 -- only execute the search RPC. PostgREST (>= v12) applies role-level settings, so
@@ -235,14 +243,43 @@ BEGIN
 END
 $query$;
 
--- The only search path. Fixed SQL, fixed ORDER BY, fixed LIMIT 51 (a page of 50
--- plus one to signal more). The organization comes only from the signed claims;
--- the workspace must be one the claims list. Errors:
+-- The only search path for search_text and short_summary, and the tenant-bound list
+-- path for every filter the RelayHistory read surface exposes (contract:
+-- docs/session-search-index-contract.md, "The search RPC (pinned contract)").
+--
+-- SQL text is assembled only from the fixed fragments below, chosen by which
+-- parameters are set; every value is bound with EXECUTE ... USING, never
+-- interpolated. Fixed ORDER BY (recency keyset), at most p_limit + 1 <= 51 rows. The
+-- organization and the workspaces come only from the signed claims. Errors:
 --   42501  caller is not the Worker role; or claims missing, malformed, for another
 --          role, or not covering the workspace
---   22023  fewer than 3 meaningful characters, or over 200, after
---          sessions.session_directory_search_query normalization
-CREATE FUNCTION sessions.search_session_directory(p_workspace_id text, p_query text)
+--   22023  an invalid value: text needing 3 to 200 meaningful characters after
+--          sessions.session_directory_search_query normalization (p_query,
+--          p_project_contains, prefix p_agent), limit outside 1..50, an unknown
+--          state, agent match or harness format, an incomplete or mismatched cursor,
+--          since after until, or a contradictory filter pair
+--   0A000  an intentionally unsupported combination (named in the message)
+CREATE FUNCTION sessions.search_session_directory(
+  p_workspace_id text DEFAULT NULL,
+  p_query text DEFAULT NULL,
+  p_harness text DEFAULT NULL,
+  p_project_id text DEFAULT NULL,
+  p_project_contains text DEFAULT NULL,
+  p_no_project boolean DEFAULT false,
+  p_agent text DEFAULT NULL,
+  p_agent_match text DEFAULT 'exact',
+  p_state text DEFAULT NULL,
+  p_user_id text DEFAULT NULL,
+  p_machine_id text DEFAULT NULL,
+  p_since timestamptz DEFAULT NULL,
+  p_until timestamptz DEFAULT NULL,
+  p_session_id text DEFAULT NULL,
+  p_cursor_last_activity_at timestamptz DEFAULT NULL,
+  p_cursor_session_id text DEFAULT NULL,
+  p_cursor_harness text DEFAULT NULL,
+  p_cursor_workspace_id text DEFAULT NULL,
+  p_limit integer DEFAULT 50
+)
 RETURNS TABLE (
   org_id text, workspace_id text, harness text, session_id text,
   created_at timestamptz, last_activity_at timestamptz,
@@ -258,6 +295,14 @@ DECLARE
   v_org text;
   v_workspaces text[];
   v_query text;
+  v_project_contains text;
+  v_agent text;
+  v_has_cursor boolean;
+  v_membership text;          -- NULL, 'users' or 'machines': the driving membership table
+  v_from text;
+  v_where text;
+  v_order text;
+  v_sql text;
 BEGIN
   -- Fail closed on the caller identity itself, whatever EXECUTE grants a later
   -- runner adds (e.g. GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions TO <app>):
@@ -282,34 +327,138 @@ BEGIN
   SELECT coalesce(array_agg(w.value #>> '{}'), '{}') INTO v_workspaces
     FROM jsonb_array_elements(v_claims -> 'app_metadata' -> 'workspace_ids') AS w
    WHERE jsonb_typeof(w.value) = 'string';
-  IF v_org = '' OR p_workspace_id IS NULL OR NOT (p_workspace_id = ANY (v_workspaces)) THEN
+  -- p_workspace_id NULL means organization-wide over exactly the claimed workspaces.
+  IF v_org = '' OR cardinality(v_workspaces) = 0
+     OR (p_workspace_id IS NOT NULL AND NOT (p_workspace_id = ANY (v_workspaces))) THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session search: tenant claims missing or invalid';
   END IF;
 
-  v_query := sessions.session_directory_search_query(p_query);
-  IF v_query IS NULL THEN
+  -- Values.
+  IF p_limit IS NULL OR p_limit < 1 OR p_limit > 50 THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session search: limit must be 1 to 50';
+  END IF;
+  IF p_query IS NOT NULL THEN
+    v_query := sessions.session_directory_search_query(p_query);
+    IF v_query IS NULL THEN
+      RAISE EXCEPTION USING ERRCODE = '22023',
+        MESSAGE = 'session search: query needs 3 to 200 meaningful characters';
+    END IF;
+  END IF;
+  IF p_project_contains IS NOT NULL THEN
+    v_project_contains := sessions.session_directory_search_query(p_project_contains);
+    IF v_project_contains IS NULL THEN
+      RAISE EXCEPTION USING ERRCODE = '22023',
+        MESSAGE = 'session search: project_contains needs 3 to 200 meaningful characters';
+    END IF;
+  END IF;
+  IF p_agent_match IS NULL OR p_agent_match NOT IN ('exact', 'prefix') THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session search: agent_match must be exact or prefix';
+  END IF;
+  IF p_agent IS NOT NULL THEN
+    v_agent := lower(btrim(p_agent));
+    IF v_agent = '' OR char_length(v_agent) > 200 THEN
+      RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session search: agent must be 1 to 200 characters';
+    END IF;
+    IF p_agent_match = 'prefix' AND sessions.session_directory_search_query(p_agent) IS NULL THEN
+      RAISE EXCEPTION USING ERRCODE = '22023',
+        MESSAGE = 'session search: agent prefix needs at least 3 meaningful characters';
+    END IF;
+  END IF;
+  IF p_state IS NOT NULL AND p_state NOT IN ('active', 'done', 'abandoned', 'unknown') THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session search: state is invalid';
+  END IF;
+  IF p_harness IS NOT NULL AND p_harness !~ '^[a-z0-9][a-z0-9._-]{0,63}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session search: harness is invalid';
+  END IF;
+  IF p_since IS NOT NULL AND p_until IS NOT NULL AND p_since > p_until THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session search: since is after until';
+  END IF;
+  IF coalesce(p_no_project, false) AND (p_project_id IS NOT NULL OR p_project_contains IS NOT NULL) THEN
     RAISE EXCEPTION USING ERRCODE = '22023',
-      MESSAGE = 'session search: query needs 3 to 200 meaningful characters';
+      MESSAGE = 'session search: no_project contradicts project_id or project_contains';
+  END IF;
+  v_has_cursor := p_cursor_last_activity_at IS NOT NULL OR p_cursor_session_id IS NOT NULL
+    OR p_cursor_harness IS NOT NULL OR p_cursor_workspace_id IS NOT NULL;
+  IF v_has_cursor AND (p_cursor_last_activity_at IS NULL OR p_cursor_session_id IS NULL OR p_cursor_harness IS NULL
+       OR (p_workspace_id IS NULL AND p_cursor_workspace_id IS NULL)
+       OR (p_workspace_id IS NOT NULL AND p_cursor_workspace_id IS NOT NULL AND p_cursor_workspace_id <> p_workspace_id)) THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session search: cursor is incomplete or for another scope';
   END IF;
 
-  RETURN QUERY EXECUTE $sql$
-SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at,
-       d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state,
-       d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros,
-       d.machine_ids, d.user_ids, d.short_summary, d.projected_at
-  FROM sessions.session_directory AS d
- WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL
-   AND d.search_text <> '' AND d.search_text ILIKE $3 ESCAPE '\'
- ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC
- LIMIT 51$sql$
-  USING v_org, p_workspace_id,
-        '%' || replace(replace(replace(v_query, '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  -- Intentionally unsupported combinations.
+  IF p_workspace_id IS NULL AND (p_agent IS NOT NULL OR p_project_id IS NOT NULL OR p_project_contains IS NOT NULL
+       OR coalesce(p_no_project, false) OR p_user_id IS NOT NULL OR p_machine_id IS NOT NULL) THEN
+    RAISE EXCEPTION USING ERRCODE = '0A000',
+      MESSAGE = 'session search: unsupported combination: agent, project, no_project, user and machine filters need p_workspace_id';
+  END IF;
+
+  -- Statement. Membership filters drive from their ordered membership index, whose
+  -- last_activity_at the projector keeps equal to the directory row's.
+  IF p_user_id IS NOT NULL THEN
+    v_membership := 'users';
+  ELSIF p_machine_id IS NOT NULL THEN
+    v_membership := 'machines';
+  END IF;
+  IF v_membership IS NULL THEN
+    v_from := ' FROM sessions.session_directory AS d';
+    v_order := ' ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC'
+      || CASE WHEN p_workspace_id IS NULL THEN ', d.workspace_id DESC' ELSE '' END;
+  ELSE
+    v_from := format(' FROM sessions.session_directory_%s AS m JOIN sessions.session_directory AS d'
+      || ' ON d.org_id = m.org_id AND d.workspace_id = m.workspace_id'
+      || ' AND d.harness = m.harness AND d.session_id = m.session_id', v_membership);
+    v_order := ' ORDER BY m.last_activity_at DESC, m.session_id DESC, m.harness DESC';
+  END IF;
+  v_where := ' WHERE d.org_id = $1 AND d.deleted_at IS NULL'
+    || CASE WHEN p_workspace_id IS NULL THEN ' AND d.workspace_id = ANY ($3)' ELSE ' AND d.workspace_id = $2' END
+    || CASE WHEN v_membership IS NULL THEN '' ELSE ' AND m.org_id = $1 AND m.workspace_id = $2' END
+    || CASE v_membership WHEN 'users' THEN ' AND m.user_id = $13' WHEN 'machines' THEN ' AND m.machine_id = $14' ELSE '' END
+    || CASE WHEN v_membership = 'users' AND p_machine_id IS NOT NULL THEN
+         ' AND EXISTS (SELECT 1 FROM sessions.session_directory_machines AS mm WHERE mm.org_id = d.org_id'
+         || ' AND mm.workspace_id = d.workspace_id AND mm.harness = d.harness AND mm.session_id = d.session_id'
+         || ' AND mm.machine_id = $14)' ELSE '' END
+    || CASE WHEN v_query IS NULL THEN '' ELSE ' AND d.search_text <> '''' AND d.search_text ILIKE $4 ESCAPE ''\''' END
+    || CASE WHEN p_harness IS NULL THEN '' ELSE ' AND d.harness = $5' END
+    || CASE WHEN p_project_id IS NULL THEN '' ELSE ' AND d.project_id = $6' END
+    || CASE WHEN v_project_contains IS NULL THEN '' ELSE ' AND d.project_id ILIKE $7 ESCAPE ''\''' END
+    || CASE WHEN coalesce(p_no_project, false) THEN ' AND d.project_id IS NULL' ELSE '' END
+    || CASE WHEN v_agent IS NULL THEN ''
+            WHEN p_agent_match = 'exact' THEN ' AND d.agent_name_normalized = $8'
+            ELSE ' AND d.agent_name_normalized LIKE $8 ESCAPE ''\''' END
+    || CASE WHEN p_state IS NULL THEN '' ELSE ' AND d.state = $9' END
+    || CASE WHEN p_since IS NULL THEN '' ELSE ' AND d.last_activity_at >= $10' END
+    || CASE WHEN p_until IS NULL THEN '' ELSE ' AND d.created_at <= $11' END
+    || CASE WHEN p_session_id IS NULL THEN '' ELSE ' AND d.session_id = $12' END
+    || CASE WHEN NOT v_has_cursor THEN ''
+            WHEN v_membership IS NOT NULL THEN ' AND (m.last_activity_at, m.session_id, m.harness) < ($15, $16, $17)'
+            WHEN p_workspace_id IS NULL THEN
+              ' AND (d.last_activity_at, d.session_id, d.harness, d.workspace_id) < ($15, $16, $17, $18)'
+            ELSE ' AND (d.last_activity_at, d.session_id, d.harness) < ($15, $16, $17)' END;
+  v_sql := 'SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at,'
+    || ' d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state,'
+    || ' d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros,'
+    || ' d.machine_ids, d.user_ids, d.short_summary, d.projected_at'
+    || v_from || v_where || v_order || ' LIMIT $19';
+
+  RETURN QUERY EXECUTE v_sql
+  USING v_org, p_workspace_id, v_workspaces,
+        CASE WHEN v_query IS NULL THEN NULL
+             ELSE '%' || replace(replace(replace(v_query, '\', '\\'), '%', '\%'), '_', '\_') || '%' END,
+        p_harness, p_project_id,
+        CASE WHEN v_project_contains IS NULL THEN NULL
+             ELSE '%' || replace(replace(replace(v_project_contains, '\', '\\'), '%', '\%'), '_', '\_') || '%' END,
+        CASE WHEN v_agent IS NULL THEN NULL
+             WHEN p_agent_match = 'exact' THEN v_agent
+             ELSE replace(replace(replace(v_agent, '\', '\\'), '%', '\%'), '_', '\_') || '%' END,
+        p_state, p_since, p_until, p_session_id, p_user_id, p_machine_id,
+        p_cursor_last_activity_at, p_cursor_session_id, p_cursor_harness, p_cursor_workspace_id,
+        p_limit + 1;
 END
 $search$;
 
-REVOKE ALL ON FUNCTION sessions.search_session_directory(text, text)
+REVOKE ALL ON FUNCTION sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)
   FROM PUBLIC, anon, authenticated, service_role;
-GRANT EXECUTE ON FUNCTION sessions.search_session_directory(text, text)
+GRANT EXECUTE ON FUNCTION sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)
   TO session_directory_search_worker;
 -- Remove every other grantee present at creation (ALTER DEFAULT PRIVILEGES, a
 -- pre-existing runtime role such as relayhistory_app), whatever the migration order.
@@ -323,15 +472,15 @@ BEGIN
       FROM pg_proc AS p
       CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) AS a
       JOIN pg_roles AS r ON r.oid = a.grantee
-     WHERE p.oid = 'sessions.search_session_directory(text, text)'::regprocedure
+     WHERE p.oid = 'sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)'::regprocedure
        AND a.privilege_type = 'EXECUTE'
        AND a.grantee <> p.proowner
        AND r.rolname <> 'session_directory_search_worker'
   LOOP
-    EXECUTE format('REVOKE ALL ON FUNCTION sessions.search_session_directory(text, text) FROM %I', v_grantee);
+    EXECUTE format('REVOKE ALL ON FUNCTION sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer) FROM %I', v_grantee);
   END LOOP;
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'relayhistory_app') THEN
-    REVOKE ALL ON FUNCTION sessions.search_session_directory(text, text) FROM relayhistory_app;
+    REVOKE ALL ON FUNCTION sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer) FROM relayhistory_app;
   END IF;
 END
 $revoke$;

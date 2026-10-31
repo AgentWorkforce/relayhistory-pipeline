@@ -121,32 +121,50 @@ SELECT d.* FROM sessions.session_directory_machines AS membership
    AND membership.machine_id = $3 AND d.deleted_at IS NULL
  ORDER BY membership.last_activity_at DESC, membership.session_id DESC, membership.harness DESC
  LIMIT $4`,
-  projectContains: `
-SELECT * FROM sessions.session_directory
- WHERE org_id = $1 AND workspace_id = $2 AND project_id ILIKE '%' || $3 || '%'
-   AND deleted_at IS NULL
- ORDER BY last_activity_at DESC, session_id DESC, harness DESC
- LIMIT $4`,
 } as const;
 
 /**
- * The only search path over search_text (and so over short_summary). Pinned contract
- * for RelayHistory #226; changing any of it is a contract change.
- * Call through PostgREST as `POST /rest/v1/rpc/search_session_directory` with
- * `Content-Profile: sessions` and a JWT whose `role` is the Worker role and whose
- * `app_metadata` carries `org_id` and `workspace_ids`.
+ * The tenant-bound search and list RPC: the only path over search_text (and so
+ * short_summary), and the V1 directory path for every filter the RelayHistory read
+ * surface exposes. Pinned contract for RelayHistory #226; changing any of it is a
+ * contract change. Call through PostgREST as `POST /rest/v1/rpc/search_session_directory`
+ * with `Content-Profile: sessions`, named `p_*` arguments, and a JWT whose `role` is the
+ * Worker role and whose `app_metadata` carries `org_id` and `workspace_ids`.
+ * `searchRpcRequest` (search-query.ts) builds a request under the same rules.
  */
 export const SESSION_DIRECTORY_SEARCH_RPC = {
   name: "sessions.search_session_directory",
-  args: { p_workspace_id: "text", p_query: "text" },
+  args: {
+    p_workspace_id: "text, NULL = organization-wide over the claimed workspaces",
+    p_query: "text: substring of search_text (metadata + scrubbed short_summary)",
+    p_harness: "text: exact harness (the read API's `source`)",
+    p_project_id: "text: exact project",
+    p_project_contains: "text: case-insensitive project substring",
+    p_no_project: "boolean: sessions without a project",
+    p_agent: "text: normalized agent name",
+    p_agent_match: "'exact' (default) | 'prefix'",
+    p_state: "'active' | 'done' | 'abandoned' | 'unknown'",
+    p_user_id: "text: user membership",
+    p_machine_id: "text: machine membership",
+    p_since: "timestamptz: last_activity_at >= since",
+    p_until: "timestamptz: created_at <= until (activity interval overlaps the window)",
+    p_session_id: "text: exact session id",
+    p_cursor_last_activity_at: "timestamptz", p_cursor_session_id: "text", p_cursor_harness: "text",
+    p_cursor_workspace_id: "text: required for organization-wide pages, else equal to p_workspace_id or NULL",
+    p_limit: "integer 1..50 (default 50); the RPC returns up to p_limit + 1 rows",
+  },
   workerRole: "session_directory_search_worker",
   claims: { role: "session_directory_search_worker", orgId: "app_metadata.org_id", workspaceIds: "app_metadata.workspace_ids" },
   /** Meaningful characters after normalizeSearchQuery: not separators, format characters or marks. */
   minQueryChars: 3,
   maxQueryChars: 200,
-  /** A page of 50 plus one row that signals more. No cursor in V1. */
-  limit: 51,
-  order: "last_activity_at DESC, session_id DESC, harness DESC",
+  minAgentPrefixChars: 3,
+  defaultLimit: 50,
+  maxLimit: 50,
+  /** At most maxLimit + 1 rows: a full page plus one row that signals more. */
+  maxRows: 51,
+  order: "last_activity_at DESC, session_id DESC, harness DESC (organization-wide: then workspace_id DESC)",
+  cursor: "(last_activity_at, session_id, harness[, workspace_id]) of the last returned row; strictly older rows follow",
   returns: [
     "org_id", "workspace_id", "harness", "session_id", "created_at", "last_activity_at",
     "title", "task_title", "agent_name", "project_id", "git_repo", "git_branch", "model", "state",
@@ -155,22 +173,34 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
   ],
   errors: {
     "42501": "caller is not the Worker role, or tenant claims missing, malformed, for another role, or not covering the workspace",
-    "22023": "fewer than 3 meaningful characters, or more than 200, after normalizeSearchQuery (search-query.ts)",
+    "22023": "an invalid value: text under the meaningful-character rule, limit, state, agent match, harness, cursor, since > until, or a contradictory pair",
+    "0A000": "an intentionally unsupported combination (see unsupported)",
     "57014": "statement_timeout (2s on the Worker role) exceeded",
   },
+  /** Returned as 0A000, never as empty results. */
+  unsupported: [
+    "organization-wide (no p_workspace_id) with p_agent, p_project_id, p_project_contains, p_no_project, p_user_id or p_machine_id",
+    "transcript/event text search (V2 search store)",
+    "ordering other than recency",
+  ],
+  /** Returned as 22023. */
+  contradictory: ["p_no_project with p_project_id or p_project_contains", "p_since later than p_until"],
 } as const;
 
-/** The exact SQL the RPC executes; plan tests compare auto_explain's Query Text to it. */
+/**
+ * The exact statement the RPC executes for a workspace-scoped text search with no other
+ * filter (whitespace aside). Plan tests compare auto_explain's Query Text to it; other
+ * shapes add the fixed fragments listed in the migration.
+ */
 export const SESSION_DIRECTORY_SEARCH_SQL = `
 SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at,
-       d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state,
-       d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros,
-       d.machine_ids, d.user_ids, d.short_summary, d.projected_at
-  FROM sessions.session_directory AS d
- WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL
-   AND d.search_text <> '' AND d.search_text ILIKE $3 ESCAPE '\\'
- ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC
- LIMIT 51`;
+ d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, d.state,
+ d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros,
+ d.machine_ids, d.user_ids, d.short_summary, d.projected_at
+ FROM sessions.session_directory AS d
+ WHERE d.org_id = $1 AND d.deleted_at IS NULL AND d.workspace_id = $2
+ AND d.search_text <> '' AND d.search_text ILIKE $4 ESCAPE '\\'
+ ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC LIMIT $19`;
 
 export const REQUIRED_SEARCH_INDEXES = [
   {
@@ -237,10 +267,10 @@ export const REQUIRED_SEARCH_INDEXES = [
     requiresDirectoryProjection: true,
   },
   {
-    id: "project-substring", indexName: "session_directory_project_trgm_idx",
-    tableName: "session_directory", consumers: ["RelayHistory projectContains", "Cloud project search"],
-    queryShape: "case-insensitive project substring (metadata only)",
-    definitionFragments: ["on sessions.session_directory using gin", "project_id", "gin_trgm_ops"],
+    id: "tenant-project-substring", indexName: "session_directory_tenant_project_trgm_idx",
+    tableName: "session_directory", consumers: ["sessions.search_session_directory p_project_contains (RelayHistory projectContains)"],
+    queryShape: "org + workspace scoped case-insensitive project substring",
+    definitionFragments: ["on sessions.session_directory using gin", "(org_id, workspace_id, project_id", "gin_trgm_ops)"],
     expectedPredicate: "((project_id IS NOT NULL) AND (deleted_at IS NULL))", requiresDirectoryProjection: true,
   },
   {

@@ -50,6 +50,7 @@ const MIGRATION = "20261030020000_session_directory_short_summary.sql";
 const DOWN = read(`supabase/rollbacks/${MIGRATION.replace(/\.sql$/, ".down.sql")}`);
 const UP = read(`supabase/migrations/${MIGRATION}`);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
+const RPC_SIGNATURE = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
 
 // Synthetic secret-shaped values, assembled at runtime so no literal sits on disk.
 const FAKE_RELAY_TOKEN = ["relay", "ag", "x".repeat(24)].join("_");
@@ -332,7 +333,7 @@ describe("search RPC authorization", () => {
       ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`);
     const executors = await db.query<{ rolname: string }>(
       `SELECT r.rolname FROM pg_roles AS r, pg_proc AS p
-        WHERE p.oid = 'sessions.search_session_directory(text, text)'::regprocedure
+        WHERE p.oid = 'sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)'::regprocedure
           AND r.rolname <> $1 AND r.oid <> p.proowner
           AND has_function_privilege(r.oid, p.oid, 'EXECUTE')
         ORDER BY r.rolname`,
@@ -352,7 +353,7 @@ describe("search RPC authorization", () => {
       GRANT USAGE ON SCHEMA sessions TO relayhistory_app;
       GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions TO relayhistory_app;`);
     const granted = await db.query<{ ok: boolean }>(
-      "SELECT has_function_privilege('relayhistory_app', 'sessions.search_session_directory(text, text)', 'EXECUTE') AS ok",
+      "SELECT has_function_privilege('relayhistory_app', 'sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)', 'EXECUTE') AS ok",
     );
     expect(granted.rows[0]?.ok).toBe(true);
     await db.query("SELECT set_config('request.jwt.claims', $1, false)", [claims("org-a", ["ws-a"])]);
@@ -368,7 +369,7 @@ describe("search RPC authorization", () => {
 
   test("only the Worker role may execute the RPC, and end users cannot filter search_text directly", async () => {
     const db = await database();
-    const fn = "sessions.search_session_directory(text, text)";
+    const fn = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
     for (const grantee of ["anon", "authenticated", "service_role"]) {
       const allowed = await db.query<{ ok: boolean }>("SELECT has_function_privilege($1, $2, 'EXECUTE') AS ok", [grantee, fn]);
       expect(allowed.rows[0]?.ok, grantee).toBe(false);
@@ -546,7 +547,7 @@ describe("search RPC query bounds", () => {
     const a = claims("org-a", ["ws-a"]);
     for (const [name, query] of INVALID) {
       expect(normalizeSearchQuery(query).ok, name).toBe(false);
-      expect(searchRpcRequest("ws-a", query).ok, name).toBe(false);
+      expect(searchRpcRequest({ workspaceId: "ws-a", q: query }).ok, name).toBe(false);
       const sql = await db.query<{ q: string | null }>("SELECT sessions.session_directory_search_query($1) AS q", [query]);
       expect(sql.rows[0]?.q, name).toBeNull();
       const { error, ranSearch } = await capturedStatements(db, a, "ws-a", query);
@@ -635,7 +636,7 @@ describe("search RPC query plan as the Worker identity", () => {
     const db = await populated();
     const { rows, inner } = await explainRpc(db, claims("org-0", ["ws-0"]), "ws-0", "Refactored module");
     console.info(`[G6 plan: common] ${JSON.stringify(inner.plan)}`);
-    expect(rows).toHaveLength(SESSION_DIRECTORY_SEARCH_RPC.limit);
+    expect(rows).toHaveLength(SESSION_DIRECTORY_SEARCH_RPC.maxRows);
     expect(inner.nodes.some((node) => node["Node Type"] === "Seq Scan")).toBe(false);
     const scan = inner.nodes.find((node) => typeof node["Index Name"] === "string")!;
     expect([
