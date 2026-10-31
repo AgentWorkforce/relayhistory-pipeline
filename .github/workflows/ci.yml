@@ -42,7 +42,7 @@ jobs:
         run: |
           # Pinned to relayauth#116 until it merges.
           git clone --quiet https://github.com/AgentWorkforce/relayauth.git "$RUNNER_TEMP/relayauth"
-          git -C "$RUNNER_TEMP/relayauth" checkout --quiet 5c8bdff96650633fd8d9b54a95d541ca62fa199f
+          git -C "$RUNNER_TEMP/relayauth" checkout --quiet 35e2171cd52a5081646188093e9534843161825c
           cd "$RUNNER_TEMP/relayauth"
           npm ci --silent
           npx turbo build --filter=@relayauth/server^...

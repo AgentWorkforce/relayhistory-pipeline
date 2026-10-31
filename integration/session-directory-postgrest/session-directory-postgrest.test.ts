@@ -556,7 +556,6 @@ const RELAYAUTH_DIR = process.env.RELAYAUTH_DIR && realpathSync(process.env.RELA
 describe.skipIf(!RELAYAUTH_DIR)("tokens minted by real RelayAuth", () => {
   const GENERAL_KEY = newKey("general");
   const GENERAL_ISSUER = "https://relayauth.test";
-  const MINT_SCOPE = "relayauth:assertion:create:session-directory-search";
   let relayAuth: Subprocess;
   let baseUrl: string;
   let apiKey: string;
@@ -588,6 +587,7 @@ describe.skipIf(!RELAYAUTH_DIR)("tokens minted by real RelayAuth", () => {
   beforeAll(async () => {
     const port = await freePort();
     baseUrl = `http://127.0.0.1:${port}`;
+    apiKey = `rak_${crypto.randomUUID().replaceAll("-", "")}`;
     const pem = (key: Key) => key.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
     relayAuth = spawn(["node", "--import", "tsx", join(RELAYAUTH_DIR!, "packages/server/src/server.ts")], {
       cwd: RELAYAUTH_DIR!,
@@ -601,6 +601,7 @@ describe.skipIf(!RELAYAUTH_DIR)("tokens minted by real RelayAuth", () => {
         INTERNAL_SECRET: crypto.randomUUID(),
         RELAYAUTH_ISSUER: GENERAL_ISSUER,
         RELAYAUTH_SIGNING_KEY_PEM: pem(GENERAL_KEY),
+        RELAYAUTH_SESSION_DIRECTORY_BOOTSTRAP_API_KEY: apiKey,
         RELAYAUTH_SESSION_DIRECTORY_ISSUANCE: "true",
         RELAYAUTH_SESSION_DIRECTORY_ISSUER: ISSUER,
         RELAYAUTH_SESSION_DIRECTORY_SIGNING_KEY_PEM: pem(SEARCH_KEY),
@@ -608,23 +609,10 @@ describe.skipIf(!RELAYAUTH_DIR)("tokens minted by real RelayAuth", () => {
     });
     await until(async () => (await fetch(`${baseUrl}/.well-known/session-directory/jwks.json`)).ok, "relayauth ready", 30_000);
 
-    // RelayAuth's kid is the key's thumbprint, so take it from the published set.
+    // RelayAuth's kid is the key's thumbprint, so take it from the published set. Its
+    // minting key comes from the boot setting, the only way to create the first one.
     const general = (await (await fetch(`${baseUrl}/.well-known/jwks.json`)).json()) as { keys: { kid: string }[] };
     GENERAL_KEY.kid = general.keys[0]!.kid;
-
-    const created = await fetch(`${baseUrl}/v1/api-keys`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${generalToken({
-          aud: ["relayauth"], sub: "agent_operator", org: "org_operator", wks: "ws_operator",
-          scopes: ["relayauth:api-key:manage:*", MINT_SCOPE],
-        })}`,
-      },
-      body: JSON.stringify({ name: "search-minter", scopes: [MINT_SCOPE] }),
-    });
-    expect(created.status).toBe(201);
-    apiKey = ((await created.json()) as { key: string }).key;
 
     // PostgREST trusts exactly what RelayAuth publishes, with its real kids.
     originalJwks = readFileSync(selfHostedJwks, "utf8");
