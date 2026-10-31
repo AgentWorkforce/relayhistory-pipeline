@@ -207,6 +207,12 @@ function receivedFirst(
  * the newest write from any origin, so a newest tombstone removes the record
  * whichever origin wrote the upsert. `received_at`, then origin, is the order
  * the projection itself falls back to for writes with no acceptance ledger.
+ *
+ * This runs after the fold, and the two rules differ on purpose. The fold picks
+ * among copies of one write, so the earliest `received_at` is that write's own,
+ * as a replay never restamps it. Here the contenders are different writes, so
+ * the latest wins, compared as instants; origin settles a tie, since timestamp
+ * spelling says nothing about which write is newer.
  */
 function newestAcrossOrigins(
   records: Iterable<RelayhistoryStreamRecord>,

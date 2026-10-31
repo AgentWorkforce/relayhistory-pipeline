@@ -251,6 +251,44 @@ describe("RelayHistory export transform", () => {
     expect(Object.keys(lines[0]!.row.record.payload)).toEqual(["ts_ms", "\uE000", "😀"]);
   });
 
+  describe("records delivered by two origins", () => {
+    const at = (seconds: number) => `2026-10-30 12:00:0${seconds}+00`;
+    const copy = (origin_id: string, text: string, received_at: string) =>
+      record("same", "1", 1, { origin_id, received_at, payload: { ts_ms: 1, text } });
+    const permutations = <T,>(items: T[]): T[][] =>
+      items.length < 2
+        ? [items]
+        : items.flatMap((item, i) =>
+            permutations(items.filter((_, j) => j !== i)).map((rest) => [item, ...rest]),
+          );
+
+    it("ranks each write by its first delivery, whatever order lines arrive in", () => {
+      // origin-a's replay at second 3 is not a newer write than origin-b's at 2.
+      const lines = [
+        copy("origin-a", "from-a", at(1)),
+        copy("origin-a", "from-a", at(3)),
+        copy("origin-b", "from-b", at(2)),
+      ];
+      for (const order of permutations(lines))
+        expect(normalizeRelayhistoryRecords(order).map((value) => value.origin_id)).toEqual(["origin-b"]);
+    });
+
+    it("settles the same instant by origin, not by how the time is spelled", () => {
+      const lines = [
+        copy("origin-a", "from-a", "2026-10-30T12:00:00.000Z"),
+        copy("origin-b", "from-b", "2026-10-30 12:00:00+00"),
+      ];
+      for (const order of permutations(lines))
+        expect(normalizeRelayhistoryRecords(order).map((value) => value.origin_id)).toEqual(["origin-b"]);
+      const respelled = [
+        copy("origin-a", "from-a", "2026-10-30 12:00:00+00"),
+        copy("origin-b", "from-b", "2026-10-30T12:00:00.000Z"),
+      ];
+      for (const order of permutations(respelled))
+        expect(normalizeRelayhistoryRecords(order).map((value) => value.origin_id)).toEqual(["origin-b"]);
+    });
+  });
+
   describe("the output it reports", () => {
     const setup = async () => {
       const f = await fixture();
