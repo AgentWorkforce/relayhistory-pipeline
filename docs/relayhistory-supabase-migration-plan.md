@@ -302,7 +302,7 @@ are live tuples from `load-results.json`.
 | `convergence_events` | 210 GB (heap 44, TOAST 87, indexes 79, of which the prefix trigram index is 39 GB), 27.8M | **Re-derived, not moved.** 99.8% of sampled rows reference a `delivery_record_id`. | Rebuilt by the pipeline's normalizer from the S3 raw stream. The derived replay comes from S3 objects. |
 | `session_rollups`, `session_catalog`, `session_relationships`, `session_commit_links`, `session_catalog_agents`, `session_timing_cache`, | ~5-6 GB of metadata | **Re-derived.** | `session_index` and `session_directory` are rebuilt from manifests by session-indexed and the directory projector. Timing comes from manifest activity times. |
 | `session_markers` | 25 GB, 25.0M (`text` and `payload` columns hold transcript content) | **Content must reach S3.** It counts as transcript-bearing (K-38). | Confirm that the `delivery_records` export carries every marker's content (kind `session_marker`); if not, export the markers too (Q26). |
-| Acceptance and identity bookkeeping: `uploaded_support_identities` 37 GB, `delivery_projection_acceptance` 28 GB, `delivery_catalog_acceptance` 13 GB, `delivery_receipts` 12 GB | **~90 GB** | **Open (Q25).** No transcript content. | Move to Supabase, drop, or re-derive. Moving it would dwarf the recent window on Supabase disk (K-32). `delivery_receipts` is in today's copy set. |
+| Acceptance and identity bookkeeping: `uploaded_support_identities` 37 GB, `delivery_projection_acceptance` 28 GB, `delivery_catalog_acceptance` 13 GB, `delivery_receipts` 12 GB | **~90 GB** | **Open (Q25).** No transcript content. | Move to Supabase, drop, or re-derive. Moving it would dwarf metadata plus the 48 h window on Supabase disk (K-32). `delivery_receipts` is in today's copy set. |
 | Copy set: `auth_sessions`, `deleted_upload_sessions`, `session_resets`, `upload_cleanup_origins`, `upload_cleanup_tombstones`, `machines`, `probe_connections`, `project_aliases`, `github_org_links`, `delivery_origins`, `delivery_receipts` | small (measure; runbook step 3) | **Must move before the flip.** These are write-path state: tokens, tombstones, cursors. | `migration:copy --mode=mirror` pre-copied (A4), then caught up inside the hold (runbook steps 4 and 10). |
 | Analysis, briefs, memory state | unknown | **Decide (Q6).** | Either export as derived objects, or re-run after the export behind `MODEL_CALLS_ENABLED` and a budget. |
 | Summaries | n/a | **Re-derived.** | summary-short runs from S3 after the export. That costs model calls; budget it per wave. |
@@ -800,7 +800,7 @@ Each item's exit gate is its own two-pass review plus CI. Every merge is K-1.
     0066 and 0067);
   - #225 (TCP seam);
   - #227 then #231 (pointer index activation, flag-gated);
-  - #226 (G3: terminal reads; it must route transcript search to the child branch for pre-T0 sessions and to the search interface (recent window + history store, K-39) for post-T0 sessions, per the G-T5 spec, instead of failing closed);
+  - #226 (G3: terminal reads; it must route transcript search to the child branch for pre-T0 sessions and to the search interface (history store primary + 48 h window, K-39, K-47) for post-T0 sessions, per the G-T5 spec, instead of failing closed);
   - #222 or its replacement (P5).
 - 96BullSessions:
   - #38 (directory), #48 (short_summary, already merged into the #38
