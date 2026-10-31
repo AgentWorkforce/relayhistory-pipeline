@@ -162,35 +162,59 @@ Use this only if the check above shows Supabase refuses the custom role. #48 wou
 
 ## Multi-workspace tokens
 
-**Status:** proposed, for review by helm-chart-chief and sessionspipelinegrok before any code. Nothing here is built. relayauth #116 stays single-workspace.
+**Status:** design only, revised after helm-chart-chief's review. Do not implement yet. relayauth #116 stays single-workspace. The RPC in #72 accepts up to 64 workspaces, so it is forward-compatible, but no issuer emits more than one today.
 
-An org-wide search needs a token claiming several workspaces, but #116's subject tokens hold one `wks`, and Cloud's RelayHistory assertions are minted per workspace. A one-workspace token must never become a wider one.
+An org-wide search needs a token claiming several workspaces, but #116's subject tokens hold one `wks`, and Cloud's RelayHistory assertions are minted per workspace. A one-workspace token must never become a wider one, and there will be no org-level, any-workspace bearer token.
 
-### Proposal
+### Subject proof
+
+A new identity-only token proves who is asking and grants nothing on its own:
+
+- Dedicated audience, used only by the bulk endpoint.
+- `sub` and `org` only, with no `wks` and no `rth:read`.
+- Lifetime of at most 60 seconds, and no refresh.
+- Minted only from an authenticated Cloud user session.
+- Refused by RelayHistory and by search, so it cannot be used directly.
+
+A subject carrying a `wks`, or any other token class, is refused.
+
+### Bulk endpoint
 
 - **A separate endpoint:** `POST /v1/tokens/session-directory-search-bulk`, with its own API key and literal scope, off by default. It shares the search issuer and key, and it is not a mode of #116's endpoint.
-- **Who authorizes:** RelayAuth asks Cloud. RelayAuth has no workspace membership data; Cloud holds it. For the verified subject's user and org, RelayAuth fetches the member workspaces over an authenticated server-to-server call. The caller's list is only a request.
-- **Refusal:** every requested workspace must be in that server-side set, or the whole request is refused. A failed or empty lookup refuses, with no cached fallback and no partial token.
-- **Subject:** a subject carrying a `wks` is refused. It needs a new, org-level subject class with a short lifetime, so no existing one-workspace token qualifies.
-- **Limits:** 1 to 64 workspaces per token, 60-second lifetime, audited with the full list.
+- **Authorization:** RelayAuth checks every requested workspace through a typed membership adapter. The caller's list is only a request.
+- **Refusal:** any workspace that is not confirmed refuses the whole request. An adapter error refuses too, with no cached fallback.
+- **Audit:** record the subject, org, workspace count and a digest of the sorted workspace set.
+- **Tokens:** 60-second lifetime, no refresh, no partial results.
+
+### Membership adapter
+
+One typed contract, answering whether a user in an org belongs to each named workspace. It returns an answer per workspace, or an error.
+
+| Deployment | Source | Status |
+| --- | --- | --- |
+| Hosted | Cloud/Supabase membership, over an authenticated server-to-server call | Contract to define. Endpoint and credential need confirming against current Cloud code; I read a two-week-old checkout. |
+| Self-hosted | HoopDb | Contract to define. No source exists today, so bulk stays disabled there until one does. |
+
+### Size limits
+
+The count limit is not enough. 64 IDs of 128 characters make a signed token of about 12 KB; UUIDs make about 4 KB. So:
+
+- Set a conservative limit on the total bytes of the serialized workspace claim, and chunk by it as well as by count.
+- Set the limit from a test of real tokens through the real proxy and PostgREST header limits, in both hosted and self-hosted paths. No figure is chosen yet.
 
 ### More than 64 workspaces
 
 Cloud, not the issuer or the RPC, handles the split. There is no token per workspace.
 
-1. Sort the member workspaces and split them into chunks of at most 64.
+1. Sort the member workspaces and split them into chunks within the count and byte limits.
 2. Mint one token per chunk, and call the RPC with `p_workspace_id` NULL and each chunk's token, in parallel with a concurrency cap.
 3. Merge by the org-wide order, `last_activity_at, session_id, harness, workspace_id`, all descending, and return the top 51.
 4. Encode one position per chunk in the page cursor, because each chunk pages separately.
 5. If any chunk fails, the page fails. A partial result would silently hide sessions.
 
-### Open questions
+### Open question
 
-1. Which token is the org-level subject? I found none today, so Cloud would mint a new class. That class is itself an any-workspace-in-org credential, so its minting needs review.
-2. Which Cloud endpoint and credential serve the membership lookup? Cloud's membership tables need confirming against current code, because I read a two-week-old checkout.
-3. Revocation: membership removal can take up to 60 seconds to reach search, the token lifetime. Is that acceptable?
-4. Header size: 64 IDs of 128 characters make a signed token of about 12 KB, which must fit PostgREST's and any proxy's header limits. UUIDs would be about 4 KB. Test before relying on it.
-5. Self-hosted: there is no Cloud in that stack, so another membership source is needed.
+Membership removal can take up to 60 seconds to reach search, the token lifetime. This needs a decision.
 
 ## Self-hosted stacks
 
