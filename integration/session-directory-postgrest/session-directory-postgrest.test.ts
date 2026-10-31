@@ -80,9 +80,20 @@ const token = (org: string, workspace: string, overrides?: Record<string, unknow
 
 class Instance {
   proc!: Subprocess;
-  constructor(readonly name: string, readonly port: number, readonly adminPort: number, readonly conf: string) {}
+  constructor(
+    readonly name: string,
+    readonly port: number,
+    readonly adminPort: number,
+    readonly conf: string,
+    /** The credential-bearing DB URI: only ever in the subprocess environment, never on disk. */
+    private readonly dbUri: string,
+  ) {}
   async start() {
-    this.proc = spawn([POSTGREST_BIN!, this.conf], { stdout: "ignore", stderr: "ignore" });
+    this.proc = spawn([POSTGREST_BIN!, this.conf], {
+      stdout: "ignore",
+      stderr: "ignore",
+      env: { ...process.env, PGRST_DB_URI: this.dbUri },
+    });
     await until(async () => (await fetch(`http://127.0.0.1:${this.adminPort}/ready`)).ok, `${this.name} ready`);
   }
   async reloadConfig(expectStatus: () => Promise<boolean>) {
@@ -221,18 +232,20 @@ beforeAll(async () => {
     writeFileSync(
       conf,
       `${profile
-        .replace("$(PGRST_DB_URI)", loginUrl(adminUrl, role, loginPassword))
         .replace("/etc/postgrest/session-directory-jwks.json", jwksPath)
         .replace("server-port = 3000", `server-port = ${port}`)
         .replace("admin-server-port = 3001", `admin-server-port = ${adminPort}`)}\ndb-pool = 2\n${extra}`,
     );
-    return { port, adminPort, conf };
+    // db-uri stays "$(PGRST_DB_URI)": PostgREST reads it from the environment.
+    expect(readFileSync(conf, "utf8")).toContain('db-uri = "$(PGRST_DB_URI)"');
+    expect(readFileSync(conf, "utf8")).not.toContain(loginPassword);
+    return { port, adminPort, conf, dbUri: loginUrl(adminUrl, role, loginPassword) };
   };
   const hosted = await profileConf("session_directory_authenticator", selfHostedJwks);
-  selfHosted = new Instance("selfHosted", hosted.port, hosted.adminPort, hosted.conf);
+  selfHosted = new Instance("selfHosted", hosted.port, hosted.adminPort, hosted.conf, hosted.dbUri);
   const weak = await profileConf("broad_authenticator", broadJwks, 'db-anon-role = "anon"\n');
   writeFileSync(weak.conf, readFileSync(weak.conf, "utf8").replace(/^jwt-aud.*$/m, ""));
-  broad = new Instance("broad", weak.port, weak.adminPort, weak.conf);
+  broad = new Instance("broad", weak.port, weak.adminPort, weak.conf, weak.dbUri);
   await Promise.all([selfHosted.start(), broad.start()]);
 }, 120_000);
 
@@ -246,6 +259,37 @@ afterAll(async () => {
 
 const instances = () => [selfHosted, broad];
 const keysOf = (result: Row[]) => [...new Set(result.map((row) => `${row.org_id}/${row.workspace_id}`))];
+
+describe("function ACLs on a fresh database", () => {
+  test("no sessions function is executable by PUBLIC", async () => {
+    const open = await admin.unsafe(
+      `SELECT p.oid::regprocedure::text AS fn FROM pg_proc AS p
+        WHERE p.pronamespace = 'sessions'::regnamespace
+          AND (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) AS a WHERE a.grantee = 0))
+        ORDER BY 1`,
+    );
+    expect(open.map((row: Row) => row.fn)).toEqual([]);
+  });
+
+  test("the PostgREST login roles execute nothing themselves; the Worker executes exactly the three RPCs", async () => {
+    const executable = async (role: string) =>
+      (
+        await admin.unsafe(
+          `SELECT p.oid::regprocedure::text AS fn FROM pg_proc AS p
+            WHERE p.pronamespace = 'sessions'::regnamespace
+              AND has_function_privilege($1, p.oid, 'EXECUTE')
+            ORDER BY 1`,
+          [role],
+        )
+      ).map((row: Row) => row.fn);
+    expect(await executable("session_directory_authenticator")).toEqual([]);
+    expect(await executable(WORKER)).toEqual([
+      "sessions.search_session_directory(text,text,text,text,text,boolean,text,text,text,text,text,timestamp with time zone,timestamp with time zone,text,timestamp with time zone,text,text,text,integer)",
+      "sessions.session_directory_pointers(text,text,text)",
+      "sessions.session_directory_readiness()",
+    ]);
+  });
+});
 
 describe("tenant isolation", () => {
   test("each tenant sees only its own rows for the same term", async () => {

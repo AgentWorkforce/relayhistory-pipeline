@@ -25,6 +25,9 @@ create trigger claimless_window_activations_append_only
 create trigger claimless_window_activations_no_truncate
   before truncate on sessions.claimless_window_activations
   for each statement execute function sessions.claimless_window_activations_append_only();
+-- Trigger-only: nothing calls it directly, so PUBLIC (the CREATE FUNCTION default)
+-- keeps no EXECUTE. Triggers fire whatever the function's ACL.
+revoke all on function sessions.claimless_window_activations_append_only() from public;
 
 alter table sessions.claimless_window_activations enable row level security;
 revoke all on sessions.claimless_window_activations from public, anon, authenticated;

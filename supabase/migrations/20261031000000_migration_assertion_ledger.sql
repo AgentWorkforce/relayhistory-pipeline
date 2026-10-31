@@ -108,6 +108,9 @@ $$;
 CREATE TRIGGER migration_ingest_audit_append_only
   BEFORE UPDATE OR DELETE ON sessions.migration_ingest_audit
   FOR EACH ROW EXECUTE FUNCTION sessions.migration_ingest_audit_append_only();
+-- Trigger-only: nothing calls it directly, so PUBLIC (the CREATE FUNCTION default)
+-- keeps no EXECUTE. Triggers fire whatever the function's ACL.
+REVOKE ALL ON FUNCTION sessions.migration_ingest_audit_append_only() FROM PUBLIC;
 
 ALTER TABLE sessions.migration_ingest_audit ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.migration_ingest_audit FROM PUBLIC, anon, authenticated;
