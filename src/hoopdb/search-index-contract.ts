@@ -68,6 +68,7 @@ export class NonAsciiAgentFilterError extends RangeError {
   }
 }
 
+// eslint-disable-next-line no-control-regex
 const NON_ASCII = /[^\u0000-\u007f]/;
 
 /**
@@ -90,7 +91,13 @@ export function agentExactValue(value: string): string {
   return normalized;
 }
 
+/**
+ * Whether `value` can be served by the direct bounded prefix query. A predicate: it
+ * never throws. Non-ASCII input is not useful there (agentPrefixRange refuses it; use
+ * the RPC), so it returns false.
+ */
 export function isUsefulAgentPrefix(value: string): boolean {
+  if (NON_ASCII.test(value)) return false;
   return Array.from(normalizeAgentName(value)).length >= MIN_AGENT_PREFIX_CHARS;
 }
 
@@ -147,7 +154,6 @@ export function agentPrefixRange(value: string): {
   upper: string;
   pattern: string;
 } {
-  // eslint-disable-next-line no-control-regex
   if (NON_ASCII.test(value)) throw new NonAsciiAgentPrefixError();
   const lower = normalizeAgentName(value);
   if (Array.from(lower).length < MIN_AGENT_PREFIX_CHARS) {

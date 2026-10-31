@@ -123,6 +123,10 @@ describe("agent-name lookup contract", () => {
     expect(MIN_AGENT_PREFIX_CHARS).toBe(3);
     expect(isUsefulAgentPrefix("he")).toBe(false);
     expect(isUsefulAgentPrefix("hel")).toBe(true);
+    // A predicate never throws: non-ASCII is simply not useful on the direct path.
+    for (const value of ["ΟΔΟΣ", "İstanbul", "Ägent", "日本語"]) {
+      expect(isUsefulAgentPrefix(value)).toBe(false);
+    }
   });
 
   test("escapes LIKE metacharacters without changing prefix semantics", () => {
