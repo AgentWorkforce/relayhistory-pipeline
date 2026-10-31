@@ -14,7 +14,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { SQL, spawn, type Subprocess } from "bun";
 import { createHmac, createSign, generateKeyPairSync, type KeyObject } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -496,5 +496,130 @@ describe("rotation and kill switch", () => {
       await admin.unsafe(`GRANT ${WORKER} TO session_directory_authenticator`);
     }
     await rows(await selfHosted.search(token("org-a", "ws-a1"), "ws-a1"));
+  });
+});
+
+/**
+ * Tokens from the real RelayAuth exchange, not fixtures. Needs RELAYAUTH_DIR: a built
+ * checkout of relayauth with the session directory issuer. Its general key is a test
+ * key, so this file can forge the subject tokens RelayAuth would have issued.
+ */
+// Resolved because the server only starts when argv[1] equals its real module path.
+const RELAYAUTH_DIR = process.env.RELAYAUTH_DIR && realpathSync(process.env.RELAYAUTH_DIR);
+describe.skipIf(!RELAYAUTH_DIR)("tokens minted by real RelayAuth", () => {
+  const GENERAL_KEY = newKey("general");
+  const GENERAL_ISSUER = "https://relayauth.test";
+  const MINT_SCOPE = "relayauth:assertion:create:session-directory-search";
+  let relayAuth: Subprocess;
+  let baseUrl: string;
+  let apiKey: string;
+  let originalJwks: string;
+
+  const generalToken = (claims: Record<string, unknown>) => {
+    const iat = Math.floor(Date.now() / 1000);
+    return sign(
+      {
+        iss: GENERAL_ISSUER, aud: ["relayhistory"], sub: "agent_reader", org: "relay_org-a", wks: "relay_ws-a1",
+        scopes: ["rth:read"], sponsorId: "user-1", sponsorChain: ["user-1", "agent_reader"],
+        token_type: "access", iat, exp: iat + 600, jti: crypto.randomUUID(), ...claims,
+      },
+      GENERAL_KEY,
+    );
+  };
+  const exchange = (subjectToken: string, workspaceId: string) =>
+    fetch(`${baseUrl}/v1/tokens/session-directory-search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey },
+      body: JSON.stringify({ subjectToken, workspaceId }),
+    });
+  const mint = async (org: string, workspace: string) => {
+    const response = await exchange(generalToken({ org, wks: workspace }), workspace.replace(/^relay_/, ""));
+    expect(response.status).toBe(201);
+    return ((await response.json()) as { accessToken: string }).accessToken;
+  };
+
+  beforeAll(async () => {
+    const port = await freePort();
+    baseUrl = `http://127.0.0.1:${port}`;
+    const pem = (key: Key) => key.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    relayAuth = spawn(["node", "--import", "tsx", join(RELAYAUTH_DIR!, "packages/server/src/server.ts")], {
+      cwd: RELAYAUTH_DIR!,
+      stdout: "ignore",
+      stderr: "ignore",
+      env: {
+        ...process.env,
+        PORT: String(port),
+        BASE_URL: baseUrl,
+        RELAYAUTH_DB_PATH: join(dir, "relayauth.db"),
+        INTERNAL_SECRET: crypto.randomUUID(),
+        RELAYAUTH_ISSUER: GENERAL_ISSUER,
+        RELAYAUTH_SIGNING_KEY_PEM: pem(GENERAL_KEY),
+        RELAYAUTH_SESSION_DIRECTORY_ISSUANCE: "true",
+        RELAYAUTH_SESSION_DIRECTORY_ISSUER: ISSUER,
+        RELAYAUTH_SESSION_DIRECTORY_SIGNING_KEY_PEM: pem(SEARCH_KEY),
+      },
+    });
+    await until(async () => (await fetch(`${baseUrl}/.well-known/session-directory/jwks.json`)).ok, "relayauth ready", 30_000);
+
+    // RelayAuth's kid is the key's thumbprint, so take it from the published set.
+    const general = (await (await fetch(`${baseUrl}/.well-known/jwks.json`)).json()) as { keys: { kid: string }[] };
+    GENERAL_KEY.kid = general.keys[0]!.kid;
+
+    const created = await fetch(`${baseUrl}/v1/api-keys`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${generalToken({
+          aud: ["relayauth"], sub: "agent_operator", org: "org_operator", wks: "ws_operator",
+          scopes: ["relayauth:api-key:manage:*", MINT_SCOPE],
+        })}`,
+      },
+      body: JSON.stringify({ name: "search-minter", scopes: [MINT_SCOPE] }),
+    });
+    expect(created.status).toBe(201);
+    apiKey = ((await created.json()) as { key: string }).key;
+
+    // PostgREST trusts exactly what RelayAuth publishes, with its real kids.
+    originalJwks = readFileSync(selfHostedJwks, "utf8");
+    const published = await (await fetch(`${baseUrl}/.well-known/session-directory/jwks.json`)).text();
+    const previous = token("org-a", "ws-a1");
+    writeFileSync(selfHostedJwks, published);
+    await selfHosted.reloadConfig(async () => (await selfHosted.search(previous, "ws-a1")).status === 401);
+  }, 60_000);
+
+  afterAll(async () => {
+    relayAuth?.kill();
+    if (originalJwks) writeFileSync(selfHostedJwks, originalJwks);
+  });
+
+  test("a minted token reads its own tenant through PostgREST", async () => {
+    const a = await rows(await selfHosted.search(await mint("relay_org-a", "relay_ws-a1"), "ws-a1"));
+    const b = await rows(await selfHosted.search(await mint("relay_org-b", "relay_ws-b1"), "ws-b1"));
+    expect(a).toHaveLength(3);
+    expect(keysOf(a)).toEqual(["org-a/ws-a1"]);
+    expect(keysOf(b)).toEqual(["org-b/ws-b1"]);
+  });
+
+  test("the same workspace id minted for two orgs stays separated", async () => {
+    const a = await rows(await selfHosted.search(await mint("relay_org-a", "ws-shared"), "ws-shared"));
+    const b = await rows(await selfHosted.search(await mint("relay_org-b", "ws-shared"), "ws-shared"));
+    expect(keysOf(a)).toEqual(["org-a/ws-shared"]);
+    expect(keysOf(b)).toEqual(["org-b/ws-shared"]);
+  });
+
+  test("a minted token cannot read another workspace", async () => {
+    const bearer = await mint("relay_org-a", "relay_ws-a1");
+    await refused(await selfHosted.search(bearer, "ws-a2"), [403], "42501");
+    await refused(await selfHosted.search(bearer, "ws-b1"), [403], "42501");
+  });
+
+  test("the exchange refuses another tenant's workspace, so no token exists to try", async () => {
+    const response = await exchange(generalToken({}), "ws-b1");
+    expect(response.status).toBe(403);
+    expect(((await response.json()) as { code: string }).code).toBe("workspace_mismatch");
+  });
+
+  test("a general RelayAuth token gets no access through PostgREST", async () => {
+    await refused(await selfHosted.search(generalToken({ role: WORKER }), "ws-a1"), [401]);
   });
 });
