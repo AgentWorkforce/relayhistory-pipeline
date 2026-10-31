@@ -40,13 +40,14 @@ import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedMigrationNames } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
+import { allowedOrgIdsFromEnv } from "./org-allowlist.ts";
 import {
   claimlessWindowDates,
   courierMigrationLedger,
   createCourierManifestRoutes,
   type ClaimlessUse,
 } from "./manifests.ts";
-import { allowedOrgIdsFromEnv, mountIngestApi } from "./routes.ts";
+import { mountIngestApi } from "./routes.ts";
 
 /** Test seams for buildIngestApp: an already migrated database and a raw store. */
 export interface IngestOverrides {
