@@ -43,6 +43,7 @@ import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedMigrationNames } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
+import { allowedOrgIdsFromEnv, orgAllowlist } from "./org-allowlist.ts";
 import {
   claimlessWindowDates,
   courierMigrationLedger,
@@ -359,6 +360,10 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
   });
   const v1 = new Hono<AppEnv>();
   v1.use("*", async (c, next) => requireAuth(c as never, next));
+  // A fixed set of tenant orgs (TENANT_ORG_IDS): any other verified org is
+  // refused before any route runs. Unset: no allowlist.
+  const allowedOrgIds = allowedOrgIdsFromEnv(process.env.TENANT_ORG_IDS);
+  if (allowedOrgIds.length) v1.use("*", orgAllowlist(allowedOrgIds));
   // Upload routes on an origin-bound deployment: only assertions minted for
   // this origin (or migration assertions, which are origin-bound by their
   // verifier), whatever the interim bearer flag says.
