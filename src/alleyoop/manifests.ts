@@ -229,20 +229,31 @@ function machineClaim(auth: Auth): string | undefined {
   return typeof value === "string" && value ? value : undefined;
 }
 
+/** The longest the legacy window may run, from activation to expiry. */
+export const CLAIMLESS_WINDOW_MAX_MS = 72 * 60 * 60 * 1000;
+
 /**
- * The legacy window for couriers from before the machine claim. Closed unless
- * a deployment opts in with `MANIFEST_MACHINE_CLAIM=compat` and a future
- * `MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL`, so a new deployment requires the claim,
- * unsetting either is the kill switch, and the window closes itself at the
- * sunset. It is read-only and version-only: no write passes through it. While
- * it is open the system is not machine-bound. Delete this and its callers when
- * the sunset passes.
+ * The legacy window for couriers from before the machine claim. Shut unless a
+ * deployment sets `MANIFEST_MACHINE_CLAIM=compat` with
+ * `MANIFEST_MACHINE_CLAIM_COMPAT_FROM` and `_UNTIL` at most 72 hours apart, so a
+ * new deployment requires the claim, unsetting any of them is the kill switch,
+ * a longer window fails closed, and it shuts itself at the expiry. It is
+ * read-only and version-only: no write passes through it. While it is open the
+ * system is not machine-bound. Delete this and its callers after the rollout.
  */
 export function claimlessWindowOpen(env: Bindings, now = new Date()): boolean {
   const vars = env as Record<string, unknown>;
   if (vars.MANIFEST_MACHINE_CLAIM !== "compat") return false;
+  const from = Date.parse(String(vars.MANIFEST_MACHINE_CLAIM_COMPAT_FROM));
   const until = Date.parse(String(vars.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL));
-  return Number.isFinite(until) && now.getTime() < until;
+  const at = now.getTime();
+  return (
+    Number.isFinite(from) &&
+    Number.isFinite(until) &&
+    until - from <= CLAIMLESS_WINDOW_MAX_MS &&
+    from <= at &&
+    at < until
+  );
 }
 
 /**

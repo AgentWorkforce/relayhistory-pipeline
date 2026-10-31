@@ -131,11 +131,6 @@ async function ingest(extra: Record<string, string> = {}) {
     RELAYHISTORY_ORIGIN: ORIGIN,
     ...extra,
   });
-  // The legacy machine-claim window: these tokens predate the claim.
-  if (extra.CLAIMLESS_WINDOW !== "shut") {
-    process.env.MANIFEST_MACHINE_CLAIM = "compat";
-    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = "2099-01-01T00:00:00.000Z";
-  }
   delete process.env.ALLOW_INTERIM_RELAYAUTH_BEARER;
   if (extra.ALLOW_INTERIM_RELAYAUTH_BEARER) process.env.ALLOW_INTERIM_RELAYAUTH_BEARER = extra.ALLOW_INTERIM_RELAYAUTH_BEARER;
   const store = createFsStore({ root });
@@ -215,11 +210,30 @@ const MIGRATION_ON = { RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS: "true", RELAYHI
 
 describe("buildIngestApp auth (production composition)", () => {
   test("the claim switch reaches the route from the real environment, and defaults shut", async () => {
-    const shut = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true", CLAIMLESS_WINDOW: "shut" });
+    const shut = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
     const { manifest } = await planned();
     const claimless = sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { tokenClass: "relayhistory_assertion" } });
     expect((await shut.commit(claimless, manifest)).status).toBe(403);
     expect(await count("sessions.claimless_uses")).toBe(0);
+
+    // The real migrations, composition and meter: a read through an open window.
+    process.env.MANIFEST_MACHINE_CLAIM = "compat";
+    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(Date.now() - 1000).toISOString();
+    process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = new Date(Date.now() + 60_000).toISOString();
+    const open = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
+    const liveLocation = { ...LOCATION, sessionId: "session-claimless" };
+    const liveKey = manifestKey(liveLocation);
+    const live = await planned(liveLocation, liveLocation.machineId);
+    expect((await open.chunk(liveToken(), liveLocation)).status).toBe(201);
+    const committed = await open.req("/v1/pipeline/manifests", liveToken(), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-machine-id": liveLocation.machineId, "x-session-id": liveLocation.sessionId },
+      body: JSON.stringify({ key: liveKey, manifest: { ...live.manifest, extensions: undefined } }),
+    });
+    expect(committed.status).toBe(202);
+    const q = new URLSearchParams({ key: liveKey, machine: liveLocation.machineId, writer: liveLocation.machineId });
+    expect((await open.req(`/v1/pipeline/manifests/status?${q}`, claimless)).status).toBe(200);
+    expect(await count("sessions.claimless_uses")).toBe(1);
   });
 
   test("default config: a generic RelayAuth bearer is refused (401) on every upload route, and so is a migration token", async () => {

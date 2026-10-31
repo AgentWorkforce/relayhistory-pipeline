@@ -176,6 +176,7 @@ export function configFromEnv(): CourierConfig {
       throw new Error("96bulls: JWT_PRIVATE_KEY_PEM is local-only; durable host enrollment requires RelayAuth");
     token = mintedBearerToken(() =>
       mintToken({ kid: required("JWT_KID"), privateKeyPem: required("JWT_PRIVATE_KEY_PEM") }, {
+        machineId: required("MACHINE_ID"),
         issuer: optional("AUTH_ISSUER", "https://96bulls.local"),
         audience: optional("AUTH_AUDIENCE", "relayhistory"),
         orgId,
@@ -197,7 +198,7 @@ export function configFromEnv(): CourierConfig {
     workspaceId,
     userId,
     ...(process.env.MACHINE_ID ? { machineId: process.env.MACHINE_ID } : {}),
-    ...(cloudSession ? { machineBound: true } : {}),
+    ...(cloudSession || process.env.JWT_PRIVATE_KEY_PEM ? { machineBound: true } : {}),
     ...(process.env.HARNESSES ? { harnesses: process.env.HARNESSES.split(",").map((s) => s.trim()).filter(Boolean) } : {}),
     closeAfterMinutes: integer("COURIER_CLOSE_AFTER_MINUTES", 30),
     startMode,

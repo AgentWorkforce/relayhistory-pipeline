@@ -9,6 +9,7 @@
  * declared but refuse to run until Khaliq clears the AWS account work
  * (see docs/aws-stage.md); nothing in this file creates a cloud resource.
  */
+import { claimlessWindowEnv, type ClaimlessWindow } from "./stacks/claimless-window.ts";
 import * as Alchemy from "alchemy";
 import { Stage } from "alchemy";
 import * as Docker from "@alchemy.run/docker";
@@ -30,6 +31,7 @@ interface LocalInputs {
   jwtKid: string;
   jwtPrivateKeyPem: string;
   courierToken: string;
+  claimlessWindow?: ClaimlessWindow;
   machineId: string;
   concourseDir: string;
   telemetryDir: string;
@@ -182,6 +184,8 @@ export default Alchemy.Stack(
       // stack's own key, so the broad interim bearer is an explicit opt-in here.
       // The ingest defaults it off (src/alleyoop/ingest.ts).
       ALLOW_INTERIM_RELAYAUTH_BEARER: "true",
+      // Default off: a local stage's tokens carry the claim, so it needs no window.
+      ...Object.fromEntries(claimlessWindowEnv(inputs.claimlessWindow).map(({ name, value }) => [name, value])),
     }, { ports: [{ external: `127.0.0.1:${PORTS.ingest}`, internal: 8080 }] });
 
     yield* service("hoopdb-indexer", name(NAMES.indexer), "hoopdb-indexer");

@@ -39,6 +39,8 @@ export interface TokenInput {
   userId: string;
   scopes?: string[];
   ttlSeconds?: number;
+  /** Signed as `meta.machineId`: what binds this token to one machine. */
+  machineId?: string;
 }
 
 /** An RS256 JWT with the claims the vendored `extractAuthContext` reads. */
@@ -56,6 +58,7 @@ export function mintToken(keys: Pick<LocalKeys, "kid" | "privateKeyPem">, input:
     nbf: now - 30,
     exp: now + (input.ttlSeconds ?? 24 * 3600),
     jti: randomUUID(),
+    ...(input.machineId ? { meta: { machineId: input.machineId } } : {}),
   };
   const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(claims))}`;
   const signature = createSign("RSA-SHA256").update(signingInput).sign(createPrivateKey(keys.privateKeyPem));

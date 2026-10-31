@@ -128,6 +128,7 @@ function prepareInputs(stage: string): Inputs {
     orgId: TENANT.orgId,
     workspaceId: TENANT.workspaceId,
     userId: TENANT.userId,
+    machineId: inputs.machineId,
     ttlSeconds: 7 * 24 * 3600,
   });
   mkdirSync(inputs.concourseDir, { recursive: true });
@@ -331,6 +332,7 @@ async function main() {
     case "token": {
       const inputs = loadInputs(requireLocalStage(stageArg));
       console.log(mintToken({ kid: inputs.jwtKid, privateKeyPem: inputs.jwtPrivateKeyPem }, {
+        machineId: inputs.machineId,
         issuer: TENANT.issuer, audience: "relayhistory", orgId: TENANT.orgId, workspaceId: TENANT.workspaceId, userId: TENANT.userId, ttlSeconds: 3600,
       }));
       return;

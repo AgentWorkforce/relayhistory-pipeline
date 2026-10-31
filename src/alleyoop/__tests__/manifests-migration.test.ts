@@ -308,8 +308,6 @@ async function fixture(
   });
   app.route("/v1", routes);
   const env = {
-    MANIFEST_MACHINE_CLAIM: "compat",
-    MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: "2099-01-01T00:00:00.000Z",
     PIPELINE_ORG_ID: ORG,
     RELAYHISTORY_ORIGIN: ORIGIN,
     RELAYHISTORY_MIGRATION_GRANTS: `${GRANT}=${PLAN}`,

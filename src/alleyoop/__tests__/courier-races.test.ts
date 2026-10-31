@@ -10,6 +10,7 @@ import {
 } from "../../shared/vendor.ts";
 import { createHash } from "node:crypto";
 import { sourceResumeOffset } from "../courier.ts";
+import { claimlessWindowOpen } from "../manifests.ts";
 import { feedRanges, feedRecordId } from "../feed-records.ts";
 import { courierWorld } from "./courier-harness.ts";
 
@@ -617,6 +618,17 @@ describe("machine claim", () => {
         (w) => void delete w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL,
         (w) => void delete w.env.MANIFEST_MACHINE_CLAIM,
         (w) => void (w.env.MANIFEST_MACHINE_CLAIM = "required"),
+        (w) => void delete w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM,
+        // Over the cap, though the expiry is still in the future.
+        (w) =>
+          void (w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+            Date.now() - 72 * 3_600_000,
+          ).toISOString()),
+        // Not started yet.
+        (w) =>
+          void (w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+            Date.now() + 10_000,
+          ).toISOString()),
       ];
       for (const close of closers) {
         const { w, version } = await setup();
@@ -628,6 +640,23 @@ describe("machine claim", () => {
           expect((await status(w, q)).status).toBe(403);
         expect(w.gate.claimless).toHaveLength(before);
       }
+    });
+
+    test("72 hours is the cap, to the millisecond", () => {
+      const from = new Date("2026-11-01T00:00:00.000Z");
+      const at = (ms: number) => new Date(from.getTime() + ms);
+      const env = (hours: number, ms = 0) =>
+        ({
+          MANIFEST_MACHINE_CLAIM: "compat",
+          MANIFEST_MACHINE_CLAIM_COMPAT_FROM: from.toISOString(),
+          MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: at(
+            hours * 3_600_000 + ms,
+          ).toISOString(),
+        }) as never;
+      expect(claimlessWindowOpen(env(72), at(1000))).toBe(true);
+      expect(claimlessWindowOpen(env(72, 1), at(1000))).toBe(false);
+      expect(claimlessWindowOpen(env(720), at(1000))).toBe(false);
+      expect(claimlessWindowOpen(env(72), at(72 * 3_600_000))).toBe(false);
     });
 
     test("the courier stays safe when it closes: it defers, never fences", async () => {

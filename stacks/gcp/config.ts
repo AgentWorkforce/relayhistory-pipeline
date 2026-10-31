@@ -1,3 +1,4 @@
+import { claimlessWindowEnv, type ClaimlessWindow } from "../claimless-window.ts";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isIP } from "node:net";
@@ -228,6 +229,8 @@ export interface GcpInputs {
     relayauthIssuer: string;
     /** Exact History origin placed in RelayAuth assertion audiences and enforced by AlleyOop. */
     relayhistoryOrigin: string;
+    /** Default off. See runbooks/manifest-activation.md. */
+    claimlessWindow?: ClaimlessWindow;
   };
 }
 
@@ -708,6 +711,7 @@ export function bulls96ReleaseValues(
         // dedicated origin-bound assertion class by default.
         { name: "ALLOW_INTERIM_RELAYAUTH_BEARER", value: "true" },
         { name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin },
+        ...claimlessWindowEnv(i.claimlessWindow),
       ],
     },
     hoopdb: { enabled: false },

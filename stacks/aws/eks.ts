@@ -8,6 +8,7 @@
  * services image digest. Secrets reach the pods through an existing Kubernetes
  * Secret synced from 1Password/Secrets Manager, never through chart values.
  */
+import { claimlessWindowEnv, type ClaimlessWindow } from "../claimless-window.ts";
 import * as AWS from "@alchemy.run/aws";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
@@ -26,6 +27,8 @@ export interface EksStageInputs {
   tenantOrgId: string;
   relayauthJwksUrl: string;
   relayhistoryOrigin: string;
+  /** Default off. See runbooks/manifest-activation.md. */
+  claimlessWindow?: ClaimlessWindow;
   /** The `iss` RelayAuth stamps; must match exactly or every token is refused. */
   relayauthIssuer?: string;
   /**
@@ -75,7 +78,7 @@ export function telemetryPolicy(i: Pick<EksStageInputs, "lockerBucketArn" | "loc
  * tested without loading either the AWS or Kubernetes providers.
  */
 export function eksChartValues(
-  i: Pick<EksStageInputs, "stage" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "relayhistoryOrigin" | "imageRepository" | "imageDigest">,
+  i: Pick<EksStageInputs, "stage" | "claimlessWindow" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "relayhistoryOrigin" | "imageRepository" | "imageDigest">,
   sandbox: boolean,
   authIssuer: string,
   authJwksUrl: string,
@@ -104,7 +107,10 @@ export function eksChartValues(
       hoopdb: sandbox ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
       locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
       auth: { jwksUrl: authJwksUrl, issuer: authIssuer },
-      extraEnv: [{ name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin }],
+      extraEnv: [
+        { name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin },
+        ...claimlessWindowEnv(i.claimlessWindow),
+      ],
       deployment: { name: "hosted", id: i.stage },
     },
     otel: {

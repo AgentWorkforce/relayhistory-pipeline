@@ -6,7 +6,8 @@ automatically. Each step needs Khaliq's explicit OK.
 
 1. Create the `MANIFEST_READINESS_KEY` credential in 1Password. It signs reader
    attestations; never put it on disk.
-2. Apply `supabase/migrations/20261031000100_manifest_readiness.sql`.
+2. Apply `supabase/migrations/20261031000100_manifest_readiness.sql` and
+   `20261101000100_claimless_uses_read_only.sql`.
 3. Build each reader with `--define __RELEASE_SHA__='"<commit>"'`. A build without
    it reports `unreleased` and cannot attest. The value is a build-time constant
    so a running process cannot claim another build.
@@ -29,26 +30,35 @@ identity.
 Every live write needs a `meta.machineId` matching the key's machine and the
 writer, always. A status read needs it too, unless the legacy window is open.
 
-The window is read-only and version-only: it returns the object version and
-nothing else. No write passes through it, so a courier without a claim cannot
-deliver, window or not. It exists so such a courier can reconcile while it is
-being replaced. While it is open **this system is not machine-bound**.
+**Stopping a host's delivery is not a rollout step.** A courier with no claim
+cannot write, window or not, so couriers must change before ingest does.
 
 Rollout, in order:
 
-1. Inventory the affected couriers: every host whose token has no claim.
-2. Enable the window for the affected stage only, with a fixed UTC expiry:
-   `MANIFEST_MACHINE_CLAIM=compat` and
-   `MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL=<RFC 3339 UTC>`. Both are needed. A bad or
-   missing date keeps it shut, and it closes itself at the expiry.
-3. Deploy claim-capable couriers. **Until each one is, its delivery is stopped**:
-   its records wait in its local source and are not lost, but they do not reach
-   the pipeline.
-4. Watch claimless use reach zero in `sessions.claimless_uses`, which records each
-   read by day, org, caller and client version. A read that cannot be recorded
-   is refused.
-5. Unset both variables before the expiry. Unsetting either, or setting
-   `required`, is the kill switch.
+1. Inventory the couriers, and which have a claim-capable release.
+2. Deploy claim-capable couriers everywhere.
+3. Verify each emits a signed `meta.machineId`: decode one token per host, and
+   confirm the claim is its machine. Do not go on until every host passes.
+4. Deploy ingest.
+
+If a host is missed, the window lets it reconcile, read-only, while it is fixed.
+It does not let it deliver:
+
+- `claimlessWindow: { from, until }` in the stage's inputs, RFC 3339 UTC, sets
+  `MANIFEST_MACHINE_CLAIM=compat`, `MANIFEST_MACHINE_CLAIM_COMPAT_FROM` and
+  `MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL`. Local, AWS and GCP stages are all off by
+  default. Set it for the affected stage only.
+- `until` is at most 72 hours after `from`. A longer window fails closed, at
+  composition and in ingest, and so does a bad or missing date. It shuts itself at
+  `until`. Restating `from` to extend it is a decision, not a retry.
+- While it is open **this system is not machine-bound**. A read gets the object
+  version and nothing else.
+- Watch `sessions.claimless_uses`, which records each read by day, org, caller
+  and client version. A read that cannot be recorded is refused.
+- Remove `claimlessWindow` once use reaches zero, before `until`. Removing it, or
+  setting `MANIFEST_MACHINE_CLAIM=required`, is the kill switch.
+
+Local stages need none of this: their tokens carry the claim.
 
 `client_version` is self-reported. It is for this meter only, and must never
 influence identity, authorization, limits or trust.

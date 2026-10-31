@@ -450,6 +450,9 @@ export async function courierWorld(
     /** The legacy window, open until `until`. */
     openClaimlessWindow: (until = new Date(Date.now() + 60_000)) => {
       env.MANIFEST_MACHINE_CLAIM = "compat";
+      env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+        until.getTime() - 3_600_000,
+      ).toISOString();
       env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = until.toISOString();
     },
     setEpoch: (epoch: number) => {

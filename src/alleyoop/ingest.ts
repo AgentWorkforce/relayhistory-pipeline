@@ -88,6 +88,7 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     // assertions minted for this deployment's origin are accepted (legacy shared audience refused).
     ...(process.env.RELAYHISTORY_ORIGIN ? { RELAYHISTORY_ORIGIN: process.env.RELAYHISTORY_ORIGIN } : {}),
     ...(process.env.MANIFEST_MACHINE_CLAIM ? { MANIFEST_MACHINE_CLAIM: process.env.MANIFEST_MACHINE_CLAIM } : {}),
+    ...(process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM ? { MANIFEST_MACHINE_CLAIM_COMPAT_FROM: process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM } : {}),
     ...(process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL ? { MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL } : {}),
     ...(process.env.BACKFILL_ACTIVATION_MAX_ATTEMPTS ? { BACKFILL_ACTIVATION_MAX_ATTEMPTS: process.env.BACKFILL_ACTIVATION_MAX_ATTEMPTS } : {}),
     ...(process.env.BACKFILL_ACTIVATION_MAX_DELAY_SECONDS ? { BACKFILL_ACTIVATION_MAX_DELAY_SECONDS: process.env.BACKFILL_ACTIVATION_MAX_DELAY_SECONDS } : {}),
