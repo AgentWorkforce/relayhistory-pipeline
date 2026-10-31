@@ -1,0 +1,2217 @@
+Plan · aws-sessions-dev
+Importing stack module
+Resolving stack services
+AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
+Loading stack state
+Computing plan
+Plan ready (2.8s)
+Plan: 33 to create, 15 to update, 1 to adopted
+
+[96bulls] update
+  properties:
+    chart: 96bulls
+  -   cluster:
+  -     accessConfig:
+  -       authenticationMode: API
+  -     certificateAuthorityData: <public cluster CA omitted>
+  -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+  -     clusterName: 96bulls-aws-sessions-dev
+  -     computeConfig:
+  -       enabled: true
+  -       nodePools:
+  -         - system
+  -         - general-purpose
+  -       nodeRoleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     connection:
+  -       auth:
+  -         clusterName: 96bulls-aws-sessions-dev
+  -         kind: aws-eks
+  -         region: us-west-2
+  -       certificateAuthorityData: <public cluster CA omitted>
+  -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     deletionProtection: false
+  -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     kubernetesNetworkConfig:
+  -       elasticLoadBalancing:
+  -         enabled: true
+  -       ipFamily: ipv4
+  -       serviceIpv4Cidr: 172.20.0.0/16
+  -     kubernetesObjects: []
+  -     logging:
+  -       clusterLogging:
+  -         - enabled: false
+  -           types:
+  -             - api
+  -             - audit
+  -             - authenticator
+  -             - controllerManager
+  -             - scheduler
+  -     managedClusterRoleName: 96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     managedNodeRoleName: 96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     oidcIssuer: https://oidc.eks.us-west-2.amazonaws.com/id/838C2CB6BC90E437DC58EA312C240377
+  -     platformVersion: eks.7
+  -     resourcesVpcConfig:
+  -       clusterSecurityGroupId: sg-01edabfa69d20db0b
+  -       endpointPrivateAccess: false
+  -       endpointPublicAccess: true
+  -       publicAccessCidrs:
+  -         - 0.0.0.0/0
+  -       securityGroupIds: []
+  -       subnetIds:
+  -         - subnet-0bef62a2d4aa5ee55
+  -         - subnet-0edd96e6b40736edb
+  -       vpcId: vpc-06384df37be8dd29b
+  -     roleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     status: ACTIVE
+  -     storageConfig:
+  -       blockStorage:
+  -         enabled: true
+  -     tags:
+  -       96bulls:component: eks
+  -       96bulls:repo: AgentWorkforce/96BullSessions
+  -       96bulls:stack: aws-sessions-dev
+  -       alchemy::id: cluster
+  -       alchemy::stack: 96bulls-aws
+  -       alchemy::stage: aws-sessions-dev
+  -     upgradePolicy:
+  -       supportType: EXTENDED
+  -     version: "1.37"
+  +   cluster: (known after apply)
+    createNamespace: true
+    namespace: 96bulls
+    releaseName: 96bulls
+    repo: https://AgentWorkforce.github.io/helm-charts
+    values:
+      alleyoop:
+        auth:
+          issuer: http://relayauth.relayauth.svc:8787
+          jwksUrl: http://relayauth.relayauth.svc:8787/.well-known/jwks.json
+        deployment:
+          id: aws-sessions-dev
+          name: hosted
+        extraEnv:
+          - name: RELAYHISTORY_ORIGIN
+            value: https://sessions-dev.agentrelay.com
+        hoopdb:
+          existingSecret: 96bulls-runtime
+          key: HOOPDB_URL
+        image:
+          digest: sha256:c13b879a668984f905e30e38b05764ec712532e8395b256d416ba1602f6c6726
+          repository: 500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services
+        locker:
+          bucket: 96bulls-aws-sessions-dev-locker-500268966557
+          credentials:
+            mode: podIdentity
+          endpoint: ""
+          region: us-west-2
+      global:
+        imageRegistry: ""
+        otel:
+          endpoint: http://otel-collector:4318
+        tenant:
+          orgId: org_sessions_dev
+      hoopdb:
+        enabled: false
+      locker:
+        enabled: false
+      otel:
+        config:
+          exporters:
+            awss3/traces:
+              marshaler: otlp_json
+              s3uploader:
+                compression: gzip
+                region: us-west-2
+                s3_base_prefix: telemetry
+                s3_bucket: 96bulls-aws-sessions-dev-locker-500268966557
+                s3_partition_timezone: UTC
+                s3_prefix: traces
+                unique_key_func_name: uuidv7
+              sending_queue:
+                enabled: true
+                num_consumers: 2
+                queue_size: 100
+              timeout: 20s
+            nop: {}
+          processors:
+            attributes/drop_forbidden:
+              actions:
+                - action: delete
+                  key: prompt
+                - action: delete
+                  key: summary
+                - action: delete
+                  key: message
+                - action: delete
+                  key: path
+                - action: delete
+                  key: body
+            redaction:
+              allow_all_keys: true
+              blocked_values:
+                - AKIA[0-9A-Z]{16}
+                - ASIA[0-9A-Z]{16}
+                - sk-[A-Za-z0-9_-]{16,}
+                - xox[abpr]-[A-Za-z0-9-]{10,}
+                - -----BEGIN [A-Z ]*PRIVATE KEY-----
+                - eyJ[A-Za-z0-9_-]{10,}[.][A-Za-z0-9_-]{10,}[.][A-Za-z0-9_-]{10,}
+                - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}"
+              summary: silent
+          service:
+            pipelines:
+              logs:
+                exporters:
+                  - nop
+                processors:
+                  - memory_limiter
+                  - batch
+                receivers:
+                  - otlp
+              metrics:
+                exporters:
+                  - nop
+                processors:
+                  - memory_limiter
+                  - batch
+                receivers:
+                  - otlp
+              traces:
+                exporters:
+                  - awss3/traces
+                processors:
+                  - memory_limiter
+                  - attributes/drop_forbidden
+                  - redaction
+                  - batch
+                receivers:
+                  - otlp
+        enabled: true
+        fullnameOverride: otel-collector
+  +       image:
+  +         digest: sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849
+  +         repository: otel/opentelemetry-collector-contrib
+  +         tag: 0.163.2
+  +       podSecurityContext:
+  +         runAsGroup: 10001
+  +         runAsNonRoot: true
+  +         runAsUser: 10001
+  +         seccompProfile:
+  +           type: RuntimeDefault
+  +       securityContext:
+  +         allowPrivilegeEscalation: false
+  +         capabilities:
+  +           drop:
+  +             - ALL
+  +         readOnlyRootFilesystem: true
+  +       serviceAccount:
+  +         automountServiceAccountToken: false
+      worker:
+        deployment:
+          id: aws-sessions-dev
+          name: hosted
+        hoopdb:
+          existingSecret: 96bulls-runtime
+          key: HOOPDB_URL
+        image:
+          digest: sha256:c13b879a668984f905e30e38b05764ec712532e8395b256d416ba1602f6c6726
+          repository: 500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services
+        locker:
+          bucket: 96bulls-aws-sessions-dev-locker-500268966557
+          credentials:
+            mode: podIdentity
+          endpoint: ""
+          region: us-west-2
+        lockerInit:
+          enabled: false
+        migrations:
+          supabaseShim: false
+        summaryEncryption:
+          existingSecret: 96bulls-runtime
+          key: SUMMARY_MASTER_KEYS
+    version: 0.3.0
+
+[alb-ingressclass] update
+  properties:
+  -   cluster:
+  -     accessConfig:
+  -       authenticationMode: API
+  -     certificateAuthorityData: <public cluster CA omitted>
+  -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+  -     clusterName: 96bulls-aws-sessions-dev
+  -     computeConfig:
+  -       enabled: true
+  -       nodePools:
+  -         - system
+  -         - general-purpose
+  -       nodeRoleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     connection:
+  -       auth:
+  -         clusterName: 96bulls-aws-sessions-dev
+  -         kind: aws-eks
+  -         region: us-west-2
+  -       certificateAuthorityData: <public cluster CA omitted>
+  -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     deletionProtection: false
+  -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     kubernetesNetworkConfig:
+  -       elasticLoadBalancing:
+  -         enabled: true
+  -       ipFamily: ipv4
+  -       serviceIpv4Cidr: 172.20.0.0/16
+  -     kubernetesObjects: []
+  -     logging:
+  -       clusterLogging:
+  -         - enabled: false
+  -           types:
+  -             - api
+  -             - audit
+  -             - authenticator
+  -             - controllerManager
+  -             - scheduler
+  -     managedClusterRoleName: 96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     managedNodeRoleName: 96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     oidcIssuer: https://oidc.eks.us-west-2.amazonaws.com/id/838C2CB6BC90E437DC58EA312C240377
+  -     platformVersion: eks.7
+  -     resourcesVpcConfig:
+  -       clusterSecurityGroupId: sg-01edabfa69d20db0b
+  -       endpointPrivateAccess: false
+  -       endpointPublicAccess: true
+  -       publicAccessCidrs:
+  -         - 0.0.0.0/0
+  -       securityGroupIds: []
+  -       subnetIds:
+  -         - subnet-0bef62a2d4aa5ee55
+  -         - subnet-0edd96e6b40736edb
+  -       vpcId: vpc-06384df37be8dd29b
+  -     roleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     status: ACTIVE
+  -     storageConfig:
+  -       blockStorage:
+  -         enabled: true
+  -     tags:
+  -       96bulls:component: eks
+  -       96bulls:repo: AgentWorkforce/96BullSessions
+  -       96bulls:stack: aws-sessions-dev
+  -       alchemy::id: cluster
+  -       alchemy::stack: 96bulls-aws
+  -       alchemy::stage: aws-sessions-dev
+  -     upgradePolicy:
+  -       supportType: EXTENDED
+  -     version: "1.37"
+  +   cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: IngressClass
+      metadata:
+        name: alb-public
+      spec:
+        controller: eks.amazonaws.com/alb
+        parameters:
+          apiGroup: eks.amazonaws.com
+          kind: IngressClassParams
+          name: alb-public
+
+[alb-ingressclassparams] update
+  properties:
+  -   cluster:
+  -     accessConfig:
+  -       authenticationMode: API
+  -     certificateAuthorityData: <public cluster CA omitted>
+  -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+  -     clusterName: 96bulls-aws-sessions-dev
+  -     computeConfig:
+  -       enabled: true
+  -       nodePools:
+  -         - system
+  -         - general-purpose
+  -       nodeRoleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     connection:
+  -       auth:
+  -         clusterName: 96bulls-aws-sessions-dev
+  -         kind: aws-eks
+  -         region: us-west-2
+  -       certificateAuthorityData: <public cluster CA omitted>
+  -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     deletionProtection: false
+  -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     kubernetesNetworkConfig:
+  -       elasticLoadBalancing:
+  -         enabled: true
+  -       ipFamily: ipv4
+  -       serviceIpv4Cidr: 172.20.0.0/16
+  -     kubernetesObjects: []
+  -     logging:
+  -       clusterLogging:
+  -         - enabled: false
+  -           types:
+  -             - api
+  -             - audit
+  -             - authenticator
+  -             - controllerManager
+  -             - scheduler
+  -     managedClusterRoleName: 96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     managedNodeRoleName: 96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     oidcIssuer: https://oidc.eks.us-west-2.amazonaws.com/id/838C2CB6BC90E437DC58EA312C240377
+  -     platformVersion: eks.7
+  -     resourcesVpcConfig:
+  -       clusterSecurityGroupId: sg-01edabfa69d20db0b
+  -       endpointPrivateAccess: false
+  -       endpointPublicAccess: true
+  -       publicAccessCidrs:
+  -         - 0.0.0.0/0
+  -       securityGroupIds: []
+  -       subnetIds:
+  -         - subnet-0bef62a2d4aa5ee55
+  -         - subnet-0edd96e6b40736edb
+  -       vpcId: vpc-06384df37be8dd29b
+  -     roleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     status: ACTIVE
+  -     storageConfig:
+  -       blockStorage:
+  -         enabled: true
+  -     tags:
+  -       96bulls:component: eks
+  -       96bulls:repo: AgentWorkforce/96BullSessions
+  -       96bulls:stack: aws-sessions-dev
+  -       alchemy::id: cluster
+  -       alchemy::stack: 96bulls-aws
+  -       alchemy::stage: aws-sessions-dev
+  -     upgradePolicy:
+  -       supportType: EXTENDED
+  -     version: "1.37"
+  +   cluster: (known after apply)
+    manifest:
+      apiVersion: eks.amazonaws.com/v1
+      kind: IngressClassParams
+      metadata:
+        name: alb-public
+      spec:
+  +       loadBalancerAttributes:
+  +         - key: access_logs.s3.enabled
+  +           value: "true"
+  +         - key: access_logs.s3.bucket
+  +           value: (known after apply)
+  +         - key: access_logs.s3.prefix
+  +           value: ingest
+  +         - key: routing.http.drop_invalid_header_fields.enabled
+  +           value: "true"
+        scheme: internet-facing
+
+[alb-logs] create
+  properties:
+    bucketName: 96bulls-aws-sessions-dev-alb-logs-500268966557
+    encryption:
+      sseAlgorithm: AES256
+    lifecycleRules:
+      - Expiration:
+          Days: 90
+        Filter:
+          Prefix: ""
+        ID: expire-access-logs
+        NoncurrentVersionExpiration:
+          NoncurrentDays: 7
+        Status: Enabled
+    policy:
+      - Action:
+          - s3:*
+        Condition:
+          Bool:
+            aws:SecureTransport: "false"
+        Effect: Deny
+        Principal: "*"
+        Resource:
+          - arn:aws:s3:::96bulls-aws-sessions-dev-alb-logs-500268966557
+          - arn:aws:s3:::96bulls-aws-sessions-dev-alb-logs-500268966557/*
+        Sid: DenyInsecureTransport
+      - Action:
+          - s3:PutObject
+        Effect: Allow
+        Principal:
+          AWS: arn:aws:iam::797873946194:root
+        Resource:
+          - arn:aws:s3:::96bulls-aws-sessions-dev-alb-logs-500268966557/ingest/AWSLogs/500268966557/*
+        Sid: ElbAccountWritesLogs
+      - Action:
+          - s3:PutObject
+        Effect: Allow
+        Principal:
+          Service: logdelivery.elasticloadbalancing.amazonaws.com
+        Resource:
+          - arn:aws:s3:::96bulls-aws-sessions-dev-alb-logs-500268966557/ingest/AWSLogs/500268966557/*
+        Sid: ElbServiceWritesLogs
+    publicAccessBlock:
+      blockPublicAcls: true
+      blockPublicPolicy: true
+      ignorePublicAcls: true
+      restrictPublicBuckets: true
+    tags:
+      96bulls:component: eks
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+    versioning: Enabled
+
+[alleyoop-role] create
+  properties:
+    assumeRolePolicyDocument:
+      Statement:
+        - Action:
+            - sts:AssumeRole
+            - sts:TagSession
+          Condition:
+            ArnEquals:
+              aws:SourceArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+            StringEquals:
+              aws:SourceAccount: "500268966557"
+          Effect: Allow
+          Principal:
+            Service: pods.eks.amazonaws.com
+      Version: 2012-10-17
+    description: "96bulls aws-sessions-dev: AlleyOop ingest: read sessions, write raw chunks and manifests (Pod Identity 96bulls/96bulls-alleyoop)"
+    inlinePolicies:
+      locker:
+        Statement:
+          - Action:
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557
+            Sid: ListForMissingKeySemantics
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557/v1/*
+            Sid: ReadSessionObjects
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557/v1/*/raw/*
+              - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557/v1/*/manifest.json
+            Sid: WriteRawChunksAndManifests
+          - Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Condition:
+              StringEquals:
+                kms:ViaService: s3.us-west-2.amazonaws.com
+            Effect: Allow
+            Resource:
+              - arn:aws:kms:us-west-2:500268966557:key/e65a51de-b114-4f8f-a8c5-bcf719a0b1f8
+            Sid: LockerKeyReadWriteViaS3
+        Version: 2012-10-17
+    maxSessionDuration: 1 hour
+    roleName: 96bulls-aws-sessions-dev-alleyoop
+    tags:
+      96bulls:component: eks
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:service-account: 96bulls/96bulls-alleyoop
+      96bulls:stack: aws-sessions-dev
+
+[budget] noop
+
+[cert-manager] create
+  properties:
+    chart: cert-manager
+    cluster: (known after apply)
+    createNamespace: true
+    namespace: cert-manager
+    releaseName: cert-manager
+    repo: https://charts.jetstack.io
+    values:
+      acmesolver:
+        image:
+          digest: sha256:c8c1225bb2fe8ab37a330b77f0d8c2ee6a41210fcb54fc07ca606ab9a022b8b7
+      cainjector:
+        image:
+          digest: sha256:083d0e906f8eb44e255fe4ff817ae54e49f9ed82e22f1011bb4e9e4f4b8a641f
+      crds:
+        enabled: true
+        keep: true
+      enableCertificateOwnerRef: true
+      image:
+        digest: sha256:9f4f96a33c7774cef24466fcd85031997531a03a8d117f151126baa8d1290dcc
+      startupapicheck:
+        enabled: false
+      webhook:
+        image:
+          digest: sha256:055ac8e9de6a0ba6763794838fe38944acc650f68ebe1b01dd8be079e580f458
+    version: v1.21.3
+
+[cluster] update
+  properties:
+    clusterName: 96bulls-aws-sessions-dev
+    compute: auto
+    deletionProtection: false
+  +   logging:
+  +     clusterLogging:
+  +       - enabled: true
+  +         types:
+  +           - api
+  +           - audit
+  +           - authenticator
+  +           - controllerManager
+  +           - scheduler
+    resourcesVpcConfig:
+  +     endpointPrivateAccess: true
+  +     endpointPublicAccess: true
+  +     publicAccessCidrs:
+  +       - operator-address-redacted/32
+      subnetIds:
+        - subnet-0bef62a2d4aa5ee55
+        - subnet-0edd96e6b40736edb
+    tags:
+      96bulls:component: eks
+  +     96bulls:control-plane-logs: (known after apply)
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+
+[control-plane-logs] adopted
+  no declared property changes
+
+[deployer] update
+  properties:
+    assumeRolePolicyDocument:
+  -     Statement:
+  -       - Action:
+  -           - sts:AssumeRoleWithWebIdentity
+  -         Condition:
+  -           StringEquals:
+  -             token.actions.githubusercontent.com:aud: sts.amazonaws.com
+  -             token.actions.githubusercontent.com:sub:
+  -               - repo:AgentWorkforce@252050005/96BullSessions@1437714333:environment:image-publish
+  -               - repo:AgentWorkforce@252050005/96BullSessions@1437714333:environment:deploy-aws-sessions-dev
+  -         Effect: Allow
+  -         Principal:
+  -           Federated: arn:aws:iam::500268966557:oidc-provider/token.actions.githubusercontent.com
+  +     Statement:
+  +       - Action:
+  +           - sts:AssumeRoleWithWebIdentity
+  +         Condition:
+  +           StringEquals:
+  +             token.actions.githubusercontent.com:aud: sts.amazonaws.com
+  +             token.actions.githubusercontent.com:sub: repo:AgentWorkforce@252050005/96BullSessions@1437714333:environment:image-publish
+  +         Effect: Allow
+  +         Principal:
+  +           Federated: arn:aws:iam::500268966557:oidc-provider/token.actions.githubusercontent.com
+      Version: 2012-10-17
+  -   description: 96bulls aws-sessions-dev deployer, assumed only by GitHub Actions for AgentWorkforce/96BullSessions
+  +   description: "96bulls aws-sessions-dev: ECR push of the services image, assumed only by AgentWorkforce/96BullSessions jobs in the image-publish environment"
+    inlinePolicies:
+      ecrPush:
+  -       Statement:
+  -         - Action:
+  -             - ecr:GetAuthorizationToken
+  -           Effect: Allow
+  -           Resource: "*"
+  -         - Action:
+  -             - ecr:BatchCheckLayerAvailability
+  -             - ecr:InitiateLayerUpload
+  -             - ecr:UploadLayerPart
+  -             - ecr:CompleteLayerUpload
+  -             - ecr:PutImage
+  -             - ecr:BatchGetImage
+  -             - ecr:DescribeImages
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:ecr:us-west-2:500268966557:repository/96bulls-services
+  +       Statement:
+  +         - Action:
+  +             - ecr:GetAuthorizationToken
+  +           Effect: Allow
+  +           Resource:
+  +             - "*"
+  +           Sid: EcrLogin
+  +         - Action:
+  +             - ecr:BatchCheckLayerAvailability
+  +             - ecr:InitiateLayerUpload
+  +             - ecr:UploadLayerPart
+  +             - ecr:CompleteLayerUpload
+  +             - ecr:PutImage
+  +             - ecr:BatchGetImage
+  +             - ecr:DescribeImages
+  +           Effect: Allow
+  +           Resource:
+  +             - arn:aws:ecr:us-west-2:500268966557:repository/96bulls-services
+  +           Sid: PushServicesImage
+        Version: 2012-10-17
+  -     locker:
+  -       Statement:
+  -         - Action:
+  -             - s3:ListBucket
+  -             - s3:GetBucketLocation
+  -             - s3:GetBucketVersioning
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557
+  -         - Action:
+  -             - s3:GetObject
+  -             - s3:GetObjectVersion
+  -             - s3:PutObject
+  -             - s3:DeleteObject
+  -             - s3:ListBucketVersions
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557/*
+  -         - Action:
+  -             - kms:Encrypt
+  -             - kms:Decrypt
+  -             - kms:GenerateDataKey*
+  -             - kms:DescribeKey
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:kms:us-west-2:500268966557:key/e65a51de-b114-4f8f-a8c5-bcf719a0b1f8
+  -       Version: 2012-10-17
+    maxSessionDuration: 1 hour
+    roleName: 96bulls-aws-sessions-dev-deployer
+    tags:
+      96bulls:component: iam
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+
+[external-dns] update
+  properties:
+    chart: external-dns
+  -   cluster:
+  -     accessConfig:
+  -       authenticationMode: API
+  -     certificateAuthorityData: <public cluster CA omitted>
+  -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+  -     clusterName: 96bulls-aws-sessions-dev
+  -     computeConfig:
+  -       enabled: true
+  -       nodePools:
+  -         - system
+  -         - general-purpose
+  -       nodeRoleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     connection:
+  -       auth:
+  -         clusterName: 96bulls-aws-sessions-dev
+  -         kind: aws-eks
+  -         region: us-west-2
+  -       certificateAuthorityData: <public cluster CA omitted>
+  -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     deletionProtection: false
+  -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     kubernetesNetworkConfig:
+  -       elasticLoadBalancing:
+  -         enabled: true
+  -       ipFamily: ipv4
+  -       serviceIpv4Cidr: 172.20.0.0/16
+  -     kubernetesObjects: []
+  -     logging:
+  -       clusterLogging:
+  -         - enabled: false
+  -           types:
+  -             - api
+  -             - audit
+  -             - authenticator
+  -             - controllerManager
+  -             - scheduler
+  -     managedClusterRoleName: 96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     managedNodeRoleName: 96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     oidcIssuer: https://oidc.eks.us-west-2.amazonaws.com/id/838C2CB6BC90E437DC58EA312C240377
+  -     platformVersion: eks.7
+  -     resourcesVpcConfig:
+  -       clusterSecurityGroupId: sg-01edabfa69d20db0b
+  -       endpointPrivateAccess: false
+  -       endpointPublicAccess: true
+  -       publicAccessCidrs:
+  -         - 0.0.0.0/0
+  -       securityGroupIds: []
+  -       subnetIds:
+  -         - subnet-0bef62a2d4aa5ee55
+  -         - subnet-0edd96e6b40736edb
+  -       vpcId: vpc-06384df37be8dd29b
+  -     roleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     status: ACTIVE
+  -     storageConfig:
+  -       blockStorage:
+  -         enabled: true
+  -     tags:
+  -       96bulls:component: eks
+  -       96bulls:repo: AgentWorkforce/96BullSessions
+  -       96bulls:stack: aws-sessions-dev
+  -       alchemy::id: cluster
+  -       alchemy::stack: 96bulls-aws
+  -       alchemy::stage: aws-sessions-dev
+  -     upgradePolicy:
+  -       supportType: EXTENDED
+  -     version: "1.37"
+  +   cluster: (known after apply)
+    namespace: kube-system
+    releaseName: external-dns
+    repo: https://kubernetes-sigs.github.io/external-dns
+    values:
+      domainFilters:
+        - agentrelay.com
+      env:
+        - name: CF_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: token
+              name: cloudflare-dns
+      extraArgs:
+        - --cloudflare-dns-records-per-page=5000
+      policy: upsert-only
+      provider:
+        name: cloudflare
+      sources:
+        - ingress
+      txtOwnerId: 96bulls-aws-sessions-dev
+      txtPrefix: _externaldns.
+    version: 1.23.0
+
+[github-oidc] noop
+
+[ingest-cert] noop
+
+[ingest-cert-validation] noop
+
+[ingest-ingress] update
+  properties:
+  -   cluster:
+  -     accessConfig:
+  -       authenticationMode: API
+  -     certificateAuthorityData: <public cluster CA omitted>
+  -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+  -     clusterName: 96bulls-aws-sessions-dev
+  -     computeConfig:
+  -       enabled: true
+  -       nodePools:
+  -         - system
+  -         - general-purpose
+  -       nodeRoleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     connection:
+  -       auth:
+  -         clusterName: 96bulls-aws-sessions-dev
+  -         kind: aws-eks
+  -         region: us-west-2
+  -       certificateAuthorityData: <public cluster CA omitted>
+  -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     deletionProtection: false
+  -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     kubernetesNetworkConfig:
+  -       elasticLoadBalancing:
+  -         enabled: true
+  -       ipFamily: ipv4
+  -       serviceIpv4Cidr: 172.20.0.0/16
+  -     kubernetesObjects: []
+  -     logging:
+  -       clusterLogging:
+  -         - enabled: false
+  -           types:
+  -             - api
+  -             - audit
+  -             - authenticator
+  -             - controllerManager
+  -             - scheduler
+  -     managedClusterRoleName: 96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     managedNodeRoleName: 96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     oidcIssuer: https://oidc.eks.us-west-2.amazonaws.com/id/838C2CB6BC90E437DC58EA312C240377
+  -     platformVersion: eks.7
+  -     resourcesVpcConfig:
+  -       clusterSecurityGroupId: sg-01edabfa69d20db0b
+  -       endpointPrivateAccess: false
+  -       endpointPublicAccess: true
+  -       publicAccessCidrs:
+  -         - 0.0.0.0/0
+  -       securityGroupIds: []
+  -       subnetIds:
+  -         - subnet-0bef62a2d4aa5ee55
+  -         - subnet-0edd96e6b40736edb
+  -       vpcId: vpc-06384df37be8dd29b
+  -     roleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     status: ACTIVE
+  -     storageConfig:
+  -       blockStorage:
+  -         enabled: true
+  -     tags:
+  -       96bulls:component: eks
+  -       96bulls:repo: AgentWorkforce/96BullSessions
+  -       96bulls:stack: aws-sessions-dev
+  -       alchemy::id: cluster
+  -       alchemy::stack: 96bulls-aws
+  -       alchemy::stage: aws-sessions-dev
+  -     upgradePolicy:
+  -       supportType: EXTENDED
+  -     version: "1.37"
+  +   cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        annotations:
+          alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-west-2:500268966557:certificate/ef7fc08c-12f6-405c-a974-59f16742c3ea
+          alb.ingress.kubernetes.io/healthcheck-path: /healthz
+          alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+          alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+          alb.ingress.kubernetes.io/target-type: ip
+  +         alb.ingress.kubernetes.io/wafv2-acl-arn: (known after apply)
+          external-dns.alpha.kubernetes.io/hostname: sessions-dev.agentrelay.com
+        name: 96bulls-ingest
+        namespace: 96bulls
+      spec:
+        ingressClassName: alb-public
+        rules:
+          - host: sessions-dev.agentrelay.com
+            http:
+              paths:
+                - backend:
+                    service:
+                      name: 96bulls-alleyoop
+                      port:
+                        number: 8080
+                  path: /
+                  pathType: Prefix
+
+[ingest-waf] create
+  properties:
+    defaultAction:
+      Allow: {}
+    description: "96bulls aws-sessions-dev: ingest ALB (managed rules, per-IP rate limit, operator routes blocked)"
+    rules:
+      - Name: AWSManagedRulesAmazonIpReputationList
+        OverrideAction:
+          None: {}
+        Priority: 0
+        Statement:
+          ManagedRuleGroupStatement:
+            Name: AWSManagedRulesAmazonIpReputationList
+            VendorName: AWS
+        VisibilityConfig:
+          CloudWatchMetricsEnabled: true
+          MetricName: AWSManagedRulesAmazonIpReputationList
+          SampledRequestsEnabled: true
+      - Name: AWSManagedRulesKnownBadInputsRuleSet
+        OverrideAction:
+          None: {}
+        Priority: 1
+        Statement:
+          ManagedRuleGroupStatement:
+            Name: AWSManagedRulesKnownBadInputsRuleSet
+            RuleActionOverrides:
+              - ActionToUse:
+                  Count: {}
+                Name: Log4JRCE_BODY
+              - ActionToUse:
+                  Count: {}
+                Name: JavaDeserializationRCE_BODY
+            VendorName: AWS
+        VisibilityConfig:
+          CloudWatchMetricsEnabled: true
+          MetricName: AWSManagedRulesKnownBadInputsRuleSet
+          SampledRequestsEnabled: true
+      - Name: AWSManagedRulesCommonRuleSet
+        OverrideAction:
+          None: {}
+        Priority: 2
+        Statement:
+          ManagedRuleGroupStatement:
+            Name: AWSManagedRulesCommonRuleSet
+            RuleActionOverrides:
+              - ActionToUse:
+                  Count: {}
+                Name: SizeRestrictions_BODY
+              - ActionToUse:
+                  Count: {}
+                Name: CrossSiteScripting_BODY
+              - ActionToUse:
+                  Count: {}
+                Name: GenericLFI_BODY
+              - ActionToUse:
+                  Count: {}
+                Name: GenericRFI_BODY
+              - ActionToUse:
+                  Count: {}
+                Name: EC2MetaDataSSRF_BODY
+            VendorName: AWS
+        VisibilityConfig:
+          CloudWatchMetricsEnabled: true
+          MetricName: AWSManagedRulesCommonRuleSet
+          SampledRequestsEnabled: true
+      - Action:
+          Block: {}
+        Name: rate-limit-per-ip
+        Priority: 3
+        Statement:
+          RateBasedStatement:
+            AggregateKeyType: IP
+            EvaluationWindowSec: 300
+            Limit: 2000
+        VisibilityConfig:
+          CloudWatchMetricsEnabled: true
+          MetricName: rate-limit-per-ip
+          SampledRequestsEnabled: true
+      - Action:
+          Block: {}
+        Name: block-operator-routes
+        Priority: 4
+        Statement:
+          ByteMatchStatement:
+            FieldToMatch:
+              UriPath: {}
+            PositionalConstraint: STARTS_WITH
+            SearchString: /v1/internal/
+            TextTransformations:
+              - Priority: 0
+                Type: URL_DECODE
+              - Priority: 1
+                Type: LOWERCASE
+        VisibilityConfig:
+          CloudWatchMetricsEnabled: true
+          MetricName: block-operator-routes
+          SampledRequestsEnabled: true
+    scope: REGIONAL
+    tags:
+      96bulls:component: eks
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+    visibilityConfig:
+      CloudWatchMetricsEnabled: true
+      MetricName: 96bulls-aws-sessions-dev-ingest
+      SampledRequestsEnabled: true
+    webAclName: 96bulls-aws-sessions-dev-ingest
+
+[network/InternetGateway] noop
+
+[locker] update
+  properties:
+    bucketName: 96bulls-aws-sessions-dev-locker-500268966557
+    encryption:
+      bucketKeyEnabled: true
+      kmsMasterKeyId: arn:aws:kms:us-west-2:500268966557:key/e65a51de-b114-4f8f-a8c5-bcf719a0b1f8
+      sseAlgorithm: aws:kms
+  +   lifecycleRules:
+  +     - AbortIncompleteMultipartUpload:
+  +         DaysAfterInitiation: 7
+  +       Filter:
+  +         Prefix: ""
+  +       ID: abort-incomplete-uploads
+  +       Status: Enabled
+  +   policy:
+  +     - Action:
+  +         - s3:*
+  +       Condition:
+  +         Bool:
+  +           aws:SecureTransport: "false"
+  +       Effect: Deny
+  +       Principal: "*"
+  +       Resource:
+  +         - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557
+  +         - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557/*
+  +       Sid: DenyInsecureTransport
+    publicAccessBlock:
+      blockPublicAcls: true
+      blockPublicPolicy: true
+      ignorePublicAcls: true
+      restrictPublicBuckets: true
+    tags:
+      96bulls:component: locker
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+    versioning: Enabled
+
+[locker-key] noop
+
+[locker-key-alias] noop
+
+[network/NatEip] noop
+
+[network/NatGateway] noop
+
+[netpol-96bulls-allow-alleyoop-from-alb] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: allow-alleyoop-from-alb
+        namespace: 96bulls
+      spec:
+        ingress:
+          - from:
+              - ipBlock:
+                  cidr: 10.42.0.0/24
+              - ipBlock:
+                  cidr: 10.42.1.0/24
+            ports:
+              - port: 8080
+                protocol: TCP
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/instance: 96bulls
+            app.kubernetes.io/name: alleyoop
+        policyTypes:
+          - Ingress
+
+[netpol-96bulls-allow-dns] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: allow-dns
+        namespace: 96bulls
+      spec:
+        egress:
+          - ports:
+              - port: 53
+                protocol: UDP
+              - port: 53
+                protocol: TCP
+        podSelector: {}
+        policyTypes:
+          - Egress
+
+[netpol-96bulls-allow-health-ports-from-vpc] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: allow-health-ports-from-vpc
+        namespace: 96bulls
+      spec:
+        ingress:
+          - from:
+              - ipBlock:
+                  cidr: 10.42.0.0/16
+            ports:
+              - port: 8081
+                protocol: TCP
+              - port: 13133
+                protocol: TCP
+        podSelector: {}
+        policyTypes:
+          - Ingress
+
+[netpol-96bulls-allow-https-egress] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: allow-https-egress
+        namespace: 96bulls
+      spec:
+        egress:
+          - ports:
+              - port: 443
+                protocol: TCP
+            to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - 169.254.169.254/32
+        podSelector: {}
+        policyTypes:
+          - Egress
+
+[netpol-96bulls-allow-otlp-egress] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: allow-otlp-egress
+        namespace: 96bulls
+      spec:
+        egress:
+          - ports:
+              - port: 4317
+                protocol: TCP
+              - port: 4318
+                protocol: TCP
+            to:
+              - podSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: 96bulls
+                    app.kubernetes.io/name: otel
+        podSelector:
+          matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values:
+                - worker
+                - alleyoop
+        policyTypes:
+          - Egress
+
+[netpol-96bulls-allow-otlp-in-namespace] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: allow-otlp-in-namespace
+        namespace: 96bulls
+      spec:
+        ingress:
+          - from:
+              - podSelector: {}
+            ports:
+              - port: 4317
+                protocol: TCP
+              - port: 4318
+                protocol: TCP
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/instance: 96bulls
+            app.kubernetes.io/name: otel
+        policyTypes:
+          - Ingress
+
+[netpol-96bulls-allow-pod-identity-agent] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: allow-pod-identity-agent
+        namespace: 96bulls
+      spec:
+        egress:
+          - ports:
+              - port: 80
+                protocol: TCP
+            to:
+              - ipBlock:
+                  cidr: 169.254.170.23/32
+        podSelector: {}
+        policyTypes:
+          - Egress
+
+[netpol-96bulls-allow-postgres-egress] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: allow-postgres-egress
+        namespace: 96bulls
+      spec:
+        egress:
+          - ports:
+              - port: 5432
+                protocol: TCP
+              - port: 6543
+                protocol: TCP
+            to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - 169.254.169.254/32
+        podSelector:
+          matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values:
+                - worker
+                - alleyoop
+        policyTypes:
+          - Egress
+
+[netpol-96bulls-allow-relayauth-egress] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: allow-relayauth-egress
+        namespace: 96bulls
+      spec:
+        egress:
+          - ports:
+              - port: 8787
+                protocol: TCP
+            to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: relayauth
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/instance: 96bulls
+            app.kubernetes.io/name: alleyoop
+        policyTypes:
+          - Egress
+
+[netpol-96bulls-allow-relayauth-tls-egress] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: allow-relayauth-tls-egress
+        namespace: 96bulls
+      spec:
+        egress:
+          - ports:
+              - port: 8443
+                protocol: TCP
+            to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: relayauth
+                podSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: relayauth-tls
+                    app.kubernetes.io/part-of: relayauth
+        podSelector:
+          matchLabels:
+            relayauth.agentrelay.com/client: tls
+        policyTypes:
+          - Egress
+
+[netpol-96bulls-default-deny] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: 96bulls
+        name: default-deny
+        namespace: 96bulls
+      spec:
+        podSelector: {}
+        policyTypes:
+          - Ingress
+          - Egress
+
+[netpol-relayauth-allow-dns] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: relayauth
+        name: allow-dns
+        namespace: relayauth
+      spec:
+        egress:
+          - ports:
+              - port: 53
+                protocol: UDP
+              - port: 53
+                protocol: TCP
+        podSelector: {}
+        policyTypes:
+          - Egress
+
+[netpol-relayauth-allow-proxy-to-relayauth] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: relayauth
+        name: allow-proxy-to-relayauth
+        namespace: relayauth
+      spec:
+        egress:
+          - ports:
+              - port: 8787
+                protocol: TCP
+            to:
+              - podSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: relayauth
+                    app.kubernetes.io/name: relayauth
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: relayauth-tls
+            app.kubernetes.io/part-of: relayauth
+        policyTypes:
+          - Egress
+
+[netpol-relayauth-allow-relayauth-from-proxy-and-jwks] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: relayauth
+        name: allow-relayauth-from-proxy-and-jwks
+        namespace: relayauth
+      spec:
+        ingress:
+          - from:
+              - podSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: relayauth-tls
+                    app.kubernetes.io/part-of: relayauth
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: 96bulls
+                podSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: 96bulls
+                    app.kubernetes.io/name: alleyoop
+            ports:
+              - port: 8787
+                protocol: TCP
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/instance: relayauth
+            app.kubernetes.io/name: relayauth
+        policyTypes:
+          - Ingress
+
+[netpol-relayauth-allow-tls-clients] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: relayauth
+        name: allow-tls-clients
+        namespace: relayauth
+      spec:
+        ingress:
+          - from:
+              - namespaceSelector:
+                  matchExpressions:
+                    - key: kubernetes.io/metadata.name
+                      operator: In
+                      values:
+                        - 96bulls
+                        - relayhistory
+                podSelector:
+                  matchLabels:
+                    relayauth.agentrelay.com/client: tls
+            ports:
+              - port: 8443
+                protocol: TCP
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: relayauth-tls
+            app.kubernetes.io/part-of: relayauth
+        policyTypes:
+          - Ingress
+
+[netpol-relayauth-default-deny] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: relayauth
+        name: default-deny
+        namespace: relayauth
+      spec:
+        podSelector: {}
+        policyTypes:
+          - Ingress
+          - Egress
+
+[pod-identity-96bulls-alleyoop] update
+  properties:
+    clusterName: 96bulls-aws-sessions-dev
+    namespace: 96bulls
+  -   roleArn: arn:aws:iam::500268966557:role/96bulls-aws-sessions-dev-pods
+  +   roleArn: (known after apply)
+    serviceAccount: 96bulls-alleyoop
+    tags:
+      96bulls:component: eks
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+
+[pod-identity-96bulls-search-worker] create
+  properties:
+    clusterName: 96bulls-aws-sessions-dev
+    namespace: 96bulls
+    roleArn: (known after apply)
+    serviceAccount: 96bulls-search-worker
+    tags:
+      96bulls:component: eks
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+
+[pod-identity-96bulls-worker] update
+  properties:
+    clusterName: 96bulls-aws-sessions-dev
+    namespace: 96bulls
+  -   roleArn: arn:aws:iam::500268966557:role/96bulls-aws-sessions-dev-pods
+  +   roleArn: (known after apply)
+    serviceAccount: 96bulls-worker
+    tags:
+      96bulls:component: eks
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+
+[pod-identity-otel] noop
+
+[pods-role] noop
+
+[network/PrivateInternetRoute] noop
+
+[network/PrivateRouteTable] noop
+
+[network/PrivateSubnet1] noop
+
+[network/PrivateSubnet2] noop
+
+[network/PrivateSubnetAssociation1] noop
+
+[network/PrivateSubnetAssociation2] noop
+
+[network/PublicInternetRoute] noop
+
+[network/PublicRouteTable] noop
+
+[network/PublicSubnet1] noop
+
+[network/PublicSubnet2] noop
+
+[network/PublicSubnetAssociation1] noop
+
+[network/PublicSubnetAssociation2] noop
+
+[relayauth] update
+  properties:
+    chart: oci://ghcr.io/agentworkforce/charts/relayauth
+  -   cluster:
+  -     accessConfig:
+  -       authenticationMode: API
+  -     certificateAuthorityData: <public cluster CA omitted>
+  -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+  -     clusterName: 96bulls-aws-sessions-dev
+  -     computeConfig:
+  -       enabled: true
+  -       nodePools:
+  -         - system
+  -         - general-purpose
+  -       nodeRoleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     connection:
+  -       auth:
+  -         clusterName: 96bulls-aws-sessions-dev
+  -         kind: aws-eks
+  -         region: us-west-2
+  -       certificateAuthorityData: <public cluster CA omitted>
+  -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     deletionProtection: false
+  -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     kubernetesNetworkConfig:
+  -       elasticLoadBalancing:
+  -         enabled: true
+  -       ipFamily: ipv4
+  -       serviceIpv4Cidr: 172.20.0.0/16
+  -     kubernetesObjects: []
+  -     logging:
+  -       clusterLogging:
+  -         - enabled: false
+  -           types:
+  -             - api
+  -             - audit
+  -             - authenticator
+  -             - controllerManager
+  -             - scheduler
+  -     managedClusterRoleName: 96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     managedNodeRoleName: 96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     oidcIssuer: https://oidc.eks.us-west-2.amazonaws.com/id/838C2CB6BC90E437DC58EA312C240377
+  -     platformVersion: eks.7
+  -     resourcesVpcConfig:
+  -       clusterSecurityGroupId: sg-01edabfa69d20db0b
+  -       endpointPrivateAccess: false
+  -       endpointPublicAccess: true
+  -       publicAccessCidrs:
+  -         - 0.0.0.0/0
+  -       securityGroupIds: []
+  -       subnetIds:
+  -         - subnet-0bef62a2d4aa5ee55
+  -         - subnet-0edd96e6b40736edb
+  -       vpcId: vpc-06384df37be8dd29b
+  -     roleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     status: ACTIVE
+  -     storageConfig:
+  -       blockStorage:
+  -         enabled: true
+  -     tags:
+  -       96bulls:component: eks
+  -       96bulls:repo: AgentWorkforce/96BullSessions
+  -       96bulls:stack: aws-sessions-dev
+  -       alchemy::id: cluster
+  -       alchemy::stack: 96bulls-aws
+  -       alchemy::stage: aws-sessions-dev
+  -     upgradePolicy:
+  -       supportType: EXTENDED
+  -     version: "1.37"
+  +   cluster: (known after apply)
+    createNamespace: true
+    namespace: relayauth
+    releaseName: relayauth
+    values:
+      baseUrl: http://relayauth.relayauth.svc:8787
+      existingSecret: relayauth
+      issuer: http://relayauth.relayauth.svc:8787
+      jwksIngress:
+        enabled: false
+      networkPolicy:
+        enabled: true
+  -       ingressFrom:
+  -         - namespaceSelector:
+  -             matchLabels:
+  -               kubernetes.io/metadata.name: 96bulls
+  +       ingressFrom:
+  +         - podSelector:
+  +             matchLabels:
+  +               app.kubernetes.io/name: relayauth-tls
+  +               app.kubernetes.io/part-of: relayauth
+  +         - namespaceSelector:
+  +             matchLabels:
+  +               kubernetes.io/metadata.name: 96bulls
+  +           podSelector:
+  +             matchLabels:
+  +               app.kubernetes.io/instance: 96bulls
+  +               app.kubernetes.io/name: alleyoop
+      persistence:
+        size: 1Gi
+        storageClass: 96bulls-gp3
+    version: 0.1.0
+
+[relayauth-tls-certificate-relayauth-ca] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: (known after apply)
+        name: relayauth-ca
+        namespace: relayauth
+      spec:
+        commonName: 96bulls relayauth in-cluster CA
+        duration: 8760h
+        isCA: true
+        issuerRef:
+          kind: Issuer
+          name: relayauth-selfsigned
+        privateKey:
+          algorithm: ECDSA
+          rotationPolicy: Always
+          size: 256
+        renewBefore: 720h
+        secretName: relayauth-ca
+
+[relayauth-tls-certificate-relayauth-tls] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: (known after apply)
+        name: relayauth-tls
+        namespace: relayauth
+      spec:
+        dnsNames:
+          - relayauth-tls.relayauth.svc
+          - relayauth-tls.relayauth.svc.cluster.local
+        duration: 2160h
+        issuerRef:
+          kind: Issuer
+          name: relayauth-ca
+        privateKey:
+          algorithm: ECDSA
+          rotationPolicy: Always
+          size: 256
+        renewBefore: 720h
+        secretName: relayauth-tls
+        usages:
+          - server auth
+          - digital signature
+          - key encipherment
+
+[relayauth-tls-configmap] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: v1
+      data:
+        nginx.conf: |
+          pid /tmp/nginx.pid;
+          worker_processes 1;
+          events { worker_connections 256; }
+          http {
+            access_log off;
+            server_tokens off;
+            client_body_temp_path /tmp/client_body;
+            proxy_temp_path /tmp/proxy;
+            fastcgi_temp_path /tmp/fastcgi;
+            uwsgi_temp_path /tmp/uwsgi;
+            scgi_temp_path /tmp/scgi;
+            map $ssl_server_name $tls_dir { default /etc/relayauth-tls; }
+            server {
+              listen 8443 ssl;
+              ssl_protocols TLSv1.3;
+              ssl_certificate $tls_dir/tls.crt;
+              ssl_certificate_key $tls_dir/tls.key;
+              client_max_body_size 1m;
+              location = /healthz { access_log off; return 200 'ok'; }
+              location / {
+                proxy_pass http://relayauth.relayauth.svc:8787;
+                proxy_set_header Host relayauth.relayauth.svc:8787;
+                proxy_set_header X-Forwarded-Proto https;
+              }
+            }
+          }
+      kind: ConfigMap
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: relayauth
+        labels:
+          app.kubernetes.io/name: relayauth-tls
+          app.kubernetes.io/part-of: relayauth
+        name: relayauth-tls-nginx
+        namespace: relayauth
+
+[relayauth-tls-deployment] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: relayauth
+        labels:
+          app.kubernetes.io/name: relayauth-tls
+          app.kubernetes.io/part-of: relayauth
+        name: relayauth-tls
+        namespace: relayauth
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app.kubernetes.io/name: relayauth-tls
+            app.kubernetes.io/part-of: relayauth
+        template:
+          metadata:
+            labels:
+              app.kubernetes.io/name: relayauth-tls
+              app.kubernetes.io/part-of: relayauth
+          spec:
+            affinity:
+              podAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/instance: relayauth
+                        app.kubernetes.io/name: relayauth
+                    topologyKey: kubernetes.io/hostname
+            automountServiceAccountToken: false
+            containers:
+              - args:
+                  - nginx
+                  - -g
+                  - daemon off;
+                  - -c
+                  - /etc/nginx-relayauth/nginx.conf
+                image: nginxinc/nginx-unprivileged:1.29.3-alpine@sha256:5aea7cc516b419e3526f47dd1531be31a56a046cfe44754d94f9383e13e2ee99
+                imagePullPolicy: IfNotPresent
+                livenessProbe:
+                  periodSeconds: 20
+                  tcpSocket:
+                    port: https
+                name: tls
+                ports:
+                  - containerPort: 8443
+                    name: https
+                    protocol: TCP
+                readinessProbe:
+                  periodSeconds: 10
+                  tcpSocket:
+                    port: https
+                resources:
+                  limits:
+                    memory: 64Mi
+                  requests:
+                    cpu: 10m
+                    memory: 16Mi
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop:
+                      - ALL
+                  readOnlyRootFilesystem: true
+                volumeMounts:
+                  - mountPath: /etc/nginx-relayauth
+                    name: conf
+                    readOnly: true
+                  - mountPath: /etc/relayauth-tls
+                    name: tls
+                    readOnly: true
+                  - mountPath: /tmp
+                    name: tmp
+            securityContext:
+              runAsGroup: 101
+              runAsNonRoot: true
+              runAsUser: 101
+              seccompProfile:
+                type: RuntimeDefault
+            serviceAccountName: relayauth-tls
+            volumes:
+              - configMap:
+                  name: relayauth-tls-nginx
+                name: conf
+              - name: tls
+                secret:
+                  items:
+                    - key: tls.crt
+                      path: tls.crt
+                    - key: tls.key
+                      path: tls.key
+                  secretName: relayauth-tls
+              - emptyDir:
+                  sizeLimit: 16Mi
+                name: tmp
+
+[relayauth-tls-issuer-relayauth-ca] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: cert-manager.io/v1
+      kind: Issuer
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: (known after apply)
+        name: relayauth-ca
+        namespace: relayauth
+      spec:
+        ca:
+          secretName: relayauth-ca
+
+[relayauth-tls-issuer-relayauth-selfsigned] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: cert-manager.io/v1
+      kind: Issuer
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: (known after apply)
+        name: relayauth-selfsigned
+        namespace: relayauth
+      spec:
+        selfSigned: {}
+
+[relayauth-tls-service] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: relayauth
+        labels:
+          app.kubernetes.io/name: relayauth-tls
+          app.kubernetes.io/part-of: relayauth
+        name: relayauth-tls
+        namespace: relayauth
+      spec:
+        ports:
+          - name: https
+            port: 8443
+            protocol: TCP
+            targetPort: https
+        selector:
+          app.kubernetes.io/name: relayauth-tls
+          app.kubernetes.io/part-of: relayauth
+        type: ClusterIP
+
+[relayauth-tls-serviceaccount] create
+  properties:
+    cluster: (known after apply)
+    manifest:
+      apiVersion: v1
+      automountServiceAccountToken: false
+      kind: ServiceAccount
+      metadata:
+        annotations:
+          96bulls.agentrelay.com/after-release: relayauth
+        labels:
+          app.kubernetes.io/name: relayauth-tls
+          app.kubernetes.io/part-of: relayauth
+        name: relayauth-tls
+        namespace: relayauth
+
+[network/S3Endpoint] noop
+
+[search-worker-role] create
+  properties:
+    assumeRolePolicyDocument:
+      Statement:
+        - Action:
+            - sts:AssumeRole
+            - sts:TagSession
+          Condition:
+            ArnEquals:
+              aws:SourceArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+            StringEquals:
+              aws:SourceAccount: "500268966557"
+          Effect: Allow
+          Principal:
+            Service: pods.eks.amazonaws.com
+      Version: 2012-10-17
+    description: "96bulls aws-sessions-dev: session directory search worker: HoopDb only, explicitly no Locker or KMS (Pod Identity 96bulls/96bulls-search-worker)"
+    inlinePolicies:
+      no-locker:
+        Statement:
+          - Action:
+              - s3:*
+            Effect: Deny
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557
+              - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557/*
+            Sid: NoLockerAccess
+          - Action:
+              - kms:*
+            Effect: Deny
+            Resource:
+              - arn:aws:kms:us-west-2:500268966557:key/e65a51de-b114-4f8f-a8c5-bcf719a0b1f8
+            Sid: NoLockerKey
+        Version: 2012-10-17
+    maxSessionDuration: 1 hour
+    roleName: 96bulls-aws-sessions-dev-search-worker
+    tags:
+      96bulls:component: eks
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:service-account: 96bulls/96bulls-search-worker
+      96bulls:stack: aws-sessions-dev
+
+[services-image] noop
+
+[storageclass-gp3] update
+  properties:
+  -   cluster:
+  -     accessConfig:
+  -       authenticationMode: API
+  -     certificateAuthorityData: <public cluster CA omitted>
+  -     clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+  -     clusterName: 96bulls-aws-sessions-dev
+  -     computeConfig:
+  -       enabled: true
+  -       nodePools:
+  -         - system
+  -         - general-purpose
+  -       nodeRoleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     connection:
+  -       auth:
+  -         clusterName: 96bulls-aws-sessions-dev
+  -         kind: aws-eks
+  -         region: us-west-2
+  -       certificateAuthorityData: <public cluster CA omitted>
+  -       endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     deletionProtection: false
+  -     endpoint: https://838C2CB6BC90E437DC58EA312C240377.gr7.us-west-2.eks.amazonaws.com
+  -     kubernetesNetworkConfig:
+  -       elasticLoadBalancing:
+  -         enabled: true
+  -       ipFamily: ipv4
+  -       serviceIpv4Cidr: 172.20.0.0/16
+  -     kubernetesObjects: []
+  -     logging:
+  -       clusterLogging:
+  -         - enabled: false
+  -           types:
+  -             - api
+  -             - audit
+  -             - authenticator
+  -             - controllerManager
+  -             - scheduler
+  -     managedClusterRoleName: 96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     managedNodeRoleName: 96bulls-aws-cluster-node-role-aws-sessions-dev-uj4fmlubolwztqko
+  -     oidcIssuer: https://oidc.eks.us-west-2.amazonaws.com/id/838C2CB6BC90E437DC58EA312C240377
+  -     platformVersion: eks.7
+  -     resourcesVpcConfig:
+  -       clusterSecurityGroupId: sg-01edabfa69d20db0b
+  -       endpointPrivateAccess: false
+  -       endpointPublicAccess: true
+  -       publicAccessCidrs:
+  -         - 0.0.0.0/0
+  -       securityGroupIds: []
+  -       subnetIds:
+  -         - subnet-0bef62a2d4aa5ee55
+  -         - subnet-0edd96e6b40736edb
+  -       vpcId: vpc-06384df37be8dd29b
+  -     roleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-cluster-role-aws-sesop7l44n3uj4fmlubolwztqko
+  -     status: ACTIVE
+  -     storageConfig:
+  -       blockStorage:
+  -         enabled: true
+  -     tags:
+  -       96bulls:component: eks
+  -       96bulls:repo: AgentWorkforce/96BullSessions
+  -       96bulls:stack: aws-sessions-dev
+  -       alchemy::id: cluster
+  -       alchemy::stack: 96bulls-aws
+  -       alchemy::stage: aws-sessions-dev
+  -     upgradePolicy:
+  -       supportType: EXTENDED
+  -     version: "1.37"
+  +   cluster: (known after apply)
+    manifest:
+      allowVolumeExpansion: true
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: 96bulls-gp3
+      parameters:
+        encrypted: "true"
+        type: gp3
+      provisioner: ebs.csi.eks.amazonaws.com
+      reclaimPolicy: Retain
+      volumeBindingMode: WaitForFirstConsumer
+
+[telemetry-role] update
+  properties:
+    assumeRolePolicyDocument:
+  -     Statement:
+  -       - Action:
+  -           - sts:AssumeRole
+  -           - sts:TagSession
+  -         Effect: Allow
+  -         Principal:
+  -           Service: pods.eks.amazonaws.com
+  +     Statement:
+  +       - Action:
+  +           - sts:AssumeRole
+  +           - sts:TagSession
+  +         Condition:
+  +           ArnEquals:
+  +             aws:SourceArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+  +           StringEquals:
+  +             aws:SourceAccount: "500268966557"
+  +         Effect: Allow
+  +         Principal:
+  +           Service: pods.eks.amazonaws.com
+      Version: 2012-10-17
+  -   description: "96bulls aws-sessions-dev: OpenTelemetry collector writes trace batches to S3"
+  +   description: "96bulls aws-sessions-dev: OpenTelemetry collector writes trace batches to S3 (Pod Identity 96bulls/otel-collector)"
+    inlinePolicies:
+      telemetry:
+        Statement:
+          - Action:
+              - s3:PutObject
+              - s3:AbortMultipartUpload
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557/telemetry/traces/*
+          - Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Condition:
+              StringEquals:
+                kms:ViaService: s3.us-west-2.amazonaws.com
+            Effect: Allow
+            Resource:
+              - arn:aws:kms:us-west-2:500268966557:key/e65a51de-b114-4f8f-a8c5-bcf719a0b1f8
+        Version: 2012-10-17
+    maxSessionDuration: 1 hour
+    roleName: 96bulls-aws-sessions-dev-telemetry
+    tags:
+      96bulls:component: eks
+      96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:service-account: 96bulls/otel-collector
+      96bulls:stack: aws-sessions-dev
+
+[trail] update
+  properties:
+    enableLogFileValidation: true
+    isLogging: true
+    isMultiRegionTrail: true
+  +   kmsKeyId: (known after apply)
+    s3BucketName: 96bulls-aws-sessions-dev-trail-500268966557
+    tags:
+      96bulls:component: cloudtrail
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+    trailName: 96bulls-aws-sessions-dev-trail
+
+[trail-key] create
+  properties:
+    deletionWindow: 30 days
+    description: "96bulls aws-sessions-dev: CloudTrail log files"
+    enableKeyRotation: true
+    policy: '{"Version":"2012-10-17","Statement":[{"Sid":"AccountAdministersKey","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::500268966557:root"},"Action":["kms:Create*","kms:Describe*","kms:Enable*","kms:List*","kms:Put*","kms:Update*","kms:Revoke*","kms:Disable*","kms:Get*","kms:Delete*","kms:TagResource","kms:UntagResource","kms:ScheduleKeyDeletion","kms:CancelKeyDeletion","kms:RotateKeyOnDemand"],"Resource":"*"},{"Sid":"CloudTrailEncryptsLogs","Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":["kms:GenerateDataKey*"],"Resource":"*","Condition":{"StringEquals":{"aws:SourceArn":"arn:aws:cloudtrail:us-west-2:500268966557:trail/96bulls-aws-sessions-dev-trail"},"StringLike":{"kms:EncryptionContext:aws:cloudtrail:arn":"arn:aws:cloudtrail:*:500268966557:trail/*"}}},{"Sid":"CloudTrailDescribesKey","Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":["kms:DescribeKey"],"Resource":"*","Condition":{"StringEquals":{"aws:SourceArn":"arn:aws:cloudtrail:us-west-2:500268966557:trail/96bulls-aws-sessions-dev-trail"}}},{"Sid":"AccountReadsLogs","Effect":"Allow","Principal":{"AWS":"*"},"Action":["kms:Decrypt","kms:ReEncryptFrom"],"Resource":"*","Condition":{"StringEquals":{"kms:CallerAccount":"500268966557"},"StringLike":{"kms:EncryptionContext:aws:cloudtrail:arn":"arn:aws:cloudtrail:*:500268966557:trail/*"}}}]}'
+    tags:
+      96bulls:component: cloudtrail
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+
+[trail-key-alias] create
+  properties:
+    aliasName: alias/96bulls-aws-sessions-dev-trail
+    targetKeyId: (known after apply)
+
+[trail-logs] update
+  properties:
+    bucketName: 96bulls-aws-sessions-dev-trail-500268966557
+    encryption:
+  +     bucketKeyEnabled: true
+  +     kmsMasterKeyId: (known after apply)
+  -     sseAlgorithm: AES256
+  +     sseAlgorithm: aws:kms
+  -   policy:
+  -     - Action:
+  -         - s3:GetBucketAcl
+  -       Effect: Allow
+  -       Principal:
+  -         Service: cloudtrail.amazonaws.com
+  -       Resource: arn:aws:s3:::96bulls-aws-sessions-dev-trail-500268966557
+  -       Sid: AWSCloudTrailAclCheck
+  -     - Action:
+  -         - s3:PutObject
+  -       Condition:
+  -         StringEquals:
+  -           s3:x-amz-acl: bucket-owner-full-control
+  -       Effect: Allow
+  -       Principal:
+  -         Service: cloudtrail.amazonaws.com
+  -       Resource: arn:aws:s3:::96bulls-aws-sessions-dev-trail-500268966557/AWSLogs/500268966557/*
+  -       Sid: AWSCloudTrailWrite
+  +   policy:
+  +     - Action:
+  +         - s3:*
+  +       Condition:
+  +         Bool:
+  +           aws:SecureTransport: "false"
+  +       Effect: Deny
+  +       Principal: "*"
+  +       Resource:
+  +         - arn:aws:s3:::96bulls-aws-sessions-dev-trail-500268966557
+  +         - arn:aws:s3:::96bulls-aws-sessions-dev-trail-500268966557/*
+  +       Sid: DenyInsecureTransport
+  +     - Action:
+  +         - s3:GetBucketAcl
+  +       Effect: Allow
+  +       Principal:
+  +         Service: cloudtrail.amazonaws.com
+  +       Resource: arn:aws:s3:::96bulls-aws-sessions-dev-trail-500268966557
+  +       Sid: AWSCloudTrailAclCheck
+  +     - Action:
+  +         - s3:PutObject
+  +       Condition:
+  +         StringEquals:
+  +           s3:x-amz-acl: bucket-owner-full-control
+  +       Effect: Allow
+  +       Principal:
+  +         Service: cloudtrail.amazonaws.com
+  +       Resource: arn:aws:s3:::96bulls-aws-sessions-dev-trail-500268966557/AWSLogs/500268966557/*
+  +       Sid: AWSCloudTrailWrite
+    publicAccessBlock:
+      blockPublicAcls: true
+      blockPublicPolicy: true
+      ignorePublicAcls: true
+      restrictPublicBuckets: true
+    tags:
+      96bulls:component: cloudtrail
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-dev
+  +   versioning: Enabled
+
+[network/Vpc] noop
+
+[worker-role] create
+  properties:
+    assumeRolePolicyDocument:
+      Statement:
+        - Action:
+            - sts:AssumeRole
+            - sts:TagSession
+          Condition:
+            ArnEquals:
+              aws:SourceArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev
+            StringEquals:
+              aws:SourceAccount: "500268966557"
+          Effect: Allow
+          Principal:
+            Service: pods.eks.amazonaws.com
+      Version: 2012-10-17
+    description: "96bulls aws-sessions-dev: worker components (indexer, referee, bob-costas, migrate): read sessions, write encrypted summaries (Pod Identity 96bulls/96bulls-worker)"
+    inlinePolicies:
+      locker:
+        Statement:
+          - Action:
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557
+            Sid: ListForMissingKeySemantics
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557/v1/*
+            Sid: ReadSessionObjects
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-dev-locker-500268966557/v1/*/summary/*
+            Sid: WriteEncryptedSummaries
+          - Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Condition:
+              StringEquals:
+                kms:ViaService: s3.us-west-2.amazonaws.com
+            Effect: Allow
+            Resource:
+              - arn:aws:kms:us-west-2:500268966557:key/e65a51de-b114-4f8f-a8c5-bcf719a0b1f8
+            Sid: LockerKeyReadWriteViaS3
+        Version: 2012-10-17
+    maxSessionDuration: 1 hour
+    roleName: 96bulls-aws-sessions-dev-worker
+    tags:
+      96bulls:component: eks
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:service-account: 96bulls/96bulls-worker
+      96bulls:stack: aws-sessions-dev

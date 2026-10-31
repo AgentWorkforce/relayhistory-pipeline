@@ -1,0 +1,72 @@
+{
+  "$comment": "Fresh isolated proof stage (cluster 96bulls-aws-proof) beside aws-sessions-dev in the same account. Copy to .96bulls/aws-proof/aws-inputs.json (gitignored) and fill every angle-bracket placeholder value; the stage refuses any that are left. Write the approval record before capturing the plan (bin/96bulls plan aws-proof --capture). accountId is an input: for a fresh account (e.g. a Pippen sandbox) drop accountShared, set pippenSandbox and, without a publish there, eks.imageRepository. Nothing here is secret: Secrets are created out of band from 1Password (docs/aws-stage.md).",
+  "accountId": "500268966557",
+  "region": "us-west-2",
+  "approval": {
+    "decision": "approved",
+    "by": "Khaliq Gant",
+    "date": "2026-10-30",
+    "operations": [
+      "deploy"
+    ],
+    "stage": "aws-proof",
+    "accountId": "500268966557",
+    "region": "us-west-2",
+    "quote": "\"yes u have OK for everything\" / \"Yes, apply A now\" / \"Apply A now, fix in parallel\""
+  },
+  "budgetUsd": 300,
+  "budgetEmail": "aws-budgets@agentrelay.com",
+  "accountShared": {
+    "ownerStage": "aws-sessions-dev"
+  },
+  "lockerNoncurrentVersionDays": 90,
+  "teardown": {
+    "purgeBucketsOnDestroy": true
+  },
+  "eks": {
+    "chartVersion": "0.3.0",
+    "runtimeSecretName": "96bulls-runtime",
+    "tenantOrgId": "org_aws_proof_1",
+    "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
+    "relayhistoryOrigin": "https://proof-sessions.agentrelay.com",
+    "relayauth": {
+      "chartVersion": "0.1.0",
+      "secretName": "relayauth"
+    },
+    "imageDigest": "sha256:59d9468551ded11f3c6f5d36558ab7ef87c3e50e99772de352cc309823cb00e0",
+    "imageSourceRevision": "2fb88cdaca3ef42f5eea42050d43448c883ac5e4",
+    "apiAccess": {
+      "publicAccessCidrs": [
+        "operator-address-redacted/32"
+      ]
+    },
+    "hoopdb": {
+      "backend": "cnpg"
+    },
+    "relaycast": {
+      "chartVersion": "0.1.0",
+      "imageDigest": "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
+      "baseUrl": "https://relaycast.proof-sessions.agentrelay.com"
+    },
+    "sessionDirectory": {
+      "enabled": false
+    },
+    "ingress": {
+      "hostname": "proof-sessions.agentrelay.com",
+      "cloudflareZoneId": "34afb0e8fc19f2b6fd025668e880a889",
+      "zoneDomain": "agentrelay.com",
+      "cloudflareTokenSecret": "cloudflare-dns",
+      "scheme": "internet-facing",
+      "rateLimitPer5Min": 2000,
+      "certValidation": {
+        "name": "_5f1f48a8dcad926249c2cc9deccebefa.proof-sessions.agentrelay.com.",
+        "value": "_deff05b5ef3939e09f6480c3a254cbe7.wzccmgtwzk.acm-validations.aws."
+      }
+    },
+    "tenantOrgIds": [
+      "org_aws_proof_1",
+      "org_aws_proof_2"
+    ]
+  },
+  "clearedBy": "Khaliq, 2026-10-30, in the self-hosted-lead session: \"yes u have OK for everything\" and \"Yes, apply A now\""
+}
