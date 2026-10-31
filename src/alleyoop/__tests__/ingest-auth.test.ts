@@ -1942,9 +1942,12 @@ describe("buildIngestApp auth (production composition)", () => {
     expect(indexed).toEqual([p.key, p.key]);
   });
 
-  test("v2 lost commit response (blocker 1): an identical retry under a fresh assertion with the same base returns the original success; a mismatched replay is refused", async () => {
-    const i = await ingest(BASE_READ_ON);
-    const location = { ...straddle, sessionId: "session-lost-response" };
+  /** A committed v2 backfill (revision 1 + one backfill epoch, 202) and its poster. */
+  const committedBackfillV2 = async (
+    i: Awaited<ReturnType<typeof ingest>>,
+    sessionId: string,
+  ) => {
+    const location = { ...straddle, sessionId };
     const p = await liveSessionWithPlan(i, location);
     const { base } = (await (
       await getBase(i, baseReadToken(p.read), p.key)
@@ -2012,7 +2015,11 @@ describe("buildIngestApp auth (production composition)", () => {
         },
       },
     };
-    const post = (t: string, manifest: unknown) =>
+    const post = (
+      t: string,
+      manifest: unknown,
+      previousVersion: unknown = p.liveVersion,
+    ) =>
       i.req("/v1/pipeline/manifests", t, {
         method: "POST",
         headers: {
@@ -2023,12 +2030,19 @@ describe("buildIngestApp auth (production composition)", () => {
         body: JSON.stringify({
           key: p.key,
           manifest,
-          previousVersion: p.liveVersion,
+          previousVersion,
         }),
       });
     const ok = await post(first, appended);
     expect(ok.status).toBe(202);
     const original = (await ok.json()) as { workKey: string };
+    return { p, base, upload, appended, post, original };
+  };
+
+  test("v2 lost commit response (blocker 1): an identical retry under a fresh assertion with the same base returns the original success; a mismatched replay is refused", async () => {
+    const i = await ingest(BASE_READ_ON);
+    const { p, base, upload, appended, post, original } =
+      await committedBackfillV2(i, "session-lost-response");
     // The response was lost: an identical retry under a FRESH assertion, same base.
     const retry = await post(migrationToken(upload), appended);
     expect(retry.status).toBe(202);
@@ -2043,6 +2057,66 @@ describe("buildIngestApp auth (production composition)", () => {
       await uploadIdentityV2Of(p.entry, PLAN, { ...base, chunk_count: 0 }),
     );
     expect((await post(otherBase, appended)).status).toBe(403);
+  });
+
+  test("v2 identical retry binds the signed base.version (blocker 1): a changed signed base.version, a missing previousVersion and a mismatched previousVersion are each refused, consuming and writing nothing", async () => {
+    const i = await ingest(BASE_READ_ON);
+    const { p, base, upload, appended, post } = await committedBackfillV2(
+      i,
+      "session-retry-version",
+    );
+    const stored = async () => {
+      const object = await i.store.getObject(objectKey(p.key));
+      return {
+        version: object.meta.version,
+        text: await new Response(object.body).text(),
+      };
+    };
+    const snapshot = async () => ({
+      uses: await count("sessions.migration_assertion_uses"),
+      chunks: await count("sessions.migration_assertion_chunks"),
+      baseReads: await count("sessions.migration_base_read_uses"),
+      audit: await count("sessions.migration_ingest_audit"),
+      jobs: await count("sessions.pipeline_jobs"),
+      object: await stored(),
+    });
+    const before = await snapshot();
+    const refused = async (label: string, r: Response) => {
+      expect({ label, status: r.status }).toEqual({ label, status: 409 });
+      expect(((await r.json()) as { error: { code: string } }).error.code).toBe(
+        "revision_conflict",
+      );
+      expect(await snapshot()).toEqual(before);
+    };
+    // 1. A fresh assertion whose signed base.version changed (the historical
+    //    previousVersion is the real base): refused.
+    const changedBase = migrationToken(
+      await uploadIdentityV2Of(p.entry, PLAN, {
+        ...base,
+        version: `${base.version}-changed`,
+      }),
+    );
+    await refused(
+      "changed signed base.version",
+      await post(changedBase, appended),
+    );
+    // 2. previousVersion missing.
+    await refused(
+      "missing previousVersion",
+      await post(migrationToken(upload), appended, null),
+    );
+    // 3. previousVersion that does not resolve to the signed base.version
+    //    (here: the appended object's own current version).
+    await refused(
+      "mismatched previousVersion",
+      await post(migrationToken(upload), appended, before.object.version),
+    );
+    await refused(
+      "mismatched previousVersion (arbitrary)",
+      await post(migrationToken(upload), appended, { version: "not-the-base" }),
+    );
+    // The genuine retry (historical previousVersion = signed base) still succeeds.
+    expect((await post(migrationToken(upload), appended)).status).toBe(202);
   });
 
   test("v2 base-read gate (blocker 2): off, everything under /base is exactly 404 for every method and path variant, before auth; on, exactly one trailing slash is stripped", async () => {

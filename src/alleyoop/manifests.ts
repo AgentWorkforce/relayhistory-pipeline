@@ -4,6 +4,7 @@ import {
   backfillBaseOf,
   isBackfillIdentity,
   isBaseReadIdentity,
+  backfillBaseVersion,
   migrationBackfillIssue,
   migrationGrantAllowed,
   migrationManifestProvenance,
@@ -751,6 +752,24 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           })
         )
           return uploadForbidden(c);
+        // On an identical retry the stored object is the appended one, so the
+        // stored-base comparison (the only check of the signed base.version)
+        // cannot run. Instead the historical `previousVersion` the commit was
+        // made against must be present and resolve EXACTLY to the signed
+        // base.version, before anything is consumed or written.
+        if (identicalRetry) {
+          const previous = version(body.previousVersion);
+          if (
+            !previous ||
+            backfillBaseVersion(previous) !== migration.upload.base.version
+          )
+            return responseError(
+              c,
+              409,
+              "revision_conflict",
+              "manifest version or writer does not match",
+            );
+        }
         if (
           !identicalRetry &&
           (!existing ||

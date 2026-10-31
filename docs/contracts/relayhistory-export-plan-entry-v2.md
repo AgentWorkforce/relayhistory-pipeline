@@ -103,6 +103,7 @@ These are normative in [`relayhistory-export-plan-entry-v2-issuer.md`](relayhist
 - If a live write commits between the mint and the commit, the stored manifest is no longer the signed base, and the commit is refused (403, or 409 on the version).
 - The courier then rereads the base, mints a fresh assertion with the new base, re-seals its chunks at their new `seq` (#46: keys embed `seq`), and commits again.
 - `backfill_sha256` and `entry_sha256` do not change, because they are position-independent. Only `base` and the work key's `@r` suffix do.
+- **Lost commit response.** If the stored object is already byte-identical to the commit, a retry under a fresh assertion with the same base returns the original success and work key. The stored manifest is then the appended one, so the stored-base comparison cannot run. Instead the append is checked against the signed base, and the historical `previousVersion` must be present and resolve exactly to the signed `base.version`, else 409 `revision_conflict`. Nothing is consumed or written on a refusal.
 
 ## Not covered
 
