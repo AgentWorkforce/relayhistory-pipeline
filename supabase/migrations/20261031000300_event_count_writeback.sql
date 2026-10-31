@@ -40,31 +40,19 @@ CREATE TRIGGER session_index_event_count_sticky
   BEFORE UPDATE ON sessions.session_index
   FOR EACH ROW EXECUTE FUNCTION sessions.session_index_event_count_sticky();
 
--- Returns applied, replayed, stale or deleted. Raises CN001 (the index hasn't
--- reached this revision: retry), CN002 (a mismatch: never retry) or CN003 (RLS
--- would hide the row, which must not read as CN001). The rule order is the table
--- in the design doc.
-CREATE FUNCTION sessions.record_normalized_event_count(
+-- The ordering rules, in the order of the design doc's table. Returns applied,
+-- replayed, stale or deleted. Raises CN001 (the index hasn't reached this revision:
+-- retry) or CN002 (a mismatch: never retry). Internal: granted to no one, and only
+-- reachable through record_normalized_event_count.
+CREATE FUNCTION sessions.apply_normalized_event_count(
   p_org_id text, p_workspace_id text, p_harness text, p_session_id text, p_machine_id text,
   p_revision bigint, p_normalized_version integer, p_work_key text,
   p_content_sha256 bytea, p_object_sha256 bytea, p_event_count integer)
-RETURNS text LANGUAGE plpgsql SECURITY DEFINER
+RETURNS text LANGUAGE plpgsql
 SET search_path = pg_catalog, sessions, pg_temp AS $fn$
 DECLARE
   v sessions.session_index%ROWTYPE;
 BEGIN
-  IF row_security_active('sessions.session_index') THEN
-    RAISE EXCEPTION 'row security filters the session index' USING ERRCODE = 'CN003';
-  END IF;
-  IF p_revision IS NULL OR p_revision < 1
-     OR p_normalized_version IS NULL OR p_normalized_version < 1
-     OR p_event_count IS NULL OR p_event_count < 0
-     OR p_work_key IS NULL OR p_work_key !~ '@'
-     OR octet_length(p_content_sha256) IS DISTINCT FROM 32
-     OR octet_length(p_object_sha256) IS DISTINCT FROM 32 THEN
-    RAISE EXCEPTION 'invalid normalized count' USING ERRCODE = '22023';
-  END IF;
-
   SELECT * INTO v FROM sessions.session_index AS s
    WHERE s.org_id = p_org_id AND s.workspace_id = p_workspace_id AND s.harness = p_harness
      AND s.session_id = p_session_id AND s.machine_id = p_machine_id
@@ -108,7 +96,73 @@ BEGIN
 END
 $fn$;
 
--- NOLOGIN, no BYPASSRLS, no table privileges. A login is a separate approved step.
+-- The capability form, and the only entry point. The caller names a job and proves
+-- it holds the lease. Tenant, session, revision, provenance and count all come from
+-- that job's row, so no caller can name or override them. The job is acked in this
+-- transaction with the count, whatever the outcome, so a lost response can't apply
+-- twice and a failure leaves both unchanged. A job in the DLQ path is never applied.
+-- Raises CN003 if RLS would hide the rows, and CN004 if this lease doesn't hold a
+-- live normalized-ready job. Expired means visible_at has passed: a live lease always
+-- holds it in the future.
+CREATE FUNCTION sessions.record_normalized_event_count(p_job_id bigint, p_lease_id uuid)
+RETURNS text LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $fn$
+DECLARE
+  j sessions.pipeline_jobs%ROWTYPE;
+  r jsonb;
+  v_outcome text;
+BEGIN
+  IF row_security_active('sessions.session_index') OR row_security_active('sessions.pipeline_jobs') THEN
+    RAISE EXCEPTION 'row security filters the count tables' USING ERRCODE = 'CN003';
+  END IF;
+  SELECT * INTO j FROM sessions.pipeline_jobs AS q
+   WHERE q.id = p_job_id AND q.lease_id = p_lease_id AND q.stage = 'normalized-ready'
+     AND NOT q.dlq AND q.visible_at > now()
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'this lease does not hold a live normalized-ready job' USING ERRCODE = 'CN004';
+  END IF;
+
+  r := j.message -> 'payload';
+  IF jsonb_typeof(r) IS DISTINCT FROM 'object'
+     OR jsonb_typeof(r -> 'manifest_revision') IS DISTINCT FROM 'number'
+     OR jsonb_typeof(r -> 'normalized_version') IS DISTINCT FROM 'number'
+     OR jsonb_typeof(r -> 'convergence_event_count') IS DISTINCT FROM 'number'
+     OR r ->> 'manifest_revision' !~ '^[1-9][0-9]{0,15}$'
+     OR r ->> 'normalized_version' !~ '^[1-9][0-9]{0,8}$'
+     OR r ->> 'convergence_event_count' !~ '^(0|[1-9][0-9]{0,8})$'
+     OR (r ->> 'source_content_sha256') !~ '^[0-9a-f]{64}$' IS NOT FALSE
+     OR (r ->> 'output_sha256') !~ '^[0-9a-f]{64}$' IS NOT FALSE
+     OR jsonb_typeof(r -> 'output_divergent') IS DISTINCT FROM 'boolean' THEN
+    RAISE EXCEPTION 'invalid normalized-ready record' USING ERRCODE = '22023';
+  END IF;
+
+  -- The record must be about the job it sits in: a substituted payload stops here.
+  IF r ->> 'org_id' IS DISTINCT FROM j.org_id
+     OR r ->> 'workspace_id' IS DISTINCT FROM j.workspace_id
+     OR r ->> 'session_id' IS DISTINCT FROM j.session_id
+     OR r ->> 'machine_id' IS DISTINCT FROM j.machine_id
+     OR r ->> 'harness' IS DISTINCT FROM j.message -> 'ctx' ->> 'harness'
+     OR r ->> 'work_key' IS DISTINCT FROM j.work_key
+     OR r ->> 'manifest_revision' IS DISTINCT FROM j.message ->> 'revision'
+     OR r ->> 'manifest_key' IS DISTINCT FROM regexp_replace(j.work_key, '@[^@]*$', '')
+     OR (r ->> 'output_divergent')::boolean THEN
+    RAISE EXCEPTION 'record does not match its job' USING ERRCODE = 'CN002';
+  END IF;
+
+  v_outcome := sessions.apply_normalized_event_count(
+    j.org_id, j.workspace_id, j.message -> 'ctx' ->> 'harness', j.session_id, j.machine_id,
+    (r ->> 'manifest_revision')::bigint, (r ->> 'normalized_version')::integer, j.work_key,
+    decode(r ->> 'source_content_sha256', 'hex'), decode(r ->> 'output_sha256', 'hex'),
+    (r ->> 'convergence_event_count')::integer);
+  DELETE FROM sessions.pipeline_jobs AS q WHERE q.id = j.id;
+  RETURN v_outcome;
+END
+$fn$;
+
+-- NOLOGIN, no BYPASSRLS, no table privileges. service_role is what the runtime
+-- connects as, and it is NOINHERIT, so it has no EXECUTE through this: the store takes
+-- the role with SET LOCAL ROLE for the one call.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'session_count_writer') THEN
@@ -117,12 +171,14 @@ BEGIN
 END
 $$;
 GRANT USAGE ON SCHEMA sessions TO session_count_writer;
+GRANT session_count_writer TO service_role;
 
 REVOKE ALL ON FUNCTION sessions.session_index_event_count_sticky() FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION sessions.record_normalized_event_count(text, text, text, text, text, bigint,
-  integer, text, bytea, bytea, integer) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION sessions.record_normalized_event_count(text, text, text, text, text, bigint,
-  integer, text, bytea, bytea, integer) TO session_count_writer;
+REVOKE ALL ON FUNCTION sessions.apply_normalized_event_count(text, text, text, text, text, bigint,
+  integer, text, bytea, bytea, integer) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.record_normalized_event_count(bigint, uuid)
+  FROM PUBLIC, anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION sessions.record_normalized_event_count(bigint, uuid) TO session_count_writer;
 
 -- Only record_normalized_event_count may write provenance. service_role holds GRANT
 -- ALL, and a column REVOKE doesn't subtract from a table grant, so the table-level

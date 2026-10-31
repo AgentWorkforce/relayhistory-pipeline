@@ -33,7 +33,7 @@ await runWorker({
       queue: postgresPipelineQueue(db),
       current,
     }),
-    normalizedCounts: postgresNormalizedCountStore(db),
+    normalizedCounts: postgresNormalizedCountStore(() => db.pool.connect()),
   }),
   handlers: (db, current) => ({
     // object-landed comes from pipelineQueueDeps; session-indexed from impl.index.

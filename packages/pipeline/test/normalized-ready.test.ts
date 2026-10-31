@@ -17,6 +17,7 @@ import {
   postgresDeadLetterStore,
   postgresNormalizedCountStore,
   postgresPipelineQueue,
+  type ConnectSql,
   type NormalizedCountOutcome,
   type NormalizedOutput,
   type NormalizedReady,
@@ -88,6 +89,7 @@ const readyMessage = (payload: unknown, over: Partial<StageMessage> = {}): Stage
   ...over,
 });
 const recorder = () => ({ log: { info: vi.fn() } }) as never;
+const JOB = { id: "1", leaseId: "0192f000-0000-7000-8000-00000000000a" };
 
 describe("parseNormalizedReady", () => {
   it("accepts a whole record", () => {
@@ -169,15 +171,25 @@ describe("normalizedReadyHandler", () => {
   const store = (outcome: NormalizedCountOutcome = "applied") => ({ record: vi.fn(async () => outcome) });
 
   it("records it, and only applied is plain success", async () => {
-    expect(await normalizedReadyHandler(store())(readyMessage(record()), recorder(), 1)).toBeUndefined();
+    expect(await normalizedReadyHandler(store())(readyMessage(record()), recorder(), 1, JOB)).toBeUndefined();
     for (const outcome of ["replayed", "stale", "deleted"] as const)
-      expect(await normalizedReadyHandler(store(outcome))(readyMessage(record()), recorder(), 1)).toEqual({ status: "skipped", reason: outcome });
+      expect(await normalizedReadyHandler(store(outcome))(readyMessage(record()), recorder(), 1, JOB)).toEqual({ status: "skipped", reason: outcome });
+  });
+
+  it("passes only the job to the store, and needs one", async () => {
+    const counts = store();
+    await normalizedReadyHandler(counts)(readyMessage(record()), recorder(), 1, JOB);
+    expect(counts.record).toHaveBeenCalledWith(JOB);
+    await expect(normalizedReadyHandler(counts)(readyMessage(record()), recorder(), 1)).rejects.toMatchObject({
+      code: "count_no_job_lease",
+      retryable: false,
+    });
   });
 
   it("quarantines divergent output and never writes it", async () => {
     const counts = store();
     await expect(
-      normalizedReadyHandler(counts)(readyMessage(record({ output_divergent: true })), recorder(), 1),
+      normalizedReadyHandler(counts)(readyMessage(record({ output_divergent: true })), recorder(), 1, JOB),
     ).rejects.toMatchObject({ code: "count_conflict", retryable: false });
     expect(counts.record).not.toHaveBeenCalled();
   });
@@ -193,7 +205,7 @@ describe("normalizedReadyHandler", () => {
     ["a key for another session", record({ manifest_key: MANIFEST_KEY.replace("s=s-1", "s=s-2") })],
   ])("refuses %s against the authenticated context", async (_, ready) => {
     const counts = store();
-    await expect(normalizedReadyHandler(counts)(readyMessage(ready), recorder(), 1)).rejects.toMatchObject({
+    await expect(normalizedReadyHandler(counts)(readyMessage(ready), recorder(), 1, JOB)).rejects.toMatchObject({
       code: "invalid_normalized_ready",
       retryable: false,
     });
@@ -204,23 +216,17 @@ describe("normalizedReadyHandler", () => {
 describe("through the queue, on the real schema", () => {
   let db: PGlite;
   const sql = () => db as unknown as SqlExecutor;
-  /** The consumer's calls run as the real role; the queue and index don't. */
-  const asWriter: SqlExecutor = {
-    query: async (text, params) => {
-      await db.exec("SET ROLE session_count_writer");
-      try {
-        return await sql().query(text, params);
-      } finally {
-        await db.exec("RESET ROLE");
-      }
-    },
+  /** Connects as the runtime role, like the indexer's login. */
+  const connect: ConnectSql = async () => {
+    await db.exec("SET ROLE service_role");
+    return { query: (text, params) => sql().query(text, params), release: () => void db.exec("RESET ROLE") };
   };
   const deps = (): StageQueueDeps => ({
     sink: new InMemoryPipelineEventSink(),
     deadLetters: postgresDeadLetterStore(sql()),
     reporter: noopErrorReporter,
     logger: { environment: "test" },
-    handlers: { "normalized-ready": normalizedReadyHandler(postgresNormalizedCountStore(asWriter)) },
+    handlers: { "normalized-ready": normalizedReadyHandler(postgresNormalizedCountStore(connect)) },
   });
   const poll = (d: StageQueueDeps) => pollPostgresStage({ sql: sql(), stage: "normalized-ready", deps: d });
   const send = (over: Partial<NormalizedReady> = {}, revision = 1) =>
@@ -267,6 +273,16 @@ describe("through the queue, on the real schema", () => {
     expect(await poll(deps())).toMatchObject({ acked: 1 });
     expect(await row()).toMatchObject({ event_count: 42, event_count_revision: 1 });
     expect(await queued()).toEqual([]);
+  });
+
+  it("the store's path takes session_count_writer: its login can't call the function directly", async () => {
+    await index(1);
+    await send();
+    await db.exec("SET ROLE service_role");
+    await expect(db.query("SELECT sessions.record_normalized_event_count(1, gen_random_uuid())")).rejects.toMatchObject({ code: "42501" });
+    await db.exec("RESET ROLE");
+    expect(await poll(deps())).toMatchObject({ acked: 1 });
+    expect(await row()).toMatchObject({ event_count: 42 });
   });
 
   it("a redelivered record is a replay, and acks", async () => {

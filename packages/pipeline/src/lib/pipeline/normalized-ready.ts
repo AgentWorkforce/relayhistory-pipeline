@@ -9,7 +9,7 @@
  * `output_divergent` is refused: the same input and version produced different
  * bytes, and a person should look. The remedy is a version bump, not forcing it.
  */
-import type { StageHandler, StageMessage } from "./dlq.js";
+import type { StageHandler, StageJob, StageMessage } from "./dlq.js";
 import { PipelineError } from "./errors.js";
 import type { NormalizedOutput } from "./stages.js";
 import { objectKeyIdentity } from "./trace.js";
@@ -39,8 +39,12 @@ export interface NormalizedReady {
 export type NormalizedCountOutcome = "applied" | "replayed" | "stale" | "deleted";
 
 export interface NormalizedCountStore {
-  /** Throws `count_index_behind` (retryable) or `count_conflict` (not). */
-  record(ready: NormalizedReady): Promise<NormalizedCountOutcome>;
+  /**
+   * Applies the held job's record and acks the job in one transaction. Everything
+   * written comes from the job's row. Throws `count_index_behind` or
+   * `count_lease_lost` (retryable) or `count_conflict` (not).
+   */
+  record(job: StageJob): Promise<NormalizedCountOutcome>;
 }
 
 const invalid = (field: string): never => {
@@ -150,7 +154,15 @@ export function buildNormalizedReady(
 export function normalizedReadyHandler(
   store: NormalizedCountStore,
 ): StageHandler {
-  return async (message, recorder) => {
+  return async (message, recorder, _attempt, job) => {
+    // The count is written from a leased job's row, so only the Postgres queue can
+    // deliver this stage. Quarantined, it waits for replay on that backend.
+    if (!job)
+      throw new PipelineError(
+        "count_no_job_lease",
+        "normalized-ready needs a leased queue job",
+        false,
+      );
     const ready = parseNormalizedReady(message.payload);
     const { ctx } = message;
     const key = objectKeyIdentity(ready.manifest_key);
@@ -174,7 +186,7 @@ export function normalizedReadyHandler(
         "normalize produced different bytes for the same input and version",
         false,
       );
-    const outcome = await store.record(ready);
+    const outcome = await store.record(job);
     recorder.log.info("normalized count", {
       outcome,
       convergence_event_count: ready.convergence_event_count,

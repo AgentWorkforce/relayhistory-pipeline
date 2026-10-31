@@ -39,7 +39,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Wraps a handler so its work runs in a span on the message's trace, with allowlisted attrs. */
 export function traced(stage: QueuedStage, handler: StageHandler): StageHandler {
-  return async (message, recorder, attempt) => {
+  return async (message, recorder, attempt, job) => {
     const ctx = ctxOf(message);
     return withSpan(`stage ${stage}`, {
       traceparent: ctx.traceparent,
@@ -56,7 +56,7 @@ export function traced(stage: QueuedStage, handler: StageHandler): StageHandler 
     }, async (span) => {
       const started = Date.now();
       try {
-        const out = await handler(message, recorder, attempt);
+        const out = await handler(message, recorder, attempt, job);
         span.setAttribute("outcome", out && typeof out === "object" && out.status === "skipped" ? "skipped" : "ok");
         log.info("stage handled", {
           stage, attempt, outcome: out && typeof out === "object" ? out.status : "ok",

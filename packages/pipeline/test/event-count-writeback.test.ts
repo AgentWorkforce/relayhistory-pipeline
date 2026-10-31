@@ -20,6 +20,7 @@ const KEY = {
   machine_id: "m-1",
 };
 const MANIFEST_KEY = "v1/ws=ws_a/m=m-1/h=claude/d=2026/10/30/s=s-1/manifest.json";
+const TRACE = "0192f000-0000-7000-8000-000000000001";
 const hex = (byte: string) => byte.repeat(32);
 const CONTENT = hex("aa");
 const OBJECT = hex("bb");
@@ -42,7 +43,7 @@ async function index(revision: number, options: { eventCount?: number; content?:
     raw_format: "jsonl",
     format_version: 1,
     revision,
-    trace_id: "0192f000-0000-7000-8000-000000000001",
+    trace_id: TRACE,
     scrubbed: true,
     deleted_at: options.deleted ? "2026-10-30T01:00:00Z" : null,
   };
@@ -57,28 +58,70 @@ interface Count {
   object?: string;
   count?: number;
   key?: Partial<typeof KEY>;
+  /** Overrides on the payload alone, so it disagrees with its job. */
+  payload?: Record<string, unknown>;
 }
 
-async function record(role: string, count: Count = {}) {
+const LEASE = "0192f000-0000-7000-8000-00000000000a";
+const OTHER_LEASE = "0192f000-0000-7000-8000-00000000000b";
+
+/** A leased normalized-ready job, as the queue would hold it. */
+async function leasedJob(count: Count = {}, columns: { stage?: string; lease?: string | null; visible?: string; dlq?: boolean } = {}) {
   const k = { ...KEY, ...count.key };
+  const workKey = count.workKey ?? `${MANIFEST_KEY}@etag-1`;
+  const revision = count.revision ?? 1;
+  const stage = columns.stage ?? "normalized-ready";
+  const message = {
+    v: 1,
+    stage,
+    workKey,
+    revision,
+    ctx: { traceId: TRACE, orgId: k.org_id, workspaceId: k.workspace_id, machineId: k.machine_id, sessionId: k.session_id, harness: k.harness },
+    payload: {
+      v: 1,
+      ...k,
+      manifest_key: workKey.replace(/@[^@]*$/, ""),
+      manifest_revision: revision,
+      work_key: workKey,
+      trace_id: TRACE,
+      source_content_sha256: count.content ?? CONTENT,
+      normalized_version: count.version ?? 2,
+      output_key: "k",
+      output_sha256: count.object ?? OBJECT,
+      output_bytes: 1,
+      convergence_event_count: count.count ?? 42,
+      unprojected_records: 0,
+      output_reused: false,
+      output_divergent: false,
+      ...count.payload,
+    },
+  };
+  const { rows } = await db.query<{ id: number }>(
+    `INSERT INTO sessions.pipeline_jobs
+       (stage, work_key, trace_id, org_id, workspace_id, session_id, machine_id, message, lease_id, visible_at, dlq)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now() + $10::interval, $11)
+     RETURNING id`,
+    [stage, workKey, TRACE, k.org_id, k.workspace_id, k.session_id, k.machine_id, JSON.stringify(message),
+     columns.lease === undefined ? LEASE : columns.lease, columns.visible ?? "300 seconds", columns.dlq ?? false],
+  );
+  return rows[0]!.id;
+}
+
+async function call(role: string, id: number, lease: string | null = LEASE) {
   await db.exec(`SET ROLE ${role}`);
   try {
     const { rows } = await db.query<{ outcome: string }>(
-      `SELECT sessions.record_normalized_event_count(
-         $1, $2, $3, $4, $5, $6::bigint, $7::integer, $8,
-         decode($9, 'hex'), decode($10, 'hex'), $11::integer) AS outcome`,
-      [
-        k.org_id, k.workspace_id, k.harness, k.session_id, k.machine_id,
-        count.revision ?? 1, count.version ?? 2, count.workKey ?? `${MANIFEST_KEY}@etag-1`,
-        count.content ?? CONTENT, count.object ?? OBJECT, count.count ?? 42,
-      ],
+      "SELECT sessions.record_normalized_event_count($1::bigint, $2::uuid) AS outcome",
+      [id, lease],
     );
     return rows[0]!.outcome;
   } finally {
     await db.exec("RESET ROLE");
   }
 }
+const record = async (role: string, count: Count = {}) => call(role, await leasedJob(count));
 const write = (count?: Count) => record("session_count_writer", count);
+const jobCount = async () => (await db.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.pipeline_jobs")).rows[0]!.n;
 
 async function stored() {
   const { rows } = await db.query<{
@@ -104,7 +147,7 @@ afterAll(async () => {
   await db?.close();
 });
 beforeEach(async () => {
-  await db.exec("RESET ROLE; TRUNCATE sessions.session_index CASCADE");
+  await db.exec("RESET ROLE; TRUNCATE sessions.session_index CASCADE; TRUNCATE sessions.pipeline_jobs");
 });
 
 describe("the ordering table", () => {
@@ -235,7 +278,126 @@ describe("around the fence", () => {
     await index(1);
     await expect(write({ count: -1 })).rejects.toMatchObject({ code: "22023" });
     await expect(write({ object: "aa" })).rejects.toMatchObject({ code: "22023" });
-    await expect(write({ workKey: "no-version" })).rejects.toMatchObject({ code: "22023" });
+    await expect(write({ workKey: "no-version" })).rejects.toMatchObject({ code: "CN002" });
+  });
+});
+
+describe("the job capability", () => {
+  const untouched = async () => {
+    expect((await stored()).event_count_revision).toBeNull();
+    expect((await stored()).event_count).toBe(7);
+  };
+
+  it("applies and acks in one call, and every outcome acks", async () => {
+    await index(1);
+    await index(2);
+    expect(await write({ revision: 2 })).toBe("applied");
+    expect(await jobCount()).toBe(0);
+    expect(await write({ revision: 2 })).toBe("replayed");
+    expect(await jobCount()).toBe(0);
+    expect(await write({ revision: 1 })).toBe("stale");
+    expect(await jobCount()).toBe(0);
+  });
+
+  it("a failure leaves the job and the count, so neither half commits alone", async () => {
+    await expect(write()).rejects.toMatchObject({ code: "CN001" });
+    expect(await jobCount()).toBe(1);
+    await index(1);
+    await db.exec("TRUNCATE sessions.pipeline_jobs");
+    await expect(write({ content: hex("cc") })).rejects.toMatchObject({ code: "CN002" });
+    expect(await jobCount()).toBe(1);
+    await untouched();
+  });
+
+  it("a lost response can't apply twice: the retry finds no job", async () => {
+    await index(1);
+    const id = await leasedJob({ count: 42 });
+    expect(await call("session_count_writer", id)).toBe("applied");
+    await expect(call("session_count_writer", id)).rejects.toMatchObject({ code: "CN004" });
+    expect((await stored()).event_count).toBe(42);
+  });
+
+  it.each([
+    ["a wrong lease", {}, OTHER_LEASE],
+    ["no lease", {}, null],
+    ["a released lease", { lease: null }, LEASE],
+    ["an expired lease", { visible: "-1 second" }, LEASE],
+    ["another stage's job", { stage: "session-indexed" }, LEASE],
+    ["a job in the DLQ path", { dlq: true }, LEASE],
+  ])("refuses %s", async (_, columns, lease) => {
+    await index(1);
+    const id = await leasedJob({}, columns);
+    await expect(call("session_count_writer", id, lease)).rejects.toMatchObject({ code: "CN004" });
+    expect(await jobCount()).toBe(1);
+    await untouched();
+  });
+
+  it("refuses another job's id with this lease", async () => {
+    await index(1);
+    await leasedJob();
+    const other = await leasedJob({}, { lease: OTHER_LEASE });
+    await expect(call("session_count_writer", other, LEASE)).rejects.toMatchObject({ code: "CN004" });
+    await untouched();
+  });
+
+  it("refuses a missing job", async () => {
+    await expect(call("session_count_writer", 999_999)).rejects.toMatchObject({ code: "CN004" });
+  });
+
+  it.each([
+    ["org", { org_id: "org_b" }],
+    ["workspace", { workspace_id: "ws_b" }],
+    ["session", { session_id: "s-2" }],
+    ["machine", { machine_id: "m-2" }],
+    ["harness", { harness: "codex" }],
+    ["work key", { work_key: "other@etag" }],
+    ["manifest key", { manifest_key: "v1/other/manifest.json" }],
+    ["revision", { manifest_revision: 2 }],
+    ["divergent output", { output_divergent: true }],
+  ])("refuses a payload substituting the %s", async (_, payload) => {
+    await index(1);
+    await expect(write({ payload })).rejects.toMatchObject({ code: "CN002" });
+    expect(await jobCount()).toBe(1);
+    await untouched();
+  });
+
+  it("a job for one tenant can't write another tenant's identical row", async () => {
+    await index(1);
+    await expect(
+      write({ key: { org_id: "org_b" }, payload: { org_id: "org_a" } }),
+    ).rejects.toMatchObject({ code: "CN002" });
+    await untouched();
+  });
+
+  it.each([
+    ["a non-numeric count", { convergence_event_count: "42" }],
+    ["a fractional count", { convergence_event_count: 1.5 }],
+    ["a missing count", { convergence_event_count: null }],
+    ["a bad checksum", { output_sha256: "zz" }],
+    ["no divergence flag", { output_divergent: "false" }],
+  ])("refuses %s", async (_, payload) => {
+    await index(1);
+    await expect(write({ payload })).rejects.toMatchObject({ code: "22023" });
+    await untouched();
+  });
+
+  it("the old tenant-naming form is gone, and the internal one is out of reach", async () => {
+    await index(1);
+    await db.exec("SET ROLE session_count_writer");
+    try {
+      await expect(
+        db.query(
+          `SELECT sessions.apply_normalized_event_count('org_a','ws_a','claude','s-1','m-1',1,2,'k@e',''::bytea,''::bytea,1)`,
+        ),
+      ).rejects.toMatchObject({ code: "42501" });
+    } finally {
+      await db.exec("RESET ROLE");
+    }
+    const { rows } = await db.query(
+      `SELECT p.oid FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'sessions' AND p.proname = 'record_normalized_event_count' AND p.pronargs <> 2`,
+    );
+    expect(rows).toEqual([]);
   });
 });
 
@@ -304,6 +466,23 @@ describe("access", () => {
       expect((await stored()).event_count_revision).toBeNull();
     });
 
+    // CI's guard: a later migration that adds a column must grant it to service_role.
+    it("service_role can INSERT and UPDATE every session_index column but provenance", async () => {
+      const { rows } = await db.query<{ attname: string; ins: boolean; upd: boolean }>(
+        `SELECT a.attname,
+                has_column_privilege('service_role', a.attrelid, a.attnum, 'INSERT') AS ins,
+                has_column_privilege('service_role', a.attrelid, a.attnum, 'UPDATE') AS upd
+           FROM pg_attribute a
+          WHERE a.attrelid = 'sessions.session_index'::regclass AND a.attnum > 0
+            AND NOT a.attisdropped AND a.attgenerated = ''`,
+      );
+      expect(rows.length).toBeGreaterThan(PROVENANCE.length);
+      for (const { attname, ins, upd } of rows) {
+        const allowed = !PROVENANCE.includes(attname);
+        expect({ attname, ins, upd }).toEqual({ attname, ins: allowed, upd: allowed });
+      }
+    });
+
     it("service_role keeps every other column, and the real upsert still works as it", async () => {
       await asService(() => index(1, { eventCount: 5 }));
       await asService(() => index(2, { eventCount: 6 }));
@@ -323,16 +502,18 @@ describe("access", () => {
 
   it("a definer RLS would filter raises CN003, not index-behind", async () => {
     await index(1);
-    const fn = `sessions.record_normalized_event_count(text, text, text, text, text, bigint, integer, text, bytea, bytea, integer)`;
+    const fn = "sessions.record_normalized_event_count(bigint, uuid)";
     await db.exec(`CREATE ROLE plain_owner NOLOGIN NOBYPASSRLS;
       GRANT USAGE ON SCHEMA sessions TO plain_owner;
       GRANT SELECT, UPDATE ON sessions.session_index TO plain_owner;
+      GRANT SELECT, DELETE ON sessions.pipeline_jobs TO plain_owner;
       ALTER FUNCTION ${fn} OWNER TO plain_owner`);
     try {
       await expect(write()).rejects.toMatchObject({ code: "CN003" });
     } finally {
       await db.exec(`ALTER FUNCTION ${fn} OWNER TO CURRENT_USER;
         REVOKE ALL ON sessions.session_index FROM plain_owner;
+        REVOKE ALL ON sessions.pipeline_jobs FROM plain_owner;
         REVOKE ALL ON SCHEMA sessions FROM plain_owner;
         DROP ROLE plain_owner`);
     }

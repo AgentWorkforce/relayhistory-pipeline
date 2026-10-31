@@ -262,6 +262,7 @@ export async function pollPostgresStage(
           {
             body: row.message,
             attempts: row.attempts,
+            job: { id: row.id, leaseId },
             ack: () => {
               outcome ??= {};
             },
