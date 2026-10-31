@@ -118,6 +118,8 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     deadLetters: () => deadLetters,
     send,
     migrationLedger: () => migrationLedger,
+    // The courier route verifies a v2 (backfill) commit against the stored base.
+    migrationBackfill: true,
   });
   const readiness = postgresReadinessStore(db);
   const courierManifests = createCourierManifestRoutes({

@@ -1,6 +1,8 @@
 import { Hono, type Context } from "hono";
 import { createMiddleware } from "hono/factory";
 import {
+  isBackfillIdentity,
+  migrationBackfillIssue,
   migrationGrantAllowed,
   migrationManifestProvenance,
   migrationPairAuthorized,
@@ -701,7 +703,9 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       })
     )
       return workspaceForbidden(c);
-    if (!(await migrationUploadMatches(auth, location, manifest)))
+    // v1: the whole session must be the signed entry. v2 (a backfill epoch)
+    // is checked against the stored base once it has been read (POST).
+    if (!isBackfillIdentity(auth.migration!.upload) && !(await migrationUploadMatches(auth, location, manifest)))
       return uploadForbidden(c);
     // 96bulls.user_id (the session's user downstream) must be the signed source user.
     if (migrationManifestProvenance(auth, manifest)) return uploadForbidden(c);
@@ -860,6 +864,13 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           "manifest chunks are not server-sealed",
         );
       const existing = await storedManifest(deps.raw, key);
+      // A v2 (backfill) assertion appends exactly one signed backfill epoch
+      // to exactly the signed live base; #42's owner fence below still runs.
+      if (migration && isBackfillIdentity(migration.upload)) {
+        if (await migrationBackfillIssue(auth, location, existing, manifest)) return uploadForbidden(c);
+        if (!existing || !sameVersion(existing.version, version(body.previousVersion)))
+          return responseError(c, 409, "revision_conflict", "manifest version or writer does not match");
+      }
       // No cron: a session's next write is what expires its parked manifest.
       await expireParkedSession(
         deps.raw.store,
@@ -1036,6 +1047,10 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           read.manifest,
         );
         if (issue) return issue;
+        // v2: the stored copy is the appended manifest just written.
+        if (isBackfillIdentity(migration.upload) &&
+          (read.manifest.revision !== manifest.revision || read.manifest.raw.content_sha256 !== manifest.raw.content_sha256))
+          return uploadForbidden(c);
       }
       const built = buildObjectLandedMessage({
         landed: {
@@ -1057,6 +1072,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         (built.message.payload as ObjectLandedPayload).migration = {
           key: migration.upload.key,
           entry_sha256: migration.upload.entry_sha256,
+          ...(isBackfillIdentity(migration.upload) ? { base_revision: migration.upload.base.revision } : {}),
         };
       }
       if (migration) {
@@ -1144,13 +1160,14 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       // A migration assertion reads only the status of a manifest of its own
       // grant, workspace, source user and plan.
       const auth = c.get("auth") as Auth;
-      if (auth.migration) {
-        const issue = await migrationManifestIssue(
-          c,
-          auth,
-          location,
-          stored.manifest,
-        );
+      // A v2 (backfill) assertion may read its live base's version (the
+      // session, grant and tenancy are already its own; the base has no
+      // export marker yet).
+      if (auth.migration && isBackfillIdentity(auth.migration.upload)) {
+        if (!migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId, stored.manifest.session.workspace_id] }))
+          return workspaceForbidden(c);
+      } else if (auth.migration) {
+        const issue = await migrationManifestIssue(c, auth, location, stored.manifest);
         if (issue) return issue;
       }
       const machine = c.req.query("machine");
