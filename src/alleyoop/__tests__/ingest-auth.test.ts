@@ -60,6 +60,7 @@ import {
 } from "../../shared/vendor.ts";
 import { sqlPipelineEventSink } from "../../hoopdb/sink.ts";
 import { buildIngestApp } from "../ingest.ts";
+import { expectedMigrationNames, generation } from "../../hoopdb/migrate.ts";
 import { mintToken } from "../auth.ts";
 import { runCourierOnce, type CourierConfig } from "../courier.ts";
 import { mintTenantToken } from "../../proof/aws/ingest.ts";
@@ -508,6 +509,60 @@ const MIGRATION_ON = {
 };
 
 describe("buildIngestApp auth (production composition)", () => {
+  test("/readyz is 503 until the Worker role validation is PASS for this image's generation", async () => {
+    const { app, env } = await ingest();
+    // This file applies the migrations directly, so record the ledger the migrator
+    // would have written: the schema gate passes and only the marker is under test.
+    await db.exec(`CREATE TABLE sessions.__96bulls_migrations (
+      name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`);
+    for (const name of await expectedMigrationNames())
+      await db.query(
+        "INSERT INTO sessions.__96bulls_migrations (name, sha256) VALUES ($1, 'x')",
+        [name],
+      );
+    const ready = async () => {
+      const r = await app.request("/readyz", {}, env);
+      return {
+        status: r.status,
+        body: (await r.json()) as { reason?: string },
+      };
+    };
+    // No marker table at all (no migrator ran here): not ready.
+    expect(await ready()).toEqual({
+      status: 503,
+      body: { ok: false, reason: "validation_pending" } as never,
+    });
+    await db.exec(`CREATE TABLE sessions.__96bulls_role_validation (
+      name text PRIMARY KEY, generation text NOT NULL,
+      status text NOT NULL CHECK (status IN ('pending', 'pass')),
+      updated_at timestamptz NOT NULL DEFAULT now())`);
+    try {
+      const gen = await generation();
+      for (const [g, status] of [
+        [gen, "pending"],
+        ["0".repeat(64), "pass"],
+      ] as const) {
+        await db.query(
+          `INSERT INTO sessions.__96bulls_role_validation (name, generation, status)
+           VALUES ('session_directory_search_worker', $1, $2)
+           ON CONFLICT (name) DO UPDATE SET generation = EXCLUDED.generation, status = EXCLUDED.status`,
+          [g, status],
+        );
+        expect((await ready()).body.reason).toBe("validation_pending");
+      }
+      await db.query(
+        "UPDATE sessions.__96bulls_role_validation SET generation = $1, status = 'pass'",
+        [gen],
+      );
+      // Past the schema gate: whatever /readyz says next, it is not the marker.
+      expect((await ready()).body.reason).not.toBe("validation_pending");
+    } finally {
+      await db.exec(
+        "DROP TABLE sessions.__96bulls_role_validation; DROP TABLE sessions.__96bulls_migrations",
+      );
+    }
+  });
+
   test("PROOF MINT + REAL ROUTE: RelayAuth request, signed machine claim and zero-side-effect refusals agree", async () => {
     let request:
       | { url: string; body: Record<string, unknown>; key: string | null }

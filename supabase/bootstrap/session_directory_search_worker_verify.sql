@@ -11,6 +11,10 @@
 --             Supabase `postgres`) is enough. It changes nothing.
 --   when      after every migrate, once the full migration set is applied.
 --   exit      0 when everything holds; otherwise SQLSTATE 55000 naming every violation.
+--   marker    run alone, it records nothing. Readers become ready only on a PASS record
+--             (sessions.__96bulls_role_validation) written in the same transaction as
+--             a successful run: by src/hoopdb/migrate.ts, or by
+--             session_directory_search_worker_mark_pass.sql for an external verifier.
 --   role      the phase 1 spec: NOLOGIN NOINHERIT NOBYPASSRLS, no SUPERUSER,
 --             CREATEROLE, CREATEDB or REPLICATION; exactly one setting, role-wide
 --             statement_timeout=2s.

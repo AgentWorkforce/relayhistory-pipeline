@@ -22,7 +22,7 @@ explicit OK.
 
 ## Interface (stable; #75 wires the deploy-time provisioning against this)
 
-**Deploy order:** phase 1 (superuser), then `hoopdb-migrate`, then phase 2. Each step uses
+**Deploy order:** phase 1 (superuser), then `hoopdb-migrate` (which runs phase 2 and records PASS; see the readiness marker below). Each step uses
 `psql -v ON_ERROR_STOP=1 -X -f <file>` against the HoopDb or Supabase database, and the
 deploy stops at the first non-zero exit. Both files are single atomic `DO` blocks.
 
@@ -61,6 +61,57 @@ Phase 1 creates no membership when a superuser runs it. On PostgreSQL 16+, a non
 CREATEROLE creator is automatically granted ADMIN OPTION on the new role. The migration
 refuses that grant, so phase 1 refuses such a caller up front (`42501`).
 
+## Readiness marker (what makes a reader ready)
+
+The ledger alone never makes HoopDb ready. Migrations commit and enter the ledger before
+phase 2 runs, so a ledger-only check would turn ready even when phase 2 failed. Readers
+therefore also require a PASS record for their own migration-set generation in
+`sessions.__96bulls_role_validation`. That covers `waitForSchema`, worker startup, the
+worker's `/readyz` (re-read on every probe) and the ingest's `/readyz`.
+
+Record format, the contract for #75's external verifier:
+
+| Column       | Type and value                                                                                                                                                                                                                                            |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`       | `text PRIMARY KEY`, always `'session_directory_search_worker'`                                                                                                                                                                                            |
+| `generation` | `text NOT NULL`: sha256 hex of the migration set (every `supabase/migrations` and `src/hoopdb/migrations` file by name and sha256, plus the phase 2 verifier). Print it with `bun src/hoopdb/migrate.ts --generation` from the same image as the readers. |
+| `status`     | `text NOT NULL`, `'pending'` or `'pass'`                                                                                                                                                                                                                  |
+| `updated_at` | `timestamptz NOT NULL`                                                                                                                                                                                                                                    |
+
+Transitions:
+
+1. The migrator takes `pg_advisory_lock(961996, 1)`, so concurrent migrators run one at a
+   time. Before any migration step, it writes `('pending', <its generation>)` and
+   commits. From that moment, every reader is non-ready.
+2. Phase 2 and the change to `'pass'` happen in one transaction, still under the lock, and
+   only for the generation that is pending. Nothing else writes `'pass'`.
+3. Anything else leaves the row `'pending'`: a crash mid-migration, a migration failure, a
+   phase 2 failure, or a failure between the last migration commit and phase 2. The
+   next migrator for that image starts again at step 1.
+4. A `'pass'` for a different generation (a stale earlier PASS, or another image's)
+   is not ready for these readers.
+
+**With the in-process verifier off** (`HOOPDB_ROLE_VERIFY=false`), the migrator still
+writes `'pending'` but never `'pass'`. Only an external verifier can then make the
+readers ready, by running, after migrate:
+
+```sh
+GEN=$(bun src/hoopdb/migrate.ts --generation)
+psql -v ON_ERROR_STOP=1 -X -v generation="$GEN" \
+  -f supabase/bootstrap/session_directory_search_worker_mark_pass.sql
+```
+
+In one transaction, that script:
+
+- takes the same advisory lock (`pg_advisory_xact_lock(961996, 1)`);
+- runs phase 2;
+- sets `'pass'` only if the row is `'pending'` for exactly `$GEN`.
+
+Otherwise it fails with `55000` and changes nothing.
+
+Kubernetes Job and pod ordering is defense in depth only. Correctness rests on the
+marker: a reader started early, or a migrator that died, simply stays non-ready.
+
 ## CNPG (self-hosted HoopDb)
 
 - **Phase 1, every deploy (required for existing clusters):** a Job ordered before
@@ -71,8 +122,9 @@ refuses that grant, so phase 1 refuses such a caller up front (`42501`).
   pointing at a ConfigMap built from the same file. CNPG runs it once, as `postgres`, at
   init. It never reruns, so the Job above is still the source of truth.
 - **Phase 2, every deploy:** `hoopdb-migrate` itself runs it after the last migration (the
-  `verify:session_directory_search_worker` step, `HOOPDB_ROLE_VERIFY`, on by default). A
-  separate post-migrate Job running phase 2 as `hoop` is equivalent.
+  `verify:session_directory_search_worker` step, `HOOPDB_ROLE_VERIFY`, on by default). With `HOOPDB_ROLE_VERIFY=false`, a
+  separate post-migrate Job must run `session_directory_search_worker_mark_pass.sql` (not
+  the bare verifier, which records nothing), or no reader becomes ready.
 
 A CNPG managed role (`spec.managed.roles`) can express the attributes but not the
 role-level `statement_timeout`, so it is not enough on its own.
@@ -100,9 +152,11 @@ On Supabase, `postgres` is not a superuser. Its behavior depends on the server v
    would then refuse it. This needs a decision before any apply: either a superuser run
    through Supabase support, or an explicit, reviewed change to the spec. It is an open
    blocker, not a step to work around.
-4. Check the role with the queries below, then apply the migrations.
-5. After the migrations, an operator runs phase 2 as `postgres` (it only reads the
-   catalogs). It must exit 0 before the deploy counts as done.
+4. Check the role with the queries below, then apply the migrations with `hoopdb-migrate`.
+   It writes the pending marker, runs phase 2 and records PASS. Migrations applied any
+   other way write no marker, so no reader becomes ready (fail closed).
+5. With `HOOPDB_ROLE_VERIFY=false`, an operator runs `mark_pass.sql` (above) as `postgres`
+   after the migrations. It must exit 0 before the deploy counts as done.
 
 ## Checks
 

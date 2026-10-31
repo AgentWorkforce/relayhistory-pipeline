@@ -73,28 +73,87 @@ export function isPrerequisiteStep(name: string): boolean {
 }
 
 /**
- * Blocks until the schema this build needs is present: the vendored sessions
- * migrations and every 96bulls migration recorded in `sessions.__96bulls_migrations`.
+ * Readiness marker written by the migrator (src/hoopdb/migrate.ts) or an external
+ * verifier: one row per validated role. `status` is 'pending' from the moment a migrator
+ * starts (before any migration step) until phase 2
+ * (supabase/bootstrap/session_directory_search_worker_verify.sql) passes for that
+ * `generation` (the migration-set digest), in the same transaction.
  */
-export async function waitForSchema(db: HoopDb, expected: string[], timeoutMs = 300_000): Promise<void> {
+export const ROLE_VALIDATION_TABLE = "sessions.__96bulls_role_validation";
+export const ROLE_VALIDATION_NAME = "session_directory_search_worker";
+
+/** What a reader requires: every schema step ledgered, and PASS for its own generation. */
+export interface ExpectedSchema {
+  names: string[];
+  generation: string;
+}
+
+export type SchemaVerdict =
+  | { ok: true }
+  | { ok: false; reason: "schema_pending"; count: number }
+  | { ok: false; reason: "validation_pending" };
+
+/**
+ * Is HoopDb ready for this image? Missing ledger rows: schema_pending. A marker that
+ * is absent, 'pending', or 'pass' for any other generation: validation_pending. Only
+ * 'pass' for exactly `expected.generation` is ready. Fails closed: a missing ledger is
+ * schema_pending and a missing marker table validation_pending; other errors propagate (callers treat them as
+ * not ready).
+ */
+export async function schemaVerdict(
+  db: { query<R = Record<string, unknown>>(text: string, params?: unknown[]): Promise<{ rows: R[] }> },
+  expected: ExpectedSchema,
+): Promise<SchemaVerdict> {
+  let rows: { name: string }[];
+  try {
+    rows = (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows;
+  } catch (err) {
+    if ((err as { code?: string }).code === "42P01")
+      return { ok: false, reason: "schema_pending", count: expected.names.filter((n) => !isPrerequisiteStep(n)).length };
+    throw err;
+  }
+  const have = new Set(rows.map((r) => r.name));
+  // The role shim, bootstrap and verify steps are not schema; the marker covers verify.
+  const missing = expected.names.filter((n) => !isPrerequisiteStep(n) && !have.has(n));
+  if (missing.length) return { ok: false, reason: "schema_pending", count: missing.length };
+  let marker: { generation: string; status: string } | undefined;
+  try {
+    marker = (
+      await db.query<{ generation: string; status: string }>(
+        `SELECT generation, status FROM ${ROLE_VALIDATION_TABLE} WHERE name = $1`,
+        [ROLE_VALIDATION_NAME],
+      )
+    ).rows[0];
+  } catch (err) {
+    if ((err as { code?: string }).code === "42P01") return { ok: false, reason: "validation_pending" };
+    throw err;
+  }
+  if (!marker || marker.status !== "pass" || marker.generation !== expected.generation)
+    return { ok: false, reason: "validation_pending" };
+  return { ok: true };
+}
+
+/**
+ * Blocks until HoopDb is ready for this build (schemaVerdict): every migration
+ * recorded in `sessions.__96bulls_migrations` and the Worker role validation marked
+ * PASS for this build's generation.
+ */
+export async function waitForSchema(db: HoopDb, expected: ExpectedSchema, timeoutMs = 300_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let attempt = 0;
+  let reason = "unreachable";
   for (;;) {
     try {
-      const { rows } = await db.query<{ name: string }>(
-        "SELECT name FROM sessions.__96bulls_migrations",
-      );
-      const have = new Set(rows.map((r) => r.name));
-      // The Supabase role shim and the role bootstrap are optional prerequisites for plain
-      // Postgres, not part of the schema: elsewhere the roles are provisioned outside the
-      // migrator, so they are never required here.
-      if (expected.filter((n) => !isPrerequisiteStep(n)).every((n) => have.has(n))) return;
+      const v = await schemaVerdict(db, expected);
+      if (v.ok) return;
+      reason = v.reason;
     } catch {
-      // table not there yet
+      // ledger not there yet
+      reason = "schema_pending";
     }
     attempt += 1;
-    if (Date.now() > deadline) throw new Error("96bulls: hoopdb schema did not become ready");
-    if (attempt % 5 === 1) log.info("waiting for hoopdb schema", { attempt });
+    if (Date.now() > deadline) throw new Error(`96bulls: hoopdb schema did not become ready (${reason})`);
+    if (attempt % 5 === 1) log.info("waiting for hoopdb schema", { attempt, reason });
     await sleep(2_000);
   }
 }

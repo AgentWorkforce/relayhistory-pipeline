@@ -18,7 +18,13 @@ import {
   selfCheckManifestEpochs,
   type ManifestReaderName,
 } from "./vendor.ts";
-import { openHoopDb, waitForHoopDb, waitForSchema, type HoopDb } from "./db.ts";
+import {
+  openHoopDb,
+  schemaVerdict,
+  waitForHoopDb,
+  waitForSchema,
+  type HoopDb,
+} from "./db.ts";
 import { ctxOf, enrichMessage } from "./enrich.ts";
 import { vendorBindings, integer } from "./env.ts";
 import { liveDataPathVerdict, workloadReadyLive } from "./data-path.ts";
@@ -26,7 +32,7 @@ import { errorFields, log } from "./log.ts";
 import { initTelemetry, shutdownTelemetry, withSpan } from "./telemetry.ts";
 import { createServer } from "node:http";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
-import { expectedMigrationNames } from "../hoopdb/migrate.ts";
+import { expectedSchema } from "../hoopdb/migrate.ts";
 
 export interface WorkerOptions {
   service: string;
@@ -143,7 +149,9 @@ export function traced(
  * Worker health, for container and Kubernetes probes (workers have no other port).
  *   GET /healthz  200 while the poll loop is ticking and HoopDb answered within
  *                 the last WORKER_UNHEALTHY_AFTER_FAILURES ticks; 503 otherwise.
- *   GET /readyz   200 once HoopDb answers and the schema ledger is complete.
+ *   GET /readyz   200 once HoopDb answers, the schema ledger is complete and the
+ *                 Worker role validation is PASS for this image's generation
+ *                 (re-read on every probe, so a failed later validation turns it 503).
  *                 A GCS workload (LOCKER_PROVIDER=gcs or WORKER_DATA_PATH_PROBE=1)
  *                 also requires the data-path settings and refuses HMAC keys.
  *   GET /datapathz  the data-path verdict alone. Unarmed on the S3 default.
@@ -152,6 +160,8 @@ export function traced(
  */
 export interface WorkerHealth {
   ready: boolean;
+  /** Live schema/validation check, set once HoopDb is open; absent means not ready. */
+  schemaReady?: () => Promise<boolean>;
   lastTickAt: number;
   consecutiveDbFailures: number;
 }
@@ -184,7 +194,14 @@ function serveHealth(health: WorkerHealth, port: number) {
   const maxTickAgeMs = integer("WORKER_MAX_TICK_AGE_MS", 120_000);
   const server = createServer((req, res) => {
     if (req.url === "/readyz") {
-      void workloadReadyLive(readyVerdict(health, { maxFailures }), process.env)
+      void (health.schemaReady ? health.schemaReady() : Promise.resolve(false))
+        .catch(() => false)
+        .then((schemaOk) =>
+          workloadReadyLive(
+            schemaOk && readyVerdict(health, { maxFailures }),
+            process.env,
+          ),
+        )
         .then((verdict) => {
           res.writeHead(verdict.ok ? 200 : 503, {
             "content-type": "application/json",
@@ -253,7 +270,9 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
     10_000,
   );
   await waitForHoopDb(db);
-  await waitForSchema(db, await expectedMigrationNames());
+  const expected = await expectedSchema();
+  await waitForSchema(db, expected);
+  health.schemaReady = async () => (await schemaVerdict(db, expected)).ok;
   clearInterval(startupBeat);
   health.ready = true;
   health.lastTickAt = Date.now();
