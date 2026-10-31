@@ -358,6 +358,73 @@ describe("buildIngestApp auth (production composition)", () => {
     expect(errors).toHaveLength(0);
   });
 
+  test("E2E under a deployment key prefix: the correct prefix is accepted through session-indexed; a wrong or absent prefix is refused, fail-closed", async () => {
+    const PREFIX = "deploy-a";
+    const i = await ingest({ ...MIGRATION_ON, ALLOW_INTERIM_RELAYAUTH_BEARER: "true", PIPELINE_KEY_PREFIX: PREFIX });
+    const { upload, manifest, entryText } = await planned();
+    const prefixedKey = `${PREFIX}/${manifestKey(LOCATION)}`;
+    // Negative first: an absent or wrong prefix is refused before any write or consume.
+    for (const key of [manifestKey(LOCATION), `deploy-b/${manifestKey(LOCATION)}`, `${PREFIX}/extra/${manifestKey(LOCATION)}`]) {
+      const refused = await i.commit(migrationToken(upload), manifest, key);
+      expect(`${key}: ${refused.status}`).toBe(`${key}: 403`);
+    }
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+    expect(await count("sessions.migration_assertion_uses")).toBe(0);
+    // Positive: chunks land under the prefix (server-chosen), the commit's
+    // seal check looks there, and the job is consumed through session-indexed.
+    const token = migrationToken(upload);
+    const chunk = await i.chunk(token, LOCATION, { entry: entryText });
+    expect(chunk.status).toBe(201);
+    expect(((await chunk.json()) as { key: string }).key.startsWith(`${PREFIX}/v1/`)).toBe(true);
+    const commit = await i.commit(token, manifest, prefixedKey);
+    expect(commit.status).toBe(202);
+    const workKey = ((await commit.json()) as { workKey: string }).workKey;
+    // The signed (unprefixed) key and entry digest; the prefix is deployment config, not identity.
+    expect(workKey).toBe(`${upload.key}@${upload.entry_sha256}`);
+    // A live session under the same prefix.
+    const liveLocation = { ...LOCATION, sessionId: "session-live" };
+    const live = await planned(liveLocation, liveLocation.machineId);
+    expect((await i.chunk(liveToken(), liveLocation)).status).toBe(201);
+    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-machine-id": liveLocation.machineId, "x-session-id": liveLocation.sessionId },
+      body: JSON.stringify({ key: `${PREFIX}/${manifestKey(liveLocation)}`, manifest: { ...live.manifest, extensions: undefined } }),
+    });
+    expect(liveCommit.status).toBe(202);
+
+    const sql = pgExecutor();
+    const indexed: string[] = [];
+    const deadLetters = postgresDeadLetterStore(sql);
+    const deps = pipelineQueueDeps({} as Bindings, {
+      queue: postgresPipelineQueue(sql),
+      sink: sqlPipelineEventSink(sql),
+      deadLetters,
+      index: { upsertRawPointer: async (pointer: { manifestKey: string }) => void indexed.push(pointer.manifestKey) } as never,
+    });
+    expect(await pollPostgresStage({ sql, stage: "object-landed", deps })).toMatchObject({ claimed: 2, acked: 2, exhausted: 0 });
+    expect(await pollPostgresStage({ sql, stage: "session-indexed", deps })).toMatchObject({ claimed: 2, acked: 2, exhausted: 0 });
+    expect(indexed.sort()).toEqual([prefixedKey, `${PREFIX}/${manifestKey(liveLocation)}`].sort());
+    expect(await deadLetters.list({ stage: "object-landed" })).toEqual([]);
+
+    // Consumer fail-closed: a migration job whose signed key is not this
+    // object's unprefixed key (here: the prefixed key itself, or another
+    // session) is refused (invalid_work_key, dead-lettered), never run as live.
+    for (const bad of [prefixedKey, manifestKey({ ...LOCATION, sessionId: "session-other" })]) {
+      await postgresPipelineQueue(sql).send({
+        v: 1, stage: "object-landed",
+        ctx: { traceId: TRACE, orgId: ORG, workspaceId: WORKSPACE },
+        workKey: `${bad}@${upload.entry_sha256}`,
+        payload: { key: prefixedKey, kind: "manifest", etag: "e1", migration: { key: bad, entry_sha256: upload.entry_sha256 } },
+      } as never);
+    }
+    const refused = await pollPostgresStage({ sql, stage: "object-landed", deps });
+    expect(refused.acked + refused.exhausted).toBe(2);
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+    expect(indexed).toHaveLength(2);
+    const letters = await deadLetters.list({ stage: "object-landed" });
+    expect(letters).toHaveLength(2);
+  });
+
   test("signed work key and durable audit: posted fields cannot alter the work key; one audit row per commit, no secrets", async () => {
     const { upload, manifest, entryText } = await planned();
     const i = await ingest(MIGRATION_ON);

@@ -307,10 +307,18 @@ function manifestMetadata(manifest: ManifestV1, env: Bindings): Record<string, s
   };
 }
 
-async function chunksAreServerSealed(raw: RawStore, manifest: ManifestV1): Promise<boolean> {
+/**
+ * Every chunk the manifest lists is a server-sealed object under the same
+ * session prefix, INCLUDING the deployment key prefix of the manifest's own
+ * key (`prefix`, already checked by `owns`). Without it, a deployment with
+ * `PIPELINE_KEY_PREFIX` / `PIPELINE_ORG_FROM_PREFIX` looked for the chunks at
+ * the unprefixed path and refused every commit.
+ */
+async function chunksAreServerSealed(raw: RawStore, manifest: ManifestV1, prefix: string | undefined): Promise<boolean> {
   const scrub = manifest.raw.scrub;
   if (!scrub || scrub.ruleset !== "relayhistory-scrub" || scrub.version < 1) return false;
   const location = {
+    ...(prefix ? { prefix } : {}),
     workspaceId: manifest.session.workspace_id,
     machineId: manifest.session.machine_id,
     harness: manifest.session.harness,
@@ -504,7 +512,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     if (encoded.byteLength > MAX_MANIFEST_BYTES)
       return responseError(c, 413, "payload_too_large", "manifest is too large");
     try {
-      if (!(await chunksAreServerSealed(deps.raw, manifest)))
+      if (!(await chunksAreServerSealed(deps.raw, manifest, location.prefix)))
         return responseError(c, 409, "chunks_unverified", "manifest chunks are not server-sealed");
       const existing = await storedManifest(deps.raw, key);
       let storedVersion: ObjectVersion;
