@@ -26,6 +26,7 @@ export const CASES = [
   "range_get",
   "list_pagination",
   "presign_get",
+  "delete_is_idempotent",
 ] as const;
 export type CaseName = (typeof CASES)[number];
 
@@ -86,6 +87,22 @@ type Case = (
 ) => Promise<void>;
 
 const cases: Record<CaseName, Case> = {
+  async delete_is_idempotent(store, base) {
+    const key = joinKey(base, "delete/object.bin");
+    await store.put(key, text("gone soon"), {
+      ifNoneMatch: true,
+      metadata: { "trace-id": "t" },
+    });
+    ensure((await store.head(key)) !== undefined, "object not stored");
+    await store.delete(key);
+    ensure((await store.head(key)) === undefined, "object survived delete");
+    await store.delete(key);
+    await store.put(key, text("different"), { ifNoneMatch: true });
+    ensure(
+      (await store.head(key))?.metadata["trace-id"] === undefined,
+      "delete left the old object's metadata behind",
+    );
+  },
   async put_get_head_metadata(store, base) {
     const k = joinKey(base, "chunk.jsonl.zst");
     const body = random(512);

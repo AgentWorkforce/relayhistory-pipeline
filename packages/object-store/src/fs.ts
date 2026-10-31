@@ -246,6 +246,13 @@ export class FsTransport implements Transport {
     });
   }
 
+  async delete(key: ObjectKey): Promise<void> {
+    await this.#exclusive(async () => {
+      await fsp.rm(await this.#path(key), { force: true });
+      await fsp.rm(await this.#sidecar(key), { force: true });
+    });
+  }
+
   async head(key: ObjectKey): Promise<ObjectMeta | undefined> {
     const st = await this.#stat(key);
     if (!st) return undefined;
@@ -429,6 +436,7 @@ function withFsErrors(t: FsTransport): Transport {
     backend: t.backend,
     put: wrap(t.put.bind(t)),
     head: wrap(t.head.bind(t)),
+    delete: wrap(t.delete.bind(t)),
     getObject: wrap(t.getObject.bind(t)),
     list: wrap(t.list.bind(t)),
     presignGet: wrap(t.presignGet.bind(t)),

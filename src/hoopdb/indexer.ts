@@ -16,7 +16,14 @@ import { log } from "../shared/log.ts";
 import { indexerReconcileRoot } from "./reconcile-root.ts";
 import { runWorker } from "../shared/worker.ts";
 import { hoopDbSessionIndex } from "./index.ts";
-import { postgresPipelineQueue } from "../shared/vendor.ts";
+import {
+  backfillActivationHandler,
+  backfillActivationLimits,
+  missingReaders,
+  postgresBackfillReady,
+  postgresPipelineQueue,
+  postgresReadinessStore,
+} from "../shared/vendor.ts";
 import { withSpan } from "../shared/telemetry.ts";
 import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 
@@ -25,7 +32,8 @@ let lastReconcileMinute = -1;
 
 await runWorker({
   service: "hoopdb-indexer",
-  stages: ["object-landed", "session-indexed"],
+  stages: ["object-landed", "session-indexed", "backfill-activation"],
+  attests: ["session-index", "hoopdb"],
   impl: (db, current) => ({
     index: hoopDbSessionIndex({
       db,
@@ -36,6 +44,17 @@ await runWorker({
   }),
   handlers: (db, current) => ({
     // object-landed comes from pipelineQueueDeps; session-indexed from impl.index.
+    "backfill-activation": backfillActivationHandler({
+      missing: () =>
+        missingReaders({
+          key: process.env.MANIFEST_READINESS_KEY,
+          store: postgresReadinessStore(db),
+        }),
+      ready: postgresBackfillReady(db),
+      requeue: (message, delaySeconds) =>
+        postgresPipelineQueue(db).send(message, { delaySeconds }),
+      limits: backfillActivationLimits(process.env),
+    }),
   }),
   tick: async (db, now) => {
     const every = integer("RECONCILE_EVERY_MINUTES", 5);
@@ -48,26 +67,37 @@ await runWorker({
     const listPrefix = indexerReconcileRoot(env);
     if (!listPrefix) {
       // Org-derived prefixes with no PIPELINE_KEY_PREFIX: the store root cannot be listed.
-      log.warn("reconcile not configured", { reason: "org_from_prefix_without_base" });
+      log.warn("reconcile not configured", {
+        reason: "org_from_prefix_without_base",
+      });
       return;
     }
     const reader = lockerManifestReader();
     const queue = postgresPipelineQueue(db);
     const lookback = integer("PIPELINE_RECONCILE_LOOKBACK_MINUTES", 15);
-    await withSpan("reconcile manifests", { attrs: { stage: "object-landed" } }, async () => {
-      const result = await reconcileManifests({
-        store: raw.store,
-        reader,
-        orgs,
-        allowPrefix: (prefix, orgId) => prefixAllowed(env, prefix, orgId),
-        send: async (m) => queue.send(await enrichMessage(m, reader)),
-        // `<base>/v1` with a static org; with org-derived prefixes the whole
-        // `<base>` root, so every `<base>/<org>/v1` is listed (allowPrefix
-        // then keeps only exact `<base>/<org>` keys of a known org).
-        listPrefix,
-        modifiedSince: new Date(now.getTime() - lookback * 60_000),
-      });
-      log.info("reconcile finished", { listed: result.listed, enqueued: result.enqueued, skipped: result.skipped, failed: result.failed });
-    });
+    await withSpan(
+      "reconcile manifests",
+      { attrs: { stage: "object-landed" } },
+      async () => {
+        const result = await reconcileManifests({
+          store: raw.store,
+          reader,
+          orgs,
+          allowPrefix: (prefix, orgId) => prefixAllowed(env, prefix, orgId),
+          send: async (m) => queue.send(await enrichMessage(m, reader)),
+          // `<base>/v1` with a static org; with org-derived prefixes the whole
+          // `<base>` root, so every `<base>/<org>/v1` is listed (allowPrefix
+          // then keeps only exact `<base>/<org>` keys of a known org).
+          listPrefix,
+          modifiedSince: new Date(now.getTime() - lookback * 60_000),
+        });
+        log.info("reconcile finished", {
+          listed: result.listed,
+          enqueued: result.enqueued,
+          skipped: result.skipped,
+          failed: result.failed,
+        });
+      },
+    );
   },
 });

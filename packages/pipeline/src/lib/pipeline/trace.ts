@@ -29,6 +29,7 @@ export const PIPELINE_STAGES = [
   "status-classify",
   "file-normalize",
   "file-maintenance",
+  "backfill-activation",
   "fetch",
 ] as const;
 export type PipelineStage = (typeof PIPELINE_STAGES)[number];

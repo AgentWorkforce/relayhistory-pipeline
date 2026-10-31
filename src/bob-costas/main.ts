@@ -12,10 +12,20 @@ const keyring = await keyringFromEnv();
 await runWorker({
   service: "bob-costas",
   stages: ["summary-short", "summary-long"],
+  attests: ["summaries"],
   // Queues summaries for indexed sessions that have none (e.g. after migration 0004).
-  tick: summarySweep({ keyring, everyMs: Number(process.env.SUMMARY_SWEEP_SECONDS ?? 300) * 1000 }),
+  tick: summarySweep({
+    keyring,
+    everyMs: Number(process.env.SUMMARY_SWEEP_SECONDS ?? 300) * 1000,
+  }),
   handlers: (db) => {
-    const deps = { db, reader: lockerManifestReader(), store: raw.store, summarizer, keyring };
+    const deps = {
+      db,
+      reader: lockerManifestReader(),
+      store: raw.store,
+      summarizer,
+      keyring,
+    };
     return {
       "summary-short": bobCostasHandler("short", deps),
       "summary-long": bobCostasHandler("long", deps),
