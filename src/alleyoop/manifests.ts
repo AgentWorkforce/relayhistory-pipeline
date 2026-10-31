@@ -307,10 +307,18 @@ function manifestMetadata(manifest: ManifestV1, env: Bindings): Record<string, s
   };
 }
 
-async function chunksAreServerSealed(raw: RawStore, manifest: ManifestV1): Promise<boolean> {
+/**
+ * Every chunk the manifest lists is a server-sealed object under the same
+ * session prefix, INCLUDING the deployment key prefix of the manifest's own
+ * key (`prefix`, already checked by `owns`). Without it, a deployment with
+ * `PIPELINE_KEY_PREFIX` / `PIPELINE_ORG_FROM_PREFIX` looked for the chunks at
+ * the unprefixed path and refused every commit.
+ */
+async function chunksAreServerSealed(raw: RawStore, manifest: ManifestV1, prefix: string | undefined): Promise<boolean> {
   const scrub = manifest.raw.scrub;
   if (!scrub || scrub.ruleset !== "relayhistory-scrub" || scrub.version < 1) return false;
   const location = {
+    ...(prefix ? { prefix } : {}),
     workspaceId: manifest.session.workspace_id,
     machineId: manifest.session.machine_id,
     harness: manifest.session.harness,
@@ -444,6 +452,25 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     return undefined;
   };
 
+  /**
+   * The storage key of a courier request. The deployment prefix is applied
+   * SERVER-SIDE from the authenticated org and the deployment config
+   * (`PIPELINE_KEY_PREFIX`, `PIPELINE_ORG_FROM_PREFIX`): the courier posts
+   * and polls the canonical unprefixed `v1/...` key, exactly as the chunk
+   * route chooses the prefix itself. A client-supplied prefix is accepted
+   * only when it is exactly the server's (the chunk response's key); any
+   * other is refused by `owns`.
+   */
+  const storageKey = (c: Context<AppEnv>, key: string) => {
+    const parsed = parseSessionKey(key);
+    if (!parsed || parsed.prefix !== undefined) return key;
+    const env = c.env ?? {};
+    const auth = c.get("auth") as Auth;
+    const base = (env.PIPELINE_KEY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
+    const prefix = env.PIPELINE_ORG_FROM_PREFIX === "true" ? (base ? `${base}/${auth.orgId}` : auth.orgId) : base;
+    return prefix ? `${prefix}/${key}` : key;
+  };
+
   const owns = async (c: Context<AppEnv>, location: NonNullable<ReturnType<typeof parseSessionKey>>) => {
     const auth = c.get("auth") as Auth;
     const env = c.env ?? {};
@@ -477,7 +504,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     } catch {
       return responseError(c, 400, "bad_request", "Request body must be valid JSON");
     }
-    const key = typeof body.key === "string" ? body.key : "";
+    const key = storageKey(c, typeof body.key === "string" ? body.key : "");
     const location = parseSessionKey(key);
     if (!location || location.rest !== "manifest.json")
       return responseError(c, 400, "bad_request", "key must be a v1 session manifest key");
@@ -504,7 +531,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     if (encoded.byteLength > MAX_MANIFEST_BYTES)
       return responseError(c, 413, "payload_too_large", "manifest is too large");
     try {
-      if (!(await chunksAreServerSealed(deps.raw, manifest)))
+      if (!(await chunksAreServerSealed(deps.raw, manifest, location.prefix)))
         return responseError(c, 409, "chunks_unverified", "manifest chunks are not server-sealed");
       const existing = await storedManifest(deps.raw, key);
       let storedVersion: ObjectVersion;
@@ -617,7 +644,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
 
   /** Startup reconciliation: version only, scoped to the stored machine/writer. */
   routes.get("/pipeline/manifests/status", async (c) => {
-    const key = c.req.query("key") ?? "";
+    const key = storageKey(c, c.req.query("key") ?? "");
     const location = parseSessionKey(key);
     if (!location || location.rest !== "manifest.json") return c.body(null, 400);
     const owned = await owns(c, location);
