@@ -14,6 +14,8 @@ import { indexStateSql } from "../probes.ts";
 const root = join(import.meta.dir, "../../../..");
 const read = (p: string) => readFileSync(join(root, p), "utf8");
 const ids = ["01a18f4a-e978-7d04-b07c-4aa8dc28dc65"];
+// Each PGlite instance takes about a second on CI; bun's 5 s default is too tight for several per test.
+const PGLITE_MS = 60_000;
 
 async function state(db: PGlite) {
   const r = await db.query<{
@@ -40,7 +42,7 @@ const RET =
 describe("search_rpc_present", () => {
   test("no RPC: false", async () => {
     expect((await state(await bare())).search_rpc_present).toBe(false);
-  });
+  }, PGLITE_MS);
   test("the contract's shape (many trailing defaulted args) is seen; the old (text,text) lookup missed it", async () => {
     const db = await bare(
       `CREATE FUNCTION sessions.search_session_directory(p_workspace_id text DEFAULT NULL, p_query text DEFAULT NULL, p_harness text DEFAULT NULL, p_no_project boolean DEFAULT false, p_since timestamptz DEFAULT NULL, p_limit integer DEFAULT 50) ${RET};`,
@@ -50,7 +52,7 @@ describe("search_rpc_present", () => {
       "SELECT to_regprocedure('sessions.search_session_directory(text,text)') IS NOT NULL AS v",
     );
     expect(old.rows[0]!.v).toBe(false);
-  });
+  }, PGLITE_MS);
   test("a plain (p_workspace_id, p_query) function is seen", async () => {
     expect(
       (
@@ -61,7 +63,7 @@ describe("search_rpc_present", () => {
         )
       ).search_rpc_present,
     ).toBe(true);
-  });
+  }, PGLITE_MS);
   test("wrong leading arguments or a later argument without a default: false", async () => {
     expect(
       (
@@ -99,7 +101,7 @@ describe("search_rpc_present", () => {
         )
       ).search_rpc_present,
     ).toBe(false);
-  });
+  }, PGLITE_MS);
 });
 
 describe("after every supabase migration", () => {
@@ -117,5 +119,5 @@ describe("after every supabase migration", () => {
     expect(s.search_rpc_present).toBe(defined);
     // When the directory migrations are present, so is the RPC (#38): both or neither.
     expect(s.search_rpc_present).toBe(s.directory_present);
-  }, 60_000);
+  }, PGLITE_MS);
 });
