@@ -425,6 +425,76 @@ describe("buildIngestApp auth (production composition)", () => {
     expect(letters).toHaveLength(2);
   });
 
+  test("prefixed GET manifests/status: the correct prefix reads the signed upload's own status; absent or wrong prefixes are refused", async () => {
+    const PREFIX = "deploy-a";
+    const i = await ingest({ ...MIGRATION_ON, PIPELINE_KEY_PREFIX: PREFIX });
+    const { upload, manifest, entryText } = await planned();
+    const prefixedKey = `${PREFIX}/${manifestKey(LOCATION)}`;
+    const writer = encodeURIComponent(`migration:${GRANT}`);
+    const status = (token: string, key: string) =>
+      i.req(`/v1/pipeline/manifests/status?key=${encodeURIComponent(key)}&machine=${LOCATION.machineId}&writer=${writer}`, token);
+    // Not yet stored: 404 under the correct prefix.
+    expect((await status(migrationToken(upload), prefixedKey)).status).toBe(404);
+    const token = migrationToken(upload);
+    expect((await i.chunk(token, LOCATION, { entry: entryText })).status).toBe(201);
+    expect((await i.commit(token, manifest, prefixedKey)).status).toBe(202);
+    // A fresh assertion for the same upload reads its status under the prefix.
+    const own = await status(migrationToken(upload), prefixedKey);
+    expect(own.status).toBe(200);
+    expect(((await own.json()) as { version: { eTag?: string } }).version.eTag).toBeTruthy();
+    // Absent, wrong or extra prefix: refused (403), never served.
+    for (const key of [manifestKey(LOCATION), `deploy-b/${manifestKey(LOCATION)}`, `${PREFIX}/extra/${manifestKey(LOCATION)}`]) {
+      const refused = await status(migrationToken(upload), key);
+      expect(`${key}: ${refused.status}`).toBe(`${key}: 403`);
+    }
+    // Another session's key under the right prefix: not the signed upload.
+    const other = await status(migrationToken(upload), `${PREFIX}/${manifestKey({ ...LOCATION, sessionId: "session-other" })}`);
+    expect(other.status).toBe(403);
+    expect(await code(other)).toBe("migration_upload_forbidden");
+  });
+
+  test("org-derived prefixes (PIPELINE_ORG_FROM_PREFIX through the real composition): the token's own org prefix is accepted end to end; another org's prefix is refused", async () => {
+    const i = await ingest({ ...MIGRATION_ON, PIPELINE_ORG_FROM_PREFIX: "true", TENANT_ORG_ID: "" });
+    const { upload, manifest, entryText } = await planned();
+    const ownKey = `${ORG}/${manifestKey(LOCATION)}`;
+    // A token for org A with a key under org B's prefix: refused before any write.
+    for (const key of [`org_other/${manifestKey(LOCATION)}`, manifestKey(LOCATION)]) {
+      const refused = await i.commit(migrationToken(upload), manifest, key);
+      expect(`${key}: ${refused.status}`).toBe(`${key}: 403`);
+    }
+    // Org B's token (its own identity) cannot write under org A's prefix either.
+    const orgBUpload = await uploadIdentityOf(
+      { ...(JSON.parse(entryText) as PlanEntry), org_id: "org_other" },
+      PLAN,
+    );
+    const orgB = await i.commit(migrationToken(orgBUpload, { org: "org_other" }), manifest, ownKey);
+    expect(orgB.status).toBe(403);
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+    // The token's own org prefix: chunk under it, commit, consume through session-indexed.
+    const token = migrationToken(upload);
+    const chunk = await i.chunk(token, LOCATION, { entry: entryText });
+    expect(chunk.status).toBe(201);
+    expect(((await chunk.json()) as { key: string }).key.startsWith(`${ORG}/v1/`)).toBe(true);
+    const commit = await i.commit(token, manifest, ownKey);
+    expect(commit.status).toBe(202);
+    const sql = pgExecutor();
+    const indexed: string[] = [];
+    const deadLetters = postgresDeadLetterStore(sql);
+    const deps = pipelineQueueDeps({ PIPELINE_ORG_FROM_PREFIX: "true" } as Bindings, {
+      queue: postgresPipelineQueue(sql),
+      sink: sqlPipelineEventSink(sql),
+      deadLetters,
+      index: { upsertRawPointer: async (pointer: { manifestKey: string }) => void indexed.push(pointer.manifestKey) } as never,
+    });
+    expect(await pollPostgresStage({ sql, stage: "object-landed", deps })).toMatchObject({ claimed: 1, acked: 1, exhausted: 0 });
+    expect(await pollPostgresStage({ sql, stage: "session-indexed", deps })).toMatchObject({ claimed: 1, acked: 1, exhausted: 0 });
+    expect(indexed).toEqual([ownKey]);
+    // No dead letter for this upload (the shared test database may hold
+    // letters from the forged jobs of the static-prefix test).
+    const letters = await deadLetters.list({ stage: "object-landed" });
+    expect(letters.filter((l) => JSON.stringify(l).includes(`${ORG}/v1/`))).toEqual([]);
+  });
+
   test("signed work key and durable audit: posted fields cannot alter the work key; one audit row per commit, no secrets", async () => {
     const { upload, manifest, entryText } = await planned();
     const i = await ingest(MIGRATION_ON);
