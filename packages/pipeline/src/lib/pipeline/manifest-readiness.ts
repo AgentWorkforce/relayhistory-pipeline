@@ -126,7 +126,7 @@ export async function missingReaders(input: {
 
 /**
  * What a reader runs before it attests: this build's validator must accept a
- * `backfill` then `resumed` session. An older validator rejects the reasons
+ * `backfill` then `resumed` session and an `adopted` cold export. An older validator rejects the reasons
  * and so never attests.
  */
 export async function selfCheckManifestEpochs(): Promise<void> {
@@ -204,6 +204,11 @@ export async function selfCheckManifestEpochs(): Promise<void> {
         epoch(2, "resumed", 2, "client", 0),
       ],
       [chunk(0, 0, 0), chunk(1, 1, 0), chunk(2, 2, 10)],
+    ),
+    session(
+      "client",
+      [epoch(0, "initial", 0, exporter), epoch(1, "adopted", 1, "client")],
+      [chunk(0, 0, 0), chunk(1, 1, 0)],
     ),
   ]) {
     manifest.raw.content_sha256 = await computeContentSha256(

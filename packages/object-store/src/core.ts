@@ -40,6 +40,7 @@ export interface Transport {
   ): Promise<ObjectVersion>;
   head(key: ObjectKey): Promise<ObjectMeta | undefined>;
   getObject(key: ObjectKey, range?: ByteRange): Promise<GetObject>;
+  delete(key: ObjectKey): Promise<void>;
   /**
    * Rewrite lost adapter metadata for an object whose bytes were verified by
    * hashing (fs sidecars only; cloud metadata is atomic with the object).
@@ -124,6 +125,10 @@ export class BaseStore implements ObjectStore {
       );
     }
     return this.#transport.presignGet(objectKey(key), Math.floor(ttlSeconds));
+  }
+
+  async delete(key: ObjectKey): Promise<void> {
+    await this.#transport.delete(objectKey(key));
   }
 
   async put(

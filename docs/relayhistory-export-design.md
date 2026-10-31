@@ -175,11 +175,16 @@ manifest body.
   manifest, adopts it after a lost race, and with `COURIER_FORMAT=ndjson` sends
   its change feed's rows, whose `origin_id`, `record_id` and `revision` equal the
   Neon records'. A `jsonl` session still cannot take a
-  backfill. A backfill stays refused (`activation_required`) until the session's
-  writer and every reader in `MANIFEST_READER_CAPABILITIES` advertise
-  `manifest-epochs-v2`, so an old courier keeps delivering and its backfill
-  waits. Still open: a session cold-exported first and resumed later stays
-  fenced on its client.
+  backfill. A backfill stays refused (`activation_required`, retried by the
+  `backfill-activation` stage) until the session's
+  writer is a known release and every reader has a signed attestation, so an old courier keeps delivering and its backfill
+  waits. A session cold-exported first and resumed later is
+  taken over with one `adopted` epoch (`manifest-v1.md`, "Handover"). A client
+  that cannot take over yet is parked beside the export, so it never stalls;
+  `deleteParkedSession` is the erasure hook and parked objects expire after 30
+  days on a later write. A takeover resumes after the marker's
+  `origin_revisions`. A session filed under `unknown-origin-*` as well as a
+  real machine is a `session_machine_split`, which blocks completion.
 - **O5:** volume. About 54M records in 161 GB of payload; estimate the
   exported zstd size and the PUT count per workspace (KMS request cost, P9).
 

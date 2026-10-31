@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   EXPORT_EXTENSION,
+  MANIFEST_EPOCHS_CAPABILITY,
+  adoptionWriteIssues,
   appendBackfillEpoch,
   backfillDigest,
   backfillStatus,
@@ -21,6 +23,7 @@ import {
   scrubbedForPointer,
   sha256HexForTest as sha256Hex,
   validateManifest,
+  writerUnderstandsBackfill,
   type BackfillChunk,
   type BackfillEpoch,
   type BackfillIO,
@@ -888,6 +891,62 @@ describe("backfill epochs", () => {
     stray.raw.epochs[1]!.reason = "rewritten";
     expect((await validateManifest(stray)).map((i) => i.path)).toContain(
       "raw.epochs[2].reason",
+    );
+  });
+
+  it("accepts a Rust-produced adopted manifest", async () => {
+    const fixture = JSON.parse(
+      readFileSync(
+        new URL("./fixtures/rust-manifest-v1-adopted.json", import.meta.url),
+        "utf8",
+      ),
+    ) as { key: string; manifest: unknown };
+    const m = await parseManifest(fixture.manifest, fixture.key);
+    expect(m.raw.content_sha256).toBe(
+      "0d24239d1b4d38dad7497e7e822d63af4c3869e99082acef2b8dbe1d54961889",
+    );
+    expect(m.raw.epochs.map((e) => e.reason)).toEqual(["initial", "adopted"]);
+    expect(m.raw.owner).toBe("dest_objstore_01");
+    expect(m.writer.capabilities).toContain(MANIFEST_EPOCHS_CAPABILITY);
+    expect(liveNextOffset(m.raw)).toBe(50);
+    expect(chunkKeys(m, { currentEpochOnly: true })).toHaveLength(1);
+  });
+
+  it("refuses an adoption of anything but a cold export, and any edit of it", async () => {
+    const m = await ndjsonManifest();
+    const adopted = structuredClone(m);
+    adopted.raw.epochs.push({
+      epoch: 1,
+      opened_at: AT,
+      reason: "adopted",
+      first_seq: 3,
+      opened_by: "client",
+    });
+    adopted.raw.epoch = 1;
+    adopted.raw.next_offset = 0;
+    expect((await validateManifest(adopted)).map((i) => i.path)).toContain(
+      "raw.epochs[1].reason",
+    );
+
+    const cold = structuredClone(m);
+    cold.raw.owner = EXPORTER;
+    cold.raw.epochs[0]!.opened_by = EXPORTER;
+    const taken = structuredClone(adopted);
+    taken.raw.epochs[0]!.opened_by = EXPORTER;
+    taken.raw.owner = "client";
+    taken.writer.delivery_instance_id = "client";
+    expect(await validateManifest(taken)).toEqual([]);
+    expect(adoptionWriteIssues(cold, taken)).toEqual([]);
+    expect(adoptionWriteIssues(m, taken).join("; ")).toContain("cold export");
+    const stolen = structuredClone(taken);
+    stolen.raw.owner = "someone-else";
+    expect(adoptionWriteIssues(cold, stolen).join("; ")).toContain(
+      "writing client",
+    );
+    const held = structuredClone(taken);
+    held.raw.owner = EXPORTER;
+    expect((await validateManifest(held)).map((i) => i.path)).toContain(
+      "raw.owner",
     );
   });
 

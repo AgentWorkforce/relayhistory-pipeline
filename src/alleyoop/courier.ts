@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 import {
   chunkKeys,
   computeContentSha256,
+  exportWatermarks,
   liveEpoch,
   liveNextOffset,
   MANIFEST_EPOCHS_CAPABILITY,
@@ -106,6 +107,8 @@ interface SessionState {
   feed_origin?: string;
   /** Another writer committed first: adopt the stored copy before writing again. */
   needs_rebase?: boolean;
+  /** The stored manifest is a cold export: the next write takes it over. */
+  adopting?: boolean;
   /** Another client owns the raw stream: stop writing; the records stay local. */
   fenced?: boolean;
   closed?: boolean;
@@ -198,6 +201,7 @@ export function configFromEnv(): CourierConfig {
           privateKeyPem: required("JWT_PRIVATE_KEY_PEM"),
         },
         {
+          machineId: required("MACHINE_ID"),
           issuer: optional("AUTH_ISSUER", "https://96bulls.local"),
           audience: optional("AUTH_AUDIENCE", "relayhistory"),
           orgId,
@@ -226,7 +230,9 @@ export function configFromEnv(): CourierConfig {
     workspaceId,
     userId,
     ...(process.env.MACHINE_ID ? { machineId: process.env.MACHINE_ID } : {}),
-    ...(cloudSession ? { machineBound: true } : {}),
+    ...(cloudSession || process.env.JWT_PRIVATE_KEY_PEM
+      ? { machineBound: true }
+      : {}),
     ...(process.env.HARNESSES
       ? {
           harnesses: process.env.HARNESSES.split(",")
@@ -374,7 +380,9 @@ function adoptManifest(
   remote: ManifestV1,
   version: ObjectVersion,
   offset: number,
+  adopting = false,
 ) {
+  session.adopting = adopting;
   const ext = remote.extensions?.[EXT] as
     { session_uuid?: unknown } | undefined;
   if (typeof ext?.session_uuid === "string")
@@ -418,7 +426,7 @@ async function rebaseSession(
   const res = await authorizedFetch(
     cfg.token,
     `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`,
-    { method: "GET" },
+    { method: "GET", headers: { "x-relay-client": PLUGIN_VERSION } },
   ).catch(() => undefined);
   if (res?.status === 404) return "reset";
   // A 403 here is about the caller's credential, never ownership: only the
@@ -432,6 +440,27 @@ async function rebaseSession(
     return "defer";
   if ((await validateManifest(body.manifest, mKey)).length > 0) return "defer";
   const origin = feedOrigin(cfg.dbPath);
+  if (body.manifest.raw.owner.startsWith("migration:")) {
+    // Nobody holds this stream. Take it over after what the export already
+    // holds: the takeover write is the fence, and a lost race lands back here
+    // or fenced.
+    const marks = exportWatermarks(body.manifest);
+    const exported = Object.keys(marks);
+    adoptManifest(
+      session,
+      body.manifest,
+      body.version,
+      origin ? (marks[origin] ?? 0) : 0,
+      true,
+    );
+    // A feed the export never saw would put one record under two origins, which
+    // has to hold like any other moved epoch.
+    session.feed_origin =
+      origin && exported.length > 0 && !(origin in marks)
+        ? exported[0]
+        : origin;
+    return "rebased";
+  }
   if (body.manifest.raw.owner !== machineId) return "fenced";
   const offset = sourceResumeOffset(body.manifest);
   if (offset === undefined) return "fenced";
@@ -457,6 +486,7 @@ const blankUpload = () => ({
   manifest_version: undefined,
   base: undefined,
   needs_rebase: false,
+  adopting: false,
 });
 
 export async function runCourierOnce(cfg: CourierConfig): Promise<{
@@ -500,7 +530,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
     const head = await authorizedFetch(
       cfg.token,
       `${cfg.ingestUrl}/v1/pipeline/manifests/status?${q}`,
-      { method: "GET" },
+      { method: "GET", headers: { "x-relay-client": PLUGIN_VERSION } },
     ).catch(() => undefined);
     if (head?.status === 403) {
       // The stored writer differs. The session's rebase reads the owner.
@@ -669,7 +699,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
     }
     const nothingNew = result.ranges.length === 0;
     if (nothingNew && !session.pending) {
-      if (session.revision === 0) continue;
+      if (session.revision === 0 || session.adopting) continue;
       if (session.closed || !shouldClose) continue;
     }
     await withSpan(
@@ -694,14 +724,14 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
         const resuming =
           !!base &&
           result.ranges.length > 0 &&
-          base.raw.epochs.at(-1)?.reason === "backfill";
+          (session.adopting || base.raw.epochs.at(-1)?.reason === "backfill");
         const pendingChunks = session.chunks.slice(base?.raw.chunk_count ?? 0);
         const epoch =
           pendingChunks.at(-1)?.epoch ??
           (base ? base.raw.epoch + (resuming ? 1 : 0) : 0);
         let stream = pendingChunks.at(-1)
           ? pendingChunks.at(-1)!.start_offset + pendingChunks.at(-1)!.bytes
-          : base
+          : base && !session.adopting
             ? liveNextOffset(base.raw)
             : 0;
         for (const range of result.ranges) {
@@ -725,6 +755,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
                 "content-type": "application/octet-stream",
                 "x-relay-trace-id": session.trace_id,
                 "x-machine-id": loc.machineId,
+                "x-relay-client": PLUGIN_VERSION,
                 "x-session-id": loc.sessionId,
                 traceparent,
               },
@@ -784,29 +815,42 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
           const revision = session.revision + 1;
           const last = session.chunks.at(-1)!;
           const nowIso = new Date().toISOString();
+          const appended = session.chunks.length > (base?.raw.chunk_count ?? 0);
           const epochs =
-            session.chunks.length > (base?.raw.chunk_count ?? 0) &&
-            base?.raw.epochs.at(-1)?.reason === "backfill"
+            base && appended && session.adopting
               ? [
                   ...base.raw.epochs,
                   {
                     epoch,
                     opened_at: nowIso,
-                    reason: "resumed" as const,
+                    reason: "adopted" as const,
                     first_seq: base.raw.chunk_count,
                     opened_by: state.machine_id,
-                    resumes_epoch: liveEpoch(base.raw),
                   },
                 ]
-              : (base?.raw.epochs ?? [
-                  {
-                    epoch: 0,
-                    opened_at: session.started_at,
-                    reason: "initial" as const,
-                    first_seq: 0,
-                    opened_by: state.machine_id,
-                  },
-                ]);
+              : base &&
+                  appended &&
+                  base.raw.epochs.at(-1)?.reason === "backfill"
+                ? [
+                    ...base.raw.epochs,
+                    {
+                      epoch,
+                      opened_at: nowIso,
+                      reason: "resumed" as const,
+                      first_seq: base.raw.chunk_count,
+                      opened_by: state.machine_id,
+                      resumes_epoch: liveEpoch(base.raw),
+                    },
+                  ]
+                : (base?.raw.epochs ?? [
+                    {
+                      epoch: 0,
+                      opened_at: session.started_at,
+                      reason: "initial" as const,
+                      first_seq: 0,
+                      opened_by: state.machine_id,
+                    },
+                  ]);
           const { ended_at: _ended, ...baseSession } = base?.session ?? {};
           manifest = {
             ...base,
@@ -900,6 +944,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
               "content-type": "application/json",
               "x-relay-trace-id": session.trace_id,
               "x-machine-id": loc.machineId,
+              "x-relay-client": PLUGIN_VERSION,
               "x-session-id": loc.sessionId,
               traceparent,
             },
@@ -944,6 +989,7 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
         session.revision = manifest.revision;
         session.manifest_version = landedBody.version;
         session.base = manifest;
+        session.adopting = false;
         session.closed = manifest.raw.state === "closed";
         session.pending = false;
         session.pending_manifest = undefined;

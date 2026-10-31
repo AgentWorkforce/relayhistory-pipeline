@@ -55,6 +55,7 @@ export {
   ServerSectionSchema,
   MANIFEST_SCHEMA_VERSION,
   ManifestV1Schema,
+  adoptionWriteIssues,
   appendBackfillEpoch,
   backfillDigest,
   backfillStatus,

@@ -7,6 +7,7 @@ import { Hono } from "hono";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import {
   commitBackfillEpoch,
+  computeContentSha256,
   isObjectStoreError,
   manifestKey,
   objectKey,
@@ -24,7 +25,10 @@ import {
 } from "../../shared/vendor.ts";
 import { runCourierOnce, type CourierConfig } from "../courier.ts";
 import { feedRecordId } from "../feed-records.ts";
-import { createCourierManifestRoutes } from "../manifests.ts";
+import {
+  createCourierManifestRoutes,
+  type ClaimlessUse,
+} from "../manifests.ts";
 
 const ORG = "org_test";
 const WORKSPACE = "default";
@@ -114,6 +118,10 @@ export async function courierWorld(
   const gate = {
     missing: [] as string[],
     requeued: [] as { message: unknown; delaySeconds: number }[],
+    claimless: [] as ClaimlessUse[],
+    auditDown: false,
+    activationDown: false,
+    firstActivation: undefined as string | undefined,
   };
   const identity: { machineClaim?: string } = { machineClaim: machineId };
   const store = createFsStore({ root });
@@ -126,6 +134,15 @@ export async function courierWorld(
     raw,
     send: async () => {},
     missingReaders: async () => gate.missing,
+    firstClaimlessActivation: async (from) => {
+      if (gate.activationDown) throw new Error("activation unavailable");
+      gate.firstActivation ??= from;
+      return gate.firstActivation;
+    },
+    recordClaimless: async (use) => {
+      if (gate.auditDown) throw new Error("audit unavailable");
+      gate.claimless.push(use);
+    },
     requeueBackfill: async (_env, message, delaySeconds) =>
       void gate.requeued.push({ message, delaySeconds }),
   });
@@ -320,6 +337,63 @@ export async function courierWorld(
     );
   };
 
+  /** A cold export: the manifest does not exist yet, and the exporter owns it. */
+  const coldExport = async (
+    text: string,
+    marker: Record<string, unknown> = {},
+  ) => {
+    const { entry, scrub } = await seal(text, 0, 0, TRACE);
+    const at = new Date().toISOString();
+    const manifest: ManifestV1 = {
+      schema_v: 1,
+      layout: "v1",
+      trace_id: TRACE,
+      revision: 1,
+      created_at: at,
+      updated_at: at,
+      session: {
+        workspace_id: WORKSPACE,
+        machine_id: machineId,
+        harness: "claude",
+        session_id: sessionId,
+        started_at: new Date(STARTED).toISOString(),
+      },
+      writer: { delivery_instance_id: EXPORTER, plugin_version: "export" },
+      raw: {
+        owner: EXPORTER,
+        state: "closed",
+        updated_at: at,
+        format: "ndjson",
+        compression: "zstd",
+        chunk_count: 1,
+        raw_bytes: entry.bytes,
+        stored_bytes: entry.stored_bytes,
+        content_sha256: await computeContentSha256([entry]),
+        epoch: 0,
+        epochs: [
+          {
+            epoch: 0,
+            opened_at: at,
+            reason: "initial",
+            first_seq: 0,
+            opened_by: EXPORTER,
+          },
+        ],
+        next_offset: entry.bytes,
+        chunks: [entry],
+        scrub,
+      },
+      extensions: {
+        "client.relayhistory_export": { ...MARKER, ...marker },
+        "96bulls": { user_id: "user" },
+      },
+    };
+    const res = await post({ key, manifest }, "migration");
+    if (res.status !== 202)
+      throw new Error(`cold export refused: ${res.status}`);
+    return manifest;
+  };
+
   /** Every `harness_line` the merged stream holds, with no folding. */
   const liveRecords = async () => {
     const { manifest } = (await stored())!;
@@ -353,6 +427,7 @@ export async function courierWorld(
     gate,
     identity,
     store,
+    rootDir: root,
     key,
     location,
     counts,
@@ -363,6 +438,7 @@ export async function courierWorld(
     stored,
     seal,
     post,
+    coldExport,
     exporter,
     exportText,
     liveRecords,
@@ -377,6 +453,14 @@ export async function courierWorld(
       ).run(sessionId, `uid-${revision}`, STARTED + revision, line, revision);
       rw.close();
       return revision;
+    },
+    /** The legacy window, open until `until`. */
+    openClaimlessWindow: (until = new Date(Date.now() + 60_000)) => {
+      env.MANIFEST_MACHINE_CLAIM = "compat";
+      env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+        until.getTime() - 3_600_000,
+      ).toISOString();
+      env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = until.toISOString();
     },
     setEpoch: (epoch: number) => {
       const rw = new DatabaseSync(dbPath);

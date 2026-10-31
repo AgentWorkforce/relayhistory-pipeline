@@ -10,6 +10,7 @@ import {
 } from "../../shared/vendor.ts";
 import { createHash } from "node:crypto";
 import { sourceResumeOffset } from "../courier.ts";
+import { claimlessWindowOpen } from "../manifests.ts";
 import { feedRanges, feedRecordId } from "../feed-records.ts";
 import { courierWorld } from "./courier-harness.ts";
 
@@ -467,9 +468,14 @@ describe("machine claim", () => {
     w.hooks.beforeManifest = async () => {
       w.hooks.beforeManifest = undefined;
       await w.exporter(w.exportText("pre-t0"));
-      w.identity.machineClaim = undefined;
     };
     await w.run();
+    expect((await w.state()).sessions["claude:session-a"].needs_rebase).toBe(
+      true,
+    );
+
+    w.identity.machineClaim = undefined;
+    w.openClaimlessWindow();
     await settle(w);
     const stuck = (await w.state()).sessions["claude:session-a"];
     expect(stuck.needs_rebase).toBe(true);
@@ -498,6 +504,7 @@ describe("machine claim", () => {
     expect(await (await status(w, q)).json()).toHaveProperty("manifest");
 
     w.identity.machineClaim = undefined;
+    w.openClaimlessWindow();
     expect(await (await status(w, q)).json()).not.toHaveProperty("manifest");
     expect(
       (await status(w, `machine=${w.machineId}&writer=someone&manifest=1`))
@@ -505,7 +512,7 @@ describe("machine claim", () => {
     ).toBe(403);
 
     w.identity.machineClaim = "another-machine";
-    expect(await (await status(w, q)).json()).not.toHaveProperty("manifest");
+    expect((await status(w, q)).status).toBe(403);
     expect(
       (
         await status(
@@ -516,20 +523,226 @@ describe("machine claim", () => {
     ).toBe(403);
   });
 
-  test("POST refuses a mismatched claim in both modes, and a missing one only when required", async () => {
-    for (const mode of ["compat", "required"]) {
+  describe("the claimless window", () => {
+    const setup = async () => {
       const w = await world({ format: "ndjson" });
-      w.env.MANIFEST_MACHINE_CLAIM = mode;
+      await w.write(line(0));
+      await w.run();
+      w.identity.machineClaim = undefined;
+      return { w, version: `machine=${w.machineId}&writer=${w.machineId}` };
+    };
+
+    test("is shut by default: a new deployment requires the claim everywhere", async () => {
+      const { w, version } = await setup();
+      for (const q of [version, `${version}&manifest=1`])
+        expect((await status(w, q)).status).toBe(403);
+      await w.write(line(1));
+      await w.run();
+      expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
+      expect(w.gate.claimless).toEqual([]);
+    });
+
+    test("open, it gives exactly the version, and audits caller and client", async () => {
+      const { w, version } = await setup();
+      w.openClaimlessWindow();
+      for (const q of [version, `${version}&manifest=1`]) {
+        const res = await status(w, q);
+        expect(res.status).toBe(200);
+        expect(Object.keys((await res.json()) as object)).toEqual(["version"]);
+      }
+      expect(w.gate.claimless).toHaveLength(2);
+      expect(w.gate.claimless[0]).toEqual({
+        orgId: "org_test",
+        caller: "agent_relayhistory_assertion:user",
+        clientVersion: "96bulls-courier/0.3.0",
+      });
+    });
+
+    test("is read-only: a claimless write is refused with it open, and leaves nothing", async () => {
+      const { w } = await setup();
+      w.openClaimlessWindow();
+      await w.write(line(1));
+      await w.run();
+      await w.run();
+      expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
+      expect((await w.stored())!.manifest.revision).toBe(1);
+      expect(w.gate.claimless.every((use) => !("surface" in use))).toBe(true);
+    });
+
+    test("client_version is a meter: changing it decides nothing", async () => {
+      for (const client of [
+        "96bulls-courier/0.3.0",
+        "96bulls-courier/0.2.0",
+        "admin",
+        "x".repeat(500),
+      ]) {
+        const { w, version } = await setup();
+        const ask = (q: string) =>
+          w.app.request(
+            `/v1/pipeline/manifests/status?${new URLSearchParams({ key: w.key, ...Object.fromEntries(new URLSearchParams(q)) })}`,
+            { headers: { "x-relay-client": client } },
+            w.env,
+          );
+        // Shut, it opens nothing. Open, it unlocks nothing and shapes no answer.
+        expect((await ask(version)).status).toBe(403);
+        w.openClaimlessWindow();
+        const res = await ask(`${version}&manifest=1`);
+        expect(res.status).toBe(200);
+        expect(Object.keys((await res.json()) as object)).toEqual(["version"]);
+        expect(w.gate.claimless.at(-1)!.clientVersion).toBe(
+          client.slice(0, 128),
+        );
+      }
+    });
+
+    test("an unaudited use is refused, not waved through", async () => {
+      const { w, version } = await setup();
+      w.openClaimlessWindow();
+      w.gate.auditDown = true;
+      expect((await status(w, version)).status).toBe(503);
+    });
+
+    test("a present, mismatched claim is refused on every form, window open or not", async () => {
+      const { w, version } = await setup();
+      w.openClaimlessWindow();
+      w.identity.machineClaim = "another-machine";
+      for (const q of [version, `${version}&manifest=1`])
+        expect((await status(w, q)).status).toBe(403);
+      expect(w.gate.claimless).toEqual([]);
+    });
+
+    test("closes completely: at the sunset, with a bad date, and on the kill switch", async () => {
+      const closers: ((w: World) => void)[] = [
+        (w) => w.openClaimlessWindow(new Date(Date.now() - 1000)),
+        (w) => void (w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL = "not a date"),
+        (w) => void delete w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL,
+        (w) => void delete w.env.MANIFEST_MACHINE_CLAIM,
+        (w) => void (w.env.MANIFEST_MACHINE_CLAIM = "required"),
+        (w) => void delete w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM,
+        // Over the cap, though the expiry is still in the future.
+        (w) =>
+          void (w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+            Date.now() - 72 * 3_600_000,
+          ).toISOString()),
+        // Not started yet.
+        (w) =>
+          void (w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+            Date.now() + 10_000,
+          ).toISOString()),
+      ];
+      for (const close of closers) {
+        const { w, version } = await setup();
+        w.openClaimlessWindow();
+        expect((await status(w, version)).status).toBe(200);
+        close(w);
+        const before = w.gate.claimless.length;
+        for (const q of [version, `${version}&manifest=1`])
+          expect((await status(w, q)).status).toBe(403);
+        expect(w.gate.claimless).toHaveLength(before);
+      }
+    });
+
+    describe("the 72-hour cap", () => {
+      const from = new Date("2026-11-01T00:00:00.000Z");
+      const at = (ms: number) => new Date(from.getTime() + ms);
+      const hours = (n: number) => n * 3_600_000;
+      const env = (start: number, end: number) =>
+        ({
+          MANIFEST_MACHINE_CLAIM: "compat",
+          MANIFEST_MACHINE_CLAIM_COMPAT_FROM: at(start).toISOString(),
+          MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL: at(end).toISOString(),
+        }) as never;
+      const first = async () => from.toISOString();
+
+      test("holds to the millisecond", async () => {
+        expect(
+          await claimlessWindowOpen(env(0, hours(72)), first, at(1000)),
+        ).toBe(true);
+        expect(
+          await claimlessWindowOpen(env(0, hours(72) + 1), first, at(1000)),
+        ).toBe(false);
+        expect(
+          await claimlessWindowOpen(env(0, hours(720)), first, at(1000)),
+        ).toBe(false);
+        expect(
+          await claimlessWindowOpen(env(0, hours(72)), first, at(hours(72))),
+        ).toBe(false);
+      });
+
+      test("a second activation with a different FROM is refused", async () => {
+        expect(
+          await claimlessWindowOpen(
+            env(hours(48), hours(100)),
+            first,
+            at(hours(50)),
+          ),
+        ).toBe(false);
+        expect(
+          await claimlessWindowOpen(
+            env(hours(1), hours(60)),
+            first,
+            at(hours(2)),
+          ),
+        ).toBe(false);
+        expect(
+          await claimlessWindowOpen(env(0, hours(60)), first, at(hours(2))),
+        ).toBe(true);
+      });
+
+      test("fails closed without the record", async () => {
+        expect(
+          await claimlessWindowOpen(env(0, hours(1)), undefined, at(1)),
+        ).toBe(false);
+        const down = async () => {
+          throw new Error("down");
+        };
+        expect(await claimlessWindowOpen(env(0, hours(1)), down, at(1))).toBe(
+          false,
+        );
+      });
+
+      test("through the route: the first use fixes it, and a restatement finds it shut", async () => {
+        const { w, version } = await setup();
+        w.openClaimlessWindow();
+        expect((await status(w, version)).status).toBe(200);
+        const fixed = w.gate.firstActivation!;
+        const until = w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL;
+        w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = new Date(
+          Date.now() - 1000,
+        ).toISOString();
+        expect((await status(w, version)).status).toBe(403);
+        expect(w.gate.firstActivation).toBe(fixed);
+
+        w.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM = fixed;
+        expect(w.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL).toBe(until);
+        expect((await status(w, version)).status).toBe(200);
+
+        w.gate.activationDown = true;
+        w.openClaimlessWindow();
+        expect((await status(w, version)).status).toBe(403);
+      });
+    });
+
+    test("the courier stays safe when it closes: it defers, never fences", async () => {
+      const { w } = await setup();
+      await w.exporter(w.exportText("pre-t0"));
+      await w.write(line(1));
+      await settle(w);
+      expect((await w.state()).sessions["claude:session-a"].fenced).toBeFalsy();
+      w.identity.machineClaim = w.machineId;
+      await settle(w);
+      expect((await w.liveRecords()).lines).toHaveLength(2);
+    });
+  });
+
+  test("POST refuses a mismatched claim with the window open or shut", async () => {
+    for (const open of [false, true]) {
+      const w = await world({ format: "ndjson" });
+      if (open) w.openClaimlessWindow();
       await w.write(line(0));
       w.identity.machineClaim = "another-machine";
       await w.run();
       expect(await w.stored()).toBeUndefined();
-
-      w.identity.machineClaim = undefined;
-      await w.run();
-      if (mode === "required") expect(await w.stored()).toBeUndefined();
-      else expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
-
       w.identity.machineClaim = w.machineId;
       await settle(w);
       expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);

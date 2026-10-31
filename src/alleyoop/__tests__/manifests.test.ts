@@ -117,6 +117,7 @@ async function fixture() {
     raw,
     send: async (_env, _stage, message) => void sent.push(message),
     missingReaders: async () => [],
+    recordClaimless: async () => {},
   });
   const app = new Hono<AppEnv>();
   let auth = {
@@ -125,7 +126,7 @@ async function fixture() {
     workspaceId: WORKSPACE,
     tokenSubject: "agent_relayhistory_assertion",
     scopes: ["rth:sync"],
-    claims: {},
+    claims: { meta: { machineId: MACHINE } },
     historyOrigin: "https://history.example",
   };
   app.use("*", async (c, next) => {
@@ -166,7 +167,7 @@ async function fixture() {
                 workspaceId: WORKSPACE,
                 tokenSubject: "agent_relayhistory_assertion",
                 scopes: ["rth:sync"],
-                claims: {},
+                claims: { meta: { machineId: MACHINE } },
                 historyOrigin: "https://history.example",
               }
             : auth,
@@ -204,7 +205,7 @@ async function fixture() {
       workspaceId: WORKSPACE,
       tokenSubject: "agent_relayhistory_assertion",
       scopes: ["rth:sync"],
-      claims: {},
+      claims: { meta: { machineId: MACHINE } },
       historyOrigin: "https://history.example",
     };
   };
@@ -330,7 +331,7 @@ describe("AlleyOop courier manifest routes", () => {
           previousVersion: firstBody.version,
         })
       ).status,
-    ).toBe(409);
+    ).toBe(403);
     const update = await f.post({
       key,
       manifest: await f.build(2),

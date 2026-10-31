@@ -43,8 +43,11 @@ import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedMigrationNames } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
 import {
+  claimlessWindowDates,
   courierMigrationLedger,
   createCourierManifestRoutes,
+  liveWriteMachineGate,
+  type ClaimlessUse,
 } from "./manifests.ts";
 
 /** Test seams for buildIngestApp: an already migrated database and a raw store. */
@@ -67,6 +70,37 @@ export interface IngestOverrides {
  *  - With `RELAYHISTORY_ORIGIN` set, the upload routes take only origin-bound
  *    assertions (or migration assertions), even with the interim bearer on.
  */
+/** One row per day, org, caller and client version. Every use is a read. */
+function recordClaimlessUse(db: SqlExecutor, use: ClaimlessUse) {
+  return db
+    .query(
+      `INSERT INTO sessions.claimless_uses (day, org_id, surface, caller, client_version)
+       VALUES (current_date, $1, 'status', $2, $3)
+       ON CONFLICT (day, org_id, surface, caller, client_version)
+       DO UPDATE SET uses = sessions.claimless_uses.uses + 1, last_at = now()`,
+      [use.orgId, use.caller, use.clientVersion],
+    )
+    .then(() => undefined);
+}
+
+/** One row for the whole database, written once: later dates never replace it. */
+async function firstClaimlessActivation(
+  db: SqlExecutor,
+  from: string,
+): Promise<string> {
+  const compatClass = "manifest_machine_claim_compat_v1";
+  await db.query(
+    `INSERT INTO sessions.claimless_window_activations (compat_class, first_activation)
+     VALUES ($1, $2) ON CONFLICT (compat_class) DO NOTHING`,
+    [compatClass, from],
+  );
+  const { rows } = await db.query<{ first_activation: string | Date }>(
+    "SELECT first_activation FROM sessions.claimless_window_activations WHERE compat_class = $1",
+    [compatClass],
+  );
+  return new Date(rows[0]!.first_activation).toISOString();
+}
+
 export async function buildIngestApp(overrides: IngestOverrides = {}) {
   const port = integer("INGEST_PORT", 8080);
   const jwks = process.env.JWKS_JSON
@@ -92,6 +126,33 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     // assertions minted for this deployment's origin are accepted (legacy shared audience refused).
     ...(process.env.RELAYHISTORY_ORIGIN
       ? { RELAYHISTORY_ORIGIN: process.env.RELAYHISTORY_ORIGIN }
+      : {}),
+    ...(process.env.MANIFEST_MACHINE_CLAIM
+      ? { MANIFEST_MACHINE_CLAIM: process.env.MANIFEST_MACHINE_CLAIM }
+      : {}),
+    ...(process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM
+      ? {
+          MANIFEST_MACHINE_CLAIM_COMPAT_FROM:
+            process.env.MANIFEST_MACHINE_CLAIM_COMPAT_FROM,
+        }
+      : {}),
+    ...(process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL
+      ? {
+          MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL:
+            process.env.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL,
+        }
+      : {}),
+    ...(process.env.BACKFILL_ACTIVATION_MAX_ATTEMPTS
+      ? {
+          BACKFILL_ACTIVATION_MAX_ATTEMPTS:
+            process.env.BACKFILL_ACTIVATION_MAX_ATTEMPTS,
+        }
+      : {}),
+    ...(process.env.BACKFILL_ACTIVATION_MAX_DELAY_SECONDS
+      ? {
+          BACKFILL_ACTIVATION_MAX_DELAY_SECONDS:
+            process.env.BACKFILL_ACTIVATION_MAX_DELAY_SECONDS,
+        }
       : {}),
     ...(process.env.RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS
       ? {
@@ -184,6 +245,12 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     migrationBackfill: true,
   });
   const readiness = postgresReadinessStore(db);
+  // Activation starts at the first start with a window set, used or not.
+  const window = claimlessWindowDates(env);
+  if (window)
+    await firstClaimlessActivation(db, window.from).catch((err) =>
+      log.warn("claimless window activation not recorded", errorFields(err)),
+    );
   const courierManifests = createCourierManifestRoutes({
     manifests: reader,
     raw,
@@ -194,6 +261,8 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
         key: process.env.MANIFEST_READINESS_KEY,
         store: readiness,
       }),
+    recordClaimless: (use) => recordClaimlessUse(db, use),
+    firstClaimlessActivation: (from) => firstClaimlessActivation(db, from),
     requeueBackfill: (_env, message, delaySeconds) =>
       queue.send(message, { delaySeconds }),
   });
@@ -319,6 +388,8 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
       );
     await next();
   });
+  // A live write must be bound to its machine before any route stores anything.
+  v1.use("*", liveWriteMachineGate);
   // Every send made while handling this request carries the authenticated user.
   v1.use("*", async (c, next) => {
     const auth = c.get("auth") as { userId?: string } | undefined;
