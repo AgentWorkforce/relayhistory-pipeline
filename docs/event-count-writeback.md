@@ -127,7 +127,8 @@ ALTER TABLE sessions.session_index
 **Provenance is writable only by the function.** `service_role` holds `GRANT ALL`,
 and a column REVOKE doesn't subtract from a table grant, so its table-level INSERT
 and UPDATE are dropped and every other column is granted back. A migration adding a
-`session_index` column must grant it too, or `service_role` can't write it. The
+`session_index` column must grant it too, or `service_role` can't write it. A pipeline
+test, which runs in CI against every migration, fails if one doesn't. The
 owner, superusers and `pg_write_all_data` stay outside grants, and the sticky trigger
 still protects the count from them.
 
@@ -137,38 +138,55 @@ Provenance columns are readable wherever `session_index` is. `work_key` repeats
 ## Database function
 
 ```sql
-sessions.record_normalized_event_count(
-  p_org_id, p_workspace_id, p_harness, p_session_id, p_machine_id,
-  p_revision bigint, p_normalized_version integer, p_work_key text,
-  p_content_sha256 bytea, p_object_sha256 bytea, p_event_count integer)
--- p_object_sha256 is output_sha256, p_event_count is convergence_event_count
+sessions.record_normalized_event_count(p_job_id bigint, p_lease_id uuid)
 RETURNS text  -- applied | replayed | stale | deleted
 ```
 
-SECURITY DEFINER with a fixed `search_path`. It raises `CN003` if RLS would hide
-the row from it, because that would otherwise read as "index behind". It locks exactly one row by the full
-primary key and touches nothing else. EXECUTE goes only to `session_count_writer`:
-NOLOGIN, no BYPASSRLS, no table privileges, granted to the consuming worker's
-login. PUBLIC, `anon` and `authenticated` get nothing.
+This is the tenant boundary (helm-chart-chief's ruling). The function is a job
+capability: **the caller proves it holds a live lease on a `normalized-ready` job,
+and can name nothing else.** Tenant, session, revision, provenance and count all
+come from that job's row and typed message.
 
-**Limit:** the function can't authenticate a tenant. A holder of the role who
-knows a session's full key, revision and `content_sha256` could write a count for
-it. The tenant boundary is the worker taking identity from `ctx`, plus the match
-on `content_sha256`, not the grant alone. helm-chart-chief is reviewing this
-boundary. The worker's held-job binding narrows it, since `record_normalized_event_count`
-is reached only by the consumer.
+- **Live lease:** the job must have this stage and lease, not be in the DLQ path, and
+  have `visible_at` in the future. Anything else raises `CN004`.
+- **The record must match its job.** A payload whose identity, work key, manifest key
+  or revision differs from the job's row, or with `output_divergent` set, raises
+  `CN002`. A malformed payload raises `22023`.
+- **Count and ack are one transaction.** Every outcome deletes the job in the same
+  transaction, and any failure leaves both unchanged. If the response is lost, the
+  retry gets `CN004`, and the count applied exactly once.
+- **`CN003`** if RLS would hide the rows, because that would otherwise read as "index
+  behind".
+
+The ordering rules live in `apply_normalized_event_count`, which no role can execute.
+The function locks exactly one job and one index row, and touches nothing else.
+
+`session_count_writer` is NOLOGIN, with no BYPASSRLS and no table privileges, and
+holds EXECUTE on this function alone. The migration grants it to `service_role`,
+the runtime role. `service_role` is NOINHERIT, so the store takes the role with
+`SET LOCAL ROLE` for the one call. PUBLIC, `anon`, `authenticated` and `service_role`
+itself can't execute the function directly.
+
+**Limits:**
+
+- The repo doesn't name the indexer's login, which is whatever `HOOPDB_URL` holds. It
+  must be able to `SET ROLE session_count_writer`, through `service_role` or directly.
+- This stage works only on the Postgres queue, because the capability is a queue job.
+  On another backend it quarantines as `count_no_job_lease`.
+- A holder of the role who also holds a lease can only apply that job. Whoever can
+  write `pipeline_jobs` directly controls the record; `service_role` still can.
 
 ## Revision ordering
 
-`p_revision` is compared with the row, under its lock, in this order:
+The job's revision is compared with the index row, under its lock, in this order:
 
 | # | Condition | Result |
 | --- | --- | --- |
-| 1 | No row, or `p_revision > revision` | Raise `CN001` (`count_index_behind`), retryable |
+| 1 | No row, or job revision > row `revision` | Raise `CN001` (`count_index_behind`), retryable |
 | 2 | `deleted_at` is set | `deleted`, no write |
-| 3 | `p_revision < revision` | `stale`, no write |
-| 4 | `manifest_key` isn't the key in `p_work_key`, or `content_sha256` differs | Raise `CN002` (`count_conflict`), not retryable |
-| 5 | Same revision, stored `event_count_normalized_version > p_normalized_version` | `stale`, no write |
+| 3 | Job revision < row `revision` | `stale`, no write |
+| 4 | `manifest_key` isn't the key in the work key, or `content_sha256` differs | Raise `CN002` (`count_conflict`), not retryable |
+| 5 | Same revision, stored `event_count_normalized_version` is higher | `stale`, no write |
 | 6 | Same revision and version, same `object_sha256` and count | `replayed`, no write |
 | 7 | Same revision and version, different object or count | Raise `CN002` |
 | 8 | Otherwise | `applied`: write the count and all provenance |
@@ -226,8 +244,10 @@ same replay path. Only `applied` makes a count authoritative. `file-normalize`
 | Failure | Code | Behaviour |
 | --- | --- | --- |
 | Index behind | `count_index_behind` | Retries with backoff, then DLQ. The DLQ means indexing is stuck |
+| Lease lost | `count_lease_lost` | Retries, which is a no-op. The next holder of the job applies it, or it was already applied and acked |
 | Database unavailable | database code | Retries, then DLQ |
 | Bad record | `invalid_normalized_ready` | DLQ at once |
+| No job | `count_no_job_lease` | DLQ at once: delivered by a non-Postgres backend |
 | Mismatch | `count_conflict` | DLQ at once, and nothing is written |
 | `output_divergent` | `count_conflict` | DLQ at once, and nothing is written. The session fails the gate until a version bump or a fix and replay. Changed runtime Unicode tables can cause this too |
 | Marker missing | `relayhistory_export_marker_missing` | `file-normalize` refuses without retries, so no record exists |
@@ -294,8 +314,8 @@ functions.
 Remaining:
 
 1. The poller adapter and the `file-normalize` worker.
-2. Grant `session_count_writer` to the indexer's login. Today the indexer connects
-   with its usual role, so the narrow role is only proven in tests.
+2. Confirm the login in `HOOPDB_URL` can take `session_count_writer`. Applying the
+   grant is a live change and needs Khaliq's OK.
 3. Add the stage to the sampler's alert stages once #47 lands.
 
 Code and draft PR only. Applying the migration, enabling normalization and any
