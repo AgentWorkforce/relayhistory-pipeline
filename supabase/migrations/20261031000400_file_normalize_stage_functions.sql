@@ -307,3 +307,12 @@ GRANT EXECUTE ON FUNCTION
   sessions.file_normalize_quarantine(bigint, uuid),
   sessions.file_normalize_resolve(bigint, uuid)
   TO file_normalize_worker;
+
+-- Enqueue is the only way a normalized-ready job is created, so it runs as the role the
+-- guard admits. Its helpers run as that role too. The membership exists only for this
+-- ALTER, so the migrating role can't become it afterwards.
+GRANT EXECUTE ON FUNCTION sessions.file_normalize_held_job(bigint, uuid),
+  sessions.file_normalize_assert_visible() TO normalized_ready_writer;
+GRANT normalized_ready_writer TO CURRENT_USER;
+ALTER FUNCTION sessions.file_normalize_enqueue_ready(bigint, uuid, jsonb) OWNER TO normalized_ready_writer;
+REVOKE normalized_ready_writer FROM CURRENT_USER;

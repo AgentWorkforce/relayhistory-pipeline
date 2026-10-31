@@ -192,6 +192,38 @@ describe("pollFileNormalize", () => {
   });
 });
 
+describe("end to end, with the guard on", () => {
+  it("the worker's record is the only way in, and it applies", async () => {
+    await db.query("SELECT * FROM sessions.upsert_session_index($1::jsonb)", [
+      JSON.stringify([{
+        org_id: "org_a", workspace_id: "ws_a", harness: "claude", session_id: "s-1", machine_id: "m-1",
+        user_id: "u", created_at: "2026-10-30T00:00:00Z", last_activity_at: "2026-10-30T00:00:00Z",
+        event_count: 7, storage_provider: "s3", bucket: "b", manifest_key: MANIFEST_KEY,
+        content_sha256: `\\x${"a".repeat(64)}`, raw_bytes: 1, chunk_count: 1, raw_format: "jsonl", format_version: 1,
+        revision: 1, trace_id: TRACE, scrubbed: true, deleted_at: null,
+      }]),
+    ]);
+    await enqueue();
+    await poll(ok);
+    const owner = (await db.query<{ owner: string }>(
+      `SELECT pg_get_userbyid(proowner) AS owner FROM pg_proc WHERE proname = 'file_normalize_enqueue_ready'`)).rows[0];
+    expect(owner?.owner).toBe("normalized_ready_writer");
+    const { rows } = await db.query<{ id: number }>("SELECT id FROM sessions.pipeline_jobs WHERE stage = 'normalized-ready'");
+    const lease = "0192f000-0000-7000-8000-00000000000a";
+    await db.query("UPDATE sessions.pipeline_jobs SET lease_id = $1, visible_at = now() + interval '60 seconds'", [lease]);
+    await db.exec("SET ROLE session_count_writer");
+    try {
+      const result = await db.query<{ outcome: string }>(
+        "SELECT sessions.record_normalized_event_count($1, $2) AS outcome", [rows[0]!.id, lease]);
+      expect(result.rows).toEqual([{ outcome: "applied" }]);
+    } finally {
+      await db.exec("RESET ROLE");
+    }
+    expect((await db.query("SELECT event_count, event_count_revision FROM sessions.session_index WHERE session_id = 's-1'")).rows)
+      .toEqual([{ event_count: 42, event_count_revision: 1 }]);
+  });
+});
+
 describe("assertQueueLimitedRole", () => {
   const as = async (role: string) => {
     await db.exec(`SET ROLE ${role}`);
