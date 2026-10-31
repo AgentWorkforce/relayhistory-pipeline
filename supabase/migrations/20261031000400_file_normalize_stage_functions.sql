@@ -242,7 +242,8 @@ $fn$;
 
 -- The letter is built from the job row: the caller supplies neither message nor id.
 CREATE FUNCTION sessions.file_normalize_quarantine(p_job_id bigint, p_lease_id uuid)
-RETURNS text LANGUAGE plpgsql SECURITY DEFINER
+RETURNS TABLE (letter_id text, letter_dead_count integer)
+LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $fn$
 DECLARE
   v sessions.pipeline_jobs%ROWTYPE;
@@ -261,8 +262,9 @@ BEGIN
     dead_count = d.dead_count + 1,
     resolved_at = NULL,
     session_id = coalesce(EXCLUDED.session_id, d.session_id),
-    machine_id = coalesce(EXCLUDED.machine_id, d.machine_id);
-  RETURN v_id;
+    machine_id = coalesce(EXCLUDED.machine_id, d.machine_id)
+  RETURNING d.id, d.dead_count INTO letter_id, letter_dead_count;
+  RETURN NEXT;
 END
 $fn$;
 

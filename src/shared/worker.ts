@@ -122,7 +122,7 @@ export function readyVerdict(h: WorkerHealth, opts: { maxFailures: number }) {
   return h.ready && h.consecutiveDbFailures < opts.maxFailures;
 }
 
-function serveHealth(health: WorkerHealth, port: number) {
+export function serveHealth(health: WorkerHealth, port: number) {
   const maxFailures = integer("WORKER_UNHEALTHY_AFTER_FAILURES", 5);
   const maxTickAgeMs = integer("WORKER_MAX_TICK_AGE_MS", 120_000);
   const server = createServer((req, res) => {

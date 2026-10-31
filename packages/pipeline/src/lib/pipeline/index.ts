@@ -47,6 +47,7 @@ export * from "./trace.js";
 export * from "./traces.js";
 export { postgrestDeadLetterStore } from "./postgrest-dead-letters.js";
 export { postgresDeadLetterStore } from "./postgres-dead-letters.js";
+export * from "./file-normalize-worker.js";
 export {
   postgresNormalizedCountStore,
   type ConnectSql,

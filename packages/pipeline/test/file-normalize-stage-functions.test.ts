@@ -103,7 +103,7 @@ describe("claim and lease", () => {
     expect((await call<{ ok: boolean }>("SELECT sessions.file_normalize_ack($1, $2) AS ok", [id, LEASE]))[0]!.ok).toBe(false);
     expect(await retry(id)).toBe("lost");
     await call("SELECT sessions.file_normalize_renew($1::bigint[], $2, 300)", [[id], LEASE]);
-    await expect(call("SELECT sessions.file_normalize_quarantine($1, $2)", [id, LEASE])).rejects.toMatchObject({ code: "FN002" });
+    await expect(call("SELECT * FROM sessions.file_normalize_quarantine($1, $2)", [id, LEASE])).rejects.toMatchObject({ code: "FN002" });
     expect(await jobs()).toHaveLength(1);
   });
 
@@ -235,15 +235,15 @@ describe("quarantine and resolve", () => {
   it.each([["org_a"], ["org with space/é"], ["a!~*'()-_.b"]])("uses the same id as deadLetterId for %s", async (org) => {
     await enqueue("file-normalize", org);
     const [id] = await claim();
-    const [{ letter }] = (await call<{ letter: string }>("SELECT sessions.file_normalize_quarantine($1, $2) AS letter", [id, LEASE])) as [{ letter: string }];
+    const [{ letter }] = (await call<{ letter: string }>("SELECT letter_id AS letter FROM sessions.file_normalize_quarantine($1, $2)", [id, LEASE])) as [{ letter: string }];
     expect(letter).toBe(deadLetterId("file-normalize", { orgId: org, workspaceId: "ws_a" }, WORK_KEY));
   });
 
   it("a second death bumps the count, and resolve closes it", async () => {
     await enqueue();
     const [id] = await claim();
-    await call("SELECT sessions.file_normalize_quarantine($1, $2)", [id, LEASE]);
-    await call("SELECT sessions.file_normalize_quarantine($1, $2)", [id, LEASE]);
+    await call("SELECT * FROM sessions.file_normalize_quarantine($1, $2)", [id, LEASE]);
+    await call("SELECT * FROM sessions.file_normalize_quarantine($1, $2)", [id, LEASE]);
     expect(await letters()).toMatchObject([{ stage: "file-normalize", state: "dead", dead_count: 2, org_id: "org_a" }]);
     await call("SELECT sessions.file_normalize_resolve($1, $2)", [id, LEASE]);
     expect((await letters())[0]?.state).toBe("resolved");
@@ -252,7 +252,7 @@ describe("quarantine and resolve", () => {
   it("refuses without the lease, and resolve leaves other letters alone", async () => {
     await enqueue();
     const [id] = await claim();
-    await expect(call("SELECT sessions.file_normalize_quarantine($1, $2)", [id, OTHER_LEASE])).rejects.toMatchObject({ code: "FN002" });
+    await expect(call("SELECT * FROM sessions.file_normalize_quarantine($1, $2)", [id, OTHER_LEASE])).rejects.toMatchObject({ code: "FN002" });
     await db.exec(`INSERT INTO sessions.pipeline_dead_letters (id, stage, message) VALUES ('other', 'session-indexed', '{}')`);
     await call("SELECT sessions.file_normalize_resolve($1, $2)", [id, LEASE]);
     expect((await letters())[0]?.state).toBe("dead");

@@ -15,6 +15,7 @@ export {
   type SqlExecutor,
 } from "@rhc/lib/pipeline/queue.ts";
 export { postgresDeadLetterStore } from "@rhc/lib/pipeline/postgres-dead-letters.ts";
+export { assertQueueLimitedRole, pollFileNormalize } from "@rhc/lib/pipeline/file-normalize-worker.ts";
 export { postgresNormalizedCountStore } from "@rhc/lib/pipeline/postgres-normalized-counts.ts";
 export { pipelineQueueDeps, type PipelineImplementations } from "@rhc/lib/pipeline/index.ts";
 export { PipelineError } from "@rhc/lib/pipeline/errors.ts";
