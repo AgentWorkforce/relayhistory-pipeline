@@ -1,15 +1,15 @@
 {
   "schema": 1,
   "stage": "aws-sessions-dev",
-  "generatedAt": "2026-10-31T01:30:32.499Z",
+  "generatedAt": "2026-10-31T01:39:52.001Z",
   "target": {
     "accountId": "500268966557",
     "region": "us-west-2",
     "callerArn": "arn:aws:sts::500268966557:assumed-role/AWSReservedSSO_AdministratorAccess_fafac944cdc114d8/khaliq@agentrelay.com"
   },
   "source": {
-    "commit": "81dc4fd0c676625896cf6b6b2a62ca3305e32404",
-    "stackSourceSha256": "1ec8bed4c99ca5df72e2279599d567630516a426d06cc8905ec3e689132b2016",
+    "commit": "8ec4a50def652813e39fbe48d58bb81594b90b04",
+    "stackSourceSha256": "9d521ce243e1b963c6337079f255c3581bf5e367d114c0ae42ca8ac1b68d8050",
     "clean": true
   },
   "inputs": {
@@ -20,9 +20,12 @@
   "state": {
     "bucket": "alchemy-state-500268966557-us-west-2-an",
     "prefix": "96bulls/96bulls-aws/aws-sessions-dev/",
-    "bucketExisted": true,
+    "versioning": "Enabled",
+    "method": "snapshot",
     "objects": 42,
-    "digest": "047382425a217b87fc38909fe61a54a3d9834cb148d2e0bdafaffde8bb93f1c2"
+    "snapshotSha256": "c9173c063ec3873c894e8b7e19749797f462e28689c84a3c66e190f16e904b64",
+    "versionsDigest": "0f578593eb0fcb17ce532c16869cb31cc4a2eaf53b6ec1d7ca07a456b2d85e72",
+    "versionEntries": 252
   },
   "tools": {
     "alchemy": "2.0.0-beta.84",
@@ -35,13 +38,13 @@
   "outputs": {
     "plan": {
       "path": "docs/plans/aws-sessions-dev.plan.txt",
-      "sha256": "0377338e45c5457a92041d4f203b0761afb7df741647f0e2921a448f8c04a82d"
+      "sha256": "25cd5c94807551a1d76fe33e87a803cee532edf32a6c5b0c6649fbdde96fb872"
     },
     "detailed": {
       "path": "docs/plans/aws-sessions-dev.plan.detailed.txt",
-      "sha256": "a0282a070311f9dae2b64a7c12bea767b90a97fde68d60b70b6ce91eb9f744ec"
+      "sha256": "07c3fa28a9708698af362ac6dd9cab3f1b41f053c44299547cf526c8e67f5207"
     }
   },
   "summary": "Plan: 33 to create, 15 to update, 1 to adopted",
-  "note": "Read-only alchemy plan (state bucket existed; state digest unchanged across the run). Verified again by `96bulls up` before any change."
+  "note": "Planned against a read-only snapshot of the state (GETs pinned to version ids, in-memory Alchemy state): no state-bucket writes, no lease. The version listing (all versions and delete markers) was identical before and after. AWS provider reads only (Describe/List/Get). `96bulls up` re-checks everything before any change."
 }
