@@ -26,7 +26,9 @@ test("a classified state is projected into the directory", async () => {
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
-    for (const file of readdirSync(join(root, dir)).filter((f) => f.endsWith(".sql")).sort())
+    for (const file of readdirSync(join(root, dir))
+      .filter((f) => f.endsWith(".sql"))
+      .sort())
       await db.exec(read(`${dir}/${file}`));
   await db.query(
     `INSERT INTO sessions.session_index
@@ -47,7 +49,12 @@ test("a classified state is projected into the directory", async () => {
   const manifest = {
     trace_id: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
     revision: 1,
-    session: { workspace_id: "w", harness: "codex", session_id: "s", machine_id: "m" },
+    session: {
+      workspace_id: "w",
+      harness: "codex",
+      session_id: "s",
+      machine_id: "m",
+    },
     raw: { state: "closed", updated_at: new Date().toISOString() },
   };
   const handler = refereeHandler({

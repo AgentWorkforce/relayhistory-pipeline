@@ -32,6 +32,9 @@ async function database(): Promise<PGlite> {
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
   }
+  // The production PostgreSQL session is UTC whatever the client host's zone; in-process
+  // PGlite would inherit the host TZ, so pin it to model production.
+  await db.exec("SET TIME ZONE 'UTC'");
   return db;
 }
 
@@ -1215,12 +1218,12 @@ describe("p_until keeps the legacy direct-list semantics", () => {
     }
   });
 
-  test("searchRpcRequest passes until through unchanged and since > until is still refused", async () => {
+  test("searchRpcRequest sends until as canonical UTC and since > until is still refused", async () => {
     const built = searchRpcRequest({
       workspaceId: "ws-u",
       until: "2026-09-10T14:00:00+02:00",
     });
-    expect(built.ok && built.body.p_until).toBe("2026-09-10T14:00:00+02:00");
+    expect(built.ok && built.body.p_until).toBe("2026-09-10T12:00:00.000000Z");
     const error = (await rpc(u, claimsFor("org-u", ["ws-u"]), {
       p_workspace_id: "ws-u",
       p_since: "2026-09-10T13:00:00Z",
