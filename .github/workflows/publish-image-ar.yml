@@ -3,9 +3,10 @@
 # main, and the confirmation phrase must match. This file does not create
 # Workload Identity, IAM, GitHub variables, or credentials, and it does not
 # edit versions.lock.json or gcpProofEligible.
-# The job fails closed until a separate approval sets:
-#   vars.GCP_WORKLOAD_IDENTITY_PROVIDER
-#   vars.GCP_AR_PUBLISHER_SERVICE_ACCOUNT
+# The job fails closed unless the GitHub variables equal the pinned publisher:
+#   projects/955297012355/locations/global/workloadIdentityPools/github-actions/providers/github
+#   awf-ar-publisher@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com
+# Those same literals are checked again inside the helper before a stub or a network call.
 # google-github-actions/auth is intentionally absent. Its access_token output
 # is written to the runner's GITHUB_OUTPUT file. The credential helper below
 # exchanges the GitHub OIDC token for a registry token in memory and prints
@@ -43,6 +44,16 @@ jobs:
             exit 1
           fi
           command -v python3 >/dev/null
+          pinned_provider="projects/955297012355/locations/global/workloadIdentityPools/github-actions/providers/github"
+          pinned_service_account="awf-ar-publisher@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com"
+          if [ "$WIF_PROVIDER" != "$pinned_provider" ]; then
+            echo "workload identity provider does not match the pinned value" >&2
+            exit 1
+          fi
+          if [ "$WIF_SERVICE_ACCOUNT" != "$pinned_service_account" ]; then
+            echo "service account does not match the pinned value" >&2
+            exit 1
+          fi
           auth_dir=$(mktemp -d /dev/shm/ar-docker.XXXXXX)
           chmod 700 "$auth_dir"
           python3 - "$auth_dir/wif.json" <<'PY'
@@ -74,6 +85,8 @@ jobs:
           IAM = "https://iamcredentials.googleapis.com/v1"
           PROVIDER_RE = r"projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]{1,32}/providers/[a-z0-9-]{1,32}"
           SERVICE_ACCOUNT_RE = r"[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]+\.iam\.gserviceaccount\.com"
+          PINNED_PROVIDER = "projects/955297012355/locations/global/workloadIdentityPools/github-actions/providers/github"
+          PINNED_SERVICE_ACCOUNT = "awf-ar-publisher@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com"
 
           class NoRedirect(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -130,18 +143,22 @@ jobs:
                   fail("token exchange failed")
 
           def exchange(cfg):
+              import re
+              provider = cfg.get("provider") if isinstance(cfg, dict) else ""
+              service_account = cfg.get("service_account") if isinstance(cfg, dict) else ""
+              if provider != PINNED_PROVIDER:
+                  fail("workload identity provider does not match the pinned value")
+              if service_account != PINNED_SERVICE_ACCOUNT:
+                  fail("service account does not match the pinned value")
+              if not isinstance(provider, str) or not re.fullmatch(PROVIDER_RE, provider):
+                  fail("workload identity provider is invalid")
+              if not isinstance(service_account, str) or not re.fullmatch(SERVICE_ACCOUNT_RE, service_account):
+                  fail("service account is invalid")
               stub = os.environ.get("AR_EXCHANGE_STUB") or ""
               if stub:
                   if os.environ.get("AR_ALLOW_EXCHANGE_STUB") != "1":
                       fail("refusing exchange stub")
                   return stub
-              import re
-              provider = cfg.get("provider") if isinstance(cfg, dict) else ""
-              service_account = cfg.get("service_account") if isinstance(cfg, dict) else ""
-              if not isinstance(provider, str) or not re.fullmatch(PROVIDER_RE, provider):
-                  fail("workload identity provider is invalid")
-              if not isinstance(service_account, str) or not re.fullmatch(SERVICE_ACCOUNT_RE, service_account):
-                  fail("service account is invalid")
               jwt = github_jwt("https://iam.googleapis.com/" + provider)
               sts = post_json(
                   STS,
