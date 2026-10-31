@@ -9,6 +9,10 @@ import type { ProofConfig } from "./config.ts";
 import type { Step } from "./exec.ts";
 import type { Tenant } from "./leak-scan.ts";
 
+/** The deployed search RPC's exact signature (to_regprocedure matches it exactly). */
+export const SESSION_DIRECTORY_SEARCH_SIGNATURE =
+  "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const IDENT = /^[A-Za-z0-9_.:-]{1,128}$/;
 const TERM = /^[a-z0-9]{3,200}$/;
@@ -65,7 +69,7 @@ export function indexStateSql(sessionIds: readonly string[]): string {
               FROM sessions.session_index WHERE session_id = ANY(${sqlList(sessionIds, "text")})),
   'directory_present', to_regclass('sessions.session_directory') IS NOT NULL
     AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'sessions' AND table_name = 'session_directory' AND column_name = 'short_summary'),
-  'search_rpc_present', to_regprocedure('sessions.search_session_directory(text,text)') IS NOT NULL);`;
+  'search_rpc_present', to_regprocedure('${SESSION_DIRECTORY_SEARCH_SIGNATURE}') IS NOT NULL);`;
 }
 
 /** Separate query: it references session_directory, which may not exist (then indexStateSql says so first). */
@@ -87,7 +91,15 @@ export function directorySql(sessionIds: readonly string[]): string {
 export function searchBatchSql(t: Tenant, queries: ReadonlyArray<{ tag: string; q: string }>): string {
   if (!IDENT.test(t.orgId) || !IDENT.test(t.workspaceId)) throw new Error("refusing unsafe tenant literal");
   if (queries.length === 0) throw new Error("empty search batch");
-  const claims = JSON.stringify({ role: "session_directory_search_worker", app_metadata: { org_id: t.orgId, workspace_ids: [t.workspaceId] } });
+  // The RPC pins iss/aud/lifetime to sessions.session_directory_search_token_policy,
+  // which only the owner can read, so the claims are built from it before SET ROLE.
+  const claims = `SELECT set_config('request.jwt.claims', json_build_object(
+  'role', 'session_directory_search_worker',
+  'iss', (SELECT issuer FROM sessions.session_directory_search_token_policy WHERE singleton),
+  'aud', (SELECT audience FROM sessions.session_directory_search_token_policy WHERE singleton),
+  'iat', floor(extract(epoch FROM clock_timestamp()))::bigint,
+  'exp', floor(extract(epoch FROM clock_timestamp()))::bigint + 60,
+  'app_metadata', json_build_object('org_id', '${t.orgId}', 'workspace_ids', json_build_array('${t.workspaceId}')))::text, true) \\g /dev/null`;
   const body = queries.map(({ tag, q }) => {
     if (!TERM.test(q)) throw new Error("refusing unsafe search term");
     if (!IDENT.test(tag)) throw new Error("refusing unsafe tag");
@@ -97,7 +109,7 @@ SELECT json_build_object('tag', '${tag}',
   'ms', extract(epoch FROM clock_timestamp() - current_setting('proof.t0')::timestamptz) * 1000)
   FROM sessions.search_session_directory(${ident(t.workspaceId)}, '${q}') r;`;
   });
-  return ["BEGIN READ ONLY;", "SET LOCAL ROLE session_directory_search_worker;", `SELECT set_config('request.jwt.claims', '${claims}', true) \\g /dev/null`, ...body, "ROLLBACK;", ""].join("\n");
+  return ["BEGIN READ ONLY;", claims, "SET LOCAL ROLE session_directory_search_worker;", ...body, "ROLLBACK;", ""].join("\n");
 }
 
 export interface SearchResultLine {
