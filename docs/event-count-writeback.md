@@ -8,10 +8,10 @@ owner: mig-cutover-observability. Contract contributor: mig-e4-export-transform.
 | Input | Pin |
 | --- | --- |
 | Implementation base | `main` at `947d361bd1a37ab85bf892b84070f0c5ee18cad6` (carries #42) |
-| #57 output contract | Candidate `bd57d4ff5d13cd74b9dafaea9b8b1e1f869e4df7`, on that base. Draft and unreviewed; the coordinator confirms the pin |
+| #57 output contract | Final content at `bd57d4ff5d13cd74b9dafaea9b8b1e1f869e4df7`, but it must rebase onto `main` for #65. Repin to the post-rebase head the coordinator sends |
 
 The contract itself is in the #58 comment pinned to that head, and this doc follows
-its names. Until the coordinator confirms the pin, the migration, function, trigger
+its names. Until that repin, the migration, function, trigger
 and their tests build on `main` at the pin above, and the handler and consumer wait.
 
 ## Problem
@@ -125,6 +125,13 @@ ALTER TABLE sessions.session_index
   whether the CHECK can be added `NOT VALID` on the partitioned table, to avoid a
   scan under lock.
 
+**Provenance is writable only by the function.** `service_role` holds `GRANT ALL`,
+and a column REVOKE doesn't subtract from a table grant, so its table-level INSERT
+and UPDATE are dropped and every other column is granted back. A migration adding a
+`session_index` column must grant it too, or `service_role` can't write it. The
+owner, superusers and `pg_write_all_data` stay outside grants, and the sticky trigger
+still protects the count from them.
+
 Provenance columns are readable wherever `session_index` is. `work_key` repeats
 `manifest_key` plus a version, so it exposes nothing new.
 
@@ -149,7 +156,8 @@ login. PUBLIC, `anon` and `authenticated` get nothing.
 knows a session's full key, revision and `content_sha256` could write a count for
 it. The tenant boundary is the worker taking identity from `ctx`, plus the match
 on `content_sha256`, not the grant alone. helm-chart-chief is reviewing this
-boundary.
+boundary. The worker's held-job binding narrows it, since `record_normalized_event_count`
+is reached only by the consumer.
 
 ## Revision ordering
 
@@ -171,7 +179,13 @@ matches. This is stricter on purpose: a row behind the record waits on case 1.
 
 A count is only ever applied to the exact revision the row holds. Index and
 normalize run on separate queues, so case 1 is normal: the count waits on retry
-until the index catches up, and it leaves no orphan rows.
+until the index catches up, and it leaves no orphan rows. That retry stops at the
+stage's attempt budget and goes to the DLQ, so a never-indexed row can't retry
+forever.
+
+A `stale` drop relies on the newer revision's own event. If that revision is
+dead-lettered or normalization is off, reconcile has to cover it. Until then the
+count stays non-authoritative, which fails safe.
 
 - **Decreases are allowed:** no rule compares counts, so a revision with deletes
   writes a lower number.
@@ -189,25 +203,20 @@ until the index catches up, and it leaves no orphan rows.
 
 ## The `file-normalize` worker
 
-The pipeline owner owns this worker (ruling, 2026-10-31). It doesn't exist yet.
-Its credential is **queue-limited: claim, ack and retry on `file-normalize`, and
-send to `normalized-ready`, with no table access.**
+The pipeline owner owns this worker (ruling, 2026-10-31). Its credential is
+**queue-limited: no table access**, through `file_normalize_worker`, which is
+NOLOGIN, has no BYPASSRLS and has no privilege on any table.
 
-- **Role:** `file_normalize_worker`, NOLOGIN, no BYPASSRLS, no privileges on any
-  table. No read of `session_index`, no write of it, and no EXECUTE on
-  `record_normalized_event_count`.
-- **Queue access through functions only.** `pollPostgresStage` and
-  `postgresPipelineQueue` run SQL directly on `pipeline_jobs`, so this role can't
-  use them as they stand. SECURITY DEFINER functions take over each operation,
-  with the stage fixed inside the function, not passed by the caller: claim, start,
-  ack and retry on `file-normalize`, and enqueue on `normalized-ready`.
-- **Events and dead letters follow the same rule.** `handleStageQueue` also writes
-  `pipeline_events` and `pipeline_dead_letters`. These need functions fixed to this
-  stage too, or a log-only sink, which would lose quarantine. Quarantine must keep
-  working, so functions are the requirement.
-- **Object store:** its own IAM, separate from this role. Decided with the worker.
-
-This is a spec. Building those functions and the worker is separate work.
+- **Functions, not tables.** Stage-fixed SECURITY DEFINER functions cover claim,
+  renew, start, ack, retry, enqueue, record event, quarantine and resolve. The
+  migration and its tests are in the stage-functions PR, stacked on #64.
+- **Held-job binding.** After the claim, every call takes the job id and lease.
+  Tenant identity comes from that job's row, and enqueue accepts only a
+  `normalized-ready` record matching it. The role can claim any tenant's job, and
+  after that can write only about that session.
+- **Still to build:** `pollPostgresStage`, `postgresPipelineQueue` and the stores use
+  the tables directly, so a poller adapter must call these functions instead. The
+  worker, its login and its object-store IAM are also separate work.
 
 ## Failure and DLQ
 
@@ -285,7 +294,7 @@ across revisions, a backfill without one is refused rather than skipped, and a
    tenant-role denial.
 2. Repin to the reviewed #57 head when the coordinator confirms it.
 3. Stage registration, handler, typed parser, consumer and the DLQ path, with tests.
-4. The `file-normalize` worker and its queue functions.
+4. The poller adapter and the `file-normalize` worker. Its queue functions are done.
 5. Add the stage to the sampler's alert stages once #47 lands.
 
 Code and draft PR only. Applying the migration, enabling normalization and any
