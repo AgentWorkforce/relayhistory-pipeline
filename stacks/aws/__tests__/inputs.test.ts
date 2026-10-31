@@ -9,7 +9,7 @@ const approved = lock.images["services-aws"].approved;
 const example = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-proof.inputs.example.json", import.meta.url)), "utf8")) as AwsInputs;
 const filled = (patch: (i: AwsInputs) => void = () => {}) => {
   const i = structuredClone(example);
-  i.approval = { ...i.approval!, date: "2026-10-30", words: "approved applying stage A (aws-proof, create-only)" };
+  i.approval = { ...i.approval!, decision: "approved", date: "2026-10-30", quote: "approved applying stage A (aws-proof, create-only)" };
   i.eks!.tenantOrgId = "org_aws_proof";
   i.eks!.apiAccess = { publicAccessCidrs: ["203.0.113.7/32"] };
   patch(i);
@@ -27,7 +27,7 @@ describe("aws-proof: a fresh, fully hardened stage beside sessions-dev", () => {
   });
 
   it("refuses the example as committed: every <...> placeholder is named", () => {
-    expect(() => validateAwsInputs("aws-proof", example)).toThrow(/\$\.approval\.date, \$\.approval\.words, \$\.eks\.tenantOrgId, \$\.eks\.apiAccess\.publicAccessCidrs\[0\]/);
+    expect(() => validateAwsInputs("aws-proof", example)).toThrow(/\$\.approval\.decision, \$\.approval\.date, \$\.approval\.quote, \$\.eks\.tenantOrgId, \$\.eks\.apiAccess\.publicAccessCidrs\[0\]/);
     expect(() => validateAwsInputs("aws-proof", filled((i) => (i.$comment = "fill <this>")))).toThrow(/\$\.\$comment/);
   });
 

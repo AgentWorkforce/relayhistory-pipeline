@@ -3,6 +3,7 @@
   "accountId": "500268966557",
   "region": "us-west-2",
   "approval": {
+    "decision": "<the literal string approved, once Khaliq has approved>",
     "by": "Khaliq Gant",
     "date": "<YYYY-MM-DD of the approval>",
     "operations": [
@@ -11,7 +12,7 @@
     "stage": "aws-proof",
     "accountId": "500268966557",
     "region": "us-west-2",
-    "words": "<Khaliq's message, verbatim>"
+    "quote": "<Khaliq's message, verbatim>"
   },
   "budgetUsd": 300,
   "budgetEmail": "aws-budgets@agentrelay.com",

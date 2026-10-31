@@ -6,7 +6,10 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { alchemyStateBucket, alchemyStatePrefix } from "../../stacks/aws/preflight.ts";
-import { STACK_SOURCE_PATHS, provenanceMismatches, sanitizeInputs, sanitizePlan, sha256, stateDigest, type Observed, type Provenance } from "./plan-provenance.ts";
+import { STACK_SOURCE_PATHS, currentObjects, provenanceMismatches, sanitizeInputs, sanitizePlan, sha256, versionsDigest, type Observed, type Provenance, type VersionListing } from "./plan-provenance.ts";
+import type { StateSnapshot } from "../../stacks/aws/state-snapshot.ts";
+import { tmpdir } from "node:os";
+import { mkdtempSync, rmSync } from "node:fs";
 import { awsInvocation } from "./aws.ts";
 
 const run = (cmd: string, args: string[], cwd: string, env: Record<string, string> = {}) => {
@@ -33,13 +36,41 @@ function observeSource(root: string) {
   return { commit: run("git", ["rev-parse", "HEAD"], root).trim(), stackSourceSha256: sha256(run("git", ["ls-tree", "-r", "HEAD", "--", ...paths], root)), clean };
 }
 
+function listVersions(root: string, bucket: string, prefix: string, region: string): VersionListing {
+  const out: VersionListing = { Versions: [], DeleteMarkers: [] };
+  let token: string | undefined;
+  do {
+    const page = awsJson(root, ["s3api", "list-object-versions", "--bucket", bucket, "--prefix", prefix, "--region", region, ...(token ? ["--starting-token", token] : [])]) as VersionListing & { NextToken?: string };
+    out.Versions!.push(...(page.Versions ?? []));
+    out.DeleteMarkers!.push(...(page.DeleteMarkers ?? []));
+    token = page.NextToken;
+  } while (token);
+  return out;
+}
+
+/** Read-only view of the stage's state: bucket versioning and every version and delete marker. */
 function observeState(root: string, accountId: string, region: string, stage: string) {
   const bucket = alchemyStateBucket(accountId, region);
-  // Refuse rather than let Alchemy create a missing state bucket during a "plan".
-  run("aws", ["s3api", "head-bucket", "--bucket", bucket, "--region", region], root);
   const prefix = `${alchemyStatePrefix(stage)}/`;
-  const listed = awsJson(root, ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix, "--region", region]) as { Contents?: { Key: string; ETag: string }[] };
-  return { bucket, prefix, ...stateDigest(listed.Contents ?? []) };
+  const versioning = (awsJson(root, ["s3api", "get-bucket-versioning", "--bucket", bucket, "--region", region]) as { Status?: string }).Status ?? "Disabled";
+  const listing = listVersions(root, bucket, prefix, region);
+  const v = versionsDigest(listing);
+  return { bucket, prefix, versioning, listing, versionsDigest: v.digest, versionEntries: v.entries };
+}
+
+/** GET each current state object at its exact version id. */
+function snapshotState(root: string, stage: string, region: string, st: ReturnType<typeof observeState>): StateSnapshot {
+  const dir = mkdtempSync(join(tmpdir(), "96bulls-state-"));
+  try {
+    const objects = currentObjects(st.listing).map((o, n) => {
+      const file = join(dir, String(n));
+      run("aws", ["s3api", "get-object", "--bucket", st.bucket, "--key", o.key, "--version-id", o.versionId, "--region", region, file], root);
+      return { key: o.key, versionId: o.versionId, text: readFileSync(file, "utf8") };
+    });
+    return { schema: 1, stack: "96bulls-aws", stage, bucket: st.bucket, prefix: st.prefix, objects };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 export function capturePlan(root: string, stage: string, env: Record<string, string | undefined>) {
@@ -51,18 +82,25 @@ export function capturePlan(root: string, stage: string, env: Record<string, str
   const caller = awsJson(root, ["sts", "get-caller-identity"]) as { Account: string; Arn: string };
   if (caller.Account !== inputs.accountId) throw new Error(`STS caller is ${caller.Account}, inputs say ${inputs.accountId}`);
   const state = observeState(root, inputs.accountId, inputs.region, stage);
+  // Transient writes are detectable only in a versioned bucket.
+  if (state.versioning !== "Enabled") throw new Error(`state bucket ${state.bucket} is not versioned; a plan's writes could not be detected`);
+  const snap = snapshotState(root, stage, inputs.region, state);
+  const snapPath = join(root, ".96bulls", stage, "state-snapshot.json");
+  const snapText = JSON.stringify(snap);
+  writeFileSync(snapPath, snapText, { mode: 0o600 });
   const cidrs = inputs.eks?.apiAccess?.publicAccessCidrs ?? [];
   const exec = (detailed: boolean) => {
     const inv = awsInvocation("plan", stage, env, { detailed });
-    const r = spawnSync("bunx", inv.args, { cwd: root, encoding: "utf8", env: { ...process.env, ...inv.env }, maxBuffer: 256 * 1024 * 1024 });
+    // In-memory state from the snapshot: the plan writes nothing to the state bucket.
+    const r = spawnSync("bunx", inv.args, { cwd: root, encoding: "utf8", env: { ...process.env, ...inv.env, NINETY_SIX_BULLS_STATE_SNAPSHOT: snapPath }, maxBuffer: 256 * 1024 * 1024 });
     if (r.status !== 0) throw new Error(`plan failed:\n${r.stdout}\n${r.stderr}`);
     return sanitizePlan(`${r.stdout}${r.stderr}`, cidrs);
   };
   const plan = exec(false);
   const detailed = exec(true);
-  // State must not have moved while planning (nothing else was applying).
+  // Every version and delete marker must be unchanged: no write at all in the window, by anyone.
   const after = observeState(root, inputs.accountId, inputs.region, stage);
-  if (after.digest !== state.digest) throw new Error("Alchemy state changed while planning; capture again");
+  if (after.versionsDigest !== state.versionsDigest) throw new Error("Alchemy state bucket changed during the capture (a version or delete marker appeared); capture again");
   const p = planPaths(root, stage);
   mkdirSync(p.dir, { recursive: true });
   const sanitized = `${JSON.stringify(sanitizeInputs(inputs), null, 2)}\n`;
@@ -77,7 +115,16 @@ export function capturePlan(root: string, stage: string, env: Record<string, str
     target: { accountId: inputs.accountId, region: inputs.region, callerArn: caller.Arn },
     source: { commit: src.commit, stackSourceSha256: src.stackSourceSha256, clean: true },
     inputs: { sha256: sha256(rawInputs), sanitizedPath: `docs/plans/${stage}.inputs.sanitized.json`, sanitizedSha256: sha256(sanitized) },
-    state: { bucket: state.bucket, prefix: state.prefix, bucketExisted: true, objects: state.objects, digest: state.digest },
+    state: {
+      bucket: state.bucket,
+      prefix: state.prefix,
+      versioning: "Enabled",
+      method: "snapshot",
+      objects: snap.objects.length,
+      snapshotSha256: sha256(snapText),
+      versionsDigest: state.versionsDigest,
+      versionEntries: state.versionEntries,
+    },
     tools: {
       alchemy: version("alchemy"),
       "@alchemy.run/aws": version("@alchemy.run/aws"),
@@ -91,7 +138,7 @@ export function capturePlan(root: string, stage: string, env: Record<string, str
       detailed: { path: `docs/plans/${stage}.plan.detailed.txt`, sha256: sha256(detailed) },
     },
     summary: /Plan: .*/.exec(plan)?.[0] ?? "no summary line",
-    note: "Read-only alchemy plan (state bucket existed; state digest unchanged across the run). Verified again by `96bulls up` before any change.",
+    note: "Planned against a read-only snapshot of the state (GETs pinned to version ids, in-memory Alchemy state): no state-bucket writes, no lease. The version listing (all versions and delete markers) was identical before and after. AWS provider reads only (Describe/List/Get). `96bulls up` re-checks everything before any change.",
   };
   writeFileSync(p.provenance, `${JSON.stringify(record, null, 2)}\n`);
   return record;
@@ -113,7 +160,7 @@ export function verifyCapturedPlan(root: string, stage: string) {
     stackSourceSha256: src.stackSourceSha256,
     clean: src.clean,
     inputsSha256: sha256(readFileSync(join(root, ".96bulls", stage, "aws-inputs.json"), "utf8")),
-    state: observeState(root, inputs.accountId, inputs.region, stage),
+    state: (({ versioning, versionsDigest, versionEntries }) => ({ versioning, versionsDigest, versionEntries }))(observeState(root, inputs.accountId, inputs.region, stage)),
     planSha256: sha256(readFileSync(p.plan, "utf8")),
     detailedSha256: sha256(readFileSync(p.detailed, "utf8")),
   };

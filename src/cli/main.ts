@@ -315,7 +315,7 @@ async function aws(verb: "plan" | "up" | "down", stage: string) {
     if (verb === "up") {
       const { verifyCapturedPlan } = await import("./aws-provenance-io.ts");
       const rec = verifyCapturedPlan(ROOT, stage);
-      console.log(`96bulls: captured plan verified (${rec.summary}, source ${rec.source.commit.slice(0, 12)}, state ${rec.state.digest.slice(0, 12)})`);
+      console.log(`96bulls: captured plan verified (${rec.summary}, source ${rec.source.commit.slice(0, 12)}, state ${rec.state.versionsDigest.slice(0, 12)})`);
     }
   } catch (err) {
     die((err as Error).message);

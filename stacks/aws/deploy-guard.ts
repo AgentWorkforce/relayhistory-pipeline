@@ -64,10 +64,12 @@ export function parseCalendarDate(s: string | undefined): Date | undefined {
 
 /**
  * Khaliq's approval for one exact operation on one exact target, as a record,
- * not prose to be pattern-matched. `words` is his message verbatim, kept for
- * the audit trail; it must not countermand the record.
+ * never as prose to be interpreted. `decision` must be exactly "approved";
+ * anything else (absent, "denied", "refused", ...) refuses. `quote` is his
+ * message verbatim for the audit trail and is never parsed.
  */
 export interface Approval {
+  decision: string;
   by: string;
   /** YYYY-MM-DD, a real date, not in the future, at most APPROVAL_MAX_AGE_DAYS old. */
   date: string;
@@ -75,12 +77,11 @@ export interface Approval {
   stage: string;
   accountId: string;
   region: string;
-  words: string;
+  quote: string;
 }
 
 export const APPROVER = "Khaliq Gant";
 export const APPROVAL_MAX_AGE_DAYS = 30;
-const COUNTERMAND = /\b(do\s+not|don'?t|never|not\s+(?:yet|approved|cleared|deploy|apply|destroy)|hold|stop|wait|revoke[sd]?|cancel(?:led)?|no\s+go)\b/i;
 
 export function assertApproval(mode: AwsMode, stage: string, inputs: { accountId: string; region: string; approval?: Approval }, now: Date): void {
   if (mode === "plan") return;
@@ -89,6 +90,7 @@ export function assertApproval(mode: AwsMode, stage: string, inputs: { accountId
     throw new Error(`96bulls: ${mode} of ${stage} is not approved: ${why}. Nothing was changed.`);
   };
   if (!a) return refuse("aws-inputs.json has no `approval` record");
+  if (a.decision !== "approved") refuse(`approval.decision is ${JSON.stringify(a.decision)}, not "approved"`);
   if (a.by !== APPROVER) refuse(`approval.by must be "${APPROVER}"`);
   const day = parseCalendarDate(a.date);
   if (!day) refuse(`approval.date ${JSON.stringify(a.date)} is not a real YYYY-MM-DD date`);
@@ -98,8 +100,7 @@ export function assertApproval(mode: AwsMode, stage: string, inputs: { accountId
   if (!Array.isArray(a.operations) || !a.operations.includes(mode)) refuse(`approval.operations does not include "${mode}"`);
   if (a.stage !== stage) refuse(`approval.stage is ${JSON.stringify(a.stage)}`);
   if (a.accountId !== inputs.accountId || a.region !== inputs.region) refuse("approval.accountId/region do not match the inputs");
-  if (!a.words?.trim() || a.words.trim().length < 8) refuse("approval.words must hold Khaliq's message verbatim");
-  if (COUNTERMAND.test(a.words)) refuse("approval.words countermand the approval");
+  if (typeof a.quote !== "string" || a.quote.trim().length < 8) refuse("approval.quote must hold Khaliq's message verbatim (kept for the audit trail, never parsed)");
 }
 
 /**

@@ -476,11 +476,12 @@ The stack itself refuses, before declaring anything and whatever started it
 - `NINETY_SIX_BULLS_CONFIRM_ACCOUNT` other than `accountId`; a live STS caller
   or provider region other than `accountId`/`region`;
 - for deploy and destroy, a missing or mismatched **approval record**:
-  `{ "by": "Khaliq Gant", "date": "YYYY-MM-DD", "operations": ["deploy"],
-  "stage", "accountId", "region", "words": "<his message verbatim>" }`. The
-  date must be a real calendar day, not in the future, at most 30 days old;
-  `operations`, `stage`, `accountId` and `region` must match exactly; `words`
-  that countermand ("do not", "hold", "wait", "not yet", ...) are refused. The
+  `{ "decision": "approved", "by": "Khaliq Gant", "date": "YYYY-MM-DD",
+  "operations": ["deploy"], "stage", "accountId", "region", "quote": "<his
+  message verbatim>" }`. `decision` must be exactly `"approved"`; anything
+  else refuses. The date must be a real calendar day, not in the future, at
+  most 30 days old; `operations`, `stage`, `accountId` and `region` must match
+  exactly. `quote` is kept for the audit trail and never interpreted. The
   free-text `clearedBy` field is informational only;
 - deploy without `NINETY_SIX_BULLS_CONFIRM_STAGE=<stage>`; destroy without
   `NINETY_SIX_BULLS_CONFIRM_DESTROY=<stage>`, and destroy of `aws-sessions-dev`
@@ -506,15 +507,27 @@ NINETY_SIX_BULLS_CONFIRM_DESTROY=aws-proof bin/96bulls down aws-proof   # rollba
 sanitized inputs and `<stage>.provenance.json` to `docs/plans/`. The record
 holds the commit and a sha256 of the committed stack source (stacks, src,
 packages, supabase, package.json, bun.lock, versions.lock.json, tsconfig.json;
-capture refuses uncommitted changes there), the inputs file sha256, the
-stage's Alchemy state (object count and a digest of keys and ETags, read before
-and after planning), the STS caller, account and region, the alchemy, provider,
-bun, aws CLI and helm versions, and the sha256 of each plan file. Capture
-refuses if the Alchemy state bucket does not exist, because Alchemy would
-create it on first use; with the bucket present, planning only reads.
-`up` re-reads all of it and refuses unless every value still matches: a
-reviewed plan is what gets applied, or nothing. Write the approval record into
-the inputs before capturing (it is part of the inputs hash).
+capture refuses uncommitted changes there), the inputs file sha256, the STS
+caller, account and region, the alchemy, provider, bun, aws CLI and helm
+versions, the sha256 of each plan file, and the state evidence below. `up`
+re-reads all of it and refuses unless every value still matches: a reviewed
+plan is what gets applied, or nothing. Write the approval record into the
+inputs before capturing (it is part of the inputs hash).
+
+**How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
+read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and
+reconciles the state bucket's versioning, ownership and encryption if they
+drifted. So a capture never plans against it. It GETs the stage's current
+state objects, pinned to their version ids, into a local snapshot
+(`.96bulls/<stage>/state-snapshot.json`, gitignored, mode 600) and plans
+against Alchemy's in-memory state built from it
+(`stacks/aws/state-snapshot.ts`; refused for anything but a plan). AWS
+providers still read live resources (Describe/List/Get). The state bucket must
+be versioned: capture records a digest of every version and delete marker under
+the stage's prefix and requires it to be identical before and after the run,
+so any write in the window, even one undone (a lease PUT then DELETE leaves a
+version and a marker), is detected. `up` requires the same digest, i.e. no
+state write by anyone since the capture.
 
 Reversibility:
 

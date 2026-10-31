@@ -5,13 +5,14 @@ import { assertApproval, assertAwsDeploymentTarget, assertClearance, awsMode, fi
 
 const NOW = new Date("2026-10-30T18:00:00Z");
 const approval: Approval = {
+  decision: "approved",
   by: "Khaliq Gant",
   date: "2026-10-30",
   operations: ["deploy"],
   stage: "aws-proof",
   accountId: "500268966557",
   region: "us-west-2",
-  words: "approved applying stage A (aws-proof, create-only)",
+  quote: "approved applying stage A (aws-proof, create-only)",
 };
 const inputs = { accountId: "500268966557", region: "us-west-2", approval };
 const env = { NINETY_SIX_BULLS_CONFIRM_ACCOUNT: "500268966557", NINETY_SIX_BULLS_CONFIRM_STAGE: "aws-proof" };
@@ -44,8 +45,19 @@ describe("AWS deploy guards", () => {
     expect(deploy({})).not.toThrow();
   });
 
-  it("refuses the review's repro: negative wording on an impossible date", () => {
-    expect(deploy({ words: "Khaliq Gant said DO NOT deploy this stage on 2026-99-99" })).toThrow(/countermand/);
+  it("refuses unless decision is exactly \"approved\", whatever the quote says", () => {
+    for (const [decision, quote] of [
+      ["refused", "I refuse to approve this deployment"],
+      ["denied", "deployment is denied"],
+      ["unauthorized", "deployment is unauthorized"],
+      ["no", "absolutely no deployment"],
+      ["Approved", "go ahead"],
+      ["approved ", "go ahead"],
+      [undefined, "go ahead and deploy"],
+    ] as const)
+      expect(deploy({ decision: decision as string, quote })).toThrow(/approval.decision is .*not "approved"/);
+    // The quote is never parsed: approval comes only from the decision field.
+    expect(deploy({ quote: "I refuse to approve this deployment" })).not.toThrow();
     expect(deploy({ date: "2026-99-99" })).toThrow(/not a real YYYY-MM-DD date/);
   });
 
@@ -57,8 +69,7 @@ describe("AWS deploy guards", () => {
     expect(deploy({ stage: "aws-sessions-dev" })).toThrow(/approval.stage/);
     expect(deploy({ accountId: "111122223333" })).toThrow(/accountId\/region/);
     expect(deploy({ region: "us-east-1" })).toThrow(/accountId\/region/);
-    expect(deploy({ words: "" })).toThrow(/verbatim/);
-    for (const w of ["hold off on this", "wait until Monday", "not yet, sorry", "please don't apply", "never deploy", "approval revoked"]) expect(deploy({ words: w })).toThrow(/countermand/);
+    expect(deploy({ quote: "" })).toThrow(/verbatim/);
     expect(() => assertApproval("deploy", "aws-proof", { accountId: "500268966557", region: "us-west-2" }, NOW)).toThrow(/no `approval` record/);
     expect(deploy({ date: "<YYYY-MM-DD of the approval>" })).toThrow(/placeholder/);
   });

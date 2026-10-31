@@ -32,6 +32,7 @@ import { eksStage } from "./eks.ts";
 import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy } from "./hardening.ts";
 import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "./inputs.ts";
 import { assertAwsDeploymentTarget, assertClearance, awsMode, type AwsMode } from "./deploy-guard.ts";
+import { snapshotStateLayer } from "./state-snapshot.ts";
 import { alchemyStateBucket, alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
 import { networkPolicies } from "./proof-addons.ts";
 import { hoopdbBackend } from "./hardening.ts";
@@ -58,6 +59,8 @@ function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
   }
   // The operation comes from Alchemy's own argv, so a direct `alchemy destroy` is gated too.
   const mode = awsMode(process.env, process.argv);
+  if (process.env.NINETY_SIX_BULLS_STATE_SNAPSHOT && mode !== "plan")
+    throw new Error(`96bulls: NINETY_SIX_BULLS_STATE_SNAPSHOT is for plans only; a ${mode} must use the live state. Nothing was changed.`);
   // Placeholders anywhere, the typed account (and stage), Khaliq's approval record, destroyable stage.
   assertClearance(mode, stage, inputs, process.env);
   assertRegion(inputs.region);
@@ -74,7 +77,11 @@ export default Alchemy.Stack(
   "96bulls-aws",
   {
     providers: Layer.mergeAll(AWS.providers(), Kubernetes.providers(), Cloudflare.providers(), SupabaseProvider()),
-    state: AWS.state({ prefix: "96bulls" }),
+    // A captured plan runs against a read-only snapshot (state-snapshot.ts): AWS.state writes a
+    // lease and may reconcile the bucket even for `alchemy plan`.
+    state: process.env.NINETY_SIX_BULLS_STATE_SNAPSHOT
+      ? snapshotStateLayer(process.env.NINETY_SIX_BULLS_STATE_SNAPSHOT)
+      : AWS.state({ prefix: "96bulls" }),
   },
   Effect.gen(function* () {
     const stage = yield* Stage;

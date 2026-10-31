@@ -7,9 +7,16 @@
  * What a record binds: the source tree the stack is built from (and that it was
  * clean), the inputs file (sha256), the stage's Alchemy state objects (digest of
  * keys + ETags), the tool versions, the STS caller, account and region, and the
- * sha256 of each plan file. The state bucket must already exist: Alchemy creates
- * a missing one on first use, so capture refuses rather than letting a "plan"
- * create it.
+ * sha256 of each plan file.
+ *
+ * Read-only by construction: `AWS.state` writes a lease (and may reconcile the
+ * bucket) even for `alchemy plan`, so capture never plans against it. It reads
+ * the stage's state objects with GETs pinned to version ids into a local
+ * snapshot and plans against that (stacks/aws/state-snapshot.ts). The state
+ * bucket must be versioned, and its full version listing for the stage (every
+ * version and delete marker) must be identical before and after: a transient
+ * write by anyone during the window leaves a version and is caught. `up`
+ * requires the listing to be unchanged since capture.
  */
 import { createHash } from "node:crypto";
 
@@ -25,17 +32,47 @@ export interface Provenance {
   target: { accountId: string; region: string; callerArn: string };
   source: { commit: string; stackSourceSha256: string; clean: true };
   inputs: { sha256: string; sanitizedPath: string; sanitizedSha256: string };
-  state: { bucket: string; prefix: string; bucketExisted: true; objects: number; digest: string };
+  state: {
+    bucket: string;
+    prefix: string;
+    versioning: "Enabled";
+    method: "snapshot";
+    /** Current (latest, not deleted) objects planned against. */
+    objects: number;
+    /** sha256 of the snapshot file's objects (key, version id, text). */
+    snapshotSha256: string;
+    /** sha256 of every version and delete marker under the prefix; equal before and after the run. */
+    versionsDigest: string;
+    versionEntries: number;
+  };
   tools: Record<string, string>;
   outputs: { plan: { path: string; sha256: string }; detailed: { path: string; sha256: string } };
   summary: string;
   note: string;
 }
 
-/** Digest of the stage's state objects: sorted `key etag` lines. Any change to state changes it. */
-export function stateDigest(objects: { Key: string; ETag: string }[]) {
-  const lines = objects.map((o) => `${o.Key} ${o.ETag}`).sort();
-  return { objects: lines.length, digest: sha256(lines.join("\n")) };
+export interface VersionListing {
+  Versions?: { Key: string; VersionId: string; IsLatest: boolean; ETag: string }[];
+  DeleteMarkers?: { Key: string; VersionId: string; IsLatest: boolean }[];
+}
+
+/**
+ * Digest of every version and delete marker under the prefix. A write that
+ * was later undone (a lease PUT then DELETE) still leaves a version and a
+ * marker, so it changes this even though the final keys and ETags do not.
+ */
+export function versionsDigest(l: VersionListing) {
+  const lines = [
+    ...(l.Versions ?? []).map((v) => `V ${v.Key} ${v.VersionId} ${v.ETag} ${v.IsLatest}`),
+    ...(l.DeleteMarkers ?? []).map((d) => `D ${d.Key} ${d.VersionId} ${d.IsLatest}`),
+  ].sort();
+  return { entries: lines.length, digest: sha256(lines.join("\n")) };
+}
+
+/** The objects a plan reads: the latest version of each key that is not deleted. */
+export function currentObjects(l: VersionListing) {
+  const deleted = new Set((l.DeleteMarkers ?? []).filter((d) => d.IsLatest).map((d) => d.Key));
+  return (l.Versions ?? []).filter((v) => v.IsLatest && !deleted.has(v.Key)).map((v) => ({ key: v.Key, versionId: v.VersionId })).sort((a, b) => a.key.localeCompare(b.key));
 }
 
 /** Inputs with the operator's address removed, safe to commit. */
@@ -62,7 +99,7 @@ export interface Observed {
   stackSourceSha256: string;
   clean: boolean;
   inputsSha256: string;
-  state: { objects: number; digest: string };
+  state: { versioning: string; versionsDigest: string; versionEntries: number };
   planSha256: string;
   detailedSha256: string;
 }
@@ -79,8 +116,9 @@ export function provenanceMismatches(p: Provenance, o: Observed): string[] {
   if (!o.clean) out.push("stack source has uncommitted changes");
   cmp("stack source", p.source.stackSourceSha256, o.stackSourceSha256);
   cmp("inputs", p.inputs.sha256, o.inputsSha256);
-  cmp("state objects", p.state.objects, o.state.objects);
-  cmp("state digest", p.state.digest, o.state.digest);
+  cmp("state bucket versioning", p.state.versioning, o.state.versioning);
+  cmp("state versions", p.state.versionEntries, o.state.versionEntries);
+  cmp("state digest", p.state.versionsDigest, o.state.versionsDigest);
   cmp("plan file", p.outputs.plan.sha256, o.planSha256);
   cmp("detailed plan file", p.outputs.detailed.sha256, o.detailedSha256);
   return out;
