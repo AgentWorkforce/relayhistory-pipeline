@@ -15,7 +15,7 @@ automatically. Each step needs Khaliq's explicit OK.
    An attestation lapses after 7 days, so readers must keep restarting or
    re-attesting, and a rollback stops counting when its row lapses.
 5. Confirm with `select reader, release_sha, attested_at from
-   sessions.manifest_readiness;`. Every reader must appear.
+sessions.manifest_readiness;`. Every reader must appear.
 
 ## Client releases
 
