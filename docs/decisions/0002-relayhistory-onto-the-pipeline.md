@@ -121,13 +121,13 @@ pgvector in Supabase.
   - Full history is served by the store-agnostic history store (0001
     Amendment 1).
   - Self-host may run the window unbounded.
-- **Window length:** 7, 14 or 30 days. It is chosen by Khaliq (K-42) after
-  the counts-only shape extraction (K-38) sizes each option.
+- **Window length: 14 days** (Khaliq, 2026-10-31, K-42). The byte size is
+  measured by the counts-only shape extraction (K-38) before the disk
+  resize.
 - **Content rules:**
   - The text is scrubbed before storage, through the same scrub hop as S3
     raw.
-  - Per-event text is capped, with a 4 KB prefix proposed for legacy
-    parity.
+  - **Complete event text**, with no per-event cap (K-42).
   - No embeddings.
   - RLS on every row, and every index leads with `org_id`.
 
@@ -149,7 +149,7 @@ pgvector in Supabase.
 
 ### Still needs Khaliq's explicit OK for each exact action
 
-- choosing the window length (K-42);
+- the window length is decided (K-42: 14 days, complete text);
 - applying the migration and enabling the writer and retention job (K-43);
 - resizing the disk (K-32).
 

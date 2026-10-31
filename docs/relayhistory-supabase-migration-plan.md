@@ -63,12 +63,13 @@ cutover.
 | 2026-10-31 | K-38 | Counts-only, read-only shape extraction from production is approved; **no corpus movement** | Khaliq, direct approval, confirmed 2026-10-31 | Allows aggregate counts and sizes (per-org session/event counts, size distributions, table sizes) to answer Q7, Q9 and Q11 and to shape the synthetic corpus. No content, query text or identifiers leave production. |
 | 2026-10-31 | K-39 | "ObsessionDB off the hot path" | Khaliq, direct, lead session | Restructures search (section 6, "Search architecture").<br>- S3 is the source of truth, and ObsessionDB is a derived, rebuildable index fed by an async indexer. Ingest never waits on it.<br>- One search interface with two adapters. The Postgres adapter is the self-host default; on hosted it serves a **bounded recent window** of transcript text in Supabase (trigram/FTS) plus metadata and summary search. The ObsessionDB adapter (any ClickHouse-protocol store) serves full history.<br>- Hosted search queries both and merges. ObsessionDB gets a roughly 1-2 s budget. On its error or timeout, the response returns the Postgres results labelled "partial: older history unavailable": never an unlabelled empty result, and never a 5xx for that case.<br>- Recent-window freshness no longer depends on the indexer.<br>- This lowers the stakes of the conditional K-28.<br>- A draft amendment to 0002 is in this PR, and the Supabase disk sizing for the window is folded into K-32. |
 | 2026-10-31 | K-40 | **Amazon OpenSearch Service is a third candidate** for the full-history transcript index, alongside ObsessionDB (conditional, K-28) and ClickHouse Cloud (trial, K-37). A **synthetic-only OpenSearch trial is approved in the proof account 500268966557 / `us-west-2`, about $50 cap.** | Khaliq, direct, 2026-10-31 | The store is decided by the same benchmark and evidence gate for every candidate: G-T0E is generalised (section 6). OpenSearch is expected to score E4, E5 and E6 through AWS VPC, IAM and compliance, and to be weaker on the cost of substring indexing (E1). The history adapter interface is **store-agnostic**, not just ClickHouse-protocol. A trial is not production provisioning. |
+| 2026-10-31 | K-42 | **Window = 14 days**; **complete event text** in the window, not a 4 KB prefix (closes Q23); **history-store budget = 1.5 s** (closes Q24) | Khaliq, direct, 2026-10-31 | Recent window = the last 14 days of complete scrubbed event text. The final byte size is still to be measured by the K-38 counts-only extraction before the disk resize (K-32). The merge/fallback (G-T1M) uses a 1.5 s hard budget for the history store. |
 | 2026-10-31 | K-22 | "Forward-only after flip" | Khaliq, lead session, relayed by the coordinator | Option R2 (section 11). T0 can be aborted up to the flip. After the flip there is no data rollback to Neon, and no reverse-sync (G-V) is built. |
 
 **Relay status.** helm-chart-chief records relayed rulings as **PROPOSED**
 until Khaliq confirms them in its own session.
 - **Confirmed directly (2026-10-31):** K-28 (restated as conditional), K-36,
-  K-37, K-38, K-39 and K-40.
+  K-37, K-38, K-39, K-40 and K-42.
 - The other rows were relayed by the coordinator from Khaliq's lead
   session. They stay proposed in that sense until helm-chart-chief records
   them as confirmed.
@@ -98,7 +99,7 @@ every step in section 15 still needs its own OK.
      on it.
 
    Hosted search queries both and merges them. If the history store errors
-   or exceeds its roughly 1-2 s budget, the response returns the Postgres
+   or exceeds its **1.5 s** budget (K-42), the response returns the Postgres
    results labelled "partial: older history unavailable". Pre-T0 history is
    served from the frozen Neon T0 child branch (K-6) until it is loaded.
    The dashboard's ranked search is keyword-only before T0 (K-36). Gate
@@ -221,7 +222,7 @@ sizing) and is folded into K-32.
 | Worker to Supabase | Direct TCP through Supavisor (relayhistory-cloud #225), one client per request. Metadata reads go through PostgREST (#226). Hyperdrive only if the benchmark justifies it. | `docs/relayhistory-supabase-migration.md` |
 | Worker to S3 | The S3 API with `PIPELINE_RAW_S3_{ENDPOINT,REGION,BUCKET,ACCESS_KEY_ID,SECRET_ACCESS_KEY,SSE}`. A Worker cannot use IAM roles, so this is a long-lived IAM access key. Security gate S5 covers it. | relayhistory-cloud `lib/pipeline/adapter.ts` |
 | Auth | Hosted RelayAuth (cloud `packages/relayauth`, Cloudflare Worker + D1), `@relayauth/server` 0.2.35 on cloud `trunk` (#5886). A **separate** search issuer and key (relayauth #116, draft). Supabase trusts only that issuer for `session_directory_search_worker`. | #63, #72, #73, relayauth #116 |
-| Transcript search: one interface, two adapters (K-39) | **Postgres adapter.** On hosted it uses Supabase `sessions`: a **bounded recent window** of scrubbed transcript text with trigram and FTS indexes, plus `session_directory` metadata and summary search. On self-host it is the default, with an unbounded window. **History adapter:** store-agnostic interface. The candidates are ObsessionDB (intended, K-28, conditional), ClickHouse Cloud, and Amazon OpenSearch Service (K-40), chosen by G-T0E, in AWS `us-east-1` (K-33). It holds full history and is fed by an **async indexer** from S3 normalized objects; ingest never waits on it. Hosted search queries both and merges, and gives the history store a roughly 1-2 s budget, falling back to labelled partial results. Proof service: `relay-transcript-proof`, `us-west-2`. Open: hosting and account (Q21). | K-39; 0002 Amendment 1 (draft) |
+| Transcript search: one interface, two adapters (K-39) | **Postgres adapter.** On hosted it uses Supabase `sessions`: a **bounded recent window** of scrubbed transcript text with trigram and FTS indexes, plus `session_directory` metadata and summary search. On self-host it is the default, with an unbounded window. **History adapter:** store-agnostic interface. The candidates are ObsessionDB (intended, K-28, conditional), ClickHouse Cloud, and Amazon OpenSearch Service (K-40), chosen by G-T0E, in AWS `us-east-1` (K-33). It holds full history and is fed by an **async indexer** from S3 normalized objects; ingest never waits on it. Hosted search queries both and merges, and gives the history store a 1.5 s budget (K-42), falling back to labelled partial results. Proof service: `relay-transcript-proof`, `us-west-2`. Open: hosting and account (Q21). | K-39; 0002 Amendment 1 (draft) |
 | Transcript search, pre-T0 sessions | Legacy `ILIKE`/trigram, run on the frozen T0 child branch (K-6) | 0002; #226 currently fails it closed, which G3 must change |
 | Neon after T0 | `sessions` is fenced read-only. A child branch at the T0 LSN serves bounded fallback reads and the export. Cloud's `public` schema stays on Neon, so "Neon retirement" (A10) means retiring the `sessions` schema, **not** deleting the project. | switch-first I6 |
 
@@ -325,7 +326,7 @@ So after T0:
  ingest → S3 (source of truth) ─┬─ pipeline stage ─► Supabase recent window (trigram/FTS, bounded)  ← Postgres adapter
                                 └─ async indexer ──► history store (full history; store-agnostic)  ← history adapter
  query → search interface ─┬─ Postgres adapter (recent window + metadata/summary) ─┐
-                           ├─ history adapter (budget ~1-2 s)                       ├─► merge (G-T5) ─► response (+ partial label)
+                           ├─ history adapter (budget 1.5 s, K-42)                  ├─► merge (G-T5) ─► response (+ partial label)
                            └─ Neon T0 child (pre-T0, until loaded; K-6)             ┘
 ```
 
@@ -333,9 +334,8 @@ So after T0:
   asynchronous, so its lag or outage never blocks ingest and never delays
   recent-window freshness.
 - **The recent window** is fed by a pipeline stage from the same normalized
-  objects, idempotent by content hash. It holds scrubbed event text with a
-  4 KB-per-event prefix for legacy parity *(proposed)*, and only within the
-  window. A daily retention job deletes rows older than the window.
+  objects, idempotent by content hash. It holds **complete scrubbed event
+  text** (K-42), for the **last 14 days** only (K-42). A daily retention job deletes rows older than the window.
   Tombstones and resets delete immediately. RLS applies, there are no
   embeddings, and erasure follows the 0002 Amendment 1 rules.
 - **Store-agnostic history adapter (K-39, K-40):** one interface, defined
@@ -350,31 +350,34 @@ So after T0:
 - **Self-host:** the Postgres adapter with an unbounded window is the
   default. The history adapter is optional.
 
-### Recent-window sizing (input to K-32; the window length is decided after K-38)
+### Recent-window sizing (input to K-32): 14 days, complete text (K-42)
 
-Window size ≈ (scrubbed text bytes per day, 4 KB-per-event prefix) × days ×
-(1 + index overhead). Trigram GIN plus FTS overhead is typically 1.5-3× the
-text; measure it on the phase 2 snapshot.
+**Decided:** 14 days of **complete** scrubbed event text, with no 4 KB
+cap. The byte size is **not yet measured**. The K-38 counts-only
+extraction must fill it in before the disk resize (K-32).
 
-The per-day bytes come from the K-38 counts-only extraction: an aggregate
-of `sum(least(octet_length(content), 4096))` and the event count per day
-for the last 30 days, per org and in total. Only aggregates leave
-production.
+Window size ≈ D × 14 × (1 + index overhead):
+- D is the scrubbed text bytes per day, complete event text;
+- trigram GIN plus FTS overhead is typically 1.5-3× the text; measure it on
+  the phase 2 snapshot.
 
-| Option | Text | With indexes (1.5-3×) | Notes |
+The K-38 extraction is aggregate only: `sum(octet_length(content))` and the
+event count per day for the last 30 days, per org and in total, plus the
+p50/p95/p99 and maximum event size, because complete text includes large
+tool outputs. Only aggregates leave production.
+
+| Window | Text | With indexes (1.5-3×) | Status |
 | --- | --- | --- | --- |
-| 7 days | 7 × D | 17.5-30 × D | smallest disk; more queries depend on the history store |
-| **14 days (proposed default)** | 14 × D | 35-60 × D | covers two working weeks |
-| 30 days | 30 × D | 75-120 × D | matches legacy's 30-day keyword-pool window (`KEYWORD_POOL_WINDOW_MS`), so parity is easiest |
+| **14 days (decided, K-42)** | 14 × D | 35-60 × D | **chosen**; D to be measured |
+| 7 days / 30 days | 7 × D / 30 × D | 17.5-30 × D / 75-120 × D | not chosen; kept for reference |
 
-D, the bytes per day, is **unknown until K-38 runs**. Khaliq picks the
-window from this table once D is filled in (K-42). The Supabase disk
-(K-32) is then sized as window size + metadata + copy set + 50% headroom.
+The Supabase disk (K-32) is sized as window size + metadata + copy set +
+50% headroom, **only after D is measured**.
 
-
-
-Earlier options T1 (fail closed), T2 alone (post-T0 sessions metadata-only) and T4
-are rejected. T3 (delay T0 until V2) is in effect for post-T0 content.
+**Watch item:** complete text puts very large events, such as long tool
+outputs, into trigram GIN. The phase 2 benchmark (SLO row 15) must cover
+the largest-event tail. If index cost is extreme, a per-event cap needs a
+new decision; it is not assumed here.
 
 ### Why V1 alone is not enough
 
@@ -435,7 +438,7 @@ proven on the phase 2 snapshot and with the live-protocol writer.
 | G-T0 | **History store: store-agnostic (K-39, K-40).** The candidates are ObsessionDB (intended, conditional, K-28), ClickHouse Cloud and Amazon OpenSearch Service, all in AWS `us-east-1` for production (K-33). The choice is made by **G-T0E** and section 10, applied the same way to every candidate. The 0001 and 0002 amendments are merged. | G-T0E evidence pack per candidate; Khaliq chooses and confirms the store; #233 updated |
 | G-T1 | **Async history indexer.** Pipeline normalized objects (the file-normalize / E4 stage) load into the history store per session revision, **off the hot path**: ingest never waits on it. It is idempotent by content hash, handles tombstones and resets, and has its own queue, DLQ and replay. Enabled before T0 (K-30). | Feed tests; replay from S3 rebuilds the store; indexer lag within SLO row 8b; an ingest test proves no ingest latency change when the indexer is stopped |
 | G-T1R | **Recent-window writer and adapter (K-39).** A pipeline stage writes scrubbed event text into the Supabase recent window (trigram/FTS), with the daily retention job and immediate tombstone/reset deletes. The Postgres adapter serves it plus metadata and summary search. | Migration plus RLS tests; retention-job tests; freshness within SLO row 8a with the history indexer stopped |
-| G-T1M | **Merge and labelled fallback (K-39).** Hosted queries both adapters (and the T0 child for pre-T0). The history adapter has a hard budget of about 1-2 s *(1.5 s proposed)*. On its error or timeout, the response returns the Postgres results labelled "partial: older history unavailable": never an unlabelled empty result, and never a 5xx for that case. | Fault-injection tests (history store down, slow, erroring) and SLO rows 14 and 15 |
+| G-T1M | **Merge and labelled fallback (K-39, K-42).** Hosted queries both adapters (and the T0 child for pre-T0). The history adapter has a **hard 1.5 s budget** (K-42). On its error or timeout, the response returns the Postgres results (14-day window, complete text) labelled "partial: older history unavailable": never an unlabelled empty result, and never a 5xx for that case. | Fault-injection tests (history store down, slow past 1.5 s, erroring) and SLO rows 14 and 15 |
 | G-T2 | **`search_shared_sessions` parity.** Same request contract: query length 1-500, filters, cursor, limit ≤20. Same response: event excerpts (`max_content`), `citation_url`, newest-first order. Same workspace confirmation that Cloud enforces. | The Cloud MCP contract tests pass unchanged against the new backend |
 | G-T3 | **`get_shared_session_context` in-session window.** For post-T0 sessions it reads that session's S3 objects and filters in the service, one session at a time (0002's surface table), so it **does not depend on the history store**. For pre-T0 sessions it uses the child branch. | Contract tests; window equality against legacy on the snapshot |
 | G-T4 | **Recall parity** against legacy on the frozen snapshot | The section 10 recall thresholds |
@@ -506,8 +509,11 @@ approved scope, account and cap.
    source record id. This matches legacy.
 4. **Paging:** a composite opaque cursor carrying each source's position.
    The limit applies after the merge.
-5. **Excerpts:** identical shape from every source (4 KB content prefix
-   rule, `max_content`, `citation_url`).
+5. **Excerpts:** identical shape from every source (`max_content`,
+   `citation_url`). Matching uses **complete** event text in the recent
+   window (K-42) and in the history store, where legacy matches only the
+   first 4 KB. New-stack hits are therefore a superset of legacy's, and the
+   extra hits are reported as additive in parity runs.
 6. **Partial results (K-39):**
    - **History store errors or exceeds its budget:** return the recent
      window's results (plus the child's for pre-T0) with
@@ -518,7 +524,7 @@ approved scope, account and cap.
      with a retryable 503. V1 metadata is in the same database and is down
      too.
 7. **Budgets:**
-   - the history adapter: about 1-2 s (1.5 s proposed);
+   - the history adapter: **1.5 s hard** (K-42);
    - the child branch: its breaker and a 6 s pool budget;
    - the whole request: within legacy's 12 s and Cloud's 15 s / 25 s.
 8. **Ranked dashboard queries (K-36):** RRF (k=60) over `event_keyword`
@@ -565,8 +571,8 @@ variant, and adopted only with Khaliq's OK (it changes recall).
 
 **3. Snippets and `citation_url`.**
 - **MCP `search_shared_sessions`:**
-  - the excerpt is the event's content, limited to the 4 KB prefix that
-    legacy searches;
+  - the excerpt is taken from the event's content around the match, which
+    may lie beyond legacy's 4 KB, since complete text is searched (K-42);
   - it is cut to the caller's `max_content`;
   - it is identical from the child branch and from ObsessionDB.
 - **Dashboard hybrid snippets:**
@@ -594,7 +600,7 @@ variant, and adopted only with Khaliq's OK (it changes recall).
 | Failure | Dashboard ranked search | MCP `search_shared_sessions` | MCP `get_shared_session_context` | V1 metadata |
 | --- | --- | --- | --- | --- |
 | Semantic pools (none before T0, K-36) | Not offered. `pools_offered: ["event_keyword","brief_keyword"]`, and they are not counted as degraded. The UI labels the mode "Keyword search". | n/a | n/a | unaffected |
-| **History store errors or times out (budget about 1-2 s)** | Postgres results plus child results (pre-T0), banner **"Partial: older history unavailable"**. Never empty without that label, never 5xx. | Postgres results plus child results, `partial: "older_history_unavailable"`, plus a line in the tool's text output | unaffected (S3 read path for post-T0) | unaffected |
+| **History store errors or times out (1.5 s budget, K-42)** | Postgres results plus child results (pre-T0), banner **"Partial: older history unavailable"**. Never empty without that label, never 5xx. | Postgres results plus child results, `partial: "older_history_unavailable"`, plus a line in the tool's text output | unaffected (S3 read path for post-T0) | unaffected |
 | History indexer lagging (store up) | Recent sessions are covered by the window. No label unless lag exceeds the window. | same | unaffected | unaffected |
 | Child branch down or breaker open | Results without pre-T0 sessions, labelled "Partial: pre-cutover history unavailable" | `partial: "pre_t0_history_unavailable"` | for a pre-T0 session: retryable `503` | unaffected |
 | Supabase (Postgres adapter) down | Retryable 503 | Retryable 503 | Post-T0 sessions are still served from S3 if the pointer lookup is cached; otherwise 503 | down |
@@ -1277,7 +1283,7 @@ ids (A#) are shown where they apply.
 | K-38 | **Approved 2026-10-31:** counts-only, read-only shape extraction from production. No corpus movement. | — | n/a (read-only) |
 | K-39 | **Decided 2026-10-31: "ObsessionDB off the hot path".** Two adapters, async indexer, labelled partial fallback. | — | — |
 | K-40 | **Decided 2026-10-31:** Amazon OpenSearch Service is a third history-store candidate. Synthetic-only trial approved in 500268966557 / `us-west-2`, about $50 cap. Not production provisioning. | — | delete the trial domain |
-| K-42 | Choose the recent-window length (7, 14 or 30 days) after the K-38 counts | — | the window can shrink or grow via retention and backfill from S3 |
+| K-42 | **Decided 2026-10-31:** a 14-day window, complete event text, and a 1.5 s history-store budget. The disk resize (K-32) still waits on the K-38 byte measurement. | — | the window can shrink or grow via retention and backfill from S3 |
 | K-43 | Apply the recent-window migration and RLS to Supabase, and enable the writer stage and retention job | — | drop the table, disable the stage |
 
 Read-only work needs no approval beyond normal access: catalog queries,
@@ -1320,11 +1326,8 @@ Read-only work needs no approval beyond normal access: catalog queries,
   are covered in section 17.
 - **Q17.** Resolved by K-34 and K-36: keyword-ranked dashboard search is in the T0 gate (G-T8).
 - **Q19, Q20:** moved to section 17.
-- **Q23.** The recent window's per-event text: a 4 KB prefix (proposed, for
-  legacy parity) or complete text. Complete text increases disk, which is
-  measured via K-38.
-- **Q24.** The history-adapter budget: 1 s or 2 s (1.5 s proposed). Set it
-  from the trials (ClickHouse Cloud, OpenSearch) and G-T0E E1.
+- **Q23.** Closed (K-42): complete event text.
+- **Q24.** Closed (K-42): 1.5 s.
 - **Q22.** The brief pools' text on the new stack: the pipeline's short and
   long summaries in ObsessionDB as plaintext, with erasure through
   tombstones? Legacy briefs are LLM output stored in Neon.
@@ -1422,7 +1425,7 @@ Either way, adding embeddings is a new decision with its own approvals.
   `search-recall-comparison-2026-10-31.md` (sections 6 and 10 copy its
   tables, benchmark design and proposed SLOs).
 - Coordinator relay, 2026-10-31:
-  - Khaliq's decisions K-6, K-22, K-27, K-28 (restated), K-33, K-34, K-36, K-37, K-38, K-39 and K-40;
+  - Khaliq's decisions K-6, K-22, K-27, K-28 (restated), K-33, K-34, K-36, K-37, K-38, K-39, K-40 and K-42;
   - storage facts: `sessions` 494 GB, `convergence_events` 210 GB, no
     production S3 bucket, R2 `relayhistory-content` empty, Supabase Pro /
     Large / 2 GB disk / empty.
