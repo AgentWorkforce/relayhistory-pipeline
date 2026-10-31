@@ -1,0 +1,28 @@
+{
+  "$comment": "Production transcript store, sessions-prod. Approval record added before capture.",
+  "accountId": "941433935742",
+  "region": "us-east-1",
+  "budgetUsd": 200,
+  "budgetEmail": "aws-budgets@agentrelay.com",
+  "transcriptStore": {
+    "managementEvents": true
+  },
+  "approval": {
+    "decision": "approved",
+    "by": "Khaliq Gant",
+    "date": "2026-10-31",
+    "operations": [
+      "deploy"
+    ],
+    "stage": "aws-sessions-prod",
+    "accountId": "941433935742",
+    "region": "us-east-1",
+    "quote": "DIRECT from Khaliq in the self-hosted-lead session, 2026-10-31, chosen options verbatim: \"Approve all A0–A4\", \"One key\", account-wide S3 Block Public Access: \"Yes\". Earlier: \"let's start the production s3 work now\", \"ok let's go\".",
+    "capture": {
+      "provenanceSha256": "3ba38db6404d345d9008033c60b4a8d20c6270aa237eab46ce79928487217a85",
+      "planSha256": "6e3c907a867a6efe220183e4bd3fd324629e93c7416ce419a50f1c2939a99df1",
+      "inputsSha256": "8f5ddaae9613a60aa174f3bdb9127a62ffd7de0f3cdba67601b29f78de52f12b",
+      "sourceCommit": "f4f025bab4ce86a4eae3cdcfea8bfcdb1f9340d0"
+    }
+  }
+}
