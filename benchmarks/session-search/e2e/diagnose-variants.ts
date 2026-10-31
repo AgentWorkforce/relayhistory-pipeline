@@ -5,6 +5,7 @@
  * errors is recorded as an error, never dropped. Same corpus limits as proof.ts.
  */
 import { readFileSync, writeFileSync } from "node:fs";
+import { cpus, totalmem } from "node:os";
 import { SCALES } from "../corpus.ts";
 import { percentile } from "../stats.ts";
 import { applyShape } from "./shape.ts";
@@ -63,10 +64,11 @@ for (const id of ["pr", "phrase", "common"]) {
     await admin.run("SYSTEM FLUSH LOGS");
     const [c] = await admin.rows<Record<string, number>>(`SELECT avg(read_rows) AS read_rows, avg(read_bytes) AS read_bytes, avg(ProfileEvents['OSCPUVirtualTimeMicroseconds']) / 1000 AS cpu_ms FROM system.query_log WHERE type = 'QueryFinish' AND log_comment = {tag:String}`, { tag });
     lat.sort((a, b) => a - b);
-    const row = { class: id, truth: oracle.counts.get(`org-0|${id}`) ?? 0, variant: name, p50: Math.round(percentile(lat, 50) ?? 0), p95: Math.round(percentile(lat, 95) ?? 0), readRows: Math.round(c?.read_rows ?? 0), readMB: Math.round((c?.read_bytes ?? 0) / 1e6), cpuMs: Math.round(c?.cpu_ms ?? 0), error };
+    const plan = await v.client.run(`EXPLAIN indexes = 1 ${v.sql}`, { q: n.query }, { SQL_relay_org: "org-0", ...v.settings }).catch((e) => `error: ${String(e).slice(0, 200)}`);
+    const row = { class: id, truth: oracle.counts.get(`org-0|${id}`) ?? 0, variant: name, p50: Math.round(percentile(lat, 50) ?? 0), p95: Math.round(percentile(lat, 95) ?? 0), readRows: Math.round(c?.read_rows ?? 0), readMB: Math.round((c?.read_bytes ?? 0) / 1e6), cpuMs: Math.round(c?.cpu_ms ?? 0), error, plan };
     rows.push(row);
-    console.log(JSON.stringify(row));
+    console.log(JSON.stringify({ ...row, plan: undefined }));
   }
 }
-writeFileSync(process.env.BENCH_OUT ?? "variants-report.json", JSON.stringify({ shapeFidelity: "PARTIAL: sanitized aggregate anchors only; cannot close T0.", loaded, parts, rows }, null, 2));
+writeFileSync(process.env.BENCH_OUT ?? "variants-report.json", JSON.stringify({ shapeFidelity: "PARTIAL: sanitized aggregate anchors only; cannot close T0.", loaded, parts, runner: { cores: cpus().length, memoryBytes: totalmem() }, adminBypass: "nopolicy_* variants show engine behaviour only; they are not a product path", rows }, null, 2));
 process.exit(0);
