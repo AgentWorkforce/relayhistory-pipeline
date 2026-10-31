@@ -89,6 +89,18 @@ state file filed under an older invented id (`m-<hex>`) stops the courier with
 its machine id migrated or its state started fresh, which is an operator
 decision.
 
+## Rust clients
+
+**Activation blocker.** The Rust adapter (`relayhistory-object-store`) does not
+use this ingest. It writes directly to the bucket with vended credentials scoped
+to `m={machine_id}` through `update_manifest`, so the machine gate, the claim, the
+activation gate and parking do not apply to it. Its
+`writer.delivery_instance_id` is a destination instance such as
+`dest_objstore_01`, not a machine id, so it could not pass this route anyway:
+`courier-handover.test.ts` proves that refusal. A desktop host that writes this
+way must either keep to the vended-credential path, with its own fence, or adopt
+`delivery_instance_id == machine_id` first.
+
 ## Retries
 
 A refused backfill is retried by the `backfill-activation` stage:
