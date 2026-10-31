@@ -258,6 +258,61 @@ describe("search RPC parity with the read surface", () => {
   });
 });
 
+describe("workspace scope stays inside the claim", () => {
+  // Claims cover only ws-a; org-a also has ws-b rows that match every probe below.
+  const onlyA = claimsFor("org-a", ["ws-a"]);
+  const wsBRow = () => rows.find((r) => r.org_id === "org-a" && r.workspace_id === "ws-b" && !r.deleted)!;
+
+  test("p_workspace_id NULL sees exactly the claimed workspaces, never the rest of the org", async () => {
+    const b = wsBRow();
+    const probes: SessionSearchRequest[] = [
+      {}, { q: "session" }, { q: b.title }, { sessionId: b.session_id }, { state: b.state as never },
+      { source: b.harness }, { since: "2026-09-01T00:00:00.000Z" }, { until: "2026-12-31T00:00:00.000Z" },
+    ];
+    for (const req of probes) {
+      // The probe does match ws-b rows when ws-b is claimed, so an empty answer is meaningful.
+      expect(oracle(rows, "org-a", ["ws-a", "ws-b"], req).some((id) => id.startsWith("org-a/ws-b/")), JSON.stringify(req)).toBe(true);
+      const hits = await pageAll(db, onlyA, req, 50);
+      expect(hits.every((id) => id.startsWith("org-a/ws-a/")), JSON.stringify(req)).toBe(true);
+      expect(hits).toEqual(oracle(rows, "org-a", ["ws-a"], req));
+    }
+  });
+
+  test("an organization-wide cursor naming an unclaimed workspace cannot widen the page", async () => {
+    // Inside the time range both workspaces share, so a leak would show on this page.
+    const at = "2026-09-03T12:00:00.000Z";
+    expect(rows.some((r) => r.org_id === "org-a" && r.workspace_id === "ws-b" && !r.deleted
+      && r.last_activity_at.getTime() < Date.parse(at))).toBe(true);
+    const hits = await rpc(db, onlyA, {
+      p_cursor_last_activity_at: at, p_cursor_session_id: "s-9999",
+      p_cursor_harness: "zzz", p_cursor_workspace_id: "ws-b", p_limit: 50,
+    });
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits.every((h) => h.workspace_id === "ws-a")).toBe(true);
+  });
+
+  test("a non-NULL p_workspace_id outside the claim is refused for every filter shape", async () => {
+    for (const body of [
+      { p_workspace_id: "ws-b" }, { p_workspace_id: "ws-b", p_query: "session" },
+      { p_workspace_id: "ws-b", p_session_id: wsBRow().session_id }, { p_workspace_id: "ws-b", p_user_id: "u-1" },
+      { p_workspace_id: "ws-b", p_agent: "agent-queue-1", p_agent_match: "prefix" },
+      { p_workspace_id: "WS-A" }, { p_workspace_id: " ws-a" }, { p_workspace_id: "" },
+    ]) {
+      const error = await rpc(db, onlyA, body).then(() => null, (c: unknown) => c) as { code?: string } | null;
+      expect(error?.code, JSON.stringify(body)).toBe("42501");
+    }
+  });
+
+  test("non-string or empty workspace claims grant nothing", async () => {
+    const odd = JSON.stringify({ role: WORKER, app_metadata: { org_id: "org-a", workspace_ids: [7, null, { id: "ws-b" }, "ws-a"] } });
+    const hits = await pageAll(db, odd, {}, 50);
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits.every((id) => id.startsWith("org-a/ws-a/"))).toBe(true);
+    const none = JSON.stringify({ role: WORKER, app_metadata: { org_id: "org-a", workspace_ids: [] } });
+    expect((await rpc(db, none, {}).then(() => null, (c: unknown) => c) as { code?: string } | null)?.code).toBe("42501");
+  });
+});
+
 describe("typed refusals, never empty results", () => {
   const CASES: Array<[string, SessionSearchRequest, Record<string, unknown>, "22023" | "0A000"]> = [
     ["org-wide agent", { agent: "agent-queue-1" }, { p_agent: "agent-queue-1" }, "0A000"],
