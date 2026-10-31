@@ -291,11 +291,16 @@ export const KMS_ADMIN_ACTIONS = [
 /**
  * Key policy for the trail's own KMS key, least privilege: the account root may
  * administer the key (no lockout) but not use it; CloudTrail may generate data
- * keys for this trail only; account principals may decrypt trail log files.
+ * keys for this trail only. The optional fourth argument lets hardened callers
+ * pass null (no log reader) or one named audit principal. Existing baseline
+ * callers that omit it retain their legacy account-reader policy.
  */
-export function trailKeyPolicy(accountId: string, region: string, trailName: string) {
+export function trailKeyPolicy(accountId: string, region: string, trailName: string, auditPrincipalArn?: string | null) {
   const trailArn = `arn:aws:cloudtrail:${region}:${accountId}:trail/${trailName}`;
   const context = { "kms:EncryptionContext:aws:cloudtrail:arn": `arn:aws:cloudtrail:*:${accountId}:trail/*` };
+  // Existing baseline stages retain their three-argument account-reader contract.
+  // Transcript storage passes null (closed) or one validated role ARN.
+  const trailReader = auditPrincipalArn === undefined ? "*" : auditPrincipalArn;
   return {
     Version: "2012-10-17" as const,
     Statement: [
@@ -318,14 +323,14 @@ export function trailKeyPolicy(accountId: string, region: string, trailName: str
         Resource: "*",
         Condition: { StringEquals: { "aws:SourceArn": trailArn } },
       },
-      {
+      ...(trailReader ? [{
         Sid: "AccountReadsLogs",
         Effect: "Allow" as const,
-        Principal: { AWS: "*" },
+        Principal: { AWS: trailReader },
         Action: ["kms:Decrypt", "kms:ReEncryptFrom"],
         Resource: "*",
         Condition: { StringEquals: { "kms:CallerAccount": accountId }, StringLike: context },
-      },
+      }] : []),
     ],
   };
 }

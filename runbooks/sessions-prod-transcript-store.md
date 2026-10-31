@@ -22,7 +22,7 @@ recorded in the inputs' `approval` record where the stack checks it
 | Bucket policy | (on the bucket) | Deny non-TLS; deny TLS < 1.2; deny `DeleteObject`/`DeleteObjectVersion` to everyone but the eraser; deny a PUT whose encryption header is anything but SSE-KMS naming this key (including `aws:kms` with no key id, which S3 would encrypt with the AWS managed `aws/s3` key). A PUT with no encryption header gets the bucket default. No Allow statements. |
 | KMS key + alias | `alias/96bulls-aws-sessions-prod-transcripts` | Rotation on, 30-day deletion window. Root administers but cannot use. Writer: `GenerateDataKey` + `Decrypt`; reader: `Decrypt`; both only via `s3.us-east-1.amazonaws.com`, from this account, for objects under `96bulls/` in this bucket (encryption context `aws:s3:arn`). |
 | S3 bucket | `96bulls-aws-sessions-prod-access-logs-941433935742` | Versioned, SSE-S3 (server access logs cannot be delivered to an SSE-KMS bucket), Block Public Access, owner-enforced, TLS only. Accepts logs only from the transcripts bucket. Logs expire after 90 days. |
-| CloudTrail | `96bulls-aws-sessions-prod-trail` | Multi-region, log file validation, own KMS key (`alias/96bulls-aws-sessions-prod-trail`) and versioned bucket (`96bulls-aws-sessions-prod-trail-941433935742`, 365-day retention). Management events plus **S3 data events for the transcripts bucket only**. The account had no trail before this stage. |
+| CloudTrail | `96bulls-aws-sessions-prod-trail` | Multi-region, log file validation, own KMS key (`alias/96bulls-aws-sessions-prod-trail`) and versioned bucket (`96bulls-aws-sessions-prod-trail-941433935742`, 365-day retention). Management events plus **S3 data events for the transcripts bucket only**. Both bucket service grants require the exact trail `SourceArn` and `SourceAccount`. Trail-log decrypt/re-encrypt is absent unless `transcriptStore.auditPrincipalArn` names one IAM role in this account. |
 | IAM user | `/96bulls/96bulls-aws-sessions-prod-transcript-writer` | The RelayHistory Worker. `ListBucket`; `GetObject` on `96bulls/*/v1/*`; `PutObject` on `…/raw/*`, `…/manifest.json`, `…/summary/*`. Explicit deny on delete, old versions, bucket configuration. |
 | IAM user | `/96bulls/96bulls-aws-sessions-prod-transcript-reader` | The history indexer. `ListBucket`; `GetObject` on `96bulls/*/v1/*`. Explicit deny on put, delete, old versions. |
 | IAM user | `/96bulls/96bulls-aws-sessions-prod-transcript-eraser` | The erasure job. `ListBucket`/`ListBucketVersions` under `96bulls/`; `DeleteObject`/`DeleteObjectVersion` on `96bulls/*`. Explicit deny on reading or writing content. No key use. |
@@ -47,12 +47,13 @@ The Worker runs with `PIPELINE_KEY_PREFIX=96bulls` and
 ### One CMK with per-object data keys, not a CMK per workspace
 
 P9 asked for a key per workspace. This stage uses **one dedicated CMK for the
-bucket with S3 Bucket Keys off**. S3 then generates a separate data key for
-every object, and the encryption context is the object ARN, which carries
-`96bulls/<org>/v1/ws=<workspace>/`. That gives per-object (so per-workspace)
-cryptographic separation, a key policy scoped by prefix, and a CloudTrail
-`Decrypt`/`GenerateDataKey` record for every object access that names the
-workspace.
+bucket with S3 Bucket Keys off**. S3 generates a separate data key for every
+object, and the encryption context is the object ARN, which carries
+`96bulls/<org>/v1/ws=<workspace>/`. This provides per-object KMS request
+attribution and avoids sharing one cached S3 Bucket Key. It is **not tenant
+cryptographic isolation**: every tenant's data key is protected by the same
+CMK, and the writer/reader principals span every tenant prefix. Compromise or
+disablement of that CMK affects all tenants.
 
 Per-workspace CMKs were rejected for now:
 
@@ -64,7 +65,8 @@ Per-workspace CMKs were rejected for now:
   now, or a separate provisioning service, which 0001 rules out in AWS.
 - **Worker change.** The Worker would have to send
   `x-amz-server-side-encryption-aws-kms-key-id` per PUT, mapping workspace to
-  key; today it sends only `aws:kms` (`PIPELINE_RAW_S3_SSE`).
+  key. Production leaves `PIPELINE_RAW_S3_SSE` unset so the bucket's dedicated
+  default CMK applies; `aws:kms` without a key id selects `aws/s3` and is denied.
 - **Cost.** 289 workspaces × $1/month, plus up to $2/month per key after
   rotations, roughly $290-870/month and growing, against about $1-3 for one key.
   (The 100,000-keys-per-account quota is not the limit; operations are.)
@@ -167,13 +169,19 @@ cp stacks/aws/examples/aws-sessions-prod.inputs.example.json .96bulls/aws-sessio
 bin/96bulls plan aws-sessions-prod --capture     # read only; docs/plans/aws-sessions-prod.*
 ```
 
-Review the plan: **creates only**, 12 resources: 3 users, 2 keys, 2 aliases,
-3 buckets, the trail and the budget (the exact list is in
-`docs/plans/aws-sessions-prod.plan.txt`). The transcripts key is created after
-the trail (its `96bulls:audit-trail` tag), which also gives IAM time to
-propagate the users the key policy names; if KMS still refuses a principal, the
-apply stops with the users created, and the run is re-planned and re-captured. Anything else (an update, a
-replace, a delete) stops the apply. Commit the capture, write
+The capture and deploy gates accept exactly four operation shapes: all 12
+resources created (initial); the known three-resource continuation after IAM
+principal propagation (`transcripts`, `transcripts-key`,
+`transcripts-key-alias`); the one post-merge policy remediation described
+below (`trail-key` and `trail-logs` update, the other ten resources `noop`);
+or all 12 resources `noop` (post-apply). Every resource must appear exactly
+once in both the compact and detailed plan. The production gate requires the
+exact compact and detailed paths and sha256 values recorded in provenance;
+the approval binds that provenance and compact plan.
+
+Any other update count or resource, replacement, deletion, import, adoption,
+unknown resource or other partial create set stops the capture and apply.
+Commit the capture, write
 `approval.capture` from the provenance (`provenanceSha256`, `planSha256`,
 `inputsSha256`, `sourceCommit`), then:
 
@@ -228,6 +236,22 @@ to see the bucket policy refuse `aws:kms` without this key id (explicitDeny).
   propagated yet; the trail-ordering delay was not long enough.
 - **Recovery:** a fresh capture showed 3 creates, with the 9 existing resources unchanged (noop) and
   nothing updated or replaced. The second apply created the remaining 3.
+- **Current evidence gap:** no final post-apply all-`noop` capture is committed. Do not call the
+  rollout complete until a fresh read-only capture shows exactly the 12 expected resources as `noop`
+  and the resulting provenance is committed. The historical recovery capture is evidence of what the
+  second apply intended, not evidence of its final state.
+- **Post-merge hardening is not yet live:** the remediation that added exact CloudTrail
+  `SourceArn`/`SourceAccount` conditions and removed account-wide trail-key decrypt is code-only at
+  the time of this record; no plan or apply was run for it. The historical capture cannot authorize
+  another deploy (it predates the required `partition: "aws"` input and these policy declarations).
+  Capture the new plan and inspect both files: it must contain exactly `trail-key update` and
+  `trail-logs update`, with the other ten resources `noop`; provenance must hash those exact compact
+  and detailed files. Run the normal guarded Alchemy deploy for that reviewed capture. If an emergency
+  direct AWS policy repair has already changed the live policies, the Alchemy deploy is still required:
+  a direct AWS repair does **not** rewrite Alchemy's persisted `oldProps`, so it does not rebaseline the
+  stack state. The guarded reconciliation is what converges the live declarations and persisted state.
+  After it succeeds, immediately make and commit a fresh read-only capture that contains exactly all
+  12 resources as `noop`. Until that final capture exists, the remediation is not complete.
 - **Next time:** if this happens on a new stage, wait a minute, re-capture and re-apply. Nothing
   partial needs cleaning up.
 - **Account-level S3 Block Public Access:** set separately on 2026-10-31 with
@@ -297,9 +321,13 @@ On exposure: set the old key `Inactive` first, then rotate.
 
 ## Rollback and teardown
 
-`aws-sessions-prod` is never destroyed by the stack (`NON_DESTROYABLE`
-matches `prod`), and `teardown.purgeBucketsOnDestroy` is refused. Roll back a
-change by reverting it and running `up`.
+`NON_DESTROYABLE` blocks the explicit Alchemy `destroy` route for
+`aws-sessions-prod`, and `teardown.purgeBucketsOnDestroy` is refused. It does
+**not** make resources deletion-proof: an `up` can reconcile a resource removed
+from the declarations by deleting it. The exact phase-aware plan contract must
+therefore pass before every deploy. Apart from the named two-policy remediation,
+updates are refused; every replacement or deletion is refused. Roll back a
+property change only through a separately reviewed contract change and capture.
 
 Removing an **empty** store (before any Worker write), with its own OK:
 

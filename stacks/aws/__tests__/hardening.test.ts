@@ -183,6 +183,15 @@ describe("CloudTrail key", () => {
     expect(ct).toHaveLength(2);
     for (const s of ct) expect(s.Condition).toMatchObject({ StringEquals: { "aws:SourceArn": "arn:aws:cloudtrail:us-west-2:500268966557:trail/96bulls-aws-sessions-dev-trail" } });
   });
+  it("grants no account-wide decrypt/re-encrypt and scopes an optional reader to one named principal", () => {
+    const closed = trailKeyPolicy("500268966557", "us-west-2", "96bulls-aws-sessions-dev-trail", null);
+    expect(JSON.stringify(closed)).not.toMatch(/kms:Decrypt|kms:ReEncrypt/);
+    expect(JSON.stringify(closed)).not.toContain('"AWS":"*"');
+    const audit = "arn:aws:iam::500268966557:role/security/trail-auditor";
+    const withAudit = trailKeyPolicy("500268966557", "us-west-2", "96bulls-aws-sessions-dev-trail", audit);
+    const read = withAudit.Statement.find((s) => s.Sid === "AccountReadsLogs")!;
+    expect(read.Principal).toEqual({ AWS: audit });
+  });
 });
 
 describe("HoopDb backend", () => {

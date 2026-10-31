@@ -32,7 +32,8 @@
  * (`aws:s3:arn`, which carries `96bulls/<org>/v1/ws=<workspace>/`). The key
  * policy only lets the named users use the key through S3, for objects under
  * `96bulls/`, and every Decrypt/GenerateDataKey lands in CloudTrail with the
- * object ARN, i.e. per-workspace attribution. Per-workspace CMKs are not used:
+ * object ARN, i.e. per-workspace attribution, not tenant cryptographic isolation.
+ * All objects are still protected by one shared CMK. Per-workspace CMKs are not used:
  * see "Why one CMK" in the runbook.
  *
  * Pure functions, unit-tested in stacks/aws/__tests__/transcript-store.test.ts;
@@ -41,6 +42,7 @@
 import * as AWS from "@alchemy.run/aws";
 import * as Effect from "effect/Effect";
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
+import { sha256, type Provenance } from "../../src/cli/plan-provenance.ts";
 import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hardening.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 
@@ -55,6 +57,9 @@ export const ACCESS_LOG_RETENTION_DAYS = 90;
 export const TRAIL_LOG_RETENTION_DAYS = 365;
 /** Regional boundary (migration plan section 6): transcript content stays in us-east-1. */
 export const TRANSCRIPT_REGION = "us-east-1";
+export const TRANSCRIPT_STAGE = "aws-sessions-prod";
+export const TRANSCRIPT_ACCOUNT_ID = "941433935742";
+export const TRANSCRIPT_PARTITION = "aws";
 export const ACCESS_LOG_PREFIX = "s3-access/transcripts/";
 
 export interface TranscriptStoreInputs {
@@ -63,6 +68,8 @@ export interface TranscriptStoreInputs {
    * in the account already logs them (a second copy is billed).
    */
   managementEvents?: boolean;
+  /** Optional role allowed to decrypt/re-encrypt CloudTrail log files. Omit for no trail-log read path. */
+  auditPrincipalArn?: string;
 }
 
 export interface TranscriptNames {
@@ -108,20 +115,137 @@ const allObjects = (bucketArn: string) => `${bucketArn}/${TENANT_KEY_BASE}/*`;
  * Inputs a transcript-store stage must not carry: it is S3 only (decision 0001),
  * production-grade (no purge) and in us-east-1 (regional boundary).
  */
-export function assertTranscriptStoreInputs(stage: string, inputs: Record<string, unknown> & { region: string; transcriptStore?: TranscriptStoreInputs }) {
+export function assertTranscriptStoreInputs(
+  stage: string,
+  inputs: Record<string, unknown> & { accountId: string; region: string; partition?: string; transcriptStore?: TranscriptStoreInputs },
+) {
+  const hasTranscriptStore = Object.prototype.hasOwnProperty.call(inputs, "transcriptStore");
   const t = inputs.transcriptStore;
-  if (!t) return;
   const refuse = (why: string): never => {
     throw new Error(`96bulls: ${stage} is a transcript-store stage: ${why}. Nothing was created.`);
   };
-  if (typeof t !== "object" || Array.isArray(t)) refuse("transcriptStore must be an object");
-  for (const k of Object.keys(t)) if (k !== "managementEvents") refuse(`transcriptStore.${k} is not a known setting`);
-  if (t.managementEvents !== undefined && typeof t.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
+  if (stage !== TRANSCRIPT_STAGE) {
+    if (hasTranscriptStore) refuse(`transcriptStore is reserved for ${TRANSCRIPT_STAGE}`);
+    return;
+  }
+  if (!hasTranscriptStore) refuse("transcriptStore is required; production may not fall through to the legacy AWS baseline");
+  if (t === null || typeof t !== "object" || Array.isArray(t) || Object.getPrototypeOf(t) !== Object.prototype)
+    refuse("transcriptStore must be a plain object");
+  const store = t as TranscriptStoreInputs;
+  if (inputs.accountId !== TRANSCRIPT_ACCOUNT_ID) refuse(`accountId must be exactly ${TRANSCRIPT_ACCOUNT_ID}, got ${JSON.stringify(inputs.accountId)}`);
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
+  if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
+  for (const k of Object.keys(store)) if (k !== "managementEvents" && k !== "auditPrincipalArn") refuse(`transcriptStore.${k} is not a known setting`);
+  if (store.managementEvents !== undefined && typeof store.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
+  if (store.auditPrincipalArn !== undefined && !new RegExp(`^arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/[A-Za-z0-9_+=,.@/-]+$`).test(store.auditPrincipalArn))
+    refuse(`transcriptStore.auditPrincipalArn must be a named IAM role in account ${TRANSCRIPT_ACCOUNT_ID} in partition aws`);
   if (stage.startsWith("aws-sandbox-") || inputs.pippenSandbox) refuse("a sandbox account never holds transcripts");
   // S3 only: production AWS is S3 (decision 0001), and nothing here may empty a bucket.
   for (const k of ["eks", "supabase", "teardown", "accountShared", "lockerNoncurrentVersionDays", "hoopdbSecretArn"] as const)
     if (inputs[k] !== undefined) refuse(`${k} is not allowed (S3 only; never purged on destroy)`);
+}
+
+const TRANSCRIPT_RESOURCES = [
+  "access-logs", "budget", "trail", "trail-key", "trail-key-alias", "trail-logs",
+  "transcript-eraser", "transcript-reader", "transcript-writer", "transcripts",
+  "transcripts-key", "transcripts-key-alias",
+] as const;
+
+export type TranscriptStorePlanPhase = "initial" | "principal-propagation recovery" | "post-merge policy remediation" | "post-apply";
+
+const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
+  { name: "initial", actions: Object.fromEntries(TRANSCRIPT_RESOURCES.map((resource) => [resource, "create"])) },
+  { name: "principal-propagation recovery", actions: { transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" } },
+  // One capture-bound exception for the policies hardened after the first production apply.
+  // The other ten resources must be noop, and a subsequent capture must be all-noop.
+  { name: "post-merge policy remediation", actions: { "trail-key": "update", "trail-logs": "update" } },
+  { name: "post-apply", actions: {} },
+];
+
+export interface TranscriptStorePlanCapture {
+  detailedPlanText: string;
+  provenanceText: string;
+}
+
+function transcriptPlanOperations(text: string, label: "compact" | "detailed", refuse: (why: string) => never) {
+  const summaries = text.split(/\r?\n/).filter((line) => line.startsWith("Plan:"));
+  if (summaries.length !== 1) refuse(`${label} plan: expected exactly one Plan: summary, found ${summaries.length}`);
+  const operations = new Map<string, string>();
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*\[([^\]]+)\]\s+(\S+)\s*$/.exec(line);
+    if (!m) continue;
+    const [, resource, action] = m;
+    if (operations.has(resource!)) refuse(`${label} plan: resource ${resource} appears more than once`);
+    operations.set(resource!, action!);
+  }
+  const expected = new Set<string>(TRANSCRIPT_RESOURCES);
+  for (const resource of operations.keys()) if (!expected.has(resource)) refuse(`${label} plan: unexpected resource ${resource}`);
+  for (const resource of expected) if (!operations.has(resource)) refuse(`${label} plan: missing resource ${resource}`);
+  for (const [resource, action] of operations)
+    if (action !== "create" && action !== "update" && action !== "noop") refuse(`${label} plan: ${resource} has forbidden action ${action}`);
+
+  const actualCounts = new Map<string, number>();
+  for (const action of operations.values()) if (action !== "noop") actualCounts.set(action, (actualCounts.get(action) ?? 0) + 1);
+  const summary = summaries[0]!;
+  const clauses = [...summary.matchAll(/(\d+) to ([a-z-]+)/g)].map((m) => ({ count: Number(m[1]), action: m[2]! }));
+  if (clauses.length === 0) {
+    if (!/^Plan:\s*(?:0 changes|no changes)\s*$/i.test(summary)) refuse(`${label} plan: unrecognized summary ${JSON.stringify(summary)}`);
+    if (actualCounts.size !== 0) refuse(`${label} plan: summary says no changes but resource lines contain changes`);
+  } else {
+    if (!/^Plan:\s*\d+ to [a-z-]+(?:,\s*\d+ to [a-z-]+)*\s*$/.test(summary))
+      refuse(`${label} plan: unrecognized summary ${JSON.stringify(summary)}`);
+    const seen = new Set<string>();
+    for (const clause of clauses) {
+      if (seen.has(clause.action)) refuse(`${label} plan: summary repeats ${clause.action}`);
+      seen.add(clause.action);
+      const actual = actualCounts.get(clause.action) ?? 0;
+      if (clause.count !== actual) refuse(`${label} plan: summary says ${clause.count} ${clause.action} but resource lines contain ${actual}`);
+    }
+    for (const [action, count] of actualCounts) if (!seen.has(action)) refuse(`${label} plan: summary omits ${count} ${action}`);
+  }
+  return { summary, operations };
+}
+
+/**
+ * Exact production contract for initial creation, partial recovery, the one
+ * capture-bound post-merge policy repair, and final all-noop evidence. Both
+ * compact and detailed plan bytes must be the exact files hashed by the bound
+ * provenance record.
+ */
+export function assertTranscriptStorePlanContract(planText: string, capture: TranscriptStorePlanCapture): TranscriptStorePlanPhase {
+  const refuse = (why: string): never => {
+    throw new Error(`96bulls: ${TRANSCRIPT_STAGE} plan contract refused: ${why}. Nothing was changed.`);
+  };
+  const compact = transcriptPlanOperations(planText, "compact", refuse);
+  const detailed = transcriptPlanOperations(capture.detailedPlanText, "detailed", refuse);
+  if (compact.summary !== detailed.summary) refuse("compact and detailed plan summaries differ");
+  for (const resource of TRANSCRIPT_RESOURCES)
+    if (compact.operations.get(resource) !== detailed.operations.get(resource))
+      refuse(`compact and detailed plans disagree on ${resource}`);
+
+  let provenance: Provenance;
+  try {
+    provenance = JSON.parse(capture.provenanceText) as Provenance;
+  } catch {
+    return refuse("provenance is not valid JSON");
+  }
+  const planPath = `docs/plans/${TRANSCRIPT_STAGE}.plan.txt`;
+  const detailedPath = `docs/plans/${TRANSCRIPT_STAGE}.plan.detailed.txt`;
+  if (provenance?.schema !== 1 || provenance.stage !== TRANSCRIPT_STAGE) refuse(`provenance must be schema 1 for ${TRANSCRIPT_STAGE}`);
+  if (provenance.outputs?.plan?.path !== planPath) refuse(`provenance compact plan path must be exactly ${planPath}`);
+  if (provenance.outputs?.detailed?.path !== detailedPath) refuse(`provenance detailed plan path must be exactly ${detailedPath}`);
+  if (provenance.outputs.plan.sha256 !== sha256(planText)) refuse("compact plan does not match its provenance sha256");
+  if (provenance.outputs.detailed.sha256 !== sha256(capture.detailedPlanText)) refuse("detailed plan does not match its provenance sha256");
+  if (provenance.summary !== compact.summary) refuse("provenance summary does not match the plan summary");
+
+  const phase = TRANSCRIPT_PLAN_PHASES.find((candidate) =>
+    TRANSCRIPT_RESOURCES.every((resource) => compact.operations.get(resource) === (candidate.actions[resource] ?? "noop")),
+  );
+  if (!phase) {
+    const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
+    return refuse(`action set does not match initial, recovery, exact two-policy remediation, or post-apply phase: ${changes.join(", ") || "(none)"}`);
+  }
+  return phase.name;
 }
 
 /**
@@ -216,6 +340,30 @@ export function accessLogBucketPolicy(i: { logBucketArn: string; sourceBucketArn
       Action: ["s3:PutObject"],
       Resource: `${i.logBucketArn}/${ACCESS_LOG_PREFIX}*`,
       Condition: { ArnLike: { "aws:SourceArn": i.sourceBucketArn }, StringEquals: { "aws:SourceAccount": i.accountId } },
+    },
+  ];
+}
+
+/** CloudTrail may inspect and write only for this exact trail and account. */
+export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; accountId: string }) {
+  const source = { "aws:SourceArn": i.trailArn, "aws:SourceAccount": i.accountId };
+  return [
+    ...denyInsecureTransport(i.bucketArn),
+    {
+      Sid: "AWSCloudTrailAclCheck",
+      Effect: "Allow" as const,
+      Principal: { Service: "cloudtrail.amazonaws.com" },
+      Action: ["s3:GetBucketAcl"],
+      Resource: i.bucketArn,
+      Condition: { StringEquals: source },
+    },
+    {
+      Sid: "AWSCloudTrailWrite",
+      Effect: "Allow" as const,
+      Principal: { Service: "cloudtrail.amazonaws.com" },
+      Action: ["s3:PutObject"],
+      Resource: `${i.bucketArn}/AWSLogs/${i.accountId}/*`,
+      Condition: { StringEquals: { ...source, "s3:x-amz-acl": "bucket-owner-full-control" } },
     },
   ];
 }
@@ -365,7 +513,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       description: `96bulls ${i.stage}: CloudTrail log files`,
       enableKeyRotation: true,
       deletionWindow: "30 days",
-      policy: JSON.stringify(trailKeyPolicy(i.accountId, i.region, n.trail)),
+      policy: JSON.stringify(trailKeyPolicy(i.accountId, i.region, n.trail, i.transcriptStore.auditPrincipalArn ?? null)),
       tags: i.tags("cloudtrail"),
     });
     yield* AWS.KMS.Alias("trail-key-alias", { aliasName: n.trailKeyAlias, targetKeyId: trailKey.keyId });
@@ -376,11 +524,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       encryption: { sseAlgorithm: "aws:kms", kmsMasterKeyId: trailKey.keyArn, bucketKeyEnabled: true, blockedEncryptionTypes: ["SSE-C"] },
       publicAccessBlock: PUBLIC_ACCESS_BLOCK,
       objectOwnership: "BucketOwnerEnforced",
-      policy: [
-        ...denyInsecureTransport(trailArn),
-        { Sid: "AWSCloudTrailAclCheck", Effect: "Allow", Principal: { Service: "cloudtrail.amazonaws.com" }, Action: ["s3:GetBucketAcl"], Resource: trailArn },
-        { Sid: "AWSCloudTrailWrite", Effect: "Allow", Principal: { Service: "cloudtrail.amazonaws.com" }, Action: ["s3:PutObject"], Resource: `${trailArn}/AWSLogs/${i.accountId}/*`, Condition: { StringEquals: { "s3:x-amz-acl": "bucket-owner-full-control" } } },
-      ] as never,
+      policy: trailLogBucketPolicy({ bucketArn: trailArn, trailArn: `arn:aws:cloudtrail:${i.region}:${i.accountId}:trail/${n.trail}`, accountId: i.accountId }) as never,
       lifecycleRules: trailLifecycleRules() as never,
       tags: i.tags("cloudtrail"),
     });

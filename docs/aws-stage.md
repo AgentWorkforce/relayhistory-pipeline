@@ -566,6 +566,21 @@ re-reads all of it and refuses unless every value still matches: a reviewed
 plan is what gets applied, or nothing. Write the approval record into the
 inputs before capturing (it is part of the inputs hash).
 
+For `aws-sessions-prod`, the stack additionally parses the reviewed plan. It
+accepts only the exact 12 transcript-store resources in the initial create,
+known three-resource recovery, one capture-bound post-merge remediation
+(`trail-key` and `trail-logs` update with the other ten `noop`), or final
+all-noop phase. Both compact and detailed plans must list the same actions and
+match the exact paths and sha256 values in the approval-bound provenance. The
+capture command refuses an invalid shape before replacing the reviewed files,
+and deploy checks it again. Any other update count or resource, replacement,
+deletion, import or adoption is rejected. A direct AWS repair does not update
+Alchemy's persisted `oldProps`; the exact two-update Alchemy reconciliation is
+still required, followed by a fresh exact 12-noop capture. `NON_DESTROYABLE`
+only blocks the explicit destroy command; it does not stop an ordinary deploy
+from reconciling a removed declaration, which is why this operation-level
+check is required.
+
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and
 reconciles the state bucket's versioning, ownership and encryption if they
