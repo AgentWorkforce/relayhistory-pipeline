@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "bun:test";
+import versionsLock from "../../../versions.lock.json";
 import {
   assertGcpInputs,
   assertGcpRuntimeDeployable,
@@ -35,6 +36,15 @@ const base: GcpInputs = {
 };
 
 describe("GCP self-host contract", () => {
+  it("pins the reviewed multi-architecture services image for the GCP proof", () => {
+    expect(versionsLock.images.services).toMatchObject({
+      ref: "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services",
+      digest: "sha256:8d77de9be0b5e5e47dda75986da882e577aafb9e28e510c844e8134fea372425",
+      sourceRevision: "09293c8d649f912aa2f4414e31a3ad7fca6eceee",
+      gcpProofEligible: true,
+    });
+  });
+
   it("accepts a substrate-only stage without pretending managed services are attached", () => {
     expect(() => assertGcpInputs("gcp-dev", base)).not.toThrow();
     expect(() => assertGcpRuntimeDeployable(base)).not.toThrow();
@@ -198,27 +208,31 @@ describe("GCP self-host contract", () => {
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
-    ).toThrow("not approved for the GCP application proof");
+    ).not.toThrow();
     expect(() =>
       assertGcpRuntimeDeployable({
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
         bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
-    ).toThrow("not approved for the GCP application proof");
+    ).not.toThrow();
     const recordedButIneligible = {
       ...base,
       managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" as const },
-      bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
+      bulls96: {
+        ...bulls96,
+        imageDigest: "sha256:245a75f9d7abdbd2167108db6e4fa852df844b41a22eaebcd64b4dd7b753b2aa",
+        imageSourceRevision: "db2663d05b327b945f1db40fd3b8aec13726fcef",
+      },
     };
     expect(() => assertGcpInputs("gcp-dev", recordedButIneligible, "destroy")).not.toThrow();
     expect(() => assertGcpRuntimeDeployable(recordedButIneligible, "destroy")).not.toThrow();
     for (const command of ["plan", "deploy"] as const) {
       expect(() => assertGcpInputs("gcp-dev", recordedButIneligible, command)).toThrow(
-        "not approved for the GCP application proof",
+        "does not match the reviewed release",
       );
       expect(() => assertGcpRuntimeDeployable(recordedButIneligible, command)).toThrow(
-        "not approved for the GCP application proof",
+        "does not match the reviewed release",
       );
     }
   });
