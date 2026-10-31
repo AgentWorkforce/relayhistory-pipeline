@@ -8,7 +8,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { reprojectCatalog } from "../../../src/migration/relayhistory-reproject.js";
+import { countAgentNameMismatches, reprojectCatalog } from "../../../src/migration/relayhistory-reproject.js";
 
 const MIGRATIONS = fileURLToPath(
   new URL("../../../vendor/relayhistory-cloud/migrations/", import.meta.url).href,
@@ -222,10 +222,25 @@ it("(a)(b)(c) reprojects every key: tombstones and lost agent names stay removed
 it("(d) a second run changes nothing", async () => {
   const before = await snapshot();
   const again = await reprojectCatalog(db, { batch: 3 });
-  expect(again).toMatchObject({ keys: 6, keysWithoutContender: 0, orphanAgentRowsRemoved: 0 });
+  expect(again).toMatchObject({ keys: 6, keysWithoutContender: 0, orphanAgentRowsRemoved: 0, agentNameMismatches: 0 });
   expect(again.after).toEqual(again.before);
   expect(await snapshot()).toEqual(before);
 }, 60_000);
+
+it("counts agent names that got past the lookup trigger, NULL included", async () => {
+  const { rows } = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.session_catalog_agents");
+  expect(rows[0]!.n).toBeGreaterThan(1);
+  expect(await countAgentNameMismatches(db)).toBe(0);
+  await db.exec(`SET session_replication_role = replica;
+    UPDATE sessions.session_catalog_agents SET agent_name_normalized = 'bypassed'
+     WHERE session_id = (SELECT min(session_id) FROM sessions.session_catalog_agents);
+    UPDATE sessions.session_catalog_agents SET agent_name_normalized = NULL
+     WHERE session_id = (SELECT max(session_id) FROM sessions.session_catalog_agents);
+    SET session_replication_role = origin;`);
+  expect(await countAgentNameMismatches(db)).toBe(2);
+  await db.exec("UPDATE sessions.session_catalog_agents SET agent_name = agent_name");
+  expect(await countAgentNameMismatches(db)).toBe(0);
+});
 
 it("leaves the workspace locks released and live delivery working afterwards", async () => {
   // A live upsert after reprojection still projects (the lock is free, triggers on).

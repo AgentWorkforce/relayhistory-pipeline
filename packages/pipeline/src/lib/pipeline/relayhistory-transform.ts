@@ -5,11 +5,13 @@
  * stream. The export is a dedicated `backfill` epoch, so arrival order is not
  * semantic: this reader takes the highest numeric revision of each
  * `(origin_id, record_id)`, applies tombstones, and then orders the surviving
- * records by event time. The resulting object is content-addressed by the
- * raw manifest digest; a later manifest cannot overwrite an earlier result.
+ * records by event time, and projects them as the live triggers would
+ * (`relayhistory-projection.ts`). The resulting object is content-addressed by
+ * the raw manifest digest; a later manifest cannot overwrite an earlier result.
  */
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import {
+  isObjectStoreError,
   manifestLocation,
   normalizedKey,
   objectKey,
@@ -18,11 +20,24 @@ import {
   type ManifestV1,
   type ObjectStore,
 } from "./object-layout.js";
-import type { ManifestReader } from "./adapter.js";
+import type { ManifestRead, ManifestReader } from "./adapter.js";
 import { PipelineError } from "./errors.js";
-import type { RawPointer, SessionTransform } from "./stages.js";
+import {
+  CONVERGENCE_EVENT_KIND,
+  canonicalTimestamp,
+  projectRelayhistorySession,
+  type ProjectionRow,
+} from "./relayhistory-projection.js";
+import type {
+  NormalizeSkipped,
+  NormalizeTarget,
+  NormalizedOutput,
+  RawPointer,
+  SessionTransform,
+} from "./stages.js";
 
-export const RELAYHISTORY_NORMALIZED_VERSION = 1;
+/** Bump with any change to the bytes projected from the same input: the object is create-only. */
+export const RELAYHISTORY_NORMALIZED_VERSION = 2;
 export const RELAYHISTORY_EXPORT_EXTENSION = "client.relayhistory_export";
 const MAX_RELAYHISTORY_CHUNK_BYTES = 16 * 1024 * 1024;
 const MAX_REVISION = 9_223_372_036_854_775_807n;
@@ -51,6 +66,14 @@ function exported(manifest: ManifestV1): boolean {
     !Array.isArray(marker) &&
     (marker as Record<string, unknown>).version === 1 &&
     (marker as Record<string, unknown>).source === "neon.delivery_records"
+  );
+}
+
+function carriesRecords(manifest: ManifestV1): boolean {
+  return (
+    manifest.extensions?.[RELAYHISTORY_EXPORT_EXTENSION] !== undefined ||
+    // A "resumed" epoch only ever follows a backfill.
+    manifest.raw.epochs.some((epoch) => epoch.reason === "backfill")
   );
 }
 
@@ -156,11 +179,58 @@ function canonical(value: unknown): unknown {
   return value;
 }
 
+/**
+ * The same revision of one record. `received_at` is excluded: it says when each
+ * path stored the record, so the export and the live client legitimately differ.
+ */
 function sameRecord(
   left: RelayhistoryStreamRecord,
   right: RelayhistoryStreamRecord,
 ): boolean {
-  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+  const content = ({ received_at: _at, ...rest }: RelayhistoryStreamRecord) =>
+    JSON.stringify(canonical(rest));
+  return content(left) === content(right);
+}
+
+function receivedFirst(
+  left: RelayhistoryStreamRecord,
+  right: RelayhistoryStreamRecord,
+): boolean {
+  return (
+    (Date.parse(left.received_at) - Date.parse(right.received_at) ||
+      compareText(left.received_at, right.received_at)) < 0
+  );
+}
+
+/**
+ * record_id is origin-independent, and the live projection keeps one row for it:
+ * the newest write from any origin, so a newest tombstone removes the record
+ * whichever origin wrote the upsert. `received_at`, then origin, is the order
+ * the projection itself falls back to for writes with no acceptance ledger.
+ *
+ * This runs after the fold, and the two rules differ on purpose. The fold picks
+ * among copies of one write, so the earliest `received_at` is that write's own,
+ * as a replay never restamps it. Here the contenders are different writes, so
+ * the latest wins, compared as instants; origin settles a tie, since timestamp
+ * spelling says nothing about which write is newer.
+ */
+function newestAcrossOrigins(
+  records: Iterable<RelayhistoryStreamRecord>,
+): RelayhistoryStreamRecord[] {
+  const newest = new Map<string, RelayhistoryStreamRecord>();
+  const out: RelayhistoryStreamRecord[] = [];
+  const rank = (record: RelayhistoryStreamRecord) =>
+    `${canonicalTimestamp(record.received_at)}\0${record.origin_id}`;
+  for (const record of records) {
+    if (record.kind === CONVERGENCE_EVENT_KIND) {
+      out.push(record);
+      continue;
+    }
+    const held = newest.get(record.record_id);
+    if (!held || compareText(rank(record), rank(held)) > 0)
+      newest.set(record.record_id, record);
+  }
+  return [...out, ...newest.values()];
 }
 
 /** Latest live records, deterministic regardless of live/backfill arrival order. */
@@ -175,16 +245,17 @@ export function normalizeRelayhistoryRecords(
       latest.set(key, record);
       continue;
     }
-    if (
-      BigInt(record.revision) === BigInt(previous.revision) &&
-      !sameRecord(record, previous)
-    )
+    if (BigInt(record.revision) !== BigInt(previous.revision)) continue;
+    if (!sameRecord(record, previous))
       fail(
         "relayhistory_revision_conflict",
         "equal RelayHistory revisions contain different records",
       );
+    // One record stored twice: the earlier copy wins whichever arrived first,
+    // so the output bytes do not depend on arrival order.
+    if (receivedFirst(record, previous)) latest.set(key, record);
   }
-  return [...latest.values()]
+  return newestAcrossOrigins(latest.values())
     .filter((record) => record.operation === "upsert" && record.payload !== null)
     .sort(
       (left, right) =>
@@ -194,12 +265,15 @@ export function normalizeRelayhistoryRecords(
     );
 }
 
-async function defaultDecompress(stored: Uint8Array): Promise<Uint8Array> {
+async function defaultDecompress(
+  stored: Uint8Array,
+  maxOutputLength: number,
+): Promise<Uint8Array> {
   try {
     const zlib = await import("node:zlib");
     if (typeof zlib.zstdDecompressSync !== "function")
       fail("zstd_unavailable", "this runtime cannot zstd-decompress raw chunks");
-    return new Uint8Array(zlib.zstdDecompressSync(stored));
+    return new Uint8Array(zlib.zstdDecompressSync(stored, { maxOutputLength }));
   } catch (error) {
     if (error instanceof PipelineError) throw error;
     fail("chunk_decompress_failed", "a RelayHistory raw chunk is not valid zstd");
@@ -258,7 +332,12 @@ export async function readRelayhistoryExport(
       fail("chunk_digest_mismatch", "a RelayHistory raw chunk has the wrong stored digest");
     let raw: Uint8Array;
     try {
-      raw = decompress ? decompress(stored) : await defaultDecompress(stored);
+      raw = decompress
+        ? decompress(stored)
+        : await defaultDecompress(
+            stored,
+            chunk.stored_raw_bytes ?? MAX_RELAYHISTORY_CHUNK_BYTES,
+          );
     } catch (error) {
       if (error instanceof PipelineError) throw error;
       fail("chunk_decompress_failed", "a RelayHistory raw chunk is not valid zstd");
@@ -286,18 +365,59 @@ export async function readRelayhistoryExport(
   return normalizeRelayhistoryRecords(records);
 }
 
-function encodedRecords(records: readonly RelayhistoryStreamRecord[]): Uint8Array {
-  const lines = records.map((record) =>
-    JSON.stringify({
-      kind: record.kind,
-      origin_id: record.origin_id,
-      record_id: record.record_id,
-      revision: record.revision,
-      received_at: record.received_at,
-      payload: canonical(record.payload),
-    }),
-  );
+function encodedRows(rows: readonly ProjectionRow[]): Uint8Array {
+  const lines = rows.map((row) => JSON.stringify(canonical(row)));
   return new TextEncoder().encode(lines.length ? `${lines.join("\n")}\n` : "");
+}
+
+/**
+ * The `convergence_events` lines of a stored normalized object. An object in any
+ * other shape, such as the record envelopes earlier builds wrote, is refused:
+ * `{table, row}` is the only normalized format.
+ */
+function convergenceEventLines(stored: Uint8Array): number {
+  let count = 0;
+  for (const line of new TextDecoder().decode(stored).split("\n")) {
+    if (!line) continue;
+    const parsed = parsedLine(line);
+    if (typeof parsed.table !== "string" || !parsed.row || typeof parsed.row !== "object")
+      fail("normalized_object_invalid", "stored normalized object is not {table, row} lines");
+    if (parsed.table === "convergence_events") count += 1;
+  }
+  return count;
+}
+
+function parsedLine(line: string): { table?: unknown; row?: unknown } {
+  try {
+    return (JSON.parse(line) ?? {}) as { table?: unknown; row?: unknown };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Whether `read` is the manifest version a message was enqueued for. Newer means
+ * the message is late, and that version's own event normalizes it. Older means
+ * the read lagged the event, which a retry settles.
+ */
+function currentForTarget(
+  read: ManifestRead,
+  manifestKey: string,
+  target: NormalizeTarget,
+): boolean {
+  const { revision } = read.manifest;
+  if (target.revision !== undefined && revision < target.revision)
+    throw new PipelineError(
+      "manifest_behind_message",
+      "the manifest read is older than the message's revision",
+      true,
+    );
+  if (target.revision !== undefined && revision > target.revision) return false;
+  const prefix = `${manifestKey}@`;
+  const expected = target.workKey?.startsWith(prefix)
+    ? target.workKey.slice(prefix.length)
+    : "";
+  return !expected || expected === read.version || expected === read.etag;
 }
 
 /**
@@ -313,33 +433,69 @@ export class RelayhistoryExportTransform implements SessionTransform {
     },
   ) {}
 
-  async normalize(pointer: RawPointer): Promise<{ outputKey?: string }> {
+  async normalize(
+    pointer: RawPointer,
+    target: NormalizeTarget = {},
+  ): Promise<NormalizedOutput | NormalizeSkipped | Record<string, never>> {
     if (pointer.deleted) return {};
     const read = await this.deps.manifests.read(pointer.manifestKey);
     if (!read) return {};
+    if (!currentForTarget(read, pointer.manifestKey, target))
+      return { skipped: "stale_manifest" };
     const manifest = read.manifest;
-    if (!exported(manifest)) return {};
+    // A harness log is left for its own normalizer. A marker this code cannot
+    // read, or a backfill without one, reaches the refusal in the reader below.
+    if (!carriesRecords(manifest)) return {};
     const records = await readRelayhistoryExport(
       manifest,
       this.deps.store,
       this.deps.decompress,
     );
-    const body = encodedRecords(records);
+    const location = manifestLocation(manifest);
+    const projection = projectRelayhistorySession(records, {
+      workspaceId: location.workspaceId,
+      source: location.harness,
+      sessionId: location.sessionId,
+    });
+    const body = encodedRows(projection.rows);
     const key = normalizedKey(
-      manifestLocation(manifest),
+      location,
       RELAYHISTORY_NORMALIZED_VERSION,
       `relayhistory-${manifest.raw.content_sha256}.ndjson`,
     );
-    await this.deps.store.put(objectKey(key), body, {
-      ifNoneMatch: true,
-      contentType: "application/x-ndjson",
-      metadata: {
-        "trace-id": manifest.trace_id,
-        "manifest-revision": String(manifest.revision),
-        "source-content-sha256": manifest.raw.content_sha256,
-        "source-epoch": String(manifest.raw.epoch),
-      },
-    });
-    return { outputKey: key };
+    let created = false;
+    try {
+      const ack = await this.deps.store.put(objectKey(key), body, {
+        ifNoneMatch: true,
+        contentType: "application/x-ndjson",
+        metadata: {
+          "trace-id": manifest.trace_id,
+          "manifest-revision": String(manifest.revision),
+          "source-content-sha256": manifest.raw.content_sha256,
+          "source-epoch": String(manifest.raw.epoch),
+        },
+      });
+      created = ack.created;
+    } catch (error) {
+      if (!isObjectStoreError(error, "already_exists")) throw error;
+    }
+    // Create-only: on a hit the stored object is the output, so it is described
+    // from its own bytes. Its metadata names whichever revision wrote it first.
+    const stored = created
+      ? body
+      : await readAll(await this.deps.store.get(objectKey(key)));
+    const outputSha256 = await sha256Hex(stored);
+    return {
+      outputKey: key,
+      revision: manifest.revision,
+      normalizedVersion: RELAYHISTORY_NORMALIZED_VERSION,
+      contentSha256: manifest.raw.content_sha256,
+      outputSha256,
+      outputBytes: stored.byteLength,
+      convergenceEventCount: convergenceEventLines(stored),
+      unprojectedRecords: projection.unprojected,
+      outputReused: !created,
+      outputDivergent: !created && outputSha256 !== (await sha256Hex(body)),
+    };
   }
 }

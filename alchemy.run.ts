@@ -178,6 +178,10 @@ export default Alchemy.Stack(
       INGEST_PORT: "8080",
       JWKS_JSON: inputs.jwksJson,
       AUTH_ISSUER: TENANT.issuer,
+      // Local Docker dev stack only: the courier's tokens are minted from this
+      // stack's own key, so the broad interim bearer is an explicit opt-in here.
+      // The ingest defaults it off (src/alleyoop/ingest.ts).
+      ALLOW_INTERIM_RELAYAUTH_BEARER: "true",
     }, { ports: [{ external: `127.0.0.1:${PORTS.ingest}`, internal: 8080 }] });
 
     yield* service("hoopdb-indexer", name(NAMES.indexer), "hoopdb-indexer");

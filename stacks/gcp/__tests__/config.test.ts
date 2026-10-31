@@ -6,6 +6,7 @@ import {
   assertGcpInputs,
   assertGcpRuntimeDeployable,
   GCP_APPROVED_TARGET,
+  GCP_APPROVED_SERVICES_IMAGE,
   GCP_NODE_ROLES,
   GCP_RUNTIME_SHAPE,
   bulls96ReleaseValues,
@@ -16,6 +17,7 @@ import {
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
+  requestedAlchemyCommand,
   captureRelaycastChartPackage,
   type GcpInputs,
 } from "../config.ts";
@@ -47,6 +49,7 @@ describe("GCP self-host contract", () => {
       existingSecretName: "not a secret name",
       imagePullSecretName: "not a pull secret name",
       imageDigest: "not-a-digest",
+      imageSourceRevision: "not-a-revision",
       relayauthJwksUrl: "http://user:password@attacker.example/jwks?token=secret",
       relayauthIssuer: "http://user:password@attacker.example",
     };
@@ -119,8 +122,8 @@ describe("GCP self-host contract", () => {
       chartVersion: "0.3.0",
       tenantOrgId: "org_123",
       existingSecretName: "bulls96-runtime",
-      imagePullSecretName: "ghcr-pull",
       imageDigest: `sha256:${"a".repeat(64)}`,
+      imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
       relayauthIssuer: "http://relayauth.relayauth.svc:8787",
     };
@@ -139,6 +142,20 @@ describe("GCP self-host contract", () => {
         bulls96: { ...bulls96, imageDigest: "main" },
       }),
     ).toThrow("immutable sha256 digest");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, imageSourceRevision: "db2663d" },
+      }),
+    ).toThrow("full Git commit SHA");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96,
+      }),
+    ).toThrow("does not match the reviewed release");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
@@ -179,16 +196,37 @@ describe("GCP self-host contract", () => {
       assertGcpInputs("gcp-dev", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
-        bulls96,
+        bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
-    ).not.toThrow();
+    ).toThrow("not approved for the GCP application proof");
     expect(() =>
       assertGcpRuntimeDeployable({
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
-        bulls96,
+        bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
-    ).not.toThrow();
+    ).toThrow("not approved for the GCP application proof");
+    const recordedButIneligible = {
+      ...base,
+      managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" as const },
+      bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
+    };
+    expect(() => assertGcpInputs("gcp-dev", recordedButIneligible, "destroy")).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable(recordedButIneligible, "destroy")).not.toThrow();
+    for (const command of ["plan", "deploy"] as const) {
+      expect(() => assertGcpInputs("gcp-dev", recordedButIneligible, command)).toThrow(
+        "not approved for the GCP application proof",
+      );
+      expect(() => assertGcpRuntimeDeployable(recordedButIneligible, command)).toThrow(
+        "not approved for the GCP application proof",
+      );
+    }
+  });
+
+  it("mirrors Alchemy's first-known-command scan for destroy cleanup", () => {
+    expect(requestedAlchemyCommand(["--stage", "gcp-dev", "destroy"])).toBe("destroy");
+    expect(requestedAlchemyCommand(["--stage", "gcp-dev", "plan", "destroy"])).toBe("plan");
+    expect(requestedAlchemyCommand(["--stage", "gcp-dev", "bogus"])).toBeUndefined();
   });
 
   it("renders a CA-backed Redis round-trip contract without AUTH or HMAC credentials", () => {
@@ -198,14 +236,15 @@ describe("GCP self-host contract", () => {
           chartVersion: "0.3.0",
           tenantOrgId: "org_123",
           existingSecretName: "bulls96-runtime",
-          imagePullSecretName: "ghcr-pull",
           imageDigest: `sha256:${"a".repeat(64)}`,
+          imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
           relayauthIssuer: "http://relayauth.relayauth.svc:8787",
         },
         {
           bucket: "locker",
           region: "us-central1",
+          imageRepository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
           cloudSqlConnectionName: "agentworkforce-dev1:us-central1:awf-dev-postgres",
           redisHost: "10.52.0.3",
           redisPort: 6379,
@@ -219,15 +258,26 @@ describe("GCP self-host contract", () => {
     expect(rendered).toContain("REDIS_TLS_CA_PEM");
     expect(rendered).toContain("REDIS_TRANSIT_ENCRYPTION");
     expect(rendered).toContain("SERVER_AUTHENTICATION");
-    expect(rendered).toContain("ghcr-pull");
+    expect(rendered).toContain("us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services");
+    expect(rendered).not.toContain("ghcr-pull");
     expect(rendered).not.toContain('"REDIS_AUTH"');
     expect(rendered).not.toContain("REDIS_PASSWORD");
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
     expect(values).toMatchObject({
-      worker: { imagePullSecrets: [{ name: "ghcr-pull" }], image: { digest: `sha256:${"a".repeat(64)}` }, locker: { credentials: { mode: "podIdentity" } } },
+      worker: {
+        imagePullSecrets: [],
+        image: {
+          repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
+          digest: `sha256:${"a".repeat(64)}`,
+        },
+        locker: { credentials: { mode: "podIdentity" } },
+      },
       alleyoop: {
-        imagePullSecrets: [{ name: "ghcr-pull" }],
-        image: { digest: `sha256:${"a".repeat(64)}` },
+        imagePullSecrets: [],
+        image: {
+          repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
+          digest: `sha256:${"a".repeat(64)}`,
+        },
         locker: { credentials: { mode: "podIdentity" } },
         auth: {
           jwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
@@ -282,11 +332,19 @@ describe("GCP self-host contract", () => {
     expect(GCP_RUNTIME_SHAPE.nodeLocation).toBe("us-central1-a");
     expect(GCP_RUNTIME_SHAPE.natIpAllocateOption).toBe("MANUAL_ONLY");
     expect(GCP_RUNTIME_SHAPE.natLogFilter).toBe("ALL");
-    expect(GCP_NODE_ROLES).toEqual(["roles/container.defaultNodeServiceAccount"]);
+    expect(GCP_NODE_ROLES).toEqual([
+      "roles/container.defaultNodeServiceAccount",
+      "roles/artifactregistry.reader",
+    ]);
     const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
     expect(stack).toContain("enablePrivateEndpoint: GCP_RUNTIME_SHAPE.privateEndpoint");
     expect(stack).toContain("autopilot: GCP_RUNTIME_SHAPE.autopilot");
     expect(stack).toContain("serviceAccount: nodeActAs.serviceAccountEmail");
+    expect(stack).toContain('GCP.IAM.Member("node-artifactregistry-reader"');
+    expect(stack).toContain("Output.all(images.registryUri, nodeArtifactRegistryReader.role)");
+    expect(stack.indexOf('GCP.IAM.Member("node-artifactregistry-reader"')).toBeLessThan(
+      stack.indexOf('Kubernetes.HelmChart("96bulls"'),
+    );
     expect(stack.indexOf('RequireNodeActAs("node-act-as"')).toBeLessThan(
       stack.indexOf('GCP.Container.Cluster("cluster"'),
     );
