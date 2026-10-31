@@ -11,7 +11,7 @@
  *   BENCH_SHAPE_FILE  aggregate-only shape file; sizes the corpus. G6 is at best PARTIAL
  *   BENCH_OUT         report path
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
@@ -96,8 +96,10 @@ async function g1() {
   // Refused uploads leave no job, no pointer and no searchable row.
   const refused = async (id: string, claim: { machineId?: string } | null) => {
     const seen = outcomes.length;
+    pipeline.refusals.length = 0;
     const r = await pipeline.courier("org-e2e-a", "ws-e2e-a", [{ id, lines: [line(`refusedmarker ${id}`, 1)] }], undefined, claim);
-    return r.result.uploaded === 0 && r.landed.claimed === 0 && outcomes.length === seen && (await countRows(`session_id = '${id}'`)) === 0;
+    return r.result.uploaded === 0 && r.landed.claimed === 0 && outcomes.length === seen && (await countRows(`session_id = '${id}'`)) === 0
+      && pipeline.refusals.length > 0 && pipeline.refusals.every((c) => c === "machine_claim_refused");
   };
   const claimAbsentRefused = await refused("s-e2e-noclaim", null);
   const claimMismatchRefused = await refused("s-e2e-wrongclaim", { machineId: "machine-other" });
@@ -108,8 +110,10 @@ async function g1() {
     ownOrgHits: (await search.search(scopeOf("org-e2e-b", ["ws-e2e-b"]), { query: "orgbmarker" })).hits.length,
     otherOrgHits: (await search.search(scopeOf("org-e2e-a", ["ws-e2e-b"]), { query: "orgbmarker" })).hits.length,
   };
+  pipeline.refusals.length = 0;
   const unlisted = await pipeline.courier("org-e2e-c", "ws-e2e-c", [{ id: "s-e2e-c", lines: [line("orgcmarker", 1)] }]);
   const unlistedRows = await countRows("org_id = 'org-e2e-c'");
+  const unlistedCodes = [...pipeline.refusals];
   await pipeline.stop();
   gate("G1_courier_to_search", {
     realCourierUploaded: first.result.uploaded === 1 && second.result.uploaded === 1,
@@ -127,7 +131,8 @@ async function g1() {
     machineClaimMismatchRefused: claimMismatchRefused,
     secondOrgIndexed: multiOrg.uploaded === 1 && multiOrg.ownOrgHits === 1,
     secondOrgHiddenFromFirst: multiOrg.otherOrgHits === 0,
-    unlistedOrgRefused: unlisted.result.uploaded === 0 && unlisted.landed.claimed === 0 && unlistedRows === 0,
+    unlistedOrgRefused: unlisted.result.uploaded === 0 && unlisted.landed.claimed === 0 && unlistedRows === 0
+      && unlistedCodes.length > 0 && unlistedCodes.every((c) => c === "org_not_allowed"),
   }, { firstHitMs: Math.round(firstHitMs), rowsBefore, rowsAfterRetry, outcomes, multiOrg, note: "the search-index step is proof code called from session-indexed; no such queue stage exists" });
   return true;
 }
@@ -405,9 +410,14 @@ report.G9_noisy_neighbour = { status: "INHERITED_FAIL", detail: "#233 gate 7 fai
 report.G11_cost_teardown = { status: "NOT_RUN", detail: "plan in docs/session-search-proof.md; no account exists" };
 for (const id of ["G2_lexical_recall", "G3_context_recall", "G4_federation", "G5_tenant_isolation", "G7_latency_load", "G8_freshness", "G10_delete_logical"])
   report[id] ??= { status: "NOT_RUN", detail: "G1 blocked" };
-const summary = { shapeFidelity: SHAPE_FIDELITY, firstQueryAfterLoad, scale: scaleName, corpus: corpusHash(params), querySet: QUERY_SET_VERSION, engine: (await admin.run("SELECT version()")).trim(), loaded, gates: report };
+// A proof gate passes only as PASS, so a green job never means the proof passed.
+const open = Object.entries(report).filter(([, g]) => g.status !== "PASS").map(([k, g]) => `${k}=${g.status}`);
+const VERDICT = open.length ? "INCOMPLETE/HOLD" : "COMPLETE";
+const summary = { verdict: VERDICT, openGates: open, shapeFidelity: SHAPE_FIDELITY, firstQueryAfterLoad, scale: scaleName, corpus: corpusHash(params), querySet: QUERY_SET_VERSION, engine: (await admin.run("SELECT version()")).trim(), loaded, gates: report };
 mkdirSync(dirname(out), { recursive: true });
 writeFileSync(out, JSON.stringify(summary, null, 2));
+console.log(`VERDICT: ${VERDICT}. Open: ${open.join(", ")}. Job success means the run executed, not that the proof passed.`);
+if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `## VERDICT: ${VERDICT}\n\nJob success means the run executed, not that the proof passed.\n\nOpen: ${open.join(", ")}\n\nSHAPE FIDELITY: ${SHAPE_FIDELITY}\n`);
 console.log(`report: ${out}`);
 const failed = Object.entries(report).filter(([, g]) => g.status === "FAIL" || g.status === "BLOCKED").map(([k]) => k);
 if (failed.length) { console.error(`failed: ${failed.join(", ")}`); process.exit(1); }

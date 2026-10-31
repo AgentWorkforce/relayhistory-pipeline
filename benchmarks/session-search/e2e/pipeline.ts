@@ -55,11 +55,17 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
   });
   const store = createFsStore({ root });
   const { app, env } = await buildIngestApp({ db: sql, raw: { store, provider: "fs", bucket: "raw" } as never });
+  const refusals: string[] = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url === JWKS_URL) return Response.json(jwks);
-    if (url.startsWith(INGEST)) { const u = new URL(url); return app.request(`${u.pathname}${u.search}`, init, env); }
+    if (url.startsWith(INGEST)) {
+      const u = new URL(url);
+      const res = await app.request(`${u.pathname}${u.search}`, init, env);
+      if (res.status >= 400) refusals.push(((await res.clone().json().catch(() => ({}))) as { error?: { code?: string } }).error?.code ?? `http_${res.status}`);
+      return res;
+    }
     return realFetch(input, init);
   }) as typeof fetch;
 
@@ -104,7 +110,7 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
   }
 
   return {
-    courier, store, db,
+    courier, store, db, refusals,
     stop: async () => { globalThis.fetch = realFetch; await db.close(); await rm(root, { recursive: true, force: true }); },
   };
 }

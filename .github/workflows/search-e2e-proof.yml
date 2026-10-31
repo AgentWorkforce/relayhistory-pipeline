@@ -15,7 +15,8 @@ on:
 permissions:
   contents: read
 jobs:
-  e2e-proof:
+  e2e-proof-execution:
+    name: e2e-proof execution, verdict in report
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:

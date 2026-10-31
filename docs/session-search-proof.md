@@ -17,6 +17,9 @@ BENCH_SCALE=M BENCH_SHAPE_FILE=benchmarks/session-search/e2e/shape-2026-10-31.js
   bun benchmarks/session-search/e2e/proof.ts
 ```
 
+**Overall verdict: INCOMPLETE/HOLD.** The run reports this whenever any gate is not PASS.
+A green CI job means the proof executed, not that it passed.
+
 ## What runs for real
 
 Real: `runCourierOnce`, `buildIngestApp` with its scrubbing chunk hop, the pipeline
@@ -37,7 +40,7 @@ are relative. Check this PR's CI at its exact head for current logic gate result
 | Gate | Result | Evidence and limits |
 | --- | --- | --- |
 | G0 Negative controls | PASS | Removing the org predicate, the substring recheck or the dedup token each changes the answer; a wrong result scores recall below 1 |
-| G1 Courier to search | PASS | First hit, planted secret absent with a positive control, append, retry dedup, stale, quarantine, opt-out. Uploads carry the signed machine claim; absent and mismatched claims are refused with no job, pointer or row, and a refusal reports G1 BLOCKED. A second org runs through the real ingest with `PIPELINE_ORG_FROM_PREFIX` and `TENANT_ORG_IDS`, stays hidden from the first, and an unlisted org is refused |
+| G1 Courier to search | PASS | First hit, planted secret absent with a positive control, append, retry dedup, stale, quarantine, opt-out. Uploads carry the signed machine claim; absent and mismatched claims are refused with exactly `machine_claim_refused` and no job, pointer or row, and a refusal reports G1 BLOCKED. A second org runs through the real ingest with `PIPELINE_ORG_FROM_PREFIX` and `TENANT_ORG_IDS`, stays hidden from the first, and an unlisted org is refused with exactly `org_not_allowed` |
 | G2 Lexical recall | PASS | Recall@5 and @10 of 1.0 and exact counts against the generator on 12 query classes in 2 orgs: phrase, error, path, PR number, case, substring, CJK, accents, 2-character, punctuation, past 4 KB, common |
 | G3 Context | PASS | Window contains the match, focus finds the event, chronological, snippets at most 320 characters, citations, cursors do not repeat |
 | G4 Federation | PASS on a small fixture | Before and after T0, straddling session and backfilled copy once each, pagination, each pool down is named. Event ids are shared by construction; the real legacy-to-store id mapping is unproven. Pre-T0 text past 4 KB stays unsearchable without a backfill |
