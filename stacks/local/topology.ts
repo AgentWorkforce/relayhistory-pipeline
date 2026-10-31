@@ -8,13 +8,19 @@
  * adapter, HoopDb = Postgres, Referee = session-state classifier, Bob Costas =
  * summaries.
  */
+import {
+  claimlessWindowEnv,
+  type ClaimlessWindow,
+} from "../claimless-window.ts";
+
 export const STACK = "96bulls";
 
 /** Images pinned by tag now; digests go into versions.lock.json on first release. */
 export const IMAGES = {
   hoopdb: "pgvector/pgvector:pg17",
   // MinIO's own registries went private in 2025; Chainguard's build is public. Pinned by digest.
-  locker: "cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7",
+  locker:
+    "cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7",
   otelCollector: "otel/opentelemetry-collector-contrib:0.163.2", // kept in step with the collector chart 0.178.0 (helm-chart-lead)
   services: "96bulls/services:local",
   /** Root one-shot for volume permissions; Alchemy containers cannot set a user. */
@@ -73,7 +79,10 @@ export const IMAGE_PATHS = {
  * 0600; when the CLI's uid is not the container's, one POSIX ACL entry grants read
  * to that uid only (`summaryKeyAccess`).
  */
-export function summaryKeyPath(stage: string, uid = process.getuid?.() ?? 1000): string {
+export function summaryKeyPath(
+  stage: string,
+  uid = process.getuid?.() ?? 1000,
+): string {
   const runtime = process.env.XDG_RUNTIME_DIR || `/run/user/${uid}`;
   return `${runtime}/96bulls/${stage}/summary-master-keys`;
 }
@@ -87,6 +96,20 @@ export const SERVICES_CONTAINER_UID = 1000;
  * mode 0600 always; if the CLI's uid differs from the container's, add exactly one
  * ACL entry `u:<containerUid>:r` (fail closed if ACLs are unavailable).
  */
-export function summaryKeyAccess(hostUid: number, containerUid = SERVICES_CONTAINER_UID): { mode: 0o600; aclReadForUid?: number } {
-  return hostUid === containerUid ? { mode: 0o600 } : { mode: 0o600, aclReadForUid: containerUid };
+export function summaryKeyAccess(
+  hostUid: number,
+  containerUid = SERVICES_CONTAINER_UID,
+): { mode: 0o600; aclReadForUid?: number } {
+  return hostUid === containerUid
+    ? { mode: 0o600 }
+    : { mode: 0o600, aclReadForUid: containerUid };
+}
+
+/** The ingest's env for a local stage. Default off: its tokens carry the claim. */
+export function localClaimEnv(
+  window: ClaimlessWindow | undefined,
+): Record<string, string> {
+  return Object.fromEntries(
+    claimlessWindowEnv(window).map(({ name, value }) => [name, value]),
+  );
 }

@@ -89,6 +89,9 @@ export interface Bindings {
   PIPELINE_STATUS_CLASSIFY?: Queue<
     import("./lib/pipeline/dlq.js").StageMessage
   >;
+  PIPELINE_BACKFILL_ACTIVATION?: Queue<
+    import("./lib/pipeline/dlq.js").StageMessage
+  >;
   PIPELINE_FILE_MAINTENANCE?: Queue<
     import("./lib/pipeline/dlq.js").StageMessage
   >;

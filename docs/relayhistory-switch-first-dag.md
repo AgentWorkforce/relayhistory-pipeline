@@ -11,21 +11,21 @@ deploying, exporting and cutting over.
 
 ## Pinned dependencies (heads as of 2026-10-30)
 
-| Gate | PR / artifact | Head | State |
-| --- | --- | --- | --- |
-| G1 Cutover gate, durable hold, data-loss fix | relayhistory-cloud #224 | `d697acd9ae` | draft; fix lane active |
-| G2 Worker TCP driver | relayhistory-cloud #225 | `5872005b41` | draft; held for independent PASS |
-| G3 Worker writes into the pipeline, reads from `session_index` and S3, bounded Neon fallback | relayhistory-cloud (P3) | none yet | **unowned** |
-| G4 Cloud consumers (Sessions board, MCP) and post-T0 write gating | cloud #5850 + P4 | `411ef650ab` | ready, held |
-| G5 Logical session directory and agent name | 96BullSessions #38 | `71b8ffdd63` | draft |
-| G6 V1 search projection columns and indexes | `docs/session-search-projection.md` | `400994d` (doc) | migration not written |
-| G7 Per-workspace KMS keys for new writes (P9) | sessionspipelinegrok + Khaliq | none | decision open |
-| G8 Erasure path for the search projection (P8a) | sessionspipelinegrok | none | decision open |
-| G9 Runner and rollouts against any Postgres | relayhistory-cloud #223 | `b06e973f25` | draft, CI green |
-| E1 Exporter (export only, after T0) | 96BullSessions #40 | `a94149a50c` | draft |
-| E2 Migration assertion (export only) | relayauth #110 | `a1368a3c10` | draft |
-| E3 Single-use assertion check at ingest (export only) | relayhistory-cloud | none | **unowned** |
-| E4 Transform reads exported streams (O3, export only) | pipeline | none | **unowned** |
+| Gate                                                                                         | PR / artifact                       | Head            | State                            |
+| -------------------------------------------------------------------------------------------- | ----------------------------------- | --------------- | -------------------------------- |
+| G1 Cutover gate, durable hold, data-loss fix                                                 | relayhistory-cloud #224             | `d697acd9ae`    | draft; fix lane active           |
+| G2 Worker TCP driver                                                                         | relayhistory-cloud #225             | `5872005b41`    | draft; held for independent PASS |
+| G3 Worker writes into the pipeline, reads from `session_index` and S3, bounded Neon fallback | relayhistory-cloud (P3)             | none yet        | **unowned**                      |
+| G4 Cloud consumers (Sessions board, MCP) and post-T0 write gating                            | cloud #5850 + P4                    | `411ef650ab`    | ready, held                      |
+| G5 Logical session directory and agent name                                                  | 96BullSessions #38                  | `71b8ffdd63`    | draft                            |
+| G6 V1 search projection columns and indexes                                                  | `docs/session-search-projection.md` | `400994d` (doc) | migration not written            |
+| G7 Per-workspace KMS keys for new writes (P9)                                                | sessionspipelinegrok + Khaliq       | none            | decision open                    |
+| G8 Erasure path for the search projection (P8a)                                              | sessionspipelinegrok                | none            | decision open                    |
+| G9 Runner and rollouts against any Postgres                                                  | relayhistory-cloud #223             | `b06e973f25`    | draft, CI green                  |
+| E1 Exporter (export only, after T0)                                                          | 96BullSessions #40                  | `a94149a50c`    | draft                            |
+| E2 Migration assertion (export only)                                                         | relayauth #110                      | `a1368a3c10`    | draft                            |
+| E3 Single-use assertion check at ingest (export only)                                        | relayhistory-cloud                  | none            | **unowned**                      |
+| E4 Transform reads exported streams (O3, export only)                                        | pipeline                            | none            | **unowned**                      |
 
 **T0 needs G1 to G8.** E1 to E4 gate only the export after T0. The agent
 index (relayhistory-cloud #222, `7264a70`) belongs to the Neon schema; its
@@ -96,6 +96,7 @@ delivery-record form, then the fence restore.
 
 A session active at T0 has records before the marker (on the branch) and
 after it (in the pipeline). The session's raw stream is append-only:
+
 - post-T0 records append as live chunks;
 - the export appends the pre-T0 records later, in a dedicated epoch;
 - the normalizer orders every record by event time and keeps each record's
@@ -107,6 +108,12 @@ append-only change that preserves the live `raw.owner`, writer, session and
 all prior chunks. Both migration and live writes compare-and-swap the exact
 object version they read, so a straddling session has one manifest order and
 the losing writer must reread before it can continue.
+
+The contract is in relayhistory's `manifest-v1.md`, section "Backfill". A
+backfill epoch is sealed: the live client never appends to it, and continues in
+a `resumed` epoch at its own offset. Re-exporting is a no-op by content digest,
+and a different digest stops for a human. A client truncate or rewrite leaves
+the backfill in the merge.
 
 ## Invariants (data loss and dual write)
 
