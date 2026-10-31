@@ -17,7 +17,7 @@ BENCH_SCALE=M BENCH_SHAPE_FILE=benchmarks/session-search/e2e/shape-2026-10-31.js
   bun benchmarks/session-search/e2e/proof.ts
 ```
 
-**Overall verdict: INCOMPLETE/HOLD.** The run reports this whenever any gate is not PASS.
+**Overall verdict: INCOMPLETE/HOLD. G6 PARTIAL, G7 and G8 RELATIVE, G9 inherited FAIL, G11 NOT RUN.** The run reports this whenever any gate is not PASS.
 A green CI job means the proof executed, not that it passed.
 
 ## What runs for real
@@ -42,6 +42,7 @@ are relative. Check this PR's CI at its exact head for current logic gate result
 | G0 Negative controls | PASS | Removing the org predicate, the substring recheck or the dedup token each changes the answer; a wrong result scores recall below 1 |
 | G1 Courier to search | PASS | First hit, planted secret absent with a positive control, append, retry dedup, stale, quarantine, opt-out. Uploads carry the signed machine claim; absent and mismatched claims are refused with exactly `machine_claim_refused` and no job, pointer or row, and a refusal reports G1 BLOCKED. A second org runs through the real ingest with `PIPELINE_ORG_FROM_PREFIX` and `TENANT_ORG_IDS`, stays hidden from the first, and an unlisted org is refused with exactly `org_not_allowed` |
 | G2 Lexical recall | PASS | Recall@5 and @10 of 1.0 and exact counts against the generator on 12 query classes in 2 orgs: phrase, error, path, PR number, case, substring, CJK, accents, 2-character, punctuation, past 4 KB, common |
+| G2b Adversarial paging | PASS | Scattered grams newest with true hits older, full pages, tenant, workspace and machine scope, equal timestamps across cursors, token boundaries, case and punctuation |
 | G3 Context | PASS | Window contains the match, focus finds the event, chronological, snippets at most 320 characters, citations, cursors do not repeat |
 | G4 Federation | PASS on a small fixture | Before and after T0, straddling session and backfilled copy once each, pagination, each pool down is named. Event ids are shared by construction; the real legacy-to-store id mapping is unproven. Pre-T0 text past 4 KB stays unsearchable without a backfill |
 | G5 Tenant isolation | PASS | Canaries across orgs and workspaces, injection strings, context, crafted cursor, reader cannot write, missing setting fails closed. The row policy is a backstop: per #233 anyone who can set the value reads that tenant |
@@ -83,20 +84,42 @@ helm-chart-chief's contract of 2026-10-31. Nothing here is met for T0.
 | 1. Separate e2e for engine and full product | Engine: G0, G2, G5, G7. Product path covers courier to store only; **no product e2e through the MCP server, Cloud API or dashboard** |
 | 2. Same Supabase and Neon baseline for every comparison | **Not met.** The legacy pool is a PGlite model of one rule; #59 has the Postgres arms but on a separate red stack |
 | 3. Server-side tenant isolation | Store chokepoint and reader user tested. Real server auth to scope, and Supabase hydrate, not exercised |
-| 4. Every Cloud, desktop and MCP filter plus compound queries | **Not met.** Store has workspace, since, until, source, cursor. Project, agent, kind, task ref, tag and machine filters are missing, and compound queries are untested |
+| 4. Every Cloud, desktop and MCP filter plus compound queries | **Not met.** Store has workspace, machine, since, until, source, cursor. Project, agent, kind, task ref and tag filters are missing, and compound queries are untested |
 | 5. Plain text first, embeddings optional | Met by design; embeddings are not built |
 | 6. Synthetic corpus measured to match production | PARTIAL. Two event totals only |
 | 7. Heavy tenant and quota tests | **Not met.** G9 inherited FAIL; quotas in #233 are not implemented |
 
 ## Proposed fixes (proposals only)
 
-**p95 miss.** CI saturated at about 12 QPS regardless of clients, so the first step is to
-find the limit: run the 12 classes singly to see which drives it, since `deploy`
-and the unindexed 2-character form read far more rows than the rest. Candidates: rank by
-recency within a `ts` window that widens on demand instead of scanning all history; add a
-minimum length or a stricter cap for under-three-character terms; separate snippet
-fetching into a second phase as #233 specifies; size per-org quotas from the result.
-Rerun on the target service, because a small runner says little about capacity.
+**p95 miss: diagnosed, not fixed.** On a 2-core runner, 4.04M events, every class
+holds about 9 to 14 QPS from 1 to 32 clients (common terms a little more), so latency is
+queueing: about 5 QPS per core, and about 190 ms of CPU per query. The cause is the
+substring recheck, which reads `text` in every surviving granule. Hits are scattered, so
+the index keeps most granules of the tenant (152 of 182 for a term with 307 hits).
+
+| One client, reader user, 307-hit term | p50 ms | MB read | CPU ms |
+| --- | --- | --- | --- |
+| Current | 110 | 179 | 203 |
+| No snippet in the query | 99 | 177 | 177 |
+| Index only, no recheck (not usable: false matches) | 39 | 36 | 63 |
+| Top-k filtering off | 149 | 303 | 277 |
+| Explicit PREWHERE | 155 | 317 | 292 |
+
+The row policy costs about 10%, so it is not the cause. `read_rows` stays above 1.2M in
+every variant, including index only, so it does not measure text read; use bytes and CPU.
+
+Candidate-first search was tried and rejected at `b734698`, run 41184915870: the index
+picks 200 candidates and only those are rechecked. It passed the recall gates, but it
+helped only common terms (14 to 23 QPS) and hurt rare ones (307 hits, 10.7 to 7.5 QPS),
+because rare candidates span all history and the second phase still reads `text` across
+that range. Each search also became two queries. The mixed load did not improve, so the
+simpler first-phase recheck stays, which also keeps exact counts as #233 specifies.
+
+Next, in order: (1) test a `ts` window that starts recent and widens, which bounds the
+read for the common newest-first case; (2) test a smaller index granularity or a
+`session` grouping that makes hits less scattered; (3) size capacity on the target. At
+today's CPU per query, 32 clients at p95 300 ms would need roughly 100 QPS, about 20 cores.
+The 5 s timeouts under load are ClickHouse code 159.
 
 **First search after load.** Not reproduced in CI (435 ms). Run the load on CI with the
 same probe at several points while parts merge, and log parts and merges with it. If it

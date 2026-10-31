@@ -47,17 +47,12 @@ async function level(needle: (typeof NEEDLES)[number], clients: number) {
   const tag = `diag:${needle.id}:${clients}`;
   const lat: number[] = [];
   const errors: Record<string, number> = {};
-  const work = { candidates: 0, falseCandidates: 0, rounds: 0, searches: 0 };
   let stop = false;
   const started = performance.now();
   const worker = async () => {
     while (!stop) {
       const s = performance.now();
-      try {
-        const { stats } = await search.search(whale, { query: needle.query, tag });
-        lat.push(performance.now() - s);
-        work.candidates += stats.candidates; work.falseCandidates += stats.falseCandidates; work.rounds += stats.rounds; work.searches++;
-      }
+      try { await search.search(whale, { query: needle.query, tag }); lat.push(performance.now() - s); }
       catch (e) { const c = errorCode(e); errors[c] = (errors[c] ?? 0) + 1; }
     }
   };
@@ -67,10 +62,8 @@ async function level(needle: (typeof NEEDLES)[number], clients: number) {
   await Promise.all(run);
   const elapsed = (performance.now() - started) / 1000;
   const qps = Math.round(lat.length / elapsed * 10) / 10;
-  const per = (n: number) => Math.round(n / Math.max(1, work.searches) * 10) / 10;
   return {
     clients, qps, qpsPerCore: Math.round(qps / cpus().length * 10) / 10, errors, ...pct(lat), server: await serverCounters(tag),
-    perSearch: { candidates: per(work.candidates), falseCandidates: per(work.falseCandidates), rounds: per(work.rounds) },
   };
 }
 
