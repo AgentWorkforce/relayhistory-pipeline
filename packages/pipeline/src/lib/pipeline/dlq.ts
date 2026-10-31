@@ -170,7 +170,13 @@ function isReplayable(
 
 export interface DeadLetterStore {
   /** Upsert by id: a new death resets state to `dead` and bumps `deadCount`. */
-  quarantine(message: StageMessage, at: Date): Promise<DeadLetter>;
+  /** `job` is the delivery's lease, which a `normalized-ready` letter requires. */
+  quarantine(message: StageMessage, at: Date, job?: StageJob): Promise<DeadLetter>;
+  /**
+   * Replay of a `normalized-ready` letter: re-runs `file-normalize` for that work
+   * and never re-sends the stored count. False if it isn't dead. Absent: unsupported.
+   */
+  rerunNormalize?(id: string, replayId: string): Promise<boolean>;
   list(filter: DeadLetterFilter): Promise<DeadLetter[]>;
   /**
    * Compare-and-set from the listed snapshot to `replaying`. Every claim bumps
@@ -359,7 +365,7 @@ export async function handleStageQueue(
     });
     if (route.dlq) {
       try {
-        const letter = await deps.deadLetters.quarantine(body, now());
+        const letter = await deps.deadLetters.quarantine(body, now(), message.job);
         await recorder.record(body.stage, "dead_lettered", {
           attempt: message.attempts,
           errorCode: "retries_exhausted",
@@ -384,7 +390,7 @@ export async function handleStageQueue(
       // would only run the message into the DLQ; quarantine it now instead, where
       // it waits indefinitely and replays once the stage is wired.
       try {
-        const letter = await deps.deadLetters.quarantine(body, now());
+        const letter = await deps.deadLetters.quarantine(body, now(), message.job);
         await recorder.record(body.stage, "dead_lettered", {
           attempt: message.attempts,
           errorCode: "stage_not_configured",
@@ -443,7 +449,7 @@ export async function handleStageQueue(
       if (!info.retryable) {
         // A permanent failure goes straight to quarantine instead of burning retries.
         try {
-          const letter = await deps.deadLetters.quarantine(body, now());
+          const letter = await deps.deadLetters.quarantine(body, now(), message.job);
           await recorder.record(body.stage, "dead_lettered", {
             attempt: message.attempts,
             error,
@@ -566,6 +572,14 @@ export async function replayDeadLetters(
   if (dryRun) return result;
   const flushes: Promise<void>[] = [];
   for (const letter of letters) {
+    if (letter.stage === "normalized-ready") {
+      const rerun = await Promise.resolve(
+        deps.deadLetters.rerunNormalize?.(letter.id, replayId) ?? false,
+      ).catch(() => false);
+      if (rerun) result.sent.push(letter.id);
+      else result.skipped.push({ id: letter.id, reason: "send_failed" });
+      continue;
+    }
     let claimed: boolean;
     try {
       // Conditional on the version we listed: if anyone claimed it since, we lose.

@@ -421,6 +421,8 @@ describe("access", () => {
       "event_count_work_key",
       "event_count_object_sha256",
       "event_count_recorded_at",
+      "revision",
+      "content_sha256",
     ];
     const asService = async <T>(run: () => Promise<T>) => {
       await db.exec("SET ROLE service_role");
@@ -440,6 +442,7 @@ describe("access", () => {
           WHERE a.attrelid = 'sessions.session_index'::regclass
             AND a.attname = ANY($1::text[])
             AND NOT r.rolsuper AND r.rolname NOT LIKE 'pg\\_%'
+            AND r.rolname <> 'normalized_ready_writer'
             AND r.oid <> (SELECT relowner FROM pg_class WHERE oid = 'sessions.session_index'::regclass)
             AND has_column_privilege(r.oid, a.attrelid, a.attnum, p.priv)`,
         [PROVENANCE],
@@ -450,7 +453,7 @@ describe("access", () => {
     it("service_role can't set them by UPDATE or INSERT, or through any column of them", async () => {
       await index(1);
       for (const column of PROVENANCE) {
-        const value = column === "event_count_recorded_at" ? "now()" : column === "event_count_object_sha256" ? "NULL::bytea" : column === "event_count_work_key" ? "'x'" : "1";
+        const value = column === "event_count_recorded_at" ? "now()" : column === "event_count_object_sha256" || column === "content_sha256" ? "NULL::bytea" : column === "event_count_work_key" ? "'x'" : "1";
         await expect(
           asService(() => db.query(`UPDATE sessions.session_index SET ${column} = ${value}`)),
         ).rejects.toMatchObject({ code: "42501" });
@@ -511,7 +514,7 @@ describe("access", () => {
     try {
       await expect(write()).rejects.toMatchObject({ code: "CN003" });
     } finally {
-      await db.exec(`ALTER FUNCTION ${fn} OWNER TO CURRENT_USER;
+      await db.exec(`ALTER FUNCTION ${fn} OWNER TO normalized_ready_writer;
         REVOKE ALL ON sessions.session_index FROM plain_owner;
         REVOKE ALL ON sessions.pipeline_jobs FROM plain_owner;
         REVOKE ALL ON SCHEMA sessions FROM plain_owner;
