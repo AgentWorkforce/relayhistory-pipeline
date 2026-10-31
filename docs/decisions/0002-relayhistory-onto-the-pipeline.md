@@ -115,17 +115,20 @@ pgvector in Supabase.
 
 ### Decision
 
-- Supabase may hold a **bounded recent window** of scrubbed session
+- Supabase may hold a **48-hour window** (K-47) of complete scrubbed session
   transcript text in the `sessions` schema, with trigram and FTS indexes.
-  It serves the Postgres adapter of the search interface on hosted.
+  It serves the Postgres adapter of the search interface on hosted as a
+  **safety net**, for indexer lag and short history-store outages. The
+  full-history store is **primary** for all transcript search (K-47).
   - Full history is served by the store-agnostic history store (0001
     Amendment 1).
   - Self-host may run the window unbounded.
-- **Window length: 14 days** (Khaliq, 2026-10-31, K-42). It was measured
-  by the counts-only shape extraction (K-38,
-  `~/selfhost-proof/notes/prod-shape-2026-10-31.md`): ~16.5 GB of text,
-  ≈ 52-56 GB with indexes, and ≈ 70 GB at the peak-week rate. The
-  recommended disk is 128 GB now and 200-256 GB planned (K-32).
+- **Window length: 48 hours** (Khaliq, 2026-10-31, K-47; it supersedes
+  K-42's 14 days). Measured by K-38
+  (`~/selfhost-proof/notes/prod-shape-2026-10-31.md`): ≈ 2.4 GB of text,
+  and ≈ 3-4 GB to ≈ 8-10 GB with indexes depending on the overhead. The
+  disk proposal is 32 GB now, 64 GB planned (K-32), excluding the open
+  ~90 GB bookkeeping question.
 - **Content rules:**
   - The text is scrubbed before storage, through the same scrub hop as S3
     raw.
@@ -136,8 +139,8 @@ pgvector in Supabase.
 ### Retention and erasure
 
 - **Retention:**
-  - A daily job deletes every row older than the window.
-  - The retention job's success is alarmed: it must have run within 26 h.
+  - An hourly job *(proposed)* deletes every row older than 48 h.
+  - The retention job's success is alarmed: it must have run within 2 h.
   - Rows are rebuildable from S3, so the window can be shrunk or regrown.
 - **Erasure SLA (K-45, Khaliq, 2026-10-31):** a **logical delete
   immediately**, and **physical purge within 48 h**, in every store that
@@ -157,7 +160,7 @@ pgvector in Supabase.
 
 ### Still needs Khaliq's explicit OK for each exact action
 
-- the window length is decided (K-42: 14 days, complete text);
+- the window length is decided (K-47: 48 h, complete text);
 - applying the migration and enabling the writer and retention job (K-43);
 - resizing the disk (K-32).
 

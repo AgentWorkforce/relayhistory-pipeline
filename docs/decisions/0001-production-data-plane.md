@@ -76,8 +76,9 @@ relayed rulings as PROPOSED until Khaliq confirms them in its session. This text
     Cloud and Amazon OpenSearch Service. All are chosen on the same
     benchmark and evidence gate, so a failed candidate changes the driver,
     not the design.
-  - Recent transcripts are also served from a bounded window in Supabase
-    (0002 Amendment 1). If the store is unavailable, search returns those
+  - **It is primary for all transcript search (K-47).** Supabase keeps a
+    48 h complete-text safety-net window (0002 Amendment 1), plus metadata
+    and summary search. If the store is unavailable, search returns those
     results as a **silent partial**: no user-facing label, with internal
     coverage metadata, metrics and an alarm (K-46).
 - **Isolation (K-44):** application-layer scoping is primary, with DB row
