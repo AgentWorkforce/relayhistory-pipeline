@@ -6,7 +6,8 @@
  */
 import { spawnSync } from "node:child_process";
 import { assertMayRun, GuardError, type GuardInput, type Mode } from "./guard.ts";
-import type { Approval, StepRecord } from "./report.ts";
+import { stepFenceIssue, type Fence } from "./fence.ts";
+import { sanitize, type Approval, type StepRecord } from "./report.ts";
 
 export interface Step {
   id: string;
@@ -42,6 +43,8 @@ export function shellQuote(argv: readonly string[]): string {
 export interface RunnerOptions {
   mode: Mode;
   identity: Omit<GuardInput, "mode" | "mutating">;
+  /** Every step's argv must stay inside this fence, in every mode (dry-run included). */
+  fence: Fence;
   spawn?: Spawn;
   print?: (line: string) => void;
 }
@@ -60,10 +63,16 @@ export class Runner {
    * which are described by a pseudo-argv such as ["HTTP", "POST", url].
    */
   gate(step: Step): { allowed: boolean; record: StepRecord } {
-    const command = shellQuote(step.argv) + (step.stdin !== undefined ? "  <<stdin" : "");
-    const base: StepRecord = { id: step.id, command, mutating: step.mutating, touches: step.touches, approval: step.approval, status: "planned" };
+    // Printed and recorded commands are always sanitized, dry-run included: no credential is ever echoed.
+    const command = sanitize(shellQuote(step.argv) + (step.stdin !== undefined ? "  <<stdin" : ""));
+    const base: StepRecord = { id: step.id, command, mutating: step.mutating, touches: step.touches.map((t) => sanitize(t)), approval: step.approval, status: "planned" };
     const print = this.o.print ?? ((l: string) => console.log(l));
     const tag = step.mutating ? (step.approval === "khaliq" ? "MUTATE*" : "MUTATE ") : "read   ";
+    const outside = stepFenceIssue(step.argv, this.o.fence);
+    if (outside) {
+      print(`  [REFUSED] ${step.id}: ${outside}`);
+      return { allowed: false, record: { ...base, status: "refused", code: outside } };
+    }
     if (this.o.mode === "dry-run") {
       print(`  [plan ${tag}] ${step.id}: ${command}`);
       return { allowed: false, record: base };

@@ -14,7 +14,7 @@ import { IngestError, locationOf, mintTenantToken, newUploadState, plantNextRevi
 import { crossTenantHits, refusedAsExpected, scanForCanaries, tenantKey, type ProbeObservation, type Tenant } from "./leak-scan.ts";
 import {
   backupRestoreSteps, cnpgInstancesStep, failoverSteps, failoverVerdict, helmHistoryStep, relaycastProbeSteps, relaycastRestartSteps,
-  relaycastVerdict, restoreCleanupSteps, RESTORE_CLUSTER, rolloutRestartSteps, rpoRto, STAGE_DESTROY_COMMAND, teardownResidue, teardownSteps, clusterGone, PROOF_TAG,
+  relaycastVerdict, restoreCleanupSteps, RESTORE_CLUSTER, rolloutRestartSteps, evaluateBackup, STAGE_DESTROY_COMMAND, teardownResidue, teardownSteps, clusterGone, PROOF_TAG,
   teardownVerifySteps, upgradeRollbackSteps, versioningEnabled,
 } from "./lifecycle.ts";
 import { directorySql, indexStateSql, jsonLines, kubectl, lastJson, primaryStep, s3ListStep, searchBatchSql, sqlStep, stageTimesSql, type SearchResultLine } from "./probes.ts";
@@ -771,9 +771,9 @@ export async function restartPersistence(ctx: Ctx): Promise<CheckResult> {
   }
   if (!c.probeImage) return r.done("blocked", "probeImage (digest-pinned, with bun) is required for the in-cluster Relaycast roundtrip");
   if (!ctx.searchable?.size) return notRun(ctx, r, "needs planted-trace with searchable sessions");
-  for (const s of relaycastProbeSteps(c, "start")) ctx.runner.run(s);
+  for (const s of relaycastProbeSteps(c, "start")) if (!ctx.runner.run(s).ok) r.failures.push(`${s.id} did not succeed`);
   const rcBefore = ctx.runner.run(relaycastProbeSteps(c, "before")[0]!);
-  const vb = relaycastVerdict(rcBefore.stdout);
+  const vb = relaycastVerdict(rcBefore.stdout, "before", rcBefore.record.status === "ran" || rcBefore.record.status === "failed");
   if (!vb.ok) r.failures.push(...vb.failures.map((f) => `relaycast before restart: ${f}`));
   for (const s of rolloutRestartSteps(c)) {
     const o = ctx.runner.run(s);
@@ -790,7 +790,7 @@ export async function restartPersistence(ctx: Ctx): Promise<CheckResult> {
   if (!failover.ok && !failover.blocked) r.failures.push(`CNPG failover: ${failover.reason}`);
   for (const s of relaycastRestartSteps(c)) if (!ctx.runner.run(s).ok) r.failures.push(`${s.id} failed`);
   const rcAfter = ctx.runner.run(relaycastProbeSteps(c, "after")[0]!);
-  const va = relaycastVerdict(rcAfter.stdout);
+  const va = relaycastVerdict(rcAfter.stdout, "after", rcAfter.record.status === "ran" || rcAfter.record.status === "failed");
   if (!va.ok) r.failures.push(...va.failures.map((f) => `relaycast after restart: ${f}`));
   const pod = primary(ctx);
   const baseline = ctx.corpus.filter((p) => ctx.searchable!.has(p.sessionId));
@@ -864,13 +864,12 @@ export async function backupRestore(ctx: Ctx): Promise<CheckResult> {
   for (const s of steps.slice(5)) if (!ctx.runner.run(s).ok) r.failures.push(`${s.id} failed`);
   const ready = ctx.now();
   const restored = sql<Array<{ trace_id: string; stage: string; at_ms: number }>>(ctx, "restore.count", `${RESTORE_CLUSTER}-1`, stageTimesSql(ctx.corpus.map((p) => p.traceId)));
-  const present = (restored ?? []).filter((x) => x.stage === "object-landed").map((x) => Number(x.at_ms));
-  const m = rpoRto({ plantedWritesMs: plantedWrites, presentInRestoreMs: present, backupStoppedMs: stopped, restoreRequestedMs: requested, restoreReadyMs: ready });
-  Object.assign(r.metrics, m, { plantedBeforeBackup: plantedWrites.filter((t) => t <= stopped).length, presentInRestore: present.length });
-  if (!restored) r.failures.push("could not query the restored cluster");
-  if (m.lostWrites) r.failures.push(`${m.lostWrites} planted write(s) committed before the backup are missing from the restore (RPO ${m.rpoMs} ms)`);
-  for (const s of restoreCleanupSteps(c, name)) ctx.runner.run(s);
-  return r.done(r.failures.length ? "fail" : "pass", `restore complete: RPO ${m.rpoMs} ms, RTO ${m.rtoMs} ms, versioning ${r.metrics.s3Versioning}`);
+  const present = restored?.filter((x) => x.stage === "object-landed").map((x) => Number(x.at_ms));
+  const cleanup = restoreCleanupSteps(c, name).map((s) => ({ id: s.id, ok: ctx.runner.run(s).ok }));
+  const v = evaluateBackup({ plantedWritesMs: plantedWrites, presentInRestoreMs: present, backupStoppedMs: stopped, restoreRequestedMs: requested, restoreReadyMs: ready, cleanup });
+  r.failures.push(...v.failures);
+  Object.assign(r.metrics, v.metrics);
+  return r.done(r.failures.length ? "fail" : "pass", `restore complete: RPO ${v.metrics.rpoMs} ms, RTO ${v.metrics.rtoMs} ms, versioning ${r.metrics.s3Versioning}`);
 }
 
 /* ================================================================ 8. teardown */

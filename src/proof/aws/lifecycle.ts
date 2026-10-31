@@ -52,8 +52,20 @@ export function failoverVerdict(before: string, after: string, instances: number
 export const RELAYCAST_PROBE_POD = `proof-relaycast-${PROOF_STAGE}`;
 
 /**
+ * Assertions each phase must print as PASS. Before the restart: a fresh
+ * workspace, agent, message send and receive. After it: the same workspace key
+ * and agent token still work, the pre-restart message is still there, and a new
+ * message round-trips. Missing, failed or extra-FAIL lines all fail the phase.
+ */
+export const RELAYCAST_ASSERTIONS = {
+  before: ["health", "workspace", "agent", "message.send", "message.receive"],
+  after: ["health", "workspace", "agent", "message.send", "message.receive", "message.persisted"],
+} as const;
+
+/**
  * Runs inside the probe pod with bun. Keeps the workspace key in the pod's own
- * emptyDir between phases; prints phase results only, never a key or body.
+ * in-memory emptyDir between phases; prints one PASS/FAIL line per assertion,
+ * never a key or a body.
  */
 export const RELAYCAST_PROBE_SOURCE = String.raw`
 const base = process.env.RC_URL, phase = process.argv.at(-1), f = "/probe/state.json";
@@ -61,23 +73,24 @@ const fs = await import("node:fs");
 const j = async (r) => { const b = await r.json().catch(() => ({})); return { s: r.status, d: b.data ?? b }; };
 const auth = (k) => ({ authorization: "Bearer " + k, "content-type": "application/json" });
 const out = (ok, what) => { console.log((ok ? "PASS " : "FAIL ") + phase + " " + what); if (!ok) process.exitCode = 1; };
-const h = await fetch(base + "/health"); out(h.status === 200, "health");
+const guard = async (what, fn) => { try { out(!!(await fn()), what); } catch { out(false, what); } };
+const read = async (token) => { const r = await fetch(base + "/v1/channels/general/messages?limit=100", { headers: auth(token) }); return r.status === 200 ? await r.text() : ""; };
+await guard("health", async () => (await fetch(base + "/health")).status === 200);
 let st = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : null;
 if (phase === "before") {
-  const ws = await j(await fetch(base + "/v1/workspaces", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "aws-proof-" + Date.now(), expires_in_seconds: 7200 }) }));
-  out(ws.s < 300 && !!ws.d.api_key, "workspace");
-  const ag = await j(await fetch(base + "/v1/agents", { method: "POST", headers: auth(ws.d.api_key), body: JSON.stringify({ name: "proof-agent", type: "agent" }) }));
-  out(ag.s < 300 && !!ag.d.token, "agent");
-  const marker = "proof-" + crypto.randomUUID();
-  const m = await fetch(base + "/v1/channels/general/messages", { method: "POST", headers: auth(ag.d.token), body: JSON.stringify({ text: marker }) });
-  out(m.status < 300, "message.write");
-  st = { key: ws.d.api_key, token: ag.d.token, marker };
+  st = {};
+  await guard("workspace", async () => { const ws = await j(await fetch(base + "/v1/workspaces", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "aws-proof-" + Date.now(), expires_in_seconds: 7200 }) })); st.key = ws.d.api_key; return ws.s < 300 && !!st.key; });
+  await guard("agent", async () => { const ag = await j(await fetch(base + "/v1/agents", { method: "POST", headers: auth(st.key), body: JSON.stringify({ name: "proof-agent", type: "agent" }) })); st.token = ag.d.token; return ag.s < 300 && !!st.token; });
   fs.writeFileSync(f, JSON.stringify(st), { mode: 0o600 });
+} else {
+  await guard("workspace", async () => !!st?.key && (await fetch(base + "/v1/agents", { headers: auth(st.key) })).status === 200);
+  await guard("agent", async () => !!st?.token && (await fetch(base + "/v1/agents", { headers: auth(st.key) }).then((r) => r.text())).includes("proof-agent"));
+  await guard("message.persisted", async () => !!st?.before && (await read(st.token)).includes(st.before));
 }
-if (!st) { out(false, "state"); process.exit(1); }
-const list = await fetch(base + "/v1/channels/general/messages?limit=50", { headers: auth(st.token) });
-const text = await list.text();
-out(list.status === 200 && text.includes(st.marker), "message.read");
+const marker = "proof-" + phase + "-" + crypto.randomUUID();
+await guard("message.send", async () => !!st?.token && (await fetch(base + "/v1/channels/general/messages", { method: "POST", headers: auth(st.token), body: JSON.stringify({ text: marker }) })).status < 300);
+await guard("message.receive", async () => !!st?.token && (await read(st.token)).includes(marker));
+if (phase === "before" && st) { st.before = marker; fs.writeFileSync(f, JSON.stringify(st), { mode: 0o600 }); }
 `;
 
 export function relaycastProbeSteps(c: ProofConfig, phase: "start" | "before" | "after" | "delete"): Step[] {
@@ -89,18 +102,23 @@ export function relaycastProbeSteps(c: ProofConfig, phase: "start" | "before" | 
       read("relaycast.probe-ready", kubectl(c, "-n", ns, "wait", "--for=condition=Ready", `pod/${RELAYCAST_PROBE_POD}`, "--timeout=180s"), [`k8s:${ns}/pod/${RELAYCAST_PROBE_POD}`], 200_000),
     ];
   if (phase === "delete") return [mut("relaycast.probe-delete", kubectl(c, "-n", ns, "delete", "pod", RELAYCAST_PROBE_POD, "--ignore-not-found"), [`k8s:${ns}/pod/${RELAYCAST_PROBE_POD} (deleted)`])];
-  // "before" writes a workspace/agent/message into the proof Relaycast; "after" only reads them back.
+  // Both phases write: "before" creates an ephemeral workspace, agent and message; "after" sends one more message.
   const argv = kubectl(c, "-n", ns, "exec", "-i", RELAYCAST_PROBE_POD, "--", "bun", "run", "-", phase);
-  const step = phase === "before"
-    ? mut(`relaycast.roundtrip.${phase}`, argv, [`relaycast:${ns} (ephemeral workspace, agent, message created)`])
-    : read(`relaycast.roundtrip.${phase}`, argv, [`relaycast:${ns} (read)`]);
-  return [{ ...step, stdin: RELAYCAST_PROBE_SOURCE }];
+  return [{ ...mut(`relaycast.roundtrip.${phase}`, argv, [`relaycast:${ns} (ephemeral workspace, agent, messages)`]), stdin: RELAYCAST_PROBE_SOURCE }];
 }
 
-export function relaycastVerdict(stdout: string): { ok: boolean; failures: string[] } {
-  const lines = stdout.split("\n").filter((l) => /^(PASS|FAIL) /.test(l));
-  const failures = lines.filter((l) => l.startsWith("FAIL ")).map((l) => l.slice(5));
-  return { ok: lines.length > 0 && failures.length === 0, failures: lines.length ? failures : ["relaycast probe printed no phase results"] };
+/**
+ * All-or-nothing: every required assertion for the phase must appear exactly as
+ * a PASS line, and no FAIL line may appear. A missing assertion (the probe died
+ * early, or the step never ran) is a failure, never a partial pass.
+ */
+export function relaycastVerdict(stdout: string, phase: "before" | "after", stepRan = true): { ok: boolean; failures: string[] } {
+  if (!stepRan) return { ok: false, failures: [`${phase}: probe step did not run`] };
+  const lines = stdout.split("\n").map((l) => l.trim());
+  const failures: string[] = [];
+  for (const l of lines) if (l.startsWith("FAIL ")) failures.push(l.slice(5));
+  for (const a of RELAYCAST_ASSERTIONS[phase]) if (!lines.includes(`PASS ${phase} ${a}`) && !failures.includes(`${phase} ${a}`)) failures.push(`${phase} ${a} missing`);
+  return { ok: failures.length === 0, failures };
 }
 
 export const relaycastRestartSteps = (c: ProofConfig): Step[] => [
@@ -196,6 +214,36 @@ export function rpoRto(o: {
     rpoMs = Math.max(...due) - from;
   }
   return { rpoMs, rtoMs: o.restoreReadyMs - o.restoreRequestedMs, lostWrites: lost.length };
+}
+
+/**
+ * The backup verdict. Empty samples prove nothing: no planted write in the
+ * source before the backup, or nothing readable in the restore, is a failure,
+ * never an RPO of 0. Cleanup (restore cluster + Backup CR) must succeed too.
+ */
+export function evaluateBackup(o: {
+  plantedWritesMs: readonly number[];
+  /** undefined when the restored cluster could not be queried. */
+  presentInRestoreMs: readonly number[] | undefined;
+  backupStoppedMs: number;
+  restoreRequestedMs: number;
+  restoreReadyMs: number;
+  cleanup: ReadonlyArray<{ id: string; ok: boolean }>;
+}): { failures: string[]; metrics: { rpoMs: number | null; rtoMs: number | null; lostWrites: number | null; plantedBeforeBackup: number; presentInRestore: number } } {
+  const failures: string[] = [];
+  const due = o.plantedWritesMs.filter((t) => t <= o.backupStoppedMs);
+  if (o.plantedWritesMs.length === 0) failures.push("no planted writes found in the source cluster; nothing to measure RPO against");
+  else if (due.length === 0) failures.push("no planted write was committed before the backup stopped; RPO is unmeasured");
+  if (o.presentInRestoreMs === undefined) failures.push("could not query the restored cluster");
+  else if (o.presentInRestoreMs.length === 0) failures.push("the restored cluster holds none of the planted sessions");
+  for (const c of o.cleanup) if (!c.ok) failures.push(`cleanup step ${c.id} failed; restore resources may remain`);
+  if (o.cleanup.length === 0) failures.push("cleanup did not run");
+  let m: ReturnType<typeof rpoRto> | undefined;
+  if (due.length && o.presentInRestoreMs?.length) {
+    m = rpoRto({ plantedWritesMs: o.plantedWritesMs, presentInRestoreMs: o.presentInRestoreMs, backupStoppedMs: o.backupStoppedMs, restoreRequestedMs: o.restoreRequestedMs, restoreReadyMs: o.restoreReadyMs });
+    if (m.lostWrites) failures.push(`${m.lostWrites} planted write(s) committed before the backup are missing from the restore (RPO ${m.rpoMs} ms)`);
+  }
+  return { failures, metrics: { rpoMs: m?.rpoMs ?? null, rtoMs: m?.rtoMs ?? null, lostWrites: m?.lostWrites ?? null, plantedBeforeBackup: due.length, presentInRestore: o.presentInRestoreMs?.length ?? 0 } };
 }
 
 export function versioningEnabled(getBucketVersioningJson: string): boolean {

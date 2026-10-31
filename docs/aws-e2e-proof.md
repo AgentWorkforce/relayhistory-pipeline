@@ -45,6 +45,37 @@ the following:
 - no name is production-shaped. A name containing `prod`, `production`,
   `sessions-dev`, `hosted` or `live` as a segment is refused.
 
+**The target fence** (`src/proof/aws/fence.ts`) checks *what* each step
+touches, not just who runs it. It applies twice:
+
+- **On the config, before anything is planned.** The values must be the proof
+  stage's own:
+  - ingest host `proof-sessions.agentrelay.com`, and origin
+    `https://proof-sessions.agentrelay.com`;
+  - Locker bucket `96bulls-aws-proof-locker-500268966557`, and any backup bucket
+    `96bulls-aws-proof-<name>-500268966557`;
+  - release `96bulls` and the AgentWorkforce chart repository;
+  - namespaces from the fixed set that `stacks/aws` creates (`96bulls`,
+    `relayauth`, `relaycast`, `cnpg-system`);
+  - deployments that belong to the `96bulls` release;
+  - a transcript database whose name starts with `proof`.
+
+  The config is also rejected if any string in it is production- or
+  shared-shaped (`prod`, `production`, `sessions-prod`, `sessions-dev`,
+  `staging`, `hosted`), or if any URL carries userinfo (`https://user:pass@host`).
+  This applies even inside the proof account.
+- **On every step's argv, in every mode including dry-run.** These must be
+  inside the fence:
+  - context, region, namespace and bucket flags;
+  - `s3://` URLs;
+  - `deployment/` names;
+  - HTTP hosts, including in-cluster `<svc>.<ns>.svc` names;
+  - account ids in ARNs.
+
+  A step outside the fence is recorded `refused` and never spawned. Every
+  printed or recorded command is sanitized, so a credential never appears in
+  output, dry-run plans included.
+
 `inputs.json` cannot change the account, the cluster or the stage. The loader
 discards those keys. It also rejects any key that looks like a secret.
 
@@ -92,7 +123,7 @@ run, the stage needs:
    `blocked` at the summary and search stages.
 4. RelayAuth (`relayauth` namespace) and Relaycast (`relaycast` namespace) from
    their released charts.
-5. The public ingest at `sessions-dev.agentrelay.com`: HTTPS :443 only, an ACM
+5. The public ingest at `proof-sessions.agentrelay.com`: HTTPS :443 only, an ACM
    certificate, a WAFv2 web ACL with a blocking rate-based rule on the ALB, and
    no HTTP listener.
 6. For the transcript gate: a ClickHouse or ObsessionDB endpoint, a synthetic
@@ -112,8 +143,7 @@ is optional, and the defaults are in `src/proof/aws/config.ts`. An example:
   "candidateChartVersion": "0.3.1",
   "expectedImages": { "<account>.dkr.ecr.us-west-2.amazonaws.com/96bulls-services": "sha256:<eks.imageDigest>" },
   "probeImage": "<account>.dkr.ecr.us-west-2.amazonaws.com/96bulls-services@sha256:<digest>",
-  "historyOrigin": "https://sessions-dev.agentrelay.com",
-  "ingress": { "hostname": "sessions-dev.agentrelay.com", "burst": { "maxRequests": 400 } },
+  "ingress": { "hostname": "proof-sessions.agentrelay.com", "burst": { "maxRequests": 400 } },
   "transcriptSearch": {
     "backend": "clickhouse",
     "feed": "harness-synthetic",
@@ -269,7 +299,9 @@ It reports landed→searchable freshness and query p50, p95 and p99 plus the
 error rate.
 
 Tenancy must be enforced by the backend. The query carries no tenant predicate,
-so a missing row policy fails the gate.
+so a missing row policy fails the gate. A cross-tenant probe that errors also
+fails the gate ("isolation unproven"). An error is never counted as a clean,
+empty result.
 
 The feed can be `pipeline` or `harness-synthetic`:
 
@@ -315,6 +347,15 @@ summary. The check also fails if `generated_at` goes backwards.
 | R | psql directory and search polls | HoopDb (read) |
 
 ### 8. restart-persistence
+
+Every Relaycast assertion must PASS in both phases, or the check fails. A
+missing, failed or unrun assertion is a failure, never a partial pass.
+
+- **Before the restart:** `health`, `workspace`, `agent`, `message.send` and
+  `message.receive`.
+- **After the restart:** the same five, plus `message.persisted`. The workspace
+  key and agent token must still work, and the pre-restart message must still
+  be there.
 
 The check runs these steps in order:
 
@@ -366,6 +407,13 @@ restored cluster and measures two numbers:
 Afterwards it deletes the restored cluster and the `Backup` CR. The backup
 objects stay under the bucket's retention.
 
+The check fails, and never reports an RPO of 0, in any of these cases:
+
+- no planted write exists in the source before the backup stopped;
+- the restored cluster cannot be queried, or holds none of the planted
+  sessions;
+- either cleanup step fails.
+
 | | Command | Touches |
 | --- | --- | --- |
 | R | `aws s3api get-bucket-versioning`, `kubectl … get cluster hoopdb -o jsonpath={.spec.backup.barmanObjectStore.destinationPath}` | config (read) |
@@ -386,12 +434,30 @@ The teardown runs in two phases:
    The check is then `blocked` and lists the tagged AWS resources that are
    still pending.
 2. **After Khaliq runs `bin/96bulls down aws-proof`** (an Alchemy destroy, which
-   this harness never runs), rerun `bun run proof:aws:teardown --confirm-live
-   --read-only`. The check passes only if `aws eks list-clusters` no longer
+   this harness never runs), rerun the teardown and pass it the report of the
+   full run:
+   `bun run proof:aws:teardown --confirm-live --read-only --prior-report .96bulls/aws-proof/<run id>/report.json`. The check passes only if `aws eks list-clusters` no longer
    names the cluster and no resource tagged `96bulls:stack=aws-proof` remains.
    A KMS key in `PendingDeletion` (the 30-day window) is the expected end state.
 
 A failed cluster listing never counts as "gone".
+
+**One report for the whole proof.** `--prior-report` merges an earlier report of
+the same proof into this run's report, and the merge is deterministic:
+
+- for each check, this run's result replaces the prior's;
+- the prior's file SHA-256 and run id are recorded in `phases`;
+- the verdict is recomputed over the merged checks.
+
+The merge is refused when the prior report:
+
+- targets another stage, cluster, context, account or region;
+- is a dry run being carried into a live run;
+- is newer than this run;
+- does not validate.
+
+So the full live run (with teardown `blocked`), merged with the phase-2
+teardown run, produces one report whose verdict covers both.
 
 | | Command | Touches |
 | --- | --- | --- |
@@ -469,9 +535,9 @@ shows that the check distinguishes tag references from pinned digests.
 - **Synthetic transcript feed.** The synthetic feed proves the backend's
   search, isolation and freshness. It does not prove a product projector, and
   none exists here yet.
-- **`sessions-dev.agentrelay.com`.** If that host currently fronts a non-proof
-  environment, the DNS guard refuses the active ingress probes until the
-  record points at the proof ALB.
+- **`proof-sessions.agentrelay.com`.** The record and its ACM certificate must
+  exist and point at the proof ALB. Until they do, the DNS guard refuses the
+  active ingress probes.
 - **Multi-org ingest.** AlleyOop's org resolver (`PIPELINE_ORG_ID` and prefix
   ownership) must map both proof tenants on this stage. A single-org
   configuration makes tenant B's planting fail with 403, which the report shows.

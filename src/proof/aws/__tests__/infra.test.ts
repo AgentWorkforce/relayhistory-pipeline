@@ -5,7 +5,7 @@ import {
   burstPlan, evaluateBurst, evaluateListeners, evaluateRoutes, evaluateTls, evaluateWafConfig, hostIsProofAlb, ingestRoutes, routeRefused, runBurst, type WebAcl,
 } from "../ingress.ts";
 import {
-  backupRestoreSteps, clusterGone, failoverVerdict, relaycastProbeSteps, relaycastVerdict, rolloutRestartSteps, rpoRto, teardownResidue, teardownSteps, upgradeRollbackSteps,
+  backupRestoreSteps, clusterGone, evaluateBackup, failoverVerdict, RELAYCAST_ASSERTIONS, relaycastProbeSteps, relaycastVerdict, rolloutRestartSteps, rpoRto, teardownResidue, teardownSteps, upgradeRollbackSteps,
 } from "../lifecycle.ts";
 
 const D = (c: string) => `sha256:${c.repeat(64)}`;
@@ -166,10 +166,28 @@ describe("lifecycle plans and verdicts", () => {
     expect(rpoRto({ plantedWritesMs: [100, 200, 300, 400], presentInRestoreMs: [100, 200], backupStoppedMs: 500, restoreRequestedMs: 0, restoreReadyMs: 5 })).toEqual({ rpoMs: 200, rtoMs: 5, lostWrites: 2 });
     expect(() => rpoRto({ plantedWritesMs: [], presentInRestoreMs: [], backupStoppedMs: 0, restoreRequestedMs: 10, restoreReadyMs: 5 })).toThrow();
   });
-  test("relaycast probe output: all PASS lines, none FAIL, and at least one", () => {
-    expect(relaycastVerdict("PASS before health\nPASS before message.read\n")).toEqual({ ok: true, failures: [] });
-    expect(relaycastVerdict("PASS after health\nFAIL after message.read\n")).toEqual({ ok: false, failures: ["after message.read"] });
-    expect(relaycastVerdict("")).toMatchObject({ ok: false });
+  test("relaycast: every assertion must PASS in each phase; partial, failed, missing or unrun is FAIL", () => {
+    const pass = (phase: "before" | "after") => RELAYCAST_ASSERTIONS[phase].map((x) => `PASS ${phase} ${x}`).join("\n");
+    expect(relaycastVerdict(pass("before"), "before")).toEqual({ ok: true, failures: [] });
+    expect(relaycastVerdict(pass("after"), "after")).toEqual({ ok: true, failures: [] });
+    // The reviewed defect: health alone used to pass.
+    expect(relaycastVerdict("PASS before health\n", "before")).toEqual({ ok: false, failures: ["before workspace missing", "before agent missing", "before message.send missing", "before message.receive missing"] });
+    expect(relaycastVerdict(pass("after").replace("PASS after message.persisted", "FAIL after message.persisted"), "after")).toEqual({ ok: false, failures: ["after message.persisted"] });
+    // "before" lines do not satisfy "after".
+    expect(relaycastVerdict(pass("before"), "after").ok).toBe(false);
+    expect(relaycastVerdict(pass("before"), "before", false)).toEqual({ ok: false, failures: ["before: probe step did not run"] });
+    expect(relaycastVerdict("", "after").failures).toHaveLength(RELAYCAST_ASSERTIONS.after.length);
+  });
+  test("backup: empty source or restore samples and failed cleanup are FAIL, never RPO 0", () => {
+    const base = { backupStoppedMs: 500, restoreRequestedMs: 1000, restoreReadyMs: 2000, cleanup: [{ id: "restore.delete", ok: true }, { id: "backup.delete", ok: true }] };
+    expect(evaluateBackup({ ...base, plantedWritesMs: [100, 200], presentInRestoreMs: [100, 200] })).toEqual({ failures: [], metrics: { rpoMs: 0, rtoMs: 1000, lostWrites: 0, plantedBeforeBackup: 2, presentInRestore: 2 } });
+    const empty = evaluateBackup({ ...base, plantedWritesMs: [], presentInRestoreMs: [] });
+    expect(empty.metrics.rpoMs).toBeNull();
+    expect(empty.failures).toEqual(["no planted writes found in the source cluster; nothing to measure RPO against", "the restored cluster holds none of the planted sessions"]);
+    expect(evaluateBackup({ ...base, plantedWritesMs: [900], presentInRestoreMs: [900] }).failures[0]).toMatch(/before the backup stopped/);
+    expect(evaluateBackup({ ...base, plantedWritesMs: [100], presentInRestoreMs: undefined }).failures).toEqual(["could not query the restored cluster"]);
+    expect(evaluateBackup({ ...base, plantedWritesMs: [100], presentInRestoreMs: [100], cleanup: [{ id: "restore.delete", ok: false }] }).failures).toEqual(["cleanup step restore.delete failed; restore resources may remain"]);
+    expect(evaluateBackup({ ...base, plantedWritesMs: [100], presentInRestoreMs: [100], cleanup: [] }).failures).toEqual(["cleanup did not run"]);
   });
   test("teardown residue: in-cluster leftovers while the cluster exists; every tagged resource once it is gone", () => {
     const k8s = JSON.stringify({ items: [{ kind: "Pod", metadata: { namespace: "relaycast", name: "proof-relaycast-aws-proof" } }] });

@@ -9,6 +9,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE } from "./guard.ts";
 import type { Tenant } from "./leak-scan.ts";
 import { validateTranscriptConfig, type TranscriptConfig } from "./transcript.ts";
+import { PROOF_CHART_REPO, PROOF_HOST, PROOF_LOCKER_BUCKET, PROOF_ORIGIN, proofConfigIssues } from "./fence.ts";
 
 export interface ProofConfig {
   stage: string;
@@ -72,18 +73,18 @@ export function defaultConfig(): ProofConfig {
     kubeContext: `arn:aws:eks:us-west-2:${PROOF_ACCOUNT_ID}:cluster/${PROOF_CLUSTER}`,
     namespace: "96bulls",
     release: "96bulls",
-    chartRepo: "https://AgentWorkforce.github.io/helm-charts",
+    chartRepo: PROOF_CHART_REPO,
     chartVersion: "0.3.0",
     expectedImages: {},
     coreDeployments: ["96bulls-alleyoop-ingest", "96bulls-worker-hoopdb-indexer", "96bulls-worker-referee", "96bulls-worker-bob-costas"],
     hoopdb: { cluster: "hoopdb", database: "hoopdb" },
     // stacks/aws/alchemy.aws.run.ts: `96bulls-<stage>-locker-<account>`, versioned, KMS-encrypted.
-    locker: { bucket: `96bulls-${PROOF_STAGE}-locker-${PROOF_ACCOUNT_ID}`, prefix: "" },
+    locker: { bucket: PROOF_LOCKER_BUCKET, prefix: "" },
     relayauth: { namespace: "relayauth", service: "relayauth", port: 8787 },
     relaycast: { namespace: "relaycast", service: "relaycast", port: 8787 },
     ingest: { service: "96bulls-alleyoop", port: 8080 },
-    ingress: { hostname: "sessions-dev.agentrelay.com", burst: {} },
-    historyOrigin: "https://aws-proof.invalid",
+    ingress: { hostname: PROOF_HOST, burst: {} },
+    historyOrigin: PROOF_ORIGIN,
     tenants: [
       { orgId: "org_proof_a", workspaceId: "default" },
       { orgId: "org_proof_b", workspaceId: "default" },
@@ -126,6 +127,8 @@ export function validateConfig(c: ProofConfig): string[] {
   if (!/^https:\/\//.test(c.historyOrigin)) issues.push("historyOrigin must be https");
   if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(c.ingress.hostname)) issues.push("ingress.hostname must be a DNS name");
   issues.push(...validateTranscriptConfig(c.transcriptSearch));
+  // Hard fence: every target is the proof stage's, no URL credentials, nothing production-shaped.
+  issues.push(...proofConfigIssues(c as unknown as Parameters<typeof proofConfigIssues>[0]));
   if (c.staleSessionsPerTenant < 1) issues.push("staleSessionsPerTenant must be >= 1");
   return issues;
 }

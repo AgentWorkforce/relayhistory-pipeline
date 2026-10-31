@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { newCtx, transcriptSearch } from "../checks.ts";
 import { defaultConfig, validateConfig, type ProofConfig } from "../config.ts";
 import { Runner } from "../exec.ts";
+import { fenceFor } from "../fence.ts";
 import { PROOF_ACCOUNT_ID, PROOF_CLUSTER } from "../guard.ts";
 import { tenantKey, type Tenant } from "../leak-scan.ts";
 import { buildReport } from "../report.ts";
@@ -34,7 +35,7 @@ function fakeBackend(enforceTenancy: boolean): TranscriptBackend & { rows: Array
 }
 
 async function run(cfg: ProofConfig, backend?: TranscriptBackend, mode: "live" | "dry-run" = "live") {
-  const ctx = newCtx(cfg, new Runner({ mode, identity, print: () => {} }), "aws-proof-test-run-0001", {});
+  const ctx = newCtx(cfg, new Runner({ mode, identity, print: () => {}, fence: fenceFor(cfg) }), "aws-proof-test-run-0001", {});
   ctx.print = () => {};
   if (backend) ctx.transcriptBackend = backend;
   return { ctx, result: await transcriptSearch(ctx) };
@@ -125,5 +126,22 @@ describe("transcript backend config and labels", () => {
     expect(new URL(seen[0]!.url).searchParams.get("readonly")).toBe("1");
     expect(seen[0]!.user).toBe("reader_a");
     await expect(b.search({ orgId: "org_x", workspaceId: "default" }, "abc")).rejects.toThrow();
+  });
+});
+
+describe("transcript-search: probe errors never count as isolation", () => {
+  test("a backend error on the cross-tenant probe is FAIL, not a clean empty observation", async () => {
+    const b = fakeBackend(true);
+    const own = b.search.bind(b);
+    // Own-tenant searches work; every query for another tenant's canary errors.
+    b.search = async (t, q) => {
+      if (!b.rows.some((r) => r.content.includes(q) && r.org_id === t.orgId)) throw Object.assign(new Error("boom"), { code: "http_500" });
+      return own(t, q);
+    };
+    const { result } = await run(configured(), b);
+    expect(result.status).toBe("fail");
+    expect(result.failures.some((f) => /cross-tenant transcript probe\(s\) errored \(http_500\); isolation unproven/.test(f))).toBe(true);
+    expect(result.metrics.crossTenantHits).toBe(0);
+    expect(result.metrics.crossTenantProbeErrors).toBeGreaterThan(0);
   });
 });

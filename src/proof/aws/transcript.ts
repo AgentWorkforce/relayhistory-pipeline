@@ -170,6 +170,7 @@ export interface TranscriptVerdict {
     landedToSearchableMs: LatencySummary;
     queryMs: LatencySummary;
     crossTenantProbes: number;
+    crossTenantProbeErrors: number;
     crossTenantHits: number;
   };
 }
@@ -196,6 +197,9 @@ export function evaluateTranscriptGate(
   const { hits } = crossTenantHits(crossProbes, owner, canaries);
   for (const h of hits) failures.push(`cross-tenant transcript hit: ${h.caller} saw ${h.owner} (${h.subject})`);
   if (crossProbes.length === 0) failures.push("no cross-tenant transcript probes ran");
+  // An errored probe observed nothing; counting it as a clean empty result would fake isolation.
+  const errored = crossProbes.filter((p) => p.status !== 200);
+  if (errored.length) failures.push(`${errored.length}/${crossProbes.length} cross-tenant transcript probe(s) errored (${[...new Set(errored.map((p) => String(p.status)))].join(", ")}); isolation unproven`);
   const queryErrors = all.reduce((n, o) => n + (o?.queryErrors ?? 0), 0);
   const query = summarize(all.flatMap((o) => o?.queryMs ?? []), queryErrors);
   if (queryErrors) failures.push(`${queryErrors} transcript search request(s) errored`);
@@ -209,6 +213,7 @@ export function evaluateTranscriptGate(
       landedToSearchableMs: stageLatency(all, (o) => o?.landedAtMs, (o) => o?.searchableAtMs),
       queryMs: query,
       crossTenantProbes: crossProbes.length,
+      crossTenantProbeErrors: errored.length,
       crossTenantHits: hits.length,
     },
   };

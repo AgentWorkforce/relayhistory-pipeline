@@ -5,9 +5,12 @@ import { join } from "node:path";
 import { parseArgs } from "../cli.ts";
 import { loadConfig } from "../config.ts";
 import { Runner, shellQuote, type Spawn } from "../exec.ts";
+import { defaultConfig } from "../config.ts";
+import { fenceFor } from "../fence.ts";
 import { assertMayRun, assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, type GuardInput } from "../guard.ts";
 
 const ARN = `arn:aws:eks:us-west-2:${PROOF_ACCOUNT_ID}:cluster/${PROOF_CLUSTER}`;
+const fence = fenceFor(defaultConfig());
 const ok: GuardInput = { mode: "live", confirmLive: true, mutating: true, accountId: PROOF_ACCOUNT_ID, clusterName: PROOF_CLUSTER, kubeContext: ARN, kubeContextCluster: ARN };
 
 const code = (f: () => void) => {
@@ -66,24 +69,24 @@ describe("runner: refusals never spawn", () => {
     const spawn: Spawn = (argv) => (calls.push(argv), { stdout: "out", status: 0 });
     return { calls, spawn };
   };
-  const step = { id: "x", argv: ["kubectl", "delete", "ns", "96bulls"], mutating: true, touches: ["k8s"], approval: "khaliq" as const };
+  const step = { id: "x", argv: ["kubectl", "--context", ARN, "delete", "ns", "96bulls"], mutating: true, touches: ["k8s"], approval: "khaliq" as const };
 
   test("dry-run plans and does not spawn", () => {
     const s = spy();
-    const r = new Runner({ mode: "dry-run", identity: ok, spawn: s.spawn, print: () => {} });
+    const r = new Runner({ mode: "dry-run", identity: ok, spawn: s.spawn, print: () => {}, fence });
     expect(r.run(step).record.status).toBe("planned");
     expect(s.calls).toHaveLength(0);
   });
   test("read-only skips mutating steps", () => {
     const s = spy();
-    const r = new Runner({ mode: "read-only", identity: ok, spawn: s.spawn, print: () => {} });
+    const r = new Runner({ mode: "read-only", identity: ok, spawn: s.spawn, print: () => {}, fence });
     expect(r.run(step).record.status).toBe("skipped");
     expect(r.run({ ...step, mutating: false }).record.status).toBe("ran");
     expect(s.calls).toHaveLength(1);
   });
   test("live without --confirm-live is refused with a code and does not spawn", () => {
     const s = spy();
-    const r = new Runner({ mode: "live", identity: { ...ok, confirmLive: false }, spawn: s.spawn, print: () => {} });
+    const r = new Runner({ mode: "live", identity: { ...ok, confirmLive: false }, spawn: s.spawn, print: () => {}, fence });
     const out = r.run(step);
     expect(out.record.status).toBe("refused");
     expect(out.record.code).toBe("missing_confirm_live");
@@ -91,12 +94,12 @@ describe("runner: refusals never spawn", () => {
   });
   test("live against a non-proof account is refused and does not spawn", () => {
     const s = spy();
-    const r = new Runner({ mode: "live", identity: { ...ok, accountId: "999999999999" }, spawn: s.spawn, print: () => {} });
+    const r = new Runner({ mode: "live", identity: { ...ok, accountId: "999999999999" }, spawn: s.spawn, print: () => {}, fence });
     expect(r.run(step).record.code).toBe("wrong_account");
     expect(s.calls).toHaveLength(0);
   });
   test("a failing command is recorded as failed with its exit code, not its output", () => {
-    const r = new Runner({ mode: "live", identity: ok, spawn: () => ({ stdout: "secret-ish", status: 3 }), print: () => {} });
+    const r = new Runner({ mode: "live", identity: ok, spawn: () => ({ stdout: "secret-ish", status: 3 }), print: () => {}, fence });
     const out = r.run(step);
     expect(out.record).toMatchObject({ status: "failed", exitCode: 3, code: "exit_3" });
     expect(JSON.stringify(out.record)).not.toContain("secret-ish");
