@@ -281,6 +281,7 @@ describe("delete propagation", () => {
     expect(await syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 6, kind: "changed", events: 0 })).toBe(true);
     expect(await allKeys(store)).toEqual([]);
     expect(state.exported("org-a", "sess:with:colons-1")!.keys).toEqual([]);
+    expect(state.truncationTotals()).toEqual({ sessions: 0, manifests: 0, strings: 0 });
     state.close();
   });
 
@@ -334,6 +335,33 @@ describe("ownership and failure bookkeeping", () => {
     state.close();
   });
 
+  test("the truncation ledger records every cut manifest and clears when the group is re-exported whole", async () => {
+    const { store } = await countingStore();
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    let huge = true;
+    const src: UnitSource = {
+      fenced: async () => false,
+      async *lines() {
+        const payload = huge ? `{"out": ${JSON.stringify("z".repeat(300_000))}}` : `{"out": "short"}`;
+        const { boundStrings } = await import("../neon-s3-sync/neon-reader.ts");
+        const b = boundStrings(payload);
+        const r = rec("tool_call", "o", "t", {});
+        yield { machine: "delivery:m", bytes: buildSessionStream([{ ...r, payload_json: b.text }]).bytes, userId: "u", truncated: b.truncated };
+      },
+    };
+    const syncer = new Syncer(fakeDb([unit("org-a")]), state, target(store), fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => src);
+    state.seeRevisions(1, [{ org_id: "org-a", session_id: "sess:with:colons-1", revision: "1" }]);
+    expect(await syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 1, kind: "recent", events: 1 })).toBe(true);
+    expect(state.truncationTotals()).toEqual({ sessions: 1, manifests: 1, strings: 1 });
+    const key = state.exported("org-a", "sess:with:colons-1")!.keys[0]!;
+    const m = JSON.parse(await readText(store, key));
+    expect(m.extensions["client.relayhistory_export"].catalog.truncated_strings).toBe(1);
+    huge = false;
+    expect(await syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 2, kind: "changed", events: 1 })).toBe(true);
+    expect(state.truncationTotals()).toEqual({ sessions: 0, manifests: 0, strings: 0 });
+    state.close();
+  });
+
   test("a failed group is retried at once when its revision moves; a fence forces a re-export", async () => {
     const state = new SyncState(join(await tempDir(), "s.sqlite"));
     const now = Date.now();
@@ -346,6 +374,41 @@ describe("ownership and failure bookkeeping", () => {
     expect(state.nextWork(now, 86_400_000, 10).map((w) => `${w.kind}:${w.session_id}`)).toEqual(["retry:s"]);
     expect(state.forceChanged([{ org_id: "o", session_id: "f" }])).toBe(1);
     expect(state.nextWork(now, 86_400_000, 10).map((w) => `${w.kind}:${w.session_id}`)).toEqual(["changed:f", "retry:s"]);
+    state.close();
+  });
+
+  test("waiting for the eraser key is retried hourly past the attempt cap; a fence revives a capped failure", async () => {
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    let now = Date.now();
+    state.seeRevisions(1, [{ org_id: "o", session_id: "e", revision: "1" }, { org_id: "o", session_id: "x", revision: "1" }]);
+    for (let i = 0; i < 8; i++) state.markFailed("o", "e", "eraser_unavailable", ["96bulls/o/v1/a/manifest.json"], 1, now);
+    for (let i = 0; i < 8; i++) state.markFailed("o", "x", "57014", ["96bulls/o/v1/b/manifest.json"], 1, now);
+    now += 61 * 60 * 1000;
+    expect(state.nextWork(now, 86_400_000, 10).map((w) => w.session_id)).toEqual(["e"]);
+    expect(state.forceChanged([{ org_id: "o", session_id: "x" }])).toBe(1);
+    expect(state.nextWork(now, 86_400_000, 10).map((w) => w.session_id).sort()).toEqual(["e", "x"]);
+    state.close();
+  });
+
+  test("a stale key that is not this exporter's does not stop the group's own erasure", async () => {
+    const { store } = await countingStore();
+    const t = target(store);
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const own = await exportUnit(t, unit("org-a"), fixedSource(baseRecords().slice(0, 1)));
+    const other = await exportUnit(t, unit("org-a", { sessionId: "other" }), fixedSource(baseRecords().slice(0, 1)));
+    state.seeRevisions(1, [{ org_id: "org-a", session_id: "sess:with:colons-1", revision: "2" }]);
+    // the group's ledger wrongly holds another session's key as well as its own
+    state.markExported("org-a", "sess:with:colons-1", 1, [other.manifests[0]!.manifestKey, own.manifests[0]!.manifestKey]);
+    const db = fakeDb([]);
+    const syncer = new Syncer(db, state, t, fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => fixedSource([]));
+    // deleteExported refuses the other session's key only by identity when called for it; simulate a foreign owner
+    const m = JSON.parse(await readText(store, other.manifests[0]!.manifestKey));
+    m.raw.owner = m.writer.delivery_instance_id = "client-1";
+    await store.put(objectKey(other.manifests[0]!.manifestKey), new TextEncoder().encode(JSON.stringify(m)));
+    expect(await syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 2, kind: "changed", events: 0 })).toBe(true);
+    expect(await allKeys(store, own.manifests[0]!.manifestKey.replace("/manifest.json", ""))).toEqual([]);
+    expect((await allKeys(store, other.manifests[0]!.manifestKey.replace("/manifest.json", ""))).length).toBeGreaterThan(0);
+    expect(state.exported("org-a", "sess:with:colons-1")!.keys).toEqual([]);
     state.close();
   });
 

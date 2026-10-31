@@ -97,6 +97,7 @@ function storeFromEnv(execute: boolean): ObjectStore {
   const kmsKey = env("S3X_SSE_KMS_KEY_ID");
   if (kmsKey && !/^arn:aws:kms:[a-z0-9-]+:\d{12}:key\/[0-9a-f-]{36}$/.test(kmsKey))
     throw new Error("S3X_SSE_KMS_KEY_ID must be a KMS key ARN");
+  if (kmsKey && sse !== "aws:kms") throw new Error("S3X_SSE_KMS_KEY_ID needs S3X_SSE=aws:kms");
   const store = (credentials: NonNullable<ReturnType<typeof credentialsFrom>>) =>
     createS3Store({
       bucket,

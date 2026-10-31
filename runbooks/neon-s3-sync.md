@@ -25,7 +25,11 @@ Provenance is self-issued, not a RelayAuth grant: `grant_id=neon-s3-sync`,
 
 A JSON string longer than the scrub bound (262,144 chars; the sealer refuses
 it rather than truncating) is cut with an in-band note and counted in the
-catalog's `truncated_strings`; the full text stays in Neon.
+catalog's `truncated_strings`; the full text stays in Neon. Khaliq accepted
+this temporarily (2026-10-31): every cut manifest is in the state file's
+`truncations` ledger (and its manifest's catalog in S3), the progress log
+reports `truncation_ledger`, and T0 is gated on zero outstanding truncations
+(follow-up: raise or chunk the sealer's limit, then re-export those sessions).
 
 ## Neon load
 
@@ -48,8 +52,12 @@ catalog's `truncated_strings`; the full text stays in Neon.
   manifest; the manifest gets a new revision; every object under the session
   prefix it no longer references is deleted, including stale `normalized/`.
 - A session gone from both sweeps (Neon hard-deleted it) is erased first.
-- Deletes go through the eraser key (the writer cannot delete). The bucket's
-  1-day noncurrent expiry removes the old versions within 48 h.
+- Deletes go through the eraser key (the writer cannot delete). They add a
+  delete marker; the bucket's 1-day noncurrent expiry (due by the next 00:00
+  UTC after a day, so within 48 h, run asynchronously by S3) removes the bytes.
+- Fences (`deleted_upload_sessions`, `session_resets`) change without a
+  revision bump: each revision sweep forces the groups they cover to re-export.
+  When idle, exports older than 14 days are re-read (delivery-only changes).
 
 ## Run (linuyc, for now)
 

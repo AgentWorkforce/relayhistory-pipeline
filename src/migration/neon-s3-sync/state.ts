@@ -60,6 +60,10 @@ export class SyncState {
         failed_revision INTEGER,
         PRIMARY KEY (org_id, session_id));
       CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS truncations (
+        org_id TEXT NOT NULL, session_id TEXT NOT NULL, manifest_key TEXT NOT NULL,
+        strings INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
+        PRIMARY KEY (org_id, session_id, manifest_key));
       CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
     `);
   }
@@ -147,7 +151,8 @@ export class SyncState {
   markFailed(org: string, session: string, code: string, keys: string[], revision: number, at = Date.now()) {
     const prior = this.exported(org, session);
     const attempts = (prior?.attempts ?? 0) + 1;
-    const nextTry = at + Math.min(4, 2 ** (attempts - 1)) * 60 * 60 * 1000;
+    // Waiting for the eraser key is not a failure of the group: retry hourly, uncapped.
+    const nextTry = at + (code === "eraser_unavailable" ? 1 : Math.min(4, 2 ** (attempts - 1))) * 60 * 60 * 1000;
     const all = JSON.stringify([...new Set([...(prior?.keys ?? []), ...keys])].sort());
     this.db
       .prepare(
@@ -160,17 +165,46 @@ export class SyncState {
   }
 
   /**
+   * The truncation ledger: every exported manifest that holds a string cut to
+   * the scrub bound, so it can be re-exported in full once the sealer takes
+   * large strings. Replaced on each export of the group; T0 waits on it being empty.
+   */
+  recordTruncations(org: string, session: string, byKey: { key: string; strings: number }[], at = Date.now()) {
+    this.#tx(() => {
+      this.db.prepare("DELETE FROM truncations WHERE org_id = ? AND session_id = ?").run(org, session);
+      const q = this.db.prepare(
+        "INSERT INTO truncations (org_id, session_id, manifest_key, strings, recorded_at) VALUES (?, ?, ?, ?, ?)",
+      );
+      for (const t of byKey) if (t.strings > 0) q.run(org, session, t.key, t.strings, at);
+    });
+  }
+
+  truncationTotals(): { sessions: number; manifests: number; strings: number } {
+    const r = this.db
+      .prepare("SELECT count(DISTINCT org_id || '/' || session_id) AS s, count(*) AS m, coalesce(sum(strings), 0) AS n FROM truncations")
+      .get() as { s: number; m: number; n: number };
+    return { sessions: Number(r.s), manifests: Number(r.m), strings: Number(r.n) };
+  }
+
+  /**
    * A deletion fence (tombstone or reset) changed without bumping the
    * session's revision: make the exported group look changed, past its debounce.
    */
   forceChanged(groups: { org_id: string; session_id: string }[]): number {
-    const q = this.db.prepare(
+    const ok = this.db.prepare(
       `UPDATE exported SET revision = -2, exported_at = 0
         WHERE org_id = ? AND session_id = ? AND error IS NULL AND keys <> '[]' AND revision <> -2`,
     );
+    // A failed group (even past its attempt cap) retries at once.
+    const failed = this.db.prepare(
+      `UPDATE exported SET failed_revision = -2, attempts = 0, next_try = 0
+        WHERE org_id = ? AND session_id = ? AND error IS NOT NULL AND keys <> '[]'
+          AND coalesce(failed_revision, 0) <> -2`,
+    );
     let n = 0;
     this.#tx(() => {
-      for (const g of groups) n += Number(q.run(g.org_id, g.session_id).changes);
+      for (const g of groups)
+        n += Number(ok.run(g.org_id, g.session_id).changes) + Number(failed.run(g.org_id, g.session_id).changes);
     });
     return n;
   }
@@ -224,7 +258,8 @@ export class SyncState {
     take(
       `SELECT g.org_id, g.session_id, g.revision, g.events FROM groups g JOIN exported e USING (org_id, session_id)
         WHERE e.error IS NOT NULL
-          AND ((e.next_try <= ? AND e.attempts < 6) OR g.revision <> coalesce(e.failed_revision, g.revision))
+          AND ((e.next_try <= ? AND (e.attempts < 6 OR e.error = 'eraser_unavailable'))
+               OR g.revision <> coalesce(e.failed_revision, g.revision))
         ORDER BY e.next_try LIMIT ?`,
       "retry",
       now,

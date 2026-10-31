@@ -363,8 +363,9 @@ export async function fencedGroups(db: Queryable): Promise<{ org_id: string; ses
      SELECT DISTINCT x.org_id, x.session_id FROM sessions.session_resets r
        JOIN sessions.delivery_records x
          ON x.org_id = r.org_id AND x.workspace_id = r.workspace_id AND x.user_id = r.user_id AND x.kind = 'session'
-     LIMIT 100000`,
+     LIMIT 100001`,
   );
+  if (rows.length > 100_000) throw Object.assign(new Error("too many fenced groups"), { code: "fence_overflow" });
   return rows;
 }
 

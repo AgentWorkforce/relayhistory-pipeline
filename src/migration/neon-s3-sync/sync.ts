@@ -157,8 +157,13 @@ export class Syncer {
     }
     if (this.stopped()) return;
     // Fences change without a revision bump: re-export (erase) what they now cover.
-    const forced = this.state.forceChanged(await fencedGroups(this.db));
-    if (forced) this.log({ message: "fenced after export", count: forced });
+    // A failure here must not stop the sweep: change-driven work also checks the fence itself.
+    try {
+      const forced = this.state.forceChanged(await fencedGroups(this.db));
+      if (forced) this.log({ message: "fenced after export", count: forced });
+    } catch (error) {
+      this.log({ message: "fence sweep failed", error_code: errorCode(error) });
+    }
     this.state.setMeta("rev_sweep_done", String(id));
     this.state.setMeta("rev_sweep_at", String(this.throttle.now()));
     this.#dropUnseen();
@@ -207,6 +212,7 @@ export class Syncer {
     const touched = new Set<string>();
     try {
       const keys: string[] = [];
+      const truncations: { key: string; strings: number }[] = [];
       if (work.kind !== "delete") {
         const units = await sessionUnits(lane.db, work.org_id, work.session_id);
         await this.hook(units.length, 0);
@@ -219,6 +225,7 @@ export class Syncer {
           if (r.fenced) this.counters.fenced += 1;
           for (const m of r.manifests) {
             keys.push(m.manifestKey);
+            truncations.push({ key: m.manifestKey, strings: m.truncatedStrings });
             if (m.written) this.counters.manifestsWritten += 1;
             else this.counters.manifestsUnchanged += 1;
             this.counters.chunksSealed += m.chunksSealed;
@@ -231,9 +238,28 @@ export class Syncer {
         }
       }
       const keep = new Set(keys);
-      for (const key of new Set([...(prior?.keys ?? []), ...touched]))
-        if (!keep.has(key)) this.counters.objectsDeleted += await deleteExported(this.target, work.org_id, key);
+      // Erase every stale key; one that fails does not stop the others.
+      let deleteError: unknown;
+      const retained: string[] = [];
+      for (const key of new Set([...(prior?.keys ?? []), ...touched])) {
+        if (keep.has(key)) continue;
+        try {
+          this.counters.objectsDeleted += await deleteExported(this.target, work.org_id, key);
+        } catch (error) {
+          const code = errorCode(error);
+          // Not this exporter's object (a client's manifest, another session's key): never ours to track.
+          if (code.startsWith("foreign_manifest") || code === "key_collision") continue;
+          retained.push(key);
+          deleteError ??= error;
+        }
+      }
+      if (deleteError !== undefined) {
+        for (const k of retained) touched.add(k);
+        for (const k of keys) touched.add(k);
+        throw deleteError;
+      }
       this.state.markExported(work.org_id, work.session_id, work.revision, keys);
+      this.state.recordTruncations(work.org_id, work.session_id, truncations);
       this.counters.groups += 1;
       this.counters.eventsDone += work.events;
       if (work.events >= 20_000)
@@ -270,6 +296,8 @@ export class Syncer {
       eta_recent_h: eta(b.recentPendingEvents),
       eta_all_h: eta(b.pendingEvents),
       errors: this.state.errorCounts(),
+      // Outstanding truncations (ledger in the state file); T0 waits on zero.
+      truncation_ledger: this.state.truncationTotals(),
     });
   }
 
