@@ -383,6 +383,7 @@ describe("GCP self-host contract", () => {
     expect(GCP_RUNTIME_SHAPE.privateEndpoint).toBe(true);
     expect(GCP_RUNTIME_SHAPE.autopilot).toBe(false);
     expect(GCP_RUNTIME_SHAPE.nodeLocation).toBe("us-central1-a");
+    expect(GCP_RUNTIME_SHAPE.initialNodeCount).toBe(3);
     expect(GCP_RUNTIME_SHAPE.natIpAllocateOption).toBe("MANUAL_ONLY");
     expect(GCP_RUNTIME_SHAPE.natLogFilter).toBe("ALL");
     expect(GCP_NODE_ROLES).toEqual([
@@ -534,6 +535,7 @@ describe("GCP self-host contract", () => {
     expect(rendered).toContain("relayauth-runtime");
     expect(rendered).toContain("relayfile-runtime");
     expect(rendered).not.toMatch(/PRIVATE KEY|password|token/i);
+    expect(auth.relayhistory).toEqual({ allowPrivateHttpOrigin: true });
   });
 
   it("keeps Relayflows standalone and optional", () => {

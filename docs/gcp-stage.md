@@ -22,11 +22,14 @@ implementations own provider adapters.
   nodes, a private control-plane endpoint, operator CIDRs only, Workload
   Identity Federation, Dataplane V2, Shielded Nodes, VPC-native ranges, one
   reserved NAT address with translation logs, and VPC flow logs. The default
-  pool is explicitly limited to one `e2-medium` node in `us-central1-a`; it is
-  not one node per zone. The node identity is a dedicated service account with
-  no key and only `roles/container.defaultNodeServiceAccount`. The deploying
-  principal must separately have `roles/iam.serviceAccountUser` on that node
-  identity so GKE may attach it. Private Service Access
+  pool is explicitly limited to three `e2-medium` nodes in `us-central1-a`; it is
+  not three nodes per zone. A single node exposes only about 940m allocatable CPU,
+  and the GKE system pods plus RelayAuth leave too little capacity for even the
+  smallest 96Bulls pod request. The node identity is a dedicated service
+  account with no key and only `roles/container.defaultNodeServiceAccount`.
+  The deploying principal must separately have
+  `roles/iam.serviceAccountUser` on that node identity so GKE may attach it.
+  Private Service Access
   stays project-local peering, not Shared VPC;
 - versioned GCS Locker bucket with uniform bucket-level access;
 - private Artifact Registry repository with immutable tags;
@@ -184,7 +187,9 @@ shared audience. The release also enables AlleyOop's RelayAuth JWT verifier;
 that switch does not reopen the legacy audience while the origin is present.
 A verifier may reach the ClusterIP through a local
 port-forward, but it must still ask RelayAuth to bind the token to this stable
-in-cluster origin.
+in-cluster origin. The GCP RelayAuth values enable its private/internal HTTP
+origin policy so this exact `.svc` origin can be minted; public HTTP origins
+remain refused by RelayAuth.
 
 Those are names and identifiers only. Secret payloads never belong in this
 file or Helm values. The stage uses its private Artifact Registry repository
