@@ -461,7 +461,7 @@ describe("migration role collision", () => {
     `SELECT 1 FROM information_schema.columns
       WHERE table_schema = 'sessions' AND table_name = 'session_directory' AND column_name = 'short_summary'`)).rows.length > 0;
 
-  test("a pre-existing role equal to what the migration creates is reused and reasserted", async () => {
+  test("a pre-existing role equal to what the migration creates is reused unaltered", async () => {
     const db = await beforeG6();
     await db.exec(`CREATE ROLE ${WORKER} NOLOGIN NOINHERIT NOBYPASSRLS;
       CREATE ROLE authenticator NOLOGIN NOINHERIT; GRANT ${WORKER} TO authenticator;`);

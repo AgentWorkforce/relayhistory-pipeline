@@ -112,8 +112,8 @@ BEGIN
                 || array_to_string(v_problems, ', '),
       HINT = 'Drop or fix the role, then rerun. The migration never reuses a role with these attributes.';
   END IF;
-  -- Safe to own: reassert the attributes so the state is exactly what we created.
-  ALTER ROLE session_directory_search_worker NOLOGIN NOINHERIT NOBYPASSRLS;
+  -- Exactly what this migration would create: reuse it as is. The role is never
+  -- altered; anything unsafe was refused above, before any other DDL ran.
 END
 $role_guard$;
 

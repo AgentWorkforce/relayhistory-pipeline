@@ -12,6 +12,8 @@ import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
+import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
+import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { canonicalJson, uploadIdentityOf, type PlanEntry, type UploadIdentity } from "@rhc/lib/pipeline/migration-assertions.ts";
 import {
@@ -85,7 +87,7 @@ const savedEnv = { ...process.env };
 const realFetch = globalThis.fetch;
 
 beforeAll(async () => {
-  db = new PGlite();
+  db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(await readFile(join(ROOT_DIR, "supabase/tests/supabase_shim.sql"), "utf8"));
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
     for (const file of (await readdir(join(ROOT_DIR, dir))).filter((f) => f.endsWith(".sql")).sort())
