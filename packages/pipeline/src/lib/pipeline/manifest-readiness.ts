@@ -5,6 +5,7 @@
  * parse the fixture manifests, then records its build's `RELEASE_SHA`, signed
  * with a server key. Nobody can open the gate by editing configuration.
  */
+import { hmacSha256, toHex, utf8 } from "../../../../object-store/src/crypto.js";
 import {
   MANIFEST_EPOCHS_CAPABILITY,
   computeContentSha256,
@@ -50,27 +51,14 @@ export interface ReadinessStore {
   put(row: ReadinessRow): Promise<void>;
 }
 
-const encoder = new TextEncoder();
-
 async function mac(key: string, row: Omit<ReadinessRow, "hmac">): Promise<string> {
-  const crypto = globalThis.crypto.subtle;
-  const secret = await crypto.importKey(
-    "raw",
-    encoder.encode(key),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
   const text = JSON.stringify([
     row.reader,
     row.capability,
     row.releaseSha,
     row.attestedAt,
   ]);
-  const signature = await crypto.sign("HMAC", secret, encoder.encode(text));
-  return [...new Uint8Array(signature)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
+  return toHex(await hmacSha256(utf8(key), text));
 }
 
 /**
