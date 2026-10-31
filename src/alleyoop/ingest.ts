@@ -263,6 +263,20 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
       return c.json({ ok: false, reason: "hoopdb_unreachable" }, 503);
     }
   });
+  // The v2 base read's default-off gate (issuer spec section 9): with
+  // RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ off, everything under
+  // /v1/pipeline/manifests/base is exactly 404, for every method and path
+  // variant, before any auth (and a base-read capability does not verify).
+  app.use("*", async (c, next) => {
+    const path = c.req.path;
+    const base = "/v1/pipeline/manifests/base";
+    if (
+      env.RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ !== "true" &&
+      (path === base || path.startsWith(`${base}/`))
+    )
+      return c.json({ error: { code: "not_found", message: "no route" } }, 404);
+    await next();
+  });
   const v1 = new Hono<AppEnv>();
   v1.use("*", async (c, next) => requireAuth(c as never, next));
   // Upload routes on an origin-bound deployment: only assertions minted for

@@ -738,12 +738,23 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       const existing = await storedManifest(deps.raw, key);
       // A v2 (backfill) assertion appends exactly one signed backfill epoch
       // to exactly the signed live base; #42's owner fence below still runs.
+      // Idempotency first: when the stored object is already byte-identical
+      // to this manifest (a retry after a lost commit response, under a fresh
+      // assertion with the same base), the append is checked against the
+      // signed base only and the commit returns the original success; any
+      // other manifest is still held to the stored-base comparison.
       if (migration && isBackfillIdentity(migration.upload)) {
-        if (await migrationBackfillIssue(auth, location, existing, manifest))
+        const identicalRetry = !!existing && existing.text === encodedText;
+        if (
+          await migrationBackfillIssue(auth, location, existing, manifest, {
+            identicalRetry,
+          })
+        )
           return uploadForbidden(c);
         if (
-          !existing ||
-          !sameVersion(existing.version, version(body.previousVersion))
+          !identicalRetry &&
+          (!existing ||
+            !sameVersion(existing.version, version(body.previousVersion)))
         )
           return responseError(
             c,
@@ -937,7 +948,9 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
    * validated, then ONE transaction consumes the capability and appends the
    * audit row; the 7 base fields are returned only after it commits.
    */
-  routes.get("/pipeline/manifests/base", async (c) => {
+  // Exactly one trailing slash is stripped (spec section 6): both spellings
+  // reach the same handler; no other variant does.
+  const baseRead = async (c: Context<AppEnv>) => {
     const env = c.env ?? {};
     if (env.RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ !== "true")
       return responseError(c, 404, "not_found", "no route");
@@ -974,7 +987,21 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     let snapshot: Awaited<ReturnType<typeof storedManifest>>;
     try {
       snapshot = await storedManifest(deps.raw, key);
-    } catch {
+    } catch (error) {
+      // A stored object that is not a valid manifest (bad JSON, failed
+      // validation, an unsupported schema, oversized) can never be a base:
+      // 409, not a retryable 503. Only real storage unavailability is 503.
+      if (
+        isObjectStoreError(error, "invalid_argument") ||
+        isObjectStoreError(error, "unsupported") ||
+        (error instanceof Error && error.message === "manifest too large")
+      )
+        return responseError(
+          c,
+          409,
+          "migration_base_unusable",
+          "the stored manifest is not a valid manifest",
+        );
       return responseError(
         c,
         503,
@@ -1018,7 +1045,9 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     if (outcome === "replayed") return replayed(c);
     if (outcome === "grant_mismatch") return grantForbidden(c);
     return c.json({ base }, 200);
-  });
+  };
+  routes.get("/pipeline/manifests/base", baseRead);
+  routes.get("/pipeline/manifests/base/", baseRead);
 
   routes.get("/pipeline/manifests/status", async (c) => {
     const key = storageKey(c, c.req.query("key") ?? "");

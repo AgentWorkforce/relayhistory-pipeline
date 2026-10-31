@@ -262,7 +262,14 @@ const count = async (table: string) =>
     .rows[0]!.n;
 
 /** buildIngestApp under an environment (unset by default: the production defaults). */
-async function ingest(extra: Record<string, string> = {}) {
+async function ingest(
+  extra: Record<string, string> = {},
+  opts: {
+    wrapStore?: (
+      store: ReturnType<typeof createFsStore>,
+    ) => ReturnType<typeof createFsStore>;
+  } = {},
+) {
   Object.assign(process.env, {
     LOCKER_BUCKET: "raw",
     TENANT_ORG_ID: ORG,
@@ -275,7 +282,7 @@ async function ingest(extra: Record<string, string> = {}) {
   if (extra.ALLOW_INTERIM_RELAYAUTH_BEARER)
     process.env.ALLOW_INTERIM_RELAYAUTH_BEARER =
       extra.ALLOW_INTERIM_RELAYAUTH_BEARER;
-  const store = createFsStore({ root });
+  const store = (opts.wrapStore ?? ((s) => s))(createFsStore({ root }));
   const { app, env } = await buildIngestApp({
     db: pgExecutor(),
     raw: { store, provider: "fs", bucket: "raw" } as never,
@@ -1474,7 +1481,7 @@ describe("buildIngestApp auth (production composition)", () => {
     });
     const p0 = await liveSessionWithPlan(off);
     const offRead = await getBase(off, baseReadToken(p0.read), p0.key);
-    expect(offRead.status).toBe(401);
+    expect(offRead.status).toBe(404);
     expect((await getBase(off, liveToken(), p0.key)).status).toBe(404);
     await db.exec("TRUNCATE sessions.pipeline_jobs");
 
@@ -1765,15 +1772,15 @@ describe("buildIngestApp auth (production composition)", () => {
       expect(`${name}: ${r.status}`).toBe(`${name}: 403`);
     }
     // One trailing slash is tolerated (the same rule for every route).
-    // ...but no handler widens to it: never a 200 with a base.
-    expect([403, 404]).toContain(
+    // ...and it is the same route: exactly one trailing slash is stripped.
+    expect(
       (
         await i.req(
           `/v1/pipeline/manifests/base/?key=${encodeURIComponent(p.key)}`,
           baseReadToken(read),
         )
       ).status,
-    );
+    ).toBe(200);
     const { rows } = await db.query(
       "SELECT 1 FROM sessions.migration_base_read_uses",
     );
@@ -1933,6 +1940,221 @@ describe("buildIngestApp auth (production composition)", () => {
       await pollPostgresStage({ sql, stage: "session-indexed", deps }),
     ).toMatchObject({ claimed: 2, acked: 2, exhausted: 0 });
     expect(indexed).toEqual([p.key, p.key]);
+  });
+
+  test("v2 lost commit response (blocker 1): an identical retry under a fresh assertion with the same base returns the original success; a mismatched replay is refused", async () => {
+    const i = await ingest(BASE_READ_ON);
+    const location = { ...straddle, sessionId: "session-lost-response" };
+    const p = await liveSessionWithPlan(i, location);
+    const { base } = (await (
+      await getBase(i, baseReadToken(p.read), p.key)
+    ).json()) as { base: BackfillBase };
+    const upload = await uploadIdentityV2Of(p.entry, PLAN, base);
+    const first = migrationToken(upload);
+    const sealed: Record<string, unknown>[] = [];
+    for (const [n, bytes] of p.sources.entries()) {
+      const r = await i.chunk(first, location, {
+        entry: p.entryText,
+        seq: base.chunk_count + n,
+        epoch: base.epoch + 1,
+        offset: p.chunks[n]!.start_offset,
+        bytes,
+        format: "ndjson",
+      });
+      expect(r.status).toBe(201);
+      sealed.push(
+        ((await r.json()) as { entry: Record<string, unknown> }).entry,
+      );
+    }
+    const added = sealed as unknown as {
+      bytes: number;
+      stored_bytes: number;
+      start_offset: number;
+    }[];
+    const appended = {
+      ...p.liveManifest,
+      revision: 2,
+      raw: {
+        ...p.liveManifest.raw,
+        chunk_count: 3,
+        raw_bytes:
+          p.liveManifest.raw.raw_bytes + added.reduce((n, c) => n + c.bytes, 0),
+        stored_bytes:
+          p.liveManifest.raw.stored_bytes +
+          added.reduce((n, c) => n + c.stored_bytes, 0),
+        content_sha256: await computeContentSha256([
+          p.liveSealed.entry,
+          ...sealed,
+        ] as never),
+        epoch: 1,
+        epochs: [
+          ...p.liveManifest.raw.epochs,
+          {
+            epoch: 1,
+            opened_at: AT,
+            reason: "backfill",
+            first_seq: 1,
+            opened_by: `migration:${GRANT}`,
+          },
+        ],
+        next_offset: added.at(-1)!.start_offset + added.at(-1)!.bytes,
+        chunks: [p.liveSealed.entry, ...sealed],
+      },
+      extensions: {
+        ...p.liveManifest.extensions,
+        "client.relayhistory_export": {
+          version: 1,
+          source: "neon.delivery_records",
+          exported_at: AT,
+          grant_id: GRANT,
+          plan_digest: PLAN,
+          source_user_id: USER,
+        },
+      },
+    };
+    const post = (t: string, manifest: unknown) =>
+      i.req("/v1/pipeline/manifests", t, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-machine-id": location.machineId,
+          "x-session-id": location.sessionId,
+        },
+        body: JSON.stringify({
+          key: p.key,
+          manifest,
+          previousVersion: p.liveVersion,
+        }),
+      });
+    const ok = await post(first, appended);
+    expect(ok.status).toBe(202);
+    const original = (await ok.json()) as { workKey: string };
+    // The response was lost: an identical retry under a FRESH assertion, same base.
+    const retry = await post(migrationToken(upload), appended);
+    expect(retry.status).toBe(202);
+    expect(((await retry.json()) as { workKey: string }).workKey).toBe(
+      original.workKey,
+    );
+    // A mismatched replay (other content than what is stored) is still refused.
+    const other = { ...appended, updated_at: "2026-10-29T11:00:00.000Z" };
+    expect((await post(migrationToken(upload), other)).status).toBe(403);
+    // A replay that is identical but claims another base is refused too.
+    const otherBase = migrationToken(
+      await uploadIdentityV2Of(p.entry, PLAN, { ...base, chunk_count: 0 }),
+    );
+    expect((await post(otherBase, appended)).status).toBe(403);
+  });
+
+  test("v2 base-read gate (blocker 2): off, everything under /base is exactly 404 for every method and path variant, before auth; on, exactly one trailing slash is stripped", async () => {
+    const off = await ingest({
+      ...MIGRATION_ON,
+      ALLOW_INTERIM_RELAYAUTH_BEARER: "true",
+    });
+    const p = await liveSessionWithPlan(off, {
+      ...straddle,
+      sessionId: "session-gate",
+    });
+    const q = `?key=${encodeURIComponent(p.key)}`;
+    for (const path of [
+      "/v1/pipeline/manifests/base",
+      "/v1/pipeline/manifests/base/",
+      "/v1/pipeline/manifests/base//",
+      "/v1/pipeline/manifests/base/x",
+    ])
+      for (const method of ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"])
+        for (const token of [
+          baseReadToken(p.read),
+          liveToken(),
+          "",
+          "garbage",
+        ]) {
+          const r = await off.app.request(
+            `${path}${q}`,
+            {
+              method,
+              headers: token ? { authorization: `Bearer ${token}` } : {},
+            },
+            off.env,
+          );
+          expect(
+            `${method} ${path} [${token ? token.slice(0, 6) : "no-token"}]: ${r.status}`,
+          ).toBe(
+            `${method} ${path} [${token ? token.slice(0, 6) : "no-token"}]: 404`,
+          );
+        }
+    // The token class is unusable elsewhere while the gate is off.
+    const elsewhere = await off.req(
+      `/v1/pipeline/manifests/status${q}`,
+      baseReadToken(p.read),
+    );
+    expect(elsewhere.status).toBe(401);
+    expect(await code(elsewhere)).toBe("invalid_claims");
+    // Gate on: `/base/` (one trailing slash) is the same route as `/base`.
+    const on = await ingest(BASE_READ_ON);
+    const p2 = await liveSessionWithPlan(on, {
+      ...straddle,
+      sessionId: "session-gate-on",
+    });
+    const slash = await on.req(
+      `/v1/pipeline/manifests/base/?key=${encodeURIComponent(p2.key)}`,
+      baseReadToken(p2.read),
+    );
+    expect(slash.status).toBe(200);
+    expect(
+      Object.keys(
+        ((await slash.json()) as { base: Record<string, unknown> }).base,
+      ),
+    ).toHaveLength(7);
+  });
+
+  test("v2 base read of a malformed stored manifest (blocker 4): 409 migration_base_unusable, not a retryable 503; real storage unavailability stays 503", async () => {
+    const down = new Set<string>();
+    const i = await ingest(BASE_READ_ON, {
+      wrapStore: (store) =>
+        new Proxy(store, {
+          get(target, prop, receiver) {
+            const value = Reflect.get(target, prop, receiver);
+            if (prop !== "getObject")
+              return typeof value === "function" ? value.bind(target) : value;
+            return async (key: Parameters<typeof store.getObject>[0]) => {
+              if ([...down].some((d) => String(key).includes(d)))
+                throw new Error("storage down");
+              return target.getObject(key);
+            };
+          },
+        }),
+    });
+    const malformed = { ...straddle, sessionId: "session-malformed" };
+    const p = await liveSessionWithPlan(i, malformed);
+    // Overwrite the stored manifest with something that is not a manifest.
+    for (const bytes of [
+      "{not json",
+      JSON.stringify({ schema_v: 1, layout: "v1" }),
+      JSON.stringify({ schema_v: 99 }),
+    ]) {
+      await i.store.put(objectKey(p.key), new TextEncoder().encode(bytes), {
+        contentType: "application/json",
+      });
+      const r = await getBase(i, baseReadToken(p.read), p.key);
+      expect(`${bytes.slice(0, 12)}: ${r.status} ${await code(r)}`).toBe(
+        `${bytes.slice(0, 12)}: 409 migration_base_unusable`,
+      );
+    }
+    const { rows: none } = await db.query(
+      "SELECT 1 FROM sessions.migration_base_read_uses",
+    );
+    expect(none).toHaveLength(0);
+    // Storage unavailable: 503, nothing consumed.
+    const flaky = { ...straddle, sessionId: "session-storage-down" };
+    const p2 = await liveSessionWithPlan(i, flaky);
+    down.add("session-storage-down");
+    const r = await getBase(i, baseReadToken(p2.read), p2.key);
+    expect(r.status).toBe(503);
+    expect(await code(r)).toBe("storage_unavailable");
+    const { rows } = await db.query(
+      "SELECT 1 FROM sessions.migration_base_read_uses",
+    );
+    expect(rows).toHaveLength(0);
   });
 
   test("v2 race: a live write between the base read and the commit makes the read base stale, and the commit is refused", async () => {

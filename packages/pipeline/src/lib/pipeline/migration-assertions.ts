@@ -1308,6 +1308,15 @@ export async function migrationBackfillIssue(
     | { manifest: ManifestV1; version: { eTag?: string; version?: string } }
     | undefined,
   incoming: ManifestV1,
+  options: {
+    /**
+     * The stored object is already byte-identical to `incoming` (a retry
+     * after a lost commit response): the stored manifest is the appended one,
+     * not the base. The append is then verified against the signed base
+     * without the stored-base comparison (its revision and version moved).
+     */
+    identicalRetry?: boolean;
+  } = {},
 ): Promise<string | undefined> {
   const upload = auth.migration?.upload;
   const tenancy = signedTenancy(auth);
@@ -1316,40 +1325,55 @@ export async function migrationBackfillIssue(
   if (!migrationSessionMatches(auth, location)) return "not the signed session";
   if (!stored) return "no live manifest to append to";
   const { base } = upload;
-  const live = stored.manifest;
-  const raw = live.raw;
-  if (
-    live.revision !== base.revision ||
-    backfillBaseVersion(stored.version) !== base.version ||
-    raw.owner !== base.owner ||
-    raw.owner.startsWith("migration:") ||
-    live.writer.delivery_instance_id !== base.writer ||
-    raw.chunk_count !== base.chunk_count ||
-    raw.chunks.length !== base.chunk_count ||
-    raw.epoch !== base.epoch ||
-    raw.content_sha256 !== base.content_sha256 ||
-    raw.epochs.some((e) => (e.reason as string) === "backfill")
-  )
-    return "the stored manifest is not the signed base";
+  if (!options.identicalRetry) {
+    const live = stored.manifest;
+    const raw = live.raw;
+    if (
+      live.revision !== base.revision ||
+      backfillBaseVersion(stored.version) !== base.version ||
+      raw.owner !== base.owner ||
+      raw.owner.startsWith("migration:") ||
+      live.writer.delivery_instance_id !== base.writer ||
+      raw.chunk_count !== base.chunk_count ||
+      raw.chunks.length !== base.chunk_count ||
+      raw.epoch !== base.epoch ||
+      raw.content_sha256 !== base.content_sha256 ||
+      raw.epochs.some((e) => (e.reason as string) === "backfill")
+    )
+      return "the stored manifest is not the signed base";
+    if (
+      canonicalJson(incoming.raw.chunks.slice(0, base.chunk_count)) !==
+        canonicalJson(raw.chunks) ||
+      canonicalJson(incoming.raw.epochs.slice(0, raw.epochs.length)) !==
+        canonicalJson(raw.epochs)
+    )
+      return "the manifest does not keep the base's chunks and epochs";
+  }
+  // The append itself, against the SIGNED base only (so an identical retry
+  // is held to the same rule): the base's chunk list hashes to the signed
+  // base content, then exactly one backfill epoch of the signed entry.
   const next = incoming.raw;
   const epoch = base.epoch + 1;
   const prefix = next.chunks.slice(0, base.chunk_count);
   const added = next.chunks.slice(base.chunk_count);
-  const opened = next.epochs.slice(raw.epochs.length);
+  const backfillEpochs = next.epochs.filter(
+    (e) => (e.reason as string) === "backfill",
+  );
+  const opened = next.epochs.at(-1);
   if (
     incoming.revision !== base.revision + 1 ||
     next.owner !== base.owner ||
     incoming.writer.delivery_instance_id !== base.writer ||
     next.format !== "ndjson" ||
     next.epoch !== epoch ||
-    canonicalJson(prefix) !== canonicalJson(raw.chunks) ||
-    canonicalJson(next.epochs.slice(0, raw.epochs.length)) !==
-      canonicalJson(raw.epochs) ||
-    opened.length !== 1 ||
-    opened[0]!.epoch !== epoch ||
-    (opened[0]!.reason as string) !== "backfill" ||
-    opened[0]!.first_seq !== base.chunk_count ||
-    opened[0]!.opened_by !== `migration:${tenancy.grant_id}` ||
+    prefix.length !== base.chunk_count ||
+    (await computeContentSha256(prefix)) !== base.content_sha256 ||
+    backfillEpochs.length !== 1 ||
+    !opened ||
+    opened !== backfillEpochs[0] ||
+    opened.epoch !== epoch ||
+    opened.first_seq !== base.chunk_count ||
+    opened.opened_by !== `migration:${tenancy.grant_id}` ||
     added.length === 0 ||
     added.some((c, i) => c.seq !== base.chunk_count + i || c.epoch !== epoch) ||
     next.chunk_count !== next.chunks.length ||
@@ -1567,10 +1591,15 @@ export function sqlMigrationAssertionLedger(
       ]);
       // One grant, one org and one plan: a use that disagrees with the
       // grant's earlier uses is refused, and nothing is written.
+      // Across BOTH ledgers (upload uses and base reads): a grant is bound
+      // to one plan and one org by whichever of them came first.
       const conflict = await tx.query(
         `SELECT 1 FROM ${uses}
             WHERE grant_id = $1 AND (plan_digest <> $2 OR org_id <> $3)
-            LIMIT 1`,
+         UNION ALL
+         SELECT 1 FROM ${baseReads}
+            WHERE grant_id = $1 AND (plan_digest <> $2 OR org_id <> $3)
+         LIMIT 1`,
         [use.grantId, use.planDigest, use.orgId],
       );
       if (conflict.rows.length) return "grant_mismatch" as const;
@@ -1627,6 +1656,20 @@ export function sqlMigrationAssertionLedger(
  */
 export class InMemoryMigrationAssertionLedger implements MigrationAssertionLedger {
   readonly uses = new Map<string, MigrationAssertionUse>();
+  /** Base-read capabilities: their own replay namespace (jti and nonce). */
+  readonly baseReads = new Map<string, MigrationAssertionUse>();
+  readonly #baseReadNonces = new Set<string>();
+
+  /** Whether a use disagrees with the grant's binding in EITHER ledger. */
+  #grantMismatch(use: MigrationAssertionUse): boolean {
+    for (const earlier of [...this.uses.values(), ...this.baseReads.values()])
+      if (
+        earlier.grantId === use.grantId &&
+        (earlier.planDigest !== use.planDigest || earlier.orgId !== use.orgId)
+      )
+        return true;
+    return false;
+  }
   readonly chunks = new Map<string, MigrationChunkUse>();
   /** The durable audit events (one per committed consumption). */
   readonly audit: (Omit<
@@ -1696,16 +1739,11 @@ export class InMemoryMigrationAssertionLedger implements MigrationAssertionLedge
     auditKey: string,
   ): Promise<MigrationConsumeResult> {
     this.#purge();
-    if (this.uses.has(use.jti) || this.#nonces.has(use.nonce))
+    if (this.baseReads.has(use.jti) || this.#baseReadNonces.has(use.nonce))
       return "replayed";
-    for (const earlier of this.uses.values())
-      if (
-        earlier.grantId === use.grantId &&
-        (earlier.planDigest !== use.planDigest || earlier.orgId !== use.orgId)
-      )
-        return "grant_mismatch";
-    this.uses.set(use.jti, use);
-    this.#nonces.set(use.nonce, use.jti);
+    if (this.#grantMismatch(use)) return "grant_mismatch";
+    this.baseReads.set(use.jti, use);
+    this.#baseReadNonces.add(use.nonce);
     this.audit.push({
       grantId: use.grantId,
       planDigest: use.planDigest,
@@ -1727,12 +1765,7 @@ export class InMemoryMigrationAssertionLedger implements MigrationAssertionLedge
     this.#purge();
     if (this.uses.has(use.jti) || this.#nonces.has(use.nonce))
       return "replayed";
-    for (const earlier of this.uses.values())
-      if (
-        earlier.grantId === use.grantId &&
-        (earlier.planDigest !== use.planDigest || earlier.orgId !== use.orgId)
-      )
-        return "grant_mismatch";
+    if (this.#grantMismatch(use)) return "grant_mismatch";
     // Reserved synchronously, before the first await, so a concurrent consume
     // of the same jti or nonce sees it.
     this.uses.set(use.jti, use);
