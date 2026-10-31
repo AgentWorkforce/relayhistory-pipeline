@@ -158,7 +158,12 @@ class S3Transport implements Transport {
   }
 
   async delete(key: ObjectKey): Promise<void> {
-    const res = await this.#request(key, "DELETE", this.#url(key), new Headers());
+    const res = await this.#request(
+      key,
+      "DELETE",
+      this.#url(key),
+      new Headers(),
+    );
     if (!res.ok && res.status !== 404)
       throw errorForStatus(BACKEND, key, res.status, "");
   }

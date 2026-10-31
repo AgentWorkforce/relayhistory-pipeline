@@ -28,6 +28,11 @@ import {
 } from "../../shared/vendor.ts";
 import { sqlPipelineEventSink } from "../../hoopdb/sink.ts";
 import { buildIngestApp } from "../ingest.ts";
+import { runCourierOnce, type CourierConfig } from "../courier.ts";
+import { DatabaseSync } from "node:sqlite";
+import { writeFile } from "node:fs/promises";
+import { indexerReconcileRoot } from "../../hoopdb/reconcile-root.ts";
+import { objectKey, prefixAllowed, reconcileManifests, objectStoreManifestReader, orgResolverFromEnv } from "../../shared/vendor.ts";
 
 const ORIGIN = "https://history.example.test";
 const ISSUER = "https://relayauth.example.test";
@@ -153,7 +158,7 @@ async function ingest(extra: Record<string, string> = {}) {
       },
       body: JSON.stringify({ key, manifest }),
     });
-  return { req, chunk, commit };
+  return { req, chunk, commit, app, env, store };
 }
 
 /** The planned upload: its chunk entry (as the server seals it), manifest and signed identity. */
@@ -356,6 +361,283 @@ describe("buildIngestApp auth (production composition)", () => {
     expect(await deadLetters.list({ stage: "object-landed" })).toEqual([]);
     const { rows: errors } = await db.query("SELECT 1 FROM sessions.pipeline_events WHERE error->>'code' = 'invalid_work_key' OR status IN ('error', 'dead_lettered')");
     expect(errors).toHaveLength(0);
+  });
+
+  test("E2E under a deployment key prefix: the correct prefix is accepted through session-indexed; a wrong or absent prefix is refused, fail-closed", async () => {
+    const PREFIX = "deploy-a";
+    const i = await ingest({ ...MIGRATION_ON, ALLOW_INTERIM_RELAYAUTH_BEARER: "true", PIPELINE_KEY_PREFIX: PREFIX });
+    const { upload, manifest, entryText } = await planned();
+    const prefixedKey = `${PREFIX}/${manifestKey(LOCATION)}`;
+    // Negative first: a wrong or extra client-supplied prefix is refused before
+    // any write or consume. (An absent prefix is applied by the server.)
+    for (const key of [`deploy-b/${manifestKey(LOCATION)}`, `${PREFIX}/extra/${manifestKey(LOCATION)}`, `${PREFIX}/${PREFIX}/${manifestKey(LOCATION)}`]) {
+      const refused = await i.commit(migrationToken(upload), manifest, key);
+      expect(`${key}: ${refused.status}`).toBe(`${key}: 403`);
+    }
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+    expect(await count("sessions.migration_assertion_uses")).toBe(0);
+    // Positive: chunks land under the prefix (server-chosen), the commit's
+    // seal check looks there, and the job is consumed through session-indexed.
+    const token = migrationToken(upload);
+    const chunk = await i.chunk(token, LOCATION, { entry: entryText });
+    expect(chunk.status).toBe(201);
+    expect(((await chunk.json()) as { key: string }).key.startsWith(`${PREFIX}/v1/`)).toBe(true);
+    const commit = await i.commit(token, manifest, prefixedKey);
+    expect(commit.status).toBe(202);
+    const workKey = ((await commit.json()) as { workKey: string }).workKey;
+    // The signed (unprefixed) key and entry digest; the prefix is deployment config, not identity.
+    expect(workKey).toBe(`${upload.key}@${upload.entry_sha256}`);
+    // A live session under the same prefix.
+    const liveLocation = { ...LOCATION, sessionId: "session-live" };
+    const live = await planned(liveLocation, liveLocation.machineId);
+    expect((await i.chunk(liveToken(), liveLocation)).status).toBe(201);
+    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-machine-id": liveLocation.machineId, "x-session-id": liveLocation.sessionId },
+      body: JSON.stringify({ key: `${PREFIX}/${manifestKey(liveLocation)}`, manifest: { ...live.manifest, extensions: undefined } }),
+    });
+    expect(liveCommit.status).toBe(202);
+
+    const sql = pgExecutor();
+    const indexed: string[] = [];
+    const deadLetters = postgresDeadLetterStore(sql);
+    const deps = pipelineQueueDeps({} as Bindings, {
+      queue: postgresPipelineQueue(sql),
+      sink: sqlPipelineEventSink(sql),
+      deadLetters,
+      index: { upsertRawPointer: async (pointer: { manifestKey: string }) => void indexed.push(pointer.manifestKey) } as never,
+    });
+    expect(await pollPostgresStage({ sql, stage: "object-landed", deps })).toMatchObject({ claimed: 2, acked: 2, exhausted: 0 });
+    expect(await pollPostgresStage({ sql, stage: "session-indexed", deps })).toMatchObject({ claimed: 2, acked: 2, exhausted: 0 });
+    expect(indexed.sort()).toEqual([prefixedKey, `${PREFIX}/${manifestKey(liveLocation)}`].sort());
+    expect(await deadLetters.list({ stage: "object-landed" })).toEqual([]);
+
+    // Consumer fail-closed: a migration job whose signed key is not this
+    // object's unprefixed key (here: the prefixed key itself, or another
+    // session) is refused (invalid_work_key, dead-lettered), never run as live.
+    for (const bad of [prefixedKey, manifestKey({ ...LOCATION, sessionId: "session-other" })]) {
+      await postgresPipelineQueue(sql).send({
+        v: 1, stage: "object-landed",
+        ctx: { traceId: TRACE, orgId: ORG, workspaceId: WORKSPACE },
+        workKey: `${bad}@${upload.entry_sha256}`,
+        payload: { key: prefixedKey, kind: "manifest", etag: "e1", migration: { key: bad, entry_sha256: upload.entry_sha256 } },
+      } as never);
+    }
+    const refused = await pollPostgresStage({ sql, stage: "object-landed", deps });
+    expect(refused.acked + refused.exhausted).toBe(2);
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+    expect(indexed).toHaveLength(2);
+    const letters = await deadLetters.list({ stage: "object-landed" });
+    expect(letters).toHaveLength(2);
+  });
+
+  test("prefixed GET manifests/status: the correct prefix reads the signed upload's own status; absent or wrong prefixes are refused", async () => {
+    const PREFIX = "deploy-a";
+    const i = await ingest({ ...MIGRATION_ON, PIPELINE_KEY_PREFIX: PREFIX });
+    const { upload, manifest, entryText } = await planned();
+    const prefixedKey = `${PREFIX}/${manifestKey(LOCATION)}`;
+    const writer = encodeURIComponent(`migration:${GRANT}`);
+    const status = (token: string, key: string) =>
+      i.req(`/v1/pipeline/manifests/status?key=${encodeURIComponent(key)}&machine=${LOCATION.machineId}&writer=${writer}`, token);
+    // Not yet stored: 404 under the correct prefix.
+    expect((await status(migrationToken(upload), prefixedKey)).status).toBe(404);
+    const token = migrationToken(upload);
+    expect((await i.chunk(token, LOCATION, { entry: entryText })).status).toBe(201);
+    expect((await i.commit(token, manifest, prefixedKey)).status).toBe(202);
+    // A fresh assertion for the same upload reads its status under the prefix.
+    const own = await status(migrationToken(upload), prefixedKey);
+    expect(own.status).toBe(200);
+    expect(((await own.json()) as { version: { eTag?: string } }).version.eTag).toBeTruthy();
+    // The unprefixed key (the courier's shape) is served under the server's prefix.
+    expect((await status(migrationToken(upload), manifestKey(LOCATION))).status).toBe(200);
+    // A wrong or extra client prefix: refused (403), never served.
+    for (const key of [`deploy-b/${manifestKey(LOCATION)}`, `${PREFIX}/extra/${manifestKey(LOCATION)}`]) {
+      const refused = await status(migrationToken(upload), key);
+      expect(`${key}: ${refused.status}`).toBe(`${key}: 403`);
+    }
+    // Another session's key under the right prefix: not the signed upload.
+    const other = await status(migrationToken(upload), `${PREFIX}/${manifestKey({ ...LOCATION, sessionId: "session-other" })}`);
+    expect(other.status).toBe(403);
+    expect(await code(other)).toBe("migration_upload_forbidden");
+  });
+
+  test("org-derived prefixes (PIPELINE_ORG_FROM_PREFIX through the real composition): the token's own org prefix is accepted end to end; another org's prefix is refused", async () => {
+    const i = await ingest({ ...MIGRATION_ON, PIPELINE_ORG_FROM_PREFIX: "true", TENANT_ORG_ID: "" });
+    const { upload, manifest, entryText } = await planned();
+    const ownKey = `${ORG}/${manifestKey(LOCATION)}`;
+    // A token for org A with a key under org B's prefix: refused before any write.
+    for (const key of [`org_other/${manifestKey(LOCATION)}`, `x/${ORG}/${manifestKey(LOCATION)}`]) {
+      const refused = await i.commit(migrationToken(upload), manifest, key);
+      expect(`${key}: ${refused.status}`).toBe(`${key}: 403`);
+    }
+    // Org B's token (its own identity) cannot write under org A's prefix either.
+    const orgBUpload = await uploadIdentityOf(
+      { ...(JSON.parse(entryText) as PlanEntry), org_id: "org_other" },
+      PLAN,
+    );
+    const orgB = await i.commit(migrationToken(orgBUpload, { org: "org_other" }), manifest, ownKey);
+    expect(orgB.status).toBe(403);
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+    // The token's own org prefix: chunk under it, commit, consume through session-indexed.
+    const token = migrationToken(upload);
+    const chunk = await i.chunk(token, LOCATION, { entry: entryText });
+    expect(chunk.status).toBe(201);
+    expect(((await chunk.json()) as { key: string }).key.startsWith(`${ORG}/v1/`)).toBe(true);
+    const commit = await i.commit(token, manifest, ownKey);
+    expect(commit.status).toBe(202);
+    const sql = pgExecutor();
+    const indexed: string[] = [];
+    const deadLetters = postgresDeadLetterStore(sql);
+    const deps = pipelineQueueDeps({ PIPELINE_ORG_FROM_PREFIX: "true" } as Bindings, {
+      queue: postgresPipelineQueue(sql),
+      sink: sqlPipelineEventSink(sql),
+      deadLetters,
+      index: { upsertRawPointer: async (pointer: { manifestKey: string }) => void indexed.push(pointer.manifestKey) } as never,
+    });
+    expect(await pollPostgresStage({ sql, stage: "object-landed", deps })).toMatchObject({ claimed: 1, acked: 1, exhausted: 0 });
+    expect(await pollPostgresStage({ sql, stage: "session-indexed", deps })).toMatchObject({ claimed: 1, acked: 1, exhausted: 0 });
+    expect(indexed).toEqual([ownKey]);
+    // No dead letter for this upload (the shared test database may hold
+    // letters from the forged jobs of the static-prefix test).
+    const letters = await deadLetters.list({ stage: "object-landed" });
+    expect(letters.filter((l) => JSON.stringify(l).includes(`${ORG}/v1/`))).toEqual([]);
+  });
+
+  test("combined base + org-derived prefix: exactly <base>/<caller org> is accepted end to end; foreign, extra and bare prefixes are refused", async () => {
+    const BASE = "deploy-a";
+    const i = await ingest({ ...MIGRATION_ON, PIPELINE_KEY_PREFIX: BASE, PIPELINE_ORG_FROM_PREFIX: "true" });
+    const { upload, manifest, entryText } = await planned();
+    const exact = `${BASE}/${ORG}/${manifestKey(LOCATION)}`;
+    for (const key of [
+      `deploy-b/${ORG}/${manifestKey(LOCATION)}`, // foreign base
+      `${BASE}/extra/${ORG}/${manifestKey(LOCATION)}`, // extra segment
+      `${ORG}/${manifestKey(LOCATION)}`, // bare org (no base)
+      `${BASE}/org_other/${manifestKey(LOCATION)}`, // another org
+      `${BASE}/${manifestKey(LOCATION)}`, // base, no org
+    ]) {
+      const refused = await i.commit(migrationToken(upload), manifest, key);
+      expect(`${key}: ${refused.status}`).toBe(`${key}: 403`);
+    }
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+    const token = migrationToken(upload);
+    const chunk = await i.chunk(token, LOCATION, { entry: entryText });
+    expect(((await chunk.json()) as { key: string }).key.startsWith(`${BASE}/${ORG}/v1/`)).toBe(true);
+    // The courier's unprefixed key: the server applies exactly <base>/<org>.
+    const commit = await i.commit(token, manifest);
+    expect(commit.status).toBe(202);
+    expect(await i.store.head(objectKey(exact))).toBeTruthy();
+    const { rows } = await db.query<{ key: string }>("SELECT message->'payload'->>'key' AS key FROM sessions.pipeline_jobs");
+    expect(rows.map((r) => r.key)).toEqual([exact]);
+  });
+
+  test("prefixAllowed: exact <base>/<org>, static base, and bare-org rules", () => {
+    const org = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "deploy-a" };
+    expect(prefixAllowed(org, "deploy-a/org_a", "org_a")).toBe(true);
+    for (const p of ["deploy-b/org_a", "deploy-a/extra/org_a", "org_a", "deploy-a/org_b", "deploy-a", undefined, "deploy-a/org_a/x"])
+      expect(`${p}: ${prefixAllowed(org, p, "org_a")}`).toBe(`${p}: false`);
+    const bare = { PIPELINE_ORG_FROM_PREFIX: "true" };
+    expect(prefixAllowed(bare, "org_a", "org_a")).toBe(true);
+    for (const p of ["x/org_a", "org_b", undefined]) expect(prefixAllowed(bare, p, "org_a")).toBe(false);
+    const fixed = { PIPELINE_KEY_PREFIX: "/deploy-a/" };
+    expect(prefixAllowed(fixed, "deploy-a", "org_a")).toBe(true);
+    for (const p of ["deploy-b", "deploy-a/org_a", undefined]) expect(prefixAllowed(fixed, p, "org_a")).toBe(false);
+    expect(prefixAllowed({}, undefined, "org_a")).toBe(true);
+    expect(prefixAllowed({}, "deploy-a", "org_a")).toBe(false);
+  });
+
+  for (const [mode, extra, prefix] of [
+    ["static prefix", { PIPELINE_KEY_PREFIX: "deploy-a" }, "deploy-a"],
+    ["org-derived prefix with a base", { PIPELINE_KEY_PREFIX: "deploy-a", PIPELINE_ORG_FROM_PREFIX: "true" }, `deploy-a/${ORG}`],
+  ] as const) {
+    test(`the REAL courier (runCourierOnce, unprefixed keys) under a ${mode}: commits, reconciles status and is consumed through session-indexed`, async () => {
+      const i = await ingest({ ...extra, ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
+      const dir = await mkdtemp(join(tmpdir(), "96bulls-courier-prefix-"));
+      try {
+        const dbPath = join(dir, "history.db");
+        const rawPath = join(dir, "session.jsonl");
+        await writeFile(rawPath, '{"type":"user","message":"one"}\n');
+        const hist = new DatabaseSync(dbPath);
+        hist.exec("CREATE TABLE sessions (session_id TEXT, source TEXT, raw_path TEXT, first_activity_ms INTEGER, last_activity_ms INTEGER, cwd TEXT, agent_version TEXT)");
+        hist.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)").run("session-courier", "claude", rawPath, 1_700_000_000_000, 1_700_000_000_100, null, "1.0.0");
+        hist.close();
+        const ingestUrl = "http://ingest.test";
+        const seenKeys: string[] = [];
+        const outer = globalThis.fetch;
+        globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          if (!url.startsWith(ingestUrl)) return outer(input, init);
+          const u = new URL(url);
+          if (u.searchParams.get("key")) seenKeys.push(u.searchParams.get("key")!);
+          if (init?.body && u.pathname.endsWith("/pipeline/manifests")) seenKeys.push((JSON.parse(String(init.body)) as { key: string }).key);
+          return i.app.request(`${u.pathname}${u.search}`, init, i.env);
+        }) as typeof fetch;
+        const config = (): CourierConfig => ({
+          dbPath, statePath: join(dir, "state.json"), ingestUrl,
+          token: { get: async () => liveToken(), invalidate: () => false },
+          orgId: ORG, workspaceId: WORKSPACE, userId: USER, machineId: "machine-c",
+          harnesses: ["claude"], closeAfterMinutes: 1_000_000, startMode: "all",
+        });
+        try {
+          expect(await runCourierOnce(config())).toMatchObject({ uploaded: 1, chunks: 1 });
+          // The courier posts the canonical unprefixed key; the server stored it under its prefix.
+          expect(seenKeys.every((k) => k.startsWith("v1/"))).toBe(true);
+          const { rows } = await db.query<{ key: string }>("SELECT message->'payload'->>'key' AS key FROM sessions.pipeline_jobs");
+          expect(rows).toHaveLength(1);
+          expect(rows[0]!.key.startsWith(`${prefix}/v1/`)).toBe(true);
+          expect(await i.store.head(objectKey(rows[0]!.key))).toBeTruthy();
+          // A restarted courier reconciles its recorded (unprefixed) key: verified, not reset.
+          expect(await runCourierOnce({ ...config(), verifiedManifests: new Set() })).toMatchObject({ uploaded: 0 });
+          const { rows: still } = await db.query("SELECT 1 FROM sessions.pipeline_jobs");
+          expect(still).toHaveLength(1);
+        } finally {
+          globalThis.fetch = outer;
+        }
+        const sql = pgExecutor();
+        const indexed: string[] = [];
+        const deadLetters = postgresDeadLetterStore(sql);
+        const deps = pipelineQueueDeps(extra as Bindings, {
+          queue: postgresPipelineQueue(sql), sink: sqlPipelineEventSink(sql), deadLetters,
+          index: { upsertRawPointer: async (pointer: { manifestKey: string }) => void indexed.push(pointer.manifestKey) } as never,
+        });
+        expect(await pollPostgresStage({ sql, stage: "object-landed", deps })).toMatchObject({ claimed: 1, acked: 1, exhausted: 0 });
+        expect(await pollPostgresStage({ sql, stage: "session-indexed", deps })).toMatchObject({ claimed: 1, acked: 1, exhausted: 0 });
+        expect(indexed).toHaveLength(1);
+        expect(indexed[0]!.startsWith(`${prefix}/v1/`)).toBe(true);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("org-derived reconcile scans the <base>/<org> roots and keeps only exact prefixes of a known org", async () => {
+    const env = { PIPELINE_KEY_PREFIX: "deploy-a", PIPELINE_ORG_FROM_PREFIX: "true" };
+    // The indexer's root (was `<base>/v1` for every mode, which never contains `<base>/<org>/v1`).
+    expect(indexerReconcileRoot(env)).toBe("deploy-a");
+    expect(indexerReconcileRoot({ PIPELINE_KEY_PREFIX: "deploy-a" })).toBe("deploy-a/v1");
+    expect(indexerReconcileRoot({})).toBe("v1");
+    expect(indexerReconcileRoot({ PIPELINE_ORG_FROM_PREFIX: "true" })).toBeUndefined();
+    const store = createFsStore({ root });
+    const { manifest } = await planned();
+    const body = new TextEncoder().encode(JSON.stringify(manifest));
+    const keys = {
+      exact: `deploy-a/${ORG}/${manifestKey(LOCATION)}`,
+      foreign: `deploy-b/${ORG}/${manifestKey(LOCATION)}`,
+      extra: `deploy-a/extra/${ORG}/${manifestKey(LOCATION)}`,
+      bare: `${ORG}/${manifestKey(LOCATION)}`,
+    };
+    for (const key of Object.values(keys)) await store.put(objectKey(key), body, { contentType: "application/json" });
+    const sent: { payload: { key: string } }[] = [];
+    const result = await reconcileManifests({
+      store,
+      reader: objectStoreManifestReader(store, { provider: "fs", bucket: "raw" }),
+      orgs: orgResolverFromEnv(env)!,
+      allowPrefix: (prefix, orgId) => prefixAllowed(env, prefix, orgId),
+      send: async (m) => void sent.push(m as never),
+      listPrefix: indexerReconcileRoot(env)!,
+      modifiedSince: new Date(0),
+    });
+    expect(sent.map((m) => m.payload.key)).toEqual([keys.exact]);
+    expect(result.enqueued).toBe(1);
   });
 
   test("signed work key and durable audit: posted fields cannot alter the work key; one audit row per commit, no secrets", async () => {

@@ -40,7 +40,10 @@ afterEach(async () => {
 async function fixture() {
   const store = createFsStore({ root });
   const raw = { store, provider: "fs" as const, bucket: "raw" };
-  const reader = objectStoreManifestReader(store, { provider: "fs", bucket: "raw" });
+  const reader = objectStoreManifestReader(store, {
+    provider: "fs",
+    bucket: "raw",
+  });
   const location: SessionLocation = {
     workspaceId: WORKSPACE,
     machineId: MACHINE,
@@ -57,7 +60,10 @@ async function fixture() {
     source: new TextEncoder().encode('{"type":"user","text":"hello"}\n'),
     traceId: TRACE,
   });
-  const build = async (revision: number, writer = MACHINE): Promise<ManifestV1> => ({
+  const build = async (
+    revision: number,
+    writer = MACHINE,
+  ): Promise<ManifestV1> => ({
     schema_v: 1,
     layout: "v1",
     trace_id: TRACE,
@@ -72,7 +78,11 @@ async function fixture() {
       started_at: AT,
       ...(revision > 1 ? { ended_at: AT } : {}),
     },
-    writer: { delivery_instance_id: writer, plugin_version: "96bulls-courier/0.3.0", capabilities: [MANIFEST_EPOCHS_CAPABILITY] },
+    writer: {
+      delivery_instance_id: writer,
+      plugin_version: "96bulls-courier/0.3.0",
+      capabilities: [MANIFEST_EPOCHS_CAPABILITY],
+    },
     raw: {
       owner: MACHINE,
       state: revision > 1 ? "closed" : "open",
@@ -84,12 +94,22 @@ async function fixture() {
       stored_bytes: sealed.entry.stored_bytes,
       content_sha256: await computeContentSha256([sealed.entry]),
       epoch: 0,
-      epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: 0, opened_by: MACHINE }],
+      epochs: [
+        {
+          epoch: 0,
+          opened_at: AT,
+          reason: "initial",
+          first_seq: 0,
+          opened_by: MACHINE,
+        },
+      ],
       next_offset: sealed.entry.bytes,
       chunks: [sealed.entry],
       scrub: sealed.scrub,
     },
-    extensions: { "96bulls": { session_uuid: UUID, session_uuid_source: "minted" } },
+    extensions: {
+      "96bulls": { session_uuid: UUID, session_uuid_source: "minted" },
+    },
   });
   const sent: StageMessage[] = [];
   const routes = createCourierManifestRoutes({
@@ -111,37 +131,46 @@ async function fixture() {
   app.use("*", async (c, next) => {
     c.set("correlationId", "test");
     const explicit = c.req.header("x-test-auth");
-    c.set("auth", explicit === "migration" ? {
-      userId: "user",
-      orgId: ORG,
-      workspaceId: WORKSPACE,
-      tokenSubject: "agent_relayhistory_migration",
-      scopes: ["rth:sync"],
-      claims: {
-        meta: {
-          tokenClass: "migration_assertion",
-          grantId: "mgr_export",
-          planDigest: "a".repeat(64),
-        },
-      },
-      historyOrigin: "https://history.example",
-    } : explicit === "malformed" ? {
-      userId: "user",
-      orgId: ORG,
-      workspaceId: WORKSPACE,
-      tokenSubject: "agent_relayhistory_migration",
-      scopes: ["rth:sync"],
-      claims: { meta: { tokenClass: "migration_assertion" } },
-      historyOrigin: "https://history.example",
-    } : explicit === "live" ? {
-      userId: "user",
-      orgId: ORG,
-      workspaceId: WORKSPACE,
-      tokenSubject: "agent_relayhistory_assertion",
-      scopes: ["rth:sync"],
-      claims: {},
-      historyOrigin: "https://history.example",
-    } : auth);
+    c.set(
+      "auth",
+      explicit === "migration"
+        ? {
+            userId: "user",
+            orgId: ORG,
+            workspaceId: WORKSPACE,
+            tokenSubject: "agent_relayhistory_migration",
+            scopes: ["rth:sync"],
+            claims: {
+              meta: {
+                tokenClass: "migration_assertion",
+                grantId: "mgr_export",
+                planDigest: "a".repeat(64),
+              },
+            },
+            historyOrigin: "https://history.example",
+          }
+        : explicit === "malformed"
+          ? {
+              userId: "user",
+              orgId: ORG,
+              workspaceId: WORKSPACE,
+              tokenSubject: "agent_relayhistory_migration",
+              scopes: ["rth:sync"],
+              claims: { meta: { tokenClass: "migration_assertion" } },
+              historyOrigin: "https://history.example",
+            }
+          : explicit === "live"
+            ? {
+                userId: "user",
+                orgId: ORG,
+                workspaceId: WORKSPACE,
+                tokenSubject: "agent_relayhistory_assertion",
+                scopes: ["rth:sync"],
+                claims: {},
+                historyOrigin: "https://history.example",
+              }
+            : auth,
+    );
     await next();
   });
   app.route("/v1", routes);
@@ -150,16 +179,24 @@ async function fixture() {
     RELAYHISTORY_ORIGIN: "https://history.example",
     PIPELINE_TELEMETRY_ID_KEY: TELEMETRY_KEY,
   };
-  const post = (body: unknown, explicitAuth?: "live" | "migration" | "malformed") => app.request("/v1/pipeline/manifests", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-machine-id": MACHINE,
-      "x-session-id": SESSION,
-      ...(explicitAuth ? { "x-test-auth": explicitAuth } : {}),
-    },
-    body: JSON.stringify(body),
-  }, env);
+  const post = (
+    body: unknown,
+    explicitAuth?: "live" | "migration" | "malformed",
+  ) =>
+    app.request(
+      "/v1/pipeline/manifests",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-machine-id": MACHINE,
+          "x-session-id": SESSION,
+          ...(explicitAuth ? { "x-test-auth": explicitAuth } : {}),
+        },
+        body: JSON.stringify(body),
+      },
+      env,
+    );
   const asLive = () => {
     auth = {
       userId: "user",
@@ -213,10 +250,19 @@ async function fixture() {
       raw: {
         ...structuredClone(previous.raw),
         // The exporter leaves client activity alone; the owner's write moves it.
-        ...(reason === "backfill" ? {} : { updated_at: new Date(Date.parse(previous.raw.updated_at) + 1).toISOString() }),
+        ...(reason === "backfill"
+          ? {}
+          : {
+              updated_at: new Date(
+                Date.parse(previous.raw.updated_at) + 1,
+              ).toISOString(),
+            }),
         chunk_count: chunks.length,
         raw_bytes: chunks.reduce((sum, chunk) => sum + chunk.bytes, 0),
-        stored_bytes: chunks.reduce((sum, chunk) => sum + chunk.stored_bytes, 0),
+        stored_bytes: chunks.reduce(
+          (sum, chunk) => sum + chunk.stored_bytes,
+          0,
+        ),
         content_sha256: await computeContentSha256(chunks),
         epoch,
         epochs: [
@@ -228,7 +274,19 @@ async function fixture() {
       },
     };
   };
-  return { store, reader, location, build, sent, app, env, post, asLive, asMigration, appendEpoch };
+  return {
+    store,
+    reader,
+    location,
+    build,
+    sent,
+    app,
+    env,
+    post,
+    asLive,
+    asMigration,
+    appendEpoch,
+  };
 }
 
 describe("AlleyOop courier manifest routes", () => {
@@ -238,7 +296,7 @@ describe("AlleyOop courier manifest routes", () => {
     const manifest = await f.build(1);
     const response = await f.post({ key, manifest });
     expect(response.status).toBe(202);
-    const body = await response.json() as { version: { eTag?: string } };
+    const body = (await response.json()) as { version: { eTag?: string } };
     expect(body.version.eTag).toBeTruthy();
     const head = await f.store.head(objectKey(key));
     expect(head?.metadata).toMatchObject({
@@ -259,11 +317,25 @@ describe("AlleyOop courier manifest routes", () => {
     const f = await fixture();
     const key = manifestKey(f.location);
     const first = await f.post({ key, manifest: await f.build(1) });
-    const firstBody = await first.json() as { version: { eTag?: string } };
+    const firstBody = (await first.json()) as { version: { eTag?: string } };
 
-    expect((await f.post({ key, manifest: await f.build(2) })).status).toBe(409);
-    expect((await f.post({ key, manifest: await f.build(2, "machine-b"), previousVersion: firstBody.version })).status).toBe(409);
-    const update = await f.post({ key, manifest: await f.build(2), previousVersion: firstBody.version });
+    expect((await f.post({ key, manifest: await f.build(2) })).status).toBe(
+      409,
+    );
+    expect(
+      (
+        await f.post({
+          key,
+          manifest: await f.build(2, "machine-b"),
+          previousVersion: firstBody.version,
+        })
+      ).status,
+    ).toBe(409);
+    const update = await f.post({
+      key,
+      manifest: await f.build(2),
+      previousVersion: firstBody.version,
+    });
     expect(update.status).toBe(202);
     const stored = await f.reader.read(key);
     expect(stored?.manifest.revision).toBe(2);
@@ -274,7 +346,7 @@ describe("AlleyOop courier manifest routes", () => {
     const key = manifestKey(f.location);
     const live = await f.build(1);
     const first = await f.post({ key, manifest: live });
-    const firstBody = await first.json() as { version: { eTag?: string } };
+    const firstBody = (await first.json()) as { version: { eTag?: string } };
 
     f.asMigration();
     const backfill = await f.appendEpoch(
@@ -285,11 +357,20 @@ describe("AlleyOop courier manifest routes", () => {
     );
     backfill.extensions = {
       ...backfill.extensions,
-      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+      "client.relayhistory_export": {
+        version: 1,
+        source: "neon.delivery_records",
+      },
     };
-    const appended = await f.post({ key, manifest: backfill, previousVersion: firstBody.version });
+    const appended = await f.post({
+      key,
+      manifest: backfill,
+      previousVersion: firstBody.version,
+    });
     expect(appended.status).toBe(202);
-    const appendedBody = await appended.json() as { version: { eTag?: string } };
+    const appendedBody = (await appended.json()) as {
+      version: { eTag?: string };
+    };
     const stored = (await f.reader.read(key))!.manifest;
     expect(stored.raw.owner).toBe(MACHINE);
     expect(stored.writer.delivery_instance_id).toBe(MACHINE);
@@ -313,32 +394,85 @@ describe("AlleyOop courier manifest routes", () => {
       MACHINE,
       '{"type":"assistant","text":"after T0"}',
     );
-    const response = await f.post({ key, manifest: resumed, previousVersion: appendedBody.version });
+    const response = await f.post({
+      key,
+      manifest: resumed,
+      previousVersion: appendedBody.version,
+    });
     expect(response.status).toBe(202);
-    expect((await f.reader.read(key))?.manifest.raw.epochs.map((epoch) => epoch.reason)).toEqual([
-      "initial",
-      "backfill",
-      "rewritten",
-    ]);
+    expect(
+      (await f.reader.read(key))?.manifest.raw.epochs.map(
+        (epoch) => epoch.reason,
+      ),
+    ).toEqual(["initial", "backfill", "rewritten"]);
+  });
+
+  test("refuses the export marker from a live writer", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const marker = {
+      "client.relayhistory_export": {
+        version: 1,
+        source: "neon.delivery_records",
+        grant_id: "mgr_export",
+        plan_digest: "a".repeat(64),
+        source_user_id: "user",
+      },
+    };
+    const first = await f.build(1, MACHINE);
+    first.extensions = { ...first.extensions, ...marker };
+    expect((await f.post({ key, manifest: first })).status).toBe(409);
+
+    const plain = await f.build(1, MACHINE);
+    const created = await f.post({ key, manifest: plain });
+    expect(created.status).toBe(202);
+    const { version } = (await created.json()) as {
+      version: { eTag?: string };
+    };
+    const next = await f.build(2, MACHINE);
+    next.extensions = { ...next.extensions, ...marker };
+    expect(
+      (await f.post({ key, manifest: next, previousVersion: version })).status,
+    ).toBe(409);
   });
 
   test("refuses a migration write that moves client-owned raw fields", async () => {
     const f = await fixture();
     const key = manifestKey(f.location);
     const first = await f.build(1);
-    const firstBody = (await (await f.post({ key, manifest: first })).json()) as { version: object };
+    const firstBody = (await (
+      await f.post({ key, manifest: first })
+    ).json()) as { version: object };
     const edits: ((m: ManifestV1) => void)[] = [
-      (m) => void (m.raw.updated_at = new Date(Date.parse(m.raw.updated_at) + 1000).toISOString()),
+      (m) =>
+        void (m.raw.updated_at = new Date(
+          Date.parse(m.raw.updated_at) + 1000,
+        ).toISOString()),
       (m) => void (m.raw.future = "x"),
     ];
     for (const edit of edits) {
-      const backfill = await f.appendEpoch(first, "backfill", "migration:mgr_export", '{"pre":"t0"}');
+      const backfill = await f.appendEpoch(
+        first,
+        "backfill",
+        "migration:mgr_export",
+        '{"pre":"t0"}',
+      );
       backfill.extensions = {
         ...backfill.extensions,
-        "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+        "client.relayhistory_export": {
+          version: 1,
+          source: "neon.delivery_records",
+        },
       };
       edit(backfill);
-      expect((await f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration")).status).toBe(409);
+      expect(
+        (
+          await f.post(
+            { key, manifest: backfill, previousVersion: firstBody.version },
+            "migration",
+          )
+        ).status,
+      ).toBe(409);
     }
   });
 
@@ -346,18 +480,65 @@ describe("AlleyOop courier manifest routes", () => {
     const f = await fixture();
     const key = manifestKey(f.location);
     const first = await f.build(1);
-    const firstBody = (await (await f.post({ key, manifest: first })).json()) as { version: object };
-    const forged = await f.appendEpoch(first, "rewritten", "migration:mgr_export", '{"live":1}');
-    expect((await f.post({ key, manifest: forged, previousVersion: firstBody.version })).status).toBe(409);
-    const stranger = await f.appendEpoch(first, "rewritten", "someone-else", '{"live":2}');
-    expect((await f.post({ key, manifest: stranger, previousVersion: firstBody.version })).status).toBe(409);
-    for (const openedBy of ["migration:", "migration:bad id", `migration:${"x".repeat(256)}`]) {
-      const malformed = await f.appendEpoch(first, "backfill", openedBy, '{"pre":"t0"}');
+    const firstBody = (await (
+      await f.post({ key, manifest: first })
+    ).json()) as { version: object };
+    const forged = await f.appendEpoch(
+      first,
+      "rewritten",
+      "migration:mgr_export",
+      '{"live":1}',
+    );
+    expect(
+      (
+        await f.post({
+          key,
+          manifest: forged,
+          previousVersion: firstBody.version,
+        })
+      ).status,
+    ).toBe(409);
+    const stranger = await f.appendEpoch(
+      first,
+      "rewritten",
+      "someone-else",
+      '{"live":2}',
+    );
+    expect(
+      (
+        await f.post({
+          key,
+          manifest: stranger,
+          previousVersion: firstBody.version,
+        })
+      ).status,
+    ).toBe(409);
+    for (const openedBy of [
+      "migration:",
+      "migration:bad id",
+      `migration:${"x".repeat(256)}`,
+    ]) {
+      const malformed = await f.appendEpoch(
+        first,
+        "backfill",
+        openedBy,
+        '{"pre":"t0"}',
+      );
       malformed.extensions = {
         ...malformed.extensions,
-        "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+        "client.relayhistory_export": {
+          version: 1,
+          source: "neon.delivery_records",
+        },
       };
-      expect((await f.post({ key, manifest: malformed, previousVersion: firstBody.version }, "migration")).status).toBe(400);
+      expect(
+        (
+          await f.post(
+            { key, manifest: malformed, previousVersion: firstBody.version },
+            "migration",
+          )
+        ).status,
+      ).toBe(400);
     }
   });
 
@@ -365,16 +546,36 @@ describe("AlleyOop courier manifest routes", () => {
     const f = await fixture();
     const key = manifestKey(f.location);
     const first = await f.build(1);
-    const firstBody = (await (await f.post({ key, manifest: first })).json()) as { version: object };
-    const backfill = await f.appendEpoch(first, "backfill", "migration:mgr_export", '{"pre":"t0"}');
+    const firstBody = (await (
+      await f.post({ key, manifest: first })
+    ).json()) as { version: object };
+    const backfill = await f.appendEpoch(
+      first,
+      "backfill",
+      "migration:mgr_export",
+      '{"pre":"t0"}',
+    );
     backfill.extensions = {
       ...backfill.extensions,
-      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+      "client.relayhistory_export": {
+        version: 1,
+        source: "neon.delivery_records",
+      },
     };
     const jsonl = structuredClone(backfill);
     jsonl.raw.format = "jsonl";
-    expect((await f.post({ key, manifest: jsonl, previousVersion: firstBody.version }, "migration")).status).toBe(400);
-    const appended = await f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration");
+    expect(
+      (
+        await f.post(
+          { key, manifest: jsonl, previousVersion: firstBody.version },
+          "migration",
+        )
+      ).status,
+    ).toBe(400);
+    const appended = await f.post(
+      { key, manifest: backfill, previousVersion: firstBody.version },
+      "migration",
+    );
     expect(appended.status).toBe(202);
     const appendedBody = (await appended.json()) as { version: object };
 
@@ -398,7 +599,11 @@ describe("AlleyOop courier manifest routes", () => {
     next.raw.stored_bytes += extra.entry.stored_bytes;
     next.raw.next_offset = end + extra.entry.bytes;
     next.raw.content_sha256 = await computeContentSha256(next.raw.chunks);
-    const refused = await f.post({ key, manifest: next, previousVersion: appendedBody.version });
+    const refused = await f.post({
+      key,
+      manifest: next,
+      previousVersion: appendedBody.version,
+    });
     expect(refused.status).toBe(409);
   });
 
@@ -410,16 +615,24 @@ describe("AlleyOop courier manifest routes", () => {
     wrongOwner.raw.epochs[0]!.opened_by = "migration:another_grant";
     wrongOwner.extensions = {
       ...wrongOwner.extensions,
-      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+      "client.relayhistory_export": {
+        version: 1,
+        source: "neon.delivery_records",
+      },
     };
-    expect((await f.post({ key, manifest: wrongOwner }, "migration")).status).toBe(409);
+    expect(
+      (await f.post({ key, manifest: wrongOwner }, "migration")).status,
+    ).toBe(409);
 
     const cold = await f.build(1, "migration:mgr_export");
     cold.raw.owner = "migration:mgr_export";
     cold.raw.epochs[0]!.opened_by = "migration:mgr_export";
     cold.extensions = {
       ...cold.extensions,
-      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+      "client.relayhistory_export": {
+        version: 1,
+        source: "neon.delivery_records",
+      },
     };
     const retries = await Promise.all([
       f.post({ key, manifest: cold }, "migration"),
@@ -433,7 +646,7 @@ describe("AlleyOop courier manifest routes", () => {
     const key = manifestKey(f.location);
     const live = await f.build(1);
     const first = await f.post({ key, manifest: live });
-    const firstBody = await first.json() as { version: { eTag?: string } };
+    const firstBody = (await first.json()) as { version: { eTag?: string } };
     f.asMigration();
     const backfill = await f.appendEpoch(
       live,
@@ -443,19 +656,53 @@ describe("AlleyOop courier manifest routes", () => {
     );
     backfill.extensions = {
       ...backfill.extensions,
-      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+      "client.relayhistory_export": {
+        version: 1,
+        source: "neon.delivery_records",
+      },
     };
     const changedOwner = structuredClone(backfill);
     changedOwner.raw.owner = "migration:mgr_export";
-    expect((await f.post({ key, manifest: changedOwner, previousVersion: firstBody.version })).status).toBe(409);
+    expect(
+      (
+        await f.post({
+          key,
+          manifest: changedOwner,
+          previousVersion: firstBody.version,
+        })
+      ).status,
+    ).toBe(409);
     const rewritten = structuredClone(backfill);
     rewritten.raw.chunks[0]!.records = 999;
-    expect((await f.post({ key, manifest: rewritten, previousVersion: firstBody.version })).status).toBe(409);
+    expect(
+      (
+        await f.post({
+          key,
+          manifest: rewritten,
+          previousVersion: firstBody.version,
+        })
+      ).status,
+    ).toBe(409);
 
     // A normal rth:sync assertion cannot use the migration-only epoch reason.
     f.asLive();
-    expect((await f.post({ key, manifest: backfill, previousVersion: firstBody.version })).status).toBe(409);
-    expect((await f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "malformed")).status).toBe(409);
+    expect(
+      (
+        await f.post({
+          key,
+          manifest: backfill,
+          previousVersion: firstBody.version,
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await f.post(
+          { key, manifest: backfill, previousVersion: firstBody.version },
+          "malformed",
+        )
+      ).status,
+    ).toBe(409);
   });
 
   test("serializes a live append and backfill append on the same object version", async () => {
@@ -463,7 +710,7 @@ describe("AlleyOop courier manifest routes", () => {
     const key = manifestKey(f.location);
     const live = await f.build(1);
     const first = await f.post({ key, manifest: live });
-    const firstBody = await first.json() as { version: { eTag?: string } };
+    const firstBody = (await first.json()) as { version: { eTag?: string } };
     const backfill = await f.appendEpoch(
       live,
       "backfill",
@@ -472,7 +719,10 @@ describe("AlleyOop courier manifest routes", () => {
     );
     backfill.extensions = {
       ...backfill.extensions,
-      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+      "client.relayhistory_export": {
+        version: 1,
+        source: "neon.delivery_records",
+      },
     };
     const liveAppend = await f.appendEpoch(
       live,
@@ -483,9 +733,17 @@ describe("AlleyOop courier manifest routes", () => {
 
     // Drive the two authenticated attempts concurrently. Exactly one CAS can
     // replace the version they both read; the loser must reread and rebuild.
-    const migrationAttempt = f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration");
-    const liveAttempt = f.post({ key, manifest: liveAppend, previousVersion: firstBody.version }, "live");
-    const statuses = (await Promise.all([migrationAttempt, liveAttempt])).map((response) => response.status).sort();
+    const migrationAttempt = f.post(
+      { key, manifest: backfill, previousVersion: firstBody.version },
+      "migration",
+    );
+    const liveAttempt = f.post(
+      { key, manifest: liveAppend, previousVersion: firstBody.version },
+      "live",
+    );
+    const statuses = (await Promise.all([migrationAttempt, liveAttempt]))
+      .map((response) => response.status)
+      .sort();
     expect(statuses).toEqual([202, 409]);
     expect((await f.reader.read(key))?.manifest.revision).toBe(2);
   });
@@ -495,7 +753,7 @@ describe("AlleyOop courier manifest routes", () => {
     const key = manifestKey(f.location);
     const live = await f.build(1);
     const first = await f.post({ key, manifest: live });
-    const firstBody = await first.json() as { version: { eTag?: string } };
+    const firstBody = (await first.json()) as { version: { eTag?: string } };
     const backfill = await f.appendEpoch(
       live,
       "backfill",
@@ -504,16 +762,31 @@ describe("AlleyOop courier manifest routes", () => {
     );
     backfill.extensions = {
       ...backfill.extensions,
-      "client.relayhistory_export": { version: 1, source: "neon.delivery_records" },
+      "client.relayhistory_export": {
+        version: 1,
+        source: "neon.delivery_records",
+      },
     };
 
     const attempts = await Promise.all([
-      f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration"),
-      f.post({ key, manifest: backfill, previousVersion: firstBody.version }, "migration"),
+      f.post(
+        { key, manifest: backfill, previousVersion: firstBody.version },
+        "migration",
+      ),
+      f.post(
+        { key, manifest: backfill, previousVersion: firstBody.version },
+        "migration",
+      ),
     ]);
     expect(attempts.map((response) => response.status)).toEqual([202, 202]);
     const bodies = await Promise.all(
-      attempts.map((response) => response.json() as Promise<{ workKey: string; version: { eTag?: string } }>),
+      attempts.map(
+        (response) =>
+          response.json() as Promise<{
+            workKey: string;
+            version: { eTag?: string };
+          }>,
+      ),
     );
     expect(bodies[1]).toEqual(bodies[0]);
     expect((await f.reader.read(key))?.manifest).toEqual(backfill);
@@ -523,11 +796,24 @@ describe("AlleyOop courier manifest routes", () => {
     const f = await fixture();
     const manifest = await f.build(1);
     const foreign = manifestKey({ ...f.location, workspaceId: "ws_other" });
-    expect((await f.post({ key: foreign, manifest: { ...manifest, session: { ...manifest.session, workspace_id: "ws_other" } } })).status).toBe(403);
+    expect(
+      (
+        await f.post({
+          key: foreign,
+          manifest: {
+            ...manifest,
+            session: { ...manifest.session, workspace_id: "ws_other" },
+          },
+        })
+      ).status,
+    ).toBe(403);
     expect(await f.store.head(objectKey(foreign))).toBeUndefined();
 
     const key = manifestKey(f.location);
-    const unsealed = { ...manifest, raw: { ...manifest.raw, scrub: undefined } };
+    const unsealed = {
+      ...manifest,
+      raw: { ...manifest.raw, scrub: undefined },
+    };
     expect((await f.post({ key, manifest: unsealed })).status).toBe(409);
     expect(await f.store.head(objectKey(key))).toBeUndefined();
   });
@@ -536,10 +822,20 @@ describe("AlleyOop courier manifest routes", () => {
     const f = await fixture();
     const key = manifestKey(f.location);
     await f.post({ key, manifest: await f.build(1) });
-    const found = await f.app.request(`/v1/pipeline/manifests/status?key=${encodeURIComponent(key)}&machine=${MACHINE}&writer=${MACHINE}`, {}, f.env);
+    const found = await f.app.request(
+      `/v1/pipeline/manifests/status?key=${encodeURIComponent(key)}&machine=${MACHINE}&writer=${MACHINE}`,
+      {},
+      f.env,
+    );
     expect(found.status).toBe(200);
-    expect((await found.json() as { version: { eTag?: string } }).version.eTag).toBeTruthy();
-    const wrong = await f.app.request(`/v1/pipeline/manifests/status?key=${encodeURIComponent(key)}&machine=machine-b&writer=machine-b`, {}, f.env);
+    expect(
+      ((await found.json()) as { version: { eTag?: string } }).version.eTag,
+    ).toBeTruthy();
+    const wrong = await f.app.request(
+      `/v1/pipeline/manifests/status?key=${encodeURIComponent(key)}&machine=machine-b&writer=machine-b`,
+      {},
+      f.env,
+    );
     expect(wrong.status).toBe(403);
   });
 });

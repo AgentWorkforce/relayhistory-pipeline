@@ -4,7 +4,10 @@
  * must come through here. There is no scheduled job: an expired one goes when
  * its session is next written, and erasure calls `deleteParkedSession`.
  */
-import { parseManifest, type ManifestV1 } from "../../../../object-store/src/manifest.js";
+import {
+  parseManifest,
+  type ManifestV1,
+} from "../../../../object-store/src/manifest.js";
 import {
   isObjectStoreError,
   manifestLocation,
@@ -80,11 +83,14 @@ export async function expireParkedSession(
   now: Date,
   ttlMs = PARKED_TTL_MS,
 ): Promise<boolean> {
-  const head = await store.head(objectKey(parkedManifestKey(manifestKey, machineId)));
+  const head = await store.head(
+    objectKey(parkedManifestKey(manifestKey, machineId)),
+  );
   if (!head) return false;
   const parkedAt = Date.parse(head.metadata[META_PARKED_AT] ?? "");
   // No stamp: keep it. Losing a client's only copy is worse than a late sweep.
-  if (!Number.isFinite(parkedAt) || now.getTime() - parkedAt <= ttlMs) return false;
+  if (!Number.isFinite(parkedAt) || now.getTime() - parkedAt <= ttlMs)
+    return false;
   await deleteParkedSession(store, manifestKey, machineId);
   return true;
 }

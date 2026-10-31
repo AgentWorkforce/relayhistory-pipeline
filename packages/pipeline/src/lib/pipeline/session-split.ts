@@ -63,7 +63,12 @@ export interface ExportDeferred {
  */
 export async function recordExportDeferred(
   db: SqlExecutor,
-  item: { orgId: string; workspaceId: string; manifestKey: string; reason: string },
+  item: {
+    orgId: string;
+    workspaceId: string;
+    manifestKey: string;
+    reason: string;
+  },
 ): Promise<void> {
   await db.query(
     `INSERT INTO sessions.export_deferred_sessions
