@@ -31,21 +31,31 @@ type Org = (typeof ORGS)[number];
 const scan = "positionCaseInsensitiveUTF8(text, {q:String}) > 0";
 const settings = (org: string, tag: string) => ({ SQL_relay_org: org, max_execution_time: 5, log_comment: tag });
 
-async function page(table: string, o: Org, q: string, tag: string, range?: [number | null, number | null]) {
+async function page(table: string, o: Org, q: string, tag: string, range?: [number | null, number | null], extra: Record<string, number> = {}) {
   const f = [`org_id = '${o.org}'`, `workspace_id IN ${o.ws}`, scan];
   if ([...q].length >= 3) f.push("hasAllTokens(text, {q:String})");
   if (range?.[0] != null) f.push(`ts >= fromUnixTimestamp64Milli(toInt64(${range[0]}))`);
   if (range?.[1] != null) f.push(`ts < fromUnixTimestamp64Milli(toInt64(${range[1]}))`);
   return reader.rows<{ event_id: string }>(`SELECT event_id, substringUTF8(text, greatest(positionCaseInsensitiveUTF8(text, {q:String}) - 80, 1), 320) AS snippet
-    FROM ${table} WHERE ${f.join(" AND ")} ORDER BY ts DESC, event_id DESC LIMIT ${LIMIT + 1}`, { q }, settings(o.org, tag));
+    FROM ${table} WHERE ${f.join(" AND ")} ORDER BY ts DESC, event_id DESC LIMIT ${LIMIT + 1}`, { q }, { ...settings(o.org, tag), ...extra });
 }
-async function windowed(table: string, o: Org, q: string, tag: string) {
+async function windowed(table: string, o: Org, q: string, tag: string, extra: Record<string, number> = {}) {
   const now = Date.now();
   const e = [1, 7, 30].map((d) => now - d * DAY);
   const ranges: Array<[number | null, number | null]> = [[e[0]!, null], [e[1]!, e[0]!], [e[2]!, e[1]!], [null, e[2]!]];
   const rows: unknown[] = [];
-  for (const r of ranges) { rows.push(...await page(table, o, q, tag, r)); if (rows.length > LIMIT) break; }
+  for (const r of ranges) { rows.push(...await page(table, o, q, tag, r, extra)); if (rows.length > LIMIT) break; }
   return rows;
+}
+/** Probe only after the first window comes up short; a page filled there pays nothing. */
+async function lateProbed(table: string, o: Org, q: string, tag: string) {
+  const edge = Date.now() - DAY;
+  const first = await page(table, o, q, tag, [edge, null]);
+  if (first.length > LIMIT || [...q].length < 3) return first.length > LIMIT ? first : windowed(table, o, q, tag);
+  const n = Number((await reader.run(`SELECT count() FROM ${table} WHERE org_id = '${o.org}' AND workspace_id IN ${o.ws} AND hasAllTokens(text, {q:String})`, { q }, { ...settings(o.org, tag), query_plan_direct_read_from_text_index: 1, query_plan_optimize_count_from_text_index: 1 })).trim());
+  if (n === 0) return [];
+  if (n <= PROBE_MAX) return [...first, ...await page(table, o, q, tag, [null, edge])];
+  return windowed(table, o, q, tag);
 }
 async function probed(table: string, o: Org, q: string, tag: string) {
   if ([...q].length < 3) return windowed(table, o, q, tag);
@@ -53,10 +63,11 @@ async function probed(table: string, o: Org, q: string, tag: string) {
   return n <= PROBE_MAX ? page(table, o, q, tag) : windowed(table, o, q, tag);
 }
 const VARIANTS = {
-  single_8192: { table: "t_8192", run: page },
-  windowed_8192: { table: "t_8192", run: windowed },
-  windowed_256: { table: "t_256", run: windowed },
-  probed_256: { table: "t_256", run: probed },
+  windowed_256: { table: "t_256", run: windowed, repeat: false },
+  late_probe_256: { table: "t_256", run: lateProbed, repeat: false },
+  repeat_one_query: { table: "t_256", run: windowed, repeat: true },
+  repeat_one_nocache: { table: "t_256", run: (t: string, o: Org, q: string, g: string) => windowed(t, o, q, g, { use_query_condition_cache: 0 }), repeat: true },
+  mix_nocache: { table: "t_256", run: (t: string, o: Org, q: string, g: string) => windowed(t, o, q, g, { use_query_condition_cache: 0 }), repeat: false },
 } as const;
 
 await installSchema(admin, pw);
@@ -84,7 +95,7 @@ const mix = NEEDLES.flatMap((n) => ORGS.map((o) => ({ n, o })));
 const pct = (xs: number[]) => { const s = [...xs].sort((a, b) => a - b); return { n: s.length, p50: Math.round(percentile(s, 50) ?? 0), p95: Math.round(percentile(s, 95) ?? 0), p99: Math.round(percentile(s, 99) ?? 0) }; };
 
 async function cell(name: keyof typeof VARIANTS, clients: number, ingest: boolean, pass: number) {
-  const { table, run } = VARIANTS[name];
+  const { table, run, repeat } = VARIANTS[name];
   const tag = `ab:${name}:${clients}:${ingest}:${pass}`;
   const byClass: Record<string, number[]> = {};
   const all: number[] = [], fresh: number[] = [], insertMs: number[] = [];
@@ -92,7 +103,7 @@ async function cell(name: keyof typeof VARIANTS, clients: number, ingest: boolea
   let stop = false;
   const worker = async (id: number) => {
     for (let i = id; !stop; i++) {
-      const m = mix[i % mix.length]!;
+      const m = repeat ? { n: NEEDLES.find((x) => x.id === "pr")!, o: ORGS[0]! } : mix[i % mix.length]!;
       const s = performance.now();
       try {
         await run(table, m.o, m.n.query, tag);
@@ -132,14 +143,14 @@ async function cell(name: keyof typeof VARIANTS, clients: number, ingest: boolea
 }
 
 const results = [];
-for (const pass of [1, 2]) for (const clients of [8, 32]) for (const ingest of [false, true]) for (const name of Object.keys(VARIANTS) as Array<keyof typeof VARIANTS>)
+for (const pass of [1, 2]) for (const clients of [8, 32]) for (const ingest of [false]) for (const name of Object.keys(VARIANTS) as Array<keyof typeof VARIANTS>)
   results.push(await cell(name, clients, ingest, pass));
 
 // Recall for the probe path, against the oracle, whale org.
 const recall: Record<string, number> = {};
 for (const n of NEEDLES) {
   const truth = oracle.newest(oracleKey("org-0", n.id)).map((h) => h.eventId).slice(0, LIMIT);
-  const got = (await probed("t_256", ORGS[0]!, n.query, "ab:recall") as Array<{ event_id: string }>).slice(0, LIMIT).map((r) => r.event_id);
+  const got = (await lateProbed("t_256", ORGS[0]!, n.query, "ab:recall") as Array<{ event_id: string }>).slice(0, LIMIT).map((r) => r.event_id);
   recall[n.id] = truth.length ? truth.filter((e, i) => got[i] === e).length / truth.length : got.length ? 0 : 1;
 }
 writeFileSync(process.env.BENCH_OUT ?? "ab-report.json", JSON.stringify({

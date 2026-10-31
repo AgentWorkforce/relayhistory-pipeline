@@ -22,6 +22,7 @@ import { PLANTED_CONTENT_MARKER, PLANTED_SECRETS } from "../../../src/concourse/
 import { federatedSearch, LEGACY_DDL } from "./federation.ts";
 import { indexManifest, type IndexDeps } from "./index-stage.ts";
 import { startPipeline, type Pointer } from "./pipeline.ts";
+import { liveKey, searchApp } from "./product.ts";
 import { applyShape, checkShapeFile } from "./shape.ts";
 import { ClickHouseHttp, installSchema, SessionSearchStore, type Scope, type SearchHit } from "./store.ts";
 import { NEEDLES, Oracle, oracleKey, QUERY_SET_VERSION, transcriptBatches } from "./transcripts.ts";
@@ -58,7 +59,9 @@ const countRows = async (where: string) => Number((await admin.run(`SELECT count
 async function g1() {
   const deps: IndexDeps = { store: null as never, search, optedOutWorkspaces: new Set(["ws-optout"]), watermarks: new Map() };
   const outcomes: string[] = [];
-  const pipeline = await startPipeline("org-e2e-a", async (p: Pointer) => { outcomes.push(await indexManifest(p.orgId, p.manifest, deps, p.keyPrefix)); last = p; });
+  const live = new Set<string>();
+  const pipeline = await startPipeline("org-e2e-a", async (p: Pointer) => { outcomes.push(await indexManifest(p.orgId, p.manifest, deps, p.keyPrefix)); last = p;
+    live.add(liveKey(p.orgId, p.manifest.session.workspace_id, p.manifest.session.harness, p.manifest.session.session_id)); });
   let last: Pointer | undefined;
   deps.store = pipeline.store as never;
   const secret = Object.values(PLANTED_SECRETS)[0]!;
@@ -112,6 +115,7 @@ async function g1() {
     otherOrgHits: (await search.search(scopeOf("org-e2e-a", ["ws-e2e-b"]), { query: "orgbmarker" })).hits.length,
   };
   pipeline.refusals.length = 0;
+  await g13Product(pipeline, live);
   const unlisted = await pipeline.courier("org-e2e-c", "ws-e2e-c", [{ id: "s-e2e-c", lines: [line("orgcmarker", 1)] }]);
   const unlistedRows = await countRows("org_id = 'org-e2e-c'");
   const unlistedCodes = [...pipeline.refusals];
@@ -136,6 +140,42 @@ async function g1() {
       && unlistedCodes.length > 0 && unlistedCodes.every((c) => c === "org_not_allowed"),
   }, { firstHitMs: Math.round(firstHitMs), rowsBefore, rowsAfterRetry, outcomes, multiOrg, note: "the search-index step is proof code called from session-indexed; no such queue stage exists" });
   return true;
+}
+
+/** Real auth to scope to hydrate, and a failed store response refused whole, with no retry. */
+async function g13Product(pipeline: Awaited<ReturnType<typeof startPipeline>>, live: Set<string>) {
+  const checks: Record<string, boolean> = {};
+  const get = async (app: ReturnType<typeof searchApp>, q: string, token?: string) => {
+    const res = await app.request(`/v1/search?q=${encodeURIComponent(q)}`, { headers: token ? { authorization: `Bearer ${token}` } : {} }, pipeline.env);
+    return { status: res.status, body: await res.json().catch(() => null) as { hits?: SearchHit[]; error?: { code: string } } | null };
+  };
+  const app = searchApp(search, live);
+  const a = pipeline.readToken("org-e2e-a", "ws-e2e-a"), b = pipeline.readToken("org-e2e-b", "ws-e2e-b");
+  const own = await get(app, "e2emarkeralpha", a);
+  checks.ownHit = own.status === 200 && own.body?.hits?.length === 1;
+  const wrongTenant = await get(app, "e2emarkeralpha", b);
+  checks.otherTenantEmpty = wrongTenant.status === 200 && wrongTenant.body?.hits?.length === 0;
+  checks.noTokenRefused = (await get(app, "e2emarkeralpha")).status === 401;
+  checks.badTokenRefused = (await get(app, "e2emarkeralpha", `${a.slice(0, -4)}AAAA`)).status === 401;
+  const noLive = await get(searchApp(search, new Set()), "e2emarkeralpha", a);
+  checks.hitWithoutPointerDropped = noLive.status === 200 && noLive.body?.hits?.length === 0;
+  const row = JSON.stringify({ workspace_id: "ws-e2e-a", harness: "claude", session_id: "s-e2e-1", machine_id: "m", event_id: "partial", at: "1", snippet: "e2emarkeralpha" });
+  const cases: Array<[string, () => Response]> = [
+    ["http408PartialRows", () => new Response(`${row}\nCode: 159. DB::Exception: Timeout exceeded`, { status: 408 })],
+    ["http500", () => new Response("Code: 241. DB::Exception: Memory limit", { status: 500 })],
+    ["http200ExceptionAfterRows", () => new Response(`${row}\nCode: 159. DB::Exception: Timeout exceeded`, { status: 200 })],
+    ["streamInterrupted", () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(`${row}\n{"workspace_id":"ws`)); c.error(new Error("connection lost")); } }), { status: 200 })],
+  ];
+  for (const [name, reply] of cases) {
+    let calls = 0;
+    const stub = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => { calls++; return reply(); } });
+    const http = new ClickHouseHttp(`http://127.0.0.1:${stub.port}`, "u", "p");
+    const r = await get(searchApp(new SessionSearchStore(http, http), live), "e2emarkeralpha", a);
+    stub.stop(true);
+    checks[`${name}/refusedWhole`] = r.status === 503 && r.body?.error?.code === "search_unavailable" && r.body?.hits === undefined;
+    checks[`${name}/noRetry`] = calls === 1;
+  }
+  gate("G13_product_read_path", checks, { scope: "real requireAuth and tokens; hydration uses an in-memory live set; not the MCP server or Cloud" });
 }
 
 function recallAt(k: number, got: string[], want: string[]) {
@@ -232,6 +272,53 @@ async function g2Adversarial() {
   checks.boundariesExact = (await walk(a, "nopqrs")).seen.sort().join() === "b-1,b-2";
   checks.punctuationExact = (await walk(a, "a.b_c%d")).seen.join() === "b-5";
   gate("G2b_adversarial_paging", checks, { deepFalse: { pages: deep.pages, sizes: deep.sizes.slice(0, 12) }, countSemantics: "the search page returns no total; an exact count is available from the same filter" });
+}
+
+/** Every filter alone, every pair, and all together, with text, on rows the oracle can scan. */
+async function g12Filters() {
+  const checks: Record<string, boolean> = {};
+  const scope = scopeOf("org-flt", ["ws-flt-a", "ws-flt-b"]);
+  const dims = {
+    workspaceId: ["ws-flt-a", "ws-flt-b"], harness: ["claude", "codex"], machineId: ["m1", "m2"], project: ["p1", "p2"], agent: ["a1", "a2"],
+    kind: ["user", "tool"], taskRef: ["t1", "t2"], tag: ["red", "blue"],
+  };
+  const base = Date.parse("2026-09-01T00:00:00.000Z");
+  const rows = Array.from({ length: 1_536 }, (_, i) => {
+    const pick = <T>(xs: T[], bit: number) => xs[(i >> bit) & 1]!;
+    return {
+      orgId: "org-flt", workspaceId: pick(dims.workspaceId, 0), harness: pick(dims.harness, 1), machineId: pick(dims.machineId, 2), sessionId: `s-${i % 40}`,
+      project: pick(dims.project, 3), agent: pick(dims.agent, 4), kind: pick(dims.kind, 5), taskRef: pick(dims.taskRef, 6), tags: [pick(dims.tag, 7)],
+      eventId: `flt-${i}`, revision: 1, chunkSeq: 0, recordSeq: i, ts: new Date(base + i * 3_600_000).toISOString(), scrubVersion: 1, text: i % 3 === 0 ? "filterneedle" : "otherwords",
+    };
+  });
+  await search.insert(rows);
+  type R = (typeof rows)[number];
+  const FILTERS: Record<string, { option: Record<string, string>; keep: (r: R) => boolean }> = {
+    source: { option: { source: "codex" }, keep: (r) => r.harness === "codex" }, machine: { option: { machineId: "m2" }, keep: (r) => r.machineId === "m2" },
+    project: { option: { project: "p2" }, keep: (r) => r.project === "p2" }, agent: { option: { agent: "a2" }, keep: (r) => r.agent === "a2" },
+    kind: { option: { kind: "tool" }, keep: (r) => r.kind === "tool" }, taskRef: { option: { taskRef: "t2" }, keep: (r) => r.taskRef === "t2" },
+    tag: { option: { tagged: "blue" }, keep: (r) => r.tags.includes("blue") },
+    since: { option: { since: "2026-09-20T00:00:00.000Z" }, keep: (r) => r.ts >= "2026-09-20T00:00:00.000Z" },
+    until: { option: { until: "2026-10-10T00:00:00.000Z" }, keep: (r) => r.ts <= "2026-10-10T00:00:00.000Z" },
+  };
+  const walk = async (option: Record<string, string>, workspaces = scope.workspaceIds) => {
+    const seen: string[] = [];
+    let cursor: string | undefined, guard = 0;
+    do { const r = await search.search(scopeOf(scope.orgId, workspaces), { query: "filterneedle", limit: 20, cursor, ...option }); seen.push(...r.hits.map((h) => h.event_id)); cursor = r.nextCursor ?? undefined; } while (cursor && ++guard < 200);
+    return seen;
+  };
+  const expect = (keep: (r: R) => boolean) => rows.filter((r) => r.text === "filterneedle" && keep(r)).sort((x, y) => (x.ts < y.ts ? 1 : -1)).map((r) => r.eventId);
+  const names = Object.keys(FILTERS);
+  const compare = async (label: string, chosen: string[]) => {
+    const option = Object.assign({}, ...chosen.map((n) => FILTERS[n]!.option));
+    const keep = (r: R) => chosen.every((n) => FILTERS[n]!.keep(r));
+    checks[label] = (await walk(option)).join() === expect(keep).join();
+  };
+  for (const n of names) await compare(n, [n]);
+  for (let i = 0; i < names.length; i++) for (let j = i + 1; j < names.length; j++) await compare(`${names[i]}+${names[j]}`, [names[i]!, names[j]!]);
+  await compare("allFilters", names);
+  checks.workspaceScope = (await walk({}, ["ws-flt-b"])).join() === expect((r) => r.workspaceId === "ws-flt-b").join();
+  gate("G12_filter_matrix", checks, { compounds: Object.keys(checks).length, limit: "project, agent, task ref and tags are copied at index time; a later rename is unhandled. Filter-only listing stays in Supabase." });
 }
 
 async function g3(oracle: Oracle) {
@@ -476,6 +563,7 @@ if (reachedStore) {
   await g2Adversarial();
   const singleShot = await reader.run(`SELECT count() FROM session_search_records WHERE org_id = 'org-1' AND positionCaseInsensitiveUTF8(text, 'deploy') > 0`, {}, { SQL_relay_org: "org-1" });
   report.G2_lexical_recall!.detail = { ...(report.G2_lexical_recall!.detail as object), exactCountStaysAvailable: Number(singleShot.trim()) };
+  await g12Filters();
   await g3(oracle);
   await g4();
   await g5();
@@ -485,7 +573,7 @@ if (reachedStore) {
 }
 report.G9_noisy_neighbour = { status: "INHERITED_FAIL", detail: "#233 gate 7 fails against 2x; not rerun here" };
 report.G11_cost_teardown = { status: "NOT_RUN", detail: "plan in docs/session-search-proof.md; no account exists" };
-for (const id of ["G2_lexical_recall", "G2b_adversarial_paging", "G3_context_recall", "G4_federation", "G5_tenant_isolation", "G7_latency_load", "G8_freshness", "G10_delete_logical"])
+for (const id of ["G2_lexical_recall", "G2b_adversarial_paging", "G12_filter_matrix", "G3_context_recall", "G4_federation", "G5_tenant_isolation", "G7_latency_load", "G8_freshness", "G10_delete_logical"])
   report[id] ??= { status: "NOT_RUN", detail: "G1 blocked" };
 // A proof gate passes only as PASS, so a green job never means the proof passed.
 const open = Object.entries(report).filter(([, g]) => g.status !== "PASS").map(([k, g]) => `${k}=${g.status}`);

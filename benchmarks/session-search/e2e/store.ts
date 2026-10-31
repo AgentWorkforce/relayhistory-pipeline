@@ -10,12 +10,13 @@ export interface SearchRecord {
   orgId: string; workspaceId: string; harness: string; sessionId: string; machineId: string;
   eventId: string; revision: number; chunkSeq: number; recordSeq: number; ts: string;
   kind: string; scrubVersion: number; text: string;
+  project?: string; agent?: string; taskRef?: string; tags?: string[];
 }
 export interface SearchHit {
   workspace_id: string; harness: string; session_id: string; machine_id: string;
   event_id: string; ts: string; snippet: string; citation: string;
 }
-export interface SearchOptions { query: string; limit?: number; since?: string; until?: string; source?: string; machineId?: string; cursor?: string; tag?: string }
+export interface SearchOptions { query: string; limit?: number; since?: string; until?: string; source?: string; machineId?: string; project?: string; agent?: string; kind?: string; taskRef?: string; tagged?: string; cursor?: string; tag?: string }
 export interface ContextEvent { event_id: string; ts: string; kind: string; text: string; is_match: 0 | 1 }
 
 const MAX_LIMIT = 20;
@@ -25,14 +26,15 @@ const DAY_MS = 86_400_000;
 /** Newest first; a final open range covers the rest, so every row stays reachable. */
 const WINDOW_DAYS = [1, 7, 30];
 const TABLE = "session_search_records";
-const COLUMNS = ["org_id", "workspace_id", "harness", "session_id", "machine_id", "event_id", "revision", "chunk_seq", "record_seq", "ts", "kind", "scrub_version", "text"];
+const COLUMNS = ["org_id", "workspace_id", "harness", "session_id", "machine_id", "event_id", "revision", "chunk_seq", "record_seq", "ts", "kind", "scrub_version", "project", "agent", "task_ref", "tags", "text"];
 
 export const schemaSql = (tokenizer = "ngrams(3)") => `
 CREATE TABLE IF NOT EXISTS ${TABLE} (
   org_id String, workspace_id String, harness LowCardinality(String),
   session_id String, machine_id String, event_id String,
   revision UInt64, chunk_seq UInt32, record_seq UInt32,
-  ts DateTime64(3, 'UTC'), kind LowCardinality(String), scrub_version UInt16, text String,
+  ts DateTime64(3, 'UTC'), kind LowCardinality(String), scrub_version UInt16,
+  project String DEFAULT '', agent String DEFAULT '', task_ref String DEFAULT '', tags Array(String) DEFAULT [], text String,
   INDEX text_idx text TYPE text(tokenizer = ${tokenizer}, preprocessor = lower(text)),
   INDEX session_idx session_id TYPE bloom_filter GRANULARITY 1
 ) ENGINE = MergeTree
@@ -81,7 +83,7 @@ export class SessionSearchStore {
     const body = records.map((r) => JSON.stringify({
       org_id: r.orgId, workspace_id: r.workspaceId, harness: r.harness, session_id: r.sessionId, machine_id: r.machineId,
       event_id: r.eventId, revision: r.revision, chunk_seq: r.chunkSeq, record_seq: r.recordSeq, ts: r.ts.replace("T", " ").replace("Z", ""),
-      kind: r.kind, scrub_version: r.scrubVersion, text: r.text,
+      kind: r.kind, scrub_version: r.scrubVersion, project: r.project ?? "", agent: r.agent ?? "", task_ref: r.taskRef ?? "", tags: r.tags ?? [], text: r.text,
     })).join("\n");
     await this.writer.run(`INSERT INTO ${TABLE} (${COLUMNS.join(",")}) FORMAT JSONEachRow`, {}, {
       async_insert: 1, wait_for_async_insert: 1, async_insert_busy_timeout_max_ms: 200,
@@ -108,6 +110,11 @@ export class SessionSearchStore {
     if (o.until) { filters.push("ts <= parseDateTime64BestEffort({until:String}, 3)"); bound.until = o.until; }
     if (o.source) { filters.push("harness = {source:String}"); bound.source = o.source; }
     if (o.machineId) { filters.push("machine_id = {machine:String}"); bound.machine = o.machineId; }
+    if (o.project) { filters.push("project = {project:String}"); bound.project = o.project; }
+    if (o.agent) { filters.push("agent = {agent:String}"); bound.agent = o.agent; }
+    if (o.kind) { filters.push("kind = {kind:String}"); bound.kind = o.kind; }
+    if (o.taskRef) { filters.push("task_ref = {taskRef:String}"); bound.taskRef = o.taskRef; }
+    if (o.tagged) { filters.push("has(tags, {tagged:String})"); bound.tagged = o.tagged; }
     if (o.cursor) {
       const [ts, id] = JSON.parse(Buffer.from(o.cursor, "base64url").toString()) as [string, string];
       filters.push("(ts, event_id) < (parseDateTime64BestEffort({cts:String}, 3), {cid:String})");

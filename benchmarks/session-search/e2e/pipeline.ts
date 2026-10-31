@@ -110,7 +110,11 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
   }
 
   return {
-    courier, store, db, refusals,
+    courier, store, db, refusals, env,
+    readToken: (orgId: string, workspaceId: string) => {
+      const now = Math.floor(Date.now() / 1000);
+      return sign({ sub: "u1", org: orgId, wks: workspaceId, sponsorId: "u1", scopes: ["rth:read"], token_type: "access", iss: ISSUER, aud: ["relayhistory"], iat: now, exp: now + 600 });
+    },
     stop: async () => { globalThis.fetch = realFetch; await db.close(); await rm(root, { recursive: true, force: true }); },
   };
 }
