@@ -198,6 +198,9 @@ function machineClaim(auth: Auth): string | undefined {
   return typeof value === "string" && value ? value : undefined;
 }
 
+const claimRequired = (env: Bindings) =>
+  (env as Record<string, unknown>).MANIFEST_MACHINE_CLAIM === "required";
+
 /**
  * A live write's machine binding: claim, key `m=` and writer agree. A mismatch
  * is always refused. A missing claim is refused when `required`, or once
@@ -213,9 +216,7 @@ function machineClaimIssue(
   if (auth.tokenSubject === MIGRATION_SUBJECT) return undefined;
   const claim = machineClaim(auth);
   if (claim === undefined) {
-    const strict =
-      required ||
-      (env as Record<string, unknown>).MANIFEST_MACHINE_CLAIM === "required";
+    const strict = required || claimRequired(env);
     return strict ? `${MACHINE_CLAIM} is required` : undefined;
   }
   return claim === manifest.session.machine_id &&
@@ -1163,6 +1164,10 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         c.req.query("machine") !== machine ||
         (claim !== undefined && claim !== machine)
       )
+        return c.body(null, 403);
+      // The claimless window is for couriers from before the claim. It closes
+      // with the switch, and the `compat` branch goes when `required` is default.
+      if (claim === undefined && !auth.migration && claimRequired(c.env ?? {}))
         return c.body(null, 403);
       // A migration assertion never reads a client's parked manifest.
       if (

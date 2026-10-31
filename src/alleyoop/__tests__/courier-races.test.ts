@@ -516,6 +516,38 @@ describe("machine claim", () => {
     ).toBe(403);
   });
 
+  test("the claimless status window closes with the switch, on every form", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.run();
+    const version = `machine=${w.machineId}&writer=${w.machineId}`;
+    w.identity.machineClaim = undefined;
+    expect((await status(w, version)).status).toBe(200);
+    expect((await status(w, `${version}&manifest=1`)).status).toBe(200);
+
+    w.env.MANIFEST_MACHINE_CLAIM = "required";
+    expect((await status(w, version)).status).toBe(403);
+    expect((await status(w, `${version}&manifest=1`)).status).toBe(403);
+
+    w.identity.machineClaim = w.machineId;
+    expect(await (await status(w, `${version}&manifest=1`)).json()).toHaveProperty("manifest");
+  });
+
+  test("the courier stays safe when the window closes on it: it defers, never fences", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.run();
+    await w.exporter(w.exportText("pre-t0"));
+    w.env.MANIFEST_MACHINE_CLAIM = "required";
+    w.identity.machineClaim = undefined;
+    await w.write(line(1));
+    await settle(w);
+    expect((await w.state()).sessions["claude:session-a"].fenced).toBeFalsy();
+    w.identity.machineClaim = w.machineId;
+    await settle(w);
+    expect((await w.liveRecords()).lines).toHaveLength(2);
+  });
+
   test("POST refuses a mismatched claim in both modes, and a missing one only when required", async () => {
     for (const mode of ["compat", "required"]) {
       const w = await world({ format: "ndjson" });

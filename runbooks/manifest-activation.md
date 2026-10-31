@@ -25,11 +25,14 @@ identity.
 
 ## Machine claim
 
-`MANIFEST_MACHINE_CLAIM` is `compat` by default: a live write with no
-`meta.machineId` is allowed. Set it to `required` once the issuer ships the
+`MANIFEST_MACHINE_CLAIM` is `compat` by default: a live write or a version-only
+status read with no `meta.machineId` is allowed. Set it to `required` once the issuer ships the
 claim. A mismatched claim is refused in both modes. A takeover and
 `status?manifest=1` need the claim in both modes, so **production rebase and
 takeover stay blocked until the claim ships**.
+
+When `required` becomes the default, delete the `compat` branch and the claimless
+status window rather than leaving them switched off.
 
 The courier gets a claim only through Cloud: set `CLOUD_URL`,
 `CLOUD_TOKEN_COMMAND_JSON` and `MACHINE_ID` (its claimed fleet node id). The
