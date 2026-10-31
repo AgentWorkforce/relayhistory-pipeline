@@ -114,6 +114,7 @@ describe("after every supabase migration", () => {
   test(`the probe reports the RPC exactly when a migration defines it (defined here: ${defined})`, async () => {
     const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
     await db.exec(read("supabase/tests/supabase_shim.sql"));
+    await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
     for (const f of files) await db.exec(read(`supabase/migrations/${f}`));
     const s = await state(db);
     expect(s.search_rpc_present).toBe(defined);

@@ -28,6 +28,12 @@ const scope = { orgId: "o" };
 beforeAll(async () => {
   pg = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await pg.exec(readFileSync(supabase("tests/supabase_shim.sql"), "utf8"));
+  await pg.exec(
+    readFileSync(
+      supabase("bootstrap/session_directory_search_worker.sql"),
+      "utf8",
+    ),
+  );
   for (const file of readdirSync(supabase("migrations/")).sort())
     await pg.exec(readFileSync(supabase(`migrations/${file}`), "utf8"));
 });

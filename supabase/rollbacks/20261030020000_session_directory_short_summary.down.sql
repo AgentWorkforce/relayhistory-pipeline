@@ -6,11 +6,15 @@
 --
 -- Rolling back removes every copy of summary text from the directory (search_text
 -- is rebuilt without it before the columns are dropped), removes the search RPC and
--- the Worker role, and restores #38's index and grants. btree_gin stays installed
+-- the Worker role's USAGE on `sessions`, and restores #38's index and grants. It does
+-- not drop the role: the migration never created it. The role belongs to the
+-- privileged bootstrap (supabase/bootstrap/session_directory_search_worker.sql), and
+-- removing it is a separate operator step in
+-- runbooks/session-directory-search-worker-bootstrap.md. btree_gin stays installed
 -- (CREATE EXTENSION IF NOT EXISTS in the up), as 20261030010000 treats pg_trgm.
 --
--- Run later downs first, in reverse migration order: 20261031001000's functions grant
--- EXECUTE to the Worker role this file drops.
+-- Run later downs first, in reverse migration order (20261031001000 builds on this
+-- one). After this down the role is back to the bootstrap spec, so the up can rerun.
 --
 -- Code only: running it against a hosted database needs the user's OK.
 
@@ -26,7 +30,6 @@ DO $role$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'session_directory_search_worker') THEN
     REVOKE ALL ON SCHEMA sessions FROM session_directory_search_worker;
-    DROP ROLE session_directory_search_worker;
   END IF;
 END
 $role$;

@@ -28,6 +28,7 @@ import {
   openHoopDb,
   waitForHoopDb,
   waitForSchema,
+  schemaVerdict,
 } from "../shared/db.ts";
 import { enrichMessage } from "../shared/enrich.ts";
 import { lockerStore } from "../shared/locker.ts";
@@ -38,7 +39,7 @@ import { healthVerdict, type WorkerHealth } from "../shared/worker.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
-import { expectedMigrationNames } from "../hoopdb/migrate.ts";
+import { expectedSchema } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
 import { allowedOrgIdsFromEnv } from "./org-allowlist.ts";
 import {
@@ -191,7 +192,7 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
   } else {
     const hoop = openHoopDb();
     await waitForHoopDb(hoop);
-    await waitForSchema(hoop, await expectedMigrationNames());
+    await waitForSchema(hoop, await expectedSchema());
     db = hoop;
     transaction = (work) => inTransaction(hoop, work);
   }
@@ -318,22 +319,14 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     const v = healthVerdict(health, Date.now(), { maxFailures, maxTickAgeMs });
     return c.json(v, v.ok ? 200 : 503);
   });
-  // Ready = the schema this image was built for is fully migrated, not just "DB answers".
-  const expected = await expectedMigrationNames();
+  // Ready = the schema this image was built for is fully migrated, the Worker role
+  // validation marker is PASS for this image's generation, AND phase 2 passes live on
+  // this probe (read-only, bounded, uncached), not just "DB answers".
+  const expected = await expectedSchema();
   app.get("/readyz", async (c) => {
     try {
-      const { rows } = await db.query<{ name: string }>(
-        "SELECT name FROM sessions.__96bulls_migrations",
-      );
-      const have = new Set(rows.map((r) => r.name));
-      const missing = expected.filter(
-        (n) => !n.startsWith("shim:") && !have.has(n),
-      );
-      if (missing.length)
-        return c.json(
-          { ok: false, reason: "schema_pending", count: missing.length },
-          503,
-        );
+      const schema = await schemaVerdict(expected, transaction);
+      if (!schema.ok) return c.json(schema, 503);
       const data = await liveDataPathVerdict(process.env);
       if (!data.ok) return c.json({ ok: false, missing: data.missing }, 503);
       return c.json({ ok: true });

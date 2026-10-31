@@ -25,6 +25,7 @@ test("a classified state is projected into the directory", async () => {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
+  await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
     for (const file of readdirSync(join(root, dir))
       .filter((f) => f.endsWith(".sql"))
