@@ -275,7 +275,7 @@ describe("access", () => {
 
   it("can't reach the count writer, the index, or the internal helpers", async () => {
     await expect(
-      call(`SELECT sessions.record_normalized_event_count('o','w','h','s','m',1,1,'k@e',''::bytea,''::bytea,1)`),
+      call("SELECT sessions.record_normalized_event_count(1, $1)", [LEASE]),
     ).rejects.toMatchObject({ code: "42501" });
     await expect(call("SELECT 1 FROM sessions.session_index")).rejects.toMatchObject({ code: "42501" });
     await expect(call("SELECT sessions.file_normalize_held_job(1, $1)", [LEASE])).rejects.toMatchObject({ code: "42501" });
