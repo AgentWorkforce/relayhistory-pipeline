@@ -17,6 +17,14 @@ create table if not exists sessions.backfill_activation_ready (
   primary key (manifest_key, grant_id)
 );
 
+-- Service-role only, like every other pipeline table: RLS on with no policy.
+ALTER TABLE sessions.manifest_readiness ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.manifest_readiness FROM PUBLIC, anon, authenticated;
+GRANT ALL ON sessions.manifest_readiness TO service_role;
+ALTER TABLE sessions.backfill_activation_ready ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.backfill_activation_ready FROM PUBLIC, anon, authenticated;
+GRANT ALL ON sessions.backfill_activation_ready TO service_role;
+
 -- The new queued stage. The span stages stay allowed where they were.
 ALTER TABLE sessions.pipeline_events DROP CONSTRAINT pipeline_events_stage_check;
 ALTER TABLE sessions.pipeline_events ADD CONSTRAINT pipeline_events_stage_check
