@@ -22,8 +22,8 @@ implementations own provider adapters.
   nodes, a private control-plane endpoint, operator CIDRs only, Workload
   Identity Federation, Dataplane V2, Shielded Nodes, VPC-native ranges, one
   reserved NAT address with translation logs, and VPC flow logs. The default
-  pool is explicitly limited to two `e2-medium` nodes in `us-central1-a`; it is
-  not two nodes per zone. A single node exposes only about 940m allocatable CPU,
+  pool is explicitly limited to three `e2-medium` nodes in `us-central1-a`; it is
+  not three nodes per zone. A single node exposes only about 940m allocatable CPU,
   and the GKE system pods plus RelayAuth leave too little capacity for even the
   smallest 96Bulls pod request. The node identity is a dedicated service
   account with no key and only `roles/container.defaultNodeServiceAccount`.

@@ -383,7 +383,7 @@ describe("GCP self-host contract", () => {
     expect(GCP_RUNTIME_SHAPE.privateEndpoint).toBe(true);
     expect(GCP_RUNTIME_SHAPE.autopilot).toBe(false);
     expect(GCP_RUNTIME_SHAPE.nodeLocation).toBe("us-central1-a");
-    expect(GCP_RUNTIME_SHAPE.initialNodeCount).toBe(2);
+    expect(GCP_RUNTIME_SHAPE.initialNodeCount).toBe(3);
     expect(GCP_RUNTIME_SHAPE.natIpAllocateOption).toBe("MANUAL_ONLY");
     expect(GCP_RUNTIME_SHAPE.natLogFilter).toBe("ALL");
     expect(GCP_NODE_ROLES).toEqual([

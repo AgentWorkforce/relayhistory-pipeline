@@ -92,9 +92,10 @@ export const GCP_RUNTIME_SHAPE = {
   machineType: "e2-medium",
   // One e2-medium exposes only ~940m allocatable CPU after GKE reservations;
   // system pods plus RelayAuth consume ~921m before the 96Bulls release starts.
-  // Two nodes are the minimum shape that can schedule the migration and four
+  // Each additional node also carries GKE DaemonSet reservations, so three
+  // nodes are the minimum shape that can schedule the migration and four
   // runtime Deployments together.
-  initialNodeCount: 2,
+  initialNodeCount: 3,
   natIpAllocateOption: "MANUAL_ONLY",
   natLogFilter: "ALL",
   nodeOauthScope: "https://www.googleapis.com/auth/cloud-platform",
