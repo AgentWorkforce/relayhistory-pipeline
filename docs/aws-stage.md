@@ -422,6 +422,27 @@ PostgREST may reach the CNPG HoopDb; nothing else. The stage refuses it unless
 (the search-token exchange carries an API key and a user token). Wiring the
 PostgREST Deployment is a follow-up once #48, #72 and #73 land.
 
+### Fresh proof stage `aws-proof`
+
+The end-to-end proof runs on its own stage, `aws-proof` (cluster
+`96bulls-aws-proof`), in the same account and region as `aws-sessions-dev`,
+which keeps running undisturbed and gets the same hardening in place. Start
+from `stacks/aws/examples/aws-proof.inputs.example.json` (copy it to
+`.96bulls/aws-proof/aws-inputs.json` and fill every `<...>`). It turns on
+everything: CNPG HoopDb, self-hosted RelayAuth with in-cluster TLS, Relaycast,
+the WAF'd internet-facing ingest on its own hostname
+(`proof-sessions.agentrelay.com`; DNS zone, token Secret and an optional
+`certValidation` are inputs), private API plus the operator CIDR.
+
+The stage owns its VPC, cluster, KMS keys, Locker, trail, ALB-log bucket and
+budget (all named `96bulls-aws-proof-*`). `accountShared.ownerStage:
+"aws-sessions-dev"` makes it reuse the account-wide pieces that stage already
+owns: the `96bulls-services` ECR repository (so `eks.imageDigest` is a digest
+in that repository), the GitHub OIDC provider and the publisher role. Before
+the first apply, create its Secrets from 1Password as for sessions-dev
+(`96bulls-runtime` without `HOOPDB_URL`, which CNPG supplies; `relayauth`;
+`kube-system/cloudflare-dns`).
+
 ### aws-inputs.json additions (proof stage)
 
 ```json

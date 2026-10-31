@@ -28,8 +28,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
 import { eksStage } from "./eks.ts";
-import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy, type HoopDbBackend } from "./hardening.ts";
-import type { IngestExposureInput, RelaycastInputs } from "./proof-addons.ts";
+import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy } from "./hardening.ts";
+import { sharedServicesRepository, validateAwsInputs, type AwsInputs } from "./inputs.ts";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -41,40 +41,7 @@ const REPO = "AgentWorkforce/96BullSessions";
  */
 const OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/96BullSessions@1437714333";
 
-/** Written by hand (not by the CLI) once Khaliq clears the account: see docs/aws-stage.md. */
-interface AwsInputs {
-  /** The target account id, repeated on the command line to deploy. */
-  accountId: string;
-  region: string;
-  /** Khaliq's words, verbatim, with the date: the record that the stage was cleared. */
-  clearedBy: string;
-  budgetUsd: number;
-  budgetEmail: string;
-  /** Where HoopDb lives (RDS/Supabase URL in Secrets Manager); not created here. */
-  hoopdbSecretArn?: string;
-  /** Khaliq, 2026-10-28: EKS is the first cloud compute target. Omit to declare the baseline only. */
-  eks?: {
-    chartVersion: string; runtimeSecretName: string; tenantOrgId: string; relayauthJwksUrl: string; relayhistoryOrigin: string; relayauthIssuer?: string;
-    relayauth?: { chartVersion: string; secretName: string };
-    /** The digest publish-image-ecr pushed to THIS account's repository (each account builds its own). Bare `sha256:<64 hex>`; tags are refused. */
-    imageDigest: string;
-    /** The full 40-hex commit that image was built from. Required: the stage refuses an image without source provenance. */
-    imageSourceRevision: string;
-    /** EKS API: private endpoint always; public only for these operator CIDRs (omit or [] = private only; never 0.0.0.0/0). */
-    apiAccess?: { publicAccessCidrs?: string[] };
-    /** HoopDb: "external" (default; HOOPDB_URL from runtimeSecretName, i.e. Supabase) or "cnpg" (in-cluster, proof stage only). */
-    hoopdb?: { backend?: HoopDbBackend };
-    /** Relaycast core chart; chartVersion and imageDigest are inputs so 0.2.0 slots in without a code change. */
-    relaycast?: RelaycastInputs;
-    /** Search-path NetworkPolicies for the #73 PostgREST profile (follow-up wires the Deployment). Needs cnpg + relayauth. */
-    sessionDirectory?: { enabled: boolean };
-    /** Ingest hostname on Cloudflare DNS (needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID at deploy). scheme defaults to internet-facing; WAF always attached. */
-    ingress?: { hostname: string; cloudflareZoneId: string; zoneDomain: string; cloudflareTokenSecret: string; certValidation?: { name: string; value: string } } & IngestExposureInput;
-  };
-  /** Khaliq, 2026-10-28: dev HoopDb is a Supabase project in the org the 96Bulls team owns. */
-  supabase?: { organizationId: string; projectName: string; region: string; plan?: "free" | "pro"; dbPassRef: string };
-}
-
+/** Written by hand (not by the CLI) once Khaliq clears the account: see docs/aws-stage.md and stacks/aws/inputs.ts. */
 function readInputs(stage: string): AwsInputs {
   const path = join(ROOT, ".96bulls", stage, "aws-inputs.json");
   let inputs: AwsInputs;
@@ -87,6 +54,7 @@ function readInputs(stage: string): AwsInputs {
   if (process.env.NINETY_SIX_BULLS_CONFIRM_ACCOUNT !== inputs.accountId)
     throw new Error("96bulls: set NINETY_SIX_BULLS_CONFIRM_ACCOUNT=<account id> to run the AWS stage; nothing was created");
   assertRegion(inputs.region);
+  validateAwsInputs(stage, inputs);
   return inputs;
 }
 
@@ -174,21 +142,25 @@ export default Alchemy.Stack(
     });
 
     // ECR: the hosted service image lives in the account, private (Khaliq, 2026-10-28: not public).
-    const ecr = yield* AWS.ECR.Repository("services-image", {
-      repositoryName: "96bulls-services",
-      imageTagMutability: "IMMUTABLE",
-      scanOnPush: true,
-      // Expire only untagged leftovers (failed or superseded multi-arch pushes). Published images are
-      // tagged sha-<commit> and never expire automatically, so a pinned, deployed digest is never deleted.
-      lifecyclePolicyText: JSON.stringify({
-        rules: [{ rulePriority: 1, description: "expire untagged images after 14 days", selection: { tagStatus: "untagged", countType: "sinceImagePushed", countUnit: "days", countNumber: 14 }, action: { type: "expire" } }],
-      }),
-      tags: tags(stage, "ecr"),
-    });
+    // A second stage in the account (accountShared) uses the owner stage's repository.
+    const ecr = inputs.accountShared
+      ? undefined
+      : yield* AWS.ECR.Repository("services-image", {
+          repositoryName: "96bulls-services",
+          imageTagMutability: "IMMUTABLE",
+          scanOnPush: true,
+          // Expire only untagged leftovers (failed or superseded multi-arch pushes). Published images are
+          // tagged sha-<commit> and never expire automatically, so a pinned, deployed digest is never deleted.
+          lifecyclePolicyText: JSON.stringify({
+            rules: [{ rulePriority: 1, description: "expire untagged images after 14 days", selection: { tagStatus: "untagged", countType: "sinceImagePushed", countUnit: "days", countNumber: 14 }, action: { type: "expire" } }],
+          }),
+          tags: tags(stage, "ecr"),
+        });
 
     // GitHub OIDC: the only way CI reaches the account, and only to push the services image.
-    // Sandbox accounts get neither (their boundary forbids new OIDC providers and trust edits).
-    const deployer = isSandbox
+    // Sandbox accounts get neither (their boundary forbids new OIDC providers and trust edits), and
+    // a stage sharing the account (accountShared) relies on the owner stage's provider and role.
+    const deployer = isSandbox || inputs.accountShared
       ? undefined
       : yield* Effect.gen(function* () {
           const oidc = yield* AWS.IAM.OpenIDConnectProvider("github-oidc", {
@@ -232,7 +204,7 @@ export default Alchemy.Stack(
           relayhistoryOrigin: inputs.eks.relayhistoryOrigin,
           ...(inputs.eks.relayauthIssuer ? { relayauthIssuer: inputs.eks.relayauthIssuer } : {}),
           ...(inputs.eks.relayauth ? { relayauth: inputs.eks.relayauth } : {}),
-          imageRepository: ecr.repositoryUri as unknown as string,
+          imageRepository: ecr ? (ecr.repositoryUri as unknown as string) : sharedServicesRepository(inputs.accountId, inputs.region),
           imageDigest: inputs.eks.imageDigest,
           imageSourceRevision: inputs.eks.imageSourceRevision,
           ...(inputs.eks.apiAccess ? { apiAccess: inputs.eks.apiAccess } : {}),
@@ -254,7 +226,7 @@ export default Alchemy.Stack(
       accountId: inputs.accountId,
       region: inputs.region,
       locker: { bucket: locker.bucketName, kmsKeyArn: key.keyArn },
-      imageRepository: ecr.repositoryUri,
+      imageRepository: ecr ? ecr.repositoryUri : sharedServicesRepository(inputs.accountId, inputs.region),
       deployerRoleArn: deployer?.roleArn ?? null,
       hoopdbSecretArn: inputs.hoopdbSecretArn ?? null,
     };
