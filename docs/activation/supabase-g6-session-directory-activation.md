@@ -36,22 +36,23 @@ Rules for the record:
 
 ### Fields that are NOT OBSERVED
 
-| field                                                                                                              | status                                                        | how to fill it once Khaliq authorizes it (read-only) | section |
-| ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------- | ---------------------------------------------------- | ------- |
-| Server version                                                                                                     | **NOT OBSERVED**                                              | P1                                                   | 1, 4    |
-| Live role identity of the bootstrap and migrator connections                                                       | **NOT OBSERVED**                                              | P2                                                   | 3, 4    |
-| Live runtime HOOPDB identity (the role the services connect as)                                                    | **NOT OBSERVED**                                              | RT1 (or R1 + R2)                                     | 3.4     |
-| Whether that runtime identity can run the live validator read-only                                                 | **NOT OBSERVED**                                              | RT2, RT3, RT4, RT5                                   | 3.4     |
-| Effective privileges (role attributes, ACLs, default ACLs, RLS, dependencies and ownership for each role involved) | **NOT OBSERVED**                                              | P2, P3, P3b, P4, A1 to A10                           | 3, 4.1  |
-| Installed migration state: the `sessions.__96bulls_migrations` ledger                                              | **NOT OBSERVED**                                              | P6, P7                                               | 2, 4    |
-| Installed migration state: the `sessions.__96bulls_role_validation` marker                                         | **NOT OBSERVED**                                              | P8                                                   | 4, 8    |
-| Installed migration state: any Supabase CLI ledger                                                                 | **NOT OBSERVED**                                              | P9                                                   | 2, 9    |
-| Lock observations (live sessions, held locks, migrator advisory lock, table sizes)                                 | **NOT OBSERVED**                                              | P14, P15, P16, P17                                   | 6       |
-| Runtime secret target (which Kubernetes Secret and key, and which 1Password item, the services use)                | **NOT OBSERVED**                                              | R1, R2                                               | 3.4     |
-| Backup and PITR availability for the project                                                                       | **NOT OBSERVED**                                              | S1                                                   | 7.1     |
-| Orchestrator readiness behavior for ingest and workers (which probe path, what traffic does on 503)                | **NOT OBSERVED**                                              | O1                                                   | 6.4     |
-| Deployed reader images, their revisions (#96+ or pre-#96) and the generation they expect                           | **NOT OBSERVED**                                              | D1, D2, D3                                           | 6.4     |
-| How the runtime Secret is synced from 1Password (resource kind and `itemPath`)                                     | **NOT OBSERVED**; the repo defines no sync resource (unknown) | R1c to R1g                                           | 3.4     |
+| field                                                                                                                                     | status                                                        | how to fill it once Khaliq authorizes it (read-only) | section |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | ---------------------------------------------------- | ------- |
+| Server version                                                                                                                            | **NOT OBSERVED**                                              | P1                                                   | 1, 4    |
+| Live role identity of the bootstrap and migrator connections                                                                              | **NOT OBSERVED**                                              | P2                                                   | 3, 4    |
+| Live runtime HOOPDB identity (the role the services connect as)                                                                           | **NOT OBSERVED**                                              | RT1 (or R1 + R2)                                     | 3.4     |
+| Whether that runtime identity can run the live validator read-only                                                                        | **NOT OBSERVED**                                              | RT2, RT3, RT4, RT5                                   | 3.4     |
+| Effective privileges (role attributes, ACLs, default ACLs, RLS, dependencies and ownership for each role involved)                        | **NOT OBSERVED**                                              | P2, P3, P3b, P4, A1 to A10                           | 3, 4.1  |
+| Installed migration state: the `sessions.__96bulls_migrations` ledger                                                                     | **NOT OBSERVED**                                              | P6, P7                                               | 2, 4    |
+| Installed migration state: the `sessions.__96bulls_role_validation` marker                                                                | **NOT OBSERVED**                                              | P8                                                   | 4, 8    |
+| Installed migration state: any Supabase CLI ledger                                                                                        | **NOT OBSERVED**                                              | P9                                                   | 2, 9    |
+| Lock observations (live sessions, held locks, migrator advisory lock, table sizes)                                                        | **NOT OBSERVED**                                              | P14, P15, P16, P17                                   | 6       |
+| Runtime secret target (which Kubernetes Secret and key, and which 1Password item, the services use)                                       | **NOT OBSERVED**                                              | R1, R2                                               | 3.4     |
+| Backup and PITR availability for the project                                                                                              | **NOT OBSERVED**                                              | S1                                                   | 7.1     |
+| Orchestrator readiness behavior for ingest and workers (which probe path, what traffic does on 503)                                       | **NOT OBSERVED**                                              | O1                                                   | 6.4     |
+| Deployed reader images, their revisions (#96+ or pre-#96) and the generation they expect                                                  | **NOT OBSERVED**                                              | D1, D2, D3                                           | 6.4     |
+| How the runtime Secret is synced from 1Password (resource kind and `itemPath`)                                                            | **NOT OBSERVED**; the repo defines no sync resource (unknown) | R1c to R1g                                           | 3.4     |
+| `authenticator` memberships, exposed schemas, `sessions` `USAGE`, per-function effective `EXECUTE`, default ACLs and event triggers (B15) | **NOT OBSERVED**                                              | Y1 to Y7                                             | 4.2     |
 
 ## 1. Target and observed server version
 
@@ -555,7 +556,7 @@ kubectl --context <prod context> -n <namespace> get secret <secret name from R1a
 kubectl --context <prod context> -n <namespace> get secret <secret name from R1a> -o go-template='owners:{{range .metadata.ownerReferences}} {{.kind}}/{{.name}}{{end}}{{"\n"}}managers:{{range .metadata.managedFields}} {{.manager}}({{.operation}}){{end}}{{"\n"}}annotation-keys:{{range $k, $v := .metadata.annotations}} {{$k}}{{end}}{{"\n"}}label-keys:{{range $k, $v := .metadata.labels}} {{$k}}{{end}}{{"\n"}}'
 
 # R1d: is any 1Password or External Secrets controller installed? (CRD names only)
-kubectl --context <prod context> get crd -o name | grep -i -E 'onepassword|externalsecret|secretstore' || echo "no sync CRDs"
+kubectl --context <prod context> get crd -o name | grep -i -E 'onepassword|externalsecret|secretstore|sealedsecret|secretproviderclass|vault|sops' || echo "no matching secret CRDs"
 
 # R1e: only if R1d lists onepassworditems.onepassword.com: the item path each one maps to its Secret
 kubectl --context <prod context> -n <namespace> get onepassworditems.onepassword.com -o jsonpath='{range .items[*]}{.metadata.name}{"\titemPath="}{.spec.itemPath}{"\n"}{end}'
@@ -592,14 +593,30 @@ Expected:
   Khaliq's record.
 - With a manual pipe, the item comes only from the operator's record, and is unknown
   until Khaliq states it.
+- **Supported paths.** R1 recognizes exactly three paths:
+  1. **1Password Operator:** R1c shows an owner `OnePasswordItem/<name>`, and R1e gives
+     its `itemPath`.
+  2. **External Secrets plus a proved 1Password provider:** R1c shows an owner
+     `ExternalSecret/<name>`, R1f names its store, and R1g shows provider type
+     `onepassword` or `onepasswordSDK` for that exact store.
+  3. **Documented manual kubectl pipe:** R1c shows no owner, and the only managers are
+     `kubectl-client-side-apply`, `kubectl-create`, `kubectl-patch`, `kubectl-edit` or
+     `kubectl`. The item then comes from Khaliq's record.
 - **STOP / UNKNOWN outcomes.** Record `UNKNOWN`, stop R1 and R2, and take it to Khaliq
   without guessing an item when:
   - R1c shows an owner kind other than `OnePasswordItem` or `ExternalSecret`;
-  - R1d lists a sync CRD other than `onepassworditems.onepassword.com` or
-    `externalsecrets.external-secrets.io`;
-  - R1g shows a provider type other than a 1Password one;
-  - the referenced store does not exist;
-  - managers cannot be attributed.
+  - R1c shows **no owner, but a clearly attributed manager or controller that is not one
+    of the three supported paths**, for example `sealed-secrets-controller`, a Secrets
+    Store CSI driver, a Vault agent or injector, SOPS or a GitOps controller, or any
+    manager other than the kubectl managers listed above. This applies even when the
+    controller is well known;
+  - R1d lists a secret-sync CRD other than `onepassworditems.onepassword.com` or
+    `externalsecrets.external-secrets.io`, and R1c attributes the Secret to it;
+  - R1g shows a provider type other than `onepassword` or `onepasswordSDK`, or the
+    referenced store does not exist;
+  - the managers cannot be attributed.
+- In every case R1 prints names, kinds, manager names, keys and `itemPath` only. Never
+  print a Secret's values, its annotation values, or the Secret as JSON or YAML.
 
 **R2** (needs Khaliq's OK; titles and field labels only, never values), run only after
 R1 has named the item:
@@ -698,6 +715,10 @@ Expected after the apply, for the G6 tables, from the migrations:
 - `session_directory_search_token_policy`: owner only.
 - `__96bulls_role_validation`: no `PUBLIC` (with #99: `SELECT` for the runtime role).
 - `session_directory_search_worker` appears on **no** relation.
+- `service_role`'s broad `ALL` on the `sessions` tables comes from `20261025000000` lines
+  527 and 528, plus later explicit grants. It is the recorded trusted-admin decision in
+  4.2, not a violation. `authenticated` and `anon` must have nothing beyond the grants
+  listed here.
 
 **A2: column ACLs (`pg_attribute.attacl`)**
 
@@ -930,6 +951,105 @@ Expected after the apply:
   is false when only column grants exist; A2 shows those.
 - The runtime role has `sel = t` on both `__96bulls_*` tables and `upd = f`.
 
+### 4.2 Authorization prerequisite: PUBLIC EXECUTE on future functions (blocker B15)
+
+**The gap.** Exposure is not the problem; PUBLIC `EXECUTE` on future functions is.
+PostgreSQL grants `EXECUTE` to `PUBLIC` on every new function by default. A function
+created in `sessions` after the last PASS therefore stays PUBLIC-executable until someone
+revokes it. Any role with `USAGE` on `sessions` can call it directly, and so can
+PostgREST's `/rpc/<name>` for any role `authenticator` can switch to, while `sessions` is
+an exposed schema.
+
+- The migrations' `DO $revoke$` blocks strip non-owner `EXECUTE` only from the functions
+  they create, at creation time.
+- Phase 2 checks only grants that name `session_directory_search_worker`, and it ignores
+  `PUBLIC`.
+- The live gate sees drift only when a reader next checks readiness. It does not stop a
+  call.
+
+**The required end state.** Every intended RPC has explicit `EXECUTE` grants to the exact
+API roles that need it, and `PUBLIC` is revoked. Functions created later do not become
+PUBLIC-executable.
+
+Production activation stays blocked until **one** of these is proved and approved by
+Khaliq:
+
+- **(A) Owner-scoped global default revoke.** Run
+  `ALTER DEFAULT PRIVILEGES FOR ROLE <creator role> REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;`
+  for every role that creates functions in `sessions`. It comes with an ACL manifest:
+  Y4 and Y6 before and after, listing every function whose effective `EXECUTE` changes,
+  and every caller that relies on PUBLIC `EXECUTE` today. Khaliq approves the blast
+  radius.
+  - **Or an equivalent durable control**, for example a reviewed schema-specific event
+    trigger that revokes `PUBLIC` `EXECUTE` on every function created in `sessions`.
+  - The repo contains neither, nor a manifest: unknown. Either one is a privilege change
+    and needs its own OK.
+- **(B) No untrusted path to `sessions`.** Prove two things. First, PostgREST does not
+  expose `sessions` (`db_schemas`). Second, no untrusted role (`anon`, `authenticated`
+  or similar) has `USAGE` on `sessions`, directly or through membership, or a direct
+  database path. (B) is not weakened here: if any one of these holds, (B) is unsatisfied.
+
+**What the repo says (B) faces.** The `sessions` RPCs are intentionally reachable through
+PostgREST and `authenticator`:
+
+- `20261025000000_sessions_index.sql` line 522 runs `GRANT USAGE ON SCHEMA sessions TO
+authenticated, service_role;`.
+- The search RPC is called as PostgREST `POST /rpc/search_session_directory` with
+  `Content-Profile: sessions` (`src/hoopdb/search-query.ts`,
+  `src/hoopdb/search-index-contract.ts`, `docs/aws-e2e-proof.md`).
+- The Worker reaches it through the separately approved `GRANT
+session_directory_search_worker TO authenticator` binding.
+
+On that design (B) is unsatisfied by repo design, and activation requires (A) or an
+equivalent reviewed durable control. The queries below record the live state. They do not change the requirement.
+
+**`service_role`: a broad, trusted-admin decision (not the PUBLIC-boundary blocker).**
+
+- `20261025000000_sessions_index.sql` lines 527 and 528 run `GRANT ALL ON ALL TABLES IN
+SCHEMA sessions TO service_role;` and `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions
+TO service_role;`.
+- `20261025000100_repo_identity.sql` line 689 and `20261025000200_scrub_quarantine.sql`
+  line 197 repeat `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions TO service_role;`.
+- `ON ALL …` covers only the objects that exist when each statement runs. Later files
+  grant `service_role` explicitly (for example `GRANT ALL ON sessions.session_directory…
+TO service_role`).
+- The G6 files revoke `service_role` explicitly from the Worker RPCs:
+  `search_session_directory`, `session_directory_pointers`,
+  `session_directory_readiness` and `session_directory_worker_scope`, plus
+  `session_directory_record_fences` and `session_directory_search_token_policy`.
+
+`service_role` is the trusted, privileged backend role, so this breadth is recorded as an
+explicit trusted-admin decision for Khaliq. It is not part of B15. It belongs in the ACL
+manifest as expected:
+
+- `service_role`: `USAGE` on `sessions`; `ALL` on the tables those files cover;
+  `EXECUTE` on the functions those files cover; **not** `EXECUTE` on the four Worker RPCs
+  above; no rights on the token policy table.
+- `authenticated`, `anon` and `session_directory_search_worker` **must not be broadened**:
+  - `authenticated` keeps exactly the migrations' explicit grants (Y3 and Y4; A1 and A2);
+  - `anon` keeps none;
+  - the Worker keeps exactly phase 2's allowlist.
+
+  An `ON ALL …` or default-privilege grant to any of the three is a violation.
+
+**Evidence queries.** Read-only, names and booleans only, each needs Khaliq's OK. **All
+NOT OBSERVED.** Record each in the section 0 format.
+
+| id  | maps                                                                                                                                                      | query                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | expected under (A) or (B)                                                                                                                                                                                                          | observed     |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| Y1  | `authenticator` memberships: the roles PostgREST can switch to                                                                                            | `SELECT g.rolname AS can_become, m.admin_option, r.rolinherit AS authenticator_inherits FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = 'authenticator' ORDER BY 1;`                                                                                                                                                                                                                                                                                                                                                                                     | recorded. Every `can_become` role is an API role that Y4 must cover.                                                                                                                                                               | NOT OBSERVED |
+| Y2  | exposed schemas, from in-database PostgREST config. Prints only the `pgrst.db_schemas` entry; every other setting, including any secret, is filtered out. | `SELECT r.rolname, s.setdatabase, x AS db_schemas_setting FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole CROSS JOIN LATERAL unnest(s.setconfig) AS x WHERE r.rolname = 'authenticator' AND x LIKE 'pgrst.db\_schemas=%';`                                                                                                                                                                                                                                                                                                                                                                                 | (B): no row listing `sessions`. (A): recorded.                                                                                                                                                                                     | NOT OBSERVED |
+| Y2b | exposed schemas, if not set in the database                                                                                                               | the project's API settings ("exposed schemas"), read by Khaliq. Where Supabase keeps this is not stated in the repo: unknown.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | as Y2                                                                                                                                                                                                                              | NOT OBSERVED |
+| Y3  | `USAGE` on `sessions`, effective (membership-aware) and direct-or-PUBLIC                                                                                  | `SELECT r.rolname, has_schema_privilege(r.oid, 'sessions', 'USAGE') AS usage_effective, EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a WHERE n.nspname = 'sessions' AND a.grantee IN (r.oid, 0) AND a.privilege_type = 'USAGE') AS usage_direct_or_public FROM pg_roles r WHERE r.rolname IN ('anon', 'authenticated', 'authenticator', 'service_role', 'session_directory_search_worker') ORDER BY 1;`                                                                                                                                                              | (B): `anon` and `authenticated` `f`. As designed: `authenticated`, `service_role` and the Worker `t`.                                                                                                                              | NOT OBSERVED |
+| Y4  | effective `EXECUTE` per `sessions` function, per API role                                                                                                 | `SELECT p.oid::regprocedure AS function, has_function_privilege('anon', p.oid, 'EXECUTE') AS anon, has_function_privilege('authenticated', p.oid, 'EXECUTE') AS authenticated, has_function_privilege('service_role', p.oid, 'EXECUTE') AS service_role, has_function_privilege('session_directory_search_worker', p.oid, 'EXECUTE') AS search_worker, EXISTS (SELECT 1 FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE') AS public_execute FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'sessions' ORDER BY 1;` | `public_execute = f` on every function. Each `t` is an intended, explicit grant listed in the ACL manifest. After the apply, `search_worker` is `t` exactly on the three approved RPCs.                                            | NOT OBSERVED |
+| Y5  | direct login path for untrusted roles                                                                                                                     | `SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname IN ('anon', 'authenticated') ORDER BY 1;`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `rolcanlogin = f`                                                                                                                                                                                                                  | NOT OBSERVED |
+| Y6  | default privileges that grant `EXECUTE` to PUBLIC on new functions                                                                                        | `SELECT pg_get_userbyid(d.defaclrole) AS creator, n.nspname AS in_schema, a.privilege_type, a.grantee = 0 AS to_public FROM pg_default_acl d LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace CROSS JOIN LATERAL aclexplode(d.defaclacl) a WHERE d.defaclobjtype = 'f' ORDER BY 1, 2;`                                                                                                                                                                                                                                                                                                                               | Under (A), after the revoke: a row per function creator showing the revoke is in effect, and no `to_public = t`. Before it: recorded. With no `pg_default_acl` row for a creator, the built-in default (PUBLIC `EXECUTE`) applies. | NOT OBSERVED |
+| Y7  | event triggers, for the "equivalent durable control" option                                                                                               | `SELECT evtname, evtevent, evtenabled, evtfoid::regprocedure AS function, evttags FROM pg_event_trigger ORDER BY 1;`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | under the event-trigger option: the reviewed trigger, enabled, on `ddl_command_end` for `CREATE FUNCTION`. Otherwise: recorded.                                                                                                    | NOT OBSERVED |
+
+Y3 and Y4 name `session_directory_search_worker`, and `has_*_privilege` raises `42704`
+for a role that does not exist. Before phase 1 has created the Worker, drop that role
+from Y3 and the `search_worker` column from Y4, and record that.
+
 ## 5. Apply sequence (placeholders only; every step needs Khaliq's explicit OK)
 
 No connection string appears here, by design. `<…>` marks a value supplied at execution
@@ -1114,7 +1234,7 @@ the repo has no timing evidence against production-shaped data.
 The G6-only statement detail is in 6.1. Lock levels are PostgreSQL's documented levels
 for each statement type, not observations.
 
-### 6.4 Readiness outage: zero downtime cannot be guaranteed
+### 6.4 Readiness and availability risk: zero downtime cannot be guaranteed
 
 **Zero downtime cannot be guaranteed for this activation.** Whether readers go unready,
 and how many, depends on which images are deployed now. The deployed images and their
@@ -1181,8 +1301,9 @@ The D3 generation applies only to `#96+` revisions. Before relying on it, confir
 
 Record, per deployment: the image, the digest, the revision, `#96+` or `pre-#96`, and the
 generation. Compare with P8 (the marker's current generation and status). If every reader
-is pre-#96, the marker flip makes none of them unready, and the outage comes only from the
-locks. If any reader is #96+, all #96+ readers go unready during the window.
+is pre-#96, the marker flip makes none of them unready. What remains is an availability
+and latency risk from the locks: requests may block or time out while a lock is held. It
+is not a guaranteed outage. If any reader is #96+, all #96+ readers go unready during the window.
 
 **#96+ reader non-ready window** ≈ the migrate duration (unknown) + the time to roll every
 #96+ reader to the new generation (unknown). This is the window in which #96+ readers
@@ -1318,8 +1439,9 @@ hosted target: unknown.
 | B10 | **Rollback limits.** No down for `20261030010000`. The downs leave ledger rows behind, and the repo has no procedure for re-applying after a down. The role is removed only by the separate superuser step.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 7                                                                                                             |
 | B11 | **Stale documentation to fix before activation** (docs only, not schema): (a) `docs/session-search-index-contract.md`, the "Caller" row of the search RPC table, still says "the migration's first statement creates the role … fails closed with `42710` … The down path drops the role it owns". Its "Rollback" bullet also says the down drops the "Worker role". Both contradict #96, where the migration never creates the role, failures are `42704` and `55000`, and the down never drops it. (b) The runbook ("Rehearsal databases") gives the new sha256 of `20261030020000` as `f86e5dc9...0d66`. The file at `28a8f0d` hashes to `c223b77e…5918de4`. Draft PR #99 (pending) corrects the runbook value and pins it with a test.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | contract doc; runbook                                                                                         |
 | B12 | **Authorization for every step above, in Khaliq's own words:** the read-only audit (section 4, 4.1, RT1 to RT5, R1, R2, O1, S1 to S3), phase 1, migrate, any external verifier run, any deploy, and the B6/B9 privilege and credential steps.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | `AGENTS.md`                                                                                                   |
-| B13 | **Zero downtime cannot be guaranteed.** If the deployed readers are #96+, all of them go unready from the pending marker write until phase 2 passes, and until every reader runs the new generation. Pre-#96 readers ignore the marker but still hit the locks. The deployed images and their generation are NOT OBSERVED (D1 to D3). On top of that, the `ACCESS EXCLUSIVE` locks in 6.3 apply. The traffic impact depends on the orchestrator's readiness behavior (O1, NOT OBSERVED). Khaliq must accept an outage window or decide on a write hold.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 6.4                                                                                                           |
+| B13 | **Zero downtime cannot be guaranteed; a user-visible outage is not asserted.** If the deployed readers include #96+ images, those readers are non-ready from the pending marker write until phase 2 passes, and until each runs the new generation (the #96+ reader non-ready window, 6.4). Pre-#96 readers ignore the marker. Whether any of this is user-visible, and for how long, is conditional on three things: the deployed reader mix (D1 to D3), the orchestrator's traffic behavior on `/readyz` 503 (O1), and the lock durations in 6.3. Those durations depend on the existing-data state (P7, P14), and the locks create availability and latency risk, not a guaranteed outage. All of these inputs are NOT OBSERVED. Once they are observed, Khaliq decides whether a maintenance window, a write hold or neither is needed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 6.4                                                                                                           |
 | B14 | **Snapshot recovery decision.** 15 of the 17 files have no down file (7.1). Three of them destroy or rewrite data on a backlog run. PITR and backup availability are NOT OBSERVED (S1). Decide whether a fresh backup or a recorded PITR restore point (S2) is a precondition for the apply.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | 7.1                                                                                                           |
+| B15 | **Authorization prerequisite (helm-chart-chief ruling): activation is blocked.** The problem is PUBLIC `EXECUTE` on future functions, not exposure. A `sessions` function created after PASS is PUBLIC-executable until the next migrate. It can be called directly or through PostgREST RPC, and the live gate only detects drift at readiness. Clearing B15 needs (A) an owner-scoped global default revoke with an ACL manifest and Khaliq's blast-radius approval, or an equivalent durable control (for example a reviewed schema-specific event trigger). The alternative, (B), is proof that `sessions` is not exposed (`db_schemas`) and that no untrusted role has `USAGE` or a direct path. The repo intends `sessions` RPCs to be reachable through PostgREST and `authenticator` (`GRANT USAGE ON SCHEMA sessions TO authenticated`; `Content-Profile: sessions`), so (B) is unsatisfied on that design and (A) or its equivalent is required. Intended RPCs need explicit grants to the exact API roles, with PUBLIC revoked. Evidence: Y1 to Y7, all NOT OBSERVED.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 4.2                                                                                                           |
 
 ## Review and validation of this document
 
@@ -1360,4 +1482,12 @@ hosted target: unknown.
   - the outage is qualified as the #96+ reader non-ready window;
   - D3 is read-only (`git ls-tree` and `git cat-file`). Its script reproduces
     `d48ab022…b5ef86` at `28a8f0d` and at `origin/main` `7ea53b8`.
+- Revision 5, after the verdict on `4ffd4da`:
+  - section 4.2, blocker B15 and evidence Y1 to Y7 (PUBLIC `EXECUTE` on future
+    functions; (B) is unsatisfied by repo design, so (A) or an equivalent reviewed
+    durable control is required);
+  - the `service_role` breadth recorded as a trusted-admin decision in the ACL manifest;
+  - B13 and 6.4 made conditional (no user-visible outage is asserted; locks are an
+    availability and latency risk);
+  - R1 STOP/UNKNOWN extended to attributed but unsupported controllers and managers.
 - Formatted with the locked Prettier 3.9.10 (`--no-config`).
