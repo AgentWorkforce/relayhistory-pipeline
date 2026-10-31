@@ -1,7 +1,8 @@
 -- G6 expand phase: claim-bound replacements for the last direct reads RelayHistory #226
 -- makes (pointers on session_index, and the directory readiness marker), and the
--- resurrection fences of decision 0002. ADDITIVE ONLY: it revokes nothing, adds no index
--- and does not change sessions.search_session_directory.
+-- resurrection fences of decision 0002. ADDITIVE ONLY: it revokes nothing, adds no search
+-- index (the only new index is the fences table's PRIMARY KEY) and does not change
+-- sessions.search_session_directory.
 --
 -- Expand/contract (docs/session-search-index-contract.md, "Direct surface: expand then
 -- contract"): this migration only adds the RPC capabilities. Direct grants are revoked in a

@@ -455,6 +455,62 @@ export function meaningfulChars(raw: string): number {
   return Array.from(query).filter((c) => c !== " " && !MARK.test(c)).length;
 }
 
+const TIMESTAMP =
+  /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?)?(?:\s*(Z|[+-]\d{2}(?::?\d{2})?))?$/i;
+
+/**
+ * The one timestamp parser for the API, independent of the host time zone:
+ * `YYYY-MM-DD[THH:MM[:SS[.ffffff]]][Z|±HH[:MM]]`, `T` or a space between date and
+ * time. A value with no offset is UTC (the PostgreSQL session's zone), never local
+ * time. Returns `YYYY-MM-DDTHH:MM:SS.ffffffZ`: fixed width, microseconds kept (a
+ * JavaScript Date would drop them, which would break keyset cursors), or null when
+ * the value is not a valid timestamp (including more than 6 fractional digits).
+ */
+export function canonicalTimestamp(value: string): string | null {
+  const m = TIMESTAMP.exec(value.trim());
+  if (!m) return null;
+  const [, y, mo, d, h = "00", mi = "00", sec = "00", frac = "", offset = "Z"] =
+    m;
+  const year = Number(y),
+    month = Number(mo),
+    day = Number(d);
+  const hour = Number(h),
+    minute = Number(mi),
+    second = Number(sec);
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  )
+    return null;
+  // Reject impossible dates (2026-02-30): Date.UTC normalizes them, so round-trip.
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  if (
+    probe.getUTCFullYear() !== year ||
+    probe.getUTCMonth() !== month - 1 ||
+    probe.getUTCDate() !== day
+  )
+    return null;
+  let offsetMinutes = 0;
+  if (offset.toUpperCase() !== "Z") {
+    const sign = offset[0] === "-" ? -1 : 1;
+    const digits = offset.slice(1).replace(":", "");
+    const oh = Number(digits.slice(0, 2)),
+      om = Number(digits.slice(2) || "0");
+    if (oh > 15 || om > 59) return null;
+    offsetMinutes = sign * (oh * 60 + om);
+  }
+  const ms =
+    Date.UTC(year, month - 1, day, hour, minute, second) -
+    offsetMinutes * 60_000;
+  if (!Number.isFinite(ms)) return null;
+  const at = new Date(ms).toISOString(); // whole seconds, so ".000Z"
+  return `${at.slice(0, 19)}.${frac.padEnd(6, "0")}Z`;
+}
+
 /** The RelayHistory read surface's filters, in the RPC's terms. */
 export interface SessionSearchRequest {
   /** Omit for an organization-wide page over the claimed workspaces. */
@@ -551,21 +607,20 @@ export function searchRpcRequest(request: SessionSearchRequest):
       return refuse("22023", "state is invalid");
     body.p_state = request.state;
   }
-  // An unparseable timestamp would reach PostgREST and fail its cast with 22007,
-  // which is outside the documented error contract; refuse it as an invalid value.
-  for (const [name, value] of [
-    ["since", request.since],
-    ["until", request.until],
-  ] as const)
-    if (value !== undefined && Number.isNaN(Date.parse(value)))
-      return refuse("22023", `${name} is not a timestamp`);
-  if (request.since !== undefined) body.p_since = request.since;
-  if (request.until !== undefined) body.p_until = request.until;
-  if (
-    request.since !== undefined &&
-    request.until !== undefined &&
-    Date.parse(request.since) > Date.parse(request.until)
-  )
+  // One canonical parser for every timestamp (canonicalTimestamp): an offset-less
+  // value is UTC, as in the UTC PostgreSQL session, never the host's time zone, and
+  // the RPC receives fixed-width microsecond UTC values. An unparseable value is a
+  // typed 22023 instead of PostgREST's 22007 cast failure.
+  const since =
+    request.since === undefined ? undefined : canonicalTimestamp(request.since);
+  const until =
+    request.until === undefined ? undefined : canonicalTimestamp(request.until);
+  if (since === null) return refuse("22023", "since is not a timestamp");
+  if (until === null) return refuse("22023", "until is not a timestamp");
+  if (since !== undefined) body.p_since = since;
+  if (until !== undefined) body.p_until = until;
+  // Same fixed-width UTC format, so string order is time order, to the microsecond.
+  if (since !== undefined && until !== undefined && since > until)
     return refuse("22023", "since is after until");
   if (
     request.noProject &&
@@ -588,7 +643,11 @@ export function searchRpcRequest(request: SessionSearchRequest):
         : c.workspaceId !== undefined && c.workspaceId !== request.workspaceId
     )
       return refuse("22023", "cursor is incomplete or for another scope");
-    body.p_cursor_last_activity_at = c.lastActivityAt;
+    // As for since/until: the same canonical parser, microseconds kept.
+    const cursorAt = canonicalTimestamp(c.lastActivityAt);
+    if (cursorAt === null)
+      return refuse("22023", "cursor lastActivityAt is not a timestamp");
+    body.p_cursor_last_activity_at = cursorAt;
     body.p_cursor_session_id = c.sessionId;
     body.p_cursor_harness = c.harness;
     if (c.workspaceId !== undefined) body.p_cursor_workspace_id = c.workspaceId;
