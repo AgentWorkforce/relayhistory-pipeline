@@ -1,11 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import {
+  MIN_AGENT_PREFIX_CHARS,
   REQUIRED_SEARCH_INDEXES,
+  SESSION_DIRECTORY_SEARCH_BOUNDARY,
+  AGENT_PREFIX_CANDIDATE_BUDGET,
+  AgentPrefixRequiresRpcError,
+  NonAsciiAgentFilterError,
+  SESSION_DIRECTORY_QUERIES,
+  agentExactValue,
   auditSearchIndexes,
+  directAgentPrefix,
+  isUsefulAgentPrefix,
+  normalizeAgentName,
   type SearchIndexCatalogRow,
 } from "../search-index-contract.ts";
 
-const READY = { agentLookupRolloutComplete: true } as const;
+const READY = { directoryProjectionComplete: true } as const;
 
 function catalogRows(): SearchIndexCatalogRow[] {
   return REQUIRED_SEARCH_INDEXES.map((requirement) => ({
@@ -19,11 +29,16 @@ function catalogRows(): SearchIndexCatalogRow[] {
   }));
 }
 
-describe("production search index contract", () => {
-  test("passes only when every consumer index is structurally ready", () => {
+describe("decision 0002 search index contract", () => {
+  test("passes only when every logical-directory index is structurally ready", () => {
     const report = auditSearchIndexes(catalogRows(), READY);
     expect(report.passed).toBe(true);
     expect(report.indexes.every((index) => index.ready)).toBe(true);
+    expect(
+      report.indexes.every((index) =>
+        index.tableName.startsWith("session_directory"),
+      ),
+    ).toBe(true);
   });
 
   test("fails closed when an index is absent", () => {
@@ -31,21 +46,10 @@ describe("production search index contract", () => {
     const missing = rows.pop()!;
     const report = auditSearchIndexes(rows, READY);
     expect(report.passed).toBe(false);
-    expect(report.indexes.find((index) => index.indexName === missing.index_name)?.reasons).toEqual(["missing"]);
-  });
-
-  test("requires the timing and opening-summary indexes used by documented surfaces", () => {
-    for (const indexName of [
-      "session_markers_timing_lookup_idx",
-      "convergence_events_opening_prompt_idx",
-    ]) {
-      const report = auditSearchIndexes(
-        catalogRows().filter((row) => row.index_name !== indexName),
-        READY,
-      );
-      expect(report.passed).toBe(false);
-      expect(report.indexes.find((index) => index.indexName === indexName)?.reasons).toEqual(["missing"]);
-    }
+    expect(
+      report.indexes.find((index) => index.indexName === missing.index_name)
+        ?.reasons,
+    ).toEqual(["missing"]);
   });
 
   test("rejects invalid, unfinished, or structurally different indexes", () => {
@@ -54,82 +58,93 @@ describe("production search index contract", () => {
       ...rows[0]!,
       is_valid: false,
       is_ready: false,
-      index_definition: "CREATE INDEX wrong ON sessions.session_rollups (org_id)",
+      index_definition:
+        "CREATE INDEX wrong ON sessions.session_directory (org_id)",
     };
     const report = auditSearchIndexes(rows, READY);
     expect(report.passed).toBe(false);
-    const item = report.indexes[0]!;
-    expect(item.reasons).toContain("invalid");
-    expect(item.reasons).toContain("not ready");
-    expect(item.reasons.some((reason) => reason.startsWith("definition missing:"))).toBe(true);
+    expect(report.indexes[0]!.reasons).toContain("invalid");
+    expect(report.indexes[0]!.reasons).toContain("not ready");
+    expect(
+      report.indexes[0]!.reasons.some((reason) =>
+        reason.startsWith("definition missing:"),
+      ),
+    ).toBe(true);
   });
 
-  test("requires direct-write GIN options for hot transcript indexes", () => {
+  test("rejects an unexpected or changed partial predicate", () => {
     const rows = catalogRows();
-    const row = rows.find((candidate) => candidate.index_name === "convergence_events_content_prefix_trgm_idx")!;
-    row.reloptions = null;
-    const report = auditSearchIndexes(rows, READY);
-    expect(report.passed).toBe(false);
-    expect(report.indexes.find((index) => index.indexName === row.index_name)?.reasons).toContain(
-      "option missing: fastupdate=off",
-    );
-  });
-
-  test("rejects a restrictive predicate on an unrestricted index", () => {
-    const rows = catalogRows();
-    const row = rows.find((candidate) => candidate.index_name === "session_rollups_workspace_recent_idx")!;
-    row.predicate = "false";
-    row.index_definition += " WHERE false";
-    const report = auditSearchIndexes(rows, READY);
-    expect(report.passed).toBe(false);
-    expect(report.indexes.find((index) => index.indexName === row.index_name)?.reasons).toContain(
-      "unexpected predicate",
-    );
-  });
-
-  test("rejects an additional restriction on an expected partial index", () => {
-    const rows = catalogRows();
-    const row = rows.find((candidate) => candidate.index_name === "convergence_events_task_title_direct_trgm_idx")!;
+    const row = rows.find(
+      (candidate) =>
+        candidate.index_name === "session_directory_agent_recent_idx",
+    )!;
     row.predicate = `(${row.predicate} AND false)`;
-    const report = auditSearchIndexes(rows, READY);
-    expect(report.passed).toBe(false);
-    expect(report.indexes.find((index) => index.indexName === row.index_name)?.reasons).toContain(
-      "predicate mismatch",
-    );
+    expect(
+      auditSearchIndexes(rows, READY).indexes.find(
+        (index) => index.indexName === row.index_name,
+      )?.reasons,
+    ).toContain("predicate mismatch");
   });
 
-  test("normalizes superficial predicate formatting", () => {
-    const rows = catalogRows();
-    const row = rows.find((candidate) => candidate.index_name === "convergence_events_task_title_direct_trgm_idx")!;
-    row.predicate = "  (TASK_TITLE   IS NOT NULL)  ";
-    expect(auditSearchIndexes(rows, READY).passed).toBe(true);
-  });
-
-  test("normalizes SQL structure without changing string literals", () => {
-    const rows = catalogRows();
-    const row = rows.find((candidate) => candidate.index_name === "convergence_events_opening_prompt_idx")!;
-    row.predicate = row.predicate!
-      .replaceAll("kind", "KIND")
-      .replaceAll("actor_role", "ACTOR_ROLE")
-      .replaceAll("text", "TEXT")
-      .replaceAll("length", "LENGTH")
-      .replaceAll("content", "CONTENT")
-      .replaceAll("coalesce", "COALESCE");
-    expect(auditSearchIndexes(rows, READY).passed).toBe(true);
-
-    row.predicate = row.predicate.replace("'user'::TEXT", "'USER'::TEXT");
-    const report = auditSearchIndexes(rows, READY);
-    expect(report.passed).toBe(false);
-    expect(report.indexes.find((index) => index.indexName === row.index_name)?.reasons).toContain(
-      "predicate mismatch",
-    );
-  });
-
-  test("fails until the agent lookup projection rollout is complete", () => {
-    const report = auditSearchIndexes(catalogRows(), { agentLookupRolloutComplete: false });
+  test("fails until the logical-session projector and backfill declare completion", () => {
+    const report = auditSearchIndexes(catalogRows(), {
+      directoryProjectionComplete: false,
+    });
     expect(report.passed).toBe(false);
     expect(
-      report.indexes.find((index) => index.indexName === "session_catalog_agents_lookup_idx")?.reasons,
-    ).toContain("agent lookup rollout incomplete");
+      report.indexes.every((index) =>
+        index.reasons.includes("directory projection incomplete"),
+      ),
+    ).toBe(true);
+  });
+
+  test("defines an explicit metadata-only search boundary", () => {
+    expect(SESSION_DIRECTORY_SEARCH_BOUNDARY.metadataOnly).toBe(true);
+    expect(SESSION_DIRECTORY_SEARCH_BOUNDARY.fields).toContain("agent_name");
+    expect(SESSION_DIRECTORY_SEARCH_BOUNDARY.excluded).toContain(
+      "transcript content",
+    );
+    expect(
+      REQUIRED_SEARCH_INDEXES.some(
+        (requirement) => requirement.tableName === "convergence_events",
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("agent-name lookup contract", () => {
+  test("normalizes exact names, ASCII only, and keeps the 3-character prefix minimum", () => {
+    expect(normalizeAgentName("  Helm-Chart-Chief ")).toBe("helm-chart-chief");
+    expect(agentExactValue("  Helm-Chief ")).toBe("helm-chief");
+    for (const value of ["ΟΔΟΣ", "İstanbul", "Ägent", "日本語"]) {
+      expect(() => normalizeAgentName(value)).toThrow(NonAsciiAgentFilterError);
+      expect(() => agentExactValue(value)).toThrow(/p_agent_match => 'exact'/);
+    }
+    expect(MIN_AGENT_PREFIX_CHARS).toBe(3);
+    expect(isUsefulAgentPrefix("he")).toBe(false);
+    expect(isUsefulAgentPrefix("hel")).toBe(true);
+    // A predicate never throws.
+    expect(isUsefulAgentPrefix("ΟΔΟΣ")).toBe(true);
+  });
+
+  test("agent prefix is RPC-only: the direct surface refuses every prefix and has no prefix SQL", () => {
+    for (const value of ["helm-99", "age", "ab", "", "ΟΔΟΣ", "a_b%"]) {
+      expect(() => directAgentPrefix(value)).toThrow(
+        AgentPrefixRequiresRpcError,
+      );
+    }
+    try {
+      directAgentPrefix("helm");
+    } catch (error) {
+      expect((error as AgentPrefixRequiresRpcError).code).toBe(
+        "agent_prefix_requires_rpc",
+      );
+      expect(String(error)).toMatch(/search_session_directory/);
+    }
+    expect(Object.keys(SESSION_DIRECTORY_QUERIES)).not.toContain("agentPrefix");
+    for (const sql of Object.values(SESSION_DIRECTORY_QUERIES)) {
+      expect(sql).not.toMatch(/\bLIKE\b|~>=~|~<~/);
+    }
+    expect(AGENT_PREFIX_CANDIDATE_BUDGET).toBe(5000);
   });
 });

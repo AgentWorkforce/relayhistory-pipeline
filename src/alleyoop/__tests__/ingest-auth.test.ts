@@ -25,6 +25,8 @@ import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
+import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
+import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import {
   backfillSha256,
@@ -219,7 +221,7 @@ const savedEnv = { ...process.env };
 const realFetch = globalThis.fetch;
 
 beforeAll(async () => {
-  db = new PGlite();
+  db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(
     await readFile(join(ROOT_DIR, "supabase/tests/supabase_shim.sql"), "utf8"),
   );

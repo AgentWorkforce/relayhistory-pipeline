@@ -23,6 +23,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
+import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
+import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import {
   migrationUploadMatches,
@@ -68,7 +70,7 @@ let db: PGlite;
 let root: string;
 
 beforeAll(async () => {
-  db = new PGlite();
+  db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(
     await readFile(join(SUPABASE, "tests/supabase_shim.sql"), "utf8"),
   );

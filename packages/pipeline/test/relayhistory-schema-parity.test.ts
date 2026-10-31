@@ -15,6 +15,7 @@
  * the read-only verifier.
  */
 import { PGlite } from "@electric-sql/pglite";
+import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -57,7 +58,9 @@ const runnerIndexes = (
     definition: string;
   }[]
 )
-  .map((index) => `CREATE INDEX IF NOT EXISTS ${index.name} ${index.definition};`)
+  .map(
+    (index) => `CREATE INDEX IF NOT EXISTS ${index.name} ${index.definition};`,
+  )
   .join("\n");
 const legacy = [
   { name: "legacy runner prelude", sql: LEGACY_RUNNER },
@@ -76,16 +79,14 @@ type Migration = { name: string; sql: string };
 
 const open: PGlite[] = [];
 async function database(...sets: Migration[][]) {
-  const db = new PGlite({ extensions: { pg_trgm } });
+  const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for (const migration of sets.flat()) {
     try {
       await db.exec(migration.sql);
     } catch (error) {
-      throw new Error(
-        `${migration.name}: ${(error as Error).message}`,
-      );
+      throw new Error(`${migration.name}: ${(error as Error).message}`);
     }
   }
   return db;
@@ -215,8 +216,7 @@ function gaps(source: Catalog, target: Catalog): string[] {
   for (const fn of source.functions)
     if (!target.functions.has(fn)) out.push(`missing function ${fn}`);
   for (const trigger of source.triggers)
-    if (!target.triggers.has(trigger))
-      out.push(`missing trigger ${trigger}`);
+    if (!target.triggers.has(trigger)) out.push(`missing trigger ${trigger}`);
   return out.sort();
 }
 
