@@ -168,6 +168,28 @@ describe("manifest v1", () => {
     expect(chunkKeys(parsed, { currentEpochOnly: true })).toHaveLength(1);
   });
 
+  it("accepts a migration backfill epoch after live delivery", async () => {
+    const m = await exampleManifest();
+    const c3 = await chunk(3, 1, 0, 100);
+    m.raw.chunks.push(c3);
+    m.raw.chunk_count = 4;
+    m.raw.raw_bytes += 100;
+    m.raw.stored_bytes += c3.stored_bytes;
+    m.raw.epoch = 1;
+    m.raw.epochs.push({
+      epoch: 1,
+      opened_at: "2026-10-25T18:50:00.000Z",
+      reason: "backfill",
+      first_seq: 3,
+      opened_by: "migration:mgr_export",
+    });
+    m.raw.next_offset = 100;
+    m.raw.content_sha256 = await computeContentSha256(m.raw.chunks);
+    await expect(parseManifest(m)).resolves.toMatchObject({
+      raw: { epoch: 1, epochs: [{ reason: "initial" }, { reason: "backfill" }] },
+    });
+  });
+
   it("opens an epoch with no chunks yet (source emptied)", async () => {
     const m = await exampleManifest();
     m.raw.epoch = 1;

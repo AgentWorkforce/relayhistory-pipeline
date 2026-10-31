@@ -48,9 +48,10 @@ Read-only, structure-only samples from Neon production on 2026-10-30
   then `record_id`. The stream is deterministic, so a re-export produces the
   same chunk hashes.
 - **Chunks:** sealed at a record boundary at 4 MiB uncompressed and
-  compressed with zstd. Each has `records`, `first_ts` and `last_ts`. There is
-  one epoch, and `raw.state` is `closed` unless the session saw activity after
-  T0 started (then `open`, so live delivery can continue it).
+  compressed with zstd. Each has `records`, `first_ts` and `last_ts`. A cold
+  export creates epoch 0. When live delivery created the manifest after T0,
+  the export appends one epoch whose reason is `backfill`; it never rewrites
+  the live epochs.
 - **Scrubbing:** done by the ingest hop (`sealRawChunk`, rule set
   `relayhistory-scrub`), as for live uploads. It sets
   `raw.scrub = {ruleset, version}`. Unscrubbed manifests are quarantined by
@@ -171,11 +172,57 @@ cap ever can.
   migration service principal with an audited, org-scoped "act as this user
   for ingest" grant, time-boxed to the export. This is an auth decision for
   the RelayAuth and ingest owners, and Khaliq.
-- **O3:** the transform's normalizer for `client.relayhistory_export`
-  sessions, so replay, briefs and embeddings read them like live sessions.
-- **O4:** sessions active across T0. Live delivery after T0 continues the
-  session's stream: the export writes epoch 0, and the client opens epoch 1.
-  Confirm with the delivery coordinator's owner-fencing rules.
+  Ingest side (E3, #43 with relayhistory-cloud #228; nothing applied or
+  enabled). The contract is
+  [docs/contracts/relayhistory-export-plan-entry-v1.md](contracts/relayhistory-export-plan-entry-v1.md):
+  - **Switches:** `RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS=true` (default
+    off) admits only migration-class tokens and never a generic RelayAuth
+    bearer. `RELAYHISTORY_MIGRATION_GRANTS` lists the accepted
+    `grantId=planDigest` pairs. The broad `ALLOW_INTERIM_RELAYAUTH_BEARER` is
+    off unless explicitly set to `true` (the local Docker stack sets it).
+  - **Routes:** only `POST /v1/pipeline/chunks`, `POST /v1/pipeline/manifests`
+    and `GET /v1/pipeline/manifests/status` (anything else is 403
+    `migration_assertion_route`).
+  - **Membership:** the ingest does not look up live workspace membership.
+    The grant operator checks it when creating the grant, and relayauth
+    #111 (@2adf414a) mints only for the grant's stored pairs.
+  - **Identity:** the assertion carries an issuer-derived `meta.upload` (relayauth #111 @2adf414a). The
+    ingest recomputes it from the actual request (key, machine, session,
+    content, entry digest) and compares (else 403
+    `migration_upload_forbidden`). The signed pair must also be the grant
+    pair (else 403 `migration_workspace_forbidden`).
+  - **Expiry:** 60 s plus 5 s skew. An expired token gets 401
+    `migration_assertion_expired`; mint again.
+  - **Single use:** 409 `migration_assertion_replayed` (mint again); 503
+    `migration_ledger_unavailable` fails closed. The ledger row and the
+    enriched `pipeline_jobs` row commit in one transaction.
+  - **Chunks:** each request carries its canonical plan entry in front of
+    the bytes. The chunk must be one of the signed entry's chunks, checked
+    against the actual bytes before anything is stored. Also one chunk per
+    `(jti, seq)` (409 `migration_chunk_conflict`) and at most 256 per
+    assertion (403 `migration_chunk_limit`).
+  - **Audit:** one durable, append-only `sessions.migration_ingest_audit` row
+    per commit, in the same transaction as the job.
+  - **Retention:** no cron. Each ledger insert deletes at most 100 rows
+    expired for more than 5 minutes. An expired token is refused before the
+    ledger is read.
+- **O3 (resolved in E4):** the transform recognizes
+  `client.relayhistory_export`, reads the canonical record envelopes from all
+  live and backfill epochs, keeps the highest numeric revision of each
+  `(origin_id, record_id)`, applies tombstones and orders the survivors by
+  event time. It writes those live records to
+  `normalized/v1/relayhistory-{raw.content_sha256}.ndjson`. The digest in the
+  key makes the object create-only, so a late transform cannot overwrite
+  output for another manifest revision. Post-T0 live chunks use the same
+  record envelope; `operation` is optional for historical upserts and required
+  to carry a live tombstone.
+- **O4 (resolved in E4):** sessions active across T0 are serialized at the
+  manifest CAS boundary. A grant-bound migration assertion may append exactly
+  one `backfill` epoch while preserving `raw.owner`, the delivery writer,
+  session identity and every prior epoch/chunk. Its `opened_by` is
+  `migration:<grantId>`. A live write and export based on the same object
+  version cannot both commit; the loser rereads and rebuilds. Normal live
+  assertions cannot open a `backfill` epoch.
 - **O5 (first measurement):** a read-only dry run over the 50 newest Neon
   sessions (2026-10-30) gave 50 machine streams, 280,144 records, 560 MB of
   raw ndjson and 169 chunks, with none fenced. The newest sessions are the
