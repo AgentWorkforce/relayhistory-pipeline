@@ -50,8 +50,12 @@ copy-everything-then-switch runbook (linuyc, uncommitted
 2. **Backfill never overwrites fresh data.** It inserts with
    `ON CONFLICT DO NOTHING` on the primary key. Rows written after T0 always
    win.
-3. **Triggers stay off for copies.** The backfill and the copy set run with
-   `session_replication_role = replica` in their own session, so historical
+3. **Triggers stay off for copies.** The backfill runs with
+   `session_replication_role = replica` in its own session. The T0 copy set
+   (mirror) does not: the Supabase admin may not set that parameter, so the
+   mirror lands through the live triggers and refuses any table whose enabled
+   triggers are not reviewed side-effect-free guards or that is in a foreign
+   key (`prepareGuardedTargetSession`). It never disables a trigger. Historical
    rows fire no projections, revision feed, wakeups or brief jobs. Every
    table, derived ones included, is copied as Neon has it. Sessions that
    straddle T0 have their rollups and caches rebuilt afterwards through the

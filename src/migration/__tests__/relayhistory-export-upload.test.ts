@@ -23,6 +23,8 @@ import {
   contentSha256,
   derivePlanContract,
   exportedOriginRevisions,
+  sourceMarksFromChunks,
+  sourceMarksIssue,
   manifestProvenanceIssue,
   migrationWorkKey,
   planContract,
@@ -59,6 +61,11 @@ interface FakeIngest {
   mintJti?: (n: number) => string | undefined;
   /** Inject a response before the route's own handling (n is per route, 1-based). */
   before?: (route: Route, n: number) => Injected;
+  statusRequests: number;
+  /** Every manifest commit body received. */
+  posted: { key: string; manifest: { revision: number; raw: { epochs: { reason: string }[] } }; previousVersion?: unknown }[];
+  /** Enforce #43's owner fence (default on). */
+  ownerFence: boolean;
   /** Test flag for the O4 activation gate. */
   activated?: boolean;
   /** Answer commits with this work key instead (e.g. the old key@version form). */
@@ -99,6 +106,8 @@ async function body(req: IncomingMessage): Promise<Buffer> {
 
 async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
   const chunks = new Map<string, string>();
+  /** Source bytes the chunk hop received, by manifest key and seq (to recompute marks at commit). */
+  const sources = new Map<string, Buffer>();
   const manifests = new Map<string, string>();
   const counts: Record<Route, number> = { chunk: 0, manifest: 0 };
   const commits = { n: 0 };
@@ -124,6 +133,9 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
     queue: [],
     requests: [],
     chunkLimit: 256,
+    ownerFence: true,
+    statusRequests: 0,
+    posted: [],
     framed: [],
     stored: manifests,
     storageRead: true,
@@ -160,6 +172,22 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
       const route: Route | undefined =
         req.method === "POST" && url.pathname === "/v1/pipeline/chunks" ? "chunk"
           : req.method === "POST" && url.pathname === "/v1/pipeline/manifests" ? "manifest" : undefined;
+      if (req.method === "GET" && url.pathname === "/v1/pipeline/manifests/status") {
+        // As main's status route for a migration assertion: absent 404; the
+        // grant's own export 200; anything else (a live session) 403.
+        fake.statusRequests += 1;
+        const claims = claimsOf(req);
+        const key = url.searchParams.get("key") ?? "";
+        if (key !== claims.meta.upload.key) return refuse(res, 403, "migration_upload_forbidden");
+        const stored = manifests.get(key);
+        if (!stored) return send(res, 404, {});
+        const m = JSON.parse(stored) as { raw: { owner: string } };
+        if (m.raw.owner !== `migration:${claims.meta.grantId}` || url.searchParams.get("writer") !== m.raw.owner) {
+          res.writeHead(403);
+          return res.end();
+        }
+        return send(res, 200, { version: { eTag: `"${sha(stored).slice(0, 8)}"` } });
+      }
       if (!route) return refuse(res, 403, "migration_assertion_route");
       const claims = claimsOf(req);
       counts[route] += 1;
@@ -220,6 +248,7 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
         const created = !chunks.has(chunkKey);
         if (created) {
           chunks.set(chunkKey, digest);
+          sources.set(`${key}#${url.searchParams.get("seq")}`, Buffer.from(source));
           fake.chunkWrites += 1;
         }
         return send(res, created ? 201 : 200, {
@@ -242,12 +271,20 @@ async function fakeIngest(signedDigest: string): Promise<FakeIngest> {
         });
       }
       if (!fake.storageRead) return refuse(res, 503, "migration_storage_read_required");
+      fake.posted.push(JSON.parse(raw.toString()));
       const posted = JSON.parse(raw.toString()) as { key: string; manifest: { extensions: Record<string, Record<string, unknown>> } };
       const marker = posted.manifest.extensions?.["client.relayhistory_export"];
       const ext96 = posted.manifest.extensions?.["96bulls"];
       // Provenance (#43 @d664d5bb): each present and equal to the signed values.
       if (!marker || marker.grant_id !== upload.grant_id || marker.plan_digest !== upload.plan_digest ||
         marker.source_user_id !== upload.source_user_id || !ext96 || ext96.user_id !== upload.source_user_id)
+        return refuse(res, 403, "migration_upload_forbidden");
+      // #43's owner fence (manifestOwnerIssue): a cold export is owned by its grant.
+      const raw0 = (posted.manifest as unknown as { raw: { owner: string; chunks: { seq: number }[] }; writer: { delivery_instance_id: string } });
+      if (fake.ownerFence && (raw0.raw.owner !== raw0.writer.delivery_instance_id || raw0.raw.owner !== `migration:${claims.meta.grantId}`))
+        return refuse(res, 409, "owner_conflict");
+      // Watermark and resume marks recomputed from the source bytes received.
+      if (sourceMarksIssue(posted.manifest as never, raw0.raw.chunks.map((c) => sources.get(`${posted.key}#${c.seq}`) ?? Buffer.alloc(0))))
         return refuse(res, 403, "migration_upload_forbidden");
       // Recompute the entry from the request (never an echoed field).
       const recomputed = derivePlanContract({
@@ -996,41 +1033,42 @@ describe("signed work key and manifest provenance (#43 @d664d5bb)", () => {
   });
 });
 
-describe("409 activation_required (O4 gate, #51)", () => {
-  test("waits a bounded time with fresh assertions, then commits once activation lands", async () => {
-    const { fake, cfg, plan, sleeps, chunkCount } = await setup({ activationWaitMs: [7, 8, 9] });
-    fake.before = (route, n) => (route === "manifest" && n <= 2 ? { status: 409, code: "activation_required" } : undefined);
-    const result = await runExportUpload(plan, cfg);
-    expect(result).toMatchObject({ failed: [], deferred: [] });
-    expect(result.stopped).toBeUndefined();
-    expect(result.committed).toHaveLength(2);
-    expect(sleeps).toEqual([7, 8]);
-    expect(fake.mints).toBe(4); // a fresh assertion per attempt
-    expect(fake.chunkWrites).toBe(chunkCount); // chunks are not resent
-    expect(fake.manifestWrites).toBe(2);
+describe("straddling sessions and the O4 activation gate (#51)", () => {
+  test("a cold export never sends previousVersion or a backfill epoch, so #51's activation gate is never hit", async () => {
+    const { fake, cfg, plan } = await setup();
+    await runExportUpload(plan, cfg);
+    expect(fake.posted).toHaveLength(2);
+    for (const body of fake.posted) {
+      expect(body.previousVersion).toBeUndefined();
+      expect(body.manifest.revision).toBe(1);
+      expect(body.manifest.raw.epochs.map((e: { reason: string }) => e.reason)).toEqual(["initial"]);
+    }
   });
 
-  test("still inactive after the budget: deferred (re-queued, reported), not failed and not stopped; a later run commits it", async () => {
+  test("a session that already has a live manifest is deferred as straddling_session before any chunk is sent", async () => {
+    const { fake, cfg, plan } = await setup();
+    const live = planContract(plan, GRANT).uploads[0]!.key;
+    // A live client's manifest at the key: owned by its machine, not by the grant.
+    fake.stored.set(live, JSON.stringify({ raw: { owner: "machine-1" }, writer: { delivery_instance_id: "machine-1" } }));
+    const result = await runExportUpload(plan, cfg);
+    expect(result.deferred).toEqual([{ key: live, code: "straddling_session", waits: 0 }]);
+    expect(result.failed).toEqual([]);
+    expect(result.stopped).toBeUndefined();
+    expect(result.committed.map((c) => c.key)).toEqual([planContract(plan, GRANT).uploads[1]!.key]);
+    expect(fake.requests.filter((r) => r.key === live)).toEqual([]); // no chunk, no commit
+    expect(JSON.parse(fake.stored.get(live)!).raw.owner).toBe("machine-1"); // untouched
+  });
+
+  test("response handling (unit): a 409 activation_required answer is waited on, then deferred, never failed or stopped", async () => {
+    // Unreachable from a cold export (see above); this pins how the courier
+    // treats the code if an ingest answers it.
     const { fake, cfg, plan, sleeps } = await setup({ activationWaitMs: [7, 8] });
-    const first = planContract(plan, GRANT).uploads[0]!.key;
-    fake.before = (route) => (route === "manifest" && !fake.activated ? { status: 409, code: "activation_required" } : undefined);
-    fake.activated = false;
-    const r1 = await runExportUpload(plan, cfg);
-    expect(r1.failed).toEqual([]);
-    expect(r1.stopped).toBeUndefined();
-    expect(r1.committed).toEqual([]);
-    expect(r1.deferred).toEqual([
-      { key: first, code: "activation_required", waits: 2 },
-      { key: planContract(plan, GRANT).uploads[1]!.key, code: "activation_required", waits: 2 },
-    ]);
+    fake.before = (route) => (route === "manifest" ? { status: 409, code: "activation_required" } : undefined);
+    const r = await runExportUpload(plan, cfg);
+    expect(r.failed).toEqual([]);
+    expect(r.stopped).toBeUndefined();
+    expect(r.deferred.map((d) => d.code)).toEqual(["activation_required", "activation_required"]);
     expect(sleeps).toEqual([7, 8, 7, 8]);
-    const cp = JSON.parse(await readFile(cfg.checkpointPath, "utf8"));
-    expect(cp.manifests[first].status).toBe("sealing");
-    fake.activated = true;
-    fake.requests.length = 0;
-    const r2 = await runExportUpload(plan, cfg);
-    expect(r2.committed).toHaveLength(2);
-    expect(fake.requests.filter((r) => r.route === "chunk")).toHaveLength(0); // sealed chunks reused
   });
 });
 
@@ -1087,4 +1125,63 @@ describe("O4 dedupe watermark: origin_revisions in the export marker", () => {
     expect(Object.keys(wm).every((k) => records.some((r) => r.origin_id === k))).toBe(true);
     expect(Object.values(wm).every((v) => Number.isSafeInteger(v) && v >= 0)).toBe(true);
   });
+});
+
+describe("watermark and resume marks are bound to the chunk bytes", () => {
+  const rec = (origin: string, id: string, revision: string, ts: number): DeliveryRecord => ({
+    kind: "session_event", origin_id: origin, record_id: id, revision, operation: "upsert",
+    received_at: "2026-10-01T00:00:00Z", payload: { ts_ms: Date.UTC(2026, 9, 1) + ts, text: "x".repeat(200) },
+  });
+  const records = [rec("epoch-a", "r1", "5", 1), rec("epoch-b", "r2", "3", 2), rec("epoch-a", "r3", "8", 3), rec("machine:m1", "e1", "1", 4)];
+  const planned = () => plannedManifestFromRecords({ orgId: "org_1", workspaceId: "ws_1", source: "claude", sessionId: "bound", machine: "m1", sourceUserId: "user_1", records, maxChunkBytes: 300 })!;
+
+  test("the bytes give the same watermark as the records, and per-chunk source_origin/source_end", () => {
+    const m = planned();
+    expect(m.chunks.length).toBeGreaterThan(2);
+    const marks = sourceMarksFromChunks(m.chunks.map((c) => c.data));
+    expect(marks.origin_revisions).toEqual(m.originRevisions!);
+    expect(marks.origin_revisions).toEqual({ "epoch-a": 8, "epoch-b": 3 });
+    // Each chunk carries its last feed origin and that origin's revision so far.
+    expect(marks.chunks.map((c) => c && `${c.source_origin}:${c.source_end}`)).toEqual(["epoch-a:5", "epoch-b:3", "epoch-a:8", undefined]);
+  });
+
+  test("a watermark or chunk mark that is not what the bytes give is detected (courier check)", async () => {
+    const m = planned();
+    const plan: ExportPlan = { exportedAt: "2026-10-30T12:00:00.000Z", manifests: [m] };
+    const contract = planContract(plan, GRANT);
+    const sealed = contract.entries[0]!.chunks.map((c) => ({ ...c, sha256_8: c.sha256.slice(0, 8), stored_bytes: c.bytes, stored_sha256: c.sha256, compression: "zstd" as const, stored_raw_bytes: c.bytes, raw_sha256: c.sha256 }));
+    const manifest = await buildExportManifest(plan, m, sealed, { ruleset: "relayhistory-scrub", version: 1 }, { grantId: GRANT, planDigest: contract.planDigest });
+    const bytes = m.chunks.map((c) => c.data);
+    expect(sourceMarksIssue(manifest, bytes)).toBeUndefined();
+    const ext = manifest.extensions as Record<string, Record<string, unknown>>;
+    ext["client.relayhistory_export"]!.origin_revisions = { "epoch-a": 9, "epoch-b": 3 }; // would skip a source row on takeover
+    expect(sourceMarksIssue(manifest, bytes)).toBe("origin_revisions");
+    ext["client.relayhistory_export"]!.origin_revisions = { "epoch-a": 8, "epoch-b": 3 };
+    (manifest.raw.chunks[2] as unknown as { source_end: number }).source_end = 99;
+    expect(sourceMarksIssue(manifest, bytes)).toBe("chunk 2");
+  });
+
+  test("the fake ingest recomputes the marks from the source bytes and refuses a tampered watermark", async () => {
+    const { fake, plan, cfg } = await setup();
+    await runExportUpload(plan, cfg);
+    const u = planContract(plan, GRANT).uploads[0]!;
+    const m = JSON.parse(fake.stored.get(u.key)!);
+    m.extensions["client.relayhistory_export"].origin_revisions = { o1: 999 };
+    const assertion = await cfg.assertions.mint(u.source_user_id, u.workspace_id, { key: u.key });
+    const res = await fetch(`${fake.url}/v1/pipeline/manifests`, {
+      method: "POST", headers: { authorization: `Bearer ${assertion.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ key: u.key, manifest: m }),
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+test("the committed watermark comes from the chunk bytes, never from a (possibly edited) plan field", async () => {
+  const { fake, plan, cfg } = await setup();
+  for (const m of plan.manifests) m.originRevisions = { o1: 999_999 }; // an edited or stale plan value
+  await runExportUpload(plan, cfg);
+  for (const [i, u] of planContract(plan, GRANT).uploads.entries()) {
+    const stored = JSON.parse(fake.stored.get(u.key)!);
+    expect(stored.extensions["client.relayhistory_export"].origin_revisions).toEqual(sourceMarksFromChunks(plan.manifests[i]!.chunks.map((c) => c.data)).origin_revisions);
+  }
 });
