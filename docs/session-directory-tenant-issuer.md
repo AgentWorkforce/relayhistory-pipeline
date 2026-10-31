@@ -30,6 +30,10 @@ The RelayHistory Worker exchanges the caller's own verified RelayAuth token for 
 | Keep a static token and filter in the Worker | Rejected | #48 refuses it by design, and isolation would rest on Worker code alone. |
 | Dedicated issuer in RelayAuth, subject-token exchange | **Chosen** | Separate key and trust scope. A Worker bug cannot name another tenant without that tenant's token. Cost: a network hop and new RelayAuth code. |
 
+## Hard precondition: TLS
+
+**The token exchange must not run over plain HTTP.** Its request carries RelayHistory's minting API key and the caller's token. `stacks/aws/relayauth.ts` serves RelayAuth over plain HTTP in the cluster, so self-hosted activation needs RelayAuth TLS first.
+
 ## Issuer and exchange
 
 - **Issuer:** a new, distinct HTTPS URL on hosted RelayAuth, for example `https://relayauth.dev/session-directory`, with discovery at `<issuer>/.well-known/openid-configuration` and a `jwks_uri` listing only this issuer's keys. The final URL is an implementation choice, but it must not equal the general issuer `https://relayauth.dev`.
@@ -74,12 +78,12 @@ A token RelayAuth cannot verify is refused, including anything admitted only by 
 
 The RPC does not check `iss`, `aud` or lifetime today. Supabase's docs say a project trusts every issuer added, and PostgREST skips audience checks unless `jwt-aud` is set. Whether hosted Supabase sets it is unconfirmed. So any other trusted issuer could otherwise satisfy the RPC.
 
-This is the proposed change, not applied to #48 and not executed. The issuer differs per environment, so it lives in an owner-only table instead of a custom setting. The migration seeds no row, so search stays refused until a row is added for that environment, and adding one is a production change.
+Implemented in #72, stacked on #48. The issuer differs per environment, so it lives in an owner-only table instead of a custom setting. The migration seeds no row, so search stays refused until a row is added for that environment, and adding one is a production change.
 
 ```sql
 CREATE TABLE sessions.session_directory_search_token_policy (
   singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-  issuer text NOT NULL CHECK (issuer LIKE 'https://%'),
+  issuer text NOT NULL CHECK (issuer ~ '^https?://'),
   audience text NOT NULL CHECK (audience <> ''),
   max_lifetime_seconds integer NOT NULL DEFAULT 60
     CHECK (max_lifetime_seconds BETWEEN 1 AND 60)
@@ -185,7 +189,12 @@ Use this only if the check above shows Supabase refuses the custom role. #48 wou
 
 ## Self-hosted stacks
 
-Hosted Supabase custom OIDC does not cover the self-hosted stacks. `stacks/aws/relayauth.ts` uses a plain-HTTP in-cluster issuer with no public JWKS, and Supabase requires HTTPS. The token shape and exchange still apply, but a self-hosted PostgREST would load the JWKS directly through `jwt-secret`. Neither `docker/` nor `stacks/` runs a PostgREST service today. This is follow-up work and does not block hosted activation.
+The AWS proof uses self-hosted PostgREST on in-cluster CloudNativePG, not hosted Supabase. The token shape, exchange and RPC pins are the same. The differences are in `stacks/aws/session-directory-postgrest/README.md`:
+
+- PostgREST reads the JWKS from a file through `jwt-secret`, so RelayAuth's OIDC discovery is not needed, and the Supabase unknowns above do not apply.
+- The issuer may be the `http://` in-cluster Service URL, because the policy only compares it. The TLS precondition above still applies to the exchange.
+- A dedicated login role holds only the Worker, `jwt-aud` is set, and there is no anon role.
+- Rotation does not depend on Supabase's pickup time. It reloads PostgREST with `NOTIFY pgrst, 'reload config'`.
 
 ## Required cross-tenant tests
 
