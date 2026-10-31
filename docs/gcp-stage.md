@@ -498,9 +498,11 @@ not present database credentials, authenticate, or execute a SQL query.
 Verification cleanup completed: the temporary namespace and Job were deleted,
 the GCS marker was deleted, the Pub/Sub marker was acknowledged, the verifier
 VM was deleted, and the temporary `roles/container.developer` binding was
-removed from the runner identity. The managed substrate remains deployed for
-the still-unproved application lane. No secret payload, database credential,
-public endpoint, DNS record, or application chart was introduced.
+removed from the runner identity. At the end of that substrate-only
+verification, the managed substrate remained deployed for the then-unproved
+application lane. That verifier introduced no secret payload, database
+credential, public endpoint, DNS record, or application chart. The later base
+application proof is recorded at the top of this guide.
 
 Read-only preflight:
 
