@@ -40,9 +40,9 @@ jobs:
           scripts/fetch-postgrest-test-bins.sh "$RUNNER_TEMP/postgrest-bins" >> "$GITHUB_ENV"
       - name: Build the RelayAuth that mints search tokens
         run: |
-          # Pinned to relayauth#116 until it merges.
+          # relayauth main at the #116 merge (e2d72f7); no release published yet.
           git clone --quiet https://github.com/AgentWorkforce/relayauth.git "$RUNNER_TEMP/relayauth"
-          git -C "$RUNNER_TEMP/relayauth" checkout --quiet 35e2171cd52a5081646188093e9534843161825c
+          git -C "$RUNNER_TEMP/relayauth" checkout --quiet e2d72f74f4692982095ede7e9d25916bc01a853b
           cd "$RUNNER_TEMP/relayauth"
           npm ci --silent
           npx turbo build --filter=@relayauth/server^...
