@@ -172,9 +172,17 @@ To request the application release after its external Secrets exist, set
   "imageDigest": "sha256:<digest-built-from-the-reviewed-main-commit>",
   "imageSourceRevision": "<full-40-character-reviewed-main-commit>",
   "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
-  "relayauthIssuer": "http://relayauth.relayauth.svc:8787"
+  "relayauthIssuer": "http://relayauth.relayauth.svc:8787",
+  "relayhistoryOrigin": "http://bulls96-alleyoop.96bulls.svc:8080"
 }
 ```
+
+`relayhistoryOrigin` is the exact audience RelayAuth places in a courier
+assertion. AlleyOop receives the same value as `RELAYHISTORY_ORIGIN`, so it
+accepts only RelayAuth's origin-bound assertion class and refuses the legacy
+shared audience. A verifier may reach the ClusterIP through a local
+port-forward, but it must still ask RelayAuth to bind the token to this stable
+in-cluster origin.
 
 Those are names and identifiers only. Secret payloads never belong in this
 file or Helm values. The stage uses its private Artifact Registry repository

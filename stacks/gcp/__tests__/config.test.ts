@@ -62,6 +62,7 @@ describe("GCP self-host contract", () => {
       imageSourceRevision: "not-a-revision",
       relayauthJwksUrl: "http://user:password@attacker.example/jwks?token=secret",
       relayauthIssuer: "http://user:password@attacker.example",
+      relayhistoryOrigin: "http://user:password@attacker.example",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
     expect(() => assertGcpRuntimeDeployable("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
@@ -136,6 +137,7 @@ describe("GCP self-host contract", () => {
       imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
       relayauthIssuer: "http://relayauth.relayauth.svc:8787",
+      relayhistoryOrigin: "http://bulls96-alleyoop.96bulls.svc:8080",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96 })).toThrow("managedDataPlane.provision");
     expect(() =>
@@ -194,6 +196,18 @@ describe("GCP self-host contract", () => {
         bulls96: { ...bulls96, relayauthIssuer: "https://relay.example.com/issuer-path" },
       }),
     ).toThrow("RelayAuth origin");
+    for (const relayhistoryOrigin of [
+      "http://user:password@bulls96-alleyoop.96bulls.svc:8080",
+      "http://attacker.example",
+      "https://history.example.com/path",
+    ])
+      expect(() =>
+        assertGcpInputs("gcp-dev", {
+          ...base,
+          managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+          bulls96: { ...bulls96, relayhistoryOrigin },
+        }),
+      ).toThrow("in-cluster Kubernetes origin");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
@@ -265,6 +279,7 @@ describe("GCP self-host contract", () => {
           imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
           relayauthIssuer: "http://relayauth.relayauth.svc:8787",
+          relayhistoryOrigin: "http://bulls96-alleyoop.96bulls.svc:8080",
         },
         {
           bucket: "locker",
@@ -310,6 +325,12 @@ describe("GCP self-host contract", () => {
           jwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
           issuer: "http://relayauth.relayauth.svc:8787",
         },
+        extraEnv: expect.arrayContaining([
+          {
+            name: "RELAYHISTORY_ORIGIN",
+            value: "http://bulls96-alleyoop.96bulls.svc:8080",
+          },
+        ]),
       },
       hoopdb: { enabled: false },
       locker: { enabled: false },
