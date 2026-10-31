@@ -21,6 +21,9 @@ export interface ContextEvent { event_id: string; ts: string; kind: string; text
 const MAX_LIMIT = 20;
 const MAX_QUERY = 500;
 const SNIPPET_CHARS = 320;
+const DAY_MS = 86_400_000;
+/** Newest first; a final open range covers the rest, so every row stays reachable. */
+const WINDOW_DAYS = [1, 7, 30];
 const TABLE = "session_search_records";
 const COLUMNS = ["org_id", "workspace_id", "harness", "session_id", "machine_id", "event_id", "revision", "chunk_seq", "record_seq", "ts", "kind", "scrub_version", "text"];
 
@@ -35,7 +38,7 @@ CREATE TABLE IF NOT EXISTS ${TABLE} (
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (org_id, workspace_id, ts, session_id, chunk_seq, record_seq)
-SETTINGS non_replicated_deduplication_window = 1000`;
+SETTINGS non_replicated_deduplication_window = 1000, index_granularity = 256`;
 
 export class ClickHouseHttp {
   constructor(private url: string, private user: string, private password: string) { assertLocalTarget(url); }
@@ -90,8 +93,10 @@ export class SessionSearchStore {
    * Newest first, event level, like search_shared_sessions. ngrams(3) cannot serve a
    * term under three characters, so that form narrows by tenant only and scans.
    * The substring check is in this phase: hasAllTokens proves grams, not adjacency.
+   * Disjoint time windows are searched newest first until a page is full, which bounds
+   * the `text` read; the concatenated result is the page a single query would return.
    */
-  async search(scope: Scope, o: SearchOptions): Promise<{ hits: SearchHit[]; nextCursor: string | null }> {
+  async search(scope: Scope, o: SearchOptions): Promise<{ hits: SearchHit[]; nextCursor: string | null; rounds: number }> {
     const q = o.query;
     if (!q || [...q].length > MAX_QUERY) throw new Error("invalid_query");
     const { params, settings } = this.guard(scope);
@@ -108,17 +113,35 @@ export class SessionSearchStore {
       filters.push("(ts, event_id) < (parseDateTime64BestEffort({cts:String}, 3), {cid:String})");
       bound.cts = ts; bound.cid = id;
     }
-    const rows = await this.reader.rows<Omit<SearchHit, "citation" | "ts"> & { at: string }>(`
+    const now = Date.now();
+    const edges = WINDOW_DAYS.map((d) => now - d * DAY_MS);
+    const ranges: Array<[number | null, number | null]> = [
+      [edges[0]!, null],
+      ...edges.slice(1).map((lo, i): [number, number] => [lo, edges[i]!]),
+      [null, edges.at(-1)!],
+    ];
+    const rows: Array<Omit<SearchHit, "citation" | "ts"> & { at: string }> = [];
+    let rounds = 0;
+    for (const [lo, hi] of ranges) {
+      const windowed = [...filters];
+      const windowBound = { ...bound };
+      if (lo !== null) { windowed.push("ts >= fromUnixTimestamp64Milli(toInt64({wlo:String}))"); windowBound.wlo = String(lo); }
+      if (hi !== null) { windowed.push("ts < fromUnixTimestamp64Milli(toInt64({whi:String}))"); windowBound.whi = String(hi); }
+      rounds++;
+      rows.push(...await this.reader.rows<(typeof rows)[number]>(`
       SELECT workspace_id, harness, session_id, machine_id, event_id,
         toString(toUnixTimestamp64Milli(ts)) AS at,
         substringUTF8(text, greatest(positionCaseInsensitiveUTF8(text, {q:String}) - 80, 1), ${SNIPPET_CHARS}) AS snippet
-      FROM ${TABLE} WHERE ${filters.join(" AND ")}
-      ORDER BY ts DESC, event_id DESC LIMIT ${limit + 1}`, bound, { ...settings, ...(o.tag ? { log_comment: o.tag } : {}) });
+      FROM ${TABLE} WHERE ${windowed.join(" AND ")}
+      ORDER BY ts DESC, event_id DESC LIMIT ${limit + 1 - rows.length}`, windowBound, { ...settings, ...(o.tag ? { log_comment: o.tag } : {}) }));
+      if (rows.length > limit) break;
+    }
     const page = rows.slice(0, limit).map(({ at, ...r }) => ({ ...r, ts: iso(at) }));
     const last = page.at(-1);
     return {
       hits: page.map((r) => ({ ...r, citation: `/sessions/${encodeURIComponent(r.session_id)}?source=${encodeURIComponent(r.harness)}` })),
       nextCursor: rows.length > limit && last ? Buffer.from(JSON.stringify([last.ts, last.event_id])).toString("base64url") : null,
+      rounds,
     };
   }
 

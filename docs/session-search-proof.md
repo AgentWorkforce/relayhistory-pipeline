@@ -115,11 +115,26 @@ because rare candidates span all history and the second phase still reads `text`
 that range. Each search also became two queries. The mixed load did not improve, so the
 simpler first-phase recheck stays, which also keeps exact counts as #233 specifies.
 
-Next, in order: (1) test a `ts` window that starts recent and widens, which bounds the
-read for the common newest-first case; (2) test a smaller index granularity or a
-`session` grouping that makes hits less scattered; (3) size capacity on the target. At
-today's CPU per query, 32 clients at p95 300 ms would need roughly 100 QPS, about 20 cores.
-The 5 s timeouts under load are ClickHouse code 159.
+Exact-dispatch timeouts at `675c209` (run 41186253718): 135 code 159 plus 3 HTTP 408
+partial-body responses, all rejected before row parsing. A non-2xx or interrupted response
+is refused as a whole; the product e2e must keep that assertion.
+
+**Windows and granularity, within one run** (41188007941, `07e8e24`): 4.04M events, 2
+cores, 6 parts per table after `OPTIMIZE`, no ingest, one class at a time, first page
+only. Recall 1.0 and no errors in every cell.
+
+| p95 ms at 32 clients | Baseline | Windowed | Granularity 256 | Both |
+| --- | --- | --- | --- | --- |
+| common | 2,589 | 304 | 1,999 | 234 |
+| rare, 307 hits | 2,526 | 687 | 1,236 | 384 |
+| phrase, 1,092 hits | 2,663 | 747 | 1,818 | 424 |
+| 2-character term | 2,668 | 1,423 | 3,523 | 1,306 |
+| ultra-rare | 399 | 717 | 315 | 710 |
+| zero hits | 144 | 479 | 254 | 589 |
+
+Terms with few or no hits scan all four windows, so they lose. Corpus ages are uniform, so
+recency gains here are not production gains. Size was unchanged at granularity 256. Sort
+by session gave no gain and was rejected. The store now uses both; see this head's CI.
 
 **First search after load.** Not reproduced in CI (435 ms). Run the load on CI with the
 same probe at several points while parts merge, and log parts and merges with it. If it

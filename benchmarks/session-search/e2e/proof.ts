@@ -13,6 +13,7 @@
  */
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { cpus } from "node:os";
 import { dirname, join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { corpusHash, SCALES, tenantCanary } from "../corpus.ts";
@@ -213,6 +214,15 @@ async function g2Adversarial() {
   await search.insert(Array.from({ length: 450 }, (_, i) => row("org-adv", "ws-adv", "m1", `e-${String(i).padStart(3, "0")}`, 5_000_000, "ghijkl")));
   const ties = await walk(a, "ghijkl");
   checks.equalTimestampsEachOnce = ties.seen.length === 450 && new Set(ties.seen).size === 450;
+  // Hits on both sides of every window edge come back once each, newest first.
+  const nowMs = Date.now(), dayMs = 86_400_000;
+  const edgeRows = [0.5, 0.999, 1.001, 6.999, 7.001, 29.999, 30.001, 100].flatMap((d, b) =>
+    Array.from({ length: 6 }, (_, i) => ({ ...row("org-adv", "ws-adv", "m1", `x-${b}-${i}`, 0, "windowedge"), ts: new Date(nowMs - d * dayMs - i).toISOString() })));
+  await search.insert(edgeRows);
+  const edges = await walk(a, "windowedge");
+  const expected = [...edgeRows].sort((x, y) => (x.ts < y.ts ? 1 : -1)).map((r) => r.eventId);
+  checks.windowEdgesOrderedEachOnce = edges.seen.join() === expected.join();
+  checks.windowEdgesFullPages = edges.sizes.slice(0, -1).every((n) => n === 10);
   // Boundaries and case: substring semantics, exactly.
   await search.insert([
     row("org-adv", "ws-adv", "m1", "b-1", 1, "ZZnopqrsZZ"), row("org-adv", "ws-adv", "m1", "b-2", 2, "NoPqRs"),
@@ -397,7 +407,7 @@ async function g7g8() {
     stop = true;
     await Promise.all(running);
     const seconds = (performance.now() - started) / 1000;
-    levels.push({ clients, qps: Math.round(lat.length / seconds), errors, errorCodes, errorRate: errors / Math.max(1, errors + lat.length), ...pct(lat) });
+    levels.push({ qpsPerCore: Math.round(lat.length / seconds / cpus().length * 10) / 10, clients, qps: Math.round(lat.length / seconds), errors, errorCodes, errorRate: errors / Math.max(1, errors + lat.length), ...pct(lat) });
   }
   report.G7_latency_load = { status: "RELATIVE", detail: { engine: "vanilla ClickHouse, one local node", coldMs: pct(cold), warmMs: pct(warm), levels } };
   report.G8_freshness = { status: "RELATIVE", detail: { insertToFirstHitMs: pct(freshness), note: "store only; pipeline queue latency is in G1 firstHitMs" } };
@@ -464,6 +474,8 @@ if (reachedStore) {
   console.log("first query after load", JSON.stringify(firstQueryAfterLoad));
   await g2(oracle);
   await g2Adversarial();
+  const singleShot = await reader.run(`SELECT count() FROM session_search_records WHERE org_id = 'org-1' AND positionCaseInsensitiveUTF8(text, 'deploy') > 0`, {}, { SQL_relay_org: "org-1" });
+  report.G2_lexical_recall!.detail = { ...(report.G2_lexical_recall!.detail as object), exactCountStaysAvailable: Number(singleShot.trim()) };
   await g3(oracle);
   await g4();
   await g5();
