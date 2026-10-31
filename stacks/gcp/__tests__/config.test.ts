@@ -290,6 +290,7 @@ describe("GCP self-host contract", () => {
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
     expect(values).toMatchObject({
       worker: {
+        fullnameOverride: "bulls96-worker",
         imagePullSecrets: [],
         image: {
           repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
@@ -298,6 +299,7 @@ describe("GCP self-host contract", () => {
         locker: { credentials: { mode: "podIdentity" } },
       },
       alleyoop: {
+        fullnameOverride: "bulls96-alleyoop",
         imagePullSecrets: [],
         image: {
           repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",

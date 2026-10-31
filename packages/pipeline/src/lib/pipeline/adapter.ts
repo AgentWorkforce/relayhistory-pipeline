@@ -452,7 +452,8 @@ export function orgResolverFromEnv(
 
 /**
  * The deployment-prefix rule for a tenant: with orgs taken from the prefix,
- * the prefix must name the caller's org; otherwise it must be exactly the
+ * the prefix must be exactly `<PIPELINE_KEY_PREFIX>/<caller's org>` (or the
+ * org alone when no base is set); otherwise it must be exactly the
  * configured `PIPELINE_KEY_PREFIX` (or absent when none is configured). Keeps
  * a caller from naming another org's object whose `ws=` happens to match.
  */
@@ -461,10 +462,13 @@ export function prefixAllowed(
   prefix: string | undefined,
   orgId: string,
 ) {
+  const base = (env.PIPELINE_KEY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
+  // With orgs taken from the prefix it must be EXACTLY `<base>/<org>` (or
+  // `<org>` with no base) for the caller's org: not another base, no extra
+  // segment, not a bare org when a base is configured.
   if (env.PIPELINE_ORG_FROM_PREFIX === "true")
-    return prefix?.split("/").filter(Boolean).pop() === orgId;
-  const expected = (env.PIPELINE_KEY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
-  return (prefix ?? "") === expected;
+    return prefix === (base ? `${base}/${orgId}` : orgId);
+  return (prefix ?? "") === base;
 }
 
 export type BuildResult =
