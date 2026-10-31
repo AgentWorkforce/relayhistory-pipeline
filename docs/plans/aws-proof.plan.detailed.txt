@@ -4,7 +4,7 @@ Resolving stack services
 AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
 Loading stack state
 Computing plan
-Plan ready (5.3s)
+Plan ready (5.4s)
 Plan: 78 to create
 
 [96bulls] create
@@ -28,7 +28,7 @@ Plan: 78 to create
             value: https://proof-sessions.agentrelay.com
         hoopdb: {}
         image:
-          digest: sha256:c13b879a668984f905e30e38b05764ec712532e8395b256d416ba1602f6c6726
+          digest: sha256:59d9468551ded11f3c6f5d36558ab7ef87c3e50e99772de352cc309823cb00e0
           repository: 500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services
         locker:
           bucket: 96bulls-aws-proof-locker-500268966557
@@ -41,7 +41,7 @@ Plan: 78 to create
         otel:
           endpoint: http://otel-collector:4318
         tenant:
-          orgId: org_aws_proof
+          orgId: org_aws_proof_1
       hoopdb:
         backups:
           enabled: false
@@ -153,7 +153,7 @@ Plan: 78 to create
           name: hosted
         hoopdb: {}
         image:
-          digest: sha256:c13b879a668984f905e30e38b05764ec712532e8395b256d416ba1602f6c6726
+          digest: sha256:59d9468551ded11f3c6f5d36558ab7ef87c3e50e99772de352cc309823cb00e0
           repository: 500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services
         locker:
           bucket: 96bulls-aws-proof-locker-500268966557

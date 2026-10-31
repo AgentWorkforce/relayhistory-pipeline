@@ -1,21 +1,21 @@
 {
   "schema": 1,
   "stage": "aws-proof",
-  "generatedAt": "2026-10-31T01:30:14.765Z",
+  "generatedAt": "2026-10-31T01:32:53.897Z",
   "target": {
     "accountId": "500268966557",
     "region": "us-west-2",
     "callerArn": "arn:aws:sts::500268966557:assumed-role/AWSReservedSSO_AdministratorAccess_fafac944cdc114d8/khaliq@agentrelay.com"
   },
   "source": {
-    "commit": "81dc4fd0c676625896cf6b6b2a62ca3305e32404",
-    "stackSourceSha256": "1ec8bed4c99ca5df72e2279599d567630516a426d06cc8905ec3e689132b2016",
+    "commit": "e1bfac0ebcfeef21fb65f8979ed459c9f7fee9fe",
+    "stackSourceSha256": "673a9ba6a8596fde1fc1eab57f142627db09cebad6481d116e4c877f97dcc3fc",
     "clean": true
   },
   "inputs": {
-    "sha256": "c65374a67766831ebc86bc7772003886bca8588db810aa1678f833da9b7aaddf",
+    "sha256": "a9f7f74895c85b596b950452e2bea0797996f99fe593bebb77699a1373e6fdaf",
     "sanitizedPath": "docs/plans/aws-proof.inputs.sanitized.json",
-    "sanitizedSha256": "f244b5f5c3ae031ea4361ce9fda06d9fe5f14537e14e28008ddcf1f2aee2b455"
+    "sanitizedSha256": "a40aae3c0f690cc7cd8e1666f53735bb7283c260675c7e14f367d582d15998c0"
   },
   "state": {
     "bucket": "alchemy-state-500268966557-us-west-2-an",
@@ -35,11 +35,11 @@
   "outputs": {
     "plan": {
       "path": "docs/plans/aws-proof.plan.txt",
-      "sha256": "40aad9c7adf5f17ef8e7d26388bf3d15366c682b19ee6a15f242f6ade22e1675"
+      "sha256": "65c6c9268c641ec59d2e8545c078327f9be835d479b544d682bf34ec04e8677f"
     },
     "detailed": {
       "path": "docs/plans/aws-proof.plan.detailed.txt",
-      "sha256": "c207b32895cdb4f7260dd75cc1351903d4d6852f83eb16e34787882cb052e059"
+      "sha256": "ed3de7ee9af64270e0b3d69fe8484433b97fc02945eb26272f6ae0048fea221c"
     }
   },
   "summary": "Plan: 78 to create",
