@@ -1267,6 +1267,36 @@ describe("buildIngestApp auth (production composition)", () => {
     expect(await code(other)).toBe("migration_upload_forbidden");
   });
 
+  test("tenant org allowlist (TENANT_ORG_IDS, org-derived prefixes): a verified token for an unlisted org is refused 403 org_not_allowed before any write; a listed org is accepted", async () => {
+    const { upload, manifest, entryText } = await planned();
+    const ownKey = `${ORG}/${manifestKey(LOCATION)}`;
+    // ORG is not listed: refused on the chunk and the commit, nothing stored or queued.
+    const closed = await ingest({
+      ...MIGRATION_ON,
+      PIPELINE_ORG_FROM_PREFIX: "true",
+      TENANT_ORG_ID: "",
+      TENANT_ORG_IDS: "org_listed_a,org_listed_b",
+    });
+    const token = migrationToken(upload);
+    const chunk = await closed.chunk(token, LOCATION, { entry: entryText });
+    expect(chunk.status).toBe(403);
+    expect(await code(chunk)).toBe("org_not_allowed");
+    const commit = await closed.commit(token, manifest, ownKey);
+    expect(commit.status).toBe(403);
+    expect(await code(commit)).toBe("org_not_allowed");
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+    // Listed: the same upload goes through.
+    const open = await ingest({
+      ...MIGRATION_ON,
+      PIPELINE_ORG_FROM_PREFIX: "true",
+      TENANT_ORG_ID: "",
+      TENANT_ORG_IDS: `org_listed_a,${ORG}`,
+    });
+    const okChunk = await open.chunk(token, LOCATION, { entry: entryText });
+    expect(okChunk.status).toBe(201);
+    expect((await open.commit(token, manifest, ownKey)).status).toBe(202);
+  });
+
   test("org-derived prefixes (PIPELINE_ORG_FROM_PREFIX through the real composition): the token's own org prefix is accepted end to end; another org's prefix is refused", async () => {
     const i = await ingest({
       ...MIGRATION_ON,
