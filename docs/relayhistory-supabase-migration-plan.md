@@ -60,7 +60,7 @@ cutover.
 | 2026-10-31 | K-34 | "Include it in the T0 gate" | Khaliq, lead session, relayed by the coordinator | **Superseded as written by K-36.** The dashboard's semantic/hybrid search (keyword + vector, ranked) must also be served on the new stack for post-T0 sessions before T0. This adds G-T8 and a hybrid benchmark lane (nDCG@10 against legacy on the hybrid query set). |
 | 2026-10-31 | K-36 | "No embeddings pre-T0" | Khaliq, lead session (final ruling). **helm-chart-chief now records it as directly approved.** | **Supersedes K-34 as written.** G-T8 becomes keyword-ranked dashboard search on ObsessionDB full-text over complete transcripts, with **no vector pools before T0**. The nDCG@10 benchmark against legacy hybrid stays as the gate. If it shows a real loss, embeddings come back as a follow-up decision (section 17). Embedding versioning, K-35, Q19 and Q20 move to section 17. |
 | 2026-10-31 | K-37 | Synthetic trials approved: **ClickHouse Cloud with a $50 hard cap**, and the **ObsessionDB free dev service (eu-central, functional testing only)** | Khaliq, direct approval, confirmed 2026-10-31 | Synthetic data only. **A trial approval is not production provisioning approval** (K-29 stays separate). Trial results feed G-T0E. ObsessionDB's dev service is outside `us-east-1`, so it cannot prove performance or region. |
-| 2026-10-31 | K-38 | Counts-only, read-only shape extraction from production is approved; **no corpus movement** | Khaliq, direct approval, confirmed 2026-10-31 | Allows aggregate counts and sizes (per-org session/event counts, size distributions, table sizes) to answer Q7, Q9 and Q11 and to shape the synthetic corpus. No content, query text or identifiers leave production. |
+| 2026-10-31 | K-38 | Counts-only, read-only shape extraction from production is approved; **no corpus movement** | Khaliq, direct approval, confirmed 2026-10-31 | Allows aggregate counts and sizes (per-org session/event counts, size distributions, table sizes) to answer Q7, Q9 and Q11 and to shape the synthetic corpus. No content, query text or identifiers leave production. **Done 2026-10-31 07:13-07:25 UTC**; results in `~/selfhost-proof/notes/prod-shape-2026-10-31.md` (section 1). |
 | 2026-10-31 | K-39 | "ObsessionDB off the hot path" | Khaliq, direct, lead session | Restructures search (section 6, "Search architecture").<br>- S3 is the source of truth, and ObsessionDB is a derived, rebuildable index fed by an async indexer. Ingest never waits on it.<br>- One search interface with two adapters. The Postgres adapter is the self-host default; on hosted it serves a **bounded recent window** of transcript text in Supabase (trigram/FTS) plus metadata and summary search. The ObsessionDB adapter (any ClickHouse-protocol store) serves full history.<br>- Hosted search queries both and merges. ObsessionDB gets a roughly 1-2 s budget. On its error or timeout, the response returns the Postgres results labelled "partial: older history unavailable": never an unlabelled empty result, and never a 5xx for that case.<br>- Recent-window freshness no longer depends on the indexer.<br>- This lowers the stakes of the conditional K-28.<br>- A draft amendment to 0002 is in this PR, and the Supabase disk sizing for the window is folded into K-32. |
 | 2026-10-31 | K-40 | **Amazon OpenSearch Service is a third candidate** for the full-history transcript index, alongside ObsessionDB (conditional, K-28) and ClickHouse Cloud (trial, K-37). A **synthetic-only OpenSearch trial is approved in the proof account 500268966557 / `us-west-2`, about $50 cap.** | Khaliq, direct, 2026-10-31 | The store is decided by the same benchmark and evidence gate for every candidate: G-T0E is generalised (section 6). OpenSearch is expected to score E4, E5 and E6 through AWS VPC, IAM and compliance, and to be weaker on the cost of substring indexing (E1). The history adapter interface is **store-agnostic**, not just ClickHouse-protocol. A trial is not production provisioning. |
 | 2026-10-31 | K-42 | **Window = 14 days**; **complete event text** in the window, not a 4 KB prefix (closes Q23); **history-store budget = 1.5 s** (closes Q24) | Khaliq, direct, 2026-10-31 | Recent window = the last 14 days of complete scrubbed event text. The final byte size is still to be measured by the K-38 counts-only extraction before the disk resize (K-32). The merge/fallback (G-T1M) uses a 1.5 s hard budget for the history store. |
@@ -155,30 +155,62 @@ every step in section 15 still needs its own OK.
 | --- | --- |
 | The RelayHistory API is a Cloudflare Worker on Neon HTTP: `@neondatabase/serverless` with `drizzle-orm/neon-http`. | relayhistory-cloud `packages/relayhistory/src/db/client.ts:8-9` (origin/main `45d53b1`) |
 | Neon project `divine-snow-84812652`, branch `production` (`br-damp-mud-apbr6ifp`), database `neondb`, PostgreSQL 17, `aws-us-east-1`, endpoint `ep-floral-pond-apkvat38`. | `docs/evidence/2026-10-30-neon-capacity/README.md`; the uncommitted cutover doc |
+| **Tenants and sessions:** 282 orgs, 289 workspaces (nearly 1:1). 203,671 sessions and 28.07M events. About 2,800 new sessions a day over 30 days (peak 5,951). Events per session: p50 21, p99 1,731, max 326,877. Concentration: the top org has 23.2% of events, and the top 10 orgs hold 74% of all-time content bytes. | K-38, exact counts from `session_rollups` (bytes from the sample) |
 | RelayHistory has no database of its own. It writes the `sessions` schema in the same `neondb` as Cloud's `public` schema. | Cloud memory note `relayhistory-revision-publisher-convoy.md`; runbook step 9 ("Cloud's `public` schema is untouched") |
 | Neon is under stress: 91.39% cache hit, 1.35 TB temp spill, 56 deadlocks, 8.9M dead tuples in `delivery_projection_acceptance`. Compute is pinned at 16/16 CU, the plan maximum. | `load-results.json`, capacity README (2026-10-30) |
 | There was a lock convoy on `session_revision_events` on 2026-10-23. It was fixed by relayhistory-cloud #164 (migration 0049, SKIP LOCKED). Still open: advisory-lock waits on `accept_delivery_batch`, and a backlog of about 1.6M messages for Cloud's `project-summary-worker`. | Cloud memory note (2026-10-24) |
 | Neon outbound logical replication is disabled. Enabling it is irreversible and restarts the endpoints. | Uncommitted cutover doc |
-| **Production transcripts are Neon rows.** The `sessions` schema is **494 GB**, of which `convergence_events` is **210 GB**. | Coordinator, 2026-10-31. No checked-in capture; unit (GB vs GiB) to confirm. |
+| **Production transcripts are Neon rows.** The `sessions` schema is **495 GB** of a **506 GB** database. `convergence_events` 210 GB, `delivery_records` 164 GB, `session_markers` 25 GB. | K-38 extraction, catalog sizes, 2026-10-31 (`~/selfhost-proof/notes/prod-shape-2026-10-31.md`) |
 | **No production S3 bucket exists.** The existing R2 bucket `relayhistory-content` is **empty**, so no session content is in object storage today. | Coordinator, 2026-10-31 |
 | Pipeline code exists in relayhistory-cloud but is inert: storage adapter #211/#216 (S3 API supported); pointer index #212; summary-short stage (`docs/pipeline-summary-short.md`); single-use migration assertions #228 (merged 2026-10-31 UTC). | PR states, read 2026-10-30 |
 | Supabase project `sessions` (`pyamkrhoyszgzirqqffq`): **Pro plan, Large compute, but a 2 GB disk, and empty.** The disk must be sized before A3 and any load (K-32). Roles `relayhistory_owner` and `relayhistory_runtime` (BYPASSRLS) exist, as does the Neon role `relayhistory_readonly`. | `docs/relayhistory-pipeline-migration.md` "Done" (A1, A2) |
 | Supabase `sessions` region: **AWS `us-east-1`**, next to Neon prod. | Khaliq, 2026-10-31 (K-33 wording). Not yet confirmed read-only: check with `scripts/sb projects list`. |
 | Production S3 bucket account: not recorded. `sessions-prod` (`941433935742`) is the existing workload account named in the cutover doc. | Open question Q2 |
 
-### Data volume: which figure to use
+### Data volume (measured, K-38)
 
-| Figure | Covers | Source | Status |
+Source: `~/selfhost-proof/notes/prod-shape-2026-10-31.md`. It is aggregates only.
+- Run 2026-10-31 07:13-07:25 UTC, read-only transactions, low load.
+- Catalog sizes and session/org counts are exact.
+- Content bytes are a 1% `TABLESAMPLE SYSTEM` of `convergence_events`,
+  extrapolated ×100 (see the caveats below).
+
+| Class | Size | Tables | Destination |
 | --- | --- | --- | --- |
-| **494 GB `sessions`, 210 GB `convergence_events`** | `sessions` schema | Coordinator, 2026-10-31 | **Current; use this.** No checked-in capture, unit unconfirmed. |
-| 484 GB `sessions`: `convergence_events` 205 GB, `delivery_records` 161 GB, `uploaded_support_identities` 37 GB | `sessions` schema | `docs/relayhistory-pipeline-migration.md` (2026-10-30) | Older. It shows roughly 10 GB of growth in about a day. |
-| 485.6 GiB (521,364,119,552 logical bytes; 521,364,119,552 / 2^30 = 485.56) | the whole Neon branch, `public` + `sessions` | uncommitted `docs/relayhistory-cutover.md` (2026-10-29), Neon API | **Stale.** No artifact. It is below the current `sessions` figure if both are binary units, so it predates the growth. |
+| Transcript-bearing | **~399 GB (~81%)** | `convergence_events` 210 GB, `delivery_records` 164 GB, `session_markers` 25 GB | content to **S3** (export) |
+| Acceptance and identity bookkeeping (no transcript content) | **~90 GB (~18%)** | `uploaded_support_identities` 37 GB, `delivery_projection_acceptance` 28 GB, `delivery_catalog_acceptance` 13 GB, `delivery_receipts` 12 GB | **open (Q25):** move to Supabase, or drop or re-derive |
+| True session metadata | **~5-6 GB (~1%)** | `session_catalog`, rollups, revisions, timing cache, outbox, `auth_sessions`, … | Supabase (index or copy set) |
+| **`sessions` total** | **495 GB** (heap 160, indexes 194, rest TOAST) | | |
+| Whole database | 506 GB | | |
 
-Before any capacity decision, re-measure read-only and check in the output
-under `docs/evidence/`:
-- `neonctl branches get br-damp-mud-apbr6ifp --project-id divine-snow-84812652 -o json` (`logical_size`);
-- `SELECT n.nspname, sum(pg_total_relation_size(c.oid)) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','m') GROUP BY 1`;
-- per-table sizes for `sessions`.
+- **Content column:** `convergence_events.content` is 59.1 GB logical
+  (~35 GB stored, 0.59 compression) over 28.3M events. The rest of that
+  table's TOAST is the `record` jsonb.
+- **Not split by column:** the `delivery_records` and `session_markers`
+  payloads.
+- **Growth:** content per day went from 0.06 GB in August to 0.51 GB in
+  September to 1.21 GB in October (2.4× month over month, Sep→Oct). The
+  busiest week, 10-19 to 10-25, ran at 1.48 GB/day.
+- **Earlier figures are superseded:**
+  - 494 GB (coordinator) and 484 GB (2026-10-30);
+  - 485.6 GiB (the uncommitted cutover doc). It is the whole-branch logical
+    size from 2026-10-29, now stale.
+
+**Sampling caveats** (from the source note):
+- SYSTEM sampling is block-clustered:
+  - 14- and 30-day byte totals carry roughly ±10-15% error;
+  - single-day values carry ±20-30%.
+- Per-org bytes are sampled. Orgs with fewer than ~100 events are
+  under-represented, which skews the per-org percentiles high.
+- The trigram ratio is extrapolated from a 4 KB-prefix index.
+- Retention deletes add GIN and heap bloat between vacuums. The 50% headroom
+  covers this.
+- A 1% sample cannot find the single largest row. The true maximum event
+  size is not measured.
+- The FTS overhead is assumed, not measured.
+- The copy-set size is not measured.
+- Stats were last analyzed 2026-10-30 23:22 UTC, with 4.4M dead tuples on
+  `convergence_events`.
 
 Under option D none of this volume is copied into Supabase: most is
 re-derived or exported to S3 (section 4). The search store (G-T), however,
@@ -251,25 +283,26 @@ These are easy to miss because they are not routes:
 
 ## 4. What must move, and what can be re-derived
 
-Sizes come from `docs/relayhistory-pipeline-migration.md` (2026-10-30). The
-current totals are larger: `sessions` 494 GB, `convergence_events` 210 GB
-(section 1). Row counts are live tuples from `load-results.json`.
+Sizes are the K-38 catalog figures (section 1, `~/selfhost-proof/notes/prod-shape-2026-10-31.md`). Row counts
+are live tuples from `load-results.json`.
 
 | Data | Size, rows | Moves? | Where and how |
 | --- | --- | --- | --- |
-| `delivery_records` (the client's own records, with revisions: session, session_event, tool_call, file_edit, …) | 161 GB, 54.0M | **Must move.** It is the only source of session content. | Exported from the T0 child branch to S3 as scrubbed raw chunks plus a manifest per session (`docs/relayhistory-export-design.md`, #40, E1 to E4). Not copied into Supabase. |
-| `convergence_events` | 210 GB (205 GB on 2026-10-30), 27.7M | **Re-derived, not moved.** 99.8% of sampled rows reference a `delivery_record_id`. | Rebuilt by the pipeline's normalizer from the S3 raw stream. The derived replay comes from S3 objects. |
-| `session_rollups`, `session_catalog`, `session_markers` (25.0M), `session_relationships`, `session_commit_links`, `session_catalog_agents`, `session_timing_cache`, projection/acceptance tables (`delivery_projection_acceptance` 50.5M, `delivery_catalog_acceptance` 25.6M) | in the 494 GB | **Re-derived.** | `session_index` and `session_directory` are rebuilt from manifests by session-indexed and the directory projector. Timing comes from manifest activity times. |
-| `uploaded_support_identities` | 37 GB, 54.3M | **Unknown (Q5).** It is the third-largest table, and no doc says what reads it after T0. | Decide: export, re-derive, or leave on the child branch until A10. |
+| `delivery_records` (the client's own records, with revisions: session, session_event, tool_call, file_edit, …) | 164 GB, 54.0M (raw `payload` jsonb holds transcript content) | **Must move.** It is the only source of session content. | Exported from the T0 child branch to S3 as scrubbed raw chunks plus a manifest per session (`docs/relayhistory-export-design.md`, #40, E1 to E4). Not copied into Supabase. |
+| `convergence_events` | 210 GB (heap 44, TOAST 87, indexes 79, of which the prefix trigram index is 39 GB), 27.8M | **Re-derived, not moved.** 99.8% of sampled rows reference a `delivery_record_id`. | Rebuilt by the pipeline's normalizer from the S3 raw stream. The derived replay comes from S3 objects. |
+| `session_rollups`, `session_catalog`, `session_relationships`, `session_commit_links`, `session_catalog_agents`, `session_timing_cache`, | ~5-6 GB of metadata | **Re-derived.** | `session_index` and `session_directory` are rebuilt from manifests by session-indexed and the directory projector. Timing comes from manifest activity times. |
+| `session_markers` | 25 GB, 25.0M (`text` and `payload` columns hold transcript content) | **Content must reach S3.** It counts as transcript-bearing (K-38). | Confirm that the `delivery_records` export carries every marker's content (kind `session_marker`); if not, export the markers too (Q26). |
+| Acceptance and identity bookkeeping: `uploaded_support_identities` 37 GB, `delivery_projection_acceptance` 28 GB, `delivery_catalog_acceptance` 13 GB, `delivery_receipts` 12 GB | **~90 GB** | **Open (Q25).** No transcript content. | Move to Supabase, drop, or re-derive. Moving it would dwarf the recent window on Supabase disk (K-32). `delivery_receipts` is in today's copy set. |
 | Copy set: `auth_sessions`, `deleted_upload_sessions`, `session_resets`, `upload_cleanup_origins`, `upload_cleanup_tombstones`, `machines`, `probe_connections`, `project_aliases`, `github_org_links`, `delivery_origins`, `delivery_receipts` | small (measure; runbook step 3) | **Must move before the flip.** These are write-path state: tokens, tombstones, cursors. | `migration:copy --mode=mirror` pre-copied (A4), then caught up inside the hold (runbook steps 4 and 10). |
 | Analysis, briefs, memory state | unknown | **Decide (Q6).** | Either export as derived objects, or re-run after the export behind `MODEL_CALLS_ENABLED` and a budget. |
 | Summaries | n/a | **Re-derived.** | summary-short runs from S3 after the export. That costs model calls; budget it per wave. |
 | Cloud `public` schema | ~1.6 GiB (inferred) | **Does not move.** | Stays on Neon. |
 
-What this means for capacity: Supabase holds pointers and metadata, roughly
-one row per session plus memberships. That is small, but the project's
-**2 GB disk is too small** even for that plus the copy set, so it must be
-resized first (K-32). Separately, **the export's
+What this means for capacity:
+- Supabase holds metadata (~5-6 GB), the 14-day recent window (52-56 GB
+  with indexes, about 70 GB at the peak rate), and whatever Q25 decides for
+  the ~90 GB of bookkeeping.
+- The 2 GB disk must be resized first (K-32: 128 GB now). Separately, **the export's
 object size and PUT count are unknown** (export-design O5). Estimate them on
 the rehearsal snapshot (phase 2) before sizing the bucket's KMS request
 budget.
@@ -350,32 +383,47 @@ So after T0:
 - **Self-host:** the Postgres adapter with an unbounded window is the
   default. The history adapter is optional.
 
-### Recent-window sizing (input to K-32): 14 days, complete text (K-42)
+### Recent-window sizing (input to K-32): 14 days, complete text (K-42), measured by K-38
 
-**Decided:** 14 days of **complete** scrubbed event text, with no 4 KB
-cap. The byte size is **not yet measured**. The K-38 counts-only
-extraction must fill it in before the disk resize (K-32).
+Source: `~/selfhost-proof/notes/prod-shape-2026-10-31.md` (1% sample ×100; caveats in section 1).
 
-Window size ≈ D × 14 × (1 + index overhead):
-- D is the scrubbed text bytes per day, complete event text;
-- trigram GIN plus FTS overhead is typically 1.5-3× the text; measure it on
-  the phase 2 snapshot.
+| Window | Events | Text (complete content) | Per day | With indexes |
+| --- | --- | --- | --- | --- |
+| 7 days | 3.70M | 6.6 GB | ~0.94 GB | ≈ 22-28 GB |
+| **14 days (decided)** | **8.81M** | **16.5 GB** | **~1.18 GB** | **≈ 52-56 GB**; **≈ 70 GB at the peak-week rate (1.48 GB/day)** |
+| 30 days | 17.39M | 35.5 GB | ~1.18 GB | ≈ 115-125 GB |
 
-The K-38 extraction is aggregate only: `sum(octet_length(content))` and the
-event count per day for the last 30 days, per org and in total, plus the
-p50/p95/p99 and maximum event size, because complete text includes large
-tool outputs. Only aggregates leave production.
+**How the 14-day estimate is made up:**
+- text 16.5 GB;
+- trigram GIN ~28.5 GB, at the measured ~1.73× of indexed text;
+- FTS GIN ~5-8 GB, assumed at 0.3-0.5×, **not measured**;
+- btrees and row overhead ~2-3 GB.
 
-| Window | Text | With indexes (1.5-3×) | Status |
-| --- | --- | --- | --- |
-| **14 days (decided, K-42)** | 14 × D | 35-60 × D | **chosen**; D to be measured |
-| 7 days / 30 days | 7 × D / 30 × D | 17.5-30 × D / 75-120 × D | not chosen; kept for reference |
+The 1.73× ratio comes from the existing `convergence_events` prefix trigram
+index: 39.24 GB over ~22.7 GB of 4 KB-prefix text. Applied to complete
+text it is probably an upper bound, because long tool outputs repeat
+trigrams.
 
-The Supabase disk (K-32) is sized as window size + metadata + copy set +
-50% headroom, **only after D is measured**.
+**Event size** (14 days, sampled):
 
-**Watch item:** complete text puts very large events, such as long tool
-outputs, into trigram GIN. The phase 2 benchmark (SLO row 15) must cover
+| p50 | p95 | p99 | p99.9 | max seen | mean |
+| --- | --- | --- | --- | --- | --- |
+| 261 B | 7.7 KB | 27 KB | 160 KB | 1.19 MB | 1,884 B |
+
+The true maximum is not measured.
+
+**Disk (K-32), recommended:**
+- **128 GB now:** the window at the peak rate (~70 GB) plus ~6 GB of
+  metadata plus 50% headroom is about 115 GB.
+- **Plan for 200-256 GB**, given 2.4× month-over-month growth (Sep→Oct).
+- Re-measure at 30 days.
+- The copy set is not measured, and the Q25 bookkeeping is **not
+  included**. If the ~90 GB of bookkeeping moves to Supabase, size it
+  again before resizing.
+
+**Watch item:** complete text puts very large events into trigram GIN:
+p99.9 is 160 KB, the largest seen is 1.19 MB, and the true maximum is
+unknown. The phase 2 benchmark (SLO row 15) must cover
 the largest-event tail. If index cost is extreme, a per-event cap needs a
 new decision; it is not assumed here.
 
@@ -697,9 +745,15 @@ SEC-10's open decision. Waves are proposed; Khaliq sets their membership.
 | W2 | Remaining orgs below the 95th percentile of `delivery_records` per org | Bulk |
 | W3 | The largest orgs, one at a time | Hottest keys, and the largest export and fallback load |
 
-**The number of orgs and their size distribution is unknown (Q7).** Measure
-it read-only on the rehearsal branch: count per `org_id` from
-`delivery_records`, no content.
+**Measured (K-38):**
+- 282 orgs and 289 workspaces;
+- sessions per org: p50 6.5, p90 725, p99 17,041;
+- the top org has 23.2% of events, and the top 10 hold 74% of content bytes;
+- the largest org has only 12% of the 14-day window.
+
+So W3 (the largest orgs, one at a time) carries most of the export bytes,
+and W1 and W2 are many small orgs. Wave membership is still Khaliq's to
+set.
 
 ### Phase 0: code prerequisites (no live action except merges)
 
@@ -1275,7 +1329,7 @@ ids (A#) are shown where they apply.
 | K-29 | Provision the **chosen** production history store in `us-east-1` and staging, and their credentials. **Only after G-T0E and Khaliq's choice. The K-37 and K-40 trial approvals do not cover this.** | — | yes, while empty |
 | K-30 | Enable the G-T1 feed into the production store (dark, canaries only, before T0) | — | disable the feed |
 | K-31 | Each use of the G-F write freeze, including the phase 3 canary proof | — | unfreeze |
-| K-32 | Resize the Supabase `sessions` disk from 2 GB. **Includes the K-39 recent window**: window size + metadata + copy set + 50% headroom (section 6, window sizing). | — | grow only |
+| K-32 | Resize the Supabase `sessions` disk from 2 GB. **Recommended: 128 GB now** (14-day window at the peak rate ~70 GB, ~6 GB metadata, 50% headroom), and plan for **200-256 GB** given 2.4× month-over-month growth (K-38). Excludes the Q25 bookkeeping and the unmeasured copy set. | — | grow only |
 | K-33 | Transcript-search region. **Decided 2026-10-31: AWS `us-east-1`.** | — | — |
 | K-34 | Ranked dashboard search in the T0 gate. **Decided 2026-10-31: "Include it in the T0 gate", superseded as written by K-36.** | — | — |
 | K-36 | **Decided 2026-10-31: "No embeddings pre-T0"** (helm-chart-chief: directly approved). G-T8 is keyword-ranked; nDCG@10 against legacy hybrid is the gate. | — | — |
@@ -1283,7 +1337,7 @@ ids (A#) are shown where they apply.
 | K-38 | **Approved 2026-10-31:** counts-only, read-only shape extraction from production. No corpus movement. | — | n/a (read-only) |
 | K-39 | **Decided 2026-10-31: "ObsessionDB off the hot path".** Two adapters, async indexer, labelled partial fallback. | — | — |
 | K-40 | **Decided 2026-10-31:** Amazon OpenSearch Service is a third history-store candidate. Synthetic-only trial approved in 500268966557 / `us-west-2`, about $50 cap. Not production provisioning. | — | delete the trial domain |
-| K-42 | **Decided 2026-10-31:** a 14-day window, complete event text, and a 1.5 s history-store budget. The disk resize (K-32) still waits on the K-38 byte measurement. | — | the window can shrink or grow via retention and backfill from S3 |
+| K-42 | **Decided 2026-10-31:** a 14-day window, complete event text, and a 1.5 s history-store budget. K-38 measured ~16.5 GB of text, 52-56 GB with indexes and ~70 GB at the peak rate. | — | the window can shrink or grow via retention and backfill from S3 |
 | K-43 | Apply the recent-window migration and RLS to Supabase, and enable the writer stage and retention job | — | drop the table, disable the stage |
 
 Read-only work needs no approval beyond normal access: catalog queries,
@@ -1303,18 +1357,18 @@ Read-only work needs no approval beyond normal access: catalog queries,
   Known: Pro plan, Large compute, 2 GB disk, empty.
 - **Q4.** The hosted Supabase PostgREST version, and whether third-party JWTs
   can set a custom role (#63, #73).
-- **Q5.** What reads `uploaded_support_identities` (37 GB) after T0.
+- **Q5.** What reads `uploaded_support_identities` (37 GB) after T0? Now part of Q25.
 - **Q6.** Analysis, briefs and memory: export, re-derive (model cost), or
   drop?
-- **Q7.** The number of orgs and their size distribution, for the waves. **Can now be answered by K-38** (counts only).
+- **Q7.** Answered by K-38: 282 orgs and 289 workspaces, heavily concentrated (section 1).
 - **Q8.** The hosted metrics, SLO and log backend for the alarms in section
   13.
-- **Q9.** The export's total zstd size and PUT count, and the KMS request
+- **Q9.** Partly informed by K-38 (~399 GB of transcript-bearing tables). Still open: the export's total zstd size and PUT count, and the KMS request
   cost (O5).
 - **Q10.** The Cloud revision-feed replacement (G-R1): owner, and the event
   contract.
-- **Q11.** K-38 allows a checked-in re-measure of the 494 GB / 210 GB figures, with
-  their unit. The 485.6 GiB branch figure is stale (section 1).
+- **Q11.** Answered by K-38: `sessions` is 495 GB of a 506 GB database
+  (catalog). The earlier figures are superseded.
 - **Q12.** Whether child-branch transcript search can meet SLO row 6
   within Neon plan limits (16 CU maximum).
 - **Q13.** Owners for the unowned items G-R1, G-P, G-S, G-H, G-T and G-F.
@@ -1326,6 +1380,15 @@ Read-only work needs no approval beyond normal access: catalog queries,
   are covered in section 17.
 - **Q17.** Resolved by K-34 and K-36: keyword-ranked dashboard search is in the T0 gate (G-T8).
 - **Q19, Q20:** moved to section 17.
+- **Q25.** The ~90 GB of acceptance and identity bookkeeping
+  (`uploaded_support_identities`, `delivery_projection_acceptance`,
+  `delivery_catalog_acceptance`, `delivery_receipts`): **move it to
+  Supabase, or drop or re-derive it?** It holds no transcript content.
+  Moving it would make it the largest item on Supabase disk, so it is
+  excluded from the K-32 recommendation.
+- **Q26.** Does the `delivery_records` export carry every `session_markers`
+  row's content (25 GB, transcript-bearing), or do the markers need their
+  own export?
 - **Q23.** Closed (K-42): complete event text.
 - **Q24.** Closed (K-42): 1.5 s.
 - **Q22.** The brief pools' text on the new stack: the pipeline's short and
@@ -1426,6 +1489,7 @@ Either way, adding embeddings is a new decision with its own approvals.
   tables, benchmark design and proposed SLOs).
 - Coordinator relay, 2026-10-31:
   - Khaliq's decisions K-6, K-22, K-27, K-28 (restated), K-33, K-34, K-36, K-37, K-38, K-39, K-40 and K-42;
+  - the K-38 shape extraction results, `~/selfhost-proof/notes/prod-shape-2026-10-31.md`;
   - storage facts: `sessions` 494 GB, `convergence_events` 210 GB, no
     production S3 bucket, R2 `relayhistory-content` empty, Supabase Pro /
     Large / 2 GB disk / empty.

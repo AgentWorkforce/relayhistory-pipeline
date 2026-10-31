@@ -121,9 +121,11 @@ pgvector in Supabase.
   - Full history is served by the store-agnostic history store (0001
     Amendment 1).
   - Self-host may run the window unbounded.
-- **Window length: 14 days** (Khaliq, 2026-10-31, K-42). The byte size is
-  measured by the counts-only shape extraction (K-38) before the disk
-  resize.
+- **Window length: 14 days** (Khaliq, 2026-10-31, K-42). It was measured
+  by the counts-only shape extraction (K-38,
+  `~/selfhost-proof/notes/prod-shape-2026-10-31.md`): ~16.5 GB of text,
+  ≈ 52-56 GB with indexes, and ≈ 70 GB at the peak-week rate. The
+  recommended disk is 128 GB now and 200-256 GB planned (K-32).
 - **Content rules:**
   - The text is scrubbed before storage, through the same scrub hop as S3
     raw.
