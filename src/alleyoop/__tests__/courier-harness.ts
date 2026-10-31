@@ -130,7 +130,7 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
     return app.request(`${url.pathname}${url.search}`, init, env);
   }) as typeof fetch;
 
-  const config = (): CourierConfig => ({
+  const config = (overrides: Partial<CourierConfig> = {}): CourierConfig => ({
     dbPath,
     statePath,
     ingestUrl: "http://ingest.test",
@@ -143,6 +143,7 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
     closeAfterMinutes: 1_000_000,
     startMode: "all",
     ...(options.format ? { format: options.format } : {}),
+    ...overrides,
   });
 
   const post = (body: unknown, auth?: "migration") => app.request("/v1/pipeline/manifests", {
@@ -211,11 +212,11 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
     return { manifest, records, lines: records.filter((r) => r.kind === "session_event" && r.record_id !== "pre-t0").map((r) => r.payload!.text as string) };
   };
 
-  const run = async () => {
+  const run = async (overrides?: Partial<CourierConfig>) => {
     const original = globalThis.fetch;
     globalThis.fetch = fetchImpl;
     try {
-      return await runCourierOnce(config());
+      return await runCourierOnce(config(overrides));
     } finally {
       globalThis.fetch = original;
     }

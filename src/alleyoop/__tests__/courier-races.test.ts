@@ -320,6 +320,17 @@ describe("activation gate (G1) and old couriers (D1)", () => {
 });
 
 describe("machine claim", () => {
+  test("a bound courier refuses state filed under another machine id", async () => {
+    const w = await world({ format: "ndjson", machineId: "m-claimed" });
+    await w.write(line(0));
+    await w.run();
+    const state = await w.state();
+    state.machine_id = "m-invented";
+    await writeFile(w.statePath, JSON.stringify(state));
+    await expect(w.run({ machineBound: true })).rejects.toMatchObject({ code: "machine_id_mismatch" });
+    expect((await w.run()).sessions).toBe(1);
+  });
+
   test("rebase needs a claim: without one the full manifest is withheld and the courier defers", async () => {
     const w = await world({ format: "ndjson" });
     await w.write(line(0));

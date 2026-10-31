@@ -6,7 +6,7 @@ automatically. Each step needs Khaliq's explicit OK.
 
 1. Create the `MANIFEST_READINESS_KEY` credential in 1Password. It signs reader
    attestations; never put it on disk.
-2. Apply `supabase/migrations/20261031000000_manifest_readiness.sql`.
+2. Apply `supabase/migrations/20261031000100_manifest_readiness.sql`.
 3. Build each reader with `--define __RELEASE_SHA__='"<commit>"'`. A build without
    it reports `unreleased` and cannot attest. The value is a build-time constant
    so a running process cannot claim another build.
@@ -30,6 +30,14 @@ identity.
 claim. A mismatched claim is refused in both modes. A takeover and
 `status?manifest=1` need the claim in both modes, so **production rebase and
 takeover stay blocked until the claim ships**.
+
+The courier gets a claim only through Cloud: set `CLOUD_URL`,
+`CLOUD_TOKEN_COMMAND_JSON` and `MACHINE_ID` (its claimed fleet node id). The
+self-minted `RELAYAUTH_URL` path signs no machine, so it stays on `compat`. A
+state file filed under an older invented id (`m-<hex>`) stops the courier with
+`machine_id_mismatch`, because its keys cannot match the claim; that host needs
+its machine id migrated or its state started fresh, which is an operator
+decision.
 
 ## Retries
 

@@ -140,6 +140,87 @@ export class RelayAuthAssertionProvider implements BearerTokenProvider {
   }
 }
 
+export interface CloudSessionConfig {
+  /** Cloud's origin, e.g. `https://agentrelay.com/cloud`. */
+  baseUrl: string;
+  workspaceId: string;
+  /** The claimed fleet node id: `meta.machineId` on every assertion. */
+  machineId: string;
+  /** The enrolled user's Cloud credential. */
+  cloudToken: () => Promise<string>;
+  refreshSkewSeconds?: number;
+  fetcher?: typeof fetch;
+  now?: () => number;
+}
+
+/**
+ * An assertion brokered by Cloud, which checks that the caller owns the machine
+ * before RelayAuth signs `meta.machineId` onto it. Self-minting cannot carry
+ * that claim: nothing there proves ownership. A refusal for the machine itself
+ * is not retryable, because no retry changes who owns it.
+ */
+export class CloudSessionAssertionProvider implements BearerTokenProvider {
+  readonly #cfg: CloudSessionConfig;
+  readonly #url: string;
+  readonly #fetch: typeof fetch;
+  readonly #now: () => number;
+  readonly #skewMs: number;
+  #cached?: { token: string; expiresAtMs: number };
+  #minting?: Promise<string>;
+
+  constructor(cfg: CloudSessionConfig) {
+    const base = new URL(cfg.baseUrl);
+    if (base.username || base.password || base.search || base.hash)
+      throw new Error("96bulls: CLOUD_URL must not contain credentials, query or fragment");
+    if (base.protocol !== "https:" && !(base.protocol === "http:" && LOOPBACK_HOSTS.has(base.hostname)))
+      throw new Error("96bulls: CLOUD_URL must use https (plain http is loopback-only)");
+    if (!cfg.machineId) throw new Error("96bulls: a Cloud session needs MACHINE_ID, the claimed fleet node id");
+    this.#cfg = cfg;
+    const workspace = encodeURIComponent(cfg.workspaceId);
+    this.#url = `${cfg.baseUrl.replace(/\/$/, "")}/api/v1/workspaces/${workspace}/relayhistory/session`;
+    this.#fetch = cfg.fetcher ?? fetch;
+    this.#now = cfg.now ?? Date.now;
+    this.#skewMs = (cfg.refreshSkewSeconds ?? 15) * 1_000;
+  }
+
+  async get(): Promise<string> {
+    if (this.#cached && this.#cached.expiresAtMs > this.#now() + this.#skewMs) return this.#cached.token;
+    if (!this.#minting) this.#minting = this.#mint().finally(() => (this.#minting = undefined));
+    return this.#minting;
+  }
+
+  invalidate(): boolean {
+    this.#cached = undefined;
+    return true;
+  }
+
+  async #mint(): Promise<string> {
+    const credential = await this.#cfg.cloudToken();
+    if (!credential) throw new Error("96bulls: the Cloud credential source returned an empty value");
+    const response = await this.#fetch(this.#url, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${credential}` },
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+      body: JSON.stringify({ mode: "sync", label: "courier", machine_id: this.#cfg.machineId }),
+    });
+    if (response.status !== 200) {
+      const body = (await response.json().catch(() => ({}))) as { code?: unknown };
+      throw Object.assign(new Error("96bulls: Cloud refused the session"), {
+        code: typeof body.code === "string" ? body.code : `cloud_http_${response.status}`,
+        retryable: response.status === 429 || response.status >= 500,
+      });
+    }
+    const body = (await response.json()) as RelayAuthAssertionResponse;
+    const expiresAtMs = typeof body.accessTokenExpiresAt === "string" ? Date.parse(body.accessTokenExpiresAt) : Number.NaN;
+    if (body.tokenType !== "Bearer" || typeof body.accessToken !== "string" || !body.accessToken || !Number.isFinite(expiresAtMs)) {
+      throw Object.assign(new Error("96bulls: Cloud returned an invalid session"), { code: "cloud_invalid_response", retryable: false });
+    }
+    this.#cached = { token: body.accessToken, expiresAtMs };
+    return body.accessToken;
+  }
+}
+
 /**
  * Parse a JSON argv array rather than a shell command. The command's stdout is
  * the secret; stderr and the secret itself are never included in thrown errors.
