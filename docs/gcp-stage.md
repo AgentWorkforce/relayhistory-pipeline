@@ -463,7 +463,7 @@ first resource. Resource order after that is: the listed Google APIs with
 standard GKE with a one-node default pool in `us-central1-a`, private nodes and
 a private endpoint, the versioned GCS bucket, the empty Secret Manager
 container, Artifact Registry, the runtime service account, Workload Identity for
-`96bulls-worker` and `96bulls-alleyoop`, `roles/storage.objectUser`, and
+`bulls96-worker` and `bulls96-alleyoop`, `roles/storage.objectUser`, and
 `roles/cloudsql.client`. With `managedDataPlane.provision`, Memorystore Redis
 7.2 is created with AUTH off and TLS server authentication, and Pub/Sub is
 created with the dead-letter service agent. The Cloud SQL body is an Action
