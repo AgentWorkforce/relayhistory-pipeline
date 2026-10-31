@@ -13,6 +13,7 @@ import type {
   StageMessage,
 } from "./dlq.js";
 import { deadLetterId } from "./dlq.js";
+import { PipelineError } from "./errors.js";
 import type { PostgresQueueOptions, SqlExecutor } from "./queue.js";
 import type { PipelineStage } from "./trace.js";
 
@@ -79,7 +80,24 @@ export function postgresDeadLetterStore(
   const letters = `${schema}.pipeline_dead_letters`;
 
   return {
-    async quarantine(message, at) {
+    async rerunNormalize(id, replayId) {
+      const { rows } = await sql.query<{ rerun: boolean }>(
+        "SELECT sessions.normalized_ready_replay($1, $2::uuid) AS rerun",
+        [id, replayId],
+      );
+      return rows[0]?.rerun === true;
+    },
+    async quarantine(message, at, job) {
+      // Its letters are written only from the held job, by a narrow function.
+      if (message.stage === "normalized-ready") {
+        if (!job)
+          throw new PipelineError("count_no_job_lease", "normalized-ready needs a leased queue job", true);
+        const { rows } = await sql.query<Row>(
+          `SELECT ${COLUMNS} FROM sessions.normalized_ready_quarantine($1::bigint, $2::uuid)`,
+          [job.id, job.leaseId],
+        );
+        return fromRow(rows[0]!);
+      }
       const { rows } = await sql.query<Row>(
         `INSERT INTO ${letters} AS d
            (id, stage, trace_id, org_id, workspace_id, session_id, machine_id,

@@ -26,6 +26,8 @@ function pipelineError(cause: unknown): PipelineError {
       return new PipelineError("count_conflict", "the count does not match its job or the indexed revision", false);
     case "22023":
       return new PipelineError("invalid_normalized_ready", "the database refused this record", false);
+    case "CN005":
+      return new PipelineError("count_guard_refused", "the guard refused this write", false);
     default:
       return new PipelineError("count_write_failed", "the count could not be written", true);
   }
