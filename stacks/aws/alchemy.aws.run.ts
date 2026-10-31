@@ -12,6 +12,9 @@
  *   CloudTrail (own versioned bucket, SSE-KMS with the trail's own key), monthly
  *   budget, GitHub OIDC provider and a 96bulls-deployer role trusted only for
  *   this repository; with `eks`, the hardened EKS proof stage (eks.ts).
+ *   With `transcriptStore` (aws-sessions-prod): the production transcript bucket
+ *   only, with its CMK, access logs, CloudTrail data events, budget and IAM
+ *   users (transcript-store.ts), instead of the baseline.
  *   Hosted production HoopDb is Supabase and production AWS is S3 only
  *   (docs/decisions/0001-production-data-plane.md); the in-cluster CNPG HoopDb
  *   is for the isolated proof stage.
@@ -39,6 +42,7 @@ import { networkPolicies } from "./proof-addons.ts";
 import { hoopdbBackend } from "./hardening.ts";
 import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
+import { transcriptStoreStage } from "./transcript-store.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const REPO = "AgentWorkforce/96BullSessions";
@@ -152,6 +156,21 @@ export default Alchemy.Stack(
     }
     const purge = inputs.teardown?.purgeBucketsOnDestroy === true;
     const name = (base: string) => `96bulls-${stage}-${base}`;
+
+    // Production transcript store (transcript-store.ts): S3 only (decision 0001), so none of the
+    // baseline below (Locker, ECR, GitHub OIDC, EKS, Supabase). validateAwsInputs refused those inputs.
+    if (inputs.transcriptStore) {
+      const store = yield* transcriptStoreStage({
+        stage,
+        accountId: inputs.accountId,
+        region: inputs.region,
+        budgetUsd: inputs.budgetUsd,
+        budgetEmail: inputs.budgetEmail,
+        transcriptStore: inputs.transcriptStore,
+        tags: (component) => tags(stage, component),
+      });
+      return { stage, accountId: inputs.accountId, region: inputs.region, transcriptStore: store };
+    }
 
     // Account baseline: one KMS key for everything we store.
     const key = yield* AWS.KMS.Key("locker-key", {

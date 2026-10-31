@@ -1,0 +1,20 @@
+Plan · aws-sessions-prod
+Importing stack module
+Resolving stack services
+AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
+Loading stack state
+Computing plan
+Plan ready (2.4s)
+Plan: 3 to create
+[access-logs] noop
+[budget] noop
+[trail] noop
+[trail-key] noop
+[trail-key-alias] noop
+[trail-logs] noop
+[transcript-eraser] noop
+[transcript-reader] noop
+[transcript-writer] noop
+[transcripts] create
+[transcripts-key] create
+[transcripts-key-alias] create
