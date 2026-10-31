@@ -56,8 +56,18 @@ export {
   type RawStore,
 } from "@rhc/lib/pipeline/adapter.ts";
 export { telemetryIdHash, telemetryIdKey } from "@rhc/lib/pipeline/telemetry-ids.ts";
-export { reconcileManifests } from "@rhc/lib/pipeline/reconcile.ts";
+export { reconcileListPrefix, reconcileManifests } from "@rhc/lib/pipeline/reconcile.ts";
 export { SCRUB_RULESET, SCRUB_RULESET_VERSION, sealRawChunk } from "@rhc/lib/pipeline/raw-chunks.ts";
+export {
+  RELAYHISTORY_EXPORT_EXTENSION,
+  RELAYHISTORY_NORMALIZED_VERSION,
+  RelayhistoryExportTransform,
+  normalizeRelayhistoryRecords,
+  parseRelayhistoryRecord,
+  readRelayhistoryExport,
+  type RelayhistoryStreamRecord,
+  type ZstdDecompress,
+} from "@rhc/lib/pipeline/relayhistory-transform.ts";
 export { scrubText, scrubJson } from "@rhc/lib/scrub.ts";
 export type { Bindings, AppEnv } from "@rhc/env.ts";
 

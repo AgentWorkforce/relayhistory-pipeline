@@ -25,9 +25,11 @@
       "note": "node:sqlite and node:zlib zstd need Bun >= 1.4"
     },
     "services": {
-      "ref": "ghcr.io/agentworkforce/96bulls-services",
-      "digest": "sha256:245a75f9d7abdbd2167108db6e4fa852df844b41a22eaebcd64b4dd7b753b2aa",
-      "note": "republished 2026-10-28 from main db2663d with Khaliq's approval (run 40809226023); includes worker + ingest health; linux/amd64+arm64. GHCR copy stays PRIVATE (Khaliq: hosted service, not public); used for kind/self-host tests with a pull secret."
+      "ref": "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services",
+      "digest": "sha256:8d77de9be0b5e5e47dda75986da882e577aafb9e28e510c844e8134fea372425",
+      "sourceRevision": "09293c8d649f912aa2f4414e31a3ad7fca6eceee",
+      "gcpProofEligible": true,
+      "note": "published 2026-10-30 from main 09293c8; immutable Artifact Registry tag sha-09293c8d649f912aa2f4414e31a3ad7fca6eceee; OCI index includes linux/amd64+arm64; image labels identify the exact source repository and revision; attestation manifests include SPDX SBOM and SLSA provenance."
     }
   },
   "vendored": {
