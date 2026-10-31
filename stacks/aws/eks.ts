@@ -17,6 +17,8 @@ import * as AWS from "@alchemy.run/aws";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
 import { ingressStage } from "./ingress.ts";
+import { resolveTenantOrgs, tenantWiring } from "./tenants.ts";
+import { RELAYAUTH_TLS_CLIENT_LABEL, RELAYAUTH_TLS_NAMESPACE, RELAYAUTH_TLS_PORT, RELAYAUTH_TLS_SERVICE, RELAYAUTH_TLS_URL } from "./relayauth-tls.ts";
 import { relayauthStage } from "./relayauth.ts";
 import {
   CONTROL_PLANE_LOG_RETENTION,
@@ -40,6 +42,8 @@ import {
   RELAYCAST_NAMESPACE,
   assertRelaycastInputs,
   assertSessionDirectoryPreconditions,
+  SEARCH_CLIENT_LABEL,
+  SESSION_DIRECTORY_POSTGREST,
   cnpgHoopdbValues,
   cnpgOperatorValues,
   networkPolicies,
@@ -63,7 +67,10 @@ export interface EksStageInputs {
   runtimeSecretName: string;
   lockerBucket: string;
   lockerRegion: string;
-  tenantOrgId: string;
+  /** One tenant org (single-tenant mode). */
+  tenantOrgId?: string;
+  /** Several tenant orgs (org-derived key prefixes; tenants.ts). tenantOrgIds[0] must equal tenantOrgId if both are set. */
+  tenantOrgIds?: string[];
   relayauthJwksUrl: string;
   relayhistoryOrigin: string;
   /** The `iss` RelayAuth stamps; must match exactly or every token is refused. */
@@ -118,7 +125,7 @@ export const OTEL_ENDPOINT = "http://otel-collector:4318";
  * tested without loading either the AWS or Kubernetes providers.
  */
 export function eksChartValues(
-  i: Pick<EksStageInputs, "stage" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "relayhistoryOrigin" | "imageRepository" | "imageDigest">,
+  i: Pick<EksStageInputs, "stage" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "tenantOrgIds" | "relayhistoryOrigin" | "imageRepository" | "imageDigest">,
   sandbox: boolean,
   authIssuer: string,
   authJwksUrl: string,
@@ -128,10 +135,11 @@ export function eksChartValues(
   // Sandboxes and the CNPG proof stage run HoopDb in the cluster; the apps then read
   // the Secret CloudNativePG generates (umbrella default hoopdb-app/uri).
   const inCluster = sandbox || cnpg !== undefined;
+  const tenants = tenantWiring(resolveTenantOrgs(i));
   return {
     global: {
       imageRegistry: "", // the ECR repository below is fully qualified
-      tenant: { orgId: i.tenantOrgId },
+      tenant: { orgId: tenants.primaryOrg },
       otel: { endpoint: OTEL_ENDPOINT },
     },
     worker: {
@@ -146,13 +154,14 @@ export function eksChartValues(
       // Bob Costas alone gets the summary master key (src/shared/keyring.ts): worker 0.4.0 projects
       // this Secret key as a read-only file into Bob Costas only (SUMMARY_MASTER_KEYS_FILE).
       summaryEncryption: { existingSecret: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" },
+      ...(tenants.extraEnv.length ? { extraEnv: tenants.extraEnv } : {}),
     },
     alleyoop: {
       image: { repository: i.imageRepository, digest: i.imageDigest },
       hoopdb: inCluster ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
       locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
       auth: { jwksUrl: authJwksUrl, issuer: authIssuer },
-      extraEnv: [{ name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin }],
+      extraEnv: [{ name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin }, ...tenants.extraEnv],
       deployment: { name: "hosted", id: i.stage },
     },
     otel: {
@@ -290,7 +299,8 @@ export const eksStage = (i: EksStageInputs) =>
 
     // EKS Pod Identity: one role per service account, none shared (hardening.ts `podRoles`).
     // Trust is bound to this account and this cluster. No static keys anywhere.
-    const refs = { lockerBucketArn: i.lockerBucketArn, lockerKmsKeyArn: i.lockerKmsKeyArn, lockerRegion: i.lockerRegion };
+    const keyBase = tenantWiring(resolveTenantOrgs(i)).keyBase;
+    const refs = { lockerBucketArn: i.lockerBucketArn, lockerKmsKeyArn: i.lockerKmsKeyArn, lockerRegion: i.lockerRegion, ...(keyBase ? { keyBase } : {}) };
     for (const r of podRoles(refs)) {
       const role = yield* AWS.IAM.Role(`${r.id}-role`, {
         roleName: `96bulls-${i.stage}-${r.id}`,
@@ -414,5 +424,16 @@ export const eksStage = (i: EksStageInputs) =>
       hostname: publicIngest?.hostname ?? null,
       ingestScheme: publicIngest?.scheme ?? null,
       relayauthIssuer: authIssuer,
+      // Endpoints the proof harness calls (in-cluster only).
+      harness: {
+        tenantOrgIds: resolveTenantOrgs(i),
+        // Secret-bearing RelayAuth calls (relayauth #116 exchange) go here, TLS 1.3, never to the plain Service.
+        relayauthTls: selfAuth
+          ? { service: RELAYAUTH_TLS_SERVICE, namespace: RELAYAUTH_TLS_NAMESPACE, port: RELAYAUTH_TLS_PORT, url: RELAYAUTH_TLS_URL, clientLabel: RELAYAUTH_TLS_CLIENT_LABEL, caConfigMap: "relayauth-ca" }
+          : null,
+        sessionDirectoryPostgrest: sessionDirectory
+          ? { service: SESSION_DIRECTORY_POSTGREST.service, namespace: SESSION_DIRECTORY_POSTGREST.namespace, port: SESSION_DIRECTORY_POSTGREST.port, url: SESSION_DIRECTORY_POSTGREST.url, clientLabel: SEARCH_CLIENT_LABEL }
+          : null,
+      },
     };
   });

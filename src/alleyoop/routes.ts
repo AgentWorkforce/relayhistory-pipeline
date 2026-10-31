@@ -5,20 +5,38 @@
  * (requireAuth), and the operator routes under `/v1/internal/pipeline/*` require
  * PIPELINE_OPS_SECRET (and answer 503 where it is not configured).
  */
-import type { Hono } from "hono";
+import type { Hono, MiddlewareHandler } from "hono";
 import { pipelineOpsRoutes, requireAuth, type AppEnv } from "../shared/vendor.ts";
 import { requestIdentity } from "../shared/enrich.ts";
 
 /** Paths served without authentication. The public ALB contract depends on this list staying this small. */
 export const PUBLIC_INGEST_PATHS = ["/.well-known/jwks.json", "/health", "/healthz", "/readyz"] as const;
 
+/**
+ * Multi-tenant deployments (TENANT_ORG_IDS, stacks/aws/tenants.ts): a valid
+ * RelayAuth token for any other org is refused before any route runs.
+ */
+export function orgAllowlist(allowed: readonly string[]): MiddlewareHandler<AppEnv> {
+  const set = new Set(allowed);
+  return async (c, next) => {
+    const org = (c.get("auth") as { orgId?: string } | undefined)?.orgId;
+    if (!org || !set.has(org))
+      return c.json({ error: { code: "org_not_allowed", message: "this deployment does not accept that org" }, correlationId: c.get("correlationId") ?? "" }, 403);
+    await next();
+  };
+}
+
+/** TENANT_ORG_IDS (comma-separated) to a list; empty means no allowlist (single-tenant mode). */
+export const allowedOrgIdsFromEnv = (v: string | undefined) => (v ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+
 export function mountIngestApi(
   app: Hono<AppEnv>,
   routes: { courierManifests: Hono<AppEnv>; pipeline: Hono<AppEnv> },
   v1: Hono<AppEnv>,
-  opts: { relayhistoryOrigin?: string | undefined } = {},
+  opts: { relayhistoryOrigin?: string | undefined; allowedOrgIds?: readonly string[] | undefined } = {},
 ) {
   v1.use("*", async (c, next) => requireAuth(c as never, next));
+  if (opts.allowedOrgIds?.length) v1.use("*", orgAllowlist(opts.allowedOrgIds));
   // Upload routes on an origin-bound deployment: only assertions minted for
   // this origin (or migration assertions, which are origin-bound by their
   // verifier), whatever the interim bearer flag says.

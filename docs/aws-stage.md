@@ -434,6 +434,36 @@ dropped, `RuntimeDefault` seccomp.
 `iam:UpdateAssumeRolePolicy` or creating identity providers, and denies both
 explicitly: a sandbox role's trust is fixed when it is created.
 
+### Tenant orgs
+
+`eks.tenantOrgId` (one org) keeps the single-tenant layout: keys at `v1/...`,
+values unchanged. `eks.tenantOrgIds` (several, e.g. `["org_aws_proof_1",
+"org_aws_proof_2"]` for the proof's isolation tests) switches both apps to the
+pipeline's org-derived prefixes: every object lands under
+`96bulls/<org>/v1/...`, the org taken from the caller's RelayAuth token and
+applied by the ingest, and the workers read it back from the key
+(`PIPELINE_ORG_FROM_PREFIX=true`, `PIPELINE_KEY_PREFIX=96bulls`). AlleyOop
+refuses (403 `org_not_allowed`) a valid token for any org not in the list
+(`TENANT_ORG_IDS`), and the pod roles' S3 scopes become `96bulls/*/v1/...`
+(`stacks/aws/tenants.ts`). Switching an existing stage between the two layouts
+changes where objects live, so do it only on a fresh stage.
+
+### In-cluster endpoints for the proof harness
+
+The stack outputs them under `eks.harness`:
+
+- **RelayAuth over TLS:** `https://relayauth-tls.relayauth.svc:8443`
+  (Service `relayauth-tls`, namespace `relayauth`, port 8443). Every
+  secret-bearing call (the relayauth #116 exchange) goes here, never to the
+  plain `relayauth:8787` Service. The caller pod must carry
+  `relayauth.agentrelay.com/client: tls` (NetworkPolicy) and trust the CA from
+  the `relayauth-ca` ConfigMap (see "Transport").
+- **Session directory PostgREST (#73, when wired):** Service
+  `session-directory-postgrest`, namespace `96bulls`, port 3000,
+  `http://session-directory-postgrest.96bulls.svc:3000`; pods labelled
+  `app.kubernetes.io/name: session-directory-postgrest`; callers labelled
+  `96bulls.agentrelay.com/search-client: "true"`.
+
 ### Session directory search path (slot for #73)
 
 The session-directory PostgREST profile (96BullSessions #73, stacked on #72 and

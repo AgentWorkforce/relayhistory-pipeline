@@ -161,7 +161,18 @@ export interface NetworkPolicyInputs {
 // ---------------------------------------------------------------------------
 
 /** Labels the #73 PostgREST profile must carry, and the label its search callers carry. */
-export const SESSION_DIRECTORY_POSTGREST = { labels: { "app.kubernetes.io/name": "session-directory-postgrest" }, port: 3000 } as const;
+/**
+ * The #73 profile's contract with this stack: Service `session-directory-postgrest`
+ * in the 96bulls namespace on port 3000, pods labelled as below. The proof
+ * harness addresses it as http://session-directory-postgrest.96bulls.svc:3000.
+ */
+export const SESSION_DIRECTORY_POSTGREST = {
+  service: "session-directory-postgrest",
+  namespace: NAMESPACE,
+  port: 3000,
+  labels: { "app.kubernetes.io/name": "session-directory-postgrest" },
+  url: `http://session-directory-postgrest.${NAMESPACE}.svc:3000`,
+} as const;
 export const SEARCH_CLIENT_LABEL = { "96bulls.agentrelay.com/search-client": "true" } as const;
 
 /**

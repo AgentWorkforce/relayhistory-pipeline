@@ -8,6 +8,7 @@
 import { assertServicesImage, clusterEndpointAccess, hoopdbBackend, lockerLifecycleRules, type HoopDbBackend } from "./hardening.ts";
 import { findPlaceholders, type Approval } from "./deploy-guard.ts";
 import { CNPG_STAGE_RE } from "./hardening.ts";
+import { resolveTenantOrgs } from "./tenants.ts";
 
 /** versions.lock.json `images.services-aws.approved`: the services images an AWS stage may run. */
 export interface ApprovedServicesImage {
@@ -53,7 +54,11 @@ export interface AwsInputs {
   lockerNoncurrentVersionDays?: number;
   /** Khaliq, 2026-10-28: EKS is the first cloud compute target. Omit to declare the baseline only. */
   eks?: {
-    chartVersion: string; runtimeSecretName: string; tenantOrgId: string; relayauthJwksUrl: string; relayhistoryOrigin: string; relayauthIssuer?: string;
+    chartVersion: string; runtimeSecretName: string; relayauthJwksUrl: string;
+    /** One tenant org (existing shape). */
+    tenantOrgId?: string;
+    /** Several tenant orgs; AlleyOop accepts exactly these (tenants.ts). tenantOrgIds[0] must equal tenantOrgId if both are set. */
+    tenantOrgIds?: string[]; relayhistoryOrigin: string; relayauthIssuer?: string;
     relayauth?: { chartVersion: string; secretName: string };
     /** The digest publish-image-ecr pushed to the services repository. Bare `sha256:<64 hex>`; tags are refused. */
     imageDigest: string;
@@ -111,6 +116,7 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
   if (eks.relayauth && eks.relayauthIssuer)
     throw new Error("96bulls: eks.relayauth (self-hosted) and eks.relayauthIssuer are both set; the self-hosted issuer is the in-cluster RelayAuth. Remove relayauthIssuer. Nothing was created.");
   assertServicesImage(eks);
+  resolveTenantOrgs(eks);
   if (eks.imageRepository !== undefined && !/^\d{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com\/96bulls-services$/.test(eks.imageRepository))
     throw new Error(`96bulls: eks.imageRepository must be an ECR 96bulls-services repository URI, got ${JSON.stringify(eks.imageRepository)}. Nothing was created.`);
   if (eks.legacyPodsRole !== undefined && eks.legacyPodsRole !== "keep") throw new Error('96bulls: eks.legacyPodsRole may only be "keep". Nothing was created.');

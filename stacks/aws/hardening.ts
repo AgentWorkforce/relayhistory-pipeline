@@ -147,9 +147,11 @@ export interface LockerRefs {
   lockerBucketArn: string;
   lockerKmsKeyArn: string;
   lockerRegion: string;
+  /** Multi-tenant stages (tenants.ts): session keys are `<keyBase>/<org>/v1/...`. */
+  keyBase?: string;
 }
 
-const sessionObjects = (bucketArn: string, tail: string) => `${bucketArn}/${LAYOUT_VERSION}/*${tail}`;
+const sessionObjects = (i: LockerRefs, tail: string) => `${i.lockerBucketArn}/${i.keyBase ? `${i.keyBase}/*/` : ""}${LAYOUT_VERSION}/*${tail}`;
 
 /**
  * S3 HEAD on a missing key answers 404 only when the caller holds s3:ListBucket
@@ -177,8 +179,8 @@ export function workerPolicy(i: LockerRefs) {
     Version: "2012-10-17" as const,
     Statement: [
       listBucket(i.lockerBucketArn),
-      { Sid: "ReadSessionObjects", Effect: "Allow" as const, Action: ["s3:GetObject"], Resource: [sessionObjects(i.lockerBucketArn, "")] },
-      { Sid: "WriteEncryptedSummaries", Effect: "Allow" as const, Action: ["s3:PutObject"], Resource: [sessionObjects(i.lockerBucketArn, "/summary/*")] },
+      { Sid: "ReadSessionObjects", Effect: "Allow" as const, Action: ["s3:GetObject"], Resource: [sessionObjects(i, "")] },
+      { Sid: "WriteEncryptedSummaries", Effect: "Allow" as const, Action: ["s3:PutObject"], Resource: [sessionObjects(i, "/summary/*")] },
       lockerKms(i, true),
     ],
   };
@@ -190,12 +192,12 @@ export function alleyoopPolicy(i: LockerRefs) {
     Version: "2012-10-17" as const,
     Statement: [
       listBucket(i.lockerBucketArn),
-      { Sid: "ReadSessionObjects", Effect: "Allow" as const, Action: ["s3:GetObject"], Resource: [sessionObjects(i.lockerBucketArn, "")] },
+      { Sid: "ReadSessionObjects", Effect: "Allow" as const, Action: ["s3:GetObject"], Resource: [sessionObjects(i, "")] },
       {
         Sid: "WriteRawChunksAndManifests",
         Effect: "Allow" as const,
         Action: ["s3:PutObject"],
-        Resource: [sessionObjects(i.lockerBucketArn, "/raw/*"), sessionObjects(i.lockerBucketArn, "/manifest.json")],
+        Resource: [sessionObjects(i, "/raw/*"), sessionObjects(i, "/manifest.json")],
       },
       lockerKms(i, true),
     ],

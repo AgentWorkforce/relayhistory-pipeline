@@ -55,3 +55,48 @@ describe("ingest authentication", () => {
     expect([...PUBLIC_INGEST_PATHS].sort()).toEqual(["/.well-known/jwks.json", "/health", "/healthz", "/readyz"]);
   });
 });
+
+describe("tenant org allowlist (TENANT_ORG_IDS)", () => {
+  const { orgAllowlist, allowedOrgIdsFromEnv } = require("../routes.ts") as typeof import("../routes.ts");
+  const withAuth = (orgId?: string) => {
+    const a = new Hono<AppEnv>();
+    a.use("*", async (c, next) => {
+      if (orgId) c.set("auth" as never, { orgId } as never);
+      await next();
+    });
+    a.use("*", orgAllowlist(["org_aws_proof_1", "org_aws_proof_2"]));
+    a.get("/v1/x", (c) => c.json({ ok: true }));
+    return a;
+  };
+  test("admits listed orgs and refuses any other authenticated org with 403", async () => {
+    expect((await withAuth("org_aws_proof_1").request("/v1/x")).status).toBe(200);
+    expect((await withAuth("org_aws_proof_2").request("/v1/x")).status).toBe(200);
+    const r = await withAuth("org_other").request("/v1/x");
+    expect(r.status).toBe(403);
+    expect(((await r.json()) as { error: { code: string } }).error.code).toBe("org_not_allowed");
+    expect((await withAuth(undefined).request("/v1/x")).status).toBe(403);
+  });
+  test("parses TENANT_ORG_IDS; unset means single-tenant (no allowlist)", () => {
+    expect(allowedOrgIdsFromEnv("org_a, org_b,")).toEqual(["org_a", "org_b"]);
+    expect(allowedOrgIdsFromEnv(undefined)).toEqual([]);
+  });
+});
+
+describe("multi-tenant ingest", () => {
+  test("mounts the allowlist only for multi-tenant deployments, after authentication", async () => {
+    const make = (allowedOrgIds?: string[]) => {
+      const a = new Hono<AppEnv>();
+      mountIngestApi(a, { courierManifests: createCourierManifestRoutes(deps), pipeline: createPipelineRoutes(deps) }, new Hono<AppEnv>(), { allowedOrgIds });
+      return a;
+    };
+    // Unauthenticated: 401 either way (auth runs first).
+    expect((await make(["org_a"]).request("/v1/pipeline/events", { method: "POST", body: "{}" }, env)).status).toBe(401);
+    const src = require("node:fs").readFileSync(new URL("../routes.ts", import.meta.url), "utf8") as string;
+    const auth = src.indexOf('v1.use("*", async (c, next) => requireAuth(c as never, next));');
+    const allow = src.indexOf('if (opts.allowedOrgIds?.length) v1.use("*", orgAllowlist(opts.allowedOrgIds));');
+    expect(auth).toBeGreaterThan(0);
+    expect(allow).toBeGreaterThan(auth);
+    const ingest = require("node:fs").readFileSync(new URL("../ingest.ts", import.meta.url), "utf8") as string;
+    expect(ingest).toContain("allowedOrgIds: allowedOrgIdsFromEnv(process.env.TENANT_ORG_IDS)");
+  });
+});

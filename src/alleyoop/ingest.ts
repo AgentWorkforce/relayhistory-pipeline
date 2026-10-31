@@ -34,7 +34,7 @@ import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedMigrationNames } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
 import { courierMigrationLedger, createCourierManifestRoutes } from "./manifests.ts";
-import { mountIngestApi } from "./routes.ts";
+import { allowedOrgIdsFromEnv, mountIngestApi } from "./routes.ts";
 
 /** Test seams for buildIngestApp: an already migrated database and a raw store. */
 export interface IngestOverrides {
@@ -177,7 +177,7 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
       return c.json({ ok: false, reason: "hoopdb_unreachable" }, 503);
     }
   });
-  mountIngestApi(app, { courierManifests, pipeline }, new Hono<AppEnv>(), { relayhistoryOrigin: env.RELAYHISTORY_ORIGIN });
+  mountIngestApi(app, { courierManifests, pipeline }, new Hono<AppEnv>(), { relayhistoryOrigin: env.RELAYHISTORY_ORIGIN, allowedOrgIds: allowedOrgIdsFromEnv(process.env.TENANT_ORG_IDS) });
   app.notFound((c) => c.json({ error: { code: "not_found", message: "no route" } }, 404));
   app.onError((err, c) => {
     log.error("request failed", errorFields(err));

@@ -26,7 +26,10 @@
   "eks": {
     "chartVersion": "0.3.0",
     "runtimeSecretName": "96bulls-runtime",
-    "tenantOrgId": "<org id for the proof tenant>",
+    "tenantOrgIds": [
+      "org_aws_proof_1",
+      "org_aws_proof_2"
+    ],
     "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
     "relayhistoryOrigin": "https://proof-sessions.agentrelay.com",
     "relayauth": {
