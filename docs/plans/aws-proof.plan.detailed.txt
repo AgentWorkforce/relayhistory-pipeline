@@ -4,46 +4,12 @@ Resolving stack services
 AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
 Loading stack state
 Computing plan
-Plan ready (15.4s)
-Plan: 4 to create, 1 to replace
+Plan ready (3.5s)
+Plan: 3 to update
 
-[96bulls] noop
-
-[alb-ingressclass] noop
-
-[alb-ingressclassparams] noop
-
-[alb-logs] noop
-
-[alleyoop-role] noop
-
-[budget] noop
-
-[cert-manager] noop
-
-[cluster] noop
-
-[cnpg-operator] noop
-
-[control-plane-logs] noop
-
-[external-dns] noop
-
-[ingest-cert] noop
-
-[ingest-cert-validation] replace
+[96bulls] update
   properties:
-  -   content: ""
-  +   content: _deff05b5ef3939e09f6480c3a254cbe7.wzccmgtwzk.acm-validations.aws
-  -   name: ""
-  +   name: _5f1f48a8dcad926249c2cc9deccebefa.proof-sessions.agentrelay.com
-    proxied: false
-    ttl: 300
-    type: CNAME
-    zoneId: 34afb0e8fc19f2b6fd025668e880a889
-
-[ingest-ingress] create
-  properties:
+    chart: 96bulls
     cluster:
       accessConfig:
         authenticationMode: API
@@ -111,141 +77,294 @@ Plan: 4 to create, 1 to replace
       upgradePolicy:
         supportType: EXTENDED
       version: "1.37"
-    manifest:
-      apiVersion: networking.k8s.io/v1
-      kind: Ingress
-      metadata:
-        annotations:
-          alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-west-2:500268966557:certificate/9d5058a4-bc00-4bbd-b26a-99894f20c009
-          alb.ingress.kubernetes.io/healthcheck-path: /healthz
-          alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
-          alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
-          alb.ingress.kubernetes.io/target-type: ip
-          alb.ingress.kubernetes.io/wafv2-acl-arn: (known after apply)
-          external-dns.alpha.kubernetes.io/hostname: proof-sessions.agentrelay.com
-        name: 96bulls-ingest
-        namespace: 96bulls
-      spec:
-        ingressClassName: alb-public
-        rules:
-          - host: proof-sessions.agentrelay.com
-            http:
-              paths:
-                - backend:
-                    service:
-                      name: 96bulls-alleyoop
-                      port:
-                        number: 8080
-                  path: /
-                  pathType: Prefix
+    createNamespace: true
+    namespace: 96bulls
+    releaseName: 96bulls
+    repo: https://AgentWorkforce.github.io/helm-charts
+    values:
+      alleyoop:
+        auth:
+          issuer: http://relayauth.relayauth.svc:8787
+          jwksUrl: http://relayauth.relayauth.svc:8787/.well-known/jwks.json
+        deployment:
+          id: aws-proof
+          name: hosted
+  -       extraEnv:
+  -         - name: RELAYHISTORY_ORIGIN
+  -           value: https://proof-sessions.agentrelay.com
+  +       extraEnv:
+  +         - name: RELAYHISTORY_ORIGIN
+  +           value: https://proof-sessions.agentrelay.com
+  +         - name: PIPELINE_ORG_FROM_PREFIX
+  +           value: "true"
+  +         - name: PIPELINE_KEY_PREFIX
+  +           value: 96bulls
+  +         - name: TENANT_ORG_IDS
+  +           value: org_aws_proof_1,org_aws_proof_2
+        hoopdb: {}
+        image:
+          digest: sha256:59d9468551ded11f3c6f5d36558ab7ef87c3e50e99772de352cc309823cb00e0
+          repository: 500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services
+        locker:
+          bucket: 96bulls-aws-proof-locker-500268966557
+          credentials:
+            mode: podIdentity
+          endpoint: ""
+          region: us-west-2
+      global:
+        imageRegistry: ""
+        otel:
+          endpoint: http://otel-collector:4318
+        tenant:
+          orgId: org_aws_proof_1
+      hoopdb:
+        backups:
+          enabled: false
+        cluster:
+          annotations:
+            96bulls.agentrelay.com/cnpg-operator-release: cnpg
+          imageName: ghcr.io/cloudnative-pg/postgresql:17-standard-trixie@sha256:ed6923f9ba2399cf9070379a353c710c29ced8a294be73986a2c3dae7e599ce3
+          instances: 1
+          storage:
+            size: 20Gi
+            storageClass: 96bulls-gp3
+        enabled: true
+      locker:
+        enabled: false
+      otel:
+        config:
+          exporters:
+            awss3/traces:
+              marshaler: otlp_json
+              s3uploader:
+                compression: gzip
+                region: us-west-2
+                s3_base_prefix: telemetry
+                s3_bucket: 96bulls-aws-proof-locker-500268966557
+                s3_partition_timezone: UTC
+                s3_prefix: traces
+                unique_key_func_name: uuidv7
+              sending_queue:
+                enabled: true
+                num_consumers: 2
+                queue_size: 100
+              timeout: 20s
+            nop: {}
+          processors:
+            attributes/drop_forbidden:
+              actions:
+                - action: delete
+                  key: prompt
+                - action: delete
+                  key: summary
+                - action: delete
+                  key: message
+                - action: delete
+                  key: path
+                - action: delete
+                  key: body
+            redaction:
+              allow_all_keys: true
+              blocked_values:
+                - AKIA[0-9A-Z]{16}
+                - ASIA[0-9A-Z]{16}
+                - sk-[A-Za-z0-9_-]{16,}
+                - xox[abpr]-[A-Za-z0-9-]{10,}
+                - -----BEGIN [A-Z ]*PRIVATE KEY-----
+                - eyJ[A-Za-z0-9_-]{10,}[.][A-Za-z0-9_-]{10,}[.][A-Za-z0-9_-]{10,}
+                - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}"
+              summary: silent
+          service:
+            pipelines:
+              logs:
+                exporters:
+                  - nop
+                processors:
+                  - memory_limiter
+                  - batch
+                receivers:
+                  - otlp
+              metrics:
+                exporters:
+                  - nop
+                processors:
+                  - memory_limiter
+                  - batch
+                receivers:
+                  - otlp
+              traces:
+                exporters:
+                  - awss3/traces
+                processors:
+                  - memory_limiter
+                  - attributes/drop_forbidden
+                  - redaction
+                  - batch
+                receivers:
+                  - otlp
+        enabled: true
+        fullnameOverride: otel-collector
+        image:
+          digest: sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849
+          repository: otel/opentelemetry-collector-contrib
+          tag: 0.163.2
+        podSecurityContext:
+          runAsGroup: 10001
+          runAsNonRoot: true
+          runAsUser: 10001
+          seccompProfile:
+            type: RuntimeDefault
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true
+        serviceAccount:
+          automountServiceAccountToken: false
+      worker:
+        deployment:
+          id: aws-proof
+          name: hosted
+  +       extraEnv:
+  +         - name: PIPELINE_ORG_FROM_PREFIX
+  +           value: "true"
+  +         - name: PIPELINE_KEY_PREFIX
+  +           value: 96bulls
+  +         - name: TENANT_ORG_IDS
+  +           value: org_aws_proof_1,org_aws_proof_2
+        hoopdb: {}
+        image:
+          digest: sha256:59d9468551ded11f3c6f5d36558ab7ef87c3e50e99772de352cc309823cb00e0
+          repository: 500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services
+        locker:
+          bucket: 96bulls-aws-proof-locker-500268966557
+          credentials:
+            mode: podIdentity
+          endpoint: ""
+          region: us-west-2
+        lockerInit:
+          enabled: false
+        migrations:
+          supabaseShim: true
+        summaryEncryption:
+          existingSecret: 96bulls-runtime
+          key: SUMMARY_MASTER_KEYS
+    version: 0.3.0
 
-[ingest-waf] create
+[alb-ingressclass] noop
+
+[alb-ingressclassparams] noop
+
+[alb-logs] noop
+
+[alleyoop-role] update
   properties:
-    defaultAction:
-      Allow: {}
-    description: "96bulls aws-proof: ingest ALB, managed rules, per-IP rate limit, operator routes blocked"
-    rules:
-      - Name: AWSManagedRulesAmazonIpReputationList
-        OverrideAction:
-          None: {}
-        Priority: 0
-        Statement:
-          ManagedRuleGroupStatement:
-            Name: AWSManagedRulesAmazonIpReputationList
-            VendorName: AWS
-        VisibilityConfig:
-          CloudWatchMetricsEnabled: true
-          MetricName: AWSManagedRulesAmazonIpReputationList
-          SampledRequestsEnabled: true
-      - Name: AWSManagedRulesKnownBadInputsRuleSet
-        OverrideAction:
-          None: {}
-        Priority: 1
-        Statement:
-          ManagedRuleGroupStatement:
-            Name: AWSManagedRulesKnownBadInputsRuleSet
-            RuleActionOverrides:
-              - ActionToUse:
-                  Count: {}
-                Name: Log4JRCE_BODY
-              - ActionToUse:
-                  Count: {}
-                Name: JavaDeserializationRCE_BODY
-            VendorName: AWS
-        VisibilityConfig:
-          CloudWatchMetricsEnabled: true
-          MetricName: AWSManagedRulesKnownBadInputsRuleSet
-          SampledRequestsEnabled: true
-      - Name: AWSManagedRulesCommonRuleSet
-        OverrideAction:
-          None: {}
-        Priority: 2
-        Statement:
-          ManagedRuleGroupStatement:
-            Name: AWSManagedRulesCommonRuleSet
-            RuleActionOverrides:
-              - ActionToUse:
-                  Count: {}
-                Name: SizeRestrictions_BODY
-              - ActionToUse:
-                  Count: {}
-                Name: CrossSiteScripting_BODY
-              - ActionToUse:
-                  Count: {}
-                Name: GenericLFI_BODY
-              - ActionToUse:
-                  Count: {}
-                Name: GenericRFI_BODY
-              - ActionToUse:
-                  Count: {}
-                Name: EC2MetaDataSSRF_BODY
-            VendorName: AWS
-        VisibilityConfig:
-          CloudWatchMetricsEnabled: true
-          MetricName: AWSManagedRulesCommonRuleSet
-          SampledRequestsEnabled: true
-      - Action:
-          Block: {}
-        Name: rate-limit-per-ip
-        Priority: 3
-        Statement:
-          RateBasedStatement:
-            AggregateKeyType: IP
-            EvaluationWindowSec: 300
-            Limit: 2000
-        VisibilityConfig:
-          CloudWatchMetricsEnabled: true
-          MetricName: rate-limit-per-ip
-          SampledRequestsEnabled: true
-      - Action:
-          Block: {}
-        Name: block-operator-routes
-        Priority: 4
-        Statement:
-          ByteMatchStatement:
-            FieldToMatch:
-              UriPath: {}
-            PositionalConstraint: STARTS_WITH
-            SearchString: /v1/internal/
-            TextTransformations:
-              - Priority: 0
-                Type: URL_DECODE
-              - Priority: 1
-                Type: LOWERCASE
-        VisibilityConfig:
-          CloudWatchMetricsEnabled: true
-          MetricName: block-operator-routes
-          SampledRequestsEnabled: true
-    scope: REGIONAL
+    assumeRolePolicyDocument:
+      Statement:
+        - Action:
+            - sts:AssumeRole
+            - sts:TagSession
+          Condition:
+            ArnEquals:
+              aws:SourceArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-proof
+            StringEquals:
+              aws:SourceAccount: "500268966557"
+          Effect: Allow
+          Principal:
+            Service: pods.eks.amazonaws.com
+      Version: 2012-10-17
+    description: "96bulls aws-proof: AlleyOop ingest: read sessions, write raw chunks and manifests (Pod Identity 96bulls/96bulls-alleyoop)"
+    inlinePolicies:
+      locker:
+  -       Statement:
+  -         - Action:
+  -             - s3:ListBucket
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557
+  -           Sid: ListForMissingKeySemantics
+  -         - Action:
+  -             - s3:GetObject
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557/v1/*
+  -           Sid: ReadSessionObjects
+  -         - Action:
+  -             - s3:PutObject
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557/v1/*/raw/*
+  -             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557/v1/*/manifest.json
+  -           Sid: WriteRawChunksAndManifests
+  -         - Action:
+  -             - kms:Decrypt
+  -             - kms:GenerateDataKey
+  -           Condition:
+  -             StringEquals:
+  -               kms:ViaService: s3.us-west-2.amazonaws.com
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:kms:us-west-2:500268966557:key/37a71ccf-45ae-4c40-8876-9d71032c5f47
+  -           Sid: LockerKeyReadWriteViaS3
+  +       Statement:
+  +         - Action:
+  +             - s3:ListBucket
+  +           Effect: Allow
+  +           Resource:
+  +             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557
+  +           Sid: ListForMissingKeySemantics
+  +         - Action:
+  +             - s3:GetObject
+  +           Effect: Allow
+  +           Resource:
+  +             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557/96bulls/*/v1/*
+  +           Sid: ReadSessionObjects
+  +         - Action:
+  +             - s3:PutObject
+  +           Effect: Allow
+  +           Resource:
+  +             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557/96bulls/*/v1/*/raw/*
+  +             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557/96bulls/*/v1/*/manifest.json
+  +           Sid: WriteRawChunksAndManifests
+  +         - Action:
+  +             - kms:Decrypt
+  +             - kms:GenerateDataKey
+  +           Condition:
+  +             StringEquals:
+  +               kms:ViaService: s3.us-west-2.amazonaws.com
+  +           Effect: Allow
+  +           Resource:
+  +             - arn:aws:kms:us-west-2:500268966557:key/37a71ccf-45ae-4c40-8876-9d71032c5f47
+  +           Sid: LockerKeyReadWriteViaS3
+        Version: 2012-10-17
+    maxSessionDuration: 1 hour
+    roleName: 96bulls-aws-proof-alleyoop
     tags:
       96bulls:component: eks
       96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:service-account: 96bulls/96bulls-alleyoop
       96bulls:stack: aws-proof
-    visibilityConfig:
-      CloudWatchMetricsEnabled: true
-      MetricName: 96bulls-aws-proof-ingest
-      SampledRequestsEnabled: true
-    webAclName: 96bulls-aws-proof-ingest
+
+[budget] noop
+
+[cert-manager] noop
+
+[cluster] noop
+
+[cnpg-operator] noop
+
+[control-plane-logs] noop
+
+[external-dns] noop
+
+[ingest-cert] noop
+
+[ingest-cert-validation] noop
+
+[ingest-ingress] noop
+
+[ingest-waf] noop
 
 [network/InternetGateway] noop
 
@@ -343,166 +462,9 @@ Plan: 4 to create, 1 to replace
 
 [relayauth-tls-deployment] noop
 
-[relayauth-tls-issuer-relayauth-ca] create
-  properties:
-    cluster:
-      accessConfig:
-        authenticationMode: API
-      certificateAuthorityData: <public cluster CA omitted>
-      clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-proof
-      clusterName: 96bulls-aws-proof
-      computeConfig:
-        enabled: true
-        nodePools:
-          - system
-          - general-purpose
-        nodeRoleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-node-role-aws-proof-ef35ez7hctuvt553
-      connection:
-        auth:
-          clusterName: 96bulls-aws-proof
-          kind: aws-eks
-          region: us-west-2
-        certificateAuthorityData: <public cluster CA omitted>
-        endpoint: https://A72E8ECF846136610D34F98BE9B150A1.gr7.us-west-2.eks.amazonaws.com
-      deletionProtection: false
-      endpoint: https://A72E8ECF846136610D34F98BE9B150A1.gr7.us-west-2.eks.amazonaws.com
-      kubernetesNetworkConfig:
-        elasticLoadBalancing:
-          enabled: true
-        ipFamily: ipv4
-        serviceIpv4Cidr: 172.20.0.0/16
-      kubernetesObjects: []
-      logging:
-        clusterLogging:
-          - enabled: true
-            types:
-              - api
-              - audit
-              - authenticator
-              - controllerManager
-              - scheduler
-      managedClusterRoleName: 96bulls-aws-cluster-cluster-role-aws-proof-ef35ez7hctuvt553
-      managedNodeRoleName: 96bulls-aws-cluster-node-role-aws-proof-ef35ez7hctuvt553
-      oidcIssuer: https://oidc.eks.us-west-2.amazonaws.com/id/A72E8ECF846136610D34F98BE9B150A1
-      platformVersion: eks.7
-      resourcesVpcConfig:
-        clusterSecurityGroupId: sg-058b1b34844554eed
-        endpointPrivateAccess: true
-        endpointPublicAccess: true
-        publicAccessCidrs:
-          - operator-address-redacted/32
-        securityGroupIds: []
-        subnetIds:
-          - subnet-013947c45ba7b82c9
-          - subnet-0936e468c181ce43b
-        vpcId: vpc-01d8a51bd32b030ea
-      roleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-cluster-role-aws-proof-ef35ez7hctuvt553
-      status: ACTIVE
-      storageConfig:
-        blockStorage:
-          enabled: true
-      tags:
-        96bulls:component: eks
-        96bulls:control-plane-logs: /aws/eks/96bulls-aws-proof/cluster
-        96bulls:repo: AgentWorkforce/96BullSessions
-        96bulls:stack: aws-proof
-        alchemy::id: cluster
-        alchemy::stack: 96bulls-aws
-        alchemy::stage: aws-proof
-      upgradePolicy:
-        supportType: EXTENDED
-      version: "1.37"
-    manifest:
-      apiVersion: cert-manager.io/v1
-      kind: Issuer
-      metadata:
-        annotations:
-          96bulls.agentrelay.com/after-release: cert-manager
-        name: relayauth-ca
-        namespace: relayauth
-      spec:
-        ca:
-          secretName: relayauth-ca
+[relayauth-tls-issuer-relayauth-ca] noop
 
-[relayauth-tls-issuer-relayauth-selfsigned] create
-  properties:
-    cluster:
-      accessConfig:
-        authenticationMode: API
-      certificateAuthorityData: <public cluster CA omitted>
-      clusterArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-proof
-      clusterName: 96bulls-aws-proof
-      computeConfig:
-        enabled: true
-        nodePools:
-          - system
-          - general-purpose
-        nodeRoleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-node-role-aws-proof-ef35ez7hctuvt553
-      connection:
-        auth:
-          clusterName: 96bulls-aws-proof
-          kind: aws-eks
-          region: us-west-2
-        certificateAuthorityData: <public cluster CA omitted>
-        endpoint: https://A72E8ECF846136610D34F98BE9B150A1.gr7.us-west-2.eks.amazonaws.com
-      deletionProtection: false
-      endpoint: https://A72E8ECF846136610D34F98BE9B150A1.gr7.us-west-2.eks.amazonaws.com
-      kubernetesNetworkConfig:
-        elasticLoadBalancing:
-          enabled: true
-        ipFamily: ipv4
-        serviceIpv4Cidr: 172.20.0.0/16
-      kubernetesObjects: []
-      logging:
-        clusterLogging:
-          - enabled: true
-            types:
-              - api
-              - audit
-              - authenticator
-              - controllerManager
-              - scheduler
-      managedClusterRoleName: 96bulls-aws-cluster-cluster-role-aws-proof-ef35ez7hctuvt553
-      managedNodeRoleName: 96bulls-aws-cluster-node-role-aws-proof-ef35ez7hctuvt553
-      oidcIssuer: https://oidc.eks.us-west-2.amazonaws.com/id/A72E8ECF846136610D34F98BE9B150A1
-      platformVersion: eks.7
-      resourcesVpcConfig:
-        clusterSecurityGroupId: sg-058b1b34844554eed
-        endpointPrivateAccess: true
-        endpointPublicAccess: true
-        publicAccessCidrs:
-          - operator-address-redacted/32
-        securityGroupIds: []
-        subnetIds:
-          - subnet-013947c45ba7b82c9
-          - subnet-0936e468c181ce43b
-        vpcId: vpc-01d8a51bd32b030ea
-      roleArn: arn:aws:iam::500268966557:role/96bulls-aws-cluster-cluster-role-aws-proof-ef35ez7hctuvt553
-      status: ACTIVE
-      storageConfig:
-        blockStorage:
-          enabled: true
-      tags:
-        96bulls:component: eks
-        96bulls:control-plane-logs: /aws/eks/96bulls-aws-proof/cluster
-        96bulls:repo: AgentWorkforce/96BullSessions
-        96bulls:stack: aws-proof
-        alchemy::id: cluster
-        alchemy::stack: 96bulls-aws
-        alchemy::stage: aws-proof
-      upgradePolicy:
-        supportType: EXTENDED
-      version: "1.37"
-    manifest:
-      apiVersion: cert-manager.io/v1
-      kind: Issuer
-      metadata:
-        annotations:
-          96bulls.agentrelay.com/after-release: cert-manager
-        name: relayauth-selfsigned
-        namespace: relayauth
-      spec:
-        selfSigned: {}
+[relayauth-tls-issuer-relayauth-selfsigned] noop
 
 [relayauth-tls-service] noop
 
@@ -528,4 +490,88 @@ Plan: 4 to create, 1 to replace
 
 [network/Vpc] noop
 
-[worker-role] noop
+[worker-role] update
+  properties:
+    assumeRolePolicyDocument:
+      Statement:
+        - Action:
+            - sts:AssumeRole
+            - sts:TagSession
+          Condition:
+            ArnEquals:
+              aws:SourceArn: arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-proof
+            StringEquals:
+              aws:SourceAccount: "500268966557"
+          Effect: Allow
+          Principal:
+            Service: pods.eks.amazonaws.com
+      Version: 2012-10-17
+    description: "96bulls aws-proof: worker components (indexer, referee, bob-costas, migrate): read sessions, write encrypted summaries (Pod Identity 96bulls/96bulls-worker)"
+    inlinePolicies:
+      locker:
+  -       Statement:
+  -         - Action:
+  -             - s3:ListBucket
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557
+  -           Sid: ListForMissingKeySemantics
+  -         - Action:
+  -             - s3:GetObject
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557/v1/*
+  -           Sid: ReadSessionObjects
+  -         - Action:
+  -             - s3:PutObject
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557/v1/*/summary/*
+  -           Sid: WriteEncryptedSummaries
+  -         - Action:
+  -             - kms:Decrypt
+  -             - kms:GenerateDataKey
+  -           Condition:
+  -             StringEquals:
+  -               kms:ViaService: s3.us-west-2.amazonaws.com
+  -           Effect: Allow
+  -           Resource:
+  -             - arn:aws:kms:us-west-2:500268966557:key/37a71ccf-45ae-4c40-8876-9d71032c5f47
+  -           Sid: LockerKeyReadWriteViaS3
+  +       Statement:
+  +         - Action:
+  +             - s3:ListBucket
+  +           Effect: Allow
+  +           Resource:
+  +             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557
+  +           Sid: ListForMissingKeySemantics
+  +         - Action:
+  +             - s3:GetObject
+  +           Effect: Allow
+  +           Resource:
+  +             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557/96bulls/*/v1/*
+  +           Sid: ReadSessionObjects
+  +         - Action:
+  +             - s3:PutObject
+  +           Effect: Allow
+  +           Resource:
+  +             - arn:aws:s3:::96bulls-aws-proof-locker-500268966557/96bulls/*/v1/*/summary/*
+  +           Sid: WriteEncryptedSummaries
+  +         - Action:
+  +             - kms:Decrypt
+  +             - kms:GenerateDataKey
+  +           Condition:
+  +             StringEquals:
+  +               kms:ViaService: s3.us-west-2.amazonaws.com
+  +           Effect: Allow
+  +           Resource:
+  +             - arn:aws:kms:us-west-2:500268966557:key/37a71ccf-45ae-4c40-8876-9d71032c5f47
+  +           Sid: LockerKeyReadWriteViaS3
+        Version: 2012-10-17
+    maxSessionDuration: 1 hour
+    roleName: 96bulls-aws-proof-worker
+    tags:
+      96bulls:component: eks
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:service-account: 96bulls/96bulls-worker
+      96bulls:stack: aws-proof

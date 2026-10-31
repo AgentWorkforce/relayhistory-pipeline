@@ -4,13 +4,13 @@ Resolving stack services
 AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
 Loading stack state
 Computing plan
-Plan ready (4.2s)
-Plan: 4 to create, 1 to replace
-[96bulls] noop
+Plan ready (3.9s)
+Plan: 3 to update
+[96bulls] update
 [alb-ingressclass] noop
 [alb-ingressclassparams] noop
 [alb-logs] noop
-[alleyoop-role] noop
+[alleyoop-role] update
 [budget] noop
 [cert-manager] noop
 [cluster] noop
@@ -18,9 +18,9 @@ Plan: 4 to create, 1 to replace
 [control-plane-logs] noop
 [external-dns] noop
 [ingest-cert] noop
-[ingest-cert-validation] replace
-[ingest-ingress] create
-[ingest-waf] create
+[ingest-cert-validation] noop
+[ingest-ingress] noop
+[ingest-waf] noop
 [network/InternetGateway] noop
 [locker] noop
 [locker-key] noop
@@ -69,8 +69,8 @@ Plan: 4 to create, 1 to replace
 [relayauth-tls-certificate-relayauth-tls] noop
 [relayauth-tls-configmap] noop
 [relayauth-tls-deployment] noop
-[relayauth-tls-issuer-relayauth-ca] create
-[relayauth-tls-issuer-relayauth-selfsigned] create
+[relayauth-tls-issuer-relayauth-ca] noop
+[relayauth-tls-issuer-relayauth-selfsigned] noop
 [relayauth-tls-service] noop
 [relayauth-tls-serviceaccount] noop
 [relaycast] noop
@@ -83,4 +83,4 @@ Plan: 4 to create, 1 to replace
 [trail-key-alias] noop
 [trail-logs] noop
 [network/Vpc] noop
-[worker-role] noop
+[worker-role] update

@@ -62,7 +62,11 @@
         "name": "_5f1f48a8dcad926249c2cc9deccebefa.proof-sessions.agentrelay.com.",
         "value": "_deff05b5ef3939e09f6480c3a254cbe7.wzccmgtwzk.acm-validations.aws."
       }
-    }
+    },
+    "tenantOrgIds": [
+      "org_aws_proof_1",
+      "org_aws_proof_2"
+    ]
   },
   "clearedBy": "Khaliq, 2026-10-30, in the self-hosted-lead session: \"yes u have OK for everything\" and \"Yes, apply A now\""
 }
