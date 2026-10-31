@@ -346,10 +346,19 @@ describe("session_directory query plans", () => {
         FROM generate_series(1, 10000) AS n;
       ANALYZE sessions.session_directory;
     `);
+    await db.query(
+      "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
+      ["https://issuer.test/session-directory", "session-directory-search"],
+    );
     const asWorker = async (agent: string) => {
+      const iat = Math.floor(Date.now() / 1000);
       await db.query("SELECT set_config('request.jwt.claims', $1, false)", [
         JSON.stringify({
           role: "session_directory_search_worker",
+          iss: "https://issuer.test/session-directory",
+          aud: "session-directory-search",
+          iat,
+          exp: iat + 60,
           app_metadata: { org_id: "o", workspace_ids: ["w"] },
         }),
       ]);

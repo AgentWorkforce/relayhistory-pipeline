@@ -9,10 +9,8 @@ import { createServer } from "node:http";
 import { Hono } from "hono";
 import {
   createPipelineRoutes,
-  pipelineOpsRoutes,
   postgresDeadLetterStore,
   postgresPipelineQueue,
-  requireAuth,
   TRACE_ID_HEADER,
   traceIdFromHeaders,
   type AppEnv,
@@ -32,7 +30,7 @@ import {
   waitForSchema,
   isPrerequisiteStep,
 } from "../shared/db.ts";
-import { enrichMessage, requestIdentity } from "../shared/enrich.ts";
+import { enrichMessage } from "../shared/enrich.ts";
 import { lockerStore } from "../shared/locker.ts";
 import { traceparentFor } from "../shared/ids.ts";
 import { integer, optional, required, vendorBindings } from "../shared/env.ts";
@@ -43,14 +41,14 @@ import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedMigrationNames } from "../hoopdb/migrate.ts";
 import { jwksFromPrivateKey } from "./auth.ts";
-import { allowedOrgIdsFromEnv, orgAllowlist } from "./org-allowlist.ts";
+import { allowedOrgIdsFromEnv } from "./org-allowlist.ts";
 import {
   claimlessWindowDates,
   courierMigrationLedger,
   createCourierManifestRoutes,
-  liveWriteMachineGate,
   type ClaimlessUse,
 } from "./manifests.ts";
+import { mountIngestApi } from "./routes.ts";
 
 /** Test seams for buildIngestApp: an already migrated database and a raw store. */
 export interface IngestOverrides {
@@ -358,55 +356,12 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
       return c.json({ error: { code: "not_found", message: "no route" } }, 404);
     await next();
   });
-  const v1 = new Hono<AppEnv>();
-  v1.use("*", async (c, next) => requireAuth(c as never, next));
-  // A fixed set of tenant orgs (TENANT_ORG_IDS): any other verified org is
-  // refused before any route runs. Unset: no allowlist.
-  const allowedOrgIds = allowedOrgIdsFromEnv(process.env.TENANT_ORG_IDS);
-  if (allowedOrgIds.length) v1.use("*", orgAllowlist(allowedOrgIds));
-  // Upload routes on an origin-bound deployment: only assertions minted for
-  // this origin (or migration assertions, which are origin-bound by their
-  // verifier), whatever the interim bearer flag says.
-  v1.use("*", async (c, next) => {
-    const path = c.req.path;
-    const upload =
-      path === "/v1/pipeline/chunks" ||
-      path === "/v1/pipeline/manifests" ||
-      path === "/v1/pipeline/manifests/status";
-    const auth = c.get("auth") as
-      { historyOrigin?: string; migration?: unknown } | undefined;
-    if (
-      upload &&
-      env.RELAYHISTORY_ORIGIN &&
-      !auth?.migration &&
-      !auth?.historyOrigin
-    )
-      return c.json(
-        {
-          error: {
-            code: "origin_bound_assertion_required",
-            message:
-              "upload routes take only assertions minted for this origin",
-          },
-          correlationId: c.get("correlationId") ?? "",
-        },
-        403,
-      );
-    await next();
+  // Authentication, the tenant org allowlist, the origin rule and the live-write machine
+  // gate, in that order, before any /v1 route (routes.ts; tested route by route).
+  mountIngestApi(app, { courierManifests, pipeline }, new Hono<AppEnv>(), {
+    relayhistoryOrigin: env.RELAYHISTORY_ORIGIN,
+    allowedOrgIds: allowedOrgIdsFromEnv(process.env.TENANT_ORG_IDS),
   });
-  // A live write must be bound to its machine before any route stores anything.
-  v1.use("*", liveWriteMachineGate);
-  // Every send made while handling this request carries the authenticated user.
-  v1.use("*", async (c, next) => {
-    const auth = c.get("auth") as { userId?: string } | undefined;
-    return requestIdentity.run({ userId: auth?.userId }, () => next());
-  });
-  // AlleyOop owns authenticated manifest writes and their compare-and-swap
-  // fence. Mount before the provenance-tracked pipeline routes it shadows.
-  v1.route("/", courierManifests);
-  v1.route("/", pipeline);
-  app.route("/v1", pipelineOpsRoutes);
-  app.route("/v1", v1);
   app.notFound((c) =>
     c.json({ error: { code: "not_found", message: "no route" } }, 404),
   );

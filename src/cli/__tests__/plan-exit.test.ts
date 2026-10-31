@@ -14,20 +14,21 @@ describe("gcp plan exit", () => {
     expect(planChildMustFailClosed(true, null)).toBe(false);
   });
 
-  it("keeps the gcp plan call fail-closed and leaves the aws plan swallow in place", () => {
+  it("keeps the gcp plan call fail-closed, and routes aws plan/up/down through the fail-closed aws runner", () => {
     const cli = readFileSync(new URL("../main.ts", import.meta.url), "utf8");
     const plan = cli.slice(cli.indexOf('case "plan"'), cli.indexOf('case "seed"'));
     const gcpAt = plan.indexOf('startsWith("gcp-")');
-    const awsAt = plan.indexOf('startsWith("aws-")');
     const localAt = plan.indexOf("requireLocalStage(stageArg)");
-    expect(gcpAt).toBeGreaterThan(awsAt);
     expect(localAt).toBeGreaterThan(gcpAt);
     const gcp = plan.slice(gcpAt, localAt);
-    const aws = plan.slice(awsAt, gcpAt);
     expect(gcp).toContain("stacks/gcp/alchemy.gcp.run.ts");
     expect(gcp).toContain("allowFail: false");
     expect(gcp).not.toContain("allowFail: true");
-    expect(aws).toContain("allowFail: true");
-    expect(aws).toContain("stacks/aws/alchemy.aws.run.ts");
+    // AWS: dispatched before the switch; the runner never sets allowFail.
+    expect(cli).toContain('if (stageArg?.startsWith("aws-") && (command === "plan" || command === "up" || command === "down")) return await aws(command, stageArg);');
+    const runner = cli.slice(cli.indexOf("function aws("), cli.indexOf("async function main()"));
+    expect(runner).toContain("sh(\"bunx\", inv.args, { env: inv.env });");
+    expect(runner).not.toContain("allowFail");
+    expect(plan).not.toContain("stacks/aws/alchemy.aws.run.ts");
   });
 });

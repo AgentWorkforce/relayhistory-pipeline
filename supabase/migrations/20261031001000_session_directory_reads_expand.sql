@@ -11,8 +11,9 @@
 --
 -- Both functions follow the search RPC's rules: SECURITY DEFINER with a pinned
 -- search_path, fixed SQL with bound values, the caller must be the
--- session_directory_search_worker role, the tenant comes only from the signed JWT claims,
--- and EXECUTE goes to that role alone.
+-- session_directory_search_worker role, the tenant comes only from the signed JWT claims
+-- (with the same issuer, audience, lifetime and workspace-bound pins), and EXECUTE goes
+-- to that role alone.
 --
 -- Code only; nothing here is applied by this repository. Down path:
 -- supabase/rollbacks/20261031001000_session_directory_reads_expand.down.sql.
@@ -71,7 +72,9 @@ LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog, sessions, pg_temp AS $scope$
 DECLARE
   v_claims jsonb;
+  v_policy sessions.session_directory_search_token_policy%ROWTYPE;
   v_org text;
+  v_workspace_claim jsonb;
   v_workspaces text[];
 BEGIN
   -- Inside SECURITY DEFINER the `role` setting still names the caller's SET ROLE.
@@ -91,11 +94,35 @@ BEGIN
      OR jsonb_typeof(v_claims -> 'app_metadata' -> 'workspace_ids') IS DISTINCT FROM 'array' THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session directory: tenant claims missing or invalid';
   END IF;
+  -- The same token pins as sessions.search_session_directory (20261030020000): one
+  -- issuer and audience from sessions.session_directory_search_token_policy, a
+  -- lifetime of 1 to max_lifetime_seconds, and exp at most that plus 30s away.
+  SELECT * INTO v_policy
+    FROM sessions.session_directory_search_token_policy WHERE singleton;
+  IF NOT FOUND
+     OR (v_claims ->> 'iss') IS DISTINCT FROM v_policy.issuer
+     OR jsonb_typeof(v_claims -> 'aud') IS DISTINCT FROM 'string'
+     OR (v_claims ->> 'aud') IS DISTINCT FROM v_policy.audience
+     OR jsonb_typeof(v_claims -> 'exp') IS DISTINCT FROM 'number'
+     OR jsonb_typeof(v_claims -> 'iat') IS DISTINCT FROM 'number'
+     OR (v_claims ->> 'exp')::numeric - (v_claims ->> 'iat')::numeric
+          NOT BETWEEN 1 AND v_policy.max_lifetime_seconds
+     OR (v_claims ->> 'exp')::numeric - extract(epoch FROM clock_timestamp())
+          > v_policy.max_lifetime_seconds + 30 THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session directory: tenant claims missing or invalid';
+  END IF;
   v_org := v_claims -> 'app_metadata' ->> 'org_id';
-  SELECT coalesce(array_agg(w.value #>> '{}'), '{}') INTO v_workspaces
-    FROM jsonb_array_elements(v_claims -> 'app_metadata' -> 'workspace_ids') AS w
-   WHERE jsonb_typeof(w.value) = 'string';
-  IF v_org = '' OR cardinality(v_workspaces) = 0
+  -- The same workspace bound: 1 to 64 unique ids of 1 to 128 non-space characters,
+  -- and one bad entry refuses the whole claim.
+  v_workspace_claim := v_claims -> 'app_metadata' -> 'workspace_ids';
+  IF jsonb_array_length(v_workspace_claim) NOT BETWEEN 1 AND 64 THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session directory: tenant claims missing or invalid';
+  END IF;
+  SELECT coalesce(array_agg(DISTINCT w.value #>> '{}'), '{}') INTO v_workspaces
+    FROM jsonb_array_elements(v_workspace_claim) AS w
+   WHERE jsonb_typeof(w.value) = 'string'
+     AND (w.value #>> '{}') ~ '^[^[:space:][:cntrl:]]{1,128}$';
+  IF v_org = '' OR cardinality(v_workspaces) <> jsonb_array_length(v_workspace_claim)
      OR (p_workspace_id IS NOT NULL AND NOT (p_workspace_id = ANY (v_workspaces))) THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session directory: tenant claims missing or invalid';
   END IF;

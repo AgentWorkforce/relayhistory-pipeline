@@ -1,5 +1,5 @@
 {
-  "$comment": "DRAFT permissions boundary for the 96bulls agent-session role in a sandbox account (Khaliq, 2026-10-28: no OrganizationAccountAccessRole, only the agent-session role, bounded). Not created anywhere. Regions limited to the allowlist; no IAM beyond roles/policies that themselves carry this boundary; no Organizations, billing, account or boundary changes. Role creation is allowed only with this boundary (Allow + explicit Deny when absent or different); role management and PassRole are limited to 96bulls-* roles tagged 96bulls:bounded=true, which the stage sets on every role it creates.",
+  "$comment": "DRAFT permissions boundary for the 96bulls agent-session role in a sandbox account (Khaliq, 2026-10-28: no OrganizationAccountAccessRole, only the agent-session role, bounded). Not created anywhere. Regions limited to the allowlist; no IAM beyond roles/policies that themselves carry this boundary; no Organizations, billing, account or boundary changes. Role creation is allowed only with this boundary (Allow + explicit Deny when absent or different); role management and PassRole are limited to 96bulls-* roles tagged 96bulls:bounded=true, which the stage sets on every role it creates. 2026-10-30 hardening: no role-trust edits (a role's trust is fixed at creation) and no new identity providers; sandbox stages create no GitHub OIDC provider or deployer role.",
   "Version": "2012-10-17",
   "Statement": [
     {
@@ -78,7 +78,6 @@
         "iam:DeleteRole",
         "iam:TagRole",
         "iam:UntagRole",
-        "iam:UpdateAssumeRolePolicy",
         "iam:UpdateRoleDescription"
       ],
       "Resource": "arn:aws:iam::*:role/96bulls-*",
@@ -97,13 +96,10 @@
       "Resource": "arn:aws:iam::*:role/96bulls-*"
     },
     {
-      "Sid": "ServiceLinkedAndOidc",
+      "Sid": "ServiceLinkedRoles",
       "Effect": "Allow",
       "Action": [
-        "iam:CreateServiceLinkedRole",
-        "iam:CreateOpenIDConnectProvider",
-        "iam:DeleteOpenIDConnectProvider",
-        "iam:TagOpenIDConnectProvider"
+        "iam:CreateServiceLinkedRole"
       ],
       "Resource": "*"
     },
@@ -166,6 +162,20 @@
           "iam:PermissionsBoundary": "arn:aws:iam::*:policy/96bulls-sandbox-boundary"
         }
       }
+    },
+    {
+      "Sid": "NoTrustEditsOrIdentityProviders",
+      "Effect": "Deny",
+      "Action": [
+        "iam:UpdateAssumeRolePolicy",
+        "iam:CreateOpenIDConnectProvider",
+        "iam:UpdateOpenIDConnectProviderThumbprint",
+        "iam:AddClientIDToOpenIDConnectProvider",
+        "iam:TagOpenIDConnectProvider",
+        "iam:CreateSAMLProvider",
+        "iam:UpdateSAMLProvider"
+      ],
+      "Resource": "*"
     }
   ]
 }

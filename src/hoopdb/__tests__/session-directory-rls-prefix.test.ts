@@ -27,6 +27,7 @@ import {
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 const WORKER = "session_directory_search_worker";
+const TOKEN_ISSUER = "https://issuer.test/session-directory";
 
 async function database(): Promise<PGlite> {
   const db = new PGlite({ extensions: { auto_explain, btree_gin, pg_trgm } });
@@ -35,6 +36,10 @@ async function database(): Promise<PGlite> {
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
   }
+  await db.query(
+    "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
+    [TOKEN_ISSUER, "session-directory-search"],
+  );
   return db;
 }
 
@@ -85,6 +90,10 @@ async function rpcAgent(
   await db.query("SELECT set_config('request.jwt.claims', $1, false)", [
     JSON.stringify({
       role: WORKER,
+      iss: TOKEN_ISSUER,
+      aud: "session-directory-search",
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 60,
       app_metadata: { org_id: "o", workspace_ids: ["w"] },
     }),
   ]);

@@ -43,6 +43,10 @@ async function database(): Promise<PGlite> {
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
   }
+  await db.query(
+    "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
+    [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],
+  );
   return db;
 }
 
@@ -64,11 +68,24 @@ async function pointer(
   );
 }
 
-const claims = (org: string, workspaces: unknown[], role = WORKER) =>
-  JSON.stringify({
+const TOKEN_ISSUER = "https://issuer.test/session-directory";
+const claims = (
+  org: string,
+  workspaces: unknown[],
+  role = WORKER,
+  overrides: Record<string, unknown> = {},
+) => {
+  const iat = Math.floor(Date.now() / 1000);
+  return JSON.stringify({
     role,
+    iss: TOKEN_ISSUER,
+    aud: SESSION_DIRECTORY_SEARCH_RPC.audience,
+    iat,
+    exp: iat + 60,
     app_metadata: { org_id: org, workspace_ids: workspaces },
+    ...overrides,
   });
+};
 
 async function asRole<T>(
   db: PGlite,
@@ -114,6 +131,45 @@ const code = async (p: Promise<unknown>) =>
       (e: unknown) => e,
     )) as { code?: string } | null
   )?.code;
+
+describe("token pins shared with the search RPC", () => {
+  test("pointers and readiness refuse a token the search RPC would refuse", async () => {
+    const db = await database();
+    await pointer(db, "org-a", "ws-a", "m-1");
+    const iat = Math.floor(Date.now() / 1000);
+    const refusedClaims = [
+      claims("org-a", ["ws-a"], WORKER, { iss: "https://other.test" }),
+      claims("org-a", ["ws-a"], WORKER, { aud: "relayhistory" }),
+      claims("org-a", ["ws-a"], WORKER, { aud: [SESSION_DIRECTORY_SEARCH_RPC.audience] }),
+      claims("org-a", ["ws-a"], WORKER, { iat, exp: iat + 3600 }),
+      claims("org-a", ["ws-a"], WORKER, { iat: iat + 3600, exp: iat + 3660 }),
+      claims("org-a", ["ws-a"], WORKER, { iat: undefined }),
+      claims("org-a", Array.from({ length: 65 }, (_, i) => `ws-${i}`)),
+      claims("org-a", ["ws-a", "bad id"]),
+    ];
+    for (const c of refusedClaims) {
+      expect(await code(pointers(db, c, "ws-a")), c).toBe("42501");
+      expect(
+        await code(
+          asRole(db, WORKER, c, () =>
+            db.query("SELECT * FROM sessions.session_directory_readiness()"),
+          ),
+        ),
+        c,
+      ).toBe("42501");
+    }
+    expect(await pointers(db, claims("org-a", ["ws-a"]), "ws-a")).toHaveLength(1);
+  });
+
+  test("with no token policy row, nothing is served", async () => {
+    const db = await database();
+    await pointer(db, "org-a", "ws-a", "m-1");
+    await db.query("DELETE FROM sessions.session_directory_search_token_policy");
+    expect(await code(pointers(db, claims("org-a", ["ws-a"]), "ws-a"))).toBe(
+      "42501",
+    );
+  });
+});
 
 describe("session_directory_pointers", () => {
   test("returns exactly #226's pointer columns for live pointers in the claimed workspace, ordered by machine", async () => {

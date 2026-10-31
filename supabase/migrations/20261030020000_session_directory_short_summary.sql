@@ -295,6 +295,21 @@ $query$;
 --          since after until, or a contradictory filter pair
 --   0A000  an intentionally unsupported combination (named in the message)
 --   54000  agent_prefix_too_broad: more than 5000 candidates for an agent prefix
+-- The one issuer and audience the RPC accepts. PostgREST verifies the signature, but
+-- a project can trust several keys and may not check `aud`, so the RPC pins both.
+-- No row is seeded: search is refused until an environment adds its own, and adding
+-- it is a deployment step. Only the owner reads this table, through the RPC.
+CREATE TABLE sessions.session_directory_search_token_policy (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  issuer text NOT NULL CHECK (issuer ~ '^https?://'),
+  audience text NOT NULL CHECK (audience <> ''),
+  max_lifetime_seconds integer NOT NULL DEFAULT 60
+    CHECK (max_lifetime_seconds BETWEEN 1 AND 60)
+);
+ALTER TABLE sessions.session_directory_search_token_policy ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_directory_search_token_policy
+  FROM PUBLIC, anon, authenticated, service_role;
+
 CREATE FUNCTION sessions.search_session_directory(
   p_workspace_id text DEFAULT NULL,
   p_query text DEFAULT NULL,
@@ -328,7 +343,9 @@ LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $search$
 DECLARE
   v_claims jsonb;
+  v_policy sessions.session_directory_search_token_policy%ROWTYPE;
   v_org text;
+  v_workspace_claim jsonb;
   v_workspaces text[];
   v_query text;
   v_project_contains text;
@@ -363,12 +380,35 @@ BEGIN
      OR jsonb_typeof(v_claims -> 'app_metadata' -> 'workspace_ids') IS DISTINCT FROM 'array' THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session search: tenant claims missing or invalid';
   END IF;
+  SELECT * INTO v_policy
+    FROM sessions.session_directory_search_token_policy WHERE singleton;
+  IF NOT FOUND
+     OR (v_claims ->> 'iss') IS DISTINCT FROM v_policy.issuer
+     OR jsonb_typeof(v_claims -> 'aud') IS DISTINCT FROM 'string'
+     OR (v_claims ->> 'aud') IS DISTINCT FROM v_policy.audience
+     OR jsonb_typeof(v_claims -> 'exp') IS DISTINCT FROM 'number'
+     OR jsonb_typeof(v_claims -> 'iat') IS DISTINCT FROM 'number'
+     OR (v_claims ->> 'exp')::numeric - (v_claims ->> 'iat')::numeric
+          NOT BETWEEN 1 AND v_policy.max_lifetime_seconds
+     -- A far-future iat must not stretch the window; 30s allows for clock skew.
+     OR (v_claims ->> 'exp')::numeric - extract(epoch FROM clock_timestamp())
+          > v_policy.max_lifetime_seconds + 30 THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session search: tenant claims missing or invalid';
+  END IF;
   v_org := v_claims -> 'app_metadata' ->> 'org_id';
-  SELECT coalesce(array_agg(w.value #>> '{}'), '{}') INTO v_workspaces
-    FROM jsonb_array_elements(v_claims -> 'app_metadata' -> 'workspace_ids') AS w
-   WHERE jsonb_typeof(w.value) = 'string';
+  -- 1 to 64 unique ids of 1 to 128 non-space characters. One bad entry refuses the
+  -- whole claim, because an issuer that emits one cannot be trusted for the others.
+  -- Size is checked first so an oversized claim is never expanded.
+  v_workspace_claim := v_claims -> 'app_metadata' -> 'workspace_ids';
+  IF jsonb_array_length(v_workspace_claim) NOT BETWEEN 1 AND 64 THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session search: tenant claims missing or invalid';
+  END IF;
+  SELECT coalesce(array_agg(DISTINCT w.value #>> '{}'), '{}') INTO v_workspaces
+    FROM jsonb_array_elements(v_workspace_claim) AS w
+   WHERE jsonb_typeof(w.value) = 'string'
+     AND (w.value #>> '{}') ~ '^[^[:space:][:cntrl:]]{1,128}$';
   -- p_workspace_id NULL means organization-wide over exactly the claimed workspaces.
-  IF v_org = '' OR cardinality(v_workspaces) = 0
+  IF v_org = '' OR cardinality(v_workspaces) <> jsonb_array_length(v_workspace_claim)
      OR (p_workspace_id IS NOT NULL AND NOT (p_workspace_id = ANY (v_workspaces))) THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session search: tenant claims missing or invalid';
   END IF;
