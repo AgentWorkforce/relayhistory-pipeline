@@ -163,6 +163,13 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
           // searchable), then fail non-retryably so the message goes to the DLQ instead
           // of retrying forever.
           const integrity = async (message: string): Promise<never> => {
+            // Ids and hashes only: the object key is a path, so it is logged as its SHA-256.
+            log.warn("short summary object integrity failure; dead-lettering", {
+              stage: "summary-short", error_code: "summary_object_integrity", retryable: false,
+              org_id: dirKey.orgId, workspace_id: dirKey.workspaceId, harness: dirKey.harness,
+              session_id: dirKey.sessionId, machine_id: s.machine_id, revision: m.revision, trace_id: m.trace_id,
+              key_sha256: row.object_key ? createHash("sha256").update(row.object_key).digest("hex") : undefined,
+            });
             await publishShortSummary(directory, dirKey, null, m.trace_id);
             throw new PipelineError("summary_object_integrity", message, false);
           };
@@ -173,8 +180,24 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
               store: deps.store, keyring: deps.keyring, ids, key: row.object_key!, sha256: row.object_sha256!, kind, revision: m.revision,
             });
           } catch (err) {
-            // A store or keyring error may be transient: clear, then let it retry as raised.
-            await publishShortSummary(directory, dirKey, null, m.trace_id);
+            // Record the original failure first, so a failing clear cannot mask it. Then
+            // clear (best effort) and rethrow the original error with its own retry
+            // class: a transient store error retries; a non-retryable keyring error (an
+            // unknown or retired key id) dead-letters instead of looping.
+            const original = err instanceof PipelineError ? err : null;
+            log.warn("short summary object read failed", {
+              stage: "summary-short", error_code: original?.code ?? "summary_object_read_failed",
+              retryable: original?.retryable ?? true, session_id: dirKey.sessionId, revision: m.revision, trace_id: m.trace_id,
+            });
+            try {
+              await publishShortSummary(directory, dirKey, null, m.trace_id);
+            } catch (clearErr) {
+              log.warn("short summary clear after read failure also failed", {
+                stage: "summary-short",
+                error_code: clearErr instanceof PipelineError ? clearErr.code : "summary_directory_clear_failed",
+                session_id: dirKey.sessionId, trace_id: m.trace_id,
+              });
+            }
             throw err;
           }
           if (published?.status !== "ready" || !published.summary || !published.model) {

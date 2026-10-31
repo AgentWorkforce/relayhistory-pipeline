@@ -25,6 +25,24 @@ are ignored. A manifest delete becomes an object-landed message with
 The payload carries `provider` (`r2`, `s3`, `gcs`, `azure`, `fs`) and `bucket`,
 which the index stores on the pointer row, and `scrubbed`.
 
+### Manifest writer and migration fencing
+
+The authenticated manifest route checks more than the object-store
+precondition. A live write must keep `raw.owner` equal to its delivery writer,
+preserve every acknowledged epoch/chunk and carry the exact previous object
+version. An assertion whose verified subject/class is
+`agent_relayhistory_migration`/`migration_assertion` is additionally bound to
+its `grantId` and `planDigest` claims. It may create a cold export owned by
+`migration:<grantId>`, or append one `backfill` epoch to an existing live
+manifest. A straddling append preserves the live owner and writer, all prior
+raw data, the server section and other extension owners. The epoch's
+`opened_by` must equal `migration:<grantId>`.
+
+The migration exception does not weaken compare-and-swap: if live delivery
+commits after the exporter read, the export receives 409 and must reread and
+rebuild its epoch. A normal `rth:sync` assertion cannot create a `backfill`
+epoch. Identical request replay remains idempotent.
+
 ## Scrubbing before object storage
 
 Raw chunks are scrubbed of PII and secrets before they reach object storage
