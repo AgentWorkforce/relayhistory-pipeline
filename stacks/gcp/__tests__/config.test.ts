@@ -2,10 +2,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "bun:test";
+import versionsLock from "../../../versions.lock.json";
 import {
   assertGcpInputs,
   assertGcpRuntimeDeployable,
   GCP_APPROVED_TARGET,
+  GCP_APPROVED_SERVICES_IMAGE,
   GCP_NODE_ROLES,
   GCP_RUNTIME_SHAPE,
   bulls96ReleaseValues,
@@ -16,6 +18,7 @@ import {
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
+  requestedAlchemyCommand,
   captureRelaycastChartPackage,
   type GcpInputs,
 } from "../config.ts";
@@ -33,9 +36,18 @@ const base: GcpInputs = {
 };
 
 describe("GCP self-host contract", () => {
+  it("pins the reviewed multi-architecture services image for the GCP proof", () => {
+    expect(versionsLock.images.services).toMatchObject({
+      ref: "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services",
+      digest: "sha256:8d77de9be0b5e5e47dda75986da882e577aafb9e28e510c844e8134fea372425",
+      sourceRevision: "09293c8d649f912aa2f4414e31a3ad7fca6eceee",
+      gcpProofEligible: true,
+    });
+  });
+
   it("accepts a substrate-only stage without pretending managed services are attached", () => {
     expect(() => assertGcpInputs("gcp-dev", base)).not.toThrow();
-    expect(() => assertGcpRuntimeDeployable(base)).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", base)).not.toThrow();
     expect(() => assertGcpInputs("gcp-../../outside", base)).toThrow(/safe gcp-\* stage/);
   });
 
@@ -45,12 +57,16 @@ describe("GCP self-host contract", () => {
       chartVersion: "0.0.1",
       tenantOrgId: "https://user:password@example.com",
       existingSecretName: "not a secret name",
+      imagePullSecretName: "not a pull secret name",
+      imageDigest: "not-a-digest",
+      imageSourceRevision: "not-a-revision",
       relayauthJwksUrl: "http://user:password@attacker.example/jwks?token=secret",
+      relayauthIssuer: "http://user:password@attacker.example",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
-    expect(() => assertGcpRuntimeDeployable({ ...base, bulls96: disabled })).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
     expect(() =>
-      assertGcpRuntimeDeployable({
+      assertGcpRuntimeDeployable("gcp-dev", {
         ...base,
         bulls96: { ...disabled, enabled: true },
       }),
@@ -83,7 +99,7 @@ describe("GCP self-host contract", () => {
 
   it("requires an explicit adapter-proof acknowledgement before managed services can cost money", () => {
     expect(() =>
-      assertGcpInputs("gcp-dev", {
+      assertGcpInputs("gcp-conformance", {
         ...base,
         managedDataPlane: { provision: true },
       }),
@@ -110,13 +126,16 @@ describe("GCP self-host contract", () => {
       );
   });
 
-  it("validates 96Bulls inputs but holds runtime wiring for the external Redis TLS proof", () => {
+  it("validates 96Bulls inputs and allows only the acknowledged managed runtime", () => {
     const bulls96 = {
       enabled: true,
       chartVersion: "0.3.0",
       tenantOrgId: "org_123",
       existingSecretName: "bulls96-runtime",
+      imageDigest: `sha256:${"a".repeat(64)}`,
+      imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
+      relayauthIssuer: "http://relayauth.relayauth.svc:8787",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96 })).toThrow("managedDataPlane.provision");
     expect(() =>
@@ -126,6 +145,27 @@ describe("GCP self-host contract", () => {
         bulls96: { ...bulls96, tenantOrgId: "https://user:password@example.com" },
       }),
     ).toThrow("org id");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, imageDigest: "main" },
+      }),
+    ).toThrow("immutable sha256 digest");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, imageSourceRevision: "db2663d" },
+      }),
+    ).toThrow("full Git commit SHA");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96,
+      }),
+    ).toThrow("does not match the reviewed release");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
@@ -151,40 +191,127 @@ describe("GCP self-host contract", () => {
       assertGcpInputs("gcp-dev", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, relayauthIssuer: "https://relay.example.com/issuer-path" },
+      }),
+    ).toThrow("RelayAuth origin");
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        relayauth: { chartVersion: "0.1.0", existingSecretName: "relayauth-runtime", baseUrl: "https://auth.example.com" },
         bulls96,
+      }),
+    ).toThrow("must match relayauth.baseUrl");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
     ).not.toThrow();
     expect(() =>
-      assertGcpRuntimeDeployable({
+      assertGcpRuntimeDeployable("gcp-conformance", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
-        bulls96,
+        bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
       }),
-    ).toThrow(/Redis TLS CA\/client round-trip contract.*Nothing was created/);
+    ).not.toThrow();
+    const approvedRuntime = {
+      ...base,
+      managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" as const },
+      bulls96: { ...bulls96, imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest },
+    };
+    expect(() => assertGcpInputs("gcp-dev", approvedRuntime, "plan")).toThrow("published only for gcp-conformance");
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", approvedRuntime, "deploy")).toThrow(
+      "published only for gcp-conformance",
+    );
+    expect(() => assertGcpInputs("gcp-dev", approvedRuntime, "destroy")).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", approvedRuntime, "destroy")).not.toThrow();
+    const recordedButIneligible = {
+      ...base,
+      managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" as const },
+      bulls96: {
+        ...bulls96,
+        imageDigest: "sha256:245a75f9d7abdbd2167108db6e4fa852df844b41a22eaebcd64b4dd7b753b2aa",
+        imageSourceRevision: "db2663d05b327b945f1db40fd3b8aec13726fcef",
+      },
+    };
+    expect(() => assertGcpInputs("gcp-dev", recordedButIneligible, "destroy")).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", recordedButIneligible, "destroy")).not.toThrow();
+    for (const command of ["plan", "deploy"] as const) {
+      expect(() => assertGcpInputs("gcp-conformance", recordedButIneligible, command)).toThrow(
+        "does not match the reviewed release",
+      );
+      expect(() => assertGcpRuntimeDeployable("gcp-conformance", recordedButIneligible, command)).toThrow(
+        "does not match the reviewed release",
+      );
+    }
   });
 
-  it("never emits static Redis TLS readiness as a substitute for a CA/client proof", () => {
-    expect(() =>
-      bulls96ReleaseValues(
+  it("mirrors Alchemy's first-known-command scan for destroy cleanup", () => {
+    expect(requestedAlchemyCommand(["--stage", "gcp-dev", "destroy"])).toBe("destroy");
+    expect(requestedAlchemyCommand(["--stage", "gcp-dev", "plan", "destroy"])).toBe("plan");
+    expect(requestedAlchemyCommand(["--stage", "gcp-dev", "bogus"])).toBeUndefined();
+  });
+
+  it("renders a CA-backed Redis round-trip contract without AUTH or HMAC credentials", () => {
+    const values = bulls96ReleaseValues(
         {
           enabled: true,
           chartVersion: "0.3.0",
           tenantOrgId: "org_123",
           existingSecretName: "bulls96-runtime",
+          imageDigest: `sha256:${"a".repeat(64)}`,
+          imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
+          relayauthIssuer: "http://relayauth.relayauth.svc:8787",
         },
         {
           bucket: "locker",
           region: "us-central1",
+          imageRepository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
           cloudSqlConnectionName: "agentworkforce-dev1:us-central1:awf-dev-postgres",
           redisHost: "10.52.0.3",
           redisPort: 6379,
+          redisCaPem: "-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n",
           pubsubTopic: "projects/agentworkforce-dev1/topics/events",
           pubsubSubscription: "projects/agentworkforce-dev1/subscriptions/events",
           workloadIdentityEmail: "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
         },
-      ),
-    ).toThrow(/external Redis TLS CA\/client round-trip contract.*Nothing was created/);
+      );
+    const rendered = JSON.stringify(values);
+    expect(rendered).toContain("REDIS_TLS_CA_PEM");
+    expect(rendered).toContain("REDIS_TRANSIT_ENCRYPTION");
+    expect(rendered).toContain("SERVER_AUTHENTICATION");
+    expect(rendered).toContain("us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services");
+    expect(rendered).not.toContain("ghcr-pull");
+    expect(rendered).not.toContain('"REDIS_AUTH"');
+    expect(rendered).not.toContain("REDIS_PASSWORD");
+    expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
+    expect(values).toMatchObject({
+      worker: {
+        imagePullSecrets: [],
+        image: {
+          repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
+          digest: `sha256:${"a".repeat(64)}`,
+        },
+        locker: { credentials: { mode: "podIdentity" } },
+      },
+      alleyoop: {
+        imagePullSecrets: [],
+        image: {
+          repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
+          digest: `sha256:${"a".repeat(64)}`,
+        },
+        locker: { credentials: { mode: "podIdentity" } },
+        auth: {
+          jwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
+          issuer: "http://relayauth.relayauth.svc:8787",
+        },
+      },
+      hoopdb: { enabled: false },
+      locker: { enabled: false },
+    });
   });
 
   it("keeps Relaycast on the released single-writer SQLite profile", () => {
@@ -230,11 +357,19 @@ describe("GCP self-host contract", () => {
     expect(GCP_RUNTIME_SHAPE.nodeLocation).toBe("us-central1-a");
     expect(GCP_RUNTIME_SHAPE.natIpAllocateOption).toBe("MANUAL_ONLY");
     expect(GCP_RUNTIME_SHAPE.natLogFilter).toBe("ALL");
-    expect(GCP_NODE_ROLES).toEqual(["roles/container.defaultNodeServiceAccount"]);
+    expect(GCP_NODE_ROLES).toEqual([
+      "roles/container.defaultNodeServiceAccount",
+      "roles/artifactregistry.reader",
+    ]);
     const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
     expect(stack).toContain("enablePrivateEndpoint: GCP_RUNTIME_SHAPE.privateEndpoint");
     expect(stack).toContain("autopilot: GCP_RUNTIME_SHAPE.autopilot");
     expect(stack).toContain("serviceAccount: nodeActAs.serviceAccountEmail");
+    expect(stack).toContain('GCP.IAM.Member("node-artifactregistry-reader"');
+    expect(stack).toContain("Output.all(images.registryUri, nodeArtifactRegistryReader.role)");
+    expect(stack.indexOf('GCP.IAM.Member("node-artifactregistry-reader"')).toBeLessThan(
+      stack.indexOf('Kubernetes.HelmChart("96bulls"'),
+    );
     expect(stack.indexOf('RequireNodeActAs("node-act-as"')).toBeLessThan(
       stack.indexOf('GCP.Container.Cluster("cluster"'),
     );
@@ -243,6 +378,11 @@ describe("GCP self-host contract", () => {
     expect(stack).toContain("filter: GCP_RUNTIME_SHAPE.natLogFilter");
     expect(stack).toContain("purpose: \"VPC_PEERING\"");
     expect(stack).toContain("network: network.selfLink.as<string>()");
+    expect(stack).toContain("authorizedNetwork: Output.map(");
+    expect(stack).toContain('`projects/${i.projectId}/global/networks/${name}`');
+    expect(stack).toContain(
+      'const project = /^projects\\/([^/]+)\\/global\\/networks\\//.exec(input.spec.privateNetwork)?.[1];',
+    );
     expect(stack).toContain('versionDestroyTtl: afterApi("secretmanager.googleapis.com"');
     expect(stack).toContain("Output.map(cluster.workloadPool");
     expect(stack.indexOf('RequireKubernetesReachability("kubernetes-reachability"')).toBeLessThan(
@@ -296,10 +436,12 @@ describe("GCP self-host contract", () => {
       writeFileSync(path, "not-the-published-chart");
       expect(() => captureRelaycastChartPackage(path)).toThrow(/digest does not match/);
       const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+      const cache = readFileSync(new URL("../chart-cache.ts", import.meta.url), "utf8");
       expect(stack).toContain("captureRelaycastChartPackage");
       expect(stack).toContain('process.env.CI !== "true"');
-      expect(stack).toContain("writeFileSync(artifact, captured.bytes");
-      expect(stack).not.toContain("readFileSync(captured.sourcePath");
+      expect(cache).toContain("writeFileSync(artifact, captured.bytes");
+      expect(cache).not.toContain("readFileSync(captured.sourcePath");
+      expect(cache).not.toContain("rmSync(extracted");
       expect(stack).toContain("invocationId: APPLY_INVOCATION_ID");
       expect(stack).toContain('chart: relaycastChart!');
       expect(stack).not.toContain('chart: "relaycast"');

@@ -9,7 +9,8 @@
  *   - created_at = earliest live pointer, last_activity_at = latest live pointer;
  *   - title, project, repository, branch, model, state and the usage counters come
  *     from the most recently active live pointer (no summing across machines);
- *   - machine_ids / user_ids and the membership tables are the union of live pointers;
+ *   - machine_ids / user_ids and the membership tables are the union of live pointers,
+ *     each membership row carrying the directory row's last_activity_at;
  *   - task_title, agent_name and short_summary are not in session_index and are kept
  *     as already projected (short_summary is written only by writeShortSummary).
  *
@@ -117,12 +118,16 @@ export async function projectSessionDirectory(
                AND p.session_id = m.session_id AND p.${column} = m.${column} AND p.deleted_at IS NULL)`,
       params,
     );
+    // last_activity_at is the logical session's, not the member's own: the search RPC
+    // drives membership filters from this index and pages with the directory keyset,
+    // so the two orders must agree.
     await db.query(
       `INSERT INTO sessions.${table} (org_id, workspace_id, harness, session_id, ${column}, last_activity_at)
-       SELECT org_id, workspace_id, harness, session_id, ${column}, max(last_activity_at)
-         FROM sessions.session_index
-        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL
-        GROUP BY org_id, workspace_id, harness, session_id, ${column}
+       SELECT DISTINCT p.org_id, p.workspace_id, p.harness, p.session_id, p.${column}, d.last_activity_at
+         FROM sessions.session_index AS p
+         JOIN sessions.session_directory AS d
+           ON d.org_id = p.org_id AND d.workspace_id = p.workspace_id AND d.harness = p.harness AND d.session_id = p.session_id
+        WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL
        ON CONFLICT (org_id, workspace_id, harness, session_id, ${column})
        DO UPDATE SET last_activity_at = excluded.last_activity_at`,
       params,

@@ -15,6 +15,7 @@ import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { SCRUB_RULESET, SCRUB_RULESET_VERSION, objectKey, rawChunkKey, type ManifestV1 } from "../../shared/vendor.ts";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
+import { createHash } from "node:crypto";
 import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
 import { bobCostasHandler } from "../../bob-costas/handler.ts";
 import { extractiveSummarizer } from "../../bob-costas/summarizer.ts";
@@ -50,6 +51,7 @@ const DOWN = read(`supabase/rollbacks/${MIGRATION.replace(/\.sql$/, ".down.sql")
 const UP = read(`supabase/migrations/${MIGRATION}`);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
 const TOKEN_ISSUER = "https://issuer.test/session-directory";
+const RPC_SIGNATURE = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
 
 // Synthetic secret-shaped values, assembled at runtime so no literal sits on disk.
 const FAKE_RELAY_TOKEN = ["relay", "ag", "x".repeat(24)].join("_");
@@ -69,7 +71,7 @@ async function database(prelude = ""): Promise<PGlite> {
     await db.exec(read(`supabase/migrations/${file}`));
   }
   await db.query(
-    `INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)`,
+    "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
     [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],
   );
   return db;
@@ -112,7 +114,7 @@ async function row(db: PGlite, session = "s-1"): Promise<Row | undefined> {
 
 const claims = (
   org: string,
-  workspaces: string[],
+  workspaces: unknown[],
   role: string = WORKER,
   overrides: Record<string, unknown> = {},
 ) => {
@@ -153,8 +155,8 @@ async function search(
 
 describe("search token pins", () => {
   const now = () => Math.floor(Date.now() / 1000);
-  const refused = async (db: PGlite, claimsJson: string) => {
-    await expect(search(db, claimsJson, "ws-a", "flaky")).rejects.toMatchObject({ code: "42501" });
+  const refused = async (db: PGlite, claimsJson: string, workspace: string | null = "ws-a") => {
+    await expect(search(db, claimsJson, workspace as string, "flaky")).rejects.toMatchObject({ code: "42501" });
   };
 
   test("accepts a token from the pinned issuer and audience", async () => {
@@ -185,12 +187,6 @@ describe("search token pins", () => {
     await refused(db, claims("org-a", ["ws-a"], WORKER, { iat: t + 3600, exp: t + 3660 }));
   });
 
-  test("refuses more than one workspace, even when the requested one is listed", async () => {
-    const db = await database();
-    await insertRow(db);
-    await refused(db, claims("org-a", ["ws-a", "ws-b"]));
-  });
-
   test("refuses everything when no policy row exists, and the migration seeds none", async () => {
     const db = await database();
     await insertRow(db);
@@ -211,6 +207,55 @@ describe("search token pins", () => {
       );
       expect(allowed.rows[0]!.ok).toBe(false);
     }
+  });
+
+  const ids = (count: number) => Array.from({ length: count }, (_, index) => `ws-${index}`);
+
+  test("accepts 1 to 64 unique workspaces, for one workspace and for the claimed set", async () => {
+    const db = await database();
+    await insertRow(db, "org-a", "ws-0", "s-0");
+    await insertRow(db, "org-a", "ws-63", "s-63");
+    await insertRow(db, "org-a", "ws-64", "s-64");
+    expect(await search(db, claims("org-a", ids(64)), "ws-63", "flaky")).toHaveLength(1);
+    const scoped = await search(db, claims("org-a", ids(64)), null as unknown as string, "flaky");
+    expect(scoped.map((hit) => hit.workspace_id).sort()).toEqual(["ws-0", "ws-63"]);
+    expect(await search(db, claims("org-a", ["x".repeat(128)]), "x".repeat(128), "flaky")).toEqual([]);
+  });
+
+  test("refuses a bad workspace set, for one workspace and for the claimed set", async () => {
+    const db = await database();
+    await insertRow(db);
+    const badSets: unknown[][] = [
+      [],
+      ids(65),
+      ["ws-a", "ws-a"],
+      ["ws-a", 7],
+      ["ws-a", null],
+      ["ws-a", { id: "ws-b" }],
+      ["ws-a", ["ws-b"]],
+      ["ws-a", ""],
+      ["ws-a", " ws-b"],
+      ["ws-a", "ws\nb"],
+      ["ws-a", "x".repeat(129)],
+    ];
+    for (const set of badSets) {
+      await refused(db, claims("org-a", set));
+      await refused(db, claims("org-a", set), null);
+    }
+  });
+
+  test("the claimed set never reaches an unclaimed workspace or another org", async () => {
+    const db = await database();
+    await insertRow(db, "org-a", "ws-a", "s-a");
+    await insertRow(db, "org-a", "ws-b", "s-b");
+    await insertRow(db, "org-a", "ws-c", "s-c");
+    await insertRow(db, "org-b", "ws-a", "s-other-org");
+    const claimed = claims("org-a", ["ws-a", "ws-c"]);
+    const hits = await search(db, claimed, null as unknown as string, "flaky");
+    expect(hits.map((hit) => hit.session_id).sort()).toEqual(["s-a", "s-c"]);
+    await refused(db, claimed, "ws-b");
+    await refused(db, claimed, "");
+    await refused(db, claimed, "WS-A");
   });
 });
 
@@ -292,6 +337,29 @@ describe("short_summary writer", () => {
     const older = await summarize(db, KEY, "older", new Date(AT.getTime() - 1000));
     expect(older.written).toBe(false);
     expect((await row(db))?.short_summary).toBe("newer");
+  });
+
+  test("a rejected newer summary clears the older one; a rejected older one leaves a newer one", async () => {
+    const db = await database();
+    await insertRow(db);
+    await summarize(db, KEY, "Old heron migration notes");
+    const a = claims("org-a", ["ws-a"]);
+    expect(await search(db, a, "ws-a", "heron")).toHaveLength(1);
+    const later = new Date(AT.getTime() + 1000);
+    await expect(summarize(db, KEY, "y".repeat(SHORT_SUMMARY_MAX_CHARS + 1), later))
+      .rejects.toThrow("short_summary rejected: over_length");
+    const cleared = await row(db);
+    expect(cleared?.short_summary).toBeNull();
+    expect(cleared?.short_summary_source).toBeNull();
+    expect(cleared?.search_text).toBe("Fix flaky queue test Helm proj-1");
+    expect(await search(db, a, "ws-a", "heron")).toEqual([]);
+
+    // The fence: a refused summary older than the stored one does not clear it.
+    await summarize(db, KEY, "Fresh egret notes", later);
+    await expect(writeShortSummary(db, { ...KEY, summary: "   ", source: "bob-costas/v1", generatedAt: AT }))
+      .rejects.toThrow("short_summary rejected: empty");
+    expect((await row(db))?.short_summary).toBe("Fresh egret notes");
+    expect(await search(db, a, "ws-a", "egret")).toHaveLength(1);
   });
 });
 
@@ -391,7 +459,7 @@ describe("search RPC authorization", () => {
       ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`);
     const executors = await db.query<{ rolname: string }>(
       `SELECT r.rolname FROM pg_roles AS r, pg_proc AS p
-        WHERE p.oid = 'sessions.search_session_directory(text, text)'::regprocedure
+        WHERE p.oid = 'sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)'::regprocedure
           AND r.rolname <> $1 AND r.oid <> p.proowner
           AND has_function_privilege(r.oid, p.oid, 'EXECUTE')
         ORDER BY r.rolname`,
@@ -411,7 +479,7 @@ describe("search RPC authorization", () => {
       GRANT USAGE ON SCHEMA sessions TO relayhistory_app;
       GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions TO relayhistory_app;`);
     const granted = await db.query<{ ok: boolean }>(
-      "SELECT has_function_privilege('relayhistory_app', 'sessions.search_session_directory(text, text)', 'EXECUTE') AS ok",
+      "SELECT has_function_privilege('relayhistory_app', 'sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)', 'EXECUTE') AS ok",
     );
     expect(granted.rows[0]?.ok).toBe(true);
     await db.query("SELECT set_config('request.jwt.claims', $1, false)", [claims("org-a", ["ws-a"])]);
@@ -427,7 +495,7 @@ describe("search RPC authorization", () => {
 
   test("only the Worker role may execute the RPC, and end users cannot filter search_text directly", async () => {
     const db = await database();
-    const fn = "sessions.search_session_directory(text, text)";
+    const fn = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
     for (const grantee of ["anon", "authenticated", "service_role"]) {
       const allowed = await db.query<{ ok: boolean }>("SELECT has_function_privilege($1, $2, 'EXECUTE') AS ok", [grantee, fn]);
       expect(allowed.rows[0]?.ok, grantee).toBe(false);
@@ -504,6 +572,75 @@ async function capturedStatements(db: PGlite, claimsJson: string, workspace: str
   return { error, ranSearch: texts.includes(SESSION_DIRECTORY_SEARCH_SQL.replace(/\s+/g, " ").trim()) };
 }
 
+describe("migration role collision", () => {
+  /** Every migration before G6, so a pre-existing role can be prepared against real tables. */
+  async function beforeG6(): Promise<PGlite> {
+    const db = new PGlite({ extensions: { auto_explain, btree_gin, pg_trgm } });
+    open.push(db);
+    await db.exec(read("supabase/tests/supabase_shim.sql"));
+    for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
+      if (file !== MIGRATION) await db.exec(read(`supabase/migrations/${file}`));
+    }
+    return db;
+  }
+  const applied = async (db: PGlite) => (await db.query(
+    `SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'sessions' AND table_name = 'session_directory' AND column_name = 'short_summary'`)).rows.length > 0;
+
+  test("a pre-existing role equal to what the migration creates is reused unaltered", async () => {
+    const db = await beforeG6();
+    await db.exec(`CREATE ROLE ${WORKER} NOLOGIN NOINHERIT NOBYPASSRLS;
+      CREATE ROLE authenticator NOLOGIN NOINHERIT; GRANT ${WORKER} TO authenticator;`);
+    await db.exec(UP);
+    expect(await applied(db)).toBe(true);
+    const role = (await db.query<Row>(
+      "SELECT rolcanlogin, rolinherit, rolbypassrls, rolconfig FROM pg_roles WHERE rolname = $1", [WORKER])).rows[0];
+    expect(role).toEqual({ rolcanlogin: false, rolinherit: false, rolbypassrls: false, rolconfig: ["statement_timeout=2s"] });
+  });
+
+  const UNSAFE: Array<[string, string, string]> = [
+    ["LOGIN", `CREATE ROLE ${WORKER} LOGIN NOINHERIT`, "LOGIN"],
+    ["INHERIT", `CREATE ROLE ${WORKER} NOLOGIN INHERIT`, "INHERIT"],
+    ["BYPASSRLS", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT BYPASSRLS`, "BYPASSRLS"],
+    ["SUPERUSER", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT SUPERUSER`, "SUPERUSER"],
+    ["CREATEROLE", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT CREATEROLE`, "CREATEROLE"],
+    ["CREATEDB", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT CREATEDB`, "CREATEDB"],
+    ["REPLICATION", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT REPLICATION`, "REPLICATION"],
+    ["extra role setting", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET search_path = public`,
+      "role settings other than statement_timeout"],
+    ["member of another role", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT service_role TO ${WORKER}`, "member of service_role"],
+    ["granted to an inheriting role", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE ROLE app_reader NOLOGIN INHERIT;
+      GRANT ${WORKER} TO app_reader`, "granted to app_reader"],
+    ["granted to an INHERIT authenticator", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE ROLE authenticator NOLOGIN INHERIT;
+      GRANT ${WORKER} TO authenticator`, "granted to authenticator"],
+    ["owns an object", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE TABLE public.g6_owned (x int);
+      ALTER TABLE public.g6_owned OWNER TO ${WORKER}`, "owns objects"],
+    ["table privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT SELECT ON sessions.session_index TO ${WORKER}`,
+      "table, view or sequence privileges"],
+    ["column privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT SELECT (org_id) ON sessions.session_directory TO ${WORKER}`,
+      "column privileges"],
+    ["function privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO ${WORKER}`,
+      "function privileges"],
+    ["schema privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT CREATE ON SCHEMA sessions TO ${WORKER}`, "schema privileges"],
+    ["database privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT;
+      DO $g$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO ${WORKER}', current_database()); END $g$`, "database privileges"],
+    ["default privileges", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO ${WORKER}`, "default privileges"],
+  ];
+  for (const [name, setup, problem] of UNSAFE) {
+    test(`fails closed, applying nothing, when the pre-existing role has: ${name}`, async () => {
+      const db = await beforeG6();
+      await db.exec(setup);
+      const error = await db.exec(UP).then(() => null, (caught: unknown) => caught) as { code?: string; message?: string } | null;
+      expect(error?.code).toBe("42710");
+      expect(error?.message).toContain("session_directory_search_worker already exists and is unsafe to reuse");
+      expect(error?.message).toContain(problem);
+      expect(await applied(db)).toBe(false);
+      expect((await db.query("SELECT 1 FROM pg_proc WHERE proname = 'search_session_directory'")).rows).toEqual([]);
+    });
+  }
+});
+
 describe("search RPC query bounds", () => {
   // Inputs that look like 3+ characters to btrim/char_length but carry fewer than
   // three meaningful ones.
@@ -536,7 +673,7 @@ describe("search RPC query bounds", () => {
     const a = claims("org-a", ["ws-a"]);
     for (const [name, query] of INVALID) {
       expect(normalizeSearchQuery(query).ok, name).toBe(false);
-      expect(searchRpcRequest("ws-a", query).ok, name).toBe(false);
+      expect(searchRpcRequest({ workspaceId: "ws-a", q: query }).ok, name).toBe(false);
       const sql = await db.query<{ q: string | null }>("SELECT sessions.session_directory_search_query($1) AS q", [query]);
       expect(sql.rows[0]?.q, name).toBeNull();
       const { error, ranSearch } = await capturedStatements(db, a, "ws-a", query);
@@ -625,7 +762,7 @@ describe("search RPC query plan as the Worker identity", () => {
     const db = await populated();
     const { rows, inner } = await explainRpc(db, claims("org-0", ["ws-0"]), "ws-0", "Refactored module");
     console.info(`[G6 plan: common] ${JSON.stringify(inner.plan)}`);
-    expect(rows).toHaveLength(SESSION_DIRECTORY_SEARCH_RPC.limit);
+    expect(rows).toHaveLength(SESSION_DIRECTORY_SEARCH_RPC.maxRows);
     expect(inner.nodes.some((node) => node["Node Type"] === "Seq Scan")).toBe(false);
     const scan = inner.nodes.find((node) => typeof node["Index Name"] === "string")!;
     expect([
@@ -776,10 +913,18 @@ describe("short_summary end to end through the pipeline", () => {
     await store.put(rawChunkKey({ workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e", startDate: "2026-10-29" },
       0, 0, "22222222", "jsonl"), zstdCompressSync(Buffer.from(`${line}\n`)));
     const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
-    const summaryShort = (directory?: Parameters<typeof bobCostasHandler>[1]["directory"], storeOverride?: typeof store) =>
-      bobCostasHandler("short", { db: hoop, reader, store: storeOverride ?? store, summarizer: extractiveSummarizer, keyring, ...(directory ? { directory } : {}) })(
+    const summaryShort = (
+      directory?: Parameters<typeof bobCostasHandler>[1]["directory"],
+      storeOverride?: typeof store,
+      keyringOverride?: typeof keyring,
+      summarizerOverride?: typeof extractiveSummarizer,
+    ) =>
+      bobCostasHandler("short", {
+        db: hoop, reader, store: storeOverride ?? store, summarizer: summarizerOverride ?? extractiveSummarizer,
+        keyring: keyringOverride ?? keyring, ...(directory ? { directory } : {}),
+      })(
         { payload: pointer, ctx: { orgId: "org-a" } } as never, { log: { info() {} } } as never);
-    return { db, hoop, index, pointer, ctx, sent, summaryShort, store };
+    return { db, hoop, index, pointer, ctx, sent, summaryShort, store, keyring };
   }
 
   test("indexer projects the row, Bob Costas writes the scrubbed summary, the RPC is tenant-bound, deletion clears it", async () => {
@@ -971,6 +1116,109 @@ describe("short_summary end to end through the pipeline", () => {
     expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
     expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
     // Once the store is back, the retry republishes.
+    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+  }, 60_000);
+
+  test("Bob Costas: a rejected new summary clears the older searchable one", async () => {
+    const { db, index, pointer, ctx, summaryShort } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    const key = { orgId: "org-a", workspaceId: "ws-e2e", harness: "codex", sessionId: "s-e2e" };
+    await writeShortSummary(db, { ...key, summary: "Stale osprey notes", source: "bob-costas/extractive/v0", generatedAt: new Date("2026-10-01T00:00:00Z") });
+    const a = claims("org-a", ["ws-e2e"]);
+    expect(await search(db, a, "ws-e2e", "osprey")).toHaveLength(1);
+    const overLong = {
+      ...extractiveSummarizer,
+      summarize: async () => ({ text: "z".repeat(SHORT_SUMMARY_MAX_CHARS + 1), modelId: "extractive/v1", tokensIn: 0, tokensOut: 0 }),
+    } as typeof extractiveSummarizer;
+    // The refusal is logged by reason and the stage completes (the encrypted object is published).
+    await summaryShort(undefined, undefined, undefined, overLong);
+    const current = await row(db, "s-e2e");
+    expect(current?.short_summary).toBeNull();
+    expect(String(current?.search_text)).not.toContain("osprey");
+    expect(await search(db, a, "ws-e2e", "osprey")).toEqual([]);
+  }, 60_000);
+
+  /** Captures the service's stderr log lines (warn/error) while `run` executes. */
+  async function stderrLines(run: () => Promise<unknown>): Promise<string[]> {
+    const lines: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await run().catch(() => undefined);
+    } finally {
+      process.stderr.write = original;
+    }
+    return lines.flatMap((chunk) => chunk.split("\n")).filter(Boolean);
+  }
+
+  test("an integrity dead-letter logs session, revision and the object key hash", async () => {
+    const { db, index, pointer, ctx, summaryShort, store } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    await summaryShort();
+    const { object_key } = (await db.query<{ object_key: string }>(
+      "SELECT object_key FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'")).rows[0]!;
+    await store.put(objectKey(object_key), new TextEncoder().encode("not an envelope"));
+    const lines = await stderrLines(() => summaryShort());
+    const line = lines.map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((entry) => entry.error_code === "summary_object_integrity");
+    expect(line).toMatchObject({
+      level: "warn", stage: "summary-short", retryable: false,
+      org_id: "org-a", workspace_id: "ws-e2e", harness: "codex", session_id: "s-e2e", machine_id: "m-1", revision: 1,
+      key_sha256: createHash("sha256").update(object_key).digest("hex"),
+    });
+    // The path itself is never logged.
+    expect(lines.join("\n")).not.toContain(object_key);
+  }, 60_000);
+
+  test("a retired key id on the retry read is non-retryable, clears the summary and cannot loop", async () => {
+    const { db, index, pointer, ctx, summaryShort, keyring } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    await summaryShort();
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+    // The pointer still names hkdf1:k1 as current, but this deployment no longer holds k1
+    // for decryption: keyById comes from the real keyring implementation, built without it.
+    const retiredOnly = await masterKeyring(parseMasterKeys(`k2:${"b".repeat(64)}`));
+    const rotatedAway = { currentKey: keyring.currentKey, keyById: retiredOnly.keyById } as typeof keyring;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const error = await summaryShort(undefined, undefined, rotatedAway).then(() => null, (caught: unknown) => caught) as
+        { code?: string; retryable?: boolean } | null;
+      expect(error?.code).toBe("keyring_unknown_key");
+      expect(error?.retryable).toBe(false);
+    }
+    expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
+    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
+  }, 60_000);
+
+  test("a failing clear after a read failure does not mask the original error", async () => {
+    const { db, index, pointer, ctx, summaryShort, store } = await pipeline();
+    await index.upsertRawPointer(pointer as never, ctx as never);
+    await summaryShort();
+    const failingStore = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === "getObject") return async () => { throw new Error("store unavailable"); };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const brokenDirectory = {
+      write: async () => ({ written: false }),
+      clear: async () => { throw new Error("directory clear failed"); },
+    };
+    let error: { code?: string; retryable?: boolean; message?: string } | null = null;
+    const lines = await stderrLines(async () => {
+      error = await summaryShort(brokenDirectory, failingStore).then(() => null, (caught: unknown) => caught) as never;
+    });
+    expect(error!.code).toBe("summary_store_unavailable");
+    expect(error!.retryable).toBe(true);
+    const entries = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const readFailed = entries.findIndex((entry) => entry.error_code === "summary_store_unavailable");
+    const clearFailed = entries.findIndex((entry) => entry.error_code === "summary_directory_clear_failed");
+    expect(readFailed).toBeGreaterThanOrEqual(0);
+    expect(clearFailed).toBeGreaterThan(readFailed);
+    // The directory was not cleared (its clear failed), and the retry still repairs it.
     expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
     expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
   }, 60_000);

@@ -6,7 +6,7 @@
 import { toRow, fromRow, MAX_TRACE_EVENTS, type PipelineEvent, type PipelineEventSink, type TraceScope, type TraceEvents } from "../shared/vendor.ts";
 import type { HoopDb } from "../shared/db.ts";
 
-export function sqlPipelineEventSink(db: HoopDb): PipelineEventSink {
+export function sqlPipelineEventSink(db: Pick<HoopDb, "query">): PipelineEventSink {
   return {
     kind: "sql",
     async record(events: PipelineEvent[]) {

@@ -167,19 +167,95 @@ export function meaningfulChars(raw: string): number {
   return Array.from(query).filter((c) => c !== " " && !MARK.test(c)).length;
 }
 
+/** The RelayHistory read surface's filters, in the RPC's terms. */
+export interface SessionSearchRequest {
+  /** Omit for an organization-wide page over the claimed workspaces. */
+  workspaceId?: string;
+  q?: string;
+  /** The read API's `source`; the directory's `harness`. */
+  source?: string;
+  projectId?: string;
+  projectContains?: string;
+  noProject?: boolean;
+  agent?: string;
+  agentMatch?: "exact" | "prefix";
+  state?: "active" | "done" | "abandoned" | "unknown";
+  userId?: string;
+  machineId?: string;
+  since?: string;
+  until?: string;
+  sessionId?: string;
+  cursor?: { lastActivityAt: string; sessionId: string; harness: string; workspaceId?: string };
+  limit?: number;
+}
+
+export type SearchRpcRefusal = { ok: false; code: "22023" | "0A000"; reason: string };
+
 /**
- * The PostgREST request the caller (RelayHistory #226) must send. Refuses locally
- * under the same rule the RPC enforces, so an invalid query never reaches it.
+ * The PostgREST request the caller (RelayHistory #226) must send, or the typed refusal
+ * the RPC itself would raise. It applies the same rules locally, so an invalid request
+ * never reaches the database; the RPC re-checks everything.
  */
-export function searchRpcRequest(workspaceId: string, raw: string):
-  | { ok: true; path: "rpc/search_session_directory"; headers: { "content-profile": "sessions" }; body: { p_workspace_id: string; p_query: string } }
-  | { ok: false; reason: "too_short" | "too_long" } {
-  const query = normalizeSearchQuery(raw);
-  if (!query.ok) return query;
-  return {
-    ok: true,
-    path: "rpc/search_session_directory",
-    headers: { "content-profile": "sessions" },
-    body: { p_workspace_id: workspaceId, p_query: query.query },
-  };
+export function searchRpcRequest(request: SessionSearchRequest):
+  | { ok: true; path: "rpc/search_session_directory"; headers: { "content-profile": "sessions" }; body: Record<string, unknown> }
+  | SearchRpcRefusal {
+  const refuse = (code: "22023" | "0A000", reason: string): SearchRpcRefusal => ({ ok: false, code, reason });
+  const body: Record<string, unknown> = {};
+  if (request.workspaceId !== undefined) body.p_workspace_id = request.workspaceId;
+  const limit = request.limit ?? 50;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) return refuse("22023", "limit must be 1 to 50");
+  body.p_limit = limit;
+  if (request.q !== undefined) {
+    const q = normalizeSearchQuery(request.q);
+    if (!q.ok) return refuse("22023", "query needs 3 to 200 meaningful characters");
+    body.p_query = q.query;
+  }
+  if (request.projectContains !== undefined) {
+    const p = normalizeSearchQuery(request.projectContains);
+    if (!p.ok) return refuse("22023", "project_contains needs 3 to 200 meaningful characters");
+    body.p_project_contains = p.query;
+  }
+  const agentMatch = request.agentMatch ?? "exact";
+  if (request.agent !== undefined) {
+    const agent = request.agent.trim().toLowerCase();
+    if (agent === "" || Array.from(agent).length > 200) return refuse("22023", "agent must be 1 to 200 characters");
+    if (agentMatch === "prefix" && !normalizeSearchQuery(request.agent).ok)
+      return refuse("22023", "agent prefix needs at least 3 meaningful characters");
+    body.p_agent = request.agent;
+    body.p_agent_match = agentMatch;
+  }
+  if (request.source !== undefined) {
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(request.source)) return refuse("22023", "harness is invalid");
+    body.p_harness = request.source;
+  }
+  if (request.state !== undefined) {
+    if (!["active", "done", "abandoned", "unknown"].includes(request.state)) return refuse("22023", "state is invalid");
+    body.p_state = request.state;
+  }
+  if (request.since !== undefined) body.p_since = request.since;
+  if (request.until !== undefined) body.p_until = request.until;
+  if (request.since !== undefined && request.until !== undefined && Date.parse(request.since) > Date.parse(request.until))
+    return refuse("22023", "since is after until");
+  if (request.noProject && (request.projectId !== undefined || request.projectContains !== undefined))
+    return refuse("22023", "no_project contradicts project_id or project_contains");
+  if (request.projectId !== undefined) body.p_project_id = request.projectId;
+  if (request.noProject) body.p_no_project = true;
+  if (request.userId !== undefined) body.p_user_id = request.userId;
+  if (request.machineId !== undefined) body.p_machine_id = request.machineId;
+  if (request.sessionId !== undefined) body.p_session_id = request.sessionId;
+  if (request.cursor) {
+    const c = request.cursor;
+    if (request.workspaceId === undefined ? c.workspaceId === undefined
+        : c.workspaceId !== undefined && c.workspaceId !== request.workspaceId)
+      return refuse("22023", "cursor is incomplete or for another scope");
+    body.p_cursor_last_activity_at = c.lastActivityAt;
+    body.p_cursor_session_id = c.sessionId;
+    body.p_cursor_harness = c.harness;
+    if (c.workspaceId !== undefined) body.p_cursor_workspace_id = c.workspaceId;
+  }
+  if (request.workspaceId === undefined && (request.agent !== undefined || request.projectId !== undefined
+      || request.projectContains !== undefined || request.noProject || request.userId !== undefined
+      || request.machineId !== undefined))
+    return refuse("0A000", "agent, project, no_project, user and machine filters need a workspace");
+  return { ok: true, path: "rpc/search_session_directory", headers: { "content-profile": "sessions" }, body };
 }

@@ -16,7 +16,7 @@ BEGIN;
 REVOKE SELECT ON sessions.session_directory FROM authenticated;
 GRANT SELECT ON sessions.session_directory TO authenticated;
 
-DROP FUNCTION IF EXISTS sessions.search_session_directory(text, text);
+DROP FUNCTION IF EXISTS sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer);
 DROP TABLE IF EXISTS sessions.session_directory_search_token_policy;
 DROP FUNCTION IF EXISTS sessions.session_directory_search_query(text);
 DO $role$
@@ -29,6 +29,7 @@ END
 $role$;
 
 DROP INDEX IF EXISTS sessions.session_directory_tenant_search_trgm_idx;
+DROP INDEX IF EXISTS sessions.session_directory_tenant_project_trgm_idx;
 DROP TRIGGER IF EXISTS session_directory_tombstone_clears_summary ON sessions.session_directory;
 DROP FUNCTION IF EXISTS sessions.session_directory_tombstone_clears_summary();
 
@@ -48,6 +49,10 @@ ALTER TABLE sessions.session_directory
   DROP COLUMN IF EXISTS short_summary_scrub_version,
   DROP COLUMN IF EXISTS short_summary_scrub_ruleset,
   DROP COLUMN IF EXISTS short_summary;
+
+CREATE INDEX IF NOT EXISTS session_directory_project_trgm_idx
+  ON sessions.session_directory USING gin (project_id public.gin_trgm_ops)
+  WHERE project_id IS NOT NULL AND deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS session_directory_metadata_trgm_idx
   ON sessions.session_directory USING gin (search_text public.gin_trgm_ops)

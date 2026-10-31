@@ -101,8 +101,18 @@ export async function writeShortSummary(
   input: ShortSummaryInput,
   scrub: (value: string) => string = scrubText,
 ): Promise<{ written: boolean; scrubVersion: number }> {
-  if (!SOURCE_PATTERN.test(input.source)) throw new ShortSummaryRejected("invalid_source");
-  const scrubbed = scrubShortSummary(input.summary, scrub);
+  let scrubbed: ScrubbedShortSummary;
+  try {
+    if (!SOURCE_PATTERN.test(input.source)) throw new ShortSummaryRejected("invalid_source");
+    scrubbed = scrubShortSummary(input.summary, scrub);
+  } catch (error) {
+    // A refused newer summary must not leave an older one searchable: the old text
+    // describes content the producer has since replaced. Clear it (and its share of
+    // search_text) under the same generated_at fence, so a refused *older* summary
+    // never clears a newer good one. Then rethrow the refusal.
+    if (error instanceof ShortSummaryRejected) await clearOlderShortSummary(db, input, input.generatedAt);
+    throw error;
+  }
   const { rows } = await db.query<{ written: boolean }>(
     `UPDATE sessions.session_directory AS d
         SET short_summary = $5,
@@ -125,6 +135,28 @@ export async function writeShortSummary(
     ],
   );
   return { written: rows.length > 0, scrubVersion: scrubbed.scrubVersion };
+}
+
+/** Clear the summary only if it is not newer than `notAfter` (the generated_at fence). */
+async function clearOlderShortSummary(db: SqlExecutor, key: SessionDirectoryKey, notAfter: Date): Promise<boolean> {
+  const { rows } = await db.query<{ cleared: boolean }>(
+    `UPDATE sessions.session_directory AS d
+        SET short_summary = NULL,
+            short_summary_scrub_ruleset = NULL,
+            short_summary_scrub_version = NULL,
+            short_summary_source = NULL,
+            short_summary_generated_at = NULL,
+            search_text = sessions.session_directory_search_text(
+              d.title, d.task_title, d.agent_name, d.project_id,
+              d.git_repo, d.git_branch, d.model, NULL),
+            projected_at = now()
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+        AND d.deleted_at IS NULL AND d.short_summary IS NOT NULL
+        AND d.short_summary_generated_at <= $5::timestamptz
+      RETURNING true AS cleared`,
+    [key.orgId, key.workspaceId, key.harness, key.sessionId, notAfter.toISOString()],
+  );
+  return rows.length > 0;
 }
 
 /** Remove a row's summary (and its share of the search document) without a tombstone. */

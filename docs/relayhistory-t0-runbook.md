@@ -28,7 +28,7 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
 | # | Action | Reversible? |
 | --- | --- | --- |
 | A1 | Create the Supabase credentials for `sessions` (`pyamkrhoyszgzirqqffq`): a schema-owner role for migrations and a runtime role for the Worker (owner of, or `BYPASSRLS` on, `sessions.machines`), both in 1Password `96Bulls-prod`; plus a read-only Neon role for copy and verify | yes (drop roles) |
-|    | Read-only check on Supabase, required before A3: `SELECT has_parameter_privilege(current_user, 'session_replication_role', 'SET')` must be true for the copy role, or the copier refuses to run | — |
+|    | Read-only check on Supabase before A3: `SELECT current_user, has_parameter_privilege(current_user, 'session_replication_role', 'SET')`. The T0 copy set (`--mode=mirror`) does **not** need it: it lands through the live triggers and refuses any table whose enabled triggers are not reviewed guards (`GUARD_TRIGGERS`) or that is in a foreign key. Only `--mode=backfill` needs it, and that step is superseded by the S3 export (decision 0002) | — |
 |    | Read-only check: `SELECT datcollate, datctype, version() FROM pg_database WHERE datname = current_database()` on Neon and Supabase. If the collation differs, add `COLLATE "C"` to the verifier's text-key ranges and re-check that prefix-search plans use their indexes | — |
 | A2 | Size the Supabase compute and disk for the eventual ~486 GiB plus growth | yes |
 | A3 | Apply the schema to Supabase: the 96Bulls migrations (`supabase db push`), then relayhistory-cloud's runner and rollouts with `DATABASE_MIGRATIONS_URL` set to Supabase | empty database: yes (drop schema) |
@@ -133,6 +133,15 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     turns, session list, search, brief, a pre-T0 session through the Neon
     fallback). Hold logs are empty, 5xx rates are back to baseline, and
     `/health/ready` is green.
+
+### Export assertions: clock health (before the backfill export starts)
+
+- Migration assertions live at most 60 s, and the ingest allows only 5 s of clock skew (contract: `docs/contracts/relayhistory-export-plan-entry-v1.md`).
+- If the issuer's (RelayAuth's) clock runs **more than 5 s ahead** of the ingest, every assertion is refused as not yet valid: 401 `invalid_claims`. This is terminal; the courier does not re-mint it.
+- If the issuer runs more than 5 s behind, assertions expire early: 401 `migration_assertion_expired`, and the courier re-mints.
+- Before and during the export, the RelayAuth, ingest and courier hosts must run NTP with clock-offset monitoring. Alert at more than 1 s of offset.
+- Do not start the backfill export while any of these hosts reports more than 1 s of offset.
+- A run of `invalid_claims` refusals that starts suddenly during the export means: check the issuer's clock first.
 
 ## After T0
 
