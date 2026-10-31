@@ -36,7 +36,6 @@ import {
   summarizeTrace,
   traceIdFromHeaders,
   fileNormalizeHandler,
-  normalizedReadyHandler,
   uuidv7,
   type PipelineEventSink,
   type PipelineStage,
@@ -141,9 +140,7 @@ function pipeline(options: { transformEnabled?: boolean } = {}) {
       }),
       "session-indexed": sessionIndexedHandler(index),
       "file-normalize": fileNormalizeHandler(transform, queues),
-      "normalized-ready": normalizedReadyHandler({
-        record: async () => "applied",
-      }),
+      "normalized-ready": async () => {},
     },
   };
   return { queues, sink, deadLetters, index, transform, deps };

@@ -280,7 +280,15 @@ export type StageHandler = (
   message: StageMessage,
   recorder: PipelineRecorder,
   attempt: number,
+  /** The Postgres queue's job capability; absent on any other backend. */
+  job?: StageJob,
 ) => Promise<void | { status: "skipped"; reason: string }>;
+
+/** The job a delivery holds, and the lease that proves it. */
+export interface StageJob {
+  id: string;
+  leaseId: string;
+}
 
 export interface StageQueueDeps {
   handlers: Partial<Record<PipelineStage, StageHandler>>;
@@ -300,7 +308,7 @@ export function defaultRetryDelaySeconds(attempt: number) {
 type QueueMessage = Pick<
   Message<unknown>,
   "body" | "attempts" | "ack" | "retry"
->;
+> & { job?: StageJob };
 type QueueBatch = { queue: string; messages: readonly QueueMessage[] };
 
 function plainLog(message: string, fields: Record<string, unknown>) {
@@ -393,7 +401,7 @@ export async function handleStageQueue(
     const replayKey = body.replay ? `:replay:${body.replay.id}` : "";
     const started = Date.now();
     try {
-      const outcome = await handler(body, recorder, message.attempts);
+      const outcome = await handler(body, recorder, message.attempts, message.job);
       await recorder.record(body.stage, outcome ? outcome.status : "ok", {
         attempt: message.attempts,
         attrs: {

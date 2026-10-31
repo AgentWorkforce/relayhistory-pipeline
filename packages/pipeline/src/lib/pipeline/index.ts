@@ -47,7 +47,10 @@ export * from "./trace.js";
 export * from "./traces.js";
 export { postgrestDeadLetterStore } from "./postgrest-dead-letters.js";
 export { postgresDeadLetterStore } from "./postgres-dead-letters.js";
-export { postgresNormalizedCountStore } from "./postgres-normalized-counts.js";
+export {
+  postgresNormalizedCountStore,
+  type ConnectSql,
+} from "./postgres-normalized-counts.js";
 
 /** Daily, at this UTC minute of the day, off the hour so it avoids other jobs. */
 export const PIPELINE_MAINTAIN_MINUTE_UTC = 3 * 60 + 17;
