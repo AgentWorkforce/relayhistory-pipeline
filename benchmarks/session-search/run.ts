@@ -9,7 +9,10 @@
  *   BENCH_OUT         report path (default benchmarks/session-search/results/<scale>.json)
  *   BENCH_REPEATS     warm samples per query (default 30)
  *
- * Exits 1 on any isolation or Lane A correctness failure: those are not metrics.
+ *   BENCH_HEAD_SHA    recorded in the report
+ *
+ * Exits 1 on any isolation or Lane A correctness failure, a contract query that returned
+ * nothing, or an agent gate that is not PASS. The report is still written.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -22,10 +25,10 @@ import {
   claims, directoryPlanSql, directorySearch, installSchema, likeTerm, loadBatch, loadNeonBatch,
   neonBriefSearch, neonEventSearch, NEON_BRIEF_SQL, NEON_EVENTS_SQL, type Db, type Hit,
 } from "./arms.ts";
-import { generateCorpus, SCALES, TERMS, tenantCanary, type CorpusParams, type CorpusSession } from "./corpus.ts";
+import { corpusHash, generateCorpus, SCALES, TERMS, tenantCanary, type CorpusParams, type CorpusSession } from "./corpus.ts";
 import { assertLocalTarget } from "./guard.ts";
 import { identity, listQueries, oracleLaneA, oracleLaneB, SMALL, textQueries, WHALE, type Tenant } from "./queries.ts";
-import { planNodes, rowAmplification, summarize, type PlanNode } from "./stats.ts";
+import { agentGate, planNodes, rowAmplification, summarize, type PlanNode } from "./stats.ts";
 
 const scale = process.env.BENCH_SCALE ?? "test";
 const base = SCALES[scale];
@@ -69,6 +72,11 @@ const now = () => performance.now();
 const failures: string[] = [];
 const hitIds = (hits: Hit[]) => hits.map((h) => identity({ harness: h.harness, sessionId: h.session_id }));
 const tenants = [WHALE, SMALL];
+
+type Identity = "authenticated" | "owner";
+const attempt = async (run: () => Promise<unknown>) => {
+  try { await run(); return "allowed"; } catch (e) { return `refused: ${(e as Error).message}`; }
+};
 
 async function timed(run: () => Promise<unknown>) {
   const start = now();
@@ -155,25 +163,35 @@ async function laneA(db: Db, kept: CorpusSession[], withSummary: boolean, arm: s
   return results;
 }
 
-async function laneC(db: Db) {
-  const rlsRun = async (c: Db, t: Tenant, sql: string, args: unknown[]) => {
-    await c.query("SELECT set_config('request.jwt.claims', $1, false)", [JSON.stringify({ role: "authenticated", app_metadata: { org_id: t.orgId, workspace_ids: [t.workspaceId] } })]);
-    await c.exec("SET ROLE authenticated");
-    try { return await c.query(sql, args); } finally { await c.exec("RESET ROLE"); }
-  };
+/** Runs as `authenticated` under RLS, or as owner (a definer RPC sees what owner sees). */
+async function as<T>(c: Db, t: Tenant, identity: Identity, run: () => Promise<T>): Promise<T> {
+  if (identity === "owner") return run();
+  await c.query("SELECT set_config('request.jwt.claims', $1, false)", [JSON.stringify({ role: "authenticated", app_metadata: { org_id: t.orgId, workspace_ids: [t.workspaceId] } })]);
+  await c.exec("SET ROLE authenticated");
+  try { return await run(); } finally { await c.exec("RESET ROLE"); }
+}
+
+async function laneC(db: Db, kept: CorpusSession[]) {
   const results: Record<string, unknown>[] = [];
   for (const t of tenants) {
-    for (const q of listQueries(t)) {
-      const plan = await (async () => {
-        await db.query("SELECT set_config('request.jwt.claims', $1, false)", [JSON.stringify({ role: "authenticated", app_metadata: { org_id: t.orgId, workspace_ids: [t.workspaceId] } })]);
-        await db.exec("SET ROLE authenticated");
-        try { return await explain(db, q.sql, q.args); } finally { await db.exec("RESET ROLE"); }
-      })();
-      const agentGate = q.agent ? (plan.rowAmplification ?? 0) <= 100 : null;
-      results.push({ tenant: t.workspaceId, query: q.id, agentGate, latency: await sample((c) => rlsRun(c, t, q.sql, q.args), db), plan });
+    for (const q of listQueries(kept, t)) {
+      for (const identity of ["authenticated", "owner"] as const) {
+        const plan = await as(db, t, identity, () => explain(db, q.sql, q.args));
+        const rows = plan.plan["Actual Rows"] ?? 0;
+        if (rows === 0) failures.push(`Lane C ${identity} ${t.workspaceId} ${q.id}: returned nothing, NOT MEASURED`);
+        const gate = q.agent ? agentGate(q.agent, plan.plan) : null;
+        if (gate && gate.verdict !== "PASS") failures.push(`agent gate ${identity} ${t.workspaceId} ${q.id}: ${gate.verdict}, ${gate.reason}`);
+        results.push({
+          tenant: t.workspaceId, query: q.id, identity, sql: q.sql, args: q.args, rows, agentGate: gate,
+          expectedIndex: q.index, usedExpectedIndex: plan.indexes.includes(q.index),
+          latency: await sample((c) => as(c, t, identity, () => c.query(q.sql, q.args)), db), plan,
+        });
+      }
     }
   }
-  return results;
+  const star = await attempt(() => as(db, WHALE, "authenticated", () => db.query(
+    "SELECT * FROM sessions.session_directory WHERE org_id = $1 AND workspace_id = $2 LIMIT 1", [WHALE.orgId, WHALE.workspaceId])));
+  return { results, selectStarAsAuthenticated: star };
 }
 
 async function neonLanes(db: Db, kept: CorpusSession[]) {
@@ -254,11 +272,12 @@ const version = (await db.query<{ v: string }>("SHOW server_version")).rows[0] a
 // Arm 2b is what #48 specifies; 2a is the same directory with no summary text.
 const load2b = await loadDirectory(db, true, kept, true);
 const report = {
+  head: process.env.BENCH_HEAD_SHA ?? "unrecorded", corpusSha256: corpusHash(params),
   scale, params, engine: pgUrl ? `postgres ${version.server_version}` : "pglite",
   warning: "Relative numbers from a local stand-in. Not Neon, not Supabase, not an e2e proof.",
   baseline: await neonLanes(db, kept),
   arm2b: {
-    loadMsIncludingBaseline: Math.round(load2b), laneA: await laneA(db, kept, true, "2b"), laneC: await laneC(db),
+    loadMsIncludingBaseline: Math.round(load2b), laneA: await laneA(db, kept, true, "2b"), laneC: await laneC(db, kept),
     laneB: "UNSUPPORTED by contract: docs/session-search-index-contract.md",
     sizes: await sizes(db),
     throughput: await throughput(8, 10),
@@ -283,9 +302,9 @@ report.arm2a = { loadMs: Math.round(load2a), laneA: await laneA(db, kept, false,
 
 mkdirSync(dirname(out), { recursive: true });
 writeFileSync(out, JSON.stringify(report, null, 2));
-const row = (r: Record<string, any>) => `${r.tenant} ${r.query}${r.lane ? ` [${r.lane}]` : ""}: cold p50 ${r.latency.cold.p50} warm p50/95/99 ${r.latency.warm.p50}/${r.latency.warm.p95}/${r.latency.warm.p99} ms errors ${r.latency.errorCount}${r.recall === undefined ? "" : ` recall ${r.recall}`} index ${r.plan.indexes.join(",") || "-"}${r.plan.seqScan ? " SEQSCAN" : ""}`;
+const row = (r: Record<string, any>) => `${r.tenant} ${r.query}${r.identity ? ` (${r.identity})` : ""}${r.agentGate ? ` gate ${r.agentGate.verdict}: ${r.agentGate.reason}` : ""}${r.lane ? ` [${r.lane}]` : ""}: cold p50 ${r.latency.cold.p50} warm p50/95/99 ${r.latency.warm.p50}/${r.latency.warm.p95}/${r.latency.warm.p99} ms errors ${r.latency.errorCount}${r.recall === undefined ? "" : ` recall ${r.recall}`} index ${r.plan.indexes.join(",") || "-"}${r.plan.seqScan ? " SEQSCAN" : ""}`;
 console.log(`engine ${report.engine}, ${params.sessions} sessions, report ${out}`);
-for (const [name, rows] of [["baseline", report.baseline], ["2b Lane A", report.arm2b.laneA], ["2b Lane C", report.arm2b.laneC], ["2a Lane A", (report.arm2a as any).laneA]] as const) {
+for (const [name, rows] of [["baseline", report.baseline], ["2b Lane A", report.arm2b.laneA], ["2b Lane C", report.arm2b.laneC.results], ["2a Lane A", (report.arm2a as any).laneA]] as const) {
   console.log(`\n${name}`);
   for (const r of rows as Record<string, any>[]) console.log(row(r));
 }

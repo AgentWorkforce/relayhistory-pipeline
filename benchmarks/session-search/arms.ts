@@ -68,6 +68,14 @@ export async function loadBatch(db: Db, sessions: CorpusSession[], withSummary: 
       org_id: s.orgId, workspace_id: s.workspaceId, harness: s.harness, session_id: s.sessionId, user_id, at: s.lastActivityAt,
     }))))],
   );
+  await db.query(
+    `INSERT INTO sessions.session_directory_machines (org_id, workspace_id, harness, session_id, machine_id, last_activity_at)
+     SELECT r.org_id, r.workspace_id, r.harness, r.session_id, r.machine_id, r.at
+       FROM jsonb_to_recordset($1::jsonb) AS r(org_id text, workspace_id text, harness text, session_id text, machine_id text, at timestamptz)`,
+    [JSON.stringify(sessions.filter((s) => !s.deleted).flatMap((s) => s.machineIds.map((machine_id) => ({
+      org_id: s.orgId, workspace_id: s.workspaceId, harness: s.harness, session_id: s.sessionId, machine_id, at: s.lastActivityAt,
+    }))))],
+  );
 }
 
 /** One tombstone in Neon is simply absent: its brief and events are deleted with the session. */

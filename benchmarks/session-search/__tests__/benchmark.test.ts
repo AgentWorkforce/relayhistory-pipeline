@@ -10,8 +10,8 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { directorySearch, installSchema, loadBatch, loadNeonBatch, neonBriefSearch, neonEventSearch, type Db } from "../arms.ts";
 import { corpusHash, generateCorpus, PLANTED_SECRET, SCALES, TERMS, tenantCanary, type CorpusSession } from "../corpus.ts";
 import { assertLocalTarget } from "../guard.ts";
-import { identity, oracleLaneA, oracleLaneB, SMALL, textQueries, WHALE } from "../queries.ts";
-import { percentile } from "../stats.ts";
+import { identity, listQueries, oracleLaneA, oracleLaneB, SMALL, textQueries, WHALE } from "../queries.ts";
+import { agentGate, percentile, type PlanNode } from "../stats.ts";
 
 const params = SCALES.test!;
 let pg: PGlite;
@@ -101,6 +101,40 @@ describe("the search boundary", () => {
   });
   test("a 2-character query is refused", async () => {
     await expect(directorySearch(db, WHALE, "de")).rejects.toThrow();
+  });
+});
+
+describe("Lane C", () => {
+  test("covers every indexed shape in the contract's table", async () => {
+    const { REQUIRED_SEARCH_INDEXES } = await import("../../../src/hoopdb/search-index-contract.ts");
+    const covered = new Set(listQueries(corpus, WHALE).map((q) => q.index));
+    const missing = REQUIRED_SEARCH_INDEXES.map((i) => i.indexName)
+      .filter((n) => !covered.has(n) && n !== "session_directory_tenant_search_trgm_idx");
+    expect(missing).toEqual([]);
+  });
+  test("every shape returns rows for both tenants, membership included", async () => {
+    for (const t of [WHALE, SMALL]) {
+      for (const q of listQueries(corpus, t)) expect([q.id, (await db.query(q.sql, q.args)).rows.length > 0]).toEqual([q.id, true]);
+    }
+  });
+});
+
+describe("agent gate", () => {
+  const scan = (node: Partial<PlanNode>): PlanNode => ({ "Node Type": "Index Only Scan", "Index Name": "x", "Actual Rows": 50, "Actual Loops": 1, ...node });
+  const limit = (child: PlanNode): PlanNode => ({ "Node Type": "Limit", "Actual Rows": 50, Plans: [child] });
+  test("an empty or absent plan is NOT MEASURED, never PASS", () => {
+    expect(agentGate("exact", null).verdict).toBe("NOT MEASURED");
+    expect(agentGate("exact", { "Node Type": "Limit", "Actual Rows": 0 }).verdict).toBe("NOT MEASURED");
+  });
+  test("a name applied as a filter fails, however few rows it reads", () => {
+    expect(agentGate("selective-prefix", limit(scan({ "Index Cond": "(org_id = 'a')", "Rows Removed by Filter": 10 }))).verdict).toBe("FAIL");
+  });
+  test("a name in the Index Cond passes", () => {
+    expect(agentGate("selective-prefix", limit(scan({ "Index Cond": "((org_id = 'a') AND (agent_name_normalized ~>=~ 'x'))" }))).verdict).toBe("PASS");
+  });
+  test("a broad prefix may walk recency, within 100x", () => {
+    expect(agentGate("broad-prefix", limit(scan({ "Index Cond": "(org_id = 'a')", "Rows Removed by Filter": 100 }))).verdict).toBe("PASS");
+    expect(agentGate("broad-prefix", limit(scan({ "Index Cond": "(org_id = 'a')", "Rows Removed by Filter": 6000 }))).verdict).toBe("FAIL");
   });
 });
 

@@ -17,7 +17,7 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { generateCorpus, SCALES, TERMS, type CorpusSession } from "./corpus.ts";
+import { corpusHash, generateCorpus, SCALES, TERMS, type CorpusSession } from "./corpus.ts";
 import { assertLocalTarget } from "./guard.ts";
 import { summarize } from "./stats.ts";
 
@@ -418,7 +418,7 @@ async function bm25() {
 }
 
 const version = await ch("SELECT version()");
-const report: Record<string, unknown> = { version, scale, warning: "Vanilla ClickHouse, synthetic data, relative numbers. Not ObsessionDB and not an e2e proof." };
+const report: Record<string, unknown> = { head: process.env.BENCH_HEAD_SHA ?? "unrecorded", corpusSha256: corpusHash(SCALES[scale]!), version, scale, warning: "Vanilla ClickHouse, synthetic data, relative numbers. Not ObsessionDB and not an e2e proof." };
 report.bm25 = await bm25();
 report.gate3 = await gate3();
 report.gate3Parts = await gate3Parts();
