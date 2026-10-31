@@ -19,6 +19,7 @@
 import * as Alchemy from "alchemy";
 import { Stage } from "alchemy";
 import * as AWS from "@alchemy.run/aws";
+import { getAccountId } from "@alchemy.run/aws/AuthProvider";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Effect from "effect/Effect";
@@ -30,6 +31,7 @@ import { SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
 import { eksStage } from "./eks.ts";
 import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy } from "./hardening.ts";
 import { sharedServicesRepository, validateAwsInputs, type AwsInputs } from "./inputs.ts";
+import { assertAwsDeploymentTarget, assertClearance, awsMode } from "./deploy-guard.ts";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -50,15 +52,16 @@ function readInputs(stage: string): AwsInputs {
   } catch {
     throw new Error(`96bulls: the AWS stage ${stage} is not cleared: ${path} does not exist (see docs/aws-stage.md). Nothing was created.`);
   }
-  if (!inputs.clearedBy?.trim()) throw new Error(`96bulls: ${path} has no clearedBy; the AWS stage is not cleared`);
-  if (process.env.NINETY_SIX_BULLS_CONFIRM_ACCOUNT !== inputs.accountId)
-    throw new Error("96bulls: set NINETY_SIX_BULLS_CONFIRM_ACCOUNT=<account id> to run the AWS stage; nothing was created");
+  // Placeholders anywhere, the typed account confirmation, and (deploy/destroy) Khaliq's dated clearance.
+  assertClearance(awsMode(process.env), inputs, process.env);
   assertRegion(inputs.region);
   validateAwsInputs(stage, inputs);
   return inputs;
 }
 
-const tags = (stage: string, component: string) => ({ "96bulls:stack": stage, "96bulls:component": component, "96bulls:repo": REPO });
+/** Pippen Tools' sweeper deletes what carries `pippen:sandbox=true` (pippen-tools docs/architecture.md). */
+let sandboxTag: Record<string, string> = {};
+const tags = (stage: string, component: string) => ({ "96bulls:stack": stage, "96bulls:component": component, "96bulls:repo": REPO, ...sandboxTag });
 
 export default Alchemy.Stack(
   "96bulls-aws",
@@ -70,6 +73,13 @@ export default Alchemy.Stack(
     const stage = yield* Stage;
     if (!stage.startsWith("aws-")) throw new Error(`96bulls: this config is for aws-* stages, got ${stage}`);
     const inputs = readInputs(stage);
+    sandboxTag = inputs.pippenSandbox ? { "pippen:sandbox": "true" } : {};
+    // Before the first resource: the credentials the providers will use must belong to the
+    // inputs' account, and the providers' region must be the inputs' region.
+    const awsEnvironment = yield* AWS.AWSEnvironment.current;
+    const liveCredentials = yield* awsEnvironment.credentials.pipe(Effect.orDie);
+    const callerAccountId = yield* getAccountId(liveCredentials as never).pipe(Effect.orDie);
+    assertAwsDeploymentTarget({ accountId: inputs.accountId, region: inputs.region }, { accountId: callerAccountId as string, region: awsEnvironment.region as string });
     const name = (base: string) => `96bulls-${stage}-${base}`;
 
     // Account baseline: one KMS key for everything we store.
@@ -89,7 +99,7 @@ export default Alchemy.Stack(
       publicAccessBlock: { blockPublicAcls: true, ignorePublicAcls: true, blockPublicPolicy: true, restrictPublicBuckets: true },
       // TLS only; superseded manifest versions and abandoned uploads expire.
       policy: denyInsecureTransport(`arn:aws:s3:::${name("locker")}-${inputs.accountId}`),
-      lifecycleRules: lockerLifecycleRules() as never,
+      lifecycleRules: lockerLifecycleRules(inputs.lockerNoncurrentVersionDays) as never,
       tags: tags(stage, "locker"),
     });
 
@@ -160,7 +170,7 @@ export default Alchemy.Stack(
     // GitHub OIDC: the only way CI reaches the account, and only to push the services image.
     // Sandbox accounts get neither (their boundary forbids new OIDC providers and trust edits), and
     // a stage sharing the account (accountShared) relies on the owner stage's provider and role.
-    const deployer = isSandbox || inputs.accountShared
+    const deployer = isSandbox || inputs.accountShared || inputs.pippenSandbox
       ? undefined
       : yield* Effect.gen(function* () {
           const oidc = yield* AWS.IAM.OpenIDConnectProvider("github-oidc", {
@@ -204,7 +214,9 @@ export default Alchemy.Stack(
           relayhistoryOrigin: inputs.eks.relayhistoryOrigin,
           ...(inputs.eks.relayauthIssuer ? { relayauthIssuer: inputs.eks.relayauthIssuer } : {}),
           ...(inputs.eks.relayauth ? { relayauth: inputs.eks.relayauth } : {}),
-          imageRepository: ecr ? (ecr.repositoryUri as unknown as string) : sharedServicesRepository(inputs.accountId, inputs.region),
+          imageRepository: inputs.eks.imageRepository ?? (ecr ? (ecr.repositoryUri as unknown as string) : sharedServicesRepository(inputs.accountId, inputs.region)),
+          ...(inputs.eks.networkPolicyEnforcement ? { networkPolicyEnforcement: true } : {}),
+          ...(inputs.eks.legacyPodsRole ? { legacyPodsRole: inputs.eks.legacyPodsRole } : {}),
           imageDigest: inputs.eks.imageDigest,
           imageSourceRevision: inputs.eks.imageSourceRevision,
           ...(inputs.eks.apiAccess ? { apiAccess: inputs.eks.apiAccess } : {}),
@@ -214,7 +226,11 @@ export default Alchemy.Stack(
           ...(inputs.eks.ingress ? { ingress: inputs.eks.ingress } : {}),
           lockerBucketArn: `arn:aws:s3:::${name("locker")}-${inputs.accountId}`,
           lockerKmsKeyArn: key.keyArn as unknown as string,
-          ...(isSandbox ? { permissionsBoundaryArn: `arn:aws:iam::${inputs.accountId}:policy/${SANDBOX_RULES.permissionsBoundary}` } : {}),
+          ...(inputs.pippenSandbox
+            ? { permissionsBoundaryArn: inputs.pippenSandbox.permissionsBoundaryArn }
+            : isSandbox
+              ? { permissionsBoundaryArn: `arn:aws:iam::${inputs.accountId}:policy/${SANDBOX_RULES.permissionsBoundary}` }
+              : {}),
           tags: tags(stage, "eks"),
         })
       : undefined;

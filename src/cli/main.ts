@@ -9,8 +9,9 @@
  *   96bulls token <stage>             mint a courier token for manual calls
  *   96bulls plan <stage>              alchemy plan (dry run)
  *
- * Guardrail: stages named aws* refuse to deploy until the AWS account work is
- * cleared by Khaliq (docs/aws-stage.md). GCP up/down stay refused. A GCP plan
+ * AWS stages (aws-*) run the gated stack through src/cli/aws.ts: plan reads
+ * only; up/down need typed confirmations, and the stack refuses unless the live
+ * account, region and Khaliq's dated clearance match the inputs (docs/aws-stage.md). GCP up/down stay refused. A GCP plan
  * uses the gated stack and exits non-zero when Alchemy does (docs/gcp-stage.md).
  */
 import { spawnSync } from "node:child_process";
@@ -22,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { generateLocalKeys, mintToken } from "../alleyoop/auth.ts";
 import { seedConcourse } from "../concourse/seed.ts";
 import { planChildExitCode, planChildMustFailClosed } from "./plan-exit.ts";
+import { awsInvocation } from "./aws.ts";
 import { HOOPDB_NAME, HOOPDB_USER, NAMES, PORTS, SERVICES_CONTAINER_UID, TENANT, summaryKeyAccess, summaryKeyPath } from "../../stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -89,7 +91,7 @@ function stageDir(stage: string) {
 
 function requireLocalStage(stage: string | undefined): string {
   if (!stage) die("stage is required, e.g. `96bulls up local`");
-  if (stage.startsWith("aws")) die("AWS stages are not cleared yet; nothing was created (docs/aws-stage.md)");
+  if (stage.startsWith("aws")) die("AWS stages support plan, up and down only (docs/aws-stage.md)");
   if (stage.startsWith("gcp")) die("GCP stages are not cleared for up/down; nothing was created (docs/gcp-stage.md)");
   if (stage !== "local" && !stage.startsWith("local-")) die(`unknown stage ${stage}; use local or local-<name>`);
   return stage;
@@ -300,7 +302,19 @@ function status(stage: string) {
   console.log(r.stdout || "(no containers)");
 }
 
+function aws(verb: "plan" | "up" | "down", stage: string) {
+  let inv;
+  try {
+    inv = awsInvocation(verb, stage, process.env);
+  } catch (err) {
+    die((err as Error).message);
+  }
+  // Fail closed: any non-zero Alchemy status exits non-zero.
+  sh("bunx", inv.args, { env: inv.env });
+}
+
 async function main() {
+  if (stageArg?.startsWith("aws-") && (command === "plan" || command === "up" || command === "down")) return aws(command, stageArg);
   switch (command) {
     case "up":
       return up(requireLocalStage(stageArg));
@@ -310,10 +324,6 @@ async function main() {
       return status(requireLocalStage(stageArg));
     case "plan": {
       if (!stageArg) die("stage is required");
-      if (stageArg.startsWith("aws-")) {
-        // Code-only until cleared: plan needs credentials and an aws-inputs.json written by hand.
-        return void sh("bunx", ["alchemy", "plan", "--config", "stacks/aws/alchemy.aws.run.ts", "--stage", stageArg, "--no-input"], { env: { ALCHEMY_PLAIN: "1" }, allowFail: true });
-      }
       if (stageArg.startsWith("gcp-")) {
         // Fail closed. A non-zero Alchemy status exits this process. Do not run a plan,
         // create the state bucket, or enable APIs until that plan is separately approved.

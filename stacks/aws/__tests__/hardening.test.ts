@@ -75,10 +75,12 @@ describe("per-service-account pod roles", () => {
   it("declares one role per service account and shares none", () => {
     expect(roles.map((r) => r.serviceAccount).sort()).toEqual(Object.values(SERVICE_ACCOUNTS).sort());
     expect(new Set(roles.map((r) => r.id)).size).toBe(roles.length);
-    // The old shared role is gone from the stack source.
+    // The old shared role survives only as an unattached rollback copy behind `legacyPodsRole: "keep"`.
     const eks = readFileSync(`${ROOT}/stacks/aws/eks.ts`, "utf8");
-    expect(eks).not.toContain('"pods-role"');
+    expect(eks.match(/"pods-role"/g)).toHaveLength(1);
+    expect(eks).toContain('if (i.legacyPodsRole === "keep") yield* AWS.IAM.Role("pods-role", legacyPodsRoleProps(i));');
     expect(eks).not.toMatch(/for \(const sa of \[/);
+    expect(eks).not.toMatch(/podRole\.roleArn/);
   });
 
   it("grants s3:DeleteObject to no pod role (the ObjectStore has no delete)", () => {
@@ -184,9 +186,12 @@ describe("CloudTrail key", () => {
 });
 
 describe("HoopDb backend", () => {
-  it("defaults to external (Supabase) and allows CNPG for the proof stage", () => {
+  it("defaults to external (Supabase) and allows CNPG only on proof and sandbox stages", () => {
     expect(hoopdbBackend("aws-sessions-dev", undefined)).toBe("external");
-    expect(hoopdbBackend("aws-sessions-dev", "cnpg")).toBe("cnpg");
+    expect(hoopdbBackend("aws-proof", "cnpg")).toBe("cnpg");
+    expect(hoopdbBackend("aws-sandbox-claude", "cnpg")).toBe("cnpg");
+    // sessions-dev must never be switched to an empty in-cluster database.
+    expect(() => hoopdbBackend("aws-sessions-dev", "cnpg")).toThrow(/keeps its external HoopDb/);
   });
   it("refuses in-cluster CNPG for any production-looking stage, and unknown backends", () => {
     expect(() => hoopdbBackend("aws-prod", "cnpg")).toThrow(/Supabase/);
@@ -205,10 +210,12 @@ describe("buckets", () => {
     expect(readFileSync(`${ROOT}/stacks/aws/ingress.ts`, "utf8")).toContain("denyInsecureTransport(logBucketArn)");
   });
 
-  it("expires superseded Locker versions and abandoned uploads, never current objects", () => {
-    const rules = lockerLifecycleRules();
+  it("expires superseded Locker versions only when a stage opts in (irreversible), never current objects", () => {
+    expect(lockerLifecycleRules(undefined).map((r) => r.ID)).toEqual(["abort-incomplete-uploads"]);
+    const rules = lockerLifecycleRules(90);
     expect(rules.map((r) => r.ID)).toEqual(["expire-noncurrent-versions", "abort-incomplete-uploads"]);
     expect(JSON.stringify(rules)).not.toMatch(/"Expiration"/);
+    expect(() => lockerLifecycleRules(7)).toThrow(/at least 30/);
   });
 
   it("encrypt the trail bucket with the trail key and keep it versioned", () => {

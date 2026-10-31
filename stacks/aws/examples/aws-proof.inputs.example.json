@@ -1,28 +1,43 @@
 {
-  "$comment": "Fresh isolated proof stage (cluster 96bulls-aws-proof) beside aws-sessions-dev in the same account. Copy to .96bulls/aws-proof/aws-inputs.json (gitignored) and replace every <...> value. Nothing here is secret: Secrets are created out of band from 1Password (docs/aws-stage.md).",
+  "$comment": "Fresh isolated proof stage (cluster 96bulls-aws-proof) beside aws-sessions-dev in the same account. Copy to .96bulls/aws-proof/aws-inputs.json (gitignored) and replace every <...> value; the stage refuses any left. accountId is an input: for a fresh account (e.g. a Pippen sandbox) drop accountShared, set pippenSandbox and, without a publish there, eks.imageRepository. Nothing here is secret: Secrets are created out of band from 1Password (docs/aws-stage.md).",
   "accountId": "500268966557",
   "region": "us-west-2",
   "clearedBy": "<Khaliq's words, verbatim, with the date>",
   "budgetUsd": 300,
   "budgetEmail": "aws-budgets@agentrelay.com",
-  "accountShared": { "ownerStage": "aws-sessions-dev" },
+  "accountShared": {
+    "ownerStage": "aws-sessions-dev"
+  },
+  "lockerNoncurrentVersionDays": 90,
   "eks": {
     "chartVersion": "0.3.0",
     "runtimeSecretName": "96bulls-runtime",
     "tenantOrgId": "<org id for the proof tenant>",
     "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
     "relayhistoryOrigin": "https://proof-sessions.agentrelay.com",
-    "relayauth": { "chartVersion": "0.1.0", "secretName": "relayauth" },
+    "relayauth": {
+      "chartVersion": "0.1.0",
+      "secretName": "relayauth"
+    },
     "imageDigest": "<sha256 digest publish-image-ecr pushed to 96bulls-services>",
     "imageSourceRevision": "<40-hex commit that image was built from>",
-    "apiAccess": { "publicAccessCidrs": ["<operator IP>/32"] },
-    "hoopdb": { "backend": "cnpg" },
+    "apiAccess": {
+      "publicAccessCidrs": [
+        "<operator IP>/32"
+      ]
+    },
+    "networkPolicyEnforcement": false,
+    "hoopdb": {
+      "backend": "cnpg"
+    },
     "relaycast": {
       "chartVersion": "0.1.0",
       "imageDigest": "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
       "baseUrl": "https://relaycast.proof-sessions.agentrelay.com"
     },
-    "sessionDirectory": { "enabled": false },
+    "sessionDirectory": {
+      "enabled": false
+    },
     "ingress": {
       "hostname": "proof-sessions.agentrelay.com",
       "cloudflareZoneId": "34afb0e8fc19f2b6fd025668e880a889",

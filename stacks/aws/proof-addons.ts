@@ -5,7 +5,7 @@
  * contracts are unit-tested (stacks/aws/__tests__/proof-addons.test.ts) and
  * rendered with `helm template` before anything is applied.
  */
-import { DIGEST_RE, NAMESPACE, PINNED_IMAGES, VPC_CIDR, assertDigestPinned } from "./hardening.ts";
+import { DIGEST_RE, NAMESPACE, PINNED_IMAGES, VPC_AZ_COUNT, VPC_CIDR, assertDigestPinned, networkSubnetCidrs } from "./hardening.ts";
 import { relayauthTlsNetworkPolicies } from "./relayauth-tls.ts";
 
 // ---------------------------------------------------------------------------
@@ -151,6 +151,8 @@ export interface NetworkPolicyInputs {
   relaycast: boolean;
   /** Fence for the session-directory PostgREST (96BullSessions #73); the Deployment itself comes from that PR. */
   sessionDirectory?: boolean;
+  /** Where the ALB lives: public subnets (internet-facing, default) or private (internal). */
+  ingestScheme?: IngestScheme;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +175,11 @@ export function assertSessionDirectoryPreconditions(i: { hoopdb: "external" | "c
     throw new Error("96bulls: eks.sessionDirectory needs self-hosted RelayAuth with in-cluster TLS (eks.relayauth): the search-token exchange carries an API key and a user token. Nothing was created.");
 }
 
+export function alleyoopIngressSubnets(scheme: IngestScheme) {
+  const s = networkSubnetCidrs(VPC_CIDR, VPC_AZ_COUNT);
+  return scheme === "internal" ? s.private : s.public;
+}
+
 /** Every NetworkPolicy the proof stage applies, grouped by namespace. */
 export function networkPolicies(i: NetworkPolicyInputs) {
   const app = (name: string) => ({ matchLabels: { "app.kubernetes.io/instance": "96bulls", "app.kubernetes.io/name": name } });
@@ -184,8 +191,14 @@ export function networkPolicies(i: NetworkPolicyInputs) {
     // Pod Identity agent (link-local, per node), S3 through the gateway endpoint, the EKS API and JWKS: HTTPS only.
     np(NAMESPACE, "allow-pod-identity-agent", { podSelector: {}, policyTypes: ["Egress"], egress: [{ to: [{ ipBlock: { cidr: "169.254.170.23/32" } }], ports: tcp(80) }] }),
     np(NAMESPACE, "allow-https-egress", { podSelector: {}, policyTypes: ["Egress"], egress: [{ to: [internetExceptImds], ports: tcp(443) }] }),
-    // Ingest: the ALB targets pod IPs from inside the VPC.
-    np(NAMESPACE, "allow-alleyoop-from-vpc", { podSelector: app("alleyoop"), policyTypes: ["Ingress"], ingress: [{ from: [{ ipBlock: { cidr: VPC_CIDR } }], ports: tcp(8080) }] }),
+    // Ingest: only the ALB's subnets may reach AlleyOop, so in-cluster traffic cannot bypass the WAF.
+    // Internet-facing ALBs sit in the public subnets, where no pod runs. An internal ALB shares the
+    // private subnets with pods, which this rule cannot tell apart (documented trade-off).
+    np(NAMESPACE, "allow-alleyoop-from-alb", {
+      podSelector: app("alleyoop"),
+      policyTypes: ["Ingress"],
+      ingress: [{ from: alleyoopIngressSubnets(i.ingestScheme ?? "internet-facing").map((cidr) => ({ ipBlock: { cidr } })), ports: tcp(8080) }],
+    }),
     // OTLP from the namespace's own workloads only.
     np(NAMESPACE, "allow-otlp-in-namespace", { podSelector: app("otel"), policyTypes: ["Ingress"], ingress: [{ from: [{ podSelector: {} }], ports: tcp(4317, 4318) }] }),
     np(NAMESPACE, "allow-otlp-egress", { podSelector: appPods, policyTypes: ["Egress"], egress: [{ to: [{ podSelector: app("otel") }], ports: tcp(4317, 4318) }] }),

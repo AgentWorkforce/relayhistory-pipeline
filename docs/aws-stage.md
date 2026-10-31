@@ -315,9 +315,19 @@ addresses, so no data port is opened by CIDR; kubelet probes from a pod's own
 node are admitted by the VPC CNI agent), AlleyOop to RelayAuth (JWKS), labelled
 callers to the RelayAuth TLS endpoint, apps to HoopDb
 (CNPG: in-namespace only, plus the operator; external: Postgres/pooler ports),
-and `96bulls` to Relaycast. The stage also writes `kube-system/amazon-vpc-cni`
-`enable-network-policy-controller: "true"`; without it Auto Mode accepts the
-policies and enforces nothing.
+and `96bulls` to Relaycast. AlleyOop's port 8080 admits only the ALB's
+**public** subnets (`10.42.0.0/24`, `10.42.1.0/24`), where no pod runs, so
+in-cluster traffic cannot reach the ingest around the WAF. (An `internal` ALB
+shares the private subnets with pods; that scheme cannot make this
+distinction.)
+
+Enforcement is a **separate, later apply**. Step 1 applies every policy while
+Auto Mode still ignores them (`eks.networkPolicyEnforcement` absent or false).
+Check them (`kubectl get networkpolicy -A`), then step 2 sets
+`eks.networkPolicyEnforcement: true`, which writes `kube-system/amazon-vpc-cni`
+`enable-network-policy-controller: "true"`. An interrupted step 1 therefore can
+never leave workloads behind a partial deny. Undo step 2 by setting it back to
+false and applying (or deleting that ConfigMap).
 
 ### Ingest exposure (public contract)
 
@@ -384,9 +394,9 @@ principals may decrypt trail log files. The Locker key keeps the default
 account policy for now (its users are IAM roles conditioned on S3).
 
 Every bucket (Locker, trail, ALB logs) denies requests without TLS
-(`aws:SecureTransport`). The Locker expires noncurrent versions after 90 days
-(superseded manifests; nothing reads old versions) and incomplete multipart
-uploads after 7.
+(`aws:SecureTransport`). The Locker aborts incomplete multipart uploads after
+7 days; expiring noncurrent versions (superseded manifests; nothing reads old
+versions) is opt-in per stage and irreversible (`lockerNoncurrentVersionDays`).
 
 ### GitHub image publisher
 
@@ -443,6 +453,42 @@ the first apply, create its Secrets from 1Password as for sessions-dev
 (`96bulls-runtime` without `HOOPDB_URL`, which CNPG supplies; `relayauth`;
 `kube-system/cloudflare-dns`).
 
+### Apply, verify and roll back
+
+Every AWS run goes through the CLI and fails closed. The stack refuses before
+declaring anything unless: no input holds a placeholder (`<...>`, TODO, ...);
+`NINETY_SIX_BULLS_CONFIRM_ACCOUNT` equals `accountId`; the live STS caller's
+account and the provider's region equal `accountId` and `region`; and, for
+`up`/`down`, `clearedBy` holds Khaliq's words with the date. Credentials stay in
+environment variables (exported from the SSO session), never on disk:
+
+```sh
+export AWS_REGION=us-west-2 NINETY_SIX_BULLS_CONFIRM_ACCOUNT=500268966557
+eval "$(aws configure export-credentials --profile sessions-dev --format env)"
+bin/96bulls plan aws-proof                                    # read only
+NINETY_SIX_BULLS_CONFIRM_STAGE=aws-proof bin/96bulls up aws-proof
+NINETY_SIX_BULLS_CONFIRM_DESTROY=aws-proof bin/96bulls down aws-proof   # rollback of a fresh stage
+```
+
+`down` is refused for `aws-sessions-dev` and any `*prod*` stage: roll those
+back by reverting the change and running `up` again. Read-only plans for both
+stages are in `docs/plans/`.
+
+Reversibility:
+
+- **IAM split.** With `eks.legacyPodsRole: "keep"` the old `…-pods` role stays,
+  unattached and unchanged, while the associations move to the per-SA roles.
+  Roll back by pointing the associations back
+  (`aws eks update-pod-identity-association --role-arn …-pods`) or reverting.
+  Retire it only in a later apply (drop the field) after the pods are verified.
+- **NetworkPolicies:** reversible; see the two steps above.
+- **Locker noncurrent-version expiry** (`lockerNoncurrentVersionDays`) is
+  **irreversible** once applied (expired versions are gone), so it is opt-in:
+  the proof stage sets it; sessions-dev does not.
+- **sessions-dev never moves to CNPG** (it would start on an empty database):
+  the stack allows `eks.hoopdb.backend: "cnpg"` only on `aws-proof*` and
+  `aws-sandbox-*` stages.
+
 ### aws-inputs.json additions (proof stage)
 
 ```json
@@ -450,6 +496,8 @@ the first apply, create its Secrets from 1Password as for sessions-dev
   "imageDigest": "sha256:<digest publish-image-ecr pushed to this account>",
   "imageSourceRevision": "<40-hex commit it was built from>",
   "apiAccess": { "publicAccessCidrs": ["<operator IP>/32"] },
+  "networkPolicyEnforcement": false,
+  "legacyPodsRole": "keep",
   "hoopdb": { "backend": "cnpg" },
   "sessionDirectory": { "enabled": false },
   "relaycast": {

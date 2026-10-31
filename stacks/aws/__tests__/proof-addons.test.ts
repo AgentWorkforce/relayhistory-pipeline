@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { eksChartValues } from "../eks.ts";
-import { PINNED_IMAGES, VPC_CIDR } from "../hardening.ts";
+import { PINNED_IMAGES, VPC_CIDR, networkSubnetCidrs } from "../hardening.ts";
 import {
   DEFAULT_INGEST_RATE_LIMIT,
   INGEST_LISTEN_PORTS,
@@ -107,10 +107,19 @@ describe("NetworkPolicies", () => {
     }
   });
 
-  it("never admits ingress from outside the VPC", () => {
-    for (const p of all)
-      for (const r of ((p.spec as { ingress?: Rule[] }).ingress ?? []))
-        for (const f of r.from ?? []) if (f.ipBlock) expect(f.ipBlock.cidr).toBe(VPC_CIDR);
+  it("admits by CIDR only the ALB's public subnets (AlleyOop:8080) and health-only ports", () => {
+    const byCidr = all.flatMap((p) =>
+      ((p.spec as { ingress?: Rule[] }).ingress ?? []).flatMap((r) =>
+        (r.from ?? []).filter((f) => f.ipBlock).map((f) => ({ policy: p.metadata.name, cidr: f.ipBlock!.cidr, ports: (r.ports ?? []).map((x) => x.port) })),
+      ),
+    );
+    expect(byCidr).toEqual([
+      { policy: "allow-health-ports-from-vpc", cidr: VPC_CIDR, ports: [8081, 13133] },
+      { policy: "allow-alleyoop-from-alb", cidr: "10.42.0.0/24", ports: [8080] },
+      { policy: "allow-alleyoop-from-alb", cidr: "10.42.1.0/24", ports: [8080] },
+    ]);
+    // The ALB subnets are the Network's public subnets, disjoint from the private (pod) subnets.
+    expect(networkSubnetCidrs(VPC_CIDR, 2)).toEqual({ public: ["10.42.0.0/24", "10.42.1.0/24"], private: ["10.42.2.0/24", "10.42.3.0/24"] });
   });
 
   it("opens internet egress only on named ports and never to instance metadata", () => {

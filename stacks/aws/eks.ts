@@ -94,6 +94,10 @@ export interface EksStageInputs {
    * Deployment comes from 96BullSessions #73; requires cnpg + self-hosted RelayAuth (TLS).
    */
   sessionDirectory?: { enabled: boolean };
+  /** Step 2 of the NetworkPolicy rollout: switch enforcement on once the policies are applied and checked. */
+  networkPolicyEnforcement?: boolean;
+  /** "keep": keep the old shared pods role (unattached) until the per-SA roles are verified. */
+  legacyPodsRole?: "keep";
   /** The Locker bucket ARN and its KMS key ARN, for the pods' Pod Identity role. */
   lockerBucketArn: string;
   lockerKmsKeyArn: string;
@@ -214,6 +218,31 @@ export function eksChartValues(
   };
 }
 
+/** The pre-split shared role, byte for byte, so keeping it is a no-op on a stage that has it. */
+export function legacyPodsRoleProps(i: Pick<EksStageInputs, "stage" | "lockerBucketArn" | "lockerKmsKeyArn" | "permissionsBoundaryArn" | "tags">) {
+  return {
+    roleName: `96bulls-${i.stage}-pods`,
+    description: `96bulls ${i.stage}: worker and ingest pods (EKS Pod Identity)`,
+    assumeRolePolicyDocument: {
+      Version: "2012-10-17" as const,
+      Statement: [{ Effect: "Allow" as const, Principal: { Service: "pods.eks.amazonaws.com" }, Action: ["sts:AssumeRole", "sts:TagSession"] }],
+    },
+    inlinePolicies: {
+      locker: {
+        Version: "2012-10-17" as const,
+        Statement: [
+          { Effect: "Allow" as const, Action: ["s3:ListBucket", "s3:GetBucketLocation", "s3:GetBucketVersioning"], Resource: [i.lockerBucketArn] },
+          { Effect: "Allow" as const, Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject"], Resource: [`${i.lockerBucketArn}/*`] },
+          { Effect: "Allow" as const, Action: ["kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"], Resource: [i.lockerKmsKeyArn] },
+        ],
+      },
+    },
+    maxSessionDuration: "1 hour" as const,
+    ...(i.permissionsBoundaryArn ? { permissionsBoundary: i.permissionsBoundaryArn } : {}),
+    tags: { ...i.tags, ...(i.permissionsBoundaryArn ? { "96bulls:bounded": "true" } : {}) },
+  };
+}
+
 export const eksStage = (i: EksStageInputs) =>
   Effect.gen(function* () {
     // Refuse before declaring anything billable.
@@ -289,8 +318,9 @@ export const eksStage = (i: EksStageInputs) =>
     const inClusterVolumes = Boolean(i.relayauth) || backend === "cnpg" || Boolean(i.relaycast) || sandbox;
     if (inClusterVolumes) yield* Kubernetes.Manifest("storageclass-gp3", { cluster: cluster as never, manifest: storageClassManifest() });
 
-    // NetworkPolicy enforcement (EKS Auto Mode needs the controller switched on), then default-deny policies.
-    yield* Kubernetes.Manifest("network-policy-controller", { cluster: cluster as never, manifest: networkPolicyControllerConfigMap() });
+    // Rollback window for the IAM split: the old shared role stays (attached to nothing) until the
+    // per-SA roles are verified, and goes in a later, separate apply that drops `legacyPodsRole`.
+    if (i.legacyPodsRole === "keep") yield* AWS.IAM.Role("pods-role", legacyPodsRoleProps(i));
 
     // In-cluster HoopDb for the isolated proof stage only (hoopdbBackend refuses production).
     const cnpgOperator = backend === "cnpg"
@@ -342,13 +372,17 @@ export const eksStage = (i: EksStageInputs) =>
     const releases: Record<string, string> = { [NAMESPACE]: chart.releaseName as unknown as string };
     if (selfAuth) releases.relayauth = selfAuth.release as unknown as string;
     if (relaycast) releases[RELAYCAST_NAMESPACE] = relaycast.releaseName as unknown as string;
-    for (const policy of networkPolicies({ hoopdb: backend, relayauth: Boolean(selfAuth), relaycast: Boolean(relaycast), sessionDirectory })) {
+    for (const policy of networkPolicies({ hoopdb: backend, relayauth: Boolean(selfAuth), relaycast: Boolean(relaycast), sessionDirectory, ingestScheme: i.ingress?.scheme ?? "internet-facing" })) {
       const { namespace, name } = policy.metadata;
       yield* Kubernetes.Manifest(`netpol-${namespace}-${name}`, {
         cluster: cluster as never,
         manifest: { ...policy, metadata: { ...policy.metadata, annotations: { "96bulls.agentrelay.com/after-release": releases[namespace]! } } },
       });
     }
+    // Enforcement is a separate, later apply (step 2): with it off, the policies above are accepted and
+    // ignored, so an interrupted first apply can never leave workloads behind a half-written deny.
+    if (i.networkPolicyEnforcement)
+      yield* Kubernetes.Manifest("network-policy-controller", { cluster: cluster as never, manifest: networkPolicyControllerConfigMap() });
     const publicIngest = i.ingress
       ? yield* ingressStage({
           stage: i.stage,

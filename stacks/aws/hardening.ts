@@ -339,11 +339,17 @@ export function trailKeyPolicy(accountId: string, region: string, trailName: str
  */
 export type HoopDbBackend = "external" | "cnpg";
 
+/** Stages that may run the disposable in-cluster HoopDb: isolated proof stages and sandboxes. */
+export const CNPG_STAGE_RE = /^aws-(proof(-[a-z0-9-]+)?|sandbox-[a-z0-9-]+)$/;
+
 export function hoopdbBackend(stage: string, backend: string | undefined): HoopDbBackend {
   const b = backend ?? "external";
   if (b !== "external" && b !== "cnpg") throw new Error(`96bulls: eks.hoopdb.backend must be "external" or "cnpg", got ${JSON.stringify(backend)}. Nothing was created.`);
-  if (b === "cnpg" && /prod/.test(stage))
+  if (b === "cnpg" && /prod/.test(stage) && !CNPG_STAGE_RE.test(stage))
     throw new Error(`96bulls: stage ${stage} looks like production; production HoopDb is Supabase (docs/decisions/0001-production-data-plane.md), never in-cluster CNPG. Nothing was created.`);
+  // A live stage (sessions-dev) switching to CNPG would start on an empty database.
+  if (b === "cnpg" && !CNPG_STAGE_RE.test(stage))
+    throw new Error(`96bulls: eks.hoopdb.backend "cnpg" is only for isolated proof and sandbox stages (aws-proof*, aws-sandbox-*); ${stage} keeps its external HoopDb. Nothing was created.`);
   return b;
 }
 
@@ -370,12 +376,38 @@ export function denyInsecureTransport(bucketArn: string) {
  * every superseded manifest; nothing reads old versions (no GetObjectVersion
  * anywhere), so they expire after 90 days. Incomplete multipart uploads go after 7.
  */
-export function lockerLifecycleRules() {
+export function lockerLifecycleRules(noncurrentVersionDays: number | undefined) {
+  if (noncurrentVersionDays !== undefined && (!Number.isInteger(noncurrentVersionDays) || noncurrentVersionDays < 30))
+    throw new Error(`96bulls: lockerNoncurrentVersionDays must be an integer of at least 30, got ${JSON.stringify(noncurrentVersionDays)}. Nothing was created.`);
   return [
-    { ID: "expire-noncurrent-versions", Status: "Enabled", Filter: { Prefix: "" }, NoncurrentVersionExpiration: { NoncurrentDays: 90 } },
+    // IRREVERSIBLE once applied: superseded versions older than this are deleted. Opt-in per stage.
+    ...(noncurrentVersionDays !== undefined
+      ? [{ ID: "expire-noncurrent-versions", Status: "Enabled", Filter: { Prefix: "" }, NoncurrentVersionExpiration: { NoncurrentDays: noncurrentVersionDays } }]
+      : []),
     { ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 } },
   ];
 }
+
+/**
+ * Subnet CIDRs exactly as AWS.EC2.Network derives them (public first, then
+ * private; /24 minimum). The internet-facing ALB lives only in the public
+ * subnets and pods only in the private ones, so the public CIDRs identify ALB
+ * traffic without admitting any pod.
+ */
+export function networkSubnetCidrs(cidrBlock: string, azCount: number) {
+  const [base, prefixText] = cidrBlock.split("/");
+  const prefix = Number(prefixText);
+  const subnetPrefix = Math.max(prefix + Math.ceil(Math.log2(azCount * 2)), 24);
+  const size = 2 ** (32 - subnetPrefix);
+  const start = base!.split(".").reduce((n, o) => n * 256 + Number(o), 0) >>> 0;
+  const network = (start & (prefix === 0 ? 0 : (~0 << (32 - prefix)) >>> 0)) >>> 0;
+  const cidr = (n: number) => `${[24, 16, 8, 0].map((s) => (n >>> s) & 255).join(".")}/${subnetPrefix}`;
+  return {
+    public: Array.from({ length: azCount }, (_, i) => cidr(network + size * i)),
+    private: Array.from({ length: azCount }, (_, i) => cidr(network + size * (i + azCount))),
+  };
+}
+export const VPC_AZ_COUNT = 2;
 
 /**
  * The GitHub publisher may push the services image to this account's ECR
