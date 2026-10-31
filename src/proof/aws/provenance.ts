@@ -31,12 +31,30 @@ export const STAGE_PLAN_FILES = {
 export const ACCEPTED_PLAN_OPS = ["create", "noop"] as const;
 
 /**
- * Updates a reviewed stage change may carry, and only when the operator names
- * them with --allow-plan-update <resource> (each must be listed here). The
- * two-tenant change (#75) updates the umbrella release and the AlleyOop role.
- * Never replace, delete, import or adopt.
+ * Resources a reviewed stage change may update (the two-tenant change in #75
+ * updates the umbrella release and the AlleyOop role). Naming them is never
+ * enough: updates are admitted only with an approval bound to the exact
+ * capture (PlanUpdateApproval). Replace, delete, import and adopt are refused
+ * unconditionally.
  */
 export const REVIEWED_PLAN_UPDATES = ["96bulls", "alleyoop-role"] as const;
+
+/** The reviewed capture an update approval is bound to; every digest must match the loaded plan exactly. */
+export interface PlanUpdateApproval {
+  provenanceSha256: string;
+  planSha256: string;
+  inputsSha256: string;
+  sourceCommit: string;
+}
+
+const APPROVAL = /^([0-9a-f]{64}):([0-9a-f]{64}):([0-9a-f]{64}):([0-9a-f]{40})$/;
+
+/** `<provenanceSha256>:<planSha256>:<inputsSha256>:<sourceCommit>`; anything else (a resource name included) is refused. */
+export function parsePlanUpdateApproval(v: string): PlanUpdateApproval | { error: string } {
+  const m = APPROVAL.exec(v);
+  if (!m) return { error: "--allow-plan-update must be <provenanceSha256>:<planSha256>:<inputsSha256>:<sourceCommit> (hex digests and a 40-hex commit)" };
+  return { provenanceSha256: m[1]!, planSha256: m[2]!, inputsSha256: m[3]!, sourceCommit: m[4]! };
+}
 
 export interface PlanOps {
   summary: Record<string, number>;
@@ -82,13 +100,12 @@ export function parsePlanOps(text: string): PlanOps | { error: string } {
 
 /**
  * Only create and noop are accepted, in the summary and on every resource line,
- * and they must agree. `allowedUpdates` (reviewed, from --allow-plan-update)
- * admits `update` for exactly those resources and nothing else.
+ * and they must agree. `updatesApproved` (true only when an approval matched
+ * the exact capture) admits `update` for REVIEWED_PLAN_UPDATES and nothing else.
  */
-export function planOpsIssues(ops: PlanOps, allowedUpdates: readonly string[] = []): string[] {
+export function planOpsIssues(ops: PlanOps, updatesApproved = false): string[] {
   const issues: string[] = [];
-  for (const a of allowedUpdates) if (!(REVIEWED_PLAN_UPDATES as readonly string[]).includes(a)) issues.push(`--allow-plan-update ${a} is not a reviewed update`);
-  const okOp = (r: { id: string; op: string }) => (ACCEPTED_PLAN_OPS as readonly string[]).includes(r.op) || (r.op === "update" && allowedUpdates.includes(r.id));
+  const okOp = (r: { id: string; op: string }) => (ACCEPTED_PLAN_OPS as readonly string[]).includes(r.op) || (r.op === "update" && updatesApproved && (REVIEWED_PLAN_UPDATES as readonly string[]).includes(r.id));
   for (const [op, n] of Object.entries(ops.summary)) if (n > 0 && !(ACCEPTED_PLAN_OPS as readonly string[]).includes(op) && op !== "update") issues.push(`plan would ${op} ${n} resource(s)`);
   const updates = ops.resources.filter((r) => r.op === "update").length;
   if ((ops.summary.update ?? 0) !== updates) issues.push(`plan summary says ${ops.summary.update ?? 0} to update but lists ${updates}`);
@@ -110,15 +127,17 @@ export interface StagePlan {
   servicesDigest: string;
   relaycastDigest: string;
   chartVersions: { "96bulls": string; relayauth: string; relaycast: string };
-  /** Reviewed updates the plan carries (--allow-plan-update); empty for a create-only plan. */
+  /** Reviewed updates the plan carries (admitted by a matching approval); empty for a create-only plan. */
   allowedUpdates: string[];
+  /** The digest-bound approval that admitted them, or null. */
+  updateApproval: PlanUpdateApproval | null;
   /** create: this plan creates the cluster; noop: it already existed when the plan was captured. */
   clusterOp: "create" | "noop";
   sessionDirectoryEnabled: boolean;
 }
 
 /** Load and re-verify the captured Stage A plan. Every mismatch is a refusal. */
-export function loadStagePlan(root: string, read: (p: string) => string | undefined = (p) => (existsSync(p) ? readFileSync(p, "utf8") : undefined), allowedUpdates: readonly string[] = []): StagePlan | { error: string } {
+export function loadStagePlan(root: string, read: (p: string) => string | undefined = (p) => (existsSync(p) ? readFileSync(p, "utf8") : undefined), approval?: PlanUpdateApproval): StagePlan | { error: string } {
   const raw = read(join(root, STAGE_PLAN_FILES.provenance));
   if (raw === undefined) return { error: `stage plan provenance ${STAGE_PLAN_FILES.provenance} is missing (capture it with \`bin/96bulls plan aws-proof --capture\`, #75)` };
   let p: {
@@ -138,14 +157,21 @@ export function loadStagePlan(root: string, read: (p: string) => string | undefi
   if (p.outputs?.plan?.path !== STAGE_PLAN_FILES.plan || p.inputs?.sanitizedPath !== STAGE_PLAN_FILES.inputs) return { error: "stage plan points at unexpected files" };
   const plan = read(join(root, STAGE_PLAN_FILES.plan));
   if (plan === undefined || sha256(plan) !== p.outputs.plan.sha256) return { error: "stage plan text does not match its recorded sha256" };
+  const inputsRawEarly = read(join(root, STAGE_PLAN_FILES.inputs));
+  if (inputsRawEarly === undefined || sha256(inputsRawEarly) !== p.inputs.sanitizedSha256) return { error: "stage plan inputs do not match their recorded sha256" };
+  // An update approval must name this exact capture: provenance bytes, plan bytes, input bytes and source commit.
+  if (approval) {
+    const actual: PlanUpdateApproval = { provenanceSha256: sha256(raw), planSha256: sha256(plan), inputsSha256: sha256(inputsRawEarly), sourceCommit: p.source.commit! };
+    for (const k of ["provenanceSha256", "planSha256", "inputsSha256", "sourceCommit"] as const)
+      if (approval[k] !== actual[k]) return { error: `plan update approval does not match this capture (${k})` };
+  }
   const ops = parsePlanOps(plan);
   if ("error" in ops) return { error: `stage plan unreadable: ${ops.error}` };
-  const opIssues = planOpsIssues(ops, allowedUpdates);
+  const opIssues = planOpsIssues(ops, !!approval);
   if (opIssues.length) return { error: `stage plan is not create-only: ${opIssues.join("; ")}` };
   if ((p as { summary?: string }).summary !== undefined && !plan.split("\n").some((l) => l.trim() === (p as { summary?: string }).summary)) return { error: "stage plan provenance summary does not match the plan text" };
   const clusterOp = ops.resources.find((r) => r.id === "cluster")!.op as "create" | "noop";
-  const inputsRaw = read(join(root, STAGE_PLAN_FILES.inputs));
-  if (inputsRaw === undefined || sha256(inputsRaw) !== p.inputs.sanitizedSha256) return { error: "stage plan inputs do not match their recorded sha256" };
+  const inputsRaw = inputsRawEarly;
   const i = JSON.parse(inputsRaw) as {
     accountId?: string; region?: string;
     eks?: { chartVersion?: string; imageDigest?: string; relayhistoryOrigin?: string; ingress?: { hostname?: string }; relayauth?: { chartVersion?: string }; relaycast?: { chartVersion?: string; imageDigest?: string }; sessionDirectory?: { enabled?: boolean } };
@@ -167,6 +193,7 @@ export function loadStagePlan(root: string, read: (p: string) => string | undefi
     chartVersions: charts as StagePlan["chartVersions"],
     clusterOp,
     allowedUpdates: ops.resources.filter((r) => r.op === "update").map((r) => r.id),
+    updateApproval: approval ?? null,
     sessionDirectoryEnabled: i.eks?.sessionDirectory?.enabled === true,
   };
 }
@@ -199,7 +226,7 @@ export interface ReportProvenance {
   inputs: { sha256: string; source: "file" | "defaults" };
   /** sha256 of the effective config the run used. */
   configSha256: string;
-  stagePlan: { provenanceSha256: string; generatedAt: string; commit: string; planSha256: string; allowedUpdates: string[] } | null;
+  stagePlan: { provenanceSha256: string; generatedAt: string; commit: string; planSha256: string; allowedUpdates: string[]; updateApproval: PlanUpdateApproval | null } | null;
   charts: Array<{ name: string; version: string; digest: string | null }>;
 }
 

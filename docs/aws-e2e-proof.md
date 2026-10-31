@@ -51,10 +51,13 @@ must agree with the lines. An unknown line, a missing `[cluster]`, or any
 `update`, `replace`, `delete`, `import` or `adopt` is refused, even when the
 cluster appears. For example, the #75 continuation capture at `ecf70fd` (one
 `replace` of a never-created record) is refused, as intended. A reviewed stage
-change may carry `update`, but only for a resource listed in
+change may carry `update` only under an approval bound to the exact capture:
+`--allow-plan-update <provenanceSha256>:<planSha256>:<inputsSha256>:<sourceCommit>`.
+The harness recomputes each value from the loaded files and refuses any
+mismatch. Even with a matching approval, `update` is admitted only for
 `REVIEWED_PLAN_UPDATES` (`96bulls` and `alleyoop-role`, for the two-tenant
-change), and only when it is named with `--allow-plan-update <resource>`. Even
-then, `replace` and the other operations stay refused.
+change). A resource name alone is never accepted, and `replace`, `delete`,
+`import` and `adopt` are refused unconditionally.
 
 The live cluster must also be the one that plan created. `describe-cluster`
 must show the cluster was created after the plan was captured when the plan

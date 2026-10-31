@@ -18,7 +18,7 @@ import { harnessOutputIssues, EXPECTED_HARNESS_OUTPUTS, PROOF_CONTEXT, PROOF_FEN
 import { assertMayRun, GuardError, PROOF_ACCOUNT_ID, PROOF_CLUSTER } from "../guard.ts";
 import { locationOf } from "../ingest.ts";
 import { admitStep, probePod, stepFenceIssue } from "../ops.ts";
-import { bindStagePlan, parsePlanOps, planOpsIssues } from "../provenance.ts";
+import { bindStagePlan, loadStagePlan, parsePlanOps, planOpsIssues, sha256Hex, STAGE_PLAN_FILES } from "../provenance.ts";
 import { buildReport, CHECK_IDS, finalVerdict, validateReport, type CheckResult } from "../report.ts";
 import { manifestKey } from "../../../shared/vendor.ts";
 
@@ -47,15 +47,14 @@ describe("(1) the stage plan must be create/noop only", () => {
     expect(parsePlanOps("Plan: 1 to create\n~ something else\n[cluster] create\n")).toMatchObject({ error: expect.stringMatching(/unrecognized plan line/) });
     expect(planOpsIssues(parsePlanOps("Plan: 1 to create\n[locker] create\n") as never)).toContain("plan has no [cluster] resource");
   });
-  test("a reviewed update is accepted only when passed by --allow-plan-update, never a replace", () => {
+  test("updates need an approval; plan-op parsing alone never admits them, and replace is never admitted", () => {
     const two = parsePlanOps("Plan: 2 to update\n[cluster] noop\n[96bulls] update\n[alleyoop-role] update\n") as Exclude<ReturnType<typeof parsePlanOps>, { error: string }>;
     expect(planOpsIssues(two)).toEqual(["plan would update [96bulls]", "plan would update [alleyoop-role]"]);
-    expect(planOpsIssues(two, ["96bulls", "alleyoop-role"])).toEqual([]);
-    expect(planOpsIssues(two, ["96bulls"])).toEqual(["plan would update [alleyoop-role]"]);
-    expect(planOpsIssues(two, ["locker"])[0]).toBe("--allow-plan-update locker is not a reviewed update");
+    expect(planOpsIssues(two, true)).toEqual([]);
+    const other = parsePlanOps("Plan: 1 to update\n[cluster] noop\n[locker] update\n") as Exclude<ReturnType<typeof parsePlanOps>, { error: string }>;
+    expect(planOpsIssues(other, true)).toEqual(["plan would update [locker]"]);
     const rep = parsePlanOps("Plan: 1 to replace\n[cluster] noop\n[96bulls] replace\n") as Exclude<ReturnType<typeof parsePlanOps>, { error: string }>;
-    expect(planOpsIssues(rep, ["96bulls"]).length).toBeGreaterThan(0);
-    expect(parseArgs(["fresh-install", "--allow-plan-update", "96bulls", "--allow-plan-update", "alleyoop-role"]).allowPlanUpdates).toEqual(["96bulls", "alleyoop-role"]);
+    expect(planOpsIssues(rep, true).length).toBeGreaterThan(0);
   });
   test("a noop cluster (continuation plan) must already have existed at capture", () => {
     const d = parseDescribeCluster(JSON.stringify({ cluster: { arn: PROOF_CLUSTER_ARN, name: PROOF_CLUSTER, status: "ACTIVE", endpoint: "https://ABC.gr7.us-west-2.eks.amazonaws.com", createdAt: "2026-10-31T02:00:00.000Z", certificateAuthority: { data: "Y2E=" } } })) as Exclude<ReturnType<typeof parseDescribeCluster>, { error: string }>;
@@ -263,5 +262,42 @@ describe("phase-1 limitation is stated", () => {
     const r = buildReport({ provenance: PROV, runId: "x", generatedAt: "2026-10-31T03:00:01.000Z", mode: "dry-run", target: { stage: "aws-proof", clusterName: PROOF_CLUSTER, kubeContext: ARN }, backends: { metadata: "m", transcript: "none" }, checks: [] });
     expect(r.limitations.join(" ")).toMatch(/NetworkPolicy is not enforced in phase 1/);
     expect(validateReport({ ...r, limitations: [] })).toContain("limitations must state every phase-1 limitation");
+  });
+});
+
+describe("final re-review: --allow-plan-update is bound to the exact reviewed capture", () => {
+  const planText = (ops: string) => `Plan · aws-proof\nComputing plan\nPlan ready (4.2s)\n${ops}`;
+  const updatePlan = planText("Plan: 2 to update\n[cluster] noop\n[96bulls] update\n[alleyoop-role] update\n");
+  const inputs = JSON.stringify({ accountId: PROOF_ACCOUNT_ID, region: "us-west-2", eks: { chartVersion: "0.3.0", imageDigest: `sha256:${"5".repeat(64)}`, relayhistoryOrigin: "https://proof-sessions.agentrelay.com", ingress: { hostname: "proof-sessions.agentrelay.com" }, relayauth: { chartVersion: "0.1.0" }, relaycast: { chartVersion: "0.1.0", imageDigest: `sha256:${"6".repeat(64)}` } } });
+  const commit = "e".repeat(40);
+  const files = (plan: string) => {
+    const prov = JSON.stringify({ stage: "aws-proof", generatedAt: "2026-10-31T01:32:53.897Z", target: { accountId: PROOF_ACCOUNT_ID, region: "us-west-2" }, source: { commit, clean: true }, inputs: { sanitizedPath: STAGE_PLAN_FILES.inputs, sanitizedSha256: sha256Hex(inputs) }, outputs: { plan: { path: STAGE_PLAN_FILES.plan, sha256: sha256Hex(plan) } } });
+    const read = (p: string) => (p.endsWith(STAGE_PLAN_FILES.provenance) ? prov : p.endsWith(STAGE_PLAN_FILES.plan) ? plan : p.endsWith(STAGE_PLAN_FILES.inputs) ? inputs : undefined);
+    return { read, tuple: { provenanceSha256: sha256Hex(prov), planSha256: sha256Hex(plan), inputsSha256: sha256Hex(inputs), sourceCommit: commit } };
+  };
+  test("the matching digest tuple admits the reviewed updates", () => {
+    const { read, tuple } = files(updatePlan);
+    expect(loadStagePlan("/r", read)).toMatchObject({ error: expect.stringMatching(/not create-only: plan would update \[96bulls\]/) });
+    expect(loadStagePlan("/r", read, tuple)).toMatchObject({ allowedUpdates: ["96bulls", "alleyoop-role"], updateApproval: tuple });
+  });
+  test("any single digest mismatch is refused", () => {
+    const { read, tuple } = files(updatePlan);
+    for (const k of ["provenanceSha256", "planSha256", "inputsSha256", "sourceCommit"] as const) {
+      const bad = { ...tuple, [k]: k === "sourceCommit" ? "f".repeat(40) : "0".repeat(64) };
+      expect(loadStagePlan("/r", read, bad)).toEqual({ error: `plan update approval does not match this capture (${k})` });
+    }
+  });
+  test("the name-only form is impossible: the CLI refuses anything but the digest tuple", () => {
+    for (const v of ["96bulls", "96bulls,alleyoop-role", "alleyoop-role", `${"a".repeat(64)}:${"b".repeat(64)}`, `${"a".repeat(64)}:${"b".repeat(64)}:${"c".repeat(64)}:short`])
+      expect(() => parseArgs(["fresh-install", "--allow-plan-update", v])).toThrow(/must be <provenanceSha256>:<planSha256>:<inputsSha256>:<sourceCommit>/);
+    const t = `${"a".repeat(64)}:${"b".repeat(64)}:${"c".repeat(64)}:${"d".repeat(40)}`;
+    expect(parseArgs(["fresh-install", `--allow-plan-update=${t}`]).planUpdateApproval).toEqual({ provenanceSha256: "a".repeat(64), planSha256: "b".repeat(64), inputsSha256: "c".repeat(64), sourceCommit: "d".repeat(40) });
+    expect(() => parseArgs(["fresh-install", "--allow-plan-update", t, "--allow-plan-update", t])).toThrow(/once/);
+  });
+  test("replace (and delete/import/adopt) stay refused with a matching tuple", () => {
+    for (const op of ["replace", "delete", "import", "adopt"]) {
+      const { read, tuple } = files(planText(`Plan: 1 to ${op}\n[cluster] noop\n[96bulls] ${op}\n`));
+      expect(loadStagePlan("/r", read, tuple)).toMatchObject({ error: expect.stringMatching(new RegExp(`plan would ${op}`)) });
+    }
   });
 });

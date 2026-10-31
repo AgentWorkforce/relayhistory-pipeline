@@ -33,7 +33,7 @@ import { loadConfig, validateConfig, type ProofConfig } from "./config.ts";
 import { Runner } from "./exec.ts";
 import { fenceFor, harnessOutputIssues, PROOF_CHART_REPO, PROOF_CONTEXT, PROOF_POSTGREST, PROOF_REGION } from "./fence.ts";
 import { bindKubeconfig, credentialIssue, parseDescribeCluster, proofKubeconfig, toolEnv, type DescribedCluster } from "./cluster-binding.ts";
-import { bindStagePlan, chartDigests, gitProvenance, loadStagePlan, sha256Hex, type ReportProvenance, type StagePlan } from "./provenance.ts";
+import { bindStagePlan, chartDigests, gitProvenance, loadStagePlan, parsePlanUpdateApproval, type PlanUpdateApproval, sha256Hex, type ReportProvenance, type StagePlan } from "./provenance.ts";
 import { assertPostDestroyTarget, assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, type Identity, type Mode } from "./guard.ts";
 import { allCanaries } from "./corpus.ts";
 import { backendLabel } from "./transcript.ts";
@@ -53,8 +53,8 @@ export interface Args {
   priorReport?: string;
   /** Verify absence after `96bulls down aws-proof`: no cluster binding, aws reads only. */
   postDestroy?: boolean;
-  /** Reviewed plan updates to accept (provenance.ts REVIEWED_PLAN_UPDATES). */
-  allowPlanUpdates: string[];
+  /** Digest-bound approval for a reviewed stage change's updates (provenance.ts PlanUpdateApproval). */
+  planUpdateApproval?: PlanUpdateApproval;
   /** The stack's outputs JSON; `eks.harness` must equal the hardcoded fence. */
   stackOutputs?: string;
 }
@@ -69,7 +69,7 @@ export function parseArgs(argv: readonly string[]): Args {
   let out: string | undefined;
   let priorReport: string | undefined;
   let postDestroy = false;
-  const allowPlanUpdates: string[] = [];
+  let planUpdateApproval: PlanUpdateApproval | undefined;
   let stackOutputs: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -91,7 +91,12 @@ export function parseArgs(argv: readonly string[]): Args {
     } else if (a === "--out") out = val();
     else if (a === "--prior-report") priorReport = val();
     else if (a === "--post-destroy") postDestroy = true;
-    else if (a === "--allow-plan-update") allowPlanUpdates.push(val());
+    else if (a === "--allow-plan-update" || a.startsWith("--allow-plan-update=")) {
+      if (planUpdateApproval) throw new Error("--allow-plan-update may be given once");
+      const v = parsePlanUpdateApproval(a.includes("=") ? a.slice(a.indexOf("=") + 1) : val());
+      if ("error" in v) throw new Error(v.error);
+      planUpdateApproval = v;
+    }
     else if (a === "--stack-outputs") stackOutputs = val();
     else if (a === "all") checks.push(...CHECK_IDS);
     else if ((CHECK_IDS as readonly string[]).includes(a)) checks.push(a as CheckId);
@@ -104,7 +109,7 @@ export function parseArgs(argv: readonly string[]): Args {
     if (checks.length !== 1 || checks[0] !== "teardown") throw new Error("--post-destroy runs the teardown check only");
     if (mode === "live" && !priorReport) throw new Error("--post-destroy needs --prior-report: the pre-teardown report carries the run's identity and evidence");
   }
-  return { checks: checks.length ? [...new Set(checks)] : [...CHECK_IDS], mode, confirmLive, target, inputs, sessions, out, allowPlanUpdates, ...(stackOutputs ? { stackOutputs } : {}), ...(priorReport ? { priorReport } : {}), ...(postDestroy ? { postDestroy } : {}) };
+  return { checks: checks.length ? [...new Set(checks)] : [...CHECK_IDS], mode, confirmLive, target, inputs, sessions, out, ...(planUpdateApproval ? { planUpdateApproval } : {}), ...(stackOutputs ? { stackOutputs } : {}), ...(priorReport ? { priorReport } : {}), ...(postDestroy ? { postDestroy } : {}) };
 }
 
 type Run = (argv: string[]) => { stdout: string; status: number | null };
@@ -201,7 +206,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
     }
   }
   // The captured Stage A create-only plan. Live runs on the proof target refuse without it.
-  const plan = args.target === "proof" ? loadStagePlan(ROOT, undefined, args.allowPlanUpdates) : undefined;
+  const plan = args.target === "proof" ? loadStagePlan(ROOT, undefined, args.planUpdateApproval) : undefined;
   if (args.mode !== "dry-run" && args.target === "proof" && (!plan || "error" in plan)) {
     console.error(`aws-proof: refusing: ${plan && "error" in plan ? plan.error : "no stage plan"}`);
     return 2;
@@ -333,7 +338,7 @@ async function reportProvenance(cfg: ProofConfig, args: Args, plan: StagePlan | 
     }),
     inputs: inputsBytes ? { sha256: sha256Hex(inputsBytes), source: "file" } : { sha256: sha256Hex(JSON.stringify(cfg)), source: "defaults" },
     configSha256: sha256Hex(JSON.stringify(cfg)),
-    stagePlan: plan ? { provenanceSha256: plan.provenanceSha256, generatedAt: plan.generatedAt, commit: plan.commit, planSha256: plan.planSha256, allowedUpdates: plan.allowedUpdates } : null,
+    stagePlan: plan ? { provenanceSha256: plan.provenanceSha256, generatedAt: plan.generatedAt, commit: plan.commit, planSha256: plan.planSha256, allowedUpdates: plan.allowedUpdates, updateApproval: plan.updateApproval } : null,
     charts,
   };
 }
