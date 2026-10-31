@@ -328,6 +328,10 @@ describe("GCP self-host contract", () => {
         },
         extraEnv: expect.arrayContaining([
           {
+            name: "ALLOW_INTERIM_RELAYAUTH_BEARER",
+            value: "true",
+          },
+          {
             name: "RELAYHISTORY_ORIGIN",
             value: "http://bulls96-alleyoop.96bulls.svc:8080",
           },

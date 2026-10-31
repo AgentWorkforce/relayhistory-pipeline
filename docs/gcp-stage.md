@@ -180,7 +180,9 @@ To request the application release after its external Secrets exist, set
 `relayhistoryOrigin` is the exact audience RelayAuth places in a courier
 assertion. AlleyOop receives the same value as `RELAYHISTORY_ORIGIN`, so it
 accepts only RelayAuth's origin-bound assertion class and refuses the legacy
-shared audience. A verifier may reach the ClusterIP through a local
+shared audience. The release also enables AlleyOop's RelayAuth JWT verifier;
+that switch does not reopen the legacy audience while the origin is present.
+A verifier may reach the ClusterIP through a local
 port-forward, but it must still ask RelayAuth to bind the token to this stable
 in-cluster origin.
 
