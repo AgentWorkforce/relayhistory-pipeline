@@ -1,6 +1,7 @@
 /**
  * HoopDb indexer: consumes `object-landed` (vendored handler, fans out to
- * `session-indexed`) and `session-indexed` (our index), and runs the manifest
+ * `session-indexed`), `session-indexed` (our index) and `normalized-ready` (the
+ * authoritative event count), and runs the manifest
  * reconcile every five minutes so MinIO, which sends no bucket notifications
  * here, still lands every manifest.
  */
@@ -15,7 +16,7 @@ import { enrichMessage } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { runWorker } from "../shared/worker.ts";
 import { hoopDbSessionIndex } from "./index.ts";
-import { postgresPipelineQueue } from "../shared/vendor.ts";
+import { postgresNormalizedCountStore, postgresPipelineQueue } from "../shared/vendor.ts";
 import { withSpan } from "../shared/telemetry.ts";
 import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 
@@ -24,7 +25,7 @@ let lastReconcileMinute = -1;
 
 await runWorker({
   service: "hoopdb-indexer",
-  stages: ["object-landed", "session-indexed"],
+  stages: ["object-landed", "session-indexed", "normalized-ready"],
   impl: (db, current) => ({
     index: hoopDbSessionIndex({
       db,
@@ -32,6 +33,7 @@ await runWorker({
       queue: postgresPipelineQueue(db),
       current,
     }),
+    normalizedCounts: postgresNormalizedCountStore(db),
   }),
   handlers: (db, current) => ({
     // object-landed comes from pipelineQueueDeps; session-indexed from impl.index.

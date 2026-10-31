@@ -273,7 +273,7 @@ describe("dead letters on the Supabase schema", () => {
             applied += 1;
             return {};
           },
-        }),
+        }, queues),
       },
     };
     const traceId = uuidv7();

@@ -38,6 +38,7 @@ import {
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
+  requestedAlchemyCommand,
   captureRelaycastChartPackage,
   type GcpInputs,
 } from "./config.ts";
@@ -101,7 +102,7 @@ interface ResolveRedisServerCaInput {
   authorization: GcpApplyAuthorizationProof;
 }
 
-function readInputs(stage: string): GcpInputs {
+function readInputs(stage: string, requestedCommand: ReturnType<typeof requestedAlchemyCommand>): GcpInputs {
   const path = join(ROOT, ".96bulls", stage, "gcp-inputs.json");
   let inputs: GcpInputs;
   try {
@@ -109,7 +110,7 @@ function readInputs(stage: string): GcpInputs {
   } catch {
     throw new Error(`96bulls: GCP stage ${stage} is not cleared: ${path} does not exist. Nothing was created.`);
   }
-  assertGcpInputs(stage, inputs);
+  assertGcpInputs(stage, inputs, requestedCommand);
   assertGcpProjectConfirmation(inputs.projectId, process.env[GCP_CONFIRM_PROJECT_ENV]);
   return inputs;
 }
@@ -130,8 +131,9 @@ function bootstrapStage(): string {
 // Synchronous, local-only bootstrap runs before any Alchemy Action, provider,
 // or state construction below. It captures the chart bytes exactly once.
 const BOOTSTRAP_STAGE = bootstrapStage();
-const BOOTSTRAP_INPUTS = readInputs(BOOTSTRAP_STAGE);
-assertGcpRuntimeDeployable(BOOTSTRAP_INPUTS);
+const BOOTSTRAP_COMMAND = requestedAlchemyCommand();
+const BOOTSTRAP_INPUTS = readInputs(BOOTSTRAP_STAGE, BOOTSTRAP_COMMAND);
+assertGcpRuntimeDeployable(BOOTSTRAP_INPUTS, BOOTSTRAP_COMMAND);
 // This value is deliberately not persisted between invocations. It prevents
 // Alchemy from reusing a prior successful Action output for the same token;
 // the atomic ledger then rejects that token as already consumed.
@@ -430,14 +432,18 @@ export default Alchemy.Stack(
       description: authorized("Dedicated GKE node identity. No keys."),
     });
     const nodeMember = Output.interpolate`serviceAccount:${nodeIdentity.email}`;
-    for (const role of GCP_NODE_ROLES) {
-      yield* GCP.IAM.Member(`node-${role.split("/")[1]!.replaceAll(".", "-")}`, {
-        kind: "project",
-        name: i.projectId,
-        role: authorized(role),
-        member: nodeMember,
-      });
-    }
+    yield* GCP.IAM.Member("node-container-defaultNodeServiceAccount", {
+      kind: "project",
+      name: i.projectId,
+      role: authorized(GCP_NODE_ROLES[0]),
+      member: nodeMember,
+    });
+    const nodeArtifactRegistryReader = yield* GCP.IAM.Member("node-artifactregistry-reader", {
+      kind: "project",
+      name: i.projectId,
+      role: authorized(GCP_NODE_ROLES[1]),
+      member: nodeMember,
+    });
 
     const nodeActAs = yield* RequireNodeActAs("node-act-as", {
       projectId: i.projectId,
@@ -826,6 +832,12 @@ export default Alchemy.Stack(
             values: bulls96ReleaseValues(i.bulls96!, {
               bucket: lockerBucket,
               region: i.region,
+              // Resolve the IAM member as part of the repository value so
+              // Helm cannot create image-pulling pods before the reader edge.
+              imageRepository: Output.map(
+                Output.all(images.registryUri, nodeArtifactRegistryReader.role),
+                ([registry]) => `${registry}/96bulls-services`,
+              ),
               cloudSqlConnectionName: dataPlane.sqlPoster.connectionName,
               redisHost: dataPlane.redis.host,
               redisPort: dataPlane.redis.port,

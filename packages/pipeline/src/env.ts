@@ -33,6 +33,11 @@ export interface AuthContext {
   sessionId?: string;
   /** As upstream env.ts: set only by verified auth boundaries (auth/relayauth.ts). */
   analyticsIdentity?: import("./auth/analytics-identity.js").AnalyticsIdentity;
+  /**
+   * As upstream env.ts (relayhistory-cloud feat/migration-assertion-ingest):
+   * set only for a RelayAuth migration assertion (relayauth#110).
+   */
+  migration?: import("./lib/pipeline/migration-assertions.js").MigrationAssertionClaims;
 }
 
 export interface Bindings {
@@ -42,6 +47,10 @@ export interface Bindings {
   RELAYAUTH_AUDIENCE?: string;
   RELAYHISTORY_ORIGIN?: string;
   RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS?: string;
+  /** As upstream env.ts: the dedicated, default-off migration-assertion switch. */
+  RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS?: string;
+  /** As upstream env.ts: accepted grants, comma-separated `grantId=planDigest`. */
+  RELAYHISTORY_MIGRATION_GRANTS?: string;
   ALLOW_INTERIM_RELAYAUTH_BEARER?: string;
   ENVIRONMENT?: string;
   // Request logs leave the Worker only when the key is set (see lib/logger.ts).
@@ -72,6 +81,7 @@ export interface Bindings {
     import("./lib/pipeline/dlq.js").StageMessage
   >;
   PIPELINE_FILE_NORMALIZE?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
+  PIPELINE_NORMALIZED_READY?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
   PIPELINE_SUMMARY_SHORT?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
   PIPELINE_SUMMARY_LONG?: Queue<import("./lib/pipeline/dlq.js").StageMessage>;
   PIPELINE_STATUS_CLASSIFY?: Queue<
