@@ -113,7 +113,8 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
     courier, store, db, refusals, env,
     readToken: (orgId: string, workspaceId: string) => {
       const now = Math.floor(Date.now() / 1000);
-      return sign({ sub: "u1", org: orgId, wks: workspaceId, sponsorId: "u1", scopes: ["rth:read"], token_type: "access", iss: ISSUER, aud: ["relayhistory"], iat: now, exp: now + 600 });
+      // This ingest has no read-token class, so the proof borrows the assertion shape.
+      return sign({ sub: "agent_relayhistory_assertion", org: orgId, wks: workspaceId, sponsorId: "u1", scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now, exp: now + 600, meta: { machineId: `${workspaceId}-m1`, tokenClass: "relayhistory_assertion" } });
     },
     stop: async () => { globalThis.fetch = realFetch; await db.close(); await rm(root, { recursive: true, force: true }); },
   };

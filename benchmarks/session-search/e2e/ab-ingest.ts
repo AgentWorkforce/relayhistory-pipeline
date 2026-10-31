@@ -13,7 +13,7 @@ import { cpus } from "node:os";
 import { SCALES } from "../corpus.ts";
 import { percentile } from "../stats.ts";
 import { applyShape } from "./shape.ts";
-import { ClickHouseHttp, installSchema, schemaSql, SessionSearchStore } from "./store.ts";
+import { ClickHouseHttp, DEFAULT_GRANULARITY, installSchema, schemaSql, SessionSearchStore } from "./store.ts";
 import { NEEDLES, Oracle, oracleKey, transcriptBatches } from "./transcripts.ts";
 
 const url = process.env.BENCH_CH_URL ?? "http://127.0.0.1:8123";
@@ -40,7 +40,7 @@ async function page(table: string, o: Org, q: string, tag: string, range?: [numb
     FROM ${table} WHERE ${f.join(" AND ")} ORDER BY ts DESC, event_id DESC LIMIT ${LIMIT + 1}`, { q }, { ...settings(o.org, tag), ...extra });
 }
 async function windowed(table: string, o: Org, q: string, tag: string, extra: Record<string, number> = {}) {
-  const now = Date.now();
+  const now = Date.parse(params.now);
   const e = [1, 7, 30].map((d) => now - d * DAY);
   const ranges: Array<[number | null, number | null]> = [[e[0]!, null], [e[1]!, e[0]!], [e[2]!, e[1]!], [null, e[2]!]];
   const rows: unknown[] = [];
@@ -49,7 +49,7 @@ async function windowed(table: string, o: Org, q: string, tag: string, extra: Re
 }
 /** Probe only after the first window comes up short; a page filled there pays nothing. */
 async function lateProbed(table: string, o: Org, q: string, tag: string) {
-  const edge = Date.now() - DAY;
+  const edge = Date.parse(params.now) - DAY;
   const first = await page(table, o, q, tag, [edge, null]);
   if (first.length > LIMIT || [...q].length < 3) return first.length > LIMIT ? first : windowed(table, o, q, tag);
   const n = Number((await reader.run(`SELECT count() FROM ${table} WHERE org_id = '${o.org}' AND workspace_id IN ${o.ws} AND hasAllTokens(text, {q:String})`, { q }, { ...settings(o.org, tag), query_plan_direct_read_from_text_index: 1, query_plan_optimize_count_from_text_index: 1 })).trim());
@@ -75,7 +75,7 @@ const oracle = new Oracle();
 let loaded = 0;
 for (const batch of transcriptBatches(params, oracle)) { await store.insert(batch); loaded += batch.length; }
 const tables = {
-  t_8192: schemaSql().replace("session_search_records", "t_8192").replace("index_granularity = 256", "index_granularity = 8192"),
+  t_8192: schemaSql(undefined, DEFAULT_GRANULARITY).replace("session_search_records", "t_8192"),
   t_256: schemaSql().replace("session_search_records", "t_256"),
 };
 for (const [t, ddl] of Object.entries(tables)) {

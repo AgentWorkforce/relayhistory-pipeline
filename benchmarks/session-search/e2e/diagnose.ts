@@ -23,7 +23,7 @@ const params = shape ? applyShape(base, shape) : base;
 const seconds = Number(process.env.BENCH_DIAG_S ?? 8);
 const out = process.env.BENCH_OUT ?? "diagnose-report.json";
 const admin = new ClickHouseHttp(url, process.env.BENCH_CH_USER ?? "default", process.env.BENCH_CH_PASSWORD ?? "");
-const search = new SessionSearchStore(new ClickHouseHttp(url, "search_reader", pw), new ClickHouseHttp(url, "search_writer", pw));
+const search = new SessionSearchStore(new ClickHouseHttp(url, "search_reader", pw), new ClickHouseHttp(url, "search_writer", pw), () => Date.parse(params.now));
 const whale: Scope = { orgId: "org-0", workspaceIds: Array.from({ length: params.workspacesPerOrg }, (_, w) => `ws-0-${w}`) };
 
 const pct = (xs: number[]) => {

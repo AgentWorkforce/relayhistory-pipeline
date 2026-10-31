@@ -23,12 +23,18 @@ const MAX_LIMIT = 20;
 const MAX_QUERY = 500;
 const SNIPPET_CHARS = 320;
 const DAY_MS = 86_400_000;
+/** One logical search across all its windows, not per window. */
+const SEARCH_BUDGET_MS = 5_000;
 /** Newest first; a final open range covers the rest, so every row stays reachable. */
 const WINDOW_DAYS = [1, 7, 30];
 const TABLE = "session_search_records";
 const COLUMNS = ["org_id", "workspace_id", "harness", "session_id", "machine_id", "event_id", "revision", "chunk_seq", "record_seq", "ts", "kind", "scrub_version", "project", "agent", "task_ref", "tags", "text"];
 
-export const schemaSql = (tokenizer = "ngrams(3)") => `
+/** 256 is the store's layout; 8192 is ClickHouse's default, kept for baseline comparisons. */
+export const SEARCH_GRANULARITY = 256;
+export const DEFAULT_GRANULARITY = 8192;
+
+export const schemaSql = (tokenizer = "ngrams(3)", granularity = SEARCH_GRANULARITY) => `
 CREATE TABLE IF NOT EXISTS ${TABLE} (
   org_id String, workspace_id String, harness LowCardinality(String),
   session_id String, machine_id String, event_id String,
@@ -40,7 +46,7 @@ CREATE TABLE IF NOT EXISTS ${TABLE} (
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (org_id, workspace_id, ts, session_id, chunk_seq, record_seq)
-SETTINGS non_replicated_deduplication_window = 1000, index_granularity = 256`;
+SETTINGS non_replicated_deduplication_window = 1000, index_granularity = ${granularity}`;
 
 export class ClickHouseHttp {
   constructor(private url: string, private user: string, private password: string) { assertLocalTarget(url); }
@@ -67,7 +73,8 @@ const iso = (ms: string) => new Date(Number(ms)).toISOString();
 const arrayLiteral = (xs: string[]) => `[${xs.map((x) => `'${x.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`).join(",")}]`;
 
 export class SessionSearchStore {
-  constructor(private reader: ClickHouseHttp, private writer: ClickHouseHttp) {}
+  /** The clock is injected so a fixed corpus keeps the same ages on any date. */
+  constructor(private reader: ClickHouseHttp, private writer: ClickHouseHttp, private clock: () => number = Date.now) {}
 
   /** Refuses before any query: an unscoped search must not be expressible. */
   private guard(scope: Scope) {
@@ -120,7 +127,8 @@ export class SessionSearchStore {
       filters.push("(ts, event_id) < (parseDateTime64BestEffort({cts:String}, 3), {cid:String})");
       bound.cts = ts; bound.cid = id;
     }
-    const now = Date.now();
+    const now = this.clock();
+    const deadline = performance.now() + SEARCH_BUDGET_MS;
     const edges = WINDOW_DAYS.map((d) => now - d * DAY_MS);
     const ranges: Array<[number | null, number | null]> = [
       [edges[0]!, null],
@@ -130,6 +138,8 @@ export class SessionSearchStore {
     const rows: Array<Omit<SearchHit, "citation" | "ts"> & { at: string }> = [];
     let rounds = 0;
     for (const [lo, hi] of ranges) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw new Error("search_timeout");
       const windowed = [...filters];
       const windowBound = { ...bound };
       if (lo !== null) { windowed.push("ts >= fromUnixTimestamp64Milli(toInt64({wlo:String}))"); windowBound.wlo = String(lo); }
@@ -140,7 +150,7 @@ export class SessionSearchStore {
         toString(toUnixTimestamp64Milli(ts)) AS at,
         substringUTF8(text, greatest(positionCaseInsensitiveUTF8(text, {q:String}) - 80, 1), ${SNIPPET_CHARS}) AS snippet
       FROM ${TABLE} WHERE ${windowed.join(" AND ")}
-      ORDER BY ts DESC, event_id DESC LIMIT ${limit + 1 - rows.length}`, windowBound, { ...settings, ...(o.tag ? { log_comment: o.tag } : {}) }));
+      ORDER BY ts DESC, event_id DESC LIMIT ${limit + 1 - rows.length}`, windowBound, { ...settings, max_execution_time: Math.max(remaining / 1000, 0.001), ...(o.tag ? { log_comment: o.tag } : {}) }));
       if (rows.length > limit) break;
     }
     const page = rows.slice(0, limit).map(({ at, ...r }) => ({ ...r, ts: iso(at) }));

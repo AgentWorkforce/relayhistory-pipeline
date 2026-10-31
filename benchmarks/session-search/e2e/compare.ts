@@ -12,7 +12,7 @@ import { cpus } from "node:os";
 import { SCALES } from "../corpus.ts";
 import { percentile } from "../stats.ts";
 import { applyShape } from "./shape.ts";
-import { ClickHouseHttp, installSchema, schemaSql, SessionSearchStore } from "./store.ts";
+import { ClickHouseHttp, DEFAULT_GRANULARITY, installSchema, schemaSql, SessionSearchStore } from "./store.ts";
 import { NEEDLES, Oracle, oracleKey, transcriptBatches } from "./transcripts.ts";
 
 const url = process.env.BENCH_CH_URL ?? "http://127.0.0.1:8123";
@@ -61,8 +61,8 @@ const oracle = new Oracle();
 let loaded = 0;
 for (const batch of transcriptBatches(params, oracle)) { await store.insert(batch); loaded += batch.length; }
 const copies: Record<string, string> = {
-  base: schemaSql().replace("session_search_records", "t_base"),
-  gran_256: schemaSql().replace("session_search_records", "t_gran_256").replace("non_replicated_deduplication_window = 1000", "index_granularity = 256"),
+  base: schemaSql(undefined, DEFAULT_GRANULARITY).replace("session_search_records", "t_base"),
+  gran_256: schemaSql().replace("session_search_records", "t_gran_256"),
 };
 const tableOf = (name: string) => `t_${name}`;
 for (const [name, ddl] of Object.entries(copies)) {

@@ -40,7 +40,7 @@ const pw = "synthetic-proof-only";
 const admin = new ClickHouseHttp(url, process.env.BENCH_CH_USER ?? "default", process.env.BENCH_CH_PASSWORD ?? "");
 const reader = new ClickHouseHttp(url, "search_reader", pw);
 const writer = new ClickHouseHttp(url, "search_writer", pw);
-const search = new SessionSearchStore(reader, writer);
+const search = new SessionSearchStore(reader, writer, () => Date.parse(params.now));
 
 type Status = "PASS" | "FAIL" | "BLOCKED" | "PARTIAL" | "RELATIVE" | "NOT_RUN" | "INHERITED_FAIL";
 const SHAPE_FIDELITY = "PARTIAL: sanitized aggregate anchors only, not a fresh production-derived shape artifact. Not production-scale parity; cannot close T0.";
@@ -175,6 +175,16 @@ async function g13Product(pipeline: Awaited<ReturnType<typeof startPipeline>>, l
     checks[`${name}/refusedWhole`] = r.status === 503 && r.body?.error?.code === "search_unavailable" && r.body?.hits === undefined;
     checks[`${name}/noRetry`] = calls === 1;
   }
+  // One budget across windows: four slow rounds cannot stack past it.
+  let slowCalls = 0;
+  const slow = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: async () => { slowCalls++; await Bun.sleep(1_800); return new Response(""); } });
+  const slowHttp = new ClickHouseHttp(`http://127.0.0.1:${slow.port}`, "u", "p");
+  const started = performance.now();
+  const budget = await get(searchApp(new SessionSearchStore(slowHttp, slowHttp), live), "e2emarkeralpha", a);
+  const elapsed = performance.now() - started;
+  slow.stop(true);
+  checks.budgetEndsSearch = budget.status === 503 && slowCalls === 3;
+  checks.budgetHeld = elapsed < 6_000;
   gate("G13_product_read_path", checks, { scope: "real requireAuth and tokens; hydration uses an in-memory live set; not the MCP server or Cloud" });
 }
 
@@ -255,7 +265,7 @@ async function g2Adversarial() {
   const ties = await walk(a, "ghijkl");
   checks.equalTimestampsEachOnce = ties.seen.length === 450 && new Set(ties.seen).size === 450;
   // Hits on both sides of every window edge come back once each, newest first.
-  const nowMs = Date.now(), dayMs = 86_400_000;
+  const nowMs = Date.parse(params.now), dayMs = 86_400_000;
   const edgeRows = [0.5, 0.999, 1.001, 6.999, 7.001, 29.999, 30.001, 100].flatMap((d, b) =>
     Array.from({ length: 6 }, (_, i) => ({ ...row("org-adv", "ws-adv", "m1", `x-${b}-${i}`, 0, "windowedge"), ts: new Date(nowMs - d * dayMs - i).toISOString() })));
   await search.insert(edgeRows);

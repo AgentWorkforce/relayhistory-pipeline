@@ -41,14 +41,16 @@ are relative. Check this PR's CI at its exact head for current logic gate result
 | --- | --- | --- |
 | G0 Negative controls | PASS | Removing the org predicate, the substring recheck or the dedup token each changes the answer; a wrong result scores recall below 1 |
 | G1 Courier to search | PASS | First hit, planted secret absent with a positive control, append, retry dedup, stale, quarantine, opt-out. Uploads carry the signed machine claim; absent and mismatched claims are refused with exactly `machine_claim_refused` and no job, pointer or row, and a refusal reports G1 BLOCKED. A second org runs through the real ingest with `PIPELINE_ORG_FROM_PREFIX` and `TENANT_ORG_IDS`, stays hidden from the first, and an unlisted org is refused with exactly `org_not_allowed` |
-| G2 Lexical recall | PASS | Recall@5 and @10 of 1.0 and exact counts against the generator on 12 query classes in 2 orgs: phrase, error, path, PR number, case, substring, CJK, accents, 2-character, punctuation, past 4 KB, common |
+| G2 Lexical recall | PASS | Recall@5 and @10 of 1.0 and exact counts against the generator on 14 query classes in 2 orgs: phrase, error, path, PR number, case, substring, CJK, accents, 2-character, punctuation, past 4 KB, ultra-rare, zero hits, common |
 | G2b Adversarial paging | PASS | Scattered grams newest with true hits older, full pages, tenant, workspace and machine scope, equal timestamps across cursors, token boundaries, case and punctuation |
 | G3 Context | PASS | Window contains the match, focus finds the event, chronological, snippets at most 320 characters, citations, cursors do not repeat |
 | G4 Federation | PASS on a small fixture | Before and after T0, straddling session and backfilled copy once each, pagination, each pool down is named. Event ids are shared by construction; the real legacy-to-store id mapping is unproven. Pre-T0 text past 4 KB stays unsearchable without a backfill |
+| G12 Filter matrix | PASS | Nine filters alone, every pair, all together, and workspace scope, each paged and compared with an oracle. Project, agent, task ref and tags are copied at index time, so a later rename is unhandled. Filter-only listing stays in Supabase |
+| G13 Product read path | See this head | Real `requireAuth`, scope from verified claims, a hit without a live pointer dropped; 408, 500, 200 with an exception, and an interrupted stream each refused whole with no retry; one 5 s budget across windows. The token borrows the upload assertion shape, because this ingest has no read-token class. Hydration is an in-memory set, not Supabase. This is not the MCP server, Cloud or a full product e2e |
 | G5 Tenant isolation | PASS | Canaries across orgs and workspaces, injection strings, context, crafted cursor, reader cannot write, missing setting fails closed. The row policy is a backstop: per #233 anyone who can set the value reads that tenant |
 | G6 Shape | **PARTIAL, gate open** | Event totals within 5%. Event sizes, session sizes, share over 4 KB and growth are assumed |
 | G7 Latency and load | RELATIVE, not a pass | See below |
-| G8 Freshness | RELATIVE, not a pass | Insert to first hit p50 17.6, p95 45.2, p99 76.5 ms. Store only, one node. Pipeline queue time on the real service is unmeasured |
+| G8 Freshness | RELATIVE, not a pass | Store only, one node. Same-run p95 114 to 151 ms at 8 clients and 423 to 498 ms at 32, with no layout penalty. Pipeline queue time on the real service is unmeasured |
 | G9 Noisy neighbour | **Inherited FAIL** | #233 gate 7 fails 2x. Not rerun |
 | G10 Delete | Logical PASS | Gone from search and context. Physical purge is #70 gate 3, on vanilla ClickHouse only |
 | G11 Cost and teardown | NOT RUN | Plan below; no account exists |
@@ -134,7 +136,25 @@ only. Recall 1.0 and no errors in every cell.
 
 Terms with few or no hits scan all four windows, so they lose. Corpus ages are uniform, so
 recency gains here are not production gains. Size was unchanged at granularity 256. Sort
-by session gave no gain and was rejected. The store now uses both; see this head's CI.
+by session gave no gain and was rejected. The store uses both, with one 5 s budget across
+all windows and an injected clock so the fixed corpus keeps its ages.
+
+Same-run mixed load, 2 cores, two passes (41189553499, 41190541876), p95 at 8 and 32
+clients: single query on granularity 8192, 1,222 and 4,656 ms, with 9 to 13 HTTP 408 per
+cell at 32; windowed on 8192, 620 and 2,561 ms; windowed on 256, 428 and 1,695 ms, 0
+errors, 35 to 39 QPS, about 19 per core, about 42 ms CPU per search.
+
+- Ingest does not explain the mix being slower than the sweep: QPS barely moves at one
+  small insert about every 300 ms. Heavier ingest is untested.
+- The query condition cache does not explain it either: turning it off changed nothing.
+  One repeated query runs at about 2x the mix (20 ms CPU against 42 ms), so the gap is
+  workload composition. Single-class sweep QPS is not a capacity figure; use the mix.
+- The G8 rise in proof runs is probably the proof's polling, since a page that never
+  fills scans all four windows. The same-run A/B, polling one window, shows no change.
+- Two probes for terms with few or no hits were rejected: an upfront count and a count
+  after a short first window. Each helped zero hits and made the rest worse (common 718
+  to 1,870 ms at 32 clients). So windows cost those terms more than one query does: a
+  known, accepted trade-off that needs real query-mix data to judge.
 
 **First search after load.** Not reproduced in CI (435 ms). Run the load on CI with the
 same probe at several points while parts merge, and log parts and merges with it. If it
