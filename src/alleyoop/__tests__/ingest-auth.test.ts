@@ -13,7 +13,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
-import { canonicalJson, uploadIdentityOf, type PlanEntry, type UploadIdentity } from "@rhc/lib/pipeline/migration-assertions.ts";
+import {
+  backfillSha256,
+  canonicalJson,
+  planEntryV2Sha256,
+  uploadIdentityOf,
+  uploadIdentityV2Of,
+  type BackfillBase,
+  type PlanEntry,
+  type PlanEntryV2,
+  type UploadIdentity,
+  type UploadIdentityV2,
+} from "@rhc/lib/pipeline/migration-assertions.ts";
 import {
   computeContentSha256,
   manifestKey,
@@ -58,7 +69,7 @@ function sign(claims: Record<string, unknown>) {
 
 const now = () => Math.floor(Date.now() / 1000);
 
-function migrationToken(upload: UploadIdentity, overrides: Record<string, unknown> = {}, meta: Record<string, unknown> = {}) {
+function migrationToken(upload: UploadIdentity | UploadIdentityV2, overrides: Record<string, unknown> = {}, meta: Record<string, unknown> = {}) {
   return sign({
     sub: "agent_relayhistory_migration", org: ORG, wks: WORKSPACE, scopes: ["rth:sync"], sponsorId: USER,
     sponsorChain: [USER, "agent_relayhistory_migration"], token_type: "access", iss: ISSUER, aud: [ORIGIN],
@@ -133,11 +144,11 @@ async function ingest(extra: Record<string, string> = {}) {
   const req = (path: string, token: string, init: RequestInit = {}) =>
     app.request(path, { ...init, headers: { authorization: `Bearer ${token}`, ...(init.headers as Record<string, string>) } }, env);
   /** A chunk request; a migration one carries its plan entry text in front of the bytes. */
-  const chunk = (token: string, location: SessionLocation = LOCATION, opts: { entry?: string; seq?: number; bytes?: Uint8Array } = {}) => {
+  const chunk = (token: string, location: SessionLocation = LOCATION, opts: { entry?: string; seq?: number; bytes?: Uint8Array; epoch?: number; offset?: number; format?: string } = {}) => {
     const bytes = opts.bytes ?? SOURCE;
     const entry = opts.entry === undefined ? undefined : new TextEncoder().encode(opts.entry);
     const body = entry ? Buffer.concat([entry, bytes]) : bytes;
-    return req(`/v1/pipeline/chunks?machine=${location.machineId}&harness=${location.harness}&session=${location.sessionId}&date=${location.startDate}&seq=${opts.seq ?? 0}&epoch=0&offset=0&format=jsonl`, token, {
+    return req(`/v1/pipeline/chunks?machine=${location.machineId}&harness=${location.harness}&session=${location.sessionId}&date=${location.startDate}&seq=${opts.seq ?? 0}&epoch=${opts.epoch ?? 0}&offset=${opts.offset ?? 0}&format=${opts.format ?? "jsonl"}`, token, {
       method: "POST",
       headers: { "x-relay-trace-id": TRACE, ...(entry ? { "x-relay-migration-plan-entry-length": String(entry.byteLength) } : {}) },
       body,
@@ -356,6 +367,140 @@ describe("buildIngestApp auth (production composition)", () => {
     expect(await deadLetters.list({ stage: "object-landed" })).toEqual([]);
     const { rows: errors } = await db.query("SELECT 1 FROM sessions.pipeline_events WHERE error->>'code' = 'invalid_work_key' OR status IN ('error', 'dead_lettered')");
     expect(errors).toHaveLength(0);
+  });
+
+  test("v2 backfill (O4): a signed backfill epoch appended to a live ndjson session commits and is consumed; every base or chunk deviation is refused", async () => {
+    const i = await ingest({ ...MIGRATION_ON, ALLOW_INTERIM_RELAYAUTH_BEARER: "true" });
+    const live = { ...LOCATION, sessionId: "session-straddle" };
+    const key = manifestKey(live);
+    const record = (n: number) => new TextEncoder().encode(`${JSON.stringify({ kind: "event", record_id: `r${n}`, origin_id: "o1", revision: 1, received_at: AT, payload: { n } })}\n`);
+    // The live session: one ndjson chunk, owned by its machine, with the user in its 96bulls extension.
+    const liveChunk = await i.chunk(liveToken(), live, { bytes: record(1), format: "ndjson" });
+    expect(liveChunk.status).toBe(201);
+    const liveSealed = (await liveChunk.json()) as { entry: Record<string, unknown> & { bytes: number; stored_bytes: number }; scrub: unknown };
+    const liveManifest = {
+      schema_v: 1, layout: "v1", trace_id: TRACE, revision: 1, created_at: AT, updated_at: AT,
+      session: { workspace_id: WORKSPACE, machine_id: live.machineId, harness: live.harness, session_id: live.sessionId, started_at: AT },
+      writer: { delivery_instance_id: live.machineId, plugin_version: "test" },
+      raw: {
+        owner: live.machineId, state: "open", updated_at: AT, format: "ndjson", compression: "zstd", chunk_count: 1,
+        raw_bytes: liveSealed.entry.bytes, stored_bytes: liveSealed.entry.stored_bytes,
+        content_sha256: await computeContentSha256([liveSealed.entry as never]), epoch: 0,
+        epochs: [{ epoch: 0, opened_at: AT, reason: "initial", first_seq: 0, opened_by: live.machineId }],
+        next_offset: liveSealed.entry.bytes, chunks: [liveSealed.entry], scrub: liveSealed.scrub,
+      },
+      extensions: { "96bulls": { session_uuid: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c19", session_uuid_source: "minted", tenant_id: ORG, user_id: USER } },
+    };
+    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-machine-id": live.machineId, "x-session-id": live.sessionId },
+      body: JSON.stringify({ key, manifest: liveManifest }),
+    });
+    expect(liveCommit.status).toBe(202);
+    const liveVersion = ((await liveCommit.json()) as { version: { eTag?: string; version?: string } }).version;
+
+    // The plan's v2 entry: two backfill source chunks, offsets from 0.
+    const sources = [record(100), record(101)];
+    const chunks = sources.map((b, n) => ({
+      start_offset: n === 0 ? 0 : sources[0]!.byteLength,
+      bytes: b.byteLength,
+      sha256: createHash("sha256").update(b).digest("hex"),
+      records: 1,
+    }));
+    const entry: PlanEntryV2 = {
+      v: 2, kind: "backfill", grant_id: GRANT, key, org_id: ORG, workspace_id: WORKSPACE, source_user_id: USER,
+      session: { machine_id: live.machineId, harness: live.harness, session_id: live.sessionId, started_at: AT },
+      format: "ndjson", chunks, backfill_sha256: await backfillSha256(chunks),
+      raw_bytes: sources.reduce((n, b) => n + b.byteLength, 0),
+    };
+    const entryText = canonicalJson(entry);
+    const base: BackfillBase = {
+      revision: 1, version: String(liveVersion.version ?? liveVersion.eTag), owner: live.machineId, writer: live.machineId,
+      chunk_count: 1, epoch: 0, content_sha256: liveManifest.raw.content_sha256,
+    };
+    const upload = await uploadIdentityV2Of(entry, PLAN, base);
+    expect(upload.entry_sha256).toBe(await planEntryV2Sha256(entry));
+
+    // Chunk negatives: wrong seq (not base.chunk_count + i), wrong epoch, wrong bytes, a v1 entry text.
+    for (const [name, opts] of [
+      ["seq 0 (inside the live range)", { seq: 0, epoch: 1, bytes: sources[0] }],
+      ["epoch 0 (not base.epoch + 1)", { seq: 1, epoch: 0, bytes: sources[0] }],
+      ["other bytes", { seq: 1, epoch: 1, bytes: record(999) }],
+      ["chunk 1's bytes at chunk 0's seq", { seq: 1, epoch: 1, bytes: sources[1], offset: 0 }],
+    ] as const) {
+      const r = await i.chunk(migrationToken(upload), live, { entry: entryText, format: "ndjson", ...opts });
+      expect(`${name}: ${r.status}`).toBe(`${name}: 403`);
+    }
+    // The planned backfill chunks, at seq = base.chunk_count + i, epoch = base.epoch + 1.
+    const token = migrationToken(upload);
+    const sealed: Record<string, unknown>[] = [];
+    for (const [n, bytes] of sources.entries()) {
+      const r = await i.chunk(token, live, { entry: entryText, seq: base.chunk_count + n, epoch: base.epoch + 1, offset: chunks[n]!.start_offset, bytes, format: "ndjson" });
+      expect(r.status).toBe(201);
+      sealed.push(((await r.json()) as { entry: Record<string, unknown> }).entry);
+    }
+    const added = sealed as unknown as { bytes: number; stored_bytes: number; start_offset: number }[];
+    const appended = {
+      ...liveManifest,
+      revision: 2,
+      raw: {
+        ...liveManifest.raw,
+        chunk_count: 3,
+        raw_bytes: liveManifest.raw.raw_bytes + added.reduce((n, c) => n + c.bytes, 0),
+        stored_bytes: liveManifest.raw.stored_bytes + added.reduce((n, c) => n + c.stored_bytes, 0),
+        content_sha256: await computeContentSha256([liveSealed.entry, ...sealed] as never),
+        epoch: 1,
+        epochs: [...liveManifest.raw.epochs, { epoch: 1, opened_at: AT, reason: "backfill", first_seq: 1, opened_by: `migration:${GRANT}` }],
+        next_offset: added.at(-1)!.start_offset + added.at(-1)!.bytes,
+        chunks: [liveSealed.entry, ...sealed],
+      },
+      extensions: {
+        ...liveManifest.extensions,
+        "client.relayhistory_export": { version: 1, source: "neon.delivery_records", exported_at: AT, grant_id: GRANT, plan_digest: PLAN, source_user_id: USER },
+      },
+    };
+    const post = (t: string, manifest: unknown, previousVersion: unknown = liveVersion) =>
+      i.req("/v1/pipeline/manifests", t, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-machine-id": live.machineId, "x-session-id": live.sessionId },
+        body: JSON.stringify({ key, manifest, previousVersion }),
+      });
+    // Commit negatives, each with a fresh assertion: a base that is not the stored one, other content, a second epoch.
+    const wrongBase = async (b: Partial<BackfillBase>) => migrationToken(await uploadIdentityV2Of(entry, PLAN, { ...base, ...b }));
+    for (const [name, t, m, expected] of [
+      ["base revision", await wrongBase({ revision: 2 }), appended, 403],
+      ["base version", await wrongBase({ version: '"stale"' }), appended, 403],
+      ["base chunk_count", await wrongBase({ chunk_count: 0 }), appended, 403],
+      ["base owner", await wrongBase({ owner: "machine-other" }), appended, 403],
+      // (Inconsistent manifests fail validation first: 400; still refused, nothing consumed.)
+      ["a missing backfill chunk", token, { ...appended, raw: { ...appended.raw, chunks: appended.raw.chunks.slice(0, 2), chunk_count: 2 } }, "400|403"],
+      ["the epoch not opened by the grant", token, { ...appended, raw: { ...appended.raw, epochs: [liveManifest.raw.epochs[0], { ...appended.raw.epochs[1], opened_by: "machine-a" }] } }, "400|403"],
+    ] as const) {
+      const r = await post(t, m);
+      expect(`${name}: ${String(expected).split("|").includes(String(r.status))}`).toBe(`${name}: true`);
+    }
+    // The stale CAS version is refused too (409), nothing consumed.
+    expect((await post(token, appended, { eTag: '"stale"' })).status).toBe(409);
+    expect(await count("sessions.migration_assertion_uses")).toBe(0);
+
+    const commit = await post(token, appended);
+    expect(commit.status).toBe(202);
+    const workKey = ((await commit.json()) as { workKey: string }).workKey;
+    expect(workKey).toBe(`${key}@${upload.entry_sha256}@r2`);
+
+    const sql = pgExecutor();
+    const indexed: string[] = [];
+    const deadLetters = postgresDeadLetterStore(sql);
+    const deps = pipelineQueueDeps({} as Bindings, {
+      queue: postgresPipelineQueue(sql), sink: sqlPipelineEventSink(sql), deadLetters,
+      index: { upsertRawPointer: async (pointer: { manifestKey: string }) => void indexed.push(pointer.manifestKey) } as never,
+    });
+    // The live commit and the backfill commit.
+    expect(await pollPostgresStage({ sql, stage: "object-landed", deps })).toMatchObject({ claimed: 2, acked: 2, exhausted: 0 });
+    expect(await pollPostgresStage({ sql, stage: "session-indexed", deps })).toMatchObject({ claimed: 2, acked: 2, exhausted: 0 });
+    expect(indexed).toEqual([key, key]);
+    const letters = await deadLetters.list({ stage: "object-landed" });
+    expect(letters.filter((l) => JSON.stringify(l).includes("session-straddle"))).toEqual([]);
   });
 
   test("signed work key and durable audit: posted fields cannot alter the work key; one audit row per commit, no secrets", async () => {

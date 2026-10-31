@@ -29,6 +29,7 @@ import {
   type ObjectLandedPayload,
 } from "../lib/pipeline/index.js";
 import {
+  isBackfillIdentity,
   MAX_PLAN_ENTRY_BYTES,
   migrationChunkMatches,
   migrationGrantAllowed,
@@ -102,6 +103,13 @@ export interface PipelineRouteDeps {
    * in place of `send`. Absent: migration assertions are refused (503).
    */
   migrationLedger?(env: Bindings): MigrationAssertionLedger | undefined;
+  /**
+   * Whether this deployment admits v2 (backfill epoch) migration assertions.
+   * Only a deployment whose manifest commit verifies the append against the
+   * stored base (96BullSessions' courier route) sets it; absent, a v2
+   * assertion is refused with 403 `migration_backfill_unsupported`.
+   */
+  migrationBackfill?: boolean;
 }
 
 const defaultDeps: PipelineRouteDeps = {
@@ -227,6 +235,13 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     const ledger = deps.migrationLedger?.(env);
     if (!ledger) return ledgerUnavailable(c);
     if (!migrationPairAuthorized(auth)) return workspaceForbidden(c);
+    if (isBackfillIdentity(auth.migration.upload) && !deps.migrationBackfill)
+      return error(
+        c,
+        403,
+        "migration_backfill_unsupported",
+        "This deployment does not accept backfill-epoch (v2) migration assertions",
+      );
     if (!migrationGrantAllowed(env, auth.migration)) return grantForbidden(c);
     // Status: only the signed upload's own manifest key.
     if (c.req.path.endsWith("/pipeline/manifests/status")) {
@@ -558,6 +573,9 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
       (built.message.payload as ObjectLandedPayload).migration = {
         key: auth.migration.upload.key,
         entry_sha256: auth.migration.upload.entry_sha256,
+        ...(isBackfillIdentity(auth.migration.upload)
+          ? { base_revision: auth.migration.upload.base.revision }
+          : {}),
       };
       // The commit's only durable write is the enqueue: the ledger consumes the
       // assertion and enqueues as one unit, so neither lands without the other.
