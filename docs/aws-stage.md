@@ -229,6 +229,16 @@ plaintext. They are derived: Bob Costas's summary sweep (at startup, then every
 `SUMMARY_SWEEP_SECONDS`, default 300) re-queues every indexed session without a
 summary and rebuilds each as an encrypted object.
 
+## Production transcript store (`aws-sessions-prod`)
+
+Production AWS is S3 only (decision 0001). The `aws-sessions-prod` stage in
+`sessions-prod` (`941433935742`, `us-east-1`) sets `transcriptStore` in its
+inputs and declares only the transcript bucket, its CMK, access logs,
+CloudTrail with S3 data events, a budget and three IAM users (writer, reader,
+eraser), none of the baseline above (`stacks/aws/transcript-store.ts`). Design,
+apply, credentials, Cloudflare wiring, rotation, teardown and the later export:
+`runbooks/sessions-prod-transcript-store.md`.
+
 ## AWS observability
 
 The EKS stage enables the umbrella chart's pinned OpenTelemetry contrib
