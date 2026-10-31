@@ -48,6 +48,7 @@ import {
 } from "./vendor/relayauth-migration-plan.ts";
 import type { ExportPlan, ExportUploadResult, UploadInput } from "./relayhistory-export-upload.ts";
 import { manifestKey } from "@rhc-object-store";
+import { canonicalizeExportPlan, EMPTY_ID_MAPPING, type IdMappingLedger } from "./relayhistory-export-ids.ts";
 
 export const SHARD_PLANNER_VERSION = 1;
 export const PLAN_CONTRACT = "relayhistory-export-plan-entry-v1";
@@ -285,7 +286,9 @@ export function shardReport(plan: ShardPlan): ShardReport {
 }
 
 /** The part of an export plan (with chunk bytes) that one shard covers. */
-export function exportPlanForShard(plan: ExportPlan, shard: Shard): ExportPlan {
+export function exportPlanForShard(input: ExportPlan, shard: Shard, mapping: IdMappingLedger = EMPTY_ID_MAPPING): ExportPlan {
+  // Shards are planned over canonical (Cloud-id) uploads; match on those keys.
+  const plan = canonicalizeExportPlan(input, mapping);
   const keys = new Set(shard.plan.manifests.map((m) => m.key));
   const manifests = plan.manifests.filter((m) => keys.has(manifestKey(m.location)));
   if (manifests.length !== keys.size) throw new Error("shard planner: the export plan does not cover this shard");
