@@ -43,7 +43,9 @@ This record is not that approval. Each of these needs it separately:
 
 **Status:** decided by Khaliq on 2026-10-31 in the lead session, relayed by
 the coordinator. The decisions are K-28 ("Yes, add ObsessionDB"), K-33
-(region) and K-34 ("Include it in the T0 gate"). This text is a draft in
+(region), K-34 ("Include it in the T0 gate") and K-36 ("No embeddings
+pre-T0", which supersedes K-34 as written). helm-chart-chief records
+relayed rulings as PROPOSED until Khaliq confirms them in its session. This text is a draft in
 96BullSessions #90 and takes effect when that PR merges.
 **Amends:** "Decision" and "Consequences" above.
 
@@ -54,7 +56,8 @@ the coordinator. The decisions are K-28 ("Yes, add ObsessionDB"), K-33
 - **ObsessionDB's role:**
   - lexical transcript search for the MCP tools (`search_shared_sessions`
     excerpts, the `get_shared_session_context` window);
-  - the dashboard's semantic/hybrid search (keyword + vector, ranked);
+  - the dashboard's ranked search: keyword ranking over complete
+    transcripts, with no vector pools before T0 (K-36);
   - the memory-pack lexical and `files_touched` pools.
 
   It is a derived projection, loaded from the pipeline's normalized S3
@@ -65,13 +68,14 @@ the coordinator. The decisions are K-28 ("Yes, add ObsessionDB"), K-33
   `relay-transcript-proof` (`us-west-2`) is evidence only and never holds
   production data.
 - **Supabase still holds no transcript text and no embeddings**, as 0002
-  requires. Embeddings, if used, live with the ObsessionDB projection.
+  requires. If embeddings are added after T0 (a separate decision), they
+  live with the ObsessionDB projection.
 
 ### Consequences
 
 - The production migration's T0 write switch waits until new sessions are
-  transcript-searchable on ObsessionDB, including hybrid search (K-27 and
-  K-34; `docs/relayhistory-supabase-migration-plan.md` gate G-T).
+  transcript-searchable on ObsessionDB, including keyword-ranked
+  dashboard search (K-27, K-34 and K-36; `docs/relayhistory-supabase-migration-plan.md` gate G-T).
 - Pre-T0 history keeps legacy transcript and hybrid search on the frozen
   Neon T0 child branch until it is loaded into ObsessionDB (K-6).
 - ClickHouse is no longer a production candidate. relayhistory-cloud #233
@@ -84,7 +88,8 @@ the coordinator. The decisions are K-28 ("Yes, add ObsessionDB"), K-33
 
 - provisioning ObsessionDB (production and staging) and its credentials;
 - enabling the feed into it;
-- enabling the embedding stage, including the model, provider and budget;
+- any later embedding stage, including the model, provider and budget
+  (post-T0 follow-up, K-35);
 - every step in the plan's approval list.
 
 This amendment is not that approval.

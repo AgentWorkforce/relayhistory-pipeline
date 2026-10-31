@@ -24,7 +24,7 @@ Section numbers refer to the plan.
 
 | Gate | Owner | State | Evidence required to close |
 | --- | --- | --- | --- |
-| **Transcript search for new sessions live (G-T, K-27): hard pre-T0 gate, critical path** | unassigned | store decided: **ObsessionDB, AWS `us-east-1`** (K-28, K-33); 0001 amendment drafted in #90, not merged; no benchmark run; vector support unverified; hybrid included (K-34) | Feed live; MCP `search_shared_sessions` and `get_shared_session_context` parity; recall SLOs (plan, section 10); cross-T0 merge spec implemented; hybrid nDCG@10 lane (SLO rows 12 and 13) green |
+| **Transcript search for new sessions live (G-T, K-27): hard pre-T0 gate, critical path** | unassigned | store decided: **ObsessionDB, AWS `us-east-1`** (K-28, K-33); 0001 amendment drafted in #90, not merged; no benchmark run; vector support unverified; dashboard ranking keyword-only before T0 (K-36 "No embeddings pre-T0") | Feed live; MCP `search_shared_sessions` and `get_shared_session_context` parity; recall SLOs (plan, section 10); cross-T0 merge spec implemented; nDCG@10 against legacy hybrid (SLO rows 12 and 13) green |
 | Post-flip write-freeze lever (G-F) | unassigned | missing (#224 has no `supabase → holding`) | Built, rehearsed, canary-proven before T0 |
 | Supabase disk resize (K-32) | Khaliq | Pro/Large, 2 GB disk, empty | Resized before A3 |
 | SEC-01 fixed in hosted RelayAuth (S1) | cloud lane | cloud #5886 merged to `trunk`; promotion to `main` and the deploy are unverified | Deployed SHA verified; negative cross-org mint probe (K-23) |
