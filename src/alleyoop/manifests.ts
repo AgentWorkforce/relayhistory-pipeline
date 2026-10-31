@@ -887,9 +887,23 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         "machine_claim_refused",
         "the token is not bound to this machine and writer",
       );
-    if (auth.tokenSubject !== MIGRATION_SUBJECT && machineClaim(auth) === undefined &&
-      !(await auditClaimless(deps, "write", auth, manifest, c.req.header("X-Relay-Client"))))
-      return responseError(c, 503, "claimless_audit_unavailable", "this write cannot be recorded");
+    if (
+      auth.tokenSubject !== MIGRATION_SUBJECT &&
+      machineClaim(auth) === undefined &&
+      !(await auditClaimless(
+        deps,
+        "write",
+        auth,
+        manifest,
+        c.req.header("X-Relay-Client"),
+      ))
+    )
+      return responseError(
+        c,
+        503,
+        "claimless_audit_unavailable",
+        "this write cannot be recorded",
+      );
     const encoded = new TextEncoder().encode(JSON.stringify(manifest));
     const encodedText = new TextDecoder().decode(encoded);
     if (encoded.byteLength > MAX_MANIFEST_BYTES)
@@ -1215,7 +1229,15 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       // if the read is on the record: an unaudited read is refused.
       if (claim === undefined && !auth.migration) {
         if (!claimlessWindowOpen(c.env ?? {})) return c.body(null, 403);
-        if (!(await auditClaimless(deps, "status", auth, stored.manifest, c.req.header("X-Relay-Client"))))
+        if (
+          !(await auditClaimless(
+            deps,
+            "status",
+            auth,
+            stored.manifest,
+            c.req.header("X-Relay-Client"),
+          ))
+        )
           return c.body(null, 503);
       }
       // A migration assertion never reads a client's parked manifest.

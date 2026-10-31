@@ -560,7 +560,9 @@ describe("machine claim", () => {
       await w.write(line(1));
       await w.run();
       expect((await w.stored())!.manifest.raw.chunk_count).toBe(2);
-      expect(w.gate.claimless.some((use) => use.surface === "write")).toBe(true);
+      expect(w.gate.claimless.some((use) => use.surface === "write")).toBe(
+        true,
+      );
     });
 
     test("an unaudited use is refused, not waved through", async () => {

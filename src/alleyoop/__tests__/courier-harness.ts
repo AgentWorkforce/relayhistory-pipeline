@@ -25,7 +25,10 @@ import {
 } from "../../shared/vendor.ts";
 import { runCourierOnce, type CourierConfig } from "../courier.ts";
 import { feedRecordId } from "../feed-records.ts";
-import { createCourierManifestRoutes, type ClaimlessUse } from "../manifests.ts";
+import {
+  createCourierManifestRoutes,
+  type ClaimlessUse,
+} from "../manifests.ts";
 
 const ORG = "org_test";
 const WORKSPACE = "default";
