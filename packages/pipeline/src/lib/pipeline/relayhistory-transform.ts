@@ -156,11 +156,27 @@ function canonical(value: unknown): unknown {
   return value;
 }
 
+/**
+ * The same revision of one record. `received_at` is excluded: it says when each
+ * path stored the record, so the export and the live client legitimately differ.
+ */
 function sameRecord(
   left: RelayhistoryStreamRecord,
   right: RelayhistoryStreamRecord,
 ): boolean {
-  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+  const content = ({ received_at: _at, ...rest }: RelayhistoryStreamRecord) =>
+    JSON.stringify(canonical(rest));
+  return content(left) === content(right);
+}
+
+function receivedFirst(
+  left: RelayhistoryStreamRecord,
+  right: RelayhistoryStreamRecord,
+): boolean {
+  return (
+    (Date.parse(left.received_at) - Date.parse(right.received_at) ||
+      compareText(left.received_at, right.received_at)) < 0
+  );
 }
 
 /** Latest live records, deterministic regardless of live/backfill arrival order. */
@@ -175,14 +191,15 @@ export function normalizeRelayhistoryRecords(
       latest.set(key, record);
       continue;
     }
-    if (
-      BigInt(record.revision) === BigInt(previous.revision) &&
-      !sameRecord(record, previous)
-    )
+    if (BigInt(record.revision) !== BigInt(previous.revision)) continue;
+    if (!sameRecord(record, previous))
       fail(
         "relayhistory_revision_conflict",
         "equal RelayHistory revisions contain different records",
       );
+    // One record stored twice: the earlier copy wins whichever arrived first,
+    // so the output bytes do not depend on arrival order.
+    if (receivedFirst(record, previous)) latest.set(key, record);
   }
   return [...latest.values()]
     .filter((record) => record.operation === "upsert" && record.payload !== null)

@@ -9,6 +9,32 @@ export interface HoopDb extends SqlExecutor {
   end(): Promise<void>;
 }
 
+/**
+ * Runs `work` in one transaction on one pooled connection: COMMIT when it
+ * resolves, ROLLBACK when it throws (then rethrows). Used by the migration
+ * assertion ledger so its row and the pipeline_jobs row commit together.
+ */
+export async function inTransaction<T>(db: Pick<HoopDb, "pool">, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const tx: SqlExecutor = {
+      async query<R = Record<string, unknown>>(text: string, params?: unknown[]) {
+        const r = await client.query(text, params as unknown[]);
+        return { rows: r.rows as R[] };
+      },
+    };
+    const result = await work(tx);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export function openHoopDb(url = required("HOOPDB_URL")): HoopDb {
   const pool = new pg.Pool({ connectionString: url, max: 8, application_name: process.env.OTEL_SERVICE_NAME ?? "96bulls" });
   pool.on("error", (err) => log.error("hoopdb pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
