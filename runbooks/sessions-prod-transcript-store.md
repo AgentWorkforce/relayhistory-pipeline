@@ -147,7 +147,7 @@ exist (the history indexer; the erasure job), each with its own approval.
    creates and hardens it (versioning, encryption, Block Public Access,
    owner-enforced) on first use: run `bin/96bulls plan aws-sessions-prod` once
    without `--capture`. That plain plan writes only the state bucket (and a
-   lease object), never a stack resource.
+   lease object), never a stack resource. (Done 2026-10-31.)
 2. **Account-level S3 Block Public Access** (recommended, not in the stack:
    Alchemy has no resource for it). The account has none set today:
 
@@ -196,9 +196,9 @@ aws s3api get-object-lock-configuration --bucket $B               # ObjectLockCo
 aws s3api get-bucket-lifecycle-configuration --bucket $B          # NoncurrentDays 1, abort 1, delete markers
 aws s3api get-bucket-policy --bucket $B --query Policy --output text | jq .
 aws s3api get-bucket-logging --bucket $B                          # target the access-log bucket
-aws kms describe-key --key-id alias/96bulls-aws-sessions-prod-transcripts
-aws kms get-key-rotation-status --key-id alias/96bulls-aws-sessions-prod-transcripts
-aws kms get-key-policy --key-id alias/96bulls-aws-sessions-prod-transcripts --policy-name default --output text | jq .
+K=$(aws kms describe-key --key-id alias/96bulls-aws-sessions-prod-transcripts --query KeyMetadata.KeyId --output text)
+aws kms get-key-rotation-status --key-id $K                       # aliases are refused here
+aws kms get-key-policy --key-id $K --policy-name default --output text | jq .
 aws cloudtrail get-event-selectors --trail-name 96bulls-aws-sessions-prod-trail
 aws cloudtrail get-trail-status --name 96bulls-aws-sessions-prod-trail       # IsLogging true
 ```
@@ -208,16 +208,30 @@ Least privilege, with the IAM policy simulator (no credentials needed):
 ```sh
 U=arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-writer
 O=arn:aws:s3:::$B/96bulls/org/v1/ws=w/m=m/h=h/d=2026/10/31/s=s
-aws iam simulate-principal-policy --policy-source-arn $U --action-names s3:PutObject \
-  --resource-arns $O/raw/x $O/manifest.json $O/summary/short.json.enc $O/other arn:aws:s3:::$B/v1/x \
-  --query 'EvaluationResults[].[EvalResourceName,EvalDecision]' --output text
-# allowed, allowed, allowed, implicitDeny, implicitDeny
+aws s3api get-bucket-policy --bucket $B --query Policy --output text > bucket-policy.json
+for r in $O/raw/x $O/manifest.json $O/summary/short.json.enc $O/other arn:aws:s3:::$B/v1/x; do   # one resource per call:
+  aws iam simulate-principal-policy --policy-source-arn $U --action-names s3:PutObject \
+    --resource-arns $r --resource-policy file://bucket-policy.json \
+    --query 'EvaluationResults[0].EvalDecision' --output text                                   # several at once with
+done   # allowed, allowed, allowed, implicitDeny, implicitDeny                                    # --resource-policy mis-evaluates
 aws iam simulate-principal-policy --policy-source-arn $U --action-names s3:DeleteObject s3:GetObjectVersion \
   --resource-arns $O/raw/x --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text   # explicitDeny
 ```
 
-(The simulator evaluates identity policies; add `--resource-policy` with the
-bucket policy to include it.)
+Add `--context-entries ContextKeyName=s3:x-amz-server-side-encryption,ContextKeyValues=aws:kms,ContextKeyType=string`
+to see the bucket policy refuse `aws:kms` without this key id (explicitDeny).
+
+## Applied 2026-10-31
+
+- **First apply:** created 9 of the 12 resources. KMS then refused the transcripts key policy with
+  `MalformedPolicyDocumentException: invalid principals`, because the IAM users it names had not
+  propagated yet; the trail-ordering delay was not long enough.
+- **Recovery:** a fresh capture showed 3 creates, with the 9 existing resources unchanged (noop) and
+  nothing updated or replaced. The second apply created the remaining 3.
+- **Next time:** if this happens on a new stage, wait a minute, re-capture and re-apply. Nothing
+  partial needs cleaning up.
+- **Account-level S3 Block Public Access:** set separately on 2026-10-31 with
+  `s3control put-public-access-block` (all four true).
 
 ## Credentials (1Password, never in logs)
 
