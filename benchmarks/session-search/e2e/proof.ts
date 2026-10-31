@@ -162,6 +162,69 @@ async function g2(oracle: Oracle) {
   gate("G2_lexical_recall", checks, { queries: QUERY_SET_VERSION, rows });
 }
 
+/** Candidate rounds, adversarially. The oracle is a substring test on the rows written here. */
+async function g2Rounds() {
+  const checks: Record<string, boolean> = {};
+  const base = Date.parse("2026-10-20T00:00:00.000Z");
+  const row = (orgId: string, workspaceId: string, machineId: string, id: string, ms: number, text: string) => ({
+    orgId, workspaceId, harness: "claude", sessionId: `s-${id}`, machineId, eventId: id, revision: 1, chunkSeq: 0, recordSeq: 0,
+    ts: new Date(base + ms).toISOString(), kind: "message", scrubVersion: 1, text,
+  });
+  const walk = async (scope: Scope, query: string, extra: { machineId?: string } = {}) => {
+    const seen: string[] = [], sizes: number[] = [];
+    let cursor: string | undefined, pages = 0, exhausted = false;
+    do {
+      const r = await search.search(scope, { query, limit: 10, cursor, ...extra });
+      seen.push(...r.hits.map((h) => h.event_id)); sizes.push(r.hits.length);
+      exhausted ||= r.stats.exhaustedRounds;
+      cursor = r.nextCursor ?? undefined;
+    } while (cursor && ++pages < 500);
+    return { seen, sizes, pages, exhausted, endedByItself: !cursor };
+  };
+  const a = scopeOf("org-adv", ["ws-adv"]);
+  // False candidates newest, more than all rounds can hold, then true hits older.
+  const FALSE = 1_250, TRUE = 25;
+  const rows = [
+    ...Array.from({ length: FALSE }, (_, i) => row("org-adv", "ws-adv", "m1", `f-${i}`, 1_000_000 - i, "qrs tt rst uu stu vv tuv")),
+    ...Array.from({ length: TRUE }, (_, i) => row("org-adv", "ws-adv", "m1", `t-${i}`, 1_000 - i, "see QRSTUV here")),
+  ];
+  await search.insert(rows);
+  const deep = await walk(a, "qrstuv");
+  checks.deepFalseAllTrueOnce = deep.seen.length === TRUE && new Set(deep.seen).size === TRUE;
+  checks.deepFalseTerminates = deep.endedByItself && deep.exhausted;
+  // Fewer false candidates than one round: pages stay full.
+  await search.insert([
+    ...Array.from({ length: 60 }, (_, i) => row("org-adv", "ws-adv", "m1", `g-${i}`, 2_000_000 - i, "lmn pp mno qq nop rr opq")),
+    ...Array.from({ length: 35 }, (_, i) => row("org-adv", "ws-adv", "m1", `h-${i}`, 1_900_000 - i, "lmnopq")),
+  ]);
+  const full = await walk(a, "lmnopq");
+  checks.fullPagesUnderFalse = full.sizes.slice(0, -1).every((n) => n === 10) && full.seen.length === 35 && new Set(full.seen).size === 35;
+  // Tenant and machine filters come before candidates: newer rows elsewhere take no slots.
+  await search.insert([
+    ...Array.from({ length: 400 }, (_, i) => row("org-adv-other", "ws-adv-other", "m1", `o-${i}`, 3_000_000 - i, "wxyzab")),
+    ...Array.from({ length: 400 }, (_, i) => row("org-adv", "ws-adv-b", "m1", `w-${i}`, 3_000_000 - i, "wxyzab")),
+    ...Array.from({ length: 400 }, (_, i) => row("org-adv", "ws-adv", "m2", `m-${i}`, 3_000_000 - i, "wxyzab")),
+    ...Array.from({ length: 12 }, (_, i) => row("org-adv", "ws-adv", "m1", `k-${i}`, 100 - i, "wxyzab")),
+  ]);
+  const scoped = await search.search(a, { query: "wxyzab", limit: 20, machineId: "m1" });
+  checks.machineFilterBeforeCandidates = scoped.hits.length === 12 && scoped.hits.every((h) => h.event_id.startsWith("k-")) && scoped.stats.candidates === 12;
+  const tenant = await walk(a, "wxyzab");
+  checks.tenantBeforeCandidates = tenant.seen.length === 412 && !tenant.seen.some((id) => id.startsWith("o-") || id.startsWith("w-"));
+  // Equal timestamps across rounds and cursors.
+  await search.insert(Array.from({ length: 450 }, (_, i) => row("org-adv", "ws-adv", "m1", `e-${String(i).padStart(3, "0")}`, 5_000_000, "ghijkl")));
+  const ties = await walk(a, "ghijkl");
+  checks.equalTimestampsEachOnce = ties.seen.length === 450 && new Set(ties.seen).size === 450;
+  // Boundaries and case: substring semantics, exactly.
+  await search.insert([
+    row("org-adv", "ws-adv", "m1", "b-1", 1, "ZZnopqrsZZ"), row("org-adv", "ws-adv", "m1", "b-2", 2, "NoPqRs"),
+    row("org-adv", "ws-adv", "m1", "b-3", 3, "nopq rs"), row("org-adv", "ws-adv", "m1", "b-4", 4, "nop-qrs"),
+    row("org-adv", "ws-adv", "m1", "b-5", 5, "a.b_c%d"), row("org-adv", "ws-adv", "m1", "b-6", 6, "aXbYcZd"),
+  ]);
+  checks.boundariesExact = (await walk(a, "nopqrs")).seen.sort().join() === "b-1,b-2";
+  checks.punctuationExact = (await walk(a, "a.b_c%d")).seen.join() === "b-5";
+  gate("G2b_candidate_rounds", checks, { deepFalse: { pages: deep.pages, sizes: deep.sizes.slice(0, 12) }, countSemantics: "no exact total is returned; rounds stop once a page is full" });
+}
+
 async function g3(oracle: Oracle) {
   const checks: Record<string, boolean> = {};
   const scope = orgScope(0);
@@ -401,6 +464,7 @@ if (reachedStore) {
   firstQueryAfterLoad = { activeParts: parts, ms: Math.round(performance.now() - probeStart), over5sLimit: performance.now() - probeStart > 5000 };
   console.log("first query after load", JSON.stringify(firstQueryAfterLoad));
   await g2(oracle);
+  await g2Rounds();
   await g3(oracle);
   await g4();
   await g5();
@@ -410,7 +474,7 @@ if (reachedStore) {
 }
 report.G9_noisy_neighbour = { status: "INHERITED_FAIL", detail: "#233 gate 7 fails against 2x; not rerun here" };
 report.G11_cost_teardown = { status: "NOT_RUN", detail: "plan in docs/session-search-proof.md; no account exists" };
-for (const id of ["G2_lexical_recall", "G3_context_recall", "G4_federation", "G5_tenant_isolation", "G7_latency_load", "G8_freshness", "G10_delete_logical"])
+for (const id of ["G2_lexical_recall", "G2b_candidate_rounds", "G3_context_recall", "G4_federation", "G5_tenant_isolation", "G7_latency_load", "G8_freshness", "G10_delete_logical"])
   report[id] ??= { status: "NOT_RUN", detail: "G1 blocked" };
 // A proof gate passes only as PASS, so a green job never means the proof passed.
 const open = Object.entries(report).filter(([, g]) => g.status !== "PASS").map(([k, g]) => `${k}=${g.status}`);

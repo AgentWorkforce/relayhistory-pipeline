@@ -8,6 +8,7 @@
  *   BENCH_DIAG_S  seconds per level (default 8)
  */
 import { readFileSync, writeFileSync } from "node:fs";
+import { cpus } from "node:os";
 import { SCALES } from "../corpus.ts";
 import { percentile } from "../stats.ts";
 import { applyShape } from "./shape.ts";
@@ -46,12 +47,17 @@ async function level(needle: (typeof NEEDLES)[number], clients: number) {
   const tag = `diag:${needle.id}:${clients}`;
   const lat: number[] = [];
   const errors: Record<string, number> = {};
+  const work = { candidates: 0, falseCandidates: 0, rounds: 0, searches: 0 };
   let stop = false;
   const started = performance.now();
   const worker = async () => {
     while (!stop) {
       const s = performance.now();
-      try { await search.search(whale, { query: needle.query, tag }); lat.push(performance.now() - s); }
+      try {
+        const { stats } = await search.search(whale, { query: needle.query, tag });
+        lat.push(performance.now() - s);
+        work.candidates += stats.candidates; work.falseCandidates += stats.falseCandidates; work.rounds += stats.rounds; work.searches++;
+      }
       catch (e) { const c = errorCode(e); errors[c] = (errors[c] ?? 0) + 1; }
     }
   };
@@ -60,7 +66,12 @@ async function level(needle: (typeof NEEDLES)[number], clients: number) {
   stop = true;
   await Promise.all(run);
   const elapsed = (performance.now() - started) / 1000;
-  return { clients, qps: Math.round(lat.length / elapsed * 10) / 10, errors, ...pct(lat), server: await serverCounters(tag) };
+  const qps = Math.round(lat.length / elapsed * 10) / 10;
+  const per = (n: number) => Math.round(n / Math.max(1, work.searches) * 10) / 10;
+  return {
+    clients, qps, qpsPerCore: Math.round(qps / cpus().length * 10) / 10, errors, ...pct(lat), server: await serverCounters(tag),
+    perSearch: { candidates: per(work.candidates), falseCandidates: per(work.falseCandidates), rounds: per(work.rounds) },
+  };
 }
 
 await installSchema(admin, pw);
@@ -90,7 +101,7 @@ for (const n of NEEDLES) {
 }
 const report = {
   shapeFidelity: "PARTIAL: sanitized aggregate anchors only, not a fresh production-derived shape artifact. Not production-scale parity; cannot close T0.",
-  loaded, cores, activeParts: (await admin.run("SELECT count() FROM system.parts WHERE table = 'session_search_records' AND active")).trim(), classes,
+  loaded, cores, runnerCores: cpus().length, activeParts: (await admin.run("SELECT count() FROM system.parts WHERE table = 'session_search_records' AND active")).trim(), classes,
 };
 writeFileSync(out, JSON.stringify(report, null, 2));
 if (failed) { console.error("failed: a class recorded search errors; see report"); process.exit(1); }

@@ -15,7 +15,9 @@ export interface SearchHit {
   workspace_id: string; harness: string; session_id: string; machine_id: string;
   event_id: string; ts: string; snippet: string; citation: string;
 }
-export interface SearchOptions { query: string; limit?: number; since?: string; until?: string; source?: string; cursor?: string; tag?: string }
+export interface SearchOptions { query: string; limit?: number; since?: string; until?: string; source?: string; machineId?: string; cursor?: string; tag?: string }
+/** No exact total: rounds stop once a page is full, so a total would need a separate count. */
+export interface SearchStats { rounds: number; candidates: number; falseCandidates: number; exhaustedRounds: boolean }
 export interface ContextEvent { event_id: string; ts: string; kind: string; text: string; is_match: 0 | 1 }
 
 const MAX_LIMIT = 20;
@@ -96,7 +98,7 @@ export class SessionSearchStore {
    * shorten one. ngrams(3) cannot serve under three characters, so that form narrows by
    * tenant only and scans.
    */
-  async search(scope: Scope, o: SearchOptions): Promise<{ hits: SearchHit[]; nextCursor: string | null }> {
+  async search(scope: Scope, o: SearchOptions): Promise<{ hits: SearchHit[]; nextCursor: string | null; stats: SearchStats }> {
     const q = o.query;
     if (!q || [...q].length > MAX_QUERY) throw new Error("invalid_query");
     const { params, settings } = this.guard(scope);
@@ -108,6 +110,9 @@ export class SessionSearchStore {
     if (o.since) { filters.push("ts >= parseDateTime64BestEffort({since:String}, 3)"); bound.since = o.since; }
     if (o.until) { filters.push("ts <= parseDateTime64BestEffort({until:String}, 3)"); bound.until = o.until; }
     if (o.source) { filters.push("harness = {source:String}"); bound.source = o.source; }
+    if (o.machineId) { filters.push("machine_id = {machine:String}"); bound.machine = o.machineId; }
+    const stats: SearchStats = { rounds: 0, candidates: 0, falseCandidates: 0, exhaustedRounds: false };
+    let more = false;
     const after = "(ts, event_id) < (parseDateTime64BestEffort({cts:String}, 3), {cid:String})";
     const decode = (c: string) => JSON.parse(Buffer.from(c, "base64url").toString()) as [string, string];
     const encode = (ts: string, id: string) => Buffer.from(JSON.stringify([ts, id])).toString("base64url");
@@ -121,7 +126,11 @@ export class SessionSearchStore {
         ORDER BY ts DESC, event_id DESC LIMIT ${limit + 1}`, { ...bound, ...(position ? { cts: position[0], cid: position[1] } : {}) }, tag);
       rows = page;
     } else {
-      for (let round = 0; round < MAX_CANDIDATE_ROUNDS && rows.length <= limit; round++) {
+      for (;;) {
+        if (rows.length > limit) break;
+        // Bounded work: hand back a short page and a cursor, never a silent end.
+        if (stats.rounds === MAX_CANDIDATE_ROUNDS) { stats.exhaustedRounds = true; more = true; break; }
+        stats.rounds++;
         const candidates = await this.reader.rows<{ id: string; ms: string }>(`
           SELECT event_id AS id, toString(toUnixTimestamp64Milli(ts)) AS ms FROM ${TABLE}
           WHERE ${[...filters, ...(position ? [after] : []), "hasAllTokens(text, {q:String})"].join(" AND ")}
@@ -133,6 +142,8 @@ export class SessionSearchStore {
             AND event_id IN {ids:Array(String)} AND positionCaseInsensitiveUTF8(text, {q:String}) > 0
           ORDER BY ts DESC, event_id DESC`, { ...bound, lo: last.ms, hi: first.ms, ids: arrayLiteral(candidates.map((c) => c.id)) }, tag);
         rows.push(...checked);
+        stats.candidates += candidates.length;
+        stats.falseCandidates += candidates.length - checked.length;
         if (candidates.length < CANDIDATE_LIMIT) break;
         position = [iso(last.ms), last.id];
       }
@@ -141,7 +152,9 @@ export class SessionSearchStore {
     const lastHit = page.at(-1);
     return {
       hits: page.map((r) => ({ ...r, citation: `/sessions/${encodeURIComponent(r.session_id)}?source=${encodeURIComponent(r.harness)}` })),
-      nextCursor: rows.length > limit && lastHit ? encode(lastHit.ts, lastHit.event_id) : null,
+      nextCursor: rows.length > limit && lastHit ? encode(lastHit.ts, lastHit.event_id)
+        : more && position ? encode(position[0], position[1]) : null,
+      stats,
     };
   }
 
