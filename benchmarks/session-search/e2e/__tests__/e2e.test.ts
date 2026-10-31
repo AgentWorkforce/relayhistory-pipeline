@@ -19,6 +19,27 @@ describe("store chokepoint", () => {
   });
 });
 
+describe("a failed response is never a page", () => {
+  const row = JSON.stringify({ workspace_id: "w", harness: "h", session_id: "s", machine_id: "m", event_id: "e", at: "1", snippet: "x" });
+  const against = async (status: number, body: string, run: (s: SessionSearchStore) => Promise<unknown>) => {
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response(body, { status }) });
+    try {
+      const http = new ClickHouseHttp(`http://127.0.0.1:${server.port}`, "u", "p");
+      return await run(new SessionSearchStore(http, http)).then(() => "accepted", (e) => String(e));
+    } finally { server.stop(true); }
+  };
+  const scope = { orgId: "o", workspaceIds: ["w"] };
+  test("408 with partial rows is refused", async () => {
+    expect(await against(408, `${row}\nCode: 159. DB::Exception: Timeout exceeded`, (s) => s.search(scope, { query: "abc" }))).toContain("clickhouse 408");
+  });
+  test("200 with an exception after rows is refused", async () => {
+    expect(await against(200, `${row}\nCode: 159. DB::Exception: Timeout exceeded`, (s) => s.search(scope, { query: "abc" }))).not.toBe("accepted");
+  });
+  test("control: a complete 200 is accepted", async () => {
+    expect(await against(200, `${row}\n`, (s) => s.search(scope, { query: "abc" }))).toBe("accepted");
+  });
+});
+
 describe("recordText", () => {
   test("indexes values, not keys or envelope fields", () => {
     const r = recordText(JSON.stringify({ type: "user", uuid: "abc", timestamp: "2026-10-30T10:00:00.000Z", message: { role: "user", content: [{ text: "needle" }] } }));
