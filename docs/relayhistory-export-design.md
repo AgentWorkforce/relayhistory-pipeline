@@ -170,6 +170,11 @@ manifest body.
   `migration:<grantId>`. A live write and export based on the same object
   version cannot both commit; the loser rereads and rebuilds. Normal live
   assertions cannot open a `backfill` epoch.
+  The epoch is sealed, and the client continues in a `resumed` epoch at its
+  own offset (`manifest-v1.md`, "Backfill"). Still open: a backfill needs an
+  `ndjson` live stream, so the courier's `jsonl` sessions cannot take one, and
+  the courier rebuilds `raw` from local state. A session cold-exported first
+  and resumed later stays fenced on its client.
 - **O5:** volume. About 54M records in 161 GB of payload; estimate the
   exported zstd size and the PUT count per workspace (KMS request cost, P9).
 

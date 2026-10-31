@@ -17,7 +17,13 @@ import {
 } from "./layout.js";
 
 export const MANIFEST_SCHEMA_VERSION = 1;
+/** `opened_by` of a backfill epoch: `migration:{grant_id}`. */
+export const MIGRATION_ID_PREFIX = "migration:";
+/** The exporter's own extension key. */
+export const EXPORT_EXTENSION = "client.relayhistory_export";
 
+/** `migration:{grant_id}`, the shape the ingest boundary mints. */
+const MIGRATION_ID = /^migration:[A-Za-z0-9._:-]{1,255}$/;
 const hex64 = z.string().regex(/^[0-9a-f]{64}$/, "64 lowercase hex chars");
 const rfc3339 = z.iso.datetime({ offset: true });
 const uint = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -112,9 +118,17 @@ export const EpochRecordSchema = z
     opened_at: rfc3339,
     // `backfill` is an append-only historical stream landed after live
     // delivery has already opened the session (the switch-first migration).
-    reason: z.enum(["initial", "truncated", "rewritten", "backfill"]),
+    // `resumed` is the raw owner continuing its source after that epoch.
+    reason: z.enum([
+      "initial",
+      "truncated",
+      "rewritten",
+      "backfill",
+      "resumed",
+    ]),
     first_seq: uint,
     opened_by: z.string().min(1),
+    resumes_epoch: uint.optional(),
   })
   .loose();
 
@@ -208,11 +222,7 @@ export type EpochRecord = z.infer<typeof EpochRecordSchema>;
 export type ScrubMarker = z.infer<typeof ScrubMarkerSchema>;
 export type ServerSection = z.infer<typeof ServerSectionSchema>;
 export type EffectiveState =
-  | "closed"
-  | "active"
-  | "idle"
-  | "abandoned"
-  | "archived";
+  "closed" | "active" | "idle" | "abandoned" | "archived";
 
 export interface ManifestIssue {
   path: string;
@@ -267,6 +277,108 @@ export async function computeContentSha256(
     h = await sha256(buf);
   }
   return toHex(h);
+}
+
+type Raw = ManifestV1["raw"];
+
+/** The newest epoch the client's source wrote. */
+export function liveEpoch(raw: Pick<Raw, "epochs">): number {
+  return raw.epochs.filter((e) => e.reason !== "backfill").at(-1)?.epoch ?? 0;
+}
+
+/** `start_offset` of an epoch's first chunk: 0, or where a `resumed` epoch continues. */
+function epochBase(raw: Raw, epoch: number): number {
+  const resumes = raw.epochs[epoch]?.resumes_epoch;
+  return resumes !== undefined && resumes < epoch ? epochEnd(raw, resumes) : 0;
+}
+
+function epochEnd(raw: Raw, epoch: number): number {
+  const last = raw.chunks.filter((c) => c.epoch === epoch).at(-1);
+  return last ? last.start_offset + last.bytes : epochBase(raw, epoch);
+}
+
+/**
+ * Where the client resumes reading its source. After a backfill, unlike
+ * `next_offset`, this is not the end of the exporter's stream.
+ */
+export function liveNextOffset(raw: Raw): number {
+  return epochEnd(raw, liveEpoch(raw));
+}
+
+/** The newest live epoch and the `resumes_epoch` chain behind it. */
+function liveEpochs(raw: Raw): Set<number> {
+  const out = new Set<number>();
+  let at: number | undefined = liveEpoch(raw);
+  while (at !== undefined && !out.has(at)) {
+    out.add(at);
+    at = raw.epochs[at]?.resumes_epoch;
+  }
+  return out;
+}
+
+const MACHINE_ORIGIN = "machine:";
+
+/**
+ * The export marker's `origin_revisions`: per client feed origin, the highest
+ * revision exported. A client resumes each feed after it, so it does not send
+ * what the export already holds. Absent means `{}`, resume from 0.
+ */
+export function exportWatermarks(manifest: ManifestV1): Record<string, number> {
+  const marker = manifest.extensions?.[EXPORT_EXTENSION] as
+    { origin_revisions?: Record<string, number> } | undefined;
+  return marker?.origin_revisions ?? {};
+}
+
+function validateExportMarker(
+  manifest: ManifestV1,
+  issue: (path: string, message: string) => void,
+): void {
+  const value = (
+    manifest.extensions?.[EXPORT_EXTENSION] as
+      { origin_revisions?: unknown } | undefined
+  )?.origin_revisions;
+  if (value === undefined) return;
+  const path = `extensions.${EXPORT_EXTENSION}.origin_revisions`;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return void issue(path, "must be an object");
+  for (const [origin, revision] of Object.entries(value)) {
+    if (!origin || origin.startsWith(MACHINE_ORIGIN))
+      issue(path, "an origin must be a client feed");
+    if (!Number.isSafeInteger(revision) || (revision as number) < 0)
+      issue(path, "a revision must be a non-negative safe integer");
+  }
+}
+
+function validateBackfillEpochs(
+  raw: Raw,
+  issue: (path: string, message: string) => void,
+): void {
+  const { epochs } = raw;
+  if (epochs.filter((e) => e.reason === "backfill").length > 1)
+    issue("raw.epochs", 'at most one epoch is "backfill"');
+  epochs.forEach((e, i) => {
+    const at = `raw.epochs[${i}]`;
+    if (e.reason === "resumed") {
+      if (epochs[i - 1]?.reason !== "backfill")
+        issue(`${at}.reason`, '"resumed" directly follows the backfill epoch');
+      const live = liveEpoch({ epochs: epochs.slice(0, i) });
+      if (e.resumes_epoch !== live)
+        issue(`${at}.resumes_epoch`, `must be ${live}, the newest live epoch`);
+      return;
+    }
+    if (e.resumes_epoch !== undefined)
+      issue(`${at}.resumes_epoch`, 'is only valid on a "resumed" epoch');
+    if (e.reason !== "backfill") return;
+    if (!MIGRATION_ID.test(e.opened_by))
+      issue(
+        `${at}.opened_by`,
+        `a backfill epoch is opened by ${MIGRATION_ID_PREFIX}{grant_id}`,
+      );
+    if (raw.format !== "ndjson")
+      issue("raw.format", "a backfill epoch needs ndjson");
+    if (!raw.chunks.some((c) => c.epoch === e.epoch))
+      issue(at, "a backfill epoch lists at least one chunk");
+  });
 }
 
 /**
@@ -327,6 +439,9 @@ export async function validateManifest(
       `is ${raw.epoch}, raw.epochs has ${epochs.length} records`,
     );
 
+  validateBackfillEpochs(raw, issue);
+  validateExportMarker(manifest, issue);
+
   let prev: ChunkEntry | undefined;
   chunks.forEach((c, i) => {
     const at = `raw.chunks[${i}]`;
@@ -343,7 +458,9 @@ export async function validateManifest(
         `${at}.seq`,
         `opens epoch ${c.epoch} but raw.epochs[${c.epoch}].first_seq is ${epochs[c.epoch]!.first_seq}`,
       );
-    const expected = firstOfEpoch ? 0 : prev!.start_offset + prev!.bytes;
+    const expected = firstOfEpoch
+      ? epochBase(raw, c.epoch)
+      : prev!.start_offset + prev!.bytes;
     if (c.start_offset !== expected)
       issue(
         `${at}.start_offset`,
@@ -353,7 +470,9 @@ export async function validateManifest(
   });
   const current = chunks.filter((c) => c.epoch === raw.epoch);
   const tail = current.at(-1);
-  const expectedNext = tail ? tail.start_offset + tail.bytes : 0;
+  const expectedNext = tail
+    ? tail.start_offset + tail.bytes
+    : epochBase(raw, raw.epoch);
   if (raw.next_offset !== expectedNext)
     issue(
       "raw.next_offset",
@@ -572,8 +691,10 @@ export function chunkKeys(
   options: { prefix?: string; currentEpochOnly?: boolean } = {},
 ): { entry: ChunkEntry; key: ObjectKey }[] {
   const loc = manifestLocation(manifest, options.prefix);
+  // "Current" is the live source's stream: never just a backfill epoch.
+  const live = liveEpochs(manifest.raw);
   return manifest.raw.chunks
-    .filter((c) => !options.currentEpochOnly || c.epoch === manifest.raw.epoch)
+    .filter((c) => !options.currentEpochOnly || live.has(c.epoch))
     .map((entry) => ({
       entry,
       key: rawChunkKey(
@@ -584,4 +705,288 @@ export function chunkKeys(
         manifest.raw.format,
       ),
     }));
+}
+
+/** A chunk of a backfill before it has a place in the manifest. */
+export type BackfillChunk = Pick<
+  ChunkEntry,
+  | "start_offset"
+  | "bytes"
+  | "stored_bytes"
+  | "sha256"
+  | "sha256_8"
+  | "stored_sha256"
+  | "stored_raw_bytes"
+  | "raw_sha256"
+  | "compression"
+  | "records"
+  | "first_ts"
+  | "last_ts"
+>;
+
+export interface BackfillEpoch {
+  /** `migration:{grant_id}`, from the exporter's verified credential. */
+  openedBy: string;
+  openedAt: string;
+  /** Contiguous from offset 0, in the export's deterministic order. */
+  chunks: readonly BackfillChunk[];
+  /** Stored as `extensions["client.relayhistory_export"]`. */
+  marker: unknown;
+}
+
+/**
+ * The content of a backfill, independent of where it landed: `seq` and the
+ * epoch number differ if live writes came first, the source digests do not.
+ */
+export async function backfillDigest(
+  chunks: readonly Pick<ChunkEntry, "start_offset" | "bytes" | "sha256">[],
+): Promise<string> {
+  return computeContentSha256(chunks.map((c) => ({ ...c, epoch: 0 })));
+}
+
+/** How a manifest relates to a backfill of `digest` (spec: "Idempotency"). */
+export async function backfillStatus(
+  manifest: ManifestV1,
+  digest: string,
+): Promise<"absent" | "present" | "conflict"> {
+  const epoch = manifest.raw.epochs.find((e) => e.reason === "backfill");
+  if (!epoch) return "absent";
+  const listed = manifest.raw.chunks.filter((c) => c.epoch === epoch.epoch);
+  return (await backfillDigest(listed)) === digest ? "present" : "conflict";
+}
+
+/**
+ * `manifest` with one sealed backfill epoch appended. Pure. Touches only what
+ * the spec allows the exporter: `raw.owner`, `raw.updated_at` and every
+ * existing entry stay as they are.
+ */
+export async function appendBackfillEpoch(
+  manifest: ManifestV1,
+  backfill: BackfillEpoch,
+): Promise<ManifestV1> {
+  const { raw } = manifest;
+  const epoch = raw.epoch + 1;
+  const added = backfill.chunks.map((c, i) => ({
+    ...c,
+    seq: raw.chunk_count + i,
+    epoch,
+  }));
+  const chunks = [...raw.chunks, ...added];
+  const tail = added.at(-1);
+  return {
+    ...manifest,
+    revision: manifest.revision + 1,
+    updated_at: backfill.openedAt,
+    raw: {
+      ...raw,
+      chunk_count: chunks.length,
+      raw_bytes: raw.raw_bytes + added.reduce((a, c) => a + c.bytes, 0),
+      stored_bytes:
+        raw.stored_bytes + added.reduce((a, c) => a + c.stored_bytes, 0),
+      content_sha256: await computeContentSha256(chunks),
+      epoch,
+      epochs: [
+        ...raw.epochs,
+        {
+          epoch,
+          opened_at: backfill.openedAt,
+          reason: "backfill",
+          first_seq: raw.chunk_count,
+          opened_by: backfill.openedBy,
+        },
+      ],
+      next_offset: tail ? tail.start_offset + tail.bytes : 0,
+      chunks,
+    },
+    extensions: { ...manifest.extensions, [EXPORT_EXTENSION]: backfill.marker },
+  };
+}
+
+function stableJson(value: unknown): string {
+  const sorted = (v: unknown): unknown =>
+    Array.isArray(v)
+      ? v.map(sorted)
+      : v && typeof v === "object"
+        ? Object.fromEntries(
+            Object.entries(v)
+              .filter(([, child]) => child !== undefined)
+              .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+              .map(([k, child]) => [k, sorted(child)]),
+          )
+        : v;
+  return JSON.stringify(sorted(value) ?? null);
+}
+
+const same = (a: unknown, b: unknown) => stableJson(a) === stableJson(b);
+
+const extendsList = (before: readonly unknown[], after: readonly unknown[]) =>
+  after.length >= before.length &&
+  before.every((entry, i) => same(entry, after[i]));
+
+/** `raw` without what an append has to recompute. */
+function rawIdentity(raw: Raw): Record<string, unknown> {
+  const {
+    chunk_count: _count,
+    raw_bytes: _rawBytes,
+    stored_bytes: _storedBytes,
+    content_sha256: _digest,
+    epoch: _epoch,
+    epochs: _epochs,
+    next_offset: _nextOffset,
+    chunks: _chunks,
+    ...rest
+  } = raw;
+  return rest;
+}
+
+/**
+ * What a write may not do to a backfill (spec: "Backfill"). `writer` is the
+ * exporter's `migration:{grant_id}`, or `"live"` for the raw owner. Empty when
+ * the write is allowed. A manifest stays individually valid through most of
+ * these, so only a comparison of the two revisions can refuse them.
+ */
+export function backfillWriteIssues(
+  previous: ManifestV1,
+  next: ManifestV1,
+  writer: string,
+): string[] {
+  const issues: string[] = [];
+  const before = previous.raw;
+  const after = next.raw;
+  const addedEpochs = after.epochs.slice(before.epochs.length);
+  const addedChunks = after.chunks.slice(before.chunks.length);
+  if (after.owner !== before.owner) issues.push("raw.owner changed");
+  if (!extendsList(before.epochs, after.epochs))
+    issues.push("an existing epoch changed");
+  if (!extendsList(before.chunks, after.chunks))
+    issues.push("an existing chunk changed");
+
+  if (writer === "live") {
+    if (addedEpochs.some((e) => e.reason === "backfill"))
+      issues.push("only the exporter opens a backfill epoch");
+    if (addedEpochs.some((e) => e.opened_by !== after.owner))
+      issues.push("the raw owner opens its own epochs");
+    const sealed = before.epochs.find((e) => e.reason === "backfill");
+    if (sealed && addedChunks.some((c) => c.epoch === sealed.epoch))
+      issues.push("the backfill epoch is sealed");
+    return issues;
+  }
+
+  const epoch = addedEpochs[0];
+  if (before.epochs.some((e) => e.reason === "backfill"))
+    issues.push("the session already has a backfill epoch");
+  if (
+    addedEpochs.length !== 1 ||
+    epoch?.reason !== "backfill" ||
+    epoch.opened_by !== writer ||
+    epoch.first_seq !== before.chunk_count
+  )
+    issues.push("the exporter edits only its own epoch");
+  if (
+    addedChunks.length === 0 ||
+    addedChunks.some((c) => c.epoch !== epoch?.epoch)
+  )
+    issues.push("the exporter appends chunks only to its own epoch");
+  if (!same(rawIdentity(before), rawIdentity(after)))
+    issues.push("the exporter changed client-owned raw fields");
+  for (const section of [
+    "session",
+    "writer",
+    "server",
+    "trace_id",
+    "created_at",
+  ] as const)
+    if (!same(previous[section], next[section]))
+      issues.push(`the exporter changed ${section}`);
+  const others = (m: ManifestV1) => {
+    const { [EXPORT_EXTENSION]: _own, ...rest } = m.extensions ?? {};
+    return rest;
+  };
+  if (!same(others(previous), others(next)))
+    issues.push("the exporter changed another extension");
+  return issues;
+}
+
+/** Storage for {@link commitBackfillEpoch}; `version` is opaque compare-and-swap state. */
+export interface BackfillIO<V> {
+  /** The manifest and its version, from the same response. */
+  read(): Promise<{ manifest: ManifestV1; version: V } | undefined>;
+  /** Conditional on `version`; `false` when another write landed first. */
+  write(next: ManifestV1, version: V): Promise<boolean>;
+  /** Seal chunks at their final keys, which embed `seq`, before the write. */
+  seal?(planned: ManifestV1): Promise<void>;
+}
+
+export interface BackfillCommit {
+  status: "committed" | "already_present";
+  attempts: number;
+  manifest: ManifestV1;
+}
+
+/**
+ * Append a backfill under the spec's compare-and-swap rules: every attempt
+ * reads and rebuilds, a lost race retries, and a re-export is a no-op by
+ * content. Throws `precondition_failed` for a different backfill (a human's
+ * decision, never an overwrite) and after `maxAttempts`, which is a delay: the
+ * caller re-queues the session.
+ */
+export async function commitBackfillEpoch<V>(
+  io: BackfillIO<V>,
+  backfill: BackfillEpoch,
+  options: {
+    maxAttempts?: number;
+    backoff?: (attempt: number) => Promise<void>;
+  } = {},
+): Promise<BackfillCommit> {
+  const attempts = options.maxAttempts ?? 8;
+  const backoff = options.backoff ?? jitteredBackoff;
+  const digest = await backfillDigest(backfill.chunks);
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const current = await io.read();
+    if (!current)
+      throw new ObjectStoreError(
+        "not_found",
+        "manifest",
+        "a backfill extends an existing manifest",
+      );
+    const status = await backfillStatus(current.manifest, digest);
+    if (status === "present")
+      return {
+        status: "already_present",
+        attempts: attempt,
+        manifest: current.manifest,
+      };
+    if (status === "conflict")
+      throw new ObjectStoreError(
+        "precondition_failed",
+        "manifest",
+        "the session has a backfill with different content",
+      );
+    const next = await appendBackfillEpoch(current.manifest, backfill);
+    const invalid = [
+      ...backfillWriteIssues(current.manifest, next, backfill.openedBy),
+      ...(await validateManifest(next)).map((i) => `${i.path}: ${i.message}`),
+    ];
+    if (invalid.length > 0)
+      throw new ObjectStoreError(
+        "invalid_argument",
+        "manifest",
+        invalid.join("; "),
+      );
+    await io.seal?.(next);
+    if (await io.write(next, current.version))
+      return { status: "committed", attempts: attempt, manifest: next };
+    if (attempt < attempts) await backoff(attempt);
+  }
+  throw new ObjectStoreError(
+    "precondition_failed",
+    "manifest",
+    `lost the manifest race ${attempts} times; re-queue the session`,
+  );
+}
+
+/** Full jitter: uniform in `[0, min(5 s, 100 ms * 2^(attempt-1))]`. */
+function jitteredBackoff(attempt: number): Promise<void> {
+  const ceiling = Math.min(5_000, 100 * 2 ** (attempt - 1));
+  return new Promise((done) => setTimeout(done, Math.random() * ceiling));
 }

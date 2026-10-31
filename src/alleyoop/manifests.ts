@@ -19,6 +19,7 @@ import {
   type MigrationConsumeResult,
 } from "@rhc/lib/pipeline/migration-assertions.ts";
 import {
+  backfillWriteIssues,
   buildObjectLandedMessage,
   isObjectStoreError,
   objectKey,
@@ -291,7 +292,7 @@ function manifestOwnerIssue(
         .some((epoch) => epoch.reason === "backfill")
     )
       return "live writer attempted to open a backfill epoch";
-    return undefined;
+    return backfillWriteIssues(existing, incoming, "live")[0];
   }
 
   const addedEpochs = raw.epochs.slice(existing.raw.epochs.length);
@@ -312,6 +313,8 @@ function manifestOwnerIssue(
     !exportMarker(incoming)
   )
     return "migration is not an append-only backfill epoch";
+  const issue = backfillWriteIssues(existing, incoming, migration)[0];
+  if (issue) return issue;
 
   for (const [key, value] of Object.entries(existing.extensions ?? {})) {
     if (key === "client.relayhistory_export") continue;

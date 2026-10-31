@@ -52,7 +52,7 @@ async function fixture() {
   };
   const sealed = await sealRawChunk(store, {
     location,
-    format: "jsonl",
+    format: "ndjson",
     seq: 0,
     epoch: 0,
     startOffset: 0,
@@ -82,7 +82,7 @@ async function fixture() {
       owner: MACHINE,
       state: revision > 1 ? "closed" : "open",
       updated_at: AT,
-      format: "jsonl",
+      format: "ndjson",
       compression: "zstd",
       chunk_count: 1,
       raw_bytes: sealed.entry.bytes,
@@ -229,7 +229,7 @@ async function fixture() {
     const seq = previous.raw.chunks.length;
     const sealed = await sealRawChunk(store, {
       location,
-      format: "jsonl",
+      format: "ndjson",
       seq,
       epoch,
       startOffset: 0,
@@ -243,9 +243,14 @@ async function fixture() {
       updated_at: new Date(Date.parse(previous.updated_at) + 1).toISOString(),
       raw: {
         ...structuredClone(previous.raw),
-        updated_at: new Date(
-          Date.parse(previous.raw.updated_at) + 1,
-        ).toISOString(),
+        // The exporter leaves client activity alone; the owner's write moves it.
+        ...(reason === "backfill"
+          ? {}
+          : {
+              updated_at: new Date(
+                Date.parse(previous.raw.updated_at) + 1,
+              ).toISOString(),
+            }),
         chunk_count: chunks.length,
         raw_bytes: chunks.reduce((sum, chunk) => sum + chunk.bytes, 0),
         stored_bytes: chunks.reduce(
@@ -423,6 +428,177 @@ describe("AlleyOop courier manifest routes", () => {
     expect(
       (await f.post({ key, manifest: next, previousVersion: version })).status,
     ).toBe(409);
+  });
+
+  test("refuses a migration write that moves client-owned raw fields", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const first = await f.build(1);
+    const firstBody = (await (
+      await f.post({ key, manifest: first })
+    ).json()) as { version: object };
+    const edits: ((m: ManifestV1) => void)[] = [
+      (m) =>
+        void (m.raw.updated_at = new Date(
+          Date.parse(m.raw.updated_at) + 1000,
+        ).toISOString()),
+      (m) => void (m.raw.future = "x"),
+    ];
+    for (const edit of edits) {
+      const backfill = await f.appendEpoch(
+        first,
+        "backfill",
+        "migration:mgr_export",
+        '{"pre":"t0"}',
+      );
+      backfill.extensions = {
+        ...backfill.extensions,
+        "client.relayhistory_export": {
+          version: 1,
+          source: "neon.delivery_records",
+        },
+      };
+      edit(backfill);
+      expect(
+        (
+          await f.post(
+            { key, manifest: backfill, previousVersion: firstBody.version },
+            "migration",
+          )
+        ).status,
+      ).toBe(409);
+    }
+  });
+
+  test("refuses forged and malformed epoch attribution", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const first = await f.build(1);
+    const firstBody = (await (
+      await f.post({ key, manifest: first })
+    ).json()) as { version: object };
+    const forged = await f.appendEpoch(
+      first,
+      "rewritten",
+      "migration:mgr_export",
+      '{"live":1}',
+    );
+    expect(
+      (
+        await f.post({
+          key,
+          manifest: forged,
+          previousVersion: firstBody.version,
+        })
+      ).status,
+    ).toBe(409);
+    const stranger = await f.appendEpoch(
+      first,
+      "rewritten",
+      "someone-else",
+      '{"live":2}',
+    );
+    expect(
+      (
+        await f.post({
+          key,
+          manifest: stranger,
+          previousVersion: firstBody.version,
+        })
+      ).status,
+    ).toBe(409);
+    for (const openedBy of [
+      "migration:",
+      "migration:bad id",
+      `migration:${"x".repeat(256)}`,
+    ]) {
+      const malformed = await f.appendEpoch(
+        first,
+        "backfill",
+        openedBy,
+        '{"pre":"t0"}',
+      );
+      malformed.extensions = {
+        ...malformed.extensions,
+        "client.relayhistory_export": {
+          version: 1,
+          source: "neon.delivery_records",
+        },
+      };
+      expect(
+        (
+          await f.post(
+            { key, manifest: malformed, previousVersion: firstBody.version },
+            "migration",
+          )
+        ).status,
+      ).toBe(400);
+    }
+  });
+
+  test("refuses a live write into the sealed backfill epoch, and a backfill on a jsonl stream", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const first = await f.build(1);
+    const firstBody = (await (
+      await f.post({ key, manifest: first })
+    ).json()) as { version: object };
+    const backfill = await f.appendEpoch(
+      first,
+      "backfill",
+      "migration:mgr_export",
+      '{"pre":"t0"}',
+    );
+    backfill.extensions = {
+      ...backfill.extensions,
+      "client.relayhistory_export": {
+        version: 1,
+        source: "neon.delivery_records",
+      },
+    };
+    const jsonl = structuredClone(backfill);
+    jsonl.raw.format = "jsonl";
+    expect(
+      (
+        await f.post(
+          { key, manifest: jsonl, previousVersion: firstBody.version },
+          "migration",
+        )
+      ).status,
+    ).toBe(400);
+    const appended = await f.post(
+      { key, manifest: backfill, previousVersion: firstBody.version },
+      "migration",
+    );
+    expect(appended.status).toBe(202);
+    const appendedBody = (await appended.json()) as { version: object };
+
+    // Offsets are contiguous, so only the two-revision check can refuse this.
+    const next = structuredClone(backfill);
+    next.revision += 1;
+    const tail = next.raw.chunks.at(-1)!;
+    const end = tail.start_offset + tail.bytes;
+    const extra = await sealRawChunk(f.store, {
+      location: f.location,
+      format: "ndjson",
+      seq: next.raw.chunks.length,
+      epoch: tail.epoch,
+      startOffset: end,
+      source: new TextEncoder().encode('{"after":"t0"}\n'),
+      traceId: TRACE,
+    });
+    next.raw.chunks.push(extra.entry);
+    next.raw.chunk_count += 1;
+    next.raw.raw_bytes += extra.entry.bytes;
+    next.raw.stored_bytes += extra.entry.stored_bytes;
+    next.raw.next_offset = end + extra.entry.bytes;
+    next.raw.content_sha256 = await computeContentSha256(next.raw.chunks);
+    const refused = await f.post({
+      key,
+      manifest: next,
+      previousVersion: appendedBody.version,
+    });
+    expect(refused.status).toBe(409);
   });
 
   test("creates a cold export only under the migration grant owner", async () => {

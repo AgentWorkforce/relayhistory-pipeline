@@ -1,8 +1,17 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  EXPORT_EXTENSION,
+  appendBackfillEpoch,
+  backfillDigest,
+  backfillStatus,
+  backfillWriteIssues,
   chunkKeys,
+  commitBackfillEpoch,
   computeContentSha256,
+  exportWatermarks,
+  liveEpoch,
+  liveNextOffset,
   manifestKey,
   needsTransform,
   normalizedIsCurrent,
@@ -11,6 +20,10 @@ import {
   quarantined,
   scrubbedForPointer,
   sha256HexForTest as sha256Hex,
+  validateManifest,
+  type BackfillChunk,
+  type BackfillEpoch,
+  type BackfillIO,
   type ManifestV1,
 } from "./helpers.js";
 
@@ -185,8 +198,12 @@ describe("manifest v1", () => {
     });
     m.raw.next_offset = 100;
     m.raw.content_sha256 = await computeContentSha256(m.raw.chunks);
+    m.raw.format = "ndjson";
     await expect(parseManifest(m)).resolves.toMatchObject({
-      raw: { epoch: 1, epochs: [{ reason: "initial" }, { reason: "backfill" }] },
+      raw: {
+        epoch: 1,
+        epochs: [{ reason: "initial" }, { reason: "backfill" }],
+      },
     });
   });
 
@@ -477,5 +494,447 @@ describe("manifest v1", () => {
     await expect(parseManifest("{not json")).rejects.toMatchObject({
       code: "invalid_argument",
     });
+  });
+});
+
+describe("backfill epochs", () => {
+  const EXPORTER = "migration:mgr_export";
+  const AT = "2026-10-30T00:00:00.000Z";
+  const marker = { version: 1, source: "neon.delivery_records" };
+
+  /** `next` live chunks, as the raw owner appends them. */
+  async function ownerAppends(
+    m: ManifestV1,
+    bytes: number,
+    label: string,
+  ): Promise<ManifestV1> {
+    const n = structuredClone(m);
+    const raw = n.raw;
+    if (raw.epochs.at(-1)!.reason === "backfill") {
+      const epoch = raw.epoch + 1;
+      raw.epochs.push({
+        epoch,
+        opened_at: AT,
+        reason: "resumed",
+        first_seq: raw.chunk_count,
+        opened_by: raw.owner,
+        resumes_epoch: liveEpoch(raw),
+      });
+      raw.epoch = epoch;
+    }
+    const sha = await sha256Hex(label);
+    const entry = {
+      ...(await chunk(raw.chunk_count, raw.epoch, liveNextOffset(raw), bytes)),
+      sha256: sha,
+      sha256_8: sha.slice(0, 8),
+    };
+    raw.chunks.push(entry);
+    raw.chunk_count += 1;
+    raw.raw_bytes += entry.bytes;
+    raw.stored_bytes += entry.stored_bytes;
+    raw.next_offset = entry.start_offset + entry.bytes;
+    raw.content_sha256 = await computeContentSha256(raw.chunks);
+    n.revision += 1;
+    return n;
+  }
+
+  async function ndjsonManifest(): Promise<ManifestV1> {
+    const m = await exampleManifest();
+    m.raw.format = "ndjson";
+    return m;
+  }
+
+  async function exportChunks(): Promise<BackfillChunk[]> {
+    const out: BackfillChunk[] = [];
+    for (const [i, [start, bytes]] of [
+      [0, 700],
+      [700, 300],
+    ].entries()) {
+      const {
+        seq: _seq,
+        epoch: _epoch,
+        ...c
+      } = await chunk(100 + i, 0, start!, bytes!);
+      out.push(c);
+    }
+    return out;
+  }
+
+  const backfill = async (openedBy = EXPORTER): Promise<BackfillEpoch> => ({
+    openedBy,
+    openedAt: AT,
+    chunks: await exportChunks(),
+    marker,
+  });
+
+  /** A manifest cell behind compare-and-swap, as the object store is. */
+  function cell(initial: ManifestV1) {
+    const state = { manifest: initial, version: 1, writes: 0 };
+    const io: BackfillIO<number> = {
+      read: async () => ({
+        manifest: state.manifest,
+        version: state.version,
+      }),
+      write: async (next, version) => {
+        if (version !== state.version) return false;
+        await parseManifest(next);
+        state.manifest = next;
+        state.version += 1;
+        state.writes += 1;
+        return true;
+      },
+    };
+    return { state, io };
+  }
+
+  const noWait = { backoff: async () => {} };
+
+  it("keeps the owner, the raw activity time and the live position", async () => {
+    const m = await ndjsonManifest();
+    const { state, io } = cell(m);
+    const done = await commitBackfillEpoch(io, await backfill(), noWait);
+    expect(done).toMatchObject({ status: "committed", attempts: 1 });
+    const n = await parseManifest(state.manifest);
+    expect(n.raw.owner).toBe(m.raw.owner);
+    expect(n.raw.updated_at).toBe(m.raw.updated_at);
+    expect(n.writer).toEqual(m.writer);
+    expect(n.revision).toBe(m.revision + 1);
+    expect(n.raw.epochs[1]).toMatchObject({
+      reason: "backfill",
+      opened_by: EXPORTER,
+      first_seq: 3,
+    });
+    expect(n.extensions?.[EXPORT_EXTENSION]).toEqual(marker);
+    expect(n.raw.next_offset).toBe(1000);
+    expect(liveEpoch(n.raw)).toBe(0);
+    expect(liveNextOffset(n.raw)).toBe(9437184);
+  });
+
+  it("gives the same result however live and backfill commits interleave", async () => {
+    const payload = await backfill();
+    const liveBytes = [10, 20, 30];
+    const digests = new Set<string>();
+    for (let backfillAfter = 0; backfillAfter <= 3; backfillAfter += 1) {
+      let m = await ndjsonManifest();
+      for (let i = 0; i < 3; i += 1) {
+        if (i === backfillAfter) m = await appendBackfillEpoch(m, payload);
+        m = await ownerAppends(m, liveBytes[i]!, `live-${i}`);
+        await parseManifest(m);
+      }
+      if (backfillAfter === 3) m = await appendBackfillEpoch(m, payload);
+      await parseManifest(m);
+
+      const liveChunks = m.raw.chunks.filter(
+        (c) => m.raw.epochs[c.epoch]!.reason !== "backfill",
+      );
+      expect(liveChunks.map((c) => c.bytes).slice(3)).toEqual(liveBytes);
+      expect(liveNextOffset(m.raw)).toBe(9437184 + 60);
+      expect(
+        await backfillStatus(m, await backfillDigest(payload.chunks)),
+      ).toBe("present");
+      // The live chunks contiguous across `resumed`, whatever the interleaving.
+      digests.add(
+        await computeContentSha256(liveChunks.map((c) => ({ ...c, epoch: 0 }))),
+      );
+    }
+    expect(digests.size).toBe(1);
+  });
+
+  it("current-epoch readers keep the live stream, not the backfill", async () => {
+    let m = await ndjsonManifest();
+    m = await appendBackfillEpoch(m, await backfill());
+    expect(
+      chunkKeys(m, { currentEpochOnly: true }).map((c) => c.entry.epoch),
+    ).toEqual([0, 0, 0]);
+    m = await ownerAppends(m, 10, "after");
+    expect(
+      chunkKeys(m, { currentEpochOnly: true }).map((c) => c.entry.seq),
+    ).toEqual([0, 1, 2, 5]);
+    expect(chunkKeys(m)).toHaveLength(6);
+  });
+
+  it("makes normalized output stale, because the raw digest and epoch move", async () => {
+    const m = await ndjsonManifest();
+    m.server = {
+      updated_at: AT,
+      normalized: {
+        version: 1,
+        source_content_sha256: m.raw.content_sha256,
+        source_epoch: 0,
+        built_at: AT,
+      },
+      lifecycle: "active",
+      lifecycle_at: AT,
+    };
+    expect(normalizedIsCurrent(m)).toBe(true);
+    expect(
+      normalizedIsCurrent(await appendBackfillEpoch(m, await backfill())),
+    ).toBe(false);
+  });
+
+  it("retries a lost race on the fresh copy, and seals under the new seq", async () => {
+    const { state, io } = cell(await ndjsonManifest());
+    const sealedSeqs: number[] = [];
+    let raced = 0;
+    const racing: BackfillIO<number> = {
+      ...io,
+      seal: async (planned) => {
+        sealedSeqs.push(planned.raw.chunks.at(-1)!.seq);
+        // The live client lands between this attempt's read and its write.
+        if (raced < 2) {
+          raced += 1;
+          state.manifest = await ownerAppends(
+            state.manifest,
+            10,
+            `race-${raced}`,
+          );
+          state.version += 1;
+        }
+      },
+    };
+    const done = await commitBackfillEpoch(racing, await backfill(), noWait);
+    expect(done).toMatchObject({ status: "committed", attempts: 3 });
+    expect(sealedSeqs).toEqual([4, 5, 6]);
+    const n = await parseManifest(state.manifest);
+    expect(n.raw.chunk_count).toBe(7);
+    expect(n.raw.chunks.filter((c) => c.bytes === 10)).toHaveLength(2);
+    expect(n.raw.epochs[1]!.first_seq).toBe(5);
+  });
+
+  it("gives up after the attempts run out, leaving the manifest alone", async () => {
+    const { state, io } = cell(await ndjsonManifest());
+    const before = state.manifest;
+    const backoffs: number[] = [];
+    await expect(
+      commitBackfillEpoch(
+        { ...io, write: async () => false },
+        await backfill(),
+        { backoff: async (n) => void backoffs.push(n) },
+      ),
+    ).rejects.toMatchObject({ code: "precondition_failed" });
+    expect(backoffs).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(state.manifest).toBe(before);
+  });
+
+  it("a re-export is a no-op by content, wherever the epoch landed", async () => {
+    const { state, io } = cell(await ndjsonManifest());
+    await commitBackfillEpoch(io, await backfill(), noWait);
+    state.manifest = await ownerAppends(state.manifest, 10, "later");
+    const revision = state.manifest.revision;
+    const writes = state.writes;
+    let sealed = 0;
+    const again = await commitBackfillEpoch(
+      { ...io, seal: async () => void (sealed += 1) },
+      await backfill("migration:mgr_rerun"),
+      noWait,
+    );
+    expect(again.status).toBe("already_present");
+    expect(state.writes).toBe(writes);
+    expect(state.manifest.revision).toBe(revision);
+    expect(sealed).toBe(0);
+  });
+
+  it("a different re-export stops for a human", async () => {
+    const { state, io } = cell(await ndjsonManifest());
+    await commitBackfillEpoch(io, await backfill(), noWait);
+    const before = state.manifest;
+    const changed = await backfill();
+    changed.chunks = changed.chunks.slice(0, 1);
+    await expect(
+      commitBackfillEpoch(io, changed, noWait),
+    ).rejects.toMatchObject({ code: "precondition_failed" });
+    expect(state.manifest).toBe(before);
+  });
+
+  it("survives a client truncate or rewrite, in either order", async () => {
+    const truncate = async (
+      m: ManifestV1,
+      reason: "truncated" | "rewritten",
+    ) => {
+      const n = structuredClone(m);
+      n.raw.epochs.push({
+        epoch: n.raw.epoch + 1,
+        opened_at: AT,
+        reason,
+        first_seq: n.raw.chunk_count,
+        opened_by: n.raw.owner,
+      });
+      n.raw.epoch += 1;
+      n.raw.next_offset = 0;
+      n.revision += 1;
+      return n;
+    };
+    const payload = await backfill();
+    const digest = await backfillDigest(payload.chunks);
+    for (const reason of ["truncated", "rewritten"] as const) {
+      const after = await truncate(
+        await appendBackfillEpoch(await ndjsonManifest(), payload),
+        reason,
+      );
+      await parseManifest(after);
+      expect(await backfillStatus(after, digest)).toBe("present");
+      expect(liveEpoch(after.raw)).toBe(2);
+      expect(chunkKeys(after)).toHaveLength(5);
+
+      const before = await appendBackfillEpoch(
+        await truncate(await ndjsonManifest(), reason),
+        payload,
+      );
+      await parseManifest(before);
+      expect(await backfillStatus(before, digest)).toBe("present");
+    }
+  });
+
+  it("refuses invalid ownership edits", async () => {
+    const m = await ndjsonManifest();
+    const good = await appendBackfillEpoch(m, await backfill());
+    expect(backfillWriteIssues(m, good, EXPORTER)).toEqual([]);
+
+    const edit = (f: (n: ManifestV1) => void) => {
+      const n = structuredClone(good);
+      f(n);
+      return backfillWriteIssues(m, n, EXPORTER);
+    };
+    const refusals: [string, (n: ManifestV1) => void][] = [
+      ["raw.owner", (n) => void (n.raw.owner = EXPORTER)],
+      ["client-owned", (n) => void (n.raw.state = "closed")],
+      ["client-owned", (n) => void (n.raw.updated_at = AT)],
+      ["writer", (n) => void (n.writer.delivery_instance_id = EXPORTER)],
+      ["session", (n) => void (n.session.ended_at = AT)],
+      ["existing chunk", (n) => void (n.raw.chunks[0]!.records = 99)],
+      ["existing epoch", (n) => void (n.raw.epochs[0]!.opened_by = EXPORTER)],
+      ["own epoch", (n) => void (n.raw.epochs[1]!.opened_by = "migration:x")],
+      ["extension", (n) => void (n.extensions = { other: 1 })],
+    ];
+    for (const [needle, f] of refusals)
+      expect(edit(f).join("; ")).toContain(needle);
+
+    expect(backfillWriteIssues(good, good, EXPORTER).join("; ")).toContain(
+      "already has a backfill",
+    );
+
+    // The live side: a backfill epoch is not its to open, grow or drop.
+    expect(backfillWriteIssues(m, good, "live").join("; ")).toContain(
+      "only the exporter",
+    );
+    const dropped = structuredClone(m);
+    expect(backfillWriteIssues(good, dropped, "live").join("; ")).toContain(
+      "existing epoch changed",
+    );
+    const grown = structuredClone(good);
+    const tail = grown.raw.chunks.at(-1)!;
+    grown.raw.chunks.push({ ...tail, seq: tail.seq + 1 });
+    expect(backfillWriteIssues(good, grown, "live").join("; ")).toContain(
+      "sealed",
+    );
+    expect(
+      backfillWriteIssues(good, await ownerAppends(good, 10, "next"), "live"),
+    ).toEqual([]);
+
+    await expect(
+      commitBackfillEpoch(
+        cell(m).io,
+        await backfill("dest_not_a_grant"),
+        noWait,
+      ),
+    ).rejects.toMatchObject({ code: "invalid_argument" });
+  });
+
+  it("the validator refuses malformed backfill and resumed epochs", async () => {
+    const good = await appendBackfillEpoch(
+      await ndjsonManifest(),
+      await backfill(),
+    );
+    const cases: [string, (n: ManifestV1) => void][] = [
+      [
+        "raw.epochs[1].opened_by",
+        (n) => void (n.raw.epochs[1]!.opened_by = "x"),
+      ],
+      ["raw.format", (n) => void (n.raw.format = "jsonl")],
+      [
+        "raw.epochs[0].resumes_epoch",
+        (n) => void (n.raw.epochs[0]!.resumes_epoch = 0),
+      ],
+      [
+        "raw.epochs[1].resumes_epoch",
+        (n) => void (n.raw.epochs[1]!.resumes_epoch = 0),
+      ],
+    ];
+    for (const [path, f] of cases) {
+      const n = structuredClone(good);
+      f(n);
+      expect((await validateManifest(n)).map((i) => i.path)).toContain(path);
+    }
+
+    const twice = await appendBackfillEpoch(good, await backfill());
+    expect((await validateManifest(twice)).map((i) => i.path)).toContain(
+      "raw.epochs",
+    );
+
+    const resumed = await ownerAppends(good, 10, "next");
+    const wrongTarget = structuredClone(resumed);
+    wrongTarget.raw.epochs[2]!.resumes_epoch = 1;
+    expect((await validateManifest(wrongTarget)).map((i) => i.path)).toContain(
+      "raw.epochs[2].resumes_epoch",
+    );
+    const restart = structuredClone(resumed);
+    restart.raw.chunks[5]!.start_offset = 0;
+    restart.raw.next_offset = 10;
+    restart.raw.content_sha256 = await computeContentSha256(restart.raw.chunks);
+    expect((await validateManifest(restart)).map((i) => i.path)).toContain(
+      "raw.chunks[5].start_offset",
+    );
+    const stray = structuredClone(resumed);
+    stray.raw.epochs[1]!.reason = "rewritten";
+    expect((await validateManifest(stray)).map((i) => i.path)).toContain(
+      "raw.epochs[2].reason",
+    );
+  });
+
+  it("reads and validates the export marker's watermarks", async () => {
+    const m = await ndjsonManifest();
+    expect(exportWatermarks(m)).toEqual({});
+    const path = `extensions.${EXPORT_EXTENSION}.origin_revisions`;
+    const marked = (origin_revisions: unknown) => ({
+      ...m,
+      extensions: { [EXPORT_EXTENSION]: { ...marker, origin_revisions } },
+    });
+    expect(await validateManifest(marked({}))).toEqual([]);
+    const good = marked({ "00000000000000ab": 41 });
+    expect(await validateManifest(good)).toEqual([]);
+    expect(exportWatermarks(good)).toEqual({ "00000000000000ab": 41 });
+    for (const bad of [
+      [],
+      "x",
+      { "machine:a": 1 },
+      { o: -1 },
+      { o: "41" },
+      { o: 1.5 },
+      { o: Number.MAX_SAFE_INTEGER + 1 },
+    ])
+      expect(
+        (await validateManifest(marked(bad))).map((i) => i.path),
+      ).toContain(path);
+  });
+
+  it("accepts a Rust-produced backfilled and resumed manifest", async () => {
+    // Built by relayhistory's Rust helpers, so both validators agree on the
+    // epoch rules, and the digest is a literal for the same reason as above.
+    const fixture = JSON.parse(
+      readFileSync(
+        new URL("./fixtures/rust-manifest-v1-backfill.json", import.meta.url),
+        "utf8",
+      ),
+    ) as { key: string; manifest: unknown };
+    const m = await parseManifest(fixture.manifest, fixture.key);
+    expect(m.raw.content_sha256).toBe(
+      "796a14cf979d68529e1cd3c9b2c02aa27a73d1054df5c5f035b755a86edc1ec4",
+    );
+    expect(m.raw.epochs.map((e) => e.reason)).toEqual([
+      "initial",
+      "backfill",
+      "resumed",
+    ]);
+    expect(liveNextOffset(m.raw)).toBe(160);
   });
 });
