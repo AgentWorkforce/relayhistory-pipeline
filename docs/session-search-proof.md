@@ -45,8 +45,8 @@ are relative. Check this PR's CI at its exact head for current logic gate result
 | G2b Adversarial paging | PASS | Scattered grams newest with true hits older, full pages, tenant, workspace and machine scope, equal timestamps across cursors, token boundaries, case and punctuation |
 | G3 Context | PASS | Window contains the match, focus finds the event, chronological, snippets at most 320 characters, citations, cursors do not repeat |
 | G4 Federation | PASS on a small fixture | Before and after T0, straddling session and backfilled copy once each, pagination, each pool down is named. Event ids are shared by construction; the real legacy-to-store id mapping is unproven. Pre-T0 text past 4 KB stays unsearchable without a backfill |
-| G12 Filter matrix | PASS | Nine filters alone, every pair, all together, and workspace scope, each paged and compared with an oracle. Project, agent, task ref and tags are copied at index time, so a later rename is unhandled. Filter-only listing stays in Supabase |
-| G13 Product read path | See this head | Real `requireAuth`, scope from verified claims, a hit without a live pointer dropped; 408, 500, 200 with an exception, and an interrupted stream each refused whole with no retry; one 5 s budget across windows. The token borrows the upload assertion shape, because this ingest has no read-token class. Hydration is an in-memory set, not Supabase. This is not the MCP server, Cloud or a full product e2e |
+| G12 Filter matrix | PASS, store level | Nine filters alone, every pair, all together, and workspace scope, each paged and compared with an oracle. Project, agent, task ref and tags are copied at index time, so a later rename is unhandled. Filter-only listing stays in Supabase |
+| G13 Product read path | PASS, narrow scope | Real `requireAuth`, scope from verified claims, a hit without a live pointer dropped; 408, 500, 200 with an exception, and an interrupted stream each refused whole with no retry; one 5 s budget across windows. The token borrows the upload assertion shape, because this ingest has no read-token class. Hydration is an in-memory set, not Supabase. This is not the MCP server, Cloud or a full product e2e |
 | G5 Tenant isolation | PASS | Canaries across orgs and workspaces, injection strings, context, crafted cursor, reader cannot write, missing setting fails closed. The row policy is a backstop: per #233 anyone who can set the value reads that tenant |
 | G6 Shape | **PARTIAL, gate open** | Event totals within 5%. Event sizes, session sizes, share over 4 KB and growth are assumed |
 | G7 Latency and load | RELATIVE, not a pass | See below |
@@ -85,8 +85,8 @@ helm-chart-chief's contract of 2026-10-31. Nothing here is met for T0.
 | --- | --- |
 | 1. Separate e2e for engine and full product | Engine: G0, G2, G5, G7. Product path covers courier to store only; **no product e2e through the MCP server, Cloud API or dashboard** |
 | 2. Same Supabase and Neon baseline for every comparison | **Not met.** The legacy pool is a PGlite model of one rule; #59 has the Postgres arms but on a separate red stack |
-| 3. Server-side tenant isolation | Store chokepoint and reader user tested. Real server auth to scope, and Supabase hydrate, not exercised |
-| 4. Every Cloud, desktop and MCP filter plus compound queries | **Not met.** Store has workspace, machine, since, until, source, cursor. Project, agent, kind, task ref and tag filters are missing, and compound queries are untested |
+| 3. Server-side tenant isolation | Store chokepoint, reader user, and real `requireAuth` to scope in G13. Supabase hydrate and a real read-token class are not exercised |
+| 4. Every Cloud, desktop and MCP filter plus compound queries | Partly. G12 covers nine filters, pairs and all together at store level. Cloud and desktop surfaces are not exercised, and filter-only listing stays in Supabase |
 | 5. Plain text first, embeddings optional | Met by design; embeddings are not built |
 | 6. Synthetic corpus measured to match production | PARTIAL. Two event totals only |
 | 7. Heavy tenant and quota tests | **Not met.** G9 inherited FAIL; quotas in #233 are not implemented |
@@ -170,6 +170,7 @@ real ingest next.
 
 - Anything on the target service: latency, `SharedMergeTree`, physical deletion.
 - Real transcript text. Generated words do not stress the tokenizer as real text would.
+- MCP server and Cloud integration, Supabase hydrate, a real read-token class.
 - Dashboard keyword ranking and nDCG@10 against legacy hybrid. Synthetic data has no
   relevance judgments, so nDCG needs Stage 2 or a labelled set. Hybrid is an appendix.
 - The 30-day keyword cap and four pools of today's dashboard are not reproduced.
