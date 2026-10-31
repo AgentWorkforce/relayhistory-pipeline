@@ -3,11 +3,13 @@ import {
   MIN_AGENT_PREFIX_CHARS,
   REQUIRED_SEARCH_INDEXES,
   SESSION_DIRECTORY_SEARCH_BOUNDARY,
-  agentPrefixPattern,
-  agentPrefixRange,
-  NonAsciiAgentPrefixError,
-  textPatternUpperBound,
+  AGENT_PREFIX_CANDIDATE_BUDGET,
+  AgentPrefixRequiresRpcError,
+  NonAsciiAgentFilterError,
+  SESSION_DIRECTORY_QUERIES,
+  agentExactValue,
   auditSearchIndexes,
+  directAgentPrefix,
   isUsefulAgentPrefix,
   normalizeAgentName,
   type SearchIndexCatalogRow,
@@ -111,43 +113,38 @@ describe("decision 0002 search index contract", () => {
 });
 
 describe("agent-name lookup contract", () => {
-  test("normalizes exact names and requires a useful prefix", () => {
+  test("normalizes exact names, ASCII only, and keeps the 3-character prefix minimum", () => {
     expect(normalizeAgentName("  Helm-Chart-Chief ")).toBe("helm-chart-chief");
+    expect(agentExactValue("  Helm-Chief ")).toBe("helm-chief");
+    for (const value of ["ΟΔΟΣ", "İstanbul", "Ägent", "日本語"]) {
+      expect(() => normalizeAgentName(value)).toThrow(NonAsciiAgentFilterError);
+      expect(() => agentExactValue(value)).toThrow(/p_agent_match => 'exact'/);
+    }
     expect(MIN_AGENT_PREFIX_CHARS).toBe(3);
     expect(isUsefulAgentPrefix("he")).toBe(false);
     expect(isUsefulAgentPrefix("hel")).toBe(true);
+    // A predicate never throws.
+    expect(isUsefulAgentPrefix("ΟΔΟΣ")).toBe(true);
   });
 
-  test("escapes LIKE metacharacters without changing prefix semantics", () => {
-    expect(agentPrefixPattern("Helm_100%")).toBe("helm\\_100\\%%");
-    expect(() => agentPrefixPattern("ab")).toThrow(RangeError);
-  });
-
-  test("builds finite text-pattern bounds for leakproof RLS prefix planning", () => {
-    expect(agentPrefixRange("Helm_100%")).toEqual({
-      lower: "helm_100%",
-      upper: "helm_100&",
-      pattern: "helm\\_100\\%%",
-    });
-    // The carry itself, on the shared byte-order helper.
-    expect(textPatternUpperBound(`ab${String.fromCodePoint(0x10ffff)}`)).toBe(
-      "ac",
-    );
-    expect(textPatternUpperBound(`ab${String.fromCodePoint(0xd7ff)}`)).toBe(
-      `ab${String.fromCodePoint(0xe000)}`,
-    );
-    expect(() =>
-      textPatternUpperBound(String.fromCodePoint(0x10ffff).repeat(3)),
-    ).toThrow(RangeError);
-    // The direct bounded path accepts ASCII only and points elsewhere for the rest.
-    for (const value of [
-      `ab${String.fromCodePoint(0x10ffff)}`,
-      "ÄGENT",
-      "café",
-      "日本語",
-    ]) {
-      expect(() => agentPrefixRange(value)).toThrow(NonAsciiAgentPrefixError);
+  test("agent prefix is RPC-only: the direct surface refuses every prefix and has no prefix SQL", () => {
+    for (const value of ["helm-99", "age", "ab", "", "ΟΔΟΣ", "a_b%"]) {
+      expect(() => directAgentPrefix(value)).toThrow(
+        AgentPrefixRequiresRpcError,
+      );
     }
-    expect(() => agentPrefixRange("ÄGENT")).toThrow(/search_session_directory/);
+    try {
+      directAgentPrefix("helm");
+    } catch (error) {
+      expect((error as AgentPrefixRequiresRpcError).code).toBe(
+        "agent_prefix_requires_rpc",
+      );
+      expect(String(error)).toMatch(/search_session_directory/);
+    }
+    expect(Object.keys(SESSION_DIRECTORY_QUERIES)).not.toContain("agentPrefix");
+    for (const sql of Object.values(SESSION_DIRECTORY_QUERIES)) {
+      expect(sql).not.toMatch(/\bLIKE\b|~>=~|~<~/);
+    }
+    expect(AGENT_PREFIX_CANDIDATE_BUDGET).toBe(5000);
   });
 });

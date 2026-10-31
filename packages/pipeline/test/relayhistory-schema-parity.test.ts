@@ -58,7 +58,9 @@ const runnerIndexes = (
     definition: string;
   }[]
 )
-  .map((index) => `CREATE INDEX IF NOT EXISTS ${index.name} ${index.definition};`)
+  .map(
+    (index) => `CREATE INDEX IF NOT EXISTS ${index.name} ${index.definition};`,
+  )
   .join("\n");
 const legacy = [
   { name: "legacy runner prelude", sql: LEGACY_RUNNER },
@@ -84,9 +86,7 @@ async function database(...sets: Migration[][]) {
     try {
       await db.exec(migration.sql);
     } catch (error) {
-      throw new Error(
-        `${migration.name}: ${(error as Error).message}`,
-      );
+      throw new Error(`${migration.name}: ${(error as Error).message}`);
     }
   }
   return db;
@@ -216,8 +216,7 @@ function gaps(source: Catalog, target: Catalog): string[] {
   for (const fn of source.functions)
     if (!target.functions.has(fn)) out.push(`missing function ${fn}`);
   for (const trigger of source.triggers)
-    if (!target.triggers.has(trigger))
-      out.push(`missing trigger ${trigger}`);
+    if (!target.triggers.has(trigger)) out.push(`missing trigger ${trigger}`);
   return out.sort();
 }
 

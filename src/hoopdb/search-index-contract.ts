@@ -52,83 +52,83 @@ export const SESSION_DIRECTORY_SEARCH_BOUNDARY = {
   transcriptBackend: "ClickHouse/ObsessionDB (not yet available)",
 } as const;
 
+/**
+ * A direct agent filter whose input the JavaScript normalization cannot match to the
+ * stored PostgreSQL lower(btrim(agent_name)) exactly; use the RPC instead.
+ */
+export class NonAsciiAgentFilterError extends RangeError {
+  constructor(readonly match: "exact" | "prefix") {
+    super(
+      `agent ${match === "exact" ? "name" : "prefix"} contains non-ASCII characters: ` +
+        "the direct query normalizes it in JavaScript, which can disagree with " +
+        "PostgreSQL lower() on the stored name, so it could miss rows. Use " +
+        `sessions.search_session_directory with p_agent_match => '${match}'.`,
+    );
+    this.name = "NonAsciiAgentFilterError";
+  }
+}
+
+// eslint-disable-next-line no-control-regex
+const NON_ASCII = /[^\u0000-\u007f]/;
+
+/**
+ * The JavaScript normalization of a direct agent filter (exact or prefix): trim and
+ * lowercase. It accepts ASCII only, where it equals PostgreSQL lower(btrim()) on every
+ * collation; any other input throws NonAsciiAgentFilterError rather than risk a
+ * silent false negative.
+ */
 export function normalizeAgentName(value: string): string {
+  if (NON_ASCII.test(value)) throw new NonAsciiAgentFilterError("exact");
   return value.trim().toLowerCase();
 }
 
-export function isUsefulAgentPrefix(value: string): boolean {
-  return Array.from(normalizeAgentName(value)).length >= MIN_AGENT_PREFIX_CHARS;
-}
-
-export function agentPrefixPattern(value: string): string {
+/** The `$3` of SESSION_DIRECTORY_QUERIES.agentExact: ASCII only, non-empty. */
+export function agentExactValue(value: string): string {
   const normalized = normalizeAgentName(value);
-  if (Array.from(normalized).length < MIN_AGENT_PREFIX_CHARS) {
-    throw new RangeError(
-      `agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`,
-    );
+  if (normalized === "" || normalized.length > 200) {
+    throw new RangeError("agent name must be 1 to 200 characters");
   }
-  return `${normalized.replace(/[\\%_]/g, "\\$&")}%`;
+  return normalized;
 }
 
 /**
- * The text_pattern_ops (byte-order) upper bound of every string that starts with
- * `prefix`: the last code point incremented, skipping the surrogate gap (U+D7FF goes
- * to U+E000), with trailing U+10FFFF dropped and carried into the previous code
- * point. A prefix of only U+10FFFF has no finite bound and is refused.
+ * Agent prefix search is RPC-only (helm-chart-chief ruling on #38). The tenant-bound RPC
+ * first counts the prefix's candidates, stopping after this budget + 1, and refuses a
+ * broader prefix as `agent_prefix_too_broad` (SQLSTATE 54000) instead of reading the
+ * whole tenant. It equals the page size times the row-amplification gate.
  */
-export function textPatternUpperBound(prefix: string): string {
-  const points = Array.from(prefix);
-  for (let index = points.length - 1; index >= 0; index -= 1) {
-    const point = points[index]!.codePointAt(0)!;
-    if (point >= 0x10ffff) continue;
-    const next = point + 1 === 0xd800 ? 0xe000 : point + 1;
-    return `${points.slice(0, index).join("")}${String.fromCodePoint(next)}`;
-  }
-  throw new RangeError(
-    "agent prefix has no finite text_pattern_ops upper bound",
-  );
-}
+export const AGENT_PREFIX_CANDIDATE_BUDGET =
+  AGENT_PREFIX_BENCHMARK_GATE.pageSize *
+  AGENT_PREFIX_BENCHMARK_GATE.maxIndexRowsExaminedPerResult;
 
-/** A direct prefix the bounded query cannot serve exactly; use the RPC instead. */
-export class NonAsciiAgentPrefixError extends RangeError {
+/** A direct (authenticated, PostgREST table) agent prefix: never served directly. */
+export class AgentPrefixRequiresRpcError extends RangeError {
+  readonly code = "agent_prefix_requires_rpc";
   constructor() {
     super(
-      "agent prefix contains non-ASCII characters: the direct bounded query cannot " +
-        "normalize them the way PostgreSQL lower() does, so it could miss rows. Use " +
-        "sessions.search_session_directory with p_agent_match => 'prefix'.",
+      "agent prefix search is served only by sessions.search_session_directory " +
+        "(p_agent_match => 'prefix'); the direct list surface takes exact agent names only",
     );
-    this.name = "NonAsciiAgentPrefixError";
+    this.name = "AgentPrefixRequiresRpcError";
   }
 }
 
 /**
- * Leakproof byte-order bounds for an authenticated RLS prefix query. PostgreSQL
- * cannot push the non-leakproof LIKE operator below an RLS security barrier, so
- * the text_pattern_ops range must be explicit and LIKE remains the exact recheck.
- *
- * The stored agent_name_normalized is PostgreSQL's lower(btrim(agent_name)), whose
- * non-ASCII case folding depends on the server collation, while these bounds are
- * computed here. Only ASCII input is accepted, where both agree exactly; anything
- * else is refused (NonAsciiAgentPrefixError) rather than silently missing rows.
+ * The direct list surface's answer to every agent prefix: a typed requires-RPC refusal.
+ * It runs no SQL. Exact agent filters stay direct (agentExactValue).
  */
-export function agentPrefixRange(value: string): {
-  lower: string;
-  upper: string;
-  pattern: string;
-} {
-  // eslint-disable-next-line no-control-regex
-  if (/[^\u0000-\u007f]/.test(value)) throw new NonAsciiAgentPrefixError();
-  const lower = normalizeAgentName(value);
-  if (Array.from(lower).length < MIN_AGENT_PREFIX_CHARS) {
-    throw new RangeError(
-      `agent prefix must contain at least ${MIN_AGENT_PREFIX_CHARS} characters`,
-    );
-  }
-  return {
-    lower,
-    upper: textPatternUpperBound(lower),
-    pattern: agentPrefixPattern(value),
-  };
+export function directAgentPrefix(value: string): never {
+  void value;
+  throw new AgentPrefixRequiresRpcError();
+}
+
+/**
+ * Whether `value` is long enough to send to the RPC as an agent prefix (3 or more
+ * characters after trim). A predicate: it never throws. Breadth is decided by the
+ * RPC's candidate budget, not here.
+ */
+export function isUsefulAgentPrefix(value: string): boolean {
+  return Array.from(value.trim()).length >= MIN_AGENT_PREFIX_CHARS;
 }
 
 /**
@@ -197,13 +197,6 @@ SELECT ${listColumns} FROM sessions.session_directory
    AND agent_name_normalized = $3 AND deleted_at IS NULL
  ORDER BY last_activity_at DESC, session_id DESC, harness DESC
  LIMIT $4`,
-  agentPrefix: `
-SELECT ${listColumns} FROM sessions.session_directory
- WHERE org_id = $1 AND workspace_id = $2
-   AND agent_name_normalized ~>=~ $3 AND agent_name_normalized ~<~ $4
-   AND agent_name_normalized LIKE $5 ESCAPE '\\' AND deleted_at IS NULL
- ORDER BY last_activity_at DESC, session_id DESC, harness DESC
- LIMIT $6`,
   createdRange: `
 SELECT ${listColumns} FROM sessions.session_directory
  WHERE org_id = $1 AND workspace_id = $2 AND created_at >= $3
@@ -258,7 +251,7 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     p_machine_id: "text: machine membership",
     p_since: "timestamptz: last_activity_at >= since",
     p_until:
-      "timestamptz: created_at <= until (activity interval overlaps the window)",
+      "timestamptz: last_activity_at <= until (inclusive; the legacy direct-list filter)",
     p_session_id: "text: exact session id",
     p_cursor_last_activity_at: "timestamptz",
     p_cursor_session_id: "text",
@@ -316,6 +309,8 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     "22023":
       "an invalid value: text under the meaningful-character rule, limit, state, agent match, harness, cursor, since > until, or a contradictory pair",
     "0A000": "an intentionally unsupported combination (see unsupported)",
+    "54000":
+      "agent_prefix_too_broad: more than AGENT_PREFIX_CANDIDATE_BUDGET (5000) sessions match the agent prefix; use a longer prefix or an exact agent",
     "57014": "statement_timeout (2s on the Worker role) exceeded",
   },
   /** Returned as 0A000, never as empty results. */
@@ -329,6 +324,52 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     "p_no_project with p_project_id or p_project_contains",
     "p_since later than p_until",
   ],
+} as const;
+
+/**
+ * Expand-phase replacements for RelayHistory #226's remaining direct reads
+ * (20261031001000_session_directory_reads_expand.sql). Same rules as the search RPC:
+ * SECURITY DEFINER, pinned search_path, fixed SQL, Worker role only, tenant from the
+ * signed claims (42501 otherwise). The direct grants they replace are revoked only in a
+ * later, separate contract step.
+ */
+export const SESSION_DIRECTORY_POINTERS_RPC = {
+  name: "sessions.session_directory_pointers",
+  args: {
+    p_workspace_id: "text (must be claimed)",
+    p_harness: "text",
+    p_session_id: "text",
+  },
+  /** Exactly RelayHistory #226's POINTER_COLUMNS. */
+  returns: [
+    "org_id",
+    "workspace_id",
+    "harness",
+    "session_id",
+    "machine_id",
+    "user_id",
+    "storage_provider",
+    "bucket",
+    "manifest_key",
+    "content_sha256",
+    "raw_format",
+    "revision",
+    "deleted_at",
+  ],
+  order: "machine_id",
+  maxRows: 64,
+  errors: {
+    "42501":
+      "not the Worker role, or claims missing/invalid/not covering the workspace",
+    "22023": "missing workspace, invalid harness or session id",
+  },
+} as const;
+
+export const SESSION_DIRECTORY_READINESS_RPC = {
+  name: "sessions.session_directory_readiness",
+  args: {},
+  returns: ["completed_at"],
+  errors: { "42501": "not the Worker role, or claims missing/invalid" },
 } as const;
 
 /**
@@ -562,7 +603,7 @@ function normalizedPredicate(value: string | null | undefined): string {
   const literals: string[] = [];
   let masked = "";
   const input = value ?? "";
-  for (let index = 0; index < input.length; ) {
+  for (let index = 0; index < input.length;) {
     if (input[index] !== "'") {
       masked += input[index];
       index += 1;

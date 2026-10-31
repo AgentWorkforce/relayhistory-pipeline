@@ -27,9 +27,11 @@ import {
 } from "./adapter.js";
 import { PipelineError } from "./errors.js";
 import {
+  backfillEntryFor,
   normalizeRelayId,
   planEntryFor,
   planEntrySha256,
+  planEntryV2Sha256,
 } from "./migration-assertions.js";
 import {
   CONVERGENCE_EVENT_KIND,
@@ -83,8 +85,9 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
  * checks the marker against the signed assertion and refuses it from any other
  * writer (`manifestOwnerIssue`, `migrationManifestProvenance`); the transform
  * has no assertion, so it requires what that leaves behind: the marker's signed
- * fields, the same user in `96bulls`, and a stream the grant itself opened,
- * either as raw owner of a cold export or as the opener of the backfill epoch.
+ * fields, the same user in `96bulls`, and a stream the grant itself opened:
+ * as raw owner of a cold export, as the opener of its epoch 0 when a client has
+ * since adopted that export, or as the opener of the backfill epoch.
  */
 export function relayhistoryExportProvenance(manifest: ManifestV1): {
   grantId: string;
@@ -121,9 +124,14 @@ export function relayhistoryExportProvenance(manifest: ManifestV1): {
       "export marker has no signed provenance",
     );
   const migration = `migration:${grantId}`;
+  const { epochs } = manifest.raw;
+  const adoptedExport =
+    epochs[0]?.opened_by === migration &&
+    epochs.some((epoch) => epoch.reason === "adopted");
   if (
     manifest.raw.owner !== migration &&
-    !manifest.raw.epochs.some(
+    !adoptedExport &&
+    !epochs.some(
       (epoch) => epoch.reason === "backfill" && epoch.opened_by === migration,
     )
   )
@@ -631,24 +639,30 @@ async function isPlannedEntry(
   if (orgId === undefined)
     fail("relayhistory_export_provenance", "migration work names no org");
   const provenance = relayhistoryExportProvenance(manifest);
-  const entry = await planEntryFor(
-    {
-      grant_id: provenance.grantId,
-      org_id: normalizeRelayId(orgId),
-      workspace_id: normalizeRelayId(manifest.session.workspace_id),
-      source_user_id: normalizeRelayId(provenance.sourceUserId),
-    },
-    {
-      workspaceId: manifest.session.workspace_id,
-      machineId: manifest.session.machine_id,
-      harness: manifest.session.harness,
-      sessionId: manifest.session.session_id,
-      startDate: new Date(manifest.session.started_at)
-        .toISOString()
-        .slice(0, 10),
-    },
-    manifest,
-  );
+  const tenancy = {
+    grant_id: provenance.grantId,
+    org_id: normalizeRelayId(orgId),
+    workspace_id: normalizeRelayId(manifest.session.workspace_id),
+    source_user_id: normalizeRelayId(provenance.sourceUserId),
+  };
+  const location = {
+    workspaceId: manifest.session.workspace_id,
+    machineId: manifest.session.machine_id,
+    harness: manifest.session.harness,
+    sessionId: manifest.session.session_id,
+    startDate: new Date(manifest.session.started_at).toISOString().slice(0, 10),
+  };
+  // v2 (a backfill epoch on a live manifest): the signed entry covers only
+  // the backfill epoch's chunks, and the work names the base it appended to.
+  if (migration.base_revision !== undefined) {
+    if (manifest.revision !== migration.base_revision + 1) return false;
+    const backfill = await backfillEntryFor(tenancy, location, manifest);
+    return (
+      !!backfill &&
+      (await planEntryV2Sha256(backfill)) === migration.entry_sha256
+    );
+  }
+  const entry = await planEntryFor(tenancy, location, manifest);
   return !!entry && (await planEntrySha256(entry)) === migration.entry_sha256;
 }
 

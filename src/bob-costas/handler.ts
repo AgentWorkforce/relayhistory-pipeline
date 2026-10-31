@@ -13,7 +13,17 @@
  */
 import { createHash } from "node:crypto";
 import { zstdDecompressSync } from "node:zlib";
-import { PipelineError, rawChunkKey, readAll, type ManifestReader, type ManifestV1, type ObjectStore, type RawPointer, type StageHandler } from "../shared/vendor.ts";
+import {
+  PipelineError,
+  parseSessionKey,
+  rawChunkKey,
+  readAll,
+  type ManifestReader,
+  type ManifestV1,
+  type ObjectStore,
+  type RawPointer,
+  type StageHandler,
+} from "../shared/vendor.ts";
 import type { HoopDb } from "../shared/db.ts";
 import { ctxOf } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
@@ -75,10 +85,19 @@ async function publishShortSummary(
     return;
   }
   try {
-    await directory.write({ ...key, summary: ready.summary, source: `bob-costas/${ready.model}`, generatedAt: ready.generatedAt });
+    await directory.write({
+      ...key,
+      summary: ready.summary,
+      source: `bob-costas/${ready.model}`,
+      generatedAt: ready.generatedAt,
+    });
   } catch (err) {
     if (!(err instanceof ShortSummaryRejected)) throw err;
-    log.info("short summary not projected", { stage: "summary-short", reason: err.reason, trace_id: traceId });
+    log.info("short summary not projected", {
+      stage: "summary-short",
+      reason: err.reason,
+      trace_id: traceId,
+    });
   }
 }
 
@@ -96,62 +115,139 @@ interface Outcome {
   records: number;
 }
 
-async function buildOutcome(kind: SummaryKind, m: ManifestV1, deps: BobCostasDeps): Promise<Outcome> {
+/**
+ * The session's location, including the deployment prefix the manifest lives
+ * under (`<PIPELINE_KEY_PREFIX>[/<org>]`, E3): chunks and the summary object
+ * sit beside the manifest, never at the unprefixed `v1/...` key.
+ */
+function sessionLocation(m: ManifestV1, manifestKey: string) {
+  const s = m.session;
+  const prefix = parseSessionKey(manifestKey)?.prefix;
+  return {
+    ...(prefix ? { prefix } : {}),
+    workspaceId: s.workspace_id,
+    machineId: s.machine_id,
+    harness: s.harness,
+    sessionId: s.session_id,
+    startDate: s.started_at.slice(0, 10),
+  };
+}
+
+async function buildOutcome(
+  kind: SummaryKind,
+  m: ManifestV1,
+  deps: BobCostasDeps,
+  manifestKey: string,
+): Promise<Outcome> {
   const none = { tokensIn: 0, tokensOut: 0, records: 0 };
   // Scrub quarantine: an unscrubbed session is never read.
   if (!m.raw.scrub) return { status: "quarantined", ...none };
   if (m.raw.format === "sqlite-rows") return { status: "unsupported", ...none };
   const s = m.session;
-  const loc = { workspaceId: s.workspace_id, machineId: s.machine_id, harness: s.harness, sessionId: s.session_id, startDate: s.started_at.slice(0, 10) };
+  const loc = sessionLocation(m, manifestKey);
   const lines: string[] = [];
   for (const chunk of m.raw.chunks) {
-    const key = rawChunkKey(loc, chunk.seq, chunk.start_offset, chunk.sha256_8, m.raw.format);
+    const key = rawChunkKey(
+      loc,
+      chunk.seq,
+      chunk.start_offset,
+      chunk.sha256_8,
+      m.raw.format,
+    );
     let stored: Uint8Array;
     try {
       stored = await readAll(await deps.store.get(key));
     } catch (err) {
-      if ((err as { code?: string }).code === "not_found") throw new PipelineError("chunk_missing", "a listed chunk is not in object storage", true);
+      if ((err as { code?: string }).code === "not_found")
+        throw new PipelineError(
+          "chunk_missing",
+          "a listed chunk is not in object storage",
+          true,
+        );
       throw err;
     }
-    lines.push(...zstdDecompressSync(Buffer.from(stored)).toString("utf8").split("\n"));
+    lines.push(
+      ...zstdDecompressSync(Buffer.from(stored)).toString("utf8").split("\n"),
+    );
   }
   const digest = digestRecords(s.harness, lines);
   if (digest.records === 0) return { status: "empty", ...none };
   const summary = await deps.summarizer.summarize(kind, digest);
-  return { status: "ready", summary: summary.text, model: summary.modelId, tokensIn: summary.tokensIn, tokensOut: summary.tokensOut, records: digest.records };
+  return {
+    status: "ready",
+    summary: summary.text,
+    model: summary.modelId,
+    tokensIn: summary.tokensIn,
+    tokensOut: summary.tokensOut,
+    records: digest.records,
+  };
 }
 
-export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageHandler {
+export function bobCostasHandler(
+  kind: SummaryKind,
+  deps: BobCostasDeps,
+): StageHandler {
   return async (message, recorder) => {
     const pointer = message.payload as RawPointer;
     if (!pointer || typeof pointer.manifestKey !== "string")
-      throw new PipelineError("invalid_pointer", `summary-${kind} payload is not a raw pointer`, false);
+      throw new PipelineError(
+        "invalid_pointer",
+        `summary-${kind} payload is not a raw pointer`,
+        false,
+      );
     const read = await deps.reader.read(pointer.manifestKey);
     if (!read) return { status: "skipped", reason: "manifest_missing" };
     const m = read.manifest;
     const s = m.session;
-    const pk = [message.ctx.orgId, s.workspace_id, s.harness, s.session_id, s.machine_id];
+    const pk = [
+      message.ctx.orgId,
+      s.workspace_id,
+      s.harness,
+      s.session_id,
+      s.machine_id,
+    ];
     const existing = await deps.db.query<{
-      content_sha256: string; revision: string; status: string; key_id: string | null;
-      object_key: string | null; object_sha256: string | null;
+      content_sha256: string;
+      revision: string;
+      status: string;
+      key_id: string | null;
+      object_key: string | null;
+      object_sha256: string | null;
     }>(
       `SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries
         WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
       [...pk, kind],
     );
     const row = existing.rows[0];
-    if (row && Number(row.revision) > m.revision) return { status: "skipped", reason: "stale_revision" };
+    if (row && Number(row.revision) > m.revision)
+      return { status: "skipped", reason: "stale_revision" };
     const ids = { orgId: message.ctx.orgId, workspaceId: s.workspace_id };
     // Current only if it is the same revision and content and, when ready, under the current key
-    // (after a rotation the summary is re-encrypted rather than stranded on the old key).
+    // (after a rotation the summary is re-encrypted rather than stranded on the old key) and at
+    // the object key beside this manifest (a session moved under a prefix is rebuilt there).
     const currentKeyId = (await deps.keyring.currentKey(ids)).keyId;
-    if (row && Number(row.revision) === m.revision && row.content_sha256 === m.raw.content_sha256 && (row.status !== "ready" || row.key_id === currentKeyId)) {
+    const expectedKey = summaryObjectKey(
+      sessionLocation(m, pointer.manifestKey),
+      kind,
+    );
+    if (
+      row &&
+      Number(row.revision) === m.revision &&
+      row.content_sha256 === m.raw.content_sha256 &&
+      (row.status !== "ready" ||
+        (row.key_id === currentKeyId && row.object_key === expectedKey))
+    ) {
       // The encrypted object and pointer are current, but a previous run may have
       // failed after COMMIT and before the directory write. Reconcile the directory
       // from the published object on every retry.
       if (kind === "short") {
         const directory = deps.directory ?? sqlShortSummaryDirectory(deps.db);
-        const dirKey = { orgId: message.ctx.orgId, workspaceId: s.workspace_id, harness: s.harness, sessionId: s.session_id };
+        const dirKey = {
+          orgId: message.ctx.orgId,
+          workspaceId: s.workspace_id,
+          harness: s.harness,
+          sessionId: s.session_id,
+        };
         if (row.status !== "ready") {
           await publishShortSummary(directory, dirKey, null, m.trace_id);
         } else {
@@ -165,19 +261,35 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
           const integrity = async (message: string): Promise<never> => {
             // Ids and hashes only: the object key is a path, so it is logged as its SHA-256.
             log.warn("short summary object integrity failure; dead-lettering", {
-              stage: "summary-short", error_code: "summary_object_integrity", retryable: false,
-              org_id: dirKey.orgId, workspace_id: dirKey.workspaceId, harness: dirKey.harness,
-              session_id: dirKey.sessionId, machine_id: s.machine_id, revision: m.revision, trace_id: m.trace_id,
-              key_sha256: row.object_key ? createHash("sha256").update(row.object_key).digest("hex") : undefined,
+              stage: "summary-short",
+              error_code: "summary_object_integrity",
+              retryable: false,
+              org_id: dirKey.orgId,
+              workspace_id: dirKey.workspaceId,
+              harness: dirKey.harness,
+              session_id: dirKey.sessionId,
+              machine_id: s.machine_id,
+              revision: m.revision,
+              trace_id: m.trace_id,
+              key_sha256: row.object_key
+                ? createHash("sha256").update(row.object_key).digest("hex")
+                : undefined,
             });
             await publishShortSummary(directory, dirKey, null, m.trace_id);
             throw new PipelineError("summary_object_integrity", message, false);
           };
-          if (!row.object_key || !row.object_sha256) await integrity("a ready short summary pointer has no object");
+          if (!row.object_key || !row.object_sha256)
+            await integrity("a ready short summary pointer has no object");
           let published: SummaryRecord | null;
           try {
             published = await readSummaryObject({
-              store: deps.store, keyring: deps.keyring, ids, key: row.object_key!, sha256: row.object_sha256!, kind, revision: m.revision,
+              store: deps.store,
+              keyring: deps.keyring,
+              ids,
+              key: row.object_key!,
+              sha256: row.object_sha256!,
+              kind,
+              revision: m.revision,
             });
           } catch (err) {
             // Record the original failure first, so a failing clear cannot mask it. Then
@@ -186,32 +298,54 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
             // unknown or retired key id) dead-letters instead of looping.
             const original = err instanceof PipelineError ? err : null;
             log.warn("short summary object read failed", {
-              stage: "summary-short", error_code: original?.code ?? "summary_object_read_failed",
-              retryable: original?.retryable ?? true, session_id: dirKey.sessionId, revision: m.revision, trace_id: m.trace_id,
+              stage: "summary-short",
+              error_code: original?.code ?? "summary_object_read_failed",
+              retryable: original?.retryable ?? true,
+              session_id: dirKey.sessionId,
+              revision: m.revision,
+              trace_id: m.trace_id,
             });
             try {
               await publishShortSummary(directory, dirKey, null, m.trace_id);
             } catch (clearErr) {
               log.warn("short summary clear after read failure also failed", {
                 stage: "summary-short",
-                error_code: clearErr instanceof PipelineError ? clearErr.code : "summary_directory_clear_failed",
-                session_id: dirKey.sessionId, trace_id: m.trace_id,
+                error_code:
+                  clearErr instanceof PipelineError
+                    ? clearErr.code
+                    : "summary_directory_clear_failed",
+                session_id: dirKey.sessionId,
+                trace_id: m.trace_id,
               });
             }
             throw err;
           }
-          if (published?.status !== "ready" || !published.summary || !published.model) {
-            return await integrity("the current short summary object is missing or cannot be authenticated");
+          if (
+            published?.status !== "ready" ||
+            !published.summary ||
+            !published.model
+          ) {
+            return await integrity(
+              "the current short summary object is missing or cannot be authenticated",
+            );
           }
-          await publishShortSummary(directory, dirKey,
-            { summary: published.summary, model: published.model, generatedAt: new Date(published.built_at) }, m.trace_id);
+          await publishShortSummary(
+            directory,
+            dirKey,
+            {
+              summary: published.summary,
+              model: published.model,
+              generatedAt: new Date(published.built_at),
+            },
+            m.trace_id,
+          );
         }
       }
       return { status: "skipped", reason: "summary_current" };
     }
 
-    const outcome = await buildOutcome(kind, m, deps);
-    const loc = { workspaceId: s.workspace_id, machineId: s.machine_id, harness: s.harness, sessionId: s.session_id, startDate: s.started_at.slice(0, 10) };
+    const outcome = await buildOutcome(kind, m, deps, pointer.manifestKey);
+    const loc = sessionLocation(m, pointer.manifestKey);
     const key = summaryObjectKey(loc, kind);
     const current = { revision: m.revision, manifestSha256: manifestSha256(m) };
     const record: SummaryRecord = {
@@ -219,7 +353,13 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
       kind,
       revision: m.revision,
       status: outcome.status,
-      ...(outcome.status === "ready" ? { summary: outcome.summary!, model: outcome.model!, source_content_sha256: m.raw.content_sha256 } : {}),
+      ...(outcome.status === "ready"
+        ? {
+            summary: outcome.summary!,
+            model: outcome.model!,
+            source_content_sha256: m.raw.content_sha256,
+          }
+        : {}),
       built_at: (deps.now?.() ?? new Date()).toISOString(),
       trace_id: m.trace_id,
     };
@@ -229,7 +369,10 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
     let published: { sha256: string; keyId: string } | undefined;
     try {
       await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`96bulls:summary:${key}`]);
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [`96bulls:summary:${key}`],
+      );
       // Under the lock, a newer revision may have published meanwhile: it owns the object.
       const locked = await client.query<{ revision: string }>(
         `SELECT revision FROM sessions.session_summaries
@@ -241,7 +384,14 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
         return { status: "skipped", reason: "stale_revision" };
       }
       if (outcome.status === "ready") {
-        const written = await writeSummaryObject({ store: deps.store, keyring: deps.keyring, ids, key, record, current });
+        const written = await writeSummaryObject({
+          store: deps.store,
+          keyring: deps.keyring,
+          ids,
+          key,
+          record,
+          current,
+        });
         if (written.outcome !== "written") {
           await client.query("ROLLBACK");
           return { status: "skipped", reason: "stale_revision" };
@@ -249,7 +399,14 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
         published = { sha256: written.sha256, keyId: written.keyId };
       } else {
         // Overwrite any earlier summary with a text-free record; create nothing otherwise.
-        await clearSummaryObject({ store: deps.store, keyring: deps.keyring, ids, key, record, current });
+        await clearSummaryObject({
+          store: deps.store,
+          keyring: deps.keyring,
+          ids,
+          key,
+          record,
+          current,
+        });
       }
       await client.query(
         `INSERT INTO sessions.session_summaries
@@ -261,8 +418,20 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
            trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,
            status = excluded.status, object_key = excluded.object_key, object_sha256 = excluded.object_sha256,
            key_id = excluded.key_id, tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out, generated_at = now()`,
-        [...pk, kind, ctx.session_uuid ?? null, m.trace_id, m.revision, m.raw.content_sha256, outcome.status,
-         published ? String(key) : null, published?.sha256 ?? null, published?.keyId ?? null, outcome.tokensIn, outcome.tokensOut],
+        [
+          ...pk,
+          kind,
+          ctx.session_uuid ?? null,
+          m.trace_id,
+          m.revision,
+          m.raw.content_sha256,
+          outcome.status,
+          published ? String(key) : null,
+          published?.sha256 ?? null,
+          published?.keyId ?? null,
+          outcome.tokensIn,
+          outcome.tokensOut,
+        ],
       );
       await client.query("COMMIT");
     } catch (err) {
@@ -277,16 +446,43 @@ export function bobCostasHandler(kind: SummaryKind, deps: BobCostasDeps): StageH
     // status clears a stale one.
     if (kind === "short") {
       const directory = deps.directory ?? sqlShortSummaryDirectory(deps.db);
-      const dirKey = { orgId: message.ctx.orgId, workspaceId: s.workspace_id, harness: s.harness, sessionId: s.session_id };
-      await publishShortSummary(directory, dirKey,
-        outcome.status === "ready" ? { summary: outcome.summary!, model: outcome.model!, generatedAt: new Date(record.built_at) } : null,
-        m.trace_id);
+      const dirKey = {
+        orgId: message.ctx.orgId,
+        workspaceId: s.workspace_id,
+        harness: s.harness,
+        sessionId: s.session_id,
+      };
+      await publishShortSummary(
+        directory,
+        dirKey,
+        outcome.status === "ready"
+          ? {
+              summary: outcome.summary!,
+              model: outcome.model!,
+              generatedAt: new Date(record.built_at),
+            }
+          : null,
+        m.trace_id,
+      );
     }
     // Ids, counts and statuses only: never the summary or the model's output.
-    recorder.log.info("summary written", { kind, status: outcome.status, tokens_in: outcome.tokensIn, tokens_out: outcome.tokensOut });
+    recorder.log.info("summary written", {
+      kind,
+      status: outcome.status,
+      tokens_in: outcome.tokensIn,
+      tokens_out: outcome.tokensOut,
+    });
     log.info("bob costas summary", {
-      stage: `summary-${kind}`, kind, status: outcome.status, model_id: outcome.model, tokens_in: outcome.tokensIn, tokens_out: outcome.tokensOut,
-      trace_id: m.trace_id, revision: m.revision, session_uuid: ctx.session_uuid, count: outcome.records,
+      stage: `summary-${kind}`,
+      kind,
+      status: outcome.status,
+      model_id: outcome.model,
+      tokens_in: outcome.tokensIn,
+      tokens_out: outcome.tokensOut,
+      trace_id: m.trace_id,
+      revision: m.revision,
+      session_uuid: ctx.session_uuid,
+      count: outcome.records,
     });
   };
 }

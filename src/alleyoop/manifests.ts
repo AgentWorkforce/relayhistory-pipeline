@@ -1,6 +1,11 @@
-import { Hono, type Context } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { createMiddleware } from "hono/factory";
 import {
+  backfillBaseOf,
+  isBackfillIdentity,
+  isBaseReadIdentity,
+  backfillBaseVersion,
+  migrationBackfillIssue,
   migrationGrantAllowed,
   migrationManifestProvenance,
   migrationPairAuthorized,
@@ -14,8 +19,19 @@ import {
   type MigrationConsumeResult,
 } from "@rhc/lib/pipeline/migration-assertions.ts";
 import {
+  backfillWriteIssues,
+  adoptionWriteIssues,
+  BACKFILL_ACTIVATION_STAGE,
+  backfillActivationDelay,
+  backfillActivationLimits,
+  backfillActivationWorkKey,
   buildObjectLandedMessage,
+  deleteParkedSession,
+  expireParkedSession,
   isObjectStoreError,
+  META_PARKED_AT,
+  parkedManifestKey as parkedKey,
+  writerUnderstandsBackfill,
   objectKey,
   OBJECT_LANDED_STAGE,
   orgResolverFromEnv,
@@ -38,6 +54,10 @@ import {
   type StageMessage,
 } from "../shared/vendor.ts";
 import { enrichMessage } from "../shared/enrich.ts";
+import { createHash } from "node:crypto";
+
+const sha256Hex = async (text: string) =>
+  createHash("sha256").update(text).digest("hex");
 
 /**
  * The ingest's migration ledger over HoopDb: `sessions.migration_assertion_uses`
@@ -75,6 +95,18 @@ interface ManifestRoutesDeps {
     stage: typeof OBJECT_LANDED_STAGE,
     message: StageMessage,
   ): Promise<void>;
+  /** Readers with no valid attestation. Absent means none are ready: fail closed. */
+  missingReaders?: () => Promise<string[]>;
+  /** Records this deployment's first activation once, and returns it. Absent: shut. */
+  firstClaimlessActivation?: FirstClaimlessActivation;
+  /** The audit and meter for the claimless window. Absent: the window stays shut. */
+  recordClaimless?: (use: ClaimlessUse) => Promise<void>;
+  /** Durable delayed requeue of a refused backfill. */
+  requeueBackfill?: (
+    env: Bindings,
+    message: StageMessage,
+    delaySeconds: number,
+  ) => Promise<void>;
   /**
    * Single-use ledger for RelayAuth migration assertions (relayauth#110). For
    * a migration commit it replaces `send`: the ledger row, the enriched
@@ -83,6 +115,76 @@ interface ManifestRoutesDeps {
    * `migration_ledger_unavailable`.
    */
   migrationLedger?: MigrationAssertionLedger;
+}
+
+/**
+ * Every mutating request a live token makes needs a signed machine claim, here,
+ * before any route reads a body or stores a byte. It denies by default, so a
+ * route added later is covered without knowing about this: only a route listed
+ * here can name a machine, and the claim must equal it. Migration assertions are
+ * bound to a grant and checked by their own admission. The manifest route also
+ * checks the claim against the manifest's key and writer.
+ */
+export const liveWriteMachineGate: MiddlewareHandler<AppEnv> = async (
+  c,
+  next,
+) => {
+  if (c.req.method === "GET" || c.req.method === "HEAD") return next();
+  const auth = c.get("auth") as Auth | undefined;
+  if (auth?.migration) return next();
+  const claim = auth ? machineClaim(auth) : undefined;
+  const refused = () =>
+    responseError(
+      c,
+      403,
+      "machine_claim_refused",
+      "the token is not bound to this machine",
+    );
+  if (claim === undefined) return refused();
+  if (
+    c.req.path.endsWith("/pipeline/chunks") &&
+    c.req.query("machine") !== claim
+  )
+    return refused();
+  if (c.req.path.endsWith("/pipeline/events")) {
+    const body = (await c.req.raw
+      .clone()
+      .json()
+      .catch(() => null)) as { machineId?: unknown } | null;
+    if (body?.machineId !== claim) return refused();
+  }
+  return next();
+};
+
+export type FirstClaimlessActivation = (from: string) => Promise<string>;
+
+/**
+ * One read through the claimless window. `clientVersion` is what the client
+ * says of itself: it is for the meter, and nothing may branch on it.
+ */
+export interface ClaimlessUse {
+  orgId: string;
+  caller: string;
+  clientVersion: string;
+}
+
+async function auditClaimless(
+  deps: ManifestRoutesDeps,
+  auth: Auth,
+  manifest: ManifestV1,
+  client: string | undefined,
+): Promise<boolean> {
+  if (!deps.recordClaimless) return false;
+  try {
+    await deps.recordClaimless({
+      orgId: auth.orgId,
+      caller: `${auth.tokenSubject}:${auth.userId}`,
+      clientVersion: (client ?? manifest.writer.plugin_version).slice(0, 128),
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 interface PostedManifest {
@@ -168,6 +270,131 @@ function migrationWriter(auth: Auth): string | undefined {
   return `migration:${grantId}`;
 }
 
+const MACHINE_CLAIM = "meta.machineId";
+
+/** The machine a live token is bound to, from a signed claim. */
+function machineClaim(auth: Auth): string | undefined {
+  const meta = auth.claims.meta;
+  if (!meta || typeof meta !== "object" || Array.isArray(meta))
+    return undefined;
+  const value = (meta as Record<string, unknown>).machineId;
+  return typeof value === "string" && value ? value : undefined;
+}
+
+/** The longest the legacy window may run, from activation to expiry. */
+export const CLAIMLESS_WINDOW_MAX_MS = 72 * 60 * 60 * 1000;
+
+/**
+ * The window's configured dates, if it is configured at all. Shut unless a
+ * deployment sets `MANIFEST_MACHINE_CLAIM=compat` with
+ * `MANIFEST_MACHINE_CLAIM_COMPAT_FROM` and `_UNTIL` at most 72 hours apart, so a
+ * new deployment requires the claim and unsetting any of them is the kill switch.
+ */
+export function claimlessWindowDates(
+  env: Bindings,
+): { from: string; until: string } | undefined {
+  const vars = env as Record<string, unknown>;
+  if (vars.MANIFEST_MACHINE_CLAIM !== "compat") return undefined;
+  const from = String(vars.MANIFEST_MACHINE_CLAIM_COMPAT_FROM);
+  const until = String(vars.MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL);
+  const start = Date.parse(from);
+  const end = Date.parse(until);
+  return Number.isFinite(start) &&
+    Number.isFinite(end) &&
+    end - start <= CLAIMLESS_WINDOW_MAX_MS
+    ? { from, until }
+    : undefined;
+}
+
+/**
+ * The legacy window for couriers from before the machine claim. It is read-only
+ * and version-only: no write passes through it. There is one activation for the
+ * whole database, recorded once: FROM must equal it and UNTIL stay within 72
+ * hours of it, so restated dates and new deployment labels open nothing, and if
+ * that record cannot be read the window stays shut. While it
+ * is open the system is not machine-bound. Delete this and its callers after
+ * the rollout.
+ */
+export async function claimlessWindowOpen(
+  env: Bindings,
+  firstActivation: FirstClaimlessActivation | undefined,
+  now = new Date(),
+): Promise<boolean> {
+  const dates = claimlessWindowDates(env);
+  if (!dates || !firstActivation) return false;
+  const at = now.getTime();
+  if (at < Date.parse(dates.from) || at >= Date.parse(dates.until))
+    return false;
+  try {
+    const first = Date.parse(await firstActivation(dates.from));
+    return (
+      first === Date.parse(dates.from) &&
+      Date.parse(dates.until) <= first + CLAIMLESS_WINDOW_MAX_MS
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A live write's machine binding: claim, key `m=` and writer agree. Every live
+ * write needs it, because the claimless window is read-only: an audit row does
+ * not make a claimless mutation acceptable. Migration assertions are bound to
+ * a grant instead.
+ */
+function machineClaimIssue(
+  manifest: ManifestV1,
+  auth: Auth,
+): string | undefined {
+  if (auth.tokenSubject === MIGRATION_SUBJECT) return undefined;
+  const claim = machineClaim(auth);
+  if (claim === undefined) return `${MACHINE_CLAIM} is required`;
+  return claim === manifest.session.machine_id &&
+    claim === manifest.writer.delivery_instance_id
+    ? undefined
+    : `${MACHINE_CLAIM} does not match the manifest`;
+}
+
+/** The session's writer and every reader must be ready for the new epochs. */
+async function activationIssue(
+  existing: ManifestV1,
+  incoming: ManifestV1,
+  missing: () => Promise<string[]>,
+): Promise<string | undefined> {
+  const adds = incoming.raw.epochs.slice(existing.raw.epochs.length);
+  const backfill = adds.some((epoch) => epoch.reason === "backfill");
+  const adoption = adds.some((epoch) => epoch.reason === "adopted");
+  if (!backfill && !adoption) return undefined;
+  if (!writerUnderstandsBackfill(adoption ? incoming : existing))
+    return "the session's writer is not a known release";
+  const readers = await missing();
+  return readers.length
+    ? `readers are not attested: ${readers.join(", ")}`
+    : undefined;
+}
+
+/**
+ * A live client that meets a cold export but cannot take it over yet: it is not
+ * a known release, or the gate is closed. It must not stall on 409s or touch
+ * the export, so its manifest is held beside it. Readers never see a parked
+ * manifest: nothing is enqueued, and the session stays the export until a
+ * capable client takes over and re-reads its source.
+ */
+async function mustPark(
+  existing: ManifestV1,
+  incoming: ManifestV1,
+  auth: Auth,
+  missing: () => Promise<string[]>,
+): Promise<boolean> {
+  return (
+    existing.raw.owner.startsWith("migration:") &&
+    auth.tokenSubject !== MIGRATION_SUBJECT &&
+    incoming.raw.owner === incoming.writer.delivery_instance_id &&
+    incoming.writer.delivery_instance_id === incoming.session.machine_id &&
+    (!writerUnderstandsBackfill(incoming) || (await missing()).length > 0)
+  );
+}
+
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === "object")
@@ -247,6 +474,14 @@ function manifestOwnerIssue(
   }
 
   if (
+    existing.raw.owner.startsWith("migration:") &&
+    raw.owner !== existing.raw.owner
+  )
+    return migration
+      ? "an exporter does not take over"
+      : adoptionWriteIssues(existing, incoming)[0];
+
+  if (
     incoming.trace_id !== existing.trace_id ||
     incoming.created_at !== existing.created_at ||
     !sameJson(incoming.server, existing.server) ||
@@ -282,7 +517,7 @@ function manifestOwnerIssue(
         .some((epoch) => epoch.reason === "backfill")
     )
       return "live writer attempted to open a backfill epoch";
-    return undefined;
+    return backfillWriteIssues(existing, incoming, "live")[0];
   }
 
   const addedEpochs = raw.epochs.slice(existing.raw.epochs.length);
@@ -303,6 +538,8 @@ function manifestOwnerIssue(
     !exportMarker(incoming)
   )
     return "migration is not an append-only backfill epoch";
+  const issue = backfillWriteIssues(existing, incoming, migration)[0];
+  if (issue) return issue;
 
   for (const [key, value] of Object.entries(existing.extensions ?? {})) {
     if (key === "client.relayhistory_export") continue;
@@ -328,6 +565,31 @@ function migrationReplayIssue(manifest: ManifestV1, auth: Auth): boolean {
       ? lastEpoch.opened_by
       : undefined;
   return expected !== undefined && migrationWriter(auth) !== expected;
+}
+
+/** Ids and keys only: the exporter holds the manifest and rebuilds it. */
+function activationMessage(
+  key: string,
+  manifest: ManifestV1,
+  auth: Auth,
+): StageMessage {
+  const meta = auth.claims.meta as Record<string, unknown>;
+  const grantId =
+    auth.migration?.grantId ??
+    (migrationWriter(auth) ?? "").slice("migration:".length);
+  const planDigest = auth.migration?.planDigest ?? String(meta.planDigest);
+  return {
+    v: 1,
+    stage: BACKFILL_ACTIVATION_STAGE,
+    ctx: {
+      traceId: manifest.trace_id,
+      orgId: auth.orgId,
+      workspaceId: manifest.session.workspace_id,
+    },
+    workKey: backfillActivationWorkKey(key, grantId),
+    revision: manifest.revision,
+    payload: { manifestKey: key, grantId, planDigest, attempt: 1 },
+  } as StageMessage;
 }
 
 function sessionUuid(manifest: ManifestV1): string | undefined {
@@ -423,11 +685,12 @@ async function chunksAreServerSealed(
 async function storedManifest(
   raw: RawStore,
   key: string,
+  target = key,
 ): Promise<
   { manifest: ManifestV1; version: ObjectVersion; text: string } | undefined
 > {
   try {
-    const object = await raw.store.getObject(objectKey(key));
+    const object = await raw.store.getObject(objectKey(target));
     const bytes = await readCapped(object.body, MAX_MANIFEST_BYTES);
     if (!bytes) throw new Error("manifest too large");
     const text = new TextDecoder().decode(bytes);
@@ -570,7 +833,12 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       })
     )
       return workspaceForbidden(c);
-    if (!(await migrationUploadMatches(auth, location, manifest)))
+    // v1: the whole session must be the signed entry. v2 (a backfill epoch)
+    // is checked against the stored base once it has been read (POST).
+    if (
+      !isBackfillIdentity(auth.migration!.upload) &&
+      !(await migrationUploadMatches(auth, location, manifest))
+    )
       return uploadForbidden(c);
     // 96bulls.user_id (the session's user downstream) must be the signed source user.
     if (migrationManifestProvenance(auth, manifest)) return uploadForbidden(c);
@@ -604,11 +872,12 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   const owns = async (
     c: Context<AppEnv>,
     location: NonNullable<ReturnType<typeof parseSessionKey>>,
+    scope = "rth:sync",
   ) => {
     const auth = c.get("auth") as Auth;
     const env = c.env ?? {};
-    if (!auth.scopes.includes("rth:sync"))
-      return responseError(c, 403, "forbidden", "rth:sync scope is required");
+    if (!auth.scopes.includes(scope))
+      return responseError(c, 403, "forbidden", `${scope} scope is required`);
     if (
       auth.migration &&
       !migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId] })
@@ -704,6 +973,13 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       const issue = await migrationManifestIssue(c, auth, location, manifest);
       if (issue) return issue;
     }
+    if (machineClaimIssue(manifest, auth))
+      return responseError(
+        c,
+        403,
+        "machine_claim_refused",
+        "the token is not bound to this machine and writer",
+      );
     const encoded = new TextEncoder().encode(JSON.stringify(manifest));
     const encodedText = new TextDecoder().decode(encoded);
     if (encoded.byteLength > MAX_MANIFEST_BYTES)
@@ -722,6 +998,105 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           "manifest chunks are not server-sealed",
         );
       const existing = await storedManifest(deps.raw, key);
+      // A v2 (backfill) assertion appends exactly one signed backfill epoch
+      // to exactly the signed live base; #42's owner fence below still runs.
+      // Idempotency first: when the stored object is already byte-identical
+      // to this manifest (a retry after a lost commit response, under a fresh
+      // assertion with the same base), the append is checked against the
+      // signed base only and the commit returns the original success; any
+      // other manifest is still held to the stored-base comparison.
+      if (migration && isBackfillIdentity(migration.upload)) {
+        const identicalRetry = !!existing && existing.text === encodedText;
+        if (
+          await migrationBackfillIssue(auth, location, existing, manifest, {
+            identicalRetry,
+          })
+        )
+          return uploadForbidden(c);
+        // On an identical retry the stored object is the appended one, so the
+        // stored-base comparison (the only check of the signed base.version)
+        // cannot run. Instead the historical `previousVersion` the commit was
+        // made against must be present and resolve EXACTLY to the signed
+        // base.version, before anything is consumed or written.
+        if (identicalRetry) {
+          const previous = version(body.previousVersion);
+          if (
+            !previous ||
+            backfillBaseVersion(previous) !== migration.upload.base.version
+          )
+            return responseError(
+              c,
+              409,
+              "revision_conflict",
+              "manifest version or writer does not match",
+            );
+        }
+        if (
+          !identicalRetry &&
+          (!existing ||
+            !sameVersion(existing.version, version(body.previousVersion)))
+        )
+          return responseError(
+            c,
+            409,
+            "revision_conflict",
+            "manifest version or writer does not match",
+          );
+      }
+      // No cron: a session's next write is what expires its parked manifest.
+      await expireParkedSession(
+        deps.raw.store,
+        key,
+        manifest.session.machine_id,
+        new Date(),
+      ).catch(() => false);
+      const missing = deps.missingReaders ?? (async () => ["unconfigured"]);
+      if (
+        existing &&
+        (await mustPark(
+          existing.manifest,
+          manifest,
+          c.get("auth") as Auth,
+          missing,
+        ))
+      ) {
+        const target = parkedKey(key, manifest.session.machine_id);
+        const held = await storedManifest(deps.raw, key, target);
+        if (
+          held &&
+          held.text !== encodedText &&
+          (!sameVersion(held.version, version(body.previousVersion)) ||
+            manifest.revision !== held.manifest.revision + 1)
+        )
+          return responseError(
+            c,
+            409,
+            "revision_conflict",
+            "parked manifest version does not match",
+          );
+        const parked =
+          held?.text === encodedText
+            ? held.version
+            : (
+                await deps.raw.store.put(objectKey(target), encoded, {
+                  ...(held ? { ifMatch: held.version } : { ifNoneMatch: true }),
+                  contentType: "application/json",
+                  metadata: {
+                    ...manifestMetadata(manifest, c.env ?? {}),
+                    [META_PARKED_AT]: new Date().toISOString(),
+                  },
+                })
+              ).version;
+        return c.json(
+          {
+            parked: true,
+            revision: manifest.revision,
+            scrubbed: true,
+            version: parked,
+          },
+          202,
+        );
+      }
       let storedVersion: ObjectVersion;
       if (!existing) {
         if (manifest.revision !== 1)
@@ -780,6 +1155,24 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
             "owner_conflict",
             "manifest owner or append fence does not match",
           );
+        const inactive = await activationIssue(
+          existing.manifest,
+          manifest,
+          missing,
+        );
+        if (inactive) {
+          const limits = backfillActivationLimits(
+            (c.env ?? {}) as Record<string, unknown>,
+          );
+          const delay = backfillActivationDelay(1, limits);
+          await deps.requeueBackfill?.(
+            c.env ?? {},
+            activationMessage(key, manifest, c.get("auth") as Auth),
+            delay,
+          );
+          c.header("Retry-After", String(delay));
+          return responseError(c, 409, "activation_required", inactive);
+        }
         storedVersion = await putManifestOrReplay(
           deps.raw,
           key,
@@ -793,6 +1186,16 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
             }),
         );
       }
+      // The takeover re-read the source: the parked copy has done its job.
+      if (
+        existing?.manifest.raw.owner.startsWith("migration:") &&
+        !manifest.raw.owner.startsWith("migration:")
+      )
+        await deleteParkedSession(
+          deps.raw.store,
+          key,
+          manifest.session.machine_id,
+        ).catch(() => undefined);
       const read = await deps.manifests.read(key);
       if (!read) throw new Error("manifest disappeared after write");
       // The authoritative storage read must agree with what was verified.
@@ -804,6 +1207,13 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           read.manifest,
         );
         if (issue) return issue;
+        // v2: the stored copy is the appended manifest just written.
+        if (
+          isBackfillIdentity(migration.upload) &&
+          (read.manifest.revision !== manifest.revision ||
+            read.manifest.raw.content_sha256 !== manifest.raw.content_sha256)
+        )
+          return uploadForbidden(c);
       }
       const built = buildObjectLandedMessage({
         landed: {
@@ -825,6 +1235,9 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         (built.message.payload as ObjectLandedPayload).migration = {
           key: migration.upload.key,
           entry_sha256: migration.upload.entry_sha256,
+          ...(isBackfillIdentity(migration.upload)
+            ? { base_revision: migration.upload.base.revision }
+            : {}),
         };
       }
       if (migration) {
@@ -889,7 +1302,121 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
     }
   });
 
-  /** Startup reconciliation: version only, scoped to the stored machine/writer. */
+  /**
+   * The v2 pre-mint base read (issuer spec section 4): only the base-read
+   * capability, only exactly `GET ...?key=<signed unprefixed key>`, default
+   * off (`RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ`). One storage snapshot,
+   * validated, then ONE transaction consumes the capability and appends the
+   * audit row; the 7 base fields are returned only after it commits.
+   */
+  // Exactly one trailing slash is stripped (spec section 6): both spellings
+  // reach the same handler; no other variant does.
+  const baseRead = async (c: Context<AppEnv>) => {
+    const env = c.env ?? {};
+    if (env.RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ !== "true")
+      return responseError(c, 404, "not_found", "no route");
+    const auth = c.get("auth") as Auth;
+    const migration = auth?.migration;
+    if (!migration || !isBaseReadIdentity(migration.upload))
+      return responseError(
+        c,
+        403,
+        "migration_token_class_forbidden",
+        "only a migration base-read capability may read a base",
+      );
+    const read = migration.upload;
+    const params = [...new URL(c.req.url).searchParams.keys()];
+    if (params.length !== 1 || params[0] !== "key")
+      return responseError(
+        c,
+        400,
+        "bad_request",
+        "exactly one query parameter, key, is allowed",
+      );
+    if (c.req.query("key") !== read.key) return uploadForbidden(c);
+    const ledger = deps.migrationLedger;
+    if (!ledger) return ledgerUnavailable(c);
+    if (!migrationPairAuthorized(auth)) return workspaceForbidden(c);
+    if (!migrationGrantAllowed(env, migration)) return grantForbidden(c);
+    const key = storageKey(c, read.key);
+    const location = parseSessionKey(key);
+    if (!location || location.rest !== "manifest.json")
+      return uploadForbidden(c);
+    if (!migrationSessionMatches(auth, location)) return uploadForbidden(c);
+    const owned = await owns(c, location, "rth:migration_base_read");
+    if (owned !== true) return owned;
+    let snapshot: Awaited<ReturnType<typeof storedManifest>>;
+    try {
+      snapshot = await storedManifest(deps.raw, key);
+    } catch (error) {
+      // A stored object that is not a valid manifest (bad JSON, failed
+      // validation, an unsupported schema, oversized) can never be a base:
+      // 409, not a retryable 503. Only real storage unavailability is 503.
+      if (
+        isObjectStoreError(error, "invalid_argument") ||
+        isObjectStoreError(error, "unsupported") ||
+        (error instanceof Error && error.message === "manifest too large")
+      )
+        return responseError(
+          c,
+          409,
+          "migration_base_unusable",
+          "the stored manifest is not a valid manifest",
+        );
+      return responseError(
+        c,
+        503,
+        "storage_unavailable",
+        "Object storage is temporarily unavailable",
+      );
+    }
+    if (!snapshot)
+      return responseError(c, 404, "not_found", "no live manifest at this key");
+    const session = snapshot.manifest.session;
+    if (
+      session.machine_id !== read.session.machine_id ||
+      session.harness !== read.session.harness ||
+      session.session_id !== read.session.session_id ||
+      session.started_at !== read.session.started_at
+    )
+      return uploadForbidden(c);
+    const base = backfillBaseOf(snapshot);
+    if (typeof base === "string")
+      return responseError(c, 409, "migration_base_unusable", base);
+    let outcome: MigrationConsumeResult;
+    try {
+      outcome = await ledger.consumeBaseRead(
+        {
+          jti: migration.jti,
+          nonce: migration.nonce,
+          grantId: migration.grantId,
+          planDigest: migration.planDigest,
+          planEntryDigest: read.entry_sha256,
+          orgId: auth.orgId,
+          workspaceId: location.workspaceId,
+          userId: auth.userId,
+          expiresAt: migration.expiresAt,
+        },
+        // Minimized: the key's digest, never its machine or session ids.
+        `${await sha256Hex(read.key)}@base_read@r${base.revision}`,
+      );
+    } catch {
+      return ledgerUnavailable(c);
+    }
+    if (outcome === "replayed") return replayed(c);
+    if (outcome === "grant_mismatch") return grantForbidden(c);
+    return c.json({ base }, 200);
+  };
+  routes.get("/pipeline/manifests/base", baseRead);
+  routes.get("/pipeline/manifests/base/", baseRead);
+
+  /**
+   * Startup reconciliation: version, scoped to the stored machine/writer. With
+   * `manifest=1` also the stored copy from the same read, for a compare-and-swap
+   * retry: a writer that lost a race edits this, never its own local rebuild.
+   * That form is scoped to the machine only, so a client can see that another
+   * writer owns the stream, and fence itself on the stored owner.
+   */
   routes.get("/pipeline/manifests/status", async (c) => {
     const key = storageKey(c, c.req.query("key") ?? "");
     const location = parseSessionKey(key);
@@ -906,7 +1433,20 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       // A migration assertion reads only the status of a manifest of its own
       // grant, workspace, source user and plan.
       const auth = c.get("auth") as Auth;
-      if (auth.migration) {
+      // A v2 (backfill) assertion may read its live base's version (the
+      // session, grant and tenancy are already its own; the base has no
+      // export marker yet).
+      if (auth.migration && isBackfillIdentity(auth.migration.upload)) {
+        if (
+          !migrationPairAuthorized(auth, {
+            workspaceIds: [
+              location.workspaceId,
+              stored.manifest.session.workspace_id,
+            ],
+          })
+        )
+          return workspaceForbidden(c);
+      } else if (auth.migration) {
         const issue = await migrationManifestIssue(
           c,
           auth,
@@ -915,12 +1455,64 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         );
         if (issue) return issue;
       }
+      const machine = stored.manifest.session.machine_id;
+      // The machine comes from the stored manifest and the signed claim. The
+      // query only has to agree: it proves nothing, and a token bound to
+      // another machine learns nothing here.
+      const claim = machineClaim(auth);
       if (
-        c.req.query("machine") !== stored.manifest.session.machine_id ||
+        c.req.query("machine") !== machine ||
+        (claim !== undefined && claim !== machine)
+      )
+        return c.body(null, 403);
+      // Without a claim, the legacy window gives the version alone, and only
+      // if the read is on the record: an unaudited read is refused.
+      if (claim === undefined && !auth.migration) {
+        if (
+          !(await claimlessWindowOpen(
+            c.env ?? {},
+            deps.firstClaimlessActivation,
+          ))
+        )
+          return c.body(null, 403);
+        if (
+          !(await auditClaimless(
+            deps,
+            auth,
+            stored.manifest,
+            c.req.header("X-Relay-Client"),
+          ))
+        )
+          return c.body(null, 503);
+      }
+      // A migration assertion never reads a client's parked manifest.
+      if (
+        auth.tokenSubject !== MIGRATION_SUBJECT &&
+        stored.manifest.raw.owner.startsWith("migration:") &&
+        c.req.query("manifest") !== "1"
+      ) {
+        const held = await storedManifest(
+          deps.raw,
+          key,
+          parkedKey(key, machine),
+        );
+        if (held) return c.json({ version: held.version }, 200);
+      }
+      // The full manifest needs a verified machine claim, never the query's
+      // word for it. Without one this stays the version-only, writer-scoped form.
+      const bound = c.req.query("manifest") === "1" && claim === machine;
+      if (
+        !bound &&
         c.req.query("writer") !== stored.manifest.writer.delivery_instance_id
       )
         return c.body(null, 403);
-      return c.json({ version: stored.version }, 200);
+      return c.json(
+        {
+          version: stored.version,
+          ...(bound ? { manifest: stored.manifest } : {}),
+        },
+        200,
+      );
     } catch {
       return c.body(null, 503);
     }
