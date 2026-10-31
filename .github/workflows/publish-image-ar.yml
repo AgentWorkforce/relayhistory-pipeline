@@ -1,0 +1,74 @@
+# Publishes the 96bulls services image to the conformance Artifact Registry
+# repository only. Manual dispatch. Khaliq must be the actor, the ref must be
+# main, and the confirmation phrase must match. This file does not create
+# Workload Identity, IAM, GitHub variables, or credentials, and it does not
+# edit versions.lock.json or gcpProofEligible.
+# The job fails closed until a separate approval sets:
+#   vars.GCP_WORKLOAD_IDENTITY_PROVIDER
+#   vars.GCP_AR_PUBLISHER_SERVICE_ACCOUNT
+name: publish-image-ar
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "publish 96bulls-services to artifact registry" to confirm Khaliq approved this publish'
+        required: true
+      ref_note:
+        description: 'Where the approval was given (date, call/message)'
+        required: true
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.actor == 'khaliqgant' && github.ref == 'refs/heads/main' && github.event.inputs.confirm == 'publish 96bulls-services to artifact registry' }}
+    environment: image-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: false
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: agentrelay-96bulls-soc2-2610
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_AR_PUBLISHER_SERVICE_ACCOUNT }}
+          token_format: access_token
+          create_credentials_file: 'false'
+          export_environment_variables: 'false'
+          access_token_scopes: 'https://www.googleapis.com/auth/cloud-platform'
+      - uses: docker/login-action@v3
+        with:
+          registry: us-central1-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+          ecr: 'false'
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push (amd64 + arm64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/services.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: true
+          provenance: mode=max
+          # Immutable sha tag only. No :main and no :latest.
+          tags: us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/AgentWorkforce/96BullSessions
+            org.opencontainers.image.revision=${{ github.sha }}
+            96bulls.approval=${{ github.event.inputs.ref_note }}
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/AgentWorkforce/96BullSessions
+            index:org.opencontainers.image.revision=${{ github.sha }}
+            manifest:org.opencontainers.image.source=https://github.com/AgentWorkforce/96BullSessions
+            manifest:org.opencontainers.image.revision=${{ github.sha }}
+      - name: Digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: printf '%s\n' "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
