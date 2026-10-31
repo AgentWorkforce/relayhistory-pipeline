@@ -41,6 +41,7 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
   };
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(await readFile(join(ROOT, "supabase/tests/supabase_shim.sql"), "utf8"));
+  await db.exec(await readFile(join(ROOT, "supabase/bootstrap/session_directory_search_worker.sql"), "utf8"));
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
     for (const file of (await readdir(join(ROOT, dir))).filter((f) => f.endsWith(".sql")).sort())
       await db.exec(await readFile(join(ROOT, dir, file), "utf8"));
