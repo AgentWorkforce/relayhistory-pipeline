@@ -1,0 +1,802 @@
+{
+  "shapeFidelity": "PARTIAL: sanitized aggregate anchors only, not a fresh production-derived shape artifact. Not production-scale parity; cannot close T0.",
+  "verdict": "INCOMPLETE/HOLD",
+  "runner": {
+    "cores": 2
+  },
+  "loaded": 4042620,
+  "recall": {
+    "phrase": 1,
+    "error": 1,
+    "path": 1,
+    "pr": 1,
+    "case": 1,
+    "substring": 1,
+    "cjk": 1,
+    "accent": 1,
+    "short": 1,
+    "punct": 1,
+    "tail": 1,
+    "ultra": 1,
+    "absent": 1,
+    "common": 1
+  },
+  "results": [
+    {
+      "variant": "windowed_256",
+      "clients": 8,
+      "ingest": false,
+      "pass": 1,
+      "qps": 39.7,
+      "qpsPerCore": 19.8,
+      "n": 600,
+      "p50": 185,
+      "p95": 403,
+      "p99": 487,
+      "errors": {},
+      "mbPerSearch": 5,
+      "cpuMsPerSearch": 41,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "path": 183,
+        "phrase": 192,
+        "error": 162,
+        "pr": 277,
+        "case": 328,
+        "substring": 340,
+        "cjk": 328,
+        "accent": 331,
+        "short": 497,
+        "punct": 266,
+        "tail": 324,
+        "ultra": 262,
+        "absent": 241,
+        "common": 154
+      }
+    },
+    {
+      "variant": "late_probe_256",
+      "clients": 8,
+      "ingest": false,
+      "pass": 1,
+      "qps": 26.4,
+      "qpsPerCore": 13.2,
+      "n": 401,
+      "p50": 287,
+      "p95": 489,
+      "p99": 589,
+      "errors": {},
+      "mbPerSearch": 7,
+      "cpuMsPerSearch": 63,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 352,
+        "path": 490,
+        "phrase": 507,
+        "error": 454,
+        "case": 396,
+        "substring": 356,
+        "cjk": 376,
+        "accent": 527,
+        "short": 589,
+        "punct": 427,
+        "tail": 347,
+        "ultra": 306,
+        "absent": 169,
+        "common": 504
+      }
+    },
+    {
+      "variant": "repeat_one_query",
+      "clients": 8,
+      "ingest": false,
+      "pass": 1,
+      "qps": 79.8,
+      "qpsPerCore": 39.9,
+      "n": 1204,
+      "p50": 99,
+      "p95": 131,
+      "p99": 150,
+      "errors": {},
+      "mbPerSearch": 1,
+      "cpuMsPerSearch": 20,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 131
+      }
+    },
+    {
+      "variant": "repeat_one_nocache",
+      "clients": 8,
+      "ingest": false,
+      "pass": 1,
+      "qps": 81.2,
+      "qpsPerCore": 40.6,
+      "n": 1222,
+      "p50": 98,
+      "p95": 129,
+      "p99": 168,
+      "errors": {},
+      "mbPerSearch": 1,
+      "cpuMsPerSearch": 20,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 129
+      }
+    },
+    {
+      "variant": "mix_nocache",
+      "clients": 8,
+      "ingest": false,
+      "pass": 1,
+      "qps": 39.3,
+      "qpsPerCore": 19.6,
+      "n": 593,
+      "p50": 188,
+      "p95": 419,
+      "p99": 555,
+      "errors": {},
+      "mbPerSearch": 5,
+      "cpuMsPerSearch": 41,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "path": 191,
+        "phrase": 162,
+        "pr": 284,
+        "error": 190,
+        "case": 308,
+        "substring": 302,
+        "cjk": 301,
+        "accent": 334,
+        "short": 571,
+        "punct": 320,
+        "tail": 318,
+        "ultra": 283,
+        "absent": 245,
+        "common": 147
+      }
+    },
+    {
+      "variant": "windowed_256",
+      "clients": 32,
+      "ingest": false,
+      "pass": 1,
+      "qps": 38.5,
+      "qpsPerCore": 19.3,
+      "n": 600,
+      "p50": 762,
+      "p95": 1592,
+      "p99": 1877,
+      "errors": {},
+      "mbPerSearch": 5,
+      "cpuMsPerSearch": 42,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "path": 841,
+        "error": 762,
+        "pr": 1114,
+        "phrase": 780,
+        "tail": 1265,
+        "substring": 1338,
+        "cjk": 1237,
+        "case": 1265,
+        "common": 648,
+        "ultra": 1016,
+        "punct": 1171,
+        "absent": 1016,
+        "accent": 1239,
+        "short": 1981
+      }
+    },
+    {
+      "variant": "late_probe_256",
+      "clients": 32,
+      "ingest": false,
+      "pass": 1,
+      "qps": 25.8,
+      "qpsPerCore": 12.9,
+      "n": 404,
+      "p50": 1190,
+      "p95": 1935,
+      "p99": 2124,
+      "errors": {},
+      "mbPerSearch": 6,
+      "cpuMsPerSearch": 65,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "absent": 548,
+        "ultra": 1124,
+        "punct": 1699,
+        "substring": 1603,
+        "common": 1972,
+        "phrase": 1680,
+        "error": 1714,
+        "case": 1461,
+        "tail": 1368,
+        "pr": 1499,
+        "accent": 2011,
+        "cjk": 1407,
+        "path": 1702,
+        "short": 2286
+      }
+    },
+    {
+      "variant": "repeat_one_query",
+      "clients": 32,
+      "ingest": false,
+      "pass": 1,
+      "qps": 76.3,
+      "qpsPerCore": 38.1,
+      "n": 1161,
+      "p50": 413,
+      "p95": 543,
+      "p99": 607,
+      "errors": {},
+      "mbPerSearch": 1,
+      "cpuMsPerSearch": 21,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 543
+      }
+    },
+    {
+      "variant": "repeat_one_nocache",
+      "clients": 32,
+      "ingest": false,
+      "pass": 1,
+      "qps": 76.7,
+      "qpsPerCore": 38.4,
+      "n": 1170,
+      "p50": 412,
+      "p95": 542,
+      "p99": 610,
+      "errors": {},
+      "mbPerSearch": 1,
+      "cpuMsPerSearch": 21,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 542
+      }
+    },
+    {
+      "variant": "mix_nocache",
+      "clients": 32,
+      "ingest": false,
+      "pass": 1,
+      "qps": 38.7,
+      "qpsPerCore": 19.3,
+      "n": 606,
+      "p50": 750,
+      "p95": 1641,
+      "p99": 1837,
+      "errors": {},
+      "mbPerSearch": 5,
+      "cpuMsPerSearch": 42,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "cjk": 1305,
+        "case": 1248,
+        "common": 699,
+        "substring": 1198,
+        "pr": 1182,
+        "error": 752,
+        "phrase": 799,
+        "tail": 1295,
+        "path": 707,
+        "absent": 988,
+        "punct": 1102,
+        "ultra": 1096,
+        "accent": 1251,
+        "short": 1933
+      }
+    },
+    {
+      "variant": "windowed_256",
+      "clients": 8,
+      "ingest": false,
+      "pass": 2,
+      "qps": 38.7,
+      "qpsPerCore": 19.4,
+      "n": 586,
+      "p50": 189,
+      "p95": 429,
+      "p99": 531,
+      "errors": {},
+      "mbPerSearch": 5,
+      "cpuMsPerSearch": 41,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 316,
+        "path": 210,
+        "phrase": 215,
+        "error": 216,
+        "case": 327,
+        "substring": 315,
+        "cjk": 349,
+        "accent": 364,
+        "short": 570,
+        "punct": 286,
+        "tail": 325,
+        "ultra": 259,
+        "absent": 227,
+        "common": 143
+      }
+    },
+    {
+      "variant": "late_probe_256",
+      "clients": 8,
+      "ingest": false,
+      "pass": 2,
+      "qps": 26.7,
+      "qpsPerCore": 13.4,
+      "n": 408,
+      "p50": 287,
+      "p95": 472,
+      "p99": 529,
+      "errors": {},
+      "mbPerSearch": 7,
+      "cpuMsPerSearch": 63,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 379,
+        "path": 396,
+        "error": 493,
+        "phrase": 421,
+        "case": 381,
+        "substring": 341,
+        "cjk": 333,
+        "accent": 530,
+        "short": 552,
+        "punct": 467,
+        "tail": 355,
+        "ultra": 289,
+        "absent": 131,
+        "common": 465
+      }
+    },
+    {
+      "variant": "repeat_one_query",
+      "clients": 8,
+      "ingest": false,
+      "pass": 2,
+      "qps": 79.2,
+      "qpsPerCore": 39.6,
+      "n": 1192,
+      "p50": 101,
+      "p95": 134,
+      "p99": 161,
+      "errors": {},
+      "mbPerSearch": 1,
+      "cpuMsPerSearch": 20,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 134
+      }
+    },
+    {
+      "variant": "repeat_one_nocache",
+      "clients": 8,
+      "ingest": false,
+      "pass": 2,
+      "qps": 80.4,
+      "qpsPerCore": 40.2,
+      "n": 1212,
+      "p50": 99,
+      "p95": 132,
+      "p99": 154,
+      "errors": {},
+      "mbPerSearch": 1,
+      "cpuMsPerSearch": 20,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 132
+      }
+    },
+    {
+      "variant": "mix_nocache",
+      "clients": 8,
+      "ingest": false,
+      "pass": 2,
+      "qps": 39.5,
+      "qpsPerCore": 19.7,
+      "n": 597,
+      "p50": 183,
+      "p95": 432,
+      "p99": 555,
+      "errors": {},
+      "mbPerSearch": 5,
+      "cpuMsPerSearch": 41,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "error": 160,
+        "phrase": 174,
+        "path": 174,
+        "pr": 267,
+        "case": 290,
+        "substring": 293,
+        "cjk": 305,
+        "accent": 404,
+        "short": 599,
+        "punct": 295,
+        "tail": 307,
+        "ultra": 283,
+        "absent": 257,
+        "common": 170
+      }
+    },
+    {
+      "variant": "windowed_256",
+      "clients": 32,
+      "ingest": false,
+      "pass": 2,
+      "qps": 38.1,
+      "qpsPerCore": 19.1,
+      "n": 590,
+      "p50": 786,
+      "p95": 1692,
+      "p99": 1882,
+      "errors": {},
+      "mbPerSearch": 5,
+      "cpuMsPerSearch": 42,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "common": 718,
+        "pr": 1192,
+        "case": 1378,
+        "path": 833,
+        "tail": 1442,
+        "phrase": 802,
+        "cjk": 1346,
+        "substring": 1282,
+        "error": 790,
+        "ultra": 1035,
+        "absent": 943,
+        "punct": 1179,
+        "accent": 1336,
+        "short": 1931
+      }
+    },
+    {
+      "variant": "late_probe_256",
+      "clients": 32,
+      "ingest": false,
+      "pass": 2,
+      "qps": 26.1,
+      "qpsPerCore": 13,
+      "n": 410,
+      "p50": 1182,
+      "p95": 1865,
+      "p99": 2033,
+      "errors": {},
+      "mbPerSearch": 6,
+      "cpuMsPerSearch": 64,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "ultra": 1116,
+        "absent": 574,
+        "substring": 1571,
+        "pr": 1568,
+        "punct": 1681,
+        "cjk": 1383,
+        "tail": 1439,
+        "common": 1870,
+        "phrase": 1754,
+        "error": 1712,
+        "path": 1717,
+        "accent": 1998,
+        "case": 1448,
+        "short": 2107
+      }
+    },
+    {
+      "variant": "repeat_one_query",
+      "clients": 32,
+      "ingest": false,
+      "pass": 2,
+      "qps": 76.4,
+      "qpsPerCore": 38.2,
+      "n": 1162,
+      "p50": 413,
+      "p95": 547,
+      "p99": 611,
+      "errors": {},
+      "mbPerSearch": 1,
+      "cpuMsPerSearch": 21,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 547
+      }
+    },
+    {
+      "variant": "repeat_one_nocache",
+      "clients": 32,
+      "ingest": false,
+      "pass": 2,
+      "qps": 77.8,
+      "qpsPerCore": 38.9,
+      "n": 1185,
+      "p50": 405,
+      "p95": 539,
+      "p99": 610,
+      "errors": {},
+      "mbPerSearch": 1,
+      "cpuMsPerSearch": 21,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "pr": 539
+      }
+    },
+    {
+      "variant": "mix_nocache",
+      "clients": 32,
+      "ingest": false,
+      "pass": 2,
+      "qps": 37.6,
+      "qpsPerCore": 18.8,
+      "n": 582,
+      "p50": 767,
+      "p95": 1692,
+      "p99": 1963,
+      "errors": {},
+      "mbPerSearch": 5,
+      "cpuMsPerSearch": 42,
+      "parts": 14,
+      "insertMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "freshnessMs": {
+        "n": 0,
+        "p50": 0,
+        "p95": 0,
+        "p99": 0
+      },
+      "classes": {
+        "cjk": 1315,
+        "tail": 1355,
+        "substring": 1347,
+        "pr": 1304,
+        "common": 690,
+        "error": 890,
+        "phrase": 752,
+        "case": 1247,
+        "path": 864,
+        "absent": 897,
+        "ultra": 1052,
+        "accent": 1327,
+        "punct": 1200,
+        "short": 2016
+      }
+    }
+  ]
+}

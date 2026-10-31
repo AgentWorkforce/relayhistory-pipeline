@@ -1,0 +1,2018 @@
+{
+  "shapeFidelity": "PARTIAL: sanitized aggregate anchors only, not a fresh production-derived shape artifact. Not production-scale parity; cannot close T0.",
+  "loaded": 4042620,
+  "cores": [
+    {
+      "metric": "OSMemoryTotal",
+      "value": 8317935616
+    }
+  ],
+  "runnerCores": 2,
+  "activeParts": "34",
+  "classes": [
+    {
+      "id": "phrase",
+      "cls": "phrase",
+      "query": "flaky retry loop",
+      "truthWhale": 1092,
+      "coldMs": 196,
+      "warmMs": 130,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'flaky retry loop\\') > 0 AND __text_index_text_idx_hasAllTokens_e984d24c7a8d9365576ce472a3b1673d\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 43 | Granules: 185\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_e984d24c7a8d9365576ce472a3b1673d\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 49/49\n│                  Granules: 521/521\n│                Partition\n│                  Condition: true\n│                  Parts: 49/49\n│                  Granules: 521/521\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 49/49\n│                  Granules: 191/521\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\" lo\", \" re\", \"aky\", \"etr\", \"fla\", \"ky \", \"lak\", \"loo\", \"oop\", \"ret\", \"ry \", \"try\", \"y l\", \"y r\"])\n│                  Parts: 43/49\n│                  Granules: 185/191\n│                Ranges: 43\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 11.8,
+          "qpsPerCore": 5.9,
+          "errors": {},
+          "n": 48,
+          "p50": 76.3,
+          "p95": 167.5,
+          "p99": 196.9,
+          "server": {
+            "queries": 96,
+            "read_rows": 847093,
+            "read_bytes": 55196161.760416664,
+            "peak_threads": 6,
+            "peak_memory": 15096432,
+            "parts": 23.208333333333332,
+            "marks": 109,
+            "cpu_ms": 58.369729166666666,
+            "disk_ms": 1.8225729166666667
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 13.9,
+          "qpsPerCore": 7,
+          "errors": {},
+          "n": 57,
+          "p50": 141.5,
+          "p95": 187.8,
+          "p99": 190.4,
+          "server": {
+            "queries": 114,
+            "read_rows": 847093,
+            "read_bytes": 55327025.473684214,
+            "peak_threads": 6,
+            "peak_memory": 14286211,
+            "parts": 23,
+            "marks": 109,
+            "cpu_ms": 64.24645614035087,
+            "disk_ms": 5.0658859649122805
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 12.9,
+          "qpsPerCore": 6.5,
+          "errors": {},
+          "n": 53,
+          "p50": 306.2,
+          "p95": 360.9,
+          "p99": 374,
+          "server": {
+            "queries": 106,
+            "read_rows": 847093,
+            "read_bytes": 54944508.405660376,
+            "peak_threads": 6,
+            "peak_memory": 14943914,
+            "parts": 23,
+            "marks": 109,
+            "cpu_ms": 69.78660377358491,
+            "disk_ms": 11.560037735849058
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 13.3,
+          "qpsPerCore": 6.7,
+          "errors": {},
+          "n": 57,
+          "p50": 591.7,
+          "p95": 706.6,
+          "p99": 737.2,
+          "server": {
+            "queries": 114,
+            "read_rows": 847093,
+            "read_bytes": 55022619.201754384,
+            "peak_threads": 6,
+            "peak_memory": 14435501,
+            "parts": 23,
+            "marks": 109,
+            "cpu_ms": 68.81048245614035,
+            "disk_ms": 19.34578947368421
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 12.9,
+          "qpsPerCore": 6.5,
+          "errors": {},
+          "n": 63,
+          "p50": 1199.6,
+          "p95": 1370.4,
+          "p99": 1400.9,
+          "server": {
+            "queries": 126,
+            "read_rows": 847093,
+            "read_bytes": 54311598.11111111,
+            "peak_threads": 6,
+            "peak_memory": 15033520,
+            "parts": 23,
+            "marks": 109,
+            "cpu_ms": 69.02288095238094,
+            "disk_ms": 30.571801587301586
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 13.3,
+          "qpsPerCore": 6.7,
+          "errors": {},
+          "n": 64,
+          "p50": 2287.2,
+          "p95": 2705.5,
+          "p99": 2787,
+          "server": {
+            "queries": 128,
+            "read_rows": 847093,
+            "read_bytes": 54293683.4140625,
+            "peak_threads": 6,
+            "peak_memory": 13255146,
+            "parts": 23,
+            "marks": 109,
+            "cpu_ms": 69.831484375,
+            "disk_ms": 51.7075859375
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "error",
+      "cls": "error",
+      "query": "ECONNRESET at RelayClient.flush",
+      "truthWhale": 898,
+      "coldMs": 127,
+      "warmMs": 89,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'ECONNRESET at RelayClient.flush\\') > 0 AND __text_index_text_idx_hasAllTokens_f0c1d21f4d3ad35c0e8f5c158e171764\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 27 | Granules: 174\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_f0c1d21f4d3ad35c0e8f5c158e171764\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\" at\", \" re\", \".fl\", \"at \", \"ayc\", \"cli\", \"con\", \"eco\", \"ela\", \"ent\", \"ese\", \"et \", \"flu\", \"ien\", \"lay\", \"lie\", \"lus\", \"nnr\", \"nre\", \"nt.\", \"onn\", \"rel\", \"res\", \"set\", \"t a\", \"t r\", \"t.f\", \"ush\", \"ycl\"])\n│                  Parts: 27/34\n│                  Granules: 174/182\n│                Ranges: 28\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 11.8,
+          "qpsPerCore": 5.9,
+          "errors": {},
+          "n": 48,
+          "p50": 84,
+          "p95": 91.3,
+          "p99": 99.7,
+          "server": {
+            "queries": 96,
+            "read_rows": 882348.5,
+            "read_bytes": 68818273.30208333,
+            "peak_threads": 6,
+            "peak_memory": 13357845,
+            "parts": 23,
+            "marks": 112.5,
+            "cpu_ms": 70.71315625,
+            "disk_ms": 2.0958333333333337
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 12.3,
+          "qpsPerCore": 6.2,
+          "errors": {},
+          "n": 51,
+          "p50": 159.3,
+          "p95": 201,
+          "p99": 214.1,
+          "server": {
+            "queries": 102,
+            "read_rows": 882348.5,
+            "read_bytes": 68525318.31372549,
+            "peak_threads": 6,
+            "peak_memory": 15582631,
+            "parts": 23,
+            "marks": 112.5,
+            "cpu_ms": 74.3028137254902,
+            "disk_ms": 6.108931372549019
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 11.9,
+          "qpsPerCore": 6,
+          "errors": {},
+          "n": 50,
+          "p50": 330.6,
+          "p95": 406.8,
+          "p99": 432.7,
+          "server": {
+            "queries": 100,
+            "read_rows": 882348.5,
+            "read_bytes": 68610793.16,
+            "peak_threads": 6,
+            "peak_memory": 15622509,
+            "parts": 23,
+            "marks": 112.5,
+            "cpu_ms": 77.12992,
+            "disk_ms": 14.316270000000001
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 10.6,
+          "qpsPerCore": 5.3,
+          "errors": {},
+          "n": 48,
+          "p50": 743,
+          "p95": 883.9,
+          "p99": 938.4,
+          "server": {
+            "queries": 96,
+            "read_rows": 882348.5,
+            "read_bytes": 68069258.45833333,
+            "peak_threads": 6,
+            "peak_memory": 15423889,
+            "parts": 23,
+            "marks": 112.5,
+            "cpu_ms": 82.43446875,
+            "disk_ms": 23.34971875
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 11.3,
+          "qpsPerCore": 5.7,
+          "errors": {},
+          "n": 52,
+          "p50": 1395.1,
+          "p95": 1561.6,
+          "p99": 1626.7,
+          "server": {
+            "queries": 104,
+            "read_rows": 882348.5,
+            "read_bytes": 66791439.14423077,
+            "peak_threads": 6,
+            "peak_memory": 14342793,
+            "parts": 23,
+            "marks": 112.5,
+            "cpu_ms": 81.53017307692308,
+            "disk_ms": 33.83075
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 11.2,
+          "qpsPerCore": 5.6,
+          "errors": {},
+          "n": 64,
+          "p50": 2694.7,
+          "p95": 3185.9,
+          "p99": 3364.3,
+          "server": {
+            "queries": 128,
+            "read_rows": 882348.5,
+            "read_bytes": 66659218.640625,
+            "peak_threads": 6,
+            "peak_memory": 14358167,
+            "parts": 23,
+            "marks": 112.5,
+            "cpu_ms": 82.457171875,
+            "disk_ms": 54.5539140625
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "path",
+      "cls": "file_path",
+      "query": "packages/pipeline/src/lib/pipeline/raw-chunks.ts",
+      "truthWhale": 860,
+      "coldMs": 90,
+      "warmMs": 91,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'packages/pipeline/src/lib/pipeline/raw-chunks.ts\\') > 0 AND __text_index_text_idx_hasAllTokens_385cd00371776dfdd63d9e2919f53ff9\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 29 | Granules: 177\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_385cd00371776dfdd63d9e2919f53ff9\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\"-ch\", \".ts\", \"/li\", \"/pi\", \"/ra\", \"/sr\", \"ack\", \"age\", \"aw-\", \"b/p\", \"c/l\", \"chu\", \"cka\", \"e/r\", \"e/s\", \"eli\", \"es/\", \"ges\", \"hun\", \"ib/\", \"ine\", \"ipe\", \"kag\", \"ks.\", \"lib\", \"lin\", \"ne/\", \"nks\", \"pac\", \"pel\", \"pip\", \"raw\", \"rc/\", \"s.t\", \"s/p\", \"src\", \"unk\", \"w-c\"])\n│                  Parts: 29/34\n│                  Granules: 177/182\n│                Ranges: 29\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 11.6,
+          "qpsPerCore": 5.8,
+          "errors": {},
+          "n": 47,
+          "p50": 85.7,
+          "p95": 89.7,
+          "p99": 112.5,
+          "server": {
+            "queries": 94,
+            "read_rows": 882282.5,
+            "read_bytes": 67704009.36170213,
+            "peak_threads": 6,
+            "peak_memory": 13503741,
+            "parts": 23,
+            "marks": 113.5,
+            "cpu_ms": 71.2483085106383,
+            "disk_ms": 2.255053191489362
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 12.1,
+          "qpsPerCore": 6.1,
+          "errors": {},
+          "n": 50,
+          "p50": 161,
+          "p95": 201.1,
+          "p99": 225.7,
+          "server": {
+            "queries": 100,
+            "read_rows": 882282.5,
+            "read_bytes": 67279185.45,
+            "peak_threads": 6,
+            "peak_memory": 15826024,
+            "parts": 23,
+            "marks": 113.5,
+            "cpu_ms": 75.51149000000001,
+            "disk_ms": 5.643020000000001
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 10.8,
+          "qpsPerCore": 5.4,
+          "errors": {},
+          "n": 45,
+          "p50": 368.2,
+          "p95": 446.7,
+          "p99": 456.5,
+          "server": {
+            "queries": 90,
+            "read_rows": 882282.5,
+            "read_bytes": 67382780.74444444,
+            "peak_threads": 6,
+            "peak_memory": 15917097,
+            "parts": 23,
+            "marks": 113.5,
+            "cpu_ms": 80.47958888888888,
+            "disk_ms": 14.629133333333334
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 10.8,
+          "qpsPerCore": 5.4,
+          "errors": {},
+          "n": 48,
+          "p50": 721.4,
+          "p95": 836.4,
+          "p99": 900.1,
+          "server": {
+            "queries": 96,
+            "read_rows": 882282.5,
+            "read_bytes": 67856803.32291667,
+            "peak_threads": 6,
+            "peak_memory": 15171102,
+            "parts": 23,
+            "marks": 113.5,
+            "cpu_ms": 84.60603125,
+            "disk_ms": 25.361833333333333
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 11,
+          "qpsPerCore": 5.5,
+          "errors": {},
+          "n": 49,
+          "p50": 1429.9,
+          "p95": 1672.4,
+          "p99": 1688.7,
+          "server": {
+            "queries": 98,
+            "read_rows": 882282.5,
+            "read_bytes": 65840379.62244898,
+            "peak_threads": 6,
+            "peak_memory": 14186755,
+            "parts": 23,
+            "marks": 113.5,
+            "cpu_ms": 83.29544897959184,
+            "disk_ms": 34.460051020408166
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 10.7,
+          "qpsPerCore": 5.4,
+          "errors": {},
+          "n": 64,
+          "p50": 2872.8,
+          "p95": 3334.6,
+          "p99": 3571.4,
+          "server": {
+            "queries": 128,
+            "read_rows": 882282.5,
+            "read_bytes": 65830800.96875,
+            "peak_threads": 6,
+            "peak_memory": 14180563,
+            "parts": 23,
+            "marks": 113.5,
+            "cpu_ms": 86.0984375,
+            "disk_ms": 54.83871875
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "pr",
+      "cls": "pr_number",
+      "query": "PR #4821",
+      "truthWhale": 307,
+      "coldMs": 128,
+      "warmMs": 127,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'PR #4821\\') > 0 AND __text_index_text_idx_hasAllTokens_70fcec575e0e132861867774e277ffc2\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 22 | Granules: 152\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_70fcec575e0e132861867774e277ffc2\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\" #4\", \"#48\", \"482\", \"821\", \"pr \", \"r #\"])\n│                  Parts: 22/34\n│                  Granules: 152/182\n│                Ranges: 36\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 8.1,
+          "qpsPerCore": 4.1,
+          "errors": {},
+          "n": 33,
+          "p50": 121,
+          "p95": 138,
+          "p99": 152.8,
+          "server": {
+            "queries": 66,
+            "read_rows": 1073340,
+            "read_bytes": 115631657,
+            "peak_threads": 6,
+            "peak_memory": 15025156,
+            "parts": 28.5,
+            "marks": 136.5,
+            "cpu_ms": 105.91783333333333,
+            "disk_ms": 2.9385
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 7.6,
+          "qpsPerCore": 3.8,
+          "errors": {},
+          "n": 31,
+          "p50": 254.3,
+          "p95": 353,
+          "p99": 354.2,
+          "server": {
+            "queries": 62,
+            "read_rows": 1073340,
+            "read_bytes": 115631657,
+            "peak_threads": 6,
+            "peak_memory": 14114917,
+            "parts": 28.5,
+            "marks": 136.5,
+            "cpu_ms": 116.42448387096775,
+            "disk_ms": 9.433161290322582
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 7.5,
+          "qpsPerCore": 3.8,
+          "errors": {},
+          "n": 32,
+          "p50": 520.3,
+          "p95": 601.1,
+          "p99": 602.5,
+          "server": {
+            "queries": 64,
+            "read_rows": 1073340,
+            "read_bytes": 115631657,
+            "peak_threads": 6,
+            "peak_memory": 16013893,
+            "parts": 28.5,
+            "marks": 136.5,
+            "cpu_ms": 123.37721875,
+            "disk_ms": 22.266015625
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 7.5,
+          "qpsPerCore": 3.8,
+          "errors": {},
+          "n": 33,
+          "p50": 1058.1,
+          "p95": 1254.4,
+          "p99": 1266.6,
+          "server": {
+            "queries": 66,
+            "read_rows": 1073340,
+            "read_bytes": 115631657,
+            "peak_threads": 6,
+            "peak_memory": 16023640,
+            "parts": 28.5,
+            "marks": 136.5,
+            "cpu_ms": 124.653,
+            "disk_ms": 26.331348484848483
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 7.2,
+          "qpsPerCore": 3.6,
+          "errors": {},
+          "n": 36,
+          "p50": 2121.2,
+          "p95": 2398.5,
+          "p99": 2455.9,
+          "server": {
+            "queries": 72,
+            "read_rows": 1073340,
+            "read_bytes": 115631657,
+            "peak_threads": 6,
+            "peak_memory": 16095802,
+            "parts": 28.5,
+            "marks": 136.5,
+            "cpu_ms": 127.87740277777777,
+            "disk_ms": 48.70238888888889
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 7.1,
+          "qpsPerCore": 3.6,
+          "errors": {},
+          "n": 38,
+          "p50": 4454.4,
+          "p95": 4788.5,
+          "p99": 4794.9,
+          "server": {
+            "queries": 76,
+            "read_rows": 1073340,
+            "read_bytes": 115631657,
+            "peak_threads": 6,
+            "peak_memory": 16055246,
+            "parts": 28.5,
+            "marks": 136.5,
+            "cpu_ms": 130.81956578947367,
+            "disk_ms": 74.22236842105262
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "case",
+      "cls": "case_fold",
+      "query": "camelhandlererror",
+      "truthWhale": 416,
+      "coldMs": 226,
+      "warmMs": 212,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'camelhandlererror\\') > 0 AND __text_index_text_idx_hasAllTokens_bb34ba230734321fa7cc9d4dc5426bab\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 24 | Granules: 159\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_bb34ba230734321fa7cc9d4dc5426bab\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\"ame\", \"and\", \"cam\", \"dle\", \"elh\", \"ere\", \"err\", \"han\", \"ler\", \"lha\", \"mel\", \"ndl\", \"rer\", \"ror\", \"rro\"])\n│                  Parts: 24/34\n│                  Granules: 159/182\n│                Ranges: 36\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 8.9,
+          "qpsPerCore": 4.5,
+          "errors": {},
+          "n": 36,
+          "p50": 109.9,
+          "p95": 133.3,
+          "p99": 143.7,
+          "server": {
+            "queries": 72,
+            "read_rows": 974286.5,
+            "read_bytes": 93767840,
+            "peak_threads": 6,
+            "peak_memory": 14861784,
+            "parts": 26.5,
+            "marks": 124.5,
+            "cpu_ms": 88.63970833333333,
+            "disk_ms": 2.7033194444444444
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 9.3,
+          "qpsPerCore": 4.7,
+          "errors": {},
+          "n": 38,
+          "p50": 211.9,
+          "p95": 238.3,
+          "p99": 239.3,
+          "server": {
+            "queries": 76,
+            "read_rows": 974286.5,
+            "read_bytes": 93712984.39473684,
+            "peak_threads": 6,
+            "peak_memory": 15049412,
+            "parts": 26.5,
+            "marks": 124.5,
+            "cpu_ms": 99.64385526315789,
+            "disk_ms": 6.662144736842105
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 9,
+          "qpsPerCore": 4.5,
+          "errors": {},
+          "n": 37,
+          "p50": 435.3,
+          "p95": 546.2,
+          "p99": 556.1,
+          "server": {
+            "queries": 74,
+            "read_rows": 974286.5,
+            "read_bytes": 93725560,
+            "peak_threads": 6,
+            "peak_memory": 15830286,
+            "parts": 26.5,
+            "marks": 124.5,
+            "cpu_ms": 102.51902702702702,
+            "disk_ms": 17.58805405405405
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 8.8,
+          "qpsPerCore": 4.4,
+          "errors": {},
+          "n": 39,
+          "p50": 889.4,
+          "p95": 1045.7,
+          "p99": 1067.3,
+          "server": {
+            "queries": 78,
+            "read_rows": 974286.5,
+            "read_bytes": 93767840,
+            "peak_threads": 6,
+            "peak_memory": 16286520,
+            "parts": 26.5,
+            "marks": 124.5,
+            "cpu_ms": 104.66319230769231,
+            "disk_ms": 25.118333333333332
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 8.4,
+          "qpsPerCore": 4.2,
+          "errors": {},
+          "n": 43,
+          "p50": 1908.7,
+          "p95": 2068.5,
+          "p99": 2111.9,
+          "server": {
+            "queries": 86,
+            "read_rows": 974286.5,
+            "read_bytes": 93767840,
+            "peak_threads": 6,
+            "peak_memory": 16292693,
+            "parts": 26.5,
+            "marks": 124.5,
+            "cpu_ms": 110.04058139534884,
+            "disk_ms": 41.13456976744186
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 8,
+          "qpsPerCore": 4,
+          "errors": {},
+          "n": 47,
+          "p50": 3840.4,
+          "p95": 4327.1,
+          "p99": 4361.8,
+          "server": {
+            "queries": 94,
+            "read_rows": 974286.5,
+            "read_bytes": 93767840,
+            "peak_threads": 6,
+            "peak_memory": 15927601,
+            "parts": 26.5,
+            "marks": 124.5,
+            "cpu_ms": 111.2691914893617,
+            "disk_ms": 61.22281914893617
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "substring",
+      "cls": "substring",
+      "query": "oekraa",
+      "truthWhale": 420,
+      "coldMs": 145,
+      "warmMs": 115,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'oekraa\\') > 0 AND __text_index_text_idx_hasAllTokens_ab79b8a82c3267539bd6515d4f7548a3\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 27 | Granules: 168\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_ab79b8a82c3267539bd6515d4f7548a3\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\"ekr\", \"kra\", \"oek\", \"raa\"])\n│                  Parts: 27/34\n│                  Granules: 168/182\n│                Ranges: 33\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 9,
+          "qpsPerCore": 4.5,
+          "errors": {},
+          "n": 36,
+          "p50": 109.4,
+          "p95": 114.3,
+          "p99": 157.9,
+          "server": {
+            "queries": 72,
+            "read_rows": 989577.5,
+            "read_bytes": 93410346.5,
+            "peak_threads": 6,
+            "peak_memory": 15636252,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 88.5580138888889,
+            "disk_ms": 2.33575
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 9.5,
+          "qpsPerCore": 4.8,
+          "errors": {},
+          "n": 39,
+          "p50": 209.5,
+          "p95": 243.2,
+          "p99": 260.9,
+          "server": {
+            "queries": 78,
+            "read_rows": 989577.5,
+            "read_bytes": 93410346.5,
+            "peak_threads": 6,
+            "peak_memory": 15718997,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 97.86566666666667,
+            "disk_ms": 7.037564102564103
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 9.3,
+          "qpsPerCore": 4.7,
+          "errors": {},
+          "n": 40,
+          "p50": 426.5,
+          "p95": 462.1,
+          "p99": 477.4,
+          "server": {
+            "queries": 80,
+            "read_rows": 989577.5,
+            "read_bytes": 93410346.5,
+            "peak_threads": 6,
+            "peak_memory": 15752891,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 100.62122500000001,
+            "disk_ms": 14.8705625
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 8.9,
+          "qpsPerCore": 4.5,
+          "errors": {},
+          "n": 40,
+          "p50": 860.5,
+          "p95": 1087.5,
+          "p99": 1159.2,
+          "server": {
+            "queries": 80,
+            "read_rows": 989577.5,
+            "read_bytes": 93410346.5,
+            "peak_threads": 6,
+            "peak_memory": 15631524,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 103.6650625,
+            "disk_ms": 22.801675
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 8.1,
+          "qpsPerCore": 4.1,
+          "errors": {},
+          "n": 40,
+          "p50": 1968.6,
+          "p95": 2256.6,
+          "p99": 2322.2,
+          "server": {
+            "queries": 80,
+            "read_rows": 989577.5,
+            "read_bytes": 93410346.5,
+            "peak_threads": 6,
+            "peak_memory": 16173961,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 109.3208875,
+            "disk_ms": 35.448724999999996
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 8.3,
+          "qpsPerCore": 4.2,
+          "errors": {},
+          "n": 45,
+          "p50": 3919.9,
+          "p95": 4237.7,
+          "p99": 4245.5,
+          "server": {
+            "queries": 90,
+            "read_rows": 989577.5,
+            "read_bytes": 93410346.5,
+            "peak_threads": 6,
+            "peak_memory": 16179785,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 111.26116666666667,
+            "disk_ms": 65.63133333333333
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "cjk",
+      "cls": "cjk",
+      "query": "検索テスト",
+      "truthWhale": 416,
+      "coldMs": 112,
+      "warmMs": 110,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'検索テスト\\') > 0 AND __text_index_text_idx_hasAllTokens_de92ae817b31199c8cdcfc80cce281c7\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 26 | Granules: 162\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_de92ae817b31199c8cdcfc80cce281c7\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\"テスト\", \"検索テ\", \"索テス\"])\n│                  Parts: 26/34\n│                  Granules: 162/182\n│                Ranges: 35\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 8.6,
+          "qpsPerCore": 4.3,
+          "errors": {},
+          "n": 35,
+          "p50": 112.6,
+          "p95": 143.5,
+          "p99": 143.6,
+          "server": {
+            "queries": 70,
+            "read_rows": 990799,
+            "read_bytes": 97238507,
+            "peak_threads": 6,
+            "peak_memory": 12814678,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 89.98938571428572,
+            "disk_ms": 2.585128571428571
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 8.9,
+          "qpsPerCore": 4.5,
+          "errors": {},
+          "n": 36,
+          "p50": 222.8,
+          "p95": 307.3,
+          "p99": 347.3,
+          "server": {
+            "queries": 72,
+            "read_rows": 990799,
+            "read_bytes": 97211928.33333333,
+            "peak_threads": 6,
+            "peak_memory": 15350432,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 101.18447222222223,
+            "disk_ms": 7.167916666666667
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 8.4,
+          "qpsPerCore": 4.2,
+          "errors": {},
+          "n": 36,
+          "p50": 471.9,
+          "p95": 569.6,
+          "p99": 605.1,
+          "server": {
+            "queries": 72,
+            "read_rows": 990799,
+            "read_bytes": 97207104.79166667,
+            "peak_threads": 6,
+            "peak_memory": 15876226,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 108.63881944444444,
+            "disk_ms": 19.76263888888889
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 7.9,
+          "qpsPerCore": 4,
+          "errors": {},
+          "n": 36,
+          "p50": 967.7,
+          "p95": 1276.8,
+          "p99": 1278,
+          "server": {
+            "queries": 72,
+            "read_rows": 990799,
+            "read_bytes": 97238507,
+            "peak_threads": 6,
+            "peak_memory": 15926750,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 110.32523611111111,
+            "disk_ms": 29.181319444444444
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 7.8,
+          "qpsPerCore": 3.9,
+          "errors": {},
+          "n": 41,
+          "p50": 1916.5,
+          "p95": 2190.6,
+          "p99": 2363,
+          "server": {
+            "queries": 82,
+            "read_rows": 990799,
+            "read_bytes": 97238507,
+            "peak_threads": 6,
+            "peak_memory": 15893691,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 116.2475,
+            "disk_ms": 39.827024390243906
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 8.1,
+          "qpsPerCore": 4.1,
+          "errors": {},
+          "n": 42,
+          "p50": 4002.4,
+          "p95": 4335.8,
+          "p99": 4377.9,
+          "server": {
+            "queries": 84,
+            "read_rows": 990799,
+            "read_bytes": 97238507,
+            "peak_threads": 6,
+            "peak_memory": 16013316,
+            "parts": 26.5,
+            "marks": 127,
+            "cpu_ms": 112.04034523809524,
+            "disk_ms": 65.23972619047619
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "accent",
+      "cls": "non_ascii",
+      "query": "café-übung",
+      "truthWhale": 418,
+      "coldMs": 111,
+      "warmMs": 108,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'café-übung\\') > 0 AND __text_index_text_idx_hasAllTokens_a0b75d9f9b06947d23521a79da116219\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 25 | Granules: 157\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_a0b75d9f9b06947d23521a79da116219\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\"-üb\", \"afé\", \"bun\", \"caf\", \"fé-\", \"ung\", \"é-ü\", \"übu\"])\n│                  Parts: 25/34\n│                  Granules: 157/182\n│                Ranges: 38\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 9.2,
+          "qpsPerCore": 4.6,
+          "errors": {},
+          "n": 37,
+          "p50": 106.2,
+          "p95": 134.8,
+          "p99": 157.7,
+          "server": {
+            "queries": 74,
+            "read_rows": 962146,
+            "read_bytes": 95361240.5,
+            "peak_threads": 6,
+            "peak_memory": 14562970,
+            "parts": 26.5,
+            "marks": 123,
+            "cpu_ms": 86.9315945945946,
+            "disk_ms": 2.392864864864865
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 9.9,
+          "qpsPerCore": 5,
+          "errors": {},
+          "n": 40,
+          "p50": 202.2,
+          "p95": 224.4,
+          "p99": 263.7,
+          "server": {
+            "queries": 80,
+            "read_rows": 962146,
+            "read_bytes": 95361240.5,
+            "peak_threads": 6,
+            "peak_memory": 15594904,
+            "parts": 26.5,
+            "marks": 123,
+            "cpu_ms": 93.77380000000001,
+            "disk_ms": 6.304787500000001
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 8.7,
+          "qpsPerCore": 4.4,
+          "errors": {},
+          "n": 36,
+          "p50": 454.3,
+          "p95": 536.3,
+          "p99": 549.9,
+          "server": {
+            "queries": 72,
+            "read_rows": 962146,
+            "read_bytes": 95361240.5,
+            "peak_threads": 6,
+            "peak_memory": 16198306,
+            "parts": 26.5,
+            "marks": 123,
+            "cpu_ms": 102.25740277777778,
+            "disk_ms": 16.872319444444447
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 8.7,
+          "qpsPerCore": 4.4,
+          "errors": {},
+          "n": 40,
+          "p50": 909.4,
+          "p95": 996.4,
+          "p99": 1062.8,
+          "server": {
+            "queries": 80,
+            "read_rows": 962146,
+            "read_bytes": 95361240.5,
+            "peak_threads": 6,
+            "peak_memory": 16252064,
+            "parts": 26.5,
+            "marks": 123,
+            "cpu_ms": 107.3727,
+            "disk_ms": 24.5479125
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 8.5,
+          "qpsPerCore": 4.3,
+          "errors": {},
+          "n": 47,
+          "p50": 1789.5,
+          "p95": 2091.6,
+          "p99": 2125.9,
+          "server": {
+            "queries": 94,
+            "read_rows": 962146,
+            "read_bytes": 95361240.5,
+            "peak_threads": 6,
+            "peak_memory": 15877140,
+            "parts": 26.5,
+            "marks": 123,
+            "cpu_ms": 107.87264893617021,
+            "disk_ms": 38.77011702127659
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 8.7,
+          "qpsPerCore": 4.4,
+          "errors": {},
+          "n": 54,
+          "p50": 3194.6,
+          "p95": 4164.6,
+          "p99": 4311.6,
+          "server": {
+            "queries": 108,
+            "read_rows": 962146,
+            "read_bytes": 95361240.5,
+            "peak_threads": 6,
+            "peak_memory": 16285590,
+            "parts": 26.5,
+            "marks": 123,
+            "cpu_ms": 107.00839814814815,
+            "disk_ms": 56.10817592592593
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "short",
+      "cls": "short_term",
+      "query": "q7",
+      "truthWhale": 200,
+      "coldMs": 150,
+      "warmMs": 89,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'q7\\') > 0\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 34 | Granules: 182\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Ranges: 34\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 10.8,
+          "qpsPerCore": 5.4,
+          "errors": {},
+          "n": 44,
+          "p50": 91.2,
+          "p95": 102.5,
+          "p99": 134.3,
+          "server": {
+            "queries": 44,
+            "read_rows": 1471611,
+            "read_bytes": 205162396.54545453,
+            "peak_threads": 6,
+            "peak_memory": 17102385,
+            "parts": 34,
+            "marks": 182,
+            "cpu_ms": 162.58320454545455,
+            "disk_ms": 4.187795454545455
+          },
+          "perSearch": {
+            "candidates": 0,
+            "falseCandidates": 0,
+            "rounds": 0
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 10,
+          "qpsPerCore": 5,
+          "errors": {},
+          "n": 41,
+          "p50": 191.8,
+          "p95": 278.5,
+          "p99": 288.7,
+          "server": {
+            "queries": 41,
+            "read_rows": 1471611,
+            "read_bytes": 209293121.24390244,
+            "peak_threads": 6,
+            "peak_memory": 17276736,
+            "parts": 34,
+            "marks": 182,
+            "cpu_ms": 177.2139512195122,
+            "disk_ms": 13.503682926829267
+          },
+          "perSearch": {
+            "candidates": 0,
+            "falseCandidates": 0,
+            "rounds": 0
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 10.3,
+          "qpsPerCore": 5.2,
+          "errors": {},
+          "n": 43,
+          "p50": 384.2,
+          "p95": 468.8,
+          "p99": 477.8,
+          "server": {
+            "queries": 43,
+            "read_rows": 1471611,
+            "read_bytes": 206691118.20930234,
+            "peak_threads": 6,
+            "peak_memory": 16974873,
+            "parts": 34,
+            "marks": 182,
+            "cpu_ms": 182.924,
+            "disk_ms": 26.61006976744186
+          },
+          "perSearch": {
+            "candidates": 0,
+            "falseCandidates": 0,
+            "rounds": 0
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 11.8,
+          "qpsPerCore": 5.9,
+          "errors": {},
+          "n": 52,
+          "p50": 661.8,
+          "p95": 870.3,
+          "p99": 965.7,
+          "server": {
+            "queries": 52,
+            "read_rows": 1471611,
+            "read_bytes": 172175096.92307693,
+            "peak_threads": 6,
+            "peak_memory": 17317785,
+            "parts": 34,
+            "marks": 182,
+            "cpu_ms": 159.53923076923078,
+            "disk_ms": 31.075134615384616
+          },
+          "perSearch": {
+            "candidates": 0,
+            "falseCandidates": 0,
+            "rounds": 0
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 11.3,
+          "qpsPerCore": 5.7,
+          "errors": {},
+          "n": 53,
+          "p50": 1402.2,
+          "p95": 1647.8,
+          "p99": 1676.3,
+          "server": {
+            "queries": 53,
+            "read_rows": 1471611,
+            "read_bytes": 180826147.73584905,
+            "peak_threads": 6,
+            "peak_memory": 17353360,
+            "parts": 34,
+            "marks": 182,
+            "cpu_ms": 167.087679245283,
+            "disk_ms": 57.69156603773585
+          },
+          "perSearch": {
+            "candidates": 0,
+            "falseCandidates": 0,
+            "rounds": 0
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 10.2,
+          "qpsPerCore": 5.1,
+          "errors": {},
+          "n": 64,
+          "p50": 2765.8,
+          "p95": 3742.7,
+          "p99": 3812.1,
+          "server": {
+            "queries": 64,
+            "read_rows": 1471611,
+            "read_bytes": 180963302.390625,
+            "peak_threads": 6,
+            "peak_memory": 17338132,
+            "parts": 34,
+            "marks": 182,
+            "cpu_ms": 178.3059375,
+            "disk_ms": 101.820734375
+          },
+          "perSearch": {
+            "candidates": 0,
+            "falseCandidates": 0,
+            "rounds": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "punct",
+      "cls": "punctuation",
+      "query": "100%_done",
+      "truthWhale": 201,
+      "coldMs": 233,
+      "warmMs": 172,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'100%_done\\') > 0 AND __text_index_text_idx_hasAllTokens_7d45d1dbeb62a4c207dd3e2176483ead\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 22 | Granules: 131\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_7d45d1dbeb62a4c207dd3e2176483ead\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\"%_d\", \"0%_\", \"00%\", \"100\", \"_do\", \"don\", \"one\"])\n│                  Parts: 22/34\n│                  Granules: 131/182\n│                Ranges: 50\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 7.5,
+          "qpsPerCore": 3.8,
+          "errors": {},
+          "n": 31,
+          "p50": 130,
+          "p95": 150.9,
+          "p99": 151.9,
+          "server": {
+            "queries": 62,
+            "read_rows": 1223148.5,
+            "read_bytes": 126521763,
+            "peak_threads": 6,
+            "peak_memory": 13930483,
+            "parts": 34,
+            "marks": 156.5,
+            "cpu_ms": 118.03425806451614,
+            "disk_ms": 3.77541935483871
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 7.6,
+          "qpsPerCore": 3.8,
+          "errors": {},
+          "n": 31,
+          "p50": 259.3,
+          "p95": 301.6,
+          "p99": 302.6,
+          "server": {
+            "queries": 62,
+            "read_rows": 1223148.5,
+            "read_bytes": 126521763,
+            "peak_threads": 6,
+            "peak_memory": 15973393,
+            "parts": 34,
+            "marks": 156.5,
+            "cpu_ms": 123.44295161290323,
+            "disk_ms": 9.131370967741935
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 7.3,
+          "qpsPerCore": 3.7,
+          "errors": {},
+          "n": 32,
+          "p50": 538.9,
+          "p95": 636.3,
+          "p99": 639.7,
+          "server": {
+            "queries": 64,
+            "read_rows": 1223148.5,
+            "read_bytes": 126521763,
+            "peak_threads": 6,
+            "peak_memory": 16293214,
+            "parts": 34,
+            "marks": 156.5,
+            "cpu_ms": 128.542578125,
+            "disk_ms": 20.20071875
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 7,
+          "qpsPerCore": 3.5,
+          "errors": {},
+          "n": 32,
+          "p50": 1097.8,
+          "p95": 1297.5,
+          "p99": 1321.5,
+          "server": {
+            "queries": 64,
+            "read_rows": 1223148.5,
+            "read_bytes": 126521763,
+            "peak_threads": 6,
+            "peak_memory": 16334624,
+            "parts": 34,
+            "marks": 156.5,
+            "cpu_ms": 133.865203125,
+            "disk_ms": 31.660140625
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 6.7,
+          "qpsPerCore": 3.4,
+          "errors": {},
+          "n": 34,
+          "p50": 2313.9,
+          "p95": 2669.5,
+          "p99": 2788.8,
+          "server": {
+            "queries": 68,
+            "read_rows": 1223148.5,
+            "read_bytes": 126521763,
+            "peak_threads": 6,
+            "peak_memory": 16332816,
+            "parts": 34,
+            "marks": 156.5,
+            "cpu_ms": 139.47430882352938,
+            "disk_ms": 52.93694117647059
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 6.7,
+          "qpsPerCore": 3.4,
+          "errors": {},
+          "n": 36,
+          "p50": 4867.4,
+          "p95": 5034.4,
+          "p99": 5078,
+          "server": {
+            "queries": 72,
+            "read_rows": 1223148.5,
+            "read_bytes": 126521763,
+            "peak_threads": 6,
+            "peak_memory": 16346912,
+            "parts": 34,
+            "marks": 156.5,
+            "cpu_ms": 134.70884722222223,
+            "disk_ms": 88.16259722222222
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "tail",
+      "cls": "beyond_4kb",
+      "query": "tailbeacon",
+      "truthWhale": 423,
+      "coldMs": 101,
+      "warmMs": 97,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'tailbeacon\\') > 0 AND __text_index_text_idx_hasAllTokens_b814b0c73fd12c4897844e65892758ae\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 24 | Granules: 158\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_b814b0c73fd12c4897844e65892758ae\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\"aco\", \"ail\", \"bea\", \"con\", \"eac\", \"ilb\", \"lbe\", \"tai\"])\n│                  Parts: 24/34\n│                  Granules: 158/182\n│                Ranges: 36\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 10.1,
+          "qpsPerCore": 5.1,
+          "errors": {},
+          "n": 41,
+          "p50": 97.8,
+          "p95": 104.4,
+          "p99": 133.5,
+          "server": {
+            "queries": 82,
+            "read_rows": 970924,
+            "read_bytes": 91552265.5,
+            "peak_threads": 6,
+            "peak_memory": 15502717,
+            "parts": 26.5,
+            "marks": 124,
+            "cpu_ms": 80.33607317073171,
+            "disk_ms": 2.2384634146341464
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 10,
+          "qpsPerCore": 5,
+          "errors": {},
+          "n": 41,
+          "p50": 194,
+          "p95": 242.8,
+          "p99": 250,
+          "server": {
+            "queries": 82,
+            "read_rows": 970924,
+            "read_bytes": 91522611.96341464,
+            "peak_threads": 6,
+            "peak_memory": 16165656,
+            "parts": 26.5,
+            "marks": 124,
+            "cpu_ms": 90.41236585365854,
+            "disk_ms": 6.232085365853659
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 10,
+          "qpsPerCore": 5,
+          "errors": {},
+          "n": 41,
+          "p50": 402,
+          "p95": 447.6,
+          "p99": 460.3,
+          "server": {
+            "queries": 82,
+            "read_rows": 970924,
+            "read_bytes": 91552265.5,
+            "peak_threads": 6,
+            "peak_memory": 16331944,
+            "parts": 26.5,
+            "marks": 124,
+            "cpu_ms": 93.10715853658537,
+            "disk_ms": 15.646378048780488
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 9.4,
+          "qpsPerCore": 4.7,
+          "errors": {},
+          "n": 42,
+          "p50": 810.8,
+          "p95": 977.2,
+          "p99": 1078.7,
+          "server": {
+            "queries": 84,
+            "read_rows": 970924,
+            "read_bytes": 91552265.5,
+            "peak_threads": 6,
+            "peak_memory": 16522735,
+            "parts": 26.5,
+            "marks": 124,
+            "cpu_ms": 98.64857142857143,
+            "disk_ms": 24.688964285714285
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 9,
+          "qpsPerCore": 4.5,
+          "errors": {},
+          "n": 47,
+          "p50": 1742.6,
+          "p95": 1972.9,
+          "p99": 2058.5,
+          "server": {
+            "queries": 94,
+            "read_rows": 970924,
+            "read_bytes": 91552265.5,
+            "peak_threads": 6,
+            "peak_memory": 16462710,
+            "parts": 26.5,
+            "marks": 124,
+            "cpu_ms": 98.8118829787234,
+            "disk_ms": 42.78986170212766
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 8.9,
+          "qpsPerCore": 4.5,
+          "errors": {},
+          "n": 61,
+          "p50": 3150.9,
+          "p95": 3930.9,
+          "p99": 4176.1,
+          "server": {
+            "queries": 122,
+            "read_rows": 970924,
+            "read_bytes": 91552265.5,
+            "peak_threads": 6,
+            "peak_memory": 15937454,
+            "parts": 26.5,
+            "marks": 124,
+            "cpu_ms": 101.56097540983608,
+            "disk_ms": 59.45516393442623
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "common",
+      "cls": "common",
+      "query": "deploy",
+      "truthWhale": 26744,
+      "coldMs": 43,
+      "warmMs": 42,
+      "plan": "Output: event_id\n\nJoinLazyColumnsStep\n├──Limit (preliminary LIMIT)\n│  │  Limit 11\n│  │  Offset 0\n│  └──Sorting (Sorting for ORDER BY)\n│     │  Sort description: ts DESC\n│     │  Limit 11\n│     └──Filter\n│        │  Filter column: org_id = \\'org-0\\' AND positionCaseInsensitiveUTF8(text, \\'deploy\\') > 0 AND __text_index_text_idx_hasAllTokens_f0bd6426fb79fc9c8854f975598fa096\n│        └──ReadFromMergeTree (default.session_search_records)\n│              Read type: Default\n│              Parts: 34 | Granules: 182\n│              Output: ts, _part_offset, _part_starting_offset, org_id, text, __text_index_text_idx_hasAllTokens_f0bd6426fb79fc9c8854f975598fa096\n│              Prewhere filter\n│              Prewhere filter column:  __topKFilter(ts)\n│              Indexes:\n│                Min-Max\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                Partition\n│                  Condition: true\n│                  Parts: 34/34\n│                  Granules: 512/512\n│                PrimaryKey\n│                  Keys:\n│                    org_id\n│                  Condition: (org_id in [\\'org-0\\', \\'org-0\\'])\n│                  Parts: 34/34\n│                  Granules: 182/512\n│                  Search Algorithm: binary search\n│                Skip\n│                  Name: text_idx\n│                  Description: text GRANULARITY 100000000\n│                  Condition: (mode: All; tokens: [\"dep\", \"epl\", \"loy\", \"plo\"])\n│                  Parts: 34/34\n│                  Granules: 182/182\n│                Ranges: 34\n└──LazilyReadFromMergeTree\n      Lazily read columns: event_id\n",
+      "levels": [
+        {
+          "clients": 1,
+          "qps": 23.4,
+          "qpsPerCore": 11.7,
+          "errors": {},
+          "n": 94,
+          "p50": 42.2,
+          "p95": 44.5,
+          "p99": 66.4,
+          "server": {
+            "queries": 188,
+            "read_rows": 731803,
+            "read_bytes": 23765149.29255319,
+            "peak_threads": 6,
+            "peak_memory": 12408553,
+            "parts": 19,
+            "marks": 95.5,
+            "cpu_ms": 32.47501595744681,
+            "disk_ms": 0.7861755319148936
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 2,
+          "qps": 25.2,
+          "qpsPerCore": 12.6,
+          "errors": {},
+          "n": 102,
+          "p50": 76.2,
+          "p95": 104.5,
+          "p99": 122.9,
+          "server": {
+            "queries": 204,
+            "read_rows": 731803,
+            "read_bytes": 23666959.970588237,
+            "peak_threads": 6,
+            "peak_memory": 12000888,
+            "parts": 19,
+            "marks": 95.5,
+            "cpu_ms": 34.636754901960785,
+            "disk_ms": 2.321764705882353
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 4,
+          "qps": 24.7,
+          "qpsPerCore": 12.4,
+          "errors": {},
+          "n": 103,
+          "p50": 158.1,
+          "p95": 204.4,
+          "p99": 222.3,
+          "server": {
+            "queries": 206,
+            "read_rows": 731803,
+            "read_bytes": 23654024.87378641,
+            "peak_threads": 6,
+            "peak_memory": 15102359,
+            "parts": 19,
+            "marks": 95.5,
+            "cpu_ms": 35.61771359223301,
+            "disk_ms": 4.803087378640776
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 8,
+          "qps": 23.4,
+          "qpsPerCore": 11.7,
+          "errors": {},
+          "n": 97,
+          "p50": 337.3,
+          "p95": 422.4,
+          "p99": 444.5,
+          "server": {
+            "queries": 194,
+            "read_rows": 731803,
+            "read_bytes": 23732438.293814432,
+            "peak_threads": 6,
+            "peak_memory": 13077928,
+            "parts": 19,
+            "marks": 95.5,
+            "cpu_ms": 36.30416494845361,
+            "disk_ms": 8.017690721649485
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 16,
+          "qps": 23.6,
+          "qpsPerCore": 11.8,
+          "errors": {},
+          "n": 102,
+          "p50": 665.6,
+          "p95": 766.2,
+          "p99": 856,
+          "server": {
+            "queries": 204,
+            "read_rows": 731803,
+            "read_bytes": 23639752.960784312,
+            "peak_threads": 6,
+            "peak_memory": 13349012,
+            "parts": 19,
+            "marks": 95.5,
+            "cpu_ms": 37.2755931372549,
+            "disk_ms": 12.17231862745098
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        },
+        {
+          "clients": 32,
+          "qps": 22.9,
+          "qpsPerCore": 11.5,
+          "errors": {},
+          "n": 104,
+          "p50": 1368.2,
+          "p95": 1608.7,
+          "p99": 1683.3,
+          "server": {
+            "queries": 208,
+            "read_rows": 731803,
+            "read_bytes": 23898579.39903846,
+            "peak_threads": 6,
+            "peak_memory": 14147664,
+            "parts": 19,
+            "marks": 95.5,
+            "cpu_ms": 38.501841346153846,
+            "disk_ms": 22.683134615384617
+          },
+          "perSearch": {
+            "candidates": 200,
+            "falseCandidates": 0,
+            "rounds": 1
+          }
+        }
+      ]
+    }
+  ]
+}
