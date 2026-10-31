@@ -898,17 +898,7 @@ export function bulls96ReleaseValues(
       // Cloud SQL is plain Postgres: selfhosted mode, the shim on, an explicit runtime role.
       extraEnv: [
         ...dataEnv(),
-        { name: "HOOPDB_DB_MODE", value: "selfhosted" },
-        { name: "HOOPDB_SUPABASE_SHIM", value: "true" },
-        ...(i.hoopdbRuntimeRole
-          ? [
-              { name: "HOOPDB_RUNTIME_ROLE", value: i.hoopdbRuntimeRole },
-              {
-                name: "HOOPDB_RUNTIME_ROLE_LOGIN",
-                value: i.hoopdbRuntimeRoleLogin === false ? "false" : "true",
-              },
-            ]
-          : []),
+        ...gcpHoopdbModeEnv(i.hoopdbRuntimeRole, i.hoopdbRuntimeRoleLogin),
       ],
     },
     alleyoop: {
@@ -950,4 +940,29 @@ export function relayflowsChartValues(
     },
     persistence: { storageClass: defaultStorageClass },
   };
+}
+
+/**
+ * The GCP migrator's explicit profile: Cloud SQL is plain Postgres dedicated to HoopDb,
+ * so selfhosted mode, the shim on, the owner-scoped global default revoke (installed by
+ * supabase/bootstrap/hoopdb_function_default_revoke.sql), and the dedicated runtime role.
+ */
+export function gcpHoopdbModeEnv(
+  runtimeRole?: string,
+  runtimeLogin?: boolean,
+): Array<{ name: string; value: string }> {
+  return [
+    { name: "HOOPDB_DB_MODE", value: "selfhosted" },
+    { name: "HOOPDB_SUPABASE_SHIM", value: "true" },
+    { name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" },
+    ...(runtimeRole
+      ? [
+          { name: "HOOPDB_RUNTIME_ROLE", value: runtimeRole },
+          {
+            name: "HOOPDB_RUNTIME_ROLE_LOGIN",
+            value: runtimeLogin === false ? "false" : "true",
+          },
+        ]
+      : []),
+  ];
 }

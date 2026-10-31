@@ -167,14 +167,15 @@ marker: a reader started early, or a migrator that died, simply stays non-ready.
 `src/hoopdb/migrate.ts` resolves an explicit profile **before opening any connection**. It
 never infers anything from the hostname. An invalid profile writes nothing anywhere.
 
-| Variable                       | Contract                                                                                                                                                                                                                                   |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `HOOPDB_DB_MODE`               | required, no default: `local` (Docker stack), `selfhosted` (CNPG, Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                              |
-| `HOOPDB_SUPABASE_SHIM`         | `local` and `selfhosted`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project. |
-| `HOOPDB_ROLE_BOOTSTRAP`        | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                               |
-| `HOOPDB_RUNTIME_ROLE`          | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                         |
-| `HOOPDB_RUNTIME_ROLE_LOGIN`    | required in `selfhosted` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                 |
-| `HOOPDB_RUNTIME_WORKLOAD_ROLE` | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                  |
+| Variable                        | Contract                                                                                                                                                                                                                                                          |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (CNPG, Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                                                     |
+| `HOOPDB_SUPABASE_SHIM`          | `local` and `selfhosted`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project.                        |
+| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                      |
+| `HOOPDB_RUNTIME_ROLE`           | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                                                |
+| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                        |
+| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                                         |
+| `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted` and `supabase`: `global-default-revoke` (the only implemented mode; the catalog must prove it, see "Function boundary"). `event-trigger` is refused as not implemented, and the old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
 
 **Runtime role: dedicated, exact least privilege.** It is checked under the migrator's
 advisory lock before any write (before the ledger and marker tables are created, before
@@ -334,12 +335,14 @@ file (head, server version, each case's pass/fail) plus its log.
 ## Function boundary (threat, residual, activation gate)
 
 **Threat.** PostgreSQL gives every new function PUBLIC EXECUTE by built-in default, and a
-per-schema `ALTER DEFAULT PRIVILEGES` cannot revoke that. So a function created in
-`sessions` after a migrate, outside the migrator (a hand-run DDL, a future tool), is
-**directly invocable** until the next migrate's revoke. Anyone with USAGE on `sessions`
-can call it, by database credential or through PostgREST RPC. This repository does
-**not** prevent that; a real PostgreSQL test shows an unrelated role calling such a
-function.
+per-schema `ALTER DEFAULT PRIVILEGES` cannot revoke that. Where no owner-scoped control is
+installed, a function created in `sessions` after a migrate, outside the migrator (a
+hand-run DDL, a future tool), is **directly invocable** until the next migrate's revoke.
+Anyone with USAGE on `sessions` can call it, by database credential or through PostgREST
+RPC. Real PostgreSQL tests show both sides:
+
+- with the selfhosted control installed, such a function is **not** invocable (42501);
+- with the built-in default in place, an unrelated role calls it.
 
 **What does fail closed.**
 
@@ -366,30 +369,52 @@ hold**: exposure is by design, and `authenticated` holds USAGE. Exposure is not 
 problem. The problem is PUBLIC EXECUTE on future functions. Each intended RPC has explicit
 grants to the exact API roles and PUBLIC stays revoked.
 
-**Activation gate (supabase mode, machine-checked).** Before any write, the migrator
-refuses with `function_boundary_unproven` unless one durable control is both present and
-approved. `HOOPDB_FUNCTION_BOUNDARY_APPROVED` records the blast-radius approval.
+**Function-boundary gate (selfhosted and supabase; only explicit local mode is ungated).**
+Before any write, the migrator refuses with `function_boundary_unproven` unless the catalog
+proves the control that `HOOPDB_FUNCTION_BOUNDARY_MODE` selects. That variable is
+configuration chosen by the reviewed deployment, not a human approval: the catalog control
+itself is the proof. The old name, `HOOPDB_FUNCTION_BOUNDARY_APPROVED`, is refused, so stale
+config fails closed.
 
-- **(A) `global-default-revoke`:**
-  `ALTER DEFAULT PRIVILEGES FOR ROLE <migration owner> REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`.
-  On Supabase the owner is `postgres`, so this changes every future postgres-created
-  function in every schema. That is why it needs explicit approval (#98).
-- **(E) `event-trigger`:** an enabled `ddl_command_end` event trigger named
-  `sessions_function_public_revoke` that revokes PUBLIC EXECUTE on `sessions` functions,
-  reviewed.
+- **`global-default-revoke` (the only mode implemented):**
+  `ALTER DEFAULT PRIVILEGES FOR ROLE <migration owner> REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`
+  in the HoopDb database.
+  - **selfhosted:** the privileged, idempotent
+    `supabase/bootstrap/hoopdb_function_default_revoke.sql`
+    (`-v migration_owner=hoop`, run as a superuser, in the HoopDb database) installs it
+    before migrate. It is global for that owner: every function the owner creates later
+    in that database, in any schema, starts without PUBLIC EXECUTE. That is safe only
+    because the selfhosted database is dedicated to HoopDb. Real PG15/17 tests show:
+    - a new owner function in `sessions` and in a second schema is not
+      PUBLIC-executable;
+    - the intended grants survive the revoke and the next migrate: the Worker's three RPCs,
+      `authenticated`'s six helpers and `service_role`'s grants, all checked against the
+      ACL manifest;
+    - the AWS CNPG and GCP fixture env passes the gate.
+  - **supabase:** the owner is `postgres`, so the same statement would reach every future
+    postgres-created function in every schema of the project. It is never run from here.
+    An operator decides it (#98), and until then supabase migrate stays refused.
+- **`event-trigger`: not implemented, refused** (`function_boundary_mode_unimplemented`).
+  A trigger's name proves nothing. A reviewed implementation must verify the enabled
+  state, events and tags, owner and function identity, function definition or hash,
+  SECURITY and `search_path` properties, and behavioural effect. That is separate work;
+  the hook (`SESSIONS_FUNCTION_EVENT_TRIGGER`) is kept.
 
 The evidence is names and booleans only:
 
 - `migration_owner`;
 - `sessions_unexposed_and_no_untrusted_usage`, always false here;
 - `global_function_default_revokes_public`;
-- `event_trigger_present`;
-- `approval`;
+- `event_trigger_present` (informational);
+- `mode`;
 - `satisfied`.
 
-`bun src/hoopdb/migrate.ts --activation-check` prints it and exits 1 if unproven. Neither
-control is applied by this repository. Selfhosted production with PostgREST has the same
-residual; run the same check there before activation.
+`bun src/hoopdb/migrate.ts --activation-check` prints it and exits 1 if unproven.
+
+**Claim paths.** The worker's only claim paths are each stage's `pollPostgresStage` and
+the side tick, all through `workerTick`, which runs the live gate (sessions-function
+check included) before each one. A table-driven test proves the order. The ingest and the
+courier claim no queue work.
 
 **Durable follow-up (open):** a dedicated `sessions` object owner, so an owner-scoped
 global default revoke has no blast radius outside HoopDb. That needs an ownership transfer
@@ -398,6 +423,10 @@ enforcement, reviewed. Tracked in #98.
 
 ## CNPG (self-hosted HoopDb)
 
+- **Selfhosted bootstraps, every deploy, before migrate, as the CNPG superuser, in the HoopDb
+  database:** `hoopdb_runtime_role.sql` (the dedicated runtime role; it also revokes PUBLIC
+  TEMPORARY) and `hoopdb_function_default_revoke.sql` (the owner-scoped function default).
+  Not wired yet: the Job is helm-charts #24's.
 - **Phase 1, every deploy (required for existing clusters):** a Job ordered before
   `hoopdb-migrate`, for example a pre-migrate step in the same release. It runs phase 1 as
   the cluster superuser `postgres` (the CNPG superuser secret, `enableSuperuserAccess`),

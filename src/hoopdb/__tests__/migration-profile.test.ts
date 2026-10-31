@@ -17,7 +17,7 @@ import {
   sessionsFunctionAcl,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
 } from "../migrate-guards.ts";
-import { gateOpen } from "../../shared/worker.ts";
+import { gateOpen, workerTick } from "../../shared/worker.ts";
 import {
   MIGRATION_SENTINELS,
   NON_CREATE_STEPS,
@@ -34,6 +34,9 @@ import {
 
 setDefaultTimeout(60_000);
 const root = join(import.meta.dir, "../../..");
+/** What supabase/bootstrap/hoopdb_function_default_revoke.sql does for the PGlite owner (postgres). */
+const OWNER_FN_DEFAULT_REVOKE =
+  "ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC";
 /** What the selfhosted runtime-role bootstrap does to the database ACL. */
 const NO_PUBLIC_TEMP =
   "DO $t$ BEGIN EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database()); END $t$";
@@ -444,6 +447,7 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
     mode: "selfhosted",
     runtimeRole: "g6_rt",
     runtimeLogin: false,
+    functionBoundary: "global-default-revoke",
   };
   /** Ledger, marker and every grant on the approved objects. */
   const state = async (db: PGlite) => ({
@@ -458,7 +462,9 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
   /** A database migrated with a good dedicated role, so hostile variants run against the full schema. */
   async function migrated(): Promise<PGlite> {
     const db = await fresh();
-    await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
     await runMigrations(client(db), { profile: { ...GOOD, mode: "local" } });
     return db;
   }
@@ -558,7 +564,7 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
     ],
     [
       "EXECUTE on a SECURITY DEFINER function outside sessions (through PUBLIC)",
-      "CREATE FUNCTION public.g6_definer() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+      "CREATE FUNCTION public.g6_definer() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; GRANT EXECUTE ON FUNCTION public.g6_definer() TO PUBLIC",
       "EXECUTE on g6_definer()",
     ],
     [
@@ -1048,7 +1054,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       sessions_unexposed_and_no_untrusted_usage: false,
       global_function_default_revokes_public: false,
       event_trigger_present: false,
-      approval: "none",
+      mode: "none",
       satisfied: false,
     });
     for (const v of Object.values(evidence))
@@ -1101,26 +1107,168 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     ).toBe(false);
   });
 
-  test("supabase activation gate (E): the reviewed event trigger, approved, passes", async () => {
+  test("event-trigger mode is not implemented: refused even with a trigger of the right name present", async () => {
     const db = await supabaseLike();
-    await db
-      .exec(
-        `CREATE FUNCTION public.g6_revoke_sessions_public() RETURNS event_trigger LANGUAGE plpgsql AS $f$
+    await db.exec(`CREATE FUNCTION public.g6_revoke_sessions_public() RETURNS event_trigger LANGUAGE plpgsql AS $f$
       BEGIN EXECUTE 'REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC'; END $f$;
       CREATE EVENT TRIGGER ${SESSIONS_FUNCTION_EVENT_TRIGGER} ON ddl_command_end WHEN TAG IN ('CREATE FUNCTION')
-        EXECUTE FUNCTION public.g6_revoke_sessions_public();`,
-      )
-      .catch((e) => {
-        throw new Error(
-          `event triggers unsupported here: ${(e as Error).message}`,
-        );
-      });
+        EXECUTE FUNCTION public.g6_revoke_sessions_public();`);
+    expect(() =>
+      migrationProfile({
+        HOOPDB_DB_MODE: "supabase",
+        HOOPDB_RUNTIME_ROLE: "g6_rt",
+        HOOPDB_RUNTIME_ROLE_LOGIN: "false",
+        HOOPDB_FUNCTION_BOUNDARY_MODE: "event-trigger",
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: "function_boundary_mode_unimplemented" }),
+    );
+    // Even forced through a profile object, a trigger's name never satisfies the gate.
     expect(
-      await failure(
-        runMigrations(client(db), {
-          profile: { ...SUPA, functionBoundary: "event-trigger" },
-        }),
-      ),
+      (
+        await failure(
+          runMigrations(client(db), {
+            profile: { ...SUPA, functionBoundary: "event-trigger" },
+          }),
+        )
+      )?.code,
+    ).toBe("function_boundary_unproven");
+    expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
+  });
+
+  test("the old HOOPDB_FUNCTION_BOUNDARY_APPROVED name is refused (stale config fails closed)", () => {
+    expect(() =>
+      migrationProfile({
+        HOOPDB_DB_MODE: "supabase",
+        HOOPDB_RUNTIME_ROLE: "g6_rt",
+        HOOPDB_RUNTIME_ROLE_LOGIN: "false",
+        HOOPDB_FUNCTION_BOUNDARY_APPROVED: "global-default-revoke",
+      }),
+    ).toThrow(expect.objectContaining({ code: "db_profile_invalid" }));
+    expect(
+      migrationProfile({
+        HOOPDB_DB_MODE: "supabase",
+        HOOPDB_RUNTIME_ROLE: "g6_rt",
+        HOOPDB_RUNTIME_ROLE_LOGIN: "false",
+        HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+      }).functionBoundary,
+    ).toBe("global-default-revoke");
+  });
+
+  test("selfhosted is gated too: refused without the owner-scoped revoke; passes with it (only local is ungated)", async () => {
+    const db = await fresh();
+    await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
+    const SELFP: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    expect(
+      (await failure(runMigrations(client(db), { profile: SELFP })))?.code,
+    ).toBe("function_boundary_unproven");
+    expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
+    await db.exec(OWNER_FN_DEFAULT_REVOKE);
+    expect(
+      await failure(runMigrations(client(db), { profile: SELFP })),
     ).toBeNull();
+    // Local mode needs no control.
+    const loc = await fresh();
+    expect(
+      await failure(runMigrations(client(loc), { profile: LOCAL })),
+    ).toBeNull();
+  });
+
+  test("blast radius of the owner-scoped revoke: new owner functions in sessions AND another schema are not PUBLIC-executable; intended grants survive (ACL manifest) the revoke and the next migrate", async () => {
+    const db = await fresh();
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
+    const SELFP: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    await runMigrations(client(db), { profile: SELFP });
+    expect(await sessionsFunctionAcl(client(db))).toEqual(MANIFEST);
+    await db.exec(`CREATE FUNCTION sessions.g6_future() RETURNS int LANGUAGE sql AS 'SELECT 1';
+      CREATE SCHEMA g6_second; CREATE FUNCTION g6_second.g6_future() RETURNS int LANGUAGE sql AS 'SELECT 1';
+      CREATE ROLE g6_probe NOLOGIN;`);
+    for (const fn of ["sessions.g6_future()", "g6_second.g6_future()"]) {
+      const r = (
+        await db.query<{ e: boolean; pub: boolean }>(
+          `SELECT has_function_privilege('g6_probe', $1::regprocedure, 'EXECUTE') AS e,
+                EXISTS (SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a WHERE p.oid = $1::regprocedure AND a.grantee = 0) AS pub`,
+          [fn],
+        )
+      ).rows[0];
+      expect(r, fn).toEqual({ e: false, pub: false });
+    }
+    await db.exec(
+      "DROP FUNCTION sessions.g6_future(); DROP SCHEMA g6_second CASCADE",
+    );
+    await runMigrations(client(db), { profile: SELFP });
+    expect(await sessionsFunctionAcl(client(db))).toEqual(MANIFEST);
+  });
+});
+
+describe("every worker claim path runs the live gate first", () => {
+  test("table-driven over each stage claim and the side tick: the gate runs before every path, and once closed nothing further runs", async () => {
+    const stages = ["capture", "index", "summary"] as const;
+    const cases: Array<[string, number]> = [
+      ["gate open throughout", Infinity],
+      ...stages.map(
+        (st, i) => [`gate closes before stage ${st}`, i] as [string, number],
+      ),
+      ["gate closes before the side tick", stages.length],
+    ];
+    for (const [name, closeAt] of cases) {
+      const log: string[] = [];
+      let checks = 0;
+      const r = await workerTick({
+        stages,
+        gate: async () => {
+          log.push("gate");
+          return checks++ < closeAt;
+        },
+        poll: async (st) => (log.push(`claim:${st}`), 1),
+        tick: async () => void log.push("tick"),
+      });
+      // Every claim path is immediately preceded by a gate check.
+      for (let i = 0; i < log.length; i++)
+        if (log[i] !== "gate") expect(log[i - 1], name).toBe("gate");
+      const paths = [...stages.map((st) => `claim:${st}`), "tick"];
+      const ran = log.filter((x) => x !== "gate");
+      expect(ran, name).toEqual(
+        paths.slice(0, Math.min(closeAt, paths.length)),
+      );
+      expect(r.gated, name).toBe(closeAt < paths.length);
+    }
+  });
+
+  test("with the real gate: a sessions function created after PASS closes every claim path (no claim, no tick)", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const expected = await expectedSchema();
+    const health = {
+      schemaReady: async () => (await schemaVerdict(expected, transact(db))).ok,
+    };
+    const ran: string[] = [];
+    const io = {
+      stages: ["a", "b"],
+      gate: () => gateOpen(health),
+      poll: async (st: string) => (ran.push(st), 1),
+      tick: async () => void ran.push("tick"),
+    };
+    expect(await workerTick(io)).toEqual({ claimed: 2, gated: false });
+    await db.exec(
+      "CREATE FUNCTION sessions.g6_late2() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+    );
+    ran.length = 0;
+    expect(await workerTick(io)).toEqual({ claimed: 0, gated: true });
+    expect(ran).toEqual([]);
   });
 });

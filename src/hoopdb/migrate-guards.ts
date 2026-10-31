@@ -617,7 +617,7 @@ export interface FunctionBoundaryEvidence {
   sessions_unexposed_and_no_untrusted_usage: false;
   global_function_default_revokes_public: boolean;
   event_trigger_present: boolean;
-  approval: FunctionBoundaryApproval | "none";
+  mode: FunctionBoundaryApproval | "none";
   satisfied: boolean;
 }
 
@@ -627,12 +627,15 @@ export interface FunctionBoundaryEvidence {
  * sessions after a migrate, outside the migrator, is directly invocable by any role with
  * USAGE on sessions (authenticated, service_role, and through PostgREST RPC) until the
  * next migrate's revoke; the live gate only turns readiness off. Activation therefore
- * needs one durable control, present AND approved (blast radius reviewed):
+ * needs one durable control, selected by the deployment (HOOPDB_FUNCTION_BOUNDARY_MODE, which
+ * is configuration, not a human approval) and proven by the catalog. The gate applies in
+ * selfhosted and supabase mode; only explicit local mode is ungated:
  *   (A) "global-default-revoke": ALTER DEFAULT PRIVILEGES FOR ROLE <migration owner>
  *       REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC. On Supabase the owner is postgres, so
  *       this changes every future postgres-created function in every schema.
- *   (E) "event-trigger": an enabled ddl_command_end event trigger named
- *       SESSIONS_FUNCTION_EVENT_TRIGGER that revokes PUBLIC EXECUTE on sessions functions.
+ *       In selfhosted, the database is dedicated to HoopDb, so the privileged
+ *       supabase/bootstrap/hoopdb_function_default_revoke.sql installs it safely.
+ *   (E) "event-trigger": NOT IMPLEMENTED, refused (hook kept for a reviewed trigger).
  * (B) cannot be claimed here (see the evidence field). Follow-up: a dedicated sessions
  * object owner, which needs an ownership transfer of live objects (activation dossier #98).
  */
@@ -655,15 +658,16 @@ export async function functionBoundaryEvidence(
       [SESSIONS_FUNCTION_EVENT_TRIGGER],
     )
   ).rows[0]!;
-  const satisfied =
-    (approval === "global-default-revoke" && r.global_revoke) ||
-    (approval === "event-trigger" && r.event_trigger);
+  // Event-trigger mode is not implemented: a trigger's name proves nothing (its enabled
+  // state, events and tags, owner, function identity and definition, SECURITY and
+  // search_path, and behaviour would all need verifying). Hook kept for that later work.
+  const satisfied = approval === "global-default-revoke" && r.global_revoke;
   return {
     migration_owner: r.owner,
     sessions_unexposed_and_no_untrusted_usage: false,
     global_function_default_revokes_public: r.global_revoke,
     event_trigger_present: r.event_trigger,
-    approval: approval ?? "none",
+    mode: approval ?? "none",
     satisfied,
   };
 }

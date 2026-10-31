@@ -70,7 +70,11 @@ export interface MigrationProfile {
   runtimeLogin?: boolean;
   /** HOOPDB_RUNTIME_WORKLOAD_ROLE: the one role allowed to be a member of the runtime role. */
   workloadRole?: string;
-  /** HOOPDB_FUNCTION_BOUNDARY_APPROVED: the reviewed durable function boundary (supabase activation gate). */
+  /**
+   * HOOPDB_FUNCTION_BOUNDARY_MODE: which durable function boundary the reviewed deployment
+   * selects. Configuration, not a human approval: the gate passes only when the catalog
+   * itself proves the selected control. Required outside local mode.
+   */
   functionBoundary?: FunctionBoundaryApproval;
 }
 
@@ -108,9 +112,13 @@ export function migrationProfile(env: Record<string, string | undefined> = proce
   const workloadRole = env.HOOPDB_RUNTIME_WORKLOAD_ROLE || undefined;
   if (workloadRole !== undefined && !ident.test(workloadRole))
     throw profileError("db_profile_invalid", "HOOPDB_RUNTIME_WORKLOAD_ROLE must be a role name");
-  const fb = env.HOOPDB_FUNCTION_BOUNDARY_APPROVED || undefined;
-  if (fb !== undefined && fb !== "global-default-revoke" && fb !== "event-trigger")
-    throw profileError("db_profile_invalid", "HOOPDB_FUNCTION_BOUNDARY_APPROVED must be global-default-revoke or event-trigger");
+  if (env.HOOPDB_FUNCTION_BOUNDARY_APPROVED !== undefined)
+    throw profileError("db_profile_invalid", "HOOPDB_FUNCTION_BOUNDARY_APPROVED was renamed HOOPDB_FUNCTION_BOUNDARY_MODE (it selects a catalog-proven control, it is not an approval); remove it");
+  const fb = env.HOOPDB_FUNCTION_BOUNDARY_MODE || undefined;
+  if (fb === "event-trigger")
+    throw profileError("function_boundary_mode_unimplemented", "HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger is not implemented yet (a reviewed trigger, verified by more than its name, is separate work); use global-default-revoke");
+  if (fb !== undefined && fb !== "global-default-revoke")
+    throw profileError("db_profile_invalid", "HOOPDB_FUNCTION_BOUNDARY_MODE must be global-default-revoke");
   const runtime = {
     runtimeRole,
     ...(runtimeLogin === undefined ? {} : { runtimeLogin }),
@@ -220,8 +228,9 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
       );
     }
     const runtime = await runtimeRolePreflight(client, profile);
-    // Supabase activation gate: a durable function boundary must be present and approved.
-    if (profile.mode === "supabase") {
+    // Durable function boundary gate, every non-local mode: the selected control must be
+    // proven by the catalog. Only explicit local (Docker dev) mode is ungated.
+    if (profile.mode !== "local") {
       const evidence = await functionBoundaryEvidence(client, profile.functionBoundary);
       if (!evidence.satisfied)
         throw profileError("function_boundary_unproven", `no approved durable function boundary: ${JSON.stringify(evidence)}; see the runbook "Function boundary"`);
@@ -420,8 +429,8 @@ async function cliHistoryPreflight(client: MigrationClient, schema: Step[]): Pro
 }
 
 function migrationProfileApproval(): FunctionBoundaryApproval | undefined {
-  const v = process.env.HOOPDB_FUNCTION_BOUNDARY_APPROVED;
-  return v === "global-default-revoke" || v === "event-trigger" ? v : undefined;
+  const v = process.env.HOOPDB_FUNCTION_BOUNDARY_MODE;
+  return v === "global-default-revoke" ? v : undefined;
 }
 
 export async function migrate(): Promise<{ applied: number; skipped: number }> {
@@ -442,7 +451,7 @@ if (import.meta.main) {
   process.env.OTEL_SERVICE_NAME ||= "hoopdb-migrate";
   if (process.argv.includes("--activation-check")) {
     // For an operator or the activation dossier: the function-boundary evidence (names and
-    // booleans only) for HOOPDB_URL and HOOPDB_FUNCTION_BOUNDARY_APPROVED. Exit 1 if unproven.
+    // booleans only) for HOOPDB_URL and HOOPDB_FUNCTION_BOUNDARY_MODE. Exit 1 if unproven.
     const db = openHoopDb();
     const approval = migrationProfileApproval();
     functionBoundaryEvidence(db, approval)
