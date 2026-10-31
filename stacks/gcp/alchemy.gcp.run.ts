@@ -133,7 +133,7 @@ function bootstrapStage(): string {
 const BOOTSTRAP_STAGE = bootstrapStage();
 const BOOTSTRAP_COMMAND = requestedAlchemyCommand();
 const BOOTSTRAP_INPUTS = readInputs(BOOTSTRAP_STAGE, BOOTSTRAP_COMMAND);
-assertGcpRuntimeDeployable(BOOTSTRAP_INPUTS, BOOTSTRAP_COMMAND);
+assertGcpRuntimeDeployable(BOOTSTRAP_STAGE, BOOTSTRAP_INPUTS, BOOTSTRAP_COMMAND);
 // This value is deliberately not persisted between invocations. It prevents
 // Alchemy from reusing a prior successful Action output for the same token;
 // the atomic ledger then rejects that token as already consumed.

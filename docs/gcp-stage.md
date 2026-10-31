@@ -184,10 +184,13 @@ Secret is used or required for that path.
 
 The digest and source revision must exactly match the structured services
 release in `versions.lock.json`, and that release must set
-`gcpProofEligible: true`. The currently recorded `db2663d` image is explicitly
-ineligible. A services image release updates the digest, full source revision,
-and eligibility together only after the image build and review complete; an
-arbitrary or merely well-formed digest cannot enable this stage.
+`gcpProofEligible: true`. The currently recorded `09293c8` image is published
+only in the `awf-conformance-images` repository, so an enabled 96Bulls release
+is refused outside the `gcp-conformance` stage. Substrate-only stages and
+destroy cleanup remain available. A services image release updates the digest,
+full source revision, and eligibility together only after the image build and
+review complete; an arbitrary or merely well-formed digest cannot enable this
+stage.
 
 `assertGcpInputs` accepts only those five target fields. `agentworkforce-dev1`
 and any other project, number, org, billing account, or region are refused

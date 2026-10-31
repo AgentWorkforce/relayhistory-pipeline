@@ -6,6 +6,7 @@ import versionsLock from "../../versions.lock.json";
 export const GCP_CONFIRM_PROJECT_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_PROJECT";
 export const GCP_CONFIRM_SQL_POST_ENV = "NINETY_SIX_BULLS_CONFIRM_GCP_SQL_POST";
 export const GCP_APPLY_NONCE_ENV = "NINETY_SIX_BULLS_GCP_APPLY_NONCE";
+export const GCP_APPLICATION_PROOF_STAGE = "gcp-conformance";
 
 export type AlchemyStackCommand =
   | "provider"
@@ -394,6 +395,10 @@ export function assertGcpInputs(
     requireRelayauthIssuer("bulls96.relayauthIssuer", inputs.bulls96.relayauthIssuer);
     if (inputs.relayauth?.baseUrl && inputs.bulls96.relayauthIssuer !== inputs.relayauth.baseUrl)
       throw new Error("96bulls: bulls96.relayauthIssuer must match relayauth.baseUrl for the in-stage RelayAuth release");
+    if (requestedCommand !== "destroy" && stage !== GCP_APPLICATION_PROOF_STAGE)
+      throw new Error(
+        `96bulls: the approved services image is published only for ${GCP_APPLICATION_PROOF_STAGE}; ${stage} cannot install 96Bulls. Nothing was created.`,
+      );
     if (requestedCommand !== "destroy")
       requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
   }
@@ -414,12 +419,20 @@ function requireApprovedGcpServicesImage(digest: string, sourceRevision: string)
 }
 
 /** Defense in depth for runtime wiring; the stack's poster remains apply-only. */
-export function assertGcpRuntimeDeployable(inputs: GcpInputs, requestedCommand?: AlchemyStackCommand): void {
+export function assertGcpRuntimeDeployable(
+  stage: string,
+  inputs: GcpInputs,
+  requestedCommand?: AlchemyStackCommand,
+): void {
   if (
     inputs.bulls96?.enabled &&
     (!inputs.managedDataPlane.provision || inputs.managedDataPlane.acknowledgement !== "adapter-proof-only")
   )
     throw new Error("96bulls: GCP runtime wiring requires the acknowledged managed data plane. Nothing was created.");
+  if (inputs.bulls96?.enabled && requestedCommand !== "destroy" && stage !== GCP_APPLICATION_PROOF_STAGE)
+    throw new Error(
+      `96bulls: the approved services image is published only for ${GCP_APPLICATION_PROOF_STAGE}; ${stage} cannot install 96Bulls. Nothing was created.`,
+    );
   if (inputs.bulls96?.enabled && requestedCommand !== "destroy")
     requireApprovedGcpServicesImage(inputs.bulls96.imageDigest, inputs.bulls96.imageSourceRevision);
 }
