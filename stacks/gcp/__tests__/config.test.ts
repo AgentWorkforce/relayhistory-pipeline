@@ -62,6 +62,7 @@ describe("GCP self-host contract", () => {
       imageSourceRevision: "not-a-revision",
       relayauthJwksUrl: "http://user:password@attacker.example/jwks?token=secret",
       relayauthIssuer: "http://user:password@attacker.example",
+      relayhistoryOrigin: "http://user:password@attacker.example",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
     expect(() => assertGcpRuntimeDeployable("gcp-dev", { ...base, bulls96: disabled })).not.toThrow();
@@ -136,6 +137,7 @@ describe("GCP self-host contract", () => {
       imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
       relayauthIssuer: "http://relayauth.relayauth.svc:8787",
+      relayhistoryOrigin: "http://bulls96-alleyoop.96bulls.svc:8080",
     };
     expect(() => assertGcpInputs("gcp-dev", { ...base, bulls96 })).toThrow("managedDataPlane.provision");
     expect(() =>
@@ -194,6 +196,19 @@ describe("GCP self-host contract", () => {
         bulls96: { ...bulls96, relayauthIssuer: "https://relay.example.com/issuer-path" },
       }),
     ).toThrow("RelayAuth origin");
+    for (const relayhistoryOrigin of [
+      "http://user:password@bulls96-alleyoop.96bulls.svc:8080",
+      "http://attacker.example",
+      "https://history.example.com/path",
+      "https://history.example.com:443",
+    ])
+      expect(() =>
+        assertGcpInputs("gcp-dev", {
+          ...base,
+          managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+          bulls96: { ...bulls96, relayhistoryOrigin },
+        }),
+      ).toThrow("in-cluster Kubernetes origin");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
@@ -265,6 +280,7 @@ describe("GCP self-host contract", () => {
           imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
           relayauthIssuer: "http://relayauth.relayauth.svc:8787",
+          relayhistoryOrigin: "http://bulls96-alleyoop.96bulls.svc:8080",
         },
         {
           bucket: "locker",
@@ -290,6 +306,7 @@ describe("GCP self-host contract", () => {
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
     expect(values).toMatchObject({
       worker: {
+        fullnameOverride: "bulls96-worker",
         imagePullSecrets: [],
         image: {
           repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
@@ -298,6 +315,7 @@ describe("GCP self-host contract", () => {
         locker: { credentials: { mode: "podIdentity" } },
       },
       alleyoop: {
+        fullnameOverride: "bulls96-alleyoop",
         imagePullSecrets: [],
         image: {
           repository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
@@ -308,6 +326,16 @@ describe("GCP self-host contract", () => {
           jwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
           issuer: "http://relayauth.relayauth.svc:8787",
         },
+        extraEnv: expect.arrayContaining([
+          {
+            name: "ALLOW_INTERIM_RELAYAUTH_BEARER",
+            value: "true",
+          },
+          {
+            name: "RELAYHISTORY_ORIGIN",
+            value: "http://bulls96-alleyoop.96bulls.svc:8080",
+          },
+        ]),
       },
       hoopdb: { enabled: false },
       locker: { enabled: false },
@@ -355,6 +383,7 @@ describe("GCP self-host contract", () => {
     expect(GCP_RUNTIME_SHAPE.privateEndpoint).toBe(true);
     expect(GCP_RUNTIME_SHAPE.autopilot).toBe(false);
     expect(GCP_RUNTIME_SHAPE.nodeLocation).toBe("us-central1-a");
+    expect(GCP_RUNTIME_SHAPE.initialNodeCount).toBe(3);
     expect(GCP_RUNTIME_SHAPE.natIpAllocateOption).toBe("MANUAL_ONLY");
     expect(GCP_RUNTIME_SHAPE.natLogFilter).toBe("ALL");
     expect(GCP_NODE_ROLES).toEqual([
@@ -506,6 +535,7 @@ describe("GCP self-host contract", () => {
     expect(rendered).toContain("relayauth-runtime");
     expect(rendered).toContain("relayfile-runtime");
     expect(rendered).not.toMatch(/PRIVATE KEY|password|token/i);
+    expect(auth.relayhistory).toEqual({ allowPrivateHttpOrigin: true });
   });
 
   it("keeps Relayflows standalone and optional", () => {

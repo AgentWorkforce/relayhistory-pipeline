@@ -467,7 +467,7 @@ BEGIN
             ELSE ' AND d.agent_name_normalized LIKE $8 ESCAPE ''\''' END
     || CASE WHEN p_state IS NULL THEN '' ELSE ' AND d.state = $9' END
     || CASE WHEN p_since IS NULL THEN '' ELSE ' AND d.last_activity_at >= $10' END
-    || CASE WHEN p_until IS NULL THEN '' ELSE ' AND d.created_at <= $11' END
+    || CASE WHEN p_until IS NULL THEN '' ELSE ' AND d.last_activity_at <= $11' END
     || CASE WHEN p_session_id IS NULL THEN '' ELSE ' AND d.session_id = $12' END
     || CASE WHEN NOT v_has_cursor THEN ''
             WHEN v_membership IS NOT NULL THEN ' AND (m.last_activity_at, m.session_id, m.harness) < ($15, $16, $17)'

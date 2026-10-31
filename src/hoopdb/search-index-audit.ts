@@ -21,7 +21,9 @@ async function directoryProjectionComplete(pool: pg.Pool): Promise<boolean> {
   return result.rows[0]?.complete === true;
 }
 
-export async function auditProductionSearchIndexes(url = required("HOOPDB_URL")) {
+export async function auditProductionSearchIndexes(
+  url = required("HOOPDB_URL"),
+) {
   const pool = new pg.Pool({
     connectionString: url,
     max: 1,
@@ -30,7 +32,9 @@ export async function auditProductionSearchIndexes(url = required("HOOPDB_URL"))
     statement_timeout: 30_000,
   });
   try {
-    const result = await pool.query<SearchIndexCatalogRow>(SEARCH_INDEX_CATALOG_SQL);
+    const result = await pool.query<SearchIndexCatalogRow>(
+      SEARCH_INDEX_CATALOG_SQL,
+    );
     return auditSearchIndexes(result.rows, {
       directoryProjectionComplete: await directoryProjectionComplete(pool),
     });
@@ -46,7 +50,9 @@ if (import.meta.main) {
       if (!report.passed) process.exitCode = 1;
     })
     .catch((error) => {
-      console.error(`96bulls: search index audit failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      console.error(
+        `96bulls: search index audit failed: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
       process.exitCode = 1;
     });
 }

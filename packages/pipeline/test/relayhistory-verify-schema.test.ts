@@ -50,7 +50,9 @@ const runnerIndexes = (
     definition: string;
   }[]
 )
-  .map((index) => `CREATE INDEX IF NOT EXISTS ${index.name} ${index.definition};`)
+  .map(
+    (index) => `CREATE INDEX IF NOT EXISTS ${index.name} ${index.definition};`,
+  )
   .join("\n");
 type Migration = { name: string; sql: string };
 const legacy: Migration[] = [
@@ -108,7 +110,9 @@ describe("relayhistory-verify schema gate on real catalogs", () => {
       const source = await readCatalog(sourceDb, "relayhistory_app");
       const target = await readCatalog(targetDb, "relayhistory_app");
       expect(source.objects.functionDefinitions.size).toBeGreaterThan(10);
-      expect(source.objects.columns.get("machines")?.get("workspace_id")).toMatchObject({
+      expect(
+        source.objects.columns.get("machines")?.get("workspace_id"),
+      ).toMatchObject({
         notNull: true,
         default: null,
         collation: "default",
@@ -120,7 +124,12 @@ describe("relayhistory-verify schema gate on real catalogs", () => {
       expect(source.role?.privileges).toContain("USAGE on schema sessions");
       expect(source.role?.privileges).toContain("SELECT on table machines");
       expect(
-        missingPrivileges(source.role!, target.role!, source.objects, target.objects),
+        missingPrivileges(
+          source.role!,
+          target.role!,
+          source.objects,
+          target.objects,
+        ),
       ).toEqual([]);
     },
   );
@@ -186,14 +195,24 @@ describe("relayhistory-verify schema gate on real catalogs", () => {
     // The source role is subject to the notes policy too, so owning (but
     // FORCEd) notes on the target is no regression; the lost grants are.
     expect(
-      missingPrivileges(source.role!, target.role!, source.objects, target.objects),
+      missingPrivileges(
+        source.role!,
+        target.role!,
+        source.objects,
+        target.objects,
+      ),
     ).toEqual([
       "target role app lacks INSERT on table jobs",
       "target role app lacks USAGE on sequence jobs_id_seq",
     ]);
     const nobody = await readCatalog(targetDb, "nobody");
     expect(
-      missingPrivileges(source.role!, nobody.role!, source.objects, target.objects),
+      missingPrivileges(
+        source.role!,
+        nobody.role!,
+        source.objects,
+        target.objects,
+      ),
     ).toEqual(["target role nobody does not exist"]);
   });
 
@@ -205,7 +224,12 @@ describe("relayhistory-verify schema gate on real catalogs", () => {
     const source = await readCatalog(sourceDb, "relayhistory_app");
     const target = await readCatalog(targetDb, "relayhistory_app");
     expect(
-      missingPrivileges(source.role!, target.role!, source.objects, target.objects),
+      missingPrivileges(
+        source.role!,
+        target.role!,
+        source.objects,
+        target.objects,
+      ),
     ).toEqual([
       "target role relayhistory_app is subject to row security on machines; source role relayhistory_app is not",
     ]);
