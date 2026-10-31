@@ -1,0 +1,530 @@
+{
+  "firstQueryAfterLoad": {
+    "activeParts": 119,
+    "ms": 13397,
+    "over5sLimit": true
+  },
+  "scale": "M",
+  "corpus": "5bee201c99899f0a29e70c0722d4c686dc32d198f89348745e3d6ea19c4b7d71",
+  "querySet": "2026-10-31.1",
+  "engine": "26.8.34.13",
+  "loaded": 4042620,
+  "gates": {
+    "G0_negative_controls": {
+      "status": "PASS",
+      "checks": {
+        "unscopedSeesData": true,
+        "recheckRemovesScatteredGrams": true,
+        "dedupTokenMatters": true,
+        "recallCheckCanFail": true
+      }
+    },
+    "G1_courier_to_search": {
+      "status": "PASS",
+      "checks": {
+        "realCourierUploaded": true,
+        "jobsConsumed": true,
+        "firstHit": true,
+        "plantedSecretWasInSource": true,
+        "plantedSecretNotSearchable": true,
+        "scrubbedRecordStillIndexed": true,
+        "appendSearchable": true,
+        "retryDeduplicated": true,
+        "staleSkipped": true,
+        "quarantineSkipped": true,
+        "optOutSkipped": true
+      },
+      "detail": {
+        "firstHitMs": 112,
+        "rowsBefore": 3,
+        "rowsAfterRetry": 3,
+        "outcomes": [
+          "indexed",
+          "indexed",
+          "skipped_opt_out"
+        ],
+        "note": "the search-index step is proof code called from session-indexed; no such queue stage exists"
+      }
+    },
+    "G2_lexical_recall": {
+      "status": "PASS",
+      "checks": {
+        "org-0/phrase": true,
+        "org-0/error": true,
+        "org-0/path": true,
+        "org-0/pr": true,
+        "org-0/case": true,
+        "org-0/substring": true,
+        "org-0/cjk": true,
+        "org-0/accent": true,
+        "org-0/short": true,
+        "org-0/punct": true,
+        "org-0/tail": true,
+        "org-0/common": true,
+        "org-1/phrase": true,
+        "org-1/error": true,
+        "org-1/path": true,
+        "org-1/pr": true,
+        "org-1/case": true,
+        "org-1/substring": true,
+        "org-1/cjk": true,
+        "org-1/accent": true,
+        "org-1/short": true,
+        "org-1/punct": true,
+        "org-1/tail": true,
+        "org-1/common": true
+      },
+      "detail": {
+        "queries": "2026-10-31.1",
+        "rows": [
+          {
+            "org": "org-0",
+            "id": "phrase",
+            "cls": "phrase",
+            "truth": 1092,
+            "count": 1092,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "error",
+            "cls": "error",
+            "truth": 898,
+            "count": 898,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "path",
+            "cls": "file_path",
+            "truth": 860,
+            "count": 860,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "pr",
+            "cls": "pr_number",
+            "truth": 307,
+            "count": 307,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "case",
+            "cls": "case_fold",
+            "truth": 416,
+            "count": 416,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "substring",
+            "cls": "substring",
+            "truth": 420,
+            "count": 420,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "cjk",
+            "cls": "cjk",
+            "truth": 416,
+            "count": 416,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "accent",
+            "cls": "non_ascii",
+            "truth": 418,
+            "count": 418,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "short",
+            "cls": "short_term",
+            "truth": 200,
+            "count": 200,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "punct",
+            "cls": "punctuation",
+            "truth": 201,
+            "count": 201,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "tail",
+            "cls": "beyond_4kb",
+            "truth": 423,
+            "count": 423,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-0",
+            "id": "common",
+            "cls": "common",
+            "truth": 26744,
+            "count": 26744,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "phrase",
+            "cls": "phrase",
+            "truth": 110,
+            "count": 110,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "error",
+            "cls": "error",
+            "truth": 85,
+            "count": 85,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "path",
+            "cls": "file_path",
+            "truth": 92,
+            "count": 92,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "pr",
+            "cls": "pr_number",
+            "truth": 35,
+            "count": 35,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "case",
+            "cls": "case_fold",
+            "truth": 49,
+            "count": 49,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "substring",
+            "cls": "substring",
+            "truth": 44,
+            "count": 44,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "cjk",
+            "cls": "cjk",
+            "truth": 59,
+            "count": 59,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "accent",
+            "cls": "non_ascii",
+            "truth": 43,
+            "count": 43,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "short",
+            "cls": "short_term",
+            "truth": 24,
+            "count": 24,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "punct",
+            "cls": "punctuation",
+            "truth": 27,
+            "count": 27,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "tail",
+            "cls": "beyond_4kb",
+            "truth": 47,
+            "count": 47,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          },
+          {
+            "org": "org-1",
+            "id": "common",
+            "cls": "common",
+            "truth": 2971,
+            "count": 2971,
+            "r5": 1,
+            "r10": 1,
+            "falseMatches": 0
+          }
+        ]
+      }
+    },
+    "G3_context_recall": {
+      "status": "PASS",
+      "checks": {
+        "phrase/windowHasMatch": true,
+        "phrase/focusFindsEvent": true,
+        "phrase/chronological": true,
+        "phrase/snippetBounded": true,
+        "phrase/citation": true,
+        "phrase/cursorNoRepeat": true,
+        "error/windowHasMatch": true,
+        "error/focusFindsEvent": true,
+        "error/chronological": true,
+        "error/snippetBounded": true,
+        "error/citation": true,
+        "error/cursorNoRepeat": true,
+        "path/windowHasMatch": true,
+        "path/focusFindsEvent": true,
+        "path/chronological": true,
+        "path/snippetBounded": true,
+        "path/citation": true,
+        "path/cursorNoRepeat": true,
+        "pr/windowHasMatch": true,
+        "pr/focusFindsEvent": true,
+        "pr/chronological": true,
+        "pr/snippetBounded": true,
+        "pr/citation": true,
+        "pr/cursorNoRepeat": true,
+        "case/windowHasMatch": true,
+        "case/focusFindsEvent": true,
+        "case/chronological": true,
+        "case/snippetBounded": true,
+        "case/citation": true,
+        "case/cursorNoRepeat": true,
+        "substring/windowHasMatch": true,
+        "substring/focusFindsEvent": true,
+        "substring/chronological": true,
+        "substring/snippetBounded": true,
+        "substring/citation": true,
+        "substring/cursorNoRepeat": true,
+        "cjk/windowHasMatch": true,
+        "cjk/focusFindsEvent": true,
+        "cjk/chronological": true,
+        "cjk/snippetBounded": true,
+        "cjk/citation": true,
+        "cjk/cursorNoRepeat": true,
+        "accent/windowHasMatch": true,
+        "accent/focusFindsEvent": true,
+        "accent/chronological": true,
+        "accent/snippetBounded": true,
+        "accent/citation": true,
+        "accent/cursorNoRepeat": true,
+        "short/windowHasMatch": true,
+        "short/focusFindsEvent": true,
+        "short/chronological": true,
+        "short/snippetBounded": true,
+        "short/citation": true,
+        "short/cursorNoRepeat": true,
+        "punct/windowHasMatch": true,
+        "punct/focusFindsEvent": true,
+        "punct/chronological": true,
+        "punct/snippetBounded": true,
+        "punct/citation": true,
+        "punct/cursorNoRepeat": true,
+        "tail/windowHasMatch": true,
+        "tail/focusFindsEvent": true,
+        "tail/chronological": true,
+        "tail/snippetBounded": true,
+        "tail/citation": true,
+        "tail/cursorNoRepeat": true
+      }
+    },
+    "G4_federation": {
+      "status": "PASS",
+      "checks": {
+        "beforeT0LegacyOnly": true,
+        "afterT0EachOnce": true,
+        "tenantScoped": true,
+        "paginationEachOnce": true,
+        "storeDownNamed": true,
+        "legacyDownNamed": true
+      },
+      "detail": {
+        "knownGap": {
+          "query": "fedlongterm",
+          "preT0HitsBeyond4KB": 0,
+          "note": "pre-T0 text past 4 KB stays unsearchable until a backfill"
+        }
+      }
+    },
+    "G5_tenant_isolation": {
+      "status": "PASS",
+      "checks": {
+        "zeroCanaryLeaks": true,
+        "positiveControl": true,
+        "emptyScopeRefused": true,
+        "emptyOrgRefused": true,
+        "injection/quote": true,
+        "injection/union": true,
+        "injection/brace": true,
+        "injection/settings": true,
+        "crossTenantContextEmpty": true,
+        "rowPolicyBackstop": true,
+        "missingSettingFailsClosed": true,
+        "readerCannotWrite": true,
+        "readerCannotDrop": true,
+        "craftedCursorStaysScoped": true
+      },
+      "detail": {
+        "attempts": 1260,
+        "leaks": 0,
+        "boundary": "#233: the row policy is a backstop; any caller who can set SQL_relay_org reads that tenant, so the chokepoint is the boundary"
+      }
+    },
+    "G6_shape": {
+      "status": "PARTIAL",
+      "detail": {
+        "issues": [],
+        "target": {
+          "events": 4080000,
+          "whaleOrgEvents": 1300000
+        },
+        "loaded": 4042620,
+        "whale": 1283692,
+        "unverified": "sanitized totals only; event sizes, session sizes, share over 4 KB and growth are assumed"
+      }
+    },
+    "G7_latency_load": {
+      "status": "RELATIVE",
+      "detail": {
+        "engine": "vanilla ClickHouse, one local node",
+        "coldMs": {
+          "n": 24,
+          "p50": 51.8,
+          "p95": 148.4,
+          "p99": 162.6
+        },
+        "warmMs": {
+          "n": 24,
+          "p50": 33.7,
+          "p95": 47.5,
+          "p99": 67.8
+        },
+        "levels": [
+          {
+            "clients": 1,
+            "qps": 25,
+            "errors": 0,
+            "errorRate": 0,
+            "n": 492,
+            "p50": 37,
+            "p95": 52.2,
+            "p99": 156.8
+          },
+          {
+            "clients": 8,
+            "qps": 90,
+            "errors": 0,
+            "errorRate": 0,
+            "n": 1808,
+            "p50": 75.5,
+            "p95": 157.7,
+            "p99": 378.1
+          },
+          {
+            "clients": 32,
+            "qps": 144,
+            "errors": 0,
+            "errorRate": 0,
+            "n": 2901,
+            "p50": 219,
+            "p95": 342.5,
+            "p99": 420.8
+          }
+        ]
+      }
+    },
+    "G8_freshness": {
+      "status": "RELATIVE",
+      "detail": {
+        "insertToFirstHitMs": {
+          "n": 271,
+          "p50": 17.6,
+          "p95": 45.2,
+          "p99": 76.5
+        },
+        "note": "store only; pipeline queue latency is in G1 firstHitMs"
+      }
+    },
+    "G10_delete_logical": {
+      "status": "PASS",
+      "checks": {
+        "contextGone": true,
+        "searchGone": true
+      },
+      "detail": {
+        "physicalPurge": "gate 3 of #70; target-engine purge not measured"
+      }
+    },
+    "G9_noisy_neighbour": {
+      "status": "INHERITED_FAIL",
+      "detail": "#233 gate 7 fails against 2x; not rerun here"
+    },
+    "G11_cost_teardown": {
+      "status": "NOT_RUN",
+      "detail": "plan in docs/session-search-proof.md; no account exists"
+    }
+  }
+}
