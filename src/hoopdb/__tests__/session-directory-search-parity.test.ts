@@ -857,6 +857,24 @@ describe("typed refusals, never empty results", () => {
     });
   }
 
+  test("agent trimming matches the RPC's btrim: spaces only", async () => {
+    // A tab-only agent is not blank to lower(btrim(...)); TypeScript must not refuse it.
+    const built = searchRpcRequest({ workspaceId: "ws-a", agent: "\t" });
+    expect(built.ok).toBe(true);
+    expect(built.ok && built.body.p_agent).toBe("\t");
+    expect(
+      await rpc(db, A, { p_workspace_id: "ws-a", p_agent: "\t" }),
+    ).toEqual([]);
+  });
+
+  test("an unparseable since or until is a typed 22023 in TypeScript", () => {
+    for (const field of ["since", "until"] as const) {
+      const built = searchRpcRequest({ workspaceId: "ws-a", [field]: "not-a-date" });
+      expect(built.ok).toBe(false);
+      expect(!built.ok && built.code).toBe("22023");
+    }
+  });
+
   test("SQL-only refusals: incomplete cursor, unknown agent match", async () => {
     for (const body of [
       { p_workspace_id: "ws-a", p_cursor_session_id: "s-0001" },
