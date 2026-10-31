@@ -39,10 +39,25 @@ This record is not that approval. Each of these needs it separately:
 - merging migration PRs that change production behaviour;
 - cutover and rollback.
 
-## Amendment 1: ObsessionDB as the transcript search store (DRAFT)
+## Amendment 1: ObsessionDB as the intended transcript search store (DRAFT, CONDITIONAL)
 
-**Status:** decided by Khaliq on 2026-10-31 in the lead session, relayed by
-the coordinator. The decisions are K-28 ("Yes, add ObsessionDB"), K-33
+**Status: conditional.** Khaliq approved ObsessionDB on 2026-10-31 as the
+**intended** production transcript store. It is **confirmed only after
+capability and security evidence**: gate G-T0E in
+`docs/relayhistory-supabase-migration-plan.md`. That covers:
+- full-text and substring performance at scale;
+- tenant isolation via row policies;
+- erasure and delete semantics;
+- IP allowlisting and private networking;
+- SOC 2 and security posture;
+- `us-east-1` availability;
+- backup and rebuild from S3.
+
+Until G-T0E passes and Khaliq confirms in his own words, this amendment
+**does not** add ObsessionDB to the production data plane. If ObsessionDB
+fails, the store choice returns to Khaliq.
+
+The decisions are K-28 ("Yes, add ObsessionDB", restated as conditional), K-33
 (region), K-34 ("Include it in the T0 gate") and K-36 ("No embeddings
 pre-T0", which supersedes K-34 as written). helm-chart-chief records
 relayed rulings as PROPOSED until Khaliq confirms them in its session. This text is a draft in
@@ -51,8 +66,8 @@ relayed rulings as PROPOSED until Khaliq confirms them in its session. This text
 
 ### Decision
 
-- **Production data plane:** Supabase (database) + AWS S3 (objects) +
-  **ObsessionDB (transcript search store)**.
+- **Production data plane, once confirmed:** Supabase (database) + AWS S3
+  (objects) + **ObsessionDB (transcript search store)**.
 - **ObsessionDB's role:**
   - lexical transcript search for the MCP tools (`search_shared_sessions`
     excerpts, the `get_shared_session_context` window);
@@ -78,14 +93,18 @@ relayed rulings as PROPOSED until Khaliq confirms them in its session. This text
   dashboard search (K-27, K-34 and K-36; `docs/relayhistory-supabase-migration-plan.md` gate G-T).
 - Pre-T0 history keeps legacy transcript and hybrid search on the frozen
   Neon T0 child branch until it is loaded into ObsessionDB (K-6).
-- ClickHouse is no longer a production candidate. relayhistory-cloud #233
-  should be updated to match.
+- ClickHouse Cloud is trialled with synthetic data only, with a $50 hard
+  cap (K-37), as an engine comparison for the evidence gate. The ObsessionDB
+  free dev service (eu-central) is used for functional checks only. Neither
+  trial is production provisioning.
+- relayhistory-cloud #233 should be updated to match.
 - The "AWS is S3 only" rule above still applies to resources we operate,
   with one exception: the ObsessionDB service in `us-east-1`. Its hosting
   model and account are open (plan Q21).
 
 ### Still needs Khaliq's explicit OK for each exact action
 
+- confirming ObsessionDB after G-T0E;
 - provisioning ObsessionDB (production and staging) and its credentials;
 - enabling the feed into it;
 - any later embedding stage, including the model, provider and budget
