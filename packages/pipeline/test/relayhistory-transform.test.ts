@@ -14,6 +14,7 @@ import {
   readAll,
   type ChunkEntry,
   type ManifestV1,
+  type ObjectStore,
   type SessionLocation,
 } from "../src/lib/pipeline/object-layout.js";
 import { objectStoreManifestReader } from "../src/lib/pipeline/adapter.js";
@@ -144,7 +145,11 @@ async function fixture() {
       "client.relayhistory_export": {
         version: 1,
         source: "neon.delivery_records",
+        grant_id: "mgr_test",
+        plan_digest: "a".repeat(64),
+        source_user_id: "user-1",
       },
+      "96bulls": { user_id: "user-1" },
     },
   };
   const key = manifestKey(loc);
@@ -253,39 +258,92 @@ describe("RelayHistory export transform", () => {
 
   describe("records delivered by two origins", () => {
     const at = (seconds: number) => `2026-10-30 12:00:0${seconds}+00`;
-    const copy = (origin_id: string, text: string, received_at: string) =>
-      record("same", "1", 1, { origin_id, received_at, payload: { ts_ms: 1, text } });
-    const permutations = <T,>(items: T[]): T[][] =>
-      items.length < 2
-        ? [items]
-        : items.flatMap((item, i) =>
-            permutations(items.filter((_, j) => j !== i)).map((rest) => [item, ...rest]),
-          );
+    const copy = (origin_id: string, text: string, received_at: string, accepted_seq: string) => ({
+      ...record("same", "1", 1, { origin_id, received_at, payload: { ts_ms: 1, text } }),
+      accepted_seq,
+    });
 
-    it("ranks each write by its first delivery, whatever order lines arrive in", () => {
-      // origin-a's replay at second 3 is not a newer write than origin-b's at 2.
+    it("ranks by the ledger, so a replay or a later stamp can't outrank a later write", () => {
       const lines = [
-        copy("origin-a", "from-a", at(1)),
-        copy("origin-a", "from-a", at(3)),
-        copy("origin-b", "from-b", at(2)),
+        copy("origin-a", "from-a", at(3), "1"),
+        copy("origin-a", "from-a", at(5), "1"),
+        copy("origin-b", "from-b", at(2), "2"),
       ];
-      for (const order of permutations(lines))
+      for (const order of [lines, [...lines].reverse(), [lines[1]!, lines[2]!, lines[0]!]])
         expect(normalizeRelayhistoryRecords(order).map((value) => value.origin_id)).toEqual(["origin-b"]);
     });
 
-    it("settles the same instant by origin, not by how the time is spelled", () => {
+    it("compares sequence numbers exactly, past a double's precision", () => {
       const lines = [
-        copy("origin-a", "from-a", "2026-10-30T12:00:00.000Z"),
-        copy("origin-b", "from-b", "2026-10-30 12:00:00+00"),
+        copy("origin-a", "from-a", at(1), "9007199254740993"),
+        copy("origin-b", "from-b", at(1), "9007199254740992"),
       ];
-      for (const order of permutations(lines))
-        expect(normalizeRelayhistoryRecords(order).map((value) => value.origin_id)).toEqual(["origin-b"]);
-      const respelled = [
-        copy("origin-a", "from-a", "2026-10-30 12:00:00+00"),
-        copy("origin-b", "from-b", "2026-10-30T12:00:00.000Z"),
-      ];
-      for (const order of permutations(respelled))
-        expect(normalizeRelayhistoryRecords(order).map((value) => value.origin_id)).toEqual(["origin-b"]);
+      expect(normalizeRelayhistoryRecords(lines).map((value) => value.origin_id)).toEqual(["origin-a"]);
+    });
+
+    it("refuses a malformed sequence number", () => {
+      expect(() =>
+        parseRelayhistoryRecord(JSON.stringify({ ...record("a", "1", 1), accepted_seq: "9223372036854775808" })),
+      ).toThrow(expect.objectContaining({ code: "relayhistory_record_invalid" }));
+    });
+  });
+
+  describe("provenance", () => {
+    const edited = async (change: (manifest: ManifestV1) => void) => {
+      const f = await fixture();
+      const manifest = structuredClone(f.manifest);
+      change(manifest);
+      return { manifest, store: f.store };
+    };
+    const marker = (m: ManifestV1) => m.extensions!["client.relayhistory_export"] as Record<string, unknown>;
+
+    it.each<[string, (m: ManifestV1) => void]>([
+      ["no grant", (m) => void delete marker(m).grant_id],
+      ["no plan digest", (m) => void delete marker(m).plan_digest],
+      ["a malformed plan digest", (m) => void (marker(m).plan_digest = "not-a-digest")],
+      ["no source user", (m) => void delete marker(m).source_user_id],
+      ["no 96bulls user", (m) => void delete m.extensions!["96bulls"]],
+      ["another 96bulls user", (m) => void (m.extensions!["96bulls"] = { user_id: "user-2" })],
+      ["a live stream with no backfill", (m) => void (m.raw.epochs[1]!.reason = "truncated")],
+      ["a backfill another grant opened", (m) => void (m.raw.epochs[1]!.opened_by = "migration:mgr_other")],
+    ])("refuses a marker with %s", async (_name, change) => {
+      const { manifest, store } = await edited(change);
+      await expect(readRelayhistoryExport(manifest, store)).rejects.toMatchObject({
+        code: "relayhistory_export_provenance",
+        retryable: false,
+      });
+    });
+
+    it("accepts a cold export its grant owns", async () => {
+      const { manifest, store } = await edited((m) => {
+        m.raw.owner = "migration:mgr_test";
+        m.raw.epochs[1]!.opened_by = "migration:mgr_other";
+      });
+      await expect(readRelayhistoryExport(manifest, store)).resolves.toHaveLength(3);
+    });
+  });
+
+  describe("session size", () => {
+    it("refuses a session past its total before reading any chunk", async () => {
+      const f = await fixture();
+      let reads = 0;
+      const store: ObjectStore = Object.create(f.store);
+      store.get = async (...args) => {
+        reads += 1;
+        return f.store.get(...args);
+      };
+      const total = f.manifest.raw.chunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+      await expect(readRelayhistoryExport(f.manifest, store, undefined, total - 1)).rejects.toMatchObject({
+        code: "relayhistory_session_too_large",
+        retryable: false,
+      });
+      expect(reads).toBe(0);
+    });
+
+    it("reads a session exactly at its total", async () => {
+      const f = await fixture();
+      const total = f.manifest.raw.chunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+      await expect(readRelayhistoryExport(f.manifest, f.store, undefined, total)).resolves.toHaveLength(3);
     });
   });
 
@@ -336,7 +394,7 @@ describe("RelayHistory export transform", () => {
             record("catalog", "1", 2, { kind: "session", payload: { title: "t" } }),
             record("presence", "1", 3, { kind: "presence" }),
           ],
-          { workspaceId: "workspace", source: "claude", sessionId: "session" },
+          { workspaceId: "workspace", source: "claude", sessionId: "session", machineId: "machine", userId: "user-1" },
         ),
       ).toMatchObject({ unprojected: 1 });
     });

@@ -24,7 +24,6 @@ import type { ManifestRead, ManifestReader } from "./adapter.js";
 import { PipelineError } from "./errors.js";
 import {
   CONVERGENCE_EVENT_KIND,
-  canonicalTimestamp,
   projectRelayhistorySession,
   type ProjectionRow,
 } from "./relayhistory-projection.js";
@@ -40,6 +39,8 @@ import type {
 export const RELAYHISTORY_NORMALIZED_VERSION = 2;
 export const RELAYHISTORY_EXPORT_EXTENSION = "client.relayhistory_export";
 const MAX_RELAYHISTORY_CHUNK_BYTES = 16 * 1024 * 1024;
+/** Everything is held in memory to fold it, so a session past this is refused. */
+export const MAX_RELAYHISTORY_SESSION_BYTES = 256 * 1024 * 1024;
 const MAX_REVISION = 9_223_372_036_854_775_807n;
 
 export interface RelayhistoryStreamRecord {
@@ -50,6 +51,11 @@ export interface RelayhistoryStreamRecord {
   operation: "upsert" | "delete";
   received_at: string;
   payload: Record<string, unknown> | null;
+  /**
+   * The record's place in the source's acceptance ledger: the order the live
+   * projection settles contenders in. Absent on records with no such ledger.
+   */
+  accepted_seq?: string;
 }
 
 export type ZstdDecompress = (stored: Uint8Array) => Uint8Array;
@@ -58,15 +64,46 @@ function fail(code: string, message: string): never {
   throw new PipelineError(code, message, false);
 }
 
-function exported(manifest: ManifestV1): boolean {
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === "object" && !Array.isArray(value);
+
+/**
+ * Who an exported session belongs to, once its manifest shows it. The ingest
+ * checks the marker against the signed assertion and refuses it from any other
+ * writer (`manifestOwnerIssue`, `migrationManifestProvenance`); the transform
+ * has no assertion, so it requires what that leaves behind: the marker's signed
+ * fields, the same user in `96bulls`, and a stream the grant itself opened,
+ * either as raw owner of a cold export or as the opener of the backfill epoch.
+ */
+export function relayhistoryExportProvenance(manifest: ManifestV1): {
+  grantId: string;
+  sourceUserId: string;
+} {
   const marker = manifest.extensions?.[RELAYHISTORY_EXPORT_EXTENSION];
-  return (
-    !!marker &&
-    typeof marker === "object" &&
-    !Array.isArray(marker) &&
-    (marker as Record<string, unknown>).version === 1 &&
-    (marker as Record<string, unknown>).source === "neon.delivery_records"
-  );
+  if (!isObject(marker) || marker.version !== 1 || marker.source !== "neon.delivery_records")
+    fail("relayhistory_export_marker_missing", "manifest is not a RelayHistory export");
+  const { grant_id: grantId, plan_digest: planDigest, source_user_id: sourceUserId } = marker;
+  const bulls = manifest.extensions?.["96bulls"];
+  if (
+    typeof grantId !== "string" ||
+    !grantId ||
+    typeof planDigest !== "string" ||
+    !/^[0-9a-f]{64}$/.test(planDigest) ||
+    typeof sourceUserId !== "string" ||
+    !sourceUserId ||
+    !isObject(bulls) ||
+    bulls.user_id !== sourceUserId
+  )
+    fail("relayhistory_export_provenance", "export marker has no signed provenance");
+  const migration = `migration:${grantId}`;
+  if (
+    manifest.raw.owner !== migration &&
+    !manifest.raw.epochs.some(
+      (epoch) => epoch.reason === "backfill" && epoch.opened_by === migration,
+    )
+  )
+    fail("relayhistory_export_provenance", "export marker is not on a stream its grant opened");
+  return { grantId, sourceUserId };
 }
 
 function carriesRecords(manifest: ManifestV1): boolean {
@@ -108,6 +145,14 @@ export function parseRelayhistoryRecord(line: string): RelayhistoryStreamRecord 
     fail("relayhistory_record_invalid", "RelayHistory record revision is not numeric");
   if (!Number.isFinite(Date.parse(receivedAt)))
     fail("relayhistory_record_invalid", "RelayHistory record received_at is invalid");
+  const acceptedSeq = record.accepted_seq;
+  if (
+    acceptedSeq !== undefined &&
+    (typeof acceptedSeq !== "string" ||
+      !/^(?:0|[1-9][0-9]{0,18})$/.test(acceptedSeq) ||
+      BigInt(acceptedSeq) > MAX_REVISION)
+  )
+    fail("relayhistory_record_invalid", "RelayHistory record accepted_seq is not numeric");
   if (operation !== "upsert" && operation !== "delete")
     fail("relayhistory_record_invalid", "RelayHistory record operation is invalid");
   if (
@@ -125,6 +170,7 @@ export function parseRelayhistoryRecord(line: string): RelayhistoryStreamRecord 
     operation,
     received_at: receivedAt,
     payload: payload as Record<string, unknown> | null,
+    ...(acceptedSeq !== undefined ? { accepted_seq: acceptedSeq } : {}),
   };
 }
 
@@ -187,8 +233,11 @@ function sameRecord(
   left: RelayhistoryStreamRecord,
   right: RelayhistoryStreamRecord,
 ): boolean {
-  const content = ({ received_at: _at, ...rest }: RelayhistoryStreamRecord) =>
-    JSON.stringify(canonical(rest));
+  const content = ({
+    received_at: _at,
+    accepted_seq: _seq,
+    ...rest
+  }: RelayhistoryStreamRecord) => JSON.stringify(canonical(rest));
   return content(left) === content(right);
 }
 
@@ -204,33 +253,42 @@ function receivedFirst(
 
 /**
  * record_id is origin-independent, and the live projection keeps one row for it:
- * the newest write from any origin, so a newest tombstone removes the record
- * whichever origin wrote the upsert. `received_at`, then origin, is the order
- * the projection itself falls back to for writes with no acceptance ledger.
- *
- * This runs after the fold, and the two rules differ on purpose. The fold picks
- * among copies of one write, so the earliest `received_at` is that write's own,
- * as a replay never restamps it. Here the contenders are different writes, so
- * the latest wins, compared as instants; origin settles a tie, since timestamp
- * spelling says nothing about which write is newer.
+ * the last write accepted from any origin, so a tombstone accepted last removes
+ * the record whichever origin wrote the upsert. Only the acceptance ledger knows
+ * that order: `received_at` is transaction start, so a writer that waited on the
+ * lock carries an older stamp than the write it follows. Contenders without
+ * `accepted_seq` are refused rather than guessed at.
  */
 function newestAcrossOrigins(
   records: Iterable<RelayhistoryStreamRecord>,
 ): RelayhistoryStreamRecord[] {
-  const newest = new Map<string, RelayhistoryStreamRecord>();
   const out: RelayhistoryStreamRecord[] = [];
-  const rank = (record: RelayhistoryStreamRecord) =>
-    `${canonicalTimestamp(record.received_at)}\0${record.origin_id}`;
+  const contenders = new Map<string, RelayhistoryStreamRecord[]>();
   for (const record of records) {
     if (record.kind === CONVERGENCE_EVENT_KIND) {
       out.push(record);
       continue;
     }
-    const held = newest.get(record.record_id);
-    if (!held || compareText(rank(record), rank(held)) > 0)
-      newest.set(record.record_id, record);
+    const group = contenders.get(record.record_id);
+    if (group) group.push(record);
+    else contenders.set(record.record_id, [record]);
   }
-  return [...out, ...newest.values()];
+  for (const group of contenders.values())
+    out.push(group.reduce(lastAccepted));
+  return out;
+}
+
+/** The later accepted of two contenders, by the source's ledger alone. */
+export function lastAccepted(
+  left: RelayhistoryStreamRecord,
+  right: RelayhistoryStreamRecord,
+): RelayhistoryStreamRecord {
+  if (left.accepted_seq === undefined || right.accepted_seq === undefined)
+    fail(
+      "relayhistory_acceptance_missing",
+      "contending RelayHistory records have no acceptance order",
+    );
+  return BigInt(right.accepted_seq) > BigInt(left.accepted_seq) ? right : left;
 }
 
 /** Latest live records, deterministic regardless of live/backfill arrival order. */
@@ -253,7 +311,9 @@ export function normalizeRelayhistoryRecords(
       );
     // One record stored twice: the earlier copy wins whichever arrived first,
     // so the output bytes do not depend on arrival order.
-    if (receivedFirst(record, previous)) latest.set(key, record);
+    const first = receivedFirst(record, previous) ? record : previous;
+    const seq = record.accepted_seq ?? previous.accepted_seq;
+    latest.set(key, seq === undefined ? first : { ...first, accepted_seq: seq });
   }
   return newestAcrossOrigins(latest.values())
     .filter((record) => record.operation === "upsert" && record.payload !== null)
@@ -285,13 +345,19 @@ export async function readRelayhistoryExport(
   manifest: ManifestV1,
   store: ObjectStore,
   decompress?: ZstdDecompress,
+  maxSessionBytes: number = MAX_RELAYHISTORY_SESSION_BYTES,
 ): Promise<RelayhistoryStreamRecord[]> {
-  if (!exported(manifest))
-    fail("relayhistory_export_marker_missing", "manifest is not a RelayHistory export");
+  relayhistoryExportProvenance(manifest);
   if (!manifest.raw.scrub)
     fail("relayhistory_export_quarantined", "RelayHistory export is not scrubbed");
   if (manifest.raw.format !== "ndjson")
     fail("relayhistory_export_format", "RelayHistory export must use ndjson");
+  const declared = manifest.raw.chunks.reduce(
+    (total, chunk) => total + Math.max(chunk.bytes, chunk.stored_raw_bytes ?? 0),
+    0,
+  );
+  if (declared > maxSessionBytes)
+    fail("relayhistory_session_too_large", "RelayHistory session exceeds the transform limit");
   const loc = manifestLocation(manifest);
   const records: RelayhistoryStreamRecord[] = [];
   for (const chunk of manifest.raw.chunks) {
@@ -365,8 +431,20 @@ export async function readRelayhistoryExport(
   return normalizeRelayhistoryRecords(records);
 }
 
+/** JSON text, with a bigint as the exact number it is. */
+function encoded(value: unknown): string {
+  if (typeof value === "bigint") return value.toString();
+  if (Array.isArray(value)) return `[${value.map(encoded).join(",")}]`;
+  if (isObject(value))
+    return `{${Object.entries(value)
+      .filter(([, child]) => child !== undefined)
+      .map(([key, child]) => `${JSON.stringify(key)}:${encoded(child)}`)
+      .join(",")}}`;
+  return JSON.stringify(value);
+}
+
 function encodedRows(rows: readonly ProjectionRow[]): Uint8Array {
-  const lines = rows.map((row) => JSON.stringify(canonical(row)));
+  const lines = rows.map((row) => encoded(canonical(row)));
   return new TextEncoder().encode(lines.length ? `${lines.join("\n")}\n` : "");
 }
 
@@ -430,6 +508,7 @@ export class RelayhistoryExportTransform implements SessionTransform {
       manifests: ManifestReader;
       store: ObjectStore;
       decompress?: ZstdDecompress;
+      maxSessionBytes?: number;
     },
   ) {}
 
@@ -450,12 +529,15 @@ export class RelayhistoryExportTransform implements SessionTransform {
       manifest,
       this.deps.store,
       this.deps.decompress,
+      this.deps.maxSessionBytes,
     );
     const location = manifestLocation(manifest);
     const projection = projectRelayhistorySession(records, {
       workspaceId: location.workspaceId,
       source: location.harness,
       sessionId: location.sessionId,
+      machineId: location.machineId,
+      userId: relayhistoryExportProvenance(manifest).sourceUserId,
     });
     const body = encodedRows(projection.rows);
     const key = normalizedKey(

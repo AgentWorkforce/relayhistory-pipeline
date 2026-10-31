@@ -213,6 +213,12 @@ async function code(response: Response) {
   return ((await response.json()) as { error?: { code?: string } }).error?.code;
 }
 
+/** A live writer's manifest: only a migration sets the export marker. */
+function liveManifest(manifest: ManifestV1): ManifestV1 {
+  const { "client.relayhistory_export": _marker, ...extensions } = manifest.extensions ?? {};
+  return { ...manifest, extensions };
+}
+
 describe("AlleyOop manifest route: migration assertions", () => {
   test("commits the ledger row and the enriched pipeline_jobs row together; a replay is 409 migration_assertion_replayed", async () => {
     const f = await fixture();
@@ -290,7 +296,7 @@ describe("AlleyOop manifest route: migration assertions", () => {
     // Ordinary (live) tokens are unaffected by the ledger. (Checked first: the
     // fixtures below share this test's store, and #42's owner fence then
     // refuses a live write over a migration-owned manifest.)
-    expect((await none.post(ordinaryAuth, await none.build({}, {}, MACHINE))).status).toBe(202);
+    expect((await none.post(ordinaryAuth, liveManifest(await none.build({}, {}, MACHINE)))).status).toBe(202);
     expect(none.sent).toHaveLength(1);
     await rm(root, { recursive: true, force: true });
     const down: MigrationAssertionLedger = {
@@ -413,7 +419,7 @@ describe("AlleyOop manifest route: migration assertions", () => {
     const f = await fixture();
     // A live session exists at the key.
     const live = await f.build({}, {}, MACHINE);
-    expect((await f.post(ordinaryAuth, live)).status).toBe(202);
+    expect((await f.post(ordinaryAuth, liveManifest(live))).status).toBe(202);
     // Same content as a new revision without the CAS version: #42 refuses.
     const sameContent = await f.post(f.as(), { ...live, revision: 2 } as ManifestV1);
     expect(sameContent.status).toBe(409);

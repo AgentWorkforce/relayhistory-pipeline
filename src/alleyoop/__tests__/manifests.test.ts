@@ -319,6 +319,31 @@ describe("AlleyOop courier manifest routes", () => {
     ]);
   });
 
+  test("refuses the export marker from a live writer", async () => {
+    const f = await fixture();
+    const key = manifestKey(f.location);
+    const marker = {
+      "client.relayhistory_export": {
+        version: 1,
+        source: "neon.delivery_records",
+        grant_id: "mgr_export",
+        plan_digest: "a".repeat(64),
+        source_user_id: "user",
+      },
+    };
+    const first = await f.build(1, MACHINE);
+    first.extensions = { ...first.extensions, ...marker };
+    expect((await f.post({ key, manifest: first })).status).toBe(409);
+
+    const plain = await f.build(1, MACHINE);
+    const created = await f.post({ key, manifest: plain });
+    expect(created.status).toBe(202);
+    const { version } = await created.json() as { version: { eTag?: string } };
+    const next = await f.build(2, MACHINE);
+    next.extensions = { ...next.extensions, ...marker };
+    expect((await f.post({ key, manifest: next, previousVersion: version })).status).toBe(409);
+  });
+
   test("creates a cold export only under the migration grant owner", async () => {
     const f = await fixture();
     const key = manifestKey(f.location);

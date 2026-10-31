@@ -149,8 +149,10 @@ manifest body.
   `client.relayhistory_export`, reads the canonical record envelopes from all
   live and backfill epochs, keeps the highest numeric revision of each
   `(origin_id, record_id)`, applies tombstones and orders the survivors by
-  event time. A record delivered by two origins keeps only its newest write,
-  as the live projection does. It projects the survivors into the rows the live
+  event time. A record delivered by two origins keeps only the write accepted
+  last, as the live projection does. That order comes from `accepted_seq`, the
+  source's acceptance ledger on each line: `received_at` cannot rebuild it, and
+  contenders without it are refused. It projects the survivors into the rows the live
   triggers leave (`relayhistory-projection.ts`, held equal to the vendored SQL
   by conformance tests) and writes them, one `{table, row}` per line, to
   `normalized/v2/relayhistory-{raw.content_sha256}.ndjson`. `{table, row}` is

@@ -208,7 +208,8 @@ function manifestOwnerIssue(
     if (migration) {
       if (raw.owner !== migration) return "cold export is not owned by its migration grant";
       if (!exportMarker(incoming)) return "cold export marker is missing";
-    }
+    } else if (incoming.extensions?.["client.relayhistory_export"] !== undefined)
+      return "only a migration writer sets the export marker";
     return undefined;
   }
 
@@ -233,6 +234,13 @@ function manifestOwnerIssue(
   if (!migration) {
     if (raw.owner !== incoming.writer.delivery_instance_id)
       return "live writer does not own the raw stream";
+    if (
+      !sameJson(
+        incoming.extensions?.["client.relayhistory_export"],
+        existing.extensions?.["client.relayhistory_export"],
+      )
+    )
+      return "only a migration writer sets the export marker";
     if (
       raw.epochs
         .slice(existing.raw.epochs.length)

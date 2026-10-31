@@ -12,11 +12,14 @@
  * changes the projection fails until this file follows it.
  *
  * Rows hold no tenant columns. Delivery-projected rows also have no `user_id`
- * (stream lines do not carry one) and no `embedding`; the session index holds
- * the owner.
+ * or `embedding`; the session index holds the owner.
  */
 import { createHash } from "node:crypto";
-import type { RelayhistoryStreamRecord } from "./relayhistory-transform.js";
+import { PipelineError } from "./errors.js";
+import {
+  lastAccepted,
+  type RelayhistoryStreamRecord,
+} from "./relayhistory-transform.js";
 
 type Json = Record<string, unknown>;
 
@@ -42,6 +45,9 @@ export interface ProjectionContext {
   /** The record `source`, which is the session's harness. */
   source: string;
   sessionId: string;
+  machineId: string;
+  /** The session's user, from the export's provenance. */
+  userId: string;
 }
 
 export const CONVERGENCE_EVENT_KIND = "convergence_event";
@@ -53,8 +59,8 @@ const ACTIVITY_KINDS = new Set([
   "trajectory",
 ]);
 const MAX_TIME_MS = 8_640_000_000_000_000;
-/** bigint's upper bound, as the nearest double. */
-const MAX_COUNT = 2 ** 63;
+/** The largest value a bigint column holds. */
+const MAX_COUNT = 9_223_372_036_854_775_807n;
 
 /**
  * Every timestamp in the output: UTC to the microsecond, so strings sort by
@@ -138,18 +144,53 @@ function catalogJson(value: unknown): unknown {
   }
 }
 
+/** A JSON number as written, for Postgres's numeric arithmetic on it. */
+class JsonNumber {
+  constructor(readonly text: string) {}
+}
+
+function parseLossless(blob: string): unknown {
+  return (JSON.parse as (text: string, reviver: unknown) => unknown)(
+    blob,
+    (_key: string, value: unknown, context: { source: string }) =>
+      typeof value === "number" ? new JsonNumber(context.source) : value,
+  );
+}
+
+/** The digits and power of ten a JSON number's text writes. */
+function decimalParts(text: string) {
+  const [, sign, whole, fraction = "", exponent = "0"] =
+    /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(text)!;
+  return {
+    negative: sign === "-" && /[1-9]/.test(whole! + fraction),
+    digits: BigInt(whole! + fraction),
+    power: Number(exponent) - fraction.length,
+  };
+}
+
+/** `digits * 10^power` for a power small enough to compute; past MAX_COUNT otherwise. */
+function scaled(digits: bigint, power: number): bigint {
+  if (digits === 0n) return 0n;
+  return power > 20 ? MAX_COUNT + 1n : digits * 10n ** BigInt(power);
+}
+
 /**
- * `round(value * 10^places)` on a non-negative JSON number, by its decimal text
- * as Postgres numerics do: binary arithmetic would round some halves down.
+ * `round(value * 10^places)` on a non-negative number, by its decimal text as
+ * Postgres numerics do: binary arithmetic would round some halves down.
  */
-function scaledRound(value: number, places: number): number {
-  const [mantissa, exponent = "0"] = String(value).split("e");
-  const [whole, fraction = ""] = mantissa!.split(".");
-  const digits = BigInt(whole! + fraction);
-  const dropped = fraction.length - Number(exponent) - places;
-  if (dropped <= 0) return Number(digits * 10n ** BigInt(-dropped));
+function scaledRound(value: JsonNumber | number, places: number): bigint {
+  const text = value instanceof JsonNumber ? value.text : String(value);
+  const { digits, power } = decimalParts(text);
+  const dropped = -power - places;
+  if (dropped <= 0) return scaled(digits, -dropped);
+  if (dropped > digits.toString().length) return 0n;
   const divisor = 10n ** BigInt(dropped);
-  return Number((digits + divisor / 2n) / divisor);
+  return (digits + divisor / 2n) / divisor;
+}
+
+/** A bigint column's value in JSON: exact, and a plain number while one can hold it. */
+function exact(value: bigint): number | bigint {
+  return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value;
 }
 
 /** sessions.delivery_activity_ms */
@@ -181,12 +222,20 @@ function projectId(payload: Json): string | null {
 }
 
 /** sessions.delivery_usage_counter: throws where it raises. */
-function usageCounter(value: unknown): number | null {
+function usageCounter(value: unknown): bigint | null {
   if (value === undefined || value === null) return null;
-  if (typeof value !== "number" || value < 0 || !Number.isInteger(value))
-    throw new Error("USAGE_NON_INTEGER_COUNTER");
-  if (value >= MAX_COUNT) throw new Error("USAGE_COUNT_NOT_REPRESENTABLE");
-  return value;
+  if (!(value instanceof JsonNumber)) throw new Error("USAGE_NON_INTEGER_COUNTER");
+  const { negative, digits, power } = decimalParts(value.text);
+  if (negative) throw new Error("USAGE_NON_INTEGER_COUNTER");
+  let count: bigint;
+  if (power >= 0 || digits === 0n) count = scaled(digits, Math.max(power, 0));
+  else {
+    const divisor = 10n ** BigInt(Math.min(-power, digits.toString().length + 1));
+    if (digits % divisor !== 0n) throw new Error("USAGE_NON_INTEGER_COUNTER");
+    count = digits / 10n ** BigInt(-power);
+  }
+  if (count > MAX_COUNT) throw new Error("USAGE_COUNT_NOT_REPRESENTABLE");
+  return count;
 }
 
 /** sessions.delivery_usage_first */
@@ -197,18 +246,23 @@ function usageFirst(object: Json, keys: string[]): unknown {
 }
 
 function isObject(value: unknown): value is Json {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    !(value instanceof JsonNumber)
+  );
 }
 
 interface Usage {
-  input: number;
-  output: number;
-  reasoning: number;
-  cacheRead: number;
-  cacheCreate: number;
-  cacheCreate5m: number | null;
-  cacheCreate1h: number | null;
-  costUsdMicros: number | null;
+  input: bigint;
+  output: bigint;
+  reasoning: bigint;
+  cacheRead: bigint;
+  cacheCreate: bigint;
+  cacheCreate5m: bigint | null;
+  cacheCreate1h: bigint | null;
+  costUsdMicros: bigint | null;
 }
 
 /**
@@ -220,18 +274,18 @@ function normalizedUsage(source: string, blob: string | null): Usage | null {
     return null;
   let token: unknown;
   try {
-    token = JSON.parse(blob);
+    token = parseLossless(blob);
   } catch {
     return null;
   }
   if (!isObject(token)) return null;
-  let input: number | null = null;
-  let output: number | null;
-  let reasoning: number | null;
-  let cacheRead: number | null = null;
-  let cacheWrite: number | null = null;
-  let write5m: number | null = null;
-  let write1h: number | null = null;
+  let input: bigint | null = null;
+  let output: bigint | null;
+  let reasoning: bigint | null;
+  let cacheRead: bigint | null = null;
+  let cacheWrite: bigint | null = null;
+  let write5m: bigint | null = null;
+  let write1h: bigint | null = null;
   let reported: boolean;
   try {
     output = usageCounter(token.output_tokens);
@@ -251,8 +305,8 @@ function normalizedUsage(source: string, blob: string | null): Usage | null {
         cacheWrite = usageCounter(token.cache_write_tokens);
       }
       reported ||= input !== null || cacheRead !== null || cacheWrite !== null;
-      if ((cacheRead ?? 0) > (input ?? 0)) return null;
-      input = (input ?? 0) - (cacheRead ?? 0);
+      if ((cacheRead ?? 0n) > (input ?? 0n)) return null;
+      input = (input ?? 0n) - (cacheRead ?? 0n);
     } else if (source === "claude") {
       input = usageCounter(token.input_tokens);
       cacheRead = usageCounter(token.cache_read_input_tokens);
@@ -267,7 +321,7 @@ function normalizedUsage(source: string, blob: string | null): Usage | null {
         cacheWrite !== null ||
         write5m !== null ||
         write1h !== null;
-      cacheWrite ??= (write5m ?? 0) + (write1h ?? 0);
+      cacheWrite ??= (write5m ?? 0n) + (write1h ?? 0n);
     } else {
       if (!Object.hasOwn(token, "usage")) return null;
       const breakdown = token.usage;
@@ -292,8 +346,8 @@ function normalizedUsage(source: string, blob: string | null): Usage | null {
         reasoning !== null ||
         grokTotal !== null;
       if (input !== null) {
-        if ((cacheRead ?? 0) > input) return null;
-        input -= cacheRead ?? 0;
+        if ((cacheRead ?? 0n) > input) return null;
+        input -= cacheRead ?? 0n;
       }
     }
   } catch {
@@ -301,28 +355,19 @@ function normalizedUsage(source: string, blob: string | null): Usage | null {
   }
   const cost = usageFirst(token, ["cost_usd", "costUSD", "total_cost_usd"]);
   if (cost !== undefined) {
-    if (typeof cost !== "number" || cost < 0) return null;
+    if (!(cost instanceof JsonNumber) || decimalParts(cost.text).negative) return null;
     reported = true;
   }
   if (!reported) return null;
-  const costUsdMicros = typeof cost === "number" ? scaledRound(cost, 6) : null;
-  if (
-    Math.max(
-      input ?? 0,
-      output ?? 0,
-      reasoning ?? 0,
-      cacheRead ?? 0,
-      cacheWrite ?? 0,
-      costUsdMicros ?? 0,
-    ) >= MAX_COUNT
-  )
-    return null;
+  const costUsdMicros = cost === undefined ? null : scaledRound(cost as JsonNumber, 6);
+  for (const count of [input, output, reasoning, cacheRead, cacheWrite, costUsdMicros])
+    if ((count ?? 0n) > MAX_COUNT) return null;
   return {
-    input: input ?? 0,
-    output: output ?? 0,
-    reasoning: reasoning ?? 0,
-    cacheRead: cacheRead ?? 0,
-    cacheCreate: cacheWrite ?? 0,
+    input: input ?? 0n,
+    output: output ?? 0n,
+    reasoning: reasoning ?? 0n,
+    cacheRead: cacheRead ?? 0n,
+    cacheCreate: cacheWrite ?? 0n,
     cacheCreate5m: write5m,
     cacheCreate1h: write1h,
     costUsdMicros,
@@ -523,27 +568,18 @@ function settleRequests(events: Json[], source: string) {
         ? event
         : least,
     );
+    const nullable = (value: bigint | null) => (value === null ? null : exact(value));
     Object.assign(carrier, {
-      input_tokens: usage.input,
-      output_tokens: usage.output,
-      reasoning_tokens: usage.reasoning,
-      cache_read_tokens: usage.cacheRead,
-      cache_create_tokens: usage.cacheCreate,
-      cache_create_5m_tokens: usage.cacheCreate5m,
-      cache_create_1h_tokens: usage.cacheCreate1h,
-      cost_usd_micros: usage.costUsdMicros,
+      input_tokens: exact(usage.input),
+      output_tokens: exact(usage.output),
+      reasoning_tokens: exact(usage.reasoning),
+      cache_read_tokens: exact(usage.cacheRead),
+      cache_create_tokens: exact(usage.cacheCreate),
+      cache_create_5m_tokens: nullable(usage.cacheCreate5m),
+      cache_create_1h_tokens: nullable(usage.cacheCreate1h),
+      cost_usd_micros: nullable(usage.costUsdMicros),
     });
   }
-}
-
-/** The newest of two records contending for one catalog key. */
-function newer(
-  left: RelayhistoryStreamRecord,
-  right: RelayhistoryStreamRecord,
-): RelayhistoryStreamRecord {
-  const a = [canonicalTimestamp(left.received_at), left.origin_id, left.record_id];
-  const b = [canonicalTimestamp(right.received_at), right.origin_id, right.record_id];
-  return a.join("\0") < b.join("\0") ? right : left;
 }
 
 /** sessions.delivery_catalog_key: the row's key within the session, or null. */
@@ -676,7 +712,7 @@ function catalogRows(
             note_ref: catalogText(p.note_ref),
             confidence_basis_points:
               typeof confidence === "number" && confidence >= 0 && confidence <= 1
-                ? scaledRound(confidence, 4)
+                ? Number(scaledRound(confidence, 4))
                 : null,
             files: catalogJson(p.files_json),
             numstat: catalogJson(p.numstat_json),
@@ -691,8 +727,12 @@ function catalogRows(
   }
 }
 
-/** A `convergence_event` line is already a row; only its times are canonicalized. */
-function directEvent(record: RelayhistoryStreamRecord): Json {
+/**
+ * A `convergence_event` line is already a row, but it comes from the stream, so
+ * its identity must be the session the manifest and its provenance name. Only
+ * its times are canonicalized.
+ */
+function directEvent(record: RelayhistoryStreamRecord, context: ProjectionContext): Json {
   const {
     org_id: _org,
     workspace_id: _workspace,
@@ -700,6 +740,19 @@ function directEvent(record: RelayhistoryStreamRecord): Json {
     ts_ms: _ts,
     ...row
   } = record.payload!;
+  if (
+    row.source !== context.source ||
+    row.session_id !== context.sessionId ||
+    row.machine_id !== context.machineId ||
+    row.user_id !== context.userId ||
+    row.event_id !== record.record_id ||
+    record.origin_id !== `machine:${context.machineId}`
+  )
+    throw new PipelineError(
+      "relayhistory_event_identity",
+      "a convergence_event line is not this session's",
+      false,
+    );
   return {
     ...row,
     ts: canonicalTimestamp(String(row.ts)),
@@ -725,7 +778,7 @@ export function projectRelayhistorySession(
   let unprojected = 0;
   for (const record of records) {
     const p = record.payload!;
-    if (record.kind === CONVERGENCE_EVENT_KIND) direct.push(directEvent(record));
+    if (record.kind === CONVERGENCE_EVENT_KIND) direct.push(directEvent(record, context));
     else if (ACTIVITY_KINDS.has(record.kind)) {
       if (!controlRow(record.kind, p) && !sidechainUserRow(record.kind, p))
         events.push(activityEvent(record, context));
@@ -736,7 +789,7 @@ export function projectRelayhistorySession(
         continue;
       }
       const held = catalog.get(key);
-      catalog.set(key, held ? newer(held, record) : record);
+      catalog.set(key, held ? lastAccepted(held, record) : record);
     }
   }
   settleToolTimes(events);

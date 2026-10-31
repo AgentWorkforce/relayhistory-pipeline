@@ -62,7 +62,7 @@ beforeEach(async () => {
   await db.exec(`SET session_replication_role = replica;
     TRUNCATE sessions.delivery_records, sessions.convergence_events, sessions.session_catalog,
       sessions.session_catalog_agents, sessions.session_relationships, sessions.session_markers,
-      sessions.session_commit_links CASCADE;
+      sessions.session_commit_links, sessions.session_rollups CASCADE;
     SET session_replication_role = origin;`);
 });
 
@@ -150,14 +150,42 @@ async function liveRows(): Promise<ProjectionRow[]> {
 const byTable = (rows: readonly ProjectionRow[], table: ProjectionRow["table"]) =>
   rows.filter((row) => row.table === table).map((row) => row.row);
 
+const context = (source = "claude") => ({
+  workspaceId: WORKSPACE,
+  source,
+  sessionId: SESSION,
+  machineId: "machine:1",
+  userId: "u",
+});
+
+const CATALOG_KINDS = ["session", "relationship", "session_marker", "commit_link"];
+
+/** Each line with its seat in the ledger the live projection settles that kind by. */
+async function withAcceptance(lines: Line[]): Promise<Line[]> {
+  const seat = async (table: string) => {
+    const { rows } = await db.query<{ origin_id: string; record_id: string; seq: string }>(
+      `SELECT origin_id, record_id, accepted_seq::text AS seq FROM sessions.${table}`,
+    );
+    return new Map(rows.map((row) => [JSON.stringify([row.origin_id, row.record_id]), row.seq]));
+  };
+  const activity = await seat("delivery_projection_acceptance");
+  const catalog = await seat("delivery_catalog_acceptance");
+  return lines.map((line) => {
+    const key = JSON.stringify([line.origin_id, line.record_id]);
+    const accepted_seq = (CATALOG_KINDS.includes(line.kind) ? catalog : activity).get(key);
+    return accepted_seq === undefined ? line : { ...line, accepted_seq };
+  });
+}
+
 /** Exactly what the live triggers leave, in the readers' event order. */
 async function expectLiveEqual(lines: Line[], source = "claude") {
   for (const line of lines) await deliver(line, source);
+  const sequenced = await withAcceptance(lines);
   const projected = projectRelayhistorySession(
     normalizeRelayhistoryRecords(
-      lines.map((line) => parseRelayhistoryRecord(JSON.stringify(line))),
+      sequenced.map((line) => parseRelayhistoryRecord(JSON.stringify(line))),
     ),
-    { workspaceId: WORKSPACE, source, sessionId: SESSION },
+    context(source),
   );
   const live = await liveRows();
   for (const table of [...Object.keys(TABLES), "convergence_events"] as ProjectionRow["table"][])
@@ -355,7 +383,7 @@ describe("export projection equals the live projection", () => {
     const live = await liveRows();
     const projected = projectRelayhistorySession(
       normalizeRelayhistoryRecords([...lines].reverse().map((value) => parseRelayhistoryRecord(JSON.stringify(value)))),
-      { workspaceId: WORKSPACE, source: "claude", sessionId: SESSION },
+      context(),
     );
     expect(byTable(projected.rows, "convergence_events")).toEqual(byTable(live, "convergence_events"));
     expect(byTable(live, "convergence_events")).toHaveLength(1);
@@ -386,6 +414,130 @@ describe("export projection equals the live projection", () => {
     });
     const { rows } = await expectLiveEqual([...lines, tombstone]);
     expect(byTable(rows, "convergence_events").map((row) => row.delivery_record_id)).toEqual(["kept"]);
+  });
+});
+
+describe("acceptance order, not delivery time, settles contenders", () => {
+  const LATER = "2026-10-30 12:00:09+00";
+  const EARLIER = "2026-10-30 12:00:01+00";
+
+  it("keeps the origin accepted last even when its received_at is earlier", async () => {
+    const { rows } = await expectLiveEqual([
+      line("x", "session_event", { role: "user", text: "first-accepted", ts_ms: T }, { received_at: LATER }),
+      line("x", "session_event", { role: "user", text: "last-accepted", ts_ms: T }, { origin_id: "origin-b", received_at: EARLIER }),
+    ]);
+    expect(byTable(rows, "convergence_events").map((row) => row.content)).toEqual(["last-accepted"]);
+  });
+
+  it("lets a tombstone accepted last win even when its received_at is earlier", async () => {
+    const { rows } = await expectLiveEqual([
+      line("x", "session_event", { role: "user", text: "gone", ts_ms: T }, { received_at: LATER }),
+      line("x", "session_event", {}, { origin_id: "origin-b", operation: "delete", payload: null, received_at: EARLIER }),
+    ]);
+    expect(byTable(rows, "convergence_events")).toEqual([]);
+  });
+
+  it("settles a catalog key the same way", async () => {
+    const { rows } = await expectLiveEqual([
+      line("s-1", "session", { title: "first-accepted" }, { received_at: LATER }),
+      line("s-2", "session", { title: "last-accepted" }, { received_at: EARLIER }),
+    ]);
+    expect(byTable(rows, "session_catalog").map((row) => row.title)).toEqual(["last-accepted"]);
+  });
+
+  it("is the same in every arrival order", async () => {
+    const lines = [
+      line("x", "session_event", { role: "user", text: "a", ts_ms: T }, { received_at: LATER }),
+      line("x", "session_event", { role: "user", text: "b", ts_ms: T }, { origin_id: "origin-b", received_at: EARLIER }),
+      line("x", "session_event", {}, { origin_id: "origin-c", operation: "delete", payload: null, received_at: EARLIER }),
+      line("y", "session_event", { role: "user", text: "c", ts_ms: T }, { received_at: LATER }),
+    ];
+    const expected = await expectLiveEqual(lines);
+    const sequenced = await withAcceptance(lines);
+    const orders = sequenced.flatMap((first, i) =>
+      sequenced.filter((_, j) => j !== i).flatMap((second) => [[first, second, ...sequenced.filter((v) => v !== first && v !== second)]]),
+    );
+    for (const order of orders)
+      expect(
+        projectRelayhistorySession(
+          normalizeRelayhistoryRecords(order.map((value) => parseRelayhistoryRecord(JSON.stringify(value)))),
+          context(),
+        ).rows,
+      ).toEqual(expected.rows);
+  });
+
+  it.each([
+    ["two origins of one record", "x", "x", "session_event", "origin-b"],
+    ["two records of one catalog key", "s-1", "s-2", "session", "origin-a"],
+  ])("refuses %s with no ledger seat, never guessing", (_name, first, second, kind, origin_id) => {
+    const lines = [
+      line(first, kind, { role: "user", ts_ms: T }),
+      line(second, kind, { role: "user", ts_ms: T }, { origin_id, received_at: LATER }),
+    ];
+    expect(() =>
+      projectRelayhistorySession(
+        normalizeRelayhistoryRecords(lines.map((value) => parseRelayhistoryRecord(JSON.stringify(value)))),
+        context(),
+      ),
+    ).toThrow(expect.objectContaining({ code: "relayhistory_acceptance_missing", retryable: false }));
+  });
+
+  it("does not let a re-exported copy lose its ledger seat", () => {
+    const seated = { ...line("x", "session_event", { role: "user", ts_ms: T }), accepted_seq: "7" };
+    const plain = line("x", "session_event", { role: "user", ts_ms: T }, { received_at: EARLIER });
+    const other = { ...line("x", "session_event", { role: "user", ts_ms: T }, { origin_id: "origin-b" }), accepted_seq: "8" };
+    const kept = normalizeRelayhistoryRecords(
+      [seated, plain, other].map((value) => parseRelayhistoryRecord(JSON.stringify(value))),
+    );
+    expect(kept.map((record) => [record.origin_id, record.accepted_seq])).toEqual([["origin-b", "8"]]);
+  });
+});
+
+describe("usage counters past a double's precision", () => {
+  const MAX = "9223372036854775807";
+  const usage = (input: string) =>
+    `{"input_tokens":${input},"output_tokens":1}`;
+  const assistant = (token_json: string) =>
+    line("a", "session_event", { role: "assistant", ts_ms: T, message_id: "m", request_id: "r", token_json });
+
+  async function liveTokens() {
+    const { rows } = await db.query<{ input: string; output: string }>(
+      "SELECT input_tokens::text AS input, output_tokens::text AS output FROM sessions.convergence_events",
+    );
+    return rows[0]!;
+  }
+
+  it.each([
+    [MAX, MAX, "1"],
+    ["9007199254740993", "9007199254740993", "1"],
+    ["9223372036854775808", "0", "0"],
+    ["1e2", "100", "1"],
+    ["1.5", "0", "0"],
+    ["-1", "0", "0"],
+    ["1e400", "0", "0"],
+  ])("input %s matches the column", async (input, stored, output) => {
+    const lines = [assistant(usage(input))];
+    await deliver(lines[0]!, "claude");
+    expect(await liveTokens()).toEqual({ input: stored, output });
+    const [row] = projectRelayhistorySession(
+      normalizeRelayhistoryRecords((await withAcceptance(lines)).map((value) => parseRelayhistoryRecord(JSON.stringify(value)))),
+      context(),
+    ).rows;
+    expect(String(row!.row.input_tokens)).toBe(stored);
+    expect(String(row!.row.output_tokens)).toBe(output);
+  });
+
+  it("rounds a cost past a double's precision as the numeric column does", async () => {
+    const lines = [assistant('{"cost_usd":1234567890.1234565}')];
+    await deliver(lines[0]!, "claude");
+    const { rows } = await db.query<{ cost: string }>(
+      "SELECT cost_usd_micros::text AS cost FROM sessions.convergence_events",
+    );
+    const [row] = projectRelayhistorySession(
+      normalizeRelayhistoryRecords((await withAcceptance(lines)).map((value) => parseRelayhistoryRecord(JSON.stringify(value)))),
+      context(),
+    ).rows;
+    expect(String(row!.row.cost_usd_micros)).toBe(rows[0]!.cost);
   });
 });
 
@@ -448,12 +600,12 @@ describe("agent_name_normalized is the target's to set", () => {
 });
 
 describe("export projection", () => {
-  const context = { workspaceId: WORKSPACE, source: "chatgpt", sessionId: SESSION };
+  const session = context("chatgpt");
 
   it("maps convergence_event lines directly and merges them in event order", () => {
     const row = {
-      machine_id: "m1",
-      user_id: "u",
+      machine_id: session.machineId,
+      user_id: session.userId,
       source: "chatgpt",
       session_id: SESSION,
       event_id: "ev",
@@ -471,13 +623,13 @@ describe("export projection", () => {
     const { rows } = projectRelayhistorySession(
       [
         parseRelayhistoryRecord(
-          JSON.stringify({ ...line("ev", "convergence_event", row), origin_id: "machine:m1" }),
+          JSON.stringify({ ...line("ev", "convergence_event", row), origin_id: `machine:${session.machineId}` }),
         ),
         parseRelayhistoryRecord(
           JSON.stringify(line("early", "session_event", { role: "user", ts_ms: Date.parse("2026-10-30T12:00:00Z") })),
         ),
       ],
-      context,
+      session,
     );
     expect(rows.map(({ row: event }) => event.ts)).toEqual([
       "2026-10-30T12:00:00.000000Z",
@@ -494,8 +646,42 @@ describe("export projection", () => {
     });
   });
 
+  it.each([
+    ["source", { source: "claude" }],
+    ["session_id", { session_id: "other" }],
+    ["machine_id", { machine_id: "other" }],
+    ["user_id", { user_id: "other" }],
+    ["event_id", { event_id: "other" }],
+  ])("refuses a convergence_event line naming another %s", (_field, changed) => {
+    const row = {
+      machine_id: session.machineId,
+      user_id: session.userId,
+      source: session.source,
+      session_id: SESSION,
+      event_id: "ev",
+      ts: "2026-10-30T12:00:00Z",
+      ...changed,
+    };
+    expect(() =>
+      projectRelayhistorySession(
+        [parseRelayhistoryRecord(JSON.stringify({ ...line("ev", "convergence_event", row), origin_id: `machine:${session.machineId}` }))],
+        session,
+      ),
+    ).toThrow(expect.objectContaining({ code: "relayhistory_event_identity", retryable: false }));
+  });
+
+  it("refuses a convergence_event line from another machine's origin", () => {
+    const row = { machine_id: session.machineId, user_id: session.userId, source: session.source, session_id: SESSION, event_id: "ev", ts: "2026-10-30T12:00:00Z" };
+    expect(() =>
+      projectRelayhistorySession(
+        [parseRelayhistoryRecord(JSON.stringify({ ...line("ev", "convergence_event", row), origin_id: "machine:other" }))],
+        session,
+      ),
+    ).toThrow(expect.objectContaining({ code: "relayhistory_event_identity" }));
+  });
+
   it("emits nothing for a stream with no deletes to apply and no records", () => {
-    expect(projectRelayhistorySession([], context)).toEqual({ rows: [], unprojected: 0 });
+    expect(projectRelayhistorySession([], session)).toEqual({ rows: [], unprojected: 0 });
   });
 
   it("orders events by time then event id, not by stream order", () => {
@@ -507,7 +693,7 @@ describe("export projection", () => {
           line("a", "session_event", { role: "user", ts_ms: T }),
         ].map((value) => parseRelayhistoryRecord(JSON.stringify(value))),
       ),
-      context,
+      session,
     );
     expect(rows.map(({ row }) => row.delivery_record_id)).toEqual(["a", "b", "late"]);
   });
