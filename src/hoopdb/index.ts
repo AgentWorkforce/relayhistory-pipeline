@@ -18,8 +18,14 @@ import type { HoopDb } from "../shared/db.ts";
 import { ctxOf, enrichMessage, sessionExt } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { uuidv7 } from "../shared/ids.ts";
+import { propagatePointerTombstone } from "./session-directory-summary.ts";
+import { projectSessionDirectory } from "./session-directory-projector.ts";
 
-export const FAN_OUT_STAGES = ["summary-short", "summary-long", "status-classify"] as const;
+export const FAN_OUT_STAGES = [
+  "summary-short",
+  "summary-long",
+  "status-classify",
+] as const;
 
 export interface IndexDeps {
   db: HoopDb;
@@ -43,8 +49,26 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         await deps.db.query(
           `UPDATE sessions.session_index SET deleted_at = now(), indexed_at = now()
             WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
-          [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id],
+          [
+            pk.org_id,
+            pk.workspace_id,
+            pk.harness,
+            pk.session_id,
+            pk.machine_id,
+          ],
         );
+        // Propagate to the logical directory: clear the summary now (it may include this
+        // machine's content), then re-project. With machines still live the projector
+        // rebuilds metadata and memberships; with none left it tombstones the row and
+        // deletes its memberships.
+        const logical = {
+          orgId: pk.org_id,
+          workspaceId: pk.workspace_id,
+          harness: pk.harness,
+          sessionId: pk.session_id,
+        };
+        await propagatePointerTombstone(deps.db, logical);
+        await projectSessionDirectory(deps.db, logical);
         return;
       }
       const read = await deps.reader.read(pointer.manifestKey);
@@ -52,14 +76,29 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
       const m = read.manifest;
       const f = pointerFields(m);
       const ext = sessionExt(m);
-      const ectx = ctx as unknown as { user_id?: string; session_uuid?: string };
+      const ectx = ctx as unknown as {
+        user_id?: string;
+        session_uuid?: string;
+      };
       // Identity comes from the authenticated request (ctx), never from the manifest body.
       // With no request identity (reconcile), keep whatever an authenticated upload recorded.
-      const existing = (await deps.db.query<{ session_uuid: string; user_id: string | null; fanout_revision: string }>(
-        `SELECT session_uuid::text, user_id, fanout_revision::text FROM sessions.session_index_ext
+      const existing = (
+        await deps.db.query<{
+          session_uuid: string;
+          user_id: string | null;
+          fanout_revision: string;
+        }>(
+          `SELECT session_uuid::text, user_id, fanout_revision::text FROM sessions.session_index_ext
           WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5`,
-        [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id],
-      )).rows[0];
+          [
+            pk.org_id,
+            pk.workspace_id,
+            pk.harness,
+            pk.session_id,
+            pk.machine_id,
+          ],
+        )
+      ).rows[0];
       const userId = ectx.user_id ?? existing?.user_id ?? "unknown";
       const row = {
         ...pk,
@@ -74,7 +113,10 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         git_branch: null,
         git_commit: null,
         model: null,
-        event_count: m.raw.chunks.reduce((n: number, c: { records?: number }) => n + (c.records ?? 0), 0),
+        event_count: m.raw.chunks.reduce(
+          (n: number, c: { records?: number }) => n + (c.records ?? 0),
+          0,
+        ),
         storage_provider: pointer.provider ?? "s3",
         bucket: pointer.bucket ?? deps.reader.bucket ?? "",
         manifest_key: pointer.manifestKey,
@@ -90,19 +132,36 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         trace_id: f.traceId,
         deleted_at: null,
       };
-      const { rows } = await deps.db.query<{ applied: boolean; revision: string }>(
+      const { rows } = await deps.db.query<{
+        applied: boolean;
+        revision: string;
+      }>(
         "SELECT applied, revision FROM sessions.upsert_session_index($1::jsonb)",
         [JSON.stringify([row])],
       );
       const applied = rows[0]?.applied ?? false;
-      const fanoutDone = existing ? Number(existing.fanout_revision) >= f.manifestRevision : false;
+      // Logical-session directory projection (idempotent; resurrects a tombstone only for
+      // a live pointer indexed after it, per the V1 precedence contract).
+      await projectSessionDirectory(deps.db, {
+        orgId: pk.org_id,
+        workspaceId: pk.workspace_id,
+        harness: pk.harness,
+        sessionId: pk.session_id,
+      });
+      const fanoutDone = existing
+        ? Number(existing.fanout_revision) >= f.manifestRevision
+        : false;
       if (!applied && fanoutDone) {
-        log.info("session index unchanged", { revision: f.manifestRevision, reason: "stale_or_equal_revision" });
+        log.info("session index unchanged", {
+          revision: f.manifestRevision,
+          reason: "stale_or_equal_revision",
+        });
         return { status: "skipped", reason: "stale_revision" };
       }
       // The customer-level id. Minted client-side; if an older client sent no
       // uuid we derive one here ONCE (reusing the stored one on later revisions) and say so.
-      const sessionUuid = ext?.session_uuid ?? existing?.session_uuid ?? uuidv7();
+      const sessionUuid =
+        ext?.session_uuid ?? existing?.session_uuid ?? uuidv7();
       const source = ext ? ext.session_uuid_source : "derived";
       await deps.db.query(
         `INSERT INTO sessions.session_index_ext
@@ -114,8 +173,19 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
            last_revision = greatest(sessions.session_index_ext.last_revision, excluded.last_revision),
            user_id = coalesce(excluded.user_id, sessions.session_index_ext.user_id),
            updated_at = now()`,
-        [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id, sessionUuid, source,
-         ctx.orgId, ectx.user_id ?? null, f.traceId, f.manifestRevision],
+        [
+          pk.org_id,
+          pk.workspace_id,
+          pk.harness,
+          pk.session_id,
+          pk.machine_id,
+          sessionUuid,
+          source,
+          ctx.orgId,
+          ectx.user_id ?? null,
+          f.traceId,
+          f.manifestRevision,
+        ],
       );
       if (fanoutDone) return;
       // Fan out, then record it. A crash in between repeats the fan-out on retry
@@ -124,8 +194,14 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
       const base: StageMessage = {
         v: 1,
         stage: "session-indexed",
-        ctx: { ...(current?.ctx ?? ctx), session_uuid: sessionUuid, session_uuid_source: source } as StageMessage["ctx"],
-        workKey: current?.workKey ?? `${pointer.manifestKey}@${read.etag ?? read.version ?? ""}`,
+        ctx: {
+          ...(current?.ctx ?? ctx),
+          session_uuid: sessionUuid,
+          session_uuid_source: source,
+        } as StageMessage["ctx"],
+        workKey:
+          current?.workKey ??
+          `${pointer.manifestKey}@${read.etag ?? read.version ?? ""}`,
         revision: f.manifestRevision,
         payload: pointer,
       };
@@ -136,7 +212,14 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
       await deps.db.query(
         `UPDATE sessions.session_index_ext SET fanout_revision = greatest(fanout_revision, $6)
           WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5`,
-        [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id, f.manifestRevision],
+        [
+          pk.org_id,
+          pk.workspace_id,
+          pk.harness,
+          pk.session_id,
+          pk.machine_id,
+          f.manifestRevision,
+        ],
       );
       log.info("session indexed", {
         stage: "session-indexed",

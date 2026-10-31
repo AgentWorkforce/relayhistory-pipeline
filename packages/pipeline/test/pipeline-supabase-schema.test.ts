@@ -6,6 +6,8 @@
  * or grant the code disagrees with fails here. No hosted Supabase is involved.
  */
 import { PGlite } from "@electric-sql/pglite";
+import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
+import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -135,7 +137,7 @@ const fetcher = postgrest as unknown as typeof fetch;
 const options = { url: "http://postgrest.local", token: "synthetic", fetcher };
 
 beforeAll(async () => {
-  db = new PGlite();
+  db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(readFileSync(supabaseFile("tests/supabase_shim.sql"), "utf8"));
   for (const file of readdirSync(supabaseFile("migrations/")).sort())
     await db.exec(readFileSync(supabaseFile(`migrations/${file}`), "utf8"));
