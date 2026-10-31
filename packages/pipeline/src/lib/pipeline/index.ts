@@ -36,6 +36,7 @@ export * from "./queue.js";
 export * from "./registry.js";
 export * from "./backfill-activation.js";
 export * from "./manifest-readiness.js";
+export * from "./relayhistory-projection.js";
 export * from "./relayhistory-transform.js";
 export * from "./stages.js";
 export * from "./telemetry-ids.js";

@@ -30,7 +30,7 @@ Read-only, structure-only samples from Neon production on 2026-10-30
   notified. Scrubbing, chunk keys, manifest validation and indexing are
   therefore exactly the live path's, with no second implementation.
 - **One exported session** is one `(workspace_id, machine_id, harness,
-  session_id)` in the v1 layout:
+session_id)` in the v1 layout:
   `v1/ws=…/m=…/h=…/d=…/s=…/manifest.json` plus
   `raw/{seq:010}-{offset}-{sha8}.ndjson.zst`.
 - **Harness** is the record `source`. **Machine** comes from the record's
@@ -57,7 +57,7 @@ Read-only, structure-only samples from Neon production on 2026-10-30
   `raw.scrub = {ruleset, version}`. Unscrubbed manifests are quarantined by
   every reader, so the export never writes chunks directly.
 - **Marker:** `extensions["client.relayhistory_export"] = {version: 1, source:
-  "neon.delivery_records", exported_at}`. Its presence tells the transform this
+"neon.delivery_records", exported_at}`. Its presence tells the transform this
   is the RelayHistory record shape, not a harness log.
 
 ## Metadata for `session_index` and V1 search
@@ -77,7 +77,7 @@ manifest body.
   them.
 - **Identity (open item O2):** `user_id` must come from an authenticated
   path. The export delivers each manifest through `POST
-  /v1/pipeline/manifests` with an org-scoped migration credential allowed to
+/v1/pipeline/manifests` with an org-scoped migration credential allowed to
   assert the session's `user_id` from Neon. That needs an explicit, audited
   migration grant in the ingest API. Without it, rows land as `unknown`.
 
@@ -149,8 +149,16 @@ manifest body.
   `client.relayhistory_export`, reads the canonical record envelopes from all
   live and backfill epochs, keeps the highest numeric revision of each
   `(origin_id, record_id)`, applies tombstones and orders the survivors by
-  event time. It writes those live records to
-  `normalized/v1/relayhistory-{raw.content_sha256}.ndjson`. The digest in the
+  event time. A record delivered by two origins keeps only the write accepted
+  last, as the live projection does. That order comes from `accepted_seq`, the
+  source's acceptance ledger on each line: `received_at` cannot rebuild it, and
+  contenders without it are refused. It projects the survivors into the rows the live
+  triggers leave (`relayhistory-projection.ts`, held equal to the vendored SQL
+  by conformance tests) and writes them, one `{table, row}` per line, to
+  `normalized/v2/relayhistory-{raw.content_sha256}.ndjson`. `{table, row}` is
+  the only normalized format: the record envelopes an earlier transform wrote
+  are superseded, a stored object in that shape is refused, and readers of
+  records read raw through `readRelayhistoryExport`. The digest in the
   key makes the object create-only, so a late transform cannot overwrite
   output for another manifest revision. Post-T0 live chunks use the same
   record envelope; `operation` is optional for historical upserts and required

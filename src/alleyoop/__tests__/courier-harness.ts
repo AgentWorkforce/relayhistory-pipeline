@@ -30,7 +30,7 @@ const ORG = "org_test";
 const WORKSPACE = "default";
 const STARTED = 1_761_730_000_000;
 export const EXPORTER = "migration:mgr_export";
-export const MARKER = { version: 1, source: "neon.delivery_records" };
+export const MARKER = { version: 1, source: "neon.delivery_records", grant_id: "mgr_export", plan_digest: "a".repeat(64), source_user_id: "user" };
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 
 const authFor = (kind: string | undefined, machineId: string | undefined) => ({

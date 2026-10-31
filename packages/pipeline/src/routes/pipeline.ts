@@ -237,6 +237,11 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
         !migrationSessionMatches(auth, location)
       )
         return uploadForbidden(c);
+      // The key's deployment prefix must be this deployment's (static
+      // PIPELINE_KEY_PREFIX, or the caller's org with PIPELINE_ORG_FROM_PREFIX),
+      // exactly as for the chunk and commit routes.
+      if (!prefixAllowed(env, location.prefix, auth.orgId))
+        return workspaceForbidden(c);
     }
     let consumed: boolean;
     try {
