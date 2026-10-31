@@ -54,6 +54,12 @@
           "digest": "sha256:c13b879a668984f905e30e38b05764ec712532e8395b256d416ba1602f6c6726",
           "sourceRevision": "ffb7ef0f684a92c129bbf14c2da2066fbe6fe6b2",
           "note": "running in aws-sessions-dev; ECR tag sha-ffb7ef0f684a92c129bbf14c2da2066fbe6fe6b2, pushed 2026-10-29"
+        },
+        {
+          "repository": "500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services",
+          "digest": "sha256:59d9468551ded11f3c6f5d36558ab7ef87c3e50e99772de352cc309823cb00e0",
+          "sourceRevision": "2fb88cdaca3ef42f5eea42050d43448c883ac5e4",
+          "note": "publish-image-ecr run 41154325003 from main 2fb88cd; ECR tag sha-2fb88cdaca3ef42f5eea42050d43448c883ac5e4, pushed 2026-10-30T18:30:23-07:00; Stage A (aws-proof) image"
         }
       ]
     },
