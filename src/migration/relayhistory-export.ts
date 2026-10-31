@@ -38,7 +38,13 @@ export interface DeliveryRecord {
   revision: string;
   operation: "upsert" | "delete";
   received_at: string;
+  /** For reading fields: numbers past a double's precision are rounded here. */
   payload: Record<string, unknown> | null;
+  /**
+   * The source's own JSON text, written to the stream as is, because `payload`
+   * has been through JSON.parse and a bigint or numeric in it would be rounded.
+   */
+  payload_json?: string | null;
   /**
    * The record's seat in the source's acceptance ledger, which is the order the
    * live projection settles contenders in. The transform needs it for a catalog
@@ -88,17 +94,18 @@ export function buildSessionStream(records: readonly DeliveryRecord[]): SessionS
   const lineStarts: number[] = [];
   let length = 0;
   for (const { record } of live) {
-    const line = encoder.encode(
-      `${JSON.stringify({
-        kind: record.kind,
-        origin_id: record.origin_id,
-        record_id: record.record_id,
-        revision: record.revision,
-        received_at: record.received_at,
-        payload: record.payload,
-        ...(record.accepted_seq ? { accepted_seq: record.accepted_seq } : {}),
-      })}\n`,
-    );
+    const envelope = JSON.stringify({
+      kind: record.kind,
+      origin_id: record.origin_id,
+      record_id: record.record_id,
+      revision: record.revision,
+      received_at: record.received_at,
+    });
+    const payload = record.payload_json ?? JSON.stringify(record.payload);
+    const seat = record.accepted_seq
+      ? `,"accepted_seq":${JSON.stringify(record.accepted_seq)}`
+      : "";
+    const line = encoder.encode(`${envelope.slice(0, -1)},"payload":${payload}${seat}}\n`);
     lineStarts.push(length);
     parts.push(line);
     length += line.byteLength;
@@ -183,10 +190,10 @@ export async function sessionsNewestFirst(
  * seeds one in: its projected row, then receipt, then origin.
  */
 export async function sessionRecords(db: Queryable, key: SessionKey): Promise<DeliveryRecord[]> {
-  const { rows } = await db.query<DeliveryRecord>(
-    `SELECT kind, origin_id, record_id, revision, operation, received_at, payload, accepted_seq FROM (
+  const { rows } = await db.query<Omit<DeliveryRecord, "payload">>(
+    `SELECT kind, origin_id, record_id, revision, operation, received_at, payload_json, accepted_seq FROM (
        SELECT d.kind, d.origin_id, d.record_id, d.revision::text AS revision, d.operation,
-              d.received_at::text AS received_at, d.payload,
+              d.received_at::text AS received_at, d.payload::text AS payload_json,
               s.seq::text AS accepted_seq,
               row_number() OVER (
                 PARTITION BY d.record_id
@@ -212,7 +219,10 @@ export async function sessionRecords(db: Queryable, key: SessionKey): Promise<De
      ) AS ranked WHERE place = 1`,
     [key.org_id, key.workspace_id, [...RECORD_KINDS], key.source, key.session_id],
   );
-  return rows;
+  return rows.map((row) => ({
+    ...row,
+    payload: row.payload_json ? (JSON.parse(row.payload_json) as DeliveryRecord["payload"]) : null,
+  }));
 }
 
 /**
@@ -223,9 +233,10 @@ export async function sessionRecords(db: Queryable, key: SessionKey): Promise<De
  * machine is the event's own machine_id, so no such session is dropped.
  */
 export async function undeliveredEvents(db: Queryable, key: SessionKey): Promise<DeliveryRecord[]> {
-  const { rows } = await db.query<{ machine_id: string; event_id: string; created_at: string; row: Record<string, unknown> }>(
+  const { rows } = await db.query<{ machine_id: string; event_id: string; created_at: string; row_json: string }>(
     `SELECT e.machine_id, e.event_id, e.ingested_at::text AS created_at,
-            to_jsonb(e) - 'org_id' - 'workspace_id' AS row
+            ((to_jsonb(e) - 'org_id' - 'workspace_id')
+              || jsonb_build_object('ts_ms', floor(extract(epoch FROM e.ts) * 1000)::bigint))::text AS row_json
        FROM sessions.convergence_events e
       WHERE e.org_id = $1 AND e.session_id = $2 AND e.workspace_id = $3 AND e.source = $4
         AND e.delivery_record_id IS NULL`,
@@ -238,7 +249,8 @@ export async function undeliveredEvents(db: Queryable, key: SessionKey): Promise
     revision: "1",
     operation: "upsert" as const,
     received_at: row.created_at,
-    payload: { ...row.row, ts_ms: Date.parse(String(row.row.ts)) },
+    payload: JSON.parse(row.row_json) as Record<string, unknown>,
+    payload_json: row.row_json,
   }));
 }
 

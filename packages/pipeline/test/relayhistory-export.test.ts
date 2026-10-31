@@ -176,6 +176,42 @@ describe("Neon reader on the pinned legacy schema", () => {
     expect(streamed[0].payload.org_id).toBeUndefined();
   });
 
+  describe("numbers past a double's precision", () => {
+    const key = { org_id: "o", workspace_id: "w", source: "claude", session_id: "s-exact" } as never;
+    const TWO_53_PLUS_1 = "9007199254740993";
+    const TWO_63 = "9223372036854775808";
+    const MAX = "9223372036854775807";
+    beforeAll(async () => {
+      await db.exec(`SET session_replication_role = replica;
+        INSERT INTO sessions.delivery_records
+          (org_id, workspace_id, origin_id, record_id, revision_id, revision, digest, kind, source, session_id, operation, payload, user_id, received_at)
+        VALUES ('o', 'w', 'a', 'big', 'v1', 1, 'd', 'session_event', 'claude', 's-exact', 'upsert',
+                '{"ts_ms": 1, "small": ${TWO_53_PLUS_1}, "large": ${TWO_63}, "fine": 0.1234567890123456789}', 'u', '2026-10-01T00:00:00Z');
+        INSERT INTO sessions.convergence_events
+          (org_id, workspace_id, machine_id, user_id, source, session_id, event_id, kind, type, ts, record, input_tokens, cost_usd_micros)
+        VALUES ('o', 'w', 'server', 'u', 'claude', 's-exact', 'ev', 'user', 'message', '2026-09-01T00:00:01.5Z', '{}', ${MAX}, ${TWO_53_PLUS_1});
+        SET session_replication_role = origin;`);
+    });
+    const text = (records: DeliveryRecord[]) => new TextDecoder().decode(buildSessionStream(records).bytes);
+
+    it("carries a delivery payload's numbers to the line byte for byte", async () => {
+      const line = text(await sessionRecords(db, key));
+      for (const number of [TWO_53_PLUS_1, TWO_63, "0.1234567890123456789"]) expect(line).toContain(number);
+    });
+
+    it("carries a direct event's bigint columns to the line byte for byte", async () => {
+      const line = text(await undeliveredEvents(db, key));
+      expect(line).toContain(`"input_tokens": ${MAX}`);
+      expect(line).toContain(`"cost_usd_micros": ${TWO_53_PLUS_1}`);
+      expect(lines(new TextEncoder().encode(line))[0].payload.ts_ms).toBe(Date.parse("2026-09-01T00:00:01.5Z"));
+    });
+
+    it("still writes a parsed payload when there is no source text", () => {
+      const stream = buildSessionStream([record({ record_id: "a", payload: { ts_ms: 1 } })]);
+      expect(lines(stream.bytes)[0].payload).toEqual({ ts_ms: 1 });
+    });
+  });
+
   describe("the write the live projection keeps", () => {
     const LATER = "2026-10-01T00:00:09Z";
     const EARLIER = "2026-10-01T00:00:01Z";
