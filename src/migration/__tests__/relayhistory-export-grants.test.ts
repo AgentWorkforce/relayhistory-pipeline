@@ -12,6 +12,7 @@ import { deriveMigrationGrantPlan } from "../vendor/relayauth-migration-plan.ts"
 import type { UploadInput } from "../relayhistory-export-upload.ts";
 import {
   applyGrants,
+  canonicalizeUploads,
   FixtureIdentityPreflight,
   FixtureMembershipSource,
   lifecycleDryRun,
@@ -125,11 +126,17 @@ class FakeRelayAuth implements GrantClient {
     const derived = deriveMigrationGrantPlan({ grantId, orgId: ORG, plan: req.plan });
     return { grantId, orgId: ORG, planDigest: derived.planDigest, allowedPairs: derived.allowedPairs, planEntries: derived.plan.manifests.length, createdAt: g.createdAt, revokedAt: g.revokedAt, replayed: !!existing };
   }
+  /** The n-th revoke lands but its response is lost (or every one from n on). */
+  loseRevokeAt?: number;
+  loseRevokesFrom?: number;
+  /** relayauth #112: 404 migration_grant_not_found; 409 migration_grant_revoked when already revoked. */
   async revokeGrant(grantId: string) {
     this.revokes += 1;
     const g = this.grants.get(grantId);
-    if (!g) throw new GrantClientError("grant_not_found", 404);
+    if (!g) throw new GrantClientError("migration_grant_not_found", 404);
+    if (g.revokedAt) throw new GrantClientError("migration_grant_revoked", 409);
     g.revokedAt = new Date(NOW + this.revokes).toISOString();
+    if (this.loseRevokeAt === this.revokes || (this.loseRevokesFrom !== undefined && this.revokes >= this.loseRevokesFrom)) throw new Error("response lost");
     return { grantId, revokedAt: g.revokedAt };
   }
   live() {
@@ -363,7 +370,7 @@ describe("Idempotency-Key", () => {
     const { cfg, client, dir, plan } = await approved();
     const applied = await applyGrants(cfg);
     expect(client.keys).toEqual(plan.shards.map((s) => shardIdempotencyKey(s.shard_id, plan.aggregate_digest)));
-    await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest });
+    await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg });
     const files = await readdir(dir);
     const everything = (await Promise.all(files.map((f) => readFile(join(dir, f), "utf8")))).join("\n") + JSON.stringify(applied);
     for (const k of client.keys) expect(everything).not.toContain(k);
@@ -428,7 +435,7 @@ describe("Idempotency-Key", () => {
     let result: unknown;
     try {
       result = await applyGrants(cfg);
-      await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest }).catch(() => undefined);
+      await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg }).catch(() => undefined);
     } finally {
       process.stdout.write = out;
       process.stderr.write = err;
@@ -492,14 +499,14 @@ describe("apply, idempotency and compensation", () => {
   test("interrupted between shards, then rolled back: revocation evidence per shard, re-apply refused", async () => {
     const { cfg, client, plan, dir } = await approved();
     const first = await applyGrants({ ...cfg, maxNewShards: 2 });
-    const evidence = await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest });
+    const evidence = await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg });
     expect(evidence.reason).toBe("rollback");
     expect(evidence.revoked.map((r) => [r.shard_id, r.grant_id])).toEqual(
       first.created.map((c) => [c.shard_id, c.grant_id]).sort((a, b) => (a[0]! < b[0]! ? -1 : 1)),
     );
     expect(evidence.revoked.every((r) => !Number.isNaN(Date.parse(r.revoked_at)))).toBe(true);
     expect(client.live()).toBe(0);
-    const again = await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest });
+    const again = await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg });
     expect(again.revoked).toEqual([]);
     expect(again.already_revoked).toHaveLength(2);
     await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "plan_rolled_back" });
@@ -509,11 +516,11 @@ describe("apply, idempotency and compensation", () => {
     const { cfg, client, plan, dir } = await approved();
     const applied = await applyGrants(cfg);
     const one = applied.created[1]!;
-    const evidence = await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, shardIds: [one.shard_id] });
+    const evidence = await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg, shardIds: [one.shard_id] });
     expect(evidence).toMatchObject({ reason: "revoke", revoked: [{ shard_id: one.shard_id, grant_id: one.grant_id }] });
     expect(client.live()).toBe(2);
-    await expect(revokeGrants({ execute: false, stateDir: dir, client, aggregateDigest: plan.aggregate_digest })).rejects.toMatchObject({ code: "execute_required" });
-    await expect(revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: "1".repeat(64) })).rejects.toMatchObject({ code: "ledger_mismatch" });
+    await expect(revokeGrants({ execute: false, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg })).rejects.toMatchObject({ code: "execute_required" });
+    await expect(revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: "1".repeat(64), plan: cfg })).rejects.toMatchObject({ code: "ledger_mismatch" });
   });
 });
 
@@ -522,5 +529,156 @@ describe("CLI", () => {
     await expect(main(["apply"])).rejects.toMatchObject({ code: "execute_required" });
     await expect(main(["apply", "--execute"])).rejects.toMatchObject({ code: "not_wired" });
     await expect(main(["revoke", "--execute"])).rejects.toMatchObject({ code: "not_wired" });
+  });
+});
+
+describe("#56 HOLD (1): the ledger is validated before it is trusted", () => {
+  const ledgerFile = (dir: string) => join(dir, "grant-ledger.json");
+  const edit = async (dir: string, f: (l: Record<string, any>) => void) => {
+    const l = JSON.parse(await readFile(ledgerFile(dir), "utf8"));
+    f(l);
+    await writeFile(ledgerFile(dir), JSON.stringify(l));
+  };
+
+  test("a forged 'created' record (wrong plan digest) is refused, not skipped", async () => {
+    const { cfg, client, dir, plan } = await approved();
+    await applyGrants({ ...cfg, maxNewShards: 1 });
+    const s1 = plan.shards[1]!.shard_id;
+    await edit(dir, (l) => (l.shards[s1] = { status: "created", run_id: "x", grant_id: `mgr_${"c".repeat(32)}`, plan_digest: "0".repeat(64), created_at: new Date(NOW).toISOString() }));
+    await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "ledger_invalid" });
+    expect(client.creates).toBe(1); // shard 1 was neither created nor silently skipped
+  });
+
+  test("a valid-looking record whose digest belongs to another shard is refused", async () => {
+    const { cfg, dir, plan } = await approved();
+    const first = await applyGrants({ ...cfg, maxNewShards: 1 });
+    const own = first.created[0]!;
+    await edit(dir, (l) => (l.shards[plan.shards[1]!.shard_id] = { status: "created", run_id: "x", grant_id: own.grant_id, plan_digest: own.plan_digest, created_at: new Date(NOW).toISOString() }));
+    await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "ledger_invalid" });
+  });
+
+  test("another version, unknown shard, unknown field, bad status or corrupt JSON are refused", async () => {
+    const cases: [string, (l: Record<string, any>) => void][] = [
+      ["version", (l) => (l.version = 99)],
+      ["unknown shard", (l) => (l.shards["e".repeat(32)] = { status: "pending", run_id: "r", started_at: new Date(NOW).toISOString() })],
+      ["unknown field", (l) => (l.extra = true)],
+      ["bad status", (l) => (l.shards[Object.keys(l.shards)[0]!].status = "done")],
+      ["extra record field", (l) => (l.shards[Object.keys(l.shards)[0]!].note = "x")],
+    ];
+    for (const [, f] of cases) {
+      const { cfg, dir } = await approved();
+      await applyGrants({ ...cfg, maxNewShards: 1 });
+      await edit(dir, f);
+      await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "ledger_invalid" });
+    }
+    const { cfg, dir } = await approved();
+    await applyGrants({ ...cfg, maxNewShards: 1 });
+    await writeFile(ledgerFile(dir), "{not json");
+    await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "ledger_invalid" });
+  });
+
+  test("a ledger written under another source snapshot is refused", async () => {
+    const { cfg, dir } = await approved();
+    await applyGrants({ ...cfg, maxNewShards: 1 });
+    await edit(dir, (l) => (l.source_snapshot_id = "fixture:cloud:" + "9".repeat(64)));
+    await expect(applyGrants(cfg)).rejects.toMatchObject({ code: "ledger_mismatch" });
+  });
+
+  test("revoke validates the ledger too", async () => {
+    const { cfg, client, dir, plan } = await approved();
+    await applyGrants(cfg);
+    await edit(dir, (l) => (l.shards[plan.shards[0]!.shard_id].plan_digest = "0".repeat(64)));
+    await expect(revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg })).rejects.toMatchObject({ code: "ledger_invalid" });
+    expect(client.revokes).toBe(0);
+  });
+});
+
+describe("#56 HOLD (2): reviewed aliases bind the signed plan and the request", () => {
+  const mapping: IdMappingLedger = {
+    version: 1, reviewed_by: "reviewer", reviewed_at: READ_AT,
+    entries: [
+      { kind: "org", legacy_id: "org_legacy", cloud_id: ORG },
+      { kind: "workspace", legacy_id: "ws_legacy", cloud_id: WS1 },
+      { kind: "user", legacy_id: "user_legacy0", cloud_id: USERS[0]! },
+    ],
+  };
+  // Legacy ids on every upload of user 0 in WS1, and the legacy org everywhere.
+  const legacy = UPLOADS.map((u) => {
+    const v = { ...u, org_id: "org_legacy" };
+    if (u.workspace_id !== WS1) return v;
+    return { ...v, workspace_id: "ws_legacy", key: u.key.replace(`ws=${WS1}/`, "ws=ws_legacy/"), ...(u.source_user_id === USERS[0] ? { source_user_id: "user_legacy0" } : {}) };
+  });
+
+  test("the plan and every create request carry only Cloud ids; RelayAuth's response verifies", async () => {
+    const sent: Parameters<GrantClient["createGrant"]>[0][] = [];
+    const client = new FakeRelayAuth();
+    const create = client.createGrant.bind(client);
+    client.createGrant = async (req) => (sent.push(req), create(req));
+    const { cfg } = await approved({ uploads: legacy, idMapping: mapping, grant: { ...GRANT, orgId: "org_legacy" } }, client);
+    const plan = await lifecyclePlan(cfg);
+    expect(plan.run_blocked).toBe(false);
+    expect(plan.org_id).toBe(ORG);
+    const result = await applyGrants(cfg);
+    expect(result.failed).toBeUndefined();
+    expect(result.created).toHaveLength(3);
+    const text = JSON.stringify(sent.map((r) => r.plan));
+    for (const alias of ["org_legacy", "ws_legacy", "user_legacy0"]) expect(text).not.toContain(alias);
+    for (const r of sent) for (const m of r.plan.manifests) {
+      expect([m.org_id, m.workspace_id, m.source_user_id].every((id) => /^[0-9a-f-]{36}$/.test(id))).toBe(true);
+      expect(m.key.startsWith(`v1/ws=${m.workspace_id}/`)).toBe(true);
+    }
+  });
+
+  test("the shard plan used for grants equals the canonical uploads' plan (the courier must export the same keys)", async () => {
+    const shardsFromAliases = (await lifecyclePlan(input({ uploads: legacy, idMapping: mapping, grant: { ...GRANT, orgId: "org_legacy" } }))).shards.map((s) => s.body_sha256);
+    const shardsFromCanonical = (await lifecyclePlan(input({ uploads: canonicalizeUploads(legacy, mapping), idMapping: mapping, grant: GRANT }))).shards.map((s) => s.body_sha256);
+    expect(shardsFromAliases).toEqual(shardsFromCanonical);
+  });
+});
+
+describe("#56 HOLD (3): revoke converges against relayauth #112's real semantics", () => {
+  test("the fake answers an already-revoked grant with 409 migration_grant_revoked, as #112 does", async () => {
+    const { cfg, client } = await approved();
+    const applied = await applyGrants(cfg);
+    const id = applied.created[0]!.grant_id;
+    await client.revokeGrant(id);
+    await expect(client.revokeGrant(id)).rejects.toMatchObject({ code: "migration_grant_revoked", status: 409 });
+  });
+
+  test("a lost revoke response converges: the retry's 409 is resolved by the idempotent replay, with RelayAuth's revoked_at", async () => {
+    const { cfg, client, dir, plan } = await approved();
+    const applied = await applyGrants(cfg);
+    client.loseRevokeAt = 2;
+    const evidence = await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg });
+    expect(evidence.failed).toEqual([]);
+    expect(evidence.revoked).toHaveLength(3);
+    const viaReplay = evidence.revoked.filter((r) => r.via === "replay");
+    expect(viaReplay).toHaveLength(1);
+    expect(viaReplay[0]!.revoked_at).toBe(client.grants.get(viaReplay[0]!.grant_id)!.revokedAt!);
+    expect(client.live()).toBe(0);
+    expect(client.grants.size).toBe(applied.created.length); // the replay created nothing
+    // Converged: the ledger says revoked, and a second rollback just reports it.
+    const again = await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg });
+    expect(again.already_revoked).toHaveLength(3);
+  });
+
+  test("every revoke response lost: the final replay still reads the revoked state back", async () => {
+    const { cfg, client, dir, plan } = await approved();
+    await applyGrants(cfg);
+    client.loseRevokesFrom = 1;
+    const evidence = await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg });
+    expect(evidence.failed).toEqual([]);
+    expect(evidence.revoked.every((r) => r.via === "replay" || r.via === "revoke")).toBe(true);
+    expect(client.live()).toBe(0);
+  });
+
+  test("a grant revoked out of band converges too; a grant RelayAuth does not know is a failure", async () => {
+    const { cfg, client, dir, plan } = await approved();
+    const applied = await applyGrants(cfg);
+    await client.revokeGrant(applied.created[0]!.grant_id); // someone else revoked it
+    client.grants.delete(applied.created[1]!.grant_id); // gone at RelayAuth
+    const evidence = await revokeGrants({ execute: true, stateDir: dir, client, aggregateDigest: plan.aggregate_digest, plan: cfg });
+    expect(evidence.revoked.map((r) => r.via).sort()).toEqual(["replay", "revoke"]);
+    expect(evidence.failed).toEqual([{ shard_id: applied.created[1]!.shard_id, grant_id: applied.created[1]!.grant_id, error: "relayauth refused: migration_grant_not_found" }]);
   });
 });

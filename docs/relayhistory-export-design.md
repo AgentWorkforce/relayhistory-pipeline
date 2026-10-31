@@ -196,6 +196,20 @@ ids are Cloud's ids is unverified, so the real reader stays unwired.
   grant. A 409 `idempotency_key_conflict`, any other 4xx, a replayed grant
   that is already revoked, or retries running out halts the run.
 
+- **Ledger:** before `apply` or `revoke` trusts the ledger, it checks the
+  exact version and shape, the approved aggregate digest, the source
+  snapshot id (on apply), and that every shard is in this plan. For every
+  recorded grant, the plan digest must be what relayauth's own derivation
+  gives for that grant id and that shard. Anything else is refused.
+- **Aliases:** reviewed aliases are rewritten to their Cloud ids in the
+  shards, the plan and every create request, including the key's `ws=`
+  segment. The courier must build its export plan from the same canonical
+  uploads (`canonicalizeUploads`).
+- **Revoke:** it converges against relayauth #112. A lost response is
+  retried. When the retry gets 409 `migration_grant_revoked`, `revoke` reads
+  `revokedAt` back by replaying the shard's create with the same
+  Idempotency-Key, which returns the stored grant and creates nothing.
+
 **Not active:** the CLI refuses `apply` and `revoke`. Activation waits for the
 authoritative membership reader, the E3 HOLDs, and Khaliq's OK.
 

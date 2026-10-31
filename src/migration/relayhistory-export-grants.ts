@@ -352,9 +352,40 @@ export interface PlanInput {
   idMapping?: IdMappingLedger;
 }
 
+/**
+ * The uploads with every id the mapping (or an exact UUID) resolves rewritten
+ * to its Cloud id: `org_id`, `workspace_id`, `source_user_id`, and the key's
+ * `ws=` segment. Shards, the plan sent to RelayAuth and the export courier's
+ * plan all use these, so a reviewed alias binds the signed plan and the
+ * request, not only the membership check. An id that does not resolve stays
+ * as it is; it is an exception and blocks its shard.
+ */
+export function canonicalizeUploads(uploads: readonly UploadInput[], mapping: IdMappingLedger = EMPTY_ID_MAPPING): UploadInput[] {
+  const m = validateIdMapping(mapping);
+  const to = (kind: IdKind, id: string) => {
+    const r = resolveCloudId(kind, id, m);
+    return r.ok ? r.cloud_id : id;
+  };
+  return uploads.map((u) => {
+    const ws = to("workspace", u.workspace_id);
+    const prefix = `v1/ws=${u.workspace_id}/`;
+    return {
+      ...u,
+      org_id: to("org", u.org_id),
+      workspace_id: ws,
+      source_user_id: to("user", u.source_user_id),
+      key: u.key.startsWith(prefix) ? `v1/ws=${ws}/${u.key.slice(prefix.length)}` : u.key,
+    };
+  });
+}
+
 async function build(input: PlanInput): Promise<Built> {
   const mapping = validateIdMapping(input.idMapping ?? EMPTY_ID_MAPPING);
-  const shardPlan = planShards({ exportedAt: input.exportedAt, uploads: input.uploads });
+  // Shard the canonical uploads; keep each one's raw ids to judge aliases.
+  const canonicalUploads = canonicalizeUploads(input.uploads, mapping);
+  const rawOf = new Map(canonicalUploads.map((c, i) => [c.key, input.uploads[i]!]));
+  if (rawOf.size !== canonicalUploads.length) refuse("ambiguous_key", "two uploads map to the same canonical manifest key");
+  const shardPlan = planShards({ exportedAt: input.exportedAt, uploads: canonicalUploads });
   const report = shardReport(shardPlan);
   const exceptions: LifecycleException[] = [];
   const blocked = new Set<string>();
@@ -375,7 +406,8 @@ async function build(input: PlanInput): Promise<Built> {
   const bad = new Map<string, { kind: IdKind; id: string; reason: "default_workspace" | "alias_id" | "invalid_id"; shards: Set<string> }>();
   const pairs = new Map<string, { workspace: string; user: string; shards: Set<string> }>();
   for (const shard of shardPlan.shards)
-    for (const m of shard.plan.manifests) {
+    for (const c of shard.plan.manifests) {
+      const m = rawOf.get(c.key)!;
       const resolved: Record<"workspace" | "user", string | undefined> = { workspace: undefined, user: undefined };
       for (const [kind, raw] of [["workspace", m.workspace_id], ["user", m.source_user_id]] as const) {
         const r = resolveCloudId(kind, raw, mapping);
@@ -455,7 +487,7 @@ async function build(input: PlanInput): Promise<Built> {
     v: LIFECYCLE_VERSION,
     contract: PLAN_CONTRACT,
     planner_version: SHARD_PLANNER_VERSION,
-    org_id: input.grant.orgId,
+    org_id: org ?? input.grant.orgId,
     exported_at: input.exportedAt,
     grant,
     source_snapshot_id: snapshotId,
@@ -470,7 +502,7 @@ async function build(input: PlanInput): Promise<Built> {
       version: LIFECYCLE_VERSION,
       contract: PLAN_CONTRACT,
       planner_version: SHARD_PLANNER_VERSION,
-      org_id: input.grant.orgId,
+      org_id: org ?? input.grant.orgId,
       exported_at: input.exportedAt,
       grant,
       source_snapshot: { source: snapshot!.source, snapshot_id: snapshotId, read_at: snapshot!.read_at },
@@ -539,7 +571,9 @@ export interface GrantClient {
 export type ShardState =
   | { status: "pending"; run_id: string; started_at: string }
   | { status: "created"; run_id: string; grant_id: string; plan_digest: string; created_at: string }
-  | { status: "revoked"; run_id: string; grant_id: string; plan_digest: string; created_at: string; revoked_at: string; reason: "rollback" | "compensating" | "revoke" };
+  /** RelayAuth answered with a grant that does not hold this shard: it must be revoked. */
+  | { status: "invalid_grant"; run_id: string; grant_id: string; seen_at: string }
+  | { status: "revoked"; run_id: string; grant_id: string; plan_digest: string; revoked_at: string; reason: "rollback" | "compensating" | "revoke"; via: "revoke" | "replay" };
 
 export interface Ledger {
   version: number;
@@ -551,14 +585,83 @@ export interface Ledger {
 }
 
 const ledgerPath = (dir: string) => join(dir, "grant-ledger.json");
+const GRANT_ID = /^mgr_[0-9a-f]{32}$/;
+const isTime = (v: unknown) => typeof v === "string" && Number.isFinite(Date.parse(v));
+const isStr = (v: unknown) => typeof v === "string" && v.length > 0;
 
-async function loadLedger(dir: string): Promise<Ledger | undefined> {
+/**
+ * Loads the ledger and validates it against the plan being applied or revoked
+ * before anything trusts it: the exact version and shape, the approved
+ * aggregate digest, (when given) the exact source snapshot id, only shards of
+ * this plan, and, for every recorded grant, a plan digest that RelayAuth's own
+ * derivation gives for that grant id and this shard's plan. Anything else is
+ * refused (`ledger_invalid` / `ledger_mismatch`), never silently trusted.
+ */
+async function loadLedger(
+  dir: string,
+  expect: { aggregateDigest: string; sourceSnapshotId?: string; orgId: string; shards: ReadonlyMap<string, Shard> },
+): Promise<Ledger | undefined> {
+  let text: string;
   try {
-    return JSON.parse(await readFile(ledgerPath(dir), "utf8")) as Ledger;
+    text = await readFile(ledgerPath(dir), "utf8");
   } catch (e) {
     if ((e as { code?: string }).code === "ENOENT") return undefined;
     throw e;
   }
+  const bad = (why: string): never => refuse("ledger_invalid", `grant ledger: ${why}`);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    bad("not JSON");
+  }
+  const l = raw as Record<string, unknown>;
+  if (!l || typeof l !== "object" || Array.isArray(l)) bad("not an object");
+  const allowed = new Set(["version", "aggregate_digest", "source_snapshot_id", "shards", "halted"]);
+  if (Object.keys(l).some((k) => !allowed.has(k))) bad("unknown fields");
+  if (l.version !== LIFECYCLE_VERSION) bad(`version ${String(l.version)} is not ${LIFECYCLE_VERSION}`);
+  if (l.aggregate_digest !== expect.aggregateDigest) refuse("ledger_mismatch", "the state directory holds another plan's grants");
+  if (!isStr(l.source_snapshot_id)) bad("source_snapshot_id missing");
+  if (expect.sourceSnapshotId !== undefined && l.source_snapshot_id !== expect.sourceSnapshotId)
+    refuse("ledger_mismatch", "the ledger was written under another membership snapshot");
+  if (l.halted !== undefined) {
+    const h = l.halted as Record<string, unknown>;
+    if (!h || !isStr(h.run_id) || !isStr(h.shard_id) || !isTime(h.at)) bad("halted is malformed");
+  }
+  const shards = l.shards as Record<string, Record<string, unknown>>;
+  if (!shards || typeof shards !== "object" || Array.isArray(shards)) bad("shards missing");
+  for (const [id, st] of Object.entries(shards)) {
+    const shard = expect.shards.get(id);
+    if (!shard) bad(`shard ${id} is not in this plan`);
+    if (!st || typeof st !== "object" || !isStr(st.run_id)) bad(`shard ${id} is malformed`);
+    const fields = (...keys: string[]) => Object.keys(st).sort().join(",") === ["status", "run_id", ...keys].sort().join(",");
+    const digestOk = () => {
+      if (!GRANT_ID.test(String(st.grant_id))) bad(`shard ${id} grant id is malformed`);
+      const want = deriveMigrationGrantPlan({ grantId: String(st.grant_id), orgId: expect.orgId, plan: shard!.plan }).planDigest;
+      if (st.plan_digest !== want) bad(`shard ${id} plan digest is not this shard's plan under its grant`);
+    };
+    switch (st.status) {
+      case "pending":
+        if (!fields("started_at") || !isTime(st.started_at)) bad(`shard ${id} pending record is malformed`);
+        break;
+      case "created":
+        if (!fields("grant_id", "plan_digest", "created_at") || !isTime(st.created_at)) bad(`shard ${id} created record is malformed`);
+        digestOk();
+        break;
+      case "invalid_grant":
+        if (!fields("grant_id", "seen_at") || !GRANT_ID.test(String(st.grant_id)) || !isTime(st.seen_at)) bad(`shard ${id} invalid_grant record is malformed`);
+        break;
+      case "revoked":
+        if (!fields("grant_id", "plan_digest", "revoked_at", "reason", "via") || !isTime(st.revoked_at) ||
+          !["rollback", "compensating", "revoke"].includes(String(st.reason)) || !["revoke", "replay"].includes(String(st.via)))
+          bad(`shard ${id} revoked record is malformed`);
+        if (st.plan_digest !== "") digestOk();
+        break;
+      default:
+        bad(`shard ${id} has unknown status`);
+    }
+  }
+  return l as unknown as Ledger;
 }
 
 async function saveLedger(dir: string, ledger: Ledger): Promise<void> {
@@ -571,15 +674,41 @@ async function saveLedger(dir: string, ledger: Ledger): Promise<void> {
 export interface RevocationEvidence {
   aggregate_digest: string;
   reason: "rollback" | "compensating" | "revoke";
-  revoked: { shard_id: string; grant_id: string; revoked_at: string }[];
+  /** `via`: "revoke" (this run's revoke answered) or "replay" (relayauth #112 409 migration_grant_revoked, revoked_at read back from the idempotent create replay). */
+  revoked: { shard_id: string; grant_id: string; revoked_at: string; via: "revoke" | "replay" }[];
   already_revoked: { shard_id: string; grant_id: string; revoked_at: string }[];
   /** Shards whose create was started but not recorded: a human must check RelayAuth. */
   unresolved: { shard_id: string; started_at: string }[];
   failed: { shard_id: string; grant_id: string; error: string }[];
 }
 
-async function revokeShards(dir: string, ledger: Ledger, client: GrantClient, ids: (id: string, s: ShardState) => boolean, reason: RevocationEvidence["reason"]): Promise<RevocationEvidence> {
+type CreateRequest = Parameters<GrantClient["createGrant"]>[0];
+
+/**
+ * Revoke each selected shard's grant, converging against relayauth #112: a
+ * revoke whose response was lost is retried; RelayAuth then answers 409
+ * `migration_grant_revoked` (no body with the time), so the revoked state and
+ * its `revokedAt` are read back by replaying the shard's create with the same
+ * Idempotency-Key, which returns the stored grant as it is, revocation state
+ * included, without creating anything. A replay naming another grant, or not
+ * revoked after the retries, is a failure in the evidence.
+ */
+async function revokeShards(
+  dir: string,
+  ledger: Ledger,
+  client: GrantClient,
+  ids: (id: string, s: ShardState) => boolean,
+  reason: RevocationEvidence["reason"],
+  requestFor: (shardId: string) => CreateRequest | undefined,
+): Promise<RevocationEvidence> {
   const evidence: RevocationEvidence = { aggregate_digest: ledger.aggregate_digest, reason, revoked: [], already_revoked: [], unresolved: [], failed: [] };
+  const replayRevokedAt = async (shardId: string, grantId: string): Promise<string | null> => {
+    const request = requestFor(shardId);
+    if (!request) throw new Error("no create request to replay for this shard");
+    const out = await client.createGrant(request);
+    if (out.grantId !== grantId) throw new Error("the replay named another grant");
+    return out.revokedAt;
+  };
   for (const [shardId, state] of Object.entries(ledger.shards).sort(([a], [b]) => cmp(a, b))) {
     if (!ids(shardId, state)) continue;
     if (state.status === "pending") {
@@ -590,15 +719,53 @@ async function revokeShards(dir: string, ledger: Ledger, client: GrantClient, id
       evidence.already_revoked.push({ shard_id: shardId, grant_id: state.grant_id, revoked_at: state.revoked_at });
       continue;
     }
-    try {
-      const out = await client.revokeGrant(state.grant_id);
-      if (out.grantId !== state.grant_id) throw new Error("revoke answered for another grant");
-      ledger.shards[shardId] = { ...state, status: "revoked", revoked_at: out.revokedAt, reason };
-      evidence.revoked.push({ shard_id: shardId, grant_id: state.grant_id, revoked_at: out.revokedAt });
-      await saveLedger(dir, ledger);
-    } catch (e) {
-      evidence.failed.push({ shard_id: shardId, grant_id: state.grant_id, error: e instanceof Error ? e.message.slice(0, 200) : "revoke failed" });
+    const planDigest = state.status === "created" ? state.plan_digest : "";
+    let revokedAt: string | undefined;
+    let via: "revoke" | "replay" = "revoke";
+    let error = "revoke failed";
+    let final = false;
+    for (let attempt = 0; attempt <= LOST_RESPONSE_RETRIES && revokedAt === undefined && !final; attempt++) {
+      try {
+        const out = await client.revokeGrant(state.grant_id);
+        if (out.grantId !== state.grant_id) throw new Error("revoke answered for another grant");
+        revokedAt = out.revokedAt;
+      } catch (e) {
+        if (e instanceof GrantClientError && e.code === "migration_grant_revoked" && e.status === 409) {
+          try {
+            const at = await replayRevokedAt(shardId, state.grant_id);
+            if (at) {
+              revokedAt = at;
+              via = "replay";
+            } else error = "RelayAuth says revoked but the replay shows the grant live";
+          } catch (r) {
+            error = r instanceof Error ? r.message.slice(0, 200) : "replay failed";
+          }
+          final = true;
+          break;
+        }
+        error = e instanceof Error ? e.message.slice(0, 200) : "revoke failed";
+        if (e instanceof GrantClientError && !e.retryable) final = true; // 404 and other answers are final
+      }
     }
+    if (revokedAt === undefined && !final) {
+      // Every answer was lost: read the state back through the replay.
+      try {
+        const at = await replayRevokedAt(shardId, state.grant_id);
+        if (at) {
+          revokedAt = at;
+          via = "replay";
+        }
+      } catch (r) {
+        error = r instanceof Error ? r.message.slice(0, 200) : "replay failed";
+      }
+    }
+    if (revokedAt === undefined) {
+      evidence.failed.push({ shard_id: shardId, grant_id: state.grant_id, error });
+      continue;
+    }
+    ledger.shards[shardId] = { status: "revoked", run_id: state.run_id, grant_id: state.grant_id, plan_digest: planDigest, revoked_at: revokedAt, reason, via };
+    evidence.revoked.push({ shard_id: shardId, grant_id: state.grant_id, revoked_at: revokedAt, via });
+    await saveLedger(dir, ledger);
   }
   await mkdir(dir, { recursive: true });
   const at = new Date().toISOString().replace(/[:.]/g, "-");
@@ -683,8 +850,8 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
   if (plan.exceptions.length) refuse("pair_exceptions", `${plan.exceptions.length} exception(s) need human review; nothing applied`);
   if (plan.aggregate_digest !== cfg.approvedDigest) refuse("digest_drift", "the recomputed aggregate digest is not the approved one");
 
-  const prior = await loadLedger(cfg.stateDir);
-  if (prior && prior.aggregate_digest !== plan.aggregate_digest) refuse("ledger_mismatch", "the state directory holds another plan's grants");
+  const byId = new Map(shards.map((s) => [s.shard_id, s]));
+  const prior = await loadLedger(cfg.stateDir, { aggregateDigest: plan.aggregate_digest, sourceSnapshotId: plan.source_snapshot.snapshot_id, orgId: plan.org_id, shards: byId });
   const ledger: Ledger = prior ?? { version: LIFECYCLE_VERSION, aggregate_digest: plan.aggregate_digest, source_snapshot_id: plan.source_snapshot.snapshot_id, shards: {} };
   if (ledger.halted) refuse("previous_run_failed", "an earlier apply failed partway; check its revocation evidence and RelayAuth before going on");
   const states = Object.values(ledger.shards);
@@ -692,6 +859,10 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
   // same Idempotency-Key; RelayAuth returns the original grant if it exists.
   if (states.some((s) => s.status === "revoked")) refuse("plan_rolled_back", "this plan's grants were revoked; approve a new plan to start again");
 
+  const requestFor = (shardId: string): CreateRequest | undefined => {
+    const shard = byId.get(shardId);
+    return shard && { apiKeyId: cfg.grant.apiKeyId, audience: cfg.grant.audience, notAfter: cfg.grant.notAfter, plan: shard.plan, idempotencyKey: shardIdempotencyKey(shardId, plan.aggregate_digest) };
+  };
   const runId = randomUUID();
   const result: ApplyResult = { aggregate_digest: plan.aggregate_digest, created: [], skipped: [], interrupted: false };
   let fresh = 0;
@@ -708,7 +879,7 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
     await saveLedger(cfg.stateDir, ledger);
     let grantId: string | undefined;
     try {
-      const request = { apiKeyId: cfg.grant.apiKeyId, audience: cfg.grant.audience, notAfter: cfg.grant.notAfter, plan: shard.plan, idempotencyKey: shardIdempotencyKey(shard.shard_id, plan.aggregate_digest) };
+      const request = requestFor(shard.shard_id)!;
       // A lost response (or a 5xx) is retried with the same key; RelayAuth
       // answers a retry with the original grant. A 4xx answer (409
       // idempotency_key_conflict included) is final and halts the run.
@@ -733,11 +904,11 @@ export async function applyGrants(cfg: ApplyConfig): Promise<ApplyResult> {
     } catch (e) {
       // A grant that was created but is wrong is revoked with the rest; a
       // create with no answer stays pending for a human.
-      if (grantId) ledger.shards[shard.shard_id] = { status: "created", run_id: runId, grant_id: grantId, plan_digest: "", created_at: new Date(now).toISOString() };
+      if (grantId) ledger.shards[shard.shard_id] = { status: "invalid_grant", run_id: runId, grant_id: grantId, seen_at: new Date(now).toISOString() };
       ledger.halted = { run_id: runId, shard_id: shard.shard_id, at: new Date(now).toISOString() };
       await saveLedger(cfg.stateDir, ledger);
       result.failed = { shard_id: shard.shard_id, error: e instanceof Error ? e.message.slice(0, 200) : "create failed" };
-      result.compensation = await revokeShards(cfg.stateDir, ledger, cfg.client, (_id, s) => s.run_id === runId, "compensating");
+      result.compensation = await revokeShards(cfg.stateDir, ledger, cfg.client, (_id, s) => s.run_id === runId, "compensating", requestFor);
       return result;
     }
   }
@@ -750,17 +921,32 @@ export interface RevokeConfig {
   client: GrantClient;
   /** The approved plan's digest; the ledger must be that plan's. */
   aggregateDigest: string;
+  /**
+   * The approved plan's inputs (no membership read): to validate the ledger's
+   * grants against each shard's plan, and to replay a shard's create when
+   * RelayAuth answers 409 migration_grant_revoked.
+   */
+  plan: Pick<PlanInput, "uploads" | "exportedAt" | "grant" | "idMapping">;
   /** Omit for the rollback (revoke-all) path. */
   shardIds?: readonly string[];
 }
 
 export async function revokeGrants(cfg: RevokeConfig): Promise<RevocationEvidence> {
   if (cfg.execute !== true) refuse("execute_required", "revoke refused without --execute");
-  const ledger = await loadLedger(cfg.stateDir);
+  const mapping = validateIdMapping(cfg.plan.idMapping ?? EMPTY_ID_MAPPING);
+  const orgRes = resolveCloudId("org", cfg.plan.grant.orgId, mapping);
+  const orgId = orgRes.ok ? orgRes.cloud_id : cfg.plan.grant.orgId;
+  const shards = planShards({ exportedAt: cfg.plan.exportedAt, uploads: canonicalizeUploads(cfg.plan.uploads, mapping) }).shards;
+  const byId = new Map(shards.map((s) => [s.shard_id, s]));
+  const ledger = await loadLedger(cfg.stateDir, { aggregateDigest: cfg.aggregateDigest, orgId, shards: byId });
   if (!ledger) refuse("ledger_missing", "no grant ledger in the state directory");
-  if (ledger!.aggregate_digest !== cfg.aggregateDigest) refuse("ledger_mismatch", "the state directory holds another plan's grants");
+  const requestFor = (shardId: string): CreateRequest | undefined => {
+    const shard = byId.get(shardId);
+    const g = cfg.plan.grant;
+    return shard && { apiKeyId: g.apiKeyId, audience: g.audience, notAfter: g.notAfter, plan: shard.plan, idempotencyKey: shardIdempotencyKey(shardId, cfg.aggregateDigest) };
+  };
   const only = cfg.shardIds ? new Set(cfg.shardIds) : undefined;
-  return revokeShards(cfg.stateDir, ledger!, cfg.client, (id) => !only || only.has(id), only ? "revoke" : "rollback");
+  return revokeShards(cfg.stateDir, ledger!, cfg.client, (id) => !only || only.has(id), only ? "revoke" : "rollback", requestFor);
 }
 
 // ---------------------------------------------------------------- CLI
