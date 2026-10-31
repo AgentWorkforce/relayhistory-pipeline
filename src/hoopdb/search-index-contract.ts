@@ -267,6 +267,12 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     orgId: "app_metadata.org_id",
     workspaceIds: "app_metadata.workspace_ids",
   },
+  /** `iss` comes from sessions.session_directory_search_token_policy, per environment. */
+  audience: "session-directory-search",
+  maxTokenLifetimeSeconds: 60,
+  /** A larger membership is split across tokens by the caller, which merges the pages. */
+  maxClaimedWorkspaces: 64,
+  maxWorkspaceIdChars: 128,
   /** Meaningful characters after normalizeSearchQuery: not separators, format characters or marks. */
   minQueryChars: 3,
   maxQueryChars: 200,
@@ -305,7 +311,7 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
   ],
   errors: {
     "42501":
-      "caller is not the Worker role, or tenant claims missing, malformed, for another role, or not covering the workspace",
+      "caller is not the Worker role, or tenant claims missing, malformed, for another role, from another issuer or audience, too long-lived, over the workspace bound, or not covering the workspace",
     "22023":
       "an invalid value: text under the meaningful-character rule, limit, state, agent match, harness, cursor, since > until, or a contradictory pair",
     "0A000": "an intentionally unsupported combination (see unsupported)",

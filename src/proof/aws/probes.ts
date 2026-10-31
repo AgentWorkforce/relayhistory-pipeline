@@ -104,7 +104,21 @@ export function directorySql(sessionIds: readonly string[]): string {
 export function searchBatchSql(t: Tenant, queries: ReadonlyArray<{ tag: string; q: string }>): string {
   if (!IDENT.test(t.orgId) || !IDENT.test(t.workspaceId)) throw new Error("refusing unsafe tenant literal");
   if (queries.length === 0) throw new Error("empty search batch");
-  const claims = JSON.stringify({ role: "session_directory_search_worker", app_metadata: { org_id: t.orgId, workspace_ids: [t.workspaceId] } });
+  // The RPC pins iss/aud/lifetime to sessions.session_directory_search_token_policy,
+  // which only the owner can read, so the claims are built from it before SET ROLE.
+  // One policy row and one captured epoch: exp = iat + the policy's own
+  // max_lifetime_seconds (1..60), so a stricter policy is honoured and the
+  // lifetime cannot straddle a second boundary.
+  const claims = `SELECT set_config('request.jwt.claims', json_build_object(
+  'role', 'session_directory_search_worker',
+  'iss', p.issuer,
+  'aud', p.audience,
+  'iat', n.iat,
+  'exp', n.iat + p.max_lifetime_seconds,
+  'app_metadata', json_build_object('org_id', '${t.orgId}', 'workspace_ids', json_build_array('${t.workspaceId}')))::text, true)
+  FROM sessions.session_directory_search_token_policy AS p,
+       (SELECT floor(extract(epoch FROM clock_timestamp()))::bigint AS iat) AS n
+ WHERE p.singleton \\g /dev/null`;
   const body = queries.map(({ tag, q }) => {
     if (!TERM.test(q)) throw new Error("refusing unsafe search term");
     if (!IDENT.test(tag)) throw new Error("refusing unsafe tag");
@@ -114,7 +128,7 @@ SELECT json_build_object('tag', '${tag}',
   'ms', extract(epoch FROM clock_timestamp() - current_setting('proof.t0')::timestamptz) * 1000)
   FROM sessions.search_session_directory(${ident(t.workspaceId)}, '${q}') r;`;
   });
-  return ["BEGIN READ ONLY;", "SET LOCAL ROLE session_directory_search_worker;", `SELECT set_config('request.jwt.claims', '${claims}', true) \\g /dev/null`, ...body, "ROLLBACK;", ""].join("\n");
+  return ["BEGIN READ ONLY;", claims, "SET LOCAL ROLE session_directory_search_worker;", ...body, "ROLLBACK;", ""].join("\n");
 }
 
 export interface SearchResultLine {

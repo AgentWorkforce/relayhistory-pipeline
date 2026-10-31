@@ -25,6 +25,7 @@ import {
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
+const TOKEN_ISSUER = "https://issuer.test/session-directory";
 
 async function database(): Promise<PGlite> {
   const db = new PGlite({ extensions: { auto_explain, btree_gin, pg_trgm } });
@@ -35,6 +36,10 @@ async function database(): Promise<PGlite> {
   // The production PostgreSQL session is UTC whatever the client host's zone; in-process
   // PGlite would inherit the host TZ, so pin it to model production.
   await db.exec("SET TIME ZONE 'UTC'");
+  await db.query(
+    "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
+    [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],
+  );
   return db;
 }
 
@@ -244,11 +249,17 @@ const ARG_TYPES: Record<string, string> = {
   p_until: "timestamptz",
   p_cursor_last_activity_at: "timestamptz",
 };
-const claimsFor = (org: string, workspaces: string[]) =>
-  JSON.stringify({
+const claimsFor = (org: string, workspaces: unknown[]) => {
+  const iat = Math.floor(Date.now() / 1000);
+  return JSON.stringify({
     role: WORKER,
+    iss: TOKEN_ISSUER,
+    aud: SESSION_DIRECTORY_SEARCH_RPC.audience,
+    iat,
+    exp: iat + 60,
     app_metadata: { org_id: org, workspace_ids: workspaces },
   });
+};
 
 /** Calls the RPC as PostgREST would: SET ROLE Worker, claims set, named arguments. */
 async function rpc(
@@ -587,29 +598,11 @@ describe("workspace scope stays inside the claim", () => {
     }
   });
 
-  test("non-string or empty workspace claims grant nothing", async () => {
-    const odd = JSON.stringify({
-      role: WORKER,
-      app_metadata: {
-        org_id: "org-a",
-        workspace_ids: [7, null, { id: "ws-b" }, "ws-a"],
-      },
-    });
-    const hits = await pageAll(db, odd, {}, 50);
-    expect(hits.length).toBeGreaterThan(0);
-    expect(hits.every((id) => id.startsWith("org-a/ws-a/"))).toBe(true);
-    const none = JSON.stringify({
-      role: WORKER,
-      app_metadata: { org_id: "org-a", workspace_ids: [] },
-    });
-    expect(
-      (
-        (await rpc(db, none, {}).then(
-          () => null,
-          (c: unknown) => c,
-        )) as { code?: string } | null
-      )?.code,
-    ).toBe("42501");
+  test("non-string or empty workspace claims are refused", async () => {
+    for (const set of [[7, null, { id: "ws-b" }, "ws-a"], []]) {
+      const error = await rpc(db, claimsFor("org-a", set), {}).then(() => null, (c: unknown) => c) as { code?: string } | null;
+      expect(error?.code).toBe("42501");
+    }
   });
 });
 
@@ -977,7 +970,11 @@ describe("search RPC plans as the Worker identity (PGlite, 30,000 rows)", () => 
             Plan: Plan;
           },
       )
-      .find((e) => e["Query Text"].includes("FROM sessions.session_directory"));
+      .find((e) =>
+        /FROM sessions\.session_directory(_users|_machines)? AS /.test(
+          e["Query Text"],
+        ),
+      );
     if (!entry) throw new Error("no inner plan captured");
     const nodes = walk(entry.Plan);
     const scans = nodes.filter(
