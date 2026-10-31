@@ -74,6 +74,12 @@ beforeAll(async () => {
   await db.exec(
     await readFile(join(SUPABASE, "tests/supabase_shim.sql"), "utf8"),
   );
+  await db.exec(
+    await readFile(
+      join(SUPABASE, "bootstrap/session_directory_search_worker.sql"),
+      "utf8",
+    ),
+  );
   for (const file of (await readdir(join(SUPABASE, "migrations")))
     .filter((f) => f.endsWith(".sql"))
     .sort())

@@ -18,7 +18,14 @@ import {
   selfCheckManifestEpochs,
   type ManifestReaderName,
 } from "./vendor.ts";
-import { openHoopDb, waitForHoopDb, waitForSchema, type HoopDb } from "./db.ts";
+import {
+  inTransaction,
+  openHoopDb,
+  schemaVerdict,
+  waitForHoopDb,
+  waitForSchema,
+  type HoopDb,
+} from "./db.ts";
 import { ctxOf, enrichMessage } from "./enrich.ts";
 import { vendorBindings, integer } from "./env.ts";
 import { liveDataPathVerdict, workloadReadyLive } from "./data-path.ts";
@@ -26,7 +33,7 @@ import { errorFields, log } from "./log.ts";
 import { initTelemetry, shutdownTelemetry, withSpan } from "./telemetry.ts";
 import { createServer } from "node:http";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
-import { expectedMigrationNames } from "../hoopdb/migrate.ts";
+import { expectedSchema } from "../hoopdb/migrate.ts";
 
 export interface WorkerOptions {
   service: string;
@@ -143,7 +150,9 @@ export function traced(
  * Worker health, for container and Kubernetes probes (workers have no other port).
  *   GET /healthz  200 while the poll loop is ticking and HoopDb answered within
  *                 the last WORKER_UNHEALTHY_AFTER_FAILURES ticks; 503 otherwise.
- *   GET /readyz   200 once HoopDb answers and the schema ledger is complete.
+ *   GET /readyz   200 once HoopDb answers, the schema ledger is complete and the
+ *                 Worker role validation is PASS for this image's generation
+ *                 (re-read on every probe, so a failed later validation turns it 503).
  *                 A GCS workload (LOCKER_PROVIDER=gcs or WORKER_DATA_PATH_PROBE=1)
  *                 also requires the data-path settings and refuses HMAC keys.
  *   GET /datapathz  the data-path verdict alone. Unarmed on the S3 default.
@@ -152,6 +161,8 @@ export function traced(
  */
 export interface WorkerHealth {
   ready: boolean;
+  /** Live schema/validation check, set once HoopDb is open; absent means not ready. */
+  schemaReady?: () => Promise<boolean>;
   lastTickAt: number;
   consecutiveDbFailures: number;
 }
@@ -174,17 +185,39 @@ export function healthVerdict(
   return { ok: true, reason: h.ready ? "ok" : "starting" };
 }
 
+/**
+ * The claim gate: the same live check as /readyz (ledger, marker and phase 2). Closed
+ * when it is unset, false, or throws. Logged when closed so a paused worker is visible.
+ */
+export async function gateOpen(
+  h: Pick<WorkerHealth, "schemaReady">,
+): Promise<boolean> {
+  const open = h.schemaReady ? await h.schemaReady().catch(() => false) : false;
+  if (!open)
+    log.warn(
+      "worker paused: live role validation gate closed; claiming nothing",
+    );
+  return open;
+}
+
 /** Readiness: the schema is complete and HoopDb is answering now. */
 export function readyVerdict(h: WorkerHealth, opts: { maxFailures: number }) {
   return h.ready && h.consecutiveDbFailures < opts.maxFailures;
 }
 
-function serveHealth(health: WorkerHealth, port: number) {
+export function serveHealth(health: WorkerHealth, port: number) {
   const maxFailures = integer("WORKER_UNHEALTHY_AFTER_FAILURES", 5);
   const maxTickAgeMs = integer("WORKER_MAX_TICK_AGE_MS", 120_000);
   const server = createServer((req, res) => {
     if (req.url === "/readyz") {
-      void workloadReadyLive(readyVerdict(health, { maxFailures }), process.env)
+      void (health.schemaReady ? health.schemaReady() : Promise.resolve(false))
+        .catch(() => false)
+        .then((schemaOk) =>
+          workloadReadyLive(
+            schemaOk && readyVerdict(health, { maxFailures }),
+            process.env,
+          ),
+        )
         .then((verdict) => {
           res.writeHead(verdict.ok ? 200 : 503, {
             "content-type": "application/json",
@@ -235,6 +268,7 @@ function serveHealth(health: WorkerHealth, port: number) {
   server.listen(port, "0.0.0.0", () =>
     log.info("worker health listening", { port }),
   );
+  return server;
 }
 
 export async function runWorker(opts: WorkerOptions): Promise<never> {
@@ -253,7 +287,11 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
     10_000,
   );
   await waitForHoopDb(db);
-  await waitForSchema(db, await expectedMigrationNames());
+  const expected = await expectedSchema();
+  await waitForSchema(db, expected);
+  // Live on every /readyz probe and before every claim: ledger, marker AND phase 2 now.
+  health.schemaReady = async () =>
+    (await schemaVerdict(expected, (work) => inTransaction(db, work))).ok;
   clearInterval(startupBeat);
   health.ready = true;
   health.lastTickAt = Date.now();
@@ -330,7 +368,19 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
       });
     }
     health.lastTickAt = Date.now();
+    // The live gate, checked again before EVERY claim (each stage's batch) and before
+    // the side tick. Current-tick semantics: a verdict holds only as of its final read,
+    // so the most a closing gate can leave running is the one batch claimed just before
+    // it closed: at most WORKER_BATCH_SIZE messages of one stage, which finish inside
+    // their pollPostgresStage call (acked, retried or dead-lettered). A batch cut short
+    // by a crash is re-delivered when its lease (WORKER_LEASE_SECONDS) expires. While
+    // the gate is closed the worker claims nothing.
+    let gated = false;
     for (const stage of opts.stages) {
+      if (!(await gateOpen(health))) {
+        gated = true;
+        break;
+      }
       try {
         const r = await pollPostgresStage({
           sql: db,
@@ -352,7 +402,7 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
         log.error("poll failed", { stage, ...errorFields(err) });
       }
     }
-    if (opts.tick) {
+    if (opts.tick && !gated && (await gateOpen(health))) {
       // Long side work (reconcile) keeps the progress clock moving while it runs.
       const tickBeat = setInterval(
         () => (health.lastTickAt = Date.now()),

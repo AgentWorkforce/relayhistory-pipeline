@@ -28,24 +28,39 @@
 -- Code only; nothing here is applied by this repository. The down path is
 -- supabase/rollbacks/20261030020000_session_directory_short_summary.down.sql.
 
--- Role guard, first so that a failure leaves nothing applied. The migration owns
--- one role, session_directory_search_worker. If it already exists it is reused only
--- when it is exactly what this migration would create: no LOGIN, INHERIT, BYPASSRLS,
--- SUPERUSER, CREATEROLE, CREATEDB or REPLICATION; a member of no role; no member
--- except `authenticator` with NOINHERIT; no owned objects; no explicit privileges
--- (tables, columns, sequences, functions, schemas, databases, default privileges);
--- no role setting other than statement_timeout. Anything else fails closed with
--- SQLSTATE 42710 naming every violation. It never silently reuses a dangerous role.
+-- Role guard, first so that a failure leaves nothing applied. This migration never
+-- creates or alters a role: creating one needs CREATEROLE, and on PostgreSQL 16+
+-- ALTER ROLE ... SET needs CREATEROLE plus ADMIN on the role, which a least-privilege
+-- migration owner (CNPG `hoop`, no CREATEROLE) does not have. The role is provisioned
+-- beforehand by the privileged, idempotent bootstrap
+-- supabase/bootstrap/session_directory_search_worker.sql (runbook:
+-- runbooks/session-directory-search-worker-bootstrap.md).
+--
+-- The role must exist exactly as the bootstrap makes it, or the migration fails closed
+-- before any DDL:
+--   - absent: SQLSTATE 42704;
+--   - anything else wrong: SQLSTATE 55000, naming every violation.
+-- Required: NOLOGIN, NOINHERIT, NOBYPASSRLS, not SUPERUSER, CREATEROLE, CREATEDB or
+-- REPLICATION. Its only setting (pg_db_role_setting) is the role-wide
+-- statement_timeout=2s, spelled exactly so: '2000ms', '2000' or an extra setting are
+-- refused. It is a member of no role. Its only member may be `authenticator`,
+-- NOINHERIT, without ADMIN OPTION (and on PostgreSQL 16+ without INHERIT on the grant).
+-- So no other role, the migration owner included, holds membership or ADMIN OPTION on
+-- it. It owns no objects and holds no explicit privileges, except USAGE on schema
+-- `sessions`, which this migration grants.
 DO $role_guard$
 DECLARE
   v_oid oid;
   v_problems text[] := '{}';
   v_row record;
+  v_settings text;
 BEGIN
   SELECT oid INTO v_oid FROM pg_roles WHERE rolname = 'session_directory_search_worker';
   IF v_oid IS NULL THEN
-    CREATE ROLE session_directory_search_worker NOLOGIN NOINHERIT NOBYPASSRLS;
-    RETURN;
+    RAISE EXCEPTION USING ERRCODE = '42704',
+      MESSAGE = 'role session_directory_search_worker does not exist; this migration does not create it',
+      HINT = 'Run supabase/bootstrap/session_directory_search_worker.sql as a privileged role first '
+             '(runbooks/session-directory-search-worker-bootstrap.md), then rerun.';
   END IF;
 
   SELECT * INTO v_row FROM pg_roles WHERE oid = v_oid;
@@ -56,23 +71,44 @@ BEGIN
   IF v_row.rolcreaterole THEN v_problems := array_append(v_problems, 'CREATEROLE'::text); END IF;
   IF v_row.rolcreatedb THEN v_problems := array_append(v_problems, 'CREATEDB'::text); END IF;
   IF v_row.rolreplication THEN v_problems := array_append(v_problems, 'REPLICATION'::text); END IF;
-  IF EXISTS (SELECT 1 FROM unnest(coalesce(v_row.rolconfig, '{}')) AS c(setting)
-              WHERE c.setting NOT LIKE 'statement\_timeout=%') THEN
-    v_problems := array_append(v_problems, 'role settings other than statement_timeout'::text);
+
+  -- Settings: exactly one row, role-wide (setdatabase = 0), exactly {statement_timeout=2s}.
+  IF (SELECT count(*) FROM pg_db_role_setting WHERE setrole = v_oid) <> 1
+     OR NOT EXISTS (SELECT 1 FROM pg_db_role_setting
+                     WHERE setrole = v_oid AND setdatabase = 0
+                       AND setconfig = ARRAY['statement_timeout=2s']::text[]) THEN
+    SELECT coalesce(string_agg(
+             CASE WHEN s.setdatabase = 0 THEN '' ELSE format('database %s: ', s.setdatabase) END
+               || array_to_string(s.setconfig, ', '), '; '), 'none')
+      INTO v_settings
+      FROM pg_db_role_setting AS s WHERE s.setrole = v_oid;
+    v_problems := array_append(v_problems,
+      format('role settings must be exactly statement_timeout=2s (found: %s)', v_settings)::text);
   END IF;
 
-  -- Memberships: it may belong to no role, and only a NOINHERIT authenticator may
-  -- belong to it (an inheriting member would gain its EXECUTE through membership).
+  -- Memberships: it may belong to no role; only a NOINHERIT authenticator without
+  -- ADMIN OPTION may belong to it (an inheriting member would gain its EXECUTE, and an
+  -- ADMIN member could grant it onward).
   FOR v_row IN SELECT r.rolname FROM pg_auth_members AS m JOIN pg_roles AS r ON r.oid = m.roleid
                 WHERE m.member = v_oid LOOP
     v_problems := array_append(v_problems, format('member of %I', v_row.rolname)::text);
   END LOOP;
-  FOR v_row IN SELECT r.rolname, r.rolinherit FROM pg_auth_members AS m JOIN pg_roles AS r ON r.oid = m.member
+  FOR v_row IN SELECT r.rolname, r.rolinherit, m.admin_option FROM pg_auth_members AS m
+                 JOIN pg_roles AS r ON r.oid = m.member
                 WHERE m.roleid = v_oid LOOP
-    IF v_row.rolname <> 'authenticator' OR v_row.rolinherit THEN
+    IF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
       v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
     END IF;
   END LOOP;
+  -- PostgreSQL 16+ records INHERIT per grant; refuse an inheriting grant even to a
+  -- NOINHERIT member. (Dynamic: the column does not exist before 16.)
+  IF current_setting('server_version_num')::int >= 160000 THEN
+    FOR v_row IN EXECUTE
+      'SELECT r.rolname FROM pg_auth_members AS m JOIN pg_roles AS r ON r.oid = m.member
+        WHERE m.roleid = $1 AND m.inherit_option' USING v_oid LOOP
+      v_problems := array_append(v_problems, format('granted WITH INHERIT to %I', v_row.rolname)::text);
+    END LOOP;
+  END IF;
 
   -- Owned objects.
   IF EXISTS (SELECT 1 FROM pg_class WHERE relowner = v_oid)
@@ -107,13 +143,13 @@ BEGIN
   END IF;
 
   IF cardinality(v_problems) > 0 THEN
-    RAISE EXCEPTION USING ERRCODE = '42710',
-      MESSAGE = 'role session_directory_search_worker already exists and is unsafe to reuse: '
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = 'role session_directory_search_worker does not match the bootstrap spec: '
                 || array_to_string(v_problems, ', '),
-      HINT = 'Drop or fix the role, then rerun. The migration never reuses a role with these attributes.';
+      HINT = 'Fix or drop the role and rerun supabase/bootstrap/session_directory_search_worker.sql '
+             'as a privileged role (runbooks/session-directory-search-worker-bootstrap.md). '
+             'The migration never alters a role.';
   END IF;
-  -- Exactly what this migration would create: reuse it as is. The role is never
-  -- altered; anything unsafe was refused above, before any other DDL ran.
 END
 $role_guard$;
 
@@ -209,10 +245,9 @@ CREATE INDEX session_directory_tenant_project_trgm_idx
 -- The dedicated Worker identity. NOLOGIN: the authenticator/credential binding is a
 -- separately reviewed deployment step. No table privileges, no BYPASSRLS; it can
 -- only execute the search RPC. PostgREST (>= v12) applies role-level settings, so
--- the timeout bounds every request made as this role.
--- (The role is created or validated at the top of this migration; see
--- session_directory_search_worker role guard.)
-ALTER ROLE session_directory_search_worker SET statement_timeout = '2s';
+-- the role-wide statement_timeout=2s set by the bootstrap bounds every request made as
+-- this role. The role guard at the top of this migration has verified it is present
+-- exactly; this migration neither creates nor alters the role.
 GRANT USAGE ON SCHEMA sessions TO session_directory_search_worker;
 
 -- One normalization rule for search queries, identical to src/hoopdb/search-query.ts
