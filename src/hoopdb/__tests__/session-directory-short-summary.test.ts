@@ -1962,6 +1962,158 @@ describe("short_summary end to end through the pipeline", () => {
       "pelican ledger",
     );
   }, 60_000);
+
+  test("deployment prefix (#88) with the directory projection (#38): a prefixed manifest publishes, reconciles on retry from the prefixed object, and rebuilds when moved", async () => {
+    const db = await hoopDatabase();
+    const q = async (text: string, params?: unknown[]) => ({
+      rows: (await db.query(text, params as never)).rows as never[],
+    });
+    const hoop = {
+      query: q,
+      pool: { connect: async () => ({ query: q, release() {} }) },
+      end: async () => {},
+    } as unknown as HoopDb;
+    const m = manifest();
+    const reader = {
+      provider: "fs",
+      bucket: "locker",
+      read: async () => ({ manifest: m, etag: "e1" }),
+    } as never;
+    const tail = "v1/ws=ws-e2e/m=m-1/h=codex/d=2026/10/29/s=s-e2e";
+    const prefixA = "96bulls/org-a";
+    const prefixB = "96bulls/org-a-moved";
+    const pointerAt = (prefix: string) => ({
+      traceId: m.trace_id,
+      workspaceId: "ws-e2e",
+      machineId: "m-1",
+      harness: "codex",
+      sessionId: "s-e2e",
+      manifestKey: `${prefix}/${tail}/manifest.json`,
+      provider: "fs",
+      bucket: "locker",
+    });
+    const ctx = {
+      traceId: m.trace_id,
+      orgId: "org-a",
+      workspaceId: "ws-e2e",
+      machineId: "m-1",
+      harness: "codex",
+      sessionId: "s-e2e",
+    };
+    const index = hoopDbSessionIndex({
+      db: hoop,
+      reader,
+      queue: {
+        backend: "memory",
+        send: async () => {},
+        sendBatch: async () => {},
+      } as never,
+      current: () => undefined,
+    });
+    await index.upsertRawPointer(pointerAt(prefixA) as never, ctx as never);
+    expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
+
+    // Chunks exist only under the deployment prefixes, as the ingest stores them.
+    const store = createFsStore({
+      root: mkdtempSync(join(tmpdir(), "g6-prefix-")),
+    });
+    const line = JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: `Fix the pelican ledger; token ${FAKE_RELAY_TOKEN}`,
+      },
+    });
+    for (const prefix of [prefixA, prefixB]) {
+      await store.put(
+        rawChunkKey(
+          {
+            prefix,
+            workspaceId: "ws-e2e",
+            machineId: "m-1",
+            harness: "codex",
+            sessionId: "s-e2e",
+            startDate: "2026-10-29",
+          },
+          0,
+          0,
+          "22222222",
+          "jsonl",
+        ),
+        zstdCompressSync(Buffer.from(`${line}\n`)),
+      );
+    }
+    const keyring = await masterKeyring(
+      parseMasterKeys(`k1:${"a".repeat(64)}`),
+    );
+    const run = (
+      prefix: string,
+      directory?: Parameters<typeof bobCostasHandler>[1]["directory"],
+    ) =>
+      bobCostasHandler("short", {
+        db: hoop,
+        reader,
+        store,
+        summarizer: extractiveSummarizer,
+        keyring,
+        ...(directory ? { directory } : {}),
+      })(
+        { payload: pointerAt(prefix), ctx: { orgId: "org-a" } } as never,
+        { log: { info() {} } } as never,
+      );
+    const objectKey = async () =>
+      (
+        await db.query<{ object_key: string }>(
+          "SELECT object_key FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'",
+        )
+      ).rows[0]?.object_key;
+
+    // 1. Published under prefix A; the directory write fails after the pointer commits.
+    const failing = {
+      write: async () => {
+        throw new Error("directory unavailable");
+      },
+      clear: async () => false,
+    };
+    await expect(run(prefixA, failing)).rejects.toThrow(
+      "directory unavailable",
+    );
+    expect(await objectKey()).toBe(`${prefixA}/${tail}/summary/short.json.enc`);
+    expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
+
+    // 2. The retry is "current" only because the pointer is the object beside this
+    //    manifest (#88). #38's reconcile then reads that prefixed object and publishes.
+    expect(await run(prefixA)).toEqual({
+      status: "skipped",
+      reason: "summary_current",
+    });
+    let current = await row(db, "s-e2e");
+    expect(String(current?.short_summary)).toContain("pelican ledger");
+    expect(String(current?.short_summary)).not.toContain(FAKE_RELAY_TOKEN);
+    expect(current?.short_summary_source).toBe("bob-costas/extractive/v1");
+    expect(
+      await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger"),
+    ).toHaveLength(1);
+
+    // 3. The same revision under prefix B is not current (the pointer is outside the
+    //    manifest's prefix): rebuilt beside the new manifest and republished.
+    const firstGenerated = (
+      current?.short_summary_generated_at as Date
+    ).getTime();
+    const moved = await run(prefixB);
+    expect(moved).not.toEqual({ status: "skipped", reason: "summary_current" });
+    expect(await objectKey()).toBe(`${prefixB}/${tail}/summary/short.json.enc`);
+    current = await row(db, "s-e2e");
+    expect(String(current?.short_summary)).toContain("pelican ledger");
+    expect(
+      (current?.short_summary_generated_at as Date).getTime(),
+    ).toBeGreaterThanOrEqual(firstGenerated);
+    // And now prefix B is the current one.
+    expect(await run(prefixB)).toEqual({
+      status: "skipped",
+      reason: "summary_current",
+    });
+  }, 60_000);
 });
 
 describe("short_summary rollback", () => {
