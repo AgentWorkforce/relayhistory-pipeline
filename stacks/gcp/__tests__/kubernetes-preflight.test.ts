@@ -41,10 +41,35 @@ describe("private GKE executor preflight", () => {
     });
   });
 
+  test("normalizes the GKE provider's canonical HTTPS endpoint to its private IPv4 host", async () => {
+    const calls: unknown[][] = [];
+    await provePrivateKubernetesReachability(
+      "https://172.20.0.2",
+      executor,
+      authorization,
+      async (...args) => {
+        calls.push(args);
+      },
+      2500,
+    );
+    expect(calls).toEqual([["172.20.0.2", 443, 2500]]);
+  });
+
   test("rejects public, malformed, whitespace, and unreachable endpoints", async () => {
     const inVpcExecutor = { ...executor, name: "gcp-vpc-runner-01", mode: "in-vpc" as const };
     const inVpcAuthorization = { ...authorization, executor: inVpcExecutor.name };
-    for (const endpoint of ["34.1.2.3", "10.52.0.2 ", "https://10.52.0.2", "not-an-ip", "127.0.0.1"])
+    for (const endpoint of [
+      "34.1.2.3",
+      "10.52.0.2 ",
+      "http://10.52.0.2",
+      "https://10.52.0.2:443",
+      "https://10.52.0.2/api",
+      "https://user@10.52.0.2",
+      "https://34.1.2.3",
+      "https://10.52.0.2 ",
+      "not-an-ip",
+      "127.0.0.1",
+    ])
       await expect(provePrivateKubernetesReachability(endpoint, inVpcExecutor, inVpcAuthorization, async () => {})).rejects.toThrow(
         /concrete private IPv4/,
       );

@@ -13,6 +13,7 @@ import {
 import { vendorBindings, integer } from "../shared/env.ts";
 import { enrichMessage } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
+import { indexerReconcileRoot } from "./reconcile-root.ts";
 import { runWorker } from "../shared/worker.ts";
 import { hoopDbSessionIndex } from "./index.ts";
 import { postgresPipelineQueue } from "../shared/vendor.ts";
@@ -44,6 +45,12 @@ await runWorker({
     const raw = lockerStore();
     const orgs = orgResolverFromEnv(env);
     if (!orgs) return;
+    const listPrefix = indexerReconcileRoot(env);
+    if (!listPrefix) {
+      // Org-derived prefixes with no PIPELINE_KEY_PREFIX: the store root cannot be listed.
+      log.warn("reconcile not configured", { reason: "org_from_prefix_without_base" });
+      return;
+    }
     const reader = lockerManifestReader();
     const queue = postgresPipelineQueue(db);
     const lookback = integer("PIPELINE_RECONCILE_LOOKBACK_MINUTES", 15);
@@ -54,7 +61,10 @@ await runWorker({
         orgs,
         allowPrefix: (prefix, orgId) => prefixAllowed(env, prefix, orgId),
         send: async (m) => queue.send(await enrichMessage(m, reader)),
-        listPrefix: `${env.PIPELINE_KEY_PREFIX ? `${env.PIPELINE_KEY_PREFIX}/` : ""}v1`,
+        // `<base>/v1` with a static org; with org-derived prefixes the whole
+        // `<base>` root, so every `<base>/<org>/v1` is listed (allowPrefix
+        // then keeps only exact `<base>/<org>` keys of a known org).
+        listPrefix,
         modifiedSince: new Date(now.getTime() - lookback * 60_000),
       });
       log.info("reconcile finished", { listed: result.listed, enqueued: result.enqueued, skipped: result.skipped, failed: result.failed });

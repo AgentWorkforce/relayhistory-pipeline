@@ -82,8 +82,18 @@ export interface MigrationAssertionClaims {
   nonce: string;
   grantId: string;
   planDigest: string;
-  /** `meta.upload`: the signed identity of the one upload this assertion is for. */
-  upload: UploadIdentity;
+  /**
+   * `meta.upload`: the signed identity of the one upload this assertion is
+   * for. v1 (`UploadIdentity`, a whole session) or v2
+   * (`UploadIdentityV2`, one backfill epoch appended to a live manifest).
+   */
+  upload: UploadIdentity | UploadIdentityV2 | UploadIdentityBaseRead;
+  /**
+   * The token class: an upload assertion (`meta.upload`, v1 or v2 commit) or
+   * the v2 base-read capability (`meta.read`). Optional for test fixtures;
+   * the verifier always sets it.
+   */
+  capability?: "upload" | "base_read";
   /** `meta.sourceUserId`: the grant pair's user. */
   sourceUserId: string;
   /** `meta.workspaceId`: the grant pair's workspace. */
@@ -376,7 +386,18 @@ export async function derivePlanEntry(
   manifest: Pick<ManifestV1, "session" | "raw">,
 ): Promise<PlanEntry | undefined> {
   const tenancy = signedTenancy(auth);
-  if (!tenancy) return undefined;
+  return tenancy && planEntryFor(tenancy, location, manifest);
+}
+
+/** The plan entry of a manifest under a known tenancy. */
+export async function planEntryFor(
+  tenancy: Pick<
+    UploadIdentity,
+    "grant_id" | "org_id" | "workspace_id" | "source_user_id"
+  >,
+  location: Parameters<typeof sessionManifestKey>[0],
+  manifest: Pick<ManifestV1, "session" | "raw">,
+): Promise<PlanEntry | undefined> {
   const raw = manifest.raw;
   const content = await computeContentSha256(raw.chunks);
   if (content !== raw.content_sha256 || raw.chunks.length !== raw.chunk_count)
@@ -407,7 +428,7 @@ export async function derivePlanEntry(
 /** The signed identity names exactly the signed tenancy and plan (canonical ids). */
 function sameTenancy(
   auth: Pick<AuthContext, "migration">,
-  upload: UploadIdentity,
+  upload: UploadIdentity | UploadIdentityV2 | UploadIdentityBaseRead,
   tenancy: Pick<
     UploadIdentity,
     "grant_id" | "org_id" | "workspace_id" | "source_user_id"
@@ -455,7 +476,13 @@ export async function migrationUploadMatches(
   manifest: Pick<ManifestV1, "session" | "raw">,
 ): Promise<boolean> {
   const upload = auth.migration?.upload;
-  if (!upload || !migrationSessionMatches(auth, location)) return false;
+  // v1 only: a backfill (v2) identity never matches a whole-session commit.
+  if (
+    !upload ||
+    isV2Identity(upload) ||
+    !migrationSessionMatches(auth, location)
+  )
+    return false;
   const entry = await derivePlanEntry(auth, location, manifest);
   if (!entry) return false;
   const derived = await uploadIdentityOf(entry, upload.plan_digest);
@@ -472,7 +499,8 @@ export async function migrationUploadMatches(
  */
 export function parseUploadIdentity(
   value: unknown,
-): UploadIdentity | undefined {
+): UploadIdentity | UploadIdentityV2 | UploadIdentityBaseRead | undefined {
+  if (isRecord(value) && "v" in value) return parseUploadIdentityV2(value);
   const record = (v: unknown) =>
     v && typeof v === "object" && !Array.isArray(v)
       ? (v as Record<string, unknown>)
@@ -634,6 +662,10 @@ export async function migrationChunkMatches(
   const tenancy = signedTenancy(auth);
   if (!upload || !tenancy || !migrationSessionMatches(auth, location))
     return undefined;
+  // A base-read capability never writes.
+  if (isBaseReadIdentity(upload)) return undefined;
+  if (isBackfillIdentity(upload))
+    return migrationBackfillChunkMatches(auth, location, chunk, entryText);
   if ((await sha256Hex(entryText)) !== upload.entry_sha256) return undefined;
   const entry = parsePlanEntry(entryText);
   if (
@@ -669,8 +701,14 @@ export async function migrationChunkMatches(
  * planned upload with a fresh assertion has the same work key.
  */
 export function migrationWorkKey(
-  upload: Pick<UploadIdentity, "key" | "entry_sha256">,
+  upload:
+    | Pick<UploadIdentity, "key" | "entry_sha256">
+    | Pick<UploadIdentityV2, "v" | "key" | "entry_sha256" | "base">,
 ): string {
+  // v2: one backfill epoch on a base revision. The base revision is signed,
+  // so a rebuild on a newer base (after a lost CAS race) is new work.
+  if ("v" in upload && upload.v === 2)
+    return `${upload.key}@${upload.entry_sha256}@r${upload.base.revision + 1}`;
   return `${upload.key}@${upload.entry_sha256}`;
 }
 
@@ -707,6 +745,653 @@ export function migrationManifestProvenance(
   return undefined;
 }
 
+// --- Plan entry v2: one backfill epoch on a live manifest -----------------
+//
+// docs/contracts/relayhistory-export-plan-entry-v2.md in 96BullSessions, with
+// vectors. v1 is unchanged. A v2 entry is stored in the grant's plan under
+// `backfills`; it lists only the backfill's chunks, independent of where they
+// land (#46: `seq` and the epoch number depend on the live manifest at append
+// time). The signed v2 identity adds the BASE it appends to, which the issuer
+// takes from the mint request and the ingest checks against storage.
+
+/** A backfill chunk as a v2 entry lists it: offsets contiguous from 0. */
+export interface BackfillEntryChunk {
+  start_offset: number;
+  bytes: number;
+  /** SHA-256 of the chunk's source bytes. */
+  sha256: string;
+  records: number;
+}
+
+/** A canonical, grant-bound backfill entry (stored in the plan's `backfills`). */
+export interface PlanEntryV2 {
+  v: 2;
+  kind: "backfill";
+  grant_id: string;
+  /** The live session's manifest key, without any deployment prefix. */
+  key: string;
+  org_id: string;
+  workspace_id: string;
+  source_user_id: string;
+  session: UploadSession;
+  /** A backfill epoch needs an ndjson stream (#46). */
+  format: "ndjson";
+  chunks: BackfillEntryChunk[];
+  /** `backfillSha256(chunks)`: #46's `backfillDigest`, independent of seq and epoch. */
+  backfill_sha256: string;
+  raw_bytes: number;
+}
+
+/** The live manifest a backfill appends to, as observed and signed at mint time. */
+export interface BackfillBase {
+  /** The stored manifest's `revision`; the backfill commits `revision + 1`. */
+  revision: number;
+  /** The stored object's version: its version id, else its ETag exactly as the store returns it. */
+  version: string;
+  /** The live `raw.owner` (never `migration:...`); unchanged by the append. */
+  owner: string;
+  /** The live `writer.delivery_instance_id`; unchanged by the append. */
+  writer: string;
+  /** The stored `raw.chunk_count`: the backfill epoch's `first_seq`. */
+  chunk_count: number;
+  /** The stored `raw.epoch`: the backfill epoch is `epoch + 1`. */
+  epoch: number;
+  /** The stored `raw.content_sha256`. */
+  content_sha256: string;
+}
+
+/** The signed v2 identity (`meta.upload` with `v: 2`). */
+export interface UploadIdentityV2 {
+  v: 2;
+  kind: "backfill";
+  grant_id: string;
+  plan_digest: string;
+  key: string;
+  org_id: string;
+  workspace_id: string;
+  source_user_id: string;
+  session: UploadSession;
+  backfill_sha256: string;
+  /** `sha256(canonical(PlanEntryV2))`. */
+  entry_sha256: string;
+  base: BackfillBase;
+}
+
+/**
+ * The pre-mint base-read capability (`meta.upload` with `kind:
+ * "backfill_base_read"`): grant-bound to one org, source user, workspace,
+ * manifest key, session, grant and plan, with no base. Admitted only on
+ * `GET /v1/pipeline/manifests/base`, single use, audited.
+ */
+export interface UploadIdentityBaseRead {
+  v: 2;
+  kind: "backfill_base_read";
+  grant_id: string;
+  plan_digest: string;
+  key: string;
+  org_id: string;
+  workspace_id: string;
+  source_user_id: string;
+  session: UploadSession;
+  /** `sha256(canonical(PlanEntryV2))` of the backfill this read is for. */
+  entry_sha256: string;
+}
+
+type AnyUploadIdentity =
+  | UploadIdentity
+  | UploadIdentityV2
+  | UploadIdentityBaseRead;
+
+/** Any v2 identity: a backfill commit or a base-read capability. */
+export function isV2Identity(
+  upload: AnyUploadIdentity,
+): upload is UploadIdentityV2 | UploadIdentityBaseRead {
+  return (upload as { v?: unknown }).v === 2;
+}
+
+/** A v2 backfill COMMIT identity (with its signed base). */
+export function isBackfillIdentity(
+  upload: AnyUploadIdentity,
+): upload is UploadIdentityV2 {
+  return isV2Identity(upload) && upload.kind === "backfill";
+}
+
+/** The v2 pre-mint base-read capability. */
+export function isBaseReadIdentity(
+  upload: AnyUploadIdentity,
+): upload is UploadIdentityBaseRead {
+  return isV2Identity(upload) && upload.kind === "backfill_base_read";
+}
+
+/** The route a migration identity may use besides admission: base reads only, or everything else. */
+export const MANIFEST_BASE_PATH = "/v1/pipeline/manifests/base";
+
+/**
+ * Whether this identity kind may call `method path`: a base-read capability
+ * only `GET /v1/pipeline/manifests/base`; every other identity never that
+ * route. (The route allowlist itself is `migrationRouteAllowed`.)
+ */
+export function migrationKindAllowsRoute(
+  upload: AnyUploadIdentity,
+  method: string,
+  path: string,
+): boolean {
+  const baseRead =
+    method === "GET" && normalizeRoutePath(path) === MANIFEST_BASE_PATH;
+  return isBaseReadIdentity(upload) ? baseRead : !baseRead;
+}
+
+/** The base-read capability of a backfill entry (what the issuer signs for `{key, kind: "backfill_base_read"}`). */
+export async function baseReadIdentityOf(
+  entry: PlanEntryV2,
+  planDigest: string,
+): Promise<UploadIdentityBaseRead> {
+  return {
+    v: 2,
+    kind: "backfill_base_read",
+    grant_id: entry.grant_id,
+    plan_digest: planDigest,
+    key: entry.key,
+    org_id: entry.org_id,
+    workspace_id: entry.workspace_id,
+    source_user_id: entry.source_user_id,
+    session: entry.session,
+    entry_sha256: await planEntryV2Sha256(entry),
+  };
+}
+
+/**
+ * The 7 base fields of a stored live manifest, as the base read returns them,
+ * or the reason it cannot take a backfill (409 `migration_base_unusable`).
+ */
+export function backfillBaseOf(stored: {
+  manifest: ManifestV1;
+  version: { eTag?: string; version?: string };
+}): BackfillBase | string {
+  const { manifest } = stored;
+  const raw = manifest.raw;
+  const version = backfillBaseVersion(stored.version);
+  if (!version) return "the stored manifest has no version";
+  if (raw.owner.startsWith("migration:"))
+    return "the session is owned by a migration grant";
+  if (raw.epochs.some((e) => (e.reason as string) === "backfill"))
+    return "the session already has a backfill epoch";
+  if (raw.format !== "ndjson") return "a backfill needs an ndjson stream";
+  return {
+    revision: manifest.revision,
+    version,
+    owner: raw.owner,
+    writer: manifest.writer.delivery_instance_id,
+    chunk_count: raw.chunk_count,
+    epoch: raw.epoch,
+    content_sha256: raw.content_sha256,
+  };
+}
+
+/**
+ * The v2 entry of a manifest's backfill epoch under a known tenancy (the
+ * ingest's commit check and the transform's provenance check): the epoch's
+ * chunks in order, every chunk's `records` REQUIRED. `undefined` when there is
+ * no single backfill epoch or a chunk lacks `records`.
+ */
+export async function backfillEntryFor(
+  tenancy: Pick<
+    UploadIdentity,
+    "grant_id" | "org_id" | "workspace_id" | "source_user_id"
+  >,
+  location: Parameters<typeof sessionManifestKey>[0],
+  manifest: Pick<ManifestV1, "session" | "raw">,
+): Promise<PlanEntryV2 | undefined> {
+  const epochs = manifest.raw.epochs.filter(
+    (e) => (e.reason as string) === "backfill",
+  );
+  if (epochs.length !== 1) return undefined;
+  const added = manifest.raw.chunks.filter((c) => c.epoch === epochs[0]!.epoch);
+  if (added.length === 0 || added.some((c) => !Number.isSafeInteger(c.records)))
+    return undefined;
+  const chunks: BackfillEntryChunk[] = added.map((c) => ({
+    start_offset: c.start_offset,
+    bytes: c.bytes,
+    sha256: c.sha256,
+    records: c.records as number,
+  }));
+  return {
+    v: 2,
+    kind: "backfill",
+    ...tenancy,
+    key: sessionManifestKey(location),
+    session: {
+      machine_id: manifest.session.machine_id,
+      harness: manifest.session.harness,
+      session_id: manifest.session.session_id,
+      started_at: manifest.session.started_at,
+    },
+    format: "ndjson",
+    chunks,
+    backfill_sha256: await backfillSha256(chunks),
+    raw_bytes: chunks.reduce((n, c) => n + c.bytes, 0),
+  };
+}
+
+/** #46's `backfillDigest`: the content hash chain with every epoch set to 0. */
+export function backfillSha256(
+  chunks: readonly Pick<
+    BackfillEntryChunk,
+    "start_offset" | "bytes" | "sha256"
+  >[],
+): Promise<string> {
+  return computeContentSha256(
+    chunks.map((c) => ({
+      epoch: 0,
+      start_offset: c.start_offset,
+      bytes: c.bytes,
+      sha256: c.sha256,
+    })),
+  );
+}
+
+/** `sha256(canonical(entry))`, lowercase hex. */
+export function planEntryV2Sha256(entry: PlanEntryV2): Promise<string> {
+  return sha256Hex(canonicalJson(entry));
+}
+
+/**
+ * A grant's plan digest once it has backfills:
+ * `sha256(canonical({v: 2, grant_id, exported_at, manifests, backfills}))`,
+ * both lists sorted by key. With no backfills it is exactly the v1 digest.
+ */
+export function exportPlanDigestV2(input: {
+  grantId: string;
+  exportedAt: string;
+  entries: readonly PlanEntry[];
+  backfills: readonly PlanEntryV2[];
+}): Promise<string> {
+  if (input.backfills.length === 0) return exportPlanDigest(input);
+  const byKey = <T extends { key: string }>(list: readonly T[]) =>
+    [...list].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  return sha256Hex(
+    canonicalJson({
+      v: 2,
+      grant_id: input.grantId,
+      exported_at: input.exportedAt,
+      manifests: byKey(input.entries),
+      backfills: byKey(input.backfills),
+    }),
+  );
+}
+
+/** The signed v2 identity of a backfill entry on an observed base. */
+export async function uploadIdentityV2Of(
+  entry: PlanEntryV2,
+  planDigest: string,
+  base: BackfillBase,
+): Promise<UploadIdentityV2> {
+  return {
+    v: 2,
+    kind: "backfill",
+    grant_id: entry.grant_id,
+    plan_digest: planDigest,
+    key: entry.key,
+    org_id: entry.org_id,
+    workspace_id: entry.workspace_id,
+    source_user_id: entry.source_user_id,
+    session: entry.session,
+    backfill_sha256: entry.backfill_sha256,
+    entry_sha256: await planEntryV2Sha256(entry),
+    base,
+  };
+}
+
+const V2_IDENTITY_KEYS = [
+  "v",
+  "kind",
+  "grant_id",
+  "plan_digest",
+  "key",
+  "org_id",
+  "workspace_id",
+  "source_user_id",
+  "session",
+  "backfill_sha256",
+  "entry_sha256",
+  "base",
+];
+const BASE_KEYS = [
+  "revision",
+  "version",
+  "owner",
+  "writer",
+  "chunk_count",
+  "epoch",
+  "content_sha256",
+];
+
+function parseUploadIdentityV2(
+  u: Record<string, unknown>,
+): UploadIdentityV2 | UploadIdentityBaseRead | undefined {
+  if (u.kind === "backfill_base_read") return parseBaseReadIdentity(u);
+  const session = u.session;
+  const base = u.base;
+  const text = (v: unknown, max = 512) =>
+    typeof v === "string" && v.length > 0 && v.length <= max;
+  if (
+    u.v !== 2 ||
+    u.kind !== "backfill" ||
+    !exactKeySet(u, V2_IDENTITY_KEYS) ||
+    !isRecord(session) ||
+    !exactKeySet(session, [
+      "machine_id",
+      "harness",
+      "session_id",
+      "started_at",
+    ]) ||
+    !Object.values(session).every((v) => text(v, 256)) ||
+    !isRecord(base) ||
+    !exactKeySet(base, BASE_KEYS) ||
+    !["grant_id", "key", "org_id", "workspace_id", "source_user_id"].every(
+      (k) => text(u[k]),
+    ) ||
+    ["org_id", "workspace_id", "source_user_id"].some(
+      (k) => normalizeRelayId(u[k] as string) !== u[k],
+    ) ||
+    !["plan_digest", "backfill_sha256", "entry_sha256"].every(
+      (k) => typeof u[k] === "string" && DIGEST_SHAPE.test(u[k] as string),
+    ) ||
+    // Bounds (issuer spec section 5): revision + 1, chunk_count + i (i < 4096)
+    // and epoch + 1 (a uint32 in the content chain) must all stay exact.
+    !(
+      Number.isSafeInteger(base.revision) &&
+      (base.revision as number) >= 1 &&
+      (base.revision as number) <= Number.MAX_SAFE_INTEGER - 1
+    ) ||
+    !(
+      uint(base.chunk_count) &&
+      (base.chunk_count as number) <= Number.MAX_SAFE_INTEGER - 4096
+    ) ||
+    !(uint(base.epoch) && (base.epoch as number) <= 4294967294) ||
+    !text(base.version) ||
+    !text(base.owner) ||
+    (base.owner as string).startsWith("migration:") ||
+    !text(base.writer) ||
+    typeof base.content_sha256 !== "string" ||
+    !DIGEST_SHAPE.test(base.content_sha256)
+  )
+    return undefined;
+  return u as unknown as UploadIdentityV2;
+}
+
+function parseBaseReadIdentity(
+  u: Record<string, unknown>,
+): UploadIdentityBaseRead | undefined {
+  const session = u.session;
+  const text = (v: unknown, max = 512) =>
+    typeof v === "string" && v.length > 0 && v.length <= max;
+  if (
+    u.v !== 2 ||
+    u.kind !== "backfill_base_read" ||
+    !exactKeySet(
+      u,
+      V2_IDENTITY_KEYS.filter((k) => k !== "backfill_sha256" && k !== "base"),
+    ) ||
+    !isRecord(session) ||
+    !exactKeySet(session, [
+      "machine_id",
+      "harness",
+      "session_id",
+      "started_at",
+    ]) ||
+    !Object.values(session).every((v) => text(v, 256)) ||
+    !["grant_id", "key", "org_id", "workspace_id", "source_user_id"].every(
+      (k) => text(u[k]),
+    ) ||
+    ["org_id", "workspace_id", "source_user_id"].some(
+      (k) => normalizeRelayId(u[k] as string) !== u[k],
+    ) ||
+    !["plan_digest", "entry_sha256"].every(
+      (k) => typeof u[k] === "string" && DIGEST_SHAPE.test(u[k] as string),
+    )
+  )
+    return undefined;
+  return u as unknown as UploadIdentityBaseRead;
+}
+
+/** Parses a v2 entry carried by a chunk request: exactly canonical, exactly the shape. */
+export function parsePlanEntryV2(text: string): PlanEntryV2 | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(value) || canonicalJson(value) !== text) return undefined;
+  const session = value.session;
+  const chunks = value.chunks;
+  if (
+    value.v !== 2 ||
+    value.kind !== "backfill" ||
+    value.format !== "ndjson" ||
+    !exactKeySet(value, [
+      "v",
+      "kind",
+      "grant_id",
+      "key",
+      "org_id",
+      "workspace_id",
+      "source_user_id",
+      "session",
+      "format",
+      "chunks",
+      "backfill_sha256",
+      "raw_bytes",
+    ]) ||
+    !isRecord(session) ||
+    !exactKeySet(session, [
+      "machine_id",
+      "harness",
+      "session_id",
+      "started_at",
+    ]) ||
+    !Array.isArray(chunks) ||
+    chunks.length === 0 ||
+    !chunks.every(
+      (c) =>
+        isRecord(c) &&
+        exactKeySet(c, ["start_offset", "bytes", "sha256", "records"]) &&
+        uint(c.start_offset) &&
+        uint(c.bytes) &&
+        (c.bytes as number) > 0 &&
+        uint(c.records) &&
+        typeof c.sha256 === "string" &&
+        DIGEST_SHAPE.test(c.sha256),
+    ) ||
+    !["grant_id", "key", "org_id", "workspace_id", "source_user_id"].every(
+      (k) => typeof value[k] === "string",
+    ) ||
+    typeof value.backfill_sha256 !== "string" ||
+    !uint(value.raw_bytes)
+  )
+    return undefined;
+  // Contiguous from offset 0, as #46 lays a backfill out; every running sum
+  // stays a safe integer (an overflow is a refusal, never a wrap).
+  if (chunks.length > 4096) return undefined;
+  let offset = 0;
+  for (const c of chunks as BackfillEntryChunk[]) {
+    if (c.start_offset !== offset) return undefined;
+    if (c.bytes > Number.MAX_SAFE_INTEGER - offset) return undefined;
+    offset += c.bytes;
+  }
+  if (value.raw_bytes !== offset) return undefined;
+  return value as unknown as PlanEntryV2;
+}
+
+/** The signed v2 entry fields that must equal the signed identity and tenancy. */
+function entryV2MatchesIdentity(
+  entry: PlanEntryV2,
+  upload: UploadIdentityV2,
+  tenancy: Pick<
+    UploadIdentity,
+    "grant_id" | "org_id" | "workspace_id" | "source_user_id"
+  >,
+): boolean {
+  return (
+    entry.key === upload.key &&
+    entry.grant_id === tenancy.grant_id &&
+    entry.org_id === tenancy.org_id &&
+    entry.workspace_id === tenancy.workspace_id &&
+    entry.source_user_id === tenancy.source_user_id &&
+    canonicalJson(entry.session) === canonicalJson(upload.session) &&
+    entry.backfill_sha256 === upload.backfill_sha256
+  );
+}
+
+/**
+ * A v2 (backfill) chunk request: the carried entry hashes to the signed
+ * `entry_sha256` and names this key, session and tenancy; the chunk's
+ * position is derived from the SIGNED base: `seq = base.chunk_count + i`,
+ * `epoch = base.epoch + 1`, at the entry's offset, with the digest of the
+ * actual bytes.
+ */
+async function migrationBackfillChunkMatches(
+  auth: Pick<AuthContext, "claims" | "migration">,
+  location: Parameters<typeof sessionManifestKey>[0],
+  chunk: { seq: number; epoch: number; startOffset: number; bytes: Uint8Array },
+  entryText: string,
+): Promise<PlanEntryChunk | undefined> {
+  const upload = auth.migration?.upload;
+  const tenancy = signedTenancy(auth);
+  if (!upload || !isBackfillIdentity(upload) || !tenancy) return undefined;
+  if (!migrationSessionMatches(auth, location)) return undefined;
+  if ((await sha256Hex(entryText)) !== upload.entry_sha256) return undefined;
+  const entry = parsePlanEntryV2(entryText);
+  if (
+    !entry ||
+    !entryV2MatchesIdentity(entry, upload, tenancy) ||
+    (await backfillSha256(entry.chunks)) !== entry.backfill_sha256
+  )
+    return undefined;
+  const index = chunk.seq - upload.base.chunk_count;
+  const planned = entry.chunks[index];
+  if (
+    !planned ||
+    chunk.epoch !== upload.base.epoch + 1 ||
+    planned.start_offset !== chunk.startOffset ||
+    planned.bytes !== chunk.bytes.byteLength ||
+    planned.sha256 !== (await sha256Hex(chunk.bytes))
+  )
+    return undefined;
+  return { seq: chunk.seq, epoch: chunk.epoch, ...planned };
+}
+
+/** A stored object's version as the v2 base names it: its version id, else its ETag. */
+export function backfillBaseVersion(version: {
+  eTag?: string;
+  version?: string;
+}): string | undefined {
+  return version.version ?? version.eTag;
+}
+
+/**
+ * A v2 (backfill) manifest commit. The STORED manifest must be exactly the
+ * signed base (revision, version, live owner and writer, chunk count, epoch,
+ * content) with no backfill epoch yet; the incoming manifest must be that base
+ * plus exactly one backfill epoch whose chunks, re-derived into a v2 entry with
+ * the signed tenancy, hash to the signed `entry_sha256` and
+ * `backfill_sha256`: `seq = base.chunk_count + i`, `epoch = base.epoch + 1`,
+ * `first_seq = base.chunk_count`, `opened_by = migration:<grant_id>`, owner
+ * and writer unchanged, ndjson. #42's owner fence still runs in the route.
+ * Returns the problem, or `undefined`.
+ */
+export async function migrationBackfillIssue(
+  auth: Pick<AuthContext, "claims" | "migration">,
+  location: Parameters<typeof sessionManifestKey>[0],
+  stored:
+    | { manifest: ManifestV1; version: { eTag?: string; version?: string } }
+    | undefined,
+  incoming: ManifestV1,
+  options: {
+    /**
+     * The stored object is already byte-identical to `incoming` (a retry
+     * after a lost commit response): the stored manifest is the appended one,
+     * not the base. The append is then verified against the signed base
+     * without the stored-base comparison (its revision and version moved).
+     */
+    identicalRetry?: boolean;
+  } = {},
+): Promise<string | undefined> {
+  const upload = auth.migration?.upload;
+  const tenancy = signedTenancy(auth);
+  if (!upload || !isBackfillIdentity(upload) || !tenancy)
+    return "not a backfill identity";
+  if (!migrationSessionMatches(auth, location)) return "not the signed session";
+  if (!stored) return "no live manifest to append to";
+  const { base } = upload;
+  if (!options.identicalRetry) {
+    const live = stored.manifest;
+    const raw = live.raw;
+    if (
+      live.revision !== base.revision ||
+      backfillBaseVersion(stored.version) !== base.version ||
+      raw.owner !== base.owner ||
+      raw.owner.startsWith("migration:") ||
+      live.writer.delivery_instance_id !== base.writer ||
+      raw.chunk_count !== base.chunk_count ||
+      raw.chunks.length !== base.chunk_count ||
+      raw.epoch !== base.epoch ||
+      raw.content_sha256 !== base.content_sha256 ||
+      raw.epochs.some((e) => (e.reason as string) === "backfill")
+    )
+      return "the stored manifest is not the signed base";
+    if (
+      canonicalJson(incoming.raw.chunks.slice(0, base.chunk_count)) !==
+        canonicalJson(raw.chunks) ||
+      canonicalJson(incoming.raw.epochs.slice(0, raw.epochs.length)) !==
+        canonicalJson(raw.epochs)
+    )
+      return "the manifest does not keep the base's chunks and epochs";
+  }
+  // The append itself, against the SIGNED base only (so an identical retry
+  // is held to the same rule): the base's chunk list hashes to the signed
+  // base content, then exactly one backfill epoch of the signed entry.
+  const next = incoming.raw;
+  const epoch = base.epoch + 1;
+  const prefix = next.chunks.slice(0, base.chunk_count);
+  const added = next.chunks.slice(base.chunk_count);
+  const backfillEpochs = next.epochs.filter(
+    (e) => (e.reason as string) === "backfill",
+  );
+  const opened = next.epochs.at(-1);
+  if (
+    incoming.revision !== base.revision + 1 ||
+    next.owner !== base.owner ||
+    incoming.writer.delivery_instance_id !== base.writer ||
+    next.format !== "ndjson" ||
+    next.epoch !== epoch ||
+    prefix.length !== base.chunk_count ||
+    (await computeContentSha256(prefix)) !== base.content_sha256 ||
+    backfillEpochs.length !== 1 ||
+    !opened ||
+    opened !== backfillEpochs[0] ||
+    opened.epoch !== epoch ||
+    opened.first_seq !== base.chunk_count ||
+    opened.opened_by !== `migration:${tenancy.grant_id}` ||
+    added.length === 0 ||
+    added.some((c, i) => c.seq !== base.chunk_count + i || c.epoch !== epoch) ||
+    next.chunk_count !== next.chunks.length ||
+    (await computeContentSha256(next.chunks)) !== next.content_sha256
+  )
+    return "the manifest is not the base plus exactly one signed backfill epoch";
+  // Every backfill chunk carries `records` (mandatory, never defaulted).
+  const entry = await backfillEntryFor(tenancy, location, incoming);
+  if (!entry) return "a backfill chunk lacks records";
+  if (
+    canonicalJson(entry.session) !== canonicalJson(upload.session) ||
+    entry.backfill_sha256 !== upload.backfill_sha256 ||
+    (await planEntryV2Sha256(entry)) !== upload.entry_sha256
+  )
+    return "the backfill is not the signed v2 entry";
+  return undefined;
+}
+
 /** An executor that can run work in one transaction (a pg Pool client, PGlite). */
 export interface TransactionalSqlExecutor extends SqlExecutor {
   transaction<T>(work: (tx: SqlExecutor) => Promise<T>): Promise<T>;
@@ -721,13 +1406,24 @@ const MIGRATION_ROUTES: readonly (readonly [string, string])[] = [
   ["POST", "/v1/pipeline/chunks"],
   ["POST", "/v1/pipeline/manifests"],
   ["GET", "/v1/pipeline/manifests/status"],
+  // The v2 pre-mint base read (base-read capabilities only; migrationKindAllowsRoute).
+  ["GET", MANIFEST_BASE_PATH],
 ];
 
+/**
+ * Exact route matching for migration tokens: the method is case-sensitive,
+ * at most ONE trailing slash is removed, and nothing else is normalized (no
+ * `//`, no extra segment, the query never selects a route).
+ */
+function normalizeRoutePath(path: string): string {
+  return path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
+}
+
 export function migrationRouteAllowed(method: string, path: string): boolean {
-  const normalized = path.length > 1 ? path.replace(/\/+$/, "") : path;
+  const normalized = normalizeRoutePath(path);
   return MIGRATION_ROUTES.some(
     ([allowedMethod, allowedPath]) =>
-      method.toUpperCase() === allowedMethod && normalized === allowedPath,
+      method === allowedMethod && normalized === allowedPath,
   );
 }
 
@@ -774,6 +1470,15 @@ export interface MigrationAssertionLedger {
     stage: PipelineStage,
     message: StageMessage,
   ): Promise<MigrationConsumeResult>;
+  /**
+   * Consumes a base-read capability: the replay row and a durable audit row
+   * (result `base_read`, `auditKey` as its work key) in one transaction;
+   * nothing is enqueued. Same replay and grant rules as `consume`.
+   */
+  consumeBaseRead(
+    use: MigrationAssertionUse,
+    auditKey: string,
+  ): Promise<MigrationConsumeResult>;
 }
 
 /**
@@ -800,6 +1505,7 @@ export function sqlMigrationAssertionLedger(
   const uses = `${schema}.migration_assertion_uses`;
   const chunks = `${schema}.migration_assertion_chunks`;
   const audit = `${schema}.migration_ingest_audit`;
+  const baseReads = `${schema}.migration_base_read_uses`;
   const enqueue =
     options.enqueue ??
     ((tx: SqlExecutor, stage: PipelineStage, message: StageMessage) =>
@@ -858,66 +1564,89 @@ export function sqlMigrationAssertionLedger(
       });
     },
     consume(use, stage, message) {
-      return sql.transaction(async (tx) => {
-        await purge(tx, uses, "jti");
-        // Serializes this grant's consumptions, so two first uses with
-        // different plans cannot both pass the consistency check.
-        await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
-          `migration-grant:${use.grantId}`,
-        ]);
-        // One grant, one org and one plan: a use that disagrees with the
-        // grant's earlier uses is refused, and nothing is written.
-        const conflict = await tx.query(
-          `SELECT 1 FROM ${uses}
+      return spend(uses, use, message.workKey, "committed", (tx) =>
+        enqueue(tx, stage, message),
+      );
+    },
+    consumeBaseRead(use, auditKey) {
+      // Its own replay namespace: a base-read jti or nonce never collides
+      // with an upload assertion's.
+      return spend(baseReads, use, auditKey, "base_read", async () => {});
+    },
+  };
+
+  function spend(
+    table: string,
+    use: MigrationAssertionUse,
+    workKey: string,
+    result: "committed" | "base_read",
+    effect: (tx: SqlExecutor) => Promise<void>,
+  ): Promise<MigrationConsumeResult> {
+    return sql.transaction(async (tx) => {
+      await purge(tx, table, "jti");
+      // Serializes this grant's consumptions, so two first uses with
+      // different plans cannot both pass the consistency check.
+      await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+        `migration-grant:${use.grantId}`,
+      ]);
+      // One grant, one org and one plan: a use that disagrees with the
+      // grant's earlier uses is refused, and nothing is written.
+      // Across BOTH ledgers (upload uses and base reads): a grant is bound
+      // to one plan and one org by whichever of them came first.
+      const conflict = await tx.query(
+        `SELECT 1 FROM ${uses}
             WHERE grant_id = $1 AND (plan_digest <> $2 OR org_id <> $3)
-            LIMIT 1`,
-          [use.grantId, use.planDigest, use.orgId],
-        );
-        if (conflict.rows.length) return "grant_mismatch" as const;
-        // Insert-if-absent on both keys. A concurrent consumer of the same jti
-        // or nonce waits on the unique index, then sees the winner's row.
-        const { rows } = await tx.query(
-          `INSERT INTO ${uses} (jti, nonce, grant_id, org_id, workspace_id,
+         UNION ALL
+         SELECT 1 FROM ${baseReads}
+            WHERE grant_id = $1 AND (plan_digest <> $2 OR org_id <> $3)
+         LIMIT 1`,
+        [use.grantId, use.planDigest, use.orgId],
+      );
+      if (conflict.rows.length) return "grant_mismatch" as const;
+      // Insert-if-absent on both keys. A concurrent consumer of the same jti
+      // or nonce waits on the unique index, then sees the winner's row.
+      const { rows } = await tx.query(
+        `INSERT INTO ${table} (jti, nonce, grant_id, org_id, workspace_id,
                                 user_id, plan_digest, plan_entry_digest,
                                 expires_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9))
            ON CONFLICT DO NOTHING
            RETURNING jti`,
-          [
-            use.jti,
-            use.nonce,
-            use.grantId,
-            use.orgId,
-            use.workspaceId,
-            use.userId,
-            use.planDigest,
-            use.planEntryDigest,
-            use.expiresAt,
-          ],
-        );
-        if (!rows.length) return "replayed" as const;
-        // Throwing here rolls the consumption back with the queue row.
-        await enqueue(tx, stage, message);
-        // The durable audit event, in the same transaction: ids, digests and
-        // the work key only (never a token, a signature or chunk bytes).
-        await tx.query(
-          `INSERT INTO ${audit} (grant_id, plan_digest, entry_sha256, work_key,
+        [
+          use.jti,
+          use.nonce,
+          use.grantId,
+          use.orgId,
+          use.workspaceId,
+          use.userId,
+          use.planDigest,
+          use.planEntryDigest,
+          use.expiresAt,
+        ],
+      );
+      if (!rows.length) return "replayed" as const;
+      // Throwing here rolls the consumption back with the queue row.
+      await effect(tx);
+      // The durable audit event, in the same transaction: ids, digests and
+      // the work key only (never a token, a signature or chunk bytes).
+      await tx.query(
+        `INSERT INTO ${audit} (grant_id, plan_digest, entry_sha256, work_key,
                                  org_id, workspace_id, user_id, result)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'committed')`,
-          [
-            use.grantId,
-            use.planDigest,
-            use.planEntryDigest,
-            message.workKey,
-            use.orgId,
-            use.workspaceId,
-            use.userId,
-          ],
-        );
-        return "consumed" as const;
-      });
-    },
-  };
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          use.grantId,
+          use.planDigest,
+          use.planEntryDigest,
+          workKey,
+          use.orgId,
+          use.workspaceId,
+          use.userId,
+          result,
+        ],
+      );
+      return "consumed" as const;
+    });
+  }
 }
 
 /**
@@ -927,6 +1656,20 @@ export function sqlMigrationAssertionLedger(
  */
 export class InMemoryMigrationAssertionLedger implements MigrationAssertionLedger {
   readonly uses = new Map<string, MigrationAssertionUse>();
+  /** Base-read capabilities: their own replay namespace (jti and nonce). */
+  readonly baseReads = new Map<string, MigrationAssertionUse>();
+  readonly #baseReadNonces = new Set<string>();
+
+  /** Whether a use disagrees with the grant's binding in EITHER ledger. */
+  #grantMismatch(use: MigrationAssertionUse): boolean {
+    for (const earlier of [...this.uses.values(), ...this.baseReads.values()])
+      if (
+        earlier.grantId === use.grantId &&
+        (earlier.planDigest !== use.planDigest || earlier.orgId !== use.orgId)
+      )
+        return true;
+    return false;
+  }
   readonly chunks = new Map<string, MigrationChunkUse>();
   /** The durable audit events (one per committed consumption). */
   readonly audit: (Omit<
@@ -934,6 +1677,7 @@ export class InMemoryMigrationAssertionLedger implements MigrationAssertionLedge
     "jti" | "nonce" | "expiresAt"
   > & {
     workKey: string;
+    result?: "committed" | "base_read";
   })[] = [];
   readonly #nonces = new Map<string, string>();
 
@@ -990,6 +1734,29 @@ export class InMemoryMigrationAssertionLedger implements MigrationAssertionLedge
       : "conflict";
   }
 
+  async consumeBaseRead(
+    use: MigrationAssertionUse,
+    auditKey: string,
+  ): Promise<MigrationConsumeResult> {
+    this.#purge();
+    if (this.baseReads.has(use.jti) || this.#baseReadNonces.has(use.nonce))
+      return "replayed";
+    if (this.#grantMismatch(use)) return "grant_mismatch";
+    this.baseReads.set(use.jti, use);
+    this.#baseReadNonces.add(use.nonce);
+    this.audit.push({
+      grantId: use.grantId,
+      planDigest: use.planDigest,
+      planEntryDigest: use.planEntryDigest,
+      orgId: use.orgId,
+      workspaceId: use.workspaceId,
+      userId: use.userId,
+      workKey: auditKey,
+      result: "base_read",
+    });
+    return "consumed";
+  }
+
   async consume(
     use: MigrationAssertionUse,
     stage: PipelineStage,
@@ -998,12 +1765,7 @@ export class InMemoryMigrationAssertionLedger implements MigrationAssertionLedge
     this.#purge();
     if (this.uses.has(use.jti) || this.#nonces.has(use.nonce))
       return "replayed";
-    for (const earlier of this.uses.values())
-      if (
-        earlier.grantId === use.grantId &&
-        (earlier.planDigest !== use.planDigest || earlier.orgId !== use.orgId)
-      )
-        return "grant_mismatch";
+    if (this.#grantMismatch(use)) return "grant_mismatch";
     // Reserved synchronously, before the first await, so a concurrent consume
     // of the same jti or nonce sees it.
     this.uses.set(use.jti, use);

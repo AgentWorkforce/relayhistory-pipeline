@@ -3,22 +3,30 @@
  * `sessions.session_index` pointer rows into `sessions.session_directory`. Called by
  * the HoopDb indexer after every pointer upsert and pointer tombstone.
  *
- * PROVISIONAL precedence (the projector decision in
- * docs/session-search-index-contract.md is still open, so the rollout marker is never
- * set here and the index audit keeps failing closed):
- *   - created_at = earliest live pointer, last_activity_at = latest live pointer;
- *   - title, project, repository, branch, model, state and the usage counters come
- *     from the most recently active live pointer (no summing across machines);
- *   - machine_ids / user_ids and the membership tables are the union of live pointers,
+ * V1 precedence (approved; provenance in docs/session-search-index-contract.md,
+ * "Projector precedence"):
+ *   - created_at: stable historical: the earliest created_at ever projected, never
+ *     moved later (not even when the earliest pointer is tombstoned);
+ *   - the latest live pointer wins every scalar and counter (title, project,
+ *     repository, branch, model, state, event and token counts, cost), without
+ *     summing across machines. last_activity_at is that pointer's;
+ *   - deterministic ties: latest last_activity_at, then highest revision, then
+ *     highest machine_id;
+ *   - machine_ids / user_ids and the membership tables are the union of LIVE pointers,
  *     each membership row carrying the directory row's last_activity_at;
+ *   - tombstone when no live pointer remains (the trigger clears short_summary and
+ *     search_text; memberships are deleted);
+ *   - resurrection only for a genuinely new pointer revision (decision 0002: a deleted
+ *     upload or pointer never comes back): a live pointer whose revision is strictly
+ *     above its machine's resurrection fence (recorded when the row was tombstoned), or
+ *     from a machine with no fence. Re-sent, stale or un-deleted revisions stay fenced.
+ *     The row comes back with the historical created_at and no summary until Bob
+ *     Costas writes one;
  *   - task_title, agent_name and short_summary are not in session_index and are kept
  *     as already projected (short_summary is written only by writeShortSummary).
  *
- * When no live pointer remains, the row is tombstoned here (summary and search_text
- * cleared by the trigger, memberships deleted). A tombstoned directory row is never
- * resurrected: deleted sessions do not come back.
  * search_text is always rebuilt with sessions.session_directory_search_text, so the
- * scrubbed short_summary stays part of it.
+ * scrubbed short_summary stays part of it. The rollout marker is never set here.
  */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { SessionDirectoryKey } from "./session-directory-summary.ts";
@@ -55,7 +63,8 @@ export async function projectSessionDirectory(
             now()
        FROM latest AS l CROSS JOIN agg
      ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET
-       created_at = excluded.created_at,
+       created_at = LEAST(d.created_at, excluded.created_at),
+       deleted_at = NULL,
        last_activity_at = excluded.last_activity_at,
        title = excluded.title,
        project_id = excluded.project_id,
@@ -74,6 +83,18 @@ export async function projectSessionDirectory(
          excluded.git_repo, excluded.git_branch, excluded.model, d.short_summary),
        projected_at = now()
      WHERE d.deleted_at IS NULL
+        OR EXISTS (
+          -- Resurrection only for a genuinely new pointer revision: live, and strictly
+          -- above its machine's fence (or a machine with no fence at all).
+          SELECT 1 FROM sessions.session_index AS later
+           WHERE later.org_id = d.org_id AND later.workspace_id = d.workspace_id
+             AND later.harness = d.harness AND later.session_id = d.session_id
+             AND later.deleted_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM sessions.session_directory_resurrection_fences AS f
+                WHERE f.org_id = later.org_id AND f.workspace_id = later.workspace_id
+                  AND f.harness = later.harness AND f.session_id = later.session_id
+                  AND f.machine_id = later.machine_id AND f.revision >= later.revision))
      RETURNING true AS projected`,
     params,
   );
@@ -95,7 +116,10 @@ export async function projectSessionDirectory(
       params,
     );
     if (gone.rows.length === 0) return { projected: false, tombstoned: false };
-    for (const table of ["session_directory_users", "session_directory_machines"] as const) {
+    for (const table of [
+      "session_directory_users",
+      "session_directory_machines",
+    ] as const) {
       await db.query(
         `DELETE FROM sessions.${table}
           WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4`,

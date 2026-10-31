@@ -48,7 +48,7 @@ export interface ObjectLandedPayload {
    * `${key}@${entry_sha256}` instead of `manifestWorkKey`. Only the ingest
    * writes queue messages, so this cannot come from a client.
    */
-  migration?: { key: string; entry_sha256: string };
+  migration?: { key: string; entry_sha256: string; base_revision?: number };
 }
 
 export type ObjectStoreProvider = "r2" | "s3" | "gcs" | "azure" | "fs";
@@ -66,6 +66,8 @@ export interface RawPointer {
   scrubbed?: boolean;
   /** The manifest was deleted: remove the pointer rather than upsert it. */
   deleted?: boolean;
+  /** Migration work: see `ObjectLandedPayload.migration`. */
+  migration?: ObjectLandedPayload["migration"];
 }
 
 export interface SessionPointerIndex {
@@ -79,9 +81,44 @@ export interface SessionPointerIndex {
   ): Promise<void | { status: "skipped"; reason: string }>;
 }
 
+/** The stored normalized object, described from its own bytes. */
+export interface NormalizedOutput {
+  outputKey: string;
+  /** The manifest this run read: `contentSha256` is its `raw.content_sha256`. */
+  revision: number;
+  normalizedVersion: number;
+  contentSha256: string;
+  /** Lowercase hex SHA-256 of the stored object. */
+  outputSha256: string;
+  outputBytes: number;
+  /** The object's `convergence_events` lines. */
+  convergenceEventCount: number;
+  /** Records with no projection, which leave no line in the object. */
+  unprojectedRecords: number;
+  /** The object was already stored, so this run published nothing. */
+  outputReused: boolean;
+  /** Reused, and this run's bytes differ: same input and version, different output. */
+  outputDivergent: boolean;
+}
+
+/** The manifest version a message was enqueued for. */
+export interface NormalizeTarget {
+  revision?: number;
+  workKey?: string;
+  orgId?: string;
+}
+
+/** A delayed message: a newer manifest stands, and its own event normalizes it. */
+export interface NormalizeSkipped {
+  skipped: "stale_manifest";
+}
+
 export interface SessionTransform {
-  /** Idempotent by input key and transform version. */
-  normalize(pointer: RawPointer): Promise<{ outputKey?: string }>;
+  /** Idempotent by input key and transform version. Empty when nothing was normalized. */
+  normalize(
+    pointer: RawPointer,
+    target?: NormalizeTarget,
+  ): Promise<NormalizedOutput | NormalizeSkipped | Record<string, never>>;
 }
 
 export interface StageSenders {
@@ -127,11 +164,19 @@ export function objectLandedWorkKey(
     typeof migration.key !== "string" ||
     typeof migration.entry_sha256 !== "string" ||
     !/^[0-9a-f]{64}$/.test(migration.entry_sha256) ||
+    (migration.base_revision !== undefined &&
+      !(
+        Number.isSafeInteger(migration.base_revision) &&
+        migration.base_revision >= 1
+      )) ||
     unprefixed === undefined ||
     migration.key !== unprefixed
   )
     return undefined;
-  return `${migration.key}@${migration.entry_sha256}`;
+  // A v2 backfill names the base revision it appended to (migrationWorkKey).
+  return migration.base_revision === undefined
+    ? `${migration.key}@${migration.entry_sha256}`
+    : `${migration.key}@${migration.entry_sha256}@r${migration.base_revision + 1}`;
 }
 
 export function objectLandedHandler(deps: {
@@ -171,6 +216,7 @@ export function objectLandedHandler(deps: {
         ? { scrubbed: payload.scrubbed }
         : {}),
       ...(deleted ? { deleted: true } : {}),
+      ...(payload.migration ? { migration: payload.migration } : {}),
     };
     const workKey = objectLandedWorkKey(payload);
     // The trace verdict matches index success to manifest work by this key, so
@@ -246,8 +292,21 @@ export function fileNormalizeHandler(
   transform: SessionTransform,
 ): StageHandler {
   return async (message, recorder) => {
-    const output = await transform.normalize(message.payload as RawPointer);
+    const output = await transform.normalize(message.payload as RawPointer, {
+      ...(message.revision !== undefined ? { revision: message.revision } : {}),
+      workKey: message.workKey,
+      orgId: message.ctx.orgId,
+    });
+    if ("skipped" in output)
+      return { status: "skipped", reason: output.skipped };
     if (output.outputKey)
-      recorder.log.info("transform output", { output_key: output.outputKey });
+      recorder.log.info("transform output", {
+        output_key: output.outputKey,
+        output_bytes: output.outputBytes,
+        convergence_event_count: output.convergenceEventCount,
+        unprojected_records: output.unprojectedRecords,
+        output_reused: output.outputReused,
+        output_divergent: output.outputDivergent,
+      });
   };
 }

@@ -13,7 +13,11 @@
  * No summary text is ever put in a log line, an error message or telemetry.
  */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
-import { SCRUB_RULESET, SCRUB_RULESET_VERSION, scrubText } from "../shared/vendor.ts";
+import {
+  SCRUB_RULESET,
+  SCRUB_RULESET_VERSION,
+  scrubText,
+} from "../shared/vendor.ts";
 import { meaningfulChars } from "./search-query.ts";
 
 /** Hard bound, in Unicode code points (PostgreSQL `char_length`). */
@@ -73,11 +77,13 @@ export function scrubShortSummary(
   if (meaningfulChars(trimmed) === 0) throw new ShortSummaryRejected("empty");
   // Refuse rather than truncate: a cut can split a credential below the scrubber's
   // match length, and a silently shortened summary is not what the producer wrote.
-  if (codePoints(trimmed) > SHORT_SUMMARY_MAX_CHARS) throw new ShortSummaryRejected("over_length");
+  if (codePoints(trimmed) > SHORT_SUMMARY_MAX_CHARS)
+    throw new ShortSummaryRejected("over_length");
   let text: string;
   try {
     text = scrub(trimmed);
-    if (typeof text !== "string") throw new ShortSummaryRejected("scrub_failed");
+    if (typeof text !== "string")
+      throw new ShortSummaryRejected("scrub_failed");
     // A fixed point proves the stored text is scrubbed under these rules.
     if (scrub(text) !== text) throw new ShortSummaryRejected("scrub_unstable");
   } catch (error) {
@@ -86,8 +92,13 @@ export function scrubShortSummary(
   }
   text = text.trim();
   if (meaningfulChars(text) === 0) throw new ShortSummaryRejected("empty");
-  if (codePoints(text) > SHORT_SUMMARY_MAX_CHARS) throw new ShortSummaryRejected("over_length");
-  return { text, scrubRuleset: SCRUB_RULESET, scrubVersion: SCRUB_RULESET_VERSION };
+  if (codePoints(text) > SHORT_SUMMARY_MAX_CHARS)
+    throw new ShortSummaryRejected("over_length");
+  return {
+    text,
+    scrubRuleset: SCRUB_RULESET,
+    scrubVersion: SCRUB_RULESET_VERSION,
+  };
 }
 
 /**
@@ -103,14 +114,16 @@ export async function writeShortSummary(
 ): Promise<{ written: boolean; scrubVersion: number }> {
   let scrubbed: ScrubbedShortSummary;
   try {
-    if (!SOURCE_PATTERN.test(input.source)) throw new ShortSummaryRejected("invalid_source");
+    if (!SOURCE_PATTERN.test(input.source))
+      throw new ShortSummaryRejected("invalid_source");
     scrubbed = scrubShortSummary(input.summary, scrub);
   } catch (error) {
     // A refused newer summary must not leave an older one searchable: the old text
     // describes content the producer has since replaced. Clear it (and its share of
     // search_text) under the same generated_at fence, so a refused *older* summary
     // never clears a newer good one. Then rethrow the refusal.
-    if (error instanceof ShortSummaryRejected) await clearOlderShortSummary(db, input, input.generatedAt);
+    if (error instanceof ShortSummaryRejected)
+      await clearOlderShortSummary(db, input, input.generatedAt);
     throw error;
   }
   const { rows } = await db.query<{ written: boolean }>(
@@ -129,8 +142,14 @@ export async function writeShortSummary(
         AND (d.short_summary_generated_at IS NULL OR d.short_summary_generated_at <= $9::timestamptz)
       RETURNING true AS written`,
     [
-      input.orgId, input.workspaceId, input.harness, input.sessionId,
-      scrubbed.text, scrubbed.scrubRuleset, scrubbed.scrubVersion, input.source,
+      input.orgId,
+      input.workspaceId,
+      input.harness,
+      input.sessionId,
+      scrubbed.text,
+      scrubbed.scrubRuleset,
+      scrubbed.scrubVersion,
+      input.source,
       input.generatedAt.toISOString(),
     ],
   );
@@ -138,7 +157,11 @@ export async function writeShortSummary(
 }
 
 /** Clear the summary only if it is not newer than `notAfter` (the generated_at fence). */
-async function clearOlderShortSummary(db: SqlExecutor, key: SessionDirectoryKey, notAfter: Date): Promise<boolean> {
+async function clearOlderShortSummary(
+  db: SqlExecutor,
+  key: SessionDirectoryKey,
+  notAfter: Date,
+): Promise<boolean> {
   const { rows } = await db.query<{ cleared: boolean }>(
     `UPDATE sessions.session_directory AS d
         SET short_summary = NULL,
@@ -154,13 +177,22 @@ async function clearOlderShortSummary(db: SqlExecutor, key: SessionDirectoryKey,
         AND d.deleted_at IS NULL AND d.short_summary IS NOT NULL
         AND d.short_summary_generated_at <= $5::timestamptz
       RETURNING true AS cleared`,
-    [key.orgId, key.workspaceId, key.harness, key.sessionId, notAfter.toISOString()],
+    [
+      key.orgId,
+      key.workspaceId,
+      key.harness,
+      key.sessionId,
+      notAfter.toISOString(),
+    ],
   );
   return rows.length > 0;
 }
 
 /** Remove a row's summary (and its share of the search document) without a tombstone. */
-export async function clearShortSummary(db: SqlExecutor, key: SessionDirectoryKey): Promise<boolean> {
+export async function clearShortSummary(
+  db: SqlExecutor,
+  key: SessionDirectoryKey,
+): Promise<boolean> {
   const { rows } = await db.query<{ cleared: boolean }>(
     `UPDATE sessions.session_directory AS d
         SET short_summary = NULL,

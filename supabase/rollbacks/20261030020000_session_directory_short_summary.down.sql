@@ -9,6 +9,9 @@
 -- the Worker role, and restores #38's index and grants. btree_gin stays installed
 -- (CREATE EXTENSION IF NOT EXISTS in the up), as 20261030010000 treats pg_trgm.
 --
+-- Run later downs first, in reverse migration order: 20261031001000's functions grant
+-- EXECUTE to the Worker role this file drops.
+--
 -- Code only: running it against a hosted database needs the user's OK.
 
 BEGIN;

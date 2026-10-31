@@ -194,11 +194,18 @@ describe("org attribution and the deployment prefix", () => {
     expect(prefixAllowed({ PIPELINE_KEY_PREFIX: "/raw/" }, "raw", ORG)).toBe(
       true,
     );
+    // Org-derived prefixes: exactly `<base>/<caller org>`, or `<caller org>`
+    // with no base; never another base, an extra segment or a bare org when a
+    // base is configured.
+    const orgFromPrefix = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "raw" };
+    expect(prefixAllowed(orgFromPrefix, `raw/${ORG}`, ORG)).toBe(true);
+    for (const prefix of ["raw/org-b", `other/${ORG}`, `raw/extra/${ORG}`, ORG, "raw", undefined])
+      expect(prefixAllowed(orgFromPrefix, prefix, ORG)).toBe(false);
     expect(
-      prefixAllowed({ PIPELINE_ORG_FROM_PREFIX: "true" }, `raw/${ORG}`, ORG),
+      prefixAllowed({ PIPELINE_ORG_FROM_PREFIX: "true" }, ORG, ORG),
     ).toBe(true);
     expect(
-      prefixAllowed({ PIPELINE_ORG_FROM_PREFIX: "true" }, "raw/org-b", ORG),
+      prefixAllowed({ PIPELINE_ORG_FROM_PREFIX: "true" }, `raw/${ORG}`, ORG),
     ).toBe(false);
   });
 });

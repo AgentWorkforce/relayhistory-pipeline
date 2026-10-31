@@ -26,6 +26,7 @@ import {
   GCP_CONFIRM_PROJECT_ENV,
   GCP_CONFIRM_SQL_POST_ENV,
   GCP_APPLY_NONCE_ENV,
+  GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS,
   GCP_NODE_ROLES,
   GCP_RUNTIME_SHAPE,
   assertGcpInputs,
@@ -522,11 +523,11 @@ export default Alchemy.Stack(
     // The proxy Kubernetes service account is created only once Cloud SQL is
     // posted. Binding it earlier would let a later account of that name assume
     // the runtime identity.
-    for (const [namespace, serviceAccount] of [
-      ["96bulls", "96bulls-worker"],
-      ["96bulls", "96bulls-alleyoop"],
+    for (const [logicalName, namespace, serviceAccount] of [
+      ["96bulls-worker", "96bulls", GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.worker],
+      ["96bulls-alleyoop", "96bulls", GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.alleyoop],
     ] as const) {
-      yield* GCP.IAM.Member(`workload-identity-${namespace}-${serviceAccount}`, {
+      yield* GCP.IAM.Member(`workload-identity-${namespace}-${logicalName}`, {
         kind: "iam.serviceAccount",
         name: runtimeIdentity.name,
         role: "roles/iam.workloadIdentityUser",

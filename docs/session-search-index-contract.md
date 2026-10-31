@@ -10,9 +10,9 @@ physical machine manifest and holds the object pointer. The additive
 That split is required for stable pagination. A session resumed on three machines
 has three manifest pointers but must occur once on a session list. The projector
 (`src/hoopdb/session-directory-projector.ts`, called by the HoopDb indexer) merges
-the physical rows into the directory with the provisional precedence described in the
-G6 section below. It never sets the rollout marker: backfill and the precedence
-decision ("Projector decision still required") remain open, so the audit fails closed.
+the physical rows into the directory with the V1 precedence in "Projector precedence"
+below. It never sets the rollout marker: the backfill lane does, so the audit keeps
+failing closed until then.
 
 Cloud must treat agent lookup as a future RelayHistory-advertised metadata
 capability. It must not bind directly to this table or assume an `agent_name` API
@@ -26,18 +26,18 @@ recent-session pages.
 
 ## Indexed remote query shapes
 
-| Filter or lookup | Index strategy |
-| --- | --- |
-| workspace or org recent | partial ordered btree with a total logical-session cursor |
-| harness/source | workspace + harness + activity cursor |
-| exact project or no project | separate partial activity indexes |
-| agent exact or prefix | normalized name with `text_pattern_ops`, then activity cursor; served through the RPC so the prefix is an index condition (under RLS `LIKE` is not LEAKPROOF and was only a filter: 1409x row amplification at benchmark size M) |
-| created range | workspace + `created_at` cursor |
-| state | workspace + state + activity cursor |
-| user or machine | normalized membership table + activity cursor |
-| session ID without workspace/harness | org + session ID lookup |
-| project substring | `sessions.search_session_directory` RPC only, over tenant-scoped trigram GIN `(org_id, workspace_id, project_id)` (replaces #38's `session_directory_project_trgm_idx`) |
-| metadata + short summary substring | `sessions.search_session_directory` RPC only, over tenant-scoped trigram GIN `(org_id, workspace_id, search_text)` (btree_gin) |
+| Filter or lookup                     | Index strategy                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| workspace or org recent              | partial ordered btree with a total logical-session cursor                                                                                                                                                                                                                                                                                     |
+| harness/source                       | workspace + harness + activity cursor                                                                                                                                                                                                                                                                                                         |
+| exact project or no project          | separate partial activity indexes                                                                                                                                                                                                                                                                                                             |
+| agent exact or prefix                | exact: normalized name with `text_pattern_ops`, then activity cursor, direct or through the RPC. Prefix: RPC only (the direct surface refuses it, `AgentPrefixRequiresRpcError`), with a candidate budget of 5,000 checked by an ordered walk of `session_directory_agent_recent_idx`; a broader prefix is `agent_prefix_too_broad` (`54000`) |
+| created range                        | workspace + `created_at` cursor                                                                                                                                                                                                                                                                                                               |
+| state                                | workspace + state + activity cursor                                                                                                                                                                                                                                                                                                           |
+| user or machine                      | normalized membership table + activity cursor                                                                                                                                                                                                                                                                                                 |
+| session ID without workspace/harness | org + session ID lookup                                                                                                                                                                                                                                                                                                                       |
+| project substring                    | `sessions.search_session_directory` RPC only, over tenant-scoped trigram GIN `(org_id, workspace_id, project_id)` (replaces #38's `session_directory_project_trgm_idx`)                                                                                                                                                                       |
+| metadata + short summary substring   | `sessions.search_session_directory` RPC only, over tenant-scoped trigram GIN `(org_id, workspace_id, search_text)` (btree_gin)                                                                                                                                                                                                                |
 
 The executable definitions live in
 `src/hoopdb/search-index-contract.ts`. `bun run audit:search-indexes` is
@@ -72,7 +72,7 @@ only; applying or merging needs the user's OK on the exact head. Migration:
 - **Search document:** `sessions.session_directory_search_text(...)` is the one
   definition of `search_text`; the summary is its last field. The writer rebuilds
   `search_text` with it, and the future projector must use the same function.
-- **Projector:** `src/hoopdb/session-directory-projector.ts` (`projectSessionDirectory`) is the create/update path. The HoopDb indexer calls it after every pointer upsert. Precedence is PROVISIONAL until the projector decision below is recorded: created_at is the earliest live pointer, last_activity_at the latest, scalar metadata and counters come from the most recently active live pointer (no summing), memberships are the union, and task_title, agent_name and short_summary are kept. It never resurrects a tombstone and never sets the rollout marker.
+- **Projector:** `src/hoopdb/session-directory-projector.ts` (`projectSessionDirectory`) is the create/update path. The HoopDb indexer calls it after every pointer upsert and pointer tombstone. Precedence is the V1 contract in "Projector precedence" below. It never sets the rollout marker.
 - **Summary producer:** Bob Costas's `summary-short` handler calls `writeShortSummary` after publishing the encrypted object (and `clearShortSummary` for any non-ready status). A refused summary is logged by reason only. If the directory write fails after the pointer committed, every retry that finds the summary current authenticates the published object and republishes it, even when the row already holds a summary (it may be an older revision's text). The `generated_at` fence makes this idempotent. If the pointer has no object, or the object is missing or cannot be authenticated, the directory summary is cleared and the stage fails with the non-retryable `summary_object_integrity`, which the stage queue dead-letters at once. If the store or keyring read throws, the directory summary is cleared first and the (retryable) error is rethrown. Each current-summary replay costs one object-store read plus one decrypt.
 - **Deletion:** the HoopDb indexer's pointer-tombstone branch (`src/hoopdb/index.ts`)
   calls `propagatePointerTombstone`, which clears the summary and its share of
@@ -98,16 +98,16 @@ filter is refused. (Under RLS, ILIKE is not LEAKPROOF and could never use a trig
 index anyway.) The executable copy is `SESSION_DIRECTORY_SEARCH_RPC` and
 `SESSION_DIRECTORY_SEARCH_SQL` in `src/hoopdb/search-index-contract.ts`.
 
-| Item | Contract |
-| --- | --- |
-| Function | `sessions.search_session_directory(p_workspace_id, p_query, p_harness, p_project_id, p_project_contains, p_no_project, p_agent, p_agent_match, p_state, p_user_id, p_machine_id, p_since, p_until, p_session_id, p_cursor_last_activity_at, p_cursor_session_id, p_cursor_harness, p_cursor_workspace_id, p_limit)`, every argument defaulted (the first two keep their positions). PostgREST `POST /rest/v1/rpc/search_session_directory`, `Content-Profile: sessions`, a JSON body of named `p_*` arguments. `searchRpcRequest` in `src/hoopdb/search-query.ts` builds it under the same rules |
-| Security | `SECURITY DEFINER`, `search_path = pg_catalog, sessions, pg_temp`. The statement is assembled only from fixed fragments chosen by which arguments are set; every value is bound with `EXECUTE ... USING` (one custom plan per call). Runs as the migration owner (table owner, RLS not forced); no BYPASSRLS role is created |
-| Caller | only `session_directory_search_worker`: `NOLOGIN NOINHERIT NOBYPASSRLS`, `statement_timeout = 2s`, `USAGE` on `sessions`, `EXECUTE` on this function, no table or column privileges. `EXECUTE` is revoked from PUBLIC, `anon`, `authenticated`, `service_role`, `relayhistory_app` and any grantee present at creation (default privileges). A grant added later (a runner's `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions`) is still refused: the function itself requires the caller's role to be the Worker (`42501`). The revoke also strips `EXECUTE` from `postgres` or `supabase_admin` if default privileges granted it to them, so ops tooling must not expect to call the RPC; only the Worker, through PostgREST, calls it. Binding it to `authenticator` and issuing its credential are a separate, reviewed deployment step. That binding (`GRANT session_directory_search_worker TO authenticator`) must keep `authenticator` NOINHERIT; with INHERIT, `has_function_privilege` becomes true for `authenticator` through membership. The Worker must stay NOLOGIN: the function's `session_user` fallback relies on it. **Role collision:** the migration's first statement creates the role, or, if it already exists, reuses it only when it is exactly what the migration would create: no LOGIN, INHERIT, BYPASSRLS, SUPERUSER, CREATEROLE, CREATEDB or REPLICATION; a member of no role; no member except a NOINHERIT `authenticator`; no owned objects; no explicit table, column, function, schema, database or default privileges; and no role setting other than `statement_timeout`. Otherwise the migration fails closed with `42710`, naming every violation, before any other DDL runs. The down path drops the role it owns |
+| Item           | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Function       | `sessions.search_session_directory(p_workspace_id, p_query, p_harness, p_project_id, p_project_contains, p_no_project, p_agent, p_agent_match, p_state, p_user_id, p_machine_id, p_since, p_until, p_session_id, p_cursor_last_activity_at, p_cursor_session_id, p_cursor_harness, p_cursor_workspace_id, p_limit)`, every argument defaulted (the first two keep their positions). PostgREST `POST /rest/v1/rpc/search_session_directory`, `Content-Profile: sessions`, a JSON body of named `p_*` arguments. `searchRpcRequest` in `src/hoopdb/search-query.ts` builds it under the same rules                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Security       | `SECURITY DEFINER`, `search_path = pg_catalog, sessions, pg_temp`. The statement is assembled only from fixed fragments chosen by which arguments are set; every value is bound with `EXECUTE ... USING` (one custom plan per call). Runs as the migration owner (table owner, RLS not forced); no BYPASSRLS role is created                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Caller         | only `session_directory_search_worker`: `NOLOGIN NOINHERIT NOBYPASSRLS`, `statement_timeout = 2s`, `USAGE` on `sessions`, `EXECUTE` on this function, no table or column privileges. `EXECUTE` is revoked from PUBLIC, `anon`, `authenticated`, `service_role`, `relayhistory_app` and any grantee present at creation (default privileges). A grant added later (a runner's `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions`) is still refused: the function itself requires the caller's role to be the Worker (`42501`). The revoke also strips `EXECUTE` from `postgres` or `supabase_admin` if default privileges granted it to them, so ops tooling must not expect to call the RPC; only the Worker, through PostgREST, calls it. Binding it to `authenticator` and issuing its credential are a separate, reviewed deployment step. That binding (`GRANT session_directory_search_worker TO authenticator`) must keep `authenticator` NOINHERIT; with INHERIT, `has_function_privilege` becomes true for `authenticator` through membership. The Worker must stay NOLOGIN: the function's `session_user` fallback relies on it. **Role collision:** the migration's first statement creates the role, or, if it already exists, reuses it only when it is exactly what the migration would create: no LOGIN, INHERIT, BYPASSRLS, SUPERUSER, CREATEROLE, CREATEDB or REPLICATION; a member of no role; no member except a NOINHERIT `authenticator`; no owned objects; no explicit table, column, function, schema, database or default privileges; and no role setting other than `statement_timeout`. Otherwise the migration fails closed with `42710`, naming every violation, before any other DDL runs. The down path drops the role it owns |
 | Tenant | from the signed JWT claims only (`request.jwt.claims`, as the RLS helpers read them): `role` must equal `session_directory_search_worker`, `app_metadata.org_id` (string) is the org, and `app_metadata.workspace_ids` (array of strings) the workspaces. `p_workspace_id` must be one of them; `NULL` means organization-wide over exactly the claimed workspaces. The caller cannot name an org. `workspace_ids` must hold 1 to 64 unique strings of 1 to 128 non-space, non-control characters; one bad entry refuses the whole claim. `iss` and `aud` must equal the row in `sessions.session_directory_search_token_policy`, which no migration seeds, so search is refused until an environment adds one. `aud` must be a string, `exp - iat` must be 1 to 60 seconds, and `exp` at most 90 seconds away. Signature verification is PostgREST's |
-| Query | One rule, implemented identically in `src/hoopdb/search-query.ts` (`normalizeSearchQuery`, `searchRpcRequest`) and `sessions.session_directory_search_query`: NFC; remove every format character (Cf: ZWSP, ZWNJ, ZWJ, BOM, bidi controls, soft hyphen); collapse runs of separators and controls (Z, Cc: NBSP, U+2000-U+200A, U+3000, tabs, newlines) to one space and trim; NFC again; then at least 3 meaningful code points (not a space, not a combining mark M) and at most 200 in total. The character classes are pinned Unicode 17.0 range tables, rendered into the migration from the TypeScript data (a test pins them). Refused input raises `22023` before the search statement runs. `\`, `%`, `_` are escaped so the term is literal; matched as `search_text ILIKE '%term%'`. PostgreSQL `normalize()` uses the server's own Unicode tables, which may be older than 17.0; for code points the server does not know, NFC may differ from the TypeScript result. The category classes are fixed data and do not depend on the server version, so the 3-character floor holds either way |
-| Order and size | `ORDER BY last_activity_at DESC, session_id DESC, harness DESC` (organization-wide: then `workspace_id DESC`); membership filters order by the membership table's copy of the same key, which the projector keeps equal. `p_limit` 1..50 (default 50); at most `p_limit + 1` rows (51), the extra row meaning "more". Cursor: the last returned row's `(last_activity_at, session_id, harness[, workspace_id])`, all required together; `workspace_id` is required organization-wide and must match `p_workspace_id` otherwise |
-| Returns | `org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, task_title, agent_name, project_id, git_repo, git_branch, model, state, event_count, input_tokens, output_tokens, cost_usd_micros, machine_ids, user_ids, short_summary, projected_at`; live rows only |
-| Errors | `42501` caller is not the Worker role, or tenant claims missing, malformed, for another role, or not covering the workspace; `22023` an invalid value (text under the meaningful-character rule for `p_query`, `p_project_contains` and a prefix `p_agent`; `p_limit` outside 1..50; unknown state, agent match or harness format; an incomplete or mismatched cursor; `p_since` after `p_until`; `p_no_project` with `p_project_id` or `p_project_contains`); `0A000` an intentionally unsupported combination (below); `57014` the 2 s statement timeout |
+| Query          | One rule, implemented identically in `src/hoopdb/search-query.ts` (`normalizeSearchQuery`, `searchRpcRequest`) and `sessions.session_directory_search_query`: NFC; remove every format character (Cf: ZWSP, ZWNJ, ZWJ, BOM, bidi controls, soft hyphen); collapse runs of separators and controls (Z, Cc: NBSP, U+2000-U+200A, U+3000, tabs, newlines) to one space and trim; NFC again; then at least 3 meaningful code points (not a space, not a combining mark M) and at most 200 in total. The character classes are pinned Unicode 17.0 range tables, rendered into the migration from the TypeScript data (a test pins them). Refused input raises `22023` before the search statement runs. `\`, `%`, `_` are escaped so the term is literal; matched as `search_text ILIKE '%term%'`. PostgreSQL `normalize()` uses the server's own Unicode tables, which may be older than 17.0; for code points the server does not know, NFC may differ from the TypeScript result. The category classes are fixed data and do not depend on the server version, so the 3-character floor holds either way                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Order and size | `ORDER BY last_activity_at DESC, session_id DESC, harness DESC` (organization-wide: then `workspace_id DESC`); membership filters order by the membership table's copy of the same key, which the projector keeps equal. `p_limit` 1..50 (default 50); at most `p_limit + 1` rows (51), the extra row meaning "more". Cursor: the last returned row's `(last_activity_at, session_id, harness[, workspace_id])`, all required together; `workspace_id` is required organization-wide and must match `p_workspace_id` otherwise                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Returns        | `org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, task_title, agent_name, project_id, git_repo, git_branch, model, state, event_count, input_tokens, output_tokens, cost_usd_micros, machine_ids, user_ids, short_summary, projected_at`; live rows only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Errors         | `42501` caller is not the Worker role, or tenant claims missing, malformed, for another role, or not covering the workspace; `22023` an invalid value (text under the meaningful-character rule for `p_query`, `p_project_contains` and a prefix `p_agent`; `p_limit` outside 1..50; unknown state, agent match or harness format; an incomplete or mismatched cursor; `p_since` after `p_until`; `p_no_project` with `p_project_id` or `p_project_contains`); `0A000` an intentionally unsupported combination (below); `57014` the 2 s statement timeout                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 #### Filters and their semantics
 
@@ -117,21 +117,21 @@ summary search, relay's MCP proxy, and RelayHistory #226's `GET /v1/sessions`) i
 G6 PR. Every list filter they send maps to an argument; text composes with every filter
 and with the cursor, and filters AND together.
 
-| Read API filter | RPC argument | Semantics |
-| --- | --- | --- |
-| `workspace` / org scope | `p_workspace_id` / `NULL` | workspace equality, or the claimed workspaces |
-| `q` (`search=metadata`) | `p_query` | case-insensitive literal substring of `search_text` (metadata + scrubbed `short_summary`) |
-| `source` | `p_harness` | exact |
-| `project` | `p_project_id` | exact |
-| `projectContains` | `p_project_contains` | case-insensitive literal substring; ANDed with `project` when both are given |
-| `noProject` | `p_no_project` | `project_id IS NULL` |
-| `agent` | `p_agent` + `p_agent_match` | `exact` (default, as legacy RelayHistory) or `prefix` (3+ meaningful characters), on the normalized name |
-| `state` | `p_state` | exact |
-| `user`, `machine` | `p_user_id`, `p_machine_id` | membership; ANDed when both are given |
-| `since` | `p_since` | `last_activity_at >= since` |
-| `until` | `p_until` | `created_at <= until`: the session's activity interval overlaps the window, a superset of legacy "has an event at or before until" (#226's `last_activity_at <= until` is narrower and is replaced) |
-| session id | `p_session_id` | exact, workspace-scoped or organization-wide |
-| `cursor`, `limit` | `p_cursor_*`, `p_limit` | keyset as above |
+| Read API filter         | RPC argument                | Semantics                                                                                                                                                                                               |
+| ----------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `workspace` / org scope | `p_workspace_id` / `NULL`   | workspace equality, or the claimed workspaces                                                                                                                                                           |
+| `q` (`search=metadata`) | `p_query`                   | case-insensitive literal substring of `search_text` (metadata + scrubbed `short_summary`)                                                                                                               |
+| `source`                | `p_harness`                 | exact                                                                                                                                                                                                   |
+| `project`               | `p_project_id`              | exact                                                                                                                                                                                                   |
+| `projectContains`       | `p_project_contains`        | case-insensitive literal substring; ANDed with `project` when both are given                                                                                                                            |
+| `noProject`             | `p_no_project`              | `project_id IS NULL`                                                                                                                                                                                    |
+| `agent`                 | `p_agent` + `p_agent_match` | `exact` (default, as legacy RelayHistory) or `prefix` (3+ meaningful characters), on the normalized name                                                                                                |
+| `state`                 | `p_state`                   | exact                                                                                                                                                                                                   |
+| `user`, `machine`       | `p_user_id`, `p_machine_id` | membership; ANDed when both are given                                                                                                                                                                   |
+| `since`                 | `p_since`                   | `last_activity_at >= since`                                                                                                                                                                             |
+| `until`                 | `p_until`                   | `last_activity_at <= until`, inclusive, compared as `timestamptz` (so any UTC offset in the input is honoured): exactly the legacy direct-list filter (#226's PostgREST `last_activity_at=lte.<until>`) |
+| session id              | `p_session_id`              | exact, workspace-scoped or organization-wide                                                                                                                                                            |
+| `cursor`, `limit`       | `p_cursor_*`, `p_limit`     | keyset as above                                                                                                                                                                                         |
 
 Intentionally unsupported, returned as `0A000` (never as empty results): an
 organization-wide page (`p_workspace_id` `NULL`) with `p_agent`, `p_project_id`,
@@ -170,41 +170,118 @@ and its `session_catalog_agents` index are not the production contract. Its
 normalization and ordered-prefix lessons remain valid; its event-triggered catalog
 projection and legacy rollout marker do not.
 
-## Agent prefix and benchmark gate
+## Agent prefix: RPC only, with a candidate budget
 
-Exact lookup accepts a complete normalized name. Prefix lookup requires at least
-three Unicode characters after trim/lowercase normalization. Shorter prefixes are
-rejected rather than allowed to scan a large tenant directory.
+Exact lookup accepts a complete normalized name, on the direct list surface or through
+the RPC. Direct exact input must be ASCII (`NonAsciiAgentFilterError` otherwise).
 
-Before a rollout can be marked complete, run exact and prefix queries against a
-production-shaped population and record p50/p95 latency plus `EXPLAIN (ANALYZE,
-BUFFERS, FORMAT JSON)`. The deterministic gate is:
+Prefix lookup is served only by `sessions.search_session_directory`
+(`p_agent_match => 'prefix'`). On the direct surface every prefix is a typed
+`AgentPrefixRequiresRpcError` (`directAgentPrefix`), raised before any SQL, and there is
+no direct prefix query. Under RLS the direct path could not bound a broad prefix: its
+bounds and LIKE recheck are estimated as independent, and PostgreSQL 15 and 17 chose a
+Seq Scan of the whole tenant (`docs/evidence/session-directory-plans.md`).
 
-- page size: 50;
-- exact and representative selective prefixes must use
-  `session_directory_agent_recent_idx` to constrain the name;
-- at least exact, representative three-character, and deliberately broad
-  three-character prefixes are measured;
-- for a deliberately broad prefix PostgreSQL may instead walk
-  `session_directory_workspace_recent_idx` or `session_directory_org_recent_idx`
-  and filter in recency order; actual index rows plus `Rows Removed by Filter`,
-  divided by returned rows, must be at most 100.
+In the RPC, a prefix needs at least three meaningful characters (`22023` otherwise).
+Before the page runs, the RPC counts the prefix's candidates, stopping after 5,001:
 
-If a real three-character prefix fails that gate, do not relax the limit or hide it
-with a faster test host. Raise the minimum prefix, add a proven projection, or move
-agent discovery to a dedicated names table. Timing thresholds are environment
-specific and belong in the release evidence; the row-amplification bound is the
-portable correctness/performance gate.
+- the count is an ordered walk of `session_directory_agent_recent_idx` (an Index Only
+  Scan; seqscan, bitmapscan and sort are disabled for that one statement and restored
+  after);
+- more than `AGENT_PREFIX_CANDIDATE_BUDGET` (5,000 = page size 50 x the 100x gate) is
+  refused as `agent_prefix_too_broad` (`54000`), asking for a longer prefix or an exact
+  agent;
+- so no prefix, however broad, reads more than 5,001 index entries or scans the tenant.
+  Raising the minimum length alone would not bound it.
 
-## Projector decision still required
+The release evidence still records p50/p95 and plans on a production-shaped
+population. The budget, not a test host's speed, is the bound.
 
-Before the projector/backfill lane can mark rollout complete, Khaliq must approve
-the precedence rules for a logical session whose machine manifests disagree on
-title, task title, agent name, project, model, or state. The schema can hold the
-result, but it intentionally does not guess whether newest activity, a designated
-owner machine, or another source wins. Usage counters also need an explicit
-sum-versus-deduplicate rule. Until those rules are recorded, the rollout marker
-stays incomplete and the audit fails closed.
+## Direct surface: expand then contract
+
+`authenticated` can still read `project_id` directly, and PostgREST lets a role filter
+on any column it can SELECT. So a direct `project_id=ilike.*v*` is possible, and under
+RLS it can never use an index: `texticlike` and `textlike` are not LEAKPROOF. No
+cosmetic index is added. The surface closes in two phases.
+
+**Expand (in #38, additive only)**
+
+- Migration `20261031001000_session_directory_reads_expand.sql`.
+- Project substring is already served by the RPC (`p_project_contains`, tenant project
+  trigram index inside the RPC identity).
+- `sessions.session_directory_pointers(p_workspace_id, p_harness, p_session_id)`
+  returns exactly RelayHistory #226's 13 pointer columns for live pointers in a claimed
+  workspace, ordered by `machine_id`, at most 64 rows.
+- `sessions.session_directory_readiness()` returns only the rollout marker's
+  `completed_at`.
+- Both are SECURITY DEFINER with a pinned `search_path` and fixed SQL. The tenant
+  comes from the signed claims (`42501` otherwise), through
+  `sessions.session_directory_worker_scope`, which applies the search RPC's token pins
+  too: the `session_directory_search_token_policy` issuer and audience, the lifetime
+  bound, and 1 to 64 valid workspace ids. EXECUTE goes to
+  `session_directory_search_worker` only, and both apply the same call-time role guard.
+- `sessions.session_directory_resurrection_fences` and its trigger implement the
+  decision 0002 resurrection rule (see "Projector precedence").
+- Nothing is revoked. `short_summary` is unchanged. There is no `service_role` fallback.
+
+**Contract (later, separate, not applied here)**
+
+- Prerequisites: #226 cuts over to the RPCs behind a flag with shadow parity, and
+  logs prove zero direct reads over an agreed window.
+- Then a separate forward migration revokes direct SELECT on `session_directory`,
+  `_users`, `_machines`, `session_index` and `session_directory_rollout` from
+  `authenticated` and from the static reader's role.
+- The plan and the consumer inventory are in #87
+  (`docs/session-directory-consumers.md`).
+
+## Projector precedence (V1)
+
+For a logical session whose machine manifests disagree, `projectSessionDirectory`
+applies, and `session-directory-precedence.test.ts` pins:
+
+- **created_at:** stable and historical: the earliest `created_at` ever projected. It
+  never moves later, not even when the earliest pointer is tombstoned.
+- **Scalars and counters:** the latest live pointer wins title, project, repository,
+  branch, model, state, event and token counts and cost, without summing across
+  machines. `last_activity_at` is that pointer's.
+- **Deterministic ties:** latest `last_activity_at`, then highest `revision`, then
+  highest `machine_id`.
+- **Memberships:** `machine_ids`, `user_ids` and the membership tables are the union of
+  LIVE pointers. Each membership row carries the directory row's `last_activity_at`.
+- **Tombstone:** when no live pointer remains. The trigger clears `short_summary` and
+  `search_text`, and memberships are deleted.
+- **Resurrection:** only for a genuinely new pointer revision (helm-chart-chief's
+  ruling on decision 0002, below):
+  - When a row becomes a tombstone, the trigger `session_directory_record_fences`
+    records every pointer's highest revision in
+    `session_directory_resurrection_fences` (expand migration `20261031001000`).
+  - The row comes back only for a live pointer whose revision is strictly above its
+    machine's fence, or from a machine with no fence. It returns with the historical
+    `created_at` and no summary until Bob Costas writes one.
+  - Re-sent, stale or un-deleted pointer revisions stay fenced permanently. Fences only
+    rise, and erasure deletes them with the row.
+- **Unchanged:** `task_title`, `agent_name` and `short_summary` are kept as projected.
+
+Provenance of the approval, recorded verbatim so it can be judged and reverted:
+
+- In helm-chart-chief's session, helm-chart-chief asked: "I recommend stable historical
+  created_at, latest-live scalar/counter winner without summing, union of live
+  memberships, tombstone when none remain, and resurrection when a later live pointer
+  appears. Approve that V1 behavior?"
+- Khaliq's next message was: "keep going".
+- It was relayed to this lane by the 96-no-bull-migration coordinator. The
+  implementing agent did not see that session firsthand.
+
+Decision 0002 and resurrection (helm-chart-chief's ruling):
+
+- A deleted upload or pointer never comes back. Its revision is fenced, so un-deleting it,
+  re-sending it, or sending an older or equal revision cannot revive anything.
+- A logical session may be resurrected, but only by a genuinely new live pointer with a
+  strictly newer admissible revision (a new upload after the deletion).
+
+`session-directory-precedence.test.ts` covers all three: a deleted pointer never
+revives, a stale or equal revision cannot, and a new higher revision (or a machine with
+no prior pointer) can. The rollout marker is still set only by the backfill lane.
 
 ## Dimensions that remain local
 
