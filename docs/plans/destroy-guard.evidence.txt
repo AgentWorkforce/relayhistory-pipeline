@@ -1,5 +1,5 @@
 # Stack-level destroy guard, exercised against the live account with `alchemy destroy --dry-run`
-# (no --yes, so Alchemy computes a plan only and never writes state). Source a378b2fe1191, 2026-10-30.
+# (no --yes, so Alchemy computes a plan only and never writes state). Run at a378b2f, 2026-10-30; stacks/aws/deploy-guard.ts and alchemy.aws.run.ts are unchanged in the rebased 0770b33.
 # Both runs bypass bin/96bulls and call Alchemy directly; the stack refuses while evaluating.
 
 $ bunx alchemy destroy --config stacks/aws/alchemy.aws.run.ts --stage aws-sessions-dev --dry-run --no-input

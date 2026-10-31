@@ -1,15 +1,15 @@
 {
   "schema": 1,
   "stage": "aws-proof",
-  "generatedAt": "2026-10-31T01:22:44.752Z",
+  "generatedAt": "2026-10-31T01:25:26.608Z",
   "target": {
     "accountId": "500268966557",
     "region": "us-west-2",
     "callerArn": "arn:aws:sts::500268966557:assumed-role/AWSReservedSSO_AdministratorAccess_fafac944cdc114d8/khaliq@agentrelay.com"
   },
   "source": {
-    "commit": "a378b2fe11919c533ce595677b6c12c0fdaa139b",
-    "stackSourceSha256": "586a7550c1fb66227e6849e9c8712cb33a9e260eaf4d895f9f36907c7c28defb",
+    "commit": "0770b33efe1ea50d540fba7538285747aa8a8447",
+    "stackSourceSha256": "ee4a33d62b59f396ff73dbb7aad7ff0b0495a5670fd4176ca649ada9b5354389",
     "clean": true
   },
   "inputs": {
@@ -35,11 +35,11 @@
   "outputs": {
     "plan": {
       "path": "docs/plans/aws-proof.plan.txt",
-      "sha256": "bd06649bb0b2bf24e973b78aaa02f8d16c32b7920e440038cbaa9a2ba91fc442"
+      "sha256": "fadbd8943b89065530621762cd785c76933ad2cf95650f57d6f0f5f5bb19dbc3"
     },
     "detailed": {
       "path": "docs/plans/aws-proof.plan.detailed.txt",
-      "sha256": "3fa1700e7b2cfb9ee04f541a29cb7b96cb481c27c3a6e85dece57d54eb68ba23"
+      "sha256": "09a594204b65b9593acbe59e64bd042d8671645de63f7a315265ae062ae7df3e"
     }
   },
   "summary": "Plan: 78 to create",
