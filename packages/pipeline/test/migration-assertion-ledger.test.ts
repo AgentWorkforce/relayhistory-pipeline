@@ -50,7 +50,13 @@ beforeEach(async () => {
 const jti = () => `tok_${randomBytes(16).toString("hex")}`;
 const nonce = () => randomBytes(24).toString("base64url");
 
-type Use = { jti: string; nonce: string; planDigest?: string; grantId?: string; expiresAt?: string };
+type Use = {
+  jti: string;
+  nonce: string;
+  planDigest?: string;
+  grantId?: string;
+  expiresAt?: string;
+};
 
 async function insertUse(tx: Transaction | PGlite, use: Use) {
   const { rows } = await tx.query(
@@ -59,7 +65,16 @@ async function insertUse(tx: Transaction | PGlite, use: Use) {
      VALUES ($1, $2, $3, $4, $5, $6, $7, $7, COALESCE($8::timestamptz, now() + interval '65 seconds'))
      ON CONFLICT DO NOTHING
      RETURNING jti`,
-    [use.jti, use.nonce, use.grantId ?? GRANT, ORG, WORKSPACE, USER, use.planDigest ?? PLAN, use.expiresAt ?? null],
+    [
+      use.jti,
+      use.nonce,
+      use.grantId ?? GRANT,
+      ORG,
+      WORKSPACE,
+      USER,
+      use.planDigest ?? PLAN,
+      use.expiresAt ?? null,
+    ],
   );
   return rows.length === 1;
 }
@@ -143,25 +158,55 @@ describe("sessions.migration_assertion_uses", () => {
 
   it("retention: the ledger deletes at most 100 rows expired past the 5 minute margin per insert", async () => {
     for (let i = 0; i < 120; i++)
-      await insertUse(db, { jti: jti(), nonce: nonce(), expiresAt: new Date(Date.now() - 3_600_000).toISOString() });
+      await insertUse(db, {
+        jti: jti(),
+        nonce: nonce(),
+        expiresAt: new Date(Date.now() - 3_600_000).toISOString(),
+      });
     // Expired, but inside the margin: kept.
-    await insertUse(db, { jti: jti(), nonce: nonce(), expiresAt: new Date(Date.now() - 60_000).toISOString() });
+    await insertUse(db, {
+      jti: jti(),
+      nonce: nonce(),
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    });
     const ledger = sqlMigrationAssertionLedger({
-      query: async (text, params) => ({ rows: (await db.query(text, params)).rows as never[] }),
-      transaction: (work) => db.transaction((tx) => work({ query: async (text, params) => ({ rows: (await tx.query(text, params)).rows as never[] }) })),
+      query: async (text, params) => ({
+        rows: (await db.query(text, params)).rows as never[],
+      }),
+      transaction: (work) =>
+        db.transaction((tx) =>
+          work({
+            query: async (text, params) => ({
+              rows: (await tx.query(text, params)).rows as never[],
+            }),
+          }),
+        ),
     });
     const fresh = {
-      jti: jti(), nonce: nonce(), grantId: GRANT, planDigest: PLAN, planEntryDigest: PLAN,
-      orgId: ORG, workspaceId: WORKSPACE, userId: USER, expiresAt: Math.floor(Date.now() / 1000) + 65,
+      jti: jti(),
+      nonce: nonce(),
+      grantId: GRANT,
+      planDigest: PLAN,
+      planEntryDigest: PLAN,
+      orgId: ORG,
+      workspaceId: WORKSPACE,
+      userId: USER,
+      expiresAt: Math.floor(Date.now() / 1000) + 65,
     };
     expect(
       await ledger.consume(fresh, "object-landed", {
-        v: 1, stage: "object-landed", ctx: { traceId: TRACE, orgId: ORG, workspaceId: WORKSPACE }, workKey: WORK_KEY, payload: {},
+        v: 1,
+        stage: "object-landed",
+        ctx: { traceId: TRACE, orgId: ORG, workspaceId: WORKSPACE },
+        workKey: WORK_KEY,
+        payload: {},
       } as never),
     ).toBe("consumed");
     expect(await count("sessions.migration_assertion_uses")).toBe(20 + 1 + 1);
     // The still-live assertion is a replay after the purge.
-    expect(await ledger.consume(fresh, "object-landed", {} as never)).toBe("replayed");
+    expect(await ledger.consume(fresh, "object-landed", {} as never)).toBe(
+      "replayed",
+    );
   });
 
   it("requires expires_at and plan_entry_digest; the chunk table is service-role only too", async () => {
@@ -175,7 +220,9 @@ describe("sessions.migration_assertion_uses", () => {
     for (const role of ["authenticated", "anon"]) {
       await db.exec(`RESET ROLE; SET ROLE ${role}`);
       try {
-        await expect(db.query("SELECT 1 FROM sessions.migration_assertion_chunks")).rejects.toThrow(/permission denied/);
+        await expect(
+          db.query("SELECT 1 FROM sessions.migration_assertion_chunks"),
+        ).rejects.toThrow(/permission denied/);
       } finally {
         await db.exec("RESET ROLE; SET ROLE service_role");
       }

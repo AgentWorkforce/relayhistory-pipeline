@@ -13,7 +13,13 @@ import { PGlite } from "@electric-sql/pglite";
 import { auto_explain } from "@electric-sql/pglite/contrib/auto_explain";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
-import { SCRUB_RULESET, SCRUB_RULESET_VERSION, objectKey, rawChunkKey, type ManifestV1 } from "../../shared/vendor.ts";
+import {
+  SCRUB_RULESET,
+  SCRUB_RULESET_VERSION,
+  objectKey,
+  rawChunkKey,
+  type ManifestV1,
+} from "../../shared/vendor.ts";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { createHash } from "node:crypto";
 import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
@@ -47,10 +53,19 @@ import {
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 const MIGRATION = "20261030020000_session_directory_short_summary.sql";
-const DOWN = read(`supabase/rollbacks/${MIGRATION.replace(/\.sql$/, ".down.sql")}`);
+const DOWN = read(
+  `supabase/rollbacks/${MIGRATION.replace(/\.sql$/, ".down.sql")}`,
+);
 const UP = read(`supabase/migrations/${MIGRATION}`);
+// Later migrations that depend on G6 (its role and functions): rolled back first.
+const EXPAND = "20261031001000_session_directory_reads_expand.sql";
+const EXPAND_UP = read(`supabase/migrations/${EXPAND}`);
+const EXPAND_DOWN = read(
+  `supabase/rollbacks/${EXPAND.replace(/\.sql$/, ".down.sql")}`,
+);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
-const RPC_SIGNATURE = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
+const RPC_SIGNATURE =
+  "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
 
 // Synthetic secret-shaped values, assembled at runtime so no literal sits on disk.
 const FAKE_RELAY_TOKEN = ["relay", "ag", "x".repeat(24)].join("_");
@@ -75,16 +90,28 @@ async function database(prelude = ""): Promise<PGlite> {
 /** The full HoopDb plan (as src/hoopdb/migrate.ts orders it): supabase, then 96bulls. */
 async function hoopDatabase(): Promise<PGlite> {
   const db = await database();
-  for (const file of readdirSync(join(root, "src/hoopdb/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
+  for (const file of readdirSync(join(root, "src/hoopdb/migrations"))
+    .filter((f) => f.endsWith(".sql"))
+    .sort()) {
     await db.exec(read(`src/hoopdb/migrations/${file}`));
   }
   return db;
 }
 
-const KEY = { orgId: "org-a", workspaceId: "ws-a", harness: "codex", sessionId: "s-1" };
+const KEY = {
+  orgId: "org-a",
+  workspaceId: "ws-a",
+  harness: "codex",
+  sessionId: "s-1",
+};
 const AT = new Date("2026-10-30T12:00:00Z");
 
-async function insertRow(db: PGlite, org = "org-a", workspace = "ws-a", session = "s-1") {
+async function insertRow(
+  db: PGlite,
+  org = "org-a",
+  workspace = "ws-a",
+  session = "s-1",
+) {
   await db.query(
     `INSERT INTO sessions.session_directory
        (org_id, workspace_id, harness, session_id, created_at, last_activity_at,
@@ -96,19 +123,35 @@ async function insertRow(db: PGlite, org = "org-a", workspace = "ws-a", session 
   );
 }
 
-async function summarize(db: PGlite, key: typeof KEY, summary: string, generatedAt = AT) {
-  return writeShortSummary(db, { ...key, summary, source: "bob-costas/v1", generatedAt });
+async function summarize(
+  db: PGlite,
+  key: typeof KEY,
+  summary: string,
+  generatedAt = AT,
+) {
+  return writeShortSummary(db, {
+    ...key,
+    summary,
+    source: "bob-costas/v1",
+    generatedAt,
+  });
 }
 
 type Row = Record<string, unknown>;
 async function row(db: PGlite, session = "s-1"): Promise<Row | undefined> {
-  return (await db.query<Row>(
-    "SELECT * FROM sessions.session_directory WHERE session_id = $1", [session],
-  )).rows[0];
+  return (
+    await db.query<Row>(
+      "SELECT * FROM sessions.session_directory WHERE session_id = $1",
+      [session],
+    )
+  ).rows[0];
 }
 
 const claims = (org: string, workspaces: string[], role: string = WORKER) =>
-  JSON.stringify({ role, app_metadata: { org_id: org, workspace_ids: workspaces } });
+  JSON.stringify({
+    role,
+    app_metadata: { org_id: org, workspace_ids: workspaces },
+  });
 
 /** Calls the RPC exactly as PostgREST would: SET ROLE to the Worker, claims GUC set. */
 async function search(
@@ -118,13 +161,19 @@ async function search(
   query: string,
   onNotice?: (message: string) => void,
 ): Promise<Row[]> {
-  await db.query("SELECT set_config('request.jwt.claims', $1, false)", [claimsJson ?? ""]);
+  await db.query("SELECT set_config('request.jwt.claims', $1, false)", [
+    claimsJson ?? "",
+  ]);
   await db.exec(`SET ROLE ${WORKER}`);
   try {
     const result = await db.query<Row>(
       "SELECT * FROM sessions.search_session_directory($1, $2)",
       [workspace, query],
-      onNotice ? { onNotice: (notice: { message: string }) => onNotice(notice.message) } as never : undefined,
+      onNotice
+        ? ({
+            onNotice: (notice: { message: string }) => onNotice(notice.message),
+          } as never)
+        : undefined,
     );
     return result.rows;
   } finally {
@@ -139,15 +188,22 @@ describe("short_summary writer", () => {
     await insertRow(db);
     const summary = `Rotated ${FAKE_RELAY_TOKEN} and edited ${FAKE_HOME}/queue.ts to fix retries.`;
     const result = await summarize(db, KEY, summary);
-    expect(result).toEqual({ written: true, scrubVersion: SCRUB_RULESET_VERSION });
+    expect(result).toEqual({
+      written: true,
+      scrubVersion: SCRUB_RULESET_VERSION,
+    });
     const stored = await row(db);
-    expect(stored?.short_summary).toBe("Rotated [REDACTED] and edited ~/proj/queue.ts to fix retries.");
+    expect(stored?.short_summary).toBe(
+      "Rotated [REDACTED] and edited ~/proj/queue.ts to fix retries.",
+    );
     expect(String(stored?.short_summary)).not.toContain(FAKE_RELAY_TOKEN);
     expect(String(stored?.search_text)).not.toContain(FAKE_RELAY_TOKEN);
     expect(stored?.short_summary_scrub_ruleset).toBe(SCRUB_RULESET);
     expect(stored?.short_summary_scrub_version).toBe(SCRUB_RULESET_VERSION);
     expect(stored?.short_summary_source).toBe("bob-costas/v1");
-    expect((stored?.short_summary_generated_at as Date).toISOString()).toBe(AT.toISOString());
+    expect((stored?.short_summary_generated_at as Date).toISOString()).toBe(
+      AT.toISOString(),
+    );
   });
 
   test("refuses over-length text in the writer and in the database", async () => {
@@ -156,59 +212,90 @@ describe("short_summary writer", () => {
     const exact = "a".repeat(SHORT_SUMMARY_MAX_CHARS);
     expect(scrubShortSummary(exact).text).toBe(exact);
     // Counted in code points, as PostgreSQL char_length does: 1000 emoji fit.
-    expect(scrubShortSummary("\u{1F402}".repeat(SHORT_SUMMARY_MAX_CHARS)).text).toHaveLength(2000);
+    expect(
+      scrubShortSummary("\u{1F402}".repeat(SHORT_SUMMARY_MAX_CHARS)).text,
+    ).toHaveLength(2000);
 
     const over = "a".repeat(SHORT_SUMMARY_MAX_CHARS + 1);
-    expect(() => scrubShortSummary(over)).toThrow(new ShortSummaryRejected("over_length"));
-    await expect(summarize(db, KEY, over)).rejects.toThrow("short_summary rejected: over_length");
+    expect(() => scrubShortSummary(over)).toThrow(
+      new ShortSummaryRejected("over_length"),
+    );
+    await expect(summarize(db, KEY, over)).rejects.toThrow(
+      "short_summary rejected: over_length",
+    );
     expect((await row(db))?.short_summary).toBeNull();
 
     // A writer that bypasses the TypeScript path still hits the CHECK.
-    await expect(db.query(
-      `UPDATE sessions.session_directory SET short_summary = $1, short_summary_scrub_ruleset = 'relayhistory-scrub',
+    await expect(
+      db.query(
+        `UPDATE sessions.session_directory SET short_summary = $1, short_summary_scrub_ruleset = 'relayhistory-scrub',
          short_summary_scrub_version = 1, short_summary_source = 'x', short_summary_generated_at = now()`,
-      [over],
-    )).rejects.toThrow(/session_directory_short_summary_length/);
+        [over],
+      ),
+    ).rejects.toThrow(/session_directory_short_summary_length/);
   });
 
   test("refuses when the scrub fails or is not stable, and writes nothing", async () => {
     const db = await database();
     await insertRow(db);
-    const input = { ...KEY, summary: "a normal summary", source: "bob-costas/v1", generatedAt: AT };
-    await expect(writeShortSummary(db, input, () => { throw new Error("boom"); }))
-      .rejects.toThrow("short_summary rejected: scrub_failed");
-    await expect(writeShortSummary(db, input, (value) => `${value}!`))
-      .rejects.toThrow("short_summary rejected: scrub_unstable");
-    await expect(writeShortSummary(db, input, () => undefined as unknown as string))
-      .rejects.toThrow("short_summary rejected: scrub_failed");
-    await expect(writeShortSummary(db, { ...input, summary: "   " }))
-      .rejects.toThrow("short_summary rejected: empty");
-    await expect(writeShortSummary(db, { ...input, source: "Not A Source" }))
-      .rejects.toThrow("short_summary rejected: invalid_source");
+    const input = {
+      ...KEY,
+      summary: "a normal summary",
+      source: "bob-costas/v1",
+      generatedAt: AT,
+    };
+    await expect(
+      writeShortSummary(db, input, () => {
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("short_summary rejected: scrub_failed");
+    await expect(
+      writeShortSummary(db, input, (value) => `${value}!`),
+    ).rejects.toThrow("short_summary rejected: scrub_unstable");
+    await expect(
+      writeShortSummary(db, input, () => undefined as unknown as string),
+    ).rejects.toThrow("short_summary rejected: scrub_failed");
+    await expect(
+      writeShortSummary(db, { ...input, summary: "   " }),
+    ).rejects.toThrow("short_summary rejected: empty");
+    await expect(
+      writeShortSummary(db, { ...input, source: "Not A Source" }),
+    ).rejects.toThrow("short_summary rejected: invalid_source");
     expect((await row(db))?.short_summary).toBeNull();
   });
 
   test("the database rejects summary text that lacks scrub provenance labels", async () => {
     const db = await database();
     await insertRow(db);
-    await expect(db.query(
-      "UPDATE sessions.session_directory SET short_summary = 'unscrubbed text'",
-    )).rejects.toThrow(/session_directory_short_summary_provenance/);
-    await expect(db.query(
-      `UPDATE sessions.session_directory SET short_summary = 'x', short_summary_scrub_ruleset = 'something-else',
+    await expect(
+      db.query(
+        "UPDATE sessions.session_directory SET short_summary = 'unscrubbed text'",
+      ),
+    ).rejects.toThrow(/session_directory_short_summary_provenance/);
+    await expect(
+      db.query(
+        `UPDATE sessions.session_directory SET short_summary = 'x', short_summary_scrub_ruleset = 'something-else',
          short_summary_scrub_version = 1, short_summary_source = 'x', short_summary_generated_at = now()`,
-    )).rejects.toThrow(/session_directory_short_summary_scrub_ruleset/);
-    await expect(db.query(
-      `UPDATE sessions.session_directory SET short_summary = 'x', short_summary_scrub_ruleset = 'relayhistory-scrub',
+      ),
+    ).rejects.toThrow(/session_directory_short_summary_scrub_ruleset/);
+    await expect(
+      db.query(
+        `UPDATE sessions.session_directory SET short_summary = 'x', short_summary_scrub_ruleset = 'relayhistory-scrub',
          short_summary_scrub_version = 0, short_summary_source = 'x', short_summary_generated_at = now()`,
-    )).rejects.toThrow(/session_directory_short_summary_scrub_version/);
+      ),
+    ).rejects.toThrow(/session_directory_short_summary_scrub_version/);
   });
 
   test("an older summary never replaces a newer one", async () => {
     const db = await database();
     await insertRow(db);
     await summarize(db, KEY, "newer");
-    const older = await summarize(db, KEY, "older", new Date(AT.getTime() - 1000));
+    const older = await summarize(
+      db,
+      KEY,
+      "older",
+      new Date(AT.getTime() - 1000),
+    );
     expect(older.written).toBe(false);
     expect((await row(db))?.short_summary).toBe("newer");
   });
@@ -220,8 +307,9 @@ describe("short_summary writer", () => {
     const a = claims("org-a", ["ws-a"]);
     expect(await search(db, a, "ws-a", "heron")).toHaveLength(1);
     const later = new Date(AT.getTime() + 1000);
-    await expect(summarize(db, KEY, "y".repeat(SHORT_SUMMARY_MAX_CHARS + 1), later))
-      .rejects.toThrow("short_summary rejected: over_length");
+    await expect(
+      summarize(db, KEY, "y".repeat(SHORT_SUMMARY_MAX_CHARS + 1), later),
+    ).rejects.toThrow("short_summary rejected: over_length");
     const cleared = await row(db);
     expect(cleared?.short_summary).toBeNull();
     expect(cleared?.short_summary_source).toBeNull();
@@ -230,8 +318,14 @@ describe("short_summary writer", () => {
 
     // The fence: a refused summary older than the stored one does not clear it.
     await summarize(db, KEY, "Fresh egret notes", later);
-    await expect(writeShortSummary(db, { ...KEY, summary: "   ", source: "bob-costas/v1", generatedAt: AT }))
-      .rejects.toThrow("short_summary rejected: empty");
+    await expect(
+      writeShortSummary(db, {
+        ...KEY,
+        summary: "   ",
+        source: "bob-costas/v1",
+        generatedAt: AT,
+      }),
+    ).rejects.toThrow("short_summary rejected: empty");
     expect((await row(db))?.short_summary).toBe("Fresh egret notes");
     expect(await search(db, a, "ws-a", "egret")).toHaveLength(1);
   });
@@ -243,15 +337,30 @@ describe("short_summary in search_text", () => {
     const db = await database();
     await insertRow(db);
     await summarize(db, KEY, "Migrated the zebra-crossing scheduler");
-    expect((await row(db))?.search_text).toBe("Fix flaky queue test Helm proj-1 Migrated the zebra-crossing scheduler");
-    const hits = await search(db, claims("org-a", ["ws-a"]), "ws-a", "ZEBRA-cross");
+    expect((await row(db))?.search_text).toBe(
+      "Fix flaky queue test Helm proj-1 Migrated the zebra-crossing scheduler",
+    );
+    const hits = await search(
+      db,
+      claims("org-a", ["ws-a"]),
+      "ws-a",
+      "ZEBRA-cross",
+    );
     expect(hits.map((hit) => hit.session_id)).toEqual(["s-1"]);
-    expect(Object.keys(hits[0]!)).toEqual([...SESSION_DIRECTORY_SEARCH_RPC.returns]);
-    expect(hits[0]!.short_summary).toBe("Migrated the zebra-crossing scheduler");
+    expect(Object.keys(hits[0]!)).toEqual([
+      ...SESSION_DIRECTORY_SEARCH_RPC.returns,
+    ]);
+    expect(hits[0]!.short_summary).toBe(
+      "Migrated the zebra-crossing scheduler",
+    );
 
     expect(await clearShortSummary(db, KEY)).toBe(true);
-    expect((await row(db))?.search_text).toBe("Fix flaky queue test Helm proj-1");
-    expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "zebra")).toEqual([]);
+    expect((await row(db))?.search_text).toBe(
+      "Fix flaky queue test Helm proj-1",
+    );
+    expect(
+      await search(db, claims("org-a", ["ws-a"]), "ws-a", "zebra"),
+    ).toEqual([]);
   });
 });
 
@@ -261,21 +370,39 @@ describe("search RPC authorization", () => {
     await insertRow(db, "org-a", "ws-a", "s-a");
     await insertRow(db, "org-b", "ws-b", "s-b");
     await insertRow(db, "org-a", "ws-hidden", "s-hidden");
-    for (const [org, workspace, session] of [["org-a", "ws-a", "s-a"], ["org-b", "ws-b", "s-b"], ["org-a", "ws-hidden", "s-hidden"]]) {
-      await summarize(db, { orgId: org!, workspaceId: workspace!, harness: "codex", sessionId: session! },
-        `walrus summary for ${session}`);
+    for (const [org, workspace, session] of [
+      ["org-a", "ws-a", "s-a"],
+      ["org-b", "ws-b", "s-b"],
+      ["org-a", "ws-hidden", "s-hidden"],
+    ]) {
+      await summarize(
+        db,
+        {
+          orgId: org!,
+          workspaceId: workspace!,
+          harness: "codex",
+          sessionId: session!,
+        },
+        `walrus summary for ${session}`,
+      );
     }
     const a = claims("org-a", ["ws-a"]);
-    expect((await search(db, a, "ws-a", "walrus")).map((hit) => hit.session_id)).toEqual(["s-a"]);
+    expect(
+      (await search(db, a, "ws-a", "walrus")).map((hit) => hit.session_id),
+    ).toEqual(["s-a"]);
 
     const refused = async (claimsJson: string | null, workspace: string) =>
-      expect(search(db, claimsJson, workspace, "walrus")).rejects.toThrow("tenant claims missing or invalid");
+      expect(search(db, claimsJson, workspace, "walrus")).rejects.toThrow(
+        "tenant claims missing or invalid",
+      );
     // Tenant A naming B's workspace, or its own org's unlisted workspace.
     await refused(a, "ws-b");
     await refused(a, "ws-hidden");
     // B's workspace id under A's org claim still cannot reach B's rows.
     await refused(claims("org-a", ["ws-b"]), "ws-x");
-    expect(await search(db, claims("org-a", ["ws-b"]), "ws-b", "walrus")).toEqual([]);
+    expect(
+      await search(db, claims("org-a", ["ws-b"]), "ws-b", "walrus"),
+    ).toEqual([]);
     // Missing, malformed, wrong-role, and structurally forged claims.
     await refused(null, "ws-a");
     await refused("{not json", "ws-a");
@@ -283,18 +410,43 @@ describe("search RPC authorization", () => {
     await refused(claims("org-a", ["ws-a"], "authenticated"), "ws-a");
     await refused(claims("org-a", ["ws-a"], "service_role"), "ws-a");
     await refused(claims("", ["ws-a"]), "ws-a");
-    await refused(JSON.stringify({ role: WORKER, app_metadata: { org_id: "org-a", workspace_ids: "ws-a" } }), "ws-a");
-    await refused(JSON.stringify({ role: WORKER, app_metadata: { org_id: ["org-a"], workspace_ids: ["ws-a"] } }), "ws-a");
-    await refused(JSON.stringify({ role: WORKER, org_id: "org-a", workspace_ids: ["ws-a"] }), "ws-a");
+    await refused(
+      JSON.stringify({
+        role: WORKER,
+        app_metadata: { org_id: "org-a", workspace_ids: "ws-a" },
+      }),
+      "ws-a",
+    );
+    await refused(
+      JSON.stringify({
+        role: WORKER,
+        app_metadata: { org_id: ["org-a"], workspace_ids: ["ws-a"] },
+      }),
+      "ws-a",
+    );
+    await refused(
+      JSON.stringify({
+        role: WORKER,
+        org_id: "org-a",
+        workspace_ids: ["ws-a"],
+      }),
+      "ws-a",
+    );
   });
 
   test("the Worker role has no table access, no login, no BYPASSRLS, and a statement timeout", async () => {
     const db = await database();
-    const role = (await db.query<Row>(
-      "SELECT rolcanlogin, rolinherit, rolbypassrls, rolsuper, rolconfig FROM pg_roles WHERE rolname = $1", [WORKER],
-    )).rows[0];
+    const role = (
+      await db.query<Row>(
+        "SELECT rolcanlogin, rolinherit, rolbypassrls, rolsuper, rolconfig FROM pg_roles WHERE rolname = $1",
+        [WORKER],
+      )
+    ).rows[0];
     expect(role).toEqual({
-      rolcanlogin: false, rolinherit: false, rolbypassrls: false, rolsuper: false,
+      rolcanlogin: false,
+      rolinherit: false,
+      rolbypassrls: false,
+      rolsuper: false,
       rolconfig: ["statement_timeout=2s"],
     });
     const privileged = await db.query<{ table_name: string }>(
@@ -308,8 +460,12 @@ describe("search RPC authorization", () => {
     expect(privileged.rows).toEqual([]);
     await db.exec(`SET ROLE ${WORKER}`);
     try {
-      await expect(db.query("SELECT search_text FROM sessions.session_directory")).rejects.toThrow(/permission denied/);
-      await expect(db.query("SELECT * FROM sessions.session_index")).rejects.toThrow(/permission denied/);
+      await expect(
+        db.query("SELECT search_text FROM sessions.session_directory"),
+      ).rejects.toThrow(/permission denied/);
+      await expect(
+        db.query("SELECT * FROM sessions.session_index"),
+      ).rejects.toThrow(/permission denied/);
     } finally {
       await db.exec("RESET ROLE");
     }
@@ -321,7 +477,8 @@ describe("search RPC authorization", () => {
     // it through authenticator's SET ROLE. Changing this to LOGIN needs a new review.
     const db = await database();
     const role = await db.query<{ rolcanlogin: boolean }>(
-      "SELECT rolcanlogin FROM pg_roles WHERE rolname = $1", [WORKER],
+      "SELECT rolcanlogin FROM pg_roles WHERE rolname = $1",
+      [WORKER],
     );
     expect(role.rows).toEqual([{ rolcanlogin: false }]);
   });
@@ -340,7 +497,9 @@ describe("search RPC authorization", () => {
       [WORKER],
     );
     expect(executors.rows).toEqual([]);
-    const checked = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM pg_roles");
+    const checked = await db.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM pg_roles",
+    );
     expect(checked.rows[0]!.n).toBeGreaterThan(5);
   });
 
@@ -356,22 +515,33 @@ describe("search RPC authorization", () => {
       "SELECT has_function_privilege('relayhistory_app', 'sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)', 'EXECUTE') AS ok",
     );
     expect(granted.rows[0]?.ok).toBe(true);
-    await db.query("SELECT set_config('request.jwt.claims', $1, false)", [claims("org-a", ["ws-a"])]);
+    await db.query("SELECT set_config('request.jwt.claims', $1, false)", [
+      claims("org-a", ["ws-a"]),
+    ]);
     await db.exec("SET ROLE relayhistory_app");
     try {
-      await expect(db.query("SELECT * FROM sessions.search_session_directory('ws-a', 'osprey')"))
-        .rejects.toThrow("caller is not the search worker role");
+      await expect(
+        db.query(
+          "SELECT * FROM sessions.search_session_directory('ws-a', 'osprey')",
+        ),
+      ).rejects.toThrow("caller is not the search worker role");
     } finally {
       await db.exec("RESET ROLE");
     }
-    expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "osprey")).toHaveLength(1);
+    expect(
+      await search(db, claims("org-a", ["ws-a"]), "ws-a", "osprey"),
+    ).toHaveLength(1);
   });
 
   test("only the Worker role may execute the RPC, and end users cannot filter search_text directly", async () => {
     const db = await database();
-    const fn = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
+    const fn =
+      "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
     for (const grantee of ["anon", "authenticated", "service_role"]) {
-      const allowed = await db.query<{ ok: boolean }>("SELECT has_function_privilege($1, $2, 'EXECUTE') AS ok", [grantee, fn]);
+      const allowed = await db.query<{ ok: boolean }>(
+        "SELECT has_function_privilege($1, $2, 'EXECUTE') AS ok",
+        [grantee, fn],
+      );
       expect(allowed.rows[0]?.ok, grantee).toBe(false);
     }
     const publicExec = await db.query(
@@ -384,12 +554,24 @@ describe("search RPC authorization", () => {
     await db.exec(`SET ROLE authenticated;
       SELECT set_config('request.jwt.claims', '{"app_metadata":{"org_id":"org-a","workspace_ids":["ws-a"]}}', false);`);
     try {
-      await expect(db.query("SELECT * FROM sessions.search_session_directory('ws-a', 'flaky')")).rejects.toThrow(/permission denied/);
-      await expect(db.query("SELECT session_id FROM sessions.session_directory WHERE search_text ILIKE '%flaky%'"))
-        .rejects.toThrow(/permission denied/);
-      await expect(db.query("SELECT short_summary FROM sessions.session_directory")).rejects.toThrow(/permission denied/);
+      await expect(
+        db.query(
+          "SELECT * FROM sessions.search_session_directory('ws-a', 'flaky')",
+        ),
+      ).rejects.toThrow(/permission denied/);
+      await expect(
+        db.query(
+          "SELECT session_id FROM sessions.session_directory WHERE search_text ILIKE '%flaky%'",
+        ),
+      ).rejects.toThrow(/permission denied/);
+      await expect(
+        db.query("SELECT short_summary FROM sessions.session_directory"),
+      ).rejects.toThrow(/permission denied/);
       // RLS-scoped listing columns stay readable.
-      expect((await db.query("SELECT session_id FROM sessions.session_directory")).rows).toEqual([{ session_id: "s-1" }]);
+      expect(
+        (await db.query("SELECT session_id FROM sessions.session_directory"))
+          .rows,
+      ).toEqual([{ session_id: "s-1" }]);
     } finally {
       await db.exec("RESET ROLE");
     }
@@ -397,12 +579,25 @@ describe("search RPC authorization", () => {
 });
 
 type Plan = { [key: string]: unknown; Plans?: Plan[] };
-const walk = (plan: Plan): Plan[] => [plan, ...(plan.Plans ?? []).flatMap(walk)];
+const walk = (plan: Plan): Plan[] => [
+  plan,
+  ...(plan.Plans ?? []).flatMap(walk),
+];
 
-type CapturedPlan = { queryText: string; plan: Plan; nodes: Plan[]; durationMs: number };
+type CapturedPlan = {
+  queryText: string;
+  plan: Plan;
+  nodes: Plan[];
+  durationMs: number;
+};
 
 /** auto_explain output (ANALYZE, BUFFERS, FORMAT JSON) of the RPC's inner statement. */
-async function explainRpc(db: PGlite, claimsJson: string, workspace: string, query: string) {
+async function explainRpc(
+  db: PGlite,
+  claimsJson: string,
+  workspace: string,
+  query: string,
+) {
   await db.exec(`LOAD 'auto_explain';
     SET auto_explain.log_min_duration = 0; SET auto_explain.log_analyze = on;
     SET auto_explain.log_buffers = on; SET auto_explain.log_timing = on;
@@ -410,40 +605,79 @@ async function explainRpc(db: PGlite, claimsJson: string, workspace: string, que
     SET client_min_messages = log;`);
   const messages: string[] = [];
   try {
-    const rows = await search(db, claimsJson, workspace, query, (message) => messages.push(message));
+    const rows = await search(db, claimsJson, workspace, query, (message) =>
+      messages.push(message),
+    );
     const captured: CapturedPlan[] = messages
-      .filter((message) => message.includes("\"Query Text\""))
+      .filter((message) => message.includes('"Query Text"'))
       .map((message) => {
         const duration = Number(/duration: ([\d.]+) ms/.exec(message)?.[1]);
-        const json = JSON.parse(message.slice(message.indexOf("{"))) as { "Query Text": string; Plan: Plan };
-        return { queryText: json["Query Text"], plan: json.Plan, nodes: walk(json.Plan), durationMs: duration };
+        const json = JSON.parse(message.slice(message.indexOf("{"))) as {
+          "Query Text": string;
+          Plan: Plan;
+        };
+        return {
+          queryText: json["Query Text"],
+          plan: json.Plan,
+          nodes: walk(json.Plan),
+          durationMs: duration,
+        };
       });
     const squash = (sql: string) => sql.replace(/\s+/g, " ").trim();
-    const inner = captured.find((entry) => squash(entry.queryText) === squash(SESSION_DIRECTORY_SEARCH_SQL));
-    if (!inner) throw new Error("auto_explain did not capture the RPC's search statement");
+    const inner = captured.find(
+      (entry) =>
+        squash(entry.queryText) === squash(SESSION_DIRECTORY_SEARCH_SQL),
+    );
+    if (!inner)
+      throw new Error(
+        "auto_explain did not capture the RPC's search statement",
+      );
     return { rows, inner };
   } finally {
-    await db.exec("SET auto_explain.log_min_duration = -1; SET client_min_messages = notice;");
+    await db.exec(
+      "SET auto_explain.log_min_duration = -1; SET client_min_messages = notice;",
+    );
   }
 }
 
 /** Every auto_explain plan logged while the Worker calls the RPC, whether or not it throws. */
-async function capturedStatements(db: PGlite, claimsJson: string, workspace: string, query: string) {
+async function capturedStatements(
+  db: PGlite,
+  claimsJson: string,
+  workspace: string,
+  query: string,
+) {
   await db.exec(`LOAD 'auto_explain';
     SET auto_explain.log_min_duration = 0; SET auto_explain.log_nested_statements = on;
     SET auto_explain.log_format = 'json'; SET client_min_messages = log;`);
   const messages: string[] = [];
   let error: unknown;
   try {
-    await search(db, claimsJson, workspace, query, (message) => messages.push(message));
+    await search(db, claimsJson, workspace, query, (message) =>
+      messages.push(message),
+    );
   } catch (caught) {
     error = caught;
   } finally {
-    await db.exec("SET auto_explain.log_min_duration = -1; SET client_min_messages = notice;");
+    await db.exec(
+      "SET auto_explain.log_min_duration = -1; SET client_min_messages = notice;",
+    );
   }
-  const texts = messages.filter((m) => m.includes("\"Query Text\"")).map((m) =>
-    (JSON.parse(m.slice(m.indexOf("{"))) as { "Query Text": string })["Query Text"].replace(/\s+/g, " ").trim());
-  return { error, ranSearch: texts.includes(SESSION_DIRECTORY_SEARCH_SQL.replace(/\s+/g, " ").trim()) };
+  const texts = messages
+    .filter((m) => m.includes('"Query Text"'))
+    .map((m) =>
+      (JSON.parse(m.slice(m.indexOf("{"))) as { "Query Text": string })[
+        "Query Text"
+      ]
+        .replace(/\s+/g, " ")
+        .trim(),
+    );
+  return {
+    error,
+    ranSearch: texts.includes(
+      SESSION_DIRECTORY_SEARCH_SQL.replace(/\s+/g, " ").trim(),
+    ),
+  };
 }
 
 describe("migration role collision", () => {
@@ -453,13 +687,18 @@ describe("migration role collision", () => {
     open.push(db);
     await db.exec(read("supabase/tests/supabase_shim.sql"));
     for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
-      if (file !== MIGRATION) await db.exec(read(`supabase/migrations/${file}`));
+      // Only the migrations before G6: later ones (the expand phase) need G6's role.
+      if (file < MIGRATION) await db.exec(read(`supabase/migrations/${file}`));
     }
     return db;
   }
-  const applied = async (db: PGlite) => (await db.query(
-    `SELECT 1 FROM information_schema.columns
-      WHERE table_schema = 'sessions' AND table_name = 'session_directory' AND column_name = 'short_summary'`)).rows.length > 0;
+  const applied = async (db: PGlite) =>
+    (
+      await db.query(
+        `SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'sessions' AND table_name = 'session_directory' AND column_name = 'short_summary'`,
+      )
+    ).rows.length > 0;
 
   test("a pre-existing role equal to what the migration creates is reused unaltered", async () => {
     const db = await beforeG6();
@@ -467,50 +706,130 @@ describe("migration role collision", () => {
       CREATE ROLE authenticator NOLOGIN NOINHERIT; GRANT ${WORKER} TO authenticator;`);
     await db.exec(UP);
     expect(await applied(db)).toBe(true);
-    const role = (await db.query<Row>(
-      "SELECT rolcanlogin, rolinherit, rolbypassrls, rolconfig FROM pg_roles WHERE rolname = $1", [WORKER])).rows[0];
-    expect(role).toEqual({ rolcanlogin: false, rolinherit: false, rolbypassrls: false, rolconfig: ["statement_timeout=2s"] });
+    const role = (
+      await db.query<Row>(
+        "SELECT rolcanlogin, rolinherit, rolbypassrls, rolconfig FROM pg_roles WHERE rolname = $1",
+        [WORKER],
+      )
+    ).rows[0];
+    expect(role).toEqual({
+      rolcanlogin: false,
+      rolinherit: false,
+      rolbypassrls: false,
+      rolconfig: ["statement_timeout=2s"],
+    });
   });
 
   const UNSAFE: Array<[string, string, string]> = [
     ["LOGIN", `CREATE ROLE ${WORKER} LOGIN NOINHERIT`, "LOGIN"],
     ["INHERIT", `CREATE ROLE ${WORKER} NOLOGIN INHERIT`, "INHERIT"],
-    ["BYPASSRLS", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT BYPASSRLS`, "BYPASSRLS"],
-    ["SUPERUSER", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT SUPERUSER`, "SUPERUSER"],
-    ["CREATEROLE", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT CREATEROLE`, "CREATEROLE"],
-    ["CREATEDB", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT CREATEDB`, "CREATEDB"],
-    ["REPLICATION", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT REPLICATION`, "REPLICATION"],
-    ["extra role setting", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET search_path = public`,
-      "role settings other than statement_timeout"],
-    ["member of another role", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT service_role TO ${WORKER}`, "member of service_role"],
-    ["granted to an inheriting role", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE ROLE app_reader NOLOGIN INHERIT;
-      GRANT ${WORKER} TO app_reader`, "granted to app_reader"],
-    ["granted to an INHERIT authenticator", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE ROLE authenticator NOLOGIN INHERIT;
-      GRANT ${WORKER} TO authenticator`, "granted to authenticator"],
-    ["owns an object", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE TABLE public.g6_owned (x int);
-      ALTER TABLE public.g6_owned OWNER TO ${WORKER}`, "owns objects"],
-    ["table privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT SELECT ON sessions.session_index TO ${WORKER}`,
-      "table, view or sequence privileges"],
-    ["column privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT SELECT (org_id) ON sessions.session_directory TO ${WORKER}`,
-      "column privileges"],
-    ["function privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO ${WORKER}`,
-      "function privileges"],
-    ["schema privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT CREATE ON SCHEMA sessions TO ${WORKER}`, "schema privileges"],
-    ["database privilege", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT;
-      DO $g$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO ${WORKER}', current_database()); END $g$`, "database privileges"],
-    ["default privileges", `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT;
-      ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO ${WORKER}`, "default privileges"],
+    [
+      "BYPASSRLS",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT BYPASSRLS`,
+      "BYPASSRLS",
+    ],
+    [
+      "SUPERUSER",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT SUPERUSER`,
+      "SUPERUSER",
+    ],
+    [
+      "CREATEROLE",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT CREATEROLE`,
+      "CREATEROLE",
+    ],
+    [
+      "CREATEDB",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT CREATEDB`,
+      "CREATEDB",
+    ],
+    [
+      "REPLICATION",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT REPLICATION`,
+      "REPLICATION",
+    ],
+    [
+      "extra role setting",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET search_path = public`,
+      "role settings other than statement_timeout",
+    ],
+    [
+      "member of another role",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT service_role TO ${WORKER}`,
+      "member of service_role",
+    ],
+    [
+      "granted to an inheriting role",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE ROLE app_reader NOLOGIN INHERIT;
+      GRANT ${WORKER} TO app_reader`,
+      "granted to app_reader",
+    ],
+    [
+      "granted to an INHERIT authenticator",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE ROLE authenticator NOLOGIN INHERIT;
+      GRANT ${WORKER} TO authenticator`,
+      "granted to authenticator",
+    ],
+    [
+      "owns an object",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; CREATE TABLE public.g6_owned (x int);
+      ALTER TABLE public.g6_owned OWNER TO ${WORKER}`,
+      "owns objects",
+    ],
+    [
+      "table privilege",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT SELECT ON sessions.session_index TO ${WORKER}`,
+      "table, view or sequence privileges",
+    ],
+    [
+      "column privilege",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT SELECT (org_id) ON sessions.session_directory TO ${WORKER}`,
+      "column privileges",
+    ],
+    [
+      "function privilege",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO ${WORKER}`,
+      "function privileges",
+    ],
+    [
+      "schema privilege",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; GRANT CREATE ON SCHEMA sessions TO ${WORKER}`,
+      "schema privileges",
+    ],
+    [
+      "database privilege",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT;
+      DO $g$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO ${WORKER}', current_database()); END $g$`,
+      "database privileges",
+    ],
+    [
+      "default privileges",
+      `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO ${WORKER}`,
+      "default privileges",
+    ],
   ];
   for (const [name, setup, problem] of UNSAFE) {
     test(`fails closed, applying nothing, when the pre-existing role has: ${name}`, async () => {
       const db = await beforeG6();
       await db.exec(setup);
-      const error = await db.exec(UP).then(() => null, (caught: unknown) => caught) as { code?: string; message?: string } | null;
+      const error = (await db.exec(UP).then(
+        () => null,
+        (caught: unknown) => caught,
+      )) as { code?: string; message?: string } | null;
       expect(error?.code).toBe("42710");
-      expect(error?.message).toContain("session_directory_search_worker already exists and is unsafe to reuse");
+      expect(error?.message).toContain(
+        "session_directory_search_worker already exists and is unsafe to reuse",
+      );
       expect(error?.message).toContain(problem);
       expect(await applied(db)).toBe(false);
-      expect((await db.query("SELECT 1 FROM pg_proc WHERE proname = 'search_session_directory'")).rows).toEqual([]);
+      expect(
+        (
+          await db.query(
+            "SELECT 1 FROM pg_proc WHERE proname = 'search_session_directory'",
+          )
+        ).rows,
+      ).toEqual([]);
     });
   }
 });
@@ -547,15 +866,27 @@ describe("search RPC query bounds", () => {
     const a = claims("org-a", ["ws-a"]);
     for (const [name, query] of INVALID) {
       expect(normalizeSearchQuery(query).ok, name).toBe(false);
-      expect(searchRpcRequest({ workspaceId: "ws-a", q: query }).ok, name).toBe(false);
-      const sql = await db.query<{ q: string | null }>("SELECT sessions.session_directory_search_query($1) AS q", [query]);
+      expect(searchRpcRequest({ workspaceId: "ws-a", q: query }).ok, name).toBe(
+        false,
+      );
+      const sql = await db.query<{ q: string | null }>(
+        "SELECT sessions.session_directory_search_query($1) AS q",
+        [query],
+      );
       expect(sql.rows[0]?.q, name).toBeNull();
-      const { error, ranSearch } = await capturedStatements(db, a, "ws-a", query);
+      const { error, ranSearch } = await capturedStatements(
+        db,
+        a,
+        "ws-a",
+        query,
+      );
       expect((error as { code?: string })?.code, name).toBe("22023");
       expect(ranSearch, name).toBe(false);
     }
     // Control: a valid query is captured, so the capture itself works.
-    expect((await capturedStatements(db, a, "ws-a", "menu")).ranSearch).toBe(true);
+    expect((await capturedStatements(db, a, "ws-a", "menu")).ranSearch).toBe(
+      true,
+    );
   });
 
   test("valid queries normalize identically in TypeScript and SQL and match literally", async () => {
@@ -563,14 +894,26 @@ describe("search RPC query bounds", () => {
     await insertRow(db);
     await summarize(db, KEY, "Caf\u00e9 menu cut 50%_off for the launch");
     const a = claims("org-a", ["ws-a"]);
-    for (const query of ["abc", "  cafe\u0301 ", "menu\u00a0cut", "\u200bmenu\u3000cut\ufeff", "50%_off", "x".repeat(200)]) {
+    for (const query of [
+      "abc",
+      "  cafe\u0301 ",
+      "menu\u00a0cut",
+      "\u200bmenu\u3000cut\ufeff",
+      "50%_off",
+      "x".repeat(200),
+    ]) {
       const ts = normalizeSearchQuery(query);
-      const sql = await db.query<{ q: string | null }>("SELECT sessions.session_directory_search_query($1) AS q", [query]);
+      const sql = await db.query<{ q: string | null }>(
+        "SELECT sessions.session_directory_search_query($1) AS q",
+        [query],
+      );
       expect(ts.ok && ts.query, JSON.stringify(query)).toBe(sql.rows[0]!.q!);
     }
     expect(await search(db, a, "ws-a", "  cafe\u0301 ")).toHaveLength(1);
     expect(await search(db, a, "ws-a", "menu\u00a0cut")).toHaveLength(1);
-    expect(await search(db, a, "ws-a", "\u200bmenu\u3000cut\ufeff")).toHaveLength(1);
+    expect(
+      await search(db, a, "ws-a", "\u200bmenu\u3000cut\ufeff"),
+    ).toHaveLength(1);
     expect(await search(db, a, "ws-a", "50%_off")).toHaveLength(1);
     expect(await search(db, a, "ws-a", "5_%")).toEqual([]);
     expect(await search(db, a, "ws-a", "menu%launch")).toEqual([]);
@@ -583,7 +926,8 @@ describe("search RPC query bounds", () => {
   });
 });
 
-const sum = (nodes: Plan[], key: string) => nodes.reduce((total, node) => total + Number(node[key] ?? 0), 0);
+const sum = (nodes: Plan[], key: string) =>
+  nodes.reduce((total, node) => total + Number(node[key] ?? 0), 0);
 
 describe("search RPC query plan as the Worker identity", () => {
   // 30,000 rows: a large tenant (org-0/ws-0, 22,500 rows) beside 7,500 rows of six
@@ -615,55 +959,101 @@ describe("search RPC query plan as the Worker identity", () => {
 
   test("a selective term uses the tenant-scoped trigram index within the gates", async () => {
     const db = await populated();
-    const { rows, inner } = await explainRpc(db, claims("org-0", ["ws-0"]), "ws-0", "quokka ledger");
+    const { rows, inner } = await explainRpc(
+      db,
+      claims("org-0", ["ws-0"]),
+      "ws-0",
+      "quokka ledger",
+    );
     console.info(`[G6 plan: selective] ${JSON.stringify(inner.plan)}`);
     expect(rows).toHaveLength(30);
-    expect(rows.every((hit) => hit.org_id === "org-0" && hit.workspace_id === "ws-0")).toBe(true);
-    expect(inner.nodes.some((node) => node["Index Name"] === "session_directory_tenant_search_trgm_idx")).toBe(true);
-    expect(inner.nodes.some((node) => node["Node Type"] === "Seq Scan")).toBe(false);
+    expect(
+      rows.every(
+        (hit) => hit.org_id === "org-0" && hit.workspace_id === "ws-0",
+      ),
+    ).toBe(true);
+    expect(
+      inner.nodes.some(
+        (node) =>
+          node["Index Name"] === "session_directory_tenant_search_trgm_idx",
+      ),
+    ).toBe(true);
+    expect(inner.nodes.some((node) => node["Node Type"] === "Seq Scan")).toBe(
+      false,
+    );
     // Amplification: heap rows examined (kept + removed by recheck/filter) per row returned.
-    const heap = inner.nodes.find((node) => node["Node Type"] === "Bitmap Heap Scan")!;
-    const examined = Number(heap["Actual Rows"]) + Number(heap["Rows Removed by Index Recheck"] ?? 0) +
+    const heap = inner.nodes.find(
+      (node) => node["Node Type"] === "Bitmap Heap Scan",
+    )!;
+    const examined =
+      Number(heap["Actual Rows"]) +
+      Number(heap["Rows Removed by Index Recheck"] ?? 0) +
       Number(heap["Rows Removed by Filter"] ?? 0);
     expect(examined / rows.length).toBeLessThanOrEqual(2);
     // Indicative PGlite bounds, not production SLOs.
-    expect(sum(inner.nodes.slice(0, 1), "Shared Hit Blocks") + sum(inner.nodes.slice(0, 1), "Shared Read Blocks"))
-      .toBeLessThanOrEqual(500);
+    expect(
+      sum(inner.nodes.slice(0, 1), "Shared Hit Blocks") +
+        sum(inner.nodes.slice(0, 1), "Shared Read Blocks"),
+    ).toBeLessThanOrEqual(500);
     expect(inner.durationMs).toBeLessThan(1000);
   });
 
   test("a common term is capped at 51 rows without a seq scan and within the gates", async () => {
     const db = await populated();
-    const { rows, inner } = await explainRpc(db, claims("org-0", ["ws-0"]), "ws-0", "Refactored module");
+    const { rows, inner } = await explainRpc(
+      db,
+      claims("org-0", ["ws-0"]),
+      "ws-0",
+      "Refactored module",
+    );
     console.info(`[G6 plan: common] ${JSON.stringify(inner.plan)}`);
     expect(rows).toHaveLength(SESSION_DIRECTORY_SEARCH_RPC.maxRows);
-    expect(inner.nodes.some((node) => node["Node Type"] === "Seq Scan")).toBe(false);
-    const scan = inner.nodes.find((node) => typeof node["Index Name"] === "string")!;
+    expect(inner.nodes.some((node) => node["Node Type"] === "Seq Scan")).toBe(
+      false,
+    );
+    const scan = inner.nodes.find(
+      (node) => typeof node["Index Name"] === "string",
+    )!;
     expect([
       "session_directory_tenant_search_trgm_idx",
       "session_directory_workspace_recent_idx",
     ]).toContain(scan["Index Name"] as string);
-    const examined = sum(inner.nodes.filter((node) => /Scan$/.test(String(node["Node Type"])) && node["Node Type"] !== "Bitmap Index Scan"), "Actual Rows") +
-      sum(inner.nodes, "Rows Removed by Filter") + sum(inner.nodes, "Rows Removed by Index Recheck");
+    const examined =
+      sum(
+        inner.nodes.filter(
+          (node) =>
+            /Scan$/.test(String(node["Node Type"])) &&
+            node["Node Type"] !== "Bitmap Index Scan",
+        ),
+        "Actual Rows",
+      ) +
+      sum(inner.nodes, "Rows Removed by Filter") +
+      sum(inner.nodes, "Rows Removed by Index Recheck");
     expect(examined / rows.length).toBeLessThanOrEqual(100);
-    expect(sum(inner.nodes.slice(0, 1), "Shared Hit Blocks") + sum(inner.nodes.slice(0, 1), "Shared Read Blocks"))
-      .toBeLessThanOrEqual(2000);
+    expect(
+      sum(inner.nodes.slice(0, 1), "Shared Hit Blocks") +
+        sum(inner.nodes.slice(0, 1), "Shared Read Blocks"),
+    ).toBeLessThanOrEqual(2000);
     expect(inner.durationMs).toBeLessThan(2000);
   });
 });
 
 describe("short_summary deletion propagation", () => {
-  const pointer = (db: PGlite, machine: string) => db.query(
-    `INSERT INTO sessions.session_index
+  const pointer = (db: PGlite, machine: string) =>
+    db.query(
+      `INSERT INTO sessions.session_index
        (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
         storage_provider, bucket, manifest_key, trace_id)
      VALUES ('org-a', 'ws-a', 'codex', 's-1', $1, 'u1', now(), now(), 's3', 'bucket', 'key/' || $1,
              '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18')`,
-    [machine],
-  );
-  const hoopDb = (db: PGlite) => ({
-    query: async (text: string, params?: unknown[]) => ({ rows: (await db.query(text, params)).rows }),
-  }) as unknown as HoopDb;
+      [machine],
+    );
+  const hoopDb = (db: PGlite) =>
+    ({
+      query: async (text: string, params?: unknown[]) => ({
+        rows: (await db.query(text, params)).rows,
+      }),
+    }) as unknown as HoopDb;
 
   test("the indexer's pointer-tombstone path clears the summary, then tombstones the row", async () => {
     const db = await database();
@@ -672,12 +1062,22 @@ describe("short_summary deletion propagation", () => {
     await pointer(db, "m2");
     await summarize(db, KEY, "heron migration notes");
     const index = hoopDbSessionIndex({
-      db: hoopDb(db), reader: {} as never, queue: {} as never, current: () => undefined,
+      db: hoopDb(db),
+      reader: {} as never,
+      queue: {} as never,
+      current: () => undefined,
     });
-    const deleted = (machine: string) => index.upsertRawPointer(
-      { deleted: true, workspaceId: "ws-a", harness: "codex", sessionId: "s-1", machineId: machine } as never,
-      { orgId: "org-a" } as never,
-    );
+    const deleted = (machine: string) =>
+      index.upsertRawPointer(
+        {
+          deleted: true,
+          workspaceId: "ws-a",
+          harness: "codex",
+          sessionId: "s-1",
+          machineId: machine,
+        } as never,
+        { orgId: "org-a" } as never,
+      );
 
     // One machine's manifest deleted: the summary goes at once, the row stays live.
     await deleted("m1");
@@ -689,28 +1089,41 @@ describe("short_summary deletion propagation", () => {
     // the agent name, without the summary.
     expect(current?.machine_ids).toEqual(["m2"]);
     expect(current?.search_text).toBe("Helm");
-    expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "heron")).toEqual([]);
+    expect(
+      await search(db, claims("org-a", ["ws-a"]), "ws-a", "heron"),
+    ).toEqual([]);
 
     // The last machine deleted: the logical row is tombstoned and holds no text.
     await deleted("m2");
     current = await row(db);
     expect(current?.deleted_at).not.toBeNull();
     expect(current?.search_text).toBe("");
-    expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "Helm")).toEqual([]);
+    expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "Helm")).toEqual(
+      [],
+    );
     // The writer never puts a summary back on a tombstone.
-    expect((await summarize(db, KEY, "heron again", new Date(AT.getTime() + 1000))).written).toBe(false);
+    expect(
+      (await summarize(db, KEY, "heron again", new Date(AT.getTime() + 1000)))
+        .written,
+    ).toBe(false);
   });
 
   test("the trigger backstop clears a summary when any writer sets deleted_at directly", async () => {
     const db = await database();
     await insertRow(db);
     await summarize(db, KEY, "heron migration notes");
-    await db.query("UPDATE sessions.session_directory SET deleted_at = now() WHERE session_id = 's-1'");
+    await db.query(
+      "UPDATE sessions.session_directory SET deleted_at = now() WHERE session_id = 's-1'",
+    );
     const tombstone = await row(db);
     for (const column of [
-      "short_summary", "short_summary_scrub_ruleset", "short_summary_scrub_version",
-      "short_summary_source", "short_summary_generated_at",
-    ]) expect(tombstone?.[column]).toBeNull();
+      "short_summary",
+      "short_summary_scrub_ruleset",
+      "short_summary_scrub_version",
+      "short_summary_source",
+      "short_summary_generated_at",
+    ])
+      expect(tombstone?.[column]).toBeNull();
     expect(tombstone?.search_text).toBe("");
     // A direct insert of a tombstone that carries a summary is also cleared.
     await db.query(
@@ -729,16 +1142,34 @@ describe("short_summary deletion propagation", () => {
 
   test("erasure deletes the row, the summary and its memberships", async () => {
     const db = await database();
-    for (const [workspace, session] of [["ws-a", "s-1"], ["ws-a", "s-2"], ["ws-keep", "s-3"]]) {
+    for (const [workspace, session] of [
+      ["ws-a", "s-1"],
+      ["ws-a", "s-2"],
+      ["ws-keep", "s-3"],
+    ]) {
       await insertRow(db, "org-a", workspace!, session!);
-      await summarize(db, { orgId: "org-a", workspaceId: workspace!, harness: "codex", sessionId: session! },
-        `ibis summary ${session}`);
+      await summarize(
+        db,
+        {
+          orgId: "org-a",
+          workspaceId: workspace!,
+          harness: "codex",
+          sessionId: session!,
+        },
+        `ibis summary ${session}`,
+      );
     }
-    await db.exec(`INSERT INTO sessions.session_directory_users VALUES ('org-a', 'ws-a', 'codex', 's-1', 'u1', now())`);
+    await db.exec(
+      `INSERT INTO sessions.session_directory_users VALUES ('org-a', 'ws-a', 'codex', 's-1', 'u1', now())`,
+    );
     expect(await eraseSessionDirectory(db, KEY)).toBe(1);
     expect(await row(db, "s-1")).toBeUndefined();
-    expect((await db.query("SELECT 1 FROM sessions.session_directory_users")).rows).toEqual([]);
-    expect(await eraseSessionDirectory(db, { orgId: "org-a", workspaceId: "ws-a" })).toBe(1);
+    expect(
+      (await db.query("SELECT 1 FROM sessions.session_directory_users")).rows,
+    ).toEqual([]);
+    expect(
+      await eraseSessionDirectory(db, { orgId: "org-a", workspaceId: "ws-a" }),
+    ).toBe(1);
     const left = await db.query<{ session_id: string }>(
       "SELECT session_id FROM sessions.session_directory WHERE short_summary ILIKE '%ibis%' OR search_text ILIKE '%ibis%'",
     );
@@ -747,46 +1178,157 @@ describe("short_summary deletion propagation", () => {
 });
 
 describe("short_summary end to end through the pipeline", () => {
-  const manifest = (): ManifestV1 => ({
-    schema_v: 1, layout: "v1", trace_id: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18", revision: 1,
-    created_at: "2026-10-29T07:00:00.000Z", updated_at: "2026-10-29T07:00:01.000Z",
-    session: { workspace_id: "ws-e2e", machine_id: "m-1", harness: "codex", session_id: "s-e2e", started_at: "2026-10-29T07:00:00.000Z" },
-    writer: { delivery_instance_id: "m-1", plugin_version: "test" },
-    raw: {
-      owner: "m-1", state: "open", updated_at: "2026-10-29T07:00:01.000Z", format: "jsonl", compression: "zstd",
-      chunk_count: 1, raw_bytes: 12, stored_bytes: 10, content_sha256: "1".repeat(64), epoch: 0,
-      epochs: [{ epoch: 0, opened_at: "2026-10-29T07:00:00.000Z", reason: "initial", first_seq: 0, opened_by: "m-1" }],
-      next_offset: 12,
-      chunks: [{ seq: 0, epoch: 0, start_offset: 0, bytes: 12, stored_bytes: 10, sha256: "2".repeat(64),
-        sha256_8: "22222222", stored_sha256: "3".repeat(64), compression: "zstd" }],
-      scrub: { ruleset: "relayhistory-scrub", version: 1 },
-    },
-    extensions: { "96bulls": { session_uuid: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c19", session_uuid_source: "minted" } },
-  }) as unknown as ManifestV1;
+  const manifest = (): ManifestV1 =>
+    ({
+      schema_v: 1,
+      layout: "v1",
+      trace_id: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      revision: 1,
+      created_at: "2026-10-29T07:00:00.000Z",
+      updated_at: "2026-10-29T07:00:01.000Z",
+      session: {
+        workspace_id: "ws-e2e",
+        machine_id: "m-1",
+        harness: "codex",
+        session_id: "s-e2e",
+        started_at: "2026-10-29T07:00:00.000Z",
+      },
+      writer: { delivery_instance_id: "m-1", plugin_version: "test" },
+      raw: {
+        owner: "m-1",
+        state: "open",
+        updated_at: "2026-10-29T07:00:01.000Z",
+        format: "jsonl",
+        compression: "zstd",
+        chunk_count: 1,
+        raw_bytes: 12,
+        stored_bytes: 10,
+        content_sha256: "1".repeat(64),
+        epoch: 0,
+        epochs: [
+          {
+            epoch: 0,
+            opened_at: "2026-10-29T07:00:00.000Z",
+            reason: "initial",
+            first_seq: 0,
+            opened_by: "m-1",
+          },
+        ],
+        next_offset: 12,
+        chunks: [
+          {
+            seq: 0,
+            epoch: 0,
+            start_offset: 0,
+            bytes: 12,
+            stored_bytes: 10,
+            sha256: "2".repeat(64),
+            sha256_8: "22222222",
+            stored_sha256: "3".repeat(64),
+            compression: "zstd",
+          },
+        ],
+        scrub: { ruleset: "relayhistory-scrub", version: 1 },
+      },
+      extensions: {
+        "96bulls": {
+          session_uuid: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c19",
+          session_uuid_source: "minted",
+        },
+      },
+    }) as unknown as ManifestV1;
 
   async function pipeline() {
     const db = await hoopDatabase();
-    const q = async (text: string, params?: unknown[]) => ({ rows: (await db.query(text, params as never)).rows as never[] });
-    const hoop = { query: q, pool: { connect: async () => ({ query: q, release() {} }) }, end: async () => {} } as unknown as HoopDb;
+    const q = async (text: string, params?: unknown[]) => ({
+      rows: (await db.query(text, params as never)).rows as never[],
+    });
+    const hoop = {
+      query: q,
+      pool: { connect: async () => ({ query: q, release() {} }) },
+      end: async () => {},
+    } as unknown as HoopDb;
     const m = manifest();
     // A second machine of the same logical session has its own manifest and uuid.
-    const m2 = { ...m, session: { ...m.session, machine_id: "m-2" },
-      extensions: { "96bulls": { session_uuid: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c1a", session_uuid_source: "minted" } } } as unknown as ManifestV1;
-    const reader = { provider: "fs", bucket: "locker",
-      read: async (key: string) => ({ manifest: key.includes("/m=m-2/") ? m2 : m, etag: "e1" }) } as never;
-    const pointer = { traceId: m.trace_id, workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e",
-      manifestKey: "v1/ws=ws-e2e/m=m-1/h=codex/d=2026/10/29/s=s-e2e/manifest.json", provider: "fs", bucket: "locker" };
-    const ctx = { traceId: m.trace_id, orgId: "org-a", workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e" };
+    const m2 = {
+      ...m,
+      session: { ...m.session, machine_id: "m-2" },
+      extensions: {
+        "96bulls": {
+          session_uuid: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c1a",
+          session_uuid_source: "minted",
+        },
+      },
+    } as unknown as ManifestV1;
+    const reader = {
+      provider: "fs",
+      bucket: "locker",
+      read: async (key: string) => ({
+        manifest: key.includes("/m=m-2/") ? m2 : m,
+        etag: "e1",
+      }),
+    } as never;
+    const pointer = {
+      traceId: m.trace_id,
+      workspaceId: "ws-e2e",
+      machineId: "m-1",
+      harness: "codex",
+      sessionId: "s-e2e",
+      manifestKey:
+        "v1/ws=ws-e2e/m=m-1/h=codex/d=2026/10/29/s=s-e2e/manifest.json",
+      provider: "fs",
+      bucket: "locker",
+    };
+    const ctx = {
+      traceId: m.trace_id,
+      orgId: "org-a",
+      workspaceId: "ws-e2e",
+      machineId: "m-1",
+      harness: "codex",
+      sessionId: "s-e2e",
+    };
     const sent: unknown[] = [];
     const index = hoopDbSessionIndex({
-      db: hoop, reader, queue: { backend: "memory", send: async (msg: unknown) => { sent.push(msg); }, sendBatch: async () => {} } as never,
+      db: hoop,
+      reader,
+      queue: {
+        backend: "memory",
+        send: async (msg: unknown) => {
+          sent.push(msg);
+        },
+        sendBatch: async () => {},
+      } as never,
       current: () => undefined,
     });
-    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "g6-e2e-")) });
-    const line = JSON.stringify({ type: "user", message: { role: "user", content: `Fix the pelican ledger; token ${FAKE_RELAY_TOKEN}` } });
-    await store.put(rawChunkKey({ workspaceId: "ws-e2e", machineId: "m-1", harness: "codex", sessionId: "s-e2e", startDate: "2026-10-29" },
-      0, 0, "22222222", "jsonl"), zstdCompressSync(Buffer.from(`${line}\n`)));
-    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    const store = createFsStore({
+      root: mkdtempSync(join(tmpdir(), "g6-e2e-")),
+    });
+    const line = JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: `Fix the pelican ledger; token ${FAKE_RELAY_TOKEN}`,
+      },
+    });
+    await store.put(
+      rawChunkKey(
+        {
+          workspaceId: "ws-e2e",
+          machineId: "m-1",
+          harness: "codex",
+          sessionId: "s-e2e",
+          startDate: "2026-10-29",
+        },
+        0,
+        0,
+        "22222222",
+        "jsonl",
+      ),
+      zstdCompressSync(Buffer.from(`${line}\n`)),
+    );
+    const keyring = await masterKeyring(
+      parseMasterKeys(`k1:${"a".repeat(64)}`),
+    );
     const summaryShort = (
       directory?: Parameters<typeof bobCostasHandler>[1]["directory"],
       storeOverride?: typeof store,
@@ -794,11 +1336,27 @@ describe("short_summary end to end through the pipeline", () => {
       summarizerOverride?: typeof extractiveSummarizer,
     ) =>
       bobCostasHandler("short", {
-        db: hoop, reader, store: storeOverride ?? store, summarizer: summarizerOverride ?? extractiveSummarizer,
-        keyring: keyringOverride ?? keyring, ...(directory ? { directory } : {}),
+        db: hoop,
+        reader,
+        store: storeOverride ?? store,
+        summarizer: summarizerOverride ?? extractiveSummarizer,
+        keyring: keyringOverride ?? keyring,
+        ...(directory ? { directory } : {}),
       })(
-        { payload: pointer, ctx: { orgId: "org-a" } } as never, { log: { info() {} } } as never);
-    return { db, hoop, index, pointer, ctx, sent, summaryShort, store, keyring };
+        { payload: pointer, ctx: { orgId: "org-a" } } as never,
+        { log: { info() {} } } as never,
+      );
+    return {
+      db,
+      hoop,
+      index,
+      pointer,
+      ctx,
+      sent,
+      summaryShort,
+      store,
+      keyring,
+    };
   }
 
   test("indexer projects the row, Bob Costas writes the scrubbed summary, the RPC is tenant-bound, deletion clears it", async () => {
@@ -812,7 +1370,16 @@ describe("short_summary end to end through the pipeline", () => {
     expect(sent.length).toBeGreaterThan(0);
     // The same workspace and session ids under another org, to prove the org boundary.
     await insertRow(db, "org-b", "ws-e2e", "s-e2e-b");
-    await summarize(db, { orgId: "org-b", workspaceId: "ws-e2e", harness: "codex", sessionId: "s-e2e-b" }, "pelican ledger for org b");
+    await summarize(
+      db,
+      {
+        orgId: "org-b",
+        workspaceId: "ws-e2e",
+        harness: "codex",
+        sessionId: "s-e2e-b",
+      },
+      "pelican ledger for org b",
+    );
 
     // 2. Bob Costas short summary over the scrubbed raw: the real production callsite.
     await summaryShort();
@@ -826,23 +1393,46 @@ describe("short_summary end to end through the pipeline", () => {
     expect(current?.short_summary_source).toBe("bob-costas/extractive/v1");
 
     // 3. The Worker RPC: tenant A finds it; tenant B (same workspace id) sees only its own.
-    const hitsA = await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger");
-    expect(hitsA.map((hit) => [hit.org_id, hit.session_id])).toEqual([["org-a", "s-e2e"]]);
-    const hitsB = await search(db, claims("org-b", ["ws-e2e"]), "ws-e2e", "pelican ledger");
-    expect(hitsB.map((hit) => [hit.org_id, hit.session_id])).toEqual([["org-b", "s-e2e-b"]]);
+    const hitsA = await search(
+      db,
+      claims("org-a", ["ws-e2e"]),
+      "ws-e2e",
+      "pelican ledger",
+    );
+    expect(hitsA.map((hit) => [hit.org_id, hit.session_id])).toEqual([
+      ["org-a", "s-e2e"],
+    ]);
+    const hitsB = await search(
+      db,
+      claims("org-b", ["ws-e2e"]),
+      "ws-e2e",
+      "pelican ledger",
+    );
+    expect(hitsB.map((hit) => [hit.org_id, hit.session_id])).toEqual([
+      ["org-b", "s-e2e-b"],
+    ]);
 
     // 4. A re-index of the same manifest keeps the summary in search_text.
     await index.upsertRawPointer(pointer as never, ctx as never);
-    expect(String((await row(db, "s-e2e"))?.search_text)).toContain("pelican ledger");
+    expect(String((await row(db, "s-e2e"))?.search_text)).toContain(
+      "pelican ledger",
+    );
 
     // 5. Deletion through the indexer clears it end to end.
-    await index.upsertRawPointer({ ...pointer, deleted: true } as never, ctx as never);
+    await index.upsertRawPointer(
+      { ...pointer, deleted: true } as never,
+      ctx as never,
+    );
     current = await row(db, "s-e2e");
     expect(current?.deleted_at).not.toBeNull();
     expect(current?.short_summary).toBeNull();
     expect(current?.search_text).toBe("");
-    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
-    // A later manifest for the deleted session does not resurrect the row.
+    expect(
+      await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger"),
+    ).toEqual([]);
+    // Re-sending the same manifest revision is fenced by upsert_session_index, so the
+    // pointer stays tombstoned and the row is not resurrected (only a later live pointer
+    // resurrects; see session-directory-precedence.test.ts).
     await index.upsertRawPointer(pointer as never, ctx as never);
     expect((await row(db, "s-e2e"))?.deleted_at).not.toBeNull();
   }, 60_000);
@@ -850,27 +1440,44 @@ describe("short_summary end to end through the pipeline", () => {
   test("deleting every pointer tombstones the row, deletes memberships, and the RPC returns nothing", async () => {
     const { db, index, pointer, ctx, summaryShort } = await pipeline();
     await index.upsertRawPointer(pointer as never, ctx as never);
-    const second = { ...pointer, machineId: "m-2", manifestKey: pointer.manifestKey.replace("/m=m-1/", "/m=m-2/") };
-    await index.upsertRawPointer(second as never, { ...ctx, machineId: "m-2" } as never);
+    const second = {
+      ...pointer,
+      machineId: "m-2",
+      manifestKey: pointer.manifestKey.replace("/m=m-1/", "/m=m-2/"),
+    };
+    await index.upsertRawPointer(
+      second as never,
+      { ...ctx, machineId: "m-2" } as never,
+    );
     await summaryShort();
     let current = await row(db, "s-e2e");
     expect(current?.machine_ids).toEqual(["m-1", "m-2"]);
     expect(String(current?.short_summary)).toContain("pelican ledger");
-    const members = async () => (await db.query(
-      `SELECT 'u' FROM sessions.session_directory_users WHERE session_id = 's-e2e'
-       UNION ALL SELECT 'm' FROM sessions.session_directory_machines WHERE session_id = 's-e2e'`)).rows.length;
+    const members = async () =>
+      (
+        await db.query(
+          `SELECT 'u' FROM sessions.session_directory_users WHERE session_id = 's-e2e'
+       UNION ALL SELECT 'm' FROM sessions.session_directory_machines WHERE session_id = 's-e2e'`,
+        )
+      ).rows.length;
     expect(await members()).toBe(3); // one user ("unknown"), two machines
     const a = claims("org-a", ["ws-e2e"]);
     expect(await search(db, a, "ws-e2e", "pelican")).toHaveLength(1);
 
-    await index.upsertRawPointer({ ...pointer, deleted: true } as never, ctx as never);
+    await index.upsertRawPointer(
+      { ...pointer, deleted: true } as never,
+      ctx as never,
+    );
     current = await row(db, "s-e2e");
     expect(current?.deleted_at).toBeNull();
     expect(current?.short_summary).toBeNull();
     expect(current?.machine_ids).toEqual(["m-2"]);
     expect(await search(db, a, "ws-e2e", "pelican")).toEqual([]);
 
-    await index.upsertRawPointer({ ...second, deleted: true } as never, { ...ctx, machineId: "m-2" } as never);
+    await index.upsertRawPointer(
+      { ...second, deleted: true } as never,
+      { ...ctx, machineId: "m-2" } as never,
+    );
     current = await row(db, "s-e2e");
     expect(current?.deleted_at).not.toBeNull();
     expect(current?.short_summary).toBeNull();
@@ -878,12 +1485,19 @@ describe("short_summary end to end through the pipeline", () => {
     expect(current?.machine_ids).toEqual([]);
     expect(current?.user_ids).toEqual([]);
     expect(await members()).toBe(0);
-    for (const term of ["pelican", "ledger", "codex", "s-e2e"]) expect(await search(db, a, "ws-e2e", term)).toEqual([]);
+    for (const term of ["pelican", "ledger", "codex", "s-e2e"])
+      expect(await search(db, a, "ws-e2e", term)).toEqual([]);
 
     // The projector alone also tombstones when no live pointer remains.
     await insertRow(db, "org-a", "ws-e2e", "s-orphan");
-    expect(await projectSessionDirectory(db, { orgId: "org-a", workspaceId: "ws-e2e", harness: "codex", sessionId: "s-orphan" }))
-      .toEqual({ projected: false, tombstoned: true });
+    expect(
+      await projectSessionDirectory(db, {
+        orgId: "org-a",
+        workspaceId: "ws-e2e",
+        harness: "codex",
+        sessionId: "s-orphan",
+      }),
+    ).toEqual({ projected: false, tombstoned: true });
     expect((await row(db, "s-orphan"))?.deleted_at).not.toBeNull();
     expect(await search(db, a, "ws-e2e", "flaky")).toEqual([]);
   }, 60_000);
@@ -892,47 +1506,83 @@ describe("short_summary end to end through the pipeline", () => {
     const { db, index, pointer, ctx, summaryShort } = await pipeline();
     await index.upsertRawPointer(pointer as never, ctx as never);
     const failing = {
-      write: async () => { throw new Error("directory unavailable"); },
+      write: async () => {
+        throw new Error("directory unavailable");
+      },
       clear: async () => false,
     };
     // First run publishes the encrypted object and pointer, then fails on the directory.
-    await expect(summaryShort(failing)).rejects.toThrow("directory unavailable");
+    await expect(summaryShort(failing)).rejects.toThrow(
+      "directory unavailable",
+    );
     expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
-    const pointers = await db.query("SELECT status FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'");
+    const pointers = await db.query(
+      "SELECT status FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'",
+    );
     expect(pointers.rows).toEqual([{ status: "ready" }]);
 
     // The retry sees a current summary and reconciles the directory from the object.
-    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(await summaryShort()).toEqual({
+      status: "skipped",
+      reason: "summary_current",
+    });
     const first = await row(db, "s-e2e");
     expect(String(first?.short_summary)).toContain("pelican ledger");
     expect(String(first?.short_summary)).not.toContain(FAKE_RELAY_TOKEN);
     expect(String(first?.search_text)).toContain("pelican ledger");
 
     // Further reruns change nothing.
-    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(await summaryShort()).toEqual({
+      status: "skipped",
+      reason: "summary_current",
+    });
     const again = await row(db, "s-e2e");
     expect(again?.short_summary).toBe(first?.short_summary);
-    expect(again?.short_summary_generated_at).toEqual(first?.short_summary_generated_at);
-    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toHaveLength(1);
+    expect(again?.short_summary_generated_at).toEqual(
+      first?.short_summary_generated_at,
+    );
+    expect(
+      await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger"),
+    ).toHaveLength(1);
   }, 60_000);
 
   test("a retry replaces an older revision's summary left behind by a failed directory write", async () => {
     const { db, index, pointer, ctx, summaryShort } = await pipeline();
     await index.upsertRawPointer(pointer as never, ctx as never);
-    const key = { orgId: "org-a", workspaceId: "ws-e2e", harness: "codex", sessionId: "s-e2e" };
+    const key = {
+      orgId: "org-a",
+      workspaceId: "ws-e2e",
+      harness: "codex",
+      sessionId: "s-e2e",
+    };
     // Revision N-1's summary is in the directory.
     const older = new Date("2026-10-01T00:00:00Z");
-    await writeShortSummary(db, { ...key, summary: "Stale osprey notes from an older revision", source: "bob-costas/extractive/v0", generatedAt: older });
+    await writeShortSummary(db, {
+      ...key,
+      summary: "Stale osprey notes from an older revision",
+      source: "bob-costas/extractive/v0",
+      generatedAt: older,
+    });
     const a = claims("org-a", ["ws-e2e"]);
     expect(await search(db, a, "ws-e2e", "osprey")).toHaveLength(1);
 
     // Revision N's object and pointer are published, then the directory write fails.
-    const failing = { write: async () => { throw new Error("directory unavailable"); }, clear: async () => false };
-    await expect(summaryShort(failing)).rejects.toThrow("directory unavailable");
+    const failing = {
+      write: async () => {
+        throw new Error("directory unavailable");
+      },
+      clear: async () => false,
+    };
+    await expect(summaryShort(failing)).rejects.toThrow(
+      "directory unavailable",
+    );
     expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("osprey");
 
     // The retry finds the summary current but the row holds the old text: it republishes.
-    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(await summaryShort()).toEqual({
+      status: "skipped",
+      reason: "summary_current",
+    });
     const fixed = await row(db, "s-e2e");
     expect(String(fixed?.short_summary)).toContain("pelican ledger");
     expect(String(fixed?.short_summary)).not.toContain("osprey");
@@ -941,15 +1591,22 @@ describe("short_summary end to end through the pipeline", () => {
     expect(fixed?.short_summary_source).toBe("bob-costas/extractive/v1");
     expect(fixed?.short_summary_scrub_ruleset).toBe(SCRUB_RULESET);
     expect(fixed?.short_summary_scrub_version).toBe(SCRUB_RULESET_VERSION);
-    expect((fixed?.short_summary_generated_at as Date).getTime()).toBeGreaterThan(older.getTime());
+    expect(
+      (fixed?.short_summary_generated_at as Date).getTime(),
+    ).toBeGreaterThan(older.getTime());
     expect(await search(db, a, "ws-e2e", "osprey")).toEqual([]);
     expect(await search(db, a, "ws-e2e", "pelican ledger")).toHaveLength(1);
 
     // A further retry changes nothing.
-    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(await summaryShort()).toEqual({
+      status: "skipped",
+      reason: "summary_current",
+    });
     const again = await row(db, "s-e2e");
     expect(again?.short_summary).toBe(fixed?.short_summary);
-    expect(again?.short_summary_generated_at).toEqual(fixed?.short_summary_generated_at);
+    expect(again?.short_summary_generated_at).toEqual(
+      fixed?.short_summary_generated_at,
+    );
     expect(again?.search_text).toBe(fixed?.search_text);
   }, 60_000);
 
@@ -957,53 +1614,97 @@ describe("short_summary end to end through the pipeline", () => {
     const { db, index, pointer, ctx, summaryShort, store } = await pipeline();
     await index.upsertRawPointer(pointer as never, ctx as never);
     await summaryShort();
-    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
-    const published = (await db.query<{ object_key: string }>(
-      "SELECT object_key FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'")).rows[0]!;
-    await store.put(objectKey(published.object_key), new TextEncoder().encode("not an envelope"));
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain(
+      "pelican ledger",
+    );
+    const published = (
+      await db.query<{ object_key: string }>(
+        "SELECT object_key FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'",
+      )
+    ).rows[0]!;
+    await store.put(
+      objectKey(published.object_key),
+      new TextEncoder().encode("not an envelope"),
+    );
 
-    const error = await summaryShort().then(() => null, (caught: unknown) => caught) as { code?: string; retryable?: boolean } | null;
+    const error = (await summaryShort().then(
+      () => null,
+      (caught: unknown) => caught,
+    )) as { code?: string; retryable?: boolean } | null;
     expect(error?.code).toBe("summary_object_integrity");
     expect(error?.retryable).toBe(false);
     expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
-    expect(String((await row(db, "s-e2e"))?.search_text)).not.toContain("pelican");
-    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
+    expect(String((await row(db, "s-e2e"))?.search_text)).not.toContain(
+      "pelican",
+    );
+    expect(
+      await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger"),
+    ).toEqual([]);
   }, 60_000);
 
   test("a store error on the retry read clears the directory summary, then rethrows it", async () => {
     const { db, index, pointer, ctx, summaryShort, store } = await pipeline();
     await index.upsertRawPointer(pointer as never, ctx as never);
     await summaryShort();
-    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain(
+      "pelican ledger",
+    );
     const down = new Error("store unavailable");
     const failingStore = new Proxy(store, {
       get(target, prop, receiver) {
-        if (prop === "getObject") return async () => { throw down; };
+        if (prop === "getObject")
+          return async () => {
+            throw down;
+          };
         return Reflect.get(target, prop, receiver);
       },
     });
-    const error = await summaryShort(undefined, failingStore).then(() => null, (caught: unknown) => caught) as
-      { code?: string; retryable?: boolean; message?: string } | null;
+    const error = (await summaryShort(undefined, failingStore).then(
+      () => null,
+      (caught: unknown) => caught,
+    )) as { code?: string; retryable?: boolean; message?: string } | null;
     // readSummaryObject wraps the store failure as the retryable summary_store_unavailable.
     expect(error?.code).toBe("summary_store_unavailable");
     expect(error?.retryable).toBe(true);
     expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
-    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
+    expect(
+      await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger"),
+    ).toEqual([]);
     // Once the store is back, the retry republishes.
-    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
-    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+    expect(await summaryShort()).toEqual({
+      status: "skipped",
+      reason: "summary_current",
+    });
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain(
+      "pelican ledger",
+    );
   }, 60_000);
 
   test("Bob Costas: a rejected new summary clears the older searchable one", async () => {
     const { db, index, pointer, ctx, summaryShort } = await pipeline();
     await index.upsertRawPointer(pointer as never, ctx as never);
-    const key = { orgId: "org-a", workspaceId: "ws-e2e", harness: "codex", sessionId: "s-e2e" };
-    await writeShortSummary(db, { ...key, summary: "Stale osprey notes", source: "bob-costas/extractive/v0", generatedAt: new Date("2026-10-01T00:00:00Z") });
+    const key = {
+      orgId: "org-a",
+      workspaceId: "ws-e2e",
+      harness: "codex",
+      sessionId: "s-e2e",
+    };
+    await writeShortSummary(db, {
+      ...key,
+      summary: "Stale osprey notes",
+      source: "bob-costas/extractive/v0",
+      generatedAt: new Date("2026-10-01T00:00:00Z"),
+    });
     const a = claims("org-a", ["ws-e2e"]);
     expect(await search(db, a, "ws-e2e", "osprey")).toHaveLength(1);
     const overLong = {
       ...extractiveSummarizer,
-      summarize: async () => ({ text: "z".repeat(SHORT_SUMMARY_MAX_CHARS + 1), modelId: "extractive/v1", tokensIn: 0, tokensOut: 0 }),
+      summarize: async () => ({
+        text: "z".repeat(SHORT_SUMMARY_MAX_CHARS + 1),
+        modelId: "extractive/v1",
+        tokensIn: 0,
+        tokensOut: 0,
+      }),
     } as typeof extractiveSummarizer;
     // The refusal is logged by reason and the stage completes (the encrypted object is published).
     await summaryShort(undefined, undefined, undefined, overLong);
@@ -1033,15 +1734,29 @@ describe("short_summary end to end through the pipeline", () => {
     const { db, index, pointer, ctx, summaryShort, store } = await pipeline();
     await index.upsertRawPointer(pointer as never, ctx as never);
     await summaryShort();
-    const { object_key } = (await db.query<{ object_key: string }>(
-      "SELECT object_key FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'")).rows[0]!;
-    await store.put(objectKey(object_key), new TextEncoder().encode("not an envelope"));
+    const { object_key } = (
+      await db.query<{ object_key: string }>(
+        "SELECT object_key FROM sessions.session_summaries WHERE session_id = 's-e2e' AND kind = 'short'",
+      )
+    ).rows[0]!;
+    await store.put(
+      objectKey(object_key),
+      new TextEncoder().encode("not an envelope"),
+    );
     const lines = await stderrLines(() => summaryShort());
-    const line = lines.map((l) => JSON.parse(l) as Record<string, unknown>)
+    const line = lines
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
       .find((entry) => entry.error_code === "summary_object_integrity");
     expect(line).toMatchObject({
-      level: "warn", stage: "summary-short", retryable: false,
-      org_id: "org-a", workspace_id: "ws-e2e", harness: "codex", session_id: "s-e2e", machine_id: "m-1", revision: 1,
+      level: "warn",
+      stage: "summary-short",
+      retryable: false,
+      org_id: "org-a",
+      workspace_id: "ws-e2e",
+      harness: "codex",
+      session_id: "s-e2e",
+      machine_id: "m-1",
+      revision: 1,
       key_sha256: createHash("sha256").update(object_key).digest("hex"),
     });
     // The path itself is never logged.
@@ -1052,19 +1767,30 @@ describe("short_summary end to end through the pipeline", () => {
     const { db, index, pointer, ctx, summaryShort, keyring } = await pipeline();
     await index.upsertRawPointer(pointer as never, ctx as never);
     await summaryShort();
-    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain(
+      "pelican ledger",
+    );
     // The pointer still names hkdf1:k1 as current, but this deployment no longer holds k1
     // for decryption: keyById comes from the real keyring implementation, built without it.
-    const retiredOnly = await masterKeyring(parseMasterKeys(`k2:${"b".repeat(64)}`));
-    const rotatedAway = { currentKey: keyring.currentKey, keyById: retiredOnly.keyById } as typeof keyring;
+    const retiredOnly = await masterKeyring(
+      parseMasterKeys(`k2:${"b".repeat(64)}`),
+    );
+    const rotatedAway = {
+      currentKey: keyring.currentKey,
+      keyById: retiredOnly.keyById,
+    } as typeof keyring;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const error = await summaryShort(undefined, undefined, rotatedAway).then(() => null, (caught: unknown) => caught) as
-        { code?: string; retryable?: boolean } | null;
+      const error = (await summaryShort(undefined, undefined, rotatedAway).then(
+        () => null,
+        (caught: unknown) => caught,
+      )) as { code?: string; retryable?: boolean } | null;
       expect(error?.code).toBe("keyring_unknown_key");
       expect(error?.retryable).toBe(false);
     }
     expect((await row(db, "s-e2e"))?.short_summary).toBeNull();
-    expect(await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger")).toEqual([]);
+    expect(
+      await search(db, claims("org-a", ["ws-e2e"]), "ws-e2e", "pelican ledger"),
+    ).toEqual([]);
   }, 60_000);
 
   test("a failing clear after a read failure does not mask the original error", async () => {
@@ -1073,28 +1799,46 @@ describe("short_summary end to end through the pipeline", () => {
     await summaryShort();
     const failingStore = new Proxy(store, {
       get(target, prop, receiver) {
-        if (prop === "getObject") return async () => { throw new Error("store unavailable"); };
+        if (prop === "getObject")
+          return async () => {
+            throw new Error("store unavailable");
+          };
         return Reflect.get(target, prop, receiver);
       },
     });
     const brokenDirectory = {
       write: async () => ({ written: false }),
-      clear: async () => { throw new Error("directory clear failed"); },
+      clear: async () => {
+        throw new Error("directory clear failed");
+      },
     };
-    let error: { code?: string; retryable?: boolean; message?: string } | null = null;
+    let error: { code?: string; retryable?: boolean; message?: string } | null =
+      null;
     const lines = await stderrLines(async () => {
-      error = await summaryShort(brokenDirectory, failingStore).then(() => null, (caught: unknown) => caught) as never;
+      error = (await summaryShort(brokenDirectory, failingStore).then(
+        () => null,
+        (caught: unknown) => caught,
+      )) as never;
     });
     expect(error!.code).toBe("summary_store_unavailable");
     expect(error!.retryable).toBe(true);
     const entries = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
-    const readFailed = entries.findIndex((entry) => entry.error_code === "summary_store_unavailable");
-    const clearFailed = entries.findIndex((entry) => entry.error_code === "summary_directory_clear_failed");
+    const readFailed = entries.findIndex(
+      (entry) => entry.error_code === "summary_store_unavailable",
+    );
+    const clearFailed = entries.findIndex(
+      (entry) => entry.error_code === "summary_directory_clear_failed",
+    );
     expect(readFailed).toBeGreaterThanOrEqual(0);
     expect(clearFailed).toBeGreaterThan(readFailed);
     // The directory was not cleared (its clear failed), and the retry still repairs it.
-    expect(await summaryShort()).toEqual({ status: "skipped", reason: "summary_current" });
-    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain("pelican ledger");
+    expect(await summaryShort()).toEqual({
+      status: "skipped",
+      reason: "summary_current",
+    });
+    expect(String((await row(db, "s-e2e"))?.short_summary)).toContain(
+      "pelican ledger",
+    );
   }, 60_000);
 });
 
@@ -1103,6 +1847,8 @@ describe("short_summary rollback", () => {
     const db = await database();
     await insertRow(db);
     await summarize(db, KEY, "pelican rollback check");
+    // Reverse migration order: the expand phase depends on G6's role.
+    await db.exec(EXPAND_DOWN);
     await db.exec(DOWN);
     const columns = await db.query(
       `SELECT column_name FROM information_schema.columns
@@ -1118,13 +1864,23 @@ describe("short_summary rollback", () => {
       [WORKER],
     );
     expect(objects.rows).toEqual([]);
-    expect((await db.query("SELECT 1 FROM pg_class WHERE relname = 'session_directory_metadata_trgm_idx'")).rows)
-      .toHaveLength(1);
-    expect((await row(db))?.search_text).toBe("Fix flaky queue test Helm proj-1");
+    expect(
+      (
+        await db.query(
+          "SELECT 1 FROM pg_class WHERE relname = 'session_directory_metadata_trgm_idx'",
+        )
+      ).rows,
+    ).toHaveLength(1);
+    expect((await row(db))?.search_text).toBe(
+      "Fix flaky queue test Helm proj-1",
+    );
 
     await db.exec(UP);
+    await db.exec(EXPAND_UP);
     await summarize(db, KEY, "pelican again");
     expect((await row(db))?.short_summary).toBe("pelican again");
-    expect(await search(db, claims("org-a", ["ws-a"]), "ws-a", "pelican")).toHaveLength(1);
+    expect(
+      await search(db, claims("org-a", ["ws-a"]), "ws-a", "pelican"),
+    ).toHaveLength(1);
   });
 });

@@ -295,7 +295,7 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     p_machine_id: "text: machine membership",
     p_since: "timestamptz: last_activity_at >= since",
     p_until:
-      "timestamptz: created_at <= until (activity interval overlaps the window)",
+      "timestamptz: last_activity_at <= until (inclusive; the legacy direct-list filter)",
     p_session_id: "text: exact session id",
     p_cursor_last_activity_at: "timestamptz",
     p_cursor_session_id: "text",
@@ -366,6 +366,52 @@ export const SESSION_DIRECTORY_SEARCH_RPC = {
     "p_no_project with p_project_id or p_project_contains",
     "p_since later than p_until",
   ],
+} as const;
+
+/**
+ * Expand-phase replacements for RelayHistory #226's remaining direct reads
+ * (20261031001000_session_directory_reads_expand.sql). Same rules as the search RPC:
+ * SECURITY DEFINER, pinned search_path, fixed SQL, Worker role only, tenant from the
+ * signed claims (42501 otherwise). The direct grants they replace are revoked only in a
+ * later, separate contract step.
+ */
+export const SESSION_DIRECTORY_POINTERS_RPC = {
+  name: "sessions.session_directory_pointers",
+  args: {
+    p_workspace_id: "text (must be claimed)",
+    p_harness: "text",
+    p_session_id: "text",
+  },
+  /** Exactly RelayHistory #226's POINTER_COLUMNS. */
+  returns: [
+    "org_id",
+    "workspace_id",
+    "harness",
+    "session_id",
+    "machine_id",
+    "user_id",
+    "storage_provider",
+    "bucket",
+    "manifest_key",
+    "content_sha256",
+    "raw_format",
+    "revision",
+    "deleted_at",
+  ],
+  order: "machine_id",
+  maxRows: 64,
+  errors: {
+    "42501":
+      "not the Worker role, or claims missing/invalid/not covering the workspace",
+    "22023": "missing workspace, invalid harness or session id",
+  },
+} as const;
+
+export const SESSION_DIRECTORY_READINESS_RPC = {
+  name: "sessions.session_directory_readiness",
+  args: {},
+  returns: ["completed_at"],
+  errors: { "42501": "not the Worker role, or claims missing/invalid" },
 } as const;
 
 /**

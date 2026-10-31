@@ -212,7 +212,7 @@ function oracle(
       (req.since === undefined ||
         r.last_activity_at.getTime() >= Date.parse(req.since)) &&
       (req.until === undefined ||
-        r.created_at.getTime() <= Date.parse(req.until)) &&
+        r.last_activity_at.getTime() <= Date.parse(req.until)) &&
       (req.sessionId === undefined || r.session_id === req.sessionId) &&
       (req.userId === undefined || r.users.includes(req.userId)) &&
       (req.machineId === undefined || r.machines.includes(req.machineId)),
@@ -1075,4 +1075,130 @@ describe("search RPC plans as the Worker identity (PGlite, 30,000 rows)", () => 
         expect(examined / rows.length).toBeLessThanOrEqual(100);
     });
   }
+});
+
+describe("p_until keeps the legacy direct-list semantics", () => {
+  // The legacy filter is #226's PostgREST `last_activity_at=lte.<until>`, i.e.
+  // `last_activity_at <= until::timestamptz`: inclusive, on last_activity_at.
+  let u: PGlite;
+  const T0 = "2026-09-10 12:00:00+00";
+  const ROWS: Array<[string, string, string]> = [
+    // [session, created_at, last_activity_at]
+    ["at-until", "2026-09-10 11:00:00+00", "2026-09-10 12:00:00+00"],
+    [
+      "one-microsecond-after",
+      "2026-09-10 11:00:00+00",
+      "2026-09-10 12:00:00.000001+00",
+    ],
+    [
+      "one-microsecond-before",
+      "2026-09-10 11:00:00+00",
+      "2026-09-10 11:59:59.999999+00",
+    ],
+    [
+      "created-before-active-after",
+      "2026-09-10 10:00:00+00",
+      "2026-09-10 13:00:00+00",
+    ],
+    ["long-before", "2026-09-01 00:00:00+00", "2026-09-02 00:00:00+00"],
+  ];
+  beforeAll(async () => {
+    u = await database();
+    for (const [session, created, last] of ROWS) {
+      await u.query(
+        `INSERT INTO sessions.session_directory
+           (org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, search_text)
+         VALUES ('org-u', 'ws-u', 'codex', $1, $2::timestamptz, $3::timestamptz, 'Session', 'Session')`,
+        [session, created, last],
+      );
+    }
+  }, 60_000);
+  afterAll(async () => {
+    await u?.close();
+  });
+
+  const legacy = async (until: string) =>
+    (
+      await u.query<{ session_id: string }>(
+        `SELECT session_id FROM sessions.session_directory
+          WHERE org_id = 'org-u' AND workspace_id = 'ws-u' AND deleted_at IS NULL
+            AND last_activity_at <= $1::timestamptz`,
+        [until],
+      )
+    ).rows
+      .map((r) => r.session_id)
+      .sort();
+  const viaRpc = async (until: string) =>
+    (
+      await rpc(u, claimsFor("org-u", ["ws-u"]), {
+        p_workspace_id: "ws-u",
+        p_until: until,
+      })
+    )
+      .map((r) => String(r.session_id))
+      .sort();
+
+  test("inclusive, on last_activity_at, at microsecond precision", async () => {
+    const expected = ["at-until", "long-before", "one-microsecond-before"];
+    expect(await legacy(T0)).toEqual(expected);
+    expect(await viaRpc(T0)).toEqual(expected);
+    // A row created before until but last active after it is excluded: the column
+    // is last_activity_at, not created_at.
+    expect(await viaRpc(T0)).not.toContain("created-before-active-after");
+    // Moving until by one microsecond moves exactly the boundary row.
+    for (const until of [
+      "2026-09-10 12:00:00.000001+00",
+      "2026-09-10 11:59:59.999999+00",
+    ]) {
+      expect(await viaRpc(until), until).toEqual(await legacy(until));
+    }
+    expect(await viaRpc("2026-09-10 12:00:00.000001+00")).toContain(
+      "one-microsecond-after",
+    );
+    expect(await viaRpc("2026-09-10 11:59:59.999999+00")).not.toContain(
+      "at-until",
+    );
+  });
+
+  test("the same instant in any UTC offset, or none (session time zone), gives the same rows", async () => {
+    // A no-offset input is read in the session time zone, as PostgREST's would be;
+    // this engine's (and Supabase's) is UTC-equivalent.
+    const offset = (
+      await u.query<{ o: number }>(
+        "SELECT EXTRACT(TIMEZONE FROM now())::int AS o",
+      )
+    ).rows[0]!.o;
+    expect(offset).toBe(0);
+    for (const until of [
+      "2026-09-10T12:00:00Z",
+      "2026-09-10T14:00:00+02:00",
+      "2026-09-10T07:00:00-05:00",
+      "2026-09-10T12:00:00",
+      "2026-09-10T12:00:00.000Z",
+    ]) {
+      expect(await viaRpc(until), until).toEqual(await legacy(until));
+      expect(await viaRpc(until), until).toEqual([
+        "at-until",
+        "long-before",
+        "one-microsecond-before",
+      ]);
+    }
+  });
+
+  test("searchRpcRequest passes until through unchanged and since > until is still refused", async () => {
+    const built = searchRpcRequest({
+      workspaceId: "ws-u",
+      until: "2026-09-10T14:00:00+02:00",
+    });
+    expect(built.ok && built.body.p_until).toBe("2026-09-10T14:00:00+02:00");
+    const error = (await rpc(u, claimsFor("org-u", ["ws-u"]), {
+      p_workspace_id: "ws-u",
+      p_since: "2026-09-10T13:00:00Z",
+      p_until: "2026-09-10T12:00:00Z",
+    }).then(
+      () => null,
+      (c: unknown) => c,
+    )) as { code?: string } | null;
+    expect(error?.code).toBe("22023");
+  });
 });
