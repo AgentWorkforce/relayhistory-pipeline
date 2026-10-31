@@ -25,28 +25,39 @@ identity.
 
 ## Machine claim
 
-**The default requires the claim.** Every live write and status read needs a
-`meta.machineId` matching the key's machine and the writer. **A deployment whose
-couriers have no claim yet must opt in before it takes this release, or its live
-delivery stops with 403.** Opting in takes both:
+**The default requires the claim, and upgrading never turns the window on.**
+Every live write needs a `meta.machineId` matching the key's machine and the
+writer, always. A status read needs it too, unless the legacy window is open.
 
-- `MANIFEST_MACHINE_CLAIM=compat`
-- `MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL=<RFC 3339>`, the sunset
+The window is read-only and version-only: it returns the object version and
+nothing else. No write passes through it, so a courier without a claim cannot
+deliver, window or not. It exists so such a courier can reconcile while it is
+being replaced. While it is open **this system is not machine-bound**.
 
-The window then closes itself at the sunset, and a bad or missing date keeps it
-shut. Unsetting either variable, or setting `required`, is the kill switch. Both
-are read through the ingest's environment.
+Rollout, in order:
 
-While the window is open **this system is not machine-bound**. A claimless read
-gets the object version alone and writes nothing. A claimless write stays
-possible, as it is today. Both are recorded per day, org, surface, caller and
-client version in `sessions.claimless_uses`, and a use that cannot be recorded is
-refused. Check that table is empty before closing the window. The client version
-is self-reported, so treat it as a guide. Takeover and `status?manifest=1` always
-need the claim, so **production rebase and takeover stay blocked until it ships**.
-A mismatched claim is refused whether the window is open or not.
+1. Inventory the affected couriers: every host whose token has no claim.
+2. Enable the window for the affected stage only, with a fixed UTC expiry:
+   `MANIFEST_MACHINE_CLAIM=compat` and
+   `MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL=<RFC 3339 UTC>`. Both are needed. A bad or
+   missing date keeps it shut, and it closes itself at the expiry.
+3. Deploy claim-capable couriers. **Until each one is, its delivery is stopped**:
+   its records wait in its local source and are not lost, but they do not reach
+   the pipeline.
+4. Watch claimless use reach zero in `sessions.claimless_uses`, which records each
+   read by day, org, caller and client version. A read that cannot be recorded
+   is refused.
+5. Unset both variables before the expiry. Unsetting either, or setting
+   `required`, is the kill switch.
 
-After the sunset, delete `claimlessWindowOpen` and its callers rather than
+`client_version` is self-reported. It is for this meter only, and must never
+influence identity, authorization, limits or trust.
+
+Takeover and `status?manifest=1` always need the claim, so **production rebase
+and takeover stay blocked until it ships**. A mismatched claim is refused whether
+the window is open or not.
+
+After the expiry, delete `claimlessWindowOpen` and its callers rather than
 leaving them shut.
 
 The courier gets a claim only through Cloud: set `CLOUD_URL`,

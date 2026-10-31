@@ -106,9 +106,11 @@ interface ManifestRoutesDeps {
   migrationLedger?: MigrationAssertionLedger;
 }
 
-/** One use of the claimless window, by caller and client version. */
+/**
+ * One read through the claimless window. `clientVersion` is what the client
+ * says of itself: it is for the meter, and nothing may branch on it.
+ */
 export interface ClaimlessUse {
-  surface: "status" | "write";
   orgId: string;
   caller: string;
   clientVersion: string;
@@ -116,7 +118,6 @@ export interface ClaimlessUse {
 
 async function auditClaimless(
   deps: ManifestRoutesDeps,
-  surface: ClaimlessUse["surface"],
   auth: Auth,
   manifest: ManifestV1,
   client: string | undefined,
@@ -124,7 +125,6 @@ async function auditClaimless(
   if (!deps.recordClaimless) return false;
   try {
     await deps.recordClaimless({
-      surface,
       orgId: auth.orgId,
       caller: `${auth.tokenSubject}:${auth.userId}`,
       clientVersion: (client ?? manifest.writer.plugin_version).slice(0, 128),
@@ -234,8 +234,9 @@ function machineClaim(auth: Auth): string | undefined {
  * a deployment opts in with `MANIFEST_MACHINE_CLAIM=compat` and a future
  * `MANIFEST_MACHINE_CLAIM_COMPAT_UNTIL`, so a new deployment requires the claim,
  * unsetting either is the kill switch, and the window closes itself at the
- * sunset. While it is open the system is not machine-bound. Delete this and its
- * callers when the sunset passes.
+ * sunset. It is read-only and version-only: no write passes through it. While
+ * it is open the system is not machine-bound. Delete this and its callers when
+ * the sunset passes.
  */
 export function claimlessWindowOpen(env: Bindings, now = new Date()): boolean {
   const vars = env as Record<string, unknown>;
@@ -245,23 +246,18 @@ export function claimlessWindowOpen(env: Bindings, now = new Date()): boolean {
 }
 
 /**
- * A live write's machine binding: claim, key `m=` and writer agree. A mismatch
- * is always refused. A missing claim is refused when `required`, or once
- * `MANIFEST_MACHINE_CLAIM=required` flips after the issuer ships it. Migration
- * assertions are bound to a grant instead.
+ * A live write's machine binding: claim, key `m=` and writer agree. Every live
+ * write needs it, because the claimless window is read-only: an audit row does
+ * not make a claimless mutation acceptable. Migration assertions are bound to
+ * a grant instead.
  */
 function machineClaimIssue(
   manifest: ManifestV1,
   auth: Auth,
-  env: Bindings,
-  required = false,
 ): string | undefined {
   if (auth.tokenSubject === MIGRATION_SUBJECT) return undefined;
   const claim = machineClaim(auth);
-  if (claim === undefined) {
-    const strict = required || !claimlessWindowOpen(env);
-    return strict ? `${MACHINE_CLAIM} is required` : undefined;
-  }
+  if (claim === undefined) return `${MACHINE_CLAIM} is required`;
   return claim === manifest.session.machine_id &&
     claim === manifest.writer.delivery_instance_id
     ? undefined
@@ -880,29 +876,12 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       const issue = await migrationManifestIssue(c, auth, location, manifest);
       if (issue) return issue;
     }
-    if (machineClaimIssue(manifest, auth, c.env ?? {}))
+    if (machineClaimIssue(manifest, auth))
       return responseError(
         c,
         403,
         "machine_claim_refused",
         "the token is not bound to this machine and writer",
-      );
-    if (
-      auth.tokenSubject !== MIGRATION_SUBJECT &&
-      machineClaim(auth) === undefined &&
-      !(await auditClaimless(
-        deps,
-        "write",
-        auth,
-        manifest,
-        c.req.header("X-Relay-Client"),
-      ))
-    )
-      return responseError(
-        c,
-        503,
-        "claimless_audit_unavailable",
-        "this write cannot be recorded",
       );
     const encoded = new TextEncoder().encode(JSON.stringify(manifest));
     const encodedText = new TextDecoder().decode(encoded);
@@ -1015,18 +994,6 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         storedVersion = existing.version;
       } else {
         const previous = version(body.previousVersion);
-        // A takeover moves ownership, so it needs the claim in every mode.
-        if (
-          existing.manifest.raw.owner.startsWith("migration:") &&
-          manifest.raw.owner !== existing.manifest.raw.owner &&
-          machineClaimIssue(manifest, c.get("auth") as Auth, c.env ?? {}, true)
-        )
-          return responseError(
-            c,
-            403,
-            "machine_claim_refused",
-            "a takeover needs a token bound to this machine and writer",
-          );
         if (
           !sameVersion(existing.version, previous) ||
           manifest.revision !== existing.manifest.revision + 1
@@ -1232,7 +1199,6 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         if (
           !(await auditClaimless(
             deps,
-            "status",
             auth,
             stored.manifest,
             c.req.header("X-Relay-Client"),

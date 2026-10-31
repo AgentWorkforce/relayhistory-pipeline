@@ -77,8 +77,8 @@ function migrationToken(upload: UploadIdentity, overrides: Record<string, unknow
 }
 
 /** An origin-bound courier assertion (live delivery), as relayauth mints for this History. */
-const liveToken = () =>
-  sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { tokenClass: "relayhistory_assertion" } });
+const liveToken = (machineId = LOCATION.machineId) =>
+  sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { machineId, tokenClass: "relayhistory_assertion" } });
 
 /** A generic RelayAuth bearer: a valid JWT of no assertion class (like a relay_pa_ token's JWT). */
 const genericToken = (aud: string[] = ["relayhistory"]) =>
@@ -217,7 +217,8 @@ describe("buildIngestApp auth (production composition)", () => {
   test("the claim switch reaches the route from the real environment, and defaults shut", async () => {
     const shut = await ingest({ ALLOW_INTERIM_RELAYAUTH_BEARER: "true", CLAIMLESS_WINDOW: "shut" });
     const { manifest } = await planned();
-    expect((await shut.commit(liveToken(), manifest)).status).toBe(403);
+    const claimless = sign({ sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER, scopes: ["rth:sync"], token_type: "access", iss: ISSUER, aud: [ORIGIN], iat: now(), exp: now() + 600, meta: { tokenClass: "relayhistory_assertion" } });
+    expect((await shut.commit(claimless, manifest)).status).toBe(403);
     expect(await count("sessions.claimless_uses")).toBe(0);
   });
 
@@ -342,8 +343,8 @@ describe("buildIngestApp auth (production composition)", () => {
     const liveLocation = { ...LOCATION, sessionId: "session-live" };
     const live = await planned(liveLocation, liveLocation.machineId);
     const liveManifest = { ...live.manifest, extensions: undefined };
-    expect((await i.chunk(liveToken(), liveLocation)).status).toBe(201);
-    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(), {
+    expect((await i.chunk(liveToken(liveLocation.machineId), liveLocation)).status).toBe(201);
+    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(liveLocation.machineId), {
       method: "POST",
       headers: { "content-type": "application/json", "x-machine-id": liveLocation.machineId, "x-session-id": liveLocation.sessionId },
       body: JSON.stringify({ key: manifestKey(liveLocation), manifest: liveManifest }),
@@ -402,8 +403,8 @@ describe("buildIngestApp auth (production composition)", () => {
     // A live session under the same prefix.
     const liveLocation = { ...LOCATION, sessionId: "session-live" };
     const live = await planned(liveLocation, liveLocation.machineId);
-    expect((await i.chunk(liveToken(), liveLocation)).status).toBe(201);
-    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(), {
+    expect((await i.chunk(liveToken(liveLocation.machineId), liveLocation)).status).toBe(201);
+    const liveCommit = await i.req("/v1/pipeline/manifests", liveToken(liveLocation.machineId), {
       method: "POST",
       headers: { "content-type": "application/json", "x-machine-id": liveLocation.machineId, "x-session-id": liveLocation.sessionId },
       body: JSON.stringify({ key: `${PREFIX}/${manifestKey(liveLocation)}`, manifest: { ...live.manifest, extensions: undefined } }),
@@ -585,7 +586,7 @@ describe("buildIngestApp auth (production composition)", () => {
         }) as typeof fetch;
         const config = (): CourierConfig => ({
           dbPath, statePath: join(dir, "state.json"), ingestUrl,
-          token: { get: async () => liveToken(), invalidate: () => false },
+          token: { get: async () => liveToken("machine-c"), invalidate: () => false },
           orgId: ORG, workspaceId: WORKSPACE, userId: USER, machineId: "machine-c",
           harnesses: ["claude"], closeAfterMinutes: 1_000_000, startMode: "all",
         });

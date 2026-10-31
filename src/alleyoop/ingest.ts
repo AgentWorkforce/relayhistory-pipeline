@@ -57,15 +57,17 @@ export interface IngestOverrides {
  *  - With `RELAYHISTORY_ORIGIN` set, the upload routes take only origin-bound
  *    assertions (or migration assertions), even with the interim bearer on.
  */
-/** One row per day, org, surface, caller and client version. */
+/** One row per day, org, caller and client version. */
 function recordClaimlessUse(db: SqlExecutor, use: ClaimlessUse) {
-  return db.query(
-    `INSERT INTO sessions.claimless_uses (day, org_id, surface, caller, client_version)
-     VALUES (current_date, $1, $2, $3, $4)
-     ON CONFLICT (day, org_id, surface, caller, client_version)
-     DO UPDATE SET uses = sessions.claimless_uses.uses + 1, last_at = now()`,
-    [use.orgId, use.surface, use.caller, use.clientVersion],
-  ).then(() => undefined);
+  return db
+    .query(
+      `INSERT INTO sessions.claimless_uses (day, org_id, caller, client_version)
+       VALUES (current_date, $1, $2, $3)
+       ON CONFLICT (day, org_id, caller, client_version)
+       DO UPDATE SET uses = sessions.claimless_uses.uses + 1, last_at = now()`,
+      [use.orgId, use.caller, use.clientVersion],
+    )
+    .then(() => undefined);
 }
 
 export async function buildIngestApp(overrides: IngestOverrides = {}) {

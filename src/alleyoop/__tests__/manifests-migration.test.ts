@@ -192,7 +192,7 @@ const ordinaryAuth: TestAuth = {
   tokenSubject: "agent_relayhistory_assertion",
   scopes: ["rth:sync"],
   historyOrigin: ORIGIN,
-  claims: {},
+  claims: { meta: { machineId: MACHINE } },
 };
 
 async function fixture(

@@ -467,10 +467,14 @@ describe("machine claim", () => {
     w.hooks.beforeManifest = async () => {
       w.hooks.beforeManifest = undefined;
       await w.exporter(w.exportText("pre-t0"));
-      w.identity.machineClaim = undefined;
-      w.openClaimlessWindow();
     };
     await w.run();
+    expect((await w.state()).sessions["claude:session-a"].needs_rebase).toBe(
+      true,
+    );
+
+    w.identity.machineClaim = undefined;
+    w.openClaimlessWindow();
     await settle(w);
     const stuck = (await w.state()).sessions["claude:session-a"];
     expect(stuck.needs_rebase).toBe(true);
@@ -547,22 +551,47 @@ describe("machine claim", () => {
       }
       expect(w.gate.claimless).toHaveLength(2);
       expect(w.gate.claimless[0]).toEqual({
-        surface: "status",
         orgId: "org_test",
         caller: "agent_relayhistory_assertion:user",
         clientVersion: "96bulls-courier/0.3.0",
       });
     });
 
-    test("a write through it is audited", async () => {
+    test("is read-only: a claimless write is refused with it open, and leaves nothing", async () => {
       const { w } = await setup();
       w.openClaimlessWindow();
       await w.write(line(1));
       await w.run();
-      expect((await w.stored())!.manifest.raw.chunk_count).toBe(2);
-      expect(w.gate.claimless.some((use) => use.surface === "write")).toBe(
-        true,
-      );
+      await w.run();
+      expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
+      expect((await w.stored())!.manifest.revision).toBe(1);
+      expect(w.gate.claimless.every((use) => !("surface" in use))).toBe(true);
+    });
+
+    test("client_version is a meter: changing it decides nothing", async () => {
+      for (const client of [
+        "96bulls-courier/0.3.0",
+        "96bulls-courier/0.2.0",
+        "admin",
+        "x".repeat(500),
+      ]) {
+        const { w, version } = await setup();
+        const ask = (q: string) =>
+          w.app.request(
+            `/v1/pipeline/manifests/status?${new URLSearchParams({ key: w.key, ...Object.fromEntries(new URLSearchParams(q)) })}`,
+            { headers: { "x-relay-client": client } },
+            w.env,
+          );
+        // Shut, it opens nothing. Open, it unlocks nothing and shapes no answer.
+        expect((await ask(version)).status).toBe(403);
+        w.openClaimlessWindow();
+        const res = await ask(`${version}&manifest=1`);
+        expect(res.status).toBe(200);
+        expect(Object.keys((await res.json()) as object)).toEqual(["version"]);
+        expect(w.gate.claimless.at(-1)!.clientVersion).toBe(
+          client.slice(0, 128),
+        );
+      }
     });
 
     test("an unaudited use is refused, not waved through", async () => {
@@ -570,9 +599,6 @@ describe("machine claim", () => {
       w.openClaimlessWindow();
       w.gate.auditDown = true;
       expect((await status(w, version)).status).toBe(503);
-      await w.write(line(1));
-      await w.run();
-      expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
     });
 
     test("a present, mismatched claim is refused on every form, window open or not", async () => {
@@ -600,9 +626,6 @@ describe("machine claim", () => {
         const before = w.gate.claimless.length;
         for (const q of [version, `${version}&manifest=1`])
           expect((await status(w, q)).status).toBe(403);
-        await w.write(line(1));
-        await w.run();
-        expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
         expect(w.gate.claimless).toHaveLength(before);
       }
     });

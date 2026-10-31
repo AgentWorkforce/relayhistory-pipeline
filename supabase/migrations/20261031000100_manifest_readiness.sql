@@ -32,16 +32,15 @@ create index if not exists export_deferred_sessions_open_idx
   on sessions.export_deferred_sessions (org_id, workspace_id)
   where resolved_at is null;
 
--- The legacy machine-claim window: who still uses it, and with which client.
+-- The legacy, read-only machine-claim window: who still reads through it.
 create table if not exists sessions.claimless_uses (
   day date not null,
   org_id text not null,
-  surface text not null check (surface in ('status', 'write')),
   caller text not null,
   client_version text not null,
   uses bigint not null default 1,
   last_at timestamptz not null default now(),
-  primary key (day, org_id, surface, caller, client_version)
+  primary key (day, org_id, caller, client_version)
 );
 
 -- Service-role only, like every other pipeline table: RLS on with no policy.
