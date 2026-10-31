@@ -578,6 +578,11 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       "MAINTAIN on sessions.session_index",
     ],
     [
+      "MAINTAIN through PUBLIC (PostgreSQL 17+)",
+      "GRANT MAINTAIN ON sessions.session_index TO PUBLIC",
+      "MAINTAIN on sessions.session_index",
+    ],
+    [
       "default privileges in sessions granting PUBLIC",
       "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT SELECT ON TABLES TO PUBLIC",
       "default privileges in schema sessions grant PUBLIC",
@@ -1053,6 +1058,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       migration_owner: "postgres",
       sessions_unexposed_and_no_untrusted_usage: false,
       global_function_default_revokes_public: false,
+      sessions_functions_owned_by_owner: true,
       event_trigger_present: false,
       mode: "none",
       satisfied: false,
@@ -1178,6 +1184,32 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(
       await failure(runMigrations(client(loc), { profile: LOCAL })),
     ).toBeNull();
+  });
+
+  test("creator coverage: a sessions function owned by any other role escapes the owner-scoped default, so the gate refuses it before any write", async () => {
+    const db = await fresh();
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
+    const SELFP: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    await runMigrations(client(db), { profile: SELFP });
+    await db.exec(`CREATE ROLE g6_other_creator NOLOGIN; GRANT CREATE, USAGE ON SCHEMA sessions TO g6_other_creator;
+      SET ROLE g6_other_creator; CREATE FUNCTION sessions.g6_foreign() RETURNS int LANGUAGE sql AS 'SELECT 1'; RESET ROLE;`);
+    const before = await snapshot(db);
+    const error = await failure(runMigrations(client(db), { profile: SELFP }));
+    expect(error?.code).toBe("function_boundary_unproven");
+    expect(JSON.parse(error!.message!.match(/(\{.*\})/)![1]!)).toMatchObject({
+      global_function_default_revokes_public: true,
+      sessions_functions_owned_by_owner: false,
+      satisfied: false,
+    });
+    expect(await snapshot(db)).toEqual(before);
   });
 
   test("blast radius of the owner-scoped revoke: new owner functions in sessions AND another schema are not PUBLIC-executable; intended grants survive (ACL manifest) the revoke and the next migrate", async () => {

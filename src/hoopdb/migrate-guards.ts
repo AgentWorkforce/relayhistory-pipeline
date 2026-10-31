@@ -615,7 +615,16 @@ export interface FunctionBoundaryEvidence {
    * sessions is an exposed schema, and authenticated and service_role hold USAGE on it.
    */
   sessions_unexposed_and_no_untrusted_usage: false;
+  /**
+   * Exactly: a pg_default_acl row for the migration owner with defaclnamespace = 0
+   * (global) and defaclobjtype 'f', whose ACL gives PUBLIC no EXECUTE.
+   */
   global_function_default_revokes_public: boolean;
+  /**
+   * Creator coverage: every sessions function is owned by the migration owner. A function
+   * created by any other role escapes the owner-scoped default, so this must hold.
+   */
+  sessions_functions_owned_by_owner: boolean;
   event_trigger_present: boolean;
   mode: FunctionBoundaryApproval | "none";
   satisfied: boolean;
@@ -648,24 +657,30 @@ export async function functionBoundaryEvidence(
       owner: string;
       global_revoke: boolean;
       event_trigger: boolean;
+      owned: boolean;
     }>(
       `SELECT current_user AS owner,
               EXISTS (SELECT 1 FROM pg_default_acl d
                        WHERE d.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = current_user)
                          AND d.defaclnamespace = 0 AND d.defaclobjtype = 'f'
                          AND NOT EXISTS (SELECT 1 FROM aclexplode(d.defaclacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')) AS global_revoke,
-              EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = $1 AND evtenabled <> 'D' AND evtevent = 'ddl_command_end') AS event_trigger`,
+              EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = $1 AND evtenabled <> 'D' AND evtevent = 'ddl_command_end') AS event_trigger,
+              NOT EXISTS (SELECT 1 FROM pg_proc p
+                           WHERE p.pronamespace = coalesce(to_regnamespace('sessions')::oid, 0)
+                             AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS owned`,
       [SESSIONS_FUNCTION_EVENT_TRIGGER],
     )
   ).rows[0]!;
   // Event-trigger mode is not implemented: a trigger's name proves nothing (its enabled
   // state, events and tags, owner, function identity and definition, SECURITY and
   // search_path, and behaviour would all need verifying). Hook kept for that later work.
-  const satisfied = approval === "global-default-revoke" && r.global_revoke;
+  const satisfied =
+    approval === "global-default-revoke" && r.global_revoke && r.owned;
   return {
     migration_owner: r.owner,
     sessions_unexposed_and_no_untrusted_usage: false,
     global_function_default_revokes_public: r.global_revoke,
+    sessions_functions_owned_by_owner: r.owned,
     event_trigger_present: r.event_trigger,
     mode: approval ?? "none",
     satisfied,

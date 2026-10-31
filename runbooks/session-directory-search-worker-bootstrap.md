@@ -394,6 +394,11 @@ config fails closed.
   - **supabase:** the owner is `postgres`, so the same statement would reach every future
     postgres-created function in every schema of the project. It is never run from here.
     An operator decides it (#98), and until then supabase migrate stays refused.
+- **Exact check and creator coverage:** the gate requires a `pg_default_acl` row for the
+  migration owner with `defaclnamespace = 0` and `defaclobjtype = 'f'` whose ACL gives
+  PUBLIC no EXECUTE, AND that every `sessions` function is owned by that owner. A
+  function created by any other role escapes the owner-scoped default, so its presence
+  refuses the gate (`sessions_functions_owned_by_owner: false`; tested on PG15 and PG17).
 - **`event-trigger`: not implemented, refused** (`function_boundary_mode_unimplemented`).
   A trigger's name proves nothing. A reviewed implementation must verify the enabled
   state, events and tags, owner and function identity, function definition or hash,
@@ -405,6 +410,7 @@ The evidence is names and booleans only:
 - `migration_owner`;
 - `sessions_unexposed_and_no_untrusted_usage`, always false here;
 - `global_function_default_revokes_public`;
+- `sessions_functions_owned_by_owner`;
 - `event_trigger_present` (informational);
 - `mode`;
 - `satisfied`.

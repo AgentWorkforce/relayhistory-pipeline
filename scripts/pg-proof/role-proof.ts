@@ -298,6 +298,7 @@ for (const r of [
   "g6_caller",
   "g6_unrel",
   "g6_probe",
+  "g6_other_creator",
 ]) {
   for (const d of (
     await sql("postgres", "SELECT datname FROM pg_database WHERE datallowconn")
@@ -1325,6 +1326,80 @@ await check(
     return [
       ok,
       `migrate=${fmt(m1)} manifest_after_revoke=${after1} sessions_fn_exec=${r.s_exec} second_schema_fn_exec=${r.o_exec} any_public=${r.any_public} next_migrate=${fmt(m2)} manifest_after_next=${after2}`,
+    ];
+  },
+);
+await check(
+  "creator coverage: a sessions function created by another role escapes the owner-scoped default; the gate refuses it before any write",
+  async () => {
+    await fresh("g6_fb", ["g6_rt2"]);
+    const m1 = migrate("g6_fb", SEQ);
+    await attempt("postgres", "CREATE ROLE g6_other_creator LOGIN");
+    await sql(
+      "g6_fb",
+      "GRANT CREATE, USAGE ON SCHEMA sessions TO g6_other_creator; GRANT CONNECT ON DATABASE g6_fb TO g6_other_creator",
+    );
+    await sql(
+      "g6_fb",
+      "CREATE FUNCTION sessions.g6_foreign() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+      "g6_other_creator",
+    );
+    const before = await snapshot("g6_fb");
+    const m2 = migrate("g6_fb", SEQ);
+    const same = (await snapshot("g6_fb")) === before;
+    const chk = spawnSync(
+      "bun",
+      ["src/hoopdb/migrate.ts", "--activation-check"],
+      {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOOPDB_URL: url("hoop", "g6_fb"),
+          HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+        },
+      },
+    );
+    const ev = JSON.parse(chk.stdout.trim().split("\n").at(-1) ?? "{}");
+    await attempt("postgres", "DROP DATABASE IF EXISTS g6_fb WITH (FORCE)");
+    await attempt("postgres", "DROP ROLE IF EXISTS g6_other_creator");
+    const ok =
+      m1.exit === 0 &&
+      m2.code === "function_boundary_unproven" &&
+      same &&
+      chk.status === 1 &&
+      ev.sessions_functions_owned_by_owner === false &&
+      ev.global_function_default_revokes_public === true;
+    return [
+      ok,
+      `first=${fmt(m1)} after_foreign_function=${fmt(m2)} unchanged=${same} evidence=${fmt(ev)}`,
+    ];
+  },
+);
+await check(
+  "PostgreSQL 17+: MAINTAIN through PUBLIC (not granted to the role) is refused (version-guarded)",
+  async () => {
+    if (MAJOR < 17)
+      return [true, `skipped: PostgreSQL ${MAJOR} has no MAINTAIN privilege`];
+    await fresh("g6_mt", ["g6_rt2"]);
+    const m1 = migrate("g6_mt", SEQ);
+    await sql("g6_mt", "GRANT MAINTAIN ON sessions.session_index TO PUBLIC");
+    const before = await snapshot("g6_mt");
+    const m2 = migrate("g6_mt", SEQ);
+    const same = (await snapshot("g6_mt")) === before;
+    const direct = (
+      await sql(
+        "g6_mt",
+        "SELECT EXISTS (SELECT 1 FROM pg_class c, aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE c.oid = 'sessions.session_index'::regclass AND r.rolname = 'g6_rt2') AS d",
+      )
+    ).rows[0].d;
+    await attempt("postgres", "DROP DATABASE IF EXISTS g6_mt WITH (FORCE)");
+    return [
+      m1.exit === 0 &&
+        m2.code === "runtime_role_unsafe" &&
+        same &&
+        direct === false,
+      `first=${fmt(m1)} via_public=${fmt(m2)} unchanged=${same} direct_grant_to_role=${direct}`,
     ];
   },
 );
