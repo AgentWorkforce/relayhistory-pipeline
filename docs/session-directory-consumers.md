@@ -6,19 +6,19 @@ this document. It is the first artifact of the surface-closure follow-up
 
 ## Sources reviewed
 
-| Source                                                  | Ref            | State           |
-| ------------------------------------------------------- | -------------- | --------------- |
-| 96BullSessions #38 `feat/session-directory-contract`    | `07a572468aa3` | open, draft     |
-| 96BullSessions #59 `feat/search-benchmark`              | `4102156f2e6f` | open, not draft |
-| 96BullSessions #72 `feat/session-directory-token-pins`  | `f3141b6601d1` | open, draft     |
-| 96BullSessions #73 `test/session-directory-postgrest`   | `2a75466c3293` | open, draft     |
-| 96BullSessions #74 `feat/aws-proof-harness`             | `9b4fc6be5b71` | open, draft     |
-| 96BullSessions #75 `feat/aws-proof-hardening`           | `5c1ee5e941bf` | open, draft     |
-| relayhistory-cloud #226 `codex/p3-phase-attested-reads` | `c4b6cf7aad74` | open, draft     |
-| relayhistory-cloud `main`                               | `45d53b18c670` | default branch  |
-| cloud `main`                                            | `ec7e0ecb2e9c` | default branch  |
-| relay `main`                                            | `e759d2ead565` | default branch  |
-| relay-desktop `main`                                    | `1b2856ce7572` | default branch  |
+| Source                                                  | Ref            | State                    |
+| ------------------------------------------------------- | -------------- | ------------------------ |
+| 96BullSessions #38 `feat/session-directory-contract`    | `7816a07de911` | open, draft (merge HOLD) |
+| 96BullSessions #59 `feat/search-benchmark`              | `4102156f2e6f` | open, not draft          |
+| 96BullSessions #72 `feat/session-directory-token-pins`  | `f3141b6601d1` | open, draft              |
+| 96BullSessions #73 `test/session-directory-postgrest`   | `2a75466c3293` | open, draft              |
+| 96BullSessions #74 `feat/aws-proof-harness`             | `9b4fc6be5b71` | open, draft              |
+| 96BullSessions #75 `feat/aws-proof-hardening`           | `5c1ee5e941bf` | open, draft              |
+| relayhistory-cloud #226 `codex/p3-phase-attested-reads` | `c4b6cf7aad74` | open, draft              |
+| relayhistory-cloud `main`                               | `45d53b18c670` | default branch           |
+| cloud `main`                                            | `ec7e0ecb2e9c` | default branch           |
+| relay `main`                                            | `e759d2ead565` | default branch           |
+| relay-desktop `main`                                    | `1b2856ce7572` | default branch           |
 
 Method: read-only `git grep` of every 96BullSessions remote branch and of #226; read-only
 GitHub code search of AgentWorkforce. Code search indexes default branches only, so
@@ -102,18 +102,18 @@ touches Supabase. Owners: cloud.
 
 ## Semantic gaps between today's direct reads and the RPC
 
-| Behavior                    | Direct (#226 H1/H3)                                                                | RPC                                                                                                                                            | Consequence for migration                                                                                                |
-| --------------------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `until`                     | `last_activity_at <= until` (`postgrest.ts` `lte`)                                 | `created_at <= until` (activity interval overlaps the window)                                                                                  | results widen: sessions active in the window with later activity reappear (closer to legacy "has an event before until") |
-| Short project substrings    | `projectContains` of any length                                                    | `p_project_contains` needs 3+ meaningful characters (`22023`)                                                                                  | 1- and 2-character `projectContains` become errors                                                                       |
-| Project filters combined    | `project`/`projectContains`/`noProject` overwrite one `project_id` key (last wins) | ANDed; `no_project` with either is `22023`                                                                                                     | silent drops become explicit                                                                                             |
-| Org-wide vs workspace       | org-wide with any filter                                                           | org-wide over the claimed workspaces only; with agent, project, no_project, user or machine is `0A000`; #72 tokens claim exactly one workspace | org-wide pages need one call per workspace, or a broader token design                                                    |
-| Detail lookup ambiguity     | `limit=2`, null when ambiguous; can omit workspace and harness                     | `p_session_id` returns up to `p_limit + 1` rows, only within claimed workspaces                                                                | #226 keeps its "exactly one" rule; an org-scoped lookup without a workspace needs the workspace in the token             |
-| Lost bearer                 | static token, works without a caller                                               | needs a per-request RelayAuth subject token; local History tokens fail closed (`postgrest.ts:275-290`)                                         | callers without a caller bearer (background or service paths) lose directory reads                                       |
-| `short_summary`             | not projected                                                                      | returned                                                                                                                                       | #226 still drops it (next section)                                                                                       |
-| Agent filter                | `agentPrefix` only (prefix)                                                        | `exact` by default, `prefix` opt-in; non-ASCII handled by SQL `lower()`                                                                        | #226 must pass `p_agent_match` explicitly                                                                                |
-| Limit                       | up to 500                                                                          | 1..50                                                                                                                                          | #226 clamps to 50                                                                                                        |
-| Users and machines together | machine dropped (users table wins)                                                 | ANDed                                                                                                                                          | silent drop becomes correct                                                                                              |
+| Behavior                    | Direct (#226 H1/H3)                                                                | RPC                                                                                                                                            | Consequence for migration                                                                                    |
+| --------------------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `until`                     | `last_activity_at <= until` (`postgrest.ts` `lte`)                                 | `last_activity_at <= until`, inclusive, `timestamptz` (#38 `7816a07`)                                                                          | no gap: the RPC now matches the legacy direct filter exactly                                                 |
+| Short project substrings    | `projectContains` of any length                                                    | `p_project_contains` needs 3+ meaningful characters (`22023`)                                                                                  | 1- and 2-character `projectContains` become errors                                                           |
+| Project filters combined    | `project`/`projectContains`/`noProject` overwrite one `project_id` key (last wins) | ANDed; `no_project` with either is `22023`                                                                                                     | silent drops become explicit                                                                                 |
+| Org-wide vs workspace       | org-wide with any filter                                                           | org-wide over the claimed workspaces only; with agent, project, no_project, user or machine is `0A000`; #72 tokens claim exactly one workspace | org-wide pages need one call per workspace, or a broader token design                                        |
+| Detail lookup ambiguity     | `limit=2`, null when ambiguous; can omit workspace and harness                     | `p_session_id` returns up to `p_limit + 1` rows, only within claimed workspaces                                                                | #226 keeps its "exactly one" rule; an org-scoped lookup without a workspace needs the workspace in the token |
+| Lost bearer                 | static token, works without a caller                                               | needs a per-request RelayAuth subject token; local History tokens fail closed (`postgrest.ts:275-290`)                                         | callers without a caller bearer (background or service paths) lose directory reads                           |
+| `short_summary`             | not projected                                                                      | returned                                                                                                                                       | #226 still drops it (next section)                                                                           |
+| Agent filter                | `agentPrefix` only (prefix)                                                        | `exact` by default, `prefix` opt-in; non-ASCII handled by SQL `lower()`                                                                        | #226 must pass `p_agent_match` explicitly                                                                    |
+| Limit                       | up to 500                                                                          | 1..50                                                                                                                                          | #226 clamps to 50                                                                                            |
+| Users and machines together | machine dropped (users table wins)                                                 | ANDed                                                                                                                                          | silent drop becomes correct                                                                                  |
 
 ## `SESSION_READS_TOKEN` role: unknown pending provenance
 
@@ -167,6 +167,26 @@ The output is one word, and no credential material leaves the process.
      with the right fallback. An RPC-row-to-response parity test covers the field.
 
    Owner: own_rhc_226_fix lane (#226 and the cloud-client contract).
+
+## Expand then contract
+
+**Expand, in #38 (`7816a07`, additive only, not applied anywhere)**
+
+- Migration `20261031001000_session_directory_reads_expand.sql` adds
+  `sessions.session_directory_pointers` and `sessions.session_directory_readiness`, with the
+  shape below.
+- Project substring was already in the RPC (`p_project_contains`, tenant project trigram
+  index inside the RPC identity).
+- Nothing is revoked. There is no index, no `short_summary` change and no `service_role`
+  fallback.
+- Retained PG15/PG17 plans: #38 `docs/evidence/session-directory-plans.md`.
+
+**Contract, later, as its own forward migration (not in #38, not applied)**
+
+- Revoke direct SELECT on `session_directory`, `_users`, `_machines`, `session_index` and
+  `session_directory_rollout` from `authenticated` and from the static reader's role.
+- Only after the rollout steps below: #226's flagged cutover with shadow parity, and
+  direct-use proof.
 
 ## Compatibility plan (proposed; nothing applied or activated)
 
