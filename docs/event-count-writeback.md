@@ -7,12 +7,11 @@ owner: mig-cutover-observability. Contract contributor: mig-e4-export-transform.
 
 | Input | Pin |
 | --- | --- |
-| Implementation base | `main` at `947d361bd1a37ab85bf892b84070f0c5ee18cad6` (carries #42) |
-| #57 output contract | Final content at `bd57d4ff5d13cd74b9dafaea9b8b1e1f869e4df7`, but it must rebase onto `main` for #65. Repin to the post-rebase head the coordinator sends |
+| Implementation base | #57 at `2f2dd1cffc0007feafd0185cbf9ed0bfead371d0`, on `main` at `c6ebf87` |
+| #57 output contract | Same head. Final, per the coordinator; no contract change since `bd57d4ff` |
 
 The contract itself is in the #58 comment pinned to that head, and this doc follows
-its names. Until that repin, the migration, function, trigger
-and their tests build on `main` at the pin above, and the handler and consumer wait.
+its names.
 
 ## Problem
 
@@ -35,7 +34,7 @@ tell them apart from the key.
 - `{table, row}` from #57 is the only format. An envelope can't give this count:
   it holds records, not the rows the live triggers leave.
 - `RELAYHISTORY_NORMALIZED_VERSION = 2`, so the key becomes
-  `normalized/v2/relayhistory-{raw.content_sha256}.ndjson`. Done at the candidate
+  `normalized/v2/relayhistory-{raw.content_sha256}.ndjson`. Done at the pinned
   #57 head. An object at that key that isn't `{table, row}` is refused.
 - `normalized/v1` is retired, not supported. No reader may accept it, and nothing
   translates it. No code on `main` constructs the transform, so no worker can have
@@ -237,15 +236,15 @@ same replay path. Only `applied` makes a count authoritative. `file-normalize`
 
 The stage flows through `pipeline_events` and the cutover sampler (#47) with no
 new emitter. `QUEUED_STAGES` gives it queue, lag and DLQ panels, and
-`pipeline.stage.errors` reports the codes above. Each outcome is recorded on the
-stage event as `outcome`, an allowlisted field.
+`pipeline.stage.errors` reports the codes above. `replayed`, `stale` and `deleted` record as `skipped`, with the outcome as the
+reason.
 
 | Signal | Source | Alert |
 | --- | --- | --- |
 | `normalized-ready` lag and depth | `pipeline_jobs` | Lag ≥ 300 s |
 | `normalized-ready` DLQ depth | `pipeline_dead_letters` | Any. Add the stage to the sampler's alert stages |
 | `count_conflict` | `pipeline.stage.errors` | Any: a broken determinism or version rule |
-| `stale` rate | `outcome` | Diagnostic |
+| `stale` rate | `skipped` events with that reason | Diagnostic |
 | `unprojected` > 0 | Stage event | Diagnostic: dropped records are excluded from the count |
 | Sessions not authoritative | Gate query below | Must reach 0 before activation |
 
@@ -288,14 +287,16 @@ across revisions, a backfill without one is refused rather than skipped, and a
 
 ## Implementation plan
 
-1. On `main` at the pin: migration, function and trigger, with PGlite tests against
-   every migration. They cover each row of the ordering table, a decrease, a
-   replay, the sticky trigger against `upsert_session_index`, a non-owner role and
-   tenant-role denial.
-2. Repin to the reviewed #57 head when the coordinator confirms it.
-3. Stage registration, handler, typed parser, consumer and the DLQ path, with tests.
-4. The poller adapter and the `file-normalize` worker. Its queue functions are done.
-5. Add the stage to the sampler's alert stages once #47 lands.
+Done in #64: the migration, function, trigger, stage registration, typed record,
+handlers, consumer and DLQ path, with tests. Done in #71: the worker's queue
+functions.
+
+Remaining:
+
+1. The poller adapter and the `file-normalize` worker.
+2. Grant `session_count_writer` to the indexer's login. Today the indexer connects
+   with its usual role, so the narrow role is only proven in tests.
+3. Add the stage to the sampler's alert stages once #47 lands.
 
 Code and draft PR only. Applying the migration, enabling normalization and any
 worker credential each need Khaliq's explicit OK.
