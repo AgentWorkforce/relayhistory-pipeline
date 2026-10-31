@@ -14,14 +14,34 @@ import {
   type StageMessage,
 } from "../../../shared/vendor.ts";
 import { zstdDecompressSync } from "node:zlib";
-import { createCourierManifestRoutes } from "../../../alleyoop/manifests.ts";
+import { createCourierManifestRoutes, liveWriteMachineGate } from "../../../alleyoop/manifests.ts";
 import { allCanaries, FAKE_AWS_KEY_ID, plantCorpus } from "../corpus.ts";
 import {
   IngestError,
   locationOf,
+  mintTenantToken,
   newUploadState,
   plantNextRevision,
 } from "../ingest.ts";
+
+const RELAYAUTH = "http://127.0.0.1:18787";
+
+/** RelayAuth #113's relevant contract, with the claim carried only by the token. */
+function fakeRelayAuth(claimless = false) {
+  const minted: Array<Record<string, unknown>> = [];
+  const fetch = async (url: string, init?: RequestInit) => {
+    if (url !== `${RELAYAUTH}/v1/tokens/relayhistory-assertion`) return new Response(null, { status: 404 });
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    minted.push(body);
+    if (!claimless && (typeof body.machineId !== "string" || !body.machineId)) return Response.json({ code: "machineId_required" }, { status: 400 });
+    const claims = { orgId: body.orgId, workspaceId: body.workspaceId, ...(claimless ? {} : { machineId: body.machineId }) };
+    return Response.json({ accessToken: `fake.${Buffer.from(JSON.stringify(claims)).toString("base64url")}` }, { status: 201 });
+  };
+  return { fetch, minted };
+}
+
+const mint = (issuer: ReturnType<typeof fakeRelayAuth>, orgId: string, machineId: string) =>
+  mintTenantToken({ relayauthUrl: RELAYAUTH, bootstrapKey: "synthetic-proof-key", orgId, workspaceId: "default", machineId, sponsorId: "proof-operator", historyOrigin: "https://history.example", fetch: issuer.fetch });
 
 const tenants = [
   { orgId: "org_proof_a", workspaceId: "default" },
@@ -92,17 +112,21 @@ describe("planting through the real manifest route", () => {
     const app = new Hono<AppEnv>();
     app.use("*", async (c, next) => {
       c.set("correlationId", "test");
+      const encoded = /^Bearer fake\.(.+)$/.exec(c.req.header("authorization") ?? "")?.[1];
+      if (!encoded) return c.json({ error: { code: "unauthorized" } }, 401);
+      const claims = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as { orgId?: string; machineId?: string };
       c.set("auth", {
         userId: "u",
-        orgId,
+        orgId: claims.orgId ?? orgId,
         workspaceId: "default",
         tokenSubject: "agent_relayhistory_assertion",
         scopes: ["rth:sync"],
-        claims: { meta: { machineId: c.req.header("x-machine-id") } },
+        claims: { meta: claims.machineId ? { machineId: claims.machineId } : {} },
         historyOrigin: "https://history.example",
       });
       await next();
     });
+    app.use("/v1/*", liveWriteMachineGate);
     // The chunk hop: the same server-side sealer the ingest uses (Technical Foul scrubs here).
     app.post("/v1/pipeline/chunks", async (c) => {
       const q = c.req.query();
@@ -154,17 +178,18 @@ describe("planting through the real manifest route", () => {
       tenants,
     });
     const s = server("org_proof_a");
+    const token = await mint(fakeRelayAuth(), "org_proof_a", p!.machineId);
     const st = newUploadState();
     const r1 = await plantNextRevision(
       { ingestUrl: "http://ingest", fetch: s.fetch },
       p!,
-      "tok",
+      token,
       st,
     );
     const r2 = await plantNextRevision(
       { ingestUrl: "http://ingest", fetch: s.fetch },
       p!,
-      "tok",
+      token,
       st,
     );
     expect([r1.revision, r2.revision]).toEqual([1, 2]);
@@ -189,7 +214,7 @@ describe("planting through the real manifest route", () => {
       plantNextRevision(
         { ingestUrl: "http://ingest", fetch: s.fetch },
         p!,
-        "tok",
+        token,
         st,
       ),
     ).rejects.toThrow(/only 2 revisions/);
@@ -205,7 +230,7 @@ describe("planting through the real manifest route", () => {
     const err = await plantNextRevision(
       { ingestUrl: "http://ingest", fetch: s.fetch },
       p!,
-      "tok",
+      await mint(fakeRelayAuth(), "org_proof_b", p!.machineId),
       newUploadState(),
     ).catch((e) => e);
     expect(err).toBeInstanceOf(IngestError);
@@ -264,5 +289,30 @@ describe("planting through the real manifest route", () => {
       /^96bulls\/org_aws_proof_1\/v1\/ws=default\//,
     );
     expect((bodies[0] as { key: string }).key).toBe(r1.manifestKey);
+  });
+
+  test("machine-bound proof tokens: exact match lands; claimless and mismatch write nothing", async () => {
+    const [p] = plantCorpus({ runId: "aws-proof-machine-0001", sessions: 2, tenants });
+    const matching = server("org_proof_a");
+    const issuer = fakeRelayAuth();
+    const token = await mint(issuer, "org_proof_a", p!.machineId);
+    expect(issuer.minted[0]).toMatchObject({ orgId: "org_proof_a", machineId: p!.machineId });
+    await expect(mint(fakeRelayAuth(), "org_proof_a", "relay_reserved")).rejects.toMatchObject({ code: "machine_id_invalid" });
+    expect((await plantNextRevision({ ingestUrl: "http://ingest", fetch: matching.fetch }, p!, token, newUploadState())).revision).toBe(1);
+    expect(matching.sent).toHaveLength(1);
+
+    for (const denied of [
+      await mint(fakeRelayAuth(true), "org_proof_a", p!.machineId),
+      await mint(fakeRelayAuth(), "org_proof_a", "proof-other-machine"),
+    ]) {
+      const isolated = server("org_proof_a");
+      const prefix = objectKey(`v1/ws=default/m=${p!.machineId}`);
+      const before = (await isolated.store.list(prefix)).items.length;
+      const error = await plantNextRevision({ ingestUrl: "http://ingest", fetch: isolated.fetch }, p!, denied, newUploadState()).catch((caught) => caught);
+      expect(error).toBeInstanceOf(IngestError);
+      expect([(error as IngestError).status, (error as IngestError).code]).toEqual([403, "machine_claim_refused"]);
+      expect(isolated.sent).toHaveLength(0);
+      expect((await isolated.store.list(prefix)).items).toHaveLength(before);
+    }
   });
 });

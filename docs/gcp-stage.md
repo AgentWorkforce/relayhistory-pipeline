@@ -56,6 +56,27 @@ summary, classification, and trace path. It does not claim Relaycast HA or the
 separately gated V1 search projection/API, which requires its own eligible
 runtime image and proof.
 
+### Machine-bound assertion activation gate
+
+The recorded one-off verifier minted its RelayAuth assertion directly through
+the in-cluster port-forward. RelayAuth #113 changes that request contract: each
+mint must include the exact proof courier `machineId`, and the returned signed
+claim must contain the identical value at `meta.machineId`. A proof involving
+more than one machine must mint one assertion per machine; tenant-wide token
+reuse is not permitted. The committed AWS proof minter and the self-hosted
+`RelayAuthAssertionProvider` enforce the same request shape so a future GCP
+verifier cannot copy the old claimless request safely.
+
+The machine claim fences AlleyOop HTTP writes only. The worker and AlleyOop
+pods also access GCS directly through their shared Workload Identity runtime
+service account; those bucket-direct operations do not traverse the HTTP
+machine gate. Their boundary is the vended Google credential and its
+bucket-level `roles/storage.objectUser` grant, not `meta.machineId`. Route tests
+therefore prove no bucket-direct isolation. GCP activation remains held until
+the RelayAuth #113 image and a services image containing this change are pinned
+and a new live proof records the request machine, signed claim, matching-route
+success, and claimless/mismatch zero-side-effect refusals.
+
 The stack entry point is `stacks/gcp/alchemy.gcp.run.ts`. It uses the same
 Alchemy + AgentWorkforce Helm boundary as the AWS stack: cloud code declares
 provider resources and passes non-secret endpoints/names into charts; runtime
