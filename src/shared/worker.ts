@@ -13,6 +13,10 @@ import {
   type StageHandler,
   type StageMessage,
   type StageQueueDeps,
+  attestReader,
+  postgresReadinessStore,
+  selfCheckManifestEpochs,
+  type ManifestReaderName,
 } from "./vendor.ts";
 import { openHoopDb, waitForHoopDb, waitForSchema, type HoopDb } from "./db.ts";
 import { ctxOf, enrichMessage } from "./enrich.ts";
@@ -31,8 +35,28 @@ export interface WorkerOptions {
   handlers: (db: HoopDb, current: () => StageMessage | undefined) => Partial<Record<QueuedStage, StageHandler>>;
   /** Extra vendored implementations (e.g. the session index). */
   impl?: (db: HoopDb, current: () => StageMessage | undefined) => Omit<PipelineImplementations, "handlers" | "queue" | "deadLetters" | "sink">;
+  /** Manifest readers in this process. They attest at startup, once the key exists. */
+  attests?: ManifestReaderName[];
   /** Runs once per loop tick, for side loops such as reconcile. */
   tick?: (db: HoopDb, now: Date) => Promise<void>;
+}
+
+/**
+ * Attest each reader this process hosts. An unattested reader only keeps the
+ * gate closed, so a failure here is logged and never stops the worker.
+ */
+async function attestReaders(readers: ManifestReaderName[], db: HoopDb) {
+  const key = process.env.MANIFEST_READINESS_KEY;
+  if (!key) return;
+  const store = postgresReadinessStore(db);
+  for (const reader of readers) {
+    try {
+      await attestReader({ reader, key, store, selfCheck: selfCheckManifestEpochs });
+      log.info("manifest reader attested", { reader });
+    } catch (err) {
+      log.warn("manifest reader did not attest", { reader, ...errorFields(err) });
+    }
+  }
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -194,6 +218,7 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
       }
     };
   }
+  await attestReaders(opts.attests ?? [], db);
   const idleMs = integer("WORKER_IDLE_MS", 1_000);
   const batchSize = integer("WORKER_BATCH_SIZE", 10);
   const leaseSeconds = integer("WORKER_LEASE_SECONDS", 300);

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
-import { MANIFEST_EPOCHS_CAPABILITY, objectKey, type ManifestV1 } from "../../shared/vendor.ts";
-import { MANIFEST_READERS } from "../manifests.ts";
-import { envelopeRange, sourceResumeOffset } from "../courier.ts";
+import { appendBackfillEpoch, MANIFEST_EPOCHS_CAPABILITY, MANIFEST_READERS, objectKey, type ManifestV1 } from "../../shared/vendor.ts";
+import { createHash } from "node:crypto";
+import { sourceResumeOffset } from "../courier.ts";
+import { feedRanges, feedRecordId } from "../feed-records.ts";
 import { courierWorld } from "./courier-harness.ts";
 
 type World = Awaited<ReturnType<typeof courierWorld>>;
@@ -16,6 +17,7 @@ afterEach(async () => {
   await Promise.all(worlds.splice(0).map((w) => w.close()));
 });
 
+const ORIGIN = "00000000000000ab";
 const line = (n: number) => JSON.stringify({ type: "user", n, timestamp: new Date(1_761_730_000_000 + n).toISOString() });
 
 /** Live chunks' record count: folding hides a double upload, this does not. */
@@ -108,7 +110,7 @@ describe("courier and exporter races (C1-C3)", () => {
     expect(manifest.raw.epochs[2]).toMatchObject({ reason: "resumed", resumes_epoch: 0, opened_by: w.machineId });
     expect(tail.epoch).toBe(2);
     expect(tail.start_offset).toBe(before.raw.next_offset);
-    expect(sourceResumeOffset(manifest)).toBe(Buffer.byteLength(`${line(0)}\n${line(1)}\n`));
+    expect(sourceResumeOffset(manifest, ORIGIN)).toBe(2);
   });
 
   test("a jsonl session's backfill is refused and the courier carries on", async () => {
@@ -152,7 +154,7 @@ describe("courier edits the stored manifest (C4-C7)", () => {
     expect(m.extensions?.["server.note"]).toBe(1);
   });
 
-  test("C5: ndjson output is a stream the transform reads", async () => {
+  test("C5: ndjson output is feed rows the transform reads", async () => {
     const w = await world({ format: "ndjson" });
     await w.write(line(0));
     await w.write("not json at all");
@@ -160,17 +162,45 @@ describe("courier edits the stored manifest (C4-C7)", () => {
     await w.exporter(w.exportText("pre-t0"));
     const { records, lines } = await w.liveRecords();
     expect(lines.toSorted()).toEqual([line(0), "not json at all"].toSorted());
-    expect(records.find((r) => r.record_id === "pre-t0")).toBeDefined();
-    const live = records.filter((r) => r.kind === "harness_line");
-    expect(new Set(live.map((r) => r.record_id)).size).toBe(2);
-    expect(live.every((r) => r.origin_id === `machine:${w.machineId}`)).toBe(true);
+    const live = records.filter((r) => r.record_id !== "pre-t0");
+    expect(live.map((r) => r.revision)).toEqual(["1", "2"]);
+    expect(live.every((r) => r.origin_id === ORIGIN)).toBe(true);
+    expect(live[0]!.payload).not.toHaveProperty("raw_facts_version");
+    expect(live[0]!.payload).not.toHaveProperty("revision");
   });
 
-  test("C5: sealing the same range twice gives the same records", () => {
-    const bytes = Buffer.from(`${line(0)}\n${line(1)}\n`);
-    const ids = { machineId: "m", sessionId: "s", startedAt: "2026-10-30T00:00:00.000Z" };
-    expect(envelopeRange({ start: 40, bytes }, ids).equals(envelopeRange({ start: 40, bytes }, ids))).toBe(true);
-    expect(envelopeRange({ start: 40, bytes }, ids).equals(envelopeRange({ start: 41, bytes }, ids))).toBe(false);
+  test("C5: a client delete reaches the stream and removes the record", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.write(line(1));
+    await w.run();
+    await w.exporter(w.exportText("pre-t0"));
+    w.tombstone(1);
+    await settle(w);
+    const { lines } = await w.liveRecords();
+    expect(lines).toEqual([line(1)]);
+  });
+
+  test("C5: identity is what the client's export computes", () => {
+    // sha256 of the compact JSON feed key, from relayhistory `make_record`.
+    expect(feedRecordId(["session_event", "claude", "s", "u"])).toBe(createHash("sha256").update('["session_event","claude","s","u"]').digest("hex"));
+    const records = [1, 2, 2, 3].map((revision) => ({ revision, line: "x".repeat(10) }));
+    const ranges = feedRanges(records, 0, 12);
+    expect(ranges.map((r) => [r.start, r.end])).toEqual([[0, 1], [1, 2], [2, 3]]);
+    expect(ranges[1]!.bytes.toString().trim().split("\n")).toHaveLength(2);
+  });
+
+  test("a rebuilt store is a typed condition, and its records are sent under the new origin", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.run();
+    w.setEpoch(173);
+    const { conditions } = await w.run();
+    expect(conditions).toEqual([expect.objectContaining({ type: "feed_epoch_moved", from: ORIGIN, to: "00000000000000ad" })]);
+    await settle(w);
+    await w.exporter(w.exportText("pre-t0"));
+    const { records } = await w.liveRecords();
+    expect(records.filter((r) => r.record_id !== "pre-t0").map((r) => r.origin_id).toSorted()).toEqual(["00000000000000ab", "00000000000000ad"]);
   });
 
   test("C6: state from before this version rebases first, and never rebuilds epoch 0", async () => {
@@ -214,23 +244,38 @@ describe("courier edits the stored manifest (C4-C7)", () => {
 describe("activation gate (G1) and old couriers (D1)", () => {
   const refused = { code: "activation_required" };
 
-  test("G1: refuses while any reader lacks the capability, and when unconfigured", async () => {
+  test("G1: refuses while any reader is unattested, and requeues durably", async () => {
     const w = await world({ format: "ndjson" });
     await w.write(line(0));
     await w.run();
-    const all = w.env.MANIFEST_READER_CAPABILITIES!;
     for (const reader of MANIFEST_READERS) {
-      w.env.MANIFEST_READER_CAPABILITIES = all.split(",").filter((p) => !p.startsWith(`${reader}=`)).join(",");
+      w.gate.missing = [reader];
       await expect(w.exporter(w.exportText("pre-t0"))).rejects.toMatchObject(refused);
     }
-    w.env.MANIFEST_READER_CAPABILITIES = all.replace(/-v2/g, "-v1");
-    await expect(w.exporter(w.exportText("pre-t0"))).rejects.toMatchObject(refused);
-    delete w.env.MANIFEST_READER_CAPABILITIES;
-    await expect(w.exporter(w.exportText("pre-t0"))).rejects.toMatchObject(refused);
     expect((await w.stored())!.manifest.raw.epochs).toHaveLength(1);
+    expect(new Set(w.gate.requeued.map((r) => (r.message as { workKey: string }).workKey)).size).toBe(1);
+    expect(w.gate.requeued[0]).toMatchObject({ delaySeconds: 60, message: { stage: "backfill-activation", payload: { attempt: 1, grantId: "mgr_export" } } });
 
-    w.env.MANIFEST_READER_CAPABILITIES = all;
+    w.gate.missing = [];
     expect(await w.exporter(w.exportText("pre-t0"))).toMatchObject({ status: "committed" });
+  });
+
+  test("409 activation_required carries Retry-After", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.run();
+    w.gate.missing = ["transform"];
+    const { manifest, version } = (await w.stored())!;
+    const sealed = await w.seal(w.exportText("pre-t0"), 1, 1, manifest.trace_id);
+    const next = await appendBackfillEpoch(manifest, {
+      openedBy: "migration:mgr_export",
+      openedAt: new Date().toISOString(),
+      chunks: [sealed.entry],
+      marker: { version: 1, source: "neon.delivery_records" },
+    });
+    const res = await w.post({ key: w.key, manifest: next, previousVersion: version }, "migration");
+    expect(res.status).toBe(409);
+    expect(res.headers.get("Retry-After")).toBe("60");
   });
 
   test("G1: refuses a session whose writer lacks the capability", async () => {
@@ -271,5 +316,68 @@ describe("activation gate (G1) and old couriers (D1)", () => {
     const { lines, manifest } = await w.liveRecords();
     expect(lines).toHaveLength(6);
     expect(uploadedRecords(manifest)).toBe(6);
+  });
+});
+
+describe("machine claim", () => {
+  test("rebase needs a claim: without one the full manifest is withheld and the courier defers", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.run();
+    await w.write(line(1));
+    w.hooks.beforeManifest = async () => {
+      w.hooks.beforeManifest = undefined;
+      await w.exporter(w.exportText("pre-t0"));
+      w.identity.machineClaim = undefined;
+    };
+    await w.run();
+    await settle(w);
+    const stuck = (await w.state()).sessions["claude:session-a"];
+    expect(stuck.needs_rebase).toBe(true);
+    expect(stuck.fenced).toBeFalsy();
+    expect((await w.stored())!.manifest.raw.epochs.map((e) => e.reason)).toEqual(["initial", "backfill"]);
+
+    w.identity.machineClaim = w.machineId;
+    await settle(w);
+    expect((await w.liveRecords()).lines).toHaveLength(2);
+  });
+
+  const status = (w: World, query: string) =>
+    w.app.request(`/v1/pipeline/manifests/status?${new URLSearchParams({ key: w.key, ...Object.fromEntries(new URLSearchParams(query)) })}`, {}, w.env);
+
+  test("the query never proves a machine: only the claim returns the manifest", async () => {
+    const w = await world({ format: "ndjson" });
+    await w.write(line(0));
+    await w.run();
+    const q = `machine=${w.machineId}&writer=${w.machineId}&manifest=1`;
+    expect(await (await status(w, q)).json()).toHaveProperty("manifest");
+
+    w.identity.machineClaim = undefined;
+    expect(await (await status(w, q)).json()).not.toHaveProperty("manifest");
+    expect((await status(w, `machine=${w.machineId}&writer=someone&manifest=1`)).status).toBe(403);
+
+    w.identity.machineClaim = "another-machine";
+    expect(await (await status(w, q)).json()).not.toHaveProperty("manifest");
+    expect((await status(w, `machine=another-machine&writer=${w.machineId}&manifest=1`)).status).toBe(403);
+  });
+
+  test("POST refuses a mismatched claim in both modes, and a missing one only when required", async () => {
+    for (const mode of ["compat", "required"]) {
+      const w = await world({ format: "ndjson" });
+      w.env.MANIFEST_MACHINE_CLAIM = mode;
+      await w.write(line(0));
+      w.identity.machineClaim = "another-machine";
+      await w.run();
+      expect(await w.stored()).toBeUndefined();
+
+      w.identity.machineClaim = undefined;
+      await w.run();
+      if (mode === "required") expect(await w.stored()).toBeUndefined();
+      else expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
+
+      w.identity.machineClaim = w.machineId;
+      await settle(w);
+      expect((await w.stored())!.manifest.raw.chunk_count).toBe(1);
+    }
   });
 });

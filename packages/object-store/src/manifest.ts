@@ -25,6 +25,15 @@ export const MIGRATION_ID_PREFIX = "migration:";
  * until the session's writer and every reader advertise it.
  */
 export const MANIFEST_EPOCHS_CAPABILITY = "manifest-epochs-v2";
+/**
+ * Client releases known to adopt a backfill and resume after it. Allowlisted
+ * here because `writer.capabilities` is only what a client says of itself.
+ */
+export const KNOWN_CLIENT_RELEASES: Readonly<
+  Record<string, readonly string[]>
+> = {
+  "96bulls-courier/0.3.0": [MANIFEST_EPOCHS_CAPABILITY],
+};
 /** The exporter's own extension key. */
 export const EXPORT_EXTENSION = "client.relayhistory_export";
 
@@ -329,6 +338,41 @@ function liveEpochs(raw: Raw): Set<number> {
   return out;
 }
 
+const MACHINE_ORIGIN = "machine:";
+
+/**
+ * The export marker's `origin_revisions`: per client feed origin, the highest
+ * revision exported. A client resumes each feed after it, so it does not send
+ * what the export already holds. Absent means `{}`, resume from 0.
+ */
+export function exportWatermarks(manifest: ManifestV1): Record<string, number> {
+  const marker = manifest.extensions?.[EXPORT_EXTENSION] as
+    | { origin_revisions?: Record<string, number> }
+    | undefined;
+  return marker?.origin_revisions ?? {};
+}
+
+function validateExportMarker(
+  manifest: ManifestV1,
+  issue: (path: string, message: string) => void,
+): void {
+  const value = (
+    manifest.extensions?.[EXPORT_EXTENSION] as
+      | { origin_revisions?: unknown }
+      | undefined
+  )?.origin_revisions;
+  if (value === undefined) return;
+  const path = `extensions.${EXPORT_EXTENSION}.origin_revisions`;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return void issue(path, "must be an object");
+  for (const [origin, revision] of Object.entries(value)) {
+    if (!origin || origin.startsWith(MACHINE_ORIGIN))
+      issue(path, "an origin must be a client feed");
+    if (!Number.isSafeInteger(revision) || (revision as number) < 0)
+      issue(path, "a revision must be a non-negative safe integer");
+  }
+}
+
 function validateBackfillEpochs(
   raw: Raw,
   issue: (path: string, message: string) => void,
@@ -430,6 +474,7 @@ export async function validateManifest(
     );
 
   validateBackfillEpochs(raw, issue);
+  validateExportMarker(manifest, issue);
 
   let prev: ChunkEntry | undefined;
   chunks.forEach((c, i) => {
@@ -699,7 +744,9 @@ export function chunkKeys(
 /** The session's last writer can adopt a backfill epoch and resume after it. */
 export function writerUnderstandsBackfill(manifest: ManifestV1): boolean {
   return (
-    manifest.writer.capabilities?.includes(MANIFEST_EPOCHS_CAPABILITY) ?? false
+    KNOWN_CLIENT_RELEASES[manifest.writer.plugin_version]?.includes(
+      MANIFEST_EPOCHS_CAPABILITY,
+    ) ?? false
   );
 }
 

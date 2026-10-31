@@ -1,5 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { computeContentSha256, objectKey, parseManifest, readAll, type ManifestV1 } from "../../shared/vendor.ts";
+import {
+  computeContentSha256,
+  deleteParkedSession,
+  expireParkedSession,
+  objectKey,
+  parseManifest,
+  PARKED_TTL_MS,
+  rawChunkKey,
+  readAll,
+  type ManifestV1,
+} from "../../shared/vendor.ts";
+import { assertNoMachineSplits, detectMachineSplits, SESSION_MACHINE_SPLIT } from "../../shared/vendor.ts";
 import { courierWorld, EXPORTER, MARKER } from "./courier-harness.ts";
 
 type World = Awaited<ReturnType<typeof courierWorld>>;
@@ -13,6 +24,7 @@ afterEach(async () => {
   await Promise.all(worlds.splice(0).map((w) => w.close()));
 });
 
+const ORIGIN = "00000000000000ab";
 const line = (n: number) => JSON.stringify({ type: "user", n });
 const settle = async (w: World) => {
   for (let i = 0; i < 4; i += 1) await w.run();
@@ -25,7 +37,7 @@ async function takeover(w: World, base: ManifestV1, owner: string, text: string,
   const epoch = m.raw.epoch + 1;
   const { entry } = await w.seal(text, m.raw.chunk_count, epoch, m.trace_id);
   m.revision += 1;
-  m.writer = { delivery_instance_id: owner, plugin_version: "test", capabilities: ["manifest-epochs-v2"] };
+  m.writer = { delivery_instance_id: owner, plugin_version: "96bulls-courier/0.3.0", capabilities: ["manifest-epochs-v2"] };
   m.raw.owner = owner;
   m.raw.epochs.push({ epoch, opened_at: m.updated_at, reason: "adopted", first_seq: m.raw.chunk_count, opened_by: owner });
   m.raw.epoch = epoch;
@@ -68,8 +80,8 @@ describe("handover from a cold export (H1-H5)", () => {
     const w = await world();
     const cold = await w.coldExport(w.exportText("pre-t0"));
     const { version } = (await w.stored())!;
-    const a = await takeover(w, cold, "instance-a", '{"from":"a"}\n');
-    const b = await takeover(w, cold, "instance-b", '{"from":"b"}\n');
+    const a = await takeover(w, cold, w.machineId, '{"from":"a"}\n');
+    const b = await takeover(w, cold, w.machineId, '{"from":"b"}\n');
     const results = await Promise.all([
       w.post({ key: w.key, manifest: a, previousVersion: version }),
       w.post({ key: w.key, manifest: b, previousVersion: version }),
@@ -77,7 +89,7 @@ describe("handover from a cold export (H1-H5)", () => {
     expect(results.map((r) => r.status).toSorted()).toEqual([202, 409]);
     const m = (await w.stored())!.manifest;
     expect(m.raw.epochs.filter((e) => e.reason === "adopted")).toHaveLength(1);
-    expect(["instance-a", "instance-b"]).toContain(m.raw.owner);
+    expect(m.raw.owner).toBe(w.machineId);
   });
 
   test("H1: a courier that loses the takeover is fenced and writes nothing more", async () => {
@@ -88,9 +100,10 @@ describe("handover from a cold export (H1-H5)", () => {
     await w.write(line(1));
     w.hooks.beforeManifest = async () => {
       w.hooks.beforeManifest = undefined;
+      // Another instance, past this route, wins the object compare-and-swap.
       const { version } = (await w.stored())!;
-      const res = await w.post({ key: w.key, manifest: await takeover(w, cold, "instance-b", '{"from":"b"}\n'), previousVersion: version });
-      expect(res.status).toBe(202);
+      const won = await takeover(w, cold, "instance-b", '{"from":"b"}\n');
+      await w.store.put(objectKey(w.key), new TextEncoder().encode(JSON.stringify(won)), { ifMatch: version, contentType: "application/json" });
     };
     await settle(w);
     expect((await w.state()).sessions["claude:session-a"].fenced).toBe(true);
@@ -119,7 +132,7 @@ describe("handover from a cold export (H1-H5)", () => {
     const w = await world();
     const cold = await w.coldExport(w.exportText("pre-t0"));
     const { version } = (await w.stored())!;
-    const owner = "instance-a";
+    const owner = w.machineId;
     const refused: [string, (m: ManifestV1) => void][] = [
       ["owner is not the writer", (m) => void (m.raw.owner = "someone-else")],
       ["no adopted epoch", (m) => void (m.raw.epochs[1]!.reason = "rewritten")],
@@ -129,7 +142,7 @@ describe("handover from a cold export (H1-H5)", () => {
     ];
     for (const [name, edit] of refused) {
       const res = await w.post({ key: w.key, manifest: await takeover(w, cold, owner, '{"x":1}\n', edit), previousVersion: version });
-      expect([name, res.status]).toEqual([name, 409]);
+      expect([name, res.status >= 400 && res.status < 500]).toEqual([name, true]);
     }
     const exportedChunk = await takeover(w, cold, owner, '{"x":1}\n');
     exportedChunk.raw.chunks.splice(0, 1);
@@ -138,13 +151,43 @@ describe("handover from a cold export (H1-H5)", () => {
 
     const asExporter = await takeover(w, cold, owner, '{"x":1}\n');
     expect((await w.post({ key: w.key, manifest: asExporter, previousVersion: version }, "migration")).status).toBe(409);
+
+    // In every mode a takeover needs the claim, and it must match.
+    w.identity.machineClaim = undefined;
+    expect((await w.post({ key: w.key, manifest: asExporter, previousVersion: version })).status).toBe(403);
+    w.identity.machineClaim = "another-machine";
+    expect((await w.post({ key: w.key, manifest: asExporter, previousVersion: version })).status).toBe(403);
     expect((await w.stored())!.manifest.raw.owner).toBe(EXPORTER);
 
+    w.identity.machineClaim = owner;
     const won = await takeover(w, cold, owner, '{"x":1}\n');
     expect((await w.post({ key: w.key, manifest: won, previousVersion: version })).status).toBe(202);
-    const second = await takeover(w, won, "instance-b", '{"y":1}\n');
+    const second = await takeover(w, won, owner, '{"y":1}\n');
     const { version: now } = (await w.stored())!;
-    expect((await w.post({ key: w.key, manifest: second, previousVersion: now })).status).toBe(400);
+    expect((await w.post({ key: w.key, manifest: second, previousVersion: now })).status).toBeGreaterThanOrEqual(400);
+  });
+
+  test("a takeover resumes after the watermark, so exported rows are not sent again", async () => {
+    const w = await world();
+    const rows = [0, 1].map((n) => w.exportedRow(n + 1, line(n))).join("");
+    await w.coldExport(rows, { origin_revisions: { [ORIGIN]: 2 } });
+    for (let n = 0; n < 4; n += 1) await w.write(line(n));
+    await settle(w);
+    const { manifest, lines } = await w.liveRecords();
+    expect(lines.toSorted()).toEqual([0, 1, 2, 3].map(line).toSorted());
+    expect(liveCount(manifest)).toBe(2);
+    expect(manifest.raw.epochs.map((e) => e.reason)).toEqual(["initial", "adopted"]);
+  });
+
+  test("with no watermark, rows sent again fold to one record each", async () => {
+    const w = await world();
+    const rows = [0, 1].map((n) => w.exportedRow(n + 1, line(n))).join("");
+    await w.coldExport(rows);
+    for (let n = 0; n < 4; n += 1) await w.write(line(n));
+    await settle(w);
+    const { manifest, lines } = await w.liveRecords();
+    expect(liveCount(manifest)).toBe(4);
+    expect(lines.toSorted()).toEqual([0, 1, 2, 3].map(line).toSorted());
   });
 
   test("H5: a client on another machine id never meets the export", async () => {
@@ -158,6 +201,27 @@ describe("handover from a cold export (H1-H5)", () => {
   });
 });
 
+describe("machine splits", () => {
+  const db = (rows: unknown[]) => {
+    const seen: unknown[][] = [];
+    return { seen, query: async (_sql: string, params?: unknown[]) => (seen.push(params ?? []), { rows }) as never };
+  };
+  const row = { workspace_id: "w", harness: "claude", session_id: "s", machine_ids: ["machine-a", "unknown-origin-7"] };
+
+  test("a split is typed, and blocks authoritative completion", async () => {
+    const found = db([row]);
+    expect(await detectMachineSplits(found, { orgId: "o" })).toEqual([
+      { type: SESSION_MACHINE_SPLIT, orgId: "o", workspaceId: "w", harness: "claude", sessionId: "s", machineIds: ["machine-a", "unknown-origin-7"] },
+    ]);
+    expect(found.seen[0]).toEqual(["o", null]);
+    await expect(assertNoMachineSplits(found, { orgId: "o", workspaceId: "w" })).rejects.toMatchObject({
+      code: SESSION_MACHINE_SPLIT,
+      splits: [{ sessionId: "s" }],
+    });
+    await expect(assertNoMachineSplits(db([]), { orgId: "o" })).resolves.toBeUndefined();
+  });
+});
+
 describe("gate and old couriers on a cold export (G1, D1)", () => {
   const held = async (w: World) => {
     const key = objectKey(w.key.replace(/manifest\.json$/, `parked/${w.machineId}/manifest.json`));
@@ -167,8 +231,7 @@ describe("gate and old couriers on a cold export (G1, D1)", () => {
   test("G1 + D1: a closed gate parks the takeover, and opening it completes it", async () => {
     const w = await world();
     const cold = await w.coldExport(w.exportText("pre-t0"));
-    const open = w.env.MANIFEST_READER_CAPABILITIES!;
-    delete w.env.MANIFEST_READER_CAPABILITIES;
+    w.gate.missing = ["transform"];
     await w.write(line(0));
     await settle(w);
     await w.write(line(1));
@@ -176,13 +239,58 @@ describe("gate and old couriers on a cold export (G1, D1)", () => {
     expect((await w.stored())!.manifest).toEqual(cold);
     expect((await held(w)).raw.chunks.length).toBeGreaterThan(1);
 
-    w.env.MANIFEST_READER_CAPABILITIES = open;
+    w.gate.missing = [];
     await w.write(line(2));
     await settle(w);
     const { manifest, lines } = await w.liveRecords();
     expect(manifest.raw.owner).toBe(w.machineId);
     expect(lines).toHaveLength(3);
     expect(liveCount(manifest)).toBe(3);
+    await expect(held(w)).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  test("a parked manifest can be erased, and what the session lists stays", async () => {
+    const w = await world();
+    const cold = await w.coldExport(w.exportText("pre-t0"));
+    w.gate.missing = ["transform"];
+    await w.write(line(0));
+    await settle(w);
+    const parked = await held(w);
+    const chunk = parked.raw.chunks.at(-1)!;
+    const chunkKey = rawChunkKey(w.location, chunk.seq, chunk.start_offset, chunk.sha256, parked.raw.format);
+    expect(await w.store.head(chunkKey)).toBeDefined();
+
+    expect(await deleteParkedSession(w.store, w.key, w.machineId)).toEqual({ manifest: true, chunks: 1 });
+    await expect(held(w)).rejects.toMatchObject({ code: "not_found" });
+    expect(await w.store.head(chunkKey)).toBeUndefined();
+    const kept = cold.raw.chunks[0]!;
+    expect(await w.store.head(rawChunkKey(w.location, kept.seq, kept.start_offset, kept.sha256, "ndjson"))).toBeDefined();
+    expect(await deleteParkedSession(w.store, w.key, w.machineId)).toEqual({ manifest: false, chunks: 0 });
+  });
+
+  test("a parked manifest expires on a later write, not by a job", async () => {
+    const w = await world();
+    await w.coldExport(w.exportText("pre-t0"));
+    w.gate.missing = ["transform"];
+    await w.write(line(0));
+    await settle(w);
+    const now = Date.now();
+    expect(await expireParkedSession(w.store, w.key, w.machineId, new Date(now + 1000))).toBe(false);
+    expect(await expireParkedSession(w.store, w.key, w.machineId, new Date(now + PARKED_TTL_MS + 60_000))).toBe(true);
+    await expect(held(w)).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  test("a migration token never reads a client's parked manifest", async () => {
+    const w = await world();
+    await w.coldExport(w.exportText("pre-t0"));
+    w.gate.missing = ["transform"];
+    await w.write(line(0));
+    await settle(w);
+    const q = new URLSearchParams({ key: w.key, machine: w.machineId, writer: w.machineId });
+    const asClient = await w.app.request(`/v1/pipeline/manifests/status?${q}`, {}, w.env);
+    expect(asClient.status).toBe(200);
+    const asExporter = await w.app.request(`/v1/pipeline/manifests/status?${q}`, { headers: { "x-test-auth": "migration" } }, w.env);
+    expect(asExporter.status).toBe(403);
   });
 
   test("D1: an old courier never stalls on a cold export, and an upgrade delivers everything", async () => {

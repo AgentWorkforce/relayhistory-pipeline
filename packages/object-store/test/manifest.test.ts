@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   EXPORT_EXTENSION,
+  MANIFEST_EPOCHS_CAPABILITY,
   adoptionWriteIssues,
   appendBackfillEpoch,
   backfillDigest,
@@ -10,6 +11,7 @@ import {
   chunkKeys,
   commitBackfillEpoch,
   computeContentSha256,
+  exportWatermarks,
   liveEpoch,
   liveNextOffset,
   manifestKey,
@@ -889,7 +891,7 @@ describe("backfill epochs", () => {
     );
     expect(m.raw.epochs.map((e) => e.reason)).toEqual(["initial", "adopted"]);
     expect(m.raw.owner).toBe("dest_objstore_01");
-    expect(writerUnderstandsBackfill(m)).toBe(true);
+    expect(m.writer.capabilities).toContain(MANIFEST_EPOCHS_CAPABILITY);
     expect(liveNextOffset(m.raw)).toBe(50);
     expect(chunkKeys(m, { currentEpochOnly: true })).toHaveLength(1);
   });
@@ -930,6 +932,32 @@ describe("backfill epochs", () => {
     expect((await validateManifest(held)).map((i) => i.path)).toContain(
       "raw.owner",
     );
+  });
+
+  it("reads and validates the export marker's watermarks", async () => {
+    const m = await ndjsonManifest();
+    expect(exportWatermarks(m)).toEqual({});
+    const path = `extensions.${EXPORT_EXTENSION}.origin_revisions`;
+    const marked = (origin_revisions: unknown) => ({
+      ...m,
+      extensions: { [EXPORT_EXTENSION]: { ...marker, origin_revisions } },
+    });
+    expect(await validateManifest(marked({}))).toEqual([]);
+    const good = marked({ "00000000000000ab": 41 });
+    expect(await validateManifest(good)).toEqual([]);
+    expect(exportWatermarks(good)).toEqual({ "00000000000000ab": 41 });
+    for (const bad of [
+      [],
+      "x",
+      { "machine:a": 1 },
+      { o: -1 },
+      { o: "41" },
+      { o: 1.5 },
+      { o: Number.MAX_SAFE_INTEGER + 1 },
+    ])
+      expect((await validateManifest(marked(bad))).map((i) => i.path)).toContain(
+        path,
+      );
   });
 
   it("accepts a Rust-produced backfilled and resumed manifest", async () => {

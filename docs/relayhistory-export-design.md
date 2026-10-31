@@ -130,8 +130,9 @@ manifest body.
   assertions cannot open a `backfill` epoch.
   The epoch is sealed, and the client continues in a `resumed` epoch at its
   own offset (`manifest-v1.md`, "Backfill"). The courier edits the stored
-  manifest, adopts it after a lost race, and with `COURIER_FORMAT=ndjson` wraps
-  harness lines in the record envelope. A `jsonl` session still cannot take a
+  manifest, adopts it after a lost race, and with `COURIER_FORMAT=ndjson` sends
+  its change feed's rows, whose `origin_id`, `record_id` and `revision` equal the
+  Neon records'. A `jsonl` session still cannot take a
   backfill. A backfill stays refused (`activation_required`) until the session's
   writer and every reader in `MANIFEST_READER_CAPABILITIES` advertise
   `manifest-epochs-v2`, so an old courier keeps delivering and its backfill

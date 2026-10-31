@@ -85,6 +85,7 @@ export {
   chunkKeys,
   commitBackfillEpoch,
   computeContentSha256,
+  exportWatermarks,
   liveEpoch,
   liveNextOffset,
   MANIFEST_EPOCHS_CAPABILITY,
@@ -107,3 +108,35 @@ export {
   type RawFormat,
 } from "@rhc-object-store";
 export { ObjectStoreError, isObjectStoreError } from "@rhc-object-store";
+export {
+  deleteParkedSession,
+  expireParkedSession,
+  META_PARKED_AT,
+  PARKED_TTL_MS,
+  parkedManifestKey,
+} from "@rhc/lib/pipeline/parked.ts";
+export {
+  assertNoMachineSplits,
+  detectMachineSplits,
+  SESSION_MACHINE_SPLIT,
+  type SessionMachineSplit,
+} from "@rhc/lib/pipeline/session-split.ts";
+export {
+  BACKFILL_ACTIVATION_STAGE,
+  backfillActivationDelay,
+  backfillActivationHandler,
+  backfillActivationLimits,
+  backfillActivationWorkKey,
+  postgresBackfillReady,
+  type BackfillActivationPayload,
+} from "@rhc/lib/pipeline/backfill-activation.ts";
+export {
+  attestReader,
+  MANIFEST_READERS,
+  missingReaders,
+  postgresReadinessStore,
+  selfCheckManifestEpochs,
+  type ManifestReader as ManifestReaderName,
+  type ReadinessRow,
+  type ReadinessStore,
+} from "@rhc/lib/pipeline/manifest-readiness.ts";

@@ -9,7 +9,6 @@ import {
   commitBackfillEpoch,
   computeContentSha256,
   isObjectStoreError,
-  MANIFEST_EPOCHS_CAPABILITY,
   manifestKey,
   objectKey,
   objectStoreManifestReader,
@@ -25,7 +24,8 @@ import {
   type SessionLocation,
 } from "../../shared/vendor.ts";
 import { runCourierOnce, type CourierConfig } from "../courier.ts";
-import { createCourierManifestRoutes, MANIFEST_READERS } from "../manifests.ts";
+import { feedRecordId } from "../feed-records.ts";
+import { createCourierManifestRoutes } from "../manifests.ts";
 
 const ORG = "org_test";
 const WORKSPACE = "default";
@@ -34,7 +34,7 @@ export const EXPORTER = "migration:mgr_export";
 export const MARKER = { version: 1, source: "neon.delivery_records" };
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 
-const authFor = (kind: string | undefined) => ({
+const authFor = (kind: string | undefined, machineId: string | undefined) => ({
   userId: "user",
   orgId: ORG,
   workspaceId: WORKSPACE,
@@ -42,7 +42,7 @@ const authFor = (kind: string | undefined) => ({
   scopes: ["rth:sync"],
   claims: kind === "migration"
     ? { meta: { tokenClass: "migration_assertion", grantId: "mgr_export", planDigest: "a".repeat(64) } }
-    : {},
+    : machineId ? { meta: { machineId } } : {},
   historyOrigin: "https://history.example",
 });
 
@@ -50,11 +50,12 @@ const authFor = (kind: string | undefined) => ({
 function asLegacyWriter(init: RequestInit): RequestInit {
   const body = JSON.parse(String(init.body)) as { manifest: ManifestV1 };
   delete body.manifest.writer.capabilities;
+  body.manifest.writer.plugin_version = "96bulls-courier/0.2.0";
   return { ...init, body: JSON.stringify(body) };
 }
 
 /** One client's courier against the real manifest routes and a real fs store. */
-export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machineId?: string; sessionId?: string; root?: string } = {}) {
+export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machineId?: string; sessionId?: string; root?: string; epoch?: number } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "96bulls-courier-races-"));
   const root = options.root ?? dir;
   const machineId = options.machineId ?? "machine-a";
@@ -64,29 +65,34 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
   const rawPath = join(dir, "session.jsonl");
   await writeFile(rawPath, "");
   const db = new DatabaseSync(dbPath);
-  db.exec("CREATE TABLE sessions (session_id TEXT, source TEXT, raw_path TEXT, first_activity_ms INTEGER, last_activity_ms INTEGER, cwd TEXT, agent_version TEXT)");
-  db.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)").run(sessionId, "claude", rawPath, STARTED, STARTED + 100, null, "1.0.0");
+  db.exec("CREATE TABLE sessions (session_id TEXT, source TEXT, raw_path TEXT, first_activity_ms INTEGER, last_activity_ms INTEGER, cwd TEXT, agent_version TEXT, revision INTEGER DEFAULT 0)");
+  db.exec("CREATE TABLE change_feed_store (singleton INTEGER PRIMARY KEY, epoch INTEGER NOT NULL)");
+  db.prepare("INSERT INTO change_feed_store VALUES (1, ?)").run(options.epoch ?? 171);
+  db.exec("CREATE TABLE session_events (source TEXT, session_id TEXT, event_uid TEXT, ts_ms INTEGER, text TEXT, raw_facts_version INTEGER, revision INTEGER)");
+  db.exec("CREATE TABLE evidence_tombstones (kind TEXT, source TEXT, session_id TEXT, record_key TEXT, revision INTEGER)");
+  db.prepare("INSERT INTO sessions (session_id, source, raw_path, first_activity_ms, last_activity_ms, cwd, agent_version) VALUES (?, ?, ?, ?, ?, ?, ?)").run(sessionId, "claude", rawPath, STARTED, STARTED + 100, null, "1.0.0");
   db.close();
 
+  /** The fake issuer and gate: a real token's claim, and attested readers. */
+  const gate = { missing: [] as string[], requeued: [] as { message: unknown; delaySeconds: number }[] };
+  const identity: { machineClaim?: string } = { machineClaim: machineId };
   const store = createFsStore({ root });
   const raw = { store, provider: "fs" as const, bucket: "raw" };
   const routes = createCourierManifestRoutes({
     manifests: objectStoreManifestReader(store, { provider: "fs", bucket: "raw" }),
     raw,
     send: async () => {},
+    missingReaders: async () => gate.missing,
+    requeueBackfill: async (_env, message, delaySeconds) => void gate.requeued.push({ message, delaySeconds }),
   });
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     c.set("correlationId", "test");
-    c.set("auth", authFor(c.req.header("x-test-auth")) as never);
+    c.set("auth", authFor(c.req.header("x-test-auth"), identity.machineClaim) as never);
     await next();
   });
   app.route("/v1", routes);
-  const env: Record<string, string> = {
-    PIPELINE_ORG_ID: ORG,
-    RELAYHISTORY_ORIGIN: "https://history.example",
-    MANIFEST_READER_CAPABILITIES: MANIFEST_READERS.map((r) => `${r}=${MANIFEST_EPOCHS_CAPABILITY}`).join(","),
-  };
+  const env: Record<string, string> = { PIPELINE_ORG_ID: ORG, RELAYHISTORY_ORIGIN: "https://history.example" };
   const location: SessionLocation = {
     workspaceId: WORKSPACE,
     machineId,
@@ -96,6 +102,7 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
   };
   const key = manifestKey(location);
 
+  let revision = 0;
   const counts = { chunkPosts: 0, manifestPosts: 0 };
   /** Runs around a courier manifest POST; returns a replacement response to drop the real one. */
   const hooks: { legacyWriter?: boolean; beforeManifest?: () => Promise<void>; afterManifest?: (res: Response) => Promise<Response | undefined> } = {};
@@ -199,7 +206,7 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
   };
 
   /** A cold export: the manifest does not exist yet, and the exporter owns it. */
-  const coldExport = async (text: string) => {
+  const coldExport = async (text: string, marker: Record<string, unknown> = {}) => {
     const { entry, scrub } = await seal(text, 0, 0, TRACE);
     const at = new Date().toISOString();
     const manifest: ManifestV1 = {
@@ -227,7 +234,7 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
         chunks: [entry],
         scrub,
       },
-      extensions: { "client.relayhistory_export": MARKER },
+      extensions: { "client.relayhistory_export": { ...MARKER, ...marker } },
     };
     const res = await post({ key, manifest }, "migration");
     if (res.status !== 202) throw new Error(`cold export refused: ${res.status}`);
@@ -238,7 +245,7 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
   const liveRecords = async () => {
     const { manifest } = (await stored())!;
     const records = await readRelayhistoryExport(manifest, store, (b) => new Uint8Array(zstdDecompressSync(b)));
-    return { manifest, records, lines: records.filter((r) => r.kind === "harness_line").map((r) => r.payload!.line as string) };
+    return { manifest, records, lines: records.filter((r) => r.kind === "session_event" && r.record_id !== "pre-t0").map((r) => r.payload!.text as string) };
   };
 
   const run = async () => {
@@ -252,8 +259,40 @@ export async function courierWorld(options: { format?: "jsonl" | "ndjson"; machi
   };
 
   return {
-    app, env, store, rootDir: root, key, location, counts, hooks, machineId, statePath, rawPath, stored, seal, post, coldExport, exporter, exportText, liveRecords, run,
-    write: (line: string) => appendFile(rawPath, `${line}\n`),
+    app, env, gate, identity, store, rootDir: root, key, location, counts, hooks, machineId, statePath, rawPath, stored, seal, post, coldExport, exporter, exportText, liveRecords, run,
+    /** One harness line: in the transcript, and as the row it became. */
+    write: async (line: string) => {
+      await appendFile(rawPath, `${line}\n`);
+      const rw = new DatabaseSync(dbPath);
+      revision += 1;
+      rw.prepare("INSERT INTO session_events VALUES ('claude', ?, ?, ?, ?, 3, ?)").run(sessionId, `uid-${revision}`, STARTED + revision, line, revision);
+      rw.close();
+      return revision;
+    },
+    setEpoch: (epoch: number) => {
+      const rw = new DatabaseSync(dbPath);
+      rw.prepare("UPDATE change_feed_store SET epoch = ?").run(epoch);
+      rw.close();
+    },
+    /** Delete a row as the client does: a tombstone with its own revision. */
+    tombstone: (n: number) => {
+      const rw = new DatabaseSync(dbPath);
+      revision += 1;
+      rw.prepare("DELETE FROM session_events WHERE event_uid = ?").run(`uid-${n}`);
+      rw.prepare("INSERT INTO evidence_tombstones VALUES ('session_event', 'claude', ?, ?, ?)").run(sessionId, `uid-${n}`, revision);
+      rw.close();
+    },
+    /** A row as the client uploaded it: what the export holds for that row. */
+    exportedRow: (n: number, line: string, origin = (options.epoch ?? 171).toString(16).padStart(16, "0")) =>
+      `${JSON.stringify({
+        kind: "session_event",
+        origin_id: origin,
+        record_id: feedRecordId(["session_event", "claude", sessionId, `uid-${n}`]),
+        revision: String(n),
+        operation: "upsert",
+        received_at: new Date(STARTED).toISOString(),
+        payload: { source: "claude", session_id: sessionId, event_uid: `uid-${n}`, ts_ms: STARTED + n, text: line },
+      })}\n`,
     state: async () => JSON.parse(await readFile(statePath, "utf8")),
     close: () => rm(dir, { recursive: true, force: true }),
   };
