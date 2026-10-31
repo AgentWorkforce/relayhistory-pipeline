@@ -11,7 +11,6 @@ import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql
 import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import type { AddressInfo } from "node:net";
 import {
-  liveRoleGate,
   ROLE_VALIDATION_TABLE,
   ROLE_VERIFY_SQL_PATH,
   schemaVerdict,
@@ -80,7 +79,7 @@ function hoopLike(db: PGlite): HoopDb {
 }
 
 const verdict = async (db: PGlite) =>
-  schemaVerdict(client(db), await expectedSchema(), transact(db));
+  schemaVerdict(await expectedSchema(), transact(db));
 const marker = async (db: PGlite) =>
   (
     await db.query<{ generation: string; status: string }>(
@@ -169,7 +168,7 @@ describe("Worker role validation marker", () => {
     // And a reader built from a different migration set never accepts this PASS.
     await runMigrations(client(db));
     const other = { ...(await expectedSchema()), generation: "f".repeat(64) };
-    expect(await schemaVerdict(client(db), other, transact(db))).toEqual({
+    expect(await schemaVerdict(other, transact(db))).toEqual({
       ok: false,
       reason: "validation_pending",
     });
@@ -270,8 +269,7 @@ describe("the live gate: the marker is never the sole authority", () => {
       ready: true,
       lastTickAt: Date.now(),
       consecutiveDbFailures: 0,
-      schemaReady: async () =>
-        (await schemaVerdict(client(db), expected, transact(db))).ok,
+      schemaReady: async () => (await schemaVerdict(expected, transact(db))).ok,
     };
     const server = serveHealth(health, 0);
     await new Promise((r) => server.once("listening", r));
@@ -295,8 +293,7 @@ describe("the live gate: the marker is never the sole authority", () => {
     await runMigrations(client(db));
     const expected = await expectedSchema();
     const health = {
-      schemaReady: async () =>
-        (await schemaVerdict(client(db), expected, transact(db))).ok,
+      schemaReady: async () => (await schemaVerdict(expected, transact(db))).ok,
     };
     let claims = 0;
     const tick = async () => {
@@ -351,20 +348,36 @@ describe("the live gate: the marker is never the sole authority", () => {
     }
   });
 
-  test("the gate is one READ ONLY transaction with its own statement_timeout, running the shared phase 2 file", async () => {
+  test("the check is one READ COMMITTED, READ ONLY transaction with its own statement_timeout: ledger, marker, the shared phase 2 file, then the marker as the final read", async () => {
+    const expected = await expectedSchema();
     const seen: string[] = [];
     const recorder: Transact = async (work) =>
       work({
         async query(text: string) {
           seen.push(text);
+          if (text.startsWith("SELECT name FROM sessions.__96bulls_migrations"))
+            return { rows: expected.names.map((name) => ({ name })) } as never;
+          if (text.startsWith("SELECT generation, status FROM"))
+            return {
+              rows: [{ generation: expected.generation, status: "pass" }],
+            } as never;
           return { rows: [] } as never;
         },
       } as never);
-    expect(await liveRoleGate(recorder)).toEqual({ ok: true });
-    expect(seen[0]).toBe("SET TRANSACTION READ ONLY");
+    expect(await schemaVerdict(expected, recorder)).toEqual({ ok: true });
+    expect(seen[0]).toBe(
+      "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
+    );
     expect(seen[1]).toMatch(/^SET LOCAL statement_timeout = \d+$/);
-    expect(seen[2]).toBe(VERIFY);
-    expect(seen).toHaveLength(3);
+    expect(seen[2]).toStartWith(
+      "SELECT name FROM sessions.__96bulls_migrations",
+    );
+    expect(seen[3]).toStartWith("SELECT generation, status FROM");
+    expect(seen[4]).toBe(VERIFY);
+    expect(seen[5]).toStartWith("SELECT generation, status FROM"); // the final read
+    expect(seen).toHaveLength(6);
+    // No advisory lock anywhere on the probe path.
+    expect(seen.some((q) => /advisory/i.test(q))).toBe(false);
     // One source: the migrator's verify step and mark_pass.sql use the same file.
     expect(
       (await plan()).find((st) => st.name.startsWith("verify:"))?.path,
@@ -372,6 +385,102 @@ describe("the live gate: the marker is never the sole authority", () => {
     expect(MARK_PASS).toContain(
       "\\ir session_directory_search_worker_verify.sql",
     );
+  });
+
+  /** A real PGlite transaction whose marker reads see `flip` once it is set (a commit by another connection, as READ COMMITTED would see it). */
+  const racing =
+    (
+      db: PGlite,
+      state: { flipTo?: string; markerReads: number; verified: boolean },
+    ): Transact =>
+    (work) =>
+      db.transaction((tx) =>
+        work({
+          async query(text: string, params?: unknown[]) {
+            const r = (await tx.query(text, params)) as { rows: unknown[] };
+            if (text === VERIFY) state.verified = true;
+            if (text.startsWith("SELECT generation, status FROM")) {
+              state.markerReads += 1;
+              if (state.flipTo)
+                return {
+                  rows: (r.rows as { generation: string }[]).map((m) => ({
+                    ...m,
+                    status: state.flipTo,
+                  })),
+                };
+            }
+            return r;
+          },
+        } as never),
+      ) as never;
+
+  test("race: the marker flips to pending after phase 2 and before the final read: not ready", async () => {
+    const db = await fresh();
+    await runMigrations(client(db));
+    const state = {
+      flipTo: undefined as string | undefined,
+      markerReads: 0,
+      verified: false,
+    };
+    const v = await schemaVerdict(await expectedSchema(), racing(db, state), {
+      afterVerify: async () => {
+        state.flipTo = "pending"; // a migrator's pending upsert committed now
+      },
+    });
+    expect(v).toEqual({ ok: false, reason: "validation_pending" });
+    expect(state).toMatchObject({ verified: true, markerReads: 2 });
+  });
+
+  test("race, reverse: pending at the first read and pass afterwards never reports ready without the live check", async () => {
+    const db = await fresh();
+    await runMigrations(client(db));
+    const state = {
+      flipTo: "pending" as string | undefined,
+      markerReads: 0,
+      verified: false,
+    };
+    expect(
+      await schemaVerdict(await expectedSchema(), racing(db, state)),
+    ).toEqual({
+      ok: false,
+      reason: "validation_pending",
+    });
+    expect(state).toMatchObject({ verified: false, markerReads: 1 }); // early exit, nothing reported ready
+    // Now it reads 'pass', but the role has drifted: the live check still runs and closes it.
+    await db.exec(`GRANT SELECT ON sessions.session_index TO ${WORKER}`);
+    const later = {
+      flipTo: undefined as string | undefined,
+      markerReads: 0,
+      verified: false,
+    };
+    expect(
+      await schemaVerdict(await expectedSchema(), racing(db, later)),
+    ).toEqual({
+      ok: false,
+      reason: "role_validation_failed",
+      error_code: "55000",
+    });
+  });
+
+  test("HOOPDB_ROLE_GATE_TIMEOUT_MS above the cap (or invalid) closes the gate instead of running unbounded", async () => {
+    const db = await fresh();
+    await runMigrations(client(db));
+    const saved = process.env.HOOPDB_ROLE_GATE_TIMEOUT_MS;
+    try {
+      for (const bad of ["10001", "0", "abc", "1.5"]) {
+        process.env.HOOPDB_ROLE_GATE_TIMEOUT_MS = bad;
+        expect(await verdict(db)).toEqual({
+          ok: false,
+          reason: "role_validation_failed",
+          error_code: "gate_timeout_invalid",
+        });
+      }
+      process.env.HOOPDB_ROLE_GATE_TIMEOUT_MS = "10000";
+      expect(await verdict(db)).toEqual({ ok: true });
+    } finally {
+      if (saved === undefined) delete process.env.HOOPDB_ROLE_GATE_TIMEOUT_MS;
+      else process.env.HOOPDB_ROLE_GATE_TIMEOUT_MS = saved;
+    }
   });
 
   // mark_pass.sql as psql runs it: \ir inlines the verifier, :'generation' is the quoted value.

@@ -75,27 +75,47 @@ grant added after a PASS fails the next check with no migrator involved. The sam
 gates `waitForSchema` (startup), worker startup, every worker `/readyz` probe, every
 ingest `/readyz` probe, and the worker's claim loop before it takes new work.
 
-The live check (`liveRoleGate` in `src/shared/db.ts`):
+The check (`schemaVerdict` in `src/shared/db.ts`) is one transaction, `READ ONLY`
+and pinned to `READ COMMITTED`, in this order:
+
+1. the ledger (`schema_pending` if incomplete);
+2. the marker (`validation_pending` unless `'pass'` for this generation; phase 2 is
+   then skipped, so nothing becomes ready without it);
+3. phase 2 (`role_validation_failed` with its SQLSTATE on any error);
+4. the marker again, as the **final read** (`validation_pending` unless still `'pass'`
+   for this generation).
+
+`READ COMMITTED` is deliberate. Every statement takes a fresh snapshot, so the final read
+sees a migrator that set the marker to `'pending'` while phase 2 was running. Under
+`REPEATABLE READ` it would reuse the first snapshot and miss that change.
 
 - **One source:** it executes `supabase/bootstrap/session_directory_search_worker_verify.sql`,
   the same file the migrator runs and `mark_pass.sql` includes with `\ir`.
-- **Read-only and bounded:** one `READ ONLY` transaction with its own
-  `statement_timeout` (`HOOPDB_ROLE_GATE_TIMEOUT_MS`, default 2000).
+- **Bounded:** the transaction has its own `statement_timeout`
+  (`HOOPDB_ROLE_GATE_TIMEOUT_MS`, default 2000). Values outside 1..10000, or non-integers,
+  close the gate (`gate_timeout_invalid`) rather than running unbounded.
 - **No lock, no cache:** it never takes the migrator's advisory lock, so a long migrate
-  never blocks a probe, and it runs on every probe and every claim tick.
+  never blocks a probe, and it runs on every probe and before every claim.
 - **Its own role:** it runs as the role the service connects as (`HOOPDB_URL`). That
   role needs SELECT on the ledger and the marker table. Phase 2 reads only PUBLIC-readable
   catalogs: `pg_roles`, `pg_auth_members`, `pg_db_role_setting`, `pg_shdepend`,
   `pg_namespace`, `pg_proc`, `pg_database` and `pg_default_acl`.
-- **Fails closed:** any error closes the gate, is logged with its SQLSTATE (`live role
-validation gate closed`) and makes the reader not ready. That covers a violation
-  (`55000`), an unreadable catalog (`42501`), a timeout (`57014`) and a lost connection.
+- **Fails closed:** any error closes the gate, is logged with its SQLSTATE and stage
+  (`live role validation gate closed`) and makes the reader not ready. That covers a
+  violation (`55000`), an unreadable catalog (`42501`), a timeout (`57014`) and a lost
+  connection.
 
-**The worker while the gate is closed:** the claim loop checks the gate before each
-tick, and while it is closed the worker claims nothing and runs no side tick. Work
-claimed before the gate closed has already finished inside its poll call (acked, retried
-or dead-lettered). A batch cut short by a crash is redelivered when its lease expires.
-The worker resumes claiming on the first tick after the gate reopens.
+**Current-tick semantics.** A verdict holds as of its final read and only for the one
+action it gates: one probe response, or one claim. The worker checks the gate again
+before every stage's claim and before its side tick, so a gate that closes mid-tick stops
+the next claim.
+
+The most a closing gate can leave running is the batch claimed just before it closed:
+at most `WORKER_BATCH_SIZE` messages (default 10) of one stage. That batch runs to
+completion inside its poll call (acked, retried or dead-lettered). If the worker
+crashes, the batch is redelivered when its lease (`WORKER_LEASE_SECONDS`, default 300)
+expires. So the window is one batch's processing time. While the gate is closed the
+worker claims nothing, and it resumes on the first check that passes.
 
 Record format, the contract for #75's external verifier:
 

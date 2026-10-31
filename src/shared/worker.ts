@@ -291,7 +291,7 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   await waitForSchema(db, expected);
   // Live on every /readyz probe and before every claim: ledger, marker AND phase 2 now.
   health.schemaReady = async () =>
-    (await schemaVerdict(db, expected, (work) => inTransaction(db, work))).ok;
+    (await schemaVerdict(expected, (work) => inTransaction(db, work))).ok;
   clearInterval(startupBeat);
   health.ready = true;
   health.lastTickAt = Date.now();
@@ -368,15 +368,19 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
       });
     }
     health.lastTickAt = Date.now();
-    // The live gate, before any new work is claimed. While it is closed the worker
-    // claims nothing (and runs no side tick); work claimed earlier has already
-    // finished inside its pollPostgresStage call (acked, retried or dead-lettered),
-    // and a batch cut short by a crash is re-delivered when its lease expires.
-    if (!(await gateOpen(health))) {
-      await sleep(idleMs);
-      continue;
-    }
+    // The live gate, checked again before EVERY claim (each stage's batch) and before
+    // the side tick. Current-tick semantics: a verdict holds only as of its final read,
+    // so the most a closing gate can leave running is the one batch claimed just before
+    // it closed: at most WORKER_BATCH_SIZE messages of one stage, which finish inside
+    // their pollPostgresStage call (acked, retried or dead-lettered). A batch cut short
+    // by a crash is re-delivered when its lease (WORKER_LEASE_SECONDS) expires. While
+    // the gate is closed the worker claims nothing.
+    let gated = false;
     for (const stage of opts.stages) {
+      if (!(await gateOpen(health))) {
+        gated = true;
+        break;
+      }
       try {
         const r = await pollPostgresStage({
           sql: db,
@@ -398,7 +402,7 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
         log.error("poll failed", { stage, ...errorFields(err) });
       }
     }
-    if (opts.tick) {
+    if (opts.tick && !gated && (await gateOpen(health))) {
       // Long side work (reconcile) keeps the progress clock moving while it runs.
       const tickBeat = setInterval(
         () => (health.lastTickAt = Date.now()),

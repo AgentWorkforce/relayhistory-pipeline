@@ -325,7 +325,7 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
   const expected = await expectedSchema();
   app.get("/readyz", async (c) => {
     try {
-      const schema = await schemaVerdict(db, expected, transaction);
+      const schema = await schemaVerdict(expected, transaction);
       if (!schema.ok) return c.json(schema, 503);
       const data = await liveDataPathVerdict(process.env);
       if (!data.ok) return c.json({ ok: false, missing: data.missing }, 503);

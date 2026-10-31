@@ -11,7 +11,7 @@
 --             Supabase `postgres`) is enough. It changes nothing.
 --   when      after every migrate, once the full migration set is applied.
 --   exit      0 when everything holds; otherwise SQLSTATE 55000 naming every violation.
---   live      it is also the readiness gate: liveRoleGate (src/shared/db.ts) runs this file
+--   live      it is also the readiness gate: schemaVerdict (src/shared/db.ts) runs this file
 --             read-only on every probe and before every worker claim.
 --   marker    run alone, it records nothing. Readers become ready only on a PASS record
 --             (sessions.__96bulls_role_validation) written in the same transaction as

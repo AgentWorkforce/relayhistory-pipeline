@@ -82,6 +82,10 @@ export async function expectedSchema(): Promise<ExpectedSchema> {
   return { names: await expectedMigrationNames(), generation: await generation() };
 }
 
+/** The migrator's "pending first" write, under its advisory lock, before any step. */
+export const MARKER_PENDING_SQL = `INSERT INTO ${ROLE_VALIDATION_TABLE} (name, generation, status) VALUES ($1, $2, 'pending')
+       ON CONFLICT (name) DO UPDATE SET generation = EXCLUDED.generation, status = 'pending', updated_at = now()`;
+
 export interface MigrationClient {
   query<R = Record<string, unknown>>(text: string, params?: unknown[]): Promise<{ rows: R[] }>;
 }
@@ -124,11 +128,7 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
     const steps = opts.steps ?? (await plan());
     const gen = await generation();
     // Pending first: committed before any migration can become visible.
-    await client.query(
-      `INSERT INTO ${ROLE_VALIDATION_TABLE} (name, generation, status) VALUES ($1, $2, 'pending')
-       ON CONFLICT (name) DO UPDATE SET generation = EXCLUDED.generation, status = 'pending', updated_at = now()`,
-      [ROLE_VALIDATION_NAME, gen],
-    );
+    await client.query(MARKER_PENDING_SQL, [ROLE_VALIDATION_NAME, gen]);
     log.info("role validation pending", { reason: gen });
     const ledger = new Map<string, string>(
       (await client.query<{ name: string; sha256: string }>(`SELECT name, sha256 FROM ${MIGRATION_LEDGER}`)).rows.map(
