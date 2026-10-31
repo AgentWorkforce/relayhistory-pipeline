@@ -37,6 +37,67 @@ const TOKEN_PREFIXES = ["relay_pa_", "relay_ws_", "relay_id_", "relay_ag_"];
 const CLOCK_SKEW_SECONDS = 60;
 export const MIGRATION_ASSERTION_SUBJECT = "agent_relayhistory_migration";
 const MIGRATION_ASSERTION_CLASS = "migration_assertion";
+/**
+ * The v2 pre-mint base-read capability (96BullSessions
+ * docs/contracts/relayhistory-export-plan-entry-v2-issuer.md section 3): its
+ * own subject, token class, scope, audience, lifetime, meta key and jti
+ * namespace, so it can never stand in for an upload assertion or the reverse.
+ */
+export const MIGRATION_BASE_READ_SUBJECT =
+  "agent_relayhistory_migration_base_read";
+const MIGRATION_BASE_READ_CLASS = "migration_base_read";
+const MIGRATION_BASE_READ_SCOPE = "rth:migration_base_read";
+const MIGRATION_BASE_READ_MAX_TTL_SECONDS = 30;
+const MIGRATION_BASE_READ_JTI_PREFIX = "mbr_";
+/** The base-read capability's audience path, after this History's origin. */
+export const MIGRATION_BASE_READ_AUDIENCE_PATH = "/v1/pipeline/manifests/base";
+
+interface MigrationClassDef {
+  kind: "upload" | "base_read";
+  sub: string;
+  tokenClass: string;
+  scope: string;
+  maxTtl: number;
+  audience: (origin: string) => string;
+  identityKey: "upload" | "read";
+}
+const UPLOAD_CLASS: MigrationClassDef = {
+  kind: "upload",
+  sub: MIGRATION_ASSERTION_SUBJECT,
+  tokenClass: MIGRATION_ASSERTION_CLASS,
+  scope: "rth:sync",
+  maxTtl: 60,
+  audience: (origin) => origin,
+  identityKey: "upload",
+};
+const BASE_READ_CLASS: MigrationClassDef = {
+  kind: "base_read",
+  sub: MIGRATION_BASE_READ_SUBJECT,
+  tokenClass: MIGRATION_BASE_READ_CLASS,
+  scope: MIGRATION_BASE_READ_SCOPE,
+  maxTtl: MIGRATION_BASE_READ_MAX_TTL_SECONDS,
+  audience: (origin) => `${origin}${MIGRATION_BASE_READ_AUDIENCE_PATH}`,
+  identityKey: "read",
+};
+
+/**
+ * The migration class a token claims by either marker (subject or
+ * meta.tokenClass); `null` when its markers name different classes (malformed).
+ */
+function migrationClassOf(
+  claims: Record<string, unknown>,
+): MigrationClassDef | null | undefined {
+  const tokenClass = metaOf(claims)?.tokenClass;
+  const bySub = [UPLOAD_CLASS, BASE_READ_CLASS].find(
+    (c) => c.sub === claims.sub,
+  );
+  const byClass = [UPLOAD_CLASS, BASE_READ_CLASS].find(
+    (c) => c.tokenClass === tokenClass,
+  );
+  if (!bySub && !byClass) return undefined;
+  if (bySub && byClass && bySub !== byClass) return null;
+  return bySub ?? byClass;
+}
 /** RelayAuth caps a migration assertion's lifetime (`exp - iat`) at 60 seconds. */
 const MIGRATION_ASSERTION_MAX_TTL_SECONDS = 60;
 /**
@@ -76,6 +137,7 @@ export async function verifyAgentRelayToken(
     | "RELAYHISTORY_ORIGIN"
     | "RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS"
     | "RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS"
+    | "RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ"
   >,
 ): Promise<AuthContext> {
   const token = stripRelayTokenPrefix(tokenWithOptionalPrefix.trim());
@@ -222,7 +284,10 @@ async function importVerificationKey(
   let jwk = jwks.keys?.find((candidate) => candidate.kid === kid);
   // 96BullSessions change: a kid we have not seen may be a rotated key. Refetch
   // the set once (rate-limited per URL) instead of rejecting until restart.
-  if (!jwk && Date.now() - (jwksFetchedAt.get(jwksUrl) ?? 0) > JWKS_REFRESH_MIN_MS) {
+  if (
+    !jwk &&
+    Date.now() - (jwksFetchedAt.get(jwksUrl) ?? 0) > JWKS_REFRESH_MIN_MS
+  ) {
     jwksCache.delete(jwksUrl);
     jwks = await getJwks(jwksUrl);
     jwk = jwks.keys?.find((candidate) => candidate.kid === kid);
@@ -284,6 +349,7 @@ function validateClaims(
     | "RELAYHISTORY_ORIGIN"
     | "RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS"
     | "RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS"
+    | "RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ"
   >,
 ): string | undefined {
   const issuer = env.RELAYAUTH_ISSUER?.trim() || DEFAULT_RELAYAUTH_ISSUER;
@@ -292,6 +358,17 @@ function validateClaims(
   }
   const historyOrigin = configuredHistoryOrigin(env);
   const migration = isMigrationAssertionMarked(claims);
+  const migrationClass = migrationClassOf(claims);
+  if (
+    migrationClass?.kind === "base_read" &&
+    env.RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ !== "true"
+  ) {
+    // The base read has its own default-off activation gate.
+    throw new IdentityError(
+      "invalid_claims",
+      "migration base reads are not enabled on this History",
+    );
+  }
   if (migration && env.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS !== "true") {
     // Dedicated, default-off switch: the broad interim bearer flag alone
     // never admits a migration assertion.
@@ -305,7 +382,8 @@ function validateClaims(
     // minted for this History's origin, never on the shared legacy audience.
     if (
       historyOrigin === undefined ||
-      soleAudience(claims.aud) !== historyOrigin
+      !migrationClass ||
+      soleAudience(claims.aud) !== migrationClass.audience(historyOrigin)
     ) {
       throw new IdentityError(
         "invalid_claims",
@@ -364,10 +442,7 @@ function validateClaims(
  * with only one of them is not ordinary either: it is refused as malformed.
  */
 function isMigrationAssertionMarked(claims: Record<string, unknown>): boolean {
-  return (
-    claims.sub === MIGRATION_ASSERTION_SUBJECT ||
-    metaOf(claims)?.tokenClass === MIGRATION_ASSERTION_CLASS
-  );
+  return migrationClassOf(claims) !== undefined;
 }
 
 /**
@@ -378,9 +453,9 @@ function isMigrationAssertionMarked(claims: Record<string, unknown>): boolean {
 export function isMigrationAssertionClass(
   claims: Record<string, unknown>,
 ): boolean {
+  const c = migrationClassOf(claims);
   return (
-    claims.sub === MIGRATION_ASSERTION_SUBJECT &&
-    metaOf(claims)?.tokenClass === MIGRATION_ASSERTION_CLASS
+    !!c && claims.sub === c.sub && metaOf(claims)?.tokenClass === c.tokenClass
   );
 }
 
@@ -404,16 +479,18 @@ function migrationAssertionClaims(
     throw new IdentityError("invalid_claims", `migration assertion ${message}`);
   };
   const meta = metaOf(claims);
-  if (!isMigrationAssertionClass(claims) || !meta) refuse("class is malformed");
+  const def = migrationClassOf(claims);
+  if (!def || !isMigrationAssertionClass(claims) || !meta)
+    refuse("class is malformed");
   if (claims.token_type !== "access") refuse("must be an access token");
   const scopes = claims.scopes;
   if (
     claims.scope !== undefined ||
     !Array.isArray(scopes) ||
     scopes.length !== 1 ||
-    scopes[0] !== "rth:sync"
+    scopes[0] !== def!.scope
   ) {
-    refuse("scopes must be exactly rth:sync");
+    refuse(`scopes must be exactly ${def!.scope}`);
   }
   const iat = claims.iat;
   const exp = claims.exp;
@@ -421,7 +498,7 @@ function migrationAssertionClaims(
     typeof iat !== "number" ||
     typeof exp !== "number" ||
     exp <= iat ||
-    exp - iat > MIGRATION_ASSERTION_MAX_TTL_SECONDS ||
+    exp - iat > def!.maxTtl ||
     iat - MIGRATION_CLOCK_SKEW_SECONDS > now
   ) {
     refuse("lifetime is invalid");
@@ -435,7 +512,13 @@ function migrationAssertionClaims(
     refuse("sourceUserId is malformed");
   if (typeof workspaceId !== "string" || !MIGRATION_ID_SHAPE.test(workspaceId))
     refuse("workspaceId is malformed");
-  if (typeof jti !== "string" || !MIGRATION_ID_SHAPE.test(jti)) {
+  if (
+    typeof jti !== "string" ||
+    !MIGRATION_ID_SHAPE.test(jti) ||
+    // Separate jti namespaces: only a base-read capability starts with mbr_.
+    jti.startsWith(MIGRATION_BASE_READ_JTI_PREFIX) !==
+      (def!.kind === "base_read")
+  ) {
     refuse("jti is malformed");
   }
   if (typeof nonce !== "string" || !MIGRATION_NONCE_SHAPE.test(nonce)) {
@@ -449,8 +532,18 @@ function migrationAssertionClaims(
   }
   // The signed per-upload identity (relayauth #111), derived by the issuer
   // from the grant's stored plan.
-  const upload = parseUploadIdentity(meta!.upload);
-  if (!upload) refuse("upload identity is malformed");
+  // An upload assertion carries meta.upload (v1 or v2 commit) and no
+  // meta.read; a base-read capability carries meta.read and no meta.upload.
+  const other = def!.identityKey === "upload" ? "read" : "upload";
+  if (meta![other] !== undefined) refuse(`must not carry meta.${other}`);
+  const parsed = parseUploadIdentity(meta![def!.identityKey]);
+  const upload =
+    parsed &&
+    (def!.kind === "base_read") ===
+      ((parsed as { kind?: unknown }).kind === "backfill_base_read")
+      ? parsed
+      : undefined;
+  if (!upload) refuse(`${def!.identityKey} identity is malformed`);
   const sponsorId = stringClaim(claims, "sponsorId");
   const chain = claims.sponsorChain;
   if (
@@ -458,7 +551,7 @@ function migrationAssertionClaims(
     !Array.isArray(chain) ||
     chain.length !== 2 ||
     chain[0] !== sponsorId ||
-    chain[1] !== MIGRATION_ASSERTION_SUBJECT
+    chain[1] !== def!.sub
   ) {
     refuse("sponsor chain is malformed");
   }
@@ -471,6 +564,7 @@ function migrationAssertionClaims(
     grantId: grantId as string,
     planDigest: planDigest as string,
     upload: upload!,
+    capability: def!.kind,
     sourceUserId: sourceUserId as string,
     workspaceId: workspaceId as string,
     // The ledger must keep this row at least until no clock could still

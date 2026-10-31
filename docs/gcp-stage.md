@@ -9,6 +9,53 @@ The only eligible target is the existing project
 org `929835122282`, region `us-central1`, billing account
 `014D50-E96D1A-DE6360`. Do not create or select another project.
 
+## Live 96Bulls application proof
+
+The full base application path completed on merge
+`9aa77fc70374b2e8578cf44881e51e9896f7d2c8`. The synthetic manifest landed at
+`2026-10-31T03:40:51Z` (`2026-10-30 20:40 PDT`), and the downstream stages
+completed in the following seconds. The release used chart
+`96bulls-0.3.1` and the eligible services image built from
+`09293c8d649f912aa2f4414e31a3ad7fca6eceee`, digest
+`sha256:8d77de9be0b5e5e47dda75986da882e577aafb9e28e510c844e8134fea372425`.
+Alchemy reconciled 47 of 47 operations successfully. Cloud SQL was adopted
+with `created=false`; it was not recreated.
+
+The proof used synthetic session `gcp-e2e-20261031`, UUIDv7
+`01a1900b-b96c-7abb-8d12-29c30ff197f2`, and trace
+`01a1900b-b96c-7f47-826d-631632c6c32e`. It established all of the following:
+
+- RelayAuth minted a 60-second assertion bound to the exact internal AlleyOop
+  origin. The target tenant's trace request returned HTTP 200 with verdict
+  `indexed`; the same trace under another tenant returned HTTP 404 with no
+  stages, and an assertion bound to a different internal origin returned HTTP
+  401 `invalid_claims`.
+- AlleyOop sealed one `relayhistory-scrub` version 1 chunk and landed a closed
+  revision-1 manifest. GCS contains that manifest, the compressed raw chunk,
+  and encrypted `summary/{short,long}.json.enc` objects. The decompressed raw
+  retained the non-secret content marker while the planted AWS-key-shaped
+  value was absent.
+- HoopDB recorded the exact tenant, workspace, machine, harness, session UUID,
+  and trace with state `done`, `scrubbed=true`, and
+  `scrub_quarantined=false`. `object-landed`, `session-indexed`,
+  `summary-short`, `summary-long`, and `status-classify` completed `ok`; the
+  classifier wrote `done/raw_closed`, and the tenant had zero dead letters.
+- The authorized Bob Costas workload opened both encrypted summary objects;
+  both pointers and decrypted records were `ready`, retained the content
+  marker, and contained no planted AWS-key-shaped value. No key or summary
+  text was printed or persisted by the verifier.
+- The four runtime deployments and Cloud SQL proxy were ready with zero
+  restarts after the migration job completed. The planted secret and content
+  marker were absent from application container logs.
+
+The verifier read the pre-existing Kubernetes Secrets only through the API,
+kept proof-only bearer/API-key material in process memory, terminated its
+short-lived port-forwards, and did not create a persistent credential file.
+This evidence covers the base GCP 96Bulls auth, ingest, scrub, GCS, HoopDB,
+summary, classification, and trace path. It does not claim Relaycast HA or the
+separately gated V1 search projection/API, which requires its own eligible
+runtime image and proof.
+
 The stack entry point is `stacks/gcp/alchemy.gcp.run.ts`. It uses the same
 Alchemy + AgentWorkforce Helm boundary as the AWS stack: cloud code declares
 provider resources and passes non-secret endpoints/names into charts; runtime
@@ -22,11 +69,14 @@ implementations own provider adapters.
   nodes, a private control-plane endpoint, operator CIDRs only, Workload
   Identity Federation, Dataplane V2, Shielded Nodes, VPC-native ranges, one
   reserved NAT address with translation logs, and VPC flow logs. The default
-  pool is explicitly limited to one `e2-medium` node in `us-central1-a`; it is
-  not one node per zone. The node identity is a dedicated service account with
-  no key and only `roles/container.defaultNodeServiceAccount`. The deploying
-  principal must separately have `roles/iam.serviceAccountUser` on that node
-  identity so GKE may attach it. Private Service Access
+  pool is explicitly limited to three `e2-medium` nodes in `us-central1-a`; it is
+  not three nodes per zone. A single node exposes only about 940m allocatable CPU,
+  and the GKE system pods plus RelayAuth leave too little capacity for even the
+  smallest 96Bulls pod request. The node identity is a dedicated service
+  account with no key and only `roles/container.defaultNodeServiceAccount`.
+  The deploying principal must separately have
+  `roles/iam.serviceAccountUser` on that node identity so GKE may attach it.
+  Private Service Access
   stays project-local peering, not Shared VPC;
 - versioned GCS Locker bucket with uniform bucket-level access;
 - private Artifact Registry repository with immutable tags;
@@ -97,8 +147,9 @@ choice: unset and `s3` stay S3, `r2` stays R2, and `PIPELINE_RAW_PROVIDER=gcs`
 builds the GCS adapter when the bucket is set and HMAC keys are absent. Any
 other name stays unconfigured.
 
-`bulls96.enabled` requires the acknowledged managed data plane, an external
-runtime Secret, and a dockerconfigjson image-pull Secret. After Memorystore is
+`bulls96.enabled` requires the acknowledged managed data plane and an external
+runtime Secret. The GKE node identity pulls the private Artifact Registry image
+without a dockerconfigjson Secret. After Memorystore is
 `READY`, an apply-time Action reads its public service-CA bundle from the exact
 Redis Admin resource and passes that bundle to the chart. `/readyz` and
 `/datapathz` perform a CA-validated, passwordless Redis `PING`; static
@@ -184,7 +235,9 @@ shared audience. The release also enables AlleyOop's RelayAuth JWT verifier;
 that switch does not reopen the legacy audience while the origin is present.
 A verifier may reach the ClusterIP through a local
 port-forward, but it must still ask RelayAuth to bind the token to this stable
-in-cluster origin.
+in-cluster origin. The GCP RelayAuth values enable its private/internal HTTP
+origin policy so this exact `.svc` origin can be minted; public HTTP origins
+remain refused by RelayAuth.
 
 Those are names and identifiers only. Secret payloads never belong in this
 file or Helm values. The stage uses its private Artifact Registry repository
@@ -319,12 +372,14 @@ Cloud SQL, in `stacks/gcp/cloud-sql.ts`:
 - An omitted or `enabled: false` bulls96 block does not throw and does not
   install the release. An enabled block emits the release only with the
   acknowledged managed data plane and named external Secrets. Nothing in that
-  path has been applied by this code change.
+  path is declarative; the later live application proof is recorded at the top
+  of this guide.
 
 Release boundaries that remain deliberate:
 
 - The runtime service account is not granted `secretAccessor`; Kubernetes
-  Secrets remain externally populated. The private image requires the named
+  Secrets remain externally populated. The services image is pulled from the
+  stage's private Artifact Registry by the GKE node identity, without an
   image-pull Secret.
 - `/readyz` and `/datapathz` require a real CA-validated Redis `PING` only when
   the GCP data-path probe is armed. The S3 default is unchanged.
@@ -332,17 +387,20 @@ Release boundaries that remain deliberate:
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
   is written.
-- No product create, write, read, indexed search, manifest replay, or product
-  teardown has run on GCP. The substrate is reconciled and its provider-path
-  proof is recorded below; that does not close the application gaps.
+- The initial 2026-10-30 substrate run did not exercise product routes. The
+  later 2026-10-31 application proof recorded above exercised authenticated
+  ingest, scrubbed object landing, Cloud SQL indexing/classification, encrypted
+  summary readback, and tenant-isolated trace reads. V1 indexed search,
+  manifest replay through a product route, Relaycast HA, and full product
+  teardown remain unproved.
 
 ## Apply, verify, and teardown
 
 The substrate deployment and its live provider-path verification completed on
-2026-10-30. The application charts remained disabled, so product create,
-indexed search, manifest replay, application database access, Relaycast
-availability, and full product teardown remain unproved. Static work does not
-wait on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down`
+2026-10-30. The base application proof completed on 2026-10-31 as recorded at
+the top of this guide. V1 indexed search, manifest replay through a product
+route, Relaycast HA, and full product teardown remain unproved. Static work
+does not wait on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down`
 refuse every `gcp-*` stage. `bin/96bulls plan gcp-*` calls
 `bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
 and is not proof. A non-zero Alchemy status exits the wrapper with that
@@ -440,9 +498,11 @@ not present database credentials, authenticate, or execute a SQL query.
 Verification cleanup completed: the temporary namespace and Job were deleted,
 the GCS marker was deleted, the Pub/Sub marker was acknowledged, the verifier
 VM was deleted, and the temporary `roles/container.developer` binding was
-removed from the runner identity. The managed substrate remains deployed for
-the still-unproved application lane. No secret payload, database credential,
-public endpoint, DNS record, or application chart was introduced.
+removed from the runner identity. At the end of that substrate-only
+verification, the managed substrate remained deployed for the then-unproved
+application lane. That verifier introduced no secret payload, database
+credential, public endpoint, DNS record, or application chart. The later base
+application proof is recorded at the top of this guide.
 
 Read-only preflight:
 

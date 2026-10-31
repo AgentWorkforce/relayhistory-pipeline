@@ -1,6 +1,11 @@
 import { Hono, type Context } from "hono";
 import { createMiddleware } from "hono/factory";
 import {
+  backfillBaseOf,
+  isBackfillIdentity,
+  isBaseReadIdentity,
+  backfillBaseVersion,
+  migrationBackfillIssue,
   migrationGrantAllowed,
   migrationManifestProvenance,
   migrationPairAuthorized,
@@ -44,6 +49,10 @@ import {
   type StageMessage,
 } from "../shared/vendor.ts";
 import { enrichMessage } from "../shared/enrich.ts";
+import { createHash } from "node:crypto";
+
+const sha256Hex = async (text: string) =>
+  createHash("sha256").update(text).digest("hex");
 
 /**
  * The ingest's migration ledger over HoopDb: `sessions.migration_assertion_uses`
@@ -664,7 +673,12 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       })
     )
       return workspaceForbidden(c);
-    if (!(await migrationUploadMatches(auth, location, manifest)))
+    // v1: the whole session must be the signed entry. v2 (a backfill epoch)
+    // is checked against the stored base once it has been read (POST).
+    if (
+      !isBackfillIdentity(auth.migration!.upload) &&
+      !(await migrationUploadMatches(auth, location, manifest))
+    )
       return uploadForbidden(c);
     // 96bulls.user_id (the session's user downstream) must be the signed source user.
     if (migrationManifestProvenance(auth, manifest)) return uploadForbidden(c);
@@ -698,11 +712,12 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   const owns = async (
     c: Context<AppEnv>,
     location: NonNullable<ReturnType<typeof parseSessionKey>>,
+    scope = "rth:sync",
   ) => {
     const auth = c.get("auth") as Auth;
     const env = c.env ?? {};
-    if (!auth.scopes.includes("rth:sync"))
-      return responseError(c, 403, "forbidden", "rth:sync scope is required");
+    if (!auth.scopes.includes(scope))
+      return responseError(c, 403, "forbidden", `${scope} scope is required`);
     if (
       auth.migration &&
       !migrationPairAuthorized(auth, { workspaceIds: [location.workspaceId] })
@@ -823,6 +838,51 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           "manifest chunks are not server-sealed",
         );
       const existing = await storedManifest(deps.raw, key);
+      // A v2 (backfill) assertion appends exactly one signed backfill epoch
+      // to exactly the signed live base; #42's owner fence below still runs.
+      // Idempotency first: when the stored object is already byte-identical
+      // to this manifest (a retry after a lost commit response, under a fresh
+      // assertion with the same base), the append is checked against the
+      // signed base only and the commit returns the original success; any
+      // other manifest is still held to the stored-base comparison.
+      if (migration && isBackfillIdentity(migration.upload)) {
+        const identicalRetry = !!existing && existing.text === encodedText;
+        if (
+          await migrationBackfillIssue(auth, location, existing, manifest, {
+            identicalRetry,
+          })
+        )
+          return uploadForbidden(c);
+        // On an identical retry the stored object is the appended one, so the
+        // stored-base comparison (the only check of the signed base.version)
+        // cannot run. Instead the historical `previousVersion` the commit was
+        // made against must be present and resolve EXACTLY to the signed
+        // base.version, before anything is consumed or written.
+        if (identicalRetry) {
+          const previous = version(body.previousVersion);
+          if (
+            !previous ||
+            backfillBaseVersion(previous) !== migration.upload.base.version
+          )
+            return responseError(
+              c,
+              409,
+              "revision_conflict",
+              "manifest version or writer does not match",
+            );
+        }
+        if (
+          !identicalRetry &&
+          (!existing ||
+            !sameVersion(existing.version, version(body.previousVersion)))
+        )
+          return responseError(
+            c,
+            409,
+            "revision_conflict",
+            "manifest version or writer does not match",
+          );
+      }
       let storedVersion: ObjectVersion;
       if (!existing) {
         if (manifest.revision !== 1)
@@ -923,6 +983,13 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           read.manifest,
         );
         if (issue) return issue;
+        // v2: the stored copy is the appended manifest just written.
+        if (
+          isBackfillIdentity(migration.upload) &&
+          (read.manifest.revision !== manifest.revision ||
+            read.manifest.raw.content_sha256 !== manifest.raw.content_sha256)
+        )
+          return uploadForbidden(c);
       }
       const built = buildObjectLandedMessage({
         landed: {
@@ -944,6 +1011,9 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         (built.message.payload as ObjectLandedPayload).migration = {
           key: migration.upload.key,
           entry_sha256: migration.upload.entry_sha256,
+          ...(isBackfillIdentity(migration.upload)
+            ? { base_revision: migration.upload.base.revision }
+            : {}),
         };
       }
       if (migration) {
@@ -1009,6 +1079,115 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
   });
 
   /**
+   * The v2 pre-mint base read (issuer spec section 4): only the base-read
+   * capability, only exactly `GET ...?key=<signed unprefixed key>`, default
+   * off (`RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ`). One storage snapshot,
+   * validated, then ONE transaction consumes the capability and appends the
+   * audit row; the 7 base fields are returned only after it commits.
+   */
+  // Exactly one trailing slash is stripped (spec section 6): both spellings
+  // reach the same handler; no other variant does.
+  const baseRead = async (c: Context<AppEnv>) => {
+    const env = c.env ?? {};
+    if (env.RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ !== "true")
+      return responseError(c, 404, "not_found", "no route");
+    const auth = c.get("auth") as Auth;
+    const migration = auth?.migration;
+    if (!migration || !isBaseReadIdentity(migration.upload))
+      return responseError(
+        c,
+        403,
+        "migration_token_class_forbidden",
+        "only a migration base-read capability may read a base",
+      );
+    const read = migration.upload;
+    const params = [...new URL(c.req.url).searchParams.keys()];
+    if (params.length !== 1 || params[0] !== "key")
+      return responseError(
+        c,
+        400,
+        "bad_request",
+        "exactly one query parameter, key, is allowed",
+      );
+    if (c.req.query("key") !== read.key) return uploadForbidden(c);
+    const ledger = deps.migrationLedger;
+    if (!ledger) return ledgerUnavailable(c);
+    if (!migrationPairAuthorized(auth)) return workspaceForbidden(c);
+    if (!migrationGrantAllowed(env, migration)) return grantForbidden(c);
+    const key = storageKey(c, read.key);
+    const location = parseSessionKey(key);
+    if (!location || location.rest !== "manifest.json")
+      return uploadForbidden(c);
+    if (!migrationSessionMatches(auth, location)) return uploadForbidden(c);
+    const owned = await owns(c, location, "rth:migration_base_read");
+    if (owned !== true) return owned;
+    let snapshot: Awaited<ReturnType<typeof storedManifest>>;
+    try {
+      snapshot = await storedManifest(deps.raw, key);
+    } catch (error) {
+      // A stored object that is not a valid manifest (bad JSON, failed
+      // validation, an unsupported schema, oversized) can never be a base:
+      // 409, not a retryable 503. Only real storage unavailability is 503.
+      if (
+        isObjectStoreError(error, "invalid_argument") ||
+        isObjectStoreError(error, "unsupported") ||
+        (error instanceof Error && error.message === "manifest too large")
+      )
+        return responseError(
+          c,
+          409,
+          "migration_base_unusable",
+          "the stored manifest is not a valid manifest",
+        );
+      return responseError(
+        c,
+        503,
+        "storage_unavailable",
+        "Object storage is temporarily unavailable",
+      );
+    }
+    if (!snapshot)
+      return responseError(c, 404, "not_found", "no live manifest at this key");
+    const session = snapshot.manifest.session;
+    if (
+      session.machine_id !== read.session.machine_id ||
+      session.harness !== read.session.harness ||
+      session.session_id !== read.session.session_id ||
+      session.started_at !== read.session.started_at
+    )
+      return uploadForbidden(c);
+    const base = backfillBaseOf(snapshot);
+    if (typeof base === "string")
+      return responseError(c, 409, "migration_base_unusable", base);
+    let outcome: MigrationConsumeResult;
+    try {
+      outcome = await ledger.consumeBaseRead(
+        {
+          jti: migration.jti,
+          nonce: migration.nonce,
+          grantId: migration.grantId,
+          planDigest: migration.planDigest,
+          planEntryDigest: read.entry_sha256,
+          orgId: auth.orgId,
+          workspaceId: location.workspaceId,
+          userId: auth.userId,
+          expiresAt: migration.expiresAt,
+        },
+        // Minimized: the key's digest, never its machine or session ids.
+        `${await sha256Hex(read.key)}@base_read@r${base.revision}`,
+      );
+    } catch {
+      return ledgerUnavailable(c);
+    }
+    if (outcome === "replayed") return replayed(c);
+    if (outcome === "grant_mismatch") return grantForbidden(c);
+    return c.json({ base }, 200);
+  };
+  routes.get("/pipeline/manifests/base", baseRead);
+  routes.get("/pipeline/manifests/base/", baseRead);
+
+
+  /**
    * Startup reconciliation: version, scoped to the stored machine/writer. With
    * `manifest=1` also the stored copy from the same read, for a compare-and-swap
    * retry: a writer that lost a race edits this, never its own local rebuild.
@@ -1031,7 +1210,20 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
       // A migration assertion reads only the status of a manifest of its own
       // grant, workspace, source user and plan.
       const auth = c.get("auth") as Auth;
-      if (auth.migration) {
+      // A v2 (backfill) assertion may read its live base's version (the
+      // session, grant and tenancy are already its own; the base has no
+      // export marker yet).
+      if (auth.migration && isBackfillIdentity(auth.migration.upload)) {
+        if (
+          !migrationPairAuthorized(auth, {
+            workspaceIds: [
+              location.workspaceId,
+              stored.manifest.session.workspace_id,
+            ],
+          })
+        )
+          return workspaceForbidden(c);
+      } else if (auth.migration) {
         const issue = await migrationManifestIssue(
           c,
           auth,
