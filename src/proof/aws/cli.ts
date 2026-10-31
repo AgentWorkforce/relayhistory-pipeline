@@ -31,11 +31,11 @@ import { uuidv7 } from "../../shared/ids.ts";
 import { CHECKS, newCtx } from "./checks.ts";
 import { loadConfig, validateConfig, type ProofConfig } from "./config.ts";
 import { Runner } from "./exec.ts";
-import { fenceFor, PROOF_REGION } from "./fence.ts";
-import { assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, type Identity, type Mode } from "./guard.ts";
+import { fenceFor, PROOF_CONTEXT, PROOF_REGION } from "./fence.ts";
+import { assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, type Identity, type Mode } from "./guard.ts";
 import { allCanaries } from "./corpus.ts";
 import { backendLabel } from "./transcript.ts";
-import { buildReport, canonicalReportBytes, CHECK_IDS, mergeReports, validateReport, type CheckId, type CheckResult, type ProofReport } from "./report.ts";
+import { admitPrior, buildReport, canonicalReportBytes, CHECK_IDS, mergeReports, validateReport, type AdmittedPrior, type CheckId, type CheckResult, type ProofReport } from "./report.ts";
 
 const ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 
@@ -128,6 +128,28 @@ export async function main(argv: readonly string[], env: Record<string, string |
       return 2;
     }
   }
+  // Full prior admissibility (bytes, digest, exact target, timestamps, live phase, executed proof)
+  // is decided here, before any AWS call or step: an inadmissible prior can never reach a teardown step.
+  let prior: AdmittedPrior | undefined;
+  if (args.priorReport) {
+    if (args.mode !== "live" || args.target !== "proof") {
+      console.error("aws-proof: --prior-report merges live proof runs only (needs --confirm-live without --read-only)");
+      return 2;
+    }
+    let bytes: string;
+    try {
+      bytes = readFileSync(args.priorReport, "utf8");
+    } catch {
+      console.error("aws-proof: --prior-report unreadable");
+      return 2;
+    }
+    const admitted = admitPrior(bytes, { stage: PROOF_STAGE, clusterName: PROOF_CLUSTER, kubeContext: PROOF_CONTEXT, accountId: PROOF_ACCOUNT_ID, region: PROOF_REGION }, Date.now());
+    if ("error" in admitted) {
+      console.error(`aws-proof: --prior-report refused before any step ran: ${admitted.error}`);
+      return 2;
+    }
+    prior = admitted;
+  }
   const identity: Identity =
     args.mode === "dry-run" || args.target === "kind-readonly"
       ? { clusterName: cfg.clusterName, kubeContext: cfg.kubeContext }
@@ -141,23 +163,6 @@ export async function main(argv: readonly string[], env: Record<string, string |
     }
   }
   // The prior report is read and validated before anything runs, so a bad merge input never costs a live run.
-  let prior: { bytes: string; report: ProofReport } | undefined;
-  if (args.priorReport) {
-    if (args.mode !== "live") {
-      console.error("aws-proof: --prior-report merges live runs only (needs --confirm-live without --read-only)");
-      return 2;
-    }
-    try {
-      const bytes = readFileSync(args.priorReport, "utf8");
-      const report = JSON.parse(bytes) as ProofReport;
-      const bad = validateReport(report);
-      if (bad.length) throw new Error(bad[0]);
-      prior = { bytes, report };
-    } catch (e) {
-      console.error(`aws-proof: --prior-report unusable: ${(e as Error).message}`);
-      return 2;
-    }
-  }
   const runId = `aws-proof-${uuidv7()}`;
   const runner = new Runner({ mode: args.mode, identity: { ...identity, confirmLive: args.confirmLive }, fence: fenceFor(args.target) });
   const ctx = newCtx(cfg, runner, runId, env);
@@ -180,13 +185,13 @@ export async function main(argv: readonly string[], env: Record<string, string |
   const own = buildReport({ runId, mode: args.mode, backends: { metadata: exercised(metadataBackend), transcript: exercised(transcriptBackend) }, target: { stage: cfg.stage, clusterName: cfg.clusterName, kubeContext: cfg.kubeContext, region: cfg.region, ...(identity.accountId ? { accountId: identity.accountId } : {}) }, checks: results });
   let report = own;
   if (prior) {
-    const merged = mergeReports(prior.bytes, own, { accountId: PROOF_ACCOUNT_ID, region: PROOF_REGION });
+    const merged = mergeReports(prior, own);
     if ("error" in merged) {
       console.error(`aws-proof: cannot merge --prior-report: ${merged.error}`);
       return 2;
     }
     report = merged.report;
-    console.log(`merged prior report ${prior.report.runId} (sha256 ${report.phases[0]!.reportSha256}); verdict covers ${report.phases.length} phase(s)`);
+    console.log(`merged prior report ${prior.report.runId} (sha256 ${prior.sha256}); verdict covers ${report.phases.length} phase(s)`);
   }
   const problems = validateReport(report, { canaries: allCanaries(ctx.corpus), secrets: ctx.secrets });
   const dir = args.out ?? join(ROOT, ".96bulls/aws-proof", runId);

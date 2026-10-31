@@ -17,6 +17,8 @@ export const PROOF_ACCOUNT_ID = "500268966557";
 /** The proof stage; stacks/aws/eks.ts names clusters `96bulls-<stage>`. */
 export const PROOF_STAGE = "aws-proof";
 export const PROOF_CLUSTER = `96bulls-${PROOF_STAGE}`;
+/** The proof stage's only region. Every ARN, context and AWS call must carry it. */
+export const PROOF_REGION = "us-west-2";
 /** The only local cluster this harness may read; it never mutates it. */
 export const LOCAL_READONLY_CONTEXT = "kind-96bulls-e2e";
 
@@ -28,6 +30,7 @@ export class GuardError extends Error {
       | "missing_confirm_live"
       | "wrong_account"
       | "wrong_cluster"
+      | "wrong_region"
       | "context_mismatch"
       | "production_name"
       | "local_is_read_only"
@@ -96,4 +99,9 @@ export function assertProofTarget(g: Omit<GuardInput, "mode" | "mutating">): voi
   const arn = parseEksArn(g.kubeContextCluster);
   if (!arn || arn.accountId !== PROOF_ACCOUNT_ID || arn.clusterName !== PROOF_CLUSTER)
     throw new GuardError("context_mismatch", `refusing: kube context '${g.kubeContext}' does not point at ${PROOF_CLUSTER} in ${PROOF_ACCOUNT_ID}`);
+  if (arn.region !== PROOF_REGION) throw new GuardError("wrong_region", `refusing: kube context cluster is in ${arn.region}, not ${PROOF_REGION}`);
+  // The context name itself, when it is an EKS ARN, must agree too.
+  const named = parseEksArn(g.kubeContext);
+  if (named && (named.region !== PROOF_REGION || named.accountId !== PROOF_ACCOUNT_ID || named.clusterName !== PROOF_CLUSTER))
+    throw new GuardError("wrong_region", `refusing: kube context name ${g.kubeContext} is not the proof cluster in ${PROOF_REGION}`);
 }

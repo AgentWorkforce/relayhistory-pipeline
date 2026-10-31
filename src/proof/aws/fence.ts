@@ -5,14 +5,17 @@
  * Every allowed value is HARDCODED here for the aws-proof stage. Nothing in the
  * fence is derived from inputs.json: config may only restate these values
  * (proofConfigIssues refuses any difference), and every step's argv is checked
- * against the constants in every mode, dry-run included (stepFenceIssue).
+ * against the constants in every mode, dry-run included (ops.ts admitStep:
+ * every command is parsed into a typed operation and must match an explicit
+ * allowlist; mutations need an exact (verb, kind, namespace, name) entry).
  * Changing a target means a reviewed code change to this file.
  *
  * Production-shaped names are refused everywhere, even inside the proof account.
  */
 import { LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE } from "./guard.ts";
 
-export const PROOF_REGION = "us-west-2";
+export { PROOF_REGION } from "./guard.ts";
+import { PROOF_REGION } from "./guard.ts";
 export const PROOF_CONTEXT = `arn:aws:eks:${PROOF_REGION}:${PROOF_ACCOUNT_ID}:cluster/${PROOF_CLUSTER}`;
 /** The proof stage's public ingest host and RelayHistory origin. Never sessions-dev or a production host. */
 export const PROOF_HOST = "proof-sessions.agentrelay.com";
@@ -51,6 +54,8 @@ export const FORBIDDEN_NAME = /(^|[^a-z0-9])(prod|production|sessions-prod|sessi
 export const URL_USERINFO = /\b[a-z][a-z0-9+.-]*:\/\/[^\s/?#@]+@/i;
 
 export interface Fence {
+  /** Which hardcoded target this is. The kind fence admits reads only. */
+  target: "proof" | "kind-readonly";
   context: string;
   region?: string;
   namespaces: ReadonlySet<string>;
@@ -71,6 +76,7 @@ export interface Fence {
 }
 
 export const PROOF_FENCE: Fence = Object.freeze({
+  target: "proof",
   context: PROOF_CONTEXT,
   region: PROOF_REGION,
   namespaces: new Set([PROOF_NAMESPACE, PROOF_RELAYAUTH.namespace, PROOF_RELAYCAST.namespace, PROOF_CNPG_NAMESPACE]),
@@ -87,6 +93,7 @@ export const PROOF_FENCE: Fence = Object.freeze({
 
 /** The local kind cluster: reads only (the guard refuses every mutation), and no AWS at all. */
 export const KIND_FENCE: Fence = Object.freeze({
+  target: "kind-readonly",
   context: LOCAL_READONLY_CONTEXT,
   namespaces: new Set(["96bulls-e2e", "relayauth-e2e", "relaycast-proof", "cnpg-system"]),
   deleteNamespaces: new Set<string>(),
@@ -174,86 +181,3 @@ export function proofConfigIssues(c: FenceSource & Record<string, unknown>): str
   return issues;
 }
 
-const valueAfter = (argv: readonly string[], flags: readonly string[]) => {
-  const out: string[] = [];
-  argv.forEach((a, i) => {
-    for (const f of flags) {
-      if (a === f && argv[i + 1] !== undefined) out.push(argv[i + 1]!);
-      else if (a.startsWith(`${f}=`)) out.push(a.slice(f.length + 1));
-    }
-  });
-  return out;
-};
-
-const placeholder = (v: string) => v.startsWith("<");
-const ok = (set: ReadonlySet<string>, v: string) => set.has(v) || placeholder(v);
-const HELM_RELEASE_SUBCOMMANDS = new Set(["upgrade", "rollback", "uninstall", "history", "status", "get"]);
-
-/**
- * Runtime fence on one step: the first reason its argv names a target outside
- * the hardcoded fence, or undefined. Placeholders (`<...>`) appear only in
- * dry-run plans.
- */
-export function stepFenceIssue(argv: readonly string[], f: Fence): string | undefined {
-  for (const a of argv) {
-    if (FORBIDDEN_NAME.test(a)) return "production_shaped_target";
-    if (URL_USERINFO.test(a)) return "url_credentials";
-    if (a === "-A" || a === "--all-namespaces" || a.startsWith("--all-namespaces=")) return "all_namespaces_refused";
-  }
-  for (const v of valueAfter(argv, ["--context", "--kube-context"])) if (v !== f.context) return "context_outside_fence";
-  for (const v of valueAfter(argv, ["--region"])) if (v !== f.region) return "region_outside_fence";
-  const namespaces = valueAfter(argv, ["-n", "--namespace"]);
-  for (const v of namespaces) if (!f.namespaces.has(v)) return "namespace_outside_fence";
-  for (const v of valueAfter(argv, ["--bucket"])) if (!ok(f.buckets, v)) return "bucket_outside_fence";
-  // Region inside shell strings (sh -c "aws ... --region X") as well as as a flag.
-  for (const a of argv) for (const m of a.matchAll(/--region[=\s]+'?([a-z0-9-]+)/g)) if (m[1] !== f.region) return "region_outside_fence";
-  if (argv[0] === "aws" && !valueAfter(argv, ["--region"]).length) return "region_missing";
-  if (argv[0] === "kubectl") {
-    let verbAt = -1;
-    for (let i = 1; i < argv.length; i++) {
-      const a = argv[i]!;
-      if (a.startsWith("-")) {
-        if (["--context", "-n", "--namespace"].includes(a)) i++;
-        continue;
-      }
-      verbAt = i;
-      break;
-    }
-    const verb = argv[verbAt];
-    // A delete must name exactly one explicit, writable namespace; the default namespace is never implied.
-    if (verb === "delete") {
-      const isNamespaceDelete = argv[verbAt + 1] === "namespace";
-      if (isNamespaceDelete) {
-        if (!f.deleteNamespaces.has(argv[verbAt + 2] ?? "")) return "delete_namespace_outside_fence";
-      } else if (namespaces.length !== 1 || !f.deleteNamespaces.has(namespaces[0]!)) return "delete_needs_allowlisted_namespace";
-    }
-    if (verb === "apply" && namespaces.length !== 1) return "apply_needs_namespace";
-    if (verb === "exec") {
-      for (const d of valueAfter(argv, ["-d"])) if (!f.databases.has(d)) return "database_outside_fence";
-    }
-    for (let i = 0; i < argv.length - 1; i++)
-      if (/^clusters\.postgresql\.cnpg\.io$/.test(argv[i]!) && !argv[i + 1]!.startsWith("-") && !ok(f.pgClusters, argv[i + 1]!)) return "pg_cluster_outside_fence";
-  }
-  if (argv[0] === "helm") {
-    const i = argv.findIndex((a) => HELM_RELEASE_SUBCOMMANDS.has(a));
-    if (i >= 0 && !ok(f.releases, argv[i + 1] ?? "")) return "release_outside_fence";
-  }
-  for (const a of argv) {
-    for (const m of a.matchAll(/s3:\/\/([^/\s'"]+)/g)) if (!ok(f.buckets, m[1]!)) return "bucket_outside_fence";
-    for (const m of a.matchAll(/(?:^|[\s"'])deployment\/([A-Za-z0-9._-]+)/g)) if (!f.deployments.has(m[1]!)) return "deployment_outside_fence";
-    for (const m of a.matchAll(/(?:^|[\s"'])svc\/([A-Za-z0-9._-]+)/g)) if (!f.services.has(m[1]!)) return "service_outside_fence";
-    for (const m of a.matchAll(/(?:^|[\s"'])(?:clusters\.postgresql\.cnpg\.io|backups\.postgresql\.cnpg\.io)\/([A-Za-z0-9._-]+)/g))
-      if (m[0].includes("clusters.") && !f.pgClusters.has(m[1]!)) return "pg_cluster_outside_fence";
-    for (const m of a.matchAll(/\bhttps?:\/\/([^/:\s'"?#]+)/g)) {
-      const host = m[1]!.toLowerCase();
-      // In-cluster service DNS is allowed only for a fenced service in a fenced namespace: <svc>.<ns>.svc
-      const svc = /^([a-z0-9-]+)\.([a-z0-9-]+)\.svc(\.cluster\.local)?$/.exec(host);
-      if (svc ? !(f.namespaces.has(svc[2]!) && f.services.has(svc[1]!)) : !f.hosts.has(host) && !placeholder(host)) return "host_outside_fence";
-    }
-    for (const m of a.matchAll(/arn:aws:[a-z0-9-]+:([a-z0-9-]*):(\d{12})?:/g)) {
-      if (m[2] && m[2] !== f.accountId) return "arn_outside_fence";
-      if (m[1] && m[1] !== f.region) return "arn_region_outside_fence";
-    }
-  }
-  return undefined;
-}

@@ -39,7 +39,9 @@ the following:
 - `--confirm-live` on the command line;
 - `aws sts get-caller-identity` returns the account `500268966557`. The
   harness checks the observed identity, not a configured value;
-- the cluster name is exactly `96bulls-aws-proof`;
+- the cluster name is exactly `96bulls-aws-proof`, and the region of every EKS
+  ARN (the kube context's cluster entry and the context name itself) is
+  `us-west-2`;
 - the kube context points at
   `arn:aws:eks:<region>:500268966557:cluster/96bulls-aws-proof`;
 - no name is production-shaped. A name containing `prod`, `production`,
@@ -76,23 +78,49 @@ The fence applies twice:
   `production`, `sessions-prod`, `sessions-dev`, `staging`, `hosted`), or if
   any URL carries userinfo (`https://user:pass@host`). This applies even in the
   proof account.
-- **On every step's argv, in every mode including dry-run.** These must be
-  inside the fence:
-  - the context and region, including `--region` inside `sh -c` strings (every
-    `aws` call must carry `--region us-west-2`);
-  - namespaces and buckets, including `s3://` URLs;
-  - `deployment/` and `svc/` names, and in-cluster `<svc>.<ns>.svc` hosts;
-  - CNPG cluster names, psql `-d` databases and Helm release names;
-  - HTTP hosts;
-  - the account and region in every ARN.
+- **On every step, in every mode including dry-run** (`src/proof/aws/ops.ts`).
+  Before anything spawns, each command is parsed into one typed operation, and
+  that operation must match an explicit allowlist:
+  - **Programs.** Only `kubectl`, `helm` and `aws` are spawned, without a shell.
+    `sh -c`, `bash -c`, `env`, absolute paths and every other program are
+    refused, so nothing can hide inside a wrapper. In-process `HTTP` and
+    `PROBE` actions are never spawned, and their hosts are fenced.
+  - **Target flags.**
+    - kubectl must start with exactly `--context` and the proof cluster ARN. A
+      missing, other or repeated context is refused.
+    - helm must start with `--kube-context` and the same ARN; only `helm show
+      values` of the AgentWorkforce charts is exempt.
+    - Every aws call must carry exactly `--region us-west-2`. Every ARN must
+      name account `500268966557` and region `us-west-2`.
+    - These are always refused: `-A`, `--all-namespaces`, `--kubeconfig`,
+      `--server`, `--token`, `--as`, `--user`, `--cluster`, `--dbname`,
+      `--profile`, `--endpoint-url`.
+  - **Who decides "mutating".** The parser decides, not the step's label. A
+    mutating operation is admitted only as an exact entry:
+    - `rollout restart` of a named deployment in its namespace;
+    - `delete pod` of `hoopdb-<n>` or the Relaycast probe pod;
+    - `delete` of the restore cluster, a `proof-*` Backup, or the
+      proof-labelled objects in `96bulls` or `relaycast`;
+    - `delete namespace 96bulls`;
+    - `apply` of a proof-labelled CNPG `Backup` (cluster `hoopdb`) or the
+      restore `Cluster`, with the manifest checked;
+    - `run` and `exec` of the digest-pinned Relaycast probe;
+    - `helm upgrade`, `rollback` and `uninstall` of release `96bulls`;
+    - `delete-object` of a planted session's `summary/short.json.enc` in the
+      Locker bucket.
 
-  `-A` and `--all-namespaces` are refused for every command. A `kubectl delete`
-  must name exactly one allowlisted namespace, and a namespace delete must
-  target one of them.
+    A step that mutates but is labelled as a read is refused. Read-only mode
+    skips everything the parser classifies as mutating.
+  - **relayauth** is read-only, except `rollout restart deployment/relayauth`.
+  - **Reads** are allowlisted the same way:
+    - psql must be exactly `psql -d hoopdb -X -At -v ON_ERROR_STOP=1 -f -` in a
+      `hoopdb-<n>` pod;
+    - port-forwards go only to the named services;
+    - logs come only from the named deployments.
 
-  A step outside the fence is recorded `refused` and never spawned. Every
-  printed or recorded command is sanitized, so a credential never appears in
-  output, dry-run plans included.
+  A refused step is recorded `refused` and never spawned. Every printed or
+  recorded command is sanitized, so a credential never appears in output,
+  dry-run plans included.
 
 `inputs.json` cannot change the account, the cluster or the stage. The loader
 discards those keys. It also rejects any key that looks like a secret.
@@ -466,20 +494,28 @@ The teardown runs in two phases:
 A failed cluster listing never counts as "gone".
 
 **One report for the whole proof.** `--prior-report` merges an earlier report
-of the same proof, and it trusts nothing in that report:
+of the same proof. The prior is admitted completely before any AWS call or
+step of the current run, so a prior that is invalid or aimed at the wrong
+target is refused (exit 2) before teardown can start. Nothing in the prior is
+trusted:
 
 - The prior is read as exact bytes. Its SHA-256 is computed over them, and the
-  bytes must be the canonical serialization the CLI writes, so an edited or
-  reformatted prior is refused.
-- It must validate, and it must be a single unmerged phase. Its run id,
-  timestamp, mode and check list must match its phase.
-- Both runs must be live. The prior must target the same stage, cluster,
-  context, account `500268966557` and region `us-west-2`.
-- Every prior check must finish before the prior's `generatedAt`, which must
-  precede every check of the current run.
+  bytes must be the canonical serialization the CLI writes.
+- It must validate. Timestamps must be strict, calendar-valid RFC 3339
+  (`YYYY-MM-DDTHH:MM:SS.sssZ`). Every check must start and finish before the
+  report's `generatedAt`, and the report may not be dated in the future.
+- It must be a single unmerged live phase whose run id, timestamp, mode and
+  check list match the report.
+- Its target must be exactly the immutable proof target: stage `aws-proof`,
+  cluster `96bulls-aws-proof`, the proof context, account `500268966557` and
+  region `us-west-2`. Matching the current run is not enough.
 - A carried `pass` or `unsupported` result must have executed: at least one
   step, and every step `ran`. A planned-only result never counts toward a PASS,
   in a merge or in any report.
+
+At merge time only the relations remain to check: the current run is a single
+live phase with the same target and a different run id, and every current
+check started after the prior was generated.
 
 Checks merge in a fixed order, with the current run's result winning. The
 verdict is recomputed, never carried, and the prior's digest is recorded in

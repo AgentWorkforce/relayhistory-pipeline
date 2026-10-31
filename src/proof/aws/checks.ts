@@ -5,10 +5,11 @@
  * guard allows. See docs/aws-e2e-proof.md for the approval boundary.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { gunzipSync } from "node:zlib";
 import type { ProofConfig } from "./config.ts";
 import { allCanaries, expectedShortSummary, FAKE_AWS_KEY_ID, plantCorpus, telemetryForbidden, type PlantedSession } from "./corpus.ts";
 import { evaluatePlantedTrace, evaluateStaleSummary, evaluateV1Scope, type SessionObservation, type StaleObservation } from "./evaluate.ts";
-import { shellQuote, type Runner, type Step } from "./exec.ts";
+import type { Runner, Step } from "./exec.ts";
 import { evaluateFreshInstall, expectedFromValues, parseChartRef, type HelmRelease, type PodList } from "./fresh-install.ts";
 import { IngestError, locationOf, mintTenantToken, newUploadState, plantNextRevision, type UploadState } from "./ingest.ts";
 import { crossTenantHits, refusedAsExpected, scanForCanaries, tenantKey, type ProbeObservation, type Tenant } from "./leak-scan.ts";
@@ -581,9 +582,15 @@ function collectTraces(ctx: Ctx): string | undefined {
   const keys = ((JSON.parse(list.stdout || "null") as Array<{ Key: string; LastModified: string }> | null) ?? []).filter((o) => Date.parse(o.LastModified) >= since).map((o) => o.Key);
   let text = "";
   for (const key of keys) {
-    // Batches are gzip OTLP/JSON; gzip -dcf decompresses or passes plain text through, so stdout stays text.
-    const o = ctx.runner.run({ id: "traces.get", argv: ["sh", "-c", `aws s3 cp --region ${shellQuote([ctx.cfg.region])} ${shellQuote([`s3://${ctx.cfg.locker.bucket}/${key}`])} - | gzip -dcf`], mutating: false, touches: [`s3:${ctx.cfg.locker.bucket}/${key} (read)`], approval: "operator" });
-    if (o.ok) text += o.stdout + "\n";
+    // No shell: the batch comes back base64 and is gunzipped in process (plain text passes through).
+    const o = ctx.runner.run({ id: "traces.get", argv: ["aws", "s3", "cp", "--region", ctx.cfg.region, `s3://${ctx.cfg.locker.bucket}/${key}`, "-"], mutating: false, touches: [`s3:${ctx.cfg.locker.bucket}/${key} (read)`], approval: "operator", binary: true });
+    if (!o.ok) continue;
+    const buf = Buffer.from(o.stdout, "base64");
+    try {
+      text += gunzipSync(buf).toString("utf8") + "\n";
+    } catch {
+      text += buf.toString("utf8") + "\n";
+    }
   }
   return text;
 }

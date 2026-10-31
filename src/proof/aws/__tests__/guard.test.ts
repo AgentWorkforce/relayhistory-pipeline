@@ -69,7 +69,7 @@ describe("runner: refusals never spawn", () => {
     const spawn: Spawn = (argv) => (calls.push(argv), { stdout: "out", status: 0 });
     return { calls, spawn };
   };
-  const step = { id: "x", argv: ["kubectl", "--context", ARN, "-n", "96bulls", "delete", "pod", "x"], mutating: true, touches: ["k8s"], approval: "khaliq" as const };
+  const step = { id: "x", argv: ["kubectl", "--context", ARN, "-n", "96bulls", "delete", "pod", "hoopdb-1"], mutating: true, touches: ["k8s"], approval: "khaliq" as const };
 
   test("dry-run plans and does not spawn", () => {
     const s = spy();
@@ -81,7 +81,7 @@ describe("runner: refusals never spawn", () => {
     const s = spy();
     const r = new Runner({ mode: "read-only", identity: ok, spawn: s.spawn, print: () => {}, fence });
     expect(r.run(step).record.status).toBe("skipped");
-    expect(r.run({ ...step, mutating: false }).record.status).toBe("ran");
+    expect(r.run({ id: "r", argv: ["kubectl", "--context", ARN, "-n", "96bulls", "get", "pods", "-o", "json"], mutating: false, touches: [], approval: "operator" }).record.status).toBe("ran");
     expect(s.calls).toHaveLength(1);
   });
   test("live without --confirm-live is refused with a code and does not spawn", () => {

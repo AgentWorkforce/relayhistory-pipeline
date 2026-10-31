@@ -218,23 +218,26 @@ export function buildReport(
   };
 }
 
+export type ExpectedTarget = Required<Pick<ProofReport["target"], "stage" | "clusterName" | "kubeContext" | "accountId" | "region">>;
+
+export interface AdmittedPrior {
+  report: ProofReport;
+  sha256: string;
+}
+
 /**
- * Merge a prior run's report into the current one. The prior is taken as the
- * exact file bytes and nothing in it is trusted:
+ * Decide whether a prior report may be carried, completely, before any step
+ * of the current run executes. Nothing in the prior is trusted:
  *
- *   - its SHA-256 is computed here over those bytes, which must be the
- *     canonical serialization (so the digest is reproducible from the report);
- *   - it must validate, be a single unmerged live phase whose run id,
- *     timestamp and check list match the report, and target the proof
- *     account, region, stage, cluster and context exactly as the current run;
- *   - every check timestamp must precede its generatedAt, which must precede
- *     every check of the current run;
- *   - every carried pass/unsupported result must have executed (steps, all `ran`).
- *
- * Both runs must be live. Checks are merged in CHECK_IDS order (the current
- * run's result wins) and the verdict is recomputed, never carried.
+ *   - exact canonical bytes (the digest is computed here over them);
+ *   - it validates (strict calendar-valid RFC 3339 timestamps, every check
+ *     bounded by the report's generatedAt, executed-step proof for passes);
+ *   - a single unmerged live phase consistent with the report;
+ *   - the exact immutable proof target (stage, cluster, context, account,
+ *     region), not merely "the same as the current run";
+ *   - generated before `nowMs`.
  */
-export function mergeReports(priorBytes: string, current: ProofReport, proof: { accountId: string; region: string }): { report: ProofReport } | { error: string } {
+export function admitPrior(priorBytes: string, expected: ExpectedTarget, nowMs: number): AdmittedPrior | { error: string } {
   let prior: ProofReport;
   try {
     prior = JSON.parse(priorBytes) as ProofReport;
@@ -242,37 +245,51 @@ export function mergeReports(priorBytes: string, current: ProofReport, proof: { 
     return { error: "prior report is not JSON" };
   }
   if (canonicalReportBytes(prior) !== priorBytes) return { error: "prior report bytes are not the canonical serialization (edited or reformatted)" };
-  const priorSha256 = sha256(priorBytes);
   const issues = validateReport(prior);
   if (issues.length) return { error: `prior report invalid: ${issues[0]}` };
-  if (prior.mode !== "live" || current.mode !== "live") return { error: "only live reports merge" };
+  if (prior.mode !== "live") return { error: "only live reports merge" };
   if (prior.phases.length !== 1) return { error: "prior report must be a single unmerged phase" };
   const ph = prior.phases[0]!;
   if (ph.mode !== "live" || ph.runId !== prior.runId || ph.generatedAt !== prior.generatedAt || ph.reportSha256 !== undefined || JSON.stringify(ph.checks) !== JSON.stringify(prior.checks.map((c) => c.check)))
     return { error: "prior phase does not match the report (mode, run id, timestamp or checks)" };
-  if (current.phases.length !== 1 || current.phases[0]!.mode !== "live") return { error: "current run must be a single live phase" };
   for (const k of ["stage", "clusterName", "kubeContext", "accountId", "region"] as const)
-    if (prior.target[k] !== current.target[k]) return { error: `prior report targets a different ${k}` };
-  if (current.target.accountId !== proof.accountId || current.target.region !== proof.region) return { error: "reports must target the proof account and region" };
-  if (prior.runId === current.runId) return { error: "prior report is this run" };
-  for (const c of prior.checks) if (c.finishedAt > prior.generatedAt) return { error: `prior check ${c.check} finished after its report was generated` };
-  for (const c of current.checks) if (c.startedAt <= prior.generatedAt) return { error: `current check ${c.check} started before the prior report was generated` };
+    if (prior.target[k] !== expected[k]) return { error: `prior report ${k} is not the proof target` };
+  if (Date.parse(prior.generatedAt) > nowMs) return { error: "prior report is dated in the future" };
   for (const c of prior.checks)
     if ((c.status === "pass" || c.status === "unsupported") && !executed(c)) return { error: `prior check ${c.check} reports ${c.status} without executed steps` };
+  return { report: prior, sha256: sha256(priorBytes) };
+}
+
+/**
+ * Merge an admitted prior into the current run's report. Only the relations
+ * between the two remain to check here: both live single phases, the same
+ * exact target, a different run, and every current check started after the
+ * prior was generated. Checks merge in CHECK_IDS order (current wins) and the
+ * verdict is recomputed, never carried.
+ */
+export function mergeReports(prior: AdmittedPrior, current: ProofReport): { report: ProofReport } | { error: string } {
+  const p = prior.report;
+  if (current.mode !== "live" || current.phases.length !== 1 || current.phases[0]!.mode !== "live") return { error: "current run must be a single live phase" };
+  for (const k of ["stage", "clusterName", "kubeContext", "accountId", "region"] as const)
+    if (p.target[k] !== current.target[k]) return { error: `prior report targets a different ${k}` };
+  if (p.runId === current.runId) return { error: "prior report is this run" };
+  for (const c of current.checks) if (c.startedAt <= p.generatedAt) return { error: `current check ${c.check} started before the prior report was generated` };
   const ran = new Set(current.checks.map((c) => c.check));
-  const checks = CHECK_IDS.flatMap((id) => current.checks.filter((c) => c.check === id).concat(ran.has(id) ? [] : prior.checks.filter((c) => c.check === id)));
+  const checks = CHECK_IDS.flatMap((id) => current.checks.filter((c) => c.check === id).concat(ran.has(id) ? [] : p.checks.filter((c) => c.check === id)));
   const ranAny = (ids: readonly CheckId[]) => ids.some((id) => ran.has(id));
   const searchGates: ProofReport["searchGates"] = {
-    metadata: ranAny(current.searchGates.metadata.checks) ? current.searchGates.metadata : prior.searchGates.metadata,
-    transcript: ranAny(current.searchGates.transcript.checks) ? current.searchGates.transcript : prior.searchGates.transcript,
+    metadata: ranAny(current.searchGates.metadata.checks) ? current.searchGates.metadata : p.searchGates.metadata,
+    transcript: ranAny(current.searchGates.transcript.checks) ? current.searchGates.transcript : p.searchGates.transcript,
   };
-  const phases = [{ ...ph, reportSha256: priorSha256 }, ...current.phases];
+  const phases = [{ ...p.phases[0]!, reportSha256: prior.sha256 }, ...current.phases];
   return { report: { ...current, checks, searchGates, phases, verdict: verdictOf(checks, searchGates.transcript.backend) } };
 }
 
 /* ------------------------------------------------------------------ validate */
 
-const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+/** Strict RFC 3339 UTC as Date#toISOString writes it, and calendar-valid (2026-02-30 is refused). */
+const ISO_SHAPE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const ISO = { test: (s: string) => ISO_SHAPE.test(s) && !Number.isNaN(Date.parse(s)) && new Date(s).toISOString() === s };
 
 /** Structural validation plus the no-secrets self-check. Empty array = valid. */
 export function validateReport(r: unknown, known: { canaries?: readonly string[]; secrets?: readonly string[] } = {}): string[] {
@@ -308,6 +325,7 @@ export function validateReport(r: unknown, known: { canaries?: readonly string[]
     if (!STATUSES.includes(c.status)) issues.push(`${at}.status invalid`);
     if (!ISO.test(c.startedAt ?? "") || !ISO.test(c.finishedAt ?? "")) issues.push(`${at} timestamps must be ISO-8601 UTC`);
     if (c.startedAt > c.finishedAt) issues.push(`${at} finishedAt precedes startedAt`);
+    if (typeof rep.generatedAt === "string" && (c.finishedAt > rep.generatedAt || c.startedAt > rep.generatedAt)) issues.push(`${at} ends after the report was generated`);
     if (!Array.isArray(c.failures) || !Array.isArray(c.evidence) || !Array.isArray(c.steps)) issues.push(`${at} failures/evidence/steps must be arrays`);
     if (c.status === "fail" && !c.failures?.length) issues.push(`${at} fails without a stated failure`);
     if (c.status === "pass" && c.failures?.length) issues.push(`${at} passes with failures recorded`);
