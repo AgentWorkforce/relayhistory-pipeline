@@ -67,6 +67,7 @@ import {
 } from "./apply-authorization.ts";
 import { requireServiceAccountActAs, type ServiceAccountActAsProof } from "./iam-preflight.ts";
 import { fetchRedisServerCa, redisAdminFetchTransport } from "./redis-ca.ts";
+import { PRIVATE_GOOGLE_APIS_RECORDS, bulls96NetworkPolicies } from "./egress.ts";
 import {
   alleyoopWriteCondition,
   ensureConditionalBucketBindings,
@@ -394,6 +395,7 @@ export default Alchemy.Stack(
       "artifactregistry.googleapis.com",
       "compute.googleapis.com",
       "container.googleapis.com",
+      "dns.googleapis.com",
       "iam.googleapis.com",
       "iamcredentials.googleapis.com",
       "pubsub.googleapis.com",
@@ -435,6 +437,26 @@ export default Alchemy.Stack(
       ],
       logConfig: { enable: true, aggregationInterval: "INTERVAL_5_SEC", flowSampling: 0.5, metadata: "INCLUDE_ALL_METADATA" },
     });
+    // Every *.googleapis.com name in the stage VPC resolves to private.googleapis.com,
+    // reached through Private Google Access, so workload egress needs no public
+    // internet route for Google APIs (egress.ts).
+    const googleApisZone = yield* GCP.DNS.ManagedZone("private-googleapis", {
+      zoneName: afterApi("dns.googleapis.com", gcpResourceName(stage, "googleapis", 63)),
+      dnsName: "googleapis.com.",
+      visibility: "private",
+      networks: [network.networkName],
+      description: authorized(`AgentWorkforce ${stage}: Google APIs on private.googleapis.com`),
+      labels: labels(stage, "dns"),
+    });
+    for (const record of PRIVATE_GOOGLE_APIS_RECORDS) {
+      yield* GCP.DNS.ResourceRecordSet(record.id, {
+        managedZone: googleApisZone.zoneName,
+        name: record.name,
+        type: record.type,
+        ttl: 300,
+        rrdatas: [...record.rrdatas],
+      });
+    }
     const natAddress = yield* GCP.Compute.Address("nat-address", {
       addressName: afterApi("compute.googleapis.com", gcpResourceName(stage, "nat", 63)),
       region: i.region,
@@ -881,6 +903,20 @@ export default Alchemy.Stack(
               },
             },
           });
+          // Default deny plus the exact egress the services use (egress.ts). Redis
+          // and Cloud SQL both take their private IPs from the PSA range.
+          for (const policy of bulls96NetworkPolicies({ redisRange: PSA_CIDR, cloudSqlRange: PSA_CIDR })) {
+            yield* Kubernetes.Manifest(`netpol-${policy.metadata.name}`, {
+              cluster,
+              manifest: {
+                ...policy,
+                metadata: {
+                  ...policy.metadata,
+                  annotations: { "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof },
+                },
+              },
+            });
+          }
           // The poster output is an explicit dependency: neither this IAM
           // edge nor the proxy deployment can apply before Cloud SQL is
           // confirmed RUNNABLE with the exact private-only body.
