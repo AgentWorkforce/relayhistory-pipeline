@@ -115,6 +115,9 @@ export class Syncer {
   ) {
     this.started = throttle.now();
     this.hook = async (rows, bytes) => {
+      // Stop promptly: a large session would otherwise hold shutdown for many
+      // minutes. Its keys are already recorded and it retries in 2 min.
+      if (this.stopped()) throw Object.assign(new Error("stopping"), { code: "interrupted" });
       this.counters.rows += rows;
       this.counters.bytes += bytes;
       await this.throttle.take(rows, bytes);
@@ -335,6 +338,9 @@ export class Syncer {
    * Sweeps run on their own loop beside the lanes.
    */
   async run(opts: { once?: boolean; maxGroups?: number } = {}) {
+    // Only one exporter runs per state file (lock): leases of an earlier one are stale.
+    const stale = this.state.releaseStaleLeases("exporter:", LEASE_HOLDER);
+    if (stale) this.log({ message: "released stale exporter leases", count: stale });
     const recovered = this.state.recoverPendingKeys();
     if (recovered) this.log({ message: "recovered interrupted groups", count: recovered });
     if (!this.state.meta("act_sweep_done")) await this.sweepActivity();

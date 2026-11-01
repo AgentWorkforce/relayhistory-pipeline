@@ -9,6 +9,7 @@ import { assertServicesImage, clusterEndpointAccess, hoopdbBackend, lockerLifecy
 import { findPlaceholders, type Approval } from "./deploy-guard.ts";
 import { isDisposableStage, isProductionLike } from "./hardening.ts";
 import { resolveTenantOrgs } from "./tenants.ts";
+import { assertTranscriptStoreInputs, type TranscriptStoreInputs } from "./transcript-store.ts";
 
 /** versions.lock.json `images.services-aws.approved`: the services images an AWS stage may run. */
 export interface ApprovedServicesImage {
@@ -22,6 +23,8 @@ export interface AwsInputs {
   /** The target account id, repeated on the command line to deploy. */
   accountId: string;
   region: string;
+  /** AWS ARN partition. Required and exactly `aws` for the production transcript store. */
+  partition?: string;
   /** Legacy free-text clearance; informational only. Deploy and destroy need `approval`. */
   clearedBy?: string;
   /** Khaliq's approval for exact operations on this exact stage/account/region (deploy-guard.ts). */
@@ -90,6 +93,12 @@ export interface AwsInputs {
     /** Ingest hostname on Cloudflare DNS (needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID at deploy). scheme defaults to internet-facing; WAF always attached. */
     ingress?: { hostname: string; cloudflareZoneId: string; zoneDomain: string; cloudflareTokenSecret: string; certValidation?: { name: string; value: string } } & IngestExposureInput;
   };
+  /**
+   * The production transcript store (transcript-store.ts) instead of the baseline:
+   * S3 only, us-east-1 only, never purged. Excludes eks, supabase, teardown,
+   * accountShared, pippenSandbox and lockerNoncurrentVersionDays.
+   */
+  transcriptStore?: TranscriptStoreInputs;
   /** Khaliq, 2026-10-28: dev HoopDb is a Supabase project in the org the 96Bulls team owns. */
   supabase?: { organizationId: string; projectName: string; region: string; plan?: "free" | "pro"; dbPassRef: string };
 }
@@ -108,6 +117,7 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
     throw new Error("96bulls: pippenSandbox.permissionsBoundaryArn must be a policy ARN in this account. Nothing was created.");
   if (inputs.pippenSandbox && inputs.accountShared) throw new Error("96bulls: a Pippen sandbox account is fresh; it cannot share another stage's account resources. Nothing was created.");
   lockerLifecycleRules(inputs.lockerNoncurrentVersionDays);
+  assertTranscriptStoreInputs(stage, inputs as unknown as Parameters<typeof assertTranscriptStoreInputs>[1]);
   if (inputs.accountShared) {
     const owner = inputs.accountShared.ownerStage;
     if (!/^aws-[a-z0-9-]+$/.test(owner ?? "") || owner === stage)

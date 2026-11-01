@@ -251,6 +251,11 @@ export class SyncState {
     return Number(this.db.prepare("UPDATE leases SET at = ? WHERE prefix = ? AND holder = ?").run(now, prefix, holder).changes) === 1;
   }
 
+  /** Leases of a holder kind other than `current` (a previous run of the same single process). */
+  releaseStaleLeases(kind: string, current: string): number {
+    return Number(this.db.prepare("DELETE FROM leases WHERE holder LIKE ? AND holder <> ?").run(`${kind}%`, current).changes);
+  }
+
   releaseLeases(holder: string, prefixes: Iterable<string>) {
     const q = this.db.prepare("DELETE FROM leases WHERE prefix = ? AND holder = ?");
     this.#tx(() => {

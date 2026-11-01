@@ -4,6 +4,7 @@
  * migration) and the raw store (a temp fs store) are substituted, as in ingest-auth.test.ts.
  */
 import { createSign, generateKeyPairSync } from "node:crypto";
+import { migrationProfile, runMigrations } from "../../../src/hoopdb/migrate.ts";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
@@ -40,11 +41,18 @@ export async function startPipeline(orgIdForStack: string, onIndexed: (p: Pointe
     return `${head}.${body}.${createSign("RSA-SHA256").update(`${head}.${body}`).end().sign(privateKey, "base64url")}`;
   };
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
-  await db.exec(await readFile(join(ROOT, "supabase/tests/supabase_shim.sql"), "utf8"));
-  await db.exec(await readFile(join(ROOT, "supabase/bootstrap/session_directory_search_worker.sql"), "utf8"));
-  for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
-    for (const file of (await readdir(join(ROOT, dir))).filter((f) => f.endsWith(".sql")).sort())
-      await db.exec(await readFile(join(ROOT, dir, file), "utf8"));
+  // The real migrator, with the explicit database-mode contract: PGlite is a local
+  // plain Postgres whose superuser runs everything (shim and Worker bootstrap included,
+  // owner-as-runtime, which only local mode allows).
+  await runMigrations(
+    {
+      async query<R>(text: string, params?: unknown[]) {
+        if (params?.length) return (await db.query<R>(text, params)) as { rows: R[] };
+        return { rows: ((await db.exec(text)).at(-1)?.rows ?? []) as R[] };
+      },
+    },
+    { profile: migrationProfile({ HOOPDB_DB_MODE: "local", HOOPDB_SUPABASE_SHIM: "true", HOOPDB_RUNTIME_ROLE: "postgres" }) },
+  );
   const wrap = (q: { query: PGlite["query"] }): SqlExecutor => ({
     query: async (text, params) => ({ rows: (await q.query(text, params)).rows as never[] }),
   });

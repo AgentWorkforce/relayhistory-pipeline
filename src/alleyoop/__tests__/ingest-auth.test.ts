@@ -550,6 +550,11 @@ describe("buildIngestApp auth (production composition)", () => {
         );
         expect((await ready()).body.reason).toBe("validation_pending");
       }
+      // What the migrator does in its validation transaction (this file applies the
+      // migrations directly): no sessions function stays PUBLIC-executable.
+      await db.exec(
+        "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC",
+      );
       await db.query(
         "UPDATE sessions.__96bulls_role_validation SET generation = $1, status = 'pass'",
         [gen],

@@ -278,11 +278,17 @@ export default Alchemy.Stack(
     );
 
     // HoopDb migrations: one-shot, idempotent, no hooks. Exits 0 when the ledger is complete.
+    // The database-mode contract is explicit (src/hoopdb/migrate.ts): local Docker Postgres,
+    // the shim on, and the services connect as the migrator itself (owner-run).
     yield* service(
       "hoopdb-migrate",
       name(NAMES.hoopdbMigrate),
       "hoopdb-migrate",
-      {},
+      {
+        HOOPDB_DB_MODE: "local",
+        HOOPDB_SUPABASE_SHIM: "true",
+        HOOPDB_RUNTIME_ROLE: HOOPDB_USER,
+      },
       { restart: "no" },
     );
 

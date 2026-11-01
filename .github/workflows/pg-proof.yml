@@ -1,0 +1,77 @@
+name: pg-proof
+# Real PostgreSQL 15 and 17 (disposable service containers, trust auth, no secrets, no
+# hosted service): the migrator's role, readiness and authority guards, end to end,
+# through scripts/pg-proof/role-proof.ts. Each run uploads a machine-verifiable JSON
+# (head SHA, server version, each case's pass/fail) and its log.
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  real-postgres:
+    name: real PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          # Disposable container: trust auth means no credential exists anywhere.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      # The literal PR head commit, not the synthetic merge ref, as in ci.yml.
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED), PostgreSQL ${{ matrix.pg }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: psql client
+        run: psql --version
+      - name: Run the real-PostgreSQL proof
+        env:
+          PGPROOF_HOST: 127.0.0.1
+          PGPROOF_PORT: "5432"
+          PGPROOF_SUPERUSER: postgres
+          PGPROOF_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          PGPROOF_OUT: pg-proof-pg${{ matrix.pg }}.json
+        run: |
+          set -o pipefail
+          bun scripts/pg-proof/role-proof.ts 2>&1 | tee pg-proof-pg${{ matrix.pg }}.log
+      - name: Check the results file names this head and this server
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          f=pg-proof-pg${{ matrix.pg }}.json
+          jq -e --arg head "$EXPECTED" --argjson major ${{ matrix.pg }} \
+            '.head == $head and .pg_major == $major and .failed == 0 and .passed > 0 and (.cases | all(.pass))' "$f"
+          jq -r '"\(.passed) passed, \(.failed) failed on PostgreSQL \(.pg_version) at \(.head)"' "$f" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pg-proof-pg${{ matrix.pg }}
+          path: |
+            pg-proof-pg${{ matrix.pg }}.json
+            pg-proof-pg${{ matrix.pg }}.log

@@ -562,6 +562,16 @@ describe("ownership and failure bookkeeping", () => {
     state.close();
   });
 
+  test("a restarted exporter releases its predecessor's leases, never the eraser's", async () => {
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    expect(state.acquireLease("p1/", "exporter:1")).toBe(true);
+    expect(state.acquireLease("p2/", "eraser:9")).toBe(true);
+    expect(state.releaseStaleLeases("exporter:", "exporter:2")).toBe(1);
+    expect(state.acquireLease("p1/", "exporter:2")).toBe(true);
+    expect(state.acquireLease("p2/", "exporter:2")).toBe(false);
+    state.close();
+  });
+
   test("keys of a run that died mid-group are recovered at the next start; a lost lease stops the write", async () => {
     const state = new SyncState(join(await tempDir(), "s.sqlite"));
     state.recordPendingKey("o", "s", "96bulls/o/v1/k/manifest.json");
