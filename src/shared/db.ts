@@ -10,7 +10,6 @@ export interface HoopDb extends SqlExecutor {
   pool: pg.Pool;
   end(): Promise<void>;
 }
-
 /**
  * Runs `work` in one transaction on one pooled connection: COMMIT when it
  * resolves, ROLLBACK when it throws (then rethrows). Used by the migration
@@ -88,6 +87,8 @@ export const ROLE_VALIDATION_NAME = "session_directory_search_worker";
 export interface ExpectedSchema {
   names: string[];
   generation: string;
+  /** Exact database mode bound into the role verifier; absent/invalid never enables compatibility exceptions. */
+  dbMode?: "local" | "selfhosted" | "cloudsql" | "supabase";
 }
 
 export type SchemaVerdict =
@@ -184,6 +185,7 @@ export async function schemaVerdict(
     return await transact(async (tx): Promise<SchemaVerdict> => {
       await tx.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY");
       await tx.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
+      await tx.query("SELECT set_config('hoopdb.db_mode', $1, true)", [expected.dbMode ?? "unspecified"]);
       stage = "ledger";
       const have = new Set(
         (await tx.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((r) => r.name),

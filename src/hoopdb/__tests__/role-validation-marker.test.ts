@@ -374,7 +374,7 @@ describe("the live gate: the marker is never the sole authority", () => {
     }
   });
 
-  test("the check is one READ COMMITTED, READ ONLY transaction with its own statement_timeout: ledger, marker, the shared phase 2 file, then the marker as the final read", async () => {
+  test("the check is one READ COMMITTED, READ ONLY transaction with its mode bound, its own statement_timeout, ledger, marker, shared phase 2 file, then the marker as the final read", async () => {
     const expected = await expectedSchema();
     const seen: string[] = [];
     const recorder: Transact = async (work) =>
@@ -395,14 +395,15 @@ describe("the live gate: the marker is never the sole authority", () => {
       "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
     );
     expect(seen[1]).toMatch(/^SET LOCAL statement_timeout = \d+$/);
-    expect(seen[2]).toStartWith(
+    expect(seen[2]).toBe("SELECT set_config('hoopdb.db_mode', $1, true)");
+    expect(seen[3]).toStartWith(
       "SELECT name FROM sessions.__96bulls_migrations",
     );
-    expect(seen[3]).toStartWith("SELECT generation, status FROM");
-    expect(seen[4]).toBe(VERIFY);
-    expect(seen[5]).toBe(SESSIONS_FUNCTION_GATE_SQL); // the live sessions-function boundary
-    expect(seen[6]).toStartWith("SELECT generation, status FROM"); // the final read
-    expect(seen).toHaveLength(7);
+    expect(seen[4]).toStartWith("SELECT generation, status FROM");
+    expect(seen[5]).toBe(VERIFY);
+    expect(seen[6]).toBe(SESSIONS_FUNCTION_GATE_SQL); // the live sessions-function boundary
+    expect(seen[7]).toStartWith("SELECT generation, status FROM"); // the final read
+    expect(seen).toHaveLength(8);
     // No advisory lock anywhere on the probe path.
     expect(seen.some((q) => /advisory/i.test(q))).toBe(false);
     // One source: the migrator's verify step and mark_pass.sql use the same file.
@@ -510,7 +511,8 @@ describe("the live gate: the marker is never the sole authority", () => {
     }
   });
 
-  // mark_pass.sql as psql runs it: \ir inlines the verifier, :'generation' is the quoted value.
+  // mark_pass.sql as psql runs it: \ir inlines the verifier and psql quotes
+  // both the migration generation and the explicit database mode.
   const MARK_PASS = readFileSync(
     join(
       root,
@@ -524,7 +526,9 @@ describe("the live gate: the marker is never the sole authority", () => {
       .map((l) =>
         l === "\\ir session_directory_search_worker_verify.sql"
           ? VERIFY
-          : l.replace(":'generation'", `'${gen.replace(/'/g, "''")}'`),
+          : l
+              .replace(":'generation'", `'${gen.replace(/'/g, "''")}'`)
+              .replace(":'db_mode'", "'local'"),
       )
       .join("\n");
   const runMarkPass = async (db: PGlite, gen: string) => {

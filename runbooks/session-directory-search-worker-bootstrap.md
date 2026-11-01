@@ -12,10 +12,10 @@ before any DDL, so nothing is applied.
 The migration's guard runs only once, because the ledger then skips the file. So every
 deploy runs two separate checks:
 
-| Phase        | File                                                            | When                                                 | Run as                                                 | Checks                                                                                            |
-| ------------ | --------------------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| 1. bootstrap | `supabase/bootstrap/session_directory_search_worker.sql`        | before every migrate                                 | a superuser                                            | provisions the bare role if absent; otherwise verifies the role spec. It does not look at grants. |
-| 2. verify    | `supabase/bootstrap/session_directory_search_worker_verify.sql` | after every migrate, once all migrations are applied | any role that can read the catalogs (`hoop` is enough) | the role spec plus the exact direct-grant allowlist. Read-only.                                   |
+| Phase        | File                                                            | When                                                 | Run as                                                     | Checks                                                                                           |
+| ------------ | --------------------------------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 1. bootstrap | `supabase/bootstrap/session_directory_search_worker.sql`        | before every migrate                                 | a superuser; PG15 CREATEROLE; or the Supabase-only wrapper | provisions the bare role if absent; otherwise verifies the role spec and the exact creator edge. |
+| 2. verify    | `supabase/bootstrap/session_directory_search_worker_verify.sql` | after every migrate, once all migrations are applied | any role that can read the catalogs (`hoop` is enough)     | the role spec plus the exact direct-grant allowlist. Read-only.                                  |
 
 Nothing here runs automatically against a real database. Every apply needs Khaliq's
 explicit OK.
@@ -28,21 +28,21 @@ deploy stops at the first non-zero exit. Both files are single atomic `DO` block
 
 Role spec (both phases):
 
-| Item     | Value                                                                                                                                                                                                                                                                            |
-| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Role     | `session_directory_search_worker`                                                                                                                                                                                                                                                |
-| Attrs    | `NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION`                                                                                                                                                                                                |
-| Settings | exactly one row in `pg_db_role_setting`: `setdatabase = 0`, `setconfig = {statement_timeout=2s}`. Other spellings (`2000ms`, `2000`), other values, extra settings and per-database settings are all refused.                                                                    |
-| Members  | it is a member of no role. Its only allowed member is the separately approved authenticator binding: `authenticator`, NOINHERIT, no ADMIN OPTION, and no INHERIT grant on PostgreSQL 16+. The migration owner and every other role hold no membership and no ADMIN OPTION on it. |
+| Item     | Value                                                                                                                                                                                                                                                                                                 |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Role     | `session_directory_search_worker`                                                                                                                                                                                                                                                                     |
+| Attrs    | `NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION`                                                                                                                                                                                                                     |
+| Settings | exactly one row in `pg_db_role_setting`: `setdatabase = 0`, `setconfig = {statement_timeout=2s}`. Other spellings (`2000ms`, `2000`), other values, extra settings and per-database settings are all refused.                                                                                         |
+| Members  | it is a member of no role. Allowed members are the separately approved `authenticator` binding, and only in `supabase` mode on PG16+, the unavoidable `postgres` creator edge: grantor `supabase_admin` with `rolsuper = true`, ADMIN true, INHERIT false and SET false. Every other edge is refused. |
 
 Phase 1, `session_directory_search_worker.sql`:
 
-| Item    | Value                                                                                                          |
-| ------- | -------------------------------------------------------------------------------------------------------------- |
-| Does    | creates the role to spec if it is absent; otherwise verifies it. It never alters an existing role.             |
-| Run as  | a superuser. A non-superuser with CREATEROLE is accepted only on PostgreSQL 15 and older (see Supabase below). |
-| Success | exit 0: the role exists to spec.                                                                               |
-| Failure | `42501`: this caller may not create the role. `55000`: an existing role differs. Nothing is changed.           |
+| Item    | Value                                                                                                                     |
+| ------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Does    | creates the role to spec if it is absent; otherwise verifies it. It never alters an existing role.                        |
+| Run as  | a superuser; a PG15 CREATEROLE role; or Supabase PG16+ `postgres` through `session_directory_search_worker_supabase.sql`. |
+| Success | exit 0: the role exists to spec.                                                                                          |
+| Failure | `42501`: this caller may not create the role. `55000`: an existing role differs. Nothing is changed.                      |
 
 Phase 2, `session_directory_search_worker_verify.sql`:
 
@@ -57,9 +57,15 @@ Phase 2, `session_directory_search_worker_verify.sql`:
 | Success                            | exit 0. It changes nothing.                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Failure                            | `55000`, naming every violation. Nothing is changed; the deploy must stop and an operator decides the fix.                                                                                                                                                                                                                                                                                                                  |
 
-Phase 1 creates no membership when a superuser runs it. On PostgreSQL 16+, a non-superuser
-CREATEROLE creator is automatically granted ADMIN OPTION on the new role. The migration
-refuses that grant, so phase 1 refuses such a caller up front (`42501`).
+Phase 1 creates no membership when a superuser runs it. On PostgreSQL 16+, Supabase's
+non-superuser CREATEROLE `postgres` necessarily receives ADMIN on a custom role, recorded
+with grantor `supabase_admin`. The Supabase wrapper binds `hoopdb.db_mode=supabase`; phase
+1, the migration guard, phase 2 and the live gate then accept only that frozen catalog
+shape. `postgres` cannot inherit or SET the dedicated role, but ADMIN plus CREATEROLE
+means it can grant or drop it. That residual administrative capability is explicit and
+is never accepted in local or selfhosted mode. A grant made after PASS is caught by the
+next live Worker phase-2 probe; a runtime-role grant is caught by the next migrator
+preflight.
 
 ## Readiness (what makes a reader ready)
 
@@ -167,14 +173,14 @@ marker: a reader started early, or a migrator that died, simply stays non-ready.
 `src/hoopdb/migrate.ts` resolves an explicit profile **before opening any connection**. It
 never infers anything from the hostname. An invalid profile writes nothing anywhere.
 
-| Variable                        | Contract                                                                                                                                                                                                                                                          |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (operator-controlled Postgres), `cloudsql` (Google Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                       |
-| `HOOPDB_SUPABASE_SHIM`          | `local`, `selfhosted` and `cloudsql`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project.           |
-| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                      |
-| `HOOPDB_RUNTIME_ROLE`           | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                                                |
-| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                            |
-| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                                         |
+| Variable                        | Contract                                                                                                                                                                                                                                                                      |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (operator-controlled Postgres), `cloudsql` (Google Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                     |
+| `HOOPDB_SUPABASE_SHIM`          | `local`, `selfhosted` and `cloudsql`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project.                        |
+| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                                  |
+| `HOOPDB_RUNTIME_ROLE`           | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                                                            |
+| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                        |
+| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                                                     |
 | `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql` and `supabase`: `global-default-revoke` (the only implemented mode; the catalog must prove it, see "Function boundary"). `event-trigger` is refused as not implemented, and the old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
 
 **Runtime role: dedicated, exact least privilege.** It is checked under the migrator's
@@ -202,25 +208,33 @@ phase 2 can mark PASS.
     migrator then verifies the resulting LOGIN-only role and its exact
     database/schema/object privileges. Its password and URL are stored in 1Password and
     supplied only through the runtime Secret.
-  - `supabase`: pre-provisioned by an operator and verified by the migrator. On
-    PostgreSQL 16+ the creator-ADMIN caveat of the Worker applies here too: a role
-    created by Supabase's non-superuser `postgres` would carry ADMIN for `postgres` and
-    be refused. This is a decision point in #98.
+  - `supabase`: pre-provisioned by an operator and verified by the migrator. On PG16+
+    the exact unavoidable `postgres` creator edge is accepted only when its grantor is
+    the frozen superuser `supabase_admin`, ADMIN is true, INHERIT and SET are false, no
+    other unconfigured member exists, and the database mode is exactly `supabase`.
 
 **The allowlist** (`runtimeRoleViolations` in `src/hoopdb/migrate-guards.ts`). Every
 violation is named:
 
 - LOGIN or NOLOGIN exactly as `HOOPDB_RUNTIME_ROLE_LOGIN` says. NOSUPERUSER, NOCREATEDB,
   NOCREATEROLE, NOREPLICATION, NOBYPASSRLS.
-- A member of no role. Its only member may be `HOOPDB_RUNTIME_WORKLOAD_ROLE`, without
-  ADMIN OPTION.
+- A member of no role. Its only ordinary member may be `HOOPDB_RUNTIME_WORKLOAD_ROLE`,
+  with ADMIN false, INHERIT/SET true, and a catalog-superuser grantor. In exact
+  `supabase` mode on PG16+, the workload grantor may instead be frozen `postgres` only
+  when the same target carries the exact `postgres`/`supabase_admin` creator edge. That
+  creator edge may coexist with the configured workload edge; every mutation or second
+  ordinary member is refused.
 - Owns nothing. No CREATE on any schema or on the database, however it is obtained
   (PUBLIC or memberships included).
 - **CONNECT is required** (effective) for the runtime role, and for the workload role
   when one is configured. A LOGIN role that can't connect is refused.
-- **TEMPORARY is refused** (effective). PUBLIC holds it by default, so revoking it from
-  the role alone is not enough. No service uses temporary objects; see
-  `docs/evidence/runtime-temp-usage.md` for the searched roots, commands and results.
+- **TEMPORARY is refused**, except for one Supabase-only platform baseline: effective
+  TEMPORARY must come solely from PUBLIC, the role must have no direct TEMPORARY ACL or
+  PUBLIC GRANT OPTION. A configured workload does not change this database-wide PUBLIC
+  baseline. Local, selfhosted and cloudsql still refuse every effective TEMPORARY grant.
+  This is compatibility, not a
+  service requirement: no service creates temporary objects or relies on runtime
+  `search_path`; see `docs/evidence/runtime-temp-usage.md`.
 - **Approved, and nothing else:** `USAGE` on schema `sessions`; `SELECT` on
   `sessions.__96bulls_migrations` and `sessions.__96bulls_role_validation`, with no GRANT
   OPTION; `CONNECT` on the database.
@@ -240,8 +254,15 @@ violation is named:
   above. USAGE on any other non-system schema is refused, PUBLIC-derived included. Type
   USAGE through PUBLIC (PostgreSQL's default for every type, needed to read typed columns)
   is accepted as non-mutating; a type grant naming the role is a direct reference, refused.
-- **MAINTAIN (PostgreSQL 17+)** on any relation, directly or through PUBLIC, is refused.
-  The check is version-guarded, because MAINTAIN does not exist on 15.
+- **Relation reachability:** effective PUBLIC-derived table, view, sequence and
+  PostgreSQL 17+ MAINTAIN grants are
+  effective only when the role also has USAGE on the containing schema. The guard uses
+  that catalog rule instead of hard-coding extension relations. A PUBLIC relation grant
+  in an inaccessible extension schema is inert; adding schema USAGE makes the same grant
+  fail. A direct relation or column ACL naming the runtime role is always refused through
+  `pg_shdepend`, even when the schema is inaccessible. `sessions` is treated as reachable during preflight because the migrator itself
+  grants the approved USAGE later in the same run. Direct relation ACLs in other
+  databases remain refused because their schema catalogs cannot be evaluated here.
 - **Coverage, stated exactly:**
   - In the current database: effective privileges in every non-system schema. That covers
     tables, views and sequences (any privilege), EXECUTE on SECURITY DEFINER functions
@@ -270,13 +291,13 @@ idempotently.
     PUBLIC for TEMPORARY loses it. The owner and superusers keep it. A real PostgreSQL
     test shows an unrelated role losing it.
   - Grant TEMPORARY explicitly to any other role that needs it.
-- **supabase:** the migrator never changes the database ACL; it detects and refuses. Before
-  the first migrate, the operator must leave the project database with:
-  - PUBLIC holding no TEMPORARY: `REVOKE TEMPORARY ON DATABASE postgres FROM PUBLIC`,
-    reviewed for its effect on Supabase's own roles first;
-  - the runtime role holding CONNECT.
-
-  This is a decision point in #98.
+- **supabase:** the migrator never changes the database ACL. It accepts Supabase's frozen
+  PUBLIC TEMPORARY baseline only when catalog evidence proves there is no direct role
+  grant and no PUBLIC GRANT OPTION. A direct TEMPORARY grant, a membership-derived grant,
+  or any non-Supabase mode fails closed. The runtime role must still hold effective
+  CONNECT. The residual is explicit: the role can create temporary objects because the
+  hosted platform grants that capability to every role, although no 96Bulls runtime path
+  uses it.
 
 **One migration authority and the full ordered sequence (decision point).** Also under the
 lock and before any write, the migrator refuses:
@@ -542,11 +563,11 @@ On Supabase, `postgres` is not a superuser. Its behavior depends on the server v
 1. Read the version: `SHOW server_version_num;`.
 2. **Below 160000 (PostgreSQL 15):** an operator runs the command above as `postgres`
    (CREATEROLE). Creating the role grants `postgres` nothing.
-3. **160000 or above:** do not run it as `postgres`. The bootstrap refuses it with
-   `42501`, because `postgres` would receive ADMIN OPTION on the role and the migration
-   would then refuse it. This needs a decision before any apply: either a superuser run
-   through Supabase support, or an explicit, reviewed change to the spec. It is an open
-   blocker, not a step to work around.
+3. **160000 or above:** run the transactional Supabase entry point as `postgres`:
+   `psql -v ON_ERROR_STOP=1 -X -f supabase/bootstrap/session_directory_search_worker_supabase.sql`.
+   It binds the exact mode, creates the role and verifies the automatic edge in one
+   transaction. A different member/grantor, non-super grantor, SET/INHERIT option,
+   missing ADMIN option or any additional membership fails with `55000` and rolls back.
 4. Check the role with the queries below, then apply the migrations with `hoopdb-migrate`.
    It writes the pending marker, runs phase 2 and records PASS. Migrations applied any
    other way write no marker, so no reader becomes ready (fail closed).
@@ -560,8 +581,11 @@ SELECT rolcanlogin, rolinherit, rolbypassrls, rolsuper, rolcreaterole, rolcreate
   FROM pg_roles WHERE rolname = 'session_directory_search_worker';
 SELECT setdatabase, setconfig FROM pg_db_role_setting s
   JOIN pg_roles r ON r.oid = s.setrole WHERE r.rolname = 'session_directory_search_worker';
-SELECT g.rolname AS role, u.rolname AS member, m.admin_option FROM pg_auth_members m
+SELECT g.rolname AS role, u.rolname AS member, x.rolname AS grantor,
+       x.rolsuper AS grantor_super, m.admin_option, m.inherit_option, m.set_option
+  FROM pg_auth_members m
   JOIN pg_roles g ON g.oid = m.roleid JOIN pg_roles u ON u.oid = m.member
+  JOIN pg_roles x ON x.oid = m.grantor
  WHERE 'session_directory_search_worker' IN (g.rolname, u.rolname);
 SELECT d.deptype, pg_describe_object(d.classid, d.objid, d.objsubid) FROM pg_shdepend d
  WHERE d.refclassid = 'pg_authid'::regclass
@@ -572,7 +596,8 @@ Expected results:
 
 - every attribute is `f`;
 - exactly one settings row, `0 | {statement_timeout=2s}`;
-- no membership rows until the separate authenticator binding.
+- selfhosted/PG15: no membership rows until the separate authenticator binding;
+- Supabase PG16+: exactly the `postgres`/`supabase_admin` creator edge described above.
 - after the migrations, `pg_shdepend` lists only `a` rows: schema `sessions` and the three
   approved functions. Before `20261030020000`, it lists none.
 
@@ -587,10 +612,11 @@ in each database.
 
 ## Rehearsal databases
 
-The HoopDb ledger records each migration's sha256. This hotfix changes
-`20261030020000`, so a rehearsal database that already applied the old file fails with
-"changed after it was applied". Recreate any such disposable database. This includes a
-local Docker stack: run `96bulls down <stage> --purge`, then `up`. The old file was never
-applied to a real one. The sha256 of `20261030020000` as merged (#96, after #72's token pins) is
-`c223b77e4c875cbc36499e6ca1c8e521b564ebf25facd87313b3e58335918de4`. The earlier draft value
-`f86e5dc9...0d66` was superseded before merge. A test pins the checksum.
+The HoopDb ledger records each migration's sha256. The only historical checksum alias is
+the guard-only `20261030020000` change: an existing ledger row holding
+`c223b77e4c875cbc36499e6ca1c8e521b564ebf25facd87313b3e58335918de4` is accepted and
+left unchanged, while a fresh database executes and records
+`b0ddc7de8c4cff9454638c52563f37f1e1380ed577e2a7535f67ddc2c0b758ce`.
+Both hashes, the migration name and the fact that this is the sole alias are pinned by a
+test. Any third checksum or any other migration name fails closed. The alias is emitted
+in migration logs and `--activation-check`; generation remains based on the current file.
