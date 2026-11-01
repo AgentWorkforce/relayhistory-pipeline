@@ -83,9 +83,25 @@ describe("per-service-account pod roles", () => {
     expect(eks).not.toMatch(/podRole\.roleArn/);
   });
 
-  it("grants s3:DeleteObject to no pod role (the ObjectStore has no delete)", () => {
+  it("grants s3:DeleteObject only to AlleyOop, only for parked-session cleanup", () => {
     for (const r of roles)
-      for (const s of r.policy.Statement as Stmt[]) if (s.Effect === "Allow") expect(s.Action.some((a) => /Delete|s3:\*/.test(a))).toBe(false);
+      for (const s of r.policy.Statement as Stmt[]) {
+        if (s.Effect !== "Allow") continue;
+        expect(s.Action.some((a) => /s3:\*|DeleteObjectVersion|DeleteBucket/.test(a))).toBe(false);
+        if (s.Action.includes("s3:DeleteObject")) {
+          expect(r.serviceAccount).toBe(SERVICE_ACCOUNTS.alleyoop);
+          expect(s.Action).toEqual(["s3:DeleteObject"]);
+        }
+      }
+    const parked = manifest.replace(/manifest\.json$/, "parked/box-1/manifest.json");
+    expect(grants(SERVICE_ACCOUNTS.alleyoop, "s3:DeleteObject", parked)).toBe(true);
+    expect(grants(SERVICE_ACCOUNTS.alleyoop, "s3:DeleteObject", raw)).toBe(true);
+    expect(grants(SERVICE_ACCOUNTS.alleyoop, "s3:PutObject", parked)).toBe(true);
+    // A live manifest or a summary is never deletable by a pod.
+    expect(grants(SERVICE_ACCOUNTS.alleyoop, "s3:DeleteObject", manifest)).toBe(false);
+    expect(grants(SERVICE_ACCOUNTS.alleyoop, "s3:DeleteObject", summary)).toBe(false);
+    for (const key of [manifest, raw, summary, parked])
+      expect(grants(SERVICE_ACCOUNTS.worker, "s3:DeleteObject", key)).toBe(false);
   });
 
   it("lets the worker read session objects and write only encrypted summaries (keys from the real layout)", () => {
