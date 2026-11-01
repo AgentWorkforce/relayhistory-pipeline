@@ -271,6 +271,30 @@ export function serveHealth(health: WorkerHealth, port: number) {
   return server;
 }
 
+/**
+ * One worker tick: every claim path, gated. The live gate (gateOpen: ledger, marker,
+ * phase 2 and the sessions-function boundary) runs before EACH stage's claim and before
+ * the side tick; once it is closed, nothing further in the tick runs. Exported so a
+ * table-driven test can prove the order over every claim path.
+ */
+export async function workerTick<S>(io: {
+  stages: readonly S[];
+  gate: () => Promise<boolean>;
+  poll: (stage: S) => Promise<number>;
+  tick?: () => Promise<void>;
+}): Promise<{ claimed: number; gated: boolean }> {
+  let claimed = 0;
+  for (const stage of io.stages) {
+    if (!(await io.gate())) return { claimed, gated: true };
+    claimed += await io.poll(stage);
+  }
+  if (io.tick) {
+    if (!(await io.gate())) return { claimed, gated: true };
+    await io.tick();
+  }
+  return { claimed, gated: false };
+}
+
 export async function runWorker(opts: WorkerOptions): Promise<never> {
   process.env.OTEL_SERVICE_NAME ||= opts.service;
   initTelemetry(opts.service);
@@ -375,47 +399,52 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
     // their pollPostgresStage call (acked, retried or dead-lettered). A batch cut short
     // by a crash is re-delivered when its lease (WORKER_LEASE_SECONDS) expires. While
     // the gate is closed the worker claims nothing.
-    let gated = false;
-    for (const stage of opts.stages) {
-      if (!(await gateOpen(health))) {
-        gated = true;
-        break;
-      }
-      try {
-        const r = await pollPostgresStage({
-          sql: db,
-          stage,
-          deps,
-          batchSize,
-          leaseSeconds,
-        });
-        claimed += r.claimed;
-        if (r.claimed)
-          log.info("poll", {
+    const r = await workerTick({
+      stages: opts.stages,
+      gate: () => gateOpen(health),
+      poll: async (stage) => {
+        try {
+          const p = await pollPostgresStage({
+            sql: db,
             stage,
-            claimed: r.claimed,
-            acked: r.acked,
-            retried: r.retried,
-            exhausted: r.exhausted,
+            deps,
+            batchSize,
+            leaseSeconds,
           });
-      } catch (err) {
-        log.error("poll failed", { stage, ...errorFields(err) });
-      }
-    }
-    if (opts.tick && !gated && (await gateOpen(health))) {
-      // Long side work (reconcile) keeps the progress clock moving while it runs.
-      const tickBeat = setInterval(
-        () => (health.lastTickAt = Date.now()),
-        10_000,
-      );
-      try {
-        await opts.tick(db, new Date());
-      } catch (err) {
-        log.error("tick failed", errorFields(err));
-      } finally {
-        clearInterval(tickBeat);
-      }
-    }
+          if (p.claimed)
+            log.info("poll", {
+              stage,
+              claimed: p.claimed,
+              acked: p.acked,
+              retried: p.retried,
+              exhausted: p.exhausted,
+            });
+          return p.claimed;
+        } catch (err) {
+          log.error("poll failed", { stage, ...errorFields(err) });
+          return 0;
+        }
+      },
+      ...(opts.tick
+        ? {
+            tick: async () => {
+              // Long side work (reconcile) keeps the progress clock moving while it runs.
+              const tickBeat = setInterval(
+                () => (health.lastTickAt = Date.now()),
+                10_000,
+              );
+              try {
+                await opts.tick!(db, new Date());
+              } catch (err) {
+                log.error("tick failed", errorFields(err));
+              } finally {
+                clearInterval(tickBeat);
+              }
+            },
+          }
+        : {}),
+    });
+    claimed += r.claimed;
     if (claimed === 0) await sleep(idleMs);
   }
 }

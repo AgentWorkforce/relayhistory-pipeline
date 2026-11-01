@@ -240,6 +240,14 @@ export interface GcpInputs {
     chartVersion: string;
     tenantOrgId: string;
     existingSecretName: string;
+    /**
+     * HOOPDB_RUNTIME_ROLE: the dedicated, non-owner Cloud SQL role the services connect as,
+     * created by supabase/bootstrap/hoopdb_runtime_role.sql as a privileged step before
+     * migrate. No default: unset, the migrator refuses to run (src/hoopdb/migrate.ts).
+     */
+    hoopdbRuntimeRole?: string;
+    /** HOOPDB_RUNTIME_ROLE_LOGIN: whether that role logs in itself (default true). */
+    hoopdbRuntimeRoleLogin?: boolean;
     /** Digest of the services image built from the reviewed runtime commit. */
     imageDigest: string;
     /** Full Git revision from which imageDigest was built. Must match versions.lock.json. */
@@ -887,7 +895,11 @@ export function bulls96ReleaseValues(
       },
       serviceAccount: { annotations: { ...identity } },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
-      extraEnv: dataEnv(),
+      // Cloud SQL is plain Postgres: selfhosted mode, the shim on, an explicit runtime role.
+      extraEnv: [
+        ...dataEnv(),
+        ...gcpHoopdbModeEnv(i.hoopdbRuntimeRole, i.hoopdbRuntimeRoleLogin),
+      ],
     },
     alleyoop: {
       fullnameOverride: GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.alleyoop,
@@ -928,4 +940,33 @@ export function relayflowsChartValues(
     },
     persistence: { storageClass: defaultStorageClass },
   };
+}
+
+/**
+ * The GCP migrator's explicit profile: Cloud SQL is plain Postgres dedicated to HoopDb,
+ * so selfhosted mode, the shim on, the exact global function default for the owner and
+ * superusers (installed by supabase/bootstrap/hoopdb_function_default_revoke.sql), and the
+ * dedicated runtime role. Cloud SQL gives the operator no superuser and its internal
+ * cloudsqladmin cannot be altered (expected, not observed live), so that bootstrap cannot
+ * run and the migrator's function-boundary gate stays refused (fail closed) until a
+ * reviewed control exists (#98).
+ */
+export function gcpHoopdbModeEnv(
+  runtimeRole?: string,
+  runtimeLogin?: boolean,
+): Array<{ name: string; value: string }> {
+  return [
+    { name: "HOOPDB_DB_MODE", value: "selfhosted" },
+    { name: "HOOPDB_SUPABASE_SHIM", value: "true" },
+    { name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" },
+    ...(runtimeRole
+      ? [
+          { name: "HOOPDB_RUNTIME_ROLE", value: runtimeRole },
+          {
+            name: "HOOPDB_RUNTIME_ROLE_LOGIN",
+            value: runtimeLogin === false ? "false" : "true",
+          },
+        ]
+      : []),
+  ];
 }

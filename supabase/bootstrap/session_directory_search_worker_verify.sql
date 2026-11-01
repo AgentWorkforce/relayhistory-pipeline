@@ -30,7 +30,7 @@
 --             None may carry GRANT OPTION. Every approved RPC must exist with exactly
 --             this signature. A missing RPC, or a function of the same name with any
 --             other signature (redefined), fails; the allowlist never shrinks to match.
---             Nothing else may reference the role in any database of the cluster
+--             No direct reference to the role may exist in any database of the cluster
 --             (pg_shdepend): no owned objects; no table, column, sequence, function,
 --             schema, database, type, language, large object, parameter, foreign server
 --             or tablespace privileges; no default privileges; no RLS policies.
