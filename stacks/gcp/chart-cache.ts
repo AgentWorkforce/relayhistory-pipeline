@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   mkdirSync,
+  lstatSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -9,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { execFileSync } from "node:child_process";
 import type {
   CapturedRelayauthChartPackage,
@@ -33,6 +34,57 @@ const CACHE_RECORD = ".96bulls-verified-chart.json";
 const LOCK_OWNER = "owner.json";
 const DEFAULT_LOCK_WAIT_MS = 15_000;
 const DEFAULT_STALE_LOCK_MS = 30_000;
+
+function preparePrivateCacheRoot(cacheRoot: string): void {
+  const uid = process.getuid?.();
+  if (uid === undefined)
+    throw new Error(
+      "96bulls: verified chart cache requires deploy-user ownership checks. Nothing was created.",
+    );
+
+  let parent;
+  try {
+    parent = lstatSync(dirname(cacheRoot));
+  } catch {
+    throw new Error(
+      "96bulls: verified chart cache parent is unavailable. Nothing was created.",
+    );
+  }
+  const parentMode = parent.mode & 0o7777;
+  const privateOwnerParent =
+    parent.uid === uid && (parentMode & 0o022) === 0;
+  const rootStickyParent =
+    parent.uid === 0 &&
+    (parentMode & 0o1000) !== 0 &&
+    (parentMode & 0o002) !== 0;
+  if (
+    !parent.isDirectory() ||
+    parent.isSymbolicLink() ||
+    (!privateOwnerParent && !rootStickyParent)
+  )
+    throw new Error(
+      "96bulls: verified chart cache parent is not trusted. Nothing was created.",
+    );
+
+  try {
+    mkdirSync(cacheRoot, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST")
+      throw new Error(
+        "96bulls: verified chart cache root is unavailable. Nothing was created.",
+      );
+  }
+  const root = lstatSync(cacheRoot);
+  if (
+    !root.isDirectory() ||
+    root.isSymbolicLink() ||
+    root.uid !== uid ||
+    (root.mode & 0o777) !== 0o700
+  )
+    throw new Error(
+      "96bulls: verified chart cache root must be owned by the deploy user with mode 0700. Nothing was created.",
+    );
+}
 
 interface LockOwner {
   id: string;
@@ -181,7 +233,7 @@ function prepareVerifiedChart(
   const staleLockMs = options.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
   if (!Number.isFinite(staleLockMs) || staleLockMs < 1)
     throw new Error("96bulls: verified Relaycast chart cache lock policy is invalid. Nothing was created.");
-  mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
+  preparePrivateCacheRoot(cacheRoot);
 
   // The expected tree hash comes from a fresh extraction of the already
   // captured, digest-verified archive. The mutable cache record is evidence,
