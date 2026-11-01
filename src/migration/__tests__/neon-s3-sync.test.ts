@@ -550,6 +550,20 @@ describe("ownership and failure bookkeeping", () => {
     state.close();
   });
 
+  test("ids longer than 128 chars that differ only at the end get distinct keys", async () => {
+    const { component } = await import("../neon-s3-sync/export-session.ts");
+    const base = `pi:${"a".repeat(64)}:pi_session_${"b".repeat(40)}:subagent_1234-5678`;
+    const [a, b] = [`${base}:agent-1`, `${base}:agent-2`];
+    expect(component(a)).not.toBe(component(b));
+    expect(component(a).length).toBe(128);
+    expect(component(a)).toMatch(/^[A-Za-z0-9._-]{128}$/);
+    expect(component("short:id")).toBe("short_id"); // unchanged for ids that fit
+    const { store } = await countingStore();
+    await exportUnit(target(store), unit("org-a", { sessionId: a }), fixedSource(baseRecords().slice(0, 1)));
+    const r = await exportUnit(target(store), unit("org-a", { sessionId: b }), fixedSource(baseRecords().slice(0, 1)));
+    expect(r.manifests[0]!.written).toBe(true);
+  });
+
   test("two Neon sessions whose ids sanitize to one key do not overwrite each other", async () => {
     const { store } = await countingStore();
     const t = target(store);

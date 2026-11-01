@@ -62,8 +62,13 @@ export interface ExportTarget {
 }
 
 /** Layout component: the pipeline's `[A-Za-z0-9._-]{1,128}`, not starting with `.` (same map as #55's courier). */
-export const component = (s: string) =>
-  s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128).replace(/^\./, "_");
+export const component = (s: string) => {
+  const safe = s.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\./, "_");
+  if (safe.length <= 128) return safe;
+  // Too long: a plain cut makes ids that differ only past char 128 collide
+  // (seen in production: 38 sessions). Keep 119 chars and a digest of the whole id.
+  return `${safe.slice(0, 119)}-${createHash("sha256").update(s).digest("hex").slice(0, 8)}`;
+};
 
 const ORG = /^[A-Za-z0-9._-]{1,128}$/;
 const KEY_ROOT = /^[a-z0-9][a-z0-9-]{0,62}$/;
