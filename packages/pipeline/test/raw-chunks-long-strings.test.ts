@@ -205,3 +205,70 @@ describe("a whitespace run longer than the context window", () => {
     expect(out).not.toContain(tok);
   });
 });
+
+// ---------------------------------------------------------------- review of 986826b
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+const logLines = (n: number) => "a log line of ordinary text here\n".repeat(Math.ceil(n / 33));
+
+describe("no regex state shared between calls (C1)", () => {
+  it("a private key in a line run is redacted before and after an unrelated long string mentioned a key header", () => {
+    const MAT = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun";
+    const pem = `-----BEGIN RSA PRIVATE KEY-----\n${`${MAT}\n`.repeat(320)}-----END RSA PRIVATE KEY-----\n`;
+    const b = `${logLines(MAX_SCRUB_CHARS - 10_000)}${pem}${logLines(20_000)}`;
+    const runB = () => {
+      try {
+        return dec.decode(scrubRecords(enc.encode(b)).scrubbed).includes(MAT) ? "LEAK" : "redacted";
+      } catch {
+        return "refused";
+      }
+    };
+    expect(runB()).not.toBe("LEAK");
+    const a = `${filler(MAX_SCRUB_CHARS + 50_000)} -----BEGIN EC PRIVATE KEY----- x -----END EC PRIVATE KEY----- ${filler(1000)}`;
+    scrubRecords(enc.encode(`${JSON.stringify({ o: a })}\n`));
+    scrubLong(a);
+    expect(runB()).not.toBe("LEAK");
+    expect(runB()).not.toBe("LEAK");
+  });
+});
+
+describe("bounded CPU on the line path (H2)", () => {
+  it("300,000 blank lines finish in seconds, not minutes", () => {
+    const t0 = performance.now();
+    try {
+      scrubRecords(enc.encode(`x\n${"\n".repeat(300_000)}y\n`));
+    } catch {
+      // refusing is acceptable; taking minutes is not
+    }
+    const t1 = performance.now();
+    try {
+      scrubRecords(enc.encode(" \n".repeat(150_000)));
+    } catch {}
+    const t2 = performance.now();
+    expect(t1 - t0).toBeLessThan(5000);
+    expect(t2 - t1).toBeLessThan(5000);
+  }, 60_000);
+});
+
+describe("prefixed credential names on the line path (H3)", () => {
+  for (const name of ["DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "STRIPE_API_KEY"]) {
+    it(`${name}\\n=\\n<secret> is never split from its value`, () => {
+      const secret = "Zq8vR2kLm9Xp4Tn7Wc3Ys6HdQQ";
+      const s = `${name}\n=\n${secret}`;
+      expect(scrubText(s)).not.toContain(secret);
+      const leaks: number[] = [];
+      for (let d = -40; d <= 40; d++) {
+        const text = `${logLines(MAX_SCRUB_CHARS - name.length + d)}${s}\n${logLines(20_000)}`;
+        let out: string;
+        try {
+          out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
+        } catch {
+          continue;
+        }
+        if (out.includes(secret)) leaks.push(d);
+      }
+      expect(leaks).toEqual([]);
+    }, 120_000);
+  }
+});

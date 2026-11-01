@@ -55,6 +55,7 @@ export const META_SCRUB_VERSION = "scrub-version";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
+// <scrub-segmenter> (folded into the scrub rule set digest test: from here to the end marker)
 /**
  * Scrub one source range record by record. A line that is a JSON object,
  * array or string is a record: every string token in it (values and keys) is scrubbed
@@ -110,7 +111,11 @@ export function scrubRecords(source: Uint8Array): {
     // `safeCut`), carrying the lines after that cut into the next segment.
     if (run && !keyOpen && privateKeyOpenAfter(line, false)) flush();
     else if (run && !keyOpen && run.length + next.length > MAX_SCRUB_CHARS) {
-      const cut = safeCut(run, next);
+      // At least CUT_CONTEXT_CHARS of what follows, for the context check.
+      let lookahead = next;
+      for (let j = i + 2; j < parts.length && lookahead.length < CUT_CONTEXT_CHARS + next.length; j += 2)
+        lookahead += (parts[j] ?? "") + (parts[j + 1] ?? "");
+      const cut = safeCut(run, lookahead.slice(0, next.length + CUT_CONTEXT_CHARS));
       // Every boundary in 64 KiB splits a match: refuse the chunk rather than
       // let `scrubText` truncate the segment and drop lines.
       if (!cut)
@@ -131,7 +136,6 @@ export function scrubRecords(source: Uint8Array): {
   return { scrubbed: encoder.encode(out), records };
 }
 
-// <scrub-segmenter> (folded into the scrub rule set digest test)
 /**
  * Longest whitespace run a segment may be cut inside. Rules whose match spans
  * a separator (`Bearer <token>`, `password: value`) allow whitespace of any
@@ -141,12 +145,15 @@ export function scrubRecords(source: Uint8Array): {
 const MAX_CUT_GAP = 1024;
 /** Most candidate cuts a segment search fully checks before refusing (bounds CPU). */
 const MAX_CUT_CHECKS = 48;
+/** Most candidates of any kind (cheap refusals included) a segment search looks at. */
+const MAX_CUT_CANDIDATES = 4096;
 /**
  * A credential keyword (and optional `:`/`=`) at the end of the text before a
  * whitespace run: a cut there would separate the keyword from its value.
  */
 const CREDENTIAL_KEYWORD =
-  /(?:\b(?:bearer|basic|token|password|passwd|pwd|secret|api[-_]?key|access[-_]?key|secret[-_]?key|private[-_]?key|client[-_]?secret|authorization|auth|credentials?|key)["']?\s*[:=]?|[:=])["']?$/i;
+  // Not `\b`: in `DB_PASSWORD` there is no word boundary between `_` and `P`.
+  /(?:(?<![A-Za-z0-9])(?:bearer|basic|token|password|passwd|pwd|secret|api[-_]?key|access[-_]?key|secret[-_]?key|private[-_]?key|client[-_]?secret|authorization|auth|credentials?|key)["']?\s*[:=]?|[:=])["']?$/i;
 
 /**
  * Whether the text may be cut at `cut` (the segments either side are then
@@ -158,19 +165,33 @@ const CREDENTIAL_KEYWORD =
  *  - `CUT_CONTEXT_CHARS` beyond each end of the run scrubs the same together and apart.
  * `budget.checks` counts the full checks (three `scrubText` calls each).
  */
-function cutIsSafe(text: string, cut: number, budget: { checks: number }): boolean {
+interface CutBudget {
+  checks: number;
+  candidates: number;
+}
+
+/**
+ * `{ ok }` plus `runStart`, the start of the whitespace run around `cut`, so a
+ * caller can skip a refused run in one step (each run is walked once).
+ */
+function cutIsSafe(text: string, cut: number, budget: CutBudget): { ok: boolean; runStart: number } {
+  budget.candidates += 1;
   let start = cut;
   while (start > 0 && /\s/.test(text[start - 1]!)) start--;
+  // Forward walk bounded: a run past MAX_CUT_GAP is refused whatever its length.
   let end = cut;
-  while (end < text.length && /\s/.test(text[end]!)) end++;
-  if (end - start > MAX_CUT_GAP) return false;
-  if (CREDENTIAL_KEYWORD.test(text.slice(Math.max(0, start - 64), start))) return false;
-  if (/[\d)]/.test(text[start - 1] ?? "") && /[\d(]/.test(text[end] ?? "")) return false;
+  while (end < text.length && end - start <= MAX_CUT_GAP && /\s/.test(text[end]!)) end++;
+  const no = { ok: false, runStart: start };
+  if (end - start > MAX_CUT_GAP) return no;
+  if (CREDENTIAL_KEYWORD.test(text.slice(Math.max(0, start - 64), start))) return no;
+  if (/[\d)]/.test(text[start - 1] ?? "") && /[\d(]/.test(text[end] ?? "")) return no;
   budget.checks += 1;
   const before = text.slice(Math.max(0, start - CUT_CONTEXT_CHARS), cut);
   const after = text.slice(cut, Math.min(text.length, end + CUT_CONTEXT_CHARS));
-  return scrubText(before + after) === scrubText(before) + scrubText(after);
+  return { ok: scrubText(before + after) === scrubText(before) + scrubText(after), runStart: start };
 }
+
+const withinBudget = (b: CutBudget) => b.checks < MAX_CUT_CHECKS && b.candidates < MAX_CUT_CANDIDATES;
 
 /** How far back `safeCut` looks for a boundary, and how much text it scrubs. */
 const CUT_SEARCH_CHARS = 65_536;
@@ -185,27 +206,35 @@ const CUT_CONTEXT_CHARS = 4096;
  * and compared with scrubbing each side alone; any difference means a match
  * crosses it.
  */
-function safeCut(run: string, next: string): number {
-  const text = run + next;
-  const budget = { checks: 0 };
+function safeCut(run: string, lookahead: string): number {
+  // `lookahead` is the line that would overflow plus at least CUT_CONTEXT_CHARS
+  // of what follows it, so a secret on a later line is in the context check.
+  const text = run + lookahead;
+  const budget: CutBudget = { checks: 0, candidates: 0 };
   const floor = Math.max(1, run.length - CUT_SEARCH_CHARS);
-  for (let cut = run.length; cut >= floor && budget.checks < MAX_CUT_CHECKS; ) {
-    if (cutIsSafe(text, cut, budget)) return cut;
-    // The previous line boundary: just after the newline ending the line
-    // before this one (0, below the floor, when there is none).
-    cut = run.lastIndexOf("\n", cut - 2) + 1;
+  for (let cut = run.length; cut >= floor && withinBudget(budget); ) {
+    const v = cutIsSafe(text, cut, budget);
+    if (v.ok) return cut;
+    // The previous line boundary before this whitespace run: just after the
+    // newline ending the line before it (0, below the floor, when there is none).
+    cut = run.lastIndexOf("\n", Math.min(cut, v.runStart) - 2) + 1;
   }
   return 0;
 }
 
-const PEM_BEGIN = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
-const PEM_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
+// Fresh objects per use: a shared global regex keeps `lastIndex` between
+// calls (and `matchAll` clones it), so one request's scan could make a later
+// one miss a key header and cut inside the key.
+const PEM_BEGIN_SRC = "-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----";
+const PEM_END_SRC = "-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----";
+const pemBegin = () => new RegExp(PEM_BEGIN_SRC, "g");
+const pemEnd = () => new RegExp(PEM_END_SRC, "g");
 
 /** Whether a private-key block is still open after `line`. */
 function privateKeyOpenAfter(line: string, open: boolean) {
   const marks = [
-    ...[...line.matchAll(PEM_BEGIN)].map((m) => [m.index, true] as const),
-    ...[...line.matchAll(PEM_END)].map((m) => [m.index, false] as const),
+    ...[...line.matchAll(pemBegin())].map((m) => [m.index, true] as const),
+    ...[...line.matchAll(pemEnd())].map((m) => [m.index, false] as const),
   ].sort((a, b) => a[0] - b[0]);
   return marks.length ? marks[marks.length - 1]![1] : open;
 }
@@ -270,6 +299,8 @@ function longCut(text: string): number {
   // A key block open at the bound: cut before its header, or not at all.
   let open = -1;
   {
+    const PEM_BEGIN = pemBegin();
+    const PEM_END = pemEnd();
     let at = 0;
     for (;;) {
       PEM_BEGIN.lastIndex = at;
@@ -291,12 +322,14 @@ function longCut(text: string): number {
   }
   if (open !== -1) top = open;
   const floor = Math.max(1, MAX_SCRUB_CHARS - CUT_SEARCH_CHARS);
-  const budget = { checks: 0 };
-  for (let cut = top; cut >= floor && budget.checks < MAX_CUT_CHECKS; cut--) {
+  const budget: CutBudget = { checks: 0, candidates: 0 };
+  for (let cut = top; cut >= floor && withinBudget(budget); cut--) {
     // Only at the end of a whitespace run (after whitespace, before text):
     // one candidate per run, so a run is checked once, not once per char.
     if (!/\s/.test(text[cut - 1] ?? "") || /\s/.test(text[cut] ?? "")) continue;
-    if (cutIsSafe(text, cut, budget)) return cut;
+    const v = cutIsSafe(text, cut, budget);
+    if (v.ok) return cut;
+    cut = Math.min(cut, v.runStart);
   }
   return 0;
 }
