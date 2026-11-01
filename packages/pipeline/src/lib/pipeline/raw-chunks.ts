@@ -38,8 +38,13 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  * `raw.scrub.version` for the current `lib/scrub.ts` rules. Bump it with any
  * rule change so readers can tell which rules a stored chunk went through;
  * existing objects are never rewritten.
+ *
+ * - 1: strings and non-record runs up to `MAX_SCRUB_CHARS`; longer ones refused.
+ * - 2: the same rules; a longer string or run is scrubbed whole, in segments
+ *   cut only where no rule can match across the cut (`scrubLong`). Output for
+ *   anything within the bound is byte-identical to version 1.
  */
-export const SCRUB_RULESET_VERSION = 1;
+export const SCRUB_RULESET_VERSION = 2;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";
@@ -203,19 +208,96 @@ export function scrubStringToken(
 const REDACTED = "[REDACTED]";
 
 /**
- * `scrubText` for stored chunks: a string past its bound would come back cut
- * short (with a note), and the chunk would be stored without the rest while
- * reporting the full source range. Refuse it instead, so the client resends
- * smaller chunks rather than skipping text that was never stored.
+ * `scrubText` for stored chunks. `scrubText` itself truncates past its bound,
+ * which would store less than the source range reports, so a longer text is
+ * scrubbed whole with `scrubLong` instead (version 2; version 1 refused it).
  */
 function scrubBounded(text: string): string {
-  if (exceedsScrubBound(text))
-    throw new PipelineError(
-      "chunk_string_too_long",
-      `raw chunk holds a line or string longer than the ${MAX_SCRUB_CHARS}-character scrub limit`,
-      false,
-    );
-  return scrubText(text);
+  return scrubLong(text);
+}
+
+/**
+ * Where a long text may be split so that scrubbing the two sides separately
+ * equals scrubbing them together: the latest index at or below
+ * `MAX_SCRUB_CHARS` (and no more than `CUT_SEARCH_CHARS` before it) that
+ *  - follows whitespace (no rule but PEM matches across a non-whitespace boundary
+ *    within one token, so a token is never split),
+ *  - does not sit between two digit groups (cards, phone numbers),
+ *  - is not inside a private-key block whose footer comes later, and
+ *  - leaves `CUT_CONTEXT_CHARS` on each side scrubbing identically together and
+ *    apart, which also covers rules whose match spans a separator before the
+ *    secret (`Bearer <token>`, `key = value`).
+ * 0 when there is none.
+ */
+function longCut(text: string): number {
+  let top = MAX_SCRUB_CHARS;
+  // A key block open at the bound: cut before its header, or not at all.
+  let open = -1;
+  {
+    let at = 0;
+    for (;;) {
+      PEM_BEGIN.lastIndex = at;
+      const begin = PEM_BEGIN.exec(text);
+      if (!begin || begin.index >= top) break;
+      PEM_END.lastIndex = begin.index + begin[0].length;
+      const end = PEM_END.exec(text);
+      if (!end) {
+        open = begin.index;
+        break;
+      }
+      // A block straddling the bound is open at the bound too.
+      if (end.index + end[0].length > top) {
+        open = begin.index;
+        break;
+      }
+      at = end.index + end[0].length;
+    }
+  }
+  if (open !== -1) top = open;
+  const floor = Math.max(1, MAX_SCRUB_CHARS - CUT_SEARCH_CHARS);
+  for (let cut = top; cut >= floor; cut--) {
+    if (!/\s/.test(text[cut - 1] ?? "")) continue;
+    if (/[\d)]/.test(text[cut - 2] ?? "") && /[\d(]/.test(text[cut] ?? "")) continue;
+    const before = text.slice(Math.max(0, cut - CUT_CONTEXT_CHARS), cut);
+    const head = text.slice(cut, cut + CUT_CONTEXT_CHARS);
+    if (scrubText(before + head) === scrubText(before) + scrubText(head)) return cut;
+  }
+  return 0;
+}
+
+/**
+ * Scrub a text of any length, whole: segments of at most `MAX_SCRUB_CHARS`
+ * split at `longCut`, each scrubbed with `scrubText`. Nothing is truncated. A
+ * text with no safe cut (one unbroken run of more than the bound, such as a
+ * base64 dump with no whitespace) is refused, never stored partly scrubbed.
+ */
+export function scrubLong(text: string): string {
+  if (!exceedsScrubBound(text)) return scrubText(text);
+  let out = "";
+  let rest = text;
+  while (exceedsScrubBound(rest)) {
+    const cut = longCut(rest);
+    if (!cut)
+      throw new PipelineError(
+        "chunk_string_too_long",
+        `raw chunk holds a line or string longer than the ${MAX_SCRUB_CHARS}-character scrub limit with no safe place to segment it`,
+        false,
+      );
+    out += scrubText(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  return out + scrubText(rest);
+}
+
+/** Whether `scrubLong` can take this text (it has safe cuts all the way). */
+export function canScrubLong(text: string): boolean {
+  let rest = text;
+  while (exceedsScrubBound(rest)) {
+    const cut = longCut(rest);
+    if (!cut) return false;
+    rest = rest.slice(cut);
+  }
+  return true;
 }
 
 /** Key names seen in one JSON object while its record is rewritten. */

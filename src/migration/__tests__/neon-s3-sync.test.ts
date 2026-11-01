@@ -222,6 +222,42 @@ describe("strings over the scrub bound", () => {
   });
 });
 
+describe("scrub rule set 2: long strings stored whole", () => {
+  test("a long string with safe cuts is kept whole (no cut, no ledger row); only an unsegmentable run is cut", () => {
+    const long = "word ".repeat(80_000);
+    const kept = boundStrings(`{"out": ${JSON.stringify(long)}}`);
+    expect(kept).toEqual({ text: `{"out": ${JSON.stringify(long)}}`, truncated: 0, maxChars: 0 });
+    const cut = boundStrings(`{"out": ${JSON.stringify("q".repeat(300_000))}}`);
+    expect(cut.truncated).toBe(1);
+  });
+
+  test("the whole string is sealed (version 2) and the transform reads it back intact", async () => {
+    const { store } = await countingStore();
+    const long = `${"word ".repeat(80_000)}AKIAIOSFODNN7EXAMPLE tail`;
+    const r = await exportUnit(target(store), unit("org-a"), fixedSource([rec("tool_call", "origin-a", "t", { output: long })]));
+    const key = r.manifests[0]!.manifestKey;
+    const m = await parseManifest(await readText(store, key), key);
+    expect(m.raw.scrub).toEqual({ ruleset: "relayhistory-scrub", version: 2 });
+    expect(r.manifests[0]!.truncatedStrings).toBe(0);
+    const read = await readRelayhistoryExport(m, store, (b) => new Uint8Array(zstdDecompressSync(b)), { prefix: "96bulls/org-a" });
+    const out = (read[0]!.payload as { output: string }).output;
+    expect(out.endsWith(" tail")).toBe(true);
+    expect(out).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(out.length).toBeGreaterThan(400_000);
+  });
+
+  test("--reexport-truncated queues every ledgered group as changed", async () => {
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    state.seeRevisions(1, [{ org_id: "o", session_id: "t", revision: "1" }, { org_id: "o", session_id: "u", revision: "1" }]);
+    state.markExported("o", "t", 1, ["96bulls/o/v1/k/manifest.json"], Date.now());
+    state.markExported("o", "u", 1, ["96bulls/o/v1/j/manifest.json"], Date.now());
+    state.recordTruncations("o", "t", [{ key: "96bulls/o/v1/k/manifest.json", strings: 2, maxChars: 300_000 }]);
+    expect(state.forceReexportTruncated()).toBe(1);
+    expect(state.nextWork(Date.now(), 86_400_000, 10).map((w) => `${w.kind}:${w.session_id}`)).toEqual(["changed:t"]);
+    state.close();
+  });
+});
+
 describe("idempotency", () => {
   test("re-exporting an unchanged session writes and deletes nothing", async () => {
     const { store, counts } = await countingStore();

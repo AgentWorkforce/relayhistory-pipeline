@@ -123,6 +123,8 @@ class MachineStream {
   reused = 0;
   truncated = 0;
   truncatedMaxChars = 0;
+  /** `raw.scrub.version`: the lowest version applied to any listed chunk. */
+  scrubVersion = SCRUB_RULESET_VERSION;
   userId: string | null = null;
 
   constructor(
@@ -186,7 +188,7 @@ class MachineStream {
     const startOffset = this.#offset;
     const stored = (await this.existing())?.manifest;
     const prior =
-      stored?.raw.scrub?.ruleset === SCRUB_RULESET && stored.raw.scrub.version === SCRUB_RULESET_VERSION
+      stored?.raw.scrub?.ruleset === SCRUB_RULESET && stored.raw.scrub.version <= SCRUB_RULESET_VERSION
         ? stored.raw.chunks[seq]
         : undefined;
     let entry: ChunkEntry;
@@ -199,6 +201,7 @@ class MachineStream {
     ) {
       entry = { ...prior };
       this.reused += 1;
+      this.scrubVersion = Math.min(this.scrubVersion, stored!.raw.scrub!.version);
     } else {
       const sealed = await sealRawChunk(this.target.store, {
         location: this.loc,
@@ -209,10 +212,14 @@ class MachineStream {
         source: data,
         traceId: this.traceId,
       });
-      if (sealed.scrub.ruleset !== SCRUB_RULESET || sealed.scrub.version !== SCRUB_RULESET_VERSION)
+      // A chunk already stored under an older version of the same rule set is
+      // kept (identical source; versions only differ past the bound, which the
+      // older one refused); the manifest records the lowest version.
+      if (sealed.scrub.ruleset !== SCRUB_RULESET || sealed.scrub.version > SCRUB_RULESET_VERSION)
         throw Object.assign(new Error("a stored chunk was sealed under another scrub rule set"), {
           code: "chunk_scrub_mismatch",
         });
+      this.scrubVersion = Math.min(this.scrubVersion, sealed.scrub.version);
       entry = { ...sealed.entry };
       this.sealed += 1;
     }
@@ -355,7 +362,7 @@ async function buildManifest(
       epochs: [{ epoch: 0, opened_at: startedAt, reason: "initial", first_seq: 0, opened_by: owner }],
       next_offset: last.start_offset + last.bytes,
       chunks: entries,
-      scrub: { ruleset: SCRUB_RULESET, version: SCRUB_RULESET_VERSION },
+      scrub: { ruleset: SCRUB_RULESET, version: stream.scrubVersion },
     },
     extensions: {
       [SESSION_EXT]: {

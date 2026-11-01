@@ -14,6 +14,9 @@ import { SCRUB_RULESET_VERSION } from "../src/lib/pipeline/raw-chunks.js";
  */
 const SCRUB_RULESETS: Record<number, string> = {
   1: "db9d65c7ab230d67488900203bb78ca8bd3ad16949a0a51b5d3d117d0cff49f8",
+  // Same rules; raw-chunks.ts now scrubs texts past MAX_SCRUB_CHARS whole, in
+  // segments (scrubLong), where version 1 refused them.
+  2: "db9d65c7ab230d67488900203bb78ca8bd3ad16949a0a51b5d3d117d0cff49f8",
 };
 
 function scrubSourceDigest() {

@@ -185,6 +185,10 @@ export async function main() {
   writeSync(lockFd, String(process.pid));
   closeSync(lockFd);
   const state = new SyncState(statePath);
+  if (flag("reexport-truncated")) {
+    // One-shot, after the scrub rule set 2 sealer lands: queue the ledgered groups.
+    log({ message: "re-export of truncated groups queued", count: state.forceReexportTruncated() });
+  }
   const throttle = new Throttle({
     rowsPerSec: Number(env("S3X_ROWS_PER_SEC", "1500")),
     bytesPerSec: Number(env("S3X_BYTES_PER_SEC", "4000000")),

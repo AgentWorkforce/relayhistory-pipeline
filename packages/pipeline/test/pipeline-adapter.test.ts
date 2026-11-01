@@ -682,15 +682,21 @@ describe("scrubbing raw chunks before object storage", () => {
     ).toThrow(/cannot be split/);
   });
 
-  it("refuses a single line or string past the scrub limit instead of truncating it", () => {
+  it("stores a line or string past the scrub limit whole (version 2), and refuses one it cannot segment", () => {
     const long = "word ".repeat(70_000); // 350 KB, one line
-    expect(() => scrubRecords(new TextEncoder().encode(`${long}\n`))).toThrow(
-      /scrub limit/,
+    const asLine = new TextDecoder().decode(
+      scrubRecords(new TextEncoder().encode(`${long}\n`)).scrubbed,
     );
+    expect(asLine).toBe(`${long}\n`);
+    const asRecord = new TextDecoder().decode(
+      scrubRecords(new TextEncoder().encode(`${JSON.stringify({ text: long })}\n`))
+        .scrubbed,
+    );
+    expect(asRecord).toBe(`${JSON.stringify({ text: long })}\n`);
+    // One unbroken run past the limit has no safe cut: refused, never truncated.
+    const run = "w".repeat(300_000);
     expect(() =>
-      scrubRecords(
-        new TextEncoder().encode(`${JSON.stringify({ text: long })}\n`),
-      ),
+      scrubRecords(new TextEncoder().encode(`${JSON.stringify({ text: run })}\n`)),
     ).toThrow(/scrub limit/);
     // Just under the limit is stored whole.
     const fits = "word ".repeat(50_000);
@@ -716,7 +722,7 @@ describe("scrubbing raw chunks before object storage", () => {
       source: SOURCE,
     });
     expect(sealed.created).toBe(true);
-    expect(sealed.scrub).toEqual({ ruleset: SCRUB_RULESET, version: 1 });
+    expect(sealed.scrub).toEqual({ ruleset: SCRUB_RULESET, version: SCRUB_RULESET_VERSION });
     const object = await store.getObject(objectKey(sealed.key));
     const compressed = await readAll(object.body);
     const stored = zstdDecompressSync(compressed);
@@ -1138,7 +1144,7 @@ describe("POST /v1/pipeline/chunks", () => {
       scrub: unknown;
     };
     expect(body.key.startsWith("v1/ws=ws_1/m=mach-1/")).toBe(true);
-    expect(body.scrub).toEqual({ ruleset: SCRUB_RULESET, version: 1 });
+    expect(body.scrub).toEqual({ ruleset: SCRUB_RULESET, version: SCRUB_RULESET_VERSION });
     const stored = zstdDecompressSync(
       await readAll((await store.getObject(objectKey(body.key))).body),
     );
