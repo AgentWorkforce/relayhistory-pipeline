@@ -19,6 +19,8 @@
 import type { Queryable } from "../relayhistory-export.ts";
 import { orgPrefix } from "../neon-s3-sync/export-session.ts";
 import { activityPage, fencedGroups, lockWaiters } from "../neon-s3-sync/neon-reader.ts";
+
+const DOT_SEGMENT = /(^|\/)\.{1,2}(\/|$)/;
 import type { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode, type Log } from "../neon-s3-sync/sync.ts";
 import type { Eraser } from "./eraser.ts";
@@ -46,7 +48,7 @@ const LEASE_HOLDER = `eraser:${process.pid}`;
 /** The session prefix a queued key belongs to, if the key has this layout under the org's prefix. */
 export function sessionPrefixOf(keyRoot: string, orgId: string, key: string): string | undefined {
   const root = `${orgPrefix(keyRoot, orgId)}/v1/`;
-  if (!key.startsWith(root)) return undefined;
+  if (!key.startsWith(root) || DOT_SEGMENT.test(key)) return undefined;
   const m = /^(.*?\/s=[^/]+\/)/.exec(key);
   return m && SESSION_PREFIX.test(m[1]!) ? m[1] : undefined;
 }
@@ -76,7 +78,9 @@ export class ErasureJob {
     this.state.forgetKeys(org, session, keys);
   }
 
-  async sweep() {
+  /** With `dryRun`, reports what it would erase and changes nothing. */
+  async sweep(opts: { dryRun?: boolean } = {}) {
+    const startedAt = this.now();
     const waiters = await lockWaiters(this.db);
     if (waiters.nonAdvisory > 3 || waiters.total > 25) {
       this.log({ message: "sweep deferred: lock waiters", lock_waiters: waiters.total });
@@ -98,15 +102,24 @@ export class ErasureJob {
       this.log({ message: "sweep saw no rollups; nothing erased" });
       return;
     }
-    this.state.setMeta("erasure_sweep_done", String(id));
-    const gone = this.state.vanishedExports(id);
-    for (const g of gone) this.#queueGroup(g.org_id, g.session_id, g.keys, "gone_from_neon");
+    if (!opts.dryRun) this.state.setMeta("erasure_sweep_done", String(id));
+    let gone = 0;
+    for (const g of this.state.vanishedExports(id, startedAt)) {
+      // Confirm on Neon right before erasing: the group really has no rollup now.
+      const { rows } = await this.db.query(
+        "SELECT 1 FROM sessions.session_rollups WHERE org_id = $1 AND session_id = $2 LIMIT 1",
+        [g.org_id, g.session_id],
+      );
+      if (rows.length) continue;
+      gone += 1;
+      if (!opts.dryRun) this.#queueGroup(g.org_id, g.session_id, g.keys, "gone_from_neon");
+    }
     let fenced = 0;
     try {
       for (const g of await fencedGroups(this.db)) {
         const row = this.state.exported(g.org_id, g.session_id);
         if (row?.keys.length) {
-          this.#queueGroup(g.org_id, g.session_id, row.keys, "fenced");
+          if (!opts.dryRun) this.#queueGroup(g.org_id, g.session_id, row.keys, "fenced");
           fenced += 1;
         }
       }
@@ -115,7 +128,8 @@ export class ErasureJob {
       this.log({ message: "fence sweep failed", error_code: errorCode(error) });
     }
     this.counters.swept += 1;
-    this.log({ message: "erasure sweep", sweep: id, count: seen, gone: gone.length, fenced });
+    if (!opts.dryRun) this.state.setMeta("erasure_sweep_at", String(this.now()));
+    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", sweep: id, count: seen, gone, fenced });
   }
 
   /** Erase what is queued and due. Returns how many items it erased or failed (not deferred). */
@@ -130,15 +144,20 @@ export class ErasureJob {
             ? item.key
             : undefined
           : sessionPrefixOf(this.cfg.keyRoot, item.org_id, item.key);
-      if (!prefix) {
-        // Never delete outside a session prefix of the item's own org.
-        this.counters.refused += 1;
-        this.state.erasureFailed(item.key, "erasure_refused_shape", this.now());
-        handled += 1;
-        continue;
-      }
-      if (!this.state.acquireLease(prefix, LEASE_HOLDER, undefined, this.now())) {
-        this.counters.deferred += 1;
+      try {
+        if (!prefix) {
+          // Never delete outside a session prefix of the item's own org.
+          this.counters.refused += 1;
+          this.state.erasureFailed(item.key, "erasure_refused_shape", this.now());
+          handled += 1;
+          continue;
+        }
+        if (!this.state.acquireLease(prefix, LEASE_HOLDER, undefined, this.now())) {
+          this.counters.deferred += 1;
+          continue;
+        }
+      } catch (error) {
+        this.log({ message: "erasure state busy", error_code: errorCode(error) });
         continue;
       }
       try {
@@ -156,7 +175,9 @@ export class ErasureJob {
         this.log({ message: "erasure failed", error_code: errorCode(error), kind: item.kind });
         handled += 1;
       } finally {
-        this.state.releaseLeases(LEASE_HOLDER, [prefix]);
+        try {
+          this.state.releaseLeases(LEASE_HOLDER, [prefix]);
+        } catch {}
       }
     }
     return handled;
@@ -167,8 +188,14 @@ export class ErasureJob {
     if (!force && now - this.#lastProgress < this.cfg.progressEveryMs) return;
     this.#lastProgress = now;
     const queue = this.state.erasureBacklog(now);
-    const breach = queue.oldestAgeH !== null && queue.oldestAgeH * 3_600_000 > this.cfg.slaWarnMs;
-    this.log({ message: breach ? "erasure SLA at risk" : "progress", ...this.counters, queue });
+    const lastSweep = Number(this.state.meta("erasure_sweep_at") ?? 0);
+    const sweepAgeH = lastSweep ? +((now - lastSweep) / 3_600_000).toFixed(2) : null;
+    const stuck = this.state.stuckWithKeys();
+    const breach =
+      (queue.oldestAgeH !== null && queue.oldestAgeH * 3_600_000 > this.cfg.slaWarnMs) ||
+      (sweepAgeH !== null && sweepAgeH > 6) ||
+      stuck > 0;
+    this.log({ message: breach ? "erasure SLA at risk" : "progress", ...this.counters, queue, sweep_age_h: sweepAgeH, stuck_with_keys: stuck });
   }
 
   async run(opts: { once?: boolean } = {}) {

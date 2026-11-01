@@ -65,6 +65,8 @@ export class SyncState {
         key TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('object', 'prefix')),
         org_id TEXT NOT NULL, reason TEXT NOT NULL, enqueued_at INTEGER NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0, next_try INTEGER NOT NULL DEFAULT 0, error TEXT);
+      CREATE TABLE IF NOT EXISTS pending_keys (org_id TEXT NOT NULL, session_id TEXT NOT NULL, key TEXT NOT NULL,
+        PRIMARY KEY (org_id, session_id, key));
       CREATE TABLE IF NOT EXISTS leases (prefix TEXT PRIMARY KEY, holder TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS erasure_seen (org_id TEXT NOT NULL, session_id TEXT NOT NULL, sweep INTEGER NOT NULL,
         PRIMARY KEY (org_id, session_id));
@@ -77,7 +79,9 @@ export class SyncState {
   }
 
   #tx(fn: () => void) {
-    this.db.exec("BEGIN");
+    // IMMEDIATE: two processes share this file; a deferred read-then-write could
+    // fail with SQLITE_BUSY_SNAPSHOT, which busy_timeout does not retry.
+    this.db.exec("BEGIN IMMEDIATE");
     try {
       fn();
       this.db.exec("COMMIT");
@@ -135,7 +139,27 @@ export class SyncState {
     return row ? { ...row, keys: JSON.parse(row.keys) as string[] } : undefined;
   }
 
+  /** A key the exporter is about to write under, recorded before the write survives a crash. */
+  recordPendingKey(org: string, session: string, key: string) {
+    this.db.prepare("INSERT OR IGNORE INTO pending_keys (org_id, session_id, key) VALUES (?, ?, ?)").run(org, session, key);
+  }
+
+  /** On start: fold keys of runs that died mid-group into their group's watermark (as failed, to retry). */
+  recoverPendingKeys(at = Date.now()): number {
+    const rows = this.db.prepare("SELECT org_id, session_id, key FROM pending_keys").all() as { org_id: string; session_id: string; key: string }[];
+    const groups = new Map<string, { org: string; session: string; keys: string[] }>();
+    for (const r of rows) {
+      const k = JSON.stringify([r.org_id, r.session_id]);
+      const g = groups.get(k) ?? { org: r.org_id, session: r.session_id, keys: [] };
+      g.keys.push(r.key);
+      groups.set(k, g);
+    }
+    for (const g of groups.values()) this.markFailed(g.org, g.session, "interrupted", g.keys, -1, at);
+    return groups.size;
+  }
+
   markExported(org: string, session: string, revision: number, keys: string[], at = Date.now()) {
+    this.db.prepare("DELETE FROM pending_keys WHERE org_id = ? AND session_id = ?").run(org, session);
     if (keys.length === 0 && !this.db.prepare("SELECT 1 FROM groups WHERE org_id = ? AND session_id = ?").get(org, session)) {
       this.db.prepare("DELETE FROM exported WHERE org_id = ? AND session_id = ?").run(org, session);
       return;
@@ -158,8 +182,10 @@ export class SyncState {
    */
   markFailed(org: string, session: string, code: string, keys: string[], revision: number, at = Date.now()) {
     const prior = this.exported(org, session);
-    const attempts = (prior?.attempts ?? 0) + 1;
-    const nextTry = at + Math.min(4, 2 ** (attempts - 1)) * 60 * 60 * 1000;
+    // Waiting for the other process's lease, or an interrupted run, is not the group's failure.
+    const transientWait = code === "prefix_busy" || code === "interrupted";
+    const attempts = (prior?.attempts ?? 0) + (transientWait ? 0 : 1);
+    const nextTry = at + (transientWait ? 2 * 60 * 1000 : Math.min(4, 2 ** Math.max(0, attempts - 1)) * 60 * 60 * 1000);
     const all = JSON.stringify([...new Set([...(prior?.keys ?? []), ...keys])].sort());
     this.db
       .prepare(
@@ -169,6 +195,7 @@ export class SyncState {
            attempts = excluded.attempts, next_try = excluded.next_try, failed_revision = excluded.failed_revision`,
       )
       .run(org, session, all, code, attempts, nextTry, revision);
+    this.db.prepare("DELETE FROM pending_keys WHERE org_id = ? AND session_id = ?").run(org, session);
   }
 
   /**
@@ -193,7 +220,7 @@ export class SyncState {
    * same time: otherwise the eraser could delete a chunk the exporter has just
    * decided to reuse. A lease older than `ttlMs` (a crashed holder) is taken over.
    */
-  acquireLease(prefix: string, holder: string, ttlMs = 30 * 60 * 1000, now = Date.now()): boolean {
+  acquireLease(prefix: string, holder: string, ttlMs = 2 * 60 * 60 * 1000, now = Date.now()): boolean {
     let ok = false;
     this.#tx(() => {
       const row = this.db.prepare("SELECT holder, at FROM leases WHERE prefix = ?").get(prefix) as
@@ -206,6 +233,11 @@ export class SyncState {
       ok = true;
     });
     return ok;
+  }
+
+  /** Extend a lease this holder still has; false if it was taken over. */
+  renewLease(prefix: string, holder: string, now = Date.now()): boolean {
+    return Number(this.db.prepare("UPDATE leases SET at = ? WHERE prefix = ? AND holder = ?").run(now, prefix, holder).changes) === 1;
   }
 
   releaseLeases(holder: string, prefixes: Iterable<string>) {
@@ -286,24 +318,34 @@ export class SyncState {
    * After a complete erasure sweep: exported groups Neon no longer has (the
    * exporter's units come only from rollups, so no rollup means nothing to keep).
    */
-  vanishedExports(sweep: number): { org_id: string; session_id: string; keys: string[] }[] {
+  vanishedExports(sweep: number, sweepStartedAt: number): { org_id: string; session_id: string; keys: string[] }[] {
+    // Only exports older than the sweep: a group created behind the sweep's cursor and
+    // exported meanwhile is not missing from Neon, only from this sweep.
     const rows = this.db
       .prepare(
         `SELECT e.org_id, e.session_id, e.keys FROM exported e
           LEFT JOIN erasure_seen s ON s.org_id = e.org_id AND s.session_id = e.session_id AND s.sweep = ?
-          WHERE s.org_id IS NULL AND e.keys <> '[]'`,
+          WHERE s.org_id IS NULL AND e.keys <> '[]' AND e.exported_at < ?
+            AND NOT EXISTS (SELECT 1 FROM pending_keys p WHERE p.org_id = e.org_id AND p.session_id = e.session_id)`,
       )
-      .all(sweep) as { org_id: string; session_id: string; keys: string }[];
+      .all(sweep, sweepStartedAt) as { org_id: string; session_id: string; keys: string }[];
     this.db.prepare("DELETE FROM erasure_seen WHERE sweep < ?").run(sweep);
     return rows.map((r) => ({ ...r, keys: JSON.parse(r.keys) as string[] }));
   }
 
   /** A group whose session prefixes are queued for erasure forgets them. */
   forgetKeys(org: string, session: string, keys: string[]) {
-    const prior = this.exported(org, session);
-    if (!prior) return;
-    const left = prior.keys.filter((k) => !keys.includes(k));
-    this.db.prepare("UPDATE exported SET keys = ? WHERE org_id = ? AND session_id = ?").run(JSON.stringify(left), org, session);
+    this.#tx(() => {
+      const prior = this.exported(org, session);
+      if (!prior) return;
+      const left = prior.keys.filter((k) => !keys.includes(k));
+      this.db.prepare("UPDATE exported SET keys = ? WHERE org_id = ? AND session_id = ?").run(JSON.stringify(left), org, session);
+    });
+  }
+
+  /** Exported groups stuck in error while they still own keys (an SLA risk the queue age does not show). */
+  stuckWithKeys(): number {
+    return Number((this.db.prepare("SELECT count(*) AS n FROM exported WHERE error IS NOT NULL AND keys <> '[]' AND attempts >= 6").get() as { n: number }).n);
   }
 
   truncationTotals(): { sessions: number; manifests: number; strings: number } {

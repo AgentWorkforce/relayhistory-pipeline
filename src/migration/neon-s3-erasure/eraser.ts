@@ -9,7 +9,7 @@
  */
 import { encodeKeyPath, sha256Hex } from "../../../packages/object-store/src/crypto.ts";
 import { signRequest, type AwsCredentials } from "../../../packages/object-store/src/sigv4.ts";
-import { decodeEntities, xmlElements, xmlText } from "../../../packages/object-store/src/xml.ts";
+import { xmlElements, xmlText } from "../../../packages/object-store/src/xml.ts";
 import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
 
 export interface Eraser {
@@ -70,18 +70,19 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser {
         for (const el of xmlElements(xml, tag)) {
           const key = xmlText(el, "Key");
           const versionId = xmlText(el, "VersionId");
-          if (key !== undefined && versionId !== undefined) out.push({ key: decodeEntities(key), versionId: decodeEntities(versionId) });
+          // xmlText already decodes entities; decoding again would mangle a literal `&amp;`.
+          if (key !== undefined && versionId !== undefined) out.push({ key, versionId });
         }
       if (xmlText(xml, "IsTruncated") !== "true") return out;
       keyMarker = xmlText(xml, "NextKeyMarker");
       versionMarker = xmlText(xml, "NextVersionIdMarker");
       if (keyMarker === undefined) return out;
-      keyMarker = decodeEntities(keyMarker);
-      if (versionMarker !== undefined) versionMarker = decodeEntities(versionMarker);
     }
   }
 
   async function remove(list: Version[]): Promise<number> {
+    if (list.some((v) => v.key.split("/").some((seg) => seg === "." || seg === "..")))
+      throw coded("erasure_key_shape", "a key with a dot segment would be normalized away");
     // Manifests first, so no reader finds a manifest whose chunks are gone.
     list.sort((a, b) => Number(b.key.endsWith("/manifest.json")) - Number(a.key.endsWith("/manifest.json")));
     for (const v of list) {

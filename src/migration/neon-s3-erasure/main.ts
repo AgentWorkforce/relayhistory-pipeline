@@ -63,9 +63,9 @@ export async function main() {
     const db = await sessionReadOnly(client as unknown as Queryable);
     const job = new ErasureJob(db, state, eraser, log, { ...DEFAULT_ERASURE_CONFIG, keyRoot: env("S3X_KEY_ROOT", "96bulls")! }, Date.now, undefined, () => stop);
     log({ message: "start", execute });
-    // A dry run must not consume the queue: it only sweeps and reports.
+    // A dry run changes nothing: it sweeps and reports what it would erase.
     if (!execute) {
-      await job.sweep();
+      await job.sweep({ dryRun: true });
       job.progress(true);
       return;
     }

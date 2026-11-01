@@ -300,13 +300,21 @@ describe("delete propagation", () => {
     const gone = await exportUnit(t, unit("o1", { sessionId: "gone" }), fixedSource(baseRecords().slice(0, 1)));
     const kept = await exportUnit(t, unit("o1", { sessionId: "kept" }), fixedSource(baseRecords().slice(0, 1)));
     state.seeRevisions(1, [{ org_id: "o1", session_id: "kept", revision: "1" }]);
-    state.markExported("o1", "gone", 1, gone.manifests.map((m) => m.manifestKey));
-    state.markExported("o1", "kept", 1, kept.manifests.map((m) => m.manifestKey));
+    state.markExported("o1", "gone", 1, gone.manifests.map((m) => m.manifestKey), Date.now() - 1000);
+    state.markExported("o1", "kept", 1, kept.manifests.map((m) => m.manifestKey), Date.now() - 1000);
+    // a group exported after the sweep started is never "gone", even if the sweep missed it
+    const fresh = await exportUnit(t, unit("o1", { sessionId: "fresh" }), fixedSource(baseRecords().slice(0, 1)));
+    state.markExported("o1", "fresh", 1, fresh.manifests.map((m) => m.manifestKey), Date.now() + 60_000);
     const db = sweepDb([{ org_id: "o1", session_id: "kept", last_ms: "1", events: "1" }]);
     const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
     await job.sweep();
     await job.drain();
-    expect(await allKeys(store, "96bulls/o1/v1")).toEqual(await allKeys(store, kept.manifests[0]!.manifestKey.replace("/manifest.json", "")));
+    expect(await allKeys(store, "96bulls/o1/v1")).toEqual(
+      [
+        ...(await allKeys(store, fresh.manifests[0]!.manifestKey.replace("/manifest.json", ""))),
+        ...(await allKeys(store, kept.manifests[0]!.manifestKey.replace("/manifest.json", ""))),
+      ].sort(),
+    );
     expect(state.exported("o1", "gone")!.keys).toEqual([]);
     // a sweep that read nothing never erases
     const empty = new ErasureJob(sweepDb([]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
@@ -320,7 +328,7 @@ describe("delete propagation", () => {
     const state = new SyncState(join(await tempDir(), "s.sqlite"));
     const r = await exportUnit(target(store), unit("o1", { sessionId: "s1" }), fixedSource(baseRecords().slice(0, 1)));
     state.seeRevisions(1, [{ org_id: "o1", session_id: "s1", revision: "1" }]);
-    state.markExported("o1", "s1", 1, r.manifests.map((m) => m.manifestKey));
+    state.markExported("o1", "s1", 1, r.manifests.map((m) => m.manifestKey), Date.now() - 1000);
     const job = new ErasureJob(sweepDb([{ org_id: "o1", session_id: "s1", last_ms: "1", events: "1" }], [{ org_id: "o1", session_id: "s1" }]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
     await job.sweep();
     await job.drain();
@@ -500,6 +508,35 @@ describe("ownership and failure bookkeeping", () => {
     await expect(exportUnit(t, unit("org-a"), fixedSource(baseRecords()))).rejects.toMatchObject({ code: "foreign_manifest" });
     expect(await erasableByExporter(t, "org-a", key)).toBe(false);
     expect(await allKeys(store)).toEqual(before);
+  });
+
+  test("a foreign manifest's key is never recorded, so no sweep can hand it to the eraser", async () => {
+    const { store } = await countingStore();
+    const t = target(store);
+    const r = await exportUnit(t, unit("org-a"), fixedSource(baseRecords().slice(0, 1)));
+    const key = r.manifests[0]!.manifestKey;
+    const m = JSON.parse(await readText(store, key));
+    m.raw.owner = m.writer.delivery_instance_id = "client-1";
+    await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(m)));
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const syncer = new Syncer(fakeDb([unit("org-a")]), state, t, fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => fixedSource(baseRecords()));
+    expect(await syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 1, kind: "recent", events: 1 })).toBe(false);
+    expect(state.exported("org-a", "sess:with:colons-1")!.keys).toEqual([]);
+    state.close();
+  });
+
+  test("keys of a run that died mid-group are recovered at the next start; a lost lease stops the write", async () => {
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    state.recordPendingKey("o", "s", "96bulls/o/v1/k/manifest.json");
+    expect(state.recoverPendingKeys()).toBe(1);
+    expect(state.exported("o", "s")).toMatchObject({ error: "interrupted", keys: ["96bulls/o/v1/k/manifest.json"] });
+    expect(state.recoverPendingKeys()).toBe(0);
+    const { store } = await countingStore();
+    await expect(
+      exportUnit({ ...target(store), renew: () => false }, unit("org-a"), fixedSource(baseRecords().slice(0, 1))),
+    ).rejects.toMatchObject({ code: "lease_lost" });
+    expect(await allKeys(store)).toEqual([]);
+    state.close();
   });
 
   test("two Neon sessions whose ids sanitize to one key do not overwrite each other", async () => {
@@ -776,8 +813,10 @@ async function eraseOrphans(store: ObjectStore, org: string, r: { manifests: { o
 /** A Neon stand-in for the erasure sweep: rollup activity pages and fenced groups. */
 function sweepDb(activity: { org_id: string; session_id: string; last_ms: string; events: string }[], fenced: { org_id: string; session_id: string }[] = []): Queryable {
   return {
-    async query<T>(sql: string) {
+    async query<T>(sql: string, params?: unknown[]) {
       if (sql.includes("pg_locks")) return { rows: [{ total: "0", non_advisory: "0" }] as T[] };
+      if (sql.startsWith("SELECT 1 FROM sessions.session_rollups"))
+        return { rows: activity.filter((a) => a.org_id === params?.[0] && a.session_id === params?.[1]).map(() => ({})) as T[] };
       if (sql.includes("deleted_upload_sessions") && sql.includes("UNION")) return { rows: fenced as T[] };
       if (sql.includes("FROM sessions.session_rollups") && sql.includes("GROUP BY org_id, session_id"))
         return { rows: (sql.includes("(org_id, session_id) >") ? [] : activity) as T[] };

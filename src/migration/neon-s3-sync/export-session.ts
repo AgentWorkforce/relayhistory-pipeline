@@ -57,6 +57,8 @@ export interface ExportTarget {
   grantId: string;
   maxChunkBytes?: number;
   now?: () => Date;
+  /** Renews this process's lease on a session prefix; false when it was lost. */
+  renew?: (manifestKey: string) => boolean;
 }
 
 /** Layout component: the pipeline's `[A-Za-z0-9._-]{1,128}`, not starting with `.` (same map as #55's courier). */
@@ -167,6 +169,7 @@ class MachineStream {
 
   async flush() {
     if (this.#len === 0) return;
+    this.holdLease();
     const data = new Uint8Array(this.#len);
     let at = 0;
     for (const part of this.#parts) {
@@ -222,6 +225,11 @@ class MachineStream {
     this.entries.push(entry);
     this.#seq += 1;
     this.#offset += data.byteLength;
+  }
+
+  holdLease() {
+    if (this.target.renew && !this.target.renew(this.key))
+      throw coded("lease_lost", "the session lease was taken over");
   }
 
   originRevisions(): Record<string, number> {
@@ -434,11 +442,12 @@ export async function exportUnit(
       for (const other of streams.values())
         if (other.key === stream.key)
           throw Object.assign(new Error("two machines map to one key"), { code: "machine_key_collision" });
-      // The key is recorded (and its prefix leased) before anything is read or
-      // written under it, so a failed run still leaves it in the watermark for
-      // a later erasure; then ownership (a foreign or colliding manifest throws).
-      opts.onKey?.(stream.key);
+      // Ownership first: a foreign or colliding manifest throws here and its key
+      // is never recorded (the eraser cannot read manifests, so only owned keys
+      // may ever reach it). Then the key is recorded and its prefix leased,
+      // before anything is written under it.
       await stream.existing();
+      opts.onKey?.(stream.key);
       streams.set(line.machine, stream);
     }
     await stream.push(line);
@@ -462,6 +471,7 @@ export async function exportUnit(
     // Our own validator first: never store a manifest the pipeline would refuse.
     await parseManifest(text, stream.key);
     const unchanged = prior !== null && comparable(prior) === comparable(manifest);
+    stream.holdLease();
     if (!unchanged)
       await target.store.put(objectKey(stream.key), new TextEncoder().encode(text), {
         ...(existing ? { ifMatch: existing.version } : { ifNoneMatch: true }),

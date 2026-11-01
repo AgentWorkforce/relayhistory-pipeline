@@ -221,7 +221,11 @@ export class Syncer {
       const units = await sessionUnits(lane.db, work.org_id, work.session_id);
       await this.hook(units.length, 0);
       for (const unit of units) {
-        const r = await exportUnit(this.target, unit, lane.source, {
+        const target = {
+          ...this.target,
+          renew: (k: string) => this.state.renewLease(k.slice(0, -"manifest.json".length), LEASE_HOLDER),
+        };
+        const r = await exportUnit(target, unit, lane.source, {
           // Work driven by a change must see a fence written with that change.
           freshFence: work.kind !== "recent" && work.kind !== "history",
           onKey: (k) => {
@@ -230,6 +234,7 @@ export class Syncer {
               throw Object.assign(new Error("the erasure job holds this session"), { code: "prefix_busy" });
             leased.push(prefix);
             touched.add(k);
+            this.state.recordPendingKey(work.org_id, work.session_id, k);
           },
         });
         if (r.fenced) this.counters.fenced += 1;
@@ -269,7 +274,9 @@ export class Syncer {
       return true;
     } catch (error) {
       const code = errorCode(error);
-      this.state.markFailed(work.org_id, work.session_id, code, [...touched], work.revision);
+      // A credential failure is not the group's: its pending keys stay recorded
+      // (recovered at the next start) and it keeps its attempts.
+      if (code !== "unauthorized") this.state.markFailed(work.org_id, work.session_id, code, [...touched], work.revision);
       this.counters.groupsFailed += 1;
       const aws = /<Code>([A-Za-z0-9]{1,64})<\/Code>/.exec(String((error as { message?: unknown })?.message ?? ""))?.[1];
       this.log({ message: "group failed", error_code: code, kind: work.kind, ...(aws ? { aws_code: aws } : {}) });
@@ -311,6 +318,8 @@ export class Syncer {
 
   /** Run until stopped (or, with `once`, until there is no work left). */
   async run(opts: { once?: boolean; maxGroups?: number } = {}) {
+    const recovered = this.state.recoverPendingKeys();
+    if (recovered) this.log({ message: "recovered interrupted groups", count: recovered });
     if (!this.state.meta("act_sweep_done")) await this.sweepActivity();
     if (!this.state.meta("rev_sweep_done")) await this.sweepRevisions();
     let done = 0;
@@ -325,7 +334,9 @@ export class Syncer {
       }
       const queue = [...work];
       let fatal: unknown;
-      await Promise.all(
+      // allSettled: a fatal error in one lane lets the others finish their group
+      // (and record it) before the process exits.
+      await Promise.allSettled(
         this.lanes.map(async (lane) => {
           for (let item = queue.shift(); item && !this.stopped() && fatal === undefined; item = queue.shift()) {
             try {

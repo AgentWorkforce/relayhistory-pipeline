@@ -123,10 +123,10 @@ function s3Code(error: unknown): string | undefined {
  * codes only. A failure waits 10 min before exiting, so a restart loop never
  * spins on a bad key.
  */
-async function preflight(store: ObjectStore): Promise<boolean> {
+async function preflight(store: ObjectStore, root: string): Promise<boolean> {
   const steps: [string, () => Promise<unknown>][] = [
-    ["list", () => store.list(objectKey("96bulls"))],
-    ["head_missing", () => store.head(objectKey("96bulls/preflight/v1/ws=w/m=m/h=h/d=2026/01/01/s=s/manifest.json"))],
+    ["list", () => store.list(objectKey(root))],
+    ["head_missing", () => store.head(objectKey(`${root}/preflight/v1/ws=w/m=m/h=h/d=2026/01/01/s=s/manifest.json`))],
   ];
   for (const [step, run] of steps) {
     try {
@@ -146,7 +146,7 @@ export async function main() {
   const url = urlFile ? readFileSync(urlFile, "utf8").trim() : env("NEON_URL");
   if (!url) throw new Error("NEON_URL_FILE (or NEON_URL) is required");
   const store = storeFromEnv(execute);
-  if (execute && !(await preflight(store))) {
+  if (execute && !(await preflight(store, env("S3X_KEY_ROOT", "96bulls")!))) {
     await new Promise((r) => setTimeout(r, 10 * 60 * 1000));
     process.exit(3);
   }
