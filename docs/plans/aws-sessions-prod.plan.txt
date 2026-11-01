@@ -5,16 +5,16 @@ AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_
 Loading stack state
 Computing plan
 Plan ready (2.4s)
-Plan: 3 to create
+Plan: 2 to update
 [access-logs] noop
 [budget] noop
 [trail] noop
-[trail-key] noop
+[trail-key] update
 [trail-key-alias] noop
-[trail-logs] noop
+[trail-logs] update
 [transcript-eraser] noop
 [transcript-reader] noop
 [transcript-writer] noop
-[transcripts] create
-[transcripts-key] create
-[transcripts-key-alias] create
+[transcripts] noop
+[transcripts-key] noop
+[transcripts-key-alias] noop
