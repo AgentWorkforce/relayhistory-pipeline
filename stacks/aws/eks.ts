@@ -57,6 +57,31 @@ import {
 
 export { telemetryPolicy } from "./hardening.ts";
 
+/**
+ * HOOPDB_DB_MODE, an explicit shim choice and the dedicated runtime role for the
+ * migrator. There is no runtime-role default in either mode: in-cluster (selfhosted) the
+ * role is created by the privileged supabase/bootstrap/hoopdb_runtime_role.sql step, run
+ * as the CNPG superuser before migrate (NOT wired here: the privileged bootstrap Job is the
+ * Helm side's, helm-charts #24; GCP is pending too); external (supabase) it is
+ * pre-provisioned by an operator. Unset, the migrator refuses to run.
+ */
+export function hoopdbModeEnv(inCluster: boolean, runtimeRole?: string, runtimeLogin = true): Array<{ name: string; value: string }> {
+  return [
+    { name: "HOOPDB_DB_MODE", value: inCluster ? "selfhosted" : "supabase" },
+    { name: "HOOPDB_SUPABASE_SHIM", value: inCluster ? "true" : "false" },
+    // Selfhosted (dedicated HoopDb database): the exact global function default (owner + superusers),
+    // installed by supabase/bootstrap/hoopdb_function_default_revoke.sql before migrate.
+    // Supabase: no default; the operator selects a control (#98), so it fails closed.
+    ...(inCluster ? [{ name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" }] : []),
+    ...(runtimeRole
+      ? [
+          { name: "HOOPDB_RUNTIME_ROLE", value: runtimeRole },
+          { name: "HOOPDB_RUNTIME_ROLE_LOGIN", value: runtimeLogin ? "true" : "false" },
+        ]
+      : []),
+  ];
+}
+
 export interface EksStageInputs {
   stage: string;
   /** The account the stage deploys into; Pod Identity trust is bound to it. */
@@ -66,6 +91,15 @@ export interface EksStageInputs {
   chartVersion: string;
   /** Kubernetes Secret holding HOOPDB_URL, LOCKER_* and the JWKS settings; created by the secrets sync, not by IaC. */
   runtimeSecretName: string;
+  /**
+   * HOOPDB_RUNTIME_ROLE: the dedicated, non-owner role the services connect as. No default
+   * (the owner `hoop` is refused in selfhosted and supabase mode): unset, the migrator
+   * refuses to run (src/hoopdb/migrate.ts). In-cluster it is created by
+   * supabase/bootstrap/hoopdb_runtime_role.sql; external it is pre-provisioned.
+   */
+  hoopdbRuntimeRole?: string;
+  /** HOOPDB_RUNTIME_ROLE_LOGIN: whether that role logs in itself (default true). */
+  hoopdbRuntimeRoleLogin?: boolean;
   lockerBucket: string;
   lockerRegion: string;
   /** One tenant org (single-tenant mode). */
@@ -128,7 +162,7 @@ export const OTEL_ENDPOINT = "http://otel-collector:4318";
  * tested without loading either the AWS or Kubernetes providers.
  */
 export function eksChartValues(
-  i: Pick<EksStageInputs, "stage" | "claimlessWindow" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "tenantOrgIds" | "relayhistoryOrigin" | "imageRepository" | "imageDigest">,
+  i: Pick<EksStageInputs, "stage" | "claimlessWindow" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "tenantOrgIds" | "relayhistoryOrigin" | "imageRepository" | "imageDigest" | "hoopdbRuntimeRole" | "hoopdbRuntimeRoleLogin">,
   sandbox: boolean,
   authIssuer: string,
   authJwksUrl: string,
@@ -157,7 +191,8 @@ export function eksChartValues(
       // Bob Costas alone gets the summary master key (src/shared/keyring.ts): worker 0.4.0 projects
       // this Secret key as a read-only file into Bob Costas only (SUMMARY_MASTER_KEYS_FILE).
       summaryEncryption: { existingSecret: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" },
-      ...(tenants.extraEnv.length ? { extraEnv: tenants.extraEnv } : {}),
+      // The migrator's explicit database-mode contract (src/hoopdb/migrate.ts); never inferred from the host.
+      extraEnv: [...hoopdbModeEnv(inCluster, i.hoopdbRuntimeRole, i.hoopdbRuntimeRoleLogin), ...tenants.extraEnv],
     },
     alleyoop: {
       image: { repository: i.imageRepository, digest: i.imageDigest },
