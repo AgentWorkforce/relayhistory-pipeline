@@ -4,8 +4,8 @@ Resolving stack services
 AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
 Loading stack state
 Computing plan
-Plan ready (2.7s)
-Plan: no changes
+Plan ready (5.4s)
+Plan: 1 to create, 1 to update
 
 [access-logs] noop
 
@@ -23,10 +23,204 @@ Plan: no changes
 
 [transcript-reader] noop
 
+[transcript-srv-writer] create
+  properties:
+    inlinePolicies:
+      transcripts:
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/ws=*/m=srv_*
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/live-sessions/*
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/live-batches/*
+            Sid: ReadLiveObjects
+          - Action:
+              - s3:PutObject
+            Condition:
+              StringEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+              StringLike:
+                s3:x-amz-server-side-encryption-aws-kms-key-id: arn:aws:kms:us-east-1:941433935742:key/*
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/ws=*/m=srv_*
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/live-sessions/*
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/live-batches/*
+            Sid: WriteLiveObjectsSseKmsOnly
+          - Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Condition:
+              ForAnyValue:StringEquals:
+                kms:ResourceAliases: alias/96bulls-aws-sessions-prod-transcripts
+              StringEquals:
+                kms:ViaService: s3.us-east-1.amazonaws.com
+            Effect: Allow
+            Resource:
+              - arn:aws:kms:us-east-1:941433935742:key/*
+            Sid: UseTranscriptKeyViaS3
+          - Action:
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+            Sid: ListForMissingKeySemantics
+          - Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:GetObjectVersion
+              - s3:ListBucketVersions
+              - s3:PutBucketPolicy
+              - s3:DeleteBucketPolicy
+              - s3:PutLifecycleConfiguration
+              - s3:PutEncryptionConfiguration
+              - s3:PutBucketVersioning
+              - s3:PutObjectAcl
+              - s3:PutBucketAcl
+              - s3:DeleteBucket
+            Effect: Deny
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+            Sid: NoDeleteNoHistoryNoAdmin
+        Version: 2012-10-17
+    path: /96bulls/
+    tags:
+      96bulls:component: iam
+      96bulls:purpose: relayhistory-api-worker-writes-live-transcripts
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-prod
+    userName: 96bulls-aws-sessions-prod-transcript-srv-writer
+
 [transcript-writer] noop
 
 [transcripts] noop
 
-[transcripts-key] noop
+[transcripts-key] update
+  properties:
+    deletionWindow: 30 days
+    description: "96bulls aws-sessions-prod: transcript objects (SSE-KMS, per-object data keys)"
+    enableKeyRotation: true
+    policy:
+  -     Statement:
+  -       - Action:
+  -           - kms:Create*
+  -           - kms:Describe*
+  -           - kms:Enable*
+  -           - kms:List*
+  -           - kms:Put*
+  -           - kms:Update*
+  -           - kms:Revoke*
+  -           - kms:Disable*
+  -           - kms:Get*
+  -           - kms:Delete*
+  -           - kms:TagResource
+  -           - kms:UntagResource
+  -           - kms:ScheduleKeyDeletion
+  -           - kms:CancelKeyDeletion
+  -           - kms:RotateKeyOnDemand
+  -         Effect: Allow
+  -         Principal:
+  -           AWS: arn:aws:iam::941433935742:root
+  -         Resource: "*"
+  -         Sid: AccountAdministersKey
+  -       - Action:
+  -           - kms:GenerateDataKey
+  -           - kms:Decrypt
+  -         Condition:
+  -           StringEquals:
+  -             kms:CallerAccount: "941433935742"
+  -             kms:ViaService: s3.us-east-1.amazonaws.com
+  -           StringLike:
+  -             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  -         Effect: Allow
+  -         Principal:
+  -           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-writer
+  -         Resource: "*"
+  -         Sid: WriterEncryptsAndReadsViaS3
+  -       - Action:
+  -           - kms:Decrypt
+  -         Condition:
+  -           StringEquals:
+  -             kms:CallerAccount: "941433935742"
+  -             kms:ViaService: s3.us-east-1.amazonaws.com
+  -           StringLike:
+  -             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  -         Effect: Allow
+  -         Principal:
+  -           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-reader
+  -         Resource: "*"
+  -         Sid: ReaderDecryptsViaS3
+  +     Statement:
+  +       - Action:
+  +           - kms:Create*
+  +           - kms:Describe*
+  +           - kms:Enable*
+  +           - kms:List*
+  +           - kms:Put*
+  +           - kms:Update*
+  +           - kms:Revoke*
+  +           - kms:Disable*
+  +           - kms:Get*
+  +           - kms:Delete*
+  +           - kms:TagResource
+  +           - kms:UntagResource
+  +           - kms:ScheduleKeyDeletion
+  +           - kms:CancelKeyDeletion
+  +           - kms:RotateKeyOnDemand
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: arn:aws:iam::941433935742:root
+  +         Resource: "*"
+  +         Sid: AccountAdministersKey
+  +       - Action:
+  +           - kms:GenerateDataKey
+  +           - kms:Decrypt
+  +         Condition:
+  +           StringEquals:
+  +             kms:CallerAccount: "941433935742"
+  +             kms:ViaService: s3.us-east-1.amazonaws.com
+  +           StringLike:
+  +             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-writer
+  +         Resource: "*"
+  +         Sid: WriterEncryptsAndReadsViaS3
+  +       - Action:
+  +           - kms:GenerateDataKey
+  +           - kms:Decrypt
+  +         Condition:
+  +           StringEquals:
+  +             kms:CallerAccount: "941433935742"
+  +             kms:ViaService: s3.us-east-1.amazonaws.com
+  +           StringLike:
+  +             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: (known after apply)
+  +         Resource: "*"
+  +         Sid: SrvWriterEncryptsAndReadsViaS3
+  +       - Action:
+  +           - kms:Decrypt
+  +         Condition:
+  +           StringEquals:
+  +             kms:CallerAccount: "941433935742"
+  +             kms:ViaService: s3.us-east-1.amazonaws.com
+  +           StringLike:
+  +             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-reader
+  +         Resource: "*"
+  +         Sid: ReaderDecryptsViaS3
+      Version: 2012-10-17
+    tags:
+      96bulls:audit-trail: 96bulls-aws-sessions-prod-trail
+      96bulls:component: kms
+      96bulls:repo: AgentWorkforce/96BullSessions
+      96bulls:stack: aws-sessions-prod
 
 [transcripts-key-alias] noop

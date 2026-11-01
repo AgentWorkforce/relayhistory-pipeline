@@ -1,21 +1,21 @@
 {
   "schema": 1,
   "stage": "aws-sessions-prod",
-  "generatedAt": "2026-11-01T04:31:29.931Z",
+  "generatedAt": "2026-11-01T21:40:07.852Z",
   "target": {
     "accountId": "941433935742",
     "region": "us-east-1",
     "callerArn": "arn:aws:sts::941433935742:assumed-role/AWSReservedSSO_AdministratorAccess_267543ee54f72723/khaliq@agentrelay.com"
   },
   "source": {
-    "commit": "20f8ac676d4950d82311c5aa4952ea012d0d4493",
-    "stackSourceSha256": "51ddea7955b9bde6bbe65d0b884723c8c1355a622ed4abc2166f0fd533990493",
+    "commit": "988de243b86ed953c8dbfd9bc754684557e57fb6",
+    "stackSourceSha256": "ce92fe55084f45bb8c7ee3dc0ef7e7accff1982e2ea6549ba92278d19c6c729b",
     "clean": true
   },
   "inputs": {
     "sha256": "9fbfca5cdd51314d711911bf057c2c06d767f7c581e50feba8e38d3a1ca6787d",
     "sanitizedPath": "docs/plans/aws-sessions-prod.inputs.sanitized.json",
-    "sanitizedSha256": "63ecfdc54b8149623ee08c049b35b6a7ea5d62b9fce9b61b1df7897a4856a200"
+    "sanitizedSha256": "9ce9ba9dd2856f451e25539fb9f41214f6b4e5152d14f1b5acbe577b6c3b4a1b"
   },
   "state": {
     "bucket": "alchemy-state-941433935742-us-east-1-an",
@@ -38,13 +38,13 @@
   "outputs": {
     "plan": {
       "path": "docs/plans/aws-sessions-prod.plan.txt",
-      "sha256": "f1e9b424b025bc0f65e94b33458dcde02f7abcf7e00135da4145d79238c66e64"
+      "sha256": "cffc5ce1c3368fed15b67a4b1fdac091841d0d317c2dbfcb482eee0a21aa5132"
     },
     "detailed": {
       "path": "docs/plans/aws-sessions-prod.plan.detailed.txt",
-      "sha256": "0ae5e1b5f8a137a76c8c867485bbbeb7a4bf2cadaabcad68012f3b6401396cb1"
+      "sha256": "627660df69b4e389fab64c7b2b4bddd4acb74486e0e5998fa1b15cbb9175bfaa"
     }
   },
-  "summary": "Plan: no changes",
+  "summary": "Plan: 1 to create, 1 to update",
   "note": "Planned against a read-only snapshot of the state (GETs pinned to version ids, in-memory Alchemy state): no state-bucket writes, no lease. The version listing (all versions and delete markers) was identical before and after. AWS provider reads only (Describe/List/Get). `96bulls up` re-checks everything before any change."
 }

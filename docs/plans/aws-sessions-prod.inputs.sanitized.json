@@ -5,20 +5,14 @@
   "approval": {
     "decision": "approved",
     "by": "Khaliq Gant",
-    "date": "2026-10-31",
+    "date": "2026-11-01",
     "operations": [
       "deploy"
     ],
     "stage": "aws-sessions-prod",
     "accountId": "941433935742",
     "region": "us-east-1",
-    "quote": "Execute the now-reviewed/merged #103 guarded live AWS remediation and noop proof.",
-    "capture": {
-      "provenanceSha256": "1e6168c0a7190b1baa1839201bb7cf8ac413c9a43223cea13a5771f77288b778",
-      "planSha256": "57e939bd82de5b01f1cee8c79edb7f6daf98b5f726c9ec57e8d9b8532862d82a",
-      "inputsSha256": "9fbfca5cdd51314d711911bf057c2c06d767f7c581e50feba8e38d3a1ca6787d",
-      "sourceCommit": "681c302b0e54f5aca1ccd564fb8ae851508cc95a"
-    }
+    "quote": "ok i pre approve each switch and cutover so go full throttle"
   },
   "budgetUsd": 200,
   "budgetEmail": "aws-budgets@agentrelay.com",
