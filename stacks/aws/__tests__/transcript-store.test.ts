@@ -1,9 +1,10 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { manifestKey, rawChunkKey, type SessionLocation } from "../../../packages/object-store/src/layout.ts";
 import { NON_DESTROYABLE } from "../deploy-guard.ts";
-import { isProductionLike } from "../hardening.ts";
+import { isProductionLike, trailKeyPolicy } from "../hardening.ts";
 import { validateAwsInputs, type AwsInputs } from "../inputs.ts";
 import { TENANT_KEY_BASE } from "../tenants.ts";
 import {
@@ -11,6 +12,7 @@ import {
   ERASURE_SLA_HOURS,
   accessLogBucketPolicy,
   accessLogLifecycleRules,
+  assertTranscriptStorePlanContract,
   transcriptBucketPolicy,
   transcriptEraserPolicy,
   transcriptKeyPolicy,
@@ -19,6 +21,7 @@ import {
   transcriptReaderPolicy,
   transcriptTrailSelectors,
   transcriptWriterPolicy,
+  trailLogBucketPolicy,
   userArn,
 } from "../transcript-store.ts";
 
@@ -32,6 +35,7 @@ const readerArn = userArn(ACCOUNT, n.userPath, n.reader);
 const eraserArn = userArn(ACCOUNT, n.userPath, n.eraser);
 const src = readFileSync(fileURLToPath(new URL("../transcript-store.ts", import.meta.url)), "utf8");
 const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
+const captureWorkflow = readFileSync(fileURLToPath(new URL("../../../src/cli/aws-provenance-io.ts", import.meta.url)), "utf8");
 const example = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-sessions-prod.inputs.example.json", import.meta.url)), "utf8")) as AwsInputs;
 
 type Stmt = { Sid?: string; Effect: "Allow" | "Deny"; Principal?: unknown; Action: string[]; Resource: string | string[]; Condition?: Record<string, Record<string, unknown>> };
@@ -265,6 +269,110 @@ describe("transcript store: CloudTrail data events", () => {
     ]);
     expect(transcriptTrailSelectors(n.bucket, false).map((s) => s.name)).toEqual(["transcript-object-events"]);
   });
+
+  it("binds both CloudTrail bucket service grants to the exact trail and account", () => {
+    const trailArn = `arn:aws:cloudtrail:${REGION}:${ACCOUNT}:trail/${n.trail}`;
+    const policy = trailLogBucketPolicy({ bucketArn: `arn:aws:s3:::${n.trailBucket}`, trailArn, accountId: ACCOUNT }) as Stmt[];
+    const grants = policy.filter((s) => s.Effect === "Allow");
+    expect(grants).toHaveLength(2);
+    expect(grants[0]!.Condition).toEqual({ StringEquals: { "aws:SourceArn": trailArn, "aws:SourceAccount": ACCOUNT } });
+    expect(grants[1]!.Condition).toEqual({ StringEquals: { "aws:SourceArn": trailArn, "aws:SourceAccount": ACCOUNT, "s3:x-amz-acl": "bucket-owner-full-control" } });
+  });
+
+  it("has no trail-log decrypt path unless one exact audit role is configured", () => {
+    const closed = trailKeyPolicy(ACCOUNT, REGION, n.trail, null);
+    expect(JSON.stringify(closed)).not.toMatch(/kms:Decrypt|kms:ReEncrypt/);
+    expect(JSON.stringify(closed)).not.toContain('"AWS":"*"');
+    const audit = `arn:aws:iam::${ACCOUNT}:role/security/96bulls-cloudtrail-auditor`;
+    const configured = trailKeyPolicy(ACCOUNT, REGION, n.trail, audit);
+    const reader = configured.Statement.find((s) => s.Sid === "AccountReadsLogs")!;
+    expect(reader.Principal).toEqual({ AWS: audit });
+    expect(reader.Action).toEqual(["kms:Decrypt", "kms:ReEncryptFrom"]);
+  });
+});
+
+describe("transcript store: deploy plan contract", () => {
+  const resources = [
+    "access-logs", "budget", "trail", "trail-key", "trail-key-alias", "trail-logs",
+    "transcript-eraser", "transcript-reader", "transcript-writer", "transcripts",
+    "transcripts-key", "transcripts-key-alias",
+  ];
+  const h = (text: string) => createHash("sha256").update(text).digest("hex");
+  const plan = (actions: Record<string, string>, summary?: string) => {
+    const counts = new Map<string, number>();
+    for (const action of Object.values(actions)) counts.set(action, (counts.get(action) ?? 0) + 1);
+    const inferred = counts.size ? `Plan: ${[...counts].map(([action, count]) => `${count} to ${action}`).join(", ")}` : "Plan: 0 changes";
+    return `${summary ?? inferred}\n${resources.map((r) => `[${r}] ${actions[r] ?? "noop"}`).join("\n")}\n`;
+  };
+  const detailed = (compact: string) => compact.split("\n").map((line) => line.startsWith("[") ? `  ${line}` : line).join("\n");
+  const provenance = (compact: string, full = detailed(compact), patch: Record<string, unknown> = {}) => JSON.stringify({
+    schema: 1,
+    stage: STAGE,
+    outputs: {
+      plan: { path: `docs/plans/${STAGE}.plan.txt`, sha256: h(compact) },
+      detailed: { path: `docs/plans/${STAGE}.plan.detailed.txt`, sha256: h(full) },
+    },
+    summary: compact.split("\n")[0],
+    ...patch,
+  });
+  const check = (compact: string, full = detailed(compact), record = provenance(compact, full)) =>
+    assertTranscriptStorePlanContract(compact, { detailedPlanText: full, provenanceText: record });
+
+  it("accepts only the exact initial, recovery, two-policy remediation, and final all-noop phases", () => {
+    expect(check(plan(Object.fromEntries(resources.map((resource) => [resource, "create"]))))).toBe("initial");
+    expect(check(plan({ transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" }))).toBe("principal-propagation recovery");
+    expect(check(plan({ "trail-key": "update", "trail-logs": "update" }))).toBe("post-merge policy remediation");
+    expect(check(plan({}))).toBe("post-apply");
+  });
+
+  it("permits exactly two named updates, rejecting one, three, or a different resource", () => {
+    for (const actions of [
+      { "trail-key": "update" },
+      { "trail-key": "update", "trail-logs": "update", trail: "update" },
+      { "trail-key": "update", trail: "update" },
+    ]) expect(() => check(plan(actions))).toThrow(/action set does not match/);
+  });
+
+  it("refuses replacements, deletes, imports/adoptions, unexpected partial creates, missing/extra resources, duplicates, and lying counts", () => {
+    for (const action of ["replace", "delete", "adopt", "import"])
+      expect(() => check(plan({ trail: action }))).toThrow(/forbidden action/);
+    expect(() => check(plan({ trail: "create" }))).toThrow(/action set/);
+    const allNoop = plan({});
+    expect(() => check(allNoop.replace("[trail] noop\n", ""))).toThrow(/missing resource trail/);
+    expect(() => check(allNoop + "[other] noop\n")).toThrow(/unexpected resource other/);
+    expect(() => check(allNoop + "[trail] noop\n")).toThrow(/more than once/);
+    expect(() => check(plan({}, "Plan: 1 to create"))).toThrow(/summary says 1 create/);
+    expect(() => check(plan({ "trail-key": "update", "trail-logs": "update" }, "Plan: 2 to update plus something else"))).toThrow(/unrecognized summary/);
+  });
+
+  it("requires the detailed repair actions and exact compact/detailed provenance hashes and paths", () => {
+    const compact = plan({ "trail-key": "update", "trail-logs": "update" });
+    const full = detailed(compact);
+    const otherUpdates = full.replace("[trail] noop", "[trail] update").replace("[trail-logs] update", "[trail-logs] noop");
+    expect(() => check(compact, otherUpdates, provenance(compact, otherUpdates))).toThrow(/disagree on trail/);
+    expect(() => check(compact, `${full}review-note\n`, provenance(compact, full))).toThrow(/detailed plan does not match/);
+    expect(() => check(compact, full, provenance(compact, full, { stage: "aws-other" }))).toThrow(/schema 1 for aws-sessions-prod/);
+    const badPath = JSON.stringify({
+      ...JSON.parse(provenance(compact, full)),
+      outputs: { ...JSON.parse(provenance(compact, full)).outputs, detailed: { path: "elsewhere", sha256: h(full) } },
+    });
+    expect(() => check(compact, full, badPath)).toThrow(/detailed plan path must be exactly/);
+  });
+
+  it("supports the required remediation reconciliation followed by an exact 12-noop capture", () => {
+    const phases = [
+      check(plan({ "trail-key": "update", "trail-logs": "update" })),
+      check(plan({})),
+    ];
+    expect(phases).toEqual(["post-merge policy remediation", "post-apply"]);
+  });
+
+  it("checks the production contract before a capture can replace reviewed files, and again before deploy", () => {
+    const captureCheck = captureWorkflow.indexOf("if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText });");
+    expect(captureCheck).toBeGreaterThan(0);
+    expect(captureCheck).toBeLessThan(captureWorkflow.indexOf("writeFileSync(p.plan, plan)"));
+    expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText })");
+  });
 });
 
 describe("transcript store: inputs", () => {
@@ -281,9 +389,19 @@ describe("transcript store: inputs", () => {
     expect(() => validateAwsInputs(STAGE, example)).toThrow(/placeholder values/);
   });
 
-  it("refuses anything but us-east-1, sandboxes, and any baseline/EKS/purge input", () => {
+  it("requires the exact production target, commercial partition, and a plain transcriptStore object", () => {
+    expect(() => validateAwsInputs(STAGE, filled((i) => (i.accountId = "111111111111")))).toThrow(/accountId must be exactly 941433935742/);
     expect(() => validateAwsInputs(STAGE, filled((i) => (i.region = "us-west-2")))).toThrow(/must stay in us-east-1/);
-    expect(() => validateAwsInputs("aws-sandbox-x", filled())).toThrow(/sandbox account never holds transcripts/);
+    for (const partition of [undefined, "aws-cn", "aws-us-gov"]) expect(() => validateAwsInputs(STAGE, filled((i) => ((i as Record<string, unknown>).partition = partition)))).toThrow(/partition must be exactly aws/);
+    expect(() => validateAwsInputs("aws-sandbox-x", filled())).toThrow(/reserved for aws-sessions-prod/);
+    for (const bad of [null, [], "yes", 1]) expect(() => validateAwsInputs(STAGE, filled((i) => ((i as Record<string, unknown>).transcriptStore = bad)))).toThrow(/plain object/);
+    expect(() => validateAwsInputs(STAGE, filled((i) => ((i as Record<string, unknown>).transcriptStore = new (class Store {})())))).toThrow(/plain object/);
+    expect(() => validateAwsInputs(STAGE, filled((i) => delete (i as Record<string, unknown>).transcriptStore))).toThrow(/transcriptStore is required/);
+  });
+
+  it("forbids transcriptStore on every other stage and refuses every legacy-baseline option", () => {
+    for (const stage of ["aws-sessions-dev", "aws-production", "aws-sandbox-x", "aws-proof", "aws-sessions-prod-copy"])
+      expect(() => validateAwsInputs(stage, filled())).toThrow(/reserved for aws-sessions-prod/);
     for (const [k, v] of [["eks", {}], ["supabase", {}], ["accountShared", { ownerStage: "aws-sessions-dev" }], ["lockerNoncurrentVersionDays", 30], ["hoopdbSecretArn", "arn:x"]] as const)
       expect(() => validateAwsInputs(STAGE, filled((i) => ((i as Record<string, unknown>)[k] = v)))).toThrow(new RegExp(`${k} is not allowed`));
     expect(() => validateAwsInputs(STAGE, filled((i) => (i.teardown = { purgeBucketsOnDestroy: true })))).toThrow(/never allowed on a production-looking stage/);
@@ -291,8 +409,16 @@ describe("transcript store: inputs", () => {
   });
 
   it("the stack declares the store instead of the baseline", () => {
-    const at = stack.indexOf("if (inputs.transcriptStore)");
+    const at = stack.indexOf("if (stage === TRANSCRIPT_STAGE)");
     expect(at).toBeGreaterThan(0);
     expect(at).toBeLessThan(stack.indexOf('AWS.KMS.Key("locker-key"'));
+    expect(stack).not.toContain("if (inputs.transcriptStore)");
+    expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText })");
+  });
+
+  it("accepts only an exact named audit role in the intended account and partition", () => {
+    expect(() => validateAwsInputs(STAGE, filled((i) => ((i.transcriptStore as Record<string, unknown>).auditPrincipalArn = `arn:aws:iam::${ACCOUNT}:role/security/auditor`)))).not.toThrow();
+    for (const arn of [`arn:aws:iam::111111111111:role/auditor`, `arn:aws-us-gov:iam::${ACCOUNT}:role/auditor`, `arn:aws:iam::${ACCOUNT}:user/auditor`, "*"])
+      expect(() => validateAwsInputs(STAGE, filled((i) => ((i.transcriptStore as Record<string, unknown>).auditPrincipalArn = arn)))).toThrow(/named IAM role/);
   });
 });

@@ -13,6 +13,7 @@ import { inputsDigest } from "../../stacks/aws/deploy-guard.ts";
 import { tmpdir } from "node:os";
 import { mkdtempSync, rmSync } from "node:fs";
 import { awsInvocation } from "./aws.ts";
+import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE } from "../../stacks/aws/transcript-store.ts";
 
 const run = (cmd: string, args: string[], cwd: string, env: Record<string, string> = {}) => {
   const r = spawnSync(cmd, args, { cwd, encoding: "utf8", env: { ...process.env, ...env }, maxBuffer: 256 * 1024 * 1024 });
@@ -77,9 +78,6 @@ export function capturePlan(root: string, stage: string, env: Record<string, str
   const p = planPaths(root, stage);
   mkdirSync(p.dir, { recursive: true });
   const sanitized = `${JSON.stringify(sanitizeInputs(inputs), null, 2)}\n`;
-  writeFileSync(p.inputs, sanitized);
-  writeFileSync(p.plan, plan);
-  writeFileSync(p.detailed, detailed);
   const version = (pkg: string) => (JSON.parse(readFileSync(join(root, "node_modules", pkg, "package.json"), "utf8")) as { version: string }).version;
   const record: Provenance = {
     schema: 1,
@@ -114,7 +112,13 @@ export function capturePlan(root: string, stage: string, env: Record<string, str
     summary: /Plan: .*/.exec(plan)?.[0] ?? "no summary line",
     note: "Planned against a read-only snapshot of the state (GETs pinned to version ids, in-memory Alchemy state): no state-bucket writes, no lease. The version listing (all versions and delete markers) was identical before and after. AWS provider reads only (Describe/List/Get). `96bulls up` re-checks everything before any change.",
   };
-  writeFileSync(p.provenance, `${JSON.stringify(record, null, 2)}\n`);
+  const provenanceText = `${JSON.stringify(record, null, 2)}\n`;
+  // Reject an unsafe production capture before it can replace the reviewed files.
+  if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText });
+  writeFileSync(p.inputs, sanitized);
+  writeFileSync(p.plan, plan);
+  writeFileSync(p.detailed, detailed);
+  writeFileSync(p.provenance, provenanceText);
   return record;
 }
 
