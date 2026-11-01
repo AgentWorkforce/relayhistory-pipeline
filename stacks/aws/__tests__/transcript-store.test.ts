@@ -19,6 +19,7 @@ import {
   transcriptLifecycleRules,
   transcriptNames,
   transcriptReaderPolicy,
+  transcriptSrvWriterPolicy,
   transcriptTrailSelectors,
   transcriptWriterPolicy,
   trailLogBucketPolicy,
@@ -33,6 +34,7 @@ const KEY = `arn:aws:kms:${REGION}:${ACCOUNT}:key/1111`;
 const writerArn = userArn(ACCOUNT, n.userPath, n.writer);
 const readerArn = userArn(ACCOUNT, n.userPath, n.reader);
 const eraserArn = userArn(ACCOUNT, n.userPath, n.eraser);
+const srvWriterArn = userArn(ACCOUNT, n.userPath, n.srvWriter);
 const src = readFileSync(fileURLToPath(new URL("../transcript-store.ts", import.meta.url)), "utf8");
 const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
 const captureWorkflow = readFileSync(fileURLToPath(new URL("../../../src/cli/aws-provenance-io.ts", import.meta.url)), "utf8");
@@ -63,7 +65,8 @@ describe("transcript store: names and layout", () => {
     expect(n.bucket).toBe("96bulls-aws-sessions-prod-transcripts-941433935742");
     expect(n.accessLogBucket).toBe("96bulls-aws-sessions-prod-access-logs-941433935742");
     for (const b of [n.bucket, n.accessLogBucket, n.trailBucket]) expect(b).toMatch(/^(?!xn--)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/);
-    for (const u of [n.writer, n.reader, n.eraser]) expect(u).toMatch(/^[\w+=,.@-]{1,64}$/);
+    expect(srvWriterArn).toBe("arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-srv-writer");
+    for (const u of [n.writer, n.reader, n.eraser, n.srvWriter]) expect(u).toMatch(/^[\w+=,.@-]{1,64}$/);
     expect(n.keyAlias).toMatch(/^alias\/[a-zA-Z0-9/_-]{1,250}$/);
     expect(n.budget).toMatch(/^[^:\\]{1,100}$/);
   });
@@ -173,7 +176,7 @@ describe("transcript store: lifecycle fits the K-45 erasure SLA", () => {
 });
 
 describe("transcript store: KMS key policy is least privilege", () => {
-  const kp = transcriptKeyPolicy({ accountId: ACCOUNT, region: REGION, bucketName: n.bucket, writerArn, readerArn });
+  const kp = transcriptKeyPolicy({ accountId: ACCOUNT, region: REGION, bucketName: n.bucket, writerArn, srvWriterArn, readerArn });
   const st = kp.Statement as Stmt[];
 
   it("never grants kms:* or a wildcard principal; the root administers but cannot use the key", () => {
@@ -187,9 +190,9 @@ describe("transcript store: KMS key policy is least privilege", () => {
     for (const use of ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey", "kms:ReEncryptFrom", "kms:ReEncryptTo"]) expect(root[0]!.Action.some((a) => covers(a, use))).toBe(false);
   });
 
-  it("only the writer and reader use it, only via S3 in us-east-1, only for objects under 96bulls/ in this bucket", () => {
+  it("only the writer, srv-writer and reader use it, only via S3 in us-east-1, only for objects under 96bulls/ in this bucket", () => {
     const users = st.filter((s) => !JSON.stringify(s.Principal).includes(":root"));
-    expect(users.map((s) => (s.Principal as { AWS: string }).AWS).sort()).toEqual([readerArn, writerArn].sort());
+    expect(users.map((s) => (s.Principal as { AWS: string }).AWS).sort()).toEqual([readerArn, srvWriterArn, writerArn].sort());
     for (const s of users) {
       expect(s.Condition).toEqual({
         StringEquals: { "kms:ViaService": `s3.${REGION}.amazonaws.com`, "kms:CallerAccount": ACCOUNT },
@@ -197,6 +200,7 @@ describe("transcript store: KMS key policy is least privilege", () => {
       });
     }
     expect(users.find((s) => (s.Principal as { AWS: string }).AWS === writerArn)!.Action.sort()).toEqual(["kms:Decrypt", "kms:GenerateDataKey"]);
+    expect(users.find((s) => (s.Principal as { AWS: string }).AWS === srvWriterArn)!.Action.sort()).toEqual(["kms:Decrypt", "kms:GenerateDataKey"]);
     expect(users.find((s) => (s.Principal as { AWS: string }).AWS === readerArn)!.Action).toEqual(["kms:Decrypt"]);
     expect(JSON.stringify(kp)).not.toContain(eraserArn);
   });
@@ -236,7 +240,7 @@ describe("transcript store: IAM users are least privilege", () => {
     expect(list.Condition).toEqual({ StringLike: { "s3:prefix": [`${TENANT_KEY_BASE}/*`] } });
   });
 
-  it("no user policy has a wildcard action, a wildcard resource, or any KMS or IAM grant", () => {
+  it("no writer/reader/eraser policy has a wildcard action, a wildcard resource, or any KMS or IAM grant", () => {
     for (const p of [writer, reader, eraser])
       for (const a of allowedActions(p)) {
         expect(a).not.toMatch(/\*/);
@@ -248,6 +252,8 @@ describe("transcript store: IAM users are least privilege", () => {
   it("creates the key after the users it names and after the trail that audits it", () => {
     const at = (s: string) => src.indexOf(s);
     expect(at('AWS.KMS.Key("transcripts-key"')).toBeGreaterThan(at('user("transcript-reader"'));
+    expect(at('AWS.KMS.Key("transcripts-key"')).toBeGreaterThan(at('"transcript-srv-writer",'));
+    expect(src).toContain("srvWriterArn: srvWriter.userArn as unknown as string,");
     expect(src).toContain('"96bulls:audit-trail": trail.trailName');
     expect(at('AWS.KMS.Key("transcripts-key"')).toBeGreaterThan(at('AWS.CloudTrail.Trail("trail"'));
   });
@@ -291,10 +297,97 @@ describe("transcript store: CloudTrail data events", () => {
   });
 });
 
+describe("transcript store: srv-writer (relayhistory-api live writer) is least privilege", () => {
+  const p = transcriptSrvWriterPolicy({ bucketArn: n.bucketArn, accountId: ACCOUNT, region: REGION, keyAlias: n.keyAlias }) as { Statement: Stmt[] };
+  const allow = p.Statement.filter((s) => s.Effect === "Allow");
+  const sid = (x: string) => p.Statement.find((s) => s.Sid === x)!;
+  const objects = [
+    `${n.bucketArn}/${TENANT_KEY_BASE}/*/v1/ws=*/m=srv_*`,
+    `${n.bucketArn}/${TENANT_KEY_BASE}/*/live-sessions/*`,
+    `${n.bucketArn}/${TENANT_KEY_BASE}/*/live-batches/*`,
+  ];
+  const srvLoc: SessionLocation = { ...loc, machineId: "srv_0123abcd" };
+  const SRV_MANIFEST = obj(manifestKey(srvLoc));
+  const SRV_RAW = obj(rawChunkKey(srvLoc, 0, 0, "b".repeat(64), "ndjson"));
+  const LIVE_SESSION = obj(`${TENANT_KEY_BASE}/org_abc/live-sessions/s1.json`);
+  const LIVE_BATCH = obj(`${TENANT_KEY_BASE}/org_abc/live-batches/2026/11/01/b1.ndjson.zst`);
+
+  it("is named like the other users and tagged with its purpose", () => {
+    expect(n.srvWriter).toBe("96bulls-aws-sessions-prod-transcript-srv-writer");
+    expect(src).toContain('"relayhistory-api-worker-writes-live-transcripts"');
+  });
+
+  it("allows exactly s3:GetObject and s3:PutObject on the srv_ machine, live-sessions and live-batches prefixes, ListBucket for 404s, plus key use", () => {
+    expect(allow.map((s) => s.Sid)).toEqual(["ReadLiveObjects", "WriteLiveObjectsSseKmsOnly", "UseTranscriptKeyViaS3", "ListForMissingKeySemantics"]);
+    // A missing key must 404 (the Worker's create-only reads), which S3
+    // decides by s3:ListBucket on the bucket; no prefix condition can apply.
+    expect(sid("ListForMissingKeySemantics").Action).toEqual(["s3:ListBucket"]);
+    expect(res(sid("ListForMissingKeySemantics"))).toEqual([n.bucketArn]);
+    expect(sid("ListForMissingKeySemantics").Condition).toBeUndefined();
+    expect(sid("ReadLiveObjects").Action).toEqual(["s3:GetObject"]);
+    expect(sid("WriteLiveObjectsSseKmsOnly").Action).toEqual(["s3:PutObject"]);
+    expect(sid("UseTranscriptKeyViaS3").Action.sort()).toEqual(["kms:Decrypt", "kms:GenerateDataKey"]);
+    expect(res(sid("ReadLiveObjects"))).toEqual(objects);
+    expect(res(sid("WriteLiveObjectsSseKmsOnly"))).toEqual(objects);
+    expect(res(sid("UseTranscriptKeyViaS3"))).toEqual([`arn:aws:kms:${REGION}:${ACCOUNT}:key/*`]);
+    expect([...new Set(allowedActions(p))].sort()).toEqual(["kms:Decrypt", "kms:GenerateDataKey", "s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
+  });
+
+  it("reaches the Worker's srv_ manifests and raw chunks and the live prefixes, nothing else", () => {
+    for (const k of [SRV_MANIFEST, SRV_RAW, LIVE_SESSION, LIVE_BATCH])
+      for (const a of ["s3:PutObject", "s3:GetObject"]) expect(decide(p, a, k)).toBe("allow");
+    for (const k of [MANIFEST, RAW, SUMMARY, OUTSIDE, obj("anything"), obj("live-sessions/x"), obj(`${TENANT_KEY_BASE}/org_abc/v1/ws=ws1/m=m1/h=claude/d=2026/10/31/s=s1/raw/x`)])
+      for (const a of ["s3:PutObject", "s3:GetObject"]) expect(decide(p, a, k)).toBe("implicit-deny");
+  });
+
+  it("never deletes, lists versions, reads old versions or changes the bucket; lists current keys only", () => {
+    for (const a of ["s3:DeleteObject", "s3:DeleteObjectVersion", "s3:GetObjectVersion", "s3:PutBucketPolicy", "s3:PutObjectAcl"]) expect(decide(p, a, SRV_MANIFEST)).toBe("deny");
+    for (const a of ["s3:ListBucketVersions", "s3:PutLifecycleConfiguration", "s3:DeleteBucket"]) expect(decide(p, a, n.bucketArn)).toBe("deny");
+    expect(decide(p, "s3:ListBucket", n.bucketArn)).toBe("allow");
+    for (const a of allowedActions(p)) expect(a).not.toMatch(/Delete|Versions|\*/);
+  });
+
+  it("PUT requires SSE-KMS with a key in this account and region; the bucket policy pins it to the transcripts CMK", () => {
+    expect(sid("WriteLiveObjectsSseKmsOnly").Condition).toEqual({
+      StringEquals: { "s3:x-amz-server-side-encryption": "aws:kms" },
+      StringLike: { "s3:x-amz-server-side-encryption-aws-kms-key-id": `arn:aws:kms:${REGION}:${ACCOUNT}:key/*` },
+    });
+    const bucket = transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: KEY, eraserArn }) as Stmt[];
+    // Identity Allow and bucket Deny together: SSE-KMS naming exactly KEY, or nothing.
+    const allowed = (h: Record<string, string>) => {
+      const sse = h["s3:x-amz-server-side-encryption"];
+      const keyId = h["s3:x-amz-server-side-encryption-aws-kms-key-id"];
+      const identity = sse === "aws:kms" && keyId !== undefined && glob(`arn:aws:kms:${REGION}:${ACCOUNT}:key/*`).test(keyId);
+      const bucketDenies = sse !== undefined && (sse !== "aws:kms" || keyId !== KEY);
+      return identity && !bucketDenies;
+    };
+    expect(bucket.find((s) => s.Sid === "SseHeaderMustNameThisKey")!.Condition).toEqual({ Null: { "s3:x-amz-server-side-encryption": "false" }, StringNotEqualsIfExists: { "s3:x-amz-server-side-encryption-aws-kms-key-id": KEY } });
+    expect(allowed({})).toBe(false);
+    expect(allowed({ "s3:x-amz-server-side-encryption": "aws:kms" })).toBe(false);
+    expect(allowed({ "s3:x-amz-server-side-encryption": "AES256" })).toBe(false);
+    expect(allowed({ "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": `arn:aws:kms:${REGION}:${ACCOUNT}:key/2222` })).toBe(false);
+    expect(allowed({ "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": KEY })).toBe(true);
+  });
+
+  it("key use is only via S3 in us-east-1 and only on the transcripts key's alias", () => {
+    expect(sid("UseTranscriptKeyViaS3").Condition).toEqual({
+      StringEquals: { "kms:ViaService": `s3.${REGION}.amazonaws.com` },
+      "ForAnyValue:StringEquals": { "kms:ResourceAliases": n.keyAlias },
+    });
+  });
+
+  it("the bucket admits it without a new grant: the bucket policy has no Allow and denies deletes to all but the eraser", () => {
+    const bucket = transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: KEY, eraserArn }) as Stmt[];
+    expect(bucket.filter((s) => s.Effect === "Allow")).toEqual([]);
+    expect(JSON.stringify(bucket)).not.toContain(srvWriterArn);
+    expect(bucket.find((s) => s.Sid === "OnlyTheEraserDeletes")!.Condition).toEqual({ ArnNotEquals: { "aws:PrincipalArn": eraserArn } });
+  });
+});
+
 describe("transcript store: deploy plan contract", () => {
   const resources = [
     "access-logs", "budget", "trail", "trail-key", "trail-key-alias", "trail-logs",
-    "transcript-eraser", "transcript-reader", "transcript-writer", "transcripts",
+    "transcript-eraser", "transcript-reader", "transcript-srv-writer", "transcript-writer", "transcripts",
     "transcripts-key", "transcripts-key-alias",
   ];
   const h = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -318,11 +411,21 @@ describe("transcript store: deploy plan contract", () => {
   const check = (compact: string, full = detailed(compact), record = provenance(compact, full)) =>
     assertTranscriptStorePlanContract(compact, { detailedPlanText: full, provenanceText: record });
 
-  it("accepts only the exact initial, recovery, two-policy remediation, and final all-noop phases", () => {
+  it("accepts only the exact initial, recovery, two-policy remediation, srv-writer addition, and final all-noop phases", () => {
     expect(check(plan(Object.fromEntries(resources.map((resource) => [resource, "create"]))))).toBe("initial");
     expect(check(plan({ transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" }))).toBe("principal-propagation recovery");
     expect(check(plan({ "trail-key": "update", "trail-logs": "update" }))).toBe("post-merge policy remediation");
+    expect(check(plan({ "transcript-srv-writer": "create", "transcripts-key": "update" }))).toBe("srv-writer addition");
     expect(check(plan({}))).toBe("post-apply");
+  });
+
+  it("the srv-writer addition is exactly the new user plus the key policy update", () => {
+    for (const actions of [
+      { "transcript-srv-writer": "create" },
+      { "transcripts-key": "update" },
+      { "transcript-srv-writer": "create", "transcripts-key": "update", transcripts: "update" },
+      { "transcript-srv-writer": "update", "transcripts-key": "update" },
+    ]) expect(() => check(plan(actions))).toThrow(/action set does not match/);
   });
 
   it("permits exactly two named updates, rejecting one, three, or a different resource", () => {
@@ -359,7 +462,7 @@ describe("transcript store: deploy plan contract", () => {
     expect(() => check(compact, full, badPath)).toThrow(/detailed plan path must be exactly/);
   });
 
-  it("supports the required remediation reconciliation followed by an exact 12-noop capture", () => {
+  it("supports the required remediation reconciliation followed by an exact all-noop capture", () => {
     const phases = [
       check(plan({ "trail-key": "update", "trail-logs": "update" })),
       check(plan({})),
