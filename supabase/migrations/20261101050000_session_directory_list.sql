@@ -23,10 +23,15 @@
 --      stored on either row.
 --   3. Indexes for the list filters that no existing index serves: the agent companion
 --      index (lower(agent) exact) and a tenant trigram index over the project id and key
---      for `projectContains`. The repeatable `user` filter walks
---      session_directory_users_recent_idx (20261030010000) once per user, bounded by the
---      page size: a tenant-prefixed GIN over user_ids would read the tenant's whole
---      org_id/workspace_id posting lists for every request, which the planner refuses. The
+--      for `projectContains`. Agent and user filters are membership filters over their
+--      companions (session_directory_agents_recent_idx, session_directory_users_recent_idx);
+--      the page is always ordered and paged on the directory row's own key. A
+--      tenant-prefixed GIN over user_ids was rejected: its org_id/workspace_id posting
+--      lists cover the whole tenant and the planner never picks it.
+--   6. Triggers that keep the companions' order keys in step with the directory row and
+--      remove a tombstoned or deleted session's agents and edges (as parent and as child),
+--      and sessions.session_directory_catalog_rollout, which gates p_agent until the
+--      catalog backfill is complete. The
 --      (org, workspace, harness, last_activity_at DESC) index the source filter needs is
 --      session_directory_harness_recent_idx (20261030010000), and the created range uses
 --      session_directory_created_recent_idx.
@@ -146,6 +151,82 @@ CREATE TRIGGER session_directory_tombstone_clears_catalog
   BEFORE INSERT OR UPDATE ON sessions.session_directory
   FOR EACH ROW EXECUTE FUNCTION sessions.session_directory_tombstone_clears_catalog();
 
+-- Companions follow the logical row's order key inside the directory row's own
+-- transaction, whichever writer moves it (projector, catalog writer, erasure, a future
+-- path). The list no longer orders by companion keys (H1), but
+-- sessions.search_session_directory still drives users/machines from them, so this
+-- keeps that RPC's pages consistent too.
+CREATE FUNCTION sessions.session_directory_companions_follow()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $follow$
+BEGIN
+  UPDATE sessions.session_directory_users AS m SET last_activity_at = NEW.last_activity_at
+   WHERE m.org_id = NEW.org_id AND m.workspace_id = NEW.workspace_id
+     AND m.harness = NEW.harness AND m.session_id = NEW.session_id
+     AND m.last_activity_at IS DISTINCT FROM NEW.last_activity_at;
+  UPDATE sessions.session_directory_machines AS m SET last_activity_at = NEW.last_activity_at
+   WHERE m.org_id = NEW.org_id AND m.workspace_id = NEW.workspace_id
+     AND m.harness = NEW.harness AND m.session_id = NEW.session_id
+     AND m.last_activity_at IS DISTINCT FROM NEW.last_activity_at;
+  UPDATE sessions.session_directory_agents AS m SET last_activity_at = NEW.last_activity_at
+   WHERE m.org_id = NEW.org_id AND m.workspace_id = NEW.workspace_id
+     AND m.harness = NEW.harness AND m.session_id = NEW.session_id
+     AND m.last_activity_at IS DISTINCT FROM NEW.last_activity_at;
+  RETURN NULL;
+END
+$follow$;
+
+CREATE TRIGGER session_directory_companions_follow
+  AFTER UPDATE OF last_activity_at ON sessions.session_directory
+  FOR EACH ROW WHEN (OLD.last_activity_at IS DISTINCT FROM NEW.last_activity_at)
+  EXECUTE FUNCTION sessions.session_directory_companions_follow();
+
+-- Erasure and tombstones reach every catalog row that names the session, whatever writer
+-- sets deleted_at or deletes the row: its agent rows, the edges it delivered as a parent,
+-- and the edges other (live) parents hold naming it as their child. A row delete
+-- cascades the first two through the foreign keys; child edges have no foreign key, so
+-- they are removed here in both cases.
+CREATE FUNCTION sessions.session_directory_forget_catalog()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $forget$
+DECLARE
+  k sessions.session_directory%ROWTYPE;
+BEGIN
+  IF TG_OP = 'DELETE' THEN k := OLD; ELSE k := NEW; END IF;
+  DELETE FROM sessions.session_directory_relationships AS r
+   WHERE r.org_id = k.org_id AND r.workspace_id = k.workspace_id AND r.harness = k.harness
+     AND (r.child_session_id = k.session_id OR r.parent_session_id = k.session_id);
+  DELETE FROM sessions.session_directory_agents AS a
+   WHERE a.org_id = k.org_id AND a.workspace_id = k.workspace_id
+     AND a.harness = k.harness AND a.session_id = k.session_id;
+  RETURN NULL;
+END
+$forget$;
+
+CREATE TRIGGER session_directory_forget_catalog_on_tombstone
+  AFTER INSERT OR UPDATE OF deleted_at ON sessions.session_directory
+  FOR EACH ROW WHEN (NEW.deleted_at IS NOT NULL)
+  EXECUTE FUNCTION sessions.session_directory_forget_catalog();
+CREATE TRIGGER session_directory_forget_catalog_on_delete
+  AFTER DELETE ON sessions.session_directory
+  FOR EACH ROW EXECUTE FUNCTION sessions.session_directory_forget_catalog();
+
+-- The agent filter matches only rows the catalog writer has written. Until the catalog
+-- backfill is complete (docs/session-directory-list.md, "Backfill") the list refuses
+-- p_agent (0A000 agent_filter_not_ready) rather than answer an empty list for sessions
+-- whose agents were never projected; relayhistory-cloud falls back to Neon on it.
+-- Marking it complete is an operator step, like session_directory_rollout.
+CREATE TABLE sessions.session_directory_catalog_rollout (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  completed_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO sessions.session_directory_catalog_rollout (singleton) VALUES (true)
+ON CONFLICT (singleton) DO NOTHING;
+ALTER TABLE sessions.session_directory_catalog_rollout ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_directory_catalog_rollout FROM PUBLIC, anon, authenticated;
+GRANT ALL ON sessions.session_directory_catalog_rollout TO service_role;
+
 -- The project text `projectContains` matches: the project id, the catalog project key and
 -- the repository (the dashboard's `project:` matches the project id, name and key; the
 -- repository carries the name). Values are joined by a newline, so only a needle that itself
@@ -172,9 +253,8 @@ CREATE INDEX session_directory_tenant_project_text_trgm_idx
 --   $10 first_ts_before  $11 cursor last_activity_at  $12 cursor session_id
 --   $13 cursor harness  $14 row limit (page + 1)  $15 key harnesses text[]
 --   $16 key session ids text[] (a batch lookup: pairs by position)  $17 excluded sources
--- The driving table follows the most selective ordered index the shape has: the agent
--- companion, else the users companion (one ordered walk per user), else the directory's
--- recency index.
+-- The page is always ordered, and the cursor always compared, on the directory row's
+-- (last_activity_at, session_id, harness); companions are membership filters only.
 CREATE FUNCTION sessions.session_directory_list_sql(
   p_source_count integer, p_has_project boolean, p_user_count integer, p_has_agent boolean,
   p_has_last_after boolean, p_has_last_before boolean,
@@ -183,43 +263,38 @@ CREATE FUNCTION sessions.session_directory_list_sql(
 ) RETURNS text LANGUAGE plpgsql IMMUTABLE
 SET search_path = pg_catalog, pg_temp AS $list_sql$
 DECLARE
-  v_drive text;   -- 'agents', 'users' or 'directory'
   v_users integer := coalesce(p_user_count, 0);
-  v_from text;
   v_where text;
-  v_key text;     -- alias whose (last_activity_at, session_id, harness) orders the page
-  v_core text;
 BEGIN
-  v_drive := CASE WHEN p_has_agent THEN 'agents'
-                  WHEN v_users > 0 THEN 'users'
-                  ELSE 'directory' END;
-  IF v_drive = 'directory' THEN
-    v_from := ' FROM sessions.session_directory AS d';
-    v_key := 'd';
-  ELSE
-    v_from := format(' FROM sessions.session_directory_%s AS m JOIN sessions.session_directory AS d'
-      || ' ON d.org_id = m.org_id AND d.workspace_id = m.workspace_id'
-      || ' AND d.harness = m.harness AND d.session_id = m.session_id', v_drive);
-    v_key := 'm';
-  END IF;
+  -- One sort key for the order and the cursor: the logical row's
+  -- (last_activity_at, session_id, harness). The companions (agents, users) are
+  -- membership filters only, never the order, so a companion row whose copied
+  -- last_activity_at lags the directory row can neither repeat nor skip a session
+  -- across pages (H1, #124 review). The planner may still drive from a companion's
+  -- index to find a selective agent's or user's sessions, then sort them.
   v_where := ' WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL'
-    || CASE WHEN v_drive = 'directory' THEN '' ELSE ' AND m.org_id = $1 AND m.workspace_id = $2' END
-    || CASE WHEN v_drive = 'agents' THEN ' AND m.agent_name_normalized = $6'
-            WHEN v_drive = 'users' AND v_users = 1 THEN ' AND m.user_id = ($5)[1]'
-            -- Several users: one ordered walk per user (the LATERAL below binds u).
-            WHEN v_drive = 'users' THEN ' AND m.user_id = u.user_id'
-            ELSE '' END
-    -- Users with an agent: the agent walk keeps sessions any listed user has, by the
-    -- logical row's user_ids, which the projector keeps equal to session_directory_users.
-    || CASE WHEN p_has_agent AND v_users > 0 THEN ' AND d.user_ids && $5' ELSE '' END
+    || CASE WHEN p_has_agent THEN
+         ' AND (d.org_id, d.workspace_id, d.harness, d.session_id) IN (SELECT a.org_id, a.workspace_id, a.harness, a.session_id'
+         || ' FROM sessions.session_directory_agents AS a'
+         || ' WHERE a.org_id = $1 AND a.workspace_id = $2 AND a.agent_name_normalized = $6)'
+       ELSE '' END
+    || CASE WHEN v_users = 1 THEN
+         ' AND (d.org_id, d.workspace_id, d.harness, d.session_id) IN (SELECT u.org_id, u.workspace_id, u.harness, u.session_id'
+         || ' FROM sessions.session_directory_users AS u'
+         || ' WHERE u.org_id = $1 AND u.workspace_id = $2 AND u.user_id = ($5)[1])'
+            WHEN v_users > 1 THEN
+         ' AND (d.org_id, d.workspace_id, d.harness, d.session_id) IN (SELECT u.org_id, u.workspace_id, u.harness, u.session_id'
+         || ' FROM sessions.session_directory_users AS u'
+         || ' WHERE u.org_id = $1 AND u.workspace_id = $2 AND u.user_id = ANY ($5))'
+       ELSE '' END
     -- One source is an ordered equality on session_directory_harness_recent_idx.
     || CASE WHEN coalesce(p_source_count, 0) = 1 THEN ' AND d.harness = ($3)[1]'
             WHEN coalesce(p_source_count, 0) > 1 THEN ' AND d.harness = ANY ($3)' ELSE '' END
+    || CASE WHEN p_has_not_sources THEN ' AND NOT (d.harness = ANY ($17::text[]))' ELSE '' END
     || CASE WHEN p_has_project THEN
          ' AND (d.project_id IS NOT NULL OR d.project_key IS NOT NULL OR d.git_repo IS NOT NULL)'
          || ' AND sessions.session_directory_project_text(d.project_id, d.project_key, d.git_repo) ILIKE $4 ESCAPE ''\'''
        ELSE '' END
-    || CASE WHEN p_has_not_sources THEN ' AND NOT (d.harness = ANY ($17::text[]))' ELSE '' END
     || CASE WHEN p_has_last_after THEN ' AND d.last_activity_at >= $7' ELSE '' END
     || CASE WHEN p_has_last_before THEN ' AND d.last_activity_at < $8' ELSE '' END
     || CASE WHEN p_has_first_after THEN ' AND d.created_at >= $9' ELSE '' END
@@ -227,37 +302,29 @@ BEGIN
     || CASE WHEN p_has_keys THEN
          ' AND (d.harness, d.session_id) IN (SELECT k.h, k.s FROM unnest($15::text[], $16::text[]) AS k(h, s))'
        ELSE '' END
-    || CASE WHEN p_has_cursor THEN format(
-         ' AND (%1$s.last_activity_at, %1$s.session_id, %1$s.harness) < ($11, $12, $13)', v_key)
+    || CASE WHEN p_has_cursor THEN
+         ' AND (d.last_activity_at, d.session_id, d.harness) < ($11, $12, $13)'
        ELSE '' END;
-  v_core := 'SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at,'
+  RETURN 'SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.created_at, d.last_activity_at,'
     || ' d.title, d.task_title, d.agent_names, d.project_id, d.project_key, d.project_key_method,'
     || ' d.git_repo, d.git_branch, d.initial_commit, d.originator, d.agent_version,'
     || ' ARRAY(SELECT DISTINCT x FROM unnest(d.catalog_models || ARRAY[d.model]) AS x'
     ||       ' WHERE x IS NOT NULL AND x <> '''' ORDER BY x) AS models,'
     || ' d.state, d.event_count, d.input_tokens, d.output_tokens, d.cost_usd_micros,'
     || ' d.machine_ids, d.user_ids,'
-    -- Parents: sessions whose delivered relationships name this one as their child.
+    -- Parents: live sessions whose delivered relationships name this one as their child
+    -- (a tombstoned parent's edges are deleted with it).
     || ' ARRAY(SELECT DISTINCT r.parent_session_id FROM sessions.session_directory_relationships AS r'
     ||       ' WHERE r.org_id = d.org_id AND r.workspace_id = d.workspace_id AND r.harness = d.harness'
     ||       ' AND r.child_session_id = d.session_id ORDER BY 1 LIMIT 64) AS parent_session_ids,'
-    -- Children: relationship rows naming this session as parent, linked or not.
+    -- Children: relationship rows naming this session as parent, linked or not (an
+    -- erased child's edge is deleted with it).
     || ' (SELECT count(*) FROM sessions.session_directory_relationships AS r'
     ||       ' WHERE r.org_id = d.org_id AND r.workspace_id = d.workspace_id AND r.harness = d.harness'
     ||       ' AND r.parent_session_id = d.session_id)::integer AS child_session_count,'
     || ' d.short_summary, d.short_summary_generated_at, d.catalog_projected_at, d.projected_at'
-    || v_from || v_where
-    || format(' ORDER BY %1$s.last_activity_at DESC, %1$s.session_id DESC, %1$s.harness DESC', v_key)
-    || ' LIMIT $14';
-  IF v_drive = 'users' AND v_users > 1 THEN
-    -- Each user's walk is bounded by the page size and carries every filter, so the
-    -- union of the walks holds the page; a session two users share appears once (the
-    -- companions carry the logical row's last_activity_at, so its keys are equal).
-    RETURN 'SELECT DISTINCT ON (p.last_activity_at, p.session_id, p.harness) p.*'
-      || ' FROM unnest($5::text[]) AS u(user_id) CROSS JOIN LATERAL (' || v_core || ') AS p'
-      || ' ORDER BY p.last_activity_at DESC, p.session_id DESC, p.harness DESC LIMIT $14';
-  END IF;
-  RETURN v_core;
+    || ' FROM sessions.session_directory AS d' || v_where
+    || ' ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC LIMIT $14';
 END
 $list_sql$;
 
@@ -363,6 +430,11 @@ BEGIN
     IF v_agent = '' OR char_length(v_agent) > 200 THEN
       RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session list: agent must be 1 to 200 characters';
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM sessions.session_directory_catalog_rollout AS r
+                    WHERE r.singleton AND r.completed_at IS NOT NULL) THEN
+      RAISE EXCEPTION USING ERRCODE = '0A000',
+        MESSAGE = 'session list: agent_filter_not_ready: the directory catalog backfill is not complete';
+    END IF;
   END IF;
   IF p_project_contains IS NOT NULL THEN
     v_project := btrim(p_project_contains);
@@ -429,12 +501,15 @@ BEGIN
   END IF;
   RETURN QUERY
     WITH spans AS MATERIALIZED (
+      -- least/greatest: a row whose created_at is after its last_activity_at (nothing
+      -- forbids it) spans the two in order instead of adding a negative delta.
       SELECT d.harness,
-             greatest((d.created_at AT TIME ZONE 'UTC')::date, v_first) AS lo,
-             least((d.last_activity_at AT TIME ZONE 'UTC')::date, v_last) AS hi
+             greatest((least(d.created_at, d.last_activity_at) AT TIME ZONE 'UTC')::date, v_first) AS lo,
+             least((greatest(d.created_at, d.last_activity_at) AT TIME ZONE 'UTC')::date, v_last) AS hi
         FROM sessions.session_directory AS d
        WHERE d.org_id = v_org AND d.workspace_id = p_workspace_id AND d.deleted_at IS NULL
-         AND d.last_activity_at >= p_since AND d.created_at <= p_until
+         AND greatest(d.created_at, d.last_activity_at) >= p_since
+         AND least(d.created_at, d.last_activity_at) <= p_until
     ), deltas AS (
       SELECT s.harness, s.lo AS day, 1::bigint AS delta FROM spans AS s
       UNION ALL
@@ -457,6 +532,10 @@ END
 $activity$;
 
 REVOKE ALL ON FUNCTION sessions.session_directory_tombstone_clears_catalog() FROM PUBLIC;
+REVOKE ALL ON FUNCTION sessions.session_directory_companions_follow()
+  FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_directory_forget_catalog()
+  FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_directory_project_text(text, text, text) FROM PUBLIC;
 -- Every writer of a directory row evaluates the trigram index expression, so the writers
 -- (service_role here; the runtime role through RUNTIME_APPLICATION_FUNCTIONS) execute it.
@@ -487,6 +566,8 @@ DECLARE
 BEGIN
   FOREACH v_fn IN ARRAY ARRAY[
     'sessions.session_directory_tombstone_clears_catalog()'::regprocedure,
+    'sessions.session_directory_companions_follow()'::regprocedure,
+    'sessions.session_directory_forget_catalog()'::regprocedure,
     'sessions.session_directory_list_sql(integer, boolean, integer, boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean)'::regprocedure,
     'sessions.list_session_directory(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)'::regprocedure,
     'sessions.session_directory_activity(text, timestamptz, timestamptz)'::regprocedure

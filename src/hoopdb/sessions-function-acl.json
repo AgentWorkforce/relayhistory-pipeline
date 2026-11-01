@@ -84,6 +84,8 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_directory_companions_follow()": ["<owner>:EXECUTE"],
+    "sessions.session_directory_forget_catalog()": ["<owner>:EXECUTE"],
     "sessions.session_directory_list_sql(integer,boolean,integer,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean)": [
       "<owner>:EXECUTE"
     ],

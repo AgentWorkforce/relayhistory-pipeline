@@ -31,7 +31,7 @@ afterEach(async () => {
   await Promise.all(open.splice(0).map((db) => db.close()));
 });
 
-async function database(): Promise<PGlite> {
+async function database(options: { catalogReady?: boolean } = {}): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
@@ -43,6 +43,9 @@ async function database(): Promise<PGlite> {
     "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
     [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],
   );
+  // The operator step that unlocks p_agent once the catalog backfill is done.
+  if (options.catalogReady ?? true)
+    await db.exec("UPDATE sessions.session_directory_catalog_rollout SET completed_at = now()");
   return db;
 }
 
@@ -314,6 +317,16 @@ describe("list_session_directory filters", () => {
     expect(ids(await list(db, { agent: "helm" }))).toEqual([]);
   });
 
+  test("agent is refused (0A000 agent_filter_not_ready) until the catalog backfill is marked complete", async () => {
+    const db = await database({ catalogReady: false });
+    await seed(db, FIXTURE);
+    expect(await code(list(db, { agent: "helm-chief" }))).toBe("0A000");
+    // Every other filter is served meanwhile.
+    expect(ids(await list(db, { users: ["u-1"] }))).toEqual(["s1", "s3"]);
+    await db.exec("UPDATE sessions.session_directory_catalog_rollout SET completed_at = now()");
+    expect(ids(await list(db, { agent: "helm-chief" }))).toEqual(["s1", "s4"]);
+  });
+
   test("timestamp bounds are half-open: after inclusive, before exclusive", async () => {
     const db = await database();
     await seed(db, FIXTURE);
@@ -385,6 +398,54 @@ describe("list_session_directory filters", () => {
       expect(seen).toHaveLength(25);
       expect(new Set(seen).size).toBe(25);
     }
+  });
+});
+
+describe("pagination with a drifted companion order key (H1)", () => {
+  test("agent and user pages follow the directory row's key: no repeat, no skip, no loop", async () => {
+    const db = await database();
+    const sessions: Session[] = Array.from({ length: 5 }, (_, n) => ({
+      id: `s${n + 1}`,
+      created: "2026-10-01T00:00:00Z",
+      last: `2026-10-0${5 - n}T00:00:00Z`,
+      users: ["u-1", "u-2"],
+      agents: ["bot"],
+    }));
+    await seed(db, sessions);
+    // s4 moves to the newest activity; its companions lag behind (a writer that crashed
+    // before its companion update, or one that read an older row).
+    await db.exec(`
+      UPDATE sessions.session_directory SET last_activity_at = '2026-10-06T00:00:00Z' WHERE session_id = 's4';
+      UPDATE sessions.session_directory_agents SET last_activity_at = '2026-10-02T00:00:00Z' WHERE session_id = 's4';
+      UPDATE sessions.session_directory_users SET last_activity_at = '2026-10-02T00:00:00Z' WHERE session_id = 's4';
+    `);
+    const expected = ids(await list(db, {}));
+    expect(expected).toEqual(["s4", "s1", "s2", "s3", "s5"]);
+    for (const shape of [{ agent: "bot" }, { users: ["u-1"] }, { users: ["u-1", "u-2"] }] as ListArgs[]) {
+      const seen: unknown[] = [];
+      let cursor: [string, string, string] | undefined;
+      for (let page = 0; page < 10; page++) {
+        const rows = await list(db, { ...shape, limit: 2, ...(cursor ? { cursor } : {}) });
+        const visible = rows.slice(0, 2);
+        seen.push(...ids(visible));
+        if (rows.length <= 2) break;
+        const last = visible[1]!;
+        cursor = [(last.last_activity_at as Date).toISOString(), last.session_id as string, last.harness as string];
+      }
+      expect(seen, JSON.stringify(shape)).toEqual(expected);
+    }
+  });
+
+  test("moving a directory row's last_activity_at moves every companion in the same statement", async () => {
+    const db = await database();
+    await seed(db, [{ id: "s1", created: "2026-10-01T00:00:00Z", last: "2026-10-02T00:00:00Z", users: ["u-1"], agents: ["bot"] }]);
+    await db.exec(`INSERT INTO sessions.session_directory_machines VALUES ('org-a', 'ws-a', 'codex', 's1', 'm-1', '2026-10-02T00:00:00Z')`);
+    await db.exec("UPDATE sessions.session_directory SET last_activity_at = '2026-10-09T00:00:00Z' WHERE session_id = 's1'");
+    const keys = await db.query<{ t: Date }>(`
+      SELECT last_activity_at AS t FROM sessions.session_directory_users
+      UNION ALL SELECT last_activity_at FROM sessions.session_directory_machines
+      UNION ALL SELECT last_activity_at FROM sessions.session_directory_agents`);
+    expect(keys.rows.map((row) => row.t.toISOString())).toEqual(Array(3).fill("2026-10-09T00:00:00.000Z"));
   });
 });
 
@@ -474,6 +535,30 @@ describe("session_directory_activity", () => {
       await db.exec("RESET ROLE");
     }
   }
+
+  test("a row with created_at after last_activity_at spans the two in order and never hides other days", async () => {
+    const db = await database();
+    await seed(db, [
+      { id: "bad", created: "2026-10-05T00:00:00Z", last: "2026-10-02T00:00:00Z" },
+      { id: "ok", harness: "claude", created: "2026-10-01T00:00:00Z", last: "2026-10-06T00:00:00Z" },
+    ]);
+    const days = await activity(db, "ws-a", "2026-10-01T00:00:00Z", "2026-10-06T23:59:59Z");
+    const totals = new Map<string, number>();
+    for (const [day, , n] of days) totals.set(day as string, (totals.get(day as string) ?? 0) + (n as number));
+    expect([...totals]).toEqual([
+      ["2026-10-01", 1], ["2026-10-02", 2], ["2026-10-03", 2],
+      ["2026-10-04", 2], ["2026-10-05", 2], ["2026-10-06", 1],
+    ]);
+  });
+
+  test("a deleted session counts on no day", async () => {
+    const db = await database();
+    await seed(db, FIXTURE);
+    await db.exec("UPDATE sessions.session_directory SET deleted_at = now() WHERE session_id = 's2' AND workspace_id = 'ws-a'");
+    const days = await activity(db, "ws-a", "2026-10-02T00:00:00Z", "2026-10-04T23:59:59Z");
+    expect(days.some(([, harness]) => harness === "claude")).toBe(false);
+    expect(ids(await list(db, {}))).toEqual(["s1", "s3", "s4"]);
+  });
 
   test("counts each session on every UTC day of its span, clipped to the window, per harness", async () => {
     const db = await database();
@@ -605,6 +690,75 @@ describe("catalog writer and projector", () => {
       })).written,
     ).toBe(false);
   });
+
+  const EMPTY = {
+    agentNames: [] as string[], models: [] as string[], projectKey: null, projectKeyMethod: null,
+    initialCommit: null, originator: null, agentVersion: null,
+    relationships: [] as Array<{ relationshipUid: string; childSessionId: string | null }>,
+  };
+  const dirKey = (sessionId: string) => ({ orgId: "org-a", workspaceId: "ws-a", harness: "codex", sessionId });
+
+  test("an erased child leaves no edge, id or count on a live parent, by tombstone or by delete (M2)", async () => {
+    const db = await database();
+    await seed(db, [
+      { id: "parent", created: "2026-10-01T00:00:00Z", last: "2026-10-05T00:00:00Z" },
+      { id: "kid-a", created: "2026-10-02T00:00:00Z", last: "2026-10-03T00:00:00Z" },
+      { id: "kid-b", created: "2026-10-02T00:00:00Z", last: "2026-10-03T00:00:00Z" },
+    ]);
+    await writeDirectoryCatalog(db as never, dirKey("parent"), {
+      ...EMPTY,
+      relationships: [
+        { relationshipUid: "ra", childSessionId: "kid-a" },
+        { relationshipUid: "rb", childSessionId: "kid-b" },
+      ],
+    });
+    const parent = async () => (await list(db, {})).find((row) => row.session_id === "parent")!;
+    expect((await parent()).child_session_count).toBe(2);
+    // Tombstone kid-a (any writer), hard-delete kid-b (erasure).
+    await db.exec("UPDATE sessions.session_directory SET deleted_at = now() WHERE session_id = 'kid-a'");
+    await db.exec("DELETE FROM sessions.session_directory WHERE session_id = 'kid-b'");
+    expect((await parent()).child_session_count).toBe(0);
+    const edges = await db.query("SELECT child_session_id FROM sessions.session_directory_relationships");
+    expect(edges.rows).toEqual([]);
+    // A re-delivered parent cannot bring the tombstoned child's id back.
+    await writeDirectoryCatalog(db as never, dirKey("parent"), {
+      ...EMPTY,
+      relationships: [{ relationshipUid: "ra", childSessionId: "kid-a" }],
+    });
+    expect((await parent()).child_session_count).toBe(0);
+  });
+
+  test("the catalog writer is one statement and never outlives a tombstone, in either order (M3)", async () => {
+    const db = await database();
+    await seed(db, [
+      { id: "p", created: "2026-10-01T00:00:00Z", last: "2026-10-05T00:00:00Z" },
+      { id: "c", created: "2026-10-02T00:00:00Z", last: "2026-10-03T00:00:00Z" },
+    ]);
+    // One statement: atomic on any executor, with the live row locked FOR UPDATE first.
+    let statements = 0;
+    const counting = {
+      query: (text: string, params?: unknown[]) => {
+        statements++;
+        expect(text).toMatch(/FOR UPDATE/);
+        return db.query(text, params);
+      },
+    };
+    const write = { ...EMPTY, agentNames: ["bot"], relationships: [{ relationshipUid: "r", childSessionId: "c" }] };
+    expect((await writeDirectoryCatalog(counting as never, dirKey("p"), write)).written).toBe(true);
+    expect(statements).toBe(1);
+    // Tombstone after the write: its triggers remove the agents and edges.
+    await db.exec("UPDATE sessions.session_directory SET deleted_at = now() WHERE session_id = 'p'");
+    const left = async () =>
+      (
+        await db.query(`SELECT 1 FROM sessions.session_directory_agents WHERE session_id = 'p'
+                        UNION ALL SELECT 1 FROM sessions.session_directory_relationships WHERE parent_session_id = 'p'`)
+      ).rows.length;
+    expect(await left()).toBe(0);
+    expect((await list(db, {})).find((row) => row.session_id === "c")!.parent_session_ids).toEqual([]);
+    // Tombstone before the write: nothing is written.
+    expect((await writeDirectoryCatalog(db as never, dirKey("p"), write)).written).toBe(false);
+    expect(await left()).toBe(0);
+  });
 });
 
 type Plan = { [key: string]: unknown; Plans?: Plan[]; "Index Name"?: string };
@@ -626,6 +780,12 @@ describe("list_session_directory query plans", () => {
              CASE WHEN n % 1000 = 0 THEN ARRAY['rare-' || n] ELSE ARRAY['u-' || (n % 200), 'u-' || ((n + 7) % 200)] END,
              ARRAY['agent-' || (n % 300)]
         FROM generate_series(1, 20000) AS n;
+      -- Other tenants' rows: the directory is one multi-tenant table, so a seq scan's cost
+      -- grows with every tenant while a companion probe's does not.
+      INSERT INTO sessions.session_directory
+        (org_id, workspace_id, harness, session_id, created_at, last_activity_at)
+      SELECT 'other-org-' || (n % 50), 'w', 'codex', 'o-' || n, now(), now()
+        FROM generate_series(1, 60000) AS n;
       INSERT INTO sessions.session_directory_users
       SELECT d.org_id, d.workspace_id, d.harness, d.session_id, u, d.last_activity_at
         FROM sessions.session_directory AS d, unnest(d.user_ids) AS u;
@@ -671,8 +831,8 @@ describe("list_session_directory query plans", () => {
       ["workspace", flags({}), params({}), "session_directory_workspace_recent_idx"],
       ["one source", flags({ 0: 1 }), params({ 3: ["gemini"] }), "session_directory_harness_recent_idx"],
       ["project substring", flags({ 1: true }), params({ 4: "%needle-project%" }), "session_directory_tenant_project_text_trgm_idx"],
-      ["one user", flags({ 2: 1 }), params({ 5: ["u-12"] }), "session_directory_users_recent_idx"],
-      ["several users", flags({ 2: 2 }), params({ 5: ["u-12", "u-13"] }), "session_directory_users_recent_idx"],
+      ["one user", flags({ 2: 1 }), params({ 5: ["rare-2000"] }), "session_directory_users_recent_idx"],
+      ["several users", flags({ 2: 2 }), params({ 5: ["rare-2000", "rare-4000"] }), "session_directory_users_recent_idx"],
       ["agent", flags({ 3: true }), params({ 6: "agent-42" }), "session_directory_agents_recent_idx"],
       ["agent + cursor", flags({ 3: true, 9: true }), params({ 6: "agent-42", 11: "2026-01-10T00:00:00Z", 12: "s-1", 13: "codex" }), "session_directory_agents_recent_idx"],
       ["batch keys", flags({ 8: true }), params({ 15: ["codex", "claude"], 16: ["s-8", "s-9"] }), ["session_directory_pkey", "session_directory_session_lookup_idx"]],

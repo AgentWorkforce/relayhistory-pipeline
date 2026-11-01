@@ -30,10 +30,19 @@ relayhistory's `project_delivery_catalog_row` performs.
 A project key that is a local path is never stored. This covers method `path`,
 absolute paths, `~`, drive letters, UNC paths and `file:` paths.
 
-**Not wired yet.** No pipeline stage calls `writeDirectoryCatalog` yet. Until a
-stage does, the agent filter, the catalog fields and parent/child links are
-empty for new sessions. The natural caller is the relayhistory transform
-completion in the indexer, which already holds the projection rows.
+**Not wired yet.** No pipeline stage calls `writeDirectoryCatalog` yet: the
+relayhistory transform builds the projection rows but writes only a normalized
+object, and no indexer stage reads it back. Until a stage does and the backfill
+runs, the catalog fields and parent/child links are empty, and the list
+**refuses `p_agent`** with `0A000 agent_filter_not_ready` instead of answering
+an empty list. relayhistory-cloud falls back to Neon on that error. An operator
+unlocks it with
+`UPDATE sessions.session_directory_catalog_rollout SET completed_at = now()`
+once the backfill is complete.
+
+`writeDirectoryCatalog` is one statement. It locks the live directory row
+(`FOR UPDATE`) and joins every write to that lock, so a tombstone either
+commits first (nothing is written) or waits and then removes what was written.
 
 ## RPCs
 
@@ -61,17 +70,26 @@ It returns up to `p_limit + 1` rows, newest activity first.
 span semantics: a session counts on every UTC day from its first to its last
 activity. The window is at most 366 days.
 
-Plans by filter shape, each pinned by an EXPLAIN test on 20,000 rows with a
-selective value:
+**Ordering.** Every page is ordered, and every cursor compared, on the
+directory row's `(last_activity_at, session_id, harness)`. The agent and user
+companions are membership filters only. A trigger also keeps every companion's
+`last_activity_at` equal to the row's in the row's own transaction, so a stale
+companion can neither repeat nor skip a session.
+
+**Erasure.** Triggers on tombstone and on delete remove the session's agent
+rows, the edges it delivered as a parent, and the edges live parents hold
+naming it as a child.
+
+Plans by filter shape, each pinned by an EXPLAIN test (20,000 tenant rows plus
+60,000 other-tenant rows) with a selective value:
 
 | shape | index |
 | --- | --- |
 | no filter | `session_directory_workspace_recent_idx` |
 | one source | `session_directory_harness_recent_idx` (org, workspace, harness, last_activity_at DESC) |
 | project substring | `session_directory_tenant_project_text_trgm_idx` (new; trigram over id, key and repo) |
-| one user | `session_directory_users_recent_idx` |
-| several users | `session_directory_users_recent_idx`, one bounded ordered walk per user (LATERAL), deduplicated |
-| agent | `session_directory_agents_recent_idx` (new; org, workspace, lower(agent), last_activity_at DESC) |
+| one or several users | `session_directory_users_recent_idx` (membership probe), then the directory primary key and a sort |
+| agent | `session_directory_agents_recent_idx` (new; membership probe), then a sort |
 | batch keys | a key index (`session_directory_session_lookup_idx` or the primary key) |
 
 A tenant-prefixed GIN over `user_ids` was tried and dropped. Its

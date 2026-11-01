@@ -138,9 +138,20 @@ export function directoryCatalogFromProjection(
 
 /**
  * Store one session's catalog on its live directory row and replace its agent and
- * relationship rows. A tombstoned or absent row is left alone (returns written: false):
- * the catalog is written after the pointer projection, never before it. The agent rows
- * carry the directory row's last_activity_at, which the projector keeps current.
+ * relationship rows, in ONE statement (atomic on any executor, no transaction needed).
+ *
+ * The statement first locks the live row (`SELECT ... FOR UPDATE`). Every write joins
+ * that lock, so:
+ *   - a tombstone that committed first leaves no live row: nothing is written
+ *     (returns written: false);
+ *   - a tombstone that arrives later blocks on the row lock until this statement
+ *     commits, and its triggers (session_directory_forget_catalog) then remove what
+ *     this wrote. No agent row or parent edge can outlive the tombstone (M3, #124 review).
+ *
+ * Agent rows copy the locked row's last_activity_at; the companions_follow trigger keeps
+ * them in step afterwards. An edge naming a child whose directory row is a tombstone is
+ * not written, so a re-delivered parent cannot reintroduce an erased child's id. (A child
+ * whose row was hard-deleted is indistinguishable from one not uploaded yet.)
  */
 export async function writeDirectoryCatalog(
   db: SqlExecutor,
@@ -172,25 +183,69 @@ export async function writeDirectoryCatalog(
       },
     })),
   ]);
-  const params = [key.orgId, key.workspaceId, key.harness, key.sessionId];
-  const updated = await db.query<{ last_activity_at: Date }>(
-    `UPDATE sessions.session_directory AS d
-        SET agent_names = $5::text[], catalog_models = $6::text[],
-            project_key = $7, project_key_method = $8, initial_commit = $9,
-            originator = $10, agent_version = $11,
-            -- The scalar agent the search RPC filters on: keep one already projected,
-            -- else the first catalog agent, and rebuild the search document with it.
-            agent_name = coalesce(d.agent_name, ($5::text[])[1]),
-            agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))),
-            search_text = sessions.session_directory_search_text(
-              d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), d.project_id,
-              d.git_repo, d.git_branch, d.model, d.short_summary),
-            catalog_projected_at = now()
-      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
-        AND d.deleted_at IS NULL
-      RETURNING d.last_activity_at`,
+  const { rows } = await db.query<{ written: boolean }>(
+    `WITH live AS MATERIALIZED (
+       SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at
+         FROM sessions.session_directory AS d
+        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+          AND d.deleted_at IS NULL
+        FOR UPDATE
+     ), updated AS (
+       UPDATE sessions.session_directory AS d
+          SET agent_names = $5::text[], catalog_models = $6::text[],
+              project_key = $7, project_key_method = $8, initial_commit = $9,
+              originator = $10, agent_version = $11,
+              -- The scalar agent the search RPC filters on: keep one already projected,
+              -- else the first catalog agent, and rebuild the search document with it.
+              agent_name = coalesce(d.agent_name, ($5::text[])[1]),
+              agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))),
+              search_text = sessions.session_directory_search_text(
+                d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), d.project_id,
+                d.git_repo, d.git_branch, d.model, d.short_summary),
+              catalog_projected_at = now()
+         FROM live AS l
+        WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id
+          AND d.harness = l.harness AND d.session_id = l.session_id
+       RETURNING d.org_id
+     ), drop_agents AS (
+       DELETE FROM sessions.session_directory_agents AS a
+        USING live AS l
+        WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id
+          AND a.harness = l.harness AND a.session_id = l.session_id
+          AND NOT (a.agent_name_normalized = ANY ($12::text[]))
+     ), put_agents AS (
+       INSERT INTO sessions.session_directory_agents
+         (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at)
+       SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at
+         FROM live AS l, unnest($5::text[]) AS x(name)
+       ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized)
+       DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at
+     ), edges AS (
+       SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child
+         FROM live AS l, unnest($13::text[], $14::text[]) AS e(uid, child)
+        WHERE e.child IS NULL OR NOT EXISTS (
+          SELECT 1 FROM sessions.session_directory AS c
+           WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id
+             AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL)
+     ), drop_edges AS (
+       DELETE FROM sessions.session_directory_relationships AS r
+        USING live AS l
+        WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id
+          AND r.harness = l.harness AND r.parent_session_id = l.session_id
+          AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e))
+     ), put_edges AS (
+       INSERT INTO sessions.session_directory_relationships
+         (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id)
+       SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e
+       ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid)
+       DO UPDATE SET child_session_id = excluded.child_session_id
+     )
+     SELECT EXISTS (SELECT 1 FROM updated) AS written`,
     [
-      ...params,
+      key.orgId,
+      key.workspaceId,
+      key.harness,
+      key.sessionId,
       catalog.agentNames,
       catalog.models,
       catalog.projectKey,
@@ -198,45 +253,10 @@ export async function writeDirectoryCatalog(
       catalog.initialCommit,
       catalog.originator,
       catalog.agentVersion,
+      catalog.agentNames.map(normalizeDirectoryAgent),
+      catalog.relationships.map((edge) => edge.relationshipUid),
+      catalog.relationships.map((edge) => edge.childSessionId),
     ],
   );
-  if (updated.rows.length === 0) return { written: false };
-  await db.query(
-    `DELETE FROM sessions.session_directory_agents
-      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4
-        AND NOT (agent_name_normalized = ANY ($5::text[]))`,
-    [...params, catalog.agentNames.map(normalizeDirectoryAgent)],
-  );
-  if (catalog.agentNames.length > 0)
-    await db.query(
-      `INSERT INTO sessions.session_directory_agents
-         (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at)
-       SELECT d.org_id, d.workspace_id, d.harness, d.session_id, a.name, lower(btrim(a.name)), d.last_activity_at
-         FROM sessions.session_directory AS d, unnest($5::text[]) AS a(name)
-        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
-       ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized)
-       DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at`,
-      [...params, catalog.agentNames],
-    );
-  await db.query(
-    `DELETE FROM sessions.session_directory_relationships
-      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND parent_session_id = $4
-        AND NOT (relationship_uid = ANY ($5::text[]))`,
-    [...params, catalog.relationships.map((edge) => edge.relationshipUid)],
-  );
-  if (catalog.relationships.length > 0)
-    await db.query(
-      `INSERT INTO sessions.session_directory_relationships
-         (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id)
-       SELECT $1, $2, $3, $4, e.uid, e.child
-         FROM unnest($5::text[], $6::text[]) AS e(uid, child)
-       ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid)
-       DO UPDATE SET child_session_id = excluded.child_session_id`,
-      [
-        ...params,
-        catalog.relationships.map((edge) => edge.relationshipUid),
-        catalog.relationships.map((edge) => edge.childSessionId),
-      ],
-    );
-  return { written: true };
+  return { written: rows[0]?.written === true };
 }
