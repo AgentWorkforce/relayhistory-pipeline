@@ -97,7 +97,34 @@ bucket, and they are removed with it.
 This is component isolation, not machine isolation. AlleyOop and the workers
 serve every machine by design, so no per-machine prefix scope applies to them.
 Machine binding stays at the AlleyOop HTTP gate, which is the only path a
-courier has to the bucket. The reviewed RelayAuth #113
+courier has to the bucket.
+
+Live evidence, 2026-11-01, GCP conformance, merge `63788ff` deployed as
+`df13a37`. The first apply failed closed: `setIamPolicy` returned 400 for a
+service account created a second earlier, so no pod changed identity and
+nothing was deleted. The retry fix in `df13a37` then applied cleanly. The
+plan's only creates and deletes were the reviewed IAM set: 8 creates and 5
+deletes, with no bucket, Cloud SQL, Redis or GKE change. All four 96Bulls
+deployments were restarted onto their new identities. Each Kubernetes service
+account then ran a short-lived probe pod that called the GCS JSON API with its
+own Workload Identity token, on a dedicated `v1/ws=proof-iam/…` prefix.
+
+| Identity | list / read | own writes | foreign or unscoped writes |
+| --- | --- | --- | --- |
+| before: all three ran as `<stage>-runtime` | 200 | 200 / 204 | **200** (proxy and worker could write manifests, chunks, anything) |
+| `cloud-sql-proxy` → `<stage>-runtime` | 403 | 403 | 403 |
+| `bulls96-alleyoop` → `<stage>-alleyoop` | 200 | manifest, overwrite, parked, `.zst` chunk 200; deletes 204 | summary, `other.txt`, outside `v1/`: 403 |
+| `bulls96-worker` → `<stage>-worker` | 200 | short and long summaries, overwrite 200; deletes 204 | manifest write and delete, chunk, outside `v1/`: 403 |
+
+Every probe object and version was removed afterwards (`leftover-objects 0`).
+The machine-bound end-to-end verifier then passed again at `df13a37`:
+- claimless assertion: issued without a claim, refused by AlleyOop with 403
+  `machine_claim_refused`, no HoopDB or GCS change;
+- mismatched machine: refused with 403 `machine_claim_refused`, no change;
+- matching machine `proof-gcp-mvybdawo8615d7-a`: chunk and manifest landed,
+  two encrypted summaries were written by the worker identity, index,
+  directory and 6 event rows, all five required stages `ok`, zero dead
+  letters, and trace verdict `indexed`. The reviewed RelayAuth #113
 image/chart and the services image containing this change are pinned in
 `versions.lock.json`.
 
