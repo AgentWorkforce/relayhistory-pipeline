@@ -65,6 +65,16 @@ export const RELAYCAST_PUBLISHED_CHART = {
     "cdfc41cb6202fd81beb17cb57d5fbbdecaf27fa427f51faa07c5ec0fc116744f",
 } as const;
 
+/** Published RelayAuth chart containing the PR #113 machine-bound issuer contract. */
+export const RELAYAUTH_PUBLISHED_CHART = {
+  version: versionsLock.charts.relayauth.version,
+  packageDigest: versionsLock.charts.relayauth.packageDigest,
+  ociDigest: versionsLock.charts.relayauth.ociDigest,
+  repository: versionsLock.images.relayauth.ref,
+  imageDigest: versionsLock.images.relayauth.digest,
+  sourceRevision: versionsLock.images.relayauth.sourceRevision,
+} as const;
+
 /**
  * The only services image the GCP proof may run. Updating a digest alone is
  * insufficient: the release commit must record the exact source revision and
@@ -123,24 +133,52 @@ export interface CapturedRelaycastChartPackage {
   readonly sourcePath: string;
 }
 
-/** Read once, then verify those exact bytes. Callers must never reopen sourcePath. */
-export function captureRelaycastChartPackage(
+export type CapturedRelayauthChartPackage = CapturedRelaycastChartPackage;
+
+function capturePublishedChartPackage(
   path: string,
+  label: string,
+  version: string,
+  expectedDigest: string,
 ): CapturedRelaycastChartPackage {
   let bytes: Buffer;
   try {
     bytes = readFileSync(path);
   } catch {
     throw new Error(
-      `96bulls: Relaycast chart package is missing; expected the published 0.1.0 artifact at ${path}. Nothing was created.`,
+      `96bulls: ${label} chart package is missing; expected the published ${version} artifact at ${path}. Nothing was created.`,
     );
   }
   const digest = createHash("sha256").update(bytes).digest("hex");
-  if (digest !== RELAYCAST_PUBLISHED_CHART.packageDigest)
+  if (digest !== expectedDigest.replace(/^sha256:/, ""))
     throw new Error(
-      "96bulls: Relaycast chart package digest does not match published 0.1.0. Nothing was created.",
+      `96bulls: ${label} chart package digest does not match published ${version}. Nothing was created.`,
     );
   return { bytes, digest, sourcePath: path };
+}
+
+/** Read once, then verify those exact bytes. Callers must never reopen sourcePath. */
+export function captureRelaycastChartPackage(
+  path: string,
+): CapturedRelaycastChartPackage {
+  return capturePublishedChartPackage(
+    path,
+    "Relaycast",
+    RELAYCAST_PUBLISHED_CHART.version,
+    RELAYCAST_PUBLISHED_CHART.packageDigest,
+  );
+}
+
+/** Capture the reviewed RelayAuth package before any provider or state initialization. */
+export function captureRelayauthChartPackage(
+  path: string,
+): CapturedRelayauthChartPackage {
+  return capturePublishedChartPackage(
+    path,
+    "RelayAuth",
+    RELAYAUTH_PUBLISHED_CHART.version,
+    RELAYAUTH_PUBLISHED_CHART.packageDigest,
+  );
 }
 
 export function isPublishedHelmRepo(repo: string | undefined): boolean {
@@ -268,6 +306,7 @@ const GCP_STAGE = /^gcp-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const PROJECT_NUMBER = /^[0-9]{6,20}$/;
 const REGION = /^[a-z]+(?:-[a-z0-9]+)+[0-9]$/;
 const SEMVER = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
+const POSTGRES_ROLE = /^[A-Za-z_][A-Za-z0-9_$-]{0,62}$/;
 const KUBERNETES_NAME = /^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$/;
 const EXECUTOR_IDENTITY =
   /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
@@ -460,6 +499,14 @@ export function assertGcpInputs(
   }
   if (inputs.relayauth) {
     requireSemver("relayauth.chartVersion", inputs.relayauth.chartVersion);
+    if (
+      requestedCommand !== "destroy" &&
+      (inputs.relayauth.chartVersion !== RELAYAUTH_PUBLISHED_CHART.version ||
+        !isPublishedHelmRepo(inputs.chartRepo))
+    )
+      throw new Error(
+        `96bulls: relayauth must use published chart ${RELAYAUTH_PUBLISHED_CHART.version} from the AgentWorkforce helm repository. Nothing was created.`,
+      );
     requireSecretName(
       "relayauth.existingSecretName",
       inputs.relayauth.existingSecretName,
@@ -491,10 +538,18 @@ export function assertGcpInputs(
         "96bulls: bulls96.enabled requires managedDataPlane.provision with acknowledgement=adapter-proof-only",
       );
     requireSemver("bulls96.chartVersion", inputs.bulls96.chartVersion);
-    const [major, minor] = inputs.bulls96.chartVersion.split(".").map(Number);
-    if (!(major! > 0 || (major === 0 && minor! >= 3)))
+    const [major, minor, patch] = inputs.bulls96.chartVersion.split(".").map(Number);
+    const supportsMigrationCredential =
+      major! > 0 || (major === 0 && (minor! > 3 || (minor === 3 && patch! >= 2)));
+    const supportedLegacyRelease = major! > 0 || (major === 0 && minor! >= 3);
+    if (
+      (requestedCommand === "destroy" && !supportedLegacyRelease) ||
+      (requestedCommand !== "destroy" && !supportsMigrationCredential)
+    )
       throw new Error(
-        "96bulls: bulls96.chartVersion must be 0.3.0 or newer so the worker chart accepts pod identity and extraEnv",
+        requestedCommand === "destroy"
+          ? "96bulls: bulls96.chartVersion must be 0.3.0 or newer"
+          : "96bulls: bulls96.chartVersion must be 0.3.2 or newer so the migration Job can use a separate owner credential",
       );
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(inputs.bulls96.tenantOrgId))
       throw new Error(
@@ -504,6 +559,16 @@ export function assertGcpInputs(
       "bulls96.existingSecretName",
       inputs.bulls96.existingSecretName,
     );
+    if (requestedCommand !== "destroy") {
+      if (!POSTGRES_ROLE.test(inputs.bulls96.hoopdbRuntimeRole ?? ""))
+        throw new Error(
+          "96bulls: bulls96.hoopdbRuntimeRole must name the dedicated non-owner PostgreSQL login role",
+        );
+      if (inputs.bulls96.hoopdbRuntimeRoleLogin !== true)
+        throw new Error(
+          "96bulls: bulls96.hoopdbRuntimeRoleLogin must be true for the GCP runtime login",
+        );
+    }
     if (!/^sha256:[a-f0-9]{64}$/.test(inputs.bulls96.imageDigest))
       throw new Error(
         "96bulls: bulls96.imageDigest must be an immutable sha256 digest",
@@ -587,6 +652,15 @@ export function assertGcpRuntimeDeployable(
       inputs.bulls96.imageDigest,
       inputs.bulls96.imageSourceRevision,
     );
+  if (
+    inputs.bulls96?.enabled &&
+    requestedCommand !== "destroy" &&
+    (!POSTGRES_ROLE.test(inputs.bulls96.hoopdbRuntimeRole ?? "") ||
+      inputs.bulls96.hoopdbRuntimeRoleLogin !== true)
+  )
+    throw new Error(
+      "96bulls: GCP runtime deploy requires an explicit dedicated HoopDb runtime role and login mode. Nothing was created.",
+    );
 }
 
 export function assertGcpSqlPostConfirmation(
@@ -638,9 +712,21 @@ export function relaycastChartValues(
 export function relayauthChartValues(
   i: RelayAuthChartInputs,
   defaultStorageClass = "standard-rwo",
+  requestedCommand?: AlchemyStackCommand,
 ) {
+  if (
+    requestedCommand !== "destroy" &&
+    i.chartVersion !== RELAYAUTH_PUBLISHED_CHART.version
+  )
+    throw new Error(
+      `96bulls: relayauth chart is not the published ${RELAYAUTH_PUBLISHED_CHART.version} machine-bound contract. Nothing was created.`,
+    );
   return {
     replicaCount: 1,
+    image: {
+      repository: RELAYAUTH_PUBLISHED_CHART.repository,
+      digest: RELAYAUTH_PUBLISHED_CHART.imageDigest,
+    },
     existingSecret: i.existingSecretName,
     // The conformance History origin is an in-cluster HTTP service. RelayAuth
     // remains fail-closed for public HTTP origins; this chart switch permits
@@ -813,7 +899,16 @@ function publicCaBundle(value: unknown): void {
 export function bulls96ReleaseValues(
   i: NonNullable<GcpInputs["bulls96"]>,
   managed: Bulls96ReleaseOutputs,
+  requestedCommand?: AlchemyStackCommand,
 ): Record<string, unknown> {
+  if (
+    requestedCommand !== "destroy" &&
+    (!POSTGRES_ROLE.test(i.hoopdbRuntimeRole ?? "") ||
+      i.hoopdbRuntimeRoleLogin !== true)
+  )
+    throw new Error(
+      "96bulls: GCP release values require an explicit dedicated HoopDb runtime role and login mode. Nothing was created.",
+    );
   if (!GSA_EMAIL.test(managed.workloadIdentityEmail))
     throw new Error(
       "96bulls: workload identity email is not a service-account email. Nothing was created.",
@@ -888,14 +983,22 @@ export function bulls96ReleaseValues(
       hoopdb: hoopdb(),
       locker: locker(),
       lockerInit: { enabled: false },
-      migrations: { supabaseShim: true },
+      migrations: {
+        // The Cloud SQL operator bootstrap creates the fixed compatibility roles. The
+        // generic shim requires SUPERUSER for service_role BYPASSRLS and is forbidden.
+        supabaseShim: false,
+        hoopdb: {
+          existingSecret: i.existingSecretName,
+          key: "HOOPDB_MIGRATION_URL",
+        },
+      },
       summaryEncryption: {
         existingSecret: i.existingSecretName,
         key: "SUMMARY_MASTER_KEYS",
       },
       serviceAccount: { annotations: { ...identity } },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
-      // Cloud SQL is plain Postgres: selfhosted mode, the shim on, an explicit runtime role.
+      // Cloud SQL has an explicit mode, externally bootstrapped roles and runtime role.
       extraEnv: [
         ...dataEnv(),
         ...gcpHoopdbModeEnv(i.hoopdbRuntimeRole, i.hoopdbRuntimeRoleLogin),
@@ -944,21 +1047,24 @@ export function relayflowsChartValues(
 
 /**
  * The GCP migrator's explicit profile: Cloud SQL is plain Postgres dedicated to HoopDb,
- * so selfhosted mode, the shim on, the exact global function default for the owner and
- * superusers (installed by supabase/bootstrap/hoopdb_function_default_revoke.sql), and the
- * dedicated runtime role. Cloud SQL gives the operator no superuser and its internal
- * cloudsqladmin cannot be altered (expected, not observed live), so that bootstrap cannot
- * run and the migrator's function-boundary gate stays refused (fail closed) until a
- * reviewed control exists (#98).
+ * so cloudsql mode, the generic shim off, external provisioning for compatibility roles, the
+ * owner-scoped global function default, and the dedicated runtime role. The catalog gate
+ * covers every ordinary sessions creator and records Google's fixed cloudsqladmin
+ * platform superuser as an explicit provider trust root.
  */
 export function gcpHoopdbModeEnv(
   runtimeRole?: string,
   runtimeLogin?: boolean,
 ): Array<{ name: string; value: string }> {
   return [
-    { name: "HOOPDB_DB_MODE", value: "selfhosted" },
-    { name: "HOOPDB_SUPABASE_SHIM", value: "true" },
+    { name: "HOOPDB_DB_MODE", value: "cloudsql" },
+    // The worker chart renders HOOPDB_SUPABASE_SHIM exactly once for its
+    // migration Job from worker.migrations.supabaseShim. Adding it to
+    // worker.extraEnv makes the Kubernetes strategic-merge key ambiguous.
     { name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" },
+    // Cloud SQL exposes no customer SUPERUSER. The operator provisions and verifies the
+    // search Worker role before deploy; the migration Job must never try to create it.
+    { name: "HOOPDB_ROLE_BOOTSTRAP", value: "false" },
     ...(runtimeRole
       ? [
           { name: "HOOPDB_RUNTIME_ROLE", value: runtimeRole },

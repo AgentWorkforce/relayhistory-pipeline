@@ -40,10 +40,11 @@ import {
   relayfileChartValues,
   relayflowsChartValues,
   requestedAlchemyCommand,
+  captureRelayauthChartPackage,
   captureRelaycastChartPackage,
   type GcpInputs,
 } from "./config.ts";
-import { prepareRelaycastChart } from "./chart-cache.ts";
+import { prepareRelayauthChart, prepareRelaycastChart } from "./chart-cache.ts";
 import { assertGcpDeploymentTarget, assertGcpProjectConfirmation } from "./deploy-guard.ts";
 import {
   ALCHEMY_GCP_BETA_84_SQL,
@@ -146,6 +147,14 @@ const BOOTSTRAP_RELAYCAST_CHART = BOOTSTRAP_INPUTS.relaycast
       ),
     )
   : null;
+const BOOTSTRAP_RELAYAUTH_CHART =
+  BOOTSTRAP_INPUTS.relayauth && BOOTSTRAP_COMMAND !== "destroy"
+    ? prepareRelayauthChart(
+        captureRelayauthChartPackage(
+          join(ROOT, ".96bulls", BOOTSTRAP_STAGE, "artifacts", "relayauth-0.1.1.tgz"),
+        ),
+      )
+    : null;
 
 const RequireGcpApplyAuthorization = Alchemy.Action<
   "96Bulls.GCP.RequireApplyAuthorization",
@@ -731,12 +740,20 @@ export default Alchemy.Stack(
             });
           return yield* Kubernetes.HelmChart("relayauth", {
             cluster,
-            chart: "relayauth",
-            repo: chartRepo,
-            version: relayauthConfig.chartVersion,
+            ...(BOOTSTRAP_COMMAND === "destroy"
+              ? {
+                  chart: "relayauth",
+                  repo: chartRepo,
+                  version: relayauthConfig.chartVersion,
+                }
+              : { chart: BOOTSTRAP_RELAYAUTH_CHART! }),
             releaseName: "relayauth",
             namespace: Output.map(kubernetesReachability!.proof, () => "relayauth"),
-            values: relayauthChartValues(relayauthConfig, storageClass),
+            values: relayauthChartValues(
+              relayauthConfig,
+              storageClass,
+              BOOTSTRAP_COMMAND,
+            ),
           });
         })
       : null;
@@ -846,7 +863,7 @@ export default Alchemy.Stack(
               pubsubTopic: eventsTopicName,
               pubsubSubscription: eventsSubscriptionName,
               workloadIdentityEmail: runtimeEmail,
-            }),
+            }, BOOTSTRAP_COMMAND),
           });
           return release.releaseName;
         })

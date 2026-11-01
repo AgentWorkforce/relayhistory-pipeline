@@ -1,19 +1,29 @@
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { prepareRelaycastChart } from "../chart-cache.ts";
+import { prepareRelayauthChart, prepareRelaycastChart } from "../chart-cache.ts";
 
-function fixture(root: string) {
+function fixture(root: string, chartName = "relaycast", version = "0.1.0") {
   const source = join(root, "source");
-  const chart = join(source, "relaycast");
+  const chart = join(source, chartName);
   mkdirSync(join(chart, "templates"), { recursive: true });
-  writeFileSync(join(chart, "Chart.yaml"), "apiVersion: v2\nname: relaycast\nversion: 0.1.0\n");
+  writeFileSync(join(chart, "Chart.yaml"), `apiVersion: v2\nname: ${chartName}\nversion: ${version}\n`);
   writeFileSync(join(chart, "templates", "service.yaml"), "kind: Service\n");
-  const artifact = join(root, "relaycast-0.1.0.tgz");
-  execFileSync("tar", ["-czf", artifact, "-C", source, "relaycast"]);
+  const artifact = join(root, `${chartName}-${version}.tgz`);
+  execFileSync("tar", ["-czf", artifact, "-C", source, chartName]);
   const bytes = readFileSync(artifact);
   const digest = createHash("sha256").update(bytes).digest("hex");
   return { artifact, bytes, digest, cacheRoot: join(root, "cache") };
@@ -103,12 +113,69 @@ describe("verified Relaycast chart cache", () => {
     }
   });
 
+  test("materializes RelayAuth from captured bytes without reopening the source", () => {
+    const root = mkdtempSync(join(tmpdir(), "96bulls-relayauth-cache-test-"));
+    try {
+      const { artifact, bytes, digest, cacheRoot } = fixture(root, "relayauth", "0.1.1");
+      const prepared = prepareRelayauthChart(
+        { bytes, digest, sourcePath: artifact },
+        { cacheRoot },
+      );
+      expect(prepared).toContain(join(digest, "relayauth"));
+      expect(readFileSync(join(prepared, "Chart.yaml"), "utf8")).toContain(
+        "name: relayauth",
+      );
+      writeFileSync(artifact, "source changed after capture");
+      expect(
+        prepareRelayauthChart({ bytes, digest, sourcePath: artifact }, { cacheRoot }),
+      ).toBe(prepared);
+      expect(lstatSync(cacheRoot).mode & 0o777).toBe(0o700);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects permissive, symlinked, or attacker-writable cache roots", () => {
+    const root = mkdtempSync(join(tmpdir(), "96bulls-hostile-cache-test-"));
+    try {
+      const { artifact, bytes, digest } = fixture(join(root, "fixture"));
+      const captured = { bytes, digest, sourcePath: artifact };
+
+      const permissive = join(root, "permissive-cache");
+      mkdirSync(permissive, { mode: 0o700 });
+      chmodSync(permissive, 0o777);
+      expect(() =>
+        prepareRelayauthChart(captured, { cacheRoot: permissive }),
+      ).toThrow(/owned by the deploy user with mode 0700/);
+
+      const target = join(root, "symlink-target");
+      mkdirSync(target, { mode: 0o700 });
+      const symlink = join(root, "symlink-cache");
+      symlinkSync(target, symlink, "dir");
+      expect(() =>
+        prepareRelayauthChart(captured, { cacheRoot: symlink }),
+      ).toThrow(/owned by the deploy user with mode 0700/);
+
+      const unsafeParent = join(root, "unsafe-parent");
+      mkdirSync(unsafeParent, { mode: 0o700 });
+      chmodSync(unsafeParent, 0o777);
+      expect(() =>
+        prepareRelayauthChart(captured, {
+          cacheRoot: join(unsafeParent, "cache"),
+        }),
+      ).toThrow(/cache parent is not trusted/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("recovers a dead extractor lock but never steals a live one", () => {
     const root = mkdtempSync(join(tmpdir(), "96bulls-chart-lock-test-"));
     try {
       const dead = fixture(join(root, "dead"));
       const deadLock = join(dead.cacheRoot, `.${dead.digest}.lock`);
       mkdirSync(deadLock, { recursive: true });
+      chmodSync(dead.cacheRoot, 0o700);
       writeFileSync(
         join(deadLock, "owner.json"),
         JSON.stringify({ id: "dead-owner-00000000", pid: 2_147_483_647, createdAtMs: 1 }),
@@ -123,6 +190,7 @@ describe("verified Relaycast chart cache", () => {
       const live = fixture(join(root, "live"));
       const liveLock = join(live.cacheRoot, `.${live.digest}.lock`);
       mkdirSync(liveLock, { recursive: true });
+      chmodSync(live.cacheRoot, 0o700);
       writeFileSync(
         join(liveLock, "owner.json"),
         JSON.stringify({ id: "live-owner-00000000", pid: process.pid, createdAtMs: Date.now() }),

@@ -72,10 +72,12 @@ pods also access GCS directly through their shared Workload Identity runtime
 service account; those bucket-direct operations do not traverse the HTTP
 machine gate. Their boundary is the vended Google credential and its
 bucket-level `roles/storage.objectUser` grant, not `meta.machineId`. Route tests
-therefore prove no bucket-direct isolation. GCP activation remains held until
-the RelayAuth #113 image and a services image containing this change are pinned
-and a new live proof records the request machine, signed claim, matching-route
-success, and claimless/mismatch zero-side-effect refusals.
+therefore prove no bucket-direct isolation. The reviewed RelayAuth #113
+image/chart and the services image containing this change are now pinned in
+`versions.lock.json`. Pinning satisfies the artifact prerequisite only: GCP
+activation remains held until a new live proof records the request machine,
+signed claim, matching-route success, and claimless/mismatch zero-side-effect
+refusals.
 
 The stack entry point is `stacks/gcp/alchemy.gcp.run.ts`. It uses the same
 Alchemy + AgentWorkforce Helm boundary as the AWS stack: cloud code declares
@@ -194,6 +196,23 @@ is ClusterIP and the chart NetworkPolicy accepts callers only from its
 namespace. `baseUrl` remains the chart-required signed-URL authority; it does
 not create public exposure. This is the single-replica SQLite contract, not a
 GCP HA proof.
+
+RelayAuth, when configured, is restricted to published chart `0.1.1` from the
+AgentWorkforce HTTPS Helm index. That release package has SHA-256
+`add6f2b3fe55a301a99b0ab43ad28a84c79767793ae7d66a38281f9d61669121`
+and its public OCI chart manifest is
+`sha256:b73b8566a97a26cfa8739ea194b1ffa627607fa603b3841e3ef2930961e48ac9`.
+The stack also overrides the chart image explicitly to
+`ghcr.io/agentworkforce/relayauth@sha256:c23c92d25fdffef3b5838a1eef4c226925f859706365d9ccece229795b877288`,
+built from reviewed RelayAuth source
+`784582ef983bb72b13b43512d9a4142ef5dfabb2` containing PR #113. A different
+chart version, repository, or default image cannot enter this proof contract.
+Before provider or state initialization, the stack reads the release archive
+once, verifies the recorded package digest, and materializes only those
+captured bytes into the same tamper-detecting local chart cache used by
+Relaycast. Helm never re-resolves the RelayAuth templates from the mutable
+repository index during plan or deploy.
+
 `/readyz` also checks that data path when `LOCKER_PROVIDER=gcs` or
 `WORKER_DATA_PATH_PROBE=1`. Production is not this lane: the production
 database is Supabase and production object storage is AWS S3.
@@ -225,6 +244,10 @@ or secret payload. Example:
   },
   "clearedBy": "Khaliq's exact clearance words, YYYY-MM-DD",
   "managedDataPlane": { "provision": false },
+  "relayauth": {
+    "chartVersion": "0.1.1",
+    "existingSecretName": "relayauth-runtime"
+  },
   "relaycast": {
     "chartVersion": "0.1.0",
     "baseUrl": "https://relay.gcp.example.com"
@@ -238,9 +261,11 @@ To request the application release after its external Secrets exist, set
 ```json
 "bulls96": {
   "enabled": true,
-  "chartVersion": "0.3.0",
+  "chartVersion": "0.3.2",
   "tenantOrgId": "org_replace_me",
   "existingSecretName": "96bulls-runtime",
+  "hoopdbRuntimeRole": "bulls96_runtime",
+  "hoopdbRuntimeRoleLogin": true,
   "imageDigest": "sha256:<digest-built-from-the-reviewed-main-commit>",
   "imageSourceRevision": "<full-40-character-reviewed-main-commit>",
   "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
@@ -266,16 +291,26 @@ for the digest-pinned services image, and the GKE node identity receives
 read-only Artifact Registry access. No GHCR pull token or dockerconfigjson
 Secret is used or required for that path.
 
+The named Secret must keep the two database boundaries separate:
+`HOOPDB_MIGRATION_URL` is the owner connection read only by the one-shot
+migration Job, while `HOOPDB_URL` is the dedicated non-owner login read by
+every long-running 96Bulls workload. `hoopdbRuntimeRole` must be the role named
+by that runtime URL and its login mode must be explicit. The stack refuses to
+render an enabled release without this separation; it never falls back to the
+owner URL for services.
+
 The digest and source revision must exactly match the structured services
 release in `versions.lock.json`, and that release must set
-`gcpProofEligible: true`. The currently recorded `09293c8` image is published
-only in the `awf-conformance-images` repository, so an enabled 96Bulls release
-is refused outside the `gcp-conformance` stage. Substrate-only stages and
-destroy cleanup remain available. A services image release updates the digest,
-full source revision, and eligibility together only after the image build and
-review complete; an arbitrary or merely well-formed digest cannot enable this
-stage. Dispatching `.github/workflows/publish-image-ar.yml` pushes only an
-immutable `sha-<full-revision>` tag of `96bulls-services` into
+`gcpProofEligible: true`. The currently recorded `85101871` image, digest
+`sha256:383839660ef3b6b972d6328b98de5ac09cde8066eed8ee483e8d9f3d6538b187`,
+was published by run `41286919861` only in the
+`awf-conformance-images` repository, so an enabled 96Bulls release is refused
+outside the `gcp-conformance` stage. Substrate-only stages and destroy cleanup
+remain available. A services image release updates the digest, full source
+revision, and eligibility together only after the image build and review
+complete; an arbitrary or merely well-formed digest cannot enable this stage.
+Dispatching `.github/workflows/publish-image-ar.yml` pushes only an immutable
+`sha-<full-revision>` tag of `96bulls-services` into
 `awf-conformance-images` and does not change `versions.lock.json` or
 `gcpProofEligible`.
 
@@ -355,6 +390,13 @@ predates later workspace-bootstrap Secret support, so this lane does not pass
 an ineffective Secret setting. There is no Relaycast Ingress, load balancer,
 ManagedCertificate, or public DNS claim in this stack.
 
+Before evaluating a non-destroy RelayAuth stage, place the exact public release
+artifact at `.96bulls/$STAGE/artifacts/relayauth-0.1.1.tgz`. The stack verifies
+its SHA-256 before constructing Alchemy and renders the captured local chart.
+Destroy deliberately does not require the artifact and accepts an older
+recorded chart version so cleanup of an existing `0.1.0` release cannot be
+blocked by this new proof pin.
+
 ## Exact gaps
 
 These are the current code facts. They are not a cloud proof.
@@ -411,6 +453,23 @@ Release boundaries that remain deliberate:
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
   is written.
+- Cloud SQL runs the migrator with `HOOPDB_DB_MODE=cloudsql`, not the generic
+  self-hosted profile. Before the release, an operator connection as the migration
+  owner runs `cloudsql_owner_function_default_revoke.sql` and
+  `cloudsql_migration_roles.sql`, followed by the canonical Worker verifier. The first
+  script applies the exact owner-scoped function default. The second uses a disposable
+  CREATEROLE trampoline whose removal also removes PostgreSQL 16+ automatic creator
+  memberships; it leaves fixed membership-free, NOLOGIN compatibility roles and never
+  creates a BYPASSRLS role. The generic Supabase shim stays disabled. The catalog gate
+  excludes only Google's immutable `cloudsqladmin` role,
+  only while the catalog marks that exact role SUPERUSER. Every other CREATE-capable
+  role remains covered. The migration Job keeps `HOOPDB_ROLE_BOOTSTRAP=false`.
+- The application runtime uses its own LOGIN role and URL. The migration owner URL is
+  available only to the migration Job. Cloud SQL creates the runtime while assigning
+  the still-empty `anon` role so it never receives `cloudsqlsuperuser`, then the Admin
+  API replaces that role list with an empty list before migrations or workload access.
+  Both credentials are sourced from 1Password; no password is persisted in Alchemy
+  state, input JSON, a repository, or a shell file.
 - The initial 2026-10-30 substrate run did not exercise product routes. The
   later 2026-10-31 application proof recorded above exercised authenticated
   ingest, scrubbed object landing, Cloud SQL indexing/classification, encrypted

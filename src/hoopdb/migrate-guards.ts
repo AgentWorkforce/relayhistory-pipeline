@@ -75,7 +75,7 @@ export function migrationChecksumAlias(
 // ---------------------------------------------------------------------------
 
 export interface RuntimeRoleConfig {
-  mode: "local" | "selfhosted" | "supabase";
+  mode: "local" | "selfhosted" | "cloudsql" | "supabase";
   role: string;
   /** HOOPDB_RUNTIME_ROLE_LOGIN: whether the role logs in itself (true) or is reached through a workload role (false). */
   login?: boolean;
@@ -833,7 +833,18 @@ export const SUPABASE_PLATFORM_SUPERUSERS: readonly string[] = Object.freeze([
   "supabase_admin",
 ]);
 
-/** A platform superuser excluded from creator coverage (supabase mode), with its attributes. */
+/**
+ * Google documents cloudsqladmin as a Cloud SQL system user with database superuser
+ * privileges that customers cannot delete or modify. It is excluded only in cloudsql
+ * mode, only while the catalog still marks it SUPERUSER, and never when it is the
+ * migration owner. No environment variable can extend this list.
+ * https://cloud.google.com/sql/docs/postgres/users#system-users
+ */
+export const CLOUDSQL_PLATFORM_SUPERUSERS: readonly string[] = Object.freeze([
+  "cloudsqladmin",
+]);
+
+/** A fixed provider platform superuser excluded from creator coverage, with its attributes. */
 export interface ExcludedPlatformSuperuser {
   role: string;
   rolsuper: boolean;
@@ -877,13 +888,14 @@ export interface FunctionBoundaryEvidence {
   sessions_create_roles_covered: boolean;
   /**
    * The HOOPDB_DB_MODE the gate ran under ("unspecified" for --activation-check without
-   * it: full coverage). Only "supabase" excludes platform superusers.
+   * it: full coverage). Only provider-specific modes exclude their fixed platform
+   * superusers.
    */
-  db_mode: "local" | "selfhosted" | "supabase" | "unspecified";
+  db_mode: "local" | "selfhosted" | "cloudsql" | "supabase" | "unspecified";
   /**
-   * supabase mode only: CREATE-capable roles left out of sessions_create_roles because
-   * the catalog shows rolsuper AND the name is in SUPABASE_PLATFORM_SUPERUSERS (the
-   * platform trust root). Always empty in other modes.
+   * Provider mode only: CREATE-capable roles left out of sessions_create_roles because
+   * the catalog shows rolsuper AND the name is in that provider's fixed platform list.
+   * Always empty in local, selfhosted and unspecified modes.
    */
   excluded_platform_superusers: ExcludedPlatformSuperuser[];
   /**
@@ -907,7 +919,7 @@ export interface FunctionBoundaryEvidence {
  * next migrate's revoke, unless its creator's global function default is exact-safe.
  * The migrator's function-boundary gate (and --activation-check) therefore requires the
  * mode the deployment selects (HOOPDB_FUNCTION_BOUNDARY_MODE, configuration, not a human
- * sign-off) to be proven by the catalog. It applies in selfhosted and supabase mode; only
+ * sign-off) to be proven by the catalog. It applies outside local mode; only
  * explicit local mode is ungated:
  *   "global-default-revoke": every sessions creator, the migration owner included, has
  *       a global function default of exactly {<self>:EXECUTE} (no other grantee, no grant
@@ -921,7 +933,7 @@ export interface FunctionBoundaryEvidence {
 export async function functionBoundaryEvidence(
   client: GuardClient,
   mode: FunctionBoundaryMode | undefined,
-  dbMode: "local" | "selfhosted" | "supabase" | undefined = undefined,
+  dbMode: "local" | "selfhosted" | "cloudsql" | "supabase" | undefined = undefined,
 ): Promise<FunctionBoundaryEvidence> {
   const head = (
     await client.query<{
@@ -970,11 +982,17 @@ export async function functionBoundaryEvidence(
   const excluded: ExcludedPlatformSuperuser[] = [];
   for (const r of roles) {
     const d = await defaultOf(r.oid);
+    const providerSuperusers =
+      dbMode === "supabase"
+        ? SUPABASE_PLATFORM_SUPERUSERS
+        : dbMode === "cloudsql"
+          ? CLOUDSQL_PLATFORM_SUPERUSERS
+          : [];
     if (
-      dbMode === "supabase" &&
+      providerSuperusers.length > 0 &&
       r.rolsuper === true &&
       r.oid !== head.owner_oid &&
-      SUPABASE_PLATFORM_SUPERUSERS.includes(r.rolname)
+      providerSuperusers.includes(r.rolname)
     ) {
       excluded.push({
         role: r.rolname,

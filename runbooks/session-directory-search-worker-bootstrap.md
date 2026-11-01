@@ -173,15 +173,15 @@ marker: a reader started early, or a migrator that died, simply stays non-ready.
 `src/hoopdb/migrate.ts` resolves an explicit profile **before opening any connection**. It
 never infers anything from the hostname. An invalid profile writes nothing anywhere.
 
-| Variable                        | Contract                                                                                                                                                                                                                                                          |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (CNPG, Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                                                     |
-| `HOOPDB_SUPABASE_SHIM`          | `local` and `selfhosted`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project.                        |
-| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                      |
-| `HOOPDB_RUNTIME_ROLE`           | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                                                |
-| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                        |
-| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                                         |
-| `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted` and `supabase`: `global-default-revoke` (the only implemented mode; the catalog must prove it, see "Function boundary"). `event-trigger` is refused as not implemented, and the old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
+| Variable                        | Contract                                                                                                                                                                                                                                                                      |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (operator-controlled Postgres), `cloudsql` (Google Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                     |
+| `HOOPDB_SUPABASE_SHIM`          | `local`, `selfhosted` and `cloudsql`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project.                        |
+| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                                  |
+| `HOOPDB_RUNTIME_ROLE`           | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                                                            |
+| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                        |
+| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                                                     |
+| `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql` and `supabase`: `global-default-revoke` (the only implemented mode; the catalog must prove it, see "Function boundary"). `event-trigger` is refused as not implemented, and the old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
 
 **Runtime role: dedicated, exact least privilege.** It is checked under the migrator's
 advisory lock before any write (before the ledger and marker tables are created, before
@@ -190,17 +190,24 @@ phase 2 can mark PASS.
 
 - **Missing role:** `runtime_role_missing`.
 - **The migrator itself (owner-as-runtime):** accepted only in `local` (the Docker
-  stack, where one superuser runs everything). Refused in `selfhosted` and `supabase`
+  stack, where one superuser runs everything). Refused in `selfhosted`, `cloudsql` and `supabase`
   (`runtime_role_unsafe`).
 - **Who creates the dedicated role:**
-  - `selfhosted` (CNPG, Cloud SQL): the privileged
+  - `selfhosted` (CNPG): the privileged
     `supabase/bootstrap/hoopdb_runtime_role.sql`, run as a superuser (CNPG `postgres`)
     before migrate on every deploy, like the Worker bootstrap. It is idempotent, creates
     the role with no privileges and never sets a password; the credential is provisioned
-    separately. **Not wired in this repository:** the privileged bootstrap Job that runs it before
-    migrate is the Helm side's (helm-charts #24). Current Helm main has no runtime-role
-    bootstrap Job, so AWS CNPG and GCP stay pending until it lands and the stacks pass
-    `hoopdbRuntimeRole`.
+    separately.
+  - `cloudsql`: the Cloud SQL Admin API creates the dedicated LOGIN user while assigning
+    the already-empty `anon` compatibility role, preventing the API's automatic
+    `cloudsqlsuperuser` membership. Before migrations grant `anon` anything and before
+    the user can reach a workload, the Admin API replaces its database-role list with
+    an empty list (`assign-roles --database-roles= --revoke-existing-roles`). This is an
+    API operation, not a SQL `REVOKE`: PostgreSQL 17 records the API grant under a
+    provider identity that the customer migration owner cannot impersonate. The
+    migrator then verifies the resulting LOGIN-only role and its exact
+    database/schema/object privileges. Its password and URL are stored in 1Password and
+    supplied only through the runtime Secret.
   - `supabase`: pre-provisioned by an operator and verified by the migrator. On PG16+
     the exact unavoidable `postgres` creator edge is accepted only when its grantor is
     the frozen superuser `supabase_admin`, ADMIN is true, INHERIT and SET are false, no
@@ -224,8 +231,8 @@ violation is named:
 - **TEMPORARY is refused**, except for one Supabase-only platform baseline: effective
   TEMPORARY must come solely from PUBLIC, the role must have no direct TEMPORARY ACL or
   PUBLIC GRANT OPTION. A configured workload does not change this database-wide PUBLIC
-  baseline. Local and
-  selfhosted still refuse every effective TEMPORARY grant. This is compatibility, not a
+  baseline. Local, selfhosted and cloudsql still refuse every effective TEMPORARY grant.
+  This is compatibility, not a
   service requirement: no service creates temporary objects or relies on runtime
   `search_path`; see `docs/evidence/runtime-temp-usage.md`.
 - **Approved, and nothing else:** `USAGE` on schema `sessions`; `SELECT` on
@@ -444,14 +451,19 @@ config fails closed.
     and the migration owner stay covered. Excluded roles are listed with their attributes
     in `excluded_platform_superusers`. `selfhosted` keeps the full check, superusers
     included (tested on PG15 and PG17).
-  - **Managed PostgreSQL without a usable superuser (Cloud SQL):** a superuser can
-    always CREATE in `sessions`, so it counts as a creator and needs its own exact
-    default. The bootstrap must run as a superuser and sets every superuser's default. On
-    Cloud SQL the operator has no superuser and the internal `cloudsqladmin` cannot be
-    altered (expected, not observed on a live instance), so the
-    bootstrap cannot run and the gate stays refused there
-    (`function_boundary_unproven`, fail closed). The GCP profile env still selects
-    `global-default-revoke`; activating GCP needs a reviewed control first (#98).
+  - **Google Cloud SQL (`cloudsql` mode):** Google documents `cloudsqladmin` as an
+    immutable system user with database-superuser privileges. The fixed
+    `CLOUDSQL_PLATFORM_SUPERUSERS` allowlist therefore excludes exactly
+    `cloudsqladmin`, only while its catalog row is still SUPERUSER and never when it is
+    the migration owner. No environment setting extends the list. The customer
+    migration owner runs `cloudsql_owner_function_default_revoke.sql`; every ordinary
+    role with effective CREATE in `sessions`, including the owner, remains covered by
+    the catalog gate. `cloudsql_migration_roles.sql` uses and drops a disposable
+    CREATEROLE trampoline; dropping it removes PostgreSQL 16+ automatic creator
+    memberships and leaves `anon`, `authenticated`, `service_role`, and the NOLOGIN
+    Worker membership-free. The Cloud SQL `service_role` is NOBYPASSRLS and exists only
+    to satisfy shared migration grants; the GCP runtime never connects as it. The
+    canonical verifier then proves the Worker role and grants.
 - **Exact default ACL:** the migration owner's `pg_default_acl` row with
   `defaclnamespace = 0` and `defaclobjtype = 'f'` must normalize to EXACTLY
   `{<self>:EXECUTE}`: owner EXECUTE, no grant option, no other grantee. Merely "PUBLIC

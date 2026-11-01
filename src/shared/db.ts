@@ -88,7 +88,7 @@ export interface ExpectedSchema {
   names: string[];
   generation: string;
   /** Exact database mode bound into the role verifier; absent/invalid never enables compatibility exceptions. */
-  dbMode?: "local" | "selfhosted" | "supabase";
+  dbMode?: "local" | "selfhosted" | "cloudsql" | "supabase";
 }
 
 export type SchemaVerdict =

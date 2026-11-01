@@ -14,11 +14,13 @@ import {
   gcpResourceName,
   pubsubServiceAgent,
   relayauthChartValues,
+  RELAYAUTH_PUBLISHED_CHART,
   RELAYCAST_PUBLISHED_CHART,
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
   requestedAlchemyCommand,
+  captureRelayauthChartPackage,
   captureRelaycastChartPackage,
   type GcpInputs,
 } from "../config.ts";
@@ -39,9 +41,18 @@ describe("GCP self-host contract", () => {
   it("pins the reviewed multi-architecture services image for the GCP proof", () => {
     expect(versionsLock.images.services).toMatchObject({
       ref: "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services",
-      digest: "sha256:8d77de9be0b5e5e47dda75986da882e577aafb9e28e510c844e8134fea372425",
-      sourceRevision: "09293c8d649f912aa2f4414e31a3ad7fca6eceee",
+      digest: "sha256:383839660ef3b6b972d6328b98de5ac09cde8066eed8ee483e8d9f3d6538b187",
+      sourceRevision: "85101871f4971e161f203dd1a758b4742b7cfe66",
       gcpProofEligible: true,
+    });
+    expect(versionsLock.images.relayauth).toMatchObject({
+      ref: "ghcr.io/agentworkforce/relayauth",
+      digest: "sha256:c23c92d25fdffef3b5838a1eef4c226925f859706365d9ccece229795b877288",
+      sourceRevision: "784582ef983bb72b13b43512d9a4142ef5dfabb2",
+    });
+    expect(versionsLock.charts.relayauth).toMatchObject({
+      version: "0.1.1",
+      packageDigest: "sha256:add6f2b3fe55a301a99b0ab43ad28a84c79767793ae7d66a38281f9d61669121",
     });
   });
 
@@ -130,9 +141,11 @@ describe("GCP self-host contract", () => {
   it("validates 96Bulls inputs and allows only the acknowledged managed runtime", () => {
     const bulls96 = {
       enabled: true,
-      chartVersion: "0.3.0",
+      chartVersion: "0.3.2",
       tenantOrgId: "org_123",
       existingSecretName: "bulls96-runtime",
+      hoopdbRuntimeRole: "bulls96_runtime",
+      hoopdbRuntimeRoleLogin: true,
       imageDigest: `sha256:${"a".repeat(64)}`,
       imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
@@ -147,6 +160,61 @@ describe("GCP self-host contract", () => {
         bulls96: { ...bulls96, tenantOrgId: "https://user:password@example.com" },
       }),
     ).toThrow("org id");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: {
+          ...bulls96,
+          chartVersion: "0.3.1",
+          imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest,
+        },
+      }),
+    ).toThrow("must be 0.3.2 or newer");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: {
+          ...bulls96,
+          imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest,
+          hoopdbRuntimeRole: undefined,
+        },
+      }),
+    ).toThrow("dedicated non-owner PostgreSQL login role");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: {
+          ...bulls96,
+          imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest,
+          hoopdbRuntimeRole: "bulls96 runtime",
+        },
+      }),
+    ).toThrow("dedicated non-owner PostgreSQL login role");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: {
+          ...bulls96,
+          imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest,
+          hoopdbRuntimeRoleLogin: undefined,
+        },
+      }),
+    ).toThrow("hoopdbRuntimeRoleLogin must be true");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: {
+          ...bulls96,
+          imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest,
+          hoopdbRuntimeRoleLogin: false,
+        },
+      }),
+    ).toThrow("hoopdbRuntimeRoleLogin must be true");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
@@ -213,7 +281,7 @@ describe("GCP self-host contract", () => {
       assertGcpInputs("gcp-dev", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
-        relayauth: { chartVersion: "0.1.0", existingSecretName: "relayauth-runtime", baseUrl: "https://auth.example.com" },
+        relayauth: { chartVersion: "0.1.1", existingSecretName: "relayauth-runtime", baseUrl: "https://auth.example.com" },
         bulls96,
       }),
     ).toThrow("must match relayauth.baseUrl");
@@ -242,6 +310,38 @@ describe("GCP self-host contract", () => {
     );
     expect(() => assertGcpInputs("gcp-dev", approvedRuntime, "destroy")).not.toThrow();
     expect(() => assertGcpRuntimeDeployable("gcp-dev", approvedRuntime, "destroy")).not.toThrow();
+    const legacyDestroy = {
+      ...approvedRuntime,
+      bulls96: {
+        ...approvedRuntime.bulls96,
+        chartVersion: "0.3.0",
+        hoopdbRuntimeRole: undefined,
+        hoopdbRuntimeRoleLogin: undefined,
+      },
+    };
+    expect(() => assertGcpInputs("gcp-dev", legacyDestroy, "destroy")).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", legacyDestroy, "destroy")).not.toThrow();
+    expect(() =>
+      bulls96ReleaseValues(
+        legacyDestroy.bulls96,
+        {
+          bucket: "locker",
+          region: "us-central1",
+          imageRepository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
+          cloudSqlConnectionName: "agentworkforce-dev1:us-central1:awf-dev-postgres",
+          redisHost: "10.52.0.3",
+          redisPort: 6379,
+          redisCaPem: "-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n",
+          pubsubTopic: "projects/agentworkforce-dev1/topics/events",
+          pubsubSubscription: "projects/agentworkforce-dev1/subscriptions/events",
+          workloadIdentityEmail: "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
+        },
+        "destroy",
+      ),
+    ).not.toThrow();
+    expect(readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8")).toContain(
+      "}, BOOTSTRAP_COMMAND)",
+    );
     const recordedButIneligible = {
       ...base,
       managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" as const },
@@ -273,9 +373,11 @@ describe("GCP self-host contract", () => {
     const values = bulls96ReleaseValues(
         {
           enabled: true,
-          chartVersion: "0.3.0",
+          chartVersion: "0.3.2",
           tenantOrgId: "org_123",
           existingSecretName: "bulls96-runtime",
+          hoopdbRuntimeRole: "bulls96_runtime",
+          hoopdbRuntimeRoleLogin: true,
           imageDigest: `sha256:${"a".repeat(64)}`,
           imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
@@ -304,6 +406,28 @@ describe("GCP self-host contract", () => {
     expect(rendered).not.toContain('"REDIS_AUTH"');
     expect(rendered).not.toContain("REDIS_PASSWORD");
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
+    const worker = values.worker as {
+      hoopdb: { existingSecret: string; key: string };
+      migrations: {
+        supabaseShim: boolean;
+        hoopdb: { existingSecret: string; key: string };
+      };
+      extraEnv: Array<{ name: string; value: string }>;
+    };
+    expect(worker.migrations.supabaseShim).toBe(false);
+    expect(worker.hoopdb).toEqual({ existingSecret: "bulls96-runtime", key: "HOOPDB_URL" });
+    expect(worker.migrations.hoopdb).toEqual({
+      existingSecret: "bulls96-runtime",
+      key: "HOOPDB_MIGRATION_URL",
+    });
+    expect(worker.extraEnv.filter(({ name }) => name === "HOOPDB_SUPABASE_SHIM")).toHaveLength(0);
+    expect(worker.extraEnv).toEqual(
+      expect.arrayContaining([
+        { name: "HOOPDB_DB_MODE", value: "cloudsql" },
+        { name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" },
+        { name: "HOOPDB_ROLE_BOOTSTRAP", value: "false" },
+      ]),
+    );
     expect(values).toMatchObject({
       worker: {
         fullnameOverride: "bulls96-worker",
@@ -498,6 +622,64 @@ describe("GCP self-host contract", () => {
     ).toThrow(/published 0\.1\.0/);
   });
 
+  it("rejects an unpublished RelayAuth chart or repository and pins its reviewed image", () => {
+    const relayauth = {
+      chartVersion: "0.1.1",
+      existingSecretName: "relayauth-runtime",
+    };
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        relayauth: { ...relayauth, chartVersion: "0.1.0" },
+      }),
+    ).toThrow(/published chart 0\.1\.1/);
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        chartRepo: "https://example.com/charts",
+        relayauth,
+      }),
+    ).toThrow(/published chart 0\.1\.1/);
+    expect(() => relayauthChartValues({ ...relayauth, chartVersion: "0.1.0" })).toThrow(
+      /published 0\.1\.1 machine-bound contract/,
+    );
+    expect(() =>
+      assertGcpInputs(
+        "gcp-dev",
+        { ...base, relayauth: { ...relayauth, chartVersion: "0.1.0" } },
+        "destroy",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      relayauthChartValues(
+        { ...relayauth, chartVersion: "0.1.0" },
+        "standard-rwo",
+        "destroy",
+      ),
+    ).not.toThrow();
+    expect(relayauthChartValues(relayauth).image).toEqual({
+      repository: RELAYAUTH_PUBLISHED_CHART.repository,
+      digest: RELAYAUTH_PUBLISHED_CHART.imageDigest,
+    });
+  });
+
+  it("captures RelayAuth chart bytes before providers and renders only the verified local chart", () => {
+    const dir = mkdtempSync(join(tmpdir(), "96bulls-relayauth-chart-test-"));
+    try {
+      const path = join(dir, "relayauth-0.1.1.tgz");
+      expect(() => captureRelayauthChartPackage(path)).toThrow(/package is missing/);
+      writeFileSync(path, "not-the-published-chart");
+      expect(() => captureRelayauthChartPackage(path)).toThrow(/digest does not match/);
+      const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+      expect(stack).toContain("captureRelayauthChartPackage");
+      expect(stack).toContain("prepareRelayauthChart");
+      expect(stack).toContain("chart: BOOTSTRAP_RELAYAUTH_CHART!");
+      expect(stack).toContain('BOOTSTRAP_COMMAND !== "destroy"');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects credential-bearing public origins before they reach chart values", () => {
     expect(() =>
       assertGcpInputs("gcp-dev", {
@@ -523,7 +705,7 @@ describe("GCP self-host contract", () => {
 
   it("passes only existing Secret names to charts", () => {
     const auth = relayauthChartValues({
-      chartVersion: "0.1.0",
+      chartVersion: "0.1.1",
       existingSecretName: "relayauth-runtime",
     });
     const file = relayfileChartValues({

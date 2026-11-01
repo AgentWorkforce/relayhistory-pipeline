@@ -13,6 +13,7 @@ import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { schemaVerdict, type Transact } from "../../shared/db.ts";
 import {
+  CLOUDSQL_PLATFORM_SUPERUSERS,
   functionBoundaryEvidence,
   isSupabaseCreatorEdge,
   isSupabasePublicTemp,
@@ -108,7 +109,7 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
     ["no mode", { ...base, HOOPDB_SUPABASE_SHIM: "true" }, "db_mode_invalid"],
     [
       "an unknown mode",
-      { ...base, HOOPDB_DB_MODE: "cloud", HOOPDB_SUPABASE_SHIM: "true" },
+      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_SUPABASE_SHIM: "true" },
       "db_mode_invalid",
     ],
     [
@@ -129,6 +130,11 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
     [
       "selfhosted without an explicit shim choice",
       { ...base, HOOPDB_DB_MODE: "selfhosted" },
+      "shim_unset",
+    ],
+    [
+      "cloudsql without an explicit shim choice",
+      { ...base, HOOPDB_DB_MODE: "cloudsql" },
       "shim_unset",
     ],
     [
@@ -184,6 +190,20 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
         HOOPDB_ROLE_BOOTSTRAP: "false",
       }),
     ).toMatchObject({ shim: true, bootstrap: false });
+    expect(
+      migrationProfile({
+        ...base,
+        HOOPDB_DB_MODE: "cloudsql",
+        HOOPDB_SUPABASE_SHIM: "true",
+        HOOPDB_ROLE_BOOTSTRAP: "false",
+        HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+      }),
+    ).toMatchObject({
+      mode: "cloudsql",
+      shim: true,
+      bootstrap: false,
+      functionBoundary: "global-default-revoke",
+    });
   });
 
   test("migrate() refuses supabase+shim before opening any connection", async () => {
@@ -204,6 +224,17 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
       for (const k of Object.keys(process.env))
         if (!(k in saved)) delete process.env[k];
       Object.assign(process.env, saved);
+    }
+  });
+
+  test("readiness binds the explicit cloudsql database mode", async () => {
+    const saved = process.env.HOOPDB_DB_MODE;
+    try {
+      process.env.HOOPDB_DB_MODE = "cloudsql";
+      expect(await expectedSchema()).toMatchObject({ dbMode: "cloudsql" });
+    } finally {
+      if (saved === undefined) delete process.env.HOOPDB_DB_MODE;
+      else process.env.HOOPDB_DB_MODE = saved;
     }
   });
 });
@@ -1271,6 +1302,130 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     functionBoundary: "global-default-revoke",
   };
   const platformList = [...SUPABASE_PLATFORM_SUPERUSERS];
+
+  test("Cloud SQL trust root: only Google's fixed cloudsqladmin SUPERUSER is excluded in cloudsql mode", async () => {
+    expect(Object.isFrozen(CLOUDSQL_PLATFORM_SUPERUSERS)).toBe(true);
+    expect([...CLOUDSQL_PLATFORM_SUPERUSERS]).toEqual(["cloudsqladmin"]);
+    const db = await supabaseLike();
+    await db.exec(
+      `${OWNER_FN_DEFAULT_REVOKE}; CREATE ROLE cloudsqladmin SUPERUSER NOLOGIN`,
+    );
+    const cloudsql = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "cloudsql",
+    );
+    expect(cloudsql.satisfied).toBe(true);
+    expect(cloudsql.excluded_platform_superusers).toEqual([
+      expect.objectContaining({
+        role: "cloudsqladmin",
+        rolsuper: true,
+        function_default: ["<built-in>"],
+      }),
+    ]);
+    expect(cloudsql.sessions_create_roles.map((c) => c.role)).not.toContain(
+      "cloudsqladmin",
+    );
+    const selfhosted = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "selfhosted",
+    );
+    expect(selfhosted.satisfied).toBe(false);
+    expect(selfhosted.excluded_platform_superusers).toEqual([]);
+    expect(selfhosted.sessions_create_roles).toContainEqual(
+      expect.objectContaining({
+        role: "cloudsqladmin",
+        superuser: true,
+        function_default_exact: false,
+      }),
+    );
+  });
+
+  test("Cloud SQL owner and migration-role bootstraps produce catalog-proven, membership-free state", async () => {
+    const db = new PGlite({
+      username: "cloudsqladmin",
+      database: "postgres",
+      initDbStartParams: ["--username=cloudsqladmin"],
+      extensions: { btree_gin, pg_trgm },
+    });
+    open.push(db);
+    await db.exec(`
+      CREATE ROLE cloudsqlsuperuser NOLOGIN;
+      CREATE ROLE migration_owner LOGIN CREATEROLE;
+      GRANT cloudsqlsuperuser TO migration_owner;
+      GRANT migration_owner TO cloudsqladmin;
+      GRANT CONNECT, CREATE ON DATABASE postgres TO migration_owner;
+      SET ROLE migration_owner;
+      CREATE SCHEMA sessions AUTHORIZATION migration_owner;
+      CREATE FUNCTION sessions.probe() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+    `);
+    await db.exec(
+      readFileSync(
+        join(
+          root,
+          "supabase/bootstrap/cloudsql_owner_function_default_revoke.sql",
+        ),
+        "utf8",
+      ),
+    );
+    const evidence = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "cloudsql",
+    );
+    expect(evidence.satisfied).toBe(true);
+    expect(evidence.owner_function_default).toEqual(["<self>:EXECUTE"]);
+    expect(evidence.excluded_platform_superusers).toEqual([
+      expect.objectContaining({ role: "cloudsqladmin", rolsuper: true }),
+    ]);
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      `SET ROLE migration_owner; ${readFileSync(
+        join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      )}`,
+    );
+    const targets = await db.query<{
+      rolname: string;
+      rolcanlogin: boolean;
+      rolinherit: boolean;
+      rolbypassrls: boolean;
+      memberships: number;
+    }>(
+      `SELECT role.rolname, role.rolcanlogin, role.rolinherit, role.rolbypassrls,
+              (SELECT count(*)::int FROM pg_auth_members membership
+                WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
+         FROM pg_roles role
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker')
+        ORDER BY 1`,
+    );
+    expect(targets.rows).toHaveLength(4);
+    expect(targets.rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          rolname: "service_role",
+          rolbypassrls: false,
+        }),
+        expect.objectContaining({
+          rolname: "session_directory_search_worker",
+          rolcanlogin: false,
+          rolinherit: false,
+          memberships: 0,
+        }),
+      ]),
+    );
+    expect(
+      await db.query(
+        `SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_cloudsql_role_seed'`,
+      ),
+    ).toMatchObject({ rows: [] });
+  });
 
   test("platform trust root: supabase_admin as a superuser with no safe default is excluded in supabase mode (listed with its attributes); the same catalog fails without the exclusion (selfhosted)", async () => {
     expect(platformList).toEqual(["supabase_admin"]);

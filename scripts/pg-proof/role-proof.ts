@@ -55,6 +55,10 @@ const SUPABASE_RUNTIME_BOOT = join(
   ROOT,
   "supabase/bootstrap/hoopdb_runtime_role_supabase.sql",
 );
+const CLOUDSQL_ROLES_BOOT = join(
+  ROOT,
+  "supabase/bootstrap/cloudsql_migration_roles.sql",
+);
 const MARK_PASS = join(
   ROOT,
   "supabase/bootstrap/session_directory_search_worker_mark_pass.sql",
@@ -447,6 +451,11 @@ for (const r of [
   "g6_nobody",
   "supabase_admin",
   "ops_admin",
+  "g6_cloud_owner",
+  "g6_cloud_rt",
+  "cloudsqladmin",
+  "cloudsqlsuperuser",
+  "bulls96_cloudsql_role_seed",
 ]) {
   for (const d of (
     await sql("postgres", "SELECT datname FROM pg_database WHERE datallowconn")
@@ -465,6 +474,111 @@ await sql(
   `DO $x$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hoop') THEN CREATE ROLE hoop LOGIN; END IF; END $x$;
   ALTER ROLE hoop NOSUPERUSER NOCREATEROLE NOCREATEDB NOBYPASSRLS`,
 );
+
+// Cloud SQL is pinned to PostgreSQL 17. Prove its complete fresh-database profile with
+// the migration owner as a real non-superuser session (not SET ROLE): the disposable
+// CREATEROLE trampoline must leave every compatibility role membership-free, the generic
+// BYPASSRLS shim stays off, and the full migrator must pass.
+await check(
+  "Cloud SQL PG17: non-superuser operator bootstrap and full profile pass without the generic shim",
+  async () => {
+    if (MAJOR < 17)
+      return [
+        true,
+        `skipped: Cloud SQL proof is pinned to PostgreSQL 17 (server is ${MAJOR})`,
+      ];
+    await sql(
+      "postgres",
+      `CREATE ROLE cloudsqlsuperuser NOLOGIN;
+       CREATE ROLE cloudsqladmin SUPERUSER NOLOGIN;
+       CREATE ROLE g6_cloud_owner LOGIN CREATEROLE NOBYPASSRLS;
+       GRANT cloudsqlsuperuser TO g6_cloud_owner;
+       CREATE ROLE g6_cloud_rt LOGIN NOCREATEROLE NOCREATEDB NOBYPASSRLS`,
+    );
+    await sql("postgres", "CREATE DATABASE g6_cloud OWNER g6_cloud_owner");
+    await sql(
+      "g6_cloud",
+      `REVOKE TEMPORARY ON DATABASE g6_cloud FROM PUBLIC;
+       GRANT CONNECT ON DATABASE g6_cloud TO g6_cloud_rt;
+       ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`,
+    );
+    await sql(
+      "g6_cloud",
+      "ALTER DEFAULT PRIVILEGES FOR ROLE g6_cloud_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+      "g6_cloud_owner",
+    );
+    const boot = psql(
+      "g6_cloud",
+      ["-f", CLOUDSQL_ROLES_BOOT],
+      "g6_cloud_owner",
+    );
+    const phase1 = psql("g6_cloud", ["-f", BOOT], "g6_cloud_owner");
+    const env = {
+      ...Object.fromEntries(
+        gcpHoopdbModeEnv("g6_cloud_rt", true).map((e) => [e.name, e.value]),
+      ),
+      HOOPDB_SUPABASE_SHIM: "false",
+    };
+    const m = migrate("g6_cloud", env, "g6_cloud_owner");
+    const again = psql(
+      "g6_cloud",
+      ["-f", CLOUDSQL_ROLES_BOOT],
+      "g6_cloud_owner",
+    );
+    const targets = (
+      await sql(
+        "g6_cloud",
+        `SELECT role.rolname, role.rolbypassrls,
+                (SELECT count(*)::int FROM pg_auth_members membership
+                  WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
+           FROM pg_roles role
+          WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker')
+          ORDER BY 1`,
+      )
+    ).rows;
+    const seed = (
+      await sql(
+        "g6_cloud",
+        "SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'bulls96_cloudsql_role_seed'",
+      )
+    ).rows[0].n;
+    const v = await verdict("g6_cloud", "g6_cloud_owner");
+    const ok =
+      boot.ok &&
+      phase1.ok &&
+      again.ok &&
+      m.exit === 0 &&
+      v.ok &&
+      seed === 0 &&
+      targets.length === 4 &&
+      targets.every(
+        (role) => role.memberships === 0 && role.rolbypassrls === false,
+      );
+    return [
+      ok,
+      `bootstrap=${boot.ok} phase1=${phase1.ok} rerun=${again.ok} migrate=${fmt(m)} verdict=${fmt(v)} seed=${seed} targets=${fmt(targets)}`,
+    ];
+  },
+);
+if (MAJOR >= 17) {
+  await attempt("postgres", "DROP DATABASE IF EXISTS g6_cloud WITH (FORCE)");
+  for (const role of [
+    "session_directory_search_worker",
+    "service_role",
+    "authenticated",
+    "anon",
+    "g6_cloud_rt",
+    "g6_cloud_owner",
+    "cloudsqladmin",
+    "cloudsqlsuperuser",
+    "bulls96_cloudsql_role_seed",
+  ])
+    await attempt("postgres", `DROP ROLE IF EXISTS ${role}`);
+  await sql(
+    "postgres",
+    "ALTER DEFAULT PRIVILEGES FOR ROLE postgres GRANT EXECUTE ON FUNCTIONS TO PUBLIC",
+  );
+}
 if (
   !psql("postgres", ["-f", join(ROOT, "supabase/tests/supabase_shim.sql")]).ok
 )
@@ -2070,12 +2184,6 @@ for (const [name, env] of [
     "AWS CNPG fixture env (hoopdbModeEnv)",
     Object.fromEntries(
       hoopdbModeEnv(true, "g6_rt2", true).map((e) => [e.name, e.value]),
-    ),
-  ],
-  [
-    "GCP fixture env (gcpHoopdbModeEnv)",
-    Object.fromEntries(
-      gcpHoopdbModeEnv("g6_rt2", true).map((e) => [e.name, e.value]),
     ),
   ],
 ] as const)

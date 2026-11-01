@@ -11,8 +11,22 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { functionBoundaryEvidence, migrationChecksumAlias, migrationChecksumMatches, runtimeRoleViolations, sequencePreflight, type FunctionBoundaryMode } from "./migrate-guards.ts";
-import { openHoopDb, waitForHoopDb, ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE, ROLE_VERIFY_SQL_PATH, type ExpectedSchema } from "../shared/db.ts";
+import {
+  functionBoundaryEvidence,
+  migrationChecksumAlias,
+  migrationChecksumMatches,
+  runtimeRoleViolations,
+  sequencePreflight,
+  type FunctionBoundaryMode,
+} from "./migrate-guards.ts";
+import {
+  openHoopDb,
+  waitForHoopDb,
+  ROLE_VALIDATION_NAME,
+  ROLE_VALIDATION_TABLE,
+  ROLE_VERIFY_SQL_PATH,
+  type ExpectedSchema,
+} from "../shared/db.ts";
 import { log } from "../shared/log.ts";
 import { optional } from "../shared/env.ts";
 
@@ -24,7 +38,10 @@ const SHIM = join(ROOT, "supabase/tests/supabase_shim.sql");
 // before migrate (runbooks/session-directory-search-worker-bootstrap.md); here it then
 // only verifies the bare role spec, on every run (never ledgered), and fails closed if
 // the role is absent or differs.
-const WORKER_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_directory_search_worker.sql");
+const WORKER_BOOTSTRAP = join(
+  ROOT,
+  "supabase/bootstrap/session_directory_search_worker.sql",
+);
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
 // The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
@@ -42,25 +59,26 @@ interface Step {
  * The database-mode contract. The migrator never infers the target from a hostname:
  * HOOPDB_DB_MODE is required and has no default.
  *   local       the Docker stack: plain Postgres, the migrator is its superuser.
- *   selfhosted  CNPG or Cloud SQL: plain Postgres, a least-privilege migration owner.
+ *   selfhosted  CNPG or another operator-controlled plain Postgres deployment.
+ *   cloudsql    Google Cloud SQL: plain Postgres with Google's fixed platform superuser.
  *   supabase    a Supabase project. The plain-Postgres role shim and the privileged
  *               role bootstrap are refused outright (supabase_shim.sql: "Never apply
  *               this to a Supabase project"); the roles are platform or operator steps.
  * HOOPDB_SUPABASE_SHIM must be set explicitly ("true" or "false") in local and
- * selfhosted mode, and may only be unset or "false" in supabase mode.
+ * selfhosted and cloudsql mode, and may only be unset or "false" in supabase mode.
  * HOOPDB_ROLE_BOOTSTRAP defaults to the shim choice and is likewise refused in supabase
  * mode. HOOPDB_RUNTIME_ROLE (required) names the role the services connect as: it gets
  * SELECT on the ledger and the readiness marker, nothing else.
  * Resolved before any connection; an invalid profile writes nothing anywhere.
  */
-export type DbMode = "local" | "selfhosted" | "supabase";
+export type DbMode = "local" | "selfhosted" | "cloudsql" | "supabase";
 export interface MigrationProfile {
   mode: DbMode;
   shim: boolean;
   bootstrap: boolean;
   verify: boolean;
   runtimeRole: string;
-  /** HOOPDB_RUNTIME_ROLE_LOGIN; required in selfhosted and supabase (the role is dedicated there). */
+  /** HOOPDB_RUNTIME_ROLE_LOGIN; required outside local mode (the role is dedicated there). */
   runtimeLogin?: boolean;
   /** HOOPDB_RUNTIME_WORKLOAD_ROLE: the one role allowed to be a member of the runtime role. */
   workloadRole?: string;
@@ -76,39 +94,87 @@ function profileError(code: string, message: string): Error {
   return Object.assign(new Error(`96bulls: ${message}`), { code });
 }
 
-function strictFlag(env: Record<string, string | undefined>, name: string): boolean | undefined {
+function strictFlag(
+  env: Record<string, string | undefined>,
+  name: string,
+): boolean | undefined {
   const v = env[name];
   if (v === undefined || v === "") return undefined;
   if (v === "1" || v.toLowerCase() === "true") return true;
   if (v === "0" || v.toLowerCase() === "false") return false;
-  throw profileError("db_profile_invalid", `${name} must be "true" or "false" (got "${v}")`);
+  throw profileError(
+    "db_profile_invalid",
+    `${name} must be "true" or "false" (got "${v}")`,
+  );
 }
 
-export function migrationProfile(env: Record<string, string | undefined> = process.env): MigrationProfile {
+export function migrationProfile(
+  env: Record<string, string | undefined> = process.env,
+): MigrationProfile {
   const mode = env.HOOPDB_DB_MODE;
-  if (mode !== "local" && mode !== "selfhosted" && mode !== "supabase") throw profileError("db_mode_invalid", "HOOPDB_DB_MODE must be local, selfhosted or supabase; there is no default");
+  if (
+    mode !== "local" &&
+    mode !== "selfhosted" &&
+    mode !== "cloudsql" &&
+    mode !== "supabase"
+  )
+    throw profileError(
+      "db_mode_invalid",
+      "HOOPDB_DB_MODE must be local, selfhosted, cloudsql or supabase; there is no default",
+    );
   const shim = strictFlag(env, "HOOPDB_SUPABASE_SHIM");
   const bootstrap = strictFlag(env, "HOOPDB_ROLE_BOOTSTRAP");
   const verify = strictFlag(env, "HOOPDB_ROLE_VERIFY") ?? true;
-  if (mode === "supabase" && shim) throw profileError("shim_forbidden", "the plain-Postgres role shim never runs in supabase mode");
-  if (mode === "supabase" && bootstrap) throw profileError("bootstrap_forbidden", "the privileged role bootstrap never runs from the migrator in supabase mode");
-  if (mode !== "supabase" && shim === undefined) throw profileError("shim_unset", `HOOPDB_SUPABASE_SHIM must be set explicitly in ${mode} mode`);
+  if (mode === "supabase" && shim)
+    throw profileError(
+      "shim_forbidden",
+      "the plain-Postgres role shim never runs in supabase mode",
+    );
+  if (mode === "supabase" && bootstrap)
+    throw profileError(
+      "bootstrap_forbidden",
+      "the privileged role bootstrap never runs from the migrator in supabase mode",
+    );
+  if (mode !== "supabase" && shim === undefined)
+    throw profileError(
+      "shim_unset",
+      `HOOPDB_SUPABASE_SHIM must be set explicitly in ${mode} mode`,
+    );
   const ident = /^[A-Za-z_][A-Za-z0-9_$-]{0,62}$/;
   const runtimeRole = env.HOOPDB_RUNTIME_ROLE ?? "";
-  if (!ident.test(runtimeRole)) throw profileError("runtime_role_unset", "HOOPDB_RUNTIME_ROLE must name the role the services connect as");
+  if (!ident.test(runtimeRole))
+    throw profileError(
+      "runtime_role_unset",
+      "HOOPDB_RUNTIME_ROLE must name the role the services connect as",
+    );
   const runtimeLogin = strictFlag(env, "HOOPDB_RUNTIME_ROLE_LOGIN");
-  if (mode !== "local" && runtimeLogin === undefined) throw profileError("runtime_role_login_unset", `HOOPDB_RUNTIME_ROLE_LOGIN must be set explicitly in ${mode} mode`);
+  if (mode !== "local" && runtimeLogin === undefined)
+    throw profileError(
+      "runtime_role_login_unset",
+      `HOOPDB_RUNTIME_ROLE_LOGIN must be set explicitly in ${mode} mode`,
+    );
   const workloadRole = env.HOOPDB_RUNTIME_WORKLOAD_ROLE || undefined;
-  if (workloadRole !== undefined && !ident.test(workloadRole)) throw profileError("db_profile_invalid", "HOOPDB_RUNTIME_WORKLOAD_ROLE must be a role name");
+  if (workloadRole !== undefined && !ident.test(workloadRole))
+    throw profileError(
+      "db_profile_invalid",
+      "HOOPDB_RUNTIME_WORKLOAD_ROLE must be a role name",
+    );
   if (env.HOOPDB_FUNCTION_BOUNDARY_APPROVED !== undefined)
-    throw profileError("db_profile_invalid", "HOOPDB_FUNCTION_BOUNDARY_APPROVED was renamed HOOPDB_FUNCTION_BOUNDARY_MODE (it selects a catalog-proven control, it is not an approval); remove it");
+    throw profileError(
+      "db_profile_invalid",
+      "HOOPDB_FUNCTION_BOUNDARY_APPROVED was renamed HOOPDB_FUNCTION_BOUNDARY_MODE (it selects a catalog-proven control, it is not an approval); remove it",
+    );
   const fb = env.HOOPDB_FUNCTION_BOUNDARY_MODE || undefined;
   if (fb === "event-trigger")
     throw profileError(
       "function_boundary_mode_unimplemented",
       "HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger is not implemented yet (a reviewed trigger, verified by more than its name, is separate work); use global-default-revoke",
     );
-  if (fb !== undefined && fb !== "global-default-revoke") throw profileError("db_profile_invalid", "HOOPDB_FUNCTION_BOUNDARY_MODE must be global-default-revoke");
+  if (fb !== undefined && fb !== "global-default-revoke")
+    throw profileError(
+      "db_profile_invalid",
+      "HOOPDB_FUNCTION_BOUNDARY_MODE must be global-default-revoke",
+    );
   const runtime = {
     runtimeRole,
     ...(runtimeLogin === undefined ? {} : { runtimeLogin }),
@@ -116,16 +182,30 @@ export function migrationProfile(env: Record<string, string | undefined> = proce
     ...(fb ? { functionBoundary: fb as FunctionBoundaryMode } : {}),
   };
   if (mode === "supabase") {
-    if (shim) throw profileError("shim_forbidden", "the plain-Postgres role shim never runs in supabase mode");
-    if (bootstrap) throw profileError("bootstrap_forbidden", "the privileged role bootstrap never runs from the migrator in supabase mode");
+    if (shim)
+      throw profileError(
+        "shim_forbidden",
+        "the plain-Postgres role shim never runs in supabase mode",
+      );
+    if (bootstrap)
+      throw profileError(
+        "bootstrap_forbidden",
+        "the privileged role bootstrap never runs from the migrator in supabase mode",
+      );
     return { mode, shim: false, bootstrap: false, verify, ...runtime };
   }
-  if (shim === undefined) throw profileError("shim_unset", `HOOPDB_SUPABASE_SHIM must be set explicitly in ${mode} mode`);
+  if (shim === undefined)
+    throw profileError(
+      "shim_unset",
+      `HOOPDB_SUPABASE_SHIM must be set explicitly in ${mode} mode`,
+    );
   return { mode, shim, bootstrap: bootstrap ?? shim, verify, ...runtime };
 }
 
 async function schemaSteps(): Promise<Step[]> {
-  const upstream = (await readdir(UPSTREAM_MIGRATIONS)).filter((f) => f.endsWith(".sql")).sort();
+  const upstream = (await readdir(UPSTREAM_MIGRATIONS))
+    .filter((f) => f.endsWith(".sql"))
+    .sort();
   const ours = (await readdir(OURS)).filter((f) => f.endsWith(".sql")).sort();
   return [
     ...upstream.map((f) => ({
@@ -171,7 +251,9 @@ export async function expectedMigrationNames(): Promise<string[]> {
  * compute the same value for the same image.
  */
 export async function generation(): Promise<string> {
-  const upstream = (await readdir(UPSTREAM_MIGRATIONS)).filter((f) => f.endsWith(".sql")).sort();
+  const upstream = (await readdir(UPSTREAM_MIGRATIONS))
+    .filter((f) => f.endsWith(".sql"))
+    .sort();
   const ours = (await readdir(OURS)).filter((f) => f.endsWith(".sql")).sort();
   const steps: Step[] = [
     ...upstream.map((f) => ({
@@ -198,7 +280,9 @@ export async function expectedSchema(): Promise<ExpectedSchema> {
   return {
     names: await expectedMigrationNames(),
     generation: await generation(),
-    ...(["local", "selfhosted", "supabase"].includes(mode ?? "") ? { dbMode: mode as MigrationProfile["mode"] } : {}),
+    ...(["local", "selfhosted", "cloudsql", "supabase"].includes(mode ?? "")
+      ? { dbMode: mode as MigrationProfile["mode"] }
+      : {}),
   };
 }
 
@@ -207,7 +291,10 @@ export const MARKER_PENDING_SQL = `INSERT INTO ${ROLE_VALIDATION_TABLE} (name, g
        ON CONFLICT (name) DO UPDATE SET generation = EXCLUDED.generation, status = 'pending', updated_at = now()`;
 
 export interface MigrationClient {
-  query<R = Record<string, unknown>>(text: string, params?: unknown[]): Promise<{ rows: R[] }>;
+  query<R = Record<string, unknown>>(
+    text: string,
+    params?: unknown[],
+  ): Promise<{ rows: R[] }>;
 }
 
 export interface RunOptions {
@@ -228,7 +315,10 @@ export interface RunOptions {
  *      it 'pending'. With the verifier disabled only an external verifier
  *      (supabase/bootstrap/session_directory_search_worker_mark_pass.sql) can pass it.
  */
-export async function runMigrations(client: MigrationClient, opts: RunOptions = {}): Promise<{ applied: number; skipped: number }> {
+export async function runMigrations(
+  client: MigrationClient,
+  opts: RunOptions = {},
+): Promise<{ applied: number; skipped: number }> {
   let applied = 0;
   let skipped = 0;
   const profile = opts.profile ?? migrationProfile();
@@ -236,23 +326,37 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
   await client.query("SELECT pg_advisory_lock(961996, 1)");
   try {
     const steps = opts.steps ?? (await plan(profile));
-    const schema = steps.filter((st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"));
+    const schema = steps.filter(
+      (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+    );
     // Read-only preflight, all under the lock: nothing below writes until every check passes.
     const ledger = await readLedger(client);
     // A HoopDb built from the old vendored pin cannot be moved forward in place:
     // upstream changed 20261025000600 after it was applied there. Say so plainly.
     if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
-      throw Object.assign(new Error("96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)"), {
-        code: "legacy_schema",
-      });
+      throw Object.assign(
+        new Error(
+          "96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)",
+        ),
+        {
+          code: "legacy_schema",
+        },
+      );
     }
     const runtime = await runtimeRolePreflight(client, profile);
     // Durable function boundary gate, every non-local mode: the selected control must be
     // proven by the catalog. Only explicit local (Docker dev) mode is ungated.
     if (profile.mode !== "local") {
-      const evidence = await functionBoundaryEvidence(client, profile.functionBoundary, profile.mode);
+      const evidence = await functionBoundaryEvidence(
+        client,
+        profile.functionBoundary,
+        profile.mode,
+      );
       if (!evidence.satisfied)
-        throw profileError("function_boundary_unproven", `no catalog-proven function boundary (HOOPDB_FUNCTION_BOUNDARY_MODE): ${JSON.stringify(evidence)}; see the runbook "Function boundary"`);
+        throw profileError(
+          "function_boundary_unproven",
+          `no catalog-proven function boundary (HOOPDB_FUNCTION_BOUNDARY_MODE): ${JSON.stringify(evidence)}; see the runbook "Function boundary"`,
+        );
     }
     await cliHistoryPreflight(client, schema);
     await sequencePreflight(client, schema, ledger);
@@ -272,11 +376,10 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
     // The runtime role reads the ledger and the marker for readiness: USAGE on the schema
     // (needed to reach them, creates nothing) and SELECT on those two tables, nothing else.
     if (runtime === "dedicated") {
-      const grant = await client.query<{ sql: string }>("SELECT format('GRANT USAGE ON SCHEMA sessions TO %I; GRANT SELECT ON %s, %s TO %I', $3::text, $1::text, $2::text, $3::text) AS sql", [
-        MIGRATION_LEDGER,
-        ROLE_VALIDATION_TABLE,
-        profile.runtimeRole,
-      ]);
+      const grant = await client.query<{ sql: string }>(
+        "SELECT format('GRANT USAGE ON SCHEMA sessions TO %I; GRANT SELECT ON %s, %s TO %I', $3::text, $1::text, $2::text, $3::text) AS sql",
+        [MIGRATION_LEDGER, ROLE_VALIDATION_TABLE, profile.runtimeRole],
+      );
       await client.query(grant.rows[0]!.sql);
     }
     const gen = await generation();
@@ -291,18 +394,35 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
     // does not check EXECUTE on a trigger function at fire time), then check the runtime
     // role against the full schema. Any failure rolls all of it back.
     const hardenAndCheck = async () => {
-      await client.query("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC");
+      await client.query(
+        "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC",
+      );
       if (runtime !== "dedicated") return;
-      const violations = await runtimeRoleViolations(client, runtimeCfg(profile), RUNTIME_TABLES, "post");
-      if (violations.length) throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`);
+      const violations = await runtimeRoleViolations(
+        client,
+        runtimeCfg(profile),
+        RUNTIME_TABLES,
+        "post",
+      );
+      if (violations.length)
+        throw profileError(
+          "runtime_role_unsafe",
+          `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`,
+        );
     };
-    const bindDbMode = () => client.query("SELECT set_config('hoopdb.db_mode', $1, true)", [profile.mode]);
+    const bindDbMode = () =>
+      client.query("SELECT set_config('hoopdb.db_mode', $1, true)", [
+        profile.mode,
+      ]);
     let postChecked = false;
     for (const step of steps) {
       const sql = await readFile(step.path, "utf8");
       // The role checks (phase 1 bootstrap, phase 2 verify) run on every migrate, each in
       // its own transaction, and are never recorded in the ledger.
-      if (step.name.startsWith("bootstrap:") || step.name.startsWith("verify:")) {
+      if (
+        step.name.startsWith("bootstrap:") ||
+        step.name.startsWith("verify:")
+      ) {
         const verify = step.name.startsWith("verify:");
         if (verify) postChecked = true;
         if (verify && opts.beforeVerify) await opts.beforeVerify();
@@ -317,7 +437,13 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
                 WHERE name = $1 AND generation = $2 AND status = 'pending' RETURNING name`,
               [ROLE_VALIDATION_NAME, gen],
             );
-            if (passed.rows.length !== 1) throw Object.assign(new Error("96bulls: role validation marker was not pending for this generation"), { code: "marker_lost" });
+            if (passed.rows.length !== 1)
+              throw Object.assign(
+                new Error(
+                  "96bulls: role validation marker was not pending for this generation",
+                ),
+                { code: "marker_lost" },
+              );
           }
           await client.query("COMMIT");
         } catch (err) {
@@ -343,13 +469,18 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
       }
       if (seen && seen !== sha) {
         // Unreachable after sequencePreflight; kept as a second line of defense.
-        throw new Error(`96bulls: migration ${step.name} changed after it was applied; add a new migration instead`);
+        throw new Error(
+          `96bulls: migration ${step.name} changed after it was applied; add a new migration instead`,
+        );
       }
       await client.query("BEGIN");
       try {
         await bindDbMode();
         await client.query(sql);
-        await client.query(`INSERT INTO ${MIGRATION_LEDGER} (name, sha256) VALUES ($1, $2)`, [step.name, sha]);
+        await client.query(
+          `INSERT INTO ${MIGRATION_LEDGER} (name, sha256) VALUES ($1, $2)`,
+          [step.name, sha],
+        );
         await client.query("COMMIT");
       } catch (err) {
         await client.query("ROLLBACK");
@@ -374,9 +505,15 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
         throw err;
       }
     }
-    if (!steps.some((s) => s.name.startsWith("verify:"))) log.info("role validation left pending: in-process verifier disabled; an external verifier must pass it", { reason: gen });
+    if (!steps.some((s) => s.name.startsWith("verify:")))
+      log.info(
+        "role validation left pending: in-process verifier disabled; an external verifier must pass it",
+        { reason: gen },
+      );
   } finally {
-    await client.query("SELECT pg_advisory_unlock(961996, 1)").catch(() => undefined);
+    await client
+      .query("SELECT pg_advisory_unlock(961996, 1)")
+      .catch(() => undefined);
   }
   log.info("hoopdb migrations complete", { count: applied, skipped });
   return { applied, skipped };
@@ -393,10 +530,23 @@ const runtimeCfg = (p: MigrationProfile) => ({
   ...(p.workloadRole ? { workload: p.workloadRole } : {}),
 });
 
-async function readLedger(client: MigrationClient): Promise<Map<string, string>> {
-  const there = (await client.query<{ r: string | null }>("SELECT to_regclass($1)::text AS r", [MIGRATION_LEDGER])).rows[0]?.r;
+async function readLedger(
+  client: MigrationClient,
+): Promise<Map<string, string>> {
+  const there = (
+    await client.query<{ r: string | null }>(
+      "SELECT to_regclass($1)::text AS r",
+      [MIGRATION_LEDGER],
+    )
+  ).rows[0]?.r;
   if (!there) return new Map();
-  return new Map((await client.query<{ name: string; sha256: string }>(`SELECT name, sha256 FROM ${MIGRATION_LEDGER}`)).rows.map((r) => [r.name, r.sha256]));
+  return new Map(
+    (
+      await client.query<{ name: string; sha256: string }>(
+        `SELECT name, sha256 FROM ${MIGRATION_LEDGER}`,
+      )
+    ).rows.map((r) => [r.name, r.sha256]),
+  );
 }
 
 /**
@@ -404,16 +554,45 @@ async function readLedger(client: MigrationClient): Promise<Map<string, string>>
  * accepted only in local mode. A dedicated role must pass the exact least-privilege
  * allowlist (runtimeRoleViolations). Otherwise it fails closed before any write.
  */
-async function runtimeRolePreflight(client: MigrationClient, profile: MigrationProfile): Promise<"owner" | "dedicated"> {
-  const r = (await client.query<{ rolname: string; me: string }>("SELECT rolname, current_user AS me FROM pg_roles WHERE rolname = $1", [profile.runtimeRole])).rows[0];
-  if (!r) throw profileError("runtime_role_missing", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} does not exist; nothing was written`);
+async function runtimeRolePreflight(
+  client: MigrationClient,
+  profile: MigrationProfile,
+): Promise<"owner" | "dedicated"> {
+  const r = (
+    await client.query<{ rolname: string; me: string }>(
+      "SELECT rolname, current_user AS me FROM pg_roles WHERE rolname = $1",
+      [profile.runtimeRole],
+    )
+  ).rows[0];
+  if (!r)
+    throw profileError(
+      "runtime_role_missing",
+      `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} does not exist; nothing was written`,
+    );
   if (r.rolname === r.me) {
-    if (profile.mode !== "local") throw profileError("runtime_role_unsafe", `in ${profile.mode} mode the services need a dedicated runtime role, not the migration owner`);
+    if (profile.mode !== "local")
+      throw profileError(
+        "runtime_role_unsafe",
+        `in ${profile.mode} mode the services need a dedicated runtime role, not the migration owner`,
+      );
     return "owner";
   }
-  if (r.rolname === ROLE_VALIDATION_NAME) throw profileError("runtime_role_unsafe", "HOOPDB_RUNTIME_ROLE must not be the search Worker");
-  const violations = await runtimeRoleViolations(client, runtimeCfg(profile), RUNTIME_TABLES, "pre");
-  if (violations.length) throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`);
+  if (r.rolname === ROLE_VALIDATION_NAME)
+    throw profileError(
+      "runtime_role_unsafe",
+      "HOOPDB_RUNTIME_ROLE must not be the search Worker",
+    );
+  const violations = await runtimeRoleViolations(
+    client,
+    runtimeCfg(profile),
+    RUNTIME_TABLES,
+    "pre",
+  );
+  if (violations.length)
+    throw profileError(
+      "runtime_role_unsafe",
+      `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`,
+    );
   return "dedicated";
 }
 
@@ -423,8 +602,17 @@ async function runtimeRolePreflight(client: MigrationClient, profile: MigrationP
  * but can't be read: `supabase db push` and this migrator must never both apply them
  * (mixed_migration_authority). See the runbook decision point.
  */
-async function cliHistoryPreflight(client: MigrationClient, schema: Step[]): Promise<void> {
-  const reg = async (name: string) => (await client.query<{ r: string | null }>("SELECT to_regclass($1)::text AS r", [name])).rows[0]?.r ?? null;
+async function cliHistoryPreflight(
+  client: MigrationClient,
+  schema: Step[],
+): Promise<void> {
+  const reg = async (name: string) =>
+    (
+      await client.query<{ r: string | null }>(
+        "SELECT to_regclass($1)::text AS r",
+        [name],
+      )
+    ).rows[0]?.r ?? null;
   let cliHistory: string | null;
   try {
     cliHistory = await reg("supabase_migrations.schema_migrations");
@@ -432,21 +620,38 @@ async function cliHistoryPreflight(client: MigrationClient, schema: Step[]): Pro
     // The schema exists but the migrator may not even look inside: it can't prove there
     // is no second authority.
     if ((err as { code?: string }).code === "42501")
-      throw profileError("mixed_migration_authority", "supabase_migrations exists but the migrator cannot read it; one authority only, see the runbook decision point");
+      throw profileError(
+        "mixed_migration_authority",
+        "supabase_migrations exists but the migrator cannot read it; one authority only, see the runbook decision point",
+      );
     throw err;
   }
   if (cliHistory) {
-    const versions = schema.filter((st) => st.name.startsWith("upstream:")).map((st) => st.name.slice("upstream:".length).split("_")[0]!);
+    const versions = schema
+      .filter((st) => st.name.startsWith("upstream:"))
+      .map((st) => st.name.slice("upstream:".length).split("_")[0]!);
     let hit: { version: string }[];
     try {
-      hit = (await client.query<{ version: string }>("SELECT version FROM supabase_migrations.schema_migrations WHERE version = ANY($1::text[]) ORDER BY version", [versions])).rows;
+      hit = (
+        await client.query<{ version: string }>(
+          "SELECT version FROM supabase_migrations.schema_migrations WHERE version = ANY($1::text[]) ORDER BY version",
+          [versions],
+        )
+      ).rows;
     } catch (err) {
       // Present but unreadable by the migrator: it can't prove there is no second authority.
       if ((err as { code?: string }).code === "42501")
-        throw profileError("mixed_migration_authority", "supabase_migrations.schema_migrations exists but the migrator cannot read it; one authority only, see the runbook decision point");
+        throw profileError(
+          "mixed_migration_authority",
+          "supabase_migrations.schema_migrations exists but the migrator cannot read it; one authority only, see the runbook decision point",
+        );
       throw err;
     }
-    if (hit.length) throw profileError("mixed_migration_authority", `supabase db push recorded ${hit.map((h) => h.version).join(", ")}; one authority only, see the runbook decision point`);
+    if (hit.length)
+      throw profileError(
+        "mixed_migration_authority",
+        `supabase db push recorded ${hit.map((h) => h.version).join(", ")}; one authority only, see the runbook decision point`,
+      );
   }
 }
 
@@ -470,9 +675,18 @@ export async function migrate(): Promise<{ applied: number; skipped: number }> {
 }
 
 async function checksumAliasEvidence(client: MigrationClient) {
-  const there = (await client.query<{ r: string | null }>("SELECT to_regclass($1)::text AS r", [MIGRATION_LEDGER])).rows[0]?.r;
+  const there = (
+    await client.query<{ r: string | null }>(
+      "SELECT to_regclass($1)::text AS r",
+      [MIGRATION_LEDGER],
+    )
+  ).rows[0]?.r;
   if (!there) return [];
-  const rows = (await client.query<{ name: string; sha256: string }>(`SELECT name, sha256 FROM ${MIGRATION_LEDGER}`)).rows;
+  const rows = (
+    await client.query<{ name: string; sha256: string }>(
+      `SELECT name, sha256 FROM ${MIGRATION_LEDGER}`,
+    )
+  ).rows;
   const steps = await schemaSteps();
   const actual = new Map<string, string>();
   for (const step of steps)
@@ -483,7 +697,11 @@ async function checksumAliasEvidence(client: MigrationClient) {
         .digest("hex"),
     );
   return rows.flatMap((row) => {
-    const alias = migrationChecksumAlias(row.name, row.sha256, actual.get(row.name) ?? "");
+    const alias = migrationChecksumAlias(
+      row.name,
+      row.sha256,
+      actual.get(row.name) ?? "",
+    );
     return alias ? [alias] : [];
   });
 }
@@ -496,20 +714,28 @@ if (import.meta.main) {
     // Without HOOPDB_DB_MODE every creator is covered (no platform exclusion). Exit 1 if
     // unproven.
     const dbMode = process.env.HOOPDB_DB_MODE;
-    if (dbMode !== undefined && !["local", "selfhosted", "supabase"].includes(dbMode)) {
+    if (
+      dbMode !== undefined &&
+      !["local", "selfhosted", "cloudsql", "supabase"].includes(dbMode)
+    ) {
       console.error("db_mode_invalid");
       process.exit(1);
     }
     const db = openHoopDb();
     const mode = migrationProfileMode();
-    Promise.all([functionBoundaryEvidence(db, mode, dbMode as DbMode | undefined), checksumAliasEvidence(db)])
+    Promise.all([
+      functionBoundaryEvidence(db, mode, dbMode as DbMode | undefined),
+      checksumAliasEvidence(db),
+    ])
       .then(async ([e, migration_checksum_aliases]) => {
         console.log(JSON.stringify({ ...e, migration_checksum_aliases }));
         await db.end();
         process.exit(e.satisfied ? 0 : 1);
       })
       .catch(async (err) => {
-        console.error((err as { code?: string }).code ?? "activation_check_failed");
+        console.error(
+          (err as { code?: string }).code ?? "activation_check_failed",
+        );
         await db.end();
         process.exit(1);
       });
