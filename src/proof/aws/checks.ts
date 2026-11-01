@@ -1018,6 +1018,12 @@ export async function restartPersistence(ctx: Ctx): Promise<CheckResult> {
   if (!va.ok) r.failures.push(...va.failures.map((f) => `relaycast after restart: ${f}`));
   const pod = primary(ctx);
   const baseline = ctx.corpus.filter((p) => ctx.searchable!.has(p.sessionId));
+  const tokenIssue = await refreshTokens(ctx);
+  if (tokenIssue)
+    return r.done(
+      r.failures.length ? "fail" : "blocked",
+      `RelayAuth token refresh before post-restart search: ${tokenIssue}`,
+    );
   const found = await searchOwn(ctx, pod, baseline, "after-restart");
   const lost = baseline.filter((p) => !found.get(p.sessionId)?.found);
   if (lost.length) r.failures.push(`${lost.length}/${baseline.length} planted sessions no longer searchable after restarts; first: ${lost.slice(0, 5).map((p) => p.sessionId).join(", ")}`);
@@ -1045,7 +1051,13 @@ export async function upgradeRollback(ctx: Ctx): Promise<CheckResult> {
   if (!prior) return r.done("blocked", "could not read the current helm revision");
   const baseline = ctx.corpus.filter((p) => ctx.searchable!.has(p.sessionId));
   const steps = upgradeRollbackSteps(c, prior);
+  let refreshIssue: string | undefined;
   const verify = async (label: string) => {
+    const tokenIssue = await refreshTokens(ctx);
+    if (tokenIssue) {
+      refreshIssue ??= `RelayAuth token refresh before post-${label} search: ${tokenIssue}`;
+      return;
+    }
     const found = await searchOwn(ctx, primary(ctx), baseline, label);
     const lost = baseline.filter((p) => !found.get(p.sessionId)?.found).length;
     r.metrics[`searchable.${label}`] = baseline.length - lost;
@@ -1057,6 +1069,8 @@ export async function upgradeRollback(ctx: Ctx): Promise<CheckResult> {
   await verify("rollback");
   const after = ctx.runner.run(helmHistoryStep(c));
   r.ev("helm-history.json", after.stdout);
+  if (refreshIssue)
+    return r.done(r.failures.length ? "fail" : "blocked", refreshIssue);
   return r.done(r.failures.length ? "fail" : "pass", `upgraded to ${c.candidateChartVersion} and rolled back to revision ${prior}; data intact`);
 }
 

@@ -536,7 +536,11 @@ const runtimeCfg = (p: MigrationProfile) => ({
   ...(p.workloadRole ? { workload: p.workloadRole } : {}),
 });
 
-/** Install only the immutable service ACL. Preflight has already rejected drift. */
+/**
+ * Install only the immutable trusted-backend ACL. Preflight has already rejected drift.
+ * The policy is all-row by design because workers span tenants; the runtime role is a
+ * service credential, never an end-user identity, and still has no ownership/BYPASSRLS.
+ */
 async function installRuntimeApplicationAcl(
   client: MigrationClient,
   role: string,

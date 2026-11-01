@@ -241,6 +241,13 @@ violation is named:
   migrator installs those grants only after all schema steps and validates the resulting
   catalog before PASS. There is no ownership, DDL, `TRUNCATE`, `REFERENCES`, `TRIGGER`,
   `MAINTAIN`, GRANT OPTION, or `BYPASSRLS`.
+- **Trusted backend, not a tenant database role:** the runtime credential is shared by
+  the ingest and worker pods, which must process rows for every tenant. Its role-scoped
+  `bulls96_trusted_backend` RLS policies are therefore deliberately all-row. Tenant
+  isolation for user-facing traffic is enforced by the authenticated RPCs and required
+  application filters; the runtime role must never be inherited by or exposed to an end
+  user. The database boundary still removes the former owner capability: no ownership,
+  DDL, `BYPASSRLS`, unlisted function execution, or privileges outside the reviewed ACL.
 - **No EXECUTE on an unlisted `sessions` function; trigger functions are never listed.**
   A trigger fires without its caller holding EXECUTE (a real PostgreSQL test shows it).
   In the same transaction as phase 2 and the PASS write, the migrator runs

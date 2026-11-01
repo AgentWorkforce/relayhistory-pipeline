@@ -374,24 +374,36 @@ describe("runtime role: required, existing, SELECT only", () => {
       (
         await db.query<Record<string, boolean>>(
           `SELECT has_table_privilege('g6_rt', 'sessions.pipeline_jobs', 'SELECT, INSERT, UPDATE, DELETE') AS queue_dml,
+                  has_table_privilege('g6_rt', 'sessions.claimless_uses', 'UPDATE') AS claimless_update,
+                  has_table_privilege('g6_rt', 'sessions.migration_assertion_uses', 'SELECT, INSERT, UPDATE, DELETE') AS assertion_cleanup,
+                  has_table_privilege('g6_rt', 'sessions.migration_assertion_chunks', 'SELECT, INSERT, UPDATE, DELETE') AS chunk_cleanup,
+                  has_table_privilege('g6_rt', 'sessions.migration_base_read_uses', 'SELECT, INSERT, UPDATE, DELETE') AS base_read_cleanup,
+                  has_table_privilege('g6_rt', 'sessions.migration_ingest_audit', 'UPDATE, DELETE') AS audit_mutation,
                   has_table_privilege('g6_rt', 'sessions.pipeline_jobs', 'TRUNCATE') AS queue_truncate,
                   has_sequence_privilege('g6_rt', 'sessions.pipeline_jobs_id_seq', 'USAGE') AS queue_sequence,
                   has_function_privilege('g6_rt', 'sessions.upsert_session_index(jsonb)', 'EXECUTE') AS index_rpc,
+                  has_function_privilege('g6_rt', 'sessions.pipeline_events_maintain(interval,integer)', 'EXECUTE') AS maintenance_rpc,
                   has_function_privilege('g6_rt', 'sessions.pipeline_jobs_observability()', 'EXECUTE') AS trigger_execute`,
         )
       ).rows[0],
     ).toEqual({
       queue_dml: true,
+      claimless_update: true,
+      assertion_cleanup: true,
+      chunk_cleanup: true,
+      base_read_cleanup: true,
+      audit_mutation: false,
       queue_truncate: false,
       queue_sequence: true,
       index_rpc: true,
+      maintenance_rpc: false,
       trigger_execute: false,
     });
     expect(
       (
         await db.query<{ n: number }>(
           `SELECT count(*)::int AS n FROM pg_policy p
-            WHERE p.polname = 'bulls96_runtime_service'
+            WHERE p.polname = 'bulls96_trusted_backend'
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
@@ -837,7 +849,7 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
   test("an altered runtime RLS policy fails closed before the marker can be rewritten", async () => {
     const db = await migrated();
     await db.exec(
-      "ALTER POLICY bulls96_runtime_service ON sessions.pipeline_jobs USING (false)",
+      "ALTER POLICY bulls96_trusted_backend ON sessions.pipeline_jobs USING (false)",
     );
     const before = await state(db);
     const error = await failure(
@@ -845,7 +857,7 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
     );
     expect(error?.code).toBe("runtime_role_unsafe");
     expect(error?.message).toContain(
-      "unapproved policy bulls96_runtime_service on sessions.pipeline_jobs",
+      "unapproved policy bulls96_trusted_backend on sessions.pipeline_jobs",
     );
     expect(await state(db)).toEqual(before);
   });

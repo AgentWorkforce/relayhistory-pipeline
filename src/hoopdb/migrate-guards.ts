@@ -107,12 +107,12 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_directory_resurrection_fences": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.manifest_readiness": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.export_deferred_sessions": ["SELECT", "INSERT", "UPDATE", "DELETE"],
-  "sessions.claimless_uses": ["SELECT", "INSERT"],
+  "sessions.claimless_uses": ["SELECT", "INSERT", "UPDATE"],
   "sessions.backfill_activation_ready": ["SELECT", "INSERT", "UPDATE", "DELETE"],
-  "sessions.migration_assertion_uses": ["SELECT", "INSERT"],
-  "sessions.migration_assertion_chunks": ["SELECT", "INSERT"],
+  "sessions.migration_assertion_uses": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.migration_assertion_chunks": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.migration_ingest_audit": ["SELECT", "INSERT"],
-  "sessions.migration_base_read_uses": ["SELECT", "INSERT"],
+  "sessions.migration_base_read_uses": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.claimless_window_activations": ["SELECT", "INSERT"],
 } as const satisfies Record<string, readonly string[]>;
 
@@ -157,7 +157,6 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.legacy_remote(text)",
   "sessions.lock_repo_catalog(text)",
   "sessions.member_of(text,text[])",
-  "sessions.pipeline_events_maintain(interval,integer)",
   "sessions.repo_backfill_report()",
   "sessions.repo_backfill_step(integer,text)",
   "sessions.repo_group(text,uuid)",
@@ -173,7 +172,14 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.upsert_session_index(jsonb)",
 ] as const;
 
-export const RUNTIME_APPLICATION_POLICY = "bulls96_runtime_service";
+/**
+ * The pods use one reviewed, multi-tenant backend identity. This policy is deliberately
+ * all-row for that identity: tenant isolation for user-facing requests remains in the
+ * authenticated RPCs and application filters, while this role is constrained by exact
+ * table/function ACLs, NOBYPASSRLS, no ownership, and no DDL. It must never be granted
+ * to a user-facing or otherwise untrusted database role.
+ */
+export const RUNTIME_APPLICATION_POLICY = "bulls96_trusted_backend";
 
 export interface RoleGrantEdge {
   rolname: string;
