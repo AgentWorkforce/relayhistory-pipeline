@@ -30,7 +30,6 @@
  */
 import * as AWS from "@alchemy.run/aws";
 import * as Effect from "effect/Effect";
-import { fileURLToPath } from "node:url";
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 
@@ -233,8 +232,6 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
   };
 }
 
-const ROOT = fileURLToPath(new URL("../..", import.meta.url));
-
 export interface SessionPipelineStageInputs {
   stage: string;
   accountId: string;
@@ -249,7 +246,9 @@ export const sessionPipelineFunction = (i: SessionPipelineStageInputs & { bucket
     const names = sessionPipelineNames(i.stage, i.accountId, i.region);
     return yield* AWS.Lambda.Function("session-pipeline", {
       functionName: names.function,
-      main: fileURLToPath(new URL("../../src/session-pipeline/lambda.ts", import.meta.url)),
+      // Relative to the repository root (bin/96bulls runs Alchemy there), so the planned
+      // props are the same in every checkout and a capture never diffs on a path.
+      main: "src/session-pipeline/lambda.ts",
       handler: "handler",
       runtime: "nodejs24.x",
       architecture: "arm64",
@@ -257,7 +256,7 @@ export const sessionPipelineFunction = (i: SessionPipelineStageInputs & { bucket
       timeout: `${FUNCTION_TIMEOUT_SECONDS} seconds`,
       env: sessionPipelineEnv({ stage: i.stage, bucket: i.bucket, names, p: i.p }),
       logging: { retention: "30 days" },
-      build: { tsconfig: `${ROOT}tsconfig.json` } as never,
+      build: { tsconfig: "tsconfig.json" } as never,
     } as never);
   });
 
