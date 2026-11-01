@@ -33,7 +33,7 @@ import { fileURLToPath } from "node:url";
 import { PIPPEN_PROOF_SANDBOX, pippenProofSandboxCallerArn, SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
 import { eksStage } from "./eks.ts";
 import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy } from "./hardening.ts";
-import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "./inputs.ts";
+import { ecrPullPolicy, sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "./inputs.ts";
 import { assertApprovalBinding, assertAwsDeploymentTarget, assertClearance, awsMode, type AwsMode } from "./deploy-guard.ts";
 import { snapshotStateLayer } from "./state-snapshot.ts";
 import { verifyDeployCapture } from "./capture-verify.ts";
@@ -251,6 +251,8 @@ export default Alchemy.Stack(
 
     // ECR: the hosted service image lives in the account, private (Khaliq, 2026-10-28: not public).
     // A second stage in the account (accountShared) uses the owner stage's repository.
+    // ecr.pullAccounts (read-only cross-account pull) is the only repository policy; none when absent.
+    const pullPolicy = ecrPullPolicy(inputs);
     const ecr = inputs.accountShared
       ? undefined
       : yield* AWS.ECR.Repository("services-image", {
@@ -262,6 +264,7 @@ export default Alchemy.Stack(
           lifecyclePolicyText: JSON.stringify({
             rules: [{ rulePriority: 1, description: "expire untagged images after 14 days", selection: { tagStatus: "untagged", countType: "sinceImagePushed", countUnit: "days", countNumber: 14 }, action: { type: "expire" } }],
           }),
+          ...(pullPolicy ? { policy: pullPolicy } : {}),
           tags: tags(stage, "ecr"),
         });
 

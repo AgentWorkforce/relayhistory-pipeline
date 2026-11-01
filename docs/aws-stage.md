@@ -77,6 +77,32 @@ and it can only push to that ECR repository (no Locker or KMS access).
 Sandbox stages create neither the OIDC provider nor the role. The GHCR
 copy stays private for kind and self-host tests.
 
+### Cross-account pull (`ecr.pullAccounts`)
+
+`ecr.pullAccounts` in a stage's `aws-inputs.json` is the only repository
+policy on its `96bulls-services` repository (`stacks/aws/inputs.ts`
+`ecrPullPolicy`). Each entry is a 12-digit account id. It gets one statement,
+principal `arn:aws:iam::<id>:root`, with exactly `ecr:BatchGetImage`,
+`ecr:GetDownloadUrlForLayer` and `ecr:BatchCheckLayerAvailability`. The
+Pippen sandbox `361835732085` gets the Sid `PippenSandboxAwsProofPull`; any
+other account gets `CrossAccountPull<id>`. The stage refuses an entry that is
+not a 12-digit id (no wildcards or ARNs), a duplicate, its own account, the
+production account `941433935742`, and a stage that owns no repository
+(`accountShared`, the transcript store). Absent or `[]` means no policy, which
+is the behavior before this input existed.
+
+Alchemy removes a repository policy the inputs do not declare. Khaliq approved
+read-only pull for the Pippen sandbox on 2026-11-01 ("give my OK"), and the
+policy was applied live to the sessions-dev repository. So **before the next
+`bin/96bulls up aws-sessions-dev`, its inputs must carry**:
+
+```json
+"ecr": { "pullAccounts": ["361835732085"] }
+```
+
+Without it, that `up` deletes the grant and the sandbox can no longer pull the
+services image.
+
 Order for the first environment: apply the baseline (creates ECR and the
 deployer role) -> set the two repo variables -> run publish-image-ecr -> put the
 digest in `aws-inputs.json` -> apply again with `eks` inputs.
@@ -536,8 +562,9 @@ account are pinned to each other (`stacks/aws/sandbox-rules.ts`
 - `accountShared` is refused: the sandbox is a fresh account, so the stage
   creates its own ECR repository but no GitHub OIDC provider or publisher role.
   The services image is pulled by digest from the sessions-dev repository
-  (`eks.imageRepository`), whose repository policy must allow `361835732085`
-  to pull; that policy change is a separate approval;
+  (`eks.imageRepository`). Khaliq approved read-only pull for `361835732085`
+  on 2026-11-01, and it is applied live as that repository's policy; see
+  [Cross-account pull](#cross-account-pull-ecrpullaccounts);
 - before declaring anything, in every mode, the stack checks that
   `aws sts get-caller-identity` is exactly
   `arn:aws:sts::361835732085:assumed-role/agent-session/agent-<session_id>`,

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "../inputs.ts";
+import { ecrPullPolicy, sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "../inputs.ts";
 import { PIPPEN_PROOF_SANDBOX, pippenProofSandboxCallerArn } from "../sandbox-rules.ts";
 import { verifyCallerArn } from "../preflight.ts";
 
@@ -154,5 +154,57 @@ describe("aws-proof-sandbox: the E2E proof in the Pippen sandbox of agent aws-pr
 
   it("names the cluster the harness's sandbox target expects", () => {
     expect(`96bulls-${PIPPEN_PROOF_SANDBOX.stage}`).toBe("96bulls-aws-proof-sandbox");
+  });
+});
+
+describe("ecr.pullAccounts: read-only cross-account pull from the services repository", () => {
+  // Applied live by the coordinator on Khaliq's OK (2026-11-01, "give my OK") to the sessions-dev repository.
+  const LIVE = {"Version":"2012-10-17","Statement":[{"Sid":"PippenSandboxAwsProofPull","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::361835732085:root"},"Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:BatchCheckLayerAvailability"]}]};
+  const devAccount = "500268966557";
+  const canon = (v: unknown): unknown => (Array.isArray(v) ? v.map(canon) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b)).map(([k, x]) => [k, canon(x)])) : v);
+
+  it("one account renders exactly the live policy (after normalization)", () => {
+    const text = ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: ["361835732085"] } })!;
+    expect(JSON.stringify(canon(JSON.parse(text)))).toBe(JSON.stringify(canon(LIVE)));
+    expect(text).toBe(JSON.stringify(LIVE)); // and byte for byte as rendered
+  });
+
+  it("other accounts get one generic read-only statement each", () => {
+    const p = JSON.parse(ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: ["361835732085", "111122223333"] } })!);
+    expect(p.Statement).toHaveLength(2);
+    expect(p.Statement[1]).toEqual({ Sid: "CrossAccountPull111122223333", Effect: "Allow", Principal: { AWS: "arn:aws:iam::111122223333:root" }, Action: LIVE.Statement[0]!.Action });
+  });
+
+  it("absent or empty means no policy (today's behavior)", () => {
+    expect(ecrPullPolicy({ accountId: devAccount })).toBeUndefined();
+    expect(ecrPullPolicy({ accountId: devAccount, ecr: {} })).toBeUndefined();
+    expect(ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: [] } })).toBeUndefined();
+  });
+
+  it("refuses invalid ids, wildcards, duplicates, the own account and anything but pullAccounts", () => {
+    for (const bad of ["*", "36183573208", "3618357320855", "arn:aws:iam::361835732085:root", " 361835732085", "36183573208x", 361835732085 as unknown as string])
+      expect(() => ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: [bad] } })).toThrow(/12-digit account ids/);
+    expect(() => ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: "361835732085" as unknown as string[] } })).toThrow(/array/);
+    expect(() => ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: ["361835732085", "361835732085"] } })).toThrow(/repeat/);
+    expect(() => ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: [devAccount] } })).toThrow(/own account/);
+    expect(() => ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: ["361835732085"], actions: ["ecr:*"] } as never })).toThrow(/only key/);
+  });
+
+  it("never grants the production account", () => {
+    expect(() => ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: ["941433935742"] } })).toThrow(/production account 941433935742/);
+    expect(() => ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: ["361835732085", "941433935742"] } })).toThrow(/production account/);
+  });
+
+  it("is refused on a stage that does not own the repository", () => {
+    expect(() => ecrPullPolicy({ accountId: devAccount, accountShared: { ownerStage: "aws-sessions-dev" }, ecr: { pullAccounts: ["361835732085"] } })).toThrow(/accountShared/);
+    expect(() => validateAwsInputs("aws-proof", filled((i) => (i.ecr = { pullAccounts: ["361835732085"] })), approved)).toThrow(/accountShared/);
+  });
+
+  it("validateAwsInputs runs it, and the stack sets it as the services repository policy only when present", () => {
+    expect(() => validateAwsInputs("aws-proof", filled((i) => { delete i.accountShared; i.ecr = { pullAccounts: ["941433935742"] }; }), approved)).toThrow(/production account/);
+    const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
+    expect(stack).toContain("const pullPolicy = ecrPullPolicy(inputs);");
+    const repo = stack.slice(stack.indexOf('AWS.ECR.Repository("services-image"'), stack.indexOf("tags: tags(stage, \"ecr\")"));
+    expect(repo).toContain("...(pullPolicy ? { policy: pullPolicy } : {}),");
   });
 });

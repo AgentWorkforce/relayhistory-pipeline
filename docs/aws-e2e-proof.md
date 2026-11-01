@@ -779,8 +779,10 @@ teardown run, produces one report whose verdict covers both.
   into 1Password, and piping them into the environment.
 - `bin/96bulls down aws-proof`.
 - For the Pippen sandbox target: `pippen sandbox up aws-proof` (both times),
-  `bin/96bulls up aws-proof-sandbox`, the ECR repository policy that lets
-  `361835732085` pull the services image, and both `pippen sandbox down aws-proof`.
+  `bin/96bulls up aws-proof-sandbox`, and both `pippen sandbox down aws-proof`.
+  The ECR pull grant for `361835732085` was approved and applied on
+  2026-11-01. It is kept by `ecr.pullAccounts` in the aws-sessions-dev inputs
+  (docs/aws-stage.md).
 
 ## Report
 
