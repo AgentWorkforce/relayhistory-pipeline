@@ -317,15 +317,20 @@ describe("transcript store: srv-writer (relayhistory-api live writer) is least p
     expect(src).toContain('"relayhistory-api-worker-writes-live-transcripts"');
   });
 
-  it("allows exactly s3:GetObject and s3:PutObject on the srv_ machine, live-sessions and live-batches prefixes, plus key use", () => {
-    expect(allow.map((s) => s.Sid)).toEqual(["ReadLiveObjects", "WriteLiveObjectsSseKmsOnly", "UseTranscriptKeyViaS3"]);
+  it("allows exactly s3:GetObject and s3:PutObject on the srv_ machine, live-sessions and live-batches prefixes, ListBucket for 404s, plus key use", () => {
+    expect(allow.map((s) => s.Sid)).toEqual(["ReadLiveObjects", "WriteLiveObjectsSseKmsOnly", "UseTranscriptKeyViaS3", "ListForMissingKeySemantics"]);
+    // A missing key must 404 (the Worker's create-only reads), which S3
+    // decides by s3:ListBucket on the bucket; no prefix condition can apply.
+    expect(sid("ListForMissingKeySemantics").Action).toEqual(["s3:ListBucket"]);
+    expect(res(sid("ListForMissingKeySemantics"))).toEqual([n.bucketArn]);
+    expect(sid("ListForMissingKeySemantics").Condition).toBeUndefined();
     expect(sid("ReadLiveObjects").Action).toEqual(["s3:GetObject"]);
     expect(sid("WriteLiveObjectsSseKmsOnly").Action).toEqual(["s3:PutObject"]);
     expect(sid("UseTranscriptKeyViaS3").Action.sort()).toEqual(["kms:Decrypt", "kms:GenerateDataKey"]);
     expect(res(sid("ReadLiveObjects"))).toEqual(objects);
     expect(res(sid("WriteLiveObjectsSseKmsOnly"))).toEqual(objects);
     expect(res(sid("UseTranscriptKeyViaS3"))).toEqual([`arn:aws:kms:${REGION}:${ACCOUNT}:key/*`]);
-    expect([...new Set(allowedActions(p))].sort()).toEqual(["kms:Decrypt", "kms:GenerateDataKey", "s3:GetObject", "s3:PutObject"]);
+    expect([...new Set(allowedActions(p))].sort()).toEqual(["kms:Decrypt", "kms:GenerateDataKey", "s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
   });
 
   it("reaches the Worker's srv_ manifests and raw chunks and the live prefixes, nothing else", () => {
@@ -335,10 +340,11 @@ describe("transcript store: srv-writer (relayhistory-api live writer) is least p
       for (const a of ["s3:PutObject", "s3:GetObject"]) expect(decide(p, a, k)).toBe("implicit-deny");
   });
 
-  it("never deletes, lists, reads old versions or changes the bucket", () => {
+  it("never deletes, lists versions, reads old versions or changes the bucket; lists current keys only", () => {
     for (const a of ["s3:DeleteObject", "s3:DeleteObjectVersion", "s3:GetObjectVersion", "s3:PutBucketPolicy", "s3:PutObjectAcl"]) expect(decide(p, a, SRV_MANIFEST)).toBe("deny");
-    for (const a of ["s3:ListBucket", "s3:ListBucketVersions", "s3:PutLifecycleConfiguration", "s3:DeleteBucket"]) expect(decide(p, a, n.bucketArn)).toBe("deny");
-    for (const a of allowedActions(p)) expect(a).not.toMatch(/Delete|List|\*/);
+    for (const a of ["s3:ListBucketVersions", "s3:PutLifecycleConfiguration", "s3:DeleteBucket"]) expect(decide(p, a, n.bucketArn)).toBe("deny");
+    expect(decide(p, "s3:ListBucket", n.bucketArn)).toBe("allow");
+    for (const a of allowedActions(p)) expect(a).not.toMatch(/Delete|Versions|\*/);
   });
 
   it("PUT requires SSE-KMS with a key in this account and region; the bucket policy pins it to the transcripts CMK", () => {

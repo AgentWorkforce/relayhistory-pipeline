@@ -451,7 +451,8 @@ export function transcriptWriterPolicy(bucketArn: string) {
  * narrows that to exactly the transcripts CMK. (The key ARN cannot appear here:
  * the key policy names this user, so the user exists before the key.) Key use is
  * granted by the key policy; this identity grant is scoped to the key's alias and
- * to S3 in this region. No delete, no list, no old versions, no bucket changes.
+ * to S3 in this region. ListBucket on the bucket (missing keys must 404, see
+ * below); no delete, no old versions, no bucket changes.
  */
 export function transcriptSrvWriterPolicy(i: { bucketArn: string; accountId: string; region: string; keyAlias: string }) {
   const objects = srvWriterObjects(i.bucketArn);
@@ -479,7 +480,14 @@ export function transcriptSrvWriterPolicy(i: { bucketArn: string; accountId: str
           "ForAnyValue:StringEquals": { "kms:ResourceAliases": i.keyAlias },
         },
       },
-      noDeleteNoHistory(i.bucketArn, ["s3:ListBucket"]),
+      // A missing key must answer 404, not 403: the Worker's create-only
+      // pointer, manifest and batch-marker reads depend on it. S3 decides that
+      // with s3:ListBucket on the bucket, and HEAD/GET carry no s3:prefix, so
+      // the grant cannot be prefix-scoped (hardening.ts listBucket): it is the
+      // same unconditional grant the transcript writer holds. Key names only;
+      // object reads stay limited to the srv_ and live prefixes above.
+      listBucket(i.bucketArn),
+      noDeleteNoHistory(i.bucketArn),
     ],
   };
 }
