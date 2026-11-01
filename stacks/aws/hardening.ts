@@ -9,12 +9,15 @@
  * The S3 grants are derived from the code that uses the Locker, not guessed:
  *
  *   key layout   packages/object-store/src/layout.ts   `{LAYOUT_VERSION}/ws=…/s=…/` + manifest.json | raw/… | summary/…
- *   AlleyOop     src/alleyoop/manifests.ts              head + get manifests and chunks; put raw/ chunks and manifest.json (conditional)
+ *   AlleyOop     src/alleyoop/manifests.ts              head + get manifests and chunks; put raw/ chunks and manifest.json (conditional);
+ *                packages/pipeline/.../parked.ts         delete parked/<machine>/manifest.json and its raw/ chunks (parked-session cleanup)
  *   Bob Costas   src/bob-costas/summary-objects.ts     head + get session objects; put summary/{short,long}.json.enc (conditional)
  *   indexer      src/hoopdb/indexer.ts                  list `v1` (reconcile) + get manifests
  *   referee      src/referee/main.ts                    get manifests
  *
- * The ObjectStore interface has no delete, so no pod role carries s3:DeleteObject.
+ * Only AlleyOop carries s3:DeleteObject, and only on raw/ chunks and parked/ manifests:
+ * parked-session expiry and takeover cleanup (ObjectStore.delete) remove exactly those.
+ * A live manifest.json or a summary is never deletable by a pod role.
  * The deployment sets no PIPELINE_KEY_PREFIX, so every session key starts at `v1/`.
  */
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
@@ -186,7 +189,11 @@ export function workerPolicy(i: LockerRefs) {
   };
 }
 
-/** AlleyOop (ingest + courier routes): read session objects, write raw chunks and manifests. */
+/**
+ * AlleyOop (ingest + courier routes): read session objects, write raw chunks and
+ * manifests (the manifest.json grant also covers parked manifests), and delete only what
+ * parked-session cleanup removes: the parked manifest and its raw chunks.
+ */
 export function alleyoopPolicy(i: LockerRefs) {
   return {
     Version: "2012-10-17" as const,
@@ -198,6 +205,12 @@ export function alleyoopPolicy(i: LockerRefs) {
         Effect: "Allow" as const,
         Action: ["s3:PutObject"],
         Resource: [sessionObjects(i, "/raw/*"), sessionObjects(i, "/manifest.json")],
+      },
+      {
+        Sid: "DeleteParkedSessionObjects",
+        Effect: "Allow" as const,
+        Action: ["s3:DeleteObject"],
+        Resource: [sessionObjects(i, "/raw/*"), sessionObjects(i, "/parked/*")],
       },
       lockerKms(i, true),
     ],

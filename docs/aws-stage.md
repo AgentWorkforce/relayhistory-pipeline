@@ -308,13 +308,15 @@ key-policy grant for the Logs service, which is a separate decision.
 
 ### Pod roles (EKS Pod Identity), one per service account
 
-Derived from the code that uses the Locker (key layout `v1/ws=…/s=…/`); no
-role has `s3:DeleteObject` because the object store has no delete.
+Derived from the code that uses the Locker (key layout `v1/ws=…/s=…/`). Only
+AlleyOop has `s3:DeleteObject`, and only on `raw/` chunks and `parked/`
+manifests: parked-session expiry and takeover cleanup delete exactly those. No
+role can delete a live `manifest.json` or a summary.
 
 | Service account | S3 | KMS (via S3 only) |
 | --- | --- | --- |
 | `96bulls-worker` (indexer, referee, Bob Costas, migrate) | ListBucket; GetObject `v1/*`; PutObject `v1/*/summary/*` | Decrypt, GenerateDataKey |
-| `96bulls-alleyoop` | ListBucket; GetObject `v1/*`; PutObject `v1/*/raw/*`, `v1/*/manifest.json` | Decrypt, GenerateDataKey |
+| `96bulls-alleyoop` | ListBucket; GetObject `v1/*`; PutObject `v1/*/raw/*`, `v1/*/manifest.json`; DeleteObject `v1/*/raw/*`, `v1/*/parked/*` | Decrypt, GenerateDataKey |
 | `96bulls-search-worker` | explicit Deny `s3:*` on the Locker | explicit Deny `kms:*` on its key |
 | `otel-collector` | PutObject, AbortMultipartUpload `telemetry/traces/*` only | unchanged |
 
