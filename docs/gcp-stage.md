@@ -58,7 +58,7 @@ runtime image and proof.
 
 ### Machine-bound assertion activation gate
 
-The recorded one-off verifier minted its RelayAuth assertion directly through
+The original one-off verifier minted its RelayAuth assertion directly through
 the in-cluster port-forward. RelayAuth #113 changes that request contract: each
 mint must include the exact proof courier `machineId`, and the returned signed
 claim must contain the identical value at `meta.machineId`. A proof involving
@@ -73,11 +73,51 @@ service account; those bucket-direct operations do not traverse the HTTP
 machine gate. Their boundary is the vended Google credential and its
 bucket-level `roles/storage.objectUser` grant, not `meta.machineId`. Route tests
 therefore prove no bucket-direct isolation. The reviewed RelayAuth #113
-image/chart and the services image containing this change are now pinned in
-`versions.lock.json`. Pinning satisfies the artifact prerequisite only: GCP
-activation remains held until a new live proof records the request machine,
-signed claim, matching-route success, and claimless/mismatch zero-side-effect
-refusals.
+image/chart and the services image containing this change are pinned in
+`versions.lock.json`.
+
+The machine-bound activation gate passed live on 2026-11-01 against merge
+`4d4d459eeed854343ebe0c18f0974a872f43ac72`. The deployment used the services
+image built from `030f59c06f5be7736053a2d153c443246ca55840`, digest
+`sha256:68afce1d31930e76cd013b40b6a81eef552dd3338a2dc717edfc575862a74254`.
+The exact-merge plan contained 42 in-place updates and five actions, with no
+create or delete. The approved deploy reconciled 47 of 47 operations; the
+Cloud SQL action adopted the existing instance rather than recreating it. The
+migration Job `bulls96-worker-migrate-d5f64141` succeeded before the runtime
+readback.
+
+The verifier used proof courier
+`proof-gcp-mvy6pl6a110b6b-a`, session
+`01a19872-3572-78cb-845e-c132749c7672`, and trace
+`01a19872-3574-759d-93c7-984b42483762`. It established all of the following:
+
+- the requested machine and signed `meta.machineId` were identical;
+- a valid 60-second claimless assertion and a mismatched-machine assertion
+  were each refused with HTTP 403 `machine_claim_refused`, with zero HoopDB or
+  GCS side effects;
+- the matching-machine chunk and manifest were accepted, the manifest landed
+  in GCS, and `object-landed`, `session-indexed`, `summary-short`,
+  `summary-long`, and `status-classify` all completed `ok`;
+- both encrypted summary objects and ready summary pointers existed, the
+  session index and directory rows existed, the freshly reminted trace-read
+  token returned verdict `indexed`, and the tenant had zero dead letters; and
+- the planted record was intentionally open, so its correct pointer state was
+  `active`, with `scrubbed=true` and `scrub_quarantined=false`. An initial
+  verifier expectation of `done` was corrected; the pipeline result did not
+  change.
+
+After the proof, RelayAuth, the four 96Bulls services, and the Cloud SQL proxy
+were all available at their desired replica counts with zero restarts. Every
+96Bulls service pod ran the pinned digest above. The failed verifier's exact
+orphan prefix for machine `proof-gcp-mvy3w3f0c6e05a-a` and session
+`01a19829-f44c-7241-b40a-8eb3e556998f` was removed including object versions;
+successful proof evidence was retained. Temporary kubeconfigs, SSH keys, and
+the runner's deployment bundle were kept in tmpfs and removed after use.
+
+This passes the base GCP machine-bound application activation gate. It does
+not prove bucket-direct machine isolation, Relaycast HA, the separately gated
+V1 indexed search/product-route replay, backup and restore, a full teardown, or
+workload egress restriction.
 
 The stack entry point is `stacks/gcp/alchemy.gcp.run.ts`. It uses the same
 Alchemy + AgentWorkforce Helm boundary as the AWS stack: cloud code declares
@@ -480,9 +520,11 @@ Release boundaries that remain deliberate:
 ## Apply, verify, and teardown
 
 The substrate deployment and its live provider-path verification completed on
-2026-10-30. The base application proof completed on 2026-10-31 as recorded at
-the top of this guide. V1 indexed search, manifest replay through a product
-route, Relaycast HA, and full product teardown remain unproved. Static work
+2026-10-30. The base application proof completed on 2026-10-31, and the
+machine-bound activation gate passed on 2026-11-01, as recorded at the top of
+this guide. V1 indexed search, manifest replay through a product route,
+Relaycast HA, backup and restore, workload egress restriction, and full product
+teardown remain unproved. Static work
 does not wait on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down`
 refuse every `gcp-*` stage. `bin/96bulls plan gcp-*` calls
 `bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
@@ -654,4 +696,8 @@ Teardown, only after that apply, in this order:
 4. `bunx alchemy destroy --config stacks/gcp/alchemy.gcp.run.ts --stage "$STAGE" --no-input` with the same confirm env. Let Alchemy delete the resources it tracks; do not pre-delete Redis, Pub/Sub, GKE, networking, the bucket, Artifact Registry, Secret Manager, or the runtime service account and leave stale state behind. APIs stay enabled because the stack sets `disableOnDestroy: false`.
 5. Read-only proof of empty: `gcloud sql instances list`, `gcloud redis instances list --region=us-central1`, `gcloud container clusters list`, `gcloud compute networks list`, and `gcloud storage ls` against `$PROJECT` return no lane resources. On this dedicated project, disable the listed APIs only after those checks are empty.
 
-Do not delete the project until those lists are empty, and do not delete it without a separate request from Khaliq. Production remains Supabase and AWS S3. This lane is not end-to-end ready until the verify steps have passed on `agentrelay-96bulls-soc2-2610`.
+Do not delete the project until those lists are empty, and do not delete it
+without a separate request from Khaliq. Production remains Supabase and AWS
+S3. The base GCP application lane is live-proven on
+`agentrelay-96bulls-soc2-2610`; the explicitly excluded scopes above require
+separate proofs before broader GCP readiness is claimed.
