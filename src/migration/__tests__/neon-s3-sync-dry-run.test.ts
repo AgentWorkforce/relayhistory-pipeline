@@ -1,6 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { existsSync, statSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stateForRun } from "../neon-s3-sync/main.ts";
@@ -19,7 +20,16 @@ test("a dry run never writes the real watermark: it works on a private copy that
   live.seeRevisions(1, [{ org_id: "o", session_id: "s", revision: "3" }]);
   live.markExported("o", "s", 3, ["96bulls/o/v1/ws=w/m=m/h=h/d=2026/10/20/s=s/manifest.json"]);
   live.close();
-  const before = await readFile(real);
+  // The watermark's logical content (bytes can move with WAL checkpoints).
+  const dump = () => {
+    const d = new DatabaseSync(real, { readOnly: true });
+    try {
+      return JSON.stringify(["groups", "exported", "meta"].map((t) => d.prepare(`SELECT * FROM ${t} ORDER BY 1, 2`).all()));
+    } finally {
+      d.close();
+    }
+  };
+  const before = dump();
 
   const run = stateForRun(false, real, join(dir, "dry-runs"));
   expect(run.path).not.toBe(real);
@@ -33,7 +43,7 @@ test("a dry run never writes the real watermark: it works on a private copy that
   run.cleanup();
 
   expect(existsSync(run.path)).toBe(false);
-  expect(Buffer.compare(await readFile(real), before)).toBe(0);
+  expect(dump()).toBe(before);
   const check = new SyncState(real);
   expect(check.exported("o", "fake")).toBeUndefined();
   expect(check.exported("o", "s")!.revision).toBe(3);
