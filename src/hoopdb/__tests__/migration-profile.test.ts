@@ -14,7 +14,12 @@ import { tmpdir } from "node:os";
 import { schemaVerdict, type Transact } from "../../shared/db.ts";
 import {
   functionBoundaryEvidence,
+  isSupabaseCreatorEdge,
+  isSupabasePublicTemp,
+  isRuntimeWorkloadEdge,
   inventoryOf,
+  MIGRATION_CHECKSUM_ALIASES,
+  migrationChecksumMatches,
   sessionsFunctionAcl,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
   SUPABASE_PLATFORM_SUPERUSERS,
@@ -441,6 +446,32 @@ test("the runbook's 20261030020000 checksum is the file's real sha256", () => {
       "utf8",
     ),
   ).toContain(sha);
+  expect(MIGRATION_CHECKSUM_ALIASES).toEqual([
+    {
+      migration: "upstream:20261030020000_session_directory_short_summary.sql",
+      ledger_sha:
+        "c223b77e4c875cbc36499e6ca1c8e521b564ebf25facd87313b3e58335918de4",
+      accepted_as_alias_of: sha,
+    },
+  ]);
+  const [alias] = MIGRATION_CHECKSUM_ALIASES;
+  expect(
+    migrationChecksumMatches(
+      alias!.migration,
+      alias!.ledger_sha,
+      alias!.accepted_as_alias_of,
+    ),
+  ).toBe(true);
+  expect(
+    migrationChecksumMatches(
+      "upstream:20261030010000_session_directory.sql",
+      alias!.ledger_sha,
+      alias!.accepted_as_alias_of,
+    ),
+  ).toBe(false);
+  expect(migrationChecksumMatches(alias!.migration, "d".repeat(64), sha)).toBe(
+    false,
+  );
 });
 
 describe("runtime role: the exact least-privilege allowlist (hostile roles refused before any write)", () => {
@@ -496,7 +527,7 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
     [
       "the workload member WITH ADMIN OPTION",
       "CREATE ROLE g6_wl NOLOGIN; GRANT g6_bad TO g6_wl WITH ADMIN OPTION",
-      "granted to g6_wl WITH ADMIN OPTION",
+      "granted to g6_wl by postgres with ADMIN=true",
       { workloadRole: "g6_wl" },
     ],
     [
@@ -560,6 +591,11 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       "SELECT on g6_pub",
     ],
     [
+      "a direct table privilege in an inaccessible schema",
+      "CREATE SCHEMA g6_hidden; CREATE TABLE g6_hidden.g6_direct (x int); GRANT SELECT ON g6_hidden.g6_direct TO g6_bad",
+      "has privileges on table g6_hidden.g6_direct",
+    ],
+    [
       "a PUBLIC sequence privilege outside sessions",
       "CREATE SEQUENCE public.g6_pub_seq; GRANT USAGE ON SEQUENCE public.g6_pub_seq TO PUBLIC",
       "privileges on sequence g6_pub_seq",
@@ -605,6 +641,99 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       "WITH GRANT OPTION is not approved",
     ],
   ];
+
+  test("Supabase PG16+ creator-edge predicate has no wildcard or mutable option", () => {
+    const cfg = { mode: "supabase" as const };
+    const edge = {
+      rolname: "postgres",
+      grantor: "supabase_admin",
+      grantor_super: true,
+      admin_option: true,
+      inherit_option: false,
+      set_option: false,
+    };
+    expect(isSupabaseCreatorEdge(cfg, 170011, edge)).toBe(true);
+    expect(isSupabaseCreatorEdge({ mode: "selfhosted" }, 170011, edge)).toBe(
+      false,
+    );
+    expect(isSupabaseCreatorEdge(cfg, 150019, edge)).toBe(false);
+    expect(
+      isSupabaseCreatorEdge(
+        { ...cfg, workload: "authenticator" },
+        170011,
+        edge,
+      ),
+    ).toBe(true);
+    for (const mutation of [
+      { rolname: "relayhistory_owner" },
+      { grantor: "ops_admin" },
+      { grantor_super: false },
+      { admin_option: false },
+      { inherit_option: true },
+      { set_option: true },
+    ])
+      expect(isSupabaseCreatorEdge(cfg, 170011, { ...edge, ...mutation })).toBe(
+        false,
+      );
+  });
+
+  test("runtime workload edge is exact, inheriting and granted only by the hosted creator or a superuser", () => {
+    const cfg = {
+      mode: "supabase" as const,
+      workload: "bulls96_workload",
+    };
+    const edge = {
+      rolname: "bulls96_workload",
+      grantor: "postgres",
+      grantor_super: false,
+      admin_option: false,
+      inherit_option: true,
+      set_option: true,
+    };
+    expect(isRuntimeWorkloadEdge(cfg, edge, true)).toBe(true);
+    expect(isRuntimeWorkloadEdge(cfg, edge)).toBe(false);
+    expect(
+      isRuntimeWorkloadEdge(
+        { mode: "selfhosted", workload: "bulls96_workload" },
+        { ...edge, grantor: "cluster_admin", grantor_super: true },
+      ),
+    ).toBe(true);
+    for (const mutation of [
+      { rolname: "second_workload" },
+      { grantor: "app_owner" },
+      { admin_option: true },
+      { inherit_option: false },
+      { set_option: false },
+    ])
+      expect(isRuntimeWorkloadEdge(cfg, { ...edge, ...mutation }, true)).toBe(
+        false,
+      );
+    expect(isRuntimeWorkloadEdge({ mode: "supabase" }, edge)).toBe(false);
+  });
+
+  test("Supabase PUBLIC TEMP compatibility accepts only the frozen indirect baseline", () => {
+    const cfg = { mode: "supabase" as const };
+    const evidence = {
+      effective: true,
+      direct: false,
+      public: true,
+      public_grantable: false,
+    };
+    expect(isSupabasePublicTemp(cfg, evidence)).toBe(true);
+    expect(isSupabasePublicTemp({ mode: "selfhosted" }, evidence)).toBe(false);
+    expect(
+      isSupabasePublicTemp({ ...cfg, workload: "authenticator" }, evidence),
+    ).toBe(true);
+    for (const mutation of [
+      { effective: false },
+      { direct: true },
+      { public: false },
+      { public_grantable: true },
+    ])
+      expect(isSupabasePublicTemp(cfg, { ...evidence, ...mutation })).toBe(
+        false,
+      );
+  });
   for (const [name, setup, problem, extra] of HOSTILE)
     test(`refuses a runtime role with ${name}; ledger, marker and grants unchanged`, async () => {
       const db = await migrated();

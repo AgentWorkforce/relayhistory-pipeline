@@ -11,12 +11,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  functionBoundaryEvidence,
-  runtimeRoleViolations,
-  sequencePreflight,
-  type FunctionBoundaryMode,
-} from "./migrate-guards.ts";
+import { functionBoundaryEvidence, migrationChecksumAlias, migrationChecksumMatches, runtimeRoleViolations, sequencePreflight, type FunctionBoundaryMode } from "./migrate-guards.ts";
 import { openHoopDb, waitForHoopDb, ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE, ROLE_VERIFY_SQL_PATH, type ExpectedSchema } from "../shared/db.ts";
 import { log } from "../shared/log.ts";
 import { optional } from "../shared/env.ts";
@@ -43,7 +38,6 @@ interface Step {
   path: string;
   sentinel?: { evidence: string; sql: string };
 }
-
 /**
  * The database-mode contract. The migrator never infers the target from a hostname:
  * HOOPDB_DB_MODE is required and has no default.
@@ -92,33 +86,29 @@ function strictFlag(env: Record<string, string | undefined>, name: string): bool
 
 export function migrationProfile(env: Record<string, string | undefined> = process.env): MigrationProfile {
   const mode = env.HOOPDB_DB_MODE;
-  if (mode !== "local" && mode !== "selfhosted" && mode !== "supabase")
-    throw profileError("db_mode_invalid", "HOOPDB_DB_MODE must be local, selfhosted or supabase; there is no default");
+  if (mode !== "local" && mode !== "selfhosted" && mode !== "supabase") throw profileError("db_mode_invalid", "HOOPDB_DB_MODE must be local, selfhosted or supabase; there is no default");
   const shim = strictFlag(env, "HOOPDB_SUPABASE_SHIM");
   const bootstrap = strictFlag(env, "HOOPDB_ROLE_BOOTSTRAP");
   const verify = strictFlag(env, "HOOPDB_ROLE_VERIFY") ?? true;
   if (mode === "supabase" && shim) throw profileError("shim_forbidden", "the plain-Postgres role shim never runs in supabase mode");
-  if (mode === "supabase" && bootstrap)
-    throw profileError("bootstrap_forbidden", "the privileged role bootstrap never runs from the migrator in supabase mode");
-  if (mode !== "supabase" && shim === undefined)
-    throw profileError("shim_unset", `HOOPDB_SUPABASE_SHIM must be set explicitly in ${mode} mode`);
+  if (mode === "supabase" && bootstrap) throw profileError("bootstrap_forbidden", "the privileged role bootstrap never runs from the migrator in supabase mode");
+  if (mode !== "supabase" && shim === undefined) throw profileError("shim_unset", `HOOPDB_SUPABASE_SHIM must be set explicitly in ${mode} mode`);
   const ident = /^[A-Za-z_][A-Za-z0-9_$-]{0,62}$/;
   const runtimeRole = env.HOOPDB_RUNTIME_ROLE ?? "";
-  if (!ident.test(runtimeRole))
-    throw profileError("runtime_role_unset", "HOOPDB_RUNTIME_ROLE must name the role the services connect as");
+  if (!ident.test(runtimeRole)) throw profileError("runtime_role_unset", "HOOPDB_RUNTIME_ROLE must name the role the services connect as");
   const runtimeLogin = strictFlag(env, "HOOPDB_RUNTIME_ROLE_LOGIN");
-  if (mode !== "local" && runtimeLogin === undefined)
-    throw profileError("runtime_role_login_unset", `HOOPDB_RUNTIME_ROLE_LOGIN must be set explicitly in ${mode} mode`);
+  if (mode !== "local" && runtimeLogin === undefined) throw profileError("runtime_role_login_unset", `HOOPDB_RUNTIME_ROLE_LOGIN must be set explicitly in ${mode} mode`);
   const workloadRole = env.HOOPDB_RUNTIME_WORKLOAD_ROLE || undefined;
-  if (workloadRole !== undefined && !ident.test(workloadRole))
-    throw profileError("db_profile_invalid", "HOOPDB_RUNTIME_WORKLOAD_ROLE must be a role name");
+  if (workloadRole !== undefined && !ident.test(workloadRole)) throw profileError("db_profile_invalid", "HOOPDB_RUNTIME_WORKLOAD_ROLE must be a role name");
   if (env.HOOPDB_FUNCTION_BOUNDARY_APPROVED !== undefined)
     throw profileError("db_profile_invalid", "HOOPDB_FUNCTION_BOUNDARY_APPROVED was renamed HOOPDB_FUNCTION_BOUNDARY_MODE (it selects a catalog-proven control, it is not an approval); remove it");
   const fb = env.HOOPDB_FUNCTION_BOUNDARY_MODE || undefined;
   if (fb === "event-trigger")
-    throw profileError("function_boundary_mode_unimplemented", "HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger is not implemented yet (a reviewed trigger, verified by more than its name, is separate work); use global-default-revoke");
-  if (fb !== undefined && fb !== "global-default-revoke")
-    throw profileError("db_profile_invalid", "HOOPDB_FUNCTION_BOUNDARY_MODE must be global-default-revoke");
+    throw profileError(
+      "function_boundary_mode_unimplemented",
+      "HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger is not implemented yet (a reviewed trigger, verified by more than its name, is separate work); use global-default-revoke",
+    );
+  if (fb !== undefined && fb !== "global-default-revoke") throw profileError("db_profile_invalid", "HOOPDB_FUNCTION_BOUNDARY_MODE must be global-default-revoke");
   const runtime = {
     runtimeRole,
     ...(runtimeLogin === undefined ? {} : { runtimeLogin }),
@@ -130,8 +120,7 @@ export function migrationProfile(env: Record<string, string | undefined> = proce
     if (bootstrap) throw profileError("bootstrap_forbidden", "the privileged role bootstrap never runs from the migrator in supabase mode");
     return { mode, shim: false, bootstrap: false, verify, ...runtime };
   }
-  if (shim === undefined)
-    throw profileError("shim_unset", `HOOPDB_SUPABASE_SHIM must be set explicitly in ${mode} mode`);
+  if (shim === undefined) throw profileError("shim_unset", `HOOPDB_SUPABASE_SHIM must be set explicitly in ${mode} mode`);
   return { mode, shim, bootstrap: bootstrap ?? shim, verify, ...runtime };
 }
 
@@ -139,7 +128,10 @@ async function schemaSteps(): Promise<Step[]> {
   const upstream = (await readdir(UPSTREAM_MIGRATIONS)).filter((f) => f.endsWith(".sql")).sort();
   const ours = (await readdir(OURS)).filter((f) => f.endsWith(".sql")).sort();
   return [
-    ...upstream.map((f) => ({ name: `upstream:${f}`, path: join(UPSTREAM_MIGRATIONS, f) })),
+    ...upstream.map((f) => ({
+      name: `upstream:${f}`,
+      path: join(UPSTREAM_MIGRATIONS, f),
+    })),
     ...ours.map((f) => ({ name: `96bulls:${f}`, path: join(OURS, f) })),
   ];
 }
@@ -147,9 +139,23 @@ async function schemaSteps(): Promise<Step[]> {
 export async function plan(profile: MigrationProfile): Promise<Step[]> {
   return [
     ...(profile.shim ? [{ name: "shim:supabase_roles", path: SHIM }] : []),
-    ...(profile.bootstrap ? [{ name: "bootstrap:session_directory_search_worker", path: WORKER_BOOTSTRAP }] : []),
+    ...(profile.bootstrap
+      ? [
+          {
+            name: "bootstrap:session_directory_search_worker",
+            path: WORKER_BOOTSTRAP,
+          },
+        ]
+      : []),
     ...(await schemaSteps()),
-    ...(profile.verify ? [{ name: "verify:session_directory_search_worker", path: WORKER_VERIFY }] : []),
+    ...(profile.verify
+      ? [
+          {
+            name: "verify:session_directory_search_worker",
+            path: WORKER_VERIFY,
+          },
+        ]
+      : []),
   ];
 }
 
@@ -168,18 +174,32 @@ export async function generation(): Promise<string> {
   const upstream = (await readdir(UPSTREAM_MIGRATIONS)).filter((f) => f.endsWith(".sql")).sort();
   const ours = (await readdir(OURS)).filter((f) => f.endsWith(".sql")).sort();
   const steps: Step[] = [
-    ...upstream.map((f) => ({ name: `upstream:${f}`, path: join(UPSTREAM_MIGRATIONS, f) })),
+    ...upstream.map((f) => ({
+      name: `upstream:${f}`,
+      path: join(UPSTREAM_MIGRATIONS, f),
+    })),
     ...ours.map((f) => ({ name: `96bulls:${f}`, path: join(OURS, f) })),
     { name: "verify:session_directory_search_worker", path: WORKER_VERIFY },
   ];
   const parts: string[][] = [];
-  for (const s of steps) parts.push([s.name, createHash("sha256").update(await readFile(s.path, "utf8")).digest("hex")]);
+  for (const s of steps)
+    parts.push([
+      s.name,
+      createHash("sha256")
+        .update(await readFile(s.path, "utf8"))
+        .digest("hex"),
+    ]);
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }
 
 /** What readiness requires of HoopDb for this image (see schemaVerdict). */
 export async function expectedSchema(): Promise<ExpectedSchema> {
-  return { names: await expectedMigrationNames(), generation: await generation() };
+  const mode = process.env.HOOPDB_DB_MODE;
+  return {
+    names: await expectedMigrationNames(),
+    generation: await generation(),
+    ...(["local", "selfhosted", "supabase"].includes(mode ?? "") ? { dbMode: mode as MigrationProfile["mode"] } : {}),
+  };
 }
 
 /** The migrator's "pending first" write, under its advisory lock, before any step. */
@@ -222,10 +242,9 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
     // A HoopDb built from the old vendored pin cannot be moved forward in place:
     // upstream changed 20261025000600 after it was applied there. Say so plainly.
     if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
-      throw Object.assign(
-        new Error("96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)"),
-        { code: "legacy_schema" },
-      );
+      throw Object.assign(new Error("96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)"), {
+        code: "legacy_schema",
+      });
     }
     const runtime = await runtimeRolePreflight(client, profile);
     // Durable function boundary gate, every non-local mode: the selected control must be
@@ -253,10 +272,11 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
     // The runtime role reads the ledger and the marker for readiness: USAGE on the schema
     // (needed to reach them, creates nothing) and SELECT on those two tables, nothing else.
     if (runtime === "dedicated") {
-      const grant = await client.query<{ sql: string }>(
-        "SELECT format('GRANT USAGE ON SCHEMA sessions TO %I; GRANT SELECT ON %s, %s TO %I', $3::text, $1::text, $2::text, $3::text) AS sql",
-        [MIGRATION_LEDGER, ROLE_VALIDATION_TABLE, profile.runtimeRole],
-      );
+      const grant = await client.query<{ sql: string }>("SELECT format('GRANT USAGE ON SCHEMA sessions TO %I; GRANT SELECT ON %s, %s TO %I', $3::text, $1::text, $2::text, $3::text) AS sql", [
+        MIGRATION_LEDGER,
+        ROLE_VALIDATION_TABLE,
+        profile.runtimeRole,
+      ]);
       await client.query(grant.rows[0]!.sql);
     }
     const gen = await generation();
@@ -274,9 +294,9 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
       await client.query("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC");
       if (runtime !== "dedicated") return;
       const violations = await runtimeRoleViolations(client, runtimeCfg(profile), RUNTIME_TABLES, "post");
-      if (violations.length)
-        throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`);
+      if (violations.length) throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`);
     };
+    const bindDbMode = () => client.query("SELECT set_config('hoopdb.db_mode', $1, true)", [profile.mode]);
     let postChecked = false;
     for (const step of steps) {
       const sql = await readFile(step.path, "utf8");
@@ -288,6 +308,7 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
         if (verify && opts.beforeVerify) await opts.beforeVerify();
         await client.query("BEGIN");
         try {
+          await bindDbMode();
           if (verify) await hardenAndCheck();
           await client.query(sql);
           if (verify) {
@@ -301,15 +322,22 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
           await client.query("COMMIT");
         } catch (err) {
           await client.query("ROLLBACK");
-          log.error("role check failed", { reason: step.name, error_code: (err as { code?: string }).code ?? "role_check_failed" });
+          log.error("role check failed", {
+            reason: step.name,
+            error_code: (err as { code?: string }).code ?? "role_check_failed",
+          });
           throw err;
         }
-        log.info(verify ? "role validation passed" : "role check passed", { reason: verify ? gen : step.name });
+        log.info(verify ? "role validation passed" : "role check passed", {
+          reason: verify ? gen : step.name,
+        });
         continue;
       }
       const sha = createHash("sha256").update(sql).digest("hex");
       const seen = ledger.get(step.name);
-      if (seen === sha) {
+      if (seen && migrationChecksumMatches(step.name, seen, sha)) {
+        const alias = migrationChecksumAlias(step.name, seen, sha);
+        if (alias) log.info("accepted historical migration checksum", alias);
         skipped += 1;
         continue;
       }
@@ -319,12 +347,16 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
       }
       await client.query("BEGIN");
       try {
+        await bindDbMode();
         await client.query(sql);
         await client.query(`INSERT INTO ${MIGRATION_LEDGER} (name, sha256) VALUES ($1, $2)`, [step.name, sha]);
         await client.query("COMMIT");
       } catch (err) {
         await client.query("ROLLBACK");
-        log.error("migration failed", { reason: step.name, error_code: (err as { code?: string }).code ?? "migration_failed" });
+        log.error("migration failed", {
+          reason: step.name,
+          error_code: (err as { code?: string }).code ?? "migration_failed",
+        });
         throw err;
       }
       applied += 1;
@@ -334,6 +366,7 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
       // In-process verifier off: the same hardening and runtime check, in one transaction.
       await client.query("BEGIN");
       try {
+        await bindDbMode();
         await hardenAndCheck();
         await client.query("COMMIT");
       } catch (err) {
@@ -341,8 +374,7 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
         throw err;
       }
     }
-    if (!steps.some((s) => s.name.startsWith("verify:")))
-      log.info("role validation left pending: in-process verifier disabled; an external verifier must pass it", { reason: gen });
+    if (!steps.some((s) => s.name.startsWith("verify:"))) log.info("role validation left pending: in-process verifier disabled; an external verifier must pass it", { reason: gen });
   } finally {
     await client.query("SELECT pg_advisory_unlock(961996, 1)").catch(() => undefined);
   }
@@ -350,7 +382,10 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
   return { applied, skipped };
 }
 
-const RUNTIME_TABLES = { ledger: MIGRATION_LEDGER, marker: ROLE_VALIDATION_TABLE };
+const RUNTIME_TABLES = {
+  ledger: MIGRATION_LEDGER,
+  marker: ROLE_VALIDATION_TABLE,
+};
 const runtimeCfg = (p: MigrationProfile) => ({
   mode: p.mode,
   role: p.runtimeRole,
@@ -361,9 +396,7 @@ const runtimeCfg = (p: MigrationProfile) => ({
 async function readLedger(client: MigrationClient): Promise<Map<string, string>> {
   const there = (await client.query<{ r: string | null }>("SELECT to_regclass($1)::text AS r", [MIGRATION_LEDGER])).rows[0]?.r;
   if (!there) return new Map();
-  return new Map(
-    (await client.query<{ name: string; sha256: string }>(`SELECT name, sha256 FROM ${MIGRATION_LEDGER}`)).rows.map((r) => [r.name, r.sha256]),
-  );
+  return new Map((await client.query<{ name: string; sha256: string }>(`SELECT name, sha256 FROM ${MIGRATION_LEDGER}`)).rows.map((r) => [r.name, r.sha256]));
 }
 
 /**
@@ -372,19 +405,15 @@ async function readLedger(client: MigrationClient): Promise<Map<string, string>>
  * allowlist (runtimeRoleViolations). Otherwise it fails closed before any write.
  */
 async function runtimeRolePreflight(client: MigrationClient, profile: MigrationProfile): Promise<"owner" | "dedicated"> {
-  const r = (
-    await client.query<{ rolname: string; me: string }>("SELECT rolname, current_user AS me FROM pg_roles WHERE rolname = $1", [profile.runtimeRole])
-  ).rows[0];
+  const r = (await client.query<{ rolname: string; me: string }>("SELECT rolname, current_user AS me FROM pg_roles WHERE rolname = $1", [profile.runtimeRole])).rows[0];
   if (!r) throw profileError("runtime_role_missing", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} does not exist; nothing was written`);
   if (r.rolname === r.me) {
-    if (profile.mode !== "local")
-      throw profileError("runtime_role_unsafe", `in ${profile.mode} mode the services need a dedicated runtime role, not the migration owner`);
+    if (profile.mode !== "local") throw profileError("runtime_role_unsafe", `in ${profile.mode} mode the services need a dedicated runtime role, not the migration owner`);
     return "owner";
   }
   if (r.rolname === ROLE_VALIDATION_NAME) throw profileError("runtime_role_unsafe", "HOOPDB_RUNTIME_ROLE must not be the search Worker");
   const violations = await runtimeRoleViolations(client, runtimeCfg(profile), RUNTIME_TABLES, "pre");
-  if (violations.length)
-    throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`);
+  if (violations.length) throw profileError("runtime_role_unsafe", `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`);
   return "dedicated";
 }
 
@@ -395,8 +424,7 @@ async function runtimeRolePreflight(client: MigrationClient, profile: MigrationP
  * (mixed_migration_authority). See the runbook decision point.
  */
 async function cliHistoryPreflight(client: MigrationClient, schema: Step[]): Promise<void> {
-  const reg = async (name: string) =>
-    (await client.query<{ r: string | null }>("SELECT to_regclass($1)::text AS r", [name])).rows[0]?.r ?? null;
+  const reg = async (name: string) => (await client.query<{ r: string | null }>("SELECT to_regclass($1)::text AS r", [name])).rows[0]?.r ?? null;
   let cliHistory: string | null;
   try {
     cliHistory = await reg("supabase_migrations.schema_migrations");
@@ -411,20 +439,14 @@ async function cliHistoryPreflight(client: MigrationClient, schema: Step[]): Pro
     const versions = schema.filter((st) => st.name.startsWith("upstream:")).map((st) => st.name.slice("upstream:".length).split("_")[0]!);
     let hit: { version: string }[];
     try {
-      hit = (
-        await client.query<{ version: string }>(
-          "SELECT version FROM supabase_migrations.schema_migrations WHERE version = ANY($1::text[]) ORDER BY version",
-          [versions],
-        )
-      ).rows;
+      hit = (await client.query<{ version: string }>("SELECT version FROM supabase_migrations.schema_migrations WHERE version = ANY($1::text[]) ORDER BY version", [versions])).rows;
     } catch (err) {
       // Present but unreadable by the migrator: it can't prove there is no second authority.
       if ((err as { code?: string }).code === "42501")
         throw profileError("mixed_migration_authority", "supabase_migrations.schema_migrations exists but the migrator cannot read it; one authority only, see the runbook decision point");
       throw err;
     }
-    if (hit.length)
-      throw profileError("mixed_migration_authority", `supabase db push recorded ${hit.map((h) => h.version).join(", ")}; one authority only, see the runbook decision point`);
+    if (hit.length) throw profileError("mixed_migration_authority", `supabase db push recorded ${hit.map((h) => h.version).join(", ")}; one authority only, see the runbook decision point`);
   }
 }
 
@@ -447,6 +469,25 @@ export async function migrate(): Promise<{ applied: number; skipped: number }> {
   }
 }
 
+async function checksumAliasEvidence(client: MigrationClient) {
+  const there = (await client.query<{ r: string | null }>("SELECT to_regclass($1)::text AS r", [MIGRATION_LEDGER])).rows[0]?.r;
+  if (!there) return [];
+  const rows = (await client.query<{ name: string; sha256: string }>(`SELECT name, sha256 FROM ${MIGRATION_LEDGER}`)).rows;
+  const steps = await schemaSteps();
+  const actual = new Map<string, string>();
+  for (const step of steps)
+    actual.set(
+      step.name,
+      createHash("sha256")
+        .update(await readFile(step.path, "utf8"))
+        .digest("hex"),
+    );
+  return rows.flatMap((row) => {
+    const alias = migrationChecksumAlias(row.name, row.sha256, actual.get(row.name) ?? "");
+    return alias ? [alias] : [];
+  });
+}
+
 if (import.meta.main) {
   process.env.OTEL_SERVICE_NAME ||= "hoopdb-migrate";
   if (process.argv.includes("--activation-check")) {
@@ -461,9 +502,9 @@ if (import.meta.main) {
     }
     const db = openHoopDb();
     const mode = migrationProfileMode();
-    functionBoundaryEvidence(db, mode, dbMode as DbMode | undefined)
-      .then(async (e) => {
-        console.log(JSON.stringify(e));
+    Promise.all([functionBoundaryEvidence(db, mode, dbMode as DbMode | undefined), checksumAliasEvidence(db)])
+      .then(async ([e, migration_checksum_aliases]) => {
+        console.log(JSON.stringify({ ...e, migration_checksum_aliases }));
         await db.end();
         process.exit(e.satisfied ? 0 : 1);
       })
@@ -482,7 +523,9 @@ if (import.meta.main) {
     migrate()
       .then(() => process.exit(0))
       .catch((err) => {
-        log.error("hoopdb migrate exited", { error_code: (err as { code?: string }).code ?? "migrate_failed" });
+        log.error("hoopdb migrate exited", {
+          error_code: (err as { code?: string }).code ?? "migrate_failed",
+        });
         if (optional("DEBUG", "") === "1") console.error(err);
         process.exit(1);
       });

@@ -43,10 +43,10 @@
 -- Required: NOLOGIN, NOINHERIT, NOBYPASSRLS, not SUPERUSER, CREATEROLE, CREATEDB or
 -- REPLICATION. Its only setting (pg_db_role_setting) is the role-wide
 -- statement_timeout=2s, spelled exactly so: '2000ms', '2000' or an extra setting are
--- refused. It is a member of no role. Its only member may be `authenticator`,
--- NOINHERIT, without ADMIN OPTION (and on PostgreSQL 16+ without INHERIT on the grant).
--- So no other role, the migration owner included, holds membership or ADMIN OPTION on
--- it. It owns no objects and holds no explicit privileges, except USAGE on schema
+-- refused. It is a member of no role. Allowed members are `authenticator` under the
+-- existing contract and, only when the migrator binds exact `supabase` mode on PG16+,
+-- the unavoidable postgres creator edge granted by superuser supabase_admin with ADMIN
+-- true and INHERIT/SET false. It owns no objects and holds no explicit privileges, except USAGE on schema
 -- `sessions`, which this migration grants.
 DO $role_guard$
 DECLARE
@@ -54,6 +54,8 @@ DECLARE
   v_problems text[] := '{}';
   v_row record;
   v_settings text;
+  v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
+  v_version int := current_setting('server_version_num')::int;
 BEGIN
   SELECT oid INTO v_oid FROM pg_roles WHERE rolname = 'session_directory_search_worker';
   IF v_oid IS NULL THEN
@@ -93,16 +95,35 @@ BEGIN
                 WHERE m.member = v_oid LOOP
     v_problems := array_append(v_problems, format('member of %I', v_row.rolname)::text);
   END LOOP;
-  FOR v_row IN SELECT r.rolname, r.rolinherit, m.admin_option FROM pg_auth_members AS m
-                 JOIN pg_roles AS r ON r.oid = m.member
-                WHERE m.roleid = v_oid LOOP
-    IF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
-      v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
-    END IF;
-  END LOOP;
+  IF v_version >= 160000 THEN
+    FOR v_row IN EXECUTE
+      'SELECT r.rolname, r.rolinherit, g.rolname AS grantor, g.rolsuper AS grantor_super,
+              m.admin_option, m.inherit_option, m.set_option
+         FROM pg_auth_members AS m
+         JOIN pg_roles AS r ON r.oid = m.member
+         JOIN pg_roles AS g ON g.oid = m.grantor
+        WHERE m.roleid = $1 ORDER BY r.rolname, g.rolname' USING v_oid LOOP
+      IF v_mode = 'supabase'
+         AND v_row.rolname = 'postgres'
+         AND v_row.grantor = 'supabase_admin' AND v_row.grantor_super
+         AND v_row.admin_option AND NOT v_row.inherit_option AND NOT v_row.set_option THEN
+        NULL;
+      ELSIF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
+        v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+      END IF;
+    END LOOP;
+  ELSE
+    FOR v_row IN SELECT r.rolname, r.rolinherit, m.admin_option FROM pg_auth_members AS m
+                   JOIN pg_roles AS r ON r.oid = m.member
+                  WHERE m.roleid = v_oid LOOP
+      IF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
+        v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+      END IF;
+    END LOOP;
+  END IF;
   -- PostgreSQL 16+ records INHERIT per grant; refuse an inheriting grant even to a
   -- NOINHERIT member. (Dynamic: the column does not exist before 16.)
-  IF current_setting('server_version_num')::int >= 160000 THEN
+  IF v_version >= 160000 THEN
     FOR v_row IN EXECUTE
       'SELECT r.rolname FROM pg_auth_members AS m JOIN pg_roles AS r ON r.oid = m.member
         WHERE m.roleid = $1 AND m.inherit_option' USING v_oid LOOP

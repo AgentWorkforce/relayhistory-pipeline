@@ -1,10 +1,11 @@
-# Runtime use of temporary objects (evidence for the no-TEMPORARY runtime role)
+# Runtime use of temporary objects and search paths
 
-The migrator refuses a runtime role with effective `TEMPORARY` on the database
-(`src/hoopdb/migrate-guards.ts`). This file records the search showing that no HoopDb
-runtime code path creates temporary objects, so that refusal removes nothing a service
-needs. Regenerate it with the commands below. Searched at commit `613627a73d8471a063eade824c04c27770bb968f` (the parent of
-the commit that adds this file).
+The migrator refuses effective `TEMPORARY` outside the catalog-exact Supabase PUBLIC
+baseline (`src/hoopdb/migrate-guards.ts`). This file records the search showing that no
+HoopDb runtime code path creates temporary objects, and that every `pg_temp` occurrence
+is a fixed function `search_path` used for hardening rather than runtime name resolution.
+The Supabase exception is therefore hosted-platform compatibility, not a service
+requirement. Regenerate the evidence with the commands below.
 
 ## What runs at runtime
 
@@ -57,8 +58,10 @@ nothing. It also excludes the migrator guard's own pattern in `src/hoopdb/migrat
 | `docker`                    | 0           | 0                                             |
 
 **Result:** zero matches that create or use a temporary object in any root. Every match is
-`pg_temp` in a `SET search_path` clause, or the guard's own pattern. No service needs
-`TEMPORARY`.
+`pg_temp` in a function-local `SET search_path` clause, or the guard's own pattern. The
+function clauses explicitly begin with `pg_catalog` and, where needed, `sessions`; putting
+`pg_temp` last prevents caller-controlled name shadowing. No service needs `TEMPORARY` or
+depends on the login role's runtime `search_path`.
 
 ## Consequence
 
@@ -67,5 +70,8 @@ nothing. It also excludes the migrator guard's own pattern in `src/hoopdb/migrat
   PUBLIC for it loses it (the owner and superusers keep it). A real PostgreSQL test shows
   an unrelated role losing it (`scripts/pg-proof/role-proof.ts`, "selfhosted bootstrap
   revokes TEMPORARY from PUBLIC").
-- **supabase:** the migrator only detects and refuses. The operator owns the project
-  database's ACL: see the runbook.
+- **supabase:** the hosted baseline keeps TEMPORARY on PUBLIC. The migrator accepts it
+  only when the role has no direct TEMPORARY ACL, PUBLIC's ACL has no GRANT OPTION, and
+  the mode is exactly `supabase`. A configured workload does not alter this database-wide
+  PUBLIC baseline. Direct grants and all other modes fail closed. The residual capability
+  to create temporary objects is real, but no searched runtime path uses it.

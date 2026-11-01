@@ -20,9 +20,10 @@
 --   role      the phase 1 spec: NOLOGIN NOINHERIT NOBYPASSRLS, no SUPERUSER,
 --             CREATEROLE, CREATEDB or REPLICATION; exactly one setting, role-wide
 --             statement_timeout=2s.
---   members   a member of no role. Its only allowed member is the separately approved
---             authenticator binding: `authenticator`, NOINHERIT, without ADMIN OPTION,
---             and on PostgreSQL 16+ without an INHERIT grant.
+--   members   a member of no role. Allowed members are the separately approved
+--             authenticator binding and, only with mode `supabase` on PG16+, the exact
+--             postgres creator edge granted by superuser supabase_admin with ADMIN true
+--             and INHERIT/SET false.
 --   grants    direct aclitems naming this role (PUBLIC grants are not the role's own
 --             and are ignored) must be exactly:
 --               USAGE on schema sessions;
@@ -65,6 +66,8 @@ DECLARE
   v_fns oid[] := '{}';
   v_fn oid;
   v_sig text;
+  v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
+  v_version int := current_setting('server_version_num')::int;
 BEGIN
   SELECT oid INTO v_oid FROM pg_roles WHERE rolname = 'session_directory_search_worker';
   IF v_oid IS NULL THEN
@@ -100,18 +103,35 @@ BEGIN
                 WHERE m.member = v_oid LOOP
     v_problems := array_append(v_problems, format('member of %I', v_row.rolname)::text);
   END LOOP;
-  FOR v_row IN SELECT r.rolname, r.rolinherit, m.admin_option FROM pg_auth_members AS m
-                 JOIN pg_roles AS r ON r.oid = m.member
-                WHERE m.roleid = v_oid LOOP
-    IF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
-      v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
-    END IF;
-  END LOOP;
-  IF current_setting('server_version_num')::int >= 160000 THEN
+  IF v_version >= 160000 THEN
+    FOR v_row IN EXECUTE
+      'SELECT r.rolname, r.rolinherit, g.rolname AS grantor, g.rolsuper AS grantor_super,
+              m.admin_option, m.inherit_option, m.set_option
+         FROM pg_auth_members AS m
+         JOIN pg_roles AS r ON r.oid = m.member
+         JOIN pg_roles AS g ON g.oid = m.grantor
+        WHERE m.roleid = $1 ORDER BY r.rolname, g.rolname' USING v_oid LOOP
+      IF v_mode = 'supabase'
+         AND v_row.rolname = 'postgres'
+         AND v_row.grantor = 'supabase_admin' AND v_row.grantor_super
+         AND v_row.admin_option AND NOT v_row.inherit_option AND NOT v_row.set_option THEN
+        NULL;
+      ELSIF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
+        v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+      END IF;
+    END LOOP;
     FOR v_row IN EXECUTE
       'SELECT r.rolname FROM pg_auth_members AS m JOIN pg_roles AS r ON r.oid = m.member
         WHERE m.roleid = $1 AND m.inherit_option' USING v_oid LOOP
       v_problems := array_append(v_problems, format('granted WITH INHERIT to %I', v_row.rolname)::text);
+    END LOOP;
+  ELSE
+    FOR v_row IN SELECT r.rolname, r.rolinherit, m.admin_option FROM pg_auth_members AS m
+                   JOIN pg_roles AS r ON r.oid = m.member
+                  WHERE m.roleid = v_oid LOOP
+      IF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
+        v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+      END IF;
     END LOOP;
   END IF;
 
