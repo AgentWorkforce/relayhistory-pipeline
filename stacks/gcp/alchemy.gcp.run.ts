@@ -67,7 +67,7 @@ import {
 } from "./apply-authorization.ts";
 import { requireServiceAccountActAs, type ServiceAccountActAsProof } from "./iam-preflight.ts";
 import { fetchRedisServerCa, redisAdminFetchTransport } from "./redis-ca.ts";
-import { PRIVATE_GOOGLE_APIS_RECORDS, assertInClusterJwks, bulls96NetworkPolicies } from "./egress.ts";
+import { PRIVATE_GOOGLE_APIS_RECORDS, assertInClusterJwks, bulls96NetworkPolicies, relayauthNetworkPolicies } from "./egress.ts";
 import {
   alleyoopWriteCondition,
   ensureConditionalBucketBindings,
@@ -832,6 +832,19 @@ export default Alchemy.Stack(
               },
             },
           });
+          // Default deny plus AlleyOop :8787 in and DNS out (egress.ts).
+          for (const policy of relayauthNetworkPolicies({ publicJwksIngress: Boolean(relayauthConfig.baseUrl) })) {
+            yield* Kubernetes.Manifest(`relayauth-netpol-${policy.metadata.name}`, {
+              cluster,
+              manifest: {
+                ...policy,
+                metadata: {
+                  ...policy.metadata,
+                  annotations: { "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof },
+                },
+              },
+            });
+          }
           if (relayauthConfig.baseUrl)
             yield* Kubernetes.Manifest("relayauth-certificate", {
               cluster,

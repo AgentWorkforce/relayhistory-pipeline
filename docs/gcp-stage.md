@@ -94,8 +94,14 @@ A private Cloud DNS zone for `googleapis.com`, bound to the stage VPC, maps
 the subnet, every Google API call stays on the private VIPs, so no rule allows
 the public internet: no arbitrary HTTPS, no external DNS resolver, and no other
 namespace. Kubelet probes and `kubectl port-forward` originate on the node and
-are not subject to pod policy. The `relayauth` namespace is not restricted by
-this change. Applying the policy requires `bulls96.relayauthJwksUrl` to be the
+are not subject to pod policy.
+
+The `relayauth` namespace gets the same default deny. RelayAuth is
+self-contained: SQLite on its own PVC, file-mounted secrets, no Google identity
+and no outbound calls. Its only egress is DNS, and its only ingress is `:8787`
+from the 96Bulls AlleyOop pods. When a public JWKS Ingress is configured
+(`relayauth.baseUrl`), `:8787` is also admitted from the GCE load-balancer and
+health-check ranges (`130.211.0.0/22`, `35.191.0.0/16`), and nothing else. Applying the policy requires `bulls96.relayauthJwksUrl` to be the
 in-cluster RelayAuth service, the only JWKS destination it allows; a public JWKS
 URL is refused rather than silently cut off. Deliberately not allowed: in-cluster
 ingress to AlleyOop (nothing calls it in-cluster and it has no Ingress or load
