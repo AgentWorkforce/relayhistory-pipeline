@@ -152,6 +152,7 @@ export interface BucketIamAuth {
 export type BucketIamFetch = (url: string, init: RequestInit) => Promise<Response>;
 
 const STORAGE = "https://storage.googleapis.com/storage/v1/b";
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Read-modify-write the bucket's v3 IAM policy under its etag, retrying a
@@ -162,8 +163,9 @@ export async function ensureConditionalBucketBindings(
   desired: readonly ConditionalBinding[],
   auth: BucketIamAuth,
   transport: BucketIamFetch = fetch,
-  attempts = 5,
+  attempts = 8,
   forbidden: readonly string[] = [],
+  backoffMs = 3_000,
 ): Promise<{ changed: boolean }> {
   objects(bucket);
   const url = `${STORAGE}/${encodeURIComponent(bucket)}/iam`;
@@ -176,8 +178,16 @@ export async function ensureConditionalBucketBindings(
     if (!changed) return { changed: false };
     const write = await transport(url, { method: "PUT", headers, body: JSON.stringify(policy) });
     if (write.ok) return { changed: true };
+    // 412/409: a concurrent policy write; re-read. 400: a service account created
+    // seconds ago is not yet a valid member (Alchemy's IAM helper notes the same);
+    // back off and retry. Anything else, or a 400 that persists, fails closed.
+    const reason = (await write.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 300);
+    if (write.status === 400 && attempt < attempts) {
+      await sleep(attempt * backoffMs);
+      continue;
+    }
     if (write.status !== 412 && write.status !== 409)
-      throw new Error(`96bulls: locker IAM policy write failed with HTTP ${write.status}.`);
+      throw new Error(`96bulls: locker IAM policy write failed with HTTP ${write.status}: ${reason}`);
   }
   throw new Error("96bulls: locker IAM policy kept changing concurrently; conditional bindings not converged.");
 }

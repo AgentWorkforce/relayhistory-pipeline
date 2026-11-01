@@ -139,6 +139,22 @@ describe("ensureConditionalBucketBindings", () => {
     expect(calls[3]!.body!.version).toBe(3);
   });
 
+  it("retries a 400 from a just-created member, then succeeds", async () => {
+    let puts = 0;
+    expect(
+      await ensureConditionalBucketBindings(
+        BUCKET,
+        desired,
+        { bearer: "t" },
+        async (_u, init) => (init.method === "GET" ? response(200, {}) : ++puts < 3 ? response(400) : response(200)),
+        8,
+        [],
+        0,
+      ),
+    ).toEqual({ changed: true });
+    expect(puts).toBe(3);
+  });
+
   it("does not write when already converged, and fails closed on a read or write error", async () => {
     const converged = reconcileConditionalBindings({ version: 3, etag: "e", bindings: [viewer] }, desired).policy;
     let writes = 0;
@@ -151,9 +167,24 @@ describe("ensureConditionalBucketBindings", () => {
     await expect(ensureConditionalBucketBindings(BUCKET, desired, { bearer: "t" }, async () => response(403))).rejects.toThrow("read failed with HTTP 403");
     await expect(
       ensureConditionalBucketBindings(BUCKET, desired, { bearer: "t" }, async (_u, init) =>
-        init.method === "GET" ? response(200, {}) : response(400),
+        init.method === "GET" ? response(200, {}) : response(403, { error: { message: "denied" } }),
       ),
-    ).rejects.toThrow("write failed with HTTP 400");
+    ).rejects.toThrow(/write failed with HTTP 403: .*denied/);
+    // A 400 that persists past every retry still fails closed, with the reason.
+    let puts = 0;
+    await expect(
+      ensureConditionalBucketBindings(
+        BUCKET,
+        desired,
+        { bearer: "t" },
+        async (_u, init) =>
+          init.method === "GET" ? response(200, {}) : (puts++, response(400, { error: { message: "bad member" } })),
+        3,
+        [],
+        0,
+      ),
+    ).rejects.toThrow(/HTTP 400: .*bad member/);
+    expect(puts).toBe(3);
   });
 });
 
