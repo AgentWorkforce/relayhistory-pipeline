@@ -325,3 +325,47 @@ describe("availability: lines ending in =, : or a keyword are stored, not refuse
       expect(out.length).toBeGreaterThan(300 * 1024);
     }, 120_000);
 });
+
+// ---------------------------------------------------------------- review #3 of aff76c5
+
+describe("record boundaries: bounded work and intact records", () => {
+  it("mixed text and JSON logs run no boundary scrub without a credential cue (counted)", () => {
+    let text = "";
+    for (let n = 0; text.length < 1024 * 1024; n++)
+      text += `2026-11-01 worker ${n} handled request in 12ms\n${JSON.stringify({ n, msg: "ok", path: `/v1/x/${n}` })}\n`;
+    const before = segmenterWork.candidates;
+    const out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
+    // Rule set 1 ran none; a check per record line here would be ~20,000.
+    expect(segmenterWork.candidates - before).toBeLessThan(50);
+    expect(out).toBe(text);
+  }, 120_000);
+
+  it("a log where every line is a cue before a JSON record costs a bounded number of checks per chunk", () => {
+    let text = "";
+    for (let n = 0; text.length < 1024 * 1024; n++) text += `config token:\n${JSON.stringify({ n, msg: "ok" })}\n`;
+    const before = segmenterWork.candidates;
+    const out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
+    expect(segmenterWork.candidates - before).toBeLessThanOrEqual(256);
+    // Objects stay intact past the cap (the cap only ever redacts a leading JSON string).
+    expect(out).toBe(text);
+  }, 120_000);
+
+  for (const cue of ["password:", "token:", "key ="]) {
+    it(`a JSON object or array after \`${cue}\` stays byte-identical`, () => {
+      for (const record of [JSON.stringify({ a: 1, b: "x" }), JSON.stringify([1, "two"])]) {
+        const text = `log line\nconfig ${cue}\n${record}\nafter\n`;
+        const out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
+        expect(out.split("\n")[2]).toBe(record);
+        expect(out.endsWith("after\n")).toBe(true);
+      }
+    });
+  }
+
+  it("a JSON string that is the value of a keyword on the line before is redacted and stays valid JSON", () => {
+    const secret = "Zq8vR2kLm9Xp4Tn7Wc3Ys6HdQQ";
+    const out = dec.decode(scrubRecords(enc.encode(`log\nDB_PASSWORD=\n"${secret}"\nnext\n`)).scrubbed);
+    expect(out).not.toContain(secret);
+    expect(JSON.parse(out.split("\n")[2]!)).toBe("[REDACTED]");
+    expect(out.endsWith("next\n")).toBe(true);
+  });
+});

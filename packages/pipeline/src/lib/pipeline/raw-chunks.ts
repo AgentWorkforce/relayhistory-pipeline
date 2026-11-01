@@ -101,24 +101,42 @@ export function scrubRecords(source: Uint8Array): {
       la += (parts[j] ?? "") + (parts[j + 1] ?? "");
     return la;
   };
-  /** Whether the run may end here (the boundary before line `i`) without splitting a match. */
-  const boundarySafe = (i: number) =>
-    !run || cutIsSafe(run + lookaheadAt(i), run.length, { checks: 0, candidates: 0 }).ok;
+  /**
+   * Whether the run may end here (the boundary before line `i`) without
+   * splitting a match. Only a credential cue (a keyword or `:`/`=`) right
+   * before the run's trailing whitespace can reach across a line into the
+   * next one (digit groups are checked too, cheaply); without one, no scrub
+   * runs, so mixed text-and-JSON logs cost what they did in rule set 1.
+   */
+  const boundarySafe = (i: number) => {
+    if (!run) return true;
+    let start = run.length;
+    while (start > 0 && /\s/.test(run[start - 1]!)) start--;
+    const cue = CREDENTIAL_KEYWORD.test(run.slice(Math.max(0, start - 64), start));
+    const digits = /[\d)]/.test(run[start - 1] ?? "") && /^\s*[\d(]/.test(parts[i] ?? "");
+    if (!cue && !digits) return true;
+    // Bounded per chunk: past the cap a cued boundary is treated as unsafe
+    // (a leading JSON string after it is redacted; a key line stays in the run).
+    if (boundaryChecks >= MAX_BOUNDARY_CHECKS) return false;
+    boundaryChecks += 1;
+    return cutIsSafe(run + lookaheadAt(i), run.length, { checks: 0, candidates: 0 }).ok;
+  };
+  let boundaryChecks = 0;
   for (let i = 0; i < parts.length; i += 2) {
     const line = parts[i]!;
     const ending = parts[i + 1] ?? "";
     if (ending) records += 1;
     if (isRecord(line)) {
-      if (!keyOpen && boundarySafe(i)) {
-        flush();
-        keyOpen = false;
-        out += scrubRecordLine(line) + ending;
-        continue;
-      }
-      // The run ends in a keyword or a match that reaches into this record
-      // (`DB_PASSWORD=` then `"<secret>"`): the record is scrubbed as a record
-      // and then stays in the run, so the run's text rules see it in context.
-      run += scrubRecordLine(line) + ending;
+      // The run's text may end in a keyword whose value is this record
+      // (`DB_PASSWORD=` then `"<secret>"`). The record is scrubbed once, as a
+      // record, and kept intact; if the boundary splits a match, the value the
+      // text rule would take, a leading JSON string, is redacted in place. (A
+      // record that opens with `{` or `[` offers the rule only the bracket.)
+      const safe = keyOpen || boundarySafe(i);
+      flush();
+      keyOpen = false;
+      const scrubbed = scrubRecordLine(line);
+      out += (safe ? scrubbed : redactLeadingString(scrubbed)) + ending;
       continue;
     }
     const next = line + ending;
@@ -162,6 +180,8 @@ export function scrubRecords(source: Uint8Array): {
 const MAX_CUT_GAP = 1024;
 /** Most candidate cuts a segment search fully checks before refusing (bounds CPU). */
 const MAX_CUT_CHECKS = 48;
+/** Most context-checked record or key-line boundaries per chunk (bounds CPU on cue-heavy logs). */
+const MAX_BOUNDARY_CHECKS = 256;
 /** Most candidates of any kind (cheap refusals included) a segment search looks at. */
 const MAX_CUT_CANDIDATES = 4096;
 /**
@@ -303,6 +323,15 @@ function privateKeyOpenAfter(line: string, open: boolean) {
     ...[...line.matchAll(pemEnd())].map((m) => [m.index, false] as const),
   ].sort((a, b) => a[0] - b[0]);
   return marks.length ? marks[marks.length - 1]![1] : open;
+}
+
+/** A record line whose first token is a JSON string, with that string redacted (still valid JSON). */
+function redactLeadingString(record: string): string {
+  const lead = record.length - record.trimStart().length;
+  if (record[lead] !== '"') return record;
+  let j = lead + 1;
+  while (j < record.length && record[j] !== '"') j += record[j] === "\\" ? 2 : 1;
+  return `${record.slice(0, lead)}${JSON.stringify(REDACTED)}${record.slice(j + 1)}`;
 }
 
 /**
