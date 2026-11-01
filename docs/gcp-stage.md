@@ -103,6 +103,31 @@ balancer), and per-API Google scoping. `private.googleapis.com` serves every API
 narrowing that needs VPC Service Controls with `restricted.googleapis.com`, which
 is a separate lane. Meanwhile IAM bounds what each identity can do.
 
+Live evidence, 2026-11-01, GCP conformance. The infrastructure was deployed from
+merge `5c512be`: 13 creates (the DNS API, the private zone, its A and wildcard
+CNAME records, and 9 policies), with no delete or replace. Probe pods with the
+real worker and AlleyOop labels and Kubernetes service accounts ran in
+`96bulls`:
+
+| Check | before | after (worker / AlleyOop) |
+| --- | --- | --- |
+| `storage.googleapis.com` resolves to | public Google IPs | `199.36.153.8`–`.11` |
+| GCS list with the pod's Workload Identity token | 200 | 200 / 200 |
+| `https://example.com` | 200 | blocked / blocked |
+| `https://1.1.1.1`, TCP `8.8.8.8:443` | reachable | blocked / blocked |
+| DNS query to `8.8.8.8` | answered | blocked / blocked |
+| Kubernetes API `:443` | open | blocked / blocked |
+| `cloud-sql-proxy:5432`, Redis `:6378` | open | open / open |
+| RelayAuth `:8787` | open | blocked / open |
+
+Every 96Bulls pod stayed ready, with zero restarts. The machine-bound end-to-end
+verifier then passed with egress restricted. It ran from `6713b19`, which
+differs from `5c512be` only in AWS stack files.
+- claimless and mismatched-machine assertions: 403 `machine_claim_refused`, with
+  no HoopDB or GCS change;
+- matching machine `proof-gcp-mvyfucaa36b947-a`: chunk and manifest landed, two
+  encrypted summaries were written, zero dead letters, trace `indexed`.
+
 ### Per-component bucket identities
 
 Each component now has its own Google service account, scoped like the AWS
