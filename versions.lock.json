@@ -26,10 +26,10 @@
     },
     "services": {
       "ref": "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services",
-      "digest": "sha256:65fda21217fe515add544bba322991170b2d6a7483996b41c1d45ec652c3e142",
-      "sourceRevision": "3b6001925ef2d8caf5190063e101e2ebf258e902",
+      "digest": "sha256:383839660ef3b6b972d6328b98de5ac09cde8066eed8ee483e8d9f3d6538b187",
+      "sourceRevision": "85101871f4971e161f203dd1a758b4742b7cfe66",
       "gcpProofEligible": true,
-      "note": "published 2026-10-31 by publish-image-ar run 41276308173 from reviewed main 3b6001925ef2d8caf5190063e101e2ebf258e902; immutable Artifact Registry tag sha-3b6001925ef2d8caf5190063e101e2ebf258e902; OCI index includes linux/amd64+arm64; image labels identify the exact source repository and revision; attestation manifests include SPDX SBOM and SLSA provenance."
+      "note": "published 2026-11-01 by publish-image-ar run 41286919861 from reviewed main 85101871f4971e161f203dd1a758b4742b7cfe66; immutable Artifact Registry tag sha-85101871f4971e161f203dd1a758b4742b7cfe66; OCI index includes linux/amd64+arm64; image labels identify the exact source repository and revision; attestation manifests include SPDX SBOM and SLSA provenance."
     },
     "relayauth": {
       "ref": "ghcr.io/agentworkforce/relayauth",
