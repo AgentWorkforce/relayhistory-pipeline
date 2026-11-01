@@ -228,11 +228,13 @@ export class Syncer {
         const r = await exportUnit(target, unit, lane.source, {
           // Work driven by a change must see a fence written with that change.
           freshFence: work.kind !== "recent" && work.kind !== "history",
-          onKey: (k) => {
+          onLease: (k) => {
             const prefix = k.slice(0, -"manifest.json".length);
             if (!this.state.acquireLease(prefix, LEASE_HOLDER))
               throw Object.assign(new Error("the erasure job holds this session"), { code: "prefix_busy" });
             leased.push(prefix);
+          },
+          onKey: (k) => {
             touched.add(k);
             this.state.recordPendingKey(work.org_id, work.session_id, k);
           },

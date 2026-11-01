@@ -318,7 +318,7 @@ export class SyncState {
    * After a complete erasure sweep: exported groups Neon no longer has (the
    * exporter's units come only from rollups, so no rollup means nothing to keep).
    */
-  vanishedExports(sweep: number, sweepStartedAt: number): { org_id: string; session_id: string; keys: string[] }[] {
+  vanishedExports(sweep: number, sweepStartedAt: number, prune = true): { org_id: string; session_id: string; keys: string[] }[] {
     // Only exports older than the sweep: a group created behind the sweep's cursor and
     // exported meanwhile is not missing from Neon, only from this sweep.
     const rows = this.db
@@ -329,7 +329,7 @@ export class SyncState {
             AND NOT EXISTS (SELECT 1 FROM pending_keys p WHERE p.org_id = e.org_id AND p.session_id = e.session_id)`,
       )
       .all(sweep, sweepStartedAt) as { org_id: string; session_id: string; keys: string }[];
-    this.db.prepare("DELETE FROM erasure_seen WHERE sweep < ?").run(sweep);
+    if (prune) this.db.prepare("DELETE FROM erasure_seen WHERE sweep < ?").run(sweep);
     return rows.map((r) => ({ ...r, keys: JSON.parse(r.keys) as string[] }));
   }
 

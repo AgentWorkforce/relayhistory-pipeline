@@ -91,7 +91,8 @@ export class ErasureJob {
     let seen = 0;
     for (;;) {
       const rows = await activityPage(this.db, after);
-      this.state.seeForErasure(id, rows);
+      // A dry run marks under a sweep id no real sweep uses (and the next real sweep clears).
+      this.state.seeForErasure(opts.dryRun ? -id : id, rows);
       seen += rows.length;
       if (rows.length === 0 || this.stopped()) break;
       after = rows.at(-1)!;
@@ -104,7 +105,7 @@ export class ErasureJob {
     }
     if (!opts.dryRun) this.state.setMeta("erasure_sweep_done", String(id));
     let gone = 0;
-    for (const g of this.state.vanishedExports(id, startedAt)) {
+    for (const g of this.state.vanishedExports(opts.dryRun ? -id : id, startedAt, !opts.dryRun)) {
       // Confirm on Neon right before erasing: the group really has no rollup now.
       const { rows } = await this.db.query(
         "SELECT 1 FROM sessions.session_rollups WHERE org_id = $1 AND session_id = $2 LIMIT 1",

@@ -428,7 +428,13 @@ export async function exportUnit(
   target: ExportTarget,
   unit: SessionUnit,
   source: UnitSource,
-  opts: { freshFence?: boolean; onKey?: (manifestKey: string) => void } = {},
+  opts: {
+    freshFence?: boolean;
+    /** Before the stored manifest is read: take the session lease (throw if busy). */
+    onLease?: (manifestKey: string) => void;
+    /** After the ownership check: record the key before anything is written under it. */
+    onKey?: (manifestKey: string) => void;
+  } = {},
 ): Promise<UnitResult> {
   if (await source.fenced(unit, opts.freshFence)) return { fenced: true, manifests: [], lines: 0 };
   const streams = new Map<string, MachineStream>();
@@ -446,6 +452,7 @@ export async function exportUnit(
       // is never recorded (the eraser cannot read manifests, so only owned keys
       // may ever reach it). Then the key is recorded and its prefix leased,
       // before anything is written under it.
+      opts.onLease?.(stream.key);
       await stream.existing();
       opts.onKey?.(stream.key);
       streams.set(line.machine, stream);
