@@ -7,6 +7,7 @@ import type { Queryable } from "../relayhistory-export.ts";
 import { erasableByExporter, exportUnit, type ExportTarget } from "./export-session.ts";
 import {
   activityPage,
+  catalogPage,
   fencedGroups,
   lockWaiters,
   neonUnitSource,
@@ -195,6 +196,17 @@ export class Syncer {
       n += rows.length;
       if (rows.length === 0 || this.stopped()) break;
       after = rows.at(-1)!;
+    }
+    // Sessions with delivery records but no rollup (no projected events yet).
+    let cat: Parameters<typeof catalogPage>[1] = null;
+    for (;;) {
+      if (this.stopped()) break;
+      const rows = await catalogPage(this.db, cat);
+      await this.hook(Math.ceil(rows.length / 50), 0);
+      this.state.seeActivity(id, rows, true);
+      n += rows.length;
+      if (rows.length === 0) break;
+      cat = rows.at(-1)!;
     }
     if (this.stopped()) return;
     this.state.setMeta("act_sweep_done", String(id));

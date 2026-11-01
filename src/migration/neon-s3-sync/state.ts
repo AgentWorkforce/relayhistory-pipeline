@@ -122,11 +122,19 @@ export class SyncState {
   }
 
   /** Record a sweep page of rollup activity. */
-  seeActivity(sweep: number, rows: { org_id: string; session_id: string; last_ms: string; events: string }[]) {
+  seeActivity(sweep: number, rows: { org_id: string; session_id: string; last_ms: string; events: string }[], catalog = false) {
+    // A catalog row only marks the group seen (and fills last_ms when the rollups gave none);
+    // it never overwrites the rollups' activity and event count.
     const q = this.db.prepare(
-      `INSERT INTO groups (org_id, session_id, last_ms, events, act_sweep) VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT (org_id, session_id) DO UPDATE SET last_ms = excluded.last_ms, events = excluded.events,
-         act_sweep = excluded.act_sweep`,
+      catalog
+        ? `INSERT INTO groups (org_id, session_id, last_ms, events, act_sweep) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (org_id, session_id) DO UPDATE SET
+             last_ms = CASE WHEN groups.act_sweep = excluded.act_sweep THEN max(coalesce(groups.last_ms, 0), excluded.last_ms) ELSE excluded.last_ms END,
+             events = CASE WHEN groups.act_sweep = excluded.act_sweep THEN groups.events ELSE excluded.events END,
+             act_sweep = excluded.act_sweep`
+        : `INSERT INTO groups (org_id, session_id, last_ms, events, act_sweep) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (org_id, session_id) DO UPDATE SET last_ms = excluded.last_ms, events = excluded.events,
+             act_sweep = excluded.act_sweep`,
     );
     this.#tx(() => {
       for (const r of rows) q.run(r.org_id, r.session_id, Number(r.last_ms), Number(r.events), sweep);
