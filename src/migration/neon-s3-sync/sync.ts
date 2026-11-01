@@ -271,7 +271,10 @@ export class Syncer {
       const code = errorCode(error);
       this.state.markFailed(work.org_id, work.session_id, code, [...touched], work.revision);
       this.counters.groupsFailed += 1;
-      this.log({ message: "group failed", error_code: code, kind: work.kind });
+      const aws = /<Code>([A-Za-z0-9]{1,64})<\/Code>/.exec(String((error as { message?: unknown })?.message ?? ""))?.[1];
+      this.log({ message: "group failed", error_code: code, kind: work.kind, ...(aws ? { aws_code: aws } : {}) });
+      // A credential or permission failure is not this group's: stop rather than fail every group.
+      if (code === "unauthorized") throw error;
       if (isConnectionError(error)) throw error;
       return false;
     } finally {

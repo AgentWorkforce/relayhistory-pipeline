@@ -111,12 +111,45 @@ function storeFromEnv(execute: boolean): ObjectStore {
   return writeOnly(store(credentialsFrom(env("S3X_CREDS_FILE"), true)!));
 }
 
+/** The AWS error code (e.g. AccessDenied, InvalidAccessKeyId) from a store error: a code, never content. */
+function s3Code(error: unknown): string | undefined {
+  const m = /<Code>([A-Za-z0-9]{1,64})<\/Code>/.exec(String((error as { message?: unknown })?.message ?? ""));
+  return m?.[1];
+}
+
+/**
+ * Before any Neon read: the writer key can list the bucket (so a missing key
+ * is a 404, not a 403) and HEAD a missing manifest. Logs status and AWS error
+ * codes only. A failure waits 10 min before exiting, so a restart loop never
+ * spins on a bad key.
+ */
+async function preflight(store: ObjectStore): Promise<boolean> {
+  const steps: [string, () => Promise<unknown>][] = [
+    ["list", () => store.list(objectKey("96bulls"))],
+    ["head_missing", () => store.head(objectKey("96bulls/preflight/v1/ws=w/m=m/h=h/d=2026/01/01/s=s/manifest.json"))],
+  ];
+  for (const [step, run] of steps) {
+    try {
+      await run();
+      log({ message: "preflight ok", step });
+    } catch (error) {
+      log({ message: "preflight failed", step, error_code: errorCode(error), aws_code: s3Code(error), status: (error as { status?: number }).status });
+      return false;
+    }
+  }
+  return true;
+}
+
 export async function main() {
   const execute = flag("execute");
   const urlFile = env("NEON_URL_FILE");
   const url = urlFile ? readFileSync(urlFile, "utf8").trim() : env("NEON_URL");
   if (!url) throw new Error("NEON_URL_FILE (or NEON_URL) is required");
   const store = storeFromEnv(execute);
+  if (execute && !(await preflight(store))) {
+    await new Promise((r) => setTimeout(r, 10 * 60 * 1000));
+    process.exit(3);
+  }
   const statePath = env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state${execute ? "" : "-dry"}.sqlite`)!;
   // One exporter per watermark: two would delete each other's freshly sealed chunks.
   const lockPath = `${statePath}.lock`;
