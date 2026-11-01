@@ -4,16 +4,16 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { prepareRelaycastChart } from "../chart-cache.ts";
+import { prepareRelayauthChart, prepareRelaycastChart } from "../chart-cache.ts";
 
-function fixture(root: string) {
+function fixture(root: string, chartName = "relaycast", version = "0.1.0") {
   const source = join(root, "source");
-  const chart = join(source, "relaycast");
+  const chart = join(source, chartName);
   mkdirSync(join(chart, "templates"), { recursive: true });
-  writeFileSync(join(chart, "Chart.yaml"), "apiVersion: v2\nname: relaycast\nversion: 0.1.0\n");
+  writeFileSync(join(chart, "Chart.yaml"), `apiVersion: v2\nname: ${chartName}\nversion: ${version}\n`);
   writeFileSync(join(chart, "templates", "service.yaml"), "kind: Service\n");
-  const artifact = join(root, "relaycast-0.1.0.tgz");
-  execFileSync("tar", ["-czf", artifact, "-C", source, "relaycast"]);
+  const artifact = join(root, `${chartName}-${version}.tgz`);
+  execFileSync("tar", ["-czf", artifact, "-C", source, chartName]);
   const bytes = readFileSync(artifact);
   const digest = createHash("sha256").update(bytes).digest("hex");
   return { artifact, bytes, digest, cacheRoot: join(root, "cache") };
@@ -98,6 +98,27 @@ describe("verified Relaycast chart cache", () => {
       expect(readFileSync(new URL("../chart-cache.ts", import.meta.url), "utf8")).not.toContain(
         "rmSync(extracted",
       );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("materializes RelayAuth from captured bytes without reopening the source", () => {
+    const root = mkdtempSync(join(tmpdir(), "96bulls-relayauth-cache-test-"));
+    try {
+      const { artifact, bytes, digest, cacheRoot } = fixture(root, "relayauth", "0.1.1");
+      const prepared = prepareRelayauthChart(
+        { bytes, digest, sourcePath: artifact },
+        { cacheRoot },
+      );
+      expect(prepared).toContain(join(digest, "relayauth"));
+      expect(readFileSync(join(prepared, "Chart.yaml"), "utf8")).toContain(
+        "name: relayauth",
+      );
+      writeFileSync(artifact, "source changed after capture");
+      expect(
+        prepareRelayauthChart({ bytes, digest, sourcePath: artifact }, { cacheRoot }),
+      ).toBe(prepared);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

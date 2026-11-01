@@ -20,6 +20,7 @@ import {
   relayfileChartValues,
   relayflowsChartValues,
   requestedAlchemyCommand,
+  captureRelayauthChartPackage,
   captureRelaycastChartPackage,
   type GcpInputs,
 } from "../config.ts";
@@ -529,10 +530,41 @@ describe("GCP self-host contract", () => {
     expect(() => relayauthChartValues({ ...relayauth, chartVersion: "0.1.0" })).toThrow(
       /published 0\.1\.1 machine-bound contract/,
     );
+    expect(() =>
+      assertGcpInputs(
+        "gcp-dev",
+        { ...base, relayauth: { ...relayauth, chartVersion: "0.1.0" } },
+        "destroy",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      relayauthChartValues(
+        { ...relayauth, chartVersion: "0.1.0" },
+        "standard-rwo",
+        "destroy",
+      ),
+    ).not.toThrow();
     expect(relayauthChartValues(relayauth).image).toEqual({
       repository: RELAYAUTH_PUBLISHED_CHART.repository,
       digest: RELAYAUTH_PUBLISHED_CHART.imageDigest,
     });
+  });
+
+  it("captures RelayAuth chart bytes before providers and renders only the verified local chart", () => {
+    const dir = mkdtempSync(join(tmpdir(), "96bulls-relayauth-chart-test-"));
+    try {
+      const path = join(dir, "relayauth-0.1.1.tgz");
+      expect(() => captureRelayauthChartPackage(path)).toThrow(/package is missing/);
+      writeFileSync(path, "not-the-published-chart");
+      expect(() => captureRelayauthChartPackage(path)).toThrow(/digest does not match/);
+      const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+      expect(stack).toContain("captureRelayauthChartPackage");
+      expect(stack).toContain("prepareRelayauthChart");
+      expect(stack).toContain("chart: BOOTSTRAP_RELAYAUTH_CHART!");
+      expect(stack).toContain('BOOTSTRAP_COMMAND !== "destroy"');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("rejects credential-bearing public origins before they reach chart values", () => {

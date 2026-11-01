@@ -207,6 +207,11 @@ The stack also overrides the chart image explicitly to
 built from reviewed RelayAuth source
 `784582ef983bb72b13b43512d9a4142ef5dfabb2` containing PR #113. A different
 chart version, repository, or default image cannot enter this proof contract.
+Before provider or state initialization, the stack reads the release archive
+once, verifies the recorded package digest, and materializes only those
+captured bytes into the same tamper-detecting local chart cache used by
+Relaycast. Helm never re-resolves the RelayAuth templates from the mutable
+repository index during plan or deploy.
 
 `/readyz` also checks that data path when `LOCKER_PROVIDER=gcs` or
 `WORKER_DATA_PATH_PROBE=1`. Production is not this lane: the production
@@ -374,6 +379,13 @@ pinned 8.0.0 image
 predates later workspace-bootstrap Secret support, so this lane does not pass
 an ineffective Secret setting. There is no Relaycast Ingress, load balancer,
 ManagedCertificate, or public DNS claim in this stack.
+
+Before evaluating a non-destroy RelayAuth stage, place the exact public release
+artifact at `.96bulls/$STAGE/artifacts/relayauth-0.1.1.tgz`. The stack verifies
+its SHA-256 before constructing Alchemy and renders the captured local chart.
+Destroy deliberately does not require the artifact and accepts an older
+recorded chart version so cleanup of an existing `0.1.0` release cannot be
+blocked by this new proof pin.
 
 ## Exact gaps
 

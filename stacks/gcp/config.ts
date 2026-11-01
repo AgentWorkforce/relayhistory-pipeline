@@ -133,24 +133,52 @@ export interface CapturedRelaycastChartPackage {
   readonly sourcePath: string;
 }
 
-/** Read once, then verify those exact bytes. Callers must never reopen sourcePath. */
-export function captureRelaycastChartPackage(
+export type CapturedRelayauthChartPackage = CapturedRelaycastChartPackage;
+
+function capturePublishedChartPackage(
   path: string,
+  label: string,
+  version: string,
+  expectedDigest: string,
 ): CapturedRelaycastChartPackage {
   let bytes: Buffer;
   try {
     bytes = readFileSync(path);
   } catch {
     throw new Error(
-      `96bulls: Relaycast chart package is missing; expected the published 0.1.0 artifact at ${path}. Nothing was created.`,
+      `96bulls: ${label} chart package is missing; expected the published ${version} artifact at ${path}. Nothing was created.`,
     );
   }
   const digest = createHash("sha256").update(bytes).digest("hex");
-  if (digest !== RELAYCAST_PUBLISHED_CHART.packageDigest)
+  if (digest !== expectedDigest.replace(/^sha256:/, ""))
     throw new Error(
-      "96bulls: Relaycast chart package digest does not match published 0.1.0. Nothing was created.",
+      `96bulls: ${label} chart package digest does not match published ${version}. Nothing was created.`,
     );
   return { bytes, digest, sourcePath: path };
+}
+
+/** Read once, then verify those exact bytes. Callers must never reopen sourcePath. */
+export function captureRelaycastChartPackage(
+  path: string,
+): CapturedRelaycastChartPackage {
+  return capturePublishedChartPackage(
+    path,
+    "Relaycast",
+    RELAYCAST_PUBLISHED_CHART.version,
+    RELAYCAST_PUBLISHED_CHART.packageDigest,
+  );
+}
+
+/** Capture the reviewed RelayAuth package before any provider or state initialization. */
+export function captureRelayauthChartPackage(
+  path: string,
+): CapturedRelayauthChartPackage {
+  return capturePublishedChartPackage(
+    path,
+    "RelayAuth",
+    RELAYAUTH_PUBLISHED_CHART.version,
+    RELAYAUTH_PUBLISHED_CHART.packageDigest,
+  );
 }
 
 export function isPublishedHelmRepo(repo: string | undefined): boolean {
@@ -471,8 +499,9 @@ export function assertGcpInputs(
   if (inputs.relayauth) {
     requireSemver("relayauth.chartVersion", inputs.relayauth.chartVersion);
     if (
-      inputs.relayauth.chartVersion !== RELAYAUTH_PUBLISHED_CHART.version ||
-      !isPublishedHelmRepo(inputs.chartRepo)
+      requestedCommand !== "destroy" &&
+      (inputs.relayauth.chartVersion !== RELAYAUTH_PUBLISHED_CHART.version ||
+        !isPublishedHelmRepo(inputs.chartRepo))
     )
       throw new Error(
         `96bulls: relayauth must use published chart ${RELAYAUTH_PUBLISHED_CHART.version} from the AgentWorkforce helm repository. Nothing was created.`,
@@ -655,8 +684,12 @@ export function relaycastChartValues(
 export function relayauthChartValues(
   i: RelayAuthChartInputs,
   defaultStorageClass = "standard-rwo",
+  requestedCommand?: AlchemyStackCommand,
 ) {
-  if (i.chartVersion !== RELAYAUTH_PUBLISHED_CHART.version)
+  if (
+    requestedCommand !== "destroy" &&
+    i.chartVersion !== RELAYAUTH_PUBLISHED_CHART.version
+  )
     throw new Error(
       `96bulls: relayauth chart is not the published ${RELAYAUTH_PUBLISHED_CHART.version} machine-bound contract. Nothing was created.`,
     );
