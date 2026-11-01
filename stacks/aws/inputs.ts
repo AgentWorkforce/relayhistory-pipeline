@@ -23,6 +23,8 @@ export interface AwsInputs {
   /** The target account id, repeated on the command line to deploy. */
   accountId: string;
   region: string;
+  /** AWS ARN partition. Required and exactly `aws` for the production transcript store. */
+  partition?: string;
   /** Legacy free-text clearance; informational only. Deploy and destroy need `approval`. */
   clearedBy?: string;
   /** Khaliq's approval for exact operations on this exact stage/account/region (deploy-guard.ts). */

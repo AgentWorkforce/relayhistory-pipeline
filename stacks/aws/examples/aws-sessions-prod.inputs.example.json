@@ -2,6 +2,7 @@
   "$comment": "Production transcript store (stacks/aws/transcript-store.ts) in sessions-prod. Copy to .96bulls/aws-sessions-prod/aws-inputs.json (gitignored) and fill every angle-bracket placeholder; the stage refuses any that are left. Write the approval record before capturing (bin/96bulls plan aws-sessions-prod --capture). Nothing here is secret: access keys are created out of band into 1Password (runbooks/sessions-prod-transcript-store.md).",
   "accountId": "941433935742",
   "region": "us-east-1",
+  "partition": "aws",
   "approval": {
     "decision": "<the literal string approved, once Khaliq has approved>",
     "by": "Khaliq Gant",
