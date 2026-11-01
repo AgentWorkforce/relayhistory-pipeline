@@ -170,12 +170,15 @@ cp stacks/aws/examples/aws-sessions-prod.inputs.example.json .96bulls/aws-sessio
 bin/96bulls plan aws-sessions-prod --capture     # read only; docs/plans/aws-sessions-prod.*
 ```
 
-The capture and deploy gates accept exactly four operation shapes: all 12
+The capture and deploy gates accept exactly six operation shapes: all 12
 resources created (initial); the known three-resource continuation after IAM
 principal propagation (`transcripts`, `transcripts-key`,
 `transcripts-key-alias`); the one post-merge policy remediation described
 below (`trail-key` and `trail-logs` update, the other ten resources `noop`);
-or all 12 resources `noop` (post-apply). Every resource must appear exactly
+the srv-writer addition (`transcript-srv-writer` create plus `transcripts-key`
+update); its propagation recovery (`transcripts-key` update alone, adding the
+srv-writer's key statement; see "Applied 2026-10-31"); or every resource
+`noop` (post-apply). Every resource must appear exactly
 once in both the compact and detailed plan. The production gate requires the
 exact compact and detailed paths and sha256 values recorded in provenance;
 the approval binds that provenance and compact plan.
@@ -253,6 +256,13 @@ to see the bucket policy refuse `aws:kms` without this key id (explicitDeny).
   `0ae5e1b5f8a137a76c8c867485bbbeb7a4bf2cadaabcad68012f3b6401396cb1`.
 - **Next time:** if this happens on a new stage, wait a minute, re-capture and re-apply. Nothing
   partial needs cleaning up.
+- **srv-writer addition (2026-11-01):** the same refusal can follow the `srv-writer addition` apply:
+  `transcript-srv-writer` is created, then KMS refuses the `transcripts-key` update because the new
+  user has not propagated. Wait 2-3 minutes and re-capture. The recapture is `transcripts-key update`
+  with the other 12 resources `noop` (the user now exists in state), the `srv-writer propagation
+  recovery` phase. The contract accepts it only when the detailed plan shows the live key policy
+  without `SrvWriterEncryptsAndReadsViaS3` and the planned policy with exactly one; any other lone
+  key-policy update is refused. Commit the capture, bind `approval.capture` to it, and `up`.
 - **Account-level S3 Block Public Access:** set separately on 2026-10-31 with
   `s3control put-public-access-block` (all four true).
 
