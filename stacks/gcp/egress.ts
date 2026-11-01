@@ -18,6 +18,12 @@
  *
  * Kubelet probes and `kubectl port-forward` arrive from the node itself, which
  * Dataplane V2 does not subject to pod NetworkPolicy.
+ *
+ * Deliberately not allowed: in-cluster ingress to AlleyOop (nothing in the cluster
+ * calls it on GCP and it has no Ingress or load balancer; an exposure lane must add
+ * its own rule), and per-API Google scoping (private.googleapis.com serves every
+ * API; narrowing that needs VPC Service Controls with restricted.googleapis.com,
+ * a separate lane; IAM bounds what each identity can do meanwhile).
  */
 
 export const NAMESPACE = "96bulls";
@@ -139,6 +145,31 @@ export function bulls96NetworkPolicies(i: Bulls96EgressInputs) {
       ],
     }),
   ];
+}
+
+/**
+ * The egress policy lets AlleyOop reach only the in-cluster RelayAuth service. The
+ * release config also accepts a public HTTPS or other-namespace JWKS endpoint, which
+ * this policy would silently cut off (the verifier fetches the URL at runtime), so
+ * applying the policy requires the in-cluster endpoint. Refusal is the migration
+ * signal: move the JWKS URL in-cluster or widen the policy deliberately.
+ */
+export function assertInClusterJwks(label: string, url: string): void {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    throw new Error(`96bulls: ${label} is not a URL. Nothing was created.`);
+  }
+  const host = u.hostname.replace(/\.$/, "").toLowerCase();
+  if (
+    u.protocol !== "http:" ||
+    (host !== "relayauth.relayauth.svc" && host !== "relayauth.relayauth.svc.cluster.local") ||
+    u.port !== "8787"
+  )
+    throw new Error(
+      `96bulls: ${label} must be the in-cluster RelayAuth service (http://relayauth.relayauth.svc:8787) while workload egress is restricted. Nothing was created.`,
+    );
 }
 
 /** Private Cloud DNS records that pin every *.googleapis.com name to the private VIPs. */

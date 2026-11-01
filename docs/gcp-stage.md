@@ -95,7 +95,13 @@ the subnet, every Google API call stays on the private VIPs, so no rule allows
 the public internet: no arbitrary HTTPS, no external DNS resolver, and no other
 namespace. Kubelet probes and `kubectl port-forward` originate on the node and
 are not subject to pod policy. The `relayauth` namespace is not restricted by
-this change.
+this change. Applying the policy requires `bulls96.relayauthJwksUrl` to be the
+in-cluster RelayAuth service, the only JWKS destination it allows; a public JWKS
+URL is refused rather than silently cut off. Deliberately not allowed: in-cluster
+ingress to AlleyOop (nothing calls it in-cluster and it has no Ingress or load
+balancer), and per-API Google scoping. `private.googleapis.com` serves every API;
+narrowing that needs VPC Service Controls with `restricted.googleapis.com`, which
+is a separate lane. Meanwhile IAM bounds what each identity can do.
 
 ### Per-component bucket identities
 

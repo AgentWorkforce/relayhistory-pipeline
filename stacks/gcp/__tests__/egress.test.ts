@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
-import { PRIVATE_GOOGLE_APIS_CIDR, PRIVATE_GOOGLE_APIS_RECORDS, bulls96NetworkPolicies } from "../egress.ts";
+import { PRIVATE_GOOGLE_APIS_CIDR, PRIVATE_GOOGLE_APIS_RECORDS, assertInClusterJwks, bulls96NetworkPolicies } from "../egress.ts";
 
 type Peer = { ipBlock?: { cidr: string; except?: string[] }; podSelector?: unknown; namespaceSelector?: unknown };
 type Rule = { to?: Peer[]; from?: Peer[]; ports?: Array<{ protocol: string; port: number }> };
@@ -49,6 +49,26 @@ describe("96bulls NetworkPolicies", () => {
     expect(dns).toHaveLength(1);
     expect(dns[0]!.to!.every((t) => t.namespaceSelector !== undefined || t.ipBlock?.cidr === "169.254.20.10/32")).toBe(true);
     expect(dns[0]!.ports!.map((p) => `${p.protocol}/${p.port}`).sort()).toEqual(["TCP/53", "UDP/53"]);
+  });
+
+  it("gives AlleyOop no in-cluster ingress; only the proxy accepts in-cluster connections", () => {
+    const ingress = policies.filter((p) => p.spec.policyTypes.includes("Ingress") && p.metadata.name !== "default-deny");
+    expect(ingress.map((p) => p.metadata.name)).toEqual(["allow-cloud-sql-proxy-from-apps"]);
+  });
+
+  it("requires the in-cluster RelayAuth JWKS endpoint the policy allows", () => {
+    expect(() => assertInClusterJwks("j", "http://relayauth.relayauth.svc:8787/.well-known/jwks.json")).not.toThrow();
+    expect(() => assertInClusterJwks("j", "http://relayauth.relayauth.svc.cluster.local:8787/.well-known/jwks.json")).not.toThrow();
+    for (const bad of [
+      "https://auth.example.com/.well-known/jwks.json",
+      "http://relayauth.other.svc:8787/.well-known/jwks.json",
+      "http://relayauth.relayauth.svc:8443/.well-known/jwks.json",
+      "https://relayauth.relayauth.svc:8787/.well-known/jwks.json",
+      "not a url",
+    ])
+      expect(() => assertInClusterJwks("j", bad)).toThrow("Nothing was created");
+    const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+    expect(stack).toContain('assertInClusterJwks("bulls96.relayauthJwksUrl", i.bulls96!.relayauthJwksUrl)');
   });
 
   it("refuses a public, malformed or out-of-range CIDR", () => {

@@ -67,7 +67,7 @@ import {
 } from "./apply-authorization.ts";
 import { requireServiceAccountActAs, type ServiceAccountActAsProof } from "./iam-preflight.ts";
 import { fetchRedisServerCa, redisAdminFetchTransport } from "./redis-ca.ts";
-import { PRIVATE_GOOGLE_APIS_RECORDS, bulls96NetworkPolicies } from "./egress.ts";
+import { PRIVATE_GOOGLE_APIS_RECORDS, assertInClusterJwks, bulls96NetworkPolicies } from "./egress.ts";
 import {
   alleyoopWriteCondition,
   ensureConditionalBucketBindings,
@@ -905,6 +905,8 @@ export default Alchemy.Stack(
           });
           // Default deny plus the exact egress the services use (egress.ts). Redis
           // and Cloud SQL both take their private IPs from the PSA range.
+          if (BOOTSTRAP_COMMAND !== "destroy")
+            assertInClusterJwks("bulls96.relayauthJwksUrl", i.bulls96!.relayauthJwksUrl);
           for (const policy of bulls96NetworkPolicies({ redisRange: PSA_CIDR, cloudSqlRange: PSA_CIDR })) {
             yield* Kubernetes.Manifest(`netpol-${policy.metadata.name}`, {
               cluster,
