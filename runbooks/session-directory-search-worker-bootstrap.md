@@ -173,15 +173,15 @@ marker: a reader started early, or a migrator that died, simply stays non-ready.
 `src/hoopdb/migrate.ts` resolves an explicit profile **before opening any connection**. It
 never infers anything from the hostname. An invalid profile writes nothing anywhere.
 
-| Variable                        | Contract                                                                                                                                                                                                                                                                      |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (operator-controlled Postgres), `cloudsql` (Google Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                     |
-| `HOOPDB_SUPABASE_SHIM`          | `local`, `selfhosted` and `cloudsql`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project.                        |
-| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                                  |
-| `HOOPDB_RUNTIME_ROLE`           | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                                                            |
-| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                        |
-| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                                                     |
-| `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql` and `supabase`: `global-default-revoke` (the only implemented mode; the catalog must prove it, see "Function boundary"). `event-trigger` is refused as not implemented, and the old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
+| Variable                        | Contract                                                                                                                                                                                                                                                                                                          |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (operator-controlled Postgres), `cloudsql` (Google Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                                                         |
+| `HOOPDB_SUPABASE_SHIM`          | `local`, `selfhosted` and `cloudsql`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project.                                                            |
+| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                                                                      |
+| `HOOPDB_RUNTIME_ROLE`           | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                                                                                                |
+| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                                                            |
+| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                                                                                         |
+| `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql` and `supabase`: `global-default-revoke`, or `event-trigger` (supabase only; refused elsewhere with `function_boundary_mode_unsupported`). The catalog must prove the selected control, see "Function boundary". The old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
 
 **Runtime role: dedicated, exact least privilege.** It is checked under the migrator's
 advisory lock before any write (before the ledger and marker tables are created, before
@@ -490,13 +490,72 @@ config fails closed.
   (by any role) adds to the global default, so any entry granting a role other than its
   own (for example `authenticated`) refuses the gate and the bootstrap
   (`sessions_schema_function_defaults` must be empty; tested on PG15 and PG17).
-- **`event-trigger`: not implemented, refused** (`function_boundary_mode_unimplemented`).
-  A trigger's name proves nothing. A reviewed implementation must verify the enabled
-  state, events and tags, owner and function identity, function definition or hash,
-  SECURITY and `search_path` properties, and behavioural effect. That is separate work;
-  the hook (`SESSIONS_FUNCTION_EVENT_TRIGGER`) is kept.
+- **`event-trigger` (supabase only):** a reviewed `ddl_command_end` event trigger scoped
+  to `sessions`, with no project-wide `ALTER DEFAULT PRIVILEGES`. Accepted only with
+  `HOOPDB_DB_MODE=supabase`; `selfhosted`, `cloudsql` and `local` refuse it
+  (`function_boundary_mode_unsupported`) and keep `global-default-revoke`.
+  - **Install:** `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql`, run
+    as `postgres` after the runtime-role and Worker bootstraps and before migrate
+    (`-v runtime_role=bulls96_runtime`). Transactional and mode-bound. It creates schema
+    `hoopdb_boundary` (no PUBLIC access), the SECURITY INVOKER plpgsql function
+    `hoopdb_boundary.sessions_function_boundary()` (`search_path = pg_catalog, pg_temp`,
+    everything fully qualified) and the trigger `hoopdb_sessions_function_boundary` on
+    the exact tag set: `CREATE`/`ALTER` `FUNCTION`, `PROCEDURE`, `AGGREGATE`,
+    `ALTER ROUTINE`, `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, `CREATE`/`ALTER
+EXTENSION`, `ALTER SCHEMA`. Idempotent; an existing trigger or runtime role that
+    differs is refused (operator decides). If `CREATE EVENT TRIGGER` is refused (no
+    supautils), it fails closed with 55000 and creates nothing.
+  - **What it enforces, at fire time** (it filters by the schema NAME `sessions`, which
+    need not exist at install): routines created in `sessions` get PUBLIC revoked; then
+    the command is aborted (42501) when a touched `sessions` routine is owned by anyone
+    but the migration owner, holds an ACL entry outside the embedded manifest (equal to
+    `src/hoopdb/sessions-function-acl.json`; owner-only for an unmanifested signature;
+    the runtime role written into the function only on `RUNTIME_APPLICATION_FUNCTIONS`),
+    or is SECURITY DEFINER outside the frozen list; or when a `sessions`-scoped function
+    default grants another role. A function GRANT/REVOKE, an extension or schema change
+    rechecks every `sessions` routine. While migrations run the check is "subset of the
+    manifest"; exact equality is checked after every migrate, and the live gate still
+    refuses PUBLIC-executable `sessions` functions. Blast radius: a function GRANT
+    anywhere in the database is refused while `sessions` itself violates the manifest.
+  - **Gate (more than its name):** before any write the migrator (and
+    `--activation-check`) compares the catalog with frozen constants in
+    `src/hoopdb/migrate-guards.ts`: `evtevent = ddl_command_end`, the exact sorted tags,
+    `evtenabled` O or A, `evtowner` and the function owner = the migration owner, the
+    function oid = `hoopdb_boundary.sessions_function_boundary()`, the prosrc sha256
+    (normalized: the runtime-role literal put back to its placeholder), `proconfig`
+    exactly the pinned search_path, SECURITY INVOKER, volatile, plpgsql, returns
+    `event_trigger`, not PUBLIC-executable, the runtime role in the body =
+    `HOOPDB_RUNTIME_ROLE`, and schema `hoopdb_boundary` private. Any drift:
+    `function_boundary_unproven`. The trigger covers the migration owner (its global
+    default may stay built-in); every other CREATE-capable role still needs its own exact
+    default, and the platform trust root rule above still applies. Other event triggers
+    are listed (`other_event_triggers`): a GRANT a hostile trigger runs is itself DDL and
+    fires the reviewed trigger, which aborts it (tested).
+  - **Supabase behaviour (from docs and supautils, NOT OBSERVED on the project):**
+    Supabase documents that `postgres` can create event triggers
+    (https://supabase.com/docs/guides/database/postgres/event-triggers). supautils
+    (https://github.com/supabase/supautils, "Privileged Role", "Non-Superuser Event
+    Triggers") creates the object as the superuser and then changes its owner to the
+    privileged role, so the gate expects `evtowner = postgres` and fails closed otherwise.
+    Privileged-role triggers are skipped for superusers and reserved roles, so DDL run as
+    `supabase_admin` is not covered: consistent with the platform trust root. They also do
+    not fire for `CREATE EXTENSION` (supautils issue 123); the post-migrate manifest check
+    and the live gate remain. If `postgres` may set `session_replication_role` (supautils
+    `privileged_role_allowed_configs`; the README's example; not verified for the
+    project), a session in `replica` mode skips an `O` trigger: the same trusted owner,
+    and the live gate still applies.
+  - **Tests:** PGlite (profile binding, a name-only trigger refused, fresh full migrate,
+    behaviour, 11 drift cases, other creators, frozen constants vs the file) and real
+    PG15/17 on the Supabase-shaped cluster (`supabase_admin` OID 10, non-superuser
+    `postgres`; supautils emulated for the install only): no supautils fails closed;
+    fresh full migrate passes; GRANT to PUBLIC, `anon` or `authenticated` (unmanifested),
+    SECURITY DEFINER, `OWNER TO`, a `sessions` default, another role's function, and a
+    hostile second trigger are aborted; CREATE OR REPLACE keeps the ACL; other schemas are
+    unaffected; disabled, replaced body, function or trigger owner changed, missing tag,
+    SECURITY DEFINER, PUBLIC-executable, a function setting added, schema opened, and a
+    runtime-role mismatch each fail the gate before any write.
 
-The evidence is names and booleans only:
+The evidence is names, booleans and hashes only (null where absent):
 
 - `migration_owner`;
 - `sessions_unexposed_and_no_untrusted_usage`, always false here;
@@ -512,7 +571,8 @@ The evidence is names and booleans only:
   `rolreplication`, `rolbypassrls` and its function default);
 - `sessions_schema_function_defaults` (`role>grantee:PRIVILEGE` entries; must be empty);
 - `sessions_functions_owned_by_owner`;
-- `event_trigger_present` (informational);
+- `event_trigger_present`, `event_trigger` (the full definition above, with `verified`)
+  and `other_event_triggers`;
 - `mode`;
 - `satisfied`.
 
@@ -531,8 +591,8 @@ courier claim no queue work.
 
 **Durable follow-up (open):** a dedicated `sessions` object owner, so an owner-scoped
 global default revoke has no blast radius outside HoopDb. That needs an ownership transfer
-of live objects, so it is out of scope for #99. Or schema-specific event-trigger
-enforcement, reviewed. Tracked in #98.
+of live objects, so it is out of scope for #99. The schema-specific event trigger above is
+the reviewed alternative for Supabase. Tracked in #98.
 
 ## CNPG (self-hosted HoopDb)
 

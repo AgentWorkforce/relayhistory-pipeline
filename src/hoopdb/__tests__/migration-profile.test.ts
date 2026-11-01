@@ -854,7 +854,9 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       "ALTER POLICY bulls96_trusted_backend ON sessions.pipeline_jobs USING (false)",
     );
     const before = await state(db);
-    const error = await failure(runMigrations(client(db), { profile: GOOD }));
+    const error = await failure(
+      runMigrations(client(db), { profile: GOOD }),
+    );
     expect(error?.code).toBe("runtime_role_unsafe");
     expect(error?.message).toContain(
       "unapproved policy bulls96_trusted_backend on sessions.pipeline_jobs",
@@ -954,13 +956,12 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     );
     expect(
       before.rows.some(
-        ({ name }) => name === "upstream:20261030010000_session_directory.sql",
+        ({ name }) =>
+          name === "upstream:20261030010000_session_directory.sql",
       ),
     ).toBe(false);
 
-    expect(
-      await failure(runMigrations(client(db), { profile: LOCAL })),
-    ).toBeNull();
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
     expect(await schemaVerdict(await expectedSchema(), transact(db))).toEqual({
       ok: true,
     });

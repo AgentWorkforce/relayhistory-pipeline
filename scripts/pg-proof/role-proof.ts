@@ -896,10 +896,7 @@ const HOSTILE: Array<[string, string]> = [
   ],
   ["CREATE on schema sessions", "GRANT CREATE ON SCHEMA sessions TO g6_bad"],
   ["CREATE on the database", "GRANT CREATE ON DATABASE g6_rt_db TO g6_bad"],
-  [
-    "unapproved table privilege",
-    "GRANT TRUNCATE ON sessions.session_index TO g6_bad",
-  ],
+  ["unapproved table privilege", "GRANT TRUNCATE ON sessions.session_index TO g6_bad"],
   [
     "a column privilege",
     "GRANT SELECT (org_id) ON sessions.session_directory TO g6_bad",

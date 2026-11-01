@@ -1455,7 +1455,8 @@ export async function eventTriggerEvidence(
       ],
     )
   ).rows[0]!;
-  const tags = r.tags ?? [];
+  // Sorted here, not in SQL: the comparison must not depend on the database collation.
+  const tags = [...(r.tags ?? [])].sort();
   const proconfig = r.proconfig ?? [];
   const body = r.prosrc === null ? null : normalizeEventTriggerBody(r.prosrc);
   const runtimeSetting = body?.runtimeRole ?? null;
@@ -1466,7 +1467,7 @@ export async function eventTriggerEvidence(
     tags,
     tags_exact:
       JSON.stringify(tags) ===
-      JSON.stringify(SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS),
+      JSON.stringify([...SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS].sort()),
     enabled: r.enabled,
     enabled_ok: r.enabled === "O" || r.enabled === "A",
     owner: r.owner,
