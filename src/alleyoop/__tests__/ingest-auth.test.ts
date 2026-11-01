@@ -618,7 +618,7 @@ describe("buildIngestApp auth (production composition)", () => {
         machineId: LOCATION.machineId,
         sponsorId: USER,
         scopes: ["rth:sync", "rth:read"],
-        expiresIn: 3600,
+        expiresIn: 60,
         historyOrigin: ORIGIN,
       },
     });
