@@ -637,7 +637,7 @@ function manifestMetadata(
  * `PIPELINE_KEY_PREFIX` / `PIPELINE_ORG_FROM_PREFIX` looked for the chunks at
  * the unprefixed path and refused every commit.
  */
-async function chunksAreServerSealed(
+export async function chunksAreServerSealed(
   raw: RawStore,
   manifest: ManifestV1,
   prefix: string | undefined,

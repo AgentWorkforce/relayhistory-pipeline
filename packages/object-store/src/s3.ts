@@ -49,6 +49,12 @@ export interface S3Config {
    * without default encryption). R2 always encrypts at rest; leave it unset.
    */
   serverSideEncryption?: "AES256" | "aws:kms";
+  /**
+   * With `aws:kms`: the key ARN sent as
+   * `x-amz-server-side-encryption-aws-kms-key-id`, for buckets whose policy
+   * refuses `aws:kms` without naming the bucket's own key.
+   */
+  sseKmsKeyId?: string;
 }
 
 const BACKEND = "s3";
@@ -124,6 +130,18 @@ class S3Transport implements Transport {
         "x-amz-server-side-encryption",
         this.#config.serverSideEncryption,
       );
+    if (this.#config.sseKmsKeyId) {
+      if (this.#config.serverSideEncryption !== "aws:kms")
+        throw new ObjectStoreError(
+          "invalid_argument",
+          BACKEND,
+          "sseKmsKeyId needs serverSideEncryption aws:kms",
+        );
+      headers.set(
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        this.#config.sseKmsKeyId,
+      );
+    }
     if (mode.kind === "create") headers.set("if-none-match", "*");
     if (mode.kind === "update") {
       if (!mode.version.eTag) {

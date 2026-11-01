@@ -12,6 +12,7 @@ import {
   isObjectStoreError,
   manifestLocation,
   objectKey,
+  parseSessionKey,
   rawChunkKey,
   readAll,
   type ObjectStore,
@@ -53,7 +54,10 @@ export async function deleteParkedSession(
   if (!parked) return { manifest: false, chunks: 0 };
   const session = await readManifest(store, manifestKey, manifestKey);
   const keep = new Set(session?.raw.chunks.map((c) => c.stored_sha256));
-  const location = manifestLocation(parked);
+  // The parked chunks live under the session's own deployment prefix
+  // (`96bulls/<org>/v1/...` with PIPELINE_KEY_PREFIX); without it the deletes
+  // went to the unprefixed path and erasure left every parked chunk behind.
+  const location = manifestLocation(parked, parseSessionKey(manifestKey)?.prefix);
   let chunks = 0;
   for (const chunk of parked.raw.chunks) {
     if (keep.has(chunk.stored_sha256)) continue;
