@@ -11,8 +11,8 @@
  *   NEON_URL_FILE        file holding the read-only Neon URL (e.g. a <(...) fd)
  *   S3X_CREDS_FILE       writer/exporter key: {"accessKeyId","secretAccessKey","sessionToken"?}
  *                        (else AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN)
- *   S3X_ERASER_CREDS_FILE  the eraser key, same shape: the only principal allowed to delete
- *                        (without it, a group needing a delete fails with eraser_unavailable and is retried)
+ *   The exporter is write-only and never loads the eraser key; deletions are
+ *   queued in the state file for `neon-s3-erasure` (its own process and key).
  *   S3X_BUCKET, S3X_EXPECT_BUCKET, S3X_REGION (us-east-1), S3X_ENDPOINT (MinIO)
  *   S3X_SSE              aws:kms | AES256; for sessions-prod `aws:kms` with S3X_SSE_KMS_KEY_ID
  *   S3X_SSE_KMS_KEY_ID   the bucket's key ARN (its policy refuses `aws:kms` without it)
@@ -31,7 +31,7 @@ import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:f
 import { createHash } from "node:crypto";
 import { createS3Store, objectKey, ObjectStoreError, type ObjectStore } from "../../shared/vendor.ts";
 import type { Queryable } from "../relayhistory-export.ts";
-import { splitStore } from "./export-session.ts";
+import { writeOnly } from "./export-session.ts";
 import { sessionReadOnly } from "./neon-reader.ts";
 import { SyncState } from "./state.ts";
 import { DEFAULT_SYNC_CONFIG, Syncer, errorCode } from "./sync.ts";
@@ -107,18 +107,8 @@ function storeFromEnv(execute: boolean): ObjectStore {
       ...(sse ? { serverSideEncryption: sse as "aws:kms" | "AES256" } : {}),
       ...(kmsKey ? { sseKmsKeyId: kmsKey } : {}),
     });
-  const writer = store(credentialsFrom(env("S3X_CREDS_FILE"), true)!);
-  const eraserCreds = credentialsFrom(env("S3X_ERASER_CREDS_FILE"), false);
-  // Without the eraser key, a delete fails the group with `eraser_unavailable`:
-  // its keys stay in the watermark and it is retried once the key is supplied.
-  const eraser = eraserCreds
-    ? store(eraserCreds)
-    : ({
-        delete: async () => {
-          throw Object.assign(new Error("no eraser key"), { code: "eraser_unavailable" });
-        },
-      } as Pick<ObjectStore, "delete"> as ObjectStore);
-  return splitStore(writer, eraser);
+  if (env("S3X_ERASER_CREDS_FILE")) throw new Error("the exporter must not be given the eraser key");
+  return writeOnly(store(credentialsFrom(env("S3X_CREDS_FILE"), true)!));
 }
 
 export async function main() {

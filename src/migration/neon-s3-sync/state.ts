@@ -25,7 +25,7 @@ export interface WorkItem {
   org_id: string;
   session_id: string;
   revision: number;
-  kind: "delete" | "changed" | "recent" | "history" | "retry" | "reverify";
+  kind: "changed" | "recent" | "history" | "retry" | "reverify";
   events: number;
 }
 
@@ -46,7 +46,8 @@ export class SyncState {
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+    // Shared by the exporter and the erasure job (two processes): WAL plus a busy wait.
+    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 10000;");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS groups (
         org_id TEXT NOT NULL, session_id TEXT NOT NULL,
@@ -60,6 +61,13 @@ export class SyncState {
         failed_revision INTEGER,
         PRIMARY KEY (org_id, session_id));
       CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS erasures (
+        key TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('object', 'prefix')),
+        org_id TEXT NOT NULL, reason TEXT NOT NULL, enqueued_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0, next_try INTEGER NOT NULL DEFAULT 0, error TEXT);
+      CREATE TABLE IF NOT EXISTS leases (prefix TEXT PRIMARY KEY, holder TEXT NOT NULL, at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS erasure_seen (org_id TEXT NOT NULL, session_id TEXT NOT NULL, sweep INTEGER NOT NULL,
+        PRIMARY KEY (org_id, session_id));
       CREATE TABLE IF NOT EXISTS truncations (
         org_id TEXT NOT NULL, session_id TEXT NOT NULL, manifest_key TEXT NOT NULL,
         strings INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
@@ -151,8 +159,7 @@ export class SyncState {
   markFailed(org: string, session: string, code: string, keys: string[], revision: number, at = Date.now()) {
     const prior = this.exported(org, session);
     const attempts = (prior?.attempts ?? 0) + 1;
-    // Waiting for the eraser key is not a failure of the group: retry hourly, uncapped.
-    const nextTry = at + (code === "eraser_unavailable" ? 1 : Math.min(4, 2 ** (attempts - 1))) * 60 * 60 * 1000;
+    const nextTry = at + Math.min(4, 2 ** (attempts - 1)) * 60 * 60 * 1000;
     const all = JSON.stringify([...new Set([...(prior?.keys ?? []), ...keys])].sort());
     this.db
       .prepare(
@@ -179,6 +186,126 @@ export class SyncState {
     });
   }
 
+  // ---------------------------------------------------------------- per-session leases
+
+  /**
+   * The exporter and the erasure job never work on one session prefix at the
+   * same time: otherwise the eraser could delete a chunk the exporter has just
+   * decided to reuse. A lease older than `ttlMs` (a crashed holder) is taken over.
+   */
+  acquireLease(prefix: string, holder: string, ttlMs = 30 * 60 * 1000, now = Date.now()): boolean {
+    let ok = false;
+    this.#tx(() => {
+      const row = this.db.prepare("SELECT holder, at FROM leases WHERE prefix = ?").get(prefix) as
+        | { holder: string; at: number }
+        | undefined;
+      if (row && row.holder !== holder && now - Number(row.at) < ttlMs) return;
+      this.db
+        .prepare("INSERT INTO leases (prefix, holder, at) VALUES (?, ?, ?) ON CONFLICT (prefix) DO UPDATE SET holder = excluded.holder, at = excluded.at")
+        .run(prefix, holder, now);
+      ok = true;
+    });
+    return ok;
+  }
+
+  releaseLeases(holder: string, prefixes: Iterable<string>) {
+    const q = this.db.prepare("DELETE FROM leases WHERE prefix = ? AND holder = ?");
+    this.#tx(() => {
+      for (const p of prefixes) q.run(p, holder);
+    });
+  }
+
+  /** Erasures the exporter has just made unnecessary: objects it references again, prefixes it writes again. */
+  cancelErasures(keys: Iterable<string>) {
+    const q = this.db.prepare("DELETE FROM erasures WHERE key = ?");
+    this.#tx(() => {
+      for (const k of keys) q.run(k);
+    });
+  }
+
+  // ---------------------------------------------------------------- erasure queue
+
+  /** Queue objects (or whole session prefixes) for the erasure job. Idempotent per key. */
+  enqueueErasure(items: { key: string; kind: "object" | "prefix"; org_id: string; reason: string }[], at = Date.now()) {
+    const q = this.db.prepare(
+      `INSERT INTO erasures (key, kind, org_id, reason, enqueued_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (key) DO UPDATE SET next_try = 0,
+         kind = CASE WHEN excluded.kind = 'prefix' THEN 'prefix' ELSE erasures.kind END`,
+    );
+    this.#tx(() => {
+      for (const i of items) q.run(i.key, i.kind, i.org_id, i.reason, at);
+    });
+  }
+
+  nextErasures(now: number, limit: number): { key: string; kind: "object" | "prefix"; org_id: string; reason: string; enqueued_at: number }[] {
+    // Prefixes first (whole sessions), then the oldest objects.
+    return this.db
+      .prepare(
+        `SELECT key, kind, org_id, reason, enqueued_at FROM erasures WHERE next_try <= ?
+          ORDER BY kind = 'prefix' DESC, enqueued_at LIMIT ?`,
+      )
+      .all(now, limit) as unknown as { key: string; kind: "object" | "prefix"; org_id: string; reason: string; enqueued_at: number }[];
+  }
+
+  erasureQueued(key: string, enqueuedAt: number): boolean {
+    return !!this.db.prepare("SELECT 1 FROM erasures WHERE key = ? AND enqueued_at = ?").get(key, enqueuedAt);
+  }
+
+  erasureDone(key: string, enqueuedAt: number) {
+    // Only if not re-queued meanwhile.
+    this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt);
+  }
+
+  erasureFailed(key: string, code: string, at = Date.now()) {
+    this.db
+      .prepare("UPDATE erasures SET attempts = attempts + 1, error = ?, next_try = ? + min(3600000, 60000 * (1 << min(attempts, 6))) WHERE key = ?")
+      .run(code, at, key);
+  }
+
+  erasureBacklog(now = Date.now()): { queued: number; oldestAgeH: number | null; failing: number } {
+    const r = this.db.prepare("SELECT count(*) AS n, min(enqueued_at) AS o, count(error) AS f FROM erasures").get() as {
+      n: number;
+      o: number | null;
+      f: number;
+    };
+    return { queued: Number(r.n), oldestAgeH: r.o === null ? null : +((now - Number(r.o)) / 3_600_000).toFixed(2), failing: Number(r.f) };
+  }
+
+  /** The erasure job's own rollup sweep: every group Neon still has activity for. */
+  seeForErasure(sweep: number, rows: { org_id: string; session_id: string }[]) {
+    const q = this.db.prepare(
+      `INSERT INTO erasure_seen (org_id, session_id, sweep) VALUES (?, ?, ?)
+       ON CONFLICT (org_id, session_id) DO UPDATE SET sweep = excluded.sweep`,
+    );
+    this.#tx(() => {
+      for (const r of rows) q.run(r.org_id, r.session_id, sweep);
+    });
+  }
+
+  /**
+   * After a complete erasure sweep: exported groups Neon no longer has (the
+   * exporter's units come only from rollups, so no rollup means nothing to keep).
+   */
+  vanishedExports(sweep: number): { org_id: string; session_id: string; keys: string[] }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT e.org_id, e.session_id, e.keys FROM exported e
+          LEFT JOIN erasure_seen s ON s.org_id = e.org_id AND s.session_id = e.session_id AND s.sweep = ?
+          WHERE s.org_id IS NULL AND e.keys <> '[]'`,
+      )
+      .all(sweep) as { org_id: string; session_id: string; keys: string }[];
+    this.db.prepare("DELETE FROM erasure_seen WHERE sweep < ?").run(sweep);
+    return rows.map((r) => ({ ...r, keys: JSON.parse(r.keys) as string[] }));
+  }
+
+  /** A group whose session prefixes are queued for erasure forgets them. */
+  forgetKeys(org: string, session: string, keys: string[]) {
+    const prior = this.exported(org, session);
+    if (!prior) return;
+    const left = prior.keys.filter((k) => !keys.includes(k));
+    this.db.prepare("UPDATE exported SET keys = ? WHERE org_id = ? AND session_id = ?").run(JSON.stringify(left), org, session);
+  }
+
   truncationTotals(): { sessions: number; manifests: number; strings: number } {
     const r = this.db
       .prepare("SELECT count(DISTINCT org_id || '/' || session_id) AS s, count(*) AS m, coalesce(sum(strings), 0) AS n FROM truncations")
@@ -200,7 +327,7 @@ export class SyncState {
     const failed = this.db.prepare(
       `UPDATE exported SET failed_revision = -2, attempts = 0, next_try = 0
         WHERE org_id = ? AND session_id = ? AND error IS NOT NULL AND keys <> '[]'
-          AND attempts >= 6 AND error <> 'eraser_unavailable'`,
+          AND attempts >= 6`,
     );
     let n = 0;
     this.#tx(() => {
@@ -212,12 +339,12 @@ export class SyncState {
 
   /**
    * The next groups to export, in priority order:
-   *  1. gone from Neon but still holding exported objects (erasure);
-   *  2. changed since their export and past their debounce (bigger sessions wait longer, at most 24 h);
-   *  3. never exported, active in the last `recentMs`, newest first;
-   *  4. never exported, the rest of history, newest first;
-   *  5. failed ones due for a retry, or whose revision moved since;
-   *  6. when nothing else waits, exports older than `reverifyMs`, oldest first.
+   * (A group gone from Neon is the erasure job's, not the exporter's.)
+   *  1. changed since their export and past their debounce (bigger sessions wait longer, at most 24 h);
+   *  2. never exported, active in the last `recentMs`, newest first;
+   *  3. never exported, the rest of history, newest first;
+   *  4. failed ones due for a retry, or whose revision moved since;
+   *  5. when nothing else waits, exports older than `reverifyMs`, oldest first.
    */
   nextWork(now: number, recentMs: number, limit: number, reverifyMs = 0): WorkItem[] {
     const out: WorkItem[] = [];
@@ -226,13 +353,6 @@ export class SyncState {
       const rows = this.db.prepare(sql).all(...params, limit - out.length) as Omit<WorkItem, "kind">[];
       for (const r of rows) out.push({ ...r, kind });
     };
-    take(
-      `SELECT e.org_id, e.session_id, -1 AS revision, 0 AS events FROM exported e
-        LEFT JOIN groups g USING (org_id, session_id)
-        WHERE g.org_id IS NULL AND e.keys <> '[]' AND e.next_try <= ? LIMIT ?`,
-      "delete",
-      now,
-    );
     take(
       `SELECT g.org_id, g.session_id, g.revision, g.events FROM groups g JOIN exported e USING (org_id, session_id)
         WHERE e.error IS NULL AND g.revision <> e.revision
@@ -259,8 +379,7 @@ export class SyncState {
     take(
       `SELECT g.org_id, g.session_id, g.revision, g.events FROM groups g JOIN exported e USING (org_id, session_id)
         WHERE e.error IS NOT NULL
-          AND ((e.next_try <= ? AND (e.attempts < 6 OR e.error = 'eraser_unavailable'))
-               OR g.revision <> coalesce(e.failed_revision, g.revision))
+          AND ((e.next_try <= ? AND e.attempts < 6) OR g.revision <> coalesce(e.failed_revision, g.revision))
         ORDER BY e.next_try LIMIT ?`,
       "retry",
       now,

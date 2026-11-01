@@ -25,7 +25,9 @@ import {
 } from "../../shared/vendor.ts";
 import { chunksAreServerSealed } from "../../alleyoop/manifests.ts";
 import { buildSessionStream, type DeliveryRecord, type Queryable } from "../relayhistory-export.ts";
-import { deleteExported, exportUnit, orgPrefix, type ExportTarget } from "../neon-s3-sync/export-session.ts";
+import { erasableByExporter, exportUnit, orgPrefix, writeOnly, type ExportTarget } from "../neon-s3-sync/export-session.ts";
+import { storeEraser } from "../neon-s3-erasure/eraser.ts";
+import { ErasureJob, DEFAULT_ERASURE_CONFIG } from "../neon-s3-erasure/job.ts";
 import { boundStrings, fencedGroups, MAX_STRING_TOKEN, neonUnitSource, readOnly, sessionUnits, type SessionUnit, type StreamLine, type UnitSource } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { Syncer, DEFAULT_SYNC_CONFIG } from "../neon-s3-sync/sync.ts";
@@ -131,7 +133,8 @@ const baseRecords = () => [
 ];
 
 const target = (store: ObjectStore, over: Partial<ExportTarget> = {}): ExportTarget => ({
-  store,
+  // The exporter only ever gets a store that cannot delete.
+  store: writeOnly(store),
   keyRoot: "96bulls",
   grantId: "neon-s3-sync",
   now: () => new Date("2026-10-31T16:00:00Z"),
@@ -240,6 +243,7 @@ describe("idempotency", () => {
     const grown = [...baseRecords().slice(0, 3), rec("file_edit", "origin-a", "f-1", { ts_ms: T0 + 5000, file_path: "x" }, "4")];
     const later = { ...t, now: () => new Date("2026-11-01T00:00:00Z") };
     const second = await exportUnit(later, unit("org-a"), fixedSource(grown));
+    await eraseOrphans(store, "org-a", second);
     const v2 = await parseManifest(await readText(store, key), key);
     expect(v2.revision).toBe(v1.revision + 1);
     expect(v2.created_at).toBe(v1.created_at);
@@ -255,7 +259,9 @@ describe("delete propagation", () => {
     const t = target(store, { maxChunkBytes: 200 });
     await exportUnit(t, unit("org-a"), fixedSource(baseRecords()));
     const without = baseRecords().filter((r) => r.record_id !== "e-1");
-    await exportUnit(t, unit("org-a"), fixedSource(without));
+    const r = await exportUnit(t, unit("org-a"), fixedSource(without));
+    // The exporter wrote the new revision and deleted nothing; the erasure job removes the old chunks.
+    await eraseOrphans(store, "org-a", r);
     for (const key of await allKeys(store)) {
       const bytes = await readAll(await store.get(objectKey(key)));
       const text = key.endsWith(".zst") ? new TextDecoder().decode(zstdDecompressSync(bytes)) : new TextDecoder().decode(bytes);
@@ -279,22 +285,92 @@ describe("delete propagation", () => {
     db.units = [];
     state.seeRevisions(2, [{ org_id: "org-a", session_id: "sess:with:colons-1", revision: "6" }]);
     expect(await syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 6, kind: "changed", events: 0 })).toBe(true);
+    expect((await allKeys(store)).length).toBeGreaterThan(0); // the exporter deleted nothing
+    await drainErasures(state, store);
     expect(await allKeys(store)).toEqual([]);
     expect(state.exported("org-a", "sess:with:colons-1")!.keys).toEqual([]);
     expect(state.truncationTotals()).toEqual({ sessions: 0, manifests: 0, strings: 0 });
     state.close();
   });
 
-  test("a group gone from both sweeps is queued for deletion first", async () => {
+  test("the erasure job erases an exported group that has no rollups left, and leaves the rest", async () => {
+    const { store } = await countingStore();
+    const t = target(store);
     const state = new SyncState(join(await tempDir(), "s.sqlite"));
-    state.seeRevisions(1, [{ org_id: "o", session_id: "gone", revision: "1" }, { org_id: "o", session_id: "kept", revision: "1" }]);
-    state.seeActivity(1, [{ org_id: "o", session_id: "kept", last_ms: String(Date.now()), events: "1" }]);
-    state.markExported("o", "gone", 1, ["96bulls/o/v1/x/manifest.json"]);
-    state.seeRevisions(2, [{ org_id: "o", session_id: "kept", revision: "1" }]);
-    state.seeActivity(2, [{ org_id: "o", session_id: "kept", last_ms: String(Date.now()), events: "1" }]);
-    expect(state.dropUnseen(2, 2)).toBe(1);
-    const work = state.nextWork(Date.now(), 14 * 86_400_000, 10);
-    expect(work[0]).toMatchObject({ session_id: "gone", kind: "delete" });
+    const gone = await exportUnit(t, unit("o1", { sessionId: "gone" }), fixedSource(baseRecords().slice(0, 1)));
+    const kept = await exportUnit(t, unit("o1", { sessionId: "kept" }), fixedSource(baseRecords().slice(0, 1)));
+    state.seeRevisions(1, [{ org_id: "o1", session_id: "kept", revision: "1" }]);
+    state.markExported("o1", "gone", 1, gone.manifests.map((m) => m.manifestKey));
+    state.markExported("o1", "kept", 1, kept.manifests.map((m) => m.manifestKey));
+    const db = sweepDb([{ org_id: "o1", session_id: "kept", last_ms: "1", events: "1" }]);
+    const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    await job.sweep();
+    await job.drain();
+    expect(await allKeys(store, "96bulls/o1/v1")).toEqual(await allKeys(store, kept.manifests[0]!.manifestKey.replace("/manifest.json", "")));
+    expect(state.exported("o1", "gone")!.keys).toEqual([]);
+    // a sweep that read nothing never erases
+    const empty = new ErasureJob(sweepDb([]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    await empty.sweep();
+    expect(state.erasureBacklog().queued).toBe(0);
+    state.close();
+  });
+
+  test("the erasure job erases a group a deletion fence covers", async () => {
+    const { store } = await countingStore();
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const r = await exportUnit(target(store), unit("o1", { sessionId: "s1" }), fixedSource(baseRecords().slice(0, 1)));
+    state.seeRevisions(1, [{ org_id: "o1", session_id: "s1", revision: "1" }]);
+    state.markExported("o1", "s1", 1, r.manifests.map((m) => m.manifestKey));
+    const job = new ErasureJob(sweepDb([{ org_id: "o1", session_id: "s1", last_ms: "1", events: "1" }], [{ org_id: "o1", session_id: "s1" }]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    await job.sweep();
+    await job.drain();
+    expect(await allKeys(store)).toEqual([]);
+    state.close();
+  });
+
+  test("the eraser refuses keys outside the item's org or session layout; a leased session waits", async () => {
+    const { store } = await countingStore();
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const r = await exportUnit(target(store), unit("org-b"), fixedSource(baseRecords().slice(0, 1)));
+    const prefixB = r.manifests[0]!.manifestKey.replace("manifest.json", "");
+    state.enqueueErasure([
+      { key: prefixB, kind: "prefix", org_id: "org-a", reason: "test" },
+      { key: "96bulls/org-a/v1/", kind: "prefix", org_id: "org-a", reason: "test" },
+    ]);
+    const job = await drainErasures(state, store);
+    expect(job.counters.refused).toBe(2);
+    expect((await allKeys(store, "96bulls/org-b")).length).toBeGreaterThan(0);
+    // lease held by the exporter: the erasure is deferred, not done
+    const s2 = new SyncState(join(await tempDir(), "s.sqlite"));
+    s2.enqueueErasure([{ key: prefixB, kind: "prefix", org_id: "org-b", reason: "test" }]);
+    expect(s2.acquireLease(prefixB, "exporter:1")).toBe(true);
+    const j2 = new ErasureJob(fakeDb([]), s2, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    expect(await j2.drain()).toBe(0);
+    expect(j2.counters.deferred).toBe(1);
+    s2.releaseLeases("exporter:1", [prefixB]);
+    expect(await j2.drain()).toBe(1);
+    expect(await allKeys(store, "96bulls/org-b")).toEqual([]);
+    state.close();
+    s2.close();
+  });
+
+  test("an orphan the exporter references again is cancelled, never erased", async () => {
+    const { store } = await countingStore();
+    const t = target(store, { maxChunkBytes: 200 });
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const records = baseRecords().slice(0, 3);
+    const syncer = new Syncer(fakeDb([unit("org-a")]), state, t, fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => fixedSource(records));
+    const w = (rev: number) => ({ org_id: "org-a", session_id: "sess:with:colons-1", revision: rev, kind: "changed" as const, events: 3 });
+    expect(await syncer.processGroup(w(1))).toBe(true);
+    const last = records.pop()!;
+    expect(await syncer.processGroup(w(2))).toBe(true);
+    expect(state.erasureBacklog().queued).toBeGreaterThan(0);
+    records.push(last); // reverted before the eraser ran: the old chunks are referenced again
+    expect(await syncer.processGroup(w(3))).toBe(true);
+    await drainErasures(state, store);
+    const key = state.exported("org-a", "sess:with:colons-1")!.keys[0]!;
+    const m = await parseManifest(await readText(store, key), key);
+    expect(await chunksAreServerSealed({ store } as never, m, "96bulls/org-a")).toBe(true);
     state.close();
   });
 
@@ -326,11 +402,10 @@ describe("ownership and failure bookkeeping", () => {
     expect(row.error).toBe("57014");
     expect(row.keys).toHaveLength(1);
     expect((await allKeys(store)).length).toBeGreaterThan(0); // sealed chunks, no manifest
-    // Neon then hard-deletes the session: both sweeps miss it, the delete work erases the prefix.
-    state.dropUnseen(2, 2);
-    const work = state.nextWork(Date.now() + 5 * 3_600_000, 14 * 86_400_000, 10);
-    expect(work[0]).toMatchObject({ kind: "delete" });
-    expect(await syncer.processGroup(work[0]!)).toBe(true);
+    // Neon then hard-deletes the session: the erasure job's sweep no longer sees it and erases the prefix.
+    const job = new ErasureJob(sweepDb([{ org_id: "org-z", session_id: "other", last_ms: "1", events: "1" }]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    await job.sweep();
+    await job.drain();
     expect(await allKeys(store)).toEqual([]);
     state.close();
   });
@@ -377,16 +452,16 @@ describe("ownership and failure bookkeeping", () => {
     state.close();
   });
 
-  test("waiting for the eraser key is retried hourly past the attempt cap; a fence revives a capped failure", async () => {
+  test("a fence revives a failure past its attempt cap, once", async () => {
     const state = new SyncState(join(await tempDir(), "s.sqlite"));
     let now = Date.now();
-    state.seeRevisions(1, [{ org_id: "o", session_id: "e", revision: "1" }, { org_id: "o", session_id: "x", revision: "1" }]);
-    for (let i = 0; i < 8; i++) state.markFailed("o", "e", "eraser_unavailable", ["96bulls/o/v1/a/manifest.json"], 1, now);
+    state.seeRevisions(1, [{ org_id: "o", session_id: "x", revision: "1" }]);
     for (let i = 0; i < 8; i++) state.markFailed("o", "x", "57014", ["96bulls/o/v1/b/manifest.json"], 1, now);
-    now += 61 * 60 * 1000;
-    expect(state.nextWork(now, 86_400_000, 10).map((w) => w.session_id)).toEqual(["e"]);
+    now += 5 * 60 * 60 * 1000;
+    expect(state.nextWork(now, 86_400_000, 10)).toEqual([]);
     expect(state.forceChanged([{ org_id: "o", session_id: "x" }])).toBe(1);
-    expect(state.nextWork(now, 86_400_000, 10).map((w) => w.session_id).sort()).toEqual(["e", "x"]);
+    expect(state.forceChanged([{ org_id: "o", session_id: "x" }])).toBe(0);
+    expect(state.nextWork(now, 86_400_000, 10).map((w) => w.session_id)).toEqual(["x"]);
     state.close();
   });
 
@@ -401,11 +476,12 @@ describe("ownership and failure bookkeeping", () => {
     state.markExported("org-a", "sess:with:colons-1", 1, [other.manifests[0]!.manifestKey, own.manifests[0]!.manifestKey]);
     const db = fakeDb([]);
     const syncer = new Syncer(db, state, t, fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => fixedSource([]));
-    // deleteExported refuses the other session's key only by identity when called for it; simulate a foreign owner
+    // the other session's manifest now belongs to a client: the exporter must not queue it
     const m = JSON.parse(await readText(store, other.manifests[0]!.manifestKey));
     m.raw.owner = m.writer.delivery_instance_id = "client-1";
     await store.put(objectKey(other.manifests[0]!.manifestKey), new TextEncoder().encode(JSON.stringify(m)));
     expect(await syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 2, kind: "changed", events: 0 })).toBe(true);
+    await drainErasures(state, store);
     expect(await allKeys(store, own.manifests[0]!.manifestKey.replace("/manifest.json", ""))).toEqual([]);
     expect((await allKeys(store, other.manifests[0]!.manifestKey.replace("/manifest.json", ""))).length).toBeGreaterThan(0);
     expect(state.exported("org-a", "sess:with:colons-1")!.keys).toEqual([]);
@@ -422,7 +498,7 @@ describe("ownership and failure bookkeeping", () => {
     await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)));
     const before = await allKeys(store);
     await expect(exportUnit(t, unit("org-a"), fixedSource(baseRecords()))).rejects.toMatchObject({ code: "foreign_manifest" });
-    await expect(deleteExported(t, "org-a", key)).rejects.toMatchObject({ code: "foreign_manifest" });
+    expect(await erasableByExporter(t, "org-a", key)).toBe(false);
     expect(await allKeys(store)).toEqual(before);
   });
 
@@ -453,9 +529,12 @@ describe("prefixes and tenant isolation", () => {
     expect(keysA.length).toBeGreaterThan(0);
     expect(keysB.length).toBe(keysA.length);
     expect((await allKeys(store)).length).toBe(keysA.length + keysB.length);
-    // An org-b key is refused when deleting for org-a.
-    await expect(deleteExported(t, "org-a", b.manifests[0]!.manifestKey)).rejects.toThrow();
-    for (const m of a.manifests) await deleteExported(t, "org-a", m.manifestKey);
+    // An org-b key is never erasable for org-a.
+    expect(await erasableByExporter(t, "org-a", b.manifests[0]!.manifestKey)).toBe(false);
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    state.enqueueErasure(a.manifests.map((m) => ({ key: m.manifestKey.replace("manifest.json", ""), kind: "prefix" as const, org_id: "org-a", reason: "test" })));
+    await drainErasures(state, store);
+    state.close();
     expect(await allKeys(store, "96bulls/org-a/")).toEqual([]);
     expect(await allKeys(store, "96bulls/org-b/")).toEqual(keysB);
   });
@@ -679,6 +758,34 @@ function fakeDb(units: SessionUnit[]): Queryable & { units: SessionUnit[] } {
   return self;
 }
 
+/** The erasure job over a plain store, draining what is queued. */
+async function drainErasures(state: SyncState, store: ObjectStore) {
+  const job = new ErasureJob(fakeDb([]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+  while ((await job.drain()) > 0);
+  return job;
+}
+
+/** Queue a unit result's orphans as the exporter does, then erase them. */
+async function eraseOrphans(store: ObjectStore, org: string, r: { manifests: { orphans: string[] }[] }) {
+  const state = new SyncState(join(await tempDir(), "s.sqlite"));
+  state.enqueueErasure(r.manifests.flatMap((m) => m.orphans.map((key) => ({ key, kind: "object" as const, org_id: org, reason: "unreferenced" }))));
+  await drainErasures(state, store);
+  state.close();
+}
+
+/** A Neon stand-in for the erasure sweep: rollup activity pages and fenced groups. */
+function sweepDb(activity: { org_id: string; session_id: string; last_ms: string; events: string }[], fenced: { org_id: string; session_id: string }[] = []): Queryable {
+  return {
+    async query<T>(sql: string) {
+      if (sql.includes("pg_locks")) return { rows: [{ total: "0", non_advisory: "0" }] as T[] };
+      if (sql.includes("deleted_upload_sessions") && sql.includes("UNION")) return { rows: fenced as T[] };
+      if (sql.includes("FROM sessions.session_rollups") && sql.includes("GROUP BY org_id, session_id"))
+        return { rows: (sql.includes("(org_id, session_id) >") ? [] : activity) as T[] };
+      throw new Error("unexpected query");
+    },
+  };
+}
+
 function fastThrottle() {
   return new Throttle({ rowsPerSec: 1e9, bytesPerSec: 1e12, slowWindows: [], slowFactor: 1, sleep: async () => {} });
 }
@@ -687,22 +794,13 @@ function fastThrottle() {
 
 const minio = process.env.S3X_TEST_MINIO_ENDPOINT;
 describe.skipIf(!minio)("against a real S3 API (MinIO, S3X_TEST_MINIO_*)", () => {
-  test("create-only chunks, CAS manifests, idempotent re-export, erasure through the eraser store", async () => {
+  test("write-only exporter, then the versioned eraser removes every version", async () => {
     const { createS3Store } = await import("../../shared/vendor.ts");
-    const { splitStore } = await import("../neon-s3-sync/export-session.ts");
-    const s3 = () =>
-      createS3Store({
-        bucket: process.env.S3X_TEST_MINIO_BUCKET ?? "s3x-test",
-        region: "us-east-1",
-        endpoint: minio!,
-        credentials: {
-          accessKeyId: process.env.S3X_TEST_MINIO_ACCESS_KEY!,
-          secretAccessKey: process.env.S3X_TEST_MINIO_SECRET_KEY!,
-        },
-      });
-    let deletes = 0;
-    const eraser = s3();
-    const store = splitStore(s3(), { ...eraser, delete: (k) => ((deletes += 1), eraser.delete(k)) });
+    const { createS3Eraser } = await import("../neon-s3-erasure/eraser.ts");
+    const creds = { accessKeyId: process.env.S3X_TEST_MINIO_ACCESS_KEY!, secretAccessKey: process.env.S3X_TEST_MINIO_SECRET_KEY! };
+    const bucket = process.env.S3X_TEST_MINIO_BUCKET ?? "s3x-test";
+    const store = createS3Store({ bucket, region: "us-east-1", endpoint: minio!, credentials: creds });
+    const eraser = createS3Eraser({ bucket, region: "us-east-1", endpoint: minio!, credentials: creds });
     const org = `org-${Date.now().toString(36)}`;
     const t = target(store, { maxChunkBytes: 200 });
     const first = await exportUnit(t, unit(org), fixedSource(baseRecords()));
@@ -712,10 +810,15 @@ describe.skipIf(!minio)("against a real S3 API (MinIO, S3X_TEST_MINIO_*)", () =>
     }
     const again = await exportUnit(t, unit(org), fixedSource(baseRecords()));
     expect(again.manifests.every((m) => !m.written && m.chunksSealed === 0)).toBe(true);
-    await exportUnit(t, unit(org), fixedSource(baseRecords().filter((r) => r.record_id !== "e-1")));
-    expect(deletes).toBeGreaterThan(0);
-    for (const m of first.manifests) await deleteExported(t, org, m.manifestKey);
+    const changed = await exportUnit(t, unit(org), fixedSource(baseRecords().filter((r) => r.record_id !== "e-1")));
+    const orphans = changed.manifests.flatMap((m) => m.orphans);
+    expect(orphans.length).toBeGreaterThan(0);
+    for (const o of orphans) expect(await eraser.eraseObject(o)).toBeGreaterThan(0);
+    for (const o of orphans) expect(await store.head(objectKey(o))).toBeUndefined();
+    // Every version (the rewritten manifest's noncurrent one too) goes with the prefix.
+    for (const m of first.manifests) await eraser.erasePrefix(m.manifestKey.replace("manifest.json", ""));
     expect(await allKeys(store, `96bulls/${org}`)).toEqual([]);
+    for (const m of first.manifests) expect(await eraser.erasePrefix(m.manifestKey.replace("manifest.json", ""))).toBe(0);
   });
 });
 

@@ -19,9 +19,10 @@
  * Idempotent: an unchanged chunk is recognised from the stored manifest (same
  * seq, offset, length and source digest) and is neither sealed nor written; an
  * unchanged manifest is not rewritten. A changed session is rewritten as a new
- * manifest revision and every object under its prefix that the new manifest
- * no longer references is deleted (erasure; bucket versioning expires the
- * noncurrent versions).
+ * manifest revision (the old one becomes a noncurrent version, expired by the
+ * bucket in a day). Write-only: objects the new manifest no longer references
+ * are queued for the separate erasure job (`../neon-s3-erasure`), which alone
+ * holds the eraser key.
  */
 import { createHash } from "node:crypto";
 import {
@@ -89,7 +90,10 @@ export interface MachineResult {
   chunksReused: number;
   rawBytes: number;
   storedBytes: number;
-  deletedObjects: number;
+  /** Objects under this session prefix the manifest no longer references (for the erasure job). */
+  orphans: string[];
+  /** The manifest and every chunk it references. */
+  referenced: string[];
   truncatedStrings: number;
 }
 
@@ -376,41 +380,42 @@ async function buildManifest(
  * Delete everything under `prefix` except `keep`. The manifest goes first, so
  * a reader never sees a manifest whose chunks are gone.
  */
-export async function deleteUnder(
-  store: ObjectStore,
-  prefix: string,
-  keep: ReadonlySet<string> = new Set(),
-): Promise<number> {
+async function listKeys(store: ObjectStore, prefix: string): Promise<string[]> {
   const keys: string[] = [];
   let cursor: string | undefined;
   do {
     const page = await store.list(objectKey(prefix.replace(/\/+$/, "")), cursor);
-    for (const item of page.items) if (!keep.has(item.key)) keys.push(item.key);
+    for (const item of page.items) keys.push(item.key);
     cursor = page.nextCursor;
   } while (cursor);
-  keys.sort((a, b) => Number(b.endsWith("/manifest.json")) - Number(a.endsWith("/manifest.json")));
-  for (const key of keys) await store.delete(objectKey(key));
-  return keys.length;
+  return keys;
 }
 
 /**
- * Remove an exported session prefix (a manifest key this exporter wrote) and
- * everything under it, after checking the key is under this org's prefix.
+ * Whether a stale session prefix (a manifest key this exporter recorded) may be
+ * handed to the erasure job: under this org's prefix, and its manifest is gone
+ * or is still this exporter's own export for this org. The exporter reads it;
+ * the eraser cannot (it has no GetObject), so the check happens here.
  */
-export async function deleteExported(target: ExportTarget, orgId: string, key: string): Promise<number> {
-  const prefix = orgPrefix(target.keyRoot, orgId);
+export async function erasableByExporter(target: ExportTarget, orgId: string, key: string): Promise<boolean> {
   const loc = parseSessionKey(key);
-  if (!loc || loc.prefix !== prefix || loc.rest !== "manifest.json")
-    throw new Error("refusing to delete a key outside this org's export prefix");
-  const found = await readManifest(target.store, key);
-  const issue = found && ownershipIssue(found.manifest, target.grantId);
-  if (issue) throw coded(issue, "refusing to erase a manifest this exporter does not own");
-  if (found && (found.manifest.extensions?.[SESSION_EXT] as { tenant_id?: unknown } | undefined)?.tenant_id !== orgId)
-    throw coded("key_collision", "refusing to erase another org's manifest");
-  return deleteUnder(target.store, key.slice(0, -"manifest.json".length));
+  if (!loc || loc.prefix !== orgPrefix(target.keyRoot, orgId) || loc.rest !== "manifest.json") return false;
+  let found: Awaited<ReturnType<typeof readManifest>>;
+  try {
+    found = await readManifest(target.store, key);
+  } catch (error) {
+    if ((error as { code?: unknown }).code === "foreign_manifest_invalid") return false;
+    throw error;
+  }
+  if (!found) return true;
+  if (ownershipIssue(found.manifest, target.grantId)) return false;
+  return (found.manifest.extensions?.[SESSION_EXT] as { tenant_id?: unknown } | undefined)?.tenant_id === orgId;
 }
 
-/** Export one unit. Returns the manifest keys it now owns (none when fenced or empty). */
+/**
+ * Export one unit. Write-only: it never deletes. Objects the new manifest no
+ * longer references come back as `orphans` for the erasure job.
+ */
 export async function exportUnit(
   target: ExportTarget,
   unit: SessionUnit,
@@ -429,10 +434,12 @@ export async function exportUnit(
       for (const other of streams.values())
         if (other.key === stream.key)
           throw Object.assign(new Error("two machines map to one key"), { code: "machine_key_collision" });
-      streams.set(line.machine, stream);
-      // Recorded before anything is written under this prefix, so a failed run
-      // still leaves the key in the watermark for a later erasure.
+      // The key is recorded (and its prefix leased) before anything is read or
+      // written under it, so a failed run still leaves it in the watermark for
+      // a later erasure; then ownership (a foreign or colliding manifest throws).
       opts.onKey?.(stream.key);
+      await stream.existing();
+      streams.set(line.machine, stream);
     }
     await stream.push(line);
   }
@@ -461,20 +468,17 @@ export async function exportUnit(
         contentType: "application/json",
         metadata: { "trace-id": manifest.trace_id },
       });
-    // Orphans: chunks of an older revision or of an interrupted run, and
-    // normalized output built from older content. Summaries are the
-    // pipeline's; they are rebuilt from the new content.
-    // Listed on every export (a read), so orphans of an interrupted run go too.
-    let deleted = 0;
-    {
-      const keep = new Set([stream.key]);
-      const raw = `${stream.key.slice(0, -"manifest.json".length)}raw/`;
-      for (const c of manifest.raw.chunks)
-        keep.add(`${raw}${String(c.seq).padStart(10, "0")}-${c.start_offset}-${c.sha256_8}.ndjson.zst`);
-      deleted += await deleteUnder(target.store, raw, keep);
-      const normalized = `${stream.key.slice(0, -"manifest.json".length)}normalized/`;
-      deleted += await deleteUnderUnless(target.store, normalized, (k) => k.includes(manifest.raw.content_sha256));
-    }
+    // Orphans, for the erasure job: chunks of an older revision or of an
+    // interrupted run, and normalized output built from older content. Listed
+    // on every export (a read), so an interrupted run's leftovers are found too.
+    const base = stream.key.slice(0, -"manifest.json".length);
+    const keep = new Set<string>();
+    for (const c of manifest.raw.chunks)
+      keep.add(`${base}raw/${String(c.seq).padStart(10, "0")}-${c.start_offset}-${c.sha256_8}.ndjson.zst`);
+    const orphans = [
+      ...(await listKeys(target.store, `${base}raw`)).filter((k) => !keep.has(k)),
+      ...(await listKeys(target.store, `${base}normalized`)).filter((k) => !k.includes(manifest.raw.content_sha256)),
+    ];
     manifests.push({
       manifestKey: stream.key,
       written: !unchanged,
@@ -482,40 +486,30 @@ export async function exportUnit(
       chunksReused: stream.reused,
       rawBytes: manifest.raw.raw_bytes,
       storedBytes: manifest.raw.stored_bytes,
-      deletedObjects: deleted,
+      orphans,
+      referenced: [stream.key, ...keep],
       truncatedStrings: stream.truncated,
     });
   }
   return { fenced: false, manifests, lines };
 }
 
-async function deleteUnderUnless(store: ObjectStore, prefix: string, keep: (key: string) => boolean): Promise<number> {
-  const keys: string[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await store.list(objectKey(prefix.replace(/\/+$/, "")), cursor);
-    for (const item of page.items) if (!keep(item.key)) keys.push(item.key);
-    cursor = page.nextCursor;
-  } while (cursor);
-  for (const key of keys) await store.delete(objectKey(key));
-  return keys.length;
-}
-
 /**
- * The production bucket's credential model (96BullSessions #100): the writer
- * (or exporter) principal may list, get and put but never delete; only the
- * eraser may delete, and it cannot read content. Deletes go to the eraser,
- * everything else to the writer.
+ * The exporter's store: everything the writer key allows, and no delete. The
+ * exporter never holds the eraser key (Khaliq, 2026-10-31); a delete reaching
+ * here is a bug.
  */
-export function splitStore(writer: ObjectStore, eraser: ObjectStore): ObjectStore {
+export function writeOnly(store: ObjectStore): ObjectStore {
   return {
-    backend: writer.backend,
-    head: (k) => writer.head(k),
-    get: (k, r) => writer.get(k, r),
-    getObject: (k, r) => writer.getObject(k, r),
-    list: (p, c) => writer.list(p, c),
-    presignGet: (k, t) => writer.presignGet(k, t),
-    put: (k, b, o) => writer.put(k, b, o),
-    delete: (k) => eraser.delete(k),
+    backend: store.backend,
+    head: (k) => store.head(k),
+    get: (k, r) => store.get(k, r),
+    getObject: (k, r) => store.getObject(k, r),
+    list: (p, c) => store.list(p, c),
+    presignGet: (k, t) => store.presignGet(k, t),
+    put: (k, b, o) => store.put(k, b, o),
+    delete: async () => {
+      throw coded("exporter_write_only", "the exporter does not delete");
+    },
   };
 }

@@ -4,7 +4,7 @@
  * first), export them, and log progress as counts only.
  */
 import type { Queryable } from "../relayhistory-export.ts";
-import { deleteExported, exportUnit, type ExportTarget } from "./export-session.ts";
+import { erasableByExporter, exportUnit, type ExportTarget } from "./export-session.ts";
 import {
   activityPage,
   fencedGroups,
@@ -48,6 +48,8 @@ export const DEFAULT_SYNC_CONFIG: SyncConfig = {
 
 export type Log = (fields: Record<string, unknown>) => void;
 
+const LEASE_HOLDER = `exporter:${process.pid}`;
+
 /** Error code only: a Postgres or store error message can quote data. */
 export function errorCode(error: unknown): string {
   const e = error as { code?: unknown; name?: unknown } | null;
@@ -65,7 +67,7 @@ export interface Counters {
   manifestsUnchanged: number;
   chunksSealed: number;
   chunksReused: number;
-  objectsDeleted: number;
+  erasuresQueued: number;
   rawBytes: number;
   storedBytesWritten: number;
   eventsDone: number;
@@ -84,7 +86,7 @@ export class Syncer {
     manifestsUnchanged: 0,
     chunksSealed: 0,
     chunksReused: 0,
-    objectsDeleted: 0,
+    erasuresQueued: 0,
     rawBytes: 0,
     storedBytesWritten: 0,
     eventsDone: 0,
@@ -208,56 +210,56 @@ export class Syncer {
   async processGroup(work: WorkItem, lane = this.lanes[0]!): Promise<boolean> {
     const prior = this.state.exported(work.org_id, work.session_id);
     const t0 = this.throttle.now();
-    // Every key this run may write under, recorded before the write.
+    // Every key this run may write under, recorded (and leased) before the write.
     const touched = new Set<string>();
+    const leased: string[] = [];
+    const referenced = new Set<string>();
     try {
       const keys: string[] = [];
       const truncations: { key: string; strings: number }[] = [];
-      if (work.kind !== "delete") {
-        const units = await sessionUnits(lane.db, work.org_id, work.session_id);
-        await this.hook(units.length, 0);
-        for (const unit of units) {
-          const r = await exportUnit(this.target, unit, lane.source, {
-            // Work driven by a change must see a fence written with that change.
-            freshFence: work.kind !== "recent" && work.kind !== "history",
-            onKey: (k) => touched.add(k),
-          });
-          if (r.fenced) this.counters.fenced += 1;
-          for (const m of r.manifests) {
-            keys.push(m.manifestKey);
-            truncations.push({ key: m.manifestKey, strings: m.truncatedStrings });
-            if (m.written) this.counters.manifestsWritten += 1;
-            else this.counters.manifestsUnchanged += 1;
-            this.counters.chunksSealed += m.chunksSealed;
-            this.counters.chunksReused += m.chunksReused;
-            this.counters.objectsDeleted += m.deletedObjects;
-            this.counters.rawBytes += m.rawBytes;
-            this.counters.truncatedStrings += m.truncatedStrings;
-            if (m.chunksSealed) this.counters.storedBytesWritten += m.storedBytes;
-          }
+      const erase: { key: string; kind: "object" | "prefix"; org_id: string; reason: string }[] = [];
+      const units = await sessionUnits(lane.db, work.org_id, work.session_id);
+      await this.hook(units.length, 0);
+      for (const unit of units) {
+        const r = await exportUnit(this.target, unit, lane.source, {
+          // Work driven by a change must see a fence written with that change.
+          freshFence: work.kind !== "recent" && work.kind !== "history",
+          onKey: (k) => {
+            const prefix = k.slice(0, -"manifest.json".length);
+            if (!this.state.acquireLease(prefix, LEASE_HOLDER))
+              throw Object.assign(new Error("the erasure job holds this session"), { code: "prefix_busy" });
+            leased.push(prefix);
+            touched.add(k);
+          },
+        });
+        if (r.fenced) this.counters.fenced += 1;
+        for (const m of r.manifests) {
+          keys.push(m.manifestKey);
+          truncations.push({ key: m.manifestKey, strings: m.truncatedStrings });
+          if (m.written) this.counters.manifestsWritten += 1;
+          else this.counters.manifestsUnchanged += 1;
+          this.counters.chunksSealed += m.chunksSealed;
+          this.counters.chunksReused += m.chunksReused;
+          this.counters.rawBytes += m.rawBytes;
+          this.counters.truncatedStrings += m.truncatedStrings;
+          if (m.chunksSealed) this.counters.storedBytesWritten += m.storedBytes;
+          for (const k of m.referenced) referenced.add(k);
+          for (const o of m.orphans) erase.push({ key: o, kind: "object", org_id: work.org_id, reason: "unreferenced" });
         }
       }
+      // Session prefixes this group no longer produces (fenced, emptied, moved
+      // to another date or machine): the whole prefix goes to the erasure job,
+      // unless the manifest there is no longer this exporter's.
       const keep = new Set(keys);
-      // Erase every stale key; one that fails does not stop the others.
-      let deleteError: unknown;
-      const retained: string[] = [];
       for (const key of new Set([...(prior?.keys ?? []), ...touched])) {
         if (keep.has(key)) continue;
-        try {
-          this.counters.objectsDeleted += await deleteExported(this.target, work.org_id, key);
-        } catch (error) {
-          const code = errorCode(error);
-          // Not this exporter's object (a client's manifest, another session's key): never ours to track.
-          if (code.startsWith("foreign_manifest") || code === "key_collision") continue;
-          retained.push(key);
-          deleteError ??= error;
-        }
+        if (await erasableByExporter(this.target, work.org_id, key))
+          erase.push({ key: key.slice(0, -"manifest.json".length), kind: "prefix", org_id: work.org_id, reason: "stale_prefix" });
       }
-      if (deleteError !== undefined) {
-        for (const k of retained) touched.add(k);
-        for (const k of keys) touched.add(k);
-        throw deleteError;
-      }
+      this.state.enqueueErasure(erase);
+      // Under the lease: nothing this group now references, or writes under, stays queued.
+      this.state.cancelErasures([...referenced, ...keys.map((k) => k.slice(0, -"manifest.json".length))]);
+      this.counters.erasuresQueued += erase.length;
       this.state.markExported(work.org_id, work.session_id, work.revision, keys);
       this.state.recordTruncations(work.org_id, work.session_id, truncations);
       this.counters.groups += 1;
@@ -272,6 +274,8 @@ export class Syncer {
       this.log({ message: "group failed", error_code: code, kind: work.kind });
       if (isConnectionError(error)) throw error;
       return false;
+    } finally {
+      this.state.releaseLeases(LEASE_HOLDER, leased);
     }
   }
 
@@ -296,6 +300,7 @@ export class Syncer {
       eta_recent_h: eta(b.recentPendingEvents),
       eta_all_h: eta(b.pendingEvents),
       errors: this.state.errorCounts(),
+      erasure_queue: this.state.erasureBacklog(now),
       // Outstanding truncations (ledger in the state file); T0 waits on zero.
       truncation_ledger: this.state.truncationTotals(),
     });
