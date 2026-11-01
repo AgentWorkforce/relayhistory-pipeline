@@ -423,8 +423,9 @@ describe("GCP self-host contract", () => {
     expect(worker.extraEnv.filter(({ name }) => name === "HOOPDB_SUPABASE_SHIM")).toHaveLength(0);
     expect(worker.extraEnv).toEqual(
       expect.arrayContaining([
-        { name: "HOOPDB_DB_MODE", value: "selfhosted" },
+        { name: "HOOPDB_DB_MODE", value: "cloudsql" },
         { name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" },
+        { name: "HOOPDB_ROLE_BOOTSTRAP", value: "false" },
       ]),
     );
     expect(values).toMatchObject({

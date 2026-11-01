@@ -48,25 +48,26 @@ interface Step {
  * The database-mode contract. The migrator never infers the target from a hostname:
  * HOOPDB_DB_MODE is required and has no default.
  *   local       the Docker stack: plain Postgres, the migrator is its superuser.
- *   selfhosted  CNPG or Cloud SQL: plain Postgres, a least-privilege migration owner.
+ *   selfhosted  CNPG or another operator-controlled plain Postgres deployment.
+ *   cloudsql    Google Cloud SQL: plain Postgres with Google's fixed platform superuser.
  *   supabase    a Supabase project. The plain-Postgres role shim and the privileged
  *               role bootstrap are refused outright (supabase_shim.sql: "Never apply
  *               this to a Supabase project"); the roles are platform or operator steps.
  * HOOPDB_SUPABASE_SHIM must be set explicitly ("true" or "false") in local and
- * selfhosted mode, and may only be unset or "false" in supabase mode.
+ * selfhosted and cloudsql mode, and may only be unset or "false" in supabase mode.
  * HOOPDB_ROLE_BOOTSTRAP defaults to the shim choice and is likewise refused in supabase
  * mode. HOOPDB_RUNTIME_ROLE (required) names the role the services connect as: it gets
  * SELECT on the ledger and the readiness marker, nothing else.
  * Resolved before any connection; an invalid profile writes nothing anywhere.
  */
-export type DbMode = "local" | "selfhosted" | "supabase";
+export type DbMode = "local" | "selfhosted" | "cloudsql" | "supabase";
 export interface MigrationProfile {
   mode: DbMode;
   shim: boolean;
   bootstrap: boolean;
   verify: boolean;
   runtimeRole: string;
-  /** HOOPDB_RUNTIME_ROLE_LOGIN; required in selfhosted and supabase (the role is dedicated there). */
+  /** HOOPDB_RUNTIME_ROLE_LOGIN; required outside local mode (the role is dedicated there). */
   runtimeLogin?: boolean;
   /** HOOPDB_RUNTIME_WORKLOAD_ROLE: the one role allowed to be a member of the runtime role. */
   workloadRole?: string;
@@ -92,8 +93,8 @@ function strictFlag(env: Record<string, string | undefined>, name: string): bool
 
 export function migrationProfile(env: Record<string, string | undefined> = process.env): MigrationProfile {
   const mode = env.HOOPDB_DB_MODE;
-  if (mode !== "local" && mode !== "selfhosted" && mode !== "supabase")
-    throw profileError("db_mode_invalid", "HOOPDB_DB_MODE must be local, selfhosted or supabase; there is no default");
+  if (mode !== "local" && mode !== "selfhosted" && mode !== "cloudsql" && mode !== "supabase")
+    throw profileError("db_mode_invalid", "HOOPDB_DB_MODE must be local, selfhosted, cloudsql or supabase; there is no default");
   const shim = strictFlag(env, "HOOPDB_SUPABASE_SHIM");
   const bootstrap = strictFlag(env, "HOOPDB_ROLE_BOOTSTRAP");
   const verify = strictFlag(env, "HOOPDB_ROLE_VERIFY") ?? true;
@@ -455,7 +456,7 @@ if (import.meta.main) {
     // Without HOOPDB_DB_MODE every creator is covered (no platform exclusion). Exit 1 if
     // unproven.
     const dbMode = process.env.HOOPDB_DB_MODE;
-    if (dbMode !== undefined && !["local", "selfhosted", "supabase"].includes(dbMode)) {
+    if (dbMode !== undefined && !["local", "selfhosted", "cloudsql", "supabase"].includes(dbMode)) {
       console.error("db_mode_invalid");
       process.exit(1);
     }
