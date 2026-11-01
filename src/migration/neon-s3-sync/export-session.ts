@@ -43,6 +43,7 @@ import {
   type SessionLocation,
 } from "../../shared/vendor.ts";
 import { MAX_CHUNK_BYTES } from "../relayhistory-export.ts";
+import { layoutComponent } from "../../shared/layout-component.ts";
 import type { SessionUnit, StreamLine, UnitSource } from "./neon-reader.ts";
 
 export const SYNC_PLUGIN_VERSION = "96bulls-neon-s3-sync/0.1.0";
@@ -62,13 +63,7 @@ export interface ExportTarget {
 }
 
 /** Layout component: the pipeline's `[A-Za-z0-9._-]{1,128}`, not starting with `.` (same map as #55's courier). */
-export const component = (s: string) => {
-  const safe = s.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\./, "_");
-  if (safe.length <= 128) return safe;
-  // Too long: a plain cut makes ids that differ only past char 128 collide
-  // (seen in production: 38 sessions). Keep 119 chars and a digest of the whole id.
-  return `${safe.slice(0, 119)}-${createHash("sha256").update(s).digest("hex").slice(0, 8)}`;
-};
+export const component = layoutComponent;
 
 const ORG = /^[A-Za-z0-9._-]{1,128}$/;
 const KEY_ROOT = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -413,7 +408,12 @@ async function listKeys(store: ObjectStore, prefix: string): Promise<string[]> {
  * or is still this exporter's own export for this org. The exporter reads it;
  * the eraser cannot (it has no GetObject), so the check happens here.
  */
-export async function erasableByExporter(target: ExportTarget, orgId: string, key: string): Promise<boolean> {
+export async function erasableByExporter(
+  target: ExportTarget,
+  orgId: string,
+  key: string,
+  sessionId?: string,
+): Promise<boolean> {
   const loc = parseSessionKey(key);
   if (!loc || loc.prefix !== orgPrefix(target.keyRoot, orgId) || loc.rest !== "manifest.json") return false;
   let found: Awaited<ReturnType<typeof readManifest>>;
@@ -425,7 +425,10 @@ export async function erasableByExporter(target: ExportTarget, orgId: string, ke
   }
   if (!found) return true;
   if (ownershipIssue(found.manifest, target.grantId)) return false;
-  return (found.manifest.extensions?.[SESSION_EXT] as { tenant_id?: unknown } | undefined)?.tenant_id === orgId;
+  if ((found.manifest.extensions?.[SESSION_EXT] as { tenant_id?: unknown } | undefined)?.tenant_id !== orgId) return false;
+  // Another Neon session's manifest at this key (an old collision) is never this group's to erase.
+  const catalog = (found.manifest.extensions?.[EXPORT_MARKER] as { catalog?: { neon_session_id?: unknown } } | undefined)?.catalog;
+  return sessionId === undefined || catalog?.neon_session_id === sessionId;
 }
 
 /**

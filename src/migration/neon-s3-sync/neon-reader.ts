@@ -16,11 +16,17 @@
 import {
   RECORD_KINDS,
   buildSessionStream,
-  deletionFenced,
   type DeliveryRecord,
   type Queryable,
 } from "../relayhistory-export.ts";
 import { MAX_SCRUB_CHARS } from "@rhc/lib/scrub.ts";
+
+/**
+ * Every delivery kind the export carries: #40's RECORD_KINDS plus `trajectory`
+ * (an activity kind) and `commit_link` (a catalog kind), which the projection
+ * reads and #40's list left out.
+ */
+export const EXPORT_KINDS = [...RECORD_KINDS, "trajectory", "commit_link"] as const;
 
 /** Kinds whose winner the catalog acceptance ledger settles (as in #78's reader). */
 const CATALOG_KINDS = new Set(["session", "relationship", "session_marker", "commit_link"]);
@@ -319,55 +325,48 @@ const DELIVERY_MACHINE_SQL = `'delivery:' || md5(jsonb_build_array(d.workspace_i
 export const SMALL_SESSION_ROWS = 4000;
 
 /**
- * Deletion fence, cached: `deleted_upload_sessions` and `session_resets` are
- * tiny, so both are read whole at most every `ttlMs`; a session is checked in
- * memory, and only a workspace with a reset falls back to #40's per-session
- * `deletionFenced` query.
+ * Deletion fence: `deleted_upload_sessions` tombstones only. A user's reset
+ * (`reset_uploaded_sessions`, vendor 0039) tombstones every session it covers
+ * and deletes their delivery records (0038 `set_session_uploads`), so the
+ * tombstones are the complete fence. A reset leg joined to `delivery_records`
+ * could only match sessions delivered *after* the reset, which must be
+ * exported, never fenced (#40's `deletionFenced` has that leg; not used here).
+ *
+ * The table is tiny, so it is read whole at most every `ttlMs`; `fresh`
+ * checks the one session directly.
  */
 function fenceCache(db: Queryable, ttlMs = 120_000) {
   const LIMIT = 1_000_000;
   let loaded = 0;
   let tombstones = new Set<string>();
-  let resets = new Set<string>();
   const k = (...parts: string[]) => JSON.stringify(parts);
-  const perSession = (unit: SessionUnit) =>
-    deletionFenced(db, {
-      org_id: unit.orgId,
-      workspace_id: unit.workspaceId,
-      source: unit.source,
-      session_id: unit.sessionId,
-      last_ts: "",
-    });
+  const perSession = async (unit: SessionUnit) =>
+    (
+      await db.query(
+        `SELECT 1 FROM sessions.deleted_upload_sessions
+          WHERE org_id = $1 AND workspace_id = $2 AND source = $3 AND session_id = $4 LIMIT 1`,
+        [unit.orgId, unit.workspaceId, unit.source, unit.sessionId],
+      )
+    ).rows.length > 0;
   return async (unit: SessionUnit, fresh = false): Promise<boolean> => {
     if (fresh) return perSession(unit);
     if (Date.now() - loaded > ttlMs) {
       const t = await db.query<{ org_id: string; workspace_id: string; source: string; session_id: string }>(
         `SELECT org_id, workspace_id, source, session_id FROM sessions.deleted_upload_sessions LIMIT ${LIMIT + 1}`,
       );
-      const r = await db.query<{ org_id: string; workspace_id: string }>(
-        `SELECT DISTINCT org_id, workspace_id FROM sessions.session_resets LIMIT ${LIMIT + 1}`,
-      );
       // Fail closed rather than miss a fence past the cap.
-      if (t.rows.length > LIMIT || r.rows.length > LIMIT) return perSession(unit);
+      if (t.rows.length > LIMIT) return perSession(unit);
       tombstones = new Set(t.rows.map((x) => k(x.org_id, x.workspace_id, x.source, x.session_id)));
-      resets = new Set(r.rows.map((x) => k(x.org_id, x.workspace_id)));
       loaded = Date.now();
     }
-    if (tombstones.has(k(unit.orgId, unit.workspaceId, unit.source, unit.sessionId))) return true;
-    if (!resets.has(k(unit.orgId, unit.workspaceId))) return false;
-    return perSession(unit);
+    return tombstones.has(k(unit.orgId, unit.workspaceId, unit.source, unit.sessionId));
   };
 }
 
-/** Every `(org, session)` a deletion fence covers: the sweep re-exports (erases) the exported ones. */
+/** Every `(org, session)` a tombstone covers: their exports are erased. */
 export async function fencedGroups(db: Queryable): Promise<{ org_id: string; session_id: string }[]> {
   const { rows } = await db.query<{ org_id: string; session_id: string }>(
-    `SELECT DISTINCT org_id, session_id FROM sessions.deleted_upload_sessions
-     UNION
-     SELECT DISTINCT x.org_id, x.session_id FROM sessions.session_resets r
-       JOIN sessions.delivery_records x
-         ON x.org_id = r.org_id AND x.workspace_id = r.workspace_id AND x.user_id = r.user_id AND x.kind = 'session'
-     LIMIT 100001`,
+    `SELECT DISTINCT org_id, session_id FROM sessions.deleted_upload_sessions LIMIT 100001`,
   );
   if (rows.length > 100_000) throw Object.assign(new Error("too many fenced groups"), { code: "fence_overflow" });
   return rows;
@@ -433,7 +432,7 @@ export function neonUnitSource(
                              AND e.machine_id = ${DELIVERY_MACHINE_SQL}) END AS has_event
            FROM d
           ORDER BY array_position($3::text[], d.kind), d.origin_id, d.record_id`,
-        [unit.orgId, unit.workspaceId, [...RECORD_KINDS], unit.source, unit.sessionId, smallRows + 1, [...CATALOG_KINDS]],
+        [unit.orgId, unit.workspaceId, [...EXPORT_KINDS], unit.source, unit.sessionId, smallRows + 1, [...CATALOG_KINDS]],
       );
       await onPage(small.rows.length, small.rows.reduce((n, r) => n + (r.payload_json?.length ?? 0), 0));
       if (small.rows.length <= smallRows) {
@@ -484,7 +483,7 @@ function deliveryLine(kind: string, row: DeliveryRow): StreamLine {
  * Same lines, same order and the same contender rule as the fast path.
  */
 async function* pagedLines(db: Queryable, unit: SessionUnit, onPage: PageHook, pageRows: number): AsyncIterable<StreamLine> {
-  for (const kind of RECORD_KINDS) {
+  for (const kind of EXPORT_KINDS) {
     const acceptance = CATALOG_KINDS.has(kind)
       ? "sessions.delivery_catalog_acceptance"
       : "sessions.delivery_projection_acceptance";
@@ -608,24 +607,27 @@ async function* undelivered(
     }
   }
   // Legacy delivery events never linked to their record (partial index
-  // convergence_events_legacy_delivery_idx on (org, session, event_id)).
-  let after: string | null = null;
+  // convergence_events_legacy_delivery_idx on (org, session, event_id)). The
+  // keyset is the full (event_id, machine_id, kind): event ids repeat across
+  // machines and kinds, and a page ending between two of them dropped one.
+  let afterLegacy: [string, string, string] | null = null;
   for (;;) {
     const { rows }: { rows: EventRow[] } = await db.query<EventRow>(
       `${select}
         WHERE e.org_id = $1 AND e.session_id = $2 AND e.delivery_record_id IS NULL
           AND e.machine_id LIKE 'delivery:%' AND e.workspace_id = $3 AND e.source = $4
-          ${after !== null ? "AND e.event_id > $6" : ""}
-        ORDER BY e.event_id
+          ${afterLegacy !== null ? "AND (e.event_id, e.machine_id, e.kind) > ($6, $7, $8)" : ""}
+        ORDER BY e.event_id, e.machine_id, e.kind
         LIMIT $5`,
-      after !== null
-        ? [unit.orgId, unit.sessionId, unit.workspaceId, unit.source, pageRows, after]
+      afterLegacy !== null
+        ? [unit.orgId, unit.sessionId, unit.workspaceId, unit.source, pageRows, ...afterLegacy]
         : [unit.orgId, unit.sessionId, unit.workspaceId, unit.source, pageRows],
     );
     await onPage(rows.length, rows.reduce((n, r) => n + r.row_json.length, 0));
     for (const row of rows) yield emit(row);
     if (rows.length < pageRows) break;
-    after = rows.at(-1)!.event_id;
+    const last: EventRow = rows.at(-1)!;
+    afterLegacy = [last.event_id, last.machine_id, last.kind];
   }
 }
 

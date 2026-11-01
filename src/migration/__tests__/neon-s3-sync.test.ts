@@ -28,7 +28,7 @@ import { buildSessionStream, type DeliveryRecord, type Queryable } from "../rela
 import { erasableByExporter, exportUnit, orgPrefix, writeOnly, type ExportTarget } from "../neon-s3-sync/export-session.ts";
 import { storeEraser } from "../neon-s3-erasure/eraser.ts";
 import { ErasureJob, DEFAULT_ERASURE_CONFIG } from "../neon-s3-erasure/job.ts";
-import { boundStrings, fencedGroups, MAX_STRING_TOKEN, neonUnitSource, readOnly, sessionUnits, type SessionUnit, type StreamLine, type UnitSource } from "../neon-s3-sync/neon-reader.ts";
+import { boundStrings, EXPORT_KINDS, fencedGroups, MAX_STRING_TOKEN, neonUnitSource, readOnly, sessionUnits, type SessionUnit, type StreamLine, type UnitSource } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { Syncer, DEFAULT_SYNC_CONFIG } from "../neon-s3-sync/sync.ts";
 import { Throttle, parseWindows } from "../neon-s3-sync/throttle.ts";
@@ -564,6 +564,48 @@ describe("ownership and failure bookkeeping", () => {
     expect(r.manifests[0]!.written).toBe(true);
   });
 
+  test("a manifest of another Neon session at a group's key is never queued for that group's erasure", async () => {
+    const { store } = await countingStore();
+    const t = target(store);
+    const r = await exportUnit(t, unit("org-a", { sessionId: "owner" }), fixedSource(baseRecords().slice(0, 1)));
+    const key = r.manifests[0]!.manifestKey;
+    expect(await erasableByExporter(t, "org-a", key, "owner")).toBe(true);
+    expect(await erasableByExporter(t, "org-a", key, "someone-else")).toBe(false);
+  });
+
+  test("a crash mid-group leaves its keys recorded; after a hard delete the erasure job removes the prefix", async () => {
+    const { store } = await countingStore();
+    const t = target(store, { maxChunkBytes: 200 });
+    const path = join(await tempDir(), "s.sqlite");
+    const state = new SyncState(path);
+    let release!: () => void;
+    const hang = new Promise<void>((r) => (release = r));
+    const src: UnitSource = {
+      fenced: async () => false,
+      async *lines() {
+        for (let i = 0; i < 3; i++)
+          yield { machine: "delivery:m1", bytes: buildSessionStream([rec("session_event", "o", `e${i}`, { x: "y".repeat(150) })]).bytes, userId: "u" };
+        await hang; // the process "dies" here: no markFailed, no markExported
+      },
+    };
+    const syncer = new Syncer(fakeDb([unit("org-a")]), state, t, fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => src);
+    const running = syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 1, kind: "recent", events: 3 });
+    await new Promise((r) => setTimeout(r, 200));
+    expect((await allKeys(store)).length).toBeGreaterThan(0); // chunks sealed, no manifest
+    // A new process on the same state file.
+    const after = new SyncState(path);
+    expect(after.recoverPendingKeys()).toBe(1);
+    after.releaseStaleLeases("exporter:", "exporter:new");
+    const job = new ErasureJob(sweepDb([{ org_id: "org-z", session_id: "other", last_ms: "1", events: "1" }]), after, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now() + 60_000, async () => {});
+    await job.sweep();
+    await job.drain();
+    expect(await allKeys(store)).toEqual([]);
+    after.close();
+    release();
+    await running.catch(() => undefined);
+    state.close();
+  });
+
   test("two Neon sessions whose ids sanitize to one key do not overwrite each other", async () => {
     const { store } = await countingStore();
     const t = target(store);
@@ -817,14 +859,60 @@ describe("Neon reader SQL (Neon-shaped PGlite)", () => {
     // the fence is cached for two minutes; a fresh source reads it again
     expect(await neonUnitSource(db, async () => {}).fenced(units[0]!)).toBe(true);
     expect(await fencedGroups(db)).toEqual([{ org_id: "o1", session_id: "s1" }]);
-    // a reset in the workspace falls back to #40's per-session query (no session record of that user here)
-    await pg.query(`DELETE FROM sessions.deleted_upload_sessions`);
-    await pg.query(`INSERT INTO sessions.session_resets VALUES ('o1', $1, 'u1', 'r1', 1)`, [ws]);
-    expect(await neonUnitSource(db, async () => {}).fenced(units[0]!)).toBe(true);
     expect(await source.fenced(units[0]!, true)).toBe(true); // fresh: bypasses the cached "not fenced"
+    // A reset, then a new session from the same user: the reset tombstoned s1 (and
+    // deleted its records); s2 was delivered after it and must be exported, never fenced.
+    await pg.query(`INSERT INTO sessions.session_resets VALUES ('o1', $1, 'u1', 'r1', 1)`, [ws]);
+    await pg.query(
+      `INSERT INTO sessions.delivery_records VALUES ('o1', $1, 'oa', 'post-reset', 'r', 1, 'd', 'session', 'claude', 's2', 'upsert', '{"title":"new"}', 'u1', '2026-10-21T10:00:00Z')`,
+      [ws],
+    );
+    const s2 = { ...units[0]!, sessionId: "s2" };
+    expect(await neonUnitSource(db, async () => {}).fenced(s2)).toBe(false);
+    expect(await neonUnitSource(db, async () => {}).fenced(s2, true)).toBe(false);
     expect(await fencedGroups(db)).toEqual([{ org_id: "o1", session_id: "s1" }]);
+    const post = await exportUnit(target(store), s2, neonUnitSource(db, async () => {}));
+    expect(post.fenced).toBe(false);
+    expect(post.manifests.length).toBe(1);
     await pg.close();
-  });
+  }, 60_000);
+
+  test("exports every kind the projection reads, including trajectory and commit_link", async () => {
+    const projected = ["history", "session_event", "tool_call", "file_edit", "trajectory", "session", "relationship", "session_marker", "commit_link"];
+    for (const k of projected) expect(EXPORT_KINDS as readonly string[]).toContain(k);
+    const pg = new PGlite();
+    await pg.exec(NEON_SCHEMA);
+    for (const [i, kind] of ["trajectory", "commit_link", "session_event"].entries())
+      await pg.query(
+        `INSERT INTO sessions.delivery_records VALUES ('o1', 'w1', 'oa', $1, 'r', 1, 'd', $2, 'claude', 's1', 'upsert', '{"a":1}', 'u1', '2026-10-20T10:00:00Z')`,
+        [`r${i}`, kind],
+      );
+    const db = readOnly(pg as unknown as Queryable);
+    const u = { ...unit("o1"), workspaceId: "w1", sessionId: "s1" };
+    for (const small of [4000, 1]) {
+      const kinds: string[] = [];
+      for await (const l of neonUnitSource(db, async () => {}, 2, small).lines(u))
+        kinds.push((JSON.parse(new TextDecoder().decode(l.bytes)) as { kind: string }).kind);
+      expect(kinds.sort()).toEqual(["commit_link", "session_event", "trajectory"]);
+    }
+    await pg.close();
+  }, 60_000);
+
+  test("legacy delivery events sharing an event_id across machines are all read across page boundaries", async () => {
+    const pg = new PGlite();
+    await pg.exec(NEON_SCHEMA);
+    for (const [m, e] of [["delivery:a", "e1"], ["delivery:b", "e1"], ["delivery:a", "e2"]])
+      await pg.query(
+        `INSERT INTO sessions.convergence_events VALUES ('o1', 'w1', $1, 'u1', 'claude', 's1', $2, 'message', '2026-10-20T10:00:00Z', 'x', '2026-10-20T10:00:01Z', NULL)`,
+        [m, e],
+      );
+    const db = readOnly(pg as unknown as Queryable);
+    const u = { ...unit("o1"), workspaceId: "w1", sessionId: "s1" };
+    const lines: StreamLine[] = [];
+    for await (const l of neonUnitSource(db, async () => {}, 1).lines(u)) lines.push(l);
+    expect(lines.length).toBe(3);
+    await pg.close();
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------- helpers
@@ -881,7 +969,7 @@ function sweepDb(activity: { org_id: string; session_id: string; last_ms: string
       if (sql.includes("pg_locks")) return { rows: [{ total: "0", non_advisory: "0" }] as T[] };
       if (sql.startsWith("SELECT 1 FROM sessions.session_rollups"))
         return { rows: activity.filter((a) => a.org_id === params?.[0] && a.session_id === params?.[1]).map(() => ({})) as T[] };
-      if (sql.includes("deleted_upload_sessions") && sql.includes("UNION")) return { rows: fenced as T[] };
+      if (sql.includes("SELECT DISTINCT org_id, session_id FROM sessions.deleted_upload_sessions")) return { rows: fenced as T[] };
       if (sql.includes("FROM sessions.session_rollups") && sql.includes("GROUP BY org_id, session_id"))
         return { rows: (sql.includes("(org_id, session_id) >") ? [] : activity) as T[] };
       throw new Error("unexpected query");

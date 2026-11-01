@@ -272,7 +272,7 @@ export class Syncer {
       const keep = new Set(keys);
       for (const key of new Set([...(prior?.keys ?? []), ...touched])) {
         if (keep.has(key)) continue;
-        if (await erasableByExporter(this.target, work.org_id, key))
+        if (await erasableByExporter(this.target, work.org_id, key, work.session_id))
           erase.push({ key: key.slice(0, -"manifest.json".length), kind: "prefix", org_id: work.org_id, reason: "stale_prefix" });
       }
       this.state.enqueueErasure(erase);
