@@ -451,7 +451,7 @@ export async function tokensFor(ctx: Ctx, relayauthUrl: string, f?: Fetch): Prom
   }
   for (const [machineId, t] of machines) {
     if (ctx.machineTokens.has(machineId)) continue;
-    const g = ctx.runner.gate({ id: `relayauth.mint.${t.orgId}.${machineId}`, argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`], mutating: true, touches: [`relayauth:${ctx.cfg.relayauth.namespace} (1h token for ${t.orgId}, bound to ${machineId})`], approval: "khaliq" });
+    const g = ctx.runner.gate({ id: `relayauth.mint.${t.orgId}.${machineId}`, argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`], mutating: true, touches: [`relayauth:${ctx.cfg.relayauth.namespace} (60s token for ${t.orgId}, bound to ${machineId})`], approval: "khaliq" });
     if (!g.allowed) {
       ctx.runner.note(g.record);
       return "token minting not allowed in this mode";
@@ -478,7 +478,7 @@ export async function tokensFor(ctx: Ctx, relayauthUrl: string, f?: Fetch): Prom
 export async function unlistedOrgProbe(ctx: Ctx, relayauthUrl: string, ingestUrl: string, f: Fetch = fetch): Promise<{ status: number; code: string }> {
   const bootstrapKey = ctx.env.PROOF_RELAYAUTH_BOOTSTRAP_KEY;
   if (!bootstrapKey) return { status: 0, code: "no_bootstrap_key" };
-  const g = ctx.runner.gate({ id: "ingest.unlisted-org", argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`, "+", `${ingestUrl}/v1/pipeline/chunks`], mutating: true, touches: [`relayauth (1h token for unlisted ${PROOF_UNLISTED_ORG})`, "alleyoop-ingest (empty chunk, expected refusal)"], approval: "khaliq" });
+  const g = ctx.runner.gate({ id: "ingest.unlisted-org", argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`, "+", `${ingestUrl}/v1/pipeline/chunks`], mutating: true, touches: [`relayauth (60s token for unlisted ${PROOF_UNLISTED_ORG})`, "alleyoop-ingest (empty chunk, expected refusal)"], approval: "khaliq" });
   ctx.runner.note(g.record);
   if (!g.allowed) return { status: 0, code: "not_allowed_in_mode" };
   let tok: string;

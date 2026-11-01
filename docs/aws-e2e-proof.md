@@ -341,7 +341,7 @@ execution time.
 | | Command | Touches |
 | --- | --- | --- |
 | R | `kubectl <ctx> -n 96bulls port-forward svc/96bulls-alleyoop 18080:8080`, `kubectl <ctx> -n relayauth port-forward svc/relayauth 18787:8787` | tunnels through the API server |
-| M* | `HTTP POST <relayauth>/v1/tokens/relayhistory-assertion` for each planted machine | RelayAuth (1h machine-bound tokens) |
+| M* | `HTTP POST <relayauth>/v1/tokens/relayhistory-assertion` for each planted machine | RelayAuth (60s machine-bound tokens) |
 | M* | `HTTP POST <ingest>/v1/pipeline/chunks` + `/v1/pipeline/manifests` ×N | Locker bucket, HoopDb (through the pipeline) |
 | R | `kubectl <ctx> -n 96bulls get clusters.postgresql.cnpg.io hoopdb -o jsonpath={.status.currentPrimary}` | CNPG |
 | R | `kubectl <ctx> -n 96bulls exec -i <primary> -c postgres -- psql -d hoopdb -X -At -v ON_ERROR_STOP=1 -f -`, with the SQL on stdin: index rows, stage times, directory rows | HoopDb (read) |
