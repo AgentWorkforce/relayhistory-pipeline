@@ -114,7 +114,7 @@ export function capturePlan(root: string, stage: string, env: Record<string, str
   };
   const provenanceText = `${JSON.stringify(record, null, 2)}\n`;
   // Reject an unsafe production capture before it can replace the reviewed files.
-  if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText });
+  if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText });
   writeFileSync(p.inputs, sanitized);
   writeFileSync(p.plan, plan);
   writeFileSync(p.detailed, detailed);

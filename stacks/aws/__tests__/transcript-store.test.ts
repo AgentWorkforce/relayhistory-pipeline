@@ -463,6 +463,48 @@ describe("transcript store: deploy plan contract", () => {
     ]) expect(() => check(plan(actions))).toThrow(/action set does not match/);
   });
 
+  // Alchemy persisted the failed update: the plan shows no property change, the state holds the pending props.
+  const SRV = `arn:aws:iam::${ACCOUNT}:user/96bulls/96bulls-aws-sessions-prod-transcript-srv-writer`;
+  const stmt = (Sid: string, AWS = `arn:aws:iam::${ACCOUNT}:root`) => ({ Sid, Effect: "Allow", Principal: { AWS }, Action: ["kms:Decrypt"], Resource: "*" });
+  const keyProps = (statements: object[]) => ({ deletionWindow: 30, enableKeyRotation: true, policy: { Version: "2012-10-17", Statement: statements } });
+  const LIVE_STMTS = LIVE.map((sid) => stmt(sid));
+  const SRV_STMT = stmt("SrvWriterEncryptsAndReadsViaS3", SRV);
+  const snapshot = (o: { status?: string; props?: object; old?: object; user?: object } = {}) => JSON.stringify({
+    schema: 1,
+    objects: [
+      { key: `96bulls/96bulls-aws/${STAGE}/transcripts-key.json`, text: JSON.stringify({
+        status: o.status ?? "updating",
+        props: o.props ?? keyProps([LIVE_STMTS[0], LIVE_STMTS[1], SRV_STMT, LIVE_STMTS[2]]),
+        old: { status: "created", props: o.old ?? keyProps(LIVE_STMTS) },
+      }) },
+      { key: `96bulls/96bulls-aws/${STAGE}/transcript-srv-writer.json`, text: JSON.stringify(o.user ?? { status: "created", attr: { userArn: SRV } }) },
+    ],
+  });
+  const pending = (stateSnapshotText?: string) => {
+    const compact = plan({ "transcripts-key": "update" });
+    const full = withKeyDiff(compact, "    no declared property changes");
+    return assertTranscriptStorePlanContract(compact, { detailedPlanText: full, provenanceText: provenance(compact, full), stateSnapshotText });
+  };
+
+  it("srv-writer recovery: accepts a persisted pending key update that adds only the srv-writer's statement", () => {
+    expect(pending(snapshot())).toBe("srv-writer propagation recovery");
+    // The deploy has no snapshot; it is bound to the captured state by the version digest.
+    expect(pending()).toBe("srv-writer propagation recovery");
+  });
+
+  it("srv-writer recovery: rejects a pending key update that is not exactly the srv-writer statement", () => {
+    for (const [snap, why] of [
+      [snapshot({ status: "created" }), /not a persisted pending update/],
+      [snapshot({ props: keyProps(LIVE_STMTS) }), /must add exactly one/],
+      [snapshot({ old: keyProps([...LIVE_STMTS, SRV_STMT]) }), /must add exactly one/],
+      [snapshot({ props: keyProps([...LIVE_STMTS, stmt("SrvWriterEncryptsAndReadsViaS3", "*")]) }), /must name the srv-writer user/],
+      [snapshot({ props: keyProps([...LIVE_STMTS.slice(0, 2), SRV_STMT]) }), /changes more than the srv-writer statement/],
+      [snapshot({ props: { ...keyProps([...LIVE_STMTS, SRV_STMT]), enableKeyRotation: false } }), /changes more than the srv-writer statement/],
+      [snapshot({ user: { status: "creating" } }), /transcript-srv-writer is not created/],
+      ["not json", /not valid JSON/],
+    ] as const) expect(() => pending(snap)).toThrow(why);
+  });
+
   it("permits exactly two named updates, rejecting one, three, or a different resource", () => {
     for (const actions of [
       { "trail-key": "update" },
@@ -506,7 +548,7 @@ describe("transcript store: deploy plan contract", () => {
   });
 
   it("checks the production contract before a capture can replace reviewed files, and again before deploy", () => {
-    const captureCheck = captureWorkflow.indexOf("if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText });");
+    const captureCheck = captureWorkflow.indexOf("if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText });");
     expect(captureCheck).toBeGreaterThan(0);
     expect(captureCheck).toBeLessThan(captureWorkflow.indexOf("writeFileSync(p.plan, plan)"));
     expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText })");

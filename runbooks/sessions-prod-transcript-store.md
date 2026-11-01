@@ -262,7 +262,11 @@ to see the bucket policy refuse `aws:kms` without this key id (explicitDeny).
   with the other 12 resources `noop` (the user now exists in state), the `srv-writer propagation
   recovery` phase. The contract accepts it only when the detailed plan shows the live key policy
   without `SrvWriterEncryptsAndReadsViaS3` and the planned policy with exactly one; any other lone
-  key-policy update is refused. Commit the capture, bind `approval.capture` to it, and `up`.
+  key-policy update is refused. In practice Alchemy persists the failed update (state `updating`), so
+  the detailed plan shows `no declared property changes` instead of a diff; then the capture checks
+  its state snapshot: the pending key props must be the previous props plus exactly the one
+  `SrvWriterEncryptsAndReadsViaS3` statement naming the srv-writer user. The deploy is bound to that
+  same state by the capture's version digest. Commit the capture, bind `approval.capture` to it, and `up`.
 - **Account-level S3 Block Public Access:** set separately on 2026-10-31 with
   `s3control put-public-access-block` (all four true).
 
