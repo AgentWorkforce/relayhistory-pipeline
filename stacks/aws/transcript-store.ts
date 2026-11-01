@@ -12,7 +12,9 @@
  *                        be delivered to an SSE-KMS bucket), 90-day retention
  *   CloudTrail           management events + S3 data events for the transcripts bucket only,
  *                        into its own SSE-KMS bucket (the trail key policy from hardening.ts)
- *   IAM users            writer (the RelayHistory Worker), reader (the indexer), eraser (the purge job).
+ *   IAM users            writer (the RelayHistory Worker), reader (the indexer), eraser (the purge job),
+ *                        srv-writer (the relayhistory-api Worker's live writer: `m=srv_*` sessions,
+ *                        live-sessions/, live-batches/, SSE-KMS headers required, no delete, no list).
  *                        Users, not roles: a Cloudflare Worker cannot assume a role. No access keys
  *                        are declared here: Alchemy state is plaintext, so keys are created out of
  *                        band straight into 1Password (runbooks/sessions-prod-transcript-store.md).
@@ -85,6 +87,7 @@ export interface TranscriptNames {
   writer: string;
   reader: string;
   eraser: string;
+  srvWriter: string;
 }
 
 export function transcriptNames(stage: string, accountId: string): TranscriptNames {
@@ -102,6 +105,7 @@ export function transcriptNames(stage: string, accountId: string): TranscriptNam
     writer: n("transcript-writer"),
     reader: n("transcript-reader"),
     eraser: n("transcript-eraser"),
+    srvWriter: n("transcript-srv-writer"),
   };
 }
 
@@ -110,6 +114,12 @@ export const userArn = (accountId: string, path: string, name: string) => `arn:a
 /** Every session object, in every org: `<bucket>/96bulls/*\/v1/*<tail>`. */
 const sessionObjects = (bucketArn: string, tail: string) => `${bucketArn}/${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/*${tail}`;
 const allObjects = (bucketArn: string) => `${bucketArn}/${TENANT_KEY_BASE}/*`;
+/** The relayhistory-api Worker's live writer: server-side machines (`m=srv_<hash>`) and the live prefixes, in every org. */
+export const srvWriterObjects = (bucketArn: string) => [
+  `${bucketArn}/${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/ws=*/m=srv_*`,
+  `${bucketArn}/${TENANT_KEY_BASE}/*/live-sessions/*`,
+  `${bucketArn}/${TENANT_KEY_BASE}/*/live-batches/*`,
+];
 
 /**
  * Inputs a transcript-store stage must not carry: it is S3 only (decision 0001),
@@ -147,18 +157,25 @@ export function assertTranscriptStoreInputs(
 
 const TRANSCRIPT_RESOURCES = [
   "access-logs", "budget", "trail", "trail-key", "trail-key-alias", "trail-logs",
-  "transcript-eraser", "transcript-reader", "transcript-writer", "transcripts",
+  "transcript-eraser", "transcript-reader", "transcript-srv-writer", "transcript-writer", "transcripts",
   "transcripts-key", "transcripts-key-alias",
 ] as const;
 
-export type TranscriptStorePlanPhase = "initial" | "principal-propagation recovery" | "post-merge policy remediation" | "post-apply";
+export type TranscriptStorePlanPhase =
+  | "initial"
+  | "principal-propagation recovery"
+  | "post-merge policy remediation"
+  | "srv-writer addition"
+  | "post-apply";
 
 const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
   { name: "initial", actions: Object.fromEntries(TRANSCRIPT_RESOURCES.map((resource) => [resource, "create"])) },
   { name: "principal-propagation recovery", actions: { transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" } },
   // One capture-bound exception for the policies hardened after the first production apply.
-  // The other ten resources must be noop, and a subsequent capture must be all-noop.
+  // The other resources must be noop, and a subsequent capture must be all-noop.
   { name: "post-merge policy remediation", actions: { "trail-key": "update", "trail-logs": "update" } },
+  // Adding the relayhistory-api live writer to the applied store: the new user, and the key policy that names it.
+  { name: "srv-writer addition", actions: { "transcript-srv-writer": "create", "transcripts-key": "update" } },
   { name: "post-apply", actions: {} },
 ];
 
@@ -243,7 +260,7 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   );
   if (!phase) {
     const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
-    return refuse(`action set does not match initial, recovery, exact two-policy remediation, or post-apply phase: ${changes.join(", ") || "(none)"}`);
+    return refuse(`action set does not match initial, recovery, exact two-policy remediation, srv-writer addition, or post-apply phase: ${changes.join(", ") || "(none)"}`);
   }
   return phase.name;
 }
@@ -370,13 +387,13 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
 
 /**
  * The transcripts CMK's policy. The account root administers the key and cannot
- * use it (no `kms:*`). Only the writer and reader may use it, only through S3 in
+ * use it (no `kms:*`). Only the writer, the srv-writer and the reader may use it, only through S3 in
  * this region, only from this account, and only for objects under `96bulls/` in
  * this bucket (the S3 encryption context, per object since bucket keys are off).
  * The eraser and every operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; readerArn: string }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string }) {
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
     StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${TENANT_KEY_BASE}/*` },
@@ -386,6 +403,7 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
     Statement: [
       { Sid: "AccountAdministersKey", Effect: "Allow" as const, Principal: { AWS: `arn:aws:iam::${i.accountId}:root` }, Action: [...KMS_ADMIN_ACTIONS], Resource: "*" },
       { Sid: "WriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.writerArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
+      { Sid: "SrvWriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.srvWriterArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
       { Sid: "ReaderDecryptsViaS3", Effect: "Allow" as const, Principal: { AWS: i.readerArn }, Action: ["kms:Decrypt"], Resource: "*", Condition: via },
     ],
   };
@@ -421,6 +439,55 @@ export function transcriptWriterPolicy(bucketArn: string) {
         Resource: [sessionObjects(bucketArn, "/raw/*"), sessionObjects(bucketArn, "/manifest.json"), sessionObjects(bucketArn, "/summary/*")],
       },
       noDeleteNoHistory(bucketArn),
+    ],
+  };
+}
+
+/**
+ * The relayhistory-api Worker's live writer: read and write only server-side
+ * machine sessions (`96bulls/<org>/v1/ws=<ws>/m=srv_<hash>/...`) and the
+ * `live-sessions/` and `live-batches/` prefixes. Every PUT must name SSE-KMS and
+ * a key in this account and region; the bucket policy's SseHeaderMustNameThisKey
+ * narrows that to exactly the transcripts CMK. (The key ARN cannot appear here:
+ * the key policy names this user, so the user exists before the key.) Key use is
+ * granted by the key policy; this identity grant is scoped to the key's alias and
+ * to S3 in this region. ListBucket on the bucket (missing keys must 404, see
+ * below); no delete, no old versions, no bucket changes.
+ */
+export function transcriptSrvWriterPolicy(i: { bucketArn: string; accountId: string; region: string; keyAlias: string }) {
+  const objects = srvWriterObjects(i.bucketArn);
+  return {
+    Version: "2012-10-17" as const,
+    Statement: [
+      { Sid: "ReadLiveObjects", Effect: "Allow" as const, Action: ["s3:GetObject"], Resource: objects },
+      {
+        Sid: "WriteLiveObjectsSseKmsOnly",
+        Effect: "Allow" as const,
+        Action: ["s3:PutObject"],
+        Resource: objects,
+        Condition: {
+          StringEquals: { "s3:x-amz-server-side-encryption": "aws:kms" },
+          StringLike: { "s3:x-amz-server-side-encryption-aws-kms-key-id": `arn:aws:kms:${i.region}:${i.accountId}:key/*` },
+        },
+      },
+      {
+        Sid: "UseTranscriptKeyViaS3",
+        Effect: "Allow" as const,
+        Action: ["kms:GenerateDataKey", "kms:Decrypt"],
+        Resource: [`arn:aws:kms:${i.region}:${i.accountId}:key/*`],
+        Condition: {
+          StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com` },
+          "ForAnyValue:StringEquals": { "kms:ResourceAliases": i.keyAlias },
+        },
+      },
+      // A missing key must answer 404, not 403: the Worker's create-only
+      // pointer, manifest and batch-marker reads depend on it. S3 decides that
+      // with s3:ListBucket on the bucket, and HEAD/GET carry no s3:prefix, so
+      // the grant cannot be prefix-scoped (hardening.ts listBucket): it is the
+      // same unconditional grant the transcript writer holds. Key names only;
+      // object reads stay limited to the srv_ and live prefixes above.
+      listBucket(i.bucketArn),
+      noDeleteNoHistory(i.bucketArn),
     ],
   };
 }
@@ -507,6 +574,12 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
     const writer = yield* user("transcript-writer", n.writer, "relayhistory-worker-writes-transcripts", transcriptWriterPolicy(n.bucketArn));
     const reader = yield* user("transcript-reader", n.reader, "history-indexer-reads-transcripts", transcriptReaderPolicy(n.bucketArn));
     const eraser = yield* user("transcript-eraser", n.eraser, "erasure-job-deletes-versions", transcriptEraserPolicy(n.bucketArn));
+    const srvWriter = yield* user(
+      "transcript-srv-writer",
+      n.srvWriter,
+      "relayhistory-api-worker-writes-live-transcripts",
+      transcriptSrvWriterPolicy({ bucketArn: n.bucketArn, accountId: i.accountId, region: i.region, keyAlias: n.keyAlias }),
+    );
 
     // CloudTrail into its own bucket and key, as in the baseline (hardening.ts trailKeyPolicy).
     const trailKey = yield* AWS.KMS.Key("trail-key", {
@@ -548,6 +621,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         region: i.region,
         bucketName: n.bucket,
         writerArn: writer.userArn as unknown as string,
+        srvWriterArn: srvWriter.userArn as unknown as string,
         readerArn: reader.userArn as unknown as string,
       }) as never,
       // Also orders the key after the trail: the trail audits its use from the first call, and the
@@ -603,5 +677,6 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       writerUser: writer.userName,
       readerUser: reader.userName,
       eraserUser: eraser.userName,
+      srvWriterUser: srvWriter.userName,
     };
   });
