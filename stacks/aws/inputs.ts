@@ -10,6 +10,7 @@ import { findPlaceholders, type Approval } from "./deploy-guard.ts";
 import { isDisposableStage, isProductionLike } from "./hardening.ts";
 import { resolveTenantOrgs } from "./tenants.ts";
 import { assertTranscriptStoreInputs, type TranscriptStoreInputs } from "./transcript-store.ts";
+import { PIPPEN_PROOF_SANDBOX } from "./sandbox-rules.ts";
 
 /** versions.lock.json `images.services-aws.approved`: the services images an AWS stage may run. */
 export interface ApprovedServicesImage {
@@ -116,6 +117,7 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
   if (inputs.pippenSandbox && !new RegExp(`^arn:aws:iam::${inputs.accountId}:policy/[\\w+=,.@/-]+$`).test(inputs.pippenSandbox.permissionsBoundaryArn ?? ""))
     throw new Error("96bulls: pippenSandbox.permissionsBoundaryArn must be a policy ARN in this account. Nothing was created.");
   if (inputs.pippenSandbox && inputs.accountShared) throw new Error("96bulls: a Pippen sandbox account is fresh; it cannot share another stage's account resources. Nothing was created.");
+  assertPippenProofSandbox(stage, inputs);
   lockerLifecycleRules(inputs.lockerNoncurrentVersionDays);
   assertTranscriptStoreInputs(stage, inputs as unknown as Parameters<typeof assertTranscriptStoreInputs>[1]);
   if (inputs.accountShared) {
@@ -146,6 +148,28 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
   if (eks.sessionDirectory?.enabled) assertSessionDirectoryPreconditions({ hoopdb, relayauthTls: Boolean(eks.relayauth) });
   if (eks.ingress) ingressExposure({ ...(eks.ingress.scheme ? { scheme: eks.ingress.scheme } : {}), ...(eks.ingress.rateLimitPer5Min !== undefined ? { rateLimitPer5Min: eks.ingress.rateLimitPer5Min } : {}) });
   return { endpointAccess, hoopdb };
+}
+
+/**
+ * The Pippen sandbox proof stage and its account are pinned to each other
+ * (sandbox-rules.ts PIPPEN_PROOF_SANDBOX): aws-proof-sandbox only in
+ * 361835732085/us-west-2, always as a Pippen sandbox (permissions boundary on
+ * every role, sweeper tag on every resource, never accountShared), and that
+ * account hosts no other stage.
+ */
+export function assertPippenProofSandbox(stage: string, inputs: Pick<AwsInputs, "accountId" | "region" | "pippenSandbox" | "accountShared">): void {
+  const sbx = PIPPEN_PROOF_SANDBOX;
+  if (stage !== sbx.stage) {
+    if (inputs.accountId === sbx.accountId)
+      throw new Error(`96bulls: account ${sbx.accountId} is the Pippen sandbox of agent ${sbx.agent}; only stage ${sbx.stage} may target it, not ${stage}. Nothing was created.`);
+    return;
+  }
+  if (inputs.accountId !== sbx.accountId || inputs.region !== sbx.region)
+    throw new Error(`96bulls: stage ${sbx.stage} runs only in the Pippen sandbox ${sbx.accountId}/${sbx.region}, not ${inputs.accountId}/${inputs.region}. Nothing was created.`);
+  if (!inputs.pippenSandbox)
+    throw new Error(`96bulls: stage ${sbx.stage} needs pippenSandbox.permissionsBoundaryArn (the sandbox boundary in ${sbx.accountId}). Nothing was created.`);
+  if (inputs.accountShared)
+    throw new Error(`96bulls: stage ${sbx.stage} is a fresh Pippen sandbox; it cannot set accountShared. Nothing was created.`);
 }
 
 /** This account's services repository, when another stage owns it. */

@@ -29,7 +29,7 @@ const AWS = {
   bucket: /^(?!xn--)(?!.*-s3alias$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/,
 };
 
-const STAGES = ["aws-proof", "aws-sessions-dev", "aws-sandbox-claude-code-agent", "aws-prod"];
+const STAGES = ["aws-proof", "aws-proof-sandbox", "aws-sessions-dev", "aws-sandbox-claude-code-agent", "aws-prod"];
 const ACCOUNT = "500268966557";
 const src = (f: string) => readFileSync(fileURLToPath(new URL(`../${f}`, import.meta.url)), "utf8");
 const refs = { lockerBucketArn: "arn:aws:s3:::b", lockerKmsKeyArn: "arn:aws:kms:us-west-2:1:key/k", lockerRegion: "us-west-2" };

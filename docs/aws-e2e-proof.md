@@ -1,7 +1,10 @@
 # AWS self-host E2E proof (harness and runbook)
 
 This harness proves the self-hosted 96Bulls deployment end to end on one
-isolated AWS stage: account `500268966557`, EKS cluster `96bulls-aws-proof`.
+isolated AWS stage: account `500268966557`, EKS cluster `96bulls-aws-proof`,
+or, with `--target pippen-sandbox`, the Pippen Tools sandbox of agent
+`aws-proof` (account `361835732085`, EKS cluster `96bulls-aws-proof-sandbox`;
+see [Pippen sandbox target](#pippen-sandbox-target)).
 It has not been run against AWS. Nothing in this repository has created the
 proof stage. The only local run so far was a read-only `fresh-install` against
 `kind-96bulls-e2e` (see [Local evidence](#local-evidence)).
@@ -9,7 +12,7 @@ proof stage. The only local run so far was a read-only `fresh-install` against
 The harness lives in `src/proof/aws/`. The entry point is:
 
 ```sh
-bun run proof:aws [checks...|all] [--read-only] [--confirm-live] [--target kind-readonly] [--inputs path] [--sessions n] [--out dir]
+bun run proof:aws [checks...|all] [--read-only] [--confirm-live] [--target proof|pippen-sandbox|kind-readonly] [--inputs path] [--sessions n] [--out dir]
 bun run proof:aws:teardown [--confirm-live]
 ```
 
@@ -17,6 +20,55 @@ Related work: #59 is the search benchmark on a local stand-in, and its
 nearest-rank percentile definition is reused here. #38 and #48 define the
 session directory, `short_summary` and the V1 search RPC. #63 is the design for
 the tenant JWT issuer.
+
+## Pippen sandbox target
+
+Khaliq decided on 2026-11-01 to run the EKS proof in a Pippen Tools sandbox,
+so that teardown is a verified sweep. The harness has exactly two AWS targets,
+both hardcoded in `src/proof/aws/guard.ts` (`PROOF_TARGETS`) and
+`src/proof/aws/fence.ts`, and `--target` chooses one. Nothing in config or
+the environment can add a third target or widen either one.
+
+| | `--target proof` (default) | `--target pippen-sandbox` |
+| --- | --- | --- |
+| Account | `500268966557` (beside aws-sessions-dev) | `361835732085` (Sandbox OU, 96Bulls org) |
+| Region | `us-west-2` | `us-west-2` |
+| Stage / cluster | `aws-proof` / `96bulls-aws-proof` | `aws-proof-sandbox` / `96bulls-aws-proof-sandbox` |
+| Caller | any principal in the account | exactly `arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof` |
+| Host | `proof-sessions.agentrelay.com` | `proof-sandbox-sessions.agentrelay.com` |
+| Buckets | `96bulls-aws-proof-{locker,hoopdb-backups}-500268966557` | `96bulls-aws-proof-sandbox-{locker,hoopdb-backups}-361835732085` |
+| Stage plan | `docs/plans/aws-proof.*` | `docs/plans/aws-proof-sandbox.*`, must carry `pippenSandbox`, never `accountShared` |
+| Inputs | `.96bulls/aws-proof/inputs.json` | `.96bulls/aws-proof-sandbox/inputs.json` |
+| Teardown | `bin/96bulls down aws-proof` | `pippen sandbox down aws-proof` |
+
+Every check that pins the sessions-dev target pins the sandbox target with
+the same strictness: the STS account, the cluster name, the cluster ARN from
+`describe-cluster`, the kube context binding, the region, the config fence,
+the stage plan and the prior report. The sandbox adds one more: before the
+cluster is described, and again before every step, the caller's
+`sts get-caller-identity` ARN must be exactly the pippen agent-session role
+session (`wrong_caller` otherwise). Each target refuses the other's account,
+cluster, context, buckets, ARNs and host. The sessions-dev target's behavior is
+unchanged.
+
+The flow (each live step needs Khaliq's OK; none has been run):
+
+1. `pippen sandbox up aws-proof`; export the agent-session credentials as
+   explicit `AWS_*` variables.
+2. `bin/96bulls plan aws-proof-sandbox --capture` from
+   `stacks/aws/examples/aws-proof-sandbox.inputs.example.json`
+   (docs/aws-stage.md); review the capture.
+3. `bin/96bulls up aws-proof-sandbox` under the approval bound to it.
+4. `bun run proof:aws all --target pippen-sandbox --confirm-live`. The
+   teardown check removes the in-cluster proof objects and reports `blocked`.
+5. `pippen sandbox down aws-proof`. It deletes everything tagged
+   `pippen:sandbox=true` and verifies zero non-baseline IAM entities. The
+   harness never runs it.
+6. `bun run proof:aws:teardown --target pippen-sandbox --post-destroy
+   --confirm-live --prior-report .96bulls/aws-proof-sandbox/<run id>/report.json`,
+   with agent-session credentials for the sandbox. Besides the checks in
+   [teardown](#11-teardown), it lists `pippen:sandbox=true` resources and
+   requires none, so anything the sweep missed fails the check.
 
 ## Safety model
 
@@ -107,7 +159,9 @@ before every step. It has no override. Any non-dry run against AWS needs all of
 the following:
 
 - `--confirm-live` on the command line;
-- `aws sts get-caller-identity` returns the account `500268966557`. The
+- `aws sts get-caller-identity` returns the account `500268966557` (on
+  `--target pippen-sandbox`: `361835732085`, and the ARN is exactly
+  `arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof`). The
   harness checks the observed identity, not a configured value;
 - the cluster name is exactly `96bulls-aws-proof`, and the region of every EKS
   ARN (the kube context's cluster entry and the context name itself) is
@@ -617,7 +671,8 @@ The teardown runs in two phases:
    The check is then `blocked` and lists the tagged AWS resources that are
    still pending.
 2. **After Khaliq runs `bin/96bulls down aws-proof`** (an Alchemy destroy, which
-   this harness never runs), verify absence with the post-destroy path:
+   this harness never runs; on the Pippen sandbox target,
+   `pippen sandbox down aws-proof`), verify absence with the post-destroy path:
    `bun run proof:aws:teardown --post-destroy --confirm-live --prior-report .96bulls/aws-proof/<run id>/report.json`.
    - **No live cluster needed.** There is no describe preflight, no kube
      context and no kubectl or helm. Identity is the STS account, the region is
@@ -626,7 +681,9 @@ The teardown runs in two phases:
      `ResourceNotFoundException`, and `list-clusters` must not name the cluster.
      No resource tagged `96bulls:stack=aws-proof` may remain; a KMS key in
      `PendingDeletion` is the expected end state. Both proof buckets must
-     answer `head-bucket` 404.
+     answer `head-bucket` 404. On the sandbox target the stage tag is
+     `96bulls:stack=aws-proof-sandbox`, and no resource tagged
+     `pippen:sandbox=true` may remain either.
    - **What counts as gone.** Only the matching error class counts. The
      harness reads stderr only for that match and never keeps it. AccessDenied,
      a 403 or a network error is "absence unproven", never gone. The check passes only if `aws eks list-clusters` no longer
@@ -674,7 +731,7 @@ teardown run, produces one report whose verdict covers both.
 | M* | `kubectl <ctx> delete namespace 96bulls --wait=true` | namespace and PVCs |
 | R | `kubectl … -n {96bulls,relaycast} get all,pvc,backups…,clusters… -l 96bulls.proof=true`, `get namespace 96bulls` | verify |
 | R | `aws resourcegroupstaggingapi get-resources --tag-filters Key=96bulls:stack,Values=aws-proof`, `aws kms describe-key` | verify |
-| Khaliq | `bin/96bulls down aws-proof` | the whole stage; printed, never run |
+| Khaliq | `bin/96bulls down aws-proof` (sandbox: `pippen sandbox down aws-proof`) | the whole stage; printed, never run |
 
 ## Steps that need Khaliq's direct OK
 
@@ -695,6 +752,9 @@ teardown run, produces one report whose verdict covers both.
 - Putting the RelayAuth bootstrap key and the transcript backend credentials
   into 1Password, and piping them into the environment.
 - `bin/96bulls down aws-proof`.
+- For the Pippen sandbox target: `pippen sandbox up aws-proof`,
+  `bin/96bulls up aws-proof-sandbox`, the ECR repository policy that lets
+  `361835732085` pull the services image, and `pippen sandbox down aws-proof`.
 
 ## Report
 
@@ -775,5 +835,11 @@ shows that the check distinguishes tag references from pinned digests.
   (`src/alleyoop/manifests.ts`) appears to rebuild chunk keys without the key
   prefix. With `PIPELINE_ORG_FROM_PREFIX`, a prefixed manifest then fails with
   409 `chunks_unverified`. #75 needs to cover this before planting can pass.
+- **Pippen sandbox sweep coverage.** The post-destroy check sees what the
+  Resource Groups Tagging API lists. Untaggable or untagged leftovers (for
+  example the stage's AWS Budget, which the stack declares without tags) are
+  not seen by it; the zero-non-baseline-IAM check is `pippen sandbox down`'s,
+  not the harness's. `proof-sandbox-sessions.agentrelay.com` and its ACM
+  certificate must exist before the ingress probes can run there.
 - **The `eks.harness` output shape** is the harness's expectation of #75. Any
   difference refuses the run.

@@ -6,6 +6,8 @@
  *   - the services image digest exists in its ECR repository and carries the
  *     tag `sha-<imageSourceRevision>` (publish-image-ecr tags by commit);
  *   - an `accountShared.ownerStage` really owns the account's ECR repository;
+ *   - on the Pippen sandbox proof stage, the caller is exactly the pippen
+ *     agent-session role session in the sandbox account;
  *   - NetworkPolicy enforcement (phase 2) only after Alchemy state shows every
  *     current policy applied, unchanged, by an earlier apply.
  */
@@ -53,6 +55,17 @@ export function verifyAccountOwner(aws: AwsCli, i: { accountId: string; region: 
   const tags = (aws.json(["ecr", "list-tags-for-resource", "--region", i.region, "--resource-arn", arn]) as { tags?: { Key: string; Value: string }[] }).tags ?? [];
   const owner = tags.find((t) => t.Key === "alchemy::stage")?.Value;
   if (owner !== i.ownerStage) fail(`96bulls-services is owned by stage ${JSON.stringify(owner)}, not accountShared.ownerStage ${i.ownerStage}`);
+}
+
+/** The caller must be exactly this assumed-role session (`aws sts get-caller-identity` Arn). */
+export function verifyCallerArn(aws: AwsCli, expectedArn: string) {
+  let who: { Arn?: string };
+  try {
+    who = aws.json(["sts", "get-caller-identity"]) as typeof who;
+  } catch {
+    return fail("sts get-caller-identity failed; the caller is unverified");
+  }
+  if (who.Arn !== expectedArn) fail(`caller ${JSON.stringify(who.Arn ?? null)} is not ${expectedArn}`);
 }
 
 /** Canonical JSON (sorted keys), so a hash depends only on content. */

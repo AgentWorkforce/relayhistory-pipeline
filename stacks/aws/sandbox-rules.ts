@@ -32,3 +32,24 @@ export function assertRegion(region: string): asserts region is SandboxRegion {
   if (!(SANDBOX_RULES.regionAllowlist as readonly string[]).includes(region))
     throw new Error(`96bulls: region ${region} is not in the allowlist ${SANDBOX_RULES.regionAllowlist.join(", ")}`);
 }
+
+/**
+ * The Pippen Tools sandbox the AWS E2E proof runs in (Khaliq, 2026-11-01): agent
+ * `aws-proof`, account 361835732085 in the Sandbox OU of the 96Bulls org
+ * (management 904260146565). Stage aws-proof-sandbox is pinned to it, and it to
+ * that stage. Credentials there come only from the pippen `agent-session` role
+ * (session `agent-aws-proof`); teardown is `pippen sandbox down aws-proof`, which
+ * sweeps everything tagged `pippen:sandbox=true` and verifies zero non-baseline
+ * IAM entities. src/proof/aws/guard.ts pins the same values for the harness.
+ */
+export const PIPPEN_PROOF_SANDBOX = {
+  stage: "aws-proof-sandbox",
+  agent: "aws-proof",
+  accountId: "361835732085",
+  region: "us-west-2",
+  managementAccountId: "904260146565",
+  callerRole: { roleName: "agent-session", sessionName: "agent-aws-proof" },
+  teardownCommand: "pippen sandbox down aws-proof",
+} as const;
+
+export const PIPPEN_PROOF_SANDBOX_CALLER_ARN = `arn:aws:sts::${PIPPEN_PROOF_SANDBOX.accountId}:assumed-role/${PIPPEN_PROOF_SANDBOX.callerRole.roleName}/${PIPPEN_PROOF_SANDBOX.callerRole.sessionName}`;

@@ -11,6 +11,9 @@ production Supabase and AWS S3 boundary.
 
 The proof harness for an isolated self-host E2E on this account
 (`aws-proof`, account 500268966557) is in [AWS self-host E2E proof](aws-e2e-proof.md).
+It can also target the Pippen Tools sandbox of agent `aws-proof` (stage
+`aws-proof-sandbox`, account 361835732085; see
+[Proof stage in a Pippen sandbox](#proof-stage-in-a-pippen-sandbox-aws-proof-sandbox)).
 It defaults to a dry run and has not been run against AWS.
 
 What the stage will need (each item needs an explicit OK): a target account
@@ -512,6 +515,53 @@ in that repository), the GitHub OIDC provider and the publisher role. Before
 the first apply, create its Secrets from 1Password as for sessions-dev
 (`96bulls-runtime` without `HOOPDB_URL`, which CNPG supplies; `relayauth`;
 `kube-system/cloudflare-dns`).
+
+### Proof stage in a Pippen sandbox `aws-proof-sandbox`
+
+Khaliq, 2026-11-01: run the EKS proof in a Pippen Tools sandbox so that
+teardown is a verified sweep rather than a hand-checked `down`. The sandbox is
+the one for agent `aws-proof`: account `361835732085`, region `us-west-2`, in
+the Sandbox OU of the 96Bulls org (management account `904260146565`).
+
+The stage `aws-proof-sandbox` (cluster `96bulls-aws-proof-sandbox`) and that
+account are pinned to each other (`stacks/aws/sandbox-rules.ts`
+`PIPPEN_PROOF_SANDBOX`, enforced by `assertPippenProofSandbox` in
+`stacks/aws/inputs.ts`):
+
+- the stage runs only in `361835732085`/`us-west-2`, and that account hosts no
+  other stage;
+- `pippenSandbox.permissionsBoundaryArn` is required and must be a policy in
+  that account; every role the stage creates carries it, and every resource
+  carries `pippen:sandbox=true` for the sweeper;
+- `accountShared` is refused: the sandbox is a fresh account, so the stage
+  creates its own ECR repository but no GitHub OIDC provider or publisher role.
+  The services image is pulled by digest from the sessions-dev repository
+  (`eks.imageRepository`), whose repository policy must allow `361835732085`
+  to pull; that policy change is a separate approval;
+- before declaring anything, in every mode, the stack checks that
+  `aws sts get-caller-identity` is exactly
+  `arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof`, the
+  pippen agent-session role. Credentials come only from that role.
+
+Start from `stacks/aws/examples/aws-proof-sandbox.inputs.example.json` (copy it
+to `.96bulls/aws-proof-sandbox/aws-inputs.json` and fill every `<...>`,
+including the sandbox's boundary policy name). The ingest hostname is
+`proof-sandbox-sessions.agentrelay.com`, so the sandbox never collides with
+the sessions-dev proof's DNS.
+
+The flow (each live step needs Khaliq's OK; nothing here has been run):
+
+1. `pippen sandbox up aws-proof`, then export the agent-session credentials.
+2. `bin/96bulls plan aws-proof-sandbox --capture` and review the capture
+   (`docs/plans/aws-proof-sandbox.*`).
+3. `bin/96bulls up aws-proof-sandbox` under an approval bound to that capture.
+4. The proof: `bun run proof:aws all --target pippen-sandbox --confirm-live`
+   (docs/aws-e2e-proof.md).
+5. `pippen sandbox down aws-proof`: deletes everything tagged
+   `pippen:sandbox=true` and verifies zero non-baseline IAM entities. This
+   replaces `bin/96bulls down` as the teardown of record.
+6. The harness's post-destroy absence check against the sandbox
+   (`--target pippen-sandbox --post-destroy`).
 
 ### Apply, verify and roll back
 

@@ -15,8 +15,8 @@
  *
  * In-process actions (`HTTP`, `PROBE`) are never spawned; their hosts are fenced.
  */
-import { FORBIDDEN_NAME, PROOF_RELAYAUTH_TLS, PROOF_SEARCH_CLIENT_POD, PROOF_KEY_PREFIX_BASE, PROOF_TENANT_ORGS, PROOF_CHART_REPO, PROOF_CORE_DEPLOYMENTS, PROOF_INGEST_SERVICE, PROOF_LOCKER_BUCKET, PROOF_POSTGREST, PROOF_PROBE_IMAGES, PROOF_RELEASE, URL_USERINFO, type Fence } from "./fence.ts";
-import { PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_REGION, PROOF_STAGE } from "./guard.ts";
+import { FORBIDDEN_NAME, PROOF_RELAYAUTH_TLS, PROOF_SEARCH_CLIENT_POD, PROOF_KEY_PREFIX_BASE, PROOF_TENANT_ORGS, PROOF_CHART_REPO, PROOF_CORE_DEPLOYMENTS, PROOF_INGEST_SERVICE, PROOF_POSTGREST, PROOF_PROBE_IMAGES, PROOF_RELEASE, URL_USERINFO, type Fence } from "./fence.ts";
+import { PROOF_TARGETS } from "./guard.ts";
 
 export type Admission = { ok: true; mutating: boolean; op: string } | { ok: false; code: string };
 
@@ -336,21 +336,27 @@ const SUMMARY_KEY = new RegExp(`^${PROOF_KEY_PREFIX_BASE}/(${PROOF_TENANT_ORGS.j
 
 const ARN = /^arn:aws:([a-z0-9-]+):([a-z0-9-]*):(\d{12})?:(.+)$/;
 
-function arnOk(v: string, ph: boolean): boolean {
+function arnOk(v: string, ph: boolean, region: string, accountId: string): boolean {
   if (ph && PLACEHOLDER.test(v)) return true;
   const m = ARN.exec(v);
-  return !!m && m[2] === PROOF_REGION && m[3] === PROOF_ACCOUNT_ID;
+  return !!m && m[2] === region && m[3] === accountId;
 }
 
 function admitAws(argv: readonly string[], f: Fence, ph: boolean): Admission {
   if (f.target !== "proof") return refuse("aws_outside_fence");
+  // Every value below comes from one of the two frozen targets, never from the step or config.
+  const pt = f.proofTarget;
+  if (!pt || PROOF_TARGETS[pt.id] !== pt || f.accountId !== pt.accountId || f.region !== pt.region || !f.lockerBucket) return refuse("aws_outside_fence");
+  const pinnedRegion = pt.region;
+  const lockerBucket = f.lockerBucket;
+  const arnOk_ = (v: string, ph_: boolean) => arnOk(v, ph_, pt.region, pt.accountId);
   const t = tokenize(argv.slice(1), AWS);
   if ("error" in t) return refuse(t.error);
   if (t.tail) return refuse("aws_operation_not_allowlisted");
   const fl = t.flags;
   const region = fl.get("region");
   if (region === undefined) return refuse("region_missing");
-  if (region !== PROOF_REGION) return refuse("region_outside_fence");
+  if (region !== pinnedRegion) return refuse("region_outside_fence");
   const opt = (flag: string) => fl.get(flag) as string | undefined;
   const [svc, cmd, ...args] = t.pos;
   const bucket = opt("bucket");
@@ -358,22 +364,24 @@ function admitAws(argv: readonly string[], f: Fence, ph: boolean): Admission {
   if (svc === "s3api") {
     if (!bucket || !buckets.has(bucket)) return refuse("bucket_outside_fence");
     if (cmd === "list-objects-v2" || cmd === "head-object" || cmd === "get-bucket-versioning" || cmd === "head-bucket") return read(`s3api ${cmd}`);
-    if (cmd === "delete-object" && bucket === PROOF_LOCKER_BUCKET && SUMMARY_KEY.test(opt("key") ?? ""))
+    if (cmd === "delete-object" && bucket === lockerBucket && SUMMARY_KEY.test(opt("key") ?? ""))
       return write("delete summary object");
     return refuse("aws_operation_not_allowlisted");
   }
   if (svc === "s3" && cmd === "cp" && args.length === 2 && args[1] === "-") {
     const src = args[0]!;
     const m = /^s3:\/\/([^/]+)\/(telemetry\/traces\/.+)$/.exec(src);
-    return m && m[1] === PROOF_LOCKER_BUCKET ? read("s3 cp trace batch") : refuse("bucket_outside_fence");
+    return m && m[1] === lockerBucket ? read("s3 cp trace batch") : refuse("bucket_outside_fence");
   }
   if (svc === "elbv2" && (cmd === "describe-load-balancers" || cmd === "describe-ssl-policies")) return read(`elbv2 ${cmd}`);
-  if (svc === "elbv2" && cmd === "describe-listeners") return arnOk(opt("load-balancer-arn") ?? "", ph) ? read("elbv2 describe-listeners") : refuse("arn_outside_fence");
-  if (svc === "wafv2" && cmd === "get-web-acl-for-resource") return arnOk(opt("resource-arn") ?? "", ph) ? read("wafv2 get-web-acl-for-resource") : refuse("arn_outside_fence");
-  if (svc === "kms" && cmd === "describe-key") return arnOk(opt("key-id") ?? "", ph) ? read("kms describe-key") : refuse("arn_outside_fence");
+  if (svc === "elbv2" && cmd === "describe-listeners") return arnOk_(opt("load-balancer-arn") ?? "", ph) ? read("elbv2 describe-listeners") : refuse("arn_outside_fence");
+  if (svc === "wafv2" && cmd === "get-web-acl-for-resource") return arnOk_(opt("resource-arn") ?? "", ph) ? read("wafv2 get-web-acl-for-resource") : refuse("arn_outside_fence");
+  if (svc === "kms" && cmd === "describe-key") return arnOk_(opt("key-id") ?? "", ph) ? read("kms describe-key") : refuse("arn_outside_fence");
   if (svc === "eks" && cmd === "list-clusters") return read("eks list-clusters");
-  if (svc === "eks" && cmd === "describe-cluster" && opt("name") === PROOF_CLUSTER) return read("eks describe-cluster");
-  if (svc === "resourcegroupstaggingapi" && cmd === "get-resources" && opt("tag-filters") === `Key=96bulls:stack,Values=${PROOF_STAGE}`) return read("tagged resources");
+  if (svc === "eks" && cmd === "describe-cluster" && opt("name") === pt.clusterName) return read("eks describe-cluster");
+  if (svc === "resourcegroupstaggingapi" && cmd === "get-resources" && opt("tag-filters") === `Key=96bulls:stack,Values=${pt.stage}`) return read("tagged resources");
+  // The Pippen sweeper's tag (pippen:sandbox=true), on the sandbox target only.
+  if (svc === "resourcegroupstaggingapi" && cmd === "get-resources" && pt.sweepTags.some((x) => opt("tag-filters") === `Key=${x.key},Values=${x.value}`)) return read("sweeper-tagged resources");
   return refuse("aws_operation_not_allowlisted");
 }
 

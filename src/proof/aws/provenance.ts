@@ -14,8 +14,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { PROOF_HOST, PROOF_ORIGIN } from "./fence.ts";
-import { PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_REGION, PROOF_STAGE } from "./guard.ts";
+import { TARGET_VALUES } from "./fence.ts";
+import { PROOF_STAGE, SESSIONS_DEV_PROOF_TARGET, type ProofTarget } from "./guard.ts";
 import type { DescribedCluster } from "./cluster-binding.ts";
 
 const sha256 = (b: string | Uint8Array) => createHash("sha256").update(b).digest("hex");
@@ -26,6 +26,12 @@ export const STAGE_PLAN_FILES = {
   plan: "docs/plans/aws-proof.plan.txt",
   inputs: "docs/plans/aws-proof.inputs.sanitized.json",
 } as const;
+
+/** The captured plan files of a hardcoded target's stage (aws-proof: STAGE_PLAN_FILES). */
+export const stagePlanFiles = (stage: string) =>
+  stage === PROOF_STAGE
+    ? STAGE_PLAN_FILES
+    : ({ provenance: `docs/plans/${stage}.provenance.json`, plan: `docs/plans/${stage}.plan.txt`, inputs: `docs/plans/${stage}.inputs.sanitized.json` } as const);
 
 /** Operations a plan may contain for the harness to accept it: nothing existing is changed. */
 export const ACCEPTED_PLAN_OPS = ["create", "noop"] as const;
@@ -61,13 +67,14 @@ export interface PlanOps {
   resources: Array<{ id: string; op: string }>;
 }
 
-const PLAN_HEADER = [/^Plan · aws-proof$/, /^Importing stack module$/, /^Resolving stack services$/, /^AWS: using environment variables \([A-Z_, ]+\) instead of the profile\.$/, /^Loading stack state$/, /^Computing plan$/, /^Plan ready \([0-9.]+m?s\)$/];
+const planHeader = (stage: string) => [new RegExp(`^Plan · ${stage.replace(/[^a-z0-9-]/g, "")}$`), /^Importing stack module$/, /^Resolving stack services$/, /^AWS: using environment variables \([A-Z_, ]+\) instead of the profile\.$/, /^Loading stack state$/, /^Computing plan$/, /^Plan ready \([0-9.]+m?s\)$/];
 
 /**
  * Parse the captured plan text: the `Plan: N to create, M to replace` summary
  * and every `[resource] op` line. Unknown lines are refused (fail closed).
  */
-export function parsePlanOps(text: string): PlanOps | { error: string } {
+export function parsePlanOps(text: string, stage: string = PROOF_STAGE): PlanOps | { error: string } {
+  const PLAN_HEADER = planHeader(stage);
   const summary: Record<string, number> = {};
   const resources: PlanOps["resources"] = [];
   let summaries = 0;
@@ -137,9 +144,12 @@ export interface StagePlan {
 }
 
 /** Load and re-verify the captured Stage A plan. Every mismatch is a refusal. */
-export function loadStagePlan(root: string, read: (p: string) => string | undefined = (p) => (existsSync(p) ? readFileSync(p, "utf8") : undefined), approval?: PlanUpdateApproval): StagePlan | { error: string } {
+export function loadStagePlan(root: string, read: (p: string) => string | undefined = (p) => (existsSync(p) ? readFileSync(p, "utf8") : undefined), approval?: PlanUpdateApproval, t: ProofTarget = SESSIONS_DEV_PROOF_TARGET): StagePlan | { error: string } {
+  const tv = TARGET_VALUES[t.id];
+  if (tv.target !== t) return { error: "not a hardcoded proof target" };
+  const STAGE_PLAN_FILES = stagePlanFiles(t.stage);
   const raw = read(join(root, STAGE_PLAN_FILES.provenance));
-  if (raw === undefined) return { error: `stage plan provenance ${STAGE_PLAN_FILES.provenance} is missing (capture it with \`bin/96bulls plan aws-proof --capture\`, #75)` };
+  if (raw === undefined) return { error: `stage plan provenance ${STAGE_PLAN_FILES.provenance} is missing (capture it with \`bin/96bulls plan ${t.stage} --capture\`${t.stage === PROOF_STAGE ? ", #75" : ""})` };
   let p: {
     stage?: string; generatedAt?: string; target?: { accountId?: string; region?: string };
     source?: { commit?: string; clean?: boolean }; inputs?: { sanitizedPath?: string; sanitizedSha256?: string };
@@ -150,8 +160,8 @@ export function loadStagePlan(root: string, read: (p: string) => string | undefi
   } catch {
     return { error: "stage plan provenance is not JSON" };
   }
-  if (p.stage !== PROOF_STAGE) return { error: `stage plan is for ${p.stage}, not ${PROOF_STAGE}` };
-  if (p.target?.accountId !== PROOF_ACCOUNT_ID || p.target?.region !== PROOF_REGION) return { error: "stage plan targets another account or region" };
+  if (p.stage !== t.stage) return { error: `stage plan is for ${p.stage}, not ${t.stage}` };
+  if (p.target?.accountId !== t.accountId || p.target?.region !== t.region) return { error: "stage plan targets another account or region" };
   if (p.source?.clean !== true || !/^[0-9a-f]{40}$/.test(p.source?.commit ?? "")) return { error: "stage plan was not captured from a clean commit" };
   if (Number.isNaN(Date.parse(p.generatedAt ?? ""))) return { error: "stage plan generatedAt invalid" };
   if (p.outputs?.plan?.path !== STAGE_PLAN_FILES.plan || p.inputs?.sanitizedPath !== STAGE_PLAN_FILES.inputs) return { error: "stage plan points at unexpected files" };
@@ -165,7 +175,7 @@ export function loadStagePlan(root: string, read: (p: string) => string | undefi
     for (const k of ["provenanceSha256", "planSha256", "inputsSha256", "sourceCommit"] as const)
       if (approval[k] !== actual[k]) return { error: `plan update approval does not match this capture (${k})` };
   }
-  const ops = parsePlanOps(plan);
+  const ops = parsePlanOps(plan, t.stage);
   if ("error" in ops) return { error: `stage plan unreadable: ${ops.error}` };
   const opIssues = planOpsIssues(ops, !!approval);
   if (opIssues.length) return { error: `stage plan is not create-only: ${opIssues.join("; ")}` };
@@ -174,10 +184,17 @@ export function loadStagePlan(root: string, read: (p: string) => string | undefi
   const inputsRaw = inputsRawEarly;
   const i = JSON.parse(inputsRaw) as {
     accountId?: string; region?: string;
+    accountShared?: unknown; pippenSandbox?: { permissionsBoundaryArn?: string };
     eks?: { chartVersion?: string; imageDigest?: string; relayhistoryOrigin?: string; ingress?: { hostname?: string }; relayauth?: { chartVersion?: string }; relaycast?: { chartVersion?: string; imageDigest?: string }; sessionDirectory?: { enabled?: boolean } };
   };
-  if (i.accountId !== PROOF_ACCOUNT_ID || i.region !== PROOF_REGION) return { error: "stage plan inputs target another account or region" };
-  if (i.eks?.ingress?.hostname !== PROOF_HOST || i.eks?.relayhistoryOrigin !== PROOF_ORIGIN) return { error: "stage plan inputs name another host or origin" };
+  if (i.accountId !== t.accountId || i.region !== t.region) return { error: "stage plan inputs target another account or region" };
+  if (i.eks?.ingress?.hostname !== tv.host || i.eks?.relayhistoryOrigin !== tv.origin) return { error: "stage plan inputs name another host or origin" };
+  // The Pippen sandbox is a fresh account: it must be planned as one (boundary on every role, sweeper tag), never as a shared account.
+  if (t.id === "pippen-sandbox") {
+    if (i.accountShared !== undefined) return { error: "stage plan inputs share another stage's account resources; a Pippen sandbox must not set accountShared" };
+    if (!new RegExp(`^arn:aws:iam::${t.accountId}:policy/[\\w+=,.@/-]+$`).test(i.pippenSandbox?.permissionsBoundaryArn ?? ""))
+      return { error: `stage plan inputs lack pippenSandbox.permissionsBoundaryArn in ${t.accountId}` };
+  }
   if (!DIGEST.test(i.eks?.imageDigest ?? "") || !DIGEST.test(i.eks?.relaycast?.imageDigest ?? "")) return { error: "stage plan inputs lack pinned image digests" };
   const v = (x: string | undefined) => (x && /^\d+\.\d+\.\d+$/.test(x) ? x : undefined);
   const charts = { "96bulls": v(i.eks?.chartVersion), relayauth: v(i.eks?.relayauth?.chartVersion), relaycast: v(i.eks?.relaycast?.chartVersion) };

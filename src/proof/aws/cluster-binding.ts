@@ -2,9 +2,10 @@
  * Binds the harness to the live proof cluster as AWS reports it, never as a
  * kubeconfig names it.
  *
- *   1. `aws eks describe-cluster --name 96bulls-aws-proof --region us-west-2`
- *      (the caller already verified as account 500268966557) gives the cluster
- *      ARN, API endpoint and certificate authority.
+ *   1. `aws eks describe-cluster --name <target cluster> --region us-west-2`
+ *      (the caller already verified as the target's account: 500268966557 for
+ *      the proof stage, 361835732085 + the agent-session role for the Pippen
+ *      sandbox) gives the cluster ARN, API endpoint and certificate authority.
  *   2. The operator's kubeconfig context must point at exactly that endpoint
  *      with exactly that CA, with no TLS override; otherwise the run fails
  *      closed. This catches a context that was renamed onto another server.
@@ -13,9 +14,11 @@
  *      `aws eks get-token`), through KUBECONFIG. The operator's kubeconfig is
  *      never consulted by a step.
  */
-import { PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_REGION } from "./guard.ts";
+import { PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_REGION, SESSIONS_DEV_PROOF_TARGET, type ProofTarget } from "./guard.ts";
 
 export const PROOF_CLUSTER_ARN = `arn:aws:eks:${PROOF_REGION}:${PROOF_ACCOUNT_ID}:cluster/${PROOF_CLUSTER}`;
+/** The EKS cluster ARN of a hardcoded proof target. */
+export const clusterArnOf = (t: ProofTarget) => `arn:aws:eks:${t.region}:${t.accountId}:cluster/${t.clusterName}`;
 
 export interface DescribedCluster {
   arn: string;
@@ -27,7 +30,8 @@ export interface DescribedCluster {
 const ENDPOINT = /^https:\/\/[A-Z0-9]+\.[a-z0-9]+\.us-west-2\.eks\.amazonaws\.com$/;
 const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 
-export function parseDescribeCluster(json: string): DescribedCluster | { error: string } {
+export function parseDescribeCluster(json: string, t: ProofTarget = SESSIONS_DEV_PROOF_TARGET): DescribedCluster | { error: string } {
+  const wantArn = clusterArnOf(t);
   let c: { cluster?: { arn?: string; name?: string; endpoint?: string; status?: string; createdAt?: string; certificateAuthority?: { data?: string } } };
   try {
     c = JSON.parse(json);
@@ -36,7 +40,7 @@ export function parseDescribeCluster(json: string): DescribedCluster | { error: 
   }
   const k = c.cluster;
   if (!k) return { error: "describe-cluster returned no cluster" };
-  if (k.arn !== PROOF_CLUSTER_ARN || k.name !== PROOF_CLUSTER) return { error: `described cluster is not ${PROOF_CLUSTER_ARN}` };
+  if (k.arn !== wantArn || k.name !== t.clusterName) return { error: `described cluster is not ${wantArn}` };
   if (k.status !== "ACTIVE") return { error: `cluster status is ${k.status ?? "unknown"}, not ACTIVE` };
   if (!k.endpoint || !ENDPOINT.test(k.endpoint)) return { error: "cluster endpoint is not an EKS endpoint in us-west-2" };
   const ca = k.certificateAuthority?.data;
@@ -76,7 +80,7 @@ export function bindKubeconfig(viewJson: string, contextName: string, d: Describ
 }
 
 /** The only kubeconfig any step uses: built from the describe result. Holds no secret (the CA is public; tokens come from the exec plugin). */
-export function proofKubeconfig(d: DescribedCluster, contextName: string): string {
+export function proofKubeconfig(d: DescribedCluster, contextName: string, t: ProofTarget = SESSIONS_DEV_PROOF_TARGET): string {
   return JSON.stringify(
     {
       apiVersion: "v1",
@@ -89,13 +93,13 @@ export function proofKubeconfig(d: DescribedCluster, contextName: string): strin
             exec: {
               apiVersion: "client.authentication.k8s.io/v1beta1",
               command: "aws",
-              args: ["eks", "get-token", "--cluster-name", PROOF_CLUSTER, "--region", PROOF_REGION, "--output", "json"],
+              args: ["eks", "get-token", "--cluster-name", t.clusterName, "--region", t.region, "--output", "json"],
               // Inherits the minimal tool env; these repeat the pins in case a kubectl ever adds its own.
               env: [
                 { name: "AWS_CONFIG_FILE", value: "/dev/null" },
                 { name: "AWS_SHARED_CREDENTIALS_FILE", value: "/dev/null" },
                 { name: "AWS_STS_REGIONAL_ENDPOINTS", value: "regional" },
-                { name: "AWS_REGION", value: PROOF_REGION },
+                { name: "AWS_REGION", value: t.region },
               ],
               interactiveMode: "Never",
             },

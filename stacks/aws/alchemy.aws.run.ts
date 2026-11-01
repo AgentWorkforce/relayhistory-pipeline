@@ -30,14 +30,14 @@ import * as Layer from "effect/Layer";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
+import { PIPPEN_PROOF_SANDBOX, PIPPEN_PROOF_SANDBOX_CALLER_ARN, SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
 import { eksStage } from "./eks.ts";
 import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy } from "./hardening.ts";
 import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "./inputs.ts";
 import { assertApprovalBinding, assertAwsDeploymentTarget, assertClearance, awsMode, type AwsMode } from "./deploy-guard.ts";
 import { snapshotStateLayer } from "./state-snapshot.ts";
 import { verifyDeployCapture } from "./capture-verify.ts";
-import { alchemyStateBucket, alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
+import { alchemyStateBucket, alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyCallerArn, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
 import { networkPolicies } from "./proof-addons.ts";
 import { hoopdbBackend } from "./hardening.ts";
 import { spawnSync } from "node:child_process";
@@ -130,6 +130,9 @@ export default Alchemy.Stack(
     const liveCredentials = yield* awsEnvironment.credentials.pipe(Effect.orDie);
     const callerAccountId = yield* getAccountId(liveCredentials as never).pipe(Effect.orDie);
     assertAwsDeploymentTarget({ accountId: inputs.accountId, region: inputs.region }, { accountId: callerAccountId as string, region: awsEnvironment.region as string });
+    // The Pippen sandbox proof stage, every mode: only the pippen agent-session role session may act there.
+    if (stage === PIPPEN_PROOF_SANDBOX.stage)
+      verifyCallerArn(awsCliRunner((cmd, args) => spawnSync(cmd, args, { encoding: "utf8", env: process.env })), PIPPEN_PROOF_SANDBOX_CALLER_ARN);
     // Read-only AWS checks with the same exported credentials (preflight.ts). Skipped on destroy:
     // tearing down must not depend on the image or the policy phase still being valid.
     if (inputs.mode !== "destroy") {

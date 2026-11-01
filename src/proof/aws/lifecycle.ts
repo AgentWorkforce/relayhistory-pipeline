@@ -9,7 +9,7 @@
  */
 import type { ProofConfig } from "./config.ts";
 import type { Step } from "./exec.ts";
-import { PROOF_STAGE } from "./guard.ts";
+import { PROOF_STAGE, proofTargetForStage } from "./guard.ts";
 import { kubectl } from "./probes.ts";
 import { PROOF_WRITABLE_NAMESPACES } from "./fence.ts";
 import { probePod, RELAYCAST_PROBE_URL } from "./ops.ts";
@@ -290,6 +290,10 @@ export function versioningEnabled(getBucketVersioningJson: string): boolean {
 
 /** The stack tag every Alchemy AWS resource carries (stacks/aws/alchemy.aws.run.ts `tags()`). */
 export const PROOF_TAG = { key: "96bulls:stack", value: PROOF_STAGE } as const;
+/** The stack tag for a config's stage (PROOF_TAG for aws-proof). */
+export const proofTagFor = (stage: string) => (stage === PROOF_STAGE ? PROOF_TAG : ({ key: "96bulls:stack", value: stage } as const));
+/** Tags the stage's destroy sweeps beyond the stack tag: `pippen:sandbox=true` on the Pippen sandbox, none on aws-proof. */
+export const sweepTagsFor = (stage: string) => proofTargetForStage(stage)?.sweepTags ?? [];
 
 /**
  * Teardown removes only what the proof created inside the proof cluster and
@@ -308,6 +312,7 @@ export function teardownSteps(c: ProofConfig): Step[] {
 }
 
 export function teardownVerifySteps(c: ProofConfig): Step[] {
+  const PROOF_TAG = proofTagFor(c.stage);
   return [
     read("teardown.verify.cluster", ["aws", "eks", "list-clusters", "--region", c.region, "--query", "clusters", "--output", "json"], [`aws:eks clusters in ${c.region} (list)`]),
     ...PROOF_WRITABLE_NAMESPACES.map((ns) => read(`teardown.verify.k8s.${ns}`, kubectl(c, "-n", ns, "get", "all,pvc,backups.postgresql.cnpg.io,clusters.postgresql.cnpg.io", "-l", "96bulls.proof=true", "-o", "json"), [`k8s:${ns} (list, labelled)`])),
@@ -318,6 +323,11 @@ export function teardownVerifySteps(c: ProofConfig): Step[] {
 
 /** Printed only: destroying the stage itself is Khaliq's call and runs through Alchemy. */
 export const STAGE_DESTROY_COMMAND = `bin/96bulls down ${PROOF_STAGE}   # Alchemy destroy; requires Khaliq's OK; not run by this harness`;
+/** The Pippen sandbox is torn down by the verified sweep, never by the harness. */
+export const SANDBOX_DESTROY_COMMAND = `pippen sandbox down aws-proof   # sweeps everything tagged pippen:sandbox=true and verifies zero non-baseline IAM; requires Khaliq's OK; not run by this harness`;
+export const stageDestroyCommandFor = (stage: string) => (proofTargetForStage(stage)?.id === "pippen-sandbox" ? SANDBOX_DESTROY_COMMAND : STAGE_DESTROY_COMMAND);
+/** The short form for messages: `96bulls down aws-proof` or `pippen sandbox down aws-proof`. */
+export const stageDestroyShortFor = (stage: string) => (proofTargetForStage(stage)?.id === "pippen-sandbox" ? "pippen sandbox down aws-proof" : `96bulls down ${stage}`);
 
 /**
  * What is left. While the cluster exists, in-cluster leftovers are residue and

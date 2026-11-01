@@ -2,6 +2,8 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "../inputs.ts";
+import { PIPPEN_PROOF_SANDBOX, PIPPEN_PROOF_SANDBOX_CALLER_ARN } from "../sandbox-rules.ts";
+import { verifyCallerArn } from "../preflight.ts";
 
 const lock = JSON.parse(readFileSync(fileURLToPath(new URL("../../../versions.lock.json", import.meta.url)), "utf8")) as { images: { "services-aws": { approved: ApprovedServicesImage[] } } };
 const approved = lock.images["services-aws"].approved;
@@ -84,5 +86,68 @@ describe("aws-proof: a fresh, fully hardened stage beside sessions-dev", () => {
     // eks.ts: clusterName = `96bulls-${stage}`
     expect(readFileSync(fileURLToPath(new URL("../eks.ts", import.meta.url)), "utf8")).toContain("const clusterName = `96bulls-${i.stage}`;");
     expect(`96bulls-${"aws-proof"}`).toBe("96bulls-aws-proof");
+  });
+});
+
+describe("aws-proof-sandbox: the E2E proof in the Pippen sandbox of agent aws-proof", () => {
+  const sbxExample = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-proof-sandbox.inputs.example.json", import.meta.url)), "utf8")) as AwsInputs;
+  const sbx = (patch: (i: AwsInputs) => void = () => {}) => {
+    const i = structuredClone(sbxExample);
+    i.approval = { ...i.approval!, decision: "approved", date: "2026-11-01", quote: "run the EKS proof in a pippen sandbox", capture: { provenanceSha256: "a".repeat(64), planSha256: "b".repeat(64), inputsSha256: "c".repeat(64), sourceCommit: "d".repeat(40) } };
+    i.eks!.apiAccess = { publicAccessCidrs: ["203.0.113.7/32"] };
+    i.pippenSandbox = { permissionsBoundaryArn: "arn:aws:iam::361835732085:policy/pippen-sandbox-boundary" };
+    patch(i);
+    return i;
+  };
+
+  it("validates once the placeholders are filled: pinned account, pippenSandbox, no accountShared, approved image", () => {
+    expect(sbxExample.accountId).toBe(PIPPEN_PROOF_SANDBOX.accountId);
+    expect(sbxExample.region).toBe("us-west-2");
+    expect(sbxExample.accountShared).toBeUndefined();
+    expect(sbxExample.eks!.ingress!.hostname).toBe("proof-sandbox-sessions.agentrelay.com");
+    expect(sbxExample.eks!.relayhistoryOrigin).toBe("https://proof-sandbox-sessions.agentrelay.com");
+    const r = validateAwsInputs("aws-proof-sandbox", sbx(), approved);
+    expect(r.hoopdb).toBe("cnpg");
+  });
+
+  it("refuses the example as committed: the boundary policy name and approval are placeholders", () => {
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbxExample)).toThrow(/\$\.pippenSandbox\.permissionsBoundaryArn/);
+  });
+
+  it("refuses the sandbox stage without pippenSandbox, with accountShared, or in another account/region", () => {
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbx((i) => delete i.pippenSandbox), approved)).toThrow(/needs pippenSandbox\.permissionsBoundaryArn/);
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbx((i) => (i.accountShared = { ownerStage: "aws-sessions-dev" })), approved)).toThrow(/cannot share|cannot set accountShared/);
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbx((i) => { delete i.pippenSandbox; i.accountShared = { ownerStage: "aws-sessions-dev" }; }), approved)).toThrow(/needs pippenSandbox/);
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbx((i) => { i.accountId = "500268966557"; i.pippenSandbox = { permissionsBoundaryArn: "arn:aws:iam::500268966557:policy/b" }; }), approved)).toThrow(/runs only in the Pippen sandbox 361835732085\/us-west-2/);
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbx((i) => (i.region = "us-east-1")), approved)).toThrow(/runs only in the Pippen sandbox/);
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbx((i) => (i.pippenSandbox = { permissionsBoundaryArn: "arn:aws:iam::500268966557:policy/b" })), approved)).toThrow(/policy ARN in this account/);
+  });
+
+  it("the sandbox account hosts no other stage", () => {
+    for (const stage of ["aws-proof", "aws-sessions-dev", "aws-sandbox-aws-proof"])
+      expect(() => validateAwsInputs(stage, sbx((i) => delete i.teardown), approved)).toThrow(/only stage aws-proof-sandbox may target it/);
+  });
+
+  it("the existing aws-proof stage is unaffected", () => {
+    expect(() => validateAwsInputs("aws-proof", filled(), approved)).not.toThrow();
+  });
+
+  it("the stack checks the caller is the pippen agent-session role before declaring anything", () => {
+    expect(PIPPEN_PROOF_SANDBOX_CALLER_ARN).toBe("arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof");
+    const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
+    const guard = stack.indexOf("verifyCallerArn(");
+    expect(guard).toBeGreaterThan(stack.indexOf("assertAwsDeploymentTarget("));
+    expect(guard).toBeLessThan(stack.indexOf("AWS.KMS.Key("));
+    expect(stack).toContain("if (stage === PIPPEN_PROOF_SANDBOX.stage)");
+    const calls: string[][] = [];
+    const aws = (arn: string | undefined) => ({ json: (a: string[]) => { calls.push(a); if (arn === undefined) throw new Error("denied"); return { Arn: arn }; }, s3Json: () => ({}) });
+    expect(() => verifyCallerArn(aws(PIPPEN_PROOF_SANDBOX_CALLER_ARN), PIPPEN_PROOF_SANDBOX_CALLER_ARN)).not.toThrow();
+    expect(() => verifyCallerArn(aws("arn:aws:sts::361835732085:assumed-role/admin/me"), PIPPEN_PROOF_SANDBOX_CALLER_ARN)).toThrow(/is not arn:aws:sts::361835732085:assumed-role\/agent-session\/agent-aws-proof/);
+    expect(() => verifyCallerArn(aws(undefined), PIPPEN_PROOF_SANDBOX_CALLER_ARN)).toThrow(/unverified/);
+    expect(calls[0]).toEqual(["sts", "get-caller-identity"]);
+  });
+
+  it("names the cluster the harness's sandbox target expects", () => {
+    expect(`96bulls-${PIPPEN_PROOF_SANDBOX.stage}`).toBe("96bulls-aws-proof-sandbox");
   });
 });
