@@ -38,14 +38,13 @@ import { DEFAULT_SYNC_CONFIG, Syncer, errorCode } from "./sync.ts";
 import { Throttle, parseWindows } from "./throttle.ts";
 
 /**
- * Optional non-secret tuning file (`S3X_TUNING_FILE`, JSON of S3X_* names to
+ * Optional non-secret tuning file (`S3X_TUNING_FILE`, default ~/.agent-tmp/s3x/tuning.json, JSON of S3X_* names to
  * values), read at each start, so a restart under the runner can change rates
  * or lanes without re-reading credentials. Only rate, lane and window keys.
  */
 const TUNABLE = new Set(["S3X_LANES", "S3X_ROWS_PER_SEC", "S3X_BYTES_PER_SEC", "S3X_SLOW_WINDOWS", "S3X_SLOW_FACTOR"]);
 const tuning: Record<string, string> = (() => {
-  const file = process.env.S3X_TUNING_FILE?.trim();
-  if (!file) return {};
+  const file = process.env.S3X_TUNING_FILE?.trim() || `${process.env.HOME}/.agent-tmp/s3x/tuning.json`;
   try {
     const t = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
     return Object.fromEntries(Object.entries(t).filter(([k]) => TUNABLE.has(k)).map(([k, v]) => [k, String(v)]));
