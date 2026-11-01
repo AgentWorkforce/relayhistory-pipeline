@@ -261,9 +261,11 @@ To request the application release after its external Secrets exist, set
 ```json
 "bulls96": {
   "enabled": true,
-  "chartVersion": "0.3.0",
+  "chartVersion": "0.3.2",
   "tenantOrgId": "org_replace_me",
   "existingSecretName": "96bulls-runtime",
+  "hoopdbRuntimeRole": "bulls96_runtime",
+  "hoopdbRuntimeRoleLogin": true,
   "imageDigest": "sha256:<digest-built-from-the-reviewed-main-commit>",
   "imageSourceRevision": "<full-40-character-reviewed-main-commit>",
   "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
@@ -288,6 +290,14 @@ file or Helm values. The stage uses its private Artifact Registry repository
 for the digest-pinned services image, and the GKE node identity receives
 read-only Artifact Registry access. No GHCR pull token or dockerconfigjson
 Secret is used or required for that path.
+
+The named Secret must keep the two database boundaries separate:
+`HOOPDB_MIGRATION_URL` is the owner connection read only by the one-shot
+migration Job, while `HOOPDB_URL` is the dedicated non-owner login read by
+every long-running 96Bulls workload. `hoopdbRuntimeRole` must be the role named
+by that runtime URL and its login mode must be explicit. The stack refuses to
+render an enabled release without this separation; it never falls back to the
+owner URL for services.
 
 The digest and source revision must exactly match the structured services
 release in `versions.lock.json`, and that release must set
