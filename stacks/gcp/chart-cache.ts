@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   mkdirSync,
+  lstatSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -9,9 +10,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { execFileSync } from "node:child_process";
-import type { CapturedRelaycastChartPackage } from "./config.ts";
+import type {
+  CapturedRelayauthChartPackage,
+  CapturedRelaycastChartPackage,
+} from "./config.ts";
 
 interface ChartCacheRecord {
   packageDigest: string;
@@ -24,10 +28,63 @@ export interface RelaycastChartCacheOptions {
   staleLockMs?: number;
 }
 
+export type RelayauthChartCacheOptions = RelaycastChartCacheOptions;
+
 const CACHE_RECORD = ".96bulls-verified-chart.json";
 const LOCK_OWNER = "owner.json";
 const DEFAULT_LOCK_WAIT_MS = 15_000;
 const DEFAULT_STALE_LOCK_MS = 30_000;
+
+function preparePrivateCacheRoot(cacheRoot: string): void {
+  const uid = process.getuid?.();
+  if (uid === undefined)
+    throw new Error(
+      "96bulls: verified chart cache requires deploy-user ownership checks. Nothing was created.",
+    );
+
+  let parent;
+  try {
+    parent = lstatSync(dirname(cacheRoot));
+  } catch {
+    throw new Error(
+      "96bulls: verified chart cache parent is unavailable. Nothing was created.",
+    );
+  }
+  const parentMode = parent.mode & 0o7777;
+  const privateOwnerParent =
+    parent.uid === uid && (parentMode & 0o022) === 0;
+  const rootStickyParent =
+    parent.uid === 0 &&
+    (parentMode & 0o1000) !== 0 &&
+    (parentMode & 0o002) !== 0;
+  if (
+    !parent.isDirectory() ||
+    parent.isSymbolicLink() ||
+    (!privateOwnerParent && !rootStickyParent)
+  )
+    throw new Error(
+      "96bulls: verified chart cache parent is not trusted. Nothing was created.",
+    );
+
+  try {
+    mkdirSync(cacheRoot, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST")
+      throw new Error(
+        "96bulls: verified chart cache root is unavailable. Nothing was created.",
+      );
+  }
+  const root = lstatSync(cacheRoot);
+  if (
+    !root.isDirectory() ||
+    root.isSymbolicLink() ||
+    root.uid !== uid ||
+    (root.mode & 0o777) !== 0o700
+  )
+    throw new Error(
+      "96bulls: verified chart cache root must be owned by the deploy user with mode 0700. Nothing was created.",
+    );
+}
 
 interface LockOwner {
   id: string;
@@ -61,8 +118,13 @@ function chartTreeDigest(root: string): string {
   return hash.digest("hex");
 }
 
-function verifiedChartPath(cache: string, expectedPackageDigest: string, expectedChartDigest: string): string | undefined {
-  const chart = join(cache, "relaycast");
+function verifiedChartPath(
+  cache: string,
+  chartName: string,
+  expectedPackageDigest: string,
+  expectedChartDigest: string,
+): string | undefined {
+  const chart = join(cache, chartName);
   try {
     if (!statSync(chart).isDirectory()) return;
     const record = JSON.parse(readFileSync(join(cache, CACHE_RECORD), "utf8")) as ChartCacheRecord;
@@ -154,21 +216,24 @@ function releaseOwnedLock(lock: string, owner: LockOwner, cacheRoot: string): vo
  * once under an exclusive directory lock and never replaced while a consumer
  * may be rendering it. Existing cache bytes are validated before reuse.
  */
-export function prepareRelaycastChart(
+function prepareVerifiedChart(
   captured: CapturedRelaycastChartPackage,
+  chartName: "relaycast" | "relayauth",
+  version: string,
+  label: "Relaycast" | "RelayAuth",
   options: RelaycastChartCacheOptions = {},
 ): string {
   if (createHash("sha256").update(captured.bytes).digest("hex") !== captured.digest)
-    throw new Error("96bulls: captured Relaycast package changed after verification. Nothing was created.");
+    throw new Error(`96bulls: captured ${label} package changed after verification. Nothing was created.`);
 
-  const cacheRoot = options.cacheRoot ?? join(tmpdir(), "96bulls-relaycast-charts-v2");
+  const cacheRoot = options.cacheRoot ?? join(tmpdir(), `96bulls-${chartName}-charts-v3`);
   const extracted = join(cacheRoot, captured.digest);
   const lock = join(cacheRoot, `.${captured.digest}.lock`);
   const deadline = Date.now() + (options.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS);
   const staleLockMs = options.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
   if (!Number.isFinite(staleLockMs) || staleLockMs < 1)
     throw new Error("96bulls: verified Relaycast chart cache lock policy is invalid. Nothing was created.");
-  mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
+  preparePrivateCacheRoot(cacheRoot);
 
   // The expected tree hash comes from a fresh extraction of the already
   // captured, digest-verified archive. The mutable cache record is evidence,
@@ -176,20 +241,20 @@ export function prepareRelaycastChart(
   const staging = join(cacheRoot, `.${captured.digest}.${process.pid}.${randomUUID()}`);
   mkdirSync(staging, { mode: 0o700 });
   try {
-    const artifact = join(staging, "relaycast-0.1.0.tgz");
+    const artifact = join(staging, `${chartName}-${version}.tgz`);
     writeFileSync(artifact, captured.bytes, { mode: 0o600 });
     execFileSync("tar", ["-xzf", artifact, "-C", staging], { stdio: "ignore" });
     rmSync(artifact, { force: true });
-    if (!statSync(join(staging, "relaycast")).isDirectory()) throw new Error("missing relaycast chart");
+    if (!statSync(join(staging, chartName)).isDirectory()) throw new Error(`missing ${chartName} chart`);
   } catch {
     rmSync(staging, { recursive: true, force: true });
-    throw new Error("96bulls: verified Relaycast package could not be cached. Nothing was created.");
+    throw new Error(`96bulls: verified ${label} package could not be cached. Nothing was created.`);
   }
-  const trustedChartDigest = chartTreeDigest(join(staging, "relaycast"));
+  const trustedChartDigest = chartTreeDigest(join(staging, chartName));
   let owner: LockOwner | undefined;
 
   for (;;) {
-    const ready = verifiedChartPath(extracted, captured.digest, trustedChartDigest);
+    const ready = verifiedChartPath(extracted, chartName, captured.digest, trustedChartDigest);
     if (ready) {
       rmSync(staging, { recursive: true, force: true });
       return ready;
@@ -205,14 +270,14 @@ export function prepareRelaycastChart(
         (!recoverStaleLock(lock, cacheRoot, staleLockMs) && Date.now() >= deadline)
       ) {
         rmSync(staging, { recursive: true, force: true });
-        throw new Error("96bulls: verified Relaycast chart cache is unavailable. Nothing was created.");
+        throw new Error(`96bulls: verified ${label} chart cache is unavailable. Nothing was created.`);
       }
       pause(Math.min(50, Math.max(1, deadline - Date.now())));
     }
   }
 
   try {
-    const ready = verifiedChartPath(extracted, captured.digest, trustedChartDigest);
+    const ready = verifiedChartPath(extracted, chartName, captured.digest, trustedChartDigest);
     if (ready) {
       rmSync(staging, { recursive: true, force: true });
       return ready;
@@ -224,20 +289,34 @@ export function prepareRelaycastChart(
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
 
-    const chart = join(staging, "relaycast");
+    const chart = join(staging, chartName);
     writeFileSync(
       join(staging, CACHE_RECORD),
       JSON.stringify({ packageDigest: captured.digest, chartDigest: trustedChartDigest } satisfies ChartCacheRecord),
       { encoding: "utf8", mode: 0o600 },
     );
     renameSync(staging, extracted);
-    const prepared = verifiedChartPath(extracted, captured.digest, trustedChartDigest);
+    const prepared = verifiedChartPath(extracted, chartName, captured.digest, trustedChartDigest);
     if (!prepared) throw new Error("prepared cache did not validate");
     return prepared;
   } catch {
     rmSync(staging, { recursive: true, force: true });
-    throw new Error("96bulls: verified Relaycast package could not be cached. Nothing was created.");
+    throw new Error(`96bulls: verified ${label} package could not be cached. Nothing was created.`);
   } finally {
     if (owner) releaseOwnedLock(lock, owner, cacheRoot);
   }
+}
+
+export function prepareRelaycastChart(
+  captured: CapturedRelaycastChartPackage,
+  options: RelaycastChartCacheOptions = {},
+): string {
+  return prepareVerifiedChart(captured, "relaycast", "0.1.0", "Relaycast", options);
+}
+
+export function prepareRelayauthChart(
+  captured: CapturedRelayauthChartPackage,
+  options: RelayauthChartCacheOptions = {},
+): string {
+  return prepareVerifiedChart(captured, "relayauth", "0.1.1", "RelayAuth", options);
 }

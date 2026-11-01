@@ -18,7 +18,11 @@
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import { orgPrefix } from "../neon-s3-sync/export-session.ts";
-import { activityPage, catalogPage, fencedGroups, groupExistsInNeon, lockWaiters } from "../neon-s3-sync/neon-reader.ts";
+import { activityPage, catalogPage, fencedGroups, fencedLivePage, groupExistsInNeon, lockWaiters, type LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
+import { liveObjectPrefix, livePointerPrefix, liveSessionsIn, liveTargets } from "./live.ts";
+
+/** Clock-skew margin between this host and S3 `LastModified`. */
+export const LIVE_SKEW_MS = 2 * 60 * 1000;
 
 const DOT_SEGMENT = /(^|\/)\.{1,2}(\/|$)/;
 import type { SyncState } from "../neon-s3-sync/state.ts";
@@ -54,7 +58,7 @@ export function sessionPrefixOf(keyRoot: string, orgId: string, key: string): st
 }
 
 export class ErasureJob {
-  readonly counters = { swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0 };
+  readonly counters = { swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0 };
   #lastSweep = 0;
   #lastProgress = 0;
 
@@ -86,6 +90,14 @@ export class ErasureJob {
       this.log({ message: "sweep deferred: lock waiters", lock_waiters: waiters.total });
       return;
     }
+    // Live (srv_) erasure first and on its own: it reads only tombstones, so
+    // a failure or an early return in the rollup and catalog walks below
+    // must not hold it back.
+    const live = await this.#eraseLiveFenced(opts.dryRun ?? false).catch((error) => {
+      this.counters.liveFenceFailed += 1;
+      this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
+      return { groups: 0, versions: 0 };
+    });
     const id = Number(this.state.meta("erasure_sweep_done") ?? 0) + 1;
     let after: { org_id: string; session_id: string } | null = null;
     let seen = 0;
@@ -136,7 +148,107 @@ export class ErasureJob {
     }
     this.counters.swept += 1;
     if (!opts.dryRun) this.state.setMeta("erasure_sweep_at", String(this.now()));
-    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", sweep: id, count: seen, gone, fenced });
+    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions });
+  }
+
+  /**
+   * Tombstoned sessions written by relayhistory-api's live writer (live.ts),
+   * erased directly on every sweep, not queued: the exporter never writes
+   * or leases `m=srv_` prefixes.
+   *
+   * Cost: tombstones are paged by primary key (no cap) and grouped by
+   * (workspace, user, origin); each group's objects and pointers are listed
+   * once (two list calls), and only tombstones with a directory or a pointer
+   * left are visited. A tombstone with nothing live (most, and every fully
+   * erased one) costs a share of those two calls.
+   *
+   * Re-enable race: a page can be minutes old by the time a row is reached,
+   * and a re-enabled session may already be re-uploading. Each tombstone is
+   * re-read right before its erasure, and only versions last modified before
+   * that read (less LIVE_SKEW_MS for clock skew) are erased. Anything newer is
+   * kept, and so is the pointer while anything is kept, so the next sweep
+   * finds the session again.
+   */
+  async #eraseLiveFenced(dryRun: boolean): Promise<{ groups: number; versions: number }> {
+    let groups = 0;
+    let versions = 0;
+    let after: LiveFencedGroup | null = null;
+    for (;;) {
+      if (this.stopped()) break;
+      let rows: LiveFencedGroup[];
+      try {
+        rows = await fencedLivePage(this.db, after);
+      } catch (error) {
+        this.counters.liveFenceFailed += 1;
+        this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
+        break;
+      }
+      if (rows.length === 0) break;
+      after = rows.at(-1)!;
+      // Per (workspace, user, origin), listed once per page: the session
+      // directories that hold any object, and the pointers. A tombstone is
+      // visited while either remains, so neither a directory left by a
+      // re-upload nor an orphaned pointer is ever skipped for good.
+      const listed = new Map<string, { dirs: Set<string>; pointers: Set<string> } | null>();
+      for (const g of rows) {
+        if (this.stopped()) break;
+        let t;
+        let objects: string;
+        let pointerRoot: string;
+        try {
+          t = liveTargets(this.cfg.keyRoot, g);
+          objects = liveObjectPrefix(this.cfg.keyRoot, g);
+          pointerRoot = livePointerPrefix(this.cfg.keyRoot, g);
+        } catch {
+          // An id that is not one safe path segment was never written either.
+          this.counters.refused += 1;
+          continue;
+        }
+        // A failed listing is remembered for the page (null), so the group's
+        // other tombstones wait for the next sweep instead of each retrying it.
+        if (listed.has(objects) && listed.get(objects) === null) continue;
+        let seen = listed.get(objects);
+        try {
+          if (!seen) {
+            seen = {
+              dirs: liveSessionsIn(objects, await this.eraser.listKeys(objects)),
+              pointers: new Set(await this.eraser.listKeys(pointerRoot)),
+            };
+            listed.set(objects, seen);
+          }
+        } catch (error) {
+          listed.set(objects, null);
+          this.counters.liveFenceFailed += 1;
+          this.log({ message: "live listing failed", error_code: errorCode(error) });
+          continue;
+        }
+        const dirKey = `${t.base.slice(objects.length).replace(/\/$/, "")}/${t.sessionSegment}`;
+        if (!seen.dirs.has(dirKey) && !seen.pointers.has(t.pointerKey)) continue;
+        groups += 1;
+        if (dryRun) continue;
+        try {
+          const checkedAt = this.now();
+          const { rows: still } = await this.db.query(
+            `SELECT 1 FROM sessions.deleted_upload_sessions
+              WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3 AND origin_id = $4 AND source = $5 AND session_id = $6`,
+            [g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id],
+          );
+          if (still.length === 0) continue; // re-enabled since the page was read
+          const before = new Date(checkedAt - LIVE_SKEW_MS);
+          const dir = await this.eraser.eraseSessionAnyDate(t.base, t.sessionSegment, before);
+          versions += dir.deleted;
+          this.counters.liveVersionsDeleted += dir.deleted;
+          if (dir.kept > 0) continue; // the next sweep comes back for the rest
+          const ptr = await this.eraser.eraseObjectBefore(t.pointerKey, before);
+          versions += ptr.deleted;
+          this.counters.liveVersionsDeleted += ptr.deleted;
+        } catch (error) {
+          this.counters.liveFenceFailed += 1;
+          this.log({ message: "live erasure failed", error_code: errorCode(error) });
+        }
+      }
+    }
+    return { groups, versions };
   }
 
   /** Erase what is queued and due. Returns how many items it erased or failed (not deferred). */

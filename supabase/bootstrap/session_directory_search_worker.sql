@@ -14,13 +14,14 @@
 --   attrs     NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
 --   settings  exactly one, role-wide: statement_timeout=2s (pg_db_role_setting,
 --             setdatabase = 0, setconfig = {statement_timeout=2s})
---   members   none; member of none. The authenticator binding (GRANT ... TO
---             authenticator, NOINHERIT, no ADMIN OPTION) is a separate, later step.
+--   members   member of none. The authenticator binding is separate. Supabase PG16+
+--             additionally has the exact postgres creator edge documented below.
 --   run as    a superuser: CNPG `postgres` (the superuser secret, or
---             postInitApplicationSQL for a new cluster). A non-superuser CREATEROLE
---             role is accepted only on PostgreSQL 15 and older, where creating a role
---             grants the creator nothing. On 16+ it would get ADMIN OPTION on the role,
---             which the migration's role guard refuses, so this file refuses it first.
+--             postInitApplicationSQL for a new cluster); a non-superuser CREATEROLE
+--             role on PostgreSQL 15 and older; or the exact Supabase PostgreSQL 16+
+--             compatibility path in session_directory_search_worker_supabase.sql.
+--             That path accepts only postgres's unavoidable ADMIN/no-INHERIT/no-SET
+--             creator edge when its grantor is the frozen superuser supabase_admin.
 --   when      before every migrate. It must run before the migration run that first
 --             applies supabase/migrations/20261030020000_session_directory_short_summary.sql
 --             (the migration fails closed, 42704, if the role is absent).
@@ -43,17 +44,22 @@ DECLARE
   v_problems text[] := '{}';
   v_row record;
   v_settings text;
+  v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
+  v_version int := current_setting('server_version_num')::int;
 BEGIN
   SELECT oid INTO v_oid FROM pg_roles WHERE rolname = 'session_directory_search_worker';
 
   IF v_oid IS NULL THEN
     SELECT rolsuper, rolcreaterole INTO v_me FROM pg_roles WHERE rolname = current_user;
     IF NOT v_me.rolsuper
-       AND NOT (v_me.rolcreaterole AND current_setting('server_version_num')::int < 160000) THEN
+       AND NOT (v_me.rolcreaterole AND v_version < 160000)
+       AND NOT (v_mode = 'supabase' AND v_version >= 160000
+                AND current_user = 'postgres' AND v_me.rolcreaterole
+                AND EXISTS (SELECT 1 FROM pg_roles
+                             WHERE rolname = 'supabase_admin' AND rolsuper)) THEN
       RAISE EXCEPTION USING ERRCODE = '42501',
         MESSAGE = format('bootstrap session_directory_search_worker: %I may not create it', current_user),
-        HINT = 'Run as a superuser. On PostgreSQL 16+ a non-superuser CREATEROLE creator is granted '
-               'ADMIN OPTION on the new role, which the migration refuses.';
+        HINT = 'Run as a superuser, or use the reviewed Supabase wrapper. The Supabase path is catalog-bound to postgres and supabase_admin.';
     END IF;
     CREATE ROLE session_directory_search_worker
       NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
@@ -89,18 +95,35 @@ BEGIN
                 WHERE m.member = v_oid LOOP
     v_problems := array_append(v_problems, format('member of %I', v_row.rolname)::text);
   END LOOP;
-  FOR v_row IN SELECT r.rolname, r.rolinherit, m.admin_option FROM pg_auth_members AS m
-                 JOIN pg_roles AS r ON r.oid = m.member
-                WHERE m.roleid = v_oid LOOP
-    IF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
-      v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
-    END IF;
-  END LOOP;
-  IF current_setting('server_version_num')::int >= 160000 THEN
+  IF v_version >= 160000 THEN
+    FOR v_row IN EXECUTE
+      'SELECT r.rolname, r.rolinherit, g.rolname AS grantor, g.rolsuper AS grantor_super,
+              m.admin_option, m.inherit_option, m.set_option
+         FROM pg_auth_members AS m
+         JOIN pg_roles AS r ON r.oid = m.member
+         JOIN pg_roles AS g ON g.oid = m.grantor
+        WHERE m.roleid = $1 ORDER BY r.rolname, g.rolname' USING v_oid LOOP
+      IF v_mode = 'supabase'
+         AND v_row.rolname = 'postgres'
+         AND v_row.grantor = 'supabase_admin' AND v_row.grantor_super
+         AND v_row.admin_option AND NOT v_row.inherit_option AND NOT v_row.set_option THEN
+        NULL; -- unavoidable PG16+ Supabase custom-role creator edge
+      ELSIF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
+        v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+      END IF;
+    END LOOP;
     FOR v_row IN EXECUTE
       'SELECT r.rolname FROM pg_auth_members AS m JOIN pg_roles AS r ON r.oid = m.member
         WHERE m.roleid = $1 AND m.inherit_option' USING v_oid LOOP
       v_problems := array_append(v_problems, format('granted WITH INHERIT to %I', v_row.rolname)::text);
+    END LOOP;
+  ELSE
+    FOR v_row IN SELECT r.rolname, r.rolinherit, m.admin_option FROM pg_auth_members AS m
+                   JOIN pg_roles AS r ON r.oid = m.member
+                  WHERE m.roleid = v_oid LOOP
+      IF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
+        v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+      END IF;
     END LOOP;
   END IF;
 

@@ -1,5 +1,6 @@
 /** HoopDb access: a pg Pool that satisfies the vendored SqlExecutor, plus readiness gates. */
 import { readFileSync } from "node:fs";
+import { RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
@@ -10,7 +11,6 @@ export interface HoopDb extends SqlExecutor {
   pool: pg.Pool;
   end(): Promise<void>;
 }
-
 /**
  * Runs `work` in one transaction on one pooled connection: COMMIT when it
  * resolves, ROLLBACK when it throws (then rethrows). Used by the migration
@@ -88,6 +88,8 @@ export const ROLE_VALIDATION_NAME = "session_directory_search_worker";
 export interface ExpectedSchema {
   names: string[];
   generation: string;
+  /** Exact database mode bound into the role verifier; absent/invalid never enables compatibility exceptions. */
+  dbMode?: "local" | "selfhosted" | "cloudsql" | "supabase";
 }
 
 export type SchemaVerdict =
@@ -115,6 +117,10 @@ const ROLE_VERIFY_SQL = readFileSync(ROLE_VERIFY_SQL_PATH, "utf8");
  * next migrate; this check turns readiness (and worker claiming) off at the next probe
  * instead (55000).
  */
+const RUNTIME_FUNCTION_REGPROCEDURES = RUNTIME_APPLICATION_FUNCTIONS.map(
+  (fn) => `'${fn.replaceAll("'", "''")}'::regprocedure`,
+).join(", ");
+
 export const SESSIONS_FUNCTION_GATE_SQL = `DO $sessions_fn_gate$
 DECLARE v text;
 BEGIN
@@ -125,7 +131,8 @@ BEGIN
           OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')
           OR (has_function_privilege(current_user, p.oid, 'EXECUTE')
               AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
-              AND NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)));
+              AND NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+              AND p.oid <> ALL (ARRAY[${RUNTIME_FUNCTION_REGPROCEDURES}]::oid[])));
   IF v IS NOT NULL THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'live gate: sessions functions executable by PUBLIC or the runtime role: ' || v;
@@ -184,6 +191,7 @@ export async function schemaVerdict(
     return await transact(async (tx): Promise<SchemaVerdict> => {
       await tx.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY");
       await tx.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
+      await tx.query("SELECT set_config('hoopdb.db_mode', $1, true)", [expected.dbMode ?? "unspecified"]);
       stage = "ledger";
       const have = new Set(
         (await tx.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((r) => r.name),

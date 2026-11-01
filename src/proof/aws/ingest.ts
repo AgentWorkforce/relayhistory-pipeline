@@ -155,6 +155,7 @@ export async function plantNextRevision(t: IngestTarget, p: PlantedSession, toke
  * different courier writer.
  */
 const MACHINE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const RELAYAUTH_ASSERTION_TTL_SECONDS = 60;
 
 export async function mintTenantToken(o: { relayauthUrl: string; bootstrapKey: string; orgId: string; workspaceId: string; machineId: string; sponsorId: string; historyOrigin: string; fetch?: Fetch }): Promise<string> {
   if (!MACHINE_ID.test(o.machineId) || o.machineId.startsWith("relay_")) throw new IngestError("machine_id_invalid", 0);
@@ -162,7 +163,7 @@ export async function mintTenantToken(o: { relayauthUrl: string; bootstrapKey: s
   const res = await f(`${o.relayauthUrl}/v1/tokens/relayhistory-assertion`, {
     method: "POST",
     headers: { "x-api-key": o.bootstrapKey, "content-type": "application/json" },
-    body: JSON.stringify({ orgId: o.orgId, workspaceId: o.workspaceId, machineId: o.machineId, sponsorId: o.sponsorId, scopes: ["rth:sync", "rth:read"], expiresIn: 3600, historyOrigin: o.historyOrigin }),
+    body: JSON.stringify({ orgId: o.orgId, workspaceId: o.workspaceId, machineId: o.machineId, sponsorId: o.sponsorId, scopes: ["rth:sync", "rth:read"], expiresIn: RELAYAUTH_ASSERTION_TTL_SECONDS, historyOrigin: o.historyOrigin }),
   });
   if (res.status !== 201) throw new IngestError(await errorCode(res), res.status);
   const { accessToken } = (await res.json()) as { accessToken?: string };

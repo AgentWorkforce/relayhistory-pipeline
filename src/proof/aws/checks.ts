@@ -45,6 +45,8 @@ export interface Ctx {
   tokens: Map<string, string>;
   /** One RelayAuth assertion per planted machine, used only for that machine's writes. */
   machineTokens: Map<string, string>;
+  /** Local refresh deadline for each 60-second machine assertion. */
+  machineTokenExpiresAt: Map<string, number>;
   /** Set by planted-trace: sessions confirmed searchable, the baseline later checks compare to. */
   searchable?: Set<string>;
   sleep: (ms: number) => Promise<void>;
@@ -71,6 +73,7 @@ export function newCtx(cfg: ProofConfig, runner: Runner, runId: string, env: Rec
     uploads: new Map(),
     tokens: new Map(),
     machineTokens: new Map(),
+    machineTokenExpiresAt: new Map(),
     diagnosticSearches: 0,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     now: () => Date.now(),
@@ -237,6 +240,10 @@ export async function publicIngress(ctx: Ctx): Promise<CheckResult> {
     return r.done(r.failures.length ? "fail" : "blocked", reachesProof ? "active probes not allowed in this mode" : `${host} does not resolve to the proof ALB (proxied or pointed elsewhere); active probes refused, ALB configuration checked only`);
   }
   const base = `https://${host}`;
+  if (ctx.tokens.size) {
+    const tokenIssue = await refreshTokens(ctx);
+    if (tokenIssue) r.failures.push(`RelayAuth token refresh: ${tokenIssue}`);
+  }
   const healthz = await fetch(`${base}/healthz`).then((x) => x.status, () => undefined);
   const other = ctx.corpus.find((p) => tenantKey(p.tenant) === tenantKey(c.tenants[1]!))!;
   const routes = ingestRoutes({ otherTraceId: other.traceId, otherManifestKey: manifestKey(locationOf(other)), other: locationOf(other) });
@@ -444,14 +451,23 @@ export async function tokensFor(ctx: Ctx, relayauthUrl: string, f?: Fetch): Prom
   if (!bootstrapKey) return "PROOF_RELAYAUTH_BOOTSTRAP_KEY is not set (pipe it from 1Password; never a file)";
   if (!ctx.secrets.includes(bootstrapKey)) ctx.secrets.push(bootstrapKey);
   const machines = new Map<string, Tenant>();
+  const firstMachine = new Map<string, string>();
   for (const p of ctx.corpus) {
     const existing = machines.get(p.machineId);
     if (existing && tenantKey(existing) !== tenantKey(p.tenant)) return `machine ${p.machineId} is planted for two tenants`;
     machines.set(p.machineId, p.tenant);
+    if (!firstMachine.has(tenantKey(p.tenant)))
+      firstMachine.set(tenantKey(p.tenant), p.machineId);
   }
   for (const [machineId, t] of machines) {
-    if (ctx.machineTokens.has(machineId)) continue;
-    const g = ctx.runner.gate({ id: `relayauth.mint.${t.orgId}.${machineId}`, argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`], mutating: true, touches: [`relayauth:${ctx.cfg.relayauth.namespace} (1h token for ${t.orgId}, bound to ${machineId})`], approval: "khaliq" });
+    const cached = ctx.machineTokens.get(machineId);
+    const fresh = cached && (ctx.machineTokenExpiresAt.get(machineId) ?? 0) - ctx.now() > 10_000;
+    if (fresh) {
+      if (firstMachine.get(tenantKey(t)) === machineId)
+        ctx.tokens.set(tenantKey(t), cached);
+      continue;
+    }
+    const g = ctx.runner.gate({ id: `relayauth.mint.${t.orgId}.${machineId}`, argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`], mutating: true, touches: [`relayauth:${ctx.cfg.relayauth.namespace} (60s token for ${t.orgId}, bound to ${machineId})`], approval: "khaliq" });
     if (!g.allowed) {
       ctx.runner.note(g.record);
       return "token minting not allowed in this mode";
@@ -460,7 +476,9 @@ export async function tokensFor(ctx: Ctx, relayauthUrl: string, f?: Fetch): Prom
       const tok = await mintTenantToken({ relayauthUrl, bootstrapKey, orgId: t.orgId, workspaceId: t.workspaceId, machineId, sponsorId, historyOrigin: ctx.cfg.historyOrigin, ...(f ? { fetch: f } : {}) });
       ctx.secrets.push(tok);
       ctx.machineTokens.set(machineId, tok);
-      if (!ctx.tokens.has(tenantKey(t))) ctx.tokens.set(tenantKey(t), tok);
+      ctx.machineTokenExpiresAt.set(machineId, ctx.now() + 60_000);
+      if (firstMachine.get(tenantKey(t)) === machineId)
+        ctx.tokens.set(tenantKey(t), tok);
       ctx.runner.note(g.record);
     } catch (e) {
       ctx.runner.note({ ...g.record, status: "failed", code: e instanceof IngestError ? e.code : "mint_error" });
@@ -468,6 +486,25 @@ export async function tokensFor(ctx: Ctx, relayauthUrl: string, f?: Fetch): Prom
     }
   }
   return undefined;
+}
+
+async function refreshTokens(ctx: Ctx): Promise<string | undefined> {
+  // Tests and diagnostic-only callers may inject opaque credentials without a mint
+  // lifetime. Only tokens minted by tokensFor participate in automatic refresh.
+  if (!ctx.machineTokenExpiresAt.size) return undefined;
+  const ra = await portForward(
+    ctx,
+    ctx.cfg.relayauth.namespace,
+    ctx.cfg.relayauth.service,
+    ctx.cfg.relayauth.port,
+    18787,
+  );
+  try {
+    if (!ra) return "port-forward to relayauth was not allowed";
+    return await tokensFor(ctx, ra.url);
+  } finally {
+    ra?.stop();
+  }
 }
 
 /**
@@ -478,7 +515,7 @@ export async function tokensFor(ctx: Ctx, relayauthUrl: string, f?: Fetch): Prom
 export async function unlistedOrgProbe(ctx: Ctx, relayauthUrl: string, ingestUrl: string, f: Fetch = fetch): Promise<{ status: number; code: string }> {
   const bootstrapKey = ctx.env.PROOF_RELAYAUTH_BOOTSTRAP_KEY;
   if (!bootstrapKey) return { status: 0, code: "no_bootstrap_key" };
-  const g = ctx.runner.gate({ id: "ingest.unlisted-org", argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`, "+", `${ingestUrl}/v1/pipeline/chunks`], mutating: true, touches: [`relayauth (1h token for unlisted ${PROOF_UNLISTED_ORG})`, "alleyoop-ingest (empty chunk, expected refusal)"], approval: "khaliq" });
+  const g = ctx.runner.gate({ id: "ingest.unlisted-org", argv: ["HTTP", "POST", `${relayauthUrl}/v1/tokens/relayhistory-assertion`, "+", `${ingestUrl}/v1/pipeline/chunks`], mutating: true, touches: [`relayauth (60s token for unlisted ${PROOF_UNLISTED_ORG})`, "alleyoop-ingest (empty chunk, expected refusal)"], approval: "khaliq" });
   ctx.runner.note(g.record);
   if (!g.allowed) return { status: 0, code: "not_allowed_in_mode" };
   let tok: string;
@@ -611,7 +648,9 @@ export async function plantedTrace(ctx: Ctx): Promise<CheckResult> {
   r.metrics.directoryPresent = db.directoryPresent;
   r.metrics.searchRpcPresent = db.searchRpcPresent;
   r.metrics.searchMode = c.search.mode;
-  const found = searchChecked ? await searchOwn(ctx, pod, ctx.corpus, "own") : new Map();
+  const searchTokenIssue = searchChecked ? await refreshTokens(ctx) : undefined;
+  if (searchTokenIssue) r.failures.push(`RelayAuth token refresh: ${searchTokenIssue}`);
+  const found = searchChecked && !searchTokenIssue ? await searchOwn(ctx, pod, ctx.corpus, "own") : new Map();
   const expected = new Map<string, string>();
   if (c.extractiveSummaries) for (const p of ctx.corpus) expected.set(p.sessionId, await expectedShortSummary(p, 1));
   const obs = new Map<string, SessionObservation>();
@@ -660,6 +699,8 @@ export async function tenantIsolation(ctx: Ctx): Promise<CheckResult> {
     return r.done("planned", "searches, by-id and manifest-status probes across tenants; scans logs and the S3 trace archive for planted canaries");
   }
   if (ctx.tokens.size < c.tenants.length) return notRun(ctx, r, "needs planted sessions and tenant tokens (run planted-trace first)");
+  const tokenIssue = await refreshTokens(ctx);
+  if (tokenIssue) return r.done("blocked", `RelayAuth token refresh: ${tokenIssue}`);
   const pod = primary(ctx);
   const owner = new Map(ctx.corpus.map((p) => [p.sessionId, p.tenant]));
   const canaries = new Map<string, string[]>();
@@ -763,6 +804,8 @@ export async function v1SearchScope(ctx: Ctx): Promise<CheckResult> {
     return r.done("planned", "full-transcript search: UNSUPPORTED (V2 absent); probes that transcript-only text is not searchable");
   }
   if (!ctx.searchable) return r.done("blocked", "full-transcript search: UNSUPPORTED (V2 absent); probe needs planted-trace with V1 search reachable");
+  const tokenIssue = await refreshTokens(ctx);
+  if (tokenIssue) return r.done("blocked", `RelayAuth token refresh: ${tokenIssue}`);
   const pod = primary(ctx);
   const probes: Array<{ hits: number; error?: string }> = [];
   for (const t of ctx.cfg.tenants) {
@@ -898,7 +941,10 @@ export async function staleSummary(ctx: Ctx): Promise<CheckResult> {
     const o = ctx.runner.run(deleteStep(p));
     if (!o.ok && o.record.status !== "planned") r.failures.push(`could not invalidate summary object for ${p.sessionId}: ${o.record.code}`);
   }
-  const plantErr = await withForwards(ctx, async (ingest) => plantRevision(ctx, ingest.url, chosen, 2));
+  const plantErr = await withForwards(ctx, async (ingest, ra) => {
+    const tokenIssue = await tokensFor(ctx, ra.url);
+    return tokenIssue ? [tokenIssue] : plantRevision(ctx, ingest.url, chosen, 2);
+  });
   if (!plantErr) return r.done("blocked", "port-forward not allowed");
   if (plantErr.length) r.failures.push(`revision 2 not accepted for ${plantErr.length} session(s)`);
   const expected2 = new Map<string, string>();
@@ -907,6 +953,11 @@ export async function staleSummary(ctx: Ctx): Promise<CheckResult> {
   const verdicts = new Map<string, ReturnType<typeof evaluateStaleSummary>>();
   while (true) {
     const now = readDb(ctx, pod, chosen, "stale.poll");
+    const tokenIssue = await refreshTokens(ctx);
+    if (tokenIssue) {
+      r.failures.push(`RelayAuth token refresh: ${tokenIssue}`);
+      break;
+    }
     const search = await searchOwn(ctx, pod, chosen, "stale");
     const reached = ctx.now() >= deadline;
     for (const p of chosen) {
@@ -967,6 +1018,12 @@ export async function restartPersistence(ctx: Ctx): Promise<CheckResult> {
   if (!va.ok) r.failures.push(...va.failures.map((f) => `relaycast after restart: ${f}`));
   const pod = primary(ctx);
   const baseline = ctx.corpus.filter((p) => ctx.searchable!.has(p.sessionId));
+  const tokenIssue = await refreshTokens(ctx);
+  if (tokenIssue)
+    return r.done(
+      r.failures.length ? "fail" : "blocked",
+      `RelayAuth token refresh before post-restart search: ${tokenIssue}`,
+    );
   const found = await searchOwn(ctx, pod, baseline, "after-restart");
   const lost = baseline.filter((p) => !found.get(p.sessionId)?.found);
   if (lost.length) r.failures.push(`${lost.length}/${baseline.length} planted sessions no longer searchable after restarts; first: ${lost.slice(0, 5).map((p) => p.sessionId).join(", ")}`);
@@ -994,7 +1051,13 @@ export async function upgradeRollback(ctx: Ctx): Promise<CheckResult> {
   if (!prior) return r.done("blocked", "could not read the current helm revision");
   const baseline = ctx.corpus.filter((p) => ctx.searchable!.has(p.sessionId));
   const steps = upgradeRollbackSteps(c, prior);
+  let refreshIssue: string | undefined;
   const verify = async (label: string) => {
+    const tokenIssue = await refreshTokens(ctx);
+    if (tokenIssue) {
+      refreshIssue ??= `RelayAuth token refresh before post-${label} search: ${tokenIssue}`;
+      return;
+    }
     const found = await searchOwn(ctx, primary(ctx), baseline, label);
     const lost = baseline.filter((p) => !found.get(p.sessionId)?.found).length;
     r.metrics[`searchable.${label}`] = baseline.length - lost;
@@ -1006,6 +1069,8 @@ export async function upgradeRollback(ctx: Ctx): Promise<CheckResult> {
   await verify("rollback");
   const after = ctx.runner.run(helmHistoryStep(c));
   r.ev("helm-history.json", after.stdout);
+  if (refreshIssue)
+    return r.done(r.failures.length ? "fail" : "blocked", refreshIssue);
   return r.done(r.failures.length ? "fail" : "pass", `upgraded to ${c.candidateChartVersion} and rolled back to revision ${prior}; data intact`);
 }
 

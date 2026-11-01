@@ -17,7 +17,7 @@
  */
 import { spawnSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
@@ -32,7 +32,10 @@ import {
   MARKER_PENDING_SQL,
 } from "../../src/hoopdb/migrate.ts";
 import { NON_CREATE_STEPS } from "../../src/hoopdb/migration-sentinels.ts";
-import { sessionsFunctionAcl } from "../../src/hoopdb/migrate-guards.ts";
+import {
+  RUNTIME_APPLICATION_FUNCTIONS,
+  sessionsFunctionAcl,
+} from "../../src/hoopdb/migrate-guards.ts";
 import { gateOpen, workerTick } from "../../src/shared/worker.ts";
 import { hoopdbModeEnv } from "../../stacks/aws/eks.ts";
 import { gcpHoopdbModeEnv } from "../../stacks/gcp/config.ts";
@@ -44,6 +47,21 @@ const SUPER = process.env.PGPROOF_SUPERUSER ?? "postgres";
 const PSQL = process.env.PGPROOF_PSQL ?? "psql";
 const OUT = process.env.PGPROOF_OUT ?? "pg-proof.json";
 const W = "session_directory_search_worker";
+const functionManifestForRuntime = (role: string) => {
+  const base = JSON.parse(
+    readFileSync(join(ROOT, "src/hoopdb/sessions-function-acl.json"), "utf8"),
+  ).functions as Record<string, string[]>;
+  return Object.fromEntries(
+    Object.entries(base).map(([fn, entries]) => [
+      fn,
+      RUNTIME_APPLICATION_FUNCTIONS.includes(
+        fn as (typeof RUNTIME_APPLICATION_FUNCTIONS)[number],
+      )
+        ? [...entries, `${role}:EXECUTE`]
+        : entries,
+    ]),
+  );
+};
 const url = (user: string, db: string) =>
   `postgres://${user}@${HOST}:${PORT}/${db}`;
 const BOOT = join(
@@ -51,6 +69,14 @@ const BOOT = join(
   "supabase/bootstrap/session_directory_search_worker.sql",
 );
 const RUNTIME_BOOT = join(ROOT, "supabase/bootstrap/hoopdb_runtime_role.sql");
+const SUPABASE_RUNTIME_BOOT = join(
+  ROOT,
+  "supabase/bootstrap/hoopdb_runtime_role_supabase.sql",
+);
+const CLOUDSQL_ROLES_BOOT = join(
+  ROOT,
+  "supabase/bootstrap/cloudsql_migration_roles.sql",
+);
 const MARK_PASS = join(
   ROOT,
   "supabase/bootstrap/session_directory_search_worker_mark_pass.sql",
@@ -130,6 +156,7 @@ function psql(
 function migrate(
   db: string,
   env: Record<string, string>,
+  user = "hoop",
 ): { exit: number; code: string } {
   const clean = Object.fromEntries(
     Object.entries(process.env).filter(([k]) => !k.startsWith("HOOPDB_")),
@@ -137,7 +164,7 @@ function migrate(
   const r = spawnSync("bun", ["src/hoopdb/migrate.ts"], {
     cwd: ROOT,
     encoding: "utf8",
-    env: { ...clean, HOOPDB_URL: url("hoop", db), ...env },
+    env: { ...clean, HOOPDB_URL: url(user, db), ...env },
   });
   const codes = [
     ...`${r.stdout}${r.stderr}`.matchAll(/"error_code":"([^"]+)"/g),
@@ -235,6 +262,140 @@ async function snapshot(db: string): Promise<string> {
   return (await sql(db, `SELECT md5(${parts.join(" || ")}) AS s`)).rows[0]
     .s as string;
 }
+
+function historicalShortSummary(current: string): string {
+  const replaceOnce = (source: string, from: string, to: string) => {
+    if (source.split(from).length !== 2)
+      throw new Error(
+        "historical 020000 reconstruction no longer has one exact source match",
+      );
+    return source.replace(from, to);
+  };
+  let old = replaceOnce(
+    current,
+    `-- refused. It is a member of no role. Allowed members are \`authenticator\` under the
+-- existing contract and, only when the migrator binds exact \`supabase\` mode on PG16+,
+-- the unavoidable postgres creator edge granted by superuser supabase_admin with ADMIN
+-- true and INHERIT/SET false. It owns no objects and holds no explicit privileges, except USAGE on schema`,
+    `-- refused. It is a member of no role. Its only member may be \`authenticator\`,
+-- NOINHERIT, without ADMIN OPTION (and on PostgreSQL 16+ without INHERIT on the grant).
+-- So no other role, the migration owner included, holds membership or ADMIN OPTION on
+-- it. It owns no objects and holds no explicit privileges, except USAGE on schema`,
+  );
+  old = replaceOnce(
+    old,
+    `  v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
+  v_version int := current_setting('server_version_num')::int;
+`,
+    "",
+  );
+  const newGrantGuard = `  IF v_version >= 160000 THEN
+    FOR v_row IN EXECUTE
+      'SELECT r.rolname, r.rolinherit, g.rolname AS grantor, g.rolsuper AS grantor_super,
+              m.admin_option, m.inherit_option, m.set_option
+         FROM pg_auth_members AS m
+         JOIN pg_roles AS r ON r.oid = m.member
+         JOIN pg_roles AS g ON g.oid = m.grantor
+        WHERE m.roleid = $1 ORDER BY r.rolname, g.rolname' USING v_oid LOOP
+      IF v_mode = 'supabase'
+         AND v_row.rolname = 'postgres'
+         AND v_row.grantor = 'supabase_admin' AND v_row.grantor_super
+         AND v_row.admin_option AND NOT v_row.inherit_option AND NOT v_row.set_option THEN
+        NULL;
+      ELSIF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
+        v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+      END IF;
+    END LOOP;
+  ELSE
+    FOR v_row IN SELECT r.rolname, r.rolinherit, m.admin_option FROM pg_auth_members AS m
+                   JOIN pg_roles AS r ON r.oid = m.member
+                  WHERE m.roleid = v_oid LOOP
+      IF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
+        v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+      END IF;
+    END LOOP;
+  END IF;`;
+  const oldGrantGuard = `  FOR v_row IN SELECT r.rolname, r.rolinherit, m.admin_option FROM pg_auth_members AS m
+                 JOIN pg_roles AS r ON r.oid = m.member
+                WHERE m.roleid = v_oid LOOP
+    IF v_row.rolname <> 'authenticator' OR v_row.rolinherit OR v_row.admin_option THEN
+      v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+    END IF;
+  END LOOP;`;
+  old = replaceOnce(old, newGrantGuard, oldGrantGuard);
+  return replaceOnce(
+    old,
+    "  IF v_version >= 160000 THEN",
+    "  IF current_setting('server_version_num')::int >= 160000 THEN",
+  );
+}
+
+async function sessionsCatalogSnapshot(
+  db: string,
+): Promise<Record<string, string>> {
+  const queries: Record<string, string> = {
+    namespace: `SELECT nspname, pg_get_userbyid(nspowner) owner, nspacl::text
+                  FROM pg_namespace WHERE nspname='sessions' ORDER BY nspname`,
+    default_acl: `SELECT pg_get_userbyid(d.defaclrole) owner,
+                         coalesce(n.nspname, '') namespace,
+                         d.defaclobjtype, d.defaclacl::text
+                    FROM pg_default_acl d
+                    LEFT JOIN pg_namespace n ON n.oid=d.defaclnamespace
+                   WHERE d.defaclnamespace=0 OR n.nspname='sessions'
+                   ORDER BY 1,2,3,4`,
+    class: `SELECT c.relname, c.relkind, c.relpersistence, pg_get_userbyid(c.relowner) owner,
+                   c.relacl::text, c.reloptions::text, c.relrowsecurity, c.relforcerowsecurity,
+                   c.relreplident, pg_get_expr(c.relpartbound, c.oid) partbound
+              FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+             WHERE n.nspname='sessions' ORDER BY c.relname`,
+    attribute: `SELECT c.relname, a.attnum, a.attname, a.atttypid::regtype::text,
+                       a.attnotnull, a.attidentity, a.attgenerated, a.attacl::text,
+                       pg_get_expr(d.adbin,d.adrelid) default_expr
+                  FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                  JOIN pg_attribute a ON a.attrelid=c.oid
+                  LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum
+                 WHERE n.nspname='sessions' AND a.attnum>0 AND NOT a.attisdropped
+                 ORDER BY c.relname,a.attnum`,
+    proc: `SELECT p.proname, pg_get_function_identity_arguments(p.oid) args,
+                  pg_get_function_result(p.oid) result, p.prosrc, p.proconfig::text,
+                  p.prosecdef, p.proleakproof, p.provolatile, p.proparallel, p.proacl::text
+             FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+            WHERE n.nspname='sessions' ORDER BY p.proname,args`,
+    constraints: `SELECT c.relname, x.conname, x.contype, x.condeferrable,
+                         x.condeferred, x.convalidated, pg_get_constraintdef(x.oid,true) def
+                    FROM pg_constraint x LEFT JOIN pg_class c ON c.oid=x.conrelid
+                    JOIN pg_namespace n ON n.oid=x.connamespace
+                   WHERE n.nspname='sessions' ORDER BY c.relname,x.conname`,
+    indexes: `SELECT t.relname table_name, i.relname index_name, pg_get_indexdef(i.oid) def
+                FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid
+                JOIN pg_class t ON t.oid=x.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+               WHERE n.nspname='sessions' ORDER BY t.relname,i.relname`,
+    triggers: `SELECT c.relname, t.tgname, pg_get_triggerdef(t.oid,true) def
+                 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+                 JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='sessions' AND NOT t.tgisinternal ORDER BY c.relname,t.tgname`,
+    policies: `SELECT c.relname, p.polname, p.polpermissive, p.polcmd,
+                      ARRAY(SELECT pg_get_userbyid(x) FROM unnest(p.polroles) x ORDER BY 1)::text roles,
+                      pg_get_expr(p.polqual,p.polrelid) qual,
+                      pg_get_expr(p.polwithcheck,p.polrelid) with_check
+                 FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid
+                 JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='sessions' ORDER BY c.relname,p.polname`,
+    comments: `SELECT pg_describe_object(d.classoid,d.objoid,d.objsubid) object, d.description
+                 FROM pg_description d
+                WHERE (d.classoid='pg_class'::regclass AND d.objoid IN
+                         (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='sessions'))
+                   OR (d.classoid='pg_proc'::regclass AND d.objoid IN
+                         (SELECT p.oid FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions'))
+                ORDER BY 1,2`,
+  };
+  const out: Record<string, string> = {};
+  for (const [name, query] of Object.entries(queries))
+    out[name] = createHash("sha256")
+      .update(JSON.stringify((await sql(db, query, "hoop")).rows))
+      .digest("hex");
+  return out;
+}
 async function verdict(
   db: string,
   user = "hoop",
@@ -294,6 +455,11 @@ for (const r of [
   "g6_bad",
   "g6_m",
   "g6_never",
+  "g6_workload",
+  "g6_second_workload",
+  "g6_workload_rt",
+  "bulls96_runtime_workload",
+  "bulls96_workload",
   "g6_other",
   "g6_caller",
   "g6_unrel",
@@ -303,6 +469,11 @@ for (const r of [
   "g6_nobody",
   "supabase_admin",
   "ops_admin",
+  "g6_cloud_owner",
+  "g6_cloud_rt",
+  "cloudsqladmin",
+  "cloudsqlsuperuser",
+  "bulls96_cloudsql_role_seed",
 ]) {
   for (const d of (
     await sql("postgres", "SELECT datname FROM pg_database WHERE datallowconn")
@@ -321,6 +492,111 @@ await sql(
   `DO $x$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hoop') THEN CREATE ROLE hoop LOGIN; END IF; END $x$;
   ALTER ROLE hoop NOSUPERUSER NOCREATEROLE NOCREATEDB NOBYPASSRLS`,
 );
+
+// Cloud SQL is pinned to PostgreSQL 17. Prove its complete fresh-database profile with
+// the migration owner as a real non-superuser session (not SET ROLE): the disposable
+// CREATEROLE trampoline must leave every compatibility role membership-free, the generic
+// BYPASSRLS shim stays off, and the full migrator must pass.
+await check(
+  "Cloud SQL PG17: non-superuser operator bootstrap and full profile pass without the generic shim",
+  async () => {
+    if (MAJOR < 17)
+      return [
+        true,
+        `skipped: Cloud SQL proof is pinned to PostgreSQL 17 (server is ${MAJOR})`,
+      ];
+    await sql(
+      "postgres",
+      `CREATE ROLE cloudsqlsuperuser NOLOGIN;
+       CREATE ROLE cloudsqladmin SUPERUSER NOLOGIN;
+       CREATE ROLE g6_cloud_owner LOGIN CREATEROLE NOBYPASSRLS;
+       GRANT cloudsqlsuperuser TO g6_cloud_owner;
+       CREATE ROLE g6_cloud_rt LOGIN NOCREATEROLE NOCREATEDB NOBYPASSRLS`,
+    );
+    await sql("postgres", "CREATE DATABASE g6_cloud OWNER g6_cloud_owner");
+    await sql(
+      "g6_cloud",
+      `REVOKE TEMPORARY ON DATABASE g6_cloud FROM PUBLIC;
+       GRANT CONNECT ON DATABASE g6_cloud TO g6_cloud_rt;
+       ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`,
+    );
+    await sql(
+      "g6_cloud",
+      "ALTER DEFAULT PRIVILEGES FOR ROLE g6_cloud_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+      "g6_cloud_owner",
+    );
+    const boot = psql(
+      "g6_cloud",
+      ["-f", CLOUDSQL_ROLES_BOOT],
+      "g6_cloud_owner",
+    );
+    const phase1 = psql("g6_cloud", ["-f", BOOT], "g6_cloud_owner");
+    const env = {
+      ...Object.fromEntries(
+        gcpHoopdbModeEnv("g6_cloud_rt", true).map((e) => [e.name, e.value]),
+      ),
+      HOOPDB_SUPABASE_SHIM: "false",
+    };
+    const m = migrate("g6_cloud", env, "g6_cloud_owner");
+    const again = psql(
+      "g6_cloud",
+      ["-f", CLOUDSQL_ROLES_BOOT],
+      "g6_cloud_owner",
+    );
+    const targets = (
+      await sql(
+        "g6_cloud",
+        `SELECT role.rolname, role.rolbypassrls,
+                (SELECT count(*)::int FROM pg_auth_members membership
+                  WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
+           FROM pg_roles role
+          WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker')
+          ORDER BY 1`,
+      )
+    ).rows;
+    const seed = (
+      await sql(
+        "g6_cloud",
+        "SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'bulls96_cloudsql_role_seed'",
+      )
+    ).rows[0].n;
+    const v = await verdict("g6_cloud", "g6_cloud_owner");
+    const ok =
+      boot.ok &&
+      phase1.ok &&
+      again.ok &&
+      m.exit === 0 &&
+      v.ok &&
+      seed === 0 &&
+      targets.length === 4 &&
+      targets.every(
+        (role) => role.memberships === 0 && role.rolbypassrls === false,
+      );
+    return [
+      ok,
+      `bootstrap=${boot.ok} phase1=${phase1.ok} rerun=${again.ok} migrate=${fmt(m)} verdict=${fmt(v)} seed=${seed} targets=${fmt(targets)}`,
+    ];
+  },
+);
+if (MAJOR >= 17) {
+  await attempt("postgres", "DROP DATABASE IF EXISTS g6_cloud WITH (FORCE)");
+  for (const role of [
+    "session_directory_search_worker",
+    "service_role",
+    "authenticated",
+    "anon",
+    "g6_cloud_rt",
+    "g6_cloud_owner",
+    "cloudsqladmin",
+    "cloudsqlsuperuser",
+    "bulls96_cloudsql_role_seed",
+  ])
+    await attempt("postgres", `DROP ROLE IF EXISTS ${role}`);
+  await sql(
+    "postgres",
+    "ALTER DEFAULT PRIVILEGES FOR ROLE postgres GRANT EXECUTE ON FUNCTIONS TO PUBLIC",
+  );
+}
 if (
   !psql("postgres", ["-f", join(ROOT, "supabase/tests/supabase_shim.sql")]).ok
 )
@@ -388,6 +664,83 @@ await check(
     return [
       !r.ok && r.out.includes("may not create"),
       r.out.trim().split("\n").at(-1) ?? "",
+    ];
+  },
+);
+await check(
+  "runtime-role bootstrap preserves the exact optional workload membership and rejects member/option drift",
+  async () => {
+    await sql(
+      "postgres",
+      "CREATE ROLE g6_workload LOGIN INHERIT; CREATE ROLE g6_second_workload LOGIN INHERIT",
+    );
+    const args = [
+      "-v",
+      "runtime_role=g6_workload_rt",
+      "-v",
+      "runtime_login=false",
+      "-v",
+      "workload_role=g6_workload",
+      "-f",
+      RUNTIME_BOOT,
+    ];
+    const create = psql("g6_boot", args);
+    await sql(
+      "postgres",
+      MAJOR >= 16
+        ? "GRANT g6_workload_rt TO g6_workload WITH INHERIT TRUE, SET TRUE"
+        : "GRANT g6_workload_rt TO g6_workload",
+    );
+    const rerun = psql("g6_boot", args);
+
+    await sql("postgres", "GRANT g6_workload_rt TO g6_second_workload");
+    const second = psql("g6_boot", args);
+    await sql("postgres", "REVOKE g6_workload_rt FROM g6_second_workload");
+
+    await sql(
+      "postgres",
+      "GRANT g6_workload_rt TO g6_workload WITH ADMIN OPTION",
+    );
+    const admin = psql("g6_boot", args);
+    await sql(
+      "postgres",
+      "REVOKE ADMIN OPTION FOR g6_workload_rt FROM g6_workload",
+    );
+
+    let wrongInherit: { ok: boolean; out: string };
+    let wrongSet = { ok: false, out: "PG15 has no per-edge SET option" };
+    if (MAJOR >= 16) {
+      await sql(
+        "postgres",
+        "GRANT g6_workload_rt TO g6_workload WITH INHERIT FALSE, SET TRUE",
+      );
+      wrongInherit = psql("g6_boot", args);
+      await sql(
+        "postgres",
+        "GRANT g6_workload_rt TO g6_workload WITH INHERIT TRUE, SET FALSE",
+      );
+      wrongSet = psql("g6_boot", args);
+      await sql(
+        "postgres",
+        "GRANT g6_workload_rt TO g6_workload WITH INHERIT TRUE, SET TRUE",
+      );
+    } else {
+      await sql("postgres", "ALTER ROLE g6_workload NOINHERIT");
+      wrongInherit = psql("g6_boot", args);
+      await sql("postgres", "ALTER ROLE g6_workload INHERIT");
+    }
+    const recovered = psql("g6_boot", args);
+    const refused = (r: { ok: boolean; out: string }) =>
+      !r.ok && r.out.includes("does not match the spec");
+    return [
+      create.ok &&
+        rerun.ok &&
+        refused(second) &&
+        refused(admin) &&
+        refused(wrongInherit) &&
+        (MAJOR < 16 || refused(wrongSet)) &&
+        recovered.ok,
+      `create=${create.ok} rerun=${rerun.ok} second=${refused(second)} admin=${refused(admin)} inherit=${refused(wrongInherit)} set=${MAJOR < 16 ? "n/a" : refused(wrongSet)} recovered=${recovered.ok}`,
     ];
   },
 );
@@ -543,14 +896,14 @@ const HOSTILE: Array<[string, string]> = [
   ],
   ["CREATE on schema sessions", "GRANT CREATE ON SCHEMA sessions TO g6_bad"],
   ["CREATE on the database", "GRANT CREATE ON DATABASE g6_rt_db TO g6_bad"],
-  ["existing DML", "GRANT INSERT ON sessions.session_index TO g6_bad"],
+  ["unapproved table privilege", "GRANT TRUNCATE ON sessions.session_index TO g6_bad"],
   [
     "a column privilege",
     "GRANT SELECT (org_id) ON sessions.session_directory TO g6_bad",
   ],
   [
     "unapproved EXECUTE",
-    "GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO g6_bad",
+    "GRANT EXECUTE ON FUNCTION sessions.session_directory_readiness() TO g6_bad",
   ],
   [
     "EXECUTE on a trigger function (no exemption)",
@@ -633,7 +986,7 @@ for (const [name, setup] of HOSTILE)
     },
   );
 await check(
-  "the dedicated runtime role, connected as itself: SELECT only, no DML/DDL/EXECUTE, owns nothing, live gate ok",
+  "the dedicated runtime role gets exact application DML/sequence/RPC access, read-only readiness metadata, no DDL/maintenance/ownership/BYPASSRLS, live gate ok",
   async () => {
     const t = [
       "sessions.__96bulls_migrations",
@@ -661,11 +1014,23 @@ await check(
       "CREATE TABLE sessions.g6_x (x int)",
       "g6_rt",
     );
-    got["EXECUTE upsert_session_index"] = await attempt(
-      "g6_rt_db",
-      "SELECT sessions.upsert_session_index('{}'::jsonb)",
-      "g6_rt",
-    );
+    const acl = (
+      await sql(
+        "g6_rt_db",
+        `SELECT
+           has_table_privilege('g6_rt', 'sessions.pipeline_jobs', 'SELECT, INSERT, UPDATE, DELETE') AS queue_dml,
+           has_table_privilege('g6_rt', 'sessions.claimless_uses', 'UPDATE') AS claimless_update,
+           has_table_privilege('g6_rt', 'sessions.migration_assertion_uses', 'SELECT, INSERT, UPDATE, DELETE') AS assertion_cleanup,
+           has_table_privilege('g6_rt', 'sessions.migration_assertion_chunks', 'SELECT, INSERT, UPDATE, DELETE') AS chunk_cleanup,
+           has_table_privilege('g6_rt', 'sessions.migration_base_read_uses', 'SELECT, INSERT, UPDATE, DELETE') AS base_read_cleanup,
+           has_table_privilege('g6_rt', 'sessions.migration_ingest_audit', 'UPDATE, DELETE') AS audit_mutation,
+           has_table_privilege('g6_rt', 'sessions.pipeline_jobs', 'TRUNCATE') AS queue_truncate,
+           has_sequence_privilege('g6_rt', 'sessions.pipeline_jobs_id_seq', 'USAGE') AS queue_sequence,
+           has_function_privilege('g6_rt', 'sessions.upsert_session_index(jsonb)', 'EXECUTE') AS index_rpc,
+           has_function_privilege('g6_rt', 'sessions.pipeline_events_maintain(interval,integer)', 'EXECUTE') AS maintenance_rpc,
+           has_function_privilege('g6_rt', 'sessions.pipeline_jobs_observability()', 'EXECUTE') AS trigger_execute`,
+      )
+    ).rows[0];
     const role = (
       await sql(
         "g6_rt_db",
@@ -677,10 +1042,21 @@ await check(
       Object.entries(got).every(([k, c]) =>
         k.endsWith("SELECT") ? c === "ok" : c === "42501",
       ) &&
+      acl.queue_dml === true &&
+      acl.claimless_update === true &&
+      acl.assertion_cleanup === true &&
+      acl.chunk_cleanup === true &&
+      acl.base_read_cleanup === true &&
+      acl.audit_mutation === false &&
+      acl.queue_truncate === false &&
+      acl.queue_sequence === true &&
+      acl.index_rpc === true &&
+      acl.maintenance_rpc === false &&
+      acl.trigger_execute === false &&
       role.rolbypassrls === false &&
       role.owned === 0 &&
       v.ok;
-    return [ok, `${fmt(got)} ${fmt(role)} verdict=${fmt(v)}`];
+    return [ok, `${fmt(got)} acl=${fmt(acl)} ${fmt(role)} verdict=${fmt(v)}`];
   },
 );
 
@@ -785,9 +1161,7 @@ await check(
 await check(
   "ACL manifest regression: every sessions function's ACL is exactly the committed manifest",
   async () => {
-    const want = JSON.parse(
-      readFileSync(join(ROOT, "src/hoopdb/sessions-function-acl.json"), "utf8"),
-    ).functions;
+    const want = functionManifestForRuntime("g6_rt");
     const h = openHoopDb(url("hoop", "g6_rt_db"));
     try {
       const got = await sessionsFunctionAcl(h);
@@ -1072,17 +1446,38 @@ await check(
     const pending = await verdict("g6_rt_db");
     const wrong = psql(
       "g6_rt_db",
-      ["-v", `generation=${"f".repeat(64)}`, "-f", MARK_PASS],
+      [
+        "-v",
+        `generation=${"f".repeat(64)}`,
+        "-v",
+        "db_mode=selfhosted",
+        "-f",
+        MARK_PASS,
+      ],
       "hoop",
     );
     const right = psql(
       "g6_rt_db",
-      ["-v", `generation=${await generation()}`, "-f", MARK_PASS],
+      [
+        "-v",
+        `generation=${await generation()}`,
+        "-v",
+        "db_mode=selfhosted",
+        "-f",
+        MARK_PASS,
+      ],
       "hoop",
     );
     const again = psql(
       "g6_rt_db",
-      ["-v", `generation=${await generation()}`, "-f", MARK_PASS],
+      [
+        "-v",
+        `generation=${await generation()}`,
+        "-v",
+        "db_mode=selfhosted",
+        "-f",
+        MARK_PASS,
+      ],
       "hoop",
     );
     const ready = await verdict("g6_rt_db");
@@ -1281,9 +1676,7 @@ await check(
   "blast radius: owner functions created later in sessions AND in a second schema are not PUBLIC-executable; intended grants survive the revoke and the next migrate (ACL manifest)",
   async () => {
     await fresh("g6_fb", ["g6_rt2"]);
-    const want = JSON.parse(
-      readFileSync(join(ROOT, "src/hoopdb/sessions-function-acl.json"), "utf8"),
-    ).functions;
+    const want = functionManifestForRuntime("g6_rt2");
     const aclOk = async () => {
       const h = openHoopDb(url("hoop", "g6_fb"));
       try {
@@ -1335,13 +1728,17 @@ await check(
   },
 );
 let BOUNDARY_EVIDENCE: unknown = null;
-const activationCheck = (db: string, extra: Record<string, string> = {}) => {
+const activationCheck = (
+  db: string,
+  extra: Record<string, string> = {},
+  user = "hoop",
+) => {
   const r = spawnSync("bun", ["src/hoopdb/migrate.ts", "--activation-check"], {
     cwd: ROOT,
     encoding: "utf8",
     env: {
       ...process.env,
-      HOOPDB_URL: url("hoop", db),
+      HOOPDB_URL: url(user, db),
       HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
       ...extra,
     },
@@ -1806,7 +2203,7 @@ await check(
     const direct = (
       await sql(
         "g6_mt",
-        "SELECT EXISTS (SELECT 1 FROM pg_class c, aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE c.oid = 'sessions.session_index'::regclass AND r.rolname = 'g6_rt2') AS d",
+        "SELECT EXISTS (SELECT 1 FROM pg_class c, aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE c.oid = 'sessions.session_index'::regclass AND r.rolname = 'g6_rt2' AND a.privilege_type = 'MAINTAIN') AS d",
       )
     ).rows[0].d;
     await attempt("postgres", "DROP DATABASE IF EXISTS g6_mt WITH (FORCE)");
@@ -1824,12 +2221,6 @@ for (const [name, env] of [
     "AWS CNPG fixture env (hoopdbModeEnv)",
     Object.fromEntries(
       hoopdbModeEnv(true, "g6_rt2", true).map((e) => [e.name, e.value]),
-    ),
-  ],
-  [
-    "GCP fixture env (gcpHoopdbModeEnv)",
-    Object.fromEntries(
-      gcpHoopdbModeEnv("g6_rt2", true).map((e) => [e.name, e.value]),
     ),
   ],
 ] as const)
@@ -1879,6 +2270,359 @@ for (const name of NON_CREATE_STEPS) {
 await attempt("postgres", "DROP DATABASE IF EXISTS g6_rt_db");
 await attempt("postgres", "DROP DATABASE IF EXISTS g6_mode");
 await attempt("postgres", "DROP DATABASE IF EXISTS g6_w");
+
+await check(
+  "020000 historical checksum alias is guard-only: old and current files leave identical catalog snapshots",
+  async () => {
+    const currentPath = join(
+      ROOT,
+      "supabase/migrations/20261030020000_session_directory_short_summary.sql",
+    );
+    const current = readFileSync(currentPath, "utf8");
+    const historical = historicalShortSummary(current);
+    const historicalHash = createHash("sha256")
+      .update(historical)
+      .digest("hex");
+    const currentHash = createHash("sha256").update(current).digest("hex");
+    const historicalPath = `/tmp/96bulls-020000-historical-${process.pid}.sql`;
+    writeFileSync(historicalPath, historical);
+    const target = SCHEMA_FILES.findIndex(
+      (f) =>
+        f.name ===
+        "upstream:20261030020000_session_directory_short_summary.sql",
+    );
+    let oldSnap: Record<string, string> = {};
+    let newSnap: Record<string, string> = {};
+    let applied = true;
+    try {
+      for (const db of ["g6_alias_old", "g6_alias_new"]) {
+        await attempt("postgres", `DROP DATABASE IF EXISTS ${db} WITH (FORCE)`);
+        await sql("postgres", `CREATE DATABASE ${db} OWNER hoop`);
+        for (let i = 0; i < target; i++) {
+          const r = psql(db, ["-1", "-f", SCHEMA_FILES[i]!.path], "hoop");
+          if (!r.ok)
+            throw new Error(`${db} prefix ${SCHEMA_FILES[i]!.name}: ${r.out}`);
+        }
+      }
+      const oldApply = psql(
+        "g6_alias_old",
+        ["-1", "-f", historicalPath],
+        "hoop",
+      );
+      const newApply = psql("g6_alias_new", ["-1", "-f", currentPath], "hoop");
+      applied = oldApply.ok && newApply.ok;
+      if (!applied) throw new Error(`old=${oldApply.out}\nnew=${newApply.out}`);
+      oldSnap = await sessionsCatalogSnapshot("g6_alias_old");
+      newSnap = await sessionsCatalogSnapshot("g6_alias_new");
+    } finally {
+      unlinkSync(historicalPath);
+      await attempt(
+        "postgres",
+        "DROP DATABASE IF EXISTS g6_alias_old WITH (FORCE)",
+      );
+      await attempt(
+        "postgres",
+        "DROP DATABASE IF EXISTS g6_alias_new WITH (FORCE)",
+      );
+    }
+    const exactOld =
+      historicalHash ===
+      "c223b77e4c875cbc36499e6ca1c8e521b564ebf25facd87313b3e58335918de4";
+    const exactCurrent =
+      currentHash ===
+      "b0ddc7de8c4cff9454638c52563f37f1e1380ed577e2a7535f67ddc2c0b758ce";
+    const identical = JSON.stringify(oldSnap) === JSON.stringify(newSnap);
+    return [
+      applied && exactOld && exactCurrent && identical,
+      `old_sha=${historicalHash} current_sha=${currentHash} catalog_identical=${identical} categories=${Object.keys(oldSnap).join(",")}`,
+    ];
+  },
+);
+
+// Final destructive-to-the-disposable-cluster proof: model Supabase's exact PG16+
+// bootstrap identity. The bootstrap superuser is OID 10 and named supabase_admin;
+// postgres is the non-superuser CREATEROLE migration owner. This is intentionally last,
+// because every earlier proof uses the stock postgres superuser.
+await check(
+  "Supabase role creator compatibility: exact edge passes end to end; mode and option mutations fail closed",
+  async () => {
+    await sql("postgres", "CREATE ROLE bootstrap_super SUPERUSER LOGIN");
+    await sql(
+      "postgres",
+      "ALTER ROLE postgres RENAME TO supabase_admin; CREATE ROLE postgres LOGIN CREATEROLE",
+      "bootstrap_super",
+    );
+    await sql("postgres", "DROP ROLE bootstrap_super", "supabase_admin");
+    await sql(
+      "postgres",
+      "DROP ROLE session_directory_search_worker",
+      "supabase_admin",
+    );
+    await sql(
+      "postgres",
+      "CREATE DATABASE g6_supabase_edge OWNER postgres",
+      "supabase_admin",
+    );
+    const shim = psql(
+      "g6_supabase_edge",
+      ["-f", join(ROOT, "supabase/tests/supabase_shim.sql")],
+      "supabase_admin",
+    );
+    if (!shim.ok)
+      throw new Error(`Supabase role-edge shim failed: ${shim.out}`);
+    await sql(
+      "g6_supabase_edge",
+      `ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+       CREATE SCHEMA extensions;
+       CREATE TABLE extensions.pg_stat_statements (calls bigint);
+       GRANT SELECT ON extensions.pg_stat_statements TO PUBLIC;
+       CREATE ROLE relayhistory_runtime LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+       GRANT TEMPORARY ON DATABASE g6_supabase_edge TO relayhistory_runtime`,
+      "postgres",
+    );
+    await sql(
+      "g6_supabase_edge",
+      "ALTER ROLE relayhistory_runtime BYPASSRLS",
+      "supabase_admin",
+    );
+    const runtimeBoot = psql(
+      "g6_supabase_edge",
+      [
+        "-v",
+        "runtime_role=bulls96_runtime",
+        "-v",
+        "runtime_login=true",
+        "-f",
+        SUPABASE_RUNTIME_BOOT,
+      ],
+      "postgres",
+    );
+    const boot = psql(
+      "g6_supabase_edge",
+      [
+        "-f",
+        join(
+          ROOT,
+          "supabase/bootstrap/session_directory_search_worker_supabase.sql",
+        ),
+      ],
+      "postgres",
+    );
+    const exactEdges =
+      Number(version.split(".")[0]) >= 16
+        ? (
+            await sql(
+              "g6_supabase_edge",
+              `SELECT g.rolname AS target, u.rolname AS member, x.rolname AS grantor,
+                      m.admin_option, m.inherit_option, m.set_option
+                 FROM pg_auth_members m
+                 JOIN pg_roles g ON g.oid=m.roleid
+                 JOIN pg_roles u ON u.oid=m.member
+                 JOIN pg_roles x ON x.oid=m.grantor
+                WHERE g.rolname IN ('bulls96_runtime','session_directory_search_worker')
+                ORDER BY 1`,
+              "postgres",
+            )
+          ).rows
+        : [];
+    const supabase = {
+      HOOPDB_DB_MODE: "supabase",
+      HOOPDB_SUPABASE_SHIM: "false",
+      HOOPDB_RUNTIME_ROLE: "bulls96_runtime",
+      HOOPDB_RUNTIME_ROLE_LOGIN: "true",
+      HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+    };
+    const legacyDrift = migrate(
+      "g6_supabase_edge",
+      { ...supabase, HOOPDB_RUNTIME_ROLE: "relayhistory_runtime" },
+      "postgres",
+    );
+    await sql(
+      "g6_supabase_edge",
+      "GRANT SELECT ON extensions.pg_stat_statements TO bulls96_runtime",
+      "postgres",
+    );
+    const directUnreachableRelation = migrate(
+      "g6_supabase_edge",
+      supabase,
+      "postgres",
+    );
+    await sql(
+      "g6_supabase_edge",
+      "REVOKE SELECT ON extensions.pg_stat_statements FROM bulls96_runtime",
+      "postgres",
+    );
+    const migrated = migrate("g6_supabase_edge", supabase, "postgres");
+    const targetMigration =
+      "upstream:20261030020000_session_directory_short_summary.sql";
+    const historicalSha =
+      "c223b77e4c875cbc36499e6ca1c8e521b564ebf25facd87313b3e58335918de4";
+    // Parameterized separately because sql() intentionally has a minimal text-only API.
+    const aliasClient = new pg.Client({
+      connectionString: url("postgres", "g6_supabase_edge"),
+    });
+    await aliasClient.connect();
+    await aliasClient.query(
+      "UPDATE sessions.__96bulls_migrations SET sha256 = $1 WHERE name = $2",
+      [historicalSha, targetMigration],
+    );
+    await aliasClient.end();
+    const aliasAccepted = migrate("g6_supabase_edge", supabase, "postgres");
+    const aliasCheck = activationCheck(
+      "g6_supabase_edge",
+      { HOOPDB_DB_MODE: "supabase" },
+      "postgres",
+    );
+    const aliasLedger = (
+      await sql(
+        "g6_supabase_edge",
+        `SELECT sha256 FROM sessions.__96bulls_migrations
+          WHERE name = '${targetMigration}'`,
+        "postgres",
+      )
+    ).rows[0]?.sha256;
+    await sql(
+      "g6_supabase_edge",
+      `UPDATE sessions.__96bulls_migrations SET sha256 = '${"d".repeat(64)}'
+        WHERE name = '${targetMigration}'`,
+      "postgres",
+    );
+    const thirdSha = migrate("g6_supabase_edge", supabase, "postgres");
+    await sql(
+      "g6_supabase_edge",
+      `UPDATE sessions.__96bulls_migrations SET sha256 = '${historicalSha}'
+        WHERE name = '${targetMigration}'`,
+      "postgres",
+    );
+    const wrongMode = migrate(
+      "g6_supabase_edge",
+      {
+        ...supabase,
+        HOOPDB_DB_MODE: "selfhosted",
+        HOOPDB_SUPABASE_SHIM: "false",
+      },
+      "postgres",
+    );
+
+    await sql(
+      "g6_supabase_edge",
+      "GRANT TEMPORARY ON DATABASE g6_supabase_edge TO bulls96_runtime",
+      "postgres",
+    );
+    const directTemp = migrate("g6_supabase_edge", supabase, "postgres");
+    await sql(
+      "g6_supabase_edge",
+      "REVOKE TEMPORARY ON DATABASE g6_supabase_edge FROM bulls96_runtime",
+      "postgres",
+    );
+
+    await sql(
+      "g6_supabase_edge",
+      "GRANT USAGE ON SCHEMA extensions TO PUBLIC",
+      "postgres",
+    );
+    const reachablePublicRelation = migrate(
+      "g6_supabase_edge",
+      supabase,
+      "postgres",
+    );
+    await sql(
+      "g6_supabase_edge",
+      "REVOKE USAGE ON SCHEMA extensions FROM PUBLIC",
+      "postgres",
+    );
+
+    const workloadArgs = [
+      "-v",
+      "runtime_role=bulls96_runtime_workload",
+      "-v",
+      "runtime_login=false",
+      "-v",
+      "workload_role=bulls96_workload",
+      "-f",
+      SUPABASE_RUNTIME_BOOT,
+    ];
+    const workloadCreate = psql("g6_supabase_edge", workloadArgs, "postgres");
+    await sql(
+      "g6_supabase_edge",
+      "CREATE ROLE bulls96_workload LOGIN",
+      "postgres",
+    );
+    await sql(
+      "g6_supabase_edge",
+      MAJOR >= 16
+        ? "GRANT bulls96_runtime_workload TO bulls96_workload WITH INHERIT TRUE, SET TRUE"
+        : "GRANT bulls96_runtime_workload TO bulls96_workload",
+      MAJOR >= 16 ? "postgres" : "supabase_admin",
+    );
+    const workloadRerun = psql("g6_supabase_edge", workloadArgs, "postgres");
+
+    let mutationRefused = true;
+    if (Number(version.split(".")[0]) >= 16) {
+      await sql(
+        "g6_supabase_edge",
+        `REVOKE session_directory_search_worker FROM postgres GRANTED BY supabase_admin;
+         GRANT session_directory_search_worker TO postgres
+           WITH ADMIN OPTION, INHERIT FALSE, SET TRUE GRANTED BY supabase_admin`,
+        "supabase_admin",
+      );
+      const mutated = psql(
+        "g6_supabase_edge",
+        [
+          "-c",
+          "BEGIN; SELECT set_config('hoopdb.db_mode','supabase',true);",
+          "-f",
+          BOOT,
+          "-c",
+          "ROLLBACK",
+        ],
+        "postgres",
+      );
+      mutationRefused =
+        !mutated.ok && mutated.out.includes("granted to postgres");
+    }
+    const edgeShape =
+      Number(version.split(".")[0]) < 16 ||
+      (exactEdges.length === 2 &&
+        exactEdges.every(
+          (e) =>
+            e.member === "postgres" &&
+            e.grantor === "supabase_admin" &&
+            e.admin_option === true &&
+            e.inherit_option === false &&
+            e.set_option === false,
+        ));
+    return [
+      runtimeBoot.ok &&
+        boot.ok &&
+        edgeShape &&
+        legacyDrift.code === "runtime_role_unsafe" &&
+        directUnreachableRelation.code === "runtime_role_unsafe" &&
+        migrated.exit === 0 &&
+        aliasAccepted.exit === 0 &&
+        aliasCheck.status === 0 &&
+        JSON.stringify(aliasCheck.evidence.migration_checksum_aliases) ===
+          JSON.stringify([
+            {
+              migration: targetMigration,
+              ledger_sha: historicalSha,
+              accepted_as_alias_of:
+                "b0ddc7de8c4cff9454638c52563f37f1e1380ed577e2a7535f67ddc2c0b758ce",
+            },
+          ]) &&
+        aliasLedger === historicalSha &&
+        thirdSha.code === "migration_changed" &&
+        directTemp.code === "runtime_role_unsafe" &&
+        reachablePublicRelation.code === "runtime_role_unsafe" &&
+        workloadCreate.ok &&
+        workloadRerun.ok &&
+        (Number(version.split(".")[0]) < 16 ||
+          wrongMode.code === "runtime_role_unsafe") &&
+        mutationRefused,
+      `runtime_boot=${runtimeBoot.ok} worker_boot=${boot.ok} edges=${fmt(exactEdges)} legacy_drift=${fmt(legacyDrift)} direct_unreachable=${fmt(directUnreachableRelation)} migrated=${fmt(migrated)} alias=${fmt(aliasAccepted)} alias_check=${fmt(aliasCheck)} alias_ledger=${aliasLedger} third_sha=${fmt(thirdSha)} direct_temp=${fmt(directTemp)} reachable_relation=${fmt(reachablePublicRelation)} workload_create=${workloadCreate.ok} workload_rerun=${workloadRerun.ok} wrong_mode=${fmt(wrongMode)} mutation_refused=${mutationRefused}`,
+    ];
+  },
+);
 
 const failed = cases.filter((c) => !c.pass).length;
 const results = {

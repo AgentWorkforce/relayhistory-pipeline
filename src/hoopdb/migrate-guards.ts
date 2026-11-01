@@ -26,12 +26,56 @@ export function guardError(code: string, message: string): Error {
   return Object.assign(new Error(`96bulls: ${message}`), { code });
 }
 
+// 20261030020000's only post-release change replaces its transient role guard with
+// the catalog-exact PG16+ Supabase creator-edge check. It changes no persistent
+// object. Existing databases can therefore retain the one known historical ledger
+// checksum while fresh databases execute and record the reviewed file below. Binding
+// both hashes prevents this exception from silently covering a future edit.
+export const MIGRATION_CHECKSUM_ALIASES = [
+  {
+    migration: "upstream:20261030020000_session_directory_short_summary.sql",
+    ledger_sha:
+      "c223b77e4c875cbc36499e6ca1c8e521b564ebf25facd87313b3e58335918de4",
+    accepted_as_alias_of:
+      "b0ddc7de8c4cff9454638c52563f37f1e1380ed577e2a7535f67ddc2c0b758ce",
+  },
+] as const;
+
+export function migrationChecksumMatches(
+  name: string,
+  recorded: string,
+  actual: string,
+): boolean {
+  return (
+    recorded === actual ||
+    MIGRATION_CHECKSUM_ALIASES.some(
+      (a) =>
+        a.migration === name &&
+        a.ledger_sha === recorded &&
+        a.accepted_as_alias_of === actual,
+    )
+  );
+}
+
+export function migrationChecksumAlias(
+  name: string,
+  recorded: string,
+  actual: string,
+): (typeof MIGRATION_CHECKSUM_ALIASES)[number] | undefined {
+  return MIGRATION_CHECKSUM_ALIASES.find(
+    (a) =>
+      a.migration === name &&
+      a.ledger_sha === recorded &&
+      a.accepted_as_alias_of === actual,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Runtime role: an exact least-privilege allowlist
 // ---------------------------------------------------------------------------
 
 export interface RuntimeRoleConfig {
-  mode: "local" | "selfhosted" | "supabase";
+  mode: "local" | "selfhosted" | "cloudsql" | "supabase";
   role: string;
   /** HOOPDB_RUNTIME_ROLE_LOGIN: whether the role logs in itself (true) or is reached through a workload role (false). */
   login?: boolean;
@@ -44,14 +88,182 @@ export interface RuntimeTables {
   marker: string;
 }
 
+/** The exact database surface shared by the 96Bulls service pods. */
+export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
+  "sessions.session_index": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.machines": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.pipeline_events": ["SELECT", "INSERT", "DELETE"],
+  "sessions.pipeline_dead_letters": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.pipeline_jobs": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.repos": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.repo_names": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_index_ext": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_summaries": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_verdicts": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_users": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_machines": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_rollout": ["SELECT"],
+  "sessions.session_directory_resurrection_fences": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.manifest_readiness": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.export_deferred_sessions": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.claimless_uses": ["SELECT", "INSERT", "UPDATE"],
+  "sessions.backfill_activation_ready": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.migration_assertion_uses": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.migration_assertion_chunks": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.migration_ingest_audit": ["SELECT", "INSERT"],
+  "sessions.migration_base_read_uses": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.claimless_window_activations": ["SELECT", "INSERT"],
+} as const satisfies Record<string, readonly string[]>;
+
+export const RUNTIME_APPLICATION_SEQUENCES = [
+  "sessions.pipeline_jobs_id_seq",
+  "sessions.migration_ingest_audit_id_seq",
+  "sessions.session_verdicts_id_seq",
+] as const;
+
+export const RUNTIME_APPLICATION_RLS_TABLES = [
+  "sessions.session_index",
+  "sessions.machines",
+  "sessions.pipeline_events",
+  "sessions.pipeline_dead_letters",
+  "sessions.pipeline_jobs",
+  "sessions.repos",
+  "sessions.repo_names",
+  "sessions.session_index_ext",
+  "sessions.session_summaries",
+  "sessions.session_verdicts",
+  "sessions.session_directory",
+  "sessions.session_directory_users",
+  "sessions.session_directory_machines",
+  "sessions.session_directory_resurrection_fences",
+  "sessions.manifest_readiness",
+  "sessions.export_deferred_sessions",
+  "sessions.claimless_uses",
+  "sessions.backfill_activation_ready",
+  "sessions.migration_assertion_uses",
+  "sessions.migration_assertion_chunks",
+  "sessions.migration_ingest_audit",
+  "sessions.migration_base_read_uses",
+  "sessions.claimless_window_activations",
+] as const;
+
+export const RUNTIME_APPLICATION_FUNCTIONS = [
+  "sessions.applied_repo_evidence(jsonb,jsonb)",
+  "sessions.canonical_remote(text)",
+  "sessions.clean_root_commit(text)",
+  "sessions.jwt_org_id()",
+  "sessions.jwt_workspace_ids()",
+  "sessions.legacy_remote(text)",
+  "sessions.lock_repo_catalog(text)",
+  "sessions.member_of(text,text[])",
+  "sessions.repo_backfill_report()",
+  "sessions.repo_backfill_step(integer,text)",
+  "sessions.repo_group(text,uuid)",
+  "sessions.repo_live(text,uuid)",
+  "sessions.repo_visibility_ids(text,uuid)",
+  "sessions.repos_maintain(integer)",
+  "sessions.resolve_repo(text,text,text,timestamp with time zone)",
+  "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
+  "sessions.session_index_batch(jsonb)",
+  "sessions.session_index_scrub_sticky()",
+  "sessions.set_session_state(text,text,text,text,text,text,timestamp with time zone)",
+  "sessions.upsert_machine(text,text,text,text,text,text,timestamp with time zone)",
+  "sessions.upsert_session_index(jsonb)",
+] as const;
+
+/**
+ * The pods use one reviewed, multi-tenant backend identity. This policy is deliberately
+ * all-row for that identity: tenant isolation for user-facing requests remains in the
+ * authenticated RPCs and application filters, while this role is constrained by exact
+ * table/function ACLs, NOBYPASSRLS, no ownership, and no DDL. It must never be granted
+ * to a user-facing or otherwise untrusted database role.
+ */
+export const RUNTIME_APPLICATION_POLICY = "bulls96_trusted_backend";
+
+export interface RoleGrantEdge {
+  rolname: string;
+  grantor: string;
+  grantor_super: boolean;
+  admin_option: boolean;
+  inherit_option: boolean;
+  set_option: boolean;
+}
+
+export interface DatabaseTempEvidence {
+  effective: boolean;
+  direct: boolean;
+  public: boolean;
+  public_grantable: boolean;
+}
+
+/** The one unavoidable PG16+ Supabase creator edge. No names are configurable. */
+export function isSupabaseCreatorEdge(
+  cfg: Pick<RuntimeRoleConfig, "mode">,
+  serverVersion: number,
+  edge: RoleGrantEdge,
+): boolean {
+  return (
+    cfg.mode === "supabase" &&
+    serverVersion >= 160000 &&
+    edge.rolname === "postgres" &&
+    edge.grantor === "supabase_admin" &&
+    edge.grantor_super &&
+    edge.admin_option &&
+    !edge.inherit_option &&
+    !edge.set_option
+  );
+}
+
+/**
+ * The one optional workload membership. On PG16+ both per-grant options must keep
+ * ordinary privilege inheritance and SET ROLE enabled; on PG15 the query projects
+ * the member role's INHERIT attribute and the platform's implicit SET capability.
+ * A hosted non-superuser creator is frozen to postgres. Every other grantor must be
+ * a catalog-verified superuser.
+ */
+export function isRuntimeWorkloadEdge(
+  cfg: Pick<RuntimeRoleConfig, "mode" | "workload">,
+  edge: RoleGrantEdge,
+  exactSupabaseCreatorPresent = false,
+): boolean {
+  return (
+    cfg.workload !== undefined &&
+    edge.rolname === cfg.workload &&
+    !edge.admin_option &&
+    edge.inherit_option &&
+    edge.set_option &&
+    (edge.grantor_super ||
+      (cfg.mode === "supabase" &&
+        exactSupabaseCreatorPresent &&
+        edge.grantor === "postgres"))
+  );
+}
+
+/** Supabase's frozen database baseline leaves TEMPORARY granted to PUBLIC. */
+export function isSupabasePublicTemp(
+  cfg: Pick<RuntimeRoleConfig, "mode">,
+  evidence: DatabaseTempEvidence,
+): boolean {
+  return (
+    cfg.mode === "supabase" &&
+    evidence.effective &&
+    !evidence.direct &&
+    evidence.public &&
+    !evidence.public_grantable
+  );
+}
+
 /**
  * Approved for the runtime role, and nothing else:
- *   USAGE on schema sessions; SELECT on the ledger and the readiness marker;
+ *   USAGE on schema sessions; SELECT on the ledger and the readiness marker; the exact
+ *   application table/function/sequence ACL and RLS policies declared above;
  *   CONNECT on the current database, which is REQUIRED (effective), as it is for the
  *   workload role when one is configured.
- * Refused, among everything else: effective TEMPORARY on the database (PUBLIC has it by
- * default; see the runbook), and EXECUTE on any sessions function, trigger functions
- * included (a trigger fires without its caller holding EXECUTE).
+ * Refused, among everything else: effective TEMPORARY on the database, except the exact
+ * PUBLIC-derived Supabase baseline (see the runbook), and EXECUTE on any unlisted
+ * sessions function. Trigger functions remain excluded because triggers fire without
+ * their caller holding EXECUTE.
  *
  * Coverage, stated exactly:
  *   current database  effective privileges in every non-system schema: tables, views,
@@ -68,9 +280,6 @@ export interface RuntimeTables {
  * phase "pre" (before any write) ignores PUBLIC-derived EXECUTE on sessions functions:
  * the migrator revokes that in the same transaction as validation. phase "post" counts
  * every EXECUTE.
- * The services' other runtime table grants are out of scope here (activation dossier
- * #98): a role holding them is refused until this allowlist is extended in a reviewed
- * change.
  */
 export async function runtimeRoleViolations(
   client: GuardClient,
@@ -79,6 +288,13 @@ export async function runtimeRoleViolations(
   phase: "pre" | "post" = "post",
 ): Promise<string[]> {
   const out: string[] = [];
+  const serverVersion = Number(
+    (
+      await client.query<{ server_version_num: string }>(
+        "SELECT current_setting('server_version_num') AS server_version_num",
+      )
+    ).rows[0]?.server_version_num ?? "0",
+  );
   const role = (
     await client.query<{
       oid: number;
@@ -120,28 +336,90 @@ export async function runtimeRoleViolations(
     )
   ).rows)
     out.push(`member of ${m.rolname}`);
-  for (const m of (
-    await client.query<{ rolname: string; admin_option: boolean }>(
-      "SELECT r.rolname, m.admin_option FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member WHERE m.roleid = $1::oid ORDER BY 1",
-      [role.oid],
+  const members =
+    serverVersion >= 160000
+      ? (
+          await client.query<{
+            rolname: string;
+            grantor: string;
+            grantor_super: boolean;
+            admin_option: boolean;
+            inherit_option: boolean;
+            set_option: boolean;
+          }>(
+            `SELECT r.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super,
+                  m.admin_option, m.inherit_option, m.set_option
+             FROM pg_auth_members m
+             JOIN pg_roles r ON r.oid = m.member
+             JOIN pg_roles g ON g.oid = m.grantor
+            WHERE m.roleid = $1::oid ORDER BY 1, 2`,
+            [role.oid],
+          )
+        ).rows
+      : (
+          await client.query<{
+            rolname: string;
+            grantor: string;
+            grantor_super: boolean;
+            admin_option: boolean;
+            inherit_option: boolean;
+            set_option: boolean;
+          }>(
+            `SELECT r.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super,
+                  m.admin_option, r.rolinherit AS inherit_option, true AS set_option
+             FROM pg_auth_members m
+             JOIN pg_roles r ON r.oid = m.member
+             JOIN pg_roles g ON g.oid = m.grantor
+            WHERE m.roleid = $1::oid ORDER BY 1, 2`,
+            [role.oid],
+          )
+        ).rows;
+  const supabaseCreatorPresent = members.some((m) =>
+    isSupabaseCreatorEdge(cfg, serverVersion, m),
+  );
+  for (const m of members) {
+    // PostgreSQL 16+ necessarily gives a non-superuser CREATEROLE creator an ADMIN
+    // membership in every custom role it creates. Supabase's bootstrap superuser is
+    // the recorded grantor, while postgres receives neither INHERIT nor SET. This one
+    // catalog-exact edge is compatible only with Supabase and may coexist only with
+    // the separately validated workload edge. No name is environment-configurable.
+    const supabaseCreatorEdge = isSupabaseCreatorEdge(cfg, serverVersion, m);
+    if (
+      supabaseCreatorEdge ||
+      isRuntimeWorkloadEdge(cfg, m, supabaseCreatorPresent)
     )
-  ).rows) {
-    if (m.rolname !== cfg.workload) out.push(`granted to ${m.rolname}`);
-    else if (m.admin_option)
-      out.push(`granted to ${m.rolname} WITH ADMIN OPTION`);
+      continue;
+    out.push(
+      `granted to ${m.rolname} by ${m.grantor} with ADMIN=${m.admin_option} INHERIT=${m.inherit_option} SET=${m.set_option}`,
+    );
   }
 
+  const applicationTables = Object.keys(RUNTIME_APPLICATION_TABLE_PRIVILEGES);
   const ids = (
     await client.query<{
       db: number;
       sessions: number | null;
       ledger: number | null;
       marker: number | null;
+      relations: number[];
+      functions: number[];
+      policies: number[];
     }>(
       `SELECT (SELECT oid::int FROM pg_database WHERE datname = current_database()) AS db,
               to_regnamespace('sessions')::oid::int AS sessions,
-              to_regclass($1)::oid::int AS ledger, to_regclass($2)::oid::int AS marker`,
-      [tables.ledger, tables.marker],
+              to_regclass($1)::oid::int AS ledger, to_regclass($2)::oid::int AS marker,
+              ARRAY(SELECT to_regclass(x)::oid::int FROM unnest($3::text[]) x WHERE to_regclass(x) IS NOT NULL) AS relations,
+              ARRAY(SELECT to_regprocedure(x)::oid::int FROM unnest($4::text[]) x WHERE to_regprocedure(x) IS NOT NULL) AS functions,
+              ARRAY(SELECT p.oid::int FROM pg_policy p WHERE p.polname = $5 AND p.polrelid = ANY(
+                ARRAY(SELECT to_regclass(x)::oid FROM unnest($6::text[]) x WHERE to_regclass(x) IS NOT NULL))) AS policies`,
+      [
+        tables.ledger,
+        tables.marker,
+        [...applicationTables, ...RUNTIME_APPLICATION_SEQUENCES],
+        [...RUNTIME_APPLICATION_FUNCTIONS],
+        RUNTIME_APPLICATION_POLICY,
+        [...RUNTIME_APPLICATION_RLS_TABLES],
+      ],
     )
   ).rows[0]!;
   // Every owner, ACL, policy and initial-privilege reference naming the role, in every
@@ -173,9 +451,19 @@ export async function runtimeRoleViolations(
         d.objid === ids.sessions) ||
         (d.dbid === ids.db &&
           d.cls === "pg_class" &&
-          (d.objid === ids.ledger || d.objid === ids.marker)) ||
+          (d.objid === ids.ledger ||
+            d.objid === ids.marker ||
+            ids.relations.includes(d.objid))) ||
+        (d.dbid === ids.db &&
+          d.cls === "pg_proc" &&
+          ids.functions.includes(d.objid)) ||
         (d.dbid === 0 && d.cls === "pg_database" && d.objid === ids.db));
-    if (approved) continue;
+    const approvedPolicy =
+      d.deptype === "r" &&
+      d.dbid === ids.db &&
+      d.cls === "pg_policy" &&
+      ids.policies.includes(d.objid);
+    if (approved || approvedPolicy) continue;
     const verb =
       d.deptype === "o"
         ? "owns"
@@ -221,20 +509,40 @@ export async function runtimeRoleViolations(
     await client.query<{
       create: boolean;
       temp: boolean;
+      direct_temp: boolean;
+      public_temp: boolean;
+      public_temp_grantable: boolean;
       connect: boolean;
       wl_connect: boolean | null;
     }>(
       `SELECT has_database_privilege($1::oid, current_database(), 'CREATE') AS create,
               has_database_privilege($1::oid, current_database(), 'TEMPORARY') AS temp,
+              EXISTS (SELECT 1 FROM pg_database x, aclexplode(coalesce(x.datacl, acldefault('d', x.datdba))) a
+                       WHERE x.datname = current_database() AND a.grantee = $1::oid
+                         AND a.privilege_type = 'TEMPORARY') AS direct_temp,
+              EXISTS (SELECT 1 FROM pg_database x, aclexplode(coalesce(x.datacl, acldefault('d', x.datdba))) a
+                       WHERE x.datname = current_database() AND a.grantee = 0
+                         AND a.privilege_type = 'TEMPORARY') AS public_temp,
+              EXISTS (SELECT 1 FROM pg_database x, aclexplode(coalesce(x.datacl, acldefault('d', x.datdba))) a
+                       WHERE x.datname = current_database() AND a.grantee = 0
+                         AND a.privilege_type = 'TEMPORARY' AND a.is_grantable) AS public_temp_grantable,
               has_database_privilege($1::oid, current_database(), 'CONNECT') AS connect,
               (SELECT has_database_privilege(r.oid, current_database(), 'CONNECT') FROM pg_roles r WHERE r.rolname = $2) AS wl_connect`,
       [role.oid, cfg.workload ?? null],
     )
   ).rows[0]!;
   if (db.create) out.push("CREATE on the database");
-  if (db.temp)
+  if (
+    db.temp &&
+    !isSupabasePublicTemp(cfg, {
+      effective: db.temp,
+      direct: db.direct_temp,
+      public: db.public_temp,
+      public_grantable: db.public_temp_grantable,
+    })
+  )
     out.push(
-      "TEMPORARY on the database (PUBLIC has it by default: revoke it from PUBLIC, see the runbook)",
+      "TEMPORARY on the database is not the exact PUBLIC-derived Supabase baseline (revoke it from PUBLIC outside Supabase, see the runbook)",
     );
   if (!db.connect) out.push("no CONNECT on the database (required)");
   if (cfg.workload && db.wl_connect !== true)
@@ -278,15 +586,18 @@ export async function runtimeRoleViolations(
       await client.query<{ rel: string }>(
         `SELECT c.oid::regclass::text AS rel FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
           WHERE ${NONSYSTEM} AND c.relkind IN ('r', 'p', 'm')
+            -- sessions becomes reachable when this same migrator grants the approved
+            -- USAGE, so preflight must treat it as reachable already.
+            AND (n.nspname = 'sessions' OR has_schema_privilege($1::oid, n.oid, 'USAGE'))
             AND CASE WHEN c.relkind IN ('r', 'p', 'm') THEN has_table_privilege($1::oid, c.oid, 'MAINTAIN') ELSE false END ORDER BY 1`,
         [role.oid],
       )
     ).rows)
       out.push(`MAINTAIN on ${m.rel}`);
-  for (const t of (
+  const effectiveTables = (
     await client.query<{ rel: string; privs: string }>(
       `SELECT c.oid::regclass::text AS rel,
-              concat_ws(',', CASE WHEN has_table_privilege($1::oid, c.oid, 'SELECT') AND c.oid NOT IN (coalesce(to_regclass($2), 0), coalesce(to_regclass($3), 0)) THEN 'SELECT' END,
+              concat_ws(',', CASE WHEN has_table_privilege($1::oid, c.oid, 'SELECT') THEN 'SELECT' END,
                 CASE WHEN has_table_privilege($1::oid, c.oid, 'INSERT') THEN 'INSERT' END,
                 CASE WHEN has_table_privilege($1::oid, c.oid, 'UPDATE') THEN 'UPDATE' END,
                 CASE WHEN has_table_privilege($1::oid, c.oid, 'DELETE') THEN 'DELETE' END,
@@ -295,22 +606,51 @@ export async function runtimeRoleViolations(
                 CASE WHEN has_table_privilege($1::oid, c.oid, 'TRIGGER') THEN 'TRIGGER' END,
                 CASE WHEN NOT has_table_privilege($1::oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES') AND has_any_column_privilege($1::oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES') THEN 'column' END) AS privs
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE ${NONSYSTEM} AND c.relkind IN ('r', 'p', 'v', 'm', 'f') ORDER BY 1`,
-      [role.oid, tables.ledger, tables.marker],
+        WHERE ${NONSYSTEM} AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+          AND (n.nspname = 'sessions' OR has_schema_privilege($1::oid, n.oid, 'USAGE')) ORDER BY 1`,
+      [role.oid],
     )
-  ).rows)
-    if (t.privs) out.push(`${t.privs} on ${t.rel}`);
-  for (const q of (
-    await client.query<{ rel: string }>(
-      `SELECT c.oid::regclass::text AS rel FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+  ).rows;
+  const expectedTablePrivileges = new Map<string, readonly string[]>([
+    [tables.ledger, ["SELECT"]],
+    [tables.marker, ["SELECT"]],
+    ...Object.entries(RUNTIME_APPLICATION_TABLE_PRIVILEGES),
+  ]);
+  for (const t of effectiveTables) {
+    const actual = t.privs ? t.privs.split(",") : [];
+    const expected = expectedTablePrivileges.get(t.rel) ?? [];
+    const unexpected = actual.filter((p) => !expected.includes(p));
+    const missing = phase === "post" ? expected.filter((p) => !actual.includes(p)) : [];
+    if (unexpected.length) out.push(`${unexpected.join(",")} on ${t.rel}`);
+    if (missing.length) out.push(`missing ${missing.join(",")} on ${t.rel}`);
+  }
+  const effectiveSequences = (
+    await client.query<{ rel: string; privs: string }>(
+      `SELECT c.oid::regclass::text AS rel,
+              concat_ws(',', CASE WHEN has_sequence_privilege($1::oid, c.oid, 'USAGE') THEN 'USAGE' END,
+                CASE WHEN has_sequence_privilege($1::oid, c.oid, 'SELECT') THEN 'SELECT' END,
+                CASE WHEN has_sequence_privilege($1::oid, c.oid, 'UPDATE') THEN 'UPDATE' END) AS privs
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE ${NONSYSTEM} AND c.relkind = 'S'
+          AND (n.nspname = 'sessions' OR has_schema_privilege($1::oid, n.oid, 'USAGE'))
           -- CASE: AND order is not guaranteed, and the function errors on a non-sequence.
           AND CASE WHEN c.relkind = 'S' THEN has_sequence_privilege($1::oid, c.oid, 'USAGE, SELECT, UPDATE') ELSE false END ORDER BY 1`,
       [role.oid],
     )
-  ).rows)
-    out.push(`privileges on sequence ${q.rel}`);
-  for (const fnr of (
+  ).rows;
+  for (const q of effectiveSequences) {
+    const approved = RUNTIME_APPLICATION_SEQUENCES.includes(
+      q.rel as (typeof RUNTIME_APPLICATION_SEQUENCES)[number],
+    );
+    if (!approved && q.privs) out.push(`privileges on sequence ${q.rel}`);
+    if (approved && q.privs !== "USAGE")
+      out.push(`${q.privs} on sequence ${q.rel} (only USAGE is approved)`);
+  }
+  if (phase === "post")
+    for (const sequence of RUNTIME_APPLICATION_SEQUENCES)
+      if (!effectiveSequences.some((q) => q.rel === sequence && q.privs === "USAGE"))
+        out.push(`missing USAGE on sequence ${sequence}`);
+  const effectiveFunctions = (
     await client.query<{ fn: string }>(
       `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE ${NONSYSTEM} AND (n.nspname = 'sessions' OR p.prosecdef)
@@ -322,8 +662,59 @@ export async function runtimeRoleViolations(
         ORDER BY 1`,
       [role.oid, phase],
     )
-  ).rows)
-    out.push(`EXECUTE on ${fnr.fn}`);
+  ).rows;
+  for (const fnr of effectiveFunctions)
+    if (!RUNTIME_APPLICATION_FUNCTIONS.includes(fnr.fn as (typeof RUNTIME_APPLICATION_FUNCTIONS)[number]))
+      out.push(`EXECUTE on ${fnr.fn}`);
+  if (phase === "post")
+    for (const fn of RUNTIME_APPLICATION_FUNCTIONS)
+      if (!effectiveFunctions.some((row) => row.fn === fn))
+        out.push(`missing EXECUTE on ${fn}`);
+
+  const grantable = (
+    await client.query<{ what: string }>(
+      `SELECT c.oid::regclass::text || ':' || a.privilege_type AS what
+         FROM pg_class c, aclexplode(c.relacl) a WHERE a.grantee = $1::oid AND a.is_grantable
+       UNION ALL
+       SELECT p.oid::regprocedure::text || ':EXECUTE' FROM pg_proc p, aclexplode(p.proacl) a
+        WHERE a.grantee = $1::oid AND a.is_grantable
+       ORDER BY 1`,
+      [role.oid],
+    )
+  ).rows;
+  for (const row of grantable) out.push(`${row.what} WITH GRANT OPTION is not approved`);
+
+  const policies = (
+    await client.query<{
+      rel: string;
+      name: string;
+      permissive: boolean;
+      command: string;
+      roles: number[];
+      using_expr: string | null;
+      check_expr: string | null;
+    }>(
+      `SELECT p.polrelid::regclass::text AS rel, p.polname AS name, p.polpermissive AS permissive,
+              p.polcmd::text AS command, p.polroles::oid[]::int[] AS roles,
+              pg_get_expr(p.polqual, p.polrelid) AS using_expr,
+              pg_get_expr(p.polwithcheck, p.polrelid) AS check_expr
+         FROM pg_policy p WHERE $1::oid = ANY(p.polroles) ORDER BY 1, 2`,
+      [role.oid],
+    )
+  ).rows;
+  for (const policy of policies) {
+    const exact =
+      RUNTIME_APPLICATION_RLS_TABLES.includes(policy.rel as (typeof RUNTIME_APPLICATION_RLS_TABLES)[number]) &&
+      policy.name === RUNTIME_APPLICATION_POLICY &&
+      policy.permissive && policy.command === "*" &&
+      policy.roles.length === 1 && policy.roles[0] === role.oid &&
+      policy.using_expr === "true" && policy.check_expr === "true";
+    if (!exact) out.push(`unapproved policy ${policy.name} on ${policy.rel}`);
+  }
+  if (phase === "post")
+    for (const rel of RUNTIME_APPLICATION_RLS_TABLES)
+      if (!policies.some((p) => p.rel === rel && p.name === RUNTIME_APPLICATION_POLICY))
+        out.push(`missing policy ${RUNTIME_APPLICATION_POLICY} on ${rel}`);
   // Detection only: a per-schema default-privileges GRANT in sessions naming PUBLIC or the
   // role is refused. This is NOT a schema-scoped fix for PostgreSQL's built-in PUBLIC
   // EXECUTE on new functions: per-schema ALTER DEFAULT PRIVILEGES cannot revoke a global
@@ -512,9 +903,11 @@ async function exists(
 
 /**
  * Refuses, before any write, unless the database is either empty of this migration
- * set or exactly a ledgered prefix of it:
+ * set or exactly a ledgered prefix of each migration lane. Upstream and 96Bulls are
+ * independent append-only lanes: a later upstream release must remain deployable after
+ * an earlier image has already recorded the then-current 96Bulls prefix.
  *   ledger_unknown_step   the ledger names a schema step this image doesn't have;
- *   ledger_gap            the ledger isn't one contiguous prefix of the ordered steps;
+ *   ledger_gap            one lane isn't a contiguous prefix of its ordered steps;
  *   migration_changed     a ledgered step's file changed;
  *   unledgered_schema     an object that an unledgered step creates already exists.
  * Nothing is ever imported into, or marked in, the ledger.
@@ -536,30 +929,53 @@ export async function sequencePreflight(
       "ledger_unknown_step",
       `the ledger records ${unknown.join(", ")}, which this image doesn't have; nothing is marked, see the runbook decision point`,
     );
-  let k = 0;
-  while (k < names.length && ledger.has(names[k]!)) k++;
-  const beyond = names.slice(k).filter((n) => ledger.has(n));
-  if (beyond.length)
+  const lanes = ["upstream:", "96bulls:"] as const;
+  const laneNames = (lane: (typeof lanes)[number]) =>
+    names.filter((name) => name.startsWith(lane));
+  const recordedUpstream = laneNames("upstream:").filter((name) =>
+    ledger.has(name),
+  );
+  const recordedBulls = laneNames("96bulls:").filter((name) =>
+    ledger.has(name),
+  );
+  // Every historical image placed the upstream lane before the 96Bulls lane. A lone
+  // 96Bulls row therefore cannot be a legitimate old prefix and remains fail-closed.
+  if (recordedBulls.length > 0 && recordedUpstream.length === 0)
     throw guardError(
       "ledger_gap",
-      `${names[k]} is not recorded but ${beyond[0]} is; the ledger must be one contiguous prefix, nothing is marked, see the runbook decision point`,
+      `${recordedBulls[0]} is recorded without any upstream migration; nothing is marked, see the runbook decision point`,
     );
+  for (const lane of lanes) {
+    const ordered = laneNames(lane);
+    let k = 0;
+    while (k < ordered.length && ledger.has(ordered[k]!)) k++;
+    const beyond = ordered.slice(k).find((name) => ledger.has(name));
+    if (beyond)
+      throw guardError(
+        "ledger_gap",
+        `${ordered[k]} is not recorded but ${beyond} is; ${lane.slice(0, -1)} migrations must be one contiguous prefix, nothing is marked, see the runbook decision point`,
+      );
+  }
   const sql = await Promise.all(
     schemaSteps.map((s) => readFile(s.path, "utf8")),
   );
-  for (let i = 0; i < k; i++) {
+  for (let i = 0; i < names.length; i++) {
+    if (!ledger.has(names[i]!)) continue;
     const sha = createHash("sha256").update(sql[i]!).digest("hex");
-    if (ledger.get(names[i]!) !== sha)
+    if (!migrationChecksumMatches(names[i]!, ledger.get(names[i]!)!, sha))
       throw guardError(
         "migration_changed",
         `migration ${names[i]} changed after it was applied; add a new migration instead`,
       );
   }
   const seen = new Set<string>();
-  for (let i = 0; i < k; i++)
+  for (let i = 0; i < names.length; i++) {
+    if (!ledger.has(names[i]!)) continue;
     for (const o of inventoryOf(sql[i]!)) seen.add(key(o));
+  }
   const found: string[] = [];
-  for (let i = k; i < names.length; i++) {
+  for (let i = 0; i < names.length; i++) {
+    if (ledger.has(names[i]!)) continue;
     for (const o of inventoryOf(sql[i]!)) {
       const id = key(o);
       if (seen.has(id)) continue;
@@ -571,7 +987,8 @@ export async function sequencePreflight(
     }
   }
   // Per-step catalog sentinels: they see ALTER-only and replacement steps too.
-  for (let i = k; i < names.length; i++) {
+  for (let i = 0; i < names.length; i++) {
+    if (ledger.has(names[i]!)) continue;
     const sentinel = schemaSteps[i]!.sentinel ?? MIGRATION_SENTINELS[names[i]!];
     if (!sentinel)
       throw guardError(
@@ -636,7 +1053,18 @@ export const SUPABASE_PLATFORM_SUPERUSERS: readonly string[] = Object.freeze([
   "supabase_admin",
 ]);
 
-/** A platform superuser excluded from creator coverage (supabase mode), with its attributes. */
+/**
+ * Google documents cloudsqladmin as a Cloud SQL system user with database superuser
+ * privileges that customers cannot delete or modify. It is excluded only in cloudsql
+ * mode, only while the catalog still marks it SUPERUSER, and never when it is the
+ * migration owner. No environment variable can extend this list.
+ * https://cloud.google.com/sql/docs/postgres/users#system-users
+ */
+export const CLOUDSQL_PLATFORM_SUPERUSERS: readonly string[] = Object.freeze([
+  "cloudsqladmin",
+]);
+
+/** A fixed provider platform superuser excluded from creator coverage, with its attributes. */
 export interface ExcludedPlatformSuperuser {
   role: string;
   rolsuper: boolean;
@@ -680,13 +1108,14 @@ export interface FunctionBoundaryEvidence {
   sessions_create_roles_covered: boolean;
   /**
    * The HOOPDB_DB_MODE the gate ran under ("unspecified" for --activation-check without
-   * it: full coverage). Only "supabase" excludes platform superusers.
+   * it: full coverage). Only provider-specific modes exclude their fixed platform
+   * superusers.
    */
-  db_mode: "local" | "selfhosted" | "supabase" | "unspecified";
+  db_mode: "local" | "selfhosted" | "cloudsql" | "supabase" | "unspecified";
   /**
-   * supabase mode only: CREATE-capable roles left out of sessions_create_roles because
-   * the catalog shows rolsuper AND the name is in SUPABASE_PLATFORM_SUPERUSERS (the
-   * platform trust root). Always empty in other modes.
+   * Provider mode only: CREATE-capable roles left out of sessions_create_roles because
+   * the catalog shows rolsuper AND the name is in that provider's fixed platform list.
+   * Always empty in local, selfhosted and unspecified modes.
    */
   excluded_platform_superusers: ExcludedPlatformSuperuser[];
   /**
@@ -710,7 +1139,7 @@ export interface FunctionBoundaryEvidence {
  * next migrate's revoke, unless its creator's global function default is exact-safe.
  * The migrator's function-boundary gate (and --activation-check) therefore requires the
  * mode the deployment selects (HOOPDB_FUNCTION_BOUNDARY_MODE, configuration, not a human
- * sign-off) to be proven by the catalog. It applies in selfhosted and supabase mode; only
+ * sign-off) to be proven by the catalog. It applies outside local mode; only
  * explicit local mode is ungated:
  *   "global-default-revoke": every sessions creator, the migration owner included, has
  *       a global function default of exactly {<self>:EXECUTE} (no other grantee, no grant
@@ -724,7 +1153,7 @@ export interface FunctionBoundaryEvidence {
 export async function functionBoundaryEvidence(
   client: GuardClient,
   mode: FunctionBoundaryMode | undefined,
-  dbMode: "local" | "selfhosted" | "supabase" | undefined = undefined,
+  dbMode: "local" | "selfhosted" | "cloudsql" | "supabase" | undefined = undefined,
 ): Promise<FunctionBoundaryEvidence> {
   const head = (
     await client.query<{
@@ -773,11 +1202,17 @@ export async function functionBoundaryEvidence(
   const excluded: ExcludedPlatformSuperuser[] = [];
   for (const r of roles) {
     const d = await defaultOf(r.oid);
+    const providerSuperusers =
+      dbMode === "supabase"
+        ? SUPABASE_PLATFORM_SUPERUSERS
+        : dbMode === "cloudsql"
+          ? CLOUDSQL_PLATFORM_SUPERUSERS
+          : [];
     if (
-      dbMode === "supabase" &&
+      providerSuperusers.length > 0 &&
       r.rolsuper === true &&
       r.oid !== head.owner_oid &&
-      SUPABASE_PLATFORM_SUPERUSERS.includes(r.rolname)
+      providerSuperusers.includes(r.rolname)
     ) {
       excluded.push({
         role: r.rolname,

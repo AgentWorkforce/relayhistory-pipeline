@@ -74,9 +74,11 @@ const compositions: [string, (window?: ClaimlessWindow) => Rendered][] = [
       bulls96ReleaseValues(
         {
           enabled: true,
-          chartVersion: "0.3.0",
+          chartVersion: "0.3.2",
           tenantOrgId: "org_123",
           existingSecretName: "bulls96-runtime",
+          hoopdbRuntimeRole: "bulls96_runtime",
+          hoopdbRuntimeRoleLogin: true,
           imageDigest: `sha256:${"a".repeat(64)}`,
           imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
           relayauthJwksUrl:
@@ -99,8 +101,10 @@ const compositions: [string, (window?: ClaimlessWindow) => Rendered][] = [
           pubsubTopic: "projects/agentworkforce-dev1/topics/events",
           pubsubSubscription:
             "projects/agentworkforce-dev1/subscriptions/events",
-          workloadIdentityEmail:
-            "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
+          workloadIdentityEmails: {
+            worker: "awf-dev-worker@agentworkforce-dev1.iam.gserviceaccount.com",
+            alleyoop: "awf-dev-alleyoop@agentworkforce-dev1.iam.gserviceaccount.com",
+          },
         },
       ) as unknown as Rendered,
   ],

@@ -13,8 +13,15 @@ import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { schemaVerdict, type Transact } from "../../shared/db.ts";
 import {
+  CLOUDSQL_PLATFORM_SUPERUSERS,
   functionBoundaryEvidence,
+  isSupabaseCreatorEdge,
+  isSupabasePublicTemp,
+  isRuntimeWorkloadEdge,
   inventoryOf,
+  MIGRATION_CHECKSUM_ALIASES,
+  migrationChecksumMatches,
+  RUNTIME_APPLICATION_FUNCTIONS,
   sessionsFunctionAcl,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
   SUPABASE_PLATFORM_SUPERUSERS,
@@ -103,7 +110,7 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
     ["no mode", { ...base, HOOPDB_SUPABASE_SHIM: "true" }, "db_mode_invalid"],
     [
       "an unknown mode",
-      { ...base, HOOPDB_DB_MODE: "cloud", HOOPDB_SUPABASE_SHIM: "true" },
+      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_SUPABASE_SHIM: "true" },
       "db_mode_invalid",
     ],
     [
@@ -124,6 +131,11 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
     [
       "selfhosted without an explicit shim choice",
       { ...base, HOOPDB_DB_MODE: "selfhosted" },
+      "shim_unset",
+    ],
+    [
+      "cloudsql without an explicit shim choice",
+      { ...base, HOOPDB_DB_MODE: "cloudsql" },
       "shim_unset",
     ],
     [
@@ -179,6 +191,20 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
         HOOPDB_ROLE_BOOTSTRAP: "false",
       }),
     ).toMatchObject({ shim: true, bootstrap: false });
+    expect(
+      migrationProfile({
+        ...base,
+        HOOPDB_DB_MODE: "cloudsql",
+        HOOPDB_SUPABASE_SHIM: "true",
+        HOOPDB_ROLE_BOOTSTRAP: "false",
+        HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+      }),
+    ).toMatchObject({
+      mode: "cloudsql",
+      shim: true,
+      bootstrap: false,
+      functionBoundary: "global-default-revoke",
+    });
   });
 
   test("migrate() refuses supabase+shim before opening any connection", async () => {
@@ -199,6 +225,17 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
       for (const k of Object.keys(process.env))
         if (!(k in saved)) delete process.env[k];
       Object.assign(process.env, saved);
+    }
+  });
+
+  test("readiness binds the explicit cloudsql database mode", async () => {
+    const saved = process.env.HOOPDB_DB_MODE;
+    try {
+      process.env.HOOPDB_DB_MODE = "cloudsql";
+      expect(await expectedSchema()).toMatchObject({ dbMode: "cloudsql" });
+    } finally {
+      if (saved === undefined) delete process.env.HOOPDB_DB_MODE;
+      else process.env.HOOPDB_DB_MODE = saved;
     }
   });
 });
@@ -300,7 +337,7 @@ describe("runtime role: required, existing, SELECT only", () => {
     expect(await snapshot(db)).toEqual(before);
   });
 
-  test("a dedicated runtime role gets SELECT on the ledger and marker only: no DML, no DDL, owns nothing, NOBYPASSRLS, and the live gate passes as it", async () => {
+  test("a dedicated runtime role gets the exact service ACL plus read-only readiness metadata, no DDL, ownership or BYPASSRLS, and the live gate passes", async () => {
     const db = await fresh();
     await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
     await runMigrations(client(db), {
@@ -333,6 +370,44 @@ describe("runtime role: required, existing, SELECT only", () => {
         g: false,
       });
     }
+    expect(
+      (
+        await db.query<Record<string, boolean>>(
+          `SELECT has_table_privilege('g6_rt', 'sessions.pipeline_jobs', 'SELECT, INSERT, UPDATE, DELETE') AS queue_dml,
+                  has_table_privilege('g6_rt', 'sessions.claimless_uses', 'UPDATE') AS claimless_update,
+                  has_table_privilege('g6_rt', 'sessions.migration_assertion_uses', 'SELECT, INSERT, UPDATE, DELETE') AS assertion_cleanup,
+                  has_table_privilege('g6_rt', 'sessions.migration_assertion_chunks', 'SELECT, INSERT, UPDATE, DELETE') AS chunk_cleanup,
+                  has_table_privilege('g6_rt', 'sessions.migration_base_read_uses', 'SELECT, INSERT, UPDATE, DELETE') AS base_read_cleanup,
+                  has_table_privilege('g6_rt', 'sessions.migration_ingest_audit', 'UPDATE, DELETE') AS audit_mutation,
+                  has_table_privilege('g6_rt', 'sessions.pipeline_jobs', 'TRUNCATE') AS queue_truncate,
+                  has_sequence_privilege('g6_rt', 'sessions.pipeline_jobs_id_seq', 'USAGE') AS queue_sequence,
+                  has_function_privilege('g6_rt', 'sessions.upsert_session_index(jsonb)', 'EXECUTE') AS index_rpc,
+                  has_function_privilege('g6_rt', 'sessions.pipeline_events_maintain(interval,integer)', 'EXECUTE') AS maintenance_rpc,
+                  has_function_privilege('g6_rt', 'sessions.pipeline_jobs_observability()', 'EXECUTE') AS trigger_execute`,
+        )
+      ).rows[0],
+    ).toEqual({
+      queue_dml: true,
+      claimless_update: true,
+      assertion_cleanup: true,
+      chunk_cleanup: true,
+      base_read_cleanup: true,
+      audit_mutation: false,
+      queue_truncate: false,
+      queue_sequence: true,
+      index_rpc: true,
+      maintenance_rpc: false,
+      trigger_execute: false,
+    });
+    expect(
+      (
+        await db.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM pg_policy p
+            WHERE p.polname = 'bulls96_trusted_backend'
+              AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
+        )
+      ).rows[0]?.n,
+    ).toBe(23);
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
@@ -425,6 +500,20 @@ describe("one migration authority: never import or mark an unledgered backlog", 
     );
     expect(await snapshot(db)).toEqual(before);
   });
+
+  test("a gap inside the 96bulls lane: refused, nothing marked, marker unchanged", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    await db.exec(
+      "DELETE FROM sessions.__96bulls_migrations WHERE name = '96bulls:0003_fanout_ledger.sql'",
+    );
+    const before = await snapshot(db);
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error?.code).toBe("ledger_gap");
+    expect(error?.message).toContain("96bulls:0003_fanout_ledger.sql");
+    expect(error?.message).toContain("96bulls:0004_summary_pointers.sql");
+    expect(await snapshot(db)).toEqual(before);
+  });
 });
 
 test("the runbook's 20261030020000 checksum is the file's real sha256", () => {
@@ -441,6 +530,32 @@ test("the runbook's 20261030020000 checksum is the file's real sha256", () => {
       "utf8",
     ),
   ).toContain(sha);
+  expect(MIGRATION_CHECKSUM_ALIASES).toEqual([
+    {
+      migration: "upstream:20261030020000_session_directory_short_summary.sql",
+      ledger_sha:
+        "c223b77e4c875cbc36499e6ca1c8e521b564ebf25facd87313b3e58335918de4",
+      accepted_as_alias_of: sha,
+    },
+  ]);
+  const [alias] = MIGRATION_CHECKSUM_ALIASES;
+  expect(
+    migrationChecksumMatches(
+      alias!.migration,
+      alias!.ledger_sha,
+      alias!.accepted_as_alias_of,
+    ),
+  ).toBe(true);
+  expect(
+    migrationChecksumMatches(
+      "upstream:20261030010000_session_directory.sql",
+      alias!.ledger_sha,
+      alias!.accepted_as_alias_of,
+    ),
+  ).toBe(false);
+  expect(migrationChecksumMatches(alias!.migration, "d".repeat(64), sha)).toBe(
+    false,
+  );
 });
 
 describe("runtime role: the exact least-privilege allowlist (hostile roles refused before any write)", () => {
@@ -496,7 +611,7 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
     [
       "the workload member WITH ADMIN OPTION",
       "CREATE ROLE g6_wl NOLOGIN; GRANT g6_bad TO g6_wl WITH ADMIN OPTION",
-      "granted to g6_wl WITH ADMIN OPTION",
+      "granted to g6_wl by postgres with ADMIN=true",
       { workloadRole: "g6_wl" },
     ],
     [
@@ -515,9 +630,9 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       "CREATE on the database",
     ],
     [
-      "existing DML",
-      "GRANT INSERT, UPDATE ON sessions.session_index TO g6_bad",
-      "INSERT,UPDATE on sessions.session_index",
+      "unapproved table privilege",
+      "GRANT TRUNCATE ON sessions.session_index TO g6_bad",
+      "TRUNCATE on sessions.session_index",
     ],
     [
       "a column privilege",
@@ -531,8 +646,8 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
     ],
     [
       "unapproved EXECUTE (direct)",
-      "GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO g6_bad",
-      "EXECUTE on sessions.upsert_session_index(jsonb)",
+      "GRANT EXECUTE ON FUNCTION sessions.session_directory_readiness() TO g6_bad",
+      "EXECUTE on sessions.session_directory_readiness()",
     ],
     [
       "EXECUTE on a trigger function (no exemption)",
@@ -558,6 +673,11 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       "a PUBLIC table privilege outside sessions",
       "CREATE TABLE public.g6_pub (x int); GRANT SELECT ON public.g6_pub TO PUBLIC",
       "SELECT on g6_pub",
+    ],
+    [
+      "a direct table privilege in an inaccessible schema",
+      "CREATE SCHEMA g6_hidden; CREATE TABLE g6_hidden.g6_direct (x int); GRANT SELECT ON g6_hidden.g6_direct TO g6_bad",
+      "has privileges on table g6_hidden.g6_direct",
     ],
     [
       "a PUBLIC sequence privilege outside sessions",
@@ -605,6 +725,99 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       "WITH GRANT OPTION is not approved",
     ],
   ];
+
+  test("Supabase PG16+ creator-edge predicate has no wildcard or mutable option", () => {
+    const cfg = { mode: "supabase" as const };
+    const edge = {
+      rolname: "postgres",
+      grantor: "supabase_admin",
+      grantor_super: true,
+      admin_option: true,
+      inherit_option: false,
+      set_option: false,
+    };
+    expect(isSupabaseCreatorEdge(cfg, 170011, edge)).toBe(true);
+    expect(isSupabaseCreatorEdge({ mode: "selfhosted" }, 170011, edge)).toBe(
+      false,
+    );
+    expect(isSupabaseCreatorEdge(cfg, 150019, edge)).toBe(false);
+    expect(
+      isSupabaseCreatorEdge(
+        { ...cfg, workload: "authenticator" },
+        170011,
+        edge,
+      ),
+    ).toBe(true);
+    for (const mutation of [
+      { rolname: "relayhistory_owner" },
+      { grantor: "ops_admin" },
+      { grantor_super: false },
+      { admin_option: false },
+      { inherit_option: true },
+      { set_option: true },
+    ])
+      expect(isSupabaseCreatorEdge(cfg, 170011, { ...edge, ...mutation })).toBe(
+        false,
+      );
+  });
+
+  test("runtime workload edge is exact, inheriting and granted only by the hosted creator or a superuser", () => {
+    const cfg = {
+      mode: "supabase" as const,
+      workload: "bulls96_workload",
+    };
+    const edge = {
+      rolname: "bulls96_workload",
+      grantor: "postgres",
+      grantor_super: false,
+      admin_option: false,
+      inherit_option: true,
+      set_option: true,
+    };
+    expect(isRuntimeWorkloadEdge(cfg, edge, true)).toBe(true);
+    expect(isRuntimeWorkloadEdge(cfg, edge)).toBe(false);
+    expect(
+      isRuntimeWorkloadEdge(
+        { mode: "selfhosted", workload: "bulls96_workload" },
+        { ...edge, grantor: "cluster_admin", grantor_super: true },
+      ),
+    ).toBe(true);
+    for (const mutation of [
+      { rolname: "second_workload" },
+      { grantor: "app_owner" },
+      { admin_option: true },
+      { inherit_option: false },
+      { set_option: false },
+    ])
+      expect(isRuntimeWorkloadEdge(cfg, { ...edge, ...mutation }, true)).toBe(
+        false,
+      );
+    expect(isRuntimeWorkloadEdge({ mode: "supabase" }, edge)).toBe(false);
+  });
+
+  test("Supabase PUBLIC TEMP compatibility accepts only the frozen indirect baseline", () => {
+    const cfg = { mode: "supabase" as const };
+    const evidence = {
+      effective: true,
+      direct: false,
+      public: true,
+      public_grantable: false,
+    };
+    expect(isSupabasePublicTemp(cfg, evidence)).toBe(true);
+    expect(isSupabasePublicTemp({ mode: "selfhosted" }, evidence)).toBe(false);
+    expect(
+      isSupabasePublicTemp({ ...cfg, workload: "authenticator" }, evidence),
+    ).toBe(true);
+    for (const mutation of [
+      { effective: false },
+      { direct: true },
+      { public: false },
+      { public_grantable: true },
+    ])
+      expect(isSupabasePublicTemp(cfg, { ...evidence, ...mutation })).toBe(
+        false,
+      );
+  });
   for (const [name, setup, problem, extra] of HOSTILE)
     test(`refuses a runtime role with ${name}; ledger, marker and grants unchanged`, async () => {
       const db = await migrated();
@@ -623,16 +836,30 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
 
   test("the documented workload membership (no ADMIN) is accepted", async () => {
     const db = await migrated();
-    await db.exec(
-      "CREATE ROLE g6_bad NOLOGIN; CREATE ROLE g6_wl LOGIN; GRANT g6_bad TO g6_wl",
-    );
+    await db.exec("CREATE ROLE g6_wl LOGIN; GRANT g6_rt TO g6_wl");
     expect(
       await failure(
         runMigrations(client(db), {
-          profile: { ...GOOD, runtimeRole: "g6_bad", workloadRole: "g6_wl" },
+          profile: { ...GOOD, workloadRole: "g6_wl" },
         }),
       ),
     ).toBeNull();
+  });
+
+  test("an altered runtime RLS policy fails closed before the marker can be rewritten", async () => {
+    const db = await migrated();
+    await db.exec(
+      "ALTER POLICY bulls96_trusted_backend ON sessions.pipeline_jobs USING (false)",
+    );
+    const before = await state(db);
+    const error = await failure(
+      runMigrations(client(db), { profile: GOOD }),
+    );
+    expect(error?.code).toBe("runtime_role_unsafe");
+    expect(error?.message).toContain(
+      "unapproved policy bulls96_trusted_backend on sessions.pipeline_jobs",
+    );
+    expect(await state(db)).toEqual(before);
   });
 
   test("selfhosted refuses the migration owner as the runtime role (owner-run is local only)", async () => {
@@ -682,7 +909,7 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
   });
 });
 
-describe("the full ordered migration sequence: one contiguous prefix, no unledgered footprint", () => {
+describe("the ordered migration lanes: contiguous prefixes, no unledgered footprint", () => {
   test("helm repro (a): only session_directory present: refused before any write (no ledger rows, no 42P07)", async () => {
     const db = await fresh();
     await db.exec(
@@ -703,6 +930,39 @@ describe("the full ordered migration sequence: one contiguous prefix, no unledge
     const error = await failure(runMigrations(client(db), { profile: LOCAL }));
     expect(error?.code).toBe("ledger_gap");
     expect(await snapshot(db)).toEqual(before);
+  });
+
+  test("a later upstream prefix extends an already-complete earlier 96bulls lane", async () => {
+    const db = await fresh();
+    const current = await plan(LOCAL);
+    const oldImage = current.filter(
+      (step) =>
+        !step.name.startsWith("verify:") &&
+        (!step.name.startsWith("upstream:") ||
+          step.name <=
+            "upstream:20261030000000_relayhistory_machines_compat.sql"),
+    );
+    await runMigrations(client(db), {
+      profile: { ...LOCAL, verify: false },
+      steps: oldImage,
+    });
+    const before = await db.query<{ name: string }>(
+      "SELECT name FROM sessions.__96bulls_migrations ORDER BY name",
+    );
+    expect(before.rows.some(({ name }) => name.startsWith("96bulls:"))).toBe(
+      true,
+    );
+    expect(
+      before.rows.some(
+        ({ name }) =>
+          name === "upstream:20261030010000_session_directory.sql",
+      ),
+    ).toBe(false);
+
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await schemaVerdict(await expectedSchema(), transact(db))).toEqual({
+      ok: true,
+    });
   });
 
   test("a contiguous prefix whose unrecorded later steps were applied anyway: refused, nothing marked", async () => {
@@ -989,6 +1249,17 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   const MANIFEST = JSON.parse(
     readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8"),
   ).functions;
+  const manifestWithRuntime = (role: string) =>
+    Object.fromEntries(
+      Object.entries(MANIFEST).map(([fn, entries]) => [
+        fn,
+        RUNTIME_APPLICATION_FUNCTIONS.includes(
+          fn as (typeof RUNTIME_APPLICATION_FUNCTIONS)[number],
+        )
+          ? [...(entries as string[]), `${role}:EXECUTE`]
+          : entries,
+      ]),
+    );
 
   test("ACL manifest regression: every sessions function's ACL after a clean migrate is exactly the committed manifest", async () => {
     const db = await fresh();
@@ -1142,6 +1413,130 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     functionBoundary: "global-default-revoke",
   };
   const platformList = [...SUPABASE_PLATFORM_SUPERUSERS];
+
+  test("Cloud SQL trust root: only Google's fixed cloudsqladmin SUPERUSER is excluded in cloudsql mode", async () => {
+    expect(Object.isFrozen(CLOUDSQL_PLATFORM_SUPERUSERS)).toBe(true);
+    expect([...CLOUDSQL_PLATFORM_SUPERUSERS]).toEqual(["cloudsqladmin"]);
+    const db = await supabaseLike();
+    await db.exec(
+      `${OWNER_FN_DEFAULT_REVOKE}; CREATE ROLE cloudsqladmin SUPERUSER NOLOGIN`,
+    );
+    const cloudsql = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "cloudsql",
+    );
+    expect(cloudsql.satisfied).toBe(true);
+    expect(cloudsql.excluded_platform_superusers).toEqual([
+      expect.objectContaining({
+        role: "cloudsqladmin",
+        rolsuper: true,
+        function_default: ["<built-in>"],
+      }),
+    ]);
+    expect(cloudsql.sessions_create_roles.map((c) => c.role)).not.toContain(
+      "cloudsqladmin",
+    );
+    const selfhosted = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "selfhosted",
+    );
+    expect(selfhosted.satisfied).toBe(false);
+    expect(selfhosted.excluded_platform_superusers).toEqual([]);
+    expect(selfhosted.sessions_create_roles).toContainEqual(
+      expect.objectContaining({
+        role: "cloudsqladmin",
+        superuser: true,
+        function_default_exact: false,
+      }),
+    );
+  });
+
+  test("Cloud SQL owner and migration-role bootstraps produce catalog-proven, membership-free state", async () => {
+    const db = new PGlite({
+      username: "cloudsqladmin",
+      database: "postgres",
+      initDbStartParams: ["--username=cloudsqladmin"],
+      extensions: { btree_gin, pg_trgm },
+    });
+    open.push(db);
+    await db.exec(`
+      CREATE ROLE cloudsqlsuperuser NOLOGIN;
+      CREATE ROLE migration_owner LOGIN CREATEROLE;
+      GRANT cloudsqlsuperuser TO migration_owner;
+      GRANT migration_owner TO cloudsqladmin;
+      GRANT CONNECT, CREATE ON DATABASE postgres TO migration_owner;
+      SET ROLE migration_owner;
+      CREATE SCHEMA sessions AUTHORIZATION migration_owner;
+      CREATE FUNCTION sessions.probe() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+    `);
+    await db.exec(
+      readFileSync(
+        join(
+          root,
+          "supabase/bootstrap/cloudsql_owner_function_default_revoke.sql",
+        ),
+        "utf8",
+      ),
+    );
+    const evidence = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "cloudsql",
+    );
+    expect(evidence.satisfied).toBe(true);
+    expect(evidence.owner_function_default).toEqual(["<self>:EXECUTE"]);
+    expect(evidence.excluded_platform_superusers).toEqual([
+      expect.objectContaining({ role: "cloudsqladmin", rolsuper: true }),
+    ]);
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      `SET ROLE migration_owner; ${readFileSync(
+        join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      )}`,
+    );
+    const targets = await db.query<{
+      rolname: string;
+      rolcanlogin: boolean;
+      rolinherit: boolean;
+      rolbypassrls: boolean;
+      memberships: number;
+    }>(
+      `SELECT role.rolname, role.rolcanlogin, role.rolinherit, role.rolbypassrls,
+              (SELECT count(*)::int FROM pg_auth_members membership
+                WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
+         FROM pg_roles role
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker')
+        ORDER BY 1`,
+    );
+    expect(targets.rows).toHaveLength(4);
+    expect(targets.rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          rolname: "service_role",
+          rolbypassrls: false,
+        }),
+        expect.objectContaining({
+          rolname: "session_directory_search_worker",
+          rolcanlogin: false,
+          rolinherit: false,
+          memberships: 0,
+        }),
+      ]),
+    );
+    expect(
+      await db.query(
+        `SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_cloudsql_role_seed'`,
+      ),
+    ).toMatchObject({ rows: [] });
+  });
 
   test("platform trust root: supabase_admin as a superuser with no safe default is excluded in supabase mode (listed with its attributes); the same catalog fails without the exclusion (selfhosted)", async () => {
     expect(platformList).toEqual(["supabase_admin"]);
@@ -1537,7 +1932,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       functionBoundary: "global-default-revoke",
     };
     await runMigrations(client(db), { profile: SELFP });
-    expect(await sessionsFunctionAcl(client(db))).toEqual(MANIFEST);
+    expect(await sessionsFunctionAcl(client(db))).toEqual(
+      manifestWithRuntime("g6_rt"),
+    );
     await db.exec(`CREATE FUNCTION sessions.g6_future() RETURNS int LANGUAGE sql AS 'SELECT 1';
       CREATE SCHEMA g6_second; CREATE FUNCTION g6_second.g6_future() RETURNS int LANGUAGE sql AS 'SELECT 1';
       CREATE ROLE g6_probe NOLOGIN;`);
@@ -1555,7 +1952,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       "DROP FUNCTION sessions.g6_future(); DROP SCHEMA g6_second CASCADE",
     );
     await runMigrations(client(db), { profile: SELFP });
-    expect(await sessionsFunctionAcl(client(db))).toEqual(MANIFEST);
+    expect(await sessionsFunctionAcl(client(db))).toEqual(
+      manifestWithRuntime("g6_rt"),
+    );
   });
 });
 

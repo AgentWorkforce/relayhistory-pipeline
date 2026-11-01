@@ -6,7 +6,7 @@
 --
 -- Usage (psql 12+, from the repository root, against the migrated database):
 --   GEN=$(bun src/hoopdb/migrate.ts --generation)    # same image as the readers
---   psql -v ON_ERROR_STOP=1 -X -v generation="$GEN" \
+--   psql -v ON_ERROR_STOP=1 -X -v generation="$GEN" -v db_mode=selfhosted \
 --     -f supabase/bootstrap/session_directory_search_worker_mark_pass.sql
 --
 -- What it does, in one transaction:
@@ -30,6 +30,7 @@
 BEGIN;
 SELECT pg_advisory_xact_lock(961996, 1);
 SELECT set_config('hoopdb.role_validation_generation', :'generation', true);
+SELECT set_config('hoopdb.db_mode', :'db_mode', true);
 \ir session_directory_search_worker_verify.sql
 DO $mark$
 DECLARE

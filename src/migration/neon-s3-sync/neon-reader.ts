@@ -438,6 +438,48 @@ export async function fencedGroups(db: Queryable): Promise<{ org_id: string; ses
   return rows;
 }
 
+/**
+ * Deletion tombstones with the identity relayhistory-api's live writer keys
+ * its objects by (`m=srv_<sha256(workspace \x1f origin \x1f user)[0:32]>`,
+ * WRITE_PATH): the same fence as `fenceCache` and `fencedGroups`,
+ * `deleted_upload_sessions` only. A reset writes a tombstone for every
+ * session it covers (0039 -> 0038 `set_session_uploads`), and so does the
+ * Neon replica for a batch a reset superseded (relayhistory-cloud 0070), so
+ * no reset leg is needed, and none may be added: one joined to later
+ * deliveries would erase sessions uploaded after the reset.
+ */
+export interface LiveFencedGroup {
+  org_id: string;
+  workspace_id: string;
+  user_id: string;
+  origin_id: string;
+  source: string;
+  session_id: string;
+}
+
+export const LIVE_FENCE_PAGE = 5_000;
+
+/** One keyset page of tombstones, in primary-key order, after `after`. */
+export async function fencedLivePage(
+  db: Queryable,
+  after: LiveFencedGroup | null,
+  limit = LIVE_FENCE_PAGE,
+): Promise<LiveFencedGroup[]> {
+  const cols = "org_id, workspace_id, user_id, origin_id, source, session_id";
+  const { rows } = after
+    ? await db.query<LiveFencedGroup>(
+        `SELECT ${cols} FROM sessions.deleted_upload_sessions
+          WHERE (${cols}) > ($1, $2, $3, $4, $5, $6)
+          ORDER BY ${cols} LIMIT $7`,
+        [after.org_id, after.workspace_id, after.user_id, after.origin_id, after.source, after.session_id, limit],
+      )
+    : await db.query<LiveFencedGroup>(
+        `SELECT ${cols} FROM sessions.deleted_upload_sessions ORDER BY ${cols} LIMIT $1`,
+        [limit],
+      );
+  return rows;
+}
+
 interface SmallRow extends DeliveryRow {
   kind: string;
   operation: string;

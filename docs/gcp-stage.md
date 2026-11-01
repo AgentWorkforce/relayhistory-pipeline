@@ -58,7 +58,7 @@ runtime image and proof.
 
 ### Machine-bound assertion activation gate
 
-The recorded one-off verifier minted its RelayAuth assertion directly through
+The original one-off verifier minted its RelayAuth assertion directly through
 the in-cluster port-forward. RelayAuth #113 changes that request contract: each
 mint must include the exact proof courier `machineId`, and the returned signed
 claim must contain the identical value at `meta.machineId`. A proof involving
@@ -68,14 +68,81 @@ reuse is not permitted. The committed AWS proof minter and the self-hosted
 verifier cannot copy the old claimless request safely.
 
 The machine claim fences AlleyOop HTTP writes only. The worker and AlleyOop
-pods also access GCS directly through their shared Workload Identity runtime
-service account; those bucket-direct operations do not traverse the HTTP
-machine gate. Their boundary is the vended Google credential and its
-bucket-level `roles/storage.objectUser` grant, not `meta.machineId`. Route tests
-therefore prove no bucket-direct isolation. GCP activation remains held until
-the RelayAuth #113 image and a services image containing this change are pinned
-and a new live proof records the request machine, signed claim, matching-route
-success, and claimless/mismatch zero-side-effect refusals.
+pods also access GCS directly through Workload Identity; those bucket-direct
+operations do not traverse the HTTP machine gate, and their boundary is the
+vended Google credential, not `meta.machineId`. Route tests therefore prove no
+bucket-direct isolation.
+
+### Per-component bucket identities
+
+Each component now has its own Google service account, scoped like the AWS
+roles in `stacks/aws/hardening.ts` (`stacks/gcp/bucket-iam.ts`):
+
+| Google service account | Kubernetes service account | Locker bucket | Other |
+| --- | --- | --- | --- |
+| `<stage>-alleyoop` | `96bulls/bulls96-alleyoop` | `objectViewer`; `objectUser` only where the name is under `v1/` and ends `/manifest.json` (live and parked) or `.zst` (raw chunks) | none |
+| `<stage>-worker` | `96bulls/bulls96-worker` (pods and Jobs) | `objectViewer`; `objectUser` only for `v1/…/summary/{short,long}.json.enc` | Pub/Sub publisher and subscriber on the events topic and subscription |
+| `<stage>-runtime` | `96bulls/cloud-sql-proxy` | none | `roles/cloudsql.client` |
+
+The write edge is `objectUser`, because a manifest compare-and-swap and
+parked-session cleanup overwrite or delete, and Cloud Storage requires
+`storage.objects.delete` for both. `objects.list` is evaluated against the
+bucket, so the conditional edge never widens listing. Alchemy's `IAM.Member`
+manages only unconditional edges, so the stack reconciles the two conditional
+edges against the bucket's version-3 policy under its etag, through the
+`EnsureLockerWriteScopes` action. It touches only bindings whose condition
+title starts with `96bulls-locker-write-`. A destroy leaves those edges on the
+bucket, and they are removed with it.
+
+This is component isolation, not machine isolation. AlleyOop and the workers
+serve every machine by design, so no per-machine prefix scope applies to them.
+Machine binding stays at the AlleyOop HTTP gate, which is the only path a
+courier has to the bucket. The reviewed RelayAuth #113
+image/chart and the services image containing this change are pinned in
+`versions.lock.json`.
+
+The machine-bound activation gate passed live on 2026-11-01 against merge
+`4d4d459eeed854343ebe0c18f0974a872f43ac72`. The deployment used the services
+image built from `030f59c06f5be7736053a2d153c443246ca55840`, digest
+`sha256:68afce1d31930e76cd013b40b6a81eef552dd3338a2dc717edfc575862a74254`.
+The exact-merge plan contained 42 in-place updates and five actions, with no
+create or delete. The approved deploy reconciled 47 of 47 operations; the
+Cloud SQL action adopted the existing instance rather than recreating it. The
+migration Job `bulls96-worker-migrate-d5f64141` succeeded before the runtime
+readback.
+
+The verifier used proof courier
+`proof-gcp-mvy6pl6a110b6b-a`, session
+`01a19872-3572-78cb-845e-c132749c7672`, and trace
+`01a19872-3574-759d-93c7-984b42483762`. It established all of the following:
+
+- the requested machine and signed `meta.machineId` were identical;
+- a valid 60-second claimless assertion and a mismatched-machine assertion
+  were each refused with HTTP 403 `machine_claim_refused`, with zero HoopDB or
+  GCS side effects;
+- the matching-machine chunk and manifest were accepted, the manifest landed
+  in GCS, and `object-landed`, `session-indexed`, `summary-short`,
+  `summary-long`, and `status-classify` all completed `ok`;
+- both encrypted summary objects and ready summary pointers existed, the
+  session index and directory rows existed, the freshly reminted trace-read
+  token returned verdict `indexed`, and the tenant had zero dead letters; and
+- the planted record was intentionally open, so its correct pointer state was
+  `active`, with `scrubbed=true` and `scrub_quarantined=false`. An initial
+  verifier expectation of `done` was corrected; the pipeline result did not
+  change.
+
+After the proof, RelayAuth, the four 96Bulls services, and the Cloud SQL proxy
+were all available at their desired replica counts with zero restarts. Every
+96Bulls service pod ran the pinned digest above. The failed verifier's exact
+orphan prefix for machine `proof-gcp-mvy3w3f0c6e05a-a` and session
+`01a19829-f44c-7241-b40a-8eb3e556998f` was removed including object versions;
+successful proof evidence was retained. Temporary kubeconfigs, SSH keys, and
+the runner's deployment bundle were kept in tmpfs and removed after use.
+
+This passes the base GCP machine-bound application activation gate. It does
+not prove bucket-direct machine isolation, Relaycast HA, the separately gated
+V1 indexed search/product-route replay, backup and restore, a full teardown, or
+workload egress restriction.
 
 The stack entry point is `stacks/gcp/alchemy.gcp.run.ts`. It uses the same
 Alchemy + AgentWorkforce Helm boundary as the AWS stack: cloud code declares
@@ -194,6 +261,23 @@ is ClusterIP and the chart NetworkPolicy accepts callers only from its
 namespace. `baseUrl` remains the chart-required signed-URL authority; it does
 not create public exposure. This is the single-replica SQLite contract, not a
 GCP HA proof.
+
+RelayAuth, when configured, is restricted to published chart `0.1.1` from the
+AgentWorkforce HTTPS Helm index. That release package has SHA-256
+`add6f2b3fe55a301a99b0ab43ad28a84c79767793ae7d66a38281f9d61669121`
+and its public OCI chart manifest is
+`sha256:b73b8566a97a26cfa8739ea194b1ffa627607fa603b3841e3ef2930961e48ac9`.
+The stack also overrides the chart image explicitly to
+`ghcr.io/agentworkforce/relayauth@sha256:c23c92d25fdffef3b5838a1eef4c226925f859706365d9ccece229795b877288`,
+built from reviewed RelayAuth source
+`784582ef983bb72b13b43512d9a4142ef5dfabb2` containing PR #113. A different
+chart version, repository, or default image cannot enter this proof contract.
+Before provider or state initialization, the stack reads the release archive
+once, verifies the recorded package digest, and materializes only those
+captured bytes into the same tamper-detecting local chart cache used by
+Relaycast. Helm never re-resolves the RelayAuth templates from the mutable
+repository index during plan or deploy.
+
 `/readyz` also checks that data path when `LOCKER_PROVIDER=gcs` or
 `WORKER_DATA_PATH_PROBE=1`. Production is not this lane: the production
 database is Supabase and production object storage is AWS S3.
@@ -225,6 +309,10 @@ or secret payload. Example:
   },
   "clearedBy": "Khaliq's exact clearance words, YYYY-MM-DD",
   "managedDataPlane": { "provision": false },
+  "relayauth": {
+    "chartVersion": "0.1.1",
+    "existingSecretName": "relayauth-runtime"
+  },
   "relaycast": {
     "chartVersion": "0.1.0",
     "baseUrl": "https://relay.gcp.example.com"
@@ -238,9 +326,11 @@ To request the application release after its external Secrets exist, set
 ```json
 "bulls96": {
   "enabled": true,
-  "chartVersion": "0.3.0",
+  "chartVersion": "0.3.2",
   "tenantOrgId": "org_replace_me",
   "existingSecretName": "96bulls-runtime",
+  "hoopdbRuntimeRole": "bulls96_runtime",
+  "hoopdbRuntimeRoleLogin": true,
   "imageDigest": "sha256:<digest-built-from-the-reviewed-main-commit>",
   "imageSourceRevision": "<full-40-character-reviewed-main-commit>",
   "relayauthJwksUrl": "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
@@ -266,16 +356,26 @@ for the digest-pinned services image, and the GKE node identity receives
 read-only Artifact Registry access. No GHCR pull token or dockerconfigjson
 Secret is used or required for that path.
 
+The named Secret must keep the two database boundaries separate:
+`HOOPDB_MIGRATION_URL` is the owner connection read only by the one-shot
+migration Job, while `HOOPDB_URL` is the dedicated non-owner login read by
+every long-running 96Bulls workload. `hoopdbRuntimeRole` must be the role named
+by that runtime URL and its login mode must be explicit. The stack refuses to
+render an enabled release without this separation; it never falls back to the
+owner URL for services.
+
 The digest and source revision must exactly match the structured services
 release in `versions.lock.json`, and that release must set
-`gcpProofEligible: true`. The currently recorded `09293c8` image is published
-only in the `awf-conformance-images` repository, so an enabled 96Bulls release
-is refused outside the `gcp-conformance` stage. Substrate-only stages and
-destroy cleanup remain available. A services image release updates the digest,
-full source revision, and eligibility together only after the image build and
-review complete; an arbitrary or merely well-formed digest cannot enable this
-stage. Dispatching `.github/workflows/publish-image-ar.yml` pushes only an
-immutable `sha-<full-revision>` tag of `96bulls-services` into
+`gcpProofEligible: true`. The currently recorded `030f59c0` image, digest
+`sha256:68afce1d31930e76cd013b40b6a81eef552dd3338a2dc717edfc575862a74254`,
+was published by run `41335978211` only in the
+`awf-conformance-images` repository, so an enabled 96Bulls release is refused
+outside the `gcp-conformance` stage. Substrate-only stages and destroy cleanup
+remain available. A services image release updates the digest, full source
+revision, and eligibility together only after the image build and review
+complete; an arbitrary or merely well-formed digest cannot enable this stage.
+Dispatching `.github/workflows/publish-image-ar.yml` pushes only an immutable
+`sha-<full-revision>` tag of `96bulls-services` into
 `awf-conformance-images` and does not change `versions.lock.json` or
 `gcpProofEligible`.
 
@@ -355,6 +455,13 @@ predates later workspace-bootstrap Secret support, so this lane does not pass
 an ineffective Secret setting. There is no Relaycast Ingress, load balancer,
 ManagedCertificate, or public DNS claim in this stack.
 
+Before evaluating a non-destroy RelayAuth stage, place the exact public release
+artifact at `.96bulls/$STAGE/artifacts/relayauth-0.1.1.tgz`. The stack verifies
+its SHA-256 before constructing Alchemy and renders the captured local chart.
+Destroy deliberately does not require the artifact and accepts an older
+recorded chart version so cleanup of an existing `0.1.0` release cannot be
+blocked by this new proof pin.
+
 ## Exact gaps
 
 These are the current code facts. They are not a cloud proof.
@@ -411,6 +518,23 @@ Release boundaries that remain deliberate:
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
   is written.
+- Cloud SQL runs the migrator with `HOOPDB_DB_MODE=cloudsql`, not the generic
+  self-hosted profile. Before the release, an operator connection as the migration
+  owner runs `cloudsql_owner_function_default_revoke.sql` and
+  `cloudsql_migration_roles.sql`, followed by the canonical Worker verifier. The first
+  script applies the exact owner-scoped function default. The second uses a disposable
+  CREATEROLE trampoline whose removal also removes PostgreSQL 16+ automatic creator
+  memberships; it leaves fixed membership-free, NOLOGIN compatibility roles and never
+  creates a BYPASSRLS role. The generic Supabase shim stays disabled. The catalog gate
+  excludes only Google's immutable `cloudsqladmin` role,
+  only while the catalog marks that exact role SUPERUSER. Every other CREATE-capable
+  role remains covered. The migration Job keeps `HOOPDB_ROLE_BOOTSTRAP=false`.
+- The application runtime uses its own LOGIN role and URL. The migration owner URL is
+  available only to the migration Job. Cloud SQL creates the runtime while assigning
+  the still-empty `anon` role so it never receives `cloudsqlsuperuser`, then the Admin
+  API replaces that role list with an empty list before migrations or workload access.
+  Both credentials are sourced from 1Password; no password is persisted in Alchemy
+  state, input JSON, a repository, or a shell file.
 - The initial 2026-10-30 substrate run did not exercise product routes. The
   later 2026-10-31 application proof recorded above exercised authenticated
   ingest, scrubbed object landing, Cloud SQL indexing/classification, encrypted
@@ -421,9 +545,11 @@ Release boundaries that remain deliberate:
 ## Apply, verify, and teardown
 
 The substrate deployment and its live provider-path verification completed on
-2026-10-30. The base application proof completed on 2026-10-31 as recorded at
-the top of this guide. V1 indexed search, manifest replay through a product
-route, Relaycast HA, and full product teardown remain unproved. Static work
+2026-10-30. The base application proof completed on 2026-10-31, and the
+machine-bound activation gate passed on 2026-11-01, as recorded at the top of
+this guide. V1 indexed search, manifest replay through a product route,
+Relaycast HA, backup and restore, workload egress restriction, and full product
+teardown remain unproved. Static work
 does not wait on the AWS adapter freeze. `bin/96bulls up` and `bin/96bulls down`
 refuse every `gcp-*` stage. `bin/96bulls plan gcp-*` calls
 `bunx alchemy plan --config stacks/gcp/alchemy.gcp.run.ts --stage <stage> --no-input`
@@ -556,9 +682,10 @@ first resource. Resource order after that is: the listed Google APIs with
 `/20` Private Service Access range, the service-networking connection, regional
 standard GKE with a one-node default pool in `us-central1-a`, private nodes and
 a private endpoint, the versioned GCS bucket, the empty Secret Manager
-container, Artifact Registry, the runtime service account, Workload Identity for
-`bulls96-worker` and `bulls96-alleyoop`, `roles/storage.objectUser`, and
-`roles/cloudsql.client`. With `managedDataPlane.provision`, Memorystore Redis
+container, Artifact Registry, the per-component service accounts and their
+Workload Identity edges for `bulls96-worker`, `bulls96-alleyoop` and
+`cloud-sql-proxy`, the per-component bucket grants above, and
+`roles/cloudsql.client` for the proxy identity. With `managedDataPlane.provision`, Memorystore Redis
 7.2 is created with AUTH off and TLS server authentication, and Pub/Sub is
 created with the dead-letter service agent. The Cloud SQL body is an Action
 input; `ensurePrivateCloudSql` runs only during an approved apply after the PSA
@@ -595,4 +722,8 @@ Teardown, only after that apply, in this order:
 4. `bunx alchemy destroy --config stacks/gcp/alchemy.gcp.run.ts --stage "$STAGE" --no-input` with the same confirm env. Let Alchemy delete the resources it tracks; do not pre-delete Redis, Pub/Sub, GKE, networking, the bucket, Artifact Registry, Secret Manager, or the runtime service account and leave stale state behind. APIs stay enabled because the stack sets `disableOnDestroy: false`.
 5. Read-only proof of empty: `gcloud sql instances list`, `gcloud redis instances list --region=us-central1`, `gcloud container clusters list`, `gcloud compute networks list`, and `gcloud storage ls` against `$PROJECT` return no lane resources. On this dedicated project, disable the listed APIs only after those checks are empty.
 
-Do not delete the project until those lists are empty, and do not delete it without a separate request from Khaliq. Production remains Supabase and AWS S3. This lane is not end-to-end ready until the verify steps have passed on `agentrelay-96bulls-soc2-2610`.
+Do not delete the project until those lists are empty, and do not delete it
+without a separate request from Khaliq. Production remains Supabase and AWS
+S3. The base GCP application lane is live-proven on
+`agentrelay-96bulls-soc2-2610`; the explicitly excluded scopes above require
+separate proofs before broader GCP readiness is claimed.
