@@ -39,9 +39,21 @@ export const PIPPEN_SANDBOX_AGENT = "aws-proof";
 export const SANDBOX_STAGE = "aws-proof-sandbox";
 export const SANDBOX_CLUSTER = `96bulls-${SANDBOX_STAGE}`;
 export const SANDBOX_REGION = "us-west-2";
-/** `aws sts get-caller-identity` Arn inside the sandbox: the pippen agent-session role, session `agent-<agent>`. */
-export const SANDBOX_CALLER_ROLE = { roleName: "agent-session", sessionName: `agent-${PIPPEN_SANDBOX_AGENT}` } as const;
-export const SANDBOX_CALLER_ARN = `arn:aws:sts::${SANDBOX_ACCOUNT_ID}:assumed-role/${SANDBOX_CALLER_ROLE.roleName}/${SANDBOX_CALLER_ROLE.sessionName}`;
+/**
+ * `aws sts get-caller-identity` Arn inside the sandbox: the pippen agent-session
+ * role, session `agent-<session_id>`, where session_id is the lease UUID that
+ * `pippen sandbox status aws-proof` shows after `up` (pippen-tools 513b8e5
+ * provisioner.ts: sessionName `agent-${session.sessionId}`, a randomUUID).
+ */
+export const SANDBOX_CALLER_ROLE = { roleName: "agent-session", sessionPrefix: "agent-" } as const;
+/** The sts assumed-role prefix every sandbox caller ARN starts with. */
+export const SANDBOX_CALLER_ROLE_PREFIX = `arn:aws:sts::${SANDBOX_ACCOUNT_ID}:assumed-role/${SANDBOX_CALLER_ROLE.roleName}/`;
+/** A pippen lease id: a lowercase RFC 4122 version-4 UUID (crypto.randomUUID), nothing else. */
+export const PIPPEN_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+/** The exact caller ARN of pippen lease `sessionId`, or undefined when the id is not a strict UUID. */
+export function sandboxCallerArn(sessionId: string | undefined): string | undefined {
+  return sessionId !== undefined && PIPPEN_SESSION_ID.test(sessionId) ? `${SANDBOX_CALLER_ROLE_PREFIX}${SANDBOX_CALLER_ROLE.sessionPrefix}${sessionId}` : undefined;
+}
 /**
  * The one resource `pippen sandbox up` creates in the member account
  * (pippen-tools src/sandbox/provisioner.ts #up: createRole agent-session, path
@@ -70,8 +82,12 @@ export interface ProofTarget {
   stage: string;
   clusterName: string;
   region: string;
-  /** When set, `sts get-caller-identity` Arn must equal this exactly before any live step. */
-  callerArn?: string;
+  /**
+   * When set, live steps need the run's pippen session id, and the
+   * `sts get-caller-identity` Arn must equal exactly
+   * `<callerRolePrefix>agent-<session id>` (sandboxCallerArn).
+   */
+  callerRolePrefix?: string;
   /** When set, post-destroy accepts a caller Arn matching this (a fresh session of the same role) instead of `callerArn`. */
   postDestroyCaller?: RegExp;
   /** The stage's teardown of its AWS resources; printed, never run by the harness. */
@@ -103,7 +119,7 @@ export const PIPPEN_SANDBOX_PROOF_TARGET: ProofTarget = Object.freeze({
   stage: SANDBOX_STAGE,
   clusterName: SANDBOX_CLUSTER,
   region: SANDBOX_REGION,
-  callerArn: SANDBOX_CALLER_ARN,
+  callerRolePrefix: SANDBOX_CALLER_ROLE_PREFIX,
   postDestroyCaller: SANDBOX_POST_DESTROY_CALLER,
   destroyCommand: `pippen sandbox down ${PIPPEN_SANDBOX_AGENT}`,
   // Alchemy's own stage tag beside 96bulls:stack, and the sweeper's tag: after the sweep and a
@@ -135,7 +151,8 @@ export class GuardError extends Error {
       | "production_name"
       | "local_is_read_only"
       | "unverified_identity"
-      | "wrong_caller",
+      | "wrong_caller"
+      | "missing_pippen_session",
     message: string,
   ) {
     super(message);
@@ -149,8 +166,10 @@ const PRODUCTION_SHAPED = /(^|[-_/:.])(prod|production|sessions-dev|hosted|live)
 export interface Identity {
   /** `aws sts get-caller-identity` Account, as observed, never as configured. */
   accountId?: string;
-  /** `aws sts get-caller-identity` Arn, as observed. Required (and pinned) only on a target with `callerArn`. */
+  /** `aws sts get-caller-identity` Arn, as observed. Required (and pinned) only on a target with `callerRolePrefix`. */
   callerArn?: string;
+  /** The pippen lease UUID the operator gave (`--pippen-session`, from `pippen sandbox status`). Narrows, never widens. */
+  pippenSessionId?: string;
   /** The EKS cluster name the operator asked for (config). */
   clusterName: string;
   /** The kube context the harness will pass as --context. */
@@ -232,16 +251,21 @@ function assertKnownTarget(t: ProofTarget): void {
 }
 
 /** On a target that pins its caller (the Pippen sandbox), the sts Arn must be exactly that role session. */
-function assertCaller(g: { callerArn?: string }, t: ProofTarget, postDestroy = false): void {
-  if (t.callerArn === undefined) return;
+function assertCaller(g: { callerArn?: string; pippenSessionId?: string }, t: ProofTarget, postDestroy = false): void {
+  if (t.callerRolePrefix === undefined) return;
+  if (!postDestroy) {
+    if (g.pippenSessionId === undefined) throw new GuardError("missing_pippen_session", "refusing: the Pippen sandbox needs --pippen-session <session_id from `pippen sandbox status aws-proof`>");
+    if (!PIPPEN_SESSION_ID.test(g.pippenSessionId)) throw new GuardError("missing_pippen_session", "refusing: --pippen-session must be a lowercase v4 UUID");
+  }
   if (!g.callerArn) throw new GuardError("unverified_identity", "refusing: caller ARN not verified with sts get-caller-identity");
   if (postDestroy && t.postDestroyCaller) {
     if (!t.postDestroyCaller.test(g.callerArn))
       throw new GuardError("wrong_caller", `refusing: caller ${g.callerArn} is not a session of the pippen agent-session role in ${t.accountId}`);
     return;
   }
-  if (g.callerArn !== t.callerArn)
-    throw new GuardError("wrong_caller", `refusing: caller ${g.callerArn} is not the pippen agent-session role ${t.callerArn}`);
+  const want = sandboxCallerArn(g.pippenSessionId);
+  if (g.callerArn !== want)
+    throw new GuardError("wrong_caller", `refusing: caller ${g.callerArn} is not the pippen agent-session role session ${want}`);
 }
 
 /**

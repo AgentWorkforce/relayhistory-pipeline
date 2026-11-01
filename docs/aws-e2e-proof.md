@@ -34,7 +34,7 @@ the environment can add a third target or widen either one.
 | Account | `500268966557` (beside aws-sessions-dev) | `361835732085` (Sandbox OU, 96Bulls org) |
 | Region | `us-west-2` | `us-west-2` |
 | Stage / cluster | `aws-proof` / `96bulls-aws-proof` | `aws-proof-sandbox` / `96bulls-aws-proof-sandbox` |
-| Caller | any principal in the account | exactly `arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof`; post-destroy: any session of the recreated `agent-session` role in `361835732085` |
+| Caller | any principal in the account | exactly `arn:aws:sts::361835732085:assumed-role/agent-session/agent-<session_id>`, `<session_id>` from `--pippen-session` (required); post-destroy: any session of the recreated `agent-session` role in `361835732085` |
 | Host | `proof-sessions.agentrelay.com` | `proof-sandbox-sessions.agentrelay.com` |
 | Buckets | `96bulls-aws-proof-{locker,hoopdb-backups}-500268966557` | `96bulls-aws-proof-sandbox-{locker,hoopdb-backups}-361835732085` |
 | Stage plan | `docs/plans/aws-proof.*` | `docs/plans/aws-proof-sandbox.*`, must carry `pippenSandbox`, never `accountShared` |
@@ -47,19 +47,26 @@ the same strictness: the STS account, the cluster name, the cluster ARN from
 the stage plan and the prior report. The sandbox adds one more: before the
 cluster is described, and again before every step, the caller's
 `sts get-caller-identity` ARN must be exactly the pippen agent-session role
-session (`wrong_caller` otherwise). Each target refuses the other's account,
+session of the current lease,
+`arn:aws:sts::361835732085:assumed-role/agent-session/agent-<session_id>`
+(`wrong_caller` otherwise). `<session_id>` is the lease UUID shown as
+`session_id` by `pippen sandbox status aws-proof` after `up`. Pass it as
+`--pippen-session <session_id>`. It is not secret, it can only narrow the
+caller, and it must be a lowercase v4 UUID. A live or read-only sandbox run
+without it, or with a malformed one, is refused (`missing_pippen_session`). Each target refuses the other's account,
 cluster, context, buckets, ARNs and host. The sessions-dev target's behavior is
 unchanged.
 
 The flow (each live step needs Khaliq's OK; none has been run):
 
 1. `pippen sandbox up aws-proof`; export the agent-session credentials as
-   explicit `AWS_*` variables.
+   explicit `AWS_*` variables, and take `session_id` from
+   `pippen sandbox status aws-proof`.
 2. `bin/96bulls plan aws-proof-sandbox --capture` from
    `stacks/aws/examples/aws-proof-sandbox.inputs.example.json`
    (docs/aws-stage.md); review the capture.
 3. `bin/96bulls up aws-proof-sandbox` under the approval bound to it.
-4. `bun run proof:aws all --target pippen-sandbox --confirm-live`. The
+4. `bun run proof:aws all --target pippen-sandbox --pippen-session <session_id> --confirm-live`. The
    teardown check removes the in-cluster proof objects and reports `blocked`.
 5. `pippen sandbox down aws-proof`, which must report `clean: true`. It
    deletes everything tagged `pippen:sandbox=true`, the agent-session role
@@ -178,7 +185,7 @@ the following:
 - `--confirm-live` on the command line;
 - `aws sts get-caller-identity` returns the account `500268966557` (on
   `--target pippen-sandbox`: `361835732085`, and the ARN is exactly
-  `arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof`). The
+  `arn:aws:sts::361835732085:assumed-role/agent-session/agent-<--pippen-session>`). The
   harness checks the observed identity, not a configured value;
 - the cluster name is exactly `96bulls-aws-proof`, and the region of every EKS
   ARN (the kube context's cluster entry and the context name itself) is

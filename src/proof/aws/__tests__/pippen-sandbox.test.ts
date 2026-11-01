@@ -17,7 +17,7 @@ import {
   fenceFor, PROOF_BACKUP_BUCKET, PROOF_CONTEXT, PROOF_FENCE, PROOF_HOST, PROOF_LOCKER_BUCKET, proofConfigIssues, SANDBOX_BACKUP_BUCKET, SANDBOX_CONTEXT, SANDBOX_FENCE, SANDBOX_HOST, SANDBOX_LOCKER_BUCKET, TARGET_VALUES,
 } from "../fence.ts";
 import {
-  assertMayRun, assertPostDestroyTarget, assertProofTarget, GuardError, PIPPEN_SANDBOX_PROOF_TARGET, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, PROOF_TARGETS, SANDBOX_ACCOUNT_ID, SANDBOX_CALLER_ARN, SANDBOX_CLUSTER, SANDBOX_STAGE, SESSIONS_DEV_PROOF_TARGET,
+  assertMayRun, assertPostDestroyTarget, assertProofTarget, GuardError, PIPPEN_SANDBOX_PROOF_TARGET, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, PROOF_TARGETS, PIPPEN_SESSION_ID, SANDBOX_ACCOUNT_ID, SANDBOX_CLUSTER, sandboxCallerArn, SANDBOX_STAGE, SESSIONS_DEV_PROOF_TARGET,
   type GuardInput, type ProofTarget,
 } from "../guard.ts";
 import { PROOF_TAG, SANDBOX_DESTROY_COMMAND, STAGE_DESTROY_COMMAND, stageDestroyCommandFor, teardownVerifySteps, withoutExempt } from "../lifecycle.ts";
@@ -27,7 +27,10 @@ import { admitPrior, buildReport, canonicalReportBytes } from "../report.ts";
 import { PROV } from "./prov.ts";
 
 const SBX = PIPPEN_SANDBOX_PROOF_TARGET;
-const ok: GuardInput = { mode: "live", confirmLive: true, mutating: true, accountId: SANDBOX_ACCOUNT_ID, callerArn: SANDBOX_CALLER_ARN, clusterName: SANDBOX_CLUSTER, kubeContext: SANDBOX_CONTEXT, kubeContextCluster: SANDBOX_CONTEXT, clusterBound: true };
+/** A pippen lease id as `pippen sandbox status aws-proof` shows it (crypto.randomUUID). */
+const SESSION = "3f2b8c1e-9d4a-4e6b-a1c7-5b0e2f9d8a14";
+const SANDBOX_CALLER_ARN = `arn:aws:sts::361835732085:assumed-role/agent-session/agent-${SESSION}`;
+const ok: GuardInput = { mode: "live", confirmLive: true, mutating: true, accountId: SANDBOX_ACCOUNT_ID, callerArn: SANDBOX_CALLER_ARN, pippenSessionId: SESSION, clusterName: SANDBOX_CLUSTER, kubeContext: SANDBOX_CONTEXT, kubeContextCluster: SANDBOX_CONTEXT, clusterBound: true };
 const devOk: GuardInput = { mode: "live", confirmLive: true, mutating: true, accountId: PROOF_ACCOUNT_ID, clusterName: PROOF_CLUSTER, kubeContext: PROOF_CONTEXT, kubeContextCluster: PROOF_CONTEXT, clusterBound: true };
 
 const code = (f: () => void) => {
@@ -42,7 +45,8 @@ const code = (f: () => void) => {
 describe("pippen sandbox target: the constants are exact", () => {
   test("account, region, stage, cluster, context, caller and teardown are pinned", () => {
     expect(SBX).toMatchObject({ id: "pippen-sandbox", accountId: "361835732085", region: "us-west-2", stage: "aws-proof-sandbox", clusterName: "96bulls-aws-proof-sandbox", destroyCommand: "pippen sandbox down aws-proof" });
-    expect(SANDBOX_CALLER_ARN).toBe("arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof");
+    expect(sandboxCallerArn(SESSION)).toBe(SANDBOX_CALLER_ARN);
+    expect(SBX.callerRolePrefix).toBe("arn:aws:sts::361835732085:assumed-role/agent-session/");
     expect(SANDBOX_CONTEXT).toBe("arn:aws:eks:us-west-2:361835732085:cluster/96bulls-aws-proof-sandbox");
     expect(SANDBOX_LOCKER_BUCKET).toBe("96bulls-aws-proof-sandbox-locker-361835732085");
     expect(SANDBOX_BACKUP_BUCKET).toBe("96bulls-aws-proof-sandbox-hoopdb-backups-361835732085");
@@ -52,9 +56,9 @@ describe("pippen sandbox target: the constants are exact", () => {
     expect(Object.keys(PROOF_TARGETS).sort()).toEqual(["pippen-sandbox", "proof"]);
   });
   test("the stack's pin agrees with the harness's", async () => {
-    const { PIPPEN_PROOF_SANDBOX, PIPPEN_PROOF_SANDBOX_CALLER_ARN } = await import("../../../../stacks/aws/sandbox-rules.ts");
+    const { PIPPEN_PROOF_SANDBOX, pippenProofSandboxCallerArn } = await import("../../../../stacks/aws/sandbox-rules.ts");
     expect(PIPPEN_PROOF_SANDBOX).toMatchObject({ stage: SBX.stage, accountId: SBX.accountId, region: SBX.region, teardownCommand: SBX.destroyCommand });
-    expect(PIPPEN_PROOF_SANDBOX_CALLER_ARN).toBe(SANDBOX_CALLER_ARN);
+    expect(pippenProofSandboxCallerArn({ NINETY_SIX_BULLS_PIPPEN_SESSION: SESSION })).toBe(SANDBOX_CALLER_ARN);
   });
 });
 
@@ -80,6 +84,22 @@ describe("pippen sandbox target: guard", () => {
     expect(run({ ...ok, callerArn: "arn:aws:iam::361835732085:user/agent-session" })).toBe("wrong_caller");
     expect(run({ ...ok, callerArn: "arn:aws:sts::500268966557:assumed-role/agent-session/agent-aws-proof" })).toBe("wrong_caller");
     expect(run({ ...ok, callerArn: `${SANDBOX_CALLER_ARN}x` })).toBe("wrong_caller");
+  });
+  test("live steps pin the caller to the given pippen session: right uuid only", () => {
+    const other = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    expect(run(ok)).toBe("allowed");
+    // another lease's session, even of the right role
+    expect(run({ ...ok, pippenSessionId: other })).toBe("wrong_caller");
+    expect(run({ ...ok, callerArn: `arn:aws:sts::361835732085:assumed-role/agent-session/agent-${other}` })).toBe("wrong_caller");
+    // the old fixed session name is not a lease id
+    expect(run({ ...ok, callerArn: "arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof" })).toBe("wrong_caller");
+    expect(run({ ...ok, pippenSessionId: "aws-proof", callerArn: "arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof" })).toBe("missing_pippen_session");
+    // missing or malformed session id
+    expect(run({ ...ok, pippenSessionId: undefined })).toBe("missing_pippen_session");
+    for (const bad of [SESSION.toUpperCase(), SESSION.replace("-4e6b-", "-1e6b-"), SESSION.replace("-a1c7-", "-c1c7-"), SESSION.slice(1), `${SESSION} `, `${SESSION}\n`, "", "*"])
+      expect(run({ ...ok, pippenSessionId: bad })).toBe("missing_pippen_session");
+    expect(PIPPEN_SESSION_ID.test(SESSION)).toBe(true);
+    expect(sandboxCallerArn("aws-proof")).toBeUndefined();
   });
   test("refuses any other cluster, the sessions-dev proof cluster included", () => {
     expect(run({ ...ok, clusterName: PROOF_CLUSTER })).toBe("wrong_cluster");
@@ -263,15 +283,21 @@ describe("pippen sandbox target: cluster binding and observed identity", () => {
   };
   test("the cluster is described only after the caller is exactly the agent-session role", () => {
     const wrong = fake(SANDBOX_ACCOUNT_ID, "arn:aws:sts::361835732085:assumed-role/admin/me");
-    const o = observeIdentity(sandboxConfig(), wrong.run, SBX);
-    expect(o.bindError).toBe("caller is not the pippen agent-session role");
+    const o = observeIdentity(sandboxConfig(), wrong.run, SBX, SESSION);
+    expect(o.bindError).toBe("caller is not the pippen agent-session role session for --pippen-session");
     expect(wrong.calls.some((c) => c[2] === "describe-cluster")).toBe(false);
     const other = fake(PROOF_ACCOUNT_ID, SANDBOX_CALLER_ARN);
-    expect(observeIdentity(sandboxConfig(), other.run, SBX).bindError).toBe("caller is not the proof account");
+    expect(observeIdentity(sandboxConfig(), other.run, SBX, SESSION).bindError).toBe("caller is not the proof account");
     expect(other.calls).toHaveLength(1);
     const right = fake(SANDBOX_ACCOUNT_ID, SANDBOX_CALLER_ARN);
-    const r = observeIdentity(sandboxConfig(), right.run, SBX);
-    expect(r.identity).toMatchObject({ accountId: SANDBOX_ACCOUNT_ID, callerArn: SANDBOX_CALLER_ARN, kubeContextCluster: SANDBOX_CONTEXT });
+    const none = fake(SANDBOX_ACCOUNT_ID, SANDBOX_CALLER_ARN);
+    expect(observeIdentity(sandboxConfig(), none.run, SBX).bindError).toMatch(/no valid --pippen-session/);
+    expect(none.calls).toHaveLength(1);
+    const stale = fake(SANDBOX_ACCOUNT_ID, "arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof");
+    expect(observeIdentity(sandboxConfig(), stale.run, SBX, SESSION).bindError).toMatch(/not the pippen agent-session role session/);
+    expect(stale.calls.some((c) => c[2] === "describe-cluster")).toBe(false);
+    const r = observeIdentity(sandboxConfig(), right.run, SBX, SESSION);
+    expect(r.identity).toMatchObject({ accountId: SANDBOX_ACCOUNT_ID, callerArn: SANDBOX_CALLER_ARN, pippenSessionId: SESSION, kubeContextCluster: SANDBOX_CONTEXT });
     expect(right.calls.slice(0, 3)).toEqual([
       ["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"],
       ["aws", "sts", "get-caller-identity", "--query", "Arn", "--output", "text"],
@@ -300,6 +326,13 @@ describe("pippen sandbox target: config and CLI", () => {
     const p = join(dir, "inputs.json");
     writeFileSync(p, JSON.stringify({ accountId: PROOF_ACCOUNT_ID, clusterName: PROOF_CLUSTER, stage: PROOF_STAGE }));
     expect(loadConfig(p, "pippen-sandbox")).toMatchObject({ accountId: SANDBOX_ACCOUNT_ID, clusterName: SANDBOX_CLUSTER, stage: SANDBOX_STAGE });
+  });
+  test("--pippen-session takes only a strict lease uuid, only on the sandbox target", () => {
+    expect(parseArgs(["--target", "pippen-sandbox", "--pippen-session", SESSION]).pippenSession).toBe(SESSION);
+    expect(() => parseArgs(["--target", "pippen-sandbox", "--pippen-session", "aws-proof"])).toThrow(/lowercase v4 UUID/);
+    expect(() => parseArgs(["--target", "pippen-sandbox", "--pippen-session", SESSION.toUpperCase()])).toThrow(/lowercase v4 UUID/);
+    expect(() => parseArgs(["--pippen-session", SESSION])).toThrow(/pippen-sandbox only/);
+    expect(() => parseArgs(["--target", "pippen-sandbox", "--pippen-session", SESSION, "--pippen-session", SESSION])).toThrow(/once/);
   });
   test("--target pippen-sandbox is explicit; unknown targets are refused", () => {
     expect(parseArgs(["--target", "pippen-sandbox"]).target).toBe("pippen-sandbox");

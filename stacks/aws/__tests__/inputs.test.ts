@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "../inputs.ts";
-import { PIPPEN_PROOF_SANDBOX, PIPPEN_PROOF_SANDBOX_CALLER_ARN } from "../sandbox-rules.ts";
+import { PIPPEN_PROOF_SANDBOX, pippenProofSandboxCallerArn } from "../sandbox-rules.ts";
 import { verifyCallerArn } from "../preflight.ts";
 
 const lock = JSON.parse(readFileSync(fileURLToPath(new URL("../../../versions.lock.json", import.meta.url)), "utf8")) as { images: { "services-aws": { approved: ApprovedServicesImage[] } } };
@@ -133,17 +133,22 @@ describe("aws-proof-sandbox: the E2E proof in the Pippen sandbox of agent aws-pr
   });
 
   it("the stack checks the caller is the pippen agent-session role before declaring anything", () => {
-    expect(PIPPEN_PROOF_SANDBOX_CALLER_ARN).toBe("arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof");
+    const SESSION = "3f2b8c1e-9d4a-4e6b-a1c7-5b0e2f9d8a14";
+    const ARN = pippenProofSandboxCallerArn({ NINETY_SIX_BULLS_PIPPEN_SESSION: SESSION });
+    expect(ARN).toBe(`arn:aws:sts::361835732085:assumed-role/agent-session/agent-${SESSION}`);
+    for (const bad of [undefined, "", "aws-proof", SESSION.toUpperCase(), SESSION.replace("-4e6b-", "-1e6b-"), `${SESSION}x`])
+      expect(() => pippenProofSandboxCallerArn({ NINETY_SIX_BULLS_PIPPEN_SESSION: bad })).toThrow(/needs NINETY_SIX_BULLS_PIPPEN_SESSION/);
     const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
     const guard = stack.indexOf("verifyCallerArn(");
     expect(guard).toBeGreaterThan(stack.indexOf("assertAwsDeploymentTarget("));
     expect(guard).toBeLessThan(stack.indexOf("AWS.KMS.Key("));
     expect(stack).toContain("if (stage === PIPPEN_PROOF_SANDBOX.stage)");
+    expect(stack).toContain("pippenProofSandboxCallerArn(process.env)");
     const calls: string[][] = [];
     const aws = (arn: string | undefined) => ({ json: (a: string[]) => { calls.push(a); if (arn === undefined) throw new Error("denied"); return { Arn: arn }; }, s3Json: () => ({}) });
-    expect(() => verifyCallerArn(aws(PIPPEN_PROOF_SANDBOX_CALLER_ARN), PIPPEN_PROOF_SANDBOX_CALLER_ARN)).not.toThrow();
-    expect(() => verifyCallerArn(aws("arn:aws:sts::361835732085:assumed-role/admin/me"), PIPPEN_PROOF_SANDBOX_CALLER_ARN)).toThrow(/is not arn:aws:sts::361835732085:assumed-role\/agent-session\/agent-aws-proof/);
-    expect(() => verifyCallerArn(aws(undefined), PIPPEN_PROOF_SANDBOX_CALLER_ARN)).toThrow(/unverified/);
+    expect(() => verifyCallerArn(aws(ARN), ARN)).not.toThrow();
+    expect(() => verifyCallerArn(aws("arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof"), ARN)).toThrow(/is not arn:aws:sts::361835732085:assumed-role\/agent-session\/agent-3f2b8c1e/);
+    expect(() => verifyCallerArn(aws(undefined), ARN)).toThrow(/unverified/);
     expect(calls[0]).toEqual(["sts", "get-caller-identity"]);
   });
 

@@ -540,8 +540,12 @@ account are pinned to each other (`stacks/aws/sandbox-rules.ts`
   to pull; that policy change is a separate approval;
 - before declaring anything, in every mode, the stack checks that
   `aws sts get-caller-identity` is exactly
-  `arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof`, the
-  pippen agent-session role. Credentials come only from that role.
+  `arn:aws:sts::361835732085:assumed-role/agent-session/agent-<session_id>`,
+  the pippen agent-session role session of the current lease. Credentials
+  come only from that role. `<session_id>` is the lease UUID that
+  `pippen sandbox status aws-proof` shows after `up`. Export it as
+  `NINETY_SIX_BULLS_PIPPEN_SESSION=<session_id>`; it is not secret, and a
+  missing or malformed value (anything but a lowercase v4 UUID) is refused.
 
 Start from `stacks/aws/examples/aws-proof-sandbox.inputs.example.json` (copy it
 to `.96bulls/aws-proof-sandbox/aws-inputs.json` and fill every `<...>`,
@@ -551,11 +555,14 @@ the sessions-dev proof's DNS.
 
 The flow (each live step needs Khaliq's OK; nothing here has been run):
 
-1. `pippen sandbox up aws-proof`, then export the agent-session credentials.
+1. `pippen sandbox up aws-proof`, then export the agent-session credentials,
+   and take `session_id` from `pippen sandbox status aws-proof`
+   (`NINETY_SIX_BULLS_PIPPEN_SESSION` for the stack, `--pippen-session` for
+   the harness).
 2. `bin/96bulls plan aws-proof-sandbox --capture` and review the capture
    (`docs/plans/aws-proof-sandbox.*`).
 3. `bin/96bulls up aws-proof-sandbox` under an approval bound to that capture.
-4. The proof: `bun run proof:aws all --target pippen-sandbox --confirm-live`
+4. The proof: `bun run proof:aws all --target pippen-sandbox --pippen-session <session_id> --confirm-live`
    (docs/aws-e2e-proof.md).
 5. `pippen sandbox down aws-proof`, which must report `clean: true`. It
    deletes everything tagged `pippen:sandbox=true` (the agent-session role
