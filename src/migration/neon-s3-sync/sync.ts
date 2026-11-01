@@ -125,11 +125,20 @@ export class Syncer {
   }
 
   /** Pause while Neon shows lock waiters beyond the guard (another backfill, a convoy). */
+  #pause: Promise<void> | undefined;
+
   async guardLocks(force = false) {
+    // Every lane waits out one pause together.
+    if (this.#pause) return this.#pause;
     const g = this.cfg.lockGuard;
     const now = this.throttle.now();
     if (!force && now - this.#lastLockCheck < g.checkEveryMs) return;
     this.#lastLockCheck = now;
+    this.#pause = this.#waitForLocks(g).finally(() => (this.#pause = undefined));
+    return this.#pause;
+  }
+
+  async #waitForLocks(g: LockGuard) {
     for (;;) {
       const w = await lockWaiters(this.db);
       if (w.nonAdvisory <= g.maxNonAdvisory && w.total <= g.maxTotal) return;
@@ -319,45 +328,78 @@ export class Syncer {
   }
 
   /** Run until stopped (or, with `once`, until there is no work left). */
+  /**
+   * Run until stopped (or, with `once`, until there is no work left). Lanes
+   * pull from one shared queue that is refilled as it drains, so a large
+   * session holds only its own lane, never the others (no batch barrier).
+   * Sweeps run on their own loop beside the lanes.
+   */
   async run(opts: { once?: boolean; maxGroups?: number } = {}) {
     const recovered = this.state.recoverPendingKeys();
     if (recovered) this.log({ message: "recovered interrupted groups", count: recovered });
     if (!this.state.meta("act_sweep_done")) await this.sweepActivity();
     if (!this.state.meta("rev_sweep_done")) await this.sweepRevisions();
+    const keyOf = (w: WorkItem) => `${w.org_id}\u0000${w.session_id}`;
+    const inFlight = new Set<string>();
+    let queue: WorkItem[] = [];
     let done = 0;
-    while (!this.stopped()) {
-      await this.sweepsIfDue();
-      const work = this.state.nextWork(this.throttle.now(), this.cfg.recentMs, 25, this.cfg.reverifyMs);
-      if (work.length === 0) {
-        this.progress();
-        if (opts.once) break;
-        await this.throttle.sleep(this.cfg.idleSleepMs);
-        continue;
+    let fatal: unknown;
+    let finished = false;
+    const halt = () => this.stopped() || fatal !== undefined || finished;
+    const refill = () => {
+      if (queue.length >= this.lanes.length) return;
+      const queued = new Set(queue.map(keyOf));
+      const more = this.state
+        .nextWork(this.throttle.now(), this.cfg.recentMs, 4 * this.lanes.length + inFlight.size, this.cfg.reverifyMs)
+        .filter((w) => !inFlight.has(keyOf(w)) && !queued.has(keyOf(w)));
+      queue = [...queue, ...more];
+    };
+    const sweeps = (async () => {
+      while (!halt()) {
+        try {
+          await this.sweepsIfDue();
+        } catch (error) {
+          if (isConnectionError(error)) fatal ??= error;
+          else this.log({ message: "sweep failed", error_code: errorCode(error) });
+        }
+        await this.throttle.sleep(5_000);
       }
-      const queue = [...work];
-      let fatal: unknown;
-      // allSettled: a fatal error in one lane lets the others finish their group
-      // (and record it) before the process exits.
-      await Promise.allSettled(
-        this.lanes.map(async (lane) => {
-          for (let item = queue.shift(); item && !this.stopped() && fatal === undefined; item = queue.shift()) {
-            try {
-              await this.processGroup(item, lane);
-            } catch (error) {
-              fatal = error;
+    })();
+    // allSettled: a fatal error in one lane lets the others finish their group
+    // (and record it) before the process exits.
+    await Promise.allSettled(
+      this.lanes.map(async (lane) => {
+        while (!halt()) {
+          refill();
+          const item = queue.shift();
+          if (!item) {
+            if (opts.once && inFlight.size === 0) {
+              finished = true;
               return;
             }
-            done += 1;
             this.progress();
+            await this.throttle.sleep(inFlight.size ? 2_000 : this.cfg.idleSleepMs);
+            continue;
           }
-        }),
-      );
-      if (fatal !== undefined) throw fatal;
-      if (opts.maxGroups !== undefined && done >= opts.maxGroups) break;
-      // Sweeps interleave with long backlogs so changes and erasures are seen.
-      await this.sweepsIfDue();
-    }
+          inFlight.add(keyOf(item));
+          try {
+            await this.processGroup(item, lane);
+          } catch (error) {
+            fatal ??= error;
+            return;
+          } finally {
+            inFlight.delete(keyOf(item));
+          }
+          done += 1;
+          this.progress();
+          if (opts.maxGroups !== undefined && done >= opts.maxGroups) finished = true;
+        }
+      }),
+    );
+    finished = true;
+    await sweeps;
     this.progress(true);
+    if (fatal !== undefined) throw fatal;
   }
 }
 

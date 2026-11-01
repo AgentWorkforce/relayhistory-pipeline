@@ -620,6 +620,45 @@ describe("throttle", () => {
   });
 });
 
+describe("run loop", () => {
+  test("lanes pull continuously: a slow group does not hold the others; every group is exported once", async () => {
+    const { store } = await countingStore();
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const now = Date.now();
+    const ids = Array.from({ length: 40 }, (_, i) => `s${i}`);
+    state.seeRevisions(1, ids.map((id) => ({ org_id: "org-a", session_id: id, revision: "1" })));
+    state.seeActivity(1, ids.map((id, i) => ({ org_id: "org-a", session_id: id, last_ms: String(now - i * 1000), events: "1" })));
+    for (const k of ["act_sweep_done", "rev_sweep_done"]) state.setMeta(k, "1");
+    for (const k of ["act_sweep_at", "rev_sweep_at"]) state.setMeta(k, String(now));
+    const order: string[] = [];
+    const db: Queryable = {
+      async query<T>(sql: string, params?: unknown[]) {
+        if (sql.includes("pg_locks")) return { rows: [{ total: "0", non_advisory: "0" }] as T[] };
+        if (sql.includes("LIMIT 10000"))
+          return { rows: [{ workspace_id: "w", source: "claude", first_ms: String(T0), last_ms: String(T0), machine_ids: [], models: [], event_count: "1", input_tokens: "0", output_tokens: "0", reasoning_tokens: "0", cache_read_tokens: "0", cache_create_tokens: "0", cost_usd_metros: "0", cost_usd_micros: "0", _s: params?.[1] }] as T[] };
+        throw new Error("unexpected query");
+      },
+    };
+    const source = (): UnitSource => ({
+      fenced: async () => false,
+      async *lines(u) {
+        if (u.sessionId === "s0") await new Promise((r) => setTimeout(r, 1500)); // the slow one
+        order.push(u.sessionId);
+        yield { machine: "delivery:m", bytes: buildSessionStream([rec("session_event", "o", u.sessionId, { a: 1 })]).bytes, userId: "u" };
+      },
+    });
+    // Real (short) timers: an instantly-resolving sleep would spin the sweep loop in microtasks.
+    const throttle = new Throttle({ rowsPerSec: 1e9, bytesPerSec: 1e12, slowWindows: [], slowFactor: 1, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 5))) });
+    const syncer = new Syncer(db, state, target(store), throttle, () => {}, DEFAULT_SYNC_CONFIG, () => false, source, [db, db]);
+    await syncer.run({ once: true });
+    expect([...order].sort()).toEqual([...ids].sort());
+    expect(syncer.counters.groups).toBe(40);
+    // the slow group finished last: the other lanes did not wait for it
+    expect(order.indexOf("s0")).toBe(39);
+    state.close();
+  });
+});
+
 describe("work order", () => {
   test("changed (past debounce) before recent before history, newest first", async () => {
     const state = new SyncState(join(await tempDir(), "s.sqlite"));
