@@ -984,7 +984,9 @@ export function bulls96ReleaseValues(
       locker: locker(),
       lockerInit: { enabled: false },
       migrations: {
-        supabaseShim: true,
+        // The Cloud SQL operator bootstrap creates the fixed compatibility roles. The
+        // generic shim requires SUPERUSER for service_role BYPASSRLS and is forbidden.
+        supabaseShim: false,
         hoopdb: {
           existingSecret: i.existingSecretName,
           key: "HOOPDB_MIGRATION_URL",
@@ -996,7 +998,7 @@ export function bulls96ReleaseValues(
       },
       serviceAccount: { annotations: { ...identity } },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
-      // Cloud SQL is plain Postgres: selfhosted mode, the shim on, an explicit runtime role.
+      // Cloud SQL has an explicit mode, externally bootstrapped roles and runtime role.
       extraEnv: [
         ...dataEnv(),
         ...gcpHoopdbModeEnv(i.hoopdbRuntimeRole, i.hoopdbRuntimeRoleLogin),
@@ -1045,7 +1047,7 @@ export function relayflowsChartValues(
 
 /**
  * The GCP migrator's explicit profile: Cloud SQL is plain Postgres dedicated to HoopDb,
- * so cloudsql mode, the shim on, external provisioning for privileged roles, the
+ * so cloudsql mode, the generic shim off, external provisioning for compatibility roles, the
  * owner-scoped global function default, and the dedicated runtime role. The catalog gate
  * covers every ordinary sessions creator and records Google's fixed cloudsqladmin
  * platform superuser as an explicit provider trust root.

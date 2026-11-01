@@ -1202,7 +1202,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     );
   });
 
-  test("Cloud SQL owner bootstrap produces catalog-proven state; the search-Worker pre-step removes its creator grant", async () => {
+  test("Cloud SQL owner and migration-role bootstraps produce catalog-proven, membership-free state", async () => {
     const db = new PGlite({
       username: "cloudsqladmin",
       database: "postgres",
@@ -1239,22 +1239,47 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(evidence.excluded_platform_superusers).toEqual([
       expect.objectContaining({ role: "cloudsqladmin", rolsuper: true }),
     ]);
-    const searchWorkerBootstrap = readFileSync(
-      join(
-        root,
-        "supabase/bootstrap/cloudsql_session_directory_search_worker.sql",
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"),
+        "utf8",
       ),
-      "utf8",
     );
-    expect(searchWorkerBootstrap).toContain(
-      "CREATE ROLE session_directory_search_worker",
+    await db.exec(
+      `SET ROLE migration_owner; ${readFileSync(
+        join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      )}`,
     );
-    expect(searchWorkerBootstrap).toContain(
-      "GRANTED BY %I",
+    const targets = await db.query<{
+      rolname: string;
+      rolcanlogin: boolean;
+      rolinherit: boolean;
+      rolbypassrls: boolean;
+      memberships: number;
+    }>(
+      `SELECT role.rolname, role.rolcanlogin, role.rolinherit, role.rolbypassrls,
+              (SELECT count(*)::int FROM pg_auth_members membership
+                WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
+         FROM pg_roles role
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker')
+        ORDER BY 1`,
     );
-    expect(searchWorkerBootstrap).toContain(
-      "could not remove creator membership",
+    expect(targets.rows).toHaveLength(4);
+    expect(targets.rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ rolname: "service_role", rolbypassrls: false }),
+        expect.objectContaining({
+          rolname: "session_directory_search_worker",
+          rolcanlogin: false,
+          rolinherit: false,
+          memberships: 0,
+        }),
+      ]),
     );
+    expect(
+      await db.query(`SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_cloudsql_role_seed'`),
+    ).toMatchObject({ rows: [] });
   });
 
   test("platform trust root: supabase_admin as a superuser with no safe default is excluded in supabase mode (listed with its attributes); the same catalog fails without the exclusion (selfhosted)", async () => {

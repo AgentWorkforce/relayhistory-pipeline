@@ -414,7 +414,7 @@ describe("GCP self-host contract", () => {
       };
       extraEnv: Array<{ name: string; value: string }>;
     };
-    expect(worker.migrations.supabaseShim).toBe(true);
+    expect(worker.migrations.supabaseShim).toBe(false);
     expect(worker.hoopdb).toEqual({ existingSecret: "bulls96-runtime", key: "HOOPDB_URL" });
     expect(worker.migrations.hoopdb).toEqual({
       existingSecret: "bulls96-runtime",

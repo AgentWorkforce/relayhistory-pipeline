@@ -433,9 +433,12 @@ config fails closed.
     the migration owner. No environment setting extends the list. The customer
     migration owner runs `cloudsql_owner_function_default_revoke.sql`; every ordinary
     role with effective CREATE in `sessions`, including the owner, remains covered by
-    the catalog gate. `cloudsql_session_directory_search_worker.sql` creates the
-    NOLOGIN Worker with the customer's CREATEROLE identity and immediately removes the
-    PostgreSQL 16+ creator membership, then the canonical verifier proves the role.
+    the catalog gate. `cloudsql_migration_roles.sql` uses and drops a disposable
+    CREATEROLE trampoline; dropping it removes PostgreSQL 16+ automatic creator
+    memberships and leaves `anon`, `authenticated`, `service_role`, and the NOLOGIN
+    Worker membership-free. The Cloud SQL `service_role` is NOBYPASSRLS and exists only
+    to satisfy shared migration grants; the GCP runtime never connects as it. The
+    canonical verifier then proves the Worker role and grants.
 - **Exact default ACL:** the migration owner's `pg_default_acl` row with
   `defaclnamespace = 0` and `defaclobjtype = 'f'` must normalize to EXACTLY
   `{<self>:EXECUTE}`: owner EXECUTE, no grant option, no other grantee. Merely "PUBLIC

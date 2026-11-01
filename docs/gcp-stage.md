@@ -456,10 +456,12 @@ Release boundaries that remain deliberate:
 - Cloud SQL runs the migrator with `HOOPDB_DB_MODE=cloudsql`, not the generic
   self-hosted profile. Before the release, an operator connection as the migration
   owner runs `cloudsql_owner_function_default_revoke.sql` and
-  `cloudsql_session_directory_search_worker.sql`, followed by the canonical Worker
-  verifier. The first script applies the exact owner-scoped function default; the
-  second handles PostgreSQL 16+ creator membership without requiring a customer
-  superuser. The catalog gate excludes only Google's immutable `cloudsqladmin` role,
+  `cloudsql_migration_roles.sql`, followed by the canonical Worker verifier. The first
+  script applies the exact owner-scoped function default. The second uses a disposable
+  CREATEROLE trampoline whose removal also removes PostgreSQL 16+ automatic creator
+  memberships; it leaves fixed membership-free, NOLOGIN compatibility roles and never
+  creates a BYPASSRLS role. The generic Supabase shim stays disabled. The catalog gate
+  excludes only Google's immutable `cloudsqladmin` role,
   only while the catalog marks that exact role SUPERUSER. Every other CREATE-capable
   role remains covered. The migration Job keeps `HOOPDB_ROLE_BOOTSTRAP=false`.
 - The application runtime uses its own LOGIN role and URL. The migration owner URL is
