@@ -126,15 +126,17 @@ export function scrubRecords(source: Uint8Array): {
     const line = parts[i]!;
     const ending = parts[i + 1] ?? "";
     if (ending) records += 1;
-    if (isRecord(line)) {
+    // Inside an open private-key block a record line (two writers interleaving
+    // on one stream) stays in the run, so the key is redacted whole, as
+    // whole-text scrubbing would; flushing here would store the rest of it.
+    if (!keyOpen && isRecord(line)) {
       // The run's text may end in a keyword whose value is this record
       // (`DB_PASSWORD=` then `"<secret>"`). The record is scrubbed once, as a
       // record, and kept intact; if the boundary splits a match, the value the
       // text rule would take, a leading JSON string, is redacted in place. (A
       // record that opens with `{` or `[` offers the rule only the bracket.)
-      const safe = keyOpen || boundarySafe(i);
+      const safe = boundarySafe(i);
       flush();
-      keyOpen = false;
       const scrubbed = scrubRecordLine(line);
       out += (safe ? scrubbed : redactLeadingString(scrubbed)) + ending;
       continue;

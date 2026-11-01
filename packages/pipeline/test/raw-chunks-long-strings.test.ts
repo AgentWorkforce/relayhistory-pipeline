@@ -369,3 +369,31 @@ describe("record boundaries: bounded work and intact records", () => {
     expect(out.endsWith("next\n")).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------- review #4 of 3b4b60b (H-B)
+
+describe("a JSON line inside an open private-key block does not split the key (H-B)", () => {
+  const b64a = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEeP";
+  const b64b = "Xq7Lm2Rt9Vw4Ys8Pz3Kd6Hn1Bc5Gf0Jj2Aa9Ee4Ii7O";
+  const cases: [string, string][] = [
+    [
+      "RSA key with a JSON log line between body lines",
+      `-----BEGIN RSA PRIVATE KEY-----\n${b64a}\n{"log":"x"}\n${b64b}\n-----END RSA PRIVATE KEY-----\n`,
+    ],
+    [
+      "EC key header mid-line, a JSON line right after it",
+      `key follows -----BEGIN EC PRIVATE KEY-----\n{"a":1}\n${b64b}\n-----END EC PRIVATE KEY-----\n`,
+    ],
+  ];
+  for (const [label, text] of cases)
+    it(label, () => {
+      // Whole-text scrubbing redacts the block; the chunk scrubber must too.
+      expect(scrubText(text)).not.toContain(b64b);
+      const { scrubbed, records } = scrubRecords(enc.encode(text));
+      const out = dec.decode(scrubbed);
+      expect(out).not.toContain(b64a);
+      expect(out).not.toContain(b64b);
+      expect(out).not.toContain("-----END");
+      expect(records).toBe(text.split("\n").length - 1);
+    });
+});
