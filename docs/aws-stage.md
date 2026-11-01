@@ -11,6 +11,9 @@ production Supabase and AWS S3 boundary.
 
 The proof harness for an isolated self-host E2E on this account
 (`aws-proof`, account 500268966557) is in [AWS self-host E2E proof](aws-e2e-proof.md).
+It can also target the Pippen Tools sandbox of agent `aws-proof` (stage
+`aws-proof-sandbox`, account 361835732085; see
+[Proof stage in a Pippen sandbox](#proof-stage-in-a-pippen-sandbox-aws-proof-sandbox)).
 It defaults to a dry run and has not been run against AWS.
 
 What the stage will need (each item needs an explicit OK): a target account
@@ -73,6 +76,32 @@ jobs in the `image-publish` GitHub environment can assume the deployer role,
 and it can only push to that ECR repository (no Locker or KMS access).
 Sandbox stages create neither the OIDC provider nor the role. The GHCR
 copy stays private for kind and self-host tests.
+
+### Cross-account pull (`ecr.pullAccounts`)
+
+`ecr.pullAccounts` in a stage's `aws-inputs.json` is the only repository
+policy on its `96bulls-services` repository (`stacks/aws/inputs.ts`
+`ecrPullPolicy`). Each entry is a 12-digit account id. It gets one statement,
+principal `arn:aws:iam::<id>:root`, with exactly `ecr:BatchGetImage`,
+`ecr:GetDownloadUrlForLayer` and `ecr:BatchCheckLayerAvailability`. The
+Pippen sandbox `361835732085` gets the Sid `PippenSandboxAwsProofPull`; any
+other account gets `CrossAccountPull<id>`. The stage refuses an entry that is
+not a 12-digit id (no wildcards or ARNs), a duplicate, its own account, the
+production account `941433935742`, and a stage that owns no repository
+(`accountShared`, the transcript store). Absent or `[]` means no policy, which
+is the behavior before this input existed.
+
+Alchemy removes a repository policy the inputs do not declare. Khaliq approved
+read-only pull for the Pippen sandbox on 2026-11-01 ("give my OK"), and the
+policy was applied live to the sessions-dev repository. So **before the next
+`bin/96bulls up aws-sessions-dev`, its inputs must carry**:
+
+```json
+"ecr": { "pullAccounts": ["361835732085"] }
+```
+
+Without it, that `up` deletes the grant and the sandbox can no longer pull the
+services image.
 
 Order for the first environment: apply the baseline (creates ECR and the
 deployer role) -> set the two repo variables -> run publish-image-ecr -> put the
@@ -514,6 +543,73 @@ in that repository), the GitHub OIDC provider and the publisher role. Before
 the first apply, create its Secrets from 1Password as for sessions-dev
 (`96bulls-runtime` without `HOOPDB_URL`, which CNPG supplies; `relayauth`;
 `kube-system/cloudflare-dns`).
+
+### Proof stage in a Pippen sandbox `aws-proof-sandbox`
+
+Khaliq, 2026-11-01: run the EKS proof in a Pippen Tools sandbox so that
+teardown is a verified sweep rather than a hand-checked `down`. The sandbox is
+the one for agent `aws-proof`: account `361835732085`, region `us-west-2`, in
+the Sandbox OU of the 96Bulls org (management account `904260146565`).
+
+The stage `aws-proof-sandbox` (cluster `96bulls-aws-proof-sandbox`) and that
+account are pinned to each other (`stacks/aws/sandbox-rules.ts`
+`PIPPEN_PROOF_SANDBOX`, enforced by `assertPippenProofSandbox` in
+`stacks/aws/inputs.ts`):
+
+- the stage runs only in `361835732085`/`us-west-2`, and that account hosts no
+  other stage;
+- `pippenSandbox.permissionsBoundaryArn` is required and must be a policy in
+  that account; every role the stage creates carries it, and every resource
+  carries `pippen:sandbox=true` for the sweeper;
+- `accountShared` is refused: the sandbox is a fresh account, so the stage
+  creates its own ECR repository but no GitHub OIDC provider or publisher role.
+  The services image is pulled by digest from the sessions-dev repository
+  (`eks.imageRepository`). Khaliq approved read-only pull for `361835732085`
+  on 2026-11-01, and it is applied live as that repository's policy; see
+  [Cross-account pull](#cross-account-pull-ecrpullaccounts);
+- before declaring anything, in every mode, the stack checks that
+  `aws sts get-caller-identity` is exactly
+  `arn:aws:sts::361835732085:assumed-role/agent-session/agent-<session_id>`,
+  the pippen agent-session role session of the current lease. Credentials
+  come only from that role. `<session_id>` is the lease UUID that
+  `pippen sandbox status aws-proof` shows after `up`. Export it as
+  `NINETY_SIX_BULLS_PIPPEN_SESSION=<session_id>`; it is not secret, and a
+  missing or malformed value (anything but a lowercase v4 UUID) is refused.
+
+Start from `stacks/aws/examples/aws-proof-sandbox.inputs.example.json` (copy it
+to `.96bulls/aws-proof-sandbox/aws-inputs.json` and fill every `<...>`,
+including the sandbox's boundary policy name). The ingest hostname is
+`proof-sandbox-sessions.agentrelay.com`, so the sandbox never collides with
+the sessions-dev proof's DNS.
+
+The flow (each live step needs Khaliq's OK; nothing here has been run):
+
+1. `pippen sandbox up aws-proof`, then export the agent-session credentials,
+   and take `session_id` from `pippen sandbox status aws-proof`
+   (`NINETY_SIX_BULLS_PIPPEN_SESSION` for the stack, `--pippen-session` for
+   the harness).
+2. `bin/96bulls plan aws-proof-sandbox --capture` and review the capture
+   (`docs/plans/aws-proof-sandbox.*`).
+3. `bin/96bulls up aws-proof-sandbox` under an approval bound to that capture.
+4. The proof: `bun run proof:aws all --target pippen-sandbox --pippen-session <session_id> --confirm-live`
+   (docs/aws-e2e-proof.md).
+5. `pippen sandbox down aws-proof`, which must report `clean: true`. It
+   deletes everything tagged `pippen:sandbox=true` (the agent-session role
+   included) and verifies zero `pippen:sandbox` resources and zero
+   non-baseline IAM roles. The baseline roles are `pippen-sweeper`,
+   `/aws-service-role/*` and `stacksets-exec-*`. This replaces
+   `bin/96bulls down` as the teardown of record.
+6. `pippen sandbox up aws-proof` for fresh agent-session credentials. It
+   recreates only `arn:aws:iam::361835732085:role/pippen/agent-session`.
+7. The harness's post-destroy absence check against the sandbox
+   (`--target pippen-sandbox --post-destroy`). It accepts any session of the
+   recreated role, lists `96bulls:stack`, `alchemy::stage` and `pippen:sandbox`
+   tagged resources, and exempts only that role's exact ARN. Resources tagged
+   `pippen:baseline=true` are never listed.
+8. `pippen sandbox down aws-proof` again.
+
+The stage's AWS Budget has no tags, so neither the pippen sweep nor the
+harness's tag check sees it.
 
 ### Apply, verify and roll back
 

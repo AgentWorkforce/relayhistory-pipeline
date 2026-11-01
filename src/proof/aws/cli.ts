@@ -8,10 +8,18 @@
  *   --read-only        run non-mutating steps only
  *   --confirm-live     required for any step against AWS; without --read-only
  *                      it also runs mutating steps. The account and cluster are
- *                      verified first and the run refuses anything but the proof
- *                      stage (account 500268966557, cluster 96bulls-aws-proof).
+ *                      verified first and the run refuses anything but the
+ *                      chosen target's account and cluster.
+ *   --target proof     (default) the proof stage beside sessions-dev: account
+ *                      500268966557, cluster 96bulls-aws-proof
+ *   --target pippen-sandbox  the Pippen sandbox of agent aws-proof: account
+ *                      361835732085, cluster 96bulls-aws-proof-sandbox, caller
+ *                      pinned to the pippen agent-session role session
+ *   --pippen-session <uuid>  sandbox only, required for live and read-only
+ *                      runs: session_id from `pippen sandbox status aws-proof`
  *   --target kind-readonly   the local kind-96bulls-e2e cluster; never mutated
- *   --inputs <path>    non-secret inputs (default .96bulls/aws-proof/inputs.json)
+ *   --inputs <path>    non-secret inputs (default .96bulls/aws-proof/inputs.json,
+ *                      or .96bulls/aws-proof-sandbox/inputs.json for the sandbox)
  *   --sessions <n>     planted sessions (default 100)
  *   --out <dir>        report directory (default .96bulls/aws-proof/<run id>/)
  *   --prior-report <path>  merge an earlier report of this proof (same target);
@@ -29,12 +37,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { uuidv7 } from "../../shared/ids.ts";
 import { CHECKS, newCtx, postDestroyTeardown } from "./checks.ts";
-import { loadConfig, validateConfig, type ProofConfig } from "./config.ts";
+import { defaultInputsPath, loadConfig, validateConfig, type ProofConfig } from "./config.ts";
 import { Runner } from "./exec.ts";
-import { fenceFor, harnessOutputIssues, PROOF_CHART_REPO, PROOF_CONTEXT, PROOF_POSTGREST, PROOF_REGION } from "./fence.ts";
+import { fenceFor, harnessOutputIssues, PROOF_CHART_REPO, PROOF_POSTGREST, TARGET_VALUES, type HarnessTarget } from "./fence.ts";
 import { bindKubeconfig, credentialIssue, parseDescribeCluster, proofKubeconfig, toolEnv, type DescribedCluster } from "./cluster-binding.ts";
 import { bindStagePlan, chartDigests, gitProvenance, loadStagePlan, parsePlanUpdateApproval, type PlanUpdateApproval, sha256Hex, type ReportProvenance, type StagePlan } from "./provenance.ts";
-import { assertPostDestroyTarget, assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, type Identity, type Mode } from "./guard.ts";
+import { assertPostDestroyTarget, assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PIPPEN_SESSION_ID, PROOF_TARGETS, sandboxCallerArn, SESSIONS_DEV_PROOF_TARGET, type Identity, type Mode, type ProofTarget } from "./guard.ts";
 import { allCanaries } from "./corpus.ts";
 import { backendLabel } from "./transcript.ts";
 import { admitPrior, buildReport, canonicalReportBytes, CHECK_IDS, mergeReports, validateReport, type AdmittedPrior, type CheckId, type CheckResult, type ProofReport } from "./report.ts";
@@ -45,18 +53,20 @@ export interface Args {
   checks: CheckId[];
   mode: Mode;
   confirmLive: boolean;
-  target: "proof" | "kind-readonly";
+  target: HarnessTarget;
   inputs?: string;
   sessions?: number;
   out?: string;
   /** A previous report of this proof (e.g. pre-teardown) to merge into this run's report. */
   priorReport?: string;
-  /** Verify absence after `96bulls down aws-proof`: no cluster binding, aws reads only. */
+  /** Verify absence after `96bulls down aws-proof` (or `pippen sandbox down aws-proof`): no cluster binding, aws reads only. */
   postDestroy?: boolean;
   /** Digest-bound approval for a reviewed stage change's updates (provenance.ts PlanUpdateApproval). */
   planUpdateApproval?: PlanUpdateApproval;
   /** The stack's outputs JSON; `eks.harness` must equal the hardcoded fence. */
   stackOutputs?: string;
+  /** Pippen sandbox only: the lease UUID (`session_id` of `pippen sandbox status aws-proof`); pins the caller session. */
+  pippenSession?: string;
 }
 
 export function parseArgs(argv: readonly string[]): Args {
@@ -71,6 +81,7 @@ export function parseArgs(argv: readonly string[]): Args {
   let postDestroy = false;
   let planUpdateApproval: PlanUpdateApproval | undefined;
   let stackOutputs: string | undefined;
+  let pippenSession: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     const val = () => {
@@ -82,7 +93,7 @@ export function parseArgs(argv: readonly string[]): Args {
     else if (a === "--confirm-live") confirmLive = true;
     else if (a === "--target") {
       const t = val();
-      if (t !== "proof" && t !== "kind-readonly") throw new Error(`unknown target ${t}`);
+      if (t !== "proof" && t !== "pippen-sandbox" && t !== "kind-readonly") throw new Error(`unknown target ${t}`);
       target = t;
     } else if (a === "--inputs") inputs = val();
     else if (a === "--sessions") {
@@ -98,18 +109,24 @@ export function parseArgs(argv: readonly string[]): Args {
       planUpdateApproval = v;
     }
     else if (a === "--stack-outputs") stackOutputs = val();
+    else if (a === "--pippen-session") {
+      if (pippenSession !== undefined) throw new Error("--pippen-session may be given once");
+      pippenSession = val();
+      if (!PIPPEN_SESSION_ID.test(pippenSession)) throw new Error("--pippen-session must be the lowercase v4 UUID session_id from `pippen sandbox status aws-proof`");
+    }
     else if (a === "all") checks.push(...CHECK_IDS);
     else if ((CHECK_IDS as readonly string[]).includes(a)) checks.push(a as CheckId);
     else throw new Error(`unknown argument ${a}`);
   }
+  if (pippenSession !== undefined && target !== "pippen-sandbox") throw new Error("--pippen-session is for --target pippen-sandbox only");
   if (target === "kind-readonly" && confirmLive && !readOnly) throw new Error("kind-readonly never runs mutating steps; drop --confirm-live or add --read-only");
   const mode: Mode = readOnly ? "read-only" : confirmLive ? "live" : "dry-run";
   if (postDestroy) {
-    if (target !== "proof") throw new Error("--post-destroy is for the proof target only");
+    if (target === "kind-readonly") throw new Error("--post-destroy is for the proof target only");
     if (checks.length !== 1 || checks[0] !== "teardown") throw new Error("--post-destroy runs the teardown check only");
     if (mode === "live" && !priorReport) throw new Error("--post-destroy needs --prior-report: the pre-teardown report carries the run's identity and evidence");
   }
-  return { checks: checks.length ? [...new Set(checks)] : [...CHECK_IDS], mode, confirmLive, target, inputs, sessions, out, ...(planUpdateApproval ? { planUpdateApproval } : {}), ...(stackOutputs ? { stackOutputs } : {}), ...(priorReport ? { priorReport } : {}), ...(postDestroy ? { postDestroy } : {}) };
+  return { checks: checks.length ? [...new Set(checks)] : [...CHECK_IDS], mode, confirmLive, target, inputs, sessions, out, ...(planUpdateApproval ? { planUpdateApproval } : {}), ...(stackOutputs ? { stackOutputs } : {}), ...(priorReport ? { priorReport } : {}), ...(postDestroy ? { postDestroy } : {}), ...(pippenSession ? { pippenSession } : {}) };
 }
 
 type Run = (argv: string[]) => { stdout: string; status: number | null };
@@ -123,18 +140,28 @@ const defaultRun: Run = (argv) => {
 /**
  * Observed identity, bound to live AWS: who the AWS CLI is (sts), what the
  * proof cluster is (describe-cluster), and whether the operator's kube context
- * reaches exactly that endpoint with exactly that CA. These four reads are the
- * only commands that run before the guard; none mutates anything.
+ * reaches exactly that endpoint with exactly that CA. These reads are the only
+ * commands that run before the guard; none mutates anything. On the Pippen
+ * sandbox the caller's ARN is read too, and the cluster is described only once
+ * it is exactly the agent-session role in the sandbox account.
  */
-export function observeIdentity(cfg: ProofConfig, run: Run = defaultRun): { identity: Identity; cluster?: DescribedCluster; bindError?: string } {
+export function observeIdentity(cfg: ProofConfig, run: Run = defaultRun, t: ProofTarget = SESSIONS_DEV_PROOF_TARGET, pippenSessionId?: string): { identity: Identity; cluster?: DescribedCluster; bindError?: string } {
   const sts = run(["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"]);
   const accountId = sts.status === 0 ? sts.stdout.trim() : undefined;
   const base: Identity = { accountId, clusterName: cfg.clusterName, kubeContext: cfg.kubeContext, clusterBound: false };
   // Only ask AWS about the cluster once the caller is the proof account.
-  if (accountId !== PROOF_ACCOUNT_ID) return { identity: base, bindError: "caller is not the proof account" };
-  const d = run(["aws", "eks", "describe-cluster", "--name", PROOF_CLUSTER, "--region", PROOF_REGION, "--output", "json"]);
+  if (accountId !== t.accountId) return { identity: base, bindError: "caller is not the proof account" };
+  if (t.callerRolePrefix !== undefined) {
+    if (pippenSessionId !== undefined) base.pippenSessionId = pippenSessionId;
+    const want = sandboxCallerArn(pippenSessionId);
+    if (!want) return { identity: base, bindError: "no valid --pippen-session; the caller session cannot be pinned" };
+    const who = run(["aws", "sts", "get-caller-identity", "--query", "Arn", "--output", "text"]);
+    if (who.status === 0) base.callerArn = who.stdout.trim();
+    if (base.callerArn !== want) return { identity: base, bindError: "caller is not the pippen agent-session role session for --pippen-session" };
+  }
+  const d = run(["aws", "eks", "describe-cluster", "--name", t.clusterName, "--region", t.region, "--output", "json"]);
   if (d.status !== 0) return { identity: base, bindError: "describe-cluster failed" };
-  const cluster = parseDescribeCluster(d.stdout);
+  const cluster = parseDescribeCluster(d.stdout, t);
   if ("error" in cluster) return { identity: base, bindError: cluster.error };
   const view = run(["kubectl", "config", "view", "--raw", "-o", "json"]);
   const bound = view.status === 0 ? bindKubeconfig(view.stdout, cfg.kubeContext, cluster) : { error: "kubectl config view failed" };
@@ -151,8 +178,14 @@ export async function main(argv: readonly string[], env: Record<string, string |
     console.error(`aws-proof: ${(e as Error).message}`);
     return 2;
   }
-  const cfg = loadConfig(args.inputs ?? join(ROOT, ".96bulls/aws-proof/inputs.json"), args.target);
+  // The one hardcoded AWS target this run may touch; undefined only for kind-readonly.
+  const pt: ProofTarget | undefined = args.target === "kind-readonly" ? undefined : PROOF_TARGETS[args.target];
+  const cfg = loadConfig(args.inputs ?? join(ROOT, defaultInputsPath(args.target)), args.target);
   if (args.sessions) cfg.sessions = args.sessions;
+  if (pt && (cfg.stage !== pt.stage || cfg.accountId !== pt.accountId || cfg.clusterName !== pt.clusterName)) {
+    console.error(`aws-proof: refusing: inputs are not for the ${args.target} target`);
+    return 2;
+  }
   const issues = validateConfig(cfg);
   if (issues.length) {
     console.error(`aws-proof: invalid inputs:\n  ${issues.join("\n  ")}`);
@@ -173,7 +206,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
   // is decided here, before any AWS call or step: an inadmissible prior can never reach a teardown step.
   let prior: AdmittedPrior | undefined;
   if (args.priorReport) {
-    if (args.mode !== "live" || args.target !== "proof") {
+    if (args.mode !== "live" || !pt) {
       console.error("aws-proof: --prior-report merges live proof runs only (needs --confirm-live without --read-only)");
       return 2;
     }
@@ -184,7 +217,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
       console.error("aws-proof: --prior-report unreadable");
       return 2;
     }
-    const admitted = admitPrior(bytes, { stage: PROOF_STAGE, clusterName: PROOF_CLUSTER, kubeContext: PROOF_CONTEXT, accountId: PROOF_ACCOUNT_ID, region: PROOF_REGION }, Date.now());
+    const admitted = admitPrior(bytes, { stage: pt.stage, clusterName: pt.clusterName, kubeContext: TARGET_VALUES[pt.id].context, accountId: pt.accountId, region: pt.region }, Date.now());
     if ("error" in admitted) {
       console.error(`aws-proof: --prior-report refused before any step ran: ${admitted.error}`);
       return 2;
@@ -206,8 +239,8 @@ export async function main(argv: readonly string[], env: Record<string, string |
     }
   }
   // The captured Stage A create-only plan. Live runs on the proof target refuse without it.
-  const plan = args.target === "proof" ? loadStagePlan(ROOT, undefined, args.planUpdateApproval) : undefined;
-  if (args.mode !== "dry-run" && args.target === "proof" && (!plan || "error" in plan)) {
+  const plan = pt ? loadStagePlan(ROOT, undefined, args.planUpdateApproval, pt) : undefined;
+  if (args.mode !== "dry-run" && pt && (!plan || "error" in plan)) {
     console.error(`aws-proof: refusing: ${plan && "error" in plan ? plan.error : "no stage plan"}`);
     return 2;
   }
@@ -218,7 +251,7 @@ export async function main(argv: readonly string[], env: Record<string, string |
   }
   let identity: Identity = { clusterName: cfg.clusterName, kubeContext: cfg.kubeContext };
   let cluster: DescribedCluster | undefined;
-  if (args.mode !== "dry-run" && args.target === "proof" && args.postDestroy) {
+  if (args.mode !== "dry-run" && pt && args.postDestroy) {
     // No cluster to bind: identity is the STS account (region pinned per step); the prior report carries the target.
     const cred = credentialIssue(env);
     if (cred) {
@@ -227,24 +260,32 @@ export async function main(argv: readonly string[], env: Record<string, string |
     }
     const sts = defaultRun(["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"]);
     identity = { clusterName: cfg.clusterName, kubeContext: cfg.kubeContext, postDestroy: true, ...(sts.status === 0 ? { accountId: sts.stdout.trim() } : {}) };
+    if (pt.callerRolePrefix !== undefined && identity.accountId === pt.accountId) {
+      const who = defaultRun(["aws", "sts", "get-caller-identity", "--query", "Arn", "--output", "text"]);
+      if (who.status === 0) identity.callerArn = who.stdout.trim();
+    }
     try {
-      assertPostDestroyTarget({ ...identity, confirmLive: args.confirmLive });
+      assertPostDestroyTarget({ ...identity, confirmLive: args.confirmLive }, pt);
     } catch (e) {
       console.error(`aws-proof: ${e instanceof GuardError ? `${e.code}: ` : ""}${(e as Error).message}`);
       return 2;
     }
-  } else if (args.mode !== "dry-run" && args.target === "proof") {
+  } else if (args.mode !== "dry-run" && pt) {
     const cred = credentialIssue(env);
     if (cred) {
       console.error(`aws-proof: refusing: ${cred}`);
       return 2;
     }
-    const o = observeIdentity(cfg);
+    if (pt.callerRolePrefix !== undefined && !args.pippenSession) {
+      console.error("aws-proof: refusing: --target pippen-sandbox needs --pippen-session <session_id from `pippen sandbox status aws-proof`>");
+      return 2;
+    }
+    const o = observeIdentity(cfg, defaultRun, pt, args.pippenSession);
     identity = o.identity;
     cluster = o.cluster;
     if (o.bindError) console.error(`aws-proof: cluster binding: ${o.bindError}`);
     try {
-      assertProofTarget({ ...identity, confirmLive: args.confirmLive });
+      assertProofTarget({ ...identity, confirmLive: args.confirmLive }, pt);
     } catch (e) {
       console.error(`aws-proof: ${e instanceof GuardError ? `${e.code}: ` : ""}${(e as Error).message}`);
       return 2;
@@ -256,13 +297,13 @@ export async function main(argv: readonly string[], env: Record<string, string |
     }
   }
   const runId = `aws-proof-${uuidv7()}`;
-  const dir = args.out ?? join(ROOT, ".96bulls/aws-proof", runId);
+  const dir = args.out ?? join(ROOT, args.target === "pippen-sandbox" ? `.96bulls/${pt!.stage}` : ".96bulls/aws-proof", runId);
   mkdirSync(dir, { recursive: true });
   // Every kubectl/helm step uses this kubeconfig, generated from describe-cluster; the operator's is never consulted.
   let kubeconfigPath: string | undefined;
   if (cluster) {
     kubeconfigPath = join(dir, "kubeconfig.json");
-    writeFileSync(kubeconfigPath, proofKubeconfig(cluster, cfg.kubeContext), { mode: 0o600 });
+    writeFileSync(kubeconfigPath, proofKubeconfig(cluster, cfg.kubeContext, pt), { mode: 0o600 });
   }
   const runner = new Runner({ mode: args.mode, identity: { ...identity, confirmLive: args.confirmLive }, fence: fenceFor(args.target), baseEnv: env, ...(kubeconfigPath ? { kubeconfigPath } : {}), ...(args.postDestroy ? { awsOnly: true } : {}) });
   const ctx = newCtx(cfg, runner, runId, env);
@@ -317,7 +358,7 @@ if (import.meta.main) process.exit(await main(process.argv.slice(2)));
 
 /** Report provenance. Chart digests are read from the public chart index only on non-dry runs. */
 async function reportProvenance(cfg: ProofConfig, args: Args, plan: StagePlan | undefined): Promise<ReportProvenance> {
-  const inputsPath = args.inputs ?? join(ROOT, ".96bulls/aws-proof/inputs.json");
+  const inputsPath = args.inputs ?? join(ROOT, defaultInputsPath(args.target));
   const inputsBytes = existsSync(inputsPath) ? readFileSync(inputsPath) : undefined;
   const wanted = plan
     ? Object.entries(plan.chartVersions).map(([name, version]) => ({ name, version }))

@@ -3,13 +3,14 @@
  * (the RelayAuth bootstrap key) come from the environment at run time, piped
  * from 1Password, and are never read from or written to this file.
  *
- * Read from `.96bulls/aws-proof/inputs.json` (gitignored) when present.
+ * Read from `.96bulls/aws-proof/inputs.json` (gitignored) when present; the
+ * Pippen sandbox target reads `.96bulls/aws-proof-sandbox/inputs.json`.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE } from "./guard.ts";
+import { LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, SANDBOX_ACCOUNT_ID, SANDBOX_CLUSTER, SANDBOX_REGION, SANDBOX_STAGE } from "./guard.ts";
 import type { Tenant } from "./leak-scan.ts";
 import { validateTranscriptConfig, type TranscriptConfig } from "./transcript.ts";
-import { PROOF_CHART_REPO, PROOF_HOST, PROOF_KEY_PREFIX_BASE, PROOF_LOCKER_BUCKET, PROOF_ORIGIN, PROOF_TENANT_ORGS, proofConfigIssues } from "./fence.ts";
+import { PROOF_CHART_REPO, PROOF_HOST, PROOF_KEY_PREFIX_BASE, PROOF_LOCKER_BUCKET, PROOF_ORIGIN, PROOF_TENANT_ORGS, proofConfigIssues, SANDBOX_CONTEXT, SANDBOX_HOST, SANDBOX_LOCKER_BUCKET, SANDBOX_ORIGIN, type HarnessTarget } from "./fence.ts";
 
 export interface ProofConfig {
   stage: string;
@@ -102,6 +103,27 @@ export function defaultConfig(): ProofConfig {
   };
 }
 
+/**
+ * The Pippen sandbox of agent aws-proof (account 361835732085): the proof
+ * stage's shape with the sandbox's own stage, cluster, context, bucket and host.
+ */
+export function sandboxConfig(): ProofConfig {
+  return {
+    ...defaultConfig(),
+    stage: SANDBOX_STAGE,
+    accountId: SANDBOX_ACCOUNT_ID,
+    region: SANDBOX_REGION,
+    clusterName: SANDBOX_CLUSTER,
+    kubeContext: SANDBOX_CONTEXT,
+    locker: { bucket: SANDBOX_LOCKER_BUCKET },
+    ingress: { hostname: SANDBOX_HOST, burst: {} },
+    historyOrigin: SANDBOX_ORIGIN,
+  };
+}
+
+/** Default non-secret inputs path per target (gitignored). */
+export const defaultInputsPath = (target: HarnessTarget) => (target === "pippen-sandbox" ? `.96bulls/${SANDBOX_STAGE}/inputs.json` : ".96bulls/aws-proof/inputs.json");
+
 /** The local kind cluster, read-only: only the fresh-install inspection runs there. */
 export function kindReadOnlyConfig(): ProofConfig {
   return {
@@ -136,8 +158,8 @@ export function validateConfig(c: ProofConfig): string[] {
   return issues;
 }
 
-export function loadConfig(path: string | undefined, preset: "proof" | "kind-readonly"): ProofConfig {
-  const base = preset === "kind-readonly" ? kindReadOnlyConfig() : defaultConfig();
+export function loadConfig(path: string | undefined, preset: HarnessTarget): ProofConfig {
+  const base = preset === "kind-readonly" ? kindReadOnlyConfig() : preset === "pippen-sandbox" ? sandboxConfig() : defaultConfig();
   if (!path || !existsSync(path)) return base;
   const secretish: string[] = [];
   const raw = JSON.parse(readFileSync(path, "utf8"), (k, v) => {

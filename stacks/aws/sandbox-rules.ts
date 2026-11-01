@@ -32,3 +32,39 @@ export function assertRegion(region: string): asserts region is SandboxRegion {
   if (!(SANDBOX_RULES.regionAllowlist as readonly string[]).includes(region))
     throw new Error(`96bulls: region ${region} is not in the allowlist ${SANDBOX_RULES.regionAllowlist.join(", ")}`);
 }
+
+/**
+ * The Pippen Tools sandbox the AWS E2E proof runs in (Khaliq, 2026-11-01): agent
+ * `aws-proof`, account 361835732085 in the Sandbox OU of the 96Bulls org
+ * (management 904260146565). Stage aws-proof-sandbox is pinned to it, and it to
+ * that stage. Credentials there come only from the pippen `agent-session` role,
+ * session `agent-<session_id>` (the lease UUID `pippen sandbox status aws-proof`
+ * shows after `up`); teardown is `pippen sandbox down aws-proof`, which
+ * sweeps everything tagged `pippen:sandbox=true` and verifies zero non-baseline
+ * IAM entities. src/proof/aws/guard.ts pins the same values for the harness.
+ */
+export const PIPPEN_PROOF_SANDBOX = {
+  stage: "aws-proof-sandbox",
+  agent: "aws-proof",
+  accountId: "361835732085",
+  region: "us-west-2",
+  managementAccountId: "904260146565",
+  callerRole: { roleName: "agent-session", sessionPrefix: "agent-" },
+  /** The operator exports the lease's session_id here for a run on this stage; it only narrows the caller. */
+  sessionEnv: "NINETY_SIX_BULLS_PIPPEN_SESSION",
+  teardownCommand: "pippen sandbox down aws-proof",
+} as const;
+
+const PIPPEN_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/**
+ * The exact caller ARN for this run: the agent-session role session of the
+ * pippen lease named by NINETY_SIX_BULLS_PIPPEN_SESSION (a lowercase v4 UUID).
+ * Throws when it is missing or malformed. The id is not secret.
+ */
+export function pippenProofSandboxCallerArn(env: Record<string, string | undefined>): string {
+  const id = env[PIPPEN_PROOF_SANDBOX.sessionEnv];
+  if (id === undefined || !PIPPEN_SESSION_ID.test(id))
+    throw new Error(`96bulls: stage ${PIPPEN_PROOF_SANDBOX.stage} needs ${PIPPEN_PROOF_SANDBOX.sessionEnv}=<session_id from \`pippen sandbox status ${PIPPEN_PROOF_SANDBOX.agent}\`> (a lowercase v4 UUID). Nothing was changed.`);
+  return `arn:aws:sts::${PIPPEN_PROOF_SANDBOX.accountId}:assumed-role/${PIPPEN_PROOF_SANDBOX.callerRole.roleName}/${PIPPEN_PROOF_SANDBOX.callerRole.sessionPrefix}${id}`;
+}
