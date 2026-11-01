@@ -445,6 +445,20 @@ describe("one migration authority: never import or mark an unledgered backlog", 
     );
     expect(await snapshot(db)).toEqual(before);
   });
+
+  test("a gap inside the 96bulls lane: refused, nothing marked, marker unchanged", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    await db.exec(
+      "DELETE FROM sessions.__96bulls_migrations WHERE name = '96bulls:0003_fanout_ledger.sql'",
+    );
+    const before = await snapshot(db);
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error?.code).toBe("ledger_gap");
+    expect(error?.message).toContain("96bulls:0003_fanout_ledger.sql");
+    expect(error?.message).toContain("96bulls:0004_summary_pointers.sql");
+    expect(await snapshot(db)).toEqual(before);
+  });
 });
 
 test("the runbook's 20261030020000 checksum is the file's real sha256", () => {
