@@ -512,9 +512,11 @@ async function exists(
 
 /**
  * Refuses, before any write, unless the database is either empty of this migration
- * set or exactly a ledgered prefix of it:
+ * set or exactly a ledgered prefix of each migration lane. Upstream and 96Bulls are
+ * independent append-only lanes: a later upstream release must remain deployable after
+ * an earlier image has already recorded the then-current 96Bulls prefix.
  *   ledger_unknown_step   the ledger names a schema step this image doesn't have;
- *   ledger_gap            the ledger isn't one contiguous prefix of the ordered steps;
+ *   ledger_gap            one lane isn't a contiguous prefix of its ordered steps;
  *   migration_changed     a ledgered step's file changed;
  *   unledgered_schema     an object that an unledgered step creates already exists.
  * Nothing is ever imported into, or marked in, the ledger.
@@ -536,18 +538,38 @@ export async function sequencePreflight(
       "ledger_unknown_step",
       `the ledger records ${unknown.join(", ")}, which this image doesn't have; nothing is marked, see the runbook decision point`,
     );
-  let k = 0;
-  while (k < names.length && ledger.has(names[k]!)) k++;
-  const beyond = names.slice(k).filter((n) => ledger.has(n));
-  if (beyond.length)
+  const lanes = ["upstream:", "96bulls:"] as const;
+  const laneNames = (lane: (typeof lanes)[number]) =>
+    names.filter((name) => name.startsWith(lane));
+  const recordedUpstream = laneNames("upstream:").filter((name) =>
+    ledger.has(name),
+  );
+  const recordedBulls = laneNames("96bulls:").filter((name) =>
+    ledger.has(name),
+  );
+  // Every historical image placed the upstream lane before the 96Bulls lane. A lone
+  // 96Bulls row therefore cannot be a legitimate old prefix and remains fail-closed.
+  if (recordedBulls.length > 0 && recordedUpstream.length === 0)
     throw guardError(
       "ledger_gap",
-      `${names[k]} is not recorded but ${beyond[0]} is; the ledger must be one contiguous prefix, nothing is marked, see the runbook decision point`,
+      `${recordedBulls[0]} is recorded without any upstream migration; nothing is marked, see the runbook decision point`,
     );
+  for (const lane of lanes) {
+    const ordered = laneNames(lane);
+    let k = 0;
+    while (k < ordered.length && ledger.has(ordered[k]!)) k++;
+    const beyond = ordered.slice(k).find((name) => ledger.has(name));
+    if (beyond)
+      throw guardError(
+        "ledger_gap",
+        `${ordered[k]} is not recorded but ${beyond} is; ${lane.slice(0, -1)} migrations must be one contiguous prefix, nothing is marked, see the runbook decision point`,
+      );
+  }
   const sql = await Promise.all(
     schemaSteps.map((s) => readFile(s.path, "utf8")),
   );
-  for (let i = 0; i < k; i++) {
+  for (let i = 0; i < names.length; i++) {
+    if (!ledger.has(names[i]!)) continue;
     const sha = createHash("sha256").update(sql[i]!).digest("hex");
     if (ledger.get(names[i]!) !== sha)
       throw guardError(
@@ -556,10 +578,13 @@ export async function sequencePreflight(
       );
   }
   const seen = new Set<string>();
-  for (let i = 0; i < k; i++)
+  for (let i = 0; i < names.length; i++) {
+    if (!ledger.has(names[i]!)) continue;
     for (const o of inventoryOf(sql[i]!)) seen.add(key(o));
+  }
   const found: string[] = [];
-  for (let i = k; i < names.length; i++) {
+  for (let i = 0; i < names.length; i++) {
+    if (ledger.has(names[i]!)) continue;
     for (const o of inventoryOf(sql[i]!)) {
       const id = key(o);
       if (seen.has(id)) continue;
@@ -571,7 +596,8 @@ export async function sequencePreflight(
     }
   }
   // Per-step catalog sentinels: they see ALTER-only and replacement steps too.
-  for (let i = k; i < names.length; i++) {
+  for (let i = 0; i < names.length; i++) {
+    if (ledger.has(names[i]!)) continue;
     const sentinel = schemaSteps[i]!.sentinel ?? MIGRATION_SENTINELS[names[i]!];
     if (!sentinel)
       throw guardError(

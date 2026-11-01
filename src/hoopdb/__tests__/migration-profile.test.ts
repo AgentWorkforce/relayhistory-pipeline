@@ -702,7 +702,7 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
   });
 });
 
-describe("the full ordered migration sequence: one contiguous prefix, no unledgered footprint", () => {
+describe("the ordered migration lanes: contiguous prefixes, no unledgered footprint", () => {
   test("helm repro (a): only session_directory present: refused before any write (no ledger rows, no 42P07)", async () => {
     const db = await fresh();
     await db.exec(
@@ -723,6 +723,39 @@ describe("the full ordered migration sequence: one contiguous prefix, no unledge
     const error = await failure(runMigrations(client(db), { profile: LOCAL }));
     expect(error?.code).toBe("ledger_gap");
     expect(await snapshot(db)).toEqual(before);
+  });
+
+  test("a later upstream prefix extends an already-complete earlier 96bulls lane", async () => {
+    const db = await fresh();
+    const current = await plan(LOCAL);
+    const oldImage = current.filter(
+      (step) =>
+        !step.name.startsWith("verify:") &&
+        (!step.name.startsWith("upstream:") ||
+          step.name <=
+            "upstream:20261030000000_relayhistory_machines_compat.sql"),
+    );
+    await runMigrations(client(db), {
+      profile: { ...LOCAL, verify: false },
+      steps: oldImage,
+    });
+    const before = await db.query<{ name: string }>(
+      "SELECT name FROM sessions.__96bulls_migrations ORDER BY name",
+    );
+    expect(before.rows.some(({ name }) => name.startsWith("96bulls:"))).toBe(
+      true,
+    );
+    expect(
+      before.rows.some(
+        ({ name }) =>
+          name === "upstream:20261030010000_session_directory.sql",
+      ),
+    ).toBe(false);
+
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await schemaVerdict(await expectedSchema(), transact(db))).toEqual({
+      ok: true,
+    });
   });
 
   test("a contiguous prefix whose unrecorded later steps were applied anyway: refused, nothing marked", async () => {
