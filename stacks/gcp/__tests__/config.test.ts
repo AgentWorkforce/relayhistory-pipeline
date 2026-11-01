@@ -41,8 +41,8 @@ describe("GCP self-host contract", () => {
   it("pins the reviewed multi-architecture services image for the GCP proof", () => {
     expect(versionsLock.images.services).toMatchObject({
       ref: "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services",
-      digest: "sha256:b6fcf90f96c7e836e46f70a897845b317a3ef01afdb3a0f71bd32a65c0e6b5cc",
-      sourceRevision: "15c2a374b377a150172ddf3d7567921be33e33a1",
+      digest: "sha256:68afce1d31930e76cd013b40b6a81eef552dd3338a2dc717edfc575862a74254",
+      sourceRevision: "030f59c06f5be7736053a2d153c443246ca55840",
       gcpProofEligible: true,
     });
     expect(versionsLock.images.relayauth).toMatchObject({

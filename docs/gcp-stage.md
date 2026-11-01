@@ -301,9 +301,9 @@ owner URL for services.
 
 The digest and source revision must exactly match the structured services
 release in `versions.lock.json`, and that release must set
-`gcpProofEligible: true`. The currently recorded `15c2a374` image, digest
-`sha256:b6fcf90f96c7e836e46f70a897845b317a3ef01afdb3a0f71bd32a65c0e6b5cc`,
-was published by run `41328029506` only in the
+`gcpProofEligible: true`. The currently recorded `030f59c0` image, digest
+`sha256:68afce1d31930e76cd013b40b6a81eef552dd3338a2dc717edfc575862a74254`,
+was published by run `41335978211` only in the
 `awf-conformance-images` repository, so an enabled 96Bulls release is refused
 outside the `gcp-conformance` stage. Substrate-only stages and destroy cleanup
 remain available. A services image release updates the digest, full source
