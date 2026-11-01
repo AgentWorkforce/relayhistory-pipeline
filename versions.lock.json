@@ -26,10 +26,16 @@
     },
     "services": {
       "ref": "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services",
-      "digest": "sha256:8d77de9be0b5e5e47dda75986da882e577aafb9e28e510c844e8134fea372425",
-      "sourceRevision": "09293c8d649f912aa2f4414e31a3ad7fca6eceee",
+      "digest": "sha256:65fda21217fe515add544bba322991170b2d6a7483996b41c1d45ec652c3e142",
+      "sourceRevision": "3b6001925ef2d8caf5190063e101e2ebf258e902",
       "gcpProofEligible": true,
-      "note": "published 2026-10-30 from main 09293c8; immutable Artifact Registry tag sha-09293c8d649f912aa2f4414e31a3ad7fca6eceee; OCI index includes linux/amd64+arm64; image labels identify the exact source repository and revision; attestation manifests include SPDX SBOM and SLSA provenance."
+      "note": "published 2026-10-31 by publish-image-ar run 41276308173 from reviewed main 3b6001925ef2d8caf5190063e101e2ebf258e902; immutable Artifact Registry tag sha-3b6001925ef2d8caf5190063e101e2ebf258e902; OCI index includes linux/amd64+arm64; image labels identify the exact source repository and revision; attestation manifests include SPDX SBOM and SLSA provenance."
+    },
+    "relayauth": {
+      "ref": "ghcr.io/agentworkforce/relayauth",
+      "digest": "sha256:c23c92d25fdffef3b5838a1eef4c226925f859706365d9ccece229795b877288",
+      "sourceRevision": "784582ef983bb72b13b43512d9a4142ef5dfabb2",
+      "note": "RelayAuth 0.2.34, published by Container Image run 41277442855 from reviewed main containing PR #113 machine-bound History assertions; public multi-platform OCI index with linux/amd64+arm64, SPDX SBOM, and build provenance."
     },
     "cnpg-operator": {
       "ref": "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1",
@@ -126,6 +132,13 @@
       "repo": "https://AgentWorkforce.github.io/helm-charts",
       "version": "0.1.0",
       "note": "per-stage eks.relaycast.chartVersion input"
+    },
+    "relayauth": {
+      "repo": "https://AgentWorkforce.github.io/helm-charts",
+      "version": "0.1.1",
+      "packageDigest": "sha256:add6f2b3fe55a301a99b0ab43ad28a84c79767793ae7d66a38281f9d61669121",
+      "ociDigest": "sha256:b73b8566a97a26cfa8739ea194b1ffa627607fa603b3841e3ef2930961e48ac9",
+      "note": "published by helm-charts Release Charts run 41278285422 from merge c074fc1; the chart pins the reviewed RelayAuth PR #113 image and is available through both the HTTPS index and public OCI registry"
     },
     "cert-manager": {
       "repo": "https://charts.jetstack.io",

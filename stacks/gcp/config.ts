@@ -65,6 +65,16 @@ export const RELAYCAST_PUBLISHED_CHART = {
     "cdfc41cb6202fd81beb17cb57d5fbbdecaf27fa427f51faa07c5ec0fc116744f",
 } as const;
 
+/** Published RelayAuth chart containing the PR #113 machine-bound issuer contract. */
+export const RELAYAUTH_PUBLISHED_CHART = {
+  version: versionsLock.charts.relayauth.version,
+  packageDigest: versionsLock.charts.relayauth.packageDigest,
+  ociDigest: versionsLock.charts.relayauth.ociDigest,
+  repository: versionsLock.images.relayauth.ref,
+  imageDigest: versionsLock.images.relayauth.digest,
+  sourceRevision: versionsLock.images.relayauth.sourceRevision,
+} as const;
+
 /**
  * The only services image the GCP proof may run. Updating a digest alone is
  * insufficient: the release commit must record the exact source revision and
@@ -460,6 +470,13 @@ export function assertGcpInputs(
   }
   if (inputs.relayauth) {
     requireSemver("relayauth.chartVersion", inputs.relayauth.chartVersion);
+    if (
+      inputs.relayauth.chartVersion !== RELAYAUTH_PUBLISHED_CHART.version ||
+      !isPublishedHelmRepo(inputs.chartRepo)
+    )
+      throw new Error(
+        `96bulls: relayauth must use published chart ${RELAYAUTH_PUBLISHED_CHART.version} from the AgentWorkforce helm repository. Nothing was created.`,
+      );
     requireSecretName(
       "relayauth.existingSecretName",
       inputs.relayauth.existingSecretName,
@@ -639,8 +656,16 @@ export function relayauthChartValues(
   i: RelayAuthChartInputs,
   defaultStorageClass = "standard-rwo",
 ) {
+  if (i.chartVersion !== RELAYAUTH_PUBLISHED_CHART.version)
+    throw new Error(
+      `96bulls: relayauth chart is not the published ${RELAYAUTH_PUBLISHED_CHART.version} machine-bound contract. Nothing was created.`,
+    );
   return {
     replicaCount: 1,
+    image: {
+      repository: RELAYAUTH_PUBLISHED_CHART.repository,
+      digest: RELAYAUTH_PUBLISHED_CHART.imageDigest,
+    },
     existingSecret: i.existingSecretName,
     // The conformance History origin is an in-cluster HTTP service. RelayAuth
     // remains fail-closed for public HTTP origins; this chart switch permits
