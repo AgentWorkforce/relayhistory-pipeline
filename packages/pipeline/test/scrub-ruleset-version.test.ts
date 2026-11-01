@@ -17,7 +17,7 @@ const SCRUB_RULESETS: Record<number, string> = {
   // From version 2 the digest also covers the segmenter in raw-chunks.ts
   // (between the `<scrub-segmenter>` markers): texts past MAX_SCRUB_CHARS are
   // scrubbed whole, in segments, where version 1 refused them.
-  2: "696b8819164fb4d266ae4fd1359f1cae874144052b1c0716309e056c8d9878d8",
+  2: "48d8023011c22b215503c0553b12f4bf7c76111faca4fb6edd33fe5687fe3810",
 };
 
 const read = (rel: string) =>

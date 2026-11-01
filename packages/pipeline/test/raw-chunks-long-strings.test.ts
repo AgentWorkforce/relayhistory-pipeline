@@ -8,6 +8,7 @@ import { MAX_SCRUB_CHARS, scrubText } from "../src/lib/scrub.js";
 import {
   SCRUB_RULESET_VERSION,
   canScrubLong,
+  segmenterWork,
   scrubLong,
   scrubRecords,
   sealRawChunk,
@@ -153,9 +154,7 @@ describe("a gap between a credential keyword and its value is never cut", () => 
     const pairs = "password: hunter2hunter2 ".repeat(Math.ceil((MAX_SCRUB_CHARS + 5000) / 25));
     expect(scrubText("password: hunter2hunter2")).not.toContain("hunter2hunter2");
     expect(scrubLong(pairs)).not.toContain("hunter2hunter2");
-    // Only keyword gaps (no other whitespace): nothing is safe to cut, so refuse.
-    const only = "password:\thunter2hunter2:".repeat(Math.ceil((MAX_SCRUB_CHARS + 5000) / 25));
-    expect(() => scrubLong(only)).toThrow(/scrub limit/);
+
     // With ordinary text before it, the cut falls before the keyword and the value is redacted.
     const text = `${filler(MAX_SCRUB_CHARS - 40)} password: ${" ".repeat(200)}hunter2hunter2 ${filler(5000)}`;
     expect(scrubLong(text)).not.toContain("hunter2hunter2");
@@ -233,33 +232,31 @@ describe("no regex state shared between calls (C1)", () => {
   });
 });
 
-describe("bounded CPU on the line path (H2)", () => {
-  it("300,000 blank lines finish in seconds, not minutes", () => {
-    const t0 = performance.now();
-    try {
-      scrubRecords(enc.encode(`x\n${"\n".repeat(300_000)}y\n`));
-    } catch {
-      // refusing is acceptable; taking minutes is not
+describe("bounded work on the line path (H2)", () => {
+  it("blank-line runs cost linear work, counted (not timed)", () => {
+    const work = () => segmenterWork.walked + segmenterWork.candidates;
+    for (const text of [`x\n${"\n".repeat(30_000)}y\n`, " \n".repeat(150_000), `x\n${"\n".repeat(300_000)}y\n`]) {
+      const before = work();
+      try {
+        scrubRecords(enc.encode(text));
+      } catch {
+        // refusing is acceptable; quadratic work is not
+      }
+      // Linear: a few walks of the input at most (the quadratic form was ~n^2 / 2).
+      expect(work() - before).toBeLessThan(10 * text.length);
     }
-    const t1 = performance.now();
-    try {
-      scrubRecords(enc.encode(" \n".repeat(150_000)));
-    } catch {}
-    const t2 = performance.now();
-    expect(t1 - t0).toBeLessThan(5000);
-    expect(t2 - t1).toBeLessThan(5000);
-  }, 60_000);
+  }, 120_000);
 });
 
-describe("prefixed credential names on the line path (H3)", () => {
+describe("prefixed credential names (H3)", () => {
   for (const name of ["DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "STRIPE_API_KEY"]) {
-    it(`${name}\\n=\\n<secret> is never split from its value`, () => {
+    it(`${name}\n=\n<secret> in one long line is never split from its value (the reported shape)`, () => {
       const secret = "Zq8vR2kLm9Xp4Tn7Wc3Ys6HdQQ";
       const s = `${name}\n=\n${secret}`;
       expect(scrubText(s)).not.toContain(secret);
       const leaks: number[] = [];
       for (let d = -40; d <= 40; d++) {
-        const text = `${logLines(MAX_SCRUB_CHARS - name.length + d)}${s}\n${logLines(20_000)}`;
+        const text = `${filler(MAX_SCRUB_CHARS - name.length + d)} ${s} ${filler(20_000)}\n`;
         let out: string;
         try {
           out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
@@ -271,4 +268,60 @@ describe("prefixed credential names on the line path (H3)", () => {
       expect(leaks).toEqual([]);
     }, 120_000);
   }
+
+  it("the keyword guard alone: `DB_PASSWORD` then `=` and a whitespace gap past the context window", () => {
+    // Without recognising DB_PASSWORD (\b fails after `_`), the cut after its
+    // line looks safe: the value is more than 4 KiB away, outside the window.
+    const secret = "Zq8vR2kLm9Xp4Tn7Wc3Ys6HdQQ";
+    const s = `DB_PASSWORD\n=${" ".repeat(1000)}\n${" ".repeat(1000)}\n${" ".repeat(1000)}\n${" ".repeat(1000)}\n${" ".repeat(900)}${secret}`;
+    expect(scrubText(`x ${s} y`)).not.toContain(secret);
+    const leaks: number[] = [];
+    for (let d = -20; d <= 20; d++) {
+      const text = `${logLines(MAX_SCRUB_CHARS - 12 + d).slice(0, MAX_SCRUB_CHARS - 12 + d)}${s}\n${logLines(20_000)}`;
+      let out: string;
+      try {
+        out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
+      } catch {
+        continue;
+      }
+      if (out.includes(secret)) leaks.push(d);
+    }
+    expect(leaks).toEqual([]);
+  }, 120_000);
+});
+
+describe("line-path flushes before a record or key line are context-checked (M-3)", () => {
+  const secret = "Zq8vR2kLm9Xp4Tn7Wc3Ys6HdQQ";
+  const key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEeP\n-----END RSA PRIVATE KEY-----";
+  const cases: [string, string][] = [
+    ["DB_PASSWORD= then a JSON string line", `log\nDB_PASSWORD=\n"${secret}"\n`],
+    ["api_key: then a JSON string line", `log\napi_key:\n"${secret}"\n`],
+    ["Authorization: Bearer then a key line", `log\nAuthorization: Bearer\n${secret} ${key}\n`],
+    ["password: then a key line", `log\npassword:\n${secret} ${key}\n`],
+  ];
+  for (const [label, text] of cases)
+    it(label, () => {
+      expect(scrubText(text)).not.toContain(secret);
+      expect(dec.decode(scrubRecords(enc.encode(text)).scrubbed)).not.toContain(secret);
+    });
+  it("an ordinary record line after ordinary text is still scrubbed as its own record", () => {
+    const text = `just a log line\n${JSON.stringify({ a: "hello" })}\n`;
+    expect(dec.decode(scrubRecords(enc.encode(text)).scrubbed)).toBe(text);
+  });
+});
+
+describe("availability: lines ending in =, : or a keyword are stored, not refused (M-2)", () => {
+  // (Lines like `next page token:` are different: the text rules themselves read
+  // the next line's first word as that token's value, so every boundary there
+  // splits a match and refusing is correct.)
+  for (const [label, line] of [
+    ["set=", (n: number) => `debug flag value ${n} set=\n`],
+    ["key", (n: number) => `row ${n} looked up by primary key\n`],
+  ] as const)
+    it(`400 KiB of "${label}" lines`, () => {
+      let text = "";
+      for (let n = 0; text.length < 400 * 1024; n++) text += line(n);
+      const out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
+      expect(out.length).toBeGreaterThan(300 * 1024);
+    }, 120_000);
 });

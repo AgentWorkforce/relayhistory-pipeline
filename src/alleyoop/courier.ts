@@ -119,6 +119,17 @@ interface SessionState {
   pending_manifest?: ManifestV1;
   /** CAS precondition paired with pending_manifest so the whole request is replayed unchanged. */
   pending_previous_version?: ObjectVersion;
+  /**
+   * The ingest refused this session's chunk permanently (a 4xx, e.g. a text it
+   * cannot scrub safely). Retried with backoff (1 h, doubling, at most 24 h), so
+   * one session never costs the ingest a refused scrub every pass. Codes only.
+   */
+  refused?: { code: string; at: string; attempts: number };
+}
+
+/** Backoff after a permanent chunk refusal: 1 h, doubling, at most 24 h. */
+export function refusalBackoffMs(attempts: number): number {
+  return Math.min(24, 2 ** Math.max(0, attempts - 1)) * 60 * 60 * 1000;
 }
 
 interface CourierState {
@@ -595,6 +606,8 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
     }
     let session = s;
     if (session.fenced) continue;
+    if (session.refused && now.getTime() - Date.parse(session.refused.at) < refusalBackoffMs(session.refused.attempts))
+      continue;
     const loc: SessionLocation = {
       workspaceId: cfg.workspaceId,
       machineId: state.machine_id,
@@ -769,6 +782,8 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
             throw Object.assign(new Error("chunk hop refused"), {
               code: body.error?.code ?? `http_${res.status}`,
               retryable: res.status >= 500,
+              // A 4xx other than auth/rate limits will refuse the same bytes again.
+              permanent: res.status >= 400 && res.status < 500 && res.status !== 401 && res.status !== 403 && res.status !== 408 && res.status !== 429,
             });
           }
           const sealed = (await res.json()) as {
@@ -1010,7 +1025,13 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
           state: manifest.raw.state,
         });
       },
-    ).catch((err) => {
+    ).then(() => {
+      if (uploading.refused) delete uploading.refused;
+    }).catch((err) => {
+      if ((err as { permanent?: unknown }).permanent === true) {
+        const attempts = (uploading.refused?.attempts ?? 0) + 1;
+        uploading.refused = { code: String((err as { code?: unknown }).code ?? "refused"), at: new Date().toISOString(), attempts };
+      }
       log.error("session upload failed", {
         harness: row.source,
         session_id: row.session_id,

@@ -94,14 +94,31 @@ export function scrubRecords(source: Uint8Array): {
     if (run) out += scrubBounded(run);
     run = "";
   };
+  /** This line and at least CUT_CONTEXT_CHARS of what follows it. */
+  const lookaheadAt = (i: number) => {
+    let la = "";
+    for (let j = i; j < parts.length && la.length < CUT_CONTEXT_CHARS + (parts[i]?.length ?? 0); j += 2)
+      la += (parts[j] ?? "") + (parts[j + 1] ?? "");
+    return la;
+  };
+  /** Whether the run may end here (the boundary before line `i`) without splitting a match. */
+  const boundarySafe = (i: number) =>
+    !run || cutIsSafe(run + lookaheadAt(i), run.length, { checks: 0, candidates: 0 }).ok;
   for (let i = 0; i < parts.length; i += 2) {
     const line = parts[i]!;
     const ending = parts[i + 1] ?? "";
     if (ending) records += 1;
     if (isRecord(line)) {
-      flush();
-      keyOpen = false;
-      out += scrubRecordLine(line) + ending;
+      if (!keyOpen && boundarySafe(i)) {
+        flush();
+        keyOpen = false;
+        out += scrubRecordLine(line) + ending;
+        continue;
+      }
+      // The run ends in a keyword or a match that reaches into this record
+      // (`DB_PASSWORD=` then `"<secret>"`): the record is scrubbed as a record
+      // and then stays in the run, so the run's text rules see it in context.
+      run += scrubRecordLine(line) + ending;
       continue;
     }
     const next = line + ending;
@@ -109,7 +126,7 @@ export function scrubRecords(source: Uint8Array): {
     // starts its own segment and is matched whole). Before a line that would
     // take it past the limit, it ends at the latest safe line boundary (see
     // `safeCut`), carrying the lines after that cut into the next segment.
-    if (run && !keyOpen && privateKeyOpenAfter(line, false)) flush();
+    if (run && !keyOpen && privateKeyOpenAfter(line, false) && boundarySafe(i)) flush();
     else if (run && !keyOpen && run.length + next.length > MAX_SCRUB_CHARS) {
       // At least CUT_CONTEXT_CHARS of what follows, for the context check.
       let lookahead = next;
@@ -171,23 +188,72 @@ interface CutBudget {
 }
 
 /**
+ * Characters the cut search has walked and candidates it has looked at, process
+ * wide. Tests read it to bound the segmenter's work deterministically (time is
+ * load-sensitive); nothing else reads it.
+ */
+export const segmenterWork = { walked: 0, candidates: 0 };
+
+/**
+ * Where a value would start after a keyword that ends right before a
+ * whitespace run ending at `end`: past the run, an optional `:`/`=`, more
+ * whitespace and an optional quote. -1 when a stretch of whitespace there is
+ * longer than MAX_CUT_GAP (a value could hide past any bounded window).
+ */
+function valueStart(text: string, end: number): number {
+  let i = end;
+  const skip = () => {
+    const from = i;
+    while (i < text.length && /\s/.test(text[i]!)) {
+      i++;
+      segmenterWork.walked++;
+      if (i - from > MAX_CUT_GAP) return false;
+    }
+    return true;
+  };
+  if (!skip()) return -1;
+  if (text[i] === ":" || text[i] === "=") i++;
+  if (!skip()) return -1;
+  if (text[i] === '"' || text[i] === "'" || text[i] === "`") i++;
+  return i;
+}
+
+/**
  * `{ ok }` plus `runStart`, the start of the whitespace run around `cut`, so a
  * caller can skip a refused run in one step (each run is walked once).
  */
 function cutIsSafe(text: string, cut: number, budget: CutBudget): { ok: boolean; runStart: number } {
   budget.candidates += 1;
+  segmenterWork.candidates++;
   let start = cut;
-  while (start > 0 && /\s/.test(text[start - 1]!)) start--;
+  while (start > 0 && /\s/.test(text[start - 1]!)) {
+    start--;
+    segmenterWork.walked++;
+  }
   // Forward walk bounded: a run past MAX_CUT_GAP is refused whatever its length.
   let end = cut;
-  while (end < text.length && end - start <= MAX_CUT_GAP && /\s/.test(text[end]!)) end++;
+  while (end < text.length && end - start <= MAX_CUT_GAP && /\s/.test(text[end]!)) {
+    end++;
+    segmenterWork.walked++;
+  }
   const no = { ok: false, runStart: start };
   if (end - start > MAX_CUT_GAP) return no;
-  if (CREDENTIAL_KEYWORD.test(text.slice(Math.max(0, start - 64), start))) return no;
   if (/[\d)]/.test(text[start - 1] ?? "") && /[\d(]/.test(text[end] ?? "")) return no;
+  // A credential keyword (or `:`/`=`) right before the run does not refuse the
+  // cut; it widens the context check so it reaches past where the keyword's
+  // value would start. Only an unbounded gap there refuses.
+  let reach = end;
+  if (CREDENTIAL_KEYWORD.test(text.slice(Math.max(0, start - 64), start))) {
+    const v = valueStart(text, end);
+    if (v < 0) return no;
+    reach = v;
+    // The value must be in view: if the text ends first, the caller has not
+    // given enough lookahead to prove anything.
+    if (reach + 1 > text.length) return no;
+  }
   budget.checks += 1;
   const before = text.slice(Math.max(0, start - CUT_CONTEXT_CHARS), cut);
-  const after = text.slice(cut, Math.min(text.length, end + CUT_CONTEXT_CHARS));
+  const after = text.slice(cut, Math.min(text.length, reach + CUT_CONTEXT_CHARS));
   return { ok: scrubText(before + after) === scrubText(before) + scrubText(after), runStart: start };
 }
 
