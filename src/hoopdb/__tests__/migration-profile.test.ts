@@ -1049,7 +1049,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     runtimeLogin: false,
   };
 
-  test("supabase activation gate: refused before any write without an approved durable function boundary; evidence is names and booleans", async () => {
+  test("supabase activation gate: refused before any write unless HOOPDB_FUNCTION_BOUNDARY_MODE selects a catalog-proven control; evidence is names and booleans", async () => {
     const db = await supabaseLike();
     const none = await failure(runMigrations(client(db), { profile: SUPA }));
     expect(none?.code).toBe("function_boundary_unproven");
@@ -1057,15 +1057,32 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(evidence).toEqual({
       migration_owner: "postgres",
       sessions_unexposed_and_no_untrusted_usage: false,
-      global_function_default_revokes_public: false,
+      owner_function_default: ["<built-in>"],
+      owner_function_default_exact: false,
+      sessions_create_roles: [
+        {
+          role: "postgres",
+          superuser: true,
+          is_migration_owner: true,
+          function_default: ["<built-in>"],
+          function_default_exact: false,
+        },
+      ],
+      sessions_create_roles_covered: false,
+      sessions_schema_function_defaults: [],
       sessions_functions_owned_by_owner: true,
       event_trigger_present: false,
       mode: "none",
       satisfied: false,
     });
-    for (const v of Object.values(evidence))
+    // Names and booleans only (in arrays and objects too).
+    const leaves = (v: unknown): unknown[] =>
+      v !== null && typeof v === "object"
+        ? Object.values(v as object).flatMap(leaves)
+        : [v];
+    for (const v of leaves(evidence))
       expect(["string", "boolean"]).toContain(typeof v);
-    // Approved but absent: still refused.
+    // Mode selected but the control absent: still refused.
     expect(
       (
         await failure(
@@ -1078,7 +1095,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
   });
 
-  test("supabase activation gate (A): an owner-scoped global default revoke, approved, passes; new owner functions are no longer PUBLIC-executable", async () => {
+  test("supabase activation gate (A): an owner-scoped global default revoke, with the mode selected, passes; new owner functions are no longer PUBLIC-executable", async () => {
     const db = await supabaseLike();
     await db.exec(
       "ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
@@ -1205,11 +1222,121 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const error = await failure(runMigrations(client(db), { profile: SELFP }));
     expect(error?.code).toBe("function_boundary_unproven");
     expect(JSON.parse(error!.message!.match(/(\{.*\})/)![1]!)).toMatchObject({
-      global_function_default_revokes_public: true,
+      owner_function_default_exact: true,
       sessions_functions_owned_by_owner: false,
       satisfied: false,
     });
     expect(await snapshot(db)).toEqual(before);
+  });
+
+  for (const [name, poison, shown] of [
+    [
+      "an extra grantee (authenticated EXECUTE)",
+      "GRANT EXECUTE ON FUNCTIONS TO authenticated",
+      "authenticated:EXECUTE",
+    ],
+    [
+      "a grant option",
+      "GRANT EXECUTE ON FUNCTIONS TO authenticated WITH GRANT OPTION",
+      "authenticated:EXECUTE*",
+    ],
+  ] as const)
+    test(`exact default ACL: a poisoned owner default (PUBLIC revoked plus ${name}) is refused before any write`, async () => {
+      const db = await fresh();
+      await db.exec(
+        readFileSync(join(root, "supabase/tests/supabase_shim.sql"), "utf8"),
+      );
+      await db.exec(
+        `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}; ALTER DEFAULT PRIVILEGES FOR ROLE postgres ${poison}`,
+      );
+      const SELFP: MigrationProfile = {
+        ...LOCAL,
+        mode: "selfhosted",
+        runtimeRole: "g6_rt",
+        runtimeLogin: false,
+        functionBoundary: "global-default-revoke",
+      };
+      const error = await failure(
+        runMigrations(client(db), { profile: SELFP }),
+      );
+      expect(error?.code).toBe("function_boundary_unproven");
+      const ev = JSON.parse(error!.message!.match(/(\{.*\})/)![1]!);
+      expect(ev.owner_function_default).toContain(shown);
+      expect(ev.owner_function_default_exact).toBe(false);
+      expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
+    });
+
+  test("pre-creation creator coverage: a CREATE-capable role that has created no function yet fails the gate", async () => {
+    const db = await fresh();
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
+    const SELFP: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    await runMigrations(client(db), { profile: SELFP });
+    await db.exec(
+      "CREATE ROLE g6_can_create NOLOGIN; GRANT CREATE, USAGE ON SCHEMA sessions TO g6_can_create",
+    );
+    const before = await snapshot(db);
+    const error = await failure(runMigrations(client(db), { profile: SELFP }));
+    expect(error?.code).toBe("function_boundary_unproven");
+    const ev = JSON.parse(error!.message!.match(/(\{.*\})/)![1]!);
+    expect(ev.sessions_functions_owned_by_owner).toBe(true); // no function yet
+    expect(ev.sessions_create_roles).toContainEqual({
+      role: "g6_can_create",
+      superuser: false,
+      is_migration_owner: false,
+      function_default: ["<built-in>"],
+      function_default_exact: false,
+    });
+    expect(ev.sessions_create_roles_covered).toBe(false);
+    expect(await snapshot(db)).toEqual(before);
+    // Its own exact-safe default covers it.
+    await db.exec(
+      "ALTER DEFAULT PRIVILEGES FOR ROLE g6_can_create REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+    );
+    expect(
+      await failure(runMigrations(client(db), { profile: SELFP })),
+    ).toBeNull();
+  });
+
+  test("a schema-scoped function default IN sessions that grants another role refuses the gate before any write, even with exact global defaults", async () => {
+    const db = await fresh();
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
+    const SELFP: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    await runMigrations(client(db), { profile: SELFP });
+    await db.exec(
+      "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT EXECUTE ON FUNCTIONS TO authenticated",
+    );
+    const before = await snapshot(db);
+    const error = await failure(runMigrations(client(db), { profile: SELFP }));
+    expect(error?.code).toBe("function_boundary_unproven");
+    const ev = JSON.parse(error!.message!.match(/(\{.*\})/)![1]!);
+    expect(ev.owner_function_default_exact).toBe(true);
+    expect(ev.sessions_create_roles_covered).toBe(true);
+    expect(ev.sessions_schema_function_defaults).toEqual([
+      "postgres>authenticated:EXECUTE",
+    ]);
+    expect(await snapshot(db)).toEqual(before);
+    await db.exec(
+      "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions REVOKE EXECUTE ON FUNCTIONS FROM authenticated",
+    );
+    expect(
+      await failure(runMigrations(client(db), { profile: SELFP })),
+    ).toBeNull();
   });
 
   test("blast radius of the owner-scoped revoke: new owner functions in sessions AND another schema are not PUBLIC-executable; intended grants survive (ACL manifest) the revoke and the next migrate", async () => {

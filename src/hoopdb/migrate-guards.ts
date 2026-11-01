@@ -603,8 +603,31 @@ export async function sequencePreflight(
 /** The reviewed event trigger an equivalent control must use, if chosen. */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER =
   "sessions_function_public_revoke";
-export type FunctionBoundaryApproval =
-  "global-default-revoke" | "event-trigger";
+export type FunctionBoundaryMode = "global-default-revoke" | "event-trigger";
+
+/**
+ * SQL (role oid as $1): the role's GLOBAL function default (pg_default_acl, defaclnamespace
+ * = 0, defaclobjtype 'f') normalized as sorted "<self>|PUBLIC|role:PRIVILEGE[*]" entries
+ * ("*" = grant option). No row means PostgreSQL's built-in default, reported as
+ * ["<built-in>"] (owner and PUBLIC EXECUTE).
+ */
+const FUNCTION_DEFAULT_ROW_SQL = `coalesce((
+    SELECT coalesce((SELECT array_agg(CASE WHEN a.grantee = 0 THEN 'PUBLIC' WHEN a.grantee = $1::oid THEN '<self>' ELSE (SELECT rolname FROM pg_roles WHERE oid = a.grantee) END
+                     || ':' || a.privilege_type || CASE WHEN a.is_grantable THEN '*' ELSE '' END ORDER BY 1)
+      FROM aclexplode(d.defaclacl) a), '{}'::text[])
+      FROM pg_default_acl d
+     WHERE d.defaclrole = $1::oid AND d.defaclnamespace = 0 AND d.defaclobjtype = 'f'), ARRAY['<built-in>'])`;
+/** The only exact-safe global function default: the role's own EXECUTE, no grant option, nothing else. */
+export const EXACT_SAFE_FUNCTION_DEFAULT = ["<self>:EXECUTE"];
+
+/** One role able to create functions in sessions, with its global function default. Names and booleans only. */
+export interface SessionsCreator {
+  role: string;
+  superuser: boolean;
+  is_migration_owner: boolean;
+  function_default: string[];
+  function_default_exact: boolean;
+}
 
 /** Names and booleans only. */
 export interface FunctionBoundaryEvidence {
@@ -615,18 +638,27 @@ export interface FunctionBoundaryEvidence {
    * sessions is an exposed schema, and authenticated and service_role hold USAGE on it.
    */
   sessions_unexposed_and_no_untrusted_usage: false;
+  /** The migration owner's global function default, normalized; exact-safe only if EXACT_SAFE_FUNCTION_DEFAULT. */
+  owner_function_default: string[];
+  owner_function_default_exact: boolean;
   /**
-   * Exactly: a pg_default_acl row for the migration owner with defaclnamespace = 0
-   * (global) and defaclobjtype 'f', whose ACL gives PUBLIC no EXECUTE.
+   * Pre-creation creator coverage: every role with effective CREATE on schema sessions
+   * (has_schema_privilege, membership included, superusers included); before sessions
+   * exists, the migration owner and every superuser. Each must have an exact-safe global
+   * function default, or a function it creates later would be PUBLIC-executable.
    */
-  global_function_default_revokes_public: boolean;
+  sessions_create_roles: SessionsCreator[];
+  sessions_create_roles_covered: boolean;
   /**
-   * Creator coverage: every sessions function is owned by the migration owner. A function
-   * created by any other role escapes the owner-scoped default, so this must hold.
+   * Schema-scoped function defaults IN sessions (any role) that grant anyone other than
+   * the defining role, as "role>grantee:PRIVILEGE[*]". They add to the global default, so
+   * any entry makes future sessions functions executable by that grantee: must be empty.
    */
+  sessions_schema_function_defaults: string[];
+  /** Every existing sessions function is owned by the migration owner. */
   sessions_functions_owned_by_owner: boolean;
   event_trigger_present: boolean;
-  mode: FunctionBoundaryApproval | "none";
+  mode: FunctionBoundaryMode | "none";
   satisfied: boolean;
 }
 
@@ -635,54 +667,101 @@ export interface FunctionBoundaryEvidence {
  * per-schema ALTER DEFAULT PRIVILEGES cannot revoke that. So a function created in
  * sessions after a migrate, outside the migrator, is directly invocable by any role with
  * USAGE on sessions (authenticated, service_role, and through PostgREST RPC) until the
- * next migrate's revoke; the live gate only turns readiness off. Activation therefore
- * needs one durable control, selected by the deployment (HOOPDB_FUNCTION_BOUNDARY_MODE, which
- * is configuration, not a human approval) and proven by the catalog. The gate applies in
- * selfhosted and supabase mode; only explicit local mode is ungated:
- *   (A) "global-default-revoke": ALTER DEFAULT PRIVILEGES FOR ROLE <migration owner>
- *       REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC. On Supabase the owner is postgres, so
- *       this changes every future postgres-created function in every schema.
- *       In selfhosted, the database is dedicated to HoopDb, so the privileged
- *       supabase/bootstrap/hoopdb_function_default_revoke.sql installs it safely.
- *   (E) "event-trigger": NOT IMPLEMENTED, refused (hook kept for a reviewed trigger).
+ * next migrate's revoke, unless its creator's global function default is exact-safe.
+ * The migrator's function-boundary gate (and --activation-check) therefore requires the
+ * mode the deployment selects (HOOPDB_FUNCTION_BOUNDARY_MODE, configuration, not a human
+ * sign-off) to be proven by the catalog. It applies in selfhosted and supabase mode; only
+ * explicit local mode is ungated:
+ *   "global-default-revoke": every sessions creator, the migration owner included, has
+ *       a global function default of exactly {<self>:EXECUTE} (no other grantee, no grant
+ *       option). Installed in selfhosted by the privileged
+ *       supabase/bootstrap/hoopdb_function_default_revoke.sql (the database is dedicated
+ *       to HoopDb). On Supabase the owner is postgres, so the operator decides (#98).
+ *   "event-trigger": NOT IMPLEMENTED, refused (hook kept for a reviewed trigger).
  * (B) cannot be claimed here (see the evidence field). Follow-up: a dedicated sessions
  * object owner, which needs an ownership transfer of live objects (activation dossier #98).
  */
 export async function functionBoundaryEvidence(
   client: GuardClient,
-  approval: FunctionBoundaryApproval | undefined,
+  mode: FunctionBoundaryMode | undefined,
 ): Promise<FunctionBoundaryEvidence> {
-  const r = (
+  const head = (
     await client.query<{
       owner: string;
-      global_revoke: boolean;
+      owner_oid: number;
       event_trigger: boolean;
       owned: boolean;
+      sessions: boolean;
     }>(
-      `SELECT current_user AS owner,
-              EXISTS (SELECT 1 FROM pg_default_acl d
-                       WHERE d.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = current_user)
-                         AND d.defaclnamespace = 0 AND d.defaclobjtype = 'f'
-                         AND NOT EXISTS (SELECT 1 FROM aclexplode(d.defaclacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')) AS global_revoke,
+      `SELECT current_user AS owner, (SELECT oid::int FROM pg_roles WHERE rolname = current_user) AS owner_oid,
               EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = $1 AND evtenabled <> 'D' AND evtevent = 'ddl_command_end') AS event_trigger,
               NOT EXISTS (SELECT 1 FROM pg_proc p
                            WHERE p.pronamespace = coalesce(to_regnamespace('sessions')::oid, 0)
-                             AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS owned`,
+                             AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS owned,
+              to_regnamespace('sessions') IS NOT NULL AS sessions`,
       [SESSIONS_FUNCTION_EVENT_TRIGGER],
     )
   ).rows[0]!;
+  const roles = (
+    await client.query<{ oid: number; rolname: string; rolsuper: boolean }>(
+      head.sessions
+        ? "SELECT oid::int AS oid, rolname, rolsuper FROM pg_roles WHERE has_schema_privilege(oid, 'sessions', 'CREATE') ORDER BY rolname"
+        : "SELECT oid::int AS oid, rolname, rolsuper FROM pg_roles WHERE rolsuper OR rolname = current_user ORDER BY rolname",
+    )
+  ).rows;
+  const defaultOf = async (oid: number) =>
+    (
+      await client.query<{ d: string[] }>(
+        `SELECT ${FUNCTION_DEFAULT_ROW_SQL} AS d`,
+        [oid],
+      )
+    ).rows[0]!.d;
+  const exact = (d: string[]) =>
+    JSON.stringify(d) === JSON.stringify(EXACT_SAFE_FUNCTION_DEFAULT);
+  const creators: SessionsCreator[] = [];
+  for (const r of roles) {
+    const d = await defaultOf(r.oid);
+    creators.push({
+      role: r.rolname,
+      superuser: r.rolsuper,
+      is_migration_owner: r.oid === head.owner_oid,
+      function_default: d,
+      function_default_exact: exact(d),
+    });
+  }
+  const ownerDefault = await defaultOf(head.owner_oid);
+  const schemaDefaults = (
+    await client.query<{ e: string }>(
+      `SELECT r.rolname || '>' || CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE (SELECT rolname FROM pg_roles WHERE oid = a.grantee) END
+              || ':' || a.privilege_type || CASE WHEN a.is_grantable THEN '*' ELSE '' END AS e
+         FROM pg_default_acl d JOIN pg_roles r ON r.oid = d.defaclrole, aclexplode(d.defaclacl) a
+        WHERE d.defaclnamespace = coalesce(to_regnamespace('sessions')::oid, 0) AND d.defaclnamespace <> 0
+          AND d.defaclobjtype = 'f' AND a.grantee <> d.defaclrole
+        ORDER BY 1`,
+    )
+  ).rows.map((x) => x.e);
+  const covered =
+    creators.length > 0 && creators.every((c) => c.function_default_exact);
   // Event-trigger mode is not implemented: a trigger's name proves nothing (its enabled
   // state, events and tags, owner, function identity and definition, SECURITY and
   // search_path, and behaviour would all need verifying). Hook kept for that later work.
   const satisfied =
-    approval === "global-default-revoke" && r.global_revoke && r.owned;
+    mode === "global-default-revoke" &&
+    exact(ownerDefault) &&
+    covered &&
+    schemaDefaults.length === 0 &&
+    head.owned;
   return {
-    migration_owner: r.owner,
+    migration_owner: head.owner,
     sessions_unexposed_and_no_untrusted_usage: false,
-    global_function_default_revokes_public: r.global_revoke,
-    sessions_functions_owned_by_owner: r.owned,
-    event_trigger_present: r.event_trigger,
-    mode: approval ?? "none",
+    owner_function_default: ownerDefault,
+    owner_function_default_exact: exact(ownerDefault),
+    sessions_create_roles: creators,
+    sessions_create_roles_covered: covered,
+    sessions_schema_function_defaults: schemaDefaults,
+    sessions_functions_owned_by_owner: head.owned,
+    event_trigger_present: head.event_trigger,
+    mode: mode ?? "none",
     satisfied,
   };
 }

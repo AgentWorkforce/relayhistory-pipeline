@@ -299,6 +299,8 @@ for (const r of [
   "g6_unrel",
   "g6_probe",
   "g6_other_creator",
+  "g6_can_create",
+  "g6_nobody",
 ]) {
   for (const d of (
     await sql("postgres", "SELECT datname FROM pg_database WHERE datallowconn")
@@ -1166,8 +1168,10 @@ await check(
   },
 );
 
+const leaves = (v: unknown): unknown[] =>
+  v !== null && typeof v === "object" ? Object.values(v).flatMap(leaves) : [v];
 await check(
-  "supabase activation gate: refused without an approved durable boundary (names and booleans); (A) owner-scoped global revoke, approved, passes",
+  "supabase activation gate: refused unless HOOPDB_FUNCTION_BOUNDARY_MODE selects a catalog-proven control (names and booleans); (A) owner-scoped global revoke with the mode selected passes",
   async () => {
     await fresh("g6_supa", ["g6_rt2"], false);
     const SUPA = {
@@ -1179,10 +1183,10 @@ await check(
     const absent = (await snapshot("g6_supa")) === "absent";
     await sql(
       "g6_supa",
-      "ALTER DEFAULT PRIVILEGES FOR ROLE hoop REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+      "ALTER DEFAULT PRIVILEGES FOR ROLE hoop REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC; ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
     );
-    const unapproved = migrate("g6_supa", SUPA);
-    const approved = migrate("g6_supa", {
+    const modeUnset = migrate("g6_supa", SUPA);
+    const selected = migrate("g6_supa", {
       ...SUPA,
       HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
     });
@@ -1204,18 +1208,17 @@ await check(
     const ok =
       none.code === "function_boundary_unproven" &&
       absent &&
-      unapproved.code === "function_boundary_unproven" &&
-      approved.exit === 0 &&
+      modeUnset.code === "function_boundary_unproven" &&
+      selected.exit === 0 &&
       check.status === 0 &&
       evidence.satisfied === true &&
-      evidence.global_function_default_revokes_public === true &&
+      evidence.owner_function_default_exact === true &&
       evidence.sessions_unexposed_and_no_untrusted_usage === false &&
-      Object.values(evidence).every((x) =>
-        ["string", "boolean"].includes(typeof x),
-      );
+      // Names and booleans only: every leaf (through the creator list) is a string or boolean.
+      leaves(evidence).every((x) => ["string", "boolean"].includes(typeof x));
     return [
       ok,
-      `none=${fmt(none)} nothing_written=${absent} unapproved=${fmt(unapproved)} approved=${fmt(approved)} evidence=${fmt(evidence)}`,
+      `none=${fmt(none)} nothing_written=${absent} mode_unset=${fmt(modeUnset)} mode_selected=${fmt(selected)} evidence=${fmt(evidence)}`,
     ];
   },
 );
@@ -1329,6 +1332,200 @@ await check(
     ];
   },
 );
+let BOUNDARY_EVIDENCE: unknown = null;
+const activationCheck = (db: string) => {
+  const r = spawnSync("bun", ["src/hoopdb/migrate.ts", "--activation-check"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOOPDB_URL: url("hoop", db),
+      HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+    },
+  });
+  return {
+    status: r.status,
+    evidence: JSON.parse(r.stdout.trim().split("\n").at(-1) || "{}"),
+  };
+};
+for (const [name, poison, shown] of [
+  [
+    "an extra grantee (authenticated EXECUTE)",
+    "GRANT EXECUTE ON FUNCTIONS TO authenticated",
+    "authenticated:EXECUTE",
+  ],
+  [
+    "a grant option",
+    "GRANT EXECUTE ON FUNCTIONS TO authenticated WITH GRANT OPTION",
+    "authenticated:EXECUTE*",
+  ],
+] as const)
+  await check(
+    `exact default ACL: a poisoned owner default (PUBLIC revoked plus ${name}) fails the bootstrap before any write and activation-check refuses`,
+    async () => {
+      await fresh("g6_pz", ["g6_rt2"], false);
+      await sql(
+        "g6_pz",
+        `ALTER DEFAULT PRIVILEGES FOR ROLE hoop REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC; ALTER DEFAULT PRIVILEGES FOR ROLE hoop ${poison}`,
+      );
+      const acls = async () =>
+        (
+          await sql(
+            "g6_pz",
+            "SELECT coalesce(string_agg(defaclrole::regrole::text || '=' || defaclacl::text, ';' ORDER BY 1), '') AS a FROM pg_default_acl",
+          )
+        ).rows[0].a as string;
+      const before = await acls();
+      const boot = psql("g6_pz", [
+        "-v",
+        "migration_owner=hoop",
+        "-f",
+        FN_DEFAULT_BOOT,
+      ]);
+      const same = (await acls()) === before;
+      const chk = activationCheck("g6_pz");
+      const m = migrate("g6_pz", SEQ);
+      const absent = (await snapshot("g6_pz")) === "absent";
+      await attempt("postgres", "DROP DATABASE IF EXISTS g6_pz WITH (FORCE)");
+      const ok =
+        !boot.ok &&
+        boot.out.includes("poisoned function default") &&
+        same &&
+        chk.status === 1 &&
+        chk.evidence.owner_function_default_exact === false &&
+        (chk.evidence.owner_function_default as string[]).includes(shown) &&
+        m.code === "function_boundary_unproven" &&
+        absent;
+      return [
+        ok,
+        `bootstrap_refused=${!boot.ok} acl_unchanged=${same} evidence_default=${fmt(chk.evidence.owner_function_default)} migrate=${fmt(m)} nothing_written=${absent}`,
+      ];
+    },
+  );
+await check(
+  "after a correct bootstrap, a function created later in sessions (by the owner or a superuser) is not executable by PUBLIC, authenticated or the runtime role",
+  async () => {
+    await fresh("g6_bh", ["g6_rt2"]);
+    const m = migrate("g6_bh", SEQ);
+    const chk = activationCheck("g6_bh");
+    BOUNDARY_EVIDENCE = chk.evidence;
+    await sql(
+      "g6_bh",
+      "CREATE FUNCTION sessions.g6_by_owner() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+      "hoop",
+    );
+    await sql(
+      "g6_bh",
+      "CREATE FUNCTION sessions.g6_by_superuser() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+    );
+    await attempt("postgres", "CREATE ROLE g6_nobody NOLOGIN");
+    const r = (
+      await sql(
+        "g6_bh",
+        `SELECT p.proname,
+              EXISTS (SELECT 1 FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a WHERE a.grantee = 0) AS public_exec,
+              has_function_privilege('g6_nobody', p.oid, 'EXECUTE') AS nobody,
+              has_function_privilege('authenticated', p.oid, 'EXECUTE') AS authenticated,
+              has_function_privilege('g6_rt2', p.oid, 'EXECUTE') AS runtime
+         FROM pg_proc p WHERE p.proname IN ('g6_by_owner', 'g6_by_superuser') ORDER BY 1`,
+      )
+    ).rows;
+    await attempt("postgres", "DROP DATABASE IF EXISTS g6_bh WITH (FORCE)");
+    await attempt("postgres", "DROP ROLE IF EXISTS g6_nobody");
+    const ok =
+      m.exit === 0 &&
+      chk.status === 0 &&
+      r.length === 2 &&
+      r.every(
+        (x) => !x.public_exec && !x.nobody && !x.authenticated && !x.runtime,
+      );
+    return [
+      ok,
+      `migrate=${fmt(m)} activation_check=${chk.status} functions=${fmt(r)}`,
+    ];
+  },
+);
+await check(
+  "pre-creation creator coverage: a CREATE-capable role that has created no function yet fails the gate (evidence names it)",
+  async () => {
+    await fresh("g6_pc", ["g6_rt2"]);
+    const m1 = migrate("g6_pc", SEQ);
+    await attempt("postgres", "CREATE ROLE g6_can_create NOLOGIN");
+    await sql(
+      "g6_pc",
+      "GRANT CREATE, USAGE ON SCHEMA sessions TO g6_can_create",
+    );
+    const before = await snapshot("g6_pc");
+    const m2 = migrate("g6_pc", SEQ);
+    const same = (await snapshot("g6_pc")) === before;
+    const chk = activationCheck("g6_pc");
+    const named = (
+      chk.evidence.sessions_create_roles as Array<{
+        role: string;
+        function_default_exact: boolean;
+      }>
+    ).find((c) => c.role === "g6_can_create");
+    const boot = psql("g6_pc", [
+      "-v",
+      "migration_owner=hoop",
+      "-f",
+      FN_DEFAULT_BOOT,
+    ]);
+    await attempt("postgres", "DROP DATABASE IF EXISTS g6_pc WITH (FORCE)");
+    await attempt("postgres", "DROP ROLE IF EXISTS g6_can_create");
+    const ok =
+      m1.exit === 0 &&
+      m2.code === "function_boundary_unproven" &&
+      same &&
+      chk.status === 1 &&
+      named?.function_default_exact === false &&
+      chk.evidence.sessions_functions_owned_by_owner === true &&
+      !boot.ok &&
+      boot.out.includes(
+        "can CREATE in sessions without an exact-safe function default",
+      );
+    return [
+      ok,
+      `first=${fmt(m1)} gate=${fmt(m2)} unchanged=${same} creator=${fmt(named)} bootstrap_refused=${!boot.ok}`,
+    ];
+  },
+);
+await check(
+  "a sessions-scoped function default granting authenticated EXECUTE (global defaults exact) fails the gate and the bootstrap, nothing changed",
+  async () => {
+    await fresh("g6_sd", ["g6_rt2"]);
+    const m1 = migrate("g6_sd", SEQ);
+    await sql(
+      "g6_sd",
+      "ALTER DEFAULT PRIVILEGES FOR ROLE hoop IN SCHEMA sessions GRANT EXECUTE ON FUNCTIONS TO authenticated",
+    );
+    const before = await snapshot("g6_sd");
+    const m2 = migrate("g6_sd", SEQ);
+    const same = (await snapshot("g6_sd")) === before;
+    const chk = activationCheck("g6_sd");
+    const boot = psql("g6_sd", [
+      "-v",
+      "migration_owner=hoop",
+      "-f",
+      FN_DEFAULT_BOOT,
+    ]);
+    await attempt("postgres", "DROP DATABASE IF EXISTS g6_sd WITH (FORCE)");
+    const ok =
+      m1.exit === 0 &&
+      m2.code === "function_boundary_unproven" &&
+      same &&
+      chk.status === 1 &&
+      chk.evidence.owner_function_default_exact === true &&
+      JSON.stringify(chk.evidence.sessions_schema_function_defaults) ===
+        JSON.stringify(["hoop>authenticated:EXECUTE"]) &&
+      !boot.ok &&
+      boot.out.includes("sessions-scoped function default");
+    return [
+      ok,
+      `first=${fmt(m1)} gate=${fmt(m2)} unchanged=${same} schema_defaults=${fmt(chk.evidence.sessions_schema_function_defaults)} bootstrap_refused=${!boot.ok}`,
+    ];
+  },
+);
 await check(
   "creator coverage: a sessions function created by another role escapes the owner-scoped default; the gate refuses it before any write",
   async () => {
@@ -1369,7 +1566,7 @@ await check(
       same &&
       chk.status === 1 &&
       ev.sessions_functions_owned_by_owner === false &&
-      ev.global_function_default_revokes_public === true;
+      ev.owner_function_default_exact === true;
     return [
       ok,
       `first=${fmt(m1)} after_foreign_function=${fmt(m2)} unchanged=${same} evidence=${fmt(ev)}`,
@@ -1467,6 +1664,9 @@ await attempt("postgres", "DROP DATABASE IF EXISTS g6_w");
 const failed = cases.filter((c) => !c.pass).length;
 const results = {
   head: process.env.PGPROOF_HEAD ?? "unknown",
+  // The catalog evidence of a correctly bootstrapped selfhosted database: the owner's
+  // global function default and every role able to CREATE in sessions, with its default.
+  function_boundary_evidence: BOUNDARY_EVIDENCE,
   pg_version: version,
   pg_major: Number(version.split(".")[0]),
   generation: await generation(),

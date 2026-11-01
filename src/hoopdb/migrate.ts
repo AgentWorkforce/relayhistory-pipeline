@@ -15,7 +15,7 @@ import {
   functionBoundaryEvidence,
   runtimeRoleViolations,
   sequencePreflight,
-  type FunctionBoundaryApproval,
+  type FunctionBoundaryMode,
 } from "./migrate-guards.ts";
 import { openHoopDb, waitForHoopDb, ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE, ROLE_VERIFY_SQL_PATH, type ExpectedSchema } from "../shared/db.ts";
 import { log } from "../shared/log.ts";
@@ -75,7 +75,7 @@ export interface MigrationProfile {
    * selects. Configuration, not a human approval: the gate passes only when the catalog
    * itself proves the selected control. Required outside local mode.
    */
-  functionBoundary?: FunctionBoundaryApproval;
+  functionBoundary?: FunctionBoundaryMode;
 }
 
 function profileError(code: string, message: string): Error {
@@ -123,7 +123,7 @@ export function migrationProfile(env: Record<string, string | undefined> = proce
     runtimeRole,
     ...(runtimeLogin === undefined ? {} : { runtimeLogin }),
     ...(workloadRole ? { workloadRole } : {}),
-    ...(fb ? { functionBoundary: fb as FunctionBoundaryApproval } : {}),
+    ...(fb ? { functionBoundary: fb as FunctionBoundaryMode } : {}),
   };
   if (mode === "supabase") {
     if (shim) throw profileError("shim_forbidden", "the plain-Postgres role shim never runs in supabase mode");
@@ -233,7 +233,7 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
     if (profile.mode !== "local") {
       const evidence = await functionBoundaryEvidence(client, profile.functionBoundary);
       if (!evidence.satisfied)
-        throw profileError("function_boundary_unproven", `no approved durable function boundary: ${JSON.stringify(evidence)}; see the runbook "Function boundary"`);
+        throw profileError("function_boundary_unproven", `no catalog-proven function boundary (HOOPDB_FUNCTION_BOUNDARY_MODE): ${JSON.stringify(evidence)}; see the runbook "Function boundary"`);
     }
     await cliHistoryPreflight(client, schema);
     await sequencePreflight(client, schema, ledger);
@@ -428,7 +428,7 @@ async function cliHistoryPreflight(client: MigrationClient, schema: Step[]): Pro
   }
 }
 
-function migrationProfileApproval(): FunctionBoundaryApproval | undefined {
+function migrationProfileMode(): FunctionBoundaryMode | undefined {
   const v = process.env.HOOPDB_FUNCTION_BOUNDARY_MODE;
   return v === "global-default-revoke" ? v : undefined;
 }
@@ -453,8 +453,8 @@ if (import.meta.main) {
     // For an operator or the activation dossier: the function-boundary evidence (names and
     // booleans only) for HOOPDB_URL and HOOPDB_FUNCTION_BOUNDARY_MODE. Exit 1 if unproven.
     const db = openHoopDb();
-    const approval = migrationProfileApproval();
-    functionBoundaryEvidence(db, approval)
+    const mode = migrationProfileMode();
+    functionBoundaryEvidence(db, mode)
       .then(async (e) => {
         console.log(JSON.stringify(e));
         await db.end();

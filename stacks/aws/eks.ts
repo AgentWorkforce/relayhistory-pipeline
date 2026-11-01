@@ -69,7 +69,7 @@ export function hoopdbModeEnv(inCluster: boolean, runtimeRole?: string, runtimeL
   return [
     { name: "HOOPDB_DB_MODE", value: inCluster ? "selfhosted" : "supabase" },
     { name: "HOOPDB_SUPABASE_SHIM", value: inCluster ? "true" : "false" },
-    // Selfhosted (dedicated HoopDb database): the owner-scoped global default revoke,
+    // Selfhosted (dedicated HoopDb database): the exact global function default (owner + superusers),
     // installed by supabase/bootstrap/hoopdb_function_default_revoke.sql before migrate.
     // Supabase: no default; the operator selects a control (#98), so it fails closed.
     ...(inCluster ? [{ name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" }] : []),

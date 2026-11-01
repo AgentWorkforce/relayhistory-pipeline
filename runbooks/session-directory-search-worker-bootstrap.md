@@ -377,28 +377,62 @@ itself is the proof. The old name, `HOOPDB_FUNCTION_BOUNDARY_APPROVED`, is refus
 config fails closed.
 
 - **`global-default-revoke` (the only mode implemented):**
-  `ALTER DEFAULT PRIVILEGES FOR ROLE <migration owner> REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`
-  in the HoopDb database.
+  `ALTER DEFAULT PRIVILEGES FOR ROLE <role> REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`
+  in the HoopDb database, for the migration owner and for every other role that can
+  create functions in `sessions`.
   - **selfhosted:** the privileged, idempotent
     `supabase/bootstrap/hoopdb_function_default_revoke.sql`
     (`-v migration_owner=hoop`, run as a superuser, in the HoopDb database) installs it
-    before migrate. It is global for that owner: every function the owner creates later
-    in that database, in any schema, starts without PUBLIC EXECUTE. That is safe only
-    because the selfhosted database is dedicated to HoopDb. Real PG15/17 tests show:
+    before migrate. It sets the global function default of the owner **and of every
+    superuser** (a superuser can always CREATE in `sessions`). That is global for those
+    roles: every function they create later in that database, in any schema, starts
+    executable by its owner only. That is safe only because the selfhosted database is
+    dedicated to HoopDb. Before any write it refuses (nothing changed) when a target's
+    existing default grants anything beyond the built-in owner/PUBLIC EXECUTE (a poisoned
+    default, for example EXECUTE to `authenticated` or a grant option), or when another
+    role can CREATE in `sessions` without an exact-safe default of its own, or a
+    `sessions`-scoped function default grants another role. Its
+    postcondition re-checks every owner, superuser and `sessions` creator. Real PG15/17
+    tests show:
     - a new owner function in `sessions` and in a second schema is not
       PUBLIC-executable;
+    - after the bootstrap, functions created later in `sessions` by the owner and by a
+      superuser are not executable (`has_function_privilege`) by PUBLIC (a fresh role),
+      `authenticated` or the runtime role;
+    - both poisoned-default variants fail the bootstrap with `pg_default_acl` unchanged,
+      and `--activation-check` and migrate refuse;
     - the intended grants survive the revoke and the next migrate: the Worker's three RPCs,
       `authenticated`'s six helpers and `service_role`'s grants, all checked against the
       ACL manifest;
-    - the AWS CNPG and GCP fixture env passes the gate.
+    - the AWS CNPG and GCP fixture env resolves to this profile (the catalog still
+      decides).
   - **supabase:** the owner is `postgres`, so the same statement would reach every future
     postgres-created function in every schema of the project. It is never run from here.
     An operator decides it (#98), and until then supabase migrate stays refused.
-- **Exact check and creator coverage:** the gate requires a `pg_default_acl` row for the
-  migration owner with `defaclnamespace = 0` and `defaclobjtype = 'f'` whose ACL gives
-  PUBLIC no EXECUTE, AND that every `sessions` function is owned by that owner. A
-  function created by any other role escapes the owner-scoped default, so its presence
-  refuses the gate (`sessions_functions_owned_by_owner: false`; tested on PG15 and PG17).
+  - **Managed PostgreSQL without a usable superuser (Cloud SQL):** a superuser can
+    always CREATE in `sessions`, so it counts as a creator and needs its own exact
+    default. The bootstrap must run as a superuser and sets every superuser's default. On
+    Cloud SQL the operator has no superuser and the internal `cloudsqladmin` cannot be
+    altered (expected, not observed on a live instance), so the
+    bootstrap cannot run and the gate stays refused there
+    (`function_boundary_unproven`, fail closed). The GCP profile env still selects
+    `global-default-revoke`; activating GCP needs a reviewed control first (#98).
+- **Exact default ACL:** the migration owner's `pg_default_acl` row with
+  `defaclnamespace = 0` and `defaclobjtype = 'f'` must normalize to EXACTLY
+  `{<self>:EXECUTE}`: owner EXECUTE, no grant option, no other grantee. Merely "PUBLIC
+  revoked" is not enough: a default that also grants `authenticated` (or anyone) EXECUTE,
+  or carries a grant option, refuses the gate. No row means the built-in default (PUBLIC
+  EXECUTE) and refuses too.
+- **Creator coverage, before any function exists:** every role with effective CREATE on
+  `sessions` (`has_schema_privilege`, so membership, the schema owner and superusers
+  count) must be the migration owner or have its own exact-safe global function default.
+  A CREATE-capable role that has not created anything yet still refuses the gate (tested
+  on PG15 and PG17). Separately, every existing `sessions` function must be owned by the
+  owner (`sessions_functions_owned_by_owner`).
+- **No schema-scoped grant in `sessions`:** a function default defined `IN SCHEMA sessions`
+  (by any role) adds to the global default, so any entry granting a role other than its
+  own (for example `authenticated`) refuses the gate and the bootstrap
+  (`sessions_schema_function_defaults` must be empty; tested on PG15 and PG17).
 - **`event-trigger`: not implemented, refused** (`function_boundary_mode_unimplemented`).
   A trigger's name proves nothing. A reviewed implementation must verify the enabled
   state, events and tags, owner and function identity, function definition or hash,
@@ -409,13 +443,23 @@ The evidence is names and booleans only:
 
 - `migration_owner`;
 - `sessions_unexposed_and_no_untrusted_usage`, always false here;
-- `global_function_default_revokes_public`;
+- `owner_function_default` (the normalized owner row: `<self>`, `PUBLIC` or
+  `role:PRIVILEGE`, `*` marking a grant option; `<built-in>` when no row exists) and
+  `owner_function_default_exact`;
+- `sessions_create_roles`: each role able to CREATE in `sessions`, with `superuser`,
+  `is_migration_owner`, its normalized `function_default` and
+  `function_default_exact`; then `sessions_create_roles_covered`;
+- `sessions_schema_function_defaults` (`role>grantee:PRIVILEGE` entries; must be empty);
 - `sessions_functions_owned_by_owner`;
 - `event_trigger_present` (informational);
 - `mode`;
 - `satisfied`.
 
-`bun src/hoopdb/migrate.ts --activation-check` prints it and exits 1 if unproven.
+`bun src/hoopdb/migrate.ts --activation-check` prints it and exits 1 if unproven. The
+real-PG proof JSON carries the same evidence for a bootstrapped selfhosted database
+(`function_boundary_evidence`). The live gate (readiness and worker claims) checks
+existing functions only; the default-ACL and creator evidence is enforced by the migrator
+and `--activation-check`.
 
 **Claim paths.** The worker's only claim paths are each stage's `pollPostgresStage` and
 the side tick, all through `workerTick`, which runs the live gate (sessions-function
@@ -431,7 +475,7 @@ enforcement, reviewed. Tracked in #98.
 
 - **Selfhosted bootstraps, every deploy, before migrate, as the CNPG superuser, in the HoopDb
   database:** `hoopdb_runtime_role.sql` (the dedicated runtime role; it also revokes PUBLIC
-  TEMPORARY) and `hoopdb_function_default_revoke.sql` (the owner-scoped function default).
+  TEMPORARY) and `hoopdb_function_default_revoke.sql` (the exact global function default for the owner and every superuser).
   Not wired yet: the Job is helm-charts #24's.
 - **Phase 1, every deploy (required for existing clusters):** a Job ordered before
   `hoopdb-migrate`, for example a pre-migrate step in the same release. It runs phase 1 as

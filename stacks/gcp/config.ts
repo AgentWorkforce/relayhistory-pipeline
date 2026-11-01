@@ -944,8 +944,12 @@ export function relayflowsChartValues(
 
 /**
  * The GCP migrator's explicit profile: Cloud SQL is plain Postgres dedicated to HoopDb,
- * so selfhosted mode, the shim on, the owner-scoped global default revoke (installed by
- * supabase/bootstrap/hoopdb_function_default_revoke.sql), and the dedicated runtime role.
+ * so selfhosted mode, the shim on, the exact global function default for the owner and
+ * superusers (installed by supabase/bootstrap/hoopdb_function_default_revoke.sql), and the
+ * dedicated runtime role. Cloud SQL gives the operator no superuser and its internal
+ * cloudsqladmin cannot be altered (expected, not observed live), so that bootstrap cannot
+ * run and the migrator's function-boundary gate stays refused (fail closed) until a
+ * reviewed control exists (#98).
  */
 export function gcpHoopdbModeEnv(
   runtimeRole?: string,
