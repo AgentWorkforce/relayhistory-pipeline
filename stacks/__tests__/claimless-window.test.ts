@@ -74,9 +74,11 @@ const compositions: [string, (window?: ClaimlessWindow) => Rendered][] = [
       bulls96ReleaseValues(
         {
           enabled: true,
-          chartVersion: "0.3.0",
+          chartVersion: "0.3.2",
           tenantOrgId: "org_123",
           existingSecretName: "bulls96-runtime",
+          hoopdbRuntimeRole: "bulls96_runtime",
+          hoopdbRuntimeRoleLogin: true,
           imageDigest: `sha256:${"a".repeat(64)}`,
           imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
           relayauthJwksUrl:

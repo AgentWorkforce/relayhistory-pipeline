@@ -306,6 +306,7 @@ const GCP_STAGE = /^gcp-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const PROJECT_NUMBER = /^[0-9]{6,20}$/;
 const REGION = /^[a-z]+(?:-[a-z0-9]+)+[0-9]$/;
 const SEMVER = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
+const POSTGRES_ROLE = /^[A-Za-z_][A-Za-z0-9_$-]{0,62}$/;
 const KUBERNETES_NAME = /^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$/;
 const EXECUTOR_IDENTITY =
   /^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
@@ -537,10 +538,10 @@ export function assertGcpInputs(
         "96bulls: bulls96.enabled requires managedDataPlane.provision with acknowledgement=adapter-proof-only",
       );
     requireSemver("bulls96.chartVersion", inputs.bulls96.chartVersion);
-    const [major, minor] = inputs.bulls96.chartVersion.split(".").map(Number);
-    if (!(major! > 0 || (major === 0 && minor! >= 3)))
+    const [major, minor, patch] = inputs.bulls96.chartVersion.split(".").map(Number);
+    if (!(major! > 0 || (major === 0 && (minor! > 3 || (minor === 3 && patch! >= 2)))))
       throw new Error(
-        "96bulls: bulls96.chartVersion must be 0.3.0 or newer so the worker chart accepts pod identity and extraEnv",
+        "96bulls: bulls96.chartVersion must be 0.3.2 or newer so the migration Job can use a separate owner credential",
       );
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(inputs.bulls96.tenantOrgId))
       throw new Error(
@@ -550,6 +551,16 @@ export function assertGcpInputs(
       "bulls96.existingSecretName",
       inputs.bulls96.existingSecretName,
     );
+    if (requestedCommand !== "destroy") {
+      if (!POSTGRES_ROLE.test(inputs.bulls96.hoopdbRuntimeRole ?? ""))
+        throw new Error(
+          "96bulls: bulls96.hoopdbRuntimeRole must name the dedicated non-owner PostgreSQL login role",
+        );
+      if (typeof inputs.bulls96.hoopdbRuntimeRoleLogin !== "boolean")
+        throw new Error(
+          "96bulls: bulls96.hoopdbRuntimeRoleLogin must be set explicitly",
+        );
+    }
     if (!/^sha256:[a-f0-9]{64}$/.test(inputs.bulls96.imageDigest))
       throw new Error(
         "96bulls: bulls96.imageDigest must be an immutable sha256 digest",
@@ -632,6 +643,15 @@ export function assertGcpRuntimeDeployable(
     requireApprovedGcpServicesImage(
       inputs.bulls96.imageDigest,
       inputs.bulls96.imageSourceRevision,
+    );
+  if (
+    inputs.bulls96?.enabled &&
+    requestedCommand !== "destroy" &&
+    (!POSTGRES_ROLE.test(inputs.bulls96.hoopdbRuntimeRole ?? "") ||
+      typeof inputs.bulls96.hoopdbRuntimeRoleLogin !== "boolean")
+  )
+    throw new Error(
+      "96bulls: GCP runtime deploy requires an explicit dedicated HoopDb runtime role and login mode. Nothing was created.",
     );
 }
 
@@ -872,6 +892,13 @@ export function bulls96ReleaseValues(
   i: NonNullable<GcpInputs["bulls96"]>,
   managed: Bulls96ReleaseOutputs,
 ): Record<string, unknown> {
+  if (
+    !POSTGRES_ROLE.test(i.hoopdbRuntimeRole ?? "") ||
+    typeof i.hoopdbRuntimeRoleLogin !== "boolean"
+  )
+    throw new Error(
+      "96bulls: GCP release values require an explicit dedicated HoopDb runtime role and login mode. Nothing was created.",
+    );
   if (!GSA_EMAIL.test(managed.workloadIdentityEmail))
     throw new Error(
       "96bulls: workload identity email is not a service-account email. Nothing was created.",
@@ -946,7 +973,13 @@ export function bulls96ReleaseValues(
       hoopdb: hoopdb(),
       locker: locker(),
       lockerInit: { enabled: false },
-      migrations: { supabaseShim: true },
+      migrations: {
+        supabaseShim: true,
+        hoopdb: {
+          existingSecret: i.existingSecretName,
+          key: "HOOPDB_MIGRATION_URL",
+        },
+      },
       summaryEncryption: {
         existingSecret: i.existingSecretName,
         key: "SUMMARY_MASTER_KEYS",

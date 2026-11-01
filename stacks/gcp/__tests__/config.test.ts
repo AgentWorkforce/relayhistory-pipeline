@@ -141,9 +141,11 @@ describe("GCP self-host contract", () => {
   it("validates 96Bulls inputs and allows only the acknowledged managed runtime", () => {
     const bulls96 = {
       enabled: true,
-      chartVersion: "0.3.0",
+      chartVersion: "0.3.2",
       tenantOrgId: "org_123",
       existingSecretName: "bulls96-runtime",
+      hoopdbRuntimeRole: "bulls96_runtime",
+      hoopdbRuntimeRoleLogin: true,
       imageDigest: `sha256:${"a".repeat(64)}`,
       imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
       relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
@@ -158,6 +160,50 @@ describe("GCP self-host contract", () => {
         bulls96: { ...bulls96, tenantOrgId: "https://user:password@example.com" },
       }),
     ).toThrow("org id");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: {
+          ...bulls96,
+          chartVersion: "0.3.1",
+          imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest,
+        },
+      }),
+    ).toThrow("must be 0.3.2 or newer");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: {
+          ...bulls96,
+          imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest,
+          hoopdbRuntimeRole: undefined,
+        },
+      }),
+    ).toThrow("dedicated non-owner PostgreSQL login role");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: {
+          ...bulls96,
+          imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest,
+          hoopdbRuntimeRole: "bulls96 runtime",
+        },
+      }),
+    ).toThrow("dedicated non-owner PostgreSQL login role");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: {
+          ...bulls96,
+          imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest,
+          hoopdbRuntimeRoleLogin: undefined,
+        },
+      }),
+    ).toThrow("hoopdbRuntimeRoleLogin must be set explicitly");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
@@ -284,9 +330,11 @@ describe("GCP self-host contract", () => {
     const values = bulls96ReleaseValues(
         {
           enabled: true,
-          chartVersion: "0.3.0",
+          chartVersion: "0.3.2",
           tenantOrgId: "org_123",
           existingSecretName: "bulls96-runtime",
+          hoopdbRuntimeRole: "bulls96_runtime",
+          hoopdbRuntimeRoleLogin: true,
           imageDigest: `sha256:${"a".repeat(64)}`,
           imageSourceRevision: GCP_APPROVED_SERVICES_IMAGE.sourceRevision,
           relayauthJwksUrl: "http://relayauth.relayauth.svc:8787/.well-known/jwks.json",
@@ -316,10 +364,19 @@ describe("GCP self-host contract", () => {
     expect(rendered).not.toContain("REDIS_PASSWORD");
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
     const worker = values.worker as {
-      migrations: { supabaseShim: boolean };
+      hoopdb: { existingSecret: string; key: string };
+      migrations: {
+        supabaseShim: boolean;
+        hoopdb: { existingSecret: string; key: string };
+      };
       extraEnv: Array<{ name: string; value: string }>;
     };
     expect(worker.migrations.supabaseShim).toBe(true);
+    expect(worker.hoopdb).toEqual({ existingSecret: "bulls96-runtime", key: "HOOPDB_URL" });
+    expect(worker.migrations.hoopdb).toEqual({
+      existingSecret: "bulls96-runtime",
+      key: "HOOPDB_MIGRATION_URL",
+    });
     expect(worker.extraEnv.filter(({ name }) => name === "HOOPDB_SUPABASE_SHIM")).toHaveLength(0);
     expect(worker.extraEnv).toEqual(
       expect.arrayContaining([
