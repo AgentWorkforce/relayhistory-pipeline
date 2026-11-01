@@ -9,6 +9,25 @@ jobs:
   checks:
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
+    # A real ClickHouse for the session read API's query tests
+    # (src/session-read-api/__tests__/page.clickhouse.test.ts), the version the
+    # search proofs pin. Test-only credentials; no production data.
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: ci-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      READ_API_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      READ_API_TEST_CLICKHOUSE_PASSWORD: ci-only
     steps:
       # Check out the literal PR head commit, not GitHub's synthetic merge ref, so a green
       # run is evidence about the exact SHA under review.

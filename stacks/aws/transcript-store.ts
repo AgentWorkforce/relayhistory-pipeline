@@ -57,6 +57,12 @@ import {
   sessionPipelineWiring,
   type SessionPipelineInputs,
 } from "./session-pipeline.ts";
+import {
+  SESSION_READ_API_RESOURCES,
+  assertSessionReadApiInputs,
+  sessionReadApi,
+  type SessionReadApiInputs,
+} from "./session-read-api.ts";
 
 /** K-45 (Khaliq, 2026-10-31): logical delete immediately, physical purge within 48 h. */
 export const ERASURE_SLA_HOURS = 48;
@@ -87,6 +93,11 @@ export interface TranscriptStoreInputs {
    * pointer + ClickHouse index. Omit for the store alone.
    */
   sessionPipeline?: SessionPipelineInputs;
+  /**
+   * The session read API (session-read-api.ts): Lambda + Function URL serving
+   * /v1 event reads from ClickHouse with Supabase erasure checks. Omit for none.
+   */
+  sessionReadApi?: SessionReadApiInputs;
 }
 
 export interface TranscriptNames {
@@ -161,8 +172,9 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "sessionPipeline") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "sessionPipeline" && k !== "sessionReadApi") refuse(`transcriptStore.${k} is not a known setting`);
   if (store.sessionPipeline !== undefined) assertSessionPipelineInputs(store.sessionPipeline, refuse);
+  if (store.sessionReadApi !== undefined) assertSessionReadApiInputs(store.sessionReadApi, refuse);
   if (store.managementEvents !== undefined && typeof store.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
   if (store.auditPrincipalArn !== undefined && !new RegExp(`^arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/[A-Za-z0-9_+=,.@/-]+$`).test(store.auditPrincipalArn))
     refuse(`transcriptStore.auditPrincipalArn must be a named IAM role in account ${TRANSCRIPT_ACCOUNT_ID} in partition aws`);
@@ -186,7 +198,25 @@ export type TranscriptStorePlanPhase =
   | "srv-writer propagation recovery"
   | "post-apply"
   | "session pipeline rollout"
-  | "session pipeline update";
+  | "session pipeline update"
+  | "session read api rollout"
+  | "session read api update";
+
+/**
+ * The read API's own phases (session-read-api.ts). It touches nothing else: no
+ * key, bucket, queue or pipeline resource may change in the same plan. Rollout:
+ * its resources are created (all, or the rest after a partial apply). Update:
+ * they change in place (code, env such as `origin`, settings). Never a
+ * replacement or deletion.
+ */
+function sessionReadApiPhase(operations: ReadonlyMap<string, string>): TranscriptStorePlanPhase | undefined {
+  const api = SESSION_READ_API_RESOURCES.map((r) => operations.get(r));
+  const others = [...operations].filter(([r]) => !(SESSION_READ_API_RESOURCES as readonly string[]).includes(r));
+  if (!others.every(([, a]) => a === "noop")) return undefined;
+  if (api.every((a) => a === "create" || a === "noop") && api.some((a) => a === "create")) return "session read api rollout";
+  if (api.every((a) => a === "update" || a === "noop") && api.some((a) => a === "update")) return "session read api update";
+  return undefined;
+}
 
 /**
  * The session pipeline's own phases (session-pipeline.ts). Rollout: the pipeline's
@@ -239,11 +269,19 @@ export interface TranscriptStorePlanCapture {
   stateSnapshotText?: string;
 }
 
-/** The resources a plan must list: the store's resources, plus every pipeline resource once any of them appears. */
+/**
+ * The resources a plan must list: the store's resources, plus every pipeline resource
+ * once any of them appears, plus every read API resource once any of those does.
+ */
 function expectedResources(names: Iterable<string>): readonly string[] {
+  const list = [...names];
   const pipeline = new Set<string>(SESSION_PIPELINE_RESOURCES);
-  for (const name of names) if (pipeline.has(name)) return [...TRANSCRIPT_RESOURCES, ...SESSION_PIPELINE_RESOURCES];
-  return TRANSCRIPT_RESOURCES;
+  const readApi = new Set<string>(SESSION_READ_API_RESOURCES);
+  return [
+    ...TRANSCRIPT_RESOURCES,
+    ...(list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
+    ...(list.some((n) => readApi.has(n)) ? SESSION_READ_API_RESOURCES : []),
+  ];
 }
 
 function transcriptPlanOperations(text: string, label: "compact" | "detailed", refuse: (why: string) => never) {
@@ -317,6 +355,15 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   if (provenance.outputs.detailed.sha256 !== sha256(capture.detailedPlanText)) refuse("detailed plan does not match its provenance sha256");
   if (provenance.summary !== compact.summary) refuse("provenance summary does not match the plan summary");
 
+  // The read API changes alone; once it is all noop, the rest of the plan is judged as before.
+  if (SESSION_READ_API_RESOURCES.some((r) => compact.operations.has(r))) {
+    const readApiPhase = sessionReadApiPhase(compact.operations);
+    if (readApiPhase) return readApiPhase;
+    if (!SESSION_READ_API_RESOURCES.every((r) => compact.operations.get(r) === "noop")) {
+      const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
+      return refuse(`action set does not match the session read api rollout or update phase (the read api changes alone): ${changes.join(", ")}`);
+    }
+  }
   const withPipeline = SESSION_PIPELINE_RESOURCES.some((r) => compact.operations.has(r));
   if (withPipeline) {
     if (SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
@@ -929,6 +976,9 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
           })
         : null;
 
+    const readApiInputs = i.transcriptStore.sessionReadApi;
+    const readApi = readApiInputs ? yield* sessionReadApi({ stage: i.stage, p: readApiInputs, tags: i.tags }) : null;
+
     yield* AWS.Budgets.Budget("budget", {
       budgetName: n.budget,
       budgetType: "COST",
@@ -952,5 +1002,6 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       eraserUser: eraser.userName,
       srvWriterUser: srvWriter.userName,
       sessionPipeline,
+      sessionReadApi: readApi,
     };
   });
