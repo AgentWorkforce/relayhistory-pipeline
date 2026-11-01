@@ -539,9 +539,17 @@ export function assertGcpInputs(
       );
     requireSemver("bulls96.chartVersion", inputs.bulls96.chartVersion);
     const [major, minor, patch] = inputs.bulls96.chartVersion.split(".").map(Number);
-    if (!(major! > 0 || (major === 0 && (minor! > 3 || (minor === 3 && patch! >= 2)))))
+    const supportsMigrationCredential =
+      major! > 0 || (major === 0 && (minor! > 3 || (minor === 3 && patch! >= 2)));
+    const supportedLegacyRelease = major! > 0 || (major === 0 && minor! >= 3);
+    if (
+      (requestedCommand === "destroy" && !supportedLegacyRelease) ||
+      (requestedCommand !== "destroy" && !supportsMigrationCredential)
+    )
       throw new Error(
-        "96bulls: bulls96.chartVersion must be 0.3.2 or newer so the migration Job can use a separate owner credential",
+        requestedCommand === "destroy"
+          ? "96bulls: bulls96.chartVersion must be 0.3.0 or newer"
+          : "96bulls: bulls96.chartVersion must be 0.3.2 or newer so the migration Job can use a separate owner credential",
       );
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(inputs.bulls96.tenantOrgId))
       throw new Error(
@@ -556,9 +564,9 @@ export function assertGcpInputs(
         throw new Error(
           "96bulls: bulls96.hoopdbRuntimeRole must name the dedicated non-owner PostgreSQL login role",
         );
-      if (typeof inputs.bulls96.hoopdbRuntimeRoleLogin !== "boolean")
+      if (inputs.bulls96.hoopdbRuntimeRoleLogin !== true)
         throw new Error(
-          "96bulls: bulls96.hoopdbRuntimeRoleLogin must be set explicitly",
+          "96bulls: bulls96.hoopdbRuntimeRoleLogin must be true for the GCP runtime login",
         );
     }
     if (!/^sha256:[a-f0-9]{64}$/.test(inputs.bulls96.imageDigest))
@@ -648,7 +656,7 @@ export function assertGcpRuntimeDeployable(
     inputs.bulls96?.enabled &&
     requestedCommand !== "destroy" &&
     (!POSTGRES_ROLE.test(inputs.bulls96.hoopdbRuntimeRole ?? "") ||
-      typeof inputs.bulls96.hoopdbRuntimeRoleLogin !== "boolean")
+      inputs.bulls96.hoopdbRuntimeRoleLogin !== true)
   )
     throw new Error(
       "96bulls: GCP runtime deploy requires an explicit dedicated HoopDb runtime role and login mode. Nothing was created.",
@@ -891,10 +899,12 @@ function publicCaBundle(value: unknown): void {
 export function bulls96ReleaseValues(
   i: NonNullable<GcpInputs["bulls96"]>,
   managed: Bulls96ReleaseOutputs,
+  requestedCommand?: AlchemyStackCommand,
 ): Record<string, unknown> {
   if (
-    !POSTGRES_ROLE.test(i.hoopdbRuntimeRole ?? "") ||
-    typeof i.hoopdbRuntimeRoleLogin !== "boolean"
+    requestedCommand !== "destroy" &&
+    (!POSTGRES_ROLE.test(i.hoopdbRuntimeRole ?? "") ||
+      i.hoopdbRuntimeRoleLogin !== true)
   )
     throw new Error(
       "96bulls: GCP release values require an explicit dedicated HoopDb runtime role and login mode. Nothing was created.",

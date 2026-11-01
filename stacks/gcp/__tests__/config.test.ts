@@ -203,7 +203,18 @@ describe("GCP self-host contract", () => {
           hoopdbRuntimeRoleLogin: undefined,
         },
       }),
-    ).toThrow("hoopdbRuntimeRoleLogin must be set explicitly");
+    ).toThrow("hoopdbRuntimeRoleLogin must be true");
+    expect(() =>
+      assertGcpInputs("gcp-conformance", {
+        ...base,
+        managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
+        bulls96: {
+          ...bulls96,
+          imageDigest: GCP_APPROVED_SERVICES_IMAGE.digest,
+          hoopdbRuntimeRoleLogin: false,
+        },
+      }),
+    ).toThrow("hoopdbRuntimeRoleLogin must be true");
     expect(() =>
       assertGcpInputs("gcp-dev", {
         ...base,
@@ -299,6 +310,38 @@ describe("GCP self-host contract", () => {
     );
     expect(() => assertGcpInputs("gcp-dev", approvedRuntime, "destroy")).not.toThrow();
     expect(() => assertGcpRuntimeDeployable("gcp-dev", approvedRuntime, "destroy")).not.toThrow();
+    const legacyDestroy = {
+      ...approvedRuntime,
+      bulls96: {
+        ...approvedRuntime.bulls96,
+        chartVersion: "0.3.0",
+        hoopdbRuntimeRole: undefined,
+        hoopdbRuntimeRoleLogin: undefined,
+      },
+    };
+    expect(() => assertGcpInputs("gcp-dev", legacyDestroy, "destroy")).not.toThrow();
+    expect(() => assertGcpRuntimeDeployable("gcp-dev", legacyDestroy, "destroy")).not.toThrow();
+    expect(() =>
+      bulls96ReleaseValues(
+        legacyDestroy.bulls96,
+        {
+          bucket: "locker",
+          region: "us-central1",
+          imageRepository: "us-central1-docker.pkg.dev/agentworkforce-dev1/awf-dev-images/96bulls-services",
+          cloudSqlConnectionName: "agentworkforce-dev1:us-central1:awf-dev-postgres",
+          redisHost: "10.52.0.3",
+          redisPort: 6379,
+          redisCaPem: "-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n",
+          pubsubTopic: "projects/agentworkforce-dev1/topics/events",
+          pubsubSubscription: "projects/agentworkforce-dev1/subscriptions/events",
+          workloadIdentityEmail: "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
+        },
+        "destroy",
+      ),
+    ).not.toThrow();
+    expect(readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8")).toContain(
+      "}, BOOTSTRAP_COMMAND)",
+    );
     const recordedButIneligible = {
       ...base,
       managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" as const },

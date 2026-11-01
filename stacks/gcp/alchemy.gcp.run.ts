@@ -863,7 +863,7 @@ export default Alchemy.Stack(
               pubsubTopic: eventsTopicName,
               pubsubSubscription: eventsSubscriptionName,
               workloadIdentityEmail: runtimeEmail,
-            }),
+            }, BOOTSTRAP_COMMAND),
           });
           return release.releaseName;
         })
