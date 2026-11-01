@@ -20,6 +20,8 @@ import { log } from "../shared/log.ts";
 import { uuidv7 } from "../shared/ids.ts";
 import { propagatePointerTombstone } from "./session-directory-summary.ts";
 import { projectSessionDirectory } from "./session-directory-projector.ts";
+import { briefConfig } from "../session-brief/config.ts";
+import { armWakeup } from "../session-brief/store.ts";
 
 export const FAN_OUT_STAGES = [
   "summary-short",
@@ -33,9 +35,17 @@ export interface IndexDeps {
   queue: PipelineQueue;
   /** The message being handled, so fan-out continues its trace and ids. */
   current: () => StageMessage | undefined;
+  /**
+   * Session briefs (src/session-brief): the wakeup debounce, or null when briefs are off.
+   * Defaults to SESSION_BRIEF_ENABLED and its timings from env.
+   */
+  brief?: { idleSeconds: number; maxWaitSeconds: number } | null;
 }
 
 export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
+  const fromEnv = briefConfig();
+  const brief =
+    deps.brief !== undefined ? deps.brief : fromEnv.enabled ? fromEnv : null;
   return {
     async upsertRawPointer(pointer: RawPointer, ctx: TraceContext) {
       const pk = {
@@ -209,6 +219,19 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         const enriched = await enrichMessage({ ...base, stage }, deps.reader);
         await deps.queue.send(enriched);
       }
+      // The model brief is debounced per logical session rather than queued per revision:
+      // each new revision pushes the wakeup back (src/session-brief/store.ts armWakeup).
+      if (brief)
+        await armWakeup(
+          deps.db,
+          {
+            orgId: pk.org_id,
+            workspaceId: pk.workspace_id,
+            harness: pk.harness,
+            sessionId: pk.session_id,
+          },
+          brief,
+        );
       await deps.db.query(
         `UPDATE sessions.session_index_ext SET fanout_revision = greatest(fanout_revision, $6)
           WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5`,

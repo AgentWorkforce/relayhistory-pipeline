@@ -114,6 +114,9 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.migration_ingest_audit": ["SELECT", "INSERT"],
   "sessions.migration_base_read_uses": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.claimless_window_activations": ["SELECT", "INSERT"],
+  "sessions.session_briefs": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_brief_wakeups": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_brief_attempts": ["SELECT", "INSERT", "UPDATE", "DELETE"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
@@ -146,6 +149,9 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.migration_ingest_audit",
   "sessions.migration_base_read_uses",
   "sessions.claimless_window_activations",
+  "sessions.session_briefs",
+  "sessions.session_brief_wakeups",
+  "sessions.session_brief_attempts",
 ] as const;
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
