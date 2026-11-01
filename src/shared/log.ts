@@ -14,7 +14,7 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "scrub_ruleset", "scrub_version", "redaction_count",
   "object_sha256", "bytes_raw", "bytes_stored", "chunk_count", "seq", "epoch", "offset",
   "model_id", "tokens_in", "tokens_out",
-  "count", "claimed", "acked", "retried", "exhausted", "listed", "enqueued", "skipped", "failed",
+  "count", "inserted", "deleted", "manifests", "claimed", "acked", "retried", "exhausted", "listed", "enqueued", "skipped", "failed",
   "state", "rule", "kind", "port", "ok", "reason", "key_sha256", "manifest_key_sha256",
   "migration", "ledger_sha", "accepted_as_alias_of",
 ]);
