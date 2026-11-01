@@ -372,14 +372,25 @@ export class SyncState {
   forceReexportTruncated(): number {
     let n = 0;
     this.#tx(() => {
-      n = Number(
-        this.db
-          .prepare(
-            `UPDATE exported SET revision = -2, exported_at = 0
-              WHERE error IS NULL AND (org_id, session_id) IN (SELECT DISTINCT org_id, session_id FROM truncations)`,
-          )
-          .run().changes,
-      );
+      // Healthy groups: look changed. Failing ones (even past the attempt cap):
+      // retry now, so no ledgered group is left holding T0 shut.
+      n =
+        Number(
+          this.db
+            .prepare(
+              `UPDATE exported SET revision = -2, exported_at = 0
+                WHERE error IS NULL AND (org_id, session_id) IN (SELECT DISTINCT org_id, session_id FROM truncations)`,
+            )
+            .run().changes,
+        ) +
+        Number(
+          this.db
+            .prepare(
+              `UPDATE exported SET failed_revision = -2, attempts = 0, next_try = 0
+                WHERE error IS NOT NULL AND (org_id, session_id) IN (SELECT DISTINCT org_id, session_id FROM truncations)`,
+            )
+            .run().changes,
+        );
     });
     return n;
   }

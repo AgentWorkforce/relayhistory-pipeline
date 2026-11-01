@@ -252,9 +252,59 @@ describe("scrub rule set 2: long strings stored whole", () => {
     state.markExported("o", "t", 1, ["96bulls/o/v1/k/manifest.json"], Date.now());
     state.markExported("o", "u", 1, ["96bulls/o/v1/j/manifest.json"], Date.now());
     state.recordTruncations("o", "t", [{ key: "96bulls/o/v1/k/manifest.json", strings: 2, maxChars: 300_000 }]);
-    expect(state.forceReexportTruncated()).toBe(1);
-    expect(state.nextWork(Date.now(), 86_400_000, 10).map((w) => `${w.kind}:${w.session_id}`)).toEqual(["changed:t"]);
+    // a ledgered group that is failing past its attempt cap is revived too
+    state.seeRevisions(1, [{ org_id: "o", session_id: "f", revision: "1" }]);
+    state.recordTruncations("o", "f", [{ key: "96bulls/o/v1/f/manifest.json", strings: 1, maxChars: 300_000 }]);
+    for (let i = 0; i < 8; i++) state.markFailed("o", "f", "57014", ["96bulls/o/v1/f/manifest.json"], 1, Date.now());
+    expect(state.forceReexportTruncated()).toBe(2);
+    expect(state.nextWork(Date.now(), 86_400_000, 10).map((w) => `${w.kind}:${w.session_id}`).sort()).toEqual(["changed:t", "retry:f"]);
     state.close();
+  });
+});
+
+describe("a session spanning the scrub rule set 1 -> 2 deploy", () => {
+  /** The exporter/courier before the bump: same bytes, scrub-version 1 metadata and manifest. */
+  function asV1(inner: ObjectStore): ObjectStore {
+    return {
+      ...inner,
+      head: (k) => inner.head(k),
+      get: (k, r) => inner.get(k, r),
+      getObject: (k, r) => inner.getObject(k, r),
+      list: (p, c) => inner.list(p, c),
+      presignGet: (k, t) => inner.presignGet(k, t),
+      delete: (k) => inner.delete(k),
+      put: (k, b, o) => {
+        if (String(k).endsWith("manifest.json"))
+          b = new TextEncoder().encode(
+            new TextDecoder().decode(b).replace('"scrub":{"ruleset":"relayhistory-scrub","version":2}', '"scrub":{"ruleset":"relayhistory-scrub","version":1}'),
+          );
+        const md = o?.metadata?.["scrub-version"] ? { ...o.metadata, "scrub-version": "1" } : o?.metadata;
+        return inner.put(k, b, { ...o, ...(md ? { metadata: md } : {}) });
+      },
+    };
+  }
+
+  test("an export grown after the deploy lists v1 and v2 chunks and still passes AlleyOop's sealed check", async () => {
+    const { store } = await countingStore();
+    const first = baseRecords().slice(0, 2);
+    const r1 = await exportUnit(target(asV1(store), { maxChunkBytes: 200 }), unit("org-a"), fixedSource(first));
+    const key = r1.manifests[0]!.manifestKey;
+    const m1 = await parseManifest(await readText(store, key), key);
+    expect(m1.raw.scrub!.version).toBe(1);
+    expect(await chunksAreServerSealed({ store } as never, m1, "96bulls/org-a")).toBe(true);
+    await exportUnit(target(store, { maxChunkBytes: 200 }), unit("org-a"), fixedSource([...first, baseRecords()[2]!]));
+    const m2 = await parseManifest(await readText(store, key), key);
+    expect(m2.raw.scrub!.version).toBe(1); // the lowest over the chunks
+    expect(await chunksAreServerSealed({ store } as never, m2, "96bulls/org-a")).toBe(true);
+    // A chunk claiming a newer rule set than this server knows is still refused.
+    const chunk = m2.raw.chunks.at(-1)!;
+    const raw = `${key.slice(0, -"manifest.json".length)}raw/${String(chunk.seq).padStart(10, "0")}-${chunk.start_offset}-${chunk.sha256_8}.ndjson.zst`;
+    const object = await store.getObject(objectKey(raw));
+    const body = await readAll(object.body);
+    await store.delete(objectKey(raw));
+    const { "content-sha256": _sha, ...meta } = object.meta.metadata;
+    await store.put(objectKey(raw), body, { metadata: { ...meta, "scrub-version": "99" } });
+    expect(await chunksAreServerSealed({ store } as never, m2, "96bulls/org-a")).toBe(false);
   });
 });
 

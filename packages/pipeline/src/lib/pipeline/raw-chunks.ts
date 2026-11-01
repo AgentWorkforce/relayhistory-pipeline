@@ -131,6 +131,47 @@ export function scrubRecords(source: Uint8Array): {
   return { scrubbed: encoder.encode(out), records };
 }
 
+// <scrub-segmenter> (folded into the scrub rule set digest test)
+/**
+ * Longest whitespace run a segment may be cut inside. Rules whose match spans
+ * a separator (`Bearer <token>`, `password: value`) allow whitespace of any
+ * length, so a cut inside a longer run cannot be proven safe within a bounded
+ * context: such a cut is refused, never guessed.
+ */
+const MAX_CUT_GAP = 1024;
+/** Most candidate cuts a segment search fully checks before refusing (bounds CPU). */
+const MAX_CUT_CHECKS = 48;
+/**
+ * A credential keyword (and optional `:`/`=`) at the end of the text before a
+ * whitespace run: a cut there would separate the keyword from its value.
+ */
+const CREDENTIAL_KEYWORD =
+  /(?:\b(?:bearer|basic|token|password|passwd|pwd|secret|api[-_]?key|access[-_]?key|secret[-_]?key|private[-_]?key|client[-_]?secret|authorization|auth|credentials?|key)["']?\s*[:=]?|[:=])["']?$/i;
+
+/**
+ * Whether the text may be cut at `cut` (the segments either side are then
+ * scrubbed separately). The cut sits inside a whitespace run `[start, end)`.
+ * It must hold that:
+ *  - the run is at most `MAX_CUT_GAP` long;
+ *  - no credential keyword or `:`/`=` ends right before the run;
+ *  - a digit or `)` before and a digit or `(` after does not straddle it (cards, phone numbers);
+ *  - `CUT_CONTEXT_CHARS` beyond each end of the run scrubs the same together and apart.
+ * `budget.checks` counts the full checks (three `scrubText` calls each).
+ */
+function cutIsSafe(text: string, cut: number, budget: { checks: number }): boolean {
+  let start = cut;
+  while (start > 0 && /\s/.test(text[start - 1]!)) start--;
+  let end = cut;
+  while (end < text.length && /\s/.test(text[end]!)) end++;
+  if (end - start > MAX_CUT_GAP) return false;
+  if (CREDENTIAL_KEYWORD.test(text.slice(Math.max(0, start - 64), start))) return false;
+  if (/[\d)]/.test(text[start - 1] ?? "") && /[\d(]/.test(text[end] ?? "")) return false;
+  budget.checks += 1;
+  const before = text.slice(Math.max(0, start - CUT_CONTEXT_CHARS), cut);
+  const after = text.slice(cut, Math.min(text.length, end + CUT_CONTEXT_CHARS));
+  return scrubText(before + after) === scrubText(before) + scrubText(after);
+}
+
 /** How far back `safeCut` looks for a boundary, and how much text it scrubs. */
 const CUT_SEARCH_CHARS = 65_536;
 const CUT_CONTEXT_CHARS = 4096;
@@ -145,16 +186,11 @@ const CUT_CONTEXT_CHARS = 4096;
  * crosses it.
  */
 function safeCut(run: string, next: string): number {
+  const text = run + next;
+  const budget = { checks: 0 };
   const floor = Math.max(1, run.length - CUT_SEARCH_CHARS);
-  for (let cut = run.length; cut >= floor; ) {
-    const before = run.slice(Math.max(0, cut - CUT_CONTEXT_CHARS), cut);
-    const after = run.slice(cut) + next;
-    const head = after.slice(0, CUT_CONTEXT_CHARS);
-    if (
-      !(/[\d)]\s*$/.test(before) && /^[\d(]/.test(after)) &&
-      scrubText(before + head) === scrubText(before) + scrubText(head)
-    )
-      return cut;
+  for (let cut = run.length; cut >= floor && budget.checks < MAX_CUT_CHECKS; ) {
+    if (cutIsSafe(text, cut, budget)) return cut;
     // The previous line boundary: just after the newline ending the line
     // before this one (0, below the floor, when there is none).
     cut = run.lastIndexOf("\n", cut - 2) + 1;
@@ -255,15 +291,16 @@ function longCut(text: string): number {
   }
   if (open !== -1) top = open;
   const floor = Math.max(1, MAX_SCRUB_CHARS - CUT_SEARCH_CHARS);
-  for (let cut = top; cut >= floor; cut--) {
-    if (!/\s/.test(text[cut - 1] ?? "")) continue;
-    if (/[\d)]/.test(text[cut - 2] ?? "") && /[\d(]/.test(text[cut] ?? "")) continue;
-    const before = text.slice(Math.max(0, cut - CUT_CONTEXT_CHARS), cut);
-    const head = text.slice(cut, cut + CUT_CONTEXT_CHARS);
-    if (scrubText(before + head) === scrubText(before) + scrubText(head)) return cut;
+  const budget = { checks: 0 };
+  for (let cut = top; cut >= floor && budget.checks < MAX_CUT_CHECKS; cut--) {
+    // Only at the end of a whitespace run (after whitespace, before text):
+    // one candidate per run, so a run is checked once, not once per char.
+    if (!/\s/.test(text[cut - 1] ?? "") || /\s/.test(text[cut] ?? "")) continue;
+    if (cutIsSafe(text, cut, budget)) return cut;
   }
   return 0;
 }
+// </scrub-segmenter>
 
 /**
  * Scrub a text of any length, whole: segments of at most `MAX_SCRUB_CHARS`

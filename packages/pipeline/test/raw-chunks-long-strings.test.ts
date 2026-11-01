@@ -105,3 +105,103 @@ describe("sealRawChunk with a record over the old bound (revert-fails)", () => {
     expect(scrubRecords(source).records).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------- review of a26aaf5
+
+const filler = (n: number) => "lorem ipsum dolor sit amet ".repeat(Math.ceil(n / 27)).slice(0, n);
+
+describe("a gap between a credential keyword and its value is never cut", () => {
+  const tok = "Zq8vR2kLm9Xp4Tn7Wc3Ys6Hd";
+  it("Bearer <5000 spaces> token: redacted or refused, never stored", () => {
+    const s = `Bearer${" ".repeat(5000)}${tok}`;
+    expect(scrubText(s)).not.toContain(tok);
+    const text = `${filler(MAX_SCRUB_CHARS - 2500)}${s} ${filler(10_000)}`;
+    let out = "";
+    try {
+      out = scrubLong(text);
+    } catch {
+      return; // refusal is safe
+    }
+    expect(out).not.toContain(tok);
+  });
+
+  it("password: <5000 newlines> value", () => {
+    const s = `password:${"\n".repeat(5000)}hunter2hunter2`;
+    const text = `${filler(MAX_SCRUB_CHARS - 2500)}${s} ${filler(10_000)}`;
+    let out = "";
+    try {
+      out = scrubLong(text);
+    } catch {
+      return;
+    }
+    expect(out).not.toContain("hunter2hunter2");
+  });
+
+  it("the same through a JSON record (live ingest path)", () => {
+    const text = `${filler(MAX_SCRUB_CHARS - 2500)}Bearer${" ".repeat(5000)}${tok} ${filler(10_000)}`;
+    let out = "";
+    try {
+      out = new TextDecoder().decode(scrubRecords(new TextEncoder().encode(`${JSON.stringify({ output: text })}\n`)).scrubbed);
+    } catch {
+      return;
+    }
+    expect(out).not.toContain(tok);
+  });
+
+  it("a short gap right at the bound is not cut between the keyword and its value", () => {
+    // Cuts fall between pairs (after a value), never between a keyword and its value.
+    const pairs = "password: hunter2hunter2 ".repeat(Math.ceil((MAX_SCRUB_CHARS + 5000) / 25));
+    expect(scrubText("password: hunter2hunter2")).not.toContain("hunter2hunter2");
+    expect(scrubLong(pairs)).not.toContain("hunter2hunter2");
+    // Only keyword gaps (no other whitespace): nothing is safe to cut, so refuse.
+    const only = "password:\thunter2hunter2:".repeat(Math.ceil((MAX_SCRUB_CHARS + 5000) / 25));
+    expect(() => scrubLong(only)).toThrow(/scrub limit/);
+    // With ordinary text before it, the cut falls before the keyword and the value is redacted.
+    const text = `${filler(MAX_SCRUB_CHARS - 40)} password: ${" ".repeat(200)}hunter2hunter2 ${filler(5000)}`;
+    expect(scrubLong(text)).not.toContain("hunter2hunter2");
+  });
+});
+
+describe("bounded CPU before a refusal", () => {
+  it("a 263 KB adversarial string is refused in well under a second (was ~53 s)", () => {
+    const bad = "key: ".repeat(Math.ceil((MAX_SCRUB_CHARS + 1000) / 5));
+    const t0 = performance.now();
+    expect(() => scrubLong(bad)).toThrow(/scrub limit/);
+    const t1 = performance.now();
+    expect(() => scrubRecords(new TextEncoder().encode(`${JSON.stringify({ o: bad })}\n`))).toThrow(/scrub limit/);
+    const t2 = performance.now();
+    expect(t1 - t0).toBeLessThan(3000);
+    expect(t2 - t1).toBeLessThan(6000);
+  });
+
+  it("a 10.8 MB benign text still scrubs whole", () => {
+    const words = "lorem ipsum dolor sit amet ".repeat(400_000);
+    expect(scrubLong(words)).toBe(words);
+  });
+});
+
+describe("private key blocks across the bound", () => {
+  it("a 20 KB PGP private key block straddling the bound stays redacted", () => {
+    const key = `-----BEGIN PGP PRIVATE KEY BLOCK-----\n${"lQdGBGVsZWN0cm9uaWNzZWNyZXRrZXltYXRlcmlhbA ".repeat(500)}\n-----END PGP PRIVATE KEY BLOCK-----`;
+    const text = `${filler(MAX_SCRUB_CHARS - 10_000)} ${key} ${filler(10_000)}`;
+    expect(scrubLong(text)).not.toContain("lQdGBGVsZWN0cm9uaWNzZWNyZXRrZXltYXRlcmlhbA");
+  });
+});
+
+describe("a whitespace run longer than the context window", () => {
+  it("is never cut at its end when the keyword is out of the window (Bearer + 5000 spaces ending below the bound)", () => {
+    const tok = "Zq8vR2kLm9Xp4Tn7Wc3Ys6Hd";
+    const gap = 5000;
+    const prefix = `${filler(MAX_SCRUB_CHARS - 11 - gap - "Bearer".length)} `;
+    const text = `${prefix}Bearer${" ".repeat(gap)}${tok} ${filler(20_000)}`;
+    // The rule redacts it in one piece.
+    expect(scrubText(`x Bearer${" ".repeat(gap)}${tok} y`)).not.toContain(tok);
+    let out = "";
+    try {
+      out = scrubLong(text);
+    } catch {
+      return;
+    }
+    expect(out).not.toContain(tok);
+  });
+});
