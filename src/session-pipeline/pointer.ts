@@ -7,8 +7,8 @@
  * (revision-fenced: a late, duplicated or replayed event never rolls a row
  * back), then `session_index_ext` and the logical `session_directory` row.
  *
- * Serialization. The read and the upsert run under the session's lock (the
- * same transaction-scoped advisory lock the search stage takes), so a put
+ * Serialization. The read and the upsert run under the session's pointer lock
+ * (a transaction-scoped advisory lock in Supabase), so a put
  * whose read raced an erasure cannot upsert after the delete's tombstone: the
  * second holder re-reads S3 and sees what the first left. Without it, a
  * revision-2 upsert that read before the delete would land after the
@@ -27,6 +27,7 @@ import {
   PipelineError,
   PipelineRecorder,
   logOnlyPipelineEventSink,
+  manifestKey,
   parseSessionKey,
   type ManifestReader,
   type OrgResolver,
@@ -47,11 +48,16 @@ export interface SessionScope {
 
 export type PointerOutcome =
   | { status: "ignored"; reason: string }
-  | { status: "indexed" | "unchanged" | "deleted"; scope: SessionScope; manifestKey: string; revision?: number };
+  | { status: "indexed" | "unchanged" | "deleted" | "moved"; scope: SessionScope; manifestKey: string; revision?: number };
 
-/** The per-session lock key, shared by the pointer and search stages. */
-export function scopeLockKey(scope: SessionScope): string {
-  return ["96bulls:session-scope", scope.orgId, scope.workspaceId, scope.harness, scope.sessionId].join("\u001f");
+/**
+ * The per-session lock keys. The pointer stage and the search stage each
+ * serialize among themselves. They need not exclude each other, because a
+ * search pass takes its lock after its own event's pointer committed. Keeping
+ * them apart means a long search pass never holds up a pointer write.
+ */
+export function scopeLockKey(scope: SessionScope, stage: "pointer" | "search" = "pointer"): string {
+  return [`96bulls:${stage}`, scope.orgId, scope.workspaceId, scope.harness, scope.sessionId].join("\u001f");
 }
 
 /** Run `work` while holding the session's lock (lambda.ts: pg_advisory_xact_lock in Supabase). */
@@ -61,6 +67,8 @@ export interface PointerDeps {
   db: HoopDb;
   lock: ScopeLock;
   reader: ManifestReader;
+  /** HEAD: whether a manifest key has a current object (the move probe). */
+  exists(key: string): Promise<boolean>;
   orgs: OrgResolver;
   allowPrefix(prefix: string | undefined, orgId: string): boolean;
   /** Where the index's fan-out (summary-short, summary-long, status-classify) goes. */
@@ -96,9 +104,42 @@ export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Pro
   return deps.lock(scope, () => indexLocked(landed, orgId, scope, deps));
 }
 
-async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionScope, deps: PointerDeps): Promise<PointerOutcome> {
+/** How far either side of a deleted key's date the same session is looked for (an exporter date move). */
+export const MOVE_PROBE_DAYS = 45;
+
+/**
+ * The same session (same machine) live under another start date, if any. The
+ * exporter re-keys a session whose first record moved earlier, writes the new
+ * key, then erases the old prefix; the pointer row (whose identity has no date)
+ * must follow the new key, not be tombstoned with the old one. Returns the
+ * nearest live key, or undefined.
+ */
+export async function findMovedSibling(key: string, exists: (key: string) => Promise<boolean>): Promise<string | undefined> {
+  const loc = parseSessionKey(key);
+  if (!loc) return undefined;
+  const base = Date.parse(`${loc.startDate}T00:00:00Z`);
+  const offsets: number[] = [];
+  for (let d = 1; d <= MOVE_PROBE_DAYS; d++) offsets.push(-d, d);
+  for (let i = 0; i < offsets.length; i += 10) {
+    const batch = offsets.slice(i, i + 10).map((d) => manifestKey({ ...loc, startDate: new Date(base + d * 86_400_000).toISOString().slice(0, 10) }));
+    const found = await Promise.all(batch.map(async (k) => ((await exists(k)) ? k : undefined)));
+    const hit = found.find((k) => k !== undefined);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionScope, deps: PointerDeps, followed = false): Promise<PointerOutcome> {
   // Canonical state, not the event: re-read the manifest, under the lock.
   const read = await deps.reader.read(landed.key);
+  if (!read && !followed) {
+    // Gone. Before tombstoning, look for the same session under another date.
+    const sibling = await findMovedSibling(landed.key, deps.exists);
+    if (sibling) {
+      const { etag: _e, version: _v, size: _s, deleted: _d, ...rest } = landed;
+      return indexLocked({ ...rest, key: sibling }, orgId, scope, deps, true);
+    }
+  }
   const built = read
     ? buildObjectLandedMessage({
         landed: { ...landed, deleted: false },
@@ -131,9 +172,38 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
   const message = await enrichMessage(indexed, deps.reader);
 
   const index = hoopDbSessionIndex({ db: deps.db, reader: deps.reader, queue: deps.fanout, current: () => message });
-  const result = await index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx);
+  const upsert = () => index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx);
+  const result = await upsert();
   const revision = message.revision;
   if (!read) return { status: "deleted", scope, manifestKey: landed.key };
+
+  // A moved session: the row names another key of the same identity (the start
+  // date, and so `d=`, changed), and the revision fence kept this key out,
+  // because a new key restarts its revision count. The key that is live in S3
+  // wins; while both are live the move is in progress and the event retries.
+  const pk = [orgId, scope.workspaceId, scope.harness, scope.sessionId, read.manifest.session.machine_id];
+  const stored = (
+    await deps.db.query<{ manifest_key: string; deleted: boolean }>(
+      `SELECT manifest_key, deleted_at IS NOT NULL AS deleted FROM sessions.session_index
+        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
+      pk,
+    )
+  ).rows[0];
+  if (stored && stored.manifest_key !== landed.key) {
+    const otherLive = !stored.deleted && (await deps.reader.read(stored.manifest_key)) !== null;
+    if (otherLive)
+      throw new PipelineError("pointer_move_pending", "the session's other key is still live; retry after its erasure", true);
+    // The stored key is gone (or tombstoned): re-key the row to this one. The
+    // row is derived, and the upsert rebuilds it from this manifest.
+    await deps.db.query(
+      `DELETE FROM sessions.session_index
+        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5
+          AND manifest_key = $6`,
+      [...pk, stored.manifest_key],
+    );
+    await upsert();
+    return { status: "moved", scope, manifestKey: landed.key, ...(revision !== undefined ? { revision } : {}) };
+  }
   return {
     status: result && result.status === "skipped" ? "unchanged" : "indexed",
     scope,

@@ -56,8 +56,8 @@ import {
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { toIndexRow, tsMillis, type IndexRow, type NeonEventRow } from "./vendor/search-index/rows.ts";
-import { EVENTS_TABLE } from "./vendor/search-index/schema.ts";
-import { deleteRows, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
+import { EVENTS_TABLE, SESSION_STATE_TABLE } from "./vendor/search-index/schema.ts";
+import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
@@ -78,6 +78,8 @@ export interface SearchIndexDeps {
 export interface SearchIndexLimits {
   /** Largest scope read into memory, summed over its manifests' raw bytes. */
   maxScopeBytes: number;
+  /** Largest scope read, summed over its manifests' chunk record counts. */
+  maxScopeEvents: number;
   /** Largest number of ClickHouse rows compared for one scope. */
   maxRows: number;
   /** Rows per insert. */
@@ -88,6 +90,7 @@ const DEFAULT_LIMITS: SearchIndexLimits = {
   // Raw text is held several times over (strings, records, projected and index
   // rows), and an out-of-memory kill fails the whole batch: stay well inside 3 GB.
   maxScopeBytes: 64 * 1024 * 1024,
+  maxScopeEvents: 100_000,
   maxRows: 500_000,
   insertBatch: 5_000,
 };
@@ -102,6 +105,10 @@ export interface SearchIndexResult {
   complete: boolean;
   /** Why the read was incomplete (codes only). */
   reasons: string[];
+  /** Another pass holds this session: nothing was done, re-enqueue the event. */
+  busy?: boolean;
+  /** Too large to index whole: no rows written, its index state marked partial. */
+  partial?: boolean;
 }
 
 interface ScopeIdentity {
@@ -223,6 +230,10 @@ interface ScopeRead {
   rows: IndexRow[];
   manifests: number;
   complete: boolean;
+  /** Too large to index whole: nothing was read. */
+  partial: boolean;
+  /** Highest manifest revision of the scope, recorded with its index state. */
+  revision: number;
   reasons: string[];
 }
 
@@ -237,9 +248,9 @@ async function readScope(
   const prefix = deps.prefixFor(scope.orgId);
   const reasons: string[] = [];
   let complete = true;
-  let bytes = 0;
   type Part = { manifest: ManifestV1; records: RelayhistoryStreamRecord[]; userId: string };
   const parts: Part[] = [];
+  const readable: ManifestV1[] = [];
   for (const key of manifestKeys) {
     const read = await deps.reader.read(key);
     if (!read) {
@@ -265,12 +276,20 @@ async function readScope(
       reasons.push("manifest_unscrubbed");
       continue;
     }
-    bytes += manifest.raw.chunks.reduce((n, c) => n + Math.max(c.bytes, c.stored_raw_bytes ?? 0), 0);
-    if (bytes > limits.maxScopeBytes) {
-      complete = false;
-      reasons.push("scope_too_large");
-      break;
-    }
+    readable.push(manifest);
+  }
+
+  // Size the whole session from its manifests before reading a chunk. A
+  // session past either bound is not read at all: it is marked partial (see
+  // indexSearchScope), never folded from a subset of its records, which could
+  // index a record's older revision whose newer one sits in an unread chunk.
+  const revision = Math.max(0, ...readable.map((m) => m.revision));
+  const bytes = readable.reduce((n, m) => n + m.raw.chunks.reduce((b, c) => b + Math.max(c.bytes, c.stored_raw_bytes ?? 0), 0), 0);
+  const events = readable.reduce((n, m) => n + m.raw.chunks.reduce((b, c) => b + (c.records ?? 0), 0), 0);
+  if (bytes > limits.maxScopeBytes || events > limits.maxScopeEvents)
+    return { rows: [], manifests: readable.length, complete: false, partial: true, revision, reasons: [...new Set([...reasons, "scope_too_large"])] };
+
+  for (const manifest of readable) {
     try {
       parts.push({ manifest, records: await readManifestRecords(manifest, deps.store, prefix, decompress), userId: manifestUserId(manifest) });
     } catch (error) {
@@ -334,7 +353,7 @@ async function readScope(
       byKey.set(keyOf({ machineId: indexRow.machine_id, source: indexRow.source, kind: indexRow.kind, eventId: indexRow.event_id }), indexRow);
     }
   }
-  return { rows: [...byKey.values()], manifests: parts.length, complete, reasons: [...new Set(reasons)] };
+  return { rows: [...byKey.values()], manifests: parts.length, complete, partial: false, revision, reasons: [...new Set(reasons)] };
 }
 
 async function clickhouseScope(
@@ -375,6 +394,27 @@ async function clickhouseScope(
   }));
 }
 
+/**
+ * The session's index state in `search_ingest_session_state` (vendored
+ * schema.ts): `needs_full = 1` marks a session whose S3 pass was partial or
+ * incomplete, so readers never take its rows as current; a complete pass
+ * writes 0. `revision` is the highest manifest revision of the scope.
+ */
+export async function recordState(ch: ClickHouseClient, scope: SessionScope, revision: number, rows: number, complete: boolean, at: Date) {
+  const ts = chNow(at);
+  await ch.insert(SESSION_STATE_TABLE, [
+    {
+      org_id: scope.orgId,
+      session_id: scope.sessionId,
+      revision,
+      synced_at: ts,
+      full_synced_at: complete ? ts : "1970-01-01 00:00:00.000",
+      scanned_rows: Math.min(rows, 4_294_967_295),
+      needs_full: complete ? 0 : 1,
+    },
+  ]);
+}
+
 /** Live manifests of a scope, from the pointer index. */
 export async function livePointerKeys(tx: SqlExecutor, scope: SessionScope): Promise<string[]> {
   const { rows } = await tx.query<{ manifest_key: string }>(
@@ -390,8 +430,13 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   const limits = { ...DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   return deps.transact(async (tx) => {
-    await tx.query("SET LOCAL lock_timeout = '30s'");
-    await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scopeLockKey(scope)]);
+    // Non-blocking: a pass already running for this session is busy for as long
+    // as its ClickHouse work takes. The caller re-enqueues this event with a
+    // delay instead of waiting (and timing out into the DLQ behind a hot session).
+    const { rows: got } = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [
+      scopeLockKey(scope, "search"),
+    ]);
+    if (!got[0]?.ok) return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, busy: true, reasons: ["scope_busy"] };
     const keys = await livePointerKeys(tx, scope);
     const at = now();
     const version = at.getTime();
@@ -413,6 +458,12 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     }
     const fromMs = Date.parse(await windowStart(deps.ch, at));
     const s3 = await readScope(scope, keys, deps, limits, version);
+    if (s3.partial) {
+      // Not indexed from S3 and never treated as current: the state row says the
+      // session owes a full pass (needs_full = 1), and nothing else is written.
+      await recordState(deps.ch, scope, s3.revision, 0, false, at);
+      return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, reasons: s3.reasons };
+    }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
     const chRows = await clickhouseScope(deps.ch, scope, fromMs, limits.maxRows + 1);
     const truncated = chRows.length > limits.maxRows;
@@ -440,6 +491,8 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       }
       await deleteRows(deps.ch, deletes);
     }
+    // Only a complete pass makes the session current; any other leaves it owing one.
+    await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at);
     return {
       manifests: s3.manifests,
       rows: inWindow.length,

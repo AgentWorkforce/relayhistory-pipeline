@@ -36,12 +36,32 @@ EventBridge rate(30 minutes) --> Lambda {"reconcile":true}:
 - **Never deletes on a partial read.** A missing manifest, an unreadable chunk
   or a truncated ClickHouse read makes the pass incomplete: inserts happen,
   deletes do not, and the next event or the reconcile finishes the job.
-- **One session at a time.** The pointer stage (manifest read and upsert) and
-  the ClickHouse pass each hold the session's transaction-scoped advisory lock
-  in Supabase. A put whose read raced an erasure therefore cannot upsert after
+- **One session at a time.** The pointer stage (manifest read and upsert) holds
+  the session's pointer lock, a transaction-scoped advisory lock in Supabase. A put whose read raced an erasure therefore cannot upsert after
   the delete's tombstone: `upsert_session_index` lets a newer revision
   undelete, so without the lock it would bring the row back for good
   (#121 review H1, `__tests__/pointer-race.test.ts` on the real SQL).
+- **A busy session is requeued, not waited on.** The ClickHouse pass takes a
+  separate search lock with `pg_try_advisory_xact_lock`. If another pass holds
+  it, the event goes back on the queue 60 s later and is acked, so a hot live
+  session never times events out into the DLQ.
+- **Date moves follow the session.** The exporter re-keys a session whose first
+  record moved earlier (a new `d=`, revision 1 at the new key), then erases the
+  old prefix. The pointer row's identity has no date, so:
+  - a manifest delete first looks for the same session (same machine) under
+    another date, up to 45 days either side; if one is live, the row follows
+    it instead of being tombstoned;
+  - a put the revision fence kept out, because the row names another key, re-keys
+    the row when that key is gone, and retries while both are live;
+  - a tombstone applies only to a row that still names the deleted key.
+  (#121 review 2 N1; `__tests__/pointer-race.test.ts`, real SQL.)
+- **Large sessions are marked partial, never indexed from a subset.** A session
+  over 64 MiB raw or 100,000 events (summed from its manifests, before any chunk
+  is read) is not read. Its `search_ingest_session_state` row gets
+  `needs_full = 1`, and nothing else is written or deleted. Every other
+  incomplete pass also writes `needs_full = 1`; only a complete pass writes 0.
+  Readers must not treat a `needs_full = 1` session's rows as current. Indexing
+  those sessions completely (cursored over their chunks) is open work.
 - **Erasure is one predicate delete.** With no live pointer, the ClickHouse
   rows of the session are deleted by `(org, workspace, source, session)`,
   without listing, so no session size can truncate it. A failure throws and
@@ -156,11 +176,15 @@ Re-drive the DLQ after a fix with
   chain (S3 cannot filter by date). The chain covers any size, but each run
   costs one LIST per 1,000 objects. Listing per org and day, or S3 Inventory,
   is the follow-up.
-- A session's ClickHouse pass reads every chunk of every live manifest, capped
-  at 64 MiB of raw per session, to stay well inside the 3 GB function (an
-  out-of-memory kill fails the whole batch). Larger sessions are indexed
-  without deletes and logged with `scope_too_large`. Incremental, chunk-only
-  indexing is the follow-up for very long live sessions.
+- A session's ClickHouse pass reads every chunk of every live manifest. Above
+  64 MiB raw or 100,000 events it is marked partial (above), logged as
+  `search index partial`, and not indexed from S3. Cursored, chunk-by-chunk
+  indexing is the open work that would cover them.
+- A date move further than 45 days from the old key is not followed: the old
+  key's delete then tombstones the row, and the new key's put re-keys the
+  `session_index` row, but the `session_directory` row stays tombstoned
+  (decision 0002: a tombstoned session does not come back on an older
+  revision).
 - The role's `s3:ListBucket` is unconditional (as for the reader user): S3
   answers 404 instead of 403 for a missing manifest only with it, and deletes
   are detected that way. It exposes key names, never content.

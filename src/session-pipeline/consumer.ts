@@ -28,6 +28,11 @@ export interface ConsumerDeps {
   pointer: PointerDeps;
   /** Absent while the search index is switched off: only pointers are written. */
   search?: SearchIndexDeps;
+  /**
+   * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
+   * another pass holds the session, so the event is neither lost nor failed.
+   */
+  requeue?: (manifestKey: string) => Promise<void>;
 }
 
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
@@ -54,7 +59,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }
   }
 
-  const scopes = new Map<string, { scope: SessionScope; messageIds: string[] }>();
+  const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string }>();
   for (const { event, messageIds } of byKey.values()) {
     const started = Date.now();
     try {
@@ -76,7 +81,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       const id = scopeId(outcome.scope);
       const held = scopes.get(id);
       if (held) held.messageIds.push(...messageIds);
-      else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds] });
+      else scopes.set(id, { scope: outcome.scope, messageIds: [...messageIds], manifestKey: outcome.manifestKey });
     } catch (error) {
       log.error("pointer index failed", { stage: "session-indexed", ...errorFields(error), duration_ms: Date.now() - started });
       for (const id of messageIds) failed.add(id);
@@ -84,11 +89,20 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   }
 
   if (deps.search) {
-    for (const { scope, messageIds } of scopes.values()) {
+    for (const { scope, messageIds, manifestKey } of scopes.values()) {
       if (messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       try {
         const result = await indexSearchScope(scope, deps.search);
+        if (result.busy) {
+          // The running pass may have read S3 before this event's write: run again later.
+          if (!deps.requeue) throw new Error("scope busy and no requeue");
+          await deps.requeue(manifestKey);
+          log.info("search index busy, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "scope_busy" });
+          continue;
+        }
+        if (result.partial)
+          log.warn("search index partial", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests, reason: "scope_too_large" });
         log.info("search index reconciled", {
           stage: "search-index",
           org_id: scope.orgId,

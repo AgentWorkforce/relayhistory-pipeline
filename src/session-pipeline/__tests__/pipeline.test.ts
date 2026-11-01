@@ -25,7 +25,7 @@ import type { HoopDb } from "../../shared/db.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import type { IndexRow } from "../vendor/search-index/rows.ts";
-import { EVENTS_TABLE } from "../vendor/search-index/schema.ts";
+import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
 import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
@@ -140,6 +140,7 @@ function fakeClickHouse() {
   };
   let failInsert = false;
   const commands: string[] = [];
+  const state: { session_id: string; needs_full: number }[] = [];
   const sha = (v: string) => createHash("sha256").update(v).digest("hex");
   const ch: ClickHouseClient = {
     database: "test",
@@ -174,20 +175,25 @@ function fakeClickHouse() {
         .map((r) => ({ workspace_id: r.workspace_id, machine_id: r.machine_id, source: r.source, kind: r.kind, event_id: r.event_id, ts_ms: tsMs(r), fingerprint: r.fingerprint })) as T[];
     },
     async insert(table, batch) {
+      if (table === SESSION_STATE_TABLE) {
+        state.push(...(batch as { session_id: string; needs_full: number }[]));
+        return;
+      }
       if (failInsert) throw Object.assign(new Error("boom"), { code: "241" });
       expect(table).toBe(EVENTS_TABLE);
       rows.push(...(batch as IndexRow[]));
     },
   };
-  return { ch, rows, final, commands, fail: (on: boolean) => (failInsert = on) };
+  return { ch, rows, final, commands, state, fail: (on: boolean) => (failInsert = on) };
 }
 
 /** Supabase as the indexer sees it: the live pointer keys of the scope, plus a call log. */
-function fakeSupabase(live: () => string[]) {
+function fakeSupabase(live: () => string[], busy: () => boolean = () => false) {
   const calls: string[] = [];
   const tx: SqlExecutor = {
     async query<R>(text: string) {
       calls.push(text.trim().replace(/\s+/g, " "));
+      if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: !busy() }] as R[] };
       if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
         return { rows: live().map((manifest_key) => ({ manifest_key })) as R[] };
       if (text.includes("upsert_session_index")) return { rows: [{ applied: true, revision: "1" }] as R[] };
@@ -217,7 +223,7 @@ describe("search index from S3", () => {
     expect(ch.final().map((r) => r.content).sort()).toEqual(["first", "second", "third"]);
     expect(ch.final().every((r) => r.org_id === "org_1" && r.user_id === "user_1" && r.fingerprint.startsWith("s3"))).toBe(true);
     // The pointer listing ran under the scope's advisory lock.
-    expect(sb.calls.some((c) => c.startsWith("SELECT pg_advisory_xact_lock"))).toBe(true);
+    expect(sb.calls.some((c) => c.startsWith("SELECT pg_try_advisory_xact_lock"))).toBe(true);
 
     // Replay: nothing changes.
     expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ inserted: 0, deleted: 0, complete: true });
@@ -308,6 +314,101 @@ describe("search index from S3", () => {
   });
 });
 
+describe("search index: a bad read never deletes (review #2 L-a)", () => {
+  const t = (s: number) => Date.parse(`2026-11-01T10:00:0${s}Z`);
+  /** Index r1 + r2, then rewrite the session so that r2 is retracted; `spoil` makes that read bad. */
+  async function retractedAfter(spoil: (key: string) => Promise<void>, limits?: SearchIndexDeps["limits"]) {
+    let keys = [await writeSession("srv_bb", [event("r1", "1", t(1), "one"), event("r2", "1", t(2), "two")])];
+    const ch = fakeClickHouse();
+    const sb = fakeSupabase(() => keys);
+    await indexSearchScope(scope, searchDeps(ch.ch, sb.transact));
+    expect(ch.final()).toHaveLength(2);
+    keys = [await writeSession("srv_bb", [event("r1", "1", t(1), "one")], 2)];
+    await spoil(keys[0]!);
+    const result = await indexSearchScope(scope, searchDeps(ch.ch, sb.transact, limits));
+    return { result, ch };
+  }
+  const chunkKeyOf = async (key: string) => {
+    const listed = await store.list(objectKey(key.replace(/\/manifest\.json$/, "/raw")));
+    return listed.items.map((i) => i.key)[listed.items.length - 1]!;
+  };
+
+  test("control: a good read deletes the retracted row", async () => {
+    const { result, ch } = await retractedAfter(async () => {});
+    expect(result).toMatchObject({ complete: true, deleted: 1 });
+    expect(ch.final()).toHaveLength(1);
+    expect(ch.state.at(-1)).toMatchObject({ needs_full: 0 });
+  });
+
+  test("an unreadable manifest (a chunk with the wrong digest)", async () => {
+    const { result, ch } = await retractedAfter(async (key) => {
+      await store.put(await chunkKeyOf(key), new Uint8Array(zstdCompressSync(new TextEncoder().encode("tampered\n"))), {});
+    });
+    expect(result).toMatchObject({ complete: false, deleted: 0, reasons: ["chunk_digest_mismatch"] });
+    expect(ch.final()).toHaveLength(2);
+    expect(ch.state.at(-1)).toMatchObject({ needs_full: 1 });
+  });
+
+  test("a projection error (a convergence_event line that is not this session's)", async () => {
+    const { result, ch } = await retractedAfter(async () => {
+      await writeSession("srv_bb", [event("r1", "1", t(1), "one"), event("x", "1", t(3), "x", { kind: "convergence_event", origin_id: "machine:elsewhere", payload: { source: "claude", session_id: "other", machine_id: "elsewhere", user_id: "u", event_id: "x", ts: AT } })], 2);
+    });
+    expect(result).toMatchObject({ complete: false, deleted: 0 });
+    expect(result.reasons).toContain("relayhistory_event_identity");
+    expect(ch.final()).toHaveLength(2);
+  });
+
+  test("a fold error (two copies of one revision that differ)", async () => {
+    let keys = [await writeSession("srv_bb", [event("r1", "1", t(1), "one"), event("r2", "1", t(2), "two")])];
+    const ch = fakeClickHouse();
+    const sb = fakeSupabase(() => keys);
+    await indexSearchScope(scope, searchDeps(ch.ch, sb.transact));
+    keys = [await writeSession("srv_bb", [event("r1", "1", t(1), "one")], 2), await writeSession("delivery_aa", [event("r1", "1", t(1), "one, but different")])];
+    const result = await indexSearchScope(scope, searchDeps(ch.ch, sb.transact));
+    expect(result).toMatchObject({ complete: false, deleted: 0, reasons: ["relayhistory_revision_conflict"] });
+    expect(ch.final().map((r) => r.event_id)).toContain(ch.final().find((r) => r.content === "two")!.event_id);
+  });
+
+  test("a truncated ClickHouse read of a live session", async () => {
+    const { result, ch } = await retractedAfter(async () => {}, { maxRows: 1 });
+    expect(result).toMatchObject({ complete: false, deleted: 0, reasons: ["clickhouse_truncated"] });
+    expect(ch.final()).toHaveLength(2);
+  });
+
+  test("a session over the size bounds is marked partial: nothing read, written or deleted (new requirement)", async () => {
+    for (const limits of [{ maxScopeBytes: 64 }, { maxScopeEvents: 0 }]) {
+      const { result, ch } = await retractedAfter(async () => {}, limits);
+      expect(result).toMatchObject({ partial: true, complete: false, inserted: 0, deleted: 0, reasons: ["scope_too_large"] });
+      expect(ch.final()).toHaveLength(2);
+      expect(ch.state.at(-1)).toMatchObject({ session_id: "sess_1", needs_full: 1 });
+    }
+  });
+});
+
+describe("search index: a busy session is requeued, not waited on (review #2 N2)", () => {
+  test("a pass that finds the session's search lock held does nothing and re-enqueues its manifest", async () => {
+    const key = await writeSession("srv_bb", [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello")]);
+    const ch = fakeClickHouse();
+    let busy = true;
+    const sb = fakeSupabase(() => [key], () => busy);
+    const requeued: string[] = [];
+    const db = { ...sb.tx, pool: undefined, end: async () => {} } as unknown as HoopDb;
+    const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
+    const deps: ConsumerDeps = {
+      pointer: { db, lock: memoryLock(), reader, exists: async (k) => (await store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
+      search: searchDeps(ch.ch, sb.transact),
+      requeue: async (k) => void requeued.push(k),
+    };
+    const put = JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", eventTime: AT, s3: { bucket: { name: "bucket" }, object: { key, eTag: "e", sequencer: "01" } } }] });
+    expect((await processBatch([{ messageId: "m", body: put }], deps)).batchItemFailures).toEqual([]);
+    expect(requeued).toEqual([key]);
+    expect(ch.final()).toHaveLength(0);
+    busy = false;
+    await processBatch([{ messageId: "m2", body: put }], deps);
+    expect(ch.final()).toHaveLength(1);
+  });
+});
+
 describe("SQS consumer", () => {
   const s3Put = (key: string, sequencer: string) =>
     JSON.stringify({
@@ -319,7 +420,7 @@ describe("SQS consumer", () => {
     const db = { ...sb.tx, pool: undefined, end: async () => {} } as unknown as HoopDb;
     const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
     const deps: ConsumerDeps = {
-      pointer: { db, lock: memoryLock(), reader, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
+      pointer: { db, lock: memoryLock(), reader, exists: async (k) => (await store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
       search: searchDeps(ch, sb.transact),
     };
     return { deps, sb };

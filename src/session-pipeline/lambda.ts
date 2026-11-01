@@ -145,6 +145,9 @@ async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>)
   }
 }
 
+/** A search pass that found its session busy runs again this much later. */
+export const BUSY_REQUEUE_DELAY_SECONDS = 60;
+
 interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
@@ -179,9 +182,19 @@ async function init(): Promise<Runtime> {
       db,
       lock,
       reader,
+      exists: async (key) => (await store.head(objectKey(key))) !== undefined,
       orgs: prefixOrgResolver,
       allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
       fanout,
+    },
+    requeue: async (manifestKey) => {
+      await awsJsonCall({
+        service: "sqs",
+        target: "AmazonSQS.SendMessage",
+        region: env.region,
+        body: { QueueUrl: env.queueUrl, MessageBody: JSON.stringify({ [RECONCILE_BODY_KEY]: { key: manifestKey } }), DelaySeconds: BUSY_REQUEUE_DELAY_SECONDS },
+        credentials: lambdaCredentials(),
+      });
     },
   };
   if (env.searchEnabled) {
