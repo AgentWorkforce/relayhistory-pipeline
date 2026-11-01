@@ -28,7 +28,7 @@ const example = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-s
 
 describe("session pipeline: grants", () => {
   it("the role may only decrypt via S3, for objects under 96bulls/ in this bucket", () => {
-    const policy = transcriptKeyPolicy({ accountId: ACCOUNT, region: REGION, bucketName: t.bucket, writerArn: "w", readerArn: "r", pipelineRoleArn: ROLE });
+    const policy = transcriptKeyPolicy({ accountId: ACCOUNT, region: REGION, bucketName: t.bucket, writerArn: "w", srvWriterArn: "sw", readerArn: "r", pipelineRoleArn: ROLE });
     const stmt = policy.Statement.find((s) => s.Sid === "SessionPipelineDecryptsViaS3")!;
     expect(stmt).toEqual(pipelineKeyStatement({ accountId: ACCOUNT, region: REGION, bucketName: t.bucket, roleArn: ROLE }));
     expect(stmt.Action).toEqual(["kms:Decrypt"]);
@@ -37,11 +37,9 @@ describe("session pipeline: grants", () => {
       StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${t.bucket}/96bulls/*` },
     });
     // Without the pipeline the key policy is unchanged (no stray statement).
-    expect(transcriptKeyPolicy({ accountId: ACCOUNT, region: REGION, bucketName: t.bucket, writerArn: "w", readerArn: "r" }).Statement.map((s) => s.Sid)).toEqual([
-      "AccountAdministersKey",
-      "WriterEncryptsAndReadsViaS3",
-      "ReaderDecryptsViaS3",
-    ]);
+    const without = transcriptKeyPolicy({ accountId: ACCOUNT, region: REGION, bucketName: t.bucket, writerArn: "w", srvWriterArn: "sw", readerArn: "r" }).Statement.map((s) => s.Sid);
+    expect(without).not.toContain("SessionPipelineDecryptsViaS3");
+    expect(policy.Statement.map((s) => s.Sid)).toEqual([...without, "SessionPipelineDecryptsViaS3"]);
   });
 
   it("the bucket grants are list + read of session objects only, and the store's denies still apply", () => {
@@ -120,7 +118,7 @@ describe("session pipeline: inputs", () => {
 describe("session pipeline: deploy plan contract", () => {
   const store = [
     "access-logs", "budget", "trail", "trail-key", "trail-key-alias", "trail-logs",
-    "transcript-eraser", "transcript-reader", "transcript-writer", "transcripts",
+    "transcript-eraser", "transcript-reader", "transcript-srv-writer", "transcript-writer", "transcripts",
     "transcripts-key", "transcripts-key-alias",
   ];
   const all = [...store, ...SESSION_PIPELINE_RESOURCES];

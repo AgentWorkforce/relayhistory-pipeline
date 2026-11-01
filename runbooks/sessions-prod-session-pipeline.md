@@ -124,7 +124,7 @@ rotation, force fresh reads with
 3. **Capture and apply.** Run `bin/96bulls plan aws-sessions-prod --capture`.
    The contract accepts it only as **session pipeline rollout**: the 11
    pipeline resources are `create`, `transcripts` (bucket policy grant) and
-   `transcripts-key` (key policy grant) are `update`, and the other 10 store
+   `transcripts-key` (key policy grant) are `update`, and the other 11 store
    resources are `noop`. Then commit the capture, write `approval.capture` and
    run `NINETY_SIX_BULLS_CONFIRM_STAGE=aws-sessions-prod bin/96bulls up aws-sessions-prod`.
    If KMS or S3 refuses the new role as an invalid principal (IAM
