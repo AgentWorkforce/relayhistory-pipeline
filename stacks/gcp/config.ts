@@ -771,7 +771,7 @@ export interface Bulls96ReleaseOutputs {
   pubsubTopic: unknown;
   pubsubSubscription: unknown;
   /** One Google service account per Kubernetes service account (bucket-iam.ts). */
-  workloadIdentityEmails: unknown;
+  workloadIdentityEmails: { worker: string; alleyoop: string };
 }
 
 const GSA_EMAIL =
@@ -913,6 +913,7 @@ export function bulls96ReleaseValues(
   const emails = managed.workloadIdentityEmails as
     | { worker?: unknown; alleyoop?: unknown }
     | undefined;
+  // Plain strings: both are derived from the stage, never deferred Outputs.
   for (const email of [emails?.worker, emails?.alleyoop])
     if (typeof email !== "string" || !GSA_EMAIL.test(email))
       throw new Error(

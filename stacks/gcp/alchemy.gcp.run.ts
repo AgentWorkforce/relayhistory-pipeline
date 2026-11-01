@@ -925,8 +925,15 @@ export default Alchemy.Stack(
               region: i.region,
               // Resolve the IAM member as part of the repository value so
               // Helm cannot create image-pulling pods before the reader edge.
+              // The service grants and write scopes ride the same value, so pods
+              // cannot roll onto an identity before it can read and write.
               imageRepository: Output.map(
-                Output.all(images.registryUri, nodeArtifactRegistryReader.role),
+                Output.all(
+                  images.registryUri,
+                  nodeArtifactRegistryReader.role,
+                  lockerWriteScopes.bucket,
+                  Output.all(...serviceBindings.map((b) => b.role)),
+                ),
                 ([registry]) => `${registry}/96bulls-services`,
               ),
               cloudSqlConnectionName: dataPlane.sqlPoster.connectionName,
@@ -935,13 +942,7 @@ export default Alchemy.Stack(
               redisCaPem: dataPlane.redis.caPem,
               pubsubTopic: eventsTopicName,
               pubsubSubscription: eventsSubscriptionName,
-              // Resolved through every service grant and the write scopes, so
-              // Helm cannot roll pods onto an identity before it can read or
-              // write the bucket.
-              workloadIdentityEmails: Output.map(
-                Output.all(lockerWriteScopes.bucket, ...serviceBindings.map((b) => b.role)),
-                () => ({ worker: workerEmail, alleyoop: alleyoopEmail }),
-              ),
+              workloadIdentityEmails: { worker: workerEmail, alleyoop: alleyoopEmail },
             }, BOOTSTRAP_COMMAND),
           });
           return release.releaseName;

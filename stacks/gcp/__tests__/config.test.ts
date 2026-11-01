@@ -532,7 +532,9 @@ describe("GCP self-host contract", () => {
     expect(stack).toContain("autopilot: GCP_RUNTIME_SHAPE.autopilot");
     expect(stack).toContain("serviceAccount: nodeActAs.serviceAccountEmail");
     expect(stack).toContain('GCP.IAM.Member("node-artifactregistry-reader"');
-    expect(stack).toContain("Output.all(images.registryUri, nodeArtifactRegistryReader.role)");
+    expect(stack).toMatch(
+      /Output\.all\(\s*images\.registryUri,\s*nodeArtifactRegistryReader\.role,\s*lockerWriteScopes\.bucket,\s*Output\.all\(\.\.\.serviceBindings\.map\(\(b\) => b\.role\)\),?\s*\)/,
+    );
     expect(stack.indexOf('GCP.IAM.Member("node-artifactregistry-reader"')).toBeLessThan(
       stack.indexOf('Kubernetes.HelmChart("96bulls"'),
     );
