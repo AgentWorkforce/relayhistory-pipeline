@@ -68,11 +68,36 @@ reuse is not permitted. The committed AWS proof minter and the self-hosted
 verifier cannot copy the old claimless request safely.
 
 The machine claim fences AlleyOop HTTP writes only. The worker and AlleyOop
-pods also access GCS directly through their shared Workload Identity runtime
-service account; those bucket-direct operations do not traverse the HTTP
-machine gate. Their boundary is the vended Google credential and its
-bucket-level `roles/storage.objectUser` grant, not `meta.machineId`. Route tests
-therefore prove no bucket-direct isolation. The reviewed RelayAuth #113
+pods also access GCS directly through Workload Identity; those bucket-direct
+operations do not traverse the HTTP machine gate, and their boundary is the
+vended Google credential, not `meta.machineId`. Route tests therefore prove no
+bucket-direct isolation.
+
+### Per-component bucket identities
+
+Each component now has its own Google service account, scoped like the AWS
+roles in `stacks/aws/hardening.ts` (`stacks/gcp/bucket-iam.ts`):
+
+| Google service account | Kubernetes service account | Locker bucket | Other |
+| --- | --- | --- | --- |
+| `<stage>-alleyoop` | `96bulls/bulls96-alleyoop` | `objectViewer`; `objectUser` only where the name is under `v1/` and ends `/manifest.json` (live and parked) or `.zst` (raw chunks) | none |
+| `<stage>-worker` | `96bulls/bulls96-worker` (pods and Jobs) | `objectViewer`; `objectUser` only for `v1/…/summary/{short,long}.json.enc` | Pub/Sub publisher and subscriber on the events topic and subscription |
+| `<stage>-runtime` | `96bulls/cloud-sql-proxy` | none | `roles/cloudsql.client` |
+
+The write edge is `objectUser`, because a manifest compare-and-swap and
+parked-session cleanup overwrite or delete, and Cloud Storage requires
+`storage.objects.delete` for both. `objects.list` is evaluated against the
+bucket, so the conditional edge never widens listing. Alchemy's `IAM.Member`
+manages only unconditional edges, so the stack reconciles the two conditional
+edges against the bucket's version-3 policy under its etag, through the
+`EnsureLockerWriteScopes` action. It touches only bindings whose condition
+title starts with `96bulls-locker-write-`. A destroy leaves those edges on the
+bucket, and they are removed with it.
+
+This is component isolation, not machine isolation. AlleyOop and the workers
+serve every machine by design, so no per-machine prefix scope applies to them.
+Machine binding stays at the AlleyOop HTTP gate, which is the only path a
+courier has to the bucket. The reviewed RelayAuth #113
 image/chart and the services image containing this change are pinned in
 `versions.lock.json`.
 
@@ -657,9 +682,10 @@ first resource. Resource order after that is: the listed Google APIs with
 `/20` Private Service Access range, the service-networking connection, regional
 standard GKE with a one-node default pool in `us-central1-a`, private nodes and
 a private endpoint, the versioned GCS bucket, the empty Secret Manager
-container, Artifact Registry, the runtime service account, Workload Identity for
-`bulls96-worker` and `bulls96-alleyoop`, `roles/storage.objectUser`, and
-`roles/cloudsql.client`. With `managedDataPlane.provision`, Memorystore Redis
+container, Artifact Registry, the per-component service accounts and their
+Workload Identity edges for `bulls96-worker`, `bulls96-alleyoop` and
+`cloud-sql-proxy`, the per-component bucket grants above, and
+`roles/cloudsql.client` for the proxy identity. With `managedDataPlane.provision`, Memorystore Redis
 7.2 is created with AUTH off and TLS server authentication, and Pub/Sub is
 created with the dead-letter service agent. The Cloud SQL body is an Action
 input; `ensurePrivateCloudSql` runs only during an approved apply after the PSA
