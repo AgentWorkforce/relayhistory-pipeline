@@ -213,7 +213,8 @@ describe("strings over the scrub bound", () => {
     const out = (JSON.parse(r.text) as { out: string }).out;
     expect(out).toContain("[neon-s3-sync: truncated");
     expect(JSON.stringify(out).length).toBeLessThanOrEqual(MAX_STRING_TOKEN);
-    expect(boundStrings('{"a": "b"}')).toEqual({ text: '{"a": "b"}', truncated: 0 });
+    expect(boundStrings('{"a": "b"}')).toEqual({ text: '{"a": "b"}', truncated: 0, maxChars: 0 });
+    expect(r.maxChars).toBe(huge.length);
     // escapes: a token long only because of escapes is bounded by its literal length
     const escaped = `{"e": ${JSON.stringify("\u0001".repeat(60_000))}}`;
     expect(escaped.length).toBeGreaterThan(MAX_STRING_TOKEN);
@@ -429,13 +430,13 @@ describe("ownership and failure bookkeeping", () => {
         const { boundStrings } = await import("../neon-s3-sync/neon-reader.ts");
         const b = boundStrings(payload);
         const r = rec("tool_call", "o", "t", {});
-        yield { machine: "delivery:m", bytes: buildSessionStream([{ ...r, payload_json: b.text }]).bytes, userId: "u", truncated: b.truncated };
+        yield { machine: "delivery:m", bytes: buildSessionStream([{ ...r, payload_json: b.text }]).bytes, userId: "u", truncated: b.truncated, truncatedMaxChars: b.maxChars };
       },
     };
     const syncer = new Syncer(fakeDb([unit("org-a")]), state, target(store), fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => src);
     state.seeRevisions(1, [{ org_id: "org-a", session_id: "sess:with:colons-1", revision: "1" }]);
     expect(await syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 1, kind: "recent", events: 1 })).toBe(true);
-    expect(state.truncationTotals()).toEqual({ sessions: 1, manifests: 1, strings: 1 });
+    expect(state.truncationTotals()).toEqual({ sessions: 1, manifests: 1, strings: 1, maxChars: 300_000 });
     const key = state.exported("org-a", "sess:with:colons-1")!.keys[0]!;
     const m = JSON.parse(await readText(store, key));
     expect(m.extensions["client.relayhistory_export"].catalog.truncated_strings).toBe(1);

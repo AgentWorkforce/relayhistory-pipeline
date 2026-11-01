@@ -74,6 +74,17 @@ export class SyncState {
         org_id TEXT NOT NULL, session_id TEXT NOT NULL, manifest_key TEXT NOT NULL,
         strings INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
         PRIMARY KEY (org_id, session_id, manifest_key));
+    `);
+    // Added after the first production start: migrate in place.
+    const cols = this.db.prepare("PRAGMA table_info(truncations)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "max_chars"))
+      try {
+        this.db.exec("ALTER TABLE truncations ADD COLUMN max_chars INTEGER NOT NULL DEFAULT 0");
+      } catch (error) {
+        // The other process (exporter or erasure job) added it first.
+        if (!/duplicate column/i.test(String((error as Error).message))) throw error;
+      }
+    this.db.exec(`
       CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
     `);
   }
@@ -203,13 +214,13 @@ export class SyncState {
    * the scrub bound, so it can be re-exported in full once the sealer takes
    * large strings. Replaced on each export of the group; T0 waits on it being empty.
    */
-  recordTruncations(org: string, session: string, byKey: { key: string; strings: number }[], at = Date.now()) {
+  recordTruncations(org: string, session: string, byKey: { key: string; strings: number; maxChars?: number }[], at = Date.now()) {
     this.#tx(() => {
       this.db.prepare("DELETE FROM truncations WHERE org_id = ? AND session_id = ?").run(org, session);
       const q = this.db.prepare(
-        "INSERT INTO truncations (org_id, session_id, manifest_key, strings, recorded_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO truncations (org_id, session_id, manifest_key, strings, recorded_at, max_chars) VALUES (?, ?, ?, ?, ?, ?)",
       );
-      for (const t of byKey) if (t.strings > 0) q.run(org, session, t.key, t.strings, at);
+      for (const t of byKey) if (t.strings > 0) q.run(org, session, t.key, t.strings, at, t.maxChars ?? 0);
     });
   }
 
@@ -348,11 +359,13 @@ export class SyncState {
     return Number((this.db.prepare("SELECT count(*) AS n FROM exported WHERE error IS NOT NULL AND keys <> '[]' AND attempts >= 6").get() as { n: number }).n);
   }
 
-  truncationTotals(): { sessions: number; manifests: number; strings: number } {
+  truncationTotals(): { sessions: number; manifests: number; strings: number; maxChars?: number } {
     const r = this.db
-      .prepare("SELECT count(DISTINCT org_id || '/' || session_id) AS s, count(*) AS m, coalesce(sum(strings), 0) AS n FROM truncations")
-      .get() as { s: number; m: number; n: number };
-    return { sessions: Number(r.s), manifests: Number(r.m), strings: Number(r.n) };
+      .prepare(
+        "SELECT count(DISTINCT org_id || '/' || session_id) AS s, count(*) AS m, coalesce(sum(strings), 0) AS n, coalesce(max(max_chars), 0) AS x FROM truncations",
+      )
+      .get() as { s: number; m: number; n: number; x: number };
+    return { sessions: Number(r.s), manifests: Number(r.m), strings: Number(r.n), ...(Number(r.x) ? { maxChars: Number(r.x) } : {}) };
   }
 
   /**

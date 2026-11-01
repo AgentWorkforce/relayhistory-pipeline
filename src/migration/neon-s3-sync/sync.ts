@@ -225,7 +225,7 @@ export class Syncer {
     const referenced = new Set<string>();
     try {
       const keys: string[] = [];
-      const truncations: { key: string; strings: number }[] = [];
+      const truncations: { key: string; strings: number; maxChars: number }[] = [];
       const erase: { key: string; kind: "object" | "prefix"; org_id: string; reason: string }[] = [];
       const units = await sessionUnits(lane.db, work.org_id, work.session_id);
       await this.hook(units.length, 0);
@@ -251,7 +251,7 @@ export class Syncer {
         if (r.fenced) this.counters.fenced += 1;
         for (const m of r.manifests) {
           keys.push(m.manifestKey);
-          truncations.push({ key: m.manifestKey, strings: m.truncatedStrings });
+          truncations.push({ key: m.manifestKey, strings: m.truncatedStrings, maxChars: m.truncatedMaxChars });
           if (m.written) this.counters.manifestsWritten += 1;
           else this.counters.manifestsUnchanged += 1;
           this.counters.chunksSealed += m.chunksSealed;

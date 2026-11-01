@@ -97,6 +97,7 @@ export interface MachineResult {
   /** The manifest and every chunk it references. */
   referenced: string[];
   truncatedStrings: number;
+  truncatedMaxChars: number;
 }
 
 export interface UnitResult {
@@ -121,6 +122,7 @@ class MachineStream {
   sealed = 0;
   reused = 0;
   truncated = 0;
+  truncatedMaxChars = 0;
   userId: string | null = null;
 
   constructor(
@@ -165,6 +167,7 @@ class MachineStream {
     }
     if (this.userId === null && line.userId) this.userId = line.userId;
     this.truncated += line.truncated ?? 0;
+    this.truncatedMaxChars = Math.max(this.truncatedMaxChars, line.truncatedMaxChars ?? 0);
   }
 
   async flush() {
@@ -506,6 +509,7 @@ export async function exportUnit(
       orphans,
       referenced: [stream.key, ...keep],
       truncatedStrings: stream.truncated,
+      truncatedMaxChars: stream.truncatedMaxChars,
     });
   }
   return { fenced: false, manifests, lines };

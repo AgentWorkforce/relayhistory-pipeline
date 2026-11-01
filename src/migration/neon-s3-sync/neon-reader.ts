@@ -229,6 +229,8 @@ export interface StreamLine {
   userId: string | null;
   /** String tokens cut to the scrub bound in this line (see `boundStrings`). */
   truncated?: number;
+  /** Length (chars) of the longest string cut in this line. */
+  truncatedMaxChars?: number;
 }
 
 export interface UnitSource {
@@ -269,17 +271,19 @@ const TRUNCATION_NOTE = (dropped: number) =>
  * bounds text everywhere else in the pipeline; every other byte of the payload
  * (numbers, key order, other strings) is kept as Neon's own text.
  */
-export function boundStrings(json: string): { text: string; truncated: number } {
-  if (json.length <= MAX_STRING_TOKEN) return { text: json, truncated: 0 };
+export function boundStrings(json: string): { text: string; truncated: number; maxChars: number } {
+  if (json.length <= MAX_STRING_TOKEN) return { text: json, truncated: 0, maxChars: 0 };
   let out = "";
   let last = 0;
   let truncated = 0;
+  let maxChars = 0;
   for (let i = 0; i < json.length; i++) {
     if (json[i] !== '"') continue;
     let j = i + 1;
     while (j < json.length && json[j] !== '"') j += json[j] === "\\" ? 2 : 1;
     if (j - i + 1 > MAX_STRING_TOKEN) {
       const value = JSON.parse(json.slice(i, j + 1)) as string;
+      maxChars = Math.max(maxChars, value.length);
       let k = MAX_STRING_TOKEN - 512;
       let literal = "";
       for (;;) {
@@ -294,7 +298,7 @@ export function boundStrings(json: string): { text: string; truncated: number } 
     }
     i = j;
   }
-  return { text: out + json.slice(last), truncated };
+  return { text: out + json.slice(last), truncated, maxChars };
 }
 
 const encodeLine = (record: DeliveryRecord): Uint8Array => buildSessionStream([record]).bytes;
@@ -469,7 +473,7 @@ function deliveryLine(kind: string, row: DeliveryRow): StreamLine {
   return {
     machine: row.machine,
     bytes: encodeLine(record),
-    ...(bounded.truncated ? { truncated: bounded.truncated } : {}),
+    ...(bounded.truncated ? { truncated: bounded.truncated, truncatedMaxChars: bounded.maxChars } : {}),
     ...(Number.isSafeInteger(revision) && revision >= 0 ? { feed: { origin: row.origin_id, revision } } : {}),
     userId: row.user_id,
   };
@@ -579,7 +583,7 @@ async function* undelivered(
       machine: row.machine_id,
       bytes: encodeLine(record),
       userId: row.user_id,
-      ...(bounded.truncated ? { truncated: bounded.truncated } : {}),
+      ...(bounded.truncated ? { truncated: bounded.truncated, truncatedMaxChars: bounded.maxChars } : {}),
     };
   };
   // Non-delivery machines: the events primary key (org, machine, source, session, kind, event_id).
