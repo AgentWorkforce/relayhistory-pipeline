@@ -94,7 +94,7 @@ describe("96bulls NetworkPolicies", () => {
 });
 
 describe("relayauth NetworkPolicies", () => {
-  const internal = relayauthNetworkPolicies({ publicJwksIngress: false }) as Policy[];
+  const internal = relayauthNetworkPolicies({ publicJwksIngress: false, relayfileConsumer: false }) as Policy[];
   const named = (ps: Policy[], n: string) => ps.find((p) => p.metadata.name === n)!;
 
   it("default-denies the namespace and allows DNS as its only egress", () => {
@@ -123,14 +123,23 @@ describe("relayauth NetworkPolicies", () => {
 
   it("adds the GCE load-balancer ranges on :8787 only when a public JWKS Ingress exists", () => {
     expect(internal.some((p) => p.metadata.name === "allow-gce-lb-to-relayauth")).toBe(false);
-    const pub = relayauthNetworkPolicies({ publicJwksIngress: true }) as Policy[];
+    const pub = relayauthNetworkPolicies({ publicJwksIngress: true, relayfileConsumer: false }) as Policy[];
     const lb = named(pub, "allow-gce-lb-to-relayauth");
     expect(lb.spec.ingress).toEqual([{ from: GCE_LB_SOURCE_RANGES.map((cidr) => ({ ipBlock: { cidr } })), ports: [{ protocol: "TCP", port: 8787 }] }]);
     expect(pub).toHaveLength(internal.length + 1);
   });
 
+  it("admits the relayfile namespace on :8787 only when the Relayfile add-on is enabled", () => {
+    expect(internal.some((p) => p.metadata.name === "allow-relayfile-to-relayauth")).toBe(false);
+    const withRelayfile = relayauthNetworkPolicies({ publicJwksIngress: false, relayfileConsumer: true }) as Policy[];
+    expect(named(withRelayfile, "allow-relayfile-to-relayauth").spec.ingress).toEqual([
+      { from: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "relayfile" } } }], ports: [{ protocol: "TCP", port: 8787 }] },
+    ]);
+    expect(withRelayfile).toHaveLength(internal.length + 1);
+  });
+
   it("is wired into the stack beside the relayauth namespace", () => {
     const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
-    expect(stack).toContain("relayauthNetworkPolicies({ publicJwksIngress: Boolean(relayauthConfig.baseUrl) })");
+    expect(stack).toContain("relayauthNetworkPolicies({ publicJwksIngress: Boolean(relayauthConfig.baseUrl), relayfileConsumer: Boolean(i.relayfile) })");
   });
 });

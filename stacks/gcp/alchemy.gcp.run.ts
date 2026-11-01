@@ -833,7 +833,7 @@ export default Alchemy.Stack(
             },
           });
           // Default deny plus AlleyOop :8787 in and DNS out (egress.ts).
-          for (const policy of relayauthNetworkPolicies({ publicJwksIngress: Boolean(relayauthConfig.baseUrl) })) {
+          for (const policy of relayauthNetworkPolicies({ publicJwksIngress: Boolean(relayauthConfig.baseUrl), relayfileConsumer: Boolean(i.relayfile) })) {
             yield* Kubernetes.Manifest(`relayauth-netpol-${policy.metadata.name}`, {
               cluster,
               manifest: {

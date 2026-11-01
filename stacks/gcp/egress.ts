@@ -151,11 +151,16 @@ export function bulls96NetworkPolicies(i: Bulls96EgressInputs) {
 /**
  * RelayAuth (namespace relayauth) is self-contained: SQLite on its own PVC, secrets
  * mounted from files, no Google identity, no outbound call. Default deny both ways,
- * DNS out, and :8787 in from the 96Bulls AlleyOop pods only. A public JWKS Ingress
+ * DNS out, and :8787 in from the 96Bulls AlleyOop pods, plus the relayfile namespace
+ * when that add-on is enabled (it verifies tokens against this JWKS). A public JWKS Ingress
  * (relayauth.baseUrl) adds :8787 from the GCE load-balancer ranges, and nothing else.
  * Kubelet probes and port-forwards come from the node and are not subject to it.
  */
-export function relayauthNetworkPolicies(i: { publicJwksIngress: boolean }) {
+export function relayauthNetworkPolicies(i: {
+  publicJwksIngress: boolean;
+  /** The optional Relayfile add-on (namespace relayfile) verifies tokens against this JWKS. */
+  relayfileConsumer: boolean;
+}) {
   const relayauthPods = { matchLabels: { "app.kubernetes.io/instance": "relayauth", "app.kubernetes.io/name": "relayauth" } };
   return [
     np("default-deny", { podSelector: {}, policyTypes: ["Ingress", "Egress"] }, RELAYAUTH_NAMESPACE),
@@ -174,6 +179,19 @@ export function relayauthNetworkPolicies(i: { publicJwksIngress: boolean }) {
       },
       RELAYAUTH_NAMESPACE,
     ),
+    ...(i.relayfileConsumer
+      ? [
+          np(
+            "allow-relayfile-to-relayauth",
+            {
+              podSelector: relayauthPods,
+              policyTypes: ["Ingress"],
+              ingress: [{ from: [{ namespaceSelector: nsSelector("relayfile") }], ports: tcp(8787) }],
+            },
+            RELAYAUTH_NAMESPACE,
+          ),
+        ]
+      : []),
     ...(i.publicJwksIngress
       ? [
           np(

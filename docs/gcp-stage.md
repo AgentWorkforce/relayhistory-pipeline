@@ -99,7 +99,9 @@ are not subject to pod policy.
 The `relayauth` namespace gets the same default deny. RelayAuth is
 self-contained: SQLite on its own PVC, file-mounted secrets, no Google identity
 and no outbound calls. Its only egress is DNS, and its only ingress is `:8787`
-from the 96Bulls AlleyOop pods. When a public JWKS Ingress is configured
+from the 96Bulls AlleyOop pods, plus the `relayfile` namespace when the
+Relayfile add-on is enabled, since it verifies tokens against this JWKS. When a
+public JWKS Ingress is configured
 (`relayauth.baseUrl`), `:8787` is also admitted from the GCE load-balancer and
 health-check ranges (`130.211.0.0/22`, `35.191.0.0/16`), and nothing else. Applying the policy requires `bulls96.relayauthJwksUrl` to be the
 in-cluster RelayAuth service, the only JWKS destination it allows; a public JWKS
