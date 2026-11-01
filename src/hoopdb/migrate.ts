@@ -170,15 +170,19 @@ export function migrationProfile(
       "HOOPDB_FUNCTION_BOUNDARY_APPROVED was renamed HOOPDB_FUNCTION_BOUNDARY_MODE (it selects a catalog-proven control, it is not an approval); remove it",
     );
   const fb = env.HOOPDB_FUNCTION_BOUNDARY_MODE || undefined;
-  if (fb === "event-trigger")
+  if (fb === "event-trigger" && mode !== "supabase")
     throw profileError(
-      "function_boundary_mode_unimplemented",
-      "HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger is not implemented yet (a reviewed trigger, verified by more than its name, is separate work); use global-default-revoke",
+      "function_boundary_mode_unsupported",
+      "HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger is supported only with HOOPDB_DB_MODE=supabase (selfhosted and cloudsql use global-default-revoke)",
     );
-  if (fb !== undefined && fb !== "global-default-revoke")
+  if (
+    fb !== undefined &&
+    fb !== "global-default-revoke" &&
+    fb !== "event-trigger"
+  )
     throw profileError(
       "db_profile_invalid",
-      "HOOPDB_FUNCTION_BOUNDARY_MODE must be global-default-revoke",
+      "HOOPDB_FUNCTION_BOUNDARY_MODE must be global-default-revoke or (supabase only) event-trigger",
     );
   const runtime = {
     runtimeRole,
@@ -356,6 +360,7 @@ export async function runMigrations(
         client,
         profile.functionBoundary,
         profile.mode,
+        profile.runtimeRole,
       );
       if (!evidence.satisfied)
         throw profileError(
@@ -710,7 +715,7 @@ async function cliHistoryPreflight(
 
 function migrationProfileMode(): FunctionBoundaryMode | undefined {
   const v = process.env.HOOPDB_FUNCTION_BOUNDARY_MODE;
-  return v === "global-default-revoke" ? v : undefined;
+  return v === "global-default-revoke" || v === "event-trigger" ? v : undefined;
 }
 
 export async function migrate(): Promise<{ applied: number; skipped: number }> {
@@ -777,7 +782,12 @@ if (import.meta.main) {
     const db = openHoopDb();
     const mode = migrationProfileMode();
     Promise.all([
-      functionBoundaryEvidence(db, mode, dbMode as DbMode | undefined),
+      functionBoundaryEvidence(
+        db,
+        mode,
+        dbMode as DbMode | undefined,
+        process.env.HOOPDB_RUNTIME_ROLE || undefined,
+      ),
       checksumAliasEvidence(db),
     ])
       .then(async ([e, migration_checksum_aliases]) => {
