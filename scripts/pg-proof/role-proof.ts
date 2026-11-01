@@ -32,7 +32,10 @@ import {
   MARKER_PENDING_SQL,
 } from "../../src/hoopdb/migrate.ts";
 import { NON_CREATE_STEPS } from "../../src/hoopdb/migration-sentinels.ts";
-import { sessionsFunctionAcl } from "../../src/hoopdb/migrate-guards.ts";
+import {
+  RUNTIME_APPLICATION_FUNCTIONS,
+  sessionsFunctionAcl,
+} from "../../src/hoopdb/migrate-guards.ts";
 import { gateOpen, workerTick } from "../../src/shared/worker.ts";
 import { hoopdbModeEnv } from "../../stacks/aws/eks.ts";
 import { gcpHoopdbModeEnv } from "../../stacks/gcp/config.ts";
@@ -44,6 +47,21 @@ const SUPER = process.env.PGPROOF_SUPERUSER ?? "postgres";
 const PSQL = process.env.PGPROOF_PSQL ?? "psql";
 const OUT = process.env.PGPROOF_OUT ?? "pg-proof.json";
 const W = "session_directory_search_worker";
+const functionManifestForRuntime = (role: string) => {
+  const base = JSON.parse(
+    readFileSync(join(ROOT, "src/hoopdb/sessions-function-acl.json"), "utf8"),
+  ).functions as Record<string, string[]>;
+  return Object.fromEntries(
+    Object.entries(base).map(([fn, entries]) => [
+      fn,
+      RUNTIME_APPLICATION_FUNCTIONS.includes(
+        fn as (typeof RUNTIME_APPLICATION_FUNCTIONS)[number],
+      )
+        ? [...entries, `${role}:EXECUTE`]
+        : entries,
+    ]),
+  );
+};
 const url = (user: string, db: string) =>
   `postgres://${user}@${HOST}:${PORT}/${db}`;
 const BOOT = join(
@@ -878,14 +896,14 @@ const HOSTILE: Array<[string, string]> = [
   ],
   ["CREATE on schema sessions", "GRANT CREATE ON SCHEMA sessions TO g6_bad"],
   ["CREATE on the database", "GRANT CREATE ON DATABASE g6_rt_db TO g6_bad"],
-  ["existing DML", "GRANT INSERT ON sessions.session_index TO g6_bad"],
+  ["unapproved table privilege", "GRANT TRUNCATE ON sessions.session_index TO g6_bad"],
   [
     "a column privilege",
     "GRANT SELECT (org_id) ON sessions.session_directory TO g6_bad",
   ],
   [
     "unapproved EXECUTE",
-    "GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO g6_bad",
+    "GRANT EXECUTE ON FUNCTION sessions.session_directory_readiness() TO g6_bad",
   ],
   [
     "EXECUTE on a trigger function (no exemption)",
@@ -968,7 +986,7 @@ for (const [name, setup] of HOSTILE)
     },
   );
 await check(
-  "the dedicated runtime role, connected as itself: SELECT only, no DML/DDL/EXECUTE, owns nothing, live gate ok",
+  "the dedicated runtime role gets exact application DML/sequence/RPC access, read-only readiness metadata, no DDL/maintenance/ownership/BYPASSRLS, live gate ok",
   async () => {
     const t = [
       "sessions.__96bulls_migrations",
@@ -996,11 +1014,23 @@ await check(
       "CREATE TABLE sessions.g6_x (x int)",
       "g6_rt",
     );
-    got["EXECUTE upsert_session_index"] = await attempt(
-      "g6_rt_db",
-      "SELECT sessions.upsert_session_index('{}'::jsonb)",
-      "g6_rt",
-    );
+    const acl = (
+      await sql(
+        "g6_rt_db",
+        `SELECT
+           has_table_privilege('g6_rt', 'sessions.pipeline_jobs', 'SELECT, INSERT, UPDATE, DELETE') AS queue_dml,
+           has_table_privilege('g6_rt', 'sessions.claimless_uses', 'UPDATE') AS claimless_update,
+           has_table_privilege('g6_rt', 'sessions.migration_assertion_uses', 'SELECT, INSERT, UPDATE, DELETE') AS assertion_cleanup,
+           has_table_privilege('g6_rt', 'sessions.migration_assertion_chunks', 'SELECT, INSERT, UPDATE, DELETE') AS chunk_cleanup,
+           has_table_privilege('g6_rt', 'sessions.migration_base_read_uses', 'SELECT, INSERT, UPDATE, DELETE') AS base_read_cleanup,
+           has_table_privilege('g6_rt', 'sessions.migration_ingest_audit', 'UPDATE, DELETE') AS audit_mutation,
+           has_table_privilege('g6_rt', 'sessions.pipeline_jobs', 'TRUNCATE') AS queue_truncate,
+           has_sequence_privilege('g6_rt', 'sessions.pipeline_jobs_id_seq', 'USAGE') AS queue_sequence,
+           has_function_privilege('g6_rt', 'sessions.upsert_session_index(jsonb)', 'EXECUTE') AS index_rpc,
+           has_function_privilege('g6_rt', 'sessions.pipeline_events_maintain(interval,integer)', 'EXECUTE') AS maintenance_rpc,
+           has_function_privilege('g6_rt', 'sessions.pipeline_jobs_observability()', 'EXECUTE') AS trigger_execute`,
+      )
+    ).rows[0];
     const role = (
       await sql(
         "g6_rt_db",
@@ -1012,10 +1042,21 @@ await check(
       Object.entries(got).every(([k, c]) =>
         k.endsWith("SELECT") ? c === "ok" : c === "42501",
       ) &&
+      acl.queue_dml === true &&
+      acl.claimless_update === true &&
+      acl.assertion_cleanup === true &&
+      acl.chunk_cleanup === true &&
+      acl.base_read_cleanup === true &&
+      acl.audit_mutation === false &&
+      acl.queue_truncate === false &&
+      acl.queue_sequence === true &&
+      acl.index_rpc === true &&
+      acl.maintenance_rpc === false &&
+      acl.trigger_execute === false &&
       role.rolbypassrls === false &&
       role.owned === 0 &&
       v.ok;
-    return [ok, `${fmt(got)} ${fmt(role)} verdict=${fmt(v)}`];
+    return [ok, `${fmt(got)} acl=${fmt(acl)} ${fmt(role)} verdict=${fmt(v)}`];
   },
 );
 
@@ -1120,9 +1161,7 @@ await check(
 await check(
   "ACL manifest regression: every sessions function's ACL is exactly the committed manifest",
   async () => {
-    const want = JSON.parse(
-      readFileSync(join(ROOT, "src/hoopdb/sessions-function-acl.json"), "utf8"),
-    ).functions;
+    const want = functionManifestForRuntime("g6_rt");
     const h = openHoopDb(url("hoop", "g6_rt_db"));
     try {
       const got = await sessionsFunctionAcl(h);
@@ -1637,9 +1676,7 @@ await check(
   "blast radius: owner functions created later in sessions AND in a second schema are not PUBLIC-executable; intended grants survive the revoke and the next migrate (ACL manifest)",
   async () => {
     await fresh("g6_fb", ["g6_rt2"]);
-    const want = JSON.parse(
-      readFileSync(join(ROOT, "src/hoopdb/sessions-function-acl.json"), "utf8"),
-    ).functions;
+    const want = functionManifestForRuntime("g6_rt2");
     const aclOk = async () => {
       const h = openHoopDb(url("hoop", "g6_fb"));
       try {
@@ -2166,7 +2203,7 @@ await check(
     const direct = (
       await sql(
         "g6_mt",
-        "SELECT EXISTS (SELECT 1 FROM pg_class c, aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE c.oid = 'sessions.session_index'::regclass AND r.rolname = 'g6_rt2') AS d",
+        "SELECT EXISTS (SELECT 1 FROM pg_class c, aclexplode(c.relacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE c.oid = 'sessions.session_index'::regclass AND r.rolname = 'g6_rt2' AND a.privilege_type = 'MAINTAIN') AS d",
       )
     ).rows[0].d;
     await attempt("postgres", "DROP DATABASE IF EXISTS g6_mt WITH (FORCE)");

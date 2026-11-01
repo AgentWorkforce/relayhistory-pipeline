@@ -78,4 +78,31 @@ describe("machine-bound proof assertions", () => {
     expect(calls).toBe(0);
     expect(ctx.machineTokens.size).toBe(0);
   });
+
+  test("reuses only assertions with more than ten seconds left and refreshes both write and read caches", async () => {
+    const ctx = context();
+    let now = 1_000;
+    let calls = 0;
+    ctx.now = () => now;
+    const mint = async (_url: string | URL | Request, init?: RequestInit) => {
+      calls += 1;
+      const body = JSON.parse(String(init?.body)) as { machineId: string };
+      return Response.json(
+        { accessToken: `mint-${calls}-${body.machineId}` },
+        { status: 201 },
+      );
+    };
+    await tokensFor(ctx, "http://127.0.0.1:18787", mint);
+    const firstCalls = calls;
+    const firstTenantTokens = new Map(ctx.tokens);
+    now += 49_000;
+    await tokensFor(ctx, "http://127.0.0.1:18787", mint);
+    expect(calls).toBe(firstCalls);
+    expect(ctx.tokens).toEqual(firstTenantTokens);
+    now += 2_000;
+    await tokensFor(ctx, "http://127.0.0.1:18787", mint);
+    expect(calls).toBe(firstCalls * 2);
+    for (const token of ctx.tokens.values()) expect(token).toStartWith("mint-");
+    expect(ctx.tokens).not.toEqual(firstTenantTokens);
+  });
 });

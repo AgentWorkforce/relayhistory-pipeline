@@ -15,6 +15,11 @@ import {
   functionBoundaryEvidence,
   migrationChecksumAlias,
   migrationChecksumMatches,
+  RUNTIME_APPLICATION_FUNCTIONS,
+  RUNTIME_APPLICATION_POLICY,
+  RUNTIME_APPLICATION_RLS_TABLES,
+  RUNTIME_APPLICATION_SEQUENCES,
+  RUNTIME_APPLICATION_TABLE_PRIVILEGES,
   runtimeRoleViolations,
   sequencePreflight,
   type FunctionBoundaryMode,
@@ -68,7 +73,7 @@ interface Step {
  * selfhosted and cloudsql mode, and may only be unset or "false" in supabase mode.
  * HOOPDB_ROLE_BOOTSTRAP defaults to the shim choice and is likewise refused in supabase
  * mode. HOOPDB_RUNTIME_ROLE (required) names the role the services connect as: it gets
- * SELECT on the ledger and the readiness marker, nothing else.
+ * the exact application ACL in migrate-guards.ts plus read-only ledger/marker access.
  * Resolved before any connection; an invalid profile writes nothing anywhere.
  */
 export type DbMode = "local" | "selfhosted" | "cloudsql" | "supabase";
@@ -373,8 +378,8 @@ export async function runMigrations(
       updated_at timestamptz NOT NULL DEFAULT now()
     )`);
     await client.query(`REVOKE ALL ON ${ROLE_VALIDATION_TABLE} FROM PUBLIC`);
-    // The runtime role reads the ledger and the marker for readiness: USAGE on the schema
-    // (needed to reach them, creates nothing) and SELECT on those two tables, nothing else.
+    // Bootstrap the readiness subset first. After every schema step, hardenAndCheck adds
+    // the immutable application ACL and validates the complete catalog before PASS.
     if (runtime === "dedicated") {
       const grant = await client.query<{ sql: string }>(
         "SELECT format('GRANT USAGE ON SCHEMA sessions TO %I; GRANT SELECT ON %s, %s TO %I', $3::text, $1::text, $2::text, $3::text) AS sql",
@@ -398,6 +403,7 @@ export async function runMigrations(
         "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC",
       );
       if (runtime !== "dedicated") return;
+      await installRuntimeApplicationAcl(client, profile.runtimeRole);
       const violations = await runtimeRoleViolations(
         client,
         runtimeCfg(profile),
@@ -529,6 +535,53 @@ const runtimeCfg = (p: MigrationProfile) => ({
   ...(p.runtimeLogin === undefined ? {} : { login: p.runtimeLogin }),
   ...(p.workloadRole ? { workload: p.workloadRole } : {}),
 });
+
+/**
+ * Install only the immutable trusted-backend ACL. Preflight has already rejected drift.
+ * The policy is all-row by design because workers span tenants; the runtime role is a
+ * service credential, never an end-user identity, and still has no ownership/BYPASSRLS.
+ */
+async function installRuntimeApplicationAcl(
+  client: MigrationClient,
+  role: string,
+): Promise<void> {
+  for (const [relation, privileges] of Object.entries(
+    RUNTIME_APPLICATION_TABLE_PRIVILEGES,
+  )) {
+    const grant = await client.query<{ sql: string }>(
+      "SELECT format('GRANT %s ON TABLE %s TO %I', $1::text, $2::regclass, $3::text) AS sql",
+      [privileges.join(", "), relation, role],
+    );
+    await client.query(grant.rows[0]!.sql);
+  }
+  for (const sequence of RUNTIME_APPLICATION_SEQUENCES) {
+    const grant = await client.query<{ sql: string }>(
+      "SELECT format('GRANT USAGE ON SEQUENCE %s TO %I', $1::regclass, $2::text) AS sql",
+      [sequence, role],
+    );
+    await client.query(grant.rows[0]!.sql);
+  }
+  for (const fn of RUNTIME_APPLICATION_FUNCTIONS) {
+    const grant = await client.query<{ sql: string }>(
+      "SELECT format('GRANT EXECUTE ON FUNCTION %s TO %I', $1::regprocedure, $2::text) AS sql",
+      [fn, role],
+    );
+    await client.query(grant.rows[0]!.sql);
+  }
+  for (const relation of RUNTIME_APPLICATION_RLS_TABLES) {
+    const exists = await client.query<{ present: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM pg_policy
+        WHERE polrelid = $1::regclass AND polname = $2) AS present`,
+      [relation, RUNTIME_APPLICATION_POLICY],
+    );
+    if (exists.rows[0]!.present) continue;
+    const create = await client.query<{ sql: string }>(
+      "SELECT format('CREATE POLICY %I ON %s AS PERMISSIVE FOR ALL TO %I USING (true) WITH CHECK (true)', $1::text, $2::regclass, $3::text) AS sql",
+      [RUNTIME_APPLICATION_POLICY, relation, role],
+    );
+    await client.query(create.rows[0]!.sql);
+  }
+}
 
 async function readLedger(
   client: MigrationClient,
