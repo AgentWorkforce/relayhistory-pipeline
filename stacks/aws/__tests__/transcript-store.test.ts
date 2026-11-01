@@ -411,7 +411,7 @@ describe("transcript store: deploy plan contract", () => {
   const check = (compact: string, full = detailed(compact), record = provenance(compact, full)) =>
     assertTranscriptStorePlanContract(compact, { detailedPlanText: full, provenanceText: record });
 
-  it("accepts only the exact initial, recovery, two-policy remediation, srv-writer addition, and final all-noop phases", () => {
+  it("accepts only the exact initial, recovery, two-policy remediation, srv-writer addition, srv-writer recovery, and final all-noop phases", () => {
     expect(check(plan(Object.fromEntries(resources.map((resource) => [resource, "create"]))))).toBe("initial");
     expect(check(plan({ transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" }))).toBe("principal-propagation recovery");
     expect(check(plan({ "trail-key": "update", "trail-logs": "update" }))).toBe("post-merge policy remediation");
@@ -422,9 +422,44 @@ describe("transcript store: deploy plan contract", () => {
   it("the srv-writer addition is exactly the new user plus the key policy update", () => {
     for (const actions of [
       { "transcript-srv-writer": "create" },
-      { "transcripts-key": "update" },
       { "transcript-srv-writer": "create", "transcripts-key": "update", transcripts: "update" },
       { "transcript-srv-writer": "update", "transcripts-key": "update" },
+    ]) expect(() => check(plan(actions))).toThrow(/action set does not match/);
+  });
+
+  // A detailed plan whose transcripts-key update shows the live policy (-) and the planned policy (+).
+  const keyDiff = (live: string[], planned: string[]) => [
+    "  properties:", "    policy:",
+    ...live.map((sid) => `  -       - Sid: placeholder\n  -         Sid: ${sid}`),
+    ...planned.map((sid) => `  +         Sid: ${sid}`),
+  ].join("\n");
+  const withKeyDiff = (compact: string, diff: string) =>
+    detailed(compact).replace("  [transcripts-key] update", `  [transcripts-key] update\n${diff}`);
+  const LIVE = ["AccountAdministersKey", "WriterEncryptsAndReadsViaS3", "ReaderDecryptsViaS3"];
+  const PLANNED = ["AccountAdministersKey", "WriterEncryptsAndReadsViaS3", "SrvWriterEncryptsAndReadsViaS3", "ReaderDecryptsViaS3"];
+
+  it("srv-writer recovery: accepts a lone transcripts-key update that adds the srv-writer's key statement", () => {
+    const compact = plan({ "transcripts-key": "update" });
+    const full = withKeyDiff(compact, keyDiff(LIVE, PLANNED));
+    expect(check(compact, full, provenance(compact, full))).toBe("srv-writer propagation recovery");
+  });
+
+  it("srv-writer recovery: rejects a key update that does not add exactly the srv-writer statement, and any other single update", () => {
+    const compact = plan({ "transcripts-key": "update" });
+    for (const [diff, why] of [
+      [keyDiff(LIVE, LIVE), /must add exactly one SrvWriterEncryptsAndReadsViaS3/],
+      [keyDiff(PLANNED, PLANNED), /already has SrvWriterEncryptsAndReadsViaS3/],
+      [keyDiff(LIVE, [...PLANNED, "SrvWriterEncryptsAndReadsViaS3"]), /must add exactly one/],
+    ] as const) {
+      const full = withKeyDiff(compact, diff);
+      expect(() => check(compact, full, provenance(compact, full))).toThrow(why);
+    }
+    expect(() => check(compact)).toThrow(/must add exactly one/);
+    for (const resource of resources.filter((r) => r !== "transcripts-key"))
+      expect(() => check(plan({ [resource]: "update" }))).toThrow(/action set does not match/);
+    for (const actions of [
+      { "transcripts-key": "update", "transcript-srv-writer": "update" },
+      { "transcripts-key": "update", transcripts: "update" },
     ]) expect(() => check(plan(actions))).toThrow(/action set does not match/);
   });
 

@@ -166,6 +166,7 @@ export type TranscriptStorePlanPhase =
   | "principal-propagation recovery"
   | "post-merge policy remediation"
   | "srv-writer addition"
+  | "srv-writer propagation recovery"
   | "post-apply";
 
 const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
@@ -176,6 +177,10 @@ const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; ac
   { name: "post-merge policy remediation", actions: { "trail-key": "update", "trail-logs": "update" } },
   // Adding the relayhistory-api live writer to the applied store: the new user, and the key policy that names it.
   { name: "srv-writer addition", actions: { "transcript-srv-writer": "create", "transcripts-key": "update" } },
+  // The srv-writer addition's own recovery: the user was created (now noop, so it exists in state) but
+  // KMS refused the key policy because the new principal had not propagated. Only the key policy update
+  // that adds the srv-writer's statement is accepted (assertSrvWriterRecoveryDiff).
+  { name: "srv-writer propagation recovery", actions: { "transcripts-key": "update" } },
   { name: "post-apply", actions: {} },
 ];
 
@@ -260,9 +265,30 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   );
   if (!phase) {
     const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
-    return refuse(`action set does not match initial, recovery, exact two-policy remediation, srv-writer addition, or post-apply phase: ${changes.join(", ") || "(none)"}`);
+    return refuse(`action set does not match initial, recovery, exact two-policy remediation, srv-writer addition, srv-writer recovery, or post-apply phase: ${changes.join(", ") || "(none)"}`);
   }
+  if (phase.name === "srv-writer propagation recovery") assertSrvWriterRecoveryDiff(capture.detailedPlanText, refuse);
   return phase.name;
+}
+
+const SRV_WRITER_KEY_SID = "SrvWriterEncryptsAndReadsViaS3";
+
+/**
+ * A lone transcripts-key update is the srv-writer recovery only when the detailed plan shows the live
+ * policy without the srv-writer's statement and the planned policy with it. Any other key-policy change
+ * alone stays refused.
+ */
+function assertSrvWriterRecoveryDiff(detailedPlanText: string, refuse: (why: string) => never) {
+  const lines = detailedPlanText.split(/\r?\n/);
+  const start = lines.findIndex((line) => /^\s*\[transcripts-key\]\s+update\s*$/.test(line));
+  if (start < 0) refuse("srv-writer recovery: detailed plan has no transcripts-key update");
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(line));
+  const block = end < 0 ? rest : rest.slice(0, end);
+  const sid = new RegExp(`^\\s*([+-])\\s+Sid:\\s*${SRV_WRITER_KEY_SID}\\s*$`);
+  const marks = block.map((line) => sid.exec(line)?.[1]).filter(Boolean);
+  if (marks.includes("-")) refuse(`srv-writer recovery: the live key policy already has ${SRV_WRITER_KEY_SID}`);
+  if (marks.filter((m) => m === "+").length !== 1) refuse(`srv-writer recovery: the key policy update must add exactly one ${SRV_WRITER_KEY_SID} statement`);
 }
 
 /**
