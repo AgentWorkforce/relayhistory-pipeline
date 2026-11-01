@@ -91,7 +91,16 @@ const sameCondition = (
 export function reconcileConditionalBindings(
   policy: BucketPolicy,
   desired: readonly ConditionalBinding[],
+  /**
+   * Members that must hold no role at all on the bucket, conditional or not:
+   * the retired shared runtime identity. Stripped from every binding, so an
+   * upgrade never depends on the removed IAM.Member edge having revoked itself.
+   */
+  forbidden: readonly string[] = [],
 ): { policy: BucketPolicy; changed: boolean } {
+  for (const f of forbidden)
+    if (!MEMBER.test(f) || desired.some((d) => d.member === f))
+      throw new Error("96bulls: a forbidden bucket member is malformed or also desired. Nothing was changed.");
   for (const d of desired) {
     if (!d.condition.title.startsWith(MANAGED_TITLE_PREFIX))
       throw new Error("96bulls: conditional bucket binding is not in the managed namespace. Nothing was changed.");
@@ -102,7 +111,13 @@ export function reconcileConditionalBindings(
   }
   const kept: BucketPolicyBinding[] = [];
   let changed = false;
-  for (const b of policy.bindings ?? []) {
+  for (const original of policy.bindings ?? []) {
+    let b = original;
+    if ((b.members ?? []).some((m) => forbidden.includes(m))) {
+      b = { ...b, members: (b.members ?? []).filter((m) => !forbidden.includes(m)) };
+      changed = true;
+      if (!b.members!.length) continue;
+    }
     const title = b.condition?.title;
     if (!title?.startsWith(MANAGED_TITLE_PREFIX)) {
       kept.push(b);
@@ -148,6 +163,7 @@ export async function ensureConditionalBucketBindings(
   auth: BucketIamAuth,
   transport: BucketIamFetch = fetch,
   attempts = 5,
+  forbidden: readonly string[] = [],
 ): Promise<{ changed: boolean }> {
   objects(bucket);
   const url = `${STORAGE}/${encodeURIComponent(bucket)}/iam`;
@@ -156,7 +172,7 @@ export async function ensureConditionalBucketBindings(
     const read = await transport(`${url}?optionsRequestedPolicyVersion=3`, { method: "GET", headers });
     if (!read.ok) throw new Error(`96bulls: locker IAM policy read failed with HTTP ${read.status}. Nothing was changed.`);
     const current = (await read.json()) as BucketPolicy;
-    const { policy, changed } = reconcileConditionalBindings(current, desired);
+    const { policy, changed } = reconcileConditionalBindings(current, desired, forbidden);
     if (!changed) return { changed: false };
     const write = await transport(url, { method: "PUT", headers, body: JSON.stringify(policy) });
     if (write.ok) return { changed: true };

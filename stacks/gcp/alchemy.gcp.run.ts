@@ -89,6 +89,8 @@ interface EnsurePrivateCloudSqlInput {
 interface EnsureLockerWriteScopesInput {
   bucket: string;
   bindings: ConditionalBinding[];
+  /** Members stripped from every bucket binding (the retired shared identity). */
+  forbidden: string[];
   authorization: GcpApplyAuthorizationProof;
 }
 
@@ -266,9 +268,14 @@ const EnsureLockerWriteScopes = Alchemy.Action<
     if (live.project !== input.authorization.projectId)
       throw new Error("96bulls: locker write scopes project differs from the resolved GCP project. Nothing was changed.");
     const result = yield* Effect.tryPromise(() =>
-      ensureConditionalBucketBindings(input.bucket, input.bindings, {
-        bearer: Redacted.value(live.accessToken),
-      }),
+      ensureConditionalBucketBindings(
+        input.bucket,
+        input.bindings,
+        { bearer: Redacted.value(live.accessToken) },
+        undefined,
+        undefined,
+        input.forbidden,
+      ),
     );
     return { bucket: input.bucket, changed: result.changed };
   }),
@@ -622,6 +629,8 @@ export default Alchemy.Stack(
           { role: "roles/storage.objectUser", member: `serviceAccount:${alleyoop}`, condition: alleyoopWriteCondition(bucket) },
         ],
       ) as unknown as ConditionalBinding[],
+      // The Cloud SQL proxy identity must hold nothing on the bucket.
+      forbidden: [`serviceAccount:${runtimeEmail}`],
       authorization: applyAuthorization,
     });
     yield* GCP.IAM.Member("runtime-cloudsql", {

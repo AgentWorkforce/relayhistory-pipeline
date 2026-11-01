@@ -94,6 +94,23 @@ describe("reconcileConditionalBindings", () => {
     expect(policy.bindings!.filter((b) => b.condition?.expression === "true")).toEqual([foreign]);
   });
 
+  it("strips a forbidden member from every binding, unconditional or not, and refuses a forbidden desired member", () => {
+    const RUNTIME = "serviceAccount:awf-conformance-runtime@agentrelay-96bulls-soc2-2610.iam.gserviceaccount.com";
+    const legacy = { role: "roles/storage.objectUser", members: [RUNTIME] };
+    const shared = { role: "roles/storage.objectViewer", members: [RUNTIME, WORKER] };
+    const conditioned = { role: "roles/storage.objectAdmin", members: [RUNTIME], condition: { title: "x", expression: "true" } };
+    const { policy, changed } = reconcileConditionalBindings(
+      { version: 3, bindings: [legacy, shared, conditioned] },
+      desired,
+      [RUNTIME],
+    );
+    expect(changed).toBe(true);
+    expect(JSON.stringify(policy.bindings)).not.toContain("awf-conformance-runtime");
+    expect(policy.bindings).toContainEqual({ role: "roles/storage.objectViewer", members: [WORKER] });
+    expect(() => reconcileConditionalBindings({}, desired, [WORKER])).toThrow("also desired");
+    expect(() => reconcileConditionalBindings({}, desired, ["allUsers"])).toThrow("malformed");
+  });
+
   it("refuses anything outside the managed namespace, a non-service-account member, or a non-storage role", () => {
     const base = desired[0]!;
     expect(() => reconcileConditionalBindings({}, [{ ...base, condition: { ...base.condition, title: "x" } }])).toThrow("managed namespace");
@@ -150,5 +167,6 @@ describe("GCP stack identities", () => {
     expect(stack).toContain('GCP.IAM.ServiceAccount("worker-identity"');
     expect(stack).toContain('GCP.IAM.ServiceAccount("alleyoop-identity"');
     expect(stack).toContain('EnsureLockerWriteScopes("locker-write-scopes"');
+    expect(stack).toContain("forbidden: [`serviceAccount:${runtimeEmail}`]");
   });
 });
