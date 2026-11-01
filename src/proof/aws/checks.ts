@@ -15,7 +15,7 @@ import { IngestError, locationOf, mintTenantToken, newUploadState, plantNextRevi
 import { crossTenantHits, refusedAsExpected, scanForCanaries, tenantKey, type ProbeObservation, type Tenant } from "./leak-scan.ts";
 import {
   backupRestoreSteps, cnpgInstancesStep, failoverSteps, failoverVerdict, helmHistoryStep, relaycastProbeSteps, relaycastRestartSteps,
-  relaycastVerdict, restoreCleanupSteps, RESTORE_CLUSTER, rolloutRestartSteps, evaluateBackup, stageDestroyCommandFor, stageDestroyShortFor, teardownResidue, teardownSteps, clusterGone, proofTagFor, sweepTagsFor,
+  relaycastVerdict, restoreCleanupSteps, RESTORE_CLUSTER, rolloutRestartSteps, evaluateBackup, stageDestroyCommandFor, stageDestroyShortFor, teardownResidue, teardownSteps, clusterGone, proofTagFor, sweepTagsFor, withoutExempt,
   teardownVerifySteps, upgradeRollbackSteps, versioningEnabled,
 } from "./lifecycle.ts";
 import { directorySql, indexStateSql, jsonLines, kubectl, lastJson, primaryStep, s3ListStep, searchBatchSql, sqlStep, stageTimesSql, type SearchResultLine, type SearchRow } from "./probes.ts";
@@ -1171,8 +1171,10 @@ const BUCKET_GONE = /\(404\)|Not Found|NoSuchBucket/;
  * `pippen sandbox down aws-proof`), verify absence without a cluster:
  * describe-cluster answers ResourceNotFound, list-clusters does not name it,
  * no resource tagged for the stage remains (a KMS key in PendingDeletion is the
- * expected end state; on the sandbox, nothing tagged pippen:sandbox=true
- * either), and both proof buckets answer 404. A failed or
+ * expected end state; on the sandbox, nothing tagged alchemy::stage=
+ * aws-proof-sandbox or pippen:sandbox=true either, except the exact ARN of
+ * the agent-session role a fresh `pippen sandbox up` made for this run), and
+ * both proof buckets answer 404. A failed or
  * ambiguous call (403, throttling, network) is never "gone".
  */
 export async function postDestroyTeardown(ctx: Ctx): Promise<CheckResult> {
@@ -1183,7 +1185,8 @@ export async function postDestroyTeardown(ctx: Ctx): Promise<CheckResult> {
   const list = ctx.runner.run(aws("post-destroy.list-clusters", ["eks", "list-clusters"]));
   const PROOF_TAG = proofTagFor(c.stage);
   const tagged = ctx.runner.run(aws("post-destroy.tagged", ["resourcegroupstaggingapi", "get-resources", "--tag-filters", `Key=${PROOF_TAG.key},Values=${PROOF_TAG.value}`]));
-  // The Pippen sandbox: nothing the sweeper owns (pippen:sandbox=true) may remain either.
+  // The Pippen sandbox: nothing Alchemy tagged for the stage (alchemy::stage) and nothing
+  // pippen:sandbox=true but the fresh agent-session role (exact ARN) may remain either.
   const swept = sweepTagsFor(c.stage).map((t) => ctx.runner.run(aws(`post-destroy.tagged.${t.key}`, ["resourcegroupstaggingapi", "get-resources", "--tag-filters", `Key=${t.key},Values=${t.value}`])));
   const buckets = [...new Set([c.locker.bucket, targetValuesForStage(c.stage)?.backupBucket ?? PROOF_BACKUP_BUCKET])].map((b) => ({ b, o: ctx.runner.run(aws(`post-destroy.head-bucket.${b}`, ["s3api", "head-bucket", "--bucket", b], [BUCKET_GONE])) }));
   if (dry(ctx)) return r.done("planned", "post-destroy: describe-cluster must answer ResourceNotFound, list-clusters must not name it, no tagged resources, both buckets 404");
@@ -1194,9 +1197,9 @@ export async function postDestroyTeardown(ctx: Ctx): Promise<CheckResult> {
   for (const { b, o } of buckets) if (!(o.record.status === "failed" && o.stderrMatches?.[0] === true)) r.failures.push(o.ok ? `bucket ${b} still exists` : `head-bucket ${b} failed without 404; absence unproven`);
   if (!tagged.ok || swept.some((x) => !x.ok)) r.failures.push("tagged-resource listing failed");
   else {
-    const res = teardownResidue({ clusterGone: true, k8sJson: "{}", namespaceOut: "", taggedJson: tagged.stdout });
+    const res = teardownResidue({ clusterGone: true, k8sJson: "{}", namespaceOut: "", taggedJson: withoutExempt(c.stage, tagged.stdout) });
     // One ARN tagged both ways is one resource.
-    for (const x of swept) for (const t of teardownResidue({ clusterGone: true, k8sJson: "{}", namespaceOut: "", taggedJson: x.stdout }).tagged) if (!res.tagged.includes(t)) res.tagged.push(t);
+    for (const x of swept) for (const t of teardownResidue({ clusterGone: true, k8sJson: "{}", namespaceOut: "", taggedJson: withoutExempt(c.stage, x.stdout) }).tagged) if (!res.tagged.includes(t)) res.tagged.push(t);
     const pending: string[] = [];
     for (const t of res.tagged.filter((x) => x.startsWith("aws arn:aws:kms:"))) {
       const arn = t.slice(4);

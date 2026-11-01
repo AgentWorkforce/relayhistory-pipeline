@@ -42,6 +42,20 @@ export const SANDBOX_REGION = "us-west-2";
 /** `aws sts get-caller-identity` Arn inside the sandbox: the pippen agent-session role, session `agent-<agent>`. */
 export const SANDBOX_CALLER_ROLE = { roleName: "agent-session", sessionName: `agent-${PIPPEN_SANDBOX_AGENT}` } as const;
 export const SANDBOX_CALLER_ARN = `arn:aws:sts::${SANDBOX_ACCOUNT_ID}:assumed-role/${SANDBOX_CALLER_ROLE.roleName}/${SANDBOX_CALLER_ROLE.sessionName}`;
+/**
+ * The one resource `pippen sandbox up` creates in the member account
+ * (pippen-tools src/sandbox/provisioner.ts #up: createRole agent-session, path
+ * /pippen/, inline policy, tagged pippen:sandbox=true + agent + session). It is
+ * the role the post-destroy run's own credentials come from.
+ */
+export const SANDBOX_AGENT_SESSION_ROLE_ARN = `arn:aws:iam::${SANDBOX_ACCOUNT_ID}:role/pippen/${SANDBOX_CALLER_ROLE.roleName}`;
+/**
+ * Post-destroy runs after `pippen sandbox down` deleted the agent-session role
+ * and a fresh `pippen sandbox up` recreated it: same role name in the same
+ * account, a session name that differs per session. Only the role is pinned;
+ * the session name must be a valid STS role-session name.
+ */
+export const SANDBOX_POST_DESTROY_CALLER = new RegExp(`^arn:aws:sts::${SANDBOX_ACCOUNT_ID}:assumed-role/${SANDBOX_CALLER_ROLE.roleName}/[\\w+=,.@-]{2,64}$`);
 
 export type ProofTargetId = "proof" | "pippen-sandbox";
 
@@ -58,10 +72,18 @@ export interface ProofTarget {
   region: string;
   /** When set, `sts get-caller-identity` Arn must equal this exactly before any live step. */
   callerArn?: string;
+  /** When set, post-destroy accepts a caller Arn matching this (a fresh session of the same role) instead of `callerArn`. */
+  postDestroyCaller?: RegExp;
   /** The stage's teardown of its AWS resources; printed, never run by the harness. */
   destroyCommand: string;
   /** Extra tag filters the post-destroy absence check lists (beyond `96bulls:stack=<stage>`). */
   sweepTags: ReadonlyArray<{ key: string; value: string }>;
+  /**
+   * Exact ARNs a post-destroy listing may show that are not leftovers: what a
+   * fresh `pippen sandbox up` creates for the verification run itself. Matched
+   * by exact ARN only, never by tag; anything else listed is residue.
+   */
+  residueExemptArns?: readonly string[];
 }
 
 /** The original target beside aws-sessions-dev. Its behavior is unchanged by the sandbox target. */
@@ -82,8 +104,13 @@ export const PIPPEN_SANDBOX_PROOF_TARGET: ProofTarget = Object.freeze({
   clusterName: SANDBOX_CLUSTER,
   region: SANDBOX_REGION,
   callerArn: SANDBOX_CALLER_ARN,
+  postDestroyCaller: SANDBOX_POST_DESTROY_CALLER,
   destroyCommand: `pippen sandbox down ${PIPPEN_SANDBOX_AGENT}`,
-  sweepTags: Object.freeze([Object.freeze({ key: "pippen:sandbox", value: "true" })]),
+  // Alchemy's own stage tag beside 96bulls:stack, and the sweeper's tag: after the sweep and a
+  // fresh `up`, the only pippen:sandbox=true resource may be the new agent-session role.
+  // Pippen's baseline is tagged pippen:baseline=true, never these, so it is never listed.
+  sweepTags: Object.freeze([Object.freeze({ key: "alchemy::stage", value: SANDBOX_STAGE }), Object.freeze({ key: "pippen:sandbox", value: "true" })]),
+  residueExemptArns: Object.freeze([SANDBOX_AGENT_SESSION_ROLE_ARN]),
 }) as ProofTarget;
 
 export const PROOF_TARGETS: Readonly<Record<ProofTargetId, ProofTarget>> = Object.freeze({ proof: SESSIONS_DEV_PROOF_TARGET, "pippen-sandbox": PIPPEN_SANDBOX_PROOF_TARGET });
@@ -205,9 +232,14 @@ function assertKnownTarget(t: ProofTarget): void {
 }
 
 /** On a target that pins its caller (the Pippen sandbox), the sts Arn must be exactly that role session. */
-function assertCaller(g: { callerArn?: string }, t: ProofTarget): void {
+function assertCaller(g: { callerArn?: string }, t: ProofTarget, postDestroy = false): void {
   if (t.callerArn === undefined) return;
   if (!g.callerArn) throw new GuardError("unverified_identity", "refusing: caller ARN not verified with sts get-caller-identity");
+  if (postDestroy && t.postDestroyCaller) {
+    if (!t.postDestroyCaller.test(g.callerArn))
+      throw new GuardError("wrong_caller", `refusing: caller ${g.callerArn} is not a session of the pippen agent-session role in ${t.accountId}`);
+    return;
+  }
   if (g.callerArn !== t.callerArn)
     throw new GuardError("wrong_caller", `refusing: caller ${g.callerArn} is not the pippen agent-session role ${t.callerArn}`);
 }
@@ -223,6 +255,6 @@ export function assertPostDestroyTarget(g: { confirmLive: boolean; accountId?: s
   if (!g.confirmLive) throw new GuardError("missing_confirm_live", "refusing: live targets need --confirm-live; nothing was run");
   if (!g.accountId) throw new GuardError("unverified_identity", "refusing: caller account not verified with sts get-caller-identity");
   if (g.accountId !== t.accountId) throw new GuardError("wrong_account", `refusing: caller account ${g.accountId} is not the proof account ${t.accountId}`);
-  assertCaller(g, t);
+  assertCaller(g, t, true);
   if (g.clusterName !== t.clusterName) throw new GuardError("wrong_cluster", `refusing: cluster '${g.clusterName}' is not the proof cluster '${t.clusterName}'`);
 }

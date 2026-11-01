@@ -557,11 +557,23 @@ The flow (each live step needs Khaliq's OK; nothing here has been run):
 3. `bin/96bulls up aws-proof-sandbox` under an approval bound to that capture.
 4. The proof: `bun run proof:aws all --target pippen-sandbox --confirm-live`
    (docs/aws-e2e-proof.md).
-5. `pippen sandbox down aws-proof`: deletes everything tagged
-   `pippen:sandbox=true` and verifies zero non-baseline IAM entities. This
-   replaces `bin/96bulls down` as the teardown of record.
-6. The harness's post-destroy absence check against the sandbox
-   (`--target pippen-sandbox --post-destroy`).
+5. `pippen sandbox down aws-proof`, which must report `clean: true`. It
+   deletes everything tagged `pippen:sandbox=true` (the agent-session role
+   included) and verifies zero `pippen:sandbox` resources and zero
+   non-baseline IAM roles. The baseline roles are `pippen-sweeper`,
+   `/aws-service-role/*` and `stacksets-exec-*`. This replaces
+   `bin/96bulls down` as the teardown of record.
+6. `pippen sandbox up aws-proof` for fresh agent-session credentials. It
+   recreates only `arn:aws:iam::361835732085:role/pippen/agent-session`.
+7. The harness's post-destroy absence check against the sandbox
+   (`--target pippen-sandbox --post-destroy`). It accepts any session of the
+   recreated role, lists `96bulls:stack`, `alchemy::stage` and `pippen:sandbox`
+   tagged resources, and exempts only that role's exact ARN. Resources tagged
+   `pippen:baseline=true` are never listed.
+8. `pippen sandbox down aws-proof` again.
+
+The stage's AWS Budget has no tags, so neither the pippen sweep nor the
+harness's tag check sees it.
 
 ### Apply, verify and roll back
 

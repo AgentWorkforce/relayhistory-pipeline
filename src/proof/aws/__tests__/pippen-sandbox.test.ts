@@ -20,7 +20,7 @@ import {
   assertMayRun, assertPostDestroyTarget, assertProofTarget, GuardError, PIPPEN_SANDBOX_PROOF_TARGET, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, PROOF_TARGETS, SANDBOX_ACCOUNT_ID, SANDBOX_CALLER_ARN, SANDBOX_CLUSTER, SANDBOX_STAGE, SESSIONS_DEV_PROOF_TARGET,
   type GuardInput, type ProofTarget,
 } from "../guard.ts";
-import { PROOF_TAG, SANDBOX_DESTROY_COMMAND, STAGE_DESTROY_COMMAND, stageDestroyCommandFor, teardownVerifySteps } from "../lifecycle.ts";
+import { PROOF_TAG, SANDBOX_DESTROY_COMMAND, STAGE_DESTROY_COMMAND, stageDestroyCommandFor, teardownVerifySteps, withoutExempt } from "../lifecycle.ts";
 import { stepFenceIssue } from "../ops.ts";
 import { loadStagePlan, sha256Hex, STAGE_PLAN_FILES, stagePlanFiles } from "../provenance.ts";
 import { admitPrior, buildReport, canonicalReportBytes } from "../report.ts";
@@ -46,7 +46,8 @@ describe("pippen sandbox target: the constants are exact", () => {
     expect(SANDBOX_CONTEXT).toBe("arn:aws:eks:us-west-2:361835732085:cluster/96bulls-aws-proof-sandbox");
     expect(SANDBOX_LOCKER_BUCKET).toBe("96bulls-aws-proof-sandbox-locker-361835732085");
     expect(SANDBOX_BACKUP_BUCKET).toBe("96bulls-aws-proof-sandbox-hoopdb-backups-361835732085");
-    expect(SBX.sweepTags).toEqual([{ key: "pippen:sandbox", value: "true" }]);
+    expect(SBX.sweepTags).toEqual([{ key: "alchemy::stage", value: "aws-proof-sandbox" }, { key: "pippen:sandbox", value: "true" }]);
+    expect(SBX.residueExemptArns).toEqual(["arn:aws:iam::361835732085:role/pippen/agent-session"]);
     expect(Object.isFrozen(SBX) && Object.isFrozen(SESSIONS_DEV_PROOF_TARGET) && Object.isFrozen(PROOF_TARGETS)).toBe(true);
     expect(Object.keys(PROOF_TARGETS).sort()).toEqual(["pippen-sandbox", "proof"]);
   });
@@ -98,6 +99,23 @@ describe("pippen sandbox target: guard", () => {
     const fake = { ...SBX, accountId: "123456789012" } as ProofTarget;
     expect(code(() => assertProofTarget({ ...ok, accountId: "123456789012" }, fake))).toBe("wrong_account");
     expect(code(() => assertPostDestroyTarget({ confirmLive: true, accountId: "123456789012", clusterName: SBX.clusterName }, fake))).toBe("wrong_account");
+  });
+  test("post-destroy accepts a fresh agent-session session (any session name), live steps do not", () => {
+    const fresh = "arn:aws:sts::361835732085:assumed-role/agent-session/pippen-agent-0b7d6c1e";
+    const pd = { confirmLive: true, accountId: SANDBOX_ACCOUNT_ID, clusterName: SANDBOX_CLUSTER };
+    expect(code(() => assertPostDestroyTarget({ ...pd, callerArn: fresh }, SBX))).toBe("allowed");
+    expect(run({ ...ok, callerArn: fresh, postDestroy: true, mutating: false })).toBe("allowed");
+    expect(run({ ...ok, callerArn: fresh })).toBe("wrong_caller");
+    for (const bad of [
+      "arn:aws:sts::361835732085:assumed-role/pippen-sweeper/x1",
+      "arn:aws:sts::361835732085:assumed-role/agent-session-admin/x1",
+      "arn:aws:sts::500268966557:assumed-role/agent-session/x1",
+      "arn:aws:sts::361835732085:assumed-role/agent-session/",
+      "arn:aws:sts::361835732085:assumed-role/agent-session/a/b",
+      "arn:aws:iam::361835732085:role/pippen/agent-session",
+    ])
+      expect(code(() => assertPostDestroyTarget({ ...pd, callerArn: bad }, SBX))).toBe("wrong_caller");
+    expect(code(() => assertPostDestroyTarget({ ...pd, callerArn: undefined }, SBX))).toBe("unverified_identity");
   });
   test("post-destroy: sandbox account + caller + cluster, reads only", () => {
     const pd = { confirmLive: true, accountId: SANDBOX_ACCOUNT_ID, callerArn: SANDBOX_CALLER_ARN, clusterName: SANDBOX_CLUSTER };
@@ -184,6 +202,8 @@ describe("pippen sandbox target: fence", () => {
     expect(stepFenceIssue(["aws", "kms", "describe-key", "--region", "us-west-2", "--key-id", "arn:aws:kms:us-west-2:500268966557:key/abc"], SANDBOX_FENCE)).toBe("arn_outside_fence");
     expect(stepFenceIssue(["aws", "resourcegroupstaggingapi", "get-resources", "--region", "us-west-2", "--tag-filters", "Key=96bulls:stack,Values=aws-proof"], SANDBOX_FENCE)).toBe("aws_operation_not_allowlisted");
     expect(stepFenceIssue(["aws", "resourcegroupstaggingapi", "get-resources", "--region", "us-west-2", "--tag-filters", "Key=pippen:sandbox,Values=false"], SANDBOX_FENCE)).toBe("aws_operation_not_allowlisted");
+    expect(stepFenceIssue(["aws", "resourcegroupstaggingapi", "get-resources", "--region", "us-west-2", "--tag-filters", "Key=alchemy::stage,Values=aws-proof"], SANDBOX_FENCE)).toBe("aws_operation_not_allowlisted");
+    expect(stepFenceIssue(["aws", "resourcegroupstaggingapi", "get-resources", "--region", "us-west-2", "--tag-filters", "Key=alchemy::stage,Values=aws-proof-sandbox"], PROOF_FENCE)).toBe("aws_operation_not_allowlisted");
     expect(stepFenceIssue(["aws", "eks", "list-clusters", "--region", "us-east-1"], SANDBOX_FENCE)).toBe("region_outside_fence");
     expect(stepFenceIssue(["HTTP", "GET", `https://${PROOF_HOST}/healthz`], SANDBOX_FENCE)).toBe("host_outside_fence");
   });
@@ -338,12 +358,18 @@ describe("pippen sandbox target: teardown is the pippen sweep, verified after", 
     expect(SANDBOX_DESTROY_COMMAND.startsWith("pippen sandbox down aws-proof ")).toBe(true);
     expect(teardownVerifySteps(sandboxConfig()).at(-1)!.argv).toContain("Key=96bulls:stack,Values=aws-proof-sandbox");
   });
-  const fake = (o: { tagged?: string; swept?: string } = {}): Spawn => (argv) => {
+  const list = (...arns: Array<string | { arn: string; tags: Record<string, string> }>) =>
+    JSON.stringify({ ResourceTagMappingList: arns.map((a) => (typeof a === "string" ? { ResourceARN: a, Tags: [] } : { ResourceARN: a.arn, Tags: Object.entries(a.tags).map(([Key, Value]) => ({ Key, Value })) })) });
+  const ROLE = "arn:aws:iam::361835732085:role/pippen/agent-session";
+  const queried: string[] = [];
+  const fake = (o: { tagged?: string; swept?: string; alchemy?: string; baseline?: string } = {}): Spawn => (argv) => {
     if (argv[2] === "describe-cluster") return { stdout: "", status: 254, stderr: "An error occurred (ResourceNotFoundException) when calling the DescribeCluster operation: No cluster found" };
     if (argv[2] === "list-clusters") return { stdout: "[]", status: 0 };
     if (argv[1] === "resourcegroupstaggingapi") {
-      const swept = argv.includes("Key=pippen:sandbox,Values=true");
-      return { stdout: (swept ? o.swept : o.tagged) ?? JSON.stringify({ ResourceTagMappingList: [] }), status: 0 };
+      const f = argv[argv.indexOf("--tag-filters") + 1]!;
+      queried.push(f);
+      const by: Record<string, string | undefined> = { "Key=pippen:sandbox,Values=true": o.swept, "Key=alchemy::stage,Values=aws-proof-sandbox": o.alchemy, "Key=96bulls:stack,Values=aws-proof-sandbox": o.tagged, "Key=pippen:baseline,Values=true": o.baseline };
+      return { stdout: by[f] ?? JSON.stringify({ ResourceTagMappingList: [] }), status: 0 };
     }
     if (argv[2] === "head-bucket") return { stdout: "", status: 254, stderr: "An error occurred (404) when calling the HeadBucket operation: Not Found" };
     return { stdout: "", status: 1 };
@@ -360,6 +386,7 @@ describe("pippen sandbox target: teardown is the pippen sweep, verified after", 
     const cmds = res.steps.map((s) => s.command);
     expect(cmds.some((c) => c.includes("Key=96bulls:stack,Values=aws-proof-sandbox"))).toBe(true);
     expect(cmds.some((c) => c.includes("Key=pippen:sandbox,Values=true"))).toBe(true);
+    expect(cmds.some((c) => c.includes("Key=alchemy::stage,Values=aws-proof-sandbox"))).toBe(true);
     expect(cmds.some((c) => c.includes(SANDBOX_LOCKER_BUCKET))).toBe(true);
     expect(cmds.some((c) => c.includes(SANDBOX_BACKUP_BUCKET))).toBe(true);
     expect(cmds.some((c) => c.includes("500268966557"))).toBe(false);
@@ -369,6 +396,43 @@ describe("pippen sandbox target: teardown is the pippen sweep, verified after", 
     const res = await run(fake({ swept: left }));
     expect(res.status).toBe("fail");
     expect(res.failures).toContain("still present after stage destroy: aws arn:aws:ec2:us-west-2:361835732085:volume/vol-1");
+  });
+  test("the fresh agent-session role (exact ARN) is not a leftover", async () => {
+    const res = await run(fake({ swept: list({ arn: ROLE, tags: { "pippen:sandbox": "true", "pippen:agent": "aws-proof", "pippen:session": "s-2" } }) }));
+    expect(res.failures).toEqual([]);
+    expect(res.status).toBe("pass");
+  });
+  test("any second pippen:sandbox resource beside the role still fails, as do look-alike role ARNs", async () => {
+    const vol = "arn:aws:ec2:us-west-2:361835732085:volume/vol-2";
+    const res = await run(fake({ swept: list({ arn: ROLE, tags: { "pippen:sandbox": "true" } }, { arn: vol, tags: { "pippen:sandbox": "true" } }) }));
+    expect(res.status).toBe("fail");
+    expect(res.failures).toEqual([`still present after stage destroy: aws ${vol}`]);
+    for (const lookalike of ["arn:aws:iam::361835732085:role/agent-session", "arn:aws:iam::361835732085:role/pippen/agent-session-2", "arn:aws:iam::500268966557:role/pippen/agent-session"]) {
+      const r2 = await run(fake({ swept: list(lookalike) }));
+      expect(r2.failures).toEqual([`still present after stage destroy: aws ${lookalike}`]);
+    }
+    // Exempt only by ARN, never by tag: a pippen:baseline tag on a stage-tagged leftover does not excuse it.
+    const kms = "arn:aws:s3:::96bulls-aws-proof-sandbox-trail-361835732085";
+    expect((await run(fake({ tagged: list({ arn: kms, tags: { "pippen:baseline": "true" } }) }))).status).toBe("fail");
+  });
+  test("an alchemy::stage-tagged leftover fails; the 96bulls:stack listing never exempts more than the role", async () => {
+    const sg = "arn:aws:ec2:us-west-2:361835732085:security-group/sg-1";
+    expect((await run(fake({ alchemy: list(sg) }))).failures).toEqual([`still present after stage destroy: aws ${sg}`]);
+    expect((await run(fake({ tagged: list(sg) }))).failures).toEqual([`still present after stage destroy: aws ${sg}`]);
+  });
+  test("Pippen's baseline (pippen:baseline=true) is never queried, so it cannot trip the check", async () => {
+    queried.length = 0;
+    const res = await run(fake({ baseline: list({ arn: "arn:aws:iam::361835732085:policy/pippen-agent-session-boundary", tags: { "pippen:baseline": "true" } }, { arn: "arn:aws:iam::361835732085:role/pippen/pippen-sweeper", tags: { "pippen:baseline": "true" } }) }));
+    expect(res.status).toBe("pass");
+    expect(queried.sort()).toEqual(["Key=96bulls:stack,Values=aws-proof-sandbox", "Key=alchemy::stage,Values=aws-proof-sandbox", "Key=pippen:sandbox,Values=true"]);
+  });
+  test("post-destroy runs with a fresh session of the recreated role", async () => {
+    const res = await run(fake(), { confirmLive: true, accountId: SANDBOX_ACCOUNT_ID, callerArn: "arn:aws:sts::361835732085:assumed-role/agent-session/pippen-agent-9f1e", clusterName: SANDBOX_CLUSTER, kubeContext: SANDBOX_CONTEXT, postDestroy: true });
+    expect(res.status).toBe("pass");
+  });
+  test("withoutExempt leaves the sessions-dev listing byte-for-byte unchanged", () => {
+    const raw = list("arn:aws:iam::500268966557:role/pippen/agent-session") + " ";
+    expect(withoutExempt(PROOF_STAGE, raw)).toBe(raw);
   });
   test("one ARN tagged both ways is reported once", async () => {
     const left = JSON.stringify({ ResourceTagMappingList: [{ ResourceARN: "arn:aws:s3:::x" }] });

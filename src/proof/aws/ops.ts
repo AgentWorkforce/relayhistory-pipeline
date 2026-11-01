@@ -380,7 +380,7 @@ function admitAws(argv: readonly string[], f: Fence, ph: boolean): Admission {
   if (svc === "eks" && cmd === "list-clusters") return read("eks list-clusters");
   if (svc === "eks" && cmd === "describe-cluster" && opt("name") === pt.clusterName) return read("eks describe-cluster");
   if (svc === "resourcegroupstaggingapi" && cmd === "get-resources" && opt("tag-filters") === `Key=96bulls:stack,Values=${pt.stage}`) return read("tagged resources");
-  // The Pippen sweeper's tag (pippen:sandbox=true), on the sandbox target only.
+  // The target's extra tags (alchemy::stage=aws-proof-sandbox, pippen:sandbox=true), on the sandbox target only.
   if (svc === "resourcegroupstaggingapi" && cmd === "get-resources" && pt.sweepTags.some((x) => opt("tag-filters") === `Key=${x.key},Values=${x.value}`)) return read("sweeper-tagged resources");
   return refuse("aws_operation_not_allowlisted");
 }

@@ -296,6 +296,23 @@ export const proofTagFor = (stage: string) => (stage === PROOF_STAGE ? PROOF_TAG
 export const sweepTagsFor = (stage: string) => proofTargetForStage(stage)?.sweepTags ?? [];
 
 /**
+ * Drop the target's exact exempt ARNs (the fresh agent-session role) from a
+ * tagged-resource listing. A target without exemptions (aws-proof) gets its
+ * listing back unchanged, byte for byte.
+ */
+export function withoutExempt(stage: string, taggedJson: string): string {
+  const ex = proofTargetForStage(stage)?.residueExemptArns;
+  if (!ex?.length) return taggedJson;
+  let parsed: { ResourceTagMappingList?: Array<{ ResourceARN: string; Tags?: Array<{ Key: string; Value: string }> }> };
+  try {
+    parsed = JSON.parse(taggedJson);
+  } catch {
+    return taggedJson; // unreadable stays unreadable: teardownResidue reports it
+  }
+  return JSON.stringify({ ...parsed, ResourceTagMappingList: (parsed.ResourceTagMappingList ?? []).filter((r) => !ex.includes(r.ResourceARN)) });
+}
+
+/**
  * Teardown removes only what the proof created inside the proof cluster and
  * the proof-tagged AWS resources. The cluster itself and its account baseline
  * are torn down by `96bulls down aws-proof` (Alchemy), which is a separate,

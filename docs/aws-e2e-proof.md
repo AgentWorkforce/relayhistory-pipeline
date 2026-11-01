@@ -34,7 +34,7 @@ the environment can add a third target or widen either one.
 | Account | `500268966557` (beside aws-sessions-dev) | `361835732085` (Sandbox OU, 96Bulls org) |
 | Region | `us-west-2` | `us-west-2` |
 | Stage / cluster | `aws-proof` / `96bulls-aws-proof` | `aws-proof-sandbox` / `96bulls-aws-proof-sandbox` |
-| Caller | any principal in the account | exactly `arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof` |
+| Caller | any principal in the account | exactly `arn:aws:sts::361835732085:assumed-role/agent-session/agent-aws-proof`; post-destroy: any session of the recreated `agent-session` role in `361835732085` |
 | Host | `proof-sessions.agentrelay.com` | `proof-sandbox-sessions.agentrelay.com` |
 | Buckets | `96bulls-aws-proof-{locker,hoopdb-backups}-500268966557` | `96bulls-aws-proof-sandbox-{locker,hoopdb-backups}-361835732085` |
 | Stage plan | `docs/plans/aws-proof.*` | `docs/plans/aws-proof-sandbox.*`, must carry `pippenSandbox`, never `accountShared` |
@@ -61,14 +61,31 @@ The flow (each live step needs Khaliq's OK; none has been run):
 3. `bin/96bulls up aws-proof-sandbox` under the approval bound to it.
 4. `bun run proof:aws all --target pippen-sandbox --confirm-live`. The
    teardown check removes the in-cluster proof objects and reports `blocked`.
-5. `pippen sandbox down aws-proof`. It deletes everything tagged
-   `pippen:sandbox=true` and verifies zero non-baseline IAM entities. The
-   harness never runs it.
-6. `bun run proof:aws:teardown --target pippen-sandbox --post-destroy
-   --confirm-live --prior-report .96bulls/aws-proof-sandbox/<run id>/report.json`,
-   with agent-session credentials for the sandbox. Besides the checks in
-   [teardown](#11-teardown), it lists `pippen:sandbox=true` resources and
-   requires none, so anything the sweep missed fails the check.
+5. `pippen sandbox down aws-proof`, which must report `clean: true`. It
+   deletes everything tagged `pippen:sandbox=true`, the agent-session role
+   included, then verifies zero `pippen:sandbox` resources and zero
+   non-baseline IAM roles. The harness never runs it.
+6. `pippen sandbox up aws-proof` again, for fresh agent-session credentials.
+   The sweep deleted the old role, so the old session cannot verify anything.
+   `up` creates exactly one resource in the account: the role
+   `arn:aws:iam::361835732085:role/pippen/agent-session`, tagged
+   `pippen:sandbox=true` (pippen-tools `src/sandbox/provisioner.ts`).
+7. `bun run proof:aws:teardown --target pippen-sandbox --post-destroy
+   --confirm-live --prior-report .96bulls/aws-proof-sandbox/<run id>/report.json`
+   with those credentials. Post-destroy accepts any session of the
+   `agent-session` role in `361835732085`, because the session name differs
+   per session; live steps still need the pinned caller above. Besides the
+   checks in [teardown](#11-teardown), it lists resources tagged
+   `96bulls:stack=aws-proof-sandbox`, `alchemy::stage=aws-proof-sandbox` and
+   `pippen:sandbox=true`, and requires none. The one exception is the exact
+   ARN of the fresh agent-session role; exemptions match by exact ARN, never
+   by tag. A second `pippen:sandbox` resource, a look-alike role ARN or any
+   stage-tagged leftover fails the check. Pippen's baseline (StackSet
+   resources such as the `pippen-agent-session-boundary` policy, tagged
+   `pippen:baseline=true`) carries none of the queried tags, so it is never
+   listed.
+8. `pippen sandbox down aws-proof` once more, to remove the verification
+   session's role.
 
 ## Safety model
 
@@ -682,8 +699,10 @@ The teardown runs in two phases:
      No resource tagged `96bulls:stack=aws-proof` may remain; a KMS key in
      `PendingDeletion` is the expected end state. Both proof buckets must
      answer `head-bucket` 404. On the sandbox target the stage tag is
-     `96bulls:stack=aws-proof-sandbox`, and no resource tagged
-     `pippen:sandbox=true` may remain either.
+     `96bulls:stack=aws-proof-sandbox`, and nothing tagged
+     `alchemy::stage=aws-proof-sandbox` or `pippen:sandbox=true` may remain
+     either, except the exact ARN of the agent-session role that the fresh
+     `pippen sandbox up` created (see [Pippen sandbox target](#pippen-sandbox-target)).
    - **What counts as gone.** Only the matching error class counts. The
      harness reads stderr only for that match and never keeps it. AccessDenied,
      a 403 or a network error is "absence unproven", never gone. The check passes only if `aws eks list-clusters` no longer
@@ -752,9 +771,9 @@ teardown run, produces one report whose verdict covers both.
 - Putting the RelayAuth bootstrap key and the transcript backend credentials
   into 1Password, and piping them into the environment.
 - `bin/96bulls down aws-proof`.
-- For the Pippen sandbox target: `pippen sandbox up aws-proof`,
+- For the Pippen sandbox target: `pippen sandbox up aws-proof` (both times),
   `bin/96bulls up aws-proof-sandbox`, the ECR repository policy that lets
-  `361835732085` pull the services image, and `pippen sandbox down aws-proof`.
+  `361835732085` pull the services image, and both `pippen sandbox down aws-proof`.
 
 ## Report
 
@@ -835,11 +854,13 @@ shows that the check distinguishes tag references from pinned digests.
   (`src/alleyoop/manifests.ts`) appears to rebuild chunk keys without the key
   prefix. With `PIPELINE_ORG_FROM_PREFIX`, a prefixed manifest then fails with
   409 `chunks_unverified`. #75 needs to cover this before planting can pass.
-- **Pippen sandbox sweep coverage.** The post-destroy check sees what the
-  Resource Groups Tagging API lists. Untaggable or untagged leftovers (for
-  example the stage's AWS Budget, which the stack declares without tags) are
-  not seen by it; the zero-non-baseline-IAM check is `pippen sandbox down`'s,
-  not the harness's. `proof-sandbox-sessions.agentrelay.com` and its ACM
+- **Pippen sandbox sweep coverage.** The post-destroy check sees only what the
+  Resource Groups Tagging API lists. The stage's AWS Budget is declared
+  without tags, so it is outside the tag check (and outside the pippen tag
+  sweep). IAM is covered by `pippen sandbox down`'s own check: zero
+  non-baseline roles, where the baseline is `pippen-sweeper` (path `/pippen/`),
+  `/aws-service-role/*` and `stacksets-exec-*`. The harness does not repeat
+  that check. `proof-sandbox-sessions.agentrelay.com` and its ACM
   certificate must exist before the ingress probes can run there.
 - **The `eks.harness` output shape** is the harness's expectation of #75. Any
   difference refuses the run.
