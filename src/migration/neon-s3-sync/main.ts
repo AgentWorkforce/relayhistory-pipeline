@@ -37,7 +37,23 @@ import { SyncState } from "./state.ts";
 import { DEFAULT_SYNC_CONFIG, Syncer, errorCode } from "./sync.ts";
 import { Throttle, parseWindows } from "./throttle.ts";
 
-const env = (k: string, d?: string) => process.env[k]?.trim() || d;
+/**
+ * Optional non-secret tuning file (`S3X_TUNING_FILE`, JSON of S3X_* names to
+ * values), read at each start, so a restart under the runner can change rates
+ * or lanes without re-reading credentials. Only rate, lane and window keys.
+ */
+const TUNABLE = new Set(["S3X_LANES", "S3X_ROWS_PER_SEC", "S3X_BYTES_PER_SEC", "S3X_SLOW_WINDOWS", "S3X_SLOW_FACTOR"]);
+const tuning: Record<string, string> = (() => {
+  const file = process.env.S3X_TUNING_FILE?.trim();
+  if (!file) return {};
+  try {
+    const t = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(t).filter(([k]) => TUNABLE.has(k)).map(([k, v]) => [k, String(v)]));
+  } catch {
+    return {};
+  }
+})();
+const env = (k: string, d?: string) => tuning[k]?.trim() || process.env[k]?.trim() || d;
 const flag = (name: string) => process.argv.includes(`--${name}`);
 const arg = (name: string) => process.argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
 
@@ -179,7 +195,7 @@ export async function main() {
   if (/-pooler\./.test(new URL(url).hostname))
     throw new Error("use a direct (unpooled) Neon URL: session settings must not leak through a pooler");
   const lanes = Number(env("S3X_LANES", "2"));
-  if (!Number.isInteger(lanes) || lanes < 1 || lanes > 4) throw new Error("S3X_LANES must be 1-4");
+  if (!Number.isInteger(lanes) || lanes < 1 || lanes > 8) throw new Error("S3X_LANES must be 1-8");
   const { default: pg } = await import("pg");
   const clients = Array.from({ length: lanes }, () => new pg.Client({ connectionString: url, application_name: "96bulls-neon-s3-sync" }));
   for (const c of clients) await c.connect();
