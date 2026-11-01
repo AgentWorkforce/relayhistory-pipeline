@@ -5,7 +5,7 @@ AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_
 Loading stack state
 Computing plan
 Plan ready (2.7s)
-Plan: 2 to update
+Plan: no changes
 
 [access-logs] noop
 
@@ -13,123 +13,11 @@ Plan: 2 to update
 
 [trail] noop
 
-[trail-key] update
-  properties:
-    deletionWindow: 30 days
-    description: "96bulls aws-sessions-prod: CloudTrail log files"
-    enableKeyRotation: true
-  -   policy: '{"Version":"2012-10-17","Statement":[{"Sid":"AccountAdministersKey","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::941433935742:root"},"Action":["kms:Create*","kms:Describe*","kms:Enable*","kms:List*","kms:Put*","kms:Update*","kms:Revoke*","kms:Disable*","kms:Get*","kms:Delete*","kms:TagResource","kms:UntagResource","kms:ScheduleKeyDeletion","kms:CancelKeyDeletion","kms:RotateKeyOnDemand"],"Resource":"*"},{"Sid":"CloudTrailEncryptsLogs","Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":["kms:GenerateDataKey*"],"Resource":"*","Condition":{"StringEquals":{"aws:SourceArn":"arn:aws:cloudtrail:us-east-1:941433935742:trail/96bulls-aws-sessions-prod-trail"},"StringLike":{"kms:EncryptionContext:aws:cloudtrail:arn":"arn:aws:cloudtrail:*:941433935742:trail/*"}}},{"Sid":"CloudTrailDescribesKey","Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":["kms:DescribeKey"],"Resource":"*","Condition":{"StringEquals":{"aws:SourceArn":"arn:aws:cloudtrail:us-east-1:941433935742:trail/96bulls-aws-sessions-prod-trail"}}},{"Sid":"AccountReadsLogs","Effect":"Allow","Principal":{"AWS":"*"},"Action":["kms:Decrypt","kms:ReEncryptFrom"],"Resource":"*","Condition":{"StringEquals":{"kms:CallerAccount":"941433935742"},"StringLike":{"kms:EncryptionContext:aws:cloudtrail:arn":"arn:aws:cloudtrail:*:941433935742:trail/*"}}}]}'
-  +   policy: '{"Version":"2012-10-17","Statement":[{"Sid":"AccountAdministersKey","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::941433935742:root"},"Action":["kms:Create*","kms:Describe*","kms:Enable*","kms:List*","kms:Put*","kms:Update*","kms:Revoke*","kms:Disable*","kms:Get*","kms:Delete*","kms:TagResource","kms:UntagResource","kms:ScheduleKeyDeletion","kms:CancelKeyDeletion","kms:RotateKeyOnDemand"],"Resource":"*"},{"Sid":"CloudTrailEncryptsLogs","Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":["kms:GenerateDataKey*"],"Resource":"*","Condition":{"StringEquals":{"aws:SourceArn":"arn:aws:cloudtrail:us-east-1:941433935742:trail/96bulls-aws-sessions-prod-trail"},"StringLike":{"kms:EncryptionContext:aws:cloudtrail:arn":"arn:aws:cloudtrail:*:941433935742:trail/*"}}},{"Sid":"CloudTrailDescribesKey","Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":["kms:DescribeKey"],"Resource":"*","Condition":{"StringEquals":{"aws:SourceArn":"arn:aws:cloudtrail:us-east-1:941433935742:trail/96bulls-aws-sessions-prod-trail"}}}]}'
-    tags:
-      96bulls:component: cloudtrail
-      96bulls:repo: AgentWorkforce/96BullSessions
-      96bulls:stack: aws-sessions-prod
+[trail-key] noop
 
 [trail-key-alias] noop
 
-[trail-logs] update
-  properties:
-    bucketName: 96bulls-aws-sessions-prod-trail-941433935742
-    encryption:
-      blockedEncryptionTypes:
-        - SSE-C
-      bucketKeyEnabled: true
-      kmsMasterKeyId: arn:aws:kms:us-east-1:941433935742:key/196153b0-502f-40a0-a805-6edba0337b09
-      sseAlgorithm: aws:kms
-    lifecycleRules:
-      - Expiration:
-          Days: 365
-        Filter:
-          Prefix: ""
-        ID: expire-trail-logs
-        Status: Enabled
-      - Filter:
-          Prefix: ""
-        ID: expire-noncurrent-versions
-        NoncurrentVersionExpiration:
-          NoncurrentDays: 30
-        Status: Enabled
-      - AbortIncompleteMultipartUpload:
-          DaysAfterInitiation: 7
-        Filter:
-          Prefix: ""
-        ID: abort-incomplete-uploads
-        Status: Enabled
-    objectOwnership: BucketOwnerEnforced
-  -   policy:
-  -     - Action:
-  -         - s3:*
-  -       Condition:
-  -         Bool:
-  -           aws:SecureTransport: "false"
-  -       Effect: Deny
-  -       Principal: "*"
-  -       Resource:
-  -         - arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742
-  -         - arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742/*
-  -       Sid: DenyInsecureTransport
-  -     - Action:
-  -         - s3:GetBucketAcl
-  -       Effect: Allow
-  -       Principal:
-  -         Service: cloudtrail.amazonaws.com
-  -       Resource: arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742
-  -       Sid: AWSCloudTrailAclCheck
-  -     - Action:
-  -         - s3:PutObject
-  -       Condition:
-  -         StringEquals:
-  -           s3:x-amz-acl: bucket-owner-full-control
-  -       Effect: Allow
-  -       Principal:
-  -         Service: cloudtrail.amazonaws.com
-  -       Resource: arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742/AWSLogs/941433935742/*
-  -       Sid: AWSCloudTrailWrite
-  +   policy:
-  +     - Action:
-  +         - s3:*
-  +       Condition:
-  +         Bool:
-  +           aws:SecureTransport: "false"
-  +       Effect: Deny
-  +       Principal: "*"
-  +       Resource:
-  +         - arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742
-  +         - arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742/*
-  +       Sid: DenyInsecureTransport
-  +     - Action:
-  +         - s3:GetBucketAcl
-  +       Condition:
-  +         StringEquals:
-  +           aws:SourceAccount: "941433935742"
-  +           aws:SourceArn: arn:aws:cloudtrail:us-east-1:941433935742:trail/96bulls-aws-sessions-prod-trail
-  +       Effect: Allow
-  +       Principal:
-  +         Service: cloudtrail.amazonaws.com
-  +       Resource: arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742
-  +       Sid: AWSCloudTrailAclCheck
-  +     - Action:
-  +         - s3:PutObject
-  +       Condition:
-  +         StringEquals:
-  +           aws:SourceAccount: "941433935742"
-  +           aws:SourceArn: arn:aws:cloudtrail:us-east-1:941433935742:trail/96bulls-aws-sessions-prod-trail
-  +           s3:x-amz-acl: bucket-owner-full-control
-  +       Effect: Allow
-  +       Principal:
-  +         Service: cloudtrail.amazonaws.com
-  +       Resource: arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742/AWSLogs/941433935742/*
-  +       Sid: AWSCloudTrailWrite
-    publicAccessBlock:
-      blockPublicAcls: true
-      blockPublicPolicy: true
-      ignorePublicAcls: true
-      restrictPublicBuckets: true
-    tags:
-      96bulls:component: cloudtrail
-      96bulls:repo: AgentWorkforce/96BullSessions
-      96bulls:stack: aws-sessions-prod
-    versioning: Enabled
+[trail-logs] noop
 
 [transcript-eraser] noop
 

@@ -236,22 +236,20 @@ to see the bucket policy refuse `aws:kms` without this key id (explicitDeny).
   propagated yet; the trail-ordering delay was not long enough.
 - **Recovery:** a fresh capture showed 3 creates, with the 9 existing resources unchanged (noop) and
   nothing updated or replaced. The second apply created the remaining 3.
-- **Current evidence gap:** no final post-apply all-`noop` capture is committed. Do not call the
-  rollout complete until a fresh read-only capture shows exactly the 12 expected resources as `noop`
-  and the resulting provenance is committed. The historical recovery capture is evidence of what the
-  second apply intended, not evidence of its final state.
-- **Post-merge hardening is not yet live:** the remediation that added exact CloudTrail
-  `SourceArn`/`SourceAccount` conditions and removed account-wide trail-key decrypt is code-only at
-  the time of this record; no plan or apply was run for it. The historical capture cannot authorize
-  another deploy (it predates the required `partition: "aws"` input and these policy declarations).
-  Capture the new plan and inspect both files: it must contain exactly `trail-key update` and
-  `trail-logs update`, with the other ten resources `noop`; provenance must hash those exact compact
-  and detailed files. Run the normal guarded Alchemy deploy for that reviewed capture. If an emergency
-  direct AWS policy repair has already changed the live policies, the Alchemy deploy is still required:
-  a direct AWS repair does **not** rewrite Alchemy's persisted `oldProps`, so it does not rebaseline the
-  stack state. The guarded reconciliation is what converges the live declarations and persisted state.
-  After it succeeds, immediately make and commit a fresh read-only capture that contains exactly all
-  12 resources as `noop`. Until that final capture exists, the remediation is not complete.
+- **Post-merge hardening applied:** merged source `681c302b0e54f5aca1ccd564fb8ae851508cc95a`
+  produced exactly `trail-key update`, `trail-logs update` and ten `noop` actions. The reviewed
+  capture is preserved by commit `20f8ac676d4950d82311c5aa4952ea012d0d4493`; its compact and
+  detailed plan hashes are `57e939bd82de5b01f1cee8c79edb7f6daf98b5f726c9ec57e8d9b8532862d82a`
+  and `bbef78b16f47d1f0792f8c5d3d2fcac2af7d754ec6e1a2ce2503e8e318966fde`.
+  The guarded deploy recomputed that exact action set, updated only those two resources, and converged
+  Alchemy's persisted properties. Live read-back showed exact trail `SourceArn` and `SourceAccount`
+  conditions on both CloudTrail bucket grants and no KMS decrypt/re-encrypt statement (no audit role
+  is configured). CloudTrail log and digest delivery remained healthy with no reported error.
+- **Final no-op proof:** the immediate version-pinned capture at source
+  `20f8ac676d4950d82311c5aa4952ea012d0d4493` shows all 12 expected resources exactly once as `noop`
+  (`Plan: no changes`). Its compact and detailed plan hashes are
+  `f1e9b424b025bc0f65e94b33458dcde02f7abcf7e00135da4145d79238c66e64` and
+  `0ae5e1b5f8a137a76c8c867485bbbeb7a4bf2cadaabcad68012f3b6401396cb1`.
 - **Next time:** if this happens on a new stage, wait a minute, re-capture and re-apply. Nothing
   partial needs cleaning up.
 - **Account-level S3 Block Public Access:** set separately on 2026-10-31 with
