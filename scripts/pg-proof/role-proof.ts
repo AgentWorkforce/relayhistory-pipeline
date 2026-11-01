@@ -1828,9 +1828,14 @@ for (const [name, env] of [
   ],
   [
     "GCP fixture env (gcpHoopdbModeEnv)",
-    Object.fromEntries(
-      gcpHoopdbModeEnv("g6_rt2", true).map((e) => [e.name, e.value]),
-    ),
+    {
+      ...Object.fromEntries(
+        gcpHoopdbModeEnv("g6_rt2", true).map((e) => [e.name, e.value]),
+      ),
+      // The GCP stack delegates this setting to the Helm migrations value.
+      // This proof invokes the migrator directly, so model the chart-owned env.
+      HOOPDB_SUPABASE_SHIM: "true",
+    },
   ],
 ] as const)
   await check(
