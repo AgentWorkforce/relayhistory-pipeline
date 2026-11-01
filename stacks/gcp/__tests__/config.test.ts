@@ -14,11 +14,13 @@ import {
   gcpResourceName,
   pubsubServiceAgent,
   relayauthChartValues,
+  RELAYAUTH_PUBLISHED_CHART,
   RELAYCAST_PUBLISHED_CHART,
   relaycastChartValues,
   relayfileChartValues,
   relayflowsChartValues,
   requestedAlchemyCommand,
+  captureRelayauthChartPackage,
   captureRelaycastChartPackage,
   type GcpInputs,
 } from "../config.ts";
@@ -39,9 +41,18 @@ describe("GCP self-host contract", () => {
   it("pins the reviewed multi-architecture services image for the GCP proof", () => {
     expect(versionsLock.images.services).toMatchObject({
       ref: "us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services",
-      digest: "sha256:8d77de9be0b5e5e47dda75986da882e577aafb9e28e510c844e8134fea372425",
-      sourceRevision: "09293c8d649f912aa2f4414e31a3ad7fca6eceee",
+      digest: "sha256:65fda21217fe515add544bba322991170b2d6a7483996b41c1d45ec652c3e142",
+      sourceRevision: "3b6001925ef2d8caf5190063e101e2ebf258e902",
       gcpProofEligible: true,
+    });
+    expect(versionsLock.images.relayauth).toMatchObject({
+      ref: "ghcr.io/agentworkforce/relayauth",
+      digest: "sha256:c23c92d25fdffef3b5838a1eef4c226925f859706365d9ccece229795b877288",
+      sourceRevision: "784582ef983bb72b13b43512d9a4142ef5dfabb2",
+    });
+    expect(versionsLock.charts.relayauth).toMatchObject({
+      version: "0.1.1",
+      packageDigest: "sha256:add6f2b3fe55a301a99b0ab43ad28a84c79767793ae7d66a38281f9d61669121",
     });
   });
 
@@ -213,7 +224,7 @@ describe("GCP self-host contract", () => {
       assertGcpInputs("gcp-dev", {
         ...base,
         managedDataPlane: { provision: true, acknowledgement: "adapter-proof-only" },
-        relayauth: { chartVersion: "0.1.0", existingSecretName: "relayauth-runtime", baseUrl: "https://auth.example.com" },
+        relayauth: { chartVersion: "0.1.1", existingSecretName: "relayauth-runtime", baseUrl: "https://auth.example.com" },
         bulls96,
       }),
     ).toThrow("must match relayauth.baseUrl");
@@ -498,6 +509,64 @@ describe("GCP self-host contract", () => {
     ).toThrow(/published 0\.1\.0/);
   });
 
+  it("rejects an unpublished RelayAuth chart or repository and pins its reviewed image", () => {
+    const relayauth = {
+      chartVersion: "0.1.1",
+      existingSecretName: "relayauth-runtime",
+    };
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        relayauth: { ...relayauth, chartVersion: "0.1.0" },
+      }),
+    ).toThrow(/published chart 0\.1\.1/);
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        chartRepo: "https://example.com/charts",
+        relayauth,
+      }),
+    ).toThrow(/published chart 0\.1\.1/);
+    expect(() => relayauthChartValues({ ...relayauth, chartVersion: "0.1.0" })).toThrow(
+      /published 0\.1\.1 machine-bound contract/,
+    );
+    expect(() =>
+      assertGcpInputs(
+        "gcp-dev",
+        { ...base, relayauth: { ...relayauth, chartVersion: "0.1.0" } },
+        "destroy",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      relayauthChartValues(
+        { ...relayauth, chartVersion: "0.1.0" },
+        "standard-rwo",
+        "destroy",
+      ),
+    ).not.toThrow();
+    expect(relayauthChartValues(relayauth).image).toEqual({
+      repository: RELAYAUTH_PUBLISHED_CHART.repository,
+      digest: RELAYAUTH_PUBLISHED_CHART.imageDigest,
+    });
+  });
+
+  it("captures RelayAuth chart bytes before providers and renders only the verified local chart", () => {
+    const dir = mkdtempSync(join(tmpdir(), "96bulls-relayauth-chart-test-"));
+    try {
+      const path = join(dir, "relayauth-0.1.1.tgz");
+      expect(() => captureRelayauthChartPackage(path)).toThrow(/package is missing/);
+      writeFileSync(path, "not-the-published-chart");
+      expect(() => captureRelayauthChartPackage(path)).toThrow(/digest does not match/);
+      const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+      expect(stack).toContain("captureRelayauthChartPackage");
+      expect(stack).toContain("prepareRelayauthChart");
+      expect(stack).toContain("chart: BOOTSTRAP_RELAYAUTH_CHART!");
+      expect(stack).toContain('BOOTSTRAP_COMMAND !== "destroy"');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects credential-bearing public origins before they reach chart values", () => {
     expect(() =>
       assertGcpInputs("gcp-dev", {
@@ -523,7 +592,7 @@ describe("GCP self-host contract", () => {
 
   it("passes only existing Secret names to charts", () => {
     const auth = relayauthChartValues({
-      chartVersion: "0.1.0",
+      chartVersion: "0.1.1",
       existingSecretName: "relayauth-runtime",
     });
     const file = relayfileChartValues({
