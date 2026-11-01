@@ -1,11 +1,11 @@
 {
   "repository": "AgentWorkforce/relayhistory-cloud",
   "path": "packages/relayhistory/src/lib/search-index",
-  "commit": "f967554608663d6c4cd252da55533ed40b818eee",
-  "note": "Verbatim copies (relayhistory-cloud #237 + #239). The ClickHouse schema and read path are owned there; never edit these files here. Re-sync by copying the files from a newer commit and updating this record.",
+  "commit": "c9026d57b2dc4d193f114050a1d9002f03cf3987",
+  "note": "Verbatim copies (relayhistory-cloud #237, #239, #243). The ClickHouse schema and read path are owned there; never edit these files here. Re-sync by copying the files from a newer commit and updating this record.",
   "files": {
-    "clickhouse.ts": "4271cbcd778b7d6c0777a29f25e678cf035a4ba1042d113932da6ea4b0b0a1ed",
-    "reconcile.ts": "7adbc8b36c9a57a69f3f9a42eacfe589a7621dfde20b5f6d0940ac094582154d",
+    "clickhouse.ts": "967fd14fdbfc7ba6d107baa09e52b5f1de2d888774c10af1d6e54902965238b5",
+    "reconcile.ts": "96305278527ca6a8bf8162a4cef60201af47f0bebb8c3a7064dfde841795d051",
     "rows.ts": "f1eb76d7f02aa29d95d493f4b0a6d6aaa968fd2bbff1ecade3789d7d5ae32eb8",
     "schema.ts": "63e8f59ce9f8845837ee9c086a2eeef15d7dfa592c70f1543e23bad7ad2b23b5"
   }

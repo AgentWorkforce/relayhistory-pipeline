@@ -45,6 +45,7 @@ import {
   normalizeRelayhistoryRecords,
   parseRelayhistoryRecord,
   projectRelayhistorySession,
+  parseSessionKey,
   readCapped,
   relayhistoryExportProvenance,
   type ManifestReader,
@@ -57,7 +58,7 @@ import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { toIndexRow, tsMillis, type IndexRow, type NeonEventRow } from "./vendor/search-index/rows.ts";
 import { EVENTS_TABLE } from "./vendor/search-index/schema.ts";
 import { deleteRows, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
-import type { SessionScope } from "./pointer.ts";
+import { scopeLockKey, type SessionScope } from "./pointer.ts";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 
@@ -84,7 +85,9 @@ export interface SearchIndexLimits {
 }
 
 const DEFAULT_LIMITS: SearchIndexLimits = {
-  maxScopeBytes: 256 * 1024 * 1024,
+  // Raw text is held several times over (strings, records, projected and index
+  // rows), and an out-of-memory kill fails the whole batch: stay well inside 3 GB.
+  maxScopeBytes: 64 * 1024 * 1024,
   maxRows: 500_000,
   insertBatch: 5_000,
 };
@@ -114,10 +117,6 @@ interface ScopeIdentity {
 const SEP = "\u001f";
 const keyOf = (i: Pick<ScopeIdentity, "machineId" | "source" | "kind" | "eventId">) =>
   [i.machineId, i.source, i.kind, i.eventId].join(SEP);
-
-function lockKey(scope: SessionScope): string {
-  return ["96bulls:search-index", scope.orgId, scope.workspaceId, scope.harness, scope.sessionId].join(SEP);
-}
 
 function defaultDecompress(stored: Uint8Array, maxOutputLength: number): Uint8Array {
   if (typeof zlib.zstdDecompressSync !== "function")
@@ -250,8 +249,19 @@ async function readScope(
       continue;
     }
     const manifest = read.manifest;
+    // The body must describe the key it was read from (as the pointer stage
+    // requires): chunk keys are built from the body, rows are stamped with the scope.
+    const s = manifest.session;
+    const at = parseSessionKey(key);
+    if (!at || s.workspace_id !== scope.workspaceId || s.harness !== scope.harness || s.session_id !== scope.sessionId || s.machine_id !== at.machineId) {
+      complete = false;
+      reasons.push("manifest_key_mismatch");
+      continue;
+    }
     // Unscrubbed raw is quarantined and never read (manifest spec, "Scrubbing").
+    // Not reading it is not knowing it: the pass deletes nothing.
     if (!manifest.raw.scrub) {
+      complete = false;
       reasons.push("manifest_unscrubbed");
       continue;
     }
@@ -381,16 +391,28 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   const now = deps.now ?? (() => new Date());
   return deps.transact(async (tx) => {
     await tx.query("SET LOCAL lock_timeout = '30s'");
-    await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [lockKey(scope)]);
+    await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scopeLockKey(scope)]);
     const keys = await livePointerKeys(tx, scope);
     const at = now();
     const version = at.getTime();
-    const erased = keys.length === 0;
-    // An erased session loses every row; otherwise the index window applies.
-    const fromMs = erased ? 0 : Date.parse(await windowStart(deps.ch, at));
-    const s3 = erased
-      ? { rows: [], manifests: 0, complete: true, reasons: [] as string[] }
-      : await readScope(scope, keys, deps, limits, version);
+    if (keys.length === 0) {
+      // Erased: no live manifest is left, so every row of the scope goes, in or
+      // out of the window. One predicate delete, no listing, so no size can
+      // truncate it. It throws on failure and the message retries.
+      await deps.ch.command(
+        `DELETE FROM ${EVENTS_TABLE}
+         WHERE org_id = {org:String} AND workspace_id = {workspace:String}
+           AND source = {source:String} AND session_id = {session:String}`,
+        {
+          params: { org: scope.orgId, workspace: scope.workspaceId, source: scope.harness, session: scope.sessionId },
+          settings: { lightweight_deletes_sync: 2 },
+          timeoutMs: 120_000,
+        },
+      );
+      return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
+    }
+    const fromMs = Date.parse(await windowStart(deps.ch, at));
+    const s3 = await readScope(scope, keys, deps, limits, version);
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
     const chRows = await clickhouseScope(deps.ch, scope, fromMs, limits.maxRows + 1);
     const truncated = chRows.length > limits.maxRows;

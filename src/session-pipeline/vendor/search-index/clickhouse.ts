@@ -74,6 +74,11 @@ export function encodeParam(value: unknown): string {
     .replace(/\r/g, "\\r");
 }
 
+/** A ClickHouse string literal with every quote and backslash escaped. */
+export function quoteString(value: string): string {
+  return `'${value.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+}
+
 function encodeNested(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(encodeNested).join(",")}]`;
   if (value && typeof value === "object" && "tuple" in value) {
@@ -82,7 +87,7 @@ function encodeNested(value: unknown): string {
   }
   if (typeof value === "number") return String(value);
   if (typeof value === "boolean") return value ? "1" : "0";
-  return `'${String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+  return quoteString(String(value));
 }
 
 /**

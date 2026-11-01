@@ -8,6 +8,7 @@
  *       session-events --(event source mapping, batch 10, partial failures)--> Lambda session-pipeline
  *       session-events --(after maxReceiveCount)--> SQS session-events-dlq (14 days, alarmed)
  *       EventBridge rule (every reconcileMinutes) --> Lambda {"reconcile":true} --> session-events
+ *       (a reconcile at its deadline invokes itself asynchronously with the listing cursor)
  *
  * The Lambda (src/session-pipeline/lambda.ts) runs the pipeline's own
  * object-landed + session-indexed handlers (Supabase `upsert_session_index`,
@@ -17,7 +18,8 @@
  * execution role and attaches no custom policy to it: the transcripts key
  * policy lets the role decrypt via S3, the bucket policy lets it list and read
  * `96bulls/*\/v1/*`, the queue policy lets it consume and re-enqueue, and the
- * secret's resource policy lets it read the one pipeline secret. The role gets
+ * secret's resource policy lets it read the one pipeline secret, and the
+ * function's own resource policy lets it invoke itself (the reconcile chain). The role gets
  * nothing else (no put, no delete, no old versions, no other secret).
  *
  * The bucket notification itself is not an Alchemy resource in this provider
@@ -50,6 +52,7 @@ export const SESSION_PIPELINE_RESOURCES = [
   "session-events-mapping",
   "session-reconcile-schedule",
   "session-reconcile-permission",
+  "session-reconcile-continue",
   "session-events-dlq-alarm",
   "session-events-age-alarm",
   "session-pipeline-errors-alarm",
@@ -316,6 +319,13 @@ export const sessionPipelineWiring = (
       principal: "events.amazonaws.com",
       sourceArn: (rule as unknown as { ruleArn: string }).ruleArn,
       sourceAccount: i.accountId,
+    } as never);
+    // A reconcile that reaches its deadline hands its cursor to the next link by invoking
+    // this function asynchronously; only the function's own role may do that.
+    yield* AWS.Lambda.Permission("session-reconcile-continue", {
+      action: "lambda:InvokeFunction",
+      functionName: i.fn.functionName as unknown as string,
+      principal: roleArn,
     } as never);
     const alarm = (id: string, props: Record<string, unknown>) =>
       AWS.CloudWatch.Alarm(id, { ActionsEnabled: false, TreatMissingData: "notBreaching", ...props, tags: i.tags("session-pipeline") } as never);

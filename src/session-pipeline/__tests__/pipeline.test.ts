@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { zstdCompressSync } from "node:zlib";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -28,7 +29,8 @@ import { EVENTS_TABLE } from "../vendor/search-index/schema.ts";
 import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
-import { reconcileRecent } from "../lambda.ts";
+import { memoryLock } from "./support.ts";
+import { RECONCILE_DEADLINE_MS, reconcileRecent } from "../lambda.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -137,17 +139,28 @@ function fakeClickHouse() {
     return [...latest.values()];
   };
   let failInsert = false;
+  const commands: string[] = [];
+  const sha = (v: string) => createHash("sha256").update(v).digest("hex");
   const ch: ClickHouseClient = {
     database: "test",
-    async command(query) {
+    async command(query, options?: { params?: Record<string, unknown> }) {
+      commands.push(query);
       if (!query.startsWith("DELETE FROM")) throw new Error(`unexpected command ${query.slice(0, 30)}`);
+      if (query.includes("{org:String}")) {
+        const p = options!.params!;
+        for (let i = rows.length - 1; i >= 0; i--) {
+          const r = rows[i]!;
+          if (r.org_id === p.org && r.workspace_id === p.workspace && r.source === p.source && r.session_id === p.session) rows.splice(i, 1);
+        }
+        return;
+      }
       const tuples = [...query.matchAll(/\(('(?:[^'\\]|\\.)*'(?:,'(?:[^'\\]|\\.)*')*),(\d+)\)/g)].map((m) =>
         [...m[1]!.matchAll(/'((?:[^'\\]|\\.)*)'/g)].map((s) => s[1]!).concat(m[2]!),
       );
       for (const [org, session, ws, machine, source, kind, eventId, ms] of tuples) {
         for (let i = rows.length - 1; i >= 0; i--) {
           const r = rows[i]!;
-          if (r.org_id === org && r.session_id === session && r.workspace_id === ws && r.machine_id === machine && r.source === source && r.kind === kind && r.event_id === eventId && tsMs(r) === Number(ms))
+          if (r.org_id === org && r.session_id === session && r.workspace_id === ws && r.machine_id === machine && r.source === source && r.kind === kind && sha(r.event_id) === eventId && tsMs(r) === Number(ms))
             rows.splice(i, 1);
         }
       }
@@ -166,7 +179,7 @@ function fakeClickHouse() {
       rows.push(...(batch as IndexRow[]));
     },
   };
-  return { ch, rows, final, fail: (on: boolean) => (failInsert = on) };
+  return { ch, rows, final, commands, fail: (on: boolean) => (failInsert = on) };
 }
 
 /** Supabase as the indexer sees it: the live pointer keys of the scope, plus a call log. */
@@ -184,8 +197,8 @@ function fakeSupabase(live: () => string[]) {
   return { tx, calls, transact: async <T>(work: (tx: SqlExecutor) => Promise<T>) => work(tx) };
 }
 
-function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"]): SearchIndexDeps {
-  return { transact, reader, store, ch, prefixFor: (org) => `96bulls/${org}`, now: () => NOW };
+function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"], limits?: SearchIndexDeps["limits"]): SearchIndexDeps {
+  return { transact, reader, store, ch, prefixFor: (org) => `96bulls/${org}`, now: () => NOW, ...(limits ? { limits } : {}) };
 }
 
 describe("search index from S3", () => {
@@ -237,8 +250,51 @@ describe("search index from S3", () => {
 
     // Erasure: no live pointer left, every row of the scope goes.
     keys = [];
-    expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ deleted: 1, complete: true });
+    expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ complete: true, reasons: ["erased"] });
     expect(ch.final()).toHaveLength(0);
+  });
+
+  test("an erasure removes every row of the scope however large it is, without listing (review M2)", async () => {
+    const t = (s: number) => Date.parse(`2026-11-01T10:00:0${s}Z`);
+    let keys = [await writeSession("srv_bb", [event("r1", "1", t(1), "one"), event("r2", "1", t(2), "two"), event("r3", "1", t(3), "three")])];
+    const ch = fakeClickHouse();
+    const sb = fakeSupabase(() => keys);
+    await indexSearchScope(scope, searchDeps(ch.ch, sb.transact));
+    // An old row outside the index window, as the Neon backfill may have left.
+    ch.rows.push({ ...ch.final()[0]!, event_id: "old", ts: "2026-08-01 00:00:00.000" });
+    // Another session's rows are untouched.
+    ch.rows.push({ ...ch.final()[0]!, session_id: "other" });
+    keys = [];
+    const result = await indexSearchScope(scope, searchDeps(ch.ch, sb.transact, { maxRows: 1 }));
+    expect(result).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect(ch.final().map((r) => r.session_id)).toEqual(["other"]);
+  });
+
+  test("an unscrubbed manifest is an incomplete read: rows from an earlier revision stay (review M1)", async () => {
+    const t = (s: number) => Date.parse(`2026-11-01T10:00:0${s}Z`);
+    let keys = [await writeSession("srv_bb", [event("r1", "1", t(1), "one")])];
+    const ch = fakeClickHouse();
+    const sb = fakeSupabase(() => keys);
+    await indexSearchScope(scope, searchDeps(ch.ch, sb.transact));
+    keys = [await writeSession("srv_bb", [event("r1", "1", t(1), "one")], 2, { scrubbed: false })];
+    expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ complete: false, deleted: 0, reasons: ["manifest_unscrubbed"] });
+    expect(ch.final()).toHaveLength(1);
+  });
+
+  test("a manifest whose body names another session is not read and deletes nothing (review L1)", async () => {
+    const t = (s: number) => Date.parse(`2026-11-01T10:00:0${s}Z`);
+    let keys = [await writeSession("srv_bb", [event("r1", "1", t(1), "one")])];
+    const ch = fakeClickHouse();
+    const sb = fakeSupabase(() => keys);
+    await indexSearchScope(scope, searchDeps(ch.ch, sb.transact));
+    // Overwrite the manifest at srv_bb's key with a body naming machine srv_other.
+    const key = keys[0]!;
+    const body = JSON.parse(new TextDecoder().decode(await new Response((await store.getObject(objectKey(key))).body).arrayBuffer()));
+    body.session.machine_id = "srv_other";
+    await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(body)), { contentType: "application/json" });
+    const result = await indexSearchScope(scope, { ...searchDeps(ch.ch, sb.transact), reader: { ...reader, read: async (k) => ({ manifest: JSON.parse(new TextDecoder().decode(await new Response((await store.getObject(objectKey(k))).body).arrayBuffer())) }) } });
+    expect(result).toMatchObject({ complete: false, deleted: 0, inserted: 0, reasons: ["manifest_key_mismatch"] });
+    expect(ch.final()).toHaveLength(1);
   });
 
   test("unscrubbed raw is never read or indexed; events outside the window are skipped", async () => {
@@ -263,7 +319,7 @@ describe("SQS consumer", () => {
     const db = { ...sb.tx, pool: undefined, end: async () => {} } as unknown as HoopDb;
     const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
     const deps: ConsumerDeps = {
-      pointer: { db, reader, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
+      pointer: { db, lock: memoryLock(), reader, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
       search: searchDeps(ch, sb.transact),
     };
     return { deps, sb };
@@ -328,15 +384,52 @@ describe("reconcile", () => {
     const etagOf = (k: string) => listed.items.find((i) => String(i.key) === k)!.version.eTag!.replace(/^"|"$/g, "");
     const sent: string[] = [];
     const db: SqlExecutor = {
-      async query<R>() {
+      async query<R>(text: string) {
+        if (text.includes("indexed_at >=")) return { rows: [] as R[] };
         return { rows: [{ manifest_key: indexed, manifest_etag: etagOf(indexed), deleted: false }] as R[] };
       },
     };
-    const summary = await reconcileRecent(
-      { store, db, keyPrefix: "96bulls", lookbackMinutes: 60, send: async (b) => void sent.push(b) },
-      new Date(Date.now() + 60_000),
-    );
+    const summary = await reconcileRecent({ store, db, keyPrefix: "96bulls", since: new Date(Date.now() - 60 * 60_000), send: async (b) => void sent.push(b) });
     expect(summary).toMatchObject({ listed: 2, recent: 2, enqueued: 1, complete: true });
     expect(JSON.parse(sent[0]!).reconcile.key).toBe(missing);
+  });
+
+  test("a live pointer whose manifest is gone is enqueued, so a lost or raced delete is repaired (review H1)", async () => {
+    const live = await writeSession("srv_ok", [event("r1", "1", 1, "x")]);
+    const gone = manifestKey(loc("srv_gone"));
+    const sent: string[] = [];
+    const db: SqlExecutor = {
+      async query<R>(text: string) {
+        if (text.includes("indexed_at >=")) return { rows: [{ manifest_key: live }, { manifest_key: gone }] as R[] };
+        return { rows: [{ manifest_key: live, manifest_etag: "whatever", deleted: false }] as R[] };
+      },
+    };
+    const summary = await reconcileRecent({ store, db, keyPrefix: "96bulls", since: new Date(0), send: async (b) => void sent.push(b) });
+    expect(summary).toMatchObject({ pointersChecked: 2, pointersGone: 1 });
+    expect(sent.map((b) => JSON.parse(b).reconcile.key)).toContain(gone);
+  });
+
+  test("stops at its deadline, under the function timeout, and returns the cursor for the next link (review M5)", async () => {
+    for (const m of ["a", "b", "c"]) await writeSession(`srv_${m}`, [event("r", "1", 1, m)]);
+    let clock = 0;
+    const pages: (string | undefined)[] = [];
+    const paged = {
+      head: store.head.bind(store),
+      async list(prefix: Parameters<ObjectStore["list"]>[0], cursor?: string) {
+        pages.push(cursor);
+        clock += 200_000; // each page "takes" 200 s
+        const all = await store.list(prefix);
+        const at = cursor ? Number(cursor) : 0;
+        return { items: all.items.slice(at, at + 1), ...(at + 1 < all.items.length ? { nextCursor: String(at + 1) } : {}) };
+      },
+    };
+    const db: SqlExecutor = { async query<R>() { return { rows: [] as R[] }; } };
+    const first = await reconcileRecent({ store: paged, db, keyPrefix: "96bulls", since: new Date(0), send: async () => {}, now: () => clock });
+    expect(RECONCILE_DEADLINE_MS).toBeLessThan(300_000);
+    expect(first.complete).toBe(false);
+    expect(first.nextCursor).toBe("2");
+    const second = await reconcileRecent({ store: paged, db, keyPrefix: "96bulls", since: new Date(0), cursor: first.nextCursor, send: async () => {}, now: () => clock });
+    expect(pages).toEqual([undefined, "1", "2", "3", "4", "5"].slice(0, pages.length));
+    expect(second.pages).toBeGreaterThan(0);
   });
 });

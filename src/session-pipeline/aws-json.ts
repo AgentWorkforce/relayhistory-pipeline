@@ -137,3 +137,27 @@ export async function awsJsonCall<T>(args: {
   }
   return (text ? JSON.parse(text) : {}) as T;
 }
+
+/** Asynchronous Lambda invoke (`X-Amz-Invocation-Type: Event`): the reconcile hands its cursor to the next link. */
+export async function invokeAsync(args: {
+  region: string;
+  functionName: string;
+  payload: string;
+  credentials: AwsSessionCredentials;
+  fetcher?: typeof fetch;
+}): Promise<void> {
+  if (!args.functionName) throw new Error("invokeAsync: no function name");
+  const url = new URL(`https://lambda.${args.region}.amazonaws.com/2015-03-31/functions/${encodeURIComponent(args.functionName)}/invocations`);
+  const headers = signV4({
+    method: "POST",
+    url,
+    service: "lambda",
+    region: args.region,
+    headers: { "content-type": "application/json", "x-amz-invocation-type": "Event" },
+    body: args.payload,
+    credentials: args.credentials,
+  });
+  const response = await (args.fetcher ?? fetch)(url, { method: "POST", headers, body: args.payload, signal: AbortSignal.timeout(10_000) });
+  await response.arrayBuffer();
+  if (response.status !== 202) throw new AwsCallError("lambda", response.status, response.headers.get("x-amzn-errortype"));
+}

@@ -7,6 +7,14 @@
  * (revision-fenced: a late, duplicated or replayed event never rolls a row
  * back), then `session_index_ext` and the logical `session_directory` row.
  *
+ * Serialization. The read and the upsert run under the session's lock (the
+ * same transaction-scoped advisory lock the search stage takes), so a put
+ * whose read raced an erasure cannot upsert after the delete's tombstone: the
+ * second holder re-reads S3 and sees what the first left. Without it, a
+ * revision-2 upsert that read before the delete would land after the
+ * tombstone and bring the row back for good (`upsert_session_index` lets a
+ * newer revision undelete).
+ *
  * The event is a hint. The manifest is always re-read, so:
  *   - a put whose manifest is gone again is handled as a delete;
  *   - a delete whose key still has a current manifest (an old version deleted
@@ -41,8 +49,17 @@ export type PointerOutcome =
   | { status: "ignored"; reason: string }
   | { status: "indexed" | "unchanged" | "deleted"; scope: SessionScope; manifestKey: string; revision?: number };
 
+/** The per-session lock key, shared by the pointer and search stages. */
+export function scopeLockKey(scope: SessionScope): string {
+  return ["96bulls:session-scope", scope.orgId, scope.workspaceId, scope.harness, scope.sessionId].join("\u001f");
+}
+
+/** Run `work` while holding the session's lock (lambda.ts: pg_advisory_xact_lock in Supabase). */
+export type ScopeLock = <T>(scope: SessionScope, work: () => Promise<T>) => Promise<T>;
+
 export interface PointerDeps {
   db: HoopDb;
+  lock: ScopeLock;
   reader: ManifestReader;
   orgs: OrgResolver;
   allowPrefix(prefix: string | undefined, orgId: string): boolean;
@@ -76,7 +93,11 @@ export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Pro
     sessionId: location.sessionId,
   };
 
-  // Canonical state, not the event: re-read the manifest.
+  return deps.lock(scope, () => indexLocked(landed, orgId, scope, deps));
+}
+
+async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionScope, deps: PointerDeps): Promise<PointerOutcome> {
+  // Canonical state, not the event: re-read the manifest, under the lock.
   const read = await deps.reader.read(landed.key);
   const built = read
     ? buildObjectLandedMessage({

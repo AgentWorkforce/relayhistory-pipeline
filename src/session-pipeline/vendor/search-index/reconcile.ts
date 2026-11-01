@@ -336,39 +336,72 @@ export interface PendingDelete {
   identity: Identity;
 }
 
-/** Delete exact (key, workspace, ts) rows, batched into few mutations. */
+export const DELETE_BYTES_BUDGET = 512 * 1024;
+
+const utf8 = new TextEncoder();
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", utf8.encode(text));
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Delete exact (key, workspace, ts) rows, batched into few mutations.
+ *
+ * Batches are capped by UTF-8 bytes as well as keys, and event_id is matched
+ * by its SHA-256, computed here: the literal sent per key has a fixed-size
+ * id member whatever the client-supplied id's length or alphabet, so no key
+ * can push a statement past max_query_size (code 62 on every retry). The
+ * other members pin the row to one org/session/workspace/machine/source/
+ * kind/ms; those are short service-assigned values.
+ */
 export async function deleteRows(
   ch: ClickHouseClient,
   deletes: PendingDelete[],
-  // ~250 bytes per tuple: 500 keeps a statement near 128 KiB, under the
-  // default max_query_size (256 KiB; code 62 SYNTAX_ERROR when exceeded).
-  chunk = 500,
+  maxKeys = 500,
+  maxBytes = DELETE_BYTES_BUDGET,
 ): Promise<void> {
-  for (let i = 0; i < deletes.length; i += chunk) {
-    const keys = deletes
-      .slice(i, i + chunk)
-      .map((d) =>
-        tuple(
-          d.orgId,
-          d.sessionId,
-          d.identity.workspaceId,
-          d.identity.machineId,
-          d.identity.source,
-          d.identity.kind,
-          d.identity.eventId,
-          d.identity.tsMs,
-        ),
-      );
+  const run = async (literals: string[]) => {
     await ch.command(
       `DELETE FROM ${EVENTS_TABLE}
-       WHERE (org_id, session_id, workspace_id, machine_id, source, kind, event_id, toUnixTimestamp64Milli(ts))
-         IN ${arrayLiteral(keys)}`,
+       WHERE (org_id, session_id, workspace_id, machine_id, source, kind, lower(hex(SHA256(event_id))), toUnixTimestamp64Milli(ts))
+         IN [${literals.join(",")}]`,
       {
         settings: { lightweight_deletes_sync: 2, max_query_size: 1_048_576 },
         timeoutMs: 60_000,
       },
     );
+  };
+  let batch: string[] = [];
+  let bytes = 0;
+  for (const d of deletes) {
+    const literal = arrayLiteral([
+      tuple(
+        d.orgId,
+        d.sessionId,
+        d.identity.workspaceId,
+        d.identity.machineId,
+        d.identity.source,
+        d.identity.kind,
+        await sha256Hex(d.identity.eventId),
+        d.identity.tsMs,
+      ),
+    ]).slice(1, -1);
+    const size = utf8.encode(literal).length + 1;
+    if (
+      batch.length > 0 &&
+      (batch.length >= maxKeys || bytes + size > maxBytes)
+    ) {
+      await run(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(literal);
+    bytes += size;
   }
+  if (batch.length > 0) await run(batch);
 }
 
 /**
@@ -810,7 +843,8 @@ async function tailPass(
         revision,
         syncedAt: readStart,
         fullAt: now(),
-        scanned: state?.scanned ?? 0,
+        // 0 marks a failed repair: never counted as harmlessly "capped".
+        scanned: 0,
         needsFull: true,
       });
       advanceTo = rev.updated_text;
@@ -836,7 +870,7 @@ async function tailPass(
           revision,
           syncedAt: readStart,
           fullAt: now(),
-          scanned: Math.max(result.scanned, state?.scanned ?? 0),
+          scanned: 0, // timed out: a pending repair, not a capped scan
           needsFull: true,
         });
         advanceTo = rev.updated_text;
@@ -953,7 +987,7 @@ async function tailPass(
           fullAt: now(),
           // Keep the larger size: a cut-short count must not demote a
           // large session to full scans on its next change.
-          scanned: Math.max(result.scanned, Number(row.scanned)),
+          scanned: 0, // timed out: a pending repair, not a capped scan
           needsFull: true,
         });
         break;

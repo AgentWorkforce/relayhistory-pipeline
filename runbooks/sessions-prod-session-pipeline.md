@@ -15,8 +15,10 @@ transcripts bucket --S3 event (96bulls/**/manifest.json, put + delete)--> SQS 96
        2. ClickHouse: reconcile the session scope (org, workspace, harness, session) against every live
           manifest of that session, read from S3 (search-index.ts). Off until searchIndex is true.
   --after 8 receives--> SQS ...-session-events-dlq (14 days, alarm on any message)
-EventBridge rate(30 minutes) --> Lambda {"reconcile":true}: list manifests modified in the last 60 minutes,
-  enqueue those whose pointer row is missing or names another ETag.
+EventBridge rate(30 minutes) --> Lambda {"reconcile":true}:
+  1. HEAD the manifest of every live pointer indexed in the last 60 minutes; enqueue the gone ones (lost or raced deletes).
+  2. List manifests modified in the last 60 minutes; enqueue those whose pointer row is missing, deleted or names another ETag.
+  At 240 s (under the 300 s timeout) it invokes itself asynchronously with the listing cursor (at most 24 links).
 ```
 
 ## Guarantees
@@ -34,9 +36,19 @@ EventBridge rate(30 minutes) --> Lambda {"reconcile":true}: list manifests modif
 - **Never deletes on a partial read.** A missing manifest, an unreadable chunk
   or a truncated ClickHouse read makes the pass incomplete: inserts happen,
   deletes do not, and the next event or the reconcile finishes the job.
-- **One session at a time.** The ClickHouse pass holds a transaction-scoped
-  advisory lock per session in Supabase, taken after the event's pointer
-  commit.
+- **One session at a time.** The pointer stage (manifest read and upsert) and
+  the ClickHouse pass each hold the session's transaction-scoped advisory lock
+  in Supabase. A put whose read raced an erasure therefore cannot upsert after
+  the delete's tombstone: `upsert_session_index` lets a newer revision
+  undelete, so without the lock it would bring the row back for good
+  (#121 review H1, `__tests__/pointer-race.test.ts` on the real SQL).
+- **Erasure is one predicate delete.** With no live pointer, the ClickHouse
+  rows of the session are deleted by `(org, workspace, source, session)`,
+  without listing, so no session size can truncate it. A failure throws and
+  the message retries.
+- **Unreadable is not empty.** A quarantined (unscrubbed) manifest, or one whose
+  body names another session than its key, makes the pass incomplete: it
+  deletes nothing.
 - **Backpressure.** The mapping caps concurrency at `maxConcurrency` (default
   4). Each invocation holds at most 4 Supabase connections. A slow downstream
   backs messages up in SQS (4-day retention). The backlog-age alarm fires
@@ -90,7 +102,7 @@ rotation, force fresh reads with
    `"sessionPipeline": { "searchIndex": false }` under `transcriptStore`, and
    write the approval record.
 3. **Capture and apply.** Run `bin/96bulls plan aws-sessions-prod --capture`.
-   The contract accepts it only as **session pipeline rollout**: the 10
+   The contract accepts it only as **session pipeline rollout**: the 11
    pipeline resources are `create`, `transcripts` (bucket policy grant) and
    `transcripts-key` (key policy grant) are `update`, and the other 10 store
    resources are `noop`. Then commit the capture, write `approval.capture` and
@@ -107,9 +119,16 @@ rotation, force fresh reads with
    `pointer indexed` lines and for no `pointer index failed`. The DLQ should
    stay empty. Run one reconcile now:
    `aws lambda invoke --function-name 96bulls-aws-sessions-prod-session-pipeline --payload '{"reconcile":true}' --cli-binary-format raw-in-base64-out /dev/stdout`.
-7. **ClickHouse stage.** Do this only once live writes reach S3: relayhistory-cloud
-   #241 `WRITE_PATH=s3_first`. Until then S3 trails Neon by the exporter's
-   30-minute debounce, and indexing from S3 would make search staler.
+7. **ClickHouse stage.** Two gates, both required:
+   - **Live writes reach S3:** relayhistory-cloud #241 `WRITE_PATH=s3_first`.
+     Until then S3 trails Neon by the exporter's 30-minute debounce, and
+     indexing from S3 would make search staler.
+   - **Every exported session carries every kind the index projects.** Sessions
+     exported by `neon-s3-sync` before 5e498e0 have no `trajectory` and
+     `commit_link` records in S3. The whole-session diff would delete the
+     trajectory rows the Neon backfill put in ClickHouse. Re-export those
+     sessions first (#101 review R1), and confirm there are none left before
+     setting `searchIndex`.
    - Add the `clickhouse` block to the secret.
    - Turn the Neon tail off (`SEARCH_INGEST_ENABLED` unset on the
      relayhistory Worker), so the two writers do not keep rewriting each
@@ -133,13 +152,22 @@ Re-drive the DLQ after a fix with
 
 ## Known limits
 
-- The reconcile lists the whole `96bulls/` prefix on every run (S3 cannot
-  filter by date). This is acceptable at today's object count. A persisted
-  cursor (S3 Inventory, or a `last_modified` watermark) is the follow-up.
+- The reconcile lists the whole `96bulls/` prefix, chunks included, on every
+  chain (S3 cannot filter by date). The chain covers any size, but each run
+  costs one LIST per 1,000 objects. Listing per org and day, or S3 Inventory,
+  is the follow-up.
 - A session's ClickHouse pass reads every chunk of every live manifest, capped
-  at 256 MiB per session. Larger sessions are indexed without deletes and
-  logged with `scope_too_large`. Incremental, chunk-only indexing is a
-  follow-up for very long live sessions.
+  at 64 MiB of raw per session, to stay well inside the 3 GB function (an
+  out-of-memory kill fails the whole batch). Larger sessions are indexed
+  without deletes and logged with `scope_too_large`. Incremental, chunk-only
+  indexing is the follow-up for very long live sessions.
+- The role's `s3:ListBucket` is unconditional (as for the reader user): S3
+  answers 404 instead of 403 for a missing manifest only with it, and deletes
+  are detected that way. It exposes key names, never content.
+- The event source mapping relies on the queue policy alone (Alchemy attaches
+  no custom policy to the function's role). This is not yet proven against
+  AWS; if `CreateEventSourceMapping` refuses it, the fallback is an Alchemy
+  Effect function with `consumeQueueMessages`.
 - Fan-out to summaries and state (`summary-*`, `status-classify`) is off
   (`PIPELINE_FANOUT=off`). Nothing consumes those queues in production yet.
   Bob Costas's sweep rebuilds missing summaries once it runs.

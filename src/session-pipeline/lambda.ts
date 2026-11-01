@@ -34,10 +34,10 @@ import {
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { HoopDb } from "../shared/db.ts";
 import { errorFields, log } from "../shared/log.ts";
-import { awsJsonCall, lambdaCredentials } from "./aws-json.ts";
+import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
-import { droppedFanout } from "./pointer.ts";
+import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 
@@ -168,9 +168,16 @@ async function init(): Promise<Runtime> {
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: env.bucket });
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: env.keyPrefix };
   const fanout: PipelineQueue = env.fanout === "postgres" ? postgresPipelineQueue(db) : droppedFanout;
+  const lock: ScopeLock = (scope, work) =>
+    transaction(db, async (tx) => {
+      await tx.query("SET LOCAL lock_timeout = '30s'");
+      await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scopeLockKey(scope)]);
+      return work();
+    });
   const deps: ConsumerDeps = {
     pointer: {
       db,
+      lock,
       reader,
       orgs: prefixOrgResolver,
       allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
@@ -205,31 +212,67 @@ export interface ReconcileSummary {
   recent: number;
   enqueued: number;
   pages: number;
+  /** Live pointers indexed in the window whose manifest was checked, and how many were gone. */
+  pointersChecked: number;
+  pointersGone: number;
+  /** Where the listing stopped at the deadline; the next link of the chain starts here. */
+  nextCursor?: string;
   complete: boolean;
 }
 
+/** Stop listing this long before the function timeout (300 s), leaving time to hand off. */
+export const RECONCILE_DEADLINE_MS = 240_000;
+
+export interface ReconcileDeps {
+  store: Pick<ObjectStore, "list" | "head">;
+  db: SqlExecutor;
+  keyPrefix: string;
+  send(body: string): Promise<void>;
+  /** Lower bound of "recent", fixed for a whole chain. */
+  since: Date;
+  cursor?: string;
+  maxPages?: number;
+  deadlineMs?: number;
+  now?: () => number;
+}
+
 /**
- * The safety net for lost or never-sent notifications: list the manifests
- * modified in the lookback window and enqueue those whose pointer row is
- * missing or names another ETag. No manifest is read here: the queue path
- * does that, with its own retries and DLQ.
+ * The safety net for lost or raced notifications, in two legs.
+ *
+ * 1. Live pointers indexed since `since` (first link only): HEAD each
+ *    manifest; a gone one is enqueued, and the queue path tombstones it under
+ *    the session lock. This repairs a delete that was lost or raced.
+ * 2. Manifests modified since `since`: enqueue those whose pointer row is
+ *    missing, deleted or names another ETag. No manifest body is read here.
+ *
+ * The listing stops at the deadline and returns `nextCursor`; the caller
+ * hands it to the next link (an async self-invocation), so a bucket of any
+ * size is covered within one chain instead of being cut off at the timeout.
  */
-export async function reconcileRecent(
-  deps: {
-    store: Pick<ObjectStore, "list">;
-    db: SqlExecutor;
-    keyPrefix: string;
-    send(body: string): Promise<void>;
-    lookbackMinutes: number;
-    maxPages?: number;
-    deadlineMs?: number;
-  },
-  now = new Date(),
-): Promise<ReconcileSummary> {
-  const since = now.getTime() - deps.lookbackMinutes * 60_000;
-  const deadline = Date.now() + (deps.deadlineMs ?? 600_000);
-  const summary: ReconcileSummary = { listed: 0, recent: 0, enqueued: 0, pages: 0, complete: false };
-  let cursor: string | undefined;
+export async function reconcileRecent(deps: ReconcileDeps): Promise<ReconcileSummary> {
+  const now = deps.now ?? Date.now;
+  const since = deps.since.getTime();
+  const deadline = now() + (deps.deadlineMs ?? RECONCILE_DEADLINE_MS);
+  const summary: ReconcileSummary = { listed: 0, recent: 0, enqueued: 0, pages: 0, pointersChecked: 0, pointersGone: 0, complete: false };
+
+  if (deps.cursor === undefined) {
+    const { rows } = await deps.db.query<{ manifest_key: string }>(
+      `SELECT manifest_key FROM sessions.session_index
+        WHERE deleted_at IS NULL AND indexed_at >= $1::timestamptz AND manifest_key LIKE $2
+        ORDER BY indexed_at LIMIT 5000`,
+      [deps.since.toISOString(), `${deps.keyPrefix}/%`],
+    );
+    for (const { manifest_key } of rows) {
+      if (now() > deadline) break;
+      summary.pointersChecked += 1;
+      if (await deps.store.head(objectKey(manifest_key))) continue;
+      summary.pointersGone += 1;
+      await deps.send(JSON.stringify({ [RECONCILE_BODY_KEY]: { key: manifest_key } }));
+      summary.enqueued += 1;
+    }
+  }
+
+  let cursor = deps.cursor;
   do {
     const page = await deps.store.list(objectKey(deps.keyPrefix), cursor);
     summary.pages += 1;
@@ -267,18 +310,33 @@ export async function reconcileRecent(
       }
     }
     cursor = page.nextCursor;
-  } while (cursor && summary.pages < (deps.maxPages ?? 5_000) && Date.now() < deadline);
+  } while (cursor && summary.pages < (deps.maxPages ?? 5_000) && now() < deadline);
   summary.complete = !cursor;
+  if (cursor) summary.nextCursor = cursor;
   return summary;
 }
 
-async function runReconcile(rt: Runtime) {
+interface ReconcileEvent {
+  reconcile: true;
+  cursor?: string;
+  since?: string;
+  /** Links already run in this chain. */
+  link?: number;
+}
+
+/** A chain never outlives two cadences of listing: a runaway is cut off, the next schedule starts over. */
+export const MAX_RECONCILE_LINKS = 24;
+
+async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   const { env } = rt;
-  return reconcileRecent({
+  const since = event.since ? new Date(event.since) : new Date(Date.now() - env.reconcileLookbackMinutes * 60_000);
+  if (!Number.isFinite(since.getTime())) throw new Error("reconcile: invalid since");
+  const summary = await reconcileRecent({
     store: createS3Store({ bucket: env.bucket, region: env.region, credentials: async () => lambdaCredentials() }),
     db: rt.deps.pointer.db,
     keyPrefix: env.keyPrefix,
-    lookbackMinutes: env.reconcileLookbackMinutes,
+    since,
+    ...(event.cursor ? { cursor: event.cursor } : {}),
     send: async (body) => {
       await awsJsonCall({
         service: "sqs",
@@ -289,9 +347,20 @@ async function runReconcile(rt: Runtime) {
       });
     },
   });
+  const link = (event.link ?? 0) + 1;
+  if (summary.nextCursor && link < MAX_RECONCILE_LINKS) {
+    const next: ReconcileEvent = { reconcile: true, cursor: summary.nextCursor, since: since.toISOString(), link };
+    await invokeAsync({
+      region: env.region,
+      functionName: process.env.AWS_LAMBDA_FUNCTION_NAME ?? "",
+      payload: JSON.stringify(next),
+      credentials: lambdaCredentials(),
+    });
+  }
+  return { ...summary, link };
 }
 
-type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown };
+type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; cursor?: string; since?: string; link?: number };
 
 export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok: boolean }> {
   if (Array.isArray(event?.Records)) {
@@ -309,9 +378,19 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
   if (event?.reconcile === true) {
     const started = Date.now();
     try {
-      const result = await runReconcile(await ready());
-      log.info("reconcile finished", { stage: "object-landed", listed: result.listed, count: result.recent, enqueued: result.enqueued, ok: result.complete, duration_ms: Date.now() - started });
-      return { ok: result.complete };
+      const result = await runReconcile(await ready(), event as ReconcileEvent);
+      log.info("reconcile finished", {
+        stage: "object-landed",
+        listed: result.listed,
+        count: result.recent,
+        enqueued: result.enqueued,
+        skipped: result.pointersChecked,
+        failed: result.pointersGone,
+        attempt: result.link,
+        ok: result.complete,
+        duration_ms: Date.now() - started,
+      });
+      return { ok: true };
     } catch (error) {
       log.error("reconcile failed", { stage: "object-landed", ...errorFields(error), duration_ms: Date.now() - started });
       return { ok: false };
