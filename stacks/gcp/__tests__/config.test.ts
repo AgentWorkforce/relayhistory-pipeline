@@ -315,6 +315,18 @@ describe("GCP self-host contract", () => {
     expect(rendered).not.toContain('"REDIS_AUTH"');
     expect(rendered).not.toContain("REDIS_PASSWORD");
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
+    const worker = values.worker as {
+      migrations: { supabaseShim: boolean };
+      extraEnv: Array<{ name: string; value: string }>;
+    };
+    expect(worker.migrations.supabaseShim).toBe(true);
+    expect(worker.extraEnv.filter(({ name }) => name === "HOOPDB_SUPABASE_SHIM")).toHaveLength(0);
+    expect(worker.extraEnv).toEqual(
+      expect.arrayContaining([
+        { name: "HOOPDB_DB_MODE", value: "selfhosted" },
+        { name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" },
+      ]),
+    );
     expect(values).toMatchObject({
       worker: {
         fullnameOverride: "bulls96-worker",

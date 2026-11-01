@@ -1015,7 +1015,9 @@ export function gcpHoopdbModeEnv(
 ): Array<{ name: string; value: string }> {
   return [
     { name: "HOOPDB_DB_MODE", value: "selfhosted" },
-    { name: "HOOPDB_SUPABASE_SHIM", value: "true" },
+    // The worker chart renders HOOPDB_SUPABASE_SHIM exactly once for its
+    // migration Job from worker.migrations.supabaseShim. Adding it to
+    // worker.extraEnv makes the Kubernetes strategic-merge key ambiguous.
     { name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" },
     ...(runtimeRole
       ? [
