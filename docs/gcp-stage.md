@@ -465,8 +465,11 @@ Release boundaries that remain deliberate:
   only while the catalog marks that exact role SUPERUSER. Every other CREATE-capable
   role remains covered. The migration Job keeps `HOOPDB_ROLE_BOOTSTRAP=false`.
 - The application runtime uses its own LOGIN role and URL. The migration owner URL is
-  available only to the migration Job. Both credentials are sourced from 1Password;
-  no password is persisted in Alchemy state, input JSON, a repository, or a shell file.
+  available only to the migration Job. Cloud SQL creates the runtime while assigning
+  the still-empty `anon` role so it never receives `cloudsqlsuperuser`, then the Admin
+  API replaces that role list with an empty list before migrations or workload access.
+  Both credentials are sourced from 1Password; no password is persisted in Alchemy
+  state, input JSON, a repository, or a shell file.
 - The initial 2026-10-30 substrate run did not exercise product routes. The
   later 2026-10-31 application proof recorded above exercised authenticated
   ingest, scrubbed object landing, Cloud SQL indexing/classification, encrypted

@@ -193,11 +193,15 @@ phase 2 can mark PASS.
     the role with no privileges and never sets a password; the credential is provisioned
     separately.
   - `cloudsql`: the Cloud SQL Admin API creates the dedicated LOGIN user while assigning
-    a temporary customer role, preventing the API's automatic `cloudsqlsuperuser`
-    membership. The migration owner immediately revokes that temporary membership and
-    drops the seed role. The migrator then verifies the resulting LOGIN-only role and
-    its exact database/schema/object privileges. Its password and URL are stored in
-    1Password and supplied only through the runtime Secret.
+    the already-empty `anon` compatibility role, preventing the API's automatic
+    `cloudsqlsuperuser` membership. Before migrations grant `anon` anything and before
+    the user can reach a workload, the Admin API replaces its database-role list with
+    an empty list (`assign-roles --database-roles= --revoke-existing-roles`). This is an
+    API operation, not a SQL `REVOKE`: PostgreSQL 17 records the API grant under a
+    provider identity that the customer migration owner cannot impersonate. The
+    migrator then verifies the resulting LOGIN-only role and its exact
+    database/schema/object privileges. Its password and URL are stored in 1Password and
+    supplied only through the runtime Secret.
   - `supabase`: pre-provisioned by an operator and verified by the migrator. On
     PostgreSQL 16+ the creator-ADMIN caveat of the Worker applies here too: a role
     created by Supabase's non-superuser `postgres` would carry ADMIN for `postgres` and
