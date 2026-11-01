@@ -18,7 +18,7 @@
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import { orgPrefix } from "../neon-s3-sync/export-session.ts";
-import { activityPage, fencedGroups, lockWaiters } from "../neon-s3-sync/neon-reader.ts";
+import { activityPage, catalogPage, fencedGroups, groupExistsInNeon, lockWaiters } from "../neon-s3-sync/neon-reader.ts";
 
 const DOT_SEGMENT = /(^|\/)\.{1,2}(\/|$)/;
 import type { SyncState } from "../neon-s3-sync/state.ts";
@@ -97,6 +97,16 @@ export class ErasureJob {
       if (rows.length === 0 || this.stopped()) break;
       after = rows.at(-1)!;
     }
+    // Catalog sessions count as present too: the exporter exports them.
+    let cat: Parameters<typeof catalogPage>[1] = null;
+    for (;;) {
+      if (this.stopped()) break;
+      const rows = await catalogPage(this.db, cat);
+      this.state.seeForErasure(opts.dryRun ? -id : id, rows);
+      seen += rows.length;
+      if (rows.length === 0) break;
+      cat = rows.at(-1)!;
+    }
     if (this.stopped()) return;
     // A sweep that saw nothing at all is a broken read, not an empty Neon: never erase on it.
     if (seen === 0) {
@@ -106,12 +116,8 @@ export class ErasureJob {
     if (!opts.dryRun) this.state.setMeta("erasure_sweep_done", String(id));
     let gone = 0;
     for (const g of this.state.vanishedExports(opts.dryRun ? -id : id, startedAt, !opts.dryRun)) {
-      // Confirm on Neon right before erasing: the group really has no rollup now.
-      const { rows } = await this.db.query(
-        "SELECT 1 FROM sessions.session_rollups WHERE org_id = $1 AND session_id = $2 LIMIT 1",
-        [g.org_id, g.session_id],
-      );
-      if (rows.length) continue;
+      // Confirm on Neon right before erasing: no rollup and no catalog row now.
+      if (await groupExistsInNeon(this.db, g.org_id, g.session_id)) continue;
       gone += 1;
       if (!opts.dryRun) this.#queueGroup(g.org_id, g.session_id, g.keys, "gone_from_neon");
     }

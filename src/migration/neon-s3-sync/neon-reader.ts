@@ -141,6 +141,43 @@ export async function activityPage(
   return rows;
 }
 
+/**
+ * Sessions in `session_catalog` in key order, as `(org, session)` activity
+ * rows. A session can have delivery records (its catalog record, presence,
+ * markers, even events not yet projected) and no rollup: rollups come only
+ * from convergence events. These must be exported too (8,610 in production
+ * on 2026-11-01), so discovery reads the catalog as well as the rollups.
+ */
+export async function catalogPage(
+  db: Queryable,
+  after: { org_id: string; workspace_id: string; source: string; session_id: string } | null,
+  limit = SWEEP_PAGE_ROWS,
+): Promise<(GroupActivity & { workspace_id: string; source: string })[]> {
+  const { rows } = await db.query<GroupActivity & { workspace_id: string; source: string }>(
+    `SELECT org_id, workspace_id, source, session_id,
+            floor(extract(epoch FROM coalesce(last_activity_at, first_activity_at, received_at)) * 1000)::bigint::text AS last_ms,
+            '0' AS events
+       FROM sessions.session_catalog
+      ${after ? "WHERE (org_id, workspace_id, source, session_id) > ($2, $3, $4, $5)" : ""}
+      ORDER BY org_id, workspace_id, source, session_id
+      LIMIT $1`,
+    after ? [limit, after.org_id, after.workspace_id, after.source, after.session_id] : [limit],
+  );
+  return rows;
+}
+
+/** Whether Neon still has anything to export for a group (a rollup or a catalog row). */
+export async function groupExistsInNeon(db: Queryable, orgId: string, sessionId: string): Promise<boolean> {
+  const { rows } = await db.query(
+    `SELECT 1 FROM sessions.session_rollups WHERE org_id = $1 AND session_id = $2
+     UNION ALL
+     SELECT 1 FROM sessions.session_catalog WHERE org_id = $1 AND session_id = $2
+     LIMIT 1`,
+    [orgId, sessionId],
+  );
+  return rows.length > 0;
+}
+
 /** One exported unit: a session's records in one workspace and harness. */
 export interface SessionUnit {
   orgId: string;
@@ -212,6 +249,28 @@ export async function sessionUnits(db: Queryable, orgId: string, sessionId: stri
     for (const m of row.machine_ids ?? []) if (m) u.machines.add(m);
     for (const m of row.models ?? []) if (m) u.models.add(m);
     for (const f of SUMS) u.sums[f]! += BigInt(row[f]);
+  }
+  // Catalog-only units: a (workspace, harness) the catalog names and no rollup covers.
+  const catalog = await db.query<{ workspace_id: string; source: string; first_ms: string | null; last_ms: string | null }>(
+    `SELECT workspace_id, source,
+            floor(extract(epoch FROM coalesce(first_activity_at, received_at)) * 1000)::bigint::text AS first_ms,
+            floor(extract(epoch FROM coalesce(last_activity_at, first_activity_at, received_at)) * 1000)::bigint::text AS last_ms
+       FROM sessions.session_catalog
+      WHERE org_id = $1 AND session_id = $2 AND workspace_id IS NOT NULL AND source IS NOT NULL
+      LIMIT 1000`,
+    [orgId, sessionId],
+  );
+  for (const row of catalog.rows) {
+    const k = JSON.stringify([row.workspace_id, row.source]);
+    if (units.has(k)) continue;
+    const first = row.first_ms === null ? 0 : Number(row.first_ms);
+    const last = row.last_ms === null ? first : Number(row.last_ms);
+    units.set(k, {
+      unit: { orgId, workspaceId: row.workspace_id, source: row.source, sessionId, firstMs: first, lastMs: last, machineIds: [], totals: {} },
+      sums: Object.fromEntries(SUMS.map((f) => [f, 0n])),
+      machines: new Set(),
+      models: new Set(),
+    });
   }
   return [...units.values()].map(({ unit, sums, machines, models }) => {
     const firstMs = Number.isFinite(unit.firstMs) ? unit.firstMs : 0;

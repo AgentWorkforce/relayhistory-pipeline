@@ -324,6 +324,22 @@ describe("delete propagation", () => {
     state.close();
   });
 
+  test("an exported session Neon has only in the catalog (no rollup) is never erased", async () => {
+    const { store } = await countingStore();
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const r = await exportUnit(target(store), unit("o1", { sessionId: "cat-only" }), fixedSource(baseRecords().slice(0, 1)));
+    state.markExported("o1", "cat-only", 0, r.manifests.map((m) => m.manifestKey), Date.now() - 1000);
+    const job = new ErasureJob(
+      sweepDb([{ org_id: "o9", session_id: "x", last_ms: "1", events: "1" }], [], [{ org_id: "o1", session_id: "cat-only" }]),
+      state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {},
+    );
+    await job.sweep();
+    await job.drain();
+    expect((await allKeys(store)).length).toBeGreaterThan(0);
+    expect(state.exported("o1", "cat-only")!.keys.length).toBe(1);
+    state.close();
+  });
+
   test("the erasure job erases a group a deletion fence covers", async () => {
     const { store } = await countingStore();
     const state = new SyncState(join(await tempDir(), "s.sqlite"));
@@ -701,6 +717,7 @@ describe("run loop", () => {
     const db: Queryable = {
       async query<T>(sql: string, params?: unknown[]) {
         if (sql.includes("pg_locks")) return { rows: [{ total: "0", non_advisory: "0" }] as T[] };
+        if (sql.includes("FROM sessions.session_catalog")) return { rows: [] as T[] };
         if (sql.includes("LIMIT 10000"))
           return { rows: [{ workspace_id: "w", source: "claude", first_ms: String(T0), last_ms: String(T0), machine_ids: [], models: [], event_count: "1", input_tokens: "0", output_tokens: "0", reasoning_tokens: "0", cache_read_tokens: "0", cache_create_tokens: "0", cost_usd_metros: "0", cost_usd_micros: "0", _s: params?.[1] }] as T[] };
         throw new Error("unexpected query");
@@ -709,7 +726,11 @@ describe("run loop", () => {
     const source = (): UnitSource => ({
       fenced: async () => false,
       async *lines(u) {
-        if (u.sessionId === "s0") await new Promise((r) => setTimeout(r, 1500)); // the slow one
+        if (u.sessionId === "s0") {
+          // Hold until every other group is done (a batch barrier would deadlock here; 8 s fallback).
+          const t0 = Date.now();
+          while (order.length < 39 && Date.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 10));
+        } // the slow one
         order.push(u.sessionId);
         yield { machine: "delivery:m", bytes: buildSessionStream([rec("session_event", "o", u.sessionId, { a: 1 })]).bytes, userId: "u" };
       },
@@ -772,6 +793,9 @@ CREATE TABLE sessions.session_rollups (org_id text, session_id text, workspace_i
   cost_usd_micros bigint, input_tokens bigint, output_tokens bigint, reasoning_tokens bigint, cache_read_tokens bigint, cache_create_tokens bigint);
 CREATE TABLE sessions.session_revisions (org_id text, session_id text, revision bigint, updated_at timestamptz, PRIMARY KEY (org_id, session_id));
 CREATE TABLE sessions.deleted_upload_sessions (org_id text, workspace_id text, user_id text, origin_id text, source text, session_id text);
+CREATE TABLE sessions.session_catalog (org_id text, workspace_id text, source text, session_id text, record_id text, origin_id text,
+  user_id text, title text, first_activity_at timestamptz, last_activity_at timestamptz, received_at timestamptz,
+  PRIMARY KEY (org_id, workspace_id, source, session_id));
 CREATE TABLE sessions.session_resets (org_id text, workspace_id text, user_id text, request_id text, deleted bigint);
 `;
 
@@ -877,6 +901,36 @@ describe("Neon reader SQL (Neon-shaped PGlite)", () => {
     await pg.close();
   }, 60_000);
 
+  test("a session with delivery records and a catalog row but no rollup is discovered and exported", async () => {
+    const pg = new PGlite();
+    await pg.exec(NEON_SCHEMA);
+    await pg.query(`INSERT INTO sessions.session_catalog VALUES ('o1', 'w1', 'claude', 'c1', 'r0', 'oa', 'u1', 't', '2026-10-20T10:00:00Z', '2026-10-20T11:00:00Z', '2026-10-20T11:00:00Z')`);
+    for (const [i, kind] of ["session", "presence", "session_event"].entries())
+      await pg.query(
+        `INSERT INTO sessions.delivery_records VALUES ('o1', 'w1', 'oa', $1, 'r', 1, 'd', $2, 'claude', 'c1', 'upsert', '{"a":1}', 'u1', '2026-10-20T10:00:00Z')`,
+        [`r${i}`, kind],
+      );
+    const db = readOnly(pg as unknown as Queryable);
+    const { catalogPage } = await import("../neon-s3-sync/neon-reader.ts");
+    expect((await catalogPage(db, null)).map((r) => r.session_id)).toEqual(["c1"]);
+    const units = await sessionUnits(db, "o1", "c1");
+    expect(units).toHaveLength(1);
+    expect(units[0]).toMatchObject({ workspaceId: "w1", source: "claude", firstMs: Date.parse("2026-10-20T10:00:00Z") });
+    const { store } = await countingStore();
+    const r = await exportUnit(target(store), units[0]!, neonUnitSource(db, async () => {}));
+    expect(r.manifests).toHaveLength(1);
+    const m = await parseManifest(await readText(store, r.manifests[0]!.manifestKey), r.manifests[0]!.manifestKey);
+    const read = await readRelayhistoryExport(m, store, (b) => new Uint8Array(zstdDecompressSync(b)), { prefix: "96bulls/o1" });
+    expect(read.map((x) => x.kind).sort()).toEqual(["presence", "session", "session_event"]);
+    // The exporter's activity sweep sees it.
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const syncer = new Syncer(db, state, target(store), fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false);
+    await syncer.sweepActivity();
+    expect(state.nextWork(Date.parse("2026-10-21T00:00:00Z"), 14 * 86_400_000, 10).map((w) => w.session_id)).toEqual(["c1"]);
+    state.close();
+    await pg.close();
+  }, 60_000);
+
   test("exports every kind the projection reads, including trajectory and commit_link", async () => {
     const projected = ["history", "session_event", "tool_call", "file_edit", "trajectory", "session", "relationship", "session_marker", "commit_link"];
     for (const k of projected) expect(EXPORT_KINDS as readonly string[]).toContain(k);
@@ -941,6 +995,7 @@ function fakeDb(units: SessionUnit[]): Queryable & { units: SessionUnit[] } {
         };
       }
       if (sql.includes("pg_locks")) return { rows: [{ total: "0", non_advisory: "0" }] as T[] };
+      if (sql.includes("FROM sessions.session_catalog") && sql.includes("LIMIT 1000")) return { rows: [] as T[] };
       throw new Error("unexpected query");
     },
   };
@@ -963,12 +1018,18 @@ async function eraseOrphans(store: ObjectStore, org: string, r: { manifests: { o
 }
 
 /** A Neon stand-in for the erasure sweep: rollup activity pages and fenced groups. */
-function sweepDb(activity: { org_id: string; session_id: string; last_ms: string; events: string }[], fenced: { org_id: string; session_id: string }[] = []): Queryable {
+function sweepDb(
+  activity: { org_id: string; session_id: string; last_ms: string; events: string }[],
+  fenced: { org_id: string; session_id: string }[] = [],
+  catalog: { org_id: string; session_id: string }[] = [],
+): Queryable {
   return {
     async query<T>(sql: string, params?: unknown[]) {
       if (sql.includes("pg_locks")) return { rows: [{ total: "0", non_advisory: "0" }] as T[] };
-      if (sql.startsWith("SELECT 1 FROM sessions.session_rollups"))
-        return { rows: activity.filter((a) => a.org_id === params?.[0] && a.session_id === params?.[1]).map(() => ({})) as T[] };
+      if (sql.includes("UNION ALL") && sql.includes("FROM sessions.session_catalog WHERE org_id = $1"))
+        return { rows: [...activity, ...catalog].filter((a) => a.org_id === params?.[0] && a.session_id === params?.[1]).map(() => ({})) as T[] };
+      if (sql.includes("FROM sessions.session_catalog") && sql.includes("ORDER BY org_id, workspace_id, source, session_id"))
+        return { rows: (sql.includes(") > (") ? [] : catalog.map((c) => ({ ...c, workspace_id: "w", source: "claude", last_ms: "1", events: "0" }))) as T[] };
       if (sql.includes("SELECT DISTINCT org_id, session_id FROM sessions.deleted_upload_sessions")) return { rows: fenced as T[] };
       if (sql.includes("FROM sessions.session_rollups") && sql.includes("GROUP BY org_id, session_id"))
         return { rows: (sql.includes("(org_id, session_id) >") ? [] : activity) as T[] };
