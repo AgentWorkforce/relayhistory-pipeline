@@ -46,6 +46,7 @@ import * as Effect from "effect/Effect";
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
 import { sha256, type Provenance } from "../../src/cli/plan-provenance.ts";
 import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hardening.ts";
+import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 
 /** K-45 (Khaliq, 2026-10-31): logical delete immediately, physical purge within 48 h. */
@@ -166,6 +167,7 @@ export type TranscriptStorePlanPhase =
   | "principal-propagation recovery"
   | "post-merge policy remediation"
   | "srv-writer addition"
+  | "srv-writer propagation recovery"
   | "post-apply";
 
 const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
@@ -176,12 +178,21 @@ const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; ac
   { name: "post-merge policy remediation", actions: { "trail-key": "update", "trail-logs": "update" } },
   // Adding the relayhistory-api live writer to the applied store: the new user, and the key policy that names it.
   { name: "srv-writer addition", actions: { "transcript-srv-writer": "create", "transcripts-key": "update" } },
+  // The srv-writer addition's own recovery: the user was created (now noop, so it exists in state) but
+  // KMS refused the key policy because the new principal had not propagated. Only the key policy update
+  // that adds the srv-writer's statement is accepted (assertSrvWriterRecoveryDiff).
+  { name: "srv-writer propagation recovery", actions: { "transcripts-key": "update" } },
   { name: "post-apply", actions: {} },
 ];
 
 export interface TranscriptStorePlanCapture {
   detailedPlanText: string;
   provenanceText: string;
+  /**
+   * The read-only state snapshot the capture planned against (capture only). The deploy has no
+   * snapshot; it is bound to the same state by the capture's version digest (capture-verify.ts).
+   */
+  stateSnapshotText?: string;
 }
 
 function transcriptPlanOperations(text: string, label: "compact" | "detailed", refuse: (why: string) => never) {
@@ -260,9 +271,79 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   );
   if (!phase) {
     const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
-    return refuse(`action set does not match initial, recovery, exact two-policy remediation, srv-writer addition, or post-apply phase: ${changes.join(", ") || "(none)"}`);
+    return refuse(`action set does not match initial, recovery, exact two-policy remediation, srv-writer addition, srv-writer recovery, or post-apply phase: ${changes.join(", ") || "(none)"}`);
   }
+  if (phase.name === "srv-writer propagation recovery") assertSrvWriterRecoveryDiff(capture.detailedPlanText, capture.stateSnapshotText, refuse);
   return phase.name;
+}
+
+const SRV_WRITER_KEY_SID = "SrvWriterEncryptsAndReadsViaS3";
+
+/**
+ * A lone transcripts-key update is the srv-writer recovery only in one of two forms:
+ *   - the detailed plan shows the live policy without the srv-writer's statement and the planned
+ *     policy with exactly one; or
+ *   - Alchemy persisted the failed update (state `updating`), so the plan shows "no declared property
+ *     changes" and the update re-applies the stored props. Then the capture's state snapshot must show
+ *     those props are exactly the previous props plus the one srv-writer statement naming the
+ *     srv-writer user. The deploy is bound to that same state by the capture's version digest.
+ * Any other lone key-policy update stays refused.
+ */
+function assertSrvWriterRecoveryDiff(detailedPlanText: string, stateSnapshotText: string | undefined, refuse: (why: string) => never) {
+  const lines = detailedPlanText.split(/\r?\n/);
+  const start = lines.findIndex((line) => /^\s*\[transcripts-key\]\s+update\s*$/.test(line));
+  if (start < 0) refuse("srv-writer recovery: detailed plan has no transcripts-key update");
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(line));
+  const block = end < 0 ? rest : rest.slice(0, end);
+  const body = block.map((line) => line.trim()).filter(Boolean);
+  if (body.length === 1 && body[0] === "no declared property changes") {
+    if (stateSnapshotText !== undefined) assertPendingSrvWriterKeyUpdate(stateSnapshotText, refuse);
+    return;
+  }
+  const sid = new RegExp(`^\\s*([+-])\\s+Sid:\\s*${SRV_WRITER_KEY_SID}\\s*$`);
+  const marks = block.map((line) => sid.exec(line)?.[1]).filter(Boolean);
+  if (marks.includes("-")) refuse(`srv-writer recovery: the live key policy already has ${SRV_WRITER_KEY_SID}`);
+  if (marks.filter((m) => m === "+").length !== 1) refuse(`srv-writer recovery: the key policy update must add exactly one ${SRV_WRITER_KEY_SID} statement`);
+}
+
+type PolicyStatement = { Sid?: string; Principal?: { AWS?: unknown } } & Record<string, unknown>;
+type KeyState = { status?: string; props?: { policy?: { Statement?: PolicyStatement[] } & Record<string, unknown> } & Record<string, unknown>; old?: KeyState };
+
+const stableJson = (value: unknown): string =>
+  Array.isArray(value)
+    ? `[${value.map(stableJson).join(",")}]`
+    : value !== null && typeof value === "object"
+      ? `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableJson((value as Record<string, unknown>)[k])}`).join(",")}}`
+      : JSON.stringify(value);
+
+/** The persisted transcripts-key update adds exactly the srv-writer statement and changes nothing else. */
+function assertPendingSrvWriterKeyUpdate(stateSnapshotText: string, refuse: (why: string) => never) {
+  let objects: Array<{ key: string; text: string }>;
+  try {
+    objects = (JSON.parse(stateSnapshotText) as { objects: Array<{ key: string; text: string }> }).objects;
+  } catch {
+    return refuse("srv-writer recovery: state snapshot is not valid JSON");
+  }
+  const read = <T>(name: string): T => {
+    const hits = objects.filter((o) => o.key === `${alchemyStatePrefix(TRANSCRIPT_STAGE)}/${name}.json`);
+    if (hits.length !== 1) refuse(`srv-writer recovery: state snapshot has ${hits.length} ${name} records`);
+    return JSON.parse(hits[0]!.text) as T;
+  };
+  const key = read<KeyState>("transcripts-key");
+  const user = read<{ status?: string; attr?: { userArn?: string } }>("transcript-srv-writer");
+  if (key.status !== "updating" || key.old?.status !== "created") refuse("srv-writer recovery: transcripts-key is not a persisted pending update");
+  if (user.status !== "created" || !user.attr?.userArn) refuse("srv-writer recovery: transcript-srv-writer is not created in state");
+  const planned = key.props?.policy?.Statement ?? [];
+  const previous = key.old?.props?.policy?.Statement ?? [];
+  const added = planned.filter((s) => s.Sid === SRV_WRITER_KEY_SID);
+  if (added.length !== 1 || previous.some((s) => s.Sid === SRV_WRITER_KEY_SID))
+    refuse(`srv-writer recovery: the pending key policy must add exactly one ${SRV_WRITER_KEY_SID} statement`);
+  if (stableJson(added[0]!.Principal) !== stableJson({ AWS: user.attr!.userArn }))
+    refuse(`srv-writer recovery: ${SRV_WRITER_KEY_SID} must name the srv-writer user`);
+  const strip = (k: KeyState | undefined, keep: PolicyStatement[]) => stableJson({ ...k?.props, policy: { ...k?.props?.policy, Statement: keep } });
+  if (strip(key, planned.filter((s) => s.Sid !== SRV_WRITER_KEY_SID)) !== strip(key.old, previous))
+    refuse("srv-writer recovery: the pending key update changes more than the srv-writer statement");
 }
 
 /**

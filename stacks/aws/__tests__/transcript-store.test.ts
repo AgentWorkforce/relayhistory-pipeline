@@ -411,7 +411,7 @@ describe("transcript store: deploy plan contract", () => {
   const check = (compact: string, full = detailed(compact), record = provenance(compact, full)) =>
     assertTranscriptStorePlanContract(compact, { detailedPlanText: full, provenanceText: record });
 
-  it("accepts only the exact initial, recovery, two-policy remediation, srv-writer addition, and final all-noop phases", () => {
+  it("accepts only the exact initial, recovery, two-policy remediation, srv-writer addition, srv-writer recovery, and final all-noop phases", () => {
     expect(check(plan(Object.fromEntries(resources.map((resource) => [resource, "create"]))))).toBe("initial");
     expect(check(plan({ transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" }))).toBe("principal-propagation recovery");
     expect(check(plan({ "trail-key": "update", "trail-logs": "update" }))).toBe("post-merge policy remediation");
@@ -422,10 +422,87 @@ describe("transcript store: deploy plan contract", () => {
   it("the srv-writer addition is exactly the new user plus the key policy update", () => {
     for (const actions of [
       { "transcript-srv-writer": "create" },
-      { "transcripts-key": "update" },
       { "transcript-srv-writer": "create", "transcripts-key": "update", transcripts: "update" },
       { "transcript-srv-writer": "update", "transcripts-key": "update" },
     ]) expect(() => check(plan(actions))).toThrow(/action set does not match/);
+  });
+
+  // A detailed plan whose transcripts-key update shows the live policy (-) and the planned policy (+).
+  const keyDiff = (live: string[], planned: string[]) => [
+    "  properties:", "    policy:",
+    ...live.map((sid) => `  -       - Sid: placeholder\n  -         Sid: ${sid}`),
+    ...planned.map((sid) => `  +         Sid: ${sid}`),
+  ].join("\n");
+  const withKeyDiff = (compact: string, diff: string) =>
+    detailed(compact).replace("  [transcripts-key] update", `  [transcripts-key] update\n${diff}`);
+  const LIVE = ["AccountAdministersKey", "WriterEncryptsAndReadsViaS3", "ReaderDecryptsViaS3"];
+  const PLANNED = ["AccountAdministersKey", "WriterEncryptsAndReadsViaS3", "SrvWriterEncryptsAndReadsViaS3", "ReaderDecryptsViaS3"];
+
+  it("srv-writer recovery: accepts a lone transcripts-key update that adds the srv-writer's key statement", () => {
+    const compact = plan({ "transcripts-key": "update" });
+    const full = withKeyDiff(compact, keyDiff(LIVE, PLANNED));
+    expect(check(compact, full, provenance(compact, full))).toBe("srv-writer propagation recovery");
+  });
+
+  it("srv-writer recovery: rejects a key update that does not add exactly the srv-writer statement, and any other single update", () => {
+    const compact = plan({ "transcripts-key": "update" });
+    for (const [diff, why] of [
+      [keyDiff(LIVE, LIVE), /must add exactly one SrvWriterEncryptsAndReadsViaS3/],
+      [keyDiff(PLANNED, PLANNED), /already has SrvWriterEncryptsAndReadsViaS3/],
+      [keyDiff(LIVE, [...PLANNED, "SrvWriterEncryptsAndReadsViaS3"]), /must add exactly one/],
+    ] as const) {
+      const full = withKeyDiff(compact, diff);
+      expect(() => check(compact, full, provenance(compact, full))).toThrow(why);
+    }
+    expect(() => check(compact)).toThrow(/must add exactly one/);
+    for (const resource of resources.filter((r) => r !== "transcripts-key"))
+      expect(() => check(plan({ [resource]: "update" }))).toThrow(/action set does not match/);
+    for (const actions of [
+      { "transcripts-key": "update", "transcript-srv-writer": "update" },
+      { "transcripts-key": "update", transcripts: "update" },
+    ]) expect(() => check(plan(actions))).toThrow(/action set does not match/);
+  });
+
+  // Alchemy persisted the failed update: the plan shows no property change, the state holds the pending props.
+  const SRV = `arn:aws:iam::${ACCOUNT}:user/96bulls/96bulls-aws-sessions-prod-transcript-srv-writer`;
+  const stmt = (Sid: string, AWS = `arn:aws:iam::${ACCOUNT}:root`) => ({ Sid, Effect: "Allow", Principal: { AWS }, Action: ["kms:Decrypt"], Resource: "*" });
+  const keyProps = (statements: object[]) => ({ deletionWindow: 30, enableKeyRotation: true, policy: { Version: "2012-10-17", Statement: statements } });
+  const LIVE_STMTS = LIVE.map((sid) => stmt(sid));
+  const SRV_STMT = stmt("SrvWriterEncryptsAndReadsViaS3", SRV);
+  const snapshot = (o: { status?: string; props?: object; old?: object; user?: object } = {}) => JSON.stringify({
+    schema: 1,
+    objects: [
+      { key: `96bulls/96bulls-aws/${STAGE}/transcripts-key.json`, text: JSON.stringify({
+        status: o.status ?? "updating",
+        props: o.props ?? keyProps([LIVE_STMTS[0], LIVE_STMTS[1], SRV_STMT, LIVE_STMTS[2]]),
+        old: { status: "created", props: o.old ?? keyProps(LIVE_STMTS) },
+      }) },
+      { key: `96bulls/96bulls-aws/${STAGE}/transcript-srv-writer.json`, text: JSON.stringify(o.user ?? { status: "created", attr: { userArn: SRV } }) },
+    ],
+  });
+  const pending = (stateSnapshotText?: string) => {
+    const compact = plan({ "transcripts-key": "update" });
+    const full = withKeyDiff(compact, "    no declared property changes");
+    return assertTranscriptStorePlanContract(compact, { detailedPlanText: full, provenanceText: provenance(compact, full), stateSnapshotText });
+  };
+
+  it("srv-writer recovery: accepts a persisted pending key update that adds only the srv-writer's statement", () => {
+    expect(pending(snapshot())).toBe("srv-writer propagation recovery");
+    // The deploy has no snapshot; it is bound to the captured state by the version digest.
+    expect(pending()).toBe("srv-writer propagation recovery");
+  });
+
+  it("srv-writer recovery: rejects a pending key update that is not exactly the srv-writer statement", () => {
+    for (const [snap, why] of [
+      [snapshot({ status: "created" }), /not a persisted pending update/],
+      [snapshot({ props: keyProps(LIVE_STMTS) }), /must add exactly one/],
+      [snapshot({ old: keyProps([...LIVE_STMTS, SRV_STMT]) }), /must add exactly one/],
+      [snapshot({ props: keyProps([...LIVE_STMTS, stmt("SrvWriterEncryptsAndReadsViaS3", "*")]) }), /must name the srv-writer user/],
+      [snapshot({ props: keyProps([...LIVE_STMTS.slice(0, 2), SRV_STMT]) }), /changes more than the srv-writer statement/],
+      [snapshot({ props: { ...keyProps([...LIVE_STMTS, SRV_STMT]), enableKeyRotation: false } }), /changes more than the srv-writer statement/],
+      [snapshot({ user: { status: "creating" } }), /transcript-srv-writer is not created/],
+      ["not json", /not valid JSON/],
+    ] as const) expect(() => pending(snap)).toThrow(why);
   });
 
   it("permits exactly two named updates, rejecting one, three, or a different resource", () => {
@@ -471,7 +548,7 @@ describe("transcript store: deploy plan contract", () => {
   });
 
   it("checks the production contract before a capture can replace reviewed files, and again before deploy", () => {
-    const captureCheck = captureWorkflow.indexOf("if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText });");
+    const captureCheck = captureWorkflow.indexOf("if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText });");
     expect(captureCheck).toBeGreaterThan(0);
     expect(captureCheck).toBeLessThan(captureWorkflow.indexOf("writeFileSync(p.plan, plan)"));
     expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText })");

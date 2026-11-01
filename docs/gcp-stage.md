@@ -73,6 +73,36 @@ operations do not traverse the HTTP machine gate, and their boundary is the
 vended Google credential, not `meta.machineId`. Route tests therefore prove no
 bucket-direct isolation.
 
+### Workload egress restriction
+
+The `96bulls` namespace is default-deny in both directions; GKE Dataplane V2
+enforces it (`stacks/gcp/egress.ts`). Only these flows are allowed:
+
+| From | To | Port |
+| --- | --- | --- |
+| every pod | kube-dns / NodeLocal DNSCache (`kube-system`, `169.254.20.10`) | 53 UDP/TCP |
+| every pod | GKE metadata server (`169.254.169.254`, `169.254.169.252`) | 80, 988 |
+| every pod | `private.googleapis.com` (`199.36.153.8/30`) | 443 |
+| worker, AlleyOop | `cloud-sql-proxy` pods | 5432 |
+| worker, AlleyOop | Memorystore Redis (PSA range `10.80.0.0/20`) | 6378 |
+| AlleyOop | RelayAuth pods in `relayauth` | 8787 |
+| `cloud-sql-proxy` | Cloud SQL private IP (PSA range) | 3307 |
+| worker, AlleyOop → `cloud-sql-proxy` | ingress | 5432 |
+
+A private Cloud DNS zone for `googleapis.com`, bound to the stage VPC, maps
+`*.googleapis.com` to `private.googleapis.com`. With Private Google Access on
+the subnet, every Google API call stays on the private VIPs, so no rule allows
+the public internet: no arbitrary HTTPS, no external DNS resolver, and no other
+namespace. Kubelet probes and `kubectl port-forward` originate on the node and
+are not subject to pod policy. The `relayauth` namespace is not restricted by
+this change. Applying the policy requires `bulls96.relayauthJwksUrl` to be the
+in-cluster RelayAuth service, the only JWKS destination it allows; a public JWKS
+URL is refused rather than silently cut off. Deliberately not allowed: in-cluster
+ingress to AlleyOop (nothing calls it in-cluster and it has no Ingress or load
+balancer), and per-API Google scoping. `private.googleapis.com` serves every API;
+narrowing that needs VPC Service Controls with `restricted.googleapis.com`, which
+is a separate lane. Meanwhile IAM bounds what each identity can do.
+
 ### Per-component bucket identities
 
 Each component now has its own Google service account, scoped like the AWS
