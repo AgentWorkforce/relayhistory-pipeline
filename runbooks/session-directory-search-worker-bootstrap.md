@@ -235,12 +235,15 @@ violation is named:
   This is compatibility, not a
   service requirement: no service creates temporary objects or relies on runtime
   `search_path`; see `docs/evidence/runtime-temp-usage.md`.
-- **Approved, and nothing else:** `USAGE` on schema `sessions`; `SELECT` on
-  `sessions.__96bulls_migrations` and `sessions.__96bulls_role_validation`, with no GRANT
-  OPTION; `CONNECT` on the database.
-- **No EXECUTE on any `sessions` function, trigger functions included.** A trigger fires
-  without its caller holding EXECUTE (a real PostgreSQL test shows it), so there is no
-  exemption. In the same transaction as phase 2 and the PASS write, the migrator runs
+- **Approved, and nothing else:** `USAGE` on schema `sessions`; read-only migration
+  ledger/marker access; `CONNECT`; and the immutable application table, identity-sequence,
+  callable-function and RLS-policy allowlists in `src/hoopdb/migrate-guards.ts`. The
+  migrator installs those grants only after all schema steps and validates the resulting
+  catalog before PASS. There is no ownership, DDL, `TRUNCATE`, `REFERENCES`, `TRIGGER`,
+  `MAINTAIN`, GRANT OPTION, or `BYPASSRLS`.
+- **No EXECUTE on an unlisted `sessions` function; trigger functions are never listed.**
+  A trigger fires without its caller holding EXECUTE (a real PostgreSQL test shows it).
+  In the same transaction as phase 2 and the PASS write, the migrator runs
   `REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC` on every run. That is
   idempotent; if validation fails, the revoke rolls back with it (a test proves the state is
   unchanged). It fixes existing functions only, not future ones; see "Function boundary"

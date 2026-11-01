@@ -21,6 +21,7 @@ import {
   inventoryOf,
   MIGRATION_CHECKSUM_ALIASES,
   migrationChecksumMatches,
+  RUNTIME_APPLICATION_FUNCTIONS,
   sessionsFunctionAcl,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
   SUPABASE_PLATFORM_SUPERUSERS,
@@ -336,7 +337,7 @@ describe("runtime role: required, existing, SELECT only", () => {
     expect(await snapshot(db)).toEqual(before);
   });
 
-  test("a dedicated runtime role gets SELECT on the ledger and marker only: no DML, no DDL, owns nothing, NOBYPASSRLS, and the live gate passes as it", async () => {
+  test("a dedicated runtime role gets the exact service ACL plus read-only readiness metadata, no DDL, ownership or BYPASSRLS, and the live gate passes", async () => {
     const db = await fresh();
     await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
     await runMigrations(client(db), {
@@ -369,6 +370,32 @@ describe("runtime role: required, existing, SELECT only", () => {
         g: false,
       });
     }
+    expect(
+      (
+        await db.query<Record<string, boolean>>(
+          `SELECT has_table_privilege('g6_rt', 'sessions.pipeline_jobs', 'SELECT, INSERT, UPDATE, DELETE') AS queue_dml,
+                  has_table_privilege('g6_rt', 'sessions.pipeline_jobs', 'TRUNCATE') AS queue_truncate,
+                  has_sequence_privilege('g6_rt', 'sessions.pipeline_jobs_id_seq', 'USAGE') AS queue_sequence,
+                  has_function_privilege('g6_rt', 'sessions.upsert_session_index(jsonb)', 'EXECUTE') AS index_rpc,
+                  has_function_privilege('g6_rt', 'sessions.pipeline_jobs_observability()', 'EXECUTE') AS trigger_execute`,
+        )
+      ).rows[0],
+    ).toEqual({
+      queue_dml: true,
+      queue_truncate: false,
+      queue_sequence: true,
+      index_rpc: true,
+      trigger_execute: false,
+    });
+    expect(
+      (
+        await db.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM pg_policy p
+            WHERE p.polname = 'bulls96_runtime_service'
+              AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
+        )
+      ).rows[0]?.n,
+    ).toBe(23);
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
@@ -591,9 +618,9 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       "CREATE on the database",
     ],
     [
-      "existing DML",
-      "GRANT INSERT, UPDATE ON sessions.session_index TO g6_bad",
-      "INSERT,UPDATE on sessions.session_index",
+      "unapproved table privilege",
+      "GRANT TRUNCATE ON sessions.session_index TO g6_bad",
+      "TRUNCATE on sessions.session_index",
     ],
     [
       "a column privilege",
@@ -607,8 +634,8 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
     ],
     [
       "unapproved EXECUTE (direct)",
-      "GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO g6_bad",
-      "EXECUTE on sessions.upsert_session_index(jsonb)",
+      "GRANT EXECUTE ON FUNCTION sessions.session_directory_readiness() TO g6_bad",
+      "EXECUTE on sessions.session_directory_readiness()",
     ],
     [
       "EXECUTE on a trigger function (no exemption)",
@@ -797,16 +824,30 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
 
   test("the documented workload membership (no ADMIN) is accepted", async () => {
     const db = await migrated();
-    await db.exec(
-      "CREATE ROLE g6_bad NOLOGIN; CREATE ROLE g6_wl LOGIN; GRANT g6_bad TO g6_wl",
-    );
+    await db.exec("CREATE ROLE g6_wl LOGIN; GRANT g6_rt TO g6_wl");
     expect(
       await failure(
         runMigrations(client(db), {
-          profile: { ...GOOD, runtimeRole: "g6_bad", workloadRole: "g6_wl" },
+          profile: { ...GOOD, workloadRole: "g6_wl" },
         }),
       ),
     ).toBeNull();
+  });
+
+  test("an altered runtime RLS policy fails closed before the marker can be rewritten", async () => {
+    const db = await migrated();
+    await db.exec(
+      "ALTER POLICY bulls96_runtime_service ON sessions.pipeline_jobs USING (false)",
+    );
+    const before = await state(db);
+    const error = await failure(
+      runMigrations(client(db), { profile: GOOD }),
+    );
+    expect(error?.code).toBe("runtime_role_unsafe");
+    expect(error?.message).toContain(
+      "unapproved policy bulls96_runtime_service on sessions.pipeline_jobs",
+    );
+    expect(await state(db)).toEqual(before);
   });
 
   test("selfhosted refuses the migration owner as the runtime role (owner-run is local only)", async () => {
@@ -1196,6 +1237,17 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   const MANIFEST = JSON.parse(
     readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8"),
   ).functions;
+  const manifestWithRuntime = (role: string) =>
+    Object.fromEntries(
+      Object.entries(MANIFEST).map(([fn, entries]) => [
+        fn,
+        RUNTIME_APPLICATION_FUNCTIONS.includes(
+          fn as (typeof RUNTIME_APPLICATION_FUNCTIONS)[number],
+        )
+          ? [...(entries as string[]), `${role}:EXECUTE`]
+          : entries,
+      ]),
+    );
 
   test("ACL manifest regression: every sessions function's ACL after a clean migrate is exactly the committed manifest", async () => {
     const db = await fresh();
@@ -1868,7 +1920,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       functionBoundary: "global-default-revoke",
     };
     await runMigrations(client(db), { profile: SELFP });
-    expect(await sessionsFunctionAcl(client(db))).toEqual(MANIFEST);
+    expect(await sessionsFunctionAcl(client(db))).toEqual(
+      manifestWithRuntime("g6_rt"),
+    );
     await db.exec(`CREATE FUNCTION sessions.g6_future() RETURNS int LANGUAGE sql AS 'SELECT 1';
       CREATE SCHEMA g6_second; CREATE FUNCTION g6_second.g6_future() RETURNS int LANGUAGE sql AS 'SELECT 1';
       CREATE ROLE g6_probe NOLOGIN;`);
@@ -1886,7 +1940,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       "DROP FUNCTION sessions.g6_future(); DROP SCHEMA g6_second CASCADE",
     );
     await runMigrations(client(db), { profile: SELFP });
-    expect(await sessionsFunctionAcl(client(db))).toEqual(MANIFEST);
+    expect(await sessionsFunctionAcl(client(db))).toEqual(
+      manifestWithRuntime("g6_rt"),
+    );
   });
 });
 

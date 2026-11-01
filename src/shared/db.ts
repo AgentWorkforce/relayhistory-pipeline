@@ -1,5 +1,6 @@
 /** HoopDb access: a pg Pool that satisfies the vendored SqlExecutor, plus readiness gates. */
 import { readFileSync } from "node:fs";
+import { RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
@@ -116,6 +117,10 @@ const ROLE_VERIFY_SQL = readFileSync(ROLE_VERIFY_SQL_PATH, "utf8");
  * next migrate; this check turns readiness (and worker claiming) off at the next probe
  * instead (55000).
  */
+const RUNTIME_FUNCTION_REGPROCEDURES = RUNTIME_APPLICATION_FUNCTIONS.map(
+  (fn) => `'${fn.replaceAll("'", "''")}'::regprocedure`,
+).join(", ");
+
 export const SESSIONS_FUNCTION_GATE_SQL = `DO $sessions_fn_gate$
 DECLARE v text;
 BEGIN
@@ -126,7 +131,8 @@ BEGIN
           OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')
           OR (has_function_privilege(current_user, p.oid, 'EXECUTE')
               AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
-              AND NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)));
+              AND NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+              AND p.oid <> ALL (ARRAY[${RUNTIME_FUNCTION_REGPROCEDURES}]::oid[])));
   IF v IS NOT NULL THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'live gate: sessions functions executable by PUBLIC or the runtime role: ' || v;
