@@ -200,6 +200,7 @@ export class ErasureJob {
   }
 
   async run(opts: { once?: boolean } = {}) {
+    this.state.releaseStaleLeases("eraser:", LEASE_HOLDER);
     while (!this.stopped()) {
       if (this.now() - this.#lastSweep >= this.cfg.sweepEveryMs) {
         this.#lastSweep = this.now();
