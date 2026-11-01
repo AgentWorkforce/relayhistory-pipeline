@@ -17,6 +17,25 @@ export interface Eraser {
   eraseObject(key: string): Promise<number>;
   /** Every version of every key under `prefix` (which ends in `/`), manifests first. */
   erasePrefix(prefix: string): Promise<number>;
+  /**
+   * Every version of every key under `base` (ends in `/`) that sits in the
+   * session directory `base + d=yyyy/mm/dd/ + sessionSegment + /`, whatever
+   * its date. Used for relayhistory-api's live objects, whose `d=` the eraser
+   * cannot read (it holds no GetObject).
+   */
+  eraseSessionAnyDate(base: string, sessionSegment: string, before?: Date): Promise<{ deleted: number; kept: number }>;
+  /** Every version of exactly this key last modified before `before` (all when unset). */
+  eraseObjectBefore(key: string, before: Date): Promise<{ deleted: number; kept: number }>;
+  /** Keys with any version under `prefix` (ends in `/`). */
+  listKeys(prefix: string): Promise<string[]>;
+}
+
+/** True when `key` is inside `base` + `d=yyyy/mm/dd/` + `sessionSegment` + `/`. */
+export function inSessionAnyDate(base: string, sessionSegment: string, key: string): boolean {
+  if (!key.startsWith(base)) return false;
+  const rest = key.slice(base.length);
+  const m = /^d=\d{4}\/\d{2}\/\d{2}\/([^/]+)\//.exec(rest);
+  return !!m && m[1] === sessionSegment;
 }
 
 export interface S3EraserConfig {
@@ -31,6 +50,16 @@ export interface S3EraserConfig {
 interface Version {
   key: string;
   versionId: string;
+  lastModified?: number;
+}
+
+/** Split versions into those strictly older than `before` (erasable) and the rest (kept). */
+function cut<T extends { lastModified?: number }>(list: T[], before?: Date): { erase: T[]; kept: number } {
+  if (!before) return { erase: list, kept: 0 };
+  const limit = before.getTime();
+  // A version with no readable time is kept: never erase what might be new.
+  const erase = list.filter((v) => v.lastModified !== undefined && v.lastModified < limit);
+  return { erase, kept: list.length - erase.length };
 }
 
 const coded = (code: string, message: string) => Object.assign(new Error(message), { code });
@@ -70,8 +99,10 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser {
         for (const el of xmlElements(xml, tag)) {
           const key = xmlText(el, "Key");
           const versionId = xmlText(el, "VersionId");
+          const modified = Date.parse(xmlText(el, "LastModified") ?? "");
           // xmlText already decodes entities; decoding again would mangle a literal `&amp;`.
-          if (key !== undefined && versionId !== undefined) out.push({ key, versionId });
+          if (key !== undefined && versionId !== undefined)
+            out.push({ key, versionId, ...(Number.isFinite(modified) ? { lastModified: modified } : {}) });
         }
       if (xmlText(xml, "IsTruncated") !== "true") return out;
       keyMarker = xmlText(xml, "NextKeyMarker");
@@ -99,6 +130,19 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
       return remove(await versions(prefix));
     },
+    eraseSessionAnyDate: async (base, segment, before) => {
+      if (!base.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
+      const { erase, kept } = cut((await versions(`${base}d=`)).filter((v) => inSessionAnyDate(base, segment, v.key)), before);
+      return { deleted: await remove(erase), kept };
+    },
+    eraseObjectBefore: async (key, before) => {
+      const { erase, kept } = cut((await versions(key)).filter((v) => v.key === key), before);
+      return { deleted: await remove(erase), kept };
+    },
+    listKeys: async (prefix) => {
+      if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
+      return [...new Set((await versions(prefix)).map((v) => v.key))];
+    },
   };
 }
 
@@ -122,6 +166,39 @@ export function storeEraser(store: ObjectStore): Eraser {
       keys.sort((a, b) => Number(b.endsWith("/manifest.json")) - Number(a.endsWith("/manifest.json")));
       for (const k of keys) await store.delete(objectKey(k));
       return keys.length;
+    },
+    async eraseSessionAnyDate(base, segment, before) {
+      if (!base.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
+      const items: { key: string; lastModified: number }[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await store.list(objectKey(base.slice(0, -1)), cursor);
+        for (const i of page.items)
+          if (inSessionAnyDate(base, segment, i.key)) items.push({ key: i.key, lastModified: i.lastModified.getTime() });
+        cursor = page.nextCursor;
+      } while (cursor);
+      const { erase, kept } = cut(items, before);
+      erase.sort((a, b) => Number(b.key.endsWith("/manifest.json")) - Number(a.key.endsWith("/manifest.json")));
+      for (const i of erase) await store.delete(objectKey(i.key));
+      return { deleted: erase.length, kept };
+    },
+    async eraseObjectBefore(key, before) {
+      const meta = await store.head(objectKey(key));
+      if (!meta) return { deleted: 0, kept: 0 };
+      if (meta.lastModified.getTime() >= before.getTime()) return { deleted: 0, kept: 1 };
+      await store.delete(objectKey(key));
+      return { deleted: 1, kept: 0 };
+    },
+    async listKeys(prefix) {
+      if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
+      const keys: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
+        keys.push(...page.items.map((i) => i.key));
+        cursor = page.nextCursor;
+      } while (cursor);
+      return keys;
     },
   };
 }

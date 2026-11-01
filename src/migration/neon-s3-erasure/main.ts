@@ -30,6 +30,9 @@ function eraserFromEnv(execute: boolean): Eraser {
     return {
       eraseObject: async () => 0,
       erasePrefix: async () => 0,
+      eraseSessionAnyDate: async () => ({ deleted: 0, kept: 0 }),
+      eraseObjectBefore: async () => ({ deleted: 0, kept: 0 }),
+      listKeys: async () => [],
     };
   const bucket = env("S3X_BUCKET");
   if (!bucket || env("S3X_EXPECT_BUCKET") !== bucket) throw new Error("S3X_BUCKET must equal S3X_EXPECT_BUCKET (write guard)");
