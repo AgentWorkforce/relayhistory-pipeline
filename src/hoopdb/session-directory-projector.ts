@@ -23,7 +23,11 @@
  *     The row comes back with the historical created_at and no summary until Bob
  *     Costas writes one;
  *   - task_title, agent_name and short_summary are not in session_index and are kept
- *     as already projected (short_summary is written only by writeShortSummary).
+ *     as already projected (short_summary is written only by writeShortSummary);
+ *   - the catalog dimensions (agent names, catalog models, project key, relationships)
+ *     are written only by writeDirectoryCatalog; the projector keeps the agent rows'
+ *     last_activity_at equal to the row's and deletes agent and relationship rows on
+ *     tombstone (the tombstone trigger clears the catalog columns).
  *
  * search_text is always rebuilt with sessions.session_directory_search_text, so the
  * scrubbed short_summary stays part of it. The rollout marker is never set here.
@@ -119,6 +123,7 @@ export async function projectSessionDirectory(
     for (const table of [
       "session_directory_users",
       "session_directory_machines",
+      "session_directory_agents",
     ] as const) {
       await db.query(
         `DELETE FROM sessions.${table}
@@ -126,6 +131,12 @@ export async function projectSessionDirectory(
         params,
       );
     }
+    // The tombstoned session's own relationship records describe deleted content.
+    await db.query(
+      `DELETE FROM sessions.session_directory_relationships
+        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND parent_session_id = $4`,
+      params,
+    );
     return { projected: false, tombstoned: true };
   }
   // Membership companions: exactly the live pointers' users and machines.
@@ -157,5 +168,17 @@ export async function projectSessionDirectory(
       params,
     );
   }
+  // Agent rows come from the catalog writer (session-directory-catalog.ts); the
+  // projector only keeps their order key equal to the logical row's.
+  await db.query(
+    `UPDATE sessions.session_directory_agents AS a
+        SET last_activity_at = d.last_activity_at
+       FROM sessions.session_directory AS d
+      WHERE a.org_id = $1 AND a.workspace_id = $2 AND a.harness = $3 AND a.session_id = $4
+        AND d.org_id = a.org_id AND d.workspace_id = a.workspace_id
+        AND d.harness = a.harness AND d.session_id = a.session_id
+        AND a.last_activity_at IS DISTINCT FROM d.last_activity_at`,
+    params,
+  );
   return { projected: true, tombstoned: false };
 }
