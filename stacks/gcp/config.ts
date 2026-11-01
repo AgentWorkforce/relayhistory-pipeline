@@ -984,7 +984,9 @@ export function bulls96ReleaseValues(
       locker: locker(),
       lockerInit: { enabled: false },
       migrations: {
-        supabaseShim: true,
+        // The Cloud SQL operator bootstrap creates the fixed compatibility roles. The
+        // generic shim requires SUPERUSER for service_role BYPASSRLS and is forbidden.
+        supabaseShim: false,
         hoopdb: {
           existingSecret: i.existingSecretName,
           key: "HOOPDB_MIGRATION_URL",
@@ -996,7 +998,7 @@ export function bulls96ReleaseValues(
       },
       serviceAccount: { annotations: { ...identity } },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
-      // Cloud SQL is plain Postgres: selfhosted mode, the shim on, an explicit runtime role.
+      // Cloud SQL has an explicit mode, externally bootstrapped roles and runtime role.
       extraEnv: [
         ...dataEnv(),
         ...gcpHoopdbModeEnv(i.hoopdbRuntimeRole, i.hoopdbRuntimeRoleLogin),
@@ -1045,23 +1047,24 @@ export function relayflowsChartValues(
 
 /**
  * The GCP migrator's explicit profile: Cloud SQL is plain Postgres dedicated to HoopDb,
- * so selfhosted mode, the shim on, the exact global function default for the owner and
- * superusers (installed by supabase/bootstrap/hoopdb_function_default_revoke.sql), and the
- * dedicated runtime role. Cloud SQL gives the operator no superuser and its internal
- * cloudsqladmin cannot be altered (expected, not observed live), so that bootstrap cannot
- * run and the migrator's function-boundary gate stays refused (fail closed) until a
- * reviewed control exists (#98).
+ * so cloudsql mode, the generic shim off, external provisioning for compatibility roles, the
+ * owner-scoped global function default, and the dedicated runtime role. The catalog gate
+ * covers every ordinary sessions creator and records Google's fixed cloudsqladmin
+ * platform superuser as an explicit provider trust root.
  */
 export function gcpHoopdbModeEnv(
   runtimeRole?: string,
   runtimeLogin?: boolean,
 ): Array<{ name: string; value: string }> {
   return [
-    { name: "HOOPDB_DB_MODE", value: "selfhosted" },
+    { name: "HOOPDB_DB_MODE", value: "cloudsql" },
     // The worker chart renders HOOPDB_SUPABASE_SHIM exactly once for its
     // migration Job from worker.migrations.supabaseShim. Adding it to
     // worker.extraEnv makes the Kubernetes strategic-merge key ambiguous.
     { name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" },
+    // Cloud SQL exposes no customer SUPERUSER. The operator provisions and verifies the
+    // search Worker role before deploy; the migration Job must never try to create it.
+    { name: "HOOPDB_ROLE_BOOTSTRAP", value: "false" },
     ...(runtimeRole
       ? [
           { name: "HOOPDB_RUNTIME_ROLE", value: runtimeRole },

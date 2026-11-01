@@ -453,6 +453,23 @@ Release boundaries that remain deliberate:
   `ReadWriteOnce`. It does not use Cloud SQL, Redis, Pub/Sub, or GCS.
 - Secret Manager stores a secret container only. No secret version or payload
   is written.
+- Cloud SQL runs the migrator with `HOOPDB_DB_MODE=cloudsql`, not the generic
+  self-hosted profile. Before the release, an operator connection as the migration
+  owner runs `cloudsql_owner_function_default_revoke.sql` and
+  `cloudsql_migration_roles.sql`, followed by the canonical Worker verifier. The first
+  script applies the exact owner-scoped function default. The second uses a disposable
+  CREATEROLE trampoline whose removal also removes PostgreSQL 16+ automatic creator
+  memberships; it leaves fixed membership-free, NOLOGIN compatibility roles and never
+  creates a BYPASSRLS role. The generic Supabase shim stays disabled. The catalog gate
+  excludes only Google's immutable `cloudsqladmin` role,
+  only while the catalog marks that exact role SUPERUSER. Every other CREATE-capable
+  role remains covered. The migration Job keeps `HOOPDB_ROLE_BOOTSTRAP=false`.
+- The application runtime uses its own LOGIN role and URL. The migration owner URL is
+  available only to the migration Job. Cloud SQL creates the runtime while assigning
+  the still-empty `anon` role so it never receives `cloudsqlsuperuser`, then the Admin
+  API replaces that role list with an empty list before migrations or workload access.
+  Both credentials are sourced from 1Password; no password is persisted in Alchemy
+  state, input JSON, a repository, or a shell file.
 - The initial 2026-10-30 substrate run did not exercise product routes. The
   later 2026-10-31 application proof recorded above exercised authenticated
   ingest, scrubbed object landing, Cloud SQL indexing/classification, encrypted
