@@ -22,6 +22,7 @@ import {
   RUNTIME_APPLICATION_TABLE_PRIVILEGES,
   runtimeRoleViolations,
   sequencePreflight,
+  sessionsFunctionAclDrift,
   type FunctionBoundaryMode,
 } from "./migrate-guards.ts";
 import {
@@ -419,6 +420,19 @@ export async function runMigrations(
         throw profileError(
           "runtime_role_unsafe",
           `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`,
+        );
+      // Event-trigger mode (supabase): the trigger checks a subset of the manifest while
+      // migrations run; here every sessions function ACL must equal the committed
+      // manifest exactly, or the whole validation transaction rolls back. Other modes
+      // keep their existing behaviour.
+      const drift =
+        profile.functionBoundary === "event-trigger"
+          ? await sessionsFunctionAclDrift(client, profile.runtimeRole)
+          : [];
+      if (drift.length)
+        throw profileError(
+          "function_acl_drift",
+          `sessions function ACLs differ from src/hoopdb/sessions-function-acl.json: ${drift.slice(0, 5).join("; ")}${drift.length > 5 ? `; and ${drift.length - 5} more` : ""}`,
         );
     };
     const bindDbMode = () =>

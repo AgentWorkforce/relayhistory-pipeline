@@ -502,11 +502,18 @@ config fails closed.
     everything fully qualified) and the trigger `hoopdb_sessions_function_boundary` on
     the exact tag set: `CREATE`/`ALTER` `FUNCTION`, `PROCEDURE`, `AGGREGATE`,
     `ALTER ROUTINE`, `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, `CREATE`/`ALTER
-EXTENSION`, `ALTER SCHEMA`. Idempotent; an existing trigger or runtime role that
-    differs is refused (operator decides). If `CREATE EVENT TRIGGER` is refused (no
+EXTENSION`, `ALTER SCHEMA`, `CREATE TYPE`. It sets the trigger `ENABLE ALWAYS`
+    (`'A'`): an `'O'` trigger is skipped in sessions with `session_replication_role =
+replica` (confirmed on PG 17.11), as dump and restore tooling sets. Idempotent; an
+    existing trigger (including one only `'O'`) or runtime role that differs is refused
+    (operator decides). If `CREATE EVENT TRIGGER` is refused (no
     supautils), it fails closed with 55000 and creates nothing.
   - **What it enforces, at fire time** (it filters by the schema NAME `sessions`, which
-    need not exist at install): routines created in `sessions` get PUBLIC revoked; then
+    need not exist at install): routines created in `sessions` get PUBLIC revoked (the
+    range and multirange constructors of a `CREATE TYPE ... AS RANGE` are checked too:
+    PostgreSQL makes the bootstrap superuser their owner, so that command is aborted
+    instead of leaving PUBLIC-executable functions that would block every later function
+    GRANT); then
     the command is aborted (42501) when a touched `sessions` routine is owned by anyone
     but the migration owner, holds an ACL entry outside the embedded manifest (equal to
     `src/hoopdb/sessions-function-acl.json`; owner-only for an unmanifested signature;
@@ -514,13 +521,16 @@ EXTENSION`, `ALTER SCHEMA`. Idempotent; an existing trigger or runtime role that
     or is SECURITY DEFINER outside the frozen list; or when a `sessions`-scoped function
     default grants another role. A function GRANT/REVOKE, an extension or schema change
     rechecks every `sessions` routine. While migrations run the check is "subset of the
-    manifest"; exact equality is checked after every migrate, and the live gate still
-    refuses PUBLIC-executable `sessions` functions. Blast radius: a function GRANT
+    manifest"; exact equality is checked after every event-trigger-mode migrate, inside
+    the validation transaction with phase 2 and PASS (`function_acl_drift`, rolled back;
+    `sessionsFunctionAclDrift` in `src/hoopdb/migrate-guards.ts`; the other modes are
+    unchanged), and the live gate still refuses PUBLIC-executable
+    `sessions` functions. Blast radius: a function GRANT
     anywhere in the database is refused while `sessions` itself violates the manifest.
   - **Gate (more than its name):** before any write the migrator (and
     `--activation-check`) compares the catalog with frozen constants in
     `src/hoopdb/migrate-guards.ts`: `evtevent = ddl_command_end`, the exact sorted tags,
-    `evtenabled` O or A, `evtowner` and the function owner = the migration owner, the
+    `evtenabled` exactly `A` (ALWAYS), `evtowner` and the function owner = the migration owner, the
     function oid = `hoopdb_boundary.sessions_function_boundary()`, the prosrc sha256
     (normalized: the runtime-role literal put back to its placeholder), `proconfig`
     exactly the pinned search_path, SECURITY INVOKER, volatile, plpgsql, returns
@@ -542,8 +552,14 @@ EXTENSION`, `ALTER SCHEMA`. Idempotent; an existing trigger or runtime role that
     not fire for `CREATE EXTENSION` (supautils issue 123); the post-migrate manifest check
     and the live gate remain. If `postgres` may set `session_replication_role` (supautils
     `privileged_role_allowed_configs`; the README's example; not verified for the
-    project), a session in `replica` mode skips an `O` trigger: the same trusted owner,
-    and the live gate still applies.
+    project), a session in `replica` mode would skip an `O` trigger, which is why the
+    trigger is `A` and the gate accepts only `A`. In every skipped case (superusers,
+    reserved roles, `CREATE EXTENSION`) only the live gate (PUBLIC or the runtime role)
+    and the next migrate's checks catch a bad ACL. An owner or superuser could still run
+    `ALTER EVENT TRIGGER ... DISABLE`; the next migrate's gate refuses it and the live
+    gate keeps refusing PUBLIC-executable functions. Whether supautils permits
+    `CREATE EVENT TRIGGER` and `ALTER EVENT TRIGGER ... ENABLE ALWAYS` for `postgres` on
+    the project is NOT OBSERVED; if `CREATE` is refused the bootstrap fails closed.
   - **Tests:** PGlite (profile binding, a name-only trigger refused, fresh full migrate,
     behaviour, 11 drift cases, other creators, frozen constants vs the file) and real
     PG15/17 on the Supabase-shaped cluster (`supabase_admin` OID 10, non-superuser
@@ -553,7 +569,16 @@ EXTENSION`, `ALTER SCHEMA`. Idempotent; an existing trigger or runtime role that
     hostile second trigger are aborted; CREATE OR REPLACE keeps the ACL; other schemas are
     unaffected; disabled, replaced body, function or trigger owner changed, missing tag,
     SECURITY DEFINER, PUBLIC-executable, a function setting added, schema opened, and a
-    runtime-role mismatch each fail the gate before any write.
+    runtime-role mismatch each fail the gate before any write. Also: CREATE PROCEDURE and
+    CREATE AGGREGATE (owner-only, grants outside the manifest aborted), `SET SCHEMA` into
+    `sessions` and RENAME away from or into a manifest signature, `CREATE EXTENSION ...
+SCHEMA sessions` and `ALTER EXTENSION ... SET SCHEMA sessions` (plain PostgreSQL,
+    where the trigger fires), `CREATE TYPE ... AS RANGE`, replica mode (`A` still aborts a
+    PUBLIC grant; an `O` trigger is skipped there and the gate refuses it), and a missing
+    manifest grant refused by the next migrate (`function_acl_drift`). Residual: the
+    harness emulates supautils by making `postgres` a superuser for the install only, so
+    it does not reproduce supautils' skips for superusers and reserved roles; on plain
+    PostgreSQL the trigger fires for superusers too.
 
 The evidence is names, booleans and hashes only (null where absent):
 

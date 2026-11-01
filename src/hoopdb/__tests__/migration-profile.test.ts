@@ -1854,6 +1854,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       `ALTER EVENT TRIGGER ${"hoopdb_sessions_function_boundary"} DISABLE`,
     ],
     [
+      "enabled ORIGIN only (skipped in replica mode)",
+      "ALTER EVENT TRIGGER hoopdb_sessions_function_boundary ENABLE",
+    ],
+    [
       "function body replaced",
       "CREATE OR REPLACE FUNCTION hoopdb_boundary.sessions_function_boundary() RETURNS event_trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$ BEGIN END $f$",
     ],
@@ -1928,6 +1932,65 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       runMigrations(client(db), { profile: SUPA_ET }),
     );
     expect(error?.code).toBe("function_boundary_unproven");
+  });
+
+  test("event-trigger mode: the bootstrap installs the trigger ENABLE ALWAYS", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    expect(
+      (
+        await db.query<{ e: string }>(
+          "SELECT evtenabled::text AS e FROM pg_event_trigger WHERE evtname = 'hoopdb_sessions_function_boundary'",
+        )
+      ).rows[0]?.e,
+    ).toBe("A");
+    // A rerun over an ORIGIN-only trigger refuses (an operator decides).
+    await db.exec(
+      "ALTER EVENT TRIGGER hoopdb_sessions_function_boundary ENABLE",
+    );
+    await expect(db.exec(ET_BOOT)).rejects.toThrow(/another definition/);
+  });
+
+  test("event-trigger mode: CREATE TYPE ... AS RANGE in sessions is checked (its PUBLIC constructors abort it), so later GRANTs elsewhere keep working", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    expect(
+      await failure(runMigrations(client(db), { profile: SUPA_ET })),
+    ).toBeNull();
+    // PGlite runs as the bootstrap superuser, which owns the constructors and can revoke
+    // them: they end owner-only. On real PostgreSQL (pg-proof) the command is aborted.
+    await db.exec("CREATE TYPE sessions.g6_range AS RANGE (subtype = int4)");
+    const publicCtors = (
+      await db.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname LIKE 'g6_%range' AND (proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(proacl) a WHERE a.grantee = 0))",
+      )
+    ).rows[0]!.n;
+    expect(publicCtors).toBe(0);
+    await db.exec(
+      "CREATE FUNCTION public.g6_later() RETURNS int LANGUAGE sql AS 'SELECT 1'; GRANT EXECUTE ON FUNCTION public.g6_later() TO anon",
+    );
+  });
+
+  test("run-time exact manifest: a missing manifest grant (allowed by the trigger as a subset) is refused by the next migrate, rolled back (function_acl_drift)", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    expect(
+      await failure(runMigrations(client(db), { profile: SUPA_ET })),
+    ).toBeNull();
+    await db.exec(
+      "REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM authenticated",
+    );
+    const error = await failure(
+      runMigrations(client(db), { profile: SUPA_ET }),
+    );
+    expect(error?.code).toBe("function_acl_drift");
+    expect(error?.message).toContain("sessions.jwt_org_id()");
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO authenticated",
+    );
+    expect(
+      await failure(runMigrations(client(db), { profile: SUPA_ET })),
+    ).toBeNull();
   });
 
   test("the frozen trigger constants match the bootstrap file (prosrc sha256 and tags)", () => {

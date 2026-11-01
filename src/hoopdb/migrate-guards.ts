@@ -1040,6 +1040,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
     "CREATE EXTENSION",
     "CREATE FUNCTION",
     "CREATE PROCEDURE",
+    "CREATE TYPE",
     "GRANT",
     "REVOKE",
   ]);
@@ -1049,7 +1050,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "63436e1fbcccb980d8f3881c0ef60c0a027059bc6a3f5232e36ec1f6b76fcd62";
+  "d31312e81caf576e196f1654e4f8534c003602920df09e6defb1e9f53ed434b8";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
@@ -1469,7 +1470,8 @@ export async function eventTriggerEvidence(
       JSON.stringify(tags) ===
       JSON.stringify([...SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS].sort()),
     enabled: r.enabled,
-    enabled_ok: r.enabled === "O" || r.enabled === "A",
+    // Exactly ALWAYS: an origin (O) trigger is skipped in replica mode.
+    enabled_ok: r.enabled === "A",
     owner: r.owner,
     owner_is_migration_owner: r.owner_ok === true,
     function: r.function,
@@ -1513,6 +1515,47 @@ export async function eventTriggerEvidence(
     e.runtime_role_setting_matches &&
     e.schema_private;
   return { ...e, verified };
+}
+
+/** The committed ACL manifest (src/hoopdb/sessions-function-acl.json). */
+export async function sessionsFunctionAclManifest(): Promise<
+  Record<string, string[]>
+> {
+  return (
+    JSON.parse(
+      await readFile(new URL("./sessions-function-acl.json", import.meta.url), "utf8"),
+    ) as { functions: Record<string, string[]> }
+  ).functions;
+}
+
+/**
+ * Run-time exact-manifest check (every event-trigger-mode migrate, inside the validation
+ * transaction, after the runtime application ACL is installed): every sessions
+ * function's ACL must equal the manifest, plus `<runtime role>:EXECUTE` on
+ * RUNTIME_APPLICATION_FUNCTIONS. Returns the differences (empty when exact).
+ */
+export async function sessionsFunctionAclDrift(
+  client: GuardClient,
+  runtimeRole: string,
+): Promise<string[]> {
+  const manifest = await sessionsFunctionAclManifest();
+  const expected: Record<string, string[]> = Object.fromEntries(
+    Object.entries(manifest).map(([fn, entries]) => [
+      fn,
+      (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+        ? [...entries, `${runtimeRole}:EXECUTE`]
+        : entries,
+    ]),
+  );
+  const actual = await sessionsFunctionAcl(client);
+  const norm = (xs: string[] | undefined) => JSON.stringify([...(xs ?? [])].sort());
+  const drift: string[] = [];
+  for (const fn of new Set([...Object.keys(expected), ...Object.keys(actual)]))
+    if (norm(expected[fn]) !== norm(actual[fn]))
+      drift.push(
+        `${fn}: ${actual[fn] ? actual[fn]!.join(",") : "missing"} (expected ${expected[fn] ? expected[fn]!.join(",") : "absent"})`,
+      );
+  return drift;
 }
 
 /**

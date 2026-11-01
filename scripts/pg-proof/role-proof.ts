@@ -2922,6 +2922,188 @@ await check(
       SA,
     );
     await sql(DB, "DROP FUNCTION sessions.g6_et_new()", "postgres");
+    // CREATE PROCEDURE and CREATE AGGREGATE in sessions: owner-only; a grant outside the manifest aborts.
+    await sql(
+      DB,
+      `CREATE PROCEDURE sessions.g6_et_proc() LANGUAGE sql AS 'SELECT 1';
+       CREATE AGGREGATE sessions.g6_et_agg(int) (sfunc = int4pl, stype = int)`,
+      "postgres",
+    );
+    const routineAcl = (
+      await sql(
+        DB,
+        `SELECT bool_and(proacl IS NOT NULL AND NOT EXISTS (SELECT 1 FROM aclexplode(proacl) a WHERE a.grantee <> proowner)) AS owner_only
+           FROM pg_proc WHERE oid IN ('sessions.g6_et_proc()'::regprocedure, 'sessions.g6_et_agg(int)'::regprocedure)`,
+        "postgres",
+      )
+    ).rows[0]!.owner_only;
+    ok.procedure_and_aggregate_owner_only = routineAcl === true;
+    ok.procedure_grant_aborts = await fails(
+      "GRANT EXECUTE ON PROCEDURE sessions.g6_et_proc() TO anon",
+    );
+    ok.aggregate_grant_aborts = await fails(
+      "GRANT EXECUTE ON FUNCTION sessions.g6_et_agg(int) TO authenticated",
+    );
+    await sql(
+      DB,
+      "DROP PROCEDURE sessions.g6_et_proc(); DROP AGGREGATE sessions.g6_et_agg(int)",
+      "postgres",
+    );
+    // SET SCHEMA into sessions: a function with a grant outside the manifest aborts.
+    await sql(
+      DB,
+      `CREATE FUNCTION public.g6_et_mover() RETURNS int LANGUAGE sql AS 'SELECT 1';
+       GRANT EXECUTE ON FUNCTION public.g6_et_mover() TO authenticated`,
+      "postgres",
+    );
+    ok.set_schema_into_sessions_aborts = await fails(
+      "ALTER FUNCTION public.g6_et_mover() SET SCHEMA sessions",
+    );
+    await sql(DB, "DROP FUNCTION public.g6_et_mover()", "postgres");
+    // RENAME: a manifested function renamed away keeps grants the new name does not allow
+    // (aborted); a new function renamed INTO a free manifest signature may hold exactly that
+    // signature's grants, nothing more (checked in one rolled-back transaction).
+    ok.rename_away_aborts = await fails(
+      "ALTER FUNCTION sessions.repo_backfill_report() RENAME TO g6_et_renamed",
+    );
+    {
+      const c = new pg.Client({ connectionString: url("postgres", DB) });
+      await c.connect();
+      const step = async (q: string) => {
+        try {
+          await c.query(q);
+          return null;
+        } catch (e) {
+          return (e as Error).message;
+        }
+      };
+      await c.query("BEGIN");
+      const r1 = await step("DROP FUNCTION sessions.repo_backfill_report()");
+      const r2 = await step(
+        "CREATE FUNCTION sessions.g6_et_into() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+      );
+      const r3 = await step(
+        "ALTER FUNCTION sessions.g6_et_into() RENAME TO repo_backfill_report",
+      );
+      const r4 = await step(
+        "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO service_role",
+      );
+      const r5 = await step(
+        "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO anon",
+      );
+      await c.query("ROLLBACK");
+      await c.end();
+      out.rename_into = { r1, r2, r3, r4, r5 };
+      ok.rename_into_manifest_signature =
+        r1 === null &&
+        r2 === null &&
+        r3 === null &&
+        r4 === null &&
+        /sessions function boundary/.test(r5 ?? "");
+    }
+    // Extensions on plain PostgreSQL (the trigger fires; supautils skips it, see the
+    // runbook): installing or moving an extension into sessions aborts.
+    ok.create_extension_in_sessions_aborts = await fails(
+      "CREATE EXTENSION citext SCHEMA sessions",
+    );
+    const extPublic = await tryMsg("CREATE EXTENSION citext SCHEMA public");
+    // Trusted-extension objects belong to the bootstrap superuser, so only it can move them.
+    const extMove = await tryMsg(
+      "ALTER EXTENSION citext SET SCHEMA sessions",
+      SA,
+    );
+    out.extension = { extPublic, extMove };
+    ok.alter_extension_set_schema_aborts =
+      extPublic === null && /sessions function boundary/.test(extMove ?? "");
+    await attempt(DB, "DROP EXTENSION IF EXISTS citext", "postgres");
+    // CREATE TYPE ... AS RANGE in sessions: PostgreSQL makes the bootstrap superuser own the
+    // PUBLIC-executable constructors, so the trigger aborts the command; nothing is left
+    // behind and later function GRANTs elsewhere still work (no project-wide denial).
+    ok.create_type_range_aborts = await fails(
+      "CREATE TYPE sessions.g6_et_range AS RANGE (subtype = int4)",
+    );
+    const leftovers = (
+      await sql(
+        DB,
+        "SELECT count(*)::int AS n FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname LIKE 'g6_et%range'",
+        "postgres",
+      )
+    ).rows[0]!.n;
+    await sql(
+      DB,
+      "CREATE FUNCTION public.g6_et_after_range() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+      "postgres",
+    );
+    const laterGrant = await tryMsg(
+      "GRANT EXECUTE ON FUNCTION public.g6_et_after_range() TO anon",
+    );
+    out.range = { leftovers, laterGrant };
+    ok.create_type_range_no_dos = leftovers === 0 && laterGrant === null;
+    await sql(DB, "DROP FUNCTION public.g6_et_after_range()", "postgres");
+    // Replica mode. ENABLE ALWAYS ('A'): a PUBLIC grant in replica mode is still aborted.
+    const replica = (stmt: string) =>
+      tryMsg(
+        `SET session_replication_role = replica; SET ROLE postgres; ${stmt}`,
+        SA,
+      );
+    await sql(
+      DB,
+      "CREATE FUNCTION sessions.g6_et_rep() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+      "postgres",
+    );
+    ok.replica_always_aborts = /sessions function boundary/.test(
+      (await replica(
+        "GRANT EXECUTE ON FUNCTION sessions.g6_et_rep() TO PUBLIC",
+      )) ?? "",
+    );
+    // An ORIGIN ('O') trigger is skipped in replica mode (why ALWAYS is required), and
+    // the gate refuses it.
+    await sql(
+      DB,
+      "ALTER EVENT TRIGGER hoopdb_sessions_function_boundary ENABLE",
+      SA,
+    );
+    const originSkipped =
+      (await replica(
+        "GRANT EXECUTE ON FUNCTION sessions.g6_et_rep() TO PUBLIC",
+      )) === null;
+    const originGate = migrate(DB, SUPA_ET, "postgres");
+    const originCheck = activationCheck(DB, ETCHECK, "postgres");
+    out.origin = {
+      skipped: originSkipped,
+      gate: originGate,
+      enabled: originCheck.evidence.event_trigger?.enabled,
+    };
+    ok.origin_replica_skipped_and_gate_refuses =
+      originSkipped &&
+      originGate.code === "function_boundary_unproven" &&
+      originCheck.evidence.event_trigger?.enabled === "O" &&
+      originCheck.evidence.event_trigger?.enabled_ok === false;
+    await sql(
+      DB,
+      "ALTER EVENT TRIGGER hoopdb_sessions_function_boundary ENABLE ALWAYS",
+      SA,
+    );
+    await sql(
+      DB,
+      "SET session_replication_role = replica; DROP FUNCTION sessions.g6_et_rep()",
+      SA,
+    );
+    // Run-time exact manifest: a missing manifest grant (a subset, so the trigger allows
+    // it) is refused by the next migrate inside its validation transaction.
+    await sql(
+      DB,
+      "REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM authenticated",
+      "postgres",
+    );
+    const aclDrift = migrate(DB, SUPA_ET, "postgres");
+    out.acl_drift = aclDrift;
+    ok.exact_manifest_drift_refused = aclDrift.code === "function_acl_drift";
+    await sql(
+      DB,
+      "GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO authenticated",
+      "postgres",
+    );
     ok.remigrate = migrate(DB, SUPA_ET, "postgres").exit === 0;
     // 5. Drift: each fails the gate (and the activation check) before any write.
     const drift = async (
@@ -2977,7 +3159,7 @@ await check(
       async () => {
         await sql(
           DB,
-          "ALTER EVENT TRIGGER hoopdb_sessions_function_boundary ENABLE",
+          "ALTER EVENT TRIGGER hoopdb_sessions_function_boundary ENABLE ALWAYS",
           SA,
         );
       },

@@ -1082,18 +1082,24 @@ Khaliq:
        `-v runtime_role=bulls96_runtime`. It installs schema `hoopdb_boundary`, the
        reviewed SECURITY INVOKER trigger function and the `ddl_command_end` trigger
        `hoopdb_sessions_function_boundary`, scoped to `sessions` by name (the schema need
-       not exist yet). No `ALTER DEFAULT PRIVILEGES` anywhere. If supautils refuses
+       not exist yet), set `ENABLE ALWAYS` so replica-mode sessions do not skip it. No
+       `ALTER DEFAULT PRIVILEGES` anywhere. If supautils refuses
        `CREATE EVENT TRIGGER`, it fails closed (55000, nothing created).
     2. Expect supautils to reassign the trigger to `postgres` (supautils README,
        "Privileged Role"); the gate requires `evtowner = postgres` and fails closed
        otherwise. Privileged-role triggers are skipped for superusers and reserved roles,
        so `supabase_admin` stays the platform trust root, and they do not fire for
-       `CREATE EXTENSION` (supautils issue 123).
+       `CREATE EXTENSION` (supautils issue 123). In those skipped cases only the live
+       gate (PUBLIC or the runtime role) and the next migrate catch a bad ACL. Whether
+       supautils permits `CREATE EVENT TRIGGER` and `ENABLE ALWAYS` for `postgres` on the
+       project is NOT OBSERVED.
     3. `HOOPDB_DB_MODE=supabase HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger HOOPDB_RUNTIME_ROLE=bulls96_runtime bun src/hoopdb/migrate.ts --activation-check`
-       must exit 0 with `event_trigger.verified: true` (event, exact tags, enabled,
+       must exit 0 with `event_trigger.verified: true` (event, exact tags, enabled `A`,
        owners, function identity, normalized prosrc sha256, proconfig, SECURITY
        INVOKER, ACL, runtime role, private schema) and `other_event_triggers` listed.
-    4. Then migrate with `HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger` (section 5). After
+    4. Then migrate with `HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger` (section 5); it
+       also checks every `sessions` function ACL against the manifest exactly before PASS
+       (`function_acl_drift`). After
        PASS, an optional read-back in a rolled-back transaction (a throwaway
        `CREATE FUNCTION sessions.<probe>`, inspect `proacl`, `ROLLBACK`) shows the
        trigger fires for `postgres` on the project: NOT OBSERVED, needs its own OK.
@@ -1645,6 +1651,8 @@ hosted target: unknown.
   - added the event-trigger path to 4.2 (A) and B15: the bootstrap, the supautils
     ownership and skip behaviour (cited, NOT OBSERVED), `--activation-check`, then
     migrate; Y7 now names the trigger owner;
+  - the trigger is `ENABLE ALWAYS`, `CREATE TYPE` is covered, and every event-trigger migrate
+    checks the exact ACL manifest before PASS (HOLD on `a76a927`);
   - PR #125 changes no migration and no verifier, so the generation is unchanged
     (`bun src/hoopdb/migrate.ts --generation` gives the same value on the branch and on
     its `main` base).

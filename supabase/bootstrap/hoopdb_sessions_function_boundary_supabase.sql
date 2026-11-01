@@ -7,7 +7,11 @@
 -- (`sessions` may not exist yet when it is installed) and changes no default privilege.
 --
 -- What the trigger does, on ddl_command_end for the tags below:
---   - every routine CREATEd in `sessions` by the command: REVOKE ALL ... FROM PUBLIC;
+--   - every routine CREATEd in `sessions` by the command: REVOKE ALL ... FROM PUBLIC. The
+--     range/multirange constructors of a CREATE TYPE ... AS RANGE in `sessions` are
+--     checked too; PostgreSQL makes the bootstrap superuser their owner, so the owner
+--     check aborts that command (otherwise their PUBLIC EXECUTE would make every later
+--     function GRANT in the database fail);
 --   - then, for every `sessions` routine the command touched (and for every `sessions`
 --     routine after a function GRANT/REVOKE, an extension or schema change), it ABORTS
 --     the command (42501) when:
@@ -22,8 +26,9 @@
 --   - after ALTER DEFAULT PRIVILEGES: aborts when a function default scoped to
 --     `sessions` grants anyone but its own role.
 --   Entries are checked as a subset of the manifest while migrations run; the migrator
---   checks exact equality after every migrate (ACL manifest) and the live gate keeps
---   refusing any PUBLIC-executable `sessions` function.
+--   checks exact equality with the manifest after every event-trigger migrate, inside its
+--   validation transaction (function_acl_drift), and the live gate keeps refusing any
+--   PUBLIC-executable `sessions` function.
 -- The function is SECURITY INVOKER with a pinned search_path: it runs as the user who
 -- issued the DDL, so it can only revoke what that user owns, and it raises otherwise.
 --
@@ -38,11 +43,18 @@
 --     `sessions` still needs its own exact function default (the migrator gate);
 --   - privileged-role triggers do not fire for CREATE EXTENSION (supautils issue 123):
 --     the migrator's post-migrate ACL manifest check and the live gate remain.
+--   In those skipped cases (superusers, reserved roles, CREATE EXTENSION) only the live
+--   gate (PUBLIC or the runtime role) and the next migrate's checks catch a bad ACL.
+--   Whether supautils permits CREATE EVENT TRIGGER on the project is NOT OBSERVED.
+-- The trigger is ENABLE ALWAYS ('A'): an 'O' trigger is skipped in replica mode
+-- (session_replication_role = replica). An owner (or superuser) could still ALTER
+-- EVENT TRIGGER ... DISABLE; the next migrate's gate refuses, and the live gate keeps
+-- refusing PUBLIC-executable functions.
 -- On plain PostgreSQL a non-superuser cannot CREATE EVENT TRIGGER: this script then
 -- fails closed (55000, nothing created, the transaction rolls back).
 --
 -- Idempotent: an existing trigger of this name must already match exactly (event, tags,
--- function, enabled); otherwise it refuses and an operator decides. Never run it outside
+-- function, enabled ALWAYS); otherwise it refuses and an operator decides. Never run it outside
 -- Supabase: selfhosted, cloudsql and local use global-default-revoke or nothing.
 --
 -- Run as postgres, after hoopdb_runtime_role_supabase.sql, before migrate:
@@ -127,6 +139,7 @@ DECLARE
   v_cmd record;
   v_fn record;
   v_targets oid[] := '{}';
+  v_ctors oid[];
   v_all boolean := false;
   v_defaults boolean := false;
   v_bad text[] := '{}';
@@ -150,6 +163,23 @@ BEGIN
         v_targets := v_targets || v_cmd.objid;
         IF v_cmd.command_tag IN ('CREATE FUNCTION', 'CREATE PROCEDURE', 'CREATE AGGREGATE') THEN
           EXECUTE pg_catalog.format('REVOKE ALL ON ROUTINE %s FROM PUBLIC', v_cmd.objid::pg_catalog.regprocedure);
+        END IF;
+      END IF;
+    ELSIF v_cmd.classid = 'pg_catalog.pg_type'::pg_catalog.regclass THEN
+      -- CREATE TYPE ... AS RANGE creates constructor functions (range and multirange)
+      -- with the built-in PUBLIC EXECUTE, owned by the bootstrap superuser: check them
+      -- (the owner check then aborts the command unless the issuer could revoke).
+      IF (SELECT t.typnamespace FROM pg_catalog.pg_type t WHERE t.oid = v_cmd.objid) = v_ns THEN
+        -- One REVOKE for all of them: it fires this trigger again, which must not see a
+        -- constructor still PUBLIC-executable.
+        SELECT pg_catalog.array_agg(p.oid) INTO v_ctors FROM pg_catalog.pg_proc p
+         WHERE p.pronamespace = v_ns AND p.proacl IS NULL
+           AND (p.prorettype = v_cmd.objid
+                OR p.prorettype IN (SELECT r.rngmultitypid FROM pg_catalog.pg_range r WHERE r.rngtypid = v_cmd.objid));
+        IF v_ctors IS NOT NULL THEN
+          v_targets := v_targets || v_ctors;
+          EXECUTE pg_catalog.format('REVOKE ALL ON ROUTINE %s FROM PUBLIC',
+            (SELECT pg_catalog.string_agg(o::pg_catalog.regprocedure::text, ', ') FROM pg_catalog.unnest(v_ctors) o));
         END IF;
       END IF;
     ELSIF v_cmd.command_tag IN ('GRANT', 'REVOKE') THEN
@@ -229,6 +259,7 @@ DECLARE
     'CREATE EXTENSION',
     'CREATE FUNCTION',
     'CREATE PROCEDURE',
+    'CREATE TYPE',
     'GRANT',
     'REVOKE'
   ]::text[];
@@ -239,7 +270,7 @@ BEGIN
   IF FOUND THEN
     IF v_row.evtevent <> 'ddl_command_end'
        OR (SELECT array_agg(t ORDER BY t) FROM unnest(v_row.evttags) t) IS DISTINCT FROM (SELECT array_agg(t ORDER BY t) FROM unnest(v_tags) t)
-       OR v_row.evtenabled NOT IN ('O', 'A')
+       OR v_row.evtenabled <> 'A'
        OR v_row.evtfoid <> 'hoopdb_boundary.sessions_function_boundary()'::regprocedure THEN
       RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'sessions function boundary bootstrap: an event trigger named hoopdb_sessions_function_boundary exists with another definition; an operator must decide';
     END IF;
@@ -254,6 +285,9 @@ BEGIN
       MESSAGE = 'sessions function boundary bootstrap: CREATE EVENT TRIGGER was refused for ' || current_user
         || ' (needs Supabase supautils privileged role, or a superuser); nothing was created';
   END;
+  -- ENABLE ALWAYS: an 'O' (origin) trigger is skipped in sessions with
+  -- session_replication_role = replica (as dump/restore tooling sets); 'A' fires there too.
+  EXECUTE 'ALTER EVENT TRIGGER hoopdb_sessions_function_boundary ENABLE ALWAYS';
 END
 $install$;
 COMMIT;
