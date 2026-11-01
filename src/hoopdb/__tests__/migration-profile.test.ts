@@ -13,9 +13,11 @@ import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { schemaVerdict, type Transact } from "../../shared/db.ts";
 import {
+  functionBoundaryEvidence,
   inventoryOf,
   sessionsFunctionAcl,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
+  SUPABASE_PLATFORM_SUPERUSERS,
 } from "../migrate-guards.ts";
 import { gateOpen, workerTick } from "../../shared/worker.ts";
 import {
@@ -1069,6 +1071,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         },
       ],
       sessions_create_roles_covered: false,
+      db_mode: "supabase",
+      excluded_platform_superusers: [],
       sessions_schema_function_defaults: [],
       sessions_functions_owned_by_owner: true,
       event_trigger_present: false,
@@ -1117,7 +1121,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         )
       ).rows[0]?.e,
     ).toBe(false);
-    // Blast radius: the owner's global default reaches every schema (why approval is required).
+    // Blast radius: the owner's global default reaches every schema (why an operator decides it).
     await db.exec(
       "CREATE FUNCTION public.g6_elsewhere() RETURNS int LANGUAGE sql AS 'SELECT 1'",
     );
@@ -1128,6 +1132,187 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         )
       ).rows[0]?.e,
     ).toBe(false);
+  });
+
+  // Option (ii): in supabase mode only, a role that is BOTH rolsuper (catalog, at gate
+  // time) AND named in SUPABASE_PLATFORM_SUPERUSERS is the platform trust root and is left
+  // out of creator coverage, with its attributes in the evidence.
+  const SUPA_A: MigrationProfile = {
+    ...SUPA,
+    functionBoundary: "global-default-revoke",
+  };
+  const platformList = [...SUPABASE_PLATFORM_SUPERUSERS];
+
+  test("platform trust root: supabase_admin as a superuser with no safe default is excluded in supabase mode (listed with its attributes); the same catalog fails without the exclusion (selfhosted)", async () => {
+    expect(platformList).toEqual(["supabase_admin"]);
+    const db = await supabaseLike();
+    await db.exec(
+      `${OWNER_FN_DEFAULT_REVOKE}; CREATE ROLE supabase_admin SUPERUSER NOLOGIN`,
+    );
+    const ev = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "supabase",
+    );
+    expect(ev.satisfied).toBe(true);
+    expect(ev.excluded_platform_superusers).toEqual([
+      {
+        role: "supabase_admin",
+        rolsuper: true,
+        rolinherit: true,
+        rolcreaterole: false,
+        rolcreatedb: false,
+        rolcanlogin: false,
+        rolreplication: false,
+        rolbypassrls: false,
+        function_default: ["<built-in>"],
+      },
+    ]);
+    expect(ev.sessions_create_roles.map((c) => c.role)).not.toContain(
+      "supabase_admin",
+    );
+    expect(
+      await failure(runMigrations(client(db), { profile: SUPA_A })),
+    ).toBeNull();
+    // Revert-sensitive: with no exclusion (selfhosted, or no mode) the same catalog fails
+    // on supabase_admin, so the supabase pass above exists only because of the exclusion.
+    for (const other of ["selfhosted", undefined] as const) {
+      const full = await functionBoundaryEvidence(
+        client(db),
+        "global-default-revoke",
+        other,
+      );
+      expect(full.satisfied).toBe(false);
+      expect(full.excluded_platform_superusers).toEqual([]);
+      expect(full.sessions_create_roles).toContainEqual(
+        expect.objectContaining({
+          role: "supabase_admin",
+          superuser: true,
+          function_default_exact: false,
+        }),
+      );
+    }
+    const selfError = await failure(
+      runMigrations(client(db), {
+        profile: { ...SUPA_A, mode: "selfhosted", shim: false },
+      }),
+    );
+    expect(selfError?.code).toBe("function_boundary_unproven");
+  });
+
+  test("platform trust root: a non-platform superuser (ops_admin) with no safe default is still covered in supabase mode: refused before any write", async () => {
+    const db = await supabaseLike();
+    await db.exec(
+      `${OWNER_FN_DEFAULT_REVOKE}; CREATE ROLE ops_admin SUPERUSER NOLOGIN`,
+    );
+    const before = await snapshot(db);
+    const error = await failure(runMigrations(client(db), { profile: SUPA_A }));
+    expect(error?.code).toBe("function_boundary_unproven");
+    const ev = JSON.parse(error!.message!.match(/(\{.*\})/)![1]!);
+    expect(ev.excluded_platform_superusers).toEqual([]);
+    expect(ev.sessions_create_roles).toContainEqual(
+      expect.objectContaining({
+        role: "ops_admin",
+        superuser: true,
+        function_default_exact: false,
+      }),
+    );
+    expect(await snapshot(db)).toEqual(before);
+  });
+
+  test("platform trust root: a role NAMED supabase_admin that is not a superuser, with CREATE on sessions and no safe default, is covered: refused", async () => {
+    const db = await supabaseLike();
+    await db.exec(OWNER_FN_DEFAULT_REVOKE);
+    expect(
+      await failure(runMigrations(client(db), { profile: SUPA_A })),
+    ).toBeNull();
+    await db.exec(
+      "CREATE ROLE supabase_admin NOSUPERUSER NOLOGIN; GRANT CREATE, USAGE ON SCHEMA sessions TO supabase_admin",
+    );
+    const before = await snapshot(db);
+    const error = await failure(runMigrations(client(db), { profile: SUPA_A }));
+    expect(error?.code).toBe("function_boundary_unproven");
+    const ev = JSON.parse(error!.message!.match(/(\{.*\})/)![1]!);
+    expect(ev.excluded_platform_superusers).toEqual([]);
+    expect(ev.sessions_create_roles).toContainEqual(
+      expect.objectContaining({
+        role: "supabase_admin",
+        superuser: false,
+        function_default_exact: false,
+      }),
+    );
+    expect(await snapshot(db)).toEqual(before);
+  });
+
+  test("platform trust root: the migration owner is always covered in supabase mode (no safe default: refused, even with supabase_admin excluded)", async () => {
+    const db = await supabaseLike();
+    await db.exec("CREATE ROLE supabase_admin SUPERUSER NOLOGIN");
+    const ev = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "supabase",
+    );
+    expect(ev.satisfied).toBe(false);
+    expect(ev.owner_function_default_exact).toBe(false);
+    expect(ev.excluded_platform_superusers.map((x) => x.role)).toEqual([
+      "supabase_admin",
+    ]);
+    expect(ev.sessions_create_roles).toContainEqual(
+      expect.objectContaining({
+        role: "postgres",
+        is_migration_owner: true,
+        function_default_exact: false,
+      }),
+    );
+    expect(
+      (await failure(runMigrations(client(db), { profile: SUPA_A })))?.code,
+    ).toBe("function_boundary_unproven");
+  });
+
+  test("platform trust root: no environment variable or role name widens the exclusion", async () => {
+    const db = await supabaseLike();
+    await db.exec(
+      `${OWNER_FN_DEFAULT_REVOKE}; CREATE ROLE ops_admin SUPERUSER NOLOGIN`,
+    );
+    const hostile = {
+      SUPABASE_PLATFORM_SUPERUSERS: "ops_admin",
+      HOOPDB_SUPABASE_PLATFORM_SUPERUSERS: "ops_admin",
+      HOOPDB_PLATFORM_SUPERUSERS: "ops_admin",
+      HOOPDB_EXCLUDED_SUPERUSERS: "ops_admin",
+      HOOPDB_FUNCTION_BOUNDARY_APPROVED: undefined,
+    };
+    const saved = Object.fromEntries(
+      Object.keys(hostile).map((k) => [k, process.env[k]]),
+    );
+    try {
+      for (const [k, v] of Object.entries(hostile))
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      const profile = migrationProfile({
+        ...process.env,
+        HOOPDB_DB_MODE: "supabase",
+        HOOPDB_RUNTIME_ROLE: "g6_rt",
+        HOOPDB_RUNTIME_ROLE_LOGIN: "false",
+        HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+      });
+      const error = await failure(runMigrations(client(db), { profile }));
+      expect(error?.code).toBe("function_boundary_unproven");
+      const ev = JSON.parse(error!.message!.match(/(\{.*\})/)![1]!);
+      expect(ev.excluded_platform_superusers).toEqual([]);
+      expect(ev.sessions_create_roles).toContainEqual(
+        expect.objectContaining({
+          role: "ops_admin",
+          function_default_exact: false,
+        }),
+      );
+      // The list itself is frozen code.
+      expect(Object.isFrozen(SUPABASE_PLATFORM_SUPERUSERS)).toBe(true);
+      expect([...SUPABASE_PLATFORM_SUPERUSERS]).toEqual(["supabase_admin"]);
+    } finally {
+      for (const [k, v] of Object.entries(saved))
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+    }
   });
 
   test("event-trigger mode is not implemented: refused even with a trigger of the right name present", async () => {

@@ -408,7 +408,21 @@ config fails closed.
       decides).
   - **supabase:** the owner is `postgres`, so the same statement would reach every future
     postgres-created function in every schema of the project. It is never run from here.
-    An operator decides it (#98), and until then supabase migrate stays refused.
+    An operator decides it (#98), and until then supabase migrate stays refused. The
+    operator path (dossier 4.2, each live step needs Khaliq's OK): `postgres`'s own
+    `ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`
+    (blast radius: every schema), then `--activation-check` with
+    `HOOPDB_DB_MODE=supabase`, then migrate.
+  - **Supabase platform trust root (supabase mode only):** Supabase's `postgres` is not
+    a superuser and cannot alter `supabase_admin`'s defaults. So in
+    `HOOPDB_DB_MODE=supabase` a CREATE-capable role is left out of creator coverage only
+    when BOTH `pg_roles.rolsuper` is true at gate time AND its name is in the
+    code-reviewed `SUPABASE_PLATFORM_SUPERUSERS` constant (`supabase_admin` only,
+    cited from the Supabase roles docs). No environment variable changes the list. Any
+    other superuser (for example `ops_admin`), a listed name that is not a superuser,
+    and the migration owner stay covered. Excluded roles are listed with their attributes
+    in `excluded_platform_superusers`. `selfhosted` keeps the full check, superusers
+    included (tested on PG15 and PG17).
   - **Managed PostgreSQL without a usable superuser (Cloud SQL):** a superuser can
     always CREATE in `sessions`, so it counts as a creator and needs its own exact
     default. The bootstrap must run as a superuser and sets every superuser's default. On
@@ -449,13 +463,19 @@ The evidence is names and booleans only:
 - `sessions_create_roles`: each role able to CREATE in `sessions`, with `superuser`,
   `is_migration_owner`, its normalized `function_default` and
   `function_default_exact`; then `sessions_create_roles_covered`;
+- `db_mode` (`unspecified` when `--activation-check` runs without `HOOPDB_DB_MODE`:
+  full coverage) and `excluded_platform_superusers` (supabase mode only: each role's
+  name, `rolsuper`, `rolinherit`, `rolcreaterole`, `rolcreatedb`, `rolcanlogin`,
+  `rolreplication`, `rolbypassrls` and its function default);
 - `sessions_schema_function_defaults` (`role>grantee:PRIVILEGE` entries; must be empty);
 - `sessions_functions_owned_by_owner`;
 - `event_trigger_present` (informational);
 - `mode`;
 - `satisfied`.
 
-`bun src/hoopdb/migrate.ts --activation-check` prints it and exits 1 if unproven. The
+`bun src/hoopdb/migrate.ts --activation-check` prints it and exits 1 if unproven (set
+`HOOPDB_DB_MODE` to the deployment's mode; an invalid value exits 1 with
+`db_mode_invalid`). The
 real-PG proof JSON carries the same evidence for a bootstrapped selfhosted database
 (`function_boundary_evidence`). The live gate (readiness and worker claims) checks
 existing functions only; the default-ACL and creator evidence is enforced by the migrator

@@ -301,6 +301,8 @@ for (const r of [
   "g6_other_creator",
   "g6_can_create",
   "g6_nobody",
+  "supabase_admin",
+  "ops_admin",
 ]) {
   for (const d of (
     await sql("postgres", "SELECT datname FROM pg_database WHERE datallowconn")
@@ -1333,7 +1335,7 @@ await check(
   },
 );
 let BOUNDARY_EVIDENCE: unknown = null;
-const activationCheck = (db: string) => {
+const activationCheck = (db: string, extra: Record<string, string> = {}) => {
   const r = spawnSync("bun", ["src/hoopdb/migrate.ts", "--activation-check"], {
     cwd: ROOT,
     encoding: "utf8",
@@ -1341,6 +1343,7 @@ const activationCheck = (db: string) => {
       ...process.env,
       HOOPDB_URL: url("hoop", db),
       HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+      ...extra,
     },
   });
   return {
@@ -1489,6 +1492,222 @@ await check(
       `first=${fmt(m1)} gate=${fmt(m2)} unchanged=${same} creator=${fmt(named)} bootstrap_refused=${!boot.ok}`,
     ];
   },
+);
+// Option (ii), supabase mode: only a role that is rolsuper (catalog, gate time) AND named
+// in SUPABASE_PLATFORM_SUPERUSERS is excluded from creator coverage. Here hoop is the
+// (non-superuser) owner, and the cluster superuser postgres is a NON-platform superuser,
+// so it stays covered and gets its own exact default.
+let PLATFORM_EVIDENCE: unknown = null;
+const SUPA_GATE = {
+  HOOPDB_DB_MODE: "supabase",
+  HOOPDB_RUNTIME_ROLE: "g6_rt2",
+  HOOPDB_RUNTIME_ROLE_LOGIN: "true",
+  HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+};
+const EXACT_HOOP_AND_POSTGRES =
+  "ALTER DEFAULT PRIVILEGES FOR ROLE hoop REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC; ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC";
+const supaCase = async (
+  db: string,
+  setup: string,
+  body: () => Promise<[boolean, string]>,
+): Promise<[boolean, string]> => {
+  await fresh(db, ["g6_rt2"], false);
+  await sql(db, setup);
+  try {
+    return await body();
+  } finally {
+    await attempt("postgres", `DROP DATABASE IF EXISTS ${db} WITH (FORCE)`);
+    await attempt("postgres", "DROP ROLE IF EXISTS supabase_admin");
+    await attempt("postgres", "DROP ROLE IF EXISTS ops_admin");
+  }
+};
+await check(
+  "platform trust root (supabase): supabase_admin as a superuser with no safe default is excluded and listed with its attributes; the same catalog fails selfhosted and with no mode (revert-sensitive)",
+  () =>
+    supaCase(
+      "g6_pt1",
+      `${EXACT_HOOP_AND_POSTGRES}; CREATE ROLE supabase_admin SUPERUSER NOLOGIN`,
+      async () => {
+        const m = migrate("g6_pt1", SUPA_GATE);
+        const supa = activationCheck("g6_pt1", { HOOPDB_DB_MODE: "supabase" });
+        const self = activationCheck("g6_pt1", {
+          HOOPDB_DB_MODE: "selfhosted",
+        });
+        const unset = activationCheck("g6_pt1");
+        const selfMigrate = migrate("g6_pt1", {
+          ...SUPA_GATE,
+          HOOPDB_DB_MODE: "selfhosted",
+          HOOPDB_SUPABASE_SHIM: "false",
+        });
+        PLATFORM_EVIDENCE = supa.evidence;
+        const ex = supa.evidence.excluded_platform_superusers as Array<
+          Record<string, unknown>
+        >;
+        const covers = (e: {
+          sessions_create_roles?: Array<{
+            role: string;
+            function_default_exact: boolean;
+          }>;
+        }) =>
+          e.sessions_create_roles?.some(
+            (c) => c.role === "supabase_admin" && !c.function_default_exact,
+          ) === true;
+        const ok =
+          m.exit === 0 &&
+          supa.status === 0 &&
+          ex.length === 1 &&
+          ex[0]!.role === "supabase_admin" &&
+          ex[0]!.rolsuper === true &&
+          ex[0]!.rolcanlogin === false &&
+          ex[0]!.rolbypassrls === false &&
+          JSON.stringify(ex[0]!.function_default) ===
+            JSON.stringify(["<built-in>"]) &&
+          self.status === 1 &&
+          covers(self.evidence) &&
+          (self.evidence.excluded_platform_superusers as unknown[]).length ===
+            0 &&
+          unset.status === 1 &&
+          covers(unset.evidence) &&
+          selfMigrate.code === "function_boundary_unproven";
+        return [
+          ok,
+          `supabase_migrate=${fmt(m)} supabase_check=${supa.status} excluded=${fmt(ex)} selfhosted_check=${self.status} no_mode_check=${unset.status} selfhosted_migrate=${fmt(selfMigrate)}`,
+        ];
+      },
+    ),
+);
+await check(
+  "platform trust root (supabase): a non-platform superuser (ops_admin) with no safe default stays covered: refused before any write",
+  () =>
+    supaCase(
+      "g6_pt2",
+      `${EXACT_HOOP_AND_POSTGRES}; CREATE ROLE ops_admin SUPERUSER NOLOGIN`,
+      async () => {
+        const m = migrate("g6_pt2", SUPA_GATE);
+        const absent = (await snapshot("g6_pt2")) === "absent";
+        const c = activationCheck("g6_pt2", { HOOPDB_DB_MODE: "supabase" });
+        const ok =
+          m.code === "function_boundary_unproven" &&
+          absent &&
+          c.status === 1 &&
+          (c.evidence.excluded_platform_superusers as unknown[]).length === 0 &&
+          (
+            c.evidence.sessions_create_roles as Array<{
+              role: string;
+              superuser: boolean;
+              function_default_exact: boolean;
+            }>
+          ).some(
+            (x) =>
+              x.role === "ops_admin" &&
+              x.superuser &&
+              !x.function_default_exact,
+          );
+        return [
+          ok,
+          `migrate=${fmt(m)} nothing_written=${absent} check=${c.status} excluded=${fmt(c.evidence.excluded_platform_superusers)}`,
+        ];
+      },
+    ),
+);
+await check(
+  "platform trust root (supabase): a role NAMED supabase_admin that is not a superuser, with CREATE on sessions and no safe default, is covered: refused, nothing changed",
+  () =>
+    supaCase("g6_pt3", EXACT_HOOP_AND_POSTGRES, async () => {
+      const m1 = migrate("g6_pt3", SUPA_GATE);
+      await attempt(
+        "postgres",
+        "CREATE ROLE supabase_admin NOSUPERUSER NOLOGIN",
+      );
+      await sql(
+        "g6_pt3",
+        "GRANT CREATE, USAGE ON SCHEMA sessions TO supabase_admin",
+      );
+      const before = await snapshot("g6_pt3");
+      const m2 = migrate("g6_pt3", SUPA_GATE);
+      const same = (await snapshot("g6_pt3")) === before;
+      const c = activationCheck("g6_pt3", { HOOPDB_DB_MODE: "supabase" });
+      await attempt(
+        "g6_pt3",
+        "REVOKE ALL ON SCHEMA sessions FROM supabase_admin",
+      );
+      const ok =
+        m1.exit === 0 &&
+        m2.code === "function_boundary_unproven" &&
+        same &&
+        c.status === 1 &&
+        (c.evidence.excluded_platform_superusers as unknown[]).length === 0 &&
+        (
+          c.evidence.sessions_create_roles as Array<{
+            role: string;
+            superuser: boolean;
+            function_default_exact: boolean;
+          }>
+        ).some(
+          (x) =>
+            x.role === "supabase_admin" &&
+            !x.superuser &&
+            !x.function_default_exact,
+        );
+      return [
+        ok,
+        `first=${fmt(m1)} gate=${fmt(m2)} unchanged=${same} check=${c.status}`,
+      ];
+    }),
+);
+await check(
+  "platform trust root (supabase): the non-superuser migration owner with no safe default is refused even with supabase_admin excluded",
+  () =>
+    supaCase(
+      "g6_pt4",
+      "ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC; CREATE ROLE supabase_admin SUPERUSER NOLOGIN",
+      async () => {
+        const m = migrate("g6_pt4", SUPA_GATE);
+        const absent = (await snapshot("g6_pt4")) === "absent";
+        const c = activationCheck("g6_pt4", { HOOPDB_DB_MODE: "supabase" });
+        const ok =
+          m.code === "function_boundary_unproven" &&
+          absent &&
+          c.status === 1 &&
+          c.evidence.owner_function_default_exact === false &&
+          (c.evidence.excluded_platform_superusers as Array<{ role: string }>)
+            .map((x) => x.role)
+            .join() === "supabase_admin";
+        return [
+          ok,
+          `migrate=${fmt(m)} nothing_written=${absent} owner_default=${fmt(c.evidence.owner_function_default)}`,
+        ];
+      },
+    ),
+);
+await check(
+  "platform trust root: no environment variable widens the exclusion (ops_admin superuser named in hostile env vars stays covered)",
+  () =>
+    supaCase(
+      "g6_pt5",
+      `${EXACT_HOOP_AND_POSTGRES}; CREATE ROLE ops_admin SUPERUSER NOLOGIN`,
+      async () => {
+        const hostile = {
+          SUPABASE_PLATFORM_SUPERUSERS: "ops_admin",
+          HOOPDB_SUPABASE_PLATFORM_SUPERUSERS: "ops_admin",
+          HOOPDB_PLATFORM_SUPERUSERS: "ops_admin",
+          HOOPDB_EXCLUDED_SUPERUSERS: "ops_admin",
+        };
+        const m = migrate("g6_pt5", { ...SUPA_GATE, ...hostile });
+        const c = activationCheck("g6_pt5", {
+          HOOPDB_DB_MODE: "supabase",
+          ...hostile,
+        });
+        const ok =
+          m.code === "function_boundary_unproven" &&
+          c.status === 1 &&
+          (c.evidence.excluded_platform_superusers as unknown[]).length === 0;
+        return [
+          ok,
+          `migrate=${fmt(m)} check=${c.status} excluded=${fmt(c.evidence.excluded_platform_superusers)}`,
+        ];
+      },
+    ),
 );
 await check(
   "a sessions-scoped function default granting authenticated EXECUTE (global defaults exact) fails the gate and the bootstrap, nothing changed",
@@ -1667,6 +1886,8 @@ const results = {
   // The catalog evidence of a correctly bootstrapped selfhosted database: the owner's
   // global function default and every role able to CREATE in sessions, with its default.
   function_boundary_evidence: BOUNDARY_EVIDENCE,
+  // Supabase mode with a platform superuser (supabase_admin) excluded from coverage.
+  supabase_platform_trust_root_evidence: PLATFORM_EVIDENCE,
   pg_version: version,
   pg_major: Number(version.split(".")[0]),
   generation: await generation(),

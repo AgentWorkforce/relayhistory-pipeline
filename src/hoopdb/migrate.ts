@@ -231,7 +231,7 @@ export async function runMigrations(client: MigrationClient, opts: RunOptions = 
     // Durable function boundary gate, every non-local mode: the selected control must be
     // proven by the catalog. Only explicit local (Docker dev) mode is ungated.
     if (profile.mode !== "local") {
-      const evidence = await functionBoundaryEvidence(client, profile.functionBoundary);
+      const evidence = await functionBoundaryEvidence(client, profile.functionBoundary, profile.mode);
       if (!evidence.satisfied)
         throw profileError("function_boundary_unproven", `no catalog-proven function boundary (HOOPDB_FUNCTION_BOUNDARY_MODE): ${JSON.stringify(evidence)}; see the runbook "Function boundary"`);
     }
@@ -451,10 +451,17 @@ if (import.meta.main) {
   process.env.OTEL_SERVICE_NAME ||= "hoopdb-migrate";
   if (process.argv.includes("--activation-check")) {
     // For an operator or the activation dossier: the function-boundary evidence (names and
-    // booleans only) for HOOPDB_URL and HOOPDB_FUNCTION_BOUNDARY_MODE. Exit 1 if unproven.
+    // booleans only) for HOOPDB_URL, HOOPDB_FUNCTION_BOUNDARY_MODE and HOOPDB_DB_MODE.
+    // Without HOOPDB_DB_MODE every creator is covered (no platform exclusion). Exit 1 if
+    // unproven.
+    const dbMode = process.env.HOOPDB_DB_MODE;
+    if (dbMode !== undefined && !["local", "selfhosted", "supabase"].includes(dbMode)) {
+      console.error("db_mode_invalid");
+      process.exit(1);
+    }
     const db = openHoopDb();
     const mode = migrationProfileMode();
-    functionBoundaryEvidence(db, mode)
+    functionBoundaryEvidence(db, mode, dbMode as DbMode | undefined)
       .then(async (e) => {
         console.log(JSON.stringify(e));
         await db.end();

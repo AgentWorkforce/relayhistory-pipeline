@@ -620,6 +620,35 @@ const FUNCTION_DEFAULT_ROW_SQL = `coalesce((
 /** The only exact-safe global function default: the role's own EXECUTE, no grant option, nothing else. */
 export const EXACT_SAFE_FUNCTION_DEFAULT = ["<self>:EXECUTE"];
 
+/**
+ * Supabase platform superusers: the platform's trust root, which the migrator cannot
+ * constrain (Supabase's postgres is not a superuser and cannot alter their defaults).
+ * Fixed and code-reviewed; no environment variable changes it. Keep it minimal; add a
+ * name only with a Supabase docs citation.
+ *   supabase_admin: "An internal role Supabase uses for administrative tasks, such as
+ *   running upgrades and automations."
+ *   (https://supabase.com/docs/guides/database/postgres/roles)
+ * A listed role is excluded from creator coverage ONLY in supabase mode AND only when
+ * pg_roles.rolsuper is true at gate time; never the migration owner. A listed name that is
+ * not a superuser, or any other superuser, stays covered.
+ */
+export const SUPABASE_PLATFORM_SUPERUSERS: readonly string[] = Object.freeze([
+  "supabase_admin",
+]);
+
+/** A platform superuser excluded from creator coverage (supabase mode), with its attributes. */
+export interface ExcludedPlatformSuperuser {
+  role: string;
+  rolsuper: boolean;
+  rolinherit: boolean;
+  rolcreaterole: boolean;
+  rolcreatedb: boolean;
+  rolcanlogin: boolean;
+  rolreplication: boolean;
+  rolbypassrls: boolean;
+  function_default: string[];
+}
+
 /** One role able to create functions in sessions, with its global function default. Names and booleans only. */
 export interface SessionsCreator {
   role: string;
@@ -649,6 +678,17 @@ export interface FunctionBoundaryEvidence {
    */
   sessions_create_roles: SessionsCreator[];
   sessions_create_roles_covered: boolean;
+  /**
+   * The HOOPDB_DB_MODE the gate ran under ("unspecified" for --activation-check without
+   * it: full coverage). Only "supabase" excludes platform superusers.
+   */
+  db_mode: "local" | "selfhosted" | "supabase" | "unspecified";
+  /**
+   * supabase mode only: CREATE-capable roles left out of sessions_create_roles because
+   * the catalog shows rolsuper AND the name is in SUPABASE_PLATFORM_SUPERUSERS (the
+   * platform trust root). Always empty in other modes.
+   */
+  excluded_platform_superusers: ExcludedPlatformSuperuser[];
   /**
    * Schema-scoped function defaults IN sessions (any role) that grant anyone other than
    * the defining role, as "role>grantee:PRIVILEGE[*]". They add to the global default, so
@@ -684,6 +724,7 @@ export interface FunctionBoundaryEvidence {
 export async function functionBoundaryEvidence(
   client: GuardClient,
   mode: FunctionBoundaryMode | undefined,
+  dbMode: "local" | "selfhosted" | "supabase" | undefined = undefined,
 ): Promise<FunctionBoundaryEvidence> {
   const head = (
     await client.query<{
@@ -703,10 +744,20 @@ export async function functionBoundaryEvidence(
     )
   ).rows[0]!;
   const roles = (
-    await client.query<{ oid: number; rolname: string; rolsuper: boolean }>(
-      head.sessions
-        ? "SELECT oid::int AS oid, rolname, rolsuper FROM pg_roles WHERE has_schema_privilege(oid, 'sessions', 'CREATE') ORDER BY rolname"
-        : "SELECT oid::int AS oid, rolname, rolsuper FROM pg_roles WHERE rolsuper OR rolname = current_user ORDER BY rolname",
+    await client.query<{
+      oid: number;
+      rolname: string;
+      rolsuper: boolean;
+      rolinherit: boolean;
+      rolcreaterole: boolean;
+      rolcreatedb: boolean;
+      rolcanlogin: boolean;
+      rolreplication: boolean;
+      rolbypassrls: boolean;
+    }>(
+      `SELECT oid::int AS oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls
+         FROM pg_roles WHERE ${head.sessions ? "has_schema_privilege(oid, 'sessions', 'CREATE')" : "rolsuper OR rolname = current_user"}
+        ORDER BY rolname`,
     )
   ).rows;
   const defaultOf = async (oid: number) =>
@@ -719,8 +770,28 @@ export async function functionBoundaryEvidence(
   const exact = (d: string[]) =>
     JSON.stringify(d) === JSON.stringify(EXACT_SAFE_FUNCTION_DEFAULT);
   const creators: SessionsCreator[] = [];
+  const excluded: ExcludedPlatformSuperuser[] = [];
   for (const r of roles) {
     const d = await defaultOf(r.oid);
+    if (
+      dbMode === "supabase" &&
+      r.rolsuper === true &&
+      r.oid !== head.owner_oid &&
+      SUPABASE_PLATFORM_SUPERUSERS.includes(r.rolname)
+    ) {
+      excluded.push({
+        role: r.rolname,
+        rolsuper: r.rolsuper,
+        rolinherit: r.rolinherit,
+        rolcreaterole: r.rolcreaterole,
+        rolcreatedb: r.rolcreatedb,
+        rolcanlogin: r.rolcanlogin,
+        rolreplication: r.rolreplication,
+        rolbypassrls: r.rolbypassrls,
+        function_default: d,
+      });
+      continue;
+    }
     creators.push({
       role: r.rolname,
       superuser: r.rolsuper,
@@ -758,6 +829,8 @@ export async function functionBoundaryEvidence(
     owner_function_default_exact: exact(ownerDefault),
     sessions_create_roles: creators,
     sessions_create_roles_covered: covered,
+    db_mode: dbMode ?? "unspecified",
+    excluded_platform_superusers: excluded,
     sessions_schema_function_defaults: schemaDefaults,
     sessions_functions_owned_by_owner: head.owned,
     event_trigger_present: head.event_trigger,
