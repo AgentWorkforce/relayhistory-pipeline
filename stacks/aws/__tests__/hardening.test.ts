@@ -268,11 +268,11 @@ describe("GitHub image publisher", () => {
   });
 
   it("is assumable only from this repository's image-publish environment", () => {
-    const t = githubImagePublishTrust("arn:aws:iam::1:oidc-provider/token.actions.githubusercontent.com", "repo:AgentWorkforce@252050005/96BullSessions@1437714333");
+    const t = githubImagePublishTrust("arn:aws:iam::1:oidc-provider/token.actions.githubusercontent.com", "repo:AgentWorkforce@252050005/sessions-pipeline@1437714333");
     expect(t.Statement).toHaveLength(1);
     expect(t.Statement[0]!.Condition.StringEquals).toEqual({
       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-      "token.actions.githubusercontent.com:sub": "repo:AgentWorkforce@252050005/96BullSessions@1437714333:environment:image-publish",
+      "token.actions.githubusercontent.com:sub": "repo:AgentWorkforce@252050005/sessions-pipeline@1437714333:environment:image-publish",
     });
   });
 });

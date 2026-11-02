@@ -46,13 +46,13 @@ import { Project as SupabaseProject, SupabaseProvider } from "../supabase/projec
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
-const REPO = "AgentWorkforce/96BullSessions";
+const REPO = "AgentWorkforce/sessions-pipeline";
 /**
  * The repo has GitHub immutable OIDC subjects on, so the sub carries numeric ids:
- * `repo:AgentWorkforce@252050005/96BullSessions@1437714333:environment:<env>`
- * (checked with `gh api repos/AgentWorkforce/96BullSessions/actions/oidc/customization/sub`).
+ * `repo:AgentWorkforce@252050005/sessions-pipeline@1437714333:environment:<env>`
+ * (checked with `gh api repos/AgentWorkforce/sessions-pipeline/actions/oidc/customization/sub`).
  */
-const OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/96BullSessions@1437714333";
+const OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/sessions-pipeline@1437714333";
 
 /** Written by hand (not by the CLI) once Khaliq clears the account: see docs/aws-stage.md and stacks/aws/inputs.ts. */
 function readInputs(stage: string): AwsInputs & { mode: AwsMode } {

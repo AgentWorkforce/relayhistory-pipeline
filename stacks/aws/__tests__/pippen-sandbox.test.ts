@@ -19,8 +19,8 @@ import { SANDBOX_BACKUP_BUCKET, SANDBOX_LOCKER_BUCKET } from "../../../src/proof
 
 const src = (f: string) => readFileSync(fileURLToPath(new URL(`../${f}`, import.meta.url)), "utf8");
 const BOUNDARY = "arn:aws:iam::361835732085:policy/pippen-agent-session-boundary";
-const SBX_TAGS = { "96bulls:stack": "aws-proof-sandbox", "96bulls:component": "eks", "96bulls:repo": "AgentWorkforce/96BullSessions", ...PIPPEN_SANDBOX_TAG };
-const DEV_TAGS = { "96bulls:stack": "aws-sessions-dev", "96bulls:component": "eks", "96bulls:repo": "AgentWorkforce/96BullSessions" };
+const SBX_TAGS = { "96bulls:stack": "aws-proof-sandbox", "96bulls:component": "eks", "96bulls:repo": "AgentWorkforce/sessions-pipeline", ...PIPPEN_SANDBOX_TAG };
+const DEV_TAGS = { "96bulls:stack": "aws-sessions-dev", "96bulls:component": "eks", "96bulls:repo": "AgentWorkforce/sessions-pipeline" };
 const refs = { lockerBucketArn: "arn:aws:s3:::b", lockerKmsKeyArn: "arn:aws:kms:us-west-2:1:key/k", lockerRegion: "us-west-2" };
 const CLUSTER_ARN = "arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-sessions-dev";
 

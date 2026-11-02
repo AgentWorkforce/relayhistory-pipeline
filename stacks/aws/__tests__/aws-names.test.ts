@@ -57,7 +57,7 @@ describe("AWS name and description charsets", () => {
       expect(legacy.roleName).toMatch(AWS.iamRoleName);
       expect(legacy.description).toMatch(AWS.iamDescription);
       expect(`96bulls-${stage}-deployer`).toMatch(AWS.iamRoleName);
-      expect(`96bulls ${stage}: ECR push of the services image, assumed only by AgentWorkforce/96BullSessions jobs in the image-publish environment`).toMatch(AWS.iamDescription);
+      expect(`96bulls ${stage}: ECR push of the services image, assumed only by AgentWorkforce/sessions-pipeline jobs in the image-publish environment`).toMatch(AWS.iamDescription);
       for (const a of ["locker", "trail"]) expect(`alias/96bulls-${stage}-${a}`).toMatch(AWS.kmsAlias);
       expect(controlPlaneLogGroupName(`96bulls-${stage}`)).toMatch(AWS.logGroup);
       expect(`96bulls-${stage}-monthly`).toMatch(AWS.budgetName);
