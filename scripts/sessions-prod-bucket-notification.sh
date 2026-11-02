@@ -75,7 +75,7 @@ case "$mode" in
     fi
     account_guard
     # The bucket must carry no notification we do not own: put replaces the whole configuration.
-    foreign="$(live | jq '[(.QueueConfigurations[] | select(.Id != "96bulls-session-pipeline-manifests")), .TopicConfigurations[], .LambdaFunctionConfigurations[]] | length + (if .EventBridgeConfiguration != null then 1 else 0 end)')"
+    foreign="$(live | jq '([(.QueueConfigurations[] | select(.Id != "96bulls-session-pipeline-manifests")), .TopicConfigurations[], .LambdaFunctionConfigurations[]] | length) + (if .EventBridgeConfiguration != null then 1 else 0 end)')"
     if [ "$foreign" != "0" ]; then
       echo "refused: $BUCKET has $foreign notification target(s) this script does not own; merge them by hand" >&2
       exit 2
