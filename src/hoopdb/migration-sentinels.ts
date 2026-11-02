@@ -92,6 +92,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261102000000_session_briefs.sql": {
     evidence: "table sessions.session_briefs",
     sql: relation("sessions.session_briefs"),
+  },
   "upstream:20261102010000_session_ingest_ledger.sql": {
     evidence: "table sessions.ingest_batches",
     sql: relation("sessions.ingest_batches"),
