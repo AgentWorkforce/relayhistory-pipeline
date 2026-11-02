@@ -29,10 +29,12 @@ export const EVENTS_TABLE = "transcript_events";
 /** Per (org, session) index state written by the pipeline (vendor/search-index/schema.ts). */
 export const SESSION_STATE_TABLE = "search_ingest_session_state";
 /**
- * At most this many partial sessions are listed per org check. The check only
- * asks "is there any"; the cap bounds the result, not the decision.
+ * At most this many partial sessions are listed per check. A session check
+ * asks about one id. A search check lists the org's partial sessions to
+ * attribute them to workspaces, so a list longer than this is not decided
+ * (queries return cap + 1 rows to tell) and the search falls back whole.
  */
-export const PARTIAL_SESSIONS_CAP = 100;
+export const PARTIAL_SESSIONS_CAP = 1000;
 /** Legacy search semantics: q matches the first 4096 characters of content, or the task title. */
 export const CONTENT_PREFIX_CHARS = 4096;
 /** The ngrams(3) text index answers queries this long or longer. */
@@ -88,9 +90,8 @@ export function qualifiedTable(database: string, table: string = EVENTS_TABLE): 
  * them as a complete transcript or a complete search.
  *
  * The state table is keyed (org_id, session_id) and has no workspace or source,
- * so a session read checks its session id across sources, and a search checks
- * the whole org (a partial session that has never been indexed has no row in
- * `transcript_events` to attribute it to a workspace).
+ * so a session read checks its session id across sources. A search uses
+ * buildWorkspacePartialSessionsQuery instead.
  *
  * With `sessionId`: that one session. Without: any session of the org, capped.
  */
@@ -107,6 +108,31 @@ GROUP BY session_id
 HAVING argMax(needs_full, synced_at) = 1
 LIMIT {cap:UInt32}`;
   return { query, params };
+}
+
+/**
+ * A workspace search's partial-session check. The state table has no
+ * workspace, so the org's partial sessions are listed (at most cap + 1, so an
+ * overflow is visible) with `in_workspace = 1` for each one that has any row,
+ * any version, in this workspace's `transcript_events`. The ones without such
+ * a row may still belong to this workspace (a session whose first pass was
+ * partial has no row at all), so the caller checks those against this
+ * workspace's live `session_index` pointers (page.ts
+ * partialSessionsInWorkspace). In-workspace sessions sort first.
+ */
+export function buildWorkspacePartialSessionsQuery(database: string, orgId: string, workspaceId: string): Built {
+  const partial = `SELECT session_id FROM ${qualifiedTable(database, SESSION_STATE_TABLE)}
+WHERE org_id = {org:String}
+GROUP BY session_id
+HAVING argMax(needs_full, synced_at) = 1`;
+  const query = `SELECT session_id, toUInt8(session_id IN (
+  SELECT DISTINCT session_id FROM ${qualifiedTable(database)}
+  WHERE org_id = {org:String} AND workspace_id = {ws:String} AND session_id IN (${partial})
+)) AS in_workspace
+FROM (${partial})
+ORDER BY in_workspace DESC, session_id
+LIMIT {cap:UInt32}`;
+  return { query, params: { org: orgId, ws: workspaceId, cap: PARTIAL_SESSIONS_CAP + 1 } };
 }
 
 /** Sort-key predicates shared by both round trips. */

@@ -87,7 +87,9 @@ Anything Phase A cannot answer exactly gets **`501 unsupported_by_backend`** wit
      - When backfill is proven complete, the floor is set to the epoch.
    - **Partial sessions:** a session whose latest `search_ingest_session_state` row has `needs_full = 1` (a partial S3 pass writes only that row; a capped reconcile writes some rows and that row) is not current in ClickHouse.
      - A session read's first page returns 501 `session_partial`.
-     - A workspace search's first page returns 501 `session_partial` while any session of the org is partial. The state table has no workspace column, and a never-indexed partial session has no row to attribute it with.
+     - A workspace search's first page returns 501 `session_partial` while a partial session belongs to the token's workspace. The state table has no workspace column, so a partial session is attributed to the workspace when it has any row (any version) in that workspace's `transcript_events`, or a live `session_index` pointer there. The pointer covers a session whose every pass was partial and so wrote no row. A session with neither belongs to another workspace, or is erased here (its rows are dropped anyway). Partial sessions of other workspaces of the org no longer stop the search.
+     - Scoping to the candidate page alone would not be sound: the events a partial session is missing from ClickHouse are never candidates, so their matches would vanish silently.
+     - The org's partial sessions are listed up to 1000. More than that is not decided, and the search returns 501 `session_partial_unbounded`.
      - The check runs only when pagination starts. A cursor continues the read it admitted: a 501 on a cursor page would end the caller's pagination in an error or restart it with duplicates.
      - The ClickHouse read user also needs `SELECT` on `search_ingest_session_state`.
 5. **Cursors** are opaque and namespaced: `b96e1:<base64url(JSON [tsMs, sessionId, source, machineId, kind, eventId])>`.
