@@ -52,6 +52,9 @@ export const PIPPEN_PROOF_SANDBOX = {
   callerRole: { roleName: "agent-session", sessionPrefix: "agent-" },
   /** The operator exports the lease's session_id here for a run on this stage; it only narrows the caller. */
   sessionEnv: "NINETY_SIX_BULLS_PIPPEN_SESSION",
+  /** Set by `pippen sandbox exec`: when present they must name the same lease and the sandbox account. */
+  execSessionEnv: "PIPPEN_SANDBOX_SESSION_ID",
+  execAccountEnv: "PIPPEN_SANDBOX_ACCOUNT_ID",
   teardownCommand: "pippen sandbox down aws-proof",
 } as const;
 
@@ -66,5 +69,12 @@ export function pippenProofSandboxCallerArn(env: Record<string, string | undefin
   const id = env[PIPPEN_PROOF_SANDBOX.sessionEnv];
   if (id === undefined || !PIPPEN_SESSION_ID.test(id))
     throw new Error(`96bulls: stage ${PIPPEN_PROOF_SANDBOX.stage} needs ${PIPPEN_PROOF_SANDBOX.sessionEnv}=<session_id from \`pippen sandbox status ${PIPPEN_PROOF_SANDBOX.agent}\`> (a lowercase v4 UUID). Nothing was changed.`);
+  // Under `pippen sandbox exec` (pippen-tools 327c263) the child also carries the lease it was issued for.
+  const execSession = env[PIPPEN_PROOF_SANDBOX.execSessionEnv];
+  if (execSession !== undefined && execSession !== id)
+    throw new Error(`96bulls: ${PIPPEN_PROOF_SANDBOX.execSessionEnv} (from \`pippen sandbox exec\`) is not ${PIPPEN_PROOF_SANDBOX.sessionEnv}; refusing a mismatched lease. Nothing was changed.`);
+  const execAccount = env[PIPPEN_PROOF_SANDBOX.execAccountEnv];
+  if (execAccount !== undefined && execAccount !== PIPPEN_PROOF_SANDBOX.accountId)
+    throw new Error(`96bulls: ${PIPPEN_PROOF_SANDBOX.execAccountEnv} is not the sandbox account ${PIPPEN_PROOF_SANDBOX.accountId}. Nothing was changed.`);
   return `arn:aws:sts::${PIPPEN_PROOF_SANDBOX.accountId}:assumed-role/${PIPPEN_PROOF_SANDBOX.callerRole.roleName}/${PIPPEN_PROOF_SANDBOX.callerRole.sessionPrefix}${id}`;
 }

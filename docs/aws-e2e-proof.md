@@ -178,6 +178,31 @@ environment built from scratch, not filtered from the operator's:
   operator `KUBECONFIG`. Only `PATH`, `HOME`, `LANG` and `TMPDIR` pass through. A kubectl or helm step without the generated
 kubeconfig is refused with `kubeconfig_unbound`.
 
+On `--target pippen-sandbox` only, the harness also accepts the refreshing
+profile that `pippen sandbox exec aws-proof -- bun run src/proof/aws/cli.ts ...`
+gives its child by default (pippen-tools 327c263): `AWS_PROFILE=pippen-sandbox`,
+`AWS_CONFIG_FILE=<exec's private dir>/config`, `AWS_SDK_LOAD_CONFIG=1`,
+`AWS_SHARED_CREDENTIALS_FILE=/dev/null` and no static keys
+(`resolveToolCredentials` in `cluster-binding.ts`). The config must hold exactly
+one section, `[profile pippen-sandbox]`, with only `region` and a
+`credential_process` that runs `pippen sandbox credentials-process aws-proof`;
+SSO settings, role chains, `endpoint_url`, `ca_bundle` or any other key are
+refused. In that mode every aws, kubectl and helm call (and the generated
+kubeconfig's `aws eks get-token` exec plugin) gets that `AWS_CONFIG_FILE` and
+`AWS_PROFILE` instead of `/dev/null`, so credentials refresh through the
+credential_process for the length of the lease; every other pin above stays.
+Refused on the sandbox: any other profile (ambient `default`, saved or SSO),
+`AWS_DEFAULT_PROFILE`, static keys mixed with a profile, a shared credentials
+file other than `/dev/null`, and a `PIPPEN_SANDBOX_SESSION_ID` other than
+`--pippen-session` (or a `PIPPEN_SANDBOX_ACCOUNT_ID` other than 361835732085).
+`pippen sandbox exec --static-credentials` (explicit keys) works as before. The
+caller must still be exactly
+`arn:aws:sts::361835732085:assumed-role/agent-session/agent-<--pippen-session>`.
+The proof (sessions-dev) target is unchanged: explicit keys only.
+The stack (`stacks/aws/sandbox-rules.ts`) applies the same lease check:
+`PIPPEN_SANDBOX_SESSION_ID`, when set, must equal
+`NINETY_SIX_BULLS_PIPPEN_SESSION`.
+
 **The guard** (`src/proof/aws/guard.ts`) runs before the first step and again
 before every step. It has no override. Any non-dry run against AWS needs all of
 the following:
