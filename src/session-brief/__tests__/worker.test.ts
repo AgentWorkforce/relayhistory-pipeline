@@ -12,7 +12,7 @@ import { writeShortSummary } from "../../hoopdb/session-directory-summary.ts";
 import { briefConfig } from "../config.ts";
 import { SessionAnalysisProviderError } from "../engine/transport.ts";
 import { SUMMARY_INSTRUCTIONS } from "../engine/summary-prompt.ts";
-import { armWakeup, sweepUnbriefed } from "../store.ts";
+import { armWakeup, scrubBrief, sweepUnbriefed } from "../store.ts";
 import { briefTick } from "../worker.ts";
 import {
   FakeModel,
@@ -188,7 +188,7 @@ describe("a due wakeup is briefed by the model", () => {
       schemaName: "session_summary",
       timeoutMs: 20_000,
       store: false,
-      maxOutputTokens: 128,
+      maxOutputTokens: 256,
       reasoningEffort: "none",
     });
     const input = JSON.parse(req.input);
@@ -204,9 +204,10 @@ describe("a due wakeup is briefed by the model", () => {
       status: "ready",
       title: s.model.reply.title,
       description: s.model.reply.description,
+      state: "completed",
       model: "gpt-5.6-luna",
-      prompt_version: "session-summary-v2",
-      engine_version: "session-summary-v2:96bulls-v1",
+      prompt_version: "session-summary-v3",
+      engine_version: "session-summary-v3:96bulls-v1",
       scrub_ruleset: "relayhistory-scrub",
       message_count: 3,
       shortened_messages: 0,
@@ -222,7 +223,12 @@ describe("a due wakeup is briefed by the model", () => {
     expect(dir.short_summary_source).toBe("session-brief/gpt-5.6-luna");
     expect(String(dir.search_text)).toContain(s.model.reply.title);
 
-    expect((await briefRpc(s.pg))[0]).toMatchObject({ status: "ready", title: s.model.reply.title });
+    expect((await briefRpc(s.pg))[0]).toMatchObject({
+      status: "ready",
+      title: s.model.reply.title,
+      description: s.model.reply.description,
+      state: "completed",
+    });
 
     // Ids, counts and codes only: no transcript text, model output or credential in logs.
     expect(logs.length).toBeGreaterThan(0);
@@ -307,6 +313,30 @@ describe("a due wakeup is briefed by the model", () => {
     expect((await briefRpc(s.pg))[0]).toMatchObject({ status: "ready" });
   });
 
+  test("a v2 brief (no state) is regenerated for an unchanged input instead of reused", async () => {
+    const s = await setup();
+    const lines = [user("fix the build"), assistant("done")];
+    await s.upload(lines);
+    await dueNow(s.pg);
+    await s.tick();
+    await s.pg.exec(`UPDATE sessions.session_briefs
+                        SET state = NULL, prompt_version = 'session-summary-v2',
+                            engine_version = 'session-summary-v2:96bulls-v1',
+                            attempted_at = now() - interval '10 minutes'`);
+    await s.upload(lines, { revision: 2 });
+    await dueNow(s.pg);
+    expect(await s.tick()).toEqual({ generated: 1 });
+    expect(s.model.requests).toHaveLength(2);
+    expect(await brief(s.pg)).toMatchObject({ state: "completed", prompt_version: "session-summary-v3" });
+    expect((await briefRpc(s.pg))[0]).toMatchObject({ status: "ready", state: "completed" });
+  });
+
+  test("a brief's state must be one of the summary states", () => {
+    const text = { title: "Fix the build", description: "Fixed it. Tests pass." };
+    expect(scrubBrief({ ...text, state: "blocked" }).state).toBe("blocked");
+    expect(() => scrubBrief({ ...text, state: "done" as never })).toThrow("state_invalid");
+  });
+
   test("new content re-briefs, and the projector keeps the brief title over the pointer title", async () => {
     const s = await setup();
     await s.upload([user("fix the build")]);
@@ -316,7 +346,7 @@ describe("a due wakeup is briefed by the model", () => {
     await s.pg.exec("UPDATE sessions.session_briefs SET attempted_at = now() - interval '10 minutes'");
     await s.upload([user("fix the build"), assistant("and add a test")], { revision: 2 });
     expect((await directory(s.pg)).title).toBe(s.model.reply.title);
-    s.model.reply = { title: "Fix the build and add a test", description: "Fixed the build and added a regression test for it." };
+    s.model.reply = { title: "Fix the build and add a test", description: "Fixed the build. Added a regression test for it.", state: "completed" };
     await dueNow(s.pg);
     expect(await s.tick()).toEqual({ generated: 1 });
     expect((await directory(s.pg)).title).toBe("Fix the build and add a test");
@@ -477,7 +507,7 @@ describe("limits and failures", () => {
     const s = await setup();
     await s.upload([user("fix the build")]);
     const token = ["ghp", "x".repeat(36)].join("_");
-    s.model.reply = { title: "Rotate the token", description: `Rotated ${token} for CI.` };
+    s.model.reply = { title: "Rotate the token", description: `Rotated ${token} for CI.`, state: "completed" };
     await dueNow(s.pg);
     expect(await s.tick()).toEqual({ generated: 1 });
     const row = (await brief(s.pg))!;

@@ -97,6 +97,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "ALTER-only: column sessions.session_index.canonical_session_id",
     sql: column("sessions.session_index", "canonical_session_id"),
   },
+  "upstream:20261102020000_session_brief_state.sql": {
+    evidence: "ALTER-only: column sessions.session_briefs.state (session_brief replaced to return it)",
+    sql: column("sessions.session_briefs", "state"),
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
@@ -121,6 +125,7 @@ export const NON_CREATE_STEPS = [
   "upstream:20261025000300_upsert_keep_on_null.sql",
   "upstream:20261030000000_relayhistory_machines_compat.sql",
   "upstream:20261102010000_session_directory_canonical_ids.sql",
+  "upstream:20261102020000_session_brief_state.sql",
   "96bulls:0003_fanout_ledger.sql",
   "96bulls:0004_summary_pointers.sql",
 ] as const;
