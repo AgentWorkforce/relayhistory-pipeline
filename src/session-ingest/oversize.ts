@@ -43,3 +43,17 @@ export function fitForScrub(record: PreparedDeliveryRecord): PreparedDeliveryRec
   const payload = fit(record.payload) as Record<string, unknown>;
   return payload === record.payload ? record : { ...record, payload };
 }
+
+/**
+ * A chunk line (`liveLine`) fitted again. The fan-out seals staged lines that
+ * were already scrubbed once, and scrubbing is not idempotent in length
+ * (`KEY=)` becomes `KEY=[REDACTED]`), so a string can cross the bound on the
+ * second pass: fit it again before it is sealed, or an acknowledged batch
+ * dead-letters.
+ */
+export function fitLine(line: string): string {
+  const parsed = JSON.parse(line) as { payload?: unknown };
+  if (!parsed.payload || typeof parsed.payload !== "object") return line;
+  const payload = fit(parsed.payload);
+  return JSON.stringify({ ...parsed, payload });
+}

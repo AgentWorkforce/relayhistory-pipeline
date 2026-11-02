@@ -34,6 +34,7 @@ import { rawZstdFrame, scrubRecords } from "@rhc/lib/pipeline/raw-chunks.ts";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { liveMachineId, writeGroups, type Group, type WriteTarget } from "./writer.ts";
+import { fitLine } from "./oversize.ts";
 
 export const STAGED_VERSION = 1;
 /** Sessions one fan-out message writes: well inside a queue invocation's subrequest budget. */
@@ -129,7 +130,8 @@ export async function readStaged(store: ObjectStore, key: string, decompress: (b
 /** The queue stage: write one message's groups. Idempotent (manifest replay dedupe by batch digest). */
 export async function fanout(target: WriteTarget, message: FanoutMessage, decompress: (bytes: Uint8Array) => Uint8Array) {
   const { header, groups } = await readStaged(target.store, message.key, decompress);
-  const slice = groups.slice(message.from, message.to);
+  // Already scrubbed once when staged: fit again for the second scrub at sealing (oversize.ts fitLine).
+  const slice = groups.slice(message.from, message.to).map((g) => ({ ...g, lines: g.lines.map(fitLine) }));
   return writeGroups(
     target,
     { orgId: header.org_id, workspaceId: header.workspace_id, originId: header.origin_id, userId: header.user_id, batchDigest: header.batch_digest },

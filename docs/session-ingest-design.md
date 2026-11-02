@@ -116,6 +116,9 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
 - The ingest adds only `oversize: "redact"`. A text `scrubLong` cannot cut, such as canonical `*_json` evidence or a base64 dump past 256K, becomes one redaction marker. Fail closed: the record and its other fields still land.
 - The default stays `refuse`, so every other writer is unchanged.
 - The output is deterministic, so a replay seals identical bytes.
+- The check covers the decoded value **and** its JSON literal, as the scrubber does: a newline-wrapped dump has no safe cut in its escaped form.
+- The fan-out fits staged lines again before sealing them, because scrubbing can lengthen a string (`?state=` becomes `?state=[REDACTED]`).
+- **Known limit:** an embedded image over 262,144 characters (about 192 KB) has no whitespace to cut at, so it lands as the redaction marker. Today `s3_first` sends it to Neon instead.
 
 ## 3. Ledger (Supabase)
 

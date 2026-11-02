@@ -419,6 +419,30 @@ describe("staging: a batch wider than one Worker invocation", () => {
     expect(ledger.commits.at(-1)!.records.map((r) => r.recordId)).toEqual(["b", "c"]);
   });
 
+  test("a string the first scrub grows past the bound still lands through the fan-out (re-review High)", async () => {
+    const { store } = setup();
+    // A string just under the bound that the staging scrub grows past it (`?state=` becomes
+    // `?state=[REDACTED]`), with no whitespace to cut at. Built after prepare (which would
+    // already redact it), as an exempt image or any non-idempotent match can.
+    const grown = "A".repeat(MAX_SCRUB_CHARS - 3 - "?state=)".length) + "?state=)";
+    const records = [
+      record({ record_id: "img", session_id: "x", payload: { blob: "placeholder", ts_ms: 1_761_955_200_000 } }),
+      record({ record_id: "b", session_id: "y" }),
+    ];
+    const { stageGroups, fanoutMessages, fanout } = await import("../staging.ts");
+    const { groupRecords } = await import("../writer.ts");
+    const prepared = await prepareDelivery(TENANT, await batch(records));
+    prepared.records[0]!.payload = { blob: grown, ts_ms: 1_761_955_200_000 };
+    const now = new Date("2026-11-02T00:00:00Z");
+    const { groups } = groupRecords(prepared.records, now);
+    const target = { store, keyRoot: "96bulls", sleep: noSleep };
+    const key = await stageGroups(target, { batch_digest: prepared.batchDigest, received_at: now.toISOString(), org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", user_id: "user-1" }, groups);
+    for (const m of fanoutMessages(key, groups.length)) await fanout(target, m, (x) => new Uint8Array(zstdDecompressSync(x)));
+    const manifests = (await listAll(store, "96bulls/org-a/v1")).filter((k) => k.endsWith("manifest.json"));
+    expect(manifests).toHaveLength(2);
+
+  }, 60_000);
+
   test("a staged batch is not acknowledged when the fan-out cannot be queued", async () => {
     const { ledger, deps } = setup();
     const staged = { ...deps, inlineMaxSessions: 1, fanout: async () => { throw new Error("queue down"); } };
