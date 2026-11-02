@@ -1,4 +1,4 @@
--- Down path for supabase/migrations/20261101030000_session_briefs.sql.
+-- Down path for supabase/migrations/20261102000000_session_briefs.sql.
 -- Additive up, so the down only drops what it added. Briefs are derived data: the brief
 -- worker rebuilds them from the scrubbed raw after an up. Revert the code first: the
 -- directory projector reads session_briefs for its title precedence. Brief titles and

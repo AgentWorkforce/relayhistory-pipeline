@@ -1,5 +1,5 @@
 /**
- * 20261101030000_session_briefs: tables, deletion triggers, RLS, and the Worker brief RPC
+ * 20261102000000_session_briefs: tables, deletion triggers, RLS, and the Worker brief RPC
  * (role guard, signed-claims scope, cross-tenant isolation, status derivation). PGlite
  * with every supabase migration and the 96bulls ones, as src/hoopdb/migrate.ts orders them.
  */
@@ -13,8 +13,8 @@ import { KEY, WORKER, asRole, briefRpc, claims, code, database, hoopDb, pointer,
 // Each test builds a PGlite database with the full migration plan (a few seconds).
 setDefaultTimeout(60_000);
 
-const UP = read("supabase/migrations/20261101030000_session_briefs.sql");
-const DOWN = read("supabase/rollbacks/20261101030000_session_briefs.down.sql");
+const UP = read("supabase/migrations/20261102000000_session_briefs.sql");
+const DOWN = read("supabase/rollbacks/20261102000000_session_briefs.down.sql");
 const VERIFY = read("supabase/bootstrap/session_directory_search_worker_verify.sql");
 
 const open: PGlite[] = [];

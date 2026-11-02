@@ -377,6 +377,29 @@ describe("limits and failures", () => {
     expect((await briefRpc(s.pg))[0]).toMatchObject({ status: "rate_limited" });
   });
 
+  test("the global daily cap counts every org's attempts and refuses until the next UTC day", async () => {
+    const s = await setup();
+    await s.pg.query(
+      `INSERT INTO sessions.session_brief_attempts (org_id, workspace_id, harness, session_id, day, attempts)
+       VALUES ('org-elsewhere', 'ws-z', 'codex', 'z-1', (now() AT TIME ZONE 'UTC')::date, 3)`,
+    );
+    await s.upload([user("fix the build")]);
+    await dueNow(s.pg);
+    expect(await s.tick({ globalDailyCap: 3 })).toEqual({ rate_limited: 1 });
+    expect(s.model.requests).toHaveLength(0);
+    expect(await brief(s.pg)).toMatchObject({ status: "rate_limited", error: "session_brief_global_capped" });
+    // Under the ceiling, the same session is briefed.
+    await dueNow(s.pg);
+    expect(await s.tick({ globalDailyCap: 4, throttleSeconds: 0 })).not.toHaveProperty("rate_limited");
+    expect(s.model.requests).toHaveLength(1);
+  });
+
+  test("the env default is a 20,000-attempt global ceiling, and 0 refuses every call", () => {
+    expect(briefConfig({}).globalDailyCap).toBe(20_000);
+    expect(briefConfig({ SESSION_BRIEF_GLOBAL_DAILY_CAP: "0" }).globalDailyCap).toBe(0);
+    expect(briefConfig({ SESSION_BRIEF_GLOBAL_DAILY_CAP: "abc" }).globalDailyCap).toBe(20_000);
+  });
+
   test("the per-session daily cap", async () => {
     const s = await setup();
     await s.upload([user("fix the build")]);

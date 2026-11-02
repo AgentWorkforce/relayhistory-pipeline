@@ -12,7 +12,9 @@
  *                        be delivered to an SSE-KMS bucket), 90-day retention
  *   CloudTrail           management events + S3 data events for the transcripts bucket only,
  *                        into its own SSE-KMS bucket (the trail key policy from hardening.ts)
- *   IAM users            writer (the RelayHistory Worker), reader (the indexer), eraser (the purge job).
+ *   IAM users            writer (the RelayHistory Worker), reader (the indexer), eraser (the purge job),
+ *                        srv-writer (the relayhistory-api Worker's live writer: `m=srv_*` sessions,
+ *                        live-sessions/, live-batches/, SSE-KMS headers required, no delete, no list).
  *                        Users, not roles: a Cloudflare Worker cannot assume a role. No access keys
  *                        are declared here: Alchemy state is plaintext, so keys are created out of
  *                        band straight into 1Password (runbooks/sessions-prod-transcript-store.md).
@@ -44,7 +46,23 @@ import * as Effect from "effect/Effect";
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
 import { sha256, type Provenance } from "../../src/cli/plan-provenance.ts";
 import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hardening.ts";
+import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
+import {
+  SESSION_PIPELINE_RESOURCES,
+  assertSessionPipelineInputs,
+  pipelineBucketStatements,
+  pipelineKeyStatement,
+  sessionPipelineFunction,
+  sessionPipelineWiring,
+  type SessionPipelineInputs,
+} from "./session-pipeline.ts";
+import {
+  SESSION_READ_API_RESOURCES,
+  assertSessionReadApiInputs,
+  sessionReadApi,
+  type SessionReadApiInputs,
+} from "./session-read-api.ts";
 
 /** K-45 (Khaliq, 2026-10-31): logical delete immediately, physical purge within 48 h. */
 export const ERASURE_SLA_HOURS = 48;
@@ -70,6 +88,16 @@ export interface TranscriptStoreInputs {
   managementEvents?: boolean;
   /** Optional role allowed to decrypt/re-encrypt CloudTrail log files. Omit for no trail-log read path. */
   auditPrincipalArn?: string;
+  /**
+   * The session pipeline (session-pipeline.ts): S3 manifest events -> SQS -> Lambda -> Supabase
+   * pointer + ClickHouse index. Omit for the store alone.
+   */
+  sessionPipeline?: SessionPipelineInputs;
+  /**
+   * The session read API (session-read-api.ts): Lambda + Function URL serving
+   * /v1 event reads from ClickHouse with Supabase erasure checks. Omit for none.
+   */
+  sessionReadApi?: SessionReadApiInputs;
 }
 
 export interface TranscriptNames {
@@ -85,6 +113,7 @@ export interface TranscriptNames {
   writer: string;
   reader: string;
   eraser: string;
+  srvWriter: string;
 }
 
 export function transcriptNames(stage: string, accountId: string): TranscriptNames {
@@ -102,6 +131,7 @@ export function transcriptNames(stage: string, accountId: string): TranscriptNam
     writer: n("transcript-writer"),
     reader: n("transcript-reader"),
     eraser: n("transcript-eraser"),
+    srvWriter: n("transcript-srv-writer"),
   };
 }
 
@@ -110,6 +140,12 @@ export const userArn = (accountId: string, path: string, name: string) => `arn:a
 /** Every session object, in every org: `<bucket>/96bulls/*\/v1/*<tail>`. */
 const sessionObjects = (bucketArn: string, tail: string) => `${bucketArn}/${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/*${tail}`;
 const allObjects = (bucketArn: string) => `${bucketArn}/${TENANT_KEY_BASE}/*`;
+/** The relayhistory-api Worker's live writer: server-side machines (`m=srv_<hash>`) and the live prefixes, in every org. */
+export const srvWriterObjects = (bucketArn: string) => [
+  `${bucketArn}/${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/ws=*/m=srv_*`,
+  `${bucketArn}/${TENANT_KEY_BASE}/*/live-sessions/*`,
+  `${bucketArn}/${TENANT_KEY_BASE}/*/live-batches/*`,
+];
 
 /**
  * Inputs a transcript-store stage must not carry: it is S3 only (decision 0001),
@@ -135,7 +171,10 @@ export function assertTranscriptStoreInputs(
   if (inputs.accountId !== TRANSCRIPT_ACCOUNT_ID) refuse(`accountId must be exactly ${TRANSCRIPT_ACCOUNT_ID}, got ${JSON.stringify(inputs.accountId)}`);
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
-  for (const k of Object.keys(store)) if (k !== "managementEvents" && k !== "auditPrincipalArn") refuse(`transcriptStore.${k} is not a known setting`);
+  for (const k of Object.keys(store))
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "sessionPipeline" && k !== "sessionReadApi") refuse(`transcriptStore.${k} is not a known setting`);
+  if (store.sessionPipeline !== undefined) assertSessionPipelineInputs(store.sessionPipeline, refuse);
+  if (store.sessionReadApi !== undefined) assertSessionReadApiInputs(store.sessionReadApi, refuse);
   if (store.managementEvents !== undefined && typeof store.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
   if (store.auditPrincipalArn !== undefined && !new RegExp(`^arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/[A-Za-z0-9_+=,.@/-]+$`).test(store.auditPrincipalArn))
     refuse(`transcriptStore.auditPrincipalArn must be a named IAM role in account ${TRANSCRIPT_ACCOUNT_ID} in partition aws`);
@@ -147,24 +186,102 @@ export function assertTranscriptStoreInputs(
 
 const TRANSCRIPT_RESOURCES = [
   "access-logs", "budget", "trail", "trail-key", "trail-key-alias", "trail-logs",
-  "transcript-eraser", "transcript-reader", "transcript-writer", "transcripts",
+  "transcript-eraser", "transcript-reader", "transcript-srv-writer", "transcript-writer", "transcripts",
   "transcripts-key", "transcripts-key-alias",
 ] as const;
 
-export type TranscriptStorePlanPhase = "initial" | "principal-propagation recovery" | "post-merge policy remediation" | "post-apply";
+export type TranscriptStorePlanPhase =
+  | "initial"
+  | "principal-propagation recovery"
+  | "post-merge policy remediation"
+  | "srv-writer addition"
+  | "srv-writer propagation recovery"
+  | "post-apply"
+  | "session pipeline rollout"
+  | "session pipeline update"
+  | "session read api rollout"
+  | "session read api update";
+
+/**
+ * The read API's own phases (session-read-api.ts). It touches nothing else: no
+ * key, bucket, queue or pipeline resource may change in the same plan. Rollout:
+ * its resources are created (all, or the rest after a partial apply). Update:
+ * they change in place (code, env such as `origin`, settings). Never a
+ * replacement or deletion.
+ */
+function sessionReadApiPhase(operations: ReadonlyMap<string, string>): TranscriptStorePlanPhase | undefined {
+  const api = SESSION_READ_API_RESOURCES.map((r) => operations.get(r));
+  const others = [...operations].filter(([r]) => !(SESSION_READ_API_RESOURCES as readonly string[]).includes(r));
+  if (!others.every(([, a]) => a === "noop")) return undefined;
+  if (api.every((a) => a === "create" || a === "noop") && api.some((a) => a === "create")) return "session read api rollout";
+  if (api.every((a) => a === "update" || a === "noop") && api.some((a) => a === "update")) return "session read api update";
+  return undefined;
+}
+
+/**
+ * The session pipeline's own phases (session-pipeline.ts). Rollout: the pipeline's
+ * resources are created (all, or the rest after a partial apply), and the store
+ * changes only by the two grants it needs: the transcripts key policy (decrypt via
+ * S3) and the bucket policy (list, read). Update: an existing pipeline changes in
+ * place (code, env, settings). The five resources that name the pipeline's role
+ * (ROLE_GRANT_RESOURCES) may update only by the role-ARN cascade, checked against
+ * the detailed plan in assertPipelineRoleCascadeDiff. Never a replacement or
+ * deletion, and every other store resource stays `noop`.
+ */
+function sessionPipelinePhase(operations: ReadonlyMap<string, string>): TranscriptStorePlanPhase | undefined {
+  if (!SESSION_PIPELINE_RESOURCES.some((r) => operations.has(r))) return undefined;
+  const pipeline = SESSION_PIPELINE_RESOURCES.map((r) => operations.get(r));
+  const store = (r: string) => operations.get(r);
+  const othersNoop = TRANSCRIPT_RESOURCES.filter((r) => r !== "transcripts" && r !== "transcripts-key").every((r) => store(r) === "noop");
+  if (!othersNoop) return undefined;
+  const grants = ["transcripts", "transcripts-key"].map(store);
+  if (pipeline.every((a) => a === "create" || a === "noop") && grants.every((a) => a === "update" || a === "noop")) {
+    if (pipeline.some((a) => a === "create")) return "session pipeline rollout";
+    if (grants.some((a) => a === "update")) return "session pipeline rollout";
+  }
+  if (grants.every((a) => a === "update" || a === "noop") && pipeline.every((a) => a === "update" || a === "noop") && pipeline.some((a) => a === "update"))
+    return "session pipeline update";
+  return undefined;
+}
 
 const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
   { name: "initial", actions: Object.fromEntries(TRANSCRIPT_RESOURCES.map((resource) => [resource, "create"])) },
   { name: "principal-propagation recovery", actions: { transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" } },
   // One capture-bound exception for the policies hardened after the first production apply.
-  // The other ten resources must be noop, and a subsequent capture must be all-noop.
+  // The other resources must be noop, and a subsequent capture must be all-noop.
   { name: "post-merge policy remediation", actions: { "trail-key": "update", "trail-logs": "update" } },
+  // Adding the relayhistory-api live writer to the applied store: the new user, and the key policy that names it.
+  { name: "srv-writer addition", actions: { "transcript-srv-writer": "create", "transcripts-key": "update" } },
+  // The srv-writer addition's own recovery: the user was created (now noop, so it exists in state) but
+  // KMS refused the key policy because the new principal had not propagated. Only the key policy update
+  // that adds the srv-writer's statement is accepted (assertSrvWriterRecoveryDiff).
+  { name: "srv-writer propagation recovery", actions: { "transcripts-key": "update" } },
   { name: "post-apply", actions: {} },
 ];
 
 export interface TranscriptStorePlanCapture {
   detailedPlanText: string;
   provenanceText: string;
+  /**
+   * The read-only state snapshot the capture planned against (capture only). The deploy has no
+   * snapshot; it is bound to the same state by the capture's version digest (capture-verify.ts).
+   */
+  stateSnapshotText?: string;
+}
+
+/**
+ * The resources a plan must list: the store's resources, plus every pipeline resource
+ * once any of them appears, plus every read API resource once any of those does.
+ */
+function expectedResources(names: Iterable<string>): readonly string[] {
+  const list = [...names];
+  const pipeline = new Set<string>(SESSION_PIPELINE_RESOURCES);
+  const readApi = new Set<string>(SESSION_READ_API_RESOURCES);
+  return [
+    ...TRANSCRIPT_RESOURCES,
+    ...(list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
+    ...(list.some((n) => readApi.has(n)) ? SESSION_READ_API_RESOURCES : []),
+  ];
 }
 
 function transcriptPlanOperations(text: string, label: "compact" | "detailed", refuse: (why: string) => never) {
@@ -178,7 +295,7 @@ function transcriptPlanOperations(text: string, label: "compact" | "detailed", r
     if (operations.has(resource!)) refuse(`${label} plan: resource ${resource} appears more than once`);
     operations.set(resource!, action!);
   }
-  const expected = new Set<string>(TRANSCRIPT_RESOURCES);
+  const expected = new Set<string>(expectedResources(operations.keys()));
   for (const resource of operations.keys()) if (!expected.has(resource)) refuse(`${label} plan: unexpected resource ${resource}`);
   for (const resource of expected) if (!operations.has(resource)) refuse(`${label} plan: missing resource ${resource}`);
   for (const [resource, action] of operations)
@@ -219,7 +336,7 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   const compact = transcriptPlanOperations(planText, "compact", refuse);
   const detailed = transcriptPlanOperations(capture.detailedPlanText, "detailed", refuse);
   if (compact.summary !== detailed.summary) refuse("compact and detailed plan summaries differ");
-  for (const resource of TRANSCRIPT_RESOURCES)
+  for (const resource of expectedResources(compact.operations.keys()))
     if (compact.operations.get(resource) !== detailed.operations.get(resource))
       refuse(`compact and detailed plans disagree on ${resource}`);
 
@@ -238,14 +355,208 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   if (provenance.outputs.detailed.sha256 !== sha256(capture.detailedPlanText)) refuse("detailed plan does not match its provenance sha256");
   if (provenance.summary !== compact.summary) refuse("provenance summary does not match the plan summary");
 
+  // The read API changes alone; once it is all noop, the rest of the plan is judged as before.
+  if (SESSION_READ_API_RESOURCES.some((r) => compact.operations.has(r))) {
+    const readApiPhase = sessionReadApiPhase(compact.operations);
+    if (readApiPhase) return readApiPhase;
+    if (!SESSION_READ_API_RESOURCES.every((r) => compact.operations.get(r) === "noop")) {
+      const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
+      return refuse(`action set does not match the session read api rollout or update phase (the read api changes alone): ${changes.join(", ")}`);
+    }
+  }
+  const withPipeline = SESSION_PIPELINE_RESOURCES.some((r) => compact.operations.has(r));
+  if (withPipeline) {
+    if (SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
+      return "post-apply";
+    const pipelinePhase = sessionPipelinePhase(compact.operations);
+    if (pipelinePhase === "session pipeline update")
+      assertPipelineRoleCascadeDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
+    if (pipelinePhase) return pipelinePhase;
+    const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
+    return refuse(`action set does not match the session pipeline rollout, update or post-apply phase: ${changes.join(", ") || "(none)"}`);
+  }
   const phase = TRANSCRIPT_PLAN_PHASES.find((candidate) =>
     TRANSCRIPT_RESOURCES.every((resource) => compact.operations.get(resource) === (candidate.actions[resource] ?? "noop")),
   );
   if (!phase) {
     const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
-    return refuse(`action set does not match initial, recovery, exact two-policy remediation, or post-apply phase: ${changes.join(", ") || "(none)"}`);
+    return refuse(`action set does not match initial, recovery, exact two-policy remediation, srv-writer addition, srv-writer recovery, or post-apply phase: ${changes.join(", ") || "(none)"}`);
   }
+  if (phase.name === "srv-writer propagation recovery") assertSrvWriterRecoveryDiff(capture.detailedPlanText, capture.stateSnapshotText, refuse);
   return phase.name;
+}
+
+/**
+ * The resources whose policies name the session pipeline's execution role. A pipeline
+ * update (any change to the function) re-plans the function's `roleArn` output as
+ * `(known after apply)`: Alchemy's Lambda provider keeps `roleName` stable but not
+ * `roleArn`. So every one of them shows an update in which the role's ARN becomes
+ * `(known after apply)`, though the role, and so the ARN, does not change.
+ */
+export const ROLE_GRANT_RESOURCES = ["session-events", "session-pipeline-secret", "session-reconcile-continue", "transcripts", "transcripts-key"] as const;
+const KNOWN_AFTER_APPLY = "(known after apply)";
+/** The two keys that hold the role ARN: a policy statement's `Principal.AWS`, and the permission's `principal`. */
+const ROLE_ARN_LINE = /^(\s*(?:AWS|principal): )(.*)$/;
+
+/** One resource's lines in a detailed plan, between its `[resource] action` line and the next. */
+function detailedBlock(lines: readonly string[], resource: string): string[] {
+  const start = lines.findIndex((line) => line.trim() === `[${resource}] update`);
+  if (start < 0) return [];
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(line));
+  return end < 0 ? rest : rest.slice(0, end);
+}
+
+/**
+ * In a session pipeline update, each ROLE_GRANT_RESOURCES update must be exactly the role-ARN
+ * cascade. Alchemy prints a changed key as its whole old value (`  - ` lines) followed by its whole
+ * new value (`  + ` lines). Each such run must have as many `-` as `+` lines, and the i-th `-` line
+ * must equal the i-th `+` line except where the `-` line is `AWS: <role>` or `principal: <role>` and
+ * the `+` line is the same key with `(known after apply)`, at least once per updated resource.
+ * <role> is the function's roleArn in the capture's state snapshot. The deploy has no snapshot; it is
+ * bound to the captured state by the version digest, and here every replaced ARN must be one role
+ * in the production account. The function itself must update, and nothing else may change.
+ */
+function assertPipelineRoleCascadeDiff(
+  operations: ReadonlyMap<string, string>,
+  detailedPlanText: string,
+  stateSnapshotText: string | undefined,
+  refuse: (why: string) => never,
+) {
+  const updated = ROLE_GRANT_RESOURCES.filter((r) => operations.get(r) === "update");
+  if (updated.length === 0) return;
+  if (operations.get("session-pipeline") !== "update")
+    refuse(`session pipeline update: ${updated.join(", ")} update but session-pipeline does not`);
+  const cascade = new Set<string>(["session-pipeline", ...updated]);
+  const others = [...operations].filter(([r, a]) => a !== "noop" && !cascade.has(r)).map(([r, a]) => `${r}:${a}`);
+  if (others.length) refuse(`session pipeline update: the role-ARN cascade comes with other changes: ${others.join(", ")}`);
+  const roleArn = stateSnapshotText === undefined ? undefined : pipelineRoleArnFromState(stateSnapshotText, refuse);
+  const lines = detailedPlanText.split(/\r?\n/);
+  const replaced = new Set<string>();
+  for (const resource of updated) {
+    const block = detailedBlock(lines, resource);
+    const marked = block.map((line) => /^  ([+-]) (.*)$/.exec(line));
+    let cascades = 0;
+    for (let i = 0; i < block.length; ) {
+      if (!marked[i]) {
+        i++;
+        continue;
+      }
+      let j = i;
+      while (j < block.length && marked[j]?.[1] === "-") j++;
+      let k = j;
+      while (k < block.length && marked[k]?.[1] === "+") k++;
+      const minus = marked.slice(i, j).map((m) => m![2]!);
+      const plus = marked.slice(j, k).map((m) => m![2]!);
+      if (minus.length === 0 || minus.length !== plus.length)
+        refuse(`session pipeline update: ${resource} adds or removes lines (${minus.length} - / ${plus.length} +), not only the role-ARN cascade`);
+      for (let n = 0; n < minus.length; n++) {
+        if (minus[n] === plus[n]) continue;
+        const old = ROLE_ARN_LINE.exec(minus[n]!);
+        if (!old || plus[n] !== `${old[1]}${KNOWN_AFTER_APPLY}`)
+          refuse(`session pipeline update: ${resource} changes ${JSON.stringify(minus[n]!.trim())} to ${JSON.stringify(plus[n]!.trim())}, not only the role-ARN cascade`);
+        if (roleArn !== undefined && old[2] !== roleArn)
+          refuse(`session pipeline update: ${resource} replaces ${old[2]}, which is not the session pipeline's role ${roleArn}`);
+        replaced.add(old[2]!);
+        cascades++;
+      }
+      i = k;
+    }
+    if (cascades === 0) refuse(`session pipeline update: ${resource} updates without the role-ARN cascade`);
+  }
+  const role = new RegExp(`^arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/[A-Za-z0-9_+=,.@-]+$`);
+  if (replaced.size !== 1 || ![...replaced].every((arn) => role.test(arn)))
+    refuse(`session pipeline update: the cascade must replace exactly one role ARN in ${TRANSCRIPT_ACCOUNT_ID}, found ${[...replaced].join(", ")}`);
+}
+
+/** The session pipeline function's execution role ARN, as the capture's state snapshot records it. */
+function pipelineRoleArnFromState(stateSnapshotText: string, refuse: (why: string) => never): string {
+  let objects: Array<{ key: string; text: string }>;
+  try {
+    objects = (JSON.parse(stateSnapshotText) as { objects: Array<{ key: string; text: string }> }).objects;
+  } catch {
+    return refuse("session pipeline update: state snapshot is not valid JSON");
+  }
+  const hits = (objects ?? []).filter((o) => o.key === `${alchemyStatePrefix(TRANSCRIPT_STAGE)}/session-pipeline.json`);
+  if (hits.length !== 1) refuse(`session pipeline update: state snapshot has ${hits.length} session-pipeline records`);
+  let fn: { status?: string; attr?: { roleArn?: unknown } };
+  try {
+    fn = JSON.parse(hits[0]!.text) as typeof fn;
+  } catch {
+    return refuse("session pipeline update: the session-pipeline state record is not valid JSON");
+  }
+  if ((fn.status !== "created" && fn.status !== "updated") || typeof fn.attr?.roleArn !== "string" || !fn.attr.roleArn)
+    refuse("session pipeline update: session-pipeline is not created in state with a roleArn");
+  return fn.attr!.roleArn as string;
+}
+
+const SRV_WRITER_KEY_SID = "SrvWriterEncryptsAndReadsViaS3";
+
+/**
+ * A lone transcripts-key update is the srv-writer recovery only in one of two forms:
+ *   - the detailed plan shows the live policy without the srv-writer's statement and the planned
+ *     policy with exactly one; or
+ *   - Alchemy persisted the failed update (state `updating`), so the plan shows "no declared property
+ *     changes" and the update re-applies the stored props. Then the capture's state snapshot must show
+ *     those props are exactly the previous props plus the one srv-writer statement naming the
+ *     srv-writer user. The deploy is bound to that same state by the capture's version digest.
+ * Any other lone key-policy update stays refused.
+ */
+function assertSrvWriterRecoveryDiff(detailedPlanText: string, stateSnapshotText: string | undefined, refuse: (why: string) => never) {
+  const lines = detailedPlanText.split(/\r?\n/);
+  const start = lines.findIndex((line) => /^\s*\[transcripts-key\]\s+update\s*$/.test(line));
+  if (start < 0) refuse("srv-writer recovery: detailed plan has no transcripts-key update");
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(line));
+  const block = end < 0 ? rest : rest.slice(0, end);
+  const body = block.map((line) => line.trim()).filter(Boolean);
+  if (body.length === 1 && body[0] === "no declared property changes") {
+    if (stateSnapshotText !== undefined) assertPendingSrvWriterKeyUpdate(stateSnapshotText, refuse);
+    return;
+  }
+  const sid = new RegExp(`^\\s*([+-])\\s+Sid:\\s*${SRV_WRITER_KEY_SID}\\s*$`);
+  const marks = block.map((line) => sid.exec(line)?.[1]).filter(Boolean);
+  if (marks.includes("-")) refuse(`srv-writer recovery: the live key policy already has ${SRV_WRITER_KEY_SID}`);
+  if (marks.filter((m) => m === "+").length !== 1) refuse(`srv-writer recovery: the key policy update must add exactly one ${SRV_WRITER_KEY_SID} statement`);
+}
+
+type PolicyStatement = { Sid?: string; Principal?: { AWS?: unknown } } & Record<string, unknown>;
+type KeyState = { status?: string; props?: { policy?: { Statement?: PolicyStatement[] } & Record<string, unknown> } & Record<string, unknown>; old?: KeyState };
+
+const stableJson = (value: unknown): string =>
+  Array.isArray(value)
+    ? `[${value.map(stableJson).join(",")}]`
+    : value !== null && typeof value === "object"
+      ? `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableJson((value as Record<string, unknown>)[k])}`).join(",")}}`
+      : JSON.stringify(value);
+
+/** The persisted transcripts-key update adds exactly the srv-writer statement and changes nothing else. */
+function assertPendingSrvWriterKeyUpdate(stateSnapshotText: string, refuse: (why: string) => never) {
+  let objects: Array<{ key: string; text: string }>;
+  try {
+    objects = (JSON.parse(stateSnapshotText) as { objects: Array<{ key: string; text: string }> }).objects;
+  } catch {
+    return refuse("srv-writer recovery: state snapshot is not valid JSON");
+  }
+  const read = <T>(name: string): T => {
+    const hits = objects.filter((o) => o.key === `${alchemyStatePrefix(TRANSCRIPT_STAGE)}/${name}.json`);
+    if (hits.length !== 1) refuse(`srv-writer recovery: state snapshot has ${hits.length} ${name} records`);
+    return JSON.parse(hits[0]!.text) as T;
+  };
+  const key = read<KeyState>("transcripts-key");
+  const user = read<{ status?: string; attr?: { userArn?: string } }>("transcript-srv-writer");
+  if (key.status !== "updating" || key.old?.status !== "created") refuse("srv-writer recovery: transcripts-key is not a persisted pending update");
+  if (user.status !== "created" || !user.attr?.userArn) refuse("srv-writer recovery: transcript-srv-writer is not created in state");
+  const planned = key.props?.policy?.Statement ?? [];
+  const previous = key.old?.props?.policy?.Statement ?? [];
+  const added = planned.filter((s) => s.Sid === SRV_WRITER_KEY_SID);
+  if (added.length !== 1 || previous.some((s) => s.Sid === SRV_WRITER_KEY_SID))
+    refuse(`srv-writer recovery: the pending key policy must add exactly one ${SRV_WRITER_KEY_SID} statement`);
+  if (stableJson(added[0]!.Principal) !== stableJson({ AWS: user.attr!.userArn }))
+    refuse(`srv-writer recovery: ${SRV_WRITER_KEY_SID} must name the srv-writer user`);
+  const strip = (k: KeyState | undefined, keep: PolicyStatement[]) => stableJson({ ...k?.props, policy: { ...k?.props?.policy, Statement: keep } });
+  if (strip(key, planned.filter((s) => s.Sid !== SRV_WRITER_KEY_SID)) !== strip(key.old, previous))
+    refuse("srv-writer recovery: the pending key update changes more than the srv-writer statement");
 }
 
 /**
@@ -370,13 +681,13 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
 
 /**
  * The transcripts CMK's policy. The account root administers the key and cannot
- * use it (no `kms:*`). Only the writer and reader may use it, only through S3 in
+ * use it (no `kms:*`). Only the writer, the srv-writer and the reader may use it, only through S3 in
  * this region, only from this account, and only for objects under `96bulls/` in
  * this bucket (the S3 encryption context, per object since bucket keys are off).
  * The eraser and every operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; readerArn: string }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string }) {
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
     StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${TENANT_KEY_BASE}/*` },
@@ -386,7 +697,9 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
     Statement: [
       { Sid: "AccountAdministersKey", Effect: "Allow" as const, Principal: { AWS: `arn:aws:iam::${i.accountId}:root` }, Action: [...KMS_ADMIN_ACTIONS], Resource: "*" },
       { Sid: "WriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.writerArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
+      { Sid: "SrvWriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.srvWriterArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
       { Sid: "ReaderDecryptsViaS3", Effect: "Allow" as const, Principal: { AWS: i.readerArn }, Action: ["kms:Decrypt"], Resource: "*", Condition: via },
+      ...(i.pipelineRoleArn ? [pipelineKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
     ],
   };
 }
@@ -421,6 +734,55 @@ export function transcriptWriterPolicy(bucketArn: string) {
         Resource: [sessionObjects(bucketArn, "/raw/*"), sessionObjects(bucketArn, "/manifest.json"), sessionObjects(bucketArn, "/summary/*")],
       },
       noDeleteNoHistory(bucketArn),
+    ],
+  };
+}
+
+/**
+ * The relayhistory-api Worker's live writer: read and write only server-side
+ * machine sessions (`96bulls/<org>/v1/ws=<ws>/m=srv_<hash>/...`) and the
+ * `live-sessions/` and `live-batches/` prefixes. Every PUT must name SSE-KMS and
+ * a key in this account and region; the bucket policy's SseHeaderMustNameThisKey
+ * narrows that to exactly the transcripts CMK. (The key ARN cannot appear here:
+ * the key policy names this user, so the user exists before the key.) Key use is
+ * granted by the key policy; this identity grant is scoped to the key's alias and
+ * to S3 in this region. ListBucket on the bucket (missing keys must 404, see
+ * below); no delete, no old versions, no bucket changes.
+ */
+export function transcriptSrvWriterPolicy(i: { bucketArn: string; accountId: string; region: string; keyAlias: string }) {
+  const objects = srvWriterObjects(i.bucketArn);
+  return {
+    Version: "2012-10-17" as const,
+    Statement: [
+      { Sid: "ReadLiveObjects", Effect: "Allow" as const, Action: ["s3:GetObject"], Resource: objects },
+      {
+        Sid: "WriteLiveObjectsSseKmsOnly",
+        Effect: "Allow" as const,
+        Action: ["s3:PutObject"],
+        Resource: objects,
+        Condition: {
+          StringEquals: { "s3:x-amz-server-side-encryption": "aws:kms" },
+          StringLike: { "s3:x-amz-server-side-encryption-aws-kms-key-id": `arn:aws:kms:${i.region}:${i.accountId}:key/*` },
+        },
+      },
+      {
+        Sid: "UseTranscriptKeyViaS3",
+        Effect: "Allow" as const,
+        Action: ["kms:GenerateDataKey", "kms:Decrypt"],
+        Resource: [`arn:aws:kms:${i.region}:${i.accountId}:key/*`],
+        Condition: {
+          StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com` },
+          "ForAnyValue:StringEquals": { "kms:ResourceAliases": i.keyAlias },
+        },
+      },
+      // A missing key must answer 404, not 403: the Worker's create-only
+      // pointer, manifest and batch-marker reads depend on it. S3 decides that
+      // with s3:ListBucket on the bucket, and HEAD/GET carry no s3:prefix, so
+      // the grant cannot be prefix-scoped (hardening.ts listBucket): it is the
+      // same unconditional grant the transcript writer holds. Key names only;
+      // object reads stay limited to the srv_ and live prefixes above.
+      listBucket(i.bucketArn),
+      noDeleteNoHistory(i.bucketArn),
     ],
   };
 }
@@ -507,6 +869,12 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
     const writer = yield* user("transcript-writer", n.writer, "relayhistory-worker-writes-transcripts", transcriptWriterPolicy(n.bucketArn));
     const reader = yield* user("transcript-reader", n.reader, "history-indexer-reads-transcripts", transcriptReaderPolicy(n.bucketArn));
     const eraser = yield* user("transcript-eraser", n.eraser, "erasure-job-deletes-versions", transcriptEraserPolicy(n.bucketArn));
+    const srvWriter = yield* user(
+      "transcript-srv-writer",
+      n.srvWriter,
+      "relayhistory-api-worker-writes-live-transcripts",
+      transcriptSrvWriterPolicy({ bucketArn: n.bucketArn, accountId: i.accountId, region: i.region, keyAlias: n.keyAlias }),
+    );
 
     // CloudTrail into its own bucket and key, as in the baseline (hardening.ts trailKeyPolicy).
     const trailKey = yield* AWS.KMS.Key("trail-key", {
@@ -539,6 +907,14 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       tags: i.tags("cloudtrail"),
     });
 
+    // The session pipeline's function (and so its Alchemy-owned execution role) comes before the key
+    // and the bucket, whose policies grant that role read access (session-pipeline.ts).
+    const pipeline = i.transcriptStore.sessionPipeline;
+    const pipelineFn = pipeline
+      ? yield* sessionPipelineFunction({ stage: i.stage, accountId: i.accountId, region: i.region, p: pipeline, tags: i.tags, bucket: n.bucket })
+      : undefined;
+    const pipelineRoleArn = pipelineFn ? ((pipelineFn as unknown as { roleArn: string }).roleArn) : undefined;
+
     const key = yield* AWS.KMS.Key("transcripts-key", {
       description: `96bulls ${i.stage}: transcript objects (SSE-KMS, per-object data keys)`,
       enableKeyRotation: true,
@@ -548,7 +924,9 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         region: i.region,
         bucketName: n.bucket,
         writerArn: writer.userArn as unknown as string,
+        srvWriterArn: srvWriter.userArn as unknown as string,
         readerArn: reader.userArn as unknown as string,
+        ...(pipelineRoleArn ? { pipelineRoleArn } : {}),
       }) as never,
       // Also orders the key after the trail: the trail audits its use from the first call, and the
       // trail chain gives IAM time to propagate the new users KMS validates as principals.
@@ -576,11 +954,30 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       encryption: { sseAlgorithm: "aws:kms", kmsMasterKeyId: key.keyArn, bucketKeyEnabled: false, blockedEncryptionTypes: ["SSE-C"] },
       publicAccessBlock: PUBLIC_ACCESS_BLOCK,
       objectOwnership: "BucketOwnerEnforced",
-      policy: transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn }) as never,
+      policy: [
+        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn }),
+        ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn }) : []),
+      ] as never,
       lifecycleRules: transcriptLifecycleRules() as never,
       logging: { targetBucket: accessLogs.bucketName as unknown as string, targetPrefix: ACCESS_LOG_PREFIX, targetObjectKeyFormat: { PartitionedPrefix: { PartitionDateSource: "EventTime" } } as never },
       tags: i.tags("transcripts"),
     });
+
+    const sessionPipeline =
+      pipeline && pipelineFn
+        ? yield* sessionPipelineWiring({
+            stage: i.stage,
+            accountId: i.accountId,
+            region: i.region,
+            p: pipeline,
+            tags: i.tags,
+            bucketArn: n.bucketArn,
+            fn: pipelineFn as unknown as { functionName: unknown; functionArn: unknown; roleArn: unknown },
+          })
+        : null;
+
+    const readApiInputs = i.transcriptStore.sessionReadApi;
+    const readApi = readApiInputs ? yield* sessionReadApi({ stage: i.stage, p: readApiInputs, tags: i.tags }) : null;
 
     yield* AWS.Budgets.Budget("budget", {
       budgetName: n.budget,
@@ -603,5 +1000,8 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       writerUser: writer.userName,
       readerUser: reader.userName,
       eraserUser: eraser.userName,
+      srvWriterUser: srvWriter.userName,
+      sessionPipeline,
+      sessionReadApi: readApi,
     };
   });

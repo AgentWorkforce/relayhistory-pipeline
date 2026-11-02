@@ -111,11 +111,17 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
   const admission = await admit(db, w, {
     sessionDailyCap: config.sessionDailyCap,
     budget: config.backgroundDailyBudget,
+    globalDailyCap: config.globalDailyCap,
   });
   if (!admission.admitted) {
     await recordBrief(db, w, sourceRevisions, {
       status: "rate_limited",
-      error: admission.reason === "capped" ? "session_brief_capped" : "session_brief_rate_limited",
+      error:
+        admission.reason === "capped"
+          ? "session_brief_capped"
+          : admission.reason === "global"
+            ? "session_brief_global_capped"
+            : "session_brief_rate_limited",
     });
     await rescheduleWakeup(db, w, { nextUtcDay: true }, { refundAttempt: true });
     return "rate_limited";

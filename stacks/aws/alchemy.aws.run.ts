@@ -30,28 +30,29 @@ import * as Layer from "effect/Layer";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
+import { PIPPEN_PROOF_SANDBOX, pippenProofSandboxCallerArn, SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
 import { eksStage } from "./eks.ts";
 import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy } from "./hardening.ts";
-import { sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "./inputs.ts";
+import { ecrPullPolicy, sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "./inputs.ts";
 import { assertApprovalBinding, assertAwsDeploymentTarget, assertClearance, awsMode, type AwsMode } from "./deploy-guard.ts";
 import { snapshotStateLayer } from "./state-snapshot.ts";
 import { verifyDeployCapture } from "./capture-verify.ts";
-import { alchemyStateBucket, alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
+import { alchemyStateBucket, alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyCallerArn, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
 import { networkPolicies } from "./proof-addons.ts";
 import { hoopdbBackend } from "./hardening.ts";
+import { stageBucketName, stageBudgetName } from "./pippen-sandbox.ts";
 import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
-const REPO = "AgentWorkforce/96BullSessions";
+const REPO = "AgentWorkforce/sessions-pipeline";
 /**
  * The repo has GitHub immutable OIDC subjects on, so the sub carries numeric ids:
- * `repo:AgentWorkforce@252050005/96BullSessions@1437714333:environment:<env>`
- * (checked with `gh api repos/AgentWorkforce/96BullSessions/actions/oidc/customization/sub`).
+ * `repo:AgentWorkforce@252050005/sessions-pipeline@1437714333:environment:<env>`
+ * (checked with `gh api repos/AgentWorkforce/sessions-pipeline/actions/oidc/customization/sub`).
  */
-const OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/96BullSessions@1437714333";
+const OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/sessions-pipeline@1437714333";
 
 /** Written by hand (not by the CLI) once Khaliq clears the account: see docs/aws-stage.md and stacks/aws/inputs.ts. */
 function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
@@ -130,6 +131,9 @@ export default Alchemy.Stack(
     const liveCredentials = yield* awsEnvironment.credentials.pipe(Effect.orDie);
     const callerAccountId = yield* getAccountId(liveCredentials as never).pipe(Effect.orDie);
     assertAwsDeploymentTarget({ accountId: inputs.accountId, region: inputs.region }, { accountId: callerAccountId as string, region: awsEnvironment.region as string });
+    // The Pippen sandbox proof stage, every mode: only this lease's agent-session role session may act there.
+    if (stage === PIPPEN_PROOF_SANDBOX.stage)
+      verifyCallerArn(awsCliRunner((cmd, args) => spawnSync(cmd, args, { encoding: "utf8", env: process.env })), pippenProofSandboxCallerArn(process.env));
     // Read-only AWS checks with the same exported credentials (preflight.ts). Skipped on destroy:
     // tearing down must not depend on the image or the policy phase still being valid.
     if (inputs.mode !== "destroy") {
@@ -158,6 +162,10 @@ export default Alchemy.Stack(
     }
     const purge = inputs.teardown?.purgeBucketsOnDestroy === true;
     const name = (base: string) => `96bulls-${stage}-${base}`;
+    // `96bulls-<stage>-<base>-<account>`; pippen-sbx- first in a Pippen sandbox, the only buckets its sweeper may delete.
+    const pippen = Boolean(inputs.pippenSandbox);
+    const lockerBucketName = stageBucketName(stage, "locker", inputs.accountId, pippen);
+    const trailBucketName = stageBucketName(stage, "trail", inputs.accountId, pippen);
 
     // Production transcript store (transcript-store.ts): S3 only (decision 0001), so none of the
     // baseline below (Locker, ECR, GitHub OIDC, EKS, Supabase). validateAwsInputs refused those inputs.
@@ -185,14 +193,14 @@ export default Alchemy.Stack(
 
     // Locker: S3 behind the adapter. Versioned, encrypted, never public.
     const locker = yield* AWS.S3.Bucket("locker", {
-      bucketName: `${name("locker")}-${inputs.accountId}`,
+      bucketName: lockerBucketName,
       // Proof/sandbox stages with teardown.purgeBucketsOnDestroy only: destroy empties every version.
       ...(purge ? { forceDestroy: true } : {}),
       versioning: "Enabled",
       encryption: { sseAlgorithm: "aws:kms", kmsMasterKeyId: key.keyArn, bucketKeyEnabled: true },
       publicAccessBlock: { blockPublicAcls: true, ignorePublicAcls: true, blockPublicPolicy: true, restrictPublicBuckets: true },
       // TLS only; superseded manifest versions and abandoned uploads expire.
-      policy: denyInsecureTransport(`arn:aws:s3:::${name("locker")}-${inputs.accountId}`),
+      policy: denyInsecureTransport(`arn:aws:s3:::${lockerBucketName}`),
       lifecycleRules: lockerLifecycleRules(inputs.lockerNoncurrentVersionDays) as never,
       tags: tags(stage, "locker"),
     });
@@ -208,16 +216,16 @@ export default Alchemy.Stack(
     });
     yield* AWS.KMS.Alias("trail-key-alias", { aliasName: `alias/${name("trail")}`, targetKeyId: trailKey.keyId });
     const trailBucket = yield* AWS.S3.Bucket("trail-logs", {
-      bucketName: `${name("trail")}-${inputs.accountId}`,
+      bucketName: trailBucketName,
       ...(purge ? { forceDestroy: true } : {}),
       versioning: "Enabled",
       encryption: { sseAlgorithm: "aws:kms", kmsMasterKeyId: trailKey.keyArn, bucketKeyEnabled: true },
       publicAccessBlock: { blockPublicAcls: true, ignorePublicAcls: true, blockPublicPolicy: true, restrictPublicBuckets: true },
       // Bucket `policy` takes the statements only.
       policy: [
-          ...denyInsecureTransport(`arn:aws:s3:::${name("trail")}-${inputs.accountId}`),
-          { Sid: "AWSCloudTrailAclCheck", Effect: "Allow", Principal: { Service: "cloudtrail.amazonaws.com" }, Action: ["s3:GetBucketAcl"], Resource: `arn:aws:s3:::${name("trail")}-${inputs.accountId}` },
-          { Sid: "AWSCloudTrailWrite", Effect: "Allow", Principal: { Service: "cloudtrail.amazonaws.com" }, Action: ["s3:PutObject"], Resource: `arn:aws:s3:::${name("trail")}-${inputs.accountId}/AWSLogs/${inputs.accountId}/*`, Condition: { StringEquals: { "s3:x-amz-acl": "bucket-owner-full-control" } } },
+          ...denyInsecureTransport(`arn:aws:s3:::${trailBucketName}`),
+          { Sid: "AWSCloudTrailAclCheck", Effect: "Allow", Principal: { Service: "cloudtrail.amazonaws.com" }, Action: ["s3:GetBucketAcl"], Resource: `arn:aws:s3:::${trailBucketName}` },
+          { Sid: "AWSCloudTrailWrite", Effect: "Allow", Principal: { Service: "cloudtrail.amazonaws.com" }, Action: ["s3:PutObject"], Resource: `arn:aws:s3:::${trailBucketName}/AWSLogs/${inputs.accountId}/*`, Condition: { StringEquals: { "s3:x-amz-acl": "bucket-owner-full-control" } } },
       ],
       tags: tags(stage, "cloudtrail"),
     });
@@ -236,7 +244,7 @@ export default Alchemy.Stack(
     const budgetUsd = isSandbox ? SANDBOX_RULES.budgetUsd : inputs.budgetUsd;
     const alarmUsd = isSandbox ? SANDBOX_RULES.budgetAlarmUsd : Math.round(inputs.budgetUsd * 0.8);
     yield* AWS.Budgets.Budget("budget", {
-      budgetName: name("monthly"),
+      budgetName: stageBudgetName(stage, pippen),
       budgetType: "COST",
       timeUnit: "MONTHLY",
       budgetLimit: { amount: String(budgetUsd), unit: "USD" },
@@ -244,10 +252,15 @@ export default Alchemy.Stack(
         { notificationType: "ACTUAL", comparisonOperator: "GREATER_THAN", threshold: alarmUsd, thresholdType: "ABSOLUTE_VALUE", subscribers: [{ subscriptionType: "EMAIL", address: inputs.budgetEmail }] },
         { notificationType: "FORECASTED", comparisonOperator: "GREATER_THAN", threshold: budgetUsd, thresholdType: "ABSOLUTE_VALUE", subscribers: [{ subscriptionType: "EMAIL", address: inputs.budgetEmail }] },
       ],
+      // Pippen sandbox: the budget is tagged too. Budgets is not in the tagging API; the sweeper
+      // lists budgets by their own tags, and the boundary creates them only with pippen:sandbox=true.
+      ...(pippen ? { tags: tags(stage, "budget") } : {}),
     });
 
     // ECR: the hosted service image lives in the account, private (Khaliq, 2026-10-28: not public).
     // A second stage in the account (accountShared) uses the owner stage's repository.
+    // ecr.pullAccounts (read-only cross-account pull) is the only repository policy; none when absent.
+    const pullPolicy = ecrPullPolicy(inputs);
     const ecr = inputs.accountShared
       ? undefined
       : yield* AWS.ECR.Repository("services-image", {
@@ -259,6 +272,7 @@ export default Alchemy.Stack(
           lifecyclePolicyText: JSON.stringify({
             rules: [{ rulePriority: 1, description: "expire untagged images after 14 days", selection: { tagStatus: "untagged", countType: "sinceImagePushed", countUnit: "days", countNumber: 14 }, action: { type: "expire" } }],
           }),
+          ...(pullPolicy ? { policy: pullPolicy } : {}),
           tags: tags(stage, "ecr"),
         });
 
@@ -302,7 +316,7 @@ export default Alchemy.Stack(
           accountId: inputs.accountId,
           chartVersion: inputs.eks.chartVersion,
           runtimeSecretName: inputs.eks.runtimeSecretName,
-          lockerBucket: `${name("locker")}-${inputs.accountId}`,
+          lockerBucket: lockerBucketName,
           lockerRegion: inputs.region,
           ...(inputs.eks.tenantOrgId !== undefined ? { tenantOrgId: inputs.eks.tenantOrgId } : {}),
           ...(inputs.eks.tenantOrgIds ? { tenantOrgIds: inputs.eks.tenantOrgIds } : {}),
@@ -321,10 +335,10 @@ export default Alchemy.Stack(
           ...(inputs.eks.relaycast ? { relaycast: inputs.eks.relaycast } : {}),
           ...(inputs.eks.sessionDirectory ? { sessionDirectory: inputs.eks.sessionDirectory } : {}),
           ...(inputs.eks.ingress ? { ingress: inputs.eks.ingress } : {}),
-          lockerBucketArn: `arn:aws:s3:::${name("locker")}-${inputs.accountId}`,
+          lockerBucketArn: `arn:aws:s3:::${lockerBucketName}`,
           lockerKmsKeyArn: key.keyArn as unknown as string,
           ...(inputs.pippenSandbox
-            ? { permissionsBoundaryArn: inputs.pippenSandbox.permissionsBoundaryArn }
+            ? { permissionsBoundaryArn: inputs.pippenSandbox.permissionsBoundaryArn, pippenSandbox: true }
             : isSandbox
               ? { permissionsBoundaryArn: `arn:aws:iam::${inputs.accountId}:policy/${SANDBOX_RULES.permissionsBoundary}` }
               : {}),

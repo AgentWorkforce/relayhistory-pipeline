@@ -11,6 +11,9 @@ production Supabase and AWS S3 boundary.
 
 The proof harness for an isolated self-host E2E on this account
 (`aws-proof`, account 500268966557) is in [AWS self-host E2E proof](aws-e2e-proof.md).
+It can also target the Pippen Tools sandbox of agent `aws-proof` (stage
+`aws-proof-sandbox`, account 361835732085; see
+[Proof stage in a Pippen sandbox](#proof-stage-in-a-pippen-sandbox-aws-proof-sandbox)).
 It defaults to a dry run and has not been run against AWS.
 
 What the stage will need (each item needs an explicit OK): a target account
@@ -73,6 +76,36 @@ jobs in the `image-publish` GitHub environment can assume the deployer role,
 and it can only push to that ECR repository (no Locker or KMS access).
 Sandbox stages create neither the OIDC provider nor the role. The GHCR
 copy stays private for kind and self-host tests.
+
+### Cross-account pull (`ecr.pullAccounts`)
+
+`ecr.pullAccounts` in a stage's `aws-inputs.json` is the only repository
+policy on its `96bulls-services` repository (`stacks/aws/inputs.ts`
+`ecrPullPolicy`). Each entry is a 12-digit account id. It gets one statement,
+principal `arn:aws:iam::<id>:root`, with exactly `ecr:BatchGetImage`,
+`ecr:GetDownloadUrlForLayer`, `ecr:BatchCheckLayerAvailability` and
+`ecr:DescribeImages` (read-only image metadata: the pulling stage's image
+check, `verifyServicesImage`, reads the pinned digest's tags). The
+Pippen sandbox `361835732085` gets the Sid `PippenSandboxAwsProofPull`; any
+other account gets `CrossAccountPull<id>`. The stage refuses an entry that is
+not a 12-digit id (no wildcards or ARNs), a duplicate, its own account, the
+production account `941433935742`, and a stage that owns no repository
+(`accountShared`, the transcript store). Absent or `[]` means no policy, which
+is the behavior before this input existed.
+
+Alchemy removes a repository policy the inputs do not declare. Khaliq approved
+read-only pull for the Pippen sandbox on 2026-11-01 ("give my OK"), and the
+three-action pull policy was applied live to the sessions-dev repository; the
+four-action policy (with `ecr:DescribeImages`) is applied live after this
+change merges. So **before the next
+`bin/96bulls up aws-sessions-dev`, its inputs must carry**:
+
+```json
+"ecr": { "pullAccounts": ["361835732085"] }
+```
+
+Without it, that `up` deletes the grant and the sandbox can no longer pull the
+services image.
 
 Order for the first environment: apply the baseline (creates ECR and the
 deployer role) -> set the two repo variables -> run publish-image-ecr -> put the
@@ -234,8 +267,8 @@ summary and rebuilds each as an encrypted object.
 Production AWS is S3 only (decision 0001). The `aws-sessions-prod` stage in
 `sessions-prod` (`941433935742`, `us-east-1`) sets `transcriptStore` in its
 inputs and declares only the transcript bucket, its CMK, access logs,
-CloudTrail with S3 data events, a budget and three IAM users (writer, reader,
-eraser), none of the baseline above (`stacks/aws/transcript-store.ts`). Design,
+CloudTrail with S3 data events, a budget and four IAM users (writer, reader,
+eraser, srv-writer for the relayhistory-api live writer), none of the baseline above (`stacks/aws/transcript-store.ts`). Design,
 apply, credentials, Cloudflare wiring, rotation, teardown and the later export:
 `runbooks/sessions-prod-transcript-store.md`.
 
@@ -308,13 +341,15 @@ key-policy grant for the Logs service, which is a separate decision.
 
 ### Pod roles (EKS Pod Identity), one per service account
 
-Derived from the code that uses the Locker (key layout `v1/ws=…/s=…/`); no
-role has `s3:DeleteObject` because the object store has no delete.
+Derived from the code that uses the Locker (key layout `v1/ws=…/s=…/`). Only
+AlleyOop has `s3:DeleteObject`, and only on `raw/` chunks and `parked/`
+manifests: parked-session expiry and takeover cleanup delete exactly those. No
+role can delete a live `manifest.json` or a summary.
 
 | Service account | S3 | KMS (via S3 only) |
 | --- | --- | --- |
 | `96bulls-worker` (indexer, referee, Bob Costas, migrate) | ListBucket; GetObject `v1/*`; PutObject `v1/*/summary/*` | Decrypt, GenerateDataKey |
-| `96bulls-alleyoop` | ListBucket; GetObject `v1/*`; PutObject `v1/*/raw/*`, `v1/*/manifest.json` | Decrypt, GenerateDataKey |
+| `96bulls-alleyoop` | ListBucket; GetObject `v1/*`; PutObject `v1/*/raw/*`, `v1/*/manifest.json`; DeleteObject `v1/*/raw/*`, `v1/*/parked/*` | Decrypt, GenerateDataKey |
 | `96bulls-search-worker` | explicit Deny `s3:*` on the Locker | explicit Deny `kms:*` on its key |
 | `otel-collector` | PutObject, AbortMultipartUpload `telemetry/traces/*` only | unchanged |
 
@@ -513,6 +548,116 @@ the first apply, create its Secrets from 1Password as for sessions-dev
 (`96bulls-runtime` without `HOOPDB_URL`, which CNPG supplies; `relayauth`;
 `kube-system/cloudflare-dns`).
 
+### Proof stage in a Pippen sandbox `aws-proof-sandbox`
+
+Khaliq, 2026-11-01: run the EKS proof in a Pippen Tools sandbox so that
+teardown is a verified sweep rather than a hand-checked `down`. The sandbox is
+the one for agent `aws-proof`: account `361835732085`, region `us-west-2`, in
+the Sandbox OU of the 96Bulls org (management account `904260146565`).
+
+The stage `aws-proof-sandbox` (cluster `96bulls-aws-proof-sandbox`) and that
+account are pinned to each other (`stacks/aws/sandbox-rules.ts`
+`PIPPEN_PROOF_SANDBOX`, enforced by `assertPippenProofSandbox` in
+`stacks/aws/inputs.ts`):
+
+- the stage runs only in `361835732085`/`us-west-2`, and that account hosts no
+  other stage;
+- `pippenSandbox.permissionsBoundaryArn` is required and must be a policy in
+  that account; every role the stage creates carries it, and every resource
+  carries `pippen:sandbox=true` for the sweeper;
+- `accountShared` is refused: the sandbox is a fresh account, so the stage
+  creates its own ECR repository but no GitHub OIDC provider or publisher role.
+  The services image is pulled by digest from the sessions-dev repository
+  (`eks.imageRepository`). Khaliq approved read-only pull for `361835732085`
+  on 2026-11-01, and it is applied live as that repository's policy; see
+  [Cross-account pull](#cross-account-pull-ecrpullaccounts);
+- before declaring anything, in every mode, the stack checks that
+  `aws sts get-caller-identity` is exactly
+  `arn:aws:sts::361835732085:assumed-role/agent-session/agent-<session_id>`,
+  the pippen agent-session role session of the current lease. Credentials
+  come only from that role. `<session_id>` is the lease UUID that
+  `pippen sandbox status aws-proof` shows after `up`. Export it as
+  `NINETY_SIX_BULLS_PIPPEN_SESSION=<session_id>`; it is not secret, and a
+  missing or malformed value (anything but a lowercase v4 UUID) is refused.
+
+Start from `stacks/aws/examples/aws-proof-sandbox.inputs.example.json` (copy it
+to `.96bulls/aws-proof-sandbox/aws-inputs.json` and fill every `<...>`,
+including the sandbox's boundary policy name). The ingest hostname is
+`proof-sandbox-sessions.agentrelay.com`, so the sandbox never collides with
+the sessions-dev proof's DNS.
+
+The flow (each live step needs Khaliq's OK; nothing here has been run):
+
+1. `pippen sandbox up aws-proof`, then export the agent-session credentials,
+   and take `session_id` from `pippen sandbox status aws-proof`
+   (`NINETY_SIX_BULLS_PIPPEN_SESSION` for the stack, `--pippen-session` for
+   the harness).
+2. `bin/96bulls plan aws-proof-sandbox --capture` and review the capture
+   (`docs/plans/aws-proof-sandbox.*`).
+3. `bin/96bulls up aws-proof-sandbox` under an approval bound to that capture.
+4. The proof: `bun run proof:aws all --target pippen-sandbox --pippen-session <session_id> --confirm-live`
+   (docs/aws-e2e-proof.md).
+5. `pippen sandbox down aws-proof`, which must report `clean: true`. It
+   deletes everything tagged `pippen:sandbox=true` (the agent-session role
+   included) and verifies zero `pippen:sandbox` resources and zero
+   non-baseline IAM roles. The baseline roles are `pippen-sweeper`,
+   `/aws-service-role/*` and `stacksets-exec-*`. This replaces
+   `bin/96bulls down` as the teardown of record.
+6. `pippen sandbox up aws-proof` for fresh agent-session credentials. It
+   recreates only `arn:aws:iam::361835732085:role/pippen/agent-session`.
+7. The harness's post-destroy absence check against the sandbox
+   (`--target pippen-sandbox --post-destroy`). It accepts any session of the
+   recreated role, lists `96bulls:stack`, `alchemy::stage` and `pippen:sandbox`
+   tagged resources, and exempts only that role's exact ARN. Resources tagged
+   `pippen:baseline=true` are never listed.
+8. `pippen sandbox down aws-proof` again.
+
+#### What `pippenSandbox` changes in the stage (and nothing else does)
+
+Khaliq, 2026-11-01: "Widen pippen boundary". The stage keeps full fidelity
+(the same KMS keys, Locker, CloudTrail, budget, ECR repository, VPC, EKS Auto
+Mode cluster, Pod Identity roles, WAF, ACM certificate and ALB as the other
+proof stages) and changes only what the pippen agent-session boundary and
+`pippen-sweeper` need (`stacks/aws/pippen-sandbox.ts`):
+
+- every IAM role is under `/pippen/workload/` with the boundary: the four Pod
+  Identity roles, the legacy pods role if kept, and the EKS Auto Mode cluster
+  and node roles (`96bulls-aws-proof-sandbox-{cluster,node}`), which the stage
+  declares and passes to the cluster instead of letting Alchemy create them at
+  `/` with no boundary;
+- the budget is `pippen-sbx-96bulls-aws-proof-sandbox-monthly`: the boundary
+  scopes Budgets by name (`budget/pippen-sbx-*`), so the agent can never touch
+  the account's baseline budget;
+- no ECR repository policy: the boundary denies `ecr:SetRepositoryPolicy` (a
+  resource policy could grant push past it), so `ecr.pullAccounts` is refused;
+- every resource carries `pippen:sandbox=true`, now including the budget, and
+  the ALB, target groups and security groups (IngressClassParams `tags`) and
+  EBS volumes (StorageClass `tagSpecification_1`) that Auto Mode creates
+  from Kubernetes objects. EC2 instances Auto Mode launches are untagged and
+  terminated by EKS with the cluster;
+- the S3 buckets are named `pippen-sbx-96bulls-aws-proof-sandbox-{locker,trail,alb-logs}-361835732085`
+  (and the proof's HoopDb backup bucket `pippen-sbx-96bulls-aws-proof-sandbox-backups-361835732085`;
+  every one is a valid S3 name, tested):
+  `pippen-sweeper` may delete only `pippen-sbx-*` buckets (S3 deletes cannot be
+  tag-conditioned);
+- no GitHub OIDC provider or deployer role (unchanged).
+
+Every other stage renders exactly as before (`stacks/aws/__tests__/pippen-sandbox.test.ts`).
+
+This needs the widened boundary and sweeper from pippen-tools (the boundary
+grants CloudTrail, WAFv2, ACM, ECR repositories and Budgets only with
+`pippen:sandbox=true`, and the sweeper deletes them). Order: merge the
+pippen-tools PR, Khaliq redeploys the pippen management stack (sandbox
+baseline StackSet; pippen-tools `docs/runbook-management-bootstrap.md` step 9)
+and the tooling release, then `pippen sandbox up aws-proof` and the flow
+above. Before that the deploy is denied at the first CloudTrail, WAF, ACM,
+ECR or Budgets call.
+
+The stack's image preflight runs `ecr describe-images` against the
+sessions-dev repository, so `ecr.pullAccounts` grants `ecr:DescribeImages` as
+well as pull. Until the four-action policy is applied live to that repository
+(after merge), the preflight is denied.
+
 ### Apply, verify and roll back
 
 The stack itself refuses, before declaring anything and whatever started it
@@ -567,16 +712,17 @@ plan is what gets applied, or nothing. Write the approval record into the
 inputs before capturing (it is part of the inputs hash).
 
 For `aws-sessions-prod`, the stack additionally parses the reviewed plan. It
-accepts only the exact 12 transcript-store resources in the initial create,
+accepts only the exact 13 transcript-store resources in the initial create,
 known three-resource recovery, one capture-bound post-merge remediation
-(`trail-key` and `trail-logs` update with the other ten `noop`), or final
-all-noop phase. Both compact and detailed plans must list the same actions and
+(`trail-key` and `trail-logs` update with every other resource `noop`), the
+srv-writer addition (`transcript-srv-writer` create and `transcripts-key`
+update, everything else `noop`), or final all-noop phase. Both compact and detailed plans must list the same actions and
 match the exact paths and sha256 values in the approval-bound provenance. The
 capture command refuses an invalid shape before replacing the reviewed files,
 and deploy checks it again. Any other update count or resource, replacement,
 deletion, import or adoption is rejected. A direct AWS repair does not update
 Alchemy's persisted `oldProps`; the exact two-update Alchemy reconciliation is
-still required, followed by a fresh exact 12-noop capture. `NON_DESTROYABLE`
+still required, followed by a fresh exact all-noop capture. `NON_DESTROYABLE`
 only blocks the explicit destroy command; it does not stop an ordinary deploy
 from reconciling a removed declaration, which is why this operation-level
 check is required.

@@ -2,7 +2,9 @@
  * The target fence. The guard (guard.ts) proves *who* we are and *which
  * cluster* we talk to; the fence proves *what* each step touches.
  *
- * Every allowed value is HARDCODED here for the aws-proof stage. Nothing in the
+ * Every allowed value is HARDCODED here for the aws-proof stage (PROOF_FENCE)
+ * and, separately, for the Pippen sandbox stage aws-proof-sandbox
+ * (SANDBOX_FENCE). Nothing in the
  * fence is derived from inputs.json: config may only restate these values
  * (proofConfigIssues refuses any difference), and every step's argv is checked
  * against the constants in every mode, dry-run included (ops.ts admitStep:
@@ -12,7 +14,7 @@
  *
  * Production-shaped names are refused everywhere, even inside the proof account.
  */
-import { LOCAL_READONLY_CONTEXT, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE } from "./guard.ts";
+import { LOCAL_READONLY_CONTEXT, PIPPEN_SANDBOX_PROOF_TARGET, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, SANDBOX_ACCOUNT_ID, SANDBOX_CLUSTER, SANDBOX_REGION, SANDBOX_STAGE, SESSIONS_DEV_PROOF_TARGET, type ProofTarget, type ProofTargetId } from "./guard.ts";
 
 export { PROOF_REGION } from "./guard.ts";
 import { PROOF_REGION } from "./guard.ts";
@@ -25,6 +27,25 @@ export const PROOF_NAME_PREFIX = `96bulls-${PROOF_STAGE}-`;
 export const PROOF_LOCKER_BUCKET = `${PROOF_NAME_PREFIX}locker-${PROOF_ACCOUNT_ID}`;
 export const PROOF_BACKUP_BUCKET = `${PROOF_NAME_PREFIX}hoopdb-backups-${PROOF_ACCOUNT_ID}`;
 export const PROOF_RELEASE = "96bulls";
+
+/*
+ * The Pippen sandbox target (guard.ts PIPPEN_SANDBOX_PROOF_TARGET): the same
+ * chart, namespaces, services and tenants as the proof stage, in account
+ * 361835732085 under stage aws-proof-sandbox, with its own host and buckets.
+ */
+export const SANDBOX_CONTEXT = `arn:aws:eks:${SANDBOX_REGION}:${SANDBOX_ACCOUNT_ID}:cluster/${SANDBOX_CLUSTER}`;
+export const SANDBOX_HOST = "proof-sandbox-sessions.agentrelay.com";
+export const SANDBOX_ORIGIN = `https://${SANDBOX_HOST}`;
+export const SANDBOX_NAME_PREFIX = `96bulls-${SANDBOX_STAGE}-`;
+/**
+ * The sandbox's buckets carry the pippen-sbx- prefix (stacks/aws/pippen-sandbox.ts
+ * stageBucketName): pippen-sweeper may delete only pippen-sbx-* buckets, since S3
+ * deletes cannot be tag-conditioned. Other names are unchanged.
+ */
+export const SANDBOX_BUCKET_PREFIX = "pippen-sbx-";
+export const SANDBOX_LOCKER_BUCKET = `${SANDBOX_BUCKET_PREFIX}${SANDBOX_NAME_PREFIX}locker-${SANDBOX_ACCOUNT_ID}`;
+// `backups`, not `hoopdb-backups`: with the prefix that name is 64 characters, over S3's 63.
+export const SANDBOX_BACKUP_BUCKET = `${SANDBOX_BUCKET_PREFIX}${SANDBOX_NAME_PREFIX}backups-${SANDBOX_ACCOUNT_ID}`;
 export const PROOF_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
 export const PROOF_CHART_HOST = "agentworkforce.github.io";
 
@@ -82,8 +103,12 @@ export const FORBIDDEN_NAME = /(^|[^a-z0-9])(prod|production|sessions-prod|sessi
 export const URL_USERINFO = /\b[a-z][a-z0-9+.-]*:\/\/[^\s/?#@]+@/i;
 
 export interface Fence {
-  /** Which hardcoded target this is. The kind fence admits reads only. */
+  /** Which kind of hardcoded fence this is: an AWS proof target ("proof", either account) or kind. The kind fence admits reads only. */
   target: "proof" | "kind-readonly";
+  /** The hardcoded AWS proof target this fence is for (guard.ts PROOF_TARGETS); undefined for kind. */
+  proofTarget?: ProofTarget;
+  /** The Locker bucket summary deletes and trace reads may name. */
+  lockerBucket?: string;
   context: string;
   region?: string;
   namespaces: ReadonlySet<string>;
@@ -105,6 +130,8 @@ export interface Fence {
 
 export const PROOF_FENCE: Fence = Object.freeze({
   target: "proof",
+  proofTarget: SESSIONS_DEV_PROOF_TARGET,
+  lockerBucket: PROOF_LOCKER_BUCKET,
   context: PROOF_CONTEXT,
   region: PROOF_REGION,
   namespaces: new Set([PROOF_NAMESPACE, PROOF_RELAYAUTH.namespace, PROOF_RELAYCAST.namespace, PROOF_CNPG_NAMESPACE]),
@@ -117,6 +144,25 @@ export const PROOF_FENCE: Fence = Object.freeze({
   releases: new Set([PROOF_RELEASE]),
   hosts: new Set(["127.0.0.1", PROOF_HOST, PROOF_CHART_HOST, ...PROOF_TRANSCRIPT_HOSTS]),
   accountId: PROOF_ACCOUNT_ID,
+});
+
+/** The Pippen sandbox: the proof fence's shape, with every account-bound value its own. */
+export const SANDBOX_FENCE: Fence = Object.freeze({
+  target: "proof",
+  proofTarget: PIPPEN_SANDBOX_PROOF_TARGET,
+  lockerBucket: SANDBOX_LOCKER_BUCKET,
+  context: SANDBOX_CONTEXT,
+  region: SANDBOX_REGION,
+  namespaces: new Set([PROOF_NAMESPACE, PROOF_RELAYAUTH.namespace, PROOF_RELAYCAST.namespace, PROOF_CNPG_NAMESPACE]),
+  deleteNamespaces: new Set(PROOF_WRITABLE_NAMESPACES),
+  buckets: new Set([SANDBOX_LOCKER_BUCKET, SANDBOX_BACKUP_BUCKET]),
+  deployments: new Set([...PROOF_CORE_DEPLOYMENTS, PROOF_RELAYAUTH.service, PROOF_RELAYCAST.service]),
+  services: new Set([PROOF_INGEST_SERVICE, PROOF_POSTGREST.service, PROOF_RELAYAUTH.service, PROOF_RELAYCAST.service]),
+  pgClusters: new Set([PROOF_HOOPDB.cluster, PROOF_RESTORE_CLUSTER]),
+  databases: new Set([PROOF_HOOPDB.database]),
+  releases: new Set([PROOF_RELEASE]),
+  hosts: new Set(["127.0.0.1", SANDBOX_HOST, PROOF_CHART_HOST, ...PROOF_TRANSCRIPT_HOSTS]),
+  accountId: SANDBOX_ACCOUNT_ID,
 });
 
 /** The local kind cluster: reads only (the guard refuses every mutation), and no AWS at all. */
@@ -134,7 +180,27 @@ export const KIND_FENCE: Fence = Object.freeze({
   hosts: new Set(["127.0.0.1", PROOF_CHART_HOST]),
 });
 
-export const fenceFor = (target: "proof" | "kind-readonly"): Fence => (target === "kind-readonly" ? KIND_FENCE : PROOF_FENCE);
+export type HarnessTarget = ProofTargetId | "kind-readonly";
+
+export const fenceFor = (target: HarnessTarget): Fence => (target === "kind-readonly" ? KIND_FENCE : target === "pippen-sandbox" ? SANDBOX_FENCE : PROOF_FENCE);
+
+/** The account-bound values config must restate exactly, per hardcoded target stage. */
+export interface TargetValues {
+  target: ProofTarget;
+  context: string;
+  host: string;
+  origin: string;
+  lockerBucket: string;
+  backupBucket: string;
+}
+
+export const TARGET_VALUES: Readonly<Record<ProofTargetId, TargetValues>> = Object.freeze({
+  proof: Object.freeze({ target: SESSIONS_DEV_PROOF_TARGET, context: PROOF_CONTEXT, host: PROOF_HOST, origin: PROOF_ORIGIN, lockerBucket: PROOF_LOCKER_BUCKET, backupBucket: PROOF_BACKUP_BUCKET }),
+  "pippen-sandbox": Object.freeze({ target: PIPPEN_SANDBOX_PROOF_TARGET, context: SANDBOX_CONTEXT, host: SANDBOX_HOST, origin: SANDBOX_ORIGIN, lockerBucket: SANDBOX_LOCKER_BUCKET, backupBucket: SANDBOX_BACKUP_BUCKET }),
+});
+
+/** The hardcoded values for a stage, or undefined when the stage is neither proof target. */
+export const targetValuesForStage = (stage: string): TargetValues | undefined => Object.values(TARGET_VALUES).find((v) => v.target.stage === stage);
 
 interface FenceSource {
   stage: string;
@@ -182,25 +248,26 @@ export function proofConfigIssues(c: FenceSource & Record<string, unknown>): str
     if (FORBIDDEN_NAME.test(v)) issues.push(`${path} is production- or shared-shaped`);
     if (URL_USERINFO.test(v)) issues.push(`${path} carries URL credentials (userinfo); credentials come from the environment only`);
   }
-  if (c.stage !== PROOF_STAGE) return issues;
+  const tv = targetValuesForStage(c.stage);
+  if (!tv) return issues;
   const want = (path: string, got: unknown, exp: unknown) => {
     if (JSON.stringify(got) !== JSON.stringify(exp)) issues.push(`${path} must be ${JSON.stringify(exp)} (got ${JSON.stringify(got)})`);
   };
-  want("region", c.region, PROOF_REGION);
-  want("kubeContext", c.kubeContext, PROOF_CONTEXT);
+  want("region", c.region, tv.target.region);
+  want("kubeContext", c.kubeContext, tv.context);
   want("namespace", c.namespace, PROOF_NAMESPACE);
   want("release", c.release, PROOF_RELEASE);
   want("chartRepo", c.chartRepo, PROOF_CHART_REPO);
   want("coreDeployments", c.coreDeployments, PROOF_CORE_DEPLOYMENTS);
   want("hoopdb", { cluster: c.hoopdb.cluster, database: c.hoopdb.database }, PROOF_HOOPDB);
-  want("locker.bucket", c.locker.bucket, PROOF_LOCKER_BUCKET);
-  if (c.backupBucket !== undefined) want("backupBucket", c.backupBucket, PROOF_BACKUP_BUCKET);
+  want("locker.bucket", c.locker.bucket, tv.lockerBucket);
+  if (c.backupBucket !== undefined) want("backupBucket", c.backupBucket, tv.backupBucket);
   if (c.probeImage !== undefined && !PROOF_PROBE_IMAGES.includes(c.probeImage as string)) issues.push(`probeImage must be one of the allowlisted images (fence.ts PROOF_PROBE_IMAGES)`);
   want("relayauth", { namespace: c.relayauth.namespace, service: c.relayauth.service }, PROOF_RELAYAUTH);
   want("relaycast", { namespace: c.relaycast.namespace, service: c.relaycast.service }, PROOF_RELAYCAST);
   want("ingest.service", c.ingest.service, PROOF_INGEST_SERVICE);
-  want("ingress.hostname", c.ingress.hostname, PROOF_HOST);
-  want("historyOrigin", c.historyOrigin, PROOF_ORIGIN);
+  want("ingress.hostname", c.ingress.hostname, tv.host);
+  want("historyOrigin", c.historyOrigin, tv.origin);
   want("tenants", (c as { tenants?: Array<{ orgId: string }> }).tenants?.map((t) => t.orgId), PROOF_TENANT_ORGS);
   want("objectKeyPrefixBase", (c as { objectKeyPrefixBase?: string }).objectKeyPrefixBase, PROOF_KEY_PREFIX_BASE);
   const t = c.transcriptSearch;

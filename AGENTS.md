@@ -1,4 +1,4 @@
-# Agent operating rules for 96BullSessions
+# Agent operating rules for sessions-pipeline (codename 96Bulls)
 
 ## Standing order for changes to `main` (Khaliq Gant, 2026-10-29)
 

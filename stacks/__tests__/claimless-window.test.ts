@@ -101,8 +101,10 @@ const compositions: [string, (window?: ClaimlessWindow) => Rendered][] = [
           pubsubTopic: "projects/agentworkforce-dev1/topics/events",
           pubsubSubscription:
             "projects/agentworkforce-dev1/subscriptions/events",
-          workloadIdentityEmail:
-            "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
+          workloadIdentityEmails: {
+            worker: "awf-dev-worker@agentworkforce-dev1.iam.gserviceaccount.com",
+            alleyoop: "awf-dev-alleyoop@agentworkforce-dev1.iam.gserviceaccount.com",
+          },
         },
       ) as unknown as Rendered,
   ],

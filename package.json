@@ -1,5 +1,5 @@
 {
-  "name": "96bullsessions",
+  "name": "sessions-pipeline",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -32,7 +32,9 @@
     "migration:reproject": "bun run src/migration/relayhistory-reproject.ts",
     "migration:reverse": "bun run src/migration/relayhistory-reverse.ts",
     "migration:sequence-fence": "bun run src/migration/relayhistory-sequence-fence.ts",
-    "migration:verify": "bun run src/migration/relayhistory-verify.ts"
+    "migration:verify": "bun run src/migration/relayhistory-verify.ts",
+    "migration:neon-s3-sync": "bun run src/migration/neon-s3-sync/main.ts",
+    "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts"
   },
   "dependencies": {
     "@96bulls/pipeline": "workspace:*",

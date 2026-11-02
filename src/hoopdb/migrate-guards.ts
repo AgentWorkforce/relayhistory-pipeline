@@ -105,6 +105,8 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_directory_machines": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_directory_rollout": ["SELECT"],
   "sessions.session_directory_resurrection_fences": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_agents": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_relationships": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.manifest_readiness": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.export_deferred_sessions": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.claimless_uses": ["SELECT", "INSERT", "UPDATE"],
@@ -140,6 +142,8 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_directory_users",
   "sessions.session_directory_machines",
   "sessions.session_directory_resurrection_fences",
+  "sessions.session_directory_agents",
+  "sessions.session_directory_relationships",
   "sessions.manifest_readiness",
   "sessions.export_deferred_sessions",
   "sessions.claimless_uses",
@@ -170,6 +174,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.repo_visibility_ids(text,uuid)",
   "sessions.repos_maintain(integer)",
   "sessions.resolve_repo(text,text,text,timestamp with time zone)",
+  "sessions.session_directory_project_text(text,text,text)",
   "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
   "sessions.session_index_batch(jsonb)",
   "sessions.session_index_scrub_sticky()",
@@ -1023,9 +1028,101 @@ export async function sequencePreflight(
 // Durable function boundary (activation gate)
 // ---------------------------------------------------------------------------
 
-/** The reviewed event trigger an equivalent control must use, if chosen. */
-export const SESSIONS_FUNCTION_EVENT_TRIGGER =
-  "sessions_function_public_revoke";
+/**
+ * Event-trigger mode (supabase only): the reviewed trigger installed by
+ * supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql. The gate verifies it
+ * by its full catalog definition against these frozen constants, never by name alone.
+ */
+export const SESSIONS_FUNCTION_EVENT_TRIGGER = "hoopdb_sessions_function_boundary";
+export const SESSIONS_FUNCTION_EVENT_TRIGGER_FUNCTION =
+  "hoopdb_boundary.sessions_function_boundary()";
+export const SESSIONS_FUNCTION_EVENT_TRIGGER_SCHEMA = "hoopdb_boundary";
+/** The exact tag set (sorted): every command that can create a routine or change its ACL, owner or security. */
+export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
+  Object.freeze([
+    "ALTER AGGREGATE",
+    "ALTER DEFAULT PRIVILEGES",
+    "ALTER EXTENSION",
+    "ALTER FUNCTION",
+    "ALTER PROCEDURE",
+    "ALTER ROUTINE",
+    "ALTER SCHEMA",
+    "CREATE AGGREGATE",
+    "CREATE EXTENSION",
+    "CREATE FUNCTION",
+    "CREATE PROCEDURE",
+    "CREATE TYPE",
+    "GRANT",
+    "REVOKE",
+  ]);
+/**
+ * sha256 (hex) of the trigger function's prosrc with its one variable part, the runtime
+ * role literal (`v_runtime text := '<role>';`), put back to the placeholder
+ * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
+ */
+export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
+  "52ff269fc6d1149ad6a92dd5b5dc1f0f1dc7d69fa538bbdef08a1579f667fe21";
+export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
+  Object.freeze(["search_path=pg_catalog, pg_temp"]);
+const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
+/** The runtime role written into a trigger body, and the body normalized back to the reviewed text. */
+export function normalizeEventTriggerBody(prosrc: string): {
+  runtimeRole: string | null;
+  sha256: string;
+} {
+  const found = [...prosrc.matchAll(RUNTIME_LITERAL)];
+  const normalized =
+    found.length === 1
+      ? prosrc.replace(RUNTIME_LITERAL, "v_runtime text := '__RUNTIME_ROLE__';")
+      : prosrc;
+  return {
+    runtimeRole: found.length === 1 ? found[0]![1]! : null,
+    sha256: createHash("sha256").update(normalized).digest("hex"),
+  };
+}
+
+/** The event trigger's catalog definition as the gate read it. Names, booleans and hashes only. */
+export interface EventTriggerEvidence {
+  name: string;
+  present: boolean;
+  event: string | null;
+  tags: string[];
+  tags_exact: boolean;
+  enabled: string | null;
+  enabled_ok: boolean;
+  owner: string | null;
+  owner_is_migration_owner: boolean;
+  function: string | null;
+  function_is_reviewed: boolean;
+  function_owner: string | null;
+  function_owner_is_migration_owner: boolean;
+  schema_owner_is_migration_owner: boolean;
+  prosrc_sha256: string | null;
+  prosrc_exact: boolean;
+  proconfig: string[];
+  proconfig_exact: boolean;
+  security_definer: boolean | null;
+  volatility: string | null;
+  language: string | null;
+  returns: string | null;
+  function_acl: string[];
+  function_public_execute: boolean;
+  /** The runtime role written into the body (allowed on RUNTIME_APPLICATION_FUNCTIONS); must equal HOOPDB_RUNTIME_ROLE. */
+  runtime_role_setting: string | null;
+  runtime_role_setting_matches: boolean;
+  /** Schema hoopdb_boundary is owned by the migration owner and grants nobody else anything. */
+  schema_private: boolean;
+  verified: boolean;
+}
+
+/** Every other event trigger in the database (informational; final-state checks still apply). */
+export interface OtherEventTrigger {
+  name: string;
+  event: string;
+  enabled: string;
+  owner: string;
+  function: string;
+}
 export type FunctionBoundaryMode = "global-default-revoke" | "event-trigger";
 
 /**
@@ -1133,6 +1230,9 @@ export interface FunctionBoundaryEvidence {
   /** Every existing sessions function is owned by the migration owner. */
   sessions_functions_owned_by_owner: boolean;
   event_trigger_present: boolean;
+  /** Event-trigger mode: the reviewed trigger's full catalog definition. */
+  event_trigger: EventTriggerEvidence;
+  other_event_triggers: OtherEventTrigger[];
   mode: FunctionBoundaryMode | "none";
   satisfied: boolean;
 }
@@ -1152,7 +1252,14 @@ export interface FunctionBoundaryEvidence {
  *       option). Installed in selfhosted by the privileged
  *       supabase/bootstrap/hoopdb_function_default_revoke.sql (the database is dedicated
  *       to HoopDb). On Supabase the owner is postgres, so the operator decides (#98).
- *   "event-trigger": NOT IMPLEMENTED, refused (hook kept for a reviewed trigger).
+ *   "event-trigger" (supabase mode only): the reviewed ddl_command_end trigger
+ *       (SESSIONS_FUNCTION_EVENT_TRIGGER) must match every frozen constant above (event,
+ *       exact tags, enabled O/A, owner = migration owner, function identity, owner,
+ *       prosrc sha256, proconfig, SECURITY INVOKER, volatility, language, not
+ *       PUBLIC-executable). The migration owner is covered by the trigger instead of its
+ *       global default; every other creator still needs an exact default. Other event
+ *       triggers are reported: any DDL they run fires the reviewed trigger too, and the
+ *       live gate keeps refusing PUBLIC-executable sessions functions.
  * (B) cannot be claimed here (see the evidence field). Follow-up: a dedicated sessions
  * object owner, which needs an ownership transfer of live objects (activation dossier #98).
  */
@@ -1160,6 +1267,7 @@ export async function functionBoundaryEvidence(
   client: GuardClient,
   mode: FunctionBoundaryMode | undefined,
   dbMode: "local" | "selfhosted" | "cloudsql" | "supabase" | undefined = undefined,
+  runtimeRole: string | undefined = undefined,
 ): Promise<FunctionBoundaryEvidence> {
   const head = (
     await client.query<{
@@ -1170,7 +1278,7 @@ export async function functionBoundaryEvidence(
       sessions: boolean;
     }>(
       `SELECT current_user AS owner, (SELECT oid::int FROM pg_roles WHERE rolname = current_user) AS owner_oid,
-              EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = $1 AND evtenabled <> 'D' AND evtevent = 'ddl_command_end') AS event_trigger,
+              EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = $1) AS event_trigger,
               NOT EXISTS (SELECT 1 FROM pg_proc p
                            WHERE p.pronamespace = coalesce(to_regnamespace('sessions')::oid, 0)
                              AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS owned,
@@ -1252,14 +1360,29 @@ export async function functionBoundaryEvidence(
         ORDER BY 1`,
     )
   ).rows.map((x) => x.e);
+  const et = await eventTriggerEvidence(client, head.owner_oid, runtimeRole);
+  const others = (
+    await client.query<OtherEventTrigger>(
+      `SELECT e.evtname AS name, e.evtevent AS event, e.evtenabled::text AS enabled,
+              (SELECT rolname FROM pg_roles WHERE oid = e.evtowner) AS owner, e.evtfoid::regprocedure::text AS function
+         FROM pg_event_trigger e WHERE e.evtname <> $1 ORDER BY 1`,
+      [SESSIONS_FUNCTION_EVENT_TRIGGER],
+    )
+  ).rows;
+  // In event-trigger mode the trigger covers the migration owner; every other creator
+  // still needs its own exact global default (supautils skips the trigger for
+  // superusers and reserved roles, and other roles are aborted only after the fact).
+  const eventTriggerMode = mode === "event-trigger" && dbMode === "supabase";
   const covered =
-    creators.length > 0 && creators.every((c) => c.function_default_exact);
-  // Event-trigger mode is not implemented: a trigger's name proves nothing (its enabled
-  // state, events and tags, owner, function identity and definition, SECURITY and
-  // search_path, and behaviour would all need verifying). Hook kept for that later work.
+    creators.length > 0 &&
+    creators.every(
+      (c) =>
+        c.function_default_exact || (eventTriggerMode && c.is_migration_owner),
+    );
   const satisfied =
-    mode === "global-default-revoke" &&
-    exact(ownerDefault) &&
+    (mode === "global-default-revoke"
+      ? exact(ownerDefault)
+      : eventTriggerMode && et.verified) &&
     covered &&
     schemaDefaults.length === 0 &&
     head.owned;
@@ -1275,9 +1398,175 @@ export async function functionBoundaryEvidence(
     sessions_schema_function_defaults: schemaDefaults,
     sessions_functions_owned_by_owner: head.owned,
     event_trigger_present: head.event_trigger,
+    event_trigger: et,
+    other_event_triggers: others,
     mode: mode ?? "none",
     satisfied,
   };
+}
+
+/** The reviewed event trigger's catalog definition, compared with the frozen constants. */
+export async function eventTriggerEvidence(
+  client: GuardClient,
+  ownerOid: number,
+  runtimeRole: string | undefined,
+): Promise<EventTriggerEvidence> {
+  const r = (
+    await client.query<{
+      present: boolean;
+      event: string | null;
+      tags: string[] | null;
+      enabled: string | null;
+      owner: string | null;
+      owner_ok: boolean | null;
+      function: string | null;
+      function_ok: boolean | null;
+      function_owner: string | null;
+      function_owner_ok: boolean | null;
+      schema_owner_ok: boolean | null;
+      prosrc: string | null;
+      proconfig: string[] | null;
+      security_definer: boolean | null;
+      volatility: string | null;
+      language: string | null;
+      returns: string | null;
+      function_acl: string[] | null;
+      function_public_execute: boolean | null;
+      schema_private: boolean | null;
+    }>(
+      `SELECT e.oid IS NOT NULL AS present, e.evtevent AS event,
+              (SELECT array_agg(t ORDER BY t) FROM unnest(e.evttags) t) AS tags,
+              e.evtenabled::text AS enabled,
+              (SELECT rolname FROM pg_roles WHERE oid = e.evtowner) AS owner,
+              e.evtowner = $2::oid AS owner_ok,
+              e.evtfoid::regprocedure::text AS function,
+              e.evtfoid = to_regprocedure($3) AS function_ok,
+              (SELECT rolname FROM pg_roles WHERE oid = p.proowner) AS function_owner,
+              p.proowner = $2::oid AS function_owner_ok,
+              (SELECT n.nspowner = $2::oid FROM pg_namespace n WHERE n.nspname = $4) AS schema_owner_ok,
+              p.prosrc,
+              p.proconfig, p.prosecdef AS security_definer, p.provolatile::text AS volatility,
+              (SELECT lanname FROM pg_language WHERE oid = p.prolang) AS language,
+              p.prorettype::regtype::text AS returns,
+              CASE WHEN p.oid IS NULL THEN NULL WHEN p.proacl IS NULL THEN ARRAY['<default>'] ELSE (
+                SELECT array_agg(CASE WHEN a.grantee = 0 THEN 'PUBLIC' WHEN a.grantee = p.proowner THEN '<owner>' ELSE (SELECT rolname FROM pg_roles WHERE oid = a.grantee) END
+                                 || ':' || a.privilege_type || CASE WHEN a.is_grantable THEN '*' ELSE '' END ORDER BY 1)
+                  FROM aclexplode(p.proacl) a) END AS function_acl,
+              CASE WHEN p.oid IS NULL THEN NULL ELSE (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0)) END AS function_public_execute,
+              (SELECT n.nspowner = $2::oid
+                      AND (n.nspacl IS NULL OR NOT EXISTS (SELECT 1 FROM aclexplode(n.nspacl) a WHERE a.grantee <> n.nspowner))
+                 FROM pg_namespace n WHERE n.nspname = $4) AS schema_private
+         FROM (SELECT 1) one
+         LEFT JOIN pg_event_trigger e ON e.evtname = $1
+         LEFT JOIN pg_proc p ON p.oid = e.evtfoid`,
+      [
+        SESSIONS_FUNCTION_EVENT_TRIGGER,
+        ownerOid,
+        SESSIONS_FUNCTION_EVENT_TRIGGER_FUNCTION,
+        SESSIONS_FUNCTION_EVENT_TRIGGER_SCHEMA,
+      ],
+    )
+  ).rows[0]!;
+  // Sorted here, not in SQL: the comparison must not depend on the database collation.
+  const tags = [...(r.tags ?? [])].sort();
+  const proconfig = r.proconfig ?? [];
+  const body = r.prosrc === null ? null : normalizeEventTriggerBody(r.prosrc);
+  const runtimeSetting = body?.runtimeRole ?? null;
+  const e = {
+    name: SESSIONS_FUNCTION_EVENT_TRIGGER,
+    present: r.present === true,
+    event: r.event,
+    tags,
+    tags_exact:
+      JSON.stringify(tags) ===
+      JSON.stringify([...SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS].sort()),
+    enabled: r.enabled,
+    // Exactly ALWAYS: an origin (O) trigger is skipped in replica mode.
+    enabled_ok: r.enabled === "A",
+    owner: r.owner,
+    owner_is_migration_owner: r.owner_ok === true,
+    function: r.function,
+    function_is_reviewed: r.function_ok === true,
+    function_owner: r.function_owner,
+    function_owner_is_migration_owner: r.function_owner_ok === true,
+    schema_owner_is_migration_owner: r.schema_owner_ok === true,
+    prosrc_sha256: body?.sha256 ?? null,
+    prosrc_exact: body?.sha256 === SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256,
+    proconfig,
+    proconfig_exact:
+      JSON.stringify(proconfig) ===
+      JSON.stringify(SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG),
+    security_definer: r.security_definer,
+    volatility: r.volatility,
+    language: r.language,
+    returns: r.returns,
+    function_acl: r.function_acl ?? [],
+    function_public_execute: r.function_public_execute !== false,
+    runtime_role_setting: runtimeSetting,
+    runtime_role_setting_matches:
+      runtimeSetting !== null && runtimeSetting === runtimeRole,
+    schema_private: r.schema_private === true,
+  };
+  const verified =
+    e.present &&
+    e.event === "ddl_command_end" &&
+    e.tags_exact &&
+    e.enabled_ok &&
+    e.owner_is_migration_owner &&
+    e.function_is_reviewed &&
+    e.function_owner_is_migration_owner &&
+    e.schema_owner_is_migration_owner &&
+    e.prosrc_exact &&
+    e.proconfig_exact &&
+    e.security_definer === false &&
+    e.volatility === "v" &&
+    e.language === "plpgsql" &&
+    e.returns === "event_trigger" &&
+    !e.function_public_execute &&
+    e.runtime_role_setting_matches &&
+    e.schema_private;
+  return { ...e, verified };
+}
+
+/** The committed ACL manifest (src/hoopdb/sessions-function-acl.json). */
+export async function sessionsFunctionAclManifest(): Promise<
+  Record<string, string[]>
+> {
+  return (
+    JSON.parse(
+      await readFile(new URL("./sessions-function-acl.json", import.meta.url), "utf8"),
+    ) as { functions: Record<string, string[]> }
+  ).functions;
+}
+
+/**
+ * Run-time exact-manifest check (every non-local migrate, inside the validation
+ * transaction, after the runtime application ACL is installed): every sessions
+ * function's ACL must equal the manifest, plus `<runtime role>:EXECUTE` on
+ * RUNTIME_APPLICATION_FUNCTIONS. Returns the differences (empty when exact).
+ */
+export async function sessionsFunctionAclDrift(
+  client: GuardClient,
+  runtimeRole: string,
+): Promise<string[]> {
+  const manifest = await sessionsFunctionAclManifest();
+  const expected: Record<string, string[]> = Object.fromEntries(
+    Object.entries(manifest).map(([fn, entries]) => [
+      fn,
+      (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+        ? [...entries, `${runtimeRole}:EXECUTE`]
+        : entries,
+    ]),
+  );
+  const actual = await sessionsFunctionAcl(client);
+  const norm = (xs: string[] | undefined) => JSON.stringify([...(xs ?? [])].sort());
+  const drift: string[] = [];
+  for (const fn of new Set([...Object.keys(expected), ...Object.keys(actual)]))
+    if (norm(expected[fn]) !== norm(actual[fn]))
+      drift.push(
+        `${fn}: ${actual[fn] ? actual[fn]!.join(",") : "missing"} (expected ${expected[fn] ? expected[fn]!.join(",") : "absent"})`,
+      );
+  return drift;
 }
 
 /**

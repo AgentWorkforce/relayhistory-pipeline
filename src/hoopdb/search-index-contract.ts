@@ -379,7 +379,7 @@ export const SESSION_DIRECTORY_READINESS_RPC = {
 } as const;
 
 /**
- * The model-written brief for one logical session (20261101030000), for relayhistory-cloud's
+ * The model-written brief for one logical session (20261102000000), for relayhistory-cloud's
  * GET /v1/sessions/:id/brief. Zero rows when the session has no live pointer.
  */
 export const SESSION_BRIEF_RPC = {

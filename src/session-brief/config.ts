@@ -27,6 +27,11 @@ export interface BriefConfig {
   wakeMaxAgeHours: number;
   backgroundDailyBudget: number;
   sessionDailyCap: number;
+  /**
+   * Model-call attempts per UTC day across every org (Khaliq, 2026-11-02): a spend
+   * ceiling over the per-org budget. Soft by at most the concurrent workers' batch.
+   */
+  globalDailyCap: number;
   throttleSeconds: number;
   maxAttempts: number;
   batch: number;
@@ -59,6 +64,7 @@ export function briefConfig(env: NodeJS.ProcessEnv = process.env): BriefConfig {
     wakeMaxAgeHours: int(env, "SESSION_WAKE_MAX_AGE_HOURS", 72, 1, 24 * 365),
     backgroundDailyBudget: int(env, "SESSION_BRIEF_BACKGROUND_DAILY_BUDGET", 5_000, 0, 1_000_000),
     sessionDailyCap: int(env, "SESSION_BRIEF_SESSION_DAILY_CAP", 30, 1, 10_000),
+    globalDailyCap: int(env, "SESSION_BRIEF_GLOBAL_DAILY_CAP", 20_000, 0, 10_000_000),
     throttleSeconds: int(env, "SESSION_BRIEF_THROTTLE_SECONDS", 120, 0, 86_400),
     maxAttempts: int(env, "SESSION_BRIEF_MAX_ATTEMPTS", 2, 1, 10),
     batch: int(env, "SESSION_BRIEF_BATCH", 5, 1, 100),

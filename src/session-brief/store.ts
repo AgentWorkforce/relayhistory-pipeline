@@ -210,29 +210,33 @@ export async function storedBrief(db: SqlExecutor, key: SessionDirectoryKey): Pr
   };
 }
 
-export type Admission = { admitted: true } | { admitted: false; reason: "capped" | "budget" };
+export type Admission = { admitted: true } | { admitted: false; reason: "capped" | "budget" | "global" };
 
 /**
  * relayhistory's admission limits, by the database's UTC day: at most `sessionDailyCap`
  * attempts for one session, and a refusal once `budget` other sessions of the org were
- * admitted today (sessions_admitted_today >= session_admission_budget). An admitted
- * attempt is counted here.
+ * admitted today (sessions_admitted_today >= session_admission_budget), and, over every
+ * org, a refusal once today's attempts reach `globalDailyCap` (a spend ceiling; Khaliq,
+ * 2026-11-02). An admitted attempt is counted here.
  */
 export async function admit(
   db: SqlExecutor,
   key: SessionDirectoryKey,
-  limits: { sessionDailyCap: number; budget: number },
+  limits: { sessionDailyCap: number; budget: number; globalDailyCap: number },
 ): Promise<Admission> {
-  const { rows } = await db.query<{ mine: number; others: number }>(
+  const { rows } = await db.query<{ mine: number; others: number; total: number }>(
     `SELECT coalesce((SELECT attempts FROM sessions.session_brief_attempts
                        WHERE org_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date
                          AND workspace_id = $2 AND harness = $3 AND session_id = $4), 0)::int AS mine,
             (SELECT count(*) FROM sessions.session_brief_attempts
               WHERE org_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date
-                AND NOT (workspace_id = $2 AND harness = $3 AND session_id = $4))::int AS others`,
+                AND NOT (workspace_id = $2 AND harness = $3 AND session_id = $4))::int AS others,
+            (SELECT coalesce(sum(attempts), 0) FROM sessions.session_brief_attempts
+              WHERE day = (now() AT TIME ZONE 'UTC')::date)::int AS total`,
     keyParams(key),
   );
-  const { mine, others } = rows[0] ?? { mine: 0, others: 0 };
+  const { mine, others, total } = rows[0] ?? { mine: 0, others: 0, total: 0 };
+  if (Number(total) >= limits.globalDailyCap) return { admitted: false, reason: "global" };
   if (Number(mine) >= limits.sessionDailyCap) return { admitted: false, reason: "capped" };
   if (Number(others) >= limits.budget) return { admitted: false, reason: "budget" };
   await db.query(

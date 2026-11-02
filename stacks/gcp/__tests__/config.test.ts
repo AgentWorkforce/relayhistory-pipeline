@@ -334,7 +334,10 @@ describe("GCP self-host contract", () => {
           redisCaPem: "-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n",
           pubsubTopic: "projects/agentworkforce-dev1/topics/events",
           pubsubSubscription: "projects/agentworkforce-dev1/subscriptions/events",
-          workloadIdentityEmail: "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
+          workloadIdentityEmails: {
+            worker: "awf-dev-worker@agentworkforce-dev1.iam.gserviceaccount.com",
+            alleyoop: "awf-dev-alleyoop@agentworkforce-dev1.iam.gserviceaccount.com",
+          },
         },
         "destroy",
       ),
@@ -394,7 +397,10 @@ describe("GCP self-host contract", () => {
           redisCaPem: "-----BEGIN CERTIFICATE-----\nQUJDRA==\n-----END CERTIFICATE-----\n",
           pubsubTopic: "projects/agentworkforce-dev1/topics/events",
           pubsubSubscription: "projects/agentworkforce-dev1/subscriptions/events",
-          workloadIdentityEmail: "awf-dev-runtime@agentworkforce-dev1.iam.gserviceaccount.com",
+          workloadIdentityEmails: {
+            worker: "awf-dev-worker@agentworkforce-dev1.iam.gserviceaccount.com",
+            alleyoop: "awf-dev-alleyoop@agentworkforce-dev1.iam.gserviceaccount.com",
+          },
         },
       );
     const rendered = JSON.stringify(values);
@@ -406,6 +412,13 @@ describe("GCP self-host contract", () => {
     expect(rendered).not.toContain('"REDIS_AUTH"');
     expect(rendered).not.toContain("REDIS_PASSWORD");
     expect(rendered).not.toContain("LOCKER_ACCESS_KEY_ID");
+    expect(rendered).not.toContain("awf-dev-runtime@");
+    expect(
+      (values.worker as { serviceAccount: { annotations: Record<string, string> } }).serviceAccount.annotations,
+    ).toEqual({ "iam.gke.io/gcp-service-account": "awf-dev-worker@agentworkforce-dev1.iam.gserviceaccount.com" });
+    expect(
+      (values.alleyoop as { serviceAccount: { annotations: Record<string, string> } }).serviceAccount.annotations,
+    ).toEqual({ "iam.gke.io/gcp-service-account": "awf-dev-alleyoop@agentworkforce-dev1.iam.gserviceaccount.com" });
     const worker = values.worker as {
       hoopdb: { existingSecret: string; key: string };
       migrations: {
@@ -519,7 +532,9 @@ describe("GCP self-host contract", () => {
     expect(stack).toContain("autopilot: GCP_RUNTIME_SHAPE.autopilot");
     expect(stack).toContain("serviceAccount: nodeActAs.serviceAccountEmail");
     expect(stack).toContain('GCP.IAM.Member("node-artifactregistry-reader"');
-    expect(stack).toContain("Output.all(images.registryUri, nodeArtifactRegistryReader.role)");
+    expect(stack).toMatch(
+      /Output\.all\(\s*images\.registryUri,\s*nodeArtifactRegistryReader\.role,\s*lockerWriteScopes\.bucket,\s*Output\.all\(\.\.\.serviceBindings\.map\(\(b\) => b\.role\)\),?\s*\)/,
+    );
     expect(stack.indexOf('GCP.IAM.Member("node-artifactregistry-reader"')).toBeLessThan(
       stack.indexOf('Kubernetes.HelmChart("96bulls"'),
     );

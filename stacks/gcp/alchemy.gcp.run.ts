@@ -67,6 +67,14 @@ import {
 } from "./apply-authorization.ts";
 import { requireServiceAccountActAs, type ServiceAccountActAsProof } from "./iam-preflight.ts";
 import { fetchRedisServerCa, redisAdminFetchTransport } from "./redis-ca.ts";
+import { ensureCloudSqlProtection, ensureLockerLifecycle } from "./data-retention.ts";
+import { PRIVATE_GOOGLE_APIS_RECORDS, assertInClusterJwks, bulls96NetworkPolicies, relayauthNetworkPolicies } from "./egress.ts";
+import {
+  alleyoopWriteCondition,
+  ensureConditionalBucketBindings,
+  workerWriteCondition,
+  type ConditionalBinding,
+} from "./bucket-iam.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
@@ -77,6 +85,25 @@ interface EnsurePrivateCloudSqlInput {
   /** Resolved PSA output: establishes that the peering exists before the POST. */
   privateServiceConnection: string;
   proxyPrincipal: string;
+  authorization: GcpApplyAuthorizationProof;
+}
+
+interface EnsureCloudSqlProtectionInput {
+  projectId: string;
+  instance: string;
+  authorization: GcpApplyAuthorizationProof;
+}
+
+interface EnsureLockerLifecycleInput {
+  bucket: string;
+  authorization: GcpApplyAuthorizationProof;
+}
+
+interface EnsureLockerWriteScopesInput {
+  bucket: string;
+  bindings: ConditionalBinding[];
+  /** Members stripped from every bucket binding (the retired shared identity). */
+  forbidden: string[];
   authorization: GcpApplyAuthorizationProof;
 }
 
@@ -242,6 +269,73 @@ const EnsurePrivateCloudSql = Alchemy.Action<
   }),
 );
 
+const EnsureLockerWriteScopes = Alchemy.Action<
+  "96Bulls.GCP.EnsureLockerWriteScopes",
+  EnsureLockerWriteScopesInput,
+  { bucket: string; changed: boolean },
+  GCP.GcpEnvironment
+>("96Bulls.GCP.EnsureLockerWriteScopes", (input) =>
+  Effect.gen(function* () {
+    assertGcpApplyLeaseActive(input.authorization);
+    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
+    if (live.project !== input.authorization.projectId)
+      throw new Error("96bulls: locker write scopes project differs from the resolved GCP project. Nothing was changed.");
+    const result = yield* Effect.tryPromise(() =>
+      ensureConditionalBucketBindings(
+        input.bucket,
+        input.bindings,
+        { bearer: Redacted.value(live.accessToken) },
+        undefined,
+        undefined,
+        input.forbidden,
+      ),
+    );
+    return { bucket: input.bucket, changed: result.changed };
+  }),
+);
+
+const EnsureCloudSqlProtection = Alchemy.Action<
+  "96Bulls.GCP.EnsureCloudSqlProtection",
+  EnsureCloudSqlProtectionInput,
+  { instance: string; changed: boolean },
+  GCP.GcpEnvironment
+>("96Bulls.GCP.EnsureCloudSqlProtection", (input) =>
+  Effect.gen(function* () {
+    assertGcpApplyLeaseActive(input.authorization);
+    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
+    if (live.project !== input.projectId || input.authorization.projectId !== input.projectId)
+      throw new Error("96bulls: Cloud SQL protection project differs from the resolved GCP project. Nothing was changed.");
+    const result = yield* Effect.tryPromise((signal) =>
+      ensureCloudSqlProtection(input.projectId, input.instance, { bearer: Redacted.value(live.accessToken) }, undefined, undefined, undefined, {
+        expiresAtMs: input.authorization.leaseExpiresAt * 1000,
+        signal,
+      }),
+    );
+    return { instance: input.instance, changed: result.changed };
+  }),
+);
+
+const EnsureLockerLifecycle = Alchemy.Action<
+  "96Bulls.GCP.EnsureLockerLifecycle",
+  EnsureLockerLifecycleInput,
+  { bucket: string; changed: boolean },
+  GCP.GcpEnvironment
+>("96Bulls.GCP.EnsureLockerLifecycle", (input) =>
+  Effect.gen(function* () {
+    assertGcpApplyLeaseActive(input.authorization);
+    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
+    if (live.project !== input.authorization.projectId)
+      throw new Error("96bulls: locker lifecycle project differs from the resolved GCP project. Nothing was changed.");
+    const result = yield* Effect.tryPromise((signal) =>
+      ensureLockerLifecycle(input.bucket, { bearer: Redacted.value(live.accessToken) }, undefined, {
+        expiresAtMs: input.authorization.leaseExpiresAt * 1000,
+        signal,
+      }),
+    );
+    return { bucket: input.bucket, changed: result.changed };
+  }),
+);
+
 const ResolveRedisServerCa = Alchemy.Action<
   "96Bulls.GCP.ResolveRedisServerCa",
   ResolveRedisServerCaInput,
@@ -338,6 +432,10 @@ export default Alchemy.Stack(
     const psaName = gcpResourceName(stage, "psa", 63);
     const runtimeAccountId = gcpResourceName(stage, "runtime", 30);
     const runtimeEmail = `${runtimeAccountId}@${i.projectId}.iam.gserviceaccount.com`;
+    const workerAccountId = gcpResourceName(stage, "worker", 30);
+    const workerEmail = `${workerAccountId}@${i.projectId}.iam.gserviceaccount.com`;
+    const alleyoopAccountId = gcpResourceName(stage, "alleyoop", 30);
+    const alleyoopEmail = `${alleyoopAccountId}@${i.projectId}.iam.gserviceaccount.com`;
     const lockerBucket = `${gcpResourceName(stage, "locker", 30)}-${i.projectId}`.slice(0, 63).replace(/-$/, "");
     const eventsTopicId = gcpResourceName(stage, "events", 63);
     const eventsSubscriptionId = gcpResourceName(stage, "events-worker", 63);
@@ -351,6 +449,7 @@ export default Alchemy.Stack(
       "artifactregistry.googleapis.com",
       "compute.googleapis.com",
       "container.googleapis.com",
+      "dns.googleapis.com",
       "iam.googleapis.com",
       "iamcredentials.googleapis.com",
       "pubsub.googleapis.com",
@@ -392,6 +491,26 @@ export default Alchemy.Stack(
       ],
       logConfig: { enable: true, aggregationInterval: "INTERVAL_5_SEC", flowSampling: 0.5, metadata: "INCLUDE_ALL_METADATA" },
     });
+    // Every *.googleapis.com name in the stage VPC resolves to private.googleapis.com,
+    // reached through Private Google Access, so workload egress needs no public
+    // internet route for Google APIs (egress.ts).
+    const googleApisZone = yield* GCP.DNS.ManagedZone("private-googleapis", {
+      zoneName: afterApi("dns.googleapis.com", gcpResourceName(stage, "googleapis", 63)),
+      dnsName: "googleapis.com.",
+      visibility: "private",
+      networks: [network.networkName],
+      description: authorized(`AgentWorkforce ${stage}: Google APIs on private.googleapis.com`),
+      labels: labels(stage, "dns"),
+    });
+    for (const record of PRIVATE_GOOGLE_APIS_RECORDS) {
+      yield* GCP.DNS.ResourceRecordSet(record.id, {
+        managedZone: googleApisZone.zoneName,
+        name: record.name,
+        type: record.type,
+        ttl: 300,
+        rrdatas: [...record.rrdatas],
+      });
+    }
     const natAddress = yield* GCP.Compute.Address("nat-address", {
       addressName: afterApi("compute.googleapis.com", gcpResourceName(stage, "nat", 63)),
       region: i.region,
@@ -507,6 +626,8 @@ export default Alchemy.Stack(
       forceDestroy: false,
       labels: labels(stage, "locker"),
     });
+    // 30-day noncurrent-version expiry on every stage's locker, data plane or not.
+    yield* EnsureLockerLifecycle("locker-lifecycle", { bucket: locker.bucketName, authorization: applyAuthorization });
     const runtimeSecret = yield* GCP.SecretManager.Secret("runtime-secret", {
       secretId: authorized(gcpResourceName(stage, "runtime", 63)),
       labels: labels(stage, "runtime"),
@@ -522,34 +643,73 @@ export default Alchemy.Stack(
       dockerConfig: { immutableTags: true },
     });
 
+    // runtime-identity is the Cloud SQL proxy's identity only: Cloud SQL client, no
+    // bucket, no Pub/Sub. The service pods each get their own account below, so a
+    // compromised proxy can no longer read or rewrite transcripts, and AlleyOop and
+    // the worker can each write only their own objects (bucket-iam.ts).
     const runtimeIdentity = yield* GCP.IAM.ServiceAccount("runtime-identity", {
       accountId: runtimeAccountId,
       displayName: afterApi("iam.googleapis.com", `AgentWorkforce ${stage} runtime`),
-      description: authorized("Workload Identity target for managed data-plane clients"),
+      description: authorized("Workload Identity target for the Cloud SQL proxy"),
     });
     // email is an Output until deploy. A JS template coerces it and throws.
     const runtimeMember = Output.interpolate`serviceAccount:${runtimeIdentity.email}`;
+    const workerIdentity = yield* GCP.IAM.ServiceAccount("worker-identity", {
+      accountId: workerAccountId,
+      displayName: afterApi("iam.googleapis.com", `AgentWorkforce ${stage} 96bulls worker`),
+      description: authorized("Workload Identity target for the 96Bulls worker pods and Jobs"),
+    });
+    const alleyoopIdentity = yield* GCP.IAM.ServiceAccount("alleyoop-identity", {
+      accountId: alleyoopAccountId,
+      displayName: afterApi("iam.googleapis.com", `AgentWorkforce ${stage} AlleyOop`),
+      description: authorized("Workload Identity target for the AlleyOop ingest pods"),
+    });
+    const workerMember = Output.interpolate`serviceAccount:${workerIdentity.email}`;
+    const alleyoopMember = Output.interpolate`serviceAccount:${alleyoopIdentity.email}`;
     // The proxy Kubernetes service account is created only once Cloud SQL is
     // posted. Binding it earlier would let a later account of that name assume
     // the runtime identity.
-    for (const [logicalName, namespace, serviceAccount] of [
-      ["96bulls-worker", "96bulls", GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.worker],
-      ["96bulls-alleyoop", "96bulls", GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.alleyoop],
+    const serviceBindings: Array<{ role: Output.Output<string> }> = [];
+    for (const [logicalName, serviceAccount, identity] of [
+      ["96bulls-worker", GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.worker, workerIdentity],
+      ["96bulls-alleyoop", GCP_BULLS96_KUBERNETES_SERVICE_ACCOUNTS.alleyoop, alleyoopIdentity],
     ] as const) {
-      yield* GCP.IAM.Member(`workload-identity-${namespace}-${logicalName}`, {
-        kind: "iam.serviceAccount",
-        name: runtimeIdentity.name,
-        role: "roles/iam.workloadIdentityUser",
-        member: Output.map(cluster.workloadPool, () =>
-          workloadIdentityPrincipal(i, namespace, serviceAccount),
-        ),
-      });
+      serviceBindings.push(
+        yield* GCP.IAM.Member(`workload-identity-${logicalName}-own`, {
+          kind: "iam.serviceAccount",
+          name: identity.name,
+          role: "roles/iam.workloadIdentityUser",
+          member: Output.map(cluster.workloadPool, () =>
+            workloadIdentityPrincipal(i, "96bulls", serviceAccount),
+          ),
+        }),
+      );
     }
-    yield* GCP.IAM.Member("runtime-locker", {
-      kind: "storage.bucket",
-      name: locker.bucketName,
-      role: authorized("roles/storage.objectUser"),
-      member: runtimeMember,
+    for (const [id, member] of [
+      ["worker", workerMember],
+      ["alleyoop", alleyoopMember],
+    ] as const) {
+      serviceBindings.push(
+        yield* GCP.IAM.Member(`${id}-locker-read`, {
+          kind: "storage.bucket",
+          name: locker.bucketName,
+          role: authorized("roles/storage.objectViewer"),
+          member,
+        }),
+      );
+    }
+    const lockerWriteScopes = yield* EnsureLockerWriteScopes("locker-write-scopes", {
+      bucket: locker.bucketName,
+      bindings: Output.map(
+        Output.all(locker.bucketName, workerIdentity.email, alleyoopIdentity.email),
+        ([bucket, worker, alleyoop]) => [
+          { role: "roles/storage.objectUser", member: `serviceAccount:${worker}`, condition: workerWriteCondition(bucket) },
+          { role: "roles/storage.objectUser", member: `serviceAccount:${alleyoop}`, condition: alleyoopWriteCondition(bucket) },
+        ],
+      ) as unknown as ConditionalBinding[],
+      // The Cloud SQL proxy identity must hold nothing on the bucket.
+      forbidden: [`serviceAccount:${runtimeEmail}`],
+      authorization: applyAuthorization,
     });
     yield* GCP.IAM.Member("runtime-cloudsql", {
       kind: "project",
@@ -580,6 +740,14 @@ export default Alchemy.Stack(
             spec: sql,
             privateServiceConnection: privateServices.name,
             proxyPrincipal: workloadIdentityPrincipal(i, "96bulls", "cloud-sql-proxy"),
+            authorization: applyAuthorization,
+          });
+          // Deletion protection and retained backups (data-retention.ts), right after the
+          // poster and independent of every other step, so a new instance never stays
+          // deletable because something later failed.
+          yield* EnsureCloudSqlProtection("cloud-sql-protection", {
+            projectId: i.projectId,
+            instance: Output.map(sqlPoster.connectionName, () => sql.instanceName) as unknown as string,
             authorization: applyAuthorization,
           });
           const redis = yield* GCP.Redis.Instance("redis", {
@@ -638,13 +806,13 @@ export default Alchemy.Stack(
             ["events-publish", "pubsub.topic", events.name, "roles/pubsub.publisher"],
             ["events-consume", "pubsub.subscription", subscription.name, "roles/pubsub.subscriber"],
           ] as const) {
-            yield* GCP.IAM.Member(`runtime-${id}`, {
+            yield* GCP.IAM.Member(`worker-${id}`, {
               kind,
               name,
               role,
-              // The runtime identity and the named topic/subscription are
+              // The worker identity and the named topic/subscription are
               // already nonce-gated dependencies of this binding.
-              member: runtimeMember,
+              member: workerMember,
             });
           }
           const pubsubAgent = `serviceAccount:${pubsubServiceAgent(i.projectNumber)}`;
@@ -728,6 +896,19 @@ export default Alchemy.Stack(
               },
             },
           });
+          // Default deny plus AlleyOop :8787 in and DNS out (egress.ts).
+          for (const policy of relayauthNetworkPolicies({ publicJwksIngress: Boolean(relayauthConfig.baseUrl), relayfileConsumer: Boolean(i.relayfile) })) {
+            yield* Kubernetes.Manifest(`relayauth-netpol-${policy.metadata.name}`, {
+              cluster,
+              manifest: {
+                ...policy,
+                metadata: {
+                  ...policy.metadata,
+                  annotations: { "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof },
+                },
+              },
+            });
+          }
           if (relayauthConfig.baseUrl)
             yield* Kubernetes.Manifest("relayauth-certificate", {
               cluster,
@@ -799,6 +980,22 @@ export default Alchemy.Stack(
               },
             },
           });
+          // Default deny plus the exact egress the services use (egress.ts). Redis
+          // and Cloud SQL both take their private IPs from the PSA range.
+          if (BOOTSTRAP_COMMAND !== "destroy")
+            assertInClusterJwks("bulls96.relayauthJwksUrl", i.bulls96!.relayauthJwksUrl);
+          for (const policy of bulls96NetworkPolicies({ redisRange: PSA_CIDR, cloudSqlRange: PSA_CIDR })) {
+            yield* Kubernetes.Manifest(`netpol-${policy.metadata.name}`, {
+              cluster,
+              manifest: {
+                ...policy,
+                metadata: {
+                  ...policy.metadata,
+                  annotations: { "96bulls.agentworkforce.dev/reachability": kubernetesReachability!.proof },
+                },
+              },
+            });
+          }
           // The poster output is an explicit dependency: neither this IAM
           // edge nor the proxy deployment can apply before Cloud SQL is
           // confirmed RUNNABLE with the exact private-only body.
@@ -852,8 +1049,15 @@ export default Alchemy.Stack(
               region: i.region,
               // Resolve the IAM member as part of the repository value so
               // Helm cannot create image-pulling pods before the reader edge.
+              // The service grants and write scopes ride the same value, so pods
+              // cannot roll onto an identity before it can read and write.
               imageRepository: Output.map(
-                Output.all(images.registryUri, nodeArtifactRegistryReader.role),
+                Output.all(
+                  images.registryUri,
+                  nodeArtifactRegistryReader.role,
+                  lockerWriteScopes.bucket,
+                  Output.all(...serviceBindings.map((b) => b.role)),
+                ),
                 ([registry]) => `${registry}/96bulls-services`,
               ),
               cloudSqlConnectionName: dataPlane.sqlPoster.connectionName,
@@ -862,7 +1066,7 @@ export default Alchemy.Stack(
               redisCaPem: dataPlane.redis.caPem,
               pubsubTopic: eventsTopicName,
               pubsubSubscription: eventsSubscriptionName,
-              workloadIdentityEmail: runtimeEmail,
+              workloadIdentityEmails: { worker: workerEmail, alleyoop: alleyoopEmail },
             }, BOOTSTRAP_COMMAND),
           });
           return release.releaseName;
@@ -877,6 +1081,8 @@ export default Alchemy.Stack(
       locker: { bucket: locker.bucketName },
       runtimeSecret: runtimeSecret.name,
       runtimeIdentity: runtimeIdentity.email,
+      workerIdentity: workerIdentity.email,
+      alleyoopIdentity: alleyoopIdentity.email,
       imageRegistry: images.registryUri,
       managedDataPlane: dataPlane,
       charts: {

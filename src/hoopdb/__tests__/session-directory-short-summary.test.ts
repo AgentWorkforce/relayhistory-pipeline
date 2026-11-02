@@ -63,8 +63,13 @@ const EXPAND_UP = read(`supabase/migrations/${EXPAND}`);
 const EXPAND_DOWN = read(
   `supabase/rollbacks/${EXPAND.replace(/\.sql$/, ".down.sql")}`,
 );
+// 20261101050000 (the list RPC) grants the Worker EXECUTE too, so a rollback past G6
+// unwinds it first and reapplies it last.
+const LIST = "20261101050000_session_directory_list.sql";
+const LIST_UP = read(`supabase/migrations/${LIST}`);
+const LIST_DOWN = read(`supabase/rollbacks/${LIST.replace(/\.sql$/, ".down.sql")}`);
 // The session briefs migration uses the expand phase's Worker scope and G6's Worker role.
-const BRIEFS = "20261101030000_session_briefs.sql";
+const BRIEFS = "20261102000000_session_briefs.sql";
 const BRIEFS_UP = read(`supabase/migrations/${BRIEFS}`);
 const BRIEFS_DOWN = read(
   `supabase/rollbacks/${BRIEFS.replace(/\.sql$/, ".down.sql")}`,
@@ -1356,6 +1361,7 @@ describe("short_summary deletion propagation", () => {
           harness: "codex",
           sessionId: "s-1",
           machineId: machine,
+          manifestKey: `key/${machine}`,
         } as never,
         { orgId: "org-a" } as never,
       );
@@ -2280,8 +2286,9 @@ describe("short_summary rollback", () => {
     const db = await database();
     await insertRow(db);
     await summarize(db, KEY, "pelican rollback check");
-    // Reverse migration order: briefs and the expand phase depend on G6's role.
+    // Reverse migration order: briefs, then the list and expand phases, depend on G6's role.
     await db.exec(BRIEFS_DOWN);
+    await db.exec(LIST_DOWN);
     await db.exec(EXPAND_DOWN);
     await db.exec(DOWN);
     const columns = await db.query(
@@ -2321,6 +2328,7 @@ describe("short_summary rollback", () => {
 
     await db.exec(UP);
     await db.exec(EXPAND_UP);
+    await db.exec(LIST_UP);
     await db.exec(BRIEFS_UP);
     await db.query(
       "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
@@ -2393,11 +2401,13 @@ describe("Worker role validation in two phases", () => {
          to_regprocedure($1)::text,
          'sessions.session_directory_pointers(text,text,text)',
          'sessions.session_directory_readiness()',
+         'sessions.list_session_directory(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
+         'sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)',
          'sessions.session_brief(text,text,text)']) AS fn ORDER BY 1`,
       [RPC_SIGNATURE],
     );
     expect(fns.rows).toEqual(approved.rows);
-    expect(fns.rows).toHaveLength(4);
+    expect(fns.rows).toHaveLength(6);
   });
 
   test("phase 2 ignores PUBLIC-derived EXECUTE: only aclitems naming the role count", async () => {

@@ -24,6 +24,11 @@
  *     Costas writes one;
  *   - task_title, agent_name and short_summary are not in session_index and are kept
  *     as already projected (short_summary is written only by writeShortSummary);
+ *   - the catalog dimensions (agent names, catalog models, project key, relationships)
+ *     are written only by writeDirectoryCatalog. Database triggers (20261101050000) keep
+ *     every companion's last_activity_at equal to the row's in the row's own transaction,
+ *     and on tombstone or delete remove the session's agent rows and its edges as parent
+ *     and as child; the tombstone trigger clears the catalog columns.
  *   - a model-written brief title (sessions.session_briefs, src/session-brief) wins over
  *     the latest pointer's title while the brief exists. Deleting a pointer deletes the
  *     brief (trigger), so the pointer title returns on the next projection.

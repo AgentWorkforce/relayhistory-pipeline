@@ -14,7 +14,7 @@ files run is the in-process PGlite inside `packages/pipeline` vitest.
 | `20261025000300_upsert_keep_on_null.sql`             | relayhistory-cloud PR #185 (`fe89fc3`)                                               |
 | `20261030010000_session_directory.sql`               | 96BullSessions decision 0002 logical-session metadata contract                       |
 | `20261030020000_session_directory_short_summary.sql` | 96BullSessions G6: bounded, scrubbed `short_summary` and the tenant-bound search RPC |
-| `20261101030000_session_briefs.sql`                 | 96BullSessions: model-written session briefs (neon-retire), the debounced wakeups and the Worker brief RPC |
+| `20261102000000_session_briefs.sql`                 | 96BullSessions: model-written session briefs (neon-retire), the debounced wakeups and the Worker brief RPC |
 | `../tests/supabase_shim.sql`                         | relayhistory-cloud PR #171, merge commit `51c313fda3c4288cf75f9927c4004fb39b6cd2ee`  |
 
 Repository: https://github.com/AgentWorkforce/relayhistory-cloud. The `000000` to

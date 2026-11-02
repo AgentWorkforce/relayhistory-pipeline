@@ -770,7 +770,8 @@ export interface Bulls96ReleaseOutputs {
   redisCaPem: unknown;
   pubsubTopic: unknown;
   pubsubSubscription: unknown;
-  workloadIdentityEmail: string;
+  /** One Google service account per Kubernetes service account (bucket-iam.ts). */
+  workloadIdentityEmails: { worker: string; alleyoop: string };
 }
 
 const GSA_EMAIL =
@@ -909,9 +910,18 @@ export function bulls96ReleaseValues(
     throw new Error(
       "96bulls: GCP release values require an explicit dedicated HoopDb runtime role and login mode. Nothing was created.",
     );
-  if (!GSA_EMAIL.test(managed.workloadIdentityEmail))
+  const emails = managed.workloadIdentityEmails as
+    | { worker?: unknown; alleyoop?: unknown }
+    | undefined;
+  // Plain strings: both are derived from the stage, never deferred Outputs.
+  for (const email of [emails?.worker, emails?.alleyoop])
+    if (typeof email !== "string" || !GSA_EMAIL.test(email))
+      throw new Error(
+        "96bulls: workload identity email is not a service-account email. Nothing was created.",
+      );
+  if (emails!.worker === emails!.alleyoop)
     throw new Error(
-      "96bulls: workload identity email is not a service-account email. Nothing was created.",
+      "96bulls: the worker and AlleyOop must not share a workload identity. Nothing was created.",
     );
   for (const [label, value] of [
     ["bucket", managed.bucket],
@@ -938,9 +948,9 @@ export function bulls96ReleaseValues(
   requireRelayauthJwksUrl("bulls96.relayauthJwksUrl", i.relayauthJwksUrl);
   requireRelayauthIssuer("bulls96.relayauthIssuer", i.relayauthIssuer);
   requireRelayhistoryOrigin("bulls96.relayhistoryOrigin", i.relayhistoryOrigin);
-  const identity = {
-    "iam.gke.io/gcp-service-account": managed.workloadIdentityEmail,
-  };
+  const identity = (email: unknown) => ({
+    "iam.gke.io/gcp-service-account": email as string,
+  });
   const dataEnv = () => [
     { name: "LOCKER_PROVIDER", value: "gcs" },
     { name: "PIPELINE_RAW_PROVIDER", value: "gcs" },
@@ -996,7 +1006,7 @@ export function bulls96ReleaseValues(
         existingSecret: i.existingSecretName,
         key: "SUMMARY_MASTER_KEYS",
       },
-      serviceAccount: { annotations: { ...identity } },
+      serviceAccount: { annotations: identity(emails!.worker) },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
       // Cloud SQL has an explicit mode, externally bootstrapped roles and runtime role.
       extraEnv: [
@@ -1012,7 +1022,7 @@ export function bulls96ReleaseValues(
       hoopdb: hoopdb(),
       locker: locker(),
       auth: { jwksUrl: i.relayauthJwksUrl, issuer: i.relayauthIssuer },
-      serviceAccount: { annotations: { ...identity } },
+      serviceAccount: { annotations: identity(emails!.alleyoop) },
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
       extraEnv: [
         ...dataEnv(),

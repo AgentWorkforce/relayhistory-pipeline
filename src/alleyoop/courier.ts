@@ -9,6 +9,7 @@
  * Runs once (`COURIER_ONCE=1`) or on an interval. Idempotent: the state file
  * records what was uploaded; a rerun uploads only new bytes.
  */
+import { layoutComponent } from "../shared/layout-component.ts";
 import { createHash } from "node:crypto";
 import {
   mkdir,
@@ -299,11 +300,8 @@ export async function readSessions(
 }
 
 const isoDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);
-const component = (s: string) =>
-  s
-    .replace(/[^A-Za-z0-9._-]/g, "_")
-    .slice(0, 128)
-    .replace(/^\./, "_");
+// The same map as the Neon export (src/shared/layout-component.ts).
+const component = layoutComponent;
 
 /** The next contiguous range of whole records after `from`, capped per chunk. */
 async function readNewRecords(

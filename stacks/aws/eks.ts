@@ -18,6 +18,7 @@ import * as AWS from "@alchemy.run/aws";
 import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
 import { ingressStage } from "./ingress.ts";
+import { PIPPEN_SANDBOX_TAG, PIPPEN_WORKLOAD_ROLE_PATH, autoModeRoleProps } from "./pippen-sandbox.ts";
 import { resolveTenantOrgs, tenantWiring } from "./tenants.ts";
 import { RELAYAUTH_TLS_CLIENT_LABEL, RELAYAUTH_TLS_NAMESPACE, RELAYAUTH_TLS_PORT, RELAYAUTH_TLS_SERVICE, RELAYAUTH_TLS_URL } from "./relayauth-tls.ts";
 import { relayauthStage } from "./relayauth.ts";
@@ -36,6 +37,7 @@ import {
   podRoles,
   telemetryPolicy,
   type HoopDbBackend,
+  type PodRoleSpec,
 } from "./hardening.ts";
 import {
   CNPG_NAMESPACE,
@@ -149,6 +151,13 @@ export interface EksStageInputs {
   lockerKmsKeyArn: string;
   /** Sandbox stages: every role we create carries this permissions boundary and the bounded tag. */
   permissionsBoundaryArn?: string;
+  /**
+   * Pippen Tools sandbox (inputs.pippenSandbox; pippen-sandbox.ts): every role under
+   * /pippen/workload/ (the Auto Mode cluster and node roles declared here rather than
+   * by Alchemy), and the load balancer and EBS volumes Auto Mode creates tagged
+   * pippen:sandbox=true. Needs permissionsBoundaryArn.
+   */
+  pippenSandbox?: boolean;
   /** Public hostname for the ingest (Cloudflare DNS). Omit to keep the ingest cluster-internal. */
   ingress?: { hostname: string; cloudflareZoneId: string; zoneDomain: string; cloudflareTokenSecret: string; certValidation?: { name: string; value: string } } & IngestExposureInput;
   tags: Record<string, string>;
@@ -268,9 +277,10 @@ export function eksChartValues(
 }
 
 /** The pre-split shared role, byte for byte, so keeping it is a no-op on a stage that has it. */
-export function legacyPodsRoleProps(i: Pick<EksStageInputs, "stage" | "lockerBucketArn" | "lockerKmsKeyArn" | "permissionsBoundaryArn" | "tags">) {
+export function legacyPodsRoleProps(i: Pick<EksStageInputs, "stage" | "lockerBucketArn" | "lockerKmsKeyArn" | "permissionsBoundaryArn" | "pippenSandbox" | "tags">) {
   return {
     roleName: `96bulls-${i.stage}-pods`,
+    ...(i.pippenSandbox ? { path: PIPPEN_WORKLOAD_ROLE_PATH } : {}),
     description: `96bulls ${i.stage}: worker and ingest pods (EKS Pod Identity)`,
     assumeRolePolicyDocument: {
       Version: "2012-10-17" as const,
@@ -292,6 +302,24 @@ export function legacyPodsRoleProps(i: Pick<EksStageInputs, "stage" | "lockerBuc
   };
 }
 
+/** One Pod Identity role (hardening.ts `podRoles`), as the IAM Role props. */
+export function podRoleProps(i: Pick<EksStageInputs, "stage" | "accountId" | "permissionsBoundaryArn" | "pippenSandbox" | "tags">, r: PodRoleSpec, clusterArn: string) {
+  return {
+    roleName: `96bulls-${i.stage}-${r.id}`,
+    ...(i.pippenSandbox ? { path: PIPPEN_WORKLOAD_ROLE_PATH } : {}),
+    description: `96bulls ${i.stage}: ${r.description} (Pod Identity ${NAMESPACE}/${r.serviceAccount})`,
+    assumeRolePolicyDocument: podIdentityTrust(i.accountId, clusterArn),
+    inlinePolicies: { [r.policyName]: r.policy as never },
+    maxSessionDuration: "1 hour" as const,
+    ...(i.permissionsBoundaryArn ? { permissionsBoundary: i.permissionsBoundaryArn } : {}),
+    tags: {
+      ...i.tags,
+      "96bulls:service-account": `${NAMESPACE}/${r.serviceAccount}`,
+      ...(i.permissionsBoundaryArn ? { "96bulls:bounded": "true" } : {}),
+    },
+  };
+}
+
 export const eksStage = (i: EksStageInputs) =>
   Effect.gen(function* () {
     // Refuse before declaring anything billable.
@@ -308,6 +336,8 @@ export const eksStage = (i: EksStageInputs) =>
     if (i.relaycast) assertRelaycastInputs(i.relaycast);
     const sessionDirectory = Boolean(i.sessionDirectory?.enabled);
     if (sessionDirectory) assertSessionDirectoryPreconditions({ hoopdb: backend, relayauthTls: Boolean(i.relayauth) });
+    if (i.pippenSandbox && !i.permissionsBoundaryArn)
+      throw new Error("96bulls: a Pippen sandbox stage needs the sandbox permissions boundary on every role. Nothing was created.");
     const network = yield* AWS.EC2.Network("network", {
       cidrBlock: VPC_CIDR,
       availabilityZones: 2,
@@ -323,10 +353,21 @@ export const eksStage = (i: EksStageInputs) =>
       retention: CONTROL_PLANE_LOG_RETENTION,
       tags: i.tags,
     });
+    // Pippen sandbox: the Auto Mode roles under /pippen/workload/ with the boundary. Elsewhere
+    // Alchemy creates and owns them (path /, no boundary), exactly as before.
+    const autoModeRoles = i.pippenSandbox
+      ? yield* Effect.gen(function* () {
+          const props = autoModeRoleProps({ stage: i.stage, permissionsBoundaryArn: i.permissionsBoundaryArn!, tags: i.tags });
+          return { cluster: yield* AWS.IAM.Role("cluster-role", props.cluster), node: yield* AWS.IAM.Role("node-role", props.node) };
+        })
+      : undefined;
     // Endpoint access and logging are UpdateClusterConfig changes: applied in place, no replacement.
     const cluster = yield* AWS.EKS.Cluster("cluster", {
       clusterName,
       compute: "auto",
+      ...(autoModeRoles
+        ? { roleArn: autoModeRoles.cluster.roleArn as unknown as string, computeConfig: { nodeRoleArn: autoModeRoles.node.roleArn as unknown as string } }
+        : {}),
       resourcesVpcConfig: { subnetIds: network.privateSubnetIds, ...endpointAccess },
       logging: controlPlaneLogging(),
       // Protection only for production; dev and sandboxes must tear down cleanly with `96bulls down`.
@@ -340,19 +381,7 @@ export const eksStage = (i: EksStageInputs) =>
     const keyBase = tenantWiring(resolveTenantOrgs(i)).keyBase;
     const refs = { lockerBucketArn: i.lockerBucketArn, lockerKmsKeyArn: i.lockerKmsKeyArn, lockerRegion: i.lockerRegion, ...(keyBase ? { keyBase } : {}) };
     for (const r of podRoles(refs)) {
-      const role = yield* AWS.IAM.Role(`${r.id}-role`, {
-        roleName: `96bulls-${i.stage}-${r.id}`,
-        description: `96bulls ${i.stage}: ${r.description} (Pod Identity ${NAMESPACE}/${r.serviceAccount})`,
-        assumeRolePolicyDocument: podIdentityTrust(i.accountId, cluster.clusterArn as unknown as string),
-        inlinePolicies: { [r.policyName]: r.policy as never },
-        maxSessionDuration: "1 hour",
-        ...(i.permissionsBoundaryArn ? { permissionsBoundary: i.permissionsBoundaryArn } : {}),
-        tags: {
-          ...i.tags,
-          "96bulls:service-account": `${NAMESPACE}/${r.serviceAccount}`,
-          ...(i.permissionsBoundaryArn ? { "96bulls:bounded": "true" } : {}),
-        },
-      });
+      const role = yield* AWS.IAM.Role(`${r.id}-role`, podRoleProps(i, r, cluster.clusterArn as unknown as string));
       // Logical ids kept from the shared-role layout so the existing associations update in place.
       const associationId = r.serviceAccount === SERVICE_ACCOUNTS.otel ? "pod-identity-otel" : `pod-identity-${r.serviceAccount}`;
       yield* AWS.EKS.PodIdentityAssociation(associationId, {
@@ -366,7 +395,7 @@ export const eksStage = (i: EksStageInputs) =>
 
     // Encrypted gp3 for every in-cluster volume (RelayAuth, HoopDb, Relaycast).
     const inClusterVolumes = Boolean(i.relayauth) || backend === "cnpg" || Boolean(i.relaycast) || sandbox;
-    if (inClusterVolumes) yield* Kubernetes.Manifest("storageclass-gp3", { cluster: cluster as never, manifest: storageClassManifest(i.purgeOnDestroy ? "Delete" : "Retain") });
+    if (inClusterVolumes) yield* Kubernetes.Manifest("storageclass-gp3", { cluster: cluster as never, manifest: storageClassManifest(i.purgeOnDestroy ? "Delete" : "Retain", i.pippenSandbox ? PIPPEN_SANDBOX_TAG : undefined) });
 
     // Rollback window for the IAM split: the old shared role stays (attached to nothing) until the
     // per-SA roles are verified, and goes in a later, separate apply that drops `legacyPodsRole`.
@@ -449,6 +478,7 @@ export const eksStage = (i: EksStageInputs) =>
           cloudflareTokenSecret: i.ingress.cloudflareTokenSecret,
           ...(i.ingress.certValidation ? { certValidation: i.ingress.certValidation } : {}),
           exposure: { ...(i.ingress.scheme ? { scheme: i.ingress.scheme } : {}), ...(i.ingress.rateLimitPer5Min !== undefined ? { rateLimitPer5Min: i.ingress.rateLimitPer5Min } : {}) },
+          ...(i.pippenSandbox ? { pippenSandbox: true } : {}),
           tags: i.tags,
         })
       : undefined;

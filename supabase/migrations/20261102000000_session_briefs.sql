@@ -29,7 +29,7 @@
 -- clears the short summary: the brief may describe the deleted machine's content.
 --
 -- Code only; nothing here is applied by this repository. Down path:
--- supabase/rollbacks/20261101030000_session_briefs.down.sql.
+-- supabase/rollbacks/20261102000000_session_briefs.down.sql.
 
 CREATE TABLE sessions.session_briefs (
   org_id text NOT NULL,
@@ -124,6 +124,8 @@ CREATE TABLE sessions.session_brief_attempts (
 
 ALTER TABLE sessions.session_briefs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.session_brief_wakeups ENABLE ROW LEVEL SECURITY;
+-- The global daily spend ceiling sums one day's attempts across every org.
+CREATE INDEX session_brief_attempts_day_idx ON sessions.session_brief_attempts (day);
 ALTER TABLE sessions.session_brief_attempts ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.session_briefs, sessions.session_brief_wakeups,
   sessions.session_brief_attempts FROM PUBLIC, anon, authenticated;

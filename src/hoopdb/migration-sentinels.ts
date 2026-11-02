@@ -77,6 +77,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.session_directory_resurrection_fences",
     sql: relation("sessions.session_directory_resurrection_fences"),
   },
+  "upstream:20261101050000_session_directory_list.sql": {
+    evidence: "table sessions.session_directory_agents",
+    sql: relation("sessions.session_directory_agents"),
+  },
   "upstream:20261101000000_migration_ingest_audit_base_read.sql": {
     evidence: "table sessions.migration_base_read_uses",
     sql: relation("sessions.migration_base_read_uses"),
@@ -85,7 +89,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.claimless_window_activations",
     sql: relation("sessions.claimless_window_activations"),
   },
-  "upstream:20261101030000_session_briefs.sql": {
+  "upstream:20261102000000_session_briefs.sql": {
     evidence: "table sessions.session_briefs",
     sql: relation("sessions.session_briefs"),
   },

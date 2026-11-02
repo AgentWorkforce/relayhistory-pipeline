@@ -68,11 +68,194 @@ reuse is not permitted. The committed AWS proof minter and the self-hosted
 verifier cannot copy the old claimless request safely.
 
 The machine claim fences AlleyOop HTTP writes only. The worker and AlleyOop
-pods also access GCS directly through their shared Workload Identity runtime
-service account; those bucket-direct operations do not traverse the HTTP
-machine gate. Their boundary is the vended Google credential and its
-bucket-level `roles/storage.objectUser` grant, not `meta.machineId`. Route tests
-therefore prove no bucket-direct isolation. The reviewed RelayAuth #113
+pods also access GCS directly through Workload Identity; those bucket-direct
+operations do not traverse the HTTP machine gate, and their boundary is the
+vended Google credential, not `meta.machineId`. Route tests therefore prove no
+bucket-direct isolation.
+
+### Workload egress restriction
+
+The `96bulls` namespace is default-deny in both directions; GKE Dataplane V2
+enforces it (`stacks/gcp/egress.ts`). Only these flows are allowed:
+
+| From | To | Port |
+| --- | --- | --- |
+| every pod | kube-dns / NodeLocal DNSCache (`kube-system`, `169.254.20.10`) | 53 UDP/TCP |
+| every pod | GKE metadata server (`169.254.169.254`, `169.254.169.252`) | 80, 988 |
+| every pod | `private.googleapis.com` (`199.36.153.8/30`) | 443 |
+| worker, AlleyOop | `cloud-sql-proxy` pods | 5432 |
+| worker, AlleyOop | Memorystore Redis (PSA range `10.80.0.0/20`) | 6378 |
+| AlleyOop | RelayAuth pods in `relayauth` | 8787 |
+| `cloud-sql-proxy` | Cloud SQL private IP (PSA range) | 3307 |
+| worker, AlleyOop → `cloud-sql-proxy` | ingress | 5432 |
+
+A private Cloud DNS zone for `googleapis.com`, bound to the stage VPC, maps
+`*.googleapis.com` to `private.googleapis.com`. With Private Google Access on
+the subnet, every Google API call stays on the private VIPs, so no rule allows
+the public internet: no arbitrary HTTPS, no external DNS resolver, and no other
+namespace. Kubelet probes and `kubectl port-forward` originate on the node and
+are not subject to pod policy.
+
+The `relayauth` namespace gets the same default deny. RelayAuth is
+self-contained: SQLite on its own PVC, file-mounted secrets, no Google identity
+and no outbound calls. Its only egress is DNS, and its only ingress is `:8787`
+from the 96Bulls AlleyOop pods, plus the `relayfile` namespace when the
+Relayfile add-on is enabled, since it verifies tokens against this JWKS. When a
+public JWKS Ingress is configured
+(`relayauth.baseUrl`), `:8787` is also admitted from the GCE load-balancer and
+health-check ranges (`130.211.0.0/22`, `35.191.0.0/16`), and nothing else.
+
+Live evidence, 2026-11-01, deployed from merge `04410e5` (3 creates, nothing
+else changed). Probe pods in another namespace (`default`) and in `relayauth`:
+
+| Check | before | after |
+| --- | --- | --- |
+| `default` pod → `relayauth:8787` | open | blocked |
+| `relayauth` pod → `https://example.com`, TCP `8.8.8.8:443` | 200 / open | blocked / blocked |
+| AlleyOop → `relayauth:8787` (JWKS) | open | open (the E2E verifies tokens) |
+
+RelayAuth stayed ready with zero restarts. The machine-bound E2E passed at
+`04410e5` (machine `proof-gcp-mvyicx6wa9e27b-a`): claimless and mismatch
+assertions were refused with 403 `machine_claim_refused`, two encrypted
+summaries were written, zero dead letters, and trace `indexed`. Other
+namespaces (`default` here) keep their own unrestricted egress; only `96bulls`
+and `relayauth` are fenced. Applying the policy requires `bulls96.relayauthJwksUrl` to be the
+in-cluster RelayAuth service, the only JWKS destination it allows; a public JWKS
+URL is refused rather than silently cut off. Deliberately not allowed: in-cluster
+ingress to AlleyOop (nothing calls it in-cluster and it has no Ingress or load
+balancer), and per-API Google scoping. `private.googleapis.com` serves every API;
+narrowing that needs VPC Service Controls with `restricted.googleapis.com`, which
+is a separate lane. Meanwhile IAM bounds what each identity can do.
+
+Live evidence, 2026-11-01, GCP conformance. The infrastructure was deployed from
+merge `5c512be`: 13 creates (the DNS API, the private zone, its A and wildcard
+CNAME records, and 9 policies), with no delete or replace. Probe pods with the
+real worker and AlleyOop labels and Kubernetes service accounts ran in
+`96bulls`:
+
+| Check | before | after (worker / AlleyOop) |
+| --- | --- | --- |
+| `storage.googleapis.com` resolves to | public Google IPs | `199.36.153.8`–`.11` |
+| GCS list with the pod's Workload Identity token | 200 | 200 / 200 |
+| `https://example.com` | 200 | blocked / blocked |
+| `https://1.1.1.1`, TCP `8.8.8.8:443` | reachable | blocked / blocked |
+| DNS query to `8.8.8.8` | answered | blocked / blocked |
+| Kubernetes API `:443` | open | blocked / blocked |
+| `cloud-sql-proxy:5432`, Redis `:6378` | open | open / open |
+| RelayAuth `:8787` | open | blocked / open |
+
+Every 96Bulls pod stayed ready, with zero restarts. The machine-bound end-to-end
+verifier then passed with egress restricted. It ran from `6713b19`, which
+differs from `5c512be` only in AWS stack files.
+- claimless and mismatched-machine assertions: 403 `machine_claim_refused`, with
+  no HoopDB or GCS change;
+- matching machine `proof-gcp-mvyfucaa36b947-a`: chunk and manifest landed, two
+  encrypted summaries were written, zero dead letters, trace `indexed`.
+
+### Backup and restore drill
+
+The protection in place on GCP conformance, as read from the live resources on
+2026-11-02:
+
+- **Cloud SQL `awf-conformance-postgres`:** automated daily backups at 13:00Z,
+  7 retained (the latest automated backup at the time succeeded),
+  point-in-time recovery on, 7 days of transaction logs in Cloud Storage.
+- **Locker bucket:** object versioning on and 7-day soft delete, with uniform
+  bucket-level access.
+
+The drill, 2026-11-02:
+
+1. **Database point-in-time restore.** `gcloud sql instances clone` of the
+   live instance at `2026-11-02T00:28:00Z` into `awf-conformance-pg-drill`
+   finished in 9.5 minutes, RUNNABLE on a private IP only. The runner opened
+   a Cloud SQL proxy to the clone and a port-forward to the live proxy, using
+   the migration credential read in memory from the `96bulls-runtime` Secret,
+   then ran the same query on both. The result was **identical**: 8
+   `session_index` rows, 57 `pipeline_events`, 16 `session_summaries`, 18
+   ledger rows, newest session `2026-11-02 00:15:48.488+00`, and the proof
+   session for machine `proof-gcp-mvyicx6wa9e27b-a` present. The clone was then
+   deleted, leaving only the live instance.
+2. **Object restore.** A random 64 KiB object under `drill-restore/` (a prefix
+   the pipeline never reads) was written and deleted; it then answered 404, and
+   its prior generation was still listed. It was restored by copying that
+   generation back, and its SHA-256 matched the original. Every version was
+   then removed (`drill versions left: 0`).
+
+Gaps found, now closed by `stacks/gcp/data-retention.ts`. Two actions run on
+every apply: `EnsureCloudSqlProtection` right after the Cloud SQL poster, and
+`EnsureLockerLifecycle` on every stage's locker. Each reads first, writes only
+on a difference, never writes after the apply lease ends, and reads back:
+- Deletion protection was off on the Cloud SQL instance, and deleting the
+  instance also deleted its automated backups. Now `deletionProtectionEnabled`
+  and `retainBackupsOnDelete` are both on.
+- The locker had no lifecycle rule, so noncurrent versions were kept
+  indefinitely. Now there is exactly one rule: delete a noncurrent version 30
+  days after it became noncurrent. Live objects are never touched, and the 7-day
+  soft delete remains. Thirty days bounds both storage and how long an erased
+  or overwritten transcript lingers.
+
+Live, 2026-11-02, merge `944992b`: the plan had no create or delete, only the
+two actions. `locker-lifecycle` and `cloud-sql-protection` both ran, and
+`gcloud` read back `deletionProtectionEnabled: true`, `retainBackupsOnDelete:
+true` and point-in-time recovery with 7 retained backups, with the instance
+RUNNABLE and not restarted. The locker's `lifecycle_config` is exactly
+`Delete` on `isLive: false, daysSinceNoncurrentTime: 30`, with versioning and
+7-day soft delete still on. A live delete attempt was deliberately not made:
+Cloud SQL has no dry run for deleting an instance, so the read-back is the
+evidence.
+
+### Per-component bucket identities
+
+Each component now has its own Google service account, scoped like the AWS
+roles in `stacks/aws/hardening.ts` (`stacks/gcp/bucket-iam.ts`):
+
+| Google service account | Kubernetes service account | Locker bucket | Other |
+| --- | --- | --- | --- |
+| `<stage>-alleyoop` | `96bulls/bulls96-alleyoop` | `objectViewer`; `objectUser` only where the name is under `v1/` and ends `/manifest.json` (live and parked) or `.zst` (raw chunks) | none |
+| `<stage>-worker` | `96bulls/bulls96-worker` (pods and Jobs) | `objectViewer`; `objectUser` only for `v1/…/summary/{short,long}.json.enc` | Pub/Sub publisher and subscriber on the events topic and subscription |
+| `<stage>-runtime` | `96bulls/cloud-sql-proxy` | none | `roles/cloudsql.client` |
+
+The write edge is `objectUser`, because a manifest compare-and-swap and
+parked-session cleanup overwrite or delete, and Cloud Storage requires
+`storage.objects.delete` for both. `objects.list` is evaluated against the
+bucket, so the conditional edge never widens listing. Alchemy's `IAM.Member`
+manages only unconditional edges, so the stack reconciles the two conditional
+edges against the bucket's version-3 policy under its etag, through the
+`EnsureLockerWriteScopes` action. It touches only bindings whose condition
+title starts with `96bulls-locker-write-`. A destroy leaves those edges on the
+bucket, and they are removed with it.
+
+This is component isolation, not machine isolation. AlleyOop and the workers
+serve every machine by design, so no per-machine prefix scope applies to them.
+Machine binding stays at the AlleyOop HTTP gate, which is the only path a
+courier has to the bucket.
+
+Live evidence, 2026-11-01, GCP conformance, merge `63788ff` deployed as
+`df13a37`. The first apply failed closed: `setIamPolicy` returned 400 for a
+service account created a second earlier, so no pod changed identity and
+nothing was deleted. The retry fix in `df13a37` then applied cleanly. The
+plan's only creates and deletes were the reviewed IAM set: 8 creates and 5
+deletes, with no bucket, Cloud SQL, Redis or GKE change. All four 96Bulls
+deployments were restarted onto their new identities. Each Kubernetes service
+account then ran a short-lived probe pod that called the GCS JSON API with its
+own Workload Identity token, on a dedicated `v1/ws=proof-iam/…` prefix.
+
+| Identity | list / read | own writes | foreign or unscoped writes |
+| --- | --- | --- | --- |
+| before: all three ran as `<stage>-runtime` | 200 | 200 / 204 | **200** (proxy and worker could write manifests, chunks, anything) |
+| `cloud-sql-proxy` → `<stage>-runtime` | 403 | 403 | 403 |
+| `bulls96-alleyoop` → `<stage>-alleyoop` | 200 | manifest, overwrite, parked, `.zst` chunk 200; deletes 204 | summary, `other.txt`, outside `v1/`: 403 |
+| `bulls96-worker` → `<stage>-worker` | 200 | short and long summaries, overwrite 200; deletes 204 | manifest write and delete, chunk, outside `v1/`: 403 |
+
+Every probe object and version was removed afterwards (`leftover-objects 0`).
+The machine-bound end-to-end verifier then passed again at `df13a37`:
+- claimless assertion: issued without a claim, refused by AlleyOop with 403
+  `machine_claim_refused`, no HoopDB or GCS change;
+- mismatched machine: refused with 403 `machine_claim_refused`, no change;
+- matching machine `proof-gcp-mvybdawo8615d7-a`: chunk and manifest landed,
+  two encrypted summaries were written by the worker identity, index,
+  directory and 6 event rows, all five required stages `ok`, zero dead
+  letters, and trace verdict `indexed`. The reviewed RelayAuth #113
 image/chart and the services image containing this change are pinned in
 `versions.lock.json`.
 
@@ -657,9 +840,10 @@ first resource. Resource order after that is: the listed Google APIs with
 `/20` Private Service Access range, the service-networking connection, regional
 standard GKE with a one-node default pool in `us-central1-a`, private nodes and
 a private endpoint, the versioned GCS bucket, the empty Secret Manager
-container, Artifact Registry, the runtime service account, Workload Identity for
-`bulls96-worker` and `bulls96-alleyoop`, `roles/storage.objectUser`, and
-`roles/cloudsql.client`. With `managedDataPlane.provision`, Memorystore Redis
+container, Artifact Registry, the per-component service accounts and their
+Workload Identity edges for `bulls96-worker`, `bulls96-alleyoop` and
+`cloud-sql-proxy`, the per-component bucket grants above, and
+`roles/cloudsql.client` for the proxy identity. With `managedDataPlane.provision`, Memorystore Redis
 7.2 is created with AUTH off and TLS server authentication, and Pub/Sub is
 created with the dead-letter service agent. The Cloud SQL body is an Action
 input; `ensurePrivateCloudSql` runs only during an approved apply after the PSA
@@ -691,7 +875,7 @@ Verify, only after an approved apply and a wired poster:
 Teardown, only after that apply, in this order:
 
 1. Delete the 96Bulls Helm release and the Cloud SQL proxy.
-2. Delete the Cloud SQL instance before the network. The poster is not an Alchemy resource, so `alchemy destroy` will not delete it until a later change puts it in the graph. Delete that instance by the prepared name if it exists.
+2. Delete the Cloud SQL instance before the network. The poster is not an Alchemy resource, so `alchemy destroy` will not delete it until a later change puts it in the graph. Delete that instance by the prepared name if it exists. The stack keeps deletion protection on (`stacks/gcp/data-retention.ts`), so first run `gcloud sql instances patch <name> --no-deletion-protection`, a deliberate step. `retainBackupsOnDelete` keeps its backups after the delete; remove them explicitly if the teardown must leave nothing.
 3. Empty the versioned GCS bucket. `forceDestroy` is false, so destroy fails while objects remain.
 4. `bunx alchemy destroy --config stacks/gcp/alchemy.gcp.run.ts --stage "$STAGE" --no-input` with the same confirm env. Let Alchemy delete the resources it tracks; do not pre-delete Redis, Pub/Sub, GKE, networking, the bucket, Artifact Registry, Secret Manager, or the runtime service account and leave stale state behind. APIs stay enabled because the stack sets `disableOnDestroy: false`.
 5. Read-only proof of empty: `gcloud sql instances list`, `gcloud redis instances list --region=us-central1`, `gcloud container clusters list`, `gcloud compute networks list`, and `gcloud storage ls` against `$PROJECT` return no lane resources. On this dedicated project, disable the listed APIs only after those checks are empty.

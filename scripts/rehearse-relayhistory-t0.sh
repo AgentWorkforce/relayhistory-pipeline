@@ -10,8 +10,8 @@
 #   3. migration:verify --mode=schema, migration:copy mirror (copy set),
 #      migration:copy backfill (every other table), migration:verify --mode=full
 #
-# Usage: scripts/rehearse-relayhistory-t0.sh [relayhistory-cloud ref] [96BullSessions ref]
-#   BULLS_TARBALL=/path/to.tar  use a local 96BullSessions tree (git archive) instead of cloning
+# Usage: scripts/rehearse-relayhistory-t0.sh [relayhistory-cloud ref] [sessions-pipeline ref]
+#   BULLS_TARBALL=/path/to.tar  use a local sessions-pipeline tree (git archive) instead of cloning
 set -euo pipefail
 RH_REF=${1:-feat/t0-cutover-gate}
 BULLS_REF=${2:-feat/supabase-production-migration}
@@ -33,7 +33,7 @@ git clone -q --depth 1 -b "$RH_REF" git@github.com:AgentWorkforce/relayhistory-c
 if [ -n "${BULLS_TARBALL:-}" ]; then
   mkdir -p "$WORK/bulls" && tar -xf "$BULLS_TARBALL" -C "$WORK/bulls"
 else
-  git clone -q --depth 1 -b "$BULLS_REF" git@github.com:AgentWorkforce/96BullSessions.git "$WORK/bulls"
+  git clone -q --depth 1 -b "$BULLS_REF" git@github.com:AgentWorkforce/sessions-pipeline.git "$WORK/bulls"
 fi
 
 docker network create "$NAME" >/dev/null
