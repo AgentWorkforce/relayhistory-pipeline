@@ -152,6 +152,41 @@ differs from `5c512be` only in AWS stack files.
 - matching machine `proof-gcp-mvyfucaa36b947-a`: chunk and manifest landed, two
   encrypted summaries were written, zero dead letters, trace `indexed`.
 
+### Backup and restore drill
+
+The protection in place on GCP conformance, as read from the live resources on
+2026-11-02:
+
+- **Cloud SQL `awf-conformance-postgres`:** automated daily backups at 13:00Z,
+  7 retained (the latest automated backup at the time succeeded),
+  point-in-time recovery on, 7 days of transaction logs in Cloud Storage.
+- **Locker bucket:** object versioning on and 7-day soft delete, with uniform
+  bucket-level access.
+
+The drill, 2026-11-02:
+
+1. **Database point-in-time restore.** `gcloud sql instances clone` of the
+   live instance at `2026-11-02T00:28:00Z` into `awf-conformance-pg-drill`
+   finished in 9.5 minutes, RUNNABLE on a private IP only. The runner opened
+   a Cloud SQL proxy to the clone and a port-forward to the live proxy, using
+   the migration credential read in memory from the `96bulls-runtime` Secret,
+   then ran the same query on both. The result was **identical**: 8
+   `session_index` rows, 57 `pipeline_events`, 16 `session_summaries`, 18
+   ledger rows, newest session `2026-11-02 00:15:48.488+00`, and the proof
+   session for machine `proof-gcp-mvyicx6wa9e27b-a` present. The clone was then
+   deleted, leaving only the live instance.
+2. **Object restore.** A random 64 KiB object under `drill-restore/` (a prefix
+   the pipeline never reads) was written and deleted; it then answered 404, and
+   its prior generation was still listed. It was restored by copying that
+   generation back, and its SHA-256 matched the original. Every version was
+   then removed (`drill versions left: 0`).
+
+Gaps found:
+- Deletion protection is off on the Cloud SQL instance, and deleting the
+  instance also deletes its automated backups.
+- The locker has no lifecycle rule, so noncurrent versions are kept
+  indefinitely; storage grows without bound.
+
 ### Per-component bucket identities
 
 Each component now has its own Google service account, scoped like the AWS

@@ -509,6 +509,11 @@ replica` (confirmed on PG 17.11), as dump and restore tooling sets. Idempotent; 
     existing trigger (including one only `'O'`) or runtime role that differs is refused
     (operator decides). If `CREATE EVENT TRIGGER` is refused (no
     supautils), it fails closed with 55000 and creates nothing.
+  - **Adding a `sessions` function:** a migration that adds or changes a `sessions`
+    function must, in the same change, update `src/hoopdb/sessions-function-acl.json`, the
+    trigger's embedded manifest, its SECURITY DEFINER list (and
+    `RUNTIME_APPLICATION_FUNCTIONS` if it is a runtime function), and
+    `SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256`; the unit tests fail otherwise.
   - **What it enforces, at fire time** (it filters by the schema NAME `sessions`, which
     need not exist at install): routines created in `sessions` get PUBLIC revoked (the
     range and multirange constructors of a `CREATE TYPE ... AS RANGE` are checked too:

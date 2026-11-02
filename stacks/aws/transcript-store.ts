@@ -48,6 +48,15 @@ import { sha256, type Provenance } from "../../src/cli/plan-provenance.ts";
 import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hardening.ts";
 import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
+import {
+  SESSION_PIPELINE_RESOURCES,
+  assertSessionPipelineInputs,
+  pipelineBucketStatements,
+  pipelineKeyStatement,
+  sessionPipelineFunction,
+  sessionPipelineWiring,
+  type SessionPipelineInputs,
+} from "./session-pipeline.ts";
 
 /** K-45 (Khaliq, 2026-10-31): logical delete immediately, physical purge within 48 h. */
 export const ERASURE_SLA_HOURS = 48;
@@ -73,6 +82,11 @@ export interface TranscriptStoreInputs {
   managementEvents?: boolean;
   /** Optional role allowed to decrypt/re-encrypt CloudTrail log files. Omit for no trail-log read path. */
   auditPrincipalArn?: string;
+  /**
+   * The session pipeline (session-pipeline.ts): S3 manifest events -> SQS -> Lambda -> Supabase
+   * pointer + ClickHouse index. Omit for the store alone.
+   */
+  sessionPipeline?: SessionPipelineInputs;
 }
 
 export interface TranscriptNames {
@@ -146,7 +160,9 @@ export function assertTranscriptStoreInputs(
   if (inputs.accountId !== TRANSCRIPT_ACCOUNT_ID) refuse(`accountId must be exactly ${TRANSCRIPT_ACCOUNT_ID}, got ${JSON.stringify(inputs.accountId)}`);
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
-  for (const k of Object.keys(store)) if (k !== "managementEvents" && k !== "auditPrincipalArn") refuse(`transcriptStore.${k} is not a known setting`);
+  for (const k of Object.keys(store))
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "sessionPipeline") refuse(`transcriptStore.${k} is not a known setting`);
+  if (store.sessionPipeline !== undefined) assertSessionPipelineInputs(store.sessionPipeline, refuse);
   if (store.managementEvents !== undefined && typeof store.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
   if (store.auditPrincipalArn !== undefined && !new RegExp(`^arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/[A-Za-z0-9_+=,.@/-]+$`).test(store.auditPrincipalArn))
     refuse(`transcriptStore.auditPrincipalArn must be a named IAM role in account ${TRANSCRIPT_ACCOUNT_ID} in partition aws`);
@@ -168,7 +184,33 @@ export type TranscriptStorePlanPhase =
   | "post-merge policy remediation"
   | "srv-writer addition"
   | "srv-writer propagation recovery"
-  | "post-apply";
+  | "post-apply"
+  | "session pipeline rollout"
+  | "session pipeline update";
+
+/**
+ * The session pipeline's own phases (session-pipeline.ts). Rollout: the pipeline's
+ * resources are created (all, or the rest after a partial apply), and the store
+ * changes only by the two grants it needs: the transcripts key policy (decrypt via
+ * S3) and the bucket policy (list, read). Update: an existing pipeline changes in
+ * place (code, env, settings) and the store does not change at all. Never a
+ * replacement or deletion, and every other store resource stays `noop`.
+ */
+function sessionPipelinePhase(operations: ReadonlyMap<string, string>): TranscriptStorePlanPhase | undefined {
+  if (!SESSION_PIPELINE_RESOURCES.some((r) => operations.has(r))) return undefined;
+  const pipeline = SESSION_PIPELINE_RESOURCES.map((r) => operations.get(r));
+  const store = (r: string) => operations.get(r);
+  const othersNoop = TRANSCRIPT_RESOURCES.filter((r) => r !== "transcripts" && r !== "transcripts-key").every((r) => store(r) === "noop");
+  if (!othersNoop) return undefined;
+  const grants = ["transcripts", "transcripts-key"].map(store);
+  if (pipeline.every((a) => a === "create" || a === "noop") && grants.every((a) => a === "update" || a === "noop")) {
+    if (pipeline.some((a) => a === "create")) return "session pipeline rollout";
+    if (grants.some((a) => a === "update")) return "session pipeline rollout";
+  }
+  if (grants.every((a) => a === "noop") && pipeline.every((a) => a === "update" || a === "noop") && pipeline.some((a) => a === "update"))
+    return "session pipeline update";
+  return undefined;
+}
 
 const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
   { name: "initial", actions: Object.fromEntries(TRANSCRIPT_RESOURCES.map((resource) => [resource, "create"])) },
@@ -195,6 +237,13 @@ export interface TranscriptStorePlanCapture {
   stateSnapshotText?: string;
 }
 
+/** The resources a plan must list: the store's resources, plus every pipeline resource once any of them appears. */
+function expectedResources(names: Iterable<string>): readonly string[] {
+  const pipeline = new Set<string>(SESSION_PIPELINE_RESOURCES);
+  for (const name of names) if (pipeline.has(name)) return [...TRANSCRIPT_RESOURCES, ...SESSION_PIPELINE_RESOURCES];
+  return TRANSCRIPT_RESOURCES;
+}
+
 function transcriptPlanOperations(text: string, label: "compact" | "detailed", refuse: (why: string) => never) {
   const summaries = text.split(/\r?\n/).filter((line) => line.startsWith("Plan:"));
   if (summaries.length !== 1) refuse(`${label} plan: expected exactly one Plan: summary, found ${summaries.length}`);
@@ -206,7 +255,7 @@ function transcriptPlanOperations(text: string, label: "compact" | "detailed", r
     if (operations.has(resource!)) refuse(`${label} plan: resource ${resource} appears more than once`);
     operations.set(resource!, action!);
   }
-  const expected = new Set<string>(TRANSCRIPT_RESOURCES);
+  const expected = new Set<string>(expectedResources(operations.keys()));
   for (const resource of operations.keys()) if (!expected.has(resource)) refuse(`${label} plan: unexpected resource ${resource}`);
   for (const resource of expected) if (!operations.has(resource)) refuse(`${label} plan: missing resource ${resource}`);
   for (const [resource, action] of operations)
@@ -247,7 +296,7 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   const compact = transcriptPlanOperations(planText, "compact", refuse);
   const detailed = transcriptPlanOperations(capture.detailedPlanText, "detailed", refuse);
   if (compact.summary !== detailed.summary) refuse("compact and detailed plan summaries differ");
-  for (const resource of TRANSCRIPT_RESOURCES)
+  for (const resource of expectedResources(compact.operations.keys()))
     if (compact.operations.get(resource) !== detailed.operations.get(resource))
       refuse(`compact and detailed plans disagree on ${resource}`);
 
@@ -266,6 +315,15 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   if (provenance.outputs.detailed.sha256 !== sha256(capture.detailedPlanText)) refuse("detailed plan does not match its provenance sha256");
   if (provenance.summary !== compact.summary) refuse("provenance summary does not match the plan summary");
 
+  const withPipeline = SESSION_PIPELINE_RESOURCES.some((r) => compact.operations.has(r));
+  if (withPipeline) {
+    if (SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
+      return "post-apply";
+    const pipelinePhase = sessionPipelinePhase(compact.operations);
+    if (pipelinePhase) return pipelinePhase;
+    const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
+    return refuse(`action set does not match the session pipeline rollout, update or post-apply phase: ${changes.join(", ") || "(none)"}`);
+  }
   const phase = TRANSCRIPT_PLAN_PHASES.find((candidate) =>
     TRANSCRIPT_RESOURCES.every((resource) => compact.operations.get(resource) === (candidate.actions[resource] ?? "noop")),
   );
@@ -474,7 +532,7 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
  * The eraser and every operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string }) {
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
     StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${TENANT_KEY_BASE}/*` },
@@ -486,6 +544,7 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
       { Sid: "WriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.writerArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
       { Sid: "SrvWriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.srvWriterArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
       { Sid: "ReaderDecryptsViaS3", Effect: "Allow" as const, Principal: { AWS: i.readerArn }, Action: ["kms:Decrypt"], Resource: "*", Condition: via },
+      ...(i.pipelineRoleArn ? [pipelineKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
     ],
   };
 }
@@ -693,6 +752,14 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       tags: i.tags("cloudtrail"),
     });
 
+    // The session pipeline's function (and so its Alchemy-owned execution role) comes before the key
+    // and the bucket, whose policies grant that role read access (session-pipeline.ts).
+    const pipeline = i.transcriptStore.sessionPipeline;
+    const pipelineFn = pipeline
+      ? yield* sessionPipelineFunction({ stage: i.stage, accountId: i.accountId, region: i.region, p: pipeline, tags: i.tags, bucket: n.bucket })
+      : undefined;
+    const pipelineRoleArn = pipelineFn ? ((pipelineFn as unknown as { roleArn: string }).roleArn) : undefined;
+
     const key = yield* AWS.KMS.Key("transcripts-key", {
       description: `96bulls ${i.stage}: transcript objects (SSE-KMS, per-object data keys)`,
       enableKeyRotation: true,
@@ -704,6 +771,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         writerArn: writer.userArn as unknown as string,
         srvWriterArn: srvWriter.userArn as unknown as string,
         readerArn: reader.userArn as unknown as string,
+        ...(pipelineRoleArn ? { pipelineRoleArn } : {}),
       }) as never,
       // Also orders the key after the trail: the trail audits its use from the first call, and the
       // trail chain gives IAM time to propagate the new users KMS validates as principals.
@@ -731,11 +799,27 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       encryption: { sseAlgorithm: "aws:kms", kmsMasterKeyId: key.keyArn, bucketKeyEnabled: false, blockedEncryptionTypes: ["SSE-C"] },
       publicAccessBlock: PUBLIC_ACCESS_BLOCK,
       objectOwnership: "BucketOwnerEnforced",
-      policy: transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn }) as never,
+      policy: [
+        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn }),
+        ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn }) : []),
+      ] as never,
       lifecycleRules: transcriptLifecycleRules() as never,
       logging: { targetBucket: accessLogs.bucketName as unknown as string, targetPrefix: ACCESS_LOG_PREFIX, targetObjectKeyFormat: { PartitionedPrefix: { PartitionDateSource: "EventTime" } } as never },
       tags: i.tags("transcripts"),
     });
+
+    const sessionPipeline =
+      pipeline && pipelineFn
+        ? yield* sessionPipelineWiring({
+            stage: i.stage,
+            accountId: i.accountId,
+            region: i.region,
+            p: pipeline,
+            tags: i.tags,
+            bucketArn: n.bucketArn,
+            fn: pipelineFn as unknown as { functionName: unknown; functionArn: unknown; roleArn: unknown },
+          })
+        : null;
 
     yield* AWS.Budgets.Budget("budget", {
       budgetName: n.budget,
@@ -759,5 +843,6 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       readerUser: reader.userName,
       eraserUser: eraser.userName,
       srvWriterUser: srvWriter.userName,
+      sessionPipeline,
     };
   });

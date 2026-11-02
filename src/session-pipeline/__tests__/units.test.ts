@@ -1,0 +1,172 @@
+import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { signV4 } from "../aws-json.ts";
+import { decodeS3Key, parseQueueBody, sequencerAfter } from "../s3-events.ts";
+import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
+import { lambdaEnv, parseSecret } from "../lambda.ts";
+
+const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
+
+describe("SigV4 for JSON-protocol services", () => {
+  test("matches the AWS documentation example (IAM ListUsers, 2015-08-30)", () => {
+    const headers = signV4({
+      method: "GET",
+      url: new URL("https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08"),
+      service: "iam",
+      region: "us-east-1",
+      headers: { "content-type": "application/x-www-form-urlencoded; charset=utf-8" },
+      body: "",
+      credentials: { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY" },
+      now: new Date("2015-08-30T12:36:00Z"),
+    });
+    expect(headers.authorization).toBe(
+      "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7",
+    );
+    expect(headers.host).toBeUndefined();
+  });
+
+  test("signs the session token", () => {
+    const headers = signV4({
+      method: "POST",
+      url: new URL("https://sqs.us-east-1.amazonaws.com/"),
+      service: "sqs",
+      region: "us-east-1",
+      headers: {},
+      body: "{}",
+      credentials: { accessKeyId: "AKID", secretAccessKey: "secret", sessionToken: "token" },
+      now: new Date("2026-11-01T00:00:00Z"),
+    });
+    expect(headers["x-amz-security-token"]).toBe("token");
+    expect(headers.authorization).toContain("SignedHeaders=host;x-amz-date;x-amz-security-token");
+  });
+});
+
+const KEY = "96bulls/org_1/v1/ws=ws_1/m=srv_ab/h=claude/d=2026/11/01/s=sess 1/manifest.json";
+const s3Body = (eventName: string, object: Record<string, unknown>) =>
+  JSON.stringify({
+    Records: [
+      {
+        eventVersion: "2.1",
+        eventSource: "aws:s3",
+        eventName,
+        eventTime: "2026-11-01T18:00:00.000Z",
+        s3: { bucket: { name: "bucket" }, object },
+      },
+    ],
+  });
+
+describe("S3 event notifications", () => {
+  test("a put carries key, ETag, version and sequencer", () => {
+    const parsed = parseQueueBody(
+      s3Body("ObjectCreated:Put", {
+        key: "96bulls/org_1/v1/ws%3Dws_1/m%3Dsrv_ab/h%3Dclaude/d%3D2026/11/01/s%3Dsess+1/manifest.json",
+        size: 10,
+        eTag: "abc",
+        versionId: "v1",
+        sequencer: "0055AED6DCD90281E5",
+      }),
+    );
+    expect(parsed).toEqual({
+      kind: "events",
+      events: [
+        {
+          provider: "s3",
+          key: KEY,
+          bucket: "bucket",
+          etag: "abc",
+          version: "v1",
+          size: 10,
+          eventTime: "2026-11-01T18:00:00.000Z",
+          sequencer: "0055AED6DCD90281E5",
+        },
+      ],
+    });
+  });
+
+  test("a version delete and a delete marker are deletes without an identity", () => {
+    for (const name of ["ObjectRemoved:Delete", "ObjectRemoved:DeleteMarkerCreated"]) {
+      const parsed = parseQueueBody(s3Body(name, { key: "a", versionId: "v9", sequencer: "01" }));
+      expect(parsed).toEqual({
+        kind: "events",
+        events: [{ provider: "s3", key: "a", bucket: "bucket", eventTime: "2026-11-01T18:00:00.000Z", sequencer: "01", deleted: true }],
+      });
+    }
+  });
+
+  test("restores, replication and other sources are ignored; the test event is recognized", () => {
+    expect(parseQueueBody(s3Body("ObjectRestore:Completed", { key: "a" }))).toEqual({ kind: "events", events: [] });
+    expect(parseQueueBody(JSON.stringify({ Records: [{ eventSource: "aws:sqs", eventName: "ObjectCreated:Put", s3: { object: { key: "a" } } }] }))).toEqual({
+      kind: "events",
+      events: [],
+    });
+    expect(parseQueueBody(JSON.stringify({ Service: "Amazon S3", Event: "s3:TestEvent", Bucket: "b" }))).toEqual({ kind: "test" });
+    expect(parseQueueBody("not json")).toEqual({ kind: "invalid" });
+    expect(parseQueueBody(JSON.stringify({ reconcile: {} }))).toEqual({ kind: "invalid" });
+  });
+
+  test("reconcile bodies become puts", () => {
+    expect(parseQueueBody(JSON.stringify({ reconcile: { key: KEY, etag: "e" } }))).toEqual({
+      kind: "events",
+      events: [{ provider: "s3", key: KEY, etag: "e" }],
+    });
+  });
+
+  test("key decoding and sequencer order", () => {
+    expect(decodeS3Key("a+b%2Bc")).toBe("a b+c");
+    expect(decodeS3Key("%E0%A4%A")).toBeNull();
+    expect(sequencerAfter("0055AED6DCD90281E6", "0055AED6DCD90281E5")).toBe(true);
+    expect(sequencerAfter("0055AED6DCD90281E5", "0055AED6DCD90281E5FF")).toBe(false);
+    expect(sequencerAfter("01", undefined)).toBe(true);
+    expect(sequencerAfter(undefined, "01")).toBe(false);
+  });
+});
+
+describe("pinned inputs", () => {
+  test("the inlined Supabase CA is the pinned certificate", () => {
+    expect(SUPABASE_PROD_CA_2021).toBe(readFileSync(here("../../../certs/supabase-prod-ca-2021.crt"), "utf8"));
+  });
+
+  test("the vendored ClickHouse helpers are unmodified copies", () => {
+    const source = JSON.parse(readFileSync(here("../vendor/search-index/SOURCE.json"), "utf8")) as { files: Record<string, string> };
+    expect(Object.keys(source.files).sort()).toEqual(["clickhouse.ts", "reconcile.ts", "rows.ts", "schema.ts"]);
+    for (const [file, digest] of Object.entries(source.files))
+      expect(createHash("sha256").update(readFileSync(here(`../vendor/search-index/${file}`))).digest("hex")).toBe(digest);
+  });
+});
+
+describe("configuration", () => {
+  const base = {
+    AWS_REGION: "us-east-1",
+    PIPELINE_RAW_S3_BUCKET: "b",
+    PIPELINE_KEY_PREFIX: "/96bulls/",
+    PIPELINE_ORG_FROM_PREFIX: "true",
+    SESSION_PIPELINE_SECRET_ARN: "arn",
+    SESSION_PIPELINE_QUEUE_URL: "https://sqs",
+  };
+
+  test("defaults keep the search index and fan-out off", () => {
+    expect(lambdaEnv(base)).toMatchObject({ keyPrefix: "96bulls", searchEnabled: false, fanout: "off" });
+    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", PIPELINE_FANOUT: "postgres" })).toMatchObject({ searchEnabled: true, fanout: "postgres" });
+  });
+
+  test("refuses the single-tenant layout and unknown fan-out", () => {
+    expect(() => lambdaEnv({ ...base, PIPELINE_ORG_FROM_PREFIX: undefined })).toThrow(/ORG_FROM_PREFIX/);
+    expect(() => lambdaEnv({ ...base, PIPELINE_FANOUT: "sqs" })).toThrow(/FANOUT/);
+  });
+
+  test("secret shape is checked without echoing values", () => {
+    expect(parseSecret(JSON.stringify({ hoopdb_url: "postgresql://u:p@h:5432/db" })).hoopdb_url).toContain("postgresql://");
+    let message = "";
+    try {
+      parseSecret(JSON.stringify({ hoopdb_url: "mysql://hunter2" }));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toBe("session pipeline secret has no hoopdb_url");
+    expect(() => parseSecret(JSON.stringify({ hoopdb_url: "postgres://x", clickhouse: { url: "https://c", user: "u", password: "", database: "d" } }))).toThrow(
+      /clickhouse.password/,
+    );
+  });
+});
