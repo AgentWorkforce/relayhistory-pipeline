@@ -444,10 +444,53 @@ database.
 
 `eks.relaycast` installs the released `relaycast` chart: one replica,
 `ClusterIP`, ingress off, SQLite on a 10 GiB `96bulls-gp3` volume, only the
-`96bulls` namespace admitted. `chartVersion` and `imageDigest` are inputs so a
-later chart (0.2.0) needs no code change. Chart 0.1.0 (Relaycast 8.0.0)
-accepts no secret material; if a later chart does, it must come from an
-existing Secret by name.
+`96bulls` namespace admitted. `chartVersion` and `imageDigest` are inputs.
+Both released charts are supported:
+
+- **0.1.0** (Relaycast 8.0.0, image `sha256:5c86c095…3b98`) accepts no secret
+  material; its values are unchanged, and `secretName` is refused.
+- **0.2.0** (relaycast-self-host 12.2.1-selfhost.1, image
+  `sha256:a05732ad4f3614d057bb1460df40a30e3a9297c8930bfdda6d4e3d6dc9f41762`)
+  requires `existingSecret` (`helm template` fails without it). Give its name
+  as `secretName`; the stack passes `existingSecret: <secretName>` and
+  `secretKeys: { internalSecret: internal-secret, bootstrapSecret:
+  workspace-bootstrap-secret }` and never a value. The chart mounts both keys
+  read-only as files (`RELAYCAST_INTERNAL_SECRET_FILE`,
+  `RELAYCAST_WORKSPACE_BOOTSTRAP_SECRET_FILE`). `secretName` is required from
+  0.2.0 on.
+
+```json
+"relaycast": {
+  "chartVersion": "0.2.0",
+  "imageDigest": "sha256:a05732ad4f3614d057bb1460df40a30e3a9297c8930bfdda6d4e3d6dc9f41762",
+  "baseUrl": "https://relaycast.proof-sandbox-sessions.agentrelay.com",
+  "secretName": "relaycast"
+}
+```
+
+**The Relaycast Secret (0.2.0, once per environment, before the deploy).**
+Secret `relaycast` in namespace `relaycast`, keys `internal-secret` (bearer
+secret for the in-cluster `/internal` admin API, at least 32 characters) and
+`workspace-bootstrap-secret` (stable derivation secret for keyed workspace
+creates; keep it stable across upgrades). Created out of band like
+RelayAuth's: generated on the Mac into the 1Password item `<stage> relaycast`
+(e.g. `aws-proof-sandbox relaycast`) and piped to the cluster:
+
+```sh
+# on the Mac (Khaliq approves each op call)
+op item create --vault <vault> --category "API Credential" --title "aws-proof-sandbox relaycast" \
+  "internal-secret[password]=$(openssl rand -hex 32)" \
+  "workspace-bootstrap-secret[password]=$(openssl rand -hex 32)"
+# from the operator shell, cluster credentials in env vars only
+kubectl create namespace relaycast --dry-run=client -o yaml | kubectl apply -f -
+ssh kjg-lap "zsh -lc 'op item get \"aws-proof-sandbox relaycast\" --vault <vault> --reveal --format json'" \
+  | jq '{apiVersion:"v1",kind:"Secret",type:"Opaque",metadata:{name:"relaycast",namespace:"relaycast"},
+         stringData:(.fields|map(select(.label|IN("internal-secret","workspace-bootstrap-secret")))|map({(.label):.value})|add)}' \
+  | kubectl apply -f -
+```
+
+The Secret lives in the cluster only, so it goes with the cluster on
+`pippen sandbox down`.
 
 ### CloudTrail and buckets
 
@@ -640,9 +683,38 @@ proof stages) and changes only what the pippen agent-session boundary and
   every one is a valid S3 name, tested):
   `pippen-sweeper` may delete only `pippen-sbx-*` buckets (S3 deletes cannot be
   tag-conditioned);
-- no GitHub OIDC provider or deployer role (unchanged).
+- no GitHub OIDC provider or deployer role (unchanged);
+- the Alchemy state is not in the account's default store
+  `alchemy-state-361835732085-us-west-2-an`, which `pippen-sweeper` is denied
+  deleting (`NeverDeleteBucketsThatMustSurvive` covers `alchemy-state-*`) and
+  which would outlive the sweep while it reports clean. It is in
+  `pippen-sbx-alchemy-state-361835732085-us-west-2-an`
+  (`stacks/aws/state-bucket.ts`): the `pippen-sbx-` prefix, Alchemy's
+  account-regional `<prefix>-<account>-<region>-an` form, tagged
+  `pippen:sandbox=true` in the CreateBucket call itself (no untagged window),
+  versioned, SSE-S3 (AES256), all public access blocked, BucketOwnerEnforced,
+  and no bucket policy or lifecycle rule (nothing protects it from the
+  sweeper). A fresh account has no state bucket: `bin/96bulls plan
+  aws-proof-sandbox --capture` creates it before the snapshot (only after STS
+  confirms the sandbox account), and the capture is of its empty listing.
+  Before Alchemy's first state call the stack's state layer checks the lease's
+  caller ARN and does the same, so a direct `alchemy` run cannot make it
+  untagged. A deploy whose state bucket has vanished since the capture is
+  refused (versioning `Absent`).
 
-Every other stage renders exactly as before (`stacks/aws/__tests__/pippen-sandbox.test.ts`).
+Every other stage renders exactly as before (`stacks/aws/__tests__/pippen-sandbox.test.ts`,
+`state-bucket.test.ts`: the same `AWS.state({ prefix: "96bulls" })` and default
+store, and a missing default store is still an error).
+
+**What is left after teardown.** `bin/96bulls down aws-proof-sandbox` removes
+the stage's resources but leaves the state bucket, with the stage's state
+objects' old versions and delete markers. `pippen sandbox down aws-proof`
+deletes it: the sweeper finds it by `pippen:sandbox=true`, empties every
+object version, delete marker and incomplete upload (pippen-tools
+`src/aws/real.ts` `#emptyBucket`, `s3:ListBucketVersions` /
+`s3:DeleteObjectVersion` on `pippen-sbx-*`), then `DeleteBucket`. The
+harness's post-destroy check heads it with the stage's other buckets
+(`src/proof/aws/fence.ts` `SANDBOX_STATE_BUCKET`) and fails while it exists.
 
 This needs the widened boundary and sweeper from pippen-tools (the boundary
 grants CloudTrail, WAFv2, ACM, ECR repositories and Budgets only with

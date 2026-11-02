@@ -14,8 +14,9 @@ import { clusterArnOf, parseDescribeCluster, proofKubeconfig } from "../cluster-
 import { defaultConfig, defaultInputsPath, loadConfig, sandboxConfig, validateConfig } from "../config.ts";
 import { Runner, type Spawn } from "../exec.ts";
 import {
-  fenceFor, PROOF_BACKUP_BUCKET, PROOF_CONTEXT, PROOF_FENCE, PROOF_HOST, PROOF_LOCKER_BUCKET, proofConfigIssues, SANDBOX_BACKUP_BUCKET, SANDBOX_CONTEXT, SANDBOX_FENCE, SANDBOX_HOST, SANDBOX_LOCKER_BUCKET, TARGET_VALUES,
+  fenceFor, PROOF_BACKUP_BUCKET, PROOF_CONTEXT, PROOF_FENCE, PROOF_HOST, PROOF_LOCKER_BUCKET, proofConfigIssues, SANDBOX_BACKUP_BUCKET, SANDBOX_CONTEXT, SANDBOX_FENCE, SANDBOX_HOST, SANDBOX_LOCKER_BUCKET, SANDBOX_STATE_BUCKET, TARGET_VALUES,
 } from "../fence.ts";
+import { pippenStateBucket } from "../../../../stacks/aws/state-bucket.ts";
 import {
   assertMayRun, assertPostDestroyTarget, assertProofTarget, GuardError, PIPPEN_SANDBOX_PROOF_TARGET, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, PROOF_TARGETS, PIPPEN_SESSION_ID, SANDBOX_ACCOUNT_ID, SANDBOX_CLUSTER, sandboxCallerArn, SANDBOX_STAGE, SESSIONS_DEV_PROOF_TARGET,
   type GuardInput, type ProofTarget,
@@ -422,7 +423,21 @@ describe("pippen sandbox target: teardown is the pippen sweep, verified after", 
     expect(cmds.some((c) => c.includes("Key=alchemy::stage,Values=aws-proof-sandbox"))).toBe(true);
     expect(cmds.some((c) => c.includes(SANDBOX_LOCKER_BUCKET))).toBe(true);
     expect(cmds.some((c) => c.includes(SANDBOX_BACKUP_BUCKET))).toBe(true);
+    expect(cmds.some((c) => c.includes(`head-bucket --bucket ${SANDBOX_STATE_BUCKET} `))).toBe(true);
     expect(cmds.some((c) => c.includes("500268966557"))).toBe(false);
+  });
+  test("post-destroy includes the sandbox's own Alchemy state bucket, the stack's exact name, and fails while it exists", async () => {
+    expect(SANDBOX_STATE_BUCKET).toBe("pippen-sbx-alchemy-state-361835732085-us-west-2-an");
+    expect(SANDBOX_STATE_BUCKET).toBe(pippenStateBucket(SANDBOX_ACCOUNT_ID, "us-west-2"));
+    expect(TARGET_VALUES["pippen-sandbox"].stateBucket).toBe(SANDBOX_STATE_BUCKET);
+    expect(TARGET_VALUES.proof.stateBucket).toBeUndefined();
+    expect(SANDBOX_FENCE.buckets.has(SANDBOX_STATE_BUCKET)).toBe(true);
+    expect(PROOF_FENCE.buckets.has(SANDBOX_STATE_BUCKET)).toBe(false);
+    const base = fake();
+    const left: Spawn = (argv, ...rest) => (argv[2] === "head-bucket" && argv.includes(SANDBOX_STATE_BUCKET) ? { stdout: "{}", status: 0 } : base(argv, ...rest));
+    const res = await run(left);
+    expect(res.status).toBe("fail");
+    expect(res.failures).toContain(`bucket ${SANDBOX_STATE_BUCKET} still exists`);
   });
   test("a resource left by the sweep, tagged only pippen:sandbox=true, is FAIL", async () => {
     const left = JSON.stringify({ ResourceTagMappingList: [{ ResourceARN: "arn:aws:ec2:us-west-2:361835732085:volume/vol-1" }] });

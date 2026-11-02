@@ -5,7 +5,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { alchemyStateBucket, alchemyStatePrefix } from "../../stacks/aws/preflight.ts";
+import { ensurePippenStateBucket } from "../../stacks/aws/state-bucket.ts";
 import { currentObjects, sanitizeInputs, sanitizePlan, sha256, type Provenance } from "./plan-provenance.ts";
 import { capturePaths, observeSource, observeState, verifyDeployCapture, type CaptureIO } from "../../stacks/aws/capture-verify.ts";
 import type { StateSnapshot } from "../../stacks/aws/state-snapshot.ts";
@@ -30,7 +30,7 @@ export const realIO = (root: string): CaptureIO => ({
 });
 export const planPaths = capturePaths;
 const observeSourceAt = (root: string) => observeSource(realIO(root));
-const observeStateAt = (root: string, accountId: string, region: string, stage: string) => observeState(realIO(root), accountId, region, stage);
+const observeStateAt = (root: string, accountId: string, region: string, stage: string, pippenSandbox = false) => observeState(realIO(root), accountId, region, stage, pippenSandbox);
 
 /** GET each current state object at its exact version id. */
 function snapshotState(root: string, stage: string, region: string, st: ReturnType<typeof observeStateAt>): StateSnapshot {
@@ -50,12 +50,17 @@ function snapshotState(root: string, stage: string, region: string, st: ReturnTy
 export function capturePlan(root: string, stage: string, env: Record<string, string | undefined>) {
   const inputsPath = join(root, ".96bulls", stage, "aws-inputs.json");
   const rawInputs = readFileSync(inputsPath, "utf8");
-  const inputs = JSON.parse(rawInputs) as { accountId: string; region: string; eks?: { apiAccess?: { publicAccessCidrs?: string[] } } };
+  const inputs = JSON.parse(rawInputs) as { accountId: string; region: string; pippenSandbox?: unknown; eks?: { apiAccess?: { publicAccessCidrs?: string[] } } };
+  const pippen = Boolean(inputs.pippenSandbox);
   const src = observeSourceAt(root);
   if (!src.clean) throw new Error("commit the stack source first: a plan must describe committed code");
   const caller = awsJson(root, ["sts", "get-caller-identity"]) as { Account: string; Arn: string };
   if (caller.Account !== inputs.accountId) throw new Error(`STS caller is ${caller.Account}, inputs say ${inputs.accountId}`);
-  const state = observeStateAt(root, inputs.accountId, inputs.region, stage);
+  // A Pippen sandbox keeps its state in its own pippen-sbx- bucket (stacks/aws/state-bucket.ts),
+  // made here on the first plan of a fresh account (tagged, versioned, encrypted, no public
+  // access) so the capture snapshots an existing, empty, versioned store. No state object is written.
+  if (pippen) ensurePippenStateBucket((args) => run("aws", args, root), { accountId: inputs.accountId, region: inputs.region, stage });
+  const state = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen);
   // Transient writes are detectable only in a versioned bucket.
   if (state.versioning !== "Enabled") throw new Error(`state bucket ${state.bucket} is not versioned; a plan's writes could not be detected`);
   const snap = snapshotState(root, stage, inputs.region, state);
@@ -73,7 +78,7 @@ export function capturePlan(root: string, stage: string, env: Record<string, str
   const plan = exec(false);
   const detailed = exec(true);
   // Every version and delete marker must be unchanged: no write at all in the window, by anyone.
-  const after = observeStateAt(root, inputs.accountId, inputs.region, stage);
+  const after = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen);
   if (after.versionsDigest !== state.versionsDigest) throw new Error("Alchemy state bucket changed during the capture (a version or delete marker appeared); capture again");
   const p = planPaths(root, stage);
   mkdirSync(p.dir, { recursive: true });

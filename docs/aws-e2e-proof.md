@@ -730,7 +730,10 @@ The teardown runs in two phases:
      `ResourceNotFoundException`, and `list-clusters` must not name the cluster.
      No resource tagged `96bulls:stack=aws-proof` may remain; a KMS key in
      `PendingDeletion` is the expected end state. Both proof buckets must
-     answer `head-bucket` 404. On the sandbox target the stage tag is
+     answer `head-bucket` 404; on the sandbox target so must the stage's own
+     Alchemy state bucket `pippen-sbx-alchemy-state-361835732085-us-west-2-an`
+     (docs/aws-stage.md, deleted by `pippen sandbox down` with every version).
+     On the sandbox target the stage tag is
      `96bulls:stack=aws-proof-sandbox`, and nothing tagged
      `alchemy::stage=aws-proof-sandbox` or `pippen:sandbox=true` may remain
      either, except the exact ARN of the agent-session role that the fresh

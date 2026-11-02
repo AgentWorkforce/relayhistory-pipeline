@@ -134,6 +134,5 @@ export function awsCliRunner(spawn: (cmd: string, args: string[]) => { status: n
   };
 }
 
-/** Alchemy's default AWS state bucket and this stack's key prefix (StateStore/State.ts). */
-export const alchemyStateBucket = (accountId: string, region: string) => `alchemy-state-${accountId}-${region}-an`;
-export const alchemyStatePrefix = (stage: string) => `96bulls/96bulls-aws/${stage}`;
+/** Alchemy's default AWS state bucket and this stack's key prefix (StateStore/State.ts); the Pippen sandbox store is in state-bucket.ts. */
+export { alchemyStateBucket, alchemyStatePrefix } from "./state-bucket.ts";

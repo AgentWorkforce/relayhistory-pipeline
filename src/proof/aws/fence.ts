@@ -46,6 +46,12 @@ export const SANDBOX_BUCKET_PREFIX = "pippen-sbx-";
 export const SANDBOX_LOCKER_BUCKET = `${SANDBOX_BUCKET_PREFIX}${SANDBOX_NAME_PREFIX}locker-${SANDBOX_ACCOUNT_ID}`;
 // `backups`, not `hoopdb-backups`: with the prefix that name is 64 characters, over S3's 63.
 export const SANDBOX_BACKUP_BUCKET = `${SANDBOX_BUCKET_PREFIX}${SANDBOX_NAME_PREFIX}backups-${SANDBOX_ACCOUNT_ID}`;
+/**
+ * The sandbox stage's Alchemy state bucket (stacks/aws/state-bucket.ts pippenStateBucket):
+ * pippen-sbx- so pippen-sweeper deletes it (it is denied alchemy-state-*), in Alchemy's
+ * account-regional naming. Post-destroy must find it gone like the stage's other buckets.
+ */
+export const SANDBOX_STATE_BUCKET = `${SANDBOX_BUCKET_PREFIX}alchemy-state-${SANDBOX_ACCOUNT_ID}-${SANDBOX_REGION}-an`;
 export const PROOF_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
 export const PROOF_CHART_HOST = "agentworkforce.github.io";
 
@@ -163,7 +169,7 @@ export const SANDBOX_FENCE: Fence = Object.freeze({
   region: SANDBOX_REGION,
   namespaces: new Set([PROOF_NAMESPACE, PROOF_RELAYAUTH.namespace, PROOF_RELAYCAST.namespace, PROOF_CNPG_NAMESPACE]),
   deleteNamespaces: new Set(PROOF_WRITABLE_NAMESPACES),
-  buckets: new Set([SANDBOX_LOCKER_BUCKET, SANDBOX_BACKUP_BUCKET]),
+  buckets: new Set([SANDBOX_LOCKER_BUCKET, SANDBOX_BACKUP_BUCKET, SANDBOX_STATE_BUCKET]),
   deployments: new Set([...PROOF_CORE_DEPLOYMENTS, PROOF_RELAYAUTH.service, PROOF_RELAYCAST.service]),
   services: new Set([PROOF_INGEST_SERVICE, PROOF_POSTGREST.service, PROOF_RELAYAUTH.service, PROOF_RELAYCAST.service]),
   pgClusters: new Set([PROOF_HOOPDB.cluster, PROOF_RESTORE_CLUSTER]),
@@ -200,11 +206,13 @@ export interface TargetValues {
   origin: string;
   lockerBucket: string;
   backupBucket: string;
+  /** The stage's own Alchemy state bucket, when teardown deletes it (the Pippen sandbox only; elsewhere it is the account's shared store). */
+  stateBucket?: string;
 }
 
 export const TARGET_VALUES: Readonly<Record<ProofTargetId, TargetValues>> = Object.freeze({
   proof: Object.freeze({ target: SESSIONS_DEV_PROOF_TARGET, context: PROOF_CONTEXT, host: PROOF_HOST, origin: PROOF_ORIGIN, lockerBucket: PROOF_LOCKER_BUCKET, backupBucket: PROOF_BACKUP_BUCKET }),
-  "pippen-sandbox": Object.freeze({ target: PIPPEN_SANDBOX_PROOF_TARGET, context: SANDBOX_CONTEXT, host: SANDBOX_HOST, origin: SANDBOX_ORIGIN, lockerBucket: SANDBOX_LOCKER_BUCKET, backupBucket: SANDBOX_BACKUP_BUCKET }),
+  "pippen-sandbox": Object.freeze({ target: PIPPEN_SANDBOX_PROOF_TARGET, context: SANDBOX_CONTEXT, host: SANDBOX_HOST, origin: SANDBOX_ORIGIN, lockerBucket: SANDBOX_LOCKER_BUCKET, backupBucket: SANDBOX_BACKUP_BUCKET, stateBucket: SANDBOX_STATE_BUCKET }),
 });
 
 /** The hardcoded values for a stage, or undefined when the stage is neither proof target. */
