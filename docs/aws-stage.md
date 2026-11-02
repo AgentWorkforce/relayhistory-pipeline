@@ -625,6 +625,11 @@ proof stages) and changes only what the pippen agent-session boundary and
   and node roles (`96bulls-aws-proof-sandbox-{cluster,node}`), which the stage
   declares and passes to the cluster instead of letting Alchemy create them at
   `/` with no boundary;
+- the budget is `pippen-sbx-96bulls-aws-proof-sandbox-monthly`: the boundary
+  scopes Budgets by name (`budget/pippen-sbx-*`), so the agent can never touch
+  the account's baseline budget;
+- no ECR repository policy: the boundary denies `ecr:SetRepositoryPolicy` (a
+  resource policy could grant push past it), so `ecr.pullAccounts` is refused;
 - every resource carries `pippen:sandbox=true`, now including the budget, and
   the ALB, target groups and security groups (IngressClassParams `tags`) and
   EBS volumes (StorageClass `tagSpecification_1`) that Auto Mode creates

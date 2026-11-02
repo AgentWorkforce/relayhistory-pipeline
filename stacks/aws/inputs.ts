@@ -126,6 +126,8 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
   if (placeholders.length) throw new Error(`96bulls: aws-inputs.json still has placeholder values at ${placeholders.join(", ")}. Nothing was created.`);
   if (inputs.pippenSandbox && !new RegExp(`^arn:aws:iam::${inputs.accountId}:policy/[\\w+=,.@/-]+$`).test(inputs.pippenSandbox.permissionsBoundaryArn ?? ""))
     throw new Error("96bulls: pippenSandbox.permissionsBoundaryArn must be a policy ARN in this account. Nothing was created.");
+  if (inputs.pippenSandbox && (inputs.ecr?.pullAccounts?.length ?? 0) > 0)
+    throw new Error("96bulls: a Pippen sandbox stage declares no ECR repository policy (its boundary denies ecr:SetRepositoryPolicy); remove ecr.pullAccounts. Nothing was created.");
   if (inputs.pippenSandbox && inputs.accountShared) throw new Error("96bulls: a Pippen sandbox account is fresh; it cannot share another stage's account resources. Nothing was created.");
   assertPippenProofSandbox(stage, inputs);
   ecrPullPolicy(inputs);

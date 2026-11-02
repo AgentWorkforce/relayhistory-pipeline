@@ -14,6 +14,11 @@
  *     boundary grants CloudTrail, WAFv2, ACM, ECR and Budgets only with it),
  *     including the budget, and the load balancer and EBS volumes that EKS Auto
  *     Mode creates from Kubernetes objects.
+ *   - Budget name: prefixed pippen-sbx- (the boundary lets the session create
+ *     only budget/pippen-sbx-*, and the sweeper deletes those by name: Budgets
+ *     is scoped by name, so the agent can never touch the baseline budget).
+ *   - No ECR repository policy (the boundary denies SetRepositoryPolicy:
+ *     a resource policy could grant push past it), so ecr.pullAccounts is refused.
  *   - S3 bucket names: prefixed pippen-sbx- (S3 deletes cannot be tag-conditioned,
  *     so pippen-sweeper may delete only pippen-sbx-* buckets).
  */
@@ -27,6 +32,9 @@ export function stageBucketName(stage: string, base: string, accountId: string, 
   if (name.length > 63) throw new Error(`96bulls: bucket name ${name} is longer than S3's 63 characters. Nothing was created.`);
   return name;
 }
+
+/** `96bulls-<stage>-monthly`, with the pippen-sbx- prefix in a Pippen sandbox. */
+export const stageBudgetName = (stage: string, pippenSandbox: boolean) => `${pippenSandbox ? PIPPEN_BUCKET_PREFIX : ""}96bulls-${stage}-monthly`;
 
 /** The managed policies EKS Auto Mode needs (the same lists Alchemy's own Auto Mode roles attach). */
 export const AUTO_MODE_CLUSTER_POLICIES = Object.freeze([

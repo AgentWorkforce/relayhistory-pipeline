@@ -110,6 +110,12 @@ describe("aws-proof-sandbox: the E2E proof in the Pippen sandbox of agent aws-pr
     expect(r.hoopdb).toBe("cnpg");
   });
 
+  it("refuses ecr.pullAccounts in a Pippen sandbox: its boundary denies ecr:SetRepositoryPolicy (pippen-tools #37)", () => {
+    expect(sbxExample.ecr).toBeUndefined();
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbx((i) => (i.ecr = { pullAccounts: ["111122223333"] })), approved)).toThrow(/declares no ECR repository policy/);
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbx((i) => (i.ecr = { pullAccounts: [] })), approved)).not.toThrow();
+  });
+
   it("refuses the example as committed: the boundary policy name and approval are placeholders", () => {
     expect(() => validateAwsInputs("aws-proof-sandbox", sbxExample)).toThrow(/\$\.pippenSandbox\.permissionsBoundaryArn/);
   });

@@ -12,6 +12,7 @@ import {
   autoModeRoleProps,
   ingressClassTags,
   stageBucketName,
+  stageBudgetName,
 } from "../pippen-sandbox.ts";
 import { STORAGE_CLASS, storageClassManifest } from "../proof-addons.ts";
 import { SANDBOX_BACKUP_BUCKET, SANDBOX_LOCKER_BUCKET } from "../../../src/proof/aws/fence.ts";
@@ -28,6 +29,7 @@ describe("pippen sandbox: other stages are byte-for-byte unchanged", () => {
     expect(stageBucketName("aws-sessions-dev", "locker", "500268966557", false)).toBe("96bulls-aws-sessions-dev-locker-500268966557");
     expect(stageBucketName("aws-proof", "trail", "500268966557", false)).toBe("96bulls-aws-proof-trail-500268966557");
     expect(stageBucketName("aws-proof", "alb-logs", "500268966557", false)).toBe("96bulls-aws-proof-alb-logs-500268966557");
+    for (const stage of ["aws-proof", "aws-sessions-dev", "aws-prod", "aws-sandbox-claude-code-agent"]) expect(stageBudgetName(stage, false)).toBe(`96bulls-${stage}-monthly`);
   });
 
   it("Pod Identity roles: the same props as the inline literal they replace (no path key at all)", () => {
@@ -105,6 +107,10 @@ describe("pippen sandbox: what the stage changes", () => {
     }
     // The old name really was invalid (regression).
     expect(valid("pippen-sbx-96bulls-aws-proof-sandbox-hoopdb-backups-361835732085")).toBe(false);
+  });
+
+  it("the budget is pippen-sbx-* (Budgets is scoped by name in the pippen boundary; ecr.pullAccounts refusal: inputs.test.ts)", () => {
+    expect(stageBudgetName("aws-proof-sandbox", true)).toBe("pippen-sbx-96bulls-aws-proof-sandbox-monthly");
   });
 
   it("every Pod Identity role and the legacy role are under /pippen/workload/ with the boundary", () => {

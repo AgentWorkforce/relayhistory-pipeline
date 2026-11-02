@@ -85,7 +85,7 @@ describe("AWS name and description charsets", () => {
     expect(stack).toContain('const trailBucketName = stageBucketName(stage, "trail", inputs.accountId, pippen);');
     expect(stack).toContain('aliasName: `alias/${name("locker")}`');
     expect(stack).toContain('aliasName: `alias/${name("trail")}`');
-    expect(stack).toContain('budgetName: name("monthly"),');
+    expect(stack).toContain("budgetName: stageBudgetName(stage, pippen),");
     expect(stack).toContain('roleName: name("deployer"),');
     // No other WAF description in the stack bypasses ingestWafIdentity.
     expect((ingress + eks + stack).match(/WAFv2\.(WebACL|RuleGroup|IPSet)\(/g)).toEqual(["WAFv2.WebACL("]);

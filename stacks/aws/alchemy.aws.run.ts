@@ -40,7 +40,7 @@ import { verifyDeployCapture } from "./capture-verify.ts";
 import { alchemyStateBucket, alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyCallerArn, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
 import { networkPolicies } from "./proof-addons.ts";
 import { hoopdbBackend } from "./hardening.ts";
-import { stageBucketName } from "./pippen-sandbox.ts";
+import { stageBucketName, stageBudgetName } from "./pippen-sandbox.ts";
 import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
@@ -244,7 +244,7 @@ export default Alchemy.Stack(
     const budgetUsd = isSandbox ? SANDBOX_RULES.budgetUsd : inputs.budgetUsd;
     const alarmUsd = isSandbox ? SANDBOX_RULES.budgetAlarmUsd : Math.round(inputs.budgetUsd * 0.8);
     yield* AWS.Budgets.Budget("budget", {
-      budgetName: name("monthly"),
+      budgetName: stageBudgetName(stage, pippen),
       budgetType: "COST",
       timeUnit: "MONTHLY",
       budgetLimit: { amount: String(budgetUsd), unit: "USD" },
