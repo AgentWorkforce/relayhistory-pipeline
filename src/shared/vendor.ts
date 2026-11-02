@@ -46,6 +46,7 @@ export {
   fromRow,
   MAX_TRACE_EVENTS,
   PipelineRecorder,
+  logOnlyPipelineEventSink,
 } from "@rhc/lib/pipeline/events.ts";
 export {
   STAGE_REGISTRY,
@@ -57,9 +58,11 @@ export {
   type SessionPointerIndex,
   type ObjectLandedPayload,
   manifestWorkKey,
+  objectLandedHandler,
   sessionIndexedHandler,
 } from "@rhc/lib/pipeline/stages.ts";
 export {
+  buildObjectDeletedMessage,
   buildObjectLandedMessage,
   OBJECT_LANDED_STAGE,
   rawStoreFromEnv,
@@ -67,8 +70,11 @@ export {
   objectStoreManifestReader,
   orgResolverFromEnv,
   prefixAllowed,
+  prefixOrgResolver,
   readCapped,
   type ManifestReader,
+  type ObjectLanded,
+  type OrgResolver,
   type RawStore,
 } from "@rhc/lib/pipeline/adapter.ts";
 export {
@@ -95,6 +101,11 @@ export {
   type RelayhistoryStreamRecord,
   type ZstdDecompress,
 } from "@rhc/lib/pipeline/relayhistory-transform.ts";
+export {
+  CONVERGENCE_EVENT_KIND,
+  projectRelayhistorySession,
+  type ProjectionContext,
+} from "@rhc/lib/pipeline/relayhistory-projection.ts";
 export { scrubText, scrubJson } from "@rhc/lib/scrub.ts";
 export type { Bindings, AppEnv } from "@rhc/env.ts";
 
@@ -123,6 +134,7 @@ export {
   objectKey,
   joinKey,
   sessionPrefix,
+  manifestLocation,
   readAll,
   type BackfillChunk,
   type BackfillIO,

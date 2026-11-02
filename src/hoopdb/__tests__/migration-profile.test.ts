@@ -1993,6 +1993,36 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     ).toBeNull();
   });
 
+  test("the trigger's SECURITY DEFINER list equals exactly the SECURITY DEFINER sessions functions a clean full migrate creates", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const created = (
+      await db.query<{ f: string }>(
+        "SELECT p.oid::regprocedure::text AS f FROM pg_proc p WHERE p.pronamespace = 'sessions'::regnamespace AND p.prosecdef",
+      )
+    ).rows
+      .map((r) => r.f)
+      .sort();
+    const listed = ET_BOOT.split("v_secdef text[] := ARRAY[")[1]!
+      .split("]::text[]")[0]!
+      .match(/'[^']+'/g)!
+      .map((x) => x.slice(1, -1))
+      .sort();
+    expect(listed).toEqual(created);
+    // Every function the migrations create is in the embedded manifest (no signature the
+    // trigger would treat as owner-only by accident).
+    const all = (
+      await db.query<{ f: string }>(
+        "SELECT p.oid::regprocedure::text AS f FROM pg_proc p WHERE p.pronamespace = 'sessions'::regnamespace",
+      )
+    ).rows.map((r) => r.f);
+    const embedded = JSON.parse(ET_BOOT.split("$manifest$")[1]!) as Record<
+      string,
+      string[]
+    >;
+    expect(all.filter((fn) => !(fn in embedded))).toEqual([]);
+  });
+
   test("the frozen trigger constants match the bootstrap file (prosrc sha256 and tags)", () => {
     const body = ET_BOOT.split("$boundary$")[1]!;
     expect(createHash("sha256").update(body).digest("hex")).toBe(
