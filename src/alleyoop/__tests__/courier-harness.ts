@@ -174,6 +174,8 @@ export async function courierWorld(
   /** Runs around a courier manifest POST; returns a replacement response to drop the real one. */
   const hooks: {
     legacyWriter?: boolean;
+    /** Replaces the chunk hop's answer (e.g. a permanent 400). */
+    chunkResponse?: () => Response | undefined;
     beforeManifest?: () => Promise<void>;
     afterManifest?: (res: Response) => Promise<Response | undefined>;
   } = {};
@@ -184,6 +186,8 @@ export async function courierWorld(
     const url = new URL(String(input));
     if (url.pathname.endsWith("/pipeline/chunks")) {
       counts.chunkPosts += 1;
+      const replaced = hooks.chunkResponse?.();
+      if (replaced) return replaced;
       const q = url.searchParams;
       const sealed = await sealRawChunk(store, {
         location: { ...location, startDate: q.get("date")! },

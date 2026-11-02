@@ -52,6 +52,7 @@ import {
   type PipelineStage,
   type RawStore,
   type StageMessage,
+  SCRUB_RULESET_VERSION,
 } from "../shared/vendor.ts";
 import { enrichMessage } from "../shared/enrich.ts";
 import { errorFields, log } from "../shared/log.ts";
@@ -673,7 +674,12 @@ export async function chunksAreServerSealed(
           meta.metadata["raw-sha256"] === chunk.raw_sha256 &&
           Number(meta.metadata["raw-bytes"]) === chunk.stored_raw_bytes &&
           meta.metadata["scrub-ruleset"] === scrub.ruleset &&
-          Number(meta.metadata["scrub-version"]) === scrub.version &&
+          // raw.scrub.version is the LOWEST version over the chunks (the courier
+          // and the export record the minimum), so a session spanning a rule-set
+          // bump lists older and newer chunks: each must be at least the
+          // manifest's version and no newer than this server's.
+          Number(meta.metadata["scrub-version"]) >= scrub.version &&
+          Number(meta.metadata["scrub-version"]) <= SCRUB_RULESET_VERSION &&
           meta.metadata["trace-id"] === manifest.trace_id
         );
       }),

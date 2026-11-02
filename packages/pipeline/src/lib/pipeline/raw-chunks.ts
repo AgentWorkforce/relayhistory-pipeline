@@ -2,8 +2,10 @@
  * The server's raw-chunk writer: scrubs a source range of PII and secrets
  * before it reaches object storage, then compresses and stores it at its v1
  * key. It mirrors the client's `scrub::seal::put_raw_chunk` (manifest spec,
- * "Scrubbing"), so a chunk the server seals is indistinguishable from one a
- * client sealed:
+ * "Scrubbing"), so a chunk the server seals has the same shape as one a
+ * client sealed. Its `raw.scrub.version` says which rules ran: from rule set 2
+ * the server also stores a string past the scrub bound, scrubbed in segments,
+ * where rule set 1 (and a client still on it) refuses it.
  *
  *   - `start_offset`, `bytes` and `sha256` describe the **source** range, so
  *     the key, resume, epochs and the hash chain do not depend on scrubbing;
@@ -38,8 +40,13 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  * `raw.scrub.version` for the current `lib/scrub.ts` rules. Bump it with any
  * rule change so readers can tell which rules a stored chunk went through;
  * existing objects are never rewritten.
+ *
+ * - 1: strings and non-record runs up to `MAX_SCRUB_CHARS`; longer ones refused.
+ * - 2: the same rules; a longer string or run is scrubbed whole, in segments
+ *   cut only where no rule can match across the cut (`scrubLong`). Output for
+ *   anything within the bound is byte-identical to version 1.
  */
-export const SCRUB_RULESET_VERSION = 1;
+export const SCRUB_RULESET_VERSION = 2;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";
@@ -50,6 +57,7 @@ export const META_SCRUB_VERSION = "scrub-version";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
+// <scrub-segmenter> (folded into the scrub rule set digest test: from here to the end marker)
 /**
  * Scrub one source range record by record. A line that is a JSON object,
  * array or string is a record: every string token in it (values and keys) is scrubbed
@@ -88,14 +96,51 @@ export function scrubRecords(source: Uint8Array): {
     if (run) out += scrubBounded(run);
     run = "";
   };
+  /** This line and at least CUT_CONTEXT_CHARS of what follows it. */
+  const lookaheadAt = (i: number) => {
+    let la = "";
+    for (let j = i; j < parts.length && la.length < CUT_CONTEXT_CHARS + (parts[i]?.length ?? 0); j += 2)
+      la += (parts[j] ?? "") + (parts[j + 1] ?? "");
+    return la;
+  };
+  /**
+   * Whether the run may end here (the boundary before line `i`) without
+   * splitting a match. Only a credential cue (a keyword or `:`/`=`) right
+   * before the run's trailing whitespace can reach across a line into the
+   * next one (digit groups are checked too, cheaply); without one, no scrub
+   * runs, so mixed text-and-JSON logs cost what they did in rule set 1.
+   */
+  const boundarySafe = (i: number) => {
+    if (!run) return true;
+    let start = run.length;
+    while (start > 0 && /\s/.test(run[start - 1]!)) start--;
+    const cue = CREDENTIAL_KEYWORD.test(run.slice(Math.max(0, start - 64), start));
+    const digits = /[\d)]/.test(run[start - 1] ?? "") && /^\s*[\d(]/.test(parts[i] ?? "");
+    if (!cue && !digits) return true;
+    // Bounded per chunk: past the cap a cued boundary is treated as unsafe
+    // (a leading JSON string after it is redacted; a key line stays in the run).
+    if (boundaryChecks >= MAX_BOUNDARY_CHECKS) return false;
+    boundaryChecks += 1;
+    return cutIsSafe(run + lookaheadAt(i), run.length, { checks: 0, candidates: 0 }).ok;
+  };
+  let boundaryChecks = 0;
   for (let i = 0; i < parts.length; i += 2) {
     const line = parts[i]!;
     const ending = parts[i + 1] ?? "";
     if (ending) records += 1;
-    if (isRecord(line)) {
+    // Inside an open private-key block a record line (two writers interleaving
+    // on one stream) stays in the run, so the key is redacted whole, as
+    // whole-text scrubbing would; flushing here would store the rest of it.
+    if (!keyOpen && isRecord(line)) {
+      // The run's text may end in a keyword whose value is this record
+      // (`DB_PASSWORD=` then `"<secret>"`). The record is scrubbed once, as a
+      // record, and kept intact; if the boundary splits a match, the value the
+      // text rule would take, a leading JSON string, is redacted in place. (A
+      // record that opens with `{` or `[` offers the rule only the bracket.)
+      const safe = boundarySafe(i);
       flush();
-      keyOpen = false;
-      out += scrubRecordLine(line) + ending;
+      const scrubbed = scrubRecordLine(line);
+      out += (safe ? scrubbed : redactLeadingString(scrubbed)) + ending;
       continue;
     }
     const next = line + ending;
@@ -103,9 +148,13 @@ export function scrubRecords(source: Uint8Array): {
     // starts its own segment and is matched whole). Before a line that would
     // take it past the limit, it ends at the latest safe line boundary (see
     // `safeCut`), carrying the lines after that cut into the next segment.
-    if (run && !keyOpen && privateKeyOpenAfter(line, false)) flush();
+    if (run && !keyOpen && privateKeyOpenAfter(line, false) && boundarySafe(i)) flush();
     else if (run && !keyOpen && run.length + next.length > MAX_SCRUB_CHARS) {
-      const cut = safeCut(run, next);
+      // At least CUT_CONTEXT_CHARS of what follows, for the context check.
+      let lookahead = next;
+      for (let j = i + 2; j < parts.length && lookahead.length < CUT_CONTEXT_CHARS + next.length; j += 2)
+        lookahead += (parts[j] ?? "") + (parts[j + 1] ?? "");
+      const cut = safeCut(run, lookahead.slice(0, next.length + CUT_CONTEXT_CHARS));
       // Every boundary in 64 KiB splits a match: refuse the chunk rather than
       // let `scrubText` truncate the segment and drop lines.
       if (!cut)
@@ -119,12 +168,126 @@ export function scrubRecords(source: Uint8Array): {
       flush();
       run = carry;
     }
-    run += line + ending;
-    keyOpen = privateKeyOpenAfter(line, keyOpen);
+    // Inside an open key block a record line joins the run record-scrubbed, not raw (K-2):
+    // raw JSON escapes hide tokens from the text rules (`\nghp_...` has no word boundary),
+    // and the record that closes the block would otherwise carry what follows its footer
+    // into the run as unscrubbed JSON. Record scrubbing leaves a lone footer string intact,
+    // so the block still pairs and is redacted whole.
+    const piece = keyOpen && isRecord(line) ? scrubRecordLine(line) : line;
+    run += piece + ending;
+    keyOpen = privateKeyOpenAfter(piece, keyOpen);
   }
   flush();
   return { scrubbed: encoder.encode(out), records };
 }
+
+/**
+ * Longest whitespace run a segment may be cut inside. Rules whose match spans
+ * a separator (`Bearer <token>`, `password: value`) allow whitespace of any
+ * length, so a cut inside a longer run cannot be proven safe within a bounded
+ * context: such a cut is refused, never guessed.
+ */
+const MAX_CUT_GAP = 1024;
+/** Most candidate cuts a segment search fully checks before refusing (bounds CPU). */
+const MAX_CUT_CHECKS = 48;
+/** Most context-checked record or key-line boundaries per chunk (bounds CPU on cue-heavy logs). */
+const MAX_BOUNDARY_CHECKS = 256;
+/** Most candidates of any kind (cheap refusals included) a segment search looks at. */
+const MAX_CUT_CANDIDATES = 4096;
+/**
+ * A credential keyword (and optional `:`/`=`) at the end of the text before a
+ * whitespace run: a cut there would separate the keyword from its value.
+ */
+const CREDENTIAL_KEYWORD =
+  // Not `\b`: in `DB_PASSWORD` there is no word boundary between `_` and `P`.
+  /(?:(?<![A-Za-z0-9])(?:bearer|basic|token|password|passwd|pwd|secret|api[-_]?key|access[-_]?key|secret[-_]?key|private[-_]?key|client[-_]?secret|authorization|auth|credentials?|key)["']?\s*[:=]?|[:=])["']?$/i;
+
+/**
+ * Whether the text may be cut at `cut` (the segments either side are then
+ * scrubbed separately). The cut sits inside a whitespace run `[start, end)`.
+ * It must hold that:
+ *  - the run is at most `MAX_CUT_GAP` long;
+ *  - no credential keyword or `:`/`=` ends right before the run;
+ *  - a digit or `)` before and a digit or `(` after does not straddle it (cards, phone numbers);
+ *  - `CUT_CONTEXT_CHARS` beyond each end of the run scrubs the same together and apart.
+ * `budget.checks` counts the full checks (three `scrubText` calls each).
+ */
+interface CutBudget {
+  checks: number;
+  candidates: number;
+}
+
+/**
+ * Characters the cut search has walked and candidates it has looked at, process
+ * wide. Tests read it to bound the segmenter's work deterministically (time is
+ * load-sensitive); nothing else reads it.
+ */
+export const segmenterWork = { walked: 0, candidates: 0 };
+
+/**
+ * Where a value would start after a keyword that ends right before a
+ * whitespace run ending at `end`: past the run, an optional `:`/`=`, more
+ * whitespace and an optional quote. -1 when a stretch of whitespace there is
+ * longer than MAX_CUT_GAP (a value could hide past any bounded window).
+ */
+function valueStart(text: string, end: number): number {
+  let i = end;
+  const skip = () => {
+    const from = i;
+    while (i < text.length && /\s/.test(text[i]!)) {
+      i++;
+      segmenterWork.walked++;
+      if (i - from > MAX_CUT_GAP) return false;
+    }
+    return true;
+  };
+  if (!skip()) return -1;
+  if (text[i] === ":" || text[i] === "=") i++;
+  if (!skip()) return -1;
+  if (text[i] === '"' || text[i] === "'" || text[i] === "`") i++;
+  return i;
+}
+
+/**
+ * `{ ok }` plus `runStart`, the start of the whitespace run around `cut`, so a
+ * caller can skip a refused run in one step (each run is walked once).
+ */
+function cutIsSafe(text: string, cut: number, budget: CutBudget): { ok: boolean; runStart: number } {
+  budget.candidates += 1;
+  segmenterWork.candidates++;
+  let start = cut;
+  while (start > 0 && /\s/.test(text[start - 1]!)) {
+    start--;
+    segmenterWork.walked++;
+  }
+  // Forward walk bounded: a run past MAX_CUT_GAP is refused whatever its length.
+  let end = cut;
+  while (end < text.length && end - start <= MAX_CUT_GAP && /\s/.test(text[end]!)) {
+    end++;
+    segmenterWork.walked++;
+  }
+  const no = { ok: false, runStart: start };
+  if (end - start > MAX_CUT_GAP) return no;
+  if (/[\d)]/.test(text[start - 1] ?? "") && /[\d(]/.test(text[end] ?? "")) return no;
+  // A credential keyword (or `:`/`=`) right before the run does not refuse the
+  // cut; it widens the context check so it reaches past where the keyword's
+  // value would start. Only an unbounded gap there refuses.
+  let reach = end;
+  if (CREDENTIAL_KEYWORD.test(text.slice(Math.max(0, start - 64), start))) {
+    const v = valueStart(text, end);
+    if (v < 0) return no;
+    reach = v;
+    // The value must be in view: if the text ends first, the caller has not
+    // given enough lookahead to prove anything.
+    if (reach + 1 > text.length) return no;
+  }
+  budget.checks += 1;
+  const before = text.slice(Math.max(0, start - CUT_CONTEXT_CHARS), cut);
+  const after = text.slice(cut, Math.min(text.length, reach + CUT_CONTEXT_CHARS));
+  return { ok: scrubText(before + after) === scrubText(before) + scrubText(after), runStart: start };
+}
+
+const withinBudget = (b: CutBudget) => b.checks < MAX_CUT_CHECKS && b.candidates < MAX_CUT_CANDIDATES;
 
 /** How far back `safeCut` looks for a boundary, and how much text it scrubs. */
 const CUT_SEARCH_CHARS = 65_536;
@@ -139,34 +302,110 @@ const CUT_CONTEXT_CHARS = 4096;
  * and compared with scrubbing each side alone; any difference means a match
  * crosses it.
  */
-function safeCut(run: string, next: string): number {
+function safeCut(run: string, lookahead: string): number {
+  // `lookahead` is the line that would overflow plus at least CUT_CONTEXT_CHARS
+  // of what follows it, so a secret on a later line is in the context check.
+  const text = run + lookahead;
+  const budget: CutBudget = { checks: 0, candidates: 0 };
   const floor = Math.max(1, run.length - CUT_SEARCH_CHARS);
-  for (let cut = run.length; cut >= floor; ) {
-    const before = run.slice(Math.max(0, cut - CUT_CONTEXT_CHARS), cut);
-    const after = run.slice(cut) + next;
-    const head = after.slice(0, CUT_CONTEXT_CHARS);
-    if (
-      !(/[\d)]\s*$/.test(before) && /^[\d(]/.test(after)) &&
-      scrubText(before + head) === scrubText(before) + scrubText(head)
-    )
-      return cut;
-    // The previous line boundary: just after the newline ending the line
-    // before this one (0, below the floor, when there is none).
-    cut = run.lastIndexOf("\n", cut - 2) + 1;
+  const keys = keyBlockSpans(run);
+  for (let cut = run.length; cut >= floor && withinBudget(budget); ) {
+    // Never inside a key block, even one that closed before the overflowing line
+    // (the context check cannot see a header more than CUT_CONTEXT_CHARS back):
+    // go to the line boundary at or before its header.
+    const inside = keyBlockAround(keys, cut);
+    if (inside) {
+      cut = run.lastIndexOf("\n", inside[0] - 1) + 1;
+      if (cut === 0) break;
+      continue;
+    }
+    const v = cutIsSafe(text, cut, budget);
+    if (v.ok) return cut;
+    // The previous line boundary before this whitespace run: just after the
+    // newline ending the line before it (0, below the floor, when there is none).
+    cut = run.lastIndexOf("\n", Math.min(cut, v.runStart) - 2) + 1;
   }
   return 0;
 }
 
-const PEM_BEGIN = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
-const PEM_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
+// Fresh objects per use: a shared global regex keeps `lastIndex` between
+// calls (and `matchAll` clones it), so one request's scan could make a later
+// one miss a key header and cut inside the key.
+const PEM_BEGIN_SRC = "-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----";
+const PEM_END_SRC = "-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----";
+const pemBegin = () => new RegExp(PEM_BEGIN_SRC, "g");
+const pemEnd = () => new RegExp(PEM_END_SRC, "g");
 
-/** Whether a private-key block is still open after `line`. */
+/**
+ * Whether a private-key block is still open after `line`, pairing header and footer
+ * in order exactly as `keyBlockSpans` and the PEM rule do: a footer only counts after
+ * the header's own match. (Taking the last marker instead disagreed on a header that
+ * shares its dashes with a footer, `-----BEGIN … KEY-----END … KEY-----`: the rule sees
+ * that block open, so it must be open here too.)
+ */
 function privateKeyOpenAfter(line: string, open: boolean) {
-  const marks = [
-    ...[...line.matchAll(PEM_BEGIN)].map((m) => [m.index, true] as const),
-    ...[...line.matchAll(PEM_END)].map((m) => [m.index, false] as const),
-  ].sort((a, b) => a[0] - b[0]);
-  return marks.length ? marks[marks.length - 1]![1] : open;
+  const PEM_BEGIN = pemBegin();
+  const PEM_END = pemEnd();
+  let at = 0;
+  for (;;) {
+    const re = open ? PEM_END : PEM_BEGIN;
+    re.lastIndex = at;
+    const m = re.exec(line);
+    if (!m) return open;
+    at = m.index + m[0].length;
+    open = !open;
+  }
+}
+
+/**
+ * Every private-key block in `text` as [start, end): from its header to just past
+ * its footer, or to the end of `text` for a block left open. A cut strictly inside
+ * one splits the key across segments, and each segment alone holds a header without
+ * its footer (or the reverse), which no rule redacts: the key lines after the cut
+ * would be stored in clear. The cut searches never stop inside one.
+ */
+function keyBlockSpans(text: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  const PEM_BEGIN = pemBegin();
+  const PEM_END = pemEnd();
+  let at = 0;
+  for (;;) {
+    PEM_BEGIN.lastIndex = at;
+    const begin = PEM_BEGIN.exec(text);
+    if (!begin) break;
+    PEM_END.lastIndex = begin.index + begin[0].length;
+    const end = PEM_END.exec(text);
+    if (!end) {
+      spans.push([begin.index, text.length]);
+      break;
+    }
+    spans.push([begin.index, end.index + end[0].length]);
+    at = end.index + end[0].length;
+  }
+  return spans;
+}
+
+/** The key block `cut` falls strictly inside, if any (spans are sorted and disjoint: binary search). */
+function keyBlockAround(spans: Array<[number, number]>, cut: number): [number, number] | undefined {
+  let lo = 0;
+  let hi = spans.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const [start, end] = spans[mid]!;
+    if (cut <= start) hi = mid - 1;
+    else if (cut >= end) lo = mid + 1;
+    else return spans[mid];
+  }
+  return undefined;
+}
+
+/** A record line whose first token is a JSON string, with that string redacted (still valid JSON). */
+function redactLeadingString(record: string): string {
+  const lead = record.length - record.trimStart().length;
+  if (record[lead] !== '"') return record;
+  let j = lead + 1;
+  while (j < record.length && record[j] !== '"') j += record[j] === "\\" ? 2 : 1;
+  return `${record.slice(0, lead)}${JSON.stringify(REDACTED)}${record.slice(j + 1)}`;
 }
 
 /**
@@ -203,19 +442,108 @@ export function scrubStringToken(
 const REDACTED = "[REDACTED]";
 
 /**
- * `scrubText` for stored chunks: a string past its bound would come back cut
- * short (with a note), and the chunk would be stored without the rest while
- * reporting the full source range. Refuse it instead, so the client resends
- * smaller chunks rather than skipping text that was never stored.
+ * `scrubText` for stored chunks. `scrubText` itself truncates past its bound,
+ * which would store less than the source range reports, so a longer text is
+ * scrubbed whole with `scrubLong` instead (version 2; version 1 refused it).
  */
 function scrubBounded(text: string): string {
-  if (exceedsScrubBound(text))
-    throw new PipelineError(
-      "chunk_string_too_long",
-      `raw chunk holds a line or string longer than the ${MAX_SCRUB_CHARS}-character scrub limit`,
-      false,
-    );
-  return scrubText(text);
+  return scrubLong(text);
+}
+
+/**
+ * Where a long text may be split so that scrubbing the two sides separately
+ * equals scrubbing them together: the latest index at or below
+ * `MAX_SCRUB_CHARS` (and no more than `CUT_SEARCH_CHARS` before it) that
+ *  - follows whitespace (no rule but PEM matches across a non-whitespace boundary
+ *    within one token, so a token is never split),
+ *  - does not sit between two digit groups (cards, phone numbers),
+ *  - is not inside a private-key block whose footer comes later, and
+ *  - leaves `CUT_CONTEXT_CHARS` on each side scrubbing identically together and
+ *    apart, which also covers rules whose match spans a separator before the
+ *    secret (`Bearer <token>`, `key = value`).
+ * 0 when there is none.
+ */
+function longCut(text: string): number {
+  let top = MAX_SCRUB_CHARS;
+  // A key block open at the bound: cut before its header, or not at all.
+  let open = -1;
+  {
+    const PEM_BEGIN = pemBegin();
+    const PEM_END = pemEnd();
+    let at = 0;
+    for (;;) {
+      PEM_BEGIN.lastIndex = at;
+      const begin = PEM_BEGIN.exec(text);
+      if (!begin || begin.index >= top) break;
+      PEM_END.lastIndex = begin.index + begin[0].length;
+      const end = PEM_END.exec(text);
+      if (!end) {
+        open = begin.index;
+        break;
+      }
+      // A block straddling the bound is open at the bound too.
+      if (end.index + end[0].length > top) {
+        open = begin.index;
+        break;
+      }
+      at = end.index + end[0].length;
+    }
+  }
+  if (open !== -1) top = open;
+  const floor = Math.max(1, MAX_SCRUB_CHARS - CUT_SEARCH_CHARS);
+  const budget: CutBudget = { checks: 0, candidates: 0 };
+  const keys = keyBlockSpans(text.slice(0, top));
+  for (let cut = top; cut >= floor && withinBudget(budget); cut--) {
+    // Not inside a key block that closed below the bound either.
+    const inside = keyBlockAround(keys, cut);
+    if (inside) {
+      cut = inside[0] + 1; // the loop's cut-- lands on the header's start
+      continue;
+    }
+    // Only at the end of a whitespace run (after whitespace, before text):
+    // one candidate per run, so a run is checked once, not once per char.
+    if (!/\s/.test(text[cut - 1] ?? "") || /\s/.test(text[cut] ?? "")) continue;
+    const v = cutIsSafe(text, cut, budget);
+    if (v.ok) return cut;
+    cut = Math.min(cut, v.runStart);
+  }
+  return 0;
+}
+// </scrub-segmenter>
+
+/**
+ * Scrub a text of any length, whole: segments of at most `MAX_SCRUB_CHARS`
+ * split at `longCut`, each scrubbed with `scrubText`. Nothing is truncated. A
+ * text with no safe cut (one unbroken run of more than the bound, such as a
+ * base64 dump with no whitespace) is refused, never stored partly scrubbed.
+ */
+export function scrubLong(text: string): string {
+  if (!exceedsScrubBound(text)) return scrubText(text);
+  let out = "";
+  let rest = text;
+  while (exceedsScrubBound(rest)) {
+    const cut = longCut(rest);
+    if (!cut)
+      throw new PipelineError(
+        "chunk_string_too_long",
+        `raw chunk holds a line or string longer than the ${MAX_SCRUB_CHARS}-character scrub limit with no safe place to segment it`,
+        false,
+      );
+    out += scrubText(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  return out + scrubText(rest);
+}
+
+/** Whether `scrubLong` can take this text (it has safe cuts all the way). */
+export function canScrubLong(text: string): boolean {
+  let rest = text;
+  while (exceedsScrubBound(rest)) {
+    const cut = longCut(rest);
+    if (!cut) return false;
+    rest = rest.slice(cut);
+  }
+  return true;
 }
 
 /** Key names seen in one JSON object while its record is rewritten. */
