@@ -1563,6 +1563,65 @@ export async function sessionsFunctionAclDrift(
   return drift;
 }
 
+/** Read-only preview of the exact-ACL drift check, split by what the migrator would do. */
+export interface FunctionAclPreview {
+  /** The runtime role whose RUNTIME_APPLICATION_FUNCTIONS grants are expected (null: none). */
+  runtime_role: string | null;
+  /** Grants present but not expected ("fn: entry"; "<default>" is the built-in PUBLIC EXECUTE): the migrator refuses these. */
+  function_acl_drift_extra: string[];
+  /** Grants expected but absent ("fn: entry"; "fn: <function>" for a missing function): the migrator would add these. */
+  function_acl_missing: string[];
+  /**
+   * PUBLIC EXECUTE the migrator would revoke before its check (its REVOKE ... FROM PUBLIC
+   * on every sessions function), so not refused; reported because such a function is
+   * PUBLIC-executable now.
+   */
+  function_acl_public_revoked: string[];
+}
+
+/**
+ * The same comparison as sessionsFunctionAclDrift (manifest plus the runtime application
+ * ACL the migrator installs), read-only and split into extras and missing grants. Missing
+ * runtime grants are expected before the first migrate; only extras would be refused.
+ */
+export async function sessionsFunctionAclPreview(
+  client: GuardClient,
+  runtimeRole: string | undefined,
+): Promise<FunctionAclPreview> {
+  const manifest = await sessionsFunctionAclManifest();
+  const actual = await sessionsFunctionAcl(client);
+  const extra: string[] = [];
+  const missing: string[] = [];
+  const publicRevoked: string[] = [];
+  for (const fn of [...new Set([...Object.keys(manifest), ...Object.keys(actual)])].sort()) {
+    const expected = new Set(manifest[fn] ?? []);
+    if (runtimeRole && (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn))
+      expected.add(`${runtimeRole}:EXECUTE`);
+    const raw = actual[fn];
+    if (raw === undefined) {
+      if (manifest[fn]) missing.push(`${fn}: <function>`);
+      continue;
+    }
+    // Model the migrator's REVOKE EXECUTE ... FROM PUBLIC: the built-in default becomes
+    // owner-only, and PUBLIC EXECUTE entries go away.
+    const have: string[] = [];
+    for (const e of raw)
+      if (e === "<default>") {
+        publicRevoked.push(`${fn}: <default>`);
+        have.push("<owner>:EXECUTE");
+      } else if (e.startsWith("PUBLIC:EXECUTE")) publicRevoked.push(`${fn}: ${e}`);
+      else have.push(e);
+    for (const e of [...have].sort()) if (!expected.has(e)) extra.push(`${fn}: ${e}`);
+    for (const e of [...expected].sort()) if (!have.includes(e)) missing.push(`${fn}: ${e}`);
+  }
+  return {
+    runtime_role: runtimeRole ?? null,
+    function_acl_drift_extra: extra,
+    function_acl_missing: missing,
+    function_acl_public_revoked: publicRevoked,
+  };
+}
+
 /**
  * Every sessions function's ACL after a migrate, normalized for comparison with the
  * committed manifest (src/hoopdb/sessions-function-acl.json): grantee names (PUBLIC for

@@ -23,6 +23,7 @@ import {
   runtimeRoleViolations,
   sequencePreflight,
   sessionsFunctionAclDrift,
+  sessionsFunctionAclPreview,
   type FunctionBoundaryMode,
 } from "./migrate-guards.ts";
 import {
@@ -784,8 +785,10 @@ if (import.meta.main) {
   if (process.argv.includes("--activation-check")) {
     // For an operator or the activation dossier: the function-boundary evidence (names and
     // booleans only) for HOOPDB_URL, HOOPDB_FUNCTION_BOUNDARY_MODE and HOOPDB_DB_MODE.
-    // Without HOOPDB_DB_MODE every creator is covered (no platform exclusion). Exit 1 if
-    // unproven.
+    // Without HOOPDB_DB_MODE every creator is covered (no platform exclusion). Outside
+    // local mode it also previews the exact-ACL drift check, read-only: grants the
+    // migrator would refuse (function_acl_drift_extra) and grants it would add
+    // (function_acl_missing). Exit 1 if unproven or if any extra exists.
     const dbMode = process.env.HOOPDB_DB_MODE;
     if (
       dbMode !== undefined &&
@@ -804,11 +807,32 @@ if (import.meta.main) {
         process.env.HOOPDB_RUNTIME_ROLE || undefined,
       ),
       checksumAliasEvidence(db),
+      // The preview needs the runtime role whose #116 grants the migrator installs; local
+      // mode has no drift check, so neither runs there.
+      dbMode === "local" || !process.env.HOOPDB_RUNTIME_ROLE
+        ? Promise.resolve(null)
+        : sessionsFunctionAclPreview(db, process.env.HOOPDB_RUNTIME_ROLE),
     ])
-      .then(async ([e, migration_checksum_aliases]) => {
-        console.log(JSON.stringify({ ...e, migration_checksum_aliases }));
+      .then(async ([e, migration_checksum_aliases, acl]) => {
+        const satisfied =
+          e.satisfied && (acl?.function_acl_drift_extra.length ?? 0) === 0;
+        console.log(
+          JSON.stringify({
+            ...e,
+            migration_checksum_aliases,
+            function_acl_preview:
+              dbMode === "local"
+                ? "not_applicable_local"
+                : acl
+                  ? "checked"
+                  : "skipped_runtime_role_unset",
+            ...(acl ?? {}),
+            function_boundary_satisfied: e.satisfied,
+            satisfied,
+          }),
+        );
         await db.end();
-        process.exit(e.satisfied ? 0 : 1);
+        process.exit(satisfied ? 0 : 1);
       })
       .catch(async (err) => {
         console.error(

@@ -97,9 +97,9 @@ or verifier, so the generation is unchanged. So:
   label is a commit that has `ab3ee7f` as an ancestor (check it with the same `merge-base`
   command). Record each digest. Images built from `fe5a2da` or `84a962c` are not allowed, even
   though they show the same generation.
-- `--activation-check` gives no read-only preview of the drift check: the drift check runs only
-  inside the migrator's validation transaction. That is a known gap; a follow-up will add the
-  preview. So the first evidence of drift is a refusal at A2 (see §8 for the resulting state).
+- `--activation-check` now previews the drift check read-only (with `HOOPDB_RUNTIME_ROLE` set):
+  `function_acl_drift_extra` lists grants the migrator would refuse (exit 1), and
+  `function_acl_missing` lists grants it would add (exit 0).
 
 **Environment for every migrator command** (names only; values come from 1Password through
 `op run` or tmpfs, are never printed and are never written to disk):
@@ -184,8 +184,8 @@ Run the steps in table order: **A1, then A0, then A2–A5**. A1 and the dump its
 
 **Other lanes (not in this plan):** #137's exact-ACL drift check now runs at every non-local
 migrate. Before the next migrate of the AWS-proof CNPG or the GCP Cloud SQL databases, their owners
-run `--activation-check` read-only there. The drift check itself has no read-only preview (§2), so
-they should compare `sessions` function ACLs with `src/hoopdb/sessions-function-acl.json` first.
+run `--activation-check` read-only there, with `HOOPDB_RUNTIME_ROLE` set: its
+`function_acl_drift_extra` must be empty (§2).
 
 **#121 ownership:** cloud-handoff owns the #121 Lambda. Its SQS mapping is paused today because of
 a secret-format bug, and it stays paused until A2 marks `pass`. Its image must pass the §2 image

@@ -1839,6 +1839,68 @@ const activationCheck = (
     evidence: JSON.parse(r.stdout.trim().split("\n").at(-1) || "{}"),
   };
 };
+await check(
+  "read-only ACL drift preview in --activation-check (selfhosted): clean migrate both lists empty (exit 0); an extra GRANT to authenticated is extra (exit 1); a missing runtime grant is missing only (exit 0); nothing is changed",
+  async () => {
+    await fresh("g6_prev", ["g6_rt2"]);
+    const env = {
+      HOOPDB_DB_MODE: "selfhosted",
+      HOOPDB_RUNTIME_ROLE: "g6_rt2",
+    };
+    const m = migrate("g6_prev", SEQ);
+    const clean = activationCheck("g6_prev", env);
+    await sql(
+      "g6_prev",
+      "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO authenticated",
+      "hoop",
+    );
+    const extra = activationCheck("g6_prev", env);
+    await sql(
+      "g6_prev",
+      "REVOKE EXECUTE ON FUNCTION sessions.repo_backfill_report() FROM authenticated; REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM g6_rt2",
+      "hoop",
+    );
+    const missing = activationCheck("g6_prev", env);
+    const stillMissing = (
+      await sql(
+        "g6_prev",
+        "SELECT has_function_privilege('g6_rt2', 'sessions.jwt_org_id()', 'EXECUTE') AS g",
+      )
+    ).rows[0]!.g;
+    const repaired = migrate("g6_prev", SEQ);
+    const after = activationCheck("g6_prev", env);
+    await attempt("postgres", "DROP DATABASE IF EXISTS g6_prev WITH (FORCE)");
+    const lists = (c: { evidence: Record<string, unknown> }) => ({
+      extra: c.evidence.function_acl_drift_extra,
+      missing: c.evidence.function_acl_missing,
+    });
+    const empty = (c: { evidence: Record<string, unknown> }) =>
+      JSON.stringify(lists(c)) === JSON.stringify({ extra: [], missing: [] });
+    return [
+      m.exit === 0 &&
+        clean.status === 0 &&
+        empty(clean) &&
+        clean.evidence.function_acl_preview === "checked" &&
+        extra.status === 1 &&
+        JSON.stringify(extra.evidence.function_acl_drift_extra) ===
+          JSON.stringify([
+            "sessions.repo_backfill_report(): authenticated:EXECUTE",
+          ]) &&
+        extra.evidence.function_boundary_satisfied === true &&
+        missing.status === 0 &&
+        JSON.stringify(lists(missing)) ===
+          JSON.stringify({
+            extra: [],
+            missing: ["sessions.jwt_org_id(): g6_rt2:EXECUTE"],
+          }) &&
+        stillMissing === false &&
+        repaired.exit === 0 &&
+        after.status === 0 &&
+        empty(after),
+      `clean=${clean.status}:${fmt(lists(clean))} extra=${extra.status}:${fmt(lists(extra))} missing=${missing.status}:${fmt(lists(missing))} read_only=${stillMissing === false} repaired=${fmt(repaired)} after=${after.status}`,
+    ];
+  },
+);
 for (const [name, poison, shown] of [
   [
     "an extra grantee (authenticated EXECUTE)",

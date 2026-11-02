@@ -23,6 +23,7 @@ import {
   migrationChecksumMatches,
   RUNTIME_APPLICATION_FUNCTIONS,
   sessionsFunctionAcl,
+  sessionsFunctionAclPreview,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
   SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256,
   SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS,
@@ -2148,6 +2149,66 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         (after.marker as Array<{ status: string }>).map((m) => m.status),
       ).toEqual(["pending"]);
     });
+
+  test("read-only ACL preview: before migrate only missing; clean migrate both empty; an extra grant is extra; a missing runtime grant is missing only", async () => {
+    const db = await fresh();
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
+    const before = await sessionsFunctionAclPreview(client(db), "g6_rt");
+    expect(before.function_acl_drift_extra).toEqual([]);
+    expect(before.function_acl_missing.length).toBeGreaterThan(0);
+    const profile: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+    expect(await sessionsFunctionAclPreview(client(db), "g6_rt")).toEqual({
+      runtime_role: "g6_rt",
+      function_acl_drift_extra: [],
+      function_acl_missing: [],
+      function_acl_public_revoked: [],
+    });
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO authenticated",
+    );
+    expect(
+      (await sessionsFunctionAclPreview(client(db), "g6_rt"))
+        .function_acl_drift_extra,
+    ).toEqual(["sessions.repo_backfill_report(): authenticated:EXECUTE"]);
+    await db.exec(
+      "REVOKE EXECUTE ON FUNCTION sessions.repo_backfill_report() FROM authenticated; REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM g6_rt",
+    );
+    expect(await sessionsFunctionAclPreview(client(db), "g6_rt")).toEqual({
+      runtime_role: "g6_rt",
+      function_acl_drift_extra: [],
+      function_acl_missing: ["sessions.jwt_org_id(): g6_rt:EXECUTE"],
+      function_acl_public_revoked: [],
+    });
+    // PUBLIC EXECUTE is what the migrator revokes, not refuses: reported separately.
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO g6_rt, PUBLIC",
+    );
+    const pub = await sessionsFunctionAclPreview(client(db), "g6_rt");
+    expect(pub.function_acl_drift_extra).toEqual([]);
+    expect(pub.function_acl_public_revoked).toEqual([
+      "sessions.jwt_org_id(): PUBLIC:EXECUTE",
+    ]);
+    await db.exec(
+      "REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM PUBLIC",
+    );
+    await db.exec(
+      "REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM g6_rt",
+    );
+    // Read-only: the preview changed nothing.
+    expect(
+      (await sessionsFunctionAclPreview(client(db), "g6_rt"))
+        .function_acl_missing,
+    ).toEqual(["sessions.jwt_org_id(): g6_rt:EXECUTE"]);
+  });
 
   test("run-time exact manifest: local mode is unchanged (no check)", async () => {
     const db = await fresh();
