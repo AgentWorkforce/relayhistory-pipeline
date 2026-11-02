@@ -71,14 +71,10 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
  * digit groups), so `scrubText` never truncates it. Line endings are kept;
  * `records` counts complete lines.
  */
-export function scrubRecords(
-  source: Uint8Array,
-  options: ScrubOptions = {},
-): {
+export function scrubRecords(source: Uint8Array): {
   scrubbed: Uint8Array;
   records: number;
 } {
-  const bounded = options.oversize === "redact" ? scrubLongOrRedact : scrubBounded;
   let text: string;
   try {
     text = decoder.decode(source);
@@ -97,7 +93,7 @@ export function scrubRecords(
   let run = "";
   let keyOpen = false;
   const flush = () => {
-    if (run) out += bounded(run);
+    if (run) out += scrubBounded(run);
     run = "";
   };
   /** This line and at least CUT_CONTEXT_CHARS of what follows it. */
@@ -143,7 +139,7 @@ export function scrubRecords(
       // record that opens with `{` or `[` offers the rule only the bracket.)
       const safe = boundarySafe(i);
       flush();
-      const scrubbed = scrubRecordLine(line, bounded);
+      const scrubbed = scrubRecordLine(line);
       out += (safe ? scrubbed : redactLeadingString(scrubbed)) + ending;
       continue;
     }
@@ -177,7 +173,7 @@ export function scrubRecords(
     // and the record that closes the block would otherwise carry what follows its footer
     // into the run as unscrubbed JSON. Record scrubbing leaves a lone footer string intact,
     // so the block still pairs and is redacted whole.
-    const piece = keyOpen && isRecord(line) ? scrubRecordLine(line, bounded) : line;
+    const piece = keyOpen && isRecord(line) ? scrubRecordLine(line) : line;
     run += piece + ending;
     keyOpen = privateKeyOpenAfter(piece, keyOpen);
   }
@@ -539,28 +535,6 @@ export function scrubLong(text: string): string {
   return out + scrubText(rest);
 }
 
-/**
- * What happens to a text `scrubLong` cannot segment (no safe cut: one unbroken
- * run past the bound, such as canonical JSON evidence or a base64 dump).
- * `refuse` (the default, every client-facing writer): `chunk_string_too_long`,
- * so the client resends smaller chunks. `redact`: for a server-side writer
- * whose input is final (a delivery batch the client cannot re-cut), the whole
- * text becomes `oversizeRedaction`, so the record still lands and nothing
- * unscrubbed is ever stored.
- */
-export interface ScrubOptions {
-  oversize?: "refuse" | "redact";
-}
-
-/** What an over-bound text with no safe cut becomes under `oversize: "redact"`. */
-export function oversizeRedaction(chars: number): string {
-  return `[REDACTED: ${chars} characters exceed the ${MAX_SCRUB_CHARS}-character scrub limit and could not be segmented safely]`;
-}
-
-function scrubLongOrRedact(text: string): string {
-  return canScrubLong(text) ? scrubLong(text) : oversizeRedaction(text.length);
-}
-
 /** Whether `scrubLong` can take this text (it has safe cuts all the way). */
 export function canScrubLong(text: string): boolean {
   let rest = text;
@@ -593,10 +567,7 @@ interface ObjectKeys {
  * the same name both stay readable. A key the source itself repeated is kept
  * as the source had it.
  */
-function scrubRecordLine(
-  line: string,
-  scrub: (text: string) => string = scrubBounded,
-): string {
+function scrubRecordLine(line: string): string {
   // One entry per open container; null for an array.
   const stack: (ObjectKeys | null)[] = [];
   let out = "";
@@ -609,7 +580,7 @@ function scrubRecordLine(
       while (line[j] !== '"') j += line[j] === "\\" ? 2 : 1;
       const literal = line.slice(i, j + 1);
       const value = JSON.parse(literal) as string;
-      const scrubbed = scrubStringToken(literal, value, scrub);
+      const scrubbed = scrubStringToken(literal, value);
       let name = scrubbed;
       if (top?.expectKey) {
         const repeated = top.source.has(value);
@@ -772,8 +743,6 @@ export async function rawChunkSealingAvailable() {
 }
 
 export interface SealRawChunk {
-  /** A text with no safe cut: refused (default) or redacted (`ScrubOptions`). */
-  oversize?: ScrubOptions["oversize"];
   location: SessionLocation;
   format: RawFormat;
   seq: number;
@@ -832,9 +801,7 @@ export async function sealRawChunk(
     sourceSha,
     input.format,
   );
-  const { scrubbed, records } = scrubRecords(input.source, {
-    oversize: input.oversize,
-  });
+  const { scrubbed, records } = scrubRecords(input.source);
   const stored = compress(scrubbed);
   const base: SourceFields = {
     seq: input.seq,

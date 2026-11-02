@@ -118,15 +118,17 @@ describe("deliverBatch", () => {
     expect(stored.payload.text).toContain("[relayhistory: truncated");
   });
 
-  test("chunk_string_too_long: long *_json evidence of short strings lands whole (segmented, not refused)", async () => {
+  test("chunk_string_too_long: long *_json evidence with no safe cut still lands (that string redacted, the record kept)", async () => {
     const { store, deps } = setup();
     const items = Array.from({ length: 40_000 }, (_, i) => `item-${i}`);
     const evidence = JSON.stringify({ items });
     expect(evidence.length).toBeGreaterThan(MAX_SCRUB_CHARS);
-    const b = await batch([record({ record_id: "t1", kind: "tool_call", payload: { input_json: evidence, ts_ms: 1_761_955_200_000 } })]);
-    await deliverBatch(deps, TENANT, b);
+    const b = await batch([record({ record_id: "t1", kind: "tool_call", payload: { input_json: evidence, tool_name: "Read", ts_ms: 1_761_955_200_000 } })]);
+    expect((await deliverBatch(deps, TENANT, b)).outcome).toBe("accepted");
     const stored = JSON.parse((await chunks(store))[0]!.trim());
-    expect(JSON.parse(stored.payload.input_json).items).toEqual(items);
+    expect(stored.record_id).toBe("t1");
+    expect(stored.payload.tool_name).toBe("Read");
+    expect(stored.payload.input_json).toMatch(/^\[REDACTED: \d+ characters exceed/);
   });
 
   test("record_without_session and many sessions land (no Workers budgets)", async () => {
@@ -390,6 +392,33 @@ describe("staging: a batch wider than one Worker invocation", () => {
     expect(m.records.map((r) => [r[0], r[1], r[4]])).toEqual([[0, 0, "a"], [0, 1, "c"], [1, 0, "b"]]);
   });
 
+  test("a staged retry whose kept records shrank writes every session it acknowledges (review H1)", async () => {
+    const { store, ledger, deps } = setup();
+    const sent: import("../staging.ts").FanoutMessage[] = [];
+    let fail = true;
+    const staged = {
+      ...deps,
+      inlineMaxSessions: 1,
+      fanout: async (m: import("../staging.ts").FanoutMessage[]) => {
+        if (fail) throw new Error("queue down");
+        sent.push(...m);
+      },
+    };
+    const records = [record({ record_id: "a", session_id: "x" }), record({ record_id: "b", session_id: "y" }), record({ record_id: "c", session_id: "z" })];
+    const b = await batch(records);
+    await deliverBatch(staged, TENANT, b).catch(() => {});
+    // Meanwhile another batch commits `a`: on the retry it is stale, so only b and c are kept.
+    ledger.revisions.set("a", 1);
+    fail = false;
+    expect((await deliverBatch(staged, TENANT, b)).outcome).toBe("accepted_staged");
+    const { fanout } = await import("../staging.ts");
+    for (const m of sent) await fanout({ store, keyRoot: "96bulls", sleep: noSleep }, m, (x) => new Uint8Array(zstdDecompressSync(x)));
+    const manifests = (await listAll(store, "96bulls/org-a/v1")).filter((k) => k.endsWith("manifest.json"));
+    expect(manifests.some((k) => k.includes("/s=y/"))).toBe(true);
+    expect(manifests.some((k) => k.includes("/s=z/"))).toBe(true);
+    expect(ledger.commits.at(-1)!.records.map((r) => r.recordId)).toEqual(["b", "c"]);
+  });
+
   test("a staged batch is not acknowledged when the fan-out cannot be queued", async () => {
     const { ledger, deps } = setup();
     const staged = { ...deps, inlineMaxSessions: 1, fanout: async () => { throw new Error("queue down"); } };
@@ -404,6 +433,9 @@ describe("Worker entry", () => {
     const worker = (await import("../worker.ts")).default;
     const res = await worker.fetch(new Request("https://x/v1/delivery/batches", { method: "POST", body: "{}" }), {}, { waitUntil: () => {} });
     expect([res.status, ((await res.json()) as { error: { code: string } }).error.code]).toEqual([503, "not_configured"]);
+    // A malformed setting is the same coded 503, not a bare 500.
+    const bad = await worker.fetch(new Request("https://x/v1/delivery/batches", { method: "POST", body: "{}" }), { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn", INGEST_MAX_PER_USER: "lots" }, { waitUntil: () => {} });
+    expect([bad.status, ((await bad.json()) as { error: { code: string } }).error.code]).toEqual([503, "not_configured"]);
     const { ingestSettings } = await import("../worker.ts");
     const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn" };
     expect((await ingestSettings(full))?.replicaMode).toBe("off");

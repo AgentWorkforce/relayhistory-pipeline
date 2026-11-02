@@ -23,12 +23,10 @@
  *   replica rebuilds Neon rows from the stored lines. Here S3 is the record:
  *   the stored lines are the scrubbed lines, as for every chunk the pipeline
  *   seals, and the batch lands.
- * - Over-bound strings are segmented, not refused (`oversize: "segment"`, see
- *   raw-chunks.ts `scrubOversize`): `prepareDelivery` already truncates a long
- *   string and appends an in-band note, which can push it just past the
- *   pipeline's bound, and `*_json` evidence is a long JSON text of short,
- *   already scrubbed strings. The client cannot re-cut a delivery batch, so
- *   refusing it would only move it to a fallback that no longer exists.
+ * - A string past the scrub bound that the pipeline segmenter (`scrubLong`,
+ *   rule set 2) cannot cut safely is redacted, not refused
+ *   before sealing (oversize.ts). The client cannot re-cut a delivery batch,
+ *   so refusing it would only move it to a fallback that no longer exists.
  * - No session-count refusal. A batch wider than one invocation's subrequest
  *   budget is staged and fanned out by the queue (staging.ts) instead of
  *   falling back.
@@ -57,6 +55,7 @@ import {
 } from "../shared/vendor.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
 import type { PreparedDeliveryRecord } from "./vendor/delivery/prepare.ts";
+import { fitForScrub } from "./oversize.ts";
 
 /** Shared with relayhistory-api's live writer (see the header). */
 export const LIVE_OWNER = "relayhistory-api:delivery";
@@ -349,7 +348,6 @@ async function writeGroup(
       startOffset: prev?.raw.next_offset ?? 0,
       source,
       traceId,
-      oversize: "redact",
     });
     const chunks = [...(prev?.raw.chunks ?? []), sealed.entry];
     const manifest = nextManifest({
@@ -398,7 +396,7 @@ export function groupRecords(records: PreparedDeliveryRecord[], receivedAt: Date
     const sessionId = none ? NO_SESSION_ID : record.session_id!;
     const key = JSON.stringify([source, sessionId]);
     const entry = map.get(key) ?? { group: { source, sessionId, lines: [] }, index: [] };
-    entry.group.lines.push(liveLine(record, stamp));
+    entry.group.lines.push(liveLine(fitForScrub(record), stamp));
     entry.index.push(i);
     map.set(key, entry);
   });

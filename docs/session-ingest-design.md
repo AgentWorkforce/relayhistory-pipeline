@@ -44,7 +44,7 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
 | s3_first fallback / failure | cause | in the ingest |
 |---|---|---|
 | `scrub_not_identity` | Neon's replica rebuilds rows from stored lines, so a line the pipeline scrubber changes must go to Neon | S3 is the record. The stored lines are the scrubbed lines, as for every chunk the pipeline seals. **Lands.** |
-| `chunk_string_too_long` | `prepareDelivery` truncates a long string and appends `[relayhistory: truncated …]`, which pushes it past `MAX_SCRUB_CHARS`. Long `*_json` evidence also exceeds the bound. | `sealRawChunk({ oversize: "segment" })` scrubs in safe segments (section 3). **Lands**, losslessly. With no safe cut, the text becomes a redaction marker. |
+| `chunk_string_too_long` | `prepareDelivery` truncates a long string and appends `[relayhistory: truncated …]`, which pushes it past `MAX_SCRUB_CHARS`. Long `*_json` evidence also exceeds the bound. | Main's `scrubLong` segments it (rule set 2). With no safe cut, `oversize: "redact"` turns that one string into a redaction marker (section 2c). **Lands.** |
 | `too_many_sessions` | the Workers subrequest budget | **Staging**: one scrubbed object holding the whole batch is put before the ack, and a queue fans it out (section 2b). **Lands.** |
 | `record_without_session` | the per-session layout | The origin's `h=_none/s=_origin` session. **Lands.** |
 | `message_too_large` | the 128 KB queue message limit | Fixed by #262. The replica keeps the descriptor path. |
@@ -87,6 +87,7 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
 - **The index:** `sessions.ingest_record_revisions`, keyed on (org, workspace, origin, record_id), holding the **committed** revision, revision id and digest. It never holds content.
   - It is seeded from Neon `delivery_records` by `ingest_seed_records`, which only a separate NOLOGIN seeder role can call. The seed is idempotent and never lowers a revision.
   - Seed per org **before** routing it, and again right after.
+  - **Gate:** the Neon→S3 exporter must have caught up for the org before the seed. A seeded revision is acknowledged as stored without an S3 write, so S3 has to hold it already. (Neon-only records come from today's fallbacks.)
 - **The rule (#250 / 0071):** a record whose stored revision is at or above the submitted one is **stale** and is acknowledged without a write.
   - Equal revision with any digest: a replay. The stored copy is kept.
   - Lower revision: ignored.
@@ -106,16 +107,14 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
 - **The queue:** the Worker's own `queue()` handler writes each slice. It is idempotent: the manifest replay extension is keyed by digest. Each message gets 10 retries, then the DLQ.
 - **Visibility:** readers see the batch seconds later.
 - **Retries:** a retried request finds its own staged object and re-queues. Duplicate messages are harmless.
-- **Follow-up:** the staged object stays after its fan-out. A lifecycle rule on `live-batches/*.staged.*` (for example, 7 days) is a store change.
+- **Content addressing:** the key names the batch digest **and** a digest of the exact groups and record identities staged. A retry that keeps the same records reuses its own object. A retry whose kept set shrank (records committed meanwhile by another batch) stages a new object. So the fan-out ranges, the replica's placements and the commit always describe the same object (review H1, tested).
+- **Follow-up:** the staged object stays after its fan-out. A lifecycle rule on `live-batches/*.staged.*` (for example, 7 days) is a store change. The erasure job must also cover staged objects; that is a canary gate (runbook 6c).
 
 ### 2c. Scrubbing for over-bound text (`raw-chunks.ts`)
 
-- The default stays `refuse`, so every client-facing writer is unchanged.
-- `oversize: "segment"` cuts at the latest separator (whitespace, `,` `:` `}` `]`) that meets all three conditions:
-  - it is not between digit groups;
-  - it is not inside an open private-key block;
-  - no rule matches across it (the text around the cut scrubs the same together as apart).
-- With no such cut, the **whole** text becomes a redaction marker: fail closed, and the record still lands.
+- Main's rule set 2 (`scrubLong`) already segments any over-bound text that has a safe whitespace cut, for every writer.
+- The ingest adds only `oversize: "redact"`. A text `scrubLong` cannot cut, such as canonical `*_json` evidence or a base64 dump past 256K, becomes one redaction marker. Fail closed: the record and its other fields still land.
+- The default stays `refuse`, so every other writer is unchanged.
 - The output is deterministic, so a replay seals identical bytes.
 
 ## 3. Ledger (Supabase)

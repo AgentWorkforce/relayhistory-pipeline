@@ -1,0 +1,34 @@
+/**
+ * The ingest's answer to `chunk_string_too_long`, before a line is sealed.
+ *
+ * The pipeline scrubber (main's rule set 2, `scrubLong`) segments any string
+ * past `MAX_SCRUB_CHARS` that has a safe whitespace cut, and refuses one that
+ * has none, such as canonical `*_json` evidence or a base64 dump. Refusing is
+ * right for a client that can resend smaller chunks; a delivery batch cannot
+ * be re-cut. So, before sealing, every string in the record that `scrubLong`
+ * would refuse becomes one redaction marker: fail closed (nothing unscrubbed
+ * is stored), and the record and its other fields still land. Everything
+ * else goes to the scrubber untouched, so the pipeline's rule set, its
+ * version and its digest are unchanged.
+ */
+import { MAX_SCRUB_CHARS, exceedsScrubBound } from "@rhc/lib/scrub.ts";
+import { canScrubLong } from "@rhc/lib/pipeline/raw-chunks.ts";
+import type { PreparedDeliveryRecord } from "./vendor/delivery/prepare.ts";
+
+export function oversizeRedaction(chars: number): string {
+  return `[REDACTED: ${chars} characters exceed the ${MAX_SCRUB_CHARS}-character scrub limit and could not be segmented safely]`;
+}
+
+function fit(value: unknown): unknown {
+  if (typeof value === "string") return exceedsScrubBound(value) && !canScrubLong(value) ? oversizeRedaction(value.length) : value;
+  if (Array.isArray(value)) return value.map(fit);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, fit(v)]));
+  return value;
+}
+
+/** The record with every string `scrubLong` cannot take redacted (ids are bounded at 512 bytes, so only the payload). */
+export function fitForScrub(record: PreparedDeliveryRecord): PreparedDeliveryRecord {
+  if (record.payload === null) return record;
+  const payload = fit(record.payload) as Record<string, unknown>;
+  return payload === record.payload ? record : { ...record, payload };
+}

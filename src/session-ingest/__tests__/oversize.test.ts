@@ -1,72 +1,43 @@
 /**
- * `scrubOversize` (raw-chunks.ts), the ingest's answer to
- * `chunk_string_too_long`: an over-bound text is scrubbed in segments, never
- * truncated and never stored unscrubbed.
+ * oversize.ts: before sealing, a string the pipeline segmenter (`scrubLong`,
+ * main's rule set 2) cannot cut becomes one redaction marker, so a delivery
+ * batch always lands and nothing unscrubbed is stored. A string it can cut is
+ * left for it. The pipeline itself still refuses for every other writer.
  */
 import { describe, expect, test } from "bun:test";
-import { MAX_SCRUB_CHARS, scrubText } from "@rhc/lib/scrub.ts";
-import { oversizeRedaction, scrubOversize, scrubRecords } from "@rhc/lib/pipeline/raw-chunks.ts";
+import { MAX_SCRUB_CHARS } from "@rhc/lib/scrub.ts";
+import { scrubRecords } from "@rhc/lib/pipeline/raw-chunks.ts";
+import { fitForScrub, oversizeRedaction } from "../oversize.ts";
+import { liveLine } from "../writer.ts";
 
 const KEY = "AKIAABCDEFGHIJKLMNOP";
-const PEM = `-----BEGIN PRIVATE KEY-----\n${"QUJD".repeat(400)}\n-----END PRIVATE KEY-----`;
+const enc = (s: string) => new TextEncoder().encode(s);
+const dec = (b: Uint8Array) => new TextDecoder().decode(b);
+const base = { schema_version: 1 as const, origin_id: "o", record_id: "r1", revision_id: "r1:1", revision: 1, kind: "tool_call" as const, source: "claude", session_id: "s", operation: "upsert" as const, digest: "d" };
+// Canonical JSON evidence has no whitespace: no safe cut for scrubLong.
+const unbroken = JSON.stringify({ items: Array.from({ length: 60_000 }, (_, i) => `v${i}`) });
 
-describe("scrubOversize", () => {
-  test("within the bound it is scrubText", () => {
-    expect(scrubOversize(`a ${KEY} b`)).toBe(scrubText(`a ${KEY} b`));
+describe("fitForScrub", () => {
+  test("the pipeline alone still refuses a string with no safe cut (every other writer)", () => {
+    expect(() => scrubRecords(enc(liveLine({ ...base, payload: { input_json: unbroken } }, "t") + "\n"))).toThrow(/scrub limit/);
   });
 
-  test("keeps every character of a long text and redacts secrets in every segment", () => {
-    const text = Array.from({ length: 50_000 }, (_, i) => (i % 997 === 0 ? KEY : `w${i}`)).join(" ") + ` ${KEY}`;
+  test("redacts only that string; the record, its other fields and their scrubbing are kept", () => {
+    const fitted = fitForScrub({ ...base, payload: { input_json: unbroken, note: `k ${KEY}`, n: 3 } });
+    const out = JSON.parse(dec(scrubRecords(enc(liveLine(fitted, "t") + "\n")).scrubbed));
+    expect(out.record_id).toBe("r1");
+    expect(out.payload.input_json).toBe(oversizeRedaction(unbroken.length));
+    expect(out.payload.n).toBe(3);
+    expect(out.payload.note).not.toContain(KEY);
+  });
+
+  test("a long text scrubLong can cut is left whole for it, and scrubbed", () => {
+    const text = Array.from({ length: 60_000 }, (_, i) => (i % 997 === 0 ? KEY : `w${i}`)).join(" ");
     expect(text.length).toBeGreaterThan(MAX_SCRUB_CHARS);
-    const out = scrubOversize(text);
+    const fitted = fitForScrub({ ...base, payload: { text } });
+    expect(fitted.payload!.text).toBe(text);
+    const out = JSON.parse(dec(scrubRecords(enc(liveLine(fitted, "t") + "\n")).scrubbed)).payload.text as string;
     expect(out).not.toContain(KEY);
     expect(out.split(" ").length).toBe(text.split(" ").length);
-    expect(out).toBe(scrubOversize(text)); // deterministic: a replay seals the same bytes
-  });
-
-  test("never cuts through a secret that sits on the natural boundary", () => {
-    // The last separator before the bound is the space inside "Bearer <token>".
-    const token = "A".repeat(40);
-    const text = "x".repeat(MAX_SCRUB_CHARS - 8) + " Bearer " + token + " " + "y ".repeat(10_000);
-    expect(text[MAX_SCRUB_CHARS - 1]).toBe(" ");
-    expect(scrubText(text.slice(0, MAX_SCRUB_CHARS))).toContain("Bearer");
-    const out = scrubOversize(text);
-    expect(out).not.toContain(token);
-  });
-
-  test("never splits a private key across segments", () => {
-    const filler = "z, ".repeat(Math.ceil((MAX_SCRUB_CHARS - 1000) / 3));
-    const out = scrubOversize(filler + PEM + " tail".repeat(5_000));
-    expect(out).not.toContain("QUJDQUJD");
-  });
-
-  test("never splits a private key larger than the cut's scrub context", () => {
-    // 12 KiB of base64 lines: the cut's 4 KiB + 4 KiB window sees neither delimiter.
-    const body = Array.from({ length: 190 }, (_, i) => `M${String(i).padStart(3, "0")}${"QUJD".repeat(15)}`).join("\n");
-    const big = `-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----`;
-    expect(big.length).toBeGreaterThan(12_000);
-    const filler = "z, ".repeat(Math.ceil((MAX_SCRUB_CHARS - 6_000) / 3));
-    const out = scrubOversize(filler + big + " tail".repeat(5_000));
-    expect(out).not.toContain("QUJDQUJD");
-  });
-
-  test("with no safe boundary the whole text is redacted, never stored unscrubbed", () => {
-    const text = "q".repeat(MAX_SCRUB_CHARS + 10);
-    expect(scrubOversize(text)).toBe(oversizeRedaction(text.length));
-  });
-});
-
-describe("sealRawChunk oversize option", () => {
-  const line = JSON.stringify({ evidence: Array.from({ length: 60_000 }, (_, i) => `v${i}`).join(",") }) + "\n";
-  const source = new TextEncoder().encode(line);
-
-  test("default (every client-facing writer): an over-bound string is still refused", () => {
-    expect(() => scrubRecords(source)).toThrow(/scrub limit/);
-    expect(() => scrubRecords(source, { oversize: "refuse" })).toThrow(/scrub limit/);
-  });
-
-  test("segment: the line is scrubbed whole and kept", () => {
-    const { scrubbed } = scrubRecords(source, { oversize: "segment" });
-    expect(new TextDecoder().decode(scrubbed)).toBe(line);
   });
 });

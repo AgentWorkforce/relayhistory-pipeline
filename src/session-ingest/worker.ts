@@ -135,10 +135,19 @@ const zstd = (bytes: Uint8Array) => new Uint8Array(zstdDecompressSync(bytes));
 
 export default {
   async fetch(request: Request, env: IngestWorkerEnv, ctx: Ctx): Promise<Response> {
-    const settings = await ingestSettings(env);
+    let settings: IngestSettings | null;
+    try {
+      settings = await ingestSettings(env);
+    } catch {
+      // A malformed setting: relayhistory's envelope, retryable, never a bare 500.
+      log.error("session ingest settings invalid", { error_code: "settings_invalid" });
+      return NOT_CONFIGURED();
+    }
     if (!settings) return NOT_CONFIGURED();
     // One Hyperdrive connection per request; Hyperdrive pools the real ones.
     const client = new pg.Client({ connectionString: env.HYPERDRIVE!.connectionString });
+    // A dropped socket surfaces on the next query as a coded 503, never as an uncaught error.
+    client.on("error", (err: Error) => log.error("session ingest db error", { error_code: (err as { code?: string }).code ?? "db_error" }));
     let connected: Promise<void> | undefined;
     const run = async (text: string, params: unknown[]) => {
       connected ??= client.connect();
@@ -178,7 +187,7 @@ export default {
 
   /** INGEST_FANOUT: one message, one slice of a staged batch. A throw retries it (then the DLQ). */
   async queue(batch: { messages: { body: unknown; ack(): void; retry(): void }[] }, env: IngestWorkerEnv): Promise<void> {
-    const settings = await ingestSettings(env);
+    const settings = await ingestSettings(env).catch(() => null);
     for (const message of batch.messages) {
       const body = message.body as FanoutMessage;
       if (!settings || body?.kind !== "ingest-fanout") {
