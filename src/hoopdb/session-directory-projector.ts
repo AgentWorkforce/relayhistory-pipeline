@@ -23,7 +23,12 @@
  *     The row comes back with the historical created_at and no summary until Bob
  *     Costas writes one;
  *   - task_title, agent_name and short_summary are not in session_index and are kept
- *     as already projected (short_summary is written only by writeShortSummary).
+ *     as already projected (short_summary is written only by writeShortSummary);
+ *   - the catalog dimensions (agent names, catalog models, project key, relationships)
+ *     are written only by writeDirectoryCatalog. Database triggers (20261101050000) keep
+ *     every companion's last_activity_at equal to the row's in the row's own transaction,
+ *     and on tombstone or delete remove the session's agent rows and its edges as parent
+ *     and as child; the tombstone trigger clears the catalog columns.
  *
  * search_text is always rebuilt with sessions.session_directory_search_text, so the
  * scrubbed short_summary stays part of it. The rollout marker is never set here.

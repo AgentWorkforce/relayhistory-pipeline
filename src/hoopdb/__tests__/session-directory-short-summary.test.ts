@@ -63,6 +63,11 @@ const EXPAND_UP = read(`supabase/migrations/${EXPAND}`);
 const EXPAND_DOWN = read(
   `supabase/rollbacks/${EXPAND.replace(/\.sql$/, ".down.sql")}`,
 );
+// 20261101050000 (the list RPC) grants the Worker EXECUTE too, so a rollback past G6
+// unwinds it first and reapplies it last.
+const LIST = "20261101050000_session_directory_list.sql";
+const LIST_UP = read(`supabase/migrations/${LIST}`);
+const LIST_DOWN = read(`supabase/rollbacks/${LIST.replace(/\.sql$/, ".down.sql")}`);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
 const TOKEN_ISSUER = "https://issuer.test/session-directory";
 const RPC_SIGNATURE = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
@@ -2274,7 +2279,8 @@ describe("short_summary rollback", () => {
     const db = await database();
     await insertRow(db);
     await summarize(db, KEY, "pelican rollback check");
-    // Reverse migration order: the expand phase depends on G6's role.
+    // Reverse migration order: the list and expand phases depend on G6's role.
+    await db.exec(LIST_DOWN);
     await db.exec(EXPAND_DOWN);
     await db.exec(DOWN);
     const columns = await db.query(
@@ -2314,6 +2320,7 @@ describe("short_summary rollback", () => {
 
     await db.exec(UP);
     await db.exec(EXPAND_UP);
+    await db.exec(LIST_UP);
     await db.query(
       "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
       [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],
@@ -2383,11 +2390,13 @@ describe("Worker role validation in two phases", () => {
       `SELECT unnest(ARRAY[
          to_regprocedure($1)::text,
          'sessions.session_directory_pointers(text,text,text)',
-         'sessions.session_directory_readiness()']) AS fn ORDER BY 1`,
+         'sessions.session_directory_readiness()',
+         'sessions.list_session_directory(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
+         'sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)']) AS fn ORDER BY 1`,
       [RPC_SIGNATURE],
     );
     expect(fns.rows).toEqual(approved.rows);
-    expect(fns.rows).toHaveLength(3);
+    expect(fns.rows).toHaveLength(5);
   });
 
   test("phase 2 ignores PUBLIC-derived EXECUTE: only aclitems naming the role count", async () => {
