@@ -14,20 +14,60 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
-    "sessions.ingest_acquire_slot(jsonb)": ["<owner>:EXECUTE",  "bulls96_session_ingest:EXECUTE"],
+    "sessions.ingest_acquire_slot(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_apply_reset(text,text,text,text)": ["<owner>:EXECUTE"],
+    "sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_batch_key(jsonb)": ["<owner>:EXECUTE"],
     "sessions.ingest_bounded(jsonb,integer,integer)": ["<owner>:EXECUTE"],
-    "sessions.ingest_claim_batch(jsonb)": ["<owner>:EXECUTE",  "bulls96_session_ingest:EXECUTE"],
-    "sessions.ingest_commit_batch(jsonb)": ["<owner>:EXECUTE",  "bulls96_session_ingest:EXECUTE"],
+    "sessions.ingest_claim_batch(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_commit_batch(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_commit_revisions(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.ingest_digest(jsonb)": ["<owner>:EXECUTE"],
     "sessions.ingest_exact_keys(jsonb,text[])": ["<owner>:EXECUTE"],
+    "sessions.ingest_fanout_fence(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_fence_pairs(jsonb)": ["<owner>:EXECUTE"],
     "sessions.ingest_identifier(jsonb,boolean)": ["<owner>:EXECUTE"],
     "sessions.ingest_records(jsonb)": ["<owner>:EXECUTE"],
-    "sessions.ingest_release_slot(jsonb)": ["<owner>:EXECUTE",  "bulls96_session_ingest:EXECUTE"],
+    "sessions.ingest_release_slot(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.ingest_require_role(text)": ["<owner>:EXECUTE"],
+    "sessions.ingest_reset_uploaded_sessions(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.ingest_revision(jsonb)": ["<owner>:EXECUTE"],
-    "sessions.ingest_seed_records(jsonb)": ["<owner>:EXECUTE",  "bulls96_session_ingest_seeder:EXECUTE"],
+    "sessions.ingest_seed_fences(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest_seeder:EXECUTE"
+    ],
+    "sessions.ingest_seed_records(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest_seeder:EXECUTE"
+    ],
     "sessions.ingest_session_pairs(jsonb)": ["<owner>:EXECUTE"],
+    "sessions.ingest_set_session_uploads(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.jwt_org_id()": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE",

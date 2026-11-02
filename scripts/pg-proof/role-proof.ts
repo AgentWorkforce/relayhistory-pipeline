@@ -68,6 +68,8 @@ const BOOT = join(
   ROOT,
   "supabase/bootstrap/session_directory_search_worker.sql",
 );
+// The session ingest roles: privileged, cluster-wide, before migrate (20261102010000 verifies).
+const INGEST_BOOT = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
 const RUNTIME_BOOT = join(ROOT, "supabase/bootstrap/hoopdb_runtime_role.sql");
 const SUPABASE_RUNTIME_BOOT = join(
   ROOT,
@@ -603,6 +605,8 @@ if (
   throw new Error("shim setup failed");
 if (!psql("postgres", ["-f", BOOT]).ok)
   throw new Error("worker bootstrap failed");
+if (!psql("postgres", ["-f", INGEST_BOOT]).ok)
+  throw new Error("session ingest roles bootstrap failed");
 
 await fresh("g6_boot");
 await check(

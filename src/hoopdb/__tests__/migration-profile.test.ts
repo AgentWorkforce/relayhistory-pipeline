@@ -1162,6 +1162,12 @@ describe("per-step catalog sentinels", () => {
         "utf8",
       ),
     );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
+        "utf8",
+      ),
+    );
     for (let i = 0; i <= upTo; i++)
       await db.exec(readFileSync(steps[i]!.path, "utf8"));
     await db.exec(`CREATE SCHEMA IF NOT EXISTS sessions; CREATE TABLE sessions.__96bulls_migrations (
@@ -1204,6 +1210,12 @@ describe("per-step catalog sentinels", () => {
     await db.exec(
       readFileSync(
         join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
       ),
     );
@@ -1310,6 +1322,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.exec(
       readFileSync(
         join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
       ),
     );
@@ -1552,6 +1570,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
         "utf8",
       )}`,
+    );
+    // As the superuser (cluster roles), then back to the role the test continues as.
+    await db.exec(
+      `RESET ROLE; ${readFileSync(
+        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
+        "utf8",
+      )}; SET ROLE migration_owner;`,
     );
     const targets = await db.query<{
       rolname: string;
@@ -2099,6 +2124,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
             "utf8",
           ),
         );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
+              "supabase/bootstrap/session_ingest_roles.sql",
+            ),
+            "utf8",
+          ),
+        );
         await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
         await db.exec(
           readFileSync(
@@ -2121,6 +2155,16 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               join(
                 root,
                 "supabase/bootstrap/session_directory_search_worker.sql",
+              ),
+              "utf8",
+            ),
+          );
+        if (mode === "cloudsql")
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/session_ingest_roles.sql",
               ),
               "utf8",
             ),

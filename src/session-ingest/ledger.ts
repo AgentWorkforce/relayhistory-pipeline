@@ -135,11 +135,31 @@ export interface SlotRequest {
 
 export type SlotResult = { ok: true } | { ok: false; retryAfterSeconds: number };
 
+/**
+ * Deletion fences and their effect on the revision index (Neon 0038/0039): a
+ * disable tombstones the sessions and forgets this user's revisions of them, so an
+ * explicit re-enable is written again; an enable lifts the tombstone; a reset
+ * tombstones and forgets every session of the user (idempotent by request id).
+ */
+export interface SelectionInput {
+  tenant: LedgerTenant;
+  originId: string;
+  sessions: [source: string, sessionId: string][];
+  enabled: boolean;
+}
+
 export interface Ledger {
   claim(input: ClaimInput): Promise<ClaimResult>;
   commit(input: CommitInput): Promise<CommitResult>;
   acquireSlot(request: SlotRequest): Promise<SlotResult>;
   releaseSlot(tenant: LedgerTenant, holder: string): Promise<void>;
+  setSessionUploads(input: SelectionInput): Promise<void>;
+  /** The number of sessions the reset tombstoned (a replayed request id answers its first count). */
+  resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number>;
+  /** Staged path: the slice's sessions fenced right now (skipped by the fan-out). */
+  fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][]): Promise<[string, string][]>;
+  /** Staged path: the records one slice wrote become stored (a session fenced since is re-armed instead). */
+  commitRevisions(tenant: LedgerTenant, originId: string, machineId: string, records: LedgerRecord[]): Promise<{ committed: number; rearmed: number }>;
 }
 
 /** The ledger is unreachable or refused: the batch answers 503 (retryable), never a fallback. */

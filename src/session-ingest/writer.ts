@@ -279,7 +279,15 @@ export interface Group {
   source: string;
   sessionId: string;
   lines: string[];
+  /**
+   * Per line, what the ledger needs that a line does not hold: the record's
+   * revision id, digest, source and session (null for the origin's no-session
+   * group). Set by `groupRecords`; carried through a staged object.
+   */
+  meta?: LineMeta[];
 }
+
+export type LineMeta = [revisionId: string, digest: string, source: string, sessionId: string | null];
 
 /** The payload's own clock of a chunk line, else `fallback`. */
 function lineTimeMs(line: string, fallback: number): number {
@@ -395,8 +403,9 @@ export function groupRecords(records: PreparedDeliveryRecord[], receivedAt: Date
     const source = none ? NO_SESSION_HARNESS : record.source;
     const sessionId = none ? NO_SESSION_ID : record.session_id!;
     const key = JSON.stringify([source, sessionId]);
-    const entry = map.get(key) ?? { group: { source, sessionId, lines: [] }, index: [] };
+    const entry = map.get(key) ?? { group: { source, sessionId, lines: [], meta: [] }, index: [] };
     entry.group.lines.push(liveLine(fitForScrub(record), stamp));
+    entry.group.meta!.push([record.revision_id, record.digest, record.source, none ? null : record.session_id!]);
     entry.index.push(i);
     map.set(key, entry);
   });

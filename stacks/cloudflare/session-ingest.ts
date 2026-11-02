@@ -56,6 +56,8 @@ export const FANOUT_MAX_RETRIES = 10;
 /** Secrets Store secret names (values created out of band from 1Password). */
 export const S3_ACCESS_KEY_SECRET = "96bulls-session-ingest-s3-access-key-id";
 export const S3_SECRET_KEY_SECRET = "96bulls-session-ingest-s3-secret-access-key";
+/** The HMAC key relayhistory signs the forwarded identity with (src/session-ingest/app.ts). */
+export const SIGNING_KEY_SECRET = "96bulls-session-ingest-signing-key";
 
 /** Plan resources, in declaration order. The Hyperdrive lookup and the external bindings have no state row. */
 export const SESSION_INGEST_RESOURCES = [
@@ -163,6 +165,7 @@ export function sessionIngestWorkerProps(p: SessionIngestInputs, bindings: { HYP
       INGEST_FANOUT: bindings.INGEST_FANOUT,
       S3_ACCESS_KEY_ID: secretsStoreSecret(p.secretsStoreId, S3_ACCESS_KEY_SECRET),
       S3_SECRET_ACCESS_KEY: secretsStoreSecret(p.secretsStoreId, S3_SECRET_KEY_SECRET),
+      INGEST_SIGNING_KEY: secretsStoreSecret(p.secretsStoreId, SIGNING_KEY_SECRET),
       ...(p.replicaMode === "queue" && p.neonReplicaQueue ? { NEON_REPLICA: externalQueue(p.neonReplicaQueue) } : {}),
     },
   };
@@ -205,7 +208,7 @@ export function assertNoSecretLiterals(env: Record<string, unknown>, refuse: (wh
     if (typeof v === "string" && /:\/\/[^/\s]*@/.test(v)) refuse(`env ${k} carries URL credentials`);
     if (typeof v === "object" && v !== null && "value" in v) refuse(`env ${k} carries a value`);
   }
-  for (const k of ["S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"]) if (!(k in env)) refuse(`env ${k} is missing (Secrets Store binding)`);
+  for (const k of ["S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "INGEST_SIGNING_KEY"]) if (!(k in env)) refuse(`env ${k} is missing (Secrets Store binding)`);
 }
 
 export function fanoutConsumerSettings() {

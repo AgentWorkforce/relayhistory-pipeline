@@ -97,6 +97,8 @@ describe("session ingest worker: bindings and no credential in state", () => {
     const env = props().env;
     expect(env.S3_ACCESS_KEY_ID).toEqual(secretsStoreSecret(hex("c"), "96bulls-session-ingest-s3-access-key-id"));
     expect(env.S3_SECRET_ACCESS_KEY).toEqual(secretsStoreSecret(hex("c"), "96bulls-session-ingest-s3-secret-access-key"));
+    // The identity signing key shared with relayhistory (review Medium: unsigned identity).
+    expect(env.INGEST_SIGNING_KEY).toEqual(secretsStoreSecret(hex("c"), "96bulls-session-ingest-signing-key"));
     expect(() => assertNoSecretLiterals(env, refuse)).not.toThrow();
     for (const bad of [
       { S3_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG" },

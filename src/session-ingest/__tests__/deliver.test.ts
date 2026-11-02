@@ -8,13 +8,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { gzipSync, zstdCompressSync, zstdDecompressSync } from "node:zlib";
 import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { MAX_SCRUB_CHARS } from "@rhc/lib/scrub.ts";
-import { createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
+import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SIGNATURE_HEADER, SYNC_SCOPE } from "../app.ts";
 import { deliverBatch, IngestUnavailable } from "../deliver.ts";
 import { MAX_REPLICA_MESSAGE_BYTES, type NeonReplicaMessage, type ReplicaSink } from "../replica.ts";
 import { DeliveryError, MAX_DELIVERY_BYTES } from "../vendor/delivery/delivery-contracts.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { LIVE_OWNER, NO_SESSION_HARNESS, liveMachineId } from "../writer.ts";
-import { MemoryLedger, TENANT, batch, record, scratchStore } from "./support.ts";
+import { MemoryLedger, SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).forEach((f) => f()));
@@ -238,7 +238,7 @@ describe("HTTP contract", () => {
   const readonly = encodeIdentity({ ...TENANT, scopes: ["rth:read"] });
   function app() {
     const { deps } = setup();
-    return createIngestApp({ deliver: deps, log: () => {} });
+    return createIngestApp({ deliver: deps, log: () => {}, identify: (r) => bindingIdentity(r) });
   }
   const post = async (body: BodyInit, headers: Record<string, string> = {}) =>
     app().fetch(new Request("https://x/v1/delivery/batches", { method: "POST", body, headers: { [IDENTITY_HEADER]: good, "x-correlation-id": "corr-1", ...headers } }));
@@ -283,8 +283,8 @@ describe("HTTP contract", () => {
     const a = app();
     const limits = await a.fetch(new Request("https://x/v1/delivery/limits", { headers: { [IDENTITY_HEADER]: good } }));
     expect(await limits.json()).toEqual({ maxRecords: 500, maxRequestBytes: MAX_DELIVERY_BYTES, contentEncodings: ["zstd", "gzip"] });
-    const sel = await a.fetch(new Request("https://x/v1/delivery/sessions/selection", { method: "POST", body: "{}", headers: { [IDENTITY_HEADER]: good } }));
-    expect([sel.status, ((await sel.json()) as { error: { code: string } }).error.code]).toEqual([501, "unsupported_by_backend"]);
+    const other = await a.fetch(new Request("https://x/v1/sessions", { headers: { [IDENTITY_HEADER]: good } }));
+    expect([other.status, ((await other.json()) as { error: { code: string } }).error.code]).toEqual([501, "unsupported_by_backend"]);
   });
 });
 
@@ -327,7 +327,7 @@ describe("old Desktops: replay fast path and per-tenant limits", () => {
     const { store, ledger, deps } = setup();
     const limited = { ...deps, slots: { maxPerUser: 1, maxPerOrg: 10, ttlSeconds: 90 } };
     ledger.slots.set(TENANT.userId, new Set(["other-request"]));
-    const app = createIngestApp({ deliver: limited, log: () => {} });
+    const app = createIngestApp({ deliver: limited, log: () => {}, identify: (r) => bindingIdentity(r) });
     const body = JSON.stringify({ protocolVersion: 1, batch: await batch([record({ record_id: "e1" })]) });
     const req = () => app.fetch(new Request("https://x/v1/delivery/batches", { method: "POST", body, headers: { [IDENTITY_HEADER]: encodeIdentity({ ...TENANT, scopes: [SYNC_SCOPE] }) } }));
     const busy = await req();
@@ -412,11 +412,13 @@ describe("staging: a batch wider than one Worker invocation", () => {
     fail = false;
     expect((await deliverBatch(staged, TENANT, b)).outcome).toBe("accepted_staged");
     const { fanout } = await import("../staging.ts");
-    for (const m of sent) await fanout({ store, keyRoot: "96bulls", sleep: noSleep }, m, (x) => new Uint8Array(zstdDecompressSync(x)));
+    for (const m of sent) await fanout({ store, keyRoot: "96bulls", sleep: noSleep }, m, (x) => new Uint8Array(zstdDecompressSync(x)), ledger);
     const manifests = (await listAll(store, "96bulls/org-a/v1")).filter((k) => k.endsWith("manifest.json"));
     expect(manifests.some((k) => k.includes("/s=y/"))).toBe(true);
     expect(manifests.some((k) => k.includes("/s=z/"))).toBe(true);
-    expect(ledger.commits.at(-1)!.records.map((r) => r.recordId)).toEqual(["b", "c"]);
+    // Revisions become stored when the fan-out wrote them, exactly the kept set.
+    expect(ledger.commits.at(-1)!.records).toEqual([]);
+    expect(ledger.revisionCommits.flat().map((r) => r.recordId).sort()).toEqual(["b", "c"]);
   });
 
   test("a string the first scrub grows past the bound still lands through the fan-out (re-review High)", async () => {
@@ -461,7 +463,7 @@ describe("Worker entry", () => {
     const bad = await worker.fetch(new Request("https://x/v1/delivery/batches", { method: "POST", body: "{}" }), { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn", INGEST_MAX_PER_USER: "lots" }, { waitUntil: () => {} });
     expect([bad.status, ((await bad.json()) as { error: { code: string } }).error.code]).toEqual([503, "not_configured"]);
     const { ingestSettings } = await import("../worker.ts");
-    const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn" };
+    const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_SIGNING_KEY: "sign", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn" };
     expect((await ingestSettings(full))?.replicaMode).toBe("off");
     for (const k of Object.keys(full)) expect(await ingestSettings({ ...full, [k]: undefined })).toBeNull();
     // Secrets Store bindings: read with get(); an unset one is not configured.
@@ -471,5 +473,101 @@ describe("Worker entry", () => {
     // A required replica without its queue is not configured; "queue" means required.
     expect(await ingestSettings({ ...full, INGEST_REPLICA_MODE: "queue" })).toBeNull();
     expect((await ingestSettings({ ...full, INGEST_REPLICA_MODE: "queue", NEON_REPLICA: {} as never }))?.replicaMode).toBe("required");
+  });
+});
+
+describe("the binding identity is signed (review Medium)", () => {
+  function app() {
+    const { deps } = setup();
+    return { app: createIngestApp({ deliver: deps, log: () => {}, signingKey: SIGNING_KEY }), deps };
+  }
+  const identity = { ...TENANT, scopes: [SYNC_SCOPE] };
+  const enc = (s: string) => new TextEncoder().encode(s);
+
+  test("a request signed with the shared key over its exact body is served", async () => {
+    const { app: a } = app();
+    const body = JSON.stringify({ protocolVersion: 1, batch: await batch([record({ record_id: "e1" })]) });
+    const res = await a.fetch(new Request("https://x/v1/delivery/batches", { method: "POST", body, headers: signedHeaders(identity, "POST", "/v1/delivery/batches", enc(body)) }));
+    expect(res.status).toBe(200);
+  });
+
+  test("unsigned, wrong key, another body, another path, another identity or a stale time: 401", async () => {
+    const { app: a } = app();
+    const body = JSON.stringify({ protocolVersion: 1, batch: await batch([record({ record_id: "e1" })]) });
+    const send = (headers: Record<string, string>, b = body, path = "/v1/delivery/batches") => a.fetch(new Request(`https://x${path}`, { method: "POST", body: b, headers }));
+    expect((await send({ [IDENTITY_HEADER]: encodeIdentity(identity) })).status).toBe(401);
+    expect((await send(signedHeaders(identity, "POST", "/v1/delivery/batches", enc(body), "other-key"))).status).toBe(401);
+    expect((await send(signedHeaders(identity, "POST", "/v1/delivery/batches", enc(body)), body + " ")).status).toBe(401);
+    expect((await send(signedHeaders(identity, "POST", "/v1/delivery/limits", enc(body)))).status).toBe(401);
+    const forged = { ...signedHeaders(identity, "POST", "/v1/delivery/batches", enc(body)), [IDENTITY_HEADER]: encodeIdentity({ ...identity, orgId: "org-victim" }) };
+    expect((await send(forged)).status).toBe(401);
+    expect((await send(signedHeaders(identity, "POST", "/v1/delivery/batches", enc(body), SIGNING_KEY, Math.floor(Date.now() / 1000) - 120))).status).toBe(401);
+    // No key configured: refused, never trusted.
+    const { deps } = setup();
+    const keyless = createIngestApp({ deliver: deps, log: () => {} });
+    const res = await keyless.fetch(new Request("https://x/v1/delivery/batches", { method: "POST", body, headers: signedHeaders(identity, "POST", "/v1/delivery/batches", enc(body)) }));
+    expect([res.status, ((await res.json()) as { error: { code: string } }).error.code]).toEqual([401, "not_configured"]);
+    void SIGNATURE_HEADER;
+  });
+});
+
+describe("deletion fences written by relayhistory (review High 2 / Medium: fences had no writer)", () => {
+  const identity = { ...TENANT, scopes: [SYNC_SCOPE] };
+  const enc = (s: string) => new TextEncoder().encode(s);
+  async function post(path: string, value: unknown) {
+    const { deps, ledger } = setup();
+    const a = createIngestApp({ deliver: deps, log: () => {}, signingKey: SIGNING_KEY });
+    const body = JSON.stringify(value);
+    const res = await a.fetch(new Request(`https://x${path}`, { method: "POST", body, headers: signedHeaders(identity, "POST", path, enc(body)) }));
+    return { res, ledger };
+  }
+  test("selection: relayhistory's body and answer; the ledger gets this user's sessions", async () => {
+    const account_id = (await batch([])).account_id;
+    const { res, ledger } = await post("/v1/delivery/sessions/selection", { account_id, origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
+    expect([res.status, await res.json()]).toEqual([200, { updated: true }]);
+    expect(ledger.selections).toEqual([{ tenant: TENANT, originId: "origin-1", sessions: [["claude", "s1"]], enabled: false }]);
+  });
+  test("selection: another tenant's account id is 403, a malformed body 400, nothing written", async () => {
+    const wrong = await post("/v1/delivery/sessions/selection", { account_id: "relayhistory:other", origin_id: "o", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
+    expect(wrong.res.status).toBe(403);
+    expect(wrong.ledger.selections).toEqual([]);
+    const bad = await post("/v1/delivery/sessions/selection", { account_id: (await batch([])).account_id, origin_id: "o", sessions: [], enabled: false });
+    expect(bad.res.status).toBe(400);
+  });
+  test("reset: needs the typed confirmation, answers relayhistory's shape", async () => {
+    const account_id = (await batch([])).account_id;
+    const ok = await post("/v1/delivery/sessions/reset", { account_id, request_id: "req-1", confirmation: "DELETE ALL SESSIONS" });
+    expect([ok.res.status, await ok.res.json()]).toEqual([200, { reset: true, deleted: 0 }]);
+    const no = await post("/v1/delivery/sessions/reset", { account_id, request_id: "req-1", confirmation: "yes" });
+    expect(no.res.status).toBe(400);
+  });
+});
+
+describe("staged fan-out commits revisions only after writing, and honours fences (review Medium)", () => {
+  test("the request commits the batch with no revisions; each slice commits what it wrote; a session fenced since is skipped", async () => {
+    const { store, ledger, deps } = setup();
+    const sent: import("../staging.ts").FanoutMessage[] = [];
+    const staged = { ...deps, inlineMaxSessions: 1, fanout: async (m: import("../staging.ts").FanoutMessage[]) => void sent.push(...m) };
+    const records = [record({ record_id: "a", session_id: "x" }), record({ record_id: "b", session_id: "y" })];
+    await deliverBatch(staged, TENANT, await batch(records));
+    expect(ledger.commits.at(-1)!.records).toEqual([]);
+    // A re-export before the fan-out ran is NOT acknowledged unwritten.
+    expect(ledger.revisions.size).toBe(0);
+    ledger.deleted.add(JSON.stringify(["claude", "y"]));
+    const { fanout } = await import("../staging.ts");
+    for (const m of sent) await fanout({ store, keyRoot: "96bulls", sleep: noSleep }, m, (x) => new Uint8Array(zstdDecompressSync(x)), ledger);
+    const manifests = (await listAll(store, "96bulls/org-a/v1")).filter((k) => k.endsWith("manifest.json"));
+    expect(manifests.some((k) => k.includes("/s=x/"))).toBe(true);
+    expect(manifests.some((k) => k.includes("/s=y/"))).toBe(false);
+    expect(ledger.revisionCommits.flat().map((r) => [r.recordId, r.sessionId, r.digest.length])).toEqual([["a", "x", 64]]);
+  }, 60_000);
+});
+
+describe("signing contract shared with relayhistory-cloud (delivery-forward.ts)", () => {
+  test("a fixed vector: relayhistory's test asserts the same string", async () => {
+    const { signRequest } = await import("../app.ts");
+    expect(signRequest("vector-key", 1800000000, "POST", "/v1/delivery/batches", "eyJpZCI6MX0", new TextEncoder().encode('{"a":1}'))).toBe(
+      "t=1800000000,v1=9e40c32831806a6c6f5e24232f926be249a5071c955213dcda3d4e24d2a34c41",
+    );
   });
 });

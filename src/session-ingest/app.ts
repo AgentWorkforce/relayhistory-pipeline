@@ -26,17 +26,53 @@
  * `X-Correlation-Id` is echoed as relayhistory does.
  */
 import { zstdDecompressSync } from "node:zlib";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { deliverBatch, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES } from "./vendor/delivery/delivery-contracts.ts";
-import { parseDeliveryRequest } from "./vendor/delivery/prepare.ts";
+import { parseDeliveryRequest, requireDeliveryAccount } from "./vendor/delivery/prepare.ts";
 
 export const SYNC_SCOPE = "rth:sync";
 export type ContentEncoding = "zstd" | "gzip";
 
 export const IDENTITY_HEADER = "x-relay-ingest-identity";
+export const SIGNATURE_HEADER = "x-relay-ingest-signature";
+/** How old (or how far ahead) a signature may be. */
+export const SIGNATURE_WINDOW_SECONDS = 60;
+
+/**
+ * What relayhistory signs (HMAC-SHA256, the shared Secrets Store key
+ * `96bulls-session-ingest-signing-key`): the version, the time, the method, the
+ * path, the identity header exactly as sent, and the SHA-256 of the body. A
+ * sibling Worker that binds this one without the key cannot assert a tenant;
+ * one that replays a captured request gets at most the same idempotent write
+ * within the window.
+ */
+export function signingInput(t: number, method: string, path: string, identity: string, body: Uint8Array): string {
+  return `v1\n${t}\n${method.toUpperCase()}\n${path}\n${identity}\n${createHash("sha256").update(body).digest("hex")}`;
+}
+
+export function signRequest(key: string, t: number, method: string, path: string, identity: string, body: Uint8Array): string {
+  return `t=${t},v1=${createHmac("sha256", key).update(signingInput(t, method, path, identity, body)).digest("hex")}`;
+}
+
+/** The identity relayhistory verified and signed (`signRequest`). Refuses an unsigned, stale or altered request. */
+export function signedBindingIdentity(key: string | undefined, nowSeconds: () => number = () => Math.floor(Date.now() / 1000)) {
+  return (request: Request, body: Uint8Array): VerifiedIdentity => {
+    if (!key) throw new AuthError(401, "not_configured", "the session ingest has no signing key");
+    const identity = request.headers.get(IDENTITY_HEADER) ?? "";
+    const m = /^t=(\d{1,12}),v1=([0-9a-f]{64})$/.exec(request.headers.get(SIGNATURE_HEADER) ?? "");
+    if (!identity || !m) throw new AuthError(401, "missing_authorization", "missing Authorization header");
+    const t = Number(m[1]);
+    if (Math.abs(nowSeconds() - t) > SIGNATURE_WINDOW_SECONDS) throw new AuthError(401, "invalid_token", "invalid or expired token");
+    const expected = Buffer.from(signRequest(key, t, request.method, new URL(request.url).pathname, identity, body).slice(-64), "hex");
+    const given = Buffer.from(m[2]!, "hex");
+    if (expected.length !== given.length || !timingSafeEqual(expected, given)) throw new AuthError(401, "invalid_token", "invalid or expired token");
+    return bindingIdentity(request);
+  };
+}
 
 /** The identity relayhistory verified, as it sends it: base64url JSON { userId, orgId, workspaceId, scopes }. */
 export function bindingIdentity(request: Request): VerifiedIdentity {
@@ -59,12 +95,15 @@ export function encodeIdentity(identity: VerifiedIdentity): string {
 }
 
 export interface IngestAppDeps {
-  identify?: (request: Request) => VerifiedIdentity | Promise<VerifiedIdentity>;
+  /** Default: `signedBindingIdentity(signingKey)`. */
+  identify?: (request: Request, body: Uint8Array) => VerifiedIdentity | Promise<VerifiedIdentity>;
+  /** The shared HMAC key (Secrets Store). Unset with no `identify`: every request is 401 not_configured. */
+  signingKey?: string;
   deliver: DeliverDeps;
   log?: (fields: Record<string, unknown>) => void;
 }
 
-type Env = { Variables: { correlationId: string; identity: VerifiedIdentity } };
+type Env = { Variables: { correlationId: string; identity: VerifiedIdentity; body: Uint8Array } };
 
 /** Node 24 always has zstd; published most preferred first, as relayhistory. */
 export function contentEncodings(): ContentEncoding[] {
@@ -157,6 +196,50 @@ function failure(c: Context<Env>, error: unknown) {
   );
 }
 
+/** The buffered body as a Request again, for `boundedJson` (decoding per Content-Encoding). */
+function bufferedRequest(c: Context<Env>): Request {
+  return new Request(c.req.raw.url, { method: c.req.raw.method, headers: c.req.raw.headers, body: c.get("body") });
+}
+
+async function jsonOf(c: Context<Env>): Promise<unknown> {
+  return boundedJson(bufferedRequest(c), { bytes: 0, wireBytes: 0, encoding: "identity" });
+}
+
+const invalid = (message: string): never => {
+  throw new DeliveryError("invalid_delivery", 400, message);
+};
+const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+function exactKeys(v: Record<string, unknown>, keys: string[]) {
+  const got = Object.keys(v).sort();
+  if (got.length !== keys.length || got.some((k, i) => k !== [...keys].sort()[i])) invalid("Unexpected or missing field");
+}
+/** relayhistory's `identifier`: 1..512 UTF-8 bytes, no control characters, well-formed. */
+function identifier(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0 && new TextEncoder().encode(v).length <= 512 && !/[\x00-\x1f\x7f]/.test(v) && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(v);
+}
+
+export function parseSelection(body: unknown): { account_id: string; origin_id: string; sessions: { source: string; session_id: string }[]; enabled: boolean } {
+  if (!isObject(body)) invalid("Expected upload selection");
+  const b = body as Record<string, unknown>;
+  exactKeys(b, ["account_id", "origin_id", "sessions", "enabled"]);
+  if (!identifier(b.origin_id) || typeof b.enabled !== "boolean" || !Array.isArray(b.sessions) || b.sessions.length < 1 || b.sessions.length > 2048)
+    invalid("Invalid upload selection");
+  for (const x of b.sessions as unknown[]) {
+    if (!isObject(x)) invalid("Invalid session identity");
+    exactKeys(x as Record<string, unknown>, ["source", "session_id"]);
+    if (!identifier((x as Record<string, unknown>).source) || !identifier((x as Record<string, unknown>).session_id)) invalid("Invalid session identity");
+  }
+  return b as never;
+}
+
+export function parseReset(body: unknown): { account_id: string; request_id: string } {
+  if (!isObject(body)) invalid("Expected session reset");
+  const b = body as Record<string, unknown>;
+  exactKeys(b, ["account_id", "request_id", "confirmation"]);
+  if (b.confirmation !== "DELETE ALL SESSIONS" || !identifier(b.request_id)) invalid("Type DELETE ALL SESSIONS to confirm the reset");
+  return b as never;
+}
+
 export function createIngestApp(deps: IngestAppDeps) {
   const app = new Hono<Env>();
   const emit = deps.log ?? ((fields) => log.info("session ingest", fields));
@@ -172,10 +255,18 @@ export function createIngestApp(deps: IngestAppDeps) {
   app.get("/healthz", (c) => c.json({ ok: true }));
 
   // Identity for /v1, relayhistory's codes: 401 missing_authorization / invalid_token, 403 forbidden.
-  const identify = deps.identify ?? bindingIdentity;
+  const identify = deps.identify ?? signedBindingIdentity(deps.signingKey);
   app.use("/v1/*", async (c, next) => {
+    // The body is read once, bounded by the wire cap, so the signature covers exactly what is parsed.
+    let body: Uint8Array;
     try {
-      c.set("identity", await identify(c.req.raw));
+      body = c.req.raw.body ? await readBounded(c.req.raw.body, MAX_DELIVERY_BYTES) : new Uint8Array();
+    } catch (error) {
+      return failure(c, error);
+    }
+    c.set("body", body);
+    try {
+      c.set("identity", await identify(c.req.raw, body));
     } catch (error) {
       if (error instanceof AuthError) return c.json(errorBody(c, error.code, error.message), error.status);
       emit({ route: "auth", outcome: "error", error_code: "identity_failed" });
@@ -193,7 +284,7 @@ export function createIngestApp(deps: IngestAppDeps) {
     const read: BodyRead = { bytes: 0, wireBytes: 0, encoding: "identity" };
     const fields: Record<string, unknown> = { route: "delivery.batches", org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
     try {
-      const batch = parseDeliveryRequest(await boundedJson(c.req.raw, read));
+      const batch = parseDeliveryRequest(await boundedJson(bufferedRequest(c), read));
       const result = await deliverBatch(deps.deliver, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, batch);
       emit({ ...fields, outcome: result.outcome, count: result.stats.records, manifests: result.stats.manifests_written, deleted: result.stats.deleted_sessions, state: result.stats.replica, duration_ms: Date.now() - started, bytes_raw: read.bytes });
       return c.json({ ...result.receipt, limits: { ...result.receipt.limits, contentEncodings: contentEncodings() } });
@@ -208,6 +299,44 @@ export function createIngestApp(deps: IngestAppDeps) {
         bytes_raw: read.bytes,
       });
       return failure(c, error);
+    }
+  });
+
+  // Deletion fences (relayhistory's selection and reset, written here right after Neon's own, by
+  // relayhistory-cloud #265). Same bodies and answers as relayhistory (lib/delivery.ts
+  // setSessionUploads / resetUploadedSessions); tenancy only from the signed identity.
+  app.post("/v1/delivery/sessions/selection", async (c) => {
+    const identity = c.get("identity");
+    try {
+      const input = parseSelection(await jsonOf(c));
+      await requireDeliveryAccount(identity, input.account_id);
+      await deps.deliver.ledger.setSessionUploads({
+        tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId },
+        originId: input.origin_id,
+        sessions: input.sessions.map((x) => [x.source, x.session_id]),
+        enabled: input.enabled,
+      });
+      emit({ route: "delivery.sessions.selection", outcome: input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
+      return c.json({ updated: true });
+    } catch (error) {
+      emit({ route: "delivery.sessions.selection", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+  app.post("/v1/delivery/sessions/reset", async (c) => {
+    const identity = c.get("identity");
+    try {
+      const input = parseReset(await jsonOf(c));
+      await requireDeliveryAccount(identity, input.account_id);
+      const deleted = await deps.deliver.ledger.resetUploadedSessions(
+        { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId },
+        input.request_id,
+      );
+      emit({ route: "delivery.sessions.reset", outcome: "reset", org_id: identity.orgId, deleted });
+      return c.json({ reset: true, deleted });
+    } catch (error) {
+      emit({ route: "delivery.sessions.reset", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
     }
   });
 

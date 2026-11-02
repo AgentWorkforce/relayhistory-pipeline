@@ -29,6 +29,7 @@ async function database(): Promise<PGlite> {
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
+  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await db.exec(read(`supabase/migrations/${file}`));
   await db.exec(ROLE);
   return db;
@@ -95,6 +96,52 @@ async function land(ledger: ReturnType<typeof sqlLedger>, c: ClaimInput) {
   if (r.kind !== "claimed" && r.kind !== "resume") throw new Error(`expected a claim, got ${r.kind}`);
   await ledger.commit(commitInput(c));
 }
+
+describe("session ingest roles: provisioned by the bootstrap, verified by the migration (review High 1)", () => {
+  const MIGRATION = "supabase/migrations/20261102010000_session_ingest_ledger.sql";
+  async function upTo(bootstrap: (db: PGlite) => Promise<void>) {
+    const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+    open.push(db);
+    await db.exec(read("supabase/tests/supabase_shim.sql"));
+    await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
+    await bootstrap(db);
+    for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
+      if (`supabase/migrations/${file}` === MIGRATION) return { db, error: await db.exec(read(MIGRATION)).then(() => null, (e: { code?: string; message?: string }) => e) };
+      await db.exec(read(`supabase/migrations/${file}`));
+    }
+    throw new Error("migration not found");
+  }
+
+  test("the migration creates and alters no role (a CNPG / Cloud SQL owner has no CREATEROLE)", () => {
+    const sqlText = read(MIGRATION).replace(/--[^\n]*/g, "");
+    expect(sqlText).not.toMatch(/\b(CREATE|ALTER|DROP)\s+ROLE\b/i);
+  });
+
+  test("without the bootstrap the migration fails closed, 42704, naming the bootstrap", async () => {
+    const { error } = await upTo(async () => {});
+    expect(error?.code).toBe("42704");
+    expect(error?.message).toContain("bulls96_session_ingest");
+  });
+
+  test("an elevated or member role fails it closed, 55000; the bootstrap is idempotent and never alters a role", async () => {
+    const elevated = await upTo(async (db) => {
+      await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
+      await db.exec("ALTER ROLE bulls96_session_ingest_seeder INHERIT");
+    });
+    expect(elevated.error?.code).toBe("55000");
+    const member = await upTo(async (db) => {
+      await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
+      await db.exec("GRANT service_role TO bulls96_session_ingest");
+    });
+    expect(member.error?.code).toBe("55000");
+    const ok = await upTo(async (db) => {
+      await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
+      await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
+    });
+    expect(ok.error).toBeNull();
+    await expect(ok.db.exec("ALTER ROLE bulls96_session_ingest_seeder INHERIT").then(() => ok.db.exec(read("supabase/bootstrap/session_ingest_roles.sql")))).rejects.toMatchObject({ code: "55000" });
+  });
+});
 
 describe("session ingest ledger", () => {
   test("no advisory lock of any kind in the migration", () => {
@@ -382,6 +429,7 @@ describe("session ingest ledger", () => {
     await land(ledger, claimInput({ records: [rec("r1", 3, "3"), rec("r2", 1, "1")] }));
     const row = (record_id: string, revision: number, d: string) => ({
       org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", record_id, revision, revision_id: `${record_id}:seed${revision}`, digest: hex(d),
+      user_id: "user-1", source: "claude", session_id: "s1",
     });
     const seed = [row("r1", 2, "a"), row("r2", 1, "b"), row("r2", 4, "c"), row("r3", 1, "d"), row("r3", 2, "e")];
     const call = (role: string) => runAs(db, role)("SELECT sessions.ingest_seed_records($1::jsonb) AS r", [JSON.stringify(seed)]);
@@ -448,5 +496,76 @@ describe("session ingest ledger", () => {
     expect(error).toBeInstanceOf(LedgerUnavailableError);
     expect(error.code).toBe("ledger_connection");
     expect(String(error.message)).not.toContain("secret-host");
+  });
+});
+
+describe("deletion, re-enable and reset forget revisions (review High 2)", () => {
+  const staleOf = async (ledger: ReturnType<typeof sqlLedger>, c: ClaimInput) => {
+    const r = await ledger.claim(c);
+    return r.kind === "replay_fast" ? "replay_fast" : r.kind === "claimed" || r.kind === "resume" ? r.stale : r.kind;
+  };
+
+  test("disable then re-enable: the same revisions under a fresh batch id are written again, not acknowledged unwritten", async () => {
+    const db = await database();
+    const ledger = sqlLedger(runAs(db));
+    await land(ledger, claimInput({ records: [rec("r1", 3, "1"), rec("r2", 3, "1")] }));
+    // Without a fence the regenerated history is a replay.
+    expect(await staleOf(ledger, claimInput({ batchId: "regen-1", batchDigest: hex("b"), records: [rec("r1", 3, "2"), rec("r2", 3, "2")] }))).toBe("replay_fast");
+    await ledger.setSessionUploads({ tenant, originId: "origin-1", sessions: [["claude", "s-1"]], enabled: false });
+    expect(await revisions(db)).toEqual([]);
+    const fenced = await ledger.claim(claimInput({ batchId: "while-off", batchDigest: hex("c"), records: [rec("r1", 3, "1")] }));
+    expect(fenced.kind === "replay_fast" && fenced.deleted).toEqual([["claude", "s-1"]]);
+    await ledger.setSessionUploads({ tenant, originId: "origin-1", sessions: [["claude", "s-1"]], enabled: true });
+    const back = await ledger.claim(claimInput({ batchId: "re-enabled", batchDigest: hex("d"), records: [rec("r1", 3, "1"), rec("r2", 3, "1")] }));
+    expect(back).toMatchObject({ kind: "claimed", deleted: [], stale: [] });
+  });
+
+  test("disable forgets only this user's revisions of that session on that origin", async () => {
+    const db = await database();
+    const ledger = sqlLedger(runAs(db));
+    await land(ledger, claimInput({ sessions: [["claude", "s-1"], ["claude", "s-2"]], records: [rec("a", 1, "1"), rec("b", 1, "1", "b:r1", ["claude", "s-2"])] }));
+    const other = { ...tenant, userId: "user-2" };
+    await land(ledger, claimInput({ tenant: other, originId: "origin-1", batchId: "u2", batchDigest: hex("f"), records: [rec("c", 1, "1")] }));
+    await ledger.setSessionUploads({ tenant, originId: "origin-1", sessions: [["claude", "s-1"]], enabled: false });
+    expect((await revisions(db)).map((r) => r.record_id)).toEqual(["b", "c"]);
+  });
+
+  test("reset tombstones and forgets every session of the user, idempotent by request id", async () => {
+    const db = await database();
+    const ledger = sqlLedger(runAs(db));
+    await land(ledger, claimInput({ sessions: [["claude", "s-1"], ["codex", "s-9"]], records: [rec("a", 1, "1"), rec("b", 1, "1", "b:r1", ["codex", "s-9"]), rec("p", 1, "1", "p:r1", ["claude", null])] }));
+    expect(await ledger.resetUploadedSessions(tenant, "req-1")).toBe(2);
+    expect(await ledger.resetUploadedSessions(tenant, "req-1")).toBe(2);
+    expect((await revisions(db)).map((r) => r.record_id)).toEqual(["p"]);
+    const deletions = await db.query("SELECT source, session_id FROM sessions.upload_deletions ORDER BY source");
+    expect(deletions.rows).toEqual([{ source: "claude", session_id: "s-1" }, { source: "codex", session_id: "s-9" }]);
+  });
+
+  test("the seed copies Neon's tombstones and forgets the seeded revisions of those sessions", async () => {
+    const db = await database();
+    const seeder = runAs(db, "bulls96_session_ingest_seeder");
+    const row = (record_id: string, session_id: string) => ({ org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", record_id, revision: 1, revision_id: `${record_id}:1`, digest: hex("a"), user_id: "user-1", source: "claude", session_id });
+    await seeder("SELECT sessions.ingest_seed_records($1::jsonb)", [JSON.stringify([row("a", "s-1"), row("b", "s-2")])]);
+    await seeder("SELECT sessions.ingest_seed_fences($1::jsonb)", [JSON.stringify({ deletions: [{ org_id: "org-a", workspace_id: "ws-a", user_id: "user-1", origin_id: "origin-1", source: "claude", session_id: "s-1" }], resets: [{ org_id: "org-a", workspace_id: "ws-a", user_id: "user-1", request_id: "neon-req", deleted: 1 }] })]);
+    expect((await revisions(db)).map((r) => r.record_id)).toEqual(["b"]);
+    expect((await db.query("SELECT count(*)::int AS n FROM sessions.upload_resets")).rows[0]).toEqual({ n: 1 });
+    // The ingest role cannot seed fences.
+    await expect(runAs(db)("SELECT sessions.ingest_seed_fences($1::jsonb)", [JSON.stringify({ deletions: [], resets: [] })])).rejects.toThrow();
+  });
+});
+
+describe("staged fan-out SQL (review Medium)", () => {
+  test("fanoutFence names the slice's fenced sessions; commitRevisions stores the rest and re-arms the fenced", async () => {
+    const db = await database();
+    const ledger = sqlLedger(runAs(db));
+    await ledger.setSessionUploads({ tenant, originId: "origin-1", sessions: [["claude", "gone"]], enabled: false });
+    expect(await ledger.fanoutFence(tenant, "origin-1", [["claude", "s-1"], ["claude", "gone"]])).toEqual([["claude", "gone"]]);
+    const out = await ledger.commitRevisions(tenant, "origin-1", MACHINE, [rec("a", 2, "1"), rec("g", 1, "1", "g:r1", ["claude", "gone"])]);
+    expect(out).toEqual({ committed: 1, rearmed: 1 });
+    expect((await revisions(db)).map((r) => r.record_id)).toEqual(["a"]);
+    const rearm = await db.query("SELECT session_id FROM sessions.upload_erasure_rearm");
+    expect(rearm.rows).toEqual([{ session_id: "gone" }]);
+    // Idempotent, and never lowers.
+    expect(await ledger.commitRevisions(tenant, "origin-1", MACHINE, [rec("a", 1, "1")])).toEqual({ committed: 0, rearmed: 0 });
   });
 });

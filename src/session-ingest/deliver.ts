@@ -255,7 +255,10 @@ async function writeAndCommit(
       batchDigest: prepared.batchDigest,
       sessions: writtenSessions,
       machineId,
-      records: keep.map((i) => prepared.records[i]!).map((r) => ({ source: r.source, sessionId: r.session_id, recordId: r.record_id, revisionId: r.revision_id, revision: r.revision, digest: r.digest })),
+      // A staged batch's revisions become stored only when the fan-out has written them
+      // (staging.ts fanout -> commitRevisions); committing them here would make a
+      // dead-lettered slice's records stale forever.
+      records: staged ? [] : keep.map((i) => prepared.records[i]!).map((r) => ({ source: r.source, sessionId: r.session_id, recordId: r.record_id, revisionId: r.revision_id, revision: r.revision, digest: r.digest })),
     }),
   );
   mark("commit");

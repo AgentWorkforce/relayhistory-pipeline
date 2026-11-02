@@ -33,7 +33,8 @@ import { createHash } from "node:crypto";
 import { rawZstdFrame, scrubRecords } from "@rhc/lib/pipeline/raw-chunks.ts";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
-import { liveMachineId, writeGroups, type Group, type WriteTarget } from "./writer.ts";
+import { liveMachineId, writeGroups, type Group, type LineMeta, type WriteTarget } from "./writer.ts";
+import type { Ledger, LedgerRecord } from "./ledger.ts";
 import { fitLine } from "./oversize.ts";
 
 export const STAGED_VERSION = 1;
@@ -89,7 +90,8 @@ export function stagedKey(
 /** Stage the batch's groups (create-only; a retry keeps the object already there). Returns its key. */
 export async function stageGroups(target: WriteTarget, header: Omit<StagedHeader, "v" | "groups">, groups: Group[]): Promise<string> {
   const full: StagedHeader = { v: STAGED_VERSION, ...header, groups: groups.map((g) => [g.source, g.sessionId]) };
-  const body = groups.flatMap((g, i) => g.lines.map((l) => `{"g":${i},"l":${l}}`)).join("\n") + "\n";
+  const body =
+    groups.flatMap((g, i) => g.lines.map((l, j) => `{"g":${i},"m":${JSON.stringify(g.meta?.[j] ?? null)},"l":${l}}`)).join("\n") + "\n";
   // Lines were fitted for the scrubber when grouped (oversize.ts checks value and literal, as the scrubber does).
   const scrubbed = scrubRecords(encoder.encode(body)).scrubbed;
   const bytes = new Uint8Array([...encoder.encode(JSON.stringify(full) + "\n"), ...scrubbed]);
@@ -116,26 +118,66 @@ export async function readStaged(store: ObjectStore, key: string, decompress: (b
   const newline = text.indexOf("\n");
   const header = JSON.parse(text.slice(0, newline)) as StagedHeader;
   if (header.v !== STAGED_VERSION || !Array.isArray(header.groups)) throw new Error("staged object has an unknown version");
-  const groups: Group[] = header.groups.map(([source, sessionId]) => ({ source, sessionId, lines: [] }));
+  const groups: Group[] = header.groups.map(([source, sessionId]) => ({ source, sessionId, lines: [], meta: [] }));
   for (const line of text.slice(newline + 1).split("\n")) {
     if (!line) continue;
-    const { g, l } = JSON.parse(line) as { g: number; l: unknown };
-    const group = groups[g];
-    if (!group) throw new Error("staged line names an unknown group");
+    const { g, m, l } = JSON.parse(line) as { g: number; m: LineMeta | null; l: unknown };
+    const group = typeof g === "number" && Number.isInteger(g) ? groups[g] : undefined;
+    if (!group || !Array.isArray(m) || m.length !== 4) throw new Error("staged line is malformed");
     group.lines.push(JSON.stringify(l));
+    group.meta!.push(m);
   }
   return { header, groups };
 }
 
-/** The queue stage: write one message's groups. Idempotent (manifest replay dedupe by batch digest). */
-export async function fanout(target: WriteTarget, message: FanoutMessage, decompress: (bytes: Uint8Array) => Uint8Array) {
+/**
+ * The queue stage: write one message's groups. Idempotent (manifest replay
+ * dedupe by batch digest). With a ledger (always in the Worker), the slice's
+ * sessions fenced now are skipped, and only after the rest are written do
+ * their records become stored revisions (`commitRevisions`, which re-arms
+ * erasure for a session fenced in between). So a slice that dead-letters
+ * leaves its records not stale, and a later re-export writes them.
+ */
+export async function fanout(
+  target: WriteTarget,
+  message: FanoutMessage,
+  decompress: (bytes: Uint8Array) => Uint8Array,
+  ledger?: Pick<Ledger, "fanoutFence" | "commitRevisions">,
+) {
   const { header, groups } = await readStaged(target.store, message.key, decompress);
+  const tenant = { orgId: header.org_id, workspaceId: header.workspace_id, userId: header.user_id };
   // Already scrubbed once when staged: fit again for the second scrub at sealing (oversize.ts fitLine).
-  const slice = groups.slice(message.from, message.to).map((g) => ({ ...g, lines: g.lines.map(fitLine) }));
-  return writeGroups(
+  let slice = groups.slice(message.from, message.to).map((g) => ({ ...g, lines: g.lines.map(fitLine) }));
+  let skipped = 0;
+  if (ledger) {
+    const sessionsOf = slice.flatMap((g) => {
+      const sid = g.meta?.[0]?.[3];
+      return sid ? [[g.meta![0]![2], sid] as [string, string]] : [];
+    });
+    const fenced = new Set((await ledger.fanoutFence(tenant, header.origin_id, sessionsOf)).map((p) => JSON.stringify(p)));
+    const before = slice.length;
+    slice = slice.filter((g) => {
+      const m = g.meta?.[0];
+      return !(m && m[3] && fenced.has(JSON.stringify([m[2], m[3]])));
+    });
+    skipped = before - slice.length;
+  }
+  const written = await writeGroups(
     target,
     { orgId: header.org_id, workspaceId: header.workspace_id, originId: header.origin_id, userId: header.user_id, batchDigest: header.batch_digest },
     slice,
     new Date(header.received_at),
   );
+  let revisions = { committed: 0, rearmed: 0 };
+  if (ledger) {
+    const records: LedgerRecord[] = slice.flatMap((g) =>
+      g.lines.map((line, j) => {
+        const r = JSON.parse(line) as { record_id: string; revision: string };
+        const [revisionId, digest, source, sessionId] = g.meta![j]!;
+        return { source, sessionId, recordId: r.record_id, revisionId, revision: Number(r.revision), digest };
+      }),
+    );
+    revisions = await ledger.commitRevisions(tenant, header.origin_id, written.machineId, records);
+  }
+  return { ...written, skipped, revisions };
 }

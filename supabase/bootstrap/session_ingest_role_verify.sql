@@ -1,7 +1,7 @@
 -- Read-only verification of the session ingest role (session_ingest_role.sql).
 -- Raises, listing every problem, unless the role has exactly the approved shape:
 -- attributes and settings, no memberships, no table or column privilege in schema
--- sessions, schema USAGE, and EXECUTE on exactly the four ingest functions (claim, commit,
+-- sessions, schema USAGE, and EXECUTE on exactly the eight ingest functions (claim, commit, selection, reset,
 -- acquire and release a slot) among the
 -- SECURITY DEFINER sessions functions.
 \set ON_ERROR_STOP 1
@@ -11,7 +11,9 @@ DECLARE
   v_problems text[] := ARRAY[]::text[];
   v_row record;
   v_allowed text[] := ARRAY['sessions.ingest_claim_batch(jsonb)', 'sessions.ingest_commit_batch(jsonb)',
-                            'sessions.ingest_acquire_slot(jsonb)', 'sessions.ingest_release_slot(jsonb)'];
+                            'sessions.ingest_acquire_slot(jsonb)', 'sessions.ingest_release_slot(jsonb)',
+                            'sessions.ingest_set_session_uploads(jsonb)', 'sessions.ingest_reset_uploaded_sessions(jsonb)',
+                            'sessions.ingest_fanout_fence(jsonb)', 'sessions.ingest_commit_revisions(jsonb)'];
 BEGIN
   SELECT * INTO v_role FROM pg_roles WHERE rolname = 'bulls96_session_ingest';
   IF NOT FOUND THEN
@@ -66,8 +68,8 @@ BEGIN
     END IF;
   END LOOP;
   IF (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-       WHERE n.nspname = 'sessions' AND p.oid::regprocedure::text = ANY (v_allowed) AND p.prosecdef) <> 4 THEN
-    v_problems := array_append(v_problems, ('the four ingest functions are missing or not SECURITY DEFINER')::text);
+       WHERE n.nspname = 'sessions' AND p.oid::regprocedure::text = ANY (v_allowed) AND p.prosecdef) <> cardinality(v_allowed) THEN
+    v_problems := array_append(v_problems, ('the eight ingest functions are missing or not SECURITY DEFINER')::text);
   END IF;
 
   IF cardinality(v_problems) > 0 THEN

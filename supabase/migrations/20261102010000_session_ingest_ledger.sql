@@ -45,25 +45,73 @@
 -- commit upserts, taken in record_id order so two commits never deadlock. A claim
 -- reads revision rows without locking them.
 --
--- Roles. bulls96_session_ingest and bulls96_session_ingest_seeder are created here
--- NOLOGIN when absent (so the grants below, and the function ACL manifest, are exact
--- after migrate). The ingest role's bootstrap (supabase/bootstrap/session_ingest_role.sql)
--- makes it LOGIN with its settings; passwords are set out of band. An existing role
--- with elevated attributes fails the migration closed.
+-- Roles. This migration never creates or alters a role (a CNPG / Cloud SQL migration
+-- owner has no CREATEROLE). supabase/bootstrap/session_ingest_roles.sql provisions
+-- bulls96_session_ingest and bulls96_session_ingest_seeder before migrate; here they are
+-- verified, fail closed: absent is 42704, elevated attributes or memberships are 55000.
+-- The ingest role may be LOGIN (session_ingest_role.sql makes it so after the first
+-- migrate); the seeder may not. Neither may be a member of any role. The ingest role may
+-- have no members but Supabase PG16+'s creator edge (postgres, granted by the superuser
+-- supabase_admin, ADMIN without INHERIT or SET); the seeder's members (an operator
+-- login) may not hold ADMIN.
 
 DO $role$
 DECLARE
   v_name text;
   r pg_roles%ROWTYPE;
+  v_row record;
+  v_problems text[];
+  v_version int := current_setting('server_version_num')::int;
 BEGIN
   FOREACH v_name IN ARRAY ARRAY['bulls96_session_ingest', 'bulls96_session_ingest_seeder'] LOOP
     SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
     IF NOT FOUND THEN
-      EXECUTE format('CREATE ROLE %I NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION', v_name);
-    ELSIF r.rolsuper OR r.rolbypassrls OR r.rolinherit
-       OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication THEN
+      RAISE EXCEPTION USING ERRCODE = '42704',
+        MESSAGE = format('role %s does not exist; this migration does not create it', v_name),
+        HINT = 'Run supabase/bootstrap/session_ingest_roles.sql as a privileged role first '
+               '(runbooks/session-ingest-rollout.md step 2), then rerun.';
+    END IF;
+    v_problems := '{}';
+    IF r.rolsuper THEN v_problems := array_append(v_problems, 'SUPERUSER'::text); END IF;
+    IF r.rolbypassrls THEN v_problems := array_append(v_problems, 'BYPASSRLS'::text); END IF;
+    IF r.rolinherit THEN v_problems := array_append(v_problems, 'INHERIT'::text); END IF;
+    IF r.rolcreaterole THEN v_problems := array_append(v_problems, 'CREATEROLE'::text); END IF;
+    IF r.rolcreatedb THEN v_problems := array_append(v_problems, 'CREATEDB'::text); END IF;
+    IF r.rolreplication THEN v_problems := array_append(v_problems, 'REPLICATION'::text); END IF;
+    IF v_name = 'bulls96_session_ingest_seeder' AND r.rolcanlogin THEN
+      v_problems := array_append(v_problems, 'LOGIN'::text);
+    END IF;
+    FOR v_row IN SELECT g.rolname FROM pg_auth_members AS m JOIN pg_roles AS g ON g.oid = m.roleid
+                  WHERE m.member = r.oid LOOP
+      v_problems := array_append(v_problems, format('member of %I', v_row.rolname)::text);
+    END LOOP;
+    IF v_version >= 160000 THEN
+      FOR v_row IN EXECUTE
+        'SELECT u.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super,
+                m.admin_option, m.inherit_option, m.set_option
+           FROM pg_auth_members AS m
+           JOIN pg_roles AS u ON u.oid = m.member
+           JOIN pg_roles AS g ON g.oid = m.grantor
+          WHERE m.roleid = $1' USING r.oid LOOP
+        IF v_row.rolname = 'postgres' AND v_row.grantor = 'supabase_admin' AND v_row.grantor_super
+           AND v_row.admin_option AND NOT v_row.inherit_option AND NOT v_row.set_option THEN
+          NULL; -- Supabase PG16+ creator edge
+        ELSIF v_name = 'bulls96_session_ingest' OR v_row.admin_option THEN
+          v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+        END IF;
+      END LOOP;
+    ELSE
+      FOR v_row IN SELECT u.rolname, m.admin_option FROM pg_auth_members AS m
+                     JOIN pg_roles AS u ON u.oid = m.member WHERE m.roleid = r.oid LOOP
+        IF v_name = 'bulls96_session_ingest' OR v_row.admin_option THEN
+          v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
+        END IF;
+      END LOOP;
+    END IF;
+    IF cardinality(v_problems) > 0 THEN
       RAISE EXCEPTION USING ERRCODE = '55000',
-        MESSAGE = format('role %s exists with elevated attributes or INHERIT', v_name);
+        MESSAGE = format('role %s does not match the bootstrap spec: %s', v_name, array_to_string(v_problems, ', ')),
+        HINT = 'Fix or drop the role and rerun supabase/bootstrap/session_ingest_roles.sql. The migration never alters a role.';
     END IF;
   END LOOP;
 END
@@ -93,9 +141,16 @@ CREATE TABLE sessions.ingest_record_revisions (
   revision bigint NOT NULL CHECK (revision > 0),
   revision_id text NOT NULL,
   digest text NOT NULL CHECK (digest ~ '^[0-9a-f]{64}$'),
+  -- The uploader and session, as Neon's delivery_records: a deletion, a reset or a
+  -- re-enable forgets exactly this user's revisions of that session (review High 2).
+  user_id text NOT NULL,
+  source text NOT NULL,
+  session_id text,
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (org_id, workspace_id, origin_id, record_id)
 );
+CREATE INDEX ingest_record_revisions_session_idx
+  ON sessions.ingest_record_revisions (org_id, workspace_id, user_id, origin_id, source, session_id);
 
 CREATE TABLE sessions.upload_deletions (
   org_id text NOT NULL,
@@ -543,14 +598,16 @@ BEGIN
   -- the stored row). Rows are touched in record_id order, so two commits sharing
   -- records lock them in the same order. Idempotent.
   INSERT INTO sessions.ingest_record_revisions AS t
-         (org_id, workspace_id, origin_id, record_id, revision, revision_id, digest)
+         (org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id)
   SELECT DISTINCT ON (i.record_id) k.org_id, k.workspace_id, k.origin_id,
-         i.record_id, i.revision, i.revision_id, i.digest
-    FROM jsonb_to_recordset(v_items) AS i(ord integer, record_id text, revision_id text, revision bigint, digest text)
+         i.record_id, i.revision, i.revision_id, i.digest, k.user_id, i.source, i.session_id
+    FROM jsonb_to_recordset(v_items) AS i(ord integer, source text, session_id text, record_id text,
+                                          revision_id text, revision bigint, digest text)
    ORDER BY i.record_id, i.revision DESC, i.revision_id, i.ord
   ON CONFLICT (org_id, workspace_id, origin_id, record_id) DO UPDATE
      SET revision = EXCLUDED.revision, revision_id = EXCLUDED.revision_id,
-         digest = EXCLUDED.digest, updated_at = now()
+         digest = EXCLUDED.digest, user_id = EXCLUDED.user_id, source = EXCLUDED.source,
+         session_id = EXCLUDED.session_id, updated_at = now()
    WHERE EXCLUDED.revision > t.revision;
 
   -- The fence again: a tombstone, or a reset since the claim, that this batch's
@@ -686,8 +743,13 @@ BEGIN
   END IF;
   FOR v_e IN SELECT x FROM jsonb_array_elements(p) AS x LOOP
     PERFORM sessions.ingest_exact_keys(v_e,
-      ARRAY['org_id', 'workspace_id', 'origin_id', 'record_id', 'revision', 'revision_id', 'digest']);
+      ARRAY['org_id', 'workspace_id', 'origin_id', 'record_id', 'revision', 'revision_id', 'digest',
+            'user_id', 'source', 'session_id']);
     v_rows := v_rows || jsonb_build_array(jsonb_build_object(
+      'user_id', sessions.ingest_identifier(v_e -> 'user_id', false),
+      'source', sessions.ingest_identifier(v_e -> 'source', false),
+      'session_id', CASE WHEN jsonb_typeof(v_e -> 'session_id') = 'null' OR v_e -> 'session_id' = '""'::jsonb
+                         THEN NULL ELSE sessions.ingest_identifier(v_e -> 'session_id', false) END,
       'org_id', sessions.ingest_identifier(v_e -> 'org_id', false),
       'workspace_id', sessions.ingest_identifier(v_e -> 'workspace_id', true),
       'origin_id', sessions.ingest_identifier(v_e -> 'origin_id', false),
@@ -697,20 +759,310 @@ BEGIN
       'digest', sessions.ingest_digest(v_e -> 'digest')));
   END LOOP;
   INSERT INTO sessions.ingest_record_revisions AS t
-         (org_id, workspace_id, origin_id, record_id, revision, revision_id, digest)
+         (org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id)
   SELECT DISTINCT ON (r.org_id, r.workspace_id, r.origin_id, r.record_id)
-         r.org_id, r.workspace_id, r.origin_id, r.record_id, r.revision, r.revision_id, r.digest
+         r.org_id, r.workspace_id, r.origin_id, r.record_id, r.revision, r.revision_id, r.digest,
+         r.user_id, r.source, r.session_id
     FROM jsonb_to_recordset(v_rows) AS r(org_id text, workspace_id text, origin_id text, record_id text,
-                                         revision bigint, revision_id text, digest text)
+                                         revision bigint, revision_id text, digest text,
+                                         user_id text, source text, session_id text)
    ORDER BY r.org_id, r.workspace_id, r.origin_id, r.record_id, r.revision DESC, r.revision_id
   ON CONFLICT (org_id, workspace_id, origin_id, record_id) DO UPDATE
      SET revision = EXCLUDED.revision, revision_id = EXCLUDED.revision_id,
-         digest = EXCLUDED.digest, updated_at = now()
+         digest = EXCLUDED.digest, user_id = EXCLUDED.user_id, source = EXCLUDED.source,
+         session_id = EXCLUDED.session_id, updated_at = now()
    WHERE EXCLUDED.revision > t.revision;
   GET DIAGNOSTICS v_n = ROW_COUNT;
   RETURN jsonb_build_object('upserted', v_n);
 END
 $seed$;
+
+-- ---------------------------------------------------------------------------
+-- Deletion fences and their effect on the ledger (review High 2 and the fence
+-- writer). Neon 0038/0039 semantics, called by relayhistory's selection and reset
+-- routes (relayhistory-cloud #265, over the ingest's binding) right after Neon's own
+-- set_session_uploads / reset_uploaded_sessions, and by the seed for the backfill:
+--   disable  tombstone the session AND forget this user's revisions of it, so an
+--            explicit re-enable backfills the same revisions with fresh batch ids
+--            (stale is judged against stored revisions only);
+--   enable   remove the tombstone;
+--   reset    tombstone every session this user has revisions of, forget them all,
+--            and record the reset (idempotent by request id, like 0039).
+-- ---------------------------------------------------------------------------
+CREATE FUNCTION sessions.ingest_fence_pairs(p jsonb)
+RETURNS TABLE (source text, session_id text)
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path = pg_catalog, pg_temp
+AS $fpairs$
+DECLARE
+  e jsonb;
+BEGIN
+  IF p IS NULL OR jsonb_typeof(p) <> 'array' OR jsonb_array_length(p) < 1 OR jsonb_array_length(p) > 2048 THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: sessions is malformed';
+  END IF;
+  FOR e IN SELECT x FROM jsonb_array_elements(p) AS x LOOP
+    IF jsonb_typeof(e) <> 'array' OR jsonb_array_length(e) <> 2 THEN
+      RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: session pair is malformed';
+    END IF;
+    source := sessions.ingest_identifier(e -> 0, false);
+    session_id := sessions.ingest_identifier(e -> 1, false);
+    RETURN NEXT;
+  END LOOP;
+END
+$fpairs$;
+
+CREATE FUNCTION sessions.ingest_apply_selection(p_org text, p_ws text, p_user text, p_origin text,
+                                                p_sessions jsonb, p_enabled boolean)
+RETURNS integer
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = pg_catalog, pg_temp
+AS $apply$
+DECLARE
+  v_n integer;
+BEGIN
+  IF p_enabled THEN
+    DELETE FROM sessions.upload_deletions AS d
+     USING sessions.ingest_fence_pairs(p_sessions) AS s
+     WHERE d.org_id = p_org AND d.workspace_id = p_ws AND d.user_id = p_user
+       AND d.origin_id = p_origin AND d.source = s.source AND d.session_id = s.session_id;
+  ELSE
+    INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id)
+    SELECT DISTINCT p_org, p_ws, p_user, p_origin, s.source, s.session_id
+      FROM sessions.ingest_fence_pairs(p_sessions) AS s
+    ON CONFLICT DO NOTHING;
+    DELETE FROM sessions.ingest_record_revisions AS t
+     USING sessions.ingest_fence_pairs(p_sessions) AS s
+     WHERE t.org_id = p_org AND t.workspace_id = p_ws AND t.user_id = p_user
+       AND t.origin_id = p_origin AND t.source = s.source AND t.session_id = s.session_id;
+  END IF;
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  RETURN v_n;
+END
+$apply$;
+
+CREATE FUNCTION sessions.ingest_apply_reset(p_org text, p_ws text, p_user text, p_request text)
+RETURNS bigint
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = pg_catalog, pg_temp
+AS $reset$
+DECLARE
+  v_previous bigint;
+  v_total bigint;
+BEGIN
+  SELECT r.deleted INTO v_previous FROM sessions.upload_resets AS r
+   WHERE r.org_id = p_org AND r.workspace_id = p_ws AND r.user_id = p_user AND r.request_id = p_request;
+  IF FOUND THEN RETURN v_previous; END IF;
+  WITH owned AS (
+    SELECT DISTINCT t.origin_id, t.source, t.session_id FROM sessions.ingest_record_revisions AS t
+     WHERE t.org_id = p_org AND t.workspace_id = p_ws AND t.user_id = p_user AND t.session_id IS NOT NULL
+  ), fenced AS (
+    INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id)
+    SELECT p_org, p_ws, p_user, o.origin_id, o.source, o.session_id FROM owned AS o
+    ON CONFLICT DO NOTHING
+  )
+  SELECT count(*) INTO v_total FROM (SELECT DISTINCT source, session_id FROM owned) AS x;
+  DELETE FROM sessions.ingest_record_revisions AS t
+   WHERE t.org_id = p_org AND t.workspace_id = p_ws AND t.user_id = p_user AND t.session_id IS NOT NULL;
+  INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id, deleted)
+  VALUES (p_org, p_ws, p_user, p_request, v_total);
+  RETURN v_total;
+END
+$reset$;
+
+-- {tenant, originId, sessions: [[source, session_id], ...] (1..2048), enabled}
+CREATE FUNCTION sessions.ingest_set_session_uploads(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $select$
+DECLARE
+  t jsonb;
+BEGIN
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  PERFORM sessions.ingest_exact_keys(p, ARRAY['tenant', 'originId', 'sessions', 'enabled']);
+  t := p -> 'tenant';
+  PERFORM sessions.ingest_exact_keys(t, ARRAY['orgId', 'workspaceId', 'userId']);
+  IF jsonb_typeof(p -> 'enabled') IS DISTINCT FROM 'boolean' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: enabled is malformed';
+  END IF;
+  RETURN jsonb_build_object('updated', sessions.ingest_apply_selection(
+    sessions.ingest_identifier(t -> 'orgId', false), sessions.ingest_identifier(t -> 'workspaceId', true),
+    sessions.ingest_identifier(t -> 'userId', false), sessions.ingest_identifier(p -> 'originId', false),
+    p -> 'sessions', (p ->> 'enabled')::boolean));
+END
+$select$;
+
+-- {tenant, requestId}
+CREATE FUNCTION sessions.ingest_reset_uploaded_sessions(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $resetfn$
+DECLARE
+  t jsonb;
+BEGIN
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  PERFORM sessions.ingest_exact_keys(p, ARRAY['tenant', 'requestId']);
+  t := p -> 'tenant';
+  PERFORM sessions.ingest_exact_keys(t, ARRAY['orgId', 'workspaceId', 'userId']);
+  RETURN jsonb_build_object('deleted', sessions.ingest_apply_reset(
+    sessions.ingest_identifier(t -> 'orgId', false), sessions.ingest_identifier(t -> 'workspaceId', true),
+    sessions.ingest_identifier(t -> 'userId', false), sessions.ingest_identifier(p -> 'requestId', false)));
+END
+$resetfn$;
+
+-- The seed's copy of Neon's fences (deleted_upload_sessions, session_resets), applied
+-- after the org's revisions are seeded: {deletions: [{org_id, workspace_id, user_id,
+-- origin_id, source, session_id}], resets: [{org_id, workspace_id, user_id, request_id,
+-- deleted}]}. A deletion forgets the seeded revisions of that session; a reset is only
+-- recorded (Neon tombstoned every session it reset, and those tombstones are in
+-- deletions). Idempotent.
+CREATE FUNCTION sessions.ingest_seed_fences(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $sfences$
+DECLARE
+  e jsonb;
+  v_deletions integer := 0;
+  v_resets integer := 0;
+BEGIN
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest_seeder');
+  PERFORM sessions.ingest_exact_keys(p, ARRAY['deletions', 'resets']);
+  IF jsonb_typeof(p -> 'deletions') <> 'array' OR jsonb_typeof(p -> 'resets') <> 'array'
+     OR jsonb_array_length(p -> 'deletions') + jsonb_array_length(p -> 'resets') > 5000 THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest seed: fences are malformed';
+  END IF;
+  FOR e IN SELECT x FROM jsonb_array_elements(p -> 'deletions') AS x LOOP
+    PERFORM sessions.ingest_exact_keys(e, ARRAY['org_id', 'workspace_id', 'user_id', 'origin_id', 'source', 'session_id']);
+    PERFORM sessions.ingest_apply_selection(
+      sessions.ingest_identifier(e -> 'org_id', false), sessions.ingest_identifier(e -> 'workspace_id', true),
+      sessions.ingest_identifier(e -> 'user_id', false), sessions.ingest_identifier(e -> 'origin_id', false),
+      jsonb_build_array(jsonb_build_array(e -> 'source', e -> 'session_id')), false);
+    v_deletions := v_deletions + 1;
+  END LOOP;
+  FOR e IN SELECT x FROM jsonb_array_elements(p -> 'resets') AS x LOOP
+    PERFORM sessions.ingest_exact_keys(e, ARRAY['org_id', 'workspace_id', 'user_id', 'request_id', 'deleted']);
+    INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id, deleted)
+    VALUES (sessions.ingest_identifier(e -> 'org_id', false), sessions.ingest_identifier(e -> 'workspace_id', true),
+            sessions.ingest_identifier(e -> 'user_id', false), sessions.ingest_identifier(e -> 'request_id', false),
+            greatest(0, coalesce((e ->> 'deleted')::bigint, 0)))
+    ON CONFLICT DO NOTHING;
+    v_resets := v_resets + 1;
+  END LOOP;
+  RETURN jsonb_build_object('deletions', v_deletions, 'resets', v_resets);
+END
+$sfences$;
+
+-- ---------------------------------------------------------------------------
+-- The staged path (review Medium: revisions before the fan-out wrote them). A staged
+-- batch is committed at request time WITHOUT revisions; each fan-out slice first asks
+-- which of its sessions are fenced now (and skips them), writes the rest, then commits
+-- exactly the records it wrote. So a dead-lettered slice leaves its records not stale
+-- (a re-export writes them again), and a tombstone that lands between the request and
+-- the fan-out is honoured.
+-- ---------------------------------------------------------------------------
+-- {tenant, originId, sessions}: the sessions fenced (deleted) right now.
+CREATE FUNCTION sessions.ingest_fanout_fence(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $ffence$
+DECLARE
+  t jsonb;
+  v_deleted jsonb;
+BEGIN
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  PERFORM sessions.ingest_exact_keys(p, ARRAY['tenant', 'originId', 'sessions']);
+  t := p -> 'tenant';
+  PERFORM sessions.ingest_exact_keys(t, ARRAY['orgId', 'workspaceId', 'userId']);
+  SELECT coalesce(jsonb_agg(jsonb_build_array(s.source, s.session_id) ORDER BY s.source, s.session_id), '[]'::jsonb)
+    INTO v_deleted
+    FROM sessions.ingest_fence_pairs(p -> 'sessions') AS s
+   WHERE EXISTS (SELECT 1 FROM sessions.upload_deletions AS d
+                  WHERE d.org_id = sessions.ingest_identifier(t -> 'orgId', false)
+                    AND d.workspace_id = sessions.ingest_identifier(t -> 'workspaceId', true)
+                    AND d.user_id = sessions.ingest_identifier(t -> 'userId', false)
+                    AND d.origin_id = sessions.ingest_identifier(p -> 'originId', false)
+                    AND d.source = s.source AND d.session_id = s.session_id);
+  RETURN jsonb_build_object('deleted', v_deleted);
+END
+$ffence$;
+
+-- {tenant, originId, machineId, records}: the records one slice wrote become stored
+-- (max wins, equal keeps), except those of a session fenced since the fence check,
+-- which are queued for another erasure sweep instead. Idempotent.
+CREATE FUNCTION sessions.ingest_commit_revisions(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $crev$
+DECLARE
+  t jsonb;
+  v_org text; v_ws text; v_user text; v_origin text; v_machine text;
+  v_items jsonb;
+  v_committed integer;
+  v_rearmed integer;
+BEGIN
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  PERFORM sessions.ingest_exact_keys(p, ARRAY['tenant', 'originId', 'machineId', 'records']);
+  t := p -> 'tenant';
+  PERFORM sessions.ingest_exact_keys(t, ARRAY['orgId', 'workspaceId', 'userId']);
+  v_org := sessions.ingest_identifier(t -> 'orgId', false);
+  v_ws := sessions.ingest_identifier(t -> 'workspaceId', true);
+  v_user := sessions.ingest_identifier(t -> 'userId', false);
+  v_origin := sessions.ingest_identifier(p -> 'originId', false);
+  IF jsonb_typeof(p -> 'machineId') IS DISTINCT FROM 'string' OR (p ->> 'machineId') !~ '^srv_[0-9a-f]{32}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: machineId is malformed';
+  END IF;
+  v_machine := p ->> 'machineId';
+  v_items := sessions.ingest_records(p -> 'records');
+  WITH items AS (
+    SELECT * FROM jsonb_to_recordset(v_items) AS i(ord integer, source text, session_id text, record_id text,
+                                                    revision_id text, revision bigint, digest text)
+  ), fenced AS (
+    SELECT DISTINCT i.source, i.session_id FROM items AS i
+     WHERE i.session_id IS NOT NULL AND EXISTS (
+       SELECT 1 FROM sessions.upload_deletions AS d
+        WHERE d.org_id = v_org AND d.workspace_id = v_ws AND d.user_id = v_user AND d.origin_id = v_origin
+          AND d.source = i.source AND d.session_id = i.session_id)
+  ), rearm AS (
+    INSERT INTO sessions.upload_erasure_rearm (org_id, workspace_id, user_id, origin_id, machine_id, source, session_id)
+    SELECT v_org, v_ws, v_user, v_origin, v_machine, f.source, f.session_id FROM fenced AS f
+    ON CONFLICT DO NOTHING
+  ), upserted AS (
+    INSERT INTO sessions.ingest_record_revisions AS r
+           (org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id)
+    SELECT DISTINCT ON (i.record_id) v_org, v_ws, v_origin, i.record_id, i.revision, i.revision_id, i.digest,
+           v_user, i.source, i.session_id
+      FROM items AS i
+     WHERE NOT EXISTS (SELECT 1 FROM fenced AS f WHERE f.source = i.source AND f.session_id = i.session_id)
+     ORDER BY i.record_id, i.revision DESC, i.revision_id, i.ord
+    ON CONFLICT (org_id, workspace_id, origin_id, record_id) DO UPDATE
+       SET revision = EXCLUDED.revision, revision_id = EXCLUDED.revision_id, digest = EXCLUDED.digest,
+           user_id = EXCLUDED.user_id, source = EXCLUDED.source, session_id = EXCLUDED.session_id,
+           updated_at = now()
+     WHERE EXCLUDED.revision > r.revision
+    RETURNING 1
+  )
+  SELECT (SELECT count(*)::integer FROM upserted), (SELECT count(*)::integer FROM fenced)
+    INTO v_committed, v_rearmed;
+  RETURN jsonb_build_object('committed', v_committed, 'rearmed', v_rearmed);
+END
+$crev$;
 
 REVOKE ALL ON FUNCTION sessions.ingest_require_role(text),
   sessions.ingest_identifier(jsonb, boolean), sessions.ingest_exact_keys(jsonb, text[]),
@@ -719,10 +1071,19 @@ REVOKE ALL ON FUNCTION sessions.ingest_require_role(text),
   sessions.ingest_bounded(jsonb, integer, integer),
   sessions.ingest_claim_batch(jsonb), sessions.ingest_commit_batch(jsonb),
   sessions.ingest_acquire_slot(jsonb), sessions.ingest_release_slot(jsonb),
-  sessions.ingest_seed_records(jsonb)
+  sessions.ingest_seed_records(jsonb),
+  sessions.ingest_fence_pairs(jsonb),
+  sessions.ingest_apply_selection(text, text, text, text, jsonb, boolean),
+  sessions.ingest_apply_reset(text, text, text, text),
+  sessions.ingest_set_session_uploads(jsonb), sessions.ingest_reset_uploaded_sessions(jsonb),
+  sessions.ingest_seed_fences(jsonb),
+  sessions.ingest_fanout_fence(jsonb), sessions.ingest_commit_revisions(jsonb)
   FROM PUBLIC, anon, authenticated, service_role;
 GRANT USAGE ON SCHEMA sessions TO bulls96_session_ingest, bulls96_session_ingest_seeder;
 GRANT EXECUTE ON FUNCTION sessions.ingest_claim_batch(jsonb), sessions.ingest_commit_batch(jsonb),
-  sessions.ingest_acquire_slot(jsonb), sessions.ingest_release_slot(jsonb)
+  sessions.ingest_acquire_slot(jsonb), sessions.ingest_release_slot(jsonb),
+  sessions.ingest_set_session_uploads(jsonb), sessions.ingest_reset_uploaded_sessions(jsonb),
+  sessions.ingest_fanout_fence(jsonb), sessions.ingest_commit_revisions(jsonb)
   TO bulls96_session_ingest;
-GRANT EXECUTE ON FUNCTION sessions.ingest_seed_records(jsonb) TO bulls96_session_ingest_seeder;
+GRANT EXECUTE ON FUNCTION sessions.ingest_seed_records(jsonb), sessions.ingest_seed_fences(jsonb)
+  TO bulls96_session_ingest_seeder;

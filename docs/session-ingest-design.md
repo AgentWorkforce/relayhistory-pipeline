@@ -71,6 +71,7 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
   - `nodejs_compat` with smart placement, which runs it near S3 and Supabase in us-east-1.
   - **Private:** `workersDev: false`, `routes: []`, `domain: null`. Pure functions, tests and mutations enforce this. The binding is its only way in, so the identity header is trusted.
   - **Same Cloudflare account as relayhistory:** a service binding cannot cross accounts, and the stage refuses any other account.
+  - **The identity is signed (review Medium):** relayhistory HMAC-SHA256-signs each call over method, path, the identity header and the body with a Secrets Store key both Workers hold; the ingest refuses an unsigned, altered or older-than-60 s request. A sibling Worker that binds the ingest cannot assert a tenant.
 - **Wire compatibility:** relayhistory's `delivery-contracts.ts` and `session-image.ts` are vendored verbatim. The validation, digest, `servicePayload` and `prepareDelivery` code from `delivery.ts` is vendored as exact line ranges, without its Neon half.
   - Location: `vendor/delivery`. `SOURCE.json` records the SHA-256 of every file and range, and `scripts/vendor-relayhistory-delivery.ts --check` fails on drift.
   - Batch digests and the content-addressed `receiptId` therefore match exactly. So do the 400/403/413/415/422 answers, the 409 bodies (`conflict`, `conflicts`, `conflictCount`), the error envelope, `X-Correlation-Id`, `limits.contentEncodings` and both 2 MiB bounds. A gzip bomb stops at the cap.
@@ -108,7 +109,8 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
 - **Visibility:** readers see the batch seconds later.
 - **Retries:** a retried request finds its own staged object and re-queues. Duplicate messages are harmless.
 - **Content addressing:** the key names the batch digest **and** a digest of the exact groups and record identities staged. A retry that keeps the same records reuses its own object. A retry whose kept set shrank (records committed meanwhile by another batch) stages a new object. So the fan-out ranges, the replica's placements and the commit always describe the same object (review H1, tested).
-- **Follow-up:** the staged object stays after its fan-out. A lifecycle rule on `live-batches/*.staged.*` (for example, 7 days) is a store change. The erasure job must also cover staged objects; that is a canary gate (runbook 6c).
+- **Revisions follow the fan-out (review Medium):** the request commits a staged batch **without** revisions. Each slice first asks which of its sessions are fenced now (`ingest_fanout_fence`, skipped), writes the rest, then commits exactly what it wrote (`ingest_commit_revisions`, which re-arms erasure for a session fenced in between). A dead-lettered slice therefore leaves its records not stale, and the runbook's DLQ redrive (within 24 h) recovers it.
+- **Erasure:** the erasure job erases a fenced machine's staged batches once they are past the 48 h redrive window, and revisits the tombstone until they are gone. No lifecycle rule (it could delete a batch waiting for a redrive).
 
 ### 2c. Scrubbing for over-bound text (`raw-chunks.ts`)
 
@@ -122,14 +124,19 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
 
 ## 3. Ledger (Supabase)
 
-Migration `supabase/migrations/20261102010000_session_ingest_ledger.sql`. The roles are created NOLOGIN by the migration; the bootstrap script makes `bulls96_session_ingest` LOGIN with a 5 s statement timeout. Each function refuses any other caller, and no advisory lock is taken anywhere (a test asserts it).
+Migration `supabase/migrations/20261102010000_session_ingest_ledger.sql`. It never creates or alters a role (review High 1: a CNPG / Cloud SQL migration owner has no CREATEROLE). `supabase/bootstrap/session_ingest_roles.sql` provisions both roles NOLOGIN before migrate (`src/hoopdb/migrate.ts` runs it as its bootstrap step, the runbook as `postgres` on Supabase); the migration verifies them and fails closed (42704 absent, 55000 elevated or a member). After migrate, `session_ingest_role.sql` makes the ingest role LOGIN with a 5 s statement timeout. Each function refuses any other caller, and no advisory lock is taken anywhere (a test asserts it).
 
 - **`ingest_batches`** holds idempotency and receipts.
   - Same digest and committed: **replay**. The receipt is recomputed from the request, since it is content-addressed. The stored `receipt_id` is cross-checked, and a mismatch is a 503.
   - Same digest and pending: **resume**.
   - Other digest: **409 `batch_id`**.
   - No client revision ids are stored.
-- **`ingest_record_revisions`** holds committed revisions only (section 2a). The commit upserts the written records in sorted order, max revision wins, and an equal revision keeps the stored row.
+- **`ingest_record_revisions`** holds committed revisions only (section 2a), with their user, source and session (Neon's `delivery_records` shape). The commit upserts the written records in sorted order, max revision wins, and an equal revision keeps the stored row.
+- **Deletion, re-enable and reset forget revisions (review High 2).** relayhistory writes every selection and reset to the ingest right after Neon (#265, signed, required once the binding is live), as Neon 0038/0039 do:
+  - a disable tombstones the session and deletes this user's revision rows of it, so an explicit re-enable backfills the same revisions under fresh batch ids and they are **written**, not acknowledged;
+  - an enable lifts the tombstone;
+  - a reset tombstones every session of the user and forgets them, idempotent by request id.
+  The seed copies Neon's existing tombstones and resets per org.
 - **`upload_deletions` / `upload_resets`** are the **deletion fences, from Supabase**.
   - Records of deleted sessions are dropped before the revision checks, and the receipt is unchanged (Neon 0038's filter).
   - The commit rechecks the fences. A tombstone or reset that landed after the claim queues that session in `upload_erasure_rearm` for another erasure sweep. That replaces the per-user lock Neon used to serialize resets against deliveries.
@@ -205,9 +212,6 @@ Migration `supabase/migrations/20261102010000_session_ingest_ledger.sql`. The ro
 
 ## 7. Follow-ups (in order)
 
-1. relayhistory-cloud: tombstone and reset dual-write to Supabase. The replica consumer changes are done in #265.
-2. 96BullSessions:
-   - the erasure job consuming `upload_erasure_rearm` and covering `live-batches/**.staged.*`;
-   - a lifecycle rule for staged objects.
-3. relay-desktop: drain an existing quarantine without regenerating, and stop regenerating on auto-include. Neither is needed for the cutover.
-4. `selection` / `reset` on the ingest. These are needed only before relayhistory's front door is retired.
+1. 96BullSessions: the erasure job reading `sessions.upload_erasure_rearm` (Supabase) as well as Neon's tombstones. While relayhistory writes every tombstone to Neon too, the Neon sweep already revisits those sessions every pass, so the re-arm table is a second signal, not the only one.
+2. relay-desktop: drain an existing quarantine without regenerating, and stop regenerating on auto-include. Neither is needed for the cutover.
+3. When relayhistory's front door is retired: Desktop calls the ingest's `selection` / `reset` routes directly (they exist, and are what #265 calls today).

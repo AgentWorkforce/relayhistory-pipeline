@@ -2,7 +2,17 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import type { ObjectStore } from "../../shared/vendor.ts";
-import type { ClaimInput, ClaimResult, CommitInput, Ledger, LedgerTenant, SlotRequest, SlotResult } from "../ledger.ts";
+import type { ClaimInput, ClaimResult, CommitInput, Ledger, LedgerRecord, LedgerTenant, SelectionInput, SlotRequest, SlotResult } from "../ledger.ts";
+import { IDENTITY_HEADER, SIGNATURE_HEADER, encodeIdentity, signRequest } from "../app.ts";
+import type { VerifiedIdentity } from "../../session-read-api/app.ts";
+
+export const SIGNING_KEY = "test-signing-key";
+
+/** Headers relayhistory sends over the binding: the identity and its signature over this exact request. */
+export function signedHeaders(identity: VerifiedIdentity, method: string, path: string, body: Uint8Array, key = SIGNING_KEY, t = Math.floor(Date.now() / 1000)) {
+  const id = encodeIdentity(identity);
+  return { [IDENTITY_HEADER]: id, [SIGNATURE_HEADER]: signRequest(key, t, method, path, id, body) };
+}
 import { deliveryAccount } from "../vendor/delivery/prepare.ts";
 import { DELIVERY_MAPPING_VERSION, type HistoryExportBatch, type HistoryExportRecord } from "../vendor/delivery/delivery-contracts.ts";
 
@@ -95,6 +105,28 @@ export class MemoryLedger implements Ledger {
   }
   async releaseSlot(t: LedgerTenant, holder: string) {
     this.slots.get(t.userId)?.delete(holder);
+  }
+  selections: SelectionInput[] = [];
+  async setSessionUploads(input: SelectionInput) {
+    this.selections.push(input);
+    for (const [s, id] of input.sessions) {
+      const k = JSON.stringify([s, id]);
+      if (input.enabled) this.deleted.delete(k);
+      else this.deleted.add(k);
+    }
+  }
+  async resetUploadedSessions(_t: LedgerTenant, _requestId: string) {
+    this.revisions.clear();
+    return 0;
+  }
+  revisionCommits: LedgerRecord[][] = [];
+  async fanoutFence(_t: LedgerTenant, _origin: string, sessions: [string, string][]) {
+    return sessions.filter(([s, id]) => this.deleted.has(JSON.stringify([s, id])));
+  }
+  async commitRevisions(_t: LedgerTenant, _origin: string, _machine: string, records: LedgerRecord[]) {
+    this.revisionCommits.push(records);
+    for (const r of records) this.revisions.set(r.recordId, Math.max(this.revisions.get(r.recordId) ?? 0, r.revision));
+    return { committed: records.length, rearmed: 0 };
   }
   async commit(input: CommitInput) {
     this.commits.push(input);
