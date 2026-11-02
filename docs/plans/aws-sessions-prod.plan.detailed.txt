@@ -4,8 +4,8 @@ Resolving stack services
 AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
 Loading stack state
 Computing plan
-Plan ready (2.7s)
-Plan: no changes
+Plan ready (4.0s)
+Plan: 1 to update
 
 [access-logs] noop
 
@@ -23,10 +23,13 @@ Plan: no changes
 
 [transcript-reader] noop
 
+[transcript-srv-writer] noop
+
 [transcript-writer] noop
 
 [transcripts] noop
 
-[transcripts-key] noop
+[transcripts-key] update
+  no declared property changes
 
 [transcripts-key-alias] noop
