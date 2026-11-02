@@ -487,6 +487,21 @@ config fails closed.
   A CREATE-capable role that has not created anything yet still refuses the gate (tested
   on PG15 and PG17). Separately, every existing `sessions` function must be owned by the
   owner (`sessions_functions_owned_by_owner`).
+- **Run-time exact manifest (every non-local mode: `global-default-revoke` in
+  `selfhosted` and `cloudsql`, `event-trigger` in `supabase`):** after the last
+  migration, inside the validation transaction with phase 2 and the PASS write, every
+  `sessions` function's ACL must equal `src/hoopdb/sessions-function-acl.json` plus
+  `<runtime role>:EXECUTE` on `RUNTIME_APPLICATION_FUNCTIONS` (#116)
+  (`sessionsFunctionAclDrift` in `src/hoopdb/migrate-guards.ts`). Any difference, an
+  extra grantee such as `authenticated` or a missing manifest grant, refuses with
+  `function_acl_drift`: the transaction rolls back, nothing is marked PASS and the
+  readiness marker stays `pending`, so readers stay not ready. Local (Docker dev) mode
+  has no such check. No Cloud SQL-specific grantee (for example `cloudsqlsuperuser` or
+  an IAM role) is granted on `sessions` functions by the repository: the trampoline
+  bootstrap (`cloudsql_migration_roles.sql`) creates roles only, and the Cloud SQL
+  pg-proof path matches the manifest. A live Cloud SQL instance is NOT OBSERVED. Tested on
+  PG15 and PG17 (selfhosted extra grant refused, marker pending, clean migrate passes)
+  and in the unit-test mode matrix.
 - **No schema-scoped grant in `sessions`:** a function default defined `IN SCHEMA sessions`
   (by any role) adds to the global default, so any entry granting a role other than its
   own (for example `authenticated`) refuses the gate and the bootstrap
@@ -527,10 +542,8 @@ replica` (confirmed on PG 17.11), as dump and restore tooling sets. Idempotent; 
     or is SECURITY DEFINER outside the frozen list; or when a `sessions`-scoped function
     default grants another role. A function GRANT/REVOKE, an extension or schema change
     rechecks every `sessions` routine. While migrations run the check is "subset of the
-    manifest"; exact equality is checked after every event-trigger-mode migrate, inside
-    the validation transaction with phase 2 and PASS (`function_acl_drift`, rolled back;
-    `sessionsFunctionAclDrift` in `src/hoopdb/migrate-guards.ts`; the other modes are
-    unchanged), and the live gate still refuses PUBLIC-executable
+    manifest"; exact equality is checked after every non-local migrate (see "Run-time exact
+    manifest" below), and the live gate still refuses PUBLIC-executable
     `sessions` functions. Blast radius: a function GRANT
     anywhere in the database is refused while `sessions` itself violates the manifest.
   - **Gate (more than its name):** before any write the migrator (and
