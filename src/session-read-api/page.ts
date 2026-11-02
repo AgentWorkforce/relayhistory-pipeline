@@ -14,6 +14,7 @@ import {
   READ_SETTINGS,
   buildCandidateQuery,
   buildNewestQuery,
+  buildPartialSessionsQuery,
   candidatePosition,
   type CandidateRow,
   type EventQuery,
@@ -175,4 +176,18 @@ export async function readEventPage(deps: PageDeps, input: EventQuery): Promise<
     nextCursor,
     erasedDropped: kept.length - live.length,
   };
+}
+
+/**
+ * Partial sessions (`needs_full = 1`, queries.ts buildPartialSessionsQuery):
+ * the one session when `sessionId` is given, else any of the org's, capped.
+ */
+export async function partialSessions(deps: PageDeps, orgId: string, sessionId?: string): Promise<string[]> {
+  const q = buildPartialSessionsQuery(deps.ch.database, orgId, sessionId);
+  const rows = await deps.ch.select<{ session_id: string }>(q.query, {
+    settings: { ...READ_SETTINGS },
+    timeoutMs: deps.timeoutMs ?? 3_000,
+    params: q.params,
+  });
+  return rows.map((r) => r.session_id);
 }

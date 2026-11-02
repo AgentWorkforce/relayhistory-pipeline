@@ -13,7 +13,9 @@
 --   RLS       session_index already has RLS on. The policy below admits only rows
 --             of the org and workspace that the current transaction bound with
 --             set_config('bulls96_read.org_id' / 'bulls96_read.workspace_id', ..., true)
---             (TENANT_SETTINGS_SQL). An unset setting is NULL and matches nothing.
+--             (TENANT_SETTINGS_SQL). A setting never set on the connection is NULL;
+--             after a transaction-local set_config ends it reads as '' on that pooled
+--             connection. Neither matches a row: org_id and workspace_id are never NULL or ''.
 --
 -- Idempotent. Run as `postgres` (Supabase) after the HoopDb migrations; set the
 -- password separately (never in this file), then verify:

@@ -10,7 +10,16 @@
  *
  * Anything this backend cannot answer exactly is `501 unsupported_by_backend`
  * with a `reason`, never a best-effort answer: the caller (Cloud) falls back
- * to relayhistory for it during the transition.
+ * to relayhistory for it during the transition. A 501 is only ever the answer
+ * to a FIRST page (no cursor), where the caller can still fall back cleanly.
+ * Once this backend has issued a cursor, the caller cannot restart elsewhere
+ * without duplicating pages, so:
+ *
+ *   - A partial session (`needs_full = 1`) is checked when pagination starts.
+ *     A cursor continues the read that check admitted.
+ *   - A search page that reaches the history floor is a terminal 200 with a
+ *     `continuation` (CONTINUATION below): the rows from the floor up, and
+ *     where the existing backend must continue strictly below it.
  *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
@@ -19,7 +28,7 @@
 import { Hono, type Context } from "hono";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { CursorError, decodeCursor } from "./cursor.ts";
-import { TenantMismatchError, readEventPage, type Liveness } from "./page.ts";
+import { TenantMismatchError, partialSessions, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
 
 export interface VerifiedIdentity {
@@ -55,6 +64,26 @@ export const EVENTS_MAX_LIMIT = 1000;
 export const SEARCH_MAX_LIMIT = 100;
 export const MAX_Q_CHARS = 500;
 const MAX_ID_CHARS = 512;
+
+/**
+ * The terminal-page signal for a search cursor page that reached the history
+ * floor. `events` holds every match from the floor up (ClickHouse is complete
+ * there); the caller continues the same read at relayhistory with `until` set
+ * to `until` (inclusive, one microsecond below the floor, so relayhistory's
+ * microsecond timestamps neither repeat a row served here nor skip one) and no
+ * cursor. Ordering is newest first, so every later relayhistory page is older
+ * still and the pagination never revisits this backend.
+ */
+export interface Continuation {
+  backend: "relayhistory";
+  reason: "history_floor";
+  until: string;
+}
+
+/** One microsecond below `floorMs`, as an ISO timestamp relayhistory accepts (six fractional digits). */
+export function continuationUntil(floorMs: number): string {
+  return new Date(floorMs - 1).toISOString().replace(/Z$/, "999Z");
+}
 
 class HttpError extends Error {
   constructor(readonly status: number, readonly code: string, message: string, readonly reason?: string) {
@@ -173,14 +202,21 @@ export function createReadApi(deps: ReadApiDeps) {
     return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId }, 503);
   };
 
-  /** Session reads: erased → empty page; history older than the floor → 501. */
-  async function sessionGate(identity: VerifiedIdentity, sessionId: string, source: string | undefined): Promise<"empty" | "ok"> {
+  const pageDeps = () => ({ ch: deps.ch, liveness: deps.liveness, timeoutMs: deps.timeoutMs });
+
+  /**
+   * Session reads: erased → empty page; history older than the floor → 501;
+   * a partial session (`needs_full = 1`) → 501 `session_partial` when
+   * pagination starts (no cursor), so the caller reads it from relayhistory.
+   */
+  async function sessionGate(identity: VerifiedIdentity, sessionId: string, source: string | undefined, continuing: boolean): Promise<"empty" | "ok"> {
     const start = await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
     if (start.pointers > 0 && start.live === 0) return "empty";
     if (deps.completeSinceMs > 0) {
       if (start.createdAtMs === null) throw unsupported("history_floor_unknown_session");
       if (start.createdAtMs < deps.completeSinceMs) throw unsupported("history_floor");
     }
+    if (!continuing && (await partialSessions(pageDeps(), identity.orgId, sessionId)).length > 0) throw unsupported("session_partial");
     return "ok";
   }
 
@@ -197,7 +233,7 @@ export function createReadApi(deps: ReadApiDeps) {
       const limit = clampLimit(single(c, "limit"), EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT);
       const maxContent = positiveInt(single(c, "maxContent"));
       const cursor = decodeCursor(single(c, "cursor"));
-      if ((await sessionGate(identity, sessionId, source)) === "empty")
+      if ((await sessionGate(identity, sessionId, source, cursor !== undefined)) === "empty")
         return c.json({ sessionId, events: [], nextCursor: null, correlationId: c.get("correlationId") });
       const page = await readEventPage(
         { ch: deps.ch, liveness: deps.liveness, timeoutMs: deps.timeoutMs },
@@ -232,7 +268,7 @@ export function createReadApi(deps: ReadApiDeps) {
 
       if (sessionId !== undefined) {
         base.limit = clampLimit(single(c, "limit"), EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT);
-        if ((await sessionGate(identity, sessionId, source)) === "empty")
+        if ((await sessionGate(identity, sessionId, source, cursor !== undefined)) === "empty")
           return c.json({ events: [], nextCursor: null, correlationId: c.get("correlationId") });
         const page = await readEventPage({ ch: deps.ch, liveness: deps.liveness, timeoutMs: deps.timeoutMs }, base);
         return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
@@ -248,8 +284,18 @@ export function createReadApi(deps: ReadApiDeps) {
       const belowFloor = deps.completeSinceMs > 0 && (sinceMs === undefined || sinceMs < deps.completeSinceMs);
       if (belowFloor) base.sinceMs = deps.completeSinceMs;
       if (untilMs !== undefined && base.sinceMs !== undefined && untilMs < base.sinceMs) throw unsupported("history_floor");
-      const page = await readEventPage({ ch: deps.ch, liveness: deps.liveness, timeoutMs: deps.timeoutMs }, base);
-      if (belowFloor && page.nextCursor === null) throw unsupported("history_floor");
+      // A partial session anywhere in the org may hold matches this backend
+      // lacks (the state table has no workspace): the search starts at relayhistory.
+      if (cursor === undefined && (await partialSessions(pageDeps(), identity.orgId)).length > 0) throw unsupported("session_partial");
+      const page = await readEventPage(pageDeps(), base);
+      if (belowFloor && page.nextCursor === null) {
+        // First page: nothing was issued yet, so the whole read falls back.
+        if (cursor === undefined) throw unsupported("history_floor");
+        // Cursor page: end this backend's part cleanly and hand the rest over.
+        const continuation: Continuation = { backend: "relayhistory", reason: "history_floor", until: continuationUntil(deps.completeSinceMs) };
+        log({ route: c.req.routePath, reason: "history_floor_continuation", status: 200, correlation_id: c.get("correlationId") });
+        return c.json({ events: page.events, nextCursor: null, continuation, correlationId: c.get("correlationId") });
+      }
       return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
       return fail(c, error);

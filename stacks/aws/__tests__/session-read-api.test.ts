@@ -1,10 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import * as AWS from "@alchemy.run/aws";
 import { SESSION_PIPELINE_RESOURCES } from "../session-pipeline.ts";
 import {
   SESSION_READ_API_RESOURCES,
   assertSessionReadApiInputs,
   sessionReadApiEnv,
+  sessionReadApiFunctionProps,
   sessionReadApiNames,
   sessionReadApiSecretPolicy,
 } from "../session-read-api.ts";
@@ -18,7 +22,7 @@ const refuse = (why: string): never => {
 describe("session read api: deploy plan contract", () => {
   const store = [
     "access-logs", "budget", "trail", "trail-key", "trail-key-alias", "trail-logs",
-    "transcript-eraser", "transcript-reader", "transcript-writer", "transcripts",
+    "transcript-eraser", "transcript-reader", "transcript-srv-writer", "transcript-writer", "transcripts",
     "transcripts-key", "transcripts-key-alias",
   ];
   const withApi = [...store, ...SESSION_READ_API_RESOURCES];
@@ -102,5 +106,22 @@ describe("session read api: inputs, grants and env", () => {
     expect(env.READ_API_ORIGIN).toBe("");
     expect(env.SESSION_READ_API_SECRET_ARN).toBe("96bulls/aws-sessions-prod/session-read-api");
     expect(Object.keys(env).some((k) => /PASSWORD|KEY$|TOKEN|URL$/.test(k))).toBe(false);
+  });
+});
+
+describe("session read api: Function URL (public by design, application auth)", () => {
+  const props = sessionReadApiFunctionProps({ stage: STAGE, names: sessionReadApiNames(STAGE), p: { completeSince: "epoch" } });
+
+  it("declares exactly a buffered NONE-auth URL with no CORS, and nothing Alchemy would default", () => {
+    expect(props.functionUrl).toEqual({ authType: "NONE", invokeMode: "BUFFERED" });
+    expect(AWS.Lambda.normalizeFunctionUrl(props.functionUrl)).toEqual({ authType: "NONE", cors: undefined, invokeMode: "BUFFERED" });
+  });
+
+  it("every /v1 route sits behind the application's bearer auth; only /health is open", () => {
+    const src = readFileSync(fileURLToPath(new URL("../../../src/session-read-api/app.ts", import.meta.url)), "utf8");
+    const routes = [...src.matchAll(/app\.(get|post|put|patch|delete|all)\("([^"]+)"/g)].map((m) => m[2]);
+    expect(routes.sort()).toEqual(["/health", "/v1/events", "/v1/sessions/:sessionId/events"]);
+    expect(src).toContain('app.use("/v1/*", async (c, next) => {');
+    expect(src).toMatch(/if \(!m\) return c\.json\(\{ error: \{ code: "missing_authorization"/);
   });
 });

@@ -121,14 +121,16 @@ export async function handleUrlEvent(app: { fetch(req: Request): Response | Prom
 }
 
 export async function handler(event: FunctionUrlEvent): Promise<FunctionUrlResult> {
+  let app: Awaited<NonNullable<typeof appPromise>>;
   try {
     appPromise ??= buildApp();
-    const app = await appPromise;
-    return await handleUrlEvent(app, event);
+    app = await appPromise;
   } catch (error) {
     // A failed init is retried on the next request rather than cached forever.
     appPromise = undefined;
     log.error("read api init failed", { error_code: (error as { name?: string })?.name ?? "error" });
     return { statusCode: 503, headers: { "content-type": "application/json", "cache-control": "private, no-store" }, body: JSON.stringify({ error: { code: "backend_unavailable", message: "read backend unavailable" } }) };
   }
+  // Route errors are answered inside the app (Hono); a throw here is not an init failure.
+  return await handleUrlEvent(app, event);
 }

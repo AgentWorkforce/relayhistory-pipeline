@@ -8,7 +8,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import { decodeCursor } from "../cursor.ts";
-import { CONTENT_TRUNCATION_NOTE, TenantMismatchError, readEventPage, type PageDeps } from "../page.ts";
+import { recordState } from "../../session-pipeline/search-index.ts";
+import { createReadApi } from "../app.ts";
+import { CONTENT_TRUNCATION_NOTE, TenantMismatchError, partialSessions, readEventPage, type PageDeps } from "../page.ts";
 import type { EventQuery } from "../queries.ts";
 import { CH_URL, freshClickHouse, memoryLiveness, row } from "./support.ts";
 
@@ -236,5 +238,62 @@ suite("readEventPage on ClickHouse", () => {
       projectId: null, trajectoryId: null, taskRef: {}, taskTitle: null, content: "content of w1", contentTruncated: false,
       tags: [], toolName: null, toolStatus: null, filesTouched: [],
     });
+  });
+  test("an event matching both the content and the title branch is one candidate, not two", async () => {
+    await insert([
+      row({ session: "both", id: "b-1", ts: "2026-10-12 10:00:02.000", content: "dual needle", title: "dual needle title" }),
+      row({ session: "both", id: "b-2", ts: "2026-10-12 10:00:01.000", content: "dual needle" }),
+      row({ session: "both", id: "b-3", ts: "2026-10-12 10:00:00.000", content: "dual needle" }),
+    ]);
+    const deps = { ch, liveness: memoryLiveness().liveness };
+    // limit 2: a duplicated b-1 would fill the page with one event.
+    const first = await readEventPage(deps, q({ q: "dual needle", order: "desc", limit: 2 }));
+    expect(first.events.map((e) => e.eventId)).toEqual(["b-1", "b-2"]);
+    expect(await all(deps, q({ q: "dual needle", order: "desc", limit: 2 }))).toEqual(["b-1", "b-2", "b-3"]);
+  });
+
+  test("partial sessions follow the pipeline's latest state row (needs_full), per org", async () => {
+    await ch.command("SYSTEM STOP MERGES search_ingest_session_state");
+    const scope = (sessionId: string, orgId = "org-a") => ({ orgId, workspaceId: "ws-a", harness: "codex", sessionId });
+    // The pipeline's own writer (search-index.ts recordState): a partial S3 pass writes needs_full = 1 only.
+    await recordState(ch, scope("p-partial"), 3, 0, false, new Date("2026-10-13T10:00:00Z"));
+    // Partial, then a complete pass: current again.
+    await recordState(ch, scope("p-healed"), 1, 0, false, new Date("2026-10-13T10:00:00Z"));
+    await recordState(ch, scope("p-healed"), 2, 10, true, new Date("2026-10-13T11:00:00Z"));
+    // Complete, then a partial pass: no longer current.
+    await recordState(ch, scope("p-regressed"), 1, 10, true, new Date("2026-10-13T10:00:00Z"));
+    await recordState(ch, scope("p-regressed"), 2, 0, false, new Date("2026-10-13T11:00:00Z"));
+    await recordState(ch, scope("p-other-org", "org-b"), 1, 0, false, new Date("2026-10-13T10:00:00Z"));
+    const deps = { ch, liveness: memoryLiveness().liveness };
+    expect((await partialSessions(deps, "org-a")).sort()).toEqual(["p-partial", "p-regressed"]);
+    expect(await partialSessions(deps, "org-a", "p-partial")).toEqual(["p-partial"]);
+    expect(await partialSessions(deps, "org-a", "p-healed")).toEqual([]);
+    expect(await partialSessions(deps, "org-a", "p-other-org")).toEqual([]);
+    expect(await partialSessions(deps, "org-c")).toEqual([]);
+  });
+
+  test("a needs_full session's stale rows are never served as its transcript; a healed one is", async () => {
+    await insert([
+      row({ session: "nf", id: "nf-1", ts: "2026-10-14 10:00:00.000", content: "stale part" }),
+      row({ session: "nf", id: "nf-2", ts: "2026-10-14 10:00:01.000", content: "stale part" }),
+    ]);
+    const createdAt = { "codex\u0000nf": Date.parse("2026-10-14T09:00:00Z") };
+    const orgA = createReadApi({
+      verify: async () => ({ userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] }),
+      ch,
+      liveness: memoryLiveness({ createdAt }).liveness,
+      completeSinceMs: 0,
+    });
+    const getA = async (path: string) => orgA.request(path, { headers: { authorization: "Bearer t" } });
+    const served = await getA("/v1/sessions/nf/events?workspace=ws-a");
+    expect(served.status).toBe(200);
+    expect(((await served.json()) as { events: unknown[] }).events).toHaveLength(2);
+    await recordState(ch, { orgId: "org-a", workspaceId: "ws-a", harness: "codex", sessionId: "nf" }, 9, 0, false, new Date("2026-10-14T12:00:00Z"));
+    for (const path of ["/v1/sessions/nf/events?workspace=ws-a", "/v1/events?workspace=ws-a&session=nf", "/v1/events?workspace=ws-a&q=stale%20part&limit=20"]) {
+      const r = await getA(path);
+      expect(r.status).toBe(501);
+      expect(((await r.json()) as { error: { reason: string } }).error.reason).toBe("session_partial");
+    }
+    await recordState(ch, { orgId: "org-a", workspaceId: "ws-a", harness: "codex", sessionId: "nf" }, 10, 2, true, new Date("2026-10-14T13:00:00Z"));
   });
 });

@@ -91,6 +91,34 @@ export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames
   };
 }
 
+/**
+ * The read API function's props. Unlike the session pipeline (`functionUrl:
+ * false`), this function is reached through its Function URL by design
+ * (docs/session-read-api-design.md section 1): the caller is a Cloudflare Worker
+ * with no AWS identity, so `AWS_IAM` URL auth cannot be used, and every `/v1`
+ * request is authenticated in the application (RS256 RelayAuth assertion bound
+ * to this exact origin, src/session-read-api/auth.ts). Alchemy grants
+ * the URL invoke action to `*` for an `authType: "NONE"` URL and
+ * `lambda:InvokeFunction` to `*` only with `InvokedViaFunctionUrl`, so the
+ * Invoke API stays closed. Explicit, buffered, and no CORS (no browser caller).
+ */
+export function sessionReadApiFunctionProps(i: { stage: string; names: SessionReadApiNames; p: SessionReadApiInputs }) {
+  return {
+    functionName: i.names.function,
+    main: "src/session-read-api/lambda.ts",
+    handler: "handler",
+    runtime: "nodejs24.x",
+    architecture: "arm64",
+    memorySize: READ_API_MEMORY_MB,
+    timeout: `${READ_API_TIMEOUT_SECONDS} seconds`,
+    reservedConcurrentExecutions: i.p.reservedConcurrency ?? 10,
+    env: sessionReadApiEnv(i),
+    functionUrl: { authType: "NONE" as const, invokeMode: "BUFFERED" as const },
+    logging: { retention: "30 days" },
+    build: { tsconfig: "tsconfig.json" },
+  };
+}
+
 export interface SessionReadApiStageInputs {
   stage: string;
   p: SessionReadApiInputs;
@@ -100,22 +128,7 @@ export interface SessionReadApiStageInputs {
 export const sessionReadApi = (i: SessionReadApiStageInputs) =>
   Effect.gen(function* () {
     const names = sessionReadApiNames(i.stage);
-    const fn = yield* AWS.Lambda.Function("session-read-api", {
-      functionName: names.function,
-      main: "src/session-read-api/lambda.ts",
-      handler: "handler",
-      runtime: "nodejs24.x",
-      architecture: "arm64",
-      memorySize: READ_API_MEMORY_MB,
-      timeout: `${READ_API_TIMEOUT_SECONDS} seconds`,
-      reservedConcurrentExecutions: i.p.reservedConcurrency ?? 10,
-      env: sessionReadApiEnv({ stage: i.stage, names, p: i.p }),
-      // Explicit: Alchemy's default is a public URL; this one is public on purpose
-      // (application auth), buffered, and has no CORS (no browser caller).
-      functionUrl: { authType: "NONE", invokeMode: "BUFFERED" },
-      logging: { retention: "30 days" },
-      build: { tsconfig: "tsconfig.json" } as never,
-    } as never);
+    const fn = yield* AWS.Lambda.Function("session-read-api", sessionReadApiFunctionProps({ stage: i.stage, names, p: i.p }) as never);
     const roleArn = (fn as unknown as { roleArn: string }).roleArn;
     // A container only: the lead sets the value from 1Password (runbook). Alchemy state never holds it.
     yield* AWS.SecretsManager.Secret("session-read-api-secret", {

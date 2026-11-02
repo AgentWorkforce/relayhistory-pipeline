@@ -6,7 +6,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import { ClickHouseError } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
-import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
+import { AuthError, continuationUntil, createReadApi, type VerifiedIdentity } from "../app.ts";
 import { relayAuthVerifier } from "../auth.ts";
 import { encodeCursor } from "../cursor.ts";
 import { handleUrlEvent, parseCompleteSince, parseReadApiSecret } from "../lambda.ts";
@@ -14,19 +14,25 @@ import { memoryLiveness } from "./support.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
 
-function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; fail?: Error } = {}) {
+function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: string[]; fail?: Error } = {}) {
   const queries: string[] = [];
   const ch: ClickHouseClient = {
     database: "relay_search",
     async command() {},
     async insert() {},
-    async select<T>(query: string) {
+    async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
       queries.push(query);
       if (rows.fail) throw rows.fail;
+      if (query.includes("search_ingest_session_state")) {
+        const session = options?.params?.session;
+        return (rows.partial ?? []).filter((id) => session === undefined || id === session).map((session_id) => ({ session_id })) as T[];
+      }
       return ((query.includes("bytes_before") ? rows.newest : rows.candidates) ?? []) as T[];
     },
   };
-  return { ch, queries };
+  /** Queries against transcript_events only (the partial-session checks read the state table). */
+  const eventQueries = () => queries.filter((q) => !q.includes("search_ingest_session_state"));
+  return { ch, queries, eventQueries };
 }
 
 function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?: ClickHouseClient; liveness?: ReturnType<typeof memoryLiveness>["liveness"]; verify?: (t: string) => Promise<VerifiedIdentity> } = {}) {
@@ -69,11 +75,11 @@ describe("auth and attestation", () => {
   });
 
   test("tenant predicates come from the token, never from parameters", async () => {
-    const { ch, queries } = stubCh();
+    const { ch, eventQueries } = stubCh();
     const { get } = api({ ch });
     await get("/v1/events?workspace=ws-a&q=hello&limit=20&org=org-b&org_id=org-b");
-    expect(queries[0]).toContain("org_id = {org:String}");
-    expect(queries[0]).toContain("workspace_id = {ws:String}");
+    expect(eventQueries()[0]).toContain("org_id = {org:String}");
+    expect(eventQueries()[0]).toContain("workspace_id = {ws:String}");
   });
 });
 
@@ -120,17 +126,44 @@ describe("history floor and erasure", () => {
   });
 
   test("a search that reaches the floor without filling its page falls back", async () => {
-    const { ch, queries } = stubCh({ candidates: [] });
+    const { ch, eventQueries } = stubCh({ candidates: [] });
     const { get } = api({ ch, completeSinceMs: floor });
     const r = await get("/v1/events?workspace=ws-a&q=needle&limit=20");
     expect(r.status).toBe(501);
     expect((await body(r)).error.reason).toBe("history_floor");
     // It searched only from the floor.
-    expect(queries[0]).toContain("{since:Int64}");
+    expect(eventQueries()[0]).toContain("{since:Int64}");
     // A search bounded inside the floor is served even when short.
     expect((await get("/v1/events?workspace=ws-a&q=needle&limit=20&since=2026-10-01T00:00:00Z")).status).toBe(200);
     // Without a limit, relayhistory's default (200) is above this backend's search cap.
     expect((await body(await get("/v1/events?workspace=ws-a&q=needle"))).error.reason).toBe("search_limit");
+  });
+
+  test("a search cursor page that reaches the floor ends cleanly with a relayhistory continuation, never a 501", async () => {
+    const cand = { ts_ms: Date.parse("2026-09-02T00:00:00Z"), session_id: "s-1", source: "codex", machine_id: "m-1", kind: "message", event_id: "e-9" };
+    const newest = [{ ...cand, org_id: "org-a", workspace_id: "ws-a", type: "assistant", user_id: "u-1", actor_name: "", actor_role: "", subagent_id: "", project_id: "", task_title: "", task_ref: "", tags: [], files_touched: [], tool_name: "", tool_status: "", content: "needle", in_budget: 1 }];
+    const { ch, eventQueries } = stubCh({ candidates: [cand], newest });
+    const { get, logs } = api({ ch, completeSinceMs: floor });
+    const cursor = encodeCursor({ tsMs: Date.parse("2026-09-03T00:00:00Z"), sessionId: "s-1", source: "codex", machineId: "m-1", kind: "message", eventId: "e-10" });
+    const r = await get(`/v1/events?workspace=ws-a&q=needle&limit=20&cursor=${cursor}`);
+    expect(r.status).toBe(200);
+    const b = await body(r);
+    // The rows from the floor up, a terminal page, and where relayhistory takes over.
+    expect(b.events.map((e: { eventId: string }) => e.eventId)).toEqual(["e-9"]);
+    expect(b.nextCursor).toBeNull();
+    expect(b.continuation).toEqual({ backend: "relayhistory", reason: "history_floor", until: "2026-08-31T23:59:59.999999Z" });
+    expect(eventQueries()[0]).toContain("{since:Int64}");
+    expect(logs.some((l) => l.reason === "history_floor_continuation")).toBe(true);
+    // A full cursor page below no floor keeps its own cursor and no continuation.
+    const full = api({ ch: stubCh({ candidates: [cand], newest }).ch, completeSinceMs: floor });
+    const f = await body(await full.get(`/v1/events?workspace=ws-a&q=needle&limit=1&cursor=${cursor}`));
+    expect(f.nextCursor).toStartWith("b96e1:");
+    expect(f.continuation).toBeUndefined();
+  });
+
+  test("continuationUntil is one microsecond below the floor, in relayhistory's accepted format", () => {
+    expect(continuationUntil(Date.parse("2026-09-01T00:00:00Z"))).toBe("2026-08-31T23:59:59.999999Z");
+    expect(continuationUntil(Date.parse("2026-09-01T00:00:00.124Z"))).toBe("2026-09-01T00:00:00.123999Z");
   });
 
   test("an erased session reads as empty without touching ClickHouse", async () => {
@@ -142,6 +175,47 @@ describe("history floor and erasure", () => {
     expect(r.status).toBe(200);
     expect(await body(r)).toMatchObject({ sessionId: "s-1", events: [], nextCursor: null });
     expect(queries).toHaveLength(0);
+  });
+});
+
+describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => {
+  test("a partial session's first page is 501 session_partial, so the caller reads it from relayhistory", async () => {
+    const { ch, eventQueries } = stubCh({ partial: ["s-1"] });
+    const { get } = api({ ch });
+    for (const path of ["/v1/sessions/s-1/events?workspace=ws-a", "/v1/events?workspace=ws-a&session=s-1"]) {
+      const r = await get(path);
+      expect(r.status).toBe(501);
+      expect((await body(r)).error.reason).toBe("session_partial");
+    }
+    // Its stale rows were never read.
+    expect(eventQueries()).toHaveLength(0);
+    // Another, complete session is served.
+    const other = api({ ch: stubCh({ partial: ["s-2"] }).ch });
+    expect((await other.get("/v1/sessions/s-1/events?workspace=ws-a")).status).toBe(200);
+  });
+
+  test("a workspace search starts at relayhistory while any session of the org is partial", async () => {
+    const { ch, eventQueries } = stubCh({ partial: ["s-elsewhere"] });
+    const { get } = api({ ch });
+    const r = await get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(501);
+    expect((await body(r)).error.reason).toBe("session_partial");
+    expect(eventQueries()).toHaveLength(0);
+    expect((await api({ ch: stubCh().ch }).get("/v1/events?workspace=ws-a&q=needle&limit=20")).status).toBe(200);
+  });
+
+  test("the partial check is bound to the token's org and checked when pagination starts, not on cursor pages", async () => {
+    const { ch, queries } = stubCh({ partial: ["s-1"] });
+    const { get } = api({ ch });
+    const cursor = encodeCursor({ tsMs: 5, sessionId: "s-1", source: "codex", machineId: "m-1", kind: "message", eventId: "e-1" });
+    // A cursor continues the read the first page admitted; a 501 here would end the caller's pagination in an error.
+    expect((await get(`/v1/sessions/s-1/events?workspace=ws-a&cursor=${cursor}`)).status).toBe(200);
+    expect((await get(`/v1/events?workspace=ws-a&q=needle&limit=20&cursor=${cursor}`)).status).toBe(200);
+    expect(queries.some((q) => q.includes("search_ingest_session_state"))).toBe(false);
+    await get("/v1/events?workspace=ws-a&q=needle&limit=20&org=org-b");
+    const state = queries.find((q) => q.includes("search_ingest_session_state"))!;
+    expect(state).toContain("org_id = {org:String}");
+    expect(state).toContain("argMax(needs_full, synced_at) = 1");
   });
 });
 

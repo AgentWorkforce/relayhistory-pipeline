@@ -19,11 +19,16 @@ These requests get `501 unsupported_by_backend` with a `reason`, and Cloud then 
 - ascending search;
 - a search limit above 100;
 - a relayhistory cursor;
-- history older than `completeSince`.
+- history older than `completeSince` (first page only, see below);
+- a session whose latest `search_ingest_session_state` row has `needs_full = 1` (`session_partial`), and every workspace search while any session of the org has one (first page only, see below).
+
+**Only a first page is ever a 501.** Once a cursor has been issued, Cloud cannot fall back without restarting the caller's pagination, so:
+- The `needs_full` check runs when pagination starts. A cursor continues the read that check admitted.
+- A search cursor page that reaches `completeSince` is a terminal `200` with `nextCursor: null` and `continuation: { backend: "relayhistory", reason: "history_floor", until }`. `events` holds every match from the floor up. `until` is one microsecond below the floor. Cloud fetches the rest of that page from relayhistory with the same parameters, `until`, and no cursor, appends it, and returns relayhistory's cursor, so the caller's pagination continues there without an error, a gap or a repeat.
 
 ## Guarantees and their tests
 
-Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--only "read api"`, 11 of 11 caught). Reverting the control turns the named test red.
+Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--only "read api"`, 18 of 18 caught). Reverting the control turns the named test red.
 
 **Tenancy:**
 - Org and workspace come only from the verified RelayAuth assertion. The token must be:
@@ -40,13 +45,15 @@ Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--
 - A page that the byte budget (2 MiB) cuts, or whose candidate scan filled `limit`, carries a cursor.
 - Pages are full while rows remain.
 
+**Partial sessions:** `needs_full = 1` (a partial or capped pipeline pass, search-index.ts `recordState`) is read from the latest state row per session (`argMax(needs_full, synced_at)`). Such a session is never served as a complete transcript; a search starts at relayhistory while any session of the org is partial, because the state table has no workspace column.
+
 **Erasure:**
 - The pipeline's lightweight DELETE masks rows at once.
 - A session whose pointer rows are all tombstoned is dropped from search and reads as empty, even before the pipeline runs.
 
 ## First apply (rollout)
 
-1. **ClickHouse user.** In ClickHouse Cloud, create a user that has only `SELECT` on `relay_search.transcript_events`. Store it in 1Password.
+1. **ClickHouse user.** In ClickHouse Cloud, create a user that has only `SELECT` on `relay_search.transcript_events` and `relay_search.search_ingest_session_state` (the `needs_full` check). Store it in 1Password. Without the second grant every first page is a 503, which Cloud falls back from.
 2. **Supabase role.** As `postgres`, after the HoopDb migrations:
    ```sh
    psql -v ON_ERROR_STOP=1 -X -d "$HOOPDB" -f supabase/bootstrap/session_read_api_role.sql

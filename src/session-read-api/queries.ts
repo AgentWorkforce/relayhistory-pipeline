@@ -26,6 +26,13 @@ import { arrayLiteral, tuple, type QueryParams } from "../session-pipeline/vendo
 import type { EventPosition } from "./cursor.ts";
 
 export const EVENTS_TABLE = "transcript_events";
+/** Per (org, session) index state written by the pipeline (vendor/search-index/schema.ts). */
+export const SESSION_STATE_TABLE = "search_ingest_session_state";
+/**
+ * At most this many partial sessions are listed per org check. The check only
+ * asks "is there any"; the cap bounds the result, not the decision.
+ */
+export const PARTIAL_SESSIONS_CAP = 100;
 /** Legacy search semantics: q matches the first 4096 characters of content, or the task title. */
 export const CONTENT_PREFIX_CHARS = 4096;
 /** The ngrams(3) text index answers queries this long or longer. */
@@ -68,9 +75,38 @@ function orderBy(order: "asc" | "desc"): string {
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u;
 
-export function qualifiedTable(database: string): string {
+export function qualifiedTable(database: string, table: string = EVENTS_TABLE): string {
   if (!IDENTIFIER.test(database)) throw new Error("ClickHouse database must be an identifier");
-  return `\`${database}\`.\`${EVENTS_TABLE}\``;
+  return `\`${database}\`.\`${table}\``;
+}
+
+/**
+ * Sessions whose latest index state is `needs_full = 1`: the pipeline's last S3
+ * pass for them was partial (it wrote only the state row, search-index.ts
+ * `indexSearchScope`) or a reconcile pass was recent-only or row-capped. Their
+ * `transcript_events` rows are not current, so this backend must not present
+ * them as a complete transcript or a complete search.
+ *
+ * The state table is keyed (org_id, session_id) and has no workspace or source,
+ * so a session read checks its session id across sources, and a search checks
+ * the whole org (a partial session that has never been indexed has no row in
+ * `transcript_events` to attribute it to a workspace).
+ *
+ * With `sessionId`: that one session. Without: any session of the org, capped.
+ */
+export function buildPartialSessionsQuery(database: string, orgId: string, sessionId?: string): Built {
+  const params: QueryParams = { org: orgId, cap: PARTIAL_SESSIONS_CAP };
+  const where = ["org_id = {org:String}"];
+  if (sessionId !== undefined) {
+    where.push("session_id = {session:String}");
+    params.session = sessionId;
+  }
+  const query = `SELECT session_id FROM ${qualifiedTable(database, SESSION_STATE_TABLE)}
+WHERE ${where.join(" AND ")}
+GROUP BY session_id
+HAVING argMax(needs_full, synced_at) = 1
+LIMIT {cap:UInt32}`;
+  return { query, params };
 }
 
 /** Sort-key predicates shared by both round trips. */

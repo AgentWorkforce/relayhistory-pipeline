@@ -82,11 +82,17 @@ Anything Phase A cannot answer exactly gets **`501 unsupported_by_backend`** wit
    - **History floor:** `READ_API_COMPLETE_SINCE` is the timestamp from which ClickHouse is known complete (backfill start).
      - A session read for a session whose `created_at` is older returns 501 `incomplete_history`.
      - So does a session read with no pointer row while the floor is set above the epoch.
-     - A search page that would need rows older than the floor returns 501, because it reached the floor without filling.
+     - A first search page that would need rows older than the floor returns 501, because it reached the floor without filling.
+     - A search **cursor** page that reaches the floor is a terminal 200 with `continuation: { backend: "relayhistory", reason: "history_floor", until }` (`until` = floor − 1 µs). Cloud appends relayhistory's page for the same parameters with that `until` and no cursor, and returns relayhistory's cursor, so a below-floor search paged to its end never ends in an error.
      - When backfill is proven complete, the floor is set to the epoch.
+   - **Partial sessions:** a session whose latest `search_ingest_session_state` row has `needs_full = 1` (a partial S3 pass writes only that row; a capped reconcile writes some rows and that row) is not current in ClickHouse.
+     - A session read's first page returns 501 `session_partial`.
+     - A workspace search's first page returns 501 `session_partial` while any session of the org is partial. The state table has no workspace column, and a never-indexed partial session has no row to attribute it with.
+     - The check runs only when pagination starts. A cursor continues the read it admitted: a 501 on a cursor page would end the caller's pagination in an error or restart it with duplicates.
+     - The ClickHouse read user also needs `SELECT` on `search_ingest_session_state`.
 5. **Cursors** are opaque and namespaced: `b96e1:<base64url(JSON [tsMs, sessionId, source, machineId, kind, eventId])>`.
    - A relayhistory cursor (`events-v2:`) sent to 96Bulls gets 501 `foreign_cursor`.
-   - Cloud keeps pagination sticky by prefix: a `b96e1:` cursor is never sent to relayhistory, which would silently restart at page one. On error with such a cursor, Cloud returns the error.
+   - Cloud keeps pagination sticky by prefix: a `b96e1:` cursor is never sent to relayhistory, which would silently restart at page one. The service answers a cursor page with a 200 (a terminal page carries `continuation` when relayhistory must finish it, see the history floor above). On a transport error or 5xx with such a cursor, Cloud returns the error and the caller retries the same cursor.
 6. **Search** (`/v1/events?q=`) is workspace-scoped only (org-wide gets 501), newest first, `limit` ≤ 50.
    - `q` must be at least 1 character. Literal `%`, `_` and `\` are fine, because `positionCaseInsensitiveUTF8` is literal.
    - `asc` with `q` gets 501.
