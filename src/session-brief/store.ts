@@ -503,7 +503,18 @@ function sameSourceSet(rows: Array<{ machine_id: string; revision: string }>, so
 /** Clear the directory short_summary only when this stage produced it (its source prefix). */
 async function clearBriefDescription(db: SqlExecutor, key: SessionDirectoryKey): Promise<void> {
   await db.query(
-    `UPDATE sessions.session_directory AS d
+    `WITH target AS (
+       SELECT d.session_id
+         FROM sessions.session_directory AS d
+        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3
+          AND (d.session_id = $4 OR EXISTS (
+            SELECT 1 FROM sessions.session_index AS p
+             WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+               AND p.harness = d.harness AND p.session_id = $4
+               AND coalesce(p.canonical_session_id, p.session_id) = d.session_id))
+        ORDER BY (d.session_id <> $4) DESC LIMIT 1
+     )
+     UPDATE sessions.session_directory AS d
         SET short_summary = NULL,
             short_summary_scrub_ruleset = NULL,
             short_summary_scrub_version = NULL,
@@ -513,7 +524,9 @@ async function clearBriefDescription(db: SqlExecutor, key: SessionDirectoryKey):
               d.title, d.task_title, d.agent_name, d.project_id,
               d.git_repo, d.git_branch, d.model, NULL) ELSE '' END,
             projected_at = now()
-      WHERE ${KEY.replace(/(org_id|workspace_id|harness|session_id)/g, "d.$1")}
+       FROM target AS t
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3
+        AND d.session_id = t.session_id
         AND d.short_summary IS NOT NULL
         AND left(d.short_summary_source, char_length($5::text)) = $5::text`,
     [...keyParams(key), SESSION_BRIEF_SOURCE_PREFIX],
@@ -526,18 +539,32 @@ async function clearBriefDescription(db: SqlExecutor, key: SessionDirectoryKey):
  */
 async function projectBriefTitle(db: SqlExecutor, key: SessionDirectoryKey, title: string | null): Promise<void> {
   await db.query(
-    `UPDATE sessions.session_directory AS d
+    `WITH target AS (
+       SELECT d.session_id
+         FROM sessions.session_directory AS d
+        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3
+          AND (d.session_id = $4 OR EXISTS (
+            SELECT 1 FROM sessions.session_index AS p
+             WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+               AND p.harness = d.harness AND p.session_id = $4
+               AND coalesce(p.canonical_session_id, p.session_id) = d.session_id))
+        ORDER BY (d.session_id <> $4) DESC LIMIT 1
+     ), title_value AS (
+       SELECT coalesce($5::text, (
+         SELECT p.title FROM sessions.session_index AS p
+          WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4
+            AND p.deleted_at IS NULL
+          ORDER BY p.last_activity_at DESC, p.revision DESC, p.machine_id DESC LIMIT 1)) AS title
+     )
+     UPDATE sessions.session_directory AS d
         SET title = t.title,
             search_text = sessions.session_directory_search_text(
               t.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch,
               d.model, d.short_summary),
             projected_at = now()
-       FROM (SELECT coalesce($5::text, (
-               SELECT p.title FROM sessions.session_index AS p
-                WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4
-                  AND p.deleted_at IS NULL
-                ORDER BY p.last_activity_at DESC, p.revision DESC, p.machine_id DESC LIMIT 1)) AS title) AS t
-      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+       FROM title_value AS t CROSS JOIN target AS target
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3
+        AND d.session_id = target.session_id
         AND d.deleted_at IS NULL AND d.title IS DISTINCT FROM t.title`,
     [...keyParams(key), title],
   );
@@ -547,14 +574,24 @@ async function projectBriefTitle(db: SqlExecutor, key: SessionDirectoryKey, titl
 export async function sweepUnbriefed(db: SqlExecutor, limit: number): Promise<number> {
   const { rows } = await db.query<{ n: number }>(
     `WITH missing AS (
-       SELECT d.org_id, d.workspace_id, d.harness, d.session_id FROM sessions.session_directory AS d
+       SELECT d.org_id, d.workspace_id, d.harness, physical.session_id
+         FROM sessions.session_directory AS d
+         CROSS JOIN LATERAL (
+           SELECT p.session_id
+             FROM sessions.session_index AS p
+            WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+              AND p.harness = d.harness AND p.deleted_at IS NULL
+              AND (p.session_id = d.session_id
+                   OR coalesce(p.canonical_session_id, p.session_id) = d.session_id)
+            ORDER BY p.last_activity_at DESC, p.revision DESC, p.machine_id DESC LIMIT 1
+         ) AS physical
         WHERE d.deleted_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM sessions.session_briefs AS b
                            WHERE b.org_id = d.org_id AND b.workspace_id = d.workspace_id
-                             AND b.harness = d.harness AND b.session_id = d.session_id)
+                             AND b.harness = d.harness AND b.session_id = physical.session_id)
           AND NOT EXISTS (SELECT 1 FROM sessions.session_brief_wakeups AS w
                            WHERE w.org_id = d.org_id AND w.workspace_id = d.workspace_id
-                             AND w.harness = d.harness AND w.session_id = d.session_id)
+                             AND w.harness = d.harness AND w.session_id = physical.session_id)
         ORDER BY d.last_activity_at DESC LIMIT $1),
      armed AS (
        INSERT INTO sessions.session_brief_wakeups

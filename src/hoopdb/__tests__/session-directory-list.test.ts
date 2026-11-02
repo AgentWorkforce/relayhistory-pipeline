@@ -604,7 +604,7 @@ describe("catalog writer and projector", () => {
 
   test("derives agents, models, project key and edges from projection rows; drops local paths", () => {
     const catalog = directoryCatalogFromProjection([
-      { table: "session_catalog", row: { models: ["o4", "gpt-5", "", 3], project_key: "github.com/acme/widgets", project_key_method: "git_remote", originator: "codex_cli", agent_version: "1.2.3" } },
+      { table: "session_catalog", row: { models: ["o4", "gpt-5", "", 3], project_key: "github.com/acme/widgets", project_key_method: "git_remote", repo_url: "git@github.com:acme/widgets.git", git_branch: "main", originator: "codex_cli", agent_version: "1.2.3" } },
       { table: "session_catalog_agents", row: { agent_name: "Helm-Chief" } },
       { table: "session_catalog_agents", row: { agent_name: "helm-chief " } },
       { table: "session_catalog_agents", row: { agent_name: "reviewer" } },
@@ -614,6 +614,9 @@ describe("catalog writer and projector", () => {
     expect(catalog.agentNames).toEqual(["helm-chief", "reviewer"]);
     expect(catalog.models).toEqual(["gpt-5", "o4"]);
     expect(catalog.projectKey).toBe("github.com/acme/widgets");
+    expect(catalog.projectId).toBe("acme/widgets");
+    expect(catalog.gitRepo).toBe("git@github.com:acme/widgets.git");
+    expect(catalog.gitBranch).toBe("main");
     expect(catalog.relationships).toEqual([
       { relationshipUid: "r1", childSessionId: "child-1" },
       { relationshipUid: "r2", childSessionId: null },
@@ -643,6 +646,9 @@ describe("catalog writer and projector", () => {
         models: ["o4"],
         projectKey: "github.com/acme/widgets",
         projectKeyMethod: "git_remote",
+        projectId: "acme/widgets",
+        gitRepo: "git@github.com:acme/widgets.git",
+        gitBranch: "main",
         initialCommit: null,
         originator: null,
         agentVersion: null,
@@ -655,6 +661,9 @@ describe("catalog writer and projector", () => {
     const rows = await list(db, { agent: "helm-chief" });
     expect(ids(rows)).toEqual(["s-1"]);
     expect(rows[0]!.models).toEqual(["gpt-5", "o4"]);
+    expect(rows[0]!.project_id).toBe("acme/widgets");
+    expect(rows[0]!.git_repo).toBe("git@github.com:acme/widgets.git");
+    expect(rows[0]!.git_branch).toBe("main");
     expect(rows[0]!.child_session_count).toBe(2);
     expect(ids(await list(db, { projectContains: "acme" }))).toEqual(["s-1"]);
     const child = (await list(db, {})).find((row) => row.session_id === "child-1")!;
@@ -686,6 +695,7 @@ describe("catalog writer and projector", () => {
     expect(
       (await writeDirectoryCatalog(db as never, key, {
         agentNames: ["x"], models: [], projectKey: null, projectKeyMethod: null,
+        projectId: null, gitRepo: null, gitBranch: null,
         initialCommit: null, originator: null, agentVersion: null, relationships: [],
       })).written,
     ).toBe(false);
@@ -693,6 +703,7 @@ describe("catalog writer and projector", () => {
 
   const EMPTY = {
     agentNames: [] as string[], models: [] as string[], projectKey: null, projectKeyMethod: null,
+    projectId: null, gitRepo: null, gitBranch: null,
     initialCommit: null, originator: null, agentVersion: null,
     relationships: [] as Array<{ relationshipUid: string; childSessionId: string | null }>,
   };

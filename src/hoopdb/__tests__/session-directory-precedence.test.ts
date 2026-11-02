@@ -11,6 +11,11 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { projectSessionDirectory } from "../session-directory-projector.ts";
+import {
+  eraseSessionDirectory,
+  propagatePointerTombstone,
+  writeShortSummary,
+} from "../session-directory-summary.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -43,6 +48,8 @@ type Pointer = {
   events?: number;
   inputTokens?: number;
   indexed?: string;
+  canonicalSession?: string;
+  canonicalMachine?: string;
 };
 
 async function upsertPointer(db: PGlite, p: Pointer) {
@@ -50,15 +57,17 @@ async function upsertPointer(db: PGlite, p: Pointer) {
     `INSERT INTO sessions.session_index
        (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
         title, state, event_count, input_tokens, storage_provider, bucket, manifest_key, trace_id,
-        revision, indexed_at, deleted_at)
+        revision, indexed_at, deleted_at, canonical_session_id, canonical_machine_id)
      VALUES ('o', 'w', 'codex', 's', $1, $2, $3::timestamptz, $4::timestamptz, $5, $6, $7, $8,
              's3', 'bucket', 'key/' || $1, '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', $9,
-             coalesce($10::timestamptz, now()), NULL)
+             coalesce($10::timestamptz, now()), NULL, $11, $12)
      ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET
        user_id = excluded.user_id, created_at = excluded.created_at,
        last_activity_at = excluded.last_activity_at, title = excluded.title, state = excluded.state,
        event_count = excluded.event_count, input_tokens = excluded.input_tokens,
-       revision = excluded.revision, indexed_at = excluded.indexed_at, deleted_at = NULL`,
+       revision = excluded.revision, indexed_at = excluded.indexed_at, deleted_at = NULL,
+       canonical_session_id = excluded.canonical_session_id,
+       canonical_machine_id = excluded.canonical_machine_id`,
     [
       p.machine,
       p.user ?? `u-${p.machine}`,
@@ -70,6 +79,8 @@ async function upsertPointer(db: PGlite, p: Pointer) {
       p.inputTokens ?? 0,
       p.revision ?? 1,
       p.indexed ?? null,
+      p.canonicalSession ?? null,
+      p.canonicalMachine ?? null,
     ],
   );
 }
@@ -229,6 +240,162 @@ describe("V1 projector precedence", () => {
     expect(current.machine_ids).toEqual(["m1"]);
     expect((await members(db, "users")).map((m) => m.v)).toEqual(["u1"]);
     expect((await members(db, "machines")).map((m) => m.v)).toEqual(["m1"]);
+  });
+
+  test("uses canonical Kimi-style ids and excludes the unknown user placeholder", async () => {
+    const db = await database();
+    await upsertPointer(db, {
+      machine: "machine_encoded",
+      user: "unknown",
+      created: "2026-10-01T10:00:00Z",
+      last: "2026-10-01T12:00:00Z",
+      canonicalSession: "kimi:s",
+      canonicalMachine: "machine:encoded",
+    });
+    expect(await projectSessionDirectory(db, KEY)).toEqual({
+      projected: true,
+      tombstoned: false,
+    });
+    const canonical = (
+      await db.query<Row>(
+        "SELECT * FROM sessions.session_directory WHERE session_id = 'kimi:s'",
+      )
+    ).rows[0]!;
+    expect(canonical.machine_ids).toEqual(["machine:encoded"]);
+    expect(canonical.user_ids).toEqual([]);
+    expect(
+      await db.query(
+        "SELECT 1 FROM sessions.session_directory WHERE session_id = 's'",
+      ),
+    ).toMatchObject({ rows: [] });
+    expect(
+      (
+        await db.query<{ machine_id: string }>(
+          "SELECT machine_id FROM sessions.session_directory_machines WHERE session_id = 'kimi:s'",
+        )
+      ).rows,
+    ).toEqual([{ machine_id: "machine:encoded" }]);
+    expect(
+      (
+        await db.query(
+          "SELECT 1 FROM sessions.session_directory_users WHERE session_id = 'kimi:s'",
+        )
+      ).rows,
+    ).toEqual([]);
+    expect(await propagatePointerTombstone(db, KEY)).toEqual({
+      found: true,
+      tombstoned: false,
+    });
+    expect(
+      await writeShortSummary(db, {
+        ...KEY,
+        summary: "Canonical summary",
+        source: "bob-costas/extractive/v1",
+        generatedAt: new Date("2026-10-01T12:30:00Z"),
+      }),
+    ).toEqual({ written: true, scrubVersion: 2 });
+    expect(
+      (
+        await db.query<{ short_summary: string }>(
+          "SELECT short_summary FROM sessions.session_directory WHERE session_id = 'kimi:s'",
+        )
+      ).rows,
+    ).toEqual([{ short_summary: "Canonical summary" }]);
+
+    await db.query(
+      "UPDATE sessions.session_index SET user_id = 'user-real' WHERE session_id = 's'",
+    );
+    await projectSessionDirectory(db, KEY);
+    expect(
+      (
+        await db.query<{ user_id: string }>(
+          "SELECT user_id FROM sessions.session_directory_users WHERE session_id = 'kimi:s'",
+        )
+      ).rows,
+    ).toEqual([{ user_id: "user-real" }]);
+
+    await tombstonePointer(db, "machine_encoded");
+    expect(await projectSessionDirectory(db, KEY)).toEqual({
+      projected: false,
+      tombstoned: true,
+    });
+    expect(
+      (
+        await db.query<{ session_id: string; machine_id: string }>(
+          "SELECT session_id, machine_id FROM sessions.session_directory_resurrection_fences WHERE session_id = 'kimi:s'",
+        )
+      ).rows,
+    ).toEqual([{ session_id: "kimi:s", machine_id: "machine:encoded" }]);
+  });
+
+  test("hard-erases a canonical directory row through its physical session key", async () => {
+    const db = await database();
+    await upsertPointer(db, {
+      machine: "machine_encoded",
+      created: "2026-10-01T10:00:00Z",
+      last: "2026-10-01T12:00:00Z",
+      canonicalSession: "kimi:s",
+      canonicalMachine: "machine:encoded",
+    });
+    await projectSessionDirectory(db, KEY);
+    expect(await eraseSessionDirectory(db, KEY)).toBe(1);
+    expect((await db.query("SELECT 1 FROM sessions.session_directory")).rows).toEqual([]);
+  });
+
+  test("keeps a legacy physical-id row until a controlled rebuild removes it", async () => {
+    const db = await database();
+    await upsertPointer(db, {
+      machine: "m1",
+      created: "2026-10-01T10:00:00Z",
+      last: "2026-10-01T12:00:00Z",
+    });
+    await projectSessionDirectory(db, KEY);
+    await db.query(
+      `UPDATE sessions.session_index
+          SET canonical_session_id = 'kimi:s', canonical_machine_id = 'machine:one'
+        WHERE session_id = 's'`,
+    );
+    await projectSessionDirectory(db, KEY);
+    expect(
+      (
+        await db.query<{ session_id: string }>(
+          "SELECT session_id FROM sessions.session_directory ORDER BY session_id",
+        )
+      ).rows,
+    ).toEqual([{ session_id: "s" }]);
+    expect((await row(db))!.machine_ids).toEqual(["machine:one"]);
+    await tombstonePointer(db, "m1");
+    await projectSessionDirectory(db, KEY);
+    expect(
+      (
+        await db.query<{ session_id: string; machine_id: string }>(
+          "SELECT session_id, machine_id FROM sessions.session_directory_resurrection_fences",
+        )
+      ).rows,
+    ).toEqual([{ session_id: "s", machine_id: "machine:one" }]);
+  });
+
+  test("fails closed when one physical scope claims two canonical session ids", async () => {
+    const db = await database();
+    await upsertPointer(db, {
+      machine: "m1",
+      created: "2026-10-01T10:00:00Z",
+      last: "2026-10-01T12:00:00Z",
+      canonicalSession: "kimi:one",
+    });
+    await upsertPointer(db, {
+      machine: "m2",
+      created: "2026-10-01T10:00:00Z",
+      last: "2026-10-01T13:00:00Z",
+      canonicalSession: "kimi:two",
+    });
+    expect(await projectSessionDirectory(db, KEY)).toEqual({
+      projected: false,
+      tombstoned: false,
+    });
+    expect(
+      (await db.query("SELECT 1 FROM sessions.session_directory")).rows,
+    ).toEqual([]);
   });
 
   /** Tombstone the logical row by deleting every pointer, then return its fences. */

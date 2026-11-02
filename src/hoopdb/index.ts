@@ -22,6 +22,10 @@ import { propagatePointerTombstone } from "./session-directory-summary.ts";
 import { projectSessionDirectory } from "./session-directory-projector.ts";
 import { briefConfig } from "../session-brief/config.ts";
 import { armWakeup } from "../session-brief/store.ts";
+import {
+  canonicalManifestIdentity,
+  manifestUserId,
+} from "../shared/manifest-identity.ts";
 
 export const FAN_OUT_STAGES = [
   "summary-short",
@@ -97,12 +101,14 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
       const m = read.manifest;
       const f = pointerFields(m);
       const ext = sessionExt(m);
+      const canonical = canonicalManifestIdentity(m);
       const ectx = ctx as unknown as {
         user_id?: string;
         session_uuid?: string;
       };
-      // Identity comes from the authenticated request (ctx), never from the manifest body.
-      // With no request identity (reconcile), keep whatever an authenticated upload recorded.
+      // Prefer identity from the authenticated request. Reconcile has no request identity,
+      // so retain the server-side value, then use only validated server-admitted manifest
+      // metadata. Never let the placeholder replace a real identity.
       const existing = (
         await deps.db.query<{
           session_uuid: string;
@@ -120,7 +126,14 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
           ],
         )
       ).rows[0];
-      const userId = ectx.user_id ?? existing?.user_id ?? "unknown";
+      const recordedUser =
+        existing?.user_id && existing.user_id !== "unknown"
+          ? existing.user_id
+          : undefined;
+      const requestUser =
+        ectx.user_id && ectx.user_id !== "unknown" ? ectx.user_id : undefined;
+      const realUserId = requestUser ?? recordedUser ?? manifestUserId(m);
+      const userId = realUserId ?? "unknown";
       const row = {
         ...pk,
         user_id: userId,
@@ -161,24 +174,6 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         [JSON.stringify([row])],
       );
       const applied = rows[0]?.applied ?? false;
-      // Logical-session directory projection (idempotent; resurrects a tombstone only for
-      // a live pointer indexed after it, per the V1 precedence contract).
-      await projectSessionDirectory(deps.db, {
-        orgId: pk.org_id,
-        workspaceId: pk.workspace_id,
-        harness: pk.harness,
-        sessionId: pk.session_id,
-      });
-      const fanoutDone = existing
-        ? Number(existing.fanout_revision) >= f.manifestRevision
-        : false;
-      if (!applied && fanoutDone) {
-        log.info("session index unchanged", {
-          revision: f.manifestRevision,
-          reason: "stale_or_equal_revision",
-        });
-        return { status: "skipped", reason: "stale_revision" };
-      }
       // The customer-level id. Minted client-side; if an older client sent no
       // uuid we derive one here ONCE (reusing the stored one on later revisions) and say so.
       const sessionUuid =
@@ -203,11 +198,53 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
           sessionUuid,
           source,
           ctx.orgId,
-          ectx.user_id ?? null,
+          realUserId ?? null,
           f.traceId,
           f.manifestRevision,
         ],
       );
+      // `upsert_session_index` is revision-fenced, so an equal-revision S3
+      // notification may have won the race with the authenticated manifest POST and
+      // stored `unknown`. Repair identity separately, but only while this physical row
+      // still names the manifest we just read; a newer pointer is never overwritten.
+      await deps.db.query(
+        `UPDATE sessions.session_index
+            SET user_id = CASE WHEN $7::text IS NULL THEN user_id ELSE $7 END,
+                canonical_session_id = $8,
+                canonical_machine_id = $9
+          WHERE org_id = $1 AND workspace_id = $2 AND harness = $3
+            AND session_id = $4 AND machine_id = $5
+            AND manifest_key = $6 AND deleted_at IS NULL`,
+        [
+          pk.org_id,
+          pk.workspace_id,
+          pk.harness,
+          pk.session_id,
+          pk.machine_id,
+          pointer.manifestKey,
+          realUserId ?? null,
+          canonical.sessionId,
+          canonical.machineId,
+        ],
+      );
+      // Logical-session directory projection (idempotent; resurrects a tombstone only for
+      // a live pointer indexed after it, per the V1 precedence contract).
+      await projectSessionDirectory(deps.db, {
+        orgId: pk.org_id,
+        workspaceId: pk.workspace_id,
+        harness: pk.harness,
+        sessionId: pk.session_id,
+      });
+      const fanoutDone = existing
+        ? Number(existing.fanout_revision) >= f.manifestRevision
+        : false;
+      if (!applied && fanoutDone) {
+        log.info("session index unchanged", {
+          revision: f.manifestRevision,
+          reason: "stale_or_equal_revision",
+        });
+        return { status: "skipped", reason: "stale_revision" };
+      }
       if (fanoutDone) return;
       // Fan out, then record it. A crash in between repeats the fan-out on retry
       // (consumers are idempotent by revision / content hash); nothing is lost.

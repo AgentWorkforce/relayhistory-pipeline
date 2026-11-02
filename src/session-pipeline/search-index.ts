@@ -59,6 +59,16 @@ import { toIndexRow, tsMillis, type IndexRow, type NeonEventRow } from "./vendor
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "./vendor/search-index/schema.ts";
 import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
+import {
+  directoryCatalogFromProjection,
+  writeDirectoryCatalog,
+  type CatalogProjectionRow,
+  type DirectoryCatalog,
+} from "../hoopdb/session-directory-catalog.ts";
+import {
+  canonicalManifestIdentity,
+  manifestUserId as admittedManifestUserId,
+} from "../shared/manifest-identity.ts";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 
@@ -73,6 +83,8 @@ export interface SearchIndexDeps {
   decompress?: (stored: Uint8Array, maxOutputLength: number) => Uint8Array;
   now?: () => Date;
   limits?: Partial<SearchIndexLimits>;
+  /** Test seam; production writes the catalog in the same Supabase transaction. */
+  writeCatalog?: typeof writeDirectoryCatalog;
 }
 
 export interface SearchIndexLimits {
@@ -138,8 +150,7 @@ export function manifestUserId(manifest: ManifestV1): string {
   try {
     return relayhistoryExportProvenance(manifest).sourceUserId;
   } catch {
-    const ext = manifest.extensions?.["96bulls"] as { user_id?: unknown } | undefined;
-    return typeof ext?.user_id === "string" ? ext.user_id : "";
+    return admittedManifestUserId(manifest) ?? "";
   }
 }
 
@@ -235,6 +246,8 @@ interface ScopeRead {
   /** Highest manifest revision of the scope, recorded with its index state. */
   revision: number;
   reasons: string[];
+  catalog: DirectoryCatalog;
+  directorySessionId: string | null;
 }
 
 async function readScope(
@@ -287,7 +300,11 @@ async function readScope(
   const bytes = readable.reduce((n, m) => n + m.raw.chunks.reduce((b, c) => b + Math.max(c.bytes, c.stored_raw_bytes ?? 0), 0), 0);
   const events = readable.reduce((n, m) => n + m.raw.chunks.reduce((b, c) => b + (c.records ?? 0), 0), 0);
   if (bytes > limits.maxScopeBytes || events > limits.maxScopeEvents)
-    return { rows: [], manifests: readable.length, complete: false, partial: true, revision, reasons: [...new Set([...reasons, "scope_too_large"])] };
+    return {
+      rows: [], manifests: readable.length, complete: false, partial: true,
+      revision, reasons: [...new Set([...reasons, "scope_too_large"])],
+      catalog: directoryCatalogFromProjection([]), directorySessionId: null,
+    };
 
   for (const manifest of readable) {
     try {
@@ -332,6 +349,7 @@ async function readScope(
   }
 
   const byKey = new Map<string, IndexRow>();
+  const catalogRows: CatalogProjectionRow[] = [];
   for (const { records, part } of groups) {
     let projected;
     try {
@@ -348,12 +366,27 @@ async function readScope(
       continue;
     }
     for (const { table, row } of projected.rows) {
-      if (table !== "convergence_events") continue;
+      if (table !== "convergence_events") {
+        catalogRows.push({ table, row });
+        continue;
+      }
       const indexRow = toIndexRow(projectedToNeonRow(row, scope, part.userId), version);
       byKey.set(keyOf({ machineId: indexRow.machine_id, source: indexRow.source, kind: indexRow.kind, eventId: indexRow.event_id }), indexRow);
     }
   }
-  return { rows: [...byKey.values()], manifests: parts.length, complete, partial: false, revision, reasons: [...new Set(reasons)] };
+  const directoryIds = new Set(
+    parts.map(({ manifest }) => canonicalManifestIdentity(manifest).sessionId),
+  );
+  if (directoryIds.size > 1) {
+    complete = false;
+    reasons.push("canonical_session_mismatch");
+  }
+  return {
+    rows: [...byKey.values()], manifests: parts.length, complete, partial: false,
+    revision, reasons: [...new Set(reasons)],
+    catalog: directoryCatalogFromProjection(catalogRows),
+    directorySessionId: directoryIds.size === 1 ? [...directoryIds][0]! : null,
+  };
 }
 
 async function clickhouseScope(
@@ -491,6 +524,20 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       }
       await deleteRows(deps.ch, deletes);
     }
+    // Catalog dimensions are authoritative only after every live manifest and raw
+    // record in the S3 scope was read and projected. Never clear them from a partial
+    // pass. The directory key is the validated source id, not its object-layout form.
+    if (complete && s3.directorySessionId !== null)
+      await (deps.writeCatalog ?? writeDirectoryCatalog)(
+        tx,
+        {
+          orgId: scope.orgId,
+          workspaceId: scope.workspaceId,
+          harness: scope.harness,
+          sessionId: s3.directorySessionId,
+        },
+        s3.catalog,
+      );
     // Only a complete pass makes the session current; any other leaves it owing one.
     await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at);
     return {
