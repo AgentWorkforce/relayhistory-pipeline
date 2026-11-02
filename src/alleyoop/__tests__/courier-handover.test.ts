@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { readFile } from "node:fs/promises";
 import {
   computeContentSha256,
   deleteParkedSession,
@@ -382,6 +383,41 @@ describe("handover from a cold export (H1-H5)", () => {
     await settle(client);
     expect((await client.stored())!.manifest.raw.owner).toBe("machine-a");
     expect((await cold.stored())!.manifest.raw.owner).toBe(EXPORTER);
+  });
+});
+
+describe("a Rust-client manifest at the gated route (activation blocker)", () => {
+  // Rust's `Writer.delivery_instance_id` is a destination instance, not a machine
+  // id: `dest_objstore_01` beside `mach-1` in this fixture, which its helpers built.
+  // A negative proof: that client cannot use this route as it stands.
+  test("is refused even with a claim for its own machine", async () => {
+    const fixture = JSON.parse(
+      await readFile(
+        new URL(
+          "../../../packages/object-store/test/fixtures/rust-manifest-v1-adopted.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ) as { key: string; manifest: ManifestV1 };
+    expect(fixture.manifest.session.machine_id).toBe("mach-1");
+    expect(fixture.manifest.writer.delivery_instance_id).not.toBe("mach-1");
+    const w = await world({ machineId: "mach-1", sessionId: "s-adopted" });
+    w.identity.machineClaim = "mach-1";
+    const res = await w.app.request(
+      "/v1/pipeline/manifests",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-machine-id": "mach-1",
+          "x-session-id": "s-adopted",
+        },
+        body: JSON.stringify({ key: fixture.key, manifest: fixture.manifest }),
+      },
+      w.env,
+    );
+    expect(res.status).toBe(403);
   });
 });
 
