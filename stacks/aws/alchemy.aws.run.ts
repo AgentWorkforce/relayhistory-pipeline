@@ -41,7 +41,8 @@ import { alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyCallerArn, 
 import { networkPolicies } from "./proof-addons.ts";
 import { hoopdbBackend } from "./hardening.ts";
 import { stageBucketName, stageBudgetName } from "./pippen-sandbox.ts";
-import { ensurePippenStateBucket, stackStateOptions, stateBucketFor, stateTargetFromArgv } from "./state-bucket.ts";
+import { ensurePippenStateBucket, stackStateOptions, stageFromArgv, stateBucketFor, stateTargetFromArgv } from "./state-bucket.ts";
+import { assertSandboxAlchemyCredentials } from "./sandbox-credentials.ts";
 import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
@@ -106,6 +107,11 @@ function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
   validateAwsInputs(stage, inputs, lock.images["services-aws"]?.approved ?? []);
   return { ...inputs, mode };
 }
+
+// aws-proof-sandbox, however Alchemy was started and before any provider or state layer resolves
+// credentials: exactly static env keys, no profile (sandbox-credentials.ts). Alchemy cannot read
+// `pippen sandbox exec`'s credential_process profile; refuse it here with the command that works.
+if (stageFromArgv(process.argv) === PIPPEN_PROOF_SANDBOX.stage) assertSandboxAlchemyCredentials(process.env);
 
 /**
  * The Alchemy state store. A Pippen sandbox keeps it in its own pippen-sbx- bucket,

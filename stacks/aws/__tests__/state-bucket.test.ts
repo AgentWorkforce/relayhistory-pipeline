@@ -222,7 +222,7 @@ describe("capture and deploy check in a Pippen sandbox", () => {
     const cap = readFileSync(fileURLToPath(new URL("../../../src/cli/aws-provenance-io.ts", import.meta.url)), "utf8");
     const ensure = cap.indexOf("if (pippen) ensurePippenStateBucket(");
     expect(ensure).toBeGreaterThan(0);
-    expect(ensure).toBeLessThan(cap.indexOf("const state = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen);"));
-    expect(cap).toContain("const after = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen);");
+    expect(ensure).toBeLessThan(cap.indexOf("const state = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen, env);"));
+    expect(cap).toContain("const after = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen, env);");
   });
 });
