@@ -67,6 +67,7 @@ import {
 } from "./apply-authorization.ts";
 import { requireServiceAccountActAs, type ServiceAccountActAsProof } from "./iam-preflight.ts";
 import { fetchRedisServerCa, redisAdminFetchTransport } from "./redis-ca.ts";
+import { ensureCloudSqlProtection, ensureLockerLifecycle } from "./data-retention.ts";
 import { PRIVATE_GOOGLE_APIS_RECORDS, assertInClusterJwks, bulls96NetworkPolicies, relayauthNetworkPolicies } from "./egress.ts";
 import {
   alleyoopWriteCondition,
@@ -84,6 +85,17 @@ interface EnsurePrivateCloudSqlInput {
   /** Resolved PSA output: establishes that the peering exists before the POST. */
   privateServiceConnection: string;
   proxyPrincipal: string;
+  authorization: GcpApplyAuthorizationProof;
+}
+
+interface EnsureCloudSqlProtectionInput {
+  projectId: string;
+  instance: string;
+  authorization: GcpApplyAuthorizationProof;
+}
+
+interface EnsureLockerLifecycleInput {
+  bucket: string;
   authorization: GcpApplyAuthorizationProof;
 }
 
@@ -277,6 +289,48 @@ const EnsureLockerWriteScopes = Alchemy.Action<
         undefined,
         input.forbidden,
       ),
+    );
+    return { bucket: input.bucket, changed: result.changed };
+  }),
+);
+
+const EnsureCloudSqlProtection = Alchemy.Action<
+  "96Bulls.GCP.EnsureCloudSqlProtection",
+  EnsureCloudSqlProtectionInput,
+  { instance: string; changed: boolean },
+  GCP.GcpEnvironment
+>("96Bulls.GCP.EnsureCloudSqlProtection", (input) =>
+  Effect.gen(function* () {
+    assertGcpApplyLeaseActive(input.authorization);
+    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
+    if (live.project !== input.projectId || input.authorization.projectId !== input.projectId)
+      throw new Error("96bulls: Cloud SQL protection project differs from the resolved GCP project. Nothing was changed.");
+    const result = yield* Effect.tryPromise((signal) =>
+      ensureCloudSqlProtection(input.projectId, input.instance, { bearer: Redacted.value(live.accessToken) }, undefined, undefined, undefined, {
+        expiresAtMs: input.authorization.leaseExpiresAt * 1000,
+        signal,
+      }),
+    );
+    return { instance: input.instance, changed: result.changed };
+  }),
+);
+
+const EnsureLockerLifecycle = Alchemy.Action<
+  "96Bulls.GCP.EnsureLockerLifecycle",
+  EnsureLockerLifecycleInput,
+  { bucket: string; changed: boolean },
+  GCP.GcpEnvironment
+>("96Bulls.GCP.EnsureLockerLifecycle", (input) =>
+  Effect.gen(function* () {
+    assertGcpApplyLeaseActive(input.authorization);
+    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
+    if (live.project !== input.authorization.projectId)
+      throw new Error("96bulls: locker lifecycle project differs from the resolved GCP project. Nothing was changed.");
+    const result = yield* Effect.tryPromise((signal) =>
+      ensureLockerLifecycle(input.bucket, { bearer: Redacted.value(live.accessToken) }, undefined, {
+        expiresAtMs: input.authorization.leaseExpiresAt * 1000,
+        signal,
+      }),
     );
     return { bucket: input.bucket, changed: result.changed };
   }),
@@ -572,6 +626,8 @@ export default Alchemy.Stack(
       forceDestroy: false,
       labels: labels(stage, "locker"),
     });
+    // 30-day noncurrent-version expiry on every stage's locker, data plane or not.
+    yield* EnsureLockerLifecycle("locker-lifecycle", { bucket: locker.bucketName, authorization: applyAuthorization });
     const runtimeSecret = yield* GCP.SecretManager.Secret("runtime-secret", {
       secretId: authorized(gcpResourceName(stage, "runtime", 63)),
       labels: labels(stage, "runtime"),
@@ -684,6 +740,14 @@ export default Alchemy.Stack(
             spec: sql,
             privateServiceConnection: privateServices.name,
             proxyPrincipal: workloadIdentityPrincipal(i, "96bulls", "cloud-sql-proxy"),
+            authorization: applyAuthorization,
+          });
+          // Deletion protection and retained backups (data-retention.ts), right after the
+          // poster and independent of every other step, so a new instance never stays
+          // deletable because something later failed.
+          yield* EnsureCloudSqlProtection("cloud-sql-protection", {
+            projectId: i.projectId,
+            instance: Output.map(sqlPoster.connectionName, () => sql.instanceName) as unknown as string,
             authorization: applyAuthorization,
           });
           const redis = yield* GCP.Redis.Instance("redis", {
