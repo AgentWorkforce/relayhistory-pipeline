@@ -39,7 +39,7 @@ the environment can add a third target or widen either one.
 | Buckets | `96bulls-aws-proof-{locker,hoopdb-backups}-500268966557` | `pippen-sbx-96bulls-aws-proof-sandbox-{locker,backups}-361835732085` (the pippen-sbx- prefix is what pippen-sweeper may delete; `backups`, since `hoopdb-backups` with the prefix is 64 characters, over S3's 63) |
 | Stage plan | `docs/plans/aws-proof.*` | `docs/plans/aws-proof-sandbox.*`, must carry `pippenSandbox`, never `accountShared` |
 | Inputs | `.96bulls/aws-proof/inputs.json` | `.96bulls/aws-proof-sandbox/inputs.json` |
-| Teardown | `bin/96bulls down aws-proof` | `pippen sandbox down aws-proof` |
+| Teardown | `bin/96bulls down aws-proof` | Ingress and DNS first, harness phase 1, `bin/96bulls down aws-proof-sandbox`, then `pippen sandbox down aws-proof` (the sweep of record; steps 4-11 below) |
 
 Every check that pins the sessions-dev target pins the sandbox target with
 the same strictness: the STS account, the cluster name, the cluster ARN from
@@ -57,42 +57,130 @@ without it, or with a malformed one, is refused (`missing_pippen_session`). Each
 cluster, context, buckets, ARNs and host. The sessions-dev target's behavior is
 unchanged.
 
-The flow (each live step needs Khaliq's OK; none has been run):
+**Credentials: two `pippen sandbox exec` modes, one per kind of step.**
+Alchemy (`bin/96bulls plan|up|down aws-proof-sandbox`) reads only static env
+keys: `@alchemy.run/aws` resolves `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+(+ `AWS_SESSION_TOKEN`) from the environment, or else its own `~/.alchemy`
+profile (stored keys, SSO, console login). It never reads `AWS_PROFILE` and
+has no `credential_process` path, so under the default `pippen sandbox exec`
+it fails with "Provider 'AWS' is not configured in profile 'default'". Run
+every Alchemy step with `pippen sandbox exec aws-proof --static-credentials --`:
+fresh credentials per invocation, at most 1 hour, no refresh, so one step per
+invocation. The harness (`bun run proof:aws ...`) and kubectl use the default
+`pippen sandbox exec aws-proof --` (a refreshing `credential_process`
+profile), because a proof run can outlast an hour.
 
-1. `pippen sandbox up aws-proof`; export the agent-session credentials as
-   explicit `AWS_*` variables, and take `session_id` from
-   `pippen sandbox status aws-proof`.
-2. `bin/96bulls plan aws-proof-sandbox --capture` from
-   `stacks/aws/examples/aws-proof-sandbox.inputs.example.json`
-   (docs/aws-stage.md); review the capture.
-3. `bin/96bulls up aws-proof-sandbox` under the approval bound to it.
-4. `bun run proof:aws all --target pippen-sandbox --pippen-session <session_id> --confirm-live`. The
-   teardown check removes the in-cluster proof objects and reports `blocked`.
-5. `pippen sandbox down aws-proof`, which must report `clean: true`. It
-   deletes everything tagged `pippen:sandbox=true`, the agent-session role
-   included, then verifies zero `pippen:sandbox` resources and zero
-   non-baseline IAM roles. The harness never runs it.
-6. `pippen sandbox up aws-proof` again, for fresh agent-session credentials.
-   The sweep deleted the old role, so the old session cannot verify anything.
-   `up` creates exactly one resource in the account: the role
-   `arn:aws:iam::361835732085:role/pippen/agent-session`, tagged
-   `pippen:sandbox=true` (pippen-tools `src/sandbox/provisioner.ts`).
-7. `bun run proof:aws:teardown --target pippen-sandbox --post-destroy
-   --confirm-live --prior-report .96bulls/aws-proof-sandbox/<run id>/report.json`
-   with those credentials. Post-destroy accepts any session of the
-   `agent-session` role in `361835732085`, because the session name differs
-   per session; live steps still need the pinned caller above. Besides the
-   checks in [teardown](#11-teardown), it lists resources tagged
-   `96bulls:stack=aws-proof-sandbox`, `alchemy::stage=aws-proof-sandbox` and
-   `pippen:sandbox=true`, and requires none. The one exception is the exact
-   ARN of the fresh agent-session role; exemptions match by exact ARN, never
-   by tag. A second `pippen:sandbox` resource, a look-alike role ARN or any
-   stage-tagged leftover fails the check. Pippen's baseline (StackSet
-   resources such as the `pippen-agent-session-boundary` policy, tagged
-   `pippen:baseline=true`) carries none of the queried tags, so it is never
-   listed.
-8. `pippen sandbox down aws-proof` once more, to remove the verification
-   session's role.
+`bin/96bulls` checks this before anything runs (`src/cli/sandbox-credentials.ts`),
+and the stack checks it again at load, so a direct `alchemy` run is held to it
+too (`stacks/aws/sandbox-credentials.ts`):
+
+- static keys and no profile: used as given. All three keys are required, and
+  if `AWS_CREDENTIAL_EXPIRATION` (set by `--static-credentials`) leaves less
+  than 50 minutes, the step is refused.
+- the default exec's `pippen-sandbox` profile and no keys: `bin/96bulls`
+  resolves it once with
+  `aws configure export-credentials --profile pippen-sandbox --format process`.
+  That runs pippen's `credentials-process`, which issues a fresh agent-session
+  session on each call. The keys go into the env of the child processes only,
+  with `AWS_CONFIG_FILE=/dev/null` and no `AWS_PROFILE`, and are never
+  written to disk, put in argv or printed. This is accepted only when the
+  profile passes the harness's own check (`resolveToolCredentials`: exactly
+  pippen's profile for this lease and account) and the credentials have at
+  least 50 minutes left. They do not refresh either. `--static-credentials`
+  is still the documented path, because pippen gives that contract directly.
+- anything else is refused before Alchemy runs, with the
+  `pippen sandbox exec aws-proof --static-credentials -- bin/96bulls <verb> aws-proof-sandbox`
+  command: any other profile, keys mixed with a profile, partial keys, no
+  credentials, or a resolution that fails or comes back short-lived.
+
+Either way, the stack's caller pin still applies on top: the caller must be
+exactly `assumed-role/agent-session/agent-$NINETY_SIX_BULLS_PIPPEN_SESSION`,
+and `PIPPEN_SANDBOX_SESSION_ID`, which exec sets in both modes, must name the
+same lease.
+
+The flow (each live step needs Khaliq's OK; none has been run). `pippen sandbox exec`
+replaces every inherited `AWS_*` variable and keeps the rest, so the
+`NINETY_SIX_BULLS_*` exports reach the child:
+
+```sh
+# 0. Lease and session (once; again after every `pippen sandbox up`).
+pippen sandbox up aws-proof
+pippen sandbox status aws-proof            # session_id
+export NINETY_SIX_BULLS_PIPPEN_SESSION=<session_id>
+export NINETY_SIX_BULLS_CONFIRM_ACCOUNT=361835732085   # AWS_REGION comes from exec
+
+# 1. Capture the plan (Alchemy: static, < 1 h). Review docs/plans/aws-proof-sandbox.*.
+pippen sandbox exec aws-proof --static-credentials -- bin/96bulls plan aws-proof-sandbox --capture
+
+# 2. Apply under the approval bound to that capture (Alchemy: static, < 1 h; the
+#    EKS Auto Mode create alone is ~15-30 min, so start with a fresh invocation).
+NINETY_SIX_BULLS_CONFIRM_STAGE=aws-proof-sandbox \
+  pippen sandbox exec aws-proof --static-credentials -- bin/96bulls up aws-proof-sandbox
+
+# 3. The proof checks, teardown last and separately (harness: refreshing profile).
+pippen sandbox exec aws-proof -- bun run proof:aws \
+  fresh-install planted-trace public-ingress tenant-isolation v1-search-scope transcript-search \
+  stale-summary restart-persistence upgrade-rollback backup-restore \
+  --target pippen-sandbox --pippen-session "$NINETY_SIX_BULLS_PIPPEN_SESSION" --confirm-live
+```
+
+If `up` runs out of its hour part-way, do not rerun it as it stands. The state
+has changed, so capture again (step 1) and apply that capture.
+
+Teardown, in this order:
+
+```sh
+# 4. Delete the Ingress first, so EKS Auto Mode removes the ALB, target groups and
+#    security groups it made from it before the cluster and VPC go (refreshing profile).
+pippen sandbox exec aws-proof -- sh -c 'k=$(mktemp) && aws eks update-kubeconfig --name 96bulls-aws-proof-sandbox --region us-west-2 --kubeconfig "$k" >/dev/null && kubectl --kubeconfig "$k" -n 96bulls delete ingress 96bulls-ingest --wait=true --timeout=10m; s=$?; rm -f "$k"; exit $s'
+pippen sandbox exec aws-proof -- aws elbv2 describe-load-balancers --region us-west-2 --query 'LoadBalancers[].LoadBalancerName'   # must be []
+
+# 5. DNS: external-dns runs with policy upsert-only, so it never deletes its records.
+#    Remove the CNAME and its ownership TXT records by hand (Cloudflare, not AWS;
+#    CF_API_TOKEN is the cloudflare-dns token, in the env for these commands only).
+ZONE=34afb0e8fc19f2b6fd025668e880a889 H=proof-sandbox-sessions.agentrelay.com
+curl -fsS -H "Authorization: Bearer $CF_API_TOKEN" "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records?per_page=100&name.contains=$H" \
+  | jq -r '.result[] | "\(.id) \(.type) \(.name)"'
+#    Delete each id whose name is $H, _externaldns.$H or _externaldns.cname-$H, and nothing else:
+curl -fsS -X DELETE -H "Authorization: Bearer $CF_API_TOKEN" "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records/<id>"
+#    Re-run the list: it must print nothing.
+
+# 6. Harness phase 1: proof objects, release, namespace (refreshing profile). This
+#    report must stay unmerged, because it is the post-destroy prior in step 10.
+pippen sandbox exec aws-proof -- bun run proof:aws teardown \
+  --target pippen-sandbox --pippen-session "$NINETY_SIX_BULLS_PIPPEN_SESSION" --confirm-live
+
+# 7. Alchemy destroy, under an approval whose operations include "destroy" (static, < 1 h).
+NINETY_SIX_BULLS_CONFIRM_DESTROY=aws-proof-sandbox \
+  pippen sandbox exec aws-proof --static-credentials -- bin/96bulls down aws-proof-sandbox
+
+# 8. The sweep of record: must report clean: true.
+pippen sandbox down aws-proof
+
+# 9. A fresh lease for verification (recreates only role/pippen/agent-session).
+pippen sandbox up aws-proof
+export NINETY_SIX_BULLS_PIPPEN_SESSION=<new session_id from `pippen sandbox status aws-proof`>
+
+# 10. Post-destroy absence check (refreshing profile; any session of the recreated role).
+pippen sandbox exec aws-proof -- bun run proof:aws:teardown --target pippen-sandbox --post-destroy \
+  --confirm-live --prior-report .96bulls/aws-proof-sandbox/<step 6 run id>/report.json
+
+# 11. Remove the verification session's role.
+pippen sandbox down aws-proof
+```
+
+The post-destroy check (step 10) accepts any session of the
+`agent-session` role in `361835732085`, because the session name differs
+per session; live steps still need the pinned caller above. Besides the
+checks in [teardown](#11-teardown), it lists resources tagged
+`96bulls:stack=aws-proof-sandbox`, `alchemy::stage=aws-proof-sandbox` and
+`pippen:sandbox=true`, and requires none. The one exception is the exact
+ARN of the fresh agent-session role; exemptions match by exact ARN, never
+by tag. A second `pippen:sandbox` resource, a look-alike role ARN or any
+stage-tagged leftover fails the check. Pippen's baseline (StackSet
+resources such as the `pippen-agent-session-boundary` policy, tagged
+`pippen:baseline=true`) carries none of the queried tags, so it is never
+listed.
 
 ## Safety model
 

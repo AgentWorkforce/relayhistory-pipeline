@@ -28,7 +28,7 @@
 import { Hono, type Context } from "hono";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { CursorError, decodeCursor } from "./cursor.ts";
-import { TenantMismatchError, partialSessions, readEventPage, type Liveness } from "./page.ts";
+import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
 
 export interface VerifiedIdentity {
@@ -286,9 +286,15 @@ export function createReadApi(deps: ReadApiDeps) {
       const belowFloor = deps.completeSinceMs > 0 && (sinceMs === undefined || sinceMs < deps.completeSinceMs);
       if (belowFloor) base.sinceMs = deps.completeSinceMs;
       if (untilMs !== undefined && base.sinceMs !== undefined && untilMs < base.sinceMs) throw unsupported("history_floor");
-      // A partial session anywhere in the org may hold matches this backend
-      // lacks (the state table has no workspace): the search starts at relayhistory.
-      if (cursor === undefined && (await partialSessions(pageDeps(), identity.orgId)).length > 0) throw unsupported("session_partial");
+      // A partial session of this workspace may hold matches this backend
+      // lacks, so the search starts at relayhistory. Partial sessions of other
+      // workspaces of the org cannot hold this workspace's rows and do not count
+      // (page.ts partialSessionsInWorkspace says how one is attributed).
+      if (cursor === undefined) {
+        const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
+        if (partials.overflow) throw unsupported("session_partial_unbounded");
+        if (partials.sessions.length > 0) throw unsupported("session_partial");
+      }
       const page = await readEventPage(pageDeps(), base);
       if (belowFloor && page.nextCursor === null) {
         // First page: nothing was issued yet, so the whole read falls back.
