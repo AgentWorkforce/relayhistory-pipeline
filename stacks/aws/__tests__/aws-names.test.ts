@@ -61,7 +61,11 @@ describe("AWS name and description charsets", () => {
       for (const a of ["locker", "trail"]) expect(`alias/96bulls-${stage}-${a}`).toMatch(AWS.kmsAlias);
       expect(controlPlaneLogGroupName(`96bulls-${stage}`)).toMatch(AWS.logGroup);
       expect(`96bulls-${stage}-monthly`).toMatch(AWS.budgetName);
-      for (const b of ["locker", "trail", "alb-logs"]) expect(`96bulls-${stage}-${b}-${ACCOUNT}`).toMatch(AWS.bucket);
+      for (const b of ["locker", "trail", "alb-logs"]) {
+        expect(`96bulls-${stage}-${b}-${ACCOUNT}`).toMatch(AWS.bucket);
+        // Only the Pippen sandbox stage gets the pippen-sbx- prefix (stageBucketName).
+        if (stage === "aws-proof-sandbox") expect(`pippen-sbx-96bulls-${stage}-${b}-361835732085`).toMatch(AWS.bucket);
+      }
     });
   }
 
@@ -70,15 +74,18 @@ describe("AWS name and description charsets", () => {
     expect(ingress).toContain("webAclName: ingestWafIdentity(i.stage).webAclName,");
     expect(ingress).toContain("description: ingestWafIdentity(i.stage).description,");
     expect(ingress).toContain("MetricName: ingestWafIdentity(i.stage).metricName");
-    expect(ingress).toContain("const logBucketName = `96bulls-${i.stage}-alb-logs-${i.accountId}`;");
+    // stageBucketName (pippen-sandbox.ts): `96bulls-<stage>-<base>-<account>`, pippen-sbx- first only in a Pippen sandbox.
+    expect(ingress).toContain('const logBucketName = stageBucketName(i.stage, "alb-logs", i.accountId, Boolean(i.pippenSandbox));');
     const eks = src("eks.ts");
     expect(eks).toContain("roleName: `96bulls-${i.stage}-${r.id}`,");
     expect(eks).toContain("description: `96bulls ${i.stage}: ${r.description} (Pod Identity ${NAMESPACE}/${r.serviceAccount})`,");
     const stack = src("alchemy.aws.run.ts");
     expect(stack).toContain('const name = (base: string) => `96bulls-${stage}-${base}`;');
+    expect(stack).toContain('const lockerBucketName = stageBucketName(stage, "locker", inputs.accountId, pippen);');
+    expect(stack).toContain('const trailBucketName = stageBucketName(stage, "trail", inputs.accountId, pippen);');
     expect(stack).toContain('aliasName: `alias/${name("locker")}`');
     expect(stack).toContain('aliasName: `alias/${name("trail")}`');
-    expect(stack).toContain('budgetName: name("monthly"),');
+    expect(stack).toContain("budgetName: stageBudgetName(stage, pippen),");
     expect(stack).toContain('roleName: name("deployer"),');
     // No other WAF description in the stack bypasses ingestWafIdentity.
     expect((ingress + eks + stack).match(/WAFv2\.(WebACL|RuleGroup|IPSet)\(/g)).toEqual(["WAFv2.WebACL("]);

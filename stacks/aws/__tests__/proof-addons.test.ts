@@ -251,7 +251,7 @@ describe("proof teardown leaves nothing behind", () => {
     expect(storageClassManifest().reclaimPolicy).toBe("Retain");
     expect(storageClassManifest("Delete").reclaimPolicy).toBe("Delete");
     const eks = readFileSync(fileURLToPath(new URL("../eks.ts", import.meta.url)), "utf8");
-    expect(eks).toContain('storageClassManifest(i.purgeOnDestroy ? "Delete" : "Retain")');
+    expect(eks).toContain('storageClassManifest(i.purgeOnDestroy ? "Delete" : "Retain", i.pippenSandbox ? PIPPEN_SANDBOX_TAG : undefined)');
   });
 });
 

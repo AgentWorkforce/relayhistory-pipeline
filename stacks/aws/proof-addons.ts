@@ -5,6 +5,7 @@
  * contracts are unit-tested (stacks/aws/__tests__/proof-addons.test.ts) and
  * rendered with `helm template` before anything is applied.
  */
+import { storageClassTagParameters } from "./pippen-sandbox.ts";
 import { DIGEST_RE, NAMESPACE, PINNED_IMAGES, VPC_AZ_COUNT, VPC_CIDR, assertDigestPinned, networkSubnetCidrs } from "./hardening.ts";
 import { relayauthTlsNetworkPolicies } from "./relayauth-tls.ts";
 
@@ -16,7 +17,8 @@ import { relayauthTlsNetworkPolicies } from "./relayauth-tls.ts";
 export const STORAGE_CLASS = "96bulls-gp3";
 
 /** Retain everywhere except proof/sandbox teardown, where a destroyed stage leaves no volumes behind. */
-export function storageClassManifest(reclaimPolicy: "Retain" | "Delete" = "Retain") {
+/** `volumeTags`: Pippen sandbox only (pippen-sandbox.ts), so pippen-sweeper finds a volume its cluster left behind. */
+export function storageClassManifest(reclaimPolicy: "Retain" | "Delete" = "Retain", volumeTags?: Readonly<Record<string, string>>) {
   return {
     apiVersion: "storage.k8s.io/v1",
     kind: "StorageClass",
@@ -25,7 +27,7 @@ export function storageClassManifest(reclaimPolicy: "Retain" | "Delete" = "Retai
     volumeBindingMode: "WaitForFirstConsumer",
     allowVolumeExpansion: true,
     reclaimPolicy,
-    parameters: { type: "gp3", encrypted: "true" },
+    parameters: { type: "gp3", encrypted: "true", ...(volumeTags ? storageClassTagParameters(volumeTags) : {}) },
   };
 }
 

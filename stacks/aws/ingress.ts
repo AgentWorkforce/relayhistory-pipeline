@@ -19,6 +19,7 @@ import * as Kubernetes from "@alchemy.run/kubernetes";
 import * as Effect from "effect/Effect";
 import * as Output from "alchemy/Output";
 import { denyInsecureTransport } from "./hardening.ts";
+import { PIPPEN_SANDBOX_TAG, ingressClassTags, stageBucketName } from "./pippen-sandbox.ts";
 import { spawnSync } from "node:child_process";
 import { validationRecordOverride, waitForValidationRecord, type ValidationRecord } from "./cert-validation.ts";
 import { EXTERNAL_DNS_CHART, INGEST_LISTEN_PORTS, INGEST_SSL_POLICY, albLogDeliveryPolicy, externalDnsImageValues, ingestWafIdentity, ingestLoadBalancerAttributes, ingestWafRules, ingressExposure, type IngestExposureInput } from "./proof-addons.ts";
@@ -49,6 +50,8 @@ export interface IngressInputs {
   certValidation?: { name: string; value: string };
   /** ALB scheme (default internet-facing) and the WAF per-IP rate limit. */
   exposure?: IngestExposureInput;
+  /** Pippen sandbox (pippen-sandbox.ts): a pippen-sbx- access-log bucket, and the ALB Auto Mode creates tagged pippen:sandbox=true. */
+  pippenSandbox?: boolean;
   tags: Record<string, string>;
 }
 
@@ -67,7 +70,7 @@ export const ingressStage = (i: IngressInputs) =>
       tags: i.tags,
     });
     // ALB access logs: SSE-S3 (ALB log delivery does not support KMS keys), TLS only, 90 days.
-    const logBucketName = `96bulls-${i.stage}-alb-logs-${i.accountId}`;
+    const logBucketName = stageBucketName(i.stage, "alb-logs", i.accountId, Boolean(i.pippenSandbox));
     const logBucketArn = `arn:aws:s3:::${logBucketName}`;
     const albLogs = yield* AWS.S3.Bucket("alb-logs", {
       bucketName: logBucketName,
@@ -118,7 +121,11 @@ export const ingressStage = (i: IngressInputs) =>
         apiVersion: "eks.amazonaws.com/v1",
         kind: "IngressClassParams",
         metadata: { name: expose.className },
-        spec: { scheme: expose.scheme, loadBalancerAttributes: ingestLoadBalancerAttributes(albLogs.bucketName as unknown as string) },
+        spec: {
+          scheme: expose.scheme,
+          loadBalancerAttributes: ingestLoadBalancerAttributes(albLogs.bucketName as unknown as string),
+          ...(i.pippenSandbox ? { tags: ingressClassTags(PIPPEN_SANDBOX_TAG) } : {}),
+        },
       },
     });
     yield* Kubernetes.Manifest("alb-ingressclass", {

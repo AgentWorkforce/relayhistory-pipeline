@@ -110,6 +110,12 @@ describe("aws-proof-sandbox: the E2E proof in the Pippen sandbox of agent aws-pr
     expect(r.hoopdb).toBe("cnpg");
   });
 
+  it("refuses ecr.pullAccounts in a Pippen sandbox: its boundary denies ecr:SetRepositoryPolicy (pippen-tools #37)", () => {
+    expect(sbxExample.ecr).toBeUndefined();
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbx((i) => (i.ecr = { pullAccounts: ["111122223333"] })), approved)).toThrow(/declares no ECR repository policy/);
+    expect(() => validateAwsInputs("aws-proof-sandbox", sbx((i) => (i.ecr = { pullAccounts: [] })), approved)).not.toThrow();
+  });
+
   it("refuses the example as committed: the boundary policy name and approval are placeholders", () => {
     expect(() => validateAwsInputs("aws-proof-sandbox", sbxExample)).toThrow(/\$\.pippenSandbox\.permissionsBoundaryArn/);
   });
@@ -158,8 +164,9 @@ describe("aws-proof-sandbox: the E2E proof in the Pippen sandbox of agent aws-pr
 });
 
 describe("ecr.pullAccounts: read-only cross-account pull from the services repository", () => {
-  // Applied live by the coordinator on Khaliq's OK (2026-11-01, "give my OK") to the sessions-dev repository.
-  const LIVE = {"Version":"2012-10-17","Statement":[{"Sid":"PippenSandboxAwsProofPull","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::361835732085:root"},"Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:BatchCheckLayerAvailability"]}]};
+  // Applied live by the coordinator on Khaliq's OK (2026-11-01, "give my OK") to the sessions-dev repository, with
+  // ecr:DescribeImages added (the sandbox stage's image check); the coordinator applies this 4-action policy after merge.
+  const LIVE = {"Version":"2012-10-17","Statement":[{"Sid":"PippenSandboxAwsProofPull","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::361835732085:root"},"Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:BatchCheckLayerAvailability","ecr:DescribeImages"]}]};
   const devAccount = "500268966557";
   const canon = (v: unknown): unknown => (Array.isArray(v) ? v.map(canon) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b)).map(([k, x]) => [k, canon(x)])) : v);
 
@@ -167,6 +174,12 @@ describe("ecr.pullAccounts: read-only cross-account pull from the services repos
     const text = ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: ["361835732085"] } })!;
     expect(JSON.stringify(canon(JSON.parse(text)))).toBe(JSON.stringify(canon(LIVE)));
     expect(text).toBe(JSON.stringify(LIVE)); // and byte for byte as rendered
+  });
+
+  it("grants read-only actions only: pull and image metadata, never push, delete or policy changes", () => {
+    const actions = JSON.parse(ecrPullPolicy({ accountId: devAccount, ecr: { pullAccounts: ["361835732085"] } })!).Statement[0].Action as string[];
+    expect(actions).toEqual(["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability", "ecr:DescribeImages"]);
+    expect(actions.every((a) => /^ecr:(BatchGet|GetDownload|BatchCheck|Describe)/.test(a))).toBe(true);
   });
 
   it("other accounts get one generic read-only statement each", () => {

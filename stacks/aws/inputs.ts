@@ -57,7 +57,8 @@ export interface AwsInputs {
   /**
    * Read-only cross-account pull from this stage's `96bulls-services` ECR
    * repository (ecrPullPolicy). Each entry is a 12-digit account id that gets
-   * BatchGetImage, GetDownloadUrlForLayer and BatchCheckLayerAvailability, and
+   * BatchGetImage, GetDownloadUrlForLayer, BatchCheckLayerAvailability and
+   * DescribeImages (read-only image metadata: the pulling stage's image check), and
    * nothing else. Omit or [] for no repository policy at all. Alchemy removes
    * a repository policy the inputs do not declare, so a live grant must be
    * listed here before the next `up`.
@@ -125,6 +126,8 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
   if (placeholders.length) throw new Error(`96bulls: aws-inputs.json still has placeholder values at ${placeholders.join(", ")}. Nothing was created.`);
   if (inputs.pippenSandbox && !new RegExp(`^arn:aws:iam::${inputs.accountId}:policy/[\\w+=,.@/-]+$`).test(inputs.pippenSandbox.permissionsBoundaryArn ?? ""))
     throw new Error("96bulls: pippenSandbox.permissionsBoundaryArn must be a policy ARN in this account. Nothing was created.");
+  if (inputs.pippenSandbox && (inputs.ecr?.pullAccounts?.length ?? 0) > 0)
+    throw new Error("96bulls: a Pippen sandbox stage declares no ECR repository policy (its boundary denies ecr:SetRepositoryPolicy); remove ecr.pullAccounts. Nothing was created.");
   if (inputs.pippenSandbox && inputs.accountShared) throw new Error("96bulls: a Pippen sandbox account is fresh; it cannot share another stage's account resources. Nothing was created.");
   assertPippenProofSandbox(stage, inputs);
   ecrPullPolicy(inputs);
@@ -187,7 +190,8 @@ export function assertPippenProofSandbox(stage: string, inputs: Pick<AwsInputs, 
 export const PRODUCTION_ACCOUNT_ID = "941433935742";
 /** The Pippen sandbox proof account's grant keeps the Sid Khaliq approved and applied (2026-11-01). */
 const PULL_SIDS: Readonly<Record<string, string>> = Object.freeze({ [PIPPEN_PROOF_SANDBOX.accountId]: "PippenSandboxAwsProofPull" });
-export const ECR_PULL_ACTIONS = Object.freeze(["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"] as const);
+/** Pull, plus ecr:DescribeImages: the pulling stage's preflight (preflight.ts verifyServicesImage) reads the pinned digest's tags. */
+export const ECR_PULL_ACTIONS = Object.freeze(["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability", "ecr:DescribeImages"] as const);
 
 /**
  * The services repository policy for `ecr.pullAccounts`, as the exact JSON

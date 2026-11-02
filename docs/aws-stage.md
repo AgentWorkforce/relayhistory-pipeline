@@ -83,7 +83,9 @@ copy stays private for kind and self-host tests.
 policy on its `96bulls-services` repository (`stacks/aws/inputs.ts`
 `ecrPullPolicy`). Each entry is a 12-digit account id. It gets one statement,
 principal `arn:aws:iam::<id>:root`, with exactly `ecr:BatchGetImage`,
-`ecr:GetDownloadUrlForLayer` and `ecr:BatchCheckLayerAvailability`. The
+`ecr:GetDownloadUrlForLayer`, `ecr:BatchCheckLayerAvailability` and
+`ecr:DescribeImages` (read-only image metadata: the pulling stage's image
+check, `verifyServicesImage`, reads the pinned digest's tags). The
 Pippen sandbox `361835732085` gets the Sid `PippenSandboxAwsProofPull`; any
 other account gets `CrossAccountPull<id>`. The stage refuses an entry that is
 not a 12-digit id (no wildcards or ARNs), a duplicate, its own account, the
@@ -93,7 +95,9 @@ is the behavior before this input existed.
 
 Alchemy removes a repository policy the inputs do not declare. Khaliq approved
 read-only pull for the Pippen sandbox on 2026-11-01 ("give my OK"), and the
-policy was applied live to the sessions-dev repository. So **before the next
+three-action pull policy was applied live to the sessions-dev repository; the
+four-action policy (with `ecr:DescribeImages`) is applied live after this
+change merges. So **before the next
 `bin/96bulls up aws-sessions-dev`, its inputs must carry**:
 
 ```json
@@ -608,8 +612,51 @@ The flow (each live step needs Khaliq's OK; nothing here has been run):
    `pippen:baseline=true` are never listed.
 8. `pippen sandbox down aws-proof` again.
 
-The stage's AWS Budget has no tags, so neither the pippen sweep nor the
-harness's tag check sees it.
+#### What `pippenSandbox` changes in the stage (and nothing else does)
+
+Khaliq, 2026-11-01: "Widen pippen boundary". The stage keeps full fidelity
+(the same KMS keys, Locker, CloudTrail, budget, ECR repository, VPC, EKS Auto
+Mode cluster, Pod Identity roles, WAF, ACM certificate and ALB as the other
+proof stages) and changes only what the pippen agent-session boundary and
+`pippen-sweeper` need (`stacks/aws/pippen-sandbox.ts`):
+
+- every IAM role is under `/pippen/workload/` with the boundary: the four Pod
+  Identity roles, the legacy pods role if kept, and the EKS Auto Mode cluster
+  and node roles (`96bulls-aws-proof-sandbox-{cluster,node}`), which the stage
+  declares and passes to the cluster instead of letting Alchemy create them at
+  `/` with no boundary;
+- the budget is `pippen-sbx-96bulls-aws-proof-sandbox-monthly`: the boundary
+  scopes Budgets by name (`budget/pippen-sbx-*`), so the agent can never touch
+  the account's baseline budget;
+- no ECR repository policy: the boundary denies `ecr:SetRepositoryPolicy` (a
+  resource policy could grant push past it), so `ecr.pullAccounts` is refused;
+- every resource carries `pippen:sandbox=true`, now including the budget, and
+  the ALB, target groups and security groups (IngressClassParams `tags`) and
+  EBS volumes (StorageClass `tagSpecification_1`) that Auto Mode creates
+  from Kubernetes objects. EC2 instances Auto Mode launches are untagged and
+  terminated by EKS with the cluster;
+- the S3 buckets are named `pippen-sbx-96bulls-aws-proof-sandbox-{locker,trail,alb-logs}-361835732085`
+  (and the proof's HoopDb backup bucket `pippen-sbx-96bulls-aws-proof-sandbox-backups-361835732085`;
+  every one is a valid S3 name, tested):
+  `pippen-sweeper` may delete only `pippen-sbx-*` buckets (S3 deletes cannot be
+  tag-conditioned);
+- no GitHub OIDC provider or deployer role (unchanged).
+
+Every other stage renders exactly as before (`stacks/aws/__tests__/pippen-sandbox.test.ts`).
+
+This needs the widened boundary and sweeper from pippen-tools (the boundary
+grants CloudTrail, WAFv2, ACM, ECR repositories and Budgets only with
+`pippen:sandbox=true`, and the sweeper deletes them). Order: merge the
+pippen-tools PR, Khaliq redeploys the pippen management stack (sandbox
+baseline StackSet; pippen-tools `docs/runbook-management-bootstrap.md` step 9)
+and the tooling release, then `pippen sandbox up aws-proof` and the flow
+above. Before that the deploy is denied at the first CloudTrail, WAF, ACM,
+ECR or Budgets call.
+
+The stack's image preflight runs `ecr describe-images` against the
+sessions-dev repository, so `ecr.pullAccounts` grants `ecr:DescribeImages` as
+well as pull. Until the four-action policy is applied live to that repository
+(after merge), the preflight is denied.
 
 ### Apply, verify and roll back
 
