@@ -133,7 +133,7 @@ export function buildCandidateQuery(database: string, input: EventQuery): Built 
   const table = qualifiedTable(database);
   const ord = orderBy(input.order);
   const select = `SELECT ts, session_id, source, machine_id, kind, event_id FROM ${table}`;
-  const limited = `ORDER BY ${ord} LIMIT {n:UInt32}`;
+  const limited = `ORDER BY ${ord} LIMIT 1 BY ${KEY_BY} LIMIT {n:UInt32}`;
   let inner: string;
   if (input.q === undefined) {
     inner = `${select} WHERE ${where.join(" AND ")} ${limited}`;
