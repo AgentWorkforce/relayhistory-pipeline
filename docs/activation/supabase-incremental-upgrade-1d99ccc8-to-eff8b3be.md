@@ -14,10 +14,12 @@ The database is already activated. It was not created by this plan.
   2026-11-01 at 17:56Z from `b47c1e6` with `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke`.
 - **Roles:**
   - `bulls96_runtime`: LOGIN, holds USAGE on `sessions` and SELECT on the ledger and the marker
-    only. The #116 runtime application ACL is **not** installed.
+    only. The #116 runtime application ACL is **not** installed. **Superseded by §1a:** it was
+    applied by hand at 02:04Z, except for the 5 #124 objects.
   - `session_directory_search_worker`: present.
   - Both carry the #106 `postgres` creator edge.
-- **Data:** about 127k rows in `sessions`. The catch-up loop writes as `postgres`.
+- **Data:** about 127k rows in `sessions`. The catch-up loop writes as `postgres`. **Superseded by
+  §1a:** the loop has been stopped since 02:02:14Z.
 - **`postgres` global function default:** `{postgres=X/postgres}`, installed by the earlier
   activation. This is the project-wide default revoke.
 - **Event triggers:** none of ours. Six platform triggers exist, all owned by `supabase_admin`.
@@ -28,6 +30,8 @@ The database is already activated. It was not created by this plan.
 Why the #121 Lambda cannot run today: it connects as `bulls96_runtime`, and that role has no
 EXECUTE on `upsert_session_index` and no table DML grants. Those grants are the #116 runtime
 application ACL. Only the migrator installs it (`installRuntimeApplicationAcl`, `migrate.ts`).
+**Superseded by §1a:** the ACL was applied by hand, minus the 5 #124 objects that A2 adds, and the
+Lambda is disabled and must be redeployed (A5).
 
 ### 1a. Changes made after the audit (cloud-handoff, 2026-11-02)
 
@@ -44,9 +48,10 @@ Recorded in `cloud-handoff-to-migration-lane.md`. Not run by this plan:
   #124 creates (the tables `session_directory_agents` and `session_directory_relationships`, the
   function `session_directory_project_text(text,text,text)`, and their 2 policies).
   - It ran an in-transaction post-check: 134 privilege checks and 23 policies, all passing.
-  - The approval is recorded as Khaliq's, **relayed** by self-hosted-lead
-    (`tonight-search-cutover.md`). It has been raised with Khaliq directly.
-  - Snapshot at 02:07Z: `bulls96_runtime-grants-now.txt`.
+  - Approval: recorded at the time as Khaliq's pre-approval, relayed by self-hosted-lead
+    (`tonight-search-cutover.md`). **Khaliq then confirmed it directly to helm-chart-chief-claude on
+    2026-11-02: the 02:04Z apply was approved and stays.**
+  - Snapshot at 02:07Z: `~/.agent-tmp/bulls96_runtime-grants-now.txt` on linuyc (cloud-handoff).
 - **#121 Lambda:** the deployed image is built from `cc37755`, which **fails the §2 image gate**. Its
   handler has no schema-verdict gate. The SQS mapping and the reconcile rule are disabled.
 - **New images (main `7d7229b`, a descendant of `ab3ee7f`, generation `eff8b3be`):**
@@ -142,18 +147,18 @@ Run every block as `BEGIN READ ONLY; SET LOCAL statement_timeout='5s'; SET LOCAL
 lock_timeout='1s'; … ROLLBACK;` with role `postgres`. Use TLS `verify-full` with the pinned CA. Do
 not print any connection string or secret.
 
-| id  | check                                                                                                                                           | expected                                                                                                                                                       |
-| --- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P1  | `SELECT count(*), max(applied_at) FROM sessions.__96bulls_migrations`                                                                           | 17. Nothing applied after 2026-11-01T17:56:13Z                                                                                                                 |
-| P2  | `SELECT name, generation, status FROM sessions.__96bulls_role_validation`                                                                       | `session_directory_search_worker`, `1d99ccc8…`, `pass`                                                                                                         |
-| P3  | `SELECT name FROM sessions.__96bulls_migrations WHERE name LIKE '%20261101050000%'`                                                             | 0 rows                                                                                                                                                         |
-| P4  | `SELECT sha256 FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261030020000_session_directory_short_summary.sql'`                   | `b0ddc7de8c4cff9454638c52563f37f1e1380ed577e2a7535f67ddc2c0b758ce`                                                                                             |
-| P5  | every ledger sha256 against the file at `ab3ee7f`                                                                                               | 17/17 equal                                                                                                                                                    |
-| P6  | P12 baseline md5s from the fe5a2da audit (roles, memberships, default_acl, db_role_settings, database ACL, schemas, extensions, event_triggers) | unchanged. On any difference, stop and re-audit                                                                                                                |
-| P7  | `pg_locks` for advisory `(961996,1)`, and non-idle sessions other than ours                                                                     | 0 advisory locks. No other non-idle session (the loop has been stopped since 02:02:14Z)                                                                        |
-| P8  | `bun src/hoopdb/migrate.ts --activation-check` with env **E-A** (read-only), after the §2 code gate                                             | exit 0, `satisfied=true`. Only `supabase_admin` under `excluded_platform_superusers`. Every `sessions` CREATE role covered. `migration_checksum_aliases` empty |
-| P9  | the #121 Lambda, the Worker and every reader are scaled to zero or paused; the catch-up loop has been stopped since 02:02:14Z (§1a)             | recorded by the executor                                                                                                                                       |
-| P10 | `bulls96_runtime` grants: a read-only dump in the same format as the 02:07Z snapshot                                                            | identical to `bulls96_runtime-grants-now.txt`, and every entry inside the code's `RUNTIME_APPLICATION_*` constants at `7d7229b`. On any extra, stop            |
+| id  | check                                                                                                                                           | expected                                                                                                                                                                                      |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1  | `SELECT count(*), max(applied_at) FROM sessions.__96bulls_migrations`                                                                           | 17. Nothing applied after 2026-11-01T17:56:13Z                                                                                                                                                |
+| P2  | `SELECT name, generation, status FROM sessions.__96bulls_role_validation`                                                                       | `session_directory_search_worker`, `1d99ccc8…`, `pass`                                                                                                                                        |
+| P3  | `SELECT name FROM sessions.__96bulls_migrations WHERE name LIKE '%20261101050000%'`                                                             | 0 rows                                                                                                                                                                                        |
+| P4  | `SELECT sha256 FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261030020000_session_directory_short_summary.sql'`                   | `b0ddc7de8c4cff9454638c52563f37f1e1380ed577e2a7535f67ddc2c0b758ce`                                                                                                                            |
+| P5  | every ledger sha256 against the file at `ab3ee7f`                                                                                               | 17/17 equal                                                                                                                                                                                   |
+| P6  | P12 baseline md5s from the fe5a2da audit (roles, memberships, default_acl, db_role_settings, database ACL, schemas, extensions, event_triggers) | unchanged. On any difference, stop and re-audit                                                                                                                                               |
+| P7  | `pg_locks` for advisory `(961996,1)`, and non-idle sessions other than ours                                                                     | 0 advisory locks. No other non-idle session (the loop has been stopped since 02:02:14Z)                                                                                                       |
+| P8  | `bun src/hoopdb/migrate.ts --activation-check` with env **E-A** (read-only), after the §2 code gate                                             | exit 0, `satisfied=true`. Only `supabase_admin` under `excluded_platform_superusers`. Every `sessions` CREATE role covered. `migration_checksum_aliases` empty                                |
+| P9  | the #121 Lambda, the Worker and every reader are scaled to zero or paused; the catch-up loop has been stopped since 02:02:14Z (§1a)             | recorded by the executor                                                                                                                                                                      |
+| P10 | `bulls96_runtime` grants: a read-only dump in the same format as the 02:07Z snapshot                                                            | identical to the 02:07Z snapshot `~/.agent-tmp/bulls96_runtime-grants-now.txt` (linuyc), and every entry inside the code's `RUNTIME_APPLICATION_*` constants at `7d7229b`. On any extra, stop |
 
 ## 5. Stage A: new code, #116 runtime ACL (boundary unchanged)
 
@@ -247,14 +252,15 @@ default-ACL md5 must be re-recorded afterwards.
 
 ## 8. Failure and rollback
 
-- **Stage A is one-way for code.** After A2 succeeds, the `b47c1e6` migrator refuses
-  (`runtime_role_unsafe`: `bulls96_runtime` now holds the #116 ACL, which the old allowlist
-  rejects). Never point an older image's migrator at this database again. Recovery is always
+- **Stage A is one-way for code, and the old code is already shut out.** Since the 02:04Z hand
+  ACL, the `b47c1e6` migrator already refuses (`runtime_role_unsafe`: `bulls96_runtime` holds
+  grants that the old allowlist rejects). After A2 the same holds. Never point an older image's migrator at this database again. Recovery is always
   forward, with fixed code at `ab3ee7f` or later.
 - **A2 fails after `20261101050000` committed** (for example `function_acl_drift` or
   `runtime_role_unsafe` in the validation transaction): the ledger has 18 rows and #124's DDL is in
-  place. The validation transaction rolled back, so there is no #116 ACL and the marker is `pending`
-  for `eff8b3be`. Readers are not-ready, and the services are already paused. Record the
+  place. The validation transaction rolled back. The hand-applied #116 ACL from 02:04Z **stays in
+  place**: only the 5 #124 objects' grants are missing, because the rolled-back transaction would
+  have added them. The marker is `pending` for `eff8b3be`. Readers are not-ready, and the services are already paused. Record the
   `error_code` and the evidence JSON. Fix the cause (code through review, or an ACL difference that
   Khaliq approves), then re-run A2. It skips the applied step and re-runs only the validation. Do not
   edit catalogs by hand.
