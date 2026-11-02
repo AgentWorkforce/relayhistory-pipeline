@@ -269,8 +269,9 @@ function sessionPipelinePhase(operations: ReadonlyMap<string, string>): Transcri
 
 /**
  * The brief schedule's own phases (session-pipeline.ts SESSION_BRIEF_RESOURCES). Rollout: its
- * resources are created (all, or the rest after a partial apply). Update: they change in
- * place (the rule's state when `briefs.enabled` flips). In either, the rest of the plan is
+ * resources are created (all, or the rest after a partial apply). Update: only the rule
+ * changes in place (its state when `briefs.enabled` flips); the permission stays noop.
+ * In either, the rest of the plan is
  * all noop, or exactly a session pipeline update (the function's env, plus the role-ARN
  * cascade, checked by assertPipelineRoleCascadeDiff); the read API stays noop. Undefined
  * when every brief resource is noop: the plan is then judged as before.
@@ -283,12 +284,19 @@ function sessionBriefPhase(
 ): TranscriptStorePlanPhase | undefined {
   // Absent (a plan captured before briefs) or all noop: not a brief phase. expectedResources
   // already refused a plan that lists some brief resources but not all.
-  const brief = SESSION_BRIEF_RESOURCES.map((r) => operations.get(r) ?? "noop");
+  const [schedule, permission] = SESSION_BRIEF_RESOURCES.map((r) => operations.get(r) ?? "noop");
+  const brief = [schedule, permission];
   if (brief.every((a) => a === "noop")) return undefined;
   const changes = () => [...operations].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ");
   const phase: TranscriptStorePlanPhase | undefined =
-    brief.every((a) => a === "create" || a === "noop") ? "session brief rollout" : brief.every((a) => a === "update" || a === "noop") ? "session brief update" : undefined;
-  if (!phase) return refuse(`session brief resources mix creates and updates: ${changes()}`);
+    brief.every((a) => a === "create" || a === "noop")
+      ? "session brief rollout"
+      : schedule === "update" && permission === "noop"
+        ? "session brief update"
+        : undefined;
+  // The EventBridge permission is create-once. Enabling or disabling briefs changes only
+  // the schedule state; an in-place permission edit could widen the invoking principal.
+  if (!phase) return refuse(`session brief resources have an unsafe action combination: ${changes()}`);
   if (!SESSION_READ_API_RESOURCES.every((r) => !operations.has(r) || operations.get(r) === "noop"))
     return refuse(`${phase}: the read api may not change in the same plan: ${changes()}`);
   const rest = new Map([...operations].filter(([r]) => !(SESSION_BRIEF_RESOURCES as readonly string[]).includes(r)));

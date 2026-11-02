@@ -280,13 +280,14 @@ describe("session pipeline: deploy plan contract", () => {
     expect(check(plan({ "session-brief-schedule": "update" }, withBrief))).toBe("session brief update");
   });
 
-  it("brief phases refuse store changes, pipeline creates, mixed actions, missing resources and a read api change", () => {
+  it("brief phases refuse store changes, pipeline creates, permission updates, mixed actions, missing resources and a read api change", () => {
     expect(() => check(plan({ ...briefCreates, trail: "update" }, withBrief))).toThrow(/must be noop or a session pipeline update/);
     expect(() => check(plan({ ...briefCreates, "transcript-reader": "update" }, withBrief))).toThrow(/must be noop or a session pipeline update/);
     expect(() => check(plan({ ...briefCreates, "session-events-dlq": "create" }, withBrief))).toThrow(/must be noop or a session pipeline update/);
     // A store grant may update only by the role-ARN cascade, which this plan does not show.
     expect(() => check(plan({ ...briefCreates, "session-pipeline": "update", transcripts: "update" }, withBrief))).toThrow(/transcripts updates without the role-ARN cascade/);
-    expect(() => check(plan({ "session-brief-schedule": "create", "session-brief-permission": "update" }, withBrief))).toThrow(/mix creates and updates/);
+    expect(() => check(plan({ "session-brief-schedule": "create", "session-brief-permission": "update" }, withBrief))).toThrow(/unsafe action combination/);
+    expect(() => check(plan({ "session-brief-permission": "update" }, withBrief))).toThrow(/unsafe action combination/);
     for (const action of ["replace", "delete"]) expect(() => check(plan({ "session-brief-schedule": action }, withBrief))).toThrow(/forbidden action/);
     expect(() => check(plan(briefCreates, [...all, "session-brief-schedule"]))).toThrow(/missing resource session-brief-permission/);
     // Brief resources never come without the pipeline's.

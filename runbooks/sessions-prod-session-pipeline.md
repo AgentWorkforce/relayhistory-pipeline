@@ -100,16 +100,17 @@ JSON:
 - `openai_api_key` is the session brief model key (Session briefs, below).
   Omit it while briefs are off. Without it a brief tick claims nothing.
 
-Set the value from 1Password with one prompt on kjg-lap. The value is never
-echoed, written to a file or put in argv. First check the item's field labels
-with `op item get … --format json | jq '[.fields[].label]'`:
+Set the value from 1Password on kjg-lap. The value is never echoed, written to
+a file or put in argv. First check the item's field labels with
+`op item get … --format json | jq '[.fields[].label]'`, then run this in a
+kjg-lap zsh (the process substitutions expose only `/dev/fd` paths in argv):
 
 ```sh
-ssh kjg-lap "zsh -lc 'jq -n \
-  --arg db \"\$(op read \"op://96Bulls-prod/<hoopdb runtime item>/<url field>\")\" \
-  --argjson ch \"\$(op item get \"clickhouse relay-search-prod ingest\" --vault 96Bulls-prod --format json \
-      | jq \"[.fields[] | {(.label): .value}] | add | {url: (\\\"https://\\\" + .host + \\\":\\\" + (.port // \\\"8443\\\")), user, password, database}\")\" \
-  \"{hoopdb_url: \\\$db, clickhouse: \\\$ch}\"'" \
+jq -n \
+  --rawfile db <(op read "op://96Bulls-prod/<hoopdb runtime item>/<url field>") \
+  --slurpfile ch <(op item get "clickhouse relay-search-prod ingest" --vault 96Bulls-prod --format json \
+    | jq '[.fields[] | {(.label): .value}] | add | {url: ("https://" + .host + ":" + (.port // "8443")), user, password, database}') \
+  '{hoopdb_url: ($db | rtrimstr("\n")), clickhouse: $ch[0]}' \
 | AWS_PROFILE=sessions-prod aws secretsmanager put-secret-value --region us-east-1 \
     --secret-id 96bulls/aws-sessions-prod/session-pipeline --secret-string file:///dev/stdin --query VersionId
 ```
@@ -217,8 +218,12 @@ controls them:
   Set them here so the budget sits in the reviewed inputs.
 - The model key is `openai_api_key` in the pipeline secret, never env or
   inputs. It goes in with the rest of the value (Credentials). Generate it into
-  1Password first, then add `--arg key "$(op read "op://96Bulls-prod/<brief model item>/credential")"`
-  and `openai_api_key: $key` to the `jq -n` in the put command.
+  1Password first, then add
+  `--rawfile key <(op read "op://96Bulls-prod/<brief model item>/credential")`
+  to the `jq -n` command and
+  `openai_api_key: ($key | rtrimstr("\n"))` to its output object. Do not use
+  `--arg key "$(op read …)"`; command substitution would expose the key in
+  `jq`'s argv.
 - Historical sessions are not enqueued: `SESSION_BRIEF_SWEEP_SECONDS` stays 0.
   A backfill needs its own approval and budget.
 
