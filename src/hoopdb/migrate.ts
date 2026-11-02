@@ -421,12 +421,13 @@ export async function runMigrations(
           "runtime_role_unsafe",
           `HOOPDB_RUNTIME_ROLE ${profile.runtimeRole} is not least-privilege: ${violations.join(", ")}`,
         );
-      // Event-trigger mode (supabase): the trigger checks a subset of the manifest while
-      // migrations run; here every sessions function ACL must equal the committed
-      // manifest exactly, or the whole validation transaction rolls back. Other modes
-      // keep their existing behaviour.
+      // Every non-local boundary mode (global-default-revoke in selfhosted and cloudsql,
+      // event-trigger in supabase): every sessions function ACL must equal the committed
+      // manifest plus the runtime application ACL exactly, or the whole validation
+      // transaction (with phase 2 and PASS) rolls back and the marker stays pending.
+      // Local (Docker dev) mode is unchanged: no check.
       const drift =
-        profile.functionBoundary === "event-trigger"
+        profile.mode !== "local"
           ? await sessionsFunctionAclDrift(client, profile.runtimeRole)
           : [];
       if (drift.length)

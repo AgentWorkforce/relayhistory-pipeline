@@ -26,7 +26,7 @@
 --   - after ALTER DEFAULT PRIVILEGES: aborts when a function default scoped to
 --     `sessions` grants anyone but its own role.
 --   Entries are checked as a subset of the manifest while migrations run; the migrator
---   checks exact equality with the manifest after every event-trigger migrate, inside its
+--   checks exact equality with the manifest after every non-local migrate, inside its
 --   validation transaction (function_acl_drift), and the live gate keeps refusing any
 --   PUBLIC-executable `sessions` function.
 -- The function is SECURITY INVOKER with a pinned search_path: it runs as the user who

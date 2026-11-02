@@ -1656,4 +1656,7 @@ hosted target: unknown.
   - PR #125 changes no migration and no verifier, so the generation is unchanged
     (`bun src/hoopdb/migrate.ts --generation` gives the same value on the branch and on
     its `main` base).
+- Revision 9: the run-time exact ACL manifest check (`function_acl_drift`) now runs in
+  every non-local mode (`global-default-revoke` in selfhosted and Cloud SQL too), not
+  only event-trigger mode; local is unchanged. No migration or verifier change.
 - Formatted with the locked Prettier 3.9.10 (`--no-config`).
