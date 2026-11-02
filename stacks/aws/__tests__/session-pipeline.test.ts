@@ -7,8 +7,10 @@ import type { AwsInputs } from "../inputs.ts";
 import {
   DELIVERY_DELAY_SECONDS,
   FUNCTION_TIMEOUT_SECONDS,
+  SESSION_BRIEF_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
   VISIBILITY_TIMEOUT_SECONDS,
+  briefScheduleProps,
   bucketNotificationConfiguration,
   pipelineBucketStatements,
   pipelineKeyStatement,
@@ -103,6 +105,30 @@ describe("session pipeline: wiring", () => {
     for (const value of Object.values(env)) expect(value).not.toMatch(/postgres(ql)?:\/\/|password|clickhouse\.cloud/i);
     expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true } }).SEARCH_INDEX_ENABLED).toBe("1");
   });
+
+  it("briefs start off: SESSION_BRIEF_ENABLED=false and the schedule DISABLED; enabled sets both, and the caps only when given", () => {
+    const off = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: {} });
+    expect(off.SESSION_BRIEF_ENABLED).toBe("false");
+    expect(Object.keys(off).filter((k) => k.startsWith("SESSION_BRIEF_"))).toEqual(["SESSION_BRIEF_ENABLED"]);
+    expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { briefs: { enabled: false, globalDailyCap: 5 } } }).SESSION_BRIEF_ENABLED).toBe("false");
+    const on = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { briefs: { enabled: true, backgroundDailyBudget: 1000, globalDailyCap: 2000 } } });
+    expect(on).toMatchObject({ SESSION_BRIEF_ENABLED: "true", SESSION_BRIEF_BACKGROUND_DAILY_BUDGET: "1000", SESSION_BRIEF_GLOBAL_DAILY_CAP: "2000" });
+    // The model key is never in env: it is read from the pipeline secret.
+    expect(Object.keys(on)).not.toContain("OPENAI_API_KEY");
+
+    const FN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:${p.function}`;
+    const sched = (briefs?: { enabled: boolean }) => briefScheduleProps({ names: p, functionArn: FN, p: briefs ? { briefs } : {}, tags: {} });
+    expect(sched().state).toBe("DISABLED");
+    expect(sched({ enabled: false }).state).toBe("DISABLED");
+    expect(sched({ enabled: true })).toEqual({
+      name: "96bulls-aws-sessions-prod-session-brief",
+      description: "96bulls session pipeline: one session-brief tick (due wakeups)",
+      scheduleExpression: "rate(1 minute)",
+      state: "ENABLED",
+      targets: [{ Id: "session-pipeline", Arn: FN, Input: '{"brief":true}' }],
+      tags: {},
+    });
+  });
 });
 
 describe("session pipeline: not reachable from the internet", () => {
@@ -119,8 +145,9 @@ describe("session pipeline: not reachable from the internet", () => {
   });
 
   it("the function's resource policy grants InvokeFunction to EventBridge (this rule) and its own role only, never a public principal", () => {
-    const grants = sessionPipelinePermissions({ accountId: ACCOUNT, functionName: p.function, ruleArn: RULE_ARN, roleArn: ROLE });
-    expect(grants.map((g) => g.id)).toEqual(["session-reconcile-permission", "session-reconcile-continue"]);
+    const BRIEF_RULE_ARN = `arn:aws:events:${REGION}:${ACCOUNT}:rule/${p.briefRule}`;
+    const grants = sessionPipelinePermissions({ accountId: ACCOUNT, functionName: p.function, ruleArn: RULE_ARN, briefRuleArn: BRIEF_RULE_ARN, roleArn: ROLE });
+    expect(grants.map((g) => g.id)).toEqual(["session-reconcile-permission", "session-reconcile-continue", "session-brief-permission"]);
     for (const { props } of grants) {
       expect(props.action).toBe("lambda:InvokeFunction");
       expect(props.principal).not.toBe("*");
@@ -128,6 +155,7 @@ describe("session pipeline: not reachable from the internet", () => {
     }
     expect(grants[0]!.props).toEqual({ action: "lambda:InvokeFunction", functionName: p.function, principal: "events.amazonaws.com", sourceArn: RULE_ARN, sourceAccount: ACCOUNT });
     expect(grants[1]!.props).toEqual({ action: "lambda:InvokeFunction", functionName: p.function, principal: ROLE });
+    expect(grants[2]!.props).toEqual({ action: "lambda:InvokeFunction", functionName: p.function, principal: "events.amazonaws.com", sourceArn: BRIEF_RULE_ARN, sourceAccount: ACCOUNT });
   });
 
   it("the reconcile chain uses the Lambda Invoke API (SigV4), not a Function URL", () => {
@@ -167,6 +195,19 @@ describe("session pipeline: inputs", () => {
     expect(() => validate(withPipeline({ maxConcurrency: 50 }))).toThrow(/maxConcurrency/);
     expect(() => validate(withPipeline({ reconcileMinutes: 1 }))).toThrow(/reconcileMinutes/);
     expect(() => validate(withPipeline([]))).toThrow(/plain object/);
+  });
+
+  it("briefs: enabled is a required boolean, the caps are bounded integers, nothing else", () => {
+    expect(() => validate(withPipeline({ briefs: { enabled: true, backgroundDailyBudget: 5000, globalDailyCap: 20000 } }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ briefs: { enabled: false } }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ briefs: {} }))).toThrow(/briefs.enabled must be a boolean/);
+    expect(() => validate(withPipeline({ briefs: { enabled: "true" } }))).toThrow(/briefs.enabled must be a boolean/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, model: "x" } }))).toThrow(/briefs.model is not a known setting/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, openai_api_key: "sk-x" } }))).toThrow(/briefs.openai_api_key is not a known setting/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, globalDailyCap: -1 } }))).toThrow(/globalDailyCap/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, backgroundDailyBudget: 1.5 } }))).toThrow(/backgroundDailyBudget/);
+    expect(() => validate(withPipeline({ briefs: [] }))).toThrow(/briefs must be a plain object/);
+    expect(() => validate(withPipeline({ briefs: null }))).toThrow(/briefs must be a plain object/);
   });
 });
 
@@ -221,6 +262,38 @@ describe("session pipeline: deploy plan contract", () => {
     // A pipeline-free plan keeps the original contract.
     expect(check(plan({}, store))).toBe("post-apply");
     expect(() => check(plan({ transcripts: "update" }, store))).toThrow(/initial, recovery/);
+  });
+
+  const withBrief = [...all, ...SESSION_BRIEF_RESOURCES];
+  const briefCreates = Object.fromEntries(SESSION_BRIEF_RESOURCES.map((r) => [r, "create"]));
+
+  it("brief rollout: the schedule's resources created, alone or with exactly a session pipeline update", () => {
+    expect(check(plan({ ...briefCreates, "session-pipeline": "update" }, withBrief))).toBe("session brief rollout");
+    expect(check(plan(briefCreates, withBrief))).toBe("session brief rollout");
+    // The rest after a partial apply.
+    expect(check(plan({ "session-brief-permission": "create" }, withBrief))).toBe("session brief rollout");
+    expect(check(plan({}, withBrief))).toBe("post-apply");
+  });
+
+  it("brief update: the rule changes in place (enabled flips), alone or with the function's env", () => {
+    expect(check(plan({ "session-brief-schedule": "update", "session-pipeline": "update" }, withBrief))).toBe("session brief update");
+    expect(check(plan({ "session-brief-schedule": "update" }, withBrief))).toBe("session brief update");
+  });
+
+  it("brief phases refuse store changes, pipeline creates, mixed actions, missing resources and a read api change", () => {
+    expect(() => check(plan({ ...briefCreates, trail: "update" }, withBrief))).toThrow(/must be noop or a session pipeline update/);
+    expect(() => check(plan({ ...briefCreates, "transcript-reader": "update" }, withBrief))).toThrow(/must be noop or a session pipeline update/);
+    expect(() => check(plan({ ...briefCreates, "session-events-dlq": "create" }, withBrief))).toThrow(/must be noop or a session pipeline update/);
+    // A store grant may update only by the role-ARN cascade, which this plan does not show.
+    expect(() => check(plan({ ...briefCreates, "session-pipeline": "update", transcripts: "update" }, withBrief))).toThrow(/transcripts updates without the role-ARN cascade/);
+    expect(() => check(plan({ "session-brief-schedule": "create", "session-brief-permission": "update" }, withBrief))).toThrow(/mix creates and updates/);
+    for (const action of ["replace", "delete"]) expect(() => check(plan({ "session-brief-schedule": action }, withBrief))).toThrow(/forbidden action/);
+    expect(() => check(plan(briefCreates, [...all, "session-brief-schedule"]))).toThrow(/missing resource session-brief-permission/);
+    // Brief resources never come without the pipeline's.
+    expect(() => check(plan(briefCreates, [...store, ...SESSION_BRIEF_RESOURCES]))).toThrow(/missing resource session-pipeline/);
+    const withApi = [...withBrief, "session-read-api", "session-read-api-secret", "session-read-api-errors-alarm", "session-read-api-throttles-alarm"];
+    expect(() => check(plan({ ...briefCreates, "session-read-api": "update" }, withApi))).toThrow(/the read api may not change in the same plan/);
+    expect(check(plan(briefCreates, withApi))).toBe("session brief rollout");
   });
 });
 
@@ -288,6 +361,16 @@ describe("session pipeline: update with the role-ARN cascade", () => {
     // A subset of the grants (the rest noop) is the same cascade.
     const keyOnly = REAL.replace(/\[transcripts-key\] update\n[\s\S]*?(?=\n\[transcripts-key-alias\])/, "[transcripts-key] noop\n");
     expect(check(keyOnly)).toBe("session pipeline update");
+  });
+
+  it("brief rollout on the real cascade: the schedule's creates plus the #141-shaped pipeline update", () => {
+    const withBrief = (text: string, action = "create") => `${text.replace(/\n*$/, "")}\n[session-brief-schedule] ${action}\n[session-brief-permission] ${action}\n`;
+    expect(check(withBrief(REAL))).toBe("session brief rollout");
+    expect(check(withBrief(REAL), null)).toBe("session brief rollout");
+    // The cascade is still checked line by line inside the brief phase.
+    const other = edit(REAL, "session-pipeline-secret", "  +           AWS: (known after apply)", () => `  +           AWS: arn:aws:iam::${ACCOUNT}:role/someone-else`);
+    expect(() => check(withBrief(other))).toThrow(/session-pipeline-secret changes .*someone-else.* not only the role-ARN cascade/);
+    expect(() => check(withBrief(op(REAL, "trail", "update")))).toThrow(/must be noop or a session pipeline update/);
   });
 
   it("refuses a grant diff that adds or removes a statement or line", () => {

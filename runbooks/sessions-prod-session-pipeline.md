@@ -86,7 +86,8 @@ JSON:
 
 ```json
 { "hoopdb_url": "postgresql://<hoopdb runtime role>:<password>@<pooler host>:5432/postgres",
-  "clickhouse": { "url": "https://<host>:8443", "user": "search_ingest", "password": "…", "database": "relay_search" } }
+  "clickhouse": { "url": "https://<host>:8443", "user": "search_ingest", "password": "…", "database": "relay_search" },
+  "openai_api_key": "…" }
 ```
 
 - `hoopdb_url` is the same HoopDb runtime role the hoopdb-indexer uses (it
@@ -96,6 +97,8 @@ JSON:
   pinned Supabase root (`certs/supabase-prod-ca-2021.crt`).
 - `clickhouse` is the `clickhouse relay-search-prod ingest` item, the same
   credentials the Neon tail uses. Omit the block while `searchIndex` is off.
+- `openai_api_key` is the session brief model key (Session briefs, below).
+  Omit it while briefs are off. Without it a brief tick claims nothing.
 
 Set the value from 1Password with one prompt on kjg-lap. The value is never
 echoed, written to a file or put in argv. First check the item's field labels
@@ -143,8 +146,9 @@ rotation, force fresh reads with
    `aws lambda get-function-url-config --function-name 96bulls-aws-sessions-prod-session-pipeline`
    must fail with `ResourceNotFoundException`, and
    `aws lambda get-policy --function-name 96bulls-aws-sessions-prod-session-pipeline`
-   must show exactly two `lambda:InvokeFunction` statements: EventBridge
-   (the reconcile rule, this account) and the function's own role.
+   must show exactly three `lambda:InvokeFunction` statements: EventBridge
+   (the reconcile rule, this account), EventBridge (the brief rule, this
+   account) and the function's own role.
 7. **ClickHouse stage.** Two gates, both required:
    - **Live writes reach S3:** relayhistory-cloud #241 `WRITE_PATH=s3_first`.
      Until then S3 trails Neon by the exporter's 30-minute debounce, and
@@ -189,6 +193,57 @@ other change. The contract accepts it only as **session pipeline update**:
 - With the cascade, only `session-pipeline` and those five may change. A
   cascade together with any other change, or without `session-pipeline`
   updating, is refused.
+
+## Session briefs
+
+Briefs (src/session-brief) run inside the pipeline function, so they need no
+new principal on the bucket, key or secret. `transcriptStore.sessionPipeline.briefs`
+controls them:
+
+```json
+"briefs": { "enabled": true, "backgroundDailyBudget": 5000, "globalDailyCap": 20000 }
+```
+
+- `enabled: true` sets `SESSION_BRIEF_ENABLED=true` on the function, so indexing
+  arms a brief wakeup per session. It also sets the `session-brief-schedule`
+  rule (`96bulls-aws-sessions-prod-session-brief`, every minute, input
+  `{"brief":true}`) to `ENABLED`. Absent or `false`: the env says `false`, the
+  rule is `DISABLED`, and a stray `{"brief":true}` returns before init.
+- Each tick claims up to `SESSION_BRIEF_BATCH` (5) due wakeups under a lease
+  and briefs them one by one. Each model call has a 20 s timeout, which fits
+  well inside the function's 300 s. Ticks may overlap: claims use `SKIP LOCKED`.
+- The caps default to src/session-brief/config.ts (5,000 sessions per org per
+  UTC day, 20,000 model attempts across all orgs per UTC day, 30 per session).
+  Set them here so the budget sits in the reviewed inputs.
+- The model key is `openai_api_key` in the pipeline secret, never env or
+  inputs. It goes in with the rest of the value (Credentials). Generate it into
+  1Password first, then add `--arg key "$(op read "op://96Bulls-prod/<brief model item>/credential")"`
+  and `openai_api_key: $key` to the `jq -n` in the put command.
+- Historical sessions are not enqueued: `SESSION_BRIEF_SWEEP_SECONDS` stays 0.
+  A backfill needs its own approval and budget.
+
+**Turning them on (each step needs Khaliq's OK):**
+
+1. **Retire the catch-up loop** (STOP, no restart). Its `b47c1e6` projector
+   overwrites brief titles in `session_directory`
+   (docs/activation/supabase-upgrade-eff8b3be-to-5ed11913.md, U6a).
+2. **Ship the code off.** Capture and apply this code with `briefs` absent. The
+   contract accepts it only as **session brief rollout**: the two brief
+   resources are `create`, and the rest is all `noop` or exactly a session
+   pipeline update (above, role-ARN cascade included). The rule is created
+   `DISABLED`.
+3. **Secret.** Put the value with `openai_api_key` (above), then force fresh
+   reads (Credentials).
+4. **Enable.** Set `briefs.enabled: true` with the approved caps, then capture
+   and apply. It is accepted only as **session brief update**: the rule
+   updates, plus the function's env update and its cascade.
+5. **Verify.** Look for `session brief tick` log lines with `failed: 0`, and
+   for rows in `sessions.session_briefs`.
+
+**Off again:** set `briefs.enabled: false`, then capture and apply (a brief
+update). For an immediate stop, run
+`aws events disable-rule --name 96bulls-aws-sessions-prod-session-brief`.
+Then reconcile the inputs, since the next capture would show the drift.
 
 ## Repo tag rename (one time, before the read API rollout)
 
