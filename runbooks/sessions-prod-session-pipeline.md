@@ -159,10 +159,36 @@ rotation, force fresh reads with
    - Turn the Neon tail off (`SEARCH_INGEST_ENABLED` unset on the
      relayhistory Worker), so the two writers do not keep rewriting each
      other's rows.
-   - Set `searchIndex: true`, then capture (**session pipeline update**:
-     `session-pipeline` update only) and apply.
+   - Set `searchIndex: true`, then capture (**session pipeline update**,
+     below) and apply.
    - The first pass over each session rewrites its rows once (`s3`
      fingerprints). This is expected.
+
+## Updating the pipeline (code or settings)
+
+A change to the function's code or settings is captured and applied like any
+other change. The contract accepts it only as **session pipeline update**:
+
+- Pipeline resources are `update` or `noop`, and at least one is `update`.
+  The store resources other than `transcripts` and `transcripts-key` stay
+  `noop`. Nothing is created, replaced or deleted.
+- When `session-pipeline` updates, the plan re-computes the function's
+  `roleArn` as `(known after apply)`: Alchemy keeps the role's name stable,
+  not its ARN. The five resources whose policies name the role then show an
+  `update`: `session-events` (queue policy), `session-pipeline-secret`
+  (resource policy), `session-reconcile-continue` (permission principal),
+  `transcripts` (bucket policy) and `transcripts-key` (key policy). The role
+  and its ARN do not change.
+- Each of those five may differ only by that cascade. Every removed line must
+  equal the added line at the same position, except an `AWS:` or `principal:`
+  line where the removed value is the function's role ARN (read from the
+  capture's state snapshot) and the added value is `(known after apply)`.
+  Any other difference refuses the capture: an added or removed statement or
+  line, a changed `Action`, `Effect`, `Resource`, `Sid` or condition, or a
+  different ARN.
+- With the cascade, only `session-pipeline` and those five may change. A
+  cascade together with any other change, or without `session-pipeline`
+  updating, is refused.
 
 ## Rollback
 
