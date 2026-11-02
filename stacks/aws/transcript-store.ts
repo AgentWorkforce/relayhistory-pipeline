@@ -200,7 +200,8 @@ export type TranscriptStorePlanPhase =
   | "session pipeline rollout"
   | "session pipeline update"
   | "session read api rollout"
-  | "session read api update";
+  | "session read api update"
+  | "repo tag rename";
 
 /**
  * The read API's own phases (session-read-api.ts). It touches nothing else: no
@@ -355,6 +356,11 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   if (provenance.outputs.detailed.sha256 !== sha256(capture.detailedPlanText)) refuse("detailed plan does not match its provenance sha256");
   if (provenance.summary !== compact.summary) refuse("provenance summary does not match the plan summary");
 
+  // The repository rename re-tags the stack: judged on its own (assertRepoTagRenameDiff), before any other phase.
+  if (planTouchesRepoTag(capture.detailedPlanText)) {
+    assertRepoTagRenameDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
+    return "repo tag rename";
+  }
   // The read API changes alone; once it is all noop, the rest of the plan is judged as before.
   if (SESSION_READ_API_RESOURCES.some((r) => compact.operations.has(r))) {
     const readApiPhase = sessionReadApiPhase(compact.operations);
@@ -488,6 +494,111 @@ function pipelineRoleArnFromState(stateSnapshotText: string, refuse: (why: strin
   if ((fn.status !== "created" && fn.status !== "updated") || typeof fn.attr?.roleArn !== "string" || !fn.attr.roleArn)
     refuse("session pipeline update: session-pipeline is not created in state with a roleArn");
   return fn.attr!.roleArn as string;
+}
+
+/**
+ * The one accepted change of the stack-wide `96bulls:repo` tag: the repository rename to
+ * AgentWorkforce/sessions-pipeline (3f8494c). Hard-coded, so no later tag change rides through.
+ */
+export const REPO_TAG_RENAME = { from: "AgentWorkforce/96BullSessions", to: "AgentWorkforce/sessions-pipeline" } as const;
+const REPO_TAG_KEY = "96bulls:repo:";
+/** A changed (`  - ` / `  + `) line of the detailed plan whose key is the repo tag. */
+const REPO_TAG_DIFF_LINE = /^  [+-] \s*96bulls:repo:/;
+/** A repo tag line (without its diff marker): indentation, value. */
+const REPO_TAG_LINE = /^(\s*)96bulls:repo: (.*)$/;
+
+/** Whether any resource in the detailed plan changes, adds or removes the repo tag. */
+function planTouchesRepoTag(detailedPlanText: string): boolean {
+  return detailedPlanText.split(/\r?\n/).some((line) => REPO_TAG_DIFF_LINE.test(line));
+}
+
+/**
+ * The repo tag rename: every resource re-tagged `96bulls:repo` from REPO_TAG_RENAME.from to
+ * REPO_TAG_RENAME.to, and nothing else. The plan may only update in place (no create, so the read
+ * API rollout is its own, later capture). Each updated resource's detailed diff is read as runs of
+ * `  - ` lines followed by as many `  + ` lines; the i-th `-` line must equal the i-th `+` line,
+ * except:
+ *   - the repo tag pair, `<indent>96bulls:repo: <from>` to the same `<indent>96bulls:repo: <to>`,
+ *     exactly once per resource (a tag-less grant, session-reconcile-continue, may have none); and
+ *   - in ROLE_GRANT_RESOURCES only, and only while session-pipeline updates, the role-ARN cascade
+ *     pair (assertPipelineRoleCascadeDiff): `AWS:` / `principal:` <the function's role> to
+ *     `(known after apply)`, with the role read from the capture's state snapshot when it has one,
+ *     and one role ARN in the production account across the plan.
+ * session-pipeline itself may update only with "no declared property changes". Every other updated
+ * resource must show the tag pair (or, for a grant, the cascade).
+ */
+function assertRepoTagRenameDiff(
+  operations: ReadonlyMap<string, string>,
+  detailedPlanText: string,
+  stateSnapshotText: string | undefined,
+  refuse: (why: string) => never,
+) {
+  const why = (s: string): never => refuse(`repo tag rename: ${s}`);
+  const notUpdate = [...operations].filter(([, a]) => a !== "update" && a !== "noop").map(([r, a]) => `${r}:${a}`);
+  if (notUpdate.length) why(`only in-place updates may come with the rename, found ${notUpdate.join(", ")}; apply the rename alone first`);
+  const updated = [...operations].filter(([, a]) => a === "update").map(([r]) => r);
+  const lines = detailedPlanText.split(/\r?\n/);
+  const pipelineUpdates = operations.get("session-pipeline") === "update";
+  if (pipelineUpdates) {
+    const body = detailedBlock(lines, "session-pipeline").map((l) => l.trim()).filter(Boolean);
+    if (body.length !== 1 || body[0] !== "no declared property changes") why("session-pipeline may update only with no declared property changes");
+  }
+  let stateRole: string | undefined;
+  let renamed = 0;
+  const cascadeArns = new Set<string>();
+  for (const resource of updated) {
+    if (resource === "session-pipeline") continue;
+    const grant = (ROLE_GRANT_RESOURCES as readonly string[]).includes(resource);
+    const block = detailedBlock(lines, resource);
+    const diff = block.map((line) => /^  ([+-]) (.*)$/.exec(line));
+    let tags = 0;
+    let cascade = 0;
+    let at = 0;
+    while (at < block.length) {
+      if (!diff[at]) {
+        at++;
+        continue;
+      }
+      const runStart = at;
+      while (at < block.length && diff[at]?.[1] === "-") at++;
+      const plusStart = at;
+      while (at < block.length && diff[at]?.[1] === "+") at++;
+      const removed = diff.slice(runStart, plusStart).map((m) => m![2]!);
+      const added = diff.slice(plusStart, at).map((m) => m![2]!);
+      if (removed.length !== added.length || removed.length === 0)
+        why(`${resource} adds or removes lines (${removed.length} - / ${added.length} +), not only the tag rename`);
+      removed.forEach((was, n) => {
+        const now = added[n]!;
+        if (was === now) return;
+        const tag = REPO_TAG_LINE.exec(was);
+        if (tag) {
+          if (tag[2] !== REPO_TAG_RENAME.from || now !== `${tag[1]}${REPO_TAG_KEY} ${REPO_TAG_RENAME.to}`)
+            why(`${resource} changes ${JSON.stringify(was.trim())} to ${JSON.stringify(now.trim())}, not exactly ${REPO_TAG_RENAME.from} to ${REPO_TAG_RENAME.to}`);
+          tags++;
+          return;
+        }
+        const principal = ROLE_ARN_LINE.exec(was);
+        if (grant && pipelineUpdates && principal && now === principal[1] + KNOWN_AFTER_APPLY) {
+          if (stateSnapshotText !== undefined) stateRole ??= pipelineRoleArnFromState(stateSnapshotText, refuse);
+          if (stateRole !== undefined && principal[2] !== stateRole)
+            why(`${resource} replaces ${principal[2]}, which is not the session pipeline's role ${stateRole}`);
+          cascadeArns.add(principal[2]!);
+          cascade++;
+          return;
+        }
+        why(`${resource} changes ${JSON.stringify(was.trim())} to ${JSON.stringify(now.trim())}, not only the tag rename${grant ? " (and the role-ARN cascade)" : ""}`);
+      });
+    }
+    if (tags > 1) why(`${resource} renames the repo tag ${tags} times`);
+    renamed += tags;
+    if (tags === 0 && !(grant && cascade > 0)) why(`${resource} updates without the repo tag rename`);
+  }
+  const accountRole = new RegExp(`^arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/[A-Za-z0-9_+=,.@-]+$`);
+  if (cascadeArns.size > 1 || [...cascadeArns].some((arn) => !accountRole.test(arn)))
+    why(`the role-ARN cascade must replace one role ARN in ${TRANSCRIPT_ACCOUNT_ID}, found ${[...cascadeArns].join(", ")}`);
+  // Every changed repo tag line in the plan is one side of a pair checked above (none outside an updated resource).
+  const tagLines = lines.filter((line) => REPO_TAG_DIFF_LINE.test(line)).length;
+  if (renamed === 0 || tagLines !== 2 * renamed) why(`the plan changes ${tagLines} repo tag lines, but only ${renamed} resources rename the tag`);
 }
 
 const SRV_WRITER_KEY_SID = "SrvWriterEncryptsAndReadsViaS3";

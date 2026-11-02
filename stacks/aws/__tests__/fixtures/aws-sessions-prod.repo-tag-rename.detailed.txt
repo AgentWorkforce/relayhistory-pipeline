@@ -1,0 +1,1015 @@
+Plan · aws-sessions-prod
+Importing stack module
+Resolving stack services
+AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
+Loading stack state
+Computing plan
+Plan ready (5.5s)
+Plan: 20 to update
+
+[access-logs] update
+  properties:
+    bucketName: 96bulls-aws-sessions-prod-access-logs-941433935742
+    encryption:
+      blockedEncryptionTypes:
+        - SSE-C
+      sseAlgorithm: AES256
+    lifecycleRules:
+      - Expiration:
+          Days: 90
+        Filter:
+          Prefix: ""
+        ID: expire-access-logs
+        Status: Enabled
+      - Filter:
+          Prefix: ""
+        ID: expire-noncurrent-versions
+        NoncurrentVersionExpiration:
+          NoncurrentDays: 1
+        Status: Enabled
+      - AbortIncompleteMultipartUpload:
+          DaysAfterInitiation: 1
+        Filter:
+          Prefix: ""
+        ID: abort-incomplete-uploads
+        Status: Enabled
+    objectOwnership: BucketOwnerEnforced
+    policy:
+      - Action:
+          - s3:*
+        Condition:
+          Bool:
+            aws:SecureTransport: "false"
+        Effect: Deny
+        Principal: "*"
+        Resource:
+          - arn:aws:s3:::96bulls-aws-sessions-prod-access-logs-941433935742
+          - arn:aws:s3:::96bulls-aws-sessions-prod-access-logs-941433935742/*
+        Sid: DenyInsecureTransport
+      - Action:
+          - s3:PutObject
+        Condition:
+          ArnLike:
+            aws:SourceArn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+          StringEquals:
+            aws:SourceAccount: "941433935742"
+        Effect: Allow
+        Principal:
+          Service: logging.s3.amazonaws.com
+        Resource: arn:aws:s3:::96bulls-aws-sessions-prod-access-logs-941433935742/s3-access/transcripts/*
+        Sid: S3ServerAccessLogsFromTranscripts
+    publicAccessBlock:
+      blockPublicAcls: true
+      blockPublicPolicy: true
+      ignorePublicAcls: true
+      restrictPublicBuckets: true
+    tags:
+      96bulls:component: access-logs
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    versioning: Enabled
+
+[budget] noop
+
+[session-events] update
+  properties:
+    delay: 30 seconds
+    messageRetentionPeriod: 4 days
+    policy:
+  -     Statement:
+  -       - Action: sqs:*
+  -         Condition:
+  -           Bool:
+  -             aws:SecureTransport: "false"
+  -         Effect: Deny
+  -         Principal: "*"
+  -         Resource: arn:aws:sqs:us-east-1:941433935742:96bulls-aws-sessions-prod-session-events
+  -         Sid: DenyInsecureTransport
+  -       - Action: sqs:SendMessage
+  -         Condition:
+  -           ArnEquals:
+  -             aws:SourceArn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+  -           StringEquals:
+  -             aws:SourceAccount: "941433935742"
+  -         Effect: Allow
+  -         Principal:
+  -           Service: s3.amazonaws.com
+  -         Resource: arn:aws:sqs:us-east-1:941433935742:96bulls-aws-sessions-prod-session-events
+  -         Sid: TranscriptBucketEvents
+  -       - Action:
+  -           - sqs:ReceiveMessage
+  -           - sqs:DeleteMessage
+  -           - sqs:ChangeMessageVisibility
+  -           - sqs:GetQueueAttributes
+  -           - sqs:SendMessage
+  -         Effect: Allow
+  -         Principal:
+  -           AWS: arn:aws:iam::941433935742:role/96bulls-aws-session-pipeline-aws-sessions-prod-nsvhn3beskmuvvon
+  -         Resource: arn:aws:sqs:us-east-1:941433935742:96bulls-aws-sessions-prod-session-events
+  -         Sid: SessionPipelineConsumes
+  +     Statement:
+  +       - Action: sqs:*
+  +         Condition:
+  +           Bool:
+  +             aws:SecureTransport: "false"
+  +         Effect: Deny
+  +         Principal: "*"
+  +         Resource: arn:aws:sqs:us-east-1:941433935742:96bulls-aws-sessions-prod-session-events
+  +         Sid: DenyInsecureTransport
+  +       - Action: sqs:SendMessage
+  +         Condition:
+  +           ArnEquals:
+  +             aws:SourceArn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+  +           StringEquals:
+  +             aws:SourceAccount: "941433935742"
+  +         Effect: Allow
+  +         Principal:
+  +           Service: s3.amazonaws.com
+  +         Resource: arn:aws:sqs:us-east-1:941433935742:96bulls-aws-sessions-prod-session-events
+  +         Sid: TranscriptBucketEvents
+  +       - Action:
+  +           - sqs:ReceiveMessage
+  +           - sqs:DeleteMessage
+  +           - sqs:ChangeMessageVisibility
+  +           - sqs:GetQueueAttributes
+  +           - sqs:SendMessage
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: (known after apply)
+  +         Resource: arn:aws:sqs:us-east-1:941433935742:96bulls-aws-sessions-prod-session-events
+  +         Sid: SessionPipelineConsumes
+      Version: 2012-10-17
+    queueName: 96bulls-aws-sessions-prod-session-events
+    receiveMessageWaitTime: 20 seconds
+    redrivePolicy:
+      deadLetterTargetArn: arn:aws:sqs:us-east-1:941433935742:96bulls-aws-sessions-prod-session-events-dlq
+      maxReceiveCount: 8
+    sqsManagedSseEnabled: true
+    tags:
+      96bulls:component: session-pipeline
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    visibilityTimeout: 1800 seconds
+
+[session-events-age-alarm] update
+  properties:
+    ActionsEnabled: false
+    AlarmDescription: "Oldest session event is older than 15 minutes: the pipeline is behind or failing."
+    ComparisonOperator: GreaterThanThreshold
+    Dimensions:
+      - Name: QueueName
+        Value: 96bulls-aws-sessions-prod-session-events
+    EvaluationPeriods: 3
+    MetricName: ApproximateAgeOfOldestMessage
+    name: 96bulls-aws-sessions-prod-session-events-backlog-age
+    Namespace: AWS/SQS
+    Period: 300
+    Statistic: Maximum
+    tags:
+      96bulls:component: session-pipeline
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    Threshold: 900
+    TreatMissingData: notBreaching
+
+[session-events-dlq] update
+  properties:
+    messageRetentionPeriod: 14 days
+    policy:
+      Statement:
+        - Action: sqs:*
+          Condition:
+            Bool:
+              aws:SecureTransport: "false"
+          Effect: Deny
+          Principal: "*"
+          Resource: arn:aws:sqs:us-east-1:941433935742:96bulls-aws-sessions-prod-session-events-dlq
+          Sid: DenyInsecureTransport
+      Version: 2012-10-17
+    queueName: 96bulls-aws-sessions-prod-session-events-dlq
+    sqsManagedSseEnabled: true
+    tags:
+      96bulls:component: session-pipeline
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+
+[session-events-dlq-alarm] update
+  properties:
+    ActionsEnabled: false
+    AlarmDescription: Session pipeline messages exhausted their retries (runbooks/sessions-prod-session-pipeline.md, DLQ).
+    ComparisonOperator: GreaterThanThreshold
+    Dimensions:
+      - Name: QueueName
+        Value: 96bulls-aws-sessions-prod-session-events-dlq
+    EvaluationPeriods: 1
+    MetricName: ApproximateNumberOfMessagesVisible
+    name: 96bulls-aws-sessions-prod-session-events-dlq-not-empty
+    Namespace: AWS/SQS
+    Period: 300
+    Statistic: Maximum
+    tags:
+      96bulls:component: session-pipeline
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    Threshold: 0
+    TreatMissingData: notBreaching
+
+[session-events-mapping] update
+  properties:
+    batchSize: 10
+    enabled: true
+    eventSourceArn: arn:aws:sqs:us-east-1:941433935742:96bulls-aws-sessions-prod-session-events
+    functionName: 96bulls-aws-sessions-prod-session-pipeline
+    functionResponseTypes:
+      - ReportBatchItemFailures
+    maximumBatchingWindow: 20 seconds
+    scalingConfig:
+      MaximumConcurrency: 4
+    tags:
+      96bulls:component: session-pipeline
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+
+[session-pipeline] update
+  no declared property changes
+
+[session-pipeline-errors-alarm] update
+  properties:
+    ActionsEnabled: false
+    AlarmDescription: Session pipeline invocations are failing (init, timeouts, crashes).
+    ComparisonOperator: GreaterThanThreshold
+    Dimensions:
+      - Name: FunctionName
+        Value: 96bulls-aws-sessions-prod-session-pipeline
+    EvaluationPeriods: 3
+    MetricName: Errors
+    name: 96bulls-aws-sessions-prod-session-pipeline-errors
+    Namespace: AWS/Lambda
+    Period: 300
+    Statistic: Sum
+    tags:
+      96bulls:component: session-pipeline
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    Threshold: 0
+    TreatMissingData: notBreaching
+
+[session-pipeline-secret] update
+  properties:
+    description: "96bulls session pipeline: Supabase HoopDb URL and ClickHouse ingest credentials (JSON)"
+    name: 96bulls/aws-sessions-prod/session-pipeline
+    recoveryWindowInDays: 7
+    resourcePolicy:
+  -     Statement:
+  -       - Action: secretsmanager:GetSecretValue
+  -         Effect: Allow
+  -         Principal:
+  -           AWS: arn:aws:iam::941433935742:role/96bulls-aws-session-pipeline-aws-sessions-prod-nsvhn3beskmuvvon
+  -         Resource: "*"
+  -         Sid: SessionPipelineReads
+  +     Statement:
+  +       - Action: secretsmanager:GetSecretValue
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: (known after apply)
+  +         Resource: "*"
+  +         Sid: SessionPipelineReads
+      Version: 2012-10-17
+    tags:
+      96bulls:component: session-pipeline
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+
+[session-reconcile-continue] update
+  properties:
+    action: lambda:InvokeFunction
+    functionName: 96bulls-aws-sessions-prod-session-pipeline
+  -   principal: arn:aws:iam::941433935742:role/96bulls-aws-session-pipeline-aws-sessions-prod-nsvhn3beskmuvvon
+  +   principal: (known after apply)
+
+[session-reconcile-permission] noop
+
+[session-reconcile-schedule] update
+  properties:
+    description: "96bulls session pipeline: reconcile recent manifests (lost notifications)"
+    name: 96bulls-aws-sessions-prod-session-reconcile
+    scheduleExpression: rate(30 minutes)
+    tags:
+      96bulls:component: session-pipeline
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    targets:
+      - Arn: arn:aws:lambda:us-east-1:941433935742:function:96bulls-aws-sessions-prod-session-pipeline
+        Id: session-pipeline
+        Input: '{"reconcile":true}'
+
+[trail] update
+  properties:
+    advancedEventSelectors:
+      - fieldSelectors:
+          - equals:
+              - Management
+            field: eventCategory
+        name: management-events
+      - fieldSelectors:
+          - equals:
+              - Data
+            field: eventCategory
+          - equals:
+              - AWS::S3::Object
+            field: resources.type
+          - field: resources.ARN
+            startsWith:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/
+        name: transcript-object-events
+    enableLogFileValidation: true
+    isLogging: true
+    isMultiRegionTrail: true
+    kmsKeyId: arn:aws:kms:us-east-1:941433935742:key/196153b0-502f-40a0-a805-6edba0337b09
+    s3BucketName: 96bulls-aws-sessions-prod-trail-941433935742
+    tags:
+      96bulls:component: cloudtrail
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    trailName: 96bulls-aws-sessions-prod-trail
+
+[trail-key] update
+  properties:
+    deletionWindow: 30 days
+    description: "96bulls aws-sessions-prod: CloudTrail log files"
+    enableKeyRotation: true
+    policy: '{"Version":"2012-10-17","Statement":[{"Sid":"AccountAdministersKey","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::941433935742:root"},"Action":["kms:Create*","kms:Describe*","kms:Enable*","kms:List*","kms:Put*","kms:Update*","kms:Revoke*","kms:Disable*","kms:Get*","kms:Delete*","kms:TagResource","kms:UntagResource","kms:ScheduleKeyDeletion","kms:CancelKeyDeletion","kms:RotateKeyOnDemand"],"Resource":"*"},{"Sid":"CloudTrailEncryptsLogs","Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":["kms:GenerateDataKey*"],"Resource":"*","Condition":{"StringEquals":{"aws:SourceArn":"arn:aws:cloudtrail:us-east-1:941433935742:trail/96bulls-aws-sessions-prod-trail"},"StringLike":{"kms:EncryptionContext:aws:cloudtrail:arn":"arn:aws:cloudtrail:*:941433935742:trail/*"}}},{"Sid":"CloudTrailDescribesKey","Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":["kms:DescribeKey"],"Resource":"*","Condition":{"StringEquals":{"aws:SourceArn":"arn:aws:cloudtrail:us-east-1:941433935742:trail/96bulls-aws-sessions-prod-trail"}}}]}'
+    tags:
+      96bulls:component: cloudtrail
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+
+[trail-key-alias] noop
+
+[trail-logs] update
+  properties:
+    bucketName: 96bulls-aws-sessions-prod-trail-941433935742
+    encryption:
+      blockedEncryptionTypes:
+        - SSE-C
+      bucketKeyEnabled: true
+      kmsMasterKeyId: arn:aws:kms:us-east-1:941433935742:key/196153b0-502f-40a0-a805-6edba0337b09
+      sseAlgorithm: aws:kms
+    lifecycleRules:
+      - Expiration:
+          Days: 365
+        Filter:
+          Prefix: ""
+        ID: expire-trail-logs
+        Status: Enabled
+      - Filter:
+          Prefix: ""
+        ID: expire-noncurrent-versions
+        NoncurrentVersionExpiration:
+          NoncurrentDays: 30
+        Status: Enabled
+      - AbortIncompleteMultipartUpload:
+          DaysAfterInitiation: 7
+        Filter:
+          Prefix: ""
+        ID: abort-incomplete-uploads
+        Status: Enabled
+    objectOwnership: BucketOwnerEnforced
+    policy:
+      - Action:
+          - s3:*
+        Condition:
+          Bool:
+            aws:SecureTransport: "false"
+        Effect: Deny
+        Principal: "*"
+        Resource:
+          - arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742
+          - arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742/*
+        Sid: DenyInsecureTransport
+      - Action:
+          - s3:GetBucketAcl
+        Condition:
+          StringEquals:
+            aws:SourceAccount: "941433935742"
+            aws:SourceArn: arn:aws:cloudtrail:us-east-1:941433935742:trail/96bulls-aws-sessions-prod-trail
+        Effect: Allow
+        Principal:
+          Service: cloudtrail.amazonaws.com
+        Resource: arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742
+        Sid: AWSCloudTrailAclCheck
+      - Action:
+          - s3:PutObject
+        Condition:
+          StringEquals:
+            aws:SourceAccount: "941433935742"
+            aws:SourceArn: arn:aws:cloudtrail:us-east-1:941433935742:trail/96bulls-aws-sessions-prod-trail
+            s3:x-amz-acl: bucket-owner-full-control
+        Effect: Allow
+        Principal:
+          Service: cloudtrail.amazonaws.com
+        Resource: arn:aws:s3:::96bulls-aws-sessions-prod-trail-941433935742/AWSLogs/941433935742/*
+        Sid: AWSCloudTrailWrite
+    publicAccessBlock:
+      blockPublicAcls: true
+      blockPublicPolicy: true
+      ignorePublicAcls: true
+      restrictPublicBuckets: true
+    tags:
+      96bulls:component: cloudtrail
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    versioning: Enabled
+
+[transcript-eraser] update
+  properties:
+    inlinePolicies:
+      transcripts:
+        Statement:
+          - Action:
+              - s3:ListBucket
+              - s3:ListBucketVersions
+            Condition:
+              StringLike:
+                s3:prefix:
+                  - 96bulls/*
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+            Sid: ListVersionsUnderPrefix
+          - Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+            Sid: DeleteEveryVersion
+          - Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:PutBucketPolicy
+              - s3:PutLifecycleConfiguration
+              - s3:PutBucketVersioning
+              - s3:DeleteBucket
+            Effect: Deny
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+            Sid: NoContentNoWrites
+        Version: 2012-10-17
+    path: /96bulls/
+    tags:
+      96bulls:component: iam
+      96bulls:purpose: erasure-job-deletes-versions
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    userName: 96bulls-aws-sessions-prod-transcript-eraser
+
+[transcript-reader] update
+  properties:
+    inlinePolicies:
+      transcripts:
+        Statement:
+          - Action:
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+            Sid: ListForMissingKeySemantics
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/*
+            Sid: ReadSessionObjects
+          - Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:GetObjectVersion
+              - s3:ListBucketVersions
+              - s3:PutBucketPolicy
+              - s3:DeleteBucketPolicy
+              - s3:PutLifecycleConfiguration
+              - s3:PutEncryptionConfiguration
+              - s3:PutBucketVersioning
+              - s3:PutObjectAcl
+              - s3:PutBucketAcl
+              - s3:DeleteBucket
+              - s3:PutObject
+            Effect: Deny
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+            Sid: NoDeleteNoHistoryNoAdmin
+        Version: 2012-10-17
+    path: /96bulls/
+    tags:
+      96bulls:component: iam
+      96bulls:purpose: history-indexer-reads-transcripts
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    userName: 96bulls-aws-sessions-prod-transcript-reader
+
+[transcript-srv-writer] update
+  properties:
+    inlinePolicies:
+      transcripts:
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/ws=*/m=srv_*
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/live-sessions/*
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/live-batches/*
+            Sid: ReadLiveObjects
+          - Action:
+              - s3:PutObject
+            Condition:
+              StringEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+              StringLike:
+                s3:x-amz-server-side-encryption-aws-kms-key-id: arn:aws:kms:us-east-1:941433935742:key/*
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/ws=*/m=srv_*
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/live-sessions/*
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/live-batches/*
+            Sid: WriteLiveObjectsSseKmsOnly
+          - Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Condition:
+              ForAnyValue:StringEquals:
+                kms:ResourceAliases: alias/96bulls-aws-sessions-prod-transcripts
+              StringEquals:
+                kms:ViaService: s3.us-east-1.amazonaws.com
+            Effect: Allow
+            Resource:
+              - arn:aws:kms:us-east-1:941433935742:key/*
+            Sid: UseTranscriptKeyViaS3
+          - Action:
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+            Sid: ListForMissingKeySemantics
+          - Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:GetObjectVersion
+              - s3:ListBucketVersions
+              - s3:PutBucketPolicy
+              - s3:DeleteBucketPolicy
+              - s3:PutLifecycleConfiguration
+              - s3:PutEncryptionConfiguration
+              - s3:PutBucketVersioning
+              - s3:PutObjectAcl
+              - s3:PutBucketAcl
+              - s3:DeleteBucket
+            Effect: Deny
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+            Sid: NoDeleteNoHistoryNoAdmin
+        Version: 2012-10-17
+    path: /96bulls/
+    tags:
+      96bulls:component: iam
+      96bulls:purpose: relayhistory-api-worker-writes-live-transcripts
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    userName: 96bulls-aws-sessions-prod-transcript-srv-writer
+
+[transcript-writer] update
+  properties:
+    inlinePolicies:
+      transcripts:
+        Statement:
+          - Action:
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+            Sid: ListForMissingKeySemantics
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/*
+            Sid: ReadSessionObjects
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/*/raw/*
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/*/manifest.json
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/*/summary/*
+            Sid: WriteRawChunksManifestsSummaries
+          - Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:GetObjectVersion
+              - s3:ListBucketVersions
+              - s3:PutBucketPolicy
+              - s3:DeleteBucketPolicy
+              - s3:PutLifecycleConfiguration
+              - s3:PutEncryptionConfiguration
+              - s3:PutBucketVersioning
+              - s3:PutObjectAcl
+              - s3:PutBucketAcl
+              - s3:DeleteBucket
+            Effect: Deny
+            Resource:
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+              - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+            Sid: NoDeleteNoHistoryNoAdmin
+        Version: 2012-10-17
+    path: /96bulls/
+    tags:
+      96bulls:component: iam
+      96bulls:purpose: relayhistory-worker-writes-transcripts
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    userName: 96bulls-aws-sessions-prod-transcript-writer
+
+[transcripts] update
+  properties:
+    bucketName: 96bulls-aws-sessions-prod-transcripts-941433935742
+    encryption:
+      blockedEncryptionTypes:
+        - SSE-C
+      bucketKeyEnabled: false
+      kmsMasterKeyId: arn:aws:kms:us-east-1:941433935742:key/c74376a5-f6ff-4ef0-9a26-543c940094ba
+      sseAlgorithm: aws:kms
+    lifecycleRules:
+      - Filter:
+          Prefix: ""
+        ID: expire-noncurrent-versions
+        NoncurrentVersionExpiration:
+          NoncurrentDays: 1
+        Status: Enabled
+      - Expiration:
+          ExpiredObjectDeleteMarker: true
+        Filter:
+          Prefix: ""
+        ID: remove-expired-delete-markers
+        Status: Enabled
+      - AbortIncompleteMultipartUpload:
+          DaysAfterInitiation: 1
+        Filter:
+          Prefix: ""
+        ID: abort-incomplete-uploads
+        Status: Enabled
+    logging:
+      targetBucket: 96bulls-aws-sessions-prod-access-logs-941433935742
+      targetObjectKeyFormat:
+        PartitionedPrefix:
+          PartitionDateSource: EventTime
+      targetPrefix: s3-access/transcripts/
+    objectLockEnabled: false
+    objectOwnership: BucketOwnerEnforced
+  -   policy:
+  -     - Action:
+  -         - s3:*
+  -       Condition:
+  -         Bool:
+  -           aws:SecureTransport: "false"
+  -       Effect: Deny
+  -       Principal: "*"
+  -       Resource:
+  -         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+  -         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+  -       Sid: DenyInsecureTransport
+  -     - Action:
+  -         - s3:*
+  -       Condition:
+  -         NumericLessThan:
+  -           s3:TlsVersion: "1.2"
+  -       Effect: Deny
+  -       Principal: "*"
+  -       Resource:
+  -         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+  -         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+  -       Sid: DenyTlsBelow12
+  -     - Action:
+  -         - s3:DeleteObject
+  -         - s3:DeleteObjectVersion
+  -       Condition:
+  -         ArnNotEquals:
+  -           aws:PrincipalArn: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-eraser
+  -       Effect: Deny
+  -       Principal: "*"
+  -       Resource:
+  -         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+  -       Sid: OnlyTheEraserDeletes
+  -     - Action:
+  -         - s3:PutObject
+  -       Condition:
+  -         "Null":
+  -           s3:x-amz-server-side-encryption: "false"
+  -         StringNotEquals:
+  -           s3:x-amz-server-side-encryption: aws:kms
+  -       Effect: Deny
+  -       Principal: "*"
+  -       Resource:
+  -         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+  -       Sid: DenyOtherEncryption
+  -     - Action:
+  -         - s3:PutObject
+  -       Condition:
+  -         "Null":
+  -           s3:x-amz-server-side-encryption: "false"
+  -         StringNotEqualsIfExists:
+  -           s3:x-amz-server-side-encryption-aws-kms-key-id: arn:aws:kms:us-east-1:941433935742:key/c74376a5-f6ff-4ef0-9a26-543c940094ba
+  -       Effect: Deny
+  -       Principal: "*"
+  -       Resource:
+  -         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+  -       Sid: SseHeaderMustNameThisKey
+  -     - Action:
+  -         - s3:ListBucket
+  -       Effect: Allow
+  -       Principal:
+  -         AWS: arn:aws:iam::941433935742:role/96bulls-aws-session-pipeline-aws-sessions-prod-nsvhn3beskmuvvon
+  -       Resource:
+  -         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+  -       Sid: SessionPipelineLists
+  -     - Action:
+  -         - s3:GetObject
+  -       Effect: Allow
+  -       Principal:
+  -         AWS: arn:aws:iam::941433935742:role/96bulls-aws-session-pipeline-aws-sessions-prod-nsvhn3beskmuvvon
+  -       Resource:
+  -         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/*
+  -       Sid: SessionPipelineReads
+  +   policy:
+  +     - Action:
+  +         - s3:*
+  +       Condition:
+  +         Bool:
+  +           aws:SecureTransport: "false"
+  +       Effect: Deny
+  +       Principal: "*"
+  +       Resource:
+  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+  +       Sid: DenyInsecureTransport
+  +     - Action:
+  +         - s3:*
+  +       Condition:
+  +         NumericLessThan:
+  +           s3:TlsVersion: "1.2"
+  +       Effect: Deny
+  +       Principal: "*"
+  +       Resource:
+  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+  +       Sid: DenyTlsBelow12
+  +     - Action:
+  +         - s3:DeleteObject
+  +         - s3:DeleteObjectVersion
+  +       Condition:
+  +         ArnNotEquals:
+  +           aws:PrincipalArn: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-eraser
+  +       Effect: Deny
+  +       Principal: "*"
+  +       Resource:
+  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+  +       Sid: OnlyTheEraserDeletes
+  +     - Action:
+  +         - s3:PutObject
+  +       Condition:
+  +         "Null":
+  +           s3:x-amz-server-side-encryption: "false"
+  +         StringNotEquals:
+  +           s3:x-amz-server-side-encryption: aws:kms
+  +       Effect: Deny
+  +       Principal: "*"
+  +       Resource:
+  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+  +       Sid: DenyOtherEncryption
+  +     - Action:
+  +         - s3:PutObject
+  +       Condition:
+  +         "Null":
+  +           s3:x-amz-server-side-encryption: "false"
+  +         StringNotEqualsIfExists:
+  +           s3:x-amz-server-side-encryption-aws-kms-key-id: arn:aws:kms:us-east-1:941433935742:key/c74376a5-f6ff-4ef0-9a26-543c940094ba
+  +       Effect: Deny
+  +       Principal: "*"
+  +       Resource:
+  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*
+  +       Sid: SseHeaderMustNameThisKey
+  +     - Action:
+  +         - s3:ListBucket
+  +       Effect: Allow
+  +       Principal:
+  +         AWS: (known after apply)
+  +       Resource:
+  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742
+  +       Sid: SessionPipelineLists
+  +     - Action:
+  +         - s3:GetObject
+  +       Effect: Allow
+  +       Principal:
+  +         AWS: (known after apply)
+  +       Resource:
+  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/*
+  +       Sid: SessionPipelineReads
+    publicAccessBlock:
+      blockPublicAcls: true
+      blockPublicPolicy: true
+      ignorePublicAcls: true
+      restrictPublicBuckets: true
+    tags:
+      96bulls:component: transcripts
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+    versioning: Enabled
+
+[transcripts-key] update
+  properties:
+    deletionWindow: 30 days
+    description: "96bulls aws-sessions-prod: transcript objects (SSE-KMS, per-object data keys)"
+    enableKeyRotation: true
+    policy:
+  -     Statement:
+  -       - Action:
+  -           - kms:Create*
+  -           - kms:Describe*
+  -           - kms:Enable*
+  -           - kms:List*
+  -           - kms:Put*
+  -           - kms:Update*
+  -           - kms:Revoke*
+  -           - kms:Disable*
+  -           - kms:Get*
+  -           - kms:Delete*
+  -           - kms:TagResource
+  -           - kms:UntagResource
+  -           - kms:ScheduleKeyDeletion
+  -           - kms:CancelKeyDeletion
+  -           - kms:RotateKeyOnDemand
+  -         Effect: Allow
+  -         Principal:
+  -           AWS: arn:aws:iam::941433935742:root
+  -         Resource: "*"
+  -         Sid: AccountAdministersKey
+  -       - Action:
+  -           - kms:GenerateDataKey
+  -           - kms:Decrypt
+  -         Condition:
+  -           StringEquals:
+  -             kms:CallerAccount: "941433935742"
+  -             kms:ViaService: s3.us-east-1.amazonaws.com
+  -           StringLike:
+  -             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  -         Effect: Allow
+  -         Principal:
+  -           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-writer
+  -         Resource: "*"
+  -         Sid: WriterEncryptsAndReadsViaS3
+  -       - Action:
+  -           - kms:GenerateDataKey
+  -           - kms:Decrypt
+  -         Condition:
+  -           StringEquals:
+  -             kms:CallerAccount: "941433935742"
+  -             kms:ViaService: s3.us-east-1.amazonaws.com
+  -           StringLike:
+  -             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  -         Effect: Allow
+  -         Principal:
+  -           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-srv-writer
+  -         Resource: "*"
+  -         Sid: SrvWriterEncryptsAndReadsViaS3
+  -       - Action:
+  -           - kms:Decrypt
+  -         Condition:
+  -           StringEquals:
+  -             kms:CallerAccount: "941433935742"
+  -             kms:ViaService: s3.us-east-1.amazonaws.com
+  -           StringLike:
+  -             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  -         Effect: Allow
+  -         Principal:
+  -           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-reader
+  -         Resource: "*"
+  -         Sid: ReaderDecryptsViaS3
+  -       - Action:
+  -           - kms:Decrypt
+  -         Condition:
+  -           StringEquals:
+  -             kms:CallerAccount: "941433935742"
+  -             kms:ViaService: s3.us-east-1.amazonaws.com
+  -           StringLike:
+  -             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  -         Effect: Allow
+  -         Principal:
+  -           AWS: arn:aws:iam::941433935742:role/96bulls-aws-session-pipeline-aws-sessions-prod-nsvhn3beskmuvvon
+  -         Resource: "*"
+  -         Sid: SessionPipelineDecryptsViaS3
+  +     Statement:
+  +       - Action:
+  +           - kms:Create*
+  +           - kms:Describe*
+  +           - kms:Enable*
+  +           - kms:List*
+  +           - kms:Put*
+  +           - kms:Update*
+  +           - kms:Revoke*
+  +           - kms:Disable*
+  +           - kms:Get*
+  +           - kms:Delete*
+  +           - kms:TagResource
+  +           - kms:UntagResource
+  +           - kms:ScheduleKeyDeletion
+  +           - kms:CancelKeyDeletion
+  +           - kms:RotateKeyOnDemand
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: arn:aws:iam::941433935742:root
+  +         Resource: "*"
+  +         Sid: AccountAdministersKey
+  +       - Action:
+  +           - kms:GenerateDataKey
+  +           - kms:Decrypt
+  +         Condition:
+  +           StringEquals:
+  +             kms:CallerAccount: "941433935742"
+  +             kms:ViaService: s3.us-east-1.amazonaws.com
+  +           StringLike:
+  +             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-writer
+  +         Resource: "*"
+  +         Sid: WriterEncryptsAndReadsViaS3
+  +       - Action:
+  +           - kms:GenerateDataKey
+  +           - kms:Decrypt
+  +         Condition:
+  +           StringEquals:
+  +             kms:CallerAccount: "941433935742"
+  +             kms:ViaService: s3.us-east-1.amazonaws.com
+  +           StringLike:
+  +             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-srv-writer
+  +         Resource: "*"
+  +         Sid: SrvWriterEncryptsAndReadsViaS3
+  +       - Action:
+  +           - kms:Decrypt
+  +         Condition:
+  +           StringEquals:
+  +             kms:CallerAccount: "941433935742"
+  +             kms:ViaService: s3.us-east-1.amazonaws.com
+  +           StringLike:
+  +             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-reader
+  +         Resource: "*"
+  +         Sid: ReaderDecryptsViaS3
+  +       - Action:
+  +           - kms:Decrypt
+  +         Condition:
+  +           StringEquals:
+  +             kms:CallerAccount: "941433935742"
+  +             kms:ViaService: s3.us-east-1.amazonaws.com
+  +           StringLike:
+  +             kms:EncryptionContext:aws:s3:arn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*
+  +         Effect: Allow
+  +         Principal:
+  +           AWS: (known after apply)
+  +         Resource: "*"
+  +         Sid: SessionPipelineDecryptsViaS3
+      Version: 2012-10-17
+    tags:
+      96bulls:audit-trail: 96bulls-aws-sessions-prod-trail
+      96bulls:component: kms
+  -     96bulls:repo: AgentWorkforce/96BullSessions
+  +     96bulls:repo: AgentWorkforce/sessions-pipeline
+      96bulls:stack: aws-sessions-prod
+
+[transcripts-key-alias] noop
