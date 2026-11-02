@@ -1,6 +1,6 @@
 -- The session ingest's Supabase login (src/session-ingest/ledger-sql.ts).
 --
--- The ingest (POST /v1/delivery/batches in AWS) keeps its idempotency, revision
+-- The ingest (POST /v1/delivery/batches, the session ingest Worker) keeps its idempotency, revision
 -- and deletion-fence ledger in Supabase. It reaches that ledger only through two
 -- SECURITY DEFINER functions (plus the slot pair), so this role may call those and nothing else: no
 -- table, no other function, no writes of its own.

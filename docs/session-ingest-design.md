@@ -66,7 +66,7 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
     - `exclude`: a per-org instant rollback.
     - `mode: "off"`: rollback for everyone.
   - **Forwarding:** a routed batch is handed byte for byte over the `DELIVERY_INGEST` service binding. The verified identity goes in `x-relay-ingest-identity`; **the bearer is never sent.** The ingest's status, body and `Retry-After` come back unchanged.
-  - **Ingest unreachable:** today's path runs on the same buffered bytes. Both paths are idempotent by digest and write the same manifests.
+  - **Ingest unreachable** (the binding throws or times out): by default a retryable 503, so the ingest stays the only writer for a routed org and the retry replays. `onUnreachable: "local"` (an emergency choice) runs today's path on the same bytes; reseed the org afterwards.
 - **The ingest Worker** (`src/session-ingest/worker.ts`, stack `stacks/cloudflare/session-ingest.ts`, stage `cf-sessions-prod`):
   - `nodejs_compat` with smart placement, which runs it near S3 and Supabase in us-east-1.
   - **Private:** `workersDev: false`, `routes: []`, `domain: null`. Pure functions, tests and mutations enforce this. The binding is its only way in, so the identity header is trusted.
@@ -205,7 +205,6 @@ Migration `supabase/migrations/20261102010000_session_ingest_ledger.sql`. The ro
 
 1. relayhistory-cloud: tombstone and reset dual-write to Supabase. The replica consumer changes are done in #265.
 2. 96BullSessions:
-   - the seed tool driving `ingest_seed_records` (read-only on Neon, per org);
    - the erasure job consuming `upload_erasure_rearm` and covering `live-batches/**.staged.*`;
    - a lifecycle rule for staged objects.
 3. relay-desktop: drain an existing quarantine without regenerating, and stop regenerating on auto-include. Neither is needed for the cutover.

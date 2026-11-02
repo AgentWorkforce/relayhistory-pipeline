@@ -1,6 +1,6 @@
 -- The session ingest's ledger (src/session-ingest/ledger.ts): what relayhistory's
 -- `accept_delivery_batch` decided in Neon that is not transcript content, so the
--- 96Bulls ingest (POST /v1/delivery/batches in AWS) needs no Neon. Code only:
+-- 96Bulls ingest (POST /v1/delivery/batches, a Cloudflare Worker) needs no Neon. Code only:
 -- applying it to a real database needs Khaliq's explicit OK.
 --
 -- Tables (no transcript content anywhere: ids, revisions, digests, times):
