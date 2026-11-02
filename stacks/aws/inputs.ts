@@ -57,7 +57,8 @@ export interface AwsInputs {
   /**
    * Read-only cross-account pull from this stage's `96bulls-services` ECR
    * repository (ecrPullPolicy). Each entry is a 12-digit account id that gets
-   * BatchGetImage, GetDownloadUrlForLayer and BatchCheckLayerAvailability, and
+   * BatchGetImage, GetDownloadUrlForLayer, BatchCheckLayerAvailability and
+   * DescribeImages (read-only image metadata: the pulling stage's image check), and
    * nothing else. Omit or [] for no repository policy at all. Alchemy removes
    * a repository policy the inputs do not declare, so a live grant must be
    * listed here before the next `up`.
@@ -187,7 +188,8 @@ export function assertPippenProofSandbox(stage: string, inputs: Pick<AwsInputs, 
 export const PRODUCTION_ACCOUNT_ID = "941433935742";
 /** The Pippen sandbox proof account's grant keeps the Sid Khaliq approved and applied (2026-11-01). */
 const PULL_SIDS: Readonly<Record<string, string>> = Object.freeze({ [PIPPEN_PROOF_SANDBOX.accountId]: "PippenSandboxAwsProofPull" });
-export const ECR_PULL_ACTIONS = Object.freeze(["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"] as const);
+/** Pull, plus ecr:DescribeImages: the pulling stage's preflight (preflight.ts verifyServicesImage) reads the pinned digest's tags. */
+export const ECR_PULL_ACTIONS = Object.freeze(["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability", "ecr:DescribeImages"] as const);
 
 /**
  * The services repository policy for `ecr.pullAccounts`, as the exact JSON

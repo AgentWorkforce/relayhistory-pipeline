@@ -83,7 +83,9 @@ copy stays private for kind and self-host tests.
 policy on its `96bulls-services` repository (`stacks/aws/inputs.ts`
 `ecrPullPolicy`). Each entry is a 12-digit account id. It gets one statement,
 principal `arn:aws:iam::<id>:root`, with exactly `ecr:BatchGetImage`,
-`ecr:GetDownloadUrlForLayer` and `ecr:BatchCheckLayerAvailability`. The
+`ecr:GetDownloadUrlForLayer`, `ecr:BatchCheckLayerAvailability` and
+`ecr:DescribeImages` (read-only image metadata: the pulling stage's image
+check, `verifyServicesImage`, reads the pinned digest's tags). The
 Pippen sandbox `361835732085` gets the Sid `PippenSandboxAwsProofPull`; any
 other account gets `CrossAccountPull<id>`. The stage refuses an entry that is
 not a 12-digit id (no wildcards or ARNs), a duplicate, its own account, the
@@ -93,7 +95,9 @@ is the behavior before this input existed.
 
 Alchemy removes a repository policy the inputs do not declare. Khaliq approved
 read-only pull for the Pippen sandbox on 2026-11-01 ("give my OK"), and the
-policy was applied live to the sessions-dev repository. So **before the next
+three-action pull policy was applied live to the sessions-dev repository; the
+four-action policy (with `ecr:DescribeImages`) is applied live after this
+change merges. So **before the next
 `bin/96bulls up aws-sessions-dev`, its inputs must carry**:
 
 ```json
@@ -642,11 +646,10 @@ and the tooling release, then `pippen sandbox up aws-proof` and the flow
 above. Before that the deploy is denied at the first CloudTrail, WAF, ACM,
 ECR or Budgets call.
 
-Still open before the first deploy: the stack's image preflight runs
-`ecr describe-images` against the sessions-dev repository, whose approved
-repository policy grants `361835732085` pull only (no `ecr:DescribeImages`),
-so the preflight is denied until that policy (an aws-sessions-dev change,
-Khaliq's approval) also allows `ecr:DescribeImages`.
+The stack's image preflight runs `ecr describe-images` against the
+sessions-dev repository, so `ecr.pullAccounts` grants `ecr:DescribeImages` as
+well as pull. Until the four-action policy is applied live to that repository
+(after merge), the preflight is denied.
 
 ### Apply, verify and roll back
 
