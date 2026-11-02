@@ -32,7 +32,11 @@ BEGIN
   END IF;
 END
 $role$;
-ALTER ROLE bulls96_read_api LOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+-- Supabase's postgres is not a superuser, and PostgreSQL 16+ lets only a superuser name SUPERUSER or
+-- REPLICATION in ALTER ROLE, even as NOSUPERUSER/NOREPLICATION (and BYPASSRLS needs BYPASSRLS). CREATE ROLE above
+-- sets the safe attributes; here only LOGIN NOINHERIT are re-asserted, and session_read_api_role_verify.sql fails
+-- if an existing role has SUPERUSER, CREATEDB, CREATEROLE, REPLICATION, BYPASSRLS or INHERIT.
+ALTER ROLE bulls96_read_api LOGIN NOINHERIT;
 ALTER ROLE bulls96_read_api SET statement_timeout = '2s';
 ALTER ROLE bulls96_read_api SET default_transaction_read_only = on;
 
