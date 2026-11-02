@@ -630,7 +630,9 @@ proof stages) and changes only what the pippen agent-session boundary and
   EBS volumes (StorageClass `tagSpecification_1`) that Auto Mode creates
   from Kubernetes objects. EC2 instances Auto Mode launches are untagged and
   terminated by EKS with the cluster;
-- the S3 buckets are named `pippen-sbx-96bulls-aws-proof-sandbox-{locker,trail,alb-logs}-361835732085`:
+- the S3 buckets are named `pippen-sbx-96bulls-aws-proof-sandbox-{locker,trail,alb-logs}-361835732085`
+  (and the proof's HoopDb backup bucket `pippen-sbx-96bulls-aws-proof-sandbox-backups-361835732085`;
+  every one is a valid S3 name, tested):
   `pippen-sweeper` may delete only `pippen-sbx-*` buckets (S3 deletes cannot be
   tag-conditioned);
 - no GitHub OIDC provider or deployer role (unchanged).

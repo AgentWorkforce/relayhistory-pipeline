@@ -49,7 +49,7 @@ describe("pippen sandbox target: the constants are exact", () => {
     expect(SBX.callerRolePrefix).toBe("arn:aws:sts::361835732085:assumed-role/agent-session/");
     expect(SANDBOX_CONTEXT).toBe("arn:aws:eks:us-west-2:361835732085:cluster/96bulls-aws-proof-sandbox");
     expect(SANDBOX_LOCKER_BUCKET).toBe("pippen-sbx-96bulls-aws-proof-sandbox-locker-361835732085");
-    expect(SANDBOX_BACKUP_BUCKET).toBe("pippen-sbx-96bulls-aws-proof-sandbox-hoopdb-backups-361835732085");
+    expect(SANDBOX_BACKUP_BUCKET).toBe("pippen-sbx-96bulls-aws-proof-sandbox-backups-361835732085");
     expect(SBX.sweepTags).toEqual([{ key: "alchemy::stage", value: "aws-proof-sandbox" }, { key: "pippen:sandbox", value: "true" }]);
     expect(SBX.residueExemptArns).toEqual(["arn:aws:iam::361835732085:role/pippen/agent-session"]);
     expect(Object.isFrozen(SBX) && Object.isFrozen(SESSIONS_DEV_PROOF_TARGET) && Object.isFrozen(PROOF_TARGETS)).toBe(true);

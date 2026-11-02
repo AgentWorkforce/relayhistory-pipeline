@@ -44,7 +44,8 @@ export const SANDBOX_NAME_PREFIX = `96bulls-${SANDBOX_STAGE}-`;
  */
 export const SANDBOX_BUCKET_PREFIX = "pippen-sbx-";
 export const SANDBOX_LOCKER_BUCKET = `${SANDBOX_BUCKET_PREFIX}${SANDBOX_NAME_PREFIX}locker-${SANDBOX_ACCOUNT_ID}`;
-export const SANDBOX_BACKUP_BUCKET = `${SANDBOX_BUCKET_PREFIX}${SANDBOX_NAME_PREFIX}hoopdb-backups-${SANDBOX_ACCOUNT_ID}`;
+// `backups`, not `hoopdb-backups`: with the prefix that name is 64 characters, over S3's 63.
+export const SANDBOX_BACKUP_BUCKET = `${SANDBOX_BUCKET_PREFIX}${SANDBOX_NAME_PREFIX}backups-${SANDBOX_ACCOUNT_ID}`;
 export const PROOF_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
 export const PROOF_CHART_HOST = "agentworkforce.github.io";
 

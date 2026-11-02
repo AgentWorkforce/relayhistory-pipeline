@@ -88,6 +88,25 @@ describe("pippen sandbox: what the stage changes", () => {
     expect(() => stageBucketName("aws-proof-sandbox-with-a-much-longer-stage-name", "alb-logs", "361835732085", true)).toThrow(/63 characters/);
   });
 
+  it("EVERY bucket name the sandbox stage and its proof render is a valid S3 name starting pippen-sbx-", () => {
+    // S3 general purpose bucket naming: 3-63 chars, lowercase letters, digits, hyphens and dots, alphanumeric at both ends.
+    const valid = (b: string) => b.length >= 3 && b.length <= 63 && /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(b) && !b.includes("..") && !/^\d+\.\d+\.\d+\.\d+$/.test(b);
+    const stack = ["locker", "trail", "alb-logs"].map((b) => stageBucketName("aws-proof-sandbox", b, "361835732085", true));
+    const all = [...stack, SANDBOX_LOCKER_BUCKET, SANDBOX_BACKUP_BUCKET];
+    for (const b of all) {
+      expect(valid(b), `${b} (${b.length} chars)`).toBe(true);
+      expect(b.startsWith(PIPPEN_BUCKET_PREFIX), b).toBe(true);
+    }
+    expect(new Set(all).size).toBe(4); // locker shared by stack and harness; the rest unique
+    expect(SANDBOX_BACKUP_BUCKET).toBe("pippen-sbx-96bulls-aws-proof-sandbox-backups-361835732085");
+    // The bucket names the stack builds are exactly stageBucketName's (every bucketName in the stack goes through it).
+    for (const f of ["alchemy.aws.run.ts", "ingress.ts", "eks.ts"]) {
+      for (const m of src(f).matchAll(/bucketName: ([^,\n]+)/g)) expect(["lockerBucketName", "trailBucketName", "logBucketName"], `${f}: ${m[1]}`).toContain(m[1]!.trim());
+    }
+    // The old name really was invalid (regression).
+    expect(valid("pippen-sbx-96bulls-aws-proof-sandbox-hoopdb-backups-361835732085")).toBe(false);
+  });
+
   it("every Pod Identity role and the legacy role are under /pippen/workload/ with the boundary", () => {
     const i = { stage: "aws-proof-sandbox", accountId: "361835732085", tags: SBX_TAGS, permissionsBoundaryArn: BOUNDARY, pippenSandbox: true };
     for (const r of podRoles(refs)) {
