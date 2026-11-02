@@ -6,6 +6,7 @@ name: deploy session-read-worker
 #
 # Environment variables (not secrets; the deploy refuses to run without them):
 #   SESSION_READ_HYPERDRIVE_ID   the Hyperdrive config for bulls96_read_api (32 hex)
+#   SESSION_READ_SUPABASE_CA_ID   the uploaded Supabase Root 2021 CA certificate id
 #   SESSION_READ_ORIGIN          https://sessions-read.agentrelay.com (also Cloud's SESSIONS_READ_96BULLS_URL)
 #   SESSION_READ_COMPLETE_SINCE  ISO UTC timestamp ClickHouse is complete from, or "epoch"
 # Environment secret: CLOUDFLARE_API_TOKEN (Workers Scripts:Edit, Hyperdrive:Read).
@@ -38,6 +39,7 @@ jobs:
       # CLOUDFLARE_API_TOKEN is given only to the steps that call Cloudflare,
       # never to install (dependency scripts) or the input checks.
       HYPERDRIVE_ID: ${{ vars.SESSION_READ_HYPERDRIVE_ID }}
+      EXPECTED_CA_ID: ${{ vars.SESSION_READ_SUPABASE_CA_ID }}
       ORIGIN: ${{ vars.SESSION_READ_ORIGIN }}
       COMPLETE_SINCE: ${{ vars.SESSION_READ_COMPLETE_SINCE }}
     defaults:
@@ -64,6 +66,7 @@ jobs:
           fail() { echo "::error::$1"; exit 1; }
           test -n "$HAS_TOKEN" || fail "CLOUDFLARE_API_TOKEN is not set on the session-read-worker environment"
           [[ "$HYPERDRIVE_ID" =~ ^[0-9a-f]{32}$ ]] && [ "$HYPERDRIVE_ID" != "00000000000000000000000000000000" ] || fail "SESSION_READ_HYPERDRIVE_ID must be the Hyperdrive config id (32 hex)"
+          test -n "$EXPECTED_CA_ID" || fail "SESSION_READ_SUPABASE_CA_ID must be the uploaded Supabase Root 2021 CA certificate id"
           # The one approved custom-domain origin, exactly as Cloud mints the
           # assertion audience (new URL(...).origin). workers.dev is disabled
           # because same-account Worker fetches through it can fail with 1042.
@@ -71,6 +74,15 @@ jobs:
           if [ "$COMPLETE_SINCE" != "epoch" ]; then
             node -e 'const t=Date.parse(process.argv[1]);if(!/^\d{4}-\d{2}-\d{2}T/.test(process.argv[1])||Number.isNaN(t))process.exit(1)' "$COMPLETE_SINCE" || fail 'SESSION_READ_COMPLETE_SINCE must be an ISO UTC timestamp or "epoch"'
           fi
+      - name: Check the live Hyperdrive safety contract
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -o pipefail
+          curl --fail --silent --show-error \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/hyperdrive/configs/$HYPERDRIVE_ID" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            | bun run scripts/check-hyperdrive-config.ts
       - name: Render the deploy config (Hyperdrive id only)
         run: |
           grep -q '"id": "00000000000000000000000000000000"' wrangler.jsonc

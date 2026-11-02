@@ -5,7 +5,7 @@
   "type": "module",
   "description": "96Bulls session read API as a Cloudflare Worker: the #135 read API (src/session-read-api) served from workerd, ClickHouse Cloud over HTTPS, Supabase through Hyperdrive.",
   "scripts": {
-    "check:deploy-config": "bun run scripts/check-deploy-config.ts",
+    "check:deploy-config": "bun run scripts/check-deploy-config.ts && vitest run --config scripts/vitest.config.ts",
     "typecheck": "bun run check:deploy-config && tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
     "dry-run": "wrangler deploy --dry-run --outdir dist"
