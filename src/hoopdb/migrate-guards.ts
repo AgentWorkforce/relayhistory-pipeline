@@ -1534,7 +1534,7 @@ export async function sessionsFunctionAclManifest(): Promise<
 }
 
 /**
- * Run-time exact-manifest check (every event-trigger-mode migrate, inside the validation
+ * Run-time exact-manifest check (every non-local migrate, inside the validation
  * transaction, after the runtime application ACL is installed): every sessions
  * function's ACL must equal the manifest, plus `<runtime role>:EXECUTE` on
  * RUNTIME_APPLICATION_FUNCTIONS. Returns the differences (empty when exact).

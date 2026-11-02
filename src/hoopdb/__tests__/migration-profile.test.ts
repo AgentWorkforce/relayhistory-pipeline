@@ -2061,6 +2061,107 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     ).toBe("global-default-revoke");
   });
 
+  // Run-time exact manifest, mode matrix: every non-local boundary mode refuses an ACL
+  // outside the manifest after migrate (rolled back, marker left pending); local does not.
+  for (const [name, mode, boundary, drift] of [
+    [
+      "selfhosted global-default-revoke: an extra grant to authenticated",
+      "selfhosted",
+      "global-default-revoke",
+      "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO authenticated",
+    ],
+    [
+      "cloudsql global-default-revoke: an extra grant to authenticated",
+      "cloudsql",
+      "global-default-revoke",
+      "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO authenticated",
+    ],
+    [
+      "supabase event-trigger: a missing manifest grant (the trigger blocks extra ones)",
+      "supabase",
+      "event-trigger",
+      "REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM authenticated",
+    ],
+  ] as const)
+    test(`run-time exact manifest (${name}): function_acl_drift, rolled back, marker pending`, async () => {
+      const db = await fresh();
+      if (mode === "supabase") {
+        await db.exec(
+          readFileSync(join(root, "supabase/tests/supabase_shim.sql"), "utf8"),
+        );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
+              "supabase/bootstrap/session_directory_search_worker.sql",
+            ),
+            "utf8",
+          ),
+        );
+        await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
+        await db.exec(
+          readFileSync(
+            join(
+              root,
+              "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql",
+            ),
+            "utf8",
+          )
+            .split("\n")
+            .filter((l) => !l.startsWith("\\"))
+            .join("\n")
+            .replaceAll(":'runtime_role'", "'g6_rt'"),
+        );
+      } else {
+        // cloudsql runs no in-migrate role bootstrap: the Worker role is provisioned first.
+        if (mode === "cloudsql")
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/session_directory_search_worker.sql",
+              ),
+              "utf8",
+            ),
+          );
+        await db.exec(
+          `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+        );
+      }
+      const profile: MigrationProfile = {
+        ...LOCAL,
+        mode,
+        shim: mode !== "supabase",
+        bootstrap: mode === "selfhosted",
+        runtimeRole: "g6_rt",
+        runtimeLogin: false,
+        functionBoundary: boundary,
+      };
+      expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+      await db.exec(drift);
+      const ledgerBefore = (await snapshot(db)).ledger;
+      const error = await failure(runMigrations(client(db), { profile }));
+      expect(error?.code).toBe("function_acl_drift");
+      const after = await snapshot(db);
+      expect(after.ledger).toEqual(ledgerBefore);
+      expect(
+        (after.marker as Array<{ status: string }>).map((m) => m.status),
+      ).toEqual(["pending"]);
+    });
+
+  test("run-time exact manifest: local mode is unchanged (no check)", async () => {
+    const db = await fresh();
+    expect(
+      await failure(runMigrations(client(db), { profile: LOCAL })),
+    ).toBeNull();
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO authenticated",
+    );
+    expect(
+      await failure(runMigrations(client(db), { profile: LOCAL })),
+    ).toBeNull();
+  });
+
   test("selfhosted is gated too: refused without the owner-scoped revoke; passes with it (only local is ungated)", async () => {
     const db = await fresh();
     await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);

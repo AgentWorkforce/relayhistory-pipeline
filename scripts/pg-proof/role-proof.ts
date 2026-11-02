@@ -1652,6 +1652,88 @@ await check(
   },
 );
 await check(
+  "run-time exact manifest (selfhosted, global-default-revoke): a clean full migrate passes; an extra GRANT EXECUTE to authenticated outside the manifest is refused (function_acl_drift), rolled back, marker left pending",
+  async () => {
+    await fresh("g6_acl", ["g6_rt2"]);
+    const clean = migrate("g6_acl", SEQ);
+    const ledger = async () =>
+      (
+        await sql(
+          "g6_acl",
+          "SELECT count(*)::int AS n FROM sessions.__96bulls_migrations",
+        )
+      ).rows[0]!.n;
+    const marker = async () =>
+      (
+        await sql(
+          "g6_acl",
+          "SELECT string_agg(status, ',') AS s FROM sessions.__96bulls_role_validation",
+        )
+      ).rows[0]!.s;
+    const markerClean = await marker();
+    // The clean migrate passed the drift check over the CURRENT manifest: every manifest
+    // signature exists (including #124's session_directory_list functions) and no other
+    // sessions function does.
+    const manifestFns = Object.keys(
+      (
+        JSON.parse(
+          await Bun.file(
+            join(ROOT, "src/hoopdb/sessions-function-acl.json"),
+          ).text(),
+        ) as { functions: Record<string, string[]> }
+      ).functions,
+    ).sort();
+    const createdFns = (
+      await sql(
+        "g6_acl",
+        "SELECT p.oid::regprocedure::text AS f FROM pg_proc p WHERE p.pronamespace = 'sessions'::regnamespace",
+      )
+    ).rows
+      .map((r) => r.f as string)
+      .sort();
+    const currentSet =
+      JSON.stringify(manifestFns) === JSON.stringify(createdFns) &&
+      createdFns.includes(
+        "sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)",
+      );
+    await sql(
+      "g6_acl",
+      "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO authenticated",
+      "hoop",
+    );
+    const before = await ledger();
+    const drifted = migrate("g6_acl", SEQ);
+    const after = await ledger();
+    const markerDrift = await marker();
+    const stillGranted = (
+      await sql(
+        "g6_acl",
+        "SELECT has_function_privilege('authenticated', 'sessions.repo_backfill_report()', 'EXECUTE') AS g",
+      )
+    ).rows[0]!.g;
+    await sql(
+      "g6_acl",
+      "REVOKE EXECUTE ON FUNCTION sessions.repo_backfill_report() FROM authenticated",
+      "hoop",
+    );
+    const repaired = migrate("g6_acl", SEQ);
+    const markerRepaired = await marker();
+    await attempt("postgres", "DROP DATABASE IF EXISTS g6_acl WITH (FORCE)");
+    return [
+      clean.exit === 0 &&
+        markerClean === "pass" &&
+        currentSet &&
+        drifted.code === "function_acl_drift" &&
+        before === after &&
+        markerDrift === "pending" &&
+        stillGranted === true &&
+        repaired.exit === 0 &&
+        markerRepaired === "pass",
+      `clean=${fmt(clean)} marker=${markerClean} functions=${createdFns.length}/${manifestFns.length} current_set=${currentSet} drift=${fmt(drifted)} ledger=${before}->${after} marker_after=${markerDrift} repaired=${fmt(repaired)} marker_repaired=${markerRepaired}`,
+    ];
+  },
+);
+await check(
   "selfhosted is gated: refused without the owner-scoped revoke (function_boundary_unproven); the bootstrap installs it and the gate passes",
   async () => {
     await fresh("g6_fb", ["g6_rt2"], false);
