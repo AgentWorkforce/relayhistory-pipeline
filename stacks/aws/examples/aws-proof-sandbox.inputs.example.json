@@ -1,5 +1,5 @@
 {
-  "$comment": "The AWS E2E proof in the Pippen Tools sandbox of agent aws-proof (account 361835732085, us-west-2; Khaliq, 2026-11-01). Copy to .96bulls/aws-proof-sandbox/aws-inputs.json (gitignored) after `pippen sandbox up aws-proof`, and fill every angle-bracket placeholder value; the stage refuses any that are left. The stage is pinned to this account and needs pippenSandbox (the sandbox's permissions boundary on every role, pippen:sandbox=true on every resource); accountShared is refused. The services image is pulled by digest from the sessions-dev account's repository (eks.imageRepository), whose repository policy allows 361835732085 to pull (approved 2026-11-01; kept by ecr.pullAccounts in the aws-sessions-dev inputs). Teardown is `pippen sandbox down aws-proof`. Nothing here is secret: Secrets are created out of band from 1Password (docs/aws-stage.md).",
+  "$comment": "The AWS E2E proof in the Pippen Tools sandbox of agent aws-proof (account 361835732085, us-west-2; Khaliq, 2026-11-01). Copy to .96bulls/aws-proof-sandbox/aws-inputs.json (gitignored) after `pippen sandbox up aws-proof`, and fill every angle-bracket placeholder value; the stage refuses any that are left. The stage is pinned to this account and needs pippenSandbox (the sandbox's permissions boundary on every role, pippen:sandbox=true on every resource); accountShared is refused. The services image is pulled by digest from the sessions-dev account's repository (eks.imageRepository), whose repository policy allows 361835732085 to pull (approved 2026-11-01; kept by ecr.pullAccounts in the aws-sessions-dev inputs). Teardown is `pippen sandbox down aws-proof`. Nothing here is secret: Secrets are created out of band from 1Password (docs/aws-stage.md), including Relaycast's (chart 0.2.0 existingSecret): Secret relaycast in namespace relaycast with keys internal-secret (>= 32 characters) and workspace-bootstrap-secret. The Alchemy state lives in pippen-sbx-alchemy-state-361835732085-us-west-2-an, made by the first `bin/96bulls plan` and deleted by `pippen sandbox down`.",
   "accountId": "361835732085",
   "region": "us-west-2",
   "approval": {
@@ -54,9 +54,10 @@
       "backend": "cnpg"
     },
     "relaycast": {
-      "chartVersion": "0.1.0",
-      "imageDigest": "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98",
-      "baseUrl": "https://relaycast.proof-sandbox-sessions.agentrelay.com"
+      "chartVersion": "0.2.0",
+      "imageDigest": "sha256:a05732ad4f3614d057bb1460df40a30e3a9297c8930bfdda6d4e3d6dc9f41762",
+      "baseUrl": "https://relaycast.proof-sandbox-sessions.agentrelay.com",
+      "secretName": "relaycast"
     },
     "sessionDirectory": {
       "enabled": false

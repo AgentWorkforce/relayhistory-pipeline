@@ -80,6 +80,11 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_brief(text,text,text)": [
+      "<owner>:EXECUTE",
+      "session_directory_search_worker:EXECUTE"
+    ],
+    "sessions.session_briefs_forget()": ["<owner>:EXECUTE"],
     "sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"

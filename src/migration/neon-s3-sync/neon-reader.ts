@@ -20,6 +20,7 @@ import {
   type Queryable,
 } from "../relayhistory-export.ts";
 import { MAX_SCRUB_CHARS } from "@rhc/lib/scrub.ts";
+import { canScrubLong } from "../../shared/vendor.ts";
 
 /**
  * Every delivery kind the export carries: #40's RECORD_KINDS plus `trajectory`
@@ -330,11 +331,11 @@ const TRUNCATION_NOTE = (dropped: number) =>
   `\n[neon-s3-sync: truncated ${dropped} characters over the ${MAX_SCRUB_CHARS}-character scrub limit; the full text stays in Neon]`;
 
 /**
- * The ingest's sealer refuses (never truncates) a chunk holding a string longer
- * than the scrub bound, so such a record could never be stored at all. Only
- * those string tokens are cut, with an in-band note, the way `scrubText`
- * bounds text everywhere else in the pipeline; every other byte of the payload
- * (numbers, key order, other strings) is kept as Neon's own text.
+ * The sealer (scrub rule set 2) stores strings longer than the scrub bound
+ * whole, scrubbed in segments; it refuses only one it cannot segment safely
+ * (an unbroken run past the bound with no whitespace, such as a base64 dump).
+ * Only such a string token is cut, with an in-band note (and counted in the
+ * truncation ledger); every other byte of the payload is kept as Neon's text.
  */
 export function boundStrings(json: string): { text: string; truncated: number; maxChars: number } {
   if (json.length <= MAX_STRING_TOKEN) return { text: json, truncated: 0, maxChars: 0 };
@@ -347,7 +348,13 @@ export function boundStrings(json: string): { text: string; truncated: number; m
     let j = i + 1;
     while (j < json.length && json[j] !== '"') j += json[j] === "\\" ? 2 : 1;
     if (j - i + 1 > MAX_STRING_TOKEN) {
-      const value = JSON.parse(json.slice(i, j + 1)) as string;
+      const source = json.slice(i, j + 1);
+      const value = JSON.parse(source) as string;
+      // The sealer scrubs both the decoded value and the raw literal.
+      if (canScrubLong(value) && canScrubLong(source)) {
+        i = j;
+        continue;
+      }
       maxChars = Math.max(maxChars, value.length);
       let k = MAX_STRING_TOKEN - 512;
       let literal = "";

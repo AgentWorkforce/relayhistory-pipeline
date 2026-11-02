@@ -39,8 +39,8 @@ import { uuidv7 } from "../../shared/ids.ts";
 import { CHECKS, newCtx, postDestroyTeardown } from "./checks.ts";
 import { defaultInputsPath, loadConfig, validateConfig, type ProofConfig } from "./config.ts";
 import { Runner } from "./exec.ts";
-import { fenceFor, harnessOutputIssues, PROOF_CHART_REPO, PROOF_POSTGREST, TARGET_VALUES, type HarnessTarget } from "./fence.ts";
-import { bindKubeconfig, credentialIssue, parseDescribeCluster, proofKubeconfig, toolEnv, type DescribedCluster } from "./cluster-binding.ts";
+import { fenceFor, harnessOutputIssues, probeImagePlanIssue, PROOF_CHART_REPO, PROOF_POSTGREST, TARGET_VALUES, type HarnessTarget } from "./fence.ts";
+import { bindKubeconfig, parseDescribeCluster, proofKubeconfig, resolveToolCredentials, STATIC_CREDENTIALS, toolEnv, type DescribedCluster, type ToolCredentials } from "./cluster-binding.ts";
 import { bindStagePlan, chartDigests, gitProvenance, loadStagePlan, parsePlanUpdateApproval, type PlanUpdateApproval, sha256Hex, type ReportProvenance, type StagePlan } from "./provenance.ts";
 import { assertPostDestroyTarget, assertProofTarget, GuardError, LOCAL_READONLY_CONTEXT, PIPPEN_SESSION_ID, PROOF_TARGETS, sandboxCallerArn, SESSIONS_DEV_PROOF_TARGET, type Identity, type Mode, type ProofTarget } from "./guard.ts";
 import { allCanaries } from "./corpus.ts";
@@ -130,12 +130,14 @@ export function parseArgs(argv: readonly string[]): Args {
 }
 
 type Run = (argv: string[]) => { stdout: string; status: number | null };
-const defaultRun: Run = (argv) => {
-  // The same minimal env as every step. Only `kubectl config view` (which execs nothing) reads the operator's kubeconfig.
-  const env = toolEnv(process.env, argv[0] === "kubectl" ? process.env.KUBECONFIG : undefined);
+/** The identity reads' runner, with the same minimal env (and credential kind) as every step. */
+export const toolRun = (creds: ToolCredentials): Run => (argv) => {
+  // Only `kubectl config view` (which execs nothing) reads the operator's kubeconfig.
+  const env = toolEnv(process.env, argv[0] === "kubectl" ? process.env.KUBECONFIG : undefined, creds);
   const r = spawnSync(argv[0]!, argv.slice(1), { encoding: "utf8", shell: false, env });
   return { stdout: r.stdout ?? "", status: r.status };
 };
+const defaultRun: Run = toolRun(STATIC_CREDENTIALS);
 
 /**
  * Observed identity, bound to live AWS: who the AWS CLI is (sts), what the
@@ -245,23 +247,30 @@ export async function main(argv: readonly string[], env: Record<string, string |
     return 2;
   }
   const stagePlan = plan && !("error" in plan) ? plan : undefined;
-  if (stagePlan && cfg.probeImage && !cfg.probeImage.endsWith(`@${stagePlan.servicesDigest}`)) {
-    console.error("aws-proof: refusing: probeImage is not the stage plan's services image");
+  const probeIssue = stagePlan ? probeImagePlanIssue(cfg.probeImage, stagePlan.servicesDigest) : undefined;
+  if (probeIssue) {
+    console.error(`aws-proof: refusing: ${probeIssue}`);
     return 2;
   }
   let identity: Identity = { clusterName: cfg.clusterName, kubeContext: cfg.kubeContext };
   let cluster: DescribedCluster | undefined;
-  if (args.mode !== "dry-run" && pt && args.postDestroy) {
-    // No cluster to bind: identity is the STS account (region pinned per step); the prior report carries the target.
-    const cred = credentialIssue(env);
-    if (cred) {
-      console.error(`aws-proof: refusing: ${cred}`);
+  // Static keys everywhere; on the Pippen sandbox also `pippen sandbox exec`'s refreshing profile (cluster-binding.ts).
+  let creds: ToolCredentials = STATIC_CREDENTIALS;
+  if (args.mode !== "dry-run" && pt) {
+    const c = resolveToolCredentials(env, pt, args.pippenSession ? { pippenSession: args.pippenSession } : {});
+    if ("error" in c) {
+      console.error(`aws-proof: refusing: ${c.error}`);
       return 2;
     }
-    const sts = defaultRun(["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"]);
+    creds = c;
+  }
+  const run = toolRun(creds);
+  if (args.mode !== "dry-run" && pt && args.postDestroy) {
+    // No cluster to bind: identity is the STS account (region pinned per step); the prior report carries the target.
+    const sts = run(["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"]);
     identity = { clusterName: cfg.clusterName, kubeContext: cfg.kubeContext, postDestroy: true, ...(sts.status === 0 ? { accountId: sts.stdout.trim() } : {}) };
     if (pt.callerRolePrefix !== undefined && identity.accountId === pt.accountId) {
-      const who = defaultRun(["aws", "sts", "get-caller-identity", "--query", "Arn", "--output", "text"]);
+      const who = run(["aws", "sts", "get-caller-identity", "--query", "Arn", "--output", "text"]);
       if (who.status === 0) identity.callerArn = who.stdout.trim();
     }
     try {
@@ -271,16 +280,11 @@ export async function main(argv: readonly string[], env: Record<string, string |
       return 2;
     }
   } else if (args.mode !== "dry-run" && pt) {
-    const cred = credentialIssue(env);
-    if (cred) {
-      console.error(`aws-proof: refusing: ${cred}`);
-      return 2;
-    }
     if (pt.callerRolePrefix !== undefined && !args.pippenSession) {
       console.error("aws-proof: refusing: --target pippen-sandbox needs --pippen-session <session_id from `pippen sandbox status aws-proof`>");
       return 2;
     }
-    const o = observeIdentity(cfg, defaultRun, pt, args.pippenSession);
+    const o = observeIdentity(cfg, run, pt, args.pippenSession);
     identity = o.identity;
     cluster = o.cluster;
     if (o.bindError) console.error(`aws-proof: cluster binding: ${o.bindError}`);
@@ -303,9 +307,9 @@ export async function main(argv: readonly string[], env: Record<string, string |
   let kubeconfigPath: string | undefined;
   if (cluster) {
     kubeconfigPath = join(dir, "kubeconfig.json");
-    writeFileSync(kubeconfigPath, proofKubeconfig(cluster, cfg.kubeContext, pt), { mode: 0o600 });
+    writeFileSync(kubeconfigPath, proofKubeconfig(cluster, cfg.kubeContext, pt, creds), { mode: 0o600 });
   }
-  const runner = new Runner({ mode: args.mode, identity: { ...identity, confirmLive: args.confirmLive }, fence: fenceFor(args.target), baseEnv: env, ...(kubeconfigPath ? { kubeconfigPath } : {}), ...(args.postDestroy ? { awsOnly: true } : {}) });
+  const runner = new Runner({ mode: args.mode, identity: { ...identity, confirmLive: args.confirmLive }, fence: fenceFor(args.target), baseEnv: env, credentials: creds, ...(kubeconfigPath ? { kubeconfigPath } : {}), ...(args.postDestroy ? { awsOnly: true } : {}) });
   const ctx = newCtx(cfg, runner, runId, env);
   if (stagePlan) ctx.stagePlan = stagePlan;
   console.log(`aws-proof ${runId}: mode=${args.mode} target=${args.target} context=${cfg.kubeContext} checks=${args.checks.join(",")}`);

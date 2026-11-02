@@ -372,6 +372,37 @@ export class SyncState {
     return Number((this.db.prepare("SELECT count(*) AS n FROM exported WHERE error IS NOT NULL AND keys <> '[]' AND attempts >= 6").get() as { n: number }).n);
   }
 
+  /**
+   * After the sealer takes long strings (scrub rule set 2): make every group in
+   * the truncation ledger look changed, so it is re-read and stored whole. The
+   * ledger rows clear as each group re-exports without a cut.
+   */
+  forceReexportTruncated(): number {
+    let n = 0;
+    this.#tx(() => {
+      // Healthy groups: look changed. Failing ones (even past the attempt cap):
+      // retry now, so no ledgered group is left holding T0 shut.
+      n =
+        Number(
+          this.db
+            .prepare(
+              `UPDATE exported SET revision = -2, exported_at = 0
+                WHERE error IS NULL AND (org_id, session_id) IN (SELECT DISTINCT org_id, session_id FROM truncations)`,
+            )
+            .run().changes,
+        ) +
+        Number(
+          this.db
+            .prepare(
+              `UPDATE exported SET failed_revision = -2, attempts = 0, next_try = 0
+                WHERE error IS NOT NULL AND (org_id, session_id) IN (SELECT DISTINCT org_id, session_id FROM truncations)`,
+            )
+            .run().changes,
+        );
+    });
+    return n;
+  }
+
   truncationTotals(): { sessions: number; manifests: number; strings: number; maxChars?: number } {
     const r = this.db
       .prepare(

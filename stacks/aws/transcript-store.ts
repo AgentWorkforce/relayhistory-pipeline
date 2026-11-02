@@ -220,6 +220,25 @@ function sessionReadApiPhase(operations: ReadonlyMap<string, string>): Transcrip
 }
 
 /**
+ * The read API rollout, while the session pipeline carries an unapplied code-only update: main
+ * moved since the pipeline's last deploy, and the read API's failed first apply left its errors
+ * alarm in state, so neither can be planned alone. The compact shape: `session-read-api` is
+ * created (never updated: the function's first apply did not complete in state), the other read
+ * API resources are created or noop, `session-pipeline` and all five ROLE_GRANT_RESOURCES update,
+ * and every other resource is noop. The detailed plan must then show `session-pipeline` with no
+ * declared property changes and each grant as exactly the role-ARN cascade
+ * (assertPipelineRoleCascadeDiff, unchanged).
+ */
+function isReadApiRolloutWithPipelineCascade(operations: ReadonlyMap<string, string>): boolean {
+  const readApi = SESSION_READ_API_RESOURCES as readonly string[];
+  const grants = ROLE_GRANT_RESOURCES as readonly string[];
+  if (operations.get("session-read-api") !== "create") return false;
+  if (!readApi.every((r) => operations.get(r) === "create" || operations.get(r) === "noop")) return false;
+  if (operations.get("session-pipeline") !== "update" || !grants.every((r) => operations.get(r) === "update")) return false;
+  return [...operations].every(([r, a]) => readApi.includes(r) || grants.includes(r) || r === "session-pipeline" || a === "noop");
+}
+
+/**
  * The session pipeline's own phases (session-pipeline.ts). Rollout: the pipeline's
  * resources are created (all, or the rest after a partial apply), and the store
  * changes only by the two grants it needs: the transcripts key policy (decrypt via
@@ -361,10 +380,19 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
     assertRepoTagRenameDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
     return "repo tag rename";
   }
-  // The read API changes alone; once it is all noop, the rest of the plan is judged as before.
+  // The read API changes alone (or, in its rollout, with the pipeline's exact code-only cascade);
+  // once it is all noop, the rest of the plan is judged as before.
   if (SESSION_READ_API_RESOURCES.some((r) => compact.operations.has(r))) {
     const readApiPhase = sessionReadApiPhase(compact.operations);
     if (readApiPhase) return readApiPhase;
+    if (isReadApiRolloutWithPipelineCascade(compact.operations)) {
+      const lines = capture.detailedPlanText.split(/\r?\n/);
+      if (!pipelineHasNoDeclaredChanges(lines))
+        refuse("session read api rollout with the pipeline cascade: session-pipeline may update only with no declared property changes");
+      const pipelineOnly = new Map([...compact.operations].filter(([r]) => !(SESSION_READ_API_RESOURCES as readonly string[]).includes(r)));
+      assertPipelineRoleCascadeDiff(pipelineOnly, capture.detailedPlanText, capture.stateSnapshotText, refuse);
+      return "session read api rollout";
+    }
     if (!SESSION_READ_API_RESOURCES.every((r) => compact.operations.get(r) === "noop")) {
       const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
       return refuse(`action set does not match the session read api rollout or update phase (the read api changes alone): ${changes.join(", ")}`);
@@ -411,6 +439,12 @@ function detailedBlock(lines: readonly string[], resource: string): string[] {
   const rest = lines.slice(start + 1);
   const end = rest.findIndex((line) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(line));
   return end < 0 ? rest : rest.slice(0, end);
+}
+
+/** Whether the detailed plan's `session-pipeline` update block is exactly "no declared property changes". */
+function pipelineHasNoDeclaredChanges(lines: readonly string[]): boolean {
+  const body = detailedBlock(lines, "session-pipeline").map((l) => l.trim()).filter(Boolean);
+  return body.length === 1 && body[0] === "no declared property changes";
 }
 
 /**

@@ -29,6 +29,9 @@
  *     every companion's last_activity_at equal to the row's in the row's own transaction,
  *     and on tombstone or delete remove the session's agent rows and its edges as parent
  *     and as child; the tombstone trigger clears the catalog columns.
+ *   - a model-written brief title (sessions.session_briefs, src/session-brief) wins over
+ *     the latest pointer's title while the brief exists. Deleting a pointer deletes the
+ *     brief (trigger), so the pointer title returns on the next projection.
  *
  * search_text is always rebuilt with sessions.session_directory_search_text, so the
  * scrubbed short_summary stays part of it. The rollout marker is never set here.
@@ -48,6 +51,10 @@ export async function projectSessionDirectory(
           AND deleted_at IS NULL
      ), latest AS (
        SELECT * FROM live ORDER BY last_activity_at DESC, revision DESC, machine_id DESC LIMIT 1
+     ), brief AS (
+       SELECT title FROM sessions.session_briefs
+        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4
+          AND title IS NOT NULL
      ), agg AS (
        SELECT min(created_at) AS created_at, max(last_activity_at) AS last_activity_at,
               array_agg(DISTINCT machine_id ORDER BY machine_id) AS machine_ids,
@@ -60,11 +67,13 @@ export async function projectSessionDirectory(
         event_count, input_tokens, output_tokens, cost_usd_micros,
         machine_ids, user_ids, search_text, projected_at)
      SELECT $1, $2, $3, $4, agg.created_at, agg.last_activity_at,
-            l.title, l.project_id, l.git_repo, l.git_branch, l.model, l.state,
+            coalesce((SELECT title FROM brief), l.title), l.project_id, l.git_repo, l.git_branch,
+            l.model, l.state,
             l.event_count, l.input_tokens, l.output_tokens, l.cost_usd_micros,
             agg.machine_ids, agg.user_ids,
             sessions.session_directory_search_text(
-              l.title, NULL, NULL, l.project_id, l.git_repo, l.git_branch, l.model, NULL),
+              coalesce((SELECT title FROM brief), l.title), NULL, NULL, l.project_id,
+              l.git_repo, l.git_branch, l.model, NULL),
             now()
        FROM latest AS l CROSS JOIN agg
      ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET

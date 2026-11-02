@@ -379,6 +379,56 @@ export const SESSION_DIRECTORY_READINESS_RPC = {
 } as const;
 
 /**
+ * The model-written brief for one logical session (20261102000000), for relayhistory-cloud's
+ * GET /v1/sessions/:id/brief. Zero rows when the session has no live pointer.
+ */
+export const SESSION_BRIEF_RPC = {
+  name: "sessions.session_brief",
+  args: {
+    p_workspace_id: "text (must be claimed)",
+    p_harness: "text",
+    p_session_id: "text",
+  },
+  returns: [
+    "org_id",
+    "workspace_id",
+    "harness",
+    "session_id",
+    "status",
+    "stale",
+    "title",
+    "description",
+    "revision",
+    "current_revision",
+    "prompt_version",
+    "engine_version",
+    "model",
+    "message_count",
+    "shortened_messages",
+    "input_tokens",
+    "output_tokens",
+    "error",
+    "generated_at",
+    "attempted_at",
+  ],
+  statuses: [
+    "ready",
+    "pending",
+    "refreshing",
+    "stale",
+    "failed",
+    "rate_limited",
+    "missing",
+  ],
+  maxRows: 1,
+  errors: {
+    "42501":
+      "not the Worker role, or claims missing/invalid/not covering the workspace",
+    "22023": "missing workspace, invalid harness or session id",
+  },
+} as const;
+
+/**
  * The exact statement the RPC executes for a workspace-scoped text search with no other
  * filter (whitespace aside). Plan tests compare auto_explain's Query Text to it; other
  * shapes add the fixed fragments listed in the migration.

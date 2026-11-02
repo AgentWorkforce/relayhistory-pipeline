@@ -1,7 +1,15 @@
 # supabase/migrations
 
-Nothing in this directory has been applied to any database. The only place these
-files run is the in-process PGlite inside `packages/pipeline` vitest.
+**Status (2026-11-02):** these migrations are applied to **production Supabase**
+(`pyamkrhoyszgzirqqffq`) through `src/hoopdb/migrate.ts`, the only migration authority. The
+generation there is `eff8b3be…`, with 18/18 ledger rows in `sessions.__96bulls_migrations`, the
+readiness marker at `pass`, and `HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger`. The record is
+`docs/activation/supabase-incremental-upgrade-1d99ccc8-to-eff8b3be.md` §10. Never apply them with
+`supabase db push`: the migrator refuses a mixed authority (`mixed_migration_authority`). Any
+further apply to a real database needs Khaliq's OK under AGENTS.md.
+
+Tests also run every file here in the in-process PGlite inside `packages/pipeline` vitest, and in
+the real-PostgreSQL proof (`.github/workflows/pg-proof.yml`).
 
 ## Provenance
 
@@ -14,6 +22,7 @@ files run is the in-process PGlite inside `packages/pipeline` vitest.
 | `20261025000300_upsert_keep_on_null.sql`             | relayhistory-cloud PR #185 (`fe89fc3`)                                               |
 | `20261030010000_session_directory.sql`               | 96BullSessions decision 0002 logical-session metadata contract                       |
 | `20261030020000_session_directory_short_summary.sql` | 96BullSessions G6: bounded, scrubbed `short_summary` and the tenant-bound search RPC |
+| `20261102000000_session_briefs.sql`                 | 96BullSessions: model-written session briefs (neon-retire), the debounced wakeups and the Worker brief RPC |
 | `../tests/supabase_shim.sql`                         | relayhistory-cloud PR #171, merge commit `51c313fda3c4288cf75f9927c4004fb39b6cd2ee`  |
 
 Repository: https://github.com/AgentWorkforce/relayhistory-cloud. The `000000` to
@@ -33,12 +42,13 @@ TypeScript tests apply every file here in name order after
 functions). So these files are dependencies of `000600`, vendored so the tests run.
 
 `20261030010000_session_directory.sql` is owned by this repository rather than
-vendored. It is an unapplied schema contract only: it creates no projector,
-backfill, trigger, deployment, or production write.
+vendored. The migration itself creates no projector, backfill, deployment, or data write.
+(It was applied to production Supabase on 2026-11-01; see the status above.)
 
 `20261030020000_session_directory_short_summary.sql` is also owned here. Provenance
 of scope: the helm-chart-chief coordinator recorded the user's direct approval to
-implement bounded short_summary work in its controlling session. Draft only. Its down
+implement bounded short_summary work in its controlling session. Applied to production
+Supabase on 2026-11-01 (see the status above). Its down
 path is `../rollbacks/20261030020000_session_directory_short_summary.down.sql`, kept
 out of this directory because the tests apply every file here in name order. The
 migration needs the `btree_gin` extension (available on Supabase) for its

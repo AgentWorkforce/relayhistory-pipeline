@@ -26,7 +26,7 @@ export function opAssignmentFields(markdown: string): string[] {
 
 describe("1Password recipes in the docs", () => {
   it("the parser sees the RelayAuth recipe's fields", () => {
-    expect(opAssignmentFields(readFileSync(`${ROOT}/docs/aws-stage.md`, "utf8"))).toEqual(["internal-secret", "bootstrap-api-key", "signing-key\\.pem", "summary-master-keys"]);
+    expect(opAssignmentFields(readFileSync(`${ROOT}/docs/aws-stage.md`, "utf8"))).toEqual(["internal-secret", "bootstrap-api-key", "signing-key\\.pem", "summary-master-keys", "internal-secret", "workspace-bootstrap-secret"]);
     expect(opAssignmentFields('op item create \\\n  "signing-key.pem[password]=$k"')).toEqual(["signing-key.pem"]);
   });
 

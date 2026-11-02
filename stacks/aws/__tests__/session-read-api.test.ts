@@ -7,6 +7,7 @@ import { SESSION_PIPELINE_RESOURCES } from "../session-pipeline.ts";
 import {
   SESSION_READ_API_RESOURCES,
   assertSessionReadApiInputs,
+  sessionReadApiAlarms,
   sessionReadApiEnv,
   sessionReadApiFunctionProps,
   sessionReadApiNames,
@@ -55,6 +56,31 @@ describe("session read api: deploy plan contract", () => {
     expect(check(plan({ "session-read-api-errors-alarm": "create" }, withApi))).toBe("session read api rollout");
   });
 
+  // sessions-prod's first apply created the errors alarm, then failed on the function's reserved
+  // concurrency (account quota 10, AWS keeps 10 unreserved). The re-plan with `reservedConcurrency:
+  // "none"` creates the function, its secret and the throttles alarm; the errors alarm is noop.
+  const partial = { "session-read-api": "create", "session-read-api-secret": "create", "session-read-api-throttles-alarm": "create" };
+
+  it("rollout after the failed first apply: the remaining read api creates and the throttles alarm, alone", () => {
+    expect(check(plan(partial, withApi))).toBe("session read api rollout");
+    expect(check(plan(partial, withBoth))).toBe("session read api rollout");
+    // The throttles alarm alone (everything else already applied).
+    expect(check(plan({ "session-read-api-throttles-alarm": "create" }, withBoth))).toBe("session read api rollout");
+  });
+
+  it("refuses anything beyond that partial rollout shape", () => {
+    // A pipeline resource created alongside (e.g. a pipeline alarm): the read api changes alone.
+    expect(() => check(plan({ ...partial, "session-pipeline-errors-alarm": "create" }, withBoth))).toThrow(/read api changes alone/);
+    expect(() => check(plan({ ...partial, "session-pipeline": "update" }, withBoth))).toThrow(/read api changes alone/);
+    // The existing errors alarm changing while the rest is created.
+    expect(() => check(plan({ ...partial, "session-read-api-errors-alarm": "update" }, withBoth))).toThrow(/read api changes alone/);
+    expect(() => check(plan({ ...partial, budget: "update" }, withBoth))).toThrow(/read api changes alone/);
+    expect(() => check(plan({ ...partial, "session-read-api-errors-alarm": "replace" }, withBoth))).toThrow(/forbidden action replace/);
+    // A plan from before the throttles alarm existed (three read api resources) is incomplete.
+    const withoutThrottles = withBoth.filter((r) => r !== "session-read-api-throttles-alarm");
+    expect(() => check(plan(partial, withoutThrottles))).toThrow(/missing resource session-read-api-throttles-alarm/);
+  });
+
   it("update: in place (e.g. setting origin), alone", () => {
     expect(check(plan({ "session-read-api": "update" }, withApi))).toBe("session read api update");
     expect(check(plan({ "session-read-api": "update" }, withBoth))).toBe("session read api update");
@@ -92,9 +118,22 @@ describe("session read api: inputs, grants and env", () => {
       { completeSince: "epoch", origin: `https://${"a".repeat(32)}.lambda-url.us-west-2.on.aws` },
       { completeSince: "epoch", origin: `https://${"a".repeat(32)}.lambda-url.us-east-1.on.aws/v1` },
       { completeSince: "epoch", reservedConcurrency: 500 },
+      { completeSince: "epoch", reservedConcurrency: 1 },
+      { completeSince: "epoch", reservedConcurrency: 51 },
+      { completeSince: "epoch", reservedConcurrency: 2.5 },
+      { completeSince: "epoch", reservedConcurrency: 0 },
+      { completeSince: "epoch", reservedConcurrency: null },
       { completeSince: "epoch", vpc: true },
     ])
       expect(() => assertSessionReadApiInputs(bad, refuse)).toThrow();
+  });
+
+  it('reservedConcurrency "none" is accepted, and no other string', () => {
+    assertSessionReadApiInputs({ completeSince: "epoch", reservedConcurrency: "none" }, refuse);
+    assertSessionReadApiInputs({ completeSince: "epoch", reservedConcurrency: 2 }, refuse);
+    assertSessionReadApiInputs({ completeSince: "epoch", reservedConcurrency: 50 }, refuse);
+    for (const bad of ["None", "NONE", "none ", "", "0", "10", "unreserved", "unlimited", "default"])
+      expect(() => assertSessionReadApiInputs({ completeSince: "epoch", reservedConcurrency: bad }, refuse)).toThrow(/reservedConcurrency must be an integer from 2 to 50, or "none"/);
   });
 
   it("only the function's own role reads the secret, and the env carries no credential", () => {
@@ -105,7 +144,52 @@ describe("session read api: inputs, grants and env", () => {
     const env = sessionReadApiEnv({ stage: STAGE, names: sessionReadApiNames(STAGE), p: { completeSince: "epoch" } });
     expect(env.READ_API_ORIGIN).toBe("");
     expect(env.SESSION_READ_API_SECRET_ARN).toBe("96bulls/aws-sessions-prod/session-read-api");
-    expect(Object.keys(env).some((k) => /PASSWORD|KEY$|TOKEN|URL$/.test(k))).toBe(false);
+    // RELAYAUTH_JWKS_URL is a public key-set location, not a credential; every other *URL stays banned.
+    expect(Object.keys(env).filter((k) => k !== "RELAYAUTH_JWKS_URL").some((k) => /PASSWORD|KEY$|TOKEN|URL$/.test(k))).toBe(false);
+  });
+});
+
+describe("session read api: reserved concurrency and alarms", () => {
+  const props = (p: Record<string, unknown>) =>
+    sessionReadApiFunctionProps({ stage: STAGE, names: sessionReadApiNames(STAGE), p: { completeSince: "epoch", ...p } }) as Record<string, unknown>;
+
+  it("reserves 10 by default, the configured number when set, and nothing with \"none\"", () => {
+    expect(props({}).reservedConcurrentExecutions).toBe(10);
+    expect(props({ reservedConcurrency: 4 }).reservedConcurrentExecutions).toBe(4);
+    const none = props({ reservedConcurrency: "none" });
+    expect("reservedConcurrentExecutions" in none).toBe(false);
+    // Nothing else differs.
+    const { reservedConcurrentExecutions: _, ...rest } = props({});
+    expect(none).toEqual(rest);
+  });
+
+  it("alarms on Errors (unchanged, already applied) and on Throttles: Sum > 0 over 5 minutes", () => {
+    const fn = "96bulls-aws-sessions-prod-session-read-api";
+    const lambda = { Namespace: "AWS/Lambda", Dimensions: [{ Name: "FunctionName", Value: fn }], Statistic: "Sum", Threshold: 0, ComparisonOperator: "GreaterThanThreshold" };
+    const alarms = sessionReadApiAlarms(sessionReadApiNames(STAGE));
+    expect(alarms.map(([id]) => id)).toEqual(["session-read-api-errors-alarm", "session-read-api-throttles-alarm"]);
+    expect(alarms.map(([id]) => id).every((id) => (SESSION_READ_API_RESOURCES as readonly string[]).includes(id))).toBe(true);
+    // The errors alarm exists in sessions-prod state: its props must stay exactly these, or the plan is not noop.
+    expect(alarms[0][1]).toEqual({
+      ActionsEnabled: false,
+      TreatMissingData: "notBreaching",
+      name: `${fn}-errors`,
+      AlarmDescription: "Session read API invocations are failing (init, timeouts, crashes); Cloud falls back to relayhistory meanwhile.",
+      ...lambda,
+      MetricName: "Errors",
+      Period: 300,
+      EvaluationPeriods: 2,
+    });
+    expect(alarms[1][1]).toEqual({
+      ActionsEnabled: false,
+      TreatMissingData: "notBreaching",
+      name: `${fn}-throttles`,
+      AlarmDescription: "Session read API invocations are throttled (reserved concurrency or the account pool); Cloud falls back to relayhistory meanwhile.",
+      ...lambda,
+      MetricName: "Throttles",
+      Period: 300,
+      EvaluationPeriods: 1,
+    });
   });
 });
 
@@ -123,5 +207,16 @@ describe("session read api: Function URL (public by design, application auth)", 
     expect(routes.sort()).toEqual(["/health", "/v1/events", "/v1/sessions/:sessionId/events"]);
     expect(src).toContain('app.use("/v1/*", async (c, next) => {');
     expect(src).toMatch(/if \(!m\) return c\.json\(\{ error: \{ code: "missing_authorization"/);
+  });
+});
+
+import { sessionReadApiEnv as _envForJwks, sessionReadApiNames as _namesForJwks } from "../session-read-api.ts";
+describe("read api RelayAuth endpoints", () => {
+  // The verifier's fallback JWKS host (relayauth.dev) does not resolve; prod RelayAuth serves keys
+  // at api.relayauth.dev. Without these the deployed API answered 401 to every Cloud request.
+  it("sets the production JWKS URL and issuer", () => {
+    const env = _envForJwks({ stage: "aws-sessions-prod", names: _namesForJwks("aws-sessions-prod"), p: { completeSince: "2026-10-17T13:48:56.633Z" } as never });
+    expect(env.RELAYAUTH_JWKS_URL).toBe("https://api.relayauth.dev/.well-known/jwks.json");
+    expect(env.RELAYAUTH_ISSUER).toBe("https://relayauth.dev");
   });
 });

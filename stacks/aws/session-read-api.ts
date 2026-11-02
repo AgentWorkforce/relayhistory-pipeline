@@ -30,14 +30,24 @@ export interface SessionReadApiInputs {
   completeSince: string;
   /** This function's URL origin (https://<id>.lambda-url.us-east-1.on.aws). Omit on the first apply. */
   origin?: string;
-  /** Reserved concurrency (2-50). Default 10. */
-  reservedConcurrency?: number;
+  /**
+   * Reserved concurrency (an integer 2-50). Default 10.
+   *
+   * `"none"` reserves nothing: the function runs from the account's unreserved
+   * pool. It exists only for an account whose Lambda concurrency quota is below
+   * the default (a new account starts at 10, and AWS keeps 10 unreserved, so any
+   * reservation is refused). It is never the default, and must be removed once
+   * the quota is raised. Throttles are alarmed either way
+   * (`session-read-api-throttles-alarm`).
+   */
+  reservedConcurrency?: number | "none";
 }
 
 export const SESSION_READ_API_RESOURCES = [
   "session-read-api",
   "session-read-api-secret",
   "session-read-api-errors-alarm",
+  "session-read-api-throttles-alarm",
 ] as const;
 
 export const READ_API_TIMEOUT_SECONDS = 10;
@@ -64,8 +74,8 @@ export function assertSessionReadApiInputs(p: unknown, refuse: (why: string) => 
     refuse('transcriptStore.sessionReadApi.completeSince must be an ISO UTC timestamp or "epoch"');
   if (v.origin !== undefined && (typeof v.origin !== "string" || !ORIGIN.test(v.origin)))
     refuse("transcriptStore.sessionReadApi.origin must be this function's us-east-1 Function URL origin (no path)");
-  if (v.reservedConcurrency !== undefined && !(Number.isInteger(v.reservedConcurrency) && (v.reservedConcurrency as number) >= 2 && (v.reservedConcurrency as number) <= 50))
-    refuse("transcriptStore.sessionReadApi.reservedConcurrency must be an integer from 2 to 50");
+  if (v.reservedConcurrency !== undefined && v.reservedConcurrency !== "none" && !(Number.isInteger(v.reservedConcurrency) && (v.reservedConcurrency as number) >= 2 && (v.reservedConcurrency as number) <= 50))
+    refuse('transcriptStore.sessionReadApi.reservedConcurrency must be an integer from 2 to 50, or "none" (only below the default account quota)');
 }
 
 /** Only the read API's role reads its secret. */
@@ -78,6 +88,10 @@ export function sessionReadApiSecretPolicy(i: { roleArn: string }) {
   };
 }
 
+/** Production RelayAuth endpoints the read API verifies Cloud's assertions against. */
+export const RELAYAUTH_PROD_JWKS_URL = "https://api.relayauth.dev/.well-known/jwks.json";
+export const RELAYAUTH_PROD_ISSUER = "https://relayauth.dev";
+
 export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames; p: SessionReadApiInputs }) {
   return {
     DEPLOYMENT: i.stage,
@@ -87,6 +101,11 @@ export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames
     READ_API_COMPLETE_SINCE: i.p.completeSince,
     // Empty until the second apply: the app then refuses every token.
     READ_API_ORIGIN: i.p.origin ?? "",
+    // Production RelayAuth (the values relayhistory-cloud deploys with, repo vars RELAYAUTH_*).
+    // The shared verifier's fallback JWKS, https://relayauth.dev/.well-known/jwks.json, does not
+    // resolve, so without this every token failed the JWKS fetch and Cloud saw only 401s.
+    RELAYAUTH_JWKS_URL: RELAYAUTH_PROD_JWKS_URL,
+    RELAYAUTH_ISSUER: RELAYAUTH_PROD_ISSUER,
     NODE_OPTIONS: "--enable-source-maps",
   };
 }
@@ -111,12 +130,45 @@ export function sessionReadApiFunctionProps(i: { stage: string; names: SessionRe
     architecture: "arm64",
     memorySize: READ_API_MEMORY_MB,
     timeout: `${READ_API_TIMEOUT_SECONDS} seconds`,
-    reservedConcurrentExecutions: i.p.reservedConcurrency ?? 10,
+    // "none": the key is absent, so Alchemy sets no function-level reservation.
+    ...(i.p.reservedConcurrency === "none" ? {} : { reservedConcurrentExecutions: i.p.reservedConcurrency ?? 10 }),
     env: sessionReadApiEnv(i),
     functionUrl: { authType: "NONE" as const, invokeMode: "BUFFERED" as const },
     logging: { retention: "30 days" },
     build: { tsconfig: "tsconfig.json" },
   };
+}
+
+/**
+ * The read API's alarms (tags are added at declaration). Errors: invocations
+ * failing. Throttles: invocations refused for concurrency, by the function's
+ * reservation or, with `reservedConcurrency: "none"`, by the account pool it
+ * then shares with the session pipeline.
+ */
+export function sessionReadApiAlarms(names: SessionReadApiNames) {
+  const lambda = { Namespace: "AWS/Lambda", Dimensions: [{ Name: "FunctionName", Value: names.function }], Statistic: "Sum", Threshold: 0, ComparisonOperator: "GreaterThanThreshold" };
+  return [
+    ["session-read-api-errors-alarm", {
+      ActionsEnabled: false,
+      TreatMissingData: "notBreaching",
+      name: `${names.function}-errors`,
+      AlarmDescription: "Session read API invocations are failing (init, timeouts, crashes); Cloud falls back to relayhistory meanwhile.",
+      ...lambda,
+      MetricName: "Errors",
+      Period: 300,
+      EvaluationPeriods: 2,
+    }],
+    ["session-read-api-throttles-alarm", {
+      ActionsEnabled: false,
+      TreatMissingData: "notBreaching",
+      name: `${names.function}-throttles`,
+      AlarmDescription: "Session read API invocations are throttled (reserved concurrency or the account pool); Cloud falls back to relayhistory meanwhile.",
+      ...lambda,
+      MetricName: "Throttles",
+      Period: 300,
+      EvaluationPeriods: 1,
+    }],
+  ] as const;
 }
 
 export interface SessionReadApiStageInputs {
@@ -138,21 +190,7 @@ export const sessionReadApi = (i: SessionReadApiStageInputs) =>
       recoveryWindowInDays: 7,
       tags: i.tags("session-read-api"),
     } as never);
-    yield* AWS.CloudWatch.Alarm("session-read-api-errors-alarm", {
-      ActionsEnabled: false,
-      TreatMissingData: "notBreaching",
-      name: `${names.function}-errors`,
-      AlarmDescription: "Session read API invocations are failing (init, timeouts, crashes); Cloud falls back to relayhistory meanwhile.",
-      Namespace: "AWS/Lambda",
-      MetricName: "Errors",
-      Dimensions: [{ Name: "FunctionName", Value: names.function }],
-      Statistic: "Sum",
-      Period: 300,
-      EvaluationPeriods: 2,
-      Threshold: 0,
-      ComparisonOperator: "GreaterThanThreshold",
-      tags: i.tags("session-read-api"),
-    } as never);
+    for (const [id, props] of sessionReadApiAlarms(names)) yield* AWS.CloudWatch.Alarm(id, { ...props, tags: i.tags("session-read-api") } as never);
     return {
       functionName: names.function,
       functionUrl: (fn as unknown as { functionUrl: string | undefined }).functionUrl,

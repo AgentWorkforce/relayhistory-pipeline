@@ -10,6 +10,8 @@ import {
   albLogDeliveryPolicy,
   ingestLoadBalancerAttributes,
   RELAYCAST_0_1_0,
+  RELAYCAST_0_2_0,
+  RELAYCAST_SECRET_KEYS,
   STORAGE_CLASS,
   assertRelaycastInputs,
   assertSessionDirectoryPreconditions,
@@ -101,12 +103,62 @@ describe("Relaycast", () => {
   });
 
   it("refuses tag-only images, inexact chart versions and non-https or pathful origins (0.2.0 slots in by input)", () => {
-    expect(() => assertRelaycastInputs({ ...inputs, chartVersion: "0.2.0", imageDigest: `sha256:${"b".repeat(64)}` })).not.toThrow();
+    expect(() => assertRelaycastInputs({ ...inputs, chartVersion: "0.2.0", imageDigest: `sha256:${"b".repeat(64)}`, secretName: "relaycast" })).not.toThrow();
     expect(() => assertRelaycastInputs({ ...inputs, imageDigest: "8.0.0" })).toThrow(/tag-only/);
     expect(() => assertRelaycastInputs({ ...inputs, chartVersion: "^0.1" })).toThrow(/exact chart version/);
     expect(() => assertRelaycastInputs({ ...inputs, baseUrl: "http://relaycast.example.com" })).toThrow(/https origin/);
     expect(() => assertRelaycastInputs({ ...inputs, baseUrl: "https://relaycast.example.com/x" })).toThrow(/https origin/);
     expect(() => assertRelaycastInputs({ ...inputs, baseUrl: "https://localhost" })).toThrow(/https origin/);
+  });
+});
+
+describe("Relaycast 0.2.0: the required existingSecret comes from the inputs, by name", () => {
+  const v1 = { ...RELAYCAST_0_1_0, baseUrl: "https://relaycast.proof-sandbox-sessions.agentrelay.com" };
+  const v2 = { ...RELAYCAST_0_2_0, baseUrl: "https://relaycast.proof-sandbox-sessions.agentrelay.com", secretName: "relaycast" };
+  const sbxExample = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-proof-sandbox.inputs.example.json", import.meta.url)), "utf8"));
+
+  it("pins 0.2.0 to its released image digest and the chart's secret keys", () => {
+    expect(RELAYCAST_0_2_0).toEqual({ chartVersion: "0.2.0", imageDigest: "sha256:a05732ad4f3614d057bb1460df40a30e3a9297c8930bfdda6d4e3d6dc9f41762" });
+    expect(RELAYCAST_SECRET_KEYS).toEqual({ internalSecret: "internal-secret", bootstrapSecret: "workspace-bootstrap-secret" });
+  });
+
+  it("passes existingSecret and secretKeys to 0.2.0 (helm template fails without them), never a secret value", () => {
+    const v = relaycastValues(v2) as Record<string, unknown>;
+    expect(v.existingSecret).toBe("relaycast");
+    expect(v.secretKeys).toEqual({ internalSecret: "internal-secret", bootstrapSecret: "workspace-bootstrap-secret" });
+    expect(v).toMatchObject({ service: { type: "ClusterIP" }, ingress: { enabled: false }, persistence: { storageClass: STORAGE_CLASS } });
+    expect(Object.keys(v).filter((k) => /secret/i.test(k)).sort()).toEqual(["existingSecret", "secretKeys"]);
+  });
+
+  it("keeps 0.1.0 working: its values are exactly as before, with no secret keys", () => {
+    expect(JSON.stringify(relaycastValues(v1))).toBe(
+      JSON.stringify({
+        image: { digest: RELAYCAST_0_1_0.imageDigest },
+        baseUrl: "https://relaycast.proof-sandbox-sessions.agentrelay.com",
+        service: { type: "ClusterIP" },
+        ingress: { enabled: false },
+        persistence: { storageClass: STORAGE_CLASS, size: "10Gi" },
+        networkPolicy: { enabled: true, ingressFrom: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "96bulls" } } }] },
+      }),
+    );
+    expect(() => assertRelaycastInputs(v1)).not.toThrow();
+  });
+
+  it("refuses 0.2.0+ without a valid secretName, and a secretName on 0.1.x (it would be ignored)", () => {
+    const { secretName: _drop, ...noSecret } = v2;
+    expect(() => assertRelaycastInputs(noSecret)).toThrow(/secretName is required for chart 0\.2\.0/);
+    expect(() => assertRelaycastInputs({ ...noSecret, chartVersion: "1.0.0" })).toThrow(/secretName is required/);
+    expect(() => assertRelaycastInputs({ ...v2, secretName: "Relaycast_Secret" })).toThrow(/Kubernetes Secret name/);
+    expect(() => assertRelaycastInputs({ ...v1, secretName: "relaycast" })).toThrow(/reads no secret/);
+    expect(() => assertRelaycastInputs(v2)).not.toThrow();
+  });
+
+  it("the sandbox example runs 0.2.0 with the Secret relaycast, and the docs name its keys", () => {
+    expect(sbxExample.eks.relaycast).toEqual({ chartVersion: "0.2.0", imageDigest: RELAYCAST_0_2_0.imageDigest, baseUrl: "https://relaycast.proof-sandbox-sessions.agentrelay.com", secretName: "relaycast" });
+    expect(() => assertRelaycastInputs(sbxExample.eks.relaycast)).not.toThrow();
+    expect(sbxExample.$comment).toContain("Secret relaycast in namespace relaycast with keys internal-secret (>= 32 characters) and workspace-bootstrap-secret");
+    const docs = readFileSync(fileURLToPath(new URL("../../../docs/aws-stage.md", import.meta.url)), "utf8");
+    for (const s of ['"secretName": "relaycast"', "internal-secret", "workspace-bootstrap-secret", "metadata:{name:\"relaycast\",namespace:\"relaycast\"}"]) expect(docs).toContain(s);
   });
 });
 

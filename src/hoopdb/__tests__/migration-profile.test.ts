@@ -23,6 +23,7 @@ import {
   migrationChecksumMatches,
   RUNTIME_APPLICATION_FUNCTIONS,
   sessionsFunctionAcl,
+  sessionsFunctionAclPreview,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
   SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256,
   SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS,
@@ -409,7 +410,7 @@ describe("runtime role: required, existing, SELECT only", () => {
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
-    ).toBe(25);
+    ).toBe(28);
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
@@ -2148,6 +2149,121 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         (after.marker as Array<{ status: string }>).map((m) => m.status),
       ).toEqual(["pending"]);
     });
+
+  test("read-only ACL preview: before migrate only missing; clean migrate both empty; an extra grant is extra; a missing runtime grant is missing only", async () => {
+    const db = await fresh();
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
+    // Before the first migrate (migrations pending): absent functions are added, not refused.
+    const before = await sessionsFunctionAclPreview(client(db), "g6_rt", true);
+    expect(before.function_acl_drift_extra).toEqual([]);
+    expect(before.function_acl_missing_refused).toEqual([]);
+    expect(before.function_acl_missing.length).toBeGreaterThan(0);
+    // With nothing pending, an absent manifest function is refused.
+    expect(
+      (await sessionsFunctionAclPreview(client(db), "g6_rt", false))
+        .function_acl_missing_refused.length,
+    ).toBeGreaterThan(0);
+    const profile: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+    expect(await sessionsFunctionAclPreview(client(db), "g6_rt")).toEqual({
+      runtime_role: "g6_rt",
+      function_acl_drift_extra: [],
+      function_acl_missing: [],
+      function_acl_missing_refused: [],
+      function_acl_public_revoked: [],
+    });
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO authenticated",
+    );
+    expect(
+      (await sessionsFunctionAclPreview(client(db), "g6_rt"))
+        .function_acl_drift_extra,
+    ).toEqual(["sessions.repo_backfill_report(): authenticated:EXECUTE"]);
+    await db.exec(
+      "REVOKE EXECUTE ON FUNCTION sessions.repo_backfill_report() FROM authenticated; REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM g6_rt",
+    );
+    expect(await sessionsFunctionAclPreview(client(db), "g6_rt")).toEqual({
+      runtime_role: "g6_rt",
+      function_acl_drift_extra: [],
+      function_acl_missing: ["sessions.jwt_org_id(): g6_rt:EXECUTE"],
+      function_acl_missing_refused: [],
+      function_acl_public_revoked: [],
+    });
+    // PUBLIC EXECUTE is what the migrator revokes, not refuses: reported separately.
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO g6_rt, PUBLIC",
+    );
+    const pub = await sessionsFunctionAclPreview(client(db), "g6_rt");
+    expect(pub.function_acl_drift_extra).toEqual([]);
+    expect(pub.function_acl_public_revoked).toEqual([
+      "sessions.jwt_org_id(): PUBLIC:EXECUTE",
+    ]);
+    await db.exec(
+      "REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM PUBLIC",
+    );
+    await db.exec(
+      "REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM g6_rt",
+    );
+    // Read-only: the preview changed nothing.
+    expect(
+      (await sessionsFunctionAclPreview(client(db), "g6_rt"))
+        .function_acl_missing,
+    ).toEqual(["sessions.jwt_org_id(): g6_rt:EXECUTE"]);
+  });
+
+  test("read-only ACL preview agrees with the migrator: a missing non-runtime manifest grant and a duplicate-grantor surplus are refused by both", async () => {
+    const db = await fresh();
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
+    const profile: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+    // A missing service_role grant: nothing re-adds it.
+    await db.exec(
+      "REVOKE EXECUTE ON FUNCTION sessions.repo_backfill_report() FROM service_role",
+    );
+    const missing = await sessionsFunctionAclPreview(client(db), "g6_rt");
+    expect(missing.function_acl_missing_refused).toEqual([
+      "sessions.repo_backfill_report(): service_role:EXECUTE",
+    ]);
+    expect(missing.function_acl_missing).toEqual([]);
+    expect((await failure(runMigrations(client(db), { profile })))?.code).toBe(
+      "function_acl_drift",
+    );
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO service_role",
+    );
+    expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+    // The same grantee:privilege from a second grantor is a surplus for both.
+    await db.exec(`CREATE ROLE g6_grantor NOLOGIN;
+      GRANT USAGE ON SCHEMA sessions TO g6_grantor;
+      GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO g6_grantor WITH GRANT OPTION;
+      SET ROLE g6_grantor;
+      GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO service_role;
+      RESET ROLE`);
+    const dup = await sessionsFunctionAclPreview(client(db), "g6_rt");
+    expect(dup.function_acl_drift_extra).toEqual([
+      "sessions.repo_backfill_report(): g6_grantor:EXECUTE*",
+      "sessions.repo_backfill_report(): service_role:EXECUTE",
+    ]);
+    expect((await failure(runMigrations(client(db), { profile })))?.code).toBe(
+      "function_acl_drift",
+    );
+  });
 
   test("run-time exact manifest: local mode is unchanged (no check)", async () => {
     const db = await fresh();

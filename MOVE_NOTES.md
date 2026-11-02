@@ -248,7 +248,7 @@ throwaway local container that was removed afterwards.
 | relayhistory-cloud (#211 head `d9f2ba2`) | 96BullSessions | How |
 | --- | --- | --- |
 | `packages/object-store/**` (32 files, incl. `s3.ts` and `test/unit.test.ts` changed by #211) | `packages/object-store/**` | whole package, byte-identical (on relayhistory-cloud `main` since #174/#205, unchanged by #210) |
-| `packages/relayhistory/src/lib/pipeline/{adapter,object-layout,raw-chunks,reconcile}.ts` (added) | `packages/pipeline/src/lib/pipeline/` | byte-identical |
+| `packages/relayhistory/src/lib/pipeline/{adapter,object-layout,raw-chunks,reconcile}.ts` (added) | `packages/pipeline/src/lib/pipeline/` | byte-identical at the move. `raw-chunks.ts` has since diverged here: scrub rule set 2 (#108) segments strings past the scrub bound. |
 | `packages/relayhistory/src/lib/pipeline/{events,telemetry-ids,trace}.ts` (changed) | `packages/pipeline/src/lib/pipeline/` | overwritten, byte-identical |
 | `packages/relayhistory/src/routes/pipeline.ts` (changed) | `packages/pipeline/src/routes/pipeline.ts` | overwritten, byte-identical |
 | `packages/relayhistory/test/{pipeline-adapter,scrub-ruleset-version}.test.ts` (added) | `packages/pipeline/test/` | byte-identical |

@@ -88,6 +88,7 @@ export {
 export {
   SCRUB_RULESET,
   SCRUB_RULESET_VERSION,
+  canScrubLong,
   sealRawChunk,
 } from "@rhc/lib/pipeline/raw-chunks.ts";
 export {

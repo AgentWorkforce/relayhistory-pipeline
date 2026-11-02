@@ -246,6 +246,14 @@ applies, and `session-directory-precedence.test.ts` pins:
 - **Scalars and counters:** the latest live pointer wins title, project, repository,
   branch, model, state, event and token counts and cost, without summing across
   machines. `last_activity_at` is that pointer's.
+- **Brief title:** a model-written brief title (`sessions.session_briefs`, written by
+  the session-brief worker, `src/session-brief/`) wins over the latest pointer's title
+  while the brief exists. Any pointer tombstone or delete removes the brief (trigger), so
+  the pointer title returns on the next projection. With briefs off no row exists and
+  this rule changes nothing.
+- **Short summary producers:** `writeShortSummary` never lets a non-brief producer
+  (Bob Costas's extractive summary) replace a `session-brief/*` summary; the brief
+  replaces any summary not newer than it. Clearing (deletion, quarantine) still clears it.
 - **Deterministic ties:** latest `last_activity_at`, then highest `revision`, then
   highest `machine_id`.
 - **Memberships:** `machine_ids`, `user_ids` and the membership tables are the union of

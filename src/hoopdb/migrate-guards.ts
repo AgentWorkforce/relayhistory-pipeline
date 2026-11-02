@@ -116,6 +116,9 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.migration_ingest_audit": ["SELECT", "INSERT"],
   "sessions.migration_base_read_uses": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.claimless_window_activations": ["SELECT", "INSERT"],
+  "sessions.session_briefs": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_brief_wakeups": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_brief_attempts": ["SELECT", "INSERT", "UPDATE", "DELETE"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
@@ -150,6 +153,9 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.migration_ingest_audit",
   "sessions.migration_base_read_uses",
   "sessions.claimless_window_activations",
+  "sessions.session_briefs",
+  "sessions.session_brief_wakeups",
+  "sessions.session_brief_attempts",
 ] as const;
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
@@ -1055,7 +1061,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "8e59640c2e9f3506a2c581bf914ba790ecb29c4c2ba390b59a9f18f7a828809a";
+  "52ff269fc6d1149ad6a92dd5b5dc1f0f1dc7d69fa538bbdef08a1579f667fe21";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
@@ -1561,6 +1567,95 @@ export async function sessionsFunctionAclDrift(
         `${fn}: ${actual[fn] ? actual[fn]!.join(",") : "missing"} (expected ${expected[fn] ? expected[fn]!.join(",") : "absent"})`,
       );
   return drift;
+}
+
+/** Read-only preview of the exact-ACL drift check, split by what the migrator would do. */
+export interface FunctionAclPreview {
+  /** The runtime role whose RUNTIME_APPLICATION_FUNCTIONS grants are expected (null: none). */
+  runtime_role: string | null;
+  /** Grants present but not expected ("fn: entry"; "<default>" is the built-in PUBLIC EXECUTE): the migrator refuses these. */
+  function_acl_drift_extra: string[];
+  /**
+   * Grants expected but absent that the migrator adds: the runtime role's
+   * RUNTIME_APPLICATION_FUNCTIONS grants (installRuntimeApplicationAcl), and
+   * "fn: <function>" for a manifest function a pending migration still has to create.
+   */
+  function_acl_missing: string[];
+  /**
+   * Grants expected but absent that nothing re-adds: a non-runtime manifest grant on an
+   * existing function, or a manifest function missing with no migration pending. The
+   * migrator refuses these (function_acl_drift).
+   */
+  function_acl_missing_refused: string[];
+  /**
+   * PUBLIC EXECUTE the migrator would revoke before its check (its REVOKE ... FROM PUBLIC
+   * on every sessions function), so not refused; reported because such a function is
+   * PUBLIC-executable now.
+   */
+  function_acl_public_revoked: string[];
+}
+
+/**
+ * The same comparison as sessionsFunctionAclDrift (manifest plus the runtime application
+ * ACL the migrator installs), read-only and split into extras and missing grants. Missing
+ * runtime grants are expected before the first migrate; only extras would be refused.
+ */
+export async function sessionsFunctionAclPreview(
+  client: GuardClient,
+  runtimeRole: string | undefined,
+  pendingMigrations = false,
+): Promise<FunctionAclPreview> {
+  const manifest = await sessionsFunctionAclManifest();
+  const actual = await sessionsFunctionAcl(client);
+  const extra: string[] = [];
+  const missing: string[] = [];
+  const missingRefused: string[] = [];
+  const publicRevoked: string[] = [];
+  // Multiset counts, as the migrator's drift check compares sorted arrays: the same
+  // grantee:privilege from two grantors counts twice and is a surplus.
+  const counts = (xs: string[]) => {
+    const m = new Map<string, number>();
+    for (const x of xs) m.set(x, (m.get(x) ?? 0) + 1);
+    return m;
+  };
+  for (const fn of [...new Set([...Object.keys(manifest), ...Object.keys(actual)])].sort()) {
+    const runtimeEntry =
+      runtimeRole && (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+        ? `${runtimeRole}:EXECUTE`
+        : null;
+    const expectedList = [...(manifest[fn] ?? []), ...(runtimeEntry ? [runtimeEntry] : [])];
+    const raw = actual[fn];
+    if (raw === undefined) {
+      if (manifest[fn])
+        (pendingMigrations ? missing : missingRefused).push(`${fn}: <function>`);
+      continue;
+    }
+    // Model the migrator's REVOKE EXECUTE ... FROM PUBLIC: the built-in default becomes
+    // owner-only, and PUBLIC EXECUTE entries go away.
+    const have: string[] = [];
+    for (const e of raw)
+      if (e === "<default>") {
+        publicRevoked.push(`${fn}: <default>`);
+        have.push("<owner>:EXECUTE");
+      } else if (e.startsWith("PUBLIC:EXECUTE")) publicRevoked.push(`${fn}: ${e}`);
+      else have.push(e);
+    const want = counts(expectedList);
+    const got = counts(have);
+    for (const [e, n] of [...got].sort())
+      for (let i = want.get(e) ?? 0; i < n; i++) extra.push(`${fn}: ${e}`);
+    for (const [e, n] of [...want].sort())
+      for (let i = got.get(e) ?? 0; i < n; i++)
+        // Only the runtime grants are (re)installed by the migrator; any other missing
+        // manifest grant on an existing function is refused.
+        (e === runtimeEntry ? missing : missingRefused).push(`${fn}: ${e}`);
+  }
+  return {
+    runtime_role: runtimeRole ?? null,
+    function_acl_drift_extra: extra,
+    function_acl_missing: missing,
+    function_acl_missing_refused: missingRefused,
+    function_acl_public_revoked: publicRevoked,
+  };
 }
 
 /**

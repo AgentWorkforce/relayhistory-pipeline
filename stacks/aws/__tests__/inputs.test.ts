@@ -138,6 +138,17 @@ describe("aws-proof-sandbox: the E2E proof in the Pippen sandbox of agent aws-pr
     expect(() => validateAwsInputs("aws-proof", filled(), approved)).not.toThrow();
   });
 
+  it("under pippen sandbox exec, the exec's lease and account must match the pinned session", () => {
+    const SESSION = "3f2b8c1e-9d4a-4e6b-a1c7-5b0e2f9d8a14";
+    const ARN = `arn:aws:sts::361835732085:assumed-role/agent-session/agent-${SESSION}`;
+    const exec = { NINETY_SIX_BULLS_PIPPEN_SESSION: SESSION, AWS_PROFILE: "pippen-sandbox", AWS_CONFIG_FILE: "/run/user/1000/pippen-exec-x/config", AWS_SHARED_CREDENTIALS_FILE: "/dev/null" };
+    expect(pippenProofSandboxCallerArn({ ...exec, PIPPEN_SANDBOX_SESSION_ID: SESSION, PIPPEN_SANDBOX_ACCOUNT_ID: "361835732085" })).toBe(ARN);
+    expect(pippenProofSandboxCallerArn(exec)).toBe(ARN);
+    expect(() => pippenProofSandboxCallerArn({ ...exec, PIPPEN_SANDBOX_SESSION_ID: "9a1c2b3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d" })).toThrow(/PIPPEN_SANDBOX_SESSION_ID .* is not NINETY_SIX_BULLS_PIPPEN_SESSION/);
+    expect(() => pippenProofSandboxCallerArn({ ...exec, PIPPEN_SANDBOX_SESSION_ID: "" })).toThrow(/is not NINETY_SIX_BULLS_PIPPEN_SESSION/);
+    expect(() => pippenProofSandboxCallerArn({ ...exec, PIPPEN_SANDBOX_ACCOUNT_ID: "500268966557" })).toThrow(/PIPPEN_SANDBOX_ACCOUNT_ID is not the sandbox account/);
+  });
+
   it("the stack checks the caller is the pippen agent-session role before declaring anything", () => {
     const SESSION = "3f2b8c1e-9d4a-4e6b-a1c7-5b0e2f9d8a14";
     const ARN = pippenProofSandboxCallerArn({ NINETY_SIX_BULLS_PIPPEN_SESSION: SESSION });
@@ -145,7 +156,9 @@ describe("aws-proof-sandbox: the E2E proof in the Pippen sandbox of agent aws-pr
     for (const bad of [undefined, "", "aws-proof", SESSION.toUpperCase(), SESSION.replace("-4e6b-", "-1e6b-"), `${SESSION}x`])
       expect(() => pippenProofSandboxCallerArn({ NINETY_SIX_BULLS_PIPPEN_SESSION: bad })).toThrow(/needs NINETY_SIX_BULLS_PIPPEN_SESSION/);
     const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
-    const guard = stack.indexOf("verifyCallerArn(");
+    // In the stack's Effect (the state layer, before it, runs the same check before making the sandbox's state bucket).
+    const guard = stack.indexOf("verifyCallerArn(", stack.indexOf("export default Alchemy.Stack("));
+    expect(stack.indexOf("verifyCallerArn(")).toBeLessThan(stack.indexOf("ensurePippenStateBucket(\n"));
     expect(guard).toBeGreaterThan(stack.indexOf("assertAwsDeploymentTarget("));
     expect(guard).toBeLessThan(stack.indexOf("AWS.KMS.Key("));
     expect(stack).toContain("if (stage === PIPPEN_PROOF_SANDBOX.stage)");

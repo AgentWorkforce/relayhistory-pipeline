@@ -64,10 +64,12 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   cut into segments under the 256 KiB scrub limit at line boundaries: a
   private key starts its own segment, and no cut falls inside one or between
   two digit groups or inside any match spanning a newline (a `Bearer` or
-  `key =` prefix and its secret), so no line is truncated (a chunk with no such boundary in the last 64 KiB of
-  a run is refused with 400 rather than truncated, as is a chunk holding a single line or string longer
-  than the 256 KiB scrub limit). Bytes that are not UTF-8 are
-  refused;
+  `key =` prefix and its secret), so no line is truncated. A chunk with no
+  such boundary in the last 64 KiB of a run is refused with 400 rather than
+  truncated. From scrub rule set 2, a single line or string longer than the
+  256 KiB scrub limit is stored whole, scrubbed in segments cut at safe
+  whitespace and never inside a private-key block; one with no safe cut is
+  refused. Bytes that are not UTF-8 are refused;
 - the caller must own the location by the same rule as the manifest POST
   (`PIPELINE_ORG_ID` or the org prefix), checked before the body is read, and
   the body is capped at 16 MiB while it is read;
@@ -75,7 +77,7 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   key, with `raw-sha256`, `raw-bytes`, `scrub-ruleset` and `scrub-version`
   metadata;
 - the response is the chunk entry and the `raw.scrub` marker
-  (`relayhistory-scrub`, version 1) for the client's manifest.
+  (`relayhistory-scrub`, the current version, 2 from scrub rule set 2) for the client's manifest.
 
 The unscrubbed bytes are never written to storage. If the key already holds
 an object (identical bytes or not), it is kept and described from its own

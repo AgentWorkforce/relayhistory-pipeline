@@ -15,6 +15,8 @@ import {
   buildCandidateQuery,
   buildNewestQuery,
   buildPartialSessionsQuery,
+  buildWorkspacePartialSessionsQuery,
+  PARTIAL_SESSIONS_CAP,
   candidatePosition,
   type CandidateRow,
   type EventQuery,
@@ -45,6 +47,8 @@ export interface Liveness {
    * `source` is omitted), whether any pointer row exists, and whether all are erased.
    */
   sessionStart(orgId: string, workspaceId: string, sessionId: string, source?: string): Promise<{ pointers: number; live: number; createdAtMs: number | null }>;
+  /** The subset of `sessionIds` with at least one live pointer row in this workspace (any harness). */
+  livePointerSessions(orgId: string, workspaceId: string, sessionIds: string[]): Promise<Set<string>>;
 }
 
 export const keyOf = (k: SessionKey) => `${k.source}\u0000${k.sessionId}`;
@@ -190,4 +194,46 @@ export async function partialSessions(deps: PageDeps, orgId: string, sessionId?:
     params: q.params,
   });
   return rows.map((r) => r.session_id);
+}
+
+export interface WorkspacePartials {
+  /** Partial sessions that may hold this workspace's rows. */
+  sessions: string[];
+  /** The org has more partial sessions than one check lists: not decided. */
+  overflow: boolean;
+}
+
+/**
+ * The partial sessions a workspace search must not answer without: those of
+ * the token's org that belong to the token's workspace. The state table has
+ * no workspace, so a partial session belongs to this workspace when either
+ *
+ *   - it has a row (any version) in this workspace's `transcript_events`, or
+ *   - it has a live pointer row in this workspace's `session_index`.
+ *
+ * The second covers a session whose passes were all partial and so wrote no
+ * row (search-index.ts indexSearchScope writes only the state row then). The
+ * pipeline indexes a scope only from its live pointers, and every Neon session
+ * reaches S3 through the exporter's pointers, so a session holding content of
+ * this workspace has a row here or a live pointer here. A session with neither
+ * belongs to another workspace (whose search it still blocks), or is erased
+ * here, where the erasure filter drops its rows anyway. Candidate rows alone
+ * would not do: the events a partial session is missing are not candidates.
+ *
+ * The check stops at the first finding: an in-workspace row decides without
+ * asking Supabase.
+ */
+export async function partialSessionsInWorkspace(deps: PageDeps, orgId: string, workspaceId: string): Promise<WorkspacePartials> {
+  const q = buildWorkspacePartialSessionsQuery(deps.ch.database, orgId, workspaceId);
+  const rows = await deps.ch.select<{ session_id: string; in_workspace: number | string }>(q.query, {
+    settings: { ...READ_SETTINGS },
+    timeoutMs: deps.timeoutMs ?? 3_000,
+    params: q.params,
+  });
+  if (rows.length > PARTIAL_SESSIONS_CAP) return { sessions: [], overflow: true };
+  const inWorkspace = rows.filter((r) => Number(r.in_workspace) === 1).map((r) => r.session_id);
+  if (inWorkspace.length > 0) return { sessions: inWorkspace, overflow: false };
+  if (rows.length === 0) return { sessions: [], overflow: false };
+  const pointed = await deps.liveness.livePointerSessions(orgId, workspaceId, rows.map((r) => r.session_id));
+  return { sessions: rows.map((r) => r.session_id).filter((id) => pointed.has(id)), overflow: false };
 }

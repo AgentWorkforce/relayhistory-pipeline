@@ -222,6 +222,92 @@ describe("strings over the scrub bound", () => {
   });
 });
 
+describe("scrub rule set 2: long strings stored whole", () => {
+  test("a long string with safe cuts is kept whole (no cut, no ledger row); only an unsegmentable run is cut", () => {
+    const long = "word ".repeat(80_000);
+    const kept = boundStrings(`{"out": ${JSON.stringify(long)}}`);
+    expect(kept).toEqual({ text: `{"out": ${JSON.stringify(long)}}`, truncated: 0, maxChars: 0 });
+    const cut = boundStrings(`{"out": ${JSON.stringify("q".repeat(300_000))}}`);
+    expect(cut.truncated).toBe(1);
+  });
+
+  test("the whole string is sealed (version 2) and the transform reads it back intact", async () => {
+    const { store } = await countingStore();
+    const long = `${"word ".repeat(80_000)}AKIAIOSFODNN7EXAMPLE tail`;
+    const r = await exportUnit(target(store), unit("org-a"), fixedSource([rec("tool_call", "origin-a", "t", { output: long })]));
+    const key = r.manifests[0]!.manifestKey;
+    const m = await parseManifest(await readText(store, key), key);
+    expect(m.raw.scrub).toEqual({ ruleset: "relayhistory-scrub", version: 2 });
+    expect(r.manifests[0]!.truncatedStrings).toBe(0);
+    const read = await readRelayhistoryExport(m, store, (b) => new Uint8Array(zstdDecompressSync(b)), { prefix: "96bulls/org-a" });
+    const out = (read[0]!.payload as { output: string }).output;
+    expect(out.endsWith(" tail")).toBe(true);
+    expect(out).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(out.length).toBeGreaterThan(400_000);
+  });
+
+  test("--reexport-truncated queues every ledgered group as changed", async () => {
+    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    state.seeRevisions(1, [{ org_id: "o", session_id: "t", revision: "1" }, { org_id: "o", session_id: "u", revision: "1" }]);
+    state.markExported("o", "t", 1, ["96bulls/o/v1/k/manifest.json"], Date.now());
+    state.markExported("o", "u", 1, ["96bulls/o/v1/j/manifest.json"], Date.now());
+    state.recordTruncations("o", "t", [{ key: "96bulls/o/v1/k/manifest.json", strings: 2, maxChars: 300_000 }]);
+    // a ledgered group that is failing past its attempt cap is revived too
+    state.seeRevisions(1, [{ org_id: "o", session_id: "f", revision: "1" }]);
+    state.recordTruncations("o", "f", [{ key: "96bulls/o/v1/f/manifest.json", strings: 1, maxChars: 300_000 }]);
+    for (let i = 0; i < 8; i++) state.markFailed("o", "f", "57014", ["96bulls/o/v1/f/manifest.json"], 1, Date.now());
+    expect(state.forceReexportTruncated()).toBe(2);
+    expect(state.nextWork(Date.now(), 86_400_000, 10).map((w) => `${w.kind}:${w.session_id}`).sort()).toEqual(["changed:t", "retry:f"]);
+    state.close();
+  });
+});
+
+describe("a session spanning the scrub rule set 1 -> 2 deploy", () => {
+  /** The exporter/courier before the bump: same bytes, scrub-version 1 metadata and manifest. */
+  function asV1(inner: ObjectStore): ObjectStore {
+    return {
+      ...inner,
+      head: (k) => inner.head(k),
+      get: (k, r) => inner.get(k, r),
+      getObject: (k, r) => inner.getObject(k, r),
+      list: (p, c) => inner.list(p, c),
+      presignGet: (k, t) => inner.presignGet(k, t),
+      delete: (k) => inner.delete(k),
+      put: (k, b, o) => {
+        if (String(k).endsWith("manifest.json"))
+          b = new TextEncoder().encode(
+            new TextDecoder().decode(b).replace('"scrub":{"ruleset":"relayhistory-scrub","version":2}', '"scrub":{"ruleset":"relayhistory-scrub","version":1}'),
+          );
+        const md = o?.metadata?.["scrub-version"] ? { ...o.metadata, "scrub-version": "1" } : o?.metadata;
+        return inner.put(k, b, { ...o, ...(md ? { metadata: md } : {}) });
+      },
+    };
+  }
+
+  test("an export grown after the deploy lists v1 and v2 chunks and still passes AlleyOop's sealed check", async () => {
+    const { store } = await countingStore();
+    const first = baseRecords().slice(0, 2);
+    const r1 = await exportUnit(target(asV1(store), { maxChunkBytes: 200 }), unit("org-a"), fixedSource(first));
+    const key = r1.manifests[0]!.manifestKey;
+    const m1 = await parseManifest(await readText(store, key), key);
+    expect(m1.raw.scrub!.version).toBe(1);
+    expect(await chunksAreServerSealed({ store } as never, m1, "96bulls/org-a")).toBe(true);
+    await exportUnit(target(store, { maxChunkBytes: 200 }), unit("org-a"), fixedSource([...first, baseRecords()[2]!]));
+    const m2 = await parseManifest(await readText(store, key), key);
+    expect(m2.raw.scrub!.version).toBe(1); // the lowest over the chunks
+    expect(await chunksAreServerSealed({ store } as never, m2, "96bulls/org-a")).toBe(true);
+    // A chunk claiming a newer rule set than this server knows is still refused.
+    const chunk = m2.raw.chunks.at(-1)!;
+    const raw = `${key.slice(0, -"manifest.json".length)}raw/${String(chunk.seq).padStart(10, "0")}-${chunk.start_offset}-${chunk.sha256_8}.ndjson.zst`;
+    const object = await store.getObject(objectKey(raw));
+    const body = await readAll(object.body);
+    await store.delete(objectKey(raw));
+    const { "content-sha256": _sha, ...meta } = object.meta.metadata;
+    await store.put(objectKey(raw), body, { metadata: { ...meta, "scrub-version": "99" } });
+    expect(await chunksAreServerSealed({ store } as never, m2, "96bulls/org-a")).toBe(false);
+  });
+});
+
 describe("idempotency", () => {
   test("re-exporting an unchanged session writes and deletes nothing", async () => {
     const { store, counts } = await countingStore();
