@@ -28,7 +28,7 @@ These requests get `501 unsupported_by_backend` with a `reason`, and Cloud then 
 
 ## Guarantees and their tests
 
-Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--only "read api"`, 26 of 26 caught). Reverting the control turns the named test red.
+Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--only "read api"`, 33 of 33 caught). Reverting the control turns the named test red.
 
 **Tenancy:**
 - Org and workspace come only from the verified RelayAuth assertion. The token must be:
@@ -67,7 +67,7 @@ Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--
    Use the real backfill start (the search-index window start), not a guess. Use `"epoch"` only once full-history backfill is proven complete.
 
    **Account below the default Lambda quota.** A new account's concurrency limit is 10, and AWS keeps 10 unreserved, so the default reservation (10) is refused (`decreases account's UnreservedConcurrentExecution below its minimum value of [10]`). Only while that quota increase is pending, add `"reservedConcurrency": "none"`: the function then reserves nothing and shares the account pool with the session pipeline. `session-read-api-throttles-alarm` (`Throttles`, Sum > 0 over 5 minutes) shows when that pool is exhausted. Remove `"none"` once the quota is raised: the re-plan is a `session read api update` that sets the reservation to 10.
-4. **Plan.** Capture the plan and record approval as for every sessions-prod change. The contract accepts only the phase `session read api rollout`: the read API's four resources (function, secret, errors and throttles alarms) are created, or the rest of them after a partial apply, and every other resource is `noop`. After the sessions-prod first apply that created only the errors alarm, the plan is `session-read-api`, `session-read-api-secret` and `session-read-api-throttles-alarm` create, `session-read-api-errors-alarm` noop.
+4. **Plan.** Capture the plan and record approval as for every sessions-prod change. The contract accepts only the phase `session read api rollout`: the read API's four resources (function, secret, errors and throttles alarms) are created, or the rest of them after a partial apply, and every other resource is `noop`. After the sessions-prod first apply that created only the errors alarm, the plan is `session-read-api`, `session-read-api-secret` and `session-read-api-throttles-alarm` create, `session-read-api-errors-alarm` noop. One exception: if the session pipeline has an unapplied code-only update, the same phase also accepts `session-pipeline` updating with no declared property changes, plus all five resources that name its role updating by exactly the role-ARN cascade (`assertPipelineRoleCascadeDiff`). This exception requires `session-read-api` to be `create`. A pipeline-only capture cannot replace it once the errors alarm is in state.
 5. **Apply.** Then set the secret value from 1Password:
    ```json
    { "clickhouse": { "url": "https://…:8443", "user": "…", "password": "…", "database": "relay_search" },
