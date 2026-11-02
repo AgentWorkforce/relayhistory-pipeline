@@ -164,10 +164,16 @@ export function ensurePippenStateBucket(aws: AwsRun, i: { accountId: string; reg
  * missing or unreadable gives undefined: the default store, and readInputs
  * then refuses the stage as before.
  */
-export function stateTargetFromArgv(argv: readonly string[], readInputsText: (stage: string) => string | undefined): (StateTarget & { stage: string }) | undefined {
+/** The aws-* stage Alchemy was started with (`--stage X` or `--stage=X`), or undefined. */
+export function stageFromArgv(argv: readonly string[]): string | undefined {
   const at = argv.indexOf("--stage");
   const stage = at >= 0 ? argv[at + 1] : argv.find((a) => a.startsWith("--stage="))?.slice("--stage=".length);
-  if (!stage || !/^aws-[a-z0-9-]+$/.test(stage)) return undefined;
+  return stage && /^aws-[a-z0-9-]+$/.test(stage) ? stage : undefined;
+}
+
+export function stateTargetFromArgv(argv: readonly string[], readInputsText: (stage: string) => string | undefined): (StateTarget & { stage: string }) | undefined {
+  const stage = stageFromArgv(argv);
+  if (!stage) return undefined;
   let inputs: Partial<StateTarget>;
   try {
     inputs = JSON.parse(readInputsText(stage) ?? "null") ?? {};

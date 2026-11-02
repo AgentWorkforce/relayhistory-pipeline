@@ -40,7 +40,7 @@ describe("plan --detailed", () => {
   test("up verifies the captured plan before deploying", () => {
     const cli = require("node:fs").readFileSync(new URL("../main.ts", import.meta.url), "utf8") as string;
     const runner = cli.slice(cli.indexOf("async function aws("), cli.indexOf("async function main()"));
-    expect(runner.indexOf("verifyCapturedPlan(ROOT, stage)")).toBeGreaterThan(0);
-    expect(runner.indexOf("verifyCapturedPlan(ROOT, stage)")).toBeLessThan(runner.indexOf('sh("bunx", inv.args'));
+    expect(runner.indexOf("verifyCapturedPlan(ROOT, stage, baseEnv)")).toBeGreaterThan(0);
+    expect(runner.indexOf("verifyCapturedPlan(ROOT, stage, baseEnv)")).toBeLessThan(runner.indexOf('sh("bunx", inv.args'));
   });
 });
