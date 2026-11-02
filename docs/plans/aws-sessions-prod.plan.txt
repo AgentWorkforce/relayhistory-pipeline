@@ -4,7 +4,7 @@ Resolving stack services
 AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
 Loading stack state
 Computing plan
-Plan ready (2.0s)
+Plan ready (2.1s)
 Plan: 2 to create, 8 to update
 [access-logs] noop
 [budget] noop
@@ -36,3 +36,5 @@ Plan: 2 to create, 8 to update
 [transcripts] update
 [transcripts-key] update
 [transcripts-key-alias] noop
+[33m[COULD_NOT_CLEAN_DIRECTORY] [0mCould not clean directory for output chunks: /home/khaliqgant/Projects/AgentWorkforce/sessions-pipeline-worktrees/brief-rollout-contract/.alchemy/bundles/96bulls-aws-aws-sessions-prod-session-pipeline. Reason: No such file or directory (os error 2)
+
