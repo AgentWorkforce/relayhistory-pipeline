@@ -81,9 +81,16 @@ because the Worker carries no migration files. The #121 Lambda has no gate at al
 
 ## Prerequisites
 
-- PR 1 (this Worker) merged. Its deploy is step 7.
-- PR 2 (`SESSION_BRIEF_ENABLED="true"` on the session pipeline Lambda) stays **unapplied** until
-  step 9.
+- This Worker merged. Its deploy is step 7.
+- **One runner.** `main` also carries an in-Lambda runner (9b3dc9d, db96343):
+  `transcriptStore.sessionPipeline.briefs.enabled` arms wakeups and enables the pipeline's own
+  every-minute `session-brief-schedule`. Arming stays **off** until step 9. Running both is safe
+  (claims are `SKIP LOCKED` under leases, and the caps are shared rows), but it is two spenders to
+  watch, and every Lambda tick takes one of the account's 10 concurrent executions. Step 9 says
+  how to arm for the Worker.
+- **Retire the catch-up loop first.** It runs the `b47c1e6` projector, which overwrites brief
+  titles in `session_directory` (docs/activation/supabase-upgrade-eff8b3be-to-5ed11913.md, U6a;
+  `runbooks/sessions-prod-session-pipeline.md` "Session briefs", step 1).
 - Prod Supabase at generation `5ed11913…` (#127's tables). This is already the case per
   `docs/activation/supabase-upgrade-eff8b3be-to-5ed11913.md`.
 - The Cloudflare account. **Recommended:** Agent Workforce `f7232cb80f6fab86a95426302af243e4`,
@@ -120,7 +127,7 @@ SELECT EXISTS (SELECT 1 FROM sessions.__96bulls_migrations WHERE name = 'upstrea
 - **Pass:** every `ok` is true except the `session_brief` row, which must be false; `ledgered` is
   true; `marker` is `pass`.
 - **On any miss, stop.** The migrator's `--activation-check` ACL drift preview (#147) shows the
-  difference. A miss would also break PR 2, because the indexer's `armWakeup` writes
+  difference. A miss would also break arming (step 9), because the indexer's `armWakeup` writes
   `session_brief_wakeups` inside the pointer upsert.
 
 **2. Hyperdrive.** Upload the CA once per account (skip this if #155 already did), then create
@@ -219,10 +226,15 @@ bunx alchemy deploy --config stacks/cloudflare/alchemy.session-brief.run.ts --st
 | `gated` | `schema_pending` / `validation_pending`: the step 1 checks, or a migrator is running. `gate_error:<SQLSTATE>`: Hyperdrive or grants. |
 | `model_not_configured` | The OpenAI secret is unset. |
 
-**9. Arm (PR 2).** Merge PR 2, then capture and apply `aws-sessions-prod` per
-`runbooks/sessions-prod-session-pipeline.md`. The contract classifies it as **session pipeline
-update**: `session-pipeline` adds `SESSION_BRIEF_ENABLED: "true"` to its env, and the five grants
-show only the role-ARN cascade.
+**9. Arm.** On `main`, arming is the pipeline input `transcriptStore.sessionPipeline.briefs.enabled`
+(`runbooks/sessions-prod-session-pipeline.md` "Session briefs"). It sets
+`SESSION_BRIEF_ENABLED: "true"` on the Lambda **and** enables its `session-brief-schedule`.
+- **With the Worker as the only runner** (Khaliq, 2026-11-02): leave `openai_api_key` out of the
+  pipeline secret. The Lambda's ticks then prune only and claim nothing. Or first add an arm-only
+  switch to `briefs`, so the env says `true` while the rule stays `DISABLED` (a small follow-up;
+  see #164).
+- Capture and apply as that runbook says: **session brief update**, with the function's env update
+  and its role-ARN cascade.
 - From then on, each newly indexed revision arms one debounced wakeup. It is due 10 minutes after
   the last activity, and never later than 60 minutes after the first unbriefed activity.
 
@@ -256,7 +268,7 @@ Wakeups with no new activity for 72 h are dropped unbriefed.
 | --- | --- |
 | Stop model calls at once, keep the Worker | Delete or blank the OpenAI Secrets Store secret, or set it to a value ending in `-disabled`. The tick then prunes only and claims nothing. Takes effect on the next invocation, with no deploy. |
 | Turn the Worker off | Set `"enabled": false` in the inputs. Capture again (phase **session brief update**: `SESSION_BRIEF_ENABLED: "false"`), approve, deploy. |
-| Stop arming | Revert PR 2 (a session pipeline update). Existing wakeups are briefed or pruned. |
+| Stop arming | `briefs.enabled: false` on the pipeline (a session brief update, per its runbook). Existing wakeups are briefed or pruned. |
 | Bad Worker version | Deploy the previous commit through steps 6 and 7. The contract never accepts a delete, so there is no Alchemy destroy. |
 
 Briefs are additive. The directory keeps the pointer title when no brief exists, and deleting a
