@@ -47,6 +47,7 @@
 --                     text, timestamptz, timestamptz, timestamptz, timestamptz, text[],
 --                     text[], timestamptz, text, text, integer)
 --   20261101050000  sessions.session_directory_activity(text, timestamptz, timestamptz)
+--   20261102000000  sessions.session_brief(text, text, text)
 --
 -- Run it with
 --   psql -v ON_ERROR_STOP=1 -X -f supabase/bootstrap/session_directory_search_worker_verify.sql
@@ -68,7 +69,8 @@ DECLARE
     'sessions.session_directory_pointers(text, text, text)',
     'sessions.session_directory_readiness()',
     'sessions.list_session_directory(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)',
-    'sessions.session_directory_activity(text, timestamptz, timestamptz)'];
+    'sessions.session_directory_activity(text, timestamptz, timestamptz)',
+    'sessions.session_brief(text, text, text)'];
   v_fns oid[] := '{}';
   v_fn oid;
   v_sig text;
@@ -158,7 +160,7 @@ BEGIN
                 WHERE p.pronamespace = v_sessions
                   AND p.proname IN ('search_session_directory', 'session_directory_pointers',
                                     'session_directory_readiness', 'list_session_directory',
-                                    'session_directory_activity')
+                                    'session_directory_activity', 'session_brief')
                   AND NOT (p.oid = ANY (v_fns)) LOOP
     v_problems := array_append(v_problems, format('approved RPC redefined: %s', v_row.fn)::text);
   END LOOP;

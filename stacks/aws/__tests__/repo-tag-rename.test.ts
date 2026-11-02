@@ -177,11 +177,11 @@ describe("repo tag rename: refusals", () => {
   });
 
   it("refuses a create (the read API) alongside the rename", () => {
-    const readApi = ["session-read-api", "session-read-api-errors-alarm", "session-read-api-secret"]
+    const readApi = ["session-read-api", "session-read-api-errors-alarm", "session-read-api-secret", "session-read-api-throttles-alarm"]
       .map((r) => `[${r}] create\n  properties:\n    tags:\n      96bulls:repo: AgentWorkforce/sessions-pipeline\n`)
       .join("\n");
     const withReadApi = REAL.replace("[session-reconcile-continue] update", `${readApi}\n[session-reconcile-continue] update`);
-    expect(() => check(withReadApi)).toThrow(/repo tag rename: only in-place updates may come with the rename, found session-read-api:create, session-read-api-errors-alarm:create, session-read-api-secret:create; apply the rename alone first/);
+    expect(() => check(withReadApi)).toThrow(/repo tag rename: only in-place updates may come with the rename, found session-read-api:create, session-read-api-errors-alarm:create, session-read-api-secret:create, session-read-api-throttles-alarm:create; apply the rename alone first/);
     expect(() => check(withReadApi, null)).toThrow(/session-read-api:create/);
     // Any other create, e.g. a store resource.
     expect(() => check(op(REAL, "budget", "noop", "create"))).toThrow(/found budget:create/);
