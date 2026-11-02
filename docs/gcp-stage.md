@@ -194,6 +194,16 @@ on a difference, never writes after the apply lease ends, and reads back:
   soft delete remains. Thirty days bounds both storage and how long an erased
   or overwritten transcript lingers.
 
+Live, 2026-11-02, merge `944992b`: the plan had no create or delete, only the
+two actions. `locker-lifecycle` and `cloud-sql-protection` both ran, and
+`gcloud` read back `deletionProtectionEnabled: true`, `retainBackupsOnDelete:
+true` and point-in-time recovery with 7 retained backups, with the instance
+RUNNABLE and not restarted. The locker's `lifecycle_config` is exactly
+`Delete` on `isLive: false, daysSinceNoncurrentTime: 30`, with versioning and
+7-day soft delete still on. A live delete attempt was deliberately not made:
+Cloud SQL has no dry run for deleting an instance, so the read-back is the
+evidence.
+
 ### Per-component bucket identities
 
 Each component now has its own Google service account, scoped like the AWS
