@@ -103,7 +103,23 @@ from the 96Bulls AlleyOop pods, plus the `relayfile` namespace when the
 Relayfile add-on is enabled, since it verifies tokens against this JWKS. When a
 public JWKS Ingress is configured
 (`relayauth.baseUrl`), `:8787` is also admitted from the GCE load-balancer and
-health-check ranges (`130.211.0.0/22`, `35.191.0.0/16`), and nothing else. Applying the policy requires `bulls96.relayauthJwksUrl` to be the
+health-check ranges (`130.211.0.0/22`, `35.191.0.0/16`), and nothing else.
+
+Live evidence, 2026-11-01, deployed from merge `04410e5` (3 creates, nothing
+else changed). Probe pods in another namespace (`default`) and in `relayauth`:
+
+| Check | before | after |
+| --- | --- | --- |
+| `default` pod → `relayauth:8787` | open | blocked |
+| `relayauth` pod → `https://example.com`, TCP `8.8.8.8:443` | 200 / open | blocked / blocked |
+| AlleyOop → `relayauth:8787` (JWKS) | open | open (the E2E verifies tokens) |
+
+RelayAuth stayed ready with zero restarts. The machine-bound E2E passed at
+`04410e5` (machine `proof-gcp-mvyicx6wa9e27b-a`): claimless and mismatch
+assertions were refused with 403 `machine_claim_refused`, two encrypted
+summaries were written, zero dead letters, and trace `indexed`. Other
+namespaces (`default` here) keep their own unrestricted egress; only `96bulls`
+and `relayauth` are fenced. Applying the policy requires `bulls96.relayauthJwksUrl` to be the
 in-cluster RelayAuth service, the only JWKS destination it allows; a public JWKS
 URL is refused rather than silently cut off. Deliberately not allowed: in-cluster
 ingress to AlleyOop (nothing calls it in-cluster and it has no Ingress or load
