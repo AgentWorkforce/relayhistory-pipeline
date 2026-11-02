@@ -41,7 +41,7 @@ import {
   type HistoryExportBatch,
 } from "./vendor/delivery/delivery-contracts.ts";
 import { prepareDelivery, type PreparedDelivery } from "./vendor/delivery/prepare.ts";
-import { batchMarkerKey, replicaMessage, sendReplica, type ReplicaOutcome, type ReplicaSink } from "./replica.ts";
+import { batchMarkerKey, replicaMessage, sendReplica, stagedReplicaMessage, type ReplicaOutcome, type ReplicaSink } from "./replica.ts";
 import { IngestWriteError, assertTenantSegment, groupRecords, liveMachineId, writeBatchObjects, type WriteResult, type WriteTarget } from "./writer.ts";
 import { fanoutMessages, stageGroups, type FanoutMessage } from "./staging.ts";
 
@@ -204,6 +204,7 @@ async function writeAndCommit(
   const machineId = liveMachineId(tenant.workspaceId, prepared.originId, tenant.userId);
   let written: WriteResult | null = null;
   let staged = false;
+  let replicaOutcome: ReplicaOutcome = "off";
   const receivedAt = now();
   const grouped = keep.length > 0 ? groupRecords(keep.map((i) => prepared.records[i]!), receivedAt) : null;
   if (grouped && deps.inlineMaxSessions !== undefined && grouped.groups.length > deps.inlineMaxSessions) {
@@ -219,6 +220,11 @@ async function writeAndCommit(
     await stage("fanout", () => deps.fanout!(fanoutMessages(key, grouped.groups.length)));
     staged = true;
     mark("staging");
+    if (deps.replica && deps.replica.mode !== "off") {
+      const message = stagedReplicaMessage(tenant, prepared, { key, groups: grouped.groups.length, index: grouped.index }, resets, now(), keep);
+      replicaOutcome = await stage("replica", () => sendReplica(deps.replica, message, prepared, batchMarkerKey(deps.target.keyRoot, tenant, prepared.originId, prepared.batchId)));
+      mark("replica");
+    }
   } else if (keep.length > 0) {
     written = await stage("objects", () =>
       writeBatchObjects(deps.target, {
@@ -233,7 +239,7 @@ async function writeAndCommit(
     mark("objects");
   }
 
-  let replica: ReplicaOutcome = staged && deps.replica && deps.replica.mode !== "off" ? "deferred_staged" : "off";
+  let replica: ReplicaOutcome = replicaOutcome;
   if (written && deps.replica && deps.replica.mode !== "off") {
     const message = replicaMessage(tenant, prepared, written, resets, now(), keep);
     replica = await stage("replica", () => sendReplica(deps.replica, message, prepared, batchMarkerKey(deps.target.keyRoot, tenant, prepared.originId, prepared.batchId)));

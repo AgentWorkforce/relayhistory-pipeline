@@ -376,6 +376,20 @@ describe("staging: a batch wider than one Worker invocation", () => {
     expect((await deliverBatch(staged, TENANT, await batch(records))).outcome).toBe("replay");
   }, 60_000);
 
+  test("a staged batch's replica is sent at request time with [group, line] placements in the staged object", async () => {
+    const sent: NeonReplicaMessage[] = [];
+    const replica: ReplicaSink = { mode: "required", send: async (m) => void sent.push(m), putDescriptor: async () => {} };
+    const { deps } = setup({ replica });
+    const staged = { ...deps, inlineMaxSessions: 1, fanout: async () => {} };
+    const records = [record({ record_id: "a", session_id: "x" }), record({ record_id: "b", session_id: "y" }), record({ record_id: "c", session_id: "x" })];
+    const result = await deliverBatch(staged, TENANT, await batch(records));
+    expect([result.outcome, result.stats.replica]).toEqual(["accepted_staged", "sent"]);
+    const m = sent[0]!;
+    expect(m.staged?.key).toMatch(/\.staged\.ndjson\.zst$/);
+    expect([m.parts.length, m.staged?.groups, m.writer]).toEqual([0, 2, "96bulls-session-ingest"]);
+    expect(m.records.map((r) => [r[0], r[1], r[4]])).toEqual([[0, 0, "a"], [0, 1, "c"], [1, 0, "b"]]);
+  });
+
   test("a staged batch is not acknowledged when the fan-out cannot be queued", async () => {
     const { ledger, deps } = setup();
     const staged = { ...deps, inlineMaxSessions: 1, fanout: async () => { throw new Error("queue down"); } };

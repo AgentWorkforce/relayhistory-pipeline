@@ -50,6 +50,14 @@ export interface NeonReplicaMessage {
   fence: { resets: number };
   enqueuedAt: string;
   descriptor?: { key: string; sha256: string };
+  /**
+   * A staged batch (staging.ts): `parts` is empty and each record's [part,
+   * line] is [group, line] in this staged object, which the consumer reads
+   * instead of chunks. Its lines are scrubbed, like every chunk.
+   */
+  staged?: { key: string; groups: number };
+  /** The writer: record ids in stored lines may be the scrubbed form of the message's. */
+  writer?: "96bulls-session-ingest";
 }
 
 export type ReplicaMode = "off" | "required" | "best_effort";
@@ -89,6 +97,40 @@ export function replicaMessage(tenant: LedgerTenant, prepared: PreparedDelivery,
     }),
     fence: { resets },
     enqueuedAt: now.toISOString(),
+    writer: "96bulls-session-ingest",
+  };
+}
+
+/** The replica of a staged batch: placements are [group, line] in the staged object. */
+export function stagedReplicaMessage(
+  tenant: LedgerTenant,
+  prepared: PreparedDelivery,
+  staged: { key: string; groups: number; index: number[][] },
+  resets: number,
+  now: Date,
+  recordsIndex: number[],
+): NeonReplicaMessage {
+  const records: NeonReplicaMessage["records"] = [];
+  staged.index.forEach((lines, group) =>
+    lines.forEach((keepIndex, line) => {
+      const record = prepared.records[recordsIndex[keepIndex]!]!;
+      records.push([group, line, record.revision_id, record.digest, record.record_id, record.revision]);
+    }),
+  );
+  return {
+    v: 1,
+    kind: "neon-replica",
+    auth: { orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId },
+    originId: prepared.originId,
+    batchId: prepared.batchId,
+    batchDigest: prepared.batchDigest,
+    receipt: prepared.receipt,
+    parts: [],
+    records,
+    fence: { resets },
+    enqueuedAt: now.toISOString(),
+    staged: { key: staged.key, groups: staged.groups },
+    writer: "96bulls-session-ingest",
   };
 }
 
@@ -99,12 +141,7 @@ export function idsScrubIdentity(prepared: PreparedDelivery): boolean {
   return scrubbed.byteLength === line.byteLength && scrubbed.every((b, i) => b === line[i]);
 }
 
-/**
- * `deferred_staged`: a staged batch's replica is not sent from the request (its
- * placements exist only after the fan-out); relayhistory's consumer learns to
- * rebuild it from the staged object (follow-up), until then Neon misses it.
- */
-export type ReplicaOutcome = "off" | "sent" | "sent_descriptor" | "skipped_ids_not_identity" | "deferred_staged" | "failed";
+export type ReplicaOutcome = "off" | "sent" | "sent_descriptor" | "skipped_ids_not_identity" | "failed";
 
 /** Queue the replica message. Throws only in `required` mode. */
 export async function sendReplica(sink: ReplicaSink | undefined, message: NeonReplicaMessage, prepared: PreparedDelivery, markerKey: string): Promise<ReplicaOutcome> {

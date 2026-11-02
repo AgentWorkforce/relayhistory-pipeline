@@ -139,13 +139,14 @@ Migration `supabase/migrations/20261102010000_session_ingest_ledger.sql`. The ro
 - **Why:** while Neon serves the read routes the read API (#135) does not, each accepted batch is also sent as relayhistory's own `NeonReplicaMessage` to relayhistory's **existing `relayhistory-neon-replica` Cloudflare Queue**. It is a producer binding in the same account, so there is no SQS and no cross-cloud credential.
 - **What the message holds:** no content. It carries parts, per-record placement, revision id and digest, and the reset count from the claim. relayhistory's consumer applies it (`accept_delivery_batch`, idempotent), so Neon's locks are paid by the consumer, never by the request.
 - **Large batches** use the create-only descriptor beside the batch marker. The descriptor is written only when the scrubber leaves every id unchanged. Otherwise the replica is skipped and counted (rare).
-- **Staged batches:** `deferred_staged`. Their placements exist only after the fan-out. Follow-up: relayhistory's consumer rebuilds them from the staged object. Until then Neon misses those batches, and S3 still has them.
+- **Staged batches** are sent at request time with `[group, line]` placements in the staged object (`staged: {key, groups}`). relayhistory's consumer rebuilds them from that object and fences their sessions first (relayhistory-cloud #265).
+- **Scrubbed ids:** messages carry `writer: "96bulls-session-ingest"`. For that writer only, the consumer accepts a stored id that is the pipeline-scrubbed form of the message's id.
 - **Modes:** `INGEST_REPLICA_MODE`.
   - `queue` (= `required`): a failed send is a 503, and the retry re-sends.
   - `best_effort`: the failure is logged and the batch answers 200.
   - `off`: no replica.
 - **When to drop it:** by the approved retirement criteria, after the 3-day standby.
-- **It doubles as the dual-run comparator** (follow-up in the consumer). A receipt that differs from the one Neon would give, or a conflict Neon would have raised, is logged per batch.
+- **It doubles as the dual-run comparator** (in the consumer, #265). A receipt Neon gives that differs from the one the ingest acknowledged logs `replica_receipt_mismatch`, and a conflict Neon raises logs `replica_conflict`.
 
 ## 5. Capacity, 429s and what old clients do with them
 
@@ -202,9 +203,7 @@ Migration `supabase/migrations/20261102010000_session_ingest_ledger.sql`. The ro
 
 ## 7. Follow-ups (in order)
 
-1. relayhistory-cloud:
-   - the replica consumer accepts messages that omit stale and deleted records, rebuilds `deferred_staged` batches from the staged object, and logs receipt comparisons;
-   - tombstone and reset dual-write to Supabase.
+1. relayhistory-cloud: tombstone and reset dual-write to Supabase. The replica consumer changes are done in #265.
 2. 96BullSessions:
    - the seed tool driving `ingest_seed_records` (read-only on Neon, per org);
    - the erasure job consuming `upload_erasure_rearm` and covering `live-batches/**.staged.*`;
