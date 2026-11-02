@@ -141,7 +141,8 @@ describe("session pipeline: not reachable from the internet", () => {
     const root = fileURLToPath(new URL("../../", import.meta.url));
     const files = (readdirSync(root, { recursive: true }) as string[]).filter((f) => f.endsWith(".ts") && !f.includes("__tests__") && !f.includes("node_modules"));
     const calls: string[] = [];
-    for (const f of files) {
+    // readdirSync order is filesystem-dependent (ext4 on CI differs from btrfs/APFS locally): sort.
+    for (const f of [...files].sort()) {
       const src = readFileSync(`${root}${f}`, "utf8");
       // URL-bearing hosts and raw URL configs are never used for the pipeline.
       expect(`${f}: ${/Lambda\.(WebFunction|HttpServer)\(|FunctionUrlConfig|InvokeFunctionUrl/.test(src)}`).toBe(`${f}: false`);
