@@ -12,7 +12,9 @@
  *
  * The Lambda (src/session-pipeline/lambda.ts) runs the pipeline's own
  * object-landed + session-indexed handlers (Supabase `upsert_session_index`,
- * revision-fenced), then the ClickHouse scope reconcile.
+ * revision-fenced), then the ClickHouse scope reconcile. With
+ * SESSION_BRIEF_ENABLED="true" the index also arms the session's brief wakeup;
+ * the brief itself is written by the session brief Cloudflare Worker.
  *
  * Permissions are resource-based, because Alchemy owns the function's
  * execution role and attaches no custom policy to it: the transcripts key
@@ -229,6 +231,11 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_PIPELINE_QUEUE_URL: i.names.queueUrl,
     SEARCH_INDEX_ENABLED: i.p.searchIndex ? "1" : "0",
     PIPELINE_FANOUT: "off",
+    // Arms one debounced brief wakeup per indexed revision (src/hoopdb/index.ts armWakeup,
+    // sessions.session_brief_wakeups). The Lambda never calls a model: the session brief
+    // Worker (stacks/cloudflare/session-brief.ts) claims and briefs them, and must be
+    // deployed first (runbooks/sessions-prod-session-brief-worker.md).
+    SESSION_BRIEF_ENABLED: "true",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",
     NODE_OPTIONS: "--enable-source-maps",

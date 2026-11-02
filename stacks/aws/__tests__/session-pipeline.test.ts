@@ -4,6 +4,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import * as AWS from "@alchemy.run/aws";
 import { fileURLToPath } from "node:url";
 import type { AwsInputs } from "../inputs.ts";
+import { briefConfig, modelKey } from "../../../src/session-brief/config.ts";
 import {
   DELIVERY_DELAY_SECONDS,
   FUNCTION_TIMEOUT_SECONDS,
@@ -99,9 +100,25 @@ describe("session pipeline: wiring", () => {
       SEARCH_INDEX_ENABLED: "0",
       PIPELINE_FANOUT: "off",
       PIPELINE_RECONCILE_LOOKBACK_MINUTES: "60",
+      SESSION_BRIEF_ENABLED: "true",
     });
     for (const value of Object.values(env)) expect(value).not.toMatch(/postgres(ql)?:\/\/|password|clickhouse\.cloud/i);
     expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true } }).SEARCH_INDEX_ENABLED).toBe("1");
+  });
+
+  it("arms session brief wakeups (exactly \"true\", the indexer's switch) and never calls a model", () => {
+    const env = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: {} });
+    expect(env.SESSION_BRIEF_ENABLED).toBe("true");
+    // src/hoopdb/index.ts arms with briefConfig() from the function env: enabled, the 0048 debounce.
+    const brief = briefConfig(env);
+    expect(brief.enabled).toBe(true);
+    expect({ idleSeconds: brief.idleSeconds, maxWaitSeconds: brief.maxWaitSeconds }).toEqual({ idleSeconds: 600, maxWaitSeconds: 3600 });
+    // The model key and every other brief setting belong to the brief Worker, not the Lambda.
+    expect(modelKey(env)).toBeNull();
+    expect(Object.keys(env).filter((k) => k.startsWith("SESSION_BRIEF_") || k === "OPENAI_API_KEY")).toEqual(["SESSION_BRIEF_ENABLED"]);
+    // On every stage and input shape: the switch is not an input.
+    for (const pi of [{}, { searchIndex: true }, { reconcileMinutes: 120 }])
+      expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: pi }).SESSION_BRIEF_ENABLED).toBe("true");
   });
 });
 
@@ -288,6 +305,42 @@ describe("session pipeline: update with the role-ARN cascade", () => {
     // A subset of the grants (the rest noop) is the same cascade.
     const keyOnly = REAL.replace(/\[transcripts-key\] update\n[\s\S]*?(?=\n\[transcripts-key-alias\])/, "[transcripts-key] noop\n");
     expect(check(keyOnly)).toBe("session pipeline update");
+  });
+
+  // The arming deploy: the function's only declared change is the one env key (Alchemy prints the
+  // changed map entry as a +/- line, unchanged entries plain, as in the #148 tag-rename capture).
+  // The standalone update phase judges the grants (the cascade) and leaves the function's own
+  // declared properties to review, so this needs no new rule.
+  const armedBlock = () => {
+    const env = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: {} });
+    const entries = Object.entries(env).sort(([a], [b]) => a.localeCompare(b));
+    return [
+      "[session-pipeline] update",
+      "  properties:",
+      "    architecture: arm64",
+      "    env:",
+      ...entries.map(([k, v]) => (k === "SESSION_BRIEF_ENABLED" ? `  +     ${k}: "${v}"` : `      ${k}: ${/^\d+$/.test(v) ? `"${v}"` : v}`)),
+      "    functionName: 96bulls-aws-sessions-prod-session-pipeline",
+    ].join("\n");
+  };
+  const ARMED = () => REAL.replace("[session-pipeline] update\n  no declared property changes", armedBlock());
+
+  it("accepts the SESSION_BRIEF_ENABLED env change with the cascade as a session pipeline update", () => {
+    const armed = ARMED();
+    expect(armed).not.toBe(REAL);
+    expect(armed).toContain('  +     SESSION_BRIEF_ENABLED: "true"');
+    expect(check(armed)).toBe("session pipeline update");
+    expect(check(armed, null)).toBe("session pipeline update");
+    // Still the cascade's own checks: a grant that changes more than the role ARN is refused.
+    const widened = edit(armed, "session-pipeline-secret", "  +       - Action: secretsmanager:GetSecretValue", () => "  +       - Action: secretsmanager:*");
+    expect(() => check(widened)).toThrow(/session-pipeline-secret changes .* not only the role-ARN cascade/);
+    // And never together with another resource change.
+    expect(() => check(op(armed, "session-events-mapping", "update"))).toThrow(/role-ARN cascade comes with other changes/);
+  });
+
+  it("the env change cannot ride on the read api rollout (that phase allows only a code-only pipeline update)", () => {
+    const withApi = withReadApi(REMAINING, ARMED());
+    expect(() => check(withApi)).toThrow(/session-pipeline may update only with no declared property changes/);
   });
 
   it("refuses a grant diff that adds or removes a statement or line", () => {

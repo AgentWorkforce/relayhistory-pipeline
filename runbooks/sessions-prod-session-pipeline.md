@@ -190,6 +190,39 @@ other change. The contract accepts it only as **session pipeline update**:
   cascade together with any other change, or without `session-pipeline`
   updating, is refused.
 
+## Session briefs: arming (`SESSION_BRIEF_ENABLED`)
+
+The function env sets `SESSION_BRIEF_ENABLED: "true"`. With it, each newly indexed revision arms
+one debounced wakeup per logical session in `sessions.session_brief_wakeups`
+(`src/hoopdb/index.ts` `armWakeup`). The wakeup is due 10 minutes after the last activity, and
+never later than 60 minutes after the first unbriefed activity.
+- The Lambda never calls a model and holds no model key.
+- The session brief Cloudflare Worker claims the wakeups and writes the briefs
+  (`runbooks/sessions-prod-session-brief-worker.md`).
+
+**Order.** Deploy the brief Worker first (its runbook, step 7). Then merge and apply this change
+(its step 9). Arming with no Worker is harmless but untidy: wakeups accumulate (one row per
+logical session) with nothing to prune or claim them, and no model is called.
+
+**Grants first.** `armWakeup` runs inside the pointer upsert, as `bulls96_runtime`. Run the
+brief Worker runbook's step 1 check before applying: `SELECT`, `INSERT`, `UPDATE` and `DELETE` on
+`session_brief_wakeups`. A missing grant would fail every pointer index, and the messages would
+retry and then reach the DLQ.
+
+**The plan.** Capture as usual. The contract accepts it as **session pipeline update**:
+- `session-pipeline` updates, and its detailed block shows the one added env entry
+  `  +     SESSION_BRIEF_ENABLED: "true"`;
+- the five role grants show only the role-ARN cascade;
+- everything else is `noop`.
+
+The standalone update phase checks the grants' diff, not the function's own declared properties,
+so the reviewer confirms the function block is exactly that env entry (and, if main moved since
+the last deploy, the code change). This env change cannot be combined with the **session read api
+rollout**: that phase accepts only a code-only pipeline update.
+
+**Rollback.** Revert the env line, capture again (a session pipeline update) and apply. Wakeups
+already armed are still briefed by the Worker, or pruned after 72 h without new activity.
+
 ## Repo tag rename (one time, before the read API rollout)
 
 3f8494c renamed the repository, so the stack-wide tag `96bulls:repo` changes
@@ -219,6 +252,7 @@ rename**, and only on its own:
 | --- | --- |
 | Stop everything, keep messages | `aws lambda update-event-source-mapping --uuid <uuid> --no-enabled` (messages wait in SQS for 4 days) |
 | Stop new events | `scripts/sessions-prod-bucket-notification.sh --remove` (the reconcile still runs: disable the rule with `aws events disable-rule --name 96bulls-aws-sessions-prod-session-reconcile`) |
+| Stop arming session briefs | Revert `SESSION_BRIEF_ENABLED` in `stacks/aws/session-pipeline.ts`, capture and apply (a session pipeline update). The brief Worker has its own rollback. |
 | ClickHouse back to the Neon tail | `searchIndex: false` (capture and apply, an update), then `SEARCH_INGEST_ENABLED=1` on the Worker |
 | Remove the pipeline | Revert, then do a reviewed capture. The contract refuses deletes, so removing the pipeline needs its own contract change and approval. |
 
