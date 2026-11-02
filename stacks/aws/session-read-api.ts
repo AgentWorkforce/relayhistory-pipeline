@@ -41,6 +41,12 @@ export interface SessionReadApiInputs {
    * (`session-read-api-throttles-alarm`).
    */
   reservedConcurrency?: number | "none";
+  /**
+   * Workspace ids allowed to use the internal directory search route
+   * (GET /v1/directory/search; 1 to 8 ids). Omitted: the route is closed for every
+   * workspace and the function's environment is unchanged.
+   */
+  directorySearchWorkspaces?: string[];
 }
 
 export const SESSION_READ_API_RESOURCES = [
@@ -62,6 +68,7 @@ export function sessionReadApiNames(stage: string): SessionReadApiNames {
   return { function: `96bulls-${stage}-session-read-api`, secret: `96bulls/${stage}/session-read-api` };
 }
 
+const DIRECTORY_WORKSPACE = /^[^\s,\p{Cc}]{1,128}$/u;
 const ORIGIN = /^https:\/\/[a-z0-9]{32}\.lambda-url\.us-east-1\.on\.aws$/;
 
 export function assertSessionReadApiInputs(p: unknown, refuse: (why: string) => never): asserts p is SessionReadApiInputs {
@@ -69,13 +76,18 @@ export function assertSessionReadApiInputs(p: unknown, refuse: (why: string) => 
     refuse("transcriptStore.sessionReadApi must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "completeSince" && k !== "origin" && k !== "reservedConcurrency") refuse(`transcriptStore.sessionReadApi.${k} is not a known setting`);
+    if (k !== "completeSince" && k !== "origin" && k !== "reservedConcurrency" && k !== "directorySearchWorkspaces") refuse(`transcriptStore.sessionReadApi.${k} is not a known setting`);
   if (typeof v.completeSince !== "string" || (v.completeSince !== "epoch" && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(v.completeSince)))
     refuse('transcriptStore.sessionReadApi.completeSince must be an ISO UTC timestamp or "epoch"');
   if (v.origin !== undefined && (typeof v.origin !== "string" || !ORIGIN.test(v.origin)))
     refuse("transcriptStore.sessionReadApi.origin must be this function's us-east-1 Function URL origin (no path)");
   if (v.reservedConcurrency !== undefined && v.reservedConcurrency !== "none" && !(Number.isInteger(v.reservedConcurrency) && (v.reservedConcurrency as number) >= 2 && (v.reservedConcurrency as number) <= 50))
     refuse('transcriptStore.sessionReadApi.reservedConcurrency must be an integer from 2 to 50, or "none" (only below the default account quota)');
+  if (v.directorySearchWorkspaces !== undefined) {
+    const ws = v.directorySearchWorkspaces;
+    if (!Array.isArray(ws) || ws.length < 1 || ws.length > 8 || new Set(ws).size !== ws.length || !ws.every((w) => typeof w === "string" && DIRECTORY_WORKSPACE.test(w)))
+      refuse("transcriptStore.sessionReadApi.directorySearchWorkspaces must be 1 to 8 distinct workspace ids (1-128 characters, no whitespace or commas)");
+  }
 }
 
 /** Only the read API's role reads its secret. */
@@ -107,6 +119,8 @@ export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames
     RELAYAUTH_JWKS_URL: RELAYAUTH_PROD_JWKS_URL,
     RELAYAUTH_ISSUER: RELAYAUTH_PROD_ISSUER,
     NODE_OPTIONS: "--enable-source-maps",
+    // Only when set, so a stage without directory search keeps its environment byte-identical.
+    ...(i.p.directorySearchWorkspaces ? { READ_API_DIRECTORY_WORKSPACES: i.p.directorySearchWorkspaces.join(",") } : {}),
   };
 }
 

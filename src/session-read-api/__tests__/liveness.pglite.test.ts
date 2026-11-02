@@ -15,6 +15,7 @@ const read = (path: string) => readFileSync(join(root, path), "utf8");
 /** psql meta-commands (\set) are not SQL. */
 const sql = (path: string) => read(path).split("\n").filter((l) => !l.startsWith("\\")).join("\n");
 const ROLE = sql("supabase/bootstrap/session_read_api_role.sql");
+const DIRECTORY = sql("supabase/bootstrap/session_read_api_directory.sql");
 const VERIFY = sql("supabase/bootstrap/session_read_api_role_verify.sql");
 
 const open: PGlite[] = [];
@@ -28,7 +29,10 @@ async function database(withRole = true): Promise<PGlite> {
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await db.exec(read(`supabase/migrations/${file}`));
-  if (withRole) await db.exec(ROLE);
+  if (withRole) {
+    await db.exec(ROLE);
+    await db.exec(DIRECTORY);
+  }
   return db;
 }
 
@@ -69,6 +73,7 @@ describe("session read API role", () => {
       "DROP POLICY session_index_read_api ON sessions.session_index",
       "GRANT SELECT (title) ON sessions.session_index TO bulls96_read_api",
       "GRANT SELECT ON sessions.session_directory TO bulls96_read_api",
+      "GRANT SELECT (short_summary) ON sessions.session_directory TO bulls96_read_api",
       "GRANT UPDATE (deleted_at) ON sessions.session_index TO bulls96_read_api",
       "ALTER ROLE bulls96_read_api BYPASSRLS",
       "ALTER ROLE bulls96_read_api RESET default_transaction_read_only",

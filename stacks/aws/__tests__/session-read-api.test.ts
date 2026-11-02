@@ -136,6 +136,20 @@ describe("session read api: inputs, grants and env", () => {
       expect(() => assertSessionReadApiInputs({ completeSince: "epoch", reservedConcurrency: bad }, refuse)).toThrow(/reservedConcurrency must be an integer from 2 to 50, or "none"/);
   });
 
+  it("directorySearchWorkspaces: 1 to 8 distinct ids, set in the env only when given", () => {
+    const names = sessionReadApiNames(STAGE);
+    assertSessionReadApiInputs({ completeSince: "epoch", directorySearchWorkspaces: ["ws-a"] }, refuse);
+    assertSessionReadApiInputs({ completeSince: "epoch", directorySearchWorkspaces: ["ws-a", "0b6f9c2e-1d4a-4c8e-9f3b-7a2d5e6c1b90"] }, refuse);
+    for (const bad of [[], ["ws-a", "ws-a"], ["ws a"], ["ws-a,ws-b"], [""], ["x".repeat(129)], [7], "ws-a", Array.from({ length: 9 }, (_, i) => `ws-${i}`)])
+      expect(() => assertSessionReadApiInputs({ completeSince: "epoch", directorySearchWorkspaces: bad }, refuse)).toThrow(/directorySearchWorkspaces must be 1 to 8 distinct workspace ids/);
+    const without = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch" } });
+    expect("READ_API_DIRECTORY_WORKSPACES" in without).toBe(false);
+    const withDir = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch", directorySearchWorkspaces: ["ws-a", "ws-b"] } });
+    expect(withDir.READ_API_DIRECTORY_WORKSPACES).toBe("ws-a,ws-b");
+    const { READ_API_DIRECTORY_WORKSPACES: _, ...rest } = withDir;
+    expect(rest).toEqual(without);
+  });
+
   it("only the function's own role reads the secret, and the env carries no credential", () => {
     const policy = sessionReadApiSecretPolicy({ roleArn: "arn:aws:iam::941433935742:role/read-api" });
     expect(policy.Statement).toEqual([
@@ -204,7 +218,7 @@ describe("session read api: Function URL (public by design, application auth)", 
   it("every /v1 route sits behind the application's bearer auth; only /health is open", () => {
     const src = readFileSync(fileURLToPath(new URL("../../../src/session-read-api/app.ts", import.meta.url)), "utf8");
     const routes = [...src.matchAll(/app\.(get|post|put|patch|delete|all)\("([^"]+)"/g)].map((m) => m[2]);
-    expect(routes.sort()).toEqual(["/health", "/v1/events", "/v1/sessions/:sessionId/events"]);
+    expect(routes.sort()).toEqual(["/health", "/v1/directory/search", "/v1/events", "/v1/sessions/:sessionId/events"]);
     expect(src).toContain('app.use("/v1/*", async (c, next) => {');
     expect(src).toMatch(/if \(!m\) return c\.json\(\{ error: \{ code: "missing_authorization"/);
   });

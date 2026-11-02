@@ -9,6 +9,7 @@ import { ClickHouseError } from "../../session-pipeline/vendor/search-index/clic
 import { AuthError, continuationUntil, createReadApi, type VerifiedIdentity } from "../app.ts";
 import { relayAuthVerifier } from "../auth.ts";
 import { encodeCursor } from "../cursor.ts";
+import { decodeDirectoryCursor, encodeDirectoryCursor, likePattern, normalizeDirectoryQuery, parseDirectoryWorkspaces, type DirectoryRow, type DirectorySearch, type DirectorySearchInput } from "../directory.ts";
 import { handleUrlEvent, parseCompleteSince, parseReadApiSecret } from "../lambda.ts";
 import { memoryLiveness } from "./support.ts";
 
@@ -369,5 +370,164 @@ describe("lambda adapter and configuration", () => {
   test("own cursors round-trip; the prefix keeps them out of relayhistory", () => {
     const c = encodeCursor({ tsMs: 5, sessionId: "s", source: "codex", machineId: "m", kind: "k", eventId: "e" });
     expect(c.startsWith("b96e1:")).toBe(true);
+  });
+});
+
+describe("directory search (GET /v1/directory/search)", () => {
+  const dirRow = (i: number, over: Partial<DirectoryRow> = {}): DirectoryRow & Record<string, unknown> => ({
+    org_id: "org-a",
+    workspace_id: "ws-a",
+    harness: "codex",
+    session_id: `s-${i}`,
+    title: `widget ${i}`,
+    git_repo: "acme/widgets",
+    last_activity_at: `2026-10-0${9 - i}T00:00:00.000001Z`,
+    state: "done",
+    ...over,
+  });
+  function stubDirectory(rows: (DirectoryRow & Record<string, unknown>)[] | Error = []) {
+    const calls: DirectorySearchInput[] = [];
+    const directory: DirectorySearch = {
+      async search(input) {
+        calls.push(input);
+        if (rows instanceof Error) throw rows;
+        return rows.slice(0, input.fetch);
+      },
+    };
+    return { directory, calls };
+  }
+  function dirApi(over: { identity?: VerifiedIdentity; rows?: (DirectoryRow & Record<string, unknown>)[] | Error; allow?: string[] | null } = {}) {
+    const { directory, calls } = stubDirectory(over.rows);
+    const logs: Record<string, unknown>[] = [];
+    const app = createReadApi({
+      verify: async (t) => {
+        if (t !== "good") throw new AuthError(401, "invalid_token", "token is not valid");
+        return over.identity ?? ID;
+      },
+      ch: stubCh().ch,
+      liveness: memoryLiveness().liveness,
+      completeSinceMs: 0,
+      ...(over.allow === null ? {} : { directory, directoryWorkspaces: new Set(over.allow ?? ["ws-a"]) }),
+      log: (f) => logs.push(f),
+    });
+    const get = async (query: string, token: string | null = "good") => {
+      const r = await app.request(`/v1/directory/search?${query}`, { headers: token ? { authorization: `Bearer ${token}` } : {} });
+      return { status: r.status, body: await body(r), headers: r.headers };
+    };
+    return { get, calls, logs };
+  }
+
+  test("directory auth: no token or a bad token is 401, a missing rth:read scope 403", async () => {
+    const { get, calls } = dirApi();
+    expect((await get("workspace=ws-a&q=widget", null)).status).toBe(401);
+    expect((await get("workspace=ws-a&q=widget", "bad")).status).toBe(401);
+    const noScope = dirApi({ identity: { ...ID, scopes: ["rth:sync"] } });
+    expect((await noScope.get("workspace=ws-a&q=widget")).status).toBe(403);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("directory workspace must be given once and equal the token's", async () => {
+    const { get, calls } = dirApi();
+    expect((await get("q=widget")).status).toBe(400);
+    expect((await get("workspace=ws-a&workspace=ws-a&q=widget")).status).toBe(400);
+    const other = await get("workspace=ws-b&q=widget");
+    expect(other.status).toBe(403);
+    expect(other.body.error.code).toBe("forbidden");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("directory allowlist: a workspace not on it, or no directory configured, is 403 directory_not_enabled", async () => {
+    const notListed = dirApi({ allow: ["ws-other"] });
+    const r = await notListed.get("workspace=ws-a&q=widget");
+    expect(r.status).toBe(403);
+    expect(r.body.error.code).toBe("directory_not_enabled");
+    expect(notListed.calls).toHaveLength(0);
+    const empty = dirApi({ allow: [] });
+    expect((await empty.get("workspace=ws-a&q=widget")).status).toBe(403);
+    const unconfigured = dirApi({ allow: null });
+    expect((await unconfigured.get("workspace=ws-a&q=widget")).body.error.code).toBe("directory_not_enabled");
+  });
+
+  test("directory tenant comes from the token, never from parameters; unknown parameters are refused", async () => {
+    const { get, calls } = dirApi();
+    expect((await get("workspace=ws-a&q=widget&org=org-b")).status).toBe(400);
+    expect((await get("workspace=ws-a&q=widget&workspace_id=ws-b")).status).toBe(400);
+    expect(calls).toHaveLength(0);
+    expect((await get("workspace=ws-a&q=%20%20Widget%20%20login%20")).status).toBe(200);
+    expect(calls).toEqual([{ orgId: "org-a", workspaceId: "ws-a", q: "Widget login", fetch: 21, cursor: undefined }]);
+  });
+
+  test("directory q must be 3 to 200 characters after trimming", async () => {
+    const { get, calls } = dirApi();
+    for (const q of ["", "ab", "%20%20ab%20%20", encodeURIComponent("x".repeat(201))]) expect((await get(`workspace=ws-a&q=${q}`)).status).toBe(400);
+    expect((await get("workspace=ws-a")).status).toBe(400);
+    expect((await get("workspace=ws-a&q=abc&q=def")).status).toBe(400);
+    expect(calls).toHaveLength(0);
+    expect((await get(`workspace=ws-a&q=${"x".repeat(200)}`)).status).toBe(200);
+  });
+
+  test("directory pointer-only: extra row columns never reach the response", async () => {
+    const { get } = dirApi({ rows: [dirRow(1, { search_text: "the summary", short_summary: "secret", task_title: "secret task", user_ids: ["u-9"] })] });
+    const r = await get("workspace=ws-a&q=widget");
+    expect(r.status).toBe(200);
+    expect(r.body.sessions).toEqual([{ session_id: "s-1", workspace_id: "ws-a", title: "widget 1", git_repo: "acme/widgets", last_activity_at: "2026-10-08T00:00:00.000001Z", state: "done" }]);
+    expect(JSON.stringify(r.body)).not.toMatch(/secret|summary|u-9|codex|org-a/);
+    expect(r.headers.get("cache-control")).toBe("private, no-store");
+    expect(r.headers.get("x-relayhistory-workspace-id")).toBe("ws-a");
+  });
+
+  test("directory pagination: limit+1 is fetched, the cursor carries the last row's exact key, limit is clamped", async () => {
+    const rows = [1, 2, 3].map((i) => dirRow(i));
+    const { get, calls } = dirApi({ rows });
+    const first = await get("workspace=ws-a&q=widget&limit=2");
+    expect(first.body.sessions.map((s: { session_id: string }) => s.session_id)).toEqual(["s-1", "s-2"]);
+    expect(calls[0]!.fetch).toBe(3);
+    expect(decodeDirectoryCursor(first.body.nextCursor)).toEqual({ lastActivityAt: "2026-10-07T00:00:00.000001Z", sessionId: "s-2", harness: "codex" });
+    await get(`workspace=ws-a&q=widget&limit=2&cursor=${encodeURIComponent(first.body.nextCursor)}`);
+    expect(calls[1]!.cursor).toEqual({ lastActivityAt: "2026-10-07T00:00:00.000001Z", sessionId: "s-2", harness: "codex" });
+    const last = await get("workspace=ws-a&q=widget&limit=3");
+    expect(last.body.nextCursor).toBeNull();
+    await get("workspace=ws-a&q=widget&limit=500");
+    expect(calls.at(-1)!.fetch).toBe(51);
+  });
+
+  test("directory cursors: an event cursor, junk or a forged key is a 400", async () => {
+    const { get, calls } = dirApi();
+    const event = encodeCursor({ tsMs: 5, sessionId: "s", source: "codex", machineId: "m", kind: "k", eventId: "e" });
+    const forged = encodeDirectoryCursor({ lastActivityAt: "2026-10-01T00:00:00Z", sessionId: "s", harness: "codex" });
+    const badHarness = encodeDirectoryCursor({ lastActivityAt: "2026-10-01T00:00:00.000001Z", sessionId: "s", harness: "Bad Harness" });
+    for (const c of [event, "b96d1:!!!", "b96d1:" + Buffer.from("[1,2]").toString("base64url"), forged, badHarness])
+      expect((await get(`workspace=ws-a&q=widget&cursor=${encodeURIComponent(c)}`)).status).toBe(400);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("directory: a row of another tenant is refused, not served", async () => {
+    for (const bad of [dirRow(2, { workspace_id: "ws-b" }), dirRow(2, { org_id: "org-b" })]) {
+      const { get, logs } = dirApi({ rows: [dirRow(1), bad] });
+      const r = await get("workspace=ws-a&q=widget");
+      expect(r.status).toBe(500);
+      expect(JSON.stringify(r.body)).not.toContain("s-1");
+      expect(logs.some((l) => l.reason === "cross_tenant_rows")).toBe(true);
+    }
+  });
+
+  test("directory: a database failure is a 503 with no detail, and logs never carry the query", async () => {
+    const { get, logs } = dirApi({ rows: Object.assign(new Error("canceling statement due to statement timeout: widget"), { code: "57014" }) });
+    const r = await get("workspace=ws-a&q=widget");
+    expect(r.status).toBe(503);
+    expect(r.body.error.code).toBe("backend_unavailable");
+    expect(JSON.stringify(r.body)).not.toContain("widget");
+    expect(JSON.stringify(logs)).not.toContain("widget");
+  });
+
+  test("directory helpers: query normalization, literal LIKE patterns, the allowlist parser", () => {
+    expect(normalizeDirectoryQuery("  a\tb\n c ")).toBe("a b c");
+    expect(normalizeDirectoryQuery("ab")).toBeUndefined();
+    expect(likePattern("50%_off\\x")).toBe("%50\\%\\_off\\\\x%");
+    expect([...parseDirectoryWorkspaces(" ws-a , ws-b ").workspaces]).toEqual(["ws-a", "ws-b"]);
+    expect(parseDirectoryWorkspaces(undefined)).toEqual({ workspaces: new Set(), invalid: false });
+    expect(parseDirectoryWorkspaces("")).toEqual({ workspaces: new Set(), invalid: false });
+    // One malformed entry closes the route for everyone rather than admitting the rest.
+    for (const raw of ["ws-a,,ws-b", "ws-a,bad id", `ws-a,${"x".repeat(129)}`]) expect(parseDirectoryWorkspaces(raw)).toEqual({ workspaces: new Set(), invalid: true });
   });
 });

@@ -12,7 +12,8 @@
  * Env: READ_API_ORIGIN (this function's URL origin; unset = every request 401),
  * READ_API_COMPLETE_SINCE (ISO timestamp from which ClickHouse history is
  * complete, or "epoch"; required), RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER
- * (optional overrides).
+ * (optional overrides), READ_API_DIRECTORY_WORKSPACES (comma-separated workspace
+ * ids allowed to use GET /v1/directory/search; unset, empty or malformed = closed).
  */
 import pg from "pg";
 import { log } from "../shared/log.ts";
@@ -21,6 +22,7 @@ import { SUPABASE_PROD_CA_2021 } from "../session-pipeline/supabase-ca.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi } from "./app.ts";
 import { relayAuthVerifier } from "./auth.ts";
+import { parseDirectoryWorkspaces, sqlDirectorySearch } from "./directory.ts";
 import { poolTenantRunner, sqlLiveness } from "./liveness.ts";
 
 export interface ReadApiSecret {
@@ -81,10 +83,16 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env): Promise<App> {
     connectionTimeoutMillis: 2_000,
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
+  const directory = parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES);
+  // A malformed allowlist closes only directory search; the event routes keep serving.
+  if (directory.invalid) log.error("read api directory allowlist is malformed; directory search is closed", { error_code: "directory_allowlist_invalid" });
+  const run = poolTenantRunner(pool as never);
   return createReadApi({
     verify: relayAuthVerifier({ origin: env.READ_API_ORIGIN || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL, issuer: env.RELAYAUTH_ISSUER }),
     ch: createClickHouseClient(secret.clickhouse),
-    liveness: sqlLiveness(poolTenantRunner(pool as never)),
+    liveness: sqlLiveness(run),
+    directory: sqlDirectorySearch(run),
+    directoryWorkspaces: directory.workspaces,
     completeSinceMs,
     log: (fields) => log.info("session read", fields),
   });

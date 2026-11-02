@@ -8,6 +8,11 @@
  *   GET /v1/events?session=…        in-session reads (q, since, until, kind)
  *   GET /v1/events?q=…              workspace transcript search
  *
+ * Internal route (not part of the relayhistory contract; directory.ts):
+ *   GET /v1/directory/search?q=…    session directory keyword search, pointers
+ *                                   only, for allowlisted workspaces
+ *                                   (READ_API_DIRECTORY_WORKSPACES)
+ *
  * Anything this backend cannot answer exactly is `501 unsupported_by_backend`
  * with a `reason`, never a best-effort answer: the caller (Cloud) falls back
  * to relayhistory for it during the transition. A 501 is only ever the answer
@@ -28,6 +33,17 @@
 import { Hono, type Context } from "hono";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { CursorError, decodeCursor } from "./cursor.ts";
+import {
+  DIRECTORY_DEFAULT_LIMIT,
+  DIRECTORY_MAX_LIMIT,
+  DIRECTORY_MAX_Q_CHARS,
+  DIRECTORY_MIN_Q_CHARS,
+  decodeDirectoryCursor,
+  encodeDirectoryCursor,
+  normalizeDirectoryQuery,
+  toPointer,
+  type DirectorySearch,
+} from "./directory.ts";
 import { TenantMismatchError, partialSessions, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
 
@@ -55,6 +71,10 @@ export interface ReadApiDeps {
   completeSinceMs: number;
   log?: (fields: Record<string, unknown>) => void;
   timeoutMs?: number;
+  /** Directory search (GET /v1/directory/search). Absent: the route is closed. */
+  directory?: DirectorySearch;
+  /** Workspaces allowed to use directory search; empty or absent: none. */
+  directoryWorkspaces?: ReadonlySet<string>;
 }
 
 /** relayhistory lib/recall.ts limits. */
@@ -64,6 +84,8 @@ export const EVENTS_MAX_LIMIT = 1000;
 export const SEARCH_MAX_LIMIT = 100;
 export const MAX_Q_CHARS = 500;
 const MAX_ID_CHARS = 512;
+/** Every parameter directory search reads; anything else is a 400, not ignored. */
+const DIRECTORY_PARAMS = ["workspace", "q", "limit", "cursor"];
 
 /**
  * The terminal-page signal for a search cursor page that reached the history
@@ -301,6 +323,39 @@ export function createReadApi(deps: ReadApiDeps) {
         return c.json({ events: page.events, nextCursor: null, continuation, correlationId: c.get("correlationId") });
       }
       return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+    } catch (error) {
+      return fail(c, error);
+    }
+  });
+
+  /**
+   * Directory search, internal: only an allowlisted workspace, only the token's
+   * workspace, pointers only. There is no other backend to fall back to, so a
+   * refusal here is a 4xx, never a 501.
+   */
+  app.get("/v1/directory/search", async (c) => {
+    try {
+      const identity = c.get("identity");
+      const ws = c.req.queries("workspace");
+      if (!ws || ws.length !== 1 || !ws[0]) throw bad("workspace must be given exactly once");
+      if (ws[0] !== identity.workspaceId) throw new HttpError(403, "forbidden", "workspace does not match the token");
+      if (!deps.directory || !deps.directoryWorkspaces?.has(identity.workspaceId))
+        throw new HttpError(403, "directory_not_enabled", "directory search is not enabled for this workspace");
+      for (const p of Object.keys(c.req.queries()))
+        if (!DIRECTORY_PARAMS.includes(p)) throw bad(`${p} is not a directory search parameter`);
+      const q = normalizeDirectoryQuery(single(c, "q"));
+      if (q === undefined) throw bad(`q must be ${DIRECTORY_MIN_Q_CHARS} to ${DIRECTORY_MAX_Q_CHARS} characters`);
+      const limit = clampLimit(single(c, "limit"), DIRECTORY_DEFAULT_LIMIT, DIRECTORY_MAX_LIMIT);
+      const cursor = decodeDirectoryCursor(single(c, "cursor"));
+      const rows = await deps.directory.search({ orgId: identity.orgId, workspaceId: identity.workspaceId, q, fetch: limit + 1, cursor });
+      // RLS and the statement already bind the tenant; a row of another one is a defect, never served.
+      for (const r of rows) if (r.org_id !== identity.orgId || r.workspace_id !== identity.workspaceId) throw new TenantMismatchError();
+      const page = rows.slice(0, limit);
+      const last = page[page.length - 1];
+      const nextCursor = rows.length > limit && last
+        ? encodeDirectoryCursor({ lastActivityAt: last.last_activity_at, sessionId: last.session_id, harness: last.harness })
+        : null;
+      return c.json({ sessions: page.map(toPointer), nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
       return fail(c, error);
     }

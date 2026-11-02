@@ -126,9 +126,41 @@ Anything Phase A cannot answer exactly gets **`501 unsupported_by_backend`** wit
 
 These are tracked in the neon-readers inventory lanes.
 
+## 6a. Internal directory search (company brain)
+
+`GET /v1/directory/search?workspace=<wks>&q=<text>[&limit=1-50][&cursor=b96d1:…]` serves one internal consumer, the `company` Cloudflare Worker (AgentWorkforce/company-brain), for the Agent Relay workspace only. It is not part of the relayhistory contract, so it never answers 501: there is no backend to fall back to.
+
+- **Auth:** the same RelayAuth assertion as every `/v1` route (RS256, `aud` = `READ_API_ORIGIN`, `rth:read`). `workspace` must equal the token's `wks` (403 otherwise). The tenant is never taken from a parameter, and any parameter other than `workspace`, `q`, `limit` and `cursor` is a 400.
+- **Allowlist:** the route is closed (403 `directory_not_enabled`) unless the token's workspace is in `READ_API_DIRECTORY_WORKSPACES`, which the stack sets only from `transcriptStore.sessionReadApi.directorySearchWorkspaces`. Unset, empty or malformed means closed for everyone. A malformed value closes only this route; the event routes keep serving.
+- **Match:** case-insensitive literal substring (`ILIKE … ESCAPE '\'`, with `%`, `_` and `\` escaped) over `title`, `task_title`, `git_repo` and `search_text`. `q` is trimmed and whitespace-collapsed, and must be 3 to 200 characters, the same bound as `search_session_directory`.
+- **Response:** pointers only, `{ sessions: [{ session_id, workspace_id, title, git_repo, last_activity_at, state }], nextCursor, correlationId }`. Rows are mapped field by field, so no other column can reach a response. `last_activity_at` is a microsecond ISO UTC timestamp.
+- **Paging:** newest first. The keyset is `(last_activity_at, session_id, harness) DESC`, the workspace recency index's order. `limit + 1` rows are fetched; a `nextCursor` means more rows exist.
+- **Visibility, in one statement, run as `bulls96_read_api` in a READ ONLY transaction with the tenant settings bound:**
+  - tenant: `org_id` and `workspace_id` are bound as parameters **and** fenced by the role's RLS policies on `session_directory` and `session_index`. Every returned row is rechecked in code (500 `cross_tenant_rows` on a mismatch).
+  - tombstone: `session_directory.deleted_at IS NULL`.
+  - erasure: at least one live `session_index` pointer (`deleted_at IS NULL`). This is stricter than the event routes, which treat "no pointer at all" as live because ClickHouse history can predate pointers. A directory row is always projected from live pointers, so this only closes the window between a pointer tombstone (or erasure) and the projector running.
+  - sharing mode: see below.
+- **Why not `sessions.search_session_directory`:** the RPC refuses every caller except the role `session_directory_search_worker`, and takes the tenant from `request.jwt.claims`. Only `authenticator` may be a member of that role, because any member could forge those claims with `set_config`. Using it would mean adding a second member edge (a HoopDb security-model change, section 3), granting a new EXECUTE (the frozen `sessions-function-acl.json` manifest and the function-boundary event trigger), or adding a new function. It also returns `short_summary`, token counts and user and machine ids, and it does not encode sharing-mode rules either. A column grant plus an RLS policy is the smaller change: no function, no EXECUTE, no membership.
+
+### Sharing mode
+
+Sharing mode is **not modelled** in `session_directory`, `session_index` or any other server-side table. It is Relay Desktop's upload consent (`relay-desktop/docs/agent-relay-probe.md`, "sharing set … --mode all|new|selected"): `all` shares every session that is not excluded, `new` withholds the sessions its baseline excluded, and `selected` shares only member sessions. What a mode withholds is never uploaded, so it never reaches the directory. Everything the directory holds was shared with its workspace, which is exactly what the existing `session_directory_member_read` policy gives every workspace member.
+
+The strictest reading available server-side is what the route enforces: one workspace (the token's), never org-wide; live pointers only; tombstoned and erased rows excluded; pointers only.
+
+**Open question for the lead:** `sessions exclude` on the desktop "does not erase already uploaded history". So a session that was uploaded and later excluded stays in the directory and is served here, as it already is to every workspace member through Cloud. If a later exclusion must hide a session from the company brain, the desktop has to send a server-side signal (an erasure, or a new per-session flag), and this route has to read it. That is not built yet.
+
+### Grant
+
+`supabase/bootstrap/session_read_api_directory.sql`, applied after `session_read_api_role.sql`: column SELECT on exactly `org_id, workspace_id, harness, session_id, title, task_title, git_repo, search_text, last_activity_at, state, deleted_at`, and the policy `session_directory_read_api` (FOR SELECT TO `bulls96_read_api`, the same tenant binding as `session_index_read_api`). `search_text` is used only in `WHERE`, but PostgreSQL has no filter-only privilege, so the role can read it. It is the metadata search document (title, task title, agent, project, repository, branch, model and the scrubbed `short_summary`), never transcript content. `short_summary` itself, counters, `user_ids`, `machine_ids` and every catalog column stay unreadable. `session_read_api_role_verify.sql` checks this exact shape. It also now refuses:
+- any role that is a member of `bulls96_read_api`, except the creator edge to `postgres`, because a member such as `authenticator` could act as the role;
+- a permissive policy for PUBLIC on either table;
+- a policy expression other than exactly the tenant binding. The check used to be a substring match, which an `OR true` passed.
+
 ## 7. Open decisions for the lead
 
 1. **Supabase read role:** approve `bulls96_read_api` (SELECT on six `session_index` columns) for phase A.
 2. **Phase C binding:** PostgREST JWT or a second member edge for the claim-bound RPCs. This goes to the HoopDb owner.
 3. **Phase B schema:** pipeline writes an `event_json` column (the #242 shape) into a `transcript_session_events` table ordered by `(org_id, session_id, ts…)`. This goes to the #121 owner.
 4. **`READ_API_COMPLETE_SINCE`:** the production value, from the backfill state.
+5. **Directory search and sharing mode:** whether a session that was excluded after upload must disappear from directory search (section 6a, "Sharing mode").

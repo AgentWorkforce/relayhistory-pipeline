@@ -11,6 +11,7 @@ Only the lead applies this, after independent review. Nothing in this file print
 | `GET /v1/sessions/:id/events` | MCP `get_shared_session`, `list_team_activity`, Skip session events |
 | `GET /v1/events?session=…` | MCP `get_shared_session_context` |
 | `GET /v1/events?q=…` | MCP `search_shared_sessions` |
+| `GET /v1/directory/search?q=…` (internal, allowlisted workspaces only) | the `company` Worker (company brain) |
 
 These requests get `501 unsupported_by_backend` with a `reason`, and Cloud then falls back:
 - every other route;
@@ -28,7 +29,7 @@ These requests get `501 unsupported_by_backend` with a `reason`, and Cloud then 
 
 ## Guarantees and their tests
 
-Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--only "read api"`, 33 of 33 caught). Reverting the control turns the named test red.
+Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--only "read api"`, 52 of 52 caught; the ClickHouse ones need `READ_API_TEST_CLICKHOUSE_URL`). Reverting the control turns the named test red.
 
 **Tenancy:**
 - Org and workspace come only from the verified RelayAuth assertion. The token must be:
@@ -79,6 +80,30 @@ Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--
    - apply.
 
    Until this step, every `/v1` request returns 401.
+
+## Directory search (internal, company brain)
+
+`GET /v1/directory/search` (docs/session-read-api-design.md section 6a) is closed until both steps below are done. Neither step changes the event routes.
+
+1. **Supabase grant.** As `postgres`, after review of the exact file:
+   ```sh
+   psql -v ON_ERROR_STOP=1 -X -d "$HOOPDB" -f supabase/bootstrap/session_read_api_directory.sql
+   psql -v ON_ERROR_STOP=1 -X -d "$HOOPDB" -f supabase/bootstrap/session_read_api_role_verify.sql   # NOTICE: PASS
+   ```
+   Until the grant is applied, the verify reports `policy session_directory_read_api is missing`. That is expected.
+2. **Allowlist.** In the inputs, add the Agent Relay workspace id:
+   ```json
+   "sessionReadApi": { …, "directorySearchWorkspaces": ["<agent relay workspace id>"] }
+   ```
+   Capture again. The contract phase must be `session read api update`: `session-read-api` updates (its env gains `READ_API_DIRECTORY_WORKSPACES`), and nothing else changes. Then apply.
+
+Rollback: remove `directorySearchWorkspaces` (a `session read api update`), which closes the route. To also drop the grant:
+```sql
+BEGIN;
+DROP POLICY IF EXISTS session_directory_read_api ON sessions.session_directory;
+REVOKE SELECT ON sessions.session_directory FROM bulls96_read_api;
+COMMIT;
+```
 
 ## Checks after apply
 
