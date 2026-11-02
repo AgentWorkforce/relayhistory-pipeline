@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
-import { PRIVATE_GOOGLE_APIS_CIDR, PRIVATE_GOOGLE_APIS_RECORDS, assertInClusterJwks, bulls96NetworkPolicies } from "../egress.ts";
+import { GCE_LB_SOURCE_RANGES, PRIVATE_GOOGLE_APIS_CIDR, PRIVATE_GOOGLE_APIS_RECORDS, assertInClusterJwks, bulls96NetworkPolicies, relayauthNetworkPolicies } from "../egress.ts";
 
 type Peer = { ipBlock?: { cidr: string; except?: string[] }; podSelector?: unknown; namespaceSelector?: unknown };
 type Rule = { to?: Peer[]; from?: Peer[]; ports?: Array<{ protocol: string; port: number }> };
@@ -90,5 +90,56 @@ describe("96bulls NetworkPolicies", () => {
     expect(stack).toContain("networks: [network.networkName]");
     expect(stack).toContain('"dns.googleapis.com"');
     expect(stack).toContain("bulls96NetworkPolicies({ redisRange: PSA_CIDR, cloudSqlRange: PSA_CIDR })");
+  });
+});
+
+describe("relayauth NetworkPolicies", () => {
+  const internal = relayauthNetworkPolicies({ publicJwksIngress: false, relayfileConsumer: false }) as Policy[];
+  const named = (ps: Policy[], n: string) => ps.find((p) => p.metadata.name === n)!;
+
+  it("default-denies the namespace and allows DNS as its only egress", () => {
+    for (const p of internal) expect(p.metadata.namespace).toBe("relayauth");
+    expect(named(internal, "default-deny").spec).toEqual({ podSelector: {}, policyTypes: ["Ingress", "Egress"] });
+    const egress = internal.filter((p) => p.spec.policyTypes.includes("Egress") && p.metadata.name !== "default-deny");
+    expect(egress.map((p) => p.metadata.name)).toEqual(["allow-dns"]);
+    expect(egress[0]!.spec.egress![0]!.ports!.map((p) => p.port)).toEqual([53, 53]);
+  });
+
+  it("admits :8787 only from the 96Bulls AlleyOop pods", () => {
+    const ingress = internal.filter((p) => p.spec.policyTypes.includes("Ingress") && p.metadata.name !== "default-deny");
+    expect(ingress.map((p) => p.metadata.name)).toEqual(["allow-alleyoop-to-relayauth"]);
+    expect(ingress[0]!.spec.ingress).toEqual([
+      {
+        from: [
+          {
+            namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "96bulls" } },
+            podSelector: { matchLabels: { "app.kubernetes.io/instance": "96bulls", "app.kubernetes.io/name": "alleyoop" } },
+          },
+        ],
+        ports: [{ protocol: "TCP", port: 8787 }],
+      },
+    ]);
+  });
+
+  it("adds the GCE load-balancer ranges on :8787 only when a public JWKS Ingress exists", () => {
+    expect(internal.some((p) => p.metadata.name === "allow-gce-lb-to-relayauth")).toBe(false);
+    const pub = relayauthNetworkPolicies({ publicJwksIngress: true, relayfileConsumer: false }) as Policy[];
+    const lb = named(pub, "allow-gce-lb-to-relayauth");
+    expect(lb.spec.ingress).toEqual([{ from: GCE_LB_SOURCE_RANGES.map((cidr) => ({ ipBlock: { cidr } })), ports: [{ protocol: "TCP", port: 8787 }] }]);
+    expect(pub).toHaveLength(internal.length + 1);
+  });
+
+  it("admits the relayfile namespace on :8787 only when the Relayfile add-on is enabled", () => {
+    expect(internal.some((p) => p.metadata.name === "allow-relayfile-to-relayauth")).toBe(false);
+    const withRelayfile = relayauthNetworkPolicies({ publicJwksIngress: false, relayfileConsumer: true }) as Policy[];
+    expect(named(withRelayfile, "allow-relayfile-to-relayauth").spec.ingress).toEqual([
+      { from: [{ namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "relayfile" } } }], ports: [{ protocol: "TCP", port: 8787 }] },
+    ]);
+    expect(withRelayfile).toHaveLength(internal.length + 1);
+  });
+
+  it("is wired into the stack beside the relayauth namespace", () => {
+    const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
+    expect(stack).toContain("relayauthNetworkPolicies({ publicJwksIngress: Boolean(relayauthConfig.baseUrl), relayfileConsumer: Boolean(i.relayfile) })");
   });
 });
