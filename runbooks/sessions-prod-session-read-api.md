@@ -1,5 +1,7 @@
 # Session read API on sessions-prod
 
+> **Being replaced** by the Cloudflare Worker in `packages/session-read-worker` (`runbooks/sessions-prod-session-read-worker.md`), which runs the same code with no Lambda on the request path. This Lambda stays until the Worker serves every route `on`; then it is retired through its own reviewed plan phase.
+
 The session read API is the Lambda in `stacks/aws/session-read-api.ts`, with code in `src/session-read-api/`. It serves relayhistory's `/v1` event reads from ClickHouse `transcript_events`, and checks erasure and the history floor in Supabase. Cloud calls it per route behind a flag (`SESSIONS_READ_96BULLS_*`) and falls back to relayhistory on any 501, 5xx or timeout.
 
 Only the lead applies this, after independent review. Nothing in this file prints or stores a credential.

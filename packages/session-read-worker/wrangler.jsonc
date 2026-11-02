@@ -1,0 +1,37 @@
+{
+  // 96Bulls session read API on Cloudflare Workers (account Agent Workforce).
+  // Deployed only by .github/workflows/deploy-session-read-worker.yml, which
+  // fills the Hyperdrive id and the vars below from GitHub environment
+  // variables. Secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
+  // are set out of band with `wrangler secret put` and survive deploys.
+  // See runbooks/sessions-prod-session-read-worker.md.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "bulls96-session-read-api",
+  "account_id": "f7232cb80f6fab86a95426302af243e4",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  // Every request makes two ClickHouse round trips and up to two Supabase
+  // transactions, all in AWS us-east-1: run next to them, not next to Cloud.
+  "placement": { "mode": "smart" },
+  "observability": { "enabled": true },
+  "hyperdrive": [
+    {
+      "binding": "SUPABASE",
+      // Placeholder; the deploy workflow substitutes vars.SESSION_READ_HYPERDRIVE_ID
+      // and refuses to deploy while it is unset. Hyperdrive ids are not secret.
+      // Local runs take the connection string from
+      // CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_SUPABASE (never a file).
+      "id": "00000000000000000000000000000000"
+    }
+  ],
+  "vars": {
+    "CLICKHOUSE_DATABASE": "relay_search",
+    // Fail closed until the deploy workflow sets them: no origin = every /v1
+    // request 401; no completeSince = every request 503.
+    "READ_API_ORIGIN": "",
+    "READ_API_COMPLETE_SINCE": ""
+  }
+}
