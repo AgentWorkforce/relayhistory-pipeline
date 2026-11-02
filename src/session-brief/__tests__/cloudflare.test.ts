@@ -1,5 +1,5 @@
 /**
- * The session brief Cloudflare Worker entry (src/session-brief/cloudflare.ts): one bounded
+ * The session brief Cloudflare Worker (entry src/session-brief/cloudflare.ts, logic cloudflare-tick.ts): one bounded
  * tick per cron invocation, over PGlite (every migration), an fs Locker, a fake manifest
  * reader and a fake model, with the Worker's env shapes (Secrets Store bindings, a
  * Hyperdrive connection string, string vars). Plus the bundle the Worker ships: it must
@@ -14,7 +14,8 @@ import { ROLE_VALIDATION_NAME as DB_ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE 
 import { expectedMigrationNames } from "../../hoopdb/migrate.ts";
 import { briefConfig } from "../config.ts";
 import { armWakeup } from "../store.ts";
-import worker, {
+import worker from "../cloudflare.ts";
+import {
   BRIEF_MIGRATION,
   ROLE_VALIDATION_NAME,
   ROLE_VALIDATION_TABLE,
@@ -24,7 +25,7 @@ import worker, {
   runBriefInvocation,
   type BriefWorkerDeps,
   type BriefWorkerEnv,
-} from "../cloudflare.ts";
+} from "../cloudflare-tick.ts";
 import { sessionBriefVars, WORKER_MAX_SESSION_BYTES } from "../../../stacks/cloudflare/session-brief.ts";
 import { FakeModel, KEY, database, dueNow, hoopDb, mapReader, pointer, root, tempStore, transcript } from "./harness.ts";
 
@@ -265,6 +266,17 @@ describe("session brief Worker: one bounded tick per invocation", () => {
     await Promise.all(waits);
     // Disabled: returns without touching anything.
     await worker.scheduled({}, deployedEnv({ SESSION_BRIEF_ENABLED: "false" }), { waitUntil: () => {} });
+  });
+});
+
+describe("session brief Worker entry module", () => {
+  test("exports the scheduled handler and nothing else (workerd refuses any other named export)", async () => {
+    // workerd treats each named export of the entry as an entrypoint: a constant there fails the
+    // script at startup ("Incorrect type for map entry ...: not of type 'function or ExportedHandler'").
+    const entry = await import("../cloudflare.ts");
+    expect(Object.keys(entry)).toEqual(["default"]);
+    expect(Object.keys(entry.default)).toEqual(["scheduled"]);
+    expect(typeof entry.default.scheduled).toBe("function");
   });
 });
 

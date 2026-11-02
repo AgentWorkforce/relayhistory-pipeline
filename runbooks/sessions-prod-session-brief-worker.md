@@ -10,9 +10,10 @@ UTC day). sessions-prod has no container runtime, so the container service
   `stacks/cloudflare/alchemy.session-brief.run.ts`: stack `96bulls-session-brief`, stage
   `cf-sessions-prod`. Same guards as #154's ingest stage: inputs file, reviewed capture, a bound
   approval and a plan contract. `destroy` is refused.
-- **Entry:** `src/session-brief/cloudflare.ts`. It exports `scheduled` only. Every minute it runs
-  one `briefTick` (`src/session-brief/worker.ts`, unchanged). The tick prunes stale wakeups, then
-  claims at most `SESSION_BRIEF_BATCH` (5) due wakeups under a 300 s lease and briefs each one.
+- **Entry:** `src/session-brief/cloudflare.ts` exports the `scheduled` handler and nothing else,
+  because workerd treats every named export of the entry as an entrypoint. The logic is in
+  `src/session-brief/cloudflare-tick.ts`. Every minute it runs one `briefTick`
+  (`src/session-brief/worker.ts`, unchanged). The tick prunes stale wakeups, then claims at most `SESSION_BRIEF_BATCH` (5) due wakeups under a 300 s lease and briefs each one.
 - **No way in:** no route, no custom domain, no workers.dev and no preview URL
   (`assertPrivateBriefWorker`).
 - **Not included:** the historical backfill of about 120k sessions. `SESSION_BRIEF_SWEEP_SECONDS`

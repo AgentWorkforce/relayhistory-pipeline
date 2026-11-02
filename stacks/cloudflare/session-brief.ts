@@ -1,7 +1,7 @@
 /**
  * The model-written session briefs for sessions-prod: one Cloudflare Worker,
  * `96bulls-session-brief`, with a cron trigger and no way in. Each invocation runs
- * one bounded tick of the brief engine (src/session-brief/cloudflare.ts, which
+ * one bounded tick of the brief engine (src/session-brief/cloudflare.ts -> cloudflare-tick.ts, which
  * reuses src/session-brief/worker.ts briefTick unchanged).
  *
  *   cron "* * * * *" --> 96bulls-session-brief (no route, no URL, no domain)
