@@ -510,7 +510,11 @@ config fails closed.
   re-adds, such as `service_role` on an existing function; exit 1), `function_acl_missing`
   (only what the migrator adds: the runtime role's #116 grants, and functions a pending
   migration creates; exit 0) and `function_acl_public_revoked` (PUBLIC EXECUTE the migrator
-  revokes first; exit 0).
+  revokes first; exit 0). Known gap, on the safe side: when a pending migration would itself
+  re-grant a missing grant on an **existing** function, the preview still lists it under
+  `function_acl_missing_refused` (exit 1), although the migrate would pass. The preview can
+  only over-refuse, never under-refuse. In that case, read the pending migration and
+  proceed only on its reviewed grants.
 - **No schema-scoped grant in `sessions`:** a function default defined `IN SCHEMA sessions`
   (by any role) adds to the global default, so any entry granting a role other than its
   own (for example `authenticated`) refuses the gate and the bootstrap
