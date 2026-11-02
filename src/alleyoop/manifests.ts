@@ -55,6 +55,7 @@ import {
   SCRUB_RULESET_VERSION,
 } from "../shared/vendor.ts";
 import { enrichMessage } from "../shared/enrich.ts";
+import { errorFields, log } from "../shared/log.ts";
 import { createHash } from "node:crypto";
 
 const sha256Hex = async (text: string) =>
@@ -1055,7 +1056,12 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         key,
         manifest.session.machine_id,
         new Date(),
-      ).catch(() => false);
+      ).catch((err) => {
+        // Best effort: the write proceeds, but a role without s3:DeleteObject
+        // (or any store error) must be visible, not silently leave parked data.
+        log.warn("parked session expiry failed", errorFields(err));
+        return false;
+      });
       const missing = deps.missingReaders ?? (async () => ["unconfigured"]);
       if (
         existing &&
@@ -1201,7 +1207,9 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
           deps.raw.store,
           key,
           manifest.session.machine_id,
-        ).catch(() => undefined);
+        ).catch((err) =>
+          log.warn("parked session cleanup failed", errorFields(err)),
+        );
       const read = await deps.manifests.read(key);
       if (!read) throw new Error("manifest disappeared after write");
       // The authoritative storage read must agree with what was verified.

@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "96bullsessions",
+      "name": "sessions-pipeline",
       "dependencies": {
         "@96bulls/pipeline": "workspace:*",
         "@alchemy.run/aws": "2.0.0-beta.84",

@@ -25,7 +25,7 @@ jobs:
   publish:
     if: ${{ github.event_name == 'workflow_dispatch' && github.actor == 'khaliqgant' && github.ref == 'refs/heads/main' && github.event.inputs.confirm == 'publish 96bulls-services to artifact registry' }}
     environment: image-publish
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPLOY_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -254,12 +254,12 @@ jobs:
           provenance: mode=max
           tags: us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services:sha-${{ github.sha }}
           labels: |
-            org.opencontainers.image.source=https://github.com/AgentWorkforce/96BullSessions
+            org.opencontainers.image.source=https://github.com/AgentWorkforce/sessions-pipeline
             org.opencontainers.image.revision=${{ github.sha }}
           annotations: |
-            index:org.opencontainers.image.source=https://github.com/AgentWorkforce/96BullSessions
+            index:org.opencontainers.image.source=https://github.com/AgentWorkforce/sessions-pipeline
             index:org.opencontainers.image.revision=${{ github.sha }}
-            manifest:org.opencontainers.image.source=https://github.com/AgentWorkforce/96BullSessions
+            manifest:org.opencontainers.image.source=https://github.com/AgentWorkforce/sessions-pipeline
             manifest:org.opencontainers.image.revision=${{ github.sha }}
       - name: Digest
         env:

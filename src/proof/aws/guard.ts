@@ -1,9 +1,12 @@
 /**
  * The hard guard for the isolated AWS self-host proof (docs/aws-e2e-proof.md).
  *
- * Every step that touches a live target passes through here first. The proof
- * may only ever act on one AWS account and one EKS cluster; anything else is
- * refused before a process is spawned. There is no override flag.
+ * Every step that touches a live target passes through here first. A run acts
+ * on exactly one of two hardcoded targets, chosen by `--target`: the proof
+ * stage beside sessions-dev (account 500268966557) or the Pippen sandbox of
+ * agent aws-proof (account 361835732085, caller pinned to the agent-session
+ * role). Anything else is refused before a process is spawned. There is no
+ * override flag and no variable that widens either target.
  *
  *   dry-run    (default) print the exact commands; touch nothing.
  *   read-only  run non-mutating steps. Allowed on the local kind cluster
@@ -22,6 +25,117 @@ export const PROOF_REGION = "us-west-2";
 /** The only local cluster this harness may read; it never mutates it. */
 export const LOCAL_READONLY_CONTEXT = "kind-96bulls-e2e";
 
+/**
+ * The second, equally hardcoded proof target: the Pippen Tools sandbox account
+ * of agent `aws-proof` (Khaliq, 2026-11-01), in the Sandbox OU of the 96Bulls
+ * org. Its teardown is `pippen sandbox down aws-proof`, a verified sweep of
+ * everything tagged `pippen:sandbox=true` plus a zero-non-baseline-IAM check.
+ * Credentials there come only from the pippen `agent-session` role, so the
+ * guard also pins the caller's assumed-role ARN.
+ */
+export const SANDBOX_ACCOUNT_ID = "361835732085";
+/** The Pippen sandbox agent name: `pippen sandbox up|down aws-proof`. */
+export const PIPPEN_SANDBOX_AGENT = "aws-proof";
+export const SANDBOX_STAGE = "aws-proof-sandbox";
+export const SANDBOX_CLUSTER = `96bulls-${SANDBOX_STAGE}`;
+export const SANDBOX_REGION = "us-west-2";
+/**
+ * `aws sts get-caller-identity` Arn inside the sandbox: the pippen agent-session
+ * role, session `agent-<session_id>`, where session_id is the lease UUID that
+ * `pippen sandbox status aws-proof` shows after `up` (pippen-tools 513b8e5
+ * provisioner.ts: sessionName `agent-${session.sessionId}`, a randomUUID).
+ */
+export const SANDBOX_CALLER_ROLE = { roleName: "agent-session", sessionPrefix: "agent-" } as const;
+/** The sts assumed-role prefix every sandbox caller ARN starts with. */
+export const SANDBOX_CALLER_ROLE_PREFIX = `arn:aws:sts::${SANDBOX_ACCOUNT_ID}:assumed-role/${SANDBOX_CALLER_ROLE.roleName}/`;
+/** A pippen lease id: a lowercase RFC 4122 version-4 UUID (crypto.randomUUID), nothing else. */
+export const PIPPEN_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+/** The exact caller ARN of pippen lease `sessionId`, or undefined when the id is not a strict UUID. */
+export function sandboxCallerArn(sessionId: string | undefined): string | undefined {
+  return sessionId !== undefined && PIPPEN_SESSION_ID.test(sessionId) ? `${SANDBOX_CALLER_ROLE_PREFIX}${SANDBOX_CALLER_ROLE.sessionPrefix}${sessionId}` : undefined;
+}
+/**
+ * The one resource `pippen sandbox up` creates in the member account
+ * (pippen-tools src/sandbox/provisioner.ts #up: createRole agent-session, path
+ * /pippen/, inline policy, tagged pippen:sandbox=true + agent + session). It is
+ * the role the post-destroy run's own credentials come from.
+ */
+export const SANDBOX_AGENT_SESSION_ROLE_ARN = `arn:aws:iam::${SANDBOX_ACCOUNT_ID}:role/pippen/${SANDBOX_CALLER_ROLE.roleName}`;
+/**
+ * Post-destroy runs after `pippen sandbox down` deleted the agent-session role
+ * and a fresh `pippen sandbox up` recreated it: same role name in the same
+ * account, a session name that differs per session. Only the role is pinned;
+ * the session name must be a valid STS role-session name.
+ */
+export const SANDBOX_POST_DESTROY_CALLER = new RegExp(`^arn:aws:sts::${SANDBOX_ACCOUNT_ID}:assumed-role/${SANDBOX_CALLER_ROLE.roleName}/[\\w+=,.@-]{2,64}$`);
+
+export type ProofTargetId = "proof" | "pippen-sandbox";
+
+/**
+ * One hardcoded proof target. There are exactly two (PROOF_TARGETS); nothing
+ * builds one from config or the environment, and every check compares against
+ * these frozen values only.
+ */
+export interface ProofTarget {
+  id: ProofTargetId;
+  accountId: string;
+  stage: string;
+  clusterName: string;
+  region: string;
+  /**
+   * When set, live steps need the run's pippen session id, and the
+   * `sts get-caller-identity` Arn must equal exactly
+   * `<callerRolePrefix>agent-<session id>` (sandboxCallerArn).
+   */
+  callerRolePrefix?: string;
+  /** When set, post-destroy accepts a caller Arn matching this (a fresh session of the same role) instead of `callerArn`. */
+  postDestroyCaller?: RegExp;
+  /** The stage's teardown of its AWS resources; printed, never run by the harness. */
+  destroyCommand: string;
+  /** Extra tag filters the post-destroy absence check lists (beyond `96bulls:stack=<stage>`). */
+  sweepTags: ReadonlyArray<{ key: string; value: string }>;
+  /**
+   * Exact ARNs a post-destroy listing may show that are not leftovers: what a
+   * fresh `pippen sandbox up` creates for the verification run itself. Matched
+   * by exact ARN only, never by tag; anything else listed is residue.
+   */
+  residueExemptArns?: readonly string[];
+}
+
+/** The original target beside aws-sessions-dev. Its behavior is unchanged by the sandbox target. */
+export const SESSIONS_DEV_PROOF_TARGET: ProofTarget = Object.freeze({
+  id: "proof",
+  accountId: PROOF_ACCOUNT_ID,
+  stage: PROOF_STAGE,
+  clusterName: PROOF_CLUSTER,
+  region: PROOF_REGION,
+  destroyCommand: `bin/96bulls down ${PROOF_STAGE}`,
+  sweepTags: Object.freeze([]),
+}) as ProofTarget;
+
+export const PIPPEN_SANDBOX_PROOF_TARGET: ProofTarget = Object.freeze({
+  id: "pippen-sandbox",
+  accountId: SANDBOX_ACCOUNT_ID,
+  stage: SANDBOX_STAGE,
+  clusterName: SANDBOX_CLUSTER,
+  region: SANDBOX_REGION,
+  callerRolePrefix: SANDBOX_CALLER_ROLE_PREFIX,
+  postDestroyCaller: SANDBOX_POST_DESTROY_CALLER,
+  destroyCommand: `pippen sandbox down ${PIPPEN_SANDBOX_AGENT}`,
+  // Alchemy's own stage tag beside 96bulls:stack, and the sweeper's tag: after the sweep and a
+  // fresh `up`, the only pippen:sandbox=true resource may be the new agent-session role.
+  // Pippen's baseline is tagged pippen:baseline=true, never these, so it is never listed.
+  sweepTags: Object.freeze([Object.freeze({ key: "alchemy::stage", value: SANDBOX_STAGE }), Object.freeze({ key: "pippen:sandbox", value: "true" })]),
+  residueExemptArns: Object.freeze([SANDBOX_AGENT_SESSION_ROLE_ARN]),
+}) as ProofTarget;
+
+export const PROOF_TARGETS: Readonly<Record<ProofTargetId, ProofTarget>> = Object.freeze({ proof: SESSIONS_DEV_PROOF_TARGET, "pippen-sandbox": PIPPEN_SANDBOX_PROOF_TARGET });
+
+/** The hardcoded target whose stage this is, or undefined (kind, or anything unknown). */
+export function proofTargetForStage(stage: string): ProofTarget | undefined {
+  return Object.values(PROOF_TARGETS).find((t) => t.stage === stage);
+}
+
 export type Mode = "dry-run" | "read-only" | "live";
 
 export class GuardError extends Error {
@@ -36,7 +150,9 @@ export class GuardError extends Error {
       | "context_mismatch"
       | "production_name"
       | "local_is_read_only"
-      | "unverified_identity",
+      | "unverified_identity"
+      | "wrong_caller"
+      | "missing_pippen_session",
     message: string,
   ) {
     super(message);
@@ -50,6 +166,10 @@ const PRODUCTION_SHAPED = /(^|[-_/:.])(prod|production|sessions-dev|hosted|live)
 export interface Identity {
   /** `aws sts get-caller-identity` Account, as observed, never as configured. */
   accountId?: string;
+  /** `aws sts get-caller-identity` Arn, as observed. Required (and pinned) only on a target with `callerRolePrefix`. */
+  callerArn?: string;
+  /** The pippen lease UUID the operator gave (`--pippen-session`, from `pippen sandbox status`). Narrows, never widens. */
+  pippenSessionId?: string;
   /** The EKS cluster name the operator asked for (config). */
   clusterName: string;
   /** The kube context the harness will pass as --context. */
@@ -85,39 +205,67 @@ export function parseEksArn(arn: string | undefined): { region: string; accountI
  * The decision depends only on observed identity, never on a flag that can
  * widen the target.
  */
-export function assertMayRun(g: GuardInput): void {
+export function assertMayRun(g: GuardInput, t: ProofTarget = SESSIONS_DEV_PROOF_TARGET): void {
   if (g.mode === "dry-run") return;
   if (g.postDestroy) {
     if (g.mutating) throw new GuardError("post_destroy_read_only", "refusing: post-destroy verification only reads");
-    return assertPostDestroyTarget(g);
+    return assertPostDestroyTarget(g, t);
   }
   if (g.kubeContext === LOCAL_READONLY_CONTEXT) {
     if (g.mutating || g.mode === "live")
       throw new GuardError("local_is_read_only", `refusing: ${LOCAL_READONLY_CONTEXT} is read-only for this harness; nothing was changed`);
     return;
   }
-  assertProofTarget(g);
+  assertProofTarget(g, t);
 }
 
-/** The account + cluster + flag check every non-local step needs, read-only included. */
-export function assertProofTarget(g: Omit<GuardInput, "mode" | "mutating">): void {
+/**
+ * The account + cluster + flag check every non-local step needs, read-only
+ * included, against one hardcoded target (default: the sessions-dev proof).
+ */
+export function assertProofTarget(g: Omit<GuardInput, "mode" | "mutating">, t: ProofTarget = SESSIONS_DEV_PROOF_TARGET): void {
+  assertKnownTarget(t);
   if (!g.confirmLive) throw new GuardError("missing_confirm_live", "refusing: live targets need --confirm-live; nothing was run");
   for (const name of [g.clusterName, g.kubeContext, g.kubeContextCluster ?? ""])
     if (PRODUCTION_SHAPED.test(name)) throw new GuardError("production_name", `refusing: '${name}' looks like a production or shared target`);
   if (!g.accountId) throw new GuardError("unverified_identity", "refusing: caller account not verified with sts get-caller-identity");
-  if (g.accountId !== PROOF_ACCOUNT_ID)
-    throw new GuardError("wrong_account", `refusing: caller account ${g.accountId} is not the proof account ${PROOF_ACCOUNT_ID}`);
-  if (g.clusterName !== PROOF_CLUSTER)
-    throw new GuardError("wrong_cluster", `refusing: cluster '${g.clusterName}' is not the proof cluster '${PROOF_CLUSTER}'`);
+  if (g.accountId !== t.accountId)
+    throw new GuardError("wrong_account", `refusing: caller account ${g.accountId} is not the proof account ${t.accountId}`);
+  assertCaller(g, t);
+  if (g.clusterName !== t.clusterName)
+    throw new GuardError("wrong_cluster", `refusing: cluster '${g.clusterName}' is not the proof cluster '${t.clusterName}'`);
   const arn = parseEksArn(g.kubeContextCluster);
-  if (!arn || arn.accountId !== PROOF_ACCOUNT_ID || arn.clusterName !== PROOF_CLUSTER)
-    throw new GuardError("context_mismatch", `refusing: kube context '${g.kubeContext}' does not point at ${PROOF_CLUSTER} in ${PROOF_ACCOUNT_ID}`);
-  if (arn.region !== PROOF_REGION) throw new GuardError("wrong_region", `refusing: kube context cluster is in ${arn.region}, not ${PROOF_REGION}`);
+  if (!arn || arn.accountId !== t.accountId || arn.clusterName !== t.clusterName)
+    throw new GuardError("context_mismatch", `refusing: kube context '${g.kubeContext}' does not point at ${t.clusterName} in ${t.accountId}`);
+  if (arn.region !== t.region) throw new GuardError("wrong_region", `refusing: kube context cluster is in ${arn.region}, not ${t.region}`);
   if (g.clusterBound !== true) throw new GuardError("cluster_unbound", "refusing: the kube context is not bound to the live cluster's endpoint and CA (describe-cluster)");
   // The context name itself, when it is an EKS ARN, must agree too.
   const named = parseEksArn(g.kubeContext);
-  if (named && (named.region !== PROOF_REGION || named.accountId !== PROOF_ACCOUNT_ID || named.clusterName !== PROOF_CLUSTER))
-    throw new GuardError("wrong_region", `refusing: kube context name ${g.kubeContext} is not the proof cluster in ${PROOF_REGION}`);
+  if (named && (named.region !== t.region || named.accountId !== t.accountId || named.clusterName !== t.clusterName))
+    throw new GuardError("wrong_region", `refusing: kube context name ${g.kubeContext} is not the proof cluster in ${t.region}`);
+}
+
+/** Only the two frozen targets are ever accepted; a look-alike object is refused. */
+function assertKnownTarget(t: ProofTarget): void {
+  if (PROOF_TARGETS[t.id] !== t) throw new GuardError("wrong_account", "refusing: not a hardcoded proof target");
+}
+
+/** On a target that pins its caller (the Pippen sandbox), the sts Arn must be exactly that role session. */
+function assertCaller(g: { callerArn?: string; pippenSessionId?: string }, t: ProofTarget, postDestroy = false): void {
+  if (t.callerRolePrefix === undefined) return;
+  if (!postDestroy) {
+    if (g.pippenSessionId === undefined) throw new GuardError("missing_pippen_session", "refusing: the Pippen sandbox needs --pippen-session <session_id from `pippen sandbox status aws-proof`>");
+    if (!PIPPEN_SESSION_ID.test(g.pippenSessionId)) throw new GuardError("missing_pippen_session", "refusing: --pippen-session must be a lowercase v4 UUID");
+  }
+  if (!g.callerArn) throw new GuardError("unverified_identity", "refusing: caller ARN not verified with sts get-caller-identity");
+  if (postDestroy && t.postDestroyCaller) {
+    if (!t.postDestroyCaller.test(g.callerArn))
+      throw new GuardError("wrong_caller", `refusing: caller ${g.callerArn} is not a session of the pippen agent-session role in ${t.accountId}`);
+    return;
+  }
+  const want = sandboxCallerArn(g.pippenSessionId);
+  if (g.callerArn !== want)
+    throw new GuardError("wrong_caller", `refusing: caller ${g.callerArn} is not the pippen agent-session role session ${want}`);
 }
 
 /**
@@ -126,9 +274,11 @@ export function assertProofTarget(g: Omit<GuardInput, "mode" | "mutating">): voi
  * context) comes from the admitted prior report, whose target is the exact
  * proof constant. No kube context is involved: the cluster is meant to be gone.
  */
-export function assertPostDestroyTarget(g: { confirmLive: boolean; accountId?: string; clusterName: string }): void {
+export function assertPostDestroyTarget(g: { confirmLive: boolean; accountId?: string; callerArn?: string; clusterName: string }, t: ProofTarget = SESSIONS_DEV_PROOF_TARGET): void {
+  assertKnownTarget(t);
   if (!g.confirmLive) throw new GuardError("missing_confirm_live", "refusing: live targets need --confirm-live; nothing was run");
   if (!g.accountId) throw new GuardError("unverified_identity", "refusing: caller account not verified with sts get-caller-identity");
-  if (g.accountId !== PROOF_ACCOUNT_ID) throw new GuardError("wrong_account", `refusing: caller account ${g.accountId} is not the proof account ${PROOF_ACCOUNT_ID}`);
-  if (g.clusterName !== PROOF_CLUSTER) throw new GuardError("wrong_cluster", `refusing: cluster '${g.clusterName}' is not the proof cluster '${PROOF_CLUSTER}'`);
+  if (g.accountId !== t.accountId) throw new GuardError("wrong_account", `refusing: caller account ${g.accountId} is not the proof account ${t.accountId}`);
+  assertCaller(g, t, true);
+  if (g.clusterName !== t.clusterName) throw new GuardError("wrong_cluster", `refusing: cluster '${g.clusterName}' is not the proof cluster '${t.clusterName}'`);
 }

@@ -20,16 +20,20 @@ recorded in the inputs' `approval` record where the stack checks it
 | --- | --- | --- |
 | S3 bucket | `96bulls-aws-sessions-prod-transcripts-941433935742` | Versioned. SSE-KMS with its own CMK, **S3 Bucket Key off**, SSE-C blocked. Block Public Access (all four). BucketOwnerEnforced. Object Lock **off**. Server access logs to the log bucket. Lifecycle: noncurrent versions expire after 1 day, expired delete markers removed, incomplete multipart uploads aborted after 1 day. |
 | Bucket policy | (on the bucket) | Deny non-TLS; deny TLS < 1.2; deny `DeleteObject`/`DeleteObjectVersion` to everyone but the eraser; deny a PUT whose encryption header is anything but SSE-KMS naming this key (including `aws:kms` with no key id, which S3 would encrypt with the AWS managed `aws/s3` key). A PUT with no encryption header gets the bucket default. No Allow statements. |
-| KMS key + alias | `alias/96bulls-aws-sessions-prod-transcripts` | Rotation on, 30-day deletion window. Root administers but cannot use. Writer: `GenerateDataKey` + `Decrypt`; reader: `Decrypt`; both only via `s3.us-east-1.amazonaws.com`, from this account, for objects under `96bulls/` in this bucket (encryption context `aws:s3:arn`). |
+| KMS key + alias | `alias/96bulls-aws-sessions-prod-transcripts` | Rotation on, 30-day deletion window. Root administers but cannot use. Writer and srv-writer: `GenerateDataKey` + `Decrypt`; reader: `Decrypt`; all only via `s3.us-east-1.amazonaws.com`, from this account, for objects under `96bulls/` in this bucket (encryption context `aws:s3:arn`). |
 | S3 bucket | `96bulls-aws-sessions-prod-access-logs-941433935742` | Versioned, SSE-S3 (server access logs cannot be delivered to an SSE-KMS bucket), Block Public Access, owner-enforced, TLS only. Accepts logs only from the transcripts bucket. Logs expire after 90 days. |
 | CloudTrail | `96bulls-aws-sessions-prod-trail` | Multi-region, log file validation, own KMS key (`alias/96bulls-aws-sessions-prod-trail`) and versioned bucket (`96bulls-aws-sessions-prod-trail-941433935742`, 365-day retention). Management events plus **S3 data events for the transcripts bucket only**. Both bucket service grants require the exact trail `SourceArn` and `SourceAccount`. Trail-log decrypt/re-encrypt is absent unless `transcriptStore.auditPrincipalArn` names one IAM role in this account. |
 | IAM user | `/96bulls/96bulls-aws-sessions-prod-transcript-writer` | The RelayHistory Worker. `ListBucket`; `GetObject` on `96bulls/*/v1/*`; `PutObject` on `…/raw/*`, `…/manifest.json`, `…/summary/*`. Explicit deny on delete, old versions, bucket configuration. |
+| IAM user | `/96bulls/96bulls-aws-sessions-prod-transcript-srv-writer` | The relayhistory-api Worker's live writer. `GetObject`/`PutObject` only on `96bulls/*/v1/ws=*/m=srv_*`, `96bulls/*/live-sessions/*`, `96bulls/*/live-batches/*`. A PUT must send `x-amz-server-side-encryption: aws:kms` and a key id in this account and region; the bucket policy pins it to the transcripts key. `GenerateDataKey`/`Decrypt` via S3 on the key's alias. `ListBucket` on the bucket, as the writer has, so a missing key answers 404 (the Worker's create-only pointer, manifest and batch-marker reads need it; HEAD/GET carry no `s3:prefix`, so it cannot be prefix-scoped). No version listing, no delete, no old versions, no bucket configuration. Added after the first apply: the plan contract's `srv-writer addition` phase is exactly `transcript-srv-writer` create plus `transcripts-key` update. |
 | IAM user | `/96bulls/96bulls-aws-sessions-prod-transcript-reader` | The history indexer. `ListBucket`; `GetObject` on `96bulls/*/v1/*`. Explicit deny on put, delete, old versions. |
 | IAM user | `/96bulls/96bulls-aws-sessions-prod-transcript-eraser` | The erasure job. `ListBucket`/`ListBucketVersions` under `96bulls/`; `DeleteObject`/`DeleteObjectVersion` on `96bulls/*`. Explicit deny on reading or writing content. No key use. |
 | Budget | `96bulls-aws-sessions-prod-monthly` | Alarm at 80% actual and 100% forecast of `budgetUsd`. |
 
 Nothing else: no Locker, ECR, GitHub OIDC, EKS or Supabase (the inputs refuse
-them), and no access keys (see "Credentials").
+them), and no access keys (see "Credentials"). The one opt-in addition is the
+session pipeline (`transcriptStore.sessionPipeline`: SQS, a Lambda, its secret
+and alarms), which adds a read-only grant for its execution role to the key
+policy and the bucket policy; see `runbooks/sessions-prod-session-pipeline.md`.
 
 Key layout (the 96Bulls pipeline's org-prefix mode, `stacks/aws/tenants.ts`):
 
@@ -169,12 +173,15 @@ cp stacks/aws/examples/aws-sessions-prod.inputs.example.json .96bulls/aws-sessio
 bin/96bulls plan aws-sessions-prod --capture     # read only; docs/plans/aws-sessions-prod.*
 ```
 
-The capture and deploy gates accept exactly four operation shapes: all 12
+The capture and deploy gates accept exactly six operation shapes: all 12
 resources created (initial); the known three-resource continuation after IAM
 principal propagation (`transcripts`, `transcripts-key`,
 `transcripts-key-alias`); the one post-merge policy remediation described
 below (`trail-key` and `trail-logs` update, the other ten resources `noop`);
-or all 12 resources `noop` (post-apply). Every resource must appear exactly
+the srv-writer addition (`transcript-srv-writer` create plus `transcripts-key`
+update); its propagation recovery (`transcripts-key` update alone, adding the
+srv-writer's key statement; see "Applied 2026-10-31"); or every resource
+`noop` (post-apply). Every resource must appear exactly
 once in both the compact and detailed plan. The production gate requires the
 exact compact and detailed paths and sha256 values recorded in provenance;
 the approval binds that provenance and compact plan.
@@ -252,6 +259,17 @@ to see the bucket policy refuse `aws:kms` without this key id (explicitDeny).
   `0ae5e1b5f8a137a76c8c867485bbbeb7a4bf2cadaabcad68012f3b6401396cb1`.
 - **Next time:** if this happens on a new stage, wait a minute, re-capture and re-apply. Nothing
   partial needs cleaning up.
+- **srv-writer addition (2026-11-01):** the same refusal can follow the `srv-writer addition` apply:
+  `transcript-srv-writer` is created, then KMS refuses the `transcripts-key` update because the new
+  user has not propagated. Wait 2-3 minutes and re-capture. The recapture is `transcripts-key update`
+  with the other 12 resources `noop` (the user now exists in state), the `srv-writer propagation
+  recovery` phase. The contract accepts it only when the detailed plan shows the live key policy
+  without `SrvWriterEncryptsAndReadsViaS3` and the planned policy with exactly one; any other lone
+  key-policy update is refused. In practice Alchemy persists the failed update (state `updating`), so
+  the detailed plan shows `no declared property changes` instead of a diff; then the capture checks
+  its state snapshot: the pending key props must be the previous props plus exactly the one
+  `SrvWriterEncryptsAndReadsViaS3` statement naming the srv-writer user. The deploy is bound to that
+  same state by the capture's version digest. Commit the capture, bind `approval.capture` to it, and `up`.
 - **Account-level S3 Block Public Access:** set separately on 2026-10-31 with
   `s3control put-public-access-block` (all four true).
 

@@ -101,11 +101,15 @@ export function scrubShortSummary(
   };
 }
 
+/** The session-brief worker's producer prefix (src/session-brief/versions.ts). */
+export const BRIEF_SUMMARY_SOURCE_PREFIX = "session-brief/";
+
 /**
  * Store a summary on a live (not tombstoned) directory row and rebuild its search
  * document with `sessions.session_directory_search_text`, so the summary is always
  * searchable through `search_text`. An older `generatedAt` never replaces a newer
- * summary. Returns whether a row was written.
+ * summary, and a non-brief producer (Bob Costas's extractive summary) never replaces a
+ * model-written brief (`session-brief/*`). Returns whether a row was written.
  */
 export async function writeShortSummary(
   db: SqlExecutor,
@@ -123,7 +127,7 @@ export async function writeShortSummary(
     // search_text) under the same generated_at fence, so a refused *older* summary
     // never clears a newer good one. Then rethrow the refusal.
     if (error instanceof ShortSummaryRejected)
-      await clearOlderShortSummary(db, input, input.generatedAt);
+      await clearOlderShortSummary(db, input, input.generatedAt, input.source);
     throw error;
   }
   const { rows } = await db.query<{ written: boolean }>(
@@ -140,6 +144,8 @@ export async function writeShortSummary(
       WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
         AND d.deleted_at IS NULL
         AND (d.short_summary_generated_at IS NULL OR d.short_summary_generated_at <= $9::timestamptz)
+        AND (d.short_summary_source IS NULL OR left(d.short_summary_source, $10) <> $11
+             OR left($8, $10) = $11)
       RETURNING true AS written`,
     [
       input.orgId,
@@ -151,6 +157,8 @@ export async function writeShortSummary(
       scrubbed.scrubVersion,
       input.source,
       input.generatedAt.toISOString(),
+      BRIEF_SUMMARY_SOURCE_PREFIX.length,
+      BRIEF_SUMMARY_SOURCE_PREFIX,
     ],
   );
   return { written: rows.length > 0, scrubVersion: scrubbed.scrubVersion };
@@ -161,6 +169,7 @@ async function clearOlderShortSummary(
   db: SqlExecutor,
   key: SessionDirectoryKey,
   notAfter: Date,
+  source: string,
 ): Promise<boolean> {
   const { rows } = await db.query<{ cleared: boolean }>(
     `UPDATE sessions.session_directory AS d
@@ -176,6 +185,9 @@ async function clearOlderShortSummary(
       WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
         AND d.deleted_at IS NULL AND d.short_summary IS NOT NULL
         AND d.short_summary_generated_at <= $5::timestamptz
+        -- The same producer precedence as the write: a refused extractive summary
+        -- never clears a model-written brief.
+        AND (left(d.short_summary_source, $7) <> $8 OR left($6, $7) = $8)
       RETURNING true AS cleared`,
     [
       key.orgId,
@@ -183,6 +195,9 @@ async function clearOlderShortSummary(
       key.harness,
       key.sessionId,
       notAfter.toISOString(),
+      source,
+      BRIEF_SUMMARY_SOURCE_PREFIX.length,
+      BRIEF_SUMMARY_SOURCE_PREFIX,
     ],
   );
   return rows.length > 0;

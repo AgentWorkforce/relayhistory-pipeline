@@ -27,7 +27,9 @@
  * Logs are JSON lines of counts and codes only: never content, ids of
  * sessions, keys or credentials.
  */
-import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, unlinkSync, writeSync } from "node:fs";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { createS3Store, objectKey, ObjectStoreError, type ObjectStore } from "../../shared/vendor.ts";
 import type { Queryable } from "../relayhistory-export.ts";
@@ -155,6 +157,37 @@ async function preflight(store: ObjectStore, root: string): Promise<boolean> {
   return true;
 }
 
+/**
+ * The state file a run may write. `--execute` uses the watermark itself. A dry
+ * run never does: it works on a private copy (`VACUUM INTO`, so the WAL is
+ * included) of the watermark, or on an empty file, under
+ * `~/.agent-tmp/s3x/dry-runs/`, removed by `cleanup`. A dry run's store
+ * discards every write, so recording its "exports" in the real watermark would
+ * mark sessions exported that are not in S3.
+ */
+export function stateForRun(execute: boolean, statePath: string, scratchDir = `${process.env.HOME}/.agent-tmp/s3x/dry-runs`): {
+  path: string;
+  cleanup: () => void;
+} {
+  if (execute) return { path: statePath, cleanup: () => {} };
+  mkdirSync(scratchDir, { recursive: true, mode: 0o700 });
+  const copy = join(scratchDir, `dry-${process.pid}-${Date.now()}.sqlite`);
+  if (existsSync(statePath)) {
+    const src = new DatabaseSync(statePath, { readOnly: true });
+    try {
+      src.exec(`VACUUM INTO '${copy.replace(/'/g, "''")}'`);
+    } finally {
+      src.close();
+    }
+  }
+  return {
+    path: copy,
+    cleanup: () => {
+      for (const f of [copy, `${copy}-wal`, `${copy}-shm`, `${copy}.lock`]) rmSync(f, { force: true });
+    },
+  };
+}
+
 export async function main() {
   const execute = flag("execute");
   const urlFile = env("NEON_URL_FILE");
@@ -165,7 +198,9 @@ export async function main() {
     await new Promise((r) => setTimeout(r, 10 * 60 * 1000));
     process.exit(3);
   }
-  const statePath = env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state${execute ? "" : "-dry"}.sqlite`)!;
+  const run = stateForRun(execute, env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!);
+  const statePath = run.path;
+  if (!execute) log({ message: "dry run on a private copy of the watermark; the real state file is never written" });
   // One exporter per watermark: two would delete each other's freshly sealed chunks.
   const lockPath = `${statePath}.lock`;
   let lockFd: number;
@@ -235,6 +270,7 @@ export async function main() {
     try {
       unlinkSync(lockPath);
     } catch {}
+    run.cleanup();
     for (const c of clients) await c.end().catch(() => undefined);
   }
 }

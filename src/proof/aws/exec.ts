@@ -109,7 +109,7 @@ export class Runner {
       return { allowed: false, record: { ...base, status: "skipped" } };
     }
     try {
-      assertMayRun({ ...this.o.identity, mode: this.o.mode, mutating });
+      assertMayRun({ ...this.o.identity, mode: this.o.mode, mutating }, this.o.fence.proofTarget);
     } catch (e) {
       const code = e instanceof GuardError ? e.code : "guard_error";
       print(`  [REFUSED] ${step.id}: ${code}`);
