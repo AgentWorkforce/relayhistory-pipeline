@@ -1,6 +1,6 @@
 /** Browser/Worker-safe contract. No provider history or Node dependencies. */
 export const SESSION_SUMMARY_VERSION = 1 as const;
-export const SESSION_SUMMARY_PROMPT_VERSION = "session-summary-v2";
+export const SESSION_SUMMARY_PROMPT_VERSION = "session-summary-v3";
 export const SESSION_SUMMARY_TIMEOUT_MS = 20_000;
 export const SESSION_SUMMARY_MAX_MESSAGES = 4_000;
 export const SESSION_SUMMARY_TEXT_BUDGET = 64_000;
@@ -11,25 +11,40 @@ export interface SessionSummaryInput {
   messages: { role: "user" | "assistant"; text: string; truncated: boolean }[];
 }
 
+/** Where the work stands at the end of the conversation, as the conversation reports it. */
+export const SESSION_SUMMARY_STATES = [
+  "in-progress",
+  "completed",
+  "blocked",
+  "abandoned",
+  "answered",
+] as const;
+export type SessionSummaryState = (typeof SESSION_SUMMARY_STATES)[number];
+
 export interface SessionSummaryText {
   title: string;
   description: string;
+  state: SessionSummaryState;
 }
 
 export const SESSION_SUMMARY_JSON_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["title", "description"],
+  required: ["title", "description", "state"],
   properties: {
     title: { type: "string", maxLength: 90 },
     description: { type: "string", maxLength: 320 },
+    state: { type: "string", enum: SESSION_SUMMARY_STATES },
   },
 } as const;
 
 export function validateSummaryText(value: unknown): SessionSummaryText {
   if (
     !record(value) ||
-    Object.keys(value).some((key) => !["title", "description"].includes(key))
+    Object.keys(value).some(
+      (key) => !["title", "description", "state"].includes(key),
+    ) ||
+    !SESSION_SUMMARY_STATES.includes(value.state as SessionSummaryState)
   )
     throw new TypeError("Invalid summary output");
   for (const [key, max] of [
@@ -47,6 +62,7 @@ export function validateSummaryText(value: unknown): SessionSummaryText {
   return {
     title: (value.title as string).trim(),
     description: (value.description as string).trim(),
+    state: value.state as SessionSummaryState,
   };
 }
 

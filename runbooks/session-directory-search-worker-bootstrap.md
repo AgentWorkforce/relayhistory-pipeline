@@ -349,13 +349,14 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261101050000_session_directory_list.sql`           | table sessions.session_directory_agents                                                                                 |
 | `upstream:20261102000000_session_briefs.sql`                   | table sessions.session_briefs                                                                                           |
 | `upstream:20261102010000_session_directory_canonical_ids.sql`  | column sessions.session_index.canonical_session_id                                                                      |
+| `upstream:20261102020000_session_brief_state.sql`              | ALTER-only: column sessions.session_briefs.state                                                                        |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
 | `96bulls:0004_summary_pointers.sql`                            | DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)                                          |
 
 For each ALTER or replacement step (`20261025000300`, `20261030000000`,
-`20261102010000`, `0003`, `0004`),
+`20261102010000`, `20261102020000`, `0003`, `0004`),
 real PostgreSQL 15 and 17 tests cover two states. Honestly applied and ledgered is
 accepted with no false positive. Applied but unledgered is refused before any write.
 

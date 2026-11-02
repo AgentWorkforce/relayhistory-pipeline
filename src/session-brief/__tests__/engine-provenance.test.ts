@@ -28,8 +28,8 @@ describe("vendored relayhistory brief engine", () => {
 
   test("the summary prompt is relayhistory's production prompt, unchanged", () => {
     expect(sha(SUMMARY_INSTRUCTIONS)).toBe(source.summary_prompt_sha256);
-    expect(SESSION_SUMMARY_PROMPT_VERSION).toBe("session-summary-v2");
-    expect(SESSION_BRIEF_PROMPT_VERSION).toBe("session-summary-v2");
-    expect(SESSION_BRIEF_ENGINE_VERSION).toBe("session-summary-v2:96bulls-v1");
+    expect(SESSION_SUMMARY_PROMPT_VERSION).toBe("session-summary-v3");
+    expect(SESSION_BRIEF_PROMPT_VERSION).toBe("session-summary-v3");
+    expect(SESSION_BRIEF_ENGINE_VERSION).toBe("session-summary-v3:96bulls-v1");
   });
 });

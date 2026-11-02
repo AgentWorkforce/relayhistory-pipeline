@@ -13,8 +13,9 @@ import {
   writeShortSummary,
   type SessionDirectoryKey,
 } from "../hoopdb/session-directory-summary.ts";
+import { SESSION_SUMMARY_STATES, type SessionSummaryState } from "./engine/summary-contract.ts";
 import type { BriefPointer } from "./input.ts";
-import { SESSION_BRIEF_SOURCE_PREFIX } from "./versions.ts";
+import { SESSION_BRIEF_PROMPT_VERSION, SESSION_BRIEF_SOURCE_PREFIX } from "./versions.ts";
 
 const KEY = `org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4`;
 const keyParams = (k: SessionDirectoryKey) => [k.orgId, k.workspaceId, k.harness, k.sessionId];
@@ -191,6 +192,9 @@ export interface StoredBrief {
   revision: number;
   title: string | null;
   description: string | null;
+  state: SessionSummaryState | null;
+  /** The prompt that wrote the stored text; a brief from another prompt is not reused. */
+  promptVersion: string | null;
   briefFingerprint: string | null;
   model: string | null;
   generatedAt: Date | null;
@@ -201,7 +205,8 @@ export interface StoredBrief {
 
 export async function storedBrief(db: SqlExecutor, key: SessionDirectoryKey): Promise<StoredBrief | null> {
   const { rows } = await db.query<Record<string, unknown>>(
-    `SELECT status, revision::text AS revision, title, description, brief_fingerprint, model,
+    `SELECT status, revision::text AS revision, title, description, state, prompt_version,
+            brief_fingerprint, model,
             generated_at, attempted_at, extract(epoch FROM now() - attempted_at)::float8 AS ago
        FROM sessions.session_briefs WHERE ${KEY}`,
     keyParams(key),
@@ -213,6 +218,8 @@ export async function storedBrief(db: SqlExecutor, key: SessionDirectoryKey): Pr
     revision: Number(r.revision),
     title: (r.title as string | null) ?? null,
     description: (r.description as string | null) ?? null,
+    state: (r.state as SessionSummaryState | null) ?? null,
+    promptVersion: (r.prompt_version as string | null) ?? null,
     briefFingerprint: (r.brief_fingerprint as string | null) ?? null,
     model: (r.model as string | null) ?? null,
     generatedAt: r.generated_at ? new Date(r.generated_at as string) : null,
@@ -278,12 +285,18 @@ export class BriefRejected extends Error {
 /**
  * Scrub and bound a model brief to SESSION_SUMMARY_JSON_SCHEMA (title <= 90, description
  * <= 320, one line each) with the shared scrubber at a fixed point, as writeShortSummary
- * does. Refuses rather than truncates.
+ * does. Refuses rather than truncates. The state is one of SESSION_SUMMARY_STATES.
  */
 export function scrubBrief(
-  brief: { title: string; description: string },
+  brief: { title: string; description: string; state: SessionSummaryState },
   scrub?: (value: string) => string,
-): { title: string; description: string; scrubRuleset: string; scrubVersion: number } {
+): {
+  title: string;
+  description: string;
+  state: SessionSummaryState;
+  scrubRuleset: string;
+  scrubVersion: number;
+} {
   const one = (value: string, max: number, field: string) => {
     let s;
     try {
@@ -298,9 +311,11 @@ export function scrubBrief(
   };
   const title = one(brief.title, 90, "title");
   const description = one(brief.description, 320, "description");
+  if (!SESSION_SUMMARY_STATES.includes(brief.state)) throw new BriefRejected("state_invalid");
   return {
     title: title.text,
     description: description.text,
+    state: brief.state,
     scrubRuleset: title.scrubRuleset,
     scrubVersion: title.scrubVersion,
   };
@@ -309,6 +324,7 @@ export function scrubBrief(
 export interface BriefText {
   title: string;
   description: string;
+  state: SessionSummaryState;
   scrubRuleset: string;
   scrubVersion: number;
   fingerprint: string;
@@ -390,16 +406,17 @@ export async function recordBrief(
       await client.query(
         `INSERT INTO sessions.session_briefs AS b
            (org_id, workspace_id, harness, session_id, status, revision, source_revisions,
-            source_fingerprint, title, description, brief_revision, brief_source_revisions,
+            source_fingerprint, title, description, state, brief_revision, brief_source_revisions,
             brief_fingerprint, scrub_ruleset, scrub_version, prompt_version, engine_version,
             model, message_count, shortened_messages, input_tokens, output_tokens, duration_ms,
             error, generated_at, attempted_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'ready', $5, $6::jsonb, $7, $8, $9, $5, $6::jsonb, $7, $10, $11,
+         VALUES ($1, $2, $3, $4, 'ready', $5, $6::jsonb, $7, $8, $9, $21, $5, $6::jsonb, $7, $10, $11,
                  $12, $13, $14, $15, $16, $17, $18, $19, NULL, $20::timestamptz, now(), now())
          ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET
            status = 'ready', revision = excluded.revision, source_revisions = excluded.source_revisions,
            source_fingerprint = excluded.source_fingerprint, title = excluded.title,
-           description = excluded.description, brief_revision = excluded.brief_revision,
+           description = excluded.description, state = excluded.state,
+           brief_revision = excluded.brief_revision,
            brief_source_revisions = excluded.brief_source_revisions,
            brief_fingerprint = excluded.brief_fingerprint, scrub_ruleset = excluded.scrub_ruleset,
            scrub_version = excluded.scrub_version, prompt_version = excluded.prompt_version,
@@ -426,6 +443,7 @@ export async function recordBrief(
           t.outputTokens,
           t.durationMs,
           t.generatedAt.toISOString(),
+          t.state,
         ],
       );
     } else if (outcome.status === "reused") {
@@ -434,9 +452,9 @@ export async function recordBrief(
             SET status = 'ready', revision = $5, source_revisions = $6::jsonb,
                 source_fingerprint = $7, brief_revision = $5, brief_source_revisions = $6::jsonb,
                 error = NULL, attempted_at = now(), updated_at = now()
-          WHERE ${KEY} AND brief_fingerprint = $7 AND title IS NOT NULL
+          WHERE ${KEY} AND brief_fingerprint = $7 AND title IS NOT NULL AND prompt_version = $8
           RETURNING title, description, model`,
-        [...keyParams(key), revision, revisions, outcome.fingerprint],
+        [...keyParams(key), revision, revisions, outcome.fingerprint, SESSION_BRIEF_PROMPT_VERSION],
       );
       const row = reused.rows[0];
       if (!row) {
@@ -458,7 +476,8 @@ export async function recordBrief(
            attempted_at = now(), updated_at = now()
            ${
              clear
-               ? `, source_fingerprint = NULL, title = NULL, description = NULL, brief_revision = NULL,
+               ? `, source_fingerprint = NULL, title = NULL, description = NULL, state = NULL,
+                  brief_revision = NULL,
                   brief_source_revisions = NULL, brief_fingerprint = NULL, scrub_ruleset = NULL,
                   scrub_version = NULL, prompt_version = NULL, engine_version = NULL, model = NULL,
                   message_count = NULL, shortened_messages = NULL, input_tokens = 0,
