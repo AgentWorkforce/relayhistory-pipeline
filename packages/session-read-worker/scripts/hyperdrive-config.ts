@@ -1,5 +1,8 @@
 export const EXPECTED_SUPABASE_HOST = "aws-0-us-east-1.pooler.supabase.com";
-export const EXPECTED_SUPABASE_USER = "bulls96_read_api";
+export const EXPECTED_SUPABASE_USER = "bulls96_read_api.pyamkrhoyszgzirqqffq";
+export const EXPECTED_SUPABASE_SCHEME = "postgres";
+export const EXPECTED_SUPABASE_PORT = 5432;
+export const EXPECTED_SUPABASE_DATABASE = "postgres";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -30,6 +33,9 @@ export function checkHyperdriveConfig(body: unknown, expected: { id: string; caI
     "mtls.ca_certificate_id": mtls.ca_certificate_id === expected.caId,
     "origin.user": origin.user === EXPECTED_SUPABASE_USER,
     "origin.host": origin.host === EXPECTED_SUPABASE_HOST,
+    "origin.scheme": origin.scheme === EXPECTED_SUPABASE_SCHEME,
+    "origin.port": origin.port === EXPECTED_SUPABASE_PORT,
+    "origin.database": origin.database === EXPECTED_SUPABASE_DATABASE,
   };
   return { ok: Object.values(checks).every(Boolean), checks };
 }
