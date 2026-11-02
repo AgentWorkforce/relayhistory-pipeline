@@ -41,6 +41,7 @@ import {
   type SessionSummaryInput,
 } from "./engine/summary-contract.ts";
 import { summaryInput } from "./engine/summary-input.ts";
+import { DEFAULT_MAX_SESSION_BYTES } from "./config.ts";
 
 /** One live pointer of the logical session, from sessions.session_index. */
 export interface BriefPointer {
@@ -53,8 +54,11 @@ export type BriefInput =
   | { kind: "ready"; input: SessionSummaryInput; sourceRevisions: Record<string, number> }
   | { kind: "quarantined" | "empty" | "ineligible"; error: string; sourceRevisions: Record<string, number> };
 
-/** Raw bytes read for one session, all machines together. relayhistory-transform's own bound. */
-export const MAX_BRIEF_SESSION_BYTES = 256 * 1024 * 1024;
+/**
+ * Raw bytes read for one session, all machines together. relayhistory-transform's own bound,
+ * and the default; a runtime with less memory lowers it (BriefConfig.maxSessionBytes).
+ */
+export const MAX_BRIEF_SESSION_BYTES = DEFAULT_MAX_SESSION_BYTES;
 
 type Row = Record<string, unknown>;
 
@@ -216,14 +220,14 @@ async function transcriptEvents(
   manifest: ManifestV1,
   manifestKey: string,
   store: ObjectStore,
-  budget: { bytes: number },
+  budget: { bytes: number; max: number },
 ): Promise<Omit<NormalizedEvent, "id">[]> {
   const loc = location(manifest, manifestKey);
   const events: Omit<NormalizedEvent, "id">[] = [];
   let index = 0;
   for (const chunk of manifest.raw.chunks) {
     budget.bytes += Math.max(chunk.bytes, chunk.stored_raw_bytes ?? 0);
-    if (budget.bytes > MAX_BRIEF_SESSION_BYTES)
+    if (budget.bytes > budget.max)
       throw new PipelineError("session_too_large", "the session exceeds the brief input bound", false);
     const key = rawChunkKey(loc, chunk.seq, chunk.start_offset, chunk.sha256_8, manifest.raw.format);
     let stored: Uint8Array;
@@ -237,7 +241,7 @@ async function transcriptEvents(
     let text: string;
     try {
       text = zstdDecompressSync(Buffer.from(stored), {
-        maxOutputLength: MAX_BRIEF_SESSION_BYTES,
+        maxOutputLength: budget.max,
       }).toString("utf8");
     } catch {
       throw new PipelineError("chunk_decompress_failed", "a raw chunk is not valid zstd", false);
@@ -269,10 +273,10 @@ async function recordEvents(
   manifest: ManifestV1,
   manifestKey: string,
   store: ObjectStore,
-  budget: { bytes: number },
+  budget: { bytes: number; max: number },
 ): Promise<Omit<NormalizedEvent, "id">[]> {
   const loc = location(manifest, manifestKey);
-  const remaining = MAX_BRIEF_SESSION_BYTES - budget.bytes;
+  const remaining = budget.max - budget.bytes;
   const records = await readRelayhistoryExport(manifest, store, undefined, {
     maxSessionBytes: remaining,
     ...(loc.prefix ? { prefix: loc.prefix } : {}),
@@ -302,7 +306,7 @@ async function recordEvents(
  * manifest that is not scrubbed quarantines the whole session (nothing is read from it).
  */
 export async function buildBriefInput(
-  deps: { reader: ManifestReader; store: ObjectStore },
+  deps: { reader: ManifestReader; store: ObjectStore; config?: { maxSessionBytes?: number } },
   key: { harness: string; sessionId: string },
   pointers: readonly BriefPointer[],
 ): Promise<BriefInput> {
@@ -320,7 +324,7 @@ export async function buildBriefInput(
   }
   if (!SESSION_SUMMARY_SOURCES.includes(key.harness))
     return { kind: "ineligible", error: "session_source_unsupported", sourceRevisions };
-  const budget = { bytes: 0 };
+  const budget = { bytes: 0, max: deps.config?.maxSessionBytes ?? MAX_BRIEF_SESSION_BYTES };
   const collected: Omit<NormalizedEvent, "id">[] = [];
   for (const { manifest, manifestKey } of manifests) {
     if (manifest.raw.format === "sqlite-rows")

@@ -24,6 +24,8 @@ type Level = "debug" | "info" | "warn" | "error";
 const service = process.env.OTEL_SERVICE_NAME ?? "96bulls";
 const deployment = process.env.DEPLOYMENT ?? "selfhost";
 const deploymentId = process.env.DEPLOYMENT_ID ?? "local";
+/** workerd (Cloudflare Workers) identifies itself here; Node, Bun and Lambda do not. */
+const WORKERD = typeof navigator !== "undefined" && navigator.userAgent === "Cloudflare-Workers";
 
 function filter(fields: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -46,7 +48,9 @@ function emit(level: Level, message: string, fields: Record<string, unknown>) {
     message: scrubText(message).slice(0, 200),
     ...filter(fields),
   });
-  if (level === "error" || level === "warn") process.stderr.write(line + "\n");
+  // On Cloudflare Workers the line goes through console, which is what Workers Logs captures.
+  if (WORKERD) (level === "error" || level === "warn" ? console.error : console.log)(line);
+  else if (level === "error" || level === "warn") process.stderr.write(line + "\n");
   else process.stdout.write(line + "\n");
 }
 

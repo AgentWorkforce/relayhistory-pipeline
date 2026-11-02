@@ -16,6 +16,9 @@
  *   SESSION_BRIEF_MAX_ATTEMPTS      2: a retryable failure is retried once (one requeue).
  *   SESSION_BRIEF_BATCH             5 wakeups per tick; SESSION_BRIEF_LEASE_SECONDS 300.
  *   SESSION_BRIEF_SWEEP_SECONDS     0 (off): how often to queue indexed sessions that have no brief.
+ *   SESSION_BRIEF_MAX_SESSION_BYTES 268435456 (256 MiB, relayhistory-transform's bound): raw bytes
+ *                                   read for one session before it is recorded `session_too_large`.
+ *                                   The Cloudflare Worker (128 MB isolates) sets it lower.
  *
  * Values are read once per process; nothing here is logged.
  */
@@ -37,7 +40,12 @@ export interface BriefConfig {
   batch: number;
   leaseSeconds: number;
   sweepSeconds: number;
+  /** Raw bytes read for one session (all machines) before `session_too_large`. */
+  maxSessionBytes: number;
 }
+
+/** relayhistory-transform's own bound, and the default. */
+export const DEFAULT_MAX_SESSION_BYTES = 256 * 1024 * 1024;
 
 function int(
   env: NodeJS.ProcessEnv,
@@ -71,6 +79,7 @@ export function briefConfig(env: NodeJS.ProcessEnv = process.env): BriefConfig {
     // Above a full batch of 20 s model calls, so a claim never lapses mid-tick.
     leaseSeconds: int(env, "SESSION_BRIEF_LEASE_SECONDS", 300, 30, 3_600),
     sweepSeconds: int(env, "SESSION_BRIEF_SWEEP_SECONDS", 0, 0, 86_400),
+    maxSessionBytes: int(env, "SESSION_BRIEF_MAX_SESSION_BYTES", DEFAULT_MAX_SESSION_BYTES, 1024 * 1024, DEFAULT_MAX_SESSION_BYTES),
   };
 }
 
