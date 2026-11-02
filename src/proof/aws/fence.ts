@@ -67,13 +67,21 @@ export const PROOF_POSTGREST = { namespace: "96bulls", service: "session-directo
 /** The in-cluster search client pod: carries both caller labels, so NetworkPolicy admits it to RelayAuth TLS and PostgREST. */
 export const PROOF_SEARCH_CLIENT_POD = "proof-search-client";
 /**
- * The only images the in-cluster probe pod may run: the Stage A services image
- * (versions.lock.json images.services-aws.approved on #75, publish-image-ecr
- * run 41154325003, source 2fb88cd). It ships bun, which the probe needs.
+ * The only images the in-cluster probe pod may run, each a
+ * versions.lock.json images.services-aws.approved entry: the Stage A services
+ * image (#75, publish-image-ecr run 41154325003, source 2fb88cd) and the
+ * Pippen-sandbox proof image (publish-image-ecr run 41375747474, source
+ * 7d7229b). They ship bun, which the probe needs. A run may use only the one
+ * that equals its stage plan's services digest (cli.ts).
  */
 export const PROOF_PROBE_IMAGES: readonly string[] = [
   "500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services@sha256:59d9468551ded11f3c6f5d36558ab7ef87c3e50e99772de352cc309823cb00e0",
+  "500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services@sha256:5bb6075240afa02a1b1797a81c07bffa029954eac7803d702ecba20db35d4db9",
 ];
+/** A configured probe image must be the stage plan's services image, by digest (the allowlist alone is not enough). */
+export function probeImagePlanIssue(probeImage: string | undefined, planServicesDigest: string): string | undefined {
+  return probeImage && !probeImage.endsWith(`@${planServicesDigest}`) ? "probeImage is not the stage plan's services image" : undefined;
+}
 /** The proof stage's tenants (#75 eks.tenantOrgIds). Any other org must get 403 org_not_allowed at ingest. */
 export const PROOF_TENANT_ORGS = ["org_aws_proof_1", "org_aws_proof_2"] as const;
 /** A deliberately unlisted org for the negative ingest check. */
