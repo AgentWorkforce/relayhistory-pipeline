@@ -40,4 +40,15 @@ describe("fitForScrub", () => {
     expect(out).not.toContain(KEY);
     expect(out.split(" ").length).toBe(text.split(" ").length);
   });
+
+  test("a long string whose only whitespace is newlines (base64, CSV) is redacted, not refused (re-review High)", () => {
+    // Decoded, the newlines are safe cuts; JSON-escaped (what the scrubber also checks), they are not.
+    const wrapped = Array.from({ length: 5_000 }, () => "QUJDRA".repeat(13)).join("\n");
+    expect(wrapped.length).toBeGreaterThan(MAX_SCRUB_CHARS);
+    const line = (payload: Record<string, unknown>) => enc(liveLine({ ...base, payload }, "t") + "\n");
+    expect(() => scrubRecords(line({ blob: wrapped }))).toThrow(/scrub limit/);
+    const fitted = fitForScrub({ ...base, payload: { blob: wrapped } });
+    const out = JSON.parse(dec(scrubRecords(line(fitted.payload!)).scrubbed));
+    expect(out.payload.blob).toBe(oversizeRedaction(wrapped.length));
+  });
 });

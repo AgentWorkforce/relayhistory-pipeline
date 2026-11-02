@@ -89,7 +89,7 @@ export function stagedKey(
 export async function stageGroups(target: WriteTarget, header: Omit<StagedHeader, "v" | "groups">, groups: Group[]): Promise<string> {
   const full: StagedHeader = { v: STAGED_VERSION, ...header, groups: groups.map((g) => [g.source, g.sessionId]) };
   const body = groups.flatMap((g, i) => g.lines.map((l) => `{"g":${i},"l":${l}}`)).join("\n") + "\n";
-  // Lines were fitted for the scrubber when grouped (oversize.ts): this never refuses.
+  // Lines were fitted for the scrubber when grouped (oversize.ts checks value and literal, as the scrubber does).
   const scrubbed = scrubRecords(encoder.encode(body)).scrubbed;
   const bytes = new Uint8Array([...encoder.encode(JSON.stringify(full) + "\n"), ...scrubbed]);
   const key = stagedKey(target.keyRoot, header, stagedContentDigest(groups));

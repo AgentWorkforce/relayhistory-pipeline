@@ -19,8 +19,19 @@ export function oversizeRedaction(chars: number): string {
   return `[REDACTED: ${chars} characters exceed the ${MAX_SCRUB_CHARS}-character scrub limit and could not be segmented safely]`;
 }
 
+/**
+ * Whether the scrubber would refuse this string. `scrubStringToken` scrubs the
+ * decoded value AND the JSON literal (escapes included), and in the literal a
+ * newline or tab is `\n` / `\t`, not whitespace, so a newline-wrapped dump
+ * that the value check passes can still have no safe cut. Both must pass.
+ */
+function refused(value: string): boolean {
+  if (!exceedsScrubBound(value) && !exceedsScrubBound(JSON.stringify(value))) return false;
+  return !canScrubLong(value) || !canScrubLong(JSON.stringify(value));
+}
+
 function fit(value: unknown): unknown {
-  if (typeof value === "string") return exceedsScrubBound(value) && !canScrubLong(value) ? oversizeRedaction(value.length) : value;
+  if (typeof value === "string") return refused(value) ? oversizeRedaction(value.length) : value;
   if (Array.isArray(value)) return value.map(fit);
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, fit(v)]));
   return value;
