@@ -20,7 +20,7 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "route", "correlation_id",
 ]);
 
-type Level = "debug" | "info" | "warn" | "error";
+export type Level = "debug" | "info" | "warn" | "error";
 const service = process.env.OTEL_SERVICE_NAME ?? "96bulls";
 const deployment = process.env.DEPLOYMENT ?? "selfhost";
 const deploymentId = process.env.DEPLOYMENT_ID ?? "local";
@@ -36,8 +36,9 @@ function filter(fields: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
-function emit(level: Level, message: string, fields: Record<string, unknown>) {
-  const line = JSON.stringify({
+/** The JSON line `emit` writes, for a runtime without process streams (the session read Worker logs it to the console). */
+export function logLine(level: Level, message: string, fields: Record<string, unknown>): string {
+  return JSON.stringify({
     ts: new Date().toISOString(),
     level,
     service,
@@ -46,6 +47,10 @@ function emit(level: Level, message: string, fields: Record<string, unknown>) {
     message: scrubText(message).slice(0, 200),
     ...filter(fields),
   });
+}
+
+function emit(level: Level, message: string, fields: Record<string, unknown>) {
+  const line = logLine(level, message, fields);
   if (level === "error" || level === "warn") process.stderr.write(line + "\n");
   else process.stdout.write(line + "\n");
 }

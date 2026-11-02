@@ -1,0 +1,26 @@
+{
+  "name": "@96bulls/session-read-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "96Bulls session read API as a Cloudflare Worker: the #135 read API (src/session-read-api) served from workerd, ClickHouse Cloud over HTTPS, Supabase through Hyperdrive.",
+  "scripts": {
+    "check:deploy-config": "bun run scripts/check-deploy-config.ts",
+    "typecheck": "bun run check:deploy-config && tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "test": "vitest run",
+    "dry-run": "wrangler deploy --dry-run --outdir dist"
+  },
+  "dependencies": {
+    "hono": "4.12.26",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.12",
+    "@cloudflare/workers-types": "4.20260621.1",
+    "@types/node": "24",
+    "@types/pg": "8.15.5",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9",
+    "wrangler": "4.156.1"
+  }
+}

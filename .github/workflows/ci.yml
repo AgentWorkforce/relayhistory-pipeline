@@ -74,3 +74,8 @@ jobs:
       - name: Guard - nothing secret-like committed
         run: |
           ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || (echo "secret-like file tracked"; exit 1)
+  # The session read Worker (packages/session-read-worker), in workerd.
+  session-read-worker:
+    uses: ./.github/workflows/session-read-worker-checks.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}

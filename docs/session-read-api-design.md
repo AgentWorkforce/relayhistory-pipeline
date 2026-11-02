@@ -22,6 +22,8 @@ Anything Phase A cannot answer exactly gets **`501 unsupported_by_backend`** wit
 
 ## 1. Hosting
 
+> **Superseded (2026-11-01): the API moves to a Cloudflare Worker,** `packages/session-read-worker`, so that no Lambda is on the request path. The account's Lambda concurrency limit is 10, and the Lambda runs without reserved concurrency. The Worker runs the same `src/session-read-api` code. Supabase is reached through Hyperdrive; the reasons are in `runbooks/sessions-prod-session-read-worker.md`. The Lambda below stays deployed only until the Worker is `on` for every route.
+
 - **Choice: one Lambda (`AWS.Lambda.Function`, `functionUrl: { authType: "NONE" }`) in sessions-prod us-east-1.** It runs nodejs24.x on arm64 with no VPC, a 1024 MB memory size and a 10 s timeout.
   - Auth is handled by the application (section 2). The Function URL's IAM auth can't be used because the caller is a Cloudflare Worker with no AWS identity.
 - **Why not API Gateway or ECS:**
