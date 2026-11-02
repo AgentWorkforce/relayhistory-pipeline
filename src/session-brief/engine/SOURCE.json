@@ -1,9 +1,9 @@
 {
   "repository": "https://github.com/AgentWorkforce/relayhistory-cloud",
-  "commit": "01b22e05a8f47ccfdb189325b5d0297f43f3ad27",
+  "commit": "5bf0704c91e0ae8037b7cb06d53841ee37856b03",
   "path": "packages/relayhistory/src/lib/session-analysis",
   "upstream_provenance": "engine/PROVENANCE.md there: ported from AgentWorkforce/skip 07a16203 (+ local summary improvements)",
-  "summary_prompt_sha256": "0e289325bbb63ceed78f10686096d4e1f83217ca601bb306abc04367ffe59179",
+  "summary_prompt_sha256": "2407689ddf4445df9a01e0f965ee65890f47020ea461e1bc7bdbe08d01c16614",
   "note": "Change upstream first; re-vendor and update the hashes in the same change. src/session-brief/__tests__/engine-provenance.test.ts checks the local hashes and the prompt hash.",
   "files": {
     "summary-contract.ts": {
@@ -14,8 +14,8 @@
     },
     "summary-prompt.ts": {
       "upstream": "engine/summary-prompt.ts",
-      "upstream_sha256": "94559552ee71cbd66d723dba880294280a02db3cef7b9e9e5e38c81a35cfd872",
-      "sha256": "94559552ee71cbd66d723dba880294280a02db3cef7b9e9e5e38c81a35cfd872",
+      "upstream_sha256": "e1f329e5224c2bb5b044688626d1000acd9211f817a6a487907912c2bdd2bd60",
+      "sha256": "e1f329e5224c2bb5b044688626d1000acd9211f817a6a487907912c2bdd2bd60",
       "adaptation": "verbatim"
     },
     "summary-input.ts": {
