@@ -2,7 +2,7 @@
 
 The session read Worker is `packages/session-read-worker`. It serves the same `/v1` read contract as the #135 Lambda (`runbooks/sessions-prod-session-read-api.md`), with the same code: `src/session-read-api/{app,auth,cursor,page,queries,liveness}.ts`. Only the adapter is new: `packages/session-read-worker/src/index.ts` replaces `lambda.ts`. No Lambda sits on the request path.
 
-It runs on the Cloudflare account Agent Workforce (`f7232cb80f6fab86a95426302af243e4`) as the Worker `bulls96-session-read-api`. Cloud reaches it through `SESSIONS_READ_96BULLS_URL` (cloud #5910). Switching Cloud from the Lambda to the Worker is that one variable.
+It runs on the Cloudflare account Agent Workforce (`f7232cb80f6fab86a95426302af243e4`) as the Worker `bulls96-session-read-api`, exclusively at the custom domain `https://sessions-read.agentrelay.com`. Cloud reaches it through `SESSIONS_READ_96BULLS_URL` (cloud #5910). Switching Cloud from the Lambda to the Worker is that one variable. `workers.dev` is disabled: a same-account Worker-to-Worker fetch through it can fail with Cloudflare error 1042.
 
 Only the lead deploys, sets secrets and creates the Hyperdrive config. Nothing in this file prints or stores a credential.
 
@@ -30,7 +30,7 @@ The same `b96e1:` cursors are issued and accepted. A cursor that the Lambda issu
 | `CLICKHOUSE_URL`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` | Worker secrets (`wrangler secret put`) | 1Password `96Bulls-prod` / `clickhouse relay-search-prod session-read-api`: user `session_read_api`, SELECT on `transcript_events` and `search_ingest_session_state`, profile `search_read_guard` |
 | `CLICKHOUSE_DATABASE` | `wrangler.jsonc` var | `relay_search` |
 | `SUPABASE` | Hyperdrive binding; id from GitHub env var `SESSION_READ_HYPERDRIVE_ID` | Hyperdrive config over 1Password `96Bulls-prod` / `bulls96_read_api - Supabase sessions (pyamkrhoyszgzirqqffq)`, which uses the session pooler `aws-0-us-east-1`, port 5432 |
-| `READ_API_ORIGIN` | GitHub env var `SESSION_READ_ORIGIN` | this Worker's origin, exactly as Cloud's `SESSIONS_READ_96BULLS_URL` |
+| `READ_API_ORIGIN` | GitHub env var `SESSION_READ_ORIGIN` | `https://sessions-read.agentrelay.com`, exactly as Cloud's `SESSIONS_READ_96BULLS_URL` |
 | `READ_API_COMPLETE_SINCE` | GitHub env var `SESSION_READ_COMPLETE_SINCE` | the same value as the Lambda's `sessionReadApi.completeSince` |
 | `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | `wrangler.jsonc` vars | `https://api.relayauth.dev/.well-known/jwks.json` and `https://relayauth.dev`, as on the Lambda since #158. Never leave them unset: the verifier's fallback JWKS does not resolve, so every token would be refused with a 401 |
 
@@ -89,11 +89,11 @@ The ClickHouse user and the Supabase role already exist: the Lambda uses them. S
      | jq '{success, id: .result.id, caching: .result.caching}'
    ```
    `caching.disabled` must come back `true`. If the item name does not resolve in `op read`, use the item's ID.
-3. **Create the GitHub environment** `session-read-worker` in AgentWorkforce/96BullSessions, with required reviewers. Then set:
+3. **Create the GitHub environment** `session-read-worker` in AgentWorkforce/sessions-pipeline, with required reviewers. Then set:
    - secret `CLOUDFLARE_API_TOKEN`, scoped to this account with Workers Scripts:Edit and Hyperdrive:Read;
    - variables `SESSION_READ_HYPERDRIVE_ID` (from step 2), `SESSION_READ_COMPLETE_SINCE` (the Lambda's value) and `SESSION_READ_ORIGIN`.
 
-   The origin is `https://bulls96-session-read-api.<account workers.dev subdomain>.workers.dev`. A custom domain also works: add a route in `wrangler.jsonc` and use that origin instead.
+   `SESSION_READ_ORIGIN` must be `https://sessions-read.agentrelay.com`. The matching `custom_domain` route is committed in `wrangler.jsonc`, and the deploy workflow refuses any other origin. Do not enable or use a `workers.dev` origin.
 4. **Deploy.** Run *deploy session-read-worker* (`workflow_dispatch`, from `main`). It runs the Worker checks, renders the Hyperdrive id, deploys with the origin and `completeSince` vars, then checks the secrets by name and smoke-tests the Worker.
 
    On the very first run, the secret check fails because the Worker had no secrets yet. Until they are set, the Worker answers 503 and is not on any request path.
@@ -110,7 +110,7 @@ The ClickHouse user and the Supabase role already exist: the Lambda uses them. S
 7. **Repoint Cloud to the Worker, in shadow first.**
    - Set Cloud's `SESSIONS_READ_96BULLS_URL` to the Worker origin, exactly `SESSION_READ_ORIGIN`. Cloud mints `aud` from it, so a mismatch is a 401 on every read.
    - If routes are already `on` against the Lambda, set them to `shadow` first, so relayhistory serves while the Worker is measured: `SESSIONS_READ_96BULLS_ROUTES=events_search=shadow,session_events=shadow,events_in_session=shadow`.
-   - Cloud and this Worker are on the same account, and Cloud fetches the URL. If the shadow log shows Cloudflare error 1042 (a Worker-to-Worker fetch on a shared zone), put the Worker on a custom domain in another zone, or add a service binding in Cloud.
+   - Keep the origin on `https://sessions-read.agentrelay.com`. The custom domain avoids the same-account `workers.dev` hop that can fail with Cloudflare error 1042.
 8. **Watch the gates per route** (design doc section 5) in `[sessions-read-shadow]` for at least 30 minutes:
    - zero `crossTenantRows`;
    - 96Bulls error rate at most 1%;

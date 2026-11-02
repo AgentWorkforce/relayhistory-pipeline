@@ -64,7 +64,7 @@ jobs:
           node-version: 24
       - name: Install (root + workspaces)
         run: bun install --frozen-lockfile
-      - name: Typecheck the Worker
+      - name: Check the production route and typecheck the Worker
         run: bun run --filter @96bulls/session-read-worker typecheck
       - name: Test inside workerd (#135 suites + full request path)
         run: bun run --filter @96bulls/session-read-worker test
