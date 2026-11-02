@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import * as AWS from "@alchemy.run/aws";
 import { fileURLToPath } from "node:url";
 import type { AwsInputs } from "../inputs.ts";
 import {
@@ -12,7 +13,9 @@ import {
   pipelineBucketStatements,
   pipelineKeyStatement,
   sessionPipelineEnv,
+  sessionPipelineFunctionProps,
   sessionPipelineNames,
+  sessionPipelinePermissions,
   sessionQueuePolicy,
   sessionSecretPolicy,
 } from "../session-pipeline.ts";
@@ -99,6 +102,55 @@ describe("session pipeline: wiring", () => {
     });
     for (const value of Object.values(env)) expect(value).not.toMatch(/postgres(ql)?:\/\/|password|clickhouse\.cloud/i);
     expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true } }).SEARCH_INDEX_ENABLED).toBe("1");
+  });
+});
+
+describe("session pipeline: not reachable from the internet", () => {
+  const stageInputs = { stage: STAGE, accountId: ACCOUNT, region: REGION, p: {}, tags: () => ({}), bucket: t.bucket };
+  const RULE_ARN = `arn:aws:events:${REGION}:${ACCOUNT}:rule/${p.rule}`;
+
+  it("the function has no Function URL (Alchemy's default is a public, unauthenticated one)", () => {
+    const props = sessionPipelineFunctionProps(stageInputs);
+    expect(props.functionUrl).toBe(false);
+    // Alchemy's own normalizer decides whether a URL (and its public grant) is created.
+    expect(AWS.Lambda.normalizeFunctionUrl(props.functionUrl)).toBeUndefined();
+    // Omitting the setting is what this guards against: it means a public URL.
+    expect(AWS.Lambda.normalizeFunctionUrl(undefined)).toEqual({ authType: "NONE", invokeMode: "BUFFERED" });
+  });
+
+  it("the function's resource policy grants InvokeFunction to EventBridge (this rule) and its own role only, never a public principal", () => {
+    const grants = sessionPipelinePermissions({ accountId: ACCOUNT, functionName: p.function, ruleArn: RULE_ARN, roleArn: ROLE });
+    expect(grants.map((g) => g.id)).toEqual(["session-reconcile-permission", "session-reconcile-continue"]);
+    for (const { props } of grants) {
+      expect(props.action).toBe("lambda:InvokeFunction");
+      expect(props.principal).not.toBe("*");
+      expect(JSON.stringify(props)).not.toMatch(/FunctionUrl|"\*"/);
+    }
+    expect(grants[0]!.props).toEqual({ action: "lambda:InvokeFunction", functionName: p.function, principal: "events.amazonaws.com", sourceArn: RULE_ARN, sourceAccount: ACCOUNT });
+    expect(grants[1]!.props).toEqual({ action: "lambda:InvokeFunction", functionName: p.function, principal: ROLE });
+  });
+
+  it("the reconcile chain uses the Lambda Invoke API (SigV4), not a Function URL", () => {
+    const src = readFileSync(fileURLToPath(new URL("../../../src/session-pipeline/aws-json.ts", import.meta.url)), "utf8");
+    expect(src).toContain("https://lambda.${args.region}.amazonaws.com/2015-03-31/functions/");
+    expect(src).toContain('"x-amz-invocation-type": "Event"');
+    expect(src).not.toMatch(/lambda-url/);
+  });
+
+  it("every Lambda function and permission in the stacks is declared through these guarded props", () => {
+    const root = fileURLToPath(new URL("../../", import.meta.url));
+    const files = (readdirSync(root, { recursive: true }) as string[]).filter((f) => f.endsWith(".ts") && !f.includes("__tests__") && !f.includes("node_modules"));
+    const calls: string[] = [];
+    for (const f of files) {
+      const src = readFileSync(`${root}${f}`, "utf8");
+      // URL-bearing hosts and raw URL configs are never used for the pipeline.
+      expect(`${f}: ${/Lambda\.(WebFunction|HttpServer)\(|FunctionUrlConfig|InvokeFunctionUrl/.test(src)}`).toBe(`${f}: false`);
+      for (const m of src.matchAll(/Lambda\.(Function|Permission)\(([^\n]*)/g)) calls.push(`${f}: ${m[1]}(${m[2]}`);
+    }
+    expect(calls).toEqual([
+      'aws/session-pipeline.ts: Function("session-pipeline", sessionPipelineFunctionProps(i) as never);',
+      "aws/session-pipeline.ts: Permission(id, props as never);",
+    ]);
   });
 });
 

@@ -139,6 +139,12 @@ rotation, force fresh reads with
    `pointer indexed` lines and for no `pointer index failed`. The DLQ should
    stay empty. Run one reconcile now:
    `aws lambda invoke --function-name 96bulls-aws-sessions-prod-session-pipeline --payload '{"reconcile":true}' --cli-binary-format raw-in-base64-out /dev/stdout`.
+   Confirm the function is not reachable from the internet:
+   `aws lambda get-function-url-config --function-name 96bulls-aws-sessions-prod-session-pipeline`
+   must fail with `ResourceNotFoundException`, and
+   `aws lambda get-policy --function-name 96bulls-aws-sessions-prod-session-pipeline`
+   must show exactly two `lambda:InvokeFunction` statements: EventBridge
+   (the reconcile rule, this account) and the function's own role.
 7. **ClickHouse stage.** Two gates, both required:
    - **Live writes reach S3:** relayhistory-cloud #241 `WRITE_PATH=s3_first`.
      Until then S3 trails Neon by the exporter's 30-minute debounce, and

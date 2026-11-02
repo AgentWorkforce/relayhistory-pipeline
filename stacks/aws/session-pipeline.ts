@@ -243,24 +243,67 @@ export interface SessionPipelineStageInputs {
   tags: (component: string) => Record<string, string>;
 }
 
+/**
+ * The pipeline function's props. `functionUrl: false` is load-bearing: Alchemy's
+ * `Lambda.Function` defaults to a public Function URL (`authType: "NONE"`, plus a
+ * resource-policy grant of the URL invoke action and `lambda:InvokeFunction`
+ * to `*`). The pipeline is invoked only by SQS, EventBridge and its own role
+ * (the reconcile chain calls the Lambda Invoke API with SigV4, never a URL), so
+ * it has no URL at all.
+ */
+export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { bucket: string }) {
+  const names = sessionPipelineNames(i.stage, i.accountId, i.region);
+  return {
+    functionName: names.function,
+    // Relative to the repository root (bin/96bulls runs Alchemy there), so the planned
+    // props are the same in every checkout and a capture never diffs on a path.
+    main: "src/session-pipeline/lambda.ts",
+    handler: "handler",
+    runtime: "nodejs24.x",
+    architecture: "arm64",
+    memorySize: 3008,
+    timeout: `${FUNCTION_TIMEOUT_SECONDS} seconds`,
+    env: sessionPipelineEnv({ stage: i.stage, bucket: i.bucket, names, p: i.p }),
+    logging: { retention: "30 days" },
+    functionUrl: false as const,
+    build: { tsconfig: "tsconfig.json" },
+  };
+}
+
+/**
+ * Every resource-policy grant on the pipeline function: EventBridge (this rule,
+ * this account) and the function's own role (the reconcile chain), both
+ * `lambda:InvokeFunction` only. Nothing public, no Function URL action.
+ */
+export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; roleArn: string }) {
+  return [
+    {
+      id: "session-reconcile-permission",
+      props: {
+        action: "lambda:InvokeFunction",
+        functionName: i.functionName,
+        principal: "events.amazonaws.com",
+        sourceArn: i.ruleArn,
+        sourceAccount: i.accountId,
+      },
+    },
+    // A reconcile that reaches its deadline hands its cursor to the next link by invoking
+    // this function asynchronously (Lambda Invoke API, SigV4); only the function's own role may do that.
+    {
+      id: "session-reconcile-continue",
+      props: {
+        action: "lambda:InvokeFunction",
+        functionName: i.functionName,
+        principal: i.roleArn,
+      },
+    },
+  ] as const;
+}
+
 /** Step 1, before the transcripts key and bucket: the function (and so its role) must exist first. */
 export const sessionPipelineFunction = (i: SessionPipelineStageInputs & { bucket: string }) =>
   Effect.gen(function* () {
-    const names = sessionPipelineNames(i.stage, i.accountId, i.region);
-    return yield* AWS.Lambda.Function("session-pipeline", {
-      functionName: names.function,
-      // Relative to the repository root (bin/96bulls runs Alchemy there), so the planned
-      // props are the same in every checkout and a capture never diffs on a path.
-      main: "src/session-pipeline/lambda.ts",
-      handler: "handler",
-      runtime: "nodejs24.x",
-      architecture: "arm64",
-      memorySize: 3008,
-      timeout: `${FUNCTION_TIMEOUT_SECONDS} seconds`,
-      env: sessionPipelineEnv({ stage: i.stage, bucket: i.bucket, names, p: i.p }),
-      logging: { retention: "30 days" },
-      build: { tsconfig: "tsconfig.json" } as never,
-    } as never);
+    return yield* AWS.Lambda.Function("session-pipeline", sessionPipelineFunctionProps(i) as never);
   });
 
 /** Step 2, after the bucket: queues, secret, mapping, schedule, alarms. */
@@ -313,20 +356,13 @@ export const sessionPipelineWiring = (
       targets: [{ Id: "session-pipeline", Arn: i.fn.functionArn as unknown as string, Input: JSON.stringify({ reconcile: true }) }],
       tags: i.tags("session-pipeline"),
     } as never);
-    yield* AWS.Lambda.Permission("session-reconcile-permission", {
-      action: "lambda:InvokeFunction",
+    for (const { id, props } of sessionPipelinePermissions({
+      accountId: i.accountId,
       functionName: i.fn.functionName as unknown as string,
-      principal: "events.amazonaws.com",
-      sourceArn: (rule as unknown as { ruleArn: string }).ruleArn,
-      sourceAccount: i.accountId,
-    } as never);
-    // A reconcile that reaches its deadline hands its cursor to the next link by invoking
-    // this function asynchronously; only the function's own role may do that.
-    yield* AWS.Lambda.Permission("session-reconcile-continue", {
-      action: "lambda:InvokeFunction",
-      functionName: i.fn.functionName as unknown as string,
-      principal: roleArn,
-    } as never);
+      ruleArn: (rule as unknown as { ruleArn: string }).ruleArn,
+      roleArn,
+    }))
+      yield* AWS.Lambda.Permission(id, props as never);
     const alarm = (id: string, props: Record<string, unknown>) =>
       AWS.CloudWatch.Alarm(id, { ActionsEnabled: false, TreatMissingData: "notBreaching", ...props, tags: i.tags("session-pipeline") } as never);
     yield* alarm("session-events-dlq-alarm", {
