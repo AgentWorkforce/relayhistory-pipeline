@@ -361,4 +361,67 @@ describe("session pipeline: update with the role-ARN cascade", () => {
     // The grants cascade only because the function updates.
     expect(() => check(REAL.replace("[session-pipeline] update\n  no declared property changes", "[session-pipeline] noop"))).toThrow(/update but session-pipeline does not/);
   });
+
+  // The sessions-prod capture at 9e5c191 (#151): the read API's failed first apply left its errors
+  // alarm in state, and main moved since the pipeline's last deploy (27f053e), so the one plan is the
+  // real #141 cascade above (re-tagged as after #148) plus the remaining read API creates. The
+  // compact action set is the capture's own; the read API create bodies are not compared by the
+  // contract and are abbreviated here.
+  const readApiBlocks = (actions: Record<string, string>) =>
+    ["session-read-api", "session-read-api-errors-alarm", "session-read-api-secret", "session-read-api-throttles-alarm"]
+      .map((r) => (actions[r] === "noop" ? `[${r}] noop\n` : `[${r}] ${actions[r]}\n  properties:\n    tags:\n      96bulls:component: session-read-api\n      96bulls:repo: AgentWorkforce/sessions-pipeline\n      96bulls:stack: aws-sessions-prod\n`))
+      .join("\n");
+  const REMAINING = { "session-read-api": "create", "session-read-api-errors-alarm": "noop", "session-read-api-secret": "create", "session-read-api-throttles-alarm": "create" };
+  const withReadApi = (actions: Record<string, string> = REMAINING, base = REAL) => {
+    const renamed = base.replaceAll("96bulls:repo: AgentWorkforce/96BullSessions", "96bulls:repo: AgentWorkforce/sessions-pipeline");
+    const out = renamed.replace("[session-reconcile-continue] update", `${readApiBlocks(actions)}\n[session-reconcile-continue] update`);
+    if (out === renamed) throw new Error("fixture has no session-reconcile-continue update");
+    return out;
+  };
+  const CAPTURE_151 = "session-events:update, session-pipeline:update, session-pipeline-secret:update, session-read-api:create, session-read-api-secret:create, session-read-api-throttles-alarm:create, session-reconcile-continue:update, transcripts:update, transcripts-key:update";
+
+  it("read api rollout with the pipeline cascade: accepts the 9e5c191 capture's action set", () => {
+    const plan = withReadApi();
+    const changes = plan.split("\n").filter((l) => isResourceLine(l) && !l.endsWith(" noop")).map((l) => l.slice(1).replace("] ", ":"));
+    expect(changes.join(", ")).toBe(CAPTURE_151);
+    expect(check(plan)).toBe("session read api rollout");
+    expect(check(plan, null)).toBe("session read api rollout");
+    // All four read api resources created (nothing applied yet) is the same rollout.
+    expect(check(withReadApi({ ...REMAINING, "session-read-api-errors-alarm": "create" }))).toBe("session read api rollout");
+  });
+
+  it("read api rollout with the pipeline cascade: session-read-api must be created, never updated or noop", () => {
+    expect(() => check(withReadApi({ ...REMAINING, "session-read-api": "update" }))).toThrow(/read api changes alone/);
+    expect(() => check(withReadApi({ ...REMAINING, "session-read-api": "noop" }))).toThrow(/read api changes alone/);
+    expect(() => check(withReadApi({ ...REMAINING, "session-read-api-errors-alarm": "update" }))).toThrow(/read api changes alone/);
+    expect(() => check(withReadApi({ ...REMAINING, "session-read-api-secret": "update" }))).toThrow(/read api changes alone/);
+  });
+
+  it("read api rollout with the pipeline cascade: the pipeline may only carry a code-only update and the exact cascade", () => {
+    // A declared property change on the function.
+    const props = withReadApi().replace("[session-pipeline] update\n  no declared property changes", "[session-pipeline] update\n  properties:\n  -   memorySize: 1024\n  +   memorySize: 2048");
+    expect(() => check(props)).toThrow(/session-pipeline may update only with no declared property changes/);
+    // A grant that changes more than the role ARN (assertPipelineRoleCascadeDiff, unchanged).
+    const action = edit(withReadApi(), "session-pipeline-secret", "  +       - Action: secretsmanager:GetSecretValue", () => "  +       - Action: secretsmanager:*");
+    expect(() => check(action)).toThrow(/session-pipeline-secret changes .* not only the role-ARN cascade/);
+    const swapped = edit(withReadApi(), "transcripts", "  +         AWS: (known after apply)", () => '  +         AWS: "*"');
+    expect(() => check(swapped)).toThrow(/transcripts changes .* not only the role-ARN cascade/);
+    expect(() => check(withReadApi(), snapshot({ status: "created", attr: { roleArn: `arn:aws:iam::${ACCOUNT}:role/another-role` } }))).toThrow(/is not the session pipeline's role/);
+    const noCascade = withReadApi().replace(/\[session-pipeline-secret\] update\n[\s\S]*?(?=\n\[session-read-api\])/, "[session-pipeline-secret] update\n  no declared property changes\n");
+    expect(() => check(noCascade)).toThrow(/session-pipeline-secret updates without the role-ARN cascade/);
+    // Fewer than the five grants, or the grants without the function.
+    const keyOnly = withReadApi().replace(/\[transcripts-key\] update\n[\s\S]*?(?=\n\[transcripts-key-alias\])/, "[transcripts-key] noop\n");
+    expect(() => check(keyOnly)).toThrow(/read api changes alone/);
+    expect(() => check(withReadApi().replace("[session-pipeline] update\n  no declared property changes", "[session-pipeline] noop"))).toThrow(/read api changes alone/);
+  });
+
+  it("read api rollout with the pipeline cascade: refuses any other change, and a tag change", () => {
+    for (const r of ["session-events-mapping", "session-events-dlq", "session-pipeline-errors-alarm", "session-reconcile-schedule", "trail", "budget", "transcripts-key-alias"])
+      expect(() => check(op(withReadApi(), r, "update"))).toThrow(/read api changes alone/);
+    expect(() => check(op(withReadApi(), "session-events-dlq-alarm", "create"))).toThrow(/read api changes alone/);
+    for (const action of ["replace", "delete"]) expect(() => check(op(withReadApi(), "trail", action))).toThrow(/forbidden action/);
+    // A tag change on a grant is the repo tag rename's own phase, which refuses creates.
+    const tag = edit(withReadApi(), "session-pipeline-secret", "      96bulls:repo: AgentWorkforce/sessions-pipeline", () => ["  -   96bulls:repo: AgentWorkforce/sessions-pipeline", "  +   96bulls:repo: AgentWorkforce/elsewhere"]);
+    expect(() => check(tag)).toThrow(/repo tag rename/);
+  });
 });
