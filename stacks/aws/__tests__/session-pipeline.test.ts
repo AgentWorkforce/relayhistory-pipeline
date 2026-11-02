@@ -211,6 +211,13 @@ describe("session pipeline: deploy plan contract", () => {
     expect(() => check(plan({ "session-pipeline": "update", transcripts: "update" }))).toThrow(/transcripts updates without the role-ARN cascade/);
   });
 
+  it("live-staging addition: with the pipeline deployed and untouched, exactly the four store policy updates", () => {
+    const staging = { "transcript-srv-writer": "update", "transcript-eraser": "update", transcripts: "update", "transcripts-key": "update" };
+    expect(check(plan(staging))).toBe("live-staging addition");
+    expect(() => check(plan({ ...staging, "transcript-writer": "update" }))).toThrow(/action set does not match/);
+    expect(() => check(plan({ ...staging, "session-pipeline": "update" }))).toThrow();
+  });
+
   it("refuses any other store change, any replacement or delete, and a partial resource list", () => {
     expect(() => check(plan({ ...creates, trail: "update" }))).toThrow(/action set does not match/);
     expect(() => check(plan({ ...creates, "transcript-reader": "update" }))).toThrow(/action set does not match/);

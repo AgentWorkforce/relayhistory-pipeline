@@ -203,7 +203,7 @@ describe("live (srv_) erasure", () => {
     const state = new SyncState(join(await tmp(), "s.sqlite"));
     const job = new ErasureJob(db, state, counting, () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep();
-    expect(calls).toEqual({ list: 2, dir: 0 });
+    expect(calls).toEqual({ list: 3, dir: 0 });
     state.close();
     await pg.close();
   });
@@ -267,4 +267,62 @@ describe("live (srv_) erasure", () => {
     state.close();
     await pg.close();
   });
+
+  // relayhistory-cloud #264's stagingKey for the same session (same machine id as live objects).
+  const STAGED = `96bulls-staging/org-1/v1/ws=ws_1/m=${M}/h=claude/s=sess_1/${"c".repeat(64)}.ndjson`;
+
+  test("a tombstoned session's replica staging (unscrubbed lines) is erased with it; another user's stays", async () => {
+    const { pg, db } = await neon();
+    const store = createFsStore({ root: await tmp() });
+    const otherStaged = `96bulls-staging/org-1/v1/ws=ws_1/m=${liveMachineId("ws/1", "origin-1", "user-2")}/h=claude/s=sess_1/${"d".repeat(64)}.ndjson`;
+    const neighbourStaged = `96bulls-staging/org-1/v1/ws=ws_1/m=${M}/h=claude/s=sess_10/${"e".repeat(64)}.ndjson`;
+    await put(store, [...WORKER_KEYS, POINTER, STAGED, otherStaged, neighbourStaged]);
+    await tombstone(pg, GROUP);
+    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    await job.sweep();
+    const left = await stagingKeys(store);
+    expect(left).toEqual([neighbourStaged, otherStaged].sort());
+    expect((await keys(store)).filter((k) => k.startsWith("96bulls/"))).toEqual([]);
+    state.close();
+    await pg.close();
+  });
+
+  test("staging alone (no live objects left) still brings the session back to the eraser", async () => {
+    const { pg, db } = await neon();
+    const store = createFsStore({ root: await tmp() });
+    await put(store, [STAGED]);
+    await tombstone(pg, GROUP);
+    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    await job.sweep();
+    expect(await stagingKeys(store)).toEqual([]);
+    state.close();
+    await pg.close();
+  });
+
+  test("staging newer than the re-check is kept, and so is the pointer", async () => {
+    const { pg, db } = await neon();
+    const store = createFsStore({ root: await tmp() });
+    await put(store, [POINTER, STAGED]);
+    await tombstone(pg, GROUP);
+    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    await job.sweep();
+    expect(await stagingKeys(store)).toEqual([STAGED]);
+    expect(await keys(store)).toContain(POINTER);
+    state.close();
+    await pg.close();
+  });
 });
+
+async function stagingKeys(store: ReturnType<typeof createFsStore>) {
+  const out: string[] = [];
+  let c: string | undefined;
+  do {
+    const p = await store.list(objectKey("96bulls-staging"), c);
+    out.push(...p.items.map((i) => i.key));
+    c = p.nextCursor;
+  } while (c);
+  return out.sort();
+}

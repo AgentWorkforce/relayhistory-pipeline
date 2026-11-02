@@ -15,6 +15,7 @@ import {
   assertTranscriptStorePlanContract,
   transcriptBucketPolicy,
   transcriptEraserPolicy,
+  STAGING_KEY_BASE,
   transcriptKeyPolicy,
   transcriptLifecycleRules,
   transcriptNames,
@@ -168,8 +169,27 @@ describe("transcript store: lifecycle fits the K-45 erasure SLA", () => {
     expect(rules.find((x) => x.Expiration?.ExpiredObjectDeleteMarker)?.Status).toBe("Enabled");
   });
 
+  it("replica staging (unscrubbed lines) expires 3 days after it is written (past the replica's 24 h requeue horizon), an overwritten copy after a day", () => {
+    const r = rules.find((x) => x.ID === "expire-live-staging") as unknown as {
+      Status: string;
+      Filter: { Prefix: string };
+      Expiration: { Days: number };
+      NoncurrentVersionExpiration: { NoncurrentDays: number };
+    };
+    expect(r.Status).toBe("Enabled");
+    expect(r.Filter).toEqual({ Prefix: `${STAGING_KEY_BASE}/` });
+    expect(r.Expiration).toEqual({ Days: 3 });
+    expect(r.NoncurrentVersionExpiration).toEqual({ NoncurrentDays: 1 });
+    // Past the replica's transient horizon (24 h), with room for a DLQ replay.
+    expect(r.Expiration.Days * 24).toBeGreaterThan(24);
+    // A literal prefix, outside 96bulls/: lifecycle filters cannot wildcard.
+    expect(STAGING_KEY_BASE).toBe("96bulls-staging");
+  });
+
   it("access logs expire and their noncurrent versions too", () => {
     const l = accessLogLifecycleRules() as { NoncurrentVersionExpiration?: { NoncurrentDays: number }; Expiration?: { Days: number } }[];
+    // Replica staging is a transcripts-bucket prefix only.
+    expect(JSON.stringify(l)).not.toContain("expire-live-staging");
     expect(l.find((x) => x.Expiration)?.Expiration?.Days).toBeGreaterThan(0);
     expect(l.find((x) => x.NoncurrentVersionExpiration)!.NoncurrentVersionExpiration!.NoncurrentDays).toBe(1);
   });
@@ -194,9 +214,15 @@ describe("transcript store: KMS key policy is least privilege", () => {
     const users = st.filter((s) => !JSON.stringify(s.Principal).includes(":root"));
     expect(users.map((s) => (s.Principal as { AWS: string }).AWS).sort()).toEqual([readerArn, srvWriterArn, writerArn].sort());
     for (const s of users) {
+      // The srv-writer alone also encrypts and reads its replica staging (96bulls-staging/).
+      const srv = (s.Principal as { AWS: string }).AWS === srvWriterArn;
       expect(s.Condition).toEqual({
         StringEquals: { "kms:ViaService": `s3.${REGION}.amazonaws.com`, "kms:CallerAccount": ACCOUNT },
-        StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${n.bucket}/${TENANT_KEY_BASE}/*` },
+        StringLike: {
+          "kms:EncryptionContext:aws:s3:arn": srv
+            ? [`arn:aws:s3:::${n.bucket}/${TENANT_KEY_BASE}/*`, `arn:aws:s3:::${n.bucket}/${STAGING_KEY_BASE}/*`]
+            : `arn:aws:s3:::${n.bucket}/${TENANT_KEY_BASE}/*`,
+        },
       });
     }
     expect(users.find((s) => (s.Principal as { AWS: string }).AWS === writerArn)!.Action.sort()).toEqual(["kms:Decrypt", "kms:GenerateDataKey"]);
@@ -237,7 +263,10 @@ describe("transcript store: IAM users are least privilege", () => {
     expect(decide(eraser, "s3:DeleteObject", OUTSIDE)).toBe("implicit-deny");
     for (const a of ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"]) expect(decide(eraser, a, RAW)).toBe("deny");
     const list = eraser.Statement.find((s) => s.Sid === "ListVersionsUnderPrefix")!;
-    expect(list.Condition).toEqual({ StringLike: { "s3:prefix": [`${TENANT_KEY_BASE}/*`] } });
+    expect(list.Condition).toEqual({ StringLike: { "s3:prefix": [`${TENANT_KEY_BASE}/*`, `${STAGING_KEY_BASE}/*`] } });
+    // Replica staging is erased with its session; nothing else outside 96bulls/.
+    expect(decide(eraser, "s3:DeleteObjectVersion", obj(`${STAGING_KEY_BASE}/org_abc/v1/ws=w/m=srv_x/h=claude/s=s1/${"a".repeat(64)}.ndjson`))).toBe("allow");
+    expect(decide(eraser, "s3:DeleteObjectVersion", obj("96bulls-other/x"))).toBe("implicit-deny");
   });
 
   it("no writer/reader/eraser policy has a wildcard action, a wildcard resource, or any KMS or IAM grant", () => {
@@ -305,6 +334,7 @@ describe("transcript store: srv-writer (relayhistory-api live writer) is least p
     `${n.bucketArn}/${TENANT_KEY_BASE}/*/v1/ws=*/m=srv_*`,
     `${n.bucketArn}/${TENANT_KEY_BASE}/*/live-sessions/*`,
     `${n.bucketArn}/${TENANT_KEY_BASE}/*/live-batches/*`,
+    `${n.bucketArn}/${STAGING_KEY_BASE}/*`,
   ];
   const srvLoc: SessionLocation = { ...loc, machineId: "srv_0123abcd" };
   const SRV_MANIFEST = obj(manifestKey(srvLoc));
@@ -417,6 +447,17 @@ describe("transcript store: deploy plan contract", () => {
     expect(check(plan({ "trail-key": "update", "trail-logs": "update" }))).toBe("post-merge policy remediation");
     expect(check(plan({ "transcript-srv-writer": "create", "transcripts-key": "update" }))).toBe("srv-writer addition");
     expect(check(plan({}))).toBe("post-apply");
+  });
+
+  it("the live-staging addition is exactly the srv-writer, eraser, key and bucket policy updates", () => {
+    const actions = { "transcript-srv-writer": "update", "transcript-eraser": "update", transcripts: "update", "transcripts-key": "update" };
+    expect(check(plan(actions))).toBe("live-staging addition");
+    for (const wrong of [
+      { ...actions, "transcript-writer": "update" },
+      { "transcript-srv-writer": "update", "transcript-eraser": "update", transcripts: "update" },
+      { ...actions, "transcript-eraser": "create" },
+      { ...actions, "transcript-reader": "update" },
+    ]) expect(() => check(plan(wrong))).toThrow(/action set does not match|forbidden action/);
   });
 
   it("the srv-writer addition is exactly the new user plus the key policy update", () => {

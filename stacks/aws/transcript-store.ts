@@ -145,7 +145,23 @@ export const srvWriterObjects = (bucketArn: string) => [
   `${bucketArn}/${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/ws=*/m=srv_*`,
   `${bucketArn}/${TENANT_KEY_BASE}/*/live-sessions/*`,
   `${bucketArn}/${TENANT_KEY_BASE}/*/live-batches/*`,
+  `${bucketArn}/${STAGING_KEY_BASE}/*`,
 ];
+/**
+ * relayhistory-api's replica staging (relayhistory-cloud #264,
+ * WRITE_PATH_STAGING): the exact, unscrubbed lines of a batch the chunk
+ * scrubber would change, held until the Neon replica applies them. A literal
+ * top-level prefix so one lifecycle rule expires it (STAGING_EXPIRY_DAYS); only the srv-writer (get, put) and the eraser (list,
+ * delete) reach it.
+ */
+export const STAGING_KEY_BASE = `${TENANT_KEY_BASE}-staging`;
+/**
+ * Longer than the replica's horizon: a message requeues for up to 24 h and can
+ * then wait in the DLQ for a replay, which still needs its staging. The 48 h
+ * erasure SLA does not rest on this expiry: the eraser deletes a tombstoned
+ * session's staging explicitly, like its live objects.
+ */
+export const STAGING_EXPIRY_DAYS = 3;
 
 /**
  * Inputs a transcript-store stage must not carry: it is S3 only (decision 0001),
@@ -196,6 +212,7 @@ export type TranscriptStorePlanPhase =
   | "post-merge policy remediation"
   | "srv-writer addition"
   | "srv-writer propagation recovery"
+  | "live-staging addition"
   | "post-apply"
   | "session pipeline rollout"
   | "session pipeline update"
@@ -244,6 +261,8 @@ function sessionPipelinePhase(operations: ReadonlyMap<string, string>): Transcri
   return undefined;
 }
 
+const LIVE_STAGING_ACTIONS = { "transcript-srv-writer": "update", "transcript-eraser": "update", transcripts: "update", "transcripts-key": "update" } as const;
+
 const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
   { name: "initial", actions: Object.fromEntries(TRANSCRIPT_RESOURCES.map((resource) => [resource, "create"])) },
   { name: "principal-propagation recovery", actions: { transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" } },
@@ -256,6 +275,9 @@ const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; ac
   // KMS refused the key policy because the new principal had not propagated. Only the key policy update
   // that adds the srv-writer's statement is accepted (assertSrvWriterRecoveryDiff).
   { name: "srv-writer propagation recovery", actions: { "transcripts-key": "update" } },
+  // The replica staging prefix: the srv-writer and eraser policies, the key policy's srv-writer
+  // statement, and the bucket's lifecycle rule. Nothing created, replaced or deleted.
+  { name: "live-staging addition", actions: LIVE_STAGING_ACTIONS },
   { name: "post-apply", actions: {} },
 ];
 
@@ -368,6 +390,12 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   if (withPipeline) {
     if (SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
       return "post-apply";
+    // With the pipeline deployed, the live-staging addition leaves every pipeline resource noop.
+    if (
+      SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") &&
+      TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === ((LIVE_STAGING_ACTIONS as Record<string, string>)[r] ?? "noop"))
+    )
+      return "live-staging addition";
     const pipelinePhase = sessionPipelinePhase(compact.operations);
     if (pipelinePhase === "session pipeline update")
       assertPipelineRoleCascadeDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
@@ -380,7 +408,7 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   );
   if (!phase) {
     const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
-    return refuse(`action set does not match initial, recovery, exact two-policy remediation, srv-writer addition, srv-writer recovery, or post-apply phase: ${changes.join(", ") || "(none)"}`);
+    return refuse(`action set does not match initial, recovery, exact two-policy remediation, srv-writer addition, srv-writer recovery, live-staging addition, or post-apply phase: ${changes.join(", ") || "(none)"}`);
   }
   if (phase.name === "srv-writer propagation recovery") assertSrvWriterRecoveryDiff(capture.detailedPlanText, capture.stateSnapshotText, refuse);
   return phase.name;
@@ -572,6 +600,14 @@ export function transcriptLifecycleRules() {
     { ID: "expire-noncurrent-versions", Status: "Enabled", Filter: { Prefix: "" }, NoncurrentVersionExpiration: { NoncurrentDays: NONCURRENT_VERSION_DAYS } },
     { ID: "remove-expired-delete-markers", Status: "Enabled", Filter: { Prefix: "" }, Expiration: { ExpiredObjectDeleteMarker: true } },
     { ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: ABORT_INCOMPLETE_UPLOAD_DAYS } },
+    // Replica staging holds unscrubbed lines: gone STAGING_EXPIRY_DAYS after it is written; an overwritten copy a day later.
+    {
+      ID: "expire-live-staging",
+      Status: "Enabled",
+      Filter: { Prefix: `${STAGING_KEY_BASE}/` },
+      Expiration: { Days: STAGING_EXPIRY_DAYS },
+      NoncurrentVersionExpiration: { NoncurrentDays: 1 },
+    },
   ];
 }
 
@@ -692,12 +728,19 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
     StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${TENANT_KEY_BASE}/*` },
   };
+  // The srv-writer also encrypts and reads its replica staging.
+  const srvVia = {
+    StringEquals: via.StringEquals,
+    StringLike: {
+      "kms:EncryptionContext:aws:s3:arn": [`arn:aws:s3:::${i.bucketName}/${TENANT_KEY_BASE}/*`, `arn:aws:s3:::${i.bucketName}/${STAGING_KEY_BASE}/*`],
+    },
+  };
   return {
     Version: "2012-10-17" as const,
     Statement: [
       { Sid: "AccountAdministersKey", Effect: "Allow" as const, Principal: { AWS: `arn:aws:iam::${i.accountId}:root` }, Action: [...KMS_ADMIN_ACTIONS], Resource: "*" },
       { Sid: "WriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.writerArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
-      { Sid: "SrvWriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.srvWriterArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
+      { Sid: "SrvWriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.srvWriterArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: srvVia },
       { Sid: "ReaderDecryptsViaS3", Effect: "Allow" as const, Principal: { AWS: i.readerArn }, Action: ["kms:Decrypt"], Resource: "*", Condition: via },
       ...(i.pipelineRoleArn ? [pipelineKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
     ],
@@ -812,9 +855,9 @@ export function transcriptEraserPolicy(bucketArn: string) {
         Effect: "Allow" as const,
         Action: ["s3:ListBucket", "s3:ListBucketVersions"],
         Resource: [bucketArn],
-        Condition: { StringLike: { "s3:prefix": [`${TENANT_KEY_BASE}/*`] } },
+        Condition: { StringLike: { "s3:prefix": [`${TENANT_KEY_BASE}/*`, `${STAGING_KEY_BASE}/*`] } },
       },
-      { Sid: "DeleteEveryVersion", Effect: "Allow" as const, Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"], Resource: [allObjects(bucketArn)] },
+      { Sid: "DeleteEveryVersion", Effect: "Allow" as const, Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"], Resource: [allObjects(bucketArn), `${bucketArn}/${STAGING_KEY_BASE}/*`] },
       {
         Sid: "NoContentNoWrites",
         Effect: "Deny" as const,

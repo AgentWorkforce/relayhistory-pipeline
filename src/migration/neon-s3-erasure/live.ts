@@ -41,6 +41,27 @@ export function liveSessionsIn(prefix: string, keys: readonly string[]): Set<str
   return out;
 }
 
+/**
+ * The (workspace, user, origin)'s replica staging root (relayhistory-cloud
+ * #264): `{root}-staging/{org}/v1/ws=/m=srv_…/`. A staged session is
+ * `h=…/s=…/<sha256>.ndjson` under it, holding unscrubbed lines until the
+ * bucket's 1-day expiry; the eraser removes it with the session.
+ */
+export function liveStagingPrefix(keyRoot: string, g: Pick<LiveFencedGroup, "org_id" | "workspace_id" | "origin_id" | "user_id">): string {
+  return `${orgPrefix(`${keyRoot}-staging`, g.org_id)}/v1/ws=${component(g.workspace_id)}/m=${liveMachineId(g.workspace_id, g.origin_id, g.user_id)}/`;
+}
+
+/** `h=…/s=…` of every staged session under `prefix` with at least one object version. */
+export function stagedSessionsIn(prefix: string, keys: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  for (const key of keys) {
+    if (!key.startsWith(prefix)) continue;
+    const m = /^(h=[^/]+)\/(s=[^/]+)\/[^/]+$/.exec(key.slice(prefix.length));
+    if (m) out.add(`${m[1]}/${m[2]}`);
+  }
+  return out;
+}
+
 export interface LiveTargets {
   /** List base, ends in `/`: `{root}/{org}/v1/ws=/m=srv_/h=/`. */
   base: string;

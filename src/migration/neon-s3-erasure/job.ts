@@ -19,7 +19,7 @@
 import type { Queryable } from "../relayhistory-export.ts";
 import { orgPrefix } from "../neon-s3-sync/export-session.ts";
 import { activityPage, catalogPage, fencedGroups, fencedLivePage, groupExistsInNeon, lockWaiters, type LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
-import { liveObjectPrefix, livePointerPrefix, liveSessionsIn, liveTargets } from "./live.ts";
+import { liveObjectPrefix, livePointerPrefix, liveSessionsIn, liveStagingPrefix, liveTargets, stagedSessionsIn } from "./live.ts";
 
 /** Clock-skew margin between this host and S3 `LastModified`. */
 export const LIVE_SKEW_MS = 2 * 60 * 1000;
@@ -189,16 +189,18 @@ export class ErasureJob {
       // directories that hold any object, and the pointers. A tombstone is
       // visited while either remains, so neither a directory left by a
       // re-upload nor an orphaned pointer is ever skipped for good.
-      const listed = new Map<string, { dirs: Set<string>; pointers: Set<string> } | null>();
+      const listed = new Map<string, { dirs: Set<string>; pointers: Set<string>; staged: Set<string> } | null>();
       for (const g of rows) {
         if (this.stopped()) break;
         let t;
         let objects: string;
         let pointerRoot: string;
+        let stagingRoot: string;
         try {
           t = liveTargets(this.cfg.keyRoot, g);
           objects = liveObjectPrefix(this.cfg.keyRoot, g);
           pointerRoot = livePointerPrefix(this.cfg.keyRoot, g);
+          stagingRoot = liveStagingPrefix(this.cfg.keyRoot, g);
         } catch {
           // An id that is not one safe path segment was never written either.
           this.counters.refused += 1;
@@ -213,6 +215,7 @@ export class ErasureJob {
             seen = {
               dirs: liveSessionsIn(objects, await this.eraser.listKeys(objects)),
               pointers: new Set(await this.eraser.listKeys(pointerRoot)),
+              staged: stagedSessionsIn(stagingRoot, await this.eraser.listKeys(stagingRoot)),
             };
             listed.set(objects, seen);
           }
@@ -223,7 +226,7 @@ export class ErasureJob {
           continue;
         }
         const dirKey = `${t.base.slice(objects.length).replace(/\/$/, "")}/${t.sessionSegment}`;
-        if (!seen.dirs.has(dirKey) && !seen.pointers.has(t.pointerKey)) continue;
+        if (!seen.dirs.has(dirKey) && !seen.pointers.has(t.pointerKey) && !seen.staged.has(dirKey)) continue;
         groups += 1;
         if (dryRun) continue;
         try {
@@ -236,9 +239,11 @@ export class ErasureJob {
           if (still.length === 0) continue; // re-enabled since the page was read
           const before = new Date(checkedAt - LIVE_SKEW_MS);
           const dir = await this.eraser.eraseSessionAnyDate(t.base, t.sessionSegment, before);
-          versions += dir.deleted;
-          this.counters.liveVersionsDeleted += dir.deleted;
-          if (dir.kept > 0) continue; // the next sweep comes back for the rest
+          // The session's replica staging (unscrubbed lines), under the same cut.
+          const staged = await this.eraser.erasePrefixBefore(`${stagingRoot}${dirKey}/`, before);
+          versions += dir.deleted + staged.deleted;
+          this.counters.liveVersionsDeleted += dir.deleted + staged.deleted;
+          if (dir.kept + staged.kept > 0) continue; // the next sweep comes back for the rest
           const ptr = await this.eraser.eraseObjectBefore(t.pointerKey, before);
           versions += ptr.deleted;
           this.counters.liveVersionsDeleted += ptr.deleted;

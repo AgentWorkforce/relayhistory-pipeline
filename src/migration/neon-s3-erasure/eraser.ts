@@ -28,6 +28,8 @@ export interface Eraser {
   eraseObjectBefore(key: string, before: Date): Promise<{ deleted: number; kept: number }>;
   /** Keys with any version under `prefix` (ends in `/`). */
   listKeys(prefix: string): Promise<string[]>;
+  /** Every version under `prefix` (ends in `/`) last modified before `before`. */
+  erasePrefixBefore(prefix: string, before: Date): Promise<{ deleted: number; kept: number }>;
 }
 
 /** True when `key` is inside `base` + `d=yyyy/mm/dd/` + `sessionSegment` + `/`. */
@@ -143,6 +145,11 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
       return [...new Set((await versions(prefix)).map((v) => v.key))];
     },
+    erasePrefixBefore: async (prefix, before) => {
+      if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
+      const { erase, kept } = cut(await versions(prefix), before);
+      return { deleted: await remove(erase), kept };
+    },
   };
 }
 
@@ -188,6 +195,19 @@ export function storeEraser(store: ObjectStore): Eraser {
       if (meta.lastModified.getTime() >= before.getTime()) return { deleted: 0, kept: 1 };
       await store.delete(objectKey(key));
       return { deleted: 1, kept: 0 };
+    },
+    async erasePrefixBefore(prefix, before) {
+      if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
+      const items: { key: string; lastModified: number }[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
+        for (const i of page.items) items.push({ key: i.key, lastModified: i.lastModified.getTime() });
+        cursor = page.nextCursor;
+      } while (cursor);
+      const { erase, kept } = cut(items, before);
+      for (const i of erase) await store.delete(objectKey(i.key));
+      return { deleted: erase.length, kept };
     },
     async listKeys(prefix) {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
