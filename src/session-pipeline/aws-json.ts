@@ -97,6 +97,16 @@ export function lambdaCredentials(env: NodeJS.ProcessEnv = process.env): AwsSess
   return { accessKeyId, secretAccessKey, ...(env.AWS_SESSION_TOKEN ? { sessionToken: env.AWS_SESSION_TOKEN } : {}) };
 }
 
+/**
+ * The AWS JSON protocol version each service speaks. Secrets Manager is awsJson1_1: sent
+ * `application/x-amz-json-1.0` it answers 404 `UnknownOperationException` with no `__type`
+ * (seen on aws-sessions-prod 2026-11-02, every GetSecretValue). SQS is awsJson1_0.
+ */
+export const JSON_PROTOCOL: Record<"secretsmanager" | "sqs", string> = {
+  secretsmanager: "application/x-amz-json-1.1",
+  sqs: "application/x-amz-json-1.0",
+};
+
 /** One JSON-protocol call (`X-Amz-Target`), e.g. secretsmanager.GetSecretValue. */
 export async function awsJsonCall<T>(args: {
   service: "secretsmanager" | "sqs";
@@ -114,7 +124,7 @@ export async function awsJsonCall<T>(args: {
     url,
     service: args.service,
     region: args.region,
-    headers: { "content-type": "application/x-amz-json-1.0", "x-amz-target": args.target },
+    headers: { "content-type": JSON_PROTOCOL[args.service], "x-amz-target": args.target },
     body,
     credentials: args.credentials,
   });
