@@ -193,8 +193,10 @@ export type TranscriptStorePlanPhase =
  * resources are created (all, or the rest after a partial apply), and the store
  * changes only by the two grants it needs: the transcripts key policy (decrypt via
  * S3) and the bucket policy (list, read). Update: an existing pipeline changes in
- * place (code, env, settings) and the store does not change at all. Never a
- * replacement or deletion, and every other store resource stays `noop`.
+ * place (code, env, settings). The five resources that name the pipeline's role
+ * (ROLE_GRANT_RESOURCES) may update only by the role-ARN cascade, checked against
+ * the detailed plan in assertPipelineRoleCascadeDiff. Never a replacement or
+ * deletion, and every other store resource stays `noop`.
  */
 function sessionPipelinePhase(operations: ReadonlyMap<string, string>): TranscriptStorePlanPhase | undefined {
   if (!SESSION_PIPELINE_RESOURCES.some((r) => operations.has(r))) return undefined;
@@ -207,7 +209,7 @@ function sessionPipelinePhase(operations: ReadonlyMap<string, string>): Transcri
     if (pipeline.some((a) => a === "create")) return "session pipeline rollout";
     if (grants.some((a) => a === "update")) return "session pipeline rollout";
   }
-  if (grants.every((a) => a === "noop") && pipeline.every((a) => a === "update" || a === "noop") && pipeline.some((a) => a === "update"))
+  if (grants.every((a) => a === "update" || a === "noop") && pipeline.every((a) => a === "update" || a === "noop") && pipeline.some((a) => a === "update"))
     return "session pipeline update";
   return undefined;
 }
@@ -320,6 +322,8 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
     if (SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
       return "post-apply";
     const pipelinePhase = sessionPipelinePhase(compact.operations);
+    if (pipelinePhase === "session pipeline update")
+      assertPipelineRoleCascadeDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
     if (pipelinePhase) return pipelinePhase;
     const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
     return refuse(`action set does not match the session pipeline rollout, update or post-apply phase: ${changes.join(", ") || "(none)"}`);
@@ -333,6 +337,110 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   }
   if (phase.name === "srv-writer propagation recovery") assertSrvWriterRecoveryDiff(capture.detailedPlanText, capture.stateSnapshotText, refuse);
   return phase.name;
+}
+
+/**
+ * The resources whose policies name the session pipeline's execution role. A pipeline
+ * update (any change to the function) re-plans the function's `roleArn` output as
+ * `(known after apply)`: Alchemy's Lambda provider keeps `roleName` stable but not
+ * `roleArn`. So every one of them shows an update in which the role's ARN becomes
+ * `(known after apply)`, though the role, and so the ARN, does not change.
+ */
+export const ROLE_GRANT_RESOURCES = ["session-events", "session-pipeline-secret", "session-reconcile-continue", "transcripts", "transcripts-key"] as const;
+const KNOWN_AFTER_APPLY = "(known after apply)";
+/** The two keys that hold the role ARN: a policy statement's `Principal.AWS`, and the permission's `principal`. */
+const ROLE_ARN_LINE = /^(\s*(?:AWS|principal): )(.*)$/;
+
+/** One resource's lines in a detailed plan, between its `[resource] action` line and the next. */
+function detailedBlock(lines: readonly string[], resource: string): string[] {
+  const start = lines.findIndex((line) => line.trim() === `[${resource}] update`);
+  if (start < 0) return [];
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(line));
+  return end < 0 ? rest : rest.slice(0, end);
+}
+
+/**
+ * In a session pipeline update, each ROLE_GRANT_RESOURCES update must be exactly the role-ARN
+ * cascade. Alchemy prints a changed key as its whole old value (`  - ` lines) followed by its whole
+ * new value (`  + ` lines). Each such run must have as many `-` as `+` lines, and the i-th `-` line
+ * must equal the i-th `+` line except where the `-` line is `AWS: <role>` or `principal: <role>` and
+ * the `+` line is the same key with `(known after apply)`, at least once per updated resource.
+ * <role> is the function's roleArn in the capture's state snapshot. The deploy has no snapshot; it is
+ * bound to the captured state by the version digest, and here every replaced ARN must be one role
+ * in the production account. The function itself must update, and nothing else may change.
+ */
+function assertPipelineRoleCascadeDiff(
+  operations: ReadonlyMap<string, string>,
+  detailedPlanText: string,
+  stateSnapshotText: string | undefined,
+  refuse: (why: string) => never,
+) {
+  const updated = ROLE_GRANT_RESOURCES.filter((r) => operations.get(r) === "update");
+  if (updated.length === 0) return;
+  if (operations.get("session-pipeline") !== "update")
+    refuse(`session pipeline update: ${updated.join(", ")} update but session-pipeline does not`);
+  const cascade = new Set<string>(["session-pipeline", ...updated]);
+  const others = [...operations].filter(([r, a]) => a !== "noop" && !cascade.has(r)).map(([r, a]) => `${r}:${a}`);
+  if (others.length) refuse(`session pipeline update: the role-ARN cascade comes with other changes: ${others.join(", ")}`);
+  const roleArn = stateSnapshotText === undefined ? undefined : pipelineRoleArnFromState(stateSnapshotText, refuse);
+  const lines = detailedPlanText.split(/\r?\n/);
+  const replaced = new Set<string>();
+  for (const resource of updated) {
+    const block = detailedBlock(lines, resource);
+    const marked = block.map((line) => /^  ([+-]) (.*)$/.exec(line));
+    let cascades = 0;
+    for (let i = 0; i < block.length; ) {
+      if (!marked[i]) {
+        i++;
+        continue;
+      }
+      let j = i;
+      while (j < block.length && marked[j]?.[1] === "-") j++;
+      let k = j;
+      while (k < block.length && marked[k]?.[1] === "+") k++;
+      const minus = marked.slice(i, j).map((m) => m![2]!);
+      const plus = marked.slice(j, k).map((m) => m![2]!);
+      if (minus.length === 0 || minus.length !== plus.length)
+        refuse(`session pipeline update: ${resource} adds or removes lines (${minus.length} - / ${plus.length} +), not only the role-ARN cascade`);
+      for (let n = 0; n < minus.length; n++) {
+        if (minus[n] === plus[n]) continue;
+        const old = ROLE_ARN_LINE.exec(minus[n]!);
+        if (!old || plus[n] !== `${old[1]}${KNOWN_AFTER_APPLY}`)
+          refuse(`session pipeline update: ${resource} changes ${JSON.stringify(minus[n]!.trim())} to ${JSON.stringify(plus[n]!.trim())}, not only the role-ARN cascade`);
+        if (roleArn !== undefined && old[2] !== roleArn)
+          refuse(`session pipeline update: ${resource} replaces ${old[2]}, which is not the session pipeline's role ${roleArn}`);
+        replaced.add(old[2]!);
+        cascades++;
+      }
+      i = k;
+    }
+    if (cascades === 0) refuse(`session pipeline update: ${resource} updates without the role-ARN cascade`);
+  }
+  const role = new RegExp(`^arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/[A-Za-z0-9_+=,.@-]+$`);
+  if (replaced.size !== 1 || ![...replaced].every((arn) => role.test(arn)))
+    refuse(`session pipeline update: the cascade must replace exactly one role ARN in ${TRANSCRIPT_ACCOUNT_ID}, found ${[...replaced].join(", ")}`);
+}
+
+/** The session pipeline function's execution role ARN, as the capture's state snapshot records it. */
+function pipelineRoleArnFromState(stateSnapshotText: string, refuse: (why: string) => never): string {
+  let objects: Array<{ key: string; text: string }>;
+  try {
+    objects = (JSON.parse(stateSnapshotText) as { objects: Array<{ key: string; text: string }> }).objects;
+  } catch {
+    return refuse("session pipeline update: state snapshot is not valid JSON");
+  }
+  const hits = (objects ?? []).filter((o) => o.key === `${alchemyStatePrefix(TRANSCRIPT_STAGE)}/session-pipeline.json`);
+  if (hits.length !== 1) refuse(`session pipeline update: state snapshot has ${hits.length} session-pipeline records`);
+  let fn: { status?: string; attr?: { roleArn?: unknown } };
+  try {
+    fn = JSON.parse(hits[0]!.text) as typeof fn;
+  } catch {
+    return refuse("session pipeline update: the session-pipeline state record is not valid JSON");
+  }
+  if ((fn.status !== "created" && fn.status !== "updated") || typeof fn.attr?.roleArn !== "string" || !fn.attr.roleArn)
+    refuse("session pipeline update: session-pipeline is not created in state with a roleArn");
+  return fn.attr!.roleArn as string;
 }
 
 const SRV_WRITER_KEY_SID = "SrvWriterEncryptsAndReadsViaS3";

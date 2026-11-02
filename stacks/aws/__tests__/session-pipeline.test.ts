@@ -204,7 +204,8 @@ describe("session pipeline: deploy plan contract", () => {
 
   it("update: pipeline resources change in place while the store is untouched", () => {
     expect(check(plan({ "session-pipeline": "update" }))).toBe("session pipeline update");
-    expect(() => check(plan({ "session-pipeline": "update", transcripts: "update" }))).toThrow(/session pipeline rollout, update or post-apply/);
+    // A store grant may update only by the role-ARN cascade (the next suite), which this plan does not show.
+    expect(() => check(plan({ "session-pipeline": "update", transcripts: "update" }))).toThrow(/transcripts updates without the role-ARN cascade/);
   });
 
   it("refuses any other store change, any replacement or delete, and a partial resource list", () => {
@@ -217,5 +218,144 @@ describe("session pipeline: deploy plan contract", () => {
     // A pipeline-free plan keeps the original contract.
     expect(check(plan({}, store))).toBe("post-apply");
     expect(() => check(plan({ transcripts: "update" }, store))).toThrow(/initial, recovery/);
+  });
+});
+
+// The real capture of #141's code-only update (bin/96bulls plan aws-sessions-prod --capture at 84a962c), sanitized as the
+// capture writes it. The function updates, and the five resources that name its role re-plan the role ARN as
+// `(known after apply)`: Alchemy keeps the function's roleName stable, not its roleArn.
+describe("session pipeline: update with the role-ARN cascade", () => {
+  const LIVE_ROLE = `arn:aws:iam::${ACCOUNT}:role/96bulls-aws-session-pipeline-aws-sessions-prod-nsvhn3beskmuvvon`;
+  const REAL = readFileSync(fileURLToPath(new URL("./fixtures/aws-sessions-prod.pipeline-update.detailed.txt", import.meta.url)), "utf8");
+  const h = (text: string) => createHash("sha256").update(text).digest("hex");
+  const isResourceLine = (l: string) => /^\[[a-z0-9-]+\] \S+$/.test(l);
+  /** Recount the summary from the resource lines, so a test changes only what it means to change. */
+  const recount = (full: string) => {
+    const counts = new Map<string, number>();
+    for (const l of full.split("\n")) if (isResourceLine(l) && !l.endsWith(" noop")) counts.set(l.split(" ")[1]!, (counts.get(l.split(" ")[1]!) ?? 0) + 1);
+    const summary = counts.size ? `Plan: ${[...counts].map(([a, c]) => `${c} to ${a}`).join(", ")}` : "Plan: no changes";
+    return full.replace(/^Plan: .*$/m, summary);
+  };
+  const snapshot = (fn: object | null = { status: "created", attr: { roleArn: LIVE_ROLE } }) => JSON.stringify({
+    schema: 1,
+    objects: [
+      { key: `96bulls/96bulls-aws/${STAGE}/transcripts-key.json`, text: JSON.stringify({ status: "created", attr: {} }) },
+      ...(fn ? [{ key: `96bulls/96bulls-aws/${STAGE}/session-pipeline.json`, text: JSON.stringify(fn) }] : []),
+    ],
+  });
+  /** `null`: the deploy's check, which has no state snapshot. */
+  const check = (detailed: string, stateSnapshot: string | null = snapshot()) => {
+    const full = recount(detailed);
+    const compact = `${full.split("\n").filter((l) => l.startsWith("Plan:") || isResourceLine(l)).join("\n")}\n`;
+    return assertTranscriptStorePlanContract(compact, {
+      detailedPlanText: full,
+      provenanceText: JSON.stringify({
+        schema: 1,
+        stage: STAGE,
+        outputs: { plan: { path: `docs/plans/${STAGE}.plan.txt`, sha256: h(compact) }, detailed: { path: `docs/plans/${STAGE}.plan.detailed.txt`, sha256: h(full) } },
+        summary: compact.split("\n")[0],
+      }),
+      stateSnapshotText: stateSnapshot ?? undefined,
+    });
+  };
+  /** Rewrite the n-th line (0-based) of a resource's block that matches `find`. */
+  const edit = (text: string, resource: string, find: RegExp | string, to: (line: string) => string | string[], nth = 0) => {
+    const lines = text.split("\n");
+    const start = lines.indexOf(`[${resource}] update`);
+    if (start < 0) throw new Error(`fixture has no ${resource} update`);
+    let seen = 0;
+    for (let i = start + 1; i < lines.length && !isResourceLine(lines[i]!); i++) {
+      const hit = typeof find === "string" ? lines[i] === find : find.test(lines[i]!);
+      if (hit && seen++ === nth) {
+        const out = to(lines[i]!);
+        lines.splice(i, 1, ...(Array.isArray(out) ? out : [out]));
+        return lines.join("\n");
+      }
+    }
+    throw new Error(`fixture ${resource} has no match ${String(find)} #${nth}`);
+  };
+  const op = (text: string, resource: string, action: string) => text.replace(`[${resource}] noop`, `[${resource}] ${action}`);
+
+  it("accepts the real cascade from the #141 capture as a session pipeline update", () => {
+    const ops = REAL.split("\n").filter((l) => isResourceLine(l) && !l.endsWith(" noop"));
+    expect(ops).toEqual(["[session-events] update", "[session-pipeline] update", "[session-pipeline-secret] update", "[session-reconcile-continue] update", "[transcripts] update", "[transcripts-key] update"]);
+    expect(check(REAL)).toBe("session pipeline update");
+    // The deploy has no snapshot; it is bound to the captured state by the version digest.
+    expect(check(REAL, null)).toBe("session pipeline update");
+    // A subset of the grants (the rest noop) is the same cascade.
+    const keyOnly = REAL.replace(/\[transcripts-key\] update\n[\s\S]*?(?=\n\[transcripts-key-alias\])/, "[transcripts-key] noop\n");
+    expect(check(keyOnly)).toBe("session pipeline update");
+  });
+
+  it("refuses a grant diff that adds or removes a statement or line", () => {
+    const addStatement = edit(REAL, "session-pipeline-secret", "  +         Sid: SessionPipelineReads", (l) => [l,
+      "  +       - Action: secretsmanager:PutSecretValue", "  +         Effect: Allow", "  +         Principal:", "  +           AWS: (known after apply)", '  +         Resource: "*"']);
+    expect(() => check(addStatement)).toThrow(/session-pipeline-secret adds or removes lines \(7 - \/ 12 \+\)/);
+    const dropStatement = REAL.replace(/(  \+     - Action:\n  \+         - s3:GetObject\n(?:  \+ .*\n)*?  \+       Sid: SessionPipelineReads\n)/, "");
+    expect(dropStatement).not.toBe(REAL);
+    expect(() => check(dropStatement)).toThrow(/transcripts adds or removes lines/);
+    const dropMinus = edit(REAL, "session-events", "  -         Sid: DenyInsecureTransport", () => []);
+    expect(() => check(dropMinus)).toThrow(/session-events adds or removes lines/);
+    // A whole new key (only + lines) is refused too.
+    const newKey = edit(REAL, "session-reconcile-continue", /^  \+   principal:/, (l) => [l, "  +   sourceAccount: \"1\""]);
+    expect(() => check(newKey)).toThrow(/session-reconcile-continue adds or removes lines/);
+  });
+
+  it("refuses a grant diff that changes an Action, Effect, Resource, Sid or condition", () => {
+    for (const [resource, find, to, nth] of [
+      ["session-pipeline-secret", "  +       - Action: secretsmanager:GetSecretValue", "  +       - Action: secretsmanager:*", 0],
+      ["session-events", "  +         Effect: Allow", "  +         Effect: Deny", 1],
+      ["session-events", "  +           - sqs:SendMessage", "  +           - sqs:PurgeQueue", 0],
+      ["transcripts", "  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/96bulls/*/v1/*", "  +         - arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742/*", 0],
+      ["transcripts", "  +       Sid: OnlyTheEraserDeletes", "  +       Sid: AnyoneDeletes", 0],
+      ["transcripts-key", "  +             kms:ViaService: s3.us-east-1.amazonaws.com", "  +             kms:ViaService: lambda.us-east-1.amazonaws.com", 3],
+      ["session-reconcile-continue", "    action: lambda:InvokeFunction", "  -   action: lambda:InvokeFunction\n  +   action: lambda:*", 0],
+    ] as const) {
+      const mutated = edit(REAL, resource, find, () => to.split("\n"), nth);
+      expect(() => check(mutated)).toThrow(new RegExp(`${resource} changes .* not only the role-ARN cascade`));
+    }
+  });
+
+  it("refuses a cascade that swaps in, or replaces, a different ARN", () => {
+    // The role ARN becomes another principal instead of (known after apply).
+    const other = edit(REAL, "session-pipeline-secret", "  +           AWS: (known after apply)", () => `  +           AWS: arn:aws:iam::${ACCOUNT}:role/someone-else`);
+    expect(() => check(other)).toThrow(/session-pipeline-secret changes .*someone-else.* not only the role-ARN cascade/);
+    const star = edit(REAL, "transcripts", "  +         AWS: (known after apply)", () => '  +         AWS: "*"');
+    expect(() => check(star)).toThrow(/transcripts changes .* not only the role-ARN cascade/);
+    // Another principal (the writer user) re-planned as unknown: not the pipeline's role.
+    const writer = edit(REAL, "transcripts-key", "  +           AWS: arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-writer", () => "  +           AWS: (known after apply)");
+    expect(() => check(writer)).toThrow(/transcripts-key replaces arn:aws:iam::941433935742:user\/96bulls\/96bulls-aws-sessions-prod-transcript-writer, which is not the session pipeline's role/);
+    expect(() => check(writer, null)).toThrow(/must replace exactly one role ARN/);
+    // The state's role differs from the ARN the plan replaces.
+    expect(() => check(REAL, snapshot({ status: "created", attr: { roleArn: `arn:aws:iam::${ACCOUNT}:role/another-role` } }))).toThrow(/is not the session pipeline's role arn:aws:iam::941433935742:role\/another-role/);
+    // Without a snapshot, two different role ARNs across the grants are refused.
+    const twoRoles = REAL.replace(`  -           AWS: ${LIVE_ROLE}\n  -         Resource: "*"\n  -         Sid: SessionPipelineReads`, `  -           AWS: arn:aws:iam::${ACCOUNT}:role/another-role\n  -         Resource: "*"\n  -         Sid: SessionPipelineReads`);
+    expect(twoRoles).not.toBe(REAL);
+    expect(() => check(twoRoles, null)).toThrow(/must replace exactly one role ARN/);
+    // The ARN is unknown under a different key than Principal.AWS / principal.
+    const sourceArn = edit(edit(REAL, "session-events", "  -             aws:SourceArn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742", () => `  -             aws:SourceArn: ${LIVE_ROLE}`),
+      "session-events", "  +             aws:SourceArn: arn:aws:s3:::96bulls-aws-sessions-prod-transcripts-941433935742", () => "  +             aws:SourceArn: (known after apply)");
+    expect(() => check(sourceArn)).toThrow(/session-events changes .*aws:SourceArn.* not only the role-ARN cascade/);
+  });
+
+  it("refuses a grant update without the cascade, and a state snapshot without the function's role", () => {
+    const noProps = REAL.replace(/\[session-pipeline-secret\] update\n[\s\S]*?(?=\n\[session-reconcile-continue\])/, "[session-pipeline-secret] update\n  no declared property changes\n");
+    expect(() => check(noProps)).toThrow(/session-pipeline-secret updates without the role-ARN cascade/);
+    expect(() => check(REAL, snapshot(null))).toThrow(/state snapshot has 0 session-pipeline records/);
+    expect(() => check(REAL, snapshot({ status: "creating", attr: { roleArn: LIVE_ROLE } }))).toThrow(/session-pipeline is not created in state/);
+    expect(() => check(REAL, snapshot({ status: "created", attr: {} }))).toThrow(/session-pipeline is not created in state/);
+    expect(() => check(REAL, "not json")).toThrow(/state snapshot is not valid JSON/);
+  });
+
+  it("refuses the cascade together with any other resource change", () => {
+    for (const r of ["trail", "transcript-reader", "transcripts-key-alias", "transcript-srv-writer"])
+      expect(() => check(op(REAL, r, "update"))).toThrow(/action set does not match the session pipeline rollout, update or post-apply/);
+    for (const r of ["session-events-dlq", "session-events-mapping", "session-reconcile-schedule", "session-reconcile-permission", "session-pipeline-errors-alarm"])
+      expect(() => check(op(REAL, r, "update"))).toThrow(new RegExp(`role-ARN cascade comes with other changes: ${r}:update`));
+    // A create alongside the update is neither rollout nor update.
+    expect(() => check(op(REAL, "session-events-dlq-alarm", "create"))).toThrow(/action set does not match the session pipeline rollout, update or post-apply/);
+    for (const action of ["replace", "delete"]) expect(() => check(op(REAL, "session-events-dlq", action))).toThrow(/forbidden action/);
+    // The grants cascade only because the function updates.
+    expect(() => check(REAL.replace("[session-pipeline] update\n  no declared property changes", "[session-pipeline] noop"))).toThrow(/update but session-pipeline does not/);
   });
 });
