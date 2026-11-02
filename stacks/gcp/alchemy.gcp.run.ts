@@ -67,6 +67,7 @@ import {
 } from "./apply-authorization.ts";
 import { requireServiceAccountActAs, type ServiceAccountActAsProof } from "./iam-preflight.ts";
 import { fetchRedisServerCa, redisAdminFetchTransport } from "./redis-ca.ts";
+import { ensureCloudSqlProtection, ensureLockerLifecycle } from "./data-retention.ts";
 import { PRIVATE_GOOGLE_APIS_RECORDS, assertInClusterJwks, bulls96NetworkPolicies, relayauthNetworkPolicies } from "./egress.ts";
 import {
   alleyoopWriteCondition,
@@ -84,6 +85,14 @@ interface EnsurePrivateCloudSqlInput {
   /** Resolved PSA output: establishes that the peering exists before the POST. */
   privateServiceConnection: string;
   proxyPrincipal: string;
+  authorization: GcpApplyAuthorizationProof;
+}
+
+interface EnsureDataRetentionInput {
+  projectId: string;
+  bucket: string;
+  /** The posted Cloud SQL instance; absent when the stage provisions no data plane. */
+  sqlInstance?: string;
   authorization: GcpApplyAuthorizationProof;
 }
 
@@ -279,6 +288,26 @@ const EnsureLockerWriteScopes = Alchemy.Action<
       ),
     );
     return { bucket: input.bucket, changed: result.changed };
+  }),
+);
+
+const EnsureDataRetention = Alchemy.Action<
+  "96Bulls.GCP.EnsureDataRetention",
+  EnsureDataRetentionInput,
+  { lifecycleChanged: boolean; sqlProtectionChanged: boolean | null },
+  GCP.GcpEnvironment
+>("96Bulls.GCP.EnsureDataRetention", (input) =>
+  Effect.gen(function* () {
+    assertGcpApplyLeaseActive(input.authorization);
+    const live = yield* GCP.GcpEnvironment.current.pipe(Effect.orDie);
+    if (live.project !== input.projectId || input.authorization.projectId !== input.projectId)
+      throw new Error("96bulls: data retention project differs from the resolved GCP project. Nothing was changed.");
+    const auth = { bearer: Redacted.value(live.accessToken) };
+    const lifecycle = yield* Effect.tryPromise(() => ensureLockerLifecycle(input.bucket, auth));
+    const sql = input.sqlInstance
+      ? yield* Effect.tryPromise(() => ensureCloudSqlProtection(input.projectId, input.sqlInstance!, auth))
+      : null;
+    return { lifecycleChanged: lifecycle.changed, sqlProtectionChanged: sql ? sql.changed : null };
   }),
 );
 
@@ -684,6 +713,14 @@ export default Alchemy.Stack(
             spec: sql,
             privateServiceConnection: privateServices.name,
             proxyPrincipal: workloadIdentityPrincipal(i, "96bulls", "cloud-sql-proxy"),
+            authorization: applyAuthorization,
+          });
+          // Deletion protection and retained backups on Cloud SQL; noncurrent-version
+          // expiry on the locker (data-retention.ts). After the poster: the instance exists.
+          yield* EnsureDataRetention("data-retention", {
+            projectId: i.projectId,
+            bucket: locker.bucketName,
+            sqlInstance: Output.map(sqlPoster.connectionName, () => sql.instanceName) as unknown as string,
             authorization: applyAuthorization,
           });
           const redis = yield* GCP.Redis.Instance("redis", {

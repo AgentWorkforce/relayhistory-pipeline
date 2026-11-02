@@ -181,11 +181,17 @@ The drill, 2026-11-02:
    generation back, and its SHA-256 matched the original. Every version was
    then removed (`drill versions left: 0`).
 
-Gaps found:
-- Deletion protection is off on the Cloud SQL instance, and deleting the
-  instance also deletes its automated backups.
-- The locker has no lifecycle rule, so noncurrent versions are kept
-  indefinitely; storage grows without bound.
+Gaps found, now closed by `stacks/gcp/data-retention.ts` (the
+`EnsureDataRetention` action reconciles both on every apply with a managed data
+plane, and reads them back):
+- Deletion protection was off on the Cloud SQL instance, and deleting the
+  instance also deleted its automated backups. Now `deletionProtectionEnabled`
+  and `retainBackupsOnDelete` are both on.
+- The locker had no lifecycle rule, so noncurrent versions were kept
+  indefinitely. Now there is exactly one rule: delete a noncurrent version 30
+  days after it became noncurrent. Live objects are never touched, and the 7-day
+  soft delete remains. Thirty days bounds both storage and how long an erased
+  or overwritten transcript lingers.
 
 ### Per-component bucket identities
 
@@ -858,7 +864,7 @@ Verify, only after an approved apply and a wired poster:
 Teardown, only after that apply, in this order:
 
 1. Delete the 96Bulls Helm release and the Cloud SQL proxy.
-2. Delete the Cloud SQL instance before the network. The poster is not an Alchemy resource, so `alchemy destroy` will not delete it until a later change puts it in the graph. Delete that instance by the prepared name if it exists.
+2. Delete the Cloud SQL instance before the network. The poster is not an Alchemy resource, so `alchemy destroy` will not delete it until a later change puts it in the graph. Delete that instance by the prepared name if it exists. The stack keeps deletion protection on (`stacks/gcp/data-retention.ts`), so first run `gcloud sql instances patch <name> --no-deletion-protection`, a deliberate step. `retainBackupsOnDelete` keeps its backups after the delete; remove them explicitly if the teardown must leave nothing.
 3. Empty the versioned GCS bucket. `forceDestroy` is false, so destroy fails while objects remain.
 4. `bunx alchemy destroy --config stacks/gcp/alchemy.gcp.run.ts --stage "$STAGE" --no-input` with the same confirm env. Let Alchemy delete the resources it tracks; do not pre-delete Redis, Pub/Sub, GKE, networking, the bucket, Artifact Registry, Secret Manager, or the runtime service account and leave stale state behind. APIs stay enabled because the stack sets `disableOnDestroy: false`.
 5. Read-only proof of empty: `gcloud sql instances list`, `gcloud redis instances list --region=us-central1`, `gcloud container clusters list`, `gcloud compute networks list`, and `gcloud storage ls` against `$PROJECT` return no lane resources. On this dedicated project, disable the listed APIs only after those checks are empty.
