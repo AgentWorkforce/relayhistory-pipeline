@@ -94,9 +94,29 @@ describe("Cloud SQL protection", () => {
     await expect(ensureCloudSqlProtection("Bad_Project", "pg", { bearer: "t" }, async () => json(200), 0)).rejects.toThrow("malformed");
   });
 
-  it("is wired into the stack after the Cloud SQL poster", () => {
+  it("never writes after the apply lease expired or was aborted", async () => {
+    let patches = 0;
+    const t = async (_u: string, init: RequestInit) => (init.method === "PATCH" ? (patches++, json(200, { name: "op" })) : json(200, { settings: {} }));
+    await expect(
+      ensureCloudSqlProtection("agentrelay-96bulls-soc2-2610", "pg", { bearer: "t" }, t, 0, 3, { expiresAtMs: Date.now() - 1 }),
+    ).rejects.toThrow("lease expired");
+    const ac = new AbortController();
+    ac.abort();
+    await expect(ensureCloudSqlProtection("agentrelay-96bulls-soc2-2610", "pg", { bearer: "t" }, t, 0, 3, { signal: ac.signal })).rejects.toThrow("interrupted");
+    await expect(ensureLockerLifecycle(BUCKET, { bearer: "t" }, async (_u, i) => (i.method === "PATCH" ? (patches++, json(200)) : json(200, {})), { expiresAtMs: Date.now() - 1 })).rejects.toThrow("lease expired");
+    expect(patches).toBe(0);
+  });
+
+  it("is wired into the stack: Cloud SQL protection right after the poster, lifecycle on every locker", () => {
     const stack = readFileSync(new URL("../alchemy.gcp.run.ts", import.meta.url), "utf8");
-    expect(stack.indexOf('EnsureDataRetention("data-retention"')).toBeGreaterThan(stack.indexOf('EnsurePrivateCloudSql("private-cloud-sql"'));
-    expect(stack).toContain("sqlInstance: Output.map(sqlPoster.connectionName, () => sql.instanceName)");
+    const poster = stack.indexOf('EnsurePrivateCloudSql("private-cloud-sql"');
+    const protection = stack.indexOf('EnsureCloudSqlProtection("cloud-sql-protection"');
+    expect(protection).toBeGreaterThan(poster);
+    // Nothing else is declared between the poster and its protection.
+    expect(stack.slice(poster, protection).match(/yield\* /g)?.length).toBe(1);
+    expect(stack).toContain('EnsureLockerLifecycle("locker-lifecycle", { bucket: locker.bucketName, authorization: applyAuthorization })');
+    // The lifecycle sits outside the managed-data-plane branch.
+    expect(stack.indexOf('EnsureLockerLifecycle("locker-lifecycle"')).toBeLessThan(stack.indexOf("const dataPlane = i.managedDataPlane.provision"));
+    for (const name of ["ensureCloudSqlProtection", "ensureLockerLifecycle"]) expect(stack).toMatch(new RegExp(`${name}\\([\\s\\S]{0,260}expiresAtMs: input\\.authorization\\.leaseExpiresAt \\* 1000,\\s*signal`));
   });
 });

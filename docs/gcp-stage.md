@@ -181,9 +181,10 @@ The drill, 2026-11-02:
    generation back, and its SHA-256 matched the original. Every version was
    then removed (`drill versions left: 0`).
 
-Gaps found, now closed by `stacks/gcp/data-retention.ts` (the
-`EnsureDataRetention` action reconciles both on every apply with a managed data
-plane, and reads them back):
+Gaps found, now closed by `stacks/gcp/data-retention.ts`. Two actions run on
+every apply: `EnsureCloudSqlProtection` right after the Cloud SQL poster, and
+`EnsureLockerLifecycle` on every stage's locker. Each reads first, writes only
+on a difference, never writes after the apply lease ends, and reads back:
 - Deletion protection was off on the Cloud SQL instance, and deleting the
   instance also deleted its automated backups. Now `deletionProtectionEnabled`
   and `retainBackupsOnDelete` are both on.

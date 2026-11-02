@@ -48,25 +48,40 @@ export interface RestAuth {
 }
 export type RestFetch = (url: string, init: RequestInit) => Promise<Response>;
 
+/** The apply mutation lease: no write may start once it is aborted or past its deadline. */
+export interface MutationLease {
+  expiresAtMs?: number;
+  signal?: AbortSignal;
+}
+
+function assertLeaseLive(lease: MutationLease | undefined, what: string): void {
+  if (lease?.signal?.aborted) throw new Error(`96bulls: apply was interrupted before the ${what} write. Nothing was changed.`);
+  if (lease?.expiresAtMs !== undefined && Date.now() >= lease.expiresAtMs)
+    throw new Error(`96bulls: the apply mutation lease expired before the ${what} write. Nothing was changed.`);
+}
+
 const reason = async (r: Response) => (await r.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 300);
 
 export async function ensureLockerLifecycle(
   bucket: string,
   auth: RestAuth,
   transport: RestFetch = fetch,
+  lease?: MutationLease,
 ): Promise<{ changed: boolean }> {
   if (!BUCKET.test(bucket)) throw new Error("96bulls: locker bucket name is malformed. Nothing was changed.");
   const url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}`;
   const headers = { authorization: `Bearer ${auth.bearer}`, "content-type": "application/json" };
   const read = async () => {
-    const r = await transport(`${url}?fields=lifecycle`, { method: "GET", headers });
+    const r = await transport(`${url}?fields=lifecycle`, { method: "GET", headers, signal: lease?.signal });
     if (!r.ok) throw new Error(`96bulls: locker lifecycle read failed with HTTP ${r.status}: ${await reason(r)}`);
     return ((await r.json()) as { lifecycle?: { rule?: LifecycleRule[] } }).lifecycle;
   };
   if (lifecycleMatches(await read())) return { changed: false };
+  assertLeaseLive(lease, "locker lifecycle");
   const w = await transport(`${url}?fields=lifecycle`, {
     method: "PATCH",
     headers,
+    signal: lease?.signal,
     body: JSON.stringify({ lifecycle: { rule: LOCKER_LIFECYCLE_RULES } }),
   });
   if (!w.ok) throw new Error(`96bulls: locker lifecycle write failed with HTTP ${w.status}: ${await reason(w)}`);
@@ -90,28 +105,31 @@ export async function ensureCloudSqlProtection(
   transport: RestFetch = fetch,
   pollMs = 3_000,
   maxPolls = 100,
+  lease?: MutationLease,
 ): Promise<{ changed: boolean }> {
   if (!PROJECT.test(project) || !INSTANCE.test(instance))
     throw new Error("96bulls: Cloud SQL project or instance name is malformed. Nothing was changed.");
   const base = `https://sqladmin.googleapis.com/v1/projects/${project}`;
   const headers = { authorization: `Bearer ${auth.bearer}`, "content-type": "application/json" };
   const settings = async (): Promise<SqlSettings> => {
-    const r = await transport(`${base}/instances/${instance}`, { method: "GET", headers });
+    const r = await transport(`${base}/instances/${instance}`, { method: "GET", headers, signal: lease?.signal });
     if (!r.ok) throw new Error(`96bulls: Cloud SQL instance read failed with HTTP ${r.status}: ${await reason(r)}`);
     return ((await r.json()) as { settings?: SqlSettings }).settings ?? {};
   };
   const protectedNow = (s: SqlSettings) => s.deletionProtectionEnabled === true && s.retainBackupsOnDelete === true;
   if (protectedNow(await settings())) return { changed: false };
+  assertLeaseLive(lease, "Cloud SQL protection");
   const p = await transport(`${base}/instances/${instance}`, {
     method: "PATCH",
     headers,
+    signal: lease?.signal,
     body: JSON.stringify({ settings: { deletionProtectionEnabled: true, retainBackupsOnDelete: true } }),
   });
   if (!p.ok) throw new Error(`96bulls: Cloud SQL protection patch failed with HTTP ${p.status}: ${await reason(p)}`);
   const op = ((await p.json()) as { name?: string }).name;
   if (!op || !/^[A-Za-z0-9-]+$/.test(op)) throw new Error("96bulls: Cloud SQL patch returned no operation.");
   for (let i = 0; i < maxPolls; i++) {
-    const r = await transport(`${base}/operations/${op}`, { method: "GET", headers });
+    const r = await transport(`${base}/operations/${op}`, { method: "GET", headers, signal: lease?.signal });
     if (!r.ok) throw new Error(`96bulls: Cloud SQL operation read failed with HTTP ${r.status}.`);
     const body = (await r.json()) as { status?: string; error?: unknown };
     if (body.status === "DONE") {
