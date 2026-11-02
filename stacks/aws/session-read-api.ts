@@ -88,6 +88,10 @@ export function sessionReadApiSecretPolicy(i: { roleArn: string }) {
   };
 }
 
+/** Production RelayAuth endpoints the read API verifies Cloud's assertions against. */
+export const RELAYAUTH_PROD_JWKS_URL = "https://api.relayauth.dev/.well-known/jwks.json";
+export const RELAYAUTH_PROD_ISSUER = "https://relayauth.dev";
+
 export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames; p: SessionReadApiInputs }) {
   return {
     DEPLOYMENT: i.stage,
@@ -97,6 +101,11 @@ export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames
     READ_API_COMPLETE_SINCE: i.p.completeSince,
     // Empty until the second apply: the app then refuses every token.
     READ_API_ORIGIN: i.p.origin ?? "",
+    // Production RelayAuth (the values relayhistory-cloud deploys with, repo vars RELAYAUTH_*).
+    // The shared verifier's fallback JWKS, https://relayauth.dev/.well-known/jwks.json, does not
+    // resolve, so without this every token failed the JWKS fetch and Cloud saw only 401s.
+    RELAYAUTH_JWKS_URL: RELAYAUTH_PROD_JWKS_URL,
+    RELAYAUTH_ISSUER: RELAYAUTH_PROD_ISSUER,
     NODE_OPTIONS: "--enable-source-maps",
   };
 }

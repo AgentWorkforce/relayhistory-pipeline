@@ -144,7 +144,8 @@ describe("session read api: inputs, grants and env", () => {
     const env = sessionReadApiEnv({ stage: STAGE, names: sessionReadApiNames(STAGE), p: { completeSince: "epoch" } });
     expect(env.READ_API_ORIGIN).toBe("");
     expect(env.SESSION_READ_API_SECRET_ARN).toBe("96bulls/aws-sessions-prod/session-read-api");
-    expect(Object.keys(env).some((k) => /PASSWORD|KEY$|TOKEN|URL$/.test(k))).toBe(false);
+    // RELAYAUTH_JWKS_URL is a public key-set location, not a credential; every other *URL stays banned.
+    expect(Object.keys(env).filter((k) => k !== "RELAYAUTH_JWKS_URL").some((k) => /PASSWORD|KEY$|TOKEN|URL$/.test(k))).toBe(false);
   });
 });
 
@@ -206,5 +207,16 @@ describe("session read api: Function URL (public by design, application auth)", 
     expect(routes.sort()).toEqual(["/health", "/v1/events", "/v1/sessions/:sessionId/events"]);
     expect(src).toContain('app.use("/v1/*", async (c, next) => {');
     expect(src).toMatch(/if \(!m\) return c\.json\(\{ error: \{ code: "missing_authorization"/);
+  });
+});
+
+import { sessionReadApiEnv as _envForJwks, sessionReadApiNames as _namesForJwks } from "../session-read-api.ts";
+describe("read api RelayAuth endpoints", () => {
+  // The verifier's fallback JWKS host (relayauth.dev) does not resolve; prod RelayAuth serves keys
+  // at api.relayauth.dev. Without these the deployed API answered 401 to every Cloud request.
+  it("sets the production JWKS URL and issuer", () => {
+    const env = _envForJwks({ stage: "aws-sessions-prod", names: _namesForJwks("aws-sessions-prod"), p: { completeSince: "2026-10-17T13:48:56.633Z" } as never });
+    expect(env.RELAYAUTH_JWKS_URL).toBe("https://api.relayauth.dev/.well-known/jwks.json");
+    expect(env.RELAYAUTH_ISSUER).toBe("https://relayauth.dev");
   });
 });
