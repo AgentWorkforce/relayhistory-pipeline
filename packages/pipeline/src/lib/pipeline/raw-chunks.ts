@@ -71,10 +71,14 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
  * digit groups), so `scrubText` never truncates it. Line endings are kept;
  * `records` counts complete lines.
  */
-export function scrubRecords(source: Uint8Array): {
+export function scrubRecords(
+  source: Uint8Array,
+  options: ScrubOptions = {},
+): {
   scrubbed: Uint8Array;
   records: number;
 } {
+  const bounded = options.oversize === "redact" ? scrubLongOrRedact : scrubBounded;
   let text: string;
   try {
     text = decoder.decode(source);
@@ -93,7 +97,7 @@ export function scrubRecords(source: Uint8Array): {
   let run = "";
   let keyOpen = false;
   const flush = () => {
-    if (run) out += scrubBounded(run);
+    if (run) out += bounded(run);
     run = "";
   };
   /** This line and at least CUT_CONTEXT_CHARS of what follows it. */
@@ -139,7 +143,7 @@ export function scrubRecords(source: Uint8Array): {
       // record that opens with `{` or `[` offers the rule only the bracket.)
       const safe = boundarySafe(i);
       flush();
-      const scrubbed = scrubRecordLine(line);
+      const scrubbed = scrubRecordLine(line, bounded);
       out += (safe ? scrubbed : redactLeadingString(scrubbed)) + ending;
       continue;
     }
@@ -173,7 +177,7 @@ export function scrubRecords(source: Uint8Array): {
     // and the record that closes the block would otherwise carry what follows its footer
     // into the run as unscrubbed JSON. Record scrubbing leaves a lone footer string intact,
     // so the block still pairs and is redacted whole.
-    const piece = keyOpen && isRecord(line) ? scrubRecordLine(line) : line;
+    const piece = keyOpen && isRecord(line) ? scrubRecordLine(line, bounded) : line;
     run += piece + ending;
     keyOpen = privateKeyOpenAfter(piece, keyOpen);
   }
@@ -535,6 +539,28 @@ export function scrubLong(text: string): string {
   return out + scrubText(rest);
 }
 
+/**
+ * What happens to a text `scrubLong` cannot segment (no safe cut: one unbroken
+ * run past the bound, such as canonical JSON evidence or a base64 dump).
+ * `refuse` (the default, every client-facing writer): `chunk_string_too_long`,
+ * so the client resends smaller chunks. `redact`: for a server-side writer
+ * whose input is final (a delivery batch the client cannot re-cut), the whole
+ * text becomes `oversizeRedaction`, so the record still lands and nothing
+ * unscrubbed is ever stored.
+ */
+export interface ScrubOptions {
+  oversize?: "refuse" | "redact";
+}
+
+/** What an over-bound text with no safe cut becomes under `oversize: "redact"`. */
+export function oversizeRedaction(chars: number): string {
+  return `[REDACTED: ${chars} characters exceed the ${MAX_SCRUB_CHARS}-character scrub limit and could not be segmented safely]`;
+}
+
+function scrubLongOrRedact(text: string): string {
+  return canScrubLong(text) ? scrubLong(text) : oversizeRedaction(text.length);
+}
+
 /** Whether `scrubLong` can take this text (it has safe cuts all the way). */
 export function canScrubLong(text: string): boolean {
   let rest = text;
@@ -567,7 +593,10 @@ interface ObjectKeys {
  * the same name both stay readable. A key the source itself repeated is kept
  * as the source had it.
  */
-function scrubRecordLine(line: string): string {
+function scrubRecordLine(
+  line: string,
+  scrub: (text: string) => string = scrubBounded,
+): string {
   // One entry per open container; null for an array.
   const stack: (ObjectKeys | null)[] = [];
   let out = "";
@@ -580,7 +609,7 @@ function scrubRecordLine(line: string): string {
       while (line[j] !== '"') j += line[j] === "\\" ? 2 : 1;
       const literal = line.slice(i, j + 1);
       const value = JSON.parse(literal) as string;
-      const scrubbed = scrubStringToken(literal, value);
+      const scrubbed = scrubStringToken(literal, value, scrub);
       let name = scrubbed;
       if (top?.expectKey) {
         const repeated = top.source.has(value);
@@ -625,20 +654,115 @@ function scrubRecordLine(line: string): string {
   return out;
 }
 
+// Ported from relayhistory-cloud #258 (df0eafe): one zstd frame workerd can always write.
 type ZstdCompress = (input: Uint8Array) => Uint8Array;
+
+const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
+/** RFC 8878 caps a block at 128 KiB. */
+const MAX_RAW_BLOCK = 128 * 1024;
+
+/**
+ * One standard zstd frame holding `input` in Raw (uncompressed) blocks (RFC
+ * 8878 §3.1.1): single segment, 4-byte content size, no checksum. Every zstd
+ * decoder reads it as one ordinary frame, so readers that decode only the
+ * first frame of a stream (Node's and workerd's `zstdDecompressSync` do, for
+ * some sizes) still get every byte. Used when compression cannot be trusted.
+ */
+export function rawZstdFrame(input: Uint8Array): Uint8Array {
+  if (input.byteLength > 0xffff_ffff)
+    throw new PipelineError("chunk_too_large", "chunk exceeds 4 GiB", false);
+  const blocks = Math.max(1, Math.ceil(input.byteLength / MAX_RAW_BLOCK));
+  const out = new Uint8Array(4 + 1 + 4 + blocks * 3 + input.byteLength);
+  out.set(ZSTD_MAGIC, 0);
+  // Frame_Header_Descriptor: FCS flag 2 (4 bytes), Single_Segment 1.
+  out[4] = 0xa0;
+  new DataView(out.buffer).setUint32(5, input.byteLength, true);
+  let o = 9;
+  for (let b = 0; b < blocks; b++) {
+    const start = b * MAX_RAW_BLOCK;
+    const size = Math.min(MAX_RAW_BLOCK, input.byteLength - start);
+    const last = b === blocks - 1 ? 1 : 0;
+    // Block_Header: Last_Block (bit 0), Block_Type Raw = 0 (bits 1-2), Block_Size (bits 3-23).
+    const header = last | (size << 3);
+    out[o] = header & 0xff;
+    out[o + 1] = (header >>> 8) & 0xff;
+    out[o + 2] = (header >>> 16) & 0xff;
+    o += 3;
+    out.set(input.subarray(start, start + size), o);
+    o += size;
+  }
+  return out;
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** workerd's `zstdCompressSync` fails past about 40 KiB of output (1.20260617). */
+const WORKERD =
+  typeof navigator !== "undefined" &&
+  navigator.userAgent === "Cloudflare-Workers";
+const WORKERD_MAX_COMPRESSED = 36 * 1024;
+const SAMPLE_BYTES = 64 * 1024;
+
 let zstd: Promise<ZstdCompress | null> | undefined;
 /**
- * `node:zlib`'s zstd encoder, when this runtime has one (Node 22.15+; a
- * Worker only with a zlib that carries zstd). Feature-detected, like the
- * request-body decoder, so a runtime without it fails one write, not the load.
+ * A zstd encoder that always produces one frame that decodes to `input`.
+ *
+ * `node:zlib`'s `zstdCompressSync` is tried first. workerd 1.20260617 throws
+ * `Error("Unexpected end of file")` from it once the compressed output passes
+ * about 40 KiB, and its streaming compressor fails at irregular sizes, so the
+ * output is verified by decompressing it. On any error or mismatch the input
+ * is stored in Raw blocks (`rawZstdFrame`): larger, never wrong. Splitting
+ * into several compressed frames was rejected: Node's and workerd's
+ * `zstdDecompressSync` silently return only the first frame for some inputs.
+ *
+ * Feature-detected, like the request-body decoder: without `node:zlib` zstd
+ * every chunk is stored raw.
  */
 function zstdEncoder(): Promise<ZstdCompress | null> {
   zstd ??= import("node:zlib").then(
-    (zlib) =>
-      typeof zlib.zstdCompressSync === "function"
-        ? (input) => new Uint8Array(zlib.zstdCompressSync(input))
-        : null,
-    () => null,
+    (zlib) => {
+      const compress =
+        typeof zlib.zstdCompressSync === "function"
+          ? zlib.zstdCompressSync
+          : null;
+      const decompress =
+        typeof zlib.zstdDecompressSync === "function"
+          ? zlib.zstdDecompressSync
+          : null;
+      return (input: Uint8Array) => {
+        if (compress && decompress) {
+          // In workerd a chunk whose compressed output would pass the
+          // compressor's limit ends up Raw anyway: predict it from the first
+          // SAMPLE_BYTES and skip the doomed full compress and verify.
+          if (WORKERD && input.byteLength > SAMPLE_BYTES) {
+            try {
+              const sample = compress(input.subarray(0, SAMPLE_BYTES));
+              const projected =
+                (sample.byteLength / SAMPLE_BYTES) * input.byteLength;
+              if (projected > WORKERD_MAX_COMPRESSED)
+                return rawZstdFrame(input);
+            } catch {
+              return rawZstdFrame(input);
+            }
+          }
+          try {
+            const packed = new Uint8Array(compress(input));
+            const back = decompress(packed, {
+              maxOutputLength: Math.max(1, input.byteLength),
+            });
+            if (sameBytes(new Uint8Array(back), input)) return packed;
+          } catch {
+            // Fall through to Raw blocks.
+          }
+        }
+        return rawZstdFrame(input);
+      };
+    },
+    () => (input: Uint8Array) => rawZstdFrame(input),
   );
   return zstd;
 }
@@ -648,6 +772,8 @@ export async function rawChunkSealingAvailable() {
 }
 
 export interface SealRawChunk {
+  /** A text with no safe cut: refused (default) or redacted (`ScrubOptions`). */
+  oversize?: ScrubOptions["oversize"];
   location: SessionLocation;
   format: RawFormat;
   seq: number;
@@ -706,7 +832,9 @@ export async function sealRawChunk(
     sourceSha,
     input.format,
   );
-  const { scrubbed, records } = scrubRecords(input.source);
+  const { scrubbed, records } = scrubRecords(input.source, {
+    oversize: input.oversize,
+  });
   const stored = compress(scrubbed);
   const base: SourceFields = {
     seq: input.seq,

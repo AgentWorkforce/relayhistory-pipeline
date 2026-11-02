@@ -348,6 +348,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261101000200_claimless_window_activations.sql`     | table sessions.claimless_window_activations                                                                             |
 | `upstream:20261101050000_session_directory_list.sql`           | table sessions.session_directory_agents                                                                                 |
 | `upstream:20261102000000_session_briefs.sql`                   | table sessions.session_briefs                                                                                           |
+| `upstream:20261102010000_session_ingest_ledger.sql`            | table sessions.ingest_batches                                                                                           |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
