@@ -33,8 +33,8 @@ function naiveScrub(text: string): string {
 }
 
 describe("scrubLong (scrub rule set version 2)", () => {
-  it("is version 2", () => {
-    expect(SCRUB_RULESET_VERSION).toBe(2);
+  it("is version 2 or later (3 adds rules, keeps the segmenter)", () => {
+    expect(SCRUB_RULESET_VERSION).toBeGreaterThanOrEqual(2);
   });
 
   it("keeps a long text whole and scrubs secrets anywhere in it, including at the bound", () => {
@@ -97,7 +97,7 @@ describe("sealRawChunk with a record over the old bound (revert-fails)", () => {
       startOffset: 0,
       source,
     });
-    expect(sealed.scrub).toEqual({ ruleset: "relayhistory-scrub", version: 2 });
+    expect(sealed.scrub).toEqual({ ruleset: "relayhistory-scrub", version: SCRUB_RULESET_VERSION });
     const stored = new TextDecoder().decode(zstdDecompressSync(await readAll(await store.get(sealed.key as never))));
     const out = (JSON.parse(stored) as { payload: { output: string } }).payload.output;
     expect(out).not.toContain(AWS);

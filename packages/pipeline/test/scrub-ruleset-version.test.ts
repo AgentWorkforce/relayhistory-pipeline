@@ -20,6 +20,10 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Updated before release (K-1, K-2: key-block segmentation fixes). Version 2 had
   // sealed no chunk: it was only ever on the unmerged #108 branch, and images build from main.
   2: "417d545e6b79b1100e206e7a6add66f24819868b2606e9ca2c45c09be9644ee2",
+  // Quoted secret keys at any JSON escaping depth, Cloudflare scannable tokens and
+  // more provider prefixes, non-Bearer Authorization, and the entropy fallback next
+  // to a secret name (2026-11-02 Cloudflare-token-in-transcript finding).
+  3: "4f9212e178e3b1536f234230c3997edc1e0f78d63821a5d34b659e0e07415cd3",
 };
 
 const read = (rel: string) =>

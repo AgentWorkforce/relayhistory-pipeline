@@ -45,8 +45,14 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  * - 2: the same rules; a longer string or run is scrubbed whole, in segments
  *   cut only where no rule can match across the cut (`scrubLong`). Output for
  *   anything within the bound is byte-identical to version 1.
+ * - 3: version 2's segmenter with new rules: quoted secret keys at any JSON
+ *   escaping depth (`\"password\": \"…\"`), Cloudflare `cfut_`/`cfat_`/`cfk_`
+ *   tokens, GitHub fine-grained, GitLab, npm, Hugging Face, SendGrid and
+ *   Slack webhook credentials, non-Bearer `Authorization` schemes, and a
+ *   high-entropy fallback only next to a secret name. Chunks sealed at 1 or 2
+ *   may hold secrets these rules now catch.
  */
-export const SCRUB_RULESET_VERSION = 2;
+export const SCRUB_RULESET_VERSION = 3;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";
