@@ -17,9 +17,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   // From version 2 the digest also covers the segmenter in raw-chunks.ts
   // (between the `<scrub-segmenter>` markers): texts past MAX_SCRUB_CHARS are
   // scrubbed whole, in segments, where version 1 refused them.
-  // Updated once before release (K-1: no cut inside a closed key block). Version 2 had
+  // Updated before release (K-1, K-2: key-block segmentation fixes). Version 2 had
   // sealed no chunk: it was only ever on the unmerged #108 branch, and images build from main.
-  2: "8f698d4ecd7a839d6735cc72acac8f82c16448e3cc65e83f56200320675d200b",
+  2: "417d545e6b79b1100e206e7a6add66f24819868b2606e9ca2c45c09be9644ee2",
 };
 
 const read = (rel: string) =>

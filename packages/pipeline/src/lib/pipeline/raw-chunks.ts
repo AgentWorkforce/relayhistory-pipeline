@@ -168,8 +168,14 @@ export function scrubRecords(source: Uint8Array): {
       flush();
       run = carry;
     }
-    run += line + ending;
-    keyOpen = privateKeyOpenAfter(line, keyOpen);
+    // Inside an open key block a record line joins the run record-scrubbed, not raw (K-2):
+    // raw JSON escapes hide tokens from the text rules (`\nghp_...` has no word boundary),
+    // and the record that closes the block would otherwise carry what follows its footer
+    // into the run as unscrubbed JSON. Record scrubbing leaves a lone footer string intact,
+    // so the block still pairs and is redacted whole.
+    const piece = keyOpen && isRecord(line) ? scrubRecordLine(line) : line;
+    run += piece + ending;
+    keyOpen = privateKeyOpenAfter(piece, keyOpen);
   }
   flush();
   return { scrubbed: encoder.encode(out), records };
@@ -330,13 +336,25 @@ const PEM_END_SRC = "-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----";
 const pemBegin = () => new RegExp(PEM_BEGIN_SRC, "g");
 const pemEnd = () => new RegExp(PEM_END_SRC, "g");
 
-/** Whether a private-key block is still open after `line`. */
+/**
+ * Whether a private-key block is still open after `line`, pairing header and footer
+ * in order exactly as `keyBlockSpans` and the PEM rule do: a footer only counts after
+ * the header's own match. (Taking the last marker instead disagreed on a header that
+ * shares its dashes with a footer, `-----BEGIN … KEY-----END … KEY-----`: the rule sees
+ * that block open, so it must be open here too.)
+ */
 function privateKeyOpenAfter(line: string, open: boolean) {
-  const marks = [
-    ...[...line.matchAll(pemBegin())].map((m) => [m.index, true] as const),
-    ...[...line.matchAll(pemEnd())].map((m) => [m.index, false] as const),
-  ].sort((a, b) => a[0] - b[0]);
-  return marks.length ? marks[marks.length - 1]![1] : open;
+  const PEM_BEGIN = pemBegin();
+  const PEM_END = pemEnd();
+  let at = 0;
+  for (;;) {
+    const re = open ? PEM_END : PEM_BEGIN;
+    re.lastIndex = at;
+    const m = re.exec(line);
+    if (!m) return open;
+    at = m.index + m[0].length;
+    open = !open;
+  }
 }
 
 /**
@@ -367,9 +385,18 @@ function keyBlockSpans(text: string): Array<[number, number]> {
   return spans;
 }
 
-/** The key block `cut` falls strictly inside, if any. */
+/** The key block `cut` falls strictly inside, if any (spans are sorted and disjoint: binary search). */
 function keyBlockAround(spans: Array<[number, number]>, cut: number): [number, number] | undefined {
-  return spans.find(([start, end]) => cut > start && cut < end);
+  let lo = 0;
+  let hi = spans.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const [start, end] = spans[mid]!;
+    if (cut <= start) hi = mid - 1;
+    else if (cut >= end) lo = mid + 1;
+    else return spans[mid];
+  }
+  return undefined;
 }
 
 /** A record line whose first token is a JSON string, with that string redacted (still valid JSON). */

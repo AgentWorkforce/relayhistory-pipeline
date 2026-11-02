@@ -437,3 +437,25 @@ describe("a cut never lands inside a private-key block that closed before the ov
       expect(out).not.toContain("-----END RSA PRIVATE KEY");
     });
 });
+
+// ------------------------- independent re-review of 7f0035a (K-2 and shared dashes)
+
+describe("a record inside an open key block joins the run record-scrubbed (K-2)", () => {
+  it("a token after the footer in the closing record is redacted, as on main", () => {
+    const tok = "ghp_AbcdEFGHijklMNOPqrstUVWX12";
+    const rec = JSON.stringify({ t: "-----END RSA PRIVATE KEY-----", out: "first line\n" + tok + " more" });
+    const out = dec.decode(scrubRecords(enc.encode(`-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n${rec}\n`)).scrubbed);
+    expect(out).not.toContain(tok);
+    expect(out).not.toContain("MIIabc");
+  });
+});
+
+describe("a header that shares its dashes with a footer leaves the block open, as the rule does", () => {
+  const body = "MIIEow" + "Q".repeat(58) + "5";
+  it("a record line after it does not flush the key body out unredacted", () => {
+    const text = `x\n-----BEGIN RSA PRIVATE KEY-----END RSA PRIVATE KEY-----\n{"a":1}\n${body}\n`;
+    expect(scrubText(text)).not.toContain(body);
+    const out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
+    expect(out).not.toContain(body);
+  });
+});
