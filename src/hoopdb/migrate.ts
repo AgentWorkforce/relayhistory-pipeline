@@ -729,6 +729,24 @@ async function cliHistoryPreflight(
   }
 }
 
+/** Read-only: does the ledger lack any migration this image would apply? */
+async function pendingMigrationsExist(
+  client: MigrationClient,
+): Promise<boolean> {
+  const has = await client.query<{ t: string | null }>(
+    `SELECT to_regclass('${MIGRATION_LEDGER}')::text AS t`,
+  );
+  if (!has.rows[0]?.t) return true;
+  const done = new Set(
+    (
+      await client.query<{ name: string }>(
+        `SELECT name FROM ${MIGRATION_LEDGER}`,
+      )
+    ).rows.map((r) => r.name),
+  );
+  return (await expectedMigrationNames()).some((n) => !done.has(n));
+}
+
 function migrationProfileMode(): FunctionBoundaryMode | undefined {
   const v = process.env.HOOPDB_FUNCTION_BOUNDARY_MODE;
   return v === "global-default-revoke" || v === "event-trigger" ? v : undefined;
@@ -811,11 +829,19 @@ if (import.meta.main) {
       // mode has no drift check, so neither runs there.
       dbMode === "local" || !process.env.HOOPDB_RUNTIME_ROLE
         ? Promise.resolve(null)
-        : sessionsFunctionAclPreview(db, process.env.HOOPDB_RUNTIME_ROLE),
+        : pendingMigrationsExist(db).then((pending) =>
+            sessionsFunctionAclPreview(
+              db,
+              process.env.HOOPDB_RUNTIME_ROLE!,
+              pending,
+            ),
+          ),
     ])
       .then(async ([e, migration_checksum_aliases, acl]) => {
         const satisfied =
-          e.satisfied && (acl?.function_acl_drift_extra.length ?? 0) === 0;
+          e.satisfied &&
+          (acl?.function_acl_drift_extra.length ?? 0) === 0 &&
+          (acl?.function_acl_missing_refused.length ?? 0) === 0;
         console.log(
           JSON.stringify({
             ...e,

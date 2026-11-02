@@ -1840,7 +1840,7 @@ const activationCheck = (
   };
 };
 await check(
-  "read-only ACL drift preview in --activation-check (selfhosted): clean migrate both lists empty (exit 0); an extra GRANT to authenticated is extra (exit 1); a missing runtime grant is missing only (exit 0); nothing is changed",
+  "read-only ACL drift preview in --activation-check (selfhosted): clean migrate all lists empty (exit 0); an extra GRANT to authenticated is extra (exit 1); a missing runtime grant is missing only (exit 0); nothing is changed; a missing service_role manifest grant and a duplicate-grantor surplus are refused by both the preview (exit 1) and migrate (function_acl_drift)",
   async () => {
     await fresh("g6_prev", ["g6_rt2"]);
     const env = {
@@ -1869,13 +1869,45 @@ await check(
     ).rows[0]!.g;
     const repaired = migrate("g6_prev", SEQ);
     const after = activationCheck("g6_prev", env);
+    // A missing NON-runtime manifest grant: nothing re-adds it, so the preview (exit 1)
+    // and the real migrate (function_acl_drift) agree.
+    await sql(
+      "g6_prev",
+      "REVOKE EXECUTE ON FUNCTION sessions.repo_backfill_report() FROM service_role",
+      "hoop",
+    );
+    const refusedPreview = activationCheck("g6_prev", env);
+    const refusedMigrate = migrate("g6_prev", SEQ);
+    await sql(
+      "g6_prev",
+      "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO service_role",
+      "hoop",
+    );
+    // The same grantee:privilege from a second grantor: a surplus for both.
+    await attempt("postgres", "DROP ROLE IF EXISTS g6_grantor");
+    await sql("postgres", "CREATE ROLE g6_grantor NOLOGIN");
+    await sql(
+      "g6_prev",
+      `GRANT USAGE ON SCHEMA sessions TO g6_grantor;
+       GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO g6_grantor WITH GRANT OPTION`,
+      "hoop",
+    );
+    await sql(
+      "g6_prev",
+      "SET ROLE g6_grantor; GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO service_role",
+    );
+    const dupPreview = activationCheck("g6_prev", env);
+    const dupMigrate = migrate("g6_prev", SEQ);
     await attempt("postgres", "DROP DATABASE IF EXISTS g6_prev WITH (FORCE)");
+    await attempt("postgres", "DROP ROLE IF EXISTS g6_grantor");
     const lists = (c: { evidence: Record<string, unknown> }) => ({
       extra: c.evidence.function_acl_drift_extra,
       missing: c.evidence.function_acl_missing,
+      refused: c.evidence.function_acl_missing_refused,
     });
     const empty = (c: { evidence: Record<string, unknown> }) =>
-      JSON.stringify(lists(c)) === JSON.stringify({ extra: [], missing: [] });
+      JSON.stringify(lists(c)) ===
+      JSON.stringify({ extra: [], missing: [], refused: [] });
     return [
       m.exit === 0 &&
         clean.status === 0 &&
@@ -1892,12 +1924,28 @@ await check(
           JSON.stringify({
             extra: [],
             missing: ["sessions.jwt_org_id(): g6_rt2:EXECUTE"],
+            refused: [],
           }) &&
         stillMissing === false &&
         repaired.exit === 0 &&
         after.status === 0 &&
-        empty(after),
-      `clean=${clean.status}:${fmt(lists(clean))} extra=${extra.status}:${fmt(lists(extra))} missing=${missing.status}:${fmt(lists(missing))} read_only=${stillMissing === false} repaired=${fmt(repaired)} after=${after.status}`,
+        empty(after) &&
+        refusedPreview.status === 1 &&
+        JSON.stringify(lists(refusedPreview)) ===
+          JSON.stringify({
+            extra: [],
+            missing: [],
+            refused: ["sessions.repo_backfill_report(): service_role:EXECUTE"],
+          }) &&
+        refusedMigrate.code === "function_acl_drift" &&
+        dupPreview.status === 1 &&
+        JSON.stringify(dupPreview.evidence.function_acl_drift_extra) ===
+          JSON.stringify([
+            "sessions.repo_backfill_report(): g6_grantor:EXECUTE*",
+            "sessions.repo_backfill_report(): service_role:EXECUTE",
+          ]) &&
+        dupMigrate.code === "function_acl_drift",
+      `clean=${clean.status}:${fmt(lists(clean))} extra=${extra.status}:${fmt(lists(extra))} missing=${missing.status}:${fmt(lists(missing))} read_only=${stillMissing === false} repaired=${fmt(repaired)} after=${after.status} refused=${refusedPreview.status}:${fmt(lists(refusedPreview))}/${fmt(refusedMigrate)} dup=${dupPreview.status}:${fmt(dupPreview.evidence.function_acl_drift_extra)}/${fmt(dupMigrate)}`,
     ];
   },
 );
