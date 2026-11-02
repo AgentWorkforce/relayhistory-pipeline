@@ -30,7 +30,10 @@ recorded in the inputs' `approval` record where the stack checks it
 | Budget | `96bulls-aws-sessions-prod-monthly` | Alarm at 80% actual and 100% forecast of `budgetUsd`. |
 
 Nothing else: no Locker, ECR, GitHub OIDC, EKS or Supabase (the inputs refuse
-them), and no access keys (see "Credentials").
+them), and no access keys (see "Credentials"). The one opt-in addition is the
+session pipeline (`transcriptStore.sessionPipeline`: SQS, a Lambda, its secret
+and alarms), which adds a read-only grant for its execution role to the key
+policy and the bucket policy; see `runbooks/sessions-prod-session-pipeline.md`.
 
 Key layout (the 96Bulls pipeline's org-prefix mode, `stacks/aws/tenants.ts`):
 

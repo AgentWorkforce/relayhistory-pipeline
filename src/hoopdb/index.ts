@@ -46,17 +46,28 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         machine_id: pointer.machineId ?? ctx.machineId ?? "unknown",
       };
       if (pointer.deleted) {
-        await deps.db.query(
+        // Fenced on the deleted key: one row (org, ws, harness, session, machine)
+        // can be fed by two keys when a session's start date moves (the d=
+        // segment is in the key, not in the row's identity). Deleting the old
+        // key must not tombstone a row that already names the new one.
+        const { rows: tombstoned } = await deps.db.query(
           `UPDATE sessions.session_index SET deleted_at = now(), indexed_at = now()
-            WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
+            WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5
+              AND manifest_key = $6
+            RETURNING 1`,
           [
             pk.org_id,
             pk.workspace_id,
             pk.harness,
             pk.session_id,
             pk.machine_id,
+            pointer.manifestKey,
           ],
         );
+        if (tombstoned.length === 0) {
+          log.info("pointer tombstone skipped", { stage: "session-indexed", reason: "row_names_another_key" });
+          return { status: "skipped", reason: "row_names_another_key" };
+        }
         // Propagate to the logical directory: clear the summary now (it may include this
         // machine's content), then re-project. With machines still live the projector
         // rebuilds metadata and memberships; with none left it tombstones the row and

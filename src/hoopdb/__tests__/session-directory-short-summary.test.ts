@@ -1355,6 +1355,7 @@ describe("short_summary deletion propagation", () => {
           harness: "codex",
           sessionId: "s-1",
           machineId: machine,
+          manifestKey: `key/${machine}`,
         } as never,
         { orgId: "org-a" } as never,
       );
