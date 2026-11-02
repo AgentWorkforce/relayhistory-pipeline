@@ -5,6 +5,7 @@
  *
  *   bun scripts/aws-hardening-mutations.ts            # all mutations
  *   bun scripts/aws-hardening-mutations.ts --list     # names only
+ *   bun scripts/aws-hardening-mutations.ts --only "read api"   # names containing it
  *
  * Each mutation edits one file in place, runs the named test files, and
  * restores the file (also on error or Ctrl-C). Run it on a clean tree.
@@ -131,10 +132,37 @@ const M: Mutation[] = [
   { name: "session pipeline update: deploy cascade accepts several or non-role ARNs", file: "stacks/aws/transcript-store.ts", from: "  if (replaced.size !== 1 || ![...replaced].every((arn) => role.test(arn)))\n", to: "  if (false)\n", tests: [`${S}session-pipeline.test.ts`], expect: ["a different ARN"] },
   { name: "session pipeline update: cascade alongside other pipeline changes accepted", file: "stacks/aws/transcript-store.ts", from: "  if (others.length) refuse(", to: "  if (false) refuse(", tests: [`${S}session-pipeline.test.ts`], expect: ["any other resource change"] },
   { name: "session pipeline update: cascade accepted without the function updating", file: "stacks/aws/transcript-store.ts", from: "  if (operations.get(\"session-pipeline\") !== \"update\")\n", to: "  if (false)\n", tests: [`${S}session-pipeline.test.ts`], expect: ["any other resource change"] },
+  // Session read API (stacks/aws/session-read-api.ts, src/session-read-api).
+  { name: "read api secret readable by any principal", file: "stacks/aws/session-read-api.ts", from: 'Principal: { AWS: i.roleArn }, Action: "secretsmanager:GetSecretValue"', to: 'Principal: "*", Action: "secretsmanager:GetSecretValue"', tests: [`${S}session-read-api.test.ts`], expect: ["only the function's own role reads the secret"] },
+  { name: "read api rolls out together with store changes", file: "stacks/aws/transcript-store.ts", from: '  if (!others.every(([, a]) => a === "noop")) return undefined;', to: "", tests: [`${S}session-read-api.test.ts`], expect: ["refuses a read api change together with any store or pipeline change"] },
+  { name: "read api value predicates only on candidates (stale version served)", file: "src/session-read-api/queries.ts", from: "FROM (${newest})${value.length ? ` WHERE ${value.join(\" AND \")}` : \"\"}", to: "FROM (${newest})", tests: ["./src/session-read-api/__tests__/page.clickhouse.test.ts"], expect: ["never matched through its stale predecessor", "filtered on the newest value"] },
+  { name: "read api candidates not deduped before LIMIT", file: "src/session-read-api/queries.ts", from: "const limited = `ORDER BY ${ord} LIMIT 1 BY ${KEY_BY} LIMIT {n:UInt32}`;", to: "const limited = `ORDER BY ${ord} LIMIT {n:UInt32}`;", tests: ["./src/session-read-api/__tests__/page.clickhouse.test.ts"], expect: ["pagination is exact"] },
+  { name: "read api short page without a cursor", file: "src/session-read-api/page.ts", from: "  } else if (candidates.length >= input.limit) {", to: "  } else if (rows.length >= input.limit) {", tests: ["./src/session-read-api/__tests__/page.clickhouse.test.ts"], expect: ["always carries a cursor"] },
+  { name: "read api tenant recheck removed", file: "src/session-read-api/page.ts", from: "    if (r.org_id !== input.orgId || r.workspace_id !== input.workspaceId) throw new TenantMismatchError();", to: "", tests: ["./src/session-read-api/__tests__/page.clickhouse.test.ts"], expect: ["is refused, not served"] },
+  { name: "read api erased sessions served", file: "src/session-read-api/page.ts", from: "  const live = kept.filter((r) => !erased.has(keyOf({ source: r.source, sessionId: r.session_id })));", to: "  const live = kept;", tests: ["./src/session-read-api/__tests__/page.clickhouse.test.ts"], expect: ["tombstoned in Supabase is dropped"] },
+  { name: "read api accepts tokens for another origin", file: "src/session-read-api/auth.ts", from: "    if (auth.historyOrigin !== config.origin) throw", to: "    if (false) throw", tests: ["./src/session-read-api/__tests__/app.test.ts"], expect: ["origin binding is checked here too"] },
+  { name: "read api honours alternative tenancy claims", file: "src/session-read-api/auth.ts", from: "      strip(claims.org) !== auth.orgId ||", to: "      false ||", tests: ["./src/session-read-api/__tests__/app.test.ts"], expect: ["ambiguous tenancy is refused"] },
+  { name: "read api workspace param not attested", file: "src/session-read-api/app.ts", from: '  if (all[0] !== identity.workspaceId) throw new HttpError(403', to: '  if (false) throw new HttpError(403', tests: ["./src/session-read-api/__tests__/app.test.ts"], expect: ["workspace must equal the token's"] },
+  { name: "read api candidate union branches not deduped", file: "src/session-read-api/queries.ts", from: "UNION ALL ${branch(titlePred)}) ${limited}", to: "UNION ALL ${branch(titlePred)}) ORDER BY ${ord} LIMIT {n:UInt32}", tests: ["./src/session-read-api/__tests__/page.clickhouse.test.ts"], expect: ["one candidate, not two"] },
+  { name: "read api partial session served (needs_full ignored on session reads)", file: "src/session-read-api/app.ts", from: "    if (!continuing && (await partialSessions(pageDeps(), identity.orgId, sessionId)).length > 0) throw unsupported(\"session_partial\");\n", to: "", tests: ["./src/session-read-api/__tests__/app.test.ts", "./src/session-read-api/__tests__/page.clickhouse.test.ts"], expect: ["first page is 501 session_partial", "stale rows are never served"] },
+  { name: "read api search ignores partial sessions", file: "src/session-read-api/app.ts", from: "      if (cursor === undefined && (await partialSessions(pageDeps(), identity.orgId)).length > 0) throw unsupported(\"session_partial\");\n", to: "", tests: ["./src/session-read-api/__tests__/app.test.ts", "./src/session-read-api/__tests__/page.clickhouse.test.ts"], expect: ["starts at relayhistory while any session", "stale rows are never served"] },
+  { name: "read api partial state from any row, not the latest", file: "src/session-read-api/queries.ts", from: "HAVING argMax(needs_full, synced_at) = 1", to: "HAVING max(needs_full) = 1", tests: ["./src/session-read-api/__tests__/page.clickhouse.test.ts"], expect: ["follow the pipeline's latest state row"] },
+  { name: "read api partial check repeated on cursor pages", file: "src/session-read-api/app.ts", from: "    if (!continuing && (await partialSessions(", to: "    if ((await partialSessions(", tests: ["./src/session-read-api/__tests__/app.test.ts"], expect: ["checked when pagination starts"] },
+  { name: "read api floor cursor page ends in a 501", file: "src/session-read-api/app.ts", from: "        if (cursor === undefined) throw unsupported(\"history_floor\");", to: "        throw unsupported(\"history_floor\");", tests: ["./src/session-read-api/__tests__/app.test.ts"], expect: ["ends cleanly with a relayhistory continuation"] },
+  { name: "read api continuation overlaps the floor", file: "src/session-read-api/app.ts", from: "return new Date(floorMs - 1).toISOString().replace(/Z$/, \"999Z\");", to: "return new Date(floorMs).toISOString();", tests: ["./src/session-read-api/__tests__/app.test.ts"], expect: ["one microsecond below the floor", "ends cleanly with a relayhistory continuation"] },
+  { name: "read api Function URL opens CORS to any origin", file: "stacks/aws/session-read-api.ts", from: "functionUrl: { authType: \"NONE\" as const, invokeMode: \"BUFFERED\" as const },", to: "functionUrl: { authType: \"NONE\" as const, invokeMode: \"BUFFERED\" as const, cors: { allowOrigins: [\"*\"] } },", tests: [`${S}session-read-api.test.ts`], expect: ["declares exactly a buffered NONE-auth URL"] },
+  { name: "read api continuation page not flagged", file: "src/session-read-api/app.ts", from: "        c.header(\"X-Sessions-Read-Continuation\", \"history_floor\");\n", to: "", tests: ["./src/session-read-api/__tests__/app.test.ts"], expect: ["ends cleanly with a relayhistory continuation"] },
+  { name: "read api RLS policy not tenant-bound", file: "supabase/bootstrap/session_read_api_role.sql", from: "    org_id = current_setting('bulls96_read.org_id', true)\n    AND workspace_id = current_setting('bulls96_read.workspace_id', true)", to: "    true", tests: ["./src/session-read-api/__tests__/liveness.pglite.test.ts"], expect: ["only for the tenant the transaction bound", "verification"] },
 ];
 
+const onlyAt = process.argv.indexOf("--only");
+const only = onlyAt >= 0 ? process.argv[onlyAt + 1] : undefined;
+if (onlyAt >= 0 && !only) throw new Error("--only needs a name substring");
+const selected = only ? M.filter((m) => m.name.includes(only)) : M;
+if (only && selected.length === 0) throw new Error(`--only ${JSON.stringify(only)} matches no mutation`);
+
 if (process.argv.includes("--list")) {
-  for (const m of M) console.log(m.name);
+  for (const m of selected) console.log(m.name);
   process.exit(0);
 }
 
@@ -142,7 +170,7 @@ let restore: (() => void) | undefined;
 for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => (restore?.(), process.exit(130)));
 
 let failures = 0;
-for (const m of M) {
+for (const m of selected) {
   const path = `${ROOT}${m.file}`;
   const original = readFileSync(path, "utf8");
   const count = original.split(m.from).length - 1;
@@ -171,5 +199,5 @@ for (const m of M) {
     restore = undefined;
   }
 }
-console.log(`${M.length - failures}/${M.length} mutations caught`);
+console.log(`${selected.length - failures}/${selected.length} mutations caught`);
 process.exit(failures ? 1 : 0);

@@ -141,7 +141,8 @@ describe("session pipeline: not reachable from the internet", () => {
     const root = fileURLToPath(new URL("../../", import.meta.url));
     const files = (readdirSync(root, { recursive: true }) as string[]).filter((f) => f.endsWith(".ts") && !f.includes("__tests__") && !f.includes("node_modules"));
     const calls: string[] = [];
-    for (const f of files) {
+    // readdirSync order is filesystem-dependent (ext4 on CI differs from btrfs/APFS locally): sort.
+    for (const f of [...files].sort()) {
       const src = readFileSync(`${root}${f}`, "utf8");
       // URL-bearing hosts and raw URL configs are never used for the pipeline.
       expect(`${f}: ${/Lambda\.(WebFunction|HttpServer)\(|FunctionUrlConfig|InvokeFunctionUrl/.test(src)}`).toBe(`${f}: false`);
@@ -150,6 +151,8 @@ describe("session pipeline: not reachable from the internet", () => {
     expect(calls).toEqual([
       'aws/session-pipeline.ts: Function("session-pipeline", sessionPipelineFunctionProps(i) as never);',
       "aws/session-pipeline.ts: Permission(id, props as never);",
+      // The read API has a Function URL by design (application auth); its props are pinned in session-read-api.test.ts.
+      'aws/session-read-api.ts: Function("session-read-api", sessionReadApiFunctionProps({ stage: i.stage, names, p: i.p }) as never);',
     ]);
   });
 });
