@@ -5,18 +5,26 @@
   "approval": {
     "decision": "approved",
     "by": "Khaliq Gant",
-    "date": "2026-11-01",
+    "date": "2026-11-02",
     "operations": [
       "deploy"
     ],
     "stage": "aws-sessions-prod",
     "accountId": "941433935742",
     "region": "us-east-1",
-    "quote": "ok i pre approve each switch and cutover so go full throttle"
+    "quote": "Khaliq (to migration-finisher, 2026-11-02 ~09:35 PT): yes — deploy 53c60ed (#166) to aws-sessions-prod for the canonical-ID backfill; brief schedule created DISABLED"
   },
   "budgetUsd": 200,
   "budgetEmail": "aws-budgets@agentrelay.com",
   "transcriptStore": {
-    "managementEvents": true
+    "managementEvents": true,
+    "sessionPipeline": {
+      "searchIndex": false
+    },
+    "sessionReadApi": {
+      "completeSince": "epoch",
+      "reservedConcurrency": "none",
+      "origin": "https://ers7kjxfhu5f3anaz5x6d5mhxy0gremx.lambda-url.us-east-1.on.aws"
+    }
   }
 }

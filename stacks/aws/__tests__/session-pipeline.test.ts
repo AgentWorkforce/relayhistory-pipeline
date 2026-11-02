@@ -293,7 +293,10 @@ describe("session pipeline: deploy plan contract", () => {
     // Brief resources never come without the pipeline's.
     expect(() => check(plan(briefCreates, [...store, ...SESSION_BRIEF_RESOURCES]))).toThrow(/missing resource session-pipeline/);
     const withApi = [...withBrief, "session-read-api", "session-read-api-secret", "session-read-api-errors-alarm", "session-read-api-throttles-alarm"];
-    expect(() => check(plan({ ...briefCreates, "session-read-api": "update" }, withApi))).toThrow(/the read api may not change in the same plan/);
+    // A read api update is judged as its code-only cascade, which this compact plan does not show.
+    expect(() => check(plan({ ...briefCreates, "session-read-api": "update" }, withApi))).toThrow(/session-read-api may update only with no declared property changes/);
+    for (const changed of [{ "session-read-api": "create" }, { "session-read-api-errors-alarm": "update" }, { "session-read-api-secret": "update" }])
+      expect(() => check(plan({ ...briefCreates, ...changed }, withApi))).toThrow(/the read api may not change in the same plan/);
     expect(check(plan(briefCreates, withApi))).toBe("session brief rollout");
   });
 });
@@ -372,6 +375,57 @@ describe("session pipeline: update with the role-ARN cascade", () => {
     const other = edit(REAL, "session-pipeline-secret", "  +           AWS: (known after apply)", () => `  +           AWS: arn:aws:iam::${ACCOUNT}:role/someone-else`);
     expect(() => check(withBrief(other))).toThrow(/session-pipeline-secret changes .*someone-else.* not only the role-ARN cascade/);
     expect(() => check(withBrief(op(REAL, "trail", "update")))).toThrow(/must be noop or a session pipeline update/);
+  });
+
+  // The 53c60ed capture's shape (#166): shared code moved since the read API's last deploy, so
+  // its function re-plans with no declared property changes and its secret re-plans its own role.
+  const API_ROLE = `arn:aws:iam::${ACCOUNT}:role/96bulls-aws-session-read-api-aws-sessions-prod-q3tjk5c7wi43htnh`;
+  const codeOnlyApiBlocks = (secretRole = API_ROLE, fn = ["  no declared property changes"]) => [
+    "[session-read-api] update", ...fn, "",
+    "[session-read-api-errors-alarm] noop", "",
+    "[session-read-api-secret] update",
+    "  properties:",
+    "    resourcePolicy:",
+    "  -     Statement:", "  -         Effect: Allow", "  -         Principal:", `  -           AWS: ${secretRole}`, '  -         Resource: "*"', "  -         Sid: SessionReadApiReads",
+    "  +     Statement:", "  +         Effect: Allow", "  +         Principal:", "  +           AWS: (known after apply)", '  +         Resource: "*"', "  +         Sid: SessionReadApiReads",
+    "      Version: 2012-10-17", "",
+    "[session-read-api-throttles-alarm] noop",
+  ].join("\n");
+  const withBriefAndApi = (text: string, api = codeOnlyApiBlocks()) =>
+    `${text.replace(/\n*$/, "")}\n[session-brief-schedule] create\n[session-brief-permission] create\n${api}\n`;
+  const snapshotWithApi = (apiRole: string = API_ROLE) => JSON.stringify({
+    schema: 1,
+    objects: [
+      ...(JSON.parse(snapshot()) as { objects: object[] }).objects,
+      { key: `96bulls/96bulls-aws/${STAGE}/session-read-api.json`, text: JSON.stringify({ status: "updated", attr: { roleArn: apiRole } }) },
+    ],
+  });
+
+  it("brief rollout with the read api's code-only cascade: function unchanged, secret re-plans only its own role", () => {
+    expect(check(withBriefAndApi(REAL), snapshotWithApi())).toBe("session brief rollout");
+    // The deploy has no snapshot; the ARN must still be one role in the account.
+    expect(check(withBriefAndApi(REAL), null)).toBe("session brief rollout");
+    // Without a secret change the function alone is the same shape.
+    const fnOnly = codeOnlyApiBlocks().replace(/\[session-read-api-secret\] update[\s\S]*?(?=\n\[session-read-api-throttles-alarm\])/, "[session-read-api-secret] noop\n");
+    expect(check(withBriefAndApi(REAL, fnOnly), snapshotWithApi())).toBe("session brief rollout");
+  });
+
+  it("brief rollout refuses a read api change beyond its code-only cascade", () => {
+    // Any declared property change on the function (env, memory, url, ...).
+    const declared = codeOnlyApiBlocks(API_ROLE, ["  properties:", "  -   memorySize: 1024", "  +   memorySize: 2048"]);
+    expect(() => check(withBriefAndApi(REAL, declared), snapshotWithApi())).toThrow(/session-read-api may update only with no declared property changes/);
+    // The secret naming another role than the read api's own, or the pipeline's.
+    expect(() => check(withBriefAndApi(REAL, codeOnlyApiBlocks(`arn:aws:iam::${ACCOUNT}:role/someone-else`)), snapshotWithApi())).toThrow(/replaces .*someone-else.*, which is not the read api's role/);
+    expect(() => check(withBriefAndApi(REAL, codeOnlyApiBlocks(LIVE_ROLE)), snapshotWithApi(LIVE_ROLE))).toThrow(/replaces the session pipeline's role/);
+    expect(() => check(withBriefAndApi(REAL, codeOnlyApiBlocks(`arn:aws:iam::123456789012:role/x`)), null)).toThrow(/exactly one role ARN in 941433935742/);
+    // The secret's policy gaining a statement.
+    const widened = codeOnlyApiBlocks().replace('  +         Sid: SessionReadApiReads', '  +         Sid: SessionReadApiReads\n  +       - Action: secretsmanager:PutSecretValue');
+    expect(() => check(withBriefAndApi(REAL, widened), snapshotWithApi())).toThrow(/adds or removes lines/);
+    // An alarm change, or a create, is never the code-only cascade.
+    expect(() => check(withBriefAndApi(REAL, codeOnlyApiBlocks().replace("[session-read-api-errors-alarm] noop", "[session-read-api-errors-alarm] update")), snapshotWithApi())).toThrow(/the read api may not change in the same plan/);
+    // The pipeline cascade is still checked alongside.
+    const other = edit(REAL, "session-pipeline-secret", "  +           AWS: (known after apply)", () => `  +           AWS: arn:aws:iam::${ACCOUNT}:role/someone-else`);
+    expect(() => check(withBriefAndApi(other), snapshotWithApi())).toThrow(/session-pipeline-secret changes .*someone-else/);
   });
 
   it("refuses a grant diff that adds or removes a statement or line", () => {
