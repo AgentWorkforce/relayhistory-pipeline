@@ -29,6 +29,12 @@
   ],
   "vars": {
     "CLICKHOUSE_DATABASE": "relay_search",
+    // Production RelayAuth, the values relayhistory-cloud and the Lambda deploy with
+    // (stacks/aws/session-read-api.ts, #158). The shared verifier's fallback JWKS,
+    // https://relayauth.dev/.well-known/jwks.json, does not resolve: unset, every
+    // token fails the JWKS fetch and Cloud sees only 401s.
+    "RELAYAUTH_JWKS_URL": "https://api.relayauth.dev/.well-known/jwks.json",
+    "RELAYAUTH_ISSUER": "https://relayauth.dev",
     // Fail closed until the deploy workflow sets them: no origin = every /v1
     // request 401; no completeSince = every request 503.
     "READ_API_ORIGIN": "",

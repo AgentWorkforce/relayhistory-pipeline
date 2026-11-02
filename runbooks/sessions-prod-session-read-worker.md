@@ -32,7 +32,7 @@ The same `b96e1:` cursors are issued and accepted. A cursor that the Lambda issu
 | `SUPABASE` | Hyperdrive binding; id from GitHub env var `SESSION_READ_HYPERDRIVE_ID` | Hyperdrive config over 1Password `96Bulls-prod` / `bulls96_read_api - Supabase sessions (pyamkrhoyszgzirqqffq)`, which uses the session pooler `aws-0-us-east-1`, port 5432 |
 | `READ_API_ORIGIN` | GitHub env var `SESSION_READ_ORIGIN` | this Worker's origin, exactly as Cloud's `SESSIONS_READ_96BULLS_URL` |
 | `READ_API_COMPLETE_SINCE` | GitHub env var `SESSION_READ_COMPLETE_SINCE` | the same value as the Lambda's `sessionReadApi.completeSince` |
-| `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | unset | the RelayAuth production defaults, as on the Lambda |
+| `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | `wrangler.jsonc` vars | `https://api.relayauth.dev/.well-known/jwks.json` and `https://relayauth.dev`, as on the Lambda since #158. Never leave them unset: the verifier's fallback JWKS does not resolve, so every token would be refused with a 401 |
 
 **Fail-closed defaults:**
 - With no origin, every `/v1` request gets a 401.

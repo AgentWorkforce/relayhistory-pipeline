@@ -16,7 +16,8 @@
  * Env (wrangler.jsonc vars, set by the deploy workflow): READ_API_ORIGIN (this
  * Worker's own origin, the only audience accepted; unset = every /v1 request
  * 401), READ_API_COMPLETE_SINCE (ISO timestamp or "epoch"; missing = 503),
- * CLICKHOUSE_DATABASE, and optional RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER.
+ * CLICKHOUSE_DATABASE, and RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
+ * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve).
  */
 import pg from "pg";
 import { logLine, type Level } from "../../../src/shared/log.ts";
