@@ -66,6 +66,18 @@
           "digest": "sha256:59d9468551ded11f3c6f5d36558ab7ef87c3e50e99772de352cc309823cb00e0",
           "sourceRevision": "2fb88cdaca3ef42f5eea42050d43448c883ac5e4",
           "note": "publish-image-ecr run 41154325003 from main 2fb88cd; ECR tag sha-2fb88cdaca3ef42f5eea42050d43448c883ac5e4, pushed 2026-10-30T18:30:23-07:00; Stage A (aws-proof) image"
+        },
+        {
+          "repository": "500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services",
+          "digest": "sha256:5bb6075240afa02a1b1797a81c07bffa029954eac7803d702ecba20db35d4db9",
+          "sourceRevision": "7d7229bb31c121ecb98cd4e35c248fc2cf5669ad",
+          "generation": "eff8b3be46565b57ad8fa5e4a066dbb6d1fe608313d9c1680bfbcd484add259b",
+          "ghcr": {
+            "ref": "ghcr.io/agentworkforce/96bulls-services",
+            "digest": "sha256:6f22ea17dff336e1431664542759fd27958649388b90a0b2f0881883caa7c6b2",
+            "run": "41375745173"
+          },
+          "note": "publish-image-ecr run 41375747474 from main 7d7229bb31c121ecb98cd4e35c248fc2cf5669ad (descends ab3ee7f; Supabase generation eff8b3be); OCI index read back from ECR by tag sha-7d7229bb31c121ecb98cd4e35c248fc2cf5669ad; same source also published to GHCR by run 41375745173 (digest above, reference only; AWS stages pull from ECR). Pippen-sandbox (aws-proof-sandbox) proof image. Publish approved by Khaliq 2026-11-01 (\"go on each, approved and pre approval\")."
         }
       ]
     },

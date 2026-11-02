@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 import { assertMayRun, GuardError, type GuardInput, type Mode } from "./guard.ts";
 import type { Fence } from "./fence.ts";
 import { admitStep } from "./ops.ts";
-import { toolEnv } from "./cluster-binding.ts";
+import { toolEnv, type ToolCredentials } from "./cluster-binding.ts";
 import { sanitize, type Approval, type StepRecord } from "./report.ts";
 
 export interface Step {
@@ -66,6 +66,8 @@ export interface RunnerOptions {
    */
   kubeconfigPath?: string;
   baseEnv?: Record<string, string | undefined>;
+  /** resolveToolCredentials' result; absent means static keys (the proof target's only kind). */
+  credentials?: ToolCredentials;
   spawn?: Spawn;
   print?: (line: string) => void;
 }
@@ -150,7 +152,7 @@ export class Runner {
 
   /** The environment every spawned tool gets: the generated kubeconfig, no retargeting variables. */
   env(): Record<string, string> {
-    return toolEnv(this.o.baseEnv ?? process.env, this.o.kubeconfigPath);
+    return toolEnv(this.o.baseEnv ?? process.env, this.o.kubeconfigPath, this.o.credentials);
   }
 
   /** Record an in-process action that `gate` allowed, with its outcome. */
