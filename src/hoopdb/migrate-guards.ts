@@ -105,6 +105,8 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_directory_machines": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_directory_rollout": ["SELECT"],
   "sessions.session_directory_resurrection_fences": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_agents": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_relationships": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.manifest_readiness": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.export_deferred_sessions": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.claimless_uses": ["SELECT", "INSERT", "UPDATE"],
@@ -137,6 +139,8 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_directory_users",
   "sessions.session_directory_machines",
   "sessions.session_directory_resurrection_fences",
+  "sessions.session_directory_agents",
+  "sessions.session_directory_relationships",
   "sessions.manifest_readiness",
   "sessions.export_deferred_sessions",
   "sessions.claimless_uses",
@@ -164,6 +168,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.repo_visibility_ids(text,uuid)",
   "sessions.repos_maintain(integer)",
   "sessions.resolve_repo(text,text,text,timestamp with time zone)",
+  "sessions.session_directory_project_text(text,text,text)",
   "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
   "sessions.session_index_batch(jsonb)",
   "sessions.session_index_scrub_sticky()",
@@ -1050,7 +1055,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "d31312e81caf576e196f1654e4f8534c003602920df09e6defb1e9f53ed434b8";
+  "8e59640c2e9f3506a2c581bf914ba790ecb29c4c2ba390b59a9f18f7a828809a";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

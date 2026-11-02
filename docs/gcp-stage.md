@@ -103,7 +103,23 @@ from the 96Bulls AlleyOop pods, plus the `relayfile` namespace when the
 Relayfile add-on is enabled, since it verifies tokens against this JWKS. When a
 public JWKS Ingress is configured
 (`relayauth.baseUrl`), `:8787` is also admitted from the GCE load-balancer and
-health-check ranges (`130.211.0.0/22`, `35.191.0.0/16`), and nothing else. Applying the policy requires `bulls96.relayauthJwksUrl` to be the
+health-check ranges (`130.211.0.0/22`, `35.191.0.0/16`), and nothing else.
+
+Live evidence, 2026-11-01, deployed from merge `04410e5` (3 creates, nothing
+else changed). Probe pods in another namespace (`default`) and in `relayauth`:
+
+| Check | before | after |
+| --- | --- | --- |
+| `default` pod → `relayauth:8787` | open | blocked |
+| `relayauth` pod → `https://example.com`, TCP `8.8.8.8:443` | 200 / open | blocked / blocked |
+| AlleyOop → `relayauth:8787` (JWKS) | open | open (the E2E verifies tokens) |
+
+RelayAuth stayed ready with zero restarts. The machine-bound E2E passed at
+`04410e5` (machine `proof-gcp-mvyicx6wa9e27b-a`): claimless and mismatch
+assertions were refused with 403 `machine_claim_refused`, two encrypted
+summaries were written, zero dead letters, and trace `indexed`. Other
+namespaces (`default` here) keep their own unrestricted egress; only `96bulls`
+and `relayauth` are fenced. Applying the policy requires `bulls96.relayauthJwksUrl` to be the
 in-cluster RelayAuth service, the only JWKS destination it allows; a public JWKS
 URL is refused rather than silently cut off. Deliberately not allowed: in-cluster
 ingress to AlleyOop (nothing calls it in-cluster and it has no Ingress or load
@@ -135,6 +151,41 @@ differs from `5c512be` only in AWS stack files.
   no HoopDB or GCS change;
 - matching machine `proof-gcp-mvyfucaa36b947-a`: chunk and manifest landed, two
   encrypted summaries were written, zero dead letters, trace `indexed`.
+
+### Backup and restore drill
+
+The protection in place on GCP conformance, as read from the live resources on
+2026-11-02:
+
+- **Cloud SQL `awf-conformance-postgres`:** automated daily backups at 13:00Z,
+  7 retained (the latest automated backup at the time succeeded),
+  point-in-time recovery on, 7 days of transaction logs in Cloud Storage.
+- **Locker bucket:** object versioning on and 7-day soft delete, with uniform
+  bucket-level access.
+
+The drill, 2026-11-02:
+
+1. **Database point-in-time restore.** `gcloud sql instances clone` of the
+   live instance at `2026-11-02T00:28:00Z` into `awf-conformance-pg-drill`
+   finished in 9.5 minutes, RUNNABLE on a private IP only. The runner opened
+   a Cloud SQL proxy to the clone and a port-forward to the live proxy, using
+   the migration credential read in memory from the `96bulls-runtime` Secret,
+   then ran the same query on both. The result was **identical**: 8
+   `session_index` rows, 57 `pipeline_events`, 16 `session_summaries`, 18
+   ledger rows, newest session `2026-11-02 00:15:48.488+00`, and the proof
+   session for machine `proof-gcp-mvyicx6wa9e27b-a` present. The clone was then
+   deleted, leaving only the live instance.
+2. **Object restore.** A random 64 KiB object under `drill-restore/` (a prefix
+   the pipeline never reads) was written and deleted; it then answered 404, and
+   its prior generation was still listed. It was restored by copying that
+   generation back, and its SHA-256 matched the original. Every version was
+   then removed (`drill versions left: 0`).
+
+Gaps found:
+- Deletion protection is off on the Cloud SQL instance, and deleting the
+  instance also deletes its automated backups.
+- The locker has no lifecycle rule, so noncurrent versions are kept
+  indefinitely; storage grows without bound.
 
 ### Per-component bucket identities
 
