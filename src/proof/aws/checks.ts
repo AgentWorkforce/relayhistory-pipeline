@@ -1174,7 +1174,8 @@ const BUCKET_GONE = /\(404\)|Not Found|NoSuchBucket/;
  * expected end state; on the sandbox, nothing tagged alchemy::stage=
  * aws-proof-sandbox or pippen:sandbox=true either, except the exact ARN of
  * the agent-session role a fresh `pippen sandbox up` made for this run), and
- * both proof buckets answer 404. A failed or
+ * both proof buckets answer 404, and on the sandbox its pippen-sbx- Alchemy
+ * state bucket too (fence.ts SANDBOX_STATE_BUCKET). A failed or
  * ambiguous call (403, throttling, network) is never "gone".
  */
 export async function postDestroyTeardown(ctx: Ctx): Promise<CheckResult> {
@@ -1188,8 +1189,10 @@ export async function postDestroyTeardown(ctx: Ctx): Promise<CheckResult> {
   // The Pippen sandbox: nothing Alchemy tagged for the stage (alchemy::stage) and nothing
   // pippen:sandbox=true but the fresh agent-session role (exact ARN) may remain either.
   const swept = sweepTagsFor(c.stage).map((t) => ctx.runner.run(aws(`post-destroy.tagged.${t.key}`, ["resourcegroupstaggingapi", "get-resources", "--tag-filters", `Key=${t.key},Values=${t.value}`])));
-  const buckets = [...new Set([c.locker.bucket, targetValuesForStage(c.stage)?.backupBucket ?? PROOF_BACKUP_BUCKET])].map((b) => ({ b, o: ctx.runner.run(aws(`post-destroy.head-bucket.${b}`, ["s3api", "head-bucket", "--bucket", b], [BUCKET_GONE])) }));
-  if (dry(ctx)) return r.done("planned", "post-destroy: describe-cluster must answer ResourceNotFound, list-clusters must not name it, no tagged resources, both buckets 404");
+  // On the Pippen sandbox also its own Alchemy state bucket, which the sweep must delete (every version).
+  const tv = targetValuesForStage(c.stage);
+  const buckets = [...new Set([c.locker.bucket, tv?.backupBucket ?? PROOF_BACKUP_BUCKET, ...(tv?.stateBucket ? [tv.stateBucket] : [])])].map((b) => ({ b, o: ctx.runner.run(aws(`post-destroy.head-bucket.${b}`, ["s3api", "head-bucket", "--bucket", b], [BUCKET_GONE])) }));
+  if (dry(ctx)) return r.done("planned", `post-destroy: describe-cluster must answer ResourceNotFound, list-clusters must not name it, no tagged resources, buckets 404 (${buckets.map((x) => x.b).join(", ")})`);
   const clusterGoneDescribe = describe.record.status === "failed" && describe.stderrMatches?.[0] === true;
   if (!clusterGoneDescribe) r.failures.push(describe.ok ? "describe-cluster still finds the cluster" : "describe-cluster failed without ResourceNotFound; absence unproven");
   const gone = clusterGone(list.ok, list.stdout, c.clusterName);

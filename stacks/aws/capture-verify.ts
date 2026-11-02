@@ -18,7 +18,7 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { inputsDigest } from "./deploy-guard.ts";
-import { alchemyStateBucket, alchemyStatePrefix } from "./preflight.ts";
+import { alchemyStatePrefix, stateBucketFor } from "./state-bucket.ts";
 import { STACK_SOURCE_PATHS, provenanceMismatches, versionsDigest, type Observed, type Provenance, type VersionListing } from "../../src/cli/plan-provenance.ts";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -74,11 +74,24 @@ export function listVersions(io: CaptureIO, bucket: string, prefix: string, regi
   return out;
 }
 
-/** Read-only view of the stage's state: bucket versioning and every version and delete marker. */
-export function observeState(io: CaptureIO, accountId: string, region: string, stage: string) {
-  const bucket = alchemyStateBucket(accountId, region);
+/**
+ * Read-only view of the stage's state: bucket versioning and every version and
+ * delete marker. In a Pippen sandbox the store is its own pippen-sbx- bucket
+ * (state-bucket.ts), and a bucket that does not exist yet is a fresh account:
+ * no prior state, versioning "Absent" (which no capture records, so a deploy
+ * against a vanished bucket is refused). Elsewhere a missing bucket stays an error.
+ */
+export function observeState(io: CaptureIO, accountId: string, region: string, stage: string, pippenSandbox = false) {
+  const bucket = stateBucketFor({ accountId, region, pippenSandbox });
   const prefix = `${alchemyStatePrefix(stage)}/`;
-  const versioning = (awsJson(io, ["s3api", "get-bucket-versioning", "--bucket", bucket, "--region", region]) as { Status?: string }).Status ?? "Disabled";
+  let versioning: string;
+  try {
+    versioning = (awsJson(io, ["s3api", "get-bucket-versioning", "--bucket", bucket, "--region", region]) as { Status?: string }).Status ?? "Disabled";
+  } catch (e) {
+    if (!pippenSandbox || !/NoSuchBucket|\(404\)|Not Found/.test(e instanceof Error ? e.message : String(e))) throw e;
+    const empty = versionsDigest({ Versions: [], DeleteMarkers: [] });
+    return { bucket, prefix, versioning: "Absent", listing: { Versions: [], DeleteMarkers: [] } as VersionListing, versionsDigest: empty.digest, versionEntries: empty.entries };
+  }
   const listing = listVersions(io, bucket, prefix, region);
   const v = versionsDigest(listing);
   return { bucket, prefix, versioning, listing, versionsDigest: v.digest, versionEntries: v.entries };
@@ -93,10 +106,10 @@ export function verifyDeployCapture(io: CaptureIO, stage: string, inputsText: st
   if (provenanceText === undefined || planText === undefined || detailedText === undefined)
     throw new Error(`96bulls: no reviewed capture for ${stage} (docs/plans/${stage}.{provenance.json,plan.txt,plan.detailed.txt}); run \`96bulls plan ${stage} --capture\`. Nothing was changed.`);
   const rec = JSON.parse(provenanceText) as Provenance;
-  const inputs = JSON.parse(inputsText) as { accountId: string; region: string };
+  const inputs = JSON.parse(inputsText) as { accountId: string; region: string; pippenSandbox?: unknown };
   const src = observeSource(io, rec.source?.commit);
   const caller = awsJson(io, ["sts", "get-caller-identity"]) as { Account: string };
-  const st = observeState(io, inputs.accountId, inputs.region, stage);
+  const st = observeState(io, inputs.accountId, inputs.region, stage, Boolean(inputs.pippenSandbox));
   const observed: Observed = {
     stage,
     accountId: caller.Account,

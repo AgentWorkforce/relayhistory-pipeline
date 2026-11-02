@@ -77,14 +77,33 @@ export function cnpgHoopdbValues(operatorRelease: string) {
 // ---------------------------------------------------------------------------
 
 export const RELAYCAST_NAMESPACE = "relaycast";
-/** helm-charts relaycast 0.1.0 (values.yaml image.digest). 0.2.0 slots in through inputs. */
+/** helm-charts relaycast 0.1.0 (values.yaml image.digest). Takes no secret material. */
 export const RELAYCAST_0_1_0 = { chartVersion: "0.1.0", imageDigest: "sha256:5c86c095a335259060dc34ce7aa2e90809267395af915977a1ae608f93a83b98" } as const;
+/** helm-charts relaycast 0.2.0 (values.yaml image.digest: relaycast-self-host 12.2.1-selfhost.1). Requires `existingSecret`. */
+export const RELAYCAST_0_2_0 = { chartVersion: "0.2.0", imageDigest: "sha256:a05732ad4f3614d057bb1460df40a30e3a9297c8930bfdda6d4e3d6dc9f41762" } as const;
+/**
+ * The keys of the Relaycast Secret (chart 0.2.0 `secretKeys`, passed explicitly so a
+ * changed chart default cannot move them). Created out of band (docs/aws-stage.md).
+ */
+export const RELAYCAST_SECRET_KEYS = Object.freeze({ internalSecret: "internal-secret", bootstrapSecret: "workspace-bootstrap-secret" });
 
 export interface RelaycastInputs {
   chartVersion: string;
   imageDigest: string;
   /** HTTPS origin Relaycast embeds in signed URLs and A2A cards; the chart requires it even while ClusterIP-only. */
   baseUrl: string;
+  /**
+   * Chart 0.2.0 and later: the existing Secret in the relaycast namespace holding
+   * RELAYCAST_SECRET_KEYS (the chart's required `existingSecret`). Refused for 0.1.x,
+   * which reads no secret.
+   */
+  secretName?: string;
+}
+
+/** Whether this chart version takes the `existingSecret` (0.2.0 and later). */
+export function relaycastNeedsSecret(chartVersion: string): boolean {
+  const [major, minor] = chartVersion.split(".").map(Number);
+  return major! > 0 || minor! >= 2;
 }
 
 export function assertRelaycastInputs(i: RelaycastInputs | undefined): asserts i is RelaycastInputs {
@@ -99,17 +118,24 @@ export function assertRelaycastInputs(i: RelaycastInputs | undefined): asserts i
   }
   if (u.protocol !== "https:" || u.pathname !== "/" || u.search || u.hash || u.username || !u.hostname.includes("."))
     throw new Error(`96bulls: eks.relaycast.baseUrl must be a bare https origin with public DNS, got ${JSON.stringify(i.baseUrl)}. Nothing was created.`);
+  if (relaycastNeedsSecret(i.chartVersion)) {
+    if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(i.secretName ?? "") || i.secretName!.length > 253)
+      throw new Error(`96bulls: eks.relaycast.secretName is required for chart ${i.chartVersion} (its existingSecret) and must be a Kubernetes Secret name, got ${JSON.stringify(i.secretName)}. Nothing was created.`);
+  } else if (i.secretName !== undefined) {
+    throw new Error(`96bulls: eks.relaycast.secretName is for chart 0.2.0 and later; chart ${i.chartVersion} reads no secret. Nothing was created.`);
+  }
 }
 
 /**
- * ClusterIP only, no ingress, one replica on the encrypted class. The pinned
- * runtime takes no secret material (chart README); if a later chart adds it, it
- * comes from an existing Secret by name, never from a value here.
+ * ClusterIP only, no ingress, one replica on the encrypted class. Chart 0.1.x
+ * takes no secret material (values unchanged); 0.2.0 and later read theirs from
+ * the existing Secret `secretName` by name and key, never from a value here.
  */
 export function relaycastValues(i: RelaycastInputs) {
   return {
     image: { digest: i.imageDigest },
     baseUrl: new URL(i.baseUrl).origin,
+    ...(relaycastNeedsSecret(i.chartVersion) ? { existingSecret: i.secretName, secretKeys: { ...RELAYCAST_SECRET_KEYS } } : {}),
     service: { type: "ClusterIP" },
     ingress: { enabled: false },
     persistence: { storageClass: STORAGE_CLASS, size: "10Gi" },
