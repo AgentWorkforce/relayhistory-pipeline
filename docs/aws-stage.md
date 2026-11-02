@@ -608,8 +608,45 @@ The flow (each live step needs Khaliq's OK; nothing here has been run):
    `pippen:baseline=true` are never listed.
 8. `pippen sandbox down aws-proof` again.
 
-The stage's AWS Budget has no tags, so neither the pippen sweep nor the
-harness's tag check sees it.
+#### What `pippenSandbox` changes in the stage (and nothing else does)
+
+Khaliq, 2026-11-01: "Widen pippen boundary". The stage keeps full fidelity
+(the same KMS keys, Locker, CloudTrail, budget, ECR repository, VPC, EKS Auto
+Mode cluster, Pod Identity roles, WAF, ACM certificate and ALB as the other
+proof stages) and changes only what the pippen agent-session boundary and
+`pippen-sweeper` need (`stacks/aws/pippen-sandbox.ts`):
+
+- every IAM role is under `/pippen/workload/` with the boundary: the four Pod
+  Identity roles, the legacy pods role if kept, and the EKS Auto Mode cluster
+  and node roles (`96bulls-aws-proof-sandbox-{cluster,node}`), which the stage
+  declares and passes to the cluster instead of letting Alchemy create them at
+  `/` with no boundary;
+- every resource carries `pippen:sandbox=true`, now including the budget, and
+  the ALB, target groups and security groups (IngressClassParams `tags`) and
+  EBS volumes (StorageClass `tagSpecification_1`) that Auto Mode creates
+  from Kubernetes objects. EC2 instances Auto Mode launches are untagged and
+  terminated by EKS with the cluster;
+- the S3 buckets are named `pippen-sbx-96bulls-aws-proof-sandbox-{locker,trail,alb-logs}-361835732085`:
+  `pippen-sweeper` may delete only `pippen-sbx-*` buckets (S3 deletes cannot be
+  tag-conditioned);
+- no GitHub OIDC provider or deployer role (unchanged).
+
+Every other stage renders exactly as before (`stacks/aws/__tests__/pippen-sandbox.test.ts`).
+
+This needs the widened boundary and sweeper from pippen-tools (the boundary
+grants CloudTrail, WAFv2, ACM, ECR repositories and Budgets only with
+`pippen:sandbox=true`, and the sweeper deletes them). Order: merge the
+pippen-tools PR, Khaliq redeploys the pippen management stack (sandbox
+baseline StackSet; pippen-tools `docs/runbook-management-bootstrap.md` step 9)
+and the tooling release, then `pippen sandbox up aws-proof` and the flow
+above. Before that the deploy is denied at the first CloudTrail, WAF, ACM,
+ECR or Budgets call.
+
+Still open before the first deploy: the stack's image preflight runs
+`ecr describe-images` against the sessions-dev repository, whose approved
+repository policy grants `361835732085` pull only (no `ecr:DescribeImages`),
+so the preflight is denied until that policy (an aws-sessions-dev change,
+Khaliq's approval) also allows `ecr:DescribeImages`.
 
 ### Apply, verify and roll back
 

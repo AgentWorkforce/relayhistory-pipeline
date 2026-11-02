@@ -37,8 +37,14 @@ export const SANDBOX_CONTEXT = `arn:aws:eks:${SANDBOX_REGION}:${SANDBOX_ACCOUNT_
 export const SANDBOX_HOST = "proof-sandbox-sessions.agentrelay.com";
 export const SANDBOX_ORIGIN = `https://${SANDBOX_HOST}`;
 export const SANDBOX_NAME_PREFIX = `96bulls-${SANDBOX_STAGE}-`;
-export const SANDBOX_LOCKER_BUCKET = `${SANDBOX_NAME_PREFIX}locker-${SANDBOX_ACCOUNT_ID}`;
-export const SANDBOX_BACKUP_BUCKET = `${SANDBOX_NAME_PREFIX}hoopdb-backups-${SANDBOX_ACCOUNT_ID}`;
+/**
+ * The sandbox's buckets carry the pippen-sbx- prefix (stacks/aws/pippen-sandbox.ts
+ * stageBucketName): pippen-sweeper may delete only pippen-sbx-* buckets, since S3
+ * deletes cannot be tag-conditioned. Other names are unchanged.
+ */
+export const SANDBOX_BUCKET_PREFIX = "pippen-sbx-";
+export const SANDBOX_LOCKER_BUCKET = `${SANDBOX_BUCKET_PREFIX}${SANDBOX_NAME_PREFIX}locker-${SANDBOX_ACCOUNT_ID}`;
+export const SANDBOX_BACKUP_BUCKET = `${SANDBOX_BUCKET_PREFIX}${SANDBOX_NAME_PREFIX}hoopdb-backups-${SANDBOX_ACCOUNT_ID}`;
 export const PROOF_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
 export const PROOF_CHART_HOST = "agentworkforce.github.io";
 

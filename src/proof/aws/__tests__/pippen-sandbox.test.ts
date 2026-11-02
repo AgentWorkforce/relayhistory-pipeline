@@ -48,8 +48,8 @@ describe("pippen sandbox target: the constants are exact", () => {
     expect(sandboxCallerArn(SESSION)).toBe(SANDBOX_CALLER_ARN);
     expect(SBX.callerRolePrefix).toBe("arn:aws:sts::361835732085:assumed-role/agent-session/");
     expect(SANDBOX_CONTEXT).toBe("arn:aws:eks:us-west-2:361835732085:cluster/96bulls-aws-proof-sandbox");
-    expect(SANDBOX_LOCKER_BUCKET).toBe("96bulls-aws-proof-sandbox-locker-361835732085");
-    expect(SANDBOX_BACKUP_BUCKET).toBe("96bulls-aws-proof-sandbox-hoopdb-backups-361835732085");
+    expect(SANDBOX_LOCKER_BUCKET).toBe("pippen-sbx-96bulls-aws-proof-sandbox-locker-361835732085");
+    expect(SANDBOX_BACKUP_BUCKET).toBe("pippen-sbx-96bulls-aws-proof-sandbox-hoopdb-backups-361835732085");
     expect(SBX.sweepTags).toEqual([{ key: "alchemy::stage", value: "aws-proof-sandbox" }, { key: "pippen:sandbox", value: "true" }]);
     expect(SBX.residueExemptArns).toEqual(["arn:aws:iam::361835732085:role/pippen/agent-session"]);
     expect(Object.isFrozen(SBX) && Object.isFrozen(SESSIONS_DEV_PROOF_TARGET) && Object.isFrozen(PROOF_TARGETS)).toBe(true);
@@ -445,7 +445,7 @@ describe("pippen sandbox target: teardown is the pippen sweep, verified after", 
       expect(r2.failures).toEqual([`still present after stage destroy: aws ${lookalike}`]);
     }
     // Exempt only by ARN, never by tag: a pippen:baseline tag on a stage-tagged leftover does not excuse it.
-    const kms = "arn:aws:s3:::96bulls-aws-proof-sandbox-trail-361835732085";
+    const kms = "arn:aws:s3:::pippen-sbx-96bulls-aws-proof-sandbox-trail-361835732085";
     expect((await run(fake({ tagged: list({ arn: kms, tags: { "pippen:baseline": "true" } }) }))).status).toBe("fail");
   });
   test("an alchemy::stage-tagged leftover fails; the 96bulls:stack listing never exempts more than the role", async () => {

@@ -36,7 +36,7 @@ the environment can add a third target or widen either one.
 | Stage / cluster | `aws-proof` / `96bulls-aws-proof` | `aws-proof-sandbox` / `96bulls-aws-proof-sandbox` |
 | Caller | any principal in the account | exactly `arn:aws:sts::361835732085:assumed-role/agent-session/agent-<session_id>`, `<session_id>` from `--pippen-session` (required); post-destroy: any session of the recreated `agent-session` role in `361835732085` |
 | Host | `proof-sessions.agentrelay.com` | `proof-sandbox-sessions.agentrelay.com` |
-| Buckets | `96bulls-aws-proof-{locker,hoopdb-backups}-500268966557` | `96bulls-aws-proof-sandbox-{locker,hoopdb-backups}-361835732085` |
+| Buckets | `96bulls-aws-proof-{locker,hoopdb-backups}-500268966557` | `pippen-sbx-96bulls-aws-proof-sandbox-{locker,hoopdb-backups}-361835732085` (the pippen-sbx- prefix is what pippen-sweeper may delete) |
 | Stage plan | `docs/plans/aws-proof.*` | `docs/plans/aws-proof-sandbox.*`, must carry `pippenSandbox`, never `accountShared` |
 | Inputs | `.96bulls/aws-proof/inputs.json` | `.96bulls/aws-proof-sandbox/inputs.json` |
 | Teardown | `bin/96bulls down aws-proof` | `pippen sandbox down aws-proof` |
