@@ -31,15 +31,27 @@ application ACL. Only the migrator installs it (`installRuntimeApplicationAcl`, 
 
 ## 2. Code to run
 
-Use origin/main at **`84a962c`** or later, which contains #139 `fe5a2da` and #125 `9dca95f`.
-Commits after `fe5a2da` touch only GCP and AWS session-pipeline code: no migration, bootstrap or
-`src/hoopdb`/`src/shared` file changed. So:
+Use origin/main at **`ab3ee7f`** (the #137 merge) or later. It contains #125 `9dca95f`, #139
+`fe5a2da` and #137.
+
+**#137 is required.** Before #137, the exact-ACL drift check ran only in `event-trigger` mode, so a
+Stage A migrate under `global-default-revoke` from `fe5a2da` or `84a962c` would skip it. From
+`ab3ee7f` it runs in every non-local mode.
+
+#137 changed only `migrate.ts`, `migrate-guards.ts`, tests and a comment in the trigger bootstrap
+header (outside the function body, so the frozen prosrc sha is unchanged). It changed no migration
+or verifier, so the generation is unchanged. So:
 
 - `bun src/hoopdb/migrate.ts --generation` must print
   `eff8b3be46565b57ad8fa5e4a066dbb6d1fe608313d9c1680bfbcd484add259b`. On any other value, stop.
-- Run it from a clean worktree with `bun install --frozen-lockfile`.
-- The images to deploy afterwards are the ones built from `fe5a2da` or later, with the same
-  generation.
+- Run it from a clean worktree at `ab3ee7f` or later with `bun install --frozen-lockfile`.
+- Rebuild the images to deploy afterwards from `ab3ee7f` or later. Images from `fe5a2da` have the
+  same generation, but their migrator lacks the drift check outside event-trigger mode, so do not
+  use them to run the migrator.
+- `--activation-check` gives no read-only preview of the drift check: the drift check runs only
+  inside the migrator's validation transaction. That is a known gap; a follow-up will add the
+  preview. So the first evidence of drift is a refusal at A2, which rolls back and leaves the
+  marker `pending`.
 
 The only migration still pending is `20261101050000_session_directory_list.sql` (#124). The
 `20261030020000` ledger row on production must already equal `b0ddc7de…0758ce`, because
@@ -48,8 +60,8 @@ The only migration still pending is `20261101050000_session_directory_list.sql` 
 ## 3. Why two stages
 
 The migrator cannot install the #116 ACL on its own. Every migrate applies all pending steps, then
-installs the runtime ACL and runs the exact-ACL drift check (#137 semantics, already active for
-Supabase), all in one validation transaction. So:
+installs the runtime ACL and runs the exact-ACL drift check (every non-local mode from #137
+onwards), all in one validation transaction. So:
 
 - **Stage A** runs the new code under the boundary that is **already proven** on this database
   (`global-default-revoke`). It applies #124 and installs the #116 ACL. This unblocks #121 without
@@ -72,7 +84,7 @@ not print any connection string or secret.
 | P2  | `SELECT name, generation, status FROM sessions.__96bulls_role_validation`                                                                       | `session_directory_search_worker`, `1d99ccc8…`, `pass`                                                                                                         |
 | P3  | `SELECT name FROM sessions.__96bulls_migrations WHERE name LIKE '%20261101050000%'`                                                             | 0 rows                                                                                                                                                         |
 | P4  | `SELECT sha256 FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261030020000_session_directory_short_summary.sql'`                   | `b0ddc7de8c4cff9454638c52563f37f1e1380ed577e2a7535f67ddc2c0b758ce`                                                                                             |
-| P5  | every ledger sha256 against the file at `84a962c`                                                                                               | 17/17 equal                                                                                                                                                    |
+| P5  | every ledger sha256 against the file at `ab3ee7f`                                                                                               | 17/17 equal                                                                                                                                                    |
 | P6  | P12 baseline md5s from the fe5a2da audit (roles, memberships, default_acl, db_role_settings, database ACL, schemas, extensions, event_triggers) | unchanged. On any difference, stop and re-audit                                                                                                                |
 | P7  | `pg_locks` for advisory `(961996,1)`, and non-idle sessions other than ours                                                                     | 0 advisory locks. Only the catch-up loop (until W1)                                                                                                            |
 | P8  | `bun src/hoopdb/migrate.ts --activation-check` with `HOOPDB_DB_MODE=supabase HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke` (read-only)   | exit 0, `satisfied=true`. Only `supabase_admin` under `excluded_platform_superusers`. Every `sessions` CREATE role covered. `migration_checksum_aliases` empty |
@@ -84,9 +96,9 @@ not print any connection string or secret.
 | ---- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
 | A0   | R    | **Restore point (Khaliq decision 2).** Run `pg_dump --schema=sessions --format=custom` as `postgres`. It only reads the database. Write it only to tmpfs. Record its sha256 and size, then upload it to the location Khaliq names: **an open decision. The dump holds tenant session metadata, so it must go to a KMS-encrypted bucket, not to a laptop disk.** Record that S3 can rebuild the index (the backfill script with the done logs) as the second restore path.                                                                                   | dump fails; sha not recorded                                       |
 | A1   | W    | Pause the catch-up loop: `touch ~/.agent-tmp/supa-prod/CATCHUP_STOP`. Wait for "stopped" in `catchup.log`, then re-run P7.                                                                                                                                                                                                                                                                                                                                                                                                                                  | no "stopped" line within 15 minutes                                |
-| A2   | W    | Run `bun src/hoopdb/migrate.ts` from `84a962c` with `HOOPDB_DB_MODE=supabase`, `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke`, `HOOPDB_RUNTIME_ROLE=bulls96_runtime`, `HOOPDB_RUNTIME_ROLE_LOGIN=true` and `HOOPDB_SUPABASE_SHIM=false`. `HOOPDB_ROLE_VERIFY` stays the default (true). The migrator writes the marker `pending` first; applies `20261101050000`; installs the #116 runtime ACL; runs phase 2, the runtime allowlist and the exact-ACL drift check; then writes the marker `pass` for `eff8b3be`, all in one validation transaction. | any non-zero exit. A refusal leaves the marker `pending`: go to §8 |
+| A2   | W    | Run `bun src/hoopdb/migrate.ts` from `ab3ee7f` with `HOOPDB_DB_MODE=supabase`, `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke`, `HOOPDB_RUNTIME_ROLE=bulls96_runtime`, `HOOPDB_RUNTIME_ROLE_LOGIN=true` and `HOOPDB_SUPABASE_SHIM=false`. `HOOPDB_ROLE_VERIFY` stays the default (true). The migrator writes the marker `pending` first; applies `20261101050000`; installs the #116 runtime ACL; runs phase 2, the runtime allowlist and the exact-ACL drift check; then writes the marker `pass` for `eff8b3be`, all in one validation transaction. | any non-zero exit. A refusal leaves the marker `pending`: go to §8 |
 | A3   | R    | Post-checks: ledger 18/18. Marker `pass` for `eff8b3be`. `--activation-check` (same env) exits 0. No `sessions` function is executable by PUBLIC. `bulls96_runtime` holds exactly the #116 ACL (EXECUTE on `RUNTIME_APPLICATION_FUNCTIONS`, `RUNTIME_APPLICATION_TABLE_PRIVILEGES`, sequences, RLS policies), and the migrator's own validation passed. P6 diff: only `sessions` objects and `bulls96_runtime` grants changed, with no change to roles, memberships, default ACLs or event triggers.                                                        | anything else                                                      |
-| A4   | W    | Restart the catch-up loop **on the new code**. The old loop's worktree is `b47c1e6`. If its handler path checks the schema verdict, it is now not-ready against `eff8b3be`. So restart it from an `84a962c` worktree: `rm -f CATCHUP_STOP`, then the documented `CATCHUP_SINCE=<A1 stop time minus 2 min>` restart. Confirm one pass logs `processed ≈ to_process` and no errors.                                                                                                                                                                           | errors in its first pass                                           |
+| A4   | W    | Restart the catch-up loop **on the new code**. The old loop's worktree is `b47c1e6`. If its handler path checks the schema verdict, it is now not-ready against `eff8b3be`. So restart it from an `ab3ee7f` worktree: `rm -f CATCHUP_STOP`, then the documented `CATCHUP_SINCE=<A1 stop time minus 2 min>` restart. Confirm one pass logs `processed ≈ to_process` and no errors.                                                                                                                                                                           | errors in its first pass                                           |
 | A5   | W    | Re-enable the #121 Lambda on images with generation `eff8b3be`. Confirm that one real object-landed event indexes as `bulls96_runtime` and that RLS still isolates tenants (the handoff's `rls-check.sql`).                                                                                                                                                                                                                                                                                                                                                 | permission errors                                                  |
 
 **Duration and locking (A2):**
