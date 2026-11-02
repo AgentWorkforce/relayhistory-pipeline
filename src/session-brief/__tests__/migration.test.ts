@@ -70,6 +70,25 @@ describe("session_briefs schema", () => {
     expect((await pg.query("SELECT state FROM sessions.session_briefs")).rows).toEqual([{ state: "answered" }]);
   });
 
+  test("the state down path removes already-generated v3 briefs so the up can reapply", async () => {
+    const pg = await db();
+    await pg.query(
+      `INSERT INTO sessions.session_briefs
+         (org_id, workspace_id, harness, session_id, status, revision, source_revisions,
+          source_fingerprint, title, description, state, brief_revision, brief_source_revisions,
+          brief_fingerprint, scrub_ruleset, scrub_version, prompt_version, engine_version, model,
+          message_count, shortened_messages, input_tokens, output_tokens, generated_at)
+       VALUES ($1, $2, $3, $4, 'ready', 1, jsonb_build_object('m-1', 1), repeat('a', 64),
+               'V3 brief title', 'Two sentences. Second one.', 'completed', 1, jsonb_build_object('m-1', 1),
+               repeat('a', 64), 'relayhistory-scrub', 1, 'session-summary-v3',
+               'session-summary-v3:96bulls-v1', 'gpt-5.6-luna', 3, 0, 10, 5, now())`,
+      [KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId],
+    );
+    await pg.exec(STATE_DOWN);
+    expect((await pg.query("SELECT count(*)::int AS n FROM sessions.session_briefs")).rows).toEqual([{ n: 0 }]);
+    await pg.exec(STATE_UP);
+  });
+
   test("a state is one of the five, describes a brief, and is required after the v2 prompt", async () => {
     const pg = await db();
     await readyBrief(pg);
