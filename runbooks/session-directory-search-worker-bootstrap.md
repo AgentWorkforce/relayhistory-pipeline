@@ -502,6 +502,14 @@ config fails closed.
   pg-proof path matches the manifest. A live Cloud SQL instance is NOT OBSERVED. Tested on
   PG15 and PG17 (selfhosted extra grant refused, marker pending, clean migrate passes)
   and in the unit-test mode matrix.
+- **Read-only preview:** outside local mode, with `HOOPDB_RUNTIME_ROLE` set,
+  `--activation-check` runs the same comparison read-only and reports
+  `function_acl_drift_extra` (grants the migrator would refuse, duplicate grantors
+  included; exit 1), `function_acl_missing_refused` (missing manifest grants nothing
+  re-adds, such as `service_role` on an existing function; exit 1), `function_acl_missing`
+  (only what the migrator adds: the runtime role's #116 grants, and functions a pending
+  migration creates; exit 0) and `function_acl_public_revoked` (PUBLIC EXECUTE the migrator
+  revokes first; exit 0).
 - **No schema-scoped grant in `sessions`:** a function default defined `IN SCHEMA sessions`
   (by any role) adds to the global default, so any entry granting a role other than its
   own (for example `authenticated`) refuses the gate and the bootstrap

@@ -190,6 +190,29 @@ other change. The contract accepts it only as **session pipeline update**:
   cascade together with any other change, or without `session-pipeline`
   updating, is refused.
 
+## Repo tag rename (one time, before the read API rollout)
+
+3f8494c renamed the repository, so the stack-wide tag `96bulls:repo` changes
+from `AgentWorkforce/96BullSessions` to `AgentWorkforce/sessions-pipeline` on
+every tagged resource. The contract accepts that plan only as **repo tag
+rename**, and only on its own:
+
+- Capture **without** `transcriptStore.sessionReadApi` in the inputs, so the
+  plan has no read API creates. A plan with any create (the read API or
+  anything else), replacement or deletion is refused.
+- Every updated resource must differ by exactly one pair,
+  `96bulls:repo: AgentWorkforce/96BullSessions` →
+  `96bulls:repo: AgentWorkforce/sessions-pipeline`, at the same position and
+  indentation. `session-pipeline` may update only with "no declared property
+  changes". The five role grants (above) may also show the role-ARN cascade,
+  checked as in a pipeline update; `session-reconcile-continue` has no tags and
+  shows only the cascade. Any other changed, added or removed line is refused,
+  including another tag key or another repo value. The two repo values are
+  hard-coded, so a later tag change needs its own contract change.
+- Apply it, then add `sessionReadApi` back, capture again and apply: that plan
+  is the separate **session read api rollout** (creates only, everything else
+  `noop`).
+
 ## Rollback
 
 | What | How |
