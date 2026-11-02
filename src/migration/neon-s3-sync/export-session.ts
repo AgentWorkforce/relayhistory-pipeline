@@ -130,13 +130,13 @@ class MachineStream {
   constructor(
     readonly target: ExportTarget,
     readonly unit: SessionUnit,
-    machine: string,
+    readonly sourceMachineId: string,
   ) {
     const startDate = new Date(unit.firstMs).toISOString().slice(0, 10);
     this.loc = {
       prefix: orgPrefix(target.keyRoot, unit.orgId),
       workspaceId: component(unit.workspaceId),
-      machineId: component(machine),
+      machineId: component(sourceMachineId),
       harness: component(unit.source),
       sessionId: component(unit.sessionId),
       startDate,
@@ -370,6 +370,8 @@ async function buildManifest(
         session_uuid_source: "minted",
         tenant_id: orgId,
         user_id: userId,
+        canonical_session_id: unit.sessionId,
+        canonical_machine_id: stream.sourceMachineId,
       },
       [EXPORT_MARKER]: {
         version: 1,
@@ -385,6 +387,7 @@ async function buildManifest(
           neon_source: unit.source,
           first_activity: startedAt,
           last_activity: new Date(unit.lastMs).toISOString(),
+          neon_machine_id: stream.sourceMachineId,
           ...unit.totals,
           ...(stream.truncated ? { truncated_strings: stream.truncated } : {}),
         },

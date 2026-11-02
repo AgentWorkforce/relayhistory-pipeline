@@ -101,4 +101,87 @@ describe("HoopDb session index", () => {
     const rows = JSON.parse(String(upsert?.params?.[0])) as Array<{ scrubbed?: boolean }>;
     expect(rows[0]?.scrubbed).toBe(true);
   });
+
+  test("repairs equal-revision identity before projecting the directory", async () => {
+    const calls: Array<{ text: string; params?: unknown[] }> = [];
+    const db = {
+      async query<R>(text: string, params?: unknown[]) {
+        calls.push({ text, params });
+        if (text.includes("SELECT session_uuid::text"))
+          return {
+            rows: [{ session_uuid: sessionUuid, user_id: "unknown", fanout_revision: "1" }] as R[],
+          };
+        if (text.includes("upsert_session_index"))
+          return { rows: [{ applied: false, revision: "1" }] as R[] };
+        if (text.includes("WITH live AS"))
+          return { rows: [{ projected: true }] as R[] };
+        return { rows: [] as R[] };
+      },
+    } as unknown as HoopDb;
+    const manifest = scrubbedManifest();
+    manifest.session.session_id = "kimi_session";
+    manifest.session.machine_id = "machine_encoded";
+    manifest.extensions = {
+      ...manifest.extensions,
+      "96bulls": {
+        session_uuid: sessionUuid,
+        session_uuid_source: "minted",
+        user_id: "user-real",
+        canonical_session_id: "kimi:session",
+        canonical_machine_id: "machine:encoded",
+      },
+    };
+    const reader: ManifestReader = {
+      provider: "s3",
+      bucket: "locker",
+      async read() {
+        return { manifest, etag: "etag-1" };
+      },
+    };
+    const queue: PipelineQueue = {
+      backend: "memory",
+      async send() {},
+      async sendBatch() {},
+    };
+    await hoopDbSessionIndex({ db, reader, queue, current: () => undefined })
+      .upsertRawPointer(
+        {
+          traceId,
+          workspaceId: "ws-test",
+          machineId: "machine_encoded",
+          harness: "codex",
+          sessionId: "kimi_session",
+          manifestKey,
+          provider: "s3",
+          bucket: "locker",
+        },
+        {
+          traceId,
+          orgId: "org-test",
+          workspaceId: "ws-test",
+          machineId: "machine_encoded",
+          harness: "codex",
+          sessionId: "kimi_session",
+        },
+      );
+
+    const extAt = calls.findIndex((call) =>
+      call.text.includes("INSERT INTO sessions.session_index_ext"),
+    );
+    const repairAt = calls.findIndex((call) =>
+      call.text.includes("canonical_session_id = $8"),
+    );
+    const projectionAt = calls.findIndex((call) =>
+      call.text.includes("WITH live AS"),
+    );
+    expect(extAt).toBeGreaterThan(-1);
+    expect(repairAt).toBeGreaterThan(extAt);
+    expect(projectionAt).toBeGreaterThan(repairAt);
+    expect(calls[extAt]!.params?.[8]).toBe("user-real");
+    expect(calls[repairAt]!.params?.slice(6)).toEqual([
+      "user-real",
+      "kimi:session",
+      "machine:encoded",
+    ]);
+  });
 });

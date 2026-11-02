@@ -310,6 +310,7 @@ Re-drive the DLQ after a fix with
 - Fan-out to summaries and state (`summary-*`, `status-classify`) is off
   (`PIPELINE_FANOUT=off`). Nothing consumes those queues in production yet.
   Bob Costas's sweep rebuilds missing summaries once it runs.
-- A pointer row's `user_id` follows the HoopDb index (`unknown` without an
-  authenticated upload). ClickHouse rows take the user from the export grant
-  or the manifest's `96bulls.user_id`.
+- A pointer row's `user_id` prefers the authenticated HoopDb identity, retains
+  an already-recorded real identity, then accepts a validated export/Courier
+  manifest binding. `unknown` is never projected as a directory membership.
+  ClickHouse rows use the same export grant or admitted manifest identity.

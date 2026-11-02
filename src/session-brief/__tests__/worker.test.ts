@@ -12,7 +12,7 @@ import { writeShortSummary } from "../../hoopdb/session-directory-summary.ts";
 import { briefConfig } from "../config.ts";
 import { SessionAnalysisProviderError } from "../engine/transport.ts";
 import { SUMMARY_INSTRUCTIONS } from "../engine/summary-prompt.ts";
-import { armWakeup } from "../store.ts";
+import { armWakeup, sweepUnbriefed } from "../store.ts";
 import { briefTick } from "../worker.ts";
 import {
   FakeModel,
@@ -231,6 +231,35 @@ describe("a due wakeup is briefed by the model", () => {
       expect(line).not.toContain(s.model.reply.title);
       expect(line).not.toContain("lease renewal");
     }
+  });
+
+  test("canonical directory ids still sweep, title and summarize through the physical pointer", async () => {
+    const s = await setup();
+    await s.upload([user("brief the canonical session"), assistant("done")]);
+    await s.pg.exec(
+      `UPDATE sessions.session_index
+          SET canonical_session_id = 'kimi:s-1', canonical_machine_id = 'machine:m-1';
+       DELETE FROM sessions.session_directory;
+       DELETE FROM sessions.session_brief_wakeups;`,
+    );
+    await projectSessionDirectory(hoopDb(s.pg), KEY);
+    expect(await sweepUnbriefed(hoopDb(s.pg), 10)).toBe(1);
+    expect((await wakeups(s.pg)).map((w) => w.session_id)).toEqual(["s-1"]);
+    await dueNow(s.pg);
+    expect(await s.tick()).toEqual({ generated: 1 });
+    expect(
+      (
+        await s.pg.query<Record<string, unknown>>(
+          "SELECT session_id, title, short_summary FROM sessions.session_directory",
+        )
+      ).rows,
+    ).toEqual([
+      {
+        session_id: "kimi:s-1",
+        title: s.model.reply.title,
+        short_summary: s.model.reply.description,
+      },
+    ]);
   });
 
   test("a RelayHistory record stream (the Neon export shape) briefs from its projected events", async () => {

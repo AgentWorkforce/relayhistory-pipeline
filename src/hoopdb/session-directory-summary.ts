@@ -131,7 +131,18 @@ export async function writeShortSummary(
     throw error;
   }
   const { rows } = await db.query<{ written: boolean }>(
-    `UPDATE sessions.session_directory AS d
+    `WITH target AS (
+       SELECT d.session_id
+         FROM sessions.session_directory AS d
+        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3
+          AND (d.session_id = $4 OR EXISTS (
+            SELECT 1 FROM sessions.session_index AS p
+             WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+               AND p.harness = d.harness AND p.session_id = $4
+               AND coalesce(p.canonical_session_id, p.session_id) = d.session_id))
+        ORDER BY (d.session_id <> $4) DESC LIMIT 1
+     )
+     UPDATE sessions.session_directory AS d
         SET short_summary = $5,
             short_summary_scrub_ruleset = $6,
             short_summary_scrub_version = $7,
@@ -141,7 +152,8 @@ export async function writeShortSummary(
               d.title, d.task_title, d.agent_name, d.project_id,
               d.git_repo, d.git_branch, d.model, $5),
             projected_at = now()
-      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+       FROM target AS t
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = t.session_id
         AND d.deleted_at IS NULL
         AND (d.short_summary_generated_at IS NULL OR d.short_summary_generated_at <= $9::timestamptz)
         AND (d.short_summary_source IS NULL OR left(d.short_summary_source, $10) <> $11
@@ -172,7 +184,18 @@ async function clearOlderShortSummary(
   source: string,
 ): Promise<boolean> {
   const { rows } = await db.query<{ cleared: boolean }>(
-    `UPDATE sessions.session_directory AS d
+    `WITH target AS (
+       SELECT d.session_id
+         FROM sessions.session_directory AS d
+        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3
+          AND (d.session_id = $4 OR EXISTS (
+            SELECT 1 FROM sessions.session_index AS p
+             WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+               AND p.harness = d.harness AND p.session_id = $4
+               AND coalesce(p.canonical_session_id, p.session_id) = d.session_id))
+        ORDER BY (d.session_id <> $4) DESC LIMIT 1
+     )
+     UPDATE sessions.session_directory AS d
         SET short_summary = NULL,
             short_summary_scrub_ruleset = NULL,
             short_summary_scrub_version = NULL,
@@ -182,7 +205,8 @@ async function clearOlderShortSummary(
               d.title, d.task_title, d.agent_name, d.project_id,
               d.git_repo, d.git_branch, d.model, NULL),
             projected_at = now()
-      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+       FROM target AS t
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = t.session_id
         AND d.deleted_at IS NULL AND d.short_summary IS NOT NULL
         AND d.short_summary_generated_at <= $5::timestamptz
         -- The same producer precedence as the write: a refused extractive summary
@@ -209,7 +233,18 @@ export async function clearShortSummary(
   key: SessionDirectoryKey,
 ): Promise<boolean> {
   const { rows } = await db.query<{ cleared: boolean }>(
-    `UPDATE sessions.session_directory AS d
+    `WITH target AS (
+       SELECT d.session_id
+         FROM sessions.session_directory AS d
+        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3
+          AND (d.session_id = $4 OR EXISTS (
+            SELECT 1 FROM sessions.session_index AS p
+             WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+               AND p.harness = d.harness AND p.session_id = $4
+               AND coalesce(p.canonical_session_id, p.session_id) = d.session_id))
+        ORDER BY (d.session_id <> $4) DESC LIMIT 1
+     )
+     UPDATE sessions.session_directory AS d
         SET short_summary = NULL,
             short_summary_scrub_ruleset = NULL,
             short_summary_scrub_version = NULL,
@@ -219,7 +254,8 @@ export async function clearShortSummary(
               d.title, d.task_title, d.agent_name, d.project_id,
               d.git_repo, d.git_branch, d.model, NULL) ELSE '' END,
             projected_at = now()
-      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+       FROM target AS t
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = t.session_id
         AND d.short_summary IS NOT NULL
       RETURNING true AS cleared`,
     [key.orgId, key.workspaceId, key.harness, key.sessionId],
@@ -239,7 +275,31 @@ export async function propagatePointerTombstone(
   key: SessionDirectoryKey,
 ): Promise<{ found: boolean; tombstoned: boolean }> {
   const { rows } = await db.query<{ tombstoned: boolean }>(
-    `UPDATE sessions.session_directory AS d
+    `WITH identity_stats AS (
+       SELECT count(*) AS pointers,
+              count(DISTINCT coalesce(canonical_session_id, session_id)) AS identities,
+              min(coalesce(canonical_session_id, session_id)) AS canonical_session_id
+         FROM sessions.session_index
+        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4
+     ), identity AS (
+       SELECT CASE WHEN pointers = 0 THEN $4 ELSE canonical_session_id END AS canonical_session_id
+         FROM identity_stats WHERE pointers = 0 OR identities = 1
+     ), target AS (
+       SELECT CASE
+         WHEN EXISTS (
+           SELECT 1 FROM sessions.session_directory AS existing
+            WHERE existing.org_id = $1 AND existing.workspace_id = $2
+              AND existing.harness = $3 AND existing.session_id = i.canonical_session_id)
+           THEN i.canonical_session_id
+         WHEN i.canonical_session_id <> $4 AND EXISTS (
+           SELECT 1 FROM sessions.session_directory AS legacy
+            WHERE legacy.org_id = $1 AND legacy.workspace_id = $2
+              AND legacy.harness = $3 AND legacy.session_id = $4)
+           THEN $4
+         ELSE i.canonical_session_id END AS session_id
+       FROM identity AS i
+     )
+     UPDATE sessions.session_directory AS d
         SET short_summary = NULL,
             short_summary_scrub_ruleset = NULL,
             short_summary_scrub_version = NULL,
@@ -252,12 +312,14 @@ export async function propagatePointerTombstone(
               WHEN EXISTS (
                 SELECT 1 FROM sessions.session_index AS p
                  WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
-                   AND p.harness = d.harness AND p.session_id = d.session_id
+                   AND p.harness = d.harness AND p.session_id = $4
                    AND p.deleted_at IS NULL)
               THEN d.deleted_at
               ELSE coalesce(d.deleted_at, now()) END,
             projected_at = now()
-      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+       FROM target AS t
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3
+        AND d.session_id = t.session_id
       RETURNING d.deleted_at IS NOT NULL AS tombstoned`,
     [key.orgId, key.workspaceId, key.harness, key.sessionId],
   );
@@ -275,8 +337,15 @@ export async function eraseSessionDirectory(
   const session = "sessionId" in scope ? scope : null;
   const { rows } = await db.query<{ n: number }>(
     session
-      ? `WITH gone AS (DELETE FROM sessions.session_directory
-           WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 RETURNING 1)
+      ? `WITH gone AS (
+           DELETE FROM sessions.session_directory AS d
+            WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3
+              AND (d.session_id = $4 OR EXISTS (
+                SELECT 1 FROM sessions.session_index AS p
+                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+                   AND p.harness = d.harness AND p.session_id = $4
+                   AND coalesce(p.canonical_session_id, p.session_id) = d.session_id))
+           RETURNING 1)
          SELECT count(*)::int AS n FROM gone`
       : `WITH gone AS (DELETE FROM sessions.session_directory
            WHERE org_id = $1 AND workspace_id = $2 RETURNING 1)

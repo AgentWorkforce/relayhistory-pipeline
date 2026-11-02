@@ -1375,7 +1375,8 @@ describe("short_summary deletion propagation", () => {
     // Re-projected from the remaining live pointer (m2 has no title/project), keeping
     // the agent name, without the summary.
     expect(current?.machine_ids).toEqual(["m2"]);
-    expect(current?.search_text).toBe("Helm");
+    // Catalog-derived project identity survives a pointer whose scalar is null.
+    expect(current?.search_text).toBe("Helm proj-1");
     expect(
       await search(db, claims("org-a", ["ws-a"]), "ws-a", "heron"),
     ).toEqual([]);
@@ -1747,7 +1748,7 @@ describe("short_summary end to end through the pipeline", () => {
        UNION ALL SELECT 'm' FROM sessions.session_directory_machines WHERE session_id = 's-e2e'`,
         )
       ).rows.length;
-    expect(await members()).toBe(3); // one user ("unknown"), two machines
+    expect(await members()).toBe(2); // placeholders are not user memberships
     const a = claims("org-a", ["ws-e2e"]);
     expect(await search(db, a, "ws-e2e", "pelican")).toHaveLength(1);
 

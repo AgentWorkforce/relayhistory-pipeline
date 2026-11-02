@@ -73,7 +73,12 @@ afterEach(async () => {
 });
 
 /** Write one manifest (one chunk) for `machine` and return its key. */
-async function writeSession(machine: string, records: RelayhistoryStreamRecord[], revision = 1, opts: { scrubbed?: boolean } = {}) {
+async function writeSession(
+  machine: string,
+  records: RelayhistoryStreamRecord[],
+  revision = 1,
+  opts: { scrubbed?: boolean; extensions?: Record<string, unknown> } = {},
+) {
   const location = loc(machine);
   const source = new TextEncoder().encode(`${records.map((r) => JSON.stringify(r)).join("\n")}\n`);
   const stored = new Uint8Array(zstdCompressSync(source));
@@ -118,7 +123,10 @@ async function writeSession(machine: string, records: RelayhistoryStreamRecord[]
       chunks: [chunk],
       ...(opts.scrubbed === false ? {} : { scrub: { ruleset: "relayhistory-scrub", version: 1 } }),
     },
-    extensions: { "96bulls": { user_id: "user_1" } },
+    extensions: {
+      "96bulls": { user_id: "user_1" },
+      ...(opts.extensions ?? {}),
+    },
   } as ManifestV1;
   const key = manifestKey(location);
   await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)), { contentType: "application/json" });
@@ -208,6 +216,64 @@ function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"],
 }
 
 describe("search index from S3", () => {
+  test("writes project/repository catalog only after a complete canonical scope projection", async () => {
+    const sessionRecord: RelayhistoryStreamRecord = {
+      kind: "session",
+      origin_id: "desktop-origin",
+      record_id: "session-1",
+      revision: "1",
+      operation: "upsert",
+      received_at: AT,
+      payload: {
+        project_key: "github.com/acme/widgets",
+        project_key_method: "git_remote",
+        repo_url: "git@github.com:acme/widgets.git",
+        git_branch: "main",
+        agent_name: "codex",
+        models_json: ["gpt-5"],
+      },
+    };
+    let keys = [
+      await writeSession("srv_bb", [sessionRecord], 1, {
+        extensions: {
+          "96bulls": {
+            user_id: "user_1",
+            canonical_session_id: "sess:1",
+          },
+        },
+      }),
+    ];
+    const ch = fakeClickHouse();
+    const sb = fakeSupabase(() => keys);
+    const writes: Array<{
+      key: Parameters<NonNullable<SearchIndexDeps["writeCatalog"]>>[1];
+      catalog: Parameters<NonNullable<SearchIndexDeps["writeCatalog"]>>[2];
+    }> = [];
+    const deps: SearchIndexDeps = {
+      ...searchDeps(ch.ch, sb.transact),
+      writeCatalog: async (_db, key, catalog) => {
+        writes.push({ key, catalog });
+        return { written: true };
+      },
+    };
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({
+      key: { sessionId: "sess:1" },
+      catalog: {
+        projectKey: "github.com/acme/widgets",
+        projectId: "acme/widgets",
+        gitRepo: "git@github.com:acme/widgets.git",
+        gitBranch: "main",
+        agentNames: ["codex"],
+      },
+    });
+
+    keys = [...keys, manifestKey(loc("srv_missing"))];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: false });
+    expect(writes).toHaveLength(1);
+  });
+
   test("two manifests carrying the same delivery records index each event once, by its Neon identity", async () => {
     const records = [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "first"), event("r2", "1", Date.parse("2026-11-01T10:00:02Z"), "second")];
     const exporter = await writeSession("delivery_aa", records);
