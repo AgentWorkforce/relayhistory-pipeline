@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/AgentWorkforce/relayhistory-cloud",
-  "commit": "5bf0704c91e0ae8037b7cb06d53841ee37856b03",
+  "commit": "634fb4b294ae9f88e4d046e055a9d95b14a87f72",
   "path": "packages/relayhistory/src/lib/session-analysis",
   "upstream_provenance": "engine/PROVENANCE.md there: ported from AgentWorkforce/skip 07a16203 (+ local summary improvements)",
   "summary_prompt_sha256": "2407689ddf4445df9a01e0f965ee65890f47020ea461e1bc7bdbe08d01c16614",
