@@ -72,7 +72,9 @@ const MAX_ID_CHARS = 512;
  * to `until` (inclusive, one microsecond below the floor, so relayhistory's
  * microsecond timestamps neither repeat a row served here nor skip one) and no
  * cursor. Ordering is newest first, so every later relayhistory page is older
- * still and the pagination never revisits this backend.
+ * still and the pagination never revisits this backend. The response carries
+ * `X-Sessions-Read-Continuation: history_floor`; a caller that sees the header
+ * must finish the page, and must not pass it on as a short final page.
  */
 export interface Continuation {
   backend: "relayhistory";
@@ -294,6 +296,8 @@ export function createReadApi(deps: ReadApiDeps) {
         // Cursor page: end this backend's part cleanly and hand the rest over.
         const continuation: Continuation = { backend: "relayhistory", reason: "history_floor", until: continuationUntil(deps.completeSinceMs) };
         log({ route: c.req.routePath, reason: "history_floor_continuation", status: 200, correlation_id: c.get("correlationId") });
+        // Flags the page so the caller finishes it without parsing every page body.
+        c.header("X-Sessions-Read-Continuation", "history_floor");
         return c.json({ events: page.events, nextCursor: null, continuation, correlationId: c.get("correlationId") });
       }
       return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });

@@ -154,11 +154,13 @@ describe("history floor and erasure", () => {
     expect(b.continuation).toEqual({ backend: "relayhistory", reason: "history_floor", until: "2026-08-31T23:59:59.999999Z" });
     expect(eventQueries()[0]).toContain("{since:Int64}");
     expect(logs.some((l) => l.reason === "history_floor_continuation")).toBe(true);
+    expect(r.headers.get("x-sessions-read-continuation")).toBe("history_floor");
     // A full cursor page below no floor keeps its own cursor and no continuation.
     const full = api({ ch: stubCh({ candidates: [cand], newest }).ch, completeSinceMs: floor });
     const f = await body(await full.get(`/v1/events?workspace=ws-a&q=needle&limit=1&cursor=${cursor}`));
     expect(f.nextCursor).toStartWith("b96e1:");
     expect(f.continuation).toBeUndefined();
+    expect((await full.get(`/v1/events?workspace=ws-a&q=needle&limit=1&cursor=${cursor}`)).headers.get("x-sessions-read-continuation")).toBeNull();
   });
 
   test("continuationUntil is one microsecond below the floor, in relayhistory's accepted format", () => {

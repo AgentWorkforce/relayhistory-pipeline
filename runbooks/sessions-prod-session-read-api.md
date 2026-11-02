@@ -24,11 +24,11 @@ These requests get `501 unsupported_by_backend` with a `reason`, and Cloud then 
 
 **Only a first page is ever a 501.** Once a cursor has been issued, Cloud cannot fall back without restarting the caller's pagination, so:
 - The `needs_full` check runs when pagination starts. A cursor continues the read that check admitted.
-- A search cursor page that reaches `completeSince` is a terminal `200` with `nextCursor: null` and `continuation: { backend: "relayhistory", reason: "history_floor", until }`. `events` holds every match from the floor up. `until` is one microsecond below the floor. Cloud fetches the rest of that page from relayhistory with the same parameters, `until`, and no cursor, appends it, and returns relayhistory's cursor, so the caller's pagination continues there without an error, a gap or a repeat.
+- A search cursor page that reaches `completeSince` is a terminal `200`, flagged `X-Sessions-Read-Continuation: history_floor`, with `nextCursor: null` and `continuation: { backend: "relayhistory", reason: "history_floor", until }`. `events` holds every match from the floor up. `until` is one microsecond below the floor. Cloud fetches the rest of that page from relayhistory with the same parameters, `until`, and no cursor, appends it, and returns relayhistory's cursor, so the caller's pagination continues there without an error, a gap or a repeat.
 
 ## Guarantees and their tests
 
-Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--only "read api"`, 18 of 18 caught). Reverting the control turns the named test red.
+Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--only "read api"`, 20 of 20 caught). Reverting the control turns the named test red.
 
 **Tenancy:**
 - Org and workspace come only from the verified RelayAuth assertion. The token must be:
