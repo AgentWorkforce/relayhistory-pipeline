@@ -397,3 +397,43 @@ describe("a JSON line inside an open private-key block does not split the key (H
       expect(records).toBe(text.split("\n").length - 1);
     });
 });
+
+// ------------------------------------- independent review of ea3d6cd (K-1), bulls-lead-claude
+
+describe("a cut never lands inside a private-key block that closed before the overflow (K-1)", () => {
+  const body = (i: number) => `MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEeP${String(i).padStart(4, "0")}`;
+  const build = (gapLines: number) => {
+    const tail: string[] = [];
+    // The cue makes the header boundary unsafe, so the run is not flushed before the key.
+    tail.push("Here is the private key:");
+    tail.push("-----BEGIN RSA PRIVATE KEY-----");
+    for (let i = 0; i < 300; i++) tail.push(body(i));
+    // Whitespace runs over MAX_CUT_GAP inside the block push the search back into it.
+    for (let i = 300; i < 300 + gapLines; i++) tail.push(body(i) + " ".repeat(1100));
+    tail.push("-----END RSA PRIVATE KEY----- 1");
+    // Digit-straddled lines: every later boundary is unsafe.
+    for (let i = 0; i < 1500; i++) tail.push(`${i},${i * 7},${i * 13}`);
+    const tailText = tail.join("\n") + "\n";
+    // Filler so the whole text just passes the bound, overflowing inside the numeric lines.
+    const filler = "lorem ipsum dolor sit amet ".repeat(40) + "\n";
+    const need = Math.ceil((MAX_SCRUB_CHARS + 4_096 - tailText.length) / filler.length);
+    return filler.repeat(Math.max(0, need)) + tailText;
+  };
+  for (const gaps of [40, 1])
+    it(`no key line survives (${gaps} gap line${gaps === 1 ? "" : "s"})`, () => {
+      const text = build(gaps);
+      expect(text.length).toBeGreaterThan(MAX_SCRUB_CHARS);
+      expect(scrubText(text)).not.toContain(body(0));
+      // Either the chunk is refused (no safe cut within the search window: never stored
+      // partly scrubbed) or it is stored with the whole key redacted. Never a key line in clear.
+      let out: string;
+      try {
+        out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
+      } catch (error) {
+        expect((error as { code?: string }).code).toBe("chunk_unsegmentable");
+        return;
+      }
+      for (let i = 0; i < 300 + gaps; i++) expect(out).not.toContain(body(i));
+      expect(out).not.toContain("-----END RSA PRIVATE KEY");
+    });
+});

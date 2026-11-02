@@ -2,8 +2,10 @@
  * The server's raw-chunk writer: scrubs a source range of PII and secrets
  * before it reaches object storage, then compresses and stores it at its v1
  * key. It mirrors the client's `scrub::seal::put_raw_chunk` (manifest spec,
- * "Scrubbing"), so a chunk the server seals is indistinguishable from one a
- * client sealed:
+ * "Scrubbing"), so a chunk the server seals has the same shape as one a
+ * client sealed. Its `raw.scrub.version` says which rules ran: from rule set 2
+ * the server also stores a string past the scrub bound, scrubbed in segments,
+ * where rule set 1 (and a client still on it) refuses it.
  *
  *   - `start_offset`, `bytes` and `sha256` describe the **source** range, so
  *     the key, resume, epochs and the hash chain do not depend on scrubbing;
@@ -300,7 +302,17 @@ function safeCut(run: string, lookahead: string): number {
   const text = run + lookahead;
   const budget: CutBudget = { checks: 0, candidates: 0 };
   const floor = Math.max(1, run.length - CUT_SEARCH_CHARS);
+  const keys = keyBlockSpans(run);
   for (let cut = run.length; cut >= floor && withinBudget(budget); ) {
+    // Never inside a key block, even one that closed before the overflowing line
+    // (the context check cannot see a header more than CUT_CONTEXT_CHARS back):
+    // go to the line boundary at or before its header.
+    const inside = keyBlockAround(keys, cut);
+    if (inside) {
+      cut = run.lastIndexOf("\n", inside[0] - 1) + 1;
+      if (cut === 0) break;
+      continue;
+    }
     const v = cutIsSafe(text, cut, budget);
     if (v.ok) return cut;
     // The previous line boundary before this whitespace run: just after the
@@ -325,6 +337,39 @@ function privateKeyOpenAfter(line: string, open: boolean) {
     ...[...line.matchAll(pemEnd())].map((m) => [m.index, false] as const),
   ].sort((a, b) => a[0] - b[0]);
   return marks.length ? marks[marks.length - 1]![1] : open;
+}
+
+/**
+ * Every private-key block in `text` as [start, end): from its header to just past
+ * its footer, or to the end of `text` for a block left open. A cut strictly inside
+ * one splits the key across segments, and each segment alone holds a header without
+ * its footer (or the reverse), which no rule redacts: the key lines after the cut
+ * would be stored in clear. The cut searches never stop inside one.
+ */
+function keyBlockSpans(text: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  const PEM_BEGIN = pemBegin();
+  const PEM_END = pemEnd();
+  let at = 0;
+  for (;;) {
+    PEM_BEGIN.lastIndex = at;
+    const begin = PEM_BEGIN.exec(text);
+    if (!begin) break;
+    PEM_END.lastIndex = begin.index + begin[0].length;
+    const end = PEM_END.exec(text);
+    if (!end) {
+      spans.push([begin.index, text.length]);
+      break;
+    }
+    spans.push([begin.index, end.index + end[0].length]);
+    at = end.index + end[0].length;
+  }
+  return spans;
+}
+
+/** The key block `cut` falls strictly inside, if any. */
+function keyBlockAround(spans: Array<[number, number]>, cut: number): [number, number] | undefined {
+  return spans.find(([start, end]) => cut > start && cut < end);
 }
 
 /** A record line whose first token is a JSON string, with that string redacted (still valid JSON). */
@@ -420,7 +465,14 @@ function longCut(text: string): number {
   if (open !== -1) top = open;
   const floor = Math.max(1, MAX_SCRUB_CHARS - CUT_SEARCH_CHARS);
   const budget: CutBudget = { checks: 0, candidates: 0 };
+  const keys = keyBlockSpans(text.slice(0, top));
   for (let cut = top; cut >= floor && withinBudget(budget); cut--) {
+    // Not inside a key block that closed below the bound either.
+    const inside = keyBlockAround(keys, cut);
+    if (inside) {
+      cut = inside[0] + 1; // the loop's cut-- lands on the header's start
+      continue;
+    }
     // Only at the end of a whitespace run (after whitespace, before text):
     // one candidate per run, so a run is checked once, not once per char.
     if (!/\s/.test(text[cut - 1] ?? "") || /\s/.test(text[cut] ?? "")) continue;
