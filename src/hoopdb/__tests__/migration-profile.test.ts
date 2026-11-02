@@ -24,6 +24,8 @@ import {
   RUNTIME_APPLICATION_FUNCTIONS,
   sessionsFunctionAcl,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
+  SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256,
+  SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS,
   SUPABASE_PLATFORM_SUPERUSERS,
 } from "../migrate-guards.ts";
 import { gateOpen, workerTick } from "../../shared/worker.ts";
@@ -1313,6 +1315,48 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
     return db;
   }
+  const ABSENT_EVENT_TRIGGER = {
+    name: "hoopdb_sessions_function_boundary",
+    present: false,
+    event: null,
+    tags: [],
+    tags_exact: false,
+    enabled: null,
+    enabled_ok: false,
+    owner: null,
+    owner_is_migration_owner: false,
+    function: null,
+    function_is_reviewed: false,
+    function_owner: null,
+    function_owner_is_migration_owner: false,
+    schema_owner_is_migration_owner: false,
+    prosrc_sha256: null,
+    prosrc_exact: false,
+    proconfig: [],
+    proconfig_exact: false,
+    security_definer: null,
+    volatility: null,
+    language: null,
+    returns: null,
+    function_acl: [],
+    function_public_execute: true,
+    runtime_role_setting: null,
+    runtime_role_setting_matches: false,
+    schema_private: false,
+    verified: false,
+  };
+  /** The reviewed bootstrap, without psql meta-commands (PGlite runs plain SQL). */
+  const ET_BOOT = readFileSync(
+    join(
+      root,
+      "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql",
+    ),
+    "utf8",
+  )
+    .split("\n")
+    .filter((l) => !l.startsWith("\\"))
+    .join("\n")
+    .replaceAll(":'runtime_role'", "'g6_rt'");
   const SUPA: MigrationProfile = {
     mode: "supabase",
     shim: false,
@@ -1347,16 +1391,18 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       sessions_schema_function_defaults: [],
       sessions_functions_owned_by_owner: true,
       event_trigger_present: false,
+      event_trigger: ABSENT_EVENT_TRIGGER,
+      other_event_triggers: [],
       mode: "none",
       satisfied: false,
     });
-    // Names and booleans only (in arrays and objects too).
+    // Names, booleans, hashes and nulls only (in arrays and objects too).
     const leaves = (v: unknown): unknown[] =>
       v !== null && typeof v === "object"
         ? Object.values(v as object).flatMap(leaves)
         : [v];
     for (const v of leaves(evidence))
-      expect(["string", "boolean"]).toContain(typeof v);
+      expect(v === null || ["string", "boolean"].includes(typeof v)).toBe(true);
     // Mode selected but the control absent: still refused.
     expect(
       (
@@ -1408,6 +1454,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   // Option (ii): in supabase mode only, a role that is BOTH rolsuper (catalog, at gate
   // time) AND named in SUPABASE_PLATFORM_SUPERUSERS is the platform trust root and is left
   // out of creator coverage, with its attributes in the evidence.
+  const SUPA_ET: MigrationProfile = {
+    ...SUPA,
+    functionBoundary: "event-trigger",
+  };
   const SUPA_A: MigrationProfile = {
     ...SUPA,
     functionBoundary: "global-default-revoke",
@@ -1710,33 +1760,256 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     }
   });
 
-  test("event-trigger mode is not implemented: refused even with a trigger of the right name present", async () => {
+  test("event-trigger mode is accepted only with HOOPDB_DB_MODE=supabase; selfhosted, cloudsql and local refuse it", () => {
+    const env = {
+      HOOPDB_RUNTIME_ROLE: "g6_rt",
+      HOOPDB_RUNTIME_ROLE_LOGIN: "false",
+      HOOPDB_FUNCTION_BOUNDARY_MODE: "event-trigger",
+    };
+    expect(
+      migrationProfile({ ...env, HOOPDB_DB_MODE: "supabase" }).functionBoundary,
+    ).toBe("event-trigger");
+    for (const mode of ["selfhosted", "cloudsql", "local"])
+      expect(() =>
+        migrationProfile({
+          ...env,
+          HOOPDB_DB_MODE: mode,
+          HOOPDB_SUPABASE_SHIM: mode === "local" ? "true" : "false",
+        }),
+      ).toThrow(
+        expect.objectContaining({ code: "function_boundary_mode_unsupported" }),
+      );
+  });
+
+  test("event-trigger mode: a trigger of the right name but another definition never satisfies the gate", async () => {
     const db = await supabaseLike();
     await db.exec(`CREATE FUNCTION public.g6_revoke_sessions_public() RETURNS event_trigger LANGUAGE plpgsql AS $f$
       BEGIN EXECUTE 'REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC'; END $f$;
       CREATE EVENT TRIGGER ${SESSIONS_FUNCTION_EVENT_TRIGGER} ON ddl_command_end WHEN TAG IN ('CREATE FUNCTION')
         EXECUTE FUNCTION public.g6_revoke_sessions_public();`);
-    expect(() =>
-      migrationProfile({
-        HOOPDB_DB_MODE: "supabase",
-        HOOPDB_RUNTIME_ROLE: "g6_rt",
-        HOOPDB_RUNTIME_ROLE_LOGIN: "false",
-        HOOPDB_FUNCTION_BOUNDARY_MODE: "event-trigger",
-      }),
-    ).toThrow(
-      expect.objectContaining({ code: "function_boundary_mode_unimplemented" }),
+    const error = await failure(
+      runMigrations(client(db), { profile: SUPA_ET }),
     );
-    // Even forced through a profile object, a trigger's name never satisfies the gate.
+    expect(error?.code).toBe("function_boundary_unproven");
+    const ev = JSON.parse(error!.message!.match(/(\{.*\})/)![1]!);
+    expect(ev.event_trigger).toMatchObject({
+      present: true,
+      tags_exact: false,
+      function_is_reviewed: false,
+      prosrc_exact: false,
+      verified: false,
+    });
+    expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
+  });
+
+  test("event-trigger mode (supabase): the reviewed bootstrap passes a fresh full migrate; the trigger enforces the boundary afterwards", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    expect(
+      await failure(runMigrations(client(db), { profile: SUPA_ET })),
+    ).toBeNull();
+    const ev = await functionBoundaryEvidence(
+      client(db),
+      "event-trigger",
+      "supabase",
+      "g6_rt",
+    );
+    expect(ev.satisfied).toBe(true);
+    expect(ev.event_trigger.verified).toBe(true);
+    expect(ev.owner_function_default_exact).toBe(false); // the trigger covers the owner
+    // The exact manifest (plus the runtime application ACL) holds after the migrate.
+    expect(await sessionsFunctionAcl(client(db))).toEqual(
+      manifestWithRuntime("g6_rt"),
+    );
+    // A new function is owner-only; a grant outside the manifest aborts.
+    await db.exec(
+      "CREATE FUNCTION sessions.g6_new() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+    );
+    expect(
+      (await sessionsFunctionAcl(client(db)))["sessions.g6_new()"],
+    ).toEqual(["<owner>:EXECUTE"]);
+    for (const stmt of [
+      "GRANT EXECUTE ON FUNCTION sessions.g6_new() TO PUBLIC",
+      "GRANT EXECUTE ON FUNCTION sessions.g6_new() TO anon",
+      "GRANT EXECUTE ON FUNCTION sessions.g6_new() TO authenticated",
+      "GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO anon",
+      "ALTER FUNCTION sessions.g6_new() SECURITY DEFINER",
+      "ALTER FUNCTION sessions.g6_new() OWNER TO g6_rt",
+      "ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT EXECUTE ON FUNCTIONS TO anon",
+    ])
+      await expect(db.exec(stmt)).rejects.toThrow(/sessions function boundary/);
+    // CREATE OR REPLACE keeps a manifested function's exact ACL.
+    await db.exec(
+      "CREATE OR REPLACE FUNCTION sessions.g6_new() RETURNS int LANGUAGE sql AS 'SELECT 2'",
+    );
+    expect(await sessionsFunctionAcl(client(db))).toEqual({
+      ...manifestWithRuntime("g6_rt"),
+      "sessions.g6_new()": ["<owner>:EXECUTE"],
+    });
+  });
+
+  for (const [name, drift] of [
+    [
+      "disabled",
+      `ALTER EVENT TRIGGER ${"hoopdb_sessions_function_boundary"} DISABLE`,
+    ],
+    [
+      "enabled ORIGIN only (skipped in replica mode)",
+      "ALTER EVENT TRIGGER hoopdb_sessions_function_boundary ENABLE",
+    ],
+    [
+      "function body replaced",
+      "CREATE OR REPLACE FUNCTION hoopdb_boundary.sessions_function_boundary() RETURNS event_trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $f$ BEGIN END $f$",
+    ],
+    [
+      "function owner changed",
+      "CREATE ROLE g6_other_owner; ALTER FUNCTION hoopdb_boundary.sessions_function_boundary() OWNER TO g6_other_owner",
+    ],
+    [
+      "a tag missing",
+      "DROP EVENT TRIGGER hoopdb_sessions_function_boundary; CREATE EVENT TRIGGER hoopdb_sessions_function_boundary ON ddl_command_end WHEN TAG IN ('CREATE FUNCTION') EXECUTE FUNCTION hoopdb_boundary.sessions_function_boundary()",
+    ],
+    [
+      "search_path unpinned",
+      "ALTER FUNCTION hoopdb_boundary.sessions_function_boundary() RESET search_path",
+    ],
+    [
+      "made PUBLIC-executable",
+      "GRANT EXECUTE ON FUNCTION hoopdb_boundary.sessions_function_boundary() TO PUBLIC",
+    ],
+    [
+      "made SECURITY DEFINER",
+      "ALTER FUNCTION hoopdb_boundary.sessions_function_boundary() SECURITY DEFINER",
+    ],
+    [
+      "a function-level setting added",
+      "ALTER FUNCTION hoopdb_boundary.sessions_function_boundary() SET work_mem = '64MB'",
+    ],
+    [
+      "schema hoopdb_boundary usable by PUBLIC",
+      "GRANT USAGE ON SCHEMA hoopdb_boundary TO PUBLIC",
+    ],
+    [
+      "schema hoopdb_boundary open for CREATE",
+      "GRANT CREATE ON SCHEMA hoopdb_boundary TO PUBLIC",
+    ],
+  ] as const)
+    test(`event-trigger mode: drift (${name}) fails closed before any write`, async () => {
+      const db = await supabaseLike();
+      await db.exec(ET_BOOT);
+      await db.exec(drift);
+      const error = await failure(
+        runMigrations(client(db), { profile: SUPA_ET }),
+      );
+      // Schema privileges also reach the runtime role, whose allowlist may refuse first;
+      // either way nothing is written and the trigger evidence is unverified.
+      expect(["function_boundary_unproven", "runtime_role_unsafe"]).toContain(
+        error?.code,
+      );
+      expect(
+        (
+          await functionBoundaryEvidence(
+            client(db),
+            "event-trigger",
+            "supabase",
+            "g6_rt",
+          )
+        ).event_trigger.verified,
+      ).toBe(false);
+      expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
+    });
+
+  test("event-trigger mode: another CREATE-capable role without an exact default still fails the gate (the trigger covers only the owner)", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    expect(
+      await failure(runMigrations(client(db), { profile: SUPA_ET })),
+    ).toBeNull();
+    await db.exec(
+      "CREATE ROLE g6_can_create NOLOGIN; GRANT CREATE, USAGE ON SCHEMA sessions TO g6_can_create",
+    );
+    const error = await failure(
+      runMigrations(client(db), { profile: SUPA_ET }),
+    );
+    expect(error?.code).toBe("function_boundary_unproven");
+  });
+
+  test("event-trigger mode: the bootstrap installs the trigger ENABLE ALWAYS", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
     expect(
       (
-        await failure(
-          runMigrations(client(db), {
-            profile: { ...SUPA, functionBoundary: "event-trigger" },
-          }),
+        await db.query<{ e: string }>(
+          "SELECT evtenabled::text AS e FROM pg_event_trigger WHERE evtname = 'hoopdb_sessions_function_boundary'",
         )
-      )?.code,
-    ).toBe("function_boundary_unproven");
-    expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
+      ).rows[0]?.e,
+    ).toBe("A");
+    // A rerun over an ORIGIN-only trigger refuses (an operator decides).
+    await db.exec(
+      "ALTER EVENT TRIGGER hoopdb_sessions_function_boundary ENABLE",
+    );
+    await expect(db.exec(ET_BOOT)).rejects.toThrow(/another definition/);
+  });
+
+  test("event-trigger mode: CREATE TYPE ... AS RANGE in sessions is checked (its PUBLIC constructors abort it), so later GRANTs elsewhere keep working", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    expect(
+      await failure(runMigrations(client(db), { profile: SUPA_ET })),
+    ).toBeNull();
+    // PGlite runs as the bootstrap superuser, which owns the constructors and can revoke
+    // them: they end owner-only. On real PostgreSQL (pg-proof) the command is aborted.
+    await db.exec("CREATE TYPE sessions.g6_range AS RANGE (subtype = int4)");
+    const publicCtors = (
+      await db.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname LIKE 'g6_%range' AND (proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(proacl) a WHERE a.grantee = 0))",
+      )
+    ).rows[0]!.n;
+    expect(publicCtors).toBe(0);
+    await db.exec(
+      "CREATE FUNCTION public.g6_later() RETURNS int LANGUAGE sql AS 'SELECT 1'; GRANT EXECUTE ON FUNCTION public.g6_later() TO anon",
+    );
+  });
+
+  test("run-time exact manifest: a missing manifest grant (allowed by the trigger as a subset) is refused by the next migrate, rolled back (function_acl_drift)", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    expect(
+      await failure(runMigrations(client(db), { profile: SUPA_ET })),
+    ).toBeNull();
+    await db.exec(
+      "REVOKE EXECUTE ON FUNCTION sessions.jwt_org_id() FROM authenticated",
+    );
+    const error = await failure(
+      runMigrations(client(db), { profile: SUPA_ET }),
+    );
+    expect(error?.code).toBe("function_acl_drift");
+    expect(error?.message).toContain("sessions.jwt_org_id()");
+    await db.exec(
+      "GRANT EXECUTE ON FUNCTION sessions.jwt_org_id() TO authenticated",
+    );
+    expect(
+      await failure(runMigrations(client(db), { profile: SUPA_ET })),
+    ).toBeNull();
+  });
+
+  test("the frozen trigger constants match the bootstrap file (prosrc sha256 and tags)", () => {
+    const body = ET_BOOT.split("$boundary$")[1]!;
+    expect(createHash("sha256").update(body).digest("hex")).toBe(
+      SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256,
+    );
+    for (const tag of SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS)
+      expect(ET_BOOT).toContain(`'${tag}'`);
+    const embedded = JSON.parse(ET_BOOT.split("$manifest$")[1]!) as Record<
+      string,
+      string[]
+    >;
+    expect(embedded).toEqual(MANIFEST);
+    const runtimeFns = ET_BOOT.split("v_runtime_fns text[] := ARRAY[")[1]!
+      .split("]::text[]")[0]!
+      .match(/'[^']+'/g)!
+      .map((x) => x.slice(1, -1));
+    expect(runtimeFns).toEqual([...RUNTIME_APPLICATION_FUNCTIONS]);
   });
 
   test("the old HOOPDB_FUNCTION_BOUNDARY_APPROVED name is refused (stale config fails closed)", () => {
