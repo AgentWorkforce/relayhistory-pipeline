@@ -485,3 +485,106 @@ describe("limits and failures", () => {
     expect((await directory(s.pg)).title).toBe("pointer title");
   });
 });
+
+describe("review fixes (#127, Devin 2026-11-02)", () => {
+  const modelHook = (s: Setup, during: () => Promise<void>) => {
+    const real = s.model.complete.bind(s.model);
+    s.model.complete = async (request) => {
+      await during();
+      return real(request);
+    };
+  };
+
+  test("a machine erased during generation never returns in the brief (stale, nothing written)", async () => {
+    const s = await setup();
+    await s.upload([user("fix the build")]);
+    await s.upload([user("other machine content")], { machine: "m-2" });
+    await dueNow(s.pg);
+    modelHook(s, () => s.pg.exec("UPDATE sessions.session_index SET deleted_at = now() WHERE machine_id = 'm-2'").then(() => undefined));
+    expect(await s.tick()).toEqual({ stale: 1 });
+    expect(s.model.requests).toHaveLength(1);
+    const b = await brief(s.pg);
+    expect(b?.title ?? null).toBeNull();
+    expect((await directory(s.pg)).short_summary).not.toBe(s.model.reply.description);
+  });
+
+  test("an older input with fewer machines at the same maximum revision does not overwrite", async () => {
+    const s = await setup();
+    await s.upload([user("fix the build")]);
+    await dueNow(s.pg);
+    // m-2 joins at the same revision while the m-1-only input is with the model.
+    modelHook(s, async () => {
+      await pointer(s.pg, { machine: "m-2", revision: 1, manifestKey: `manifest/${KEY.sessionId}/m-2/r1` });
+    });
+    expect(await s.tick()).toEqual({ stale: 1 });
+    expect((await brief(s.pg))?.title ?? null).toBeNull();
+  });
+
+  test("a quarantine removes the brief's own description from the directory and search", async () => {
+    const s = await setup();
+    await s.upload([user("fix the build")]);
+    await dueNow(s.pg);
+    expect(await s.tick()).toEqual({ generated: 1 });
+    expect((await directory(s.pg)).short_summary).toBe(s.model.reply.description);
+    await s.upload([user("secret stuff")], { revision: 2, scrubbed: false });
+    await dueNow(s.pg);
+    expect(await s.tick({ throttleSeconds: 0 })).toEqual({ quarantined: 1 });
+    const d = await directory(s.pg);
+    expect(d.short_summary).toBeNull();
+    expect(String(d.search_text)).not.toContain("lease renewal");
+  });
+
+  test("a run re-armed by new evidence starts a fresh debounce window, not the stale first one", async () => {
+    const s = await setup();
+    await s.upload([user("fix the build")]);
+    await dueNow(s.pg);
+    // The session has been pending for two hours: the old window's cap is long past.
+    await s.pg.exec("UPDATE sessions.session_brief_wakeups SET pending_since = now() - interval '2 hours'");
+    modelHook(s, () => armWakeup(hoopDb(s.pg), KEY, { idleSeconds: 600, maxWaitSeconds: 3600 }));
+    expect(await s.tick()).toEqual({ generated: 1 });
+    const { rows } = await s.pg.query<{ fresh: boolean; future: boolean }>(
+      `SELECT pending_since > now() - interval '1 minute' AS fresh,
+              due_at > now() + interval '500 seconds' AS future
+         FROM sessions.session_brief_wakeups`,
+    );
+    expect(rows[0]).toEqual({ fresh: true, future: true });
+  });
+
+  test("a reused or empty outcome spends no admission: only a model call is counted", async () => {
+    const s = await setup();
+    await s.upload([user("fix the build")]);
+    await dueNow(s.pg);
+    expect(await s.tick()).toEqual({ generated: 1 });
+    // Same text on a new revision: reused without a model call.
+    await s.upload([user("fix the build")], { revision: 2 });
+    await dueNow(s.pg);
+    expect(await s.tick({ throttleSeconds: 0 })).toEqual({ reused: 1 });
+    const { rows } = await s.pg.query<{ n: number }>(
+      "SELECT coalesce(sum(attempts), 0)::int AS n FROM sessions.session_brief_attempts",
+    );
+    expect(rows[0]!.n).toBe(1);
+    expect(s.model.requests).toHaveLength(1);
+  });
+
+  test("a wakeup cleanup failure after the brief committed leaves the brief ready", async () => {
+    const s = await setup();
+    await s.upload([user("fix the build")]);
+    await dueNow(s.pg);
+    const real = hoopDb(s.pg);
+    const failing = {
+      ...real,
+      query: async (text: string, params?: unknown[]) => {
+        if (/DELETE FROM sessions\.session_brief_wakeups\s+WHERE[\s\S]*generation = \$6::bigint/.test(text)) throw new Error("transient");
+        return real.query(text, params as never);
+      },
+    } as typeof real;
+    const counts = await briefTick({
+      reader: mapReader(s.manifests),
+      store: s.store,
+      transport: s.model,
+      config: testConfig(),
+    })(failing, new Date());
+    expect(counts).toEqual({ generated: 1 });
+    expect(await brief(s.pg)).toMatchObject({ status: "ready", title: s.model.reply.title });
+  });
+});

@@ -114,9 +114,17 @@ export async function claimWakeups(db: SqlExecutor, batch: number, leaseSeconds:
 
 /**
  * Done with a claim. The wakeup goes only if no new evidence armed it meanwhile (same
- * generation); otherwise the lease is released and the new generation stays due.
+ * generation); otherwise the lease is released and the new generation stays due, in a
+ * fresh debounce window: the evidence that re-armed it is unbriefed from now, so
+ * pending_since restarts here and due_at is recomputed against it. Without this, a
+ * session active for over an hour kept its first pending_since and every later re-arm
+ * was due at once (one model call per revision, bounded only by the throttle).
  */
-export async function finishWakeup(db: SqlExecutor, w: ClaimedWakeup): Promise<void> {
+export async function finishWakeup(
+  db: SqlExecutor,
+  w: ClaimedWakeup,
+  window: { idleSeconds: number; maxWaitSeconds: number },
+): Promise<void> {
   const params = [...keyParams(w), w.leaseId, w.generation];
   const { rows } = await db.query(
     `DELETE FROM sessions.session_brief_wakeups
@@ -125,9 +133,12 @@ export async function finishWakeup(db: SqlExecutor, w: ClaimedWakeup): Promise<v
   );
   if (rows.length) return;
   await db.query(
-    `UPDATE sessions.session_brief_wakeups SET lease_id = NULL, lease_expires_at = NULL
+    `UPDATE sessions.session_brief_wakeups AS w
+        SET lease_id = NULL, lease_expires_at = NULL, pending_since = now(),
+            due_at = LEAST(w.evidence_at + make_interval(secs => $6::integer),
+                           now() + make_interval(secs => $7::integer))
       WHERE ${KEY} AND lease_id = $5::uuid`,
-    params.slice(0, 5),
+    [...params.slice(0, 5), window.idleSeconds, window.maxWaitSeconds],
   );
 }
 
@@ -355,6 +366,23 @@ export async function recordBrief(
       await client.query("ROLLBACK");
       return { written: false };
     }
+    // The input must still be exactly the session's live pointer set: the same machines
+    // at the same revisions. FOR SHARE holds those rows until COMMIT, so a pointer
+    // tombstone or delete (and its brief-forget trigger) waits for this write, or wins
+    // before it, and the brief is dropped as stale. This fences a deleted machine's
+    // content out of a brief generated before the delete, and an older input (fewer
+    // machines at the same maximum revision) out of a newer brief.
+    // Exactly livePointers' read (64 by machine_id, then rows with a manifest), so a
+    // session past 64 machines still compares equal to the set the input was built from.
+    const live = await client.query<{ machine_id: string; manifest_key: string | null; revision: string }>(
+      `SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index
+        WHERE ${KEY} AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE`,
+      keyParams(key),
+    );
+    if (!sameSourceSet(live.rows.filter((r) => r.manifest_key), sourceRevisions)) {
+      await client.query("ROLLBACK");
+      return { written: false };
+    }
     const revisions = JSON.stringify(sourceRevisions);
     let reusedText: { title: string; description: string; model: string } | null = null;
     if (outcome.status === "ready") {
@@ -450,8 +478,10 @@ export async function recordBrief(
         generatedAt: new Date(),
       });
     } else if (outcome.status === "quarantined") {
-      // Fall back to the pointer title; Bob Costas clears the short summary for a quarantine.
+      // Fall back to the pointer title, and remove a description this stage wrote, so a
+      // quarantined brief leaves nothing searchable. Another producer's summary is kept.
       await projectBriefTitle(client, key, null);
+      await clearBriefDescription(client, key);
     }
     await client.query("COMMIT");
     return { written: true };
@@ -461,6 +491,33 @@ export async function recordBrief(
   } finally {
     client.release();
   }
+}
+
+/** True when `rows` (machine_id, revision) are exactly the brief's source revisions. */
+function sameSourceSet(rows: Array<{ machine_id: string; revision: string }>, source: Record<string, number>): boolean {
+  const ids = Object.keys(source);
+  if (rows.length !== ids.length) return false;
+  return rows.every((r) => Object.prototype.hasOwnProperty.call(source, r.machine_id) && source[r.machine_id] === Number(r.revision));
+}
+
+/** Clear the directory short_summary only when this stage produced it (its source prefix). */
+async function clearBriefDescription(db: SqlExecutor, key: SessionDirectoryKey): Promise<void> {
+  await db.query(
+    `UPDATE sessions.session_directory AS d
+        SET short_summary = NULL,
+            short_summary_scrub_ruleset = NULL,
+            short_summary_scrub_version = NULL,
+            short_summary_source = NULL,
+            short_summary_generated_at = NULL,
+            search_text = CASE WHEN d.deleted_at IS NULL THEN sessions.session_directory_search_text(
+              d.title, d.task_title, d.agent_name, d.project_id,
+              d.git_repo, d.git_branch, d.model, NULL) ELSE '' END,
+            projected_at = now()
+      WHERE ${KEY.replace(/(org_id|workspace_id|harness|session_id)/g, "d.$1")}
+        AND d.short_summary IS NOT NULL
+        AND left(d.short_summary_source, char_length($5::text)) = $5::text`,
+    [...keyParams(key), SESSION_BRIEF_SOURCE_PREFIX],
+  );
 }
 
 /**

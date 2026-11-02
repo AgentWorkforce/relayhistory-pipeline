@@ -94,7 +94,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
   const { db, config } = deps;
   const pointers = await livePointers(db, w);
   if (!pointers.length) {
-    await finishWakeup(db, w);
+    await finishWakeup(db, w, { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds });
     return "gone";
   }
   const stored = await storedBrief(db, w);
@@ -108,29 +108,25 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     return "throttled";
   }
   const sourceRevisions = Object.fromEntries(pointers.map((p) => [p.machineId, p.revision]));
-  const admission = await admit(db, w, {
-    sessionDailyCap: config.sessionDailyCap,
-    budget: config.backgroundDailyBudget,
-    globalDailyCap: config.globalDailyCap,
-  });
-  if (!admission.admitted) {
-    await recordBrief(db, w, sourceRevisions, {
-      status: "rate_limited",
-      error:
-        admission.reason === "capped"
-          ? "session_brief_capped"
-          : admission.reason === "global"
-            ? "session_brief_global_capped"
-            : "session_brief_rate_limited",
-    });
-    await rescheduleWakeup(db, w, { nextUtcDay: true }, { refundAttempt: true });
-    return "rate_limited";
-  }
+  const window = { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds };
+  // After a committed outcome, cleanup is separate: a cleanup failure never rewrites the
+  // committed brief (the lease lapses and the wakeup is reclaimed, then reused or throttled).
+  const finish = async () => {
+    try {
+      await finishWakeup(db, w, window);
+    } catch (error) {
+      log.warn("session brief wakeup cleanup failed", {
+        stage: "session-brief",
+        session_id: w.sessionId,
+        error_code: error instanceof Error ? error.name : "unknown",
+      });
+    }
+  };
   try {
     const built = await buildBriefInput(deps, w, pointers);
     if (built.kind !== "ready") {
       await recordBrief(db, w, built.sourceRevisions, { status: built.kind, error: built.error });
-      await finishWakeup(db, w);
+      await finish();
       return built.kind;
     }
     const print = fingerprint(built.input);
@@ -139,8 +135,28 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
         status: "reused",
         fingerprint: print,
       });
-      await finishWakeup(db, w);
+      await finish();
       return written ? "reused" : "stale";
+    }
+    // Only a real model call is admitted and counted: empty, ineligible and reused
+    // outcomes above never spend the per-session cap, the org budget or the global ceiling.
+    const admission = await admit(db, w, {
+      sessionDailyCap: config.sessionDailyCap,
+      budget: config.backgroundDailyBudget,
+      globalDailyCap: config.globalDailyCap,
+    });
+    if (!admission.admitted) {
+      await recordBrief(db, w, built.sourceRevisions, {
+        status: "rate_limited",
+        error:
+          admission.reason === "capped"
+            ? "session_brief_capped"
+            : admission.reason === "global"
+              ? "session_brief_global_capped"
+              : "session_brief_rate_limited",
+      });
+      await rescheduleWakeup(db, w, { nextUtcDay: true }, { refundAttempt: true });
+      return "rate_limited";
     }
     const transport = deps.transport;
     if (!transport) throw new SessionAnalysisProviderError("model_not_configured", false);
@@ -165,7 +181,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
         generatedAt: new Date(),
       },
     });
-    await finishWakeup(db, w);
+    await finish();
     log.info("session brief generated", {
       stage: "session-brief",
       org_id: w.orgId,
@@ -193,7 +209,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
       return "retrying";
     }
     await recordBrief(db, w, sourceRevisions, { status: "failed", error: failure.code });
-    await finishWakeup(db, w);
+    await finish();
     log.warn("session brief failed", {
       stage: "session-brief",
       session_id: w.sessionId,
