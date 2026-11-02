@@ -1671,6 +1671,31 @@ await check(
         )
       ).rows[0]!.s;
     const markerClean = await marker();
+    // The clean migrate passed the drift check over the CURRENT manifest: every manifest
+    // signature exists (including #124's session_directory_list functions) and no other
+    // sessions function does.
+    const manifestFns = Object.keys(
+      (
+        JSON.parse(
+          await Bun.file(
+            join(ROOT, "src/hoopdb/sessions-function-acl.json"),
+          ).text(),
+        ) as { functions: Record<string, string[]> }
+      ).functions,
+    ).sort();
+    const createdFns = (
+      await sql(
+        "g6_acl",
+        "SELECT p.oid::regprocedure::text AS f FROM pg_proc p WHERE p.pronamespace = 'sessions'::regnamespace",
+      )
+    ).rows
+      .map((r) => r.f as string)
+      .sort();
+    const currentSet =
+      JSON.stringify(manifestFns) === JSON.stringify(createdFns) &&
+      createdFns.includes(
+        "sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)",
+      );
     await sql(
       "g6_acl",
       "GRANT EXECUTE ON FUNCTION sessions.repo_backfill_report() TO authenticated",
@@ -1697,13 +1722,14 @@ await check(
     return [
       clean.exit === 0 &&
         markerClean === "pass" &&
+        currentSet &&
         drifted.code === "function_acl_drift" &&
         before === after &&
         markerDrift === "pending" &&
         stillGranted === true &&
         repaired.exit === 0 &&
         markerRepaired === "pass",
-      `clean=${fmt(clean)} marker=${markerClean} drift=${fmt(drifted)} ledger=${before}->${after} marker_after=${markerDrift} repaired=${fmt(repaired)} marker_repaired=${markerRepaired}`,
+      `clean=${fmt(clean)} marker=${markerClean} functions=${createdFns.length}/${manifestFns.length} current_set=${currentSet} drift=${fmt(drifted)} ledger=${before}->${after} marker_after=${markerDrift} repaired=${fmt(repaired)} marker_repaired=${markerRepaired}`,
     ];
   },
 );
