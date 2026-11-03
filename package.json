@@ -2,6 +2,7 @@
   "name": "sessions-pipeline",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "description": "96Bulls: infrastructure and services for the Agent Relay sessions pipeline. One entry point brings the whole pipe up or down.",
   "workspaces": [
