@@ -19,10 +19,18 @@ export default async function setup(project: TestProject) {
     ack = JSON.parse(readFileSync(resolve(fixture, "claim.json"), "utf8"));
   if (ack.version !== 1 || ack.current !== true || !ack.identity || !ack.index)
     throw new Error("fixture claim must be an acknowledged v1 publication");
+  const proof = JSON.parse(
+    readFileSync(resolve(fixture, "proof.json"), "utf8"),
+  );
   let requests = 0,
     totalBytes = 0,
     maxBytes = 0;
   const server = createServer((req, res) => {
+    if (req.url === "/proof") {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(proof));
+      return;
+    }
     if (req.url === "/claim") {
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify(ack));
