@@ -67,6 +67,10 @@ const url = (user: string, db: string) =>
 const BOOT = join(
   ROOT,
   "supabase/bootstrap/session_directory_search_worker.sql",
+const TOKEN_VERIFIER_BOOT = join(
+  ROOT,
+  "supabase/bootstrap/session_token_verifier.sql",
+);
 );
 const RUNTIME_BOOT = join(ROOT, "supabase/bootstrap/hoopdb_runtime_role.sql");
 const SUPABASE_RUNTIME_BOOT = join(
@@ -531,6 +535,7 @@ await check(
       "g6_cloud_owner",
     );
     const phase1 = psql("g6_cloud", ["-f", BOOT], "g6_cloud_owner");
+    psql("g6_cloud", ["-f", TOKEN_VERIFIER_BOOT], "g6_cloud_owner");
     const env = {
       ...Object.fromEntries(
         gcpHoopdbModeEnv("g6_cloud_rt", true).map((e) => [e.name, e.value]),
@@ -601,8 +606,11 @@ if (
   !psql("postgres", ["-f", join(ROOT, "supabase/tests/supabase_shim.sql")]).ok
 )
   throw new Error("shim setup failed");
-if (!psql("postgres", ["-f", BOOT]).ok)
-  throw new Error("worker bootstrap failed");
+if (
+  !psql("postgres", ["-f", BOOT]).ok ||
+  !psql("postgres", ["-f", TOKEN_VERIFIER_BOOT]).ok
+)
+  throw new Error("role bootstrap failed");
 
 await fresh("g6_boot");
 await check(
@@ -817,6 +825,7 @@ await check(
       )
     ).rows[0].n;
     psql("postgres", ["-f", BOOT]);
+    psql("postgres", ["-f", TOKEN_VERIFIER_BOOT]);
     return [ok && short === 0, `${fmt(m)} short_summary_columns=${short}`];
   },
 );

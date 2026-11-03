@@ -349,6 +349,7 @@ beforeAll(async () => {
   await db.exec(
     readFileSync(
       supabaseFile("bootstrap/session_directory_search_worker.sql"),
+      supabaseFile("bootstrap/session_token_verifier.sql"),
       "utf8",
     ),
   );
@@ -872,6 +873,7 @@ describe("20261025000600 on a database with rows under the old stage names", () 
       await old.exec(
         readFileSync(
           supabaseFile("bootstrap/session_directory_search_worker.sql"),
+          supabaseFile("bootstrap/session_token_verifier.sql"),
           "utf8",
         ),
       );

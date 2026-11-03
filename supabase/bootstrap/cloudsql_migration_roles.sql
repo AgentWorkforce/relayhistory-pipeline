@@ -46,7 +46,8 @@ BEGIN
     'anon'::name,
     'authenticated'::name,
     'service_role'::name,
-    'session_directory_search_worker'::name
+    'session_directory_search_worker'::name,
+    'session_token_verifier'::name
   ] LOOP
     SELECT * INTO v_row FROM pg_roles WHERE rolname = v_role;
     IF NOT FOUND THEN
@@ -111,6 +112,10 @@ BEGIN
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
       ALTER ROLE session_directory_search_worker SET statement_timeout = '2s';
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'session_token_verifier') THEN
+      CREATE ROLE session_token_verifier
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
     RESET ROLE;
     DROP ROLE bulls96_cloudsql_role_seed;
   END IF;
@@ -121,7 +126,8 @@ BEGIN
       FROM pg_auth_members membership
       JOIN pg_roles target ON target.oid IN (membership.roleid, membership.member)
      WHERE target.rolname IN (
-       'anon', 'authenticated', 'service_role', 'session_directory_search_worker'
+       'anon', 'authenticated', 'service_role', 'session_directory_search_worker',
+       'session_token_verifier'
      )
   ) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',

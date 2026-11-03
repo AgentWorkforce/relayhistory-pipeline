@@ -31,6 +31,7 @@ beforeAll(async () => {
   await pg.exec(
     readFileSync(
       supabase("bootstrap/session_directory_search_worker.sql"),
+      supabase("bootstrap/session_token_verifier.sql"),
       "utf8",
     ),
   );
