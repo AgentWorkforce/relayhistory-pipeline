@@ -30,6 +30,7 @@ export interface Sentinel {
 }
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
+  "upstream:20261103040000_session_replay_pages.sql": { evidence: "table sessions.session_replay_publications", sql: relation("sessions.session_replay_publications") },
   "upstream:20261025000000_sessions_index.sql": {
     evidence: "table sessions.session_index",
     sql: relation("sessions.session_index"),

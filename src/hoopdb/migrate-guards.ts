@@ -163,6 +163,8 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
 ] as const;
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
+  "sessions.capture_session_replay_pages(text,text,text,text)",
+  "sessions.publish_session_replay_pages(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer)",
   "sessions.applied_repo_evidence(jsonb,jsonb)",
   "sessions.canonical_remote(text)",
   "sessions.clean_root_commit(text)",
@@ -1065,7 +1067,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "051ef13c8816af4363f8bcd55f0677ad5d91bd56cd09cd5cccd7d6308cce0afb";
+  "357c085aea7824950aa87ce0d1e6777f91544a278b34b79138e8f0703994fe69";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
