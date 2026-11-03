@@ -352,6 +352,12 @@ beforeAll(async () => {
       "utf8",
     ),
   );
+  await db.exec(
+    readFileSync(
+      supabaseFile("bootstrap/session_token_verifier.sql"),
+      "utf8",
+    ),
+  );
   for (const file of readdirSync(supabaseFile("migrations/")).sort())
     await db.exec(readFileSync(supabaseFile(`migrations/${file}`), "utf8"));
   await db.exec("SET ROLE service_role");
@@ -872,6 +878,12 @@ describe("20261025000600 on a database with rows under the old stage names", () 
       await old.exec(
         readFileSync(
           supabaseFile("bootstrap/session_directory_search_worker.sql"),
+          "utf8",
+        ),
+      );
+      await old.exec(
+        readFileSync(
+          supabaseFile("bootstrap/session_token_verifier.sql"),
           "utf8",
         ),
       );

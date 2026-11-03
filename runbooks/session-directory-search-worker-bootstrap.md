@@ -344,7 +344,9 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261031000000_migration_assertion_ledger.sql`       | table sessions.migration_assertion_uses                                                                                 |
 | `upstream:20261031000100_manifest_readiness.sql`               | table sessions.manifest_readiness                                                                                       |
 | `upstream:20261031001000_session_directory_reads_expand.sql`   | table sessions.session_directory_resurrection_fences                                                                    |
+| `upstream:20261101000000_auth_sessions.sql`                    | table sessions.auth_sessions                                                                                            |
 | `upstream:20261101000000_migration_ingest_audit_base_read.sql` | table sessions.migration_base_read_uses                                                                                 |
+| `upstream:20261101000100_auth_session_verify.sql`              | table sessions.auth_token_verifier_policy                                                                               |
 | `upstream:20261101000200_claimless_window_activations.sql`     | table sessions.claimless_window_activations                                                                             |
 | `upstream:20261101050000_session_directory_list.sql`           | table sessions.session_directory_agents                                                                                 |
 | `upstream:20261102000000_session_briefs.sql`                   | table sessions.session_briefs                                                                                           |

@@ -5,6 +5,18 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.auth_session_resolve(text,timestamp with time zone,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.auth_session_verify(text,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "session_token_verifier:EXECUTE"
+    ],
+    "sessions.auth_sessions_mirror(jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.canonical_remote(text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"

@@ -381,6 +381,9 @@ export const ALLOWED_SCHEMA_DIFFERENCES: ReadonlySet<string> = new Set([
   // the machines_member_read policy. The runtime-role check still requires the
   // RelayHistory role to bypass it (missingPrivileges).
   "different row security machines: source disabled, target enabled",
+  // The Supabase auth path intentionally enables RLS on the shared legacy
+  // auth_sessions table; Neon leaves it off. Reviewed divergence.
+  "different row security auth_sessions: source disabled, target enabled",
   // 20261030000000_relayhistory_machines_compat.sql: sessions.upsert_machine
   // inserts machines rows without a workspace.
   "different column default machines.workspace_id: source none, target 'default'::text",
@@ -459,6 +462,15 @@ export function allowedDifferences(source: CatalogObjects, target: CatalogObject
 }
 
 /**
+ * Tables where a target-side RLS enablement is the reviewed hardening, not a
+ * missing privilege for the runtime role: under the Supabase auth backend the
+ * shared auth_sessions table is reached only through service_role and the
+ * session_token_verifier edge — the app runtime role must not read it, so the
+ * new restriction is intended.
+ */
+export const ALLOWED_NEW_ROW_SECURITY: ReadonlySet<string> = new Set(["auth_sessions"]);
+
+/**
  * Every privilege the source runtime role holds that the target runtime role
  * lacks, and every table where the target role would be filtered by row
  * security that never filtered the source role (an RLS-enabled table with no
@@ -479,6 +491,7 @@ export function missingPrivileges(
   const filtered = (objects: CatalogObjects, role: RoleAccess, table: string) =>
     objects.tables.get(table)?.rowSecurity === true && !role.rowSecurityExempt.has(table);
   for (const table of source.tables.keys()) {
+    if (ALLOWED_NEW_ROW_SECURITY.has(table)) continue;
     if (target.tables.has(table) && !filtered(source, sourceRole, table) && filtered(target, targetRole, table))
       out.push(`target role ${targetRole.name} is subject to row security on ${table}; source role ${sourceRole.name} is not`);
   }
