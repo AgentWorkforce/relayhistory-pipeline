@@ -17,8 +17,8 @@ do{const page=await from.list(objectKey("96bulls/org_replay/v1"),cursor);for(con
 if(!manifests.length)throw Error("no synthetic source manifests");
 for(const key of manifests){
  const object=await from.getObject(objectKey(key)),bytes=await readAll(object.body),manifest=await parseManifest(new TextDecoder().decode(bytes),key);
- await store.put(objectKey(key),bytes,{ifNoneMatch:true,metadata:object.meta.metadata});
- for(const {key:rawKey} of chunkKeys(manifest,{prefix:parseSessionKey(key)!.prefix})){const obj=await from.getObject(rawKey);await store.put(rawKey,await readAll(obj.body),{ifNoneMatch:true,metadata:obj.meta.metadata});}
+ await store.put(objectKey(key),bytes,{ifNoneMatch:true,metadata:Object.fromEntries(Object.entries(object.meta.metadata??{}).filter(([k])=>k!=="content-sha256"))});
+ for(const {key:rawKey} of chunkKeys(manifest,{prefix:parseSessionKey(key)!.prefix})){const obj=await from.getObject(rawKey);await store.put(rawKey,await readAll(obj.body),{ifNoneMatch:true,metadata:Object.fromEntries(Object.entries(obj.meta.metadata??{}).filter(([k])=>k!=="content-sha256"))});}
  const ext=manifest.extensions!["96bulls"] as {canonical_machine_id:string};await addReplayPointer(x.db,{key,digest:manifest.raw.content_sha256,physicalSession:manifest.session.session_id,physicalMachine:manifest.session.machine_id,canonicalMachine:ext.canonical_machine_id,revision:manifest.revision,trace:manifest.trace_id});
 }
 const first=await parseManifest(new TextDecoder().decode(await readAll(await store.get(objectKey(manifests[0]!)))),manifests[0]!);
