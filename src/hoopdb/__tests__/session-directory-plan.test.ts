@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
@@ -77,6 +77,19 @@ async function database(): Promise<PGlite> {
   return db;
 }
 
+/** The executable audit covers every current index, so this fixture applies
+ * every migration rather than the historical directory-only subset below. */
+async function fullDatabase(): Promise<PGlite> {
+  const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+  open.push(db);
+  await db.exec(shim);
+  await db.exec(bootstrap);
+  const root = join(import.meta.dir, "../../../supabase/migrations");
+  for (const file of readdirSync(root).filter(file => file.endsWith(".sql")).sort())
+    await db.exec(readFileSync(join(root, file), "utf8"));
+  return db;
+}
+
 async function enterAuthenticated(
   db: PGlite,
   org = "o",
@@ -125,7 +138,7 @@ async function explain(
 
 describe("session_directory migration", () => {
   test("matches the executable catalog audit and starts rollout incomplete", async () => {
-    const db = await database();
+    const db = await fullDatabase();
     const rows = await db.query<SearchIndexCatalogRow>(
       SEARCH_INDEX_CATALOG_SQL,
     );
