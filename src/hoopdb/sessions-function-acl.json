@@ -117,6 +117,10 @@
     "sessions.session_directory_companions_follow()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_directory_desktop_catalog(text,text,text)": [
+      "<owner>:EXECUTE",
+      "session_directory_search_worker:EXECUTE"
+    ],
     "sessions.session_directory_event_activity(text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
