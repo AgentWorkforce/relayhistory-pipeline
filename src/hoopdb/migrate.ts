@@ -55,6 +55,13 @@ const TOKEN_VERIFIER_BOOTSTRAP = join(
   ROOT,
   "supabase/bootstrap/session_token_verifier.sql",
 );
+// Phase 2 for the verifier role: its exact catalog shape (role spec, memberships,
+// schema USAGE, no table privilege, EXECUTE on exactly auth_session_verify).
+// Runs after every migration like WORKER_VERIFY; read-only and never ledgered.
+const TOKEN_VERIFIER_VERIFY = join(
+  ROOT,
+  "supabase/bootstrap/session_token_verifier_verify.sql",
+);
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
 // The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
@@ -255,6 +262,10 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
             name: "verify:session_directory_search_worker",
             path: WORKER_VERIFY,
           },
+          {
+            name: "verify:session_token_verifier",
+            path: TOKEN_VERIFIER_VERIFY,
+          },
         ]
       : []),
   ];
@@ -283,6 +294,7 @@ export async function generation(): Promise<string> {
     })),
     ...ours.map((f) => ({ name: `96bulls:${f}`, path: join(OURS, f) })),
     { name: "verify:session_directory_search_worker", path: WORKER_VERIFY },
+    { name: "verify:session_token_verifier", path: TOKEN_VERIFIER_VERIFY },
   ];
   const parts: string[][] = [];
   for (const s of steps)
@@ -452,7 +464,14 @@ export async function runMigrations(
         profile.mode,
       ]);
     let postChecked = false;
-    for (const step of steps) {
+    // The validation marker flips to 'pass' once, after every phase-2 verifier
+    // has passed: only the last verify step does the UPDATE, so an earlier
+    // failure can never leave a half-checked generation marked pass.
+    const lastVerifyIndex = steps.reduce(
+      (acc, s, i) => (s.name.startsWith("verify:") ? i : acc),
+      -1,
+    );
+    for (const [stepIndex, step] of steps.entries()) {
       const sql = await readFile(step.path, "utf8");
       // The role checks (phase 1 bootstrap, phase 2 verify) run on every migrate, each in
       // its own transaction, and are never recorded in the ledger.
@@ -468,7 +487,7 @@ export async function runMigrations(
           await bindDbMode();
           if (verify) await hardenAndCheck();
           await client.query(sql);
-          if (verify) {
+          if (verify && stepIndex === lastVerifyIndex) {
             const passed = await client.query(
               `UPDATE ${ROLE_VALIDATION_TABLE} SET status = 'pass', updated_at = now()
                 WHERE name = $1 AND generation = $2 AND status = 'pending' RETURNING name`,

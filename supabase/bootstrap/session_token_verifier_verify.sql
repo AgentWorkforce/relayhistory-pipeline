@@ -6,13 +6,12 @@
 -- `postgres` creator edge, USAGE on schema sessions, no CREATE, no table or
 -- column privilege anywhere in schema sessions, and EXECUTE on exactly
 -- sessions.auth_session_verify(text, timestamptz) among sessions functions.
-\set ON_ERROR_STOP 1
 DO $verify$
 DECLARE
   v_role pg_roles%ROWTYPE;
   v_problems text[] := ARRAY[]::text[];
   v_row record;
-  v_allowed text[] := ARRAY['sessions.auth_session_verify(text, timestamptz)'];
+  v_fn oid := 'sessions.auth_session_verify(text,timestamptz)'::regprocedure;
   v_version int := current_setting('server_version_num')::int;
 BEGIN
   SELECT * INTO v_role FROM pg_roles WHERE rolname = 'session_token_verifier';
@@ -71,21 +70,21 @@ BEGIN
   -- EXECUTE on exactly the one approved RPC among all sessions functions. USAGE
   -- on the schema makes anything PUBLIC-executable reachable too, so count
   -- effective EXECUTE on every sessions function, not just SECURITY DEFINER.
+  -- Function identity is by OID: regprocedure text spellings are never compared.
   FOR v_row IN
-    SELECT p.oid::regprocedure::text AS fn,
+    SELECT p.oid AS fn, p.oid::regprocedure::text AS fname,
            has_function_privilege(v_role.oid, p.oid, 'EXECUTE') AS can
       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
      WHERE n.nspname = 'sessions'
   LOOP
-    IF v_row.can AND NOT (v_row.fn = ANY (v_allowed)) THEN
-      v_problems := array_append(v_problems, (format('EXECUTE on %s', v_row.fn))::text);
-    ELSIF NOT v_row.can AND v_row.fn = ANY (v_allowed) THEN
-      v_problems := array_append(v_problems, (format('no EXECUTE on %s', v_row.fn))::text);
+    IF v_row.can AND v_row.fn <> v_fn THEN
+      v_problems := array_append(v_problems, (format('EXECUTE on %s', v_row.fname))::text);
+    ELSIF NOT v_row.can AND v_row.fn = v_fn THEN
+      v_problems := array_append(v_problems, (format('no EXECUTE on %s', v_row.fname))::text);
     END IF;
   END LOOP;
-  IF (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-       WHERE n.nspname = 'sessions' AND p.oid::regprocedure::text = ANY (v_allowed) AND p.prosecdef) <> cardinality(v_allowed) THEN
-    v_problems := array_append(v_problems, ('sessions.auth_session_verify(text, timestamptz) is missing or not SECURITY DEFINER')::text);
+  IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE oid = v_fn AND prosecdef) THEN
+    v_problems := array_append(v_problems, ('sessions.auth_session_verify(text,timestamptz) is missing or not SECURITY DEFINER')::text);
   END IF;
 
   IF cardinality(v_problems) > 0 THEN

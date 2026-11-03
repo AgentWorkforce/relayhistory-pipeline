@@ -2572,3 +2572,24 @@ describe("every worker claim path runs the live gate first", () => {
     expect(ran).toEqual([]);
   });
 });
+
+describe("session token verifier phase 2", () => {
+  const VERIFY = "supabase/bootstrap/session_token_verifier_verify.sql";
+
+  test("wired: a clean migrate passes the verifier phase 2; a table grant on auth_sessions (drift) is caught", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    // The phase-2 file itself passes on a clean migrate.
+    await db.exec(readFileSync(join(root, VERIFY), "utf8"));
+    // Drift: a table grant the approved shape refuses.
+    await db.exec(
+      "GRANT SELECT ON sessions.auth_sessions TO session_token_verifier",
+    );
+    await expect(
+      db.exec(readFileSync(join(root, VERIFY), "utf8")),
+    ).rejects.toThrow(/session token verifier is not in the approved shape/);
+    // Wired: the next migrate runs phase 2 and fails closed as well.
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error).not.toBeNull();
+  });
+});
