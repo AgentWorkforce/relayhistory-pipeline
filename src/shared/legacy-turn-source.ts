@@ -46,3 +46,35 @@ export function selectedPublicTurnPredicateSql(
  AND ${e}.workspace_id=${t}.workspace_id AND ${e}.session_id=${t}.session_id
  AND ${e}.source<>${sourceParameter})))`;
 }
+
+const orderEncoder = new TextEncoder();
+function textOrder(a: unknown, b: unknown) {
+  const x = orderEncoder.encode(String(a ?? "")),
+    y = orderEncoder.encode(String(b ?? ""));
+  for (let i = 0; i < Math.min(x.length, y.length); i++)
+    if (x[i] !== y[i]) return x[i]! - y[i]!;
+  return x.length - y.length;
+}
+/** The public turn tuple uses the persisted source label, not the attributed
+ * harness. Exporters retain it privately when canonicalizing row.source. */
+export function comparePublicTurnRows(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+): number {
+  const key = (r: Record<string, unknown>) =>
+    r.legacy_stored_source ?? r.source;
+  const id =
+    /^[0-9]+$/u.test(String(a.id)) && /^[0-9]+$/u.test(String(b.id))
+      ? BigInt(String(a.id)) < BigInt(String(b.id))
+        ? -1
+        : BigInt(String(a.id)) > BigInt(String(b.id))
+          ? 1
+          : 0
+      : textOrder(a.id, b.id);
+  return (
+    Number(a.turn_index) - Number(b.turn_index) ||
+    textOrder(a.workspace_id, b.workspace_id) ||
+    textOrder(key(a), key(b)) ||
+    id
+  );
+}
