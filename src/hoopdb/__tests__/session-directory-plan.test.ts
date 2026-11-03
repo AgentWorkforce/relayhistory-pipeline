@@ -41,6 +41,13 @@ const bootstrap = readFileSync(
   ),
   "utf8",
 );
+const tokenBootstrap = readFileSync(
+  join(
+    import.meta.dir,
+    "../../../supabase/bootstrap/session_token_verifier.sql",
+  ),
+  "utf8",
+);
 const open: PGlite[] = [];
 
 afterEach(async () => {
@@ -52,6 +59,7 @@ async function database(): Promise<PGlite> {
   open.push(db);
   await db.exec(shim);
   await db.exec(bootstrap);
+  await db.exec(tokenBootstrap);
   await db.exec(readFileSync(join(import.meta.dir, "../../../supabase/bootstrap/session_ingest_roles.sql"), "utf8"));
   await db.exec(`
     CREATE SCHEMA sessions;

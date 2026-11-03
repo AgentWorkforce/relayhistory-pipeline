@@ -29,6 +29,7 @@ async function database(): Promise<PGlite> {
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
+    await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
   await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await db.exec(read(`supabase/migrations/${file}`));
   await db.exec(ROLE);
@@ -104,6 +105,7 @@ describe("session ingest roles: provisioned by the bootstrap, verified by the mi
     open.push(db);
     await db.exec(read("supabase/tests/supabase_shim.sql"));
     await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
+    await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
     await bootstrap(db);
     for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
       if (`supabase/migrations/${file}` === MIGRATION) return { db, error: await db.exec(read(MIGRATION)).then(() => null, (e: { code?: string; message?: string }) => e) };
