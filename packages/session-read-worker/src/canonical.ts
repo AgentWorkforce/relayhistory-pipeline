@@ -159,6 +159,16 @@ function canonicalMetadataReader(
     return boundedJson(response, signal);
   };
 }
+export { tokenTenant as canonicalTokenTenant };
+export function canonicalClaimReader(
+  env: CanonicalEnv,
+  token: string,
+  signal: AbortSignal,
+  rpc: "session_directory_analysis_cache" | "request_session_analysis_cache",
+  fetcher: typeof fetch = fetch,
+) {
+  return canonicalMetadataReader(env, token, signal, fetcher, rpc);
+}
 export function canonicalPointerReader(
   env: CanonicalEnv,
   token: string,

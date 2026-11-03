@@ -20,6 +20,7 @@
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve).
  */
 import pg from "pg";
+import { canonicalAnalysisHandle } from "./analysis-cache.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
@@ -165,6 +166,7 @@ export interface Overrides {
 }
 
 export async function handle(request: Request, env: Env, ctx: ExecutionContext, overrides: Overrides = {}): Promise<Response> {
+  if (new URL(request.url).pathname.startsWith("/v1/canonical/analyses/")) return canonicalAnalysisHandle(request, env, overrides.fetcher);
   if (new URL(request.url).pathname.startsWith("/v1/canonical/")) return canonicalHandle(request, env, overrides.fetcher);
   // GET only, as the Lambda's Function URL adapter (HEAD is not a read the contract has).
   if (request.method !== "GET") return json(405, "method_not_allowed", "GET only", { allow: "GET" });

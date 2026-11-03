@@ -23,7 +23,11 @@ export default defineConfig({
     ],
   },
   test: {
-    include: ["test/canonical.test.ts", "test/canonical-pages.test.ts"],
+    include: [
+      "test/canonical.test.ts",
+      "test/canonical-pages.test.ts",
+      "test/analysis-cache.test.ts",
+    ],
     testTimeout: 30000,
   },
 });

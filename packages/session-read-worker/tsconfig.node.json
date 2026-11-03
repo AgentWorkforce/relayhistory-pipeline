@@ -7,6 +7,7 @@
     "test/global-setup.ts",
     "test/artifact-capacity-setup.ts",
     "vitest.artifact-capacity.config.ts",
+    "vitest.analysis-cache.config.ts",
     "scripts"
   ]
 }
