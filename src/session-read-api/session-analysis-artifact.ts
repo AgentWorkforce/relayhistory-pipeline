@@ -20,3 +20,8 @@ export interface SessionAnalysisSnapshot {
  snapshotAt:string;snapshotId:string;
  payload:{outcome:"not_found"}|{outcome:"ok";sessionId:string;requests:Record<string,unknown>[];analyses:Record<string,unknown>[]};
 }
+
+/** Fixed envelope key order on both sides; public row keys/values are preserved. */
+export function analysisSnapshotJson(payload:SessionAnalysisSnapshot["payload"]):string {
+ return payload.outcome==="not_found"?JSON.stringify({outcome:"not_found"}):JSON.stringify({outcome:"ok",sessionId:payload.sessionId,requests:payload.requests,analyses:payload.analyses});
+}
