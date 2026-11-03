@@ -50,7 +50,7 @@ It exports actual source records with content/native IDs/tool metadata/counters 
 
 ## Current capacity coverage
 
-The synthetic 300001-event proof has 187578412 raw bytes. This is a partial capacity slice. Operator catalog evidence on 2026-11-03 reports 21 canonical cohorts over 256MiB and a largest single NDJSON source of 1530237909 bytes (largest union 1530892459 bytes). Those sources require a separate high-memory or streaming Node execution path; this producer deliberately refuses them. Worker page bounds remain unchanged. No production-wide capacity or activation claim follows from the synthetic proof.
+The synthetic 300001-event proof has 187578412 raw bytes. This is a partial capacity slice. Operator catalog evidence on 2026-11-03 reports 21 canonical cohorts over 256MiB and a largest physical manifest uncompressed chunk total of 1530237909 bytes (largest union 1530892459 bytes). Those sources require a separate high-memory or streaming Node execution path; this producer deliberately refuses them. Worker page bounds remain unchanged. No production-wide capacity or activation claim follows from the synthetic proof.
 
 For offline combined index/metadata/publication proof, reuse only the immutable synthetic raw source:
 
