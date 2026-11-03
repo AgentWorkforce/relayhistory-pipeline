@@ -77,3 +77,15 @@ export function artifactViewRow(item: ArtifactRow, view: ArtifactView): Artifact
   const message = payload && typeof payload === "object" ? (payload as {message_id?: unknown}).message_id : undefined;
   return { table: item.table, row: { ...row, record: { payload: { message_id: typeof message === "string" ? message : null } } } };
 }
+const orderEncoder = new TextEncoder();
+function compareUtf8(a: unknown,b: unknown): number {
+  const x=orderEncoder.encode(String(a)),y=orderEncoder.encode(String(b));
+  for(let i=0;i<Math.min(x.length,y.length);i++)if(x[i]!==y[i])return x[i]!-y[i]!;
+  return x.length-y.length;
+}
+/** Authoritative projected event timestamps are canonical microsecond strings.
+ * Preserve the raw provider's exact byte order, shared by producer and readers. */
+export function compareArtifactEventRows(a: Record<string,unknown>,b: Record<string,unknown>): number {
+  const x=String(a.ts),y=String(b.ts);
+  return x.length-y.length || compareUtf8(x,y) || compareUtf8(a.event_id,b.event_id) || compareUtf8(a.machine_id,b.machine_id) || compareUtf8(a.kind,b.kind);
+}
