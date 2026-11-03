@@ -142,7 +142,10 @@ export function directoryEventsFromProjection(
       (a, b) =>
         a.ts.length - b.ts.length ||
         (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0) ||
-        String(a.event_id).localeCompare(String(b.event_id), "en"),
+        Buffer.compare(
+          Buffer.from(String(a.event_id)),
+          Buffer.from(String(b.event_id)),
+        ),
     );
   const kinds = [...new Set(rows.map((r) => String(r.kind)))].sort();
   if (

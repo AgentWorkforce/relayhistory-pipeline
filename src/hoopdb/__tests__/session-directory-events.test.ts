@@ -122,6 +122,13 @@ describe("canonical directory event aggregates", () => {
     expect(JSON.stringify(result)).not.toContain("LATER PROMPT");
     expect(directoryEventsFromProjection([row()]).openingEvent).toBeNull();
   });
+  test("same-timestamp work state uses the source PostgreSQL C event-id order", () => {
+    const result = directoryEventsFromProjection([
+      row({ event_id: "_", kind: "task", task_status: "completed" }),
+      row({ event_id: "Z", kind: "task", task_status: "paused" }),
+    ]);
+    expect(result.workStatus).toBe("finished");
+  });
   test("zero-cache events preserve complete zero splits and null cost", () => {
     expect(
       directoryEventsFromProjection([
@@ -772,5 +779,4 @@ describe("directory event writer fencing", () => {
       ).rows[0],
     ).toEqual({ n: 40 });
   }, 120000);
-
 });
