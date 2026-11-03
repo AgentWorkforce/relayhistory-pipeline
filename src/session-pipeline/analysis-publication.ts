@@ -4,7 +4,7 @@ import {objectKey,readAll,type ObjectStore} from "../../packages/object-store/sr
 import type {SqlExecutor} from "../../packages/pipeline/src/lib/pipeline/queue.ts";
 import type {ArtifactIdentity,ArtifactSource} from "../session-read-api/canonical-artifact.ts";
 import {ARTIFACT_MAX_OBJECT_BYTES} from "../session-read-api/canonical-artifact.ts";
-import {ANALYSIS_ARTIFACT_TABLES,analysisSnapshotJson,analysisGenerationJson,type SessionAnalysisIndex,type SessionAnalysisSnapshot} from "../session-read-api/session-analysis-artifact.ts";
+import {ANALYSIS_ARTIFACT_TABLES,ANALYSIS_MAX_SNAPSHOT_BYTES,analysisSnapshotJson,analysisGenerationJson,type SessionAnalysisIndex,type SessionAnalysisSnapshot} from "../session-read-api/session-analysis-artifact.ts";
 import {materializeCanonicalArtifacts,artifactDigest,ArtifactBuildError} from "./replay-pages.ts";
 import {readLegacyAnalysisSnapshot,type ReadonlyAnalysisSource} from "./analysis-snapshot.ts";
 import type {ReplayCapture} from "./replay-publication.ts";
@@ -20,7 +20,7 @@ export async function buildSessionAnalysisArtifacts(store:ObjectStore,identity:A
  const payloadBytes=new TextEncoder().encode(analysisSnapshotJson(snapshot.payload));
  // Explicit assembly refusal; proving a given legal payload fits workerd remains
  // a consumer capacity gate. Never silently truncate analysis/history fields.
- if(payloadBytes.length>64*1024*1024)refuse("analysis_response_bound");
+ if(payloadBytes.length>ANALYSIS_MAX_SNAPSHOT_BYTES)refuse("analysis_response_bound");
  const snapshotSha256=artifactDigest(payloadBytes),generation=analysisArtifactGeneration(identity,source,snapshot,snapshotSha256);
  const items=snapshot.payload.outcome==="ok"?[snapshot.payload.requests,snapshot.payload.analyses]:[[],[]];
  const rows=items.flatMap((items,n)=>items.map((payload,ordinal)=>({table:ANALYSIS_ARTIFACT_TABLES[n]!,row:{org_id:identity.orgId,workspace_id:identity.workspaceId,source:identity.source,session_id:identity.sessionId,ordinal,payload}})));

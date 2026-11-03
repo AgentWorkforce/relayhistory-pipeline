@@ -127,6 +127,9 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_analysis_cache_demand(text,text,text,text,boolean)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_brief(text,text,text)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"

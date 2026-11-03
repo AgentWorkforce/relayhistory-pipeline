@@ -46,10 +46,15 @@ import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
+import {checkedAnalysisCursor,reconcileAnalysisPage} from "./analysis-reconcile.ts";
+import {analysisRefreshTick,enqueueAnalysisScope,type AnalysisRefreshDeps} from "./analysis-refresh.ts";
+import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.ts";
 import { briefTick } from "../session-brief/worker.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
+  /** Separate least-privilege READ ONLY legacy source, never exposed to Worker. */
+  analysis_source_readonly_url?: string;
   clickhouse?: { url: string; user: string; password: string; database: string };
   openai_api_key?: string;
 }
@@ -62,6 +67,7 @@ export interface LambdaEnv {
   queueUrl: string;
   searchEnabled: boolean;
   replayPagesEnabled: boolean;
+  analysisCacheEnabled: boolean;
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
   dbPoolMax: number;
@@ -84,6 +90,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     queueUrl: need("SESSION_PIPELINE_QUEUE_URL"),
     searchEnabled: env.SEARCH_INDEX_ENABLED === "1",
     replayPagesEnabled: env.SESSION_REPLAY_PAGES_ENABLED === "1",
+    analysisCacheEnabled: env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
     fanout,
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
@@ -101,6 +108,7 @@ export function parseSecret(text: string): PipelineSecret {
   const v = value as Partial<PipelineSecret> | null;
   if (!v || typeof v.hoopdb_url !== "string" || !/^postgres(ql)?:\/\//.test(v.hoopdb_url))
     throw new Error("session pipeline secret has no hoopdb_url");
+  if(v.analysis_source_readonly_url!==undefined&&(typeof v.analysis_source_readonly_url!=="string"||!/^postgres(ql)?:\/\//u.test(v.analysis_source_readonly_url)))throw new Error("session pipeline secret analysis_source_readonly_url must be a postgres URL");
   if (v.clickhouse !== undefined) {
     const c = v.clickhouse;
     for (const k of ["url", "user", "password", "database"] as const)
@@ -164,6 +172,7 @@ interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
   brief: ReturnType<typeof briefTick>;
+  analysis?: AnalysisRefreshDeps;
 }
 
 let runtime: Promise<Runtime> | undefined;
@@ -234,7 +243,9 @@ async function init(): Promise<Runtime> {
     config: briefConfig(),
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
-  return { env, deps, brief };
+  let analysis:AnalysisRefreshDeps|undefined;
+  if(env.analysisCacheEnabled){if(!secret.analysis_source_readonly_url)throw new Error("analysis cache enabled without readonly source configuration");analysis={db,store,source:readonlyAnalysisSource(readonlyAnalysisPool(secret.analysis_source_readonly_url,code=>log.error("analysis source pool error",{stage:"analysis-cache",error_code:code})))};}
+  return { env, deps, brief, analysis };
 }
 
 function ready(): Promise<Runtime> {
@@ -399,7 +410,7 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   return { ...summary, link };
 }
 
-type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; cursor?: string; since?: string; link?: number };
+type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; analysisCache?:unknown; analysisCacheReconcile?:unknown; analysisCursor?:unknown; cursor?: string; since?: string; link?: number };
 
 export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok: boolean }> {
   if (Array.isArray(event?.Records)) {
@@ -434,6 +445,27 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
       log.error("reconcile failed", { stage: "object-landed", ...errorFields(error), duration_ms: Date.now() - started });
       return { ok: false };
     }
+  }
+  if(event?.analysisCacheReconcile===true){
+    if(process.env.SESSION_ANALYSIS_CACHE_ENABLED!=="1")return {ok:true};
+    const started=Date.now();try{const rt=await ready();if(!rt.analysis)throw new Error("analysis cache runtime unavailable");
+      const page=await reconcileAnalysisPage({source:rt.analysis.source,enqueue:identity=>enqueueAnalysisScope(rt.analysis!,identity)},{cursor:checkedAnalysisCursor(event.analysisCursor)});
+      if(page.nextCursor)await invokeAsync({region:rt.env.region,functionName:process.env.AWS_LAMBDA_FUNCTION_NAME??"",payload:JSON.stringify({analysisCacheReconcile:true,analysisCursor:page.nextCursor}),credentials:lambdaCredentials()});
+      log.info("analysis cache reconcile page",{stage:"analysis-cache",count:page.scanned,enqueued:page.accepted,skipped:page.unavailable,failed:page.invalidScope,ok:page.unavailable===0&&page.invalidScope===0,reason:page.complete?"scan_complete":"continuation",duration_ms:Date.now()-started});return {ok:true};
+    }catch(error){log.error("analysis cache reconcile failed",{stage:"analysis-cache",...errorFields(error),duration_ms:Date.now()-started});throw new Error("analysis cache reconcile failed");}
+  }
+  if(event?.analysisCache===true){
+    // Default off before secret lookup, connection pools or object access.
+    if(process.env.SESSION_ANALYSIS_CACHE_ENABLED!=="1")return {ok:true};
+    const started=Date.now();try{const rt=await ready();if(!rt.analysis)throw new Error("analysis cache runtime unavailable");
+      const first=await analysisRefreshTick(rt.analysis,{maxJobs:10,maxMs:24000});
+      // One-minute schedule, two bounded passes. Cadence remains a target until
+      // actual source/network/load execution is measured; leases make overlap safe.
+      if(Date.now()-started<30000)await new Promise(resolve=>setTimeout(resolve,30000-(Date.now()-started)));
+      const second=Date.now()-started<50000?await analysisRefreshTick(rt.analysis,{maxJobs:10,maxMs:24000}):{claimed:0,published:0,failed:0,lost:0};
+      log.info("analysis cache refresh finished",{stage:"analysis-cache",count:first.published+second.published,failed:first.failed+second.failed+first.lost+second.lost,duration_ms:Date.now()-started});
+      return {ok:first.failed+second.failed+first.lost+second.lost===0};
+    }catch(error){log.error("analysis cache refresh failed",{stage:"analysis-cache",...errorFields(error),duration_ms:Date.now()-started});return {ok:false};}
   }
   if (event?.brief === true) {
     // Off: return before init, so a schedule left enabled by mistake reads no secret and opens no pool.
