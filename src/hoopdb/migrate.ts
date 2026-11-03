@@ -49,6 +49,12 @@ const WORKER_BOOTSTRAP = join(
   ROOT,
   "supabase/bootstrap/session_directory_search_worker.sql",
 );
+// The auth token verifier role (session_token_verifier): the same contract, its own
+// file. 20261101000100 verifies it and fails closed if absent (42704); it never creates it.
+const TOKEN_VERIFIER_BOOTSTRAP = join(
+  ROOT,
+  "supabase/bootstrap/session_token_verifier.sql",
+);
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
 // The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
@@ -235,6 +241,10 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
           {
             name: "bootstrap:session_directory_search_worker",
             path: WORKER_BOOTSTRAP,
+          },
+          {
+            name: "bootstrap:session_token_verifier",
+            path: TOKEN_VERIFIER_BOOTSTRAP,
           },
         ]
       : []),
