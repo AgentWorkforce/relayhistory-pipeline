@@ -6,6 +6,9 @@
  *   OPENAI_API_KEY                  the model credential (relayhistory's binding name). Unset,
  *                                   blank or ending in "-disabled": no model calls, and the
  *                                   worker claims nothing (a wakeup is never spent without one).
+ *   OPENAI_BASE_URL                 default https://api.openai.com/v1: an OpenAI-compatible
+ *                                   Responses API base; calls go to <base>/responses. https,
+ *                                   loopback, or an in-cluster Service with ALLOW_IN_CLUSTER_HTTP=true.
  *   SESSION_BRIEF_MODEL             default gpt-5.6-luna (relayhistory SESSION_SUMMARY_MODEL_VERSION).
  *   SESSION_BRIEF_IDLE_SECONDS      600: due this long after the newest evidence (0048).
  *   SESSION_BRIEF_MAX_WAIT_SECONDS  3600: never later than this after the first unbriefed evidence.
@@ -19,6 +22,11 @@
  *
  * Values are read once per process; nothing here is logged.
  */
+import {
+  assertDestinationUrl,
+  destinationPolicy,
+} from "../shared/destination-url.ts";
+
 export interface BriefConfig {
   enabled: boolean;
   model: string;
@@ -78,4 +86,40 @@ export function briefConfig(env: NodeJS.ProcessEnv = process.env): BriefConfig {
 export function modelKey(env: NodeJS.ProcessEnv = process.env): string | null {
   const key = env.OPENAI_API_KEY?.trim();
   return !key || key.endsWith("-disabled") ? null : key;
+}
+
+export const DEFAULT_MODEL_BASE_URL = "https://api.openai.com/v1";
+/** The URL the vendored engine/transport.ts posts to (hash-pinned; not edited here). */
+const ENGINE_RESPONSES_URL = `${DEFAULT_MODEL_BASE_URL}/responses`;
+
+/**
+ * The Responses endpoint, from OPENAI_BASE_URL (default the hosted OpenAI API).
+ * The request carries the model key, so the URL gets the shared transport rule
+ * (src/shared/destination-url.ts). Throws at startup on a bad value.
+ */
+export function modelResponsesUrl(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.OPENAI_BASE_URL?.trim();
+  if (!raw) return ENGINE_RESPONSES_URL;
+  const url = assertDestinationUrl("OPENAI_BASE_URL", raw, destinationPolicy(env));
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}/responses`;
+}
+
+/**
+ * A fetch for createAnalysisTransport that sends the engine's fixed Responses
+ * request to `responsesUrl` instead. Undefined when the default is in use, so
+ * the hosted path is byte-identical to the vendored engine.
+ */
+export function modelFetch(
+  responsesUrl: string,
+  base: typeof globalThis.fetch = globalThis.fetch,
+): typeof globalThis.fetch | undefined {
+  if (responsesUrl === ENGINE_RESPONSES_URL) return undefined;
+  const redirected = (input: string | URL | Request, init?: RequestInit) => {
+    const target = input instanceof Request ? input.url : String(input);
+    // Only the engine's one request is rerouted; anything else is a bug.
+    if (target !== ENGINE_RESPONSES_URL)
+      return Promise.reject(new Error("96bulls: unexpected model request URL"));
+    return base(responsesUrl, init);
+  };
+  return redirected as typeof globalThis.fetch;
 }

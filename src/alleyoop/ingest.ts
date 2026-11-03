@@ -35,6 +35,10 @@ import { lockerStore } from "../shared/locker.ts";
 import { traceparentFor } from "../shared/ids.ts";
 import { integer, optional, required, vendorBindings } from "../shared/env.ts";
 import { liveDataPathVerdict } from "../shared/data-path.ts";
+import {
+  assertDestinationUrl,
+  destinationPolicy,
+} from "../shared/destination-url.ts";
 import { healthVerdict, type WorkerHealth } from "../shared/worker.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { initTelemetry, withSpan } from "../shared/telemetry.ts";
@@ -101,7 +105,28 @@ async function firstClaimlessActivation(
   return new Date(rows[0]!.first_activation).toISOString();
 }
 
+/**
+ * Startup validation of the ingest's own destinations: the JWKS it trusts keys
+ * from and the origin assertions must be bound to. Same transport rule as the
+ * courier (src/shared/destination-url.ts, ALLOW_IN_CLUSTER_HTTP). The origin's
+ * audience comparison stays exact; only which URLs may be named is checked.
+ */
+export function assertIngestDestinations(env: NodeJS.ProcessEnv = process.env) {
+  const policy = destinationPolicy(env);
+  const jwksUrl = env.RELAYAUTH_JWKS_URL?.trim();
+  if (jwksUrl) assertDestinationUrl("RELAYAUTH_JWKS_URL", jwksUrl, policy);
+  const origin = env.RELAYHISTORY_ORIGIN?.trim();
+  if (origin) {
+    const url = assertDestinationUrl("RELAYHISTORY_ORIGIN", origin, policy, {
+      allowPath: false,
+    });
+    if (origin.replace(/\/$/, "").toLowerCase() !== url.origin)
+      throw new Error("96bulls: RELAYHISTORY_ORIGIN must be an exact bare origin");
+  }
+}
+
 export async function buildIngestApp(overrides: IngestOverrides = {}) {
+  assertIngestDestinations();
   const port = integer("INGEST_PORT", 8080);
   const jwks = process.env.JWKS_JSON
     ? (JSON.parse(process.env.JWKS_JSON) as Record<string, unknown>)
