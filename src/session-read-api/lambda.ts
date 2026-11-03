@@ -93,6 +93,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env): Promise<App> {
     verify: relayAuthVerifier(readApiAuthConfig(env)),
     ch: createClickHouseClient(secret.clickhouse),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
+    supa: poolTenantRunner(pool as never),
     completeSinceMs,
     log: (fields) => log.info("session read", fields),
   });

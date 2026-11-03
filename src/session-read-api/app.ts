@@ -29,6 +29,9 @@ import { Hono, type Context } from "hono";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { CursorError, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readEventPage, type Liveness } from "./page.ts";
+import type { TenantRunner } from "./liveness.ts";
+import { sessionOutput } from "./session-output.ts";
+import { MAX_SESSION_ACTIVITY_DAYS, activityDayCount, sessionActivity, sessionActivityClickHouse } from "./session-activity.ts";
 import type { EventQuery } from "./queries.ts";
 
 export interface VerifiedIdentity {
@@ -51,6 +54,8 @@ export interface ReadApiDeps {
   verify: Verifier;
   ch: ClickHouseClient;
   liveness: Liveness;
+  /** Supabase tenant runner for the aggregate lanes (output, non-q activity). */
+  supa?: TenantRunner;
   /** Epoch ms from which ClickHouse holds complete history; 0 = complete. */
   completeSinceMs: number;
   log?: (fields: Record<string, unknown>) => void;
@@ -307,6 +312,54 @@ export function createReadApi(deps: ReadApiDeps) {
         return c.json({ events: page.events, nextCursor: null, continuation, correlationId: c.get("correlationId") });
       }
       return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+    } catch (error) {
+      return fail(c, error);
+    }
+  });
+
+
+  // GET /v1/sessions/output — deterministic summary metrics on the Supabase lane.
+  app.get("/v1/sessions/output", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      if (!deps.supa) throw unsupported("supa_lane");
+      const sinceQ = c.req.queries("since"), untilQ = c.req.queries("until");
+      if (sinceQ?.length !== 1 || untilQ?.length !== 1)
+        throw bad("since and until are required exactly once");
+      const since = new Date(sinceQ[0]!), until = new Date(untilQ[0]!);
+      if (Number.isNaN(since.getTime()) || Number.isNaN(until.getTime()) || until < since || activityDayCount(since, until) > 366)
+        throw bad("Invalid output date range");
+      const output = await sessionOutput(deps.supa, identity.orgId, identity.workspaceId, since, until);
+      return c.json({ since: since.toISOString(), until: until.toISOString(), output, correlationId: c.get("correlationId") });
+    } catch (error) {
+      return fail(c, error);
+    }
+  });
+
+  // GET /v1/sessions/activity — distinct sessions per UTC day and source.
+  // Without q the Supabase rollup lane answers; a text query stays on the
+  // all-ClickHouse lane (newest-version per event key, like the list).
+  app.get("/v1/sessions/activity", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      const rawSince = c.req.query("since"), rawUntil = c.req.query("until");
+      if (!rawSince || !rawUntil) throw bad("since and until are required");
+      const since = new Date(rawSince), until = new Date(rawUntil);
+      if (Number.isNaN(since.getTime())) throw bad("Invalid output date range");
+      if (Number.isNaN(until.getTime())) throw bad("Invalid output date range");
+      if (until < since) throw bad("until must not be earlier than since");
+      if (activityDayCount(since, until) > MAX_SESSION_ACTIVITY_DAYS)
+        throw bad(`since and until may span at most ${MAX_SESSION_ACTIVITY_DAYS} UTC days`);
+      const q = c.req.query("q");
+      if (q && q.length > MAX_Q_CHARS) throw bad(`q must be ${MAX_Q_CHARS} characters or fewer`);
+      const days = q
+        ? await sessionActivityClickHouse(deps.ch, identity.orgId, identity.workspaceId, since, until, q)
+        : deps.supa
+          ? await sessionActivity(deps.supa, identity.orgId, identity.workspaceId, since, until)
+          : (() => { throw unsupported("supa_lane"); })();
+      return c.json({ since: since.toISOString(), until: until.toISOString(), days, correlationId: c.get("correlationId") });
     } catch (error) {
       return fail(c, error);
     }

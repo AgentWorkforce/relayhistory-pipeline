@@ -113,6 +113,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "ALTER-only: column sessions.session_briefs.state (session_brief replaced to return it)",
     sql: column("sessions.session_briefs", "state"),
   },
+  "upstream:20261103070000_session_aggregates.sql": {
+    evidence: "function sessions.session_output",
+    sql: fn("sessions", "session_output"),
+  },
   "upstream:20261103010000_session_directory_event_metadata.sql": {
     evidence: "table sessions.session_directory_event_times",
     sql: relation("sessions.session_directory_event_times"),
