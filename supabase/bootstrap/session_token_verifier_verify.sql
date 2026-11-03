@@ -50,38 +50,56 @@ BEGIN
     END LOOP;
   END IF;
 
-  -- No table, view or column privilege of any kind in sessions, however obtained.
+  -- No direct table, view or column privilege of any kind in sessions. Direct
+  -- grants only (aclexplode): PUBLIC-derived effective rights are not this
+  -- role's grants and are the sessions function boundary's domain.
   FOR v_row IN
-    SELECT c.oid::regclass::text AS rel
-      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    SELECT c.oid::regclass::text AS rel, a.privilege_type AS priv
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+           aclexplode(c.relacl) a
      WHERE n.nspname = 'sessions' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
-       AND (has_table_privilege(v_role.oid, c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
-            OR has_any_column_privilege(v_role.oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES'))
+       AND a.grantee = v_role.oid
   LOOP
-    v_problems := array_append(v_problems, (format('privilege on %s', v_row.rel))::text);
+    v_problems := array_append(v_problems, (format('%s on %s', v_row.priv, v_row.rel))::text);
   END LOOP;
-  IF NOT has_schema_privilege(v_role.oid, 'sessions', 'USAGE') THEN
-    v_problems := array_append(v_problems, ('no USAGE on schema sessions')::text);
+  FOR v_row IN
+    SELECT format('%I.%I', c.relname, at.attname) AS col, a.privilege_type AS priv
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_attribute at ON at.attrelid = c.oid AND at.attnum > 0 AND NOT at.attisdropped,
+           aclexplode(at.attacl) a
+     WHERE n.nspname = 'sessions' AND a.grantee = v_role.oid
+  LOOP
+    v_problems := array_append(v_problems, (format('%s on %s', v_row.priv, v_row.col))::text);
+  END LOOP;
+  -- Schema sessions: exactly one direct USAGE grant, nothing else.
+  IF NOT EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a
+                  WHERE n.nspname = 'sessions' AND a.grantee = v_role.oid
+                    AND a.privilege_type = 'USAGE') THEN
+    v_problems := array_append(v_problems, ('missing USAGE on schema sessions')::text);
   END IF;
-  IF has_schema_privilege(v_role.oid, 'sessions', 'CREATE') THEN
-    v_problems := array_append(v_problems, ('CREATE on schema sessions')::text);
+  IF EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a
+              WHERE n.nspname = 'sessions' AND a.grantee = v_role.oid
+                AND (a.privilege_type <> 'USAGE' OR a.is_grantable)) THEN
+    v_problems := array_append(v_problems, ('schema sessions: privileges other than USAGE')::text);
   END IF;
 
-  -- EXECUTE on exactly the one approved RPC among all sessions functions. USAGE
-  -- on the schema makes anything PUBLIC-executable reachable too, so count
-  -- effective EXECUTE on every sessions function, not just SECURITY DEFINER.
-  -- Function identity is by OID: regprocedure text spellings are never compared.
+  -- EXECUTE on exactly the one approved RPC: direct grants via proacl only.
+  -- PUBLIC-executable functions are not this role's grants (the boundary and
+  -- the live gate own that check). Function identity is by OID.
+  IF NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) a
+                  WHERE p.oid = v_fn AND a.grantee = v_role.oid
+                    AND a.privilege_type = 'EXECUTE' AND NOT a.is_grantable) THEN
+    v_problems := array_append(v_problems, (format('missing EXECUTE on %s', v_fn::regprocedure))::text);
+  END IF;
   FOR v_row IN
-    SELECT p.oid AS fn, p.oid::regprocedure::text AS fname,
-           has_function_privilege(v_role.oid, p.oid, 'EXECUTE') AS can
-      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-     WHERE n.nspname = 'sessions'
+    SELECT p.oid::regprocedure::text AS fn
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace,
+           aclexplode(p.proacl) a
+     WHERE n.nspname = 'sessions' AND a.grantee = v_role.oid
+       AND (p.oid <> v_fn OR a.privilege_type <> 'EXECUTE' OR a.is_grantable)
   LOOP
-    IF v_row.can AND v_row.fn <> v_fn THEN
-      v_problems := array_append(v_problems, (format('EXECUTE on %s', v_row.fname))::text);
-    ELSIF NOT v_row.can AND v_row.fn = v_fn THEN
-      v_problems := array_append(v_problems, (format('no EXECUTE on %s', v_row.fname))::text);
-    END IF;
+    v_problems := array_append(v_problems, (format('%s: unapproved direct privilege', v_row.fn))::text);
   END LOOP;
   IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE oid = v_fn AND prosecdef) THEN
     v_problems := array_append(v_problems, ('sessions.auth_session_verify(text,timestamptz) is missing or not SECURITY DEFINER')::text);
