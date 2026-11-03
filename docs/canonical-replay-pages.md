@@ -18,13 +18,13 @@ The anchor raw hash is deliberately present: existing exporter orphan cleanup re
 
 ## Source capture and publication
 
-The raw Worker's16MiB/100k/64-pointer boundary is unchanged. A separate trusted Node snapshot uses256MiB raw input,1M actual parsed records and at most10000 complete pointers. Actual source reads enforce chunk counts/digests, bounded decompression, canonical identity, admitted user ownership, optional catalog ETag, accepted_seq, per-origin revisions, tombstones, separate legacy domains and the full physical/canonical alias union through the same shared projection/fold. Output rows are capped at2M and unique stored artifact bytes at2GiB; exceeding a bound refuses publication.
+The raw Worker's16MiB/100k/64-pointer boundary is unchanged. A separate trusted Node snapshot uses256MiB raw input,1M actual parsed records and at most10000 complete pointers. Actual source reads enforce chunk counts/digests, bounded decompression, canonical identity, admitted user ownership, optional catalog ETag, accepted_seq, per-origin revisions, tombstones, separate legacy domains and the full physical/canonical alias union through the same shared projection/fold. The Node ClickHouse/index metadata pass shares this 256MiB/1M boundary; its full-source reconciliation and actual #171 acknowledgement precede replay publication. Output rows are capped at2M and unique stored artifact bytes at2GiB; exceeding a bound refuses publication.
 
 The raw cursor source-generation helper is unchanged and exported. Artifact generation is explicitly domain-separated as SHA256 of JSON.stringify(["canonical-read-artifact-v1",rawSourceGeneration,epoch,sourceFingerprint]). Canonical artifact semantic changes require a version/domain bump. Cursors also bind indexSHA so rebuilt content cannot be mixed across pages.
 
 `20261103040000_session_replay_pages.sql` adds backend capture/publication RPCs and a compact claim-bound read RPC. Source fingerprint is SHA256 over PostgreSQL's exact UTF8 JSONB text of the captured source snapshot; callers carry this opaque fingerprint rather than reproducing PostgreSQL serialization. Snapshot includes all live pointer tuples, physical/canonical identities, revisions, raw-chain digests, owners, storage/bucket/format/ETag/count metadata, persistent pending epochs and directory epoch/tombstone. A NO CYCLE global sequence drives persistent per-canonical-scope epochs; erasure/recreation and return-to-identical values cannot recreate an old epoch. Source-field updates invalidate publication; classifier-only writes do not strand artifacts awaiting an S3 event they never produce.
 
-The producer hydrates and rechecks the captured union, writes immutable objects create-only, checks every put acknowledgement, then reads back and hashes every object. Only then may publish_session_replay_pages CAS the exact source snapshot/fingerprint/epoch under the same row lock acquired by source invalidation triggers. It also enforces the exact current anchor prefix and index-SHA key. Stale, erased, directory-tombstoned, foreign-scope or incomplete work publishes nothing current.
+The producer hydrates and rechecks the captured union, writes immutable objects create-only, checks every put acknowledgement, then reads back and hashes every object. Only then may publish_session_replay_pages CAS the exact source snapshot/fingerprint/epoch under the same row lock acquired by source invalidation triggers. It also enforces the exact current anchor prefix and index-SHA key. A live, non-tombstoned directory row is mandatory at capture and publication. Hard directory deletion blocks even a newly captured generation while source pointers remain; recreation allocates a new epoch and rejects all old captures. Stale, erased, foreign-scope or incomplete work publishes nothing current.
 
 session_directory_replay_pages(workspace,harness,session) derives org from the existing signed search-worker policy and grants that role only this RPC. There are no new table grants. It distinguishes authenticated absence (exists:false) from an existing source without current publication (exists:true,current:false). The latter must be503 in page mode. Current responses acknowledge exact identity, epoch, source fingerprint, generation, normalized prefix and index key/SHA/byte count. The Worker rechecks this acknowledgement after bounded hydration and has no raw/Neon fallback in selected page mode.
 
@@ -47,3 +47,17 @@ node --experimental-transform-types --import ./scripts/proof-typescript-loader.m
 ```
 
 It exports actual source records with content/native IDs/tool metadata/counters across machines, then invokes the actual producer and SQL publication. proof.json/claim.json contain only synthetic metadata. Real offline workerd reads must exercise these bounded page objects rather than embedding the whole fixture in the isolate. Focused source tests cover write/read-back failure, source races, owner/digest/revision/alias/deletion CAS, ABA, >64 pointers, workspace claims and absent-versus-unpublished semantics. Mutation controls and exact capacity results belong in the PR evidence; a green suite alone cannot establish omitted cases.
+
+## Current capacity coverage
+
+The synthetic 300001-event proof has 187578412 raw bytes. This is a partial capacity slice. Operator catalog evidence on 2026-11-03 reports 21 canonical cohorts over 256MiB and a largest single NDJSON source of 1530237909 bytes (largest union 1530892459 bytes). Those sources require a separate high-memory or streaming Node execution path; this producer deliberately refuses them. Worker page bounds remain unchanged. No production-wide capacity or activation claim follows from the synthetic proof.
+
+For offline combined index/metadata/publication proof, reuse only the immutable synthetic raw source:
+
+```sh
+node --experimental-transform-types --import ./scripts/proof-typescript-loader.mjs ./scripts/proof-canonical-index-capacity.ts --source <previous-synthetic-fixture> --out <new-empty-directory>
+```
+
+The recorder executes the actual ClickHouse gzip/JSONEachRow codec with an intercepted transport; it proves emitted rows and actual SQL metadata, not a running ClickHouse server's acceptance or cloud latency. The output directory contains a fresh SQL-backed acknowledgement and bounded objects for the real offline workerd consumer proof.
+
+Schema rollback order is replay pages (040000), event metadata (010000), then earlier directory migrations. Disable consumers/producers and retire all acknowledgements before schema rollback; reapplication starts a new epoch domain. Ordinary runtime rollback only disables flags and preserves the additive schema.

@@ -121,7 +121,7 @@ BEGIN
  fp:=encode(sha256(convert_to(captured::text,'UTF8')),'hex');
  RETURN jsonb_build_object('exists',jsonb_array_length(captured->'pointers')>0,
   'identity',jsonb_build_object('orgId',p_org,'workspaceId',p_workspace,'source',p_harness,'sessionId',canonical_id),
-  'blocked',coalesce(captured->'directory'->>'deleted_at','')<>'',
+  'blocked',jsonb_typeof(captured->'directory') IS DISTINCT FROM 'object' OR coalesce(captured->'directory'->>'deleted_at','')<>'',
   'source',jsonb_build_object('epoch',captured->>'epoch','fingerprint',fp),'snapshot',captured);
 END $capture$;
 
@@ -138,7 +138,7 @@ BEGIN
  IF NOT FOUND THEN RETURN false; END IF;
  live:=sessions.session_replay_source_snapshot(p_org,p_workspace,p_harness,p_session);
  fp:=encode(sha256(convert_to(live::text,'UTF8')),'hex');
- IF coalesce(live->'directory'->>'deleted_at','')<>'' OR live IS DISTINCT FROM p_snapshot OR fp IS DISTINCT FROM p_fingerprint OR jsonb_array_length(live->'pointers')=0
+ IF jsonb_typeof(live->'directory') IS DISTINCT FROM 'object' OR coalesce(live->'directory'->>'deleted_at','')<>'' OR live IS DISTINCT FROM p_snapshot OR fp IS DISTINCT FROM p_fingerprint OR jsonb_array_length(live->'pointers')=0
   OR p_generation IS NULL OR p_source_generation IS NULL OR p_index_sha256 IS NULL OR p_index_bytes IS NULL OR p_prefix IS NULL OR p_index_key IS NULL
   OR p_generation !~ '^[0-9a-f]{64}$' OR p_source_generation !~ '^[0-9a-f]{64}$'
   OR p_index_sha256 !~ '^[0-9a-f]{64}$' OR p_index_bytes NOT BETWEEN 1 AND 262144 THEN RETURN false; END IF;

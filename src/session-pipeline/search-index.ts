@@ -36,6 +36,7 @@
  *
  * Nothing here logs content; errors carry codes only.
  */
+import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../session-read-api/canonical-artifact.ts";
 import { readCanonicalScope } from "../session-read-api/canonical-projection.ts";
 export { manifestUserId, readManifestRecords, projectedToNeonRow } from "../session-read-api/canonical-projection.ts";
 import * as zlib from "node:zlib";
@@ -80,11 +81,12 @@ export interface SearchIndexLimits {
 }
 
 const DEFAULT_LIMITS: SearchIndexLimits = {
-  // Raw text is held several times over (strings, records, projected and index
-  // rows), and an out-of-memory kill fails the whole batch: stay well inside 3 GB.
-  maxScopeBytes: 64 * 1024 * 1024,
-  maxScopeEvents: 100_000,
-  maxRows: 500_000,
+  // This trusted Node path shares the producer source bound. Raw/projection
+  // copies still need measured execution capacity; this does not lift Worker
+  // limits or cover production cohorts above the explicit 256 MiB ceiling.
+  maxScopeBytes: ARTIFACT_MAX_SOURCE_BYTES,
+  maxScopeEvents: ARTIFACT_MAX_SOURCE_RECORDS,
+  maxRows: 1_000_000,
   insertBatch: 5_000,
 };
 

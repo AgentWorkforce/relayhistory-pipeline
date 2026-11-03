@@ -2,6 +2,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
+import { projectSessionDirectory } from "../../hoopdb/session-directory-projector.ts";
 import { runMigrations } from "../../hoopdb/migrate.ts";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { objectKey, parseManifest, readAll, type ObjectStore } from "../../../packages/object-store/src/index.ts";
@@ -42,6 +43,9 @@ export async function exportReplayFixture(store:ObjectStore, db:Parameters<typeo
   },
  });
  for(const m of result.manifests){const manifest=await parseManifest(new TextDecoder().decode(await readAll(await store.get(objectKey(m.manifestKey)))),m.manifestKey);const ext=manifest.extensions!["96bulls"] as {canonical_machine_id:string};await addReplayPointer(db,{key:m.manifestKey,digest:manifest.raw.content_sha256,physicalSession:manifest.session.session_id,physicalMachine:manifest.session.machine_id,canonicalMachine:ext.canonical_machine_id,revision:manifest.revision,trace:manifest.trace_id});}
+ const physicalSessions=new Set<string>();
+ for(const m of result.manifests){const manifest=await parseManifest(new TextDecoder().decode(await readAll(await store.get(objectKey(m.manifestKey)))),m.manifestKey);physicalSessions.add(manifest.session.session_id);}
+ for(const sessionId of physicalSessions)await projectSessionDirectory(db,{orgId:i.orgId,workspaceId:i.workspaceId,harness:i.source,sessionId});
  return result;
 }
 export {createFsStore};

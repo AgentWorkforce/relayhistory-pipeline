@@ -881,6 +881,7 @@ describe("migration up/down/up", () => {
     const db = await database();
     await seed(db, FIXTURE);
     // Newer migrations depending on catalog columns must roll back first.
+    await db.exec(read("supabase/rollbacks/20261103040000_session_replay_pages.down.sql"));
     await db.exec(read("supabase/rollbacks/20261103010000_session_directory_event_metadata.down.sql"));
     await db.exec(DOWN);
     expect(
@@ -891,6 +892,7 @@ describe("migration up/down/up", () => {
     expect((await db.query("SELECT count(*)::int AS n FROM sessions.session_directory")).rows).toEqual([{ n: 6 }]);
     await db.exec(UP);
     await db.exec(read("supabase/migrations/20261103010000_session_directory_event_metadata.sql"));
+    await db.exec(read("supabase/migrations/20261103040000_session_replay_pages.sql"));
     expect(ids(await list(db, {}))).toEqual(["s1", "s2", "s3", "s4"]);
   });
 });
