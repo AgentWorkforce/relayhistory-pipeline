@@ -25,3 +25,8 @@ export interface SessionAnalysisSnapshot {
 export function analysisSnapshotJson(payload:SessionAnalysisSnapshot["payload"]):string {
  return payload.outcome==="not_found"?JSON.stringify({outcome:"not_found"}):JSON.stringify({outcome:"ok",sessionId:payload.sessionId,requests:payload.requests,analyses:payload.analyses});
 }
+
+/** Generation tuple is independent of JSONB/RPC property insertion order. */
+export function analysisGenerationJson(identity:ArtifactIdentity,source:ArtifactSource,snapshotAt:string,snapshotId:string,snapshotSha256:string):string {
+ return JSON.stringify(["session-analysis-cache-v1",{orgId:identity.orgId,workspaceId:identity.workspaceId,source:identity.source,sessionId:identity.sessionId},{epoch:source.epoch,fingerprint:source.fingerprint},snapshotAt,snapshotId,snapshotSha256]);
+}
