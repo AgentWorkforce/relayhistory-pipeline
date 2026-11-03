@@ -579,9 +579,17 @@ await check(
       targets.every(
         (role) => role.memberships === 0 && role.rolbypassrls === false,
       );
+    const err = (...runs: { ok?: boolean; out?: string }[]) => {
+      for (const r of runs)
+        if (r && r.ok === false) {
+          const line = r.out?.split("\n").find((l) => /ERROR|FATAL|error/i.test(l));
+          return ` detail=${(line ?? r.out?.split("\n")[0] ?? "").slice(0, 300)}`;
+        }
+      return "";
+    };
     return [
       ok,
-      `bootstrap=${boot.ok} phase1=${phase1.ok} rerun=${again.ok} migrate=${fmt(m)} verdict=${fmt(v)} seed=${seed} targets=${fmt(targets)}`,
+      `bootstrap=${boot.ok} phase1=${phase1.ok} rerun=${again.ok} migrate=${fmt(m)} verdict=${fmt(v)} seed=${seed} targets=${fmt(targets)}${err(boot, phase1, again)}`,
     ];
   },
 );
