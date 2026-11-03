@@ -72,7 +72,7 @@ function settings(over: Partial<IngestWorkerEnv> = {}): IngestWorkerEnv {
     INGEST_REPLICA_MODE: "off", ...over };
 }
 async function send(t: ReturnType<typeof tenant>, b: ReturnType<typeof batch>, e = settings(), signed = true) {
-  const bytes = encoder.encode(JSON.stringify(b));
+  const bytes = encoder.encode(JSON.stringify({ protocolVersion: 1, batch: b }));
   const identity = encodeIdentity(t);
   const ctx = createExecutionContext();
   try {
@@ -100,7 +100,7 @@ describe("session ingest entry inside workerd", () => {
   test("acknowledges signed batches only after durable S3 writes and committed ledger state, then replays without writes", async () => {
     const s3 = s3Boundary(); const t = tenant(); const b = batch(t);
     const first = await send(t, b);
-    expect(first.status).toBe(200); expect(await revisions(t)).toBe(1);
+    expect(first.status, JSON.stringify(first.body)).toBe(200); expect(await revisions(t)).toBe(1);
     const manifests = [...s3.objects.entries()].filter(([key]) => key.endsWith("/manifest.json"));
     expect(manifests).toHaveLength(1);
     expect(JSON.parse(new TextDecoder().decode(manifests[0][1].bytes)).writer.plugin_version).toBe("96bulls-session-ingest/1");
