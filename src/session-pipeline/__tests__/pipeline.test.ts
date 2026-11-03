@@ -77,7 +77,7 @@ async function writeSession(
   machine: string,
   records: RelayhistoryStreamRecord[],
   revision = 1,
-  opts: { scrubbed?: boolean; extensions?: Record<string, unknown> } = {},
+  opts: { scrubbed?: boolean; extensions?: Record<string, unknown>; declaredRecords?:number|null } = {},
 ) {
   const location = loc(machine);
   const source = new TextEncoder().encode(`${records.map((r) => JSON.stringify(r)).join("\n")}\n`);
@@ -95,7 +95,7 @@ async function writeSession(
     stored_raw_bytes: source.byteLength,
     raw_sha256: sha,
     compression: "zstd",
-    records: records.length,
+    records: opts.declaredRecords===null?undefined:opts.declaredRecords??records.length,
   };
   await store.put(rawChunkKey(location, chunk.seq, 0, sha, "ndjson"), stored, {});
   const manifest: ManifestV1 = {
@@ -218,6 +218,21 @@ function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"],
 }
 
 describe("search index from S3", () => {
+  test("direct canonical machine identity survives physical key encoding",async()=>{
+    const machine="machine:1";
+    const key=await writeSession("machine_1",[event("e1","1",Date.parse(AT),"direct",{kind:"convergence_event",origin_id:"machine:"+machine,payload:{source:scope.harness,session_id:scope.sessionId,machine_id:machine,user_id:"user_1",event_id:"e1",kind:"prompt",ts:AT,content:"direct"}})],1,{extensions:{"96bulls":{user_id:"user_1",canonical_machine_id:machine}}});
+    const sb=fakeSupabase(()=>[key]),ch=fakeClickHouse();
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({complete:true,inserted:1});
+    expect(ch.final()[0]?.machine_id).toBe(machine);
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({complete:true,inserted:0,deleted:0});
+  });
+  test.each([null,0])("actual record counts enforce the scope bound when declared records is %s",async declaredRecords=>{
+    const key=await writeSession("srv_bb",[event("r1","1",Date.parse(AT),"one"),event("r2","1",Date.parse(AT),"two")],1,{declaredRecords});
+    const sb=fakeSupabase(()=>[key]),ch=fakeClickHouse();
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact,{maxScopeEvents:1}))).toMatchObject({complete:false,partial:true,reasons:["scope_too_large"],inserted:0});
+    expect(ch.final()).toHaveLength(0);
+  });
+
   test("migrates encoded physical delivery IDs to public canonical IDs and reconciles/erases both exactly", async () => {
     const ch=fakeClickHouse();
     let keys=[await writeSession("srv_bb",[event("r1","1",Date.parse(AT),"canonical transcript")])];

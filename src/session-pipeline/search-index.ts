@@ -164,6 +164,7 @@ export async function readManifestRecords(
   store: ObjectStore,
   prefix: string,
   decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
+  maxRecords = Number.POSITIVE_INFINITY,
 ): Promise<RelayhistoryStreamRecord[]> {
   if (manifest.raw.format !== "ndjson")
     throw new PipelineError("raw_format_unsupported", "only ndjson raw is indexed", false);
@@ -196,7 +197,10 @@ export async function readManifestRecords(
     } catch {
       throw new PipelineError("chunk_not_utf8", "a raw chunk is not UTF-8", false);
     }
-    for (const line of text.split("\n")) if (line) records.push(parseRelayhistoryRecord(line));
+    for (const line of text.split("\n")) if (line) {
+        if (records.length >= maxRecords) throw new PipelineError("scope_too_large", "actual canonical record count exceeds scope limit", false);
+        records.push(parseRelayhistoryRecord(line));
+      }
   }
   return records;
 }
@@ -318,10 +322,14 @@ async function readScope(
       catalog: directoryCatalogFromProjection([]), directorySessionId: null, events: null, sources: [],
     };
 
+  let parsedRecords = 0;
   for (const manifest of readable) {
     try {
-      parts.push({ manifest, records: await readManifestRecords(manifest, deps.store, prefix, decompress), userId: manifestUserId(manifest) });
+      const records=await readManifestRecords(manifest,deps.store,prefix,decompress,limits.maxScopeEvents-parsedRecords);
+      parsedRecords+=records.length;
+      parts.push({manifest,records,userId:manifestUserId(manifest)});
     } catch (error) {
+      if(error instanceof PipelineError&&error.code==="scope_too_large")return {rows:[],manifests:parts.length,complete:false,partial:true,revision,reasons:[...new Set([...reasons,"scope_too_large"])],catalog:directoryCatalogFromProjection([]),directorySessionId:null,events:null,sources:[]};
       if (error instanceof PipelineError && error.retryable) throw error;
       complete = false;
       reasons.push(error instanceof PipelineError ? error.code : "manifest_unreadable");
@@ -378,7 +386,7 @@ async function readScope(
         workspaceId: scope.workspaceId,
         source: scope.harness,
         sessionId: canonicalManifestIdentity(part.manifest).sessionId,
-        machineId: part.manifest.session.machine_id,
+        machineId: canonicalManifestIdentity(part.manifest).machineId,
         userId: part.userId,
       });
     } catch (error) {
