@@ -15,6 +15,7 @@ import type {
   ArtifactSource,
 } from "./canonical-artifact.ts";
 import {
+  ANALYSIS_MAX_ENVELOPE_BYTES,
   ANALYSIS_FRESH_SECONDS,
   ANALYSIS_MAX_HISTORY,
   analysisSnapshotJson,
@@ -264,7 +265,7 @@ export async function readSessionAnalysisCache(
           )
             fail("analysis_row_identity");
           assembled += Buffer.byteLength(JSON.stringify(row.payload));
-          if (assembled > 16 * 1024 * 1024 - 64 * 1024)
+          if (assembled > ANALYSIS_MAX_ENVELOPE_BYTES - 64 * 1024)
             fail("analysis_response_bound");
           payloads.push(row.payload);
           if (
