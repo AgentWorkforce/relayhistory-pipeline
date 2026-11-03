@@ -34,11 +34,12 @@ beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), "canonical-legacy-"));
   await pg.exec(`CREATE SCHEMA sessions;
  CREATE TABLE sessions.session_rollups(org_id text,session_id text);CREATE TABLE sessions.session_catalog(org_id text,session_id text);
+ CREATE TABLE sessions.convergence_events(org_id text,workspace_id text,source text,session_id text);
  CREATE TABLE sessions.conversation_turns(id uuid PRIMARY KEY,org_id text,workspace_id text,source text,session_id text,session_owner text,turn_index int,role text,content text,actor_name text,actor_role text,metadata jsonb,ts timestamptz);
  CREATE TABLE sessions.session_links(id bigint PRIMARY KEY,org_id text,workspace_id text,source text,session_id text,link_kind text,link_ref text,link_url text,metadata jsonb,confidence_basis_points int,link_ts timestamptz,updated_at timestamptz,created_at timestamptz);
  CREATE TABLE sessions.session_outcomes(org_id text,workspace_id text,source text,session_id text,commit_sha text,user_id text,reverted boolean,shipped_at timestamptz,ingested_at timestamptz,created_at timestamptz);`);
   await pg.query(
-    `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','claude','sess:1','owner',3,'assistant','preserved legacy transcript','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00.123456Z')`,
+    `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','owner','sess:1','owner',3,'assistant','preserved legacy transcript','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00.123456Z')`,
     [turnId],
   );
 });
@@ -129,6 +130,7 @@ test("exports and reads actual legacy row plus explicit empty-table coverage thr
     table: "conversation_turns",
     row: {
       id: turnId,
+      legacy_stored_source: "owner",
       content: "preserved legacy transcript",
       turn_index: 3,
       metadata: { nativeCli: "claude" },
@@ -329,4 +331,94 @@ test("legal source IDs cannot collide with the completeness marker across origin
   expect(
     snapshot.rows.find((r) => r.table === "conversation_turns")?.row.id,
   ).toBe(turnId);
+});
+
+test("metadata overrides a different stored provider while preserving raw source and all public turn fields", async () => {
+  const id = "22222222-2222-4222-8222-222222222222";
+  try {
+    await pg.query(
+      `INSERT INTO sessions.conversation_turns VALUES($1,'org_attr','ws_attr','codex','same-id','alice',5,'assistant','exact content','Agent','owner','{"nativeCli":"claude","kept":{"tool":true}}','2026-11-01T10:00:00.123456Z')`,
+      [id],
+    );
+    const units = await includeLegacyUnits(db, "org_attr", "same-id", []);
+    expect(units.map((u) => u.source)).toEqual(["claude"]);
+    const source = withLegacySource(
+        db,
+        { fenced: async () => false, async *lines() {} },
+        async () => {},
+      ),
+      records = [];
+    for await (const line of source.lines(units[0]!))
+      records.push(JSON.parse(new TextDecoder().decode(line.bytes)));
+    const result = canonicalLegacy(records, {
+      orgId: "org_attr",
+      workspaceId: "ws_attr",
+      source: "claude",
+      sessionId: "same-id",
+    });
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]!.row).toMatchObject({
+      id,
+      source: "claude",
+      legacy_stored_source: "codex",
+      session_owner: "alice",
+      turn_index: 5,
+      content: "exact content",
+      actor_name: "Agent",
+      actor_role: "owner",
+      metadata: { nativeCli: "claude", kept: { tool: true } },
+      ts: "2026-11-01T10:00:00.123456+00:00",
+    });
+  } finally {
+    await pg.query(
+      "DELETE FROM sessions.conversation_turns WHERE org_id='org_attr'",
+    );
+  }
+});
+test("raw source equal to owner uses only a unique event provider in that workspace", async () => {
+  try {
+    await pg.exec(`INSERT INTO sessions.conversation_turns VALUES('33333333-3333-4333-8333-333333333333','org_attr','ws_attr','alice','same-id','alice',0,'user','hello','User','owner','{}','2026-11-01T10:00:00Z');
+ INSERT INTO sessions.convergence_events VALUES('org_attr','ws_attr','claude','same-id'),('org_attr','other-ws','codex','same-id'),('foreign','ws_attr','codex','same-id');`);
+    const units = await includeLegacyUnits(db, "org_attr", "same-id", []);
+    expect(units.map((u) => [u.workspaceId, u.source])).toEqual([
+      ["ws_attr", "claude"],
+    ]);
+    const records = [],
+      source = withLegacySource(
+        db,
+        { fenced: async () => false, async *lines() {} },
+        async () => {},
+      );
+    for await (const line of source.lines(units[0]!))
+      records.push(JSON.parse(new TextDecoder().decode(line.bytes)));
+    expect(
+      canonicalLegacy(records, {
+        orgId: "org_attr",
+        workspaceId: "ws_attr",
+        source: "claude",
+        sessionId: "same-id",
+      }).rows[0]!.row,
+    ).toMatchObject({ source: "claude", legacy_stored_source: "alice" });
+  } finally {
+    await pg.exec(
+      "DELETE FROM sessions.conversation_turns WHERE org_id='org_attr';DELETE FROM sessions.convergence_events WHERE org_id IN('org_attr','foreign')",
+    );
+  }
+});
+test("truly unbound turn-only coverage refuses discovery and export admission without inventing a provider", async () => {
+  try {
+    await pg.exec(
+      `INSERT INTO sessions.conversation_turns VALUES('44444444-4444-4444-8444-444444444444','org_attr','ws_attr','alice','same-id','alice',0,'user','hello','User','owner','{}','2026-11-01T10:00:00Z');`,
+    );
+    await expect(
+      includeLegacyUnits(db, "org_attr", "same-id", []),
+    ).rejects.toThrow("legacy_source_unbound");
+    await expect(legacyActivityPage(db, null, 5000)).rejects.toThrow(
+      "legacy_source_unbound",
+    );
+  } finally {
+    await pg.query(
+      "DELETE FROM sessions.conversation_turns WHERE org_id='org_attr'",
+    );
+  }
 });
