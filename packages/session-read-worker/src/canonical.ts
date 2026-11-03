@@ -215,6 +215,8 @@ export async function canonicalHandle(
           "view",
           "maxContent",
           "generation",
+          "since",
+          "until",
         ].includes(key) ||
         url.searchParams.getAll(key).length !== 1
       )
@@ -274,6 +276,11 @@ export async function canonicalHandle(
     if (order !== "asc" && order !== "desc")
       throw new CanonicalReadError("parameter", 400);
     const mode = env.CANONICAL_READ_MODE ?? "raw";
+    if (
+      mode !== "pages" &&
+      (url.searchParams.has("since") || url.searchParams.has("until"))
+    )
+      throw new CanonicalReadError("parameter", 400);
     if (mode !== "raw" && mode !== "pages")
       throw new CanonicalReadError("not_configured");
     const deadline = new Promise<never>((_, reject) => {
