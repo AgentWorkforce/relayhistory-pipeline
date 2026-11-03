@@ -159,7 +159,7 @@ function fakeClickHouse() {
         const p = options!.params!;
         for (let i = rows.length - 1; i >= 0; i--) {
           const r = rows[i]!;
-          if (r.org_id === p.org && r.workspace_id === p.workspace && r.source === p.source && r.session_id === p.session) rows.splice(i, 1);
+          if (r.org_id === p.org && r.workspace_id === p.workspace && r.source === p.source && (r.session_id === p.session || r.session_id === p.canonical)) rows.splice(i, 1);
         }
         return;
       }
@@ -178,9 +178,9 @@ function fakeClickHouse() {
       if (query.includes("search_ingest_state")) return [] as T[];
       const p = options!.params!;
       return final()
-        .filter((r) => r.org_id === p.org && r.session_id === p.session && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
+        .filter((r) => r.org_id === p.org && (r.session_id === p.session || r.session_id === p.canonical) && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
         .slice(0, Number(p.limit))
-        .map((r) => ({ workspace_id: r.workspace_id, machine_id: r.machine_id, source: r.source, kind: r.kind, event_id: r.event_id, ts_ms: tsMs(r), fingerprint: r.fingerprint })) as T[];
+        .map((r) => ({ workspace_id: r.workspace_id, session_id:r.session_id, machine_id: r.machine_id, source: r.source, kind: r.kind, event_id: r.event_id, ts_ms: tsMs(r), fingerprint: r.fingerprint })) as T[];
     },
     async insert(table, batch) {
       if (table === SESSION_STATE_TABLE) {
@@ -205,6 +205,7 @@ function fakeSupabase(live: () => string[], busy: () => boolean = () => false, c
       if (text.includes("event_projection_sources")) return { rows: [{ written: true }] as R[] };
       if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
         return { rows: live().map((manifest_key) => ({ manifest_key, canonical_id:canonicalId() })) as R[] };
+      if(text.includes("AS canonical_id FROM sessions.session_index"))return {rows:[{canonical_id:canonicalId()}] as R[]};
       if (text.includes("upsert_session_index")) return { rows: [{ applied: true, revision: "1" }] as R[] };
       return { rows: [] as R[] };
     },
@@ -217,6 +218,30 @@ function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"],
 }
 
 describe("search index from S3", () => {
+  test("migrates encoded physical delivery IDs to public canonical IDs and reconciles/erases both exactly", async () => {
+    const ch=fakeClickHouse();
+    let keys=[await writeSession("srv_bb",[event("r1","1",Date.parse(AT),"canonical transcript")])];
+    let canonicalId=scope.sessionId;
+    const sb=fakeSupabase(()=>keys,()=>false,()=>canonicalId);
+    await indexSearchScope(scope,searchDeps(ch.ch,sb.transact));
+    expect(ch.final().map(r=>r.session_id)).toEqual([scope.sessionId]);
+    canonicalId="sess:1"; // layoutComponent("sess:1") === "sess_1"
+    keys=[await writeSession("srv_bb",[event("r1","1",Date.parse(AT),"canonical transcript")],2,{extensions:{"96bulls":{user_id:"user_1",canonical_session_id:canonicalId}}})];
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({inserted:1,deleted:1,complete:true});
+    expect(ch.final().filter(r=>r.session_id===canonicalId).map(r=>r.content)).toEqual(["canonical transcript"]);
+    expect(ch.final().filter(r=>r.session_id===scope.sessionId)).toHaveLength(0);
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({inserted:0,deleted:0,complete:true});
+    // A stale physical copy must be removed even when its canonical copy is current.
+    ch.rows.push({...ch.final()[0]!,session_id:scope.sessionId});
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({inserted:0,deleted:1,complete:true});
+    expect(ch.final()).toHaveLength(1);
+    keys=[];
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({complete:true,reasons:["erased"]});
+    expect(ch.final()).toHaveLength(0);
+    expect(ch.state.filter(r=>r.session_id===canonicalId).at(-1)?.needs_full).toBe(0);
+    expect(ch.state.filter(r=>r.session_id===scope.sessionId).at(-1)?.needs_full).toBe(0);
+  });
+
   test("writes complete canonical event metadata once across duplicate manifest copies", async () => {
     const a = await writeSession("export", [
       event("r1", "1", Date.parse(AT), "text"),

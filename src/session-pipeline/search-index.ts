@@ -128,6 +128,7 @@ export interface SearchIndexResult {
 
 interface ScopeIdentity {
   machineId: string;
+  sessionId: string;
   source: string;
   kind: string;
   eventId: string;
@@ -365,7 +366,7 @@ async function readScope(
     const identity = JSON.stringify([deliveryMachine(scope.workspaceId,record.origin_id),record.record_id]);
     const prior = ownerByEvent.get(identity);
     if (prior?.userId && part.userId && prior.userId !== part.userId) { complete=false; reasons.push("event_owner_conflict"); }
-    else if (part.userId || prior === undefined) ownerByEvent.set(identity,{userId:part.userId,sessionId:part.manifest.session.session_id});
+    else if (part.userId || prior === undefined) ownerByEvent.set(identity,{userId:part.userId,sessionId:canonicalManifestIdentity(part.manifest).sessionId});
   }
   const byKey = new Map<string, IndexRow>();
   const metadataByKey = new Map<string, Json>();
@@ -376,7 +377,7 @@ async function readScope(
       projected = projectRelayhistorySession(records, {
         workspaceId: scope.workspaceId,
         source: scope.harness,
-        sessionId: part.manifest.session.session_id,
+        sessionId: canonicalManifestIdentity(part.manifest).sessionId,
         machineId: part.manifest.session.machine_id,
         userId: part.userId,
       });
@@ -425,9 +426,11 @@ async function clickhouseScope(
   scope: SessionScope,
   fromMs: number,
   limit: number,
+  canonicalSessionId = scope.sessionId,
 ): Promise<ScopeIdentity[]> {
   const rows = await ch.select<{
     workspace_id: string;
+    session_id: string;
     machine_id: string;
     source: string;
     kind: string;
@@ -435,20 +438,21 @@ async function clickhouseScope(
     ts_ms: number;
     fingerprint: string;
   }>(
-    `SELECT workspace_id, machine_id, source, kind, event_id,
+    `SELECT workspace_id, session_id, machine_id, source, kind, event_id,
         toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint
      FROM ${EVENTS_TABLE} FINAL
-     WHERE org_id = {org:String} AND session_id = {session:String}
+     WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String})
        AND workspace_id = {workspace:String} AND source = {source:String}
        AND toUnixTimestamp64Milli(ts) >= {from:Int64}
      LIMIT {limit:UInt32}`,
     {
-      params: { org: scope.orgId, session: scope.sessionId, workspace: scope.workspaceId, source: scope.harness, from: fromMs, limit },
+      params: { org: scope.orgId, session: scope.sessionId, canonical: canonicalSessionId, workspace: scope.workspaceId, source: scope.harness, from: fromMs, limit },
       timeoutMs: 20_000,
     },
   );
   return rows.map((r) => ({
     workspaceId: r.workspace_id,
+    sessionId: r.session_id,
     machineId: r.machine_id,
     source: r.source,
     kind: r.kind,
@@ -464,19 +468,17 @@ async function clickhouseScope(
  * incomplete, so readers never take its rows as current; a complete pass
  * writes 0. `revision` is the highest manifest revision of the scope.
  */
-export async function recordState(ch: ClickHouseClient, scope: SessionScope, revision: number, rows: number, complete: boolean, at: Date) {
+export async function recordState(ch: ClickHouseClient, scope: SessionScope, revision: number, rows: number, complete: boolean, at: Date, canonicalSessionId = scope.sessionId) {
   const ts = chNow(at);
-  await ch.insert(SESSION_STATE_TABLE, [
-    {
+  await ch.insert(SESSION_STATE_TABLE, [...new Set([scope.sessionId, canonicalSessionId])].map(sessionId => ({
       org_id: scope.orgId,
-      session_id: scope.sessionId,
+      session_id: sessionId,
       revision,
       synced_at: ts,
       full_synced_at: complete ? ts : "1970-01-01 00:00:00.000",
       scanned_rows: Math.min(rows, 4_294_967_295),
       needs_full: complete ? 0 : 1,
-    },
-  ]);
+    })));
 }
 
 /** Live manifests of a scope, from the pointer index. */
@@ -499,7 +501,9 @@ async function livePointerSnapshot(tx: SqlExecutor, scope: SessionScope): Promis
       ORDER BY p.machine_id`,
     [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId],
   );
-  return { keys: rows.map((r) => r.manifest_key), epoch: rows[0]?.event_epoch ?? "0", canonicalId:rows[0]?.canonical_id??scope.sessionId };
+  let canonicalId=rows[0]?.canonical_id;
+  if(!rows.length){const previous=await tx.query<{canonical_id:string}>(`SELECT coalesce(canonical_session_id,session_id) AS canonical_id FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 ORDER BY revision DESC LIMIT 1`,[scope.orgId,scope.workspaceId,scope.harness,scope.sessionId]);canonicalId=previous.rows[0]?.canonical_id;}
+  return { keys: rows.map((r) => r.manifest_key), epoch: rows[0]?.event_epoch ?? "0", canonicalId:canonicalId??scope.sessionId };
 }
 
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
@@ -526,13 +530,14 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       await deps.ch.command(
         `DELETE FROM ${EVENTS_TABLE}
          WHERE org_id = {org:String} AND workspace_id = {workspace:String}
-           AND source = {source:String} AND session_id = {session:String}`,
+           AND source = {source:String} AND (session_id = {session:String} OR session_id = {canonical:String})`,
         {
-          params: { org: scope.orgId, workspace: scope.workspaceId, source: scope.harness, session: scope.sessionId },
+          params: { org: scope.orgId, workspace: scope.workspaceId, source: scope.harness, session: scope.sessionId, canonical: pointerSnapshot.canonicalId },
           settings: { lightweight_deletes_sync: 2 },
           timeoutMs: 120_000,
         },
       );
+      await recordState(deps.ch,scope,0,0,true,at,pointerSnapshot.canonicalId);
       await completeErasedDirectoryEvents(tx,scope);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
     }
@@ -542,11 +547,11 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if (s3.partial) {
       // Not indexed from S3 and never treated as current: the state row says the
       // session owes a full pass (needs_full = 1), and nothing else is written.
-      await recordState(deps.ch, scope, s3.revision, 0, false, at);
+      await recordState(deps.ch, scope, s3.revision, 0, false, at, pointerSnapshot.canonicalId);
       return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, reasons: s3.reasons };
     }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
-    const chRows = await clickhouseScope(deps.ch, scope, fromMs, limits.maxRows + 1);
+    const chRows = await clickhouseScope(deps.ch, scope, fromMs, limits.maxRows + 1, pointerSnapshot.canonicalId);
     const truncated = chRows.length > limits.maxRows;
     const existing = new Map<string, ScopeIdentity[]>();
     for (const r of chRows) existing.set(keyOf(r), [...(existing.get(keyOf(r)) ?? []), r]);
@@ -554,7 +559,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     const toInsert = inWindow.filter((r) => {
       const tsMs = tsMillis(`${r.ts.replace(" ", "T")}Z`);
       const same = existing.get(keyOf({ machineId: r.machine_id, source: r.source, kind: r.kind, eventId: r.event_id })) ?? [];
-      return !same.some((c) => c.workspaceId === r.workspace_id && c.tsMs === tsMs && c.fingerprint === r.fingerprint);
+      return !same.some((c) => c.sessionId === r.session_id && c.workspaceId === r.workspace_id && c.tsMs === tsMs && c.fingerprint === r.fingerprint);
     });
     for (let i = 0; i < toInsert.length; i += limits.insertBatch)
       await deps.ch.insert(EVENTS_TABLE, toInsert.slice(i, i + limits.insertBatch), { timeoutMs: 60_000 });
@@ -567,8 +572,8 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       for (const [key, list] of existing) {
         const current = wanted.get(key);
         for (const c of list) {
-          if (!current || current.workspace_id !== c.workspaceId || tsMillis(`${current.ts.replace(" ", "T")}Z`) !== c.tsMs)
-            deletes.push({ orgId: scope.orgId, sessionId: scope.sessionId, identity: c } as PendingDelete);
+          if (!current || current.session_id !== c.sessionId || current.workspace_id !== c.workspaceId || tsMillis(`${current.ts.replace(" ", "T")}Z`) !== c.tsMs)
+            deletes.push({ orgId: scope.orgId, sessionId: c.sessionId, identity: c } as PendingDelete);
         }
       }
       await deleteRows(deps.ch, deletes);
@@ -590,7 +595,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       }
     }
     // Only a complete pass makes the session current; any other leaves it owing one.
-    await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at);
+    await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at, pointerSnapshot.canonicalId);
     return {
       manifests: s3.manifests,
       rows: inWindow.length,
