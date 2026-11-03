@@ -9,6 +9,7 @@ import {
   type ArtifactNode, type ArtifactEntry, type ArtifactPage, type ArtifactIndex,
   type ArtifactRow, type ArtifactView, type ArtifactBlob, type ArtifactString,
 } from "../session-read-api/canonical-artifact.ts";
+import {comparePublicTurnRows} from "../shared/legacy-turn-source.ts";
 import { canonicalTimestamp } from "../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import { readCapped } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
 import { objectKey, type ObjectStore } from "../../packages/object-store/src/index.ts";
@@ -27,9 +28,7 @@ export function compareArtifactRows(a: ArtifactRow, b: ArtifactRow): number {
   if (a.table === "convergence_events") {
     return compareArtifactEventRows(x,y);
   }
-  if (a.table === "conversation_turns")
-    return Number(x.turn_index) - Number(y.turn_index) || textCompare(x.workspace_id,y.workspace_id) || textCompare(x.source,y.source) ||
-      (/^[0-9]+$/u.test(String(x.id)) && /^[0-9]+$/u.test(String(y.id)) ? (BigInt(String(x.id))<BigInt(String(y.id))?-1:BigInt(String(x.id))>BigInt(String(y.id))?1:0) : textCompare(x.id,y.id));
+  if (a.table === "conversation_turns") return comparePublicTurnRows(x,y);
   if (a.table === "session_links") {
     const t = textCompare(time(x.link_ts ?? x.updated_at ?? x.created_at), time(y.link_ts ?? y.updated_at ?? y.created_at));
     return t || (BigInt(String(x.id)) < BigInt(String(y.id)) ? -1 : BigInt(String(x.id)) > BigInt(String(y.id)) ? 1 : 0);
