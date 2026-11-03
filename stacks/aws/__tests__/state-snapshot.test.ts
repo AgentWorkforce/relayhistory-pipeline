@@ -35,7 +35,8 @@ describe("plans run against a read-only state snapshot", () => {
 
   it("the stack uses the snapshot only when asked, and refuses it for deploy or destroy", () => {
     const stack = readFileSync(fileURLToPath(new URL("../alchemy.aws.run.ts", import.meta.url)), "utf8");
-    expect(stack).toContain("? snapshotStateLayer(process.env.NINETY_SIX_BULLS_STATE_SNAPSHOT)\n      : AWS.state({ prefix: \"96bulls\" }),");
+    // Every stage but a Pippen sandbox falls through to the default store; the sandbox's store is state-bucket.ts.
+    expect(stack).toContain("? snapshotStateLayer(process.env.NINETY_SIX_BULLS_STATE_SNAPSHOT)\n      : stateTarget?.pippenSandbox\n        ? pippenStateLayer(stateTarget)\n        : AWS.state({ prefix: \"96bulls\" }),");
     expect(stack).toContain('if (process.env.NINETY_SIX_BULLS_STATE_SNAPSHOT && mode !== "plan")');
     const io = readFileSync(fileURLToPath(new URL("../../../src/cli/aws-provenance-io.ts", import.meta.url)), "utf8");
     expect(io).toContain("NINETY_SIX_BULLS_STATE_SNAPSHOT: snapPath");

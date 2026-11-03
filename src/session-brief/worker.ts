@@ -130,7 +130,8 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
       return built.kind;
     }
     const print = fingerprint(built.input);
-    if (stored?.title && stored.briefFingerprint === print) {
+    // A brief from another prompt (v2 had no state) is regenerated even for the same input.
+    if (stored?.title && stored.briefFingerprint === print && stored.promptVersion === SESSION_BRIEF_PROMPT_VERSION) {
       const { written } = await recordBrief(db, w, built.sourceRevisions, {
         status: "reused",
         fingerprint: print,

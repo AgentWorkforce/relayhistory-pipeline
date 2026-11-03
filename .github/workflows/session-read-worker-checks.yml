@@ -1,0 +1,73 @@
+name: session-read-worker checks
+# The session read Worker (packages/session-read-worker): typecheck, every suite
+# inside workerd against a real ClickHouse and a real Postgres, and a wrangler
+# dry-run bundle. Called by ci.yml on every change and by the deploy workflow
+# before it deploys. Test-only credentials; no production data.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to check
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  worker:
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: ci-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      READ_API_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      READ_API_TEST_CLICKHOUSE_PASSWORD: ci-only
+      READ_WORKER_TEST_PG_URL: postgresql://postgres:ci-only@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ inputs.ref }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ inputs.ref }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "session-read-worker commit under test: $actual (expected $EXPECTED)" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED" || test "$(git rev-parse "$EXPECTED^{commit}")" = "$actual"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install (root + workspaces)
+        run: bun install --frozen-lockfile
+      - name: Check the production route and typecheck the Worker
+        run: bun run --filter @96bulls/session-read-worker typecheck
+      - name: Test inside workerd (#135 suites + full request path)
+        run: bun run --filter @96bulls/session-read-worker test
+      - name: Bundle exactly as a deploy would (wrangler dry run)
+        working-directory: packages/session-read-worker
+        run: bunx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/session-read-worker-dist"

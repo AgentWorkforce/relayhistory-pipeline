@@ -27,6 +27,7 @@ import {
 import type { HoopDb } from "../shared/db.ts";
 import { ctxOf } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
+import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
 import { digestRecords, type Summarizer } from "./summarizer.ts";
 import {
   ShortSummaryRejected,
@@ -246,7 +247,7 @@ export function bobCostasHandler(
           orgId: message.ctx.orgId,
           workspaceId: s.workspace_id,
           harness: s.harness,
-          sessionId: s.session_id,
+          sessionId: canonicalManifestIdentity(m).sessionId,
         };
         if (row.status !== "ready") {
           await publishShortSummary(directory, dirKey, null, m.trace_id);
@@ -450,7 +451,7 @@ export function bobCostasHandler(
         orgId: message.ctx.orgId,
         workspaceId: s.workspace_id,
         harness: s.harness,
-        sessionId: s.session_id,
+        sessionId: canonicalManifestIdentity(m).sessionId,
       };
       await publishShortSummary(
         directory,

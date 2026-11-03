@@ -37,10 +37,12 @@ import { ecrPullPolicy, sharedServicesRepository, validateAwsInputs, type Approv
 import { assertApprovalBinding, assertAwsDeploymentTarget, assertClearance, awsMode, type AwsMode } from "./deploy-guard.ts";
 import { snapshotStateLayer } from "./state-snapshot.ts";
 import { verifyDeployCapture } from "./capture-verify.ts";
-import { alchemyStateBucket, alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyCallerArn, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
+import { alchemyStatePrefix, awsCliRunner, verifyAccountOwner, verifyCallerArn, verifyNetworkPolicyPhase, verifyServicesImage } from "./preflight.ts";
 import { networkPolicies } from "./proof-addons.ts";
 import { hoopdbBackend } from "./hardening.ts";
 import { stageBucketName, stageBudgetName } from "./pippen-sandbox.ts";
+import { ensurePippenStateBucket, stackStateOptions, stageFromArgv, stateBucketFor, stateTargetFromArgv } from "./state-bucket.ts";
+import { assertSandboxAlchemyCredentials } from "./sandbox-credentials.ts";
 import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
@@ -106,6 +108,42 @@ function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
   return { ...inputs, mode };
 }
 
+// aws-proof-sandbox, however Alchemy was started and before any provider or state layer resolves
+// credentials: exactly static env keys, no profile (sandbox-credentials.ts). Alchemy cannot read
+// `pippen sandbox exec`'s credential_process profile; refuse it here with the command that works.
+if (stageFromArgv(process.argv) === PIPPEN_PROOF_SANDBOX.stage) assertSandboxAlchemyCredentials(process.env);
+
+/**
+ * The Alchemy state store. A Pippen sandbox keeps it in its own pippen-sbx- bucket,
+ * which pippen-sweeper deletes (state-bucket.ts); before Alchemy's first state
+ * operation the layer checks the caller (the lease's agent-session role on the pinned
+ * stage, the inputs' account in any case) and makes the bucket tagged if absent, so
+ * AWS.state never creates it untagged. Every other stage: Alchemy's default store, as before.
+ */
+const stateTarget = stateTargetFromArgv(process.argv, (stage) => {
+  try {
+    return readFileSync(join(ROOT, ".96bulls", stage, "aws-inputs.json"), "utf8");
+  } catch {
+    return undefined;
+  }
+});
+const pippenStateLayer = (t: NonNullable<typeof stateTarget>) =>
+  Layer.unwrap(
+    Effect.sync(() => {
+      const spawn = (cmd: string, args: string[]) => spawnSync(cmd, args, { encoding: "utf8", env: process.env });
+      if (t.stage === PIPPEN_PROOF_SANDBOX.stage) verifyCallerArn(awsCliRunner(spawn), pippenProofSandboxCallerArn(process.env));
+      ensurePippenStateBucket(
+        (args) => {
+          const r = spawn("aws", args);
+          if (r.status !== 0) throw new Error(`aws ${args.slice(0, 2).join(" ")} failed: ${(r.stderr || "").trim()}`);
+          return r.stdout;
+        },
+        { accountId: t.accountId, region: t.region, stage: t.stage },
+      );
+      return AWS.state(stackStateOptions(t));
+    }),
+  );
+
 /** Pippen Tools' sweeper deletes what carries `pippen:sandbox=true` (pippen-tools docs/architecture.md). */
 let sandboxTag: Record<string, string> = {};
 const tags = (stage: string, component: string) => ({ "96bulls:stack": stage, "96bulls:component": component, "96bulls:repo": REPO, ...sandboxTag });
@@ -118,7 +156,9 @@ export default Alchemy.Stack(
     // lease and may reconcile the bucket even for `alchemy plan`.
     state: process.env.NINETY_SIX_BULLS_STATE_SNAPSHOT
       ? snapshotStateLayer(process.env.NINETY_SIX_BULLS_STATE_SNAPSHOT)
-      : AWS.state({ prefix: "96bulls" }),
+      : stateTarget?.pippenSandbox
+        ? pippenStateLayer(stateTarget)
+        : AWS.state({ prefix: "96bulls" }),
   },
   Effect.gen(function* () {
     const stage = yield* Stage;
@@ -147,7 +187,7 @@ export default Alchemy.Stack(
       if (inputs.accountShared) verifyAccountOwner(aws, { accountId: inputs.accountId, region: inputs.region, ownerStage: inputs.accountShared.ownerStage });
       if (inputs.eks?.networkPolicyEnforcement)
         verifyNetworkPolicyPhase(aws, {
-          stateBucket: alchemyStateBucket(inputs.accountId, inputs.region),
+          stateBucket: stateBucketFor(inputs),
           statePrefix: alchemyStatePrefix(stage),
           region: inputs.region,
           policies: networkPolicies({

@@ -129,6 +129,22 @@ describe("sqlLiveness as the role", () => {
     expect([...erased]).toEqual(["codex\u0000gone"]);
   }, 60_000);
 
+  test("livePointerSessions: ids with a live pointer in this workspace, any harness", async () => {
+    const db = await database();
+    await pointer(db, { session: "live" });
+    await pointer(db, { session: "half", machine: "m-1", deleted: true });
+    await pointer(db, { session: "half", harness: "claude", machine: "m-2" });
+    await pointer(db, { session: "gone", deleted: true });
+    // Live elsewhere only: another workspace, another org.
+    await pointer(db, { ws: "ws-b", session: "other-ws" });
+    await pointer(db, { org: "org-b", session: "other-org" });
+    const liveness = sqlLiveness(poolTenantRunner(asRole(db)));
+    const ids = ["live", "half", "gone", "other-ws", "other-org", "absent"];
+    expect([...(await liveness.livePointerSessions("org-a", "ws-a", ids))].sort()).toEqual(["half", "live"]);
+    expect([...(await liveness.livePointerSessions("org-a", "ws-b", ids))]).toEqual(["other-ws"]);
+    expect([...(await liveness.livePointerSessions("org-a", "ws-a", []))]).toEqual([]);
+  }, 60_000);
+
   test("sessionStart: earliest live created_at, pointer counts, optional harness", async () => {
     const db = await database();
     await pointer(db, { session: "s", machine: "m-1", created: "2026-10-02T00:00:00Z" });

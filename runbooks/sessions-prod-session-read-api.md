@@ -1,5 +1,7 @@
 # Session read API on sessions-prod
 
+> **Being replaced** by the Cloudflare Worker in `packages/session-read-worker` (`runbooks/sessions-prod-session-read-worker.md`), which runs the same code with no Lambda on the request path. This Lambda stays until the Worker serves every route `on`; then it is retired through its own reviewed plan phase.
+
 The session read API is the Lambda in `stacks/aws/session-read-api.ts`, with code in `src/session-read-api/`. It serves relayhistory's `/v1` event reads from ClickHouse `transcript_events`, and checks erasure and the history floor in Supabase. Cloud calls it per route behind a flag (`SESSIONS_READ_96BULLS_*`) and falls back to relayhistory on any 501, 5xx or timeout.
 
 Only the lead applies this, after independent review. Nothing in this file prints or stores a credential.
@@ -20,7 +22,7 @@ These requests get `501 unsupported_by_backend` with a `reason`, and Cloud then 
 - a search limit above 100;
 - a relayhistory cursor;
 - history older than `completeSince` (first page only, see below);
-- a session whose latest `search_ingest_session_state` row has `needs_full = 1` (`session_partial`), and every workspace search while any session of the org has one (first page only, see below).
+- a session whose latest `search_ingest_session_state` row has `needs_full = 1` (`session_partial`), and a workspace search while a session of that workspace has one (first page only, see below).
 
 **Only a first page is ever a 501.** Once a cursor has been issued, Cloud cannot fall back without restarting the caller's pagination, so:
 - The `needs_full` check runs when pagination starts. A cursor continues the read that check admitted.
@@ -45,7 +47,7 @@ Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--
 - A page that the byte budget (2 MiB) cuts, or whose candidate scan filled `limit`, carries a cursor.
 - Pages are full while rows remain.
 
-**Partial sessions:** `needs_full = 1` (a partial or capped pipeline pass, search-index.ts `recordState`) is read from the latest state row per session (`argMax(needs_full, synced_at)`). Such a session is never served as a complete transcript; a search starts at relayhistory while any session of the org is partial, because the state table has no workspace column.
+**Partial sessions:** `needs_full = 1` (a partial or capped pipeline pass, search-index.ts `recordState`) is read from the latest state row per session (`argMax(needs_full, synced_at)`). Such a session is never served as a complete transcript. A search starts at relayhistory while a partial session belongs to its workspace: the state table has no workspace column, so a partial session counts for the workspace where it has a `transcript_events` row or a live `session_index` pointer (page.ts `partialSessionsInWorkspace`). More than 1000 partial sessions in the org is `session_partial_unbounded`.
 
 **Erasure:**
 - The pipeline's lightweight DELETE masks rows at once.

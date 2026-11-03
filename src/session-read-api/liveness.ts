@@ -66,6 +66,11 @@ export const SESSION_START_SQL = `SELECT count(*)::int AS pointers,
  WHERE org_id = $1 AND workspace_id = $2 AND session_id = $3
    AND ($4::text IS NULL OR harness = $4)`;
 
+export const LIVE_POINTER_SESSIONS_SQL = `SELECT DISTINCT session_id
+  FROM sessions.session_index
+ WHERE org_id = $1 AND workspace_id = $2 AND deleted_at IS NULL
+   AND session_id = ANY($3::text[])`;
+
 export function sqlLiveness(run: TenantRunner): Liveness {
   return {
     async erased(orgId, workspaceId, keys: SessionKey[]) {
@@ -79,6 +84,13 @@ export function sqlLiveness(run: TenantRunner): Liveness {
         ]),
       );
       return new Set(rows.map((r) => keyOf({ source: r.harness, sessionId: r.session_id })));
+    },
+    async livePointerSessions(orgId, workspaceId, sessionIds) {
+      if (sessionIds.length === 0) return new Set();
+      const { rows } = await run(orgId, workspaceId, (q) =>
+        q.query<{ session_id: string }>(LIVE_POINTER_SESSIONS_SQL, [orgId, workspaceId, sessionIds]),
+      );
+      return new Set(rows.map((r) => r.session_id));
     },
     async sessionStart(orgId, workspaceId, sessionId, source) {
       const { rows } = await run(orgId, workspaceId, (q) =>

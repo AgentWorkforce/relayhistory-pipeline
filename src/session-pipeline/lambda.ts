@@ -4,19 +4,23 @@
  *
  *   SQS batch (S3 object events, reconcile items) -> processBatch -> partial batch response
  *   EventBridge schedule {"reconcile": true}      -> list recent manifests -> SQS
+ *   EventBridge schedule {"brief": true}          -> one session-brief tick (src/session-brief)
  *
  * Configuration: plain env for ids and switches; credentials only from one
  * Secrets Manager secret (`SESSION_PIPELINE_SECRET_ARN`), read once per
  * sandbox with the execution role. The secret holds JSON:
  *
  *   { "hoopdb_url": "postgresql://…",           Supabase, the hoopdb runtime role
- *     "clickhouse": { "url", "user", "password", "database" } }   optional
+ *     "clickhouse": { "url", "user", "password", "database" },   optional
+ *     "openai_api_key": "…" }                    optional: session brief model calls
  *
  * Switches (env): SEARCH_INDEX_ENABLED=1 turns the ClickHouse stage on (off by
  * default, so the pointer stage can go live first); PIPELINE_FANOUT=postgres
  * enqueues the index's summary/state fan-out on `sessions.pipeline_jobs`
  * (default off: no consumer runs in production yet, and Bob Costas's sweep
- * rebuilds missing summaries when it does).
+ * rebuilds missing summaries when it does). SESSION_BRIEF_ENABLED=true arms brief
+ * wakeups as sessions index and lets the brief schedule run; with no
+ * `openai_api_key` a brief tick claims nothing (src/session-brief/config.ts).
  */
 import pg from "pg";
 import {
@@ -40,10 +44,14 @@ import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord }
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
+import { briefConfig, modelKey } from "../session-brief/config.ts";
+import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
+import { briefTick } from "../session-brief/worker.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
   clickhouse?: { url: string; user: string; password: string; database: string };
+  openai_api_key?: string;
 }
 
 export interface LambdaEnv {
@@ -96,6 +104,8 @@ export function parseSecret(text: string): PipelineSecret {
     for (const k of ["url", "user", "password", "database"] as const)
       if (!c || typeof c[k] !== "string" || !c[k]) throw new Error(`session pipeline secret clickhouse.${k} is missing`);
   }
+  if (v.openai_api_key !== undefined && (typeof v.openai_api_key !== "string" || !v.openai_api_key.trim()))
+    throw new Error("session pipeline secret openai_api_key must be a non-empty string when present");
   return v as PipelineSecret;
 }
 
@@ -151,6 +161,7 @@ export const BUSY_REQUEUE_DELAY_SECONDS = 60;
 interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
+  brief: ReturnType<typeof briefTick>;
 }
 
 let runtime: Promise<Runtime> | undefined;
@@ -207,8 +218,16 @@ async function init(): Promise<Runtime> {
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
     };
   }
+  // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
+  const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
+  const brief = briefTick({
+    reader,
+    store,
+    transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
+    config: briefConfig(),
+  });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
-  return { env, deps };
+  return { env, deps, brief };
 }
 
 function ready(): Promise<Runtime> {
@@ -373,7 +392,7 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   return { ...summary, link };
 }
 
-type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; cursor?: string; since?: string; link?: number };
+type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; cursor?: string; since?: string; link?: number };
 
 export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok: boolean }> {
   if (Array.isArray(event?.Records)) {
@@ -406,6 +425,19 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
       return { ok: true };
     } catch (error) {
       log.error("reconcile failed", { stage: "object-landed", ...errorFields(error), duration_ms: Date.now() - started });
+      return { ok: false };
+    }
+  }
+  if (event?.brief === true) {
+    // Off: return before init, so a schedule left enabled by mistake reads no secret and opens no pool.
+    if (!briefConfig().enabled) return { ok: true };
+    const started = Date.now();
+    try {
+      const rt = await ready();
+      await rt.brief(rt.deps.pointer.db, new Date());
+      return { ok: true };
+    } catch (error) {
+      log.error("session brief tick failed", { stage: "session-brief", ...errorFields(error), duration_ms: Date.now() - started });
       return { ok: false };
     }
   }

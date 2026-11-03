@@ -24,6 +24,12 @@ const UP = read(
 const DOWN = read(
   "supabase/rollbacks/20261031001000_session_directory_reads_expand.down.sql",
 );
+const CANONICAL_UP = read(
+  "supabase/migrations/20261102010000_session_directory_canonical_ids.sql",
+);
+const CANONICAL_DOWN = read(
+  "supabase/rollbacks/20261102010000_session_directory_canonical_ids.down.sql",
+);
 const FUNCTIONS = [
   "sessions.session_directory_pointers(text, text, text)",
   "sessions.session_directory_readiness()",
@@ -187,6 +193,39 @@ describe("session_directory_pointers", () => {
       rows.every((r) => r.deleted_at === null && r.org_id === "org-a"),
     ).toBe(true);
     expect(Number(rows[0]!.revision)).toBe(2);
+  });
+
+  test("looks up and returns canonical session and machine ids while preserving the physical manifest pointer", async () => {
+    const db = await database();
+    await pointer(db, "org-a", "ws-a", "delivery_abc");
+    await db.query(
+      `UPDATE sessions.session_index
+          SET canonical_session_id = 'kimi:session',
+              canonical_machine_id = 'delivery:abc'
+        WHERE org_id = 'org-a' AND workspace_id = 'ws-a'`,
+    );
+    const rows = await pointers(
+      db,
+      claims("org-a", ["ws-a"]),
+      "ws-a",
+      "codex",
+      "kimi:session",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      session_id: "kimi:session",
+      machine_id: "delivery:abc",
+      manifest_key: "v1/delivery_abc",
+    });
+    expect(
+      await pointers(
+        db,
+        claims("org-a", ["ws-a"]),
+        "ws-a",
+        "codex",
+        "s-1",
+      ),
+    ).toEqual(rows);
   });
 
   test("caps the result at 64 rows", async () => {
@@ -379,5 +418,39 @@ describe("expand migration", () => {
     expect(await pointers(db, claims("org-a", ["ws-a"]), "ws-a")).toHaveLength(
       1,
     );
+  });
+});
+
+describe("canonical identity migration", () => {
+  test("down restores physical pointer reads and up applies again", async () => {
+    const db = await database();
+    await pointer(db, "org-a", "ws-a", "delivery_abc");
+    await db.exec(CANONICAL_DOWN);
+    expect(
+      (
+        await db.query(
+          `SELECT 1 FROM pg_attribute
+            WHERE attrelid = 'sessions.session_index'::regclass
+              AND attname = 'canonical_session_id' AND NOT attisdropped`,
+        )
+      ).rows,
+    ).toEqual([]);
+    expect(
+      await pointers(db, claims("org-a", ["ws-a"]), "ws-a"),
+    ).toHaveLength(1);
+    await db.exec(CANONICAL_UP);
+    await db.query(
+      `UPDATE sessions.session_index
+          SET canonical_session_id = 'kimi:session', canonical_machine_id = 'delivery:abc'`,
+    );
+    expect(
+      await pointers(
+        db,
+        claims("org-a", ["ws-a"]),
+        "ws-a",
+        "codex",
+        "kimi:session",
+      ),
+    ).toHaveLength(1);
   });
 });

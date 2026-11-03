@@ -21,6 +21,7 @@ import { SUPABASE_PROD_CA_2021 } from "../session-pipeline/supabase-ca.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi } from "./app.ts";
 import { relayAuthVerifier } from "./auth.ts";
+import { parseCompleteSince } from "./config.ts";
 import { poolTenantRunner, sqlLiveness } from "./liveness.ts";
 
 export interface ReadApiSecret {
@@ -45,13 +46,7 @@ export function parseReadApiSecret(text: string): ReadApiSecret {
   return v as ReadApiSecret;
 }
 
-/** "epoch" → 0 (complete history); otherwise an ISO timestamp. Missing or junk refuses to start. */
-export function parseCompleteSince(raw: string | undefined): number {
-  if (raw === "epoch") return 0;
-  const t = raw ? Date.parse(raw) : Number.NaN;
-  if (Number.isNaN(t)) throw new Error('session read api: READ_API_COMPLETE_SINCE must be an ISO timestamp or "epoch"');
-  return t;
-}
+export { parseCompleteSince };
 
 type App = ReturnType<typeof createReadApi>;
 let appPromise: Promise<App> | undefined;

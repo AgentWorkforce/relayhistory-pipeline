@@ -13,7 +13,8 @@ ClickHouse; this list never reads transcript content.
 
 | dimension | where it lives | written by |
 | --- | --- | --- |
-| source (harness), project id, repository, branch, latest model, counts, tokens, cost, first/last activity, users, machines | `session_directory` (20261030010000) | projector, from `session_index` |
+| source (harness), latest model, counts, tokens, cost, first/last activity, users, machines | `session_directory` (20261030010000) | projector, from `session_index` |
+| project id, repository, branch | `session_directory` | `writeDirectoryCatalog` from the complete raw-record projection; pointer values are a fallback |
 | title | `session_directory.title` | projector (pointer title); the brief writer (feat/model-session-brief) projects the model-written title with precedence |
 | short summary | `session_directory.short_summary` (20261030020000) | `writeShortSummary` |
 | **agent names (several per session)** | **`session_directory.agent_names` + `session_directory_agents`** (new) | **`writeDirectoryCatalog`** |
@@ -30,10 +31,12 @@ relayhistory's `project_delivery_catalog_row` performs.
 A project key that is a local path is never stored. This covers method `path`,
 absolute paths, `~`, drive letters, UNC paths and `file:` paths.
 
-**Not wired yet.** No pipeline stage calls `writeDirectoryCatalog` yet: the
-relayhistory transform builds the projection rows but writes only a normalized
-object, and no indexer stage reads it back. Until a stage does and the backfill
-runs, the catalog fields and parent/child links are empty, and the list
+The S3 search-index pass calls `writeDirectoryCatalog` after every complete
+logical-session read. A partial, missing, unscrubbed, conflicting, over-limit,
+or ClickHouse-truncated pass never clears or updates catalog fields. Historical
+sessions still need the controlled re-projection in
+`docs/activation/session-directory-parity-reprojection.md`. Until that backfill
+runs, old catalog fields and parent/child links may be empty, and the list
 **refuses `p_agent`** with `0A000 agent_filter_not_ready` instead of answering
 an empty list. relayhistory-cloud falls back to Neon on that error. An operator
 unlocks it with
@@ -102,8 +105,8 @@ After the migration, existing rows have empty catalog columns and no agent or
 relationship rows. Two paths are possible, and each is an operator step that
 needs Khaliq's OK, like any write to a real database:
 
-1. Replay `writeDirectoryCatalog` from the normalized relayhistory projection
-   objects already in object storage, one call per session.
+1. Replay `writeDirectoryCatalog` from a complete projection of each session's
+   canonical raw objects in object storage, one call per session.
 2. For sessions that only Neon knows, copy from Neon `sessions.session_catalog`,
    `session_catalog_agents` and `session_relationships` (read-only role) into
    `writeDirectoryCatalog` inputs. Neon keeps one agent per session (0058

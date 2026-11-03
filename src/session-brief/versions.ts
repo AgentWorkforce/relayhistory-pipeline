@@ -1,6 +1,6 @@
 import { SESSION_SUMMARY_PROMPT_VERSION, SESSION_SUMMARY_VERSION } from "./engine/summary-contract.ts";
 
-/** The brief's prompt, unchanged from relayhistory (`session-summary-v2`). */
+/** The brief's prompt, relayhistory's `session-summary-v3` (two-sentence description and state). */
 export const SESSION_BRIEF_PROMPT_VERSION = SESSION_SUMMARY_PROMPT_VERSION;
 /** relayhistory's is `session-summary-v2:workspace-v1`; this input adapter is the 96Bulls one. */
 export const SESSION_BRIEF_ENGINE_VERSION = `${SESSION_SUMMARY_PROMPT_VERSION}:96bulls-v1`;

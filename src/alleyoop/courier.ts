@@ -929,6 +929,8 @@ export async function runCourierOnce(cfg: CourierConfig): Promise<{
                 session_uuid_source: "minted",
                 tenant_id: cfg.orgId,
                 user_id: cfg.userId,
+                canonical_session_id: row.session_id,
+                canonical_machine_id: state.machine_id,
               },
             },
           };

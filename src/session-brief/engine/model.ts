@@ -22,9 +22,9 @@ export interface ModelTransportRequest {
   schemaName: "session_analysis" | "session_summary";
   schema: Record<string, unknown>;
   timeoutMs: number;
-  /** Exact Skip summary model parameters; absent for full analysis. */
+  /** Summary model parameters; absent for full analysis. */
   store?: false;
-  maxOutputTokens?: 128;
+  maxOutputTokens?: 256;
   reasoningEffort?: "none";
 }
 export interface ModelTransportResponse {
@@ -57,7 +57,7 @@ export async function summarizeSessionInput(
     schema: SESSION_SUMMARY_JSON_SCHEMA as unknown as Record<string, unknown>,
     timeoutMs: SESSION_SUMMARY_TIMEOUT_MS,
     store: false,
-    maxOutputTokens: 128,
+    maxOutputTokens: 256,
     reasoningEffort: "none",
   });
   let summary: SessionSummaryText;
