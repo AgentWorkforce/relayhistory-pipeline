@@ -87,7 +87,7 @@ export function withLegacySource(
             const record: DeliveryRecord = {
               kind: spec.kind,
               origin_id: "legacy:" + spec.table,
-              record_id: row.key,
+              record_id: "legacy:" + spec.table + ":" + row.key,
               revision: "1",
               operation: "upsert",
               received_at: row.received_at,
@@ -114,7 +114,7 @@ export function withLegacySource(
       const record: DeliveryRecord = {
         kind: "legacy_scope",
         origin_id: "legacy:scope",
-        record_id: "coverage",
+        record_id: "legacy:scope:coverage",
         revision: "1",
         operation: "upsert",
         received_at: new Date(unit.lastMs).toISOString(),

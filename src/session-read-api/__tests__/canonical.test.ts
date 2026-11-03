@@ -612,7 +612,7 @@ test("provider exposes scoped legacy table pages and explicit coverage without N
     {
       kind: "legacy_conversation_turn",
       origin_id: "legacy:conversation_turns",
-      record_id: "id",
+      record_id: "legacy:conversation_turns:id",
       revision: "1",
       operation: "upsert",
       received_at: AT,
@@ -631,7 +631,7 @@ test("provider exposes scoped legacy table pages and explicit coverage without N
     {
       kind: "legacy_scope",
       origin_id: "legacy:scope",
-      record_id: "coverage",
+      record_id: "legacy:scope:coverage",
       revision: "1",
       operation: "upsert",
       received_at: AT,

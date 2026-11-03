@@ -41,7 +41,7 @@ export function canonicalLegacy(
       if (
         p.version !== 1 ||
         record.origin_id !== "legacy:scope" ||
-        record.record_id !== "coverage" ||
+        record.record_id !== "legacy:scope:coverage" ||
         !Array.isArray(p.tables) ||
         JSON.stringify([...p.tables].sort()) !==
           JSON.stringify([...LEGACY_SOURCE_TABLES].sort())
@@ -54,7 +54,7 @@ export function canonicalLegacy(
     if (table === "conversation_turns") {
       if (
         typeof p.id !== "string" ||
-        p.id !== record.record_id ||
+        "legacy:" + table + ":" + p.id !== record.record_id ||
         !integer(p.turn_index) ||
         Number(p.turn_index) > 2147483647 ||
         !["user", "assistant", "system"].includes(String(p.role)) ||
@@ -67,7 +67,7 @@ export function canonicalLegacy(
     } else if (table === "session_links") {
       if (
         typeof p.id !== "string" ||
-        p.id !== record.record_id ||
+        "legacy:" + table + ":" + p.id !== record.record_id ||
         !/^[1-9][0-9]{0,18}$/u.test(p.id) ||
         BigInt(p.id) > 9223372036854775807n ||
         !["link_kind", "link_ref"].every(
@@ -79,7 +79,7 @@ export function canonicalLegacy(
     } else if (table === "session_outcomes") {
       if (
         typeof p.commit_sha !== "string" ||
-        p.commit_sha !== record.record_id ||
+        "legacy:" + table + ":" + p.commit_sha !== record.record_id ||
         !p.commit_sha ||
         typeof p.reverted !== "boolean" ||
         !clock(p.shipped_at, true) ||

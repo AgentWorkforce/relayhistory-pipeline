@@ -12,7 +12,7 @@ const record = (
 ): RelayhistoryStreamRecord => ({
   kind: "legacy_conversation_turn",
   origin_id: "legacy:conversation_turns",
-  record_id: "id",
+  record_id: "legacy:conversation_turns:id",
   revision: "1",
   operation: "upsert",
   received_at: "2026-11-01T00:00:00Z",
@@ -50,6 +50,6 @@ test("coverage requires every table exactly once", () => {
   });
   r.kind = "legacy_scope";
   r.origin_id = "legacy:scope";
-  r.record_id = "coverage";
+  r.record_id = "legacy:scope:coverage";
   expect(() => canonicalLegacy([r], identity)).toThrow();
 });

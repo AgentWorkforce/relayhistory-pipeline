@@ -8,6 +8,7 @@ import {
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import {
   normalizeRelayhistoryRecords,
+  isLegacyRelayhistoryRecord,
   parseRelayhistoryRecord,
   relayhistoryExportProvenance,
   type RelayhistoryStreamRecord,
@@ -419,7 +420,11 @@ export async function readCanonicalScope(
   const ownerByEvent = new Map<string, { userId: string; sessionId: string }>();
   for (const part of parts)
     for (const record of part.records) {
-      if (record.kind === CONVERGENCE_EVENT_KIND) continue;
+      if (
+        record.kind === CONVERGENCE_EVENT_KIND ||
+        isLegacyRelayhistoryRecord(record)
+      )
+        continue;
       const identity = JSON.stringify([
         deliveryMachine(scope.workspaceId, record.origin_id),
         record.record_id,

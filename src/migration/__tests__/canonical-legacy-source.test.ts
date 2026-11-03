@@ -236,3 +236,97 @@ test("opt-in sync discovers and exports a legacy-only group; default source stay
   expect(lines).toEqual([]);
   state.close();
 });
+
+test("legal source IDs cannot collide with the completeness marker across origins", async () => {
+  await pg.exec(
+    `INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','coverage','user_1',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`,
+  );
+  const unit = (await includeLegacyUnits(db, "org_1", "sess:1", []))[0]!;
+  const store = createFsStore({ root: join(root, "collision-objects") });
+  const source = withLegacySource(
+    db,
+    {
+      fenced: async () => false,
+      async *lines() {
+        // A delivery ID can legally equal even the new reserved-looking marker ID.
+        yield {
+          machine: "legacy:records",
+          userId: "unknown",
+          bytes: new TextEncoder().encode(
+            JSON.stringify({
+              kind: "session_event",
+              origin_id: "legacy:scope",
+              record_id: "legacy:scope:coverage",
+              revision: "1",
+              operation: "upsert",
+              received_at: "2026-11-01T10:00:00Z",
+              payload: {
+                ts_ms: 1793527200000,
+                text: "independent delivery",
+                role: "assistant",
+              },
+            }) + "\n",
+          ),
+        };
+      },
+    },
+    async () => {},
+    1,
+  );
+  const result = await exportUnit(
+    { store, keyRoot: "96bulls", grantId: "grant_1" },
+    unit,
+    source,
+  );
+  const key = result.manifests[0]!.manifestKey;
+  const manifest = await parseManifest(
+    new TextDecoder().decode(await readAll(await store.get(objectKey(key)))),
+    key,
+  );
+  const pointer: CanonicalPointer = {
+    org_id: "org_1",
+    workspace_id: "ws_1",
+    harness: "claude",
+    session_id: "sess:1",
+    machine_id: "legacy:records",
+    user_id: "unknown",
+    storage_provider: "s3",
+    bucket: "bucket",
+    manifest_key: key,
+    content_sha256: manifest.raw.content_sha256,
+    raw_format: "ndjson",
+    revision: manifest.revision,
+    deleted_at: null,
+  };
+  const snapshot = await canonicalSnapshot(
+    {
+      store,
+      provider: "s3",
+      bucket: "bucket",
+      prefix: {
+        PIPELINE_KEY_PREFIX: "96bulls",
+        PIPELINE_ORG_FROM_PREFIX: "true",
+      },
+      pointers: async () => [pointer],
+      decompress: (b) => new Uint8Array(zstdDecompressSync(b)),
+    },
+    {
+      orgId: "org_1",
+      workspaceId: "ws_1",
+      source: "claude",
+      sessionId: "sess:1",
+    },
+  );
+  expect(snapshot.legacyCoverage).not.toBeNull();
+  expect(
+    snapshot.rows.find((r) => r.table === "convergence_events")?.row.content,
+  ).toBe("independent delivery");
+  expect(
+    snapshot.rows.find(
+      (r) => r.table === "session_outcomes" && r.row.commit_sha === "coverage",
+    ),
+  ).toBeTruthy();
+  expect(
+    snapshot.rows.find((r) => r.table === "conversation_turns")?.row.id,
+  ).toBe(turnId);
+});
