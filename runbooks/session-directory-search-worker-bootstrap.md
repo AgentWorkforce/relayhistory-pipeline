@@ -351,6 +351,8 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261102010000_session_directory_canonical_ids.sql`  | column sessions.session_index.canonical_session_id                                                                      |
 | `upstream:20261103010000_session_directory_event_metadata.sql` | table sessions.session_directory_event_times |
 | `upstream:20261103040000_session_replay_pages.sql` | table sessions.session_replay_publications |
+| `upstream:20261103050000_session_desktop_catalog.sql` | column sessions.session_directory.catalog_read_version |
+| `upstream:20261103060000_session_analysis_publications.sql` | table sessions.session_analysis_publications |
 | `upstream:20261102020000_session_brief_state.sql`              | ALTER-only: column sessions.session_briefs.state                                                                        |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

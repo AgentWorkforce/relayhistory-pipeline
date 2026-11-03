@@ -65,6 +65,8 @@ DECLARE
   v_db oid := (SELECT oid FROM pg_database WHERE datname = current_database());
   v_sessions oid := to_regnamespace('sessions')::oid;
   v_approved text[] := ARRAY[
+    'sessions.request_session_analysis_cache(text,text,text)',
+    'sessions.session_directory_analysis_cache(text,text,text)',
     'sessions.session_directory_desktop_catalog(text,text,text)',
     'sessions.session_directory_replay_pages(text,text,text)',
     'sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)',

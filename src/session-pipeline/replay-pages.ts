@@ -23,6 +23,7 @@ const time = (v: unknown) => v == null ? "" : canonicalTimestamp(String(v));
 /** The same event byte order as the raw provider; legacy numeric keys stay numeric. */
 export function compareArtifactRows(a: ArtifactRow, b: ArtifactRow): number {
   const x = a.row, y = b.row;
+  if (a.table === "session_analysis_requests" || a.table === "session_analyses") return Number(x.ordinal)-Number(y.ordinal);
   if (a.table === "convergence_events") {
     return compareArtifactEventRows(x,y);
   }
