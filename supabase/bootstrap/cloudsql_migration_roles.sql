@@ -48,7 +48,7 @@ BEGIN
     'authenticated'::name,
     'service_role'::name,
     'session_directory_search_worker'::name,
-    'session_token_verifier'::name
+    'session_token_verifier'::name,
     'bulls96_session_ingest'::name,
     'bulls96_session_ingest_seeder'::name
   ] LOOP
