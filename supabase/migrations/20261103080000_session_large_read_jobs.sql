@@ -1,5 +1,7 @@
 -- Default-off durable handoff for trusted high-memory Node processing.
 -- No transcript bytes, credentials, or direct reader table grants.
+-- Lease authority uses wall time: now() is frozen at transaction start and
+-- must not permit an expired lease to renew or publish in a held transaction.
 CREATE TABLE sessions.session_large_read_jobs(
  org_id text NOT NULL,workspace_id text NOT NULL,harness text NOT NULL,session_id text NOT NULL,
  source_epoch bigint NOT NULL,source_fingerprint text NOT NULL CHECK(source_fingerprint~'^[0-9a-f]{64}$'),
@@ -26,7 +28,7 @@ BEGIN
  VALUES(p_org,p_workspace,p_harness,canonical_id,e,f)
  ON CONFLICT(org_id,workspace_id,harness,session_id) DO UPDATE SET
  source_epoch=excluded.source_epoch,source_fingerprint=excluded.source_fingerprint,state='queued',
- available_at=now(),lease_nonce=NULL,lease_expires_at=NULL,attempts=0,last_error=NULL,updated_at=now()
+ available_at=clock_timestamp(),lease_nonce=NULL,lease_expires_at=NULL,attempts=0,last_error=NULL,updated_at=now()
  WHERE j.source_epoch IS DISTINCT FROM excluded.source_epoch OR j.source_fingerprint IS DISTINCT FROM excluded.source_fingerprint
     OR j.state='superseded';
  RETURN jsonb_build_object('enqueued',true,'identity',c->'identity','source',c->'source');
@@ -38,7 +40,7 @@ DECLARE j sessions.session_large_read_jobs%ROWTYPE;c jsonb;
 BEGIN
  IF p_nonce IS NULL OR p_lease_seconds IS NULL OR p_lease_seconds NOT BETWEEN 30 AND 300 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='large read: invalid lease'; END IF;
  FOR j IN SELECT * FROM sessions.session_large_read_jobs WHERE
- (state='queued' AND available_at<=now()) OR (state='running' AND lease_expires_at<=now())
+ (state='queued' AND available_at<=clock_timestamp()) OR (state='running' AND lease_expires_at<=clock_timestamp())
  ORDER BY available_at,updated_at LIMIT 100 FOR UPDATE SKIP LOCKED LOOP
   IF j.attempts>=5 THEN
    UPDATE sessions.session_large_read_jobs SET state='failed',lease_nonce=NULL,lease_expires_at=NULL,last_error='attempts_exhausted',updated_at=now() WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
@@ -51,7 +53,7 @@ BEGIN
     WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
    CONTINUE;
   END IF;
-  UPDATE sessions.session_large_read_jobs SET state='running',lease_nonce=p_nonce,lease_expires_at=now()+make_interval(secs=>p_lease_seconds),attempts=attempts+1,last_error=NULL,updated_at=now()
+  UPDATE sessions.session_large_read_jobs SET state='running',lease_nonce=p_nonce,lease_expires_at=clock_timestamp()+make_interval(secs=>p_lease_seconds),attempts=attempts+1,last_error=NULL,updated_at=now()
    WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
   RETURN jsonb_build_object('identity',c->'identity','source',c->'source','leaseNonce',p_nonce::text);
  END LOOP;
@@ -63,11 +65,11 @@ RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_
 DECLARE c jsonb;j sessions.session_large_read_jobs%ROWTYPE;
 BEGIN
  SELECT * INTO j FROM sessions.session_large_read_jobs WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=p_session FOR UPDATE;
- IF NOT FOUND OR j.state<>'running' OR j.lease_nonce IS DISTINCT FROM p_nonce OR j.lease_expires_at<=now() THEN RETURN false; END IF;
+ IF NOT FOUND OR j.state<>'running' OR j.lease_nonce IS DISTINCT FROM p_nonce OR j.lease_expires_at<=clock_timestamp() THEN RETURN false; END IF;
  c:=sessions.capture_session_replay_pages(p_org,p_workspace,p_harness,p_session);
  IF NOT (c->>'exists')::boolean OR (c->>'blocked')::boolean OR c->'source'->>'epoch' IS DISTINCT FROM j.source_epoch::text
   OR c->'source'->>'fingerprint' IS DISTINCT FROM j.source_fingerprint THEN RETURN false; END IF;
- UPDATE sessions.session_large_read_jobs SET lease_expires_at=now()+interval '120 seconds',updated_at=now()
+ UPDATE sessions.session_large_read_jobs SET lease_expires_at=clock_timestamp()+interval '120 seconds',updated_at=now()
  WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=p_session;
  RETURN true;
 END $heartbeat$;
@@ -81,7 +83,7 @@ CREATE FUNCTION sessions.publish_session_large_read(
 DECLARE j sessions.session_large_read_jobs%ROWTYPE;
 BEGIN
  SELECT * INTO j FROM sessions.session_large_read_jobs WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=p_session FOR UPDATE;
- IF NOT FOUND OR j.state<>'running' OR j.lease_nonce IS DISTINCT FROM p_nonce OR j.lease_expires_at<=now()
+ IF NOT FOUND OR j.state<>'running' OR j.lease_nonce IS DISTINCT FROM p_nonce OR j.lease_expires_at<=clock_timestamp()
   OR j.source_epoch IS DISTINCT FROM p_epoch OR j.source_fingerprint IS DISTINCT FROM p_fingerprint THEN RETURN false; END IF;
  IF NOT sessions.publish_session_replay_pages(p_org,p_workspace,p_harness,p_session,p_epoch,p_fingerprint,p_snapshot,
   p_generation,p_source_generation,p_prefix,p_index_key,p_index_sha256,p_index_bytes) THEN RETURN false; END IF;
@@ -94,9 +96,9 @@ CREATE FUNCTION sessions.retry_session_large_read(p_org text,p_workspace text,p_
 RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $retry$
 BEGIN
  IF p_error IS NULL OR p_error !~ '^[a-z][a-z0-9_]{0,63}$' THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='large read: invalid error code'; END IF;
- UPDATE sessions.session_large_read_jobs SET state=CASE WHEN attempts>=5 THEN 'failed' ELSE 'queued' END,available_at=now()+interval '30 seconds',lease_nonce=NULL,lease_expires_at=NULL,last_error=p_error,updated_at=now()
+ UPDATE sessions.session_large_read_jobs SET state=CASE WHEN attempts>=5 THEN 'failed' ELSE 'queued' END,available_at=clock_timestamp()+interval '30 seconds',lease_nonce=NULL,lease_expires_at=NULL,last_error=p_error,updated_at=now()
  WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=p_session
-  AND state='running' AND lease_nonce=p_nonce AND lease_expires_at>now();
+  AND state='running' AND lease_nonce=p_nonce AND lease_expires_at>clock_timestamp();
  RETURN FOUND;
 END $retry$;
 

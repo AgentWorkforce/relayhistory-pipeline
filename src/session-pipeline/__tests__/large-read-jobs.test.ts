@@ -17,3 +17,39 @@ test("routing handles oversized and unknown metadata durably before acknowledgin
 test("public search worker cannot read the ledger or execute backend handoff",async()=>{const x=await fresh();await x.pg.exec("SET ROLE session_directory_search_worker");await expect(x.pg.query("SELECT * FROM sessions.session_large_read_jobs")).rejects.toMatchObject({code:"42501"});await expect(enqueue(x)).rejects.toMatchObject({code:"42501"});await x.pg.exec("RESET ROLE")});
 test("retries keep only bounded error codes, cap poison attempts, and reject stale nonce",async()=>{const x=await fresh();await enqueue(x);await claim(x);await expect(x.db.query("SELECT sessions.retry_session_large_read($1,$2,$3,$4,$5::uuid,$6) ok",[...scope,n1,"private error body"])).rejects.toMatchObject({code:"22023"});expect((await x.db.query("SELECT sessions.retry_session_large_read($1,$2,$3,$4,$5::uuid,$6) ok",[...scope,n2,"failed"])).rows[0].ok).toBe(false);await x.pg.exec("UPDATE sessions.session_large_read_jobs SET attempts=5");expect((await x.db.query("SELECT sessions.retry_session_large_read($1,$2,$3,$4,$5::uuid,$6) ok",[...scope,n1,"failed"])).rows[0].ok).toBe(true);expect((await x.pg.query("SELECT state FROM sessions.session_large_read_jobs")).rows[0].state).toBe("failed");expect(await claim(x,n2)).toBeNull()});
 test("larger Node profile is explicit and bounded while standard admission stays unchanged",()=>{expect(nodeReadBudget().sourceBytes).toBe(256*1024**2);expect(nodeReadBudget().projectedRows).toBe(500000);expect(nodeReadBudget("large").sourceBytes).toBe(2*1024**3);expect(nodeReadBudget("large").artifactBytes).toBe(16*1024**3);expect(()=>nodeReadBudget("unbounded" as any)).toThrow("node_read_profile_invalid")});
+
+// Hold a real transaction open across wall-clock expiry. now() alone cannot
+// distinguish these cases because PostgreSQL freezes it at transaction start.
+test.each(["heartbeat","publish","retry"] as const)("held transaction cannot %s an actually expired lease",async(operation)=>{
+ const x=await fresh();await enqueue(x);await claim(x);await x.pg.exec("BEGIN");
+ try{
+  await x.pg.exec("UPDATE sessions.session_large_read_jobs SET lease_expires_at=clock_timestamp()+interval '50 milliseconds'");
+  await new Promise(resolve=>setTimeout(resolve,80));
+  expect((await x.pg.query<{expired:boolean}>("SELECT lease_expires_at<clock_timestamp() expired FROM sessions.session_large_read_jobs")).rows[0]!.expired).toBe(true);
+  const accepted=operation==="publish"?await pub(x):operation==="heartbeat"?(await x.db.query<{ok:boolean}>("SELECT sessions.heartbeat_session_large_read($1,$2,$3,$4,$5::uuid) ok",[...scope,n1])).rows[0]!.ok:(await x.db.query<{ok:boolean}>("SELECT sessions.retry_session_large_read($1,$2,$3,$4,$5::uuid,$6) ok",[...scope,n1,"failed"])).rows[0]!.ok;
+  expect(accepted).toBe(false);
+ }finally{await x.pg.exec("ROLLBACK")}
+});
+test.each(["queued","running"] as const)("held transaction claims a %s job when wall time reaches its due boundary",async(state)=>{
+ const x=await fresh();await enqueue(x);if(state==="running")await claim(x);await x.pg.exec("BEGIN");
+ try{
+  await x.pg.exec(state==="queued"?"UPDATE sessions.session_large_read_jobs SET available_at=clock_timestamp()+interval '50 milliseconds'":"UPDATE sessions.session_large_read_jobs SET lease_expires_at=clock_timestamp()+interval '50 milliseconds'");
+  await new Promise(resolve=>setTimeout(resolve,80));
+  expect((await claim(x,n2))?.leaseNonce).toBe(n2);
+ }finally{await x.pg.exec("ROLLBACK")}
+});
+test("claim and heartbeat extend from invocation wall time inside a held transaction",async()=>{
+ const x=await fresh();await enqueue(x);await x.pg.exec("BEGIN");
+ try{
+  await new Promise(resolve=>setTimeout(resolve,80));
+  const invoked=(await x.pg.query<{at:string}>("SELECT clock_timestamp()::text at")).rows[0]!.at;
+  expect((await claim(x)).leaseNonce).toBe(n1);
+  expect((await x.pg.query<{fresh:boolean}>("SELECT lease_expires_at >= $1::timestamptz+interval '120 seconds' fresh FROM sessions.session_large_read_jobs",[invoked])).rows[0]!.fresh).toBe(true);
+  const beatAt=(await x.pg.query<{at:string}>("SELECT clock_timestamp()::text at")).rows[0]!.at;
+  expect((await x.db.query<{ok:boolean}>("SELECT sessions.heartbeat_session_large_read($1,$2,$3,$4,$5::uuid) ok",[...scope,n1])).rows[0]!.ok).toBe(true);
+  expect((await x.pg.query<{fresh:boolean}>("SELECT lease_expires_at >= $1::timestamptz+interval '120 seconds' fresh FROM sessions.session_large_read_jobs",[beatAt])).rows[0]!.fresh).toBe(true);
+  const retryAt=(await x.pg.query<{at:string}>("SELECT clock_timestamp()::text at")).rows[0]!.at;
+  expect((await x.db.query<{ok:boolean}>("SELECT sessions.retry_session_large_read($1,$2,$3,$4,$5::uuid,$6) ok",[...scope,n1,"failed"])).rows[0]!.ok).toBe(true);
+  expect((await x.pg.query<{fresh:boolean}>("SELECT available_at >= $1::timestamptz+interval '30 seconds' fresh FROM sessions.session_large_read_jobs",[retryAt])).rows[0]!.fresh).toBe(true);
+ }finally{await x.pg.exec("ROLLBACK")}
+});
