@@ -7,10 +7,8 @@
  * one shared layout encoding produces the manifest's physical id; malformed or
  * unrelated metadata can never redirect a pointer to another object-layout key.
  */
-import {
-  relayhistoryExportProvenance,
-  type ManifestV1,
-} from "./vendor.ts";
+import { relayhistoryExportProvenance } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
+import type { ManifestV1 } from "../../packages/object-store/src/index.ts";
 import { layoutComponent } from "./layout-component.ts";
 
 const MAX_ID_CODE_POINTS = 255;
