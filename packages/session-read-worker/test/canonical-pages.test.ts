@@ -31,11 +31,12 @@ const token =
     }),
   ) +
   ".signature";
-const request = (suffix = "") =>
+const request = (suffix = "", limit = 2) =>
   new Request(
     "https://read.test/v1/canonical/sessions/" +
       encodeURIComponent(identity.sessionId) +
-      "?workspace=ws-a&source=codex&view=replay&limit=2" +
+      "?workspace=ws-a&source=codex&view=replay&limit=" +
+      limit +
       suffix,
     { headers: { authorization: "Bearer " + token } },
   );
@@ -52,7 +53,7 @@ async function fixture() {
     objects.set(key, bytes);
     return { key, sha256: await sha256Hex(bytes), bytes: bytes.length };
   }
-  const rows = [1, 2].map((n) => ({
+  const rows = [1, 2, 3].map((n) => ({
     table: "convergence_events",
     row: {
       org_id: identity.orgId,
@@ -69,7 +70,7 @@ async function fixture() {
       record: { payload: { message_id: "native" + n } },
     },
   }));
-  const page = await put("page.json", {
+  const page1 = await put("page1.json", {
     version: 1,
     kind: "row-page",
     identity,
@@ -77,7 +78,56 @@ async function fixture() {
     table: "convergence_events",
     view: "replay",
     start: 0,
-    rows,
+    rows: rows.slice(0, 1),
+  });
+  const page2 = await put("page2.json", {
+    version: 1,
+    kind: "row-page",
+    identity,
+    generation,
+    table: "convergence_events",
+    view: "replay",
+    start: 1,
+    rows: rows.slice(1),
+  });
+  const root = await put("root.json", {
+    version: 1,
+    kind: "range-node",
+    identity,
+    generation,
+    unit: "rows",
+    table: "convergence_events",
+    view: "replay",
+    start: 0,
+    count: 3,
+    children: [
+      { ...page1, start: 0, count: 1, kind: "page" },
+      { ...page2, start: 1, count: 2, kind: "page" },
+    ],
+  });
+  const bounds = await put("bounds.json", {
+    version: 1,
+    kind: "row-page",
+    identity,
+    generation,
+    table: "convergence_events",
+    view: "bounds",
+    start: 0,
+    rows: rows.map((item) => ({
+      table: item.table,
+      row: Object.fromEntries(
+        [
+          "org_id",
+          "workspace_id",
+          "source",
+          "session_id",
+          "ts",
+          "event_id",
+          "machine_id",
+          "kind",
+        ].map((k) => [k, item.row[k as keyof typeof item.row]]),
+      ),
+    })),
   });
   const index = await put("index.json", {
     version: 1,
@@ -90,9 +140,13 @@ async function fixture() {
     legacyCoverage: null,
     tables: {
       convergence_events: {
+        bounds: {
+          count: 3,
+          root: { ...bounds, start: 0, count: 3, kind: "page" },
+        },
         replay: {
-          count: 2,
-          root: { ...page, start: 0, count: 2, kind: "page" },
+          count: 3,
+          root: { ...root, start: 0, count: 3, kind: "node" },
         },
       },
     },
@@ -153,7 +207,7 @@ it("serves selected page mode in real workerd without entering the raw provider"
   });
   expect(body.rows.map((x: any) => x.row.event_id)).toEqual(["e1", "e2"]);
   expect(body.rows[0].row.record.payload.message_id).toBe("native1");
-  expect(f.counts()).toEqual({ reads: 2, claims: 2 });
+  expect(f.counts()).toEqual({ reads: 4, claims: 2 });
 });
 it("refuses stale/foreign selected publications before object or raw reads", async () => {
   for (const ack of [
@@ -229,4 +283,51 @@ it("sends the same claim bearer and exact tenant key to the publication RPC", as
   );
   expect(await reader(identity)).toMatchObject({ exists: false });
   expect(calls).toBe(1);
+});
+
+it("HTTP timestamp windows seek past first physical replay page and forward both inclusive bounds", async () => {
+  const f = await fixture();
+  const result = await canonicalHandle(
+    request(
+      "&since=2026-11-01T10:00:00.000002Z&until=2026-11-01T10:00:00.000002Z",
+      1,
+    ),
+    { CANONICAL_READ_ENABLED: "true", CANONICAL_READ_MODE: "pages" },
+    forbidden,
+    { pointers: forbidden } as never,
+    f.deps,
+  );
+  expect(result.status).toBe(200);
+  const body: any = await result.json();
+  expect(body.rows.map((x: any) => x.row.event_id)).toEqual(["e2"]);
+  expect(body.nextCursor).toBeNull();
+});
+it("HTTP timestamp window cursor cannot be reused with a changed window", async () => {
+  const f = await fixture(),
+    env = { CANONICAL_READ_ENABLED: "true", CANONICAL_READ_MODE: "pages" };
+  const original = await canonicalHandle(
+    request(
+      "&since=2026-11-01T10:00:00.000001Z&until=2026-11-01T10:00:00.000003Z",
+      1,
+    ),
+    env,
+    forbidden,
+    { pointers: forbidden } as never,
+    f.deps,
+  );
+  expect(original.status).toBe(200);
+  const body: any = await original.json();
+  expect(body.nextCursor).toBeTruthy();
+  const changed = await canonicalHandle(
+    request(
+      "&since=2026-11-01T10:00:00.000001Z&until=2026-11-01T10:00:00.000002Z&cursor=" +
+        encodeURIComponent(body.nextCursor),
+      1,
+    ),
+    env,
+    forbidden,
+    { pointers: forbidden } as never,
+    f.deps,
+  );
+  expect(changed.status).toBe(400);
 });

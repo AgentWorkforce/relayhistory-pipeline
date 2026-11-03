@@ -314,6 +314,8 @@ export async function canonicalHandle(
           cursor: url.searchParams.get("cursor"),
           maxContent,
           generation: expectedGeneration,
+          since: url.searchParams.get("since") ?? undefined,
+          until: url.searchParams.get("until") ?? undefined,
         }),
         deadline,
       ]);

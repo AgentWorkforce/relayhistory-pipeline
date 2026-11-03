@@ -240,3 +240,62 @@ it("matches producer oracle at physical page boundaries/middle/end and seeks tie
     }),
   );
 });
+
+it("actual HTTP handler seeks a middle window and rejects a changed-window cursor on the large publication", async () => {
+  const { ack, deps, proof } = await setup(),
+    identity = ack.identity;
+  const target = proof.expectedPositions.find(
+    (p: any) => p.position === Math.floor(proof.events / 2),
+  ).ts;
+  const token =
+    "header." +
+    btoa(
+      JSON.stringify({
+        role: "session_directory_search_worker",
+        app_metadata: {
+          org_id: identity.orgId,
+          workspace_ids: [identity.workspaceId],
+        },
+      }),
+    ) +
+    ".signature";
+  async function read(extra: Record<string, string>) {
+    const params = new URLSearchParams({
+      workspace: identity.workspaceId,
+      source: identity.source,
+      view: "replay",
+      limit: "2",
+      order: "asc",
+      maxContent: "80",
+      ...extra,
+    });
+    return canonicalHandle(
+      new Request(
+        "https://read.test/v1/canonical/sessions/" +
+          encodeURIComponent(identity.sessionId) +
+          "?" +
+          params,
+        { headers: { authorization: "Bearer " + token } },
+      ),
+      { CANONICAL_READ_ENABLED: "true", CANONICAL_READ_MODE: "pages" },
+      () => {
+        throw new Error("raw/Neon forbidden");
+      },
+      undefined,
+      deps,
+    );
+  }
+  const response = await read({ since: target });
+  expect(response.status).toBe(200);
+  const body: any = await response.json();
+  expect(body.rows.length).toBe(2);
+  expect(body.rows.every((x: any) => String(x.row.ts) >= target)).toBe(true);
+  expect(body.rows[0].row.ts).not.toBe(proof.expectedPositions[0].ts);
+  expect(body.nextCursor).toBeTruthy();
+  const changed = await read({
+    since: target,
+    until: target,
+    cursor: body.nextCursor,
+  });
+  expect(changed.status).toBe(400);
+});
