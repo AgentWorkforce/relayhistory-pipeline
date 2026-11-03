@@ -50,6 +50,10 @@ const VERIFY = readFileSync(
   join(root, "supabase/bootstrap/session_directory_search_worker_verify.sql"),
   "utf8",
 );
+const TOKEN_VERIFY = readFileSync(
+  join(root, "supabase/bootstrap/session_token_verifier_verify.sql"),
+  "utf8",
+);
 
 const open: PGlite[] = [];
 afterEach(async () => {
@@ -252,6 +256,7 @@ describe("Worker role validation marker", () => {
     // The external verifier's transaction (the mark_pass.sql contract, minus psql).
     await db.exec(`BEGIN; SELECT pg_advisory_xact_lock(961996, 1);
       ${VERIFY}
+      ${TOKEN_VERIFY}
       UPDATE ${ROLE_VALIDATION_TABLE} SET status = 'pass', updated_at = now()
        WHERE name = '${WORKER}' AND generation = '${await generation()}' AND status = 'pending';
       COMMIT;`);
@@ -401,9 +406,10 @@ describe("the live gate: the marker is never the sole authority", () => {
     );
     expect(seen[4]).toStartWith("SELECT generation, status FROM");
     expect(seen[5]).toBe(VERIFY);
-    expect(seen[6]).toBe(SESSIONS_FUNCTION_GATE_SQL); // the live sessions-function boundary
-    expect(seen[7]).toStartWith("SELECT generation, status FROM"); // the final read
-    expect(seen).toHaveLength(8);
+    expect(seen[6]).toBe(TOKEN_VERIFY);
+    expect(seen[7]).toBe(SESSIONS_FUNCTION_GATE_SQL); // the live sessions-function boundary
+    expect(seen[8]).toStartWith("SELECT generation, status FROM"); // the final read
+    expect(seen).toHaveLength(9);
     // No advisory lock anywhere on the probe path.
     expect(seen.some((q) => /advisory/i.test(q))).toBe(false);
     // One source: the migrator's verify step and mark_pass.sql use the same file.
@@ -526,9 +532,11 @@ describe("the live gate: the marker is never the sole authority", () => {
       .map((l) =>
         l === "\\ir session_directory_search_worker_verify.sql"
           ? VERIFY
-          : l
-              .replace(":'generation'", `'${gen.replace(/'/g, "''")}'`)
-              .replace(":'db_mode'", "'local'"),
+          : l === "\\ir session_token_verifier_verify.sql"
+            ? TOKEN_VERIFY
+            : l
+                .replace(":'generation'", `'${gen.replace(/'/g, "''")}'`)
+                .replace(":'db_mode'", "'local'"),
       )
       .join("\n");
   const runMarkPass = async (db: PGlite, gen: string) => {
