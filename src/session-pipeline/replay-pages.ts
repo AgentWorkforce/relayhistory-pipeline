@@ -1,3 +1,4 @@
+import { nodeReadBudget, type NodeReadProfile } from "../session-read-api/node-read-profile.ts";
 /** Node-only, write-before-publication materializer. No Worker source-budget lift. */
 import { createHash } from "node:crypto";
 import {
@@ -39,6 +40,7 @@ export function compareArtifactRows(a: ArtifactRow, b: ArtifactRow): number {
 }
 export interface MaterializeInput {
   identity: ArtifactIdentity; generation: string; source: ArtifactSource; prefix: string;
+  profile?: NodeReadProfile;
   rows: ArtifactRow[]; legacyCoverage: ArtifactIndex["legacyCoverage"];
 }
 export interface MaterializeResult { index: ArtifactRef; document: ArtifactIndex; objects: number; bytes: number }
@@ -51,7 +53,7 @@ class Writer {
     const sha256 = artifactDigest(bytes), key = `${this.input.prefix}${sha256}.${extension}`;
     const cached = this.written.get(key); if (cached) return cached;
     // Output expansion is bounded separately from the admitted raw source budget.
-    if (this.bytes + bytes.length > 2 * 1024 ** 3) refuse("artifact_output_bound");
+    if (this.bytes + bytes.length > nodeReadBudget(this.input.profile).artifactBytes) refuse("artifact_output_bound");
     this.bytes += bytes.length;
     const ack = await this.store.put(objectKey(key), bytes, { ifNoneMatch: true, contentSha256: sha256, contentType: extension === "json" ? "application/json" : "application/octet-stream" });
     if (ack.contentSha256 !== sha256 || ack.size !== bytes.length) refuse("artifact_write_ack_invalid");
@@ -146,7 +148,7 @@ class Writer {
 /** Called only after authoritative full-union projection succeeds. Publication is a separate CAS. */
 export async function materializeCanonicalArtifacts(store: ObjectStore, input: MaterializeInput): Promise<MaterializeResult> {
   if (!/^[0-9a-f]{64}$/u.test(input.generation) || !/^[0-9a-f]{64}$/u.test(input.source.fingerprint) || !/^[1-9][0-9]*$/u.test(input.source.epoch) || !input.prefix.endsWith("/")) refuse("artifact_identity_invalid");
-  if (input.rows.length > 2_000_000) refuse("artifact_row_bound");
+  if (input.rows.length > nodeReadBudget(input.profile).artifactRows) refuse("artifact_row_bound");
   const writer = new Writer(store, input), groups = new Map<string, ArtifactRow[]>();
   for (const item of input.rows) {
     const group = groups.get(item.table) ?? []; group.push(item); groups.set(item.table, group);

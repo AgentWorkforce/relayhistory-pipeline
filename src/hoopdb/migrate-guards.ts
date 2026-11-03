@@ -163,6 +163,13 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
 ] as const;
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
+  "sessions.enqueue_session_large_read(text,text,text,text)",
+  "sessions.claim_session_large_read(uuid,integer)",
+  "sessions.heartbeat_session_large_read(text,text,text,text,uuid)",
+  "sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)",
+  "sessions.retry_session_large_read(text,text,text,text,uuid,text)",
+  "sessions.route_session_large_read(text,text,text,text)",
+
   "sessions.capture_session_replay_pages(text,text,text,text)",
   "sessions.publish_session_replay_pages(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer)",
   "sessions.applied_repo_evidence(jsonb,jsonb)",
@@ -1067,7 +1074,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "357c085aea7824950aa87ce0d1e6777f91544a278b34b79138e8f0703994fe69";
+  "9705a8a75041dc5fb94af1391bcfdcf39a4287e0eec13df021e9324602f00fe2";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

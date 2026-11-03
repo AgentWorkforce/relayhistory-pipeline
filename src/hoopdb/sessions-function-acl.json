@@ -13,10 +13,22 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.claim_session_large_read(uuid,integer)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.claimless_window_activations_append_only()": [
       "<owner>:EXECUTE"
     ],
     "sessions.clean_root_commit(text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.enqueue_session_large_read(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.heartbeat_session_large_read(text,text,text,text,uuid)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
@@ -64,6 +76,10 @@
     "sessions.pipeline_jobs_observability()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.publish_session_replay_pages(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -96,6 +112,14 @@
       "service_role:EXECUTE"
     ],
     "sessions.resolve_repo(text,text,text,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.retry_session_large_read(text,text,text,text,uuid,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.route_session_large_read(text,text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
