@@ -880,6 +880,8 @@ describe("migration up/down/up", () => {
   test("the down path removes exactly what the up added and the up reapplies", async () => {
     const db = await database();
     await seed(db, FIXTURE);
+    // Newer migrations depending on catalog columns must roll back first.
+    await db.exec(read("supabase/rollbacks/20261103010000_session_directory_event_metadata.down.sql"));
     await db.exec(DOWN);
     expect(
       (await db.query("SELECT to_regprocedure('sessions.list_session_directory(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)') AS f")).rows,
@@ -888,6 +890,7 @@ describe("migration up/down/up", () => {
     // The directory rows themselves survive the down.
     expect((await db.query("SELECT count(*)::int AS n FROM sessions.session_directory")).rows).toEqual([{ n: 6 }]);
     await db.exec(UP);
+    await db.exec(read("supabase/migrations/20261103010000_session_directory_event_metadata.sql"));
     expect(ids(await list(db, {}))).toEqual(["s1", "s2", "s3", "s4"]);
   });
 });
