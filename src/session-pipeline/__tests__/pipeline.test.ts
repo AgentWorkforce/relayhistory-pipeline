@@ -196,14 +196,15 @@ function fakeClickHouse() {
 }
 
 /** Supabase as the indexer sees it: the live pointer keys of the scope, plus a call log. */
-function fakeSupabase(live: () => string[], busy: () => boolean = () => false) {
+function fakeSupabase(live: () => string[], busy: () => boolean = () => false, canonicalId:()=>string=()=>scope.sessionId) {
   const calls: string[] = [];
   const tx: SqlExecutor = {
     async query<R>(text: string) {
       calls.push(text.trim().replace(/\s+/g, " "));
       if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: !busy() }] as R[] };
+      if (text.includes("event_projection_sources")) return { rows: [{ written: true }] as R[] };
       if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
-        return { rows: live().map((manifest_key) => ({ manifest_key })) as R[] };
+        return { rows: live().map((manifest_key) => ({ manifest_key, canonical_id:canonicalId() })) as R[] };
       if (text.includes("upsert_session_index")) return { rows: [{ applied: true, revision: "1" }] as R[] };
       return { rows: [] as R[] };
     },
@@ -216,6 +217,52 @@ function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"],
 }
 
 describe("search index from S3", () => {
+  test("writes complete canonical event metadata once across duplicate manifest copies", async () => {
+    const a = await writeSession("export", [
+      event("r1", "1", Date.parse(AT), "text"),
+    ]);
+    const b = await writeSession("live", [
+      event("r1", "1", Date.parse(AT), "text"),
+    ]);
+    const sb = fakeSupabase(() => [a, b]);
+    const ch = fakeClickHouse();
+    const writes: unknown[] = [];
+    const deps = {
+      ...searchDeps(ch.ch, sb.transact),
+      writeEvents: async (_tx: unknown, _key: unknown, input: unknown) => {
+        writes.push(input);
+        return { written: true };
+      },
+    };
+    expect(await indexSearchScope(scope, deps)).toMatchObject({
+      complete: true,
+    });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({
+      events: {
+        eventCount: "1",
+        kinds: ["session_event"],
+        reasoningTokens: "0",
+      },
+      sources: [
+        { manifestKey: a, revision: "1" },
+        { manifestKey: b, revision: "1" },
+      ],
+    });
+    await store.delete(objectKey(b));
+    writes.length = 0;
+    expect(await indexSearchScope(scope, deps)).toMatchObject({
+      complete: false,
+    });
+    expect(writes).toHaveLength(0);
+  });
+  test("conflicting pointer aliases never bypass admitted canonical manifest identity", async () => {
+    const manifest = await writeSession("srv_bb", [event("r1","1",Date.parse(AT),"text")]);
+    const sb=fakeSupabase(()=>[manifest],undefined,()=>"unrelated-canonical");const ch=fakeClickHouse();
+    const writes:unknown[]=[];
+    const deps={...searchDeps(ch.ch,sb.transact),writeEvents:async(_db:unknown,_key:unknown,input:unknown)=>{writes.push(input);return {written:true};}};
+    expect(await indexSearchScope(scope,deps)).toMatchObject({complete:false});expect(writes).toHaveLength(0);
+  });
   test("writes project/repository catalog only after a complete canonical scope projection", async () => {
     const sessionRecord: RelayhistoryStreamRecord = {
       kind: "session",
@@ -244,7 +291,7 @@ describe("search index from S3", () => {
       }),
     ];
     const ch = fakeClickHouse();
-    const sb = fakeSupabase(() => keys);
+    const sb = fakeSupabase(() => keys,undefined,()=>"sess:1");
     const writes: Array<{
       key: Parameters<NonNullable<SearchIndexDeps["writeCatalog"]>>[1];
       catalog: Parameters<NonNullable<SearchIndexDeps["writeCatalog"]>>[2];
