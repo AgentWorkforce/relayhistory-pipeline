@@ -17,8 +17,8 @@ export async function replayDatabase() {
  await runMigrations(db,{profile:{mode:"local",shim:true,bootstrap:true,verify:true,runtimeRole:"postgres"}});
  return {pg,db};
 }
-export async function addReplayPointer(db: ReturnType<typeof replayDatabase> extends Promise<infer R> ? R extends {db:infer D}?D:never:never, pointer: { key:string; digest:string; physicalSession:string; physicalMachine:string; canonicalSession?:string; canonicalMachine?:string; user?:string; revision?:number; trace?:string }) {
- const i=REPLAY_FIXTURE_IDENTITY;
+export async function addReplayPointer(db: ReturnType<typeof replayDatabase> extends Promise<infer R> ? R extends {db:infer D}?D:never:never, pointer: { identity?:{orgId:string;workspaceId:string;source:string;sessionId:string}; key:string; digest:string; physicalSession:string; physicalMachine:string; canonicalSession?:string; canonicalMachine?:string; user?:string; revision?:number; trace?:string }) {
+ const i=pointer.identity??REPLAY_FIXTURE_IDENTITY;
  await db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,canonical_session_id,canonical_machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,content_sha256,raw_format,revision,trace_id)
  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,'s3','replay-fixture',$10,decode($11,'hex'),'ndjson',$12,$13)`,[i.orgId,i.workspaceId,i.source,pointer.physicalSession,pointer.physicalMachine,pointer.canonicalSession??i.sessionId,pointer.canonicalMachine??pointer.physicalMachine,pointer.user??"user_replay",REPLAY_FIXTURE_AT,pointer.key,pointer.digest,pointer.revision??1,pointer.trace??"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18"]);
 }

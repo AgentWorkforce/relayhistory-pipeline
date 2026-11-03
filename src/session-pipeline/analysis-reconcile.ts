@@ -1,7 +1,8 @@
 /** Bounded metadata-only source discovery. Durable continuation is the Lambda
  * async event cursor, acknowledged only after this page's enqueue RPCs succeed. */
 import type {ArtifactIdentity} from "../session-read-api/canonical-artifact.ts";
-import {LEGACY_ANALYSIS_OWNERSHIP_SQL,type ReadonlyAnalysisSource} from "./analysis-snapshot.ts";
+import type {ReadonlyAnalysisSource} from "./analysis-snapshot.ts";
+import {ANALYSIS_NAMESPACE_SOURCES_SQL} from "./analysis-scope.ts";
 export type AnalysisReconcileCursor=[string,string,string];
 export function checkedAnalysisCursor(value:unknown):AnalysisReconcileCursor|undefined{if(value===undefined)return undefined;if(!Array.isArray(value)||value.length!==3||value.some(v=>typeof v!=="string"||!v||v.length>512))throw new Error("analysis reconcile: invalid cursor");return value as AnalysisReconcileCursor}
 type Key={org_id:string;workspace_id:string;session_id:string};
@@ -19,14 +20,12 @@ export async function reconcileAnalysisPage(deps:{source:ReadonlyAnalysisSource;
  let last:Key|undefined;
  for(const k of rows.slice(0,pageSize)){
   if(now()>=stop)break;
-  let scope:ArtifactIdentity|undefined;
-  if([k.org_id,k.workspace_id,k.session_id].every(v=>v&&v.length<=512)){
-   const evidence=(await db.query<{workspace_id:string|null;source:string|null}>(LEGACY_ANALYSIS_OWNERSHIP_SQL,[k.org_id,k.session_id])).rows;
-   const providers=new Set(evidence.map(r=>r.source).filter((v):v is string=>v!==null)),source=[...providers][0];
-   if(evidence.length&&evidence.every(r=>r.workspace_id===k.workspace_id)&&providers.size===1&&source&&/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(source))scope={orgId:k.org_id,workspaceId:k.workspace_id,source,sessionId:k.session_id};
-  }
-  if(!scope)invalidScope++;
-  else{
+  const providers=(await db.query<{source:string}>(`SELECT source FROM (${ANALYSIS_NAMESPACE_SOURCES_SQL}) scoped ORDER BY source COLLATE "C" LIMIT 9`,[k.org_id,k.session_id,k.workspace_id])).rows.map(r=>r.source);
+  if(providers.length>8)throw new Error("analysis reconcile: namespace fanout bound");
+  if(!providers.length)invalidScope++;
+  for(const source of providers){
+   if(!/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(source)){invalidScope++;continue}
+   const scope:ArtifactIdentity={orgId:k.org_id,workspaceId:k.workspace_id,source,sessionId:k.session_id};
    const ack=await deps.enqueue(scope) as {accepted?:unknown};
    if(typeof ack?.accepted!=="boolean")throw new Error("analysis reconcile: invalid durable enqueue acknowledgement");
    if(ack.accepted)accepted++;else unavailable++;

@@ -6,7 +6,7 @@ export const LEGACY_REQUEST="00000000-0000-4000-8000-000000000001",LEGACY_ANALYS
 const request=LEGACY_REQUEST,analysis=LEGACY_ANALYSIS,brief=LEGACY_BRIEF;
 export async function legacyAnalysisOracle(){const pg=new PGlite();await pg.exec(`CREATE SCHEMA sessions;
 CREATE TABLE sessions.convergence_events(org_id text,session_id text,workspace_id text,source text);
-CREATE TABLE sessions.conversation_turns(org_id text,session_id text,workspace_id text,metadata jsonb,source text);
+CREATE TABLE sessions.conversation_turns(org_id text,session_id text,workspace_id text,metadata jsonb,source text,session_owner text NOT NULL DEFAULT 'owner');
 CREATE TABLE sessions.session_analysis_requests(id uuid,org_id text,workspace_id text,session_id text,status text,last_error text,analysis_job_id uuid,brief_job_id uuid,created_at timestamptz,updated_at timestamptz);
 CREATE TABLE sessions.session_analysis_jobs(id uuid,org_id text,session_id text,status text,last_error text,source jsonb,source_provider text,source_fingerprint text,attempts integer,analysis_version text,schema_version integer,summary_version text,model_version text,summary_model_version text,result jsonb,created_at timestamptz,updated_at timestamptz,completed_at timestamptz,workspace_id text);
 INSERT INTO sessions.convergence_events VALUES('org','session','ws','claude');`);

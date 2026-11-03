@@ -2,7 +2,8 @@
  * Source: RHC9ff3a285cf2d7ac617ad4a2a59ffc6931a60fecb. Runtime needs SELECT
  * on the four approved tables, no EXECUTE on source application functions.
  * Actual upstream SQL functions remain independent test oracles. */
-export const ANALYSIS_V1_SELECT_SQL=String.raw`WITH projection(request_id,session_id,status,error,job_id,request_created_at,request_updated_at,source_provider,source_fingerprint,attempts,analysis_version,schema_version,summary_version,model_version,summary_model_version,result,job_created_at,job_updated_at,job_completed_at) AS MATERIALIZED (
+import {ANALYSIS_NAMESPACE_SOURCES_SQL} from "./analysis-scope.ts";
+export const ANALYSIS_V1_SELECT_SQL=String.raw`WITH namespace_sources AS MATERIALIZED (${ANALYSIS_NAMESPACE_SOURCES_SQL}), projection(request_id,session_id,status,error,job_id,request_created_at,request_updated_at,source_provider,source_fingerprint,attempts,analysis_version,schema_version,summary_version,model_version,summary_model_version,result,job_created_at,job_updated_at,job_completed_at) AS MATERIALIZED (
 SELECT r.id, r.session_id,
     CASE WHEN r.status <> 'resolved' THEN r.status
          WHEN b.id IS NULL THEN COALESCE(a.status, 'failed')
@@ -43,9 +44,14 @@ SELECT r.id, r.session_id,
       AND NOT (a.status = 'failed' AND a.last_error = 'superseded' AND r.brief_job_id IS NOT NULL)
     LEFT JOIN sessions.session_analysis_jobs AS b ON b.id = r.brief_job_id
       AND b.org_id = r.org_id AND b.session_id = r.session_id
-   WHERE r.org_id = $1 AND r.session_id = $2
+   WHERE r.org_id = $1 AND r.session_id = $2 AND r.workspace_id=$3
+      AND (COALESCE(a.source_provider,b.source_provider)=$4 OR (
+       COALESCE(a.source_provider,b.source_provider) IS NULL
+       AND (SELECT count(*) FROM namespace_sources)=1 AND EXISTS(SELECT 1 FROM namespace_sources WHERE source=$4)))
 )
-SELECT CASE WHEN $1 IS NOT NULL AND length($1) BETWEEN 1 AND 512 AND btrim($1)<>'' AND $2 IS NOT NULL AND length($2) BETWEEN 1 AND 512 AND btrim($2)<>'' AND (EXISTS(SELECT 1 FROM sessions.convergence_events WHERE org_id=$1 AND session_id=$2) OR EXISTS(SELECT 1 FROM sessions.conversation_turns WHERE org_id=$1 AND session_id=$2) OR EXISTS(SELECT 1 FROM sessions.session_analysis_requests WHERE org_id=$1 AND session_id=$2) OR EXISTS(SELECT 1 FROM sessions.session_analysis_jobs WHERE org_id=$1 AND session_id=$2) ) THEN jsonb_build_object('outcome','ok','sessionId',$2,'requests',(SELECT COALESCE(jsonb_agg(jsonb_build_object(
+SELECT CASE WHEN $1 IS NOT NULL AND length($1) BETWEEN 1 AND 512 AND btrim($1)<>'' AND $2 IS NOT NULL AND length($2) BETWEEN 1 AND 512 AND btrim($2)<>'' AND (
+ EXISTS(SELECT 1 FROM namespace_sources WHERE source=$4) OR EXISTS(SELECT 1 FROM projection)
+) THEN jsonb_build_object('outcome','ok','sessionId',$2,'requests',(SELECT COALESCE(jsonb_agg(jsonb_build_object(
     'id', v.request_id, 'sessionId', v.session_id, 'status', v.status,
     'analysisId', v.job_id, 'error', v.error,
     'createdAt', v.request_created_at, 'updatedAt', v.request_updated_at
@@ -64,4 +70,11 @@ SELECT CASE WHEN $1 IS NOT NULL AND length($1) BETWEEN 1 AND 512 AND btrim($1)<>
           FROM (SELECT * FROM projection
                  ORDER BY request_created_at DESC, request_id DESC LIMIT 50) AS recent
          WHERE job_id IS NOT NULL
-         ORDER BY job_id, request_created_at DESC, request_id DESC) AS v)) ELSE jsonb_build_object('outcome','not_found') END AS payload`;
+         ORDER BY job_id, request_created_at DESC, request_id DESC) AS v)) ELSE jsonb_build_object('outcome','not_found') END AS payload,
+ EXISTS(SELECT 1 FROM sessions.session_analysis_requests r
+  LEFT JOIN sessions.session_analysis_jobs a ON a.id=r.analysis_job_id AND a.org_id=r.org_id AND a.session_id=r.session_id
+   AND NOT(a.status='failed' AND a.last_error='superseded' AND r.brief_job_id IS NOT NULL)
+  LEFT JOIN sessions.session_analysis_jobs b ON b.id=r.brief_job_id AND b.org_id=r.org_id AND b.session_id=r.session_id
+  WHERE r.org_id=$1 AND r.session_id=$2 AND r.workspace_id=$3
+   AND COALESCE(a.source_provider,b.source_provider) IS NULL AND (SELECT count(*) FROM namespace_sources)<>1
+ ) AS unbound_requests`;
