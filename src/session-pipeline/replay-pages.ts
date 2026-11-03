@@ -3,7 +3,7 @@ import { nodeReadBudget, type NodeReadProfile } from "../session-read-api/node-r
 import { createHash } from "node:crypto";
 import {
   ARTIFACT_VERSION, ARTIFACT_TABLES, ARTIFACT_MAX_OBJECT_BYTES, ARTIFACT_MAX_ROWS_PER_PAGE,
-  ARTIFACT_FANOUT, ARTIFACT_MAX_DEPTH, ARTIFACT_STRING_SEGMENT_CHARS,
+  ARTIFACT_FANOUT, ARTIFACT_MAX_DEPTH, ARTIFACT_STRING_SEGMENT_CHARS, ARTIFACT_MAX_ROW_BYTES,
   ARTIFACT_BLOB_SEGMENT_BYTES, artifactViewRow, compareArtifactEventRows,
   type ArtifactIdentity, type ArtifactSource, type ArtifactRef, type ArtifactRangeRef,
   type ArtifactNode, type ArtifactEntry, type ArtifactPage, type ArtifactIndex,
@@ -107,6 +107,9 @@ class Writer {
   }
   async entry(item: ArtifactRow, view: ArtifactView): Promise<ArtifactEntry> {
     let row = artifactViewRow(item, view).row;
+    // Never acknowledge a generation containing a row the public consumer refuses.
+    // Measure the hydrated envelope before splitting content or nested objects.
+    if (bytesOf({table:item.table,row}).length > ARTIFACT_MAX_ROW_BYTES) refuse("artifact_row_bound");
     let content: ArtifactString | undefined;
     if (view === "replay" && typeof row.content === "string" && bytesOf(row.content).length > 32 * 1024) {
       content = await this.string(row.content); row = { ...row, content: null };

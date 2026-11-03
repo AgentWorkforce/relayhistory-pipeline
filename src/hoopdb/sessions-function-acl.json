@@ -24,6 +24,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.discover_session_large_reads()": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.enqueue_session_large_read(text,text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
