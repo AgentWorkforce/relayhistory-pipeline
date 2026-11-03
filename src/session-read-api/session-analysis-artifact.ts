@@ -6,6 +6,8 @@ export const ANALYSIS_ARTIFACT_TABLES=["session_analysis_requests","session_anal
 export const ANALYSIS_MAX_HISTORY=50;
 /** Matches the selected public Cloud/Worker aggregate response ceiling. */
 export const ANALYSIS_MAX_ENVELOPE_BYTES=16*1024*1024;
+export const ANALYSIS_TRANSPORT_RESERVE_BYTES=64*1024;
+export const ANALYSIS_MAX_SNAPSHOT_BYTES=ANALYSIS_MAX_ENVELOPE_BYTES-ANALYSIS_TRANSPORT_RESERVE_BYTES;
 export const ANALYSIS_FRESH_SECONDS=120;
 export interface SessionAnalysisIndex {
  version:1;kind:"session-analysis-index";codec:"canonical-analysis-graph-v1";
