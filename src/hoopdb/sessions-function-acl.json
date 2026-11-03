@@ -95,6 +95,10 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.list_session_directory_events(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer,text)": [
+      "<owner>:EXECUTE",
+      "session_directory_search_worker:EXECUTE"
+    ],
     "sessions.lock_repo_catalog(text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -156,6 +160,19 @@
       "session_directory_search_worker:EXECUTE"
     ],
     "sessions.session_directory_companions_follow()": ["<owner>:EXECUTE"],
+    "sessions.session_directory_event_activity(text,timestamp with time zone,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "session_directory_search_worker:EXECUTE"
+    ],
+    "sessions.session_directory_event_times_forget()": ["<owner>:EXECUTE"],
+    "sessions.session_directory_events_changed()": ["<owner>:EXECUTE"],
+    "sessions.session_directory_events_list_sql(integer,boolean,integer,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_directory_events_require_ready(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_directory_events_tombstone()": ["<owner>:EXECUTE"],
     "sessions.session_directory_forget_catalog()": ["<owner>:EXECUTE"],
     "sessions.session_directory_list_sql(integer,boolean,integer,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean)": [
       "<owner>:EXECUTE"
@@ -164,6 +181,7 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_directory_project_name()": ["<owner>:EXECUTE"],
     "sessions.session_directory_project_text(text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"

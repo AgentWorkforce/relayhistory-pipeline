@@ -38,6 +38,7 @@
  */
 import { createHash } from "node:crypto";
 import * as zlib from "node:zlib";
+import { layoutComponent } from "../shared/layout-component.ts";
 import {
   CONVERGENCE_EVENT_KIND,
   PipelineError,
@@ -53,6 +54,7 @@ import {
   type ObjectStore,
   type RelayhistoryStreamRecord,
 } from "../shared/vendor.ts";
+import { deliveryMachine } from "@rhc/lib/pipeline/relayhistory-projection.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { toIndexRow, tsMillis, type IndexRow, type NeonEventRow } from "./vendor/search-index/rows.ts";
@@ -65,6 +67,7 @@ import {
   type CatalogProjectionRow,
   type DirectoryCatalog,
 } from "../hoopdb/session-directory-catalog.ts";
+import { directoryEventsFromProjection, writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents, type DirectoryEvents, type DirectoryEventInput } from "../hoopdb/session-directory-events.ts";
 import {
   canonicalManifestIdentity,
   manifestUserId as admittedManifestUserId,
@@ -85,6 +88,7 @@ export interface SearchIndexDeps {
   limits?: Partial<SearchIndexLimits>;
   /** Test seam; production writes the catalog in the same Supabase transaction. */
   writeCatalog?: typeof writeDirectoryCatalog;
+  writeEvents?: typeof writeDirectoryEvents;
 }
 
 export interface SearchIndexLimits {
@@ -125,6 +129,7 @@ export interface SearchIndexResult {
 
 interface ScopeIdentity {
   machineId: string;
+  sessionId: string;
   source: string;
   kind: string;
   eventId: string;
@@ -160,6 +165,7 @@ export async function readManifestRecords(
   store: ObjectStore,
   prefix: string,
   decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
+  maxRecords = Number.POSITIVE_INFINITY,
 ): Promise<RelayhistoryStreamRecord[]> {
   if (manifest.raw.format !== "ndjson")
     throw new PipelineError("raw_format_unsupported", "only ndjson raw is indexed", false);
@@ -192,7 +198,10 @@ export async function readManifestRecords(
     } catch {
       throw new PipelineError("chunk_not_utf8", "a raw chunk is not UTF-8", false);
     }
-    for (const line of text.split("\n")) if (line) records.push(parseRelayhistoryRecord(line));
+    for (const line of text.split("\n")) if (line) {
+        if (records.length >= maxRecords) throw new PipelineError("scope_too_large", "actual canonical record count exceeds scope limit", false);
+        records.push(parseRelayhistoryRecord(line));
+      }
   }
   return records;
 }
@@ -248,6 +257,8 @@ interface ScopeRead {
   reasons: string[];
   catalog: DirectoryCatalog;
   directorySessionId: string | null;
+  events: DirectoryEvents | null;
+  sources: DirectoryEventInput["sources"];
 }
 
 async function readScope(
@@ -256,6 +267,7 @@ async function readScope(
   deps: SearchIndexDeps,
   limits: SearchIndexLimits,
   version: number,
+  expectedCanonicalId?: string,
 ): Promise<ScopeRead> {
   const decompress = deps.decompress ?? defaultDecompress;
   const prefix = deps.prefixFor(scope.orgId);
@@ -264,6 +276,7 @@ async function readScope(
   type Part = { manifest: ManifestV1; records: RelayhistoryStreamRecord[]; userId: string };
   const parts: Part[] = [];
   const readable: ManifestV1[] = [];
+  const manifestKeysByBody = new Map<ManifestV1, string>();
   for (const key of manifestKeys) {
     const read = await deps.reader.read(key);
     if (!read) {
@@ -277,7 +290,7 @@ async function readScope(
     // requires): chunk keys are built from the body, rows are stamped with the scope.
     const s = manifest.session;
     const at = parseSessionKey(key);
-    if (!at || s.workspace_id !== scope.workspaceId || s.harness !== scope.harness || s.session_id !== scope.sessionId || s.machine_id !== at.machineId) {
+    if (!at || s.workspace_id !== scope.workspaceId || s.harness !== scope.harness || s.session_id !== at.sessionId || (!expectedCanonicalId && s.session_id !== scope.sessionId) || s.machine_id !== at.machineId) {
       complete = false;
       reasons.push("manifest_key_mismatch");
       continue;
@@ -289,7 +302,11 @@ async function readScope(
       reasons.push("manifest_unscrubbed");
       continue;
     }
+    if (expectedCanonicalId && canonicalManifestIdentity(manifest).sessionId !== expectedCanonicalId) {
+      complete = false; reasons.push("canonical_session_mismatch"); continue;
+    }
     readable.push(manifest);
+    manifestKeysByBody.set(manifest, key);
   }
 
   // Size the whole session from its manifests before reading a chunk. A
@@ -303,13 +320,17 @@ async function readScope(
     return {
       rows: [], manifests: readable.length, complete: false, partial: true,
       revision, reasons: [...new Set([...reasons, "scope_too_large"])],
-      catalog: directoryCatalogFromProjection([]), directorySessionId: null,
+      catalog: directoryCatalogFromProjection([]), directorySessionId: null, events: null, sources: [],
     };
 
+  let parsedRecords = 0;
   for (const manifest of readable) {
     try {
-      parts.push({ manifest, records: await readManifestRecords(manifest, deps.store, prefix, decompress), userId: manifestUserId(manifest) });
+      const records=await readManifestRecords(manifest,deps.store,prefix,decompress,limits.maxScopeEvents-parsedRecords);
+      parsedRecords+=records.length;
+      parts.push({manifest,records,userId:manifestUserId(manifest)});
     } catch (error) {
+      if(error instanceof PipelineError&&error.code==="scope_too_large")return {rows:[],manifests:parts.length,complete:false,partial:true,revision,reasons:[...new Set([...reasons,"scope_too_large"])],catalog:directoryCatalogFromProjection([]),directorySessionId:null,events:null,sources:[]};
       if (error instanceof PipelineError && error.retryable) throw error;
       complete = false;
       reasons.push(error instanceof PipelineError ? error.code : "manifest_unreadable");
@@ -348,7 +369,16 @@ async function readScope(
     }
   }
 
+  const ownerByEvent = new Map<string,{userId:string;sessionId:string}>();
+  for (const part of parts) for (const record of part.records) {
+    if (record.kind === CONVERGENCE_EVENT_KIND) continue;
+    const identity = JSON.stringify([deliveryMachine(scope.workspaceId,record.origin_id),record.record_id]);
+    const prior = ownerByEvent.get(identity);
+    if (prior?.userId && part.userId && prior.userId !== part.userId) { complete=false; reasons.push("event_owner_conflict"); }
+    else if (part.userId || prior === undefined) ownerByEvent.set(identity,{userId:part.userId,sessionId:canonicalManifestIdentity(part.manifest).sessionId});
+  }
   const byKey = new Map<string, IndexRow>();
+  const metadataByKey = new Map<string, Json>();
   const catalogRows: CatalogProjectionRow[] = [];
   for (const { records, part } of groups) {
     let projected;
@@ -356,8 +386,8 @@ async function readScope(
       projected = projectRelayhistorySession(records, {
         workspaceId: scope.workspaceId,
         source: scope.harness,
-        sessionId: scope.sessionId,
-        machineId: part.manifest.session.machine_id,
+        sessionId: canonicalManifestIdentity(part.manifest).sessionId,
+        machineId: canonicalManifestIdentity(part.manifest).machineId,
         userId: part.userId,
       });
     } catch (error) {
@@ -370,8 +400,14 @@ async function readScope(
         catalogRows.push({ table, row });
         continue;
       }
-      const indexRow = toIndexRow(projectedToNeonRow(row, scope, part.userId), version);
-      byKey.set(keyOf({ machineId: indexRow.machine_id, source: indexRow.source, kind: indexRow.kind, eventId: indexRow.event_id }), indexRow);
+      // Delivery projection is tenant-free; restore the record's admitted owner,
+      // not the uploader/first-manifest owner of a multi-machine logical scope.
+      const owner = ownerByEvent.get(JSON.stringify([row.machine_id,row.delivery_record_id]));
+      const canonicalRow = { ...row, session_id:row.delivery_record_id ? owner?.sessionId ?? row.session_id : row.session_id, user_id: row.user_id ?? owner?.userId ?? part.userId };
+      const indexRow = toIndexRow(projectedToNeonRow(canonicalRow, scope, part.userId), version);
+      const identity = keyOf({ machineId: indexRow.machine_id, source: indexRow.source, kind: indexRow.kind, eventId: indexRow.event_id });
+      byKey.set(identity, indexRow);
+      metadataByKey.set(identity, { ...canonicalRow, _index_fingerprint: indexRow.fingerprint });
     }
   }
   const directoryIds = new Set(
@@ -381,11 +417,16 @@ async function readScope(
     complete = false;
     reasons.push("canonical_session_mismatch");
   }
+  let metadata: DirectoryEvents | null = null;
+  try { metadata = directoryEventsFromProjection([...metadataByKey.values()]); }
+  catch { complete = false; reasons.push("directory_event_metadata_invalid"); }
   return {
     rows: [...byKey.values()], manifests: parts.length, complete, partial: false,
     revision, reasons: [...new Set(reasons)],
     catalog: directoryCatalogFromProjection(catalogRows),
     directorySessionId: directoryIds.size === 1 ? [...directoryIds][0]! : null,
+    events: metadata,
+    sources: parts.map(({ manifest }) => ({ manifestKey: manifestKeysByBody.get(manifest)!, revision: String(manifest.revision) })),
   };
 }
 
@@ -394,9 +435,11 @@ async function clickhouseScope(
   scope: SessionScope,
   fromMs: number,
   limit: number,
+  canonicalSessionId = scope.sessionId,
 ): Promise<ScopeIdentity[]> {
   const rows = await ch.select<{
     workspace_id: string;
+    session_id: string;
     machine_id: string;
     source: string;
     kind: string;
@@ -404,20 +447,21 @@ async function clickhouseScope(
     ts_ms: number;
     fingerprint: string;
   }>(
-    `SELECT workspace_id, machine_id, source, kind, event_id,
+    `SELECT workspace_id, session_id, machine_id, source, kind, event_id,
         toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint
      FROM ${EVENTS_TABLE} FINAL
-     WHERE org_id = {org:String} AND session_id = {session:String}
+     WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String})
        AND workspace_id = {workspace:String} AND source = {source:String}
        AND toUnixTimestamp64Milli(ts) >= {from:Int64}
      LIMIT {limit:UInt32}`,
     {
-      params: { org: scope.orgId, session: scope.sessionId, workspace: scope.workspaceId, source: scope.harness, from: fromMs, limit },
+      params: { org: scope.orgId, session: scope.sessionId, canonical: canonicalSessionId, workspace: scope.workspaceId, source: scope.harness, from: fromMs, limit },
       timeoutMs: 20_000,
     },
   );
   return rows.map((r) => ({
     workspaceId: r.workspace_id,
+    sessionId: r.session_id,
     machineId: r.machine_id,
     source: r.source,
     kind: r.kind,
@@ -433,30 +477,42 @@ async function clickhouseScope(
  * incomplete, so readers never take its rows as current; a complete pass
  * writes 0. `revision` is the highest manifest revision of the scope.
  */
-export async function recordState(ch: ClickHouseClient, scope: SessionScope, revision: number, rows: number, complete: boolean, at: Date) {
+export async function recordState(ch: ClickHouseClient, scope: SessionScope, revision: number, rows: number, complete: boolean, at: Date, canonicalSessionId = scope.sessionId) {
   const ts = chNow(at);
-  await ch.insert(SESSION_STATE_TABLE, [
-    {
+  await ch.insert(SESSION_STATE_TABLE, [...new Set([scope.sessionId, canonicalSessionId])].map(sessionId => ({
       org_id: scope.orgId,
-      session_id: scope.sessionId,
+      session_id: sessionId,
       revision,
       synced_at: ts,
       full_synced_at: complete ? ts : "1970-01-01 00:00:00.000",
       scanned_rows: Math.min(rows, 4_294_967_295),
       needs_full: complete ? 0 : 1,
-    },
-  ]);
+    })));
 }
 
 /** Live manifests of a scope, from the pointer index. */
 export async function livePointerKeys(tx: SqlExecutor, scope: SessionScope): Promise<string[]> {
-  const { rows } = await tx.query<{ manifest_key: string }>(
-    `SELECT manifest_key FROM sessions.session_index
-      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL
-      ORDER BY machine_id`,
+  return (await livePointerSnapshot(tx, scope)).keys;
+}
+
+/** The source set and directory epoch share one MVCC snapshot. Pointer changes
+ * increment the epoch; the final UPDATE compares it after locking the current row. */
+async function livePointerSnapshot(tx: SqlExecutor, scope: SessionScope): Promise<{ keys: string[]; epoch: string; canonicalId:string }> {
+  const { rows } = await tx.query<{ manifest_key: string; event_epoch: string; canonical_id:string }>(
+    `SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch
+       FROM sessions.session_index p LEFT JOIN LATERAL (
+         SELECT d.event_projection_epoch FROM sessions.session_directory d
+          WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness
+            AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id)
+          ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1
+       ) d ON true
+      WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL
+      ORDER BY p.machine_id`,
     [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId],
   );
-  return rows.map((r) => r.manifest_key);
+  let canonicalId=rows[0]?.canonical_id;
+  if(!rows.length){const previous=await tx.query<{canonical_id:string}>(`SELECT coalesce(canonical_session_id,session_id) AS canonical_id FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 ORDER BY revision DESC LIMIT 1`,[scope.orgId,scope.workspaceId,scope.harness,scope.sessionId]);canonicalId=previous.rows[0]?.canonical_id;}
+  return { keys: rows.map((r) => r.manifest_key), epoch: rows[0]?.event_epoch ?? "0", canonicalId:canonicalId??scope.sessionId };
 }
 
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
@@ -470,9 +526,27 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       scopeLockKey(scope, "search"),
     ]);
     if (!got[0]?.ok) return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, busy: true, reasons: ["scope_busy"] };
-    const keys = await livePointerKeys(tx, scope);
+    const pointerSnapshot = await livePointerSnapshot(tx, scope);
+    const keys = pointerSnapshot.keys;
+    const { rows: canonicalLock } = await tx.query<{ok:boolean}>("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok", [["96bulls:directory-events",scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId].join("\u001f")]);
+    if (!canonicalLock[0]?.ok) return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,busy:true,reasons:["canonical_scope_busy"]};
     const at = now();
     const version = at.getTime();
+    // A stale DB alias is not authority to delete another canonical session.
+    if(layoutComponent(pointerSnapshot.canonicalId)!==scope.sessionId){
+      await invalidateDirectoryEvents(tx,scope);
+      await recordState(deps.ch,scope,0,0,false,at,pointerSnapshot.canonicalId);
+      return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_session_mismatch"]};
+    }
+    const {rows:siblings}=await tx.query<{manifest_key:string}>(`SELECT manifest_key FROM sessions.session_index
+      WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id`,[scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId]);
+    const siblingKeys=siblings.map(r=>r.manifest_key);
+    if(!keys.length&&siblingKeys.length){
+      // Erasing one alias must never erase a live canonical sibling.
+      await invalidateDirectoryEvents(tx,scope);
+      await recordState(deps.ch,scope,0,0,false,at,pointerSnapshot.canonicalId);
+      return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_scope_still_live"]};
+    }
     if (keys.length === 0) {
       // Erased: no live manifest is left, so every row of the scope goes, in or
       // out of the window. One predicate delete, no listing, so no size can
@@ -480,25 +554,26 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       await deps.ch.command(
         `DELETE FROM ${EVENTS_TABLE}
          WHERE org_id = {org:String} AND workspace_id = {workspace:String}
-           AND source = {source:String} AND session_id = {session:String}`,
+           AND source = {source:String} AND (session_id = {session:String} OR session_id = {canonical:String})`,
         {
-          params: { org: scope.orgId, workspace: scope.workspaceId, source: scope.harness, session: scope.sessionId },
+          params: { org: scope.orgId, workspace: scope.workspaceId, source: scope.harness, session: scope.sessionId, canonical: pointerSnapshot.canonicalId },
           settings: { lightweight_deletes_sync: 2 },
           timeoutMs: 120_000,
         },
       );
+      await recordState(deps.ch,scope,0,0,true,at,pointerSnapshot.canonicalId);
+      await completeErasedDirectoryEvents(tx,scope);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
     }
     const fromMs = Date.parse(await windowStart(deps.ch, at));
-    const s3 = await readScope(scope, keys, deps, limits, version);
-    if (s3.partial) {
-      // Not indexed from S3 and never treated as current: the state row says the
-      // session owes a full pass (needs_full = 1), and nothing else is written.
-      await recordState(deps.ch, scope, s3.revision, 0, false, at);
-      return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, reasons: s3.reasons };
+    const s3 = await readScope(scope, siblingKeys, deps, limits, version, pointerSnapshot.canonicalId);
+    if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
+      await invalidateDirectoryEvents(tx,scope);
+      await recordState(deps.ch,scope,s3.revision,0,false,at,pointerSnapshot.canonicalId);
+      return {manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]};
     }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
-    const chRows = await clickhouseScope(deps.ch, scope, fromMs, limits.maxRows + 1);
+    const chRows = await clickhouseScope(deps.ch, scope, fromMs, limits.maxRows + 1, pointerSnapshot.canonicalId);
     const truncated = chRows.length > limits.maxRows;
     const existing = new Map<string, ScopeIdentity[]>();
     for (const r of chRows) existing.set(keyOf(r), [...(existing.get(keyOf(r)) ?? []), r]);
@@ -506,40 +581,34 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     const toInsert = inWindow.filter((r) => {
       const tsMs = tsMillis(`${r.ts.replace(" ", "T")}Z`);
       const same = existing.get(keyOf({ machineId: r.machine_id, source: r.source, kind: r.kind, eventId: r.event_id })) ?? [];
-      return !same.some((c) => c.workspaceId === r.workspace_id && c.tsMs === tsMs && c.fingerprint === r.fingerprint);
+      return !same.some((c) => c.sessionId === r.session_id && c.workspaceId === r.workspace_id && c.tsMs === tsMs && c.fingerprint === r.fingerprint);
     });
     for (let i = 0; i < toInsert.length; i += limits.insertBatch)
       await deps.ch.insert(EVENTS_TABLE, toInsert.slice(i, i + limits.insertBatch), { timeoutMs: 60_000 });
 
     const deletes: PendingDelete[] = [];
-    const complete = s3.complete && !truncated;
+    let complete = s3.complete && !truncated;
+    if (!complete) await invalidateDirectoryEvents(tx, scope);
     if (complete) {
       const wanted = new Map(inWindow.map((r) => [keyOf({ machineId: r.machine_id, source: r.source, kind: r.kind, eventId: r.event_id }), r]));
       for (const [key, list] of existing) {
         const current = wanted.get(key);
         for (const c of list) {
-          if (!current || current.workspace_id !== c.workspaceId || tsMillis(`${current.ts.replace(" ", "T")}Z`) !== c.tsMs)
-            deletes.push({ orgId: scope.orgId, sessionId: scope.sessionId, identity: c } as PendingDelete);
+          if (!current || current.session_id !== c.sessionId || current.workspace_id !== c.workspaceId || tsMillis(`${current.ts.replace(" ", "T")}Z`) !== c.tsMs)
+            deletes.push({ orgId: scope.orgId, sessionId: c.sessionId, identity: c } as PendingDelete);
         }
       }
       await deleteRows(deps.ch, deletes);
     }
-    // Catalog dimensions are authoritative only after every live manifest and raw
-    // record in the S3 scope was read and projected. Never clear them from a partial
-    // pass. The directory key is the validated source id, not its object-layout form.
-    if (complete && s3.directorySessionId !== null)
-      await (deps.writeCatalog ?? writeDirectoryCatalog)(
-        tx,
-        {
-          orgId: scope.orgId,
-          workspaceId: scope.workspaceId,
-          harness: scope.harness,
-          sessionId: s3.directorySessionId,
-        },
-        s3.catalog,
-      );
+    // Metadata and CH describe the same validated canonical source union.
+    if(complete){
+      const directoryKey={orgId:scope.orgId,workspaceId:scope.workspaceId,harness:scope.harness,sessionId:pointerSnapshot.canonicalId};
+      const written=await (deps.writeEvents??writeDirectoryEvents)(tx,directoryKey,{sourceSessionId:scope.sessionId,expectedEpoch:pointerSnapshot.epoch,sources:s3.sources,events:s3.events});
+      if(written.written)await (deps.writeCatalog??writeDirectoryCatalog)(tx,directoryKey,s3.catalog);
+      else {complete=false;s3.reasons.push("directory_event_sources_changed");await invalidateDirectoryEvents(tx,scope);}
+    }
     // Only a complete pass makes the session current; any other leaves it owing one.
-    await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at);
+    await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at, pointerSnapshot.canonicalId);
     return {
       manifests: s3.manifests,
       rows: inWindow.length,
