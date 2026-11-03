@@ -105,7 +105,7 @@ BEGIN
 END
 $role$;
 
-CREATE TABLE sessions.auth_token_verifier_policy (
+CREATE TABLE IF NOT EXISTS sessions.auth_token_verifier_policy (
   singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
   issuer text NOT NULL CHECK (issuer ~ '^https?://'),
   audience text NOT NULL CHECK (audience <> ''),

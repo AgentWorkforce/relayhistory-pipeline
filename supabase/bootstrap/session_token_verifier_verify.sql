@@ -16,7 +16,8 @@ DECLARE
 BEGIN
   SELECT * INTO v_role FROM pg_roles WHERE rolname = 'session_token_verifier';
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'session token verifier: session_token_verifier does not exist';
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = 'session token verifier: session_token_verifier does not exist';
   END IF;
   IF v_role.rolcanlogin THEN v_problems := array_append(v_problems, ('role can log in')::text); END IF;
   IF v_role.rolinherit THEN v_problems := array_append(v_problems, ('role has INHERIT')::text); END IF;
@@ -50,43 +51,29 @@ BEGIN
     END LOOP;
   END IF;
 
-  -- No direct table, view or column privilege of any kind in sessions. Direct
-  -- grants only (aclexplode): PUBLIC-derived effective rights are not this
-  -- role's grants and are the sessions function boundary's domain.
+  -- No table, view or column privilege of any kind in sessions, however
+  -- obtained: effective rights, PUBLIC-derived included. USAGE on the schema
+  -- makes any PUBLIC grant reachable, so effective is the only safe check.
   FOR v_row IN
-    SELECT c.oid::regclass::text AS rel, a.privilege_type AS priv
-      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
-           aclexplode(c.relacl) a
+    SELECT c.oid::regclass::text AS rel
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = 'sessions' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
-       AND a.grantee = v_role.oid
+       AND (has_table_privilege(v_role.oid, c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+            OR has_any_column_privilege(v_role.oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES'))
   LOOP
-    v_problems := array_append(v_problems, (format('%s on %s', v_row.priv, v_row.rel))::text);
+    v_problems := array_append(v_problems, (format('privilege on %s', v_row.rel))::text);
   END LOOP;
-  FOR v_row IN
-    SELECT format('%I.%I', c.relname, at.attname) AS col, a.privilege_type AS priv
-      FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-      JOIN pg_attribute at ON at.attrelid = c.oid AND at.attnum > 0 AND NOT at.attisdropped,
-           aclexplode(at.attacl) a
-     WHERE n.nspname = 'sessions' AND a.grantee = v_role.oid
-  LOOP
-    v_problems := array_append(v_problems, (format('%s on %s', v_row.priv, v_row.col))::text);
-  END LOOP;
-  -- Schema sessions: exactly one direct USAGE grant, nothing else.
-  IF NOT EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a
-                  WHERE n.nspname = 'sessions' AND a.grantee = v_role.oid
-                    AND a.privilege_type = 'USAGE') THEN
-    v_problems := array_append(v_problems, ('missing USAGE on schema sessions')::text);
+  IF NOT has_schema_privilege(v_role.oid, 'sessions', 'USAGE') THEN
+    v_problems := array_append(v_problems, ('no USAGE on schema sessions')::text);
   END IF;
-  IF EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a
-              WHERE n.nspname = 'sessions' AND a.grantee = v_role.oid
-                AND (a.privilege_type <> 'USAGE' OR a.is_grantable)) THEN
-    v_problems := array_append(v_problems, ('schema sessions: privileges other than USAGE')::text);
+  IF has_schema_privilege(v_role.oid, 'sessions', 'CREATE') THEN
+    v_problems := array_append(v_problems, ('CREATE on schema sessions')::text);
   END IF;
 
   -- EXECUTE on exactly the one approved RPC: direct grants via proacl only.
-  -- PUBLIC-executable functions are not this role's grants (the boundary and
-  -- the live gate own that check). Function identity is by OID.
+  -- A merely PUBLIC-executable function is not a grant to this role; the
+  -- sessions function boundary and live gate own that check. Function
+  -- identity is by OID.
   IF NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) a
                   WHERE p.oid = v_fn AND a.grantee = v_role.oid
                     AND a.privilege_type = 'EXECUTE' AND NOT a.is_grantable) THEN
@@ -106,7 +93,8 @@ BEGIN
   END IF;
 
   IF cardinality(v_problems) > 0 THEN
-    RAISE EXCEPTION 'session token verifier is not in the approved shape: %', array_to_string(v_problems, '; ');
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = 'session token verifier is not in the approved shape: ' || array_to_string(v_problems, '; ');
   END IF;
   RAISE NOTICE 'session token verifier: PASS';
 END

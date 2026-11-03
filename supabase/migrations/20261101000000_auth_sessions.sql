@@ -28,7 +28,7 @@
 
 CREATE SCHEMA IF NOT EXISTS sessions;
 
-CREATE TABLE sessions.auth_sessions (
+CREATE TABLE IF NOT EXISTS sessions.auth_sessions (
   id text PRIMARY KEY,
   token_family_id text NOT NULL,
   subject_type text NOT NULL DEFAULT 'cli',
@@ -50,14 +50,14 @@ CREATE TABLE sessions.auth_sessions (
   analytics_identity jsonb
 );
 
-CREATE INDEX auth_sessions_family_idx ON sessions.auth_sessions (token_family_id);
-CREATE INDEX auth_sessions_org_idx ON sessions.auth_sessions (org_id);
+CREATE INDEX IF NOT EXISTS auth_sessions_family_idx ON sessions.auth_sessions (token_family_id);
+CREATE INDEX IF NOT EXISTS auth_sessions_org_idx ON sessions.auth_sessions (org_id);
 
 ALTER TABLE sessions.auth_sessions ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.auth_sessions FROM PUBLIC, anon, authenticated;
 GRANT SELECT, INSERT, UPDATE ON sessions.auth_sessions TO service_role;
 
-CREATE FUNCTION sessions.auth_session_resolve(
+CREATE OR REPLACE FUNCTION sessions.auth_session_resolve(
   p_access_token_hash text,
   p_now timestamptz,
   p_touch_before timestamptz DEFAULT NULL
@@ -92,7 +92,7 @@ BEGIN
 END
 $$;
 
-CREATE FUNCTION sessions.auth_sessions_mirror(p_rows jsonb)
+CREATE OR REPLACE FUNCTION sessions.auth_sessions_mirror(p_rows jsonb)
 RETURNS integer
 LANGUAGE sql
 SECURITY INVOKER
