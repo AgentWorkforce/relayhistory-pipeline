@@ -84,6 +84,7 @@ async function database(...sets: Migration[][]) {
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
   await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
+  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   for (const migration of sets.flat()) {
     try {
       await db.exec(migration.sql);

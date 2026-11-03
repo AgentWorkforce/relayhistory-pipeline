@@ -51,7 +51,7 @@ url() { printf 'postgres://postgres:%s@%s-%s:5432/postgres' "$PW" "$NAME" "$1"; 
 psql_in() { docker exec -i "$NAME-$1" psql -v ON_ERROR_STOP=1 -q -U postgres -d postgres; }
 
 step "target: 96Bulls supabase migrations (test-only role shim, then the role bootstrap as superuser)"
-cat "$WORK/bulls/supabase/tests/supabase_shim.sql" "$WORK/bulls/supabase/bootstrap/session_directory_search_worker.sql" \
+cat "$WORK/bulls/supabase/tests/supabase_shim.sql" "$WORK/bulls/supabase/bootstrap/session_directory_search_worker.sql" "$WORK/bulls/supabase/bootstrap/session_ingest_roles.sql" \
   "$WORK/bulls"/supabase/migrations/*.sql | psql_in dst
 
 step "source and target: relayhistory-cloud runner over TCP"

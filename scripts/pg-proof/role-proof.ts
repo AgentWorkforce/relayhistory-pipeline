@@ -72,6 +72,8 @@ const TOKEN_VERIFIER_BOOT = join(
   ROOT,
   "supabase/bootstrap/session_token_verifier.sql",
 );
+// The session ingest roles: privileged, cluster-wide, before migrate (20261102010000 verifies).
+const INGEST_BOOT = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
 const RUNTIME_BOOT = join(ROOT, "supabase/bootstrap/hoopdb_runtime_role.sql");
 const SUPABASE_RUNTIME_BOOT = join(
   ROOT,
@@ -611,6 +613,10 @@ if (
   !psql("postgres", ["-f", TOKEN_VERIFIER_BOOT]).ok
 )
   throw new Error("role bootstrap failed");
+if (!psql("postgres", ["-f", BOOT]).ok)
+  throw new Error("worker bootstrap failed");
+if (!psql("postgres", ["-f", INGEST_BOOT]).ok)
+  throw new Error("session ingest roles bootstrap failed");
 
 await fresh("g6_boot");
 await check(

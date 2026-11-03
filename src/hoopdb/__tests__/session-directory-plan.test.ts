@@ -52,6 +52,7 @@ async function database(): Promise<PGlite> {
   open.push(db);
   await db.exec(shim);
   await db.exec(bootstrap);
+  await db.exec(readFileSync(join(import.meta.dir, "../../../supabase/bootstrap/session_ingest_roles.sql"), "utf8"));
   await db.exec(`
     CREATE SCHEMA sessions;
     CREATE FUNCTION sessions.jwt_org_id() RETURNS text LANGUAGE sql STABLE AS $$
