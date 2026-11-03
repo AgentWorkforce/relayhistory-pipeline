@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import type { ObjectStore } from "../../shared/vendor.ts";
@@ -21,6 +21,7 @@ export const TENANT = { orgId: "org-a", workspaceId: "ws-a", userId: "user-1" };
 /** A scratch fs store under $TMPDIR (the caller's own scratch, never /tmp by default). */
 export function scratchStore(): { store: ObjectStore; done: () => void } {
   const base = process.env.TMPDIR ?? join(process.env.HOME ?? ".", ".agent-tmp", "tmp");
+  mkdirSync(base, { recursive: true, mode: 0o700 });
   const root = mkdtempSync(join(base, "ingest-"));
   return { store: createFsStore({ root }) as unknown as ObjectStore, done: () => rmSync(root, { recursive: true, force: true }) };
 }
