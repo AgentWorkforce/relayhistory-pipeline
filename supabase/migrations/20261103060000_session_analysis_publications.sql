@@ -61,8 +61,6 @@ BEGIN
    -- a different source epoch. No clock granularity assumption hides a race.
    IF ROW(prior.source_epoch,prior.source_fingerprint,prior.snapshot_id,prior.snapshot_sha256,prior.generation,prior.artifact_prefix,prior.index_key,prior.index_sha256,prior.index_bytes)
     IS DISTINCT FROM ROW(p_epoch,p_fingerprint,p_snapshot_id,p_snapshot_sha256,p_generation,p_prefix,p_index_key,p_index_sha256,p_index_bytes) THEN RETURN false;END IF;
-   UPDATE sessions.session_analysis_publications a SET refresh_nonce=p_lease_nonce,published_at=clock_timestamp() WHERE a.org_id=p_org AND a.workspace_id=p_workspace AND a.harness=p_harness AND a.session_id=p_session;
-   RETURN true;
   END IF;
  END IF;
  INSERT INTO sessions.session_analysis_publications(org_id,workspace_id,harness,session_id,source_epoch,source_fingerprint,snapshot_at,snapshot_id,snapshot_sha256,generation,artifact_prefix,index_key,index_sha256,index_bytes,refresh_nonce)
@@ -70,7 +68,15 @@ BEGIN
  ON CONFLICT(org_id,workspace_id,harness,session_id) DO UPDATE SET source_epoch=excluded.source_epoch,source_fingerprint=excluded.source_fingerprint,
  snapshot_at=excluded.snapshot_at,snapshot_id=excluded.snapshot_id,snapshot_sha256=excluded.snapshot_sha256,generation=excluded.generation,
  artifact_prefix=excluded.artifact_prefix,index_key=excluded.index_key,index_sha256=excluded.index_sha256,index_bytes=excluded.index_bytes,refresh_nonce=excluded.refresh_nonce,published_at=clock_timestamp();
+ -- A pointer upsert can wait on a row lock or trigger past lease/TTL expiry.
+ -- Raising inside this exception block rolls back the provisional write.
+ PERFORM 1 FROM sessions.session_analysis_wakeups w WHERE w.org_id=p_org AND w.workspace_id=p_workspace AND w.harness=p_harness AND w.session_id=p_session
+  AND w.source_epoch=p_epoch AND w.source_fingerprint=p_fingerprint AND w.lease_nonce=p_lease_nonce AND w.generation=w.lease_generation AND w.lease_expires_at>clock_timestamp();
+ IF NOT FOUND OR p_snapshot_at<clock_timestamp()-interval '120 seconds' OR p_snapshot_at>clock_timestamp()+interval '30 seconds' THEN
+  RAISE EXCEPTION USING ERRCODE='RH002',MESSAGE='analysis publication: authority expired during write';
+ END IF;
  RETURN true;
+EXCEPTION WHEN SQLSTATE 'RH002' THEN RETURN false;
 END $publish$;
 
 CREATE FUNCTION sessions.session_directory_analysis_cache(p_workspace_id text,p_harness text,p_session_id text)
