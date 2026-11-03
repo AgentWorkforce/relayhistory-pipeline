@@ -77,9 +77,9 @@ async function writeSession(
   machine: string,
   records: RelayhistoryStreamRecord[],
   revision = 1,
-  opts: { scrubbed?: boolean; extensions?: Record<string, unknown>; declaredRecords?:number|null } = {},
+  opts: { scrubbed?: boolean; extensions?: Record<string, unknown>; declaredRecords?:number|null; physicalSessionId?:string } = {},
 ) {
-  const location = loc(machine);
+  const location = {...loc(machine),...(opts.physicalSessionId?{sessionId:opts.physicalSessionId}:{})};
   const source = new TextEncoder().encode(`${records.map((r) => JSON.stringify(r)).join("\n")}\n`);
   const stored = new Uint8Array(zstdCompressSync(source));
   const sha = await sha256Hex(source);
@@ -105,7 +105,7 @@ async function writeSession(
     revision,
     created_at: AT,
     updated_at: AT,
-    session: { workspace_id: scope.workspaceId, machine_id: machine, harness: scope.harness, session_id: scope.sessionId, started_at: AT },
+    session: { workspace_id: scope.workspaceId, machine_id: machine, harness: scope.harness, session_id: location.sessionId, started_at: AT },
     writer: { delivery_instance_id: machine, plugin_version: "test" },
     raw: {
       owner: machine,
@@ -686,4 +686,43 @@ describe("reconcile", () => {
     expect(pages).toEqual([undefined, "1", "2", "3", "4", "5"].slice(0, pages.length));
     expect(second.pages).toBeGreaterThan(0);
   });
+});
+
+const canonical='sess:1';
+function aliasDb(liveA:()=>string[],siblings:()=>string[]){
+ const base=fakeSupabase(liveA,()=>false,()=>canonical);
+ const tx={...base.tx,async query(text:string,params?:unknown[]){
+  if(text.includes('FROM sessions.session_index')&&text.includes('deleted_at IS NULL')){
+   const selected=text.includes('p.session_id=$4')?liveA():siblings();
+   return{rows:selected.map(manifest_key=>({manifest_key,canonical_id:canonical,event_epoch:'0'}))};
+  }
+  return base.tx.query(text,params);
+ }};
+ return{tx,transact:async(work:any)=>work(tx)};
+}
+test('independent: valid same-physical two-machine group survives one machine removal',async()=>{
+ const a=await writeSession('machine_a',[event('ra','1',Date.parse(AT),'source A',{origin_id:'origin-a'})],1,{extensions:{'96bulls':{user_id:'user_1',canonical_session_id:canonical}}});
+ const b=await writeSession('machine_b',[event('rb','1',Date.parse(AT),'source B',{origin_id:'origin-b'})],1,{extensions:{'96bulls':{user_id:'user_1',canonical_session_id:canonical}}});
+ let keys=[a,b];const sb=fakeSupabase(()=>keys,()=>false,()=>canonical),ch=fakeClickHouse();
+ expect((await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).complete).toBe(true);
+ keys=[b];expect((await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).complete).toBe(true);
+ expect(ch.final().map(r=>r.content)).toEqual(['source B']);
+});
+test('independent: malformed stale physical alias reconcile must preserve valid canonical sibling',async()=>{
+ const b=await writeSession('machine_b',[event('rb','1',Date.parse(AT),'source B',{origin_id:'origin-b'})],1,{extensions:{'96bulls':{user_id:'user_1',canonical_session_id:canonical}}});
+ const seed=fakeSupabase(()=>[b],()=>false,()=>canonical),ch=fakeClickHouse();
+ expect((await indexSearchScope(scope,searchDeps(ch.ch,seed.transact))).complete).toBe(true);
+ const a=await writeSession('machine_a',[event('ra','1',Date.parse(AT),'source A',{origin_id:'origin-a'})],1,{physicalSessionId:'alias_a',extensions:{'96bulls':{user_id:'user_1',canonical_session_id:canonical}}});
+ const sb=aliasDb(()=>[a],()=>[a,b]);
+ const result=await indexSearchScope({...scope,sessionId:'alias_a'},searchDeps(ch.ch,sb.transact));
+ expect(result.complete).toBe(false);
+ expect(ch.final().map(r=>r.content)).toContain('source B');
+});
+test('independent: erased stale physical alias must preserve live canonical sibling',async()=>{
+ const b=await writeSession('machine_b',[event('rb','1',Date.parse(AT),'source B',{origin_id:'origin-b'})],1,{extensions:{'96bulls':{user_id:'user_1',canonical_session_id:canonical}}});
+ const seed=fakeSupabase(()=>[b],()=>false,()=>canonical),ch=fakeClickHouse();
+ expect((await indexSearchScope(scope,searchDeps(ch.ch,seed.transact))).complete).toBe(true);
+ const sb=aliasDb(()=>[],()=>[b]);
+ await indexSearchScope({...scope,sessionId:'alias_a'},searchDeps(ch.ch,sb.transact));
+ expect(ch.final().map(r=>r.content)).toContain('source B');
 });

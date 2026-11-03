@@ -38,6 +38,7 @@
  */
 import { createHash } from "node:crypto";
 import * as zlib from "node:zlib";
+import { layoutComponent } from "../shared/layout-component.ts";
 import {
   CONVERGENCE_EVENT_KIND,
   PipelineError,
@@ -531,6 +532,21 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if (!canonicalLock[0]?.ok) return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,busy:true,reasons:["canonical_scope_busy"]};
     const at = now();
     const version = at.getTime();
+    // A stale DB alias is not authority to delete another canonical session.
+    if(layoutComponent(pointerSnapshot.canonicalId)!==scope.sessionId){
+      await invalidateDirectoryEvents(tx,scope);
+      await recordState(deps.ch,scope,0,0,false,at,pointerSnapshot.canonicalId);
+      return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_session_mismatch"]};
+    }
+    const {rows:siblings}=await tx.query<{manifest_key:string}>(`SELECT manifest_key FROM sessions.session_index
+      WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id`,[scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId]);
+    const siblingKeys=siblings.map(r=>r.manifest_key);
+    if(!keys.length&&siblingKeys.length){
+      // Erasing one alias must never erase a live canonical sibling.
+      await invalidateDirectoryEvents(tx,scope);
+      await recordState(deps.ch,scope,0,0,false,at,pointerSnapshot.canonicalId);
+      return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_scope_still_live"]};
+    }
     if (keys.length === 0) {
       // Erased: no live manifest is left, so every row of the scope goes, in or
       // out of the window. One predicate delete, no listing, so no size can
@@ -550,13 +566,11 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
     }
     const fromMs = Date.parse(await windowStart(deps.ch, at));
-    const s3 = await readScope(scope, keys, deps, limits, version);
-    if (!s3.complete) await invalidateDirectoryEvents(tx, scope);
-    if (s3.partial) {
-      // Not indexed from S3 and never treated as current: the state row says the
-      // session owes a full pass (needs_full = 1), and nothing else is written.
-      await recordState(deps.ch, scope, s3.revision, 0, false, at, pointerSnapshot.canonicalId);
-      return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, reasons: s3.reasons };
+    const s3 = await readScope(scope, siblingKeys, deps, limits, version, pointerSnapshot.canonicalId);
+    if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
+      await invalidateDirectoryEvents(tx,scope);
+      await recordState(deps.ch,scope,s3.revision,0,false,at,pointerSnapshot.canonicalId);
+      return {manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]};
     }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
     const chRows = await clickhouseScope(deps.ch, scope, fromMs, limits.maxRows + 1, pointerSnapshot.canonicalId);
@@ -586,21 +600,12 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       }
       await deleteRows(deps.ch, deletes);
     }
-    // CH reconciles the addressed physical scope. Directory metadata folds every
-    // physical sibling mapping to this canonical identity under one canonical lock.
-    if (complete && s3.directorySessionId !== null) {
-      const { rows: siblings } = await tx.query<{manifest_key:string}>(`SELECT manifest_key FROM sessions.session_index
-        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id`,[scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId]);
-      const siblingKeys=siblings.map(r=>r.manifest_key);
-      const canonical = siblingKeys.length===keys.length&&siblingKeys.every(k=>keys.includes(k)) ? s3 : await readScope(scope,siblingKeys,deps,limits,version,pointerSnapshot.canonicalId);
-      if (!canonical.complete || canonical.events===null || canonical.directorySessionId!==pointerSnapshot.canonicalId) {
-        complete=false;s3.reasons.push(...canonical.reasons,"canonical_metadata_incomplete");await invalidateDirectoryEvents(tx,scope);
-      } else {
-        const directoryKey={orgId:scope.orgId,workspaceId:scope.workspaceId,harness:scope.harness,sessionId:canonical.directorySessionId};
-        const written=await (deps.writeEvents??writeDirectoryEvents)(tx,directoryKey,{sourceSessionId:scope.sessionId,expectedEpoch:pointerSnapshot.epoch,sources:canonical.sources,events:canonical.events});
-        if(written.written) await (deps.writeCatalog??writeDirectoryCatalog)(tx,directoryKey,canonical.catalog);
-        else {complete=false;s3.reasons.push("directory_event_sources_changed");await invalidateDirectoryEvents(tx,scope);}
-      }
+    // Metadata and CH describe the same validated canonical source union.
+    if(complete){
+      const directoryKey={orgId:scope.orgId,workspaceId:scope.workspaceId,harness:scope.harness,sessionId:pointerSnapshot.canonicalId};
+      const written=await (deps.writeEvents??writeDirectoryEvents)(tx,directoryKey,{sourceSessionId:scope.sessionId,expectedEpoch:pointerSnapshot.epoch,sources:s3.sources,events:s3.events});
+      if(written.written)await (deps.writeCatalog??writeDirectoryCatalog)(tx,directoryKey,s3.catalog);
+      else {complete=false;s3.reasons.push("directory_event_sources_changed");await invalidateDirectoryEvents(tx,scope);}
     }
     // Only a complete pass makes the session current; any other leaves it owing one.
     await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at, pointerSnapshot.canonicalId);
