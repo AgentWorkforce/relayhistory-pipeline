@@ -2147,6 +2147,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
             join(
               root,
               "supabase/bootstrap/session_token_verifier.sql",
+            ),
             "utf8",
           ),
         );
@@ -2155,6 +2156,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
             join(
               root,
               "supabase/bootstrap/session_ingest_roles.sql",
+            ),
             "utf8",
           ),
         );
@@ -2190,6 +2192,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               join(
                 root,
                 "supabase/bootstrap/session_token_verifier.sql",
+              ),
               "utf8",
             ),
           );
@@ -2198,6 +2201,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               join(
                 root,
                 "supabase/bootstrap/session_ingest_roles.sql",
+              ),
               "utf8",
             ),
           );
