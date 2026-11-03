@@ -15,6 +15,7 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  attestations: write
 jobs:
   publish:
     # Only Khaliq may dispatch it, and only with the phrase; the job also runs in the
@@ -27,6 +28,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
+      # A customer image must come from a reviewed commit on main.
+      - name: Verify the source commit is reviewed on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$(git rev-parse "${GITHUB_SHA}^{commit}")" origin/main; then
+            echo "Refusing to publish ${GITHUB_SHA}: it is not on main" >&2
+            exit 1
+          fi
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -49,6 +60,16 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             96bulls.approval=${{ github.event.inputs.ref_note }}
+          # Customer releases need an SBOM and verifiable (max-mode) provenance;
+          # the signed GitHub attestation below covers the pushed digest.
+          provenance: mode=max
+          sbom: true
+      - name: Attest published image
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/agentworkforce/96bulls-services
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
       - name: Digest
         run: |
           echo "ghcr.io/agentworkforce/96bulls-services@${{ steps.build.outputs.digest }}" | tee -a "$GITHUB_STEP_SUMMARY"
