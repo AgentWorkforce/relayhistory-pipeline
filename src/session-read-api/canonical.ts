@@ -119,6 +119,7 @@ export async function canonicalSnapshot(
   if (!pointers.length)
     return {
       generation: version,
+      exists: false,
       legacyCoverage: null,
       rows: [] as Array<{ table: string; row: Record<string, unknown> }>,
     };
@@ -195,6 +196,7 @@ export async function canonicalSnapshot(
   const legacy = canonicalLegacy(result.records, identity);
   return {
     generation: version,
+    exists: true,
     legacyCoverage: legacy.coverage,
     rows: [...result.projectionRows, ...legacy.rows],
   };
