@@ -278,11 +278,11 @@
     ],
     "sessions.session_output(text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
-      "bulls96_read_api:EXECUTE"
+      "session_directory_search_worker:EXECUTE"
     ],
     "sessions.session_activity(text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
-      "bulls96_read_api:EXECUTE"
+      "session_directory_search_worker:EXECUTE"
     ]
   }
 }

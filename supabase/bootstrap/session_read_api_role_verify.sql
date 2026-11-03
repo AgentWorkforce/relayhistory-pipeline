@@ -65,10 +65,7 @@ BEGIN
   FOR v_row IN
     SELECT p.oid::regprocedure::text AS fn FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
      WHERE n.nspname = 'sessions' AND p.prosecdef AND has_function_privilege(v_role.oid, p.oid, 'EXECUTE')
-       AND p.oid NOT IN (
-         -- The aggregate lane's claim-bound RPCs (tenant settings checked inside).
-         to_regprocedure('sessions.session_output(text,timestamptz,timestamptz)'),
-         to_regprocedure('sessions.session_activity(text,timestamptz,timestamptz)'))
+
   LOOP
     v_problems := array_append(v_problems, (format('EXECUTE on security definer %s', v_row.fn))::text);
   END LOOP;

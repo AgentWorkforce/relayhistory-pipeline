@@ -72,7 +72,9 @@ DECLARE
     'sessions.session_directory_activity(text, timestamptz, timestamptz)',
     'sessions.session_directory_event_activity(text, timestamptz, timestamptz)',
     'sessions.list_session_directory_events(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer, text)',
-    'sessions.session_brief(text, text, text)'];
+    'sessions.session_brief(text, text, text)',
+    'sessions.session_output(text, timestamptz, timestamptz)',
+    'sessions.session_activity(text, timestamptz, timestamptz)'];
   v_fns oid[] := '{}';
   v_fn oid;
   v_sig text;
@@ -162,7 +164,8 @@ BEGIN
                 WHERE p.pronamespace = v_sessions
                   AND p.proname IN ('search_session_directory', 'session_directory_pointers',
                                     'session_directory_readiness', 'list_session_directory',
-                                    'session_directory_activity', 'session_directory_event_activity', 'list_session_directory_events', 'session_brief')
+                                    'session_directory_activity', 'session_directory_event_activity', 'list_session_directory_events', 'session_brief',
+                                    'session_output', 'session_activity')
                   AND NOT (p.oid = ANY (v_fns)) LOOP
     v_problems := array_append(v_problems, format('approved RPC redefined: %s', v_row.fn)::text);
   END LOOP;
