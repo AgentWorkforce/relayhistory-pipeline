@@ -1,6 +1,7 @@
 /** Bounded workerd consumer of immutable, source-acknowledged canonical pages.
  * It never folds raw records, constructs a Neon client, or falls back on misses.
  */
+import { canonicalTimestamp } from "../hoopdb/search-query.ts";
 import { createHash } from "node:crypto";
 import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
 import { CanonicalReadError } from "./canonical.ts";
@@ -40,6 +41,8 @@ export interface ArtifactQuery {
   cursor?: string | null;
   maxContent?: number;
   generation?: string | null;
+  since?: string;
+  until?: string;
 }
 const MAX_ROW_BYTES = 64 * 1024 * 1024,
   MAX_REPLY_BYTES = 2 * 1024 * 1024,
@@ -147,6 +150,8 @@ interface Cursor {
   order: string;
   maxContent: number | null;
   offset: number;
+  since?: string | null;
+  until?: string | null;
 }
 function queryCursor(query: ArtifactQuery, id: ArtifactIdentity) {
   if (!query.cursor) return null;
@@ -163,6 +168,8 @@ function queryCursor(query: ArtifactQuery, id: ArtifactIdentity) {
     c.view !== (query.view ?? "raw") ||
     c.order !== (query.order ?? "asc") ||
     c.maxContent !== (query.maxContent ?? null) ||
+    (c.since ?? null) !== (query.since ?? null) ||
+    (c.until ?? null) !== (query.until ?? null) ||
     !count(c.offset)
   )
     fail("cursor", 400);
@@ -194,7 +201,11 @@ export async function canonicalArtifactPage(
         (view !== "replay" ||
           !count(query.maxContent) ||
           query.maxContent === 0)) ||
-      (query.generation != null && !hash(query.generation))
+      (query.generation != null && !hash(query.generation)) ||
+      ((query.since !== undefined || query.until !== undefined) &&
+        query.table !== "convergence_events") ||
+      (query.since !== undefined && !canonicalTimestamp(query.since)) ||
+      (query.until !== undefined && !canonicalTimestamp(query.until))
     )
       fail("parameter", 400);
     const cursor = queryCursor(query, identity),
@@ -317,7 +328,8 @@ export async function canonicalArtifactPage(
       (selected.count === 0 ? selected.root !== null : selected.root === null)
     )
       fail("artifact_view");
-    const total = selected.count;
+    const sourceTotal = selected.count;
+    let total = sourceTotal;
     let offset = cursor?.offset ?? 0;
     if (offset > total) fail("cursor", 400);
     const cache = new Map<string, unknown>();
@@ -356,6 +368,7 @@ export async function canonicalArtifactPage(
       ref: ArtifactRangeRef,
       unit: "rows" | "bytes" | "utf16",
       depth: number,
+      rowView: ArtifactView = storageView,
     ) {
       if (depth >= ARTIFACT_MAX_DEPTH) fail("artifact_depth");
       const value = await json(ref);
@@ -372,7 +385,7 @@ export async function canonicalArtifactPage(
         !value.children.length ||
         value.children.length > ARTIFACT_FANOUT ||
         (unit === "rows" &&
-          (value.table !== query.table || value.view !== storageView))
+          (value.table !== query.table || value.view !== rowView))
       )
         fail("artifact_node");
       let at = ref.start;
@@ -389,14 +402,15 @@ export async function canonicalArtifactPage(
       ref: ArtifactRangeRef,
       ordinal: number,
       depth = 0,
+      rowView: ArtifactView = storageView,
     ): Promise<ArtifactPage> {
       range(ref, "rows");
       if (ordinal < ref.start || ordinal >= ref.start + ref.count)
         fail("artifact_range");
       if (ref.kind === "node") {
-        for (const child of await children(ref, "rows", depth))
+        for (const child of await children(ref, "rows", depth, rowView))
           if (ordinal >= child.start && ordinal < child.start + child.count)
-            return pageFor(child, ordinal, depth + 1);
+            return pageFor(child, ordinal, depth + 1, rowView);
         return fail("artifact_range");
       }
       const p = await json(ref);
@@ -407,7 +421,7 @@ export async function canonicalArtifactPage(
         !sameIdentity(p.identity, identity) ||
         p.generation !== ack.generation ||
         p.table !== query.table ||
-        p.view !== storageView ||
+        p.view !== rowView ||
         p.start !== ref.start ||
         !Array.isArray(p.rows) ||
         !p.rows.length ||
@@ -588,10 +602,68 @@ export async function canonicalArtifactPage(
       if (selected.root.start !== 0 || selected.root.count !== total)
         fail("artifact_range");
     }
+    let firstOrdinal = 0,
+      endOrdinal = sourceTotal;
+    const since =
+        query.since === undefined
+          ? undefined
+          : canonicalTimestamp(query.since)!,
+      until =
+        query.until === undefined
+          ? undefined
+          : canonicalTimestamp(query.until)!;
+    const timeCompare = (a: string, b: string) =>
+      a.length - b.length || (a < b ? -1 : a > b ? 1 : 0);
+    if (since !== undefined || until !== undefined) {
+      const bounds = index.tables.convergence_events?.bounds;
+      if (
+        !bounds ||
+        bounds.count !== sourceTotal ||
+        (sourceTotal ? !bounds.root : bounds.root !== null)
+      )
+        fail("artifact_bounds");
+      if (bounds.root) {
+        range(bounds.root, "rows");
+        if (bounds.root.start !== 0 || bounds.root.count !== sourceTotal)
+          fail("artifact_bounds");
+      }
+      async function seek(target: string, inclusive: boolean) {
+        let low = 0,
+          high = sourceTotal;
+        while (low < high) {
+          const middle = Math.floor((low + high) / 2),
+            p = await pageFor(bounds!.root!, middle, 0, "bounds"),
+            entry = p.rows[middle - p.start]!;
+          if (
+            !obj(entry) ||
+            entry.table !== query.table ||
+            !obj(entry.row) ||
+            entry.rowJson ||
+            entry.content
+          )
+            fail("artifact_bounds");
+          rowIdentity(entry.row);
+          const ts = entry.row.ts;
+          if (typeof ts !== "string" || canonicalTimestamp(ts) !== ts)
+            fail("artifact_bounds");
+          const comparison = timeCompare(ts, target);
+          if (comparison < 0 || (inclusive && comparison === 0))
+            low = middle + 1;
+          else high = middle;
+        }
+        return low;
+      }
+      if (since !== undefined) firstOrdinal = await seek(since, false);
+      if (until !== undefined) endOrdinal = await seek(until, true);
+      endOrdinal = Math.max(firstOrdinal, endOrdinal);
+      total = endOrdinal - firstOrdinal;
+      if (offset > total) fail("cursor", 400);
+    }
     const rows: Array<{ table: string; row: Record<string, unknown> }> = [];
     let replyBytes = 0;
     while (offset < total && rows.length < query.limit) {
-      const ordinal = order === "asc" ? offset : total - 1 - offset;
+      const ordinal =
+        order === "asc" ? firstOrdinal + offset : endOrdinal - 1 - offset;
       const p = await pageFor(selected.root!, ordinal);
       const entry = p.rows[ordinal - p.start]!;
       if (
@@ -609,6 +681,13 @@ export async function canonicalArtifactPage(
       const row = await hydrate(entry),
         item = { table: query.table, row },
         size = encoder.encode(JSON.stringify(item)).byteLength;
+      if (
+        (since !== undefined || until !== undefined) &&
+        (typeof row.ts !== "string" ||
+          (since !== undefined && timeCompare(row.ts, since) < 0) ||
+          (until !== undefined && timeCompare(row.ts, until) > 0))
+      )
+        fail("artifact_bounds");
       if (rows.length && replyBytes + size > MAX_REPLY_BYTES - 4096) break;
       if (
         !rows.length &&
@@ -657,6 +736,8 @@ export async function canonicalArtifactPage(
             order,
             maxContent: query.maxContent ?? null,
             offset,
+            since: query.since ?? null,
+            until: query.until ?? null,
           } satisfies Cursor)
         : null;
     return {

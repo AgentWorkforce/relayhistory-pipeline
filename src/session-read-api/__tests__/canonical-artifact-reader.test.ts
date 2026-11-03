@@ -238,6 +238,31 @@ beforeEach(async () => {
     ),
   };
   index.tables.convergence_events!.replay = { count: 3, root };
+  const boundRows = [entries[0]!.row!, big, entries[2]!.row!].map((row) => ({
+    table: "convergence_events",
+    row: Object.fromEntries(
+      ["source", "session_id", "event_id", "machine_id", "kind", "ts"].map(
+        (key) => [key, row[key]],
+      ),
+    ),
+  }));
+  const boundPage = await put(
+    "bounds-page.json",
+    encode({
+      version: 1,
+      kind: "row-page",
+      identity,
+      generation,
+      table: "convergence_events",
+      view: "bounds",
+      start: 0,
+      rows: boundRows,
+    }),
+    0,
+    3,
+    "page",
+  );
+  index.tables.convergence_events!.bounds = { count: 3, root: boundPage };
   await publish();
   deps = {
     signal: controller.signal,
@@ -442,4 +467,58 @@ test("rejects acknowledged reversed event rows using the shared byte comparator"
   await expect(
     canonicalArtifactPage(deps, identity, query({ limit: 2 })),
   ).rejects.toMatchObject({ reason: "artifact_order" });
+});
+
+test("seeks inclusive precise timestamp ranges through bounds without scanning content", async () => {
+  const since = "2026-11-01T10:00:00.000002Z",
+    until = since;
+  const middle = await canonicalArtifactPage(
+    deps,
+    identity,
+    query({ since, until, limit: 3 }),
+  );
+  expect(middle.rows.map((x) => x.row.event_id)).toEqual(["e2"]);
+  expect(middle.nextCursor).toBeNull();
+  expect(readKeys.some((k) => k.endsWith("string-0.json"))).toBe(false);
+  readKeys = [];
+  const latest = await canonicalArtifactPage(
+    deps,
+    identity,
+    query({ since, order: "desc" }),
+  );
+  expect(latest.rows[0]!.row.event_id).toBe("e3");
+  const older = await canonicalArtifactPage(
+    deps,
+    identity,
+    query({ since, order: "desc", cursor: latest.nextCursor }),
+  );
+  expect(older.rows[0]!.row.event_id).toBe("e2");
+  await expect(
+    canonicalArtifactPage(
+      deps,
+      identity,
+      query({
+        since: "2026-11-01T10:00:00.000001Z",
+        order: "desc",
+        cursor: latest.nextCursor,
+      }),
+    ),
+  ).rejects.toMatchObject({ status: 400 });
+  expect(
+    (
+      await canonicalArtifactPage(
+        deps,
+        identity,
+        query({ since: "2026-11-01T10:00:00.000004Z" }),
+      )
+    ).rows,
+  ).toEqual([]);
+});
+test("refuses missing/misaligned timestamp bounds instead of an unbounded replay scan", async () => {
+  delete index.tables.convergence_events!.bounds;
+  await publish();
+  await expect(
+    canonicalArtifactPage(deps, identity, query({ since: "2026-11-01" })),
+  ).rejects.toMatchObject({ reason: "artifact_bounds" });
+  expect(readKeys.some((k) => k.endsWith("page-1.json"))).toBe(false);
 });
