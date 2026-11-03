@@ -70,8 +70,9 @@ BEGIN
  IF NOT (c->>'exists')::boolean OR (c->>'blocked')::boolean OR c->'source'->>'epoch' IS DISTINCT FROM j.source_epoch::text
   OR c->'source'->>'fingerprint' IS DISTINCT FROM j.source_fingerprint THEN RETURN false; END IF;
  UPDATE sessions.session_large_read_jobs SET lease_expires_at=clock_timestamp()+interval '120 seconds',updated_at=now()
- WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=p_session;
- RETURN true;
+ WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=p_session
+  AND lease_expires_at>clock_timestamp();
+ RETURN FOUND;
 END $heartbeat$;
 
 -- Publication and lease completion share the row lock and transaction. A stale
@@ -85,10 +86,19 @@ BEGIN
  SELECT * INTO j FROM sessions.session_large_read_jobs WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=p_session FOR UPDATE;
  IF NOT FOUND OR j.state<>'running' OR j.lease_nonce IS DISTINCT FROM p_nonce OR j.lease_expires_at<=clock_timestamp()
   OR j.source_epoch IS DISTINCT FROM p_epoch OR j.source_fingerprint IS DISTINCT FROM p_fingerprint THEN RETURN false; END IF;
- IF NOT sessions.publish_session_replay_pages(p_org,p_workspace,p_harness,p_session,p_epoch,p_fingerprint,p_snapshot,
-  p_generation,p_source_generation,p_prefix,p_index_key,p_index_sha256,p_index_bytes) THEN RETURN false; END IF;
- UPDATE sessions.session_large_read_jobs SET state='complete',lease_nonce=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=now()
- WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=p_session;
+ -- The nested publisher can wait on the source-publication row lock until
+ -- after expiry. Its provisional write must roll back if authority lapses.
+ BEGIN
+  IF NOT sessions.publish_session_replay_pages(p_org,p_workspace,p_harness,p_session,p_epoch,p_fingerprint,p_snapshot,
+   p_generation,p_source_generation,p_prefix,p_index_key,p_index_sha256,p_index_bytes) THEN RETURN false; END IF;
+  UPDATE sessions.session_large_read_jobs SET state='complete',lease_nonce=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=now()
+  WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=p_session
+   AND lease_expires_at>clock_timestamp();
+  IF NOT FOUND THEN
+   RAISE EXCEPTION USING ERRCODE='RH001',MESSAGE='large read: lease expired during publication';
+  END IF;
+ EXCEPTION WHEN SQLSTATE 'RH001' THEN RETURN false;
+ END;
  RETURN true;
 END $publish$;
 

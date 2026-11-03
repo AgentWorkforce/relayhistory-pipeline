@@ -53,3 +53,22 @@ test("claim and heartbeat extend from invocation wall time inside a held transac
   expect((await x.pg.query<{fresh:boolean}>("SELECT available_at >= $1::timestamptz+interval '30 seconds' fresh FROM sessions.session_large_read_jobs",[retryAt])).rows[0]!.fresh).toBe(true);
  }finally{await x.pg.exec("ROLLBACK")}
 });
+
+test("heartbeat cannot renew after source capture stalls across lease expiry",async()=>{
+ const x=await fresh();await enqueue(x);await claim(x);
+ await x.pg.exec(`ALTER FUNCTION sessions.capture_session_replay_pages(text,text,text,text) RENAME TO capture_session_replay_pages_unstalled;
+ CREATE FUNCTION sessions.capture_session_replay_pages(p_org text,p_workspace text,p_harness text,p_session text) RETURNS jsonb LANGUAGE plpgsql STABLE AS $stall$
+ BEGIN PERFORM pg_sleep(0.15); RETURN sessions.capture_session_replay_pages_unstalled(p_org,p_workspace,p_harness,p_session); END $stall$;`);
+ await x.pg.exec("UPDATE sessions.session_large_read_jobs SET lease_expires_at=clock_timestamp()+interval '100 milliseconds'");
+ expect((await x.db.query<{ok:boolean}>("SELECT sessions.heartbeat_session_large_read($1,$2,$3,$4,$5::uuid) ok",[...scope,n1])).rows[0]!.ok).toBe(false);
+ expect((await x.pg.query<{expired:boolean}>("SELECT lease_expires_at<clock_timestamp() expired FROM sessions.session_large_read_jobs")).rows[0]!.expired).toBe(true);
+});
+test("publication rolls back provisional artifacts when its nested write stalls across expiry",async()=>{
+ const x=await fresh();await enqueue(x);await claim(x);
+ await x.pg.exec(`CREATE FUNCTION sessions.stall_large_read_publication() RETURNS trigger LANGUAGE plpgsql AS $stall$ BEGIN PERFORM pg_sleep(0.15); RETURN NEW; END $stall$;
+ CREATE TRIGGER stall_large_read_publication BEFORE UPDATE ON sessions.session_replay_publications FOR EACH ROW EXECUTE FUNCTION sessions.stall_large_read_publication();`);
+ await x.pg.exec("UPDATE sessions.session_large_read_jobs SET lease_expires_at=clock_timestamp()+interval '100 milliseconds'");
+ expect(await pub(x)).toBe(false);
+ expect((await x.pg.query<{index_key:string|null}>("SELECT index_key FROM sessions.session_replay_publications")).rows[0]!.index_key).toBeNull();
+ expect((await x.pg.query<{state:string}>("SELECT state FROM sessions.session_large_read_jobs")).rows[0]!.state).toBe("running");
+});
