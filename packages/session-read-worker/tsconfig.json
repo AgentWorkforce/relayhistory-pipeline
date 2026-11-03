@@ -12,7 +12,8 @@
     "esModuleInterop": true,
     "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types", "node"],
     "paths": {
-      "@rhc/*": ["../pipeline/src/*"]
+      "@rhc/*": ["../pipeline/src/*"],
+      "@rhc-object-store": ["../object-store/src/index.ts"]
     }
   },
   "include": ["src", "test"],

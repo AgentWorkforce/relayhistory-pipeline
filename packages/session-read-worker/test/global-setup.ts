@@ -32,6 +32,7 @@ declare module "vitest" {
     chReadUser: string;
     chReadPassword: string;
     pgReadUrl: string;
+    pgIngestUrl: string;
     pgAdminUrl: string;
     jwksUrl: string;
     signingJwk: JsonWebKey;
@@ -66,6 +67,7 @@ export default async function setup(project: TestProject) {
   // Postgres: a fresh database as Supabase looks after the HoopDb migrations.
   const pgDatabase = `read_worker_${id()}`;
   const pgReadPassword = id() + id();
+  const pgIngestPassword = id() + id();
   const server = new pg.Client({ connectionString: pgUrl });
   await server.connect();
   await server.query(`CREATE DATABASE ${pgDatabase}`);
@@ -84,10 +86,16 @@ export default async function setup(project: TestProject) {
   await db.query(`ALTER ROLE bulls96_read_api PASSWORD '${pgReadPassword}'`);
   await db.query(`GRANT CONNECT ON DATABASE ${pgDatabase} TO bulls96_read_api`);
   await db.query(sql("supabase/bootstrap/session_read_api_role_verify.sql"));
+  // The ingest entry is exercised in workerd against its real restricted role.
+  await db.query(`ALTER ROLE bulls96_session_ingest LOGIN PASSWORD '${pgIngestPassword}'`);
+  await db.query(`GRANT CONNECT ON DATABASE ${pgDatabase} TO bulls96_session_ingest`);
   await db.end();
   const readUrl = new URL(adminUrl);
   readUrl.username = "bulls96_read_api";
   readUrl.password = pgReadPassword;
+  const ingestUrl = new URL(adminUrl);
+  ingestUrl.username = "bulls96_session_ingest";
+  ingestUrl.password = pgIngestPassword;
 
   // RelayAuth: a JWKS endpoint with one per-run key.
   const pair = await crypto.subtle.generateKey(
@@ -116,6 +124,7 @@ export default async function setup(project: TestProject) {
   project.provide("chReadUser", chReadUser);
   project.provide("chReadPassword", chReadPassword);
   project.provide("pgReadUrl", readUrl.toString());
+  project.provide("pgIngestUrl", ingestUrl.toString());
   project.provide("pgAdminUrl", adminUrl.toString());
   project.provide("jwksUrl", `http://127.0.0.1:${port}/.well-known/jwks.json`);
   project.provide("signingJwk", signingJwk);
