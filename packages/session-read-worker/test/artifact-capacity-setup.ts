@@ -1,7 +1,7 @@
 /** Node-only fixture server. Streams the real producer's synthetic objects from
  * disk; the workerd isolate never loads the full corpus or production config. */
 import { createServer } from "node:http";
-import { createReadStream, readFileSync, statSync } from "node:fs";
+import { createReadStream, readFileSync, statSync, existsSync } from "node:fs";
 import { resolve, sep } from "node:path";
 import type { TestProject } from "vitest/node";
 declare module "vitest" {
@@ -22,6 +22,9 @@ export default async function setup(project: TestProject) {
   const proof = JSON.parse(
     readFileSync(resolve(fixture, "proof.json"), "utf8"),
   );
+  const namespaces = resolve(fixture, "namespaces.json");
+  if (existsSync(namespaces))
+    proof.namespaces = JSON.parse(readFileSync(namespaces, "utf8"));
   let requests = 0,
     totalBytes = 0,
     maxBytes = 0;

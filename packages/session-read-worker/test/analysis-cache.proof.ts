@@ -197,3 +197,69 @@ it("HTTP demand wakeup scope and disabled mode refuse before cache/object operat
   expect(disabled.status).toBe(503);
   expect(f.counts().claims).toBe(0);
 });
+
+it("actual Node24 namespace publications preserve all three scoped histories and refuse cross-namespace claims", async (context) => {
+  const f = await setup(),
+    namespaces = f.proof.namespaces;
+  if (!Array.isArray(namespaces)) context.skip();
+  expect(namespaces).toHaveLength(3);
+  for (const ns of namespaces) {
+    const deps = {
+      ...f.deps,
+      now: () => Date.parse(ns.claim.snapshotAt) + 1000,
+      publication: async () => ns.claim,
+    };
+    const token =
+      "header." +
+      btoa(
+        JSON.stringify({
+          role: "session_directory_search_worker",
+          app_metadata: {
+            org_id: ns.identity.orgId,
+            workspace_ids: [ns.identity.workspaceId],
+          },
+        }),
+      ) +
+      ".signature";
+    const request = new Request(
+      "https://read.test/v1/canonical/analyses/" +
+        encodeURIComponent(ns.identity.sessionId) +
+        "?" +
+        new URLSearchParams({
+          workspace: ns.identity.workspaceId,
+          source: ns.identity.source,
+        }),
+      { headers: { authorization: "Bearer " + token } },
+    );
+    const response = await canonicalAnalysisHandle(
+      request,
+      { CANONICAL_READ_ENABLED: "true", CANONICAL_READ_MODE: "pages" },
+      () => {
+        throw new Error("Neon/raw forbidden");
+      },
+      deps,
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as any;
+    expect(body.payload.requests.map((r: any) => r.id)).toEqual(ns.requestIds);
+    expect(body.payload.analyses.map((r: any) => r.id)).toEqual(ns.analysisIds);
+    expect(body.payload.analyses[0].result.brief.title).toBe(ns.expectedTitle);
+    expect(
+      createHash("sha256")
+        .update(analysisSnapshotJson(body.payload))
+        .digest("hex"),
+    ).toBe(ns.expectedSha256);
+  }
+  await fetch(base() + "/reset");
+  for (const ns of namespaces.slice(1)) {
+    await expect(
+      readSessionAnalysisCache(
+        { ...f.deps, publication: async () => ns.claim },
+        f.claim.identity,
+      ),
+    ).rejects.toMatchObject({ reason: "analysis_publication" });
+  }
+  expect(
+    ((await (await fetch(base() + "/stats")).json()) as any).requests,
+  ).toBe(0);
+});
