@@ -142,6 +142,11 @@ beforeAll(async () => {
   await db.exec(
     readFileSync(
       supabaseFile("bootstrap/session_directory_search_worker.sql"),
+      "utf8",
+    ),
+  );
+  await db.exec(
+    readFileSync(
       supabaseFile("bootstrap/session_token_verifier.sql"),
       "utf8",
     ),
