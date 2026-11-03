@@ -2592,4 +2592,16 @@ describe("session token verifier phase 2", () => {
     const error = await failure(runMigrations(client(db), { profile: LOCAL }));
     expect(error).not.toBeNull();
   });
+
+  test("the live gate and the migrator see the same verifier set: table-grant drift closes schemaVerdict", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const expected = await expectedSchema();
+    expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: true });
+    await db.exec(
+      "GRANT SELECT ON sessions.auth_sessions TO session_token_verifier",
+    );
+    const closed = await schemaVerdict(expected, transact(db));
+    expect(closed.ok).toBe(false);
+  });
 });
