@@ -67,10 +67,10 @@ const url = (user: string, db: string) =>
 const BOOT = join(
   ROOT,
   "supabase/bootstrap/session_directory_search_worker.sql",
+);
 const TOKEN_VERIFIER_BOOT = join(
   ROOT,
   "supabase/bootstrap/session_token_verifier.sql",
-);
 );
 const RUNTIME_BOOT = join(ROOT, "supabase/bootstrap/hoopdb_runtime_role.sql");
 const SUPABASE_RUNTIME_BOOT = join(
