@@ -2604,4 +2604,30 @@ describe("session token verifier phase 2", () => {
     const closed = await schemaVerdict(expected, transact(db));
     expect(closed.ok).toBe(false);
   });
+
+  test("PG17+: a direct or PUBLIC MAINTAIN grant is effective drift, caught by phase 2", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const v = Number(
+      (await db.query<{ v: string }>("SELECT current_setting('server_version_num') AS v")).rows[0].v,
+    );
+    if (v < 170000) return; // MAINTAIN does not exist before PG17
+    const verify = () => db.exec(readFileSync(join(root, VERIFY), "utf8"));
+    // Direct grant to the role: fails closed.
+    await db.exec(
+      "GRANT MAINTAIN ON sessions.auth_sessions TO session_token_verifier",
+    );
+    await expect(verify()).rejects.toThrow(
+      /session token verifier is not in the approved shape/,
+    );
+    await db.exec(
+      "REVOKE MAINTAIN ON sessions.auth_sessions FROM session_token_verifier",
+    );
+    await verify(); // clean again
+    // The same grant via PUBLIC is effective drift too.
+    await db.exec("GRANT MAINTAIN ON sessions.auth_sessions TO PUBLIC");
+    await expect(verify()).rejects.toThrow(
+      /session token verifier is not in the approved shape/,
+    );
+  });
 });

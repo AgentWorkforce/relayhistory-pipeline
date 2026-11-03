@@ -13,6 +13,11 @@ DECLARE
   v_row record;
   v_fn oid := 'sessions.auth_session_verify(text,timestamptz)'::regprocedure;
   v_version int := current_setting('server_version_num')::int;
+  -- PG17 adds MAINTAIN (VACUUM/ANALYZE/REINDEX/REFRESH/CLUSTER/LOCK); it does
+  -- not exist before 17, so the effective privilege list is version-guarded.
+  v_table_privs text := 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'
+                        || CASE WHEN current_setting('server_version_num')::int >= 170000
+                                THEN ', MAINTAIN' ELSE '' END;
 BEGIN
   SELECT * INTO v_role FROM pg_roles WHERE rolname = 'session_token_verifier';
   IF NOT FOUND THEN
@@ -58,7 +63,7 @@ BEGIN
     SELECT c.oid::regclass::text AS rel
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = 'sessions' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
-       AND (has_table_privilege(v_role.oid, c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+       AND (has_table_privilege(v_role.oid, c.oid, v_table_privs)
             OR has_any_column_privilege(v_role.oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES'))
   LOOP
     v_problems := array_append(v_problems, (format('privilege on %s', v_row.rel))::text);
