@@ -26,6 +26,7 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.forget_pointer_derivatives()": ["<owner>:EXECUTE"],
     "sessions.ingest_acquire_slot(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

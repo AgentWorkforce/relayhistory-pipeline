@@ -359,6 +359,7 @@ names every step, and that each sentinel is false before its step and true after
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
 | `96bulls:0004_summary_pointers.sql`                            | DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)                                          |
+| `96bulls:0005_derived_pointer_erasure.sql`                     | trigger function sessions.forget_pointer_derivatives                                                                    |
 
 For each ALTER or replacement step (`20261025000300`, `20261030000000`,
 `20261102010000`, `20261102020000`, `0003`, `0004`),

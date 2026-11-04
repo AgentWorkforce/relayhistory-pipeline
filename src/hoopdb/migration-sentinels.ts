@@ -138,6 +138,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
       "DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)",
     sql: column("sessions.session_summaries", "object_key"),
   },
+  "96bulls:0005_derived_pointer_erasure.sql": {
+    evidence: "trigger function sessions.forget_pointer_derivatives",
+    sql: fn("sessions", "forget_pointer_derivatives"),
+  },
 };
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */
