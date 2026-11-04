@@ -16,6 +16,9 @@ import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.t
 import {
   chunkKeys,
   parseSessionKey,
+  isManifestRest,
+  isPublicationManifestRest,
+  parseUploadGenerationPrefix,
   type ManifestV1,
   type ObjectStore,
 } from "../../packages/object-store/src/index.ts";
@@ -288,7 +291,9 @@ export async function readCanonicalScope(
     const s = manifest.session;
     const at = parseSessionKey(key);
     if (
-      !at ||
+      !at || !isManifestRest(at.rest) ||
+      ((parseUploadGenerationPrefix(at.prefix)?.base ?? at.prefix ?? "") !== prefix) ||
+      (isPublicationManifestRest(at.rest) && !parseUploadGenerationPrefix(at.prefix)) ||
       s.workspace_id !== scope.workspaceId ||
       s.harness !== scope.harness ||
       s.session_id !== at.sessionId ||
@@ -357,7 +362,7 @@ export async function readCanonicalScope(
       const records = await readManifestRecords(
         manifest,
         deps.store,
-        prefix,
+        parseSessionKey(manifestKeysByBody.get(manifest)!)?.prefix ?? prefix,
         decompress,
         limits.maxScopeEvents - parsedRecords,
       );
