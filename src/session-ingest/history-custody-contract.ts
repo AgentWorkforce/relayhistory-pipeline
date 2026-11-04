@@ -1,4 +1,4 @@
-// GENERATED from AgentWorkforce/relayhistory-cloud packages/relayhistory/src/lib/history-custody-contract.ts @ 89aaf380f8a2b3a26050d352492c6c342fa15484
+// GENERATED from AgentWorkforce/relayhistory-cloud packages/relayhistory/src/lib/history-custody-contract.ts @ 689143c3cd6b75af9954727c6493965f7c24672b
 // SHA256 d1fc98e92a902c711d0000cbed82c8e05d414f7cf9b6ad251bb907f909480049; regenerate: bun scripts/sync-history-source-contract.ts
 /**
  * PRIVATE full-publication source metadata port. No public HTTP route and no

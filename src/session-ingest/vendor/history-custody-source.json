@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "sourceRepo": "AgentWorkforce/relayhistory-cloud",
+  "sourceCommit": "689143c3cd6b75af9954727c6493965f7c24672b",
+  "files": [
+    {
+      "module": "history-custody-contract",
+      "sourcePath": "packages/relayhistory/src/lib/history-custody-contract.ts",
+      "sha256": "d1fc98e92a902c711d0000cbed82c8e05d414f7cf9b6ad251bb907f909480049"
+    },
+    {
+      "module": "history-custody-node",
+      "sourcePath": "packages/relayhistory/src/lib/history-custody-node.ts",
+      "sha256": "4118ec050f3dea0277bf07bde59927cb7b0e55b4cc82a31cd7c1f5ace297a6f7"
+    },
+    {
+      "module": "history-custody-authority-sql",
+      "sourcePath": "packages/relayhistory/src/lib/history-custody-authority-sql.ts",
+      "sha256": "80a41772759c5c72521039215550a2dac394fc3b918bdae97b8382abf841bf62"
+    },
+    {
+      "module": "delivery-source-authority-sql",
+      "sourcePath": "packages/relayhistory/src/lib/delivery-source-authority-sql.ts",
+      "sha256": "83b28761d8b6236f6a92206360de94b7f075baa3cda793f72ed3e4c766045b7e"
+    },
+    {
+      "module": "delivery-source-role-facts",
+      "sourcePath": "packages/relayhistory/src/lib/delivery-source-role-facts.ts",
+      "sha256": "fbf405fb40781cf61c11e15364de2cbfa222d4df3e2b31e465141ba13b6ab912"
+    }
+  ]
+}
