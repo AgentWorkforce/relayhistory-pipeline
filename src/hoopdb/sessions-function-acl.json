@@ -32,6 +32,9 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_apply_ordered_control(jsonb,text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_apply_reset(text,text,text,text)": [
       "<owner>:EXECUTE"
     ],

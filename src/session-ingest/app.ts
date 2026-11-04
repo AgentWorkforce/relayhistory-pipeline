@@ -1,3 +1,4 @@
+import {orderedControl,orderedControlResult,type OrderedControl} from "./control-protocol.ts";
 /**
  * The 96Bulls session ingest: relayhistory's delivery write contract
  * (relayhistory-cloud packages/relayhistory/src/routes/delivery.ts), served
@@ -34,6 +35,8 @@ import { deliverBatch, IngestUnavailable, type DeliverDeps } from "./deliver.ts"
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES } from "./vendor/delivery/delivery-contracts.ts";
 import { parseDeliveryRequest, requireDeliveryAccount } from "./vendor/delivery/prepare.ts";
 
+export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl};
+
 export const SYNC_SCOPE = "rth:sync";
 export type ContentEncoding = "zstd" | "gzip";
 
@@ -60,7 +63,7 @@ export function signRequest(key: string, t: number, method: string, path: string
 
 /** The identity relayhistory verified and signed (`signRequest`). Refuses an unsigned, stale or altered request. */
 export function signedBindingIdentity(key: string | undefined, nowSeconds: () => number = () => Math.floor(Date.now() / 1000)) {
-  return (request: Request, body: Uint8Array): VerifiedIdentity => {
+  return (request: Request, body: Uint8Array): IngestIdentity => {
     if (!key) throw new AuthError(401, "not_configured", "the session ingest has no signing key");
     const identity = request.headers.get(IDENTITY_HEADER) ?? "";
     const m = /^t=(\d{1,12}),v1=([0-9a-f]{64})$/.exec(request.headers.get(SIGNATURE_HEADER) ?? "");
@@ -75,35 +78,37 @@ export function signedBindingIdentity(key: string | undefined, nowSeconds: () =>
 }
 
 /** The identity relayhistory verified, as it sends it: base64url JSON { userId, orgId, workspaceId, scopes }. */
-export function bindingIdentity(request: Request): VerifiedIdentity {
+export function bindingIdentity(request: Request): IngestIdentity {
   const raw = request.headers.get(IDENTITY_HEADER);
   if (!raw) throw new AuthError(401, "missing_authorization", "missing Authorization header");
-  let v: Partial<VerifiedIdentity> | null = null;
+  let v: Partial<IngestIdentity> | null = null;
   try {
-    v = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as Partial<VerifiedIdentity>;
+    v = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as Partial<IngestIdentity>;
   } catch {
     // fall through
   }
   const id = (x: unknown) => typeof x === "string" && x.length > 0 && x.length <= 512;
   if (!v || !id(v.userId) || !id(v.orgId) || typeof v.workspaceId !== "string" || !Array.isArray(v.scopes) || !v.scopes.every((s) => typeof s === "string"))
     throw new AuthError(401, "invalid_token", "invalid or expired token");
-  return { userId: v.userId!, orgId: v.orgId!, workspaceId: v.workspaceId, scopes: v.scopes };
+  let control:OrderedControl|undefined;
+  if("control" in v){try{control=orderedControl(v.control)}catch{throw new AuthError(401,"invalid_token","invalid or expired token")}}
+  return { userId: v.userId!, orgId: v.orgId!, workspaceId: v.workspaceId, scopes: v.scopes,...(control?{control}:{}) };
 }
 
-export function encodeIdentity(identity: VerifiedIdentity): string {
+export function encodeIdentity(identity: IngestIdentity): string {
   return Buffer.from(JSON.stringify(identity), "utf8").toString("base64url");
 }
 
 export interface IngestAppDeps {
   /** Default: `signedBindingIdentity(signingKey)`. */
-  identify?: (request: Request, body: Uint8Array) => VerifiedIdentity | Promise<VerifiedIdentity>;
+  identify?: (request: Request, body: Uint8Array) => IngestIdentity | Promise<IngestIdentity>;
   /** The shared HMAC key (Secrets Store). Unset with no `identify`: every request is 401 not_configured. */
   signingKey?: string;
   deliver: DeliverDeps;
   log?: (fields: Record<string, unknown>) => void;
 }
 
-type Env = { Variables: { correlationId: string; identity: VerifiedIdentity; body: Uint8Array } };
+type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array } };
 
 /** Node 24 always has zstd; published most preferred first, as relayhistory. */
 export function contentEncodings(): ContentEncoding[] {
@@ -310,14 +315,20 @@ export function createIngestApp(deps: IngestAppDeps) {
     try {
       const input = parseSelection(await jsonOf(c));
       await requireDeliveryAccount(identity, input.account_id);
-      await deps.deliver.ledger.setSessionUploads({
+      const selection={
         tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId },
         originId: input.origin_id,
-        sessions: input.sessions.map((x) => [x.source, x.session_id]),
+        sessions: input.sessions.map((x):[string,string] => [x.source, x.session_id]),
         enabled: input.enabled,
-      });
-      emit({ route: "delivery.sessions.selection", outcome: input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
-      return c.json({ updated: true });
+      };
+      let controlAck;
+      if(identity.control){
+        if(identity.control.kind!=="selection"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
+        const result=await deps.deliver.ledger.applyOrderedControl({...selection,control:{...identity.control,kind:"selection"}});
+        controlAck=orderedControlResult(result,identity.control).control;
+      }else await deps.deliver.ledger.setSessionUploads(selection);
+      emit({ route: "delivery.sessions.selection", outcome: controlAck?"control_"+controlAck.outcome:input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
+      return c.json({ updated: true,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
       emit({ route: "delivery.sessions.selection", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
       return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
@@ -328,12 +339,15 @@ export function createIngestApp(deps: IngestAppDeps) {
     try {
       const input = parseReset(await jsonOf(c));
       await requireDeliveryAccount(identity, input.account_id);
-      const deleted = await deps.deliver.ledger.resetUploadedSessions(
-        { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId },
-        input.request_id,
-      );
-      emit({ route: "delivery.sessions.reset", outcome: "reset", org_id: identity.orgId, deleted });
-      return c.json({ reset: true, deleted });
+      const tenant={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
+      let deleted:number,controlAck;
+      if(identity.control){
+        if(identity.control.kind!=="reset"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
+        const result=orderedControlResult(await deps.deliver.ledger.applyOrderedControl({tenant,requestId:input.request_id,control:{...identity.control,kind:"reset"}}),identity.control);
+        deleted=result.deleted!;controlAck=result.control;
+      }else deleted=await deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id);
+      emit({ route: "delivery.sessions.reset", outcome: controlAck?"control_"+controlAck.outcome:"reset", org_id: identity.orgId, deleted });
+      return c.json({ reset: true, deleted,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
       emit({ route: "delivery.sessions.reset", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
       return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));

@@ -35,3 +35,5 @@ Erasure uses a verified persistent redaction barrier and permanent removal of al
 Root's reviewed routing rollback stops new acceptance/publication while preserving acknowledged durable bytes, outbox entries, replay bounds, ownership epochs and cleanup tickets. Do not drop tables, clear ledgers, lower revisions or restore stale fence snapshots. Defaultoff is required for unfinished background processors. Any unexplained receipt/storage mismatch, cross-tenant result, lost generation fence, failed cleanup recovery or log leak holds publication/ramp until independently resolved.
 
 The existing bootstrap/operator files remain source authorities: supabase/bootstrap/session_ingest_roles.sql, session_ingest_role.sql, session_ingest_role_verify.sql and the pure session_ingest_verify.sql. They do not authorize execution merely by existing in the tree.
+
+040520 requires owner-bound admission.control_epoch and the real Neon0077 ordered control journal. See docs/ordered-ingest-controls.md; unversioned selected buffered controls refuse. Public bodies are unchanged; control metadata comes only from the verified signed identity.

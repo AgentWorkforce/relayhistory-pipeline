@@ -1,3 +1,4 @@
+import {orderedFixtureLedger} from "./ordered-support.ts";
 import { afterEach, expect, test, setDefaultTimeout } from "bun:test";
 import { readFileSync,readdirSync,mkdtempSync,rmSync } from "node:fs";
 import { join } from "node:path";
@@ -198,8 +199,8 @@ test("trusted buffered receipt leaves historical proof open, but explicit canoni
 });
 for(const action of ["disable","reset"] as const)test("buffered receipt cannot exempt "+action+" from baseline closure",async()=>{
  const f=await fixture(),p=await f.prepared();await bufferReceipt(f);
- await f.db.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until) VALUES($1,repeat('a',64),repeat('b',64),$2,clock_timestamp()+interval '1 hour')",[TENANT.orgId,gen]);
- const ledger=sqlLedger(f.ingest.query as never,{acceptanceMode:"buffered",expectedGeneration:gen});
+ await f.db.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch) VALUES($1,repeat('a',64),repeat('b',64),$2,clock_timestamp()+interval '1 hour',repeat('3',64))",[TENANT.orgId,gen]);
+ const ledger=orderedFixtureLedger(sqlLedger(f.ingest.query as never,{acceptanceMode:"buffered",expectedGeneration:gen}),f.db as never);
  if(action==="disable")await ledger.setSessionUploads({tenant:TENANT,originId:"origin-1",sessions:[["claude","sess-1"]],enabled:false});
  else await ledger.resetUploadedSessions(TENANT,"buffer-reset");
  await expect(f.rpc("ingest_seed_proven_records",p.payload)).rejects.toMatchObject({code:"40001"});

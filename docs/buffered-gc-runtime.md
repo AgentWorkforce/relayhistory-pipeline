@@ -52,7 +52,7 @@ ACK; acknowledged receipts remain metadata inputs for qualified drain.
 
 Org admission has exactly these owner-only fields:
 org_id, privacy_baseline_sha256, retention_contract_sha256, schema_generation,
-valid_until. There is no mode column. The ceremony must prove every frozen-Neon
+valid_until;040520 adds owner-bound control_epoch. There is no mode column. The ceremony must prove every frozen-Neon
 owner packet, seeder ACK, matching compiled PASS and permanent retention evidence.
 Hashes alone do not establish completeness. Close by retained-row UPDATE setting
 valid_until in the past, never DELETE. Close waits producer/control SHARE locks;
@@ -108,8 +108,10 @@ or erasure evidence. Never disable GC as the first rollback step.
 
 ## Existing production policy prerequisites verified read-only
 
-The reviewed template fixes RoleName to96bulls-sessions-prod-buffered-gc so exact resource-policy changes can be reviewed before creation. This requires CAPABILITY_NAMED_IAM; the role was absent at the read-only check. Actual bucket versioning is enabled and BucketKeyEnabled=false. The existing bucket policy explicitly denies version deletion to every principal except the old eraser user; the CMK root-administration statement does not delegate data cryptography to arbitrary identity policies. Therefore this new role additionally needs a reviewed buffered-prefix-only bucket exception and an exact-role CMK Decrypt/GenerateDataKey statement. Identity policy alone cannot provide access. No policy was applied.
+The reviewed template fixes RoleName to `96bulls-sessions-prod-buffered-gc` so exact resource-policy changes can be reviewed before creation. This requires CAPABILITY_NAMED_IAM; the role was absent at the read-only check. Actual bucket versioning is enabled and BucketKeyEnabled=false. The existing bucket policy explicitly denies version deletion to every principal except the old eraser user; the CMK root-administration statement does not delegate data cryptography to arbitrary identity policies. Therefore this new role additionally needs a reviewed buffered-prefix-only bucket exception and an exact-role CMK Decrypt/GenerateDataKey statement. Identity policy alone cannot provide access. No policy was applied.
 
 The operator proposal preserves existing principals/statements, denies this GC role any deletion outside buffered storage and all plain DeleteObject, and grants data cryptography only via S3/account/object-prefix context. Re-read and compare exact semantic preimage hashes before applying; stop on drift. Create the default-off role first; do not enable/admit while policies or transport proof are missing. AWS Access Analyzer returned no findings for both actual preimages and proposed policies; CloudFormation validate-template accepted the named-role template. These checks do not establish effective live permission.
 
-The existing transcript-store K-45 objective is immediate logical deletion and physical purge within48hours; it does not impose a waiting canary. The owned capacity case now creates20 acknowledged batches with500 records/groups each through the actual producer, then checks the default claim scans all20 inside its1.8second metadata budget. Root measured305ms on owned PostgreSQL17/Node24/MinIO (106S3requests across14groups,~299MiB peakRSS). This does not prove production latency, sustained arrival capacity or the physical purge objective. Review actual backlog/throughput and retain active GC while admission closes.
+The existing transcript-store K-45 objective is immediate logical deletion and physical purge within 48 hours; it does not impose a waiting canary. The owned capacity case now creates 20 acknowledged batches with 500 records/groups each through the actual producer, then checks the default claim scans all 20 inside its 1.8 second metadata budget. Root measured 305 ms on owned PostgreSQL17/Node24/MinIO (106 S3 requests across 14 groups, about 299 MiB peak RSS). This does not prove production latency, sustained arrival capacity or the physical purge objective. Review actual backlog/throughput and retain active GC while admission closes.
+
+Ordered dual-control epoch/version/digest contract: [ordered-ingest-controls.md](ordered-ingest-controls.md).

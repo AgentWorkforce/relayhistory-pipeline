@@ -37,7 +37,11 @@
     "scripts/proof-ingest-s3-seed.ts",
     "scripts/sync-ingest-seed-boundary.ts",
     "scripts/schema-release-*.ts",
-    "scripts/proof-buffered-gc-runtime.ts"
+    "scripts/proof-buffered-gc-runtime.ts",
+    "scripts/proof-ordered-controls.ts",
+    "scripts/sync-ingest-control-boundary.ts",
+    "scripts/build-ordered-router-fixture.ts",
+    "scripts/generate-ordered-control-neon-fixture.ts"
   ],
   "exclude": [
     "node_modules",
