@@ -6,12 +6,12 @@ import type {SqlExecutor} from "@rhc/lib/pipeline/queue.ts";
 import type {Transact} from "./db.ts";
 import type {ManifestV1} from "../../packages/object-store/src/index.ts";
 export interface PublicationEvidence {
- orgId:string;workspaceId:string;harness:string;sessionId:string;machineId:string;manifestKey:string;revision:string;
+ orgId:string;workspaceId:string;harness:string;sessionId:string;machineId:string;manifestKey:string;revision:string;schemaGeneration:string;
 }
 export interface PublicationAuthority {managed:boolean;current:boolean;generation:string|null;revision:string}
-export function publicationEvidence(orgId:string,manifestKey:string,manifest:ManifestV1):PublicationEvidence{
+export function publicationEvidence(orgId:string,manifestKey:string,manifest:ManifestV1,schemaGeneration:string):PublicationEvidence{
  const s=manifest.session;
- return {orgId,workspaceId:s.workspace_id,harness:s.harness,sessionId:s.session_id,machineId:s.machine_id,manifestKey,revision:String(manifest.revision)};
+ return {orgId,workspaceId:s.workspace_id,harness:s.harness,sessionId:s.session_id,machineId:s.machine_id,manifestKey,revision:String(manifest.revision),schemaGeneration};
 }
 async function authority(db:SqlExecutor,fn:"probe"|"lock",evidence:PublicationEvidence):Promise<PublicationAuthority>{
  const r=await db.query<{result:unknown}>("SELECT sessions.session_publication_"+fn+"($1::jsonb) AS result",[JSON.stringify(evidence)]);

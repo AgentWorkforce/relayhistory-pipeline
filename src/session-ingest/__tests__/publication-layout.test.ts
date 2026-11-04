@@ -2,7 +2,7 @@
 import {describe,test,expect} from "bun:test";
 import {readFileSync} from "node:fs";
 import {join} from "node:path";
-import {parseManifest,chunkKeys,manifestKey,parseSessionKey,publicationManifestKey,uploadGenerationPrefix,parseUploadGenerationPrefix,isManifestRest,isPublicationManifestRest} from "../../../packages/object-store/src/index.ts";
+import {parseManifest,chunkKeys,manifestKey,parseSessionKey,publicationManifestKey,uploadGenerationPrefix,parseUploadGenerationPrefix,isManifestRest,isPublicationManifestRest,publicationDerivedKey} from "../../../packages/object-store/src/index.ts";
 import {prefixAllowed,prefixOrgResolver,buildObjectLandedMessage} from "../../../packages/pipeline/src/lib/pipeline/adapter.ts";
 const generation="12345678-1234-1234-1234-123456789abc",publication="abcdefab-1234-1234-1234-123456789abc";
 const fixture=JSON.parse(readFileSync(join(import.meta.dir,"../../../packages/object-store/test/fixtures/rust-manifest-v1-scrubbed.json"),"utf8")).manifest;
@@ -14,6 +14,8 @@ describe("immutable upload publication layout",()=>{
   const key=publicationManifestKey(at,publication);
   const image=await parseManifest(fixture,key);
   expect(image.raw.epoch).toBe(legacy.raw.epoch);
+  expect(String(publicationDerivedKey(String(key),"a".repeat(64),"summary-short"))).toContain("/publications/"+publication+"/derived/summary-short/");
+  expect(()=>publicationDerivedKey(String(key),"a".repeat(64),"../escape")).toThrow();
   expect(parseSessionKey(key)?.rest).toBe("publications/"+publication+"/manifest.json");
   const raw=chunkKeys(image,{prefix:at.prefix});
   expect(raw.length).toBeGreaterThan(0);

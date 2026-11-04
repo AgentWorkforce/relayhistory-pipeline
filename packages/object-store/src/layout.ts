@@ -43,6 +43,15 @@ export function publicationManifestKey(loc: SessionLocation, publication: string
     throw new ObjectStoreError("invalid_argument", "layout", "invalid upload publication");
   return joinKey(sessionPrefix(loc), "publications/" + publication + "/" + MANIFEST_FILE);
 }
+/** Managed derived outputs are immutable, registered by exact hash before PUT. */
+export function publicationDerivedKey(manifest: string, sha256: string, family: string): ObjectKey {
+  const at = parseSessionKey(manifest);
+  if (!at || !parseUploadGenerationPrefix(at.prefix) || !isPublicationManifestRest(at.rest) ||
+      !/^[a-f0-9]{64}$/.test(sha256) || !/^[a-z][a-z0-9-]{0,63}$/.test(family))
+    throw new ObjectStoreError("invalid_argument", "layout", "invalid publication derived key");
+  return objectKey(manifest.slice(0,-MANIFEST_FILE.length) + "derived/" + family + "/" + sha256 + ".bin");
+}
+
 
 
 export const RAW_FORMATS = ["jsonl", "ndjson", "sqlite-rows"] as const;

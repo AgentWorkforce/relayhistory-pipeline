@@ -34,6 +34,7 @@ export {
   uploadGenerationPrefix,
   parseUploadGenerationPrefix,
   publicationManifestKey,
+  publicationDerivedKey,
   RAW_FORMATS,
   machinePrefix,
   manifestKey,
