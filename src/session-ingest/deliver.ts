@@ -43,10 +43,12 @@ import {
 import { prepareDelivery, type PreparedDelivery } from "./vendor/delivery/prepare.ts";
 import { batchMarkerKey, replicaMessage, sendReplica, stagedReplicaMessage, type ReplicaOutcome, type ReplicaSink } from "./replica.ts";
 import { IngestWriteError, assertTenantSegment, groupRecords, liveMachineId, writeBatchObjects, type WriteResult, type WriteTarget } from "./writer.ts";
-import { fanoutMessages, stageGroups, type FanoutMessage } from "./staging.ts";
+import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
+import { prepareBufferedStage, putBufferedStage, fanoutMessages, stageGroups, type FanoutMessage } from "./staging.ts";
 
 export interface DeliverDeps {
   ledger: Ledger;
+  acceptanceMode?: IngestAcceptanceMode;
   target: WriteTarget;
   replica?: ReplicaSink;
   now?: () => Date;
@@ -64,7 +66,7 @@ export interface DeliverDeps {
   fanout?: (messages: FanoutMessage[]) => Promise<void>;
 }
 
-export type DeliverOutcome = "accepted" | "accepted_staged" | "replay" | "replay_fast" | "accepted_all_deleted";
+export type DeliverOutcome = "accepted" | "accepted_buffered" | "accepted_staged" | "replay" | "replay_fast" | "accepted_all_deleted";
 
 export interface DeliverResult {
   receipt: DeliveryReceipt;
@@ -208,6 +210,21 @@ async function writeAndCommit(
   let replicaOutcome: ReplicaOutcome = "off";
   const receivedAt = now();
   const grouped = keep.length > 0 ? groupRecords(keep.map((i) => prepared.records[i]!), receivedAt) : null;
+  if (deps.acceptanceMode === "buffered") {
+    if (!grouped || !deps.ledger.prepareBufferStage || !deps.ledger.commitBuffered || deps.replica?.mode && deps.replica.mode !== "off")
+      throw new IngestUnavailable("buffer", "buffer_not_configured");
+    const attempt = {tenant, originId:prepared.originId, batchId:prepared.batchId, batchDigest:prepared.batchDigest, claimToken};
+    const preparedStage = await stage("buffer_prepare", async () => prepareBufferedStage(deps.target.keyRoot,
+      {claim_token:claimToken,batch_digest:prepared.batchDigest,received_at:receivedAt.toISOString(),org_id:tenant.orgId,workspace_id:tenant.workspaceId,origin_id:prepared.originId,user_id:tenant.userId},
+      grouped.groups, grouped.index.map(indexes => indexes.map(i => keep[i]!))));
+    const intent = await stage("buffer_intent", () => deps.ledger.prepareBufferStage!({...attempt,...preparedStage.spec}));
+    mark("buffer_intent");
+    await stage("buffer_put", () => putBufferedStage(deps.target.store,preparedStage));
+    mark("buffer_put");
+    await stage("buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}));
+    mark("buffer_receipt");
+    return {receipt:withLimits(prepared),outcome:"accepted_buffered",stats:{...base,deleted_sessions:deleted.size,timing_ms:timing}};
+  }
   if (grouped && deps.inlineMaxSessions !== undefined && grouped.groups.length > deps.inlineMaxSessions) {
     // Too wide for this invocation: one staged object now, the sessions from the queue.
     if (!deps.fanout) throw new IngestUnavailable("staging", "fanout_not_configured");

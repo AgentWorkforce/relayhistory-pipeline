@@ -229,6 +229,24 @@
     "sessions.upsert_session_index(jsonb)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.ingest_claim_buffered_batch(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_prepare_buffer_stage(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_commit_buffered_batch(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_claim_batch_mode(jsonb,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_require_buffer_admission(text)": [
+      "<owner>:EXECUTE"
     ]
   }
 }

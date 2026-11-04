@@ -261,7 +261,7 @@ export async function putBufferedStage(store: ObjectStore, prepared: PreparedBuf
   const { body, spec } = prepared;
   if (body.byteLength !== spec.bytes || byteSha(body) !== spec.sha256) throw new Error("buffered_proof_invalid");
   try {
-    await store.put(objectKey(spec.key), body, { ifNoneMatch: true, contentType: "application/zstd" });
+    await store.put(objectKey(spec.key), body, { ifNoneMatch: true, contentSha256: spec.sha256, contentType: "application/zstd" });
   } catch (error) {
     if (!isObjectStoreError(error, "already_exists") && !isObjectStoreError(error, "precondition_failed")) throw error;
     await readBufferedBytes(store, spec);
