@@ -10,9 +10,13 @@ const root = resolve(args[at + 1]),
   path = "packages/relayhistory/src/lib/search-feature-journal.ts";
 const text = await readFile(join(root, path), "utf8"),
   sha = createHash("sha256").update(text).digest("hex");
-const commit = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
-  encoding: "utf8",
-}).trim();
+const commit = execFileSync(
+  "git",
+  ["-C", root, "log", "-1", "--format=%H", "--", path],
+  {
+    encoding: "utf8",
+  },
+).trim();
 if (
   execFileSync("git", ["-C", root, "status", "--porcelain", "--", path], {
     encoding: "utf8",

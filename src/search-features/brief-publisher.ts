@@ -101,12 +101,13 @@ export function briefFeatureRow(
   }
   if (
     !Array.isArray(vector) ||
-    (vector.length !== 1536 && !(p.embedding === null && vector.length === 0)) ||
+    (vector.length !== 1536 &&
+      !(p.embedding === null && vector.length === 0)) ||
     vector.some(
       (v) =>
         typeof v !== "number" ||
         !Number.isFinite(v) ||
-        Math.abs(v) > 3.4028234663852886e38,
+        !Number.isFinite(Math.fround(v)),
     )
   )
     return fail("vector_invalid");

@@ -181,4 +181,27 @@ test("duplicate keys, oversize batch and pre-aborted work produce no CH writes",
   expect(d.writes).toHaveLength(0);
 });
 
-test('cleared/missing vector preserves live legacy keyword text and a null model',()=>{const s=fixture();s.row!.embedding=null;s.row!.embedding_model=null;const r=briefFeatureRow(s);expect(r).toMatchObject({deleted:0,title:'İΣ title',embedding:[],embedding_model:null,embedding_dim:0})});
+test("cleared/missing vector preserves live legacy keyword text and a null model", () => {
+  const s = fixture();
+  s.row!.embedding = null;
+  s.row!.embedding_model = null;
+  const r = briefFeatureRow(s);
+  expect(r).toMatchObject({
+    deleted: 0,
+    title: "İΣ title",
+    embedding: [],
+    embedding_model: null,
+    embedding_dim: 0,
+  });
+});
+
+test("pgvector maximum finite Float32 text is admitted while true overflow is refused", () => {
+  const s = fixture();
+  const v = Array(1536).fill(0);
+  v[0] = 3.4028235e38;
+  s.row!.embedding = JSON.stringify(v);
+  expect((briefFeatureRow(s).embedding as number[])[0]).toBe(v[0]);
+  v[0] = 3.5e38;
+  s.row!.embedding = JSON.stringify(v);
+  expect(() => briefFeatureRow(s)).toThrow();
+});
