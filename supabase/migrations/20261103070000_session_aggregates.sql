@@ -75,36 +75,72 @@ BEGIN
       MESSAGE = 'session output: no ready aggregate publication for this workspace';
   END IF;
   RETURN QUERY
-    -- Only the current ready publication counts; staged/superseded rows are
-    -- invisible to the read (the EXISTS gate above is existence, not scoping).
+    -- Oracle-exact over the compact publication: explicit links/outcomes pool
+    -- all-history; tool-derived candidates are the publisher's windowed set
+    -- (fold supplies every tool_commit row it derived; the read re-applies the
+    -- window so published rows outside it never count). Short-sha prefixes
+    -- canonicalize against the same-window unique 40-char set.
     WITH scoped AS MATERIALIZED (
       SELECT c.* FROM sessions.session_aggregate_candidates c
       JOIN sessions.session_aggregate_publications p ON p.id = c.publication_id
       WHERE p.org_id = v_org AND p.workspace_id = p_workspace_id
         AND p.ready AND p.superseded_by IS NULL
-        AND c.ts >= p_since AND c.ts <= p_until
+    ), msg AS (
+      SELECT DISTINCT source, session_id, dedup_key FROM scoped
+      WHERE candidate_type = 'assistant_message' AND ts >= p_since AND ts <= p_until
+    ), legacy AS (
+      SELECT c.dedup_key FROM scoped c
+      WHERE c.candidate_type = 'legacy_turn' AND c.ts >= p_since AND c.ts <= p_until
+        AND NOT EXISTS (SELECT 1 FROM msg m WHERE m.source = c.source AND m.session_id = c.session_id)
+    ), commit_candidates AS (
+      SELECT dedup_key AS sha, ts, stats FROM scoped WHERE candidate_type = 'explicit_commit'
+      UNION ALL
+      SELECT dedup_key, ts, stats FROM scoped
+      WHERE candidate_type = 'tool_commit' AND ts >= p_since AND ts <= p_until
+    ), commit_hashes AS MATERIALIZED (
+      SELECT DISTINCT sha FROM commit_candidates
+    ), short_lengths AS (
+      SELECT DISTINCT length(sha) AS size FROM commit_hashes WHERE length(sha) BETWEEN 1 AND 39
+    ), unique_prefixes AS MATERIALIZED (
+      SELECT left(full_id.sha, short.size) AS prefix, min(full_id.sha) AS sha
+      FROM commit_hashes full_id CROSS JOIN short_lengths short
+      WHERE length(full_id.sha) = 40
+      GROUP BY left(full_id.sha, short.size) HAVING count(*) = 1
+    ), canonical_commits AS (
+      SELECT COALESCE(prefix.sha, c.sha) AS sha, c.ts, c.stats
+      FROM commit_candidates c LEFT JOIN unique_prefixes prefix ON prefix.prefix = c.sha
+    ), stat_entries AS (
+      SELECT sha, ts, CASE
+        WHEN jsonb_typeof(stats) = 'array' THEN stats
+        WHEN jsonb_typeof(stats) = 'object' AND EXISTS (
+          SELECT 1 FROM jsonb_each(stats) field
+          WHERE field.key IN ('added', 'deleted', 'removed', 'additions', 'deletions')
+            AND jsonb_typeof(field.value) NOT IN ('object', 'array')
+        ) THEN jsonb_build_array(stats)
+        WHEN jsonb_typeof(stats) = 'object' THEN (SELECT jsonb_agg(value) FROM jsonb_each(stats))
+      END AS entries
+      FROM canonical_commits
+    ), normalized_stats AS (
+      SELECT sha, ts,
+        CASE WHEN entries IS NOT NULL THEN (
+          SELECT CASE WHEN COALESCE(bool_and(COALESCE(COALESCE(value->>'additions', value->>'added') ~ '^[0-9]{1,12}$' OR COALESCE(value->>'additions', value->>'added') = '-' OR (jsonb_typeof(value->'path') = 'string' AND value->'additions' = 'null'::jsonb AND value->'deletions' = 'null'::jsonb), false)), true)
+            THEN COALESCE(sum(CASE WHEN COALESCE(value->>'additions', value->>'added') ~ '^[0-9]{1,12}$' THEN COALESCE(value->>'additions', value->>'added')::bigint ELSE 0 END), 0) END
+          FROM jsonb_array_elements(entries)
+        ) END AS added,
+        CASE WHEN entries IS NOT NULL THEN (
+          SELECT CASE WHEN COALESCE(bool_and(COALESCE(COALESCE(value->>'deletions', value->>'removed', value->>'deleted') ~ '^[0-9]{1,12}$' OR COALESCE(value->>'deletions', value->>'removed', value->>'deleted') = '-' OR (jsonb_typeof(value->'path') = 'string' AND value->'additions' = 'null'::jsonb AND value->'deletions' = 'null'::jsonb), false)), true)
+            THEN COALESCE(sum(CASE WHEN COALESCE(value->>'deletions', value->>'removed', value->>'deleted') ~ '^[0-9]{1,12}$' THEN COALESCE(value->>'deletions', value->>'removed', value->>'deleted')::bigint ELSE 0 END), 0) END
+          FROM jsonb_array_elements(entries)
+        ) END AS removed
+      FROM stat_entries
     ), commits AS (
-      -- One row per sha, explicit links/outcomes preferred over tool-derived;
-      -- earliest ts wins inside a type (the oracle's prefix+min(ts) semantics).
-      SELECT DISTINCT ON (dedup_key) dedup_key, stats
-      FROM scoped WHERE candidate_type IN ('explicit_commit','tool_commit')
-      ORDER BY dedup_key,
-        CASE candidate_type WHEN 'explicit_commit' THEN 0 ELSE 1 END, ts
+      SELECT sha, min(ts) AS ts, max(added) AS added, max(removed) AS removed
+      FROM normalized_stats GROUP BY sha
     )
-    SELECT
-      (count(*) FILTER (WHERE candidate_type = 'assistant_message')
-       -- Legacy turns count only when their session produced no in-window
-       -- assistant message (the oracle's window-scoped suppression — the fold
-       -- itself is all-time, so this cannot live in deriveCandidates).
-       + count(*) FILTER (WHERE candidate_type = 'legacy_turn' AND NOT EXISTS (
-           SELECT 1 FROM scoped m
-            WHERE m.candidate_type = 'assistant_message'
-              AND m.source = scoped.source AND m.session_id = scoped.session_id)))::bigint,
-      (SELECT count(*) FROM commits)::bigint,
-      (SELECT COALESCE(sum((stats->>'added')::bigint), 0) FROM commits WHERE stats ? 'added')::bigint,
-      (SELECT COALESCE(sum((stats->>'removed')::bigint), 0) FROM commits WHERE stats ? 'removed')::bigint,
-      (SELECT count(*) FROM commits WHERE NOT (stats ? 'added' AND stats ? 'removed'))::bigint
-    FROM scoped;
+    SELECT ((SELECT count(*) FROM msg) + (SELECT count(*) FROM legacy))::bigint,
+      count(*)::bigint, COALESCE(sum(added), 0)::bigint, COALESCE(sum(removed), 0)::bigint,
+      count(*) FILTER (WHERE added IS NULL OR removed IS NULL)::bigint
+    FROM commits WHERE ts >= p_since AND ts <= p_until;
 END
 $fn$;
 

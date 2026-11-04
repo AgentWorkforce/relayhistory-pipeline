@@ -19,13 +19,13 @@ export interface FoldEvent {
 export interface LegacyTurn { id: string; orgId: string; workspaceId: string; source: string; sessionId: string; ts: string }
 export interface CommitRecord {
   sha: string; orgId: string; workspaceId: string; source: string; sessionId: string;
-  ts: string; stats?: { added?: number; removed?: number };
+  ts: string; stats?: unknown;
   provenance: string;
 }
 export interface CandidateRow {
   orgId: string; workspaceId: string; source: string; sessionId: string;
   type: CandidateType; dedupKey: string; ts: string;
-  stats?: Record<string, number>; provenance?: Record<string, string>;
+  stats?: unknown; provenance?: Record<string, string>;
 }
 
 const GIT_COMMIT = /\bgit\b[^\n]*\bcommit\b/;
@@ -70,7 +70,7 @@ export function deriveCandidates(
       for (const m of (r.content ?? "").matchAll(RESULT_SHA) as unknown as RegExpExecArray[])
         out.push({ orgId: r.orgId, workspaceId: r.workspaceId, source: r.source, sessionId: r.sessionId,
           type: "tool_commit", dedupKey: m[1]!.toLowerCase(), ts: r.ts,
-          stats: { added: +(m[2] ?? 0), removed: +(m[3] ?? 0) },
+          stats: { added: m[2] ?? "0", deleted: m[3] ?? "0" },
           provenance: { call: callKey ?? "" } });
   }
   return out;
