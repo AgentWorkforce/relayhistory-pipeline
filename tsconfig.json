@@ -45,7 +45,9 @@
     "scripts/proof-receipt-seats.ts",
     "scripts/sync-ingest-seat-boundary.ts",
     "scripts/sync-ingest-custody-boundary.ts",
-    "scripts/sync-ingest-lazy-boundary.ts"
+    "scripts/sync-ingest-lazy-boundary.ts",
+    "scripts/proof-lazy-current-custody.ts",
+    "scripts/build-lazy-custody-source-fixture.ts"
   ],
   "exclude": [
     "node_modules",
