@@ -1,0 +1,133 @@
+name: guarded private session-ingest Worker
+# Manual/main only. This workflow never creates a GitHub environment, Hyperdrive,
+# Secrets Store, credentials, grants, or upstream delivery-forward bindings/flags.
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Capture a reviewed plan, or apply that exact approved capture
+        required: true
+        type: choice
+        options: [capture, deploy]
+      expected_source_sha:
+        description: Exact immutable main SHA (must equal this workflow revision)
+        required: true
+        type: string
+      acknowledge_state_ready:
+        description: Acknowledge a reviewed compatible Alchemy state store already exists
+        required: true
+        default: false
+        type: boolean
+      capture_run_id:
+        description: Deploy only - prior successful capture run at the same main SHA
+        required: false
+        type: string
+      capture_provenance_sha256:
+        description: Deploy only - exact reviewed provenance file SHA256
+        required: false
+        type: string
+      operator_approval_json:
+        description: Deploy only - verbatim dated Khaliq approval with exact capture binding
+        required: false
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: private-session-ingest-production
+  cancel-in-progress: false
+env:
+  INGEST_CI_PHASE: ${{ inputs.phase }}
+  EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+  ACKNOWLEDGE_STATE_READY: ${{ inputs.acknowledge_state_ready }}
+  CAPTURE_RUN_ID: ${{ inputs.capture_run_id }}
+  CAPTURE_PROVENANCE_SHA256: ${{ inputs.capture_provenance_sha256 }}
+  OPERATOR_APPROVAL_JSON: ${{ inputs.operator_approval_json }}
+  SESSION_INGEST_APPROVER_LOGIN: ${{ vars.SESSION_INGEST_APPROVER_LOGIN }}
+jobs:
+  gate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    # Deliberately NO environment here. A missing name must not auto-create an
+    # unprotected environment before its real protection is checked.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install without deployment credentials
+        run: bun install --frozen-lockfile
+      - name: Check exact source and existing human/main environment protections
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/private-ingest-ci.ts gate
+      - name: Typecheck the source and CI adapter
+        run: |
+          bunx tsc --noEmit
+          bunx tsc --noEmit --moduleResolution bundler --module esnext --target es2022 --allowImportingTsExtensions --skipLibCheck scripts/private-ingest-ci.ts
+      - name: Offline private stage, CI contract and ingest controls
+        # A role fixture initializes three PGlites; this is a harness bound,
+        # independent of the request/deadline assertions in the runtime tests.
+        run: bun test ./stacks/cloudflare ./src/session-ingest --timeout 30000
+
+  release:
+    needs: gate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    environment: session-ingest-worker
+    env:
+      SESSION_INGEST_ACCOUNT_ID: ${{ vars.SESSION_INGEST_ACCOUNT_ID }}
+      SESSION_INGEST_HYPERDRIVE_ID: ${{ vars.SESSION_INGEST_HYPERDRIVE_ID }}
+      SESSION_INGEST_SECRETS_STORE_ID: ${{ vars.SESSION_INGEST_SECRETS_STORE_ID }}
+      SESSION_INGEST_KMS_KEY_ARN: ${{ vars.SESSION_INGEST_KMS_KEY_ARN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install without deployment credentials
+        run: bun install --frozen-lockfile
+      - name: Recheck real protection and this run's actual human approval
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/private-ingest-ci.ts approved
+      - name: Download exact reviewed capture
+        if: inputs.phase == 'deploy'
+        uses: actions/download-artifact@v4
+        with:
+          name: session-ingest-capture-${{ github.sha }}-${{ inputs.capture_run_id }}
+          run-id: ${{ inputs.capture_run_id }}
+          github-token: ${{ github.token }}
+          path: .96bulls/ci-capture
+      - name: Guarded capture or deploy through the existing Alchemy stack
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.SESSION_INGEST_ACCOUNT_ID }}
+        run: bun scripts/private-ingest-ci.ts "$INGEST_CI_PHASE"
+      - name: Publish validated credential-free plan capture
+        if: inputs.phase == 'capture'
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-ingest-capture-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            docs/plans/cf-sessions-prod.plan.txt
+            docs/plans/cf-sessions-prod.plan.detailed.txt
+            docs/plans/cf-sessions-prod.inputs.sanitized.json
+            docs/plans/cf-sessions-prod.provenance.json
+          if-no-files-found: error
+          retention-days: 7
