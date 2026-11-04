@@ -5,6 +5,9 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { spawnSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:http";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import pg from "pg";
 import { createS3Store, objectKey, objectStoreManifestReader, readAll, postgresPipelineQueue, type StageMessage, type ManifestV1 } from "../shared/vendor.ts";
@@ -22,6 +25,7 @@ import { indexSearchScope } from "../session-pipeline/search-index.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { schemaStatements } from "../session-pipeline/vendor/search-index/schema.ts";
 import { derivedTick } from "../session-pipeline/derived-tick.ts";
+import { buildDerivedProbeBundle } from "./build-derived-bundle.ts";
 
 const owned = `bob-proof-${process.pid}-${Date.now()}`;
 const containers: string[] = [];
@@ -30,6 +34,7 @@ const logs: string[] = [];
 const checks: string[] = [];
 const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: process.env.HOME, LANG: "C.UTF-8" };
 const adminPools: pg.Pool[] = [];
+const bundleDirectory = await mkdtemp(join(tmpdir(), "bob-packaged-worker-"));
 const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
 function check(name: string) { checks.push(name); console.log(`PASS ${name}`); }
 function docker(args: string[], extraEnv = env) {
@@ -252,23 +257,57 @@ try {
   assert(noTime.gated); assert.equal(noTime.claimed, 0);
   check("finite-duration tick validates live role gate, leaves summaries queued without keys, consumes with keys, and stops before deadline");
 
+  // Actual Alchemy/Rolldown artifact, detached from the source checkout. Its
+  // verifiers and migration generation must work with no SQL assets on disk.
+  const node = process.env.BOB_PROOF_NODE ?? "node";
+  assert(/^v24\./.test(spawnSync(node, ["--version"], { encoding: "utf8" }).stdout ?? ""), "proof_requires_node24");
+  const bundled = await buildDerivedProbeBundle(bundleDirectory);
+  assert.deepEqual(await readdir(bundleDirectory), ["derived-worker.mjs"]);
+  const bundledTick = async () => {
+    const p = spawn(node, [bundled, "--run-owned-fixture"], { cwd: bundleDirectory,
+      env: { ...env, ...workerEnv }, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    p.stdout.on("data", b => output += b.toString());
+    p.stderr.on("data", b => output += b.toString());
+    const code = await new Promise<number | null>((resolve, reject) => { p.on("error", reject); p.on("close", resolve); });
+    assert.equal(code, 0, "packaged_worker_failed");
+    logs.push(output);
+    const result = output.split("\n").find(s => s.startsWith("BUNDLED_DERIVED_RESULT="));
+    assert(result, "packaged_worker_result_missing");
+    return JSON.parse(result.slice("BUNDLED_DERIVED_RESULT=".length)) as { claimed: number; acked: number; gated: boolean };
+  };
+  await owner.query("DELETE FROM sessions.session_summaries");
+  await postgresPipelineQueue(db).sendBatch(stages.map(stage => ({ ...wrong, stage,
+    workKey: `bundled-${stage}`, ctx: { ...wrong.ctx, orgId: TENANT.orgId } })));
+  await owner.query("UPDATE sessions.__96bulls_role_validation SET status='pending'");
+  const blockedBundle = await bundledTick();
+  assert(blockedBundle.gated); assert.equal(blockedBundle.claimed, 0);
+  await owner.query("UPDATE sessions.__96bulls_role_validation SET status='pass'");
+  const liveBundle = await bundledTick();
+  assert.equal(liveBundle.acked, 3); assert(!liveBundle.gated);
+  assert.equal((await owner.query("SELECT count(*)::int n FROM sessions.session_summaries WHERE status='ready'")).rows[0].n, 2);
+  check("detached Node24 Alchemy bundle runs real gated queue/summary work without verifier or migration files and refuses a pending role gate");
+
   // A real erasure clears every S3 version under this fixture's session prefix.
   // Fence the SQL row first, matching the required eraser ordering contract.
   await owner.query("UPDATE sessions.session_index SET deleted_at=now()");
+  assert.equal((await owner.query("SELECT count(*)::int n FROM sessions.session_summaries")).rows[0].n, 0);
+  assert.equal((await owner.query("SELECT count(*)::int n FROM sessions.session_verdicts")).rows[0].n, 0);
   const eraser = createS3Eraser({ bucket, endpoint, region: "us-east-1", credentials: { accessKeyId, secretAccessKey } });
   assert((await eraser.erasePrefix(key.replace(/manifest.json$/, ""))) > 0);
   assert.equal((await eraser.listKeys(key.replace(/manifest.json$/, ""))).length, 0);
   assert((await indexSearchScope(scope, searchDeps)).complete);
   assert.equal((await ch.select<{ n: number }>("SELECT count() n FROM transcript_events FINAL"))[0]?.n, 0);
-  check("fenced session erasure removes all raw/manifest/summary S3 versions and derived CH rows");
+  check("fenced session erasure removes summary/verdict SQL metadata, all raw/manifest/summary S3 versions and derived CH rows");
 
   await pause(100);
   assert(logs.every(s => !s.includes(fakeSecret) && !s.includes(marker)));
   check("worker logs contain no planted secret or source marker");
   console.log(JSON.stringify({ proof: "bob-runtime", checks, productionReady: false,
-    blockers: ["canonical_fold_over_64MiB_or_100k_records", "managed_publication_authority_not_composed", "armed_lambda_assets_not_packaged", "bob_output_reader_and_search_projection_missing", "live_runtime_unverified", "full_reset_and_SQL_derived_erasure_not_proved"] }, null, 2));
+    blockers: ["canonical_fold_over_64MiB_or_100k_records", "managed_publication_authority_not_composed", "bob_output_reader_and_search_projection_missing", "live_runtime_unverified", "managed_reset_generation_boundary_not_proved"] }, null, 2));
 } finally {
   for (const p of workers) p.proc.kill("SIGTERM");
   await Promise.all(adminPools.map(p => p.end()));
   for (const name of containers.reverse()) spawnSync("docker", ["rm", "-f", "-v", name], { stdio: "ignore" });
+  await rm(bundleDirectory, { force: true, recursive: true });
 }

@@ -86,13 +86,21 @@ format; values are imported into RAM, never logged or written by this code.
 Existing master IDs and decrypt keys must be preserved. No key was fetched,
 created in 1Password, rotated, or installed during this work.
 
-**Packaging blocker:** the shared schema gate loads SQL verifier files, and
-`expectedSchema()` reads the migration set. The current Lambda builder does not
-package those assets. The disabled bundle cold-starts correctly because this
-module loads lazily. An armed release needs a verified build-time schema/gate
-contract or correctly packaged assets, with the same authoritative verifier;
-do not enable the branch on the present ZIP. The local proof runs from a complete
-source checkout and does not establish armed ZIP compatibility.
+**Packaged schema contract:** the Alchemy function build now embeds the exact
+migration generation and both authoritative verifier SQL files through
+`derived-schema-build.ts`. Source/container runs load those same files normally.
+The shared live gate retains its read-only transaction, both verifiers,
+function-boundary check and final marker read. Empty assets close the gate.
+Embedded inputs are frozen and registered as build/watch dependencies. The
+compiled generation comes from source, never from the live database marker;
+the final composed release must rebuild this capture from its own migration set.
+
+The detached Node 24 proof uses the actual function-props build plugin and
+Alchemy/Rolldown bundler. Only the resulting `.mjs` file is in its temporary
+runtime directory: no SQL or migration files. It performs real PG/S3 queue and
+summary work, and claims nothing when the role marker is pending. This closes
+the schema-asset packaging gap in source; production arm64/live validation and
+the other authority/permission gates below remain held.
 
 After that and the managed-authority dependencies pass, the reviewable deployment
 changes are: a disabled EventBridge rule targeting this same function with
@@ -109,7 +117,7 @@ do not invent an alternative layout or apply a wildcard grant in this draft.
 
 ## Actual proof and validation
 
-Run on Linux in an isolated checkout with its own frozen Bun install:
+Run on Linux with Node 24 on PATH, in an isolated checkout with its own frozen Bun install:
 
 ```sh
 bun run typecheck
@@ -125,13 +133,16 @@ non-superuser runtime role. MinIO is versioned; generated fixture credentials
 enter through a RAM FIFO, not Docker Config.Env, arguments, or saved files.
 Summary master keys exist only in process memory. ClickHouse 26.8 is real.
 
-Validation: 55 focused tests and 11 legacy projection cases passed; the full-flow
-proof passed 12 checks. Root and workspace typechecks passed. The bundled Lambda
+Validation: 107 build/gate/worker regression tests and 11 legacy projection cases
+passed; the full-flow proof passed 13 checks. Three scoped erasure tests and
+eleven migration/sentinel/ACL cases also passed. Root and workspace typechecks
+passed. The bundled Lambda
 returned safely for the default-off event under Node 24 from outside the checkout.
 The services Dockerfile built locally as `96bulls/pipe-bob-prep:20261104`,
 image ID `sha256:6a9a8d8be8e231ab8748e64fbfda80ec102f317bf72eef51597bf32ffe8aacf7`
 (amd64). Worker imports and missing-summary-key startup refusal passed inside it.
-The image was not pushed, and production arm64 packaging remains unverified.
+This image was built at the original `c98a532` checkpoint, not rebuilt for every
+later source change. It was not pushed; production arm64 packaging is unverified.
 
 The proof starts actual indexer/Referee/Bob processes, sends a signed HTTP upload
 through the real SQL ledger and Technical Foul path, then verifies live index
@@ -165,11 +176,14 @@ Do not retain the old 384 MiB chart limit or infer canonical support from it.
    generation/currentness, instead of refolding >64 MiB canonical sessions.
    Reuse the authoritative large fold chooser/stream from the seed/replay source
    where required. Run Bob against the actual largest-cohort proof afterward.
-3. Complete and prove SQL derived metadata cleanup and full reset alongside GC.
-   This proof erases every S3 version and the CH rows; it does not claim that
-   tombstoning an index row alone removes summary/verdict SQL metadata.
-4. Package and test the armed Lambda gate contract, then review the exact
-   permissions, secrets, schema, image and disabled schedule as one release.
+3. Compose and prove managed reset-generation safety with Native/GC. Migration
+   `0005_derived_pointer_erasure.sql` now atomically removes summary pointers and
+   verdicts for an authorized physical index tombstone/delete, including scoped
+   bulk deletes. Installation changes no existing row; siblings and rollback are
+   tested. It does not replace managed generation/ABA fencing or erase preexisting
+   orphan metadata through an unreviewed initial purge.
+4. Review the exact arm64 artifact, permissions, secrets, schema and disabled
+   schedule as one release. The armed schema-gate bundle is now proved locally.
 5. Add the authenticated Bob output reader and approved search projection.
    In this source, only Bob retry and the smoke/proof utilities read
    `session_summaries` / decrypt its objects. Neither the read API nor the read

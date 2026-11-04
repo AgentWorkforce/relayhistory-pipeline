@@ -239,8 +239,8 @@ async function init(): Promise<Runtime> {
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
   return { env, deps, brief, derived: async remainingMs => {
-    // The role-gate filesystem contract is loaded only for an armed derived
-    // invocation. Its SQL assets must be packaged before release activation.
+    // The configured Alchemy build embeds the authoritative schema/SQL contract;
+    // source/container runs read those same inputs from the checkout.
     const { derivedTick } = await import("./derived-tick.ts");
     return derivedTick({ db, store, reader, keyring, remainingMs,
       sweep: process.env.SESSION_DERIVED_SWEEP_ENABLED === "true" });

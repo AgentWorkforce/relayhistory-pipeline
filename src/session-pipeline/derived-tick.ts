@@ -5,7 +5,7 @@ import {
   type ManifestReader, type ObjectStore,
 } from "../shared/vendor.ts";
 import { schemaVerdict, inTransaction, type HoopDb } from "../shared/db.ts";
-import { expectedSchema } from "../hoopdb/migrate.ts";
+import { derivedSchemaAssets } from "./derived-schema.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { refereeHandler } from "../referee/handler.ts";
 import { bobCostasHandler } from "../bob-costas/handler.ts";
@@ -20,8 +20,8 @@ export async function derivedTick(input: {
   sweep?: boolean;
 }) {
   const { db, reader, store, keyring } = input;
-  const expected = await expectedSchema();
-  const gate = async () => (await schemaVerdict(expected, work => inTransaction(db, work))).ok;
+  const assets = await derivedSchemaAssets();
+  const gate = async () => (await schemaVerdict(assets.expected, work => inTransaction(db, work), { verifierSql: assets.verifiers })).ok;
   const summarizer = summarizerFromEnv();
   const deps = pipelineQueueDeps({ ENVIRONMENT: "production" }, {
     queue: postgresPipelineQueue(db), deadLetters: postgresDeadLetterStore(db), sink: sqlPipelineEventSink(db),

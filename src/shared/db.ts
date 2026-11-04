@@ -106,14 +106,26 @@ export type SchemaVerdict =
 export const ROLE_VERIFY_SQL_PATH = fileURLToPath(
   new URL("../../supabase/bootstrap/session_directory_search_worker_verify.sql", import.meta.url),
 );
-const ROLE_VERIFY_SQL = readFileSync(ROLE_VERIFY_SQL_PATH, "utf8");
 // The auth token verifier's phase 2 (supabase/bootstrap/session_token_verifier_verify.sql):
 // the same contract for session_token_verifier — run by the migrator's verify step, the
 // external mark_pass wrapper, and this live gate. Read-only.
-const TOKEN_VERIFIER_VERIFY_SQL = readFileSync(
-  fileURLToPath(new URL("../../supabase/bootstrap/session_token_verifier_verify.sql", import.meta.url)),
-  "utf8",
+export const TOKEN_VERIFIER_VERIFY_SQL_PATH = fileURLToPath(
+  new URL("../../supabase/bootstrap/session_token_verifier_verify.sql", import.meta.url),
 );
+
+/** Trusted build input only: Lambda embeds these same authoritative SQL files.
+ * Never populated from a request, environment variable or database row. */
+export interface SchemaVerifierSql {
+  readonly searchWorker: string;
+  readonly tokenVerifier: string;
+}
+let localVerifierSql: SchemaVerifierSql | undefined;
+function filesystemVerifierSql(): SchemaVerifierSql {
+  return localVerifierSql ??= {
+    searchWorker: readFileSync(ROLE_VERIFY_SQL_PATH, "utf8"),
+    tokenVerifier: readFileSync(TOKEN_VERIFIER_VERIFY_SQL_PATH, "utf8"),
+  };
+}
 
 /**
  * Live sessions-function boundary, read-only, part of every readiness check: no sessions
@@ -189,7 +201,7 @@ const MARKER_SQL = `SELECT generation, status FROM ${ROLE_VALIDATION_TABLE} WHER
 export async function schemaVerdict(
   expected: ExpectedSchema,
   transact: Transact,
-  opts: { afterVerify?: () => Promise<void> } = {},
+  opts: { afterVerify?: () => Promise<void>; verifierSql?: SchemaVerifierSql } = {},
 ): Promise<SchemaVerdict> {
   type Stage = "config" | "ledger" | "marker" | "verify" | "final";
   let stage = "config" as Stage; // widened: it is advanced inside the transaction callback
@@ -213,8 +225,12 @@ export async function schemaVerdict(
       stage = "marker";
       if (!(await passed())) return { ok: false, reason: "validation_pending" };
       stage = "verify";
-      await tx.query(ROLE_VERIFY_SQL);
-      await tx.query(TOKEN_VERIFIER_VERIFY_SQL);
+      const verifierSql = opts.verifierSql ?? filesystemVerifierSql();
+      // An incomplete packaged contract must close the gate, never skip a verifier.
+      if (!verifierSql.searchWorker.trim() || !verifierSql.tokenVerifier.trim())
+        throw Object.assign(new Error("schema verifier assets are missing"), { code: "gate_assets_missing" });
+      await tx.query(verifierSql.searchWorker);
+      await tx.query(verifierSql.tokenVerifier);
       await tx.query(SESSIONS_FUNCTION_GATE_SQL);
       if (opts.afterVerify) await opts.afterVerify(); // test seam: a concurrent flip lands here
       stage = "final";
