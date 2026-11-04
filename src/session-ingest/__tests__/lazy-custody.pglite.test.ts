@@ -101,3 +101,23 @@ test("cold zero-row reset seals USER; old correct-generation unqualified control
  await f.db.exec("DELETE FROM sessions.ingest_lazy_user_seals");
  await expect(f.send("lost-seal",record({record_id:"lost"}),null,"1")).rejects.toThrow();
 });
+
+test("in-batch native-key twins use actual CURRENT revision: new/equal conflicting peers409, below-current peers ACK ignored",async()=>{
+ const f=await fixture(),old=record({record_id:"twins",revision:8,session_id:"B"}),current=await metadata(old);
+ async function send(id:string,revision:number,cur:SourceCurrentRecord|null){
+  const records=[{...record({record_id:"twins",revision,session_id:"A"}),revision_id:"z-peer",payload:{text:"Z"}},{...record({record_id:"twins",revision,session_id:"A"}),revision_id:"a-peer",payload:{text:"A"}}];
+  const raw=await batch(records,{batch_id:id});const custody=await f.packet(raw,cur);return deliverBatch({...f.deps,custody},TENANT,raw);
+ }
+ await send("below",1,current);expect((await f.seats("below")).records.every((r:any)=>!r.bodyAccepted)).toBe(true);
+ await expect(send("equal",8,current)).rejects.toMatchObject({status:409,code:"delivery_conflict"});
+ await expect(send("above",9,current)).rejects.toMatchObject({status:409,code:"delivery_conflict"});
+ const g=await fixture(),raw=await batch([{...record({record_id:"new-twin"}),revision_id:"one",payload:{text:"one"}},{...record({record_id:"new-twin"}),revision_id:"two",payload:{text:"two"}}],{batch_id:"new-conflict"});
+ await expect(deliverBatch({...g.deps,custody:await g.packet(raw)},TENANT,raw)).rejects.toMatchObject({status:409});
+});
+
+test("source-native processing rank assigns ACK seats while preserving original ordinal maps",async()=>{
+ const f=await fixture(),raw=await batch([{...record({record_id:"z-native",session_id:"catalog"}),kind:"session",payload:{title:"Z wins"}},{...record({record_id:"a-native",session_id:"catalog"}),kind:"session",payload:{title:"A first"}}],{batch_id:"rank"});
+ const packet=await f.packet(raw);packet.witness.records[0]!.processingRank=1;packet.witness.records[1]!.processingRank=0;
+ await deliverBatch({...f.deps,custody:await f.sign(packet.witness)},TENANT,raw);
+ const rows=(await f.seats("rank")).records;expect(rows.map((r:any)=>r.ord)).toEqual([0,1]);expect(rows.every((r:any)=>r.bodyAccepted)).toBe(true);expect(BigInt(rows[0].seat)).toBeGreaterThan(BigInt(rows[1].seat));
+});

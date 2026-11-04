@@ -1193,6 +1193,13 @@ BEGIN
       FROM sessions.ingest_record_revisions AS c
      WHERE c.org_id = k.org_id AND c.workspace_id = k.workspace_id AND c.origin_id = k.origin_id
        AND c.record_id = ANY (ARRAY(SELECT DISTINCT s.record_id FROM sorted AS s))
+       AND NOT(p_mode='buffered' AND EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton))
+    UNION ALL
+    SELECT n.record_id,n.current_revision AS revision FROM sessions.ingest_lazy_native_slots n
+     WHERE p_mode='buffered' AND EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton)
+      AND n.org_id=k.org_id AND n.workspace_id=k.workspace_id AND n.origin_id=k.origin_id
+      AND n.current_owner=k.user_id AND n.current_revision IS NOT NULL
+      AND n.record_id=ANY(ARRAY(SELECT DISTINCT s.record_id FROM sorted s))
   ), peers AS (
     SELECT DISTINCT ON (s.record_id, s.revision) s.record_id, s.revision,
            s.revision_id AS peer_revision_id, s.digest AS peer_digest
@@ -1200,7 +1207,8 @@ BEGIN
   ), judged AS (
     SELECT s.rn, s.ord, s.record_id, s.revision_id, s.revision, s.digest,
            c.revision IS NOT NULL AND c.revision >= s.revision AS stale,
-           (c.revision IS NULL OR c.revision < s.revision)
+           (c.revision IS NULL OR c.revision < s.revision OR
+             (c.revision=s.revision AND p_mode='buffered' AND EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton)))
              AND p.peer_revision_id <> s.revision_id AND p.peer_digest <> s.digest AS twin,
            p.peer_revision_id, p.peer_digest
       FROM sorted AS s
@@ -1223,7 +1231,8 @@ BEGIN
     INTO v_count, v_conflicts, v_stale, v_fast
     FROM numbered AS n;
   IF v_count > 0 THEN
-    IF p_mode='buffered' THEN RETURN jsonb_build_object('kind','baseline_pending'); END IF;
+    IF p_mode='buffered' AND NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton) THEN
+      RETURN jsonb_build_object('kind','baseline_pending'); END IF;
     RETURN jsonb_build_object('kind', 'revision_conflict', 'conflicts', v_conflicts, 'count', v_count);
   END IF;
 
