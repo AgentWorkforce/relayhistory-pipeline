@@ -22,7 +22,8 @@ for(const m of sql.matchAll(/GRANT EXECUTE ON FUNCTION([\s\S]*?)TO\s+bulls96_ses
  }
 if(grants.size!==4)throw Error("unexpected GC RPC count");
 const acl=JSON.parse(await readFile(file("src/hoopdb/sessions-function-acl.json"),"utf8"));
-for(const key of Object.keys(acl.functions))if(key.startsWith("sessions.ingest_buffer_gc_"))delete acl.functions[key];
+// Later migrations may add private GC helpers: replace only definitions owned here.
+for(const key of defs.keys())delete acl.functions[key];
 for(const key of defs.keys())acl.functions[key]=["<owner>:EXECUTE",...(grants.has(key)?["bulls96_session_ingest:EXECUTE"]:[])];
 acl.functions=Object.fromEntries(Object.entries(acl.functions).sort(([a],[b])=>a<b?-1:a>b?1:0));
 let wrapper=await readFile(file("supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql"),"utf8");
@@ -30,7 +31,7 @@ wrapper=wrapper.replace(/v_manifest jsonb := \$manifest\$[\s\S]*?\$manifest\$::j
  ()=>"v_manifest jsonb := $manifest$"+JSON.stringify(acl.functions)+"$manifest$::jsonb;");
 const secdefBlock=wrapper.match(/v_secdef text\[\] := ARRAY\[([\s\S]*?)\]::text\[\];/);
 if(!secdefBlock)throw Error("boundary SECDEF source missing");
-const secdefs=[...secdefBlock[1]!.matchAll(/'([^']+)'/g)].map(m=>m[1]!).filter(k=>!k.startsWith("sessions.ingest_buffer_gc_"));
+const secdefs=[...secdefBlock[1]!.matchAll(/'([^']+)'/g)].map(m=>m[1]!).filter(k=>!defs.has(k));
 for(const [sig,def]of defs)if(def.secdef)secdefs.push(sig);
 wrapper=wrapper.replace(secdefBlock[0],"v_secdef text[] := ARRAY[\n"+[...new Set(secdefs)].sort().map(k=>"    '"+k+"'").join(",\n")+"\n  ]::text[];");
 const body=wrapper.match(/v_body text := \$boundary\$([\s\S]*?)\$boundary\$;/)?.[1];
