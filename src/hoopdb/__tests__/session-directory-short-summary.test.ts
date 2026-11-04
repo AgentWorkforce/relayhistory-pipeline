@@ -1625,6 +1625,9 @@ describe("short_summary end to end through the pipeline", () => {
       ),
       zstdCompressSync(Buffer.from(`${line}\n`)),
     );
+    const stored = zstdCompressSync(Buffer.from(`${line}\n`));
+    Object.assign(m.raw.chunks[0]!, { stored_bytes: stored.length,
+      stored_sha256: createHash("sha256").update(stored).digest("hex") });
     const keyring = await masterKeyring(
       parseMasterKeys(`k1:${"a".repeat(64)}`),
     );
@@ -1635,6 +1638,7 @@ describe("short_summary end to end through the pipeline", () => {
       summarizerOverride?: typeof extractiveSummarizer,
     ) =>
       bobCostasHandler("short", {
+        projectShortSummary: true,
         db: hoop,
         reader,
         store: storeOverride ?? store,
@@ -2223,11 +2227,15 @@ describe("short_summary end to end through the pipeline", () => {
     const keyring = await masterKeyring(
       parseMasterKeys(`k1:${"a".repeat(64)}`),
     );
+    const stored = zstdCompressSync(Buffer.from(`${line}\n`));
+    Object.assign(m.raw.chunks[0]!, { stored_bytes: stored.length,
+      stored_sha256: createHash("sha256").update(stored).digest("hex") });
     const run = (
       prefix: string,
       directory?: Parameters<typeof bobCostasHandler>[1]["directory"],
     ) =>
       bobCostasHandler("short", {
+        projectShortSummary: true,
         db: hoop,
         reader,
         store,
@@ -2277,6 +2285,8 @@ describe("short_summary end to end through the pipeline", () => {
     const firstGenerated = (
       current?.short_summary_generated_at as Date
     ).getTime();
+    // A moved key is valid only after the live index points at it.
+    await db.query("UPDATE sessions.session_index SET manifest_key=$1 WHERE session_id='s-e2e'", [`${prefixB}/${tail}/manifest.json`]);
     const moved = await run(prefixB);
     expect(moved).not.toEqual({ status: "skipped", reason: "summary_current" });
     expect(await objectKey()).toBe(`${prefixB}/${tail}/summary/short.json.enc`);

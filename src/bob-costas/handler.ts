@@ -12,12 +12,9 @@
  * Idempotent by revision and raw content hash.
  */
 import { createHash } from "node:crypto";
-import { zstdDecompressSync } from "node:zlib";
 import {
   PipelineError,
   parseSessionKey,
-  rawChunkKey,
-  readAll,
   type ManifestReader,
   type ManifestV1,
   type ObjectStore,
@@ -28,7 +25,9 @@ import type { HoopDb } from "../shared/db.ts";
 import { ctxOf } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
-import { digestRecords, type Summarizer } from "./summarizer.ts";
+import { type Summarizer } from "./summarizer.ts";
+import { rawDigest } from "./raw-digest.ts";
+import { assertDerivedScope, derivedCurrent } from "../shared/derived-session.ts";
 import {
   ShortSummaryRejected,
   clearShortSummary,
@@ -54,8 +53,12 @@ export interface BobCostasDeps {
   summarizer: Summarizer;
   keyring: WorkspaceKeyring;
   now?: () => Date;
-  /** The session_directory short_summary projection; defaults to the SQL writer on `db`. */
+  /** Explicit projection injection; the default SQL writer requires the opt-in below. */
   directory?: ShortSummaryDirectory;
+  /** Explicit content-copy opt-in; production defaults to encrypted objects only. */
+  projectShortSummary?: boolean;
+  /** Optional per-job ceiling for a finite-duration host such as Lambda. */
+  maxRawBytes?: number;
 }
 
 /** Where Bob Costas publishes the bounded, scrubbed short summary for search (G6). */
@@ -69,6 +72,14 @@ export function sqlShortSummaryDirectory(db: HoopDb): ShortSummaryDirectory {
     write: (input) => writeShortSummary(db, input),
     clear: (key) => clearShortSummary(db, key),
   };
+}
+
+const noDirectory: ShortSummaryDirectory = {
+  write: async () => ({ written: false }), clear: async () => false,
+};
+function directoryFor(deps: BobCostasDeps, db = deps.db): ShortSummaryDirectory {
+  return deps.directory ?? ((deps.projectShortSummary ?? process.env.BOB_COSTAS_DIRECTORY_SUMMARY_ENABLED === "true")
+    ? sqlShortSummaryDirectory(db) : noDirectory);
 }
 
 /**
@@ -144,34 +155,7 @@ async function buildOutcome(
   // Scrub quarantine: an unscrubbed session is never read.
   if (!m.raw.scrub) return { status: "quarantined", ...none };
   if (m.raw.format === "sqlite-rows") return { status: "unsupported", ...none };
-  const s = m.session;
-  const loc = sessionLocation(m, manifestKey);
-  const lines: string[] = [];
-  for (const chunk of m.raw.chunks) {
-    const key = rawChunkKey(
-      loc,
-      chunk.seq,
-      chunk.start_offset,
-      chunk.sha256_8,
-      m.raw.format,
-    );
-    let stored: Uint8Array;
-    try {
-      stored = await readAll(await deps.store.get(key));
-    } catch (err) {
-      if ((err as { code?: string }).code === "not_found")
-        throw new PipelineError(
-          "chunk_missing",
-          "a listed chunk is not in object storage",
-          true,
-        );
-      throw err;
-    }
-    lines.push(
-      ...zstdDecompressSync(Buffer.from(stored)).toString("utf8").split("\n"),
-    );
-  }
-  const digest = digestRecords(s.harness, lines);
+  const digest = await rawDigest(m, manifestKey, deps.store, deps.maxRawBytes);
   if (digest.records === 0) return { status: "empty", ...none };
   const summary = await deps.summarizer.summarize(kind, digest);
   return {
@@ -199,6 +183,39 @@ export function bobCostasHandler(
     const read = await deps.reader.read(pointer.manifestKey);
     if (!read) return { status: "skipped", reason: "manifest_missing" };
     const m = read.manifest;
+    assertDerivedScope(message, m, pointer.manifestKey);
+    if (!(await derivedCurrent(deps.db, message, m, pointer.manifestKey)))
+      return { status: "skipped", reason: "index_not_current" };
+    // Every projection write AND clear rechecks the source under its row lock,
+    // including error/retry paths that may resume after a newer job committed.
+    const publishCurrent = async (
+      key: SessionDirectoryKey,
+      ready: Parameters<typeof publishShortSummary>[2],
+      traceId: string,
+      expectedObjectSha = row?.object_sha256 ?? null,
+    ) => {
+      if (kind !== "short" || (!deps.directory && !(deps.projectShortSummary ?? process.env.BOB_COSTAS_DIRECTORY_SUMMARY_ENABLED === "true"))) return;
+      const c = await deps.db.pool.connect();
+      try {
+        await c.query("BEGIN");
+        await c.query("SET LOCAL lock_timeout = '5s'");
+        await c.query("SET LOCAL statement_timeout = '30s'");
+        if (await derivedCurrent(c as never, message, m, pointer.manifestKey, true)) {
+          const current = await c.query(`SELECT 1 FROM sessions.session_summaries
+            WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5
+              AND kind=$6 AND revision=$7 AND content_sha256=$8
+              AND object_sha256 IS NOT DISTINCT FROM $9`,
+            [message.ctx.orgId, m.session.workspace_id, m.session.harness, m.session.session_id,
+              m.session.machine_id, kind, m.revision, m.raw.content_sha256, expectedObjectSha]);
+          if (current.rows.length)
+            await publishShortSummary(directoryFor(deps, c as never), key, ready, traceId);
+        }
+        await c.query("COMMIT");
+      } catch (err) {
+        await c.query("ROLLBACK").catch(() => undefined);
+        throw err;
+      } finally { c.release(); }
+    };
     const s = m.session;
     const pk = [
       message.ctx.orgId,
@@ -241,8 +258,7 @@ export function bobCostasHandler(
       // The encrypted object and pointer are current, but a previous run may have
       // failed after COMMIT and before the directory write. Reconcile the directory
       // from the published object on every retry.
-      if (kind === "short") {
-        const directory = deps.directory ?? sqlShortSummaryDirectory(deps.db);
+      {
         const dirKey = {
           orgId: message.ctx.orgId,
           workspaceId: s.workspace_id,
@@ -250,7 +266,7 @@ export function bobCostasHandler(
           sessionId: canonicalManifestIdentity(m).sessionId,
         };
         if (row.status !== "ready") {
-          await publishShortSummary(directory, dirKey, null, m.trace_id);
+          await publishCurrent(dirKey, null, m.trace_id);
         } else {
           // Always authenticate and republish the current object, even when the row
           // already holds a summary: it may be an older revision's text left behind by
@@ -261,8 +277,8 @@ export function bobCostasHandler(
           // of retrying forever.
           const integrity = async (message: string): Promise<never> => {
             // Ids and hashes only: the object key is a path, so it is logged as its SHA-256.
-            log.warn("short summary object integrity failure; dead-lettering", {
-              stage: "summary-short",
+            log.warn("summary object integrity failure; dead-lettering", {
+              stage: `summary-${kind}`,
               error_code: "summary_object_integrity",
               retryable: false,
               org_id: dirKey.orgId,
@@ -276,7 +292,7 @@ export function bobCostasHandler(
                 ? createHash("sha256").update(row.object_key).digest("hex")
                 : undefined,
             });
-            await publishShortSummary(directory, dirKey, null, m.trace_id);
+            await publishCurrent(dirKey, null, m.trace_id);
             throw new PipelineError("summary_object_integrity", message, false);
           };
           if (!row.object_key || !row.object_sha256)
@@ -298,8 +314,8 @@ export function bobCostasHandler(
             // class: a transient store error retries; a non-retryable keyring error (an
             // unknown or retired key id) dead-letters instead of looping.
             const original = err instanceof PipelineError ? err : null;
-            log.warn("short summary object read failed", {
-              stage: "summary-short",
+            log.warn("summary object read failed", {
+              stage: `summary-${kind}`,
               error_code: original?.code ?? "summary_object_read_failed",
               retryable: original?.retryable ?? true,
               session_id: dirKey.sessionId,
@@ -307,10 +323,10 @@ export function bobCostasHandler(
               trace_id: m.trace_id,
             });
             try {
-              await publishShortSummary(directory, dirKey, null, m.trace_id);
+              await publishCurrent(dirKey, null, m.trace_id);
             } catch (clearErr) {
-              log.warn("short summary clear after read failure also failed", {
-                stage: "summary-short",
+              log.warn("summary clear after read failure also failed", {
+                stage: `summary-${kind}`,
                 error_code:
                   clearErr instanceof PipelineError
                     ? clearErr.code
@@ -330,8 +346,7 @@ export function bobCostasHandler(
               "the current short summary object is missing or cannot be authenticated",
             );
           }
-          await publishShortSummary(
-            directory,
+          await publishCurrent(
             dirKey,
             {
               summary: published.summary,
@@ -370,10 +385,16 @@ export function bobCostasHandler(
     let published: { sha256: string; keyId: string } | undefined;
     try {
       await client.query("BEGIN");
+      await client.query("SET LOCAL lock_timeout = '5s'");
+      await client.query("SET LOCAL statement_timeout = '30s'");
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
         [`96bulls:summary:${key}`],
       );
+      if (!(await derivedCurrent(client as never, message, m, pointer.manifestKey, true))) {
+        await client.query("ROLLBACK");
+        return { status: "skipped", reason: "index_not_current" };
+      }
       // Under the lock, a newer revision may have published meanwhile: it owns the object.
       const locked = await client.query<{ revision: string }>(
         `SELECT revision FROM sessions.session_summaries
@@ -446,15 +467,13 @@ export function bobCostasHandler(
     // reason only (the encrypted object above is unaffected), and any other summary
     // status clears a stale one.
     if (kind === "short") {
-      const directory = deps.directory ?? sqlShortSummaryDirectory(deps.db);
       const dirKey = {
         orgId: message.ctx.orgId,
         workspaceId: s.workspace_id,
         harness: s.harness,
         sessionId: canonicalManifestIdentity(m).sessionId,
       };
-      await publishShortSummary(
-        directory,
+      await publishCurrent(
         dirKey,
         outcome.status === "ready"
           ? {
@@ -464,6 +483,7 @@ export function bobCostasHandler(
             }
           : null,
         m.trace_id,
+        published?.sha256 ?? null,
       );
     }
     // Ids, counts and statuses only: never the summary or the model's output.

@@ -39,15 +39,20 @@ export async function findMissingSummaries(db: Pick<HoopDb, "query">, stage: (ty
         AND NOT EXISTS (SELECT 1 FROM sessions.session_summaries s
                          WHERE s.org_id=i.org_id AND s.workspace_id=i.workspace_id AND s.harness=i.harness
                            AND s.session_id=i.session_id AND s.machine_id=i.machine_id AND s.kind=$1
-                           AND (s.status <> 'ready' OR s.key_id = $4))
+                           AND s.revision=i.revision
+                           AND s.content_sha256=encode(i.content_sha256, 'hex')
+                           AND (s.status <> 'ready' OR (s.key_id = $4
+                             AND s.object_key = regexp_replace(i.manifest_key, '/manifest[.]json$', '/summary/' || $1 || '.json.enc'))))
         -- Not already queued.
         AND NOT EXISTS (SELECT 1 FROM sessions.pipeline_jobs j
                          WHERE j.stage=$2 AND NOT j.dlq AND j.org_id=i.org_id AND j.workspace_id=i.workspace_id
-                           AND j.session_id=i.session_id AND j.machine_id=i.machine_id)
+                           AND j.session_id=i.session_id AND j.machine_id=i.machine_id
+                           AND j.message->'ctx'->>'harness'=i.harness)
         -- Not dead-lettered: a permanent failure waits for a person (replay), not every sweep.
         AND NOT EXISTS (SELECT 1 FROM sessions.pipeline_dead_letters d
                          WHERE d.stage=$2 AND d.resolved_at IS NULL AND d.org_id=i.org_id AND d.workspace_id=i.workspace_id
-                           AND d.session_id=i.session_id AND d.machine_id=i.machine_id)
+                           AND d.session_id=i.session_id AND d.machine_id=i.machine_id
+                           AND d.message->'ctx'->>'harness'=i.harness)
       ORDER BY i.indexed_at DESC NULLS LAST
       LIMIT $3`,
     [KIND[stage], stage, limit, currentKeyId],

@@ -47,11 +47,15 @@ import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
 import { briefTick } from "../session-brief/worker.ts";
+import { masterKeyring, parseMasterKeys } from "../shared/keyring.ts";
+import type { WorkspaceKeyring } from "../bob-costas/summary-objects.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
   clickhouse?: { url: string; user: string; password: string; database: string };
   openai_api_key?: string;
+  /** Existing master ids and keys, injected from managed memory only; never rotated here. */
+  summary_master_keys?: string;
 }
 
 export interface LambdaEnv {
@@ -106,6 +110,10 @@ export function parseSecret(text: string): PipelineSecret {
   }
   if (v.openai_api_key !== undefined && (typeof v.openai_api_key !== "string" || !v.openai_api_key.trim()))
     throw new Error("session pipeline secret openai_api_key must be a non-empty string when present");
+  if (v.summary_master_keys !== undefined) {
+    if (typeof v.summary_master_keys !== "string") throw new Error("session pipeline summary keyring is invalid");
+    parseMasterKeys(v.summary_master_keys);
+  }
   return v as PipelineSecret;
 }
 
@@ -162,6 +170,7 @@ interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
   brief: ReturnType<typeof briefTick>;
+  derived: (remainingMs: () => number) => Promise<unknown>;
 }
 
 let runtime: Promise<Runtime> | undefined;
@@ -181,6 +190,8 @@ async function init(): Promise<Runtime> {
   const store = createS3Store({ bucket: env.bucket, region: env.region, credentials: async () => lambdaCredentials() });
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: env.bucket });
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: env.keyPrefix };
+  const keyring: WorkspaceKeyring | undefined = secret.summary_master_keys
+    ? await masterKeyring(parseMasterKeys(secret.summary_master_keys)) : undefined;
   const fanout: PipelineQueue = env.fanout === "postgres" ? postgresPipelineQueue(db) : droppedFanout;
   const lock: ScopeLock = (scope, work) =>
     transaction(db, async (tx) => {
@@ -227,7 +238,13 @@ async function init(): Promise<Runtime> {
     config: briefConfig(),
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
-  return { env, deps, brief };
+  return { env, deps, brief, derived: async remainingMs => {
+    // The role-gate filesystem contract is loaded only for an armed derived
+    // invocation. Its SQL assets must be packaged before release activation.
+    const { derivedTick } = await import("./derived-tick.ts");
+    return derivedTick({ db, store, reader, keyring, remainingMs,
+      sweep: process.env.SESSION_DERIVED_SWEEP_ENABLED === "true" });
+  } };
 }
 
 function ready(): Promise<Runtime> {
@@ -392,9 +409,25 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   return { ...summary, link };
 }
 
-type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; cursor?: string; since?: string; link?: number };
+type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; derived?: unknown; cursor?: string; since?: string; link?: number };
 
-export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok: boolean }> {
+export async function handler(event: LambdaEvent, context?: { getRemainingTimeInMillis(): number }): Promise<BatchResponse | { ok: boolean }> {
+  if (event?.derived === true) {
+    // Return before Secrets Manager or DB initialization when unarmed.
+    if (process.env.SESSION_DERIVED_ENABLED !== "true") return { ok: true };
+    const started = Date.now();
+    try {
+      if (!context) throw new Error("derived invocation requires a runtime deadline");
+      const result = await (await ready()).derived(() => context.getRemainingTimeInMillis());
+      const r = result as { claimed: number; acked: number; retried: number; exhausted: number; gated: boolean; summaryKeyringReady: boolean };
+      log.info("derived tick finished", { stage: "derived", claimed: r.claimed, acked: r.acked,
+        retried: r.retried, exhausted: r.exhausted, ok: !r.gated && r.summaryKeyringReady, reason: !r.summaryKeyringReady ? "summary_keyring_missing" : r.gated ? "gated_or_deadline" : "ok" });
+      return { ok: !r.gated && r.summaryKeyringReady };
+    } catch (error) {
+      log.error("derived tick failed", { stage: "derived", ...errorFields(error), duration_ms: Date.now() - started });
+      return { ok: false };
+    }
+  }
   if (Array.isArray(event?.Records)) {
     let rt: Runtime;
     try {

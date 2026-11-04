@@ -36,9 +36,9 @@ test("a classified state is projected into the directory", async () => {
   await db.query(
     `INSERT INTO sessions.session_index
        (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
-        storage_provider, bucket, manifest_key, trace_id, revision)
+        storage_provider, bucket, manifest_key, trace_id, revision, content_sha256)
      VALUES ('o', 'w', 'codex', 's', 'm', 'u', now(), now(), 's3', 'bucket', 'key/m',
-             '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1)`,
+             '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1, decode('${"c".repeat(64)}','hex'))`,
   );
   await projectSessionDirectory(db as never, KEY);
   const state = async () =>
@@ -58,10 +58,10 @@ test("a classified state is projected into the directory", async () => {
       session_id: "s",
       machine_id: "m",
     },
-    raw: { state: "closed", updated_at: new Date().toISOString() },
+    raw: { state: "closed", updated_at: new Date().toISOString(), content_sha256: "c".repeat(64) },
   };
   const handler = refereeHandler({
-    db: db as never,
+    db: { query: db.query.bind(db), pool: { connect: async () => ({ query: db.query.bind(db), release() {} }) } } as never,
     reader: { read: async () => ({ manifest }) } as never,
   });
   const info = () => {};
@@ -70,4 +70,14 @@ test("a classified state is projected into the directory", async () => {
     { log: { info, warn: info, error: info } } as never,
   );
   expect(await state()).toBe("done");
+  // An older job arriving later must not regress the current state or create
+  // an obsolete audit row, even though its classification time would be newer.
+  await db.query("UPDATE sessions.session_index SET revision=2, state='active' WHERE org_id='o'");
+  const before = (await db.query("SELECT count(*)::int n FROM sessions.session_verdicts")).rows;
+  expect(await handler(
+    { payload: { manifestKey: "key/m" }, ctx: { orgId: "o" } } as never,
+    { log: { info, warn: info, error: info } } as never,
+  )).toEqual({ status: "skipped", reason: "index_not_current" });
+  expect((await db.query("SELECT state FROM sessions.session_index WHERE org_id='o'")).rows[0]).toEqual({ state: "active" });
+  expect((await db.query("SELECT count(*)::int n FROM sessions.session_verdicts")).rows).toEqual(before);
 }, 30_000);

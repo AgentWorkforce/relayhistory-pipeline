@@ -31,6 +31,13 @@ async function setup() {
   await pg.exec(`INSERT INTO sessions.session_summaries (org_id, workspace_id, harness, session_id, machine_id, kind, trace_id, revision, content_sha256, summary)
                  VALUES ('o','w','claude','old','m','short','01a188e1-ef86-7b16-938a-e91b6b78643b',1,'${"d".repeat(64)}','OLD PLAINTEXT')`);
   await pg.exec(MIG("0004_summary_pointers.sql"));
+  await pg.exec(`CREATE TABLE sessions.session_index (
+    org_id text, workspace_id text, harness text, session_id text, machine_id text,
+    revision bigint, manifest_key text, content_sha256 bytea, deleted_at timestamptz);
+    INSERT INTO sessions.session_index VALUES
+    ('o','w','claude','s1','m',2,'k',decode('${"c".repeat(64)}','hex'),NULL),
+    ('org_aws_proof_1','w','claude','s1','m',2,
+      '96bulls/org_aws_proof_1/v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/manifest.json',decode('${"c".repeat(64)}','hex'),NULL)`);
   const q = async (text: string, params?: unknown[]) => ({
     rows: (await pg.query(text, params as never)).rows as never[],
   });
@@ -79,6 +86,75 @@ const noDirectory = {
 };
 
 describe("Bob Costas stores summaries as encrypted Locker objects, pointers in HoopDb", () => {
+  for (const oldReady of [true, false]) it(`a delayed old ${oldReady ? "summary" : "clear"} cannot replace a newer pointer/object`, async () => {
+    const { pg, db } = await setup();
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-barrier-")) });
+    await store.put(rawChunkKey(loc, 0, 0, "abcdef12", "jsonl"), zstdCompressSync(Buffer.from(JSON.stringify({ role: "user", content: "fresh marker" }) + "\n")));
+    const chunks = [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }];
+    const old = manifest(oldReady, chunks);
+    const fresh = { ...manifest(true, chunks), revision: 3 };
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    let release!: () => void, entered!: () => void;
+    const blocked = new Promise<void>(r => release = r);
+    const started = new Promise<void>(r => entered = r);
+    // The old job already passed its first source check. Pause it before its
+    // final publication lock, then let the newer job commit both bytes/pointer.
+    const waitingKeyring = { ...keyring, currentKey: async (ids: Parameters<typeof keyring.currentKey>[0]) => { entered(); await blocked; return keyring.currentKey(ids); } };
+    const deps = { db, store, keyring, directory: noDirectory, summarizer: extractiveSummarizer };
+    const pending = bobCostasHandler("short", { ...deps, keyring: waitingKeyring,
+      reader: { read: async () => ({ manifest: old }) } as never })(message, recorder);
+    await started;
+    await pg.query("UPDATE sessions.session_index SET revision=3 WHERE org_id='o'");
+    await bobCostasHandler("short", { ...deps, reader: { read: async () => ({ manifest: fresh }) } as never })(message, recorder);
+    const before = (await pg.query<Record<string, unknown>>("SELECT * FROM sessions.session_summaries")).rows[0]!;
+    release();
+    expect(await pending).toEqual({ status: "skipped", reason: "index_not_current" });
+    expect((await pg.query("SELECT * FROM sessions.session_summaries")).rows[0]).toEqual(before);
+    const rec = await readSummaryObject({ store, keyring, ids: { orgId: "o", workspaceId: "w" },
+      key: String(before.object_key), sha256: String(before.object_sha256), kind: "short", revision: 3 });
+    expect(rec?.summary).toContain("fresh marker");
+  }, 30_000);
+
+  it("erased and superseded index rows cannot be reconstructed by replay", async () => {
+    const { pg, db } = await setup();
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    const m = manifest(true, []);
+    const deps = { db, keyring, store: {} as never, summarizer: extractiveSummarizer,
+      reader: { read: async () => ({ manifest: m }) } as never };
+    await pg.query("UPDATE sessions.session_index SET deleted_at=now() WHERE org_id='o'");
+    expect(await bobCostasHandler("short", deps)(message, recorder)).toEqual({ status: "skipped", reason: "index_not_current" });
+    await pg.query("UPDATE sessions.session_index SET deleted_at=NULL, revision=3 WHERE org_id='o'");
+    expect(await bobCostasHandler("long", deps)(message, recorder)).toEqual({ status: "skipped", reason: "index_not_current" });
+    expect((await pg.query("SELECT * FROM sessions.session_summaries")).rows).toEqual([]);
+  }, 30_000);
+
+  it("an old retry read failure cannot clear a newer directory summary", async () => {
+    const { pg, db } = await setup();
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-error-barrier-")) });
+    await store.put(rawChunkKey(loc, 0, 0, "abcdef12", "jsonl"), zstdCompressSync(Buffer.from('{"role":"user","content":"newer marker"}\n')));
+    const m = manifest(true, [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }]);
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    const deps = { db, store, keyring, summarizer: extractiveSummarizer, directory: noDirectory,
+      reader: { read: async () => ({ manifest: m }) } as never };
+    await bobCostasHandler("short", deps)(message, recorder);
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(r => enter = r), blocked = new Promise<void>(r => release = r);
+    const failing = new Proxy(store, { get(target, prop, receiver) {
+      if (prop === "getObject") return async () => { enter(); await blocked; throw new Error("read failed"); };
+      return Reflect.get(target, prop, receiver);
+    } });
+    let clears = 0;
+    const pending = bobCostasHandler("short", { ...deps, store: failing, directory: { ...noDirectory, clear: async () => { clears++; return true; } } })(message, recorder).catch(e => e);
+    await entered;
+    await pg.query("UPDATE sessions.session_index SET revision=3 WHERE org_id='o'");
+    await bobCostasHandler("short", { ...deps, reader: { read: async () => ({ manifest: { ...m, revision: 3 } }) } as never })(message, recorder);
+    const before = (await pg.query("SELECT * FROM sessions.session_summaries")).rows[0];
+    release();
+    expect((await pending).code).toBe("summary_store_unavailable");
+    expect(clears).toBe(0);
+    expect((await pg.query("SELECT * FROM sessions.session_summaries")).rows[0]).toEqual(before);
+  }, 30_000);
+
   it("ready: object summary/short.json.enc decrypts; the row has only the pointer; old plaintext rows are gone", async () => {
     const { pg, db } = await setup();
     expect(
@@ -316,7 +392,9 @@ describe("Bob Costas under org-derived key prefixes (PIPELINE_ORG_FROM_PREFIX)",
         ctx: { orgId: "org_aws_proof_1" },
       }) as never;
     const unprefixed = "v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/manifest.json";
+    await pg.query("UPDATE sessions.session_index SET manifest_key=$1 WHERE org_id='org_aws_proof_1'", [unprefixed]);
     await bobCostasHandler("short", deps)(at(unprefixed), recorder);
+    await pg.query("UPDATE sessions.session_index SET manifest_key=$1 WHERE org_id='org_aws_proof_1'", [`96bulls/org_aws_proof_1/${unprefixed}`]);
     // Same revision and content, now under the tenant prefix: not "current", rebuilt beside the new manifest.
     const moved = await bobCostasHandler("short", deps)(
       at(`96bulls/org_aws_proof_1/${unprefixed}`),
