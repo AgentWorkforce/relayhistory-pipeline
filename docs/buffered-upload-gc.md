@@ -1,12 +1,12 @@
 # Durable buffered-object redaction SQL
 
-This is a dormant schema prerequisite.040500 owns stage admission/receipt/outbox and040400 owns historical S3 proof.040510 supplies metadata leases and atomic pointer replacement; Root owns the matching S3/runtime implementation. No production SQL, grant, flag, routing or deployment is performed here.
+This is a dormant schema prerequisite.040500 owns stage admission/receipt/outbox and040400 owns historical S3 proof.040510 supplies metadata leases and atomic pointer replacement; The matching Node runtime is documented in buffered-gc-runtime.md. No production SQL, grant, flag, routing or deployment is performed here.
 
 The four ingest-role RPCs use one JSON contract:
 
 | RPC | Request | Result |
 | --- | --- | --- |
-| ingest_buffer_gc_claim | limit1..100 | tickets with stageToken,claimToken,leaseToken,rowVersion decimalstring,key,sha256,bytes,groupOrdinals,keepGroupIndexes,receiptState,phase,resetEpoch decimalstring,cleanupState and optional replacement |
+| ingest_buffer_gc_claim | limit1..100 plus exact compiled generation | tickets with stageToken,claimToken,leaseToken,rowVersion decimalstring,key,sha256,bytes,groupOrdinals,keepGroupIndexes,receiptState,phase,resetEpoch decimalstring,cleanupState and optional replacement |
 | ingest_buffer_gc_prepare | stageToken,leaseToken,key,sha256,bytes,groupOrdinals | replacementStageToken plus registered object metadata |
 | ingest_buffer_gc_swap | stageToken,leaseToken,replacementStageToken ornull | swapped boolean |
 | ingest_buffer_gc_finish | stageToken,leaseToken,barrierVersionId | finished boolean |
@@ -26,3 +26,5 @@ The generated ACL grants exactly the four GC RPCs, no private helpers/tables/col
 Evidence: seven actual PGlite SQL controls, real owned PostgreSQL17 lock/expiry/rollback controls, targeted mutations, typechecks and full migrator composition are recorded in the handoff. Synthetic tests are not production privacy approval. Org admission remains empty/defaultoff until operator-attested privacy and retention baselines, reviewed resource permissions, complete late-write handling, independent source review and real upload/read/erasure E2E gates are met.
 
 040600's separate publisher ledger may share the existing intent gc_lease_token/until/version exclusion under the same lock order. Publisher claims set gc_keep_groups=NULL, so GC prepare/swap reject that nonce as a plan. GC skips any valid publisher lease; after expiry it may issue a fresh nonce for an actual cleanup plan. Publisher final CAS and heartbeat must check its own ledger plus the exact exclusion nonce/version/deadline, outbox version and original fences. This is read/copy exclusion only, never a substitute for generation-safe canonical S3 publication.
+
+Permanent entry, compiled assets, admission-close/generation contract and remaining resource gates: see [buffered-gc-runtime.md](buffered-gc-runtime.md).
