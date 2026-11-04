@@ -74,9 +74,11 @@ export async function copyBriefFeaturePage(
     throw new BriefFeatureError("checkpoint_invalid");
   deps.signal?.throwIfAborted();
   if (previous.phase === "baseline") {
-    const h =
-      previous.baselineH ??
-      (await readFeatureJournalPage(deps.db, "brief", "0", 1)).observedRevision;
+    // Runtime must persist captured H under its lease BEFORE any CH write.
+    // Recapturing H after a partial baseline crash can skip an intervening delete.
+    if (previous.baselineH === null)
+      throw new BriefFeatureError("baseline_uninitialized");
+    const h = previous.baselineH;
     const page = await readFeatureBaselinePage(
       deps.db,
       "brief",

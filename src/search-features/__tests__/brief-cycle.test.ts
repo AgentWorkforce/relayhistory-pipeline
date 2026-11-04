@@ -34,7 +34,12 @@ test("empty initial baseline never claims ready until a committed journal poll c
   };
   const first = await copyBriefFeaturePage(
     { db, ch },
-    initialBriefFeatureCheckpoint(),
+    {
+      ...initialBriefFeatureCheckpoint(),
+      baselineH: "3",
+      checkpoint: "3",
+      observedRevision: "3",
+    },
   );
   expect(first.complete).toBe(false);
   expect(first.next).toMatchObject({
@@ -109,4 +114,18 @@ test("contextual/non-libc source fold refuses instead of silently adopting runti
   await expect(readLegacyCasefoldProfile(db)).rejects.toMatchObject({
     reason: "casefold_contextual",
   });
+});
+
+test("uninitialized H is refused before any source read or CH write", async () => {
+  let reads = 0;
+  const db: FeatureReader = {
+    async query() {
+      reads++;
+      throw Error("source should not be touched");
+    },
+  };
+  await expect(
+    copyBriefFeaturePage({ db, ch }, initialBriefFeatureCheckpoint()),
+  ).rejects.toMatchObject({ reason: "baseline_uninitialized" });
+  expect(reads).toBe(0);
 });
