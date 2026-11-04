@@ -57,7 +57,6 @@ function fixture() {
     result: rows,
     result_info: {
       page,
-      total_pages: pages,
       per_page: 100,
       count: rows.length,
       total_count: total,
@@ -557,4 +556,32 @@ test("created-here control state permits only six resource keys and refuses app 
     guarded(state + "/state/stacks", { method: "DELETE" }),
   ).rejects.toMatchObject({ code: "state_scope" });
   expect(calls).toHaveLength(count);
+});
+
+test.each([
+  "incomplete",
+  "changedTotal",
+  "wrongCount",
+  "wrongPageSize",
+] as const)("actual no-total_pages pagination refuses %s", async (mode) => {
+  const x = fixture();
+  const wrapped: typeof fetch = async (input, init) => {
+    const r = await x.fetcher(input, init);
+    const url = new URL(String(input));
+    if (!url.pathname.endsWith("/namespaces")) return r;
+    const b = (await r.json()) as any;
+    if (mode === "incomplete" && b.result_info.page === 1) {
+      b.result.pop();
+      b.result_info.count--;
+    }
+    if (mode === "changedTotal" && b.result_info.page === 2)
+      b.result_info.total_count = 102;
+    if (mode === "wrongCount") b.result_info.count++;
+    if (mode === "wrongPageSize") b.result_info.per_page = 99;
+    return Response.json(b);
+  };
+  await expect(
+    bootstrapMetadata(spec, token, wrapped).admission(),
+  ).rejects.toThrow();
+  expect(x.calls.every((c) => c.method === "GET")).toBe(true);
 });
