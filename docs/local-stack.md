@@ -60,8 +60,12 @@ uses via `/readyz`).
 
 The vendored middleware accepts an RS256 JWT verified against a JWKS URL. `up`
 mints a key pair; the ingest serves `/.well-known/jwks.json`; the local courier
-mints short-lived tokens in memory. Hosted and customer installs point
-`RELAYAUTH_JWKS_URL` at RelayAuth instead. A durable host courier sets
+mints short-lived tokens in memory (the local stack sets the dev-only
+`ALLOW_INTERIM_RELAYAUTH_BEARER=true`). Hosted and customer installs point
+`RELAYAUTH_JWKS_URL` at RelayAuth instead, set `AUTH_ISSUER` to RelayAuth's
+issuer, and set `RELAYHISTORY_ORIGIN`, with the interim bearer off: the ingest
+then accepts only RelayAuth's History assertions minted for that exact origin
+(RS256, sole audience, the dedicated token class). A durable host courier sets
 `RELAYAUTH_URL`, the exact `RELAYAUTH_HISTORY_ORIGIN`, and
 `RELAYAUTH_API_KEY_COMMAND_JSON`, a JSON argv array that reads the dedicated
 assertion key from a central broker or secret manager. The command is never run

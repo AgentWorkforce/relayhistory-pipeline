@@ -404,6 +404,9 @@ describe("GCP self-host contract", () => {
         },
       );
     const rendered = JSON.stringify(values);
+    // The origin alone enables RelayAuth's origin-bound assertions; the broad
+    // interim bearer is local-only and never rendered for GCP.
+    expect(rendered).not.toContain("ALLOW_INTERIM_RELAYAUTH_BEARER");
     expect(rendered).toContain("REDIS_TLS_CA_PEM");
     expect(rendered).toContain("REDIS_TRANSIT_ENCRYPTION");
     expect(rendered).toContain("SERVER_AUTHENTICATION");
@@ -464,10 +467,6 @@ describe("GCP self-host contract", () => {
           issuer: "http://relayauth.relayauth.svc:8787",
         },
         extraEnv: expect.arrayContaining([
-          {
-            name: "ALLOW_INTERIM_RELAYAUTH_BEARER",
-            value: "true",
-          },
           {
             name: "RELAYHISTORY_ORIGIN",
             value: "http://bulls96-alleyoop.96bulls.svc:8080",

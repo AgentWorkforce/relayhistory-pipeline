@@ -991,6 +991,82 @@ describe("buildIngestApp auth (production composition)", () => {
     }
   });
 
+  test("default config (interim bearer off, origin set): the REAL courier delivers with RelayAuth's origin-bound assertion; other bearers are refused and write nothing", async () => {
+    const i = await ingest();
+    const objects = async (location: SessionLocation) =>
+      (await i.store.list(objectKey(sessionPrefix(location)))).items.length;
+    const unsigned = `${Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url")}.${liveToken().split(".")[1]}.`;
+    for (const [name, token] of [
+      ["unsigned", unsigned],
+      ["generic", genericToken()],
+      ["generic for this origin", genericToken([ORIGIN])],
+      ["other origin", sign({ ...JSON.parse(Buffer.from(liveToken().split(".")[1]!, "base64url").toString("utf8")), aud: ["https://history.other.test"] })],
+    ] as const) {
+      const response = await i.chunk(token, LOCATION);
+      expect(`${name}: ${response.status}`).toBe(`${name}: 401`);
+    }
+    expect(await objects(LOCATION)).toBe(0);
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+
+    const dir = await mkdtemp(join(tmpdir(), "96bulls-courier-origin-"));
+    const outer = globalThis.fetch;
+    try {
+      const dbPath = join(dir, "history.db");
+      const rawPath = join(dir, "session.jsonl");
+      await writeFile(rawPath, '{"type":"user","message":"one"}\n');
+      const hist = new DatabaseSync(dbPath);
+      hist.exec(
+        "CREATE TABLE sessions (session_id TEXT, source TEXT, raw_path TEXT, first_activity_ms INTEGER, last_activity_ms INTEGER, cwd TEXT, agent_version TEXT)",
+      );
+      hist
+        .prepare("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run("session-origin", "claude", rawPath, 1_700_000_000_000, 1_700_000_000_100, null, "1.0.0");
+      hist.close();
+      const ingestUrl = "http://ingest.test";
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (!url.startsWith(ingestUrl)) return outer(input, init);
+        const u = new URL(url);
+        return i.app.request(`${u.pathname}${u.search}`, init, i.env);
+      }) as typeof fetch;
+      const config = (token: () => string): CourierConfig => ({
+        dbPath,
+        statePath: join(dir, "state.json"),
+        ingestUrl,
+        token: { get: async () => token(), invalidate: () => false },
+        orgId: ORG,
+        workspaceId: WORKSPACE,
+        userId: USER,
+        machineId: "machine-o",
+        harnesses: ["claude"],
+        closeAfterMinutes: 1_000_000,
+        startMode: "all",
+      });
+      // Nothing is delivered with a bearer the interim flag used to admit.
+      expect(await runCourierOnce(config(() => genericToken()))).toMatchObject({ uploaded: 0 });
+      expect(await count("sessions.pipeline_jobs")).toBe(0);
+      expect(await runCourierOnce(config(() => liveToken("machine-o")))).toMatchObject({ uploaded: 1, chunks: 1 });
+      const { rows } = await db.query<{ key: string }>(
+        "SELECT message->'payload'->>'key' AS key FROM sessions.pipeline_jobs",
+      );
+      expect(rows).toHaveLength(1);
+      expect(await i.store.head(objectKey(rows[0]!.key))).toBeTruthy();
+    } finally {
+      globalThis.fetch = outer;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("regression: with the interim bearer off and no origin, even a valid origin-bound assertion is refused (401 auth_not_configured)", async () => {
+    const i = await ingest({ RELAYHISTORY_ORIGIN: "" });
+    for (const token of [liveToken(), genericToken()]) {
+      const response = await i.chunk(token, LOCATION);
+      expect(response.status).toBe(401);
+      expect(await code(response)).toBe("auth_not_configured");
+    }
+    expect(await count("sessions.pipeline_jobs")).toBe(0);
+  });
+
   test("refuses each contract violation end to end", async () => {
     const { upload, manifest, entryText } = await planned();
     const i = await ingest(MIGRATION_ON);
