@@ -25,6 +25,12 @@ const CLI = "/home/khaliqgant/.local/bin/supabase";
 const INPUT = ".96bulls/owner-apply/readonly-plan.json",
   CAPTURE = "docs/plans/supabase-owner-apply.capture.json",
   APPROVAL = ".96bulls/owner-apply/approval.json";
+/** Supabase CLI refreshes this version-only cache during its approved login flow. */
+const CLI_CACHE = "supabase/.temp/cli-latest";
+export function ownerApplySourceFiles(files: string[], cache?: string): void {
+  if (files.some(p => p !== CAPTURE && p !== CLI_CACHE)) no("owner_dirty_checkout");
+  if (files.includes(CLI_CACHE) && (typeof cache !== "string" || cache.length > 64 || !/^v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?\n?$/u.test(cache))) no("owner_cli_cache_invalid");
+}
 export function ownerApplyArgs(argv: string[]) {
   const mode = argv[0];
   if (
@@ -89,7 +95,7 @@ export async function ownerApplyMain(argv = process.argv.slice(2)) {
         "\0",
       ),
     ].filter(Boolean);
-    if (files.some((p) => p !== CAPTURE)) no("owner_dirty_checkout");
+    ownerApplySourceFiles(files, files.includes(CLI_CACHE) ? await text(CLI_CACHE) : undefined);
   };
   await recheckSource();
   const planText = await text(INPUT),

@@ -12,7 +12,7 @@ import {
   auditCanonicalOwnerSql,
   applyOwnerRelease,
 } from "../owner-operator-apply.ts";
-import { ownerApplyArgs } from "../../../scripts/schema-release-owner-apply.ts";
+import { ownerApplyArgs, ownerApplySourceFiles } from "../../../scripts/schema-release-owner-apply.ts";
 const pin = { sha: "a".repeat(40), generation: "b".repeat(64) },
   now = Date.now();
 function boundary() {
@@ -331,4 +331,13 @@ test("the first live apply ledger pin is the captured175 baseline", () => {
   expect(A.ledger).toBe(
     "175cd1eb198a8afc62576c7ebe5fd2bf06526b3222a94ee3c9b346e7b6a0d129",
   );
+});
+
+test("approved CLI version-cache churn cannot hide dirty source or arbitrary artifacts", () => {
+  expect(() => ownerApplySourceFiles(["supabase/.temp/cli-latest"], "v3.0.0")).not.toThrow();
+  expect(() => ownerApplySourceFiles(["docs/plans/supabase-owner-apply.capture.json", "supabase/.temp/cli-latest"], "v3.0.0\n")).not.toThrow();
+  for (const path of ["supabase/migrations/20261104055000_lazy_current_custody.sql", "scripts/schema-release-owner-apply.ts", "supabase/.temp/project-ref", ".96bulls/unreviewed.sql"])
+    expect(() => ownerApplySourceFiles(["supabase/.temp/cli-latest",path], "v3.0.0")).toThrow("owner_dirty_checkout");
+  for (const cache of [undefined, "v3.0.0\nextra", "$(command)", "v"+"3".repeat(65)+".0.0"])
+    expect(() => ownerApplySourceFiles(["supabase/.temp/cli-latest"], cache)).toThrow("owner_cli_cache_invalid");
 });
