@@ -156,7 +156,7 @@
                     },
                     "StringLike": {
                       "kms:EncryptionContext:aws:s3:arn": {
-                        "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/v1/ws=*/m=srv_*/b=*.staged.ndjson.zst"
+                        "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/v1/ws=*/m=srv_*"
                       }
                     }
                   }

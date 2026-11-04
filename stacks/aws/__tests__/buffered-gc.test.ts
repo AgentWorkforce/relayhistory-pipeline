@@ -42,6 +42,10 @@ test("actual producer stage permits needed operations but no plain deletion", ()
   expect(decision("s3:PutObject", arn(key), { "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": parameters.KmsKeyArn! })).toBe("allowed");
   expect(decision("s3:PutObject", arn(key))).toBe("implicitDeny");
   expect(decision("s3:DeleteObject", arn(key))).toBe("implicitDeny");
+  const kmsContext = {"kms:CallerAccount":"941433935742", "kms:ViaService":"s3.us-east-1.amazonaws.com", "kms:EncryptionContext:aws:s3:arn":arn(key)};
+  expect(decision("kms:Decrypt", parameters.KmsKeyArn!, kmsContext)).toBe("allowed");
+  expect(decision("kms:GenerateDataKey", parameters.KmsKeyArn!, kmsContext)).toBe("allowed");
+  expect(decision("kms:Decrypt", parameters.KmsKeyArn!, {...kmsContext,"kms:ViaService":"kms.us-east-1.amazonaws.com"})).toBe("implicitDeny");
   expect(decision("s3:ListBucketVersions", `arn:aws:s3:::${parameters.BufferBucket}`, { "s3:prefix": key })).toBe("allowed");
 });
 test("canonical derived and staged-looking canonical paths remain explicitly denied", () => {
