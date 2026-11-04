@@ -79,6 +79,34 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS
 DECLARE candidate record;q sessions.history_model_wakeups;e jsonb;items jsonb:='[]'::jsonb;started timestamptz:=clock_timestamp();
 BEGIN
  PERFORM sessions.ingest_require_generation(p->>'generation');
+ -- A schema upgrade never adopts an old lease/frontier. Once expired, an old
+ -- PENDING row is only a bounded scope hint: lock/recheck its original source
+ -- under this generation, cancel that exact old work, then create a fresh wake.
+ -- Completed/terminal failures remain unchanged. No whole-corpus read/scan.
+ FOR candidate IN SELECT work_id,evidence FROM sessions.history_model_work
+  WHERE status='pending' AND evidence->>'generation' IS DISTINCT FROM p->>'generation'
+   AND(lease_until IS NULL OR lease_until<=clock_timestamp())
+  ORDER BY next_attempt_at,created_at,work_id LIMIT 32 LOOP
+  e:=jsonb_set(candidate.evidence,'{generation}',p->'generation',false);
+  IF sessions.ingest_history_source_current(e,true) IS NULL THEN
+   UPDATE sessions.history_model_work SET status='canceled',last_error_code='source_or_graph_changed',
+    lease_token=NULL,lease_until=NULL,checkpoint_version=checkpoint_version+1
+    WHERE work_id IN(SELECT work_id FROM sessions.history_model_work WHERE work_id=candidate.work_id
+     AND status='pending' AND evidence=candidate.evidence
+     AND(lease_until IS NULL OR lease_until<=clock_timestamp())FOR UPDATE SKIP LOCKED);
+   CONTINUE;
+  END IF;
+  UPDATE sessions.history_model_work SET status='canceled',last_error_code='schema_generation_changed',
+   lease_token=NULL,lease_until=NULL,checkpoint_version=checkpoint_version+1
+   WHERE work_id IN(SELECT work_id FROM sessions.history_model_work WHERE work_id=candidate.work_id
+    AND status='pending' AND evidence=candidate.evidence
+    AND(lease_until IS NULL OR lease_until<=clock_timestamp())FOR UPDATE SKIP LOCKED);
+  IF NOT FOUND THEN CONTINUE;END IF;
+  INSERT INTO sessions.history_model_wakeups(org_id,workspace_id,harness,session_id,authority_id,source_epoch,source_fingerprint,mask_sha256)
+   VALUES(e->'identity'->>'orgId',e->'identity'->>'workspaceId',e->'identity'->>'source',e->'identity'->>'sessionId',
+    (e->>'authorityId')::uuid,(e->'source'->>'epoch')::bigint,e->'source'->>'fingerprint',e->>'maskSha256')
+   ON CONFLICT(org_id,workspace_id,harness,session_id)DO NOTHING;
+ END LOOP;
  FOR candidate IN SELECT * FROM sessions.history_model_wakeups WHERE lease_until IS NULL OR lease_until<=clock_timestamp()
   ORDER BY queued_at,org_id,workspace_id,harness,session_id LIMIT 32 LOOP
   e:=jsonb_build_object('generation',p->>'generation','identity',jsonb_build_object('orgId',candidate.org_id,'workspaceId',candidate.workspace_id,'source',candidate.harness,'sessionId',candidate.session_id),

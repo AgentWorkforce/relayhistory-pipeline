@@ -32,7 +32,12 @@ locks. A job cannot adopt another lease or resume onto a new source.
 bounded retry and terminal failure. Wakes clear only with matching-source
 enqueue. A model failure publishes no fake empty result. Retryable failures
 back off; at most twelve consecutive attempts without progress are admitted.
-Nonretryable failure is durable. The creator-only retry RPC revokes old nonces
+Nonretryable failure is durable. After a schema upgrade, bounded discovery uses
+expired prior-generation pending rows only as scope hints, cancels those old
+leases and creates fresh wakes after rechecking the same current source. It
+does not adopt old frontiers, replay completed work, or automatically regenerate
+unchanged summaries when only the model/key configuration changes.
+The creator-only retry RPC revokes old nonces
 and admits only the same still-current source/graph/config.
 
 ## Bounded model and object work
@@ -107,8 +112,18 @@ fold, masked graph, restricted roles, durable discovery/work and both encrypted
 pointers. A source change during final read withholds the still-readable old
 ciphertext. This is an offline provider fixture, not a live quality/spend proof.
 
-The dedicated-role policy has separate actual owned PostgreSQL 15/16/17
-controls; the first proof covered the seven-capability predecessor, and must be
-rerun against the final eight-capability source before signoff. Full corpus,
-cloud KMS/IAM, real provider, persistent runtime and actual Desktop caller
-acceptance are not inferred from those results.
+The final eight-capability role policy has 15 actual owned PostgreSQL controls
+on each of versions 15/16/17 (45 total), including effective PUBLIC leaks,
+reachable membership, unexpected EXECUTE, approved LOGIN and timeout drift.
+The clean packaged Node24 job also runs against fresh PG17 and versioned MinIO
+with a real local HTTP Responses fixture, both small and multiMiB sessions,
+exact nested big integers, known-intent/lost-PUT retry, both cipher pointers,
+provider refusal, owner-role rejection and complete pool cleanup. These tests
+replace only connection/secret/provider transport with owned fixture ports.
+SSE-KMS headers are checked before the MinIO bridge strips/re-signs them; this
+is not proof of actual AWS KMS/resource policies. Full corpus, real-provider
+quality/spend, deployed runtime and actual Desktop caller acceptance remain
+separate RED gates. See src/proof/full-model-runtime.ts for the reproducible
+packaged proof; build via scripts/build-full-model.ts into a unique relay-briefs
+directory from a clean checkout. Its immutable manifest pins HEAD, generation,
+all five verifier SHAs, template, bundle and ZIP.

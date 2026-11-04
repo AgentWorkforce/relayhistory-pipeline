@@ -142,7 +142,7 @@ try{
  check("final packaged job uses actual HTTP structured Responses/all long rows and both authenticated encrypted summaries");
  assert(jobPools.every(p=>(p as any).ending===true));check("all owned job and heartbeat pools close after every invocation");
 
- const {enqueueFullModelWork,modelWorkConfig}=await import("../bob-costas/full-model-ledger.ts");
+ const {enqueueFullModelWork,claimFullModelWork,modelWorkConfig}=await import("../bob-costas/full-model-ledger.ts");
  const modelPool=new pg.Pool({host:"127.0.0.1",port,user:"bulls96_session_model",database:"postgres",connectionTimeoutMillis:1000,max:1});pools.push(modelPool);
  const modelDb={query:async<T>(q:string,p?:unknown[])=>({rows:(await modelPool.query(q,p)).rows as T[]})};
  const compact=await captureHistorySourceReference(modelDb,identity,{schemaGeneration:gen});
@@ -154,6 +154,19 @@ try{
  const refusal=(await owner.query("SELECT status,last_error_code FROM sessions.history_model_work WHERE config->>'model'='fixture-refusal'")).rows[0];
  assert.equal(refusal.status,"failed");assert.equal(refusal.last_error_code,"model_refusal");
  providerMode="normal";check("actual provider refusal is durable terminal failure, never fake empty completion");
+ if(!long){
+  await enqueueFullModelWork(modelDb,compact,modelWorkConfig("fixture-upgrade",key.keyId,graph.publication!));
+  const oldTicket=(await claimFullModelWork(modelDb,gen,"fixture-upgrade"))!;assert(oldTicket);
+  const e={generation:"d".repeat(64),identity:compact.identity,source:compact.source,authorityId:compact.authorityId,maskSha256:compact.maskSha256};
+  await owner.query("UPDATE sessions.history_model_work SET evidence=$1::jsonb,captured=jsonb_set(captured,'{schemaGeneration}',to_jsonb($2::text)),work_key=encode(sha256(convert_to(jsonb_build_array('history-model-work-v1',$1::jsonb,config)::text,'UTF8')),'hex')WHERE work_id=$3",[JSON.stringify(e),"d".repeat(64),oldTicket.workId]);
+  const waiting=await api({...env,BOB_COSTAS_MODEL:"fixture-upgrade"},()=>300000,overrides);assert.equal(waiting.claimed,0);
+  await owner.query("UPDATE sessions.history_model_work SET lease_until=clock_timestamp()-interval '1 second' WHERE work_id=$1",[oldTicket.workId]);
+  const restarted=await api({...env,BOB_COSTAS_MODEL:"fixture-upgrade"},()=>300000,overrides);assert.equal(restarted.completed,1);
+  const jobs=(await owner.query("SELECT work_id,status,last_error_code FROM sessions.history_model_work WHERE config->>'model'='fixture-upgrade'")).rows;
+  assert.equal(jobs.find(x=>x.work_id===oldTicket.workId).status,"canceled");assert.equal(jobs.find(x=>x.work_id!==oldTicket.workId).status,"complete");
+  check("actual packaged discovery restarts expired old-generation pending work without adopting its nonce/frontier");
+ }
+
  let wrongPool:pg.Pool|undefined;
  await assert.rejects(api(env,()=>300000,{...overrides,pool:()=>{wrongPool=new pg.Pool({host:"127.0.0.1",port,user:"postgres",database:"postgres",connectionTimeoutMillis:1000,max:1});jobPools.push(wrongPool);return wrongPool}}),{code:"model_database_role"});
  assert(jobPools.every(p=>(p as any).ending===true));check("actual owner connection refuses before provider and closes both pools");

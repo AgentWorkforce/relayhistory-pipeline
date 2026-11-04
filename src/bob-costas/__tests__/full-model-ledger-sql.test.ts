@@ -3,7 +3,7 @@
 import{test,expect}from"bun:test";
 import{PGlite}from"@electric-sql/pglite";
 import{readFile}from"node:fs/promises";
-import{enqueueFullModelWork,claimFullModelWork,heartbeatFullModelWork,checkpointFullModelWork,failFullModelWork,modelWorkConfig}from"../full-model-ledger.ts";
+import{enqueueFullModelWork,claimFullModelWork,heartbeatFullModelWork,checkpointFullModelWork,failFullModelWork,discoverFullModelScopes,modelWorkConfig}from"../full-model-ledger.ts";
 import type{HistorySourceReference}from"../../shared/history-source-authority.ts";
 const GEN="a".repeat(64),HASH="b".repeat(64),ID="12345678-1234-1234-1234-123456789abc";
 const captured:HistorySourceReference={identity:{orgId:"org",workspaceId:"ws",source:"claude",sessionId:"session"},source:{epoch:"9007199254740993",fingerprint:HASH},authorityId:ID,maskSha256:HASH,recordCount:"1",schemaGeneration:GEN,derivedAnchorKey:"fixture-anchor"};
@@ -116,5 +116,25 @@ test("actual630 derives namespace and row count from locked source instead of ca
  }
  expect((await f.db.query("SELECT * FROM sessions.history_model_work")).rows).toHaveLength(0);
  expect((await f.enqueue()).current).toBe(true);
+ }finally{await f.pg.close()}
+},10000);
+
+
+test("new schema generation re-wakes only expired pending work without adopting its nonce or frontier",async()=>{
+ const f=await fixture();try{
+ await f.enqueue();const t=(await claimFullModelWork(f.db,GEN,"fixture-model"))!;
+ const old="d".repeat(64),e={...f.evidence,generation:old};
+ await f.db.query("UPDATE sessions.history_model_work SET evidence=$1::jsonb,captured=jsonb_set(captured,'{schemaGeneration}',to_jsonb($2::text)),work_key=encode(sha256(convert_to(jsonb_build_array('history-model-work-v1',$1::jsonb,config)::text,'UTF8')),'hex')",[JSON.stringify(e),old]);
+ expect(await discoverFullModelScopes(f.db,GEN)).toEqual([]);
+ expect((await f.db.query<any>("SELECT status FROM sessions.history_model_work")).rows[0]?.status).toBe("pending");
+ await f.pg.exec("UPDATE sessions.history_model_work SET lease_until=clock_timestamp()-interval '1 second'");
+ const wake=await discoverFullModelScopes(f.db,GEN);expect(wake).toHaveLength(1);
+ expect((await f.db.query<any>("SELECT status,last_error_code FROM sessions.history_model_work")).rows[0]).toEqual({status:"canceled",last_error_code:"schema_generation_changed"});
+ expect(await heartbeatFullModelWork(f.db,t)).toBe(false);
+ await enqueueFullModelWork(f.db,captured,f.config,wake[0]!.wakeToken);
+ const fresh=(await claimFullModelWork(f.db,GEN,"fixture-model"))!;
+ expect(fresh.workId).not.toBe(t.workId);expect(fresh.leaseToken).not.toBe(t.leaseToken);
+ expect(fresh.checkpoint.cursor).toEqual({rowOrdinal:"0",utf16Offset:0});expect(fresh.checkpoint.calls).toBe("0");
+ expect((await f.db.query("SELECT * FROM sessions.history_model_wakeups")).rows).toHaveLength(0);
  }finally{await f.pg.close()}
 },10000);
