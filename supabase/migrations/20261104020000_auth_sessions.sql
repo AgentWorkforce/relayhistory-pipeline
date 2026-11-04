@@ -1,3 +1,5 @@
+-- Appended as 20261104020000 to preserve existing upstream ledger prefixes.
+-- Upstream provenance: relayhistory-cloud supabase/migrations/20261101000000_auth_sessions.sql.
 -- History token auth (`rth_at_*` / `rth_st_*` / `rth_rt_*` hash lookup) on
 -- Supabase, so the Worker's hottest Neon read can leave Neon. Code only:
 -- applying it to a hosted project needs Khaliq's go.

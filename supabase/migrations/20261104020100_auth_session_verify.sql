@@ -1,3 +1,4 @@
+-- Appended as 20261104020100 to preserve existing upstream ledger prefixes.
 -- A second verifier for relayhistory bearer tokens (`rth_at_*` / `rth_st_*`):
 -- lets another service (the 96Bulls session read API) check a token against
 -- sessions.auth_sessions over PostgREST without Neon and without the
@@ -17,7 +18,7 @@
 --     EXECUTE on sessions.auth_session_verify, nothing else: no table, no other
 --     function, no BYPASSRLS. It is a member of no role. Its members may only be
 --     the separately approved `authenticator` edge (PostgREST's switch-to, a
---     deployment step without ADMIN OPTION) and, on Supabase PG16+, the
+--     deployment step without ADMIN OPTION or inherited privileges) and, on Supabase PG16+, the
 --     unavoidable `postgres` creator edge (granted by the superuser
 --     supabase_admin, ADMIN without INHERIT or SET).
 --   sessions.auth_token_verifier_policy: the one JWT issuer and audience the
@@ -42,7 +43,9 @@
 -- last_used_at stays relayhistory's: this function never writes.
 --
 -- Not done here, deliberately (deployment steps, relayhistory-cloud docs/auth-backend.md):
---   GRANT session_token_verifier TO authenticator  (PostgREST's switch-to edge)
+--   PG16+: GRANT session_token_verifier TO authenticator
+--            WITH INHERIT FALSE, SET TRUE, ADMIN FALSE
+--   PG15: GRANT session_token_verifier TO authenticator (member must be NOINHERIT)
 --   INSERT INTO sessions.auth_token_verifier_policy (issuer, audience) VALUES (...)
 
 DO $role$
@@ -71,7 +74,7 @@ BEGIN
     v_problems := array_append(v_problems, format('member of %I', v_row.rolname)::text);
   END LOOP;
   -- Members OF the verifier. Only the separately approved authenticator edge
-  -- (never ADMIN) and, on Supabase PG16+, the unavoidable postgres creator edge.
+  -- (never ADMIN or inherited privileges) and, on Supabase PG16+, the unavoidable postgres creator edge.
   IF v_version >= 160000 THEN
     FOR v_row IN EXECUTE
       'SELECT u.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super,
@@ -83,16 +86,17 @@ BEGIN
       IF v_row.rolname = 'postgres' AND v_row.grantor = 'supabase_admin' AND v_row.grantor_super
          AND v_row.admin_option AND NOT v_row.inherit_option AND NOT v_row.set_option THEN
         NULL; -- Supabase PG16+ creator edge
-      ELSIF v_row.rolname = 'authenticator' AND NOT v_row.admin_option THEN
+      ELSIF v_row.rolname = 'authenticator' AND NOT v_row.admin_option
+         AND NOT v_row.inherit_option AND v_row.set_option THEN
         NULL; -- separately approved PostgREST switch-to edge
       ELSE
         v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
       END IF;
     END LOOP;
   ELSE
-    FOR v_row IN SELECT u.rolname, m.admin_option FROM pg_auth_members AS m
+    FOR v_row IN SELECT u.rolname, u.rolinherit, m.admin_option FROM pg_auth_members AS m
                    JOIN pg_roles AS u ON u.oid = m.member WHERE m.roleid = r.oid LOOP
-      IF NOT (v_row.rolname = 'authenticator' AND NOT v_row.admin_option) THEN
+      IF NOT (v_row.rolname = 'authenticator' AND NOT v_row.admin_option AND NOT v_row.rolinherit) THEN
         v_problems := array_append(v_problems, format('granted to %I', v_row.rolname)::text);
       END IF;
     END LOOP;

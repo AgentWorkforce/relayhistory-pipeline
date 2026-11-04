@@ -344,14 +344,14 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261031000000_migration_assertion_ledger.sql`       | table sessions.migration_assertion_uses                                                                                 |
 | `upstream:20261031000100_manifest_readiness.sql`               | table sessions.manifest_readiness                                                                                       |
 | `upstream:20261031001000_session_directory_reads_expand.sql`   | table sessions.session_directory_resurrection_fences                                                                    |
-| `upstream:20261101000000_auth_sessions.sql`                    | table sessions.auth_sessions                                                                                            |
 | `upstream:20261101000000_migration_ingest_audit_base_read.sql` | table sessions.migration_base_read_uses                                                                                 |
-| `upstream:20261101000100_auth_session_verify.sql`              | table sessions.auth_token_verifier_policy                                                                               |
 | `upstream:20261101000200_claimless_window_activations.sql`     | table sessions.claimless_window_activations                                                                             |
 | `upstream:20261101050000_session_directory_list.sql`           | table sessions.session_directory_agents                                                                                 |
 | `upstream:20261102000000_session_briefs.sql`                   | table sessions.session_briefs                                                                                           |
 | `upstream:20261102010000_session_directory_canonical_ids.sql`  | column sessions.session_index.canonical_session_id                                                                      |
 | `upstream:20261102020000_session_brief_state.sql`              | ALTER-only: column sessions.session_briefs.state                                                                        |
+| `upstream:20261104020000_auth_sessions.sql`                    | table sessions.auth_sessions                                                                                            |
+| `upstream:20261104020100_auth_session_verify.sql`              | table sessions.auth_token_verifier_policy                                                                               |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
@@ -752,3 +752,27 @@ left unchanged, while a fresh database executes and records
 Both hashes, the migration name and the fact that this is the sole alias are pinned by a
 test. Any third checksum or any other migration name fails closed. The alias is emitted
 in migration logs and `--activation-check`; generation remains based on the current file.
+
+### Auth verifier append-only upgrade and membership
+
+The vendored auth source filenames are preserved in their provenance comments.
+This repository applies them as `20261104020000_auth_sessions.sql` and
+`20261104020100_auth_session_verify.sql`, after existing upstream migrations.
+Do not restore the earlier insertion timestamps: a populated upstream migration
+ledger must remain a contiguous prefix. The migrator never renames/imports an
+applied ledger row or bypasses its checksum/sequence guard. These auth migrations
+are unreleased here; an installation with the earlier draft filenames already
+recorded requires explicit operator reconciliation, not an automatic ledger edit.
+
+The verifier bootstrap, migration role guard and phase-2 verifier all require a
+switch-only authenticator membership: no ADMIN OPTION, and on PostgreSQL16+
+`INHERIT FALSE, SET TRUE`; on PostgreSQL15 the authenticator member role must be
+`NOINHERIT`. Existing unsafe membership is refused without changing it. Grants or
+role changes remain operator actions. T0's target setup runs both privileged role
+bootstraps before its sorted migration files.
+
+`scripts/pg-proof/auth-upgrade-proof.ts` exercises the actual T0 setup, the pinned
+21-step pre-auth base ledger plus preserved data, no-op retry, all three guards,
+and effective inherited-vs-switch privileges on disposable PG15/16/17. It refuses
+existing verifier/authenticator/directory roles and requires explicit disposable
+cluster opt-in. The new proof runs before the general role proof in CI.
