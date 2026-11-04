@@ -36,8 +36,13 @@ export async function semanticSha256(value:string):Promise<string>{const b=await
 export function semanticStatusVersion(generation:string,dirty:boolean){if(!semanticDecimal(generation)||generation==="0")throw new Error("feature_generation_invalid");return (2n*BigInt(generation)+(dirty?0n:1n)).toString()}
 export function parseSemanticProfile(json:string):SemanticFeatureProfile{
  if(new TextEncoder().encode(json).length>SEMANTIC_COPY_PROFILE_BYTES)throw new Error("feature_profile_bound");
- const v=JSON.parse(json);if(!v||Object.keys(v).sort().join(",")!=="entries,source"||!v.source||typeof v.source!=="object"||Array.isArray(v.source)||!["datcollate","datctype","datlocprovider"].every(k=>typeof v.source[k]==="string"&&v.source[k])||v.source.datlocprovider!=="c"||!Array.isArray(v.entries)||v.entries.length>SEMANTIC_COPY_PROFILE_ENTRIES)throw new Error("feature_profile_invalid");
+ const v=JSON.parse(json);if(!v||Object.keys(v).sort().join(",")!=="entries,source"||!v.source||typeof v.source!=="object"||Array.isArray(v.source)||!["datcollate","datctype","datlocprovider"].every(k=>typeof v.source[k]==="string"&&v.source[k])||!((v.source.datlocprovider==="c"&&(v.source.datlocale===undefined||v.source.datlocale===""))||(v.source.datlocprovider==="b"&&v.source.datcollate==="C.UTF-8"&&v.source.datctype==="C.UTF-8"&&v.source.datlocale==="C.UTF-8"))||!Array.isArray(v.entries)||v.entries.length>SEMANTIC_COPY_PROFILE_ENTRIES)throw new Error("feature_profile_invalid");
  const keys=new Set<string>();for(const p of v.entries){if(!Array.isArray(p)||p.length!==2||p.some((s:unknown)=>typeof s!=="string"||Array.from(s).length!==1)||keys.has(p[0]))throw new Error("feature_profile_invalid");keys.add(p[0])}
  return {sourceHash:"",source:v.source,entries:v.entries};
 }
 export function foldSemanticQuery(profile:SemanticFeatureProfile,text:string){const map=new Map(profile.entries);return Array.from(text,c=>map.get(c)??c).join("")}
+
+export function semanticTargetHashInput(endpoint:string,database:string,eventSchemaProtocolHash:string,briefSchemaProtocolHash:string){const u=new URL(endpoint);if(!["http:","https:"].includes(u.protocol)||!database||!semanticHash(eventSchemaProtocolHash)||!semanticHash(briefSchemaProtocolHash))throw new Error("feature_target_invalid");return JSON.stringify(["semantic-copy-target-v1",u.origin+u.pathname.replace(/\/+$/u,""),database,eventSchemaProtocolHash,briefSchemaProtocolHash])}
+
+/** Legacy frozen-rank cursors bind deployment/source identity, not moving journal checkpoints. */
+export function semanticCursorBindingInput(v:Pick<SemanticFeatureAuthority,"sourceId"|"sourceAuthorityHash"|"targetHash"|"profileHash">){return JSON.stringify(["semantic-copy-cursor-v1",v.sourceId,v.sourceAuthorityHash,v.targetHash,v.profileHash])}

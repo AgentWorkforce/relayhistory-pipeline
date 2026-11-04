@@ -1,5 +1,5 @@
 import {expect,test} from "bun:test";
-import {semanticCheckpoint,semanticSha256,semanticDataHashInput,semanticAuthorityHashInput,semanticStatusVersion,parseSemanticProfile,foldSemanticQuery} from "../semantic-copy-protocol.ts";
+import {semanticCheckpoint,semanticSha256,semanticDataHashInput,semanticAuthorityHashInput,semanticStatusVersion,parseSemanticProfile,foldSemanticQuery,semanticCursorBindingInput} from "../semantic-copy-protocol.ts";
 test("authority generation fences writes while stable data hashes preserve unchanged cursor identity",async()=>{
  const v={sourceId:"legacy-main",kind:"event" as const,sourceAuthorityHash:"a".repeat(64),targetHash:"b".repeat(64),profileHash:"c".repeat(64),stateHash:"d".repeat(64)};
  const data=await semanticSha256(semanticDataHashInput(v));expect(data).toMatch(/^[a-f0-9]{64}$/);expect(await semanticSha256(semanticDataHashInput({...v}))).toBe(data);
@@ -15,3 +15,7 @@ test("fold profile preserves source mapping and refuses duplicate or unbounded m
  expect(()=>parseSemanticProfile(json.replace('[["İ","i"]]','[["İ","i"],["İ","x"]]'))).toThrow("feature_profile_invalid");
  expect(()=>parseSemanticProfile(" ".repeat(262145))).toThrow("feature_profile_bound");
 });
+
+test("builtin profile requires exact attested C.UTF-8 locale metadata and preserves simple source sigma",()=>{const profile={source:{datcollate:"C.UTF-8",datctype:"C.UTF-8",datlocprovider:"b",datlocale:"C.UTF-8"},entries:[["Ο","ο"],["Σ","σ"]]};expect(foldSemanticQuery(parseSemanticProfile(JSON.stringify(profile)),"ΟΣ_%")).toBe("οσ_%");for(const patch of [{datlocale:""},{datcollate:"en_US.utf8"},{datctype:"C"},{datlocprovider:"i"}])expect(()=>parseSemanticProfile(JSON.stringify({...profile,source:{...profile.source,...patch}}))).toThrow("feature_profile_invalid")});
+
+test("frozen rank cursor identity survives unrelated progress and changes only for deployment/source/profile",()=>{const a={sourceId:"legacy-main",sourceAuthorityHash:"a".repeat(64),targetHash:"b".repeat(64),profileHash:"c".repeat(64)},b={...a,dataHash:"changed",generation:"99",checkpoint:"999"};expect(semanticCursorBindingInput(a)).toBe(semanticCursorBindingInput(b));expect(semanticCursorBindingInput({...a,profileHash:"d".repeat(64)})).not.toBe(semanticCursorBindingInput(a))});
