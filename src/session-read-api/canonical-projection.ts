@@ -88,13 +88,27 @@ export async function readManifestRecords(
   decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
   maxRecords = Number.POSITIVE_INFINITY,
 ): Promise<RelayhistoryStreamRecord[]> {
+  const rows: RelayhistoryStreamRecord[] = [];
+  for await (const row of streamManifestRecords(manifest, store, prefix, decompress, maxRecords))
+    rows.push(row);
+  return rows;
+}
+
+/** Bounded chunk-by-chunk reader; proofs need not retain full session payloads. */
+export async function* streamManifestRecords(
+  manifest: ManifestV1,
+  store: ObjectStore,
+  prefix: string,
+  decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
+  maxRecords = Number.POSITIVE_INFINITY,
+): AsyncGenerator<RelayhistoryStreamRecord> {
   if (manifest.raw.format !== "ndjson")
     throw new PipelineError(
       "raw_format_unsupported",
       "only ndjson raw is indexed",
       false,
     );
-  const records: RelayhistoryStreamRecord[] = [];
+  let records = 0;
   for (const { entry, key } of chunkKeys(manifest, { prefix })) {
     if (
       entry.stored_bytes > MAX_CHUNK_BYTES ||
@@ -162,16 +176,16 @@ export async function readManifestRecords(
     }
     for (const line of text.split("\n"))
       if (line) {
-        if (records.length >= maxRecords)
+        if (records >= maxRecords)
           throw new PipelineError(
             "scope_too_large",
             "actual canonical record count exceeds scope limit",
             false,
           );
-        records.push(parseRelayhistoryRecord(line));
+        records += 1;
+        yield parseRelayhistoryRecord(line);
       }
   }
-  return records;
 }
 
 type Json = Record<string, unknown>;

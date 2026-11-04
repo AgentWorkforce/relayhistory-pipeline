@@ -1,5 +1,6 @@
 -- Append-only release name; authored originally as 20261102010000_session_ingest_ledger.sql.
--- The original name was never released/applied. Original statement bodies preserved.
+-- The original name was never released/applied. Original statement bodies preserved except the source-blind seed RPC grants,
+-- retired in the reviewed040400 proof-seed change.
 -- The session ingest's ledger (src/session-ingest/ledger.ts): what relayhistory's
 -- `accept_delivery_batch` decided in Neon that is not transcript content, so the
 -- 96Bulls ingest (POST /v1/delivery/batches, a Cloudflare Worker) needs no Neon. Code only:
@@ -1087,5 +1088,4 @@ GRANT EXECUTE ON FUNCTION sessions.ingest_claim_batch(jsonb), sessions.ingest_co
   sessions.ingest_set_session_uploads(jsonb), sessions.ingest_reset_uploaded_sessions(jsonb),
   sessions.ingest_fanout_fence(jsonb), sessions.ingest_commit_revisions(jsonb)
   TO bulls96_session_ingest;
-GRANT EXECUTE ON FUNCTION sessions.ingest_seed_records(jsonb), sessions.ingest_seed_fences(jsonb)
-  TO bulls96_session_ingest_seeder;
+-- Retired unsafe seeds are owner-only;040400 installs the S3-proven replacement.

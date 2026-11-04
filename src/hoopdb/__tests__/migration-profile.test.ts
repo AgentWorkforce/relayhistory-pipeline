@@ -2674,3 +2674,23 @@ describe("session token verifier phase 2", () => {
     );
   });
 });
+
+describe("S3 proof seeder phase 2",()=>{
+ const verify="supabase/bootstrap/session_ingest_seeder_verify.sql";
+ test("OID comparison survives visible sessions schema and effective column drift closes live gate",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  await db.exec("SET search_path=sessions,public");
+  await db.exec(readFileSync(join(root,verify),"utf8"));
+  const expected=await expectedSchema();
+  expect(await schemaVerdict(expected,transact(db))).toEqual({ok:true});
+  await db.exec("GRANT SELECT(id) ON sessions.ingest_seed_captures TO PUBLIC");
+  expect((await schemaVerdict(expected,transact(db))).ok).toBe(false);
+ });
+ test("seeder failure cannot leave PASS after the other two verifiers succeeded",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  await db.exec("GRANT SELECT ON sessions.ingest_seed_captures TO bulls96_session_ingest_seeder");
+  const error=await failure(runMigrations(client(db),{profile:LOCAL}));
+  expect(error).not.toBeNull();
+  expect((await db.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0]).toEqual({status:"pending"});
+ });
+});

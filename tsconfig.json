@@ -30,7 +30,10 @@
     "stacks",
     "alchemy.run.ts",
     "smoke",
-    "src/types/*.d.ts"
+    "src/types/*.d.ts",
+    "scripts/session-ingest-seed.ts",
+    "scripts/proof-ingest-s3-seed.ts",
+    "scripts/sync-ingest-seed-boundary.ts"
   ],
   "exclude": [
     "node_modules",
