@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseCliLogin, ownerPlanInputs } from "./schema-release-owner-operator-plan.ts";
+import { parseCliLogin, ownerPlanInputs } from "../../../scripts/schema-release-owner-operator-plan.ts";
 const good = ["export PGHOST='db.pyamkrhoyszgzirqqffq.supabase.co'", "export PGPORT='5432'", "export PGUSER='cli_login_postgres'", "export PGPASSWORD='fake-unit-only-credential-value'", "export PGDATABASE='postgres'"].join("\n");
 describe("existing approved project owner plan", () => {
   test("reads CLI credential in memory without interpreting unrelated shell commands", () => { const p = parseCliLogin(good + "\nrm -rf /never-run-this-unit-fixture"); expect(p.password).toBe("fake-unit-only-credential-value"); });
