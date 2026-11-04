@@ -4,13 +4,13 @@ import {objectKey,readAll,type ObjectStore} from "../../packages/object-store/sr
 import type {SqlExecutor} from "../../packages/pipeline/src/lib/pipeline/queue.ts";
 import type {ArtifactIdentity,ArtifactSource} from "../session-read-api/canonical-artifact.ts";
 import {ARTIFACT_MAX_OBJECT_BYTES} from "../session-read-api/canonical-artifact.ts";
-import {ANALYSIS_ARTIFACT_TABLES,ANALYSIS_MAX_SNAPSHOT_BYTES,analysisSnapshotJson,analysisGenerationJson,type SessionAnalysisIndex,type SessionAnalysisSnapshot} from "../session-read-api/session-analysis-artifact.ts";
+import {ANALYSIS_ARTIFACT_TABLES,ANALYSIS_MAX_SNAPSHOT_BYTES,analysisSnapshotJson,analysisGenerationJson,analysisSourceSnapshotJson,type SessionAnalysisIndex,type SessionAnalysisSnapshot} from "../session-read-api/session-analysis-artifact.ts";
 import {materializeCanonicalArtifacts,artifactDigest,ArtifactBuildError} from "./replay-pages.ts";
 import {readLegacyAnalysisSnapshot,type ReadonlyAnalysisSource} from "./analysis-snapshot.ts";
 import type {ReplayCapture} from "./replay-publication.ts";
 export interface AnalysisPublisherDeps {db:SqlExecutor;store:ObjectStore;source:ReadonlyAnalysisSource;lease:{nonce:string;source:ArtifactSource}}
 function refuse(code:string):never{throw new ArtifactBuildError(code)}
-export function analysisArtifactGeneration(identity:ArtifactIdentity,source:ArtifactSource,snapshot:SessionAnalysisSnapshot,snapshotSha256:string){return artifactDigest(analysisGenerationJson(identity,source,snapshot.snapshotAt,snapshot.snapshotId,snapshotSha256))}
+export function analysisArtifactGeneration(identity:ArtifactIdentity,source:ArtifactSource,snapshot:SessionAnalysisSnapshot,snapshotSha256:string){return artifactDigest(analysisGenerationJson(identity,source,snapshot.snapshotAt,snapshot.snapshotId,snapshotSha256,snapshot.cachedBriefTitle===undefined?undefined:artifactDigest(analysisSourceSnapshotJson(snapshotSha256,snapshot.cachedBriefTitle))))}
 async function capture(db:SqlExecutor,identity:ArtifactIdentity){const c=(await db.query<{c:ReplayCapture}>("SELECT sessions.capture_session_replay_pages($1,$2,$3,$4) c",[identity.orgId,identity.workspaceId,identity.source,identity.sessionId])).rows[0]?.c;
  if(!c||c.identity?.orgId!==identity.orgId||c.identity.workspaceId!==identity.workspaceId||c.identity.source!==identity.source||c.identity.sessionId!==identity.sessionId)refuse("analysis_capture_invalid");
  if(typeof c.exists!=="boolean"||typeof c.blocked!=="boolean")refuse("analysis_capture_invalid");
@@ -21,11 +21,12 @@ export async function buildSessionAnalysisArtifacts(store:ObjectStore,identity:A
  // Explicit assembly refusal; proving a given legal payload fits workerd remains
  // a consumer capacity gate. Never silently truncate analysis/history fields.
  if(payloadBytes.length>ANALYSIS_MAX_SNAPSHOT_BYTES)refuse("analysis_response_bound");
+ if(snapshot.cachedBriefTitle!==undefined&&new TextEncoder().encode(JSON.stringify(snapshot.cachedBriefTitle)).length>ARTIFACT_MAX_OBJECT_BYTES)refuse("analysis_index_bound");
  const snapshotSha256=artifactDigest(payloadBytes),generation=analysisArtifactGeneration(identity,source,snapshot,snapshotSha256);
  const items=snapshot.payload.outcome==="ok"?[snapshot.payload.requests,snapshot.payload.analyses]:[[],[]];
  const rows=items.flatMap((items,n)=>items.map((payload,ordinal)=>({table:ANALYSIS_ARTIFACT_TABLES[n]!,row:{org_id:identity.orgId,workspace_id:identity.workspaceId,source:identity.source,session_id:identity.sessionId,ordinal,payload}})));
  const graph=await materializeCanonicalArtifacts(store,{identity,generation,source,prefix,rows,additionalTables:ANALYSIS_ARTIFACT_TABLES,legacyCoverage:null});
- const document:SessionAnalysisIndex={version:1,kind:"session-analysis-index",codec:"canonical-analysis-graph-v1",projection:"read_session_analysis_v1/0031",outcome:snapshot.payload.outcome,identity,source,generation,snapshotAt:snapshot.snapshotAt,snapshotId:snapshot.snapshotId,snapshotSha256,graph:graph.index,counts:{requests:items[0]!.length,analyses:items[1]!.length}};
+ const document:SessionAnalysisIndex={version:1,kind:"session-analysis-index",codec:"canonical-analysis-graph-v1",projection:"read_session_analysis_v1/0031",outcome:snapshot.payload.outcome,identity,source,generation,snapshotAt:snapshot.snapshotAt,snapshotId:snapshot.snapshotId,snapshotSha256,...(snapshot.cachedBriefTitle===undefined?{}:{cachedBriefTitle:snapshot.cachedBriefTitle,sourceSnapshotSha256:artifactDigest(analysisSourceSnapshotJson(snapshotSha256,snapshot.cachedBriefTitle))}),graph:graph.index,counts:{requests:items[0]!.length,analyses:items[1]!.length}};
  const bytes=new TextEncoder().encode(JSON.stringify(document)),sha256=artifactDigest(bytes),key=prefix+sha256+".json";
  if(bytes.length>ARTIFACT_MAX_OBJECT_BYTES)refuse("analysis_index_bound");
  const ack=await store.put(objectKey(key),bytes,{ifNoneMatch:true,contentSha256:sha256});
