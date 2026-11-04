@@ -4,7 +4,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { SqlExecutor } from "../../packages/pipeline/src/lib/pipeline/queue.ts";
 import type { ObjectStore } from "../../packages/object-store/src/index.ts";
-import { historyDerivedKey, registerHistoryDerivedObject, type HistorySourceCapture, type HistorySummaryPointer } from "../shared/history-source-authority.ts";
+import { historyDerivedKey, registerHistoryDerivedObject, type HistorySourceReference, type HistorySummaryPointer } from "../shared/history-source-authority.ts";
 import { boundedObjectStore } from "../shared/bounded-object-store.ts";
 import { prepareBoundSummaryValue, putPreparedSummaryObject, readBoundSummaryValue, type WorkspaceKeyring } from "./summary-objects.ts";
 import type { FullModelConclusion, FullModelCheckpoint, ModelSlice, ModelSliceRef } from "./full-model-work.ts";
@@ -12,7 +12,7 @@ import { fullModelSourceBinding } from "./full-model-input.ts";
 
 export interface ModelArtifactDeps {
  db: SqlExecutor; store: ObjectStore; keyring: WorkspaceKeyring;
- captured: HistorySourceCapture; workId: string; configSha256: string;
+ captured: HistorySourceReference; workId: string; configSha256: string;
 }
 const binding=(d:ModelArtifactDeps,purpose:string)=>createHash("sha256").update(JSON.stringify(["bob-work-envelope-v1",fullModelSourceBinding(d.captured),d.workId,d.configSha256,purpose])).digest("hex");
 export function modelArtifactPorts(d:ModelArtifactDeps){

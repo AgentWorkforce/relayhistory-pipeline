@@ -1,8 +1,8 @@
 /** Lossless bounded framing of the OFFICIAL canonical projection for model work.
  * This module does not parse/fold raw records or decide visibility. The caller
- * captures HistorySourceCapture and applies its complete mask before projection. */
+ * captures HistorySourceReference and applies its complete mask before projection. */
 import { createHash } from "node:crypto";
-import type { HistorySourceCapture } from "../shared/history-source-authority.ts";
+import type { HistorySourceReference } from "../shared/history-source-authority.ts";
 import type { ScopeRead } from "../session-read-api/canonical-projection.ts";
 
 export type FullModelProjectionRow = ScopeRead["projectionRows"][number];
@@ -15,7 +15,7 @@ const sha = (value: string) => createHash("sha256").update(value).digest("hex");
 
 /** Model-work cache domain, not a replacement for Native's SQL source evidence.
  * Explicit constructors avoid JSONB/object insertion-order drift. */
-export function fullModelSourceBinding(c: HistorySourceCapture): string {
+export function fullModelSourceBinding(c: HistorySourceReference): string {
   return sha(JSON.stringify(["bob-full-source-v1",
     { orgId: c.identity.orgId, workspaceId: c.identity.workspaceId, source: c.identity.source, sessionId: c.identity.sessionId },
     { epoch: c.source.epoch, fingerprint: c.source.fingerprint },
