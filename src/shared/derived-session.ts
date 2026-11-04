@@ -2,13 +2,20 @@
 import { prefixAllowed } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
 import { PipelineError, parseSessionKey, type ManifestV1, type StageMessage } from "./vendor.ts";
 import type { HoopDb } from "./db.ts";
+import { isPublicationManifestRest, parseUploadGenerationPrefix } from "../../packages/object-store/src/index.ts";
 
-export function assertDerivedScope(message: StageMessage, m: ManifestV1, key: string) {
-  // Native 040600 owns the authority predicate and qualified sidecar layout.
-  // The legacy worker must not mutate managed-generation images before that
-  // final-write/clear CAS contract is composed into this release.
-  if (/(?:^|\/)upload-generations\/|\/publications\//.test(key))
-    throw new PipelineError("derived_managed_authority_unavailable", "managed derived publication requires the current-image authority contract", false);
+export function managedDerivedManifest(key: string): boolean {
+  const loc = parseSessionKey(key);
+  return !!loc && !!parseUploadGenerationPrefix(loc.prefix) && isPublicationManifestRest(loc.rest);
+}
+
+export function assertDerivedScope(message: StageMessage, m: ManifestV1, key: string, allowManaged = false) {
+  if (/(?:^|\/)upload-generations\/|\/publications\//.test(key)) {
+    if (!allowManaged)
+      throw new PipelineError("derived_managed_authority_unavailable", "managed derived publication requires the current-image authority contract", false);
+    if (!managedDerivedManifest(key))
+      throw new PipelineError("derived_scope_mismatch", "derived publication key is not an authoritative managed manifest", false);
+  }
   const ctx = message.ctx;
   const s = m.session;
   const loc = parseSessionKey(key);

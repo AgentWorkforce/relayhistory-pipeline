@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
-import { readSummaryObject, summaryObjectKey, writeSummaryObject, prepareSummaryObject, type SummaryRecord } from "../summary-objects.ts";
+import { readSummaryObject, summaryObjectKey, writeSummaryObject, prepareSummaryObject, putPreparedSummaryObject, type SummaryRecord } from "../summary-objects.ts";
 
 const HEX_A = "a".repeat(64);
 const HEX_B = "b".repeat(64);
@@ -19,6 +19,21 @@ const allFiles = (dir: string): string[] =>
   readdirSync(dir).flatMap((f) => (statSync(join(dir, f)).isDirectory() ? allFiles(join(dir, f)) : [join(dir, f)]));
 
 describe("summary objects (upstream envelope) with the HKDF keyring", () => {
+  it("immutable prepared writes reuse identical bytes and refuse changed bytes without overwriting", async () => {
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bc-immutable-")) });
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${HEX_A}`));
+    const key = "fixture/publication/immutable/short.bin";
+    const prepared = await prepareSummaryObject({ keyring, ids, key, record: record() });
+    await putPreparedSummaryObject({ store, prepared });
+    const version = (await store.head(key as never))?.version;
+    await putPreparedSummaryObject({ store, prepared });
+    expect((await store.head(key as never))?.version).toEqual(version);
+    const another = await prepareSummaryObject({ keyring, ids, key, record: record({ summary: "different" }) });
+    await expect(putPreparedSummaryObject({ store, prepared: another })).rejects.toMatchObject({ code: "summary_contended" });
+    prepared.body[0] = prepared.body[0]! ^ 1;
+    await expect(putPreparedSummaryObject({ store, prepared })).rejects.toMatchObject({ code: "summary_prepared_invalid", retryable: false });
+    expect((await store.head(key as never))?.version).toEqual(version);
+  });
   it("prepares exact encrypted registration bytes without storage and preserves envelope/AAD compatibility", async () => {
     const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bc-prepared-")) });
     const keyring = await masterKeyring(parseMasterKeys(`k1:${HEX_A}`));

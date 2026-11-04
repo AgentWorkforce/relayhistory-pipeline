@@ -7,8 +7,9 @@
  * `summary/{short,long}.json.enc` (`summary-objects.ts`, ported from upstream),
  * under the workspace key. `sessions.session_summaries` holds only the pointer:
  * object key, ciphertext SHA-256, key id, status and revision, never the text
- * or the model name. Object first, then pointer, inside one transaction holding
- * a per-session advisory lock, so two runs never publish in different orders.
+ * or the model name. The legacy path writes object then pointer under one
+ * per-session transaction lock. Managed images use registered immutable objects
+ * outside SQL, then Native's short generation-fenced metadata transaction.
  * Idempotent by revision and raw content hash.
  */
 import { createHash } from "node:crypto";
@@ -28,6 +29,8 @@ import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
 import { type Summarizer } from "./summarizer.ts";
 import { rawDigest } from "./raw-digest.ts";
 import { assertDerivedScope, derivedCurrent } from "../shared/derived-session.ts";
+import { derivedPublication, lockDerivedPublication } from "../shared/derived-publication.ts";
+import { managedSummary } from "./managed-handler.ts";
 import {
   ShortSummaryRejected,
   clearShortSummary,
@@ -59,6 +62,8 @@ export interface BobCostasDeps {
   projectShortSummary?: boolean;
   /** Optional per-job ceiling for a finite-duration host such as Lambda. */
   maxRawBytes?: number;
+  /** Compiled build generation, provided only with managed protocol enabled. */
+  schemaGeneration?: string;
 }
 
 /** Where Bob Costas publishes the bounded, scrubbed short summary for search (G6). */
@@ -183,7 +188,11 @@ export function bobCostasHandler(
     const read = await deps.reader.read(pointer.manifestKey);
     if (!read) return { status: "skipped", reason: "manifest_missing" };
     const m = read.manifest;
-    assertDerivedScope(message, m, pointer.manifestKey);
+    assertDerivedScope(message, m, pointer.manifestKey, deps.schemaGeneration !== undefined);
+    const publication = await derivedPublication(deps.db, message, m, pointer.manifestKey, deps.schemaGeneration);
+    if (publication?.authority.managed) return managedSummary({ kind, deps, message, manifest: m,
+      manifestKey: pointer.manifestKey, publication, recorder,
+      build: () => buildOutcome(kind, m, deps, pointer.manifestKey) });
     if (!(await derivedCurrent(deps.db, message, m, pointer.manifestKey)))
       return { status: "skipped", reason: "index_not_current" };
     // Every projection write AND clear rechecks the source under its row lock,
@@ -200,6 +209,9 @@ export function bobCostasHandler(
         await c.query("BEGIN");
         await c.query("SET LOCAL lock_timeout = '5s'");
         await c.query("SET LOCAL statement_timeout = '30s'");
+        if (!(await lockDerivedPublication(c as never, publication, pointer.manifestKey))) {
+          await c.query("ROLLBACK"); return;
+        }
         if (await derivedCurrent(c as never, message, m, pointer.manifestKey, true)) {
           const current = await c.query(`SELECT 1 FROM sessions.session_summaries
             WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5
@@ -387,6 +399,10 @@ export function bobCostasHandler(
       await client.query("BEGIN");
       await client.query("SET LOCAL lock_timeout = '5s'");
       await client.query("SET LOCAL statement_timeout = '30s'");
+      if (!(await lockDerivedPublication(client as never, publication, pointer.manifestKey))) {
+        await client.query("ROLLBACK");
+        return { status: "skipped", reason: "publication_not_current" };
+      }
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
         [`96bulls:summary:${key}`],

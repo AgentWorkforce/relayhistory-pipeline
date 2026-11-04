@@ -75,10 +75,39 @@ SQL text projection defaults off. Only explicit
 opts into the legacy short-summary copy. Existing columns/data are not removed.
 `BOB_COSTAS_MODEL=off` is extractive; other model names remain unimplemented.
 
-Managed `upload-generations/` / `publications/` jobs are explicitly refused
-until Native's shared authority contract is composed. Legacy index-row fencing
-does not replace managed-generation authority. No managed canonical image is
-rewritten or given a guessed sidecar path by this draft.
+Managed `upload-generations/` / `publications/` jobs remain explicitly refused
+by default. The separate managed path is wired to Native's frozen shared
+interface at `1c1720615c8bffec509df8b8eb1b7e1d7ac533f3`; backend SQL 040600 is
+not composed in this older baseline. Legacy index-row fencing does not replace
+managed-generation authority. No managed canonical image is rewritten or given
+a guessed sidecar path by this draft.
+
+`SESSION_MANAGED_DERIVED_ENABLED=true` is a separate, default-off source opt-in
+for both service workers and the derived Lambda tick. It supplies the compiled
+source generation, including the Lambda's embedded capture, to ALL publication
+probes (old legacy-key events too). Missing backend SQL or generation validation
+fails closed without a legacy fallback. Compose and prove the SQL/four-verifier
+generation before enabling this switch; it must be coordinated with publisher
+activation across all derived consumers. No runtime flag was changed here.
+
+On managed images, model/raw reads, encryption, registration and S3 PUT happen
+outside the final SQL transaction. Every exact ciphertext descriptor is
+registered before immutable `IfNoneMatch` PUT, using Native's artifact-UUID key
+helper. Final pointer writes and nonready clears require Native's generation /
+user / head lock before the exact live index row lock, on the same SQL executor.
+The managed path never writes a SQL text projection. Its retry read-error path
+performs no clear, so delayed errors cannot erase newer pointer/object data.
+Replay authenticates the current qualified object and raw hash, then rechecks
+both source authority and the exact SQL pointer before acknowledging it.
+Same revision/hash under another image cannot reuse the previous image's key.
+Nonready outcomes clear only current SQL pointers; previous immutable objects
+remain registered for Native's erasure lifecycle. Legacy unmanaged object writes
+retain their existing shared-key transaction behavior.
+
+Referee uses `setPublicationState` under that same Native/index transaction,
+then projects the directory and records the verdict. A refused qualified state
+write records no managed verdict. Managed verdict retries preserve the latest
+classification time; stale publications cannot write either state or audit rows.
 
 `prepareSummaryObject` now seals a supplied immutable key entirely in memory and
 returns the exact ciphertext, SHA-256, byte count and current key ID for Native's
@@ -138,6 +167,20 @@ old-version read, broad bucket write, new key, or broader credential fallback is
 needed for Bob. Exact managed sidecar resources depend on Native's shared helper;
 do not invent an alternative layout or apply a wildcard grant in this draft.
 
+Root's 08:39Z read-only policy capture adds a required CMK policy change:
+identity-policy `kms:GenerateDataKey` alone is insufficient. The actual key
+policy delegates administration, with this pipeline role explicitly allowed
+only Decrypt. The reviewed write plan therefore needs BOTH the identity grant
+and an explicit exact-principal CMK `GenerateDataKey` + `Decrypt` statement,
+restricted by S3 ViaService, caller account and qualified encrypted-summary
+object prefixes. Preserve the existing decrypt statements for old keys/objects.
+Bucket versioning is Enabled and BucketKey is false in that capture. Bob gets
+no delete grant. Root owns the separate narrow GC bucket-policy exception:
+the current explicit delete deny allows only the existing eraser IAM user.
+Source: `~/relay-briefs/aws-transcript-policies-readonly-20261104.json` on SF.
+Static Access Analyzer validation of Root's GC proposal does not establish Bob
+permission or successful live writes. No policy was applied by this lane.
+
 ## Actual proof and validation
 
 Run on Linux with Node 24 on PATH, in an isolated checkout with its own frozen Bun install:
@@ -177,6 +220,19 @@ queue consumption, absent-key behavior, deadline gating, and all-version S3
 raw/manifest/summary erasure plus ClickHouse erasure. Worker logs exclude the
 planted secret and source marker.
 
+Validation additionally passes 43 worker/Lambda cases, including ten managed
+protocol tests, plus two adapter cases. The managed tests use a controlled Native
+authority port with the real baseline PGlite schema, filesystem object store,
+encrypted envelopes and worker handlers. They verify exact registration before
+immutable PUT outside SQL,
+same-transaction final gate/index/write order, current replay, old summary /
+nonready / read-error / Referee barriers, generation refusal, and reset after
+registration preventing SQL metadata recreation. The late private object is
+registered but intentionally remains in that test: its eventual all-version
+erasure still requires Native's real GC proof. These port tests are not a proof
+of 040600's unfinished SQL or the managed full stack. The 13-check real runtime
+fixture still passes with the managed switch off; typechecks pass.
+
 Barrier regressions explicitly let a newer job commit before releasing an older
 summary, nonready clear, or retry read-error job. The newer pointer/object survives.
 Legacy projection opt-in tests continue to cover provenance, integrity failure,
@@ -205,10 +261,11 @@ the foundation, register managed objects, publish SQL pointers or activate Bob.
 
 ## Remaining acceptance dependencies
 
-1. Native 040600's authoritative generation-qualified SQL final-write and clear
-   CAS, immutable image recognition, and publication/attempt-qualified sidecar
-   helpers. Exercise both-job barriers against that exact contract for Bob and
-   Referee; legacy tests do not prove managed-image safety.
+1. Compose Native 040600's actual generation-qualified SQL and runtime, then run
+   the prepared Bob/Referee wiring and both-job barriers against it. Frozen
+   shared helpers are staged exactly from Native in dependency commit `b160f2c`;
+   the release union should reuse its Native composition instead of duplicating
+   that dependency commit. Port/legacy tests do not prove managed SQL safety.
 2. Compose the canonical foundation and consume its authoritative published
    pages (`canonicalArtifactPage`, replay view), with pinned publication
    generation/currentness, instead of refolding >64 MiB canonical sessions.

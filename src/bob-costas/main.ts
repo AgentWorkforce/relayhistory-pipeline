@@ -4,11 +4,14 @@ import { bobCostasHandler } from "./handler.ts";
 import { summarizerFromEnv } from "./summarizer.ts";
 import { keyringFromEnv } from "../shared/keyring.ts";
 import { summarySweep } from "./sweep.ts";
+import { expectedSchema } from "../hoopdb/migrate.ts";
 
 const raw = lockerStore();
 const summarizer = summarizerFromEnv();
 // Summaries are stored encrypted in the Locker; refuse to start without a keyring.
 const keyring = await keyringFromEnv();
+const publication = process.env.SESSION_MANAGED_DERIVED_ENABLED === "true"
+  ? { schemaGeneration: (await expectedSchema()).generation } : {};
 await runWorker({
   service: "bob-costas",
   stages: ["summary-short", "summary-long"],
@@ -25,6 +28,7 @@ await runWorker({
       store: raw.store,
       summarizer,
       keyring,
+      ...publication,
     };
     return {
       "summary-short": bobCostasHandler("short", deps),

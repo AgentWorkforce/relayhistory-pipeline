@@ -129,6 +129,7 @@ const MESSAGES = {
   summary_contended: "the summary object kept changing under the writer",
   summary_store_timeout: "the object store did not answer in time",
   summary_too_large: "the summary exceeds its verified encrypted-object bound",
+  summary_prepared_invalid: "the prepared encrypted summary does not match its descriptor",
 } as const;
 
 export type SummaryObjectErrorCode = keyof typeof MESSAGES;
@@ -180,6 +181,34 @@ export async function prepareSummaryObject(args: {
   catch (err) { throw err instanceof PipelineError ? err : fail("keyring_unavailable", true); }
   const body = await seal(current, key, record);
   return { key, keyId: current.keyId, body, sha256: await sha256Hex(body), bytes: body.byteLength };
+}
+
+/** Store only the exact registered bytes, immutably. Caller must register the
+ * descriptor through Native BEFORE this call. This function grants no authority.
+ * A retry under the same key can reuse identical bytes, never replace them.
+ */
+export async function putPreparedSummaryObject(args: {
+  store: ObjectStore; prepared: PreparedSummaryObject; storeTimeoutMs?: number;
+}): Promise<void> {
+  const { store } = args;
+  if (args.prepared.body.byteLength > MAX_SUMMARY_OBJECT_BYTES) throw fail("summary_prepared_invalid", false);
+  const prepared = { ...args.prepared, body: args.prepared.body.slice() };
+  if (prepared.bytes > MAX_SUMMARY_OBJECT_BYTES || prepared.bytes !== prepared.body.byteLength ||
+      await sha256Hex(prepared.body) !== prepared.sha256) throw fail("summary_prepared_invalid", false);
+  const key = objectKey(prepared.key);
+  const call = <T>(fn: () => Promise<T>) => withDeadline(fn, args.storeTimeoutMs);
+  try {
+    await call(() => store.put(key, prepared.body, { ifNoneMatch: true,
+      contentSha256: prepared.sha256, contentType: "application/json",
+      metadata: { [META_SUMMARY_KEY_ID]: prepared.keyId },
+    }));
+  } catch (err) {
+    if (isObjectStoreError(err, "precondition_failed") || isObjectStoreError(err, "already_exists")) {
+      if (await storedDigest(call, store, key) === prepared.sha256) return;
+      throw fail("summary_contended", true);
+    }
+    throw storeError(err);
+  }
 }
 
 /**

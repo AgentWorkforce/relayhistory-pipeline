@@ -2,8 +2,8 @@
  * Referee: the session-state classifier. Consumes `status-classify`. Rules only
  * by default (no model call): closed raw stream = done; no activity for
  * REFEREE_ABANDON_AFTER_MINUTES = abandoned; otherwise active. Writes the
- * verdict through the vendored `sessions.set_session_state` (monotonic on
- * classified_at) and keeps every verdict in `session_verdicts`.
+ * verdict through the legacy state RPC or Native's qualified publication RPC,
+ * with the verdict and directory projection in the same fenced transaction.
  */
 import {
   PipelineError,
@@ -16,7 +16,9 @@ import { ctxOf } from "../shared/enrich.ts";
 import { integer } from "../shared/env.ts";
 import { log } from "../shared/log.ts";
 import { projectSessionDirectory } from "../hoopdb/session-directory-projector.ts";
-import { assertDerivedScope, derivedCurrent } from "../shared/derived-session.ts";
+import { assertDerivedScope } from "../shared/derived-session.ts";
+import { derivedPublication, withDerivedCurrent } from "../shared/derived-publication.ts";
+import { setPublicationState } from "../shared/publication-authority.ts";
 
 export type Verdict = {
   state: "active" | "done" | "abandoned" | "unknown";
@@ -46,6 +48,7 @@ export function refereeHandler(deps: {
   db: HoopDb;
   reader: ManifestReader;
   now?: () => Date;
+  schemaGeneration?: string;
 }): StageHandler {
   const now = deps.now ?? (() => new Date());
   const abandonAfterMinutes = integer("REFEREE_ABANDON_AFTER_MINUTES", 24 * 60);
@@ -60,7 +63,10 @@ export function refereeHandler(deps: {
     const read = await deps.reader.read(pointer.manifestKey);
     if (!read) return { status: "skipped", reason: "manifest_missing" };
     const m = read.manifest;
-    assertDerivedScope(message, m, pointer.manifestKey);
+    assertDerivedScope(message, m, pointer.manifestKey, deps.schemaGeneration !== undefined);
+    const publication = await derivedPublication(deps.db, message, m, pointer.manifestKey, deps.schemaGeneration);
+    if (publication?.authority.managed && !publication.authority.current)
+      return { status: "skipped", reason: "publication_not_current" };
     const s = m.session;
     const lastActivity = new Date(s.ended_at ?? m.raw.updated_at);
     const verdict = classify({
@@ -72,32 +78,30 @@ export function refereeHandler(deps: {
     });
     const classifiedAt = now();
     const ctx = ctxOf(message);
-    const client = await deps.db.pool.connect();
     let applied = false;
-    try {
-      await client.query("BEGIN");
-      await client.query("SET LOCAL lock_timeout = '5s'");
-      await client.query("SET LOCAL statement_timeout = '30s'");
-      if (!(await derivedCurrent(client as never, message, m, pointer.manifestKey, true))) {
-        await client.query("ROLLBACK");
-        return { status: "skipped", reason: "index_not_current" };
+    const result = await withDerivedCurrent({ db: deps.db, message, manifest: m,
+      key: pointer.manifestKey, publication }, async (client, authority) => {
+      const managed = authority?.managed === true;
+      if (managed) applied = await setPublicationState(client, publication!.evidence, verdict.state, classifiedAt);
+      else {
+        const { rows } = await client.query<{ set_session_state: boolean }>(
+          "SELECT sessions.set_session_state($1,$2,$3,$4,$5,$6,$7::timestamptz)",
+          [
+            message.ctx.orgId,
+            s.workspace_id,
+            s.harness,
+            s.session_id,
+            s.machine_id,
+            verdict.state,
+            classifiedAt.toISOString(),
+          ],
+        );
+        applied = rows[0]?.set_session_state ?? false;
       }
-      const { rows } = await client.query<{ set_session_state: boolean }>(
-        "SELECT sessions.set_session_state($1,$2,$3,$4,$5,$6,$7::timestamptz)",
-        [
-          message.ctx.orgId,
-          s.workspace_id,
-          s.harness,
-          s.session_id,
-          s.machine_id,
-          verdict.state,
-          classifiedAt.toISOString(),
-        ],
-      );
-      applied = rows[0]?.set_session_state ?? false;
+      if (managed && !applied) return;
       // set_session_state updates only the pointer; re-project the logical session so
       // the directory's state (and its p_state filter) follows the classification.
-      if (rows[0]?.set_session_state)
+      if (applied)
         await projectSessionDirectory(client as never, {
           orgId: message.ctx.orgId,
           workspaceId: s.workspace_id,
@@ -108,7 +112,9 @@ export function refereeHandler(deps: {
         `INSERT INTO sessions.session_verdicts
            (org_id, workspace_id, harness, session_id, machine_id, session_uuid, trace_id, revision, state, rule, model_id, classified_at)
          VALUES ($1,$2,$3,$4,$5,$6::uuid,$7::uuid,$8,$9,$10,'rules/v1',$11::timestamptz)
-         ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, trace_id, revision) DO NOTHING`,
+         ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, trace_id, revision) ${managed
+          ? "DO UPDATE SET state=excluded.state,rule=excluded.rule,model_id=excluded.model_id,classified_at=excluded.classified_at WHERE sessions.session_verdicts.classified_at<=excluded.classified_at"
+          : "DO NOTHING"}`,
         [
           message.ctx.orgId,
           s.workspace_id,
@@ -123,11 +129,8 @@ export function refereeHandler(deps: {
           classifiedAt.toISOString(),
         ],
       );
-      await client.query("COMMIT");
-    } catch (err) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw err;
-    } finally { client.release(); }
+    });
+    if (!result.current) return { status: "skipped", reason: publication ? "publication_or_index_not_current" : "index_not_current" };
     recorder.log.info("verdict", { state: verdict.state, rule: verdict.rule });
     log.info("referee verdict", {
       stage: "status-classify",
