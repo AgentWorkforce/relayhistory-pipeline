@@ -57,7 +57,8 @@ BEGIN
   FOR o IN SELECT value FROM jsonb_array_elements(g.value) LOOP
    r:=v_records->(o::text);
    IF v_pair IS NULL THEN v_pair:=jsonb_build_array(r->>'source',r->>'session_id');
-   ELSIF v_pair IS DISTINCT FROM jsonb_build_array(r->>'source',r->>'session_id') THEN
+   ELSIF v_pair IS DISTINCT FROM jsonb_build_array(r->>'source',r->>'session_id')
+    AND NOT(v_pair->>1 IS NULL AND r->>'session_id' IS NULL) THEN
     RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='buffer gc: group crosses source session';
    END IF;
    v_total:=v_total+1;
@@ -116,7 +117,19 @@ BEGIN
   -- A prospective child cannot be independently aborted during its parent's copy.
   IF s.parent_stage_token IS NOT NULL THEN
    SELECT * INTO parent FROM sessions.ingest_stage_intents WHERE stage_token=s.parent_stage_token;
-   IF parent.gc_replacement_stage_token=s.stage_token AND parent.gc_lease_until>clock_timestamp() THEN CONTINUE;END IF;
+   -- Prospective bytes have a deterministic key. They remain owned through
+   -- repeated parent crashes; retiring them merely because a lease expired would
+   -- make that same replacement key permanently unusable after its barrier.
+   IF parent.gc_replacement_stage_token=s.stage_token AND parent.cleanup_state='live' AND parent.receipt_state='acknowledged'
+    AND ROW(parent.org_id,parent.workspace_id,parent.user_id,parent.origin_id,parent.batch_id,parent.claim_token,parent.digest)
+      IS NOT DISTINCT FROM ROW(s.org_id,s.workspace_id,s.user_id,s.origin_id,s.batch_id,s.claim_token,s.digest)
+    AND EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox o WHERE o.org_id=parent.org_id AND o.workspace_id=parent.workspace_id
+      AND o.user_id=parent.user_id AND o.origin_id=parent.origin_id AND o.batch_id=parent.batch_id AND o.digest=parent.digest
+      AND o.state='buffered' AND o.active_stage_token=parent.stage_token)
+   THEN
+    UPDATE sessions.ingest_stage_intents SET gc_checked_at=clock_timestamp() WHERE stage_token=s.stage_token;
+    CONTINUE;
+   END IF;
   END IF;
   PERFORM 1 FROM sessions.ingest_buffer_outbox WHERE org_id=s.org_id AND workspace_id=s.workspace_id
    AND origin_id=s.origin_id AND batch_id=s.batch_id FOR UPDATE;
@@ -168,7 +181,8 @@ BEGIN
    WHERE stage_token=s.stage_token RETURNING * INTO s;
   v_ticket:=jsonb_build_object('stageToken',s.stage_token,'claimToken',s.claim_token,'leaseToken',v_token,
    'rowVersion',s.row_version::text,'key',s.stage_key,'sha256',s.stage_sha256,'bytes',s.stage_bytes,
-   'groupOrdinals',s.group_ordinals,'keepGroupIndexes',v_keep,'receiptState',s.receipt_state,'phase',v_phase);
+   'groupOrdinals',s.group_ordinals,'keepGroupIndexes',v_keep,'receiptState',s.receipt_state,'phase',v_phase,
+   'resetEpoch',s.reset_epoch::text,'cleanupState',s.cleanup_state);
   IF s.gc_replacement_stage_token IS NOT NULL THEN
    SELECT * INTO child FROM sessions.ingest_stage_intents WHERE stage_token=s.gc_replacement_stage_token;
    v_ticket:=v_ticket||jsonb_build_object('replacement',jsonb_build_object('stageToken',child.stage_token,

@@ -70,6 +70,21 @@ try{
   assert((await rpc("finish",{stageToken:f.token,leaseToken:f.ticket.leaseToken,barrierVersionId:"verified-barrier-version"})).finished,"finish");
   assert((await db.query("SELECT active_stage_token FROM sessions.ingest_buffer_outbox WHERE org_id=$1",[f.org])).rows[0].active_stage_token===child.replacementStageToken,"kept_current");
  });
+ await check("two real parent lease expiries preserve the deterministic prospective child",async()=>{
+  const f=await fixture(),child=await rpc("prepare",f.spec);
+  for(let i=0;i<2;i++){
+   await db.query("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()+interval '100 milliseconds' WHERE stage_token=$1",[f.token]);
+   await db.query("UPDATE sessions.ingest_stage_intents SET expires_at=clock_timestamp()+interval '100 milliseconds' WHERE stage_token=$1",[child.replacementStageToken]);
+   await sleep(150);
+   const tickets=(await rpc("claim",{limit:100})).tickets;
+   assert(!tickets.some((x:any)=>x.stageToken===child.replacementStageToken),"prospective_child_not_retired");
+   const ticket=tickets.find((x:any)=>x.stageToken===f.token);assert(ticket,"parent_retry_ticket");
+   f.ticket=ticket;f.spec.leaseToken=ticket.leaseToken;
+   assert((await rpc("prepare",f.spec)).replacementStageToken===child.replacementStageToken,"deterministic_child_retained");
+  }
+  assert((await rpc("swap",{stageToken:f.token,leaseToken:f.ticket.leaseToken,replacementStageToken:child.replacementStageToken})).swapped,"retry_swap");
+  assert((await rpc("finish",{stageToken:f.token,leaseToken:f.ticket.leaseToken,barrierVersionId:"double-crash-parent-barrier"})).finished,"retry_cleanup");
+ });
  await check("finish final expiry rolls back retirement acknowledgement after write delay",async()=>{
   const f=await fixture(),child=await rpc("prepare",f.spec);await rpc("swap",{stageToken:f.token,leaseToken:f.ticket.leaseToken,replacementStageToken:child.replacementStageToken});
   await db.query("CREATE FUNCTION sessions.gc_proof_delay() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF NEW.cleanup_state='redacted' THEN PERFORM pg_sleep(0.35);END IF;RETURN NEW;END$$;CREATE TRIGGER gc_proof_delay BEFORE UPDATE ON sessions.ingest_stage_intents FOR EACH ROW EXECUTE FUNCTION sessions.gc_proof_delay()");
