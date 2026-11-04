@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "synthetic": true,
+  "scope": {
+    "organizationId": "example-org",
+    "workspaceId": "example-workspace"
+  },
+  "window": {
+    "since": "2026-10-21T07:00:00.000Z",
+    "until": "2026-11-04T08:00:00.000Z"
+  },
+  "provenance": {
+    "source": "synthetic fixture",
+    "exportedAt": "2026-11-04T09:00:00.000Z",
+    "redacted": true
+  },
+  "coverage": {
+    "status": "partial",
+    "notes": "Synthetic excerpts only. No real team sessions were evaluated."
+  },
+  "sessions": [
+    {
+      "key": "backend",
+      "organizationId": "example-org",
+      "workspaceId": "example-workspace",
+      "source": "codex",
+      "sessionId": "example-backend",
+      "title": "backend example work",
+      "projectKey": "github.com/example/api",
+      "taskRefs": ["pagination"],
+      "parentSessionKey": null
+    },
+    {
+      "key": "frontend",
+      "organizationId": "example-org",
+      "workspaceId": "example-workspace",
+      "source": "claude",
+      "sessionId": "example-frontend",
+      "title": "frontend example work",
+      "projectKey": "github.com/example/api",
+      "taskRefs": ["pagination"],
+      "parentSessionKey": null
+    },
+    {
+      "key": "producer",
+      "organizationId": "example-org",
+      "workspaceId": "example-workspace",
+      "source": "codex",
+      "sessionId": "example-producer",
+      "title": "producer example work",
+      "projectKey": "github.com/example/schema",
+      "taskRefs": ["schema-contract"],
+      "parentSessionKey": null
+    },
+    {
+      "key": "consumer",
+      "organizationId": "example-org",
+      "workspaceId": "example-workspace",
+      "source": "claude",
+      "sessionId": "example-consumer",
+      "title": "consumer example work",
+      "projectKey": "github.com/example/schema",
+      "taskRefs": ["schema-contract"],
+      "parentSessionKey": null
+    },
+    {
+      "key": "helper",
+      "organizationId": "example-org",
+      "workspaceId": "example-workspace",
+      "source": "codex",
+      "sessionId": "example-delegated-helper",
+      "title": "Delegated schema review",
+      "projectKey": null,
+      "taskRefs": [],
+      "parentSessionKey": "producer"
+    }
+  ],
+  "events": [
+    {
+      "id": "api-decision",
+      "sessionKey": "backend",
+      "machineId": "example-machine",
+      "eventId": "event-1",
+      "kind": "message",
+      "occurredAt": "2026-11-02T10:12:00.000Z",
+      "availableAt": "2026-11-02T10:13:00.000Z",
+      "text": "The response uses nextCursor. Page numbers are not supported.",
+      "truncated": false,
+      "filesTouched": ["pagination.ts"]
+    },
+    {
+      "id": "client-action",
+      "sessionKey": "frontend",
+      "machineId": "example-machine",
+      "eventId": "event-2",
+      "kind": "message",
+      "occurredAt": "2026-11-02T10:34:00.000Z",
+      "availableAt": "2026-11-02T10:35:00.000Z",
+      "text": "Implementing the client request with a page number parameter.",
+      "truncated": false,
+      "filesTouched": ["pagination.ts"]
+    },
+    {
+      "id": "client-revision",
+      "sessionKey": "frontend",
+      "machineId": "example-machine",
+      "eventId": "event-3",
+      "kind": "message",
+      "occurredAt": "2026-11-03T09:20:00.000Z",
+      "availableAt": "2026-11-03T09:21:00.000Z",
+      "text": "The integration check failed because the API expects a cursor. Replaced the page-number request and the check now passes.",
+      "truncated": false,
+      "filesTouched": ["pagination.ts"]
+    },
+    {
+      "id": "ready-message",
+      "sessionKey": "producer",
+      "machineId": "example-machine",
+      "eventId": "event-4",
+      "kind": "message",
+      "occurredAt": "2026-11-02T11:00:00.000Z",
+      "availableAt": "2026-11-02T11:01:00.000Z",
+      "text": "Sent the consumer agent the finalized response schema and its passing contract test.",
+      "truncated": false,
+      "filesTouched": ["schema.ts"]
+    },
+    {
+      "id": "acknowledgment",
+      "sessionKey": "consumer",
+      "machineId": "example-machine",
+      "eventId": "event-5",
+      "kind": "message",
+      "occurredAt": "2026-11-02T11:05:00.000Z",
+      "availableAt": "2026-11-02T11:06:00.000Z",
+      "text": "Received the schema. Updating the integration to match the supplied contract.",
+      "truncated": false,
+      "filesTouched": ["schema.ts"]
+    },
+    {
+      "id": "integration-pass",
+      "sessionKey": "consumer",
+      "machineId": "example-machine",
+      "eventId": "event-6",
+      "kind": "message",
+      "occurredAt": "2026-11-02T11:15:00.000Z",
+      "availableAt": "2026-11-02T11:16:00.000Z",
+      "text": "The integration contract test passes with the shared schema.",
+      "truncated": false,
+      "filesTouched": ["schema.ts"]
+    },
+    {
+      "id": "helper-review",
+      "sessionKey": "helper",
+      "machineId": "example-machine",
+      "eventId": "event-7",
+      "kind": "message",
+      "occurredAt": "2026-11-02T11:02:00.000Z",
+      "availableAt": "2026-11-02T11:03:00.000Z",
+      "text": "Reviewing the schema as a delegated task from the producer.",
+      "truncated": false,
+      "filesTouched": ["schema.ts"]
+    }
+  ]
+}
