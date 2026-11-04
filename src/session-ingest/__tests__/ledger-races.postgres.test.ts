@@ -5,7 +5,7 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import pg from "pg";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, mkdtempSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
@@ -63,10 +63,13 @@ async function database(repair = true) {
   });
   await pool.query("CREATE SCHEMA sessions");
   await pool.query(sql("supabase/tests/supabase_shim.sql"));
-  await pool.query(sql("supabase/bootstrap/session_ingest_roles.sql"));
-  await pool.query(
-    sql("supabase/migrations/20261102010000_session_ingest_ledger.sql"),
-  );
+  await pool.query("CREATE EXTENSION pg_trgm; CREATE EXTENSION btree_gin");
+  for (const file of ["session_directory_search_worker.sql", "session_token_verifier.sql", "session_ingest_roles.sql"])
+    await pool.query(sql("supabase/bootstrap/" + file));
+  for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
+    if ("supabase/migrations/" + file !== migration)
+      await pool.query(sql("supabase/migrations/" + file));
+  }
   if (repair) await apply(pool);
   const client = async () => {
     const c = await pool.connect();

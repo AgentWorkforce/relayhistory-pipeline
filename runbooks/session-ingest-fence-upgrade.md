@@ -10,6 +10,8 @@ Claim, direct commit, fanout revision commit, selection, and reset acquire one s
 
 Before applying this migration or enabling the upgraded writer, stop new ingest requests and drain/reconcile any pre-upgrade acknowledged staged receipts and pending claims. Their session membership was not recorded in SQL, so the migration cannot infer it from old empty-revision commits. Verify the pending queue/receipts directly; an empty revision ledger alone is insufficient. With a never-enabled dedicated writer, establish that no pre-upgrade receipts exist. Do not use unproven historical revision seeding as a substitute.
 
+For event-trigger boundary mode, refresh the reviewed boundary bootstrap/embedded ACL manifest before migrate; the new owner-only helper changes the pinned body hash. The exact runtime/helper grants remain unchanged. The updated migrator refuses an older installed boundary body.
+
 The migration and its backfill run transactionally through the existing migrator. No role creation, role mutation, extra credentials, S3 policy or Worker flag change is part of this change. Concurrent revision seeding remains an offline rollout operation, never an ingest-time activity.
 
 Continue the existing erasure consumer and its rearm handling. A reset may finish while object IO is in flight; the late commit deliberately leaves revisions absent and enqueues another sweep. These tests prove queueing, not a deployed eraser's drain. Existing staged-root erasure/redrive policy remains a separate rollout check.
