@@ -109,6 +109,15 @@ function generation(
     )
     .digest("hex");
 }
+/** Stable fingerprint of a pointer vector; callers must validate pointer authority first. */
+export function canonicalPointerGeneration(identity: CanonicalIdentity, pointers: CanonicalPointer[]): string {
+  return generation(pointers, identity);
+}
+/** Recheck the validated pointer vector without re-reading transcript objects. */
+export async function canonicalGeneration(deps: CanonicalDeps, identity: CanonicalIdentity): Promise<string> {
+  return generation(checked(await deps.pointers(identity), identity, deps), identity);
+}
+
 export async function canonicalSnapshot(
   deps: CanonicalDeps,
   identity: CanonicalIdentity,

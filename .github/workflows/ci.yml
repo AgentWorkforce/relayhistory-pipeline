@@ -52,6 +52,10 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Typecheck packages/pipeline
         run: bun run --filter @96bulls/pipeline typecheck
+      - name: Typecheck coordination evaluator
+        run: bun run --filter @96bulls/coordination-eval typecheck
+      - name: Test coordination evaluator
+        run: bun run --filter @96bulls/coordination-eval test
       - name: Test packages/pipeline (vitest, in-process PGlite; no real database)
         run: bun run --filter @96bulls/pipeline test
       - name: Build packages/object-store

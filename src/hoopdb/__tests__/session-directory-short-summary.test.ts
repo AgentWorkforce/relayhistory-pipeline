@@ -77,6 +77,9 @@ const BRIEFS_DOWN = read(
 const EVENTS = "20261103010000_session_directory_event_metadata.sql";
 const EVENTS_UP = read(`supabase/migrations/${EVENTS}`);
 const EVENTS_DOWN = read(`supabase/rollbacks/${EVENTS.replace(/\.sql$/, ".down.sql")}`);
+const REPORTS = "20261104030000_coordination_report_jobs.sql";
+const REPORTS_UP = read(`supabase/migrations/${REPORTS}`);
+const REPORTS_DOWN = read(`supabase/rollbacks/${REPORTS.replace(/\.sql$/, ".down.sql")}`);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
 const TOKEN_ISSUER = "https://issuer.test/session-directory";
 const RPC_SIGNATURE = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
@@ -2299,6 +2302,7 @@ describe("short_summary rollback", () => {
     await insertRow(db);
     await summarize(db, KEY, "pelican rollback check");
     // Reverse dependency order: event metadata also depends on G6 and the list/catalog phases.
+    await db.exec(REPORTS_DOWN);
     await db.exec(EVENTS_DOWN);
     await db.exec(BRIEFS_DOWN);
     await db.exec(LIST_DOWN);
@@ -2344,6 +2348,7 @@ describe("short_summary rollback", () => {
     await db.exec(LIST_UP);
     await db.exec(BRIEFS_UP);
     await db.exec(EVENTS_UP);
+    await db.exec(REPORTS_UP);
     await db.query(
       "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
       [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],

@@ -83,6 +83,12 @@ One `session_uuid` (UUIDv7, minted once on the client) and one pipeline
   `stacks/gcp/alchemy.gcp.run.ts` (`docs/gcp-stage.md`).
 - `stacks/local/topology.ts`: names, ports, images, tenant ids, as data.
 - `src/`: the services (Bun/TypeScript). One image, `SERVICE=` picks the entry (`docker/`).
+- `packages/coordination-eval`: the coordination evidence rubric, bounded analysis
+  engine and report renderer. `src/coordination-report` runs canonical workspace
+  retrospectives inside the pipeline and persists draft reports in HoopDb; see
+  the [runbook](runbooks/coordination-reports.md) and
+  [review workflow](packages/coordination-eval/README.md). Local pilot artifacts
+  stay in the gitignored `.coordination-eval/` directory.
 - `packages/pipeline`, `packages/object-store`: the pipeline framework and object-store adapters, moved from relayhistory-cloud #210 and #211 (byte-identical at the move, except where `MOVE_NOTES.md` records a later change, such as scrub rule set 2 in `raw-chunks.ts`; it also has the mapping and the few stand-ins). The services import them through `src/shared/vendor.ts`.
 - `vendor/relayhistory`: the `ai-hist` Rust CLI and transcript fixtures, for Concourse.
 - `docs/`, `runbooks/`, `versions.lock.json`.

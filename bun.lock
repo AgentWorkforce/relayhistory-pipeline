@@ -32,6 +32,10 @@
         "typescript": "5.9.3",
       },
     },
+    "packages/coordination-eval": {
+      "name": "@96bulls/coordination-eval",
+      "version": "0.2.0",
+    },
     "packages/object-store": {
       "name": "@relayhistory/object-store",
       "version": "0.1.0",
@@ -80,6 +84,8 @@
     },
   },
   "packages": {
+    "@96bulls/coordination-eval": ["@96bulls/coordination-eval@workspace:packages/coordination-eval"],
+
     "@96bulls/pipeline": ["@96bulls/pipeline@workspace:packages/pipeline"],
 
     "@96bulls/session-read-worker": ["@96bulls/session-read-worker@workspace:packages/session-read-worker"],

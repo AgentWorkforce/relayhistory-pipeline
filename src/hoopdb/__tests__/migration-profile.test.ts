@@ -22,6 +22,7 @@ import {
   MIGRATION_CHECKSUM_ALIASES,
   migrationChecksumMatches,
   RUNTIME_APPLICATION_FUNCTIONS,
+  RUNTIME_APPLICATION_RLS_TABLES,
   sessionsFunctionAcl,
   sessionsFunctionAclPreview,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
@@ -410,7 +411,7 @@ describe("runtime role: required, existing, SELECT only", () => {
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
-    ).toBe(30);
+    ).toBe(RUNTIME_APPLICATION_RLS_TABLES.length);
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
