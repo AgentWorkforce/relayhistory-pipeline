@@ -30,10 +30,33 @@ export interface BufferedGcTicket {
   sha256: string;
   bytes: number;
   groupOrdinals: number[][];
+  /** Sorted original claim ordinals, including subsets within a stored group. */
+  keepOrdinals: number[];
+  /** Derived indexes of groups containing at least one retained ordinal. */
   keepGroupIndexes: number[];
   resetEpoch: string;
   rowVersion: string;
   phase: "plan" | "cleanup";
   cleanupState: "live" | "retired" | "redacted";
   replacement?: BufferedStageSpec & { stageToken: string };
+}
+
+/** Validate the SQL retention mask and preserve original line/group ordering. */
+export function bufferedOrdinalSelection(
+  groupOrdinals: number[][], keepOrdinals: number[], keepGroupIndexes: number[],
+): { groupIndex: number; ordinals: number[]; lineIndexes: number[] }[] {
+  if (!Array.isArray(keepOrdinals) || !Array.isArray(keepGroupIndexes)) throw new Error("buffered_keep_invalid");
+  const original = new Set(groupOrdinals.flat());
+  let previous = -1;
+  for (const ord of keepOrdinals) {
+    if (!Number.isInteger(ord) || ord <= previous || !original.has(ord)) throw new Error("buffered_keep_invalid");
+    previous = ord;
+  }
+  const keep = new Set(keepOrdinals);
+  const selected = groupOrdinals.flatMap((group, groupIndex) => {
+    const lineIndexes = group.flatMap((ord, i) => keep.has(ord) ? [i] : []);
+    return lineIndexes.length ? [{ groupIndex, lineIndexes, ordinals: lineIndexes.map(i => group[i]!) }] : [];
+  });
+  if (JSON.stringify(keepGroupIndexes) !== JSON.stringify(selected.map(s => s.groupIndex))) throw new Error("buffered_keep_invalid");
+  return selected;
 }

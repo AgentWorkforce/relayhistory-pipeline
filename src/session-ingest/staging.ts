@@ -38,7 +38,7 @@ import { layoutComponent } from "../shared/layout-component.ts";
 import { liveMachineId, writeGroups, type Group, type LineMeta, type WriteTarget } from "./writer.ts";
 import type { Ledger, LedgerRecord } from "./ledger.ts";
 import { fitLine } from "./oversize.ts";
-import type { BufferedStageSpec, BufferedGcTicket } from "./buffered-protocol.ts";
+import { bufferedOrdinalSelection, type BufferedStageSpec, type BufferedGcTicket } from "./buffered-protocol.ts";
 
 export const STAGED_VERSION = 1;
 /** Sessions one fan-out message writes: well inside a queue invocation's subrequest budget. */
@@ -228,10 +228,15 @@ export function prepareBufferedStage(
   const full: StagedHeader = { v: 1, ...header, publication_state: "buffered", groups: groups.map(g => [g.source, g.sessionId]) };
   const body = groups.flatMap((g, i) => g.lines.map((l, j) => `{"g":${i},"m":${JSON.stringify(g.meta?.[j] ?? null)},"l":${l}}`)).join("\n") + "\n";
   const scrubbed = scrubRecords(encoder.encode(body)).scrubbed;
+  return packBufferedStage(keyRoot, full, scrubbed, groupOrdinals);
+}
+
+/** Initial admission scrubs once; GC only reframes verified, already-scrubbed lines. */
+function packBufferedStage(keyRoot: string, full: StagedHeader, body: Uint8Array, groupOrdinals: number[][]): PreparedBufferedStage {
   const prefix = encoder.encode(JSON.stringify(full) + "\n");
-  if (prefix.byteLength + scrubbed.byteLength > BUFFER_STAGE_MAX_BYTES - 1024) throw new Error("buffered_stage_too_large");
-  const raw = new Uint8Array(prefix.byteLength + scrubbed.byteLength);
-  raw.set(prefix); raw.set(scrubbed, prefix.byteLength);
+  if (prefix.byteLength + body.byteLength > BUFFER_STAGE_MAX_BYTES - 1024) throw new Error("buffered_stage_too_large");
+  const raw = new Uint8Array(prefix.byteLength + body.byteLength);
+  raw.set(prefix); raw.set(body, prefix.byteLength);
   const packed = rawZstdFrame(raw);
   if (packed.byteLength > BUFFER_STAGE_MAX_BYTES) throw new Error("buffered_stage_too_large");
   const key = stagedKey(keyRoot, full, byteSha(packed), "buffered-batches");
@@ -285,15 +290,17 @@ export async function readBufferedStage(
 export function prepareBufferedReplacement(keyRoot: string, ticket: BufferedGcTicket, decoded: DecodedBufferedStage): PreparedBufferedStage {
   if (ticket.key !== decoded.spec.key || ticket.sha256 !== decoded.spec.sha256 || ticket.bytes !== decoded.spec.bytes ||
       ticket.claimToken !== decoded.header.claim_token || JSON.stringify(ticket.groupOrdinals) !== JSON.stringify(decoded.spec.groupOrdinals)) throw new Error("buffered_ticket_mismatch");
-  const indexes = ticket.keepGroupIndexes;
-  let prior = -1;
-  for (const index of indexes) {
-    if (!Number.isInteger(index) || index <= prior || index >= decoded.groups.length) throw new Error("buffered_keep_invalid");
-    prior = index;
-  }
-  if (indexes.length === 0 || indexes.length === decoded.groups.length) throw new Error("buffered_replacement_unnecessary");
-  const { v: _v, groups: _groups, publication_state: _state, ...header } = decoded.header;
-  const result = prepareBufferedStage(keyRoot, header, indexes.map(i => decoded.groups[i]!), indexes.map(i => decoded.spec.groupOrdinals[i]!));
+  assertOrdinals(decoded.groups, decoded.spec.groupOrdinals);
+  const selected = bufferedOrdinalSelection(ticket.groupOrdinals, ticket.keepOrdinals, ticket.keepGroupIndexes);
+  const recordCount = ticket.groupOrdinals.reduce((n, group) => n + group.length, 0);
+  if (ticket.phase !== "plan" || ticket.receiptState !== "acknowledged" || !ticket.keepOrdinals.length || ticket.keepOrdinals.length === recordCount) throw new Error("buffered_replacement_unnecessary");
+  const groups = selected.map(({groupIndex, lineIndexes}) => {
+    const group = decoded.groups[groupIndex]!;
+    return {...group, lines: lineIndexes.map(i => group.lines[i]!), meta: lineIndexes.map(i => group.meta![i]!)};
+  });
+  const full: StagedHeader = {...decoded.header, groups: groups.map(g => [g.source, g.sessionId])};
+  const body = encoder.encode(groups.flatMap((g, i) => g.lines.map((l, j) => `{"g":${i},"m":${JSON.stringify(g.meta![j])},"l":${l}}`)).join("\n") + "\n");
+  const result = packBufferedStage(keyRoot, full, body, selected.map(s => s.ordinals));
   if (result.spec.key === ticket.key) throw new Error("buffered_replacement_same_key");
   return result;
 }

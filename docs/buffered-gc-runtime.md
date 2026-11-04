@@ -107,3 +107,9 @@ keeps GC scheduled until every acknowledged/retired object has verified retentio
 or erasure evidence. Never disable GC as the first rollback step.
 
 Ordered dual-control epoch/version/digest contract: [ordered-ingest-controls.md](ordered-ingest-controls.md).
+
+### Original-record retention masks
+
+Lazy-current custody migration 040550 supplies a required `keepOrdinals` field on every GC ticket: sorted, unique original claim ordinals. `keepGroupIndexes` is derived from that mask. A replacement is necessary when any record is removed, including a partial removal that leaves every group present. Replacement objects retain the original sparse ordinal maps and matching line metadata; subsequent rewrites never renumber records. Cleanup tickets contain empty masks. This runtime must compose with the ordinal-aware SQL contract; it refuses older tickets missing the mask.
+
+GC verifies the stored object, selects the retained lines and reframes them without running the scrubber again. Initial admission still scrubs. Reapplying a non-idempotent scrubber would alter already acknowledged retained values. Four focused regression groups fail when the previous group-only runtime is restored, covering mixed groups, all-groups-present partial removal, invalid masks and a synthetic non-idempotent scrub value. These codec checks do not establish SQL current-seat correctness, deletion races, live transport or production retention; those require the composed PostgreSQL/versioned-object-store proof before admission.

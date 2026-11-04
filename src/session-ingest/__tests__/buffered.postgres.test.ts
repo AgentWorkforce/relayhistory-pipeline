@@ -163,7 +163,7 @@ describe.skipIf(!url)("buffer-only actual PG receipt/outbox",()=>{
  test("mixed stage rewrite preserves exact kept ordinal mapping and scrubbed content; redaction barrier defeats late create",async()=>{
   const d=await fixture();await deliverBatch(d.deps,TENANT,await batch([record({record_id:"keep",session_id:"keep-session"}),record({record_id:"erase",session_id:"erase-session"})]));
   const [r]=await d.rows();const decoded=await readBufferedStage(d.store,r,unzip);
-  const replacement=prepareBufferedReplacement("96bulls",{...r,stageToken:r.stage_token,claimToken:r.claim_token,leaseToken:crypto.randomUUID(),receiptState:"acknowledged",rowVersion:"2",resetEpoch:"0",phase:"plan",cleanupState:"live",keepGroupIndexes:[0]},decoded);
+  const replacement=prepareBufferedReplacement("96bulls",{...r,stageToken:r.stage_token,claimToken:r.claim_token,leaseToken:crypto.randomUUID(),receiptState:"acknowledged",rowVersion:"2",resetEpoch:"0",phase:"plan",cleanupState:"live",keepOrdinals:[0],keepGroupIndexes:[0]},decoded);
   expect(replacement.spec.groupOrdinals).toEqual([[0]]);expect(replacement.spec.key).not.toBe(r.key);
   await putBufferedStage(d.store,replacement);
   expect((await readBufferedStage(d.store,replacement.spec,unzip)).groups).toHaveLength(1);
