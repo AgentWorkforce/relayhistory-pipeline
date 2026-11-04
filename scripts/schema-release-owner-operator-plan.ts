@@ -40,6 +40,24 @@ export function ownerPlanInputs(env: NodeJS.ProcessEnv, argv: string[]) {
   if (!sha || !/^[0-9a-f]{40}$/u.test(sha) || !digest || !/^[0-9a-f]{64}$/u.test(digest)) refuse("operator_source_pin");
   return { sha, digest };
 }
+interface OwnerPlanClient {
+  connect(): Promise<void>;
+  query(sql: string): Promise<unknown>;
+  end(): Promise<void>;
+}
+/** Never queue ROLLBACK on a failed connection; pg cannot service that queue. */
+export async function withOwnerPlanClient<T>(client: OwnerPlanClient, work: () => Promise<T>): Promise<T> {
+  let began = false;
+  try {
+    await client.connect();
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    began = true;
+    return await work();
+  } finally {
+    try { if (began) await client.query("ROLLBACK").catch(() => {}); }
+    finally { await client.end().catch(() => {}); }
+  }
+}
 export async function operatorOwnerPlan() {
   const input = ownerPlanInputs(process.env, process.argv);
   const childEnv = Object.fromEntries(["PATH", "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "DBUS_SESSION_BUS_ADDRESS"].flatMap(k => process.env[k] ? [[k, process.env[k]!]] : []));
@@ -52,9 +70,7 @@ export async function operatorOwnerPlan() {
   const client = new pg.Client({ host: "aws-0-us-east-1.pooler.supabase.com", port: 5432, database: "postgres", user: `cli_login_postgres.${PROJECT}`, password: login.password, ssl: { ca: SUPABASE_PROD_CA_2021, rejectUnauthorized: true, servername: "aws-0-us-east-1.pooler.supabase.com" }, connectionTimeoutMillis: 10000, options: "-c statement_timeout=15000 -c lock_timeout=2000 -c idle_in_transaction_session_timeout=20000", application_name: "96bulls-owner-operator-plan-readonly" });
   login.password = "";
   client.on("error", () => {});
-  try {
-    await client.connect();
-    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  return withOwnerPlanClient(client, async () => {
     await client.query("SET LOCAL ROLE postgres");
     const me = (await client.query("SELECT current_user AS owner, session_user AS login, current_database() AS db, current_setting('transaction_read_only') AS ro, pg_get_userbyid(nspowner) AS schema_owner FROM pg_namespace WHERE nspname='sessions'")).rows[0];
     if (!me || me.owner !== "postgres" || me.login !== "cli_login_postgres" || me.schema_owner !== "postgres" || me.db !== "postgres" || me.ro !== "on") refuse("operator_owner_identity");
@@ -63,6 +79,6 @@ export async function operatorOwnerPlan() {
     const report = await inspectMigrations(client, profile);
     const trigger = await functionBoundaryEvidence(client, "event-trigger", "supabase", "bulls96_runtime");
     console.log(JSON.stringify({ version: 1, status: "planned_readonly_not_apply_approval", at: new Date().toISOString(), project: PROJECT, sourceSha: input.sha, boundary: "global-default-revoke", existingEventTriggerMatchesSource: trigger.satisfied, ...report }));
-  } finally { await client.query("ROLLBACK").catch(() => {}); await client.end().catch(() => {}); }
+  });
 }
 if (import.meta.main) operatorOwnerPlan().catch(error => { const code = typeof error?.code === "string" && /^[A-Za-z0-9_]{1,64}$/u.test(error.code) ? error.code : "operator_plan_failed"; console.log(JSON.stringify({ status: "refused", code })); process.exitCode = 1; });
