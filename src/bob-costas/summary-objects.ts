@@ -1,10 +1,10 @@
 // Ported from AgentWorkforce/relayhistory-cloud
 // packages/relayhistory/src/lib/pipeline/summary-objects.ts @ 73434047b6d7
-// (spec: docs/pipeline-summary-short.md). Body verbatim; only the imports differ
+// (spec: docs/pipeline-summary-short.md). The local deviations are the imports
 // (this repo's vendored pipeline and object store), plus `summaryObjectKey` and
 // `SummaryKind` copied from upstream object-layout.ts, a `BufferSource` alias
-// (this repo's tsconfig has no DOM lib), and one marked deviation in
-// writeSummaryObject (reuse only under the current key, for rotation).
+// (this repo's tsconfig has no DOM lib), current-key reuse for rotation,
+// reusable in-memory preparation, and actual byte bounds on reads/writes.
 // Keep in sync on upstream changes.
 /**
  * Summary objects in the bucket: the encrypted envelope at
@@ -28,7 +28,7 @@ import {
   isObjectStoreError,
   joinKey,
   objectKey,
-  readAll,
+  readCapped,
   sessionPrefix,
   type ObjectKey,
   type ObjectStore,
@@ -128,6 +128,7 @@ const MESSAGES = {
   summary_store_rejected: "the object store refused the summary object",
   summary_contended: "the summary object kept changing under the writer",
   summary_store_timeout: "the object store did not answer in time",
+  summary_too_large: "the summary exceeds its verified encrypted-object bound",
 } as const;
 
 export type SummaryObjectErrorCode = keyof typeof MESSAGES;
@@ -157,6 +158,29 @@ const MAX_WRITE_ATTEMPTS = 4;
 const DEFAULT_STORE_TIMEOUT_MS = 5_000;
 /** The largest summary envelope read back; a long summary is a few KiB. */
 const MAX_SUMMARY_OBJECT_BYTES = 1024 * 1024;
+
+/** Exact encrypted bytes and registration descriptor, before any SQL/S3 work.
+ * Native's shared helper supplies the immutable publication/attempt-qualified
+ * key. This function grants no publication authority and performs no PUT. */
+export interface PreparedSummaryObject {
+  readonly key: string;
+  readonly sha256: string;
+  readonly bytes: number;
+  readonly keyId: string;
+  readonly body: Uint8Array;
+}
+
+export async function prepareSummaryObject(args: {
+  keyring: WorkspaceKeyring; ids: WorkspaceIds; key: string; record: SummaryRecord;
+}): Promise<PreparedSummaryObject> {
+  const key = String(objectKey(args.key));
+  const record = { ...args.record };
+  let current: { keyId: string; key: CryptoKey };
+  try { current = await args.keyring.currentKey(args.ids); }
+  catch (err) { throw err instanceof PipelineError ? err : fail("keyring_unavailable", true); }
+  const body = await seal(current, key, record);
+  return { key, keyId: current.keyId, body, sha256: await sha256Hex(body), bytes: body.byteLength };
+}
 
 /**
  * Write `record` to `key` for the session's current manifest.
@@ -272,7 +296,8 @@ async function storedDigest(
       await object.body.cancel().catch(() => undefined);
       return undefined;
     }
-    return await sha256Hex(await call(() => readAll(object.body)));
+    const body = await call(() => readCapped(object.body, MAX_SUMMARY_OBJECT_BYTES));
+    return body ? await sha256Hex(body) : undefined;
   } catch (err) {
     if (isObjectStoreError(err, "not_found")) return undefined;
     throw storeError(err);
@@ -353,7 +378,9 @@ export async function readSummaryObject(args: {
       await object.body.cancel().catch(() => undefined);
       return null;
     }
-    body = await readAll(object.body);
+    const bounded = await readCapped(object.body, MAX_SUMMARY_OBJECT_BYTES);
+    if (!bounded) return null;
+    body = bounded;
   } catch (err) {
     if (isObjectStoreError(err, "not_found")) return null;
     throw storeError(err);
@@ -387,6 +414,8 @@ async function seal(
   key: string,
   record: SummaryRecord,
 ): Promise<Uint8Array> {
+  const plain = new TextEncoder().encode(JSON.stringify(record));
+  if (plain.byteLength > MAX_SUMMARY_OBJECT_BYTES) throw fail("summary_too_large", false);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt(
     {
@@ -395,7 +424,7 @@ async function seal(
       additionalData: aad(key, record.kind, record.revision) as BufferSource,
     },
     current.key,
-    new TextEncoder().encode(JSON.stringify(record)) as BufferSource,
+    plain as BufferSource,
   );
   const envelope: Envelope = {
     v: SUMMARY_ENVELOPE_VERSION,
@@ -404,7 +433,9 @@ async function seal(
     iv: base64(iv),
     ct: base64(new Uint8Array(ct)),
   };
-  return new TextEncoder().encode(JSON.stringify(envelope));
+  const body = new TextEncoder().encode(JSON.stringify(envelope));
+  if (body.byteLength > MAX_SUMMARY_OBJECT_BYTES) throw fail("summary_too_large", false);
+  return body;
 }
 
 async function open(

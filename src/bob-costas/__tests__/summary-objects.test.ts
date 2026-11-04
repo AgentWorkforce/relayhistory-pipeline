@@ -2,9 +2,10 @@ import { describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
-import { readSummaryObject, summaryObjectKey, writeSummaryObject, type SummaryRecord } from "../summary-objects.ts";
+import { readSummaryObject, summaryObjectKey, writeSummaryObject, prepareSummaryObject, type SummaryRecord } from "../summary-objects.ts";
 
 const HEX_A = "a".repeat(64);
 const HEX_B = "b".repeat(64);
@@ -18,6 +19,35 @@ const allFiles = (dir: string): string[] =>
   readdirSync(dir).flatMap((f) => (statSync(join(dir, f)).isDirectory() ? allFiles(join(dir, f)) : [join(dir, f)]));
 
 describe("summary objects (upstream envelope) with the HKDF keyring", () => {
+  it("prepares exact encrypted registration bytes without storage and preserves envelope/AAD compatibility", async () => {
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bc-prepared-")) });
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${HEX_A}`));
+    // Fixture key only: the managed publisher owns production qualified names.
+    const key = "fixture/publication/attempt/short.json.enc";
+    const prepared = await prepareSummaryObject({ keyring, ids, key, record: record() });
+    expect(prepared.sha256).toBe(createHash("sha256").update(prepared.body).digest("hex"));
+    expect(prepared.bytes).toBe(prepared.body.byteLength);
+    expect(prepared.keyId).toBe("hkdf1:k1");
+    expect(new TextDecoder().decode(prepared.body)).not.toContain("SECRET-SUMMARY-TEXT");
+    await store.put(prepared.key as never, prepared.body, { ifNoneMatch: true, contentSha256: prepared.sha256 });
+    expect((await readSummaryObject({ store, keyring, ids, key, sha256: prepared.sha256, kind: "short", revision: 3 }))?.summary).toBe("SECRET-SUMMARY-TEXT");
+    const moved = "fixture/another-attempt/short.json.enc";
+    await store.put(moved as never, prepared.body);
+    expect(await readSummaryObject({ store, keyring, ids, key: moved, sha256: prepared.sha256, kind: "short", revision: 3 })).toBeNull();
+    await expect(prepareSummaryObject({ keyring, ids, key, record: record({ summary: "x".repeat(1024 * 1024) }) }))
+      .rejects.toMatchObject({ code: "summary_too_large", retryable: false });
+  });
+
+  it("bounds actual response bytes even when object metadata understates its size", async () => {
+    let cancelled = false, keyReads = 0;
+    const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new Uint8Array(2 * 1024 * 1024)); }, cancel() { cancelled = true; } });
+    const store = { getObject: async () => ({ meta: { size: 1 }, body }) } as never;
+    const keyring = { keyById: async () => { keyReads++; throw new Error("must not derive"); } } as never;
+    expect(await readSummaryObject({ store, keyring, ids, key: "fixture/short.json.enc", sha256: HEX_A, kind: "short", revision: 3 })).toBeNull();
+    expect(cancelled).toBe(true);
+    expect(keyReads).toBe(0);
+  });
+
   it("writes summary/<kind>.json.enc next to the raw, encrypted, and reads it back by pointer", async () => {
     const root = mkdtempSync(join(tmpdir(), "bc-"));
     const store = createFsStore({ root });

@@ -69,6 +69,15 @@ until Native's shared authority contract is composed. Legacy index-row fencing
 does not replace managed-generation authority. No managed canonical image is
 rewritten or given a guessed sidecar path by this draft.
 
+`prepareSummaryObject` now seals a supplied immutable key entirely in memory and
+returns the exact ciphertext, SHA-256, byte count and current key ID for Native's
+registration step. It performs no storage or authority operation. Generate the
+artifact UUID before encryption through Native's helper; register before the
+conditional immutable PUT. A retry under the same key must reuse the prepared
+bytes; re-encryption needs a new UUID/key. Envelope v1, key derivation and AAD
+remain compatible. Reads enforce the 1 MiB actual-stream bound even when object
+metadata lies, and oversize writes fail permanently.
+
 ## Default-off durable-consumer preparation
 
 `session-pipeline/derived-tick.ts` consumes at most one job per stage from the
@@ -94,6 +103,9 @@ function-boundary check and final marker read. Empty assets close the gate.
 Embedded inputs are frozen and registered as build/watch dependencies. The
 compiled generation comes from source, never from the live database marker;
 the final composed release must rebuild this capture from its own migration set.
+This older baseline has two verifier files. The newer release composition has
+four, including ingest and seeder; Auth owns that adaptation. This checkpoint
+does not prove the newer four-verifier composition.
 
 The detached Node 24 proof uses the actual function-props build plugin and
 Alchemy/Rolldown bundler. Only the resulting `.mjs` file is in its temporary
