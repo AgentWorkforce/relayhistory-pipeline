@@ -108,6 +108,9 @@ const catalog = (extra: Partial<Record<"index" | "trigger", string>> = {}): Cata
   tables: new Map([
     ["machines", { rowSecurity: false, forceRowSecurity: false }],
     ["jobs", { rowSecurity: true, forceRowSecurity: false }],
+    // The shared legacy auth table: Neon leaves RLS off; the Supabase path
+    // enables it as the reviewed hardening.
+    ["auth_sessions", { rowSecurity: false, forceRowSecurity: false }],
   ]),
   policies: new Map([["jobs.jobs_org", '{"cmd":"SELECT","qual":"(org_id = \'a\'::text)"}']]),
   types: new Map([
@@ -222,13 +225,15 @@ describe("allowlist", () => {
   const bullsTarget = () => {
     const target = catalog();
     target.tables.set("machines", { rowSecurity: true, forceRowSecurity: false });
+    target.tables.set("auth_sessions", { rowSecurity: true, forceRowSecurity: false });
     target.columns.get("machines")!.set("workspace_id", column({ notNull: true, default: "'default'::text" }));
     return target;
   };
 
-  test("holds exactly the two reviewed differences", () => {
+  test("holds exactly the three reviewed differences", () => {
     expect([...ALLOWED_SCHEMA_DIFFERENCES].sort()).toEqual([
       "different column default machines.workspace_id: source none, target 'default'::text",
+      "different row security auth_sessions: source disabled, target enabled",
       "different row security machines: source disabled, target enabled",
     ]);
   });

@@ -1162,6 +1162,12 @@ describe("per-step catalog sentinels", () => {
         "utf8",
       ),
     );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_token_verifier.sql"),
+        "utf8",
+      ),
+    );
     for (let i = 0; i <= upTo; i++)
       await db.exec(readFileSync(steps[i]!.path, "utf8"));
     await db.exec(`CREATE SCHEMA IF NOT EXISTS sessions; CREATE TABLE sessions.__96bulls_migrations (
@@ -1204,6 +1210,12 @@ describe("per-step catalog sentinels", () => {
     await db.exec(
       readFileSync(
         join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_token_verifier.sql"),
         "utf8",
       ),
     );
@@ -1310,6 +1322,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.exec(
       readFileSync(
         join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_token_verifier.sql"),
         "utf8",
       ),
     );
@@ -2099,6 +2117,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
             "utf8",
           ),
         );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
+              "supabase/bootstrap/session_token_verifier.sql",
+            ),
+            "utf8",
+          ),
+        );
         await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
         await db.exec(
           readFileSync(
@@ -2121,6 +2148,16 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               join(
                 root,
                 "supabase/bootstrap/session_directory_search_worker.sql",
+              ),
+              "utf8",
+            ),
+          );
+        if (mode === "cloudsql")
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/session_token_verifier.sql",
               ),
               "utf8",
             ),
@@ -2533,5 +2570,64 @@ describe("every worker claim path runs the live gate first", () => {
     ran.length = 0;
     expect(await workerTick(io)).toEqual({ claimed: 0, gated: true });
     expect(ran).toEqual([]);
+  });
+});
+
+describe("session token verifier phase 2", () => {
+  const VERIFY = "supabase/bootstrap/session_token_verifier_verify.sql";
+
+  test("wired: a clean migrate passes the verifier phase 2; a table grant on auth_sessions (drift) is caught", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    // The phase-2 file itself passes on a clean migrate.
+    await db.exec(readFileSync(join(root, VERIFY), "utf8"));
+    // Drift: a table grant the approved shape refuses.
+    await db.exec(
+      "GRANT SELECT ON sessions.auth_sessions TO session_token_verifier",
+    );
+    await expect(
+      db.exec(readFileSync(join(root, VERIFY), "utf8")),
+    ).rejects.toThrow(/session token verifier is not in the approved shape/);
+    // Wired: the next migrate runs phase 2 and fails closed as well.
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error).not.toBeNull();
+  });
+
+  test("the live gate and the migrator see the same verifier set: table-grant drift closes schemaVerdict", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const expected = await expectedSchema();
+    expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: true });
+    await db.exec(
+      "GRANT SELECT ON sessions.auth_sessions TO session_token_verifier",
+    );
+    const closed = await schemaVerdict(expected, transact(db));
+    expect(closed.ok).toBe(false);
+  });
+
+  test("PG17+: a direct or PUBLIC MAINTAIN grant is effective drift, caught by phase 2", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const v = Number(
+      (await db.query<{ v: string }>("SELECT current_setting('server_version_num') AS v")).rows[0].v,
+    );
+    if (v < 170000) return; // MAINTAIN does not exist before PG17
+    const verify = () => db.exec(readFileSync(join(root, VERIFY), "utf8"));
+    // Direct grant to the role: fails closed.
+    await db.exec(
+      "GRANT MAINTAIN ON sessions.auth_sessions TO session_token_verifier",
+    );
+    await expect(verify()).rejects.toThrow(
+      /session token verifier is not in the approved shape/,
+    );
+    await db.exec(
+      "REVOKE MAINTAIN ON sessions.auth_sessions FROM session_token_verifier",
+    );
+    await verify(); // clean again
+    // The same grant via PUBLIC is effective drift too.
+    await db.exec("GRANT MAINTAIN ON sessions.auth_sessions TO PUBLIC");
+    await expect(verify()).rejects.toThrow(
+      /session token verifier is not in the approved shape/,
+    );
   });
 });

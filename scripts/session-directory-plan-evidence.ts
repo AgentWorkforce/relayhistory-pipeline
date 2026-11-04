@@ -76,6 +76,12 @@ async function evidence(adminUrl: string) {
         "utf8",
       ),
     );
+    await c.query(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_token_verifier.sql"),
+        "utf8",
+      ),
+    );
     for (const f of readdirSync(join(root, "supabase/migrations")).sort()) {
       await c.query(readFileSync(join(root, "supabase/migrations", f), "utf8"));
     }
