@@ -20,19 +20,20 @@ export interface BufferedClaimRecord {
   revision: number;
   digest: string;
 }
-/** Root's GC RPC maps attemptToken to stage_token, distinct from claimToken. */
+/** Exact internal JSON contract shared by040510 and Root's GC runtime. */
 export interface BufferedGcTicket {
-  attemptToken: string;
+  stageToken: string;
   claimToken: string;
   leaseToken: string;
-  state: "preparing" | "acknowledged";
-  oldKey: string;
+  receiptState: "preparing" | "acknowledged";
+  key: string;
   sha256: string;
   bytes: number;
   groupOrdinals: number[][];
   keepGroupIndexes: number[];
   resetEpoch: string;
-  currentVersion: string;
+  rowVersion: string;
+  phase: "plan" | "cleanup";
   cleanupState: "live" | "retired" | "redacted";
+  replacement?: BufferedStageSpec & { stageToken: string };
 }
-
