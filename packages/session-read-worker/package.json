@@ -1,6 +1,7 @@
 {
   "name": "@96bulls/session-read-worker",
   "version": "0.0.0",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "96Bulls session read API as a Cloudflare Worker: the #135 read API (src/session-read-api) served from workerd, ClickHouse Cloud over HTTPS, Supabase through Hyperdrive.",

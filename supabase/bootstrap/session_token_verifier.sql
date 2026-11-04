@@ -1,6 +1,6 @@
 -- Phase 1: privileged bootstrap for the auth token verifier role. Before migrate.
 --
--- The migration (supabase/migrations/20261101000100_auth_session_verify.sql) never
+-- The migration (supabase/migrations/20261104020100_auth_session_verify.sql) never
 -- creates or alters a role: a CNPG/Cloud SQL migration owner has no CREATEROLE. It
 -- verifies this role (42704 if absent, 55000 if it differs) and grants EXECUTE on
 -- sessions.auth_session_verify to it. This file provisions it, the pattern of
@@ -15,14 +15,16 @@
 --   attrs     NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
 --   members   member of none. Members OF the role may only be the separately
 --             approved `authenticator` edge (PostgREST's switch-to, granted as a
---             deployment step without ADMIN OPTION) and, on Supabase PG16+, the
+--             deployment step without ADMIN OPTION or inherited privileges;
+--             PG16+ requires INHERIT FALSE and SET TRUE; PG15 requires the
+--             authenticator role NOINHERIT) and, on Supabase PG16+, the
 --             unavoidable `postgres` creator edge (grantor supabase_admin, ADMIN
 --             without INHERIT or SET).
 --   run as    a superuser (CNPG `postgres`); a CREATEROLE role on PostgreSQL 15 and
 --             older (Cloud SQL's migration_owner); or Supabase's `postgres` on 16+.
 --   when      before every migrate (src/hoopdb/migrate.ts runs it as its bootstrap
 --             step where the migrator may; on Supabase the operator runs it as
---             `postgres` before the migrate that carries 20261101000100).
+--             `postgres` before the migrate that carries 20261104020100).
 --   exit      success: the role exists (created now or already) and is not elevated.
 --             failure: 42501 (caller may not create it) or 55000 (an existing role
 --             is elevated or a member of another role; nothing is changed). It
@@ -66,7 +68,7 @@ BEGIN
       HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
   END IF;
   -- Members OF the verifier: only the separately approved authenticator edge
-  -- (never ADMIN) and the Supabase PG16+ postgres creator edge.
+  -- (never ADMIN or inherited privileges) and the Supabase PG16+ postgres creator edge.
   IF v_version >= 160000 THEN
     FOR v_row IN EXECUTE
       'SELECT u.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super,
@@ -78,7 +80,8 @@ BEGIN
       IF v_row.rolname = 'postgres' AND v_row.grantor = 'supabase_admin' AND v_row.grantor_super
          AND v_row.admin_option AND NOT v_row.inherit_option AND NOT v_row.set_option THEN
         NULL; -- Supabase PG16+ creator edge
-      ELSIF v_row.rolname = 'authenticator' AND NOT v_row.admin_option THEN
+      ELSIF v_row.rolname = 'authenticator' AND NOT v_row.admin_option
+         AND NOT v_row.inherit_option AND v_row.set_option THEN
         NULL; -- separately approved PostgREST switch-to edge
       ELSE
         RAISE EXCEPTION USING ERRCODE = '55000',
@@ -87,9 +90,9 @@ BEGIN
       END IF;
     END LOOP;
   ELSE
-    FOR v_row IN SELECT u.rolname, m.admin_option FROM pg_auth_members AS m
+    FOR v_row IN SELECT u.rolname, u.rolinherit, m.admin_option FROM pg_auth_members AS m
                    JOIN pg_roles AS u ON u.oid = m.member WHERE m.roleid = r.oid LOOP
-      IF NOT (v_row.rolname = 'authenticator' AND NOT v_row.admin_option) THEN
+      IF NOT (v_row.rolname = 'authenticator' AND NOT v_row.admin_option AND NOT v_row.rolinherit) THEN
         RAISE EXCEPTION USING ERRCODE = '55000',
           MESSAGE = format('bootstrap session_token_verifier: unexpected member %I', v_row.rolname),
           HINT = 'Nothing was changed. Revoke the member by hand, then rerun.';
