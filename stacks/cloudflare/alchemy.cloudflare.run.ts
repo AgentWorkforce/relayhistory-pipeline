@@ -91,16 +91,32 @@ function readInputs(stage: string, mode: CloudflareMode): { inputs: CloudflareSt
   return { inputs, inputsText };
 }
 
+/** Must refuse buffered before any convenience state/bootstrap path is built. */
+export function stockCloudflareState(load: typeof readInputs = readInputs) {
+  return Layer.unwrap(
+    Effect.gen(function* () {
+      const stage = yield* Stage;
+      const { inputs } = load(stage, cloudflareMode(process.argv));
+      if (inputs.sessionIngest.acceptanceMode === "buffered")
+        throw new Error(
+          "stock_buffered_refused: use retained operator with paused Queue provider",
+        );
+      return Cloudflare.state({ name: "96bulls" });
+    }),
+  );
+}
+
 export default Alchemy.Stack(
   "96bulls-cloudflare",
   {
     providers: Layer.mergeAll(Cloudflare.providers()),
-    state: Cloudflare.state({ name: "96bulls" }),
+    state: stockCloudflareState(),
   },
   Effect.gen(function* () {
     const stage = yield* Stage;
     const mode = cloudflareMode(process.argv);
     const { inputs, inputsText } = readInputs(stage, mode);
+    if (inputs.sessionIngest.acceptanceMode === "buffered") throw new Error("stock_buffered_refused: use retained operator with paused Queue provider");
     if (mode === "deploy") {
       const plans = join(ROOT, "docs", "plans");
       let provenanceText: string, planText: string, detailedPlanText: string;

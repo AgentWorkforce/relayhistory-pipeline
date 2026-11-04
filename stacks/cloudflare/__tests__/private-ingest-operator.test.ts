@@ -25,7 +25,7 @@ const secrets: OperatorSecrets = {
   stateUrl: "https://alchemy-state-store-96bulls.fixture.workers.dev",
   stateToken: "synthetic-state-token-not-authorized",
 };
-const input = {
+const baseInput = {
   sessionIngest: {
     accountId: secrets.accountId,
     hyperdriveId: "b".repeat(32),
@@ -34,6 +34,7 @@ const input = {
       "arn:aws:kms:us-east-1:941433935742:key/12345678-1234-1234-1234-123456789abc",
   },
 };
+const input = baseInput;
 const control = {
   status: "created",
   resourceType: "Cloudflare.Worker",
@@ -61,7 +62,20 @@ const tools = {
     nativeBindingsSha256: "f".repeat(64),
   };
 const digest = (v: string) => createHash("sha256").update(v).digest("hex");
-test("actual original four-resource declaration uses only the authenticated HTTP state port and retained plan", async () => {
+async function actualPlanProof(mode: "canonical" | "buffered") {
+  const input = {
+    ...baseInput,
+    sessionIngest: {
+      ...baseInput.sessionIngest,
+      ...(mode === "buffered"
+        ? {
+            acceptanceMode: "buffered" as const,
+            inlineMaxSessions: 0,
+            replicaMode: "off" as const,
+          }
+        : {}),
+    },
+  };
   let native: any;
   const originalPlan = Stacks.plan;
   const watched = spyOn(Stacks, "plan").mockImplementation((args: any) =>
@@ -242,7 +256,15 @@ test("actual original four-resource declaration uses only the authenticated HTTP
     } finally {
       applySpy.mockRestore();
     }
-    expect(assertOperatorSnapshot(native, input)).toHaveLength(13);
+    expect(assertOperatorSnapshot(native, input)).toHaveLength(
+      mode === "buffered" ? 14 : 13,
+    );
+    const queue = native.native.resources["session-ingest-fanout"];
+    if (mode === "buffered") {
+      expect(queue.props.deliveryPaused).toBe(true);
+      expect(queue.provider.version).toBe(1);
+      expect(queue.downstream).toContain("session-ingest-fanout-consumer");
+    }
     for (const change of ["binding", "target", "type", "action", "resource"]) {
       const rows = { ...native.native.resources },
         original = rows["session-ingest"];
@@ -291,7 +313,11 @@ test("actual original four-resource declaration uses only the authenticated HTTP
     }
     await rm(dir, { recursive: true, force: true });
   }
-});
+}
+test.each(["canonical", "buffered"] as const)(
+  "actual original four-resource declaration %s uses authenticated HTTP state and retained plan",
+  actualPlanProof,
+);
 test.each(["version", "missing", "foreign"] as const)(
   "state %s prerequisite refuses without a refresh helper",
   async (mode) => {

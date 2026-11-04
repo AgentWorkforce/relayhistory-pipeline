@@ -72,6 +72,8 @@ export type ReplicaMode = "off" | "queue";
 export interface SessionIngestInputs {
   /** The relayhistory Cloudflare account (the service binding needs both Workers in one account). */
   accountId: string;
+  /** Buffered acceptance stores S3/outbox only; canonical publication is separately refused. */
+  acceptanceMode?: "canonical" | "buffered";
   /** The Hyperdrive config the lead created (Supabase transaction pooler, bulls96_session_ingest). */
   hyperdriveId: string;
   /** The account Secrets Store holding the srv-writer access key. */
@@ -92,7 +94,7 @@ export interface SessionIngestInputs {
 const HEX32 = /^[0-9a-f]{32}$/;
 const KEY_ARN = /^arn:aws:kms:us-east-1:941433935742:key\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const REPLICA_QUEUE = /^relayhistory-neon-replica(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$/;
-const KEYS = ["accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue"];
+const KEYS = ["acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue"];
 
 export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => never): asserts p is SessionIngestInputs {
   if (p === null || typeof p !== "object" || Array.isArray(p) || Object.getPrototypeOf(p) !== Object.prototype) refuse("sessionIngest inputs must be a plain object");
@@ -107,7 +109,9 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
   int("maxPerUser", 1, 64);
   int("maxPerOrg", 1, 1024);
   // 48 sessions is the Worker's subrequest budget per batch (relayhistory MAX_LIVE_SESSIONS).
-  int("inlineMaxSessions", 1, 48);
+  if (v.acceptanceMode !== undefined && v.acceptanceMode !== "canonical" && v.acceptanceMode !== "buffered") refuse("sessionIngest.acceptanceMode must be canonical or buffered");
+  int("inlineMaxSessions", v.acceptanceMode === "buffered" ? 0 : 1, 48);
+  if (v.acceptanceMode === "buffered" && (v.inlineMaxSessions !== 0 || (v.replicaMode ?? "off") !== "off")) refuse("buffered acceptance requires explicit inlineMaxSessions 0 and replicaMode off");
   if (v.maxPerUser !== undefined && v.maxPerOrg !== undefined && (v.maxPerUser as number) > (v.maxPerOrg as number)) refuse("sessionIngest.maxPerUser cannot exceed maxPerOrg");
   if (v.replicaMode !== undefined && v.replicaMode !== "off" && v.replicaMode !== "queue") refuse('sessionIngest.replicaMode must be "off" or "queue"');
   if (v.neonReplicaQueue !== undefined && (typeof v.neonReplicaQueue !== "string" || !REPLICA_QUEUE.test(v.neonReplicaQueue)))
@@ -137,6 +141,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     INGEST_MAX_PER_ORG: String(p.maxPerOrg ?? 32),
     INGEST_INLINE_MAX_SESSIONS: String(p.inlineMaxSessions ?? 40),
     INGEST_REPLICA_MODE: p.replicaMode ?? "off",
+    ...(p.acceptanceMode === "buffered" ? { INGEST_ACCEPTANCE_MODE: "buffered" } : {}),
   };
 }
 
@@ -287,8 +292,8 @@ export const sessionIngestStage = (p: SessionIngestInputs) =>
     const refuse = (why: string): never => {
       throw new Error(`96bulls: ${SESSION_INGEST_STAGE}: ${why}. Nothing was created.`);
     };
-    const dlq = yield* Cloudflare.Queues.Queue("session-ingest-fanout-dlq", { name: FANOUT_DLQ });
-    const fanout = yield* Cloudflare.Queues.Queue("session-ingest-fanout", { name: FANOUT_QUEUE });
+    const dlq = yield* Cloudflare.Queues.Queue("session-ingest-fanout-dlq", { name: FANOUT_DLQ, ...(p.acceptanceMode === "buffered" ? { deliveryPaused: true } : {}) } as never);
+    const fanout = yield* Cloudflare.Queues.Queue("session-ingest-fanout", { name: FANOUT_QUEUE, ...(p.acceptanceMode === "buffered" ? { deliveryPaused: true } : {}) } as never);
     const props = sessionIngestWorkerProps(p, {
       HYPERDRIVE: Cloudflare.Hyperdrive.lookup("HYPERDRIVE", { hyperdriveId: p.hyperdriveId }),
       INGEST_FANOUT: fanout,

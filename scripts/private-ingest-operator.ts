@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import * as Effect from "effect/Effect";
 import * as Alchemy from "alchemy";
 import * as Cloudflare from "@alchemy.run/cloudflare";
+import { bufferedQueueProviders } from "../stacks/cloudflare/buffered-queue-provider.ts";
 import { State, type StateService } from "alchemy/State/State";
 import { makeHttpStateStore } from "alchemy/State/HttpStateStore";
 import { encodeState } from "alchemy/State/StateEncoding";
@@ -352,6 +353,7 @@ export function guardOperatorFetch(
   secrets: OperatorSecrets,
   mode: "plan" | "deploy",
   base: typeof fetch,
+  acceptanceMode: "canonical" | "buffered" = "canonical",
 ): typeof fetch {
   const state = operatorStateUrl(secrets.stateUrl),
     queueIds = new Map<string, string>();
@@ -460,7 +462,7 @@ export function guardOperatorFetch(
     const q = /^queues\/([0-9a-f]{32})(?:\/consumers(?:\/[^/]+)?)?$/u.exec(
       path,
     );
-    if (q && queueIds.has(q[1]!) && ["PUT", "POST"].includes(method)) {
+    if (q && queueIds.has(q[1]!) && ["PUT", "POST", "PATCH"].includes(method)) {
       const b = await new Response(init?.body).json();
       if (!object(b)) refuse("queue_scope");
       if (path.includes("/consumers")) {
@@ -470,6 +472,15 @@ export function guardOperatorFetch(
           b.dead_letter_queue !== FANOUT_DLQ
         )
           refuse("consumer_scope");
+      } else if (method === "PATCH") {
+        if (acceptanceMode !== "buffered") refuse("queue_pause_scope");
+        if (
+          Object.keys(b).some((k) => k !== "settings") ||
+          !object(b.settings) ||
+          Object.keys(b.settings).length !== 1 ||
+          b.settings.delivery_paused !== true
+        )
+          refuse("queue_pause_scope");
       } else if (b.queue_name !== queueIds.get(q[1]!)) refuse("queue_scope");
       return send();
     }
@@ -691,6 +702,12 @@ export function assertOperatorSnapshot(
         });
       }
     }
+    if (
+      ["session-ingest-fanout", "session-ingest-fanout-dlq"].includes(id) &&
+      row.props.deliveryPaused !==
+        (input.sessionIngest.acceptanceMode === "buffered" ? true : undefined)
+    )
+      refuse("native_queue_pause");
     if (id !== "session-ingest" && row.bindings.length)
       refuse("native_binding_inventory");
     if (
@@ -790,7 +807,13 @@ export async function retainedOperatorPlan(
   // state port deliberately does not instantiate Cloudflare.state/bootstrap/login.
   const definition = Alchemy.Stack(
     "96bulls-cloudflare",
-    { providers: Cloudflare.providers(), state },
+    {
+      providers:
+        input.sessionIngest.acceptanceMode === "buffered"
+          ? bufferedQueueProviders()
+          : Cloudflare.providers(),
+      state,
+    },
     Effect.gen(function* () {
       assertCloudflareStage(SESSION_INGEST_STAGE, mode, input, {
         CLOUDFLARE_ACCOUNT_ID: secrets.accountId,
@@ -871,7 +894,12 @@ export async function retainedOperatorPlan(
           memoryOperatorServices(
             secrets,
             runtime.directory,
-            guardOperatorFetch(secrets, mode, runtime.fetcher),
+            guardOperatorFetch(
+              secrets,
+              mode,
+              runtime.fetcher,
+              input.sessionIngest.acceptanceMode,
+            ),
             mode,
           ),
           loader,

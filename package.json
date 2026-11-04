@@ -44,6 +44,7 @@
     "@alchemy.run/docker": "2.0.0-beta.84",
     "@alchemy.run/gcp": "2.0.0-beta.84",
     "@alchemy.run/kubernetes": "2.0.0-beta.84",
+    "@distilled.cloud/cloudflare": "1.0.0-rc.17",
     "@effect/platform-bun": "4.0.7",
     "@effect/platform-node": "4.0.7",
     "@opentelemetry/api": "1.10.0",
