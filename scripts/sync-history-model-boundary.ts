@@ -21,6 +21,13 @@ const block=wrapper.match(/v_secdef text\[\] := ARRAY\[([\s\S]*?)\]::text\[\];/)
 if(!block)throw Error("SECDEF inventory missing");
 const secdefs=[...block[1]!.matchAll(/'([^']+)'/g)].map(m=>m[1]!).filter(k=>!defs.has(k));
 for(const[f,sd]of defs)if(sd)secdefs.push(f);
+// Composed Pipe005 is an existing owner-only erasure trigger, not a model RPC.
+// Derive its declaration from its actual migration and retain the no-grant ACL.
+const erasureSql=await readFile(file("src/hoopdb/migrations/0005_derived_pointer_erasure.sql"),"utf8");
+const erasure=/CREATE FUNCTION\s+(sessions\.forget_pointer_derivatives)\(\)\s+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER/i.exec(erasureSql);
+if(!erasure||JSON.stringify(acl.functions[erasure[1]+"()"])!==JSON.stringify(["<owner>:EXECUTE"]))throw Error("private Pipe erasure classification drift");
+secdefs.push(erasure[1]+"()");
+
 wrapper=wrapper.replace(block[0],"v_secdef text[] := ARRAY[\n"+[...new Set(secdefs)].sort().map(f=>"    '"+f+"'").join(",\n")+"\n  ]::text[];");
 const body=wrapper.match(/v_body text := \$boundary\$([\s\S]*?)\$boundary\$;/)?.[1];if(!body)throw Error("boundary missing");
 const sha=createHash("sha256").update(body).digest("hex");

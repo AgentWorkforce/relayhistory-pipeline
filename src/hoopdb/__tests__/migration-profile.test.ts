@@ -66,6 +66,8 @@ const open: PGlite[] = [];
 afterEach(async () => {
   await Promise.all(open.splice(0).map((db) => db.close()));
 });
+/** Explicit privileged prerequisites for manual/bootstrap-OFF fixtures. */
+function ingestPrerequisites(){return["session_ingest_roles.sql","session_history_model_worker.sql"].map(file=>readFileSync(join(root,"supabase/bootstrap",file),"utf8")).join("\n");}
 async function fresh(): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
@@ -1171,10 +1173,7 @@ describe("per-step catalog sentinels", () => {
       ),
     );
     await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
-        "utf8",
-      ),
+      ingestPrerequisites(),
     );
     for (let i = 0; i <= upTo; i++)
       await db.exec(readFileSync(steps[i]!.path, "utf8"));
@@ -1228,10 +1227,7 @@ describe("per-step catalog sentinels", () => {
       ),
     );
     await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
-        "utf8",
-      ),
+      ingestPrerequisites(),
     );
     for (const st of steps) {
       expect(await sentinel(db, st.name), `${st.name} before`).toBe(false);
@@ -1346,10 +1342,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       ),
     );
     await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
-        "utf8",
-      ),
+      ingestPrerequisites(),
     );
     await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
     return db;
@@ -1593,10 +1586,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     );
     // As the superuser (cluster roles), then back to the role the test continues as.
     await db.exec(
-      `RESET ROLE; ${readFileSync(
-        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
-        "utf8",
-      )}; SET ROLE migration_owner;`,
+      `RESET ROLE; ${ingestPrerequisites()}; SET ROLE migration_owner;`,
     );
     const targets = await db.query<{
       rolname: string;
@@ -2174,13 +2164,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
           ),
         );
         await db.exec(
-          readFileSync(
-            join(
-              root,
-              "supabase/bootstrap/session_ingest_roles.sql",
-            ),
-            "utf8",
-          ),
+          ingestPrerequisites(),
         );
         await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
         await db.exec(
@@ -2219,13 +2203,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
             ),
           );
           await db.exec(
-            readFileSync(
-              join(
-                root,
-                "supabase/bootstrap/session_ingest_roles.sql",
-              ),
-              "utf8",
-            ),
+            ingestPrerequisites(),
           );
         await db.exec(
           `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,

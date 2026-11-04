@@ -3,6 +3,7 @@
 import pg from"pg";
 import{createS3Store,parseSessionKey,publicationDerivedKey,type ObjectStore}from"../../packages/object-store/src/index.ts";
 import{MODEL_WORKER_ROLE}from"../shared/model-worker-contract.ts";
+import{SESSIONS_FUNCTION_GATE_SQL}from"../shared/db.ts";
 import{ROLE_VERIFIERS}from"../hoopdb/role-verifier-contract.ts";
 import{SemanticPostgresExecutor}from"../search-features/semantic-copy-postgres.ts";
 import{derivedSchemaAssets,type DerivedSchemaAssets}from"../session-pipeline/derived-schema.ts";
@@ -79,7 +80,7 @@ export async function runFullModelJob(env:NodeJS.ProcessEnv,remainingMs:()=>numb
   const ctx={signal:controller.signal,deadline:Math.min(deadline,Date.now()+10000)};
   const who=(await read.queryBounded<{me:string;session:string}>("SELECT current_user AS me,session_user AS session",[],ctx)).rows[0];
   if(who?.me!==MODEL_WORKER_ROLE||who.session!==MODEL_WORKER_ROLE)no("model_database_role");
-  await read.queryBounded("SET LOCAL hoopdb.db_mode='supabase';"+ROLE_VERIFIERS.map(v=>assets.verifiers[v.key]).join("\n"),[],ctx);
+  await read.queryBounded("SET LOCAL hoopdb.db_mode='supabase';"+ROLE_VERIFIERS.map(v=>assets.verifiers[v.key]).join("\n")+"\n"+SESSIONS_FUNCTION_GATE_SQL,[],ctx);
   const store=(overrides.store??createS3Store)({bucket:config.bucket,region:config.region,credentials:async()=>credentials(),serverSideEncryption:"aws:kms",sseKmsKeyId:config.kmsKeyArn,fetch:boundedFetch});
   const keyring=await masterKeyring(secret.keys);
   const model=createFullModelTransport({config:modelConfig,apiKey:()=>secret.apiKey,fetch:overrides.providerFetch??boundedFetch});

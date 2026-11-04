@@ -113,6 +113,7 @@ DECLARE
     'sessions.enqueue_session_analysis_cache(text,text,text,text)',
     'sessions.enqueue_session_large_read(text,text,text,text)',
     'sessions.finish_session_analysis_cache(text,text,text,text,bigint,text,uuid,text)',
+    'sessions.forget_pointer_derivatives()',
     'sessions.heartbeat_session_analysis_cache(text,text,text,text,bigint,text,uuid)',
     'sessions.heartbeat_session_large_read(text,text,text,text,uuid)',
     'sessions.ingest_acquire_slot(jsonb)',

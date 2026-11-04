@@ -12,6 +12,7 @@ import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql
 import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import type { AddressInfo } from "node:net";
 import { SESSIONS_FUNCTION_GATE_SQL } from "../../shared/db.ts";
+import{ROLE_VERIFIERS}from"../role-verifier-contract.ts";
 import {
   ROLE_VALIDATION_TABLE,
   ROLE_VERIFY_SQL_PATH,
@@ -408,13 +409,12 @@ describe("the live gate: the marker is never the sole authority", () => {
       "SELECT name FROM sessions.__96bulls_migrations",
     );
     expect(seen[4]).toStartWith("SELECT generation, status FROM");
-    expect(seen[5]).toBe(VERIFY);
-    expect(seen[6]).toBe(TOKEN_VERIFY);
-    expect(seen[7]).toBe(SEEDER_VERIFY);
-    expect(seen[8]).toBe(INGEST_VERIFY);
-    expect(seen[9]).toBe(SESSIONS_FUNCTION_GATE_SQL); // the live sessions-function boundary
-    expect(seen[10]).toStartWith("SELECT generation, status FROM"); // the final read
-    expect(seen).toHaveLength(11);
+    for(const[v,at]of ROLE_VERIFIERS.map((v,at)=>[v,at]as const))
+      expect(seen[5+at]).toBe(readFileSync(v.path,"utf8"));
+    const fence=5+ROLE_VERIFIERS.length;
+    expect(seen[fence]).toBe(SESSIONS_FUNCTION_GATE_SQL);
+    expect(seen[fence+1]).toStartWith("SELECT generation, status FROM"); // exact final read
+    expect(seen).toHaveLength(fence+2);
     // No advisory lock anywhere on the probe path.
     expect(seen.some((q) => /advisory/i.test(q))).toBe(false);
     // One source: the migrator's verify step and mark_pass.sql use the same file.
