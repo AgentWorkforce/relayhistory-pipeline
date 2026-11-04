@@ -1,3 +1,4 @@
+import {initializeFixtureSeatClock} from "./ordered-support.ts";
 import {test,expect,afterEach,setDefaultTimeout} from "bun:test";
 import {PGlite} from "@electric-sql/pglite";
 import {btree_gin} from "@electric-sql/pglite/contrib/btree_gin";
@@ -21,6 +22,7 @@ async function fixture(admit=true){
  await db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest_seeder");
  await db.query("SELECT sessions.ingest_seed_fence_baseline($1::jsonb)",[JSON.stringify({org_id:tenant.orgId,workspace_id:tenant.workspaceId,user_id:tenant.userId,deletions:[],resets:[]})]);await db.exec("COMMIT");
  if(admit)await db.query("INSERT INTO sessions.ingest_buffer_admission VALUES($1,repeat('a',64),repeat('b',64),$2,clock_timestamp()+interval '1 hour',$3)",[tenant.orgId,generation,epoch]);
+ if(admit)await initializeFixtureSeatClock(db as never,generation);
  const ledger=sqlLedger(run,{acceptanceMode:"buffered",expectedGeneration:generation}),legacy=sqlLedger(run);
  const input=(enabled:boolean)=>({tenant,originId:"origin",sessions:[["claude","session"]] as [string,string][],enabled});
  async function selection(version:string,enabled:boolean,e=epoch){

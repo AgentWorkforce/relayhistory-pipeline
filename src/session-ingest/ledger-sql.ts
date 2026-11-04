@@ -1,3 +1,5 @@
+import {validatedCustodyAck} from "./custody-ack.ts";
+import {DeliveryError} from "./vendor/delivery/delivery-contracts.ts";
 import {orderedControl,orderedControlResult} from "./control-protocol.ts";
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 /**
@@ -66,6 +68,7 @@ async function call(run: SqlRun, fn: LedgerFunction, input: unknown): Promise<un
   try {
     ({ rows } = await run(`SELECT sessions.${fn}($1::jsonb) AS result`, [JSON.stringify(input)]));
   } catch (error) {
+    if((error as {code?:unknown})?.code==="P0W01")throw new DeliveryError("forbidden",403,"Delivery record belongs to another user");
     throw new LedgerUnavailableError(ledgerErrorCode(error));
   }
   if (rows.length !== 1) throw new LedgerUnavailableError("ledger_bad_result");
@@ -175,7 +178,11 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
       try{return orderedControlResult(r,control)}catch{throw new LedgerUnavailableError("ledger_control_ack_refused")}
     },
     async claim(input: ClaimInput): Promise<ClaimResult> {
-      return parseClaimResult((await call(run, options.acceptanceMode === "buffered" ? "ingest_claim_buffered_batch" : "ingest_claim_batch", options.acceptanceMode==="buffered"?buffered(input):input)) as Record<string, unknown>);
+      const raw=(await call(run,options.acceptanceMode==="buffered"?"ingest_claim_buffered_batch":"ingest_claim_batch",options.acceptanceMode==="buffered"?buffered(input):input)) as Record<string,unknown>;
+      const result=parseClaimResult(raw);
+      if(raw.custodyAck!==undefined){try{result.custodyAck=validatedCustodyAck(raw.custodyAck,input.custody)}catch{throw new LedgerUnavailableError("ledger_custody_ack_refused")}}
+      if(input.custody&&!result.custodyAck)throw new LedgerUnavailableError("ledger_custody_ack_missing");
+      return result;
     },
     async prepareBufferStage(input) {
       if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
@@ -189,6 +196,7 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
       const r = await call(run,"ingest_commit_buffered_batch",buffered(input)) as Record<string,unknown>;
       if (r.kind === "intent_invalid") throw new LedgerUnavailableError("ledger_stage_invalidated");
       if (r.kind !== "committed") throw new LedgerUnavailableError("ledger_bad_result");
+      if(r.custodyAck!==undefined){try{return validatedCustodyAck(r.custodyAck)}catch{throw new LedgerUnavailableError("ledger_custody_ack_refused")}}
     },
     async commit(input: CommitInput): Promise<CommitResult> {
       const r = (await call(run, "ingest_commit_batch", input)) as Record<string, unknown>;

@@ -1,3 +1,5 @@
+import type {CurrentCustodyPacket,CurrentCustodyAck} from "./custody-protocol.ts";
+import {validatedCustodyAck} from "./custody-ack.ts";
 /**
  * `POST /v1/delivery/batches` without Neon: every accepted batch is in S3
  * before the response, and there is no fallback path.
@@ -47,6 +49,8 @@ import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { prepareBufferedStage, putBufferedStage, fanoutMessages, stageGroups, type FanoutMessage } from "./staging.ts";
 
 export interface DeliverDeps {
+  /** Verified private source packet, bound to this request only. */
+  custody?:CurrentCustodyPacket;
   ledger: Ledger;
   acceptanceMode?: IngestAcceptanceMode;
   target: WriteTarget;
@@ -69,6 +73,7 @@ export interface DeliverDeps {
 export type DeliverOutcome = "accepted" | "accepted_buffered" | "accepted_staged" | "replay" | "replay_fast" | "accepted_all_deleted";
 
 export interface DeliverResult {
+  custodyAck?:CurrentCustodyAck;
   receipt: DeliveryReceipt;
   outcome: DeliverOutcome;
   /** Ids, counts and codes only: what the request log line may carry. */
@@ -147,6 +152,7 @@ export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batc
   const claim = await stage("claim", () =>
     deps.ledger.claim({
       tenant,
+      ...(deps.custody?{custody:deps.custody}:{}),
       originId: prepared.originId,
       batchId: prepared.batchId,
       batchDigest: prepared.batchDigest,
@@ -160,12 +166,12 @@ export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batc
   if (claim.kind === "replay") {
     // Content-addressed: the same digest recomputes the same receipt. A mismatch is corruption, never a 200.
     if (claim.receiptId !== prepared.receipt.receiptId) throw new IngestUnavailable("replay", "receipt_mismatch");
-    return { receipt: withLimits(prepared), outcome: "replay", stats: { ...base, timing_ms: timing } };
+    return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay", stats: { ...base, timing_ms: timing } };
   }
   if (claim.kind === "batch_conflict") throw batchIdConflict(prepared, claim.currentDigest);
   if (claim.kind === "revision_conflict") throw revisionConflict(prepared.originId, claim.conflicts, claim.count);
   if (claim.kind === "replay_fast")
-    return { receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
+    return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
 
   // The deletion filter (records of sessions the user deleted from this origin are
   // acknowledged, not stored) and the replay fast path (records already stored at or
@@ -221,9 +227,11 @@ async function writeAndCommit(
     mark("buffer_intent");
     await stage("buffer_put", () => putBufferedStage(deps.target.store,preparedStage));
     mark("buffer_put");
-    await stage("buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}));
+    const ack=await stage("buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}));
+    let custodyAck:CurrentCustodyAck|undefined;
+    if(deps.custody){try{custodyAck=validatedCustodyAck(ack,deps.custody)}catch{throw new IngestUnavailable("buffer_receipt","custody_ack_missing")}}
     mark("buffer_receipt");
-    return {receipt:withLimits(prepared),outcome:"accepted_buffered",stats:{...base,deleted_sessions:deleted.size,timing_ms:timing}};
+    return {custodyAck,receipt:withLimits(prepared),outcome:"accepted_buffered",stats:{...base,deleted_sessions:deleted.size,timing_ms:timing}};
   }
   if (grouped && deps.inlineMaxSessions !== undefined && grouped.groups.length > deps.inlineMaxSessions) {
     // Too wide for this invocation: one staged object now, the sessions from the queue.

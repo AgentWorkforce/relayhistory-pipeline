@@ -1,3 +1,4 @@
+import type {CurrentCustodyPacket,CurrentCustodyAck} from "./custody-protocol.ts";
 import type {OrderedControl,OrderedControlResult} from "./control-protocol.ts";
 import type { BufferedStageSpec, BufferedStageIntent } from "./buffered-protocol.ts";
 /**
@@ -55,6 +56,7 @@ export interface LedgerRecord {
 }
 
 export interface ClaimInput {
+  custody?:CurrentCustodyPacket;
   tenant: LedgerTenant;
   originId: string;
   batchId: string;
@@ -87,7 +89,7 @@ export interface RevisionConflict {
  * revisions. `resets`: the user's reset count, which the optional Neon
  * replica's guard compares at apply time (relayhistory's `fence.resets`).
  */
-export type ClaimResult =
+type BaseClaimResult =
   /** First sight of this batch: claimed `pending`. */
   | { kind: "claimed"; claimToken: string; deleted: [string, string][]; stale: number[]; resets: number }
   /** A pending claim with this digest (an earlier attempt stopped part way): re-run, every step is idempotent. */
@@ -103,6 +105,8 @@ export type ClaimResult =
   | { kind: "batch_conflict"; currentDigest: string }
   /** 409 record_revision (#250: in-batch reuse of a new revision only): first MAX_DELIVERY_CONFLICTS, and the total. */
   | { kind: "revision_conflict"; conflicts: RevisionConflict[]; count: number };
+
+export type ClaimResult = BaseClaimResult & {custodyAck?:CurrentCustodyAck};
 
 /** A server-issued immutable claim snapshot, carried through object IO. */
 export interface ClaimAttempt {
@@ -162,14 +166,14 @@ export interface SelectionInput {
 }
 
 export type OrderedControlInput =
- | (SelectionInput & {control:OrderedControl & {kind:"selection"}})
- | {tenant:LedgerTenant;requestId:string;control:OrderedControl & {kind:"reset"}};
+ | (SelectionInput & {control:OrderedControl & {kind:"selection"};custody?:CurrentCustodyPacket})
+ | {tenant:LedgerTenant;requestId:string;control:OrderedControl & {kind:"reset"};custody?:CurrentCustodyPacket};
 export interface Ledger {
   /** Private verified-identity path. Unsupported stores must fail, never fall back. */
   applyOrderedControl?(input:OrderedControlInput):Promise<OrderedControlResult>;
   claim(input: ClaimInput): Promise<ClaimResult>;
   prepareBufferStage?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & BufferedStageSpec): Promise<BufferedStageIntent>;
-  commitBuffered?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & {stageToken:string}): Promise<void>;
+  commitBuffered?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & {stageToken:string}): Promise<CurrentCustodyAck|void>;
   commit(input: CommitInput): Promise<CommitResult>;
   acquireSlot(request: SlotRequest): Promise<SlotResult>;
   releaseSlot(tenant: LedgerTenant, holder: string): Promise<void>;

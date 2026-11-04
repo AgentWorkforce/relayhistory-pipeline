@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { zstdDecompressSync } from 'node:zlib';
 import { objectKey, isObjectStoreError, type ObjectStore } from '../shared/vendor.ts';
 import type { PreservedVersionEraser } from '../migration/neon-s3-erasure/eraser.ts';
-import type { BufferedGcTicket, BufferedStageSpec } from './buffered-protocol.ts';
+import { bufferedOrdinalSelection, type BufferedGcTicket, type BufferedStageSpec } from './buffered-protocol.ts';
 import { BUFFER_STAGE_MAX_BYTES, readBufferedStage, prepareBufferedReplacement, putBufferedStage } from './staging.ts';
 const sha = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 const uuid = (s: unknown): s is string => typeof s === 'string' && /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(s);
@@ -31,12 +31,11 @@ export function assertBufferedTicket(v: unknown): asserts v is BufferedGcTicket 
   assertBufferedSpec(v);
   const t = v as unknown as BufferedGcTicket;
   if (!uuid(t.stageToken) || !uuid(t.claimToken) || !uuid(t.leaseToken) || !/^\d+$/.test(t.rowVersion) || !/^\d+$/.test(t.resetEpoch) || !['preparing', 'acknowledged'].includes(t.receiptState) || !['plan', 'cleanup'].includes(t.phase) || !['live', 'retired', 'redacted'].includes(t.cleanupState) || !Array.isArray(t.keepGroupIndexes)) no('ticket');
-  let prev = -1;
-  for (const n of t.keepGroupIndexes) {
-    if (!Number.isInteger(n) || n <= prev || n >= t.groupOrdinals.length) no('ticket_keep');
-    prev = n;
-  }
-  if (t.phase === 'plan' && (t.receiptState !== 'acknowledged' || t.keepGroupIndexes.length === t.groupOrdinals.length)) no('ticket_plan');
+  try { bufferedOrdinalSelection(t.groupOrdinals, t.keepOrdinals, t.keepGroupIndexes); }
+  catch { no('ticket_keep'); }
+  const recordCount = t.groupOrdinals.reduce((n, group) => n + group.length, 0);
+  if (t.phase === 'plan' && (t.receiptState !== 'acknowledged' || t.keepOrdinals.length === recordCount)) no('ticket_plan');
+  if (t.phase === 'cleanup' && t.keepOrdinals.length !== 0) no('ticket_cleanup');
   if (t.replacement !== undefined) { assertBufferedSpec(t.replacement); if (!uuid(t.replacement.stageToken)) no('ticket_replacement'); }
 }
 export interface BufferedGcSql { query(sql: string, params: unknown[]): Promise<{ rows: Record<string, unknown>[] }> }
@@ -134,7 +133,7 @@ export async function collectBufferedTicket(t: BufferedGcTicket, deps: BufferedG
       await putBufferedStage(deps.store, prepared);
     }
     if (!await deps.ledger.swap(t, replacement)) return 'deferred'; // Current pointer must move BEFORE old cleanup.
-    cleanup = { ...t, phase: 'cleanup', cleanupState: 'retired' };
+    cleanup = { ...t, phase: 'cleanup', cleanupState: 'retired', keepOrdinals: [], keepGroupIndexes: [], replacement: undefined };
   }
   const version = await ensureBufferedBarrier(deps.store, cleanup);
   await deps.eraser.eraseObjectExcept(t.key, version);

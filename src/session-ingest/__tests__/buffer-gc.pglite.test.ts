@@ -1,4 +1,4 @@
-import {orderedFixtureLedger} from "./ordered-support.ts";
+import {orderedFixtureLedger,initializeFixtureSeatClock} from "./ordered-support.ts";
 import {afterEach,expect,setDefaultTimeout,test} from "bun:test";
 import {readFileSync,readdirSync} from "node:fs";
 import {join} from "node:path";
@@ -29,19 +29,27 @@ async function fixture(){
  };
  const rpc=async(name:string,p:unknown)=>(await as("bulls96_session_ingest","SELECT sessions.ingest_buffer_gc_"+name+"($1::jsonb) AS r",[JSON.stringify(name==="claim"?{generation,...p as any}:p)])).rows[0]!.r as any;
  await db.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch) VALUES($1,repeat('a',64),repeat('b',64),$2,clock_timestamp()+interval '1 hour',repeat('3',64))",[tenant.orgId,generation]);
+ await initializeFixtureSeatClock(db as never,generation);
  const ledger=orderedFixtureLedger(sqlLedger(((s:string,p:unknown[])=>as("bulls96_session_ingest",s,p)) as never,{acceptanceMode:"buffered",expectedGeneration:generation}),db as never);
  let serial=0;
  async function stage(opts:{ack?:boolean;groups?:number[][];expired?:boolean}={}){
   const batch="batch-"+(++serial),claim=randomUUID(),token=randomUUID(),digest=hash(batch),sha=hash(token);
   const keyFor=(bodySha:string)=>"96bulls/org-a/buffered-batches/v1/ws=ws-a/m=fixture/b="+hash(digest).slice(0,32)+"-"+bodySha.slice(0,16)+"-"+hash(claim).slice(0,32)+".staged.ndjson.zst";
   const groups=opts.groups??[[0],[1],[2]];
-  await db.query("INSERT INTO sessions.ingest_batches(org_id,workspace_id,origin_id,batch_id,user_id,digest,receipt_id,state,committed_at,publication_state) VALUES($1,$2,$3,$4,$5,$6,'rhr_'||repeat('a',64),$7,CASE WHEN $8 THEN clock_timestamp() END,'buffered')",[tenant.orgId,tenant.workspaceId,origin,batch,tenant.userId,digest,opts.ack===false?"pending":"committed",opts.ack!==false]);
+  const duplicate=new Set(groups.flat()).size!==groups.flat().length,ackGroups=duplicate?[[0],[1],[2]]:groups;
+  await db.query("INSERT INTO sessions.ingest_batches(org_id,workspace_id,origin_id,batch_id,user_id,digest,receipt_id,state,committed_at,publication_state) VALUES($1,$2,$3,$4,$5,$6,'rhr_'||repeat('a',64),$7,CASE WHEN $8 THEN clock_timestamp() END,'buffered')",[tenant.orgId,tenant.workspaceId,origin,batch,tenant.userId,digest,"pending",false]);
   const records=[{ord:0,source:"claude",session_id:"gone",record_id:"g",revision_id:"g:1",revision:1,digest:hash("g")},
    {ord:1,source:"claude",session_id:"live",record_id:"l",revision_id:"l:1",revision:1,digest:hash("l")},
    {ord:2,source:"claude",session_id:null,record_id:"n",revision_id:"n:1",revision:1,digest:hash("n")}];
-  await db.query("INSERT INTO sessions.ingest_claim_attempts(claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,epochs,records,reset_epoch) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,0)",[claim,tenant.orgId,tenant.workspaceId,tenant.userId,origin,batch,digest,JSON.stringify([{source:"claude",session_id:"gone",epoch:0,reset_epoch:0},{source:"claude",session_id:"live",epoch:0,reset_epoch:0}]),JSON.stringify(records)]);
-  await db.query("INSERT INTO sessions.ingest_stage_intents(stage_token,claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,stage_key,stage_sha256,stage_bytes,group_ordinals,reset_epoch,receipt_state,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,10,$11,0,$12,clock_timestamp()+$13::interval)",[token,claim,tenant.orgId,tenant.workspaceId,tenant.userId,origin,batch,digest,keyFor(sha),sha,JSON.stringify(groups),opts.ack===false?"preparing":"acknowledged",opts.expired?"-1 second":"5 minutes"]);
-  if(opts.ack!==false)await db.query("INSERT INTO sessions.ingest_buffer_outbox(org_id,workspace_id,origin_id,batch_id,user_id,digest,active_stage_token) VALUES($1,$2,$3,$4,$5,$6,$7)",[tenant.orgId,tenant.workspaceId,origin,batch,tenant.userId,digest,token]);
+  await db.query("INSERT INTO sessions.ingest_claim_attempts(claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,epochs,records,reset_epoch,schema_generation) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10)",[claim,tenant.orgId,tenant.workspaceId,tenant.userId,origin,batch,digest,JSON.stringify([{source:"claude",session_id:"gone",epoch:0,reset_epoch:0},{source:"claude",session_id:"live",epoch:0,reset_epoch:0}]),JSON.stringify(records),generation]);
+  await db.query("INSERT INTO sessions.ingest_stage_intents(stage_token,claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,stage_key,stage_sha256,stage_bytes,group_ordinals,reset_epoch,receipt_state,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,10,$11,0,$12,clock_timestamp()+$13::interval)",[token,claim,tenant.orgId,tenant.workspaceId,tenant.userId,origin,batch,digest,keyFor(sha),sha,JSON.stringify(ackGroups),"preparing","5 minutes"]);
+  if(opts.ack!==false){
+   await db.query("INSERT INTO sessions.ingest_buffer_outbox(org_id,workspace_id,origin_id,batch_id,user_id,digest,active_stage_token) VALUES($1,$2,$3,$4,$5,$6,$7)",[tenant.orgId,tenant.workspaceId,origin,batch,tenant.userId,digest,token]);
+   await db.query("UPDATE sessions.ingest_stage_intents SET receipt_state='acknowledged' WHERE stage_token=$1",[token]);
+   await db.query("UPDATE sessions.ingest_batches SET state='committed',committed_at=clock_timestamp(),buffer_receipt_kind='staged' WHERE batch_id=$1",[batch]);
+  }
+  if(duplicate)await db.query("UPDATE sessions.ingest_stage_intents SET group_ordinals=$1 WHERE stage_token=$2",[JSON.stringify(groups),token]);
+  if(opts.expired)await db.query("UPDATE sessions.ingest_stage_intents SET expires_at=clock_timestamp()-interval '1 second' WHERE stage_token=$1",[token]);
   return {batch,claim,token,digest,keyFor,sha};
  }
  const disable=()=>ledger.setSessionUploads({tenant,originId:origin,sessions:[["claude","gone"]],enabled:false});
@@ -157,7 +165,7 @@ test("ticket matches the shared consumer fields including original reset epoch a
  const f=await fixture(),s=await f.stage();await f.disable();
  const t=(await f.rpc("claim",{limit:1})).tickets[0];
  expect(t).toEqual({stageToken:s.token,claimToken:s.claim,leaseToken:expect.any(String),rowVersion:"2",
-  key:s.keyFor(s.sha),sha256:s.sha,bytes:10,groupOrdinals:[[0],[1],[2]],keepGroupIndexes:[1,2],
+  key:s.keyFor(s.sha),sha256:s.sha,bytes:10,groupOrdinals:[[0],[1],[2]],keepGroupIndexes:[1,2],keepOrdinals:[1,2],
   receiptState:"acknowledged",phase:"plan",resetEpoch:"0",cleanupState:"live"});
 });
 test("a legal mixed-source no-session group remains readable and reset removes every original ordinal",async()=>{

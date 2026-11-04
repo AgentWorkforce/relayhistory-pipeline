@@ -1,4 +1,4 @@
-import {orderedFixtureLedger} from "./ordered-support.ts";
+import {orderedFixtureLedger,initializeFixtureSeatClock} from "./ordered-support.ts";
 import { afterEach, expect, test, setDefaultTimeout } from "bun:test";
 import { readFileSync,readdirSync,mkdtempSync,rmSync } from "node:fs";
 import { join } from "node:path";
@@ -190,7 +190,9 @@ async function bufferReceipt(f:Awaited<ReturnType<typeof fixture>>){
 test("trusted buffered receipt leaves historical proof open, but explicit canonical admission closes it",async()=>{
  const f=await fixture(),p=await f.prepared();await bufferReceipt(f);
  expect(await f.rpc("ingest_seed_proven_records",p.payload)).toMatchObject({accepted:true,upserted:1});
- await f.db.exec("UPDATE sessions.ingest_batches SET state='committed',committed_at=clock_timestamp() WHERE batch_id='buffered-receipt'");
+ await f.db.query("INSERT INTO sessions.ingest_buffer_admission VALUES($1,repeat('a',64),repeat('b',64),$2,clock_timestamp()+interval '1 hour',repeat('3',64))",[TENANT.orgId,gen]);
+ await initializeFixtureSeatClock(f.db as never,gen);
+ await f.db.exec("UPDATE sessions.ingest_batches SET state='committed',committed_at=clock_timestamp(),buffer_receipt_kind='suppressed' WHERE batch_id='buffered-receipt'");
  expect(await f.rpc("ingest_seed_proven_records",p.payload)).toMatchObject({accepted:true,upserted:0});
  await f.prepared();
  await f.db.exec("UPDATE sessions.ingest_batches SET publication_state='canonical' WHERE batch_id='buffered-receipt'");
