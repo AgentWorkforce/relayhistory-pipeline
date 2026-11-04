@@ -65,6 +65,16 @@ export function addDigestRecord(d: SessionDigest, rec: Record<string, unknown>):
     if (rec.type === "tool_call" && typeof rec.name === "string") addTool(d, rec.name);
 }
 
+/** Shared mapping for authoritative canonical projections, including replay pages. */
+export function addProjectedDigestRecord(d: SessionDigest, row: Record<string, unknown>): void {
+  d.records++;
+  addDigestRecord(d, {
+    role: row.actor_role, type: row.kind, content: row.content,
+    timestamp: row.ts, model: row.model,
+    ...(row.kind === "tool_call" ? { name: (row.tool_call as Record<string, unknown> | null)?.name } : {}),
+  });
+}
+
 function addTool(d: SessionDigest, name: string) {
   const bounded = name.slice(0, 128);
   if (Object.hasOwn(d.toolCalls, bounded) || Object.keys(d.toolCalls).length < 128)

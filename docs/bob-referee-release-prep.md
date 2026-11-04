@@ -48,6 +48,17 @@ folding is capped at 64 MiB / 100,000 records; each raw chunk is capped at
 The finite-duration consumer additionally caps native jobs at 64 MiB. This is
 safe bounded refusal, not full support for the large canonical population.
 
+The separate, inactive `pageDigest` consumer port accepts authoritative
+`canonicalArtifactPage` replay pages with an explicit artifact generation and
+abort signal. It requests 1000 rows / 2000 content characters, checks row scope,
+publication generation, cursor progress and host budget, and returns a complete
+digest or throws. It retains one page, a bounded cursor-hash set (10,000 pages
+maximum), and the same bounded digest. Artifact generation is a SHA-256, distinct
+from Native's upload UUID and the compiled schema generation. The trusted page
+reader must bind org/workspace and recheck publication currentness; Native's
+final SQL pointer fence remains independently required. No new raw decoder,
+revision/delete fold, production page authority or automatic fallback is added.
+
 Both workers verify tenant/session bindings and require the exact live index
 key, revision and content hash. Bob rechecks under the publication transaction's
 index row lock; Referee checks and writes its verdict/state in one transaction.
@@ -177,6 +188,21 @@ An earlier run peaked at 394,880 KiB (about 386 MiB).
 This is synthetic native JSONL, not a measured canonical 1.53 GB acceptance run.
 Do not retain the old 384 MiB chart limit or infer canonical support from it.
 
+`bob-canonical-pages.ts` consumes the existing independent-largest fixture through
+the actual foundation checkout's `canonicalArtifactPage` implementation, used
+read-only as an explicit test oracle. That fixture represents 1,550,924,671 raw
+source bytes and 901,653 current events. The final run consumed all events in
+959 pages with 1918 publication checks, retained ten prompt samples, and produced
+both extractive summaries in 110 seconds at 149,640 KiB peak RSS (about 146 MiB).
+Earlier runs peaked at about 157–158 MiB. Twenty-nine worker regression cases,
+including four page-consumer tests, and root/workspace typechecks passed.
+Both summaries were sealed, conditionally written and decrypted through the
+existing encrypted-object modules in an owned disposable filesystem store;
+fixture keys stayed in RAM. The actual reader's publication-change control
+refused stale output. This proves
+the page-consumer algorithm on existing synthetic artifacts; it does not compose
+the foundation, register managed objects, publish SQL pointers or activate Bob.
+
 ## Remaining acceptance dependencies
 
 1. Native 040600's authoritative generation-qualified SQL final-write and clear
@@ -187,7 +213,9 @@ Do not retain the old 384 MiB chart limit or infer canonical support from it.
    pages (`canonicalArtifactPage`, replay view), with pinned publication
    generation/currentness, instead of refolding >64 MiB canonical sessions.
    Reuse the authoritative large fold chooser/stream from the seed/replay source
-   where required. Run Bob against the actual largest-cohort proof afterward.
+   where required. The inactive consumer has now passed the actual existing
+   largest synthetic artifact fixture; repeat it through the composed handler
+   and exact final generation fence before activation.
 3. Compose and prove managed reset-generation safety with Native/GC. Migration
    `0005_derived_pointer_erasure.sql` now atomically removes summary pointers and
    verdicts for an authorized physical index tombstone/delete, including scoped

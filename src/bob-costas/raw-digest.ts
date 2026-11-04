@@ -8,7 +8,7 @@ import { readCapped } from "../../packages/pipeline/src/lib/pipeline/adapter.ts"
 import { normalizeRelayhistoryRecords } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import { projectRelayhistorySession } from "../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import { readManifestRecords } from "../session-read-api/canonical-projection.ts";
-import { addDigestRecord, digestRecords, newDigest, type SessionDigest } from "./summarizer.ts";
+import { addProjectedDigestRecord, digestRecords, newDigest, type SessionDigest } from "./summarizer.ts";
 
 export const MAX_SUMMARY_CHUNK_BYTES = 16 * 1024 * 1024;
 export const MAX_CANONICAL_SUMMARY_BYTES = 64 * 1024 * 1024;
@@ -57,12 +57,7 @@ export async function rawDigest(m: ManifestV1, manifestKey: string, store: Objec
     });
     for (const { table, row } of projected.rows) {
       if (table !== "convergence_events") continue;
-      d.records++;
-      addDigestRecord(d, {
-        role: row.actor_role, type: row.kind, content: row.content,
-        timestamp: row.ts, model: row.model,
-        ...(row.kind === "tool_call" ? { name: (row.tool_call as Record<string, unknown> | null)?.name } : {}),
-      });
+      addProjectedDigestRecord(d, row);
     }
     return d;
   }
