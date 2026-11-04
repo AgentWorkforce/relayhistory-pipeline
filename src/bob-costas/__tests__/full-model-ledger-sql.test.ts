@@ -3,16 +3,19 @@
 import{test,expect}from"bun:test";
 import{PGlite}from"@electric-sql/pglite";
 import{readFile}from"node:fs/promises";
-import{enqueueFullModelWork,claimFullModelWork,heartbeatFullModelWork,checkpointFullModelWork,modelWorkConfig}from"../full-model-ledger.ts";
+import{enqueueFullModelWork,claimFullModelWork,heartbeatFullModelWork,checkpointFullModelWork,failFullModelWork,modelWorkConfig}from"../full-model-ledger.ts";
 import type{HistorySourceReference}from"../../shared/history-source-authority.ts";
 const GEN="a".repeat(64),HASH="b".repeat(64),ID="12345678-1234-1234-1234-123456789abc";
 const captured:HistorySourceReference={identity:{orgId:"org",workspaceId:"ws",source:"claude",sessionId:"session"},source:{epoch:"9007199254740993",fingerprint:HASH},authorityId:ID,maskSha256:HASH,recordCount:"1",schemaGeneration:GEN,derivedAnchorKey:"fixture-anchor"};
 async function fixture(){
- const pg=new PGlite(),db={query:async<T>(q:string,p?:unknown[])=>pg.query<T>(q,p)},config=modelWorkConfig("fixture-model","fixture-key");
+ const pg=new PGlite(),db={query:async<T>(q:string,p?:unknown[])=>pg.query<T>(q,p)},graph={version:1 as const,identity:captured.identity,source:captured.source,generation:HASH,prefix:"fixture/graph/",index:{key:"fixture/graph/index.json",sha256:HASH,bytes:123}},config=modelWorkConfig("fixture-model","fixture-key",graph);
  await pg.exec(`
  CREATE ROLE anon;CREATE ROLE authenticated;CREATE ROLE service_role;CREATE SCHEMA sessions;
- CREATE TABLE sessions.ingest_history_scope_versions(evidence jsonb PRIMARY KEY);
+ CREATE TABLE sessions.ingest_history_scope_versions(evidence jsonb PRIMARY KEY,authority_id uuid,org_id text,workspace_id text,harness text,session_id text,source_epoch bigint,source_fingerprint text,mask_sha256 text,state text,record_count bigint,derived_anchor_key text);
+ CREATE TABLE sessions.ingest_history_scope_current(authority_id uuid,org_id text,workspace_id text,harness text,session_id text,ready boolean);
+ CREATE TABLE sessions.session_replay_publications(org_id text,workspace_id text,harness text,session_id text,epoch bigint,published_epoch bigint,index_key text,source_snapshot jsonb,source_fingerprint text);
  CREATE TABLE sessions.test_model_callbacks(kind text PRIMARY KEY,payload jsonb);
+ CREATE TABLE sessions.test_model_graph(publication jsonb);
  CREATE TABLE sessions.test_callback_behavior(fail_state boolean NOT NULL DEFAULT false);
  INSERT INTO sessions.test_callback_behavior DEFAULT VALUES;
  CREATE FUNCTION sessions.ingest_require_generation(g text)RETURNS void LANGUAGE plpgsql AS $$BEGIN IF g IS DISTINCT FROM '${GEN}' THEN RAISE EXCEPTION 'wrong generation';END IF;END$$;
@@ -21,7 +24,7 @@ async function fixture(){
  PERFORM sessions.ingest_require_generation(e->>'generation');
  IF l THEN SELECT * INTO s FROM sessions.ingest_history_scope_versions WHERE evidence=e FOR SHARE;
  ELSE SELECT * INTO s FROM sessions.ingest_history_scope_versions WHERE evidence=e;END IF;RETURN s;END$$;
- CREATE FUNCTION sessions.session_history_source_lock(e jsonb)RETURNS jsonb LANGUAGE sql AS $$SELECT jsonb_build_object('current',sessions.ingest_history_source_current(e,true) IS NOT NULL)$$;
+ CREATE FUNCTION sessions.session_history_source_lock(e jsonb)RETURNS jsonb LANGUAGE sql AS $$SELECT jsonb_build_object('current',(sessions.ingest_history_source_current(e,true)).evidence IS NOT NULL)$$;
  CREATE FUNCTION sessions.session_history_summary_publish(p jsonb)RETURNS jsonb LANGUAGE plpgsql AS $$BEGIN
  INSERT INTO sessions.test_model_callbacks VALUES(p->'pointer'->>'kind',p) ON CONFLICT(kind)DO UPDATE SET payload=excluded.payload;
  RETURN '{"applied":true}'::jsonb;END$$;
@@ -31,9 +34,11 @@ async function fixture(){
  RETURN '{"applied":true}'::jsonb;END$$;
  `);
  const evidence={generation:GEN,identity:captured.identity,source:captured.source,authorityId:ID,maskSha256:HASH};
- await db.query("INSERT INTO sessions.ingest_history_scope_versions VALUES($1::jsonb)",[JSON.stringify(evidence)]);
+ await db.query("INSERT INTO sessions.ingest_history_scope_versions(evidence,record_count,derived_anchor_key) VALUES($1::jsonb,1,'fixture-anchor')",[JSON.stringify(evidence)]);
+ await db.query("INSERT INTO sessions.test_model_graph VALUES($1::jsonb)",[JSON.stringify(graph)]);
  await pg.exec(await readFile(new URL("../../../supabase/bootstrap/session_history_model_worker.sql",import.meta.url),"utf8"));
- for(const name of ["capture","register_object","replay_descriptor"])await pg.exec("CREATE FUNCTION sessions.session_history_"+name+"(p jsonb)RETURNS jsonb LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$SELECT '{}'::jsonb$$;REVOKE ALL ON FUNCTION sessions.session_history_"+name+"(jsonb) FROM PUBLIC");
+ for(const name of ["capture","register_object"])await pg.exec("CREATE FUNCTION sessions.session_history_"+name+"(p jsonb)RETURNS jsonb LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$SELECT '{}'::jsonb$$;REVOKE ALL ON FUNCTION sessions.session_history_"+name+"(jsonb) FROM PUBLIC");
+ await pg.exec("CREATE FUNCTION sessions.session_history_replay_descriptor(p jsonb)RETURNS jsonb LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$SELECT jsonb_build_object('current',true,'publication',(SELECT publication FROM sessions.test_model_graph))$$;REVOKE ALL ON FUNCTION sessions.session_history_replay_descriptor(jsonb) FROM PUBLIC");
  await pg.exec(await readFile(new URL("../../../supabase/migrations/20261104063000_history_model_work.sql",import.meta.url),"utf8"));
  return{pg,db,config,evidence,async enqueue(){return enqueueFullModelWork(db,captured,config)}};
 }
@@ -89,5 +94,27 @@ test("stale source/no grant/wrong generation refuse; no implicit owner or servic
  await f.pg.exec("SET ROLE service_role");
  await expect(f.db.query("SELECT sessions.session_history_model_claim($1::jsonb)",[JSON.stringify({generation:GEN,leaseSeconds:120,model:"fixture-model"})])).rejects.toThrow("permission denied");
  await expect(f.db.query("SELECT * FROM sessions.history_model_work")).rejects.toThrow("permission denied");
+ }finally{await f.pg.close()}
+},10000);
+
+test("permanent provider failure is durable and owner-only exact-source retry revokes old nonce",async()=>{
+ const f=await fixture();try{
+ await f.enqueue();const t=(await claimFullModelWork(f.db,GEN,"fixture-model"))!;
+ expect(await failFullModelWork(f.db,t,{code:"model_refusal",retryable:false})).toBe(true);
+ expect((await f.db.query<any>("SELECT status,last_error_code FROM sessions.history_model_work")).rows[0]).toEqual({status:"failed",last_error_code:"model_refusal"});
+ expect(await claimFullModelWork(f.db,GEN,"fixture-model")).toBeNull();
+ expect((await f.db.query<any>("SELECT sessions.ingest_history_model_retry($1::jsonb) AS r",[JSON.stringify({workId:t.workId,generation:GEN})])).rows[0]?.r).toEqual({retried:true});
+ const retry=(await claimFullModelWork(f.db,GEN,"fixture-model"))!;expect(retry.leaseToken).not.toBe(t.leaseToken);expect(retry.checkpointVersion).toBe("2");
+ expect(await failFullModelWork(f.db,t,{code:"model_refusal",retryable:false})).toBe(false);
+ }finally{await f.pg.close()}
+},10000);
+
+test("actual630 derives namespace and row count from locked source instead of caller metadata",async()=>{
+ const f=await fixture();try{
+ for(const changed of[{...captured,derivedAnchorKey:"foreign-anchor"},{...captured,recordCount:"2"},{...captured,untrusted:"extra"}]){
+  await expect(enqueueFullModelWork(f.db,changed as never,f.config)).rejects.toMatchObject({code:"22023"});
+ }
+ expect((await f.db.query("SELECT * FROM sessions.history_model_work")).rows).toHaveLength(0);
+ expect((await f.enqueue()).current).toBe(true);
  }finally{await f.pg.close()}
 },10000);

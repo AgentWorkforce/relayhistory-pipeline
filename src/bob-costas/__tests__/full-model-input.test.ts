@@ -64,3 +64,14 @@ test("partial continuation cannot splice a changed canonical row", async () => {
     readRow: async () => ({ ...original, row: { ...original.row, content: "changed" } }) }))
     .rejects.toMatchObject({ code: "summary_source_row_changed" });
 });
+
+test("uses official raw codec for nested large integers in model fragments and row SHA",async()=>{
+ const {parseRelayhistoryJsonExact}=await import("../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts");
+ const value={table:"conversation_turns",row:{record:{nested:[9007199254740993n,-9223372036854775808n]},content:"exact"}};
+ const encoded=prepareFullModelRow(value as never);
+ expect(encoded.json).toContain("9007199254740993");expect(encoded.json).not.toContain('"9007199254740993"');
+ expect(encoded.sha256).toBe(createHash("sha256").update(encoded.json).digest("hex"));
+ const part=await nextFullModelInput({sourceBinding:binding,cursor:{rowOrdinal:"0",utf16Offset:0},signal,readRow:async n=>n==="0"?value as never:null});
+ const text=JSON.parse(part.input).fragments.map((x:any)=>x.jsonFragment).join("");
+ expect(parseRelayhistoryJsonExact(text)).toEqual(value);expect(part.inputComplete).toBe(true);
+});

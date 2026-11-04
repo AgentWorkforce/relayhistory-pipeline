@@ -1,0 +1,365 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "DORMANT full-summary model worker. Dedicated function-only SQL role and qualified derived S3 namespace. Source proposal only; actual model/CMK/retention/caller gates required.",
+  "Parameters": {
+    "FunctionName": {
+      "Type": "String",
+      "Default": "sessions-full-model",
+      "AllowedPattern": "[A-Za-z0-9_-]{1,64}"
+    },
+    "KmsKeyArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws:kms:us-east-1:941433935742:key/[0-9a-f-]{36}"
+    },
+    "ExpectedGeneration": {
+      "Type": "String",
+      "AllowedPattern": "[a-f0-9]{64}"
+    },
+    "CodeBucket": {
+      "Type": "String",
+      "MinLength": 3
+    },
+    "CodeKey": {
+      "Type": "String",
+      "MinLength": 1
+    },
+    "CodeVersion": {
+      "Type": "String",
+      "MinLength": 1
+    },
+    "ArtifactSha256": {
+      "Type": "String",
+      "AllowedPattern": "[a-f0-9]{64}",
+      "Description": "Operator must independently match immutable CodeVersion ZIP SHA; CloudFormation does not validate S3 SHA."
+    },
+    "EnableModel": {
+      "Type": "String",
+      "Default": "false",
+      "AllowedValues": [
+        "false",
+        "true"
+      ]
+    },
+    "Bucket": {
+      "Type": "String",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
+    },
+    "SecretArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws:secretsmanager:us-east-1:941433935742:secret:96bulls/[A-Za-z0-9_./-]+/session-model-[A-Za-z0-9]{6}"
+    },
+    "Model": {
+      "Type": "String",
+      "Default": "off",
+      "AllowedPattern": "[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}",
+      "Description": "Explicit provider model. off refuses model execution even if schedule enabled."
+    }
+  },
+  "Conditions": {
+    "Armed": {
+      "Fn::Equals": [
+        {
+          "Ref": "EnableModel"
+        },
+        "true"
+      ]
+    }
+  },
+  "Resources": {
+    "LogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${FunctionName}"
+        },
+        "RetentionInDays": 14
+      }
+    },
+    "Role": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "qualified-model-derived-only",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": {
+                    "Ref": "SecretArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/replay/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/bob-slice/*.bin"
+                    },
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/summary-short/*.bin"
+                    },
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/summary-long/*.bin"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:PutObject"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/bob-slice/*.bin"
+                    },
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/summary-short/*.bin"
+                    },
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/summary-long/*.bin"
+                    }
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "s3:x-amz-server-side-encryption": "aws:kms",
+                      "s3:x-amz-server-side-encryption-aws-kms-key-id": {
+                        "Ref": "KmsKeyArn"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "kms:Decrypt",
+                    "kms:GenerateDataKey"
+                  ],
+                  "Resource": {
+                    "Ref": "KmsKeyArn"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "kms:CallerAccount": "941433935742",
+                      "kms:ViaService": "s3.us-east-1.amazonaws.com"
+                    },
+                    "StringLike": {
+                      "kms:EncryptionContext:aws:s3:arn": [
+                        {
+                          "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/replay/*"
+                        },
+                        {
+                          "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/bob-slice/*.bin"
+                        },
+                        {
+                          "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/summary-short/*.bin"
+                        },
+                        {
+                          "Fn::Sub": "arn:aws:s3:::${Bucket}/96bulls/*/upload-generations/g=*/v1/ws=*/m=*/h=*/d=*/*/*/s=*/publications/*/derived/summary-long/*.bin"
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "LogGroup",
+                      "Arn"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "RoleName": "96bulls-sessions-prod-session-model"
+      }
+    },
+    "Function": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "LogGroup",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "FunctionName"
+        },
+        "Runtime": "nodejs24.x",
+        "Architectures": [
+          "x86_64"
+        ],
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "Role",
+            "Arn"
+          ]
+        },
+        "MemorySize": 3008,
+        "Timeout": 300,
+        "ReservedConcurrentExecutions": 1,
+        "EphemeralStorage": {
+          "Size": 512
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          },
+          "S3ObjectVersion": {
+            "Ref": "CodeVersion"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "SESSION_FULL_MODEL_ENABLED": {
+              "Ref": "EnableModel"
+            },
+            "HOOPDB_DB_MODE": "supabase",
+            "BOB_COSTAS_MODEL": {
+              "Ref": "Model"
+            },
+            "PIPELINE_RAW_S3_BUCKET": {
+              "Ref": "Bucket"
+            },
+            "SESSION_MODEL_KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "SESSION_MODEL_SECRET_ARN": {
+              "Ref": "SecretArn"
+            },
+            "SESSION_MODEL_EXPECT_GENERATION": {
+              "Ref": "ExpectedGeneration"
+            },
+            "SESSION_MODEL_BUDGET_MS": "240000"
+          }
+        }
+      }
+    },
+    "Schedule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "ScheduleExpression": "rate(1 minute)",
+        "State": {
+          "Fn::If": [
+            "Armed",
+            "ENABLED",
+            "DISABLED"
+          ]
+        },
+        "Targets": [
+          {
+            "Id": "full-model",
+            "Arn": {
+              "Fn::GetAtt": [
+                "Function",
+                "Arn"
+              ]
+            },
+            "RetryPolicy": {
+              "MaximumRetryAttempts": 0,
+              "MaximumEventAgeInSeconds": 60
+            },
+            "Input": "{\"fullModel\":true}"
+          }
+        ]
+      }
+    },
+    "Permission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "Function"
+        },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "Schedule",
+            "Arn"
+          ]
+        },
+        "SourceAccount": "941433935742"
+      }
+    },
+    "AsyncConfig": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Function"
+        },
+        "Qualifier": "$LATEST",
+        "MaximumRetryAttempts": 0,
+        "MaximumEventAgeInSeconds": 60
+      }
+    },
+    "ErrorsAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "FunctionName"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 0,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    }
+  },
+  "Outputs": {
+    "FunctionArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "Function",
+          "Arn"
+        ]
+      }
+    },
+    "ExpectedGeneration": {
+      "Value": {
+        "Ref": "ExpectedGeneration"
+      }
+    },
+    "ArtifactSha256": {
+      "Value": {
+        "Ref": "ArtifactSha256"
+      }
+    }
+  }
+}

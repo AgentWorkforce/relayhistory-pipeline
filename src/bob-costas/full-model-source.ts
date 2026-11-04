@@ -22,12 +22,13 @@ export interface FullModelSourceReader{
  readRow(ordinal:string,signal:AbortSignal):Promise<FullModelProjectionRow|null>;
 }
 export async function openFullModelSource(args:{
- db:SqlExecutor;store:ObjectStore;captured:HistorySourceReference;signal:AbortSignal;profile?:NodeReadProfile;
+ db:SqlExecutor;dbForSignal?:(signal:AbortSignal)=>SqlExecutor;store:ObjectStore;captured:HistorySourceReference;publication?:ArtifactPublication;signal:AbortSignal;profile?:NodeReadProfile;
 }):Promise<FullModelSourceReader>{
  const {captured,db}=args,budget=nodeReadBudget(args.profile);
  args.signal.throwIfAborted();
  const publication=await readHistoryReplayDescriptor(db,captured);
  if(!publication)no("model_source_graph_pending");
+ if(args.publication&&!samePublication(publication,args.publication))no("model_source_graph_changed");
  const store=boundedObjectStore(args.store,args.signal);
  const object=await store.getObject(publication.index.key as never);
  if(object.meta.size>ARTIFACT_MAX_OBJECT_BYTES){await object.body.cancel().catch(()=>{});no("model_source_index_bound");}
@@ -60,7 +61,7 @@ export async function openFullModelSource(args:{
    const position=Number(ordinal),range=ranges.find(r=>position>=r.first&&position<r.first+r.count);
    if(!range)no("model_source_coverage");
    const deps={signal:AbortSignal.any([args.signal,signal]),
-    publication:async()=>{const p=await readHistoryReplayDescriptor(db,captured);if(!samePublication(p,publication))no("model_source_changed");return{...p,exists:true,current:true};},
+    publication:async(_identity:unknown,readSignal:AbortSignal)=>{const p=await readHistoryReplayDescriptor(args.dbForSignal?.(readSignal)??db,captured);if(!samePublication(p,publication))no("model_source_changed");return{...p,exists:true,current:true};},
     read:async(key:string,readSignal:AbortSignal)=>boundedObjectStore(args.store,readSignal).get(key as never)};
    const result=await canonicalArtifactNodePage(deps,captured.identity,{table:range.table,view:"raw",order:"asc",limit:1,generation:publication.generation,
     cursor:artifactOrdinalCursor(captured.identity,publication,{table:range.table,view:"raw",order:"asc",position:position-range.first})});

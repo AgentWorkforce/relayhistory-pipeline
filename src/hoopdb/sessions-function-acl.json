@@ -208,6 +208,18 @@
     "sessions.ingest_history_mask_rows(text,bigint,integer)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_history_model_checkpoint_valid(jsonb,jsonb,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_model_graph_wake()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_model_retry(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_model_ticket(sessions.history_model_work)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_native_changed()": [
       "<owner>:EXECUTE"
     ],
@@ -624,6 +636,26 @@
     "sessions.session_history_mask_page(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_model_checkpoint(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_model:EXECUTE"
+    ],
+    "sessions.session_history_model_claim(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_model:EXECUTE"
+    ],
+    "sessions.session_history_model_discover(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_model:EXECUTE"
+    ],
+    "sessions.session_history_model_enqueue(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_model:EXECUTE"
+    ],
+    "sessions.session_history_model_heartbeat(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_model:EXECUTE"
     ],
     "sessions.session_history_register_artifact(jsonb)": [
       "<owner>:EXECUTE",

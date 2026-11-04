@@ -8,7 +8,7 @@ import type { FullModelTransport, FullModelResult } from "./full-model-provider.
 
 export const FULL_MODEL_WORK_PROTOCOL = "bob-full-work-v1";
 export interface ModelSliceRef {
-  key: string; sha256: string; bytes: number; keyId: string;
+  id: string; sha256: string; bytes: number;
   first: string; count: string; level: number;
 }
 export interface FullModelCheckpoint {
@@ -46,7 +46,7 @@ export function initialFullModelCheckpoint(sourceBinding:string,configSha256:str
  return {protocol:FULL_MODEL_WORK_PROTOCOL,sourceBinding,configSha256,cursor:{rowOrdinal:"0",utf16Offset:0},units:"0",inputComplete:false,frontier:[],carry:null,tokensIn:"0",tokensOut:"0",calls:"0",actualModel:null};
 }
 function checkRef(ref:ModelSliceRef){
- if(!ref||typeof ref.key!=="string"||!ref.key||!HEX.test(ref.sha256)||!Number.isSafeInteger(ref.bytes)||ref.bytes<1||ref.bytes>1048576||typeof ref.keyId!=="string"||!ref.keyId||!validDec(ref.first)||!validDec(ref.count)||BigInt(ref.count)<1n||!Number.isInteger(ref.level)||ref.level<0||ref.level>126)fail("model_work_ref");
+ if(!ref||typeof ref.id!=="string"||!(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/).test(ref.id)||!HEX.test(ref.sha256)||!Number.isSafeInteger(ref.bytes)||ref.bytes<1||ref.bytes>1048576||!validDec(ref.first)||!validDec(ref.count)||BigInt(ref.count)<1n||!Number.isInteger(ref.level)||ref.level<0||ref.level>126)fail("model_work_ref");
 }
 export function validateFullModelCheckpoint(c:FullModelCheckpoint,sourceBinding:string,configSha256:string):void{
  if(!c||c.protocol!==FULL_MODEL_WORK_PROTOCOL||c.sourceBinding!==sourceBinding||c.configSha256!==configSha256||!HEX.test(sourceBinding)||!HEX.test(configSha256)||!validDec(c.units)||!validDec(c.tokensIn)||!validDec(c.tokensOut)||!validDec(c.calls)||typeof c.inputComplete!=="boolean"||!(c.actualModel===null||typeof c.actualModel==="string"&&c.actualModel.length>0&&c.actualModel.length<=200)||!c.cursor||!validDec(c.cursor.rowOrdinal)||!Number.isSafeInteger(c.cursor.utf16Offset)||c.cursor.utf16Offset<0||(c.cursor.utf16Offset>0&&!HEX.test(c.cursor.rowSha256??""))||!Array.isArray(c.frontier)||c.frontier.length>63)fail("model_work_checkpoint");

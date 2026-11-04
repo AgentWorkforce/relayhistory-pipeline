@@ -2,6 +2,8 @@
  * This module does not parse/fold raw records or decide visibility. The caller
  * captures HistorySourceReference and applies its complete mask before projection. */
 import { createHash } from "node:crypto";
+import{encodeRelayhistoryJsonExact}from"../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
+import type{ArtifactPublication}from"../session-read-api/canonical-artifact.ts";
 import type { HistorySourceReference } from "../shared/history-source-authority.ts";
 import type { ScopeRead } from "../session-read-api/canonical-projection.ts";
 
@@ -21,11 +23,15 @@ export function fullModelSourceBinding(c: HistorySourceReference): string {
     { epoch: c.source.epoch, fingerprint: c.source.fingerprint },
     c.authorityId, c.maskSha256, c.schemaGeneration, c.derivedAnchorKey]));
 }
+export function fullModelGraphBinding(c:HistorySourceReference,graph:ArtifactPublication):string{
+ if(graph.source.epoch!==c.source.epoch||graph.source.fingerprint!==c.source.fingerprint||["orgId","workspaceId","source","sessionId"].some(k=>graph.identity[k as keyof typeof graph.identity]!==c.identity[k as keyof typeof c.identity]))no("summary_source_graph");
+ return sha(JSON.stringify(["bob-full-graph-v1",fullModelSourceBinding(c),graph.generation,graph.prefix,graph.index.key,graph.index.sha256,graph.index.bytes]));
+}
 export interface PreparedModelRow { readonly json: string; readonly sha256: string; readonly units: number }
 /** All projected fields are retained, including arbitrary native/tool objects.
  * Oversize is an explicit refusal, never an unchecked body-limit increase. */
 export function prepareFullModelRow(row: FullModelProjectionRow): PreparedModelRow {
-  const json = JSON.stringify(row);
+  const json = encodeRelayhistoryJsonExact(row);
   if (typeof json !== "string" || Buffer.byteLength(json) > FULL_MODEL_ROW_BYTES) no("summary_source_row_bound");
   return Object.freeze({ json, sha256: sha(json), units: json.length });
 }

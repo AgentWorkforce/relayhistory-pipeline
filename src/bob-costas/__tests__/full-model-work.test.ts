@@ -25,13 +25,13 @@ async function ports(rows: any[]){
   }},
   writeSlice:async(value,range)=>{
    writes++;
-   const key="fixture/source/registered/"+randomUUID()+".bin";
+   const id=randomUUID(),key="fixture/source/registered/"+id+".bin";
    const prepared=await prepareBoundSummaryValue({keyring,ids,key,binding:source,value:value as unknown as Record<string,unknown>});
    await putPreparedSummaryObject({store,prepared});
-   return {key,sha256:prepared.sha256,bytes:prepared.bytes,keyId:prepared.keyId,...range};
+   return {id,sha256:prepared.sha256,bytes:prepared.bytes,...range};
   },
   readSlice:async ref=>{
-   const v=await readBoundSummaryValue({store,keyring,ids,...ref,binding:source});
+   const v=await readBoundSummaryValue({store,keyring,ids,key:"fixture/source/registered/"+ref.id+".bin",sha256:ref.sha256,keyId:"hkdf1:k1",binding:source});
    if(!v)throw Error("slice_integrity");
    return v as unknown as ModelSlice;
   }
@@ -83,7 +83,7 @@ test("missing coverage, changed source/config and wrong encrypted range refuse b
  for(const changed of [{...c,sourceBinding:"c".repeat(64)},{...c,configSha256:"c".repeat(64)},{...c,units:"1"}])
   await expect(stepFullModelWork({ports:fixture.p,checkpoint:changed,sourceBinding:source,configSha256:config,signal:AbortSignal.timeout(10000)})).rejects.toThrow();
  expect(fixture.calls).toBe(0);
- const fake:ModelSliceRef={key:"fixture/k",keyId:"hkdf1:k1",sha256:"f".repeat(64),bytes:200,first:"0",count:"1",level:0};
+ const fake:ModelSliceRef={id:"12345678-1234-1234-1234-123456789abc",sha256:"f".repeat(64),bytes:200,first:"0",count:"1",level:0};
  const bad={...c,units:"1",inputComplete:true,frontier:[fake]};
  fixture.p.readSlice=async()=>({protocol:"bob-notes-v1",sourceBinding:"d".repeat(64),first:"0",count:"1",notes:"wrong source"});
  await expect(stepFullModelWork({ports:fixture.p,checkpoint:bad,sourceBinding:source,configSha256:config,signal:AbortSignal.timeout(10000)})).rejects.toThrow("model_slice_binding");

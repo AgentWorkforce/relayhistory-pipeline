@@ -137,6 +137,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.ingest_stage_intents",
     sql: relation("sessions.ingest_stage_intents"),
   },
+  "upstream:20261104063000_history_model_work.sql":{
+    evidence:"durable source-qualified model work and complete-graph wake tables",
+    sql:"SELECT to_regclass('sessions.history_model_work') IS NOT NULL AND to_regclass('sessions.history_model_wakeups') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

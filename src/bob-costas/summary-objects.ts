@@ -407,7 +407,7 @@ export async function readSummaryObject(args: {
 }
 
 async function readEncryptedSummary(args: {
-  store: ObjectStore; keyring: WorkspaceKeyring; ids: WorkspaceIds; key: string; sha256: string;
+  store: ObjectStore; keyring: WorkspaceKeyring; ids: WorkspaceIds; key: string; sha256: string; bytes?:number;
 }): Promise<{ envelope: Envelope; key: CryptoKey } | null> {
   let body: Uint8Array;
   try {
@@ -423,6 +423,7 @@ async function readEncryptedSummary(args: {
     if (isObjectStoreError(err, "not_found")) return null;
     throw storeError(err);
   }
+  if(args.bytes!==undefined&&body.byteLength!==args.bytes)return null;
   if ((await sha256Hex(body)) !== args.sha256) return null;
   const envelope = parseEnvelope(body);
   if (!envelope) return null;
@@ -569,7 +570,7 @@ export async function prepareBoundSummaryValue(args: {
 }
 export async function readBoundSummaryValue(args: {
   store: ObjectStore; keyring: WorkspaceKeyring; ids: WorkspaceIds; key: string;
-  sha256: string; keyId: string; binding: string;
+  sha256: string; keyId: string; binding: string; bytes?:number;
 }): Promise<Record<string, unknown> | null> {
   const binding = logicalAad(args.key, args.binding);
   const encrypted = await readEncryptedSummary(args);
