@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { openReadOnlySqlite } from "./sqlite-reader.ts";
 import { createHash } from "node:crypto";
 import {
   readFile,
@@ -174,7 +174,7 @@ export async function exportLocalWorkspace(options: LocalExportOptions) {
   )
     fail("invalid selected session keys");
   const deadline = Date.now() + timeoutMs;
-  const db = new Database(options.dbPath, { readonly: true, strict: true });
+  const db = openReadOnlySqlite(options.dbPath);
   const checkBudget = () => {
     if (Date.now() > deadline)
       fail("read budget exceeded; narrow the selected sessions or window");
