@@ -33,6 +33,20 @@ export interface CanonicalEventRow {
   tags: unknown; embedding: string | null; embeddingModel: string | null;
   contentHash: string | null;
 }
+/** One projected ML-brief row (accepted ML contract; NOT a Bob summary). */
+export interface CanonicalBriefRow {
+  orgId: string; workspaceId: string; source: string; sessionId: string;
+  title: string; description: string;
+  titleFolded: string; descriptionFolded: string;
+  briefCompletedAt: string;
+  embedding: string | null; embeddingModel: string | null;
+  contentHash: string;
+}
+/** Brief tombstone: prior-session keyset retired by a replaced image. */
+export interface CanonicalBriefTombstone {
+  orgId: string; workspaceId: string; source: string; sessionId: string;
+}
+
 /** Prior-image keyset entry emitted as a tombstone on replacement/retire. */
 export interface CanonicalTombstone {
   orgId: string; workspaceId: string; source: string; sessionId: string;
@@ -83,6 +97,65 @@ const eventSnapshot = (
     content_hash: r.contentHash,
   },
 });
+const briefSnapshot = (
+  r: CanonicalBriefRow,
+  e: CanonicalImageEvidence,
+): FeatureSnapshot => ({
+  reference: {
+    kind: "brief",
+    key: {
+      orgId: r.orgId, source: r.source, sessionId: r.sessionId,
+      workspaceId: r.workspaceId,
+    },
+    revision: e.revision, sourceHash: e.sourceHash, deleted: false,
+  },
+  row: {
+    org_id: r.orgId, workspace_id: r.workspaceId, source: r.source,
+    session_id: r.sessionId,
+    title: r.title, description: r.description,
+    title_folded: r.titleFolded, description_folded: r.descriptionFolded,
+    brief_completed_at: r.briefCompletedAt,
+    embedding: r.embedding, embedding_model: r.embeddingModel,
+    content_hash: r.contentHash,
+  },
+});
+const briefTombstoneSnapshot = (
+  t: CanonicalBriefTombstone,
+  e: CanonicalImageEvidence,
+): FeatureSnapshot => ({
+  reference: {
+    kind: "brief",
+    key: {
+      orgId: t.orgId, source: t.source, sessionId: t.sessionId,
+      workspaceId: t.workspaceId,
+    },
+    revision: e.revision, sourceHash: e.sourceHash, deleted: true,
+  },
+  row: null,
+});
+
+/** Brief-pool rows for one canonical image page + its replaced keyset. */
+export function produceBriefFeatures(
+  rows: CanonicalBriefRow[],
+  tombstones: CanonicalBriefTombstone[],
+  e: CanonicalImageEvidence,
+): CanonicalProduceResult {
+  try {
+    return {
+      kind: "rows",
+      rows: [
+        ...rows.map((r) => briefFeatureRow(briefSnapshot(r, e), e.revision)),
+        ...tombstones.map((t) =>
+          briefFeatureRow(briefTombstoneSnapshot(t, e), e.revision)),
+      ],
+    };
+  } catch (err) {
+    if (err instanceof EventFeatureError)
+      return { kind: "refused", reason: err.reason };
+    throw err;
+  }
+}
+
 const tombstoneSnapshot = (
   t: CanonicalTombstone,
   e: CanonicalImageEvidence,

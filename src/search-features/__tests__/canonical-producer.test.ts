@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { eventFeatureRow } from "../event-publisher.ts";
 import { featureVersion } from "../source.ts";
+import { briefFeatureRow } from "../brief-publisher.ts";
 import {
   produceEventFeatures,
+  produceBriefFeatures,
+  type CanonicalBriefRow,
+  type CanonicalBriefTombstone,
   type CanonicalEventRow,
   type CanonicalTombstone,
   type CanonicalImageEvidence,
@@ -95,5 +99,42 @@ describe("canonical feature producer", () => {
     r.contentFolded = null;
     const out = produceEventFeatures([r], [], ev);
     expect(out).toEqual({ kind: "refused", reason: "payload_invalid" });
+  });
+  test("brief rows are byte-identical to the legacy copier (non-authority)", () => {
+    const b: CanonicalBriefRow = {
+      orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1",
+      title: "T", description: "D", titleFolded: "t", descriptionFolded: "d",
+      briefCompletedAt: "2026-10-30T12:00:00.000000Z",
+      embedding: null, embeddingModel: null, contentHash: "h",
+    };
+    const legacy = briefFeatureRow({
+      reference: { kind: "brief",
+        key: { orgId: "org", source: "codex", sessionId: "s-1",
+          workspaceId: "ws" },
+        revision: LEGACY_REV, sourceHash: HASH, deleted: false },
+      row: { org_id: "org", workspace_id: "ws", source: "codex",
+        session_id: "s-1", title: "T", description: "D",
+        title_folded: "t", description_folded: "d",
+        brief_completed_at: "2026-10-30T12:00:00.000000Z",
+        embedding: null, embedding_model: null, content_hash: "h" },
+    });
+    const out = produceBriefFeatures([b], [], ev);
+    if (out.kind !== "rows") throw new Error(out.reason);
+    const c = out.rows[0]!;
+    for (const k of Object.keys(legacy))
+      if (!AUTHORITY.includes(k)) expect(c[k]).toEqual(legacy[k]);
+    expect(c.version).toBe(featureVersion(CANON_REV));
+    expect(c.source_revision).toBe(CANON_REV);
+  });
+  test("brief tombstone carries empty fields + epoch stamp", () => {
+    const t: CanonicalBriefTombstone = {
+      orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" };
+    const out = produceBriefFeatures([], [t], ev);
+    if (out.kind !== "rows") throw new Error(out.reason);
+    const c = out.rows[0]!;
+    expect(c.deleted).toBe(1);
+    expect(c.title).toBe("");
+    expect(c.embedding_dim).toBe(0);
+    expect(c.brief_completed_at).toBe("1970-01-01 00:00:00.000000");
   });
 });
