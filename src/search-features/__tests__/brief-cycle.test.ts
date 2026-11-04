@@ -28,13 +28,18 @@ test("empty initial baseline never claims ready until a committed journal poll c
       return {
         rows: (sql.startsWith("WITH observed")
           ? [{ p: { observedRevision: revision, rows: [] } }]
-          : []) as T[],
+          : [{ page: { too_large: false, rows: [] } }]) as T[],
       };
     },
   };
   const first = await copyBriefFeaturePage(
     { db, ch },
-    initialBriefFeatureCheckpoint(),
+    {
+      ...initialBriefFeatureCheckpoint(),
+      baselineH: "3",
+      checkpoint: "3",
+      observedRevision: "3",
+    },
   );
   expect(first.complete).toBe(false);
   expect(first.next).toMatchObject({
@@ -81,7 +86,12 @@ test("source fold profile uses bounded readonly metadata pages and preserves exa
       if (sql.includes("pg_database"))
         return {
           rows: [
-            { datcollate: "fixture", datctype: "fixture", datlocprovider: "c" },
+            {
+              datcollate: "fixture",
+              datctype: "fixture",
+              datlocprovider: "c",
+              datlocale: "",
+            },
           ] as T[],
         };
       const text = params![0] as string;
@@ -101,12 +111,57 @@ test("contextual/non-libc source fold refuses instead of silently adopting runti
     async query<T>() {
       return {
         rows: [
-          { datcollate: "fixture", datctype: "fixture", datlocprovider: "i" },
+          {
+            datcollate: "fixture",
+            datctype: "fixture",
+            datlocprovider: "i",
+            datlocale: "icu-fixture",
+          },
         ] as T[],
       };
     },
   };
   await expect(readLegacyCasefoldProfile(db)).rejects.toMatchObject({
     reason: "casefold_contextual",
+  });
+});
+
+test("uninitialized H is refused before any source read or CH write", async () => {
+  let reads = 0;
+  const db: FeatureReader = {
+    async query() {
+      reads++;
+      throw Error("source should not be touched");
+    },
+  };
+  await expect(
+    copyBriefFeaturePage({ db, ch }, initialBriefFeatureCheckpoint()),
+  ).rejects.toMatchObject({ reason: "baseline_uninitialized" });
+  expect(reads).toBe(0);
+});
+
+test("actual-shape builtin C.UTF-8 source is admitted without substituting libc metadata", async () => {
+  const db: FeatureReader = {
+    async query<T>(sql: string, params?: unknown[]) {
+      if (sql.includes("pg_database"))
+        return {
+          rows: [
+            {
+              datcollate: "C.UTF-8",
+              datctype: "C.UTF-8",
+              datlocprovider: "b",
+              datlocale: "C.UTF-8",
+            },
+          ] as T[],
+        };
+      return { rows: [{ folded: params![0] }] as T[] };
+    },
+  };
+  const p = await readLegacyCasefoldProfile(db);
+  expect(p.source).toEqual({
+    datcollate: "C.UTF-8",
+    datctype: "C.UTF-8",
+    datlocprovider: "b",
+    datlocale: "C.UTF-8",
   });
 });
