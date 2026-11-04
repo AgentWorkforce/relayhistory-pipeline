@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
-import { readSummaryObject, summaryObjectKey, writeSummaryObject, prepareSummaryObject, putPreparedSummaryObject, type SummaryRecord } from "../summary-objects.ts";
+import { readSummaryObject, summaryObjectKey, writeSummaryObject, prepareSummaryObject, putPreparedSummaryObject, prepareBoundSummaryValue, readBoundSummaryValue, type SummaryRecord } from "../summary-objects.ts";
 
 const HEX_A = "a".repeat(64);
 const HEX_B = "b".repeat(64);
@@ -19,6 +19,28 @@ const allFiles = (dir: string): string[] =>
   readdirSync(dir).flatMap((f) => (statSync(join(dir, f)).isDirectory() ? allFiles(join(dir, f)) : [join(dir, f)]));
 
 describe("summary objects (upstream envelope) with the HKDF keyring", () => {
+  it("logical encrypted slices bind exact source, object namespace, key id and tenant", async () => {
+    const root = mkdtempSync(join(tmpdir(), "bc-logical-"));
+    const store = createFsStore({ root });
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${HEX_A}`));
+    const key = "fixture/logical/source1/bob-slice/attempt.json.enc";
+    const value = { protocol: "bob-slice-v1", source: HEX_A, text: "PRIVATE-MODEL-OUTPUT", tools: ["\ud800"] };
+    const prepared = await prepareBoundSummaryValue({ keyring, ids, key, binding: HEX_A, value });
+    expect((await store.head(key as never))).toBeUndefined();
+    expect(new TextDecoder().decode(prepared.body)).not.toContain("PRIVATE-MODEL-OUTPUT");
+    await putPreparedSummaryObject({ store, prepared });
+    const read = { store, keyring, ids, key, binding: HEX_A, sha256: prepared.sha256, keyId: prepared.keyId };
+    expect(await readBoundSummaryValue(read)).toEqual(value);
+    expect(await readBoundSummaryValue({ ...read, binding: HEX_B })).toBeNull();
+    expect(await readBoundSummaryValue({ ...read, keyId: "hkdf1:k2" })).toBeNull();
+    expect(await readBoundSummaryValue({ ...read, ids: { ...ids, orgId: "foreign" } })).toBeNull();
+    const moved = "fixture/logical/source2/bob-slice/attempt.json.enc";
+    await store.put(moved as never, prepared.body);
+    expect(await readBoundSummaryValue({ ...read, key: moved })).toBeNull();
+    expect(await readSummaryObject({ ...read, kind: "short", revision: 1 })).toBeNull();
+    for (const f of allFiles(root)) expect(readFileSync(f, "utf8")).not.toContain("PRIVATE-MODEL-OUTPUT");
+  });
+
   it("immutable prepared writes reuse identical bytes and refuse changed bytes without overwriting", async () => {
     const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bc-immutable-")) });
     const keyring = await masterKeyring(parseMasterKeys(`k1:${HEX_A}`));

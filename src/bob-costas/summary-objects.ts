@@ -400,6 +400,15 @@ export async function readSummaryObject(args: {
   kind: SummaryKind;
   revision: number;
 }): Promise<SummaryRecord | null> {
+  const encrypted = await readEncryptedSummary(args);
+  if (!encrypted) return null;
+  const record = await open(encrypted.key, encrypted.envelope, args.key, args.kind, args.revision);
+  return record && record.kind === args.kind && record.revision === args.revision ? record : null;
+}
+
+async function readEncryptedSummary(args: {
+  store: ObjectStore; keyring: WorkspaceKeyring; ids: WorkspaceIds; key: string; sha256: string;
+}): Promise<{ envelope: Envelope; key: CryptoKey } | null> {
   let body: Uint8Array;
   try {
     const object = await args.store.getObject(objectKey(args.key));
@@ -425,13 +434,9 @@ export async function readSummaryObject(args: {
       ? err
       : fail("keyring_unavailable", true);
   }
-  const record = await open(key, envelope, args.key, args.kind, args.revision);
-  return record &&
-    record.kind === args.kind &&
-    record.revision === args.revision
-    ? record
-    : null;
+  return { envelope, key };
 }
+
 
 /** Associated data: the envelope only opens at its own key, kind and revision. */
 function aad(key: string, kind: SummaryKind, revision: number): Uint8Array {
@@ -443,14 +448,21 @@ async function seal(
   key: string,
   record: SummaryRecord,
 ): Promise<Uint8Array> {
-  const plain = new TextEncoder().encode(JSON.stringify(record));
+  return sealValue(current, record, aad(key, record.kind, record.revision));
+}
+
+async function sealValue(
+  current: { keyId: string; key: CryptoKey }, value: object, binding: Uint8Array,
+): Promise<Uint8Array> {
+  const plain = new TextEncoder().encode(JSON.stringify(value));
+
   if (plain.byteLength > MAX_SUMMARY_OBJECT_BYTES) throw fail("summary_too_large", false);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt(
     {
       name: "AES-GCM",
       iv,
-      additionalData: aad(key, record.kind, record.revision) as BufferSource,
+      additionalData: binding as BufferSource,
     },
     current.key,
     plain as BufferSource,
@@ -474,17 +486,21 @@ async function open(
   kind: SummaryKind,
   revision: number,
 ): Promise<SummaryRecord | null> {
+  return await openValue(key, envelope, aad(objectKeyName, kind, revision)) as SummaryRecord | null;
+}
+
+async function openValue(key: CryptoKey, envelope: Envelope, binding: Uint8Array): Promise<unknown | null> {
   try {
     const plain = await crypto.subtle.decrypt(
       {
         name: "AES-GCM",
         iv: unbase64(envelope.iv) as BufferSource,
-        additionalData: aad(objectKeyName, kind, revision) as BufferSource,
+        additionalData: binding as BufferSource,
       },
       key,
       unbase64(envelope.ct) as BufferSource,
     );
-    return JSON.parse(new TextDecoder().decode(plain)) as SummaryRecord;
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plain));
   } catch {
     // Wrong key, tampered bytes, or a different key/kind/revision.
     return null;
@@ -531,4 +547,33 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
   return Array.from(new Uint8Array(digest), (b) =>
     b.toString(16).padStart(2, "0"),
   ).join("");
+}
+
+
+/** Generic logical/slice envelope. binding is the caller's SHA of the complete
+ * captured-source tuple, purpose and work identity. This grants no SQL/S3 authority.
+ * The existing v1 record/AAD remains unchanged and cannot open this domain. */
+function logicalAad(key: string, binding: string): Uint8Array {
+  if (!/^[a-f0-9]{64}$/.test(binding)) throw fail("summary_prepared_invalid", false);
+  return new TextEncoder().encode(JSON.stringify(["bob-logical-envelope-v2", key, binding]));
+}
+export async function prepareBoundSummaryValue(args: {
+  keyring: WorkspaceKeyring; ids: WorkspaceIds; key: string; binding: string; value: Record<string, unknown>;
+}): Promise<PreparedSummaryObject> {
+  const key = String(objectKey(args.key)), binding = logicalAad(key, args.binding);
+  let current: { keyId: string; key: CryptoKey };
+  try { current = await args.keyring.currentKey(args.ids); }
+  catch (error) { throw error instanceof PipelineError ? error : fail("keyring_unavailable", true); }
+  const body = await sealValue(current, args.value, binding);
+  return { key, keyId: current.keyId, body, sha256: await sha256Hex(body), bytes: body.byteLength };
+}
+export async function readBoundSummaryValue(args: {
+  store: ObjectStore; keyring: WorkspaceKeyring; ids: WorkspaceIds; key: string;
+  sha256: string; keyId: string; binding: string;
+}): Promise<Record<string, unknown> | null> {
+  const binding = logicalAad(args.key, args.binding);
+  const encrypted = await readEncryptedSummary(args);
+  if (!encrypted || encrypted.envelope.key_id !== args.keyId) return null;
+  const value = await openValue(encrypted.key, encrypted.envelope, binding);
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
