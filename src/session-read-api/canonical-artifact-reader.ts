@@ -176,10 +176,40 @@ function queryCursor(query: ArtifactQuery, id: ArtifactIdentity) {
     fail("cursor", 400);
   return c as unknown as Cursor;
 }
-export async function canonicalArtifactPage(
+/** Construct an ordinal seek using the reader-owned cursor wire contract.
+ * Position is relative to the selected view/order/time window. The reader
+ * still checks the live publication, index digest and selected row bounds. */
+export function artifactOrdinalCursor(
+  identity: ArtifactIdentity,
+  captured: ArtifactPublication,
+  seek: Omit<ArtifactQuery, "limit" | "cursor" | "generation"> & { position: number },
+): string {
+  const ack = publication({ ...captured, exists: true, current: true }, identity);
+  if ("exists" in ack || !count(seek.position)) fail("cursor", 400);
+  const cursor = "artifact-v1:" + cursorEncode({
+    version: 1, identity, generation: ack.generation,
+    indexSha256: ack.index.sha256, table: seek.table,
+    view: seek.view ?? "raw", order: seek.order ?? "asc",
+    maxContent: seek.maxContent ?? null, offset: seek.position,
+    since: seek.since ?? null, until: seek.until ?? null,
+  } satisfies Cursor);
+  queryCursor({ ...seek, cursor, limit: 1 }, identity);
+  return cursor;
+}
+/** Worker entry: request parameters cannot select the trusted Node row budget. */
+export function canonicalArtifactPage(
+  deps: ArtifactReadDeps, identity: ArtifactIdentity, query: ArtifactQuery,
+) { return artifactPage(deps, identity, query, false); }
+/** Trusted Node-only raw consumer. Keeps the same codec, integrity/cursor/source
+ * fences, 2MiB aggregate page target and explicit 64MiB single-row maximum. */
+export function canonicalArtifactNodePage(
+  deps: ArtifactReadDeps, identity: ArtifactIdentity, query: ArtifactQuery,
+) { return artifactPage(deps, identity, query, true); }
+async function artifactPage(
   deps: ArtifactReadDeps,
   identity: ArtifactIdentity,
   query: ArtifactQuery,
+  trustedNode: boolean,
 ) {
   const stop = new AbortController(),
     signal = AbortSignal.any([deps.signal, stop.signal]);
@@ -693,7 +723,7 @@ export async function canonicalArtifactPage(
       if (
         !rows.length &&
         size >
-          (["replay", "legacy"].includes(view)
+          ((["replay", "legacy"].includes(view) || trustedNode && view === "raw")
             ? MAX_ROW_BYTES
             : MAX_REPLY_BYTES - 4096)
       )

@@ -2,6 +2,8 @@ import { beforeEach, expect, test } from "bun:test";
 import { sha256Hex } from "../../../packages/object-store/src/crypto.ts";
 import {
   canonicalArtifactPage,
+  canonicalArtifactNodePage,
+  artifactOrdinalCursor,
   type ArtifactReadDeps,
 } from "../canonical-artifact-reader.ts";
 import {
@@ -521,4 +523,35 @@ test("refuses missing/misaligned timestamp bounds instead of an unbounded replay
     canonicalArtifactPage(deps, identity, query({ since: "2026-11-01" })),
   ).rejects.toMatchObject({ reason: "artifact_bounds" });
   expect(readKeys.some((k) => k.endsWith("page-1.json"))).toBe(false);
+});
+
+test("reader-owned ordinal seeks bind view, index, generation and byte-exact row position", async () => {
+  const cursor = artifactOrdinalCursor(identity, ack, { table: "convergence_events", view: "replay", order: "asc", position: 1 });
+  const page = await canonicalArtifactPage(deps, identity, query({ cursor }));
+  expect(page.rows[0]!.row.event_id).toBe("e2");
+  await expect(canonicalArtifactPage(deps, identity, query({ cursor, order: "desc" }))).rejects.toMatchObject({ status: 400 });
+  await expect(canonicalArtifactPage(deps, identity, query({ cursor, view: "raw" }))).rejects.toMatchObject({ status: 400 });
+  const changed = artifactOrdinalCursor(identity, { ...ack, index: { ...ack.index, sha256: "f".repeat(64) } }, { table: "convergence_events", view: "replay", position: 1 });
+  await expect(canonicalArtifactPage(deps, identity, query({ cursor: changed }))).rejects.toMatchObject({ status: 400 });
+  expect(() => artifactOrdinalCursor(identity, ack, { table: "convergence_events", position: -1 })).toThrow();
+});
+
+test("trusted Node raw entry preserves multiMiB arbitrary native fields while Worker raw refuses", async () => {
+  const body = { source: identity.source, session_id: identity.sessionId, event_id: "large-native", machine_id: "m", kind: "tool_call", ts: "2026-11-01T10:00:00.000001Z", record: { payload: { native: "😀".repeat(600_000), tools: Array.from({length: 10_001}, (_, i) => ({id: i, nested: {keep: true}})) } } };
+  const raw = encode(body), parts: ArtifactRangeRef[] = [];
+  for (let at = 0; at < raw.length; at += 65536) parts.push(await put("raw-blob-" + at, raw.slice(at, at + 65536), at, Math.min(65536, raw.length - at), "segment"));
+  const root = await node("raw-blob-node.json", "bytes", parts);
+  const page = await put("raw-row.json", encode({ version: 1, kind: "row-page", identity, generation, table: "convergence_events", view: "raw", start: 0, rows: [{ table: "convergence_events", rowJson: { codec: "json-utf8-segments-v1", bytes: raw.length, sha256: await sha256Hex(raw), root } }] }), 0, 1, "page");
+  index.tables.convergence_events!.raw = { count: 1, root: page };
+  await publish();
+  const cursor = artifactOrdinalCursor(identity, ack, { table: "convergence_events", view: "raw", position: 0 });
+  const q = { table: "convergence_events", view: "raw" as const, limit: 1, cursor };
+  await expect(canonicalArtifactPage(deps, identity, q)).rejects.toMatchObject({ reason: "row_bound" });
+  const got = await canonicalArtifactNodePage(deps, identity, q);
+  expect(raw.length).toBeGreaterThan(2 * 1024 ** 2);
+  expect(got.rows[0]!.row).toEqual(body);
+  expect(got.nextCursor).toBeNull();
+  const old = deps.publication; let reads = 0;
+  deps.publication = async (...args) => { const value = await old(...args); return ++reads === 1 ? value : {...value as any, generation: "f".repeat(64)} };
+  await expect(canonicalArtifactNodePage(deps, identity, q)).rejects.toMatchObject({ reason: "source_generation_changed" });
 });
