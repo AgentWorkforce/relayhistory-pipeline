@@ -346,6 +346,73 @@ export interface RunOptions {
   steps?: Step[];
   /** Test seam: runs after the last migration commit, before phase 2. */
   beforeVerify?: () => Promise<void>;
+  /** Release plan binding, checked under the migrator lock before writes. */
+  expectedLedgerSha256?: string;
+  /** External release gates rechecked under the migrator lock, before any write. */
+  beforeWrite?: () => Promise<void>;
+}
+
+/** Shared read-only preflight: release planning and apply enforce the same guards. */
+async function migrationPreflight(client: MigrationClient, profile: MigrationProfile, schema: Step[]) {
+  const ledger = await readLedger(client);
+  // A HoopDb built from the old vendored pin cannot be moved forward in place:
+  // upstream changed 20261025000600 after it was applied there. Say so plainly.
+  if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
+    throw Object.assign(
+      new Error(
+        "96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)",
+      ),
+      {
+        code: "legacy_schema",
+      },
+    );
+  }
+  const runtime = await runtimeRolePreflight(client, profile);
+  // Durable function boundary gate, every non-local mode: the selected control must be
+  // proven by the catalog. Only explicit local (Docker dev) mode is ungated.
+  if (profile.mode !== "local") {
+    const evidence = await functionBoundaryEvidence(
+      client,
+      profile.functionBoundary,
+      profile.mode,
+      profile.runtimeRole,
+    );
+    if (!evidence.satisfied)
+      throw profileError(
+        "function_boundary_unproven",
+        `no catalog-proven function boundary (HOOPDB_FUNCTION_BOUNDARY_MODE): ${JSON.stringify(evidence)}; see the runbook "Function boundary"`,
+      );
+  }
+  await cliHistoryPreflight(client, schema);
+  await sequencePreflight(client, schema, ledger);
+  return { ledger, runtime };
+}
+export function migrationLedgerSha256(ledger: Map<string, string>): string {
+  return createHash("sha256").update(JSON.stringify([...ledger].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest("hex");
+}
+/** Caller owns the READ ONLY transaction; never invokes bootstrap or schema SQL. */
+export async function inspectMigrations(client: MigrationClient, profile: MigrationProfile) {
+  if (profile.mode !== "supabase" || profile.shim || profile.bootstrap || !profile.verify)
+    throw profileError("release_profile", "release inspection requires Supabase, verifier enabled, shim/bootstrap disabled");
+  const steps = await schemaSteps();
+  const { ledger } = await migrationPreflight(client, profile, steps);
+  const acl = await sessionsFunctionAclPreview(client, profile.runtimeRole, steps.some(s => !ledger.has(s.name)));
+  if (acl.function_acl_drift_extra.length || acl.function_acl_missing_refused.length)
+    throw profileError("function_acl_drift", "release inspection refused ACL drift");
+  // Prerequisites only, no provisioning. Authoritative migration/phase-2 SQL still
+  // verifies the complete role contract, including memberships and effective grants.
+  const roles = (await client.query<{rolname:string; safe:boolean}>(
+    "SELECT rolname, NOT (rolcanlogin OR rolinherit OR rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication) AS safe FROM pg_roles WHERE rolname = ANY($1::text[])",
+    [["session_directory_search_worker", "session_token_verifier"]])).rows;
+  if (roles.length !== 2 || roles.some(r => !r.safe))
+    throw profileError("bootstrap_prerequisite", "operator-provisioned search/token bare roles absent or unsafe");
+  const inventory = [];
+  for (const step of steps) inventory.push({
+    name: step.name,
+    sha256: createHash("sha256").update(await readFile(step.path, "utf8")).digest("hex"),
+    pending: !ledger.has(step.name),
+  });
+  return { generation: await generation(), ledgerSha256: migrationLedgerSha256(ledger), inventory, acl };
 }
 
 /**
@@ -373,37 +440,11 @@ export async function runMigrations(
       (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
     );
     // Read-only preflight, all under the lock: nothing below writes until every check passes.
-    const ledger = await readLedger(client);
-    // A HoopDb built from the old vendored pin cannot be moved forward in place:
-    // upstream changed 20261025000600 after it was applied there. Say so plainly.
-    if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
-      throw Object.assign(
-        new Error(
-          "96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)",
-        ),
-        {
-          code: "legacy_schema",
-        },
-      );
-    }
-    const runtime = await runtimeRolePreflight(client, profile);
-    // Durable function boundary gate, every non-local mode: the selected control must be
-    // proven by the catalog. Only explicit local (Docker dev) mode is ungated.
-    if (profile.mode !== "local") {
-      const evidence = await functionBoundaryEvidence(
-        client,
-        profile.functionBoundary,
-        profile.mode,
-        profile.runtimeRole,
-      );
-      if (!evidence.satisfied)
-        throw profileError(
-          "function_boundary_unproven",
-          `no catalog-proven function boundary (HOOPDB_FUNCTION_BOUNDARY_MODE): ${JSON.stringify(evidence)}; see the runbook "Function boundary"`,
-        );
-    }
-    await cliHistoryPreflight(client, schema);
-    await sequencePreflight(client, schema, ledger);
+    const { ledger, runtime } = await migrationPreflight(client, profile, schema);
+    if (opts.expectedLedgerSha256 !== undefined &&
+        migrationLedgerSha256(ledger) !== opts.expectedLedgerSha256)
+      throw profileError("release_ledger_changed", "database ledger changed since the approved read-only plan");
+    if (opts.beforeWrite) await opts.beforeWrite();
     await client.query("CREATE SCHEMA IF NOT EXISTS sessions");
     await client.query(`CREATE TABLE IF NOT EXISTS ${MIGRATION_LEDGER} (
       name text PRIMARY KEY,
