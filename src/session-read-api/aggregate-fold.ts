@@ -13,7 +13,10 @@ export interface FoldEvent {
   kind: string; type: string; ts: string;
   actorRole?: string; content?: string;
   requestKey?: string; deliveryRecordId?: string;
-  record?: { payload?: { message_id?: string; kind?: string; args_json?: string } };
+  record?: { payload?: {
+    message_id?: string; kind?: string; args_json?: string;
+    tool_use_id?: string; parent_id?: string; turn_id?: string;
+  } };
   toolName?: string; machineId?: string; eventId?: string;
 }
 export interface LegacyTurn { id: string; orgId: string; workspaceId: string; source: string; sessionId: string; ts: string }
@@ -58,20 +61,41 @@ export function deriveCandidates(
     out.push({ orgId: c.orgId, workspaceId: c.workspaceId, source: c.source, sessionId: c.sessionId,
       type: "explicit_commit", dedupKey: c.sha.toLowerCase(), ts: c.ts,
       stats: c.stats, provenance: { method: c.provenance } });
-  for (const call of events.filter(e => e.toolName && TOOLS.has(e.toolName) && GIT_COMMIT.test(e.record?.payload?.args_json ?? ""))) {
-    // Correlate tool_result events to THIS call by the shared payload key
-    // (message_id/request_key/delivery_record_id), not every result in the set.
-    const callKey = call.record?.payload?.message_id || call.requestKey || call.deliveryRecordId;
-    const results = events.filter(e => e.actorRole === "tool_result" &&
-      e.source === call.source && e.sessionId === call.sessionId &&
-      callKey !== undefined &&
-      (e.record?.payload?.message_id === callKey || e.requestKey === callKey || e.deliveryRecordId === callKey));
-    for (const r of results)
-      for (const m of (r.content ?? "").matchAll(RESULT_SHA) as unknown as RegExpExecArray[])
-        out.push({ orgId: r.orgId, workspaceId: r.workspaceId, source: r.source, sessionId: r.sessionId,
-          type: "tool_commit", dedupKey: m[1]!.toLowerCase(), ts: r.ts,
-          stats: { added: m[2] ?? "0", deleted: m[3] ?? "0" },
-          provenance: { call: callKey ?? "" } });
+  // Tool-derived commits: oracle correlation — a tool_result matches when a
+  // tool_call exists in the same scope+session, not after it, sharing
+  // tool_use_id, parent/turn-compatible, and the call set collapses to exactly
+  // one logical call that is a git-commit shell tool (ambiguity or a competing
+  // non-commit call disqualifies the candidate entirely).
+  for (const r of events.filter(e => e.actorRole === "tool_result")) {
+    const rp = r.record?.payload ?? {};
+    const calls = events.filter(c =>
+      c.orgId === r.orgId && c.workspaceId === r.workspaceId &&
+      c.source === r.source && c.sessionId === r.sessionId &&
+      c.kind === "tool_call" && c.ts <= r.ts &&
+      (c.record?.payload?.tool_use_id ?? "") !== "" &&
+      c.record?.payload?.tool_use_id === rp.tool_use_id &&
+      (!rp.parent_id || rp.parent_id === c.record?.payload?.message_id ||
+       rp.message_id === c.record?.payload?.message_id) &&
+      (!rp.turn_id || events.some(par =>
+        par.orgId === c.orgId && par.workspaceId === c.workspaceId &&
+        par.source === c.source && par.sessionId === c.sessionId &&
+        par.kind === "session_event" &&
+        (par.record?.payload?.message_id ?? "") !== "" &&
+        par.record?.payload?.message_id === c.record?.payload?.message_id &&
+        par.record?.payload?.turn_id === rp.turn_id)));
+    const logical = new Set(calls.map(c => JSON.stringify([
+      c.record?.payload?.message_id ?? null, c.toolName ?? null,
+      c.record?.payload?.args_json ?? null,
+      c.record?.payload?.message_id ? null : c.ts])));
+    if (logical.size !== 1) continue;
+    const call = calls[0]!;
+    if (!(call.toolName && TOOLS.has(call.toolName) &&
+          GIT_COMMIT.test(call.record?.payload?.args_json ?? ""))) continue;
+    for (const m of (r.content ?? "").matchAll(RESULT_SHA) as unknown as RegExpExecArray[])
+      out.push({ orgId: r.orgId, workspaceId: r.workspaceId, source: r.source, sessionId: r.sessionId,
+        type: "tool_commit", dedupKey: m[1]!.toLowerCase(), ts: r.ts,
+        stats: { added: m[2] ?? "0", deleted: m[3] ?? "0" },
+        provenance: { call: call.record?.payload?.tool_use_id ?? "" } });
   }
   return out;
 }

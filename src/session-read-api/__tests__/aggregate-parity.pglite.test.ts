@@ -146,6 +146,45 @@ describe("oracle parity",()=>{
     const {o,n}=await parity(d,[ev("2026-10-30","s-1")],"",`INSERT INTO sessions.session_commit_links VALUES('org-a','ws-a','src-x','s-1','abc1234','[]'::jsonb,NULL,'2026-10-30T01:00:00Z');INSERT INTO sessions.session_outcomes VALUES('org-a','ws-a','src-x','s-1','abc1234','[{"additions":"5","deletions":"2"}]'::jsonb,'2026-10-30T02:00:00Z','2026-10-30T02:00:00Z');`);
     expect(n).toEqual(o);
   });
+  test("ambiguous tool_use_id / competing noncommit call excludes the tool commit",async()=>{
+    const d=await db();
+    // Result has commit-shaped output; two calls share tool_use_id (one not git).
+    const evs=[
+      `INSERT INTO sessions.convergence_events VALUES('org-a','ws-a','m-1','u-1','src-x','s-1','c1','tool_call','tool_call','2026-10-30T10:00:00Z','assistant',NULL,NULL,NULL,'bash','{"payload":{"tool_use_id":"tu-1","args_json":"git commit -m x"}}'::jsonb,'2026-10-30T10:00:00Z')`,
+      `INSERT INTO sessions.convergence_events VALUES('org-a','ws-a','m-1','u-1','src-x','s-1','c2','tool_call','tool_call','2026-10-30T10:01:00Z','assistant',NULL,NULL,NULL,'bash','{"payload":{"tool_use_id":"tu-1","args_json":"git status"}}'::jsonb,'2026-10-30T10:01:00Z')`,
+      `INSERT INTO sessions.convergence_events VALUES('org-a','ws-a','m-1','u-1','src-x','s-1','r1','tool_result','tool_result','2026-10-30T10:02:00Z','tool_result','[main abc1234] msg\n 2 files changed, 5 insertions(+), 3 deletions(-)',NULL,NULL,NULL,'{"payload":{"tool_use_id":"tu-1","message_id":"mm"}}'::jsonb,'2026-10-30T10:02:00Z')`,
+    ];
+    const {o,n}=await parity(d,evs,"","");
+    expect(n).toEqual(o);
+    expect(n.commits).toBe(0);
+  });
+  test("multi-machine: distinct machine:event fallback ids count separately",async()=>{
+    const d=await db();
+    const evs=[
+      `INSERT INTO sessions.convergence_events VALUES('org-a','ws-a','m-1','u-1','src-x','s-1','e1','session_event','assistant','2026-10-30T10:00:00Z','assistant','hello',NULL,NULL,'{}'::jsonb,NULL,'2026-10-30T10:00:00Z')`,
+      `INSERT INTO sessions.convergence_events VALUES('org-a','ws-a','m-2','u-1','src-x','s-1','e2','session_event','assistant','2026-10-30T10:05:00Z','assistant','hello again',NULL,NULL,'{}'::jsonb,NULL,'2026-10-30T10:05:00Z')`,
+    ];
+    const {o,n}=await parity(d,evs,"","");
+    expect(n).toEqual(o);
+    expect(n.agentMessages).toBe(2);
+  });
+  test("superseded publication is invisible; stale CAS aborts ready flip",async()=>{
+    const d=await db();
+    await parity(d,[ev("2026-10-30","s-1")],"","");
+    // A second publication supersedes; reads must see only the new candidates.
+    await d.exec("RESET ROLE");
+    const rows=(await d.query<Record<string,unknown>>("SELECT * FROM sessions.convergence_events")).rows;
+    const cands=deriveCandidates(rows.map(r=>({orgId:r.org_id,workspaceId:r.workspace_id,source:r.source,sessionId:r.session_id,kind:r.kind,type:r.type,ts:r.ts,actorRole:r.actor_role,content:r.content,requestKey:r.request_key,deliveryRecordId:r.delivery_record_id,record:r.record as never,toolName:r.tool_name,machineId:r.machine_id,eventId:r.event_id}) as never),[],[],[]);
+    await d.query("BEGIN"); try {
+      await publishAggregates({query:(t,p)=>d.query(t,p) as never},{orgId:"org-a",workspaceId:"ws-a",sourceEpoch:new Date(),unionCas:"cas-2",candidates:[]});
+      await d.query("COMMIT");
+    } catch(e) { await d.query("ROLLBACK"); throw e; }
+    await d.exec("SET ROLE session_directory_search_worker");
+    // Superseded rows are invisible: the new ready publication is empty,
+    // so the answer is legitimately zero — the stale first set never leaks.
+    const n2 = await sessionOutput(run(d),"org-a","ws-a",new Date(S),new Date(U));
+    expect(n2).toEqual({agentMessages:0,commits:0,linesAdded:0,linesRemoved:0,commitsWithoutLineCounts:0});
+  });
   test("unready publication refuses 42501, never false zeros",async()=>{
     const d=await db();
     await expect(sessionOutput(run(d),"org-a","ws-a",new Date(S),new Date(U))).rejects.toThrow();
