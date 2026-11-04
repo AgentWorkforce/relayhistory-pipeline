@@ -35,7 +35,7 @@ export const MIGRATION_CHECKSUM_ALIASES = [
   {
     migration: "upstream:20261030020000_session_directory_short_summary.sql",
     ledger_sha:
-      "262a9d42183cfc917bb5aa91a1088a6dedef369c982159ee31b7b22aa733579e",
+      "c223b77e4c875cbc36499e6ca1c8e521b564ebf25facd87313b3e58335918de4",
     accepted_as_alias_of:
       "b0ddc7de8c4cff9454638c52563f37f1e1380ed577e2a7535f67ddc2c0b758ce",
   },
@@ -1065,7 +1065,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "afb0224dee97fec7d17a6a223d90d4ed88114881274f4534519f760e149f969c";
+  "262a9d42183cfc917bb5aa91a1088a6dedef369c982159ee31b7b22aa733579e";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
