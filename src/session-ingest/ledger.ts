@@ -87,9 +87,9 @@ export interface RevisionConflict {
  */
 export type ClaimResult =
   /** First sight of this batch: claimed `pending`. */
-  | { kind: "claimed"; deleted: [string, string][]; stale: number[]; resets: number }
+  | { kind: "claimed"; claimToken: string; deleted: [string, string][]; stale: number[]; resets: number }
   /** A pending claim with this digest (an earlier attempt stopped part way): re-run, every step is idempotent. */
-  | { kind: "resume"; deleted: [string, string][]; stale: number[]; resets: number }
+  | { kind: "resume"; claimToken: string; deleted: [string, string][]; stale: number[]; resets: number }
   /**
    * Every record is stale or deleted: the claim committed the batch itself in
    * the same round trip. Nothing is written to S3 and commit is not called.
@@ -102,11 +102,20 @@ export type ClaimResult =
   /** 409 record_revision (#250: in-batch reuse of a new revision only): first MAX_DELIVERY_CONFLICTS, and the total. */
   | { kind: "revision_conflict"; conflicts: RevisionConflict[]; count: number };
 
+/** A server-issued immutable claim snapshot, carried through object IO. */
+export interface ClaimAttempt {
+  batchId: string;
+  batchDigest: string;
+  claimToken: string;
+}
+export type StagedAttempt = Pick<ClaimAttempt, "batchDigest" | "claimToken">;
+
 export interface CommitInput {
   tenant: LedgerTenant;
   originId: string;
   batchId: string;
   batchDigest: string;
+  claimToken: string;
   /** Sessions this batch wrote to S3 (after the deletion filter). */
   sessions: [source: string, sessionId: string][];
   /** Exactly the records written to S3: their revisions become stored (max wins, equal keeps). */
@@ -159,9 +168,9 @@ export interface Ledger {
   /** The number of sessions the reset tombstoned (a replayed request id answers its first count). */
   resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number>;
   /** Staged path: the slice's sessions fenced right now (skipped by the fan-out). */
-  fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][]): Promise<[string, string][]>;
+  fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][], attempt: StagedAttempt): Promise<[string, string][]>;
   /** Staged path: the records one slice wrote become stored (a session fenced since is re-armed instead). */
-  commitRevisions(tenant: LedgerTenant, originId: string, machineId: string, records: LedgerRecord[]): Promise<{ committed: number; rearmed: number }>;
+  commitRevisions(tenant: LedgerTenant, originId: string, machineId: string, records: LedgerRecord[], attempt: StagedAttempt): Promise<{ committed: number; rearmed: number }>;
 }
 
 /** The ledger is unreachable or refused: the batch answers 503 (retryable), never a fallback. */

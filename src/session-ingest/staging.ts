@@ -22,6 +22,8 @@
  * the pipeline scrubber (`scrubRecords`) before the put, so
  * nothing unscrubbed is at rest.
  *
+ * The key also binds the immutable nonce. Additive v1 remains compatible with
+ * the transitional Neon replica; upgraded fanout refuses missing-token headers.
  * The key names the batch digest AND the exact groups and record identities
  * staged (`sha16(content)`). A retry that keeps the same records finds its
  * own object (create-only, identical); a retry whose kept set shrank (records
@@ -43,6 +45,7 @@ export const FANOUT_GROUPS_PER_MESSAGE = 40;
 
 export interface StagedHeader {
   v: 1;
+  claim_token: string;
   batch_digest: string;
   received_at: string;
   org_id: string;
@@ -80,11 +83,11 @@ export function stagedContentDigest(groups: Group[]): string {
 
 export function stagedKey(
   keyRoot: string,
-  h: Pick<StagedHeader, "org_id" | "workspace_id" | "origin_id" | "user_id" | "batch_digest">,
+  h: Pick<StagedHeader, "org_id" | "workspace_id" | "origin_id" | "user_id" | "batch_digest" | "claim_token">,
   contentDigest: string,
 ): string {
   const machine = liveMachineId(h.workspace_id, h.origin_id, h.user_id);
-  return `${keyRoot}/${h.org_id}/live-batches/v1/ws=${layoutComponent(h.workspace_id)}/m=${machine}/b=${sha256Hex(h.batch_digest).slice(0, 32)}-${contentDigest.slice(0, 16)}.staged.ndjson.zst`;
+  return `${keyRoot}/${h.org_id}/live-batches/v1/ws=${layoutComponent(h.workspace_id)}/m=${machine}/b=${sha256Hex(h.batch_digest).slice(0, 32)}-${contentDigest.slice(0, 16)}-${sha256Hex(h.claim_token).slice(0, 32)}.staged.ndjson.zst`;
 }
 
 /** Stage the batch's groups (create-only; a retry keeps the object already there). Returns its key. */
@@ -117,7 +120,7 @@ export async function readStaged(store: ObjectStore, key: string, decompress: (b
   const text = decoder.decode(bytes);
   const newline = text.indexOf("\n");
   const header = JSON.parse(text.slice(0, newline)) as StagedHeader;
-  if (header.v !== STAGED_VERSION || !Array.isArray(header.groups)) throw new Error("staged object has an unknown version");
+  if (header.v !== STAGED_VERSION || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(header.claim_token) || !Array.isArray(header.groups)) throw new Error("staged object has an unknown version");
   const groups: Group[] = header.groups.map(([source, sessionId]) => ({ source, sessionId, lines: [], meta: [] }));
   for (const line of text.slice(newline + 1).split("\n")) {
     if (!line) continue;
@@ -145,6 +148,7 @@ export async function fanout(
   ledger?: Pick<Ledger, "fanoutFence" | "commitRevisions">,
 ) {
   const { header, groups } = await readStaged(target.store, message.key, decompress);
+  const attempt = { batchDigest: header.batch_digest, claimToken: header.claim_token };
   const tenant = { orgId: header.org_id, workspaceId: header.workspace_id, userId: header.user_id };
   // Already scrubbed once when staged: fit again for the second scrub at sealing (oversize.ts fitLine).
   let slice = groups.slice(message.from, message.to).map((g) => ({ ...g, lines: g.lines.map(fitLine) }));
@@ -154,7 +158,7 @@ export async function fanout(
       const sid = g.meta?.[0]?.[3];
       return sid ? [[g.meta![0]![2], sid] as [string, string]] : [];
     });
-    const fenced = new Set((await ledger.fanoutFence(tenant, header.origin_id, sessionsOf)).map((p) => JSON.stringify(p)));
+    const fenced = new Set((await ledger.fanoutFence(tenant, header.origin_id, sessionsOf, attempt)).map((p) => JSON.stringify(p)));
     const before = slice.length;
     slice = slice.filter((g) => {
       const m = g.meta?.[0];
@@ -177,7 +181,7 @@ export async function fanout(
         return { source, sessionId, recordId: r.record_id, revisionId, revision: Number(r.revision), digest };
       }),
     );
-    revisions = await ledger.commitRevisions(tenant, header.origin_id, written.machineId, records);
+    revisions = await ledger.commitRevisions(tenant, header.origin_id, written.machineId, records, attempt);
   }
   return { ...written, skipped, revisions };
 }

@@ -1,6 +1,6 @@
 -- Phase 1: privileged bootstrap for the session ingest roles. Before migrate.
 --
--- The migration (supabase/migrations/20261102010000_session_ingest_ledger.sql) never
+-- The migration (supabase/migrations/20261104022000_session_ingest_ledger.sql) never
 -- creates or alters a role: a CNPG/Cloud SQL migration owner has no CREATEROLE. It
 -- verifies these roles (42704 if absent, 55000 if they differ) and grants EXECUTE on
 -- the ingest functions to them. This file provisions them, the pattern of

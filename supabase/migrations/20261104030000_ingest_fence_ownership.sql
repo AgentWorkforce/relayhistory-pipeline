@@ -33,6 +33,86 @@ END
 $lock$;
 REVOKE ALL ON FUNCTION sessions.ingest_lock_fences(text,text,text)
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+-- Versions survive enable and ownership removal: the disappearance of a
+-- tombstone must not make a pre-disable write trusted again.
+CREATE TABLE sessions.ingest_fence_versions (
+ org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,
+ origin_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+ epoch bigint NOT NULL CHECK(epoch>0),
+ PRIMARY KEY(org_id,workspace_id,user_id,origin_id,source,session_id)
+);
+-- Every resume receives a new immutable snapshot. An old writer cannot borrow
+-- the newer resume's epochs by presenting the same batch id/digest.
+CREATE TABLE sessions.ingest_claim_attempts (
+ claim_token uuid PRIMARY KEY,
+ org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,
+ origin_id text NOT NULL,batch_id text NOT NULL,digest text NOT NULL,
+ epochs jsonb NOT NULL CHECK(jsonb_typeof(epochs)='array'),
+ FOREIGN KEY(org_id,workspace_id,origin_id,batch_id)
+  REFERENCES sessions.ingest_batches(org_id,workspace_id,origin_id,batch_id) ON DELETE CASCADE
+);
+CREATE INDEX ingest_claim_attempts_batch_idx ON sessions.ingest_claim_attempts(org_id,workspace_id,origin_id,batch_id);
+ALTER TABLE sessions.ingest_fence_versions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions.ingest_claim_attempts ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.ingest_fence_versions,sessions.ingest_claim_attempts
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+CREATE FUNCTION sessions.ingest_attempt_epochs(
+ p_org text,p_ws text,p_user text,p_origin text,p_batch text,p_digest text,p_token text)
+RETURNS jsonb LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $attempt$
+DECLARE v jsonb;
+BEGIN
+ IF p_batch IS NOT NULL AND NOT EXISTS(SELECT 1 FROM sessions.ingest_batches AS b
+   WHERE b.org_id=p_org AND b.workspace_id=p_ws AND b.user_id=p_user AND b.origin_id=p_origin
+     AND b.batch_id=p_batch AND b.digest=p_digest) THEN
+  RAISE EXCEPTION USING ERRCODE='P0002',MESSAGE='session ingest: no claim for this batch';
+ END IF;
+ IF p_token IS NULL OR p_token !~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: unknown claim attempt';
+ END IF;
+ SELECT a.epochs INTO v FROM sessions.ingest_claim_attempts AS a
+ JOIN sessions.ingest_batches AS b USING(org_id,workspace_id,origin_id,batch_id)
+ WHERE a.org_id=p_org AND a.workspace_id=p_ws AND a.user_id=p_user
+   AND a.origin_id=p_origin AND (p_batch IS NULL OR a.batch_id=p_batch) AND a.digest=p_digest
+   AND a.claim_token=p_token::uuid AND b.user_id=p_user AND b.digest=p_digest;
+ IF NOT FOUND THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: unknown claim attempt';
+ END IF;
+ RETURN v;
+END
+$attempt$;
+
+CREATE FUNCTION sessions.ingest_attempt_fenced(
+ p_org text,p_ws text,p_user text,p_origin text,p_epochs jsonb,p_pairs jsonb)
+RETURNS jsonb LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $afence$
+DECLARE v jsonb;v_reset bigint;
+BEGIN
+ SELECT count(*) INTO v_reset FROM sessions.upload_resets AS r
+ WHERE r.org_id=p_org AND r.workspace_id=p_ws AND r.user_id=p_user;
+ IF EXISTS(SELECT 1 FROM sessions.ingest_session_pairs(p_pairs) AS s
+   WHERE NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(p_epochs) AS e(source text,session_id text,epoch bigint,reset_epoch bigint)
+     WHERE e.source=s.source AND e.session_id=s.session_id)) THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: session outside claim attempt';
+ END IF;
+ SELECT coalesce(jsonb_agg(jsonb_build_array(s.source,s.session_id)
+   ORDER BY s.source COLLATE "C",s.session_id COLLATE "C"),'[]'::jsonb) INTO v
+ FROM sessions.ingest_session_pairs(p_pairs) AS s
+ JOIN jsonb_to_recordset(p_epochs) AS e(source text,session_id text,epoch bigint,reset_epoch bigint)
+   ON e.source=s.source AND e.session_id=s.session_id
+ LEFT JOIN sessions.ingest_fence_versions AS f
+   ON f.org_id=p_org AND f.workspace_id=p_ws AND f.user_id=p_user
+    AND f.origin_id=p_origin AND f.source=s.source AND f.session_id=s.session_id
+ WHERE coalesce(f.epoch,0)<>e.epoch OR v_reset<>e.reset_epoch OR EXISTS(
+   SELECT 1 FROM sessions.upload_deletions AS d
+   WHERE d.org_id=p_org AND d.workspace_id=p_ws AND d.user_id=p_user
+     AND d.origin_id=p_origin AND d.source=s.source AND d.session_id=s.session_id);
+ RETURN v;
+END
+$afence$;
+REVOKE ALL ON FUNCTION sessions.ingest_attempt_epochs(text,text,text,text,text,text,text),
+ sessions.ingest_attempt_fenced(text,text,text,text,jsonb,jsonb)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
 CREATE OR REPLACE FUNCTION sessions.ingest_claim_batch(p jsonb)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -55,6 +135,8 @@ DECLARE
   v_resets integer;
   v_fast boolean;
   v_inserted boolean;
+  v_token uuid;
+  v_epochs jsonb;
 BEGIN
   PERFORM sessions.ingest_require_role('bulls96_session_ingest');
   PERFORM sessions.ingest_exact_keys(p,
@@ -79,6 +161,7 @@ BEGIN
    WHERE b.org_id = k.org_id AND b.workspace_id = k.workspace_id
      AND b.origin_id = k.origin_id AND b.batch_id = k.batch_id;
   IF FOUND THEN
+    IF v_batch.user_id<>k.user_id THEN RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='session ingest: batch owner mismatch'; END IF;
     IF v_batch.digest <> k.digest THEN
       RETURN jsonb_build_object('kind', 'batch_conflict', 'currentDigest', v_batch.digest);
     END IF;
@@ -176,6 +259,7 @@ BEGIN
       SELECT * INTO v_batch FROM sessions.ingest_batches AS b
        WHERE b.org_id = k.org_id AND b.workspace_id = k.workspace_id
          AND b.origin_id = k.origin_id AND b.batch_id = k.batch_id;
+      IF v_batch.user_id<>k.user_id THEN RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='session ingest: batch owner mismatch'; END IF;
       IF v_batch.digest <> k.digest THEN
         RETURN jsonb_build_object('kind', 'batch_conflict', 'currentDigest', v_batch.digest);
       END IF;
@@ -205,7 +289,19 @@ BEGIN
     WHERE d.org_id=k.org_id AND d.workspace_id=k.workspace_id AND d.user_id=k.user_id
       AND d.origin_id=k.origin_id AND d.source=s.source AND d.session_id=s.session_id)
   ON CONFLICT DO NOTHING;
-  RETURN jsonb_build_object('kind', v_state, 'deleted', v_deleted, 'stale', v_stale, 'resets', v_resets);
+  IF v_state IN ('claimed','resume') THEN
+    v_token:=gen_random_uuid();
+    SELECT coalesce(jsonb_agg(jsonb_build_object('source',x.source,'session_id',x.session_id,'epoch',coalesce(f.epoch,0),'reset_epoch',v_resets)
+      ORDER BY x.source COLLATE "C",x.session_id COLLATE "C"),'[]'::jsonb) INTO v_epochs
+    FROM (SELECT q.source,q.session_id FROM sessions.ingest_session_pairs(p -> 'sessions') AS q
+          UNION SELECT i.source,i.session_id FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
+           WHERE i.session_id IS NOT NULL) AS x
+    LEFT JOIN sessions.ingest_fence_versions AS f ON f.org_id=k.org_id AND f.workspace_id=k.workspace_id
+      AND f.user_id=k.user_id AND f.origin_id=k.origin_id AND f.source=x.source AND f.session_id=x.session_id;
+    INSERT INTO sessions.ingest_claim_attempts(claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,epochs)
+    VALUES(v_token,k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,v_epochs);
+  END IF;
+  RETURN jsonb_build_object('kind', v_state, 'claimToken',v_token, 'deleted', v_deleted, 'stale', v_stale, 'resets', v_resets);
 END
 $claim$;
 
@@ -222,10 +318,14 @@ DECLARE
   v_items jsonb;
   v_claimed_at timestamptz;
   v_rearmed integer;
+  v_epochs jsonb;
+  v_fenced jsonb;
+  v_pairs jsonb;
+  v_invalidated boolean;
 BEGIN
   PERFORM sessions.ingest_require_role('bulls96_session_ingest');
   PERFORM sessions.ingest_exact_keys(p,
-    ARRAY['tenant', 'originId', 'batchId', 'batchDigest', 'sessions', 'records', 'machineId']);
+    ARRAY['tenant', 'originId', 'batchId', 'batchDigest', 'sessions', 'records', 'machineId', 'claimToken']);
   k := sessions.ingest_batch_key(p);
   IF jsonb_typeof(p -> 'machineId') IS DISTINCT FROM 'string'
      OR (p ->> 'machineId') !~ '^srv_[0-9a-f]{32}$' THEN
@@ -237,14 +337,24 @@ BEGIN
 
   PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
 
-  -- Batch lock follows fence lock.
-  UPDATE sessions.ingest_batches AS b
-     SET state = 'committed', committed_at = coalesce(b.committed_at, now())
-   WHERE b.org_id = k.org_id AND b.workspace_id = k.workspace_id
-     AND b.origin_id = k.origin_id AND b.batch_id = k.batch_id AND b.digest = k.digest
-  RETURNING b.claimed_at INTO v_claimed_at;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION USING ERRCODE = 'P0002', MESSAGE = 'session ingest: no claim for this batch';
+  v_epochs:=sessions.ingest_attempt_epochs(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,p->>'claimToken');
+  v_pairs:=(SELECT coalesce(jsonb_agg(jsonb_build_array(x.source,x.session_id)),'[]'::jsonb)
+    FROM (SELECT q.source,q.session_id FROM sessions.ingest_session_pairs(p->'sessions') AS q
+          UNION SELECT i.source,i.session_id FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
+            WHERE i.session_id IS NOT NULL) AS x);
+  v_fenced:=sessions.ingest_attempt_fenced(k.org_id,k.workspace_id,k.user_id,k.origin_id,v_epochs,v_pairs);
+  SELECT EXISTS(SELECT 1 FROM jsonb_array_elements(v_fenced) AS x(pair)
+    WHERE NOT EXISTS(SELECT 1 FROM sessions.upload_deletions AS d
+      WHERE d.org_id=k.org_id AND d.workspace_id=k.workspace_id AND d.user_id=k.user_id
+        AND d.origin_id=k.origin_id AND d.source=x.pair->>0 AND d.session_id=x.pair->>1))
+    INTO v_invalidated;
+  SELECT b.claimed_at INTO v_claimed_at FROM sessions.ingest_batches AS b
+   WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id AND b.origin_id=k.origin_id
+     AND b.batch_id=k.batch_id AND b.digest=k.digest AND b.user_id=k.user_id FOR UPDATE;
+  IF NOT v_invalidated THEN
+    UPDATE sessions.ingest_batches AS b SET state='committed',committed_at=coalesce(b.committed_at,now())
+     WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id AND b.origin_id=k.origin_id
+       AND b.batch_id=k.batch_id AND b.digest=k.digest AND b.user_id=k.user_id;
   END IF;
 
   -- The written revisions become stored: per record its highest (first in identity
@@ -257,9 +367,8 @@ BEGIN
          i.record_id, i.revision, i.revision_id, i.digest, k.user_id, i.source, i.session_id
     FROM jsonb_to_recordset(v_items) AS i(ord integer, source text, session_id text, record_id text,
                                           revision_id text, revision bigint, digest text)
-   WHERE i.session_id IS NULL OR NOT EXISTS (SELECT 1 FROM sessions.upload_deletions AS d
-     WHERE d.org_id=k.org_id AND d.workspace_id=k.workspace_id AND d.user_id=k.user_id
-       AND d.origin_id=k.origin_id AND d.source=i.source AND d.session_id=i.session_id)
+   WHERE i.session_id IS NULL OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(v_fenced) AS f(pair)
+     WHERE f.pair->>0=i.source AND f.pair->>1=i.session_id)
    ORDER BY i.record_id, i.revision DESC, i.revision_id, i.ord
   ON CONFLICT (org_id, workspace_id, origin_id, record_id) DO UPDATE
      SET revision = EXCLUDED.revision, revision_id = EXCLUDED.revision_id,
@@ -270,17 +379,7 @@ BEGIN
   -- The fence again: a tombstone, or a reset since the claim, that this batch's
   -- objects may have outrun. Those sessions are swept again.
   WITH reached AS (
-    SELECT s.source, s.session_id
-      FROM (SELECT x.source,x.session_id FROM sessions.ingest_session_pairs(p -> 'sessions') AS x
-            UNION SELECT i.source,i.session_id FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
-              WHERE i.session_id IS NOT NULL) AS s
-     WHERE EXISTS (SELECT 1 FROM sessions.upload_deletions AS d
-                    WHERE d.org_id = k.org_id AND d.workspace_id = k.workspace_id
-                      AND d.user_id = k.user_id AND d.origin_id = k.origin_id
-                      AND d.source = s.source AND d.session_id = s.session_id)
-        OR EXISTS (SELECT 1 FROM sessions.upload_resets AS r
-                    WHERE r.org_id = k.org_id AND r.workspace_id = k.workspace_id
-                      AND r.user_id = k.user_id AND r.reset_at >= v_claimed_at)
+    SELECT x.pair->>0 AS source,x.pair->>1 AS session_id FROM jsonb_array_elements(v_fenced) AS x(pair)
   ), queued AS (
     INSERT INTO sessions.upload_erasure_rearm
            (org_id, workspace_id, user_id, origin_id, machine_id, source, session_id)
@@ -289,7 +388,7 @@ BEGIN
     ON CONFLICT DO NOTHING
   )
   SELECT count(*)::integer INTO v_rearmed FROM reached;
-  RETURN jsonb_build_object('rearmed', v_rearmed);
+  RETURN jsonb_build_object('rearmed', v_rearmed,'invalidated',v_invalidated);
 END
 $commit$;
 
@@ -310,6 +409,9 @@ BEGIN
      WHERE d.org_id = p_org AND d.workspace_id = p_ws AND d.user_id = p_user
        AND d.origin_id = p_origin AND d.source = s.source AND d.session_id = s.session_id;
   ELSE
+    INSERT INTO sessions.ingest_fence_versions AS f(org_id,workspace_id,user_id,origin_id,source,session_id,epoch)
+    SELECT DISTINCT p_org,p_ws,p_user,p_origin,x.source,x.session_id,1 FROM sessions.ingest_fence_pairs(p_sessions) AS x
+    ON CONFLICT(org_id,workspace_id,user_id,origin_id,source,session_id) DO UPDATE SET epoch=f.epoch+1;
     INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id)
     SELECT DISTINCT p_org, p_ws, p_user, p_origin, s.source, s.session_id
       FROM sessions.ingest_fence_pairs(p_sessions) AS s
@@ -350,6 +452,10 @@ BEGIN
     UNION
     SELECT o.origin_id,o.source,o.session_id FROM sessions.ingest_session_ownership AS o
      WHERE o.org_id=p_org AND o.workspace_id=p_ws AND o.user_id=p_user
+  ), versioned AS (
+    INSERT INTO sessions.ingest_fence_versions AS f(org_id,workspace_id,user_id,origin_id,source,session_id,epoch)
+    SELECT p_org,p_ws,p_user,o.origin_id,o.source,o.session_id,1 FROM owned AS o
+    ON CONFLICT(org_id,workspace_id,user_id,origin_id,source,session_id) DO UPDATE SET epoch=f.epoch+1
   ), fenced AS (
     INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id)
     SELECT p_org, p_ws, p_user, o.origin_id, o.source, o.session_id FROM owned AS o
@@ -379,9 +485,12 @@ DECLARE
   v_items jsonb;
   v_committed integer;
   v_rearmed integer;
+  v_epochs jsonb;
+  v_fenced jsonb;
+  v_pairs jsonb;
 BEGIN
   PERFORM sessions.ingest_require_role('bulls96_session_ingest');
-  PERFORM sessions.ingest_exact_keys(p, ARRAY['tenant', 'originId', 'machineId', 'records']);
+  PERFORM sessions.ingest_exact_keys(p, ARRAY['tenant', 'originId', 'machineId', 'records','batchDigest','claimToken']);
   t := p -> 'tenant';
   PERFORM sessions.ingest_exact_keys(t, ARRAY['orgId', 'workspaceId', 'userId']);
   v_org := sessions.ingest_identifier(t -> 'orgId', false);
@@ -394,15 +503,17 @@ BEGIN
   v_machine := p ->> 'machineId';
   v_items := sessions.ingest_records(p -> 'records');
   PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
+  v_epochs:=sessions.ingest_attempt_epochs(v_org,v_ws,v_user,v_origin,
+    NULL,sessions.ingest_digest(p->'batchDigest'),p->>'claimToken');
+  v_pairs:=(SELECT coalesce(jsonb_agg(jsonb_build_array(x.source,x.session_id)),'[]'::jsonb)
+    FROM (SELECT DISTINCT i.source,i.session_id FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
+      WHERE i.session_id IS NOT NULL) AS x);
+  v_fenced:=sessions.ingest_attempt_fenced(v_org,v_ws,v_user,v_origin,v_epochs,v_pairs);
   WITH items AS (
     SELECT * FROM jsonb_to_recordset(v_items) AS i(ord integer, source text, session_id text, record_id text,
                                                     revision_id text, revision bigint, digest text)
   ), fenced AS (
-    SELECT DISTINCT i.source, i.session_id FROM items AS i
-     WHERE i.session_id IS NOT NULL AND EXISTS (
-       SELECT 1 FROM sessions.upload_deletions AS d
-        WHERE d.org_id = v_org AND d.workspace_id = v_ws AND d.user_id = v_user AND d.origin_id = v_origin
-          AND d.source = i.source AND d.session_id = i.session_id)
+    SELECT x.pair->>0 AS source,x.pair->>1 AS session_id FROM jsonb_array_elements(v_fenced) AS x(pair)
   ), rearm AS (
     INSERT INTO sessions.upload_erasure_rearm (org_id, workspace_id, user_id, origin_id, machine_id, source, session_id)
     SELECT v_org, v_ws, v_user, v_origin, v_machine, f.source, f.session_id FROM fenced AS f
@@ -427,3 +538,21 @@ BEGIN
   RETURN jsonb_build_object('committed', v_committed, 'rearmed', v_rearmed);
 END
 $crev$;
+
+CREATE OR REPLACE FUNCTION sessions.ingest_fanout_fence(p jsonb)
+RETURNS jsonb LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $ffence$
+DECLARE v_org text;v_ws text;v_user text;v_origin text;v_epochs jsonb;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','sessions','batchDigest','claimToken']);
+ PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);
+ v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);
+ v_origin:=sessions.ingest_identifier(p->'originId',false);
+ PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
+ v_epochs:=sessions.ingest_attempt_epochs(v_org,v_ws,v_user,v_origin,
+   NULL,sessions.ingest_digest(p->'batchDigest'),p->>'claimToken');
+ RETURN jsonb_build_object('deleted',sessions.ingest_attempt_fenced(v_org,v_ws,v_user,v_origin,v_epochs,p->'sessions'));
+END
+$ffence$;

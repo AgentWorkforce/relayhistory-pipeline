@@ -174,7 +174,7 @@ export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batc
   prepared.records.forEach((r, i) => {
     if (!stale.has(i) && !(r.session_id && deleted.has(pair(r.source, r.session_id)))) keep.push(i);
   });
-  const work = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, { ...base, stale: stale.size }, timing, mark, now);
+  const work = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, claim.claimToken, { ...base, stale: stale.size }, timing, mark, now);
   if (!deps.slots) return work();
   const holder = (deps.requestId ?? (() => crypto.randomUUID()))();
   const slot = await stage("slot", () => deps.ledger.acquireSlot({ tenant, holder, ...deps.slots! }));
@@ -196,6 +196,7 @@ async function writeAndCommit(
   deleted: Set<string>,
   keep: number[],
   resets: number,
+  claimToken: string,
   base: Omit<DeliverResult["stats"], "timing_ms">,
   timing: Record<string, number>,
   mark: (name: string) => void,
@@ -213,7 +214,7 @@ async function writeAndCommit(
     const key = await stage("staging", () =>
       stageGroups(
         deps.target,
-        { batch_digest: prepared.batchDigest, received_at: receivedAt.toISOString(), org_id: tenant.orgId, workspace_id: tenant.workspaceId, origin_id: prepared.originId, user_id: tenant.userId },
+        { claim_token: claimToken, batch_digest: prepared.batchDigest, received_at: receivedAt.toISOString(), org_id: tenant.orgId, workspace_id: tenant.workspaceId, origin_id: prepared.originId, user_id: tenant.userId },
         grouped.groups,
       ),
     );
@@ -253,6 +254,7 @@ async function writeAndCommit(
       originId: prepared.originId,
       batchId: prepared.batchId,
       batchDigest: prepared.batchDigest,
+      claimToken,
       sessions: writtenSessions,
       machineId,
       // A staged batch's revisions become stored only when the fan-out has written them

@@ -1,3 +1,5 @@
+-- Append-only release name; authored originally as 20261103010000_session_directory_event_metadata.sql.
+-- Original name never released/applied; original statement bodies preserved.
 -- Complete canonical-event metadata only; no prompt, transcript, opening-summary or
 -- exact activity projection. Existing rows are NOT ready until controlled replay.
 ALTER TABLE sessions.session_directory

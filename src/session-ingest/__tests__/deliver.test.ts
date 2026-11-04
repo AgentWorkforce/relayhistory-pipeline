@@ -543,7 +543,7 @@ describe("staging: a batch wider than one Worker invocation", () => {
     const now = new Date("2026-11-02T00:00:00Z");
     const { groups } = groupRecords(prepared.records, now);
     const target = { store, keyRoot: "96bulls", sleep: noSleep };
-    const key = await stageGroups(target, { batch_digest: prepared.batchDigest, received_at: now.toISOString(), org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", user_id: "user-1" }, groups);
+    const key = await stageGroups(target, { claim_token:crypto.randomUUID(),batch_digest: prepared.batchDigest, received_at: now.toISOString(), org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", user_id: "user-1" }, groups);
     for (const m of fanoutMessages(key, groups.length)) await fanout(target, m, (x) => new Uint8Array(zstdDecompressSync(x)));
     const manifests = (await listAll(store, "96bulls/org-a/v1")).filter((k) => k.endsWith("manifest.json"));
     expect(manifests).toHaveLength(2);

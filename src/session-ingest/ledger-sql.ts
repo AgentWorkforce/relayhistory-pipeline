@@ -1,6 +1,6 @@
 /**
  * The ledger over SQL: one call per claim and per commit, each to its
- * SECURITY DEFINER function (supabase/migrations/20261102010000_session_ingest_ledger.sql),
+ * SECURITY DEFINER function (supabase/migrations/20261104022000_session_ingest_ledger.sql),
  * as the `bulls96_session_ingest` login (supabase/bootstrap/session_ingest_role.sql).
  *
  * Failures become `LedgerUnavailableError` with a code only (the SQLSTATE
@@ -8,7 +8,7 @@
  * so they are never carried, logged or returned. A result that does not have
  * the shape the function promises is `ledger_bad_result`.
  */
-import type { LedgerRecord, SelectionInput } from "./ledger.ts";
+import type { StagedAttempt, LedgerRecord, SelectionInput } from "./ledger.ts";
 import {
   LedgerUnavailableError,
   type ClaimInput,
@@ -134,7 +134,10 @@ export function parseClaimResult(r: Record<string, unknown>): ClaimResult {
     case "replay_fast":
       if (typeof r.resets !== "number" || !Number.isSafeInteger(r.resets) || r.resets < 0)
         throw new LedgerUnavailableError("ledger_bad_result");
-      return { kind: r.kind, deleted: pairs(r.deleted), stale: indexes(r.stale), resets: r.resets };
+      if (r.kind === "replay_fast") return { kind: r.kind, deleted: pairs(r.deleted), stale: indexes(r.stale), resets: r.resets };
+      if (typeof r.claimToken !== "string" || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(r.claimToken))
+        throw new LedgerUnavailableError("ledger_bad_result");
+      return { kind: r.kind, claimToken: r.claimToken, deleted: pairs(r.deleted), stale: indexes(r.stale), resets: r.resets };
     case "replay":
       if (typeof r.receiptId !== "string" || !/^rhr_[0-9a-f]{64}$/.test(r.receiptId))
         throw new LedgerUnavailableError("ledger_bad_result");
@@ -161,8 +164,9 @@ export function sqlLedger(run: SqlRun): Ledger {
     },
     async commit(input: CommitInput): Promise<CommitResult> {
       const r = (await call(run, "ingest_commit_batch", input)) as Record<string, unknown>;
-      if (typeof r.rearmed !== "number" || !Number.isSafeInteger(r.rearmed) || r.rearmed < 0)
+      if (typeof r.rearmed !== "number" || !Number.isSafeInteger(r.rearmed) || r.rearmed < 0 || typeof r.invalidated !== "boolean")
         throw new LedgerUnavailableError("ledger_bad_result");
+      if (r.invalidated === true) throw new LedgerUnavailableError("ledger_attempt_superseded");
       return { rearmed: r.rearmed };
     },
     async acquireSlot(request: SlotRequest): Promise<SlotResult> {
@@ -189,16 +193,15 @@ export function sqlLedger(run: SqlRun): Ledger {
       const r = (await call(run, "ingest_set_session_uploads", input)) as Record<string, unknown>;
       if (typeof r.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
     },
-    async fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][]): Promise<[string, string][]> {
-      if (sessions.length === 0) return [];
-      const r = (await call(run, "ingest_fanout_fence", { tenant, originId, sessions })) as Record<string, unknown>;
+    async fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][], attempt: StagedAttempt): Promise<[string, string][]> {
+      const r = (await call(run, "ingest_fanout_fence", { tenant, originId, sessions, batchDigest: attempt.batchDigest, claimToken: attempt.claimToken })) as Record<string, unknown>;
       if (!Array.isArray(r.deleted) || !r.deleted.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === "string" && typeof p[1] === "string"))
         throw new LedgerUnavailableError("ledger_bad_result");
       return r.deleted as [string, string][];
     },
-    async commitRevisions(tenant: LedgerTenant, originId: string, machineId: string, records: LedgerRecord[]) {
+    async commitRevisions(tenant: LedgerTenant, originId: string, machineId: string, records: LedgerRecord[], attempt: StagedAttempt) {
       if (records.length === 0) return { committed: 0, rearmed: 0 };
-      const r = (await call(run, "ingest_commit_revisions", { tenant, originId, machineId, records })) as Record<string, unknown>;
+      const r = (await call(run, "ingest_commit_revisions", { tenant, originId, machineId, records, batchDigest: attempt.batchDigest, claimToken: attempt.claimToken })) as Record<string, unknown>;
       if (typeof r.committed !== "number" || typeof r.rearmed !== "number") throw new LedgerUnavailableError("ledger_bad_result");
       return { committed: r.committed, rearmed: r.rearmed };
     },

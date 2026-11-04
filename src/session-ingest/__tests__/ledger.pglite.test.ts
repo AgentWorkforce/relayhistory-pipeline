@@ -1,5 +1,5 @@
 /**
- * The session ingest ledger (20261102010000_session_ingest_ledger.sql) in PGlite
+ * The session ingest ledger (20261104022000_session_ingest_ledger.sql) in PGlite
  * with every Supabase migration and the role bootstrap, called through
  * `sqlLedger` AS bulls96_session_ingest (SET ROLE), as production logs in.
  */
@@ -36,12 +36,20 @@ async function database(): Promise<PGlite> {
   return db;
 }
 
+const attempts=new Map<string,string>();
+const attemptKey=(c:ClaimInput)=>JSON.stringify([c.tenant,c.originId,c.batchId,c.batchDigest]);
+const attempt=(c:ClaimInput)=>({batchId:c.batchId,batchDigest:c.batchDigest,claimToken:attempts.get(attemptKey(c))??"00000000-0000-0000-0000-000000000000"});
 /** Each call runs as `role`, the way one pooled login would. */
 function runAs(db: PGlite, role = "bulls96_session_ingest") {
   return async (text: string, params: unknown[]) => {
     await db.exec(`SET ROLE ${role}`);
     try {
-      return (await db.query(text, params)) as { rows: Record<string, unknown>[] };
+      const out=(await db.query(text, params)) as { rows: Record<string, unknown>[] };
+      if(text.includes("ingest_claim_batch")&&params[0]) {
+        const result=out.rows[0]?.result as {claimToken?:string};
+        if(result?.claimToken)attempts.set(attemptKey(JSON.parse(String(params[0]))),result.claimToken);
+      }
+      return out;
     } finally {
       await db.exec("RESET ROLE");
     }
@@ -82,11 +90,12 @@ const commitInput = (c: ClaimInput, sessions = c.sessions, records = c.records):
   originId: c.originId,
   batchId: c.batchId,
   batchDigest: c.batchDigest,
+  claimToken:attempt(c).claimToken,
   sessions,
   records,
   machineId: MACHINE,
 });
-const MIGRATION = read("supabase/migrations/20261102010000_session_ingest_ledger.sql");
+const MIGRATION = read("supabase/migrations/20261104022000_session_ingest_ledger.sql");
 const revisions = async (db: PGlite) =>
   (await db.query("SELECT record_id, revision, revision_id, digest FROM sessions.ingest_record_revisions ORDER BY record_id")).rows;
 const state = async (db: PGlite, batchId = "batch-1") =>
@@ -99,7 +108,7 @@ async function land(ledger: ReturnType<typeof sqlLedger>, c: ClaimInput) {
 }
 
 describe("session ingest roles: provisioned by the bootstrap, verified by the migration (review High 1)", () => {
-  const MIGRATION = "supabase/migrations/20261102010000_session_ingest_ledger.sql";
+  const MIGRATION = "supabase/migrations/20261104022000_session_ingest_ledger.sql";
   async function upTo(bootstrap: (db: PGlite) => Promise<void>) {
     const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
     open.push(db);
@@ -172,7 +181,7 @@ describe("session ingest ledger", () => {
     const db = await database();
     const ledger = sqlLedger(runAs(db));
     const c = claimInput();
-    expect(await ledger.claim(c)).toEqual({ kind: "claimed", deleted: [], stale: [], resets: 0 });
+    expect(await ledger.claim(c)).toEqual({ claimToken:expect.any(String),kind: "claimed", deleted: [], stale: [], resets: 0 });
     expect(await state(db)).toBe("pending");
     expect(await revisions(db)).toEqual([]);
     expect(await ledger.commit(commitInput(c))).toEqual({ rearmed: 0 });
@@ -187,7 +196,7 @@ describe("session ingest ledger", () => {
     const c = claimInput({ records: [rec("r1", 1, "1"), rec("r2", 1, "1")] });
     await ledger.claim(c);
     // The commit never ran (the writer stopped): nothing is stored, so a retry writes again.
-    expect(await ledger.claim(c)).toEqual({ kind: "resume", deleted: [], stale: [], resets: 0 });
+    expect(await ledger.claim(c)).toEqual({claimToken:expect.any(String), kind: "resume", deleted: [], stale: [], resets: 0 });
   });
 
   test("a record of a still-pending batch is not stale for another batch; after commit it is", async () => {
@@ -196,10 +205,10 @@ describe("session ingest ledger", () => {
     const c = claimInput();
     await ledger.claim(c);
     const other = claimInput({ batchId: "batch-2", batchDigest: hex("b"), records: [rec("r1", 1, "1"), rec("r5", 1, "5")] });
-    expect(await ledger.claim(other)).toEqual({ kind: "claimed", deleted: [], stale: [], resets: 0 });
+    expect(await ledger.claim(other)).toEqual({ claimToken:expect.any(String),kind: "claimed", deleted: [], stale: [], resets: 0 });
     await ledger.commit(commitInput(c));
     const third = claimInput({ batchId: "batch-3", batchDigest: hex("c"), records: [rec("r5", 1, "5"), rec("r1", 1, "1")] });
-    expect(await ledger.claim(third)).toEqual({ kind: "claimed", deleted: [], stale: [1], resets: 0 });
+    expect(await ledger.claim(third)).toEqual({ claimToken:expect.any(String),kind: "claimed", deleted: [], stale: [1], resets: 0 });
   });
 
   test("another digest under a batch id is a batch conflict, pending or committed", async () => {
@@ -219,7 +228,7 @@ describe("session ingest ledger", () => {
     const ledger = sqlLedger(runAs(db));
     await land(ledger, claimInput({ records: [rec("r1", 1, "1"), rec("r2", 1, "1")] }));
     const c = claimInput({ batchId: "batch-2", batchDigest: hex("b"), records: [rec("r1", 1, "9", "r1:other"), rec("r3", 1, "3")] });
-    expect(await ledger.claim(c)).toEqual({ kind: "claimed", deleted: [], stale: [0], resets: 0 });
+    expect(await ledger.claim(c)).toEqual({ claimToken:expect.any(String),kind: "claimed", deleted: [], stale: [0], resets: 0 });
     // Even if a caller committed it as written, the equal revision keeps the stored row.
     await ledger.commit(commitInput(c));
     expect(await revisions(db)).toEqual([
@@ -235,7 +244,7 @@ describe("session ingest ledger", () => {
     await land(ledger, claimInput({ records: [rec("r1", 5, "5"), rec("r2", 1, "1")] }));
     // Stale even when reused with other content in the batch: no twin 409 below the stored revision.
     const c = claimInput({ batchId: "batch-2", batchDigest: hex("b"), records: [rec("r2", 2, "2"), rec("r1", 3, "3", "x"), rec("r1", 3, "4", "y")] });
-    expect(await ledger.claim(c)).toEqual({ kind: "claimed", deleted: [], stale: [1, 2], resets: 0 });
+    expect(await ledger.claim(c)).toEqual({ claimToken:expect.any(String),kind: "claimed", deleted: [], stale: [1, 2], resets: 0 });
     await ledger.commit(commitInput(c));
     expect((await revisions(db)).map((r) => [r.record_id, r.revision])).toEqual([["r1", 5], ["r2", 2]]);
   });
@@ -327,7 +336,7 @@ describe("session ingest ledger", () => {
     );
     const ledger = sqlLedger(runAs(db));
     const r = await ledger.claim(claimInput({ sessions: [["claude", "s-1"], ["claude", "s-2"], ["codex", "s-2"]] }));
-    expect(r).toEqual({ kind: "claimed", deleted: [["claude", "s-2"]], stale: [], resets: 0 });
+    expect(r).toEqual({ claimToken:expect.any(String),kind: "claimed", deleted: [["claude", "s-2"]], stale: [], resets: 0 });
   });
 
   test("records of a deleted session are not judged: a twin there is no 409", async () => {
@@ -338,7 +347,7 @@ describe("session ingest ledger", () => {
       sessions: [["claude", "s-1"], ["claude", "s-2"]],
       records: [rec("r1", 1, "1"), rec("r9", 1, "1", "r9:a", ["claude", "s-2"]), rec("r9", 1, "2", "r9:b", ["claude", "s-2"])],
     });
-    expect(await ledger.claim(c)).toEqual({ kind: "claimed", deleted: [["claude", "s-2"]], stale: [], resets: 0 });
+    expect(await ledger.claim(c)).toEqual({ claimToken:expect.any(String),kind: "claimed", deleted: [["claude", "s-2"]], stale: [], resets: 0 });
     // A record with no session is judged as before.
     const none = claimInput({ batchId: "batch-3", batchDigest: hex("c"), sessions: [], records: [rec("r8", 1, "1", "a", ["claude", null]), rec("r8", 1, "2", "b", ["claude", null])] });
     expect((await ledger.claim(none)).kind).toBe("revision_conflict");
@@ -349,7 +358,7 @@ describe("session ingest ledger", () => {
     await db.query(`INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id) VALUES
       ('org-a', 'ws-a', 'user-1', 'q1'), ('org-a', 'ws-a', 'user-1', 'q2'), ('org-a', 'ws-a', 'user-2', 'q3')`);
     const ledger = sqlLedger(runAs(db));
-    expect(await ledger.claim(claimInput())).toEqual({ kind: "claimed", deleted: [], stale: [], resets: 2 });
+    expect(await ledger.claim(claimInput())).toEqual({ claimToken:expect.any(String),kind: "claimed", deleted: [], stale: [], resets: 2 });
   });
 
   test("a tombstone after the claim re-arms erasure at commit, once", async () => {
@@ -376,8 +385,7 @@ describe("session ingest ledger", () => {
     expect(await ledger.commit(commitInput(c))).toEqual({ rearmed: 0 });
     const c2 = claimInput({ batchId: "batch-2", batchDigest: hex("b"), records: [rec("r2", 1, "1")], sessions: [["claude", "s-1"], ["claude", "s-2"]] });
     await ledger.claim(c2);
-    await db.query(`UPDATE sessions.ingest_batches SET claimed_at = now() - interval '1 minute' WHERE batch_id = 'batch-2'`);
-    await db.query(`INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id) VALUES ('org-a', 'ws-a', 'user-1', 'new')`);
+    await ledger.resetUploadedSessions(tenant,"new");
     expect(await ledger.commit(commitInput(c2))).toEqual({ rearmed: 2 });
   });
 
@@ -561,14 +569,16 @@ describe("staged fan-out SQL (review Medium)", () => {
     const db = await database();
     const ledger = sqlLedger(runAs(db));
     await ledger.setSessionUploads({ tenant, originId: "origin-1", sessions: [["claude", "gone"]], enabled: false });
-    expect(await ledger.fanoutFence(tenant, "origin-1", [["claude", "s-1"], ["claude", "gone"]])).toEqual([["claude", "gone"]]);
-    const out = await ledger.commitRevisions(tenant, "origin-1", MACHINE, [rec("a", 2, "1"), rec("g", 1, "1", "g:r1", ["claude", "gone"])]);
+    const c=claimInput({sessions:[["claude","s-1"],["claude","gone"]],records:[rec("a",2,"1"),rec("g",1,"1","g:r1",["claude","gone"])]});
+    await ledger.claim(c);
+    expect(await ledger.fanoutFence(tenant, "origin-1", [["claude", "s-1"], ["claude", "gone"]],attempt(c))).toEqual([["claude", "gone"]]);
+    const out = await ledger.commitRevisions(tenant, "origin-1", MACHINE, [rec("a", 2, "1"), rec("g", 1, "1", "g:r1", ["claude", "gone"])],attempt(c));
     expect(out).toEqual({ committed: 1, rearmed: 1 });
     expect((await revisions(db)).map((r) => r.record_id)).toEqual(["a"]);
     const rearm = await db.query("SELECT session_id FROM sessions.upload_erasure_rearm");
     expect(rearm.rows).toEqual([{ session_id: "gone" }]);
     // Idempotent, and never lowers.
-    expect(await ledger.commitRevisions(tenant, "origin-1", MACHINE, [rec("a", 1, "1")])).toEqual({ committed: 0, rearmed: 0 });
+    expect(await ledger.commitRevisions(tenant, "origin-1", MACHINE, [rec("a", 1, "1")],attempt(c))).toEqual({ committed: 0, rearmed: 0 });
   });
 });
 
@@ -587,8 +597,8 @@ describe("pending session ownership fences", () => {
     await ledger.claim(c);await ledger.commit(commitInput(c,c.sessions,[]));
     expect(await revisions(db)).toEqual([]);
     expect(await ledger.resetUploadedSessions(tenant,"staged-reset")).toBe(1);
-    expect(await ledger.fanoutFence(tenant,c.originId,c.sessions)).toEqual(c.sessions);
-    expect(await ledger.commitRevisions(tenant,c.originId,MACHINE,c.records)).toEqual({committed:0,rearmed:1});
+    expect(await ledger.fanoutFence(tenant,c.originId,c.sessions,attempt(c))).toEqual(c.sessions);
+    expect(await ledger.commitRevisions(tenant,c.originId,MACHINE,c.records,attempt(c))).toEqual({committed:0,rearmed:1});
     expect(await revisions(db)).toEqual([]);
   });
   test("ownership reset remains scoped by tenant, workspace and user", async () => {
@@ -598,7 +608,7 @@ describe("pending session ownership fences", () => {
       await ledger.claim({...c,tenant:t,batchId:"other-"+t.orgId+t.workspaceId+t.userId});
       expect(await ledger.resetUploadedSessions(t,"isolated")).toBe(1);
     }
-    expect(await ledger.fanoutFence(tenant,c.originId,c.sessions)).toEqual([]);
+    expect(await ledger.fanoutFence(tenant,c.originId,c.sessions,attempt(c))).toEqual([]);
     expect(await ledger.resetUploadedSessions(tenant,"own-reset")).toBe(1);
   });
 });

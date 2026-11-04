@@ -74,7 +74,7 @@ const BRIEFS_UP = read(`supabase/migrations/${BRIEFS}`);
 const BRIEFS_DOWN = read(
   `supabase/rollbacks/${BRIEFS.replace(/\.sql$/, ".down.sql")}`,
 );
-const EVENTS = "20261103010000_session_directory_event_metadata.sql";
+const EVENTS = "20261104021000_session_directory_event_metadata.sql";
 const EVENTS_UP = read(`supabase/migrations/${EVENTS}`);
 const EVENTS_DOWN = read(`supabase/rollbacks/${EVENTS.replace(/\.sql$/, ".down.sql")}`);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;

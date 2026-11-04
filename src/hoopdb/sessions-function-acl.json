@@ -56,6 +56,12 @@
     ],
     "sessions.ingest_fence_pairs(jsonb)": ["<owner>:EXECUTE"],
     "sessions.ingest_identifier(jsonb,boolean)": ["<owner>:EXECUTE"],
+    "sessions.ingest_attempt_epochs(text,text,text,text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_attempt_fenced(text,text,text,text,jsonb,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_lock_fences(text,text,text)": ["<owner>:EXECUTE"],
     "sessions.ingest_records(jsonb)": ["<owner>:EXECUTE"],
     "sessions.ingest_release_slot(jsonb)": [

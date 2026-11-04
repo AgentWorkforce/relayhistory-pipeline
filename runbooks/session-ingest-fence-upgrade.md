@@ -1,32 +1,47 @@
-# Pending upload fencing upgrade
+# Upload fence generation release
 
-Append migration `20261104030000_ingest_fence_ownership.sql` after the existing ingest ledger. It preserves non-fenced committed revisions, removes previously reinserted fenced replay entries, backfills session ownership, and replaces only ledger decisions. New tables contain tenant/session identifiers, with RLS and no direct runtime table grants. Existing function grants and authenticated binding identity are unchanged.
+Apply the release union in append order: existing main auth migrations 20261104020000/20261104020100, then20261104021000 event metadata,20261104022000 ingest ledger,20261104030000 repair. The formerly unlanded event/ingest files retain their original statement bodies and provenance names in comments. No applied auth migration bytes change. Never adopt a database containing an unreleased old filename by guessing a checksum or marking it applied.
 
-Claims record non-fenced session ownership before acknowledgement, including staged batches whose receipt commits no revisions. Reset enumerates both committed revisions and that ownership. Disable/reset remove ownership together with revisions. A fresh post-enable claim registers the session again. Source and session remain distinct; records without a session retain the prior non-reset semantics.
+The repair preserves non-fenced committed revisions, removes previously reinserted fenced replay entries, and backfills session ownership. New tables contain metadata only and have RLS with no direct runtime table grants. Existing authenticated binding/role contracts stay unchanged; three internal helpers are owner-only and part of both exact ACL manifests.
 
-Claim, direct commit, fanout revision commit, selection, and reset acquire one short row lock keyed by `(org_id,workspace_id,user_id)` before fence decisions. Object reads/writes and queue publication remain outside those transactions. Direct commits exclude currently fenced revisions and rearm erasure for written sessions; fanout commits retain the same rearm behavior. Different users/workspaces do not share this lock. This serializes SQL decisions, not complete uploads.
+Claims register pending session ownership before acknowledgement, including staged batches whose receipt commits no revisions. Reset enumerates that ownership as well as stored revisions. Claim, direct commit, fanout fence/commit, selection and reset use one short SQL row lock keyed by(org,workspace,user); S3 IO and queue publication stay outside those transactions. Different users/workspaces do not share the row lock.
 
-## Operator prerequisites
+Persistent per-session epochs survive re-enable. Disable increments the addressed epoch; reset increments each discovered session epoch. The append-only upload_resets count also fences a reset that discovered no ownership. Every claimed/resumed attempt receives a server UUID and immutable epoch/reset-count snapshot. A resume never replaces the snapshot used by an older nonce. Lookup uses the nonce primary key plus exact tenant/origin/digest and its original batch relationship.
 
-Before applying this migration or enabling the upgraded writer, stop new ingest requests and drain/reconcile any pre-upgrade acknowledged staged receipts and pending claims. Their session membership was not recorded in SQL, so the migration cannot infer it from old empty-revision commits. Verify the pending queue/receipts directly; an empty revision ledger alone is insufficient. With a never-enabled dedicated writer, establish that no pre-upgrade receipts exist. Do not use unproven historical revision seeding as a substitute.
+Direct commits exclude any snapshot-invalid session from the replay index and enqueue erasure rearm. If a session changed generations and is now enabled, the batch remains pending and the Worker returns retryable 503; a new attempt rewrites it before acknowledgement. Unaffected records in a mixed batch retain their normal committed revision. Currently deleted sessions keep the existing acknowledge-as-deleted behavior.
 
-For event-trigger boundary mode, refresh the reviewed boundary bootstrap/embedded ACL manifest before migrate; the new owner-only helper changes the pinned body hash. The exact runtime/helper grants remain unchanged. The updated migrator refuses an older installed boundary body.
+Staged objects keep additive v1 for the transitional Neon replica. Only the opaque claim_token is added to the header; no raw client batch id is newly stored there. The immutable object key also binds the nonce. Upgraded fanout requires that token, validates it before writes even for no-session groups, and uses its original snapshot at commit. Old missing-token headers fail closed. A generation change before fanout skips the old session; a change during object IO leaves its revision absent and rearms erasure. A re-enabled fresh upload can therefore restore actual bytes instead of receiving a false replay_fast.
 
-The migration and its backfill run transactionally through the existing migrator. No role creation, role mutation, extra credentials, S3 policy or Worker flag change is part of this change. Concurrent revision seeding remains an offline rollout operation, never an ingest-time activity.
+## Stable fence contract for offline seed capture
 
-Continue the existing erasure consumer and its rearm handling. A reset may finish while object IO is in flight; the late commit deliberately leaves revisions absent and enqueues another sweep. These tests prove queueing, not a deployed eraser's drain. Existing staged-root erasure/redrive policy remains a separate rollout check.
+After ingest_lock_fences(org,ws,user), compare all scope fields exactly:
 
-Rollback routing uses the approved ingest switch after stopping/draining active work. Retain the append migration and ownership rows; do not restore old function bodies or drop the new tables while uploads/fanout can still run. Never rewrite the applied original migration.
+- ingest_fence_versions PK(org_id,workspace_id,user_id,origin_id,source,session_id), epoch bigint>0; missing row means 0. Versions are never removed on enable.
+- upload_resets is append-only per(org_id,workspace_id,user_id,request_id); count(*)::text for the user scope is a monotonic reset epoch. Replaying the same request id adds nothing.
+- Capture both reset count and exact source/session epochs under that lock and compare them under the same lock at seed commit. Keep decimal bigint strings/SQL comparisons exact.
+- Known session ownership lives in ingest_session_ownership. Never delete/reset version rows, request rows or claim snapshots to bypass refusal.
+
+Concurrent revision seeding is not an ingest operation. The separate reviewed S3-proven seed prerequisite must replace the old unproven boolean-session seed before activation. This repair changes no revision column or seed RPC.
+
+## Operator prerequisites and rollback
+
+Stop new ingress and drain/reconcile all pre-upgrade pending claims, acknowledged staged receipts and redrives before applying/enabling the new RPC contract. Older receipts never stored the necessary nonce/session ownership, so an empty revision ledger cannot establish that they are safe. Establish that no such receipts exist for a never-enabled dedicated writer. Retain immutable attempts until all associated fanout work is complete.
+
+Migrate transactionally through the existing migrator. For event-trigger boundary mode, refresh the reviewed bootstrap/embedded manifest before migrate; the new owner-only helpers change the pinned body hash. A stale installed boundary refuses validation. No role creation/mutation, credentials, S3 policy, deploy or Worker switch is part of this source change.
+
+Continue the reviewed erasure consumer and rearm handling. These tests prove rearm queueing, not a deployed sweep. Actual eraser consumption, continuous Neon dual-fences where applicable, staged-root erasure/redrive policy and seed proof remain operator gates. Routing new uploads is independent of the historical search/read backfill.
+
+Rollback uses the approved ingress switch after stopping/draining active work. Keep the append migrations, version rows and attempts. Do not restore old function bodies/drop tables while old or new uploads/fanout can run.
 
 ## Reproduction
 
-Use only an owned disposable PostgreSQL cluster, as a role allowed to create disposable databases and test roles:
+Use only an owned disposable PostgreSQL cluster:
 
-```sh
-SESSION_INGEST_TEST_PG_URL=postgres://postgres@127.0.0.1:<owned-port>/postgres \
-  bun test src/session-ingest/__tests__/ledger-races.postgres.test.ts
-```
+    SESSION_INGEST_TEST_PG_URL=postgres://postgres@127.0.0.1:<owned-port>/postgres \
+      bun test src/session-ingest/__tests__/ledger-races.postgres.test.ts
 
-Each test creates and removes its own database and temporary filesystem object store. The real PostgreSQL suite proves disable/commit and reset/fanout interleavings, actual zstd bytes restored by re-upload, pending/staged reset coverage, tenant isolation, populated-ledger upgrade, and closed helper/table permissions. No SQL lock crosses the object-write barrier.
+The actual PostgreSQL suite creates/removes its own databases and filesystem stores. It proves real disable/commit and reset/fanout barriers, re-uploaded zstd bytes, immutable same-batch resume snapshots, nonce/scope rejection, mixed-batch preservation, and populated released-main upgrade. That upgrade requires the reviewed 4ddee50 Git ancestor to be available and checks its original migration bytes.
 
-Set `INGEST_RACE_MUTATION=no_serialization`, `no_pending_ownership`, or `no_commit_filter` to run discriminating controls against a modified copy of the migration in that disposable database. The checked-in SQL is not edited by these controls.
+Set REVIEW_RHC_REPLICA_MODULE to the frozen RHC265 at 0c41e7e neon-replica.ts module to additionally prove new-stage rebuild through its actual consumer, v2 rejection and missing-token refusal in upgraded fanout. No RHC source is edited.
+
+The INGEST_RACE_MUTATION choices(without the space) are no_serialization, no_pending_ownership, no_commit_filter, no_epoch_check and no_nonce_binding. Each removes one fence from a disposable SQL copy; the harness refuses a mutation that changes nothing. Run them serially or with a bounded fixture concurrency; no server connection-limit changes are needed.

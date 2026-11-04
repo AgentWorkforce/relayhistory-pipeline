@@ -1,3 +1,5 @@
+-- Append-only release name; authored originally as 20261102010000_session_ingest_ledger.sql.
+-- The original name was never released/applied. Original statement bodies preserved.
 -- The session ingest's ledger (src/session-ingest/ledger.ts): what relayhistory's
 -- `accept_delivery_batch` decided in Neon that is not transcript content, so the
 -- 96Bulls ingest (POST /v1/delivery/batches, a Cloudflare Worker) needs no Neon. Code only:

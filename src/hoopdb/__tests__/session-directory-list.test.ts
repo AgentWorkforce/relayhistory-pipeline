@@ -892,7 +892,7 @@ describe("migration up/down/up", () => {
     // The directory rows themselves survive the down.
     expect((await db.query("SELECT count(*)::int AS n FROM sessions.session_directory")).rows).toEqual([{ n: 6 }]);
     await db.exec(UP);
-    await db.exec(read("supabase/migrations/20261103010000_session_directory_event_metadata.sql"));
+    await db.exec(read("supabase/migrations/20261104021000_session_directory_event_metadata.sql"));
     expect(ids(await list(db, {}))).toEqual(["s1", "s2", "s3", "s4"]);
   });
 });
