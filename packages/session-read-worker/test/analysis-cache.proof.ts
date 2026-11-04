@@ -263,3 +263,72 @@ it("actual Node24 namespace publications preserve all three scoped histories and
     ((await (await fetch(base() + "/stats")).json()) as any).requests,
   ).toBe(0);
 });
+
+it("actual readonly-role title snapshots serve all namespaces from one compact wrapper each without hydrating analysis graphs", async () => {
+  const initial = await setup();
+  for (const item of initial.proof.namespaces) {
+    const claim = item.claim,
+      identity = item.identity;
+    await fetch(base() + "/reset");
+    const token =
+      "header." +
+      btoa(
+        JSON.stringify({
+          role: "session_directory_search_worker",
+          app_metadata: {
+            org_id: identity.orgId,
+            workspace_ids: [identity.workspaceId],
+          },
+        }),
+      ) +
+      ".signature";
+    let claims = 0;
+    const response = await canonicalAnalysisHandle(
+      new Request(
+        "https://read.test/v1/canonical/analyses/" +
+          encodeURIComponent(identity.sessionId) +
+          "?" +
+          new URLSearchParams({
+            workspace: identity.workspaceId,
+            source: identity.source,
+            view: "title",
+          }),
+        { headers: { authorization: "Bearer " + token } },
+      ),
+      { CANONICAL_READ_ENABLED: "true", CANONICAL_READ_MODE: "pages" },
+      () => {
+        throw Error("source/Neon/network forbidden");
+      },
+      {
+        ...initial.deps,
+        now: () => Date.parse(claim.snapshotAt) + 1000,
+        publication: async () => {
+          claims++;
+          return claim;
+        },
+      },
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as any;
+    expect(body.outcome).toBe("title");
+    expect(body.cachedBriefTitle).toEqual({
+      version: 1,
+      complete: true,
+      title: item.expectedTitle,
+    });
+    expect(body.payload).toBeUndefined();
+    expect(claims).toBe(2);
+    const stats = (await (await fetch(base() + "/stats")).json()) as any;
+    expect(stats.requests).toBe(1);
+    expect(stats.totalBytes).toBe(claim.index.bytes);
+    console.info(
+      "actual_title_namespace",
+      JSON.stringify({
+        identity,
+        bytes: stats.totalBytes,
+        objects: stats.requests,
+        title: body.cachedBriefTitle.title,
+      }),
+    );
+  }
+});

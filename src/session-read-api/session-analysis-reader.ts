@@ -20,6 +20,8 @@ import {
   ANALYSIS_MAX_HISTORY,
   analysisSnapshotJson,
   analysisGenerationJson,
+  analysisSourceSnapshotJson,
+  type CachedBriefTitle,
   type SessionAnalysisIndex,
   type SessionAnalysisSnapshot,
 } from "./session-analysis-artifact.ts";
@@ -132,18 +134,6 @@ function parseClaim(
     snapshotSha256: value.snapshotSha256,
     validUntil: value.validUntil,
   };
-  if (
-    digest(
-      analysisGenerationJson(
-        id,
-        claim.source,
-        claim.snapshotAt,
-        claim.snapshotId,
-        claim.snapshotSha256,
-      ),
-    ) !== claim.generation
-  )
-    fail("analysis_generation");
   return claim;
 }
 function sameClaim(a: Ready, b: Ready) {
@@ -160,9 +150,10 @@ function sameClaim(a: Ready, b: Ready) {
     a.validUntil === b.validUntil
   );
 }
-export async function readSessionAnalysisCache(
+async function readAnalysisCache(
   deps: AnalysisCacheDeps,
   identity: ArtifactIdentity,
+  titleOnly: boolean,
 ) {
   const stop = new AbortController(),
     signal = AbortSignal.any([deps.signal, stop.signal]),
@@ -185,6 +176,7 @@ export async function readSessionAnalysisCache(
         fresh.epoch !== ack.epoch
       )
         fail("source_generation_changed");
+      if (titleOnly) fail("analysis_title_not_ready");
       return {
         outcome: "not_found" as const,
         payload: { outcome: "not_found" as const },
@@ -223,7 +215,78 @@ export async function readSessionAnalysisCache(
         (loaded.counts[field] as number) > ANALYSIS_MAX_HISTORY
       )
         fail("analysis_history_bound");
+    let cachedBriefTitle: CachedBriefTitle | undefined;
+    let sourceSnapshotSha256: string | undefined;
+    if (
+      Object.hasOwn(loaded, "cachedBriefTitle") ||
+      Object.hasOwn(loaded, "sourceSnapshotSha256")
+    ) {
+      if (!obj(loaded.cachedBriefTitle) || !hash(loaded.sourceSnapshotSha256))
+        fail("analysis_title_attestation");
+      cachedBriefTitle = {
+        version: 1,
+        complete: true,
+        title: loaded.cachedBriefTitle.title as string | null,
+      };
+      // The shared canonicalizer validates complete/version/trimmed title before
+      // metadata can affect generation. Do not copy unknown wrapper properties.
+      if (
+        loaded.cachedBriefTitle.version !== 1 ||
+        loaded.cachedBriefTitle.complete !== true
+      )
+        fail("analysis_title_attestation");
+      let calculated: string;
+      try {
+        calculated = digest(
+          analysisSourceSnapshotJson(claim.snapshotSha256, cachedBriefTitle),
+        );
+      } catch {
+        fail("analysis_title_attestation");
+      }
+      if (calculated !== loaded.sourceSnapshotSha256)
+        fail("analysis_source_snapshot_digest");
+      sourceSnapshotSha256 = calculated;
+    }
+    if (
+      digest(
+        analysisGenerationJson(
+          identity,
+          claim.source,
+          claim.snapshotAt,
+          claim.snapshotId,
+          claim.snapshotSha256,
+          sourceSnapshotSha256,
+        ),
+      ) !== claim.generation
+    )
+      fail("analysis_generation");
+    if (
+      loaded.outcome === "not_found" &&
+      (loaded.counts.requests !== 0 || loaded.counts.analyses !== 0)
+    )
+      fail("analysis_index");
     assertArtifactReference(loaded.graph, claim.prefix);
+    if (titleOnly) {
+      if (!cachedBriefTitle || !sourceSnapshotSha256)
+        fail("analysis_title_not_ready");
+      const fresh = parseClaim(
+        await deps.publication(identity, signal),
+        identity,
+        now(),
+      );
+      if (!fresh.exists || !sameClaim(claim, fresh))
+        fail("source_generation_changed");
+      return {
+        outcome: "title" as const,
+        cachedBriefTitle,
+        sourceSnapshotSha256,
+        generation: claim.generation,
+        snapshotAt: claim.snapshotAt,
+        snapshotId: claim.snapshotId,
+        validUntil: claim.validUntil,
+      };
+    }
+
     const index = loaded as unknown as SessionAnalysisIndex;
     const graphClaim = {
       version: 1,
@@ -316,4 +379,23 @@ export async function readSessionAnalysisCache(
   } finally {
     stop.abort();
   }
+}
+
+type CacheReadResult = Awaited<ReturnType<typeof readAnalysisCache>>;
+export function readSessionAnalysisCache(
+  deps: AnalysisCacheDeps,
+  identity: ArtifactIdentity,
+): Promise<Exclude<CacheReadResult, { outcome: "title" }>> {
+  return readAnalysisCache(deps, identity, false) as Promise<
+    Exclude<CacheReadResult, { outcome: "title" }>
+  >;
+}
+/** Reads one SHA-bound compact wrapper; never hydrates v1 result graphs. */
+export function readSessionAnalysisTitle(
+  deps: AnalysisCacheDeps,
+  identity: ArtifactIdentity,
+): Promise<Extract<CacheReadResult, { outcome: "title" }>> {
+  return readAnalysisCache(deps, identity, true) as Promise<
+    Extract<CacheReadResult, { outcome: "title" }>
+  >;
 }
