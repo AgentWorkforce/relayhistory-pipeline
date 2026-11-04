@@ -1,8 +1,8 @@
+import { semanticCheckpoint } from "./semantic-copy-protocol.ts";
 import {
   readFeatureJournalPage,
   readFeatureBaselinePage,
   readFeatureSnapshots,
-  featureVersion,
   type FeatureReader,
 } from "./source.ts";
 import {
@@ -42,32 +42,15 @@ export async function copyEventFeaturePage(
   published: number;
   complete: boolean;
 }> {
-  if (
-    !Number.isInteger(batch) ||
-    batch < 1 ||
-    batch > 200 ||
-    !previous ||
-    !["baseline", "journal"].includes(previous.phase) ||
-    typeof previous.polled !== "boolean" ||
-    !(
-      previous.baselineCursor === null ||
-      typeof previous.baselineCursor === "string"
-    )
-  )
+  if (!Number.isInteger(batch) || batch < 1 || batch > 200)
     throw new EventFeatureError("checkpoint_invalid");
+  try {
+    semanticCheckpoint(previous);
+  } catch {
+    throw new EventFeatureError("checkpoint_invalid");
+  }
   if (previous.baselineH === null)
     throw new EventFeatureError("baseline_not_captured");
-  featureVersion(previous.baselineH);
-  featureVersion(previous.checkpoint);
-  featureVersion(previous.observedRevision);
-  if (
-    BigInt(previous.checkpoint) > BigInt(previous.observedRevision) ||
-    BigInt(previous.checkpoint) < BigInt(previous.baselineH) ||
-    (previous.phase === "baseline" &&
-      (previous.polled || previous.checkpoint !== previous.baselineH)) ||
-    (previous.phase === "journal" && previous.baselineCursor !== null)
-  )
-    throw new EventFeatureError("checkpoint_invalid");
   deps.signal?.throwIfAborted();
   if (previous.phase === "baseline") {
     const page = await readFeatureBaselinePage(

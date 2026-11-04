@@ -1,6 +1,11 @@
+import { createHash } from "node:crypto";
 /** Owned disposable PG17/CH26 proof; no environment credentials/production targets. */
 import pg from "pg";
-import { mkdir, writeFile } from "node:fs/promises";
+import {
+  eventFeatureRow,
+  publishEventFeatureSnapshots,
+} from "../src/search-features/event-publisher.ts";
+import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { createClickHouseClient } from "../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { eventFeatureSchemaStatements } from "../src/search-features/event-schema.ts";
 import { briefFeatureSchemaStatements } from "../src/search-features/brief-schema.ts";
@@ -12,6 +17,7 @@ import { publishBriefFeatureSnapshots } from "../src/search-features/brief-publi
 import {
   readFeatureBaselinePage,
   readFeatureJournalPage,
+  readFeatureSnapshots,
 } from "../src/search-features/source.ts";
 import {
   readLegacyCasefoldProfile,
@@ -27,7 +33,7 @@ if (
   !out?.includes("/relay-briefs/ch-event-feature-proof-20261103")
 )
   throw Error("owned fixture only");
-const name = "event_feature_fixture_codex",
+const name = "event_feature_fixture_codex_builtin",
   credentials = {
     host: "127.0.0.1",
     port: 32770,
@@ -37,7 +43,11 @@ const name = "event_feature_fixture_codex",
 const admin = new pg.Client({ ...credentials, database: "postgres" });
 await admin.connect();
 try {
-  await admin.query("CREATE DATABASE " + name);
+  await admin.query(
+    "CREATE DATABASE " +
+      name +
+      " TEMPLATE template0 LOCALE_PROVIDER builtin BUILTIN_LOCALE 'C.UTF-8' LC_COLLATE 'C.UTF-8' LC_CTYPE 'C.UTF-8'",
+  );
 } catch (e: any) {
   if (e.code !== "42P04") throw e;
 } finally {
@@ -329,9 +339,126 @@ try {
     published: r.published,
     complete: r.complete,
   });
+
+  state = r.next;
+  const reference = {
+    kind: "event" as const,
+    key: {
+      orgId: "org",
+      workspaceId: "ws",
+      source: "codex",
+      sessionId: "mutable",
+      machineId: "m",
+      kind: "prompt",
+      eventId: "mutable",
+      ts: "2026-11-01T10:00:00.000000Z",
+    },
+    revision: "0",
+    sourceHash: "a".repeat(64),
+    deleted: false,
+  };
+  const old = (await readFeatureSnapshots(db, [reference]))[0]!;
+  await pool.query(
+    "DELETE FROM sessions.convergence_events WHERE org_id='org' AND session_id='mutable'",
+  );
+  const gone = (await readFeatureSnapshots(db, [reference]))[0]!;
+  await publishEventFeatureSnapshots({ db, ch }, [gone]);
+  const erased = await ch.select<any>(
+    "SELECT deleted,content,length(embedding) dimensions FROM session_event_features WHERE org_id='org' AND workspace_id='ws' AND session_id='mutable'",
+  );
+  assert(
+    erased.every(
+      (r) => r.deleted === 1 && r.content === null && r.dimensions === 0,
+    ),
+    "old content survived erasure",
+  );
+  await event("mutable", "p");
+  const live = (await readFeatureSnapshots(db, [reference]))[0]!;
+  await publishEventFeatureSnapshots({ db, ch }, [live]);
+  await ch.insert("session_event_features", [
+    eventFeatureRow(old, state.baselineH!),
+  ]);
+  let staleRefused = false;
+  try {
+    await publishEventFeatureSnapshots({ db, ch }, [gone]);
+  } catch (e: any) {
+    staleRefused = e.reason === "source_changed";
+  }
+  assert(staleRefused, "stale eraser CAS accepted");
+  const after = await ch.select<any>(
+    "SELECT deleted,content FROM session_event_features FINAL WHERE org_id='org' AND workspace_id='ws' AND session_id='mutable'",
+  );
+  assert(
+    after.length === 1 &&
+      after[0].deleted === 0 &&
+      after[0].content === "Needle content",
+    "stale eraser defeated resurrection",
+  );
+  await pool.query(
+    "UPDATE sessions.convergence_events SET workspace_id='other',ts='2026-11-01T10:00:00.000002Z' WHERE org_id='org' AND session_id='mutable'",
+  );
+  const moved = await copyEventFeaturePage({ db, ch }, state, 200);
+  const visible = buildEventVisibility(connection, scope, fold);
+  assert(
+    !(await ch.select<any>(visible.query, { params: visible.params })).some(
+      (r) => r.session_id === "mutable",
+    ),
+    "old workspace/timestamp routing survived move",
+  );
+  checks.push({
+    name: "actual_delete_blank_resurrection_stale_eraser_and_move",
+    erased: erased.length,
+    staleRefused,
+    moved: moved.published,
+  });
+  // Legal large source content is intentionally indexed only through the legacy
+  // left(content,4096) predicate; large mandatory task metadata is retained losslessly.
+  const largeMetadata = "m".repeat(1_200_000),
+    largeContent = "C".repeat(2_360_000);
+  await event(
+    "large-metadata",
+    "p",
+    undefined,
+    undefined,
+    undefined,
+    "codex",
+    "ws",
+    "large-org",
+  );
+  await pool.query(
+    "UPDATE sessions.convergence_events SET content=$1,task_ref=$2::jsonb WHERE org_id='large-org' AND session_id='large-metadata'",
+    [largeContent, JSON.stringify({ large: largeMetadata })],
+  );
+  const largeCopy = await copyEventFeaturePage({ db, ch }, moved.next, 200);
+  const largeRows = await ch.select<any>(
+    "SELECT lengthUTF8(content) content_chars,lengthUTF8(task_ref_text) metadata_chars,lower(hex(SHA256(JSONExtractString(task_ref_text,'large')))) metadata_hash FROM session_event_features FINAL WHERE org_id='large-org' AND session_id='large-metadata'",
+  );
+  assert(
+    largeRows.length === 1 &&
+      Number(largeRows[0].content_chars) === 4096 &&
+      Number(largeRows[0].metadata_chars) > 1_000_000 &&
+      largeRows[0].metadata_hash ===
+        createHash("sha256").update(largeMetadata).digest("hex"),
+    "large source metadata/content contract changed",
+  );
+  checks.push({
+    name: "large_metadata_lossless_and_legacy_content_prefix",
+    published: largeCopy.published,
+    ...largeRows[0],
+  });
   const result = {
-    sourceApiSha:
-      "ee32443826d955142d7279008cbabe68c0fcdfc094cd843a917dae2172eb2026",
+    collation: (
+      await pool.query(
+        "SELECT datcollate,datctype,datlocprovider,coalesce(to_jsonb(pg_database)->>'datlocale','') datlocale FROM pg_database WHERE datname=current_database()",
+      )
+    ).rows[0],
+    sourceApiSha: createHash("sha256")
+      .update(
+        await readFile(
+          rhc + "/packages/relayhistory/src/lib/search-feature-journal.ts",
+        ),
+      )
+      .digest("hex"),
     postgres: (await pool.query("SELECT version() v")).rows[0].v,
     clickhouse: (await ch.select<any>("SELECT version() v"))[0].v,
     checks,

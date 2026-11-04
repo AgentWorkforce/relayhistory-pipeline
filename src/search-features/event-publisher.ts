@@ -16,6 +16,7 @@ export class EventFeatureError extends Error {
     this.name = "EventFeatureError";
   }
 }
+export const EVENT_FEATURE_ROW_MAX_BYTES = 16 * 1024 * 1024;
 const fail = (reason: string): never => {
   throw new EventFeatureError(reason);
 };
@@ -163,7 +164,9 @@ export function eventFeatureRow(
     embedding_dim: embedding.length,
     content_hash: p.content_hash,
   };
-  if (Buffer.byteLength(JSON.stringify(row), "utf8") > 1024 * 1024)
+  if (
+    Buffer.byteLength(JSON.stringify(row), "utf8") > EVENT_FEATURE_ROW_MAX_BYTES
+  )
     return fail("payload_bound");
   return row;
 }

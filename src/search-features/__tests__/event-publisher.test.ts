@@ -188,3 +188,26 @@ test("uncaptured baseline cannot publish; capture is metadata only until runtime
   expect(captured.polled).toBe(false);
   expect(d.inserts).toHaveLength(0);
 });
+
+test("baseline capture rejects invented observations before any source read", async () => {
+  const d = setup();
+  await expect(
+    copyEventFeaturePage(d, {
+      ...initialEventFeatureCheckpoint(),
+      baselineH: "23",
+      checkpoint: "23",
+      observedRevision: "24",
+    }),
+  ).rejects.toMatchObject({ reason: "checkpoint_invalid" });
+  expect(d.inserts).toHaveLength(0);
+});
+
+test("large mandatory metadata crosses old1MiB bound losslessly; row ceiling remains explicit", () => {
+  const s = fixture();
+  s.row!.task_ref_text = JSON.stringify({ large: "m".repeat(1_200_000) });
+  s.row!.task_ref_text_folded = s.row!.task_ref_text;
+  const row = eventFeatureRow(s);
+  expect(row.task_ref_text).toBe(s.row!.task_ref_text);
+  s.row!.task_ref_text = "m".repeat(17 * 1024 * 1024);
+  expect(() => eventFeatureRow(s)).toThrow("Event feature publication refused");
+});
