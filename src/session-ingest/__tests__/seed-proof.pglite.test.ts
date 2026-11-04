@@ -204,3 +204,17 @@ for(const action of ["disable","reset"] as const)test("buffered receipt cannot e
  await expect(f.rpc("ingest_seed_proven_records",p.payload)).rejects.toMatchObject({code:"40001"});
  await expect(f.prepared()).rejects.toMatchObject({code:"55000"});
 });
+
+test("equal seeded NULL-original row remains valid through the actual staged commit RPC",async()=>{
+ const f=await fixture(),p=await f.prepared();await f.rpc("ingest_seed_proven_records",p.payload);
+ const ledger=sqlLedger(f.ingest.query as never);
+ const records=[{source:"claude",sessionId:"sess-1",recordId:"r1",revisionId:"client-equal",revision:7,digest:"e".repeat(64)},
+  {source:"claude",sessionId:"sess-1",recordId:"r2",revisionId:"client-new",revision:8,digest:"f".repeat(64)}];
+ const claim=await ledger.claim({tenant:TENANT,originId:"origin-1",batchId:"mixed-commit",batchDigest:"c".repeat(64),receiptId:"rhr_"+"d".repeat(64),sessions:[["claude","sess-1"]],records});
+ expect(claim.kind).toBe("claimed");
+ if(claim.kind!=="claimed")throw new Error("claim_required");
+ expect(await ledger.commitRevisions(TENANT,"origin-1",f.written.manifests[0]!.manifest.session.machine_id,records,{batchId:"mixed-commit",batchDigest:"c".repeat(64),claimToken:claim.claimToken})).toEqual({committed:1,rearmed:0});
+ expect((await f.db.query("SELECT record_id,revision::text,revision_id,digest FROM sessions.ingest_record_revisions ORDER BY record_id")).rows).toEqual([
+  {record_id:"r1",revision:"7",revision_id:null,digest:null},
+  {record_id:"r2",revision:"8",revision_id:"client-new",digest:"f".repeat(64)}]);
+});

@@ -37,7 +37,9 @@ function supaClient(){
 }
 function neonClient(){
  const u=parseUrl(fd("NEON_URL_FILE"));
- if(!["postgresql:","postgres:"].includes(u.protocol)||!u.hostname.endsWith(".neon.tech")||!u.password||u.hash)fail("seed_neon_connection");
+ if(!["postgresql:","postgres:"].includes(u.protocol)||!u.hostname.endsWith(".neon.tech")||!u.password||u.hash||
+  !process.env.SEED_EXPECT_NEON_HOST||u.hostname!==process.env.SEED_EXPECT_NEON_HOST||
+  !process.env.SEED_EXPECT_NEON_DATABASE||decodeURIComponent(u.pathname.slice(1))!==process.env.SEED_EXPECT_NEON_DATABASE)fail("seed_neon_connection");
  for(const[k,v]of u.searchParams)if(!((k==="sslmode"&&["require","verify-full"].includes(v))||(k==="channel_binding"&&v==="require")))fail("seed_connection_options");
  return new pg.Client({host:u.hostname,port:Number(u.port||5432),database:decodeURIComponent(u.pathname.slice(1)),user:decodeURIComponent(u.username),password:decodeURIComponent(u.password),
   ssl:{rejectUnauthorized:true,servername:u.hostname},connectionTimeoutMillis:10000,
@@ -47,7 +49,7 @@ function readStore():{store:ObjectStore;bucket:string}{
  const bucket=process.env.SEED_BUCKET;
  if(!bucket||bucket!==process.env.SEED_EXPECT_BUCKET)fail("seed_bucket_pin");
  const creds=JSON.parse(fd("SEED_S3_CREDS_FILE"));
- if(typeof creds.accessKeyId!=="string"||typeof creds.secretAccessKey!=="string")fail("seed_s3_credentials");
+ if(typeof creds.accessKeyId!=="string"||!creds.accessKeyId||typeof creds.secretAccessKey!=="string"||!creds.secretAccessKey)fail("seed_s3_credentials");
  const endpoint=process.env.SEED_S3_ENDPOINT;
  if(endpoint&&!endpoint.startsWith("https://"))fail("seed_s3_tls");
  const original=createS3Store({bucket,region:process.env.SEED_S3_REGION||"us-east-1",credentials:creds,...(endpoint?{endpoint}:{})});
@@ -69,6 +71,14 @@ export async function main(){
  if(process.env.SEED_EXPECT_GENERATION!==expected)fail("seed_generation_pin");
  const cacheDir=process.env.SEED_PROOF_DIR;
  if(!cacheDir)fail("seed_proof_dir_required");
+ // Validate EVERY local option and credential/store shape before a baseline can
+ // be sealed. Network/source changes remain fail-closed and require source freeze.
+ const max=args.find(a=>a.startsWith("--max-scopes="))?.split("=")[1];
+ const maxScopes=max?Number(max):undefined;
+ if(maxScopes!==undefined&&(!Number.isSafeInteger(maxScopes)||maxScopes<1||maxScopes>1000000))fail("seed_scope_bound");
+ const concurrency=Number(process.env.SEED_CONCURRENCY||"4");
+ if(!Number.isSafeInteger(concurrency)||concurrency<1||concurrency>4)fail("seed_concurrency");
+ const {store,bucket}=readStore();
  const supa=supaClient(),neon=execute?neonClient():null;
  supa.on("error",()=>{});neon?.on("error",()=>{});
  const attested=new WeakSet<pg.PoolClient>();
@@ -104,14 +114,11 @@ export async function main(){
    // Import tombstones/resets BEFORE capturing S3/fence generations.
    fences=await seedFences(source,sql,org,discovered.users);
   }
-  const {store,bucket}=readStore();
-  const max=args.find(a=>a.startsWith("--max-scopes="))?.split("=")[1];
-  const concurrency=Number(process.env.SEED_CONCURRENCY||"4");
   const result=await seedOrgFromS3(sql,{
     store,bucket,provider:"s3",reader:objectStoreManifestReader(store,{provider:"s3",bucket,maxBytes:64*1024*1024}),
     prefixFor:org=>"96bulls/"+org,
     decompress:(stored,maxBytes)=>new Uint8Array(zstdDecompressSync(stored,{maxOutputLength:maxBytes})),
-  },org,expected,{sourceHead:head,cacheDir,execute,concurrency,...(max?{maxScopes:Number(max)}:{}),
+  },org,expected,{sourceHead:head,cacheDir,execute,concurrency,...(maxScopes===undefined?{}:{maxScopes}),
     log:counts=>console.log(JSON.stringify(counts))});
   console.log(JSON.stringify({outcome:execute?"proof_seeded":"proof_preview",...result,fences}));
  }finally{await Promise.allSettled([supa.end(),...(neon?[neon.end()]:[])])}

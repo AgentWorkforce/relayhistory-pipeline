@@ -30,3 +30,11 @@ Bounded state: one chunk per active cohort,64MiB SQLite cache,32GiB SQLite per c
 Readonly production metadata at2026-11-04T05:08:17Z counted130386 cohorts,136787 pointers,301453 chunks,133953904905 raw bytes across313orgs. This is cost metadata, not delivery eligibility/completeness. Full verification needs roughly one manifest GET per pointer, one chunk GET per chunk, scope capture/recheck RPCs and1000-record commits. Largest org numeric total26269849263B. Per-org rollout can avoid global124.75GiB verification before initial scoped relief. Synthetic throughput is reported separately, not a cloud ETA.
 
 S3 maxima do not prove the latest Neon-only record/tombstone frontier. Keep canonical fanout paused until that frontier, generation-safe S3 publication/erasure, final union verification and operator gates are satisfied. A buffered receipt means durable acceptance with later visibility, never permission for canonical publication. This implementation performs no production seed/migration/flag/deploy/write.
+
+## Failure and recovery
+
+Freeze legacy fence writers as part of the source/admission barrier BEFORE the first baseline import. Import commits per user, not atomically per org. A network/S3/source failure may leave a sealed subset; an identical stable source snapshot can retry as a no-op. If source fences changed after a partial import, STOP: baseline-already-sealed is an intentional refusal. Do not clear, overwrite or re-import stale baselines. Recovery requires an independently reviewed reconciliation/frontier plan, not a CLI override.
+
+All local argument, bucket, credential/store shape, concurrency and scope bounds are validated before baseline writes. Network failures can still happen later; this does not make the required source freeze optional. Execute also requires explicitly pinned SEED_EXPECT_NEON_HOST and SEED_EXPECT_NEON_DATABASE, in addition to TLS, suffix and readonly-role checks. These pins must come from the reviewed operator plan.
+
+Seeded NULL originals are exercised through actual ingest_claim_batch and ingest_commit_revisions at equal revision in a mixed batch: the existing proof row remains unchanged and the new record commits its actual client ID/digest. The ordinary equal/older/newer/tombstone delivery controls also retain real receipt IDs.
