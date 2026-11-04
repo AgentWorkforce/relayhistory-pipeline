@@ -37,4 +37,3 @@ scripts/proof-semantic-copy-real.ts uses only uniquely owned disposable PG17/CH2
 Additional unit/integration checks exercise nonce/generation/state/source CAS, baseline crash/retry, final-publication failure, known newer revision, default-off CLI/Lambda/schedule/phase boundaries, migrator ACL/sentinel/down-up and four blocked-write rollback operations. Reverting the four final expiry guards makes four checks fail; reverting the dirty ACK makes two checks fail; reverting the unowned-target guard makes one check fail. Exact results and immutable final head are recorded in the PR/report.
 
 No production SQL, grants, credentials, deploy, flag, merge or source data were changed by this implementation lane. Source quality and CI readiness remain separate from activation authority.
-

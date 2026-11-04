@@ -86,4 +86,3 @@ try{
  checks.push({actualCHNegativeControls:{advancedCheckpointMissingBinding:true,oldHigherVersionFeatureWithoutBinding:true,differentSourceBinding:true,dirtyReadRefusal:true,lateOldCompleteCannotReplaceNewDirty:true}});
  await mkdir(out,{recursive:true});await writeFile(out+"/proof.json",JSON.stringify({head:execFileSync("git",["rev-parse","HEAD"],{encoding:"utf8"}).trim(),checks},null,2));console.log(JSON.stringify(checks,null,2));
 }finally{await Promise.all([owner.end(),metadataOwner.end(),sourcePool.end(),statePool.end()])}
-
