@@ -172,6 +172,64 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_publication_abandon(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_publication_candidates(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_publication_claim(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_publication_component(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_publication_defer(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_publication_gc_claim(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_publication_gc_finish(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_publication_guard_pointer()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_publication_heartbeat(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_publication_locked(uuid,uuid,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_publication_prepare(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_publication_publish(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_publication_register_objects(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_publication_retire_fence()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_publication_revision_snapshot(uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_publication_scope(jsonb,boolean)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_receipt_seat_ack()": [
       "<owner>:EXECUTE"
     ],
@@ -408,7 +466,27 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.session_publication_is_managed(text,text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.session_publication_lock(jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.session_publication_probe(jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.session_publication_register_object(jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.set_session_state(text,text,text,text,text,text,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.set_session_state_for_publication(text,text,text,text,text,text,bigint,text,timestamp with time zone,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
