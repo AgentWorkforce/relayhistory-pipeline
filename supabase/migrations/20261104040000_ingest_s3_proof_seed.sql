@@ -93,13 +93,19 @@ CREATE FUNCTION sessions.ingest_seed_close_baseline()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $close$
 DECLARE v_org text;v_ws text;v_user text;
 BEGIN
+ --040500's trusted buffer claim persists bytes only; historical proof remains
+ --open until explicit canonical admission. Before that column exists every row
+ --is conservatively canonical. No client payload can choose this exemption.
+ IF TG_TABLE_NAME='ingest_batches' AND
+   coalesce(to_jsonb(NEW)->>'publication_state','canonical')='buffered'
+ THEN RETURN NEW;END IF;
  IF TG_OP='DELETE' THEN v_org:=OLD.org_id;v_ws:=OLD.workspace_id;v_user:=OLD.user_id;
  ELSE v_org:=NEW.org_id;v_ws:=NEW.workspace_id;v_user:=NEW.user_id;END IF;
  UPDATE sessions.ingest_seed_fence_baselines SET closed_at=clock_timestamp()
   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user AND closed_at IS NULL;
  IF TG_OP='DELETE' THEN RETURN OLD;END IF;RETURN NEW;
 END $close$;
-CREATE TRIGGER ingest_seed_close_batch AFTER INSERT ON sessions.ingest_batches
+CREATE TRIGGER ingest_seed_close_batch AFTER INSERT OR UPDATE ON sessions.ingest_batches
  FOR EACH ROW EXECUTE FUNCTION sessions.ingest_seed_close_baseline();
 CREATE TRIGGER ingest_seed_close_versions AFTER INSERT OR UPDATE OR DELETE ON sessions.ingest_fence_versions
  FOR EACH ROW EXECUTE FUNCTION sessions.ingest_seed_close_baseline();

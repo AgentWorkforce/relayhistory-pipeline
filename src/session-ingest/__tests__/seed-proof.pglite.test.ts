@@ -181,3 +181,26 @@ for(const control of [
  expect(folded).toHaveLength(control.count);
  expect(folded[0]?.payload?.text).toBe(control.text);
 });
+
+async function bufferReceipt(f:Awaited<ReturnType<typeof fixture>>){
+ await f.db.exec("ALTER TABLE sessions.ingest_batches ADD COLUMN publication_state text NOT NULL DEFAULT 'canonical' CHECK(publication_state IN('buffered','canonical'))");
+ await f.db.query("INSERT INTO sessions.ingest_batches(org_id,workspace_id,origin_id,batch_id,user_id,digest,receipt_id,state,publication_state) VALUES($1,$2,'origin-1','buffered-receipt',$3,repeat('c',64),'rhr_'||repeat('d',64),'pending','buffered')",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
+}
+test("trusted buffered receipt leaves historical proof open, but explicit canonical admission closes it",async()=>{
+ const f=await fixture(),p=await f.prepared();await bufferReceipt(f);
+ expect(await f.rpc("ingest_seed_proven_records",p.payload)).toMatchObject({accepted:true,upserted:1});
+ await f.db.exec("UPDATE sessions.ingest_batches SET state='committed',committed_at=clock_timestamp() WHERE batch_id='buffered-receipt'");
+ expect(await f.rpc("ingest_seed_proven_records",p.payload)).toMatchObject({accepted:true,upserted:0});
+ await f.prepared();
+ await f.db.exec("UPDATE sessions.ingest_batches SET publication_state='canonical' WHERE batch_id='buffered-receipt'");
+ await expect(f.rpc("ingest_seed_proven_records",p.payload)).rejects.toMatchObject({code:"40001"});
+ await expect(f.prepared()).rejects.toMatchObject({code:"55000"});
+});
+for(const action of ["disable","reset"] as const)test("buffered receipt cannot exempt "+action+" from baseline closure",async()=>{
+ const f=await fixture(),p=await f.prepared();await bufferReceipt(f);
+ const ledger=sqlLedger(f.ingest.query as never);
+ if(action==="disable")await ledger.setSessionUploads({tenant:TENANT,originId:"origin-1",sessions:[["claude","sess-1"]],enabled:false});
+ else await ledger.resetUploadedSessions(TENANT,"buffer-reset");
+ await expect(f.rpc("ingest_seed_proven_records",p.payload)).rejects.toMatchObject({code:"40001"});
+ await expect(f.prepared()).rejects.toMatchObject({code:"55000"});
+});
