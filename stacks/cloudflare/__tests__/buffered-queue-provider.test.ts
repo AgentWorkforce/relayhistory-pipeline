@@ -266,6 +266,7 @@ test("buffered mode captures inline0/off and rejects accidental canonical settin
     kmsKeyArn:
       "arn:aws:kms:us-east-1:941433935742:key/12345678-1234-1234-1234-123456789abc",
     acceptanceMode: "buffered" as const,
+    expectedGeneration: "e".repeat(64),
     inlineMaxSessions: 0,
     replicaMode: "off" as const,
   };
@@ -274,7 +275,12 @@ test("buffered mode captures inline0/off and rejects accidental canonical settin
   };
   assertSessionIngestInputs(input, refuse);
   expect(sessionIngestVars(input).INGEST_ACCEPTANCE_MODE).toBe("buffered");
+  expect(sessionIngestVars(input).INGEST_EXPECT_GENERATION).toBe("e".repeat(64));
   for (const value of [
+    { ...input, expectedGeneration: undefined },
+    { ...input, expectedGeneration: "e".repeat(63) },
+    { ...input, expectedGeneration: "E".repeat(64) },
+    { ...input, expectedGeneration: 42 },
     { ...input, inlineMaxSessions: 1 },
     { ...input, replicaMode: "queue" },
     { ...input, acceptanceMode: "canonical" },
@@ -333,4 +339,14 @@ test("operator pause capability requires captured buffered mode, observed exact 
     }),
   ).rejects.toThrow("queue_pause_scope");
   expect(calls.length).toBe(before + 1);
+});
+
+test("buffered declaration refuses missing expected generation even before vars are rendered", () => {
+  const input = {
+    accountId: account, hyperdriveId: "c".repeat(32), secretsStoreId: "d".repeat(32),
+    kmsKeyArn: "arn:aws:kms:us-east-1:941433935742:key/12345678-1234-1234-1234-123456789abc",
+    acceptanceMode: "buffered" as const, inlineMaxSessions: 0, replicaMode: "off" as const,
+  };
+  expect(() => sessionIngestVars(input)).toThrow("expectedGeneration");
+  expect(() => assertSessionIngestInputs(input, (why) => { throw Error(why); })).toThrow("expectedGeneration");
 });

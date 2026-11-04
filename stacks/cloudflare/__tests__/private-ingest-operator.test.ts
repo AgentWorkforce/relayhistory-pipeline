@@ -70,6 +70,7 @@ async function actualPlanProof(mode: "canonical" | "buffered") {
       ...(mode === "buffered"
         ? {
             acceptanceMode: "buffered" as const,
+            expectedGeneration: "e".repeat(64),
             inlineMaxSessions: 0,
             replicaMode: "off" as const,
           }
@@ -257,10 +258,28 @@ async function actualPlanProof(mode: "canonical" | "buffered") {
       applySpy.mockRestore();
     }
     expect(assertOperatorSnapshot(native, input)).toHaveLength(
-      mode === "buffered" ? 14 : 13,
+      mode === "buffered" ? 15 : 13,
     );
     const queue = native.native.resources["session-ingest-fanout"];
     if (mode === "buffered") {
+      const worker = native.native.resources["session-ingest"];
+      expect(worker.props.env.INGEST_EXPECT_GENERATION).toBe("e".repeat(64));
+      const generationBinding = worker.bindings.find((b: any) => b.sid === "INGEST_EXPECT_GENERATION");
+      expect(generationBinding.data.bindings[0]).toEqual({
+        type: "plain_text", name: "INGEST_EXPECT_GENERATION", text: "e".repeat(64),
+      });
+      const changedInput = { ...input, sessionIngest: { ...input.sessionIngest, expectedGeneration: "f".repeat(64) } };
+      expect(operatorCapture(source, JSON.stringify(changedInput), secrets, result.plans, tools, result.authority).generation)
+        .not.toBe(capture.generation);
+      for (const change of ["missing", "wrong"]) {
+        const rows = { ...native.native.resources };
+        rows["session-ingest"] = { ...worker, bindings: worker.bindings.map((b: any) =>
+          b.sid !== "INGEST_EXPECT_GENERATION" ? b : {
+            ...b, data: { bindings: [{ ...b.data.bindings[0], text: "f".repeat(64) }] },
+          }).filter((b: any) => change !== "missing" || b.sid !== "INGEST_EXPECT_GENERATION") };
+        expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: rows } }, input))
+          .toThrow(change === "missing" ? "native_binding_inventory" : "native_binding_target");
+      }
       expect(queue.props.deliveryPaused).toBe(true);
       expect(queue.provider.version).toBe(1);
       expect(queue.downstream).toContain("session-ingest-fanout-consumer");
