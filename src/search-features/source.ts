@@ -1,5 +1,5 @@
 // GENERATED from relayhistory-cloud packages/relayhistory/src/lib/search-feature-journal.ts
-// Source commit: c08424bfbd1bdffc906c8fa63ba85a1214c23ff2; SHA256: 579adf774bb9208e867ad1c917adc188adf071e1101a3956d87b10bfc0b3af69
+// Source commit: d953f2b2974438dd74c7cd4b7daaddbd05a6cf24; SHA256: ee32443826d955142d7279008cbabe68c0fcdfc094cd843a917dae2172eb2026
 // Regenerate/check: bun scripts/sync-search-feature-source.ts --source <RHC-worktree> [--check]
 /** Readonly legacy feature source API. No connection, token, model or writes. */
 export type FeatureKind = "event" | "brief";
@@ -262,20 +262,20 @@ export async function readFeatureBaselinePage(
       k === "event"
         ? "search_feature_event_payload"
         : "search_feature_brief_payload";
-  const tuple = columns.map((c) => `s.${c} COLLATE "C"`).join(","),
+  const tuple = columns.map((c) => `s.${c}`).join(","),
     params: unknown[] = [batch + 1];
   const where = after
     ? `AND (${tuple})>(${after
         .map((v, n) => {
           params.push(v);
-          return `$${n + 2}::text COLLATE "C"`;
+          return `$${n + 2}::text`;
         })
         .join(",")})`
     : "";
   const rows = (
     await sourceQuery<any>(
       db,
-      `WITH source AS MATERIALIZED(SELECT sessions.${keyFn}(s) key,sessions.${payloadFn}(s) payload,${columns.map((c) => `s.${c}`).join(",")} FROM sessions.${table} s WHERE ${k === "event" ? "s.embedding IS NOT NULL" : "true"} ${where} ORDER BY ${tuple} LIMIT $1)
+      `WITH source AS MATERIALIZED(SELECT sessions.${keyFn}(s) key,sessions.${payloadFn}(s) payload,${columns.map((c) => `s.${c}`).join(",")} FROM sessions.${table} s WHERE true ${where} ORDER BY ${tuple} LIMIT $1)
  SELECT s.*,encode(sha256(convert_to(coalesce(payload,jsonb_build_array('deleted','${k}',key))::text,'UTF8')),'hex') actual_hash FROM source s ORDER BY ${tuple}`,
       params,
     )
