@@ -177,7 +177,8 @@
               ]
             }
           }
-        ]
+        ],
+        "RoleName": "96bulls-sessions-prod-buffered-gc"
       }
     },
     "Function": {

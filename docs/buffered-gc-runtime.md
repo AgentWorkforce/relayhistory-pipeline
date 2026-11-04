@@ -105,3 +105,11 @@ notification/response ownership and backlog coverage remain operator duties.
 Rollback closes retained admission, drains/rejects producers and controls, and
 keeps GC scheduled until every acknowledged/retired object has verified retention
 or erasure evidence. Never disable GC as the first rollback step.
+
+## Existing production policy prerequisites verified read-only
+
+The reviewed template fixes RoleName to96bulls-sessions-prod-buffered-gc so exact resource-policy changes can be reviewed before creation. This requires CAPABILITY_NAMED_IAM; the role was absent at the read-only check. Actual bucket versioning is enabled and BucketKeyEnabled=false. The existing bucket policy explicitly denies version deletion to every principal except the old eraser user; the CMK root-administration statement does not delegate data cryptography to arbitrary identity policies. Therefore this new role additionally needs a reviewed buffered-prefix-only bucket exception and an exact-role CMK Decrypt/GenerateDataKey statement. Identity policy alone cannot provide access. No policy was applied.
+
+The operator proposal preserves existing principals/statements, denies this GC role any deletion outside buffered storage and all plain DeleteObject, and grants data cryptography only via S3/account/object-prefix context. Re-read and compare exact semantic preimage hashes before applying; stop on drift. Create the default-off role first; do not enable/admit while policies or transport proof are missing. AWS Access Analyzer returned no findings for both actual preimages and proposed policies; CloudFormation validate-template accepted the named-role template. These checks do not establish effective live permission.
+
+The existing transcript-store K-45 objective is immediate logical deletion and physical purge within48hours; it does not impose a waiting canary. The owned capacity case now creates20 acknowledged batches with500 records/groups each through the actual producer, then checks the default claim scans all20 inside its1.8second metadata budget. Root measured305ms on owned PostgreSQL17/Node24/MinIO (106S3requests across14groups,~299MiB peakRSS). This does not prove production latency, sustained arrival capacity or the physical purge objective. Review actual backlog/throughput and retain active GC while admission closes.

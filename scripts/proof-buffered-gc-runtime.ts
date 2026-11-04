@@ -32,7 +32,9 @@ function port(name:string,key:string){
  const p=d.NetworkSettings.Ports[key][0];if(p.HostIp!=="127.0.0.1")throw Error("loopback_only");
  return Number(p.HostPort);
 }
-const pgPort=port("buffer-gc-runtime-pg17-20261104","5432/tcp"),s3Port=port("buffer-gc-runtime-minio-20261104","9000/tcp");
+const fixturePrefix=process.env.GC_RUNTIME_FIXTURE_PREFIX??"buffer-gc-runtime";
+if(!["buffer-gc-runtime","root-buffer-gc-capacity"].includes(fixturePrefix))throw Error("fixture_prefix_refused");
+const pgPort=port(fixturePrefix+"-pg17-20261104","5432/tcp"),s3Port=port(fixturePrefix+"-minio-20261104","9000/tcp");
 const head=execFileSync("git",["rev-parse","HEAD"],{encoding:"utf8"}).trim();
 const dirty=!!execFileSync("git",["status","--porcelain"],{encoding:"utf8"}).trim();
 if(dirty&&!process.argv.includes("--allow-wip"))throw Error("source_dirty");
@@ -286,6 +288,21 @@ try{
   const bad=sqlBufferedGcLedger({query:(s,p)=>x.query(s,p)},expected);
   await bad.claim(1).then(()=>{throw Error("wrong_role_accepted")},e=>assert(e.code==="sql_42501","wrong_role_code"));
   assert(proof.requests===before,"wrong_role_no_io");
+ });
+ await check("default permanent claim handles twenty maximum legal500-record stages within its1.8s metadata budget",async()=>{
+  const orgs:string[]=[];
+  for(let b=0;b<20;b++){
+   const f=await fixture();orgs.push(f.tenant.orgId);
+   f.batch.records=Array.from({length:500},(_,i)=>({schema_version:1 as const,origin_id:f.origin,record_id:"cap-record-"+i,revision_id:"cap-revision-"+i,revision:1,kind:"session_event" as const,source:"claude",session_id:"cap-session-"+i,operation:"upsert" as const,payload:{text:"synthetic capacity message "+i,ts_ms:1761955200000}}));
+   const ack=await f.deliver();assert(ack.outcome==="accepted_buffered","capacity_producer_ack");
+  }
+  await owner.query("UPDATE sessions.ingest_stage_intents SET gc_checked_at=clock_timestamp()+interval '1 day' WHERE NOT(org_id=ANY($1::text[]))",[orgs]);
+  const bounded=sqlBufferedGcLedger({query:(s,p)=>executor.queryBounded(s,p,{signal:AbortSignal.timeout(1800),deadline:Date.now()+1800})},expected);
+  const start=Date.now(),tickets=await bounded.claim(5),ms=Date.now()-start;
+  assert(tickets.length===0,"healthy_capacity_no_cleanup");
+  const seen=(await owner.query("SELECT count(*)::int AS n FROM sessions.ingest_stage_intents WHERE org_id=ANY($1::text[]) AND gc_checked_at IS NOT NULL",[orgs])).rows[0].n;
+  assert(seen===20,"all_twenty_maximum_candidates_scanned");assert(ms<1800,"maximum_shape_claim_budget");
+  proof.capacity={batches:20,recordsPerBatch:500,totalRecords:10000,claimLimit:5,candidatesScanned:seen,elapsedMs:ms};
  });
  proof.passed=proof.cases.length;proof.maxRSSBytes=process.resourceUsage().maxRSS*1024;
 }catch(e){proof.failed=1;proof.error={stage,code:(e as any)?.code??(e as any)?.message};process.exitCode=1}
