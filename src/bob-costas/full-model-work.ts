@@ -15,7 +15,7 @@ export interface FullModelCheckpoint {
   protocol: typeof FULL_MODEL_WORK_PROTOCOL; sourceBinding: string; configSha256: string;
   cursor: ModelInputCursor; units: string; inputComplete: boolean;
   frontier: ModelSliceRef[]; carry: ModelSliceRef | null;
-  tokensIn: string; tokensOut: string; calls: string;
+  tokensIn: string; tokensOut: string; calls: string; actualModel: string|null;
 }
 export interface ModelSlice { protocol: "bob-notes-v1"; sourceBinding: string; first: string; count: string; notes: string }
 export interface FullModelConclusion { short: string; long: string; state: "active"|"done"|"abandoned"|"unknown"; stateReason: string }
@@ -43,13 +43,13 @@ export function fullModelConfigHash(model:string,keyId:string):string{
 }
 export function initialFullModelCheckpoint(sourceBinding:string,configSha256:string):FullModelCheckpoint{
  if(!HEX.test(sourceBinding)||!HEX.test(configSha256))fail("model_work_binding");
- return {protocol:FULL_MODEL_WORK_PROTOCOL,sourceBinding,configSha256,cursor:{rowOrdinal:"0",utf16Offset:0},units:"0",inputComplete:false,frontier:[],carry:null,tokensIn:"0",tokensOut:"0",calls:"0"};
+ return {protocol:FULL_MODEL_WORK_PROTOCOL,sourceBinding,configSha256,cursor:{rowOrdinal:"0",utf16Offset:0},units:"0",inputComplete:false,frontier:[],carry:null,tokensIn:"0",tokensOut:"0",calls:"0",actualModel:null};
 }
 function checkRef(ref:ModelSliceRef){
  if(!ref||typeof ref.key!=="string"||!ref.key||!HEX.test(ref.sha256)||!Number.isSafeInteger(ref.bytes)||ref.bytes<1||ref.bytes>1048576||typeof ref.keyId!=="string"||!ref.keyId||!validDec(ref.first)||!validDec(ref.count)||BigInt(ref.count)<1n||!Number.isInteger(ref.level)||ref.level<0||ref.level>126)fail("model_work_ref");
 }
 export function validateFullModelCheckpoint(c:FullModelCheckpoint,sourceBinding:string,configSha256:string):void{
- if(!c||c.protocol!==FULL_MODEL_WORK_PROTOCOL||c.sourceBinding!==sourceBinding||c.configSha256!==configSha256||!HEX.test(sourceBinding)||!HEX.test(configSha256)||!validDec(c.units)||!validDec(c.tokensIn)||!validDec(c.tokensOut)||!validDec(c.calls)||typeof c.inputComplete!=="boolean"||!c.cursor||!validDec(c.cursor.rowOrdinal)||!Number.isSafeInteger(c.cursor.utf16Offset)||c.cursor.utf16Offset<0||(c.cursor.utf16Offset>0&&!HEX.test(c.cursor.rowSha256??""))||!Array.isArray(c.frontier)||c.frontier.length>63)fail("model_work_checkpoint");
+ if(!c||c.protocol!==FULL_MODEL_WORK_PROTOCOL||c.sourceBinding!==sourceBinding||c.configSha256!==configSha256||!HEX.test(sourceBinding)||!HEX.test(configSha256)||!validDec(c.units)||!validDec(c.tokensIn)||!validDec(c.tokensOut)||!validDec(c.calls)||typeof c.inputComplete!=="boolean"||!(c.actualModel===null||typeof c.actualModel==="string"&&c.actualModel.length>0&&c.actualModel.length<=200)||!c.cursor||!validDec(c.cursor.rowOrdinal)||!Number.isSafeInteger(c.cursor.utf16Offset)||c.cursor.utf16Offset<0||(c.cursor.utf16Offset>0&&!HEX.test(c.cursor.rowSha256??""))||!Array.isArray(c.frontier)||c.frontier.length>63)fail("model_work_checkpoint");
  const refs=[...c.frontier,...(c.carry?[c.carry]:[])].sort((a,b)=>BigInt(a.first)<BigInt(b.first)?-1:1);
  let end=0n; const levels=new Set<number>();
  for(const r of c.frontier){checkRef(r);if(levels.has(r.level))fail("model_work_coverage");levels.add(r.level);}
@@ -66,6 +66,9 @@ function checkSlice(slice:ModelSlice,ref:ModelSliceRef,binding:string):ModelSlic
  notes({notes:slice.notes});return slice;
 }
 function usage(c:FullModelCheckpoint,r:FullModelResult){
+ if(typeof r.model!=="string"||!r.model||r.model.length>200)fail("model_identity_invalid");
+ if(c.actualModel===null)c.actualModel=r.model;
+ else if(c.actualModel!==r.model)fail("model_identity_changed");
  for(const k of ["tokensIn","tokensOut"] as const){if(!Number.isSafeInteger(r[k])||r[k]<0)fail("model_usage_invalid");c[k]=(BigInt(c[k])+BigInt(r[k])).toString();}
  c.calls=(BigInt(c.calls)+1n).toString();
 }
