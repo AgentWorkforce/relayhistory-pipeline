@@ -326,14 +326,14 @@ function sessionAnalysisCachePhase(
   stateSnapshotText: string | undefined,
   refuse: (why: string) => never,
 ): TranscriptStorePlanPhase | undefined {
-  // Absent (a plan captured before briefs) or all noop: not a analysis cache phase. expectedResources
+  // Absent (a plan captured before briefs) or all noop: not an analysis cache phase. expectedResources
   // already refused a plan that lists some analysis cache resources but not all.
   const [schedule, permission,reconcileSchedule,reconcilePermission] = SESSION_ANALYSIS_CACHE_RESOURCES.map((r) => operations.get(r) ?? "noop");
   const brief = [schedule, permission,reconcileSchedule,reconcilePermission];
   if (brief.every((a) => a === "noop")) return undefined;
   if(SESSION_BRIEF_RESOURCES.some(r=>operations.has(r)&&operations.get(r)!=="noop"))return refuse("brief and analysis cache schedules require separate reviewed phases");
   const changes = () => [...operations].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ");
-  const phase: TranscriptStorePlanPhase | undefined =
+  const analysisPhase: TranscriptStorePlanPhase | undefined =
     brief.every((a) => a === "create" || a === "noop")
       ? "session analysis cache rollout"
       : permission === "noop" && reconcilePermission === "noop" && [schedule,reconcileSchedule].every(a=>a==="update"||a==="noop") && [schedule,reconcileSchedule].some(a=>a==="update")
@@ -341,23 +341,23 @@ function sessionAnalysisCachePhase(
         : undefined;
   // The EventBridge permission is create-once. Enabling or disabling briefs changes only
   // the schedule state; an in-place permission edit could widen the invoking principal.
-  if (!phase) return refuse(`session analysis cache resources have an unsafe action combination: ${changes()}`);
+  if (!analysisPhase) return refuse(`session analysis cache resources have an unsafe action combination: ${changes()}`);
   // The read API stays noop, except for the code-only cascade a shared-code change on main
-  // causes (assertReadApiCodeOnlyCascade): it is then judged on its own and left out of the rest.
-  const readApi = SESSION_READ_API_RESOURCES as readonly string[];
-  if (!readApi.every((r) => !operations.has(r) || operations.get(r) === "noop")) {
+  // causes (assertReadApiCodeOnlyCascade): it is then judged on its own and left out of the analysisRest.
+  const analysisReadApi = SESSION_READ_API_RESOURCES as readonly string[];
+  if (!analysisReadApi.every((r) => !operations.has(r) || operations.get(r) === "noop")) {
     if (!readApiCodeOnlyShape(operations))
-      return refuse(`${phase}: the read api may not change in the same plan: ${changes()}`);
-    assertReadApiCodeOnlyCascade(detailedPlanText, stateSnapshotText, (why) => refuse(`${phase}: ${why}`));
+      return refuse(`${analysisPhase}: the read api may not change in the same plan: ${changes()}`);
+    assertReadApiCodeOnlyCascade(detailedPlanText, stateSnapshotText, (why) => refuse(`${analysisPhase}: ${why}`));
   }
-  const rest = new Map(
-    [...operations].filter(([r]) => !(SESSION_ANALYSIS_CACHE_RESOURCES as readonly string[]).includes(r) && !readApi.includes(r)),
+  const analysisRest = new Map(
+    [...operations].filter(([r]) => !(SESSION_ANALYSIS_CACHE_RESOURCES as readonly string[]).includes(r) && !analysisReadApi.includes(r)),
   );
-  if ([...rest.values()].every((a) => a === "noop")) return phase;
-  if (sessionPipelinePhase(rest) !== "session pipeline update")
-    return refuse(`${phase}: the rest of the plan must be noop or a session pipeline update: ${changes()}`);
-  assertPipelineRoleCascadeDiff(rest, detailedPlanText, stateSnapshotText, refuse);
-  return phase;
+  if ([...analysisRest.values()].every((a) => a === "noop")) return analysisPhase;
+  if (sessionPipelinePhase(analysisRest) !== "session pipeline update")
+    return refuse(`${analysisPhase}: the analysisRest of the plan must be noop or a session pipeline update: ${changes()}`);
+  assertPipelineRoleCascadeDiff(analysisRest, detailedPlanText, stateSnapshotText, refuse);
+  return analysisPhase;
 }
 
 const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
