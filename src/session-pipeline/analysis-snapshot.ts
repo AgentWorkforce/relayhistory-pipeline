@@ -4,6 +4,7 @@
 import pg,{type Pool} from "pg";
 import type {SqlExecutor} from "../../packages/pipeline/src/lib/pipeline/queue.ts";
 import {ANALYSIS_V1_SELECT_SQL} from "./analysis-v1-select.ts";
+import {CACHED_BRIEF_TITLE_SELECT_SQL} from "./analysis-title-select.ts";
 import type {ArtifactIdentity} from "../session-read-api/canonical-artifact.ts";
 import {ANALYSIS_MAX_HISTORY,type SessionAnalysisSnapshot} from "../session-read-api/session-analysis-artifact.ts";
 export class AnalysisSnapshotError extends Error {constructor(public readonly code:string){super(code);this.name="AnalysisSnapshotError"}}
@@ -18,7 +19,12 @@ export async function readLegacyAnalysisSnapshot(source:ReadonlyAnalysisSource,i
  const {rows}=await db.query<{snapshot_at:string;snapshot_id:string;payload:SessionAnalysisSnapshot["payload"];unbound_requests:boolean}>(`SELECT to_char(transaction_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') snapshot_at,encode(sha256(convert_to(pg_current_snapshot()::text,'UTF8')),'hex') snapshot_id,p.payload,p.unbound_requests FROM (${ANALYSIS_V1_SELECT_SQL}) p`,[identity.orgId,identity.sessionId,identity.workspaceId,identity.source]);
  const value=rows[0];if(!value||!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/u.test(value.snapshot_at)||!value.snapshot_id)refuse("analysis_snapshot_invalid");
  if(value.unbound_requests)refuse("analysis_request_source_ambiguous");
- const p=value.payload;if(p?.outcome==="not_found")return {snapshotAt:value.snapshot_at,snapshotId:value.snapshot_id,payload:p};
+ // The list-title contract is independent of the fifty-row v1 history window.
+ // Keep its exact old job-scope proof and request ordering in this SAME snapshot.
+ const titles=(await db.query<{title:unknown}>(CACHED_BRIEF_TITLE_SELECT_SQL,[JSON.stringify([{session_id:identity.sessionId,source:identity.source}]),identity.orgId,identity.workspaceId,JSON.stringify([identity.workspaceId])])).rows;
+ if(titles.length>1)refuse("analysis_title_projection_invalid");
+ const title=titles[0]?.title,cachedBriefTitle={version:1 as const,complete:true as const,title:typeof title==="string"&&title.trim()?title.trim():null};
+ const p=value.payload;if(p?.outcome==="not_found")return {snapshotAt:value.snapshot_at,snapshotId:value.snapshot_id,cachedBriefTitle,payload:p};
  if(p?.outcome!=="ok"||p.sessionId!==identity.sessionId||!Array.isArray(p.requests)||!Array.isArray(p.analyses)||p.requests.length>ANALYSIS_MAX_HISTORY||p.analyses.length>ANALYSIS_MAX_HISTORY)refuse("analysis_projection_invalid");
  const ids=p.requests.map(r=>r.id);if(ids.some(id=>typeof id!=="string")||new Set(ids).size!==ids.length)refuse("analysis_projection_invalid");
  const {rows:proofs}=await db.query<RequestProof>(`SELECT r.id::text,r.workspace_id,r.analysis_job_id::text,r.brief_job_id::text,
@@ -44,7 +50,7 @@ export async function readLegacyAnalysisSnapshot(source:ReadonlyAnalysisSource,i
  const analysisIds=new Set<string>();const analyses=p.analyses.filter(a=>contributors.has(String(a.id))).map(a=>{if(typeof a.id!=="string"||analysisIds.has(a.id)||a.sessionId!==identity.sessionId)refuse("analysis_projection_invalid");analysisIds.add(a.id);return contributors.get(a.id)!.every(safe)?a:{...a,result:null,status:"failed",error:reason(contributors.get(a.id)!.find(r=>!safe(r))!)}});
  if(requests.some(r=>r.sessionId!==identity.sessionId)||[...contributors.keys()].some(id=>!analysisIds.has(id)))refuse("analysis_projection_invalid");
  const scopedRequests=requests.map(r=>{const why=reason(byId.get(String(r.id))!);return why?{...r,status:"failed",error:why}:r});
- return {snapshotAt:value.snapshot_at,snapshotId:value.snapshot_id,payload:{outcome:"ok",sessionId:identity.sessionId,requests:scopedRequests,analyses}};
+ return {snapshotAt:value.snapshot_at,snapshotId:value.snapshot_id,cachedBriefTitle,payload:{outcome:"ok",sessionId:identity.sessionId,requests:scopedRequests,analyses}};
 })}
 
 /** Separate public-CA TLS source pool; never reuse Supabase's pinned-root pool.
