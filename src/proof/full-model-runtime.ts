@@ -1,6 +1,7 @@
 /** Owned synthetic Node24 -> full migrator -> dedicated LOGIN -> FINAL BUNDLE
  * -> local HTTP Responses fixture + versioned MinIO. No production ports/keys.
  * READY metadata/ScopeKeys setup is a620 PORT fixture, not its full creator.
+ * Run Node24 --experimental-transform-types --import ./scripts/proof-typescript-loader.mjs.
  * MODEL_PROOF_BUNDLE must identify the build manifest's exact clean source. */
 import assert from"node:assert/strict";
 import pg from"pg";
@@ -130,7 +131,7 @@ try{
  const failed=(await owner.query("SELECT checkpoint,status FROM sessions.history_model_work")).rows[0];assert.equal(failed.status,"pending");assert.equal(failed.checkpoint.calls,"0");assert.equal(failed.checkpoint.cursor.rowOrdinal,"0");
  assert.equal((await owner.query("SELECT count(*)::int n FROM sessions.ingest_history_derived_objects WHERE object_key LIKE '%/bob-slice/%'")).rows[0].n,1);
  check("lost PUT response retains known intent and original durable cursor; no fake completion");
- await owner.query("UPDATE sessions.history_model_work SET next_at=clock_timestamp()");
+ await owner.query("UPDATE sessions.history_model_work SET next_attempt_at=clock_timestamp()");
  let complete=0;
  for(let i=0;i<12&&!complete;i++){const r=await run();complete+=r.completed;assert.equal(r.failed,0)}
  assert.equal(complete,1);assert(proof.providerCalls>10);assert(observed.some(s=>s.includes("message-30")));assert(observed.some(s=>s.includes("VISIBLE-MASKED-EVIDENCE")));assert(observed.every(s=>!s.includes("MOVED-PRIVATE-MUST-NOT-MODEL")));
