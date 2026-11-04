@@ -883,6 +883,8 @@ describe("migration up/down/up", () => {
     const db = await database();
     await seed(db, FIXTURE);
     // Newer migrations depending on catalog columns must roll back first.
+    await db.exec(read("supabase/rollbacks/20261103060000_session_analysis_publications.down.sql"));
+    await db.exec(read("supabase/rollbacks/20261103050000_session_desktop_catalog.down.sql"));
     await db.exec(read("supabase/rollbacks/20261103040000_session_replay_pages.down.sql"));
     await db.exec(read("supabase/rollbacks/20261104021000_session_directory_event_metadata.down.sql"));
     await db.exec(DOWN);
@@ -895,6 +897,8 @@ describe("migration up/down/up", () => {
     await db.exec(UP);
     await db.exec(read("supabase/migrations/20261104021000_session_directory_event_metadata.sql"));
     await db.exec(read("supabase/migrations/20261103040000_session_replay_pages.sql"));
+    await db.exec(read("supabase/migrations/20261103050000_session_desktop_catalog.sql"));
+    await db.exec(read("supabase/migrations/20261103060000_session_analysis_publications.sql"));
     expect(ids(await list(db, {}))).toEqual(["s1", "s2", "s3", "s4"]);
   });
 });

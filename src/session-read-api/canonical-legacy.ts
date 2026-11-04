@@ -1,3 +1,4 @@
+import { comparePublicTurnRows } from "../shared/legacy-turn-source.ts";
 /** Legacy public evidence preserved explicitly in the canonical raw stream. */
 import type { RelayhistoryStreamRecord } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import type { CanonicalIdentity } from "./canonical.ts";
@@ -55,6 +56,8 @@ export function canonicalLegacy(
       if (
         typeof p.id !== "string" ||
         "legacy:" + table + ":" + p.id !== record.record_id ||
+        (p.legacy_stored_source !== undefined &&
+          typeof p.legacy_stored_source !== "string") ||
         !integer(p.turn_index) ||
         Number(p.turn_index) > 2147483647 ||
         !["user", "assistant", "system"].includes(String(p.role)) ||
@@ -89,8 +92,14 @@ export function canonicalLegacy(
     }
     rows.push({ table: table!, row: p });
   }
+  const orderedTurns = rows
+    .filter((r) => r.table === "conversation_turns")
+    .sort((a, b) => comparePublicTurnRows(a.row, b.row));
+  let next = 0;
   return {
-    rows,
+    rows: rows.map((r) =>
+      r.table === "conversation_turns" ? orderedTurns[next++]! : r,
+    ),
     coverage: coverage
       ? { version: 1 as const, tables: [...LEGACY_SOURCE_TABLES] }
       : null,

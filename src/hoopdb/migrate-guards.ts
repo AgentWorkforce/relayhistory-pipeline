@@ -166,16 +166,21 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.applied_repo_evidence(jsonb,jsonb)",
   "sessions.canonical_remote(text)",
   "sessions.capture_session_replay_pages(text,text,text,text)",
+  "sessions.claim_session_analysis_cache()",
   "sessions.claim_session_large_read(uuid,integer)",
   "sessions.clean_root_commit(text)",
   "sessions.discover_session_large_reads()",
+  "sessions.enqueue_session_analysis_cache(text,text,text,text)",
   "sessions.enqueue_session_large_read(text,text,text,text)",
+  "sessions.finish_session_analysis_cache(text,text,text,text,bigint,text,uuid,text)",
+  "sessions.heartbeat_session_analysis_cache(text,text,text,text,bigint,text,uuid)",
   "sessions.heartbeat_session_large_read(text,text,text,text,uuid)",
   "sessions.jwt_org_id()",
   "sessions.jwt_workspace_ids()",
   "sessions.legacy_remote(text)",
   "sessions.lock_repo_catalog(text)",
   "sessions.member_of(text,text[])",
+  "sessions.publish_session_analysis_cache(text,text,text,text,bigint,text,timestamp with time zone,text,text,text,text,text,text,integer,uuid)",
   "sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)",
   "sessions.publish_session_replay_pages(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer)",
   "sessions.repo_backfill_report()",
@@ -1079,7 +1084,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "bd4f96a13c14a797e9ef25084460acc9d8f38bf88cfce8b9f9457fda4f82684d";
+  "5dbc589d358cd6b4947d655b02725923046141664b44b375ca89de1c0d00fe94";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

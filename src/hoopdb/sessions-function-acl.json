@@ -25,6 +25,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.claim_session_analysis_cache()": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.claim_session_large_read(uuid,integer)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -40,7 +44,19 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.enqueue_session_analysis_cache(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.enqueue_session_large_read(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.finish_session_analysis_cache(text,text,text,text,bigint,text,uuid,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.heartbeat_session_analysis_cache(text,text,text,text,bigint,text,uuid)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
@@ -370,6 +386,10 @@
     "sessions.pipeline_jobs_observability()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.publish_session_analysis_cache(text,text,text,text,bigint,text,timestamp with time zone,text,text,text,text,text,text,integer,uuid)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -405,6 +425,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.request_session_analysis_cache(text,text,text)": [
+      "<owner>:EXECUTE",
+      "session_directory_search_worker:EXECUTE"
+    ],
     "sessions.resolve_repo(text,text,text,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -421,6 +445,9 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_analysis_cache_demand(text,text,text,text,boolean)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_brief(text,text,text)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
@@ -432,8 +459,16 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_directory_analysis_cache(text,text,text)": [
+      "<owner>:EXECUTE",
+      "session_directory_search_worker:EXECUTE"
+    ],
     "sessions.session_directory_companions_follow()": [
       "<owner>:EXECUTE"
+    ],
+    "sessions.session_directory_desktop_catalog(text,text,text)": [
+      "<owner>:EXECUTE",
+      "session_directory_search_worker:EXECUTE"
     ],
     "sessions.session_directory_event_activity(text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
