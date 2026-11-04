@@ -61,7 +61,7 @@ export async function runSemanticCopyTick(deps: {
                 continue;
             let result;
             try {
-                result = await runSemanticCopyPage({ store, source, ch: deps.ch, featureTables: [EVENT_FEATURES_TABLE, BRIEF_FEATURES_TABLE], signal: controller.signal, now,
+                result = await runSemanticCopyPage({ store, source, ch: deps.ch, featureTables: {event:EVENT_FEATURES_TABLE,brief:BRIEF_FEATURES_TABLE}, signal: controller.signal, now,
                     verifySource: () => verifyFeatureSourceAuthority(source, FEATURE_SOURCE_AUTHORITY),
                     copyPage: async (k, previous) => { let n = batches[k]; for (;;) {
                         try {

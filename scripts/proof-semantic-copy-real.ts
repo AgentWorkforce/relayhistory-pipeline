@@ -69,14 +69,14 @@ try{
  const lease=await store.claim("event");assert(lease,"real final control lease");
  const refusal=async(work:()=>Promise<unknown>,reason:string)=>{let why="";try{await work()}catch(e:any){why=e.reason??e.message}assert(why===reason,"expected "+reason+" got "+why)};
  await ch.command("TRUNCATE TABLE session_feature_copy_profiles");
- await refusal(()=>publishSemanticCopyProfile(ch,lease!,["session_event_features","session_brief_features"]),"checkpoint_without_target_binding");
+ await refusal(()=>publishSemanticCopyProfile(ch,lease!,{event:"session_event_features",brief:"session_brief_features"}),"checkpoint_without_target_binding");
  const priorFeature=(await ch.select<any>("SELECT * FROM session_event_features FINAL WHERE event_id='e1'"))[0];
  await ch.insert("session_event_features",[{...priorFeature,version:"99999999",source_revision:"49999999"}]);
  const orphanStore=new SemanticCopyStore(db,"orphan-target",FEATURE_SOURCE_AUTHORITY.identitySha256);
  await orphanStore.register("a".repeat(64),profileRow.profile_hash,profileRow.profile_json);const orphan=await orphanStore.claim("event");assert(orphan,"orphan lease");
- await refusal(()=>publishSemanticCopyProfile(ch,orphan!,["session_event_features","session_brief_features"]),"unowned_target_not_empty");
+ await refusal(()=>publishSemanticCopyProfile(ch,orphan!,{event:"session_event_features",brief:"session_brief_features"}),"unowned_target_not_empty");
  await ch.insert("session_feature_copy_profiles",[{...profileRow,source_id:"foreign-source"}]);
- await refusal(()=>publishSemanticCopyProfile(ch,lease!,["session_event_features","session_brief_features"]),"target_binding_changed");
+ await refusal(()=>publishSemanticCopyProfile(ch,lease!,{event:"session_event_features",brief:"session_brief_features"}),"target_binding_changed");
  await ch.command("TRUNCATE TABLE session_feature_copy_profiles");await ch.insert("session_feature_copy_profiles",[profileRow]);
  await publishSemanticCopyAuthority(ch,lease!,true);
  let dirtyRefused=false;try{await readSemanticFeatureAuthority(ch,"legacy-main","event",FEATURE_SOURCE_AUTHORITY.identitySha256)}catch{dirtyRefused=true}assert(dirtyRefused,"dirty must refuse");

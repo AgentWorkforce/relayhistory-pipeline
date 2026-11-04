@@ -5,7 +5,7 @@ import { readFeatureJournalPage } from "./source.ts";
 import type { ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { SemanticCopyStore, SemanticCopyError, type SemanticCopyLease } from "./semantic-copy-store.ts";
 import { semanticCheckpoint, semanticDecimal, type SemanticFeatureCheckpoint } from "./semantic-copy-protocol.ts";
-import { publishSemanticCopyProfile, publishSemanticCopyAuthority } from "./semantic-copy-publication.ts";
+import { publishSemanticCopyProfile, publishSemanticCopyAuthority, type SemanticFeatureTables } from "./semantic-copy-publication.ts";
 export interface VerifiedFeatureSource {
     identitySha256: string;
     observedRevision: string;
@@ -15,7 +15,7 @@ export interface SemanticCopyPageDeps {
     source: FeatureReader;
     ch: ClickHouseClient;
     verifySource: () => Promise<VerifiedFeatureSource>;
-    featureTables: readonly string[];
+    featureTables: SemanticFeatureTables;
     copyPage: (kind: FeatureKind, previous: SemanticFeatureCheckpoint) => Promise<{
         next: SemanticFeatureCheckpoint;
         published: number;
@@ -56,14 +56,14 @@ export async function runSemanticCopyPage(deps: SemanticCopyPageDeps, kind: Feat
         active();
         await publishSemanticCopyProfile(deps.ch, c, deps.featureTables);
         active();
-        await publishSemanticCopyAuthority(deps.ch, c, true); // ACK dirty BEFORE any feature write.
-        await beat();
-        active();
         if (c.state.baselineH === null) {
             const h = (await readFeatureJournalPage(deps.source, kind, "0", 1)).observedRevision;
             c = await deps.store.initialize(c, h);
             active();
         }
+        await publishSemanticCopyAuthority(deps.ch, c, true); // ACK dirty BEFORE any feature write.
+        await beat();
+        active();
         const result = await deps.copyPage(kind, c.state);
         active();
         const proof = await verify();

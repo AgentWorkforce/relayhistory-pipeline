@@ -5,9 +5,11 @@ import { SemanticCopyError } from "./semantic-copy-store.ts";
 import { SEMANTIC_COPY_AUTHORITY_TABLE, SEMANTIC_COPY_PROFILE_TABLE, semanticStatusVersion, semanticSha256, semanticAuthorityHashInput, parseSemanticProfile } from "./semantic-copy-protocol.ts";
 const settings = { async_insert: 0, wait_for_async_insert: 1 };
 function profileRow(c: SemanticCopyLease) { return { source_id: c.sourceId, source_authority_hash: c.sourceAuthorityHash, target_hash: c.targetHash, profile_hash: c.profileHash, profile_json: c.profileJson }; }
-export async function publishSemanticCopyProfile(ch: ClickHouseClient, c: SemanticCopyLease, featureTables: readonly string[]) {
+export interface SemanticFeatureTables {event:string;brief:string}
+export async function publishSemanticCopyProfile(ch: ClickHouseClient, c: SemanticCopyLease, featureTables: SemanticFeatureTables) {
+    const tables=Object.values(featureTables);
     parseSemanticProfile(c.profileJson);
-    if (!featureTables.length || featureTables.some(t => !/^[a-z_][a-z0-9_]*$/u.test(t)))
+    if (Object.keys(featureTables).sort().join(",")!=="brief,event" || new Set(tables).size!==2 || tables.some(t => !/^[a-z_][a-z0-9_]*$/u.test(t)))
         throw new SemanticCopyError("target_inventory_invalid");
     const prior = await ch.select<any>("SELECT source_id,source_authority_hash,target_hash,profile_hash,profile_json FROM " + SEMANTIC_COPY_PROFILE_TABLE + " FINAL LIMIT 2", { settings: { max_result_rows: 2, max_result_bytes: 524288 } });
     const row = profileRow(c), same = (v: any) => Object.entries(row).every(([k, value]) => v[k] === value);
@@ -18,9 +20,17 @@ export async function publishSemanticCopyProfile(ch: ClickHouseClient, c: Semant
             throw new SemanticCopyError("checkpoint_without_target_binding");
         const counts = await ch.select<{
             n: string;
-        }>("SELECT toString(sum(n)) n FROM (" + featureTables.map(t => "SELECT count() n FROM " + t + " FINAL").join(" UNION ALL ") + ")", { settings: { max_result_rows: 1, max_result_bytes: 1024 } });
+        }>("SELECT toString(sum(n)) n FROM (" + tables.map(t => "SELECT count() n FROM " + t + " FINAL").join(" UNION ALL ") + ")", { settings: { max_result_rows: 1, max_result_bytes: 1024 } });
         if (counts.length !== 1 || counts[0]!.n !== "0")
             throw new SemanticCopyError("unowned_target_not_empty");
+    }
+    // A global profile does not prove ownership of a rebuilt per-kind checkpoint.
+    // Check BEFORE capturing H: a new baseline would otherwise skip old deletions.
+    if (c.state.baselineH===null) {
+        const kindCounts=await ch.select<{n:string}>("SELECT toString(count()) n FROM "+featureTables[c.kind]+" FINAL",{settings:{max_result_rows:1,max_result_bytes:1024}});
+        if(kindCounts.length!==1||kindCounts[0]!.n!=="0")throw new SemanticCopyError("unowned_kind_target");
+        const authorityCounts=await ch.select<{n:string}>("SELECT toString(count()) n FROM "+SEMANTIC_COPY_AUTHORITY_TABLE+" FINAL"+(prior.length?" WHERE kind={kind:String}":""),{params:prior.length?{kind:c.kind}:undefined,settings:{max_result_rows:1,max_result_bytes:1024}});
+        if(authorityCounts.length!==1||authorityCounts[0]!.n!=="0")throw new SemanticCopyError("unowned_kind_authority");
     }
     await ch.insert(SEMANTIC_COPY_PROFILE_TABLE, [row], { settings });
     const read = await ch.select<any>("SELECT source_id,source_authority_hash,target_hash,profile_hash,profile_json FROM " + SEMANTIC_COPY_PROFILE_TABLE + " FINAL LIMIT 2", { settings: { max_result_rows: 2, max_result_bytes: 524288 } });
