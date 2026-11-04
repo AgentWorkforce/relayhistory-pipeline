@@ -1,0 +1,10 @@
+DROP FUNCTION IF EXISTS sessions.finish_search_feature_copy(text,text,uuid,bigint,text,text);
+DROP FUNCTION IF EXISTS sessions.commit_search_feature_copy(text,text,uuid,bigint,text,jsonb,timestamp with time zone);
+DROP FUNCTION IF EXISTS sessions.heartbeat_search_feature_copy(text,text,uuid,bigint);
+DROP FUNCTION IF EXISTS sessions.initialize_search_feature_baseline(text,text,uuid,bigint,text,bigint);
+DROP FUNCTION IF EXISTS sessions.claim_search_feature_copy(text,text,text,uuid);
+DROP FUNCTION IF EXISTS sessions.register_search_feature_source(text,text,text,text,text);
+DROP FUNCTION IF EXISTS sessions.search_feature_copy_body(text,text);
+DROP FUNCTION IF EXISTS sessions.search_feature_copy_state_valid(jsonb);
+DROP TABLE IF EXISTS sessions.search_feature_copy_state;
+DROP TABLE IF EXISTS sessions.search_feature_sources;

@@ -214,3 +214,5 @@ describe("brief schedule invocation", () => {
     }
   });
 });
+
+test("semantic copier default-off returns before runtime/secret initialization",async()=>{const previous=process.env.SESSION_SEMANTIC_COPY_ENABLED;try{delete process.env.SESSION_SEMANTIC_COPY_ENABLED;expect(await handler({semanticCopy:true})).toEqual({ok:true})}finally{if(previous===undefined)delete process.env.SESSION_SEMANTIC_COPY_ENABLED;else process.env.SESSION_SEMANTIC_COPY_ENABLED=previous}});

@@ -8,6 +8,8 @@ import {
   DELIVERY_DELAY_SECONDS,
   FUNCTION_TIMEOUT_SECONDS,
   SESSION_BRIEF_RESOURCES,
+  SESSION_SEMANTIC_COPY_RESOURCES,
+  semanticCopyScheduleProps,
   SESSION_PIPELINE_RESOURCES,
   VISIBILITY_TIMEOUT_SECONDS,
   briefScheduleProps,
@@ -264,6 +266,28 @@ describe("session pipeline: deploy plan contract", () => {
     // A pipeline-free plan keeps the original contract.
     expect(check(plan({}, store))).toBe("post-apply");
     expect(() => check(plan({ transcripts: "update" }, store))).toThrow(/initial, recovery/);
+  });
+
+  const withSemantic=[...all,...SESSION_SEMANTIC_COPY_RESOURCES];
+  it("semantic copier defaults disabled with exact rule/account invoke permission",()=>{
+    expect(semanticCopyScheduleProps({names:p,functionArn:"fn",p:{},tags:{}})).toMatchObject({state:"DISABLED",scheduleExpression:"rate(1 minute)",targets:[{Input:JSON.stringify({semanticCopy:true})}]});
+    expect(sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:{}})).toMatchObject({SESSION_SEMANTIC_COPY_ENABLED:"0",SESSION_SEARCH_FEATURE_SOURCE_ID:""});
+    const enabled={semanticCopy:{enabled:true,sourceId:"reviewed-source"}};
+    expect(semanticCopyScheduleProps({names:p,functionArn:"fn",p:enabled,tags:{}}).state).toBe("ENABLED");
+    const permission=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:"old",briefRuleArn:"brief",semanticRuleArn:"exact-semantic-rule",roleArn:ROLE}).at(-1)!;
+    expect(permission.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn:"exact-semantic-rule",sourceAccount:ACCOUNT});
+  });
+  it("semantic phase keeps permission create-only and refuses mixed schedules, unrelated changes and unproven cascades",()=>{
+    const creates=Object.fromEntries(SESSION_SEMANTIC_COPY_RESOURCES.map(r=>[r,"create"]));expect(check(plan(creates,withSemantic))).toBe("session semantic copy rollout");
+    expect(check(plan({"session-semantic-copy-schedule":"update"},withSemantic))).toBe("session semantic copy update");
+    expect(()=>check(plan({"session-semantic-copy-permission":"update"},withSemantic))).toThrow(/unsafe action combination/);
+    expect(()=>check(plan(creates,[...all,"session-semantic-copy-schedule"]))).toThrow(/missing resource session-semantic-copy-permission/);
+    for(const action of ["delete","replace"])expect(()=>check(plan({"session-semantic-copy-schedule":action},withSemantic))).toThrow(/forbidden action/);
+    expect(()=>check(plan({...creates,trail:"update"},withSemantic))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-brief-schedule":"update"},[...withSemantic,...SESSION_BRIEF_RESOURCES]))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withSemantic))).toThrow(/without the role-ARN cascade/);
+    const withApi=[...withSemantic,"session-read-api","session-read-api-secret","session-read-api-errors-alarm","session-read-api-throttles-alarm"];
+    expect(()=>check(plan({...creates,"session-read-api":"update"},withApi))).toThrow(/only with no declared property changes/);
   });
 
   const withBrief = [...all, ...SESSION_BRIEF_RESOURCES];

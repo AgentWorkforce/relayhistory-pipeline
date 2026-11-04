@@ -40,6 +40,8 @@ import { TENANT_KEY_BASE } from "./tenants.ts";
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
   searchIndex?: boolean;
+  /** Default off; source identity must match the immutable CH copier binding. */
+  semanticCopy?: {enabled:boolean;sourceId:string};
   /** Default off. Requires separately reviewed normalized-prefix write/KMS permission and publication migration. */
   replayPages?: boolean;
   /** Lambda concurrency cap from the queue (2-10). Default 4. */
@@ -84,6 +86,7 @@ export const SESSION_PIPELINE_RESOURCES = [
  * (transcript-store.ts expectedResources).
  */
 export const SESSION_BRIEF_RESOURCES = ["session-brief-schedule", "session-brief-permission"] as const;
+export const SESSION_SEMANTIC_COPY_RESOURCES=["session-semantic-copy-schedule","session-semantic-copy-permission"] as const;
 /** The brief tick runs this often. */
 export const BRIEF_SCHEDULE_MINUTES = 1;
 
@@ -105,6 +108,7 @@ export interface SessionPipelineNames {
   secret: string;
   rule: string;
   briefRule: string;
+  semanticRule:string;
 }
 
 export function sessionPipelineNames(stage: string, accountId: string, region: string): SessionPipelineNames {
@@ -119,6 +123,7 @@ export function sessionPipelineNames(stage: string, accountId: string, region: s
     secret: `96bulls/${stage}/session-pipeline`,
     rule: n("session-reconcile"),
     briefRule: n("session-brief"),
+    semanticRule:n("session-semantic-copy"),
   };
 }
 
@@ -127,13 +132,16 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");
+  if(v.semanticCopy!==undefined){const c=v.semanticCopy as Record<string,unknown>|null;
+    if(!c||typeof c!=="object"||Array.isArray(c)||Object.getPrototypeOf(c)!==Object.prototype||Object.keys(c).some(k=>k!=="enabled"&&k!=="sourceId")||typeof c.enabled!=="boolean"||typeof c.sourceId!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(c.sourceId))refuse("transcriptStore.sessionPipeline.semanticCopy requires enabled and an explicit sourceId");
+  }
   if (v.briefs !== undefined) {
     const b = v.briefs as Record<string, unknown> | null;
     if (b === null || typeof b !== "object" || Array.isArray(b) || Object.getPrototypeOf(b) !== Object.prototype)
@@ -274,6 +282,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_PIPELINE_QUEUE_URL: i.names.queueUrl,
     SEARCH_INDEX_ENABLED: i.p.searchIndex ? "1" : "0",
     SESSION_REPLAY_PAGES_ENABLED: i.p.replayPages ? "1" : "0",
+    SESSION_SEMANTIC_COPY_ENABLED:i.p.semanticCopy?.enabled?"1":"0",
+    SESSION_SEARCH_FEATURE_SOURCE_ID:i.p.semanticCopy?.sourceId??"",
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",
@@ -324,7 +334,7 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
  * and brief rules, this account) and the function's own role (the reconcile chain),
  * all `lambda:InvokeFunction` only. Nothing public, no Function URL action.
  */
-export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; roleArn: string }) {
+export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; semanticRuleArn?:string; roleArn: string }) {
   return [
     {
       id: "session-reconcile-permission",
@@ -356,6 +366,7 @@ export function sessionPipelinePermissions(i: { accountId: string; functionName:
         sourceAccount: i.accountId,
       },
     },
+    ...(i.semanticRuleArn?[{id:"session-semantic-copy-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.semanticRuleArn,sourceAccount:i.accountId}}]:[]),
   ] as const;
 }
 
@@ -372,6 +383,11 @@ export function briefScheduleProps(i: { names: SessionPipelineNames; functionArn
     targets: [{ Id: "session-pipeline", Arn: i.functionArn, Input: JSON.stringify({ brief: true }) }],
     tags: i.tags,
   };
+}
+
+/** One bounded background feature tick; defaults disabled and carries no credentials. */
+export function semanticCopyScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
+ return {name:i.names.semanticRule,description:"96bulls verified global feature copy",scheduleExpression:"rate(1 minute)",state:i.p.semanticCopy?.enabled?("ENABLED" as const):("DISABLED" as const),targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({semanticCopy:true})}],tags:i.tags};
 }
 
 /** Step 1, before the transcripts key and bucket: the function (and so its role) must exist first. */
@@ -431,11 +447,13 @@ export const sessionPipelineWiring = (
       tags: i.tags("session-pipeline"),
     } as never);
     const briefRule = yield* AWS.EventBridge.Rule("session-brief-schedule", briefScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
+    const semanticRule=yield* AWS.EventBridge.Rule("session-semantic-copy-schedule",semanticCopyScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
     for (const { id, props } of sessionPipelinePermissions({
       accountId: i.accountId,
       functionName: i.fn.functionName as unknown as string,
       ruleArn: (rule as unknown as { ruleArn: string }).ruleArn,
       briefRuleArn: (briefRule as unknown as { ruleArn: string }).ruleArn,
+      semanticRuleArn:(semanticRule as unknown as {ruleArn:string}).ruleArn,
       roleArn,
     }))
       yield* AWS.Lambda.Permission(id, props as never);

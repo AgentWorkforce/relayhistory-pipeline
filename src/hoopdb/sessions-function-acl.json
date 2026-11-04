@@ -21,6 +21,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.claim_search_feature_copy(text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.claim_session_brief_documents(uuid,integer)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -36,6 +40,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.commit_search_feature_copy(text,text,uuid,bigint,text,jsonb,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.discover_session_large_reads()": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -44,7 +52,19 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.finish_search_feature_copy(text,text,uuid,bigint,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.heartbeat_search_feature_copy(text,text,uuid,bigint)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.heartbeat_session_large_read(text,text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.initialize_search_feature_baseline(text,text,uuid,bigint,text,bigint)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
@@ -103,6 +123,10 @@
     "sessions.queue_session_brief_document(jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.register_search_feature_source(text,text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.repo_backfill_report()": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -145,6 +169,12 @@
     "sessions.route_session_large_read(text,text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.search_feature_copy_body(text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.search_feature_copy_state_valid(jsonb)": [
+      "<owner>:EXECUTE"
     ],
     "sessions.search_session_directory(text,text,text,text,text,boolean,text,text,text,text,text,timestamp with time zone,timestamp with time zone,text,timestamp with time zone,text,text,text,integer)": [
       "<owner>:EXECUTE",

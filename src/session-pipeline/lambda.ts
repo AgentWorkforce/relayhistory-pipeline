@@ -48,11 +48,14 @@ import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
 import { briefTick } from "../session-brief/worker.ts";
+import {runSemanticCopyTick} from "../search-features/semantic-copy-job.ts";
+import {semanticReadonlyPool,semanticFeatureReader} from "../search-features/semantic-copy-source-pool.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
   clickhouse?: { url: string; user: string; password: string; database: string };
   openai_api_key?: string;
+  analysis_source_readonly_url?: string;
 }
 
 export interface LambdaEnv {
@@ -64,6 +67,8 @@ export interface LambdaEnv {
   searchEnabled: boolean;
   replayPagesEnabled: boolean;
   largeScopeHandoffEnabled?: boolean;
+  semanticCopyEnabled?: boolean;
+  semanticSourceId?: string;
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
   dbPoolMax: number;
@@ -87,6 +92,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     searchEnabled: env.SEARCH_INDEX_ENABLED === "1",
     replayPagesEnabled: env.SESSION_REPLAY_PAGES_ENABLED === "1",
     largeScopeHandoffEnabled: env.SESSION_LARGE_READ_HANDOFF_ENABLED === "1",
+    semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
+    semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
     fanout,
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
@@ -111,6 +118,7 @@ export function parseSecret(text: string): PipelineSecret {
   }
   if (v.openai_api_key !== undefined && (typeof v.openai_api_key !== "string" || !v.openai_api_key.trim()))
     throw new Error("session pipeline secret openai_api_key must be a non-empty string when present");
+  if(v.analysis_source_readonly_url!==undefined&&(typeof v.analysis_source_readonly_url!=="string"||!/^postgres(?:ql)?:\/\//u.test(v.analysis_source_readonly_url)))throw new Error("session pipeline secret readonly source URL invalid");
   return v as PipelineSecret;
 }
 
@@ -167,6 +175,7 @@ interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
   brief: ReturnType<typeof briefTick>;
+  semanticCopy?:()=>Promise<unknown>;
 }
 
 let runtime: Promise<Runtime> | undefined;
@@ -238,7 +247,13 @@ async function init(): Promise<Runtime> {
     config: briefConfig(),
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
-  return { env, deps, brief };
+  let semanticCopy:Runtime["semanticCopy"];
+  if(env.semanticCopyEnabled){
+    if(!secret.clickhouse||!secret.analysis_source_readonly_url||!env.semanticSourceId)throw new Error("semantic copier configuration incomplete");
+    const source=semanticFeatureReader(semanticReadonlyPool(secret.analysis_source_readonly_url)),ch=createClickHouseClient(secret.clickhouse),sourceId=env.semanticSourceId,endpoint=secret.clickhouse.url;
+    semanticCopy=async()=>{const result=await runSemanticCopyTick({db,source,ch,sourceId,endpoint});if(result.failed)throw new Error("semantic copier kind failed");return result};
+  }
+  return { env, deps, brief,semanticCopy };
 }
 
 function ready(): Promise<Runtime> {
@@ -403,9 +418,14 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   return { ...summary, link };
 }
 
-type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; cursor?: string; since?: string; link?: number };
+type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; semanticCopy?:unknown; cursor?: string; since?: string; link?: number };
 
 export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok: boolean }> {
+  if(event?.semanticCopy===true){
+    if(process.env.SESSION_SEMANTIC_COPY_ENABLED!=="1")return {ok:true};
+    const rt=await ready();if(!rt.semanticCopy)throw new Error("semantic copier unavailable");
+    await rt.semanticCopy();return {ok:true};
+  }
   if (Array.isArray(event?.Records)) {
     let rt: Runtime;
     try {

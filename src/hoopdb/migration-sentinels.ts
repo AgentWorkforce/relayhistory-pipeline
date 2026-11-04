@@ -30,6 +30,7 @@ export interface Sentinel {
 }
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
+  "upstream:20261103100000_semantic_copy_state.sql": {evidence:"table sessions.search_feature_copy_state",sql:relation("sessions.search_feature_copy_state")},
   "upstream:20261103090000_session_brief_documents.sql": {evidence:"table sessions.session_brief_document_outbox",sql:relation("sessions.session_brief_document_outbox")},
   "upstream:20261103080000_session_large_read_jobs.sql": { evidence: "table sessions.session_large_read_jobs", sql: relation("sessions.session_large_read_jobs") },
   "upstream:20261103040000_session_replay_pages.sql": { evidence: "table sessions.session_replay_publications", sql: relation("sessions.session_replay_publications") },
