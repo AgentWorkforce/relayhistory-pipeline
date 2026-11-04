@@ -47,7 +47,9 @@ export class CanonicalReadError extends Error {
     this.name = "CanonicalReadError";
   }
 }
+import type{HistoryLogicalMask}from"../shared/history-visibility.ts";
 export interface CanonicalDeps {
+  historyMask?:HistoryLogicalMask;
   pointers(identity: CanonicalIdentity): Promise<CanonicalPointer[]>;
   store: ObjectStore;
   provider: string;
@@ -153,6 +155,7 @@ async function snapshotWithLimits(
     [...byKey.keys()],
     {
       store: deps.store,
+      historyMask:deps.historyMask,
       prefixFor: () =>
         deps.prefix.PIPELINE_ORG_FROM_PREFIX === "true"
           ? [deps.prefix.PIPELINE_KEY_PREFIX, identity.orgId]

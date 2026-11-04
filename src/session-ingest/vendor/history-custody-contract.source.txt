@@ -1,0 +1,125 @@
+/**
+ * PRIVATE full-publication source metadata port. No public HTTP route and no
+ * initial upload witness change. The Node SDK finishes every page inside one
+ * read-only repeatable-read transaction before returning complete:true.
+ */
+import type {
+  SourcePrivacyPacket,
+  SourceCustodyWitness,
+} from "./current-custody-protocol.js";
+
+export const HISTORY_CURRENT_METADATA_PROTOCOL = "history-current-metadata-v1";
+export const HISTORY_CUSTODY_RECORD_IDS = 500;
+export const HISTORY_CUSTODY_OWNER_PAGE = 8;
+export const HISTORY_CUSTODY_ROWS = 10_000;
+export const HISTORY_CUSTODY_PAGE_BYTES = 16 * 1024 * 1024;
+export const HISTORY_CUSTODY_LOOKUP_BYTES = 64 * 1024 * 1024;
+
+export interface HistoryCustodyProviderIdentity {
+  protocol: "history-source-provider-v1";
+  hostname: string;
+  database: string;
+  databaseOid: string;
+  serverVersion: string;
+  catalogSequenceOid: string;
+  projectionSequenceOid: string;
+}
+export interface HistoryCustodyAuthority {
+  sourceAuthoritySha256: string;
+  /** Excludes caller role; Root binds this to the original provider/DB proof. */
+  providerIdentitySha256: string;
+  providerIdentity: HistoryCustodyProviderIdentity;
+  /** Safe catalog/index/role facts only. Never a URL, password, or row payload. */
+  descriptor: Record<string, unknown>;
+}
+export interface HistoryCustodyLookupInput {
+  orgId: string;
+  workspaceId: string;
+  recordIds: readonly string[];
+  /** All raw-pointer and prior target owners, including owners with no live row. */
+  priorOwners: readonly string[];
+  expectedSourceAuthoritySha256: string;
+  expectedProviderIdentitySha256: string;
+  controlEpoch: string;
+}
+export interface HistoryCustodyRow {
+  originId: string;
+  recordId: string;
+  userId: string;
+  revision: string;
+  revisionId: string;
+  digest: string;
+  kind: string;
+  source: string;
+  sessionId: string | null;
+  operation: "upsert" | "delete";
+  receivedAt: string;
+  /** Independent nullable domains. Neither is a globally unique clock. */
+  catalogAcceptedSeq: string | null;
+  projectionAcceptedSeq: string | null;
+  projectedExists: boolean;
+  currentFenced: boolean;
+}
+export interface HistoryCustodyOwnerHead {
+  userId: string;
+  controlEpoch: string;
+  version: string;
+  pending: boolean;
+  pendingControl: SourceCustodyWitness["pendingControl"];
+  privacyVersion: string;
+}
+export interface HistoryCustodyOwner extends HistoryCustodyOwnerHead {
+  /** Null never proves empty privacy; completed-version USER seals remain required. */
+  privacy: SourcePrivacyPacket | null;
+}
+export interface HistoryCustodyTerminal {
+  rowCount: number;
+  ownerCount: number;
+  recordPages: number;
+  ownerPages: number;
+  /** SHA256(previous hex + newline + native PostgreSQL JSONB page SHA256). */
+  chainSha256: string;
+}
+export interface HistoryCustodySnapshot {
+  protocol: typeof HISTORY_CURRENT_METADATA_PROTOCOL;
+  orgId: string;
+  workspaceId: string;
+  sourceAuthoritySha256: string;
+  providerIdentitySha256: string;
+  controlEpoch: string;
+  complete: true;
+  requestedRecordIds: string[];
+  rows: HistoryCustodyRow[];
+  owners: HistoryCustodyOwner[];
+  terminal: HistoryCustodyTerminal;
+  lookupSha256: string;
+}
+export interface HistoryCustodyRevalidateInput {
+  orgId: string;
+  workspaceId: string;
+  expectedSourceAuthoritySha256: string;
+  expectedProviderIdentitySha256: string;
+  controlEpoch: string;
+  /** The COMPLETE snapshot owner union, not just currently surviving row owners. */
+  owners: readonly string[];
+}
+export interface HistoryCustodyRevalidation {
+  protocol: typeof HISTORY_CURRENT_METADATA_PROTOCOL;
+  sourceAuthoritySha256: string;
+  providerIdentitySha256: string;
+  controlEpoch: string;
+  complete: true;
+  owners: HistoryCustodyOwnerHead[];
+  lookupSha256: string;
+}
+export interface HistoryCustodySourcePort {
+  snapshot(
+    input: HistoryCustodyLookupInput,
+    signal?: AbortSignal,
+  ): Promise<HistoryCustodySnapshot>;
+  /** Fresh source statement snapshot after all metadata/S3 work, before target CAS. */
+  revalidate(
+    input: HistoryCustodyRevalidateInput,
+    signal?: AbortSignal,
+  ): Promise<HistoryCustodyRevalidation>;
+}
