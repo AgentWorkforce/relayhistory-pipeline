@@ -32,6 +32,8 @@ async function fixture(){
  `);
  const evidence={generation:GEN,identity:captured.identity,source:captured.source,authorityId:ID,maskSha256:HASH};
  await db.query("INSERT INTO sessions.ingest_history_scope_versions VALUES($1::jsonb)",[JSON.stringify(evidence)]);
+ await pg.exec(await readFile(new URL("../../../supabase/bootstrap/session_history_model_worker.sql",import.meta.url),"utf8"));
+ for(const name of ["capture","register_object","replay_descriptor"])await pg.exec("CREATE FUNCTION sessions.session_history_"+name+"(p jsonb)RETURNS jsonb LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$SELECT '{}'::jsonb$$;REVOKE ALL ON FUNCTION sessions.session_history_"+name+"(jsonb) FROM PUBLIC");
  await pg.exec(await readFile(new URL("../../../supabase/migrations/20261104063000_history_model_work.sql",import.meta.url),"utf8"));
  return{pg,db,config,evidence,async enqueue(){return enqueueFullModelWork(db,captured,config)}};
 }

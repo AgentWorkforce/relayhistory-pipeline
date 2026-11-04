@@ -1,3 +1,4 @@
+import{ROLE_VERIFIERS}from"../hoopdb/role-verifier-contract.ts";
 /** Default-off host Node runtime. Managed credentials are pinned IMDSv2 only;
  * source SQL/CH/legacy compute are never run on the ingress request path.
  */
@@ -51,7 +52,7 @@ export interface PublicationRuntimeOverrides{
 export async function runCanonicalPublicationRuntime(env:NodeJS.ProcessEnv,mode:'publish'|'gc',overrides:PublicationRuntimeOverrides={},external?:AbortSignal){
  if(!publicationEnabled(env,mode))return{enabled:false as const};
  const config=publicationRuntimeConfig(env),assets=await(overrides.assets??derivedSchemaAssets)();
- if(assets.expected.generation!==config.generation||!assets.expected.names.length||Object.values(assets.verifiers).length!==4||Object.values(assets.verifiers).some(s=>!s?.trim()))no('compiled_generation_mismatch');
+ if(assets.expected.generation!==config.generation||!assets.expected.names.length||Object.values(assets.verifiers).length!==ROLE_VERIFIERS.length||Object.values(assets.verifiers).some(s=>!s?.trim()))no('compiled_generation_mismatch');
  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),config.budgetMs),signal=AbortSignal.any([controller.signal,...(external?[external]:[])]),deadline=Date.now()+config.budgetMs;
  let pool:pg.Pool|undefined;
  try{

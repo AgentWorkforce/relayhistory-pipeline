@@ -8,6 +8,7 @@
  * Helm hooks. Idempotent and safe to run on every `up`.
  */
 import { createHash } from "node:crypto";
+import{ROLE_VERIFIERS}from"./role-verifier-contract.ts";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,6 +67,8 @@ const TOKEN_VERIFIER_VERIFY = join(
 // file. 20261102010000 verifies them and fails closed if absent (42704); it never creates them.
 const INGEST_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
 const INGEST_ROLE_VERIFY = join(ROOT,"supabase/bootstrap/session_ingest_verify.sql");
+const MODEL_WORKER_BOOTSTRAP=join(ROOT,"supabase/bootstrap/session_history_model_worker.sql");
+const MODEL_WORKER_VERIFY=join(ROOT,"supabase/bootstrap/session_history_model_verify.sql");
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
 // The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
@@ -259,23 +262,11 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
             path: TOKEN_VERIFIER_BOOTSTRAP,
           },
           { name: "bootstrap:session_ingest_roles", path: INGEST_BOOTSTRAP },
+          {name:"bootstrap:session_history_model_worker",path:MODEL_WORKER_BOOTSTRAP},
         ]
       : []),
     ...(await schemaSteps()),
-    ...(profile.verify
-      ? [
-          {
-            name: "verify:session_directory_search_worker",
-            path: WORKER_VERIFY,
-          },
-          {
-            name: "verify:session_token_verifier",
-            path: TOKEN_VERIFIER_VERIFY,
-          },
-          {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
-          {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
-        ]
-      : []),
+    ...(profile.verify ? ROLE_VERIFIERS.map(({name,path})=>({name,path})) : []),
   ];
 }
 
@@ -301,10 +292,7 @@ export async function generation(): Promise<string> {
       path: join(UPSTREAM_MIGRATIONS, f),
     })),
     ...ours.map((f) => ({ name: `96bulls:${f}`, path: join(OURS, f) })),
-    { name: "verify:session_directory_search_worker", path: WORKER_VERIFY },
-    { name: "verify:session_token_verifier", path: TOKEN_VERIFIER_VERIFY },
-    {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
-    {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
+    ...ROLE_VERIFIERS.map(({name,path})=>({name,path})),
   ];
   const parts: string[][] = [];
   for (const s of steps)

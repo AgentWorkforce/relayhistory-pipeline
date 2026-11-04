@@ -1,5 +1,7 @@
 /** HoopDb access: a pg Pool that satisfies the vendored SqlExecutor, plus readiness gates. */
 import { readFileSync } from "node:fs";
+import{ROLE_VERIFIERS,type SchemaVerifierSql}from"../hoopdb/role-verifier-contract.ts";
+export type{SchemaVerifierSql}from"../hoopdb/role-verifier-contract.ts";
 import { RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
@@ -111,24 +113,15 @@ export const ROLE_VERIFY_SQL_PATH = fileURLToPath(
 // external mark_pass wrapper, and this live gate. Read-only.
 export const INGEST_SEED_VERIFY_SQL_PATH = fileURLToPath(new URL("../../supabase/bootstrap/session_ingest_seeder_verify.sql", import.meta.url));
 export const TOKEN_VERIFIER_VERIFY_SQL_PATH = fileURLToPath(new URL("../../supabase/bootstrap/session_token_verifier_verify.sql", import.meta.url));
+export const MODEL_WORKER_VERIFY_SQL_PATH=fileURLToPath(new URL("../../supabase/bootstrap/session_history_model_verify.sql",import.meta.url));
 export const INGEST_ROLE_VERIFY_SQL_PATH = fileURLToPath(new URL("../../supabase/bootstrap/session_ingest_verify.sql", import.meta.url));
 
 /** Trusted build input only: Lambda embeds these same authoritative SQL files.
  * Never populated from a request, environment variable or database row. */
-export interface SchemaVerifierSql {
-  readonly searchWorker: string;
-  readonly tokenVerifier: string;
-  readonly ingestSeeder: string;
-  readonly ingest: string;
-}
+
 let localVerifierSql: SchemaVerifierSql | undefined;
 function filesystemVerifierSql(): SchemaVerifierSql {
-  return localVerifierSql ??= {
-    searchWorker: readFileSync(ROLE_VERIFY_SQL_PATH, "utf8"),
-    tokenVerifier: readFileSync(TOKEN_VERIFIER_VERIFY_SQL_PATH, "utf8"),
-    ingestSeeder: readFileSync(INGEST_SEED_VERIFY_SQL_PATH, "utf8"),
-    ingest: readFileSync(INGEST_ROLE_VERIFY_SQL_PATH, "utf8"),
-  };
+  return localVerifierSql ??= Object.fromEntries(ROLE_VERIFIERS.map(v=>[v.key,readFileSync(v.path,"utf8")])) as unknown as SchemaVerifierSql;
 }
 
 /**
@@ -231,12 +224,9 @@ export async function schemaVerdict(
       stage = "verify";
       const verifierSql = opts.verifierSql ?? filesystemVerifierSql();
       // An incomplete packaged contract must close the gate, never skip a verifier.
-      if (!verifierSql.searchWorker?.trim() || !verifierSql.tokenVerifier?.trim() || !verifierSql.ingestSeeder?.trim() || !verifierSql.ingest?.trim())
+      if (ROLE_VERIFIERS.some(v=>!verifierSql[v.key]?.trim()))
         throw Object.assign(new Error("schema verifier assets are missing"), { code: "gate_assets_missing" });
-      await tx.query(verifierSql.searchWorker);
-      await tx.query(verifierSql.tokenVerifier);
-      await tx.query(verifierSql.ingestSeeder);
-      await tx.query(verifierSql.ingest);
+      for(const v of ROLE_VERIFIERS)await tx.query(verifierSql[v.key]);
       await tx.query(SESSIONS_FUNCTION_GATE_SQL);
       if (opts.afterVerify) await opts.afterVerify(); // test seam: a concurrent flip lands here
       stage = "final";

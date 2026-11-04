@@ -16,7 +16,30 @@ const array=verifier.match(/v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/)
 if(!array||array.length!==1)throw Error("model_verifier_policy_drift");
 let v=verifier.replace(array[0],"v_allowed text[] := ARRAY[\n"+MODEL_WORKER_FUNCTIONS.map(f=>" '"+f+"'").join(",\n")+"\n ]::text[];")
  .replaceAll("bulls96_session_ingest",MODEL_WORKER_ROLE).replaceAll("session ingest","session model");
-const outputs={"supabase/bootstrap/session_history_model_worker.sql":stamp+b,"supabase/bootstrap/session_history_model_verify.sql":stamp+v};
+const grants=`-- BEGIN GENERATED MODEL CAPABILITIES
+-- PROPOSED source contract, not an operator approval. Bare role must be created
+-- through its reviewed privileged prerequisite; this migrator never creates it.
+DO $model_grants$
+DECLARE r pg_roles%ROWTYPE;f text;p record;
+BEGIN
+ SELECT * INTO r FROM pg_roles WHERE rolname='${MODEL_WORKER_ROLE}';
+ IF NOT FOUND OR r.rolsuper OR r.rolinherit OR r.rolbypassrls OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication
+  OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=r.oid) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='model role prerequisite absent or unsafe';END IF;
+ FOREACH f IN ARRAY ARRAY[${MODEL_WORKER_FUNCTIONS.map(f=>"'"+f+"'").join(",")}]::text[] LOOP
+  SELECT proowner,prosecdef INTO p FROM pg_proc WHERE oid=to_regprocedure(f);
+  IF NOT FOUND OR NOT p.prosecdef OR p.proowner IS DISTINCT FROM(SELECT oid FROM pg_roles WHERE rolname=current_user)
+   OR p.proowner=r.oid THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='model RPC creator mismatch';END IF;
+ END LOOP;
+END $model_grants$;
+GRANT USAGE ON SCHEMA sessions TO ${MODEL_WORKER_ROLE};
+${MODEL_WORKER_FUNCTIONS.map(f=>'GRANT EXECUTE ON FUNCTION '+f+' TO '+MODEL_WORKER_ROLE+';').join('\n')}
+-- END GENERATED MODEL CAPABILITIES`;
+const migrationPath="supabase/migrations/20261104063000_history_model_work.sql";
+let migration=await read(migrationPath);
+const pattern=/-- BEGIN GENERATED MODEL CAPABILITIES[\s\S]*?-- END GENERATED MODEL CAPABILITIES/;
+migration=pattern.test(migration)?migration.replace(pattern,()=>grants):migration+"\n"+grants+"\n";
+const outputs={"supabase/bootstrap/session_history_model_worker.sql":stamp+b,"supabase/bootstrap/session_history_model_verify.sql":stamp+v,[migrationPath]:migration};
 let drift=false;
 for(const[p,out]of Object.entries(outputs)){
  let old:string|undefined;try{old=await read(p)}catch{}

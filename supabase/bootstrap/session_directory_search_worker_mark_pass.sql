@@ -35,6 +35,7 @@ SELECT set_config('hoopdb.db_mode', :'db_mode', true);
 \ir session_token_verifier_verify.sql
 \ir session_ingest_seeder_verify.sql
 \ir session_ingest_verify.sql
+\ir session_history_model_verify.sql
 DO $mark$
 DECLARE
   v_gen text := current_setting('hoopdb.role_validation_generation');

@@ -4,10 +4,12 @@ import { packagedDerivedSchemaSource, derivedSchemaBuildPlugin } from "../derive
 import { derivedSchemaAssets } from "../../../src/session-pipeline/derived-schema.ts";
 import { ROLE_VERIFY_SQL_PATH, TOKEN_VERIFIER_VERIFY_SQL_PATH, schemaVerdict, type Transact } from "../../../src/shared/db.ts";
 
+import{ROLE_VERIFIERS}from"../../../src/hoopdb/role-verifier-contract.ts";
+
 const originalMode = process.env.HOOPDB_DB_MODE;
 afterEach(() => { if (originalMode === undefined) delete process.env.HOOPDB_DB_MODE; else process.env.HOOPDB_DB_MODE = originalMode; });
 
-test("packaged contract carries the exact authoritative schema and both SQL verifiers", async () => {
+test("packaged contract carries the exact authoritative schema and every authoritative SQL verifier", async () => {
   delete process.env.HOOPDB_DB_MODE;
   const expected = await derivedSchemaAssets();
   const source = await packagedDerivedSchemaSource();
@@ -16,7 +18,7 @@ test("packaged contract carries the exact authoritative schema and both SQL veri
   expect(captured).toEqual(expected);
   expect(Object.isFrozen(captured.verifiers)).toBe(true);
   expect(expected.verifiers.searchWorker).toBe(await readFile(ROLE_VERIFY_SQL_PATH, "utf8"));
-  expect(expected.verifiers.tokenVerifier).toBe(await readFile(TOKEN_VERIFIER_VERIFY_SQL_PATH, "utf8"));
+  for(const v of ROLE_VERIFIERS)expect(expected.verifiers[v.key]).toBe(await readFile(v.path,"utf8"));
   process.env.HOOPDB_DB_MODE = "supabase";
   expect((await packaged.derivedSchemaAssets()).expected).toEqual({ ...expected.expected, dbMode: "supabase" });
 });
@@ -30,9 +32,12 @@ test("an incomplete packaged verifier closes the gate rather than skipping check
       ? assets.expected.names.map(name => ({ name }))
       : sql.includes("WHERE name = $1") ? [{ generation: assets.expected.generation, status: "pass" }] : [] } as never;
   } });
-  expect(await schemaVerdict(assets.expected, transact, { verifierSql: { ...assets.verifiers, tokenVerifier: "" } }))
-    .toEqual({ ok: false, reason: "role_validation_failed", error_code: "gate_assets_missing" });
-  expect(seen).not.toContain(assets.verifiers.searchWorker);
+  for(const v of ROLE_VERIFIERS){
+    seen.length=0;
+    expect(await schemaVerdict(assets.expected, transact, { verifierSql: { ...assets.verifiers, [v.key]: "" } }))
+      .toEqual({ ok: false, reason: "role_validation_failed", error_code: "gate_assets_missing" });
+    for(const source of Object.values(assets.verifiers))expect(seen).not.toContain(source);
+  }
 });
 
 test("build plugin only replaces its own schema module", async () => {
@@ -40,7 +45,7 @@ test("build plugin only replaces its own schema module", async () => {
   const watched: string[] = [];
   await packagedDerivedSchemaSource(path => watched.push(path));
   expect(watched).toContain(ROLE_VERIFY_SQL_PATH);
-  expect(watched).toContain(TOKEN_VERIFIER_VERIFY_SQL_PATH);
+  for(const v of ROLE_VERIFIERS)expect(watched).toContain(v.path);
   const assets = await derivedSchemaAssets();
   for (const name of assets.expected.names)
     expect(watched.some(path => path.endsWith(name.slice(name.indexOf(":") + 1)))).toBe(true);

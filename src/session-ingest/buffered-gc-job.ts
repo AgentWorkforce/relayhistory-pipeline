@@ -1,3 +1,4 @@
+import{ROLE_VERIFIERS}from"../hoopdb/role-verifier-contract.ts";
 /** Permanent buffered GC job. Default-off Lambda entry imports this only when armed.
  * Credentials are execution-role sessions; transcript bodies/keys and secret text
  * never reach logs. SQL operations reuse the independently reviewed owned canceler.
@@ -61,7 +62,7 @@ export interface GcJobOverrides{
 export async function runBufferedGcJob(env:NodeJS.ProcessEnv,overrides:GcJobOverrides={}){
  const config=gcJobConfig(env),assets=await(overrides.assets??derivedSchemaAssets)();
  if(assets.expected.generation!==config.expectedGeneration||!assets.expected.names.length||
-  Object.values(assets.verifiers).length!==4||Object.values(assets.verifiers).some(s=>typeof s!=="string"||!s.trim()))no("compiled_generation_mismatch");
+  Object.values(assets.verifiers).length!==ROLE_VERIFIERS.length||Object.values(assets.verifiers).some(s=>typeof s!=="string"||!s.trim()))no("compiled_generation_mismatch");
  const deadline=Date.now()+config.budgetMs,controller=new AbortController(),timer=setTimeout(()=>controller.abort(),config.budgetMs);
  const actualFetch=overrides.fetcher??fetch;
  const boundedFetch=(async(input:Parameters<typeof fetch>[0],init?:RequestInit)=>{

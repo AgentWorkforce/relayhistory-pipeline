@@ -534,19 +534,11 @@ describe("the live gate: the marker is never the sole authority", () => {
   const markPass = (gen: string) =>
     MARK_PASS.split("\n")
       .filter((l) => !l.startsWith("\\set "))
-      .map((l) =>
-        l === "\\ir session_directory_search_worker_verify.sql"
-          ? VERIFY
-          : l === "\\ir session_token_verifier_verify.sql"
-            ? TOKEN_VERIFY
-            : l === "\\ir session_ingest_seeder_verify.sql"
-              ? SEEDER_VERIFY
-              : l === "\\ir session_ingest_verify.sql"
-                ? INGEST_VERIFY
-                : l
-                .replace(":'generation'", `'${gen.replace(/'/g, "''")}'`)
-                .replace(":'db_mode'", "'local'"),
-      )
+      .map(l=>{
+        const include=/^\\ir ([a-z_]+\.sql)$/.exec(l);
+        if(include)return readFileSync(join(root,"supabase/bootstrap",include[1]!),"utf8");
+        return l.replace(":'generation'", "'"+gen.replace(/'/g,"''")+"'").replace(":'db_mode'","'local'");
+      })
       .join("\n");
   const runMarkPass = async (db: PGlite, gen: string) => {
     const error = await failure(db.exec(markPass(gen)));

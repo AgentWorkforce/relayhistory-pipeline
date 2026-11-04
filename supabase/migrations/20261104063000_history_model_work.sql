@@ -235,3 +235,29 @@ BEGIN
   JOIN pg_roles r ON r.oid=a.grantee WHERE c.oid=t AND a.grantee<>c.relowner LOOP
   EXECUTE format('REVOKE ALL ON TABLE %s FROM %I',t,grantee);END LOOP;
 END $acl$;
+
+-- BEGIN GENERATED MODEL CAPABILITIES
+-- PROPOSED source contract, not an operator approval. Bare role must be created
+-- through its reviewed privileged prerequisite; this migrator never creates it.
+DO $model_grants$
+DECLARE r pg_roles%ROWTYPE;f text;p record;
+BEGIN
+ SELECT * INTO r FROM pg_roles WHERE rolname='bulls96_session_model';
+ IF NOT FOUND OR r.rolsuper OR r.rolinherit OR r.rolbypassrls OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication
+  OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=r.oid) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='model role prerequisite absent or unsafe';END IF;
+ FOREACH f IN ARRAY ARRAY['sessions.session_history_capture(jsonb)','sessions.session_history_model_checkpoint(jsonb)','sessions.session_history_model_claim(jsonb)','sessions.session_history_model_enqueue(jsonb)','sessions.session_history_model_heartbeat(jsonb)','sessions.session_history_register_object(jsonb)','sessions.session_history_replay_descriptor(jsonb)']::text[] LOOP
+  SELECT proowner,prosecdef INTO p FROM pg_proc WHERE oid=to_regprocedure(f);
+  IF NOT FOUND OR NOT p.prosecdef OR p.proowner IS DISTINCT FROM(SELECT oid FROM pg_roles WHERE rolname=current_user)
+   OR p.proowner=r.oid THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='model RPC creator mismatch';END IF;
+ END LOOP;
+END $model_grants$;
+GRANT USAGE ON SCHEMA sessions TO bulls96_session_model;
+GRANT EXECUTE ON FUNCTION sessions.session_history_capture(jsonb) TO bulls96_session_model;
+GRANT EXECUTE ON FUNCTION sessions.session_history_model_checkpoint(jsonb) TO bulls96_session_model;
+GRANT EXECUTE ON FUNCTION sessions.session_history_model_claim(jsonb) TO bulls96_session_model;
+GRANT EXECUTE ON FUNCTION sessions.session_history_model_enqueue(jsonb) TO bulls96_session_model;
+GRANT EXECUTE ON FUNCTION sessions.session_history_model_heartbeat(jsonb) TO bulls96_session_model;
+GRANT EXECUTE ON FUNCTION sessions.session_history_register_object(jsonb) TO bulls96_session_model;
+GRANT EXECUTE ON FUNCTION sessions.session_history_replay_descriptor(jsonb) TO bulls96_session_model;
+-- END GENERATED MODEL CAPABILITIES

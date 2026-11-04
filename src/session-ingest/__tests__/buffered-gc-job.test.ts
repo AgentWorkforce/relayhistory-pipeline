@@ -22,7 +22,7 @@ test("dedicated ingest login uses pinned TLS; URL options cannot disable it",()=
 });
 test("compiled generation mismatch refuses before secret retrieval",async()=>{
  let secrets=0;
- await expect(runBufferedGcJob(env,{assets:async()=>({expected:{names:["x"],generation:"b".repeat(64)},verifiers:{searchWorker:"x",tokenVerifier:"x",ingestSeeder:"x",ingest:"x"}}),secret:async()=>{secrets++;throw Error("unused")}})).rejects.toMatchObject({code:"compiled_generation_mismatch"});
+ await expect(runBufferedGcJob(env,{assets:async()=>({expected:{names:["x"],generation:"b".repeat(64)},verifiers:{searchWorker:"x",tokenVerifier:"x",ingestSeeder:"x",ingest:"x",modelWorker:"x"}}),secret:async()=>{secrets++;throw Error("unused")}})).rejects.toMatchObject({code:"compiled_generation_mismatch"});
  expect(secrets).toBe(0);
 });
 test("buffer-only store refuses canonical/object enumeration and invalid paths before transport",async()=>{
