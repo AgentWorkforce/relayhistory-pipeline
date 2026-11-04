@@ -10,7 +10,7 @@ DECLARE
   v_role pg_roles%ROWTYPE;
   v_problems text[] := ARRAY[]::text[];
   v_row record;
-  v_allowed text[] := ARRAY['sessions.ingest_claim_batch(jsonb)', 'sessions.ingest_commit_batch(jsonb)',
+  v_allowed text[] := ARRAY['sessions.ingest_claim_batch(jsonb)', 'sessions.ingest_claim_buffered_batch(jsonb)', 'sessions.ingest_prepare_buffer_stage(jsonb)', 'sessions.ingest_commit_buffered_batch(jsonb)', 'sessions.ingest_commit_batch(jsonb)',
                             'sessions.ingest_acquire_slot(jsonb)', 'sessions.ingest_release_slot(jsonb)',
                             'sessions.ingest_set_session_uploads(jsonb)', 'sessions.ingest_reset_uploaded_sessions(jsonb)',
                             'sessions.ingest_fanout_fence(jsonb)', 'sessions.ingest_commit_revisions(jsonb)'];

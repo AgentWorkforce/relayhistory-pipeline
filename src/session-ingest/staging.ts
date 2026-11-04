@@ -38,6 +38,7 @@ import { layoutComponent } from "../shared/layout-component.ts";
 import { liveMachineId, writeGroups, type Group, type LineMeta, type WriteTarget } from "./writer.ts";
 import type { Ledger, LedgerRecord } from "./ledger.ts";
 import { fitLine } from "./oversize.ts";
+import type { BufferedStageSpec, BufferedGcTicket } from "./buffered-protocol.ts";
 
 export const STAGED_VERSION = 1;
 /** Sessions one fan-out message writes: well inside a queue invocation's subrequest budget. */
@@ -45,6 +46,8 @@ export const FANOUT_GROUPS_PER_MESSAGE = 40;
 
 export interface StagedHeader {
   v: 1;
+  /** Internal marker: buffered objects are never canonical fanout input. */
+  publication_state?: "buffered";
   claim_token: string;
   batch_digest: string;
   received_at: string;
@@ -85,9 +88,10 @@ export function stagedKey(
   keyRoot: string,
   h: Pick<StagedHeader, "org_id" | "workspace_id" | "origin_id" | "user_id" | "batch_digest" | "claim_token">,
   contentDigest: string,
+  namespace: "live-batches" | "buffered-batches" = "live-batches",
 ): string {
   const machine = liveMachineId(h.workspace_id, h.origin_id, h.user_id);
-  return `${keyRoot}/${h.org_id}/live-batches/v1/ws=${layoutComponent(h.workspace_id)}/m=${machine}/b=${sha256Hex(h.batch_digest).slice(0, 32)}-${contentDigest.slice(0, 16)}-${sha256Hex(h.claim_token).slice(0, 32)}.staged.ndjson.zst`;
+  return `${keyRoot}/${h.org_id}/${namespace}/v1/ws=${layoutComponent(h.workspace_id)}/m=${machine}/b=${sha256Hex(h.batch_digest).slice(0, 32)}-${contentDigest.slice(0, 16)}-${sha256Hex(h.claim_token).slice(0, 32)}.staged.ndjson.zst`;
 }
 
 /** Stage the batch's groups (create-only; a retry keeps the object already there). Returns its key. */
@@ -97,7 +101,9 @@ export async function stageGroups(target: WriteTarget, header: Omit<StagedHeader
     groups.flatMap((g, i) => g.lines.map((l, j) => `{"g":${i},"m":${JSON.stringify(g.meta?.[j] ?? null)},"l":${l}}`)).join("\n") + "\n";
   // Lines were fitted for the scrubber when grouped (oversize.ts checks value and literal, as the scrubber does).
   const scrubbed = scrubRecords(encoder.encode(body)).scrubbed;
-  const bytes = new Uint8Array([...encoder.encode(JSON.stringify(full) + "\n"), ...scrubbed]);
+  const prefix = encoder.encode(JSON.stringify(full) + "\n");
+  const bytes = new Uint8Array(prefix.byteLength + scrubbed.byteLength);
+  bytes.set(prefix); bytes.set(scrubbed, prefix.byteLength);
   const key = stagedKey(target.keyRoot, header, stagedContentDigest(groups));
   try {
     await target.store.put(objectKey(key), rawZstdFrame(bytes), { ifNoneMatch: true, contentType: "application/zstd" });
@@ -116,7 +122,10 @@ export function fanoutMessages(key: string, groups: number): FanoutMessage[] {
 
 /** Decode a staged object (a single zstd frame). */
 export async function readStaged(store: ObjectStore, key: string, decompress: (bytes: Uint8Array) => Uint8Array): Promise<{ header: StagedHeader; groups: Group[] }> {
-  const bytes = decompress(await readAll((await store.getObject(objectKey(key))).body));
+  return decodeStaged(decompress(await readAll((await store.getObject(objectKey(key))).body)));
+}
+
+function decodeStaged(bytes: Uint8Array): { header: StagedHeader; groups: Group[] } {
   const text = decoder.decode(bytes);
   const newline = text.indexOf("\n");
   const header = JSON.parse(text.slice(0, newline)) as StagedHeader;
@@ -147,7 +156,9 @@ export async function fanout(
   decompress: (bytes: Uint8Array) => Uint8Array,
   ledger?: Pick<Ledger, "fanoutFence" | "commitRevisions">,
 ) {
+  if (message.key.includes("/buffered-batches/v1/")) throw new Error("buffered_publication_refused");
   const { header, groups } = await readStaged(target.store, message.key, decompress);
+  if (header.publication_state === "buffered") throw new Error("buffered_publication_refused");
   const attempt = { batchDigest: header.batch_digest, claimToken: header.claim_token };
   const tenant = { orgId: header.org_id, workspaceId: header.workspace_id, userId: header.user_id };
   // Already scrubbed once when staged: fit again for the second scrub at sealing (oversize.ts fitLine).
@@ -184,4 +195,105 @@ export async function fanout(
     revisions = await ledger.commitRevisions(tenant, header.origin_id, written.machineId, records, attempt);
   }
   return { ...written, skipped, revisions };
+}
+
+/** Buffer acceptance is bounded by the HTTP batch limit; this cap includes framing. */
+export const BUFFER_STAGE_MAX_BYTES = 16 * 1024 * 1024;
+export interface PreparedBufferedStage { spec: BufferedStageSpec; body: Uint8Array }
+export interface DecodedBufferedStage { header: StagedHeader; groups: Group[]; spec: BufferedStageSpec }
+const byteSha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+
+function assertOrdinals(groups: Group[], ordinals: number[][]): void {
+  if (groups.length === 0 || groups.length > 500 || groups.length !== ordinals.length) throw new Error("buffered_groups_invalid");
+  const seen = new Set<number>();
+  groups.forEach((g, i) => {
+    const indexes = ordinals[i];
+    if (!Array.isArray(indexes) || !g.lines.length || indexes.length !== g.lines.length) throw new Error("buffered_groups_invalid");
+    for (const index of indexes) {
+      if (!Number.isInteger(index) || index < 0 || index > 999 || seen.has(index)) throw new Error("buffered_ordinals_invalid");
+      seen.add(index);
+    }
+  });
+  if (seen.size > 500) throw new Error("buffered_ordinals_invalid");
+}
+
+/** Pure preparation. Register this exact spec in SQL BEFORE calling putBufferedStage. */
+export function prepareBufferedStage(
+  keyRoot: string,
+  header: Omit<StagedHeader, "v" | "groups" | "publication_state">,
+  groups: Group[],
+  groupOrdinals: number[][],
+): PreparedBufferedStage {
+  assertOrdinals(groups, groupOrdinals);
+  const full: StagedHeader = { v: 1, ...header, publication_state: "buffered", groups: groups.map(g => [g.source, g.sessionId]) };
+  const body = groups.flatMap((g, i) => g.lines.map((l, j) => `{"g":${i},"m":${JSON.stringify(g.meta?.[j] ?? null)},"l":${l}}`)).join("\n") + "\n";
+  const scrubbed = scrubRecords(encoder.encode(body)).scrubbed;
+  const prefix = encoder.encode(JSON.stringify(full) + "\n");
+  if (prefix.byteLength + scrubbed.byteLength > BUFFER_STAGE_MAX_BYTES - 1024) throw new Error("buffered_stage_too_large");
+  const raw = new Uint8Array(prefix.byteLength + scrubbed.byteLength);
+  raw.set(prefix); raw.set(scrubbed, prefix.byteLength);
+  const packed = rawZstdFrame(raw);
+  if (packed.byteLength > BUFFER_STAGE_MAX_BYTES) throw new Error("buffered_stage_too_large");
+  const key = stagedKey(keyRoot, full, byteSha(packed), "buffered-batches");
+  return { body: packed, spec: { key, bytes: packed.byteLength, sha256: byteSha(packed), groupOrdinals: groupOrdinals.map(x => [...x]) } };
+}
+
+async function readBufferedBytes(store: ObjectStore, spec: Pick<BufferedStageSpec, "key" | "bytes" | "sha256">): Promise<Uint8Array> {
+  if (!Number.isSafeInteger(spec.bytes) || spec.bytes < 1 || spec.bytes > BUFFER_STAGE_MAX_BYTES || !/^[0-9a-f]{64}$/.test(spec.sha256)) throw new Error("buffered_proof_invalid");
+  const body = (await store.getObject(objectKey(spec.key))).body;
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for await (const chunk of body) {
+    size += chunk.byteLength;
+    if (size > spec.bytes) throw new Error("buffered_bytes_mismatch");
+    chunks.push(chunk);
+  }
+  if (size !== spec.bytes) throw new Error("buffered_bytes_mismatch");
+  const packed = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { packed.set(chunk, offset); offset += chunk.byteLength; }
+  if (byteSha(packed) !== spec.sha256) throw new Error("buffered_sha_mismatch");
+  return packed;
+}
+
+/** Register this object's intent first. Existing redaction bytes never count as success. */
+export async function putBufferedStage(store: ObjectStore, prepared: PreparedBufferedStage): Promise<void> {
+  const { body, spec } = prepared;
+  if (body.byteLength !== spec.bytes || byteSha(body) !== spec.sha256) throw new Error("buffered_proof_invalid");
+  try {
+    await store.put(objectKey(spec.key), body, { ifNoneMatch: true, contentSha256: spec.sha256, contentType: "application/zstd" });
+  } catch (error) {
+    if (!isObjectStoreError(error, "already_exists") && !isObjectStoreError(error, "precondition_failed")) throw error;
+    await readBufferedBytes(store, spec);
+  }
+}
+
+export async function readBufferedStage(
+  store: ObjectStore,
+  spec: BufferedStageSpec,
+  decompress: (bytes: Uint8Array) => Uint8Array,
+): Promise<DecodedBufferedStage> {
+  const raw = decompress(await readBufferedBytes(store, spec));
+  if (raw.byteLength > BUFFER_STAGE_MAX_BYTES) throw new Error("buffered_stage_too_large");
+  const decoded = decodeStaged(raw);
+  if (decoded.header.publication_state !== "buffered") throw new Error("buffered_header_invalid");
+  assertOrdinals(decoded.groups, spec.groupOrdinals);
+  return { ...decoded, spec };
+}
+
+/** GC registers this replacement BEFORE PUT, then CASes the durable outbox pointer. */
+export function prepareBufferedReplacement(keyRoot: string, ticket: BufferedGcTicket, decoded: DecodedBufferedStage): PreparedBufferedStage {
+  if (ticket.key !== decoded.spec.key || ticket.sha256 !== decoded.spec.sha256 || ticket.bytes !== decoded.spec.bytes ||
+      ticket.claimToken !== decoded.header.claim_token || JSON.stringify(ticket.groupOrdinals) !== JSON.stringify(decoded.spec.groupOrdinals)) throw new Error("buffered_ticket_mismatch");
+  const indexes = ticket.keepGroupIndexes;
+  let prior = -1;
+  for (const index of indexes) {
+    if (!Number.isInteger(index) || index <= prior || index >= decoded.groups.length) throw new Error("buffered_keep_invalid");
+    prior = index;
+  }
+  if (indexes.length === 0 || indexes.length === decoded.groups.length) throw new Error("buffered_replacement_unnecessary");
+  const { v: _v, groups: _groups, publication_state: _state, ...header } = decoded.header;
+  const result = prepareBufferedStage(keyRoot, header, indexes.map(i => decoded.groups[i]!), indexes.map(i => decoded.spec.groupOrdinals[i]!));
+  if (result.spec.key === ticket.key) throw new Error("buffered_replacement_same_key");
+  return result;
 }

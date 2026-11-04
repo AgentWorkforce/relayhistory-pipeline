@@ -1,3 +1,4 @@
+import type { BufferedStageSpec, BufferedStageIntent } from "./buffered-protocol.ts";
 /**
  * The session ingest's Supabase ledger: everything `accept_delivery_batch`
  * decided in Neon that is not transcript content.
@@ -161,6 +162,8 @@ export interface SelectionInput {
 
 export interface Ledger {
   claim(input: ClaimInput): Promise<ClaimResult>;
+  prepareBufferStage?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & BufferedStageSpec): Promise<BufferedStageIntent>;
+  commitBuffered?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & {stageToken:string}): Promise<void>;
   commit(input: CommitInput): Promise<CommitResult>;
   acquireSlot(request: SlotRequest): Promise<SlotResult>;
   releaseSlot(tenant: LedgerTenant, holder: string): Promise<void>;
