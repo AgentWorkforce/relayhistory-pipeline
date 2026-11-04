@@ -1,9 +1,11 @@
 /**
- * Canonical feature copy cycle: mirrors the legacy event-cycle checkpoint
- * structure, but reads the durable canonical journal (publication + retirement)
- * instead of the legacy Neon feature journal. One journal entry maps to one
- * bounded image page projection + one CH insert; the journal revision is the
- * CAS fence — entries at or below the checkpoint are stale and refused.
+ * Canonical feature copy cycle: journal-driven, mirrors event-cycle's
+ * checkpoint structure, reads the durable canonical journal. Native's
+ * paged/terminal/authority contract: bounded imagePages/priorKeyPages with
+ * explicit terminal cursors + pageSha256, per-page ackPage, and finish() CAS
+ * requiring both pool terminal descriptors + all page ACKs + still-current
+ * source authority + unchanged bindings. A stale revision at/below the
+ * checkpoint is fenced before any write.
  */
 import type { ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import {
@@ -12,7 +14,6 @@ import {
   projectBriefTombstone,
   projectEventRow,
   projectTombstone,
-  type CanonicalProjectResult,
 } from "./canonical-image.ts";
 import {
   produceBriefFeatures,
@@ -20,29 +21,39 @@ import {
   type CanonicalBriefRow,
   type CanonicalBriefTombstone,
   type CanonicalEventRow,
-  type CanonicalTombstone,
   type CanonicalImageEvidence,
+  type CanonicalTombstone,
   type CanonicalProduceResult,
 } from "./canonical-producer.ts";
 import type {
   CanonicalJournalEntry,
-  CanonicalJournalPort,
+  CanonicalPageAckPort,
+  CanonicalSourceAuthority,
 } from "./canonical-version.ts";
 
-/** Bounded port that returns one page of opaque canonical image rows. */
+/** One bounded image page: rows, explicit terminal cursor, CAS hashes. */
+export interface CanonicalImagePage {
+  rows: unknown[];
+  cursor: string | null;      // null = terminal
+  source: string;
+  pointerSetHash: string;
+  pageSha256: string;
+}
+/** The paged image/prior-keyset port — bounded, never a whole image at once. */
 export interface CanonicalImagePort {
-  /** event-pool projected rows for this image page; null = end of image. */
-  events(imageKey: string, page: number): Promise<unknown[] | null>;
-  /** brief-pool projected rows for this image page; null = end of image. */
-  briefs(imageKey: string, page: number): Promise<unknown[] | null>;
-  /** prior keyset for retire entries (exact tombstone targets). */
-  priorEvents(imageKey: string): Promise<unknown[]>;
-  priorBriefs(imageKey: string): Promise<unknown[]>;
+  imagePages(
+    entry: CanonicalJournalEntry, kind: "event" | "brief", cursor: string | null,
+  ): Promise<CanonicalImagePage>;
+  priorKeyPages(
+    entry: CanonicalJournalEntry, kind: "event" | "brief", cursor: string | null,
+  ): Promise<CanonicalImagePage>;
+  /** A verified complete-image descriptor — a null first page is a valid
+   *  empty pool ONLY when this exists. */
+  imageDescriptor(entry: CanonicalJournalEntry): Promise<
+    { imageKey: string; sourceHash: string; pointerSetHash: string; complete: boolean } | null>;
 }
 
-export interface CanonicalCycleState {
-  checkpoint: string;
-}
+export interface CanonicalCycleState { checkpoint: string; }
 export type CanonicalCycleResult =
   | { kind: "copied"; checkpoint: string; rows: number }
   | { kind: "refused"; reason: string }
@@ -51,78 +62,104 @@ export type CanonicalCycleResult =
 const projectAll = <T>(
   page: unknown[],
   fn: (v: unknown) => { kind: "row"; row: T } | { kind: "refused"; reason: string },
-): CanonicalProjectResult<T> => {
+) => {
   const bounded = boundPage(page);
   if (bounded.kind !== "rows") return bounded;
   const out: T[] = [];
   for (const v of bounded.rows) {
     const r = fn(v);
-    if (r.kind !== "row") return { kind: "refused", reason: r.reason };
+    if (r.kind !== "row") return { kind: "refused" as const, reason: r.reason };
     out.push(r.row);
   }
-  return { kind: "rows", rows: out };
+  return { kind: "rows" as const, rows: out };
 };
 
+/** Drain one bounded page source: pages until the terminal cursor. */
+async function* pageAll(
+  port: CanonicalImagePort,
+  entry: CanonicalJournalEntry,
+  kind: "event" | "brief",
+  prior: boolean,
+): AsyncGenerator<CanonicalImagePage, void, void> {
+  let cursor: string | null = null;
+  do {
+    const page: CanonicalImagePage = prior
+      ? await port.priorKeyPages(entry, kind, cursor)
+      : await port.imagePages(entry, kind, cursor);
+    yield page;
+    cursor = page.cursor;
+  } while (cursor !== null);
+}
+
 /**
- * Copy one journal entry into the event+brief pools. Stale entries (revision
- * at/below the checkpoint) refuse — a delayed writer can never resurrect.
+ * Copy one journal entry into the event+brief pools, page-by-page with
+ * per-page ack + terminal finish CAS. Stale entries refuse before any write.
  */
 export async function copyCanonicalEntry(
-  journal: CanonicalJournalPort,
   images: CanonicalImagePort,
+  acks: CanonicalPageAckPort,
   ch: ClickHouseClient,
   state: CanonicalCycleState,
   entry: CanonicalJournalEntry,
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
-  const ev: CanonicalImageEvidence =
-    entry.kind === "publish"
-      ? {
-          schemaGeneration: entry.schemaGeneration, imageKey: entry.imageKey,
-          revision: entry.revision, sourceHash: entry.sourceHash,
-        }
-      : {
-          schemaGeneration: entry.schemaGeneration, imageKey: entry.imageKey,
-          revision: entry.revision, sourceHash: entry.priorKeysetHash,
-        };
-  const inserts: Record<string, unknown>[] = [];
-  if (entry.kind === "publish") {
-    const epage = await images.events(entry.imageKey, 0);
-    if (epage === null) return { kind: "refused", reason: "image_unavailable" };
-    const bpage = await images.briefs(entry.imageKey, 0);
-    if (bpage === null) return { kind: "refused", reason: "image_unavailable" };
-    const events = projectAll<CanonicalEventRow>(epage, projectEventRow);
-    if (events.kind !== "rows") return events;
-    const briefs = projectAll<CanonicalBriefRow>(bpage, projectBriefRow);
-    if (briefs.kind !== "rows") return briefs;
-    const e = produceEventFeatures(events.rows, [], ev);
-    if (e.kind !== "rows") return e;
-    const b = produceBriefFeatures(briefs.rows, [], ev);
-    if (b.kind !== "rows") return b;
-    inserts.push(...e.rows, ...b.rows);
-  } else {
-    const events = projectAll<CanonicalTombstone>(
-      await images.priorEvents(entry.imageKey), projectTombstone);
-    if (events.kind !== "rows") return events;
-    const briefs = projectAll<CanonicalBriefTombstone>(
-      await images.priorBriefs(entry.imageKey), projectBriefTombstone);
-    if (briefs.kind !== "rows") return briefs;
-    const e = produceEventFeatures(
-      [], events.rows.map((r) => ({
-        orgId: r.orgId, workspaceId: r.workspaceId, source: r.source,
-        sessionId: r.sessionId, machineId: r.machineId, kind: r.kind,
-        eventId: r.eventId, ts: r.ts,
-      })), ev);
-    if (e.kind !== "rows") return e;
-    const b = produceBriefFeatures([], briefs.rows.map((r) => ({
-      orgId: r.orgId, workspaceId: r.workspaceId, source: r.source,
-      sessionId: r.sessionId,
-    })), ev);
-    if (b.kind !== "rows") return b;
-    inserts.push(...e.rows, ...b.rows);
+  const ev: CanonicalImageEvidence = {
+    schemaGeneration: entry.schemaGeneration,
+    imageKey: entry.imageKey,
+    revision: entry.revision,
+    sourceHash:
+      entry.kind === "publish" ? entry.sourceHash : entry.priorKeysetHash,
+  };
+  const sourceAuthority: CanonicalSourceAuthority =
+    entry.kind === "publish" ? entry.sourceAuthority : entry.priorSourceAuthority;
+  const insertOnePage = async (
+    kind: "event" | "brief", page: CanonicalImagePage,
+  ) => {
+    const rows =
+      kind === "event"
+        ? projectAll<CanonicalEventRow | CanonicalTombstone>(page.rows,
+            entry.kind === "publish" ? projectEventRow : projectTombstone)
+        : projectAll<CanonicalBriefRow | CanonicalBriefTombstone>(page.rows,
+            entry.kind === "publish" ? projectBriefRow : projectBriefTombstone);
+    if (rows.kind !== "rows") return rows;
+    const produced: CanonicalProduceResult =
+      kind === "event"
+        ? produceEventFeatures(
+            entry.kind === "publish"
+              ? (rows.rows as CanonicalEventRow[]) : [],
+            entry.kind === "retire"
+              ? (rows.rows as CanonicalTombstone[]) : [], ev)
+        : produceBriefFeatures(
+            entry.kind === "publish"
+              ? (rows.rows as CanonicalBriefRow[]) : [],
+            entry.kind === "retire"
+              ? (rows.rows as CanonicalBriefTombstone[]) : [], ev);
+    if (produced.kind !== "rows") return produced;
+    await ch.insert("session_feature_rows", produced.rows);
+    await acks.ackPage({
+      entry, kind, cursor: page.cursor ?? "terminal",
+      pageSha256: page.pageSha256,
+    });
+    return produced;
+  };
+  let total = 0, terminalEvent = "", terminalBrief = "";
+  for (const kind of ["event", "brief"] as const) {
+    for await (const page of pageAll(images, entry, kind,
+        entry.kind === "retire")) {
+      const r = await insertOnePage(kind, page);
+      if (r.kind === "refused") return r;
+      total += r.rows.length;
+    }
+    if (kind === "event") terminalEvent = "terminal";
+    else terminalBrief = "terminal";
   }
-  await ch.insert("session_event_features", inserts);
-  return { kind: "copied", checkpoint: entry.revision, rows: inserts.length };
+  // finish CAS: terminal descriptors + all page ACKs + still-current authority
+  await acks.finish({
+    entry, terminalEvent, terminalBrief,
+    sourceAuthority,
+    profileBinding: "builtin-fold",
+  });
+  return { kind: "copied", checkpoint: entry.revision, rows: total };
 }
 export { type CanonicalProduceResult };

@@ -5,10 +5,14 @@
 CREATE TABLE sessions.canonical_feature_journal (
   revision bigint PRIMARY KEY,             -- managed counter, seed > legacy
   kind text NOT NULL CHECK (kind IN ('seed','publish','retire')),
+  scope jsonb NOT NULL,                    -- {orgId,workspaceId,harness,sessionId}
   schema_generation text NOT NULL,         -- same-generation CAS fence
   image_key text NOT NULL,                 -- publication image identity
   source_hash char(64) NOT NULL,           -- image content CAS
   prior_keyset_hash char(64),              -- retire: exact prior keyset
+  source_authority jsonb NOT NULL,         -- publish: {epoch,fingerprint}
+  prior_source_authority jsonb,            -- retire: same shape; null = new scope
+  pointer_set jsonb NOT NULL,              -- {hash,count} inventory identity
   recorded_at timestamptz NOT NULL DEFAULT now()
 );
 -- The managed counter is the table's own max(revision): a single-writer

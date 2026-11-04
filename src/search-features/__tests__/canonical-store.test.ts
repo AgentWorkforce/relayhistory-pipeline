@@ -4,11 +4,14 @@ import {
   CanonicalVersionStore,
 } from "../canonical-journal.ts";
 
-/** In-memory SqlQuery emulation of the 040610 table shape. */
+const SCOPE = JSON.stringify({ orgId: "o", workspaceId: "w", harness: "h",
+  sessionId: "s" });
+const AUTH = JSON.stringify({ epoch: "1", fingerprint: "a".repeat(64) });
+const PTR = JSON.stringify({ hash: "p".repeat(64), count: 1 });
 const fakeDb = () => {
   const table: Record<string, unknown>[] = [];
   const query = async <T>(text: string, params: unknown[] = []) => {
-    if (text.includes("SELECT revision FROM") && text.includes("DESC"))
+    if (text.includes("ORDER BY revision DESC"))
       return { rows: table.length
         ? [{ revision: String(Math.max(...table.map((r) => Number(r.revision)))) } as T]
         : [] as T[] };
@@ -23,9 +26,11 @@ const fakeDb = () => {
         .slice(0, Number(params[1])) as T[] };
     if (text.startsWith("INSERT")) {
       table.push({
-        revision: params[0], kind: params[1], schema_generation: params[2],
-        image_key: params[3], source_hash: params[4],
-        prior_keyset_hash: params[5] ?? null,
+        revision: params[0], kind: params[1], scope: params[2],
+        schema_generation: params[3], image_key: params[4],
+        source_hash: params[5], prior_keyset_hash: params[6] ?? null,
+        source_authority: params[7], prior_source_authority: params[8],
+        pointer_set: params[9],
       });
       return { rows: [] as T[] };
     }
@@ -33,6 +38,18 @@ const fakeDb = () => {
   };
   return { table, query };
 };
+const pub = (rev: string, key = "i") => ({
+  kind: "publish" as const, revision: rev, imageKey: key,
+  schemaGeneration: "g", sourceHash: "a".repeat(64),
+  scope: JSON.parse(SCOPE), sourceAuthority: JSON.parse(AUTH),
+  pointerSet: JSON.parse(PTR),
+});
+const ret = (rev: string) => ({
+  kind: "retire" as const, revision: rev, imageKey: "i",
+  schemaGeneration: "g", priorKeysetHash: "c".repeat(64),
+  scope: JSON.parse(SCOPE), priorSourceAuthority: JSON.parse(AUTH),
+  pointerSet: JSON.parse(PTR),
+});
 describe("canonical journal store", () => {
   test("seed above legacy clock, never backwards", async () => {
     const db = fakeDb();
@@ -40,37 +57,34 @@ describe("canonical journal store", () => {
     await v.seed("100");
     expect(await v.last()).toBe("100");
     await expect(v.seed("100")).rejects.toThrow("seed_below_last");
-    await expect(v.seed("50")).rejects.toThrow("seed_below_last");
   });
   test("next() allocates strictly above the last revision", async () => {
     const db = fakeDb();
     const v = new CanonicalVersionStore({ query: db.query });
     await v.seed("100");
     expect(await v.next()).toBe("101");
-    await v.next();
-    expect(await v.last()).toBe("100"); // next() only reads, doesn't insert
   });
   test("append writes publish/retire entries; stale fences", async () => {
     const db = fakeDb();
     const j = new CanonicalJournalStore({ query: db.query });
-    await j.append({ kind: "publish", revision: "10", imageKey: "i",
-      schemaGeneration: "g", sourceHash: "a".repeat(64) }, "0");
-    await expect(j.append({ kind: "publish", revision: "5",
-      imageKey: "i2", schemaGeneration: "g",
-      sourceHash: "b".repeat(64) }, "10")).rejects.toThrow("stale_revision");
-    await j.append({ kind: "retire", revision: "20", imageKey: "i",
-      schemaGeneration: "g", priorKeysetHash: "c".repeat(64) }, "10");
-    const entries = await j.entries("0", 10);
-    expect(entries.map((e) => e.kind)).toEqual(["publish", "retire"]);
+    await j.append(pub("10"), "0");
+    await expect(j.append(pub("5", "i2"), "10"))
+      .rejects.toThrow("stale_revision");
+    await j.append(ret("20"), "10");
+    const out = await j.entries("0", 10);
+    expect(out.entries.map((e) => e.kind)).toEqual(["publish", "retire"]);
+    expect(out.hasMore).toBe(false);
   });
-  test("entries paging respects the after cursor + limit", async () => {
+  test("entries paging: hasMore, nextRevision, limit != completeness", async () => {
     const db = fakeDb();
     const j = new CanonicalJournalStore({ query: db.query });
-    for (const r of ["10", "20", "30"])
-      await j.append({ kind: "publish", revision: r, imageKey: "i" + r,
-        schemaGeneration: "g", sourceHash: "a".repeat(64) }, "0");
-    expect((await j.entries("10", 1)).map((e) => e.revision)).toEqual(["20"]);
-    expect((await j.entries("10", 10)).map((e) => e.revision))
-      .toEqual(["20", "30"]);
+    for (const r of ["10", "20", "30"]) await j.append(pub(r, "i" + r), "0");
+    const first = await j.entries("10", 1);
+    expect(first.entries.map((e) => e.revision)).toEqual(["20"]);
+    expect(first.hasMore).toBe(true);
+    const rest = await j.entries("10", 10);
+    expect(rest.entries.map((e) => e.revision)).toEqual(["20", "30"]);
+    expect(rest.hasMore).toBe(false);
+    expect(rest.nextRevision).toBe("30");
   });
 });

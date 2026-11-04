@@ -29,14 +29,61 @@ export interface CanonicalVersionPort {
 
 /** Durable publication + retirement journal — the only valid input. */
 export interface CanonicalJournalPort {
-  /** Committed entries in order: publication or retirement, CAS-fenced. */
-  entries(after: string, limit: number): Promise<CanonicalJournalEntry[]>;
+  /**
+   * Committed entries in order: publication or retirement, CAS-fenced.
+   * hasMore distinguishes a bounded page from a complete enumeration —
+   * a returned limit is never implicit completeness.
+   */
+  entries(after: string, limit: number): Promise<{
+    entries: CanonicalJournalEntry[];
+    nextRevision: string;
+    hasMore: boolean;
+  }>;
 }
 export type CanonicalJournalEntry =
   | { kind: "publish"; revision: string; imageKey: string;
-      schemaGeneration: string; sourceHash: string }
+      schemaGeneration: string; sourceHash: string; scope: CanonicalScope;
+      sourceAuthority: CanonicalSourceAuthority; pointerSet: CanonicalPointerSet }
   | { kind: "retire"; revision: string; imageKey: string;
-      schemaGeneration: string; priorKeysetHash: string };
+      schemaGeneration: string; priorKeysetHash: string; scope: CanonicalScope;
+      priorSourceAuthority: CanonicalSourceAuthority; pointerSet: CanonicalPointerSet };
+
+/** One logical scope the journal is always scoped to (native contract). */
+export interface CanonicalScope {
+  orgId: string; workspaceId: string; harness: string; sessionId: string;
+}
+/** Replay source authority: publication epoch + snapshot fingerprint. */
+export interface CanonicalSourceAuthority {
+  epoch: string; fingerprint: string;
+}
+/** Exact captured inventory identity — hash and count, never payload bytes. */
+export interface CanonicalPointerSet { hash: string; count: number; }
+
+/** The 610 transaction port: OWNER-ONLY INVOKER inside the 620 final CAS. */
+export interface CanonicalFeatureChangedPort {
+  canonicalFeatureChanged(input: {
+    scope: CanonicalScope;
+    source: CanonicalSourceAuthority;     // priorSource null = new scope
+    priorSource: CanonicalSourceAuthority | null;
+    pointerSet: CanonicalPointerSet;
+  }): Promise<string>; // returns the allocated managed revision
+}
+
+/** Per-page acknowledgment — idempotent restart-safe progress. */
+export interface CanonicalPageAckPort {
+  ackPage(input: {
+    entry: CanonicalJournalEntry; kind: "event" | "brief";
+    cursor: string; pageSha256: string;
+  }): Promise<void>;
+  /** finish CAS: both pool terminal descriptors + all page ACKs + current
+   *  source authority + unchanged target/profile bindings. */
+  finish(input: {
+    entry: CanonicalJournalEntry;
+    terminalEvent: string; terminalBrief: string;
+    sourceAuthority: CanonicalSourceAuthority;
+    profileBinding: string;
+  }): Promise<void>;
+}
 
 /**
  * 040610 proposal (metadata-only, tentative — DO NOT reserve/push yet):

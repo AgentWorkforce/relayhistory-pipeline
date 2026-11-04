@@ -10,6 +10,9 @@
 import type {
   CanonicalJournalEntry,
   CanonicalJournalPort,
+  CanonicalScope,
+  CanonicalSourceAuthority,
+  CanonicalPointerSet,
   CanonicalVersionPort,
 } from "./canonical-version.ts";
 
@@ -20,19 +23,32 @@ export interface SqlQuery {
 type Row = {
   revision: string | number;
   kind: string;
+  scope: string;
   schema_generation: string;
   image_key: string;
   source_hash: string;
   prior_keyset_hash: string | null;
+  source_authority: string;
+  prior_source_authority: string | null;
+  pointer_set: string;
 };
-const toEntry = (r: Row): CanonicalJournalEntry =>
-  r.kind === "retire"
+const toEntry = (r: Row): CanonicalJournalEntry => {
+  const scope = JSON.parse(r.scope) as CanonicalScope;
+  const pointerSet = JSON.parse(r.pointer_set) as CanonicalPointerSet;
+  return r.kind === "retire"
     ? { kind: "retire", revision: String(r.revision),
         imageKey: r.image_key, schemaGeneration: r.schema_generation,
-        priorKeysetHash: r.prior_keyset_hash ?? "" }
+        priorKeysetHash: r.prior_keyset_hash ?? "", scope,
+        priorSourceAuthority:
+          JSON.parse(r.prior_source_authority ?? "null") as CanonicalSourceAuthority,
+        pointerSet }
     : { kind: "publish", revision: String(r.revision),
         imageKey: r.image_key, schemaGeneration: r.schema_generation,
-        sourceHash: r.source_hash };
+        sourceHash: r.source_hash, scope,
+        sourceAuthority:
+          JSON.parse(r.source_authority) as CanonicalSourceAuthority,
+        pointerSet };
+};
 
 /**
  * Durable version counter over the same table — a single-row high-water under
@@ -69,28 +85,38 @@ export class CanonicalVersionStore implements CanonicalVersionPort {
 }
 export class CanonicalJournalStore implements CanonicalJournalPort {
   constructor(readonly db: SqlQuery) {}
-  async entries(after: string, limit: number): Promise<CanonicalJournalEntry[]> {
+  async entries(after: string, limit: number) {
     const { rows } = await this.db.query<Row>(
-      "SELECT revision,kind,schema_generation,image_key,source_hash," +
-        " prior_keyset_hash FROM sessions.canonical_feature_journal" +
+      "SELECT revision,kind,scope,schema_generation,image_key,source_hash," +
+        " prior_keyset_hash,source_authority,prior_source_authority," +
+        " pointer_set FROM sessions.canonical_feature_journal" +
         " WHERE revision > $1::bigint AND kind <> 'seed'" +
         " ORDER BY revision LIMIT $2",
       [after, limit]);
-    return rows.map(toEntry);
+    const entries = rows.map(toEntry);
+    return {
+      entries,
+      nextRevision: entries.length ? entries[entries.length - 1]!.revision : after,
+      hasMore: rows.length === limit,
+    };
   }
   /** CAS-fenced append — a stale revision can never land. */
   async append(entry: CanonicalJournalEntry, observed: string): Promise<void> {
     if (BigInt(entry.revision) <= BigInt(observed))
       throw new Error("stale_revision");
+    const scope = JSON.stringify(entry.scope);
+    const ptr = JSON.stringify(entry.pointerSet);
     const cols = entry.kind === "retire"
-      ? ["retire", entry.schemaGeneration, entry.imageKey, "",
-          entry.priorKeysetHash]
-      : ["publish", entry.schemaGeneration, entry.imageKey,
-          entry.sourceHash, ""];
+      ? ["retire", scope, entry.schemaGeneration, entry.imageKey, "",
+          entry.priorKeysetHash, "",
+          JSON.stringify(entry.priorSourceAuthority), ptr]
+      : ["publish", scope, entry.schemaGeneration, entry.imageKey,
+          entry.sourceHash, "", JSON.stringify(entry.sourceAuthority), "", ptr];
     await this.db.query(
       "INSERT INTO sessions.canonical_feature_journal(" +
-        "revision,kind,schema_generation,image_key,source_hash," +
-        " prior_keyset_hash) VALUES($1::bigint,$2,$3,$4,$5,$6)",
+        "revision,kind,scope,schema_generation,image_key,source_hash," +
+        " prior_keyset_hash,source_authority,prior_source_authority," +
+        " pointer_set) VALUES($1::bigint,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
       [entry.revision, ...cols]);
   }
 }
