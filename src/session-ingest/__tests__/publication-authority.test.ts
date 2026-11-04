@@ -22,3 +22,15 @@ test("missing or contradictory authority refuses instead of treating absent regi
  }
 });
 
+
+test("prepared derived body and qualified state carry exact source schema without inferring it",async()=>{
+ const {registerPublicationObject,setPublicationState}=await import("../../shared/publication-authority.ts");
+ const calls:{sql:string,args:unknown[]|undefined}[]=[];
+ const db={query:async(sql:string,args?:unknown[])=>{calls.push({sql,args});return {rows:[sql.includes("register_object")?{result:{registered:true}}:{applied:true}]};}};
+ await registerPublicationObject(db as never,evidence,{key:"prepared-key",sha256:"b".repeat(64),bytes:42});
+ const submitted=JSON.parse(String(calls[0]!.args![0]));
+ expect(submitted.pointer.schemaGeneration).toBe(evidence.schemaGeneration);expect(submitted.key).toBe("prepared-key");expect(submitted.bytes).toBe(42);
+ expect(await setPublicationState(db as never,evidence,"done",new Date("2026-11-04T00:00:00Z"))).toBe(true);
+ expect(calls[1]!.args![9]).toBe(evidence.schemaGeneration);
+});
+

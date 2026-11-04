@@ -14,8 +14,8 @@ describe("immutable upload publication layout",()=>{
   const key=publicationManifestKey(at,publication);
   const image=await parseManifest(fixture,key);
   expect(image.raw.epoch).toBe(legacy.raw.epoch);
-  expect(String(publicationDerivedKey(String(key),"a".repeat(64),"summary-short"))).toContain("/publications/"+publication+"/derived/summary-short/");
-  expect(()=>publicationDerivedKey(String(key),"a".repeat(64),"../escape")).toThrow();
+  expect(String(publicationDerivedKey(String(key),publication,"summary-short"))).toContain("/publications/"+publication+"/derived/summary-short/");
+  expect(()=>publicationDerivedKey(String(key),publication,"../escape")).toThrow();
   expect(parseSessionKey(key)?.rest).toBe("publications/"+publication+"/manifest.json");
   const raw=chunkKeys(image,{prefix:at.prefix});
   expect(raw.length).toBeGreaterThan(0);
