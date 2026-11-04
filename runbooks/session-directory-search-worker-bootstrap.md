@@ -355,6 +355,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261104020000_auth_sessions.sql`                    | table sessions.auth_sessions                                                                                            |
 | `upstream:20261104020100_auth_session_verify.sql`              | table sessions.auth_token_verifier_policy                                                                               |
 | `upstream:20261104030000_ingest_fence_ownership.sql`           | table sessions.ingest_session_ownership                                                                                  |
+| `upstream:20261104050000_buffered_upload_receipts.sql` | table sessions.ingest_stage_intents |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
