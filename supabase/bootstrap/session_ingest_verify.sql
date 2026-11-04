@@ -10,9 +10,12 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_buffer_gc_prepare(jsonb)',
  'sessions.ingest_buffer_gc_swap(jsonb)',
  'sessions.ingest_claim_batch(jsonb)',
+ 'sessions.ingest_claim_buffered_batch(jsonb)',
  'sessions.ingest_commit_batch(jsonb)',
+ 'sessions.ingest_commit_buffered_batch(jsonb)',
  'sessions.ingest_commit_revisions(jsonb)',
  'sessions.ingest_fanout_fence(jsonb)',
+ 'sessions.ingest_prepare_buffer_stage(jsonb)',
  'sessions.ingest_release_slot(jsonb)',
  'sessions.ingest_reset_uploaded_sessions(jsonb)',
  'sessions.ingest_set_session_uploads(jsonb)'

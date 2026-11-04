@@ -284,3 +284,344 @@ CREATE FUNCTION sessions.ingest_claim_buffered_batch(p jsonb) RETURNS jsonb
 LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $buffered$
  SELECT sessions.ingest_claim_batch_mode(p,'buffered');
 $buffered$;
+
+CREATE FUNCTION sessions.ingest_prepare_buffer_stage(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $prepare$
+DECLARE k record;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;
+ v_key text;v_sha text;v_bytes bigint;v_groups jsonb;v_count integer;v_distinct integer;v_token uuid;v_pairs jsonb;v_fenced jsonb;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','claimToken','key','sha256','bytes','groupOrdinals']);
+ k:=sessions.ingest_batch_key(p);
+ PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
+ PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+ PERFORM sessions.ingest_attempt_epochs(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,p->>'claimToken');
+ SELECT * INTO a FROM sessions.ingest_claim_attempts WHERE claim_token=(p->>'claimToken')::uuid;
+ IF a.reset_epoch IS NULL OR a.records IS NULL THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: attempt lacks buffered proof'; END IF;
+ PERFORM 1 FROM sessions.ingest_batches b WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id
+  AND b.origin_id=k.origin_id AND b.batch_id=k.batch_id AND b.user_id=k.user_id AND b.digest=k.digest
+  AND b.publication_state='buffered' AND b.state='pending' FOR UPDATE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: buffered batch not pending'; END IF;
+ v_key:=p->>'key';v_sha:=sessions.ingest_digest(p->'sha256');
+ IF jsonb_typeof(p->'key') IS DISTINCT FROM 'string' OR octet_length(v_key) NOT BETWEEN 1 AND 2048
+   OR position('/'||k.org_id||'/buffered-batches/v1/' IN v_key)=0
+   OR v_key !~ ('-'||substr(encode(sha256(convert_to(p->>'claimToken','UTF8')),'hex'),1,32)||'\.staged\.ndjson\.zst$')
+   OR v_key ~ '[\x01-\x1f\x7f]' THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid buffered key'; END IF;
+ IF jsonb_typeof(p->'bytes') IS DISTINCT FROM 'number' OR (p->>'bytes') !~ '^[1-9][0-9]{0,7}$' THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid buffered bytes';
+ END IF;
+ v_bytes:=(p->>'bytes')::bigint;
+ IF v_bytes>16777216 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: buffered bytes exceed limit'; END IF;
+ v_groups:=p->'groupOrdinals';
+ IF jsonb_typeof(v_groups) IS DISTINCT FROM 'array' OR jsonb_array_length(v_groups) NOT BETWEEN 1 AND 500 THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid buffered groups';
+ END IF;
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(v_groups) g
+    WHERE jsonb_typeof(g)<>'array' OR jsonb_array_length(g) NOT BETWEEN 1 AND 500) THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid buffered ordinal group';
+ END IF;
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(v_groups) g CROSS JOIN LATERAL jsonb_array_elements(g) o
+   WHERE jsonb_typeof(o)<>'number' OR o::text !~ '^(0|[1-9][0-9]{0,2})$'
+      OR NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(a.records) r(ord integer) WHERE r.ord=(o::text)::int)) THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: ordinal outside original claim';
+ END IF;
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(v_groups) g
+  CROSS JOIN LATERAL (
+   SELECT count(DISTINCT jsonb_build_array(r.source,r.session_id)) FILTER(WHERE r.session_id IS NOT NULL) cohorts,
+          bool_or(r.session_id IS NULL) has_null,bool_or(r.session_id IS NOT NULL) has_session
+    FROM jsonb_array_elements(g) o JOIN jsonb_to_recordset(a.records) r(ord integer,source text,session_id text)
+      ON r.ord=(o::text)::int
+  ) q WHERE q.cohorts>1 OR (q.has_null AND q.has_session)) THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: buffered group mixes session owners';
+ END IF;
+ SELECT count(*)::int,count(DISTINCT o)::int INTO v_count,v_distinct
+  FROM jsonb_array_elements(v_groups) g CROSS JOIN LATERAL jsonb_array_elements(g) o;
+ IF v_count<>v_distinct OR v_count>500 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: repeated buffered ordinal'; END IF;
+ IF a.reset_epoch<>(SELECT count(*) FROM sessions.upload_resets r
+    WHERE r.org_id=k.org_id AND r.workspace_id=k.workspace_id AND r.user_id=k.user_id) THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: reset before buffered intent';
+ END IF;
+ -- Cover every currently live original ordinal exactly once; original metadata
+ -- remains in SQL, so scrubbed record/session ids cannot affect this decision.
+ SELECT coalesce(jsonb_agg(jsonb_build_array(r.source,r.session_id)),'[]'::jsonb) INTO v_pairs
+ FROM (SELECT DISTINCT source,session_id FROM jsonb_to_recordset(a.records) r(source text,session_id text)
+       WHERE session_id IS NOT NULL) r;
+ v_fenced:=sessions.ingest_attempt_fenced(k.org_id,k.workspace_id,k.user_id,k.origin_id,a.epochs,v_pairs);
+ IF EXISTS(SELECT 1 FROM jsonb_to_recordset(a.records) r(ord integer,source text,session_id text)
+   WHERE (r.ord IN(SELECT (o::text)::int FROM jsonb_array_elements(v_groups) g CROSS JOIN LATERAL jsonb_array_elements(g) o))
+      IS DISTINCT FROM (r.session_id IS NULL OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(v_fenced) f
+          WHERE f->>0=r.source AND f->>1=r.session_id))) THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: buffered ordinal coverage changed';
+ END IF;
+ SELECT * INTO t FROM sessions.ingest_stage_intents
+  WHERE claim_token=a.claim_token AND stage_key=v_key FOR UPDATE;
+ IF FOUND THEN
+  IF t.stage_sha256<>v_sha OR t.stage_bytes<>v_bytes OR t.group_ordinals<>v_groups
+    OR t.cleanup_state<>'live' OR t.receipt_state<>'preparing' OR t.expires_at<=clock_timestamp()
+    OR t.parent_stage_token IS NOT NULL THEN
+   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: buffered intent refused';
+  END IF;
+  RETURN jsonb_build_object('stageToken',t.stage_token,'expiresAt',t.expires_at);
+ END IF;
+ v_token:=gen_random_uuid();
+ INSERT INTO sessions.ingest_stage_intents(stage_token,claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,
+   stage_key,stage_sha256,stage_bytes,group_ordinals,reset_epoch,expires_at)
+ VALUES(v_token,a.claim_token,k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,
+   v_key,v_sha,v_bytes,v_groups,a.reset_epoch,clock_timestamp()+interval '120 seconds')
+ RETURNING * INTO t;
+ RETURN jsonb_build_object('stageToken',t.stage_token,'expiresAt',t.expires_at);
+END
+$prepare$;
+
+CREATE FUNCTION sessions.ingest_commit_buffered_batch(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $bcommit$
+DECLARE k record;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;
+ v_pairs jsonb;v_fenced jsonb;v_invalid boolean;v_stage uuid;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','claimToken','stageToken']);
+ k:=sessions.ingest_batch_key(p);
+ PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
+ PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+ PERFORM sessions.ingest_attempt_epochs(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,p->>'claimToken');
+ v_stage:=(p->>'stageToken')::uuid;
+ SELECT * INTO a FROM sessions.ingest_claim_attempts WHERE claim_token=(p->>'claimToken')::uuid;
+ PERFORM 1 FROM sessions.ingest_batches b WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id
+  AND b.origin_id=k.origin_id AND b.batch_id=k.batch_id AND b.user_id=k.user_id AND b.digest=k.digest
+  AND b.publication_state='buffered' FOR UPDATE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: no buffered batch'; END IF;
+ SELECT * INTO t FROM sessions.ingest_stage_intents WHERE stage_token=v_stage AND claim_token=a.claim_token FOR UPDATE;
+ IF NOT FOUND OR t.parent_stage_token IS NOT NULL OR t.cleanup_state<>'live'
+   OR (t.receipt_state='preparing' AND t.expires_at<=clock_timestamp()) THEN
+  RETURN jsonb_build_object('kind','intent_invalid');
+ END IF;
+ SELECT coalesce(jsonb_agg(jsonb_build_array(r.source,r.session_id)),'[]'::jsonb) INTO v_pairs
+ FROM (SELECT DISTINCT r.source,r.session_id FROM jsonb_to_recordset(a.records) r(ord integer,source text,session_id text)
+  WHERE r.session_id IS NOT NULL AND r.ord IN(
+   SELECT (o::text)::int FROM jsonb_array_elements(t.group_ordinals) g CROSS JOIN LATERAL jsonb_array_elements(g) o)) r;
+ v_fenced:=sessions.ingest_attempt_fenced(k.org_id,k.workspace_id,k.user_id,k.origin_id,a.epochs,v_pairs);
+ v_invalid:=jsonb_array_length(v_fenced)>0 OR a.reset_epoch IS NULL OR a.reset_epoch<>(SELECT count(*) FROM sessions.upload_resets r
+  WHERE r.org_id=k.org_id AND r.workspace_id=k.workspace_id AND r.user_id=k.user_id);
+ IF v_invalid THEN
+  UPDATE sessions.ingest_stage_intents SET cleanup_state='retired',row_version=row_version+1 WHERE stage_token=v_stage;
+  RETURN jsonb_build_object('kind','intent_invalid');
+ END IF;
+ IF t.receipt_state='acknowledged' THEN
+  IF EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox o WHERE o.org_id=k.org_id AND o.workspace_id=k.workspace_id
+    AND o.origin_id=k.origin_id AND o.batch_id=k.batch_id AND o.digest=k.digest AND o.active_stage_token=v_stage) THEN
+   RETURN jsonb_build_object('kind','committed');
+  END IF;
+  RETURN jsonb_build_object('kind','intent_invalid');
+ END IF;
+ IF EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox o WHERE o.org_id=k.org_id AND o.workspace_id=k.workspace_id
+   AND o.origin_id=k.origin_id AND o.batch_id=k.batch_id) THEN RETURN jsonb_build_object('kind','intent_invalid'); END IF;
+ -- Receipt and durable recovery pointer are one transaction; no queue proof.
+ INSERT INTO sessions.ingest_buffer_outbox(org_id,workspace_id,user_id,origin_id,batch_id,digest,active_stage_token)
+ VALUES(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,v_stage);
+ UPDATE sessions.ingest_stage_intents SET receipt_state='acknowledged',row_version=row_version+1 WHERE stage_token=v_stage;
+ UPDATE sessions.ingest_batches b SET state='committed',committed_at=coalesce(b.committed_at,clock_timestamp()),buffer_receipt_kind='staged'
+ WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id AND b.origin_id=k.origin_id AND b.batch_id=k.batch_id
+  AND b.user_id=k.user_id AND b.digest=k.digest AND b.publication_state='buffered';
+ RETURN jsonb_build_object('kind','committed');
+END
+$bcommit$;
+REVOKE ALL ON FUNCTION sessions.ingest_claim_buffered_batch(jsonb),
+ sessions.ingest_prepare_buffer_stage(jsonb),sessions.ingest_commit_buffered_batch(jsonb)
+ FROM PUBLIC,anon,authenticated,service_role;
+GRANT EXECUTE ON FUNCTION sessions.ingest_claim_buffered_batch(jsonb),
+ sessions.ingest_prepare_buffer_stage(jsonb),sessions.ingest_commit_buffered_batch(jsonb)
+ TO bulls96_session_ingest;
+
+
+-- Buffered admission is not canonical publication authority.
+CREATE OR REPLACE FUNCTION sessions.ingest_fanout_fence(p jsonb)
+RETURNS jsonb LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $ffence$
+DECLARE v_org text;v_ws text;v_user text;v_origin text;v_epochs jsonb;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  IF EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_batches b
+    USING(org_id,workspace_id,origin_id,batch_id)
+    WHERE a.claim_token::text=p->>'claimToken' AND b.publication_state='buffered') THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered publication refused';
+  END IF;
+
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','sessions','batchDigest','claimToken']);
+ PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);
+ v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);
+ v_origin:=sessions.ingest_identifier(p->'originId',false);
+ PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
+ v_epochs:=sessions.ingest_attempt_epochs(v_org,v_ws,v_user,v_origin,
+   NULL,sessions.ingest_digest(p->'batchDigest'),p->>'claimToken');
+ RETURN jsonb_build_object('deleted',sessions.ingest_attempt_fenced(v_org,v_ws,v_user,v_origin,v_epochs,p->'sessions'));
+END
+$ffence$;
+
+-- Buffered admission is not canonical publication authority.
+CREATE OR REPLACE FUNCTION sessions.ingest_commit_revisions(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $crev$
+DECLARE
+  t jsonb;
+  v_org text; v_ws text; v_user text; v_origin text; v_machine text;
+  v_items jsonb;
+  v_committed integer;
+  v_rearmed integer;
+  v_epochs jsonb;
+  v_fenced jsonb;
+  v_pairs jsonb;
+BEGIN
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  IF EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_batches b
+    USING(org_id,workspace_id,origin_id,batch_id)
+    WHERE a.claim_token::text=p->>'claimToken' AND b.publication_state='buffered') THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered publication refused';
+  END IF;
+
+  PERFORM sessions.ingest_exact_keys(p, ARRAY['tenant', 'originId', 'machineId', 'records','batchDigest','claimToken']);
+  t := p -> 'tenant';
+  PERFORM sessions.ingest_exact_keys(t, ARRAY['orgId', 'workspaceId', 'userId']);
+  v_org := sessions.ingest_identifier(t -> 'orgId', false);
+  v_ws := sessions.ingest_identifier(t -> 'workspaceId', true);
+  v_user := sessions.ingest_identifier(t -> 'userId', false);
+  v_origin := sessions.ingest_identifier(p -> 'originId', false);
+  IF jsonb_typeof(p -> 'machineId') IS DISTINCT FROM 'string' OR (p ->> 'machineId') !~ '^srv_[0-9a-f]{32}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: machineId is malformed';
+  END IF;
+  v_machine := p ->> 'machineId';
+  v_items := sessions.ingest_records(p -> 'records');
+  PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
+  v_epochs:=sessions.ingest_attempt_epochs(v_org,v_ws,v_user,v_origin,
+    NULL,sessions.ingest_digest(p->'batchDigest'),p->>'claimToken');
+  v_pairs:=(SELECT coalesce(jsonb_agg(jsonb_build_array(x.source,x.session_id)),'[]'::jsonb)
+    FROM (SELECT DISTINCT i.source,i.session_id FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
+      WHERE i.session_id IS NOT NULL) AS x);
+  v_fenced:=sessions.ingest_attempt_fenced(v_org,v_ws,v_user,v_origin,v_epochs,v_pairs);
+  WITH items AS (
+    SELECT * FROM jsonb_to_recordset(v_items) AS i(ord integer, source text, session_id text, record_id text,
+                                                    revision_id text, revision bigint, digest text)
+  ), fenced AS (
+    SELECT x.pair->>0 AS source,x.pair->>1 AS session_id FROM jsonb_array_elements(v_fenced) AS x(pair)
+  ), rearm AS (
+    INSERT INTO sessions.upload_erasure_rearm (org_id, workspace_id, user_id, origin_id, machine_id, source, session_id)
+    SELECT v_org, v_ws, v_user, v_origin, v_machine, f.source, f.session_id FROM fenced AS f
+    ON CONFLICT DO NOTHING
+  ), upserted AS (
+    INSERT INTO sessions.ingest_record_revisions AS r
+           (org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id)
+    SELECT DISTINCT ON (i.record_id) v_org, v_ws, v_origin, i.record_id, i.revision, i.revision_id, i.digest,
+           v_user, i.source, i.session_id
+      FROM items AS i
+     WHERE NOT EXISTS (SELECT 1 FROM fenced AS f WHERE f.source = i.source AND f.session_id = i.session_id)
+     ORDER BY i.record_id, i.revision DESC, i.revision_id, i.ord
+    ON CONFLICT (org_id, workspace_id, origin_id, record_id) DO UPDATE
+       SET revision = EXCLUDED.revision, revision_id = EXCLUDED.revision_id, digest = EXCLUDED.digest,
+           user_id = EXCLUDED.user_id, source = EXCLUDED.source, session_id = EXCLUDED.session_id,
+           updated_at = now()
+     WHERE EXCLUDED.revision > r.revision
+    RETURNING 1
+  )
+  SELECT (SELECT count(*)::integer FROM upserted), (SELECT count(*)::integer FROM fenced)
+    INTO v_committed, v_rearmed;
+  RETURN jsonb_build_object('committed', v_committed, 'rearmed', v_rearmed);
+END
+$crev$;
+
+-- Buffered admission is not canonical publication authority.
+CREATE OR REPLACE FUNCTION sessions.ingest_commit_batch(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $commit$
+DECLARE
+  k record;
+  v_machine text;
+  v_items jsonb;
+  v_claimed_at timestamptz;
+  v_rearmed integer;
+  v_epochs jsonb;
+  v_fenced jsonb;
+  v_pairs jsonb;
+  v_invalidated boolean;
+BEGIN
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  IF EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_batches b
+    USING(org_id,workspace_id,origin_id,batch_id)
+    WHERE a.claim_token::text=p->>'claimToken' AND b.publication_state='buffered') THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered publication refused';
+  END IF;
+
+  PERFORM sessions.ingest_exact_keys(p,
+    ARRAY['tenant', 'originId', 'batchId', 'batchDigest', 'sessions', 'records', 'machineId', 'claimToken']);
+  k := sessions.ingest_batch_key(p);
+  IF jsonb_typeof(p -> 'machineId') IS DISTINCT FROM 'string'
+     OR (p ->> 'machineId') !~ '^srv_[0-9a-f]{32}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: machineId is malformed';
+  END IF;
+  v_machine := p ->> 'machineId';
+  v_items := sessions.ingest_records(p -> 'records');
+  PERFORM sessions.ingest_session_pairs(p -> 'sessions');
+
+  PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
+
+  v_epochs:=sessions.ingest_attempt_epochs(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,p->>'claimToken');
+  v_pairs:=(SELECT coalesce(jsonb_agg(jsonb_build_array(x.source,x.session_id)),'[]'::jsonb)
+    FROM (SELECT q.source,q.session_id FROM sessions.ingest_session_pairs(p->'sessions') AS q
+          UNION SELECT i.source,i.session_id FROM jsonb_to_recordset(v_items) AS i(source text,session_id text)
+            WHERE i.session_id IS NOT NULL) AS x);
+  v_fenced:=sessions.ingest_attempt_fenced(k.org_id,k.workspace_id,k.user_id,k.origin_id,v_epochs,v_pairs);
+  SELECT EXISTS(SELECT 1 FROM jsonb_array_elements(v_fenced) AS x(pair)
+    WHERE NOT EXISTS(SELECT 1 FROM sessions.upload_deletions AS d
+      WHERE d.org_id=k.org_id AND d.workspace_id=k.workspace_id AND d.user_id=k.user_id
+        AND d.origin_id=k.origin_id AND d.source=x.pair->>0 AND d.session_id=x.pair->>1))
+    INTO v_invalidated;
+  SELECT b.claimed_at INTO v_claimed_at FROM sessions.ingest_batches AS b
+   WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id AND b.origin_id=k.origin_id
+     AND b.batch_id=k.batch_id AND b.digest=k.digest AND b.user_id=k.user_id FOR UPDATE;
+  IF NOT v_invalidated THEN
+    UPDATE sessions.ingest_batches AS b SET state='committed',committed_at=coalesce(b.committed_at,now())
+     WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id AND b.origin_id=k.origin_id
+       AND b.batch_id=k.batch_id AND b.digest=k.digest AND b.user_id=k.user_id;
+  END IF;
+
+  -- The written revisions become stored: per record its highest (first in identity
+  -- order), inserted, or replacing a lower one only (#250: an equal revision keeps
+  -- the stored row). Rows are touched in record_id order, so two commits sharing
+  -- records lock them in the same order. Idempotent.
+  INSERT INTO sessions.ingest_record_revisions AS t
+         (org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id)
+  SELECT DISTINCT ON (i.record_id) k.org_id, k.workspace_id, k.origin_id,
+         i.record_id, i.revision, i.revision_id, i.digest, k.user_id, i.source, i.session_id
+    FROM jsonb_to_recordset(v_items) AS i(ord integer, source text, session_id text, record_id text,
+                                          revision_id text, revision bigint, digest text)
+   WHERE i.session_id IS NULL OR NOT EXISTS(SELECT 1 FROM jsonb_array_elements(v_fenced) AS f(pair)
+     WHERE f.pair->>0=i.source AND f.pair->>1=i.session_id)
+   ORDER BY i.record_id, i.revision DESC, i.revision_id, i.ord
+  ON CONFLICT (org_id, workspace_id, origin_id, record_id) DO UPDATE
+     SET revision = EXCLUDED.revision, revision_id = EXCLUDED.revision_id,
+         digest = EXCLUDED.digest, user_id = EXCLUDED.user_id, source = EXCLUDED.source,
+         session_id = EXCLUDED.session_id, updated_at = now()
+   WHERE EXCLUDED.revision > t.revision;
+
+  -- The fence again: a tombstone, or a reset since the claim, that this batch's
+  -- objects may have outrun. Those sessions are swept again.
+  WITH reached AS (
+    SELECT x.pair->>0 AS source,x.pair->>1 AS session_id FROM jsonb_array_elements(v_fenced) AS x(pair)
+  ), queued AS (
+    INSERT INTO sessions.upload_erasure_rearm
+           (org_id, workspace_id, user_id, origin_id, machine_id, source, session_id)
+    SELECT k.org_id, k.workspace_id, k.user_id, k.origin_id, v_machine, r.source, r.session_id
+      FROM reached AS r
+    ON CONFLICT DO NOTHING
+  )
+  SELECT count(*)::integer INTO v_rearmed FROM reached;
+  RETURN jsonb_build_object('rearmed', v_rearmed,'invalidated',v_invalidated);
+END
+$commit$;

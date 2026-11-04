@@ -122,6 +122,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.ingest_session_ownership",
     sql: relation("sessions.ingest_session_ownership"),
   },
+  "upstream:20261104050000_buffered_upload_receipts.sql": {
+    evidence: "table sessions.ingest_stage_intents",
+    sql: relation("sessions.ingest_stage_intents"),
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
