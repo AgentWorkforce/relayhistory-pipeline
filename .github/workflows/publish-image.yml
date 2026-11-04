@@ -18,9 +18,9 @@ permissions:
   attestations: write
 jobs:
   publish:
-    # Only Khaliq may dispatch it, and only with the phrase; the job also runs in the
+    # Only Khaliq may dispatch it, only from main, and only with the phrase; the job also runs in the
     # image-publish environment so a protection rule can add a second gate when the plan allows it.
-    if: ${{ github.actor == 'khaliqgant' && github.event.inputs.confirm == 'publish 96bulls-services' }}
+    if: ${{ github.ref == 'refs/heads/main' && github.actor == 'khaliqgant' && github.event.inputs.confirm == 'publish 96bulls-services' }}
     environment: image-publish
     runs-on: ${{ vars.DEPLOY_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
