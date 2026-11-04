@@ -6,9 +6,10 @@ import type { SqlExecutor } from "../../packages/pipeline/src/lib/pipeline/queue
 import { nodeReadBudget } from "../session-read-api/node-read-profile.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
 import { produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
+import type { HistorySourceCapture } from "../shared/history-source-authority.ts";
 import type { SessionScope } from "./pointer.ts";
 export interface LargeReadJob { identity:{orgId:string;workspaceId:string;source:string;sessionId:string};source:{epoch:string;fingerprint:string};leaseNonce:string }
-export interface LargeReadDeps { db:SqlExecutor;search:SearchIndexDeps;replay:ReplayProducerDeps;signal?:AbortSignal;heartbeatMs?:number }
+export interface LargeReadDeps { history?:(job:LargeReadJob)=>Promise<HistorySourceCapture>; db:SqlExecutor;search:SearchIndexDeps;replay:ReplayProducerDeps;signal?:AbortSignal;heartbeatMs?:number }
 function scopeOf(j:LargeReadJob):SessionScope{return {orgId:j.identity.orgId,workspaceId:j.identity.workspaceId,harness:j.identity.source,sessionId:j.identity.sessionId}}
 const args=(s:SessionScope)=>[s.orgId,s.workspaceId,s.harness,s.sessionId];
 export async function routeLargeRead(db:SqlExecutor,s:SessionScope):Promise<boolean>{
@@ -32,11 +33,17 @@ export async function runLargeReadOnce(deps:LargeReadDeps):Promise<"idle"|"publi
   if(!captured?.exists||captured.blocked||captured.source?.epoch!==j.source.epoch||captured.source?.fingerprint!==j.source.fingerprint)throw new Error("large_source_changed");
   const physical=layoutComponent(j.identity.sessionId);
   if(!captured.snapshot?.pointers?.some((p:any)=>p.source_session_id===physical))throw new Error("large_physical_source_missing");
+  const history=deps.history?await deps.history(j):deps.replay.history;
+  if(captured.snapshot?.history?.required===true&&!history)throw new Error("large_history_authority_required");
   const indexScope={...scope,sessionId:physical},budget=nodeReadBudget("large");
-  const indexed=await indexSearchScope(indexScope,{...deps.search,limits:{...deps.search.limits,maxScopeBytes:budget.sourceBytes,maxScopeEvents:budget.sourceRecords,maxRows:budget.projectedRows}});
-  if(indexed.busy||!indexed.complete)throw new Error("large_index_incomplete");
+  // Managed images use610's source-bound feature publisher. The old physical
+  // transcript_events indexer cannot attest a logical History winner mask.
+  if(!history){
+   const indexed=await indexSearchScope(indexScope,{...deps.search,limits:{...deps.search.limits,maxScopeBytes:budget.sourceBytes,maxScopeEvents:budget.sourceRecords,maxRows:budget.projectedRows}});
+   if(indexed.busy||!indexed.complete)throw new Error("large_index_incomplete");
+  }
   active();
-  const result=await produceCanonicalReplay(scope,{...deps.replay,profile:"large",publish:async publishParams=>{
+  const result=await produceCanonicalReplay(scope,{...deps.replay,history,largeLease:nonce,profile:"large",publish:async publishParams=>{
    active();if(String(publishParams[4])!==j.source.epoch||publishParams[5]!==j.source.fingerprint)return false;
    const r=await deps.db.query<{ok:boolean}>("SELECT sessions.publish_session_large_read($1,$2,$3,$4,$5::bigint,$6,$7::jsonb,$8,$9,$10,$11,$12,$13::integer,$14::uuid) ok",[...publishParams,nonce]);
    return r.rows[0]?.ok===true;

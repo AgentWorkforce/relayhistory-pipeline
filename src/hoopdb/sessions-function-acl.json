@@ -165,6 +165,86 @@
     "sessions.ingest_fence_pairs(jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_history_control_changed()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_invalidate_scope(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_inventory_claim(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_inventory_finish(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_inventory_heartbeat(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_inventory_locked(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_inventory_page(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_inventory_refs(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_mask_get(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_mask_register(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_mask_rows(text,bigint,integer)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_native_changed()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_native_snapshot(uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_plan_carriers_page(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_plan_claim(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_plan_heartbeat(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_plan_locked(uuid,uuid,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_plan_refs_page(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_pointer(sessions.session_index)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_require_model_permit(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_root(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_source_current(jsonb,boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_sync_pointer()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_identifier(jsonb,boolean)": [
       "<owner>:EXECUTE"
     ],
@@ -532,6 +612,46 @@
     ],
     "sessions.session_directory_worker_scope(text)": [
       "<owner>:EXECUTE"
+    ],
+    "sessions.session_history_capture(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_mask_page(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_register_artifact(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_register_object(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_replay_descriptor(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_replay_publish(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_source_lock(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_state_publish(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_summary_get(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_summary_publish(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.session_index_batch(jsonb)": [
       "<owner>:EXECUTE",
