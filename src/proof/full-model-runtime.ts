@@ -31,7 +31,8 @@ assert.equal(manifest.head,head);assert.equal(manifest.dirty,false);
 assert.equal(createHash("sha256").update(readFileSync(bundle)).digest("hex"),manifest.bundleSha256);
 assert.equal(execFileSync("git",["status","--porcelain"],{encoding:"utf8"}).trim(),"");
 mkdirSync(out,{recursive:false,mode:0o700});
-const proof:any={head,manifest,node:process.version,cases:[],providerCalls:0,requests:0,intentsBeforePut:0,kmsHeaders:0,packagedInvocations:0,manual620PortFixture:true};
+const long=process.env.MODEL_PROOF_SMALL!=="1";
+const proof:any={head,manifest,node:process.version,scenario:long?"long":"small",cases:[],providerCalls:0,requests:0,intentsBeforePut:0,kmsHeaders:0,packagedInvocations:0,manual620PortFixture:true};
 const check=(name:string)=>{proof.cases.push(name);console.log("PASS "+name)};
 const owned="full-model-proof-"+process.pid+"-"+Date.now(),containers:string[]=[],pools:pg.Pool[]=[];
 const credentials={accessKeyId:"owned-model-fixture",secretAccessKey:randomBytes(32).toString("hex")},region="us-east-1",bucket="replay-fixture";
@@ -69,7 +70,7 @@ try{
  const x={db:owner,pg:{exec:(q:string)=>owner!.query(q)}};
  const gen=await generation(),authority=randomUUID(),scope={orgId:identity.orgId,workspaceId:identity.workspaceId,harness:identity.source,sessionId:identity.sessionId};
  const base="2026-11-01T10:00:00.000000Z",records:RelayhistoryStreamRecord[]=[];
- for(let i=0;i<31;i++)records.push({kind:"convergence_event",origin_id:"machine:machine:0",record_id:"native-"+i,revision:"1",accepted_seq:String(i+1),operation:"upsert",received_at:base,payload:{source:identity.source,session_id:identity.sessionId,machine_id:"machine:0",user_id:"user_replay",event_id:"native-"+i,kind:"session_event",type:"assistant",ts:base,ingested_at:base,actor_name:"fixture",actor_role:"assistant",content:i===23?"long all-content ".repeat(160000):"message-"+i,model:"fixture",tool_calls:i===23?Array.from({length:10001},(_,n)=>({id:n,args:{name:"tool",surrogate:"\ud800"}})):[],record:{payload:{message_id:"real-native-"+i,arbitrary:["kept",i]}}}});
+ for(let i=0;i<31;i++)records.push({kind:"convergence_event",origin_id:"machine:machine:0",record_id:"native-"+i,revision:"1",accepted_seq:String(i+1),operation:"upsert",received_at:base,payload:{source:identity.source,session_id:identity.sessionId,machine_id:"machine:0",user_id:"user_replay",event_id:"native-"+i,kind:"session_event",type:"assistant",ts:base,ingested_at:base,actor_name:"fixture",actor_role:"assistant",content:i===23?"long all-content ".repeat(long?160000:1):"message-"+i,model:"fixture",tool_calls:i===23?Array.from({length:long?10001:2},(_,n)=>({id:n,args:{name:"tool",surrogate:"\ud800"}})):[],record:{payload:{message_id:"real-native-"+i,arbitrary:["kept",i],native_exact:9007199254740993n}}}});
  const visible:RelayhistoryStreamRecord={kind:"session_event",origin_id:"current-origin",record_id:"visible-native",revision:"1",accepted_seq:"9007199254740993",operation:"upsert",received_at:base,payload:{text:"VISIBLE-MASKED-EVIDENCE",role:"assistant",ts_ms:Date.parse(base),message_id:"visible-message"}};
  const hidden:RelayhistoryStreamRecord={...visible,record_id:"hidden-native",payload:{...visible.payload,text:"MOVED-PRIVATE-MUST-NOT-MODEL"}};
  records.push(visible,hidden);
@@ -134,12 +135,26 @@ try{
  await owner.query("UPDATE sessions.history_model_work SET next_attempt_at=clock_timestamp()");
  let complete=0;
  for(let i=0;i<12&&!complete;i++){const r=await run();complete+=r.completed;assert.equal(r.failed,0)}
- assert.equal(complete,1);assert(proof.providerCalls>10);assert(observed.some(s=>s.includes("message-30")));assert(observed.some(s=>s.includes("VISIBLE-MASKED-EVIDENCE")));assert(observed.every(s=>!s.includes("MOVED-PRIVATE-MUST-NOT-MODEL")));
+ assert.equal(complete,1);assert(proof.providerCalls>(long?10:0));assert(observed.some(s=>s.includes("message-30")));assert(observed.some(s=>s.includes("VISIBLE-MASKED-EVIDENCE")));assert(observed.every(s=>!s.includes("MOVED-PRIVATE-MUST-NOT-MODEL")));assert(observed.some(s=>JSON.parse(s).fragments?.some((f:any)=>f.jsonFragment.includes('"native_exact":9007199254740993'))));
  assert.equal((await owner.query("SELECT status FROM sessions.history_model_work")).rows[0].status,"complete");
  for(const kind of["short","long"]as const){const pointer=await readHistorySummary(ingest,history,kind);assert(pointer);const text=await readFullModelSummary({store,keyring,captured:history,pointer,signal:AbortSignal.timeout(5000)});assert(typeof text?.summary==="string"&&text.summary.includes("Owned"));const object=await store.getObject(pointer.objectKey as never);const chunks=[];for await(const c of object.body as any)chunks.push(c);const bytes=Buffer.concat(chunks);assert.equal(createHash("sha256").update(bytes).digest("hex"),pointer.objectSha256);assert.equal(bytes.length,pointer.objectBytes);assert(!bytes.includes(Buffer.from("Owned complete")))}
  assert.equal((await owner.query("SELECT count(*)::int n FROM sessions.ingest_history_states")).rows[0].n,0);
  check("final packaged job uses actual HTTP structured Responses/all long rows and both authenticated encrypted summaries");
  assert(jobPools.every(p=>(p as any).ending===true));check("all owned job and heartbeat pools close after every invocation");
+
+ const {enqueueFullModelWork,modelWorkConfig}=await import("../bob-costas/full-model-ledger.ts");
+ const modelPool=new pg.Pool({host:"127.0.0.1",port,user:"bulls96_session_model",database:"postgres",connectionTimeoutMillis:1000,max:1});pools.push(modelPool);
+ const modelDb={query:async<T>(q:string,p?:unknown[])=>({rows:(await modelPool.query(q,p)).rows as T[]})};
+ await enqueueFullModelWork(modelDb,history,modelWorkConfig("fixture-refusal","hkdf1:fixture",graph.publication!));
+ providerMode="refusal";proof.packagedInvocations++;
+ const refused=await api({...env,BOB_COSTAS_MODEL:"fixture-refusal"},()=>300000,overrides);
+ assert.equal(refused.failed,1);assert.equal(refused.completed,0);
+ const refusal=(await owner.query("SELECT status,last_error_code FROM sessions.history_model_work WHERE config->>'model'='fixture-refusal'")).rows[0];
+ assert.equal(refusal.status,"failed");assert.equal(refusal.last_error_code,"model_refusal");
+ providerMode="normal";check("actual provider refusal is durable terminal failure, never fake empty completion");
+ let wrongPool:pg.Pool|undefined;
+ await assert.rejects(api(env,()=>300000,{...overrides,pool:()=>{wrongPool=new pg.Pool({host:"127.0.0.1",port,user:"postgres",database:"postgres",connectionTimeoutMillis:1000,max:1});jobPools.push(wrongPool);return wrongPool}}),{code:"model_database_role"});
+ assert(jobPools.every(p=>(p as any).ending===true));check("actual owner connection refuses before provider and closes both pools");
  proof.rssMaxKiB=process.resourceUsage().maxRSS;proof.ok=true;
 } catch(error){proof.ok=false;proof.error=String(error);throw error}
 finally{if(provider)await new Promise<void>(r=>provider!.close(()=>r()));await Promise.all(pools.map(p=>p.end()));for(const c of containers.reverse())try{docker(["rm","-f",c])}catch{};writeFileSync(resolve(out,"proof.json"),JSON.stringify(proof,null,2)+"\n")}

@@ -8,6 +8,7 @@ import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { objectKey, parseManifest, readAll, type ObjectStore } from "../../../packages/object-store/src/index.ts";
 import { exportUnit } from "../../migration/neon-s3-sync/export-session.ts";
 import type { SessionUnit } from "../../migration/neon-s3-sync/neon-reader.ts";
+import { encodeRelayhistoryJsonExact } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import type { RelayhistoryStreamRecord } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 export const REPLAY_FIXTURE_IDENTITY = { orgId:"org_replay",workspaceId:"ws_replay",source:"claude",sessionId:"large:replay" };
 export const REPLAY_FIXTURE_AT = "2026-11-01T10:00:00.000Z";
@@ -37,9 +38,9 @@ export async function exportReplayFixture(store:ObjectStore, db:Parameters<typeo
       record.kind="convergence_event";record.origin_id=`machine:machine:${lane}`;record.record_id=`direct-${String(n).padStart(12,"0")}`;
       record.payload={source:i.source,session_id:i.sessionId,machine_id:`machine:${lane}`,user_id:"user_replay",event_id:record.record_id,kind:"session_event",type:"assistant",ts:n===0&&count>=300000?at:at.slice(0,-1)+"456Z",ingested_at:at,actor_name:"CapacityAgent",actor_role:"owner",content,model:"fixture-model",provider:"fixture",input_tokens:12,output_tokens:24,reasoning_tokens:5,cache_read_tokens:7,cache_create_tokens:3,task_ref:{},tags:["capacity","native"],files_touched:["src/fixture.ts"],tool_calls:n===0&&count>=300000?Array.from({length:5000},(_,call)=>({id:`call-${call}`,name:"Read",input:{path:"src/fixture.ts",call}})):[{id:`call-${n}`,name:"Read",input:{path:"src/fixture.ts"}}],record:{payload:{message_id:`native-${n}`,text:content}}};
     }
-    yield {machine:`machine:${lane}`,userId:"user_replay",bytes:encoder.encode(JSON.stringify(record)+"\n")};
+    yield {machine:`machine:${lane}`,userId:"user_replay",bytes:encoder.encode(encodeRelayhistoryJsonExact(record)+"\n")};
    }
-   for(const record of extraRecords)yield {machine:"machine:0",userId:"user_replay",bytes:encoder.encode(JSON.stringify(record)+"\n")};
+   for(const record of extraRecords)yield {machine:"machine:0",userId:"user_replay",bytes:encoder.encode(encodeRelayhistoryJsonExact(record)+"\n")};
   },
  });
  for(const m of result.manifests){const manifest=await parseManifest(new TextDecoder().decode(await readAll(await store.get(objectKey(m.manifestKey)))),m.manifestKey);const ext=manifest.extensions!["96bulls"] as {canonical_machine_id:string};await addReplayPointer(db,{key:m.manifestKey,digest:manifest.raw.content_sha256,physicalSession:manifest.session.session_id,physicalMachine:manifest.session.machine_id,canonicalMachine:ext.canonical_machine_id,revision:manifest.revision,trace:manifest.trace_id});}

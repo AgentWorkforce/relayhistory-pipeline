@@ -42,7 +42,7 @@ export function modelStore(store:ObjectStore):ObjectStore{
   if(!p?.prefix?.startsWith("96bulls/")||!m)return false;
   try{return publicationDerivedKey(key.slice(0,key.length-p.rest.length)+"publications/"+m[1]+"/manifest.json",m[3]!,m[2]!)===key}catch{return false}
  };
- const graph=(key:string)=>{const p=parseSessionKey(key);return!!p&&p.prefix?.startsWith("96bulls/")&&(/(?:^|\/)normalized\/read-projection-v1\//.test(p.rest)||/^publications\/[0-9a-f-]{36}\/derived\/replay\//.test(p.rest))};
+ const graph=(key:string)=>{const p=parseSessionKey(key);return!!p&&p.prefix?.startsWith("96bulls/")&&/^publications\/[0-9a-f-]{36}\/derived\/replay\//.test(p.rest)};
  return new Proxy(store,{get(target,k){
   const value=Reflect.get(target,k);
   if(typeof value!=="function")return value;
