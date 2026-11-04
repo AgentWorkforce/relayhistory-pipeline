@@ -54,7 +54,7 @@ interface SessionScope {
   harness: string;
   sessionId: string;
 }
-import{historyRecordVisible,type HistoryLogicalMask}from"../shared/history-visibility.ts";
+import{historyRecordVisible,assertHistoryMaskCoverage,type HistoryLogicalMask}from"../shared/history-visibility.ts";
 interface SearchIndexDeps {
   historyMask?:HistoryLogicalMask;
   reader: ManifestReader;
@@ -443,6 +443,7 @@ export async function readCanonicalScope(
     if(deps.historyMask.scope.orgId!==scope.orgId||deps.historyMask.scope.workspaceId!==scope.workspaceId||deps.historyMask.scope.source!==scope.harness||deps.historyMask.scope.sessionId!==scope.sessionId)
       throw new PipelineError("history_visibility_scope","logical source mask belongs to another scope",false);
     for(const part of parts)part.records=part.records.filter(r=>historyRecordVisible(r,part.userId,deps.historyMask!));
+    assertHistoryMaskCoverage(deps.historyMask,parts.flatMap(part=>part.records));
   }
 
   // Fold every copy together; a conflicting copy (same revision, different
