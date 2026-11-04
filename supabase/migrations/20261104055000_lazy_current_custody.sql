@@ -1188,7 +1188,7 @@ BEGIN
              ORDER BY i.record_id COLLATE "C", i.revision, i.revision_id COLLATE "C", i.ord) AS rn
       FROM jsonb_to_recordset(v_live) AS i(ord integer, source text, session_id text,
                                             record_id text, revision_id text, revision bigint, digest text)
-  ), stored AS (
+  ), stored AS MATERIALIZED (
     SELECT c.record_id, c.revision
       FROM sessions.ingest_record_revisions AS c
      WHERE c.org_id = k.org_id AND c.workspace_id = k.workspace_id AND c.origin_id = k.origin_id
@@ -1199,6 +1199,11 @@ BEGIN
      WHERE p_mode='buffered' AND EXISTS(SELECT 1 FROM sessions.ingest_lazy_policy WHERE singleton)
       AND n.org_id=k.org_id AND n.workspace_id=k.workspace_id AND n.origin_id=k.origin_id
       AND n.current_owner=k.user_id AND n.current_revision IS NOT NULL
+      -- Probe the existing global-native PK for this bounded batch. An owner
+      -- index alone would scan every current record the user has ever uploaded.
+      AND n.key_sha256=ANY(ARRAY(SELECT encode(sha256(convert_to(
+        jsonb_build_array('global-native-custody-v1',k.org_id,k.workspace_id,k.origin_id,s.record_id)::text,'UTF8')),'hex')
+        FROM sorted s))
       AND n.record_id=ANY(ARRAY(SELECT DISTINCT s.record_id FROM sorted s))
   ), peers AS (
     SELECT DISTINCT ON (s.record_id, s.revision) s.record_id, s.revision,
