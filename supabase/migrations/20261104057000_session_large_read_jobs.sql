@@ -1,3 +1,4 @@
+-- Append-only release rename; upstream provenance: 20261103080000_session_large_read_jobs.sql. Never applied under the upstream filename in this release.
 -- Default-off durable handoff for trusted high-memory Node processing.
 -- No transcript bytes, credentials, or direct reader table grants.
 -- Lease authority uses wall time: now() is frozen at transaction start and

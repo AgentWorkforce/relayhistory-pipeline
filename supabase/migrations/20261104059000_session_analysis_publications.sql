@@ -1,3 +1,4 @@
+-- Append-only release rename; upstream provenance: 20261103060000_session_analysis_publications.sql. Never applied under the upstream filename in this release.
 -- Immutable full v1 payloads live in object storage, not this pointer catalog.
 CREATE TABLE sessions.session_analysis_publications (
  org_id text NOT NULL,workspace_id text NOT NULL,harness text NOT NULL,session_id text NOT NULL,
