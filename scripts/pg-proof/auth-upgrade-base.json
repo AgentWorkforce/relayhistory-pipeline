@@ -2,26 +2,6 @@
   "base": "3356c81bf8e1c3c8717b58a2376fc3221c8301b6",
   "steps": [
     {
-      "name": "96bulls:0001_96bulls_observability.sql",
-      "path": "src/hoopdb/migrations/0001_96bulls_observability.sql",
-      "sha256": "b9d059c426982d4a2ece264932a9a4d841d29afdf2e6b8457436766ba7a430a8"
-    },
-    {
-      "name": "96bulls:0002_session_ext_and_summaries.sql",
-      "path": "src/hoopdb/migrations/0002_session_ext_and_summaries.sql",
-      "sha256": "2fee02abb8cb680a9c089ee58caf71dda82894a91ba218e99c915ec6e0525568"
-    },
-    {
-      "name": "96bulls:0003_fanout_ledger.sql",
-      "path": "src/hoopdb/migrations/0003_fanout_ledger.sql",
-      "sha256": "cccdd28c9be9f675307af848f39453d770a45ddb375a43b82c046aba7ff618c7"
-    },
-    {
-      "name": "96bulls:0004_summary_pointers.sql",
-      "path": "src/hoopdb/migrations/0004_summary_pointers.sql",
-      "sha256": "fe351f30fbda78ecfd6d58e681e573354bbe28906d870293b99da34fe96b2e94"
-    },
-    {
       "name": "upstream:20261025000000_sessions_index.sql",
       "path": "supabase/migrations/20261025000000_sessions_index.sql",
       "sha256": "6bfdb4c3b74edab105494203d6c40d10395e9934927b38dce80857b65b8874a3"
@@ -110,6 +90,26 @@
       "name": "upstream:20261102020000_session_brief_state.sql",
       "path": "supabase/migrations/20261102020000_session_brief_state.sql",
       "sha256": "5bd8f34617393742968fa2018d04a64e0f3838a6afb4a65d14537986d8be7d87"
+    },
+    {
+      "name": "96bulls:0001_96bulls_observability.sql",
+      "path": "src/hoopdb/migrations/0001_96bulls_observability.sql",
+      "sha256": "b9d059c426982d4a2ece264932a9a4d841d29afdf2e6b8457436766ba7a430a8"
+    },
+    {
+      "name": "96bulls:0002_session_ext_and_summaries.sql",
+      "path": "src/hoopdb/migrations/0002_session_ext_and_summaries.sql",
+      "sha256": "2fee02abb8cb680a9c089ee58caf71dda82894a91ba218e99c915ec6e0525568"
+    },
+    {
+      "name": "96bulls:0003_fanout_ledger.sql",
+      "path": "src/hoopdb/migrations/0003_fanout_ledger.sql",
+      "sha256": "cccdd28c9be9f675307af848f39453d770a45ddb375a43b82c046aba7ff618c7"
+    },
+    {
+      "name": "96bulls:0004_summary_pointers.sql",
+      "path": "src/hoopdb/migrations/0004_summary_pointers.sql",
+      "sha256": "fe351f30fbda78ecfd6d58e681e573354bbe28906d870293b99da34fe96b2e94"
     }
   ]
 }
