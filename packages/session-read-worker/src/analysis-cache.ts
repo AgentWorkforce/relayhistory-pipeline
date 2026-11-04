@@ -4,6 +4,7 @@ import { CanonicalReadError } from "../../../src/session-read-api/canonical.ts";
 import type { ArtifactIdentity } from "../../../src/session-read-api/canonical-artifact.ts";
 import {
   readSessionAnalysisCache,
+  readSessionAnalysisTitle,
   type AnalysisCacheDeps,
 } from "../../../src/session-read-api/session-analysis-reader.ts";
 import {
@@ -58,10 +59,13 @@ export async function canonicalAnalysisHandle(
       throw new CanonicalReadError("route", 400);
     for (const key of url.searchParams.keys())
       if (
-        !["workspace", "source"].includes(key) ||
+        !["workspace", "source", "view"].includes(key) ||
         url.searchParams.getAll(key).length !== 1
       )
         throw new CanonicalReadError("parameter", 400);
+    const view = url.searchParams.get("view");
+    if (view !== null && view !== "title")
+      throw new CanonicalReadError("parameter", 400);
     const workspace = url.searchParams.get("workspace"),
       source = url.searchParams.get("source"),
       sessionId = decodeURIComponent(match[1]!);
@@ -121,12 +125,14 @@ export async function canonicalAnalysisHandle(
     const result = await Promise.race([
       (async () => {
         wakeAck(await selected.wake(identity, signal), identity);
-        return readSessionAnalysisCache({ ...selected, signal }, identity);
+        return view === "title"
+          ? readSessionAnalysisTitle({ ...selected, signal }, identity)
+          : readSessionAnalysisCache({ ...selected, signal }, identity);
       })(),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-          controller.abort();
           reject(new CanonicalReadError("deadline"));
+          controller.abort();
         }, 8000);
       }),
     ]);
