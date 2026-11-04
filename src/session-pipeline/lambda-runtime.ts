@@ -7,12 +7,13 @@ import type { BatchResponse } from "./consumer.ts";
 export interface PipelineLambdaEvent {
   Records?: { messageId: string; body: string; eventSource?: string; attributes?: Record<string, string> }[];
   reconcile?: unknown; brief?: unknown; sessionAnalysis?: unknown; analysisCache?: unknown; analysisCacheReconcile?: unknown; semanticCopy?: unknown; bufferedSearchFeed?: unknown; bufferedErasureDelete?: unknown;
+  coordinationReport?: unknown; coordinationReportRead?: unknown;
   schedule?: string; analysisCursor?: unknown; cursor?: string; since?: string; link?: number;
 }
 export interface LambdaRuntimeBinding {
   handler(event: unknown): Promise<BatchResponse | void>;
 }
-export type PipelineInvoker = (event: PipelineLambdaEvent) => Promise<BatchResponse | { ok: boolean }>;
+export type PipelineInvoker = (event: PipelineLambdaEvent) => Promise<BatchResponse | { ok: boolean; [key: string]: unknown }>;
 const SCHEDULES = { reconcile: "reconcile", brief: "brief", "session-analysis": "sessionAnalysis", "analysis-cache": "analysisCache", "analysis-cache-reconcile": "analysisCacheReconcile", "semantic-copy": "semanticCopy", "buffered-search-feed": "bufferedSearchFeed", "buffered-erasure-delete": "bufferedErasureDelete" } as const;
 type Schedule = keyof typeof SCHEDULES;
 
@@ -23,7 +24,7 @@ function queueBody(item: Extract<WorkItem, { type: "manifest-landed" }>): string
   } }] });
 }
 
-export async function dispatchRegisteredLambda(adapter: PipelineRuntimeAdapter, event: PipelineLambdaEvent, invoke: PipelineInvoker): Promise<BatchResponse | { ok: boolean }> {
+export async function dispatchRegisteredLambda(adapter: PipelineRuntimeAdapter, event: PipelineLambdaEvent, invoke: PipelineInvoker): Promise<BatchResponse | { ok: boolean; [key: string]: unknown }> {
   const caps = adapter.capabilities();
   if (adapter.kind !== "lambda" || caps.kind !== "lambda" || caps.trigger !== "push" || !caps.partialBatchFailure || caps.scopeSerialization !== "advisory-lock") throw new Error("Lambda runtime composition incompatible");
   if (event.schedule !== undefined && (typeof event.schedule !== "string" || !Object.hasOwn(SCHEDULES, event.schedule))) throw new Error("Lambda invocation schedule invalid");
