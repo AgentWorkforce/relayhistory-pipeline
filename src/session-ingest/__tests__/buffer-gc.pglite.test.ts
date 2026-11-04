@@ -148,3 +148,65 @@ test("publisher's shared exclusion lease blocks GC but cannot masquerade as a GC
  const t=(await f.rpc("claim",{limit:10})).tickets[0];
  expect(t.stageToken).toBe(s.token);expect(t.leaseToken).not.toBe(token);
 });
+
+test("ticket matches the shared consumer fields including original reset epoch and cleanup state",async()=>{
+ const f=await fixture(),s=await f.stage();await f.disable();
+ const t=(await f.rpc("claim",{limit:1})).tickets[0];
+ expect(t).toEqual({stageToken:s.token,claimToken:s.claim,leaseToken:expect.any(String),rowVersion:"2",
+  key:s.keyFor(s.sha),sha256:s.sha,bytes:10,groupOrdinals:[[0],[1],[2]],keepGroupIndexes:[1,2],
+  receiptState:"acknowledged",phase:"plan",resetEpoch:"0",cleanupState:"live"});
+});
+test("a legal mixed-source no-session group remains readable and reset removes every original ordinal",async()=>{
+ const {prepareDelivery,deliveryAccount}=await import("../vendor/delivery/prepare.ts");
+ const {groupRecords}=await import("../writer.ts");
+ const {batch,record}=await import("./support.ts");
+ const f=await fixture();
+ const input=await batch([record({record_id:"n0",origin_id:origin,source:"claude",session_id:null}),
+  record({record_id:"n1",origin_id:origin,source:"codex",session_id:null})],{origin_id:origin});
+ input.account_id=await deliveryAccount(tenant);
+ const p=await prepareDelivery(tenant,input),grouped=groupRecords(p.records,new Date("2026-11-04T00:00:00Z"));
+ expect(grouped.index).toEqual([[0,1]]);
+ const s=await f.stage({groups:grouped.index});
+ const records=p.records.map((r,ord)=>({ord,source:r.source,session_id:r.session_id,record_id:r.record_id,
+  revision_id:r.revision_id,revision:r.revision,digest:r.digest}));
+ await f.db.query("UPDATE sessions.ingest_claim_attempts SET records=$1,epochs='[]' WHERE claim_token=$2",[JSON.stringify(records),s.claim]);
+ expect((await f.rpc("claim",{limit:1})).tickets).toEqual([]);
+ await f.ledger.resetUploadedSessions(tenant,"mixed-no-session-reset");
+ const t=(await f.rpc("claim",{limit:1})).tickets[0];expect(t.keepGroupIndexes).toEqual([]);
+ expect(await f.rpc("swap",{...lease(t),replacementStageToken:null})).toEqual({swapped:true});
+ expect(await f.rpc("finish",{...lease(t),barrierVersionId:"barrier-mixed-no-session"})).toEqual({finished:true});
+});
+test("two expired parent copies retain the same deterministic prospective child until swap",async()=>{
+ const f=await fixture(),s=await f.stage();await f.disable();
+ const t0=(await f.rpc("claim",{limit:1})).tickets[0],sha=hash("same-kept-body");
+ const spec={key:s.keyFor(sha),sha256:sha,bytes:8,groupOrdinals:[[1],[2]]};
+ const child=await f.rpc("prepare",{...lease(t0),...spec});
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1 second' WHERE stage_token=$1",[s.token]);
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET expires_at=clock_timestamp()-interval '1 second' WHERE stage_token=$1",[child.replacementStageToken]);
+ const t1=(await f.rpc("claim",{limit:1})).tickets[0];expect(t1.stageToken).toBe(s.token);
+ expect((await f.rpc("prepare",{...lease(t1),...spec})).replacementStageToken).toBe(child.replacementStageToken);
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1 second' WHERE stage_token=$1",[s.token]);
+ const tickets=(await f.rpc("claim",{limit:1})).tickets;
+ expect(tickets.map((t:any)=>t.stageToken)).toEqual([s.token]);
+ const t2=tickets[0];
+ expect((await f.rpc("prepare",{...lease(t2),...spec})).replacementStageToken).toBe(child.replacementStageToken);
+ expect((await f.db.query("SELECT cleanup_state FROM sessions.ingest_stage_intents WHERE stage_token=$1",[child.replacementStageToken])).rows[0]).toEqual({cleanup_state:"live"});
+ expect(await f.rpc("swap",{...lease(t2),replacementStageToken:child.replacementStageToken})).toEqual({swapped:true});
+ expect(await f.rpc("finish",{...lease(t2),barrierVersionId:"barrier-parent-after-retry"})).toEqual({finished:true});
+});
+
+test("prospective ownership ends when original kept groups shrink and orphan cleanup remains resumable",async()=>{
+ const f=await fixture(),s=await f.stage();await f.disable();
+ const t0=(await f.rpc("claim",{limit:1})).tickets[0],sha=hash("future-invalid-child");
+ const child=await f.rpc("prepare",{...lease(t0),key:s.keyFor(sha),sha256:sha,bytes:8,groupOrdinals:[[1],[2]]});
+ await f.ledger.resetUploadedSessions(tenant,"shrink-after-copy");
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1 second' WHERE stage_token=$1",[s.token]);
+ const t=(await f.rpc("claim",{limit:1})).tickets[0];
+ expect(t.stageToken).toBe(s.token);expect(t.keepGroupIndexes).toEqual([]);
+ expect((await f.db.query("SELECT cleanup_state FROM sessions.ingest_stage_intents WHERE stage_token=$1",[child.replacementStageToken])).rows[0]).toEqual({cleanup_state:"retired"});
+ expect(await f.rpc("swap",{...lease(t),replacementStageToken:null})).toEqual({swapped:true});
+ const orphan=(await f.rpc("claim",{limit:10})).tickets.find((x:any)=>x.stageToken===child.replacementStageToken);
+ expect(orphan).toMatchObject({phase:"cleanup",cleanupState:"retired",receiptState:"preparing"});
+ expect(await f.rpc("finish",{...lease(orphan),barrierVersionId:"barrier-orphan"})).toEqual({finished:true});
+ expect(await f.rpc("finish",{...lease(t),barrierVersionId:"barrier-retired-parent"})).toEqual({finished:true});
+});
