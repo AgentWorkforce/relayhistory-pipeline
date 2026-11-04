@@ -67,5 +67,5 @@ export async function produceCanonicalReplay(scope: SessionScope, deps: ReplayPr
   const params = [identity.orgId,identity.workspaceId,identity.source,identity.sessionId,first.source.epoch,first.source.fingerprint,JSON.stringify(first.snapshot),generation,sourceGeneration,prefix,made.index.key,made.index.sha256,made.index.bytes];
   const published = deps.publish ? await deps.publish(params) : (await deps.db.query<{published:boolean}>("SELECT sessions.publish_session_replay_pages($1,$2,$3,$4,$5::bigint,$6,$7::jsonb,$8,$9,$10,$11,$12,$13::integer) AS published",params)).rows[0]?.published;
   if (published !== true) fail("artifact_publish_cas_failed");
-  return { published:true, publication:{version:1,identity,generation,source:first.source,prefix,index:made.index}, rows:snapshot.rows.length, objects:made.objects, bytes:made.bytes };
+  return { published:true, publication:{version:1,identity,generation,source:first.source,prefix,index:made.index}, rows:snapshot.rows.filter(row=>row.table!=="session_directory_event_values").length, objects:made.objects, bytes:made.bytes };
 }
