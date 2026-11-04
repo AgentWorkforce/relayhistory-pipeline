@@ -15,6 +15,45 @@ import { joinKey, objectKey, type ObjectKey } from "./key.js";
 export const LAYOUT_VERSION = "v1";
 export const MANIFEST_FILE = "manifest.json";
 
+/** Upload generations are independent of raw.epoch (which is the scrub epoch). */
+const PUBLICATION_UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+export function uploadGenerationPrefix(base: string, generation: string): string {
+  if (!PUBLICATION_UUID.test(generation) || !base || base.split("/").some(x => !x || x === "." || x === ".."))
+    throw new ObjectStoreError("invalid_argument", "layout", "invalid upload generation prefix");
+  return base + "/upload-generations/g=" + generation;
+}
+export function parseUploadGenerationPrefix(prefix: string | undefined): { base: string; generation: string } | undefined {
+  const marker = "/upload-generations/g=";
+  const index = prefix?.lastIndexOf(marker) ?? -1;
+  if (!prefix || index <= 0) return undefined;
+  const generation = prefix.slice(index + marker.length), base = prefix.slice(0,index);
+  if (!PUBLICATION_UUID.test(generation) || base.split("/").some(x => !x || x === "." || x === "..") || base.includes(marker)) return undefined;
+  return {base,generation};
+}
+export function isPublicationManifestRest(rest: string): boolean {
+  const match = /^publications\/([^/]+)\/manifest\.json$/.exec(rest);
+  return !!match && PUBLICATION_UUID.test(match[1]!);
+}
+export function isManifestRest(rest: string): boolean {
+  return rest === MANIFEST_FILE || isPublicationManifestRest(rest);
+}
+/** Immutable manifest; rawChunkKey remains beside the session root, shared in one generation. */
+export function publicationManifestKey(loc: SessionLocation, publication: string): ObjectKey {
+  if (!parseUploadGenerationPrefix(loc.prefix) || !PUBLICATION_UUID.test(publication))
+    throw new ObjectStoreError("invalid_argument", "layout", "invalid upload publication");
+  return joinKey(sessionPrefix(loc), "publications/" + publication + "/" + MANIFEST_FILE);
+}
+/** Managed derived outputs are immutable, registered by exact hash before PUT. */
+export function publicationDerivedKey(manifest: string, artifactId: string, family: string): ObjectKey {
+  const at = parseSessionKey(manifest);
+  if (!at || !parseUploadGenerationPrefix(at.prefix) || !isPublicationManifestRest(at.rest) ||
+      !PUBLICATION_UUID.test(artifactId) || !/^[a-z][a-z0-9-]{0,63}$/.test(family))
+    throw new ObjectStoreError("invalid_argument", "layout", "invalid publication derived key");
+  return objectKey(manifest.slice(0,-MANIFEST_FILE.length) + "derived/" + family + "/" + artifactId + ".bin");
+}
+
+
+
 export const RAW_FORMATS = ["jsonl", "ndjson", "sqlite-rows"] as const;
 export type RawFormat = (typeof RAW_FORMATS)[number];
 

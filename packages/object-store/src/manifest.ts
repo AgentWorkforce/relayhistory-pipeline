@@ -12,6 +12,9 @@ import {
   LAYOUT_VERSION,
   RAW_FORMATS,
   parseSessionKey,
+  isManifestRest,
+  isPublicationManifestRest,
+  parseUploadGenerationPrefix,
   rawChunkKey,
   type SessionLocation,
 } from "./layout.js";
@@ -522,7 +525,7 @@ export async function validateManifest(
 
   if (manifestKey !== undefined) {
     const loc = parseSessionKey(String(manifestKey));
-    if (!loc || loc.rest !== "manifest.json") {
+    if (!loc || !isManifestRest(loc.rest) || (isPublicationManifestRest(loc.rest) && !parseUploadGenerationPrefix(loc.prefix))) {
       issue("$key", `${manifestKey} is not a v1 manifest key`);
     } else {
       const pairs: [string, string, string][] = [
