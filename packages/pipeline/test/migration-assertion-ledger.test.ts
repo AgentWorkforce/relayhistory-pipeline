@@ -46,6 +46,12 @@ beforeAll(async () => {
       "utf8",
     ),
   );
+  await db.exec(
+    readFileSync(
+      supabaseFile("bootstrap/session_ingest_roles.sql"),
+      "utf8",
+    ),
+  );
   for (const file of readdirSync(supabaseFile("migrations/")).sort())
     await db.exec(readFileSync(supabaseFile(`migrations/${file}`), "utf8"));
   await db.exec("SET ROLE service_role");

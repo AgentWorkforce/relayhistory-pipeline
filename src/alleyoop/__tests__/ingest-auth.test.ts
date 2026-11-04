@@ -238,6 +238,12 @@ beforeAll(async () => {
       "utf8",
     ),
   );
+  await db.exec(
+    await readFile(
+      join(ROOT_DIR, "supabase/bootstrap/session_ingest_roles.sql"),
+      "utf8",
+    ),
+  );
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
     for (const file of (await readdir(join(ROOT_DIR, dir)))
       .filter((f) => f.endsWith(".sql"))

@@ -5,8 +5,9 @@
 -- creates a role. PostgreSQL documents that the creator cannot revoke that grant.
 -- https://www.postgresql.org/docs/17/role-attributes.html
 --
--- Use a disposable CREATEROLE trampoline instead: it creates the four fixed NOLOGIN
--- roles, then the migration owner drops the trampoline. DROP ROLE removes the
+-- Use a disposable CREATEROLE trampoline instead: it creates the six fixed NOLOGIN
+-- roles (the session ingest's two included: 20261102010000 verifies them and never
+-- creates a role), then the migration owner drops the trampoline. DROP ROLE removes the
 -- trampoline's automatic memberships, leaving every target membership-free. The
 -- trampoline and every target are created in this one transaction, so any refusal rolls
 -- the entire operation back.
@@ -47,7 +48,9 @@ BEGIN
     'authenticated'::name,
     'service_role'::name,
     'session_directory_search_worker'::name,
-    'session_token_verifier'::name
+    'session_token_verifier'::name,
+    'bulls96_session_ingest'::name,
+    'bulls96_session_ingest_seeder'::name
   ] LOOP
     SELECT * INTO v_row FROM pg_roles WHERE rolname = v_role;
     IF NOT FOUND THEN
@@ -116,6 +119,14 @@ BEGIN
       CREATE ROLE session_token_verifier
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_session_ingest') THEN
+      CREATE ROLE bulls96_session_ingest
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_session_ingest_seeder') THEN
+      CREATE ROLE bulls96_session_ingest_seeder
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
     RESET ROLE;
     DROP ROLE bulls96_cloudsql_role_seed;
   END IF;
@@ -127,7 +138,8 @@ BEGIN
       JOIN pg_roles target ON target.oid IN (membership.roleid, membership.member)
      WHERE target.rolname IN (
        'anon', 'authenticated', 'service_role', 'session_directory_search_worker',
-       'session_token_verifier'
+       'session_token_verifier',
+       'bulls96_session_ingest', 'bulls96_session_ingest_seeder'
      )
   ) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',

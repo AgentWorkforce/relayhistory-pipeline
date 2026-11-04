@@ -86,6 +86,12 @@ beforeAll(async () => {
       "utf8",
     ),
   );
+  await db.exec(
+    await readFile(
+      join(SUPABASE, "bootstrap/session_ingest_roles.sql"),
+      "utf8",
+    ),
+  );
   for (const file of (await readdir(join(SUPABASE, "migrations")))
     .filter((f) => f.endsWith(".sql"))
     .sort())

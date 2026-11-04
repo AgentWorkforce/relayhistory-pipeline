@@ -421,7 +421,7 @@ function normalizedUsage(source: string, blob: string | null): Usage | null {
 }
 
 /** The machine a delivery origin's events live on. */
-function deliveryMachine(workspaceId: string, originId: string): string {
+export function deliveryMachine(workspaceId: string, originId: string): string {
   const key = `[${JSON.stringify(workspaceId)}, ${JSON.stringify(originId)}]`;
   return `delivery:${createHash("md5").update(key).digest("hex")}`;
 }

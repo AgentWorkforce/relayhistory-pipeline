@@ -105,9 +105,17 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "ALTER-only: column sessions.session_index.canonical_session_id",
     sql: column("sessions.session_index", "canonical_session_id"),
   },
+  "upstream:20261102010000_session_ingest_ledger.sql": {
+    evidence: "table sessions.ingest_batches",
+    sql: relation("sessions.ingest_batches"),
+  },
   "upstream:20261102020000_session_brief_state.sql": {
     evidence: "ALTER-only: column sessions.session_briefs.state (session_brief replaced to return it)",
     sql: column("sessions.session_briefs", "state"),
+  },
+  "upstream:20261103010000_session_directory_event_metadata.sql": {
+    evidence: "table sessions.session_directory_event_times",
+    sql: relation("sessions.session_directory_event_times"),
   },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",

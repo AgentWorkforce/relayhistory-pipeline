@@ -62,6 +62,9 @@ const TOKEN_VERIFIER_VERIFY = join(
   ROOT,
   "supabase/bootstrap/session_token_verifier_verify.sql",
 );
+// The session ingest roles (bulls96_session_ingest, _seeder): the same contract, its own
+// file. 20261102010000 verifies them and fails closed if absent (42704); it never creates them.
+const INGEST_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
 // The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
@@ -253,6 +256,7 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
             name: "bootstrap:session_token_verifier",
             path: TOKEN_VERIFIER_BOOTSTRAP,
           },
+          { name: "bootstrap:session_ingest_roles", path: INGEST_BOOTSTRAP },
         ]
       : []),
     ...(await schemaSteps()),

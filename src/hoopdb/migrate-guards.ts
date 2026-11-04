@@ -107,6 +107,8 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_directory_resurrection_fences": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_directory_agents": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_directory_relationships": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_event_times": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_event_pending": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.manifest_readiness": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.export_deferred_sessions": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.claimless_uses": ["SELECT", "INSERT", "UPDATE"],
@@ -144,6 +146,8 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_directory_resurrection_fences",
   "sessions.session_directory_agents",
   "sessions.session_directory_relationships",
+  "sessions.session_directory_event_times",
+  "sessions.session_directory_event_pending",
   "sessions.manifest_readiness",
   "sessions.export_deferred_sessions",
   "sessions.claimless_uses",
@@ -1061,7 +1065,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "aa230971a9a55fa7dfb2d6e8e71717bb9f4b148428302894d15e2844af2ee03d";
+  "f5e94b7f0144c1a9cec3207f0a19c1ce057aafb1a3894e197ea439b5248796c2";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
