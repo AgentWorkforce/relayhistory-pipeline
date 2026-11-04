@@ -62,3 +62,13 @@ test('losing scope alias captures the original winner seat and never promotes af
  const invalid=value();invalid.records[0]!.firstDigest=OTHER;
  expect(()=>parseReceiptSeatSnapshot(invalid,[record],stage)).toThrow('publication_seats_decision');
 });
+
+
+test('lower losing revisions reference the current winner seat without inventing its revision',()=>{
+ const records=[{...record,revision:8},{...record,ord:1,revision:1,digest:OTHER},{...record,ord:2,revision:2,digest:"c".repeat(64)}];
+ const v=value();
+ v.records.push({...v.records[0]!,ord:1,candidateDigest:OTHER,bodyAccepted:false},{...v.records[0]!,ord:2,candidateDigest:"c".repeat(64),bodyAccepted:false});
+ const snap=parseReceiptSeatSnapshot(v,records,{...stage,groupOrdinals:[[0,1,2]]});
+ expect(acceptedReceiptSeat(snap,0).record.revision).toBe(8);
+ for(const ord of[1,2])expect(()=>acceptedReceiptSeat(snap,ord)).toThrow('publication_seats_losing_body');
+});

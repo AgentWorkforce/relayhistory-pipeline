@@ -44,9 +44,10 @@ export function parseReceiptSeatSnapshot(value:unknown,records:BufferedClaimReco
   if(v.bodyAccepted&&v.firstDigest!==v.candidateDigest)no('decision');
   const proof=JSON.stringify([seat,v.firstDigest,v.bodyAccepted]);
   if(byIdentity.has(key)&&byIdentity.get(key)!==proof)no('seat_alias');byIdentity.set(key,proof);
-  // One accepted winner may also be the immutable decision for a losing
-  // equal-revision scope alias. Its native record/revision/reset must agree.
-  const seatIdentity=JSON.stringify([record.record_id,record.revision,resetEpoch,v.firstDigest]);
+  // A losing lower revision may reference a higher CURRENT target seat.
+  // Candidate revision/reset cannot describe that winner. Bind its native
+  // identity/digest here; only accepted decisions bind their full scope below.
+  const seatIdentity=JSON.stringify([record.record_id,v.firstDigest]);
   if(bySeat.has(seat)&&bySeat.get(seat)!==seatIdentity)no('seat_alias');bySeat.set(seat,seatIdentity);
   if(v.bodyAccepted){if(byAcceptedSeat.has(seat)&&byAcceptedSeat.get(seat)!==key)no('seat_alias');byAcceptedSeat.set(seat,key);}
   slots.set(v.ord,Object.freeze({record:Object.freeze({...record}),seat:Object.freeze({ord:v.ord,seat,bodyAccepted:v.bodyAccepted,candidateDigest:v.candidateDigest,firstDigest:v.firstDigest,resetEpoch,fenceEpoch})}));
