@@ -121,7 +121,7 @@ test("current ledger/source/gen/plan/capture/wrapper/manual exception are exact 
       JSON.stringify(x.approval),
       pin,
       x.wrapper,
-      now + A.maxAgeMs,
+      now + 3600000,
     ),
   ).toThrow("owner_plan_stale");
   expect(() =>
@@ -171,7 +171,8 @@ test("canonical actual source role audit is read-only and passes unchanged", asy
 });
 function fake(failure = "", resetOwner = true) {
   const calls: string[] = [];
-  let role = "postgres";
+  let role = "postgres",
+    inTx = false;
   return {
     calls,
     client: {
@@ -183,6 +184,8 @@ function fake(failure = "", resetOwner = true) {
         calls.push(sql);
         if (sql.startsWith("BEGIN") && failure === "begin")
           throw Error(failure);
+        if (sql.startsWith("BEGIN")) inTx = true;
+        if (sql === "ROLLBACK") inTx = false;
         if (sql === "RESET ROLE")
           role = resetOwner ? "postgres" : "cli_login_postgres";
         if (sql.includes("current_user AS owner"))
@@ -195,11 +198,7 @@ function fake(failure = "", resetOwner = true) {
                 schemaOwner: A.owner,
                 role,
                 pid: 42,
-                ro:
-                  calls.at(-3) === "RESET ROLE" ||
-                  (calls.includes("RESET ROLE") && !calls.includes("ROLLBACK"))
-                    ? "on"
-                    : "off",
+                ro: inTx ? "on" : "off",
               },
             ],
           };
@@ -313,4 +312,10 @@ test("backend identity drift refuses the next canonical SQL before submission", 
     fenced.query("CREATE TABLE sessions.not_allowed(id int)"),
   ).rejects.toThrow("owner_session_identity");
   expect(x.calls.some((q) => q.includes("CREATE TABLE"))).toBe(false);
+});
+
+test("the first live apply ledger pin is the captured175 baseline", () => {
+  expect(A.ledger).toBe(
+    "175cd1eb198a8afc62576c7ebe5fd2bf06526b3222a94ee3c9b346e7b6a0d129",
+  );
 });
