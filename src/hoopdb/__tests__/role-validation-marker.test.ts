@@ -55,6 +55,9 @@ const TOKEN_VERIFY = readFileSync(
   "utf8",
 );
 
+const SEEDER_VERIFY = readFileSync(join(root,"supabase/bootstrap/session_ingest_seeder_verify.sql"),"utf8");
+const INGEST_VERIFY = readFileSync(join(root,"supabase/bootstrap/session_ingest_verify.sql"),"utf8");
+
 const open: PGlite[] = [];
 afterEach(async () => {
   await Promise.all(open.splice(0).map((db) => db.close()));
@@ -407,9 +410,11 @@ describe("the live gate: the marker is never the sole authority", () => {
     expect(seen[4]).toStartWith("SELECT generation, status FROM");
     expect(seen[5]).toBe(VERIFY);
     expect(seen[6]).toBe(TOKEN_VERIFY);
-    expect(seen[7]).toBe(SESSIONS_FUNCTION_GATE_SQL); // the live sessions-function boundary
-    expect(seen[8]).toStartWith("SELECT generation, status FROM"); // the final read
-    expect(seen).toHaveLength(9);
+    expect(seen[7]).toBe(SEEDER_VERIFY);
+    expect(seen[8]).toBe(INGEST_VERIFY);
+    expect(seen[9]).toBe(SESSIONS_FUNCTION_GATE_SQL); // the live sessions-function boundary
+    expect(seen[10]).toStartWith("SELECT generation, status FROM"); // the final read
+    expect(seen).toHaveLength(11);
     // No advisory lock anywhere on the probe path.
     expect(seen.some((q) => /advisory/i.test(q))).toBe(false);
     // One source: the migrator's verify step and mark_pass.sql use the same file.
@@ -534,7 +539,11 @@ describe("the live gate: the marker is never the sole authority", () => {
           ? VERIFY
           : l === "\\ir session_token_verifier_verify.sql"
             ? TOKEN_VERIFY
-            : l
+            : l === "\\ir session_ingest_seeder_verify.sql"
+              ? SEEDER_VERIFY
+              : l === "\\ir session_ingest_verify.sql"
+                ? INGEST_VERIFY
+                : l
                 .replace(":'generation'", `'${gen.replace(/'/g, "''")}'`)
                 .replace(":'db_mode'", "'local'"),
       )

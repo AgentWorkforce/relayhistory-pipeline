@@ -30,6 +30,16 @@ export interface Sentinel {
 }
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
+  "upstream:20261104055000_lazy_current_custody.sql": {evidence:"table sessions.ingest_lazy_policy",sql:relation("sessions.ingest_lazy_policy")},
+  "upstream:20261104054000_ingest_custody_baseline.sql": {evidence:"table sessions.ingest_custody_imports",sql:relation("sessions.ingest_custody_imports")},
+  "upstream:20261104053000_ingest_first_ack_seats.sql": {evidence:"table sessions.ingest_receipt_seat_clock",sql:relation("sessions.ingest_receipt_seat_clock")},
+  "upstream:20261104052000_ordered_ingest_controls.sql": {evidence:"column sessions.ingest_buffer_admission.control_epoch",sql:column("sessions.ingest_buffer_admission","control_epoch")},
+  "upstream:20261104060000_ingest_canonical_publication.sql": {evidence:"table sessions.ingest_publication_heads",sql:relation("sessions.ingest_publication_heads")},
+  "upstream:20261104051000_ingest_buffer_gc.sql": {evidence:"column sessions.ingest_stage_intents.gc_lease_token",sql:column("sessions.ingest_stage_intents","gc_lease_token")},
+  "upstream:20261104057000_session_large_read_jobs.sql": { evidence: "table sessions.session_large_read_jobs", sql: relation("sessions.session_large_read_jobs") },
+  "upstream:20261104059000_session_analysis_publications.sql": { evidence: "table sessions.session_analysis_publications", sql: relation("sessions.session_analysis_publications") },
+  "upstream:20261104058000_session_desktop_catalog.sql": { evidence: "column sessions.session_directory.catalog_read_version", sql: column("sessions.session_directory", "catalog_read_version") },
+  "upstream:20261104056000_session_replay_pages.sql": { evidence: "table sessions.session_replay_publications", sql: relation("sessions.session_replay_publications") },
   "upstream:20261025000000_sessions_index.sql": {
     evidence: "table sessions.session_index",
     sql: relation("sessions.session_index"),
@@ -120,6 +130,11 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261104030000_ingest_fence_ownership.sql": {
     evidence: "table sessions.ingest_session_ownership",
     sql: relation("sessions.ingest_session_ownership"),
+  },
+  "upstream:20261104040000_ingest_s3_proof_seed.sql": {evidence:"table sessions.ingest_seed_captures",sql:relation("sessions.ingest_seed_captures")},
+  "upstream:20261104050000_buffered_upload_receipts.sql": {
+    evidence: "table sessions.ingest_stage_intents",
+    sql: relation("sessions.ingest_stage_intents"),
   },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",

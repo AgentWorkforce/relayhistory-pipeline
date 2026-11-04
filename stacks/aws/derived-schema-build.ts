@@ -3,7 +3,7 @@
 import { fileURLToPath } from "node:url";
 import { resolve, join } from "node:path";
 import { derivedSchemaAssets } from "../../src/session-pipeline/derived-schema.ts";
-import { ROLE_VERIFY_SQL_PATH, TOKEN_VERIFIER_VERIFY_SQL_PATH } from "../../src/shared/db.ts";
+import { ROLE_VERIFY_SQL_PATH, TOKEN_VERIFIER_VERIFY_SQL_PATH,INGEST_SEED_VERIFY_SQL_PATH,INGEST_ROLE_VERIFY_SQL_PATH } from "../../src/shared/db.ts";
 
 const MODULE = fileURLToPath(new URL("../../src/session-pipeline/derived-schema.ts", import.meta.url));
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -18,10 +18,10 @@ export async function packagedDerivedSchemaSource(onInput?: (path: string) => vo
   if (JSON.stringify(first) !== JSON.stringify(final))
     throw new Error("derived schema sources changed during the build");
   if (!first.expected.names.length || !/^[0-9a-f]{64}$/.test(first.expected.generation) ||
-      !first.verifiers.searchWorker.trim() || !first.verifiers.tokenVerifier.trim())
+      !first.verifiers.searchWorker.trim() || !first.verifiers.tokenVerifier.trim()||!first.verifiers.ingestSeeder.trim()||!first.verifiers.ingest.trim())
     throw new Error("derived schema build assets are incomplete");
   // SQL is a build input even though it is absent from the runtime module graph.
-  for (const path of [ROLE_VERIFY_SQL_PATH, TOKEN_VERIFIER_VERIFY_SQL_PATH,
+  for (const path of [ROLE_VERIFY_SQL_PATH, TOKEN_VERIFIER_VERIFY_SQL_PATH,INGEST_SEED_VERIFY_SQL_PATH,INGEST_ROLE_VERIFY_SQL_PATH,
     ...first.expected.names.map(name => {
       const [kind, file] = name.split(":");
       if (!file || !["upstream", "96bulls"].includes(kind!)) throw new Error("unknown schema input");

@@ -2697,6 +2697,45 @@ describe("session token verifier phase 2", () => {
   });
 });
 
+describe("S3 proof seeder phase 2",()=>{
+ const verify="supabase/bootstrap/session_ingest_seeder_verify.sql";
+ test("OID comparison survives visible sessions schema and effective column drift closes live gate",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  await db.exec("SET search_path=sessions,public");
+  await db.exec(readFileSync(join(root,verify),"utf8"));
+  const expected=await expectedSchema();
+  expect(await schemaVerdict(expected,transact(db))).toEqual({ok:true});
+  await db.exec("GRANT SELECT(id) ON sessions.ingest_seed_captures TO PUBLIC");
+  expect((await schemaVerdict(expected,transact(db))).ok).toBe(false);
+ });
+ test("seeder failure cannot leave PASS after the other two verifiers succeeded",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  await db.exec("GRANT SELECT ON sessions.ingest_seed_captures TO bulls96_session_ingest_seeder");
+  const error=await failure(runMigrations(client(db),{profile:LOCAL}));
+  expect(error).not.toBeNull();
+  expect((await db.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0]).toEqual({status:"pending"});
+ });
+});
+
+describe("buffered ingest phase2",()=>{
+ test("direct ingest-only column drift closes live gate while unrelated role verifiers remain valid",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  const expected=await expectedSchema();
+  expect(await schemaVerdict(expected,transact(db))).toEqual({ok:true});
+  await db.exec("GRANT SELECT(stage_key) ON sessions.ingest_stage_intents TO bulls96_session_ingest");
+  for(const file of ["session_directory_search_worker_verify.sql","session_token_verifier_verify.sql","session_ingest_seeder_verify.sql"])
+   await db.exec(readFileSync(join(root,"supabase/bootstrap",file),"utf8"));
+  expect((await schemaVerdict(expected,transact(db))).ok).toBe(false);
+ });
+ test("ingest failure after all other verifiers leaves the generation marker pending",async()=>{
+  const db=await fresh();
+  const error=await failure(runMigrations(client(db),{profile:LOCAL,beforeVerify:async()=>{
+   await db.exec("GRANT SELECT ON sessions.ingest_stage_intents TO bulls96_session_ingest");
+  }}));
+  expect(error).not.toBeNull();
+  expect((await db.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0]).toEqual({status:"pending"});
+ });
+});
 
 describe("release pre-write fences", () => {
   test("a changed planned ledger refuses before the first persistent write", async () => {

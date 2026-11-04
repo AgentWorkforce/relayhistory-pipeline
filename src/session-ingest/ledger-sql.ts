@@ -1,3 +1,7 @@
+import {validatedCustodyAck} from "./custody-ack.ts";
+import {DeliveryError} from "./vendor/delivery/delivery-contracts.ts";
+import {orderedControl,orderedControlResult} from "./control-protocol.ts";
+import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 /**
  * The ledger over SQL: one call per claim and per commit, each to its
  * SECURITY DEFINER function (supabase/migrations/20261104022000_session_ingest_ledger.sql),
@@ -47,6 +51,9 @@ export function ledgerErrorCode(error: unknown): string {
 }
 
 type LedgerFunction =
+  | "ingest_claim_buffered_batch"
+  | "ingest_prepare_buffer_stage"
+  | "ingest_commit_buffered_batch"
   | "ingest_claim_batch"
   | "ingest_commit_batch"
   | "ingest_acquire_slot"
@@ -61,6 +68,7 @@ async function call(run: SqlRun, fn: LedgerFunction, input: unknown): Promise<un
   try {
     ({ rows } = await run(`SELECT sessions.${fn}($1::jsonb) AS result`, [JSON.stringify(input)]));
   } catch (error) {
+    if((error as {code?:unknown})?.code==="P0W01")throw new DeliveryError("forbidden",403,"Delivery record belongs to another user");
     throw new LedgerUnavailableError(ledgerErrorCode(error));
   }
   if (rows.length !== 1) throw new LedgerUnavailableError("ledger_bad_result");
@@ -129,6 +137,7 @@ function conflict(v: unknown): RevisionConflict {
 
 export function parseClaimResult(r: Record<string, unknown>): ClaimResult {
   switch (r.kind) {
+    case "baseline_pending": throw new LedgerUnavailableError("ledger_baseline_pending");
     case "claimed":
     case "resume":
     case "replay_fast":
@@ -157,10 +166,37 @@ export function parseClaimResult(r: Record<string, unknown>): ClaimResult {
   }
 }
 
-export function sqlLedger(run: SqlRun): Ledger {
+export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAcceptanceMode;expectedGeneration?:string } = {}): Ledger {
+  if(options.acceptanceMode==="buffered"&&(typeof options.expectedGeneration!=="string"||!/^[a-f0-9]{64}$/.test(options.expectedGeneration)))throw new LedgerUnavailableError("ledger_generation_required");
+  const buffered=(input:unknown)=>({...input as Record<string,unknown>,generation:options.expectedGeneration});
   return {
+    async applyOrderedControl(input) {
+      if(options.acceptanceMode!=="buffered")throw new LedgerUnavailableError("ledger_mode_refused");
+      const control=orderedControl(input.control);
+      const fn=control.kind==="selection"?"ingest_set_session_uploads":"ingest_reset_uploaded_sessions";
+      const r=await call(run,fn,buffered(input));
+      try{return orderedControlResult(r,control)}catch{throw new LedgerUnavailableError("ledger_control_ack_refused")}
+    },
     async claim(input: ClaimInput): Promise<ClaimResult> {
-      return parseClaimResult((await call(run, "ingest_claim_batch", input)) as Record<string, unknown>);
+      const raw=(await call(run,options.acceptanceMode==="buffered"?"ingest_claim_buffered_batch":"ingest_claim_batch",options.acceptanceMode==="buffered"?buffered(input):input)) as Record<string,unknown>;
+      const result=parseClaimResult(raw);
+      if(raw.custodyAck!==undefined){try{result.custodyAck=validatedCustodyAck(raw.custodyAck,input.custody)}catch{throw new LedgerUnavailableError("ledger_custody_ack_refused")}}
+      if(input.custody&&!result.custodyAck)throw new LedgerUnavailableError("ledger_custody_ack_missing");
+      return result;
+    },
+    async prepareBufferStage(input) {
+      if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
+      const r = await call(run, "ingest_prepare_buffer_stage", buffered(input)) as Record<string,unknown>;
+      if (typeof r.stageToken !== "string" || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(r.stageToken) ||
+          typeof r.expiresAt !== "string" || !Number.isFinite(Date.parse(r.expiresAt))) throw new LedgerUnavailableError("ledger_bad_result");
+      return {stageToken:r.stageToken,expiresAt:r.expiresAt};
+    },
+    async commitBuffered(input) {
+      if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
+      const r = await call(run,"ingest_commit_buffered_batch",buffered(input)) as Record<string,unknown>;
+      if (r.kind === "intent_invalid") throw new LedgerUnavailableError("ledger_stage_invalidated");
+      if (r.kind !== "committed") throw new LedgerUnavailableError("ledger_bad_result");
+      if(r.custodyAck!==undefined){try{return validatedCustodyAck(r.custodyAck)}catch{throw new LedgerUnavailableError("ledger_custody_ack_refused")}}
     },
     async commit(input: CommitInput): Promise<CommitResult> {
       const r = (await call(run, "ingest_commit_batch", input)) as Record<string, unknown>;
@@ -190,7 +226,7 @@ export function sqlLedger(run: SqlRun): Ledger {
       if (typeof r.released !== "boolean") throw new LedgerUnavailableError("ledger_bad_result");
     },
     async setSessionUploads(input: SelectionInput): Promise<void> {
-      const r = (await call(run, "ingest_set_session_uploads", input)) as Record<string, unknown>;
+      const r = (await call(run, "ingest_set_session_uploads", options.acceptanceMode==="buffered"?buffered(input):input)) as Record<string, unknown>;
       if (typeof r.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
     },
     async fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][], attempt: StagedAttempt): Promise<[string, string][]> {
@@ -206,7 +242,7 @@ export function sqlLedger(run: SqlRun): Ledger {
       return { committed: r.committed, rearmed: r.rearmed };
     },
     async resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number> {
-      const r = (await call(run, "ingest_reset_uploaded_sessions", { tenant, requestId })) as Record<string, unknown>;
+      const r = (await call(run, "ingest_reset_uploaded_sessions", options.acceptanceMode==="buffered"?buffered({tenant,requestId}):{tenant,requestId})) as Record<string, unknown>;
       if (typeof r.deleted !== "number" || !Number.isSafeInteger(r.deleted) || r.deleted < 0) throw new LedgerUnavailableError("ledger_bad_result");
       return r.deleted;
     },

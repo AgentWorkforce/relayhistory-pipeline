@@ -908,7 +908,7 @@ describe.skipIf(!url)("released main ledger upgrade", () => {
       const oldNames = new Map([
         [
           "upstream:20261104021000_session_directory_event_metadata.sql",
-          "upstream:20261103010000_session_directory_event_metadata.sql",
+          "upstream:20261104021000_session_directory_event_metadata.sql",
         ],
         [
           "upstream:20261104022000_session_ingest_ledger.sql",

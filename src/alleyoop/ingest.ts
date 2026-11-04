@@ -64,9 +64,14 @@ export interface IngestOverrides {
 
 /**
  * The production composition of the AlleyOop ingest. Auth (no bypass):
+ *  - With `RELAYHISTORY_ORIGIN` set (hosted and customer installs), RelayAuth's
+ *    origin-bound History assertion is verified (RS256 against
+ *    `RELAYAUTH_JWKS_URL`, exact issuer, sole audience = this origin, the
+ *    dedicated token class) and nothing else; no flag is needed.
  *  - `ALLOW_INTERIM_RELAYAUTH_BEARER` is OFF unless the environment sets it to
  *    exactly "true" (an explicit dev/test opt-in; the local Docker stack sets
- *    it). Off, a generic RelayAuth bearer is refused (401).
+ *    it). Off, a generic RelayAuth bearer is refused (401), and with no origin
+ *    every bearer is refused (401 auth_not_configured).
  *  - Migration assertions go through the dedicated verifier
  *    (`RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS=true`, default off), which
  *    admits only the migration class, under its full contract (signed pair,

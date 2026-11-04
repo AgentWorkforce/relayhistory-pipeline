@@ -35,7 +35,7 @@ import {
   type StageMessage,
 } from "../shared/vendor.ts";
 import type { ObjectLanded } from "@rhc/lib/pipeline/adapter.ts";
-import type { HoopDb } from "../shared/db.ts";
+import type { HoopDb,Transact } from "../shared/db.ts";
 import { enrichMessage } from "../shared/enrich.ts";
 import { hoopDbSessionIndex } from "../hoopdb/index.ts";
 
@@ -73,6 +73,7 @@ export interface PointerDeps {
   allowPrefix(prefix: string | undefined, orgId: string): boolean;
   /** Where the index's fan-out (summary-short, summary-long, status-classify) goes. */
   fanout: PipelineQueue;
+  publication?:{schemaGeneration:string;transact:Transact};
   now?: () => Date;
 }
 
@@ -86,6 +87,7 @@ export const droppedFanout: PipelineQueue = {
 export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Promise<PointerOutcome> {
   const location = parseSessionKey(landed.key);
   if (!location) return { status: "ignored", reason: "not_a_session_key" };
+  if(location.prefix?.includes('/upload-generations/'))return{status:"ignored",reason:"managed_publication_hint"};
   if (location.rest !== "manifest.json") return { status: "ignored", reason: "not_a_manifest" };
   if (landed.bucket && deps.reader.bucket && landed.bucket !== deps.reader.bucket)
     return { status: "ignored", reason: "other_bucket" };
@@ -94,6 +96,12 @@ export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Pro
   // this deployment does not own.
   if (!orgId) return { status: "ignored", reason: "org_unresolved" };
   if (!deps.allowPrefix(location.prefix, orgId)) return { status: "ignored", reason: "outside_prefix" };
+  // A legacy key of an adopted managed carrier must not update ext/fanout either.
+  if(location.machineId.startsWith('srv_')){
+    const managed=await deps.db.query<{managed:boolean}>("SELECT sessions.session_publication_is_managed($1,$2,$3,$4,$5) AS managed",
+      [orgId,location.workspaceId,location.harness,location.sessionId,location.machineId]);
+    if(managed.rows[0]?.managed===true)return{status:"ignored",reason:"managed_publication_hint"};
+  }
   const scope: SessionScope = {
     orgId,
     workspaceId: location.workspaceId,
@@ -171,9 +179,10 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
   if (!indexed) return { status: "ignored", reason: "no_pointer" };
   const message = await enrichMessage(indexed, deps.reader);
 
-  const index = hoopDbSessionIndex({ db: deps.db, reader: deps.reader, queue: deps.fanout, current: () => message });
+  const index = hoopDbSessionIndex({ db: deps.db, reader: deps.reader, queue: deps.fanout, current: () => message,publication:deps.publication });
   const upsert = () => index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx);
   const result = await upsert();
+  if(result?.status==="skipped"&&result.reason==="publication_retired")return{status:"ignored",reason:"managed_publication_hint"};
   const revision = message.revision;
   if (!read) return { status: "deleted", scope, manifestKey: landed.key };
 

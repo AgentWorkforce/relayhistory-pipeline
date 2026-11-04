@@ -109,21 +109,25 @@ export const ROLE_VERIFY_SQL_PATH = fileURLToPath(
 // The auth token verifier's phase 2 (supabase/bootstrap/session_token_verifier_verify.sql):
 // the same contract for session_token_verifier — run by the migrator's verify step, the
 // external mark_pass wrapper, and this live gate. Read-only.
-export const TOKEN_VERIFIER_VERIFY_SQL_PATH = fileURLToPath(
-  new URL("../../supabase/bootstrap/session_token_verifier_verify.sql", import.meta.url),
-);
+export const INGEST_SEED_VERIFY_SQL_PATH = fileURLToPath(new URL("../../supabase/bootstrap/session_ingest_seeder_verify.sql", import.meta.url));
+export const TOKEN_VERIFIER_VERIFY_SQL_PATH = fileURLToPath(new URL("../../supabase/bootstrap/session_token_verifier_verify.sql", import.meta.url));
+export const INGEST_ROLE_VERIFY_SQL_PATH = fileURLToPath(new URL("../../supabase/bootstrap/session_ingest_verify.sql", import.meta.url));
 
 /** Trusted build input only: Lambda embeds these same authoritative SQL files.
  * Never populated from a request, environment variable or database row. */
 export interface SchemaVerifierSql {
   readonly searchWorker: string;
   readonly tokenVerifier: string;
+  readonly ingestSeeder: string;
+  readonly ingest: string;
 }
 let localVerifierSql: SchemaVerifierSql | undefined;
 function filesystemVerifierSql(): SchemaVerifierSql {
   return localVerifierSql ??= {
     searchWorker: readFileSync(ROLE_VERIFY_SQL_PATH, "utf8"),
     tokenVerifier: readFileSync(TOKEN_VERIFIER_VERIFY_SQL_PATH, "utf8"),
+    ingestSeeder: readFileSync(INGEST_SEED_VERIFY_SQL_PATH, "utf8"),
+    ingest: readFileSync(INGEST_ROLE_VERIFY_SQL_PATH, "utf8"),
   };
 }
 
@@ -227,10 +231,12 @@ export async function schemaVerdict(
       stage = "verify";
       const verifierSql = opts.verifierSql ?? filesystemVerifierSql();
       // An incomplete packaged contract must close the gate, never skip a verifier.
-      if (!verifierSql.searchWorker.trim() || !verifierSql.tokenVerifier.trim())
+      if (!verifierSql.searchWorker?.trim() || !verifierSql.tokenVerifier?.trim() || !verifierSql.ingestSeeder?.trim() || !verifierSql.ingest?.trim())
         throw Object.assign(new Error("schema verifier assets are missing"), { code: "gate_assets_missing" });
       await tx.query(verifierSql.searchWorker);
       await tx.query(verifierSql.tokenVerifier);
+      await tx.query(verifierSql.ingestSeeder);
+      await tx.query(verifierSql.ingest);
       await tx.query(SESSIONS_FUNCTION_GATE_SQL);
       if (opts.afterVerify) await opts.afterVerify(); // test seam: a concurrent flip lands here
       stage = "final";

@@ -33,6 +33,8 @@ SELECT set_config('hoopdb.role_validation_generation', :'generation', true);
 SELECT set_config('hoopdb.db_mode', :'db_mode', true);
 \ir session_directory_search_worker_verify.sql
 \ir session_token_verifier_verify.sql
+\ir session_ingest_seeder_verify.sql
+\ir session_ingest_verify.sql
 DO $mark$
 DECLARE
   v_gen text := current_setting('hoopdb.role_validation_generation');
