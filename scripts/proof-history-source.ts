@@ -72,6 +72,8 @@ await check("logical source locks bind summary intent/final CAS and native chang
  await expect(publishHistorySummary(service,captured,pointer)).rejects.toThrow("transaction permit required");
  expect(await withHistorySourceAuthority(transact,captured,async tx=>publishHistorySummary(tx,captured,pointer))).toEqual({current:true,value:true});
  expect((await readHistorySummary(service,captured,"short"))?.objectKey).toBe(objectKey);
+ await owner.query("UPDATE sessions.session_directory SET event_projection_ready=true,event_projection_version=1,event_projected_at=clock_timestamp(),event_projection_sources=jsonb_build_object('fixture','{}'::jsonb),work_status='active',work_status_at=clock_timestamp() WHERE org_id=$1",[identity.orgId]);
+ assert.deepEqual((await owner.query("SELECT event_projection_ready,work_status,work_status_at FROM sessions.session_directory WHERE org_id=$1",[identity.orgId])).rows[0],{event_projection_ready:false,work_status:null,work_status_at:null});
  const sliceKey=historyDerivedKey(captured,"bob-slice","32345678-1234-1234-1234-123456789abc");
  await registerHistoryDerivedObject(service,captured,{key:sliceKey,sha256:"b".repeat(64),bytes:100});
  await expect(withHistorySourceAuthority(transact,captured,async tx=>publishHistorySummary(tx,captured,{...pointer,objectKey:sliceKey}))).rejects.toThrow("registered encrypted summary required");

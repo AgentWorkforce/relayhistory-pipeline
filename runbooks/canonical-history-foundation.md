@@ -52,7 +52,10 @@ including small managed sessions, because every complete graph needs eventual
 population. A claim examines at most100 due attempts and may return no claim after\nretiring a stale page; that is not a global completion/readiness proof. The final creator still must enqueue before its metadata commit.
 
 Managed directory state is written only from a matching current logical state;
-late physical classifiers cannot replace it. Legacy plaintext short summaries
+late physical classifiers cannot replace it. Existing171-only callers are
+held unready for managed scopes and stale work_status fields are cleared, even
+if an old repair attempts to advertise readiness. This is deliberately failclosed
+until610's exact source-bound feature receipt is integrated. Legacy plaintext short summaries
 are cleared for managed scopes. A new native destination invalidates immediately,
 even before that native key has any registered scope dependency. Empty
 workspaces retain their existing supported identity.

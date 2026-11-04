@@ -992,7 +992,7 @@ BEGIN
  INSERT INTO sessions.ingest_history_required_scopes AS r(org_id,workspace_id,harness,session_id)VALUES(p_org,p_ws,p_harness,p_session)
   ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET request_version=r.request_version+1,requested_at=clock_timestamp();
  UPDATE sessions.ingest_history_scope_current SET ready=false WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_harness AND session_id=p_session;
- UPDATE sessions.session_directory SET state='unknown',short_summary=NULL WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_harness AND session_id=p_session AND(state<>'unknown'OR short_summary IS NOT NULL);
+ UPDATE sessions.session_directory SET state='unknown',short_summary=NULL,event_projection_ready=false,work_status=NULL,work_status_at=NULL WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_harness AND session_id=p_session AND(state<>'unknown'OR short_summary IS NOT NULL OR event_projection_ready OR work_status IS NOT NULL);
  INSERT INTO sessions.session_replay_publications AS a(org_id,workspace_id,harness,session_id)VALUES(p_org,p_ws,p_harness,p_session)
   ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET epoch=nextval('sessions.session_replay_epoch_seq');
  UPDATE sessions.ingest_history_derived_objects o SET cleanup_state='retired',row_version=row_version+1 FROM sessions.ingest_history_scope_versions v
@@ -1049,6 +1049,9 @@ BEGIN
  END IF;
  -- Managed summaries are encrypted registered objects; legacy unqualified
  -- plaintext writes must not become an apparent current short summary.
+ --171 callers cannot attest a logical mask. Until610 publishes an exact
+ -- source-bound feature receipt, even a late physical repair stays unready.
+ NEW.event_projection_ready:=false;NEW.work_status:=NULL;NEW.work_status_at:=NULL;
  NEW.short_summary:=NULL;NEW.state:=coalesce(assigned,'unknown');RETURN NEW;
 END $directory_state$;
 CREATE TRIGGER ingest_history_directory_state BEFORE INSERT OR UPDATE ON sessions.session_directory
