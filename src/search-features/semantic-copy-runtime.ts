@@ -40,18 +40,20 @@ export async function runSemanticCopyPage(deps: SemanticCopyPageDeps, kind: Feat
     let c = await deps.store.claim(kind);
     if (c === null)
         return { status: "idle", complete: false, published: 0 };
+    const heartbeatAbort=new AbortController();
     let deadline = c.leaseExpiresAt, lost = false, beating: Promise<void> | undefined;
     const active = () => { deps.signal?.throwIfAborted(); if (lost || Date.parse(deadline) <= now())
         throw new SemanticCopyError("checkpoint_lease_lost"); };
     const beat = async () => { try {
-        const n = await deps.store.heartbeat(c!);
+        const n = await deps.store.heartbeat(c!,heartbeatAbort.signal);
         deadline = n.leaseExpiresAt;
     }
     catch {
-        lost = true;
+        if(!heartbeatAbort.signal.aborted)lost = true;
     } };
     const timer = setInterval(() => { if (!beating)
         beating = beat().finally(() => { beating = undefined; }); }, interval);
+    const stopHeartbeat=async()=>{clearInterval(timer);heartbeatAbort.abort();await beating};
     try {
         active();
         await publishSemanticCopyProfile(deps.ch, c, deps.featureTables);
@@ -71,6 +73,7 @@ export async function runSemanticCopyPage(deps: SemanticCopyPageDeps, kind: Feat
         if (BigInt(proof.observedRevision) < BigInt(next.observedRevision))
             throw new SemanticCopyError("source_revision_reset");
         const actualNext = next.phase === "journal" && next.polled ? { ...next, observedRevision: proof.observedRevision } : next;
+        await stopHeartbeat();
         active();
         c = await deps.store.commit(c, actualNext, new Date(now()).toISOString());
         active();
@@ -81,11 +84,11 @@ export async function runSemanticCopyPage(deps: SemanticCopyPageDeps, kind: Feat
         return { status: "published", complete: c.complete, published: result.published };
     }
     catch (error) {
+        await stopHeartbeat();
         await deps.store.finish(c, "copy_page_failed").catch(() => false);
         throw new SemanticCopyError(error instanceof SemanticCopyError ? error.reason : "copy_page_failed");
     }
     finally {
-        clearInterval(timer);
-        await beating;
+        await stopHeartbeat();
     }
 }

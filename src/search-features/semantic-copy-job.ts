@@ -1,7 +1,9 @@
+import {scopeSemanticSql,type SemanticBoundedSql} from "./semantic-copy-postgres.ts";
+import {createSemanticClickHouseClient,type SemanticClickHouseClient} from "./semantic-copy-ch.ts";
 /** Actual bounded Node job: generated source verification, both real stages,
  * persistent RPC checkpoints, CH dirty/final ACKs. No runtime DDL or model calls. */
 import type { SqlExecutor } from "../../packages/pipeline/src/lib/pipeline/queue.ts";
-import { createClickHouseClient, type ClickHouseConfig, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
+import { type ClickHouseConfig } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { FEATURE_SOURCE_AUTHORITY } from "./source-authority.ts";
 import { verifyFeatureSourceAuthority, FeatureJournalError, type FeatureReader } from "./source.ts";
 import { readLegacyCasefoldProfile } from "./casefold-source.ts";
@@ -14,9 +16,9 @@ import { SemanticCopyStore, SemanticCopyError } from "./semantic-copy-store.ts";
 import { runSemanticCopyPage } from "./semantic-copy-runtime.ts";
 import { semanticSha256, semanticTargetHashInput, parseSemanticProfile, type SemanticFeatureKind } from "./semantic-copy-protocol.ts";
 export async function runSemanticCopyTick(deps: {
-    db: SqlExecutor;
-    source: FeatureReader;
-    ch: ClickHouseClient;
+    db: SemanticBoundedSql;
+    source: SemanticBoundedSql;
+    ch: SemanticClickHouseClient;
     sourceId: string;
     endpoint: string;
     signal?: AbortSignal;
@@ -31,6 +33,7 @@ export async function runSemanticCopyTick(deps: {
         throw new SemanticCopyError("job_bound");
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(deps.sourceId))
         throw new SemanticCopyError("source_id_invalid");
+    if(typeof deps.db.queryBounded!=="function"||typeof deps.source.queryBounded!=="function"||typeof deps.ch.scoped!=="function")throw new SemanticCopyError("bounded_transport_required");
     const stop = now() + maxMs, controller = new AbortController(), abort = () => controller.abort();
     deps.signal?.addEventListener("abort", abort, { once: true });
     if (deps.signal?.aborted)
@@ -38,7 +41,8 @@ export async function runSemanticCopyTick(deps: {
     const timer = setTimeout(abort, maxMs);
     const active = () => { controller.signal.throwIfAborted(); if (now() >= stop)
         throw new SemanticCopyError("job_deadline"); };
-    const source: FeatureReader = { async query<T>(sql: string, params?: unknown[]) { active(); const r = await deps.source.query<T>(sql, params); active(); return r; } };
+    const context={signal:controller.signal,deadline:stop,now},metadata=scopeSemanticSql(deps.db,context),reader=scopeSemanticSql(deps.source,context),ch=deps.ch.scoped(context);
+    const source: FeatureReader = { async query<T>(sql: string, params?: unknown[]) { active(); const r = await reader.query<T>(sql, params); active(); return r; } };
     try {
         await verifySemanticReadonlyRole(source, FEATURE_SOURCE_AUTHORITY.catalog.relations.map(r => r.identity), FEATURE_SOURCE_AUTHORITY.catalog.functions.filter(f => f.securityDefiner).map(f => f.identity));
         const proof = await verifyFeatureSourceAuthority(source, FEATURE_SOURCE_AUTHORITY);
@@ -50,7 +54,7 @@ export async function runSemanticCopyTick(deps: {
             throw new SemanticCopyError("profile_hash_invalid");
         const eventSchema = await semanticSha256(JSON.stringify(["event-feature-projection-v1", ...eventFeatureSchemaStatements()])), briefSchema = await semanticSha256(JSON.stringify(["brief-feature-projection-v1", ...briefFeatureSchemaStatements()]));
         const targetHash = await semanticSha256(semanticTargetHashInput(deps.endpoint, deps.ch.database, eventSchema, briefSchema));
-        const store = new SemanticCopyStore(deps.db, deps.sourceId, FEATURE_SOURCE_AUTHORITY.identitySha256);
+        const store = new SemanticCopyStore(metadata, deps.sourceId, FEATURE_SOURCE_AUTHORITY.identitySha256);
         await store.register(targetHash, profile.sourceHash, profileJson);
         const batches = { event: batch, brief: batch };
         const stats = { pages: 0, published: 0, eventComplete: false, briefComplete: false, failed: 0 }, idle = new Set<SemanticFeatureKind>();
@@ -61,11 +65,11 @@ export async function runSemanticCopyTick(deps: {
                 continue;
             let result;
             try {
-                result = await runSemanticCopyPage({ store, source, ch: deps.ch, featureTables: {event:EVENT_FEATURES_TABLE,brief:BRIEF_FEATURES_TABLE}, signal: controller.signal, now,
+                result = await runSemanticCopyPage({ store, source, ch, featureTables: {event:EVENT_FEATURES_TABLE,brief:BRIEF_FEATURES_TABLE}, signal: controller.signal, now,
                     verifySource: () => verifyFeatureSourceAuthority(source, FEATURE_SOURCE_AUTHORITY),
                     copyPage: async (k, previous) => { let n = batches[k]; for (;;) {
                         try {
-                            const result = k === "event" ? await copyEventFeaturePage({ db: source, ch: deps.ch, signal: controller.signal }, previous, n) : await copyBriefFeaturePage({ db: source, ch: deps.ch, signal: controller.signal }, previous, n);
+                            const result = k === "event" ? await copyEventFeaturePage({ db: source, ch, signal: controller.signal }, previous, n) : await copyBriefFeaturePage({ db: source, ch, signal: controller.signal }, previous, n);
                             batches[k] = n;
                             return result;
                         }
@@ -97,8 +101,9 @@ export async function runSemanticCopyTick(deps: {
         return stats;
     }
     finally {
+        controller.abort();
         clearTimeout(timer);
         deps.signal?.removeEventListener("abort", abort);
     }
 }
-export { createClickHouseClient, type ClickHouseConfig };
+export { createSemanticClickHouseClient as createClickHouseClient, type ClickHouseConfig };

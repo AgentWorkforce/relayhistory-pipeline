@@ -1,3 +1,5 @@
+import {createSemanticClickHouseClient} from "../search-features/semantic-copy-ch.ts";
+import {SemanticPostgresExecutor} from "../search-features/semantic-copy-postgres.ts";
 import { routeLargeRead } from "./large-read-worker.ts";
 /**
  * AWS Lambda entry for the sessions-prod session pipeline
@@ -49,7 +51,7 @@ import { briefConfig, modelKey } from "../session-brief/config.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
 import { briefTick } from "../session-brief/worker.ts";
 import {runSemanticCopyTick} from "../search-features/semantic-copy-job.ts";
-import {semanticReadonlyPool,semanticFeatureReader} from "../search-features/semantic-copy-source-pool.ts";
+import {semanticReadonlyPool,semanticFeatureReader,semanticMetadataPool} from "../search-features/semantic-copy-source-pool.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
@@ -250,8 +252,8 @@ async function init(): Promise<Runtime> {
   let semanticCopy:Runtime["semanticCopy"];
   if(env.semanticCopyEnabled){
     if(!secret.clickhouse||!secret.analysis_source_readonly_url||!env.semanticSourceId)throw new Error("semantic copier configuration incomplete");
-    const source=semanticFeatureReader(semanticReadonlyPool(secret.analysis_source_readonly_url)),ch=createClickHouseClient(secret.clickhouse),sourceId=env.semanticSourceId,endpoint=secret.clickhouse.url;
-    semanticCopy=async()=>{const result=await runSemanticCopyTick({db,source,ch,sourceId,endpoint});if(result.failed)throw new Error("semantic copier kind failed");return result};
+    const semanticDb=new SemanticPostgresExecutor(semanticMetadataPool(secret.hoopdb_url)),source=semanticFeatureReader(semanticReadonlyPool(secret.analysis_source_readonly_url)),ch=createSemanticClickHouseClient(secret.clickhouse),sourceId=env.semanticSourceId,endpoint=secret.clickhouse.url;
+    semanticCopy=async()=>{const result=await runSemanticCopyTick({db:semanticDb,source,ch,sourceId,endpoint});if(result.failed)throw new Error("semantic copier kind failed");return result};
   }
   return { env, deps, brief,semanticCopy };
 }

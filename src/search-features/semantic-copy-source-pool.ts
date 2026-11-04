@@ -1,5 +1,7 @@
 /** A separate readonly public-CA source connection; never reuse Supabase/owner. */
 import pg, { type Pool } from "pg";
+import {SemanticPostgresExecutor} from "./semantic-copy-postgres.ts";
+import {SUPABASE_PROD_CA_2021} from "../session-pipeline/supabase-ca.ts";
 import type { FeatureReader } from "./source.ts";
 export function semanticReadonlyPool(url: string): Pool {
     const u = new URL(url);
@@ -7,11 +9,18 @@ export function semanticReadonlyPool(url: string): Pool {
         throw new Error("feature source URL invalid");
     for (const key of ["sslmode", "sslrootcert", "sslcert", "sslkey", "ssl", "options"])
         u.searchParams.delete(key);
-    const pool = new pg.Pool({ connectionString: u.toString(), max: 1, ssl: { rejectUnauthorized: true }, application_name: "96bulls-feature-copy-readonly", options: "-c default_transaction_read_only=on -c statement_timeout=15000", idleTimeoutMillis: 60000 });
+    const pool = new pg.Pool({ connectionString: u.toString(), max: 1, connectionTimeoutMillis:1000, ssl: { rejectUnauthorized: true }, application_name: "96bulls-feature-copy-readonly", options: "-c default_transaction_read_only=on -c statement_timeout=15000", idleTimeoutMillis: 60000 });
     pool.on("error", () => { });
     return pool;
 }
-export function semanticFeatureReader(pool: Pool): FeatureReader { return { async query<T>(sql: string, params?: unknown[]) { const r = await pool.query(sql, params); return { rows: r.rows as T[] }; } }; }
+export function semanticFeatureReader(pool:Pool){return new SemanticPostgresExecutor(pool,true)}
+/** Dedicated copier metadata connections; unrelated Lambda work keeps its pool. */
+export function semanticMetadataPool(url:string):Pool {
+ const u=new URL(url);if(!/^postgres(?:ql)?:$/u.test(u.protocol))throw new Error("feature metadata URL invalid");
+ for(const key of ["sslmode","sslrootcert","sslcert","sslkey","ssl","options"])u.searchParams.delete(key);
+ const pool=new pg.Pool({connectionString:u.toString(),max:2,connectionTimeoutMillis:1000,ssl:{ca:SUPABASE_PROD_CA_2021,rejectUnauthorized:true},application_name:"96bulls-feature-copy-metadata",idleTimeoutMillis:60000});pool.on("error",()=>{});return pool;
+}
+
 /** Runtime credential proof; readonly URL options do not substitute for a readonly principal. */
 export async function verifySemanticReadonlyRole(db: FeatureReader, relations: readonly string[], mutators: readonly string[]) {
     const r = (await db.query<any>("SELECT rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls,rolinherit FROM pg_catalog.pg_roles WHERE rolname=current_user")).rows;

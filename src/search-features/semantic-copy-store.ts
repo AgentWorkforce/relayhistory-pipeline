@@ -1,3 +1,4 @@
+import type {SemanticScopedSql} from "./semantic-copy-postgres.ts";
 /** Real metadata RPC adapter. The database owns lease/generation/checkpoint state. */
 import { randomUUID } from "node:crypto";
 import type { SqlExecutor } from "../../packages/pipeline/src/lib/pipeline/queue.ts";
@@ -54,16 +55,14 @@ export async function checkedSemanticLease(raw: unknown, expected: {
 }
 export class SemanticCopyStore {
     constructor(readonly db: SqlExecutor, readonly sourceId: string, readonly sourceAuthorityHash: string) { }
-    private async body(sql: string, args: unknown[]) { return (await this.db.query<{
-        v: unknown;
-    }>(sql, args)).rows[0]?.v; }
+    private async body(sql:string,args:unknown[],signal?:AbortSignal){const db=this.db as Partial<SemanticScopedSql>;const result=signal&&db.queryWithSignal?await db.queryWithSignal<{v:unknown}>(sql,args,signal):await this.db.query<{v:unknown}>(sql,args);return result.rows[0]?.v}
     private expected(kind: SemanticFeatureKind, nonce: string, generation?: string) { return { sourceId: this.sourceId, kind, sourceAuthorityHash: this.sourceAuthorityHash, nonce, generation }; }
     async register(targetHash: string, profileHash: string, profileJson: string) { if (await this.body("SELECT sessions.register_search_feature_source($1,$2,$3,$4,$5) v", [this.sourceId, targetHash, this.sourceAuthorityHash, profileHash, profileJson]) !== true)
         throw new SemanticCopyError("source_binding_changed"); }
     async claim(kind: SemanticFeatureKind): Promise<SemanticCopyLease | null> { const nonce = randomUUID(), v = await this.body("SELECT sessions.claim_search_feature_copy($1,$2,$3,$4::uuid) v", [this.sourceId, kind, this.sourceAuthorityHash, nonce]); return v === null ? null : checkedSemanticLease(v, this.expected(kind, nonce)); }
     async initialize(c: SemanticCopyLease, h: string) { const v = await this.body("SELECT sessions.initialize_search_feature_baseline($1,$2,$3::uuid,$4::bigint,$5,$6::bigint) v", [this.sourceId, c.kind, c.leaseNonce, c.generation, c.stateHash, h]); if (v === null)
         throw new SemanticCopyError("baseline_lease_lost"); return checkedSemanticLease(v, this.expected(c.kind, c.leaseNonce, c.generation)); }
-    async heartbeat(c: SemanticCopyLease) { const v = await this.body("SELECT sessions.heartbeat_search_feature_copy($1,$2,$3::uuid,$4::bigint) v", [this.sourceId, c.kind, c.leaseNonce, c.generation]); if (v === null)
+    async heartbeat(c: SemanticCopyLease,signal?:AbortSignal) { const v = await this.body("SELECT sessions.heartbeat_search_feature_copy($1,$2,$3::uuid,$4::bigint) v", [this.sourceId, c.kind, c.leaseNonce, c.generation],signal); if (v === null)
         throw new SemanticCopyError("checkpoint_lease_lost"); return checkedSemanticLease(v, this.expected(c.kind, c.leaseNonce, c.generation)); }
     async commit(c: SemanticCopyLease, next: SemanticFeatureCheckpoint, checkedAt: string) { const v = await this.body("SELECT sessions.commit_search_feature_copy($1,$2,$3::uuid,$4::bigint,$5,$6::jsonb,$7::timestamptz) v", [this.sourceId, c.kind, c.leaseNonce, c.generation, c.stateHash, JSON.stringify(next), checkedAt]); if (v === null)
         throw new SemanticCopyError("checkpoint_cas_failed"); const result = await checkedSemanticLease(v, this.expected(c.kind, c.leaseNonce, c.generation)); if (stateTuple(result.state) !== stateTuple(next))

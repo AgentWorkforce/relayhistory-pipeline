@@ -1,3 +1,5 @@
+import {createSemanticClickHouseClient} from "../src/search-features/semantic-copy-ch.ts";
+import {SemanticPostgresExecutor} from "../src/search-features/semantic-copy-postgres.ts";
 /** Actual owned PG17 builtin + CH26 + durable100000 integration; synthetic only. */
 import pg from "pg";
 import {SemanticCopyStore} from "../src/search-features/semantic-copy-store.ts";
@@ -13,7 +15,7 @@ import {semanticCopySchemaStatements} from "../src/search-features/semantic-copy
 import {readSemanticFeatureAuthority,readSemanticFeatureProfile,assertSemanticAuthorityPair} from "../src/search-features/semantic-copy-readiness.ts";
 import {verifySemanticReadonlyRole} from "../src/search-features/semantic-copy-source-pool.ts";
 const root=process.cwd(),[rhc,out]=process.argv.slice(2);
-if(!root.endsWith("/semantic-copy-state-20261103")||!rhc?.endsWith("/relayhistory-cloud-worktrees/ch-brief-search-20261103")||!out?.includes("/relay-briefs/semantic-copy-real-"))throw Error("owned fixture only");
+if(!(root.endsWith("/semantic-copy-state-20261103")||root.endsWith("/semantic-copy-recovery-20261104"))||!rhc?.endsWith("/relayhistory-cloud-worktrees/ch-brief-search-20261103")||!out?.includes("/relay-briefs/semantic-copy-real-"))throw Error("owned fixture only");
 const port=Number(execFileSync("docker",["port","semantic-copy-proof-pg17-20261104","5432"],{encoding:"utf8"}).trim().split(":").at(-1));
 const chport=Number(execFileSync("docker",["port","semantic-copy-proof-ch26-20261104","8123"],{encoding:"utf8"}).trim().split(":").at(-1));
 const credentials={host:"127.0.0.1",port,user:"postgres",password:"synthetic-semantic-only"};
@@ -34,10 +36,10 @@ for(const r of FEATURE_SOURCE_AUTHORITY.catalog.relations)await owner.query(r.id
 for(const f of FEATURE_SOURCE_AUTHORITY.catalog.functions)if(!f.securityDefiner)await owner.query("GRANT EXECUTE ON FUNCTION "+f.identity+" TO semantic_source_reader");
 await metadataOwner.query("CREATE SCHEMA sessions;GRANT USAGE ON SCHEMA sessions TO service_role");
 await metadataOwner.query(await readFile(root+"/supabase/migrations/20261103100000_semantic_copy_state.sql","utf8"));
-const sourcePool=new pg.Pool({...credentials,database:"semantic_source_fixture",user:"semantic_source_reader",options:"-c default_transaction_read_only=on -c statement_timeout=15000"}),statePool=new pg.Pool({...credentials,database:"semantic_state_fixture",user:"service_role"});
-const source={async query<T>(sql:string,params?:unknown[]){return{rows:(await sourcePool.query(sql,params)).rows as T[]}}},db={async query<T>(sql:string,params?:unknown[]){return{rows:(await statePool.query(sql,params)).rows as T[]}}};
+const sourcePool=new pg.Pool({...credentials,database:"semantic_source_fixture",connectionTimeoutMillis:1000,user:"semantic_source_reader",options:"-c default_transaction_read_only=on -c statement_timeout=15000"}),statePool=new pg.Pool({...credentials,database:"semantic_state_fixture",connectionTimeoutMillis:1000,user:"service_role"});
+const source=new SemanticPostgresExecutor(sourcePool,true),db=new SemanticPostgresExecutor(statePool);
 const endpoint="http://127.0.0.1:"+chport,rootCh=createClickHouseClient({url:endpoint,user:"proof",password:"synthetic-semantic-only",database:"default"});await rootCh.command("DROP DATABASE IF EXISTS semantic_copy_fixture");await rootCh.command("CREATE DATABASE semantic_copy_fixture");
-const ch=createClickHouseClient({url:endpoint,user:"proof",password:"synthetic-semantic-only",database:"semantic_copy_fixture"});
+const ch=createSemanticClickHouseClient({url:endpoint,user:"proof",password:"synthetic-semantic-only",database:"semantic_copy_fixture"});
 for(const sql of [...eventFeatureSchemaStatements(),...briefFeatureSchemaStatements(),...semanticCopySchemaStatements()])await ch.command(sql);
 const checks:any[]=[],assert=(v:unknown,why:string)=>{if(!v)throw Error(why)};
 try{
