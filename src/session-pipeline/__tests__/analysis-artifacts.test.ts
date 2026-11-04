@@ -1,9 +1,10 @@
 import {afterEach,expect,test} from "bun:test";
+import {artifactDigest} from "../replay-pages.ts";
 import {mkdtemp,rm} from "node:fs/promises";import {tmpdir} from "node:os";import {join} from "node:path";
 import {objectKey,readAll,type ObjectStore} from "../../../packages/object-store/src/index.ts";
 import {createFsStore,REPLAY_FIXTURE_IDENTITY as identity} from "./replay-fixture.ts";
 import {buildSessionAnalysisArtifacts,analysisArtifactGeneration} from "../analysis-publication.ts";
-import {analysisGenerationJson,analysisSnapshotJson,type SessionAnalysisSnapshot} from "../../session-read-api/session-analysis-artifact.ts";
+import {analysisGenerationJson,analysisSourceSnapshotJson,analysisSnapshotJson,type SessionAnalysisSnapshot} from "../../session-read-api/session-analysis-artifact.ts";
 const directories:string[]=[];afterEach(async()=>{for(const p of directories.splice(0))await rm(p,{recursive:true,force:true})});
 const source={epoch:"123",fingerprint:"a".repeat(64)},snapshot:SessionAnalysisSnapshot={snapshotAt:"2026-11-03T00:00:00.000001Z",snapshotId:"b".repeat(64),payload:{outcome:"ok",sessionId:identity.sessionId,requests:[],analyses:[]}};
 async function store(){const root=await mkdtemp(join(tmpdir(),"analysis-codec-"));directories.push(root);return createFsStore({root})}
@@ -25,3 +26,5 @@ test.each([
   if(count===0)expect(graph.tables[name].raw.root).toBeNull();
  }
 });
+
+test("title source digest changes v2 generation while preserving public payload and persisted v1 generation",()=>{const raw=analysisSnapshotJson(snapshot.payload),publicSha=artifactDigest(raw),a=artifactDigest(analysisSourceSnapshotJson(publicSha,{version:1,complete:true,title:"first"})),b=artifactDigest(analysisSourceSnapshotJson(publicSha,{title:"second",complete:true,version:1}));expect(a).not.toBe(b);expect(analysisGenerationJson(identity,source,snapshot.snapshotAt,snapshot.snapshotId,publicSha,a)).not.toBe(analysisGenerationJson(identity,source,snapshot.snapshotAt,snapshot.snapshotId,publicSha,b));expect(analysisGenerationJson(identity,source,snapshot.snapshotAt,snapshot.snapshotId,publicSha)).toBe(JSON.stringify(["session-analysis-cache-v1",identity,source,snapshot.snapshotAt,snapshot.snapshotId,publicSha]));expect(analysisSnapshotJson(snapshot.payload)).toBe(raw);expect(analysisSourceSnapshotJson(publicSha,{title:"first",complete:true,version:1})).toBe(analysisSourceSnapshotJson(publicSha,{version:1,complete:true,title:"first"}));for(const title of [""," untrimmed ",undefined])expect(()=>analysisSourceSnapshotJson(publicSha,{version:1,complete:true,title} as any)).toThrow("analysis_title_attestation_invalid")});
