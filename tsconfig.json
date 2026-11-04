@@ -42,7 +42,8 @@
     "scripts/build-ordered-router-fixture.ts",
     "scripts/generate-ordered-control-neon-fixture.ts",
     "scripts/proof-receipt-seats.ts",
-    "scripts/sync-ingest-seat-boundary.ts"
+    "scripts/sync-ingest-seat-boundary.ts",
+    "scripts/sync-ingest-custody-boundary.ts"
   ],
   "exclude": [
     "node_modules",

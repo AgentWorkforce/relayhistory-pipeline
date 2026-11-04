@@ -49,7 +49,8 @@ test("later same-origin equal revision keeps first ACK seat/body; higher revisio
 test("uninitialized baseline blocks actual staged and suppressed ACKs; runtime cannot initialize/read clock",async()=>{
  const f=await fixture(false);
  await expect(deliverBatch(f.deps,TENANT,await batch([record({record_id:"cold"})]))).rejects.toThrow();
- await f.ledger.setSessionUploads({tenant:TENANT,originId:"origin-1",sessions:[["claude","sess-1"]],enabled:false});
+ await expect(f.ledger.setSessionUploads({tenant:TENANT,originId:"origin-1",sessions:[["claude","sess-1"]],enabled:false})).rejects.toThrow();
+ await f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,\'origin-1\',\'claude\',\'sess-1\')",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
  await expect(deliverBatch(f.deps,TENANT,await batch([record({record_id:"suppressed"})],{batch_id:"suppressed"}))).rejects.toThrow();
  await expect(f.run("SELECT sessions.ingest_receipt_seat_initialize($1::jsonb)",[JSON.stringify(fixtureSeatBaseline(gen))])).rejects.toMatchObject({code:"42501"});
  await expect(f.run("SELECT * FROM sessions.ingest_receipt_seat_clock",[])).rejects.toMatchObject({code:"42501"});
