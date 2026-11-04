@@ -133,11 +133,13 @@ function filesystemVerifierSql(): SchemaVerifierSql {
  * next migrate; this check turns readiness (and worker claiming) off at the next probe
  * instead (55000).
  */
-const RUNTIME_FUNCTION_REGPROCEDURES = RUNTIME_APPLICATION_FUNCTIONS.map(
-  (fn) => `'${fn.replaceAll("'", "''")}'::regprocedure`,
-).join(", ");
-
-export const SESSIONS_FUNCTION_GATE_SQL = `DO $sessions_fn_gate$
+/** Trusted source registry only, never request/environment/database input.
+ * A dedicated function-only worker uses its OWN exact registry; the ordinary
+ * application runtime retains its existing unchanged capability set. */
+export function sessionsFunctionGateSql(allowedFunctions:readonly string[]):string{
+ if(allowedFunctions.length>128||allowedFunctions.some(fn=>typeof fn!=="string"||fn.length>1024||!/^sessions\.[a-z_][a-z0-9_]*\([a-z0-9_, \[\]]*\)$/.test(fn)))throw Error("function_gate_registry_invalid");
+ const regprocedures=allowedFunctions.map(fn=>"'"+fn.replaceAll("'","''")+"'::regprocedure").join(", ");
+ return `DO $sessions_fn_gate$
 DECLARE v text;
 BEGIN
   SELECT string_agg(p.oid::regprocedure::text, ', ' ORDER BY 1) INTO v
@@ -148,13 +150,15 @@ BEGIN
           OR (has_function_privilege(current_user, p.oid, 'EXECUTE')
               AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
               AND NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
-              AND p.oid <> ALL (ARRAY[${RUNTIME_FUNCTION_REGPROCEDURES}]::oid[])));
+              AND p.oid <> ALL (ARRAY[${regprocedures}]::oid[])));
   IF v IS NOT NULL THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'live gate: sessions functions executable by PUBLIC or the runtime role: ' || v;
   END IF;
 END
 $sessions_fn_gate$`;
+}
+export const SESSIONS_FUNCTION_GATE_SQL=sessionsFunctionGateSql(RUNTIME_APPLICATION_FUNCTIONS);
 
 /** Runs `work` in one transaction on one connection (inTransaction, or a test double). */
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;

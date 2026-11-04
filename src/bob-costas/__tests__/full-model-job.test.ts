@@ -31,3 +31,17 @@ test("default off/model off and wrong compiled generation perform no secret, poo
  await expect(runFullModelJob(env,()=>300000,{...overrides,assets:async()=>assets})).rejects.toMatchObject({code:"model_compiled_generation"});
  expect(io).toBe(0);
 });
+
+test("dedicated model residual gate uses its exact static registry without broadening the app runtime",async()=>{
+ const {PGlite}=await import("@electric-sql/pglite"),{sessionsFunctionGateSql}=await import("../../shared/db.ts"),{MODEL_WORKER_FUNCTIONS}=await import("../../shared/model-worker-contract.ts");
+ const pg=new PGlite();try{
+ await pg.exec("CREATE ROLE bulls96_session_model;CREATE SCHEMA sessions;REVOKE ALL ON SCHEMA sessions FROM PUBLIC;GRANT USAGE ON SCHEMA sessions TO bulls96_session_model");
+ for(const signature of MODEL_WORKER_FUNCTIONS)await pg.exec("CREATE FUNCTION "+signature.replace("(jsonb)","(p jsonb)")+"RETURNS jsonb LANGUAGE sql AS $$SELECT '{}'::jsonb$$;REVOKE ALL ON FUNCTION "+signature+" FROM PUBLIC;GRANT EXECUTE ON FUNCTION "+signature+" TO bulls96_session_model");
+ await pg.exec("SET ROLE bulls96_session_model");
+ await pg.exec(sessionsFunctionGateSql(MODEL_WORKER_FUNCTIONS));
+ await expect(pg.exec(sessionsFunctionGateSql([]))).rejects.toThrow("live gate: sessions functions executable");
+ await pg.exec("RESET ROLE;CREATE FUNCTION sessions.unexpected_model_cap()RETURNS void LANGUAGE sql AS $$SELECT$$;REVOKE ALL ON FUNCTION sessions.unexpected_model_cap() FROM PUBLIC;GRANT EXECUTE ON FUNCTION sessions.unexpected_model_cap() TO bulls96_session_model;SET ROLE bulls96_session_model");
+ await expect(pg.exec(sessionsFunctionGateSql(MODEL_WORKER_FUNCTIONS))).rejects.toThrow("sessions.unexpected_model_cap()");
+ expect(()=>sessionsFunctionGateSql(["sessions.evil();DROP ROLE postgres"])).toThrow("function_gate_registry_invalid");
+ }finally{await pg.close()}
+});
