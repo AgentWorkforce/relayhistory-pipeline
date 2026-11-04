@@ -1,3 +1,4 @@
+import { encodeRelayhistoryJsonExact } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import { nodeReadBudget, type NodeReadProfile } from "../session-read-api/node-read-profile.ts";
 /** Node-only, write-before-publication materializer. No Worker source-budget lift. */
 import { createHash } from "node:crypto";
@@ -19,7 +20,7 @@ export class ArtifactBuildError extends Error {
   constructor(readonly code: string) { super(code); this.name = "ArtifactBuildError"; }
 }
 function refuse(code: string): never { throw new ArtifactBuildError(code); }
-const bytesOf = (value: unknown) => encoder.encode(JSON.stringify(value));
+const bytesOf = (value: unknown) => encoder.encode(encodeRelayhistoryJsonExact(value));
 const textCompare = (a: unknown, b: unknown) => Buffer.compare(Buffer.from(String(a ?? "")), Buffer.from(String(b ?? "")));
 const time = (v: unknown) => v == null ? "" : canonicalTimestamp(String(v));
 /** The same event byte order as the raw provider; legacy numeric keys stay numeric. */
@@ -36,7 +37,7 @@ export function compareArtifactRows(a: ArtifactRow, b: ArtifactRow): number {
   }
   if (a.table === "session_outcomes")
     return textCompare(time(x.shipped_at ?? x.ingested_at ?? x.created_at), time(y.shipped_at ?? y.ingested_at ?? y.created_at)) || textCompare(x.commit_sha, y.commit_sha);
-  return textCompare(JSON.stringify(x), JSON.stringify(y));
+  return textCompare(encodeRelayhistoryJsonExact(x), encodeRelayhistoryJsonExact(y));
 }
 export interface MaterializeInput {
   identity: ArtifactIdentity; generation: string; source: ArtifactSource; prefix: string;

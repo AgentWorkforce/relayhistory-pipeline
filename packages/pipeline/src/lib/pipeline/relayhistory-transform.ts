@@ -771,3 +771,9 @@ export class RelayhistoryExportTransform implements SessionTransform {
     };
   }
 }
+
+
+// Shared exact JSON boundary for canonical artifacts and trusted Node model
+// consumers. These are the SAME raw parser/encoder; no PostgreSQL JSONB hash or
+// new normalization rule is introduced.
+export {parseExact as parseRelayhistoryJsonExact,encoded as encodeRelayhistoryJsonExact};

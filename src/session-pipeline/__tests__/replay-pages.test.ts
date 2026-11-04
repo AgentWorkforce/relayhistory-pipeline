@@ -94,3 +94,15 @@ test("managed replay requires exact mask, registers graph before PUT and publish
  const old=(await x.db.query<any>("SELECT sessions.publish_session_replay_pages($1,$2,$3,$4,$5::bigint,$6,$7::jsonb,$8,$9,$10,$11,$12,$13::integer) ok",[identity.orgId,identity.workspaceId,identity.source,identity.sessionId,history.source.epoch,history.source.fingerprint,"{}",result.publication!.generation,"c".repeat(64),result.publication!.prefix,result.publication!.index.key,result.publication!.index.sha256,result.publication!.index.bytes])).rows[0].ok;
  expect(old).toBe(false);
 });
+
+test("Node raw graph retains exact nested integers parsed by the authoritative raw codec",async()=>{
+ const {parseRelayhistoryRecord}=await import("../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts");
+ const {canonicalArtifactNodePage}=await import("../../session-read-api/canonical-artifact-reader.ts");
+ const record=parseRelayhistoryRecord('{"kind":"session_event","origin_id":"origin","record_id":"native","revision":"1","accepted_seq":"1","received_at":"2026-11-01T00:00:00Z","operation":"upsert","payload":{"native_counter":9007199254740993}}');
+ expect(record.payload!.native_counter).toBe(9007199254740993n);
+ const store=await storage(),row={source:identity.source,session_id:identity.sessionId,event_id:"native",machine_id:"machine",kind:"session_event",ts:"2026-11-01T00:00:00Z",record};
+ const spec=input([{table:"convergence_events",row}]);
+ const made=await materializeCanonicalArtifacts(store,spec);
+ const page=await canonicalArtifactNodePage({signal:new AbortController().signal,publication:async()=>({version:1,exists:true,current:true,identity,generation:spec.generation,source:spec.source,prefix:spec.prefix,index:made.index}),read:async k=>store.get(objectKey(k))},identity,{table:"convergence_events",view:"raw",limit:1});
+ expect((page.rows[0]!.row.record as any).payload.native_counter).toBe(9007199254740993n);
+});

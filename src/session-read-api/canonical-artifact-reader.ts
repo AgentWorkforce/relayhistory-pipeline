@@ -1,6 +1,7 @@
 /** Bounded workerd consumer of immutable, source-acknowledged canonical pages.
  * It never folds raw records, constructs a Neon client, or falls back on misses.
  */
+import { parseRelayhistoryJsonExact, encodeRelayhistoryJsonExact } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import { canonicalTimestamp } from "../hoopdb/search-query.ts";
 import { createHash } from "node:crypto";
 import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
@@ -119,9 +120,9 @@ function publication(
     index: value.index,
   } as unknown as ArtifactPublication;
 }
-function decode(bytes: Uint8Array): unknown {
+function decode(bytes: Uint8Array, exact = false): unknown {
   try {
-    return JSON.parse(
+    return (exact ? parseRelayhistoryJsonExact : JSON.parse)(
       new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes),
     );
   } catch {
@@ -325,7 +326,7 @@ async function artifactPage(
         reader.releaseLock();
       }
     }
-    const loaded = decode(await bytes(ack.index));
+    const loaded = decode(await bytes(ack.index), trustedNode);
     if (
       !obj(loaded) ||
       loaded.version !== 1 ||
@@ -368,7 +369,7 @@ async function artifactPage(
       checkedRef(ref, ARTIFACT_MAX_OBJECT_BYTES);
       const key = JSON.stringify([ref.key, ref.sha256, ref.bytes]);
       if (cache.has(key)) return cache.get(key);
-      const value = decode(await bytes(ref));
+      const value = decode(await bytes(ref), trustedNode);
       if (cache.size >= 32) cache.delete(cache.keys().next().value!);
       cache.set(key, value);
       return value;
@@ -534,7 +535,7 @@ async function artifactPage(
       });
       if (at !== blob.bytes || (await sha256Hex(data)) !== blob.sha256)
         fail("artifact_digest");
-      const value = decode(data);
+      const value = decode(data, trustedNode);
       if (!obj(value)) fail("artifact_row");
       return value;
     }
@@ -562,7 +563,7 @@ async function artifactPage(
       let pending = "";
       await segments(desc.root, "utf16", wanted, async (ref, data) => {
         if (ref.start !== at) fail("artifact_range");
-        const value = decode(data);
+        const value = decode(data, trustedNode);
         if (typeof value !== "string" || value.length !== ref.count)
           fail("artifact_string");
         const piece = value.slice(0, wanted - at);
@@ -711,7 +712,7 @@ async function artifactPage(
         break;
       const row = await hydrate(entry),
         item = { table: query.table, row },
-        size = encoder.encode(JSON.stringify(item)).byteLength;
+        size = encoder.encode(trustedNode ? encodeRelayhistoryJsonExact(item) : JSON.stringify(item)).byteLength;
       if (
         (since !== undefined || until !== undefined) &&
         (typeof row.ts !== "string" ||
