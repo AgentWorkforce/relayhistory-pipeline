@@ -44,6 +44,7 @@ const tables = new Set([
   "session_links",
   "session_outcomes",
   "session_timing",
+  "session_directory_event_values",
 ]);
 async function boundedJson(
   response: Response,

@@ -198,6 +198,7 @@ async function snapshotWithLimits(
       maxScopeEvents,
       maxRows,
       insertBatch: 5000,
+      directoryValues: true,
     },
     0,
     identity.sessionId,

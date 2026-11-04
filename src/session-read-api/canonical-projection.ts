@@ -1,5 +1,6 @@
 /** Shared canonical S3 reader/projection. The live CH writer and read Worker
  * invoke this same implementation; neither maintains a shadow event mapping. */
+import { canonicalDirectoryValues } from "./canonical-directory-values.ts";
 import { createHash } from "node:crypto";
 import {
   CONVERGENCE_EVENT_KIND,
@@ -60,6 +61,8 @@ interface SearchIndexLimits {
   maxScopeEvents: number;
   maxRows: number;
   insertBatch: number;
+  /** Read-artifact projection only; legacy CH writer does not construct display values. */
+  directoryValues?: boolean;
 }
 const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
 const SEP = "\u001f";
@@ -507,6 +510,13 @@ export async function readCanonicalScope(
     complete = false;
     reasons.push("directory_event_metadata_invalid");
   }
+  // Both locators were selected from metadataByKey. Fetch only those rows:
+  // display materialization never scans/copies the full transcript a second time.
+  const displayValues = limits.directoryValues && metadata
+    ? canonicalDirectoryValues({orgId:scope.orgId,workspaceId:scope.workspaceId},metadata,
+        [...new Set([metadata.openingEvent,metadata.projectEvent].flatMap(event=>event ? [keyOf({machineId:event.machine_id,source:event.source,kind:event.kind,eventId:event.event_id})] : []))]
+          .map(key=>metadataByKey.get(key)!))
+    : [];
   return {
     records: canonicalRecords,
     projectionRows: [
@@ -517,6 +527,7 @@ export async function readCanonicalScope(
           row,
         }),
       ),
+      ...displayValues,
     ],
     rows: [...byKey.values()],
     manifests: parts.length,
