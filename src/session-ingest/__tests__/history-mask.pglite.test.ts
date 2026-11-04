@@ -6,7 +6,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { captureHistorySource, withHistorySourceAuthority, historyDerivedKey, registerHistoryDerivedObject, publishHistorySummary, readHistorySummary } from "../../shared/history-source-authority.ts";
+import { captureHistorySource, withHistorySourceAuthority, historyDerivedKey, registerHistoryDerivedObject, publishHistorySummary, publishHistoryState, readHistorySummary } from "../../shared/history-source-authority.ts";
 import { sqlHistoryMaskStore, updateHistoryMask } from "../../shared/history-mask.ts";
 setDefaultTimeout(30000);
 const root=join(import.meta.dir,"../../.."),gen="a".repeat(64),scope={orgId:"mask-org",workspaceId:"mask-ws"};
@@ -43,6 +43,9 @@ test("actual SQL COW tree seeks exact ordinal pages and updates only changed lea
  await expect(sqlHistoryMaskStore(run,gen,"foreign","ws").read(first.sha256)).rejects.toThrow("unknown mask");
 });
 test("actual SQL refuses NULL operation, foreign child and false counts rather than admitting malformed visibility",async()=>{
+ const emptyWorkspace=sqlHistoryMaskStore(run,gen,scope.orgId,"");
+ const empty=await updateHistoryMask(emptyWorkspace,{orgId:scope.orgId,workspaceId:""},null,[]);
+ expect((await emptyWorkspace.read(empty.sha256)).workspaceId).toBe("");
  const store=sqlHistoryMaskStore(run,gen,scope.orgId,scope.workspaceId);
  const winner={originId:"origin",recordId:"bad",kind:"history",revision:"1",acceptedSeq:"2",operation:null,userId:"owner",source:"claude",sessionId:"s",contentSha256:"c".repeat(64),lineage:"0"};
  await expect(store.register({protocol:"history-mask-v1",...scope,prefix:"",kind:"leaf",count:"1",items:[{recordId:"bad",winner:winner as any}]})).rejects.toThrow("mask current custody");
@@ -75,16 +78,40 @@ test("logical source locks bind summary intent/final CAS and native changes inva
  await expect(publishHistorySummary(service,captured,pointer)).rejects.toThrow("transaction permit required");
  expect(await withHistorySourceAuthority(transact,captured,async tx=>publishHistorySummary(tx,captured,pointer))).toEqual({current:true,value:true});
  expect((await readHistorySummary(service,captured,"short"))?.objectKey).toBe(objectKey);
+ await withHistorySourceAuthority(transact,captured,async tx=>publishHistoryState(tx,captured,"done","2026-11-04T00:00:00Z"));
+ expect((await db.query("SELECT state FROM sessions.session_directory WHERE org_id=$1",[identity.orgId])).rows[0]!.state).toBe("done");
+ expect((await db.query("SELECT sessions.set_session_state($1,$2,$3,$4,'srv_origin','active',clock_timestamp()) applied",[identity.orgId,identity.workspaceId,identity.source,identity.sessionId])).rows[0]!.applied).toBe(false);
+ await db.query("UPDATE sessions.session_directory SET state='active',short_summary='stale physical summary' WHERE org_id=$1",[identity.orgId]);
+ expect((await db.query("SELECT state,short_summary FROM sessions.session_directory WHERE org_id=$1",[identity.orgId])).rows[0]).toEqual({state:"done",short_summary:null});
+
  const sliceKey=historyDerivedKey(captured,"bob-slice","32345678-1234-1234-1234-123456789abc");
  await registerHistoryDerivedObject(service,captured,{key:sliceKey,sha256:"b".repeat(64),bytes:100});
  await expect(withHistorySourceAuthority(transact,captured,async tx=>publishHistorySummary(tx,captured,{...pointer,objectKey:sliceKey}))).rejects.toThrow("registered encrypted summary required");
  expect((await readHistorySummary(service,captured,"short"))?.objectKey).toBe(objectKey);
+
+ // The managed worker uses only generation-bound JSON entrypoints; old
+ // service workers must leave these jobs queued.
+ const discovery=(await service.query("SELECT sessions.session_history_large_job($1::jsonb) r",[JSON.stringify({generation:gen,action:"discover"})])).rows[0].r;
+ expect(discovery).toMatchObject({busy:false,scanned:1,changed:1,cycleComplete:true});
+ expect((await db.query("SELECT sessions.claim_session_large_read($1::uuid,120) j",["42345678-1234-1234-1234-123456789abc"])).rows[0]!.j).toBe(null);
+ const leaseNonce="52345678-1234-1234-1234-123456789abc";
+ const job=async(action:string)=> (await service.query("SELECT sessions.session_history_large_job($1::jsonb) r",[JSON.stringify({generation:gen,action,leaseNonce,...(action==="claim"?{}:{identity})})])).rows[0].r;
+ expect(await job("claim")).toMatchObject({identity,source:captured.source,schemaGeneration:gen,leaseNonce});
+ expect(await job("heartbeat")).toEqual({ok:true});
+ await expect(service.query("SELECT sessions.claim_session_large_read($1::uuid,120)",[leaseNonce])).rejects.toThrow("permission denied");
+ await expect(service.query("SELECT sessions.session_history_large_job($1::jsonb)",[JSON.stringify({generation:"b".repeat(64),action:"heartbeat",leaseNonce,identity})])).rejects.toThrow();
+ await db.query("UPDATE sessions.session_large_read_jobs SET lease_expires_at=clock_timestamp()-interval'1 second'WHERE org_id=$1",[identity.orgId]);
+ expect(await job("heartbeat")).toEqual({ok:false});
+ expect(await job("retry")).toEqual({ok:false});
+ expect(await job("claim")).toMatchObject({leaseNonce,schemaGeneration:gen});
+ expect(await job("retry")).toEqual({ok:true});
 
  const before=(await db.query("SELECT manifest_key FROM sessions.session_index WHERE org_id=$1",[identity.orgId])).rows;
  await db.query("INSERT INTO sessions.ingest_lazy_native_slots(key_sha256,key_material,org_id,workspace_id,origin_id,record_id,source_identity_sha256,control_epoch,initialized_witness_sha256) VALUES(repeat('e',64),'[]',$1,$2,'origin','native-19',repeat('c',64),repeat('d',64),repeat('f',64))",[identity.orgId,identity.workspaceId]);
  let calls=0;expect(await withHistorySourceAuthority(transact,captured,async()=>{calls++})).toEqual({current:false});expect(calls).toBe(0);
  expect((await db.query("SELECT manifest_key FROM sessions.session_index WHERE org_id=$1",[identity.orgId])).rows).toEqual(before);
  expect((await db.query("SELECT state FROM sessions.ingest_history_reconcile_outbox WHERE native_key_sha256=repeat('e',64)")).rows[0]!.state).toBe("pending");
+ expect((await db.query("SELECT state FROM sessions.session_directory WHERE org_id=$1",[identity.orgId])).rows[0]!.state).toBe("unknown");
  expect((await db.query("SELECT cleanup_state FROM sessions.ingest_history_derived_objects WHERE object_key=$1",[objectKey])).rows[0]!.cleanup_state).toBe("retired");
  // Simulate the next immutable rebuilt version for the same unchanged pointer.
  // No currently owned native slot is required to invalidate legacy source data.
@@ -99,4 +126,32 @@ test("logical source locks bind summary intent/final CAS and native changes inva
  expect(await withHistorySourceAuthority(transact,rebuilt,async()=>{throw Error("legacy-only stale callback")})).toEqual({current:false});
  expect((await db.query("SELECT state,control_version::text FROM sessions.ingest_history_privacy_outbox WHERE org_id=$1 AND user_id='history-user'",[identity.orgId])).rows[0]).toEqual({state:"pending",control_version:"1"});
 
+});
+
+test("a new destination invalidates before a record has any registered scope dependency",async()=>{
+ const h="9".repeat(64);
+ expect((await db.query("SELECT count(*)::int n FROM sessions.ingest_history_scope_keys WHERE record_id='never-registered'")).rows[0]!.n).toBe(0);
+ await db.query("INSERT INTO sessions.ingest_lazy_native_slots(key_sha256,key_material,org_id,workspace_id,origin_id,record_id,source_identity_sha256,control_epoch,initialized_witness_sha256,current_owner,current_source,current_session,current_revision,current_digest,current_reset_epoch,current_fence_epoch) VALUES($1,'[]','brand-org','brand-ws','origin','never-registered',repeat('c',64),repeat('d',64),repeat('f',64),'user','claude','new-session',1,repeat('a',64),0,0)",[h]);
+ expect((await db.query("SELECT count(*)::int n FROM sessions.ingest_history_required_scopes WHERE org_id='brand-org' AND session_id='new-session'")).rows[0]!.n).toBe(1);
+ const snapshot=(await db.query("SELECT sessions.session_replay_source_snapshot('brand-org','brand-ws','claude','new-session') s")).rows[0]!.s as any;
+ expect(snapshot.history).toEqual({version:1,required:true,ready:false});
+ await db.query("UPDATE sessions.ingest_lazy_native_slots SET current_session='moved-session',current_revision=2,lineage=1 WHERE key_sha256=$1",[h]);
+ expect((await db.query("SELECT session_id FROM sessions.ingest_history_required_scopes WHERE org_id='brand-org' ORDER BY session_id")).rows).toEqual([{session_id:"moved-session"},{session_id:"new-session"}]);
+});
+
+
+test("unused foundation rolls down without discarding authority, restores legacy claimant, and reapplies",async()=>{
+ await expect(db.exec(readFileSync(join(root,"supabase/rollbacks/20261104062000_canonical_history_lineage.down.sql"),"utf8"))).rejects.toThrow("retain authority/object ledgers");
+ const clean=new PGlite({extensions:{btree_gin,pg_trgm}}),read=(p:string)=>readFileSync(join(root,p),"utf8");
+ try{
+  await clean.exec(read("supabase/tests/supabase_shim.sql"));
+  for(const f of["session_directory_search_worker","session_token_verifier","session_ingest_roles"])await clean.exec(read("supabase/bootstrap/"+f+".sql"));
+  for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await clean.exec(read("supabase/migrations/"+f));
+  await clean.exec(read("supabase/rollbacks/20261104062000_canonical_history_lineage.down.sql"));
+  expect((await clean.query("SELECT to_regprocedure('sessions.session_history_large_job(jsonb)') p,to_regclass('sessions.ingest_history_scope_current') t")).rows[0]).toEqual({p:null,t:null});
+  expect((await clean.query("SELECT prosrc LIKE '%ingest_history_%' managed,pronargdefaults FROM pg_proc WHERE oid='sessions.claim_session_large_read(uuid,integer)'::regprocedure")).rows[0]).toEqual({managed:false,pronargdefaults:1});
+  expect((await clean.query("SELECT count(*)::int n FROM pg_attribute WHERE attrelid='sessions.session_large_read_jobs'::regclass AND attname='history_generation'AND NOT attisdropped")).rows[0]!.n).toBe(0);
+  await clean.exec(read("supabase/migrations/20261104062000_canonical_history_lineage.sql"));
+  expect((await clean.query("SELECT to_regprocedure('sessions.session_history_large_job(jsonb)') IS NOT NULL yes")).rows[0]!.yes).toBe(true);
+ }finally{await clean.close()}
 });

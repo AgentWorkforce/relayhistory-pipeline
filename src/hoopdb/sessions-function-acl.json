@@ -168,6 +168,9 @@
     "sessions.ingest_history_control_changed()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_history_directory_state()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_invalidate_scope(text,text,text,text)": [
       "<owner>:EXECUTE"
     ],
@@ -614,6 +617,10 @@
       "<owner>:EXECUTE"
     ],
     "sessions.session_history_capture(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.session_history_large_job(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],

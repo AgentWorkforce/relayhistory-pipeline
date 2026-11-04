@@ -1,4 +1,5 @@
 /** Explicit Node job entry point. The disabled path reads no credentials and performs no I/O. */
+import {captureHistorySource} from "../shared/history-source-authority.ts";
 import {createS3Store,objectStoreManifestReader} from "../shared/vendor.ts";
 import {supabasePool,parseSecret,transaction} from "./lambda.ts";
 import {lambdaCredentials} from "./aws-json.ts";
@@ -7,6 +8,8 @@ import {runLargeReadOnce,type LargeReadDeps} from "./large-read-worker.ts";
 export interface LargeReadRuntime { deps:LargeReadDeps;close:()=>Promise<void> }
 export function largeReadRuntime(env:NodeJS.ProcessEnv):LargeReadRuntime{
  const need=(key:string)=>{const value=env[key];if(!value)throw new Error(`large worker missing ${key}`);return value};
+ const generation=env.SESSION_HISTORY_EXPECT_GENERATION;
+ if(generation!==undefined&&!/^[a-f0-9]{64}$/.test(generation))throw new Error("large worker invalid History generation");
  const secret=parseSecret(need("SESSION_PIPELINE_SECRET_JSON"));if(!secret.clickhouse)throw new Error("large worker needs ClickHouse");
  const region=need("AWS_REGION"),bucket=need("PIPELINE_RAW_S3_BUCKET"),prefix=need("PIPELINE_KEY_PREFIX").replace(/^\/+|\/+$/g,"");
  if(!prefix||env.PIPELINE_ORG_FROM_PREFIX!=="true")throw new Error("large worker requires org-prefix layout");
@@ -14,7 +17,7 @@ export function largeReadRuntime(env:NodeJS.ProcessEnv):LargeReadRuntime{
  const encryption=env.PIPELINE_RAW_S3_SSE;if(encryption!==undefined&&encryption!=="AES256"&&encryption!=="aws:kms")throw new Error("large worker invalid encryption");
  if(env.PIPELINE_RAW_S3_KMS_KEY_ID&&encryption!=="aws:kms")throw new Error("large worker invalid encryption key mode");
  const db=supabasePool(secret.hoopdb_url,4),store=createS3Store({bucket,region,credentials:async()=>lambdaCredentials(env),serverSideEncryption:encryption,sseKmsKeyId:env.PIPELINE_RAW_S3_KMS_KEY_ID});
- const deps:LargeReadDeps={db,search:{transact:work=>transaction(db,work),reader:objectStoreManifestReader(store,{provider:"s3",bucket}),store,ch:createClickHouseClient(secret.clickhouse),prefixFor:org=>`${prefix}/${org}`},replay:{db,store,provider:"s3",bucket,prefix:{PIPELINE_KEY_PREFIX:prefix,PIPELINE_ORG_FROM_PREFIX:"true"}}};
+ const deps:LargeReadDeps={db,...(generation?{expectedGeneration:generation,history:(job)=>captureHistorySource(db,job.identity,{schemaGeneration:generation,profile:"large"})}:{}),search:{transact:work=>transaction(db,work),reader:objectStoreManifestReader(store,{provider:"s3",bucket}),store,ch:createClickHouseClient(secret.clickhouse),prefixFor:org=>`${prefix}/${org}`},replay:{db,store,provider:"s3",bucket,prefix:{PIPELINE_KEY_PREFIX:prefix,PIPELINE_ORG_FROM_PREFIX:"true"}}};
  return {deps,close:()=>db.end()};
 }
 export async function largeReadMain(env:NodeJS.ProcessEnv=process.env,factory:(env:NodeJS.ProcessEnv)=>LargeReadRuntime=largeReadRuntime){
@@ -24,7 +27,7 @@ export async function largeReadMain(env:NodeJS.ProcessEnv=process.env,factory:(e
  process.once("SIGTERM",terminate);process.once("SIGINT",terminate);
  let processed=0,published=0,failed=0,scanned=0,cycleComplete=false,scanPages=0;
  const discover=async()=>{
-   const page=(await runtime.deps.db.query<{r:{busy:boolean;scanned:number;changed:number;cycleComplete:boolean}}>("SELECT sessions.discover_session_large_reads() r")).rows[0]?.r;
+   const page=(runtime.deps.expectedGeneration?(await runtime.deps.db.query<{r:any}>("SELECT sessions.session_history_large_job($1::jsonb) r",[JSON.stringify({generation:runtime.deps.expectedGeneration,action:"discover"})])).rows[0]?.r:(await runtime.deps.db.query<{r:{busy:boolean;scanned:number;changed:number;cycleComplete:boolean}}>("SELECT sessions.discover_session_large_reads() r")).rows[0]?.r);
    if(!page||typeof page.busy!=="boolean"||!Number.isSafeInteger(page.scanned)||page.scanned<0||page.scanned>128||!Number.isSafeInteger(page.changed)||page.changed<0||page.changed>page.scanned||typeof page.cycleComplete!=="boolean")throw new Error("large worker invalid discovery");
    scanned+=page.scanned;cycleComplete=page.cycleComplete;return page;
  };

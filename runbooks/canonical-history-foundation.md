@@ -37,7 +37,25 @@ mask, registers all artifact objects before PUT, verifies their bytes and
 publishes the index through a qualified source/optional large-job lease CAS.
 Unqualified managed replay publication refuses. Default Worker raw replies stay
 2MiB; trusted Node raw consumers can hydrate one bounded64MiB row using the same
-codec and reader-owned ordinal cursor.
+codec and reader-owned ordinal cursor. Exact raw JSON integers use the existing
+canonical codec through materialization and trusted Node reads, including nested
+signed64-bit values.
+
+Managed large-job discovery/claim/heartbeat/retry are generation-bound through
+one function-only RPC. The old physical claimant excludes managed logical
+scopes. The actual Node runner uses the same managed capture/mask and source CAS,
+with schema generation plus original lease nonce bound through completion.
+SESSION_HISTORY_EXPECT_GENERATION selects that explicit managed runtime; the
+configured database principal must have the reviewed ingest function profile.
+No service-role fallback is attempted. Discovery walks a durable128-scope cursor
+including small managed sessions, because every complete graph needs eventual
+population. A claim examines at most100 due attempts and may return no claim after\nretiring a stale page; that is not a global completion/readiness proof. The final creator still must enqueue before its metadata commit.
+
+Managed directory state is written only from a matching current logical state;
+late physical classifiers cannot replace it. Legacy plaintext short summaries
+are cleared for managed scopes. A new native destination invalidates immediately,
+even before that native key has any registered scope dependency. Empty
+workspaces retain their existing supported identity.
 
 ## Proofs and limits
 
@@ -64,15 +82,17 @@ Do not reuse an author's DB, copy credentials or run this against a service URL.
 
 Atomic multi-carrier old/new pointer publication, fresh destinations, complete
 global physical ownership including unindexed NULL archives, persistent legacy
-retirement/GC, whole-workspace inventory CAS, source79 SDK composition and
-all-owner revalidation remain unfinished. The physical plan capture alone does
+retirement/GC, whole-workspace inventory CAS, source79 installation/operator identity and complete target-overlay/body
+provenance remain unfinished. The generated689 source SDK and multi-lookup
+owner-context checks are composed source; they do not independently establish
+those final publication gates. The physical plan capture alone does
 not publish an image. The masked logical source/version creator is still part
 of that final CAS; fixture owner inserts are explicitly synthetic.
 
 Durable reconcile/retirement workers must consume cleared slots and legacy-only
-privacy controls even with no surviving buffered payload. Public logical
-short/long summary readers and source-bound directory/Referee facts are not
-wired by merely storing metadata here.610 search publication and630 model
+privacy controls even with no surviving buffered payload. Public logical short/long encrypted summary readers and complete source-bound
+Referee facts are not wired by merely storing metadata here. Directory state
+uses its existing selected-list path; actual final-caller proof is still required.610 search publication and630 model
 integration, exact current-head source review, PG/MinIO races and the largest
 1.55GB managed rewrite remain separate mandatory gates. No full read/search/
 Bob/Referee switchover or48h retention SLO is established.

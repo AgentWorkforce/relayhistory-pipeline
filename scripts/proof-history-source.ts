@@ -5,7 +5,7 @@ import{sqlHistoryMaskStore,updateHistoryMask}from"../src/shared/history-mask.ts"
 import{captureHistorySource,withHistorySourceAuthority,historyDerivedKey,registerHistoryDerivedObject,publishHistorySummary,readHistorySummary}from"../src/shared/history-source-authority.ts";
 if(process.env.HISTORY_DISPOSABLE!=="1")throw Error("owned_fixture_required");
 const fixtureContainer=process.argv[2]??"canonical-history-source-pg17-20261104";
-if(!["canonical-history-source-pg17-20261104","canonical-history-source-final-pg17-20261104"].includes(fixtureContainer))throw Error("unowned_fixture");
+if(!["canonical-history-source-pg17-20261104","canonical-history-source-final-pg17-20261104","canonical-history-managed-pg17-20261104","canonical-history-managed-final-pg17-20261104"].includes(fixtureContainer))throw Error("unowned_fixture");
 const container=JSON.parse(execFileSync("docker",["inspect",fixtureContainer],{encoding:"utf8"}))[0];assert.equal(container.Config.Labels["com.96bulls.proof"],"canonical-history-source");
 const port=container.NetworkSettings.Ports["5432/tcp"][0];assert.equal(port.HostIp,"127.0.0.1");
 const cfg=(user="postgres",database="history_source")=>({host:"127.0.0.1",port:Number(port.HostPort),user,database,connectionTimeoutMillis:1000});
@@ -79,6 +79,25 @@ await check("logical source locks bind summary intent/final CAS and native chang
 
  await owner.query("BEGIN");await owner.query("SELECT pg_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:directory-events',$1::text,$2::text,$3::text,$4::text),0))",[identity.orgId,identity.workspaceId,identity.source,identity.sessionId]);
  await assert.rejects(()=>withHistorySourceAuthority(transact,captured,async()=>{throw Error("must_not_run")}),(e:any)=>e.code==="40001");await owner.query("ROLLBACK");
+
+ const jobNonce="52345678-1234-1234-1234-123456789abc";
+ const job=async(action:string)=>(await ingest.query("SELECT sessions.session_history_large_job($1::jsonb) r",[JSON.stringify({generation:gen,action,...(action==='discover'?{}:{leaseNonce:jobNonce}),...(action==='heartbeat'||action==='retry'?{identity}:{})})])).rows[0].r;
+ assert.equal((await job("discover")).changed,1);
+ assert.equal((await owner.query("SELECT sessions.claim_session_large_read($1::uuid,120) j",[jobNonce])).rows[0].j,null);
+ assert.equal((await job("claim")).schemaGeneration,gen);
+ assert.deepEqual(await job("heartbeat"),{ok:true});
+ await assert.rejects(()=>ingest.query("SELECT sessions.claim_session_large_read($1::uuid,120)",[jobNonce]),(e:any)=>e.code==='42501');
+ // Hold a row lock until AFTER expiry; the lease must be checked after wait,
+ // not only before blocking. Neither the product deadline nor role is changed.
+ await owner.query("BEGIN");
+ await owner.query("UPDATE sessions.session_large_read_jobs SET lease_expires_at=clock_timestamp()+interval'100 milliseconds' WHERE org_id=$1",[identity.orgId]);
+ const blocked=job("heartbeat");
+ await new Promise(resolve=>setTimeout(resolve,180));
+ await owner.query("COMMIT");
+ assert.deepEqual(await blocked,{ok:false});
+ assert.deepEqual(await job("retry"),{ok:false});
+ assert.equal((await job("claim")).leaseNonce,jobNonce);
+ assert.deepEqual(await job("retry"),{ok:true});
  const before=(await db.query("SELECT manifest_key FROM sessions.session_index WHERE org_id=$1",[identity.orgId])).rows;
  await db.query("INSERT INTO sessions.ingest_lazy_native_slots(key_sha256,key_material,org_id,workspace_id,origin_id,record_id,source_identity_sha256,control_epoch,initialized_witness_sha256) VALUES(repeat('e',64),'[]',$1,$2,'origin','native-19',repeat('c',64),repeat('d',64),repeat('f',64))",[identity.orgId,identity.workspaceId]);
  let calls=0;expect(await withHistorySourceAuthority(transact,captured,async()=>{calls++})).toEqual({current:false});expect(calls).toBe(0);
@@ -99,6 +118,27 @@ await check("logical source locks bind summary intent/final CAS and native chang
  expect((await db.query("SELECT state,control_version::text FROM sessions.ingest_history_privacy_outbox WHERE org_id=$1 AND user_id='history-user'",[identity.orgId])).rows[0]).toEqual({state:"pending",control_version:"1"});
 
 });
+
+await check("managed Node leased graph runs under actual restricted LOGIN with no physical CH indexing",async()=>{
+ const {exportReplayFixture,createFsStore,REPLAY_FIXTURE_IDENTITY:i}=await import("../src/session-pipeline/__tests__/replay-fixture.ts");
+ const {runLargeReadOnce}=await import("../src/session-pipeline/large-read-worker.ts");
+ const {readHistoryReplayDescriptor}=await import("../src/shared/history-source-authority.ts");
+ const store=createFsStore({root:"/home/khaliqgant/relay-briefs/history-managed-worker-objects-"+Date.now()});
+ await exportReplayFixture(store,db,6,2);
+ const authority="62345678-1234-1234-1234-123456789abc";
+ const mask=await updateHistoryMask(sqlHistoryMaskStore(ingest,gen,i.orgId,i.workspaceId),{orgId:i.orgId,workspaceId:i.workspaceId},null,Array.from({length:5},(_,n)=>({recordId:"event-"+String(n+1).padStart(12,"0"),winner:null})));
+ const anchor="96bulls/"+i.orgId+"/upload-generations/g="+authority+"/v1/ws="+i.workspaceId+"/m=history_scope/h="+i.source+"/d=2026/11/01/s=logical/publications/"+authority+"/manifest.json";
+ await owner.query("INSERT INTO sessions.ingest_history_scope_versions(authority_id,org_id,workspace_id,harness,session_id,source_epoch,mask_sha256,record_count,derived_anchor_key,bucket,region,key_root,state,pointer_snapshot_sha256) SELECT $1,org_id,workspace_id,harness,session_id,epoch,$2,5,$3,'replay-fixture','us-east-1','96bulls','ready',repeat('a',64) FROM sessions.session_replay_publications WHERE org_id=$4",[authority,mask.sha256,anchor,i.orgId]);
+ await owner.query("INSERT INTO sessions.ingest_history_scope_current VALUES($1,$2,$3,$4,$5,true)",[i.orgId,i.workspaceId,i.source,i.sessionId,authority]);
+ await owner.query("UPDATE sessions.ingest_history_scope_versions SET source_fingerprint=encode(sha256(convert_to(sessions.session_replay_source_snapshot(org_id,workspace_id,harness,session_id)::text,'UTF8')),'hex') WHERE authority_id=$1",[authority]);
+ for(let n=1;n<=5;n++)await owner.query("INSERT INTO sessions.ingest_history_scope_keys VALUES($1,$2,$3,$4,$5)",[i.orgId,i.workspaceId,"event-"+String(n).padStart(12,"0"),i.source,i.sessionId]);
+ const history=()=>captureHistorySource(ingest,i,{schemaGeneration:gen,profile:"large"});
+ assert.equal((await ingest.query("SELECT sessions.session_history_large_job($1::jsonb) r",[JSON.stringify({generation:gen,action:"discover"})])).rows[0].r.changed,1);
+ const result=await runLargeReadOnce({db:ingest,expectedGeneration:gen,history,search:new Proxy({}as any,{get(){throw Error("legacy_CH_forbidden")}}),replay:{db:ingest,store,provider:"s3",bucket:"replay-fixture",prefix:{PIPELINE_KEY_PREFIX:"96bulls",PIPELINE_ORG_FROM_PREFIX:"true"}}});
+ assert.equal(result,"published");
+ assert.ok((await readHistoryReplayDescriptor(ingest,await history()))?.index.bytes);
+ assert.deepEqual((await owner.query("SELECT state,history_generation FROM sessions.session_large_read_jobs WHERE org_id=$1",[i.orgId])).rows[0],{state:"complete",history_generation:gen});
+});
 proof.runtime=(await ingest.query("SELECT session_user,current_user,(SELECT rolbypassrls OR rolsuper FROM pg_roles WHERE rolname=current_user) privileged")).rows[0];assert.equal(proof.runtime.session_user,"bulls96_session_ingest");assert.equal(proof.runtime.privileged,false);proof.pass=true;
 }catch(e:any){proof.pass=false;proof.failure={code:e.code,message:e.message};console.error(proof.failure);process.exitCode=1}
-finally{await ingest?.end();await owner.end();writeFileSync("/home/khaliqgant/relay-briefs/history-source-actual-pg-20261104.json",JSON.stringify(proof,null,2));}
+finally{await ingest?.end();await owner.end();writeFileSync("/home/khaliqgant/relay-briefs/"+(fixtureContainer.includes("managed")?"history-source-managed-actual-pg-20261104.json":"history-source-actual-pg-20261104.json"),JSON.stringify(proof,null,2));}

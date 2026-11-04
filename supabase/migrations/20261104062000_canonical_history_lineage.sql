@@ -9,7 +9,15 @@ BEGIN
   'sessions.ingest_lazy_stage_seats(uuid)'::regprocedure,'sessions.ingest_publication_claim(jsonb)'::regprocedure,
   'sessions.session_replay_source_snapshot(text,text,text,text)'::regprocedure,
   'sessions.publish_session_replay_pages(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer)'::regprocedure,
-  'sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)'::regprocedure) AND proowner<>me) THEN
+  'sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)'::regprocedure,
+  'sessions.session_publication_is_managed(text,text,text,text,text)'::regprocedure,
+  'sessions.claim_session_large_read(uuid,integer)'::regprocedure,
+  'sessions.heartbeat_session_large_read(text,text,text,text,uuid)'::regprocedure,
+  'sessions.retry_session_large_read(text,text,text,text,uuid,text)'::regprocedure,
+  'sessions.enqueue_session_large_read(text,text,text,text)'::regprocedure,
+  'sessions.capture_session_replay_pages(text,text,text,text)'::regprocedure) AND proowner<>me)
+ OR EXISTS(SELECT 1 FROM pg_class WHERE oid IN('sessions.session_large_read_jobs'::regclass,'sessions.session_index'::regclass,
+  'sessions.session_directory'::regclass,'sessions.session_replay_publications'::regclass)AND relowner<>me) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: original coherent creator required';END IF;
 END $creator$;
 
@@ -488,13 +496,23 @@ BEGIN
  -- Sorted nonblocking scope locks avoid USER->scope / scope->model deadlocks.
  FOR v_scope IN
   SELECT z.*FROM(
-   SELECT DISTINCT k.org_id,k.workspace_id,k.harness,k.session_id
-   FROM history_new n JOIN sessions.ingest_history_scope_keys k
+   SELECT k.org_id,k.workspace_id,k.harness,k.session_id FROM history_new n JOIN sessions.ingest_history_scope_keys k
     ON k.org_id=n.org_id AND k.workspace_id=n.workspace_id AND k.record_id=n.record_id
+   UNION SELECT n.org_id,n.workspace_id,n.current_source,n.current_session FROM history_new n
+    WHERE n.current_owner IS NOT NULL AND n.current_session IS NOT NULL
   )z ORDER BY z.org_id COLLATE"C",z.workspace_id COLLATE"C",z.harness COLLATE"C",z.session_id COLLATE"C"
  LOOP
   PERFORM sessions.ingest_history_invalidate_scope(v_scope.org_id,v_scope.workspace_id,v_scope.harness,v_scope.session_id);
  END LOOP;
+ IF TG_OP='UPDATE'THEN
+  FOR v_scope IN SELECT z.*FROM(
+   SELECT DISTINCT o.org_id,o.workspace_id,o.current_source AS harness,o.current_session AS session_id
+    FROM history_old o JOIN history_new n USING(key_sha256)WHERE o.current_owner IS NOT NULL AND o.current_session IS NOT NULL
+     AND ROW(o.current_owner,o.current_source,o.current_session,o.current_revision,o.current_digest,o.lineage)
+      IS DISTINCT FROM ROW(n.current_owner,n.current_source,n.current_session,n.current_revision,n.current_digest,n.lineage)
+  )z ORDER BY z.org_id COLLATE"C",z.workspace_id COLLATE"C",z.harness COLLATE"C",z.session_id COLLATE"C"
+  LOOP PERFORM sessions.ingest_history_invalidate_scope(v_scope.org_id,v_scope.workspace_id,v_scope.harness,v_scope.session_id);END LOOP;
+ END IF;
  RETURN NULL;
 END $changed$;
 -- Transition tables batch resets/large ACKs; never one nested SPI mutation per
@@ -520,6 +538,13 @@ CREATE TABLE sessions.ingest_history_mask_pages(
  record_count bigint NOT NULL CHECK(record_count BETWEEN 0 AND 2000000),document jsonb NOT NULL,
  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+CREATE TABLE sessions.ingest_history_required_scopes(
+ org_id text NOT NULL,workspace_id text NOT NULL,harness text NOT NULL,session_id text NOT NULL,
+ requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),request_version bigint NOT NULL DEFAULT 1,
+ PRIMARY KEY(org_id,workspace_id,harness,session_id)
+);
+ALTER TABLE sessions.ingest_history_required_scopes ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.ingest_history_required_scopes FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 CREATE TABLE sessions.ingest_history_scope_versions(
  authority_id uuid PRIMARY KEY,org_id text NOT NULL,workspace_id text NOT NULL,harness text NOT NULL,session_id text NOT NULL,
  source_epoch bigint NOT NULL CHECK(source_epoch>0),source_fingerprint text CHECK(source_fingerprint~'^[a-f0-9]{64}$'),
@@ -576,8 +601,8 @@ DECLARE d jsonb;r jsonb;w jsonb;child sessions.ingest_history_mask_pages%ROWTYPE
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','document']);PERFORM sessions.ingest_require_generation(p->>'generation');
  d:=p->'document';PERFORM sessions.ingest_exact_keys(d,ARRAY['protocol','orgId','workspaceId','prefix','kind','count','items']);
+ PERFORM sessions.ingest_identifier(d->'orgId',false);PERFORM sessions.ingest_identifier(d->'workspaceId',true);
  IF d->>'protocol'IS DISTINCT FROM'history-mask-v1'OR octet_length(d::text)>16777216
-  OR EXISTS(SELECT 1 FROM unnest(ARRAY['orgId','workspaceId'])k WHERE jsonb_typeof(d->k)IS DISTINCT FROM'string'OR char_length(d->>k)NOT BETWEEN 1 AND 255)
   OR jsonb_typeof(d->'prefix')IS DISTINCT FROM'string'OR d->>'prefix'!~'^[a-f0-9]{0,64}$'
   OR jsonb_typeof(d->'count')IS DISTINCT FROM'string'OR d->>'count'!~'^(0|[1-9][0-9]{0,6})$'OR(d->>'count')::bigint>2000000
   OR jsonb_typeof(d->'items')IS DISTINCT FROM'array'THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: invalid mask page';END IF;
@@ -659,7 +684,9 @@ RETURNS jsonb LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg
  ),'[]'::jsonb)) || coalesce((SELECT jsonb_build_object('history',jsonb_build_object('version',1,'required',true,'ready',c.ready AND v.source_epoch=a.epoch,
   'authorityId',v.authority_id,'maskSha256',v.mask_sha256,'recordCount',v.record_count::text,'derivedAnchorKey',v.derived_anchor_key))
   FROM sessions.ingest_history_scope_current c JOIN sessions.ingest_history_scope_versions v USING(authority_id)
-  WHERE c.org_id=p_org AND c.workspace_id=p_workspace AND c.harness=p_harness AND c.session_id=p_session),'{}'::jsonb) FROM sessions.session_replay_publications a
+  WHERE c.org_id=p_org AND c.workspace_id=p_workspace AND c.harness=p_harness AND c.session_id=p_session),
+  (SELECT jsonb_build_object('history',jsonb_build_object('version',1,'required',true,'ready',false))
+    FROM sessions.ingest_history_required_scopes r WHERE r.org_id=p_org AND r.workspace_id=p_workspace AND r.harness=p_harness AND r.session_id=p_session),'{}'::jsonb) FROM sessions.session_replay_publications a
  WHERE a.org_id=p_org AND a.workspace_id=p_workspace AND a.harness=p_harness AND a.session_id=p_session;
 $snapshot$;
 
@@ -670,7 +697,7 @@ BEGIN
  PERFORM sessions.ingest_require_generation(p->>'generation');
  PERFORM sessions.ingest_exact_keys(p->'identity',ARRAY['orgId','workspaceId','source','sessionId']);
  PERFORM sessions.ingest_exact_keys(p->'source',ARRAY['epoch','fingerprint']);
- o:=sessions.ingest_identifier(p#>'{identity,orgId}',false);w:=sessions.ingest_identifier(p#>'{identity,workspaceId}',false);
+ o:=sessions.ingest_identifier(p#>'{identity,orgId}',false);w:=sessions.ingest_identifier(p#>'{identity,workspaceId}',true);
  h:=sessions.ingest_identifier(p#>'{identity,source}',false);sid:=sessions.ingest_identifier(p#>'{identity,sessionId}',false);
  IF jsonb_typeof(p->'authorityId')IS DISTINCT FROM'string'OR p->>'authorityId'!~'^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$'
   OR jsonb_typeof(p#>'{source,epoch}')IS DISTINCT FROM'string'OR p#>>'{source,epoch}'!~'^[1-9][0-9]{0,18}$'OR(p#>>'{source,epoch}')::numeric>9223372036854775807
@@ -869,6 +896,8 @@ BEGIN
  IF p->'largeLease'='null'::jsonb THEN
   ok:=sessions.publish_session_replay_pages(a->>0,a->>1,a->>2,a->>3,(a->>4)::bigint,a->>5,snapshot,a->>7,a->>8,a->>9,a->>10,a->>11,(a->>12)::integer);
  ELSE
+  IF NOT EXISTS(SELECT 1 FROM sessions.session_large_read_jobs j WHERE j.org_id=v.org_id AND j.workspace_id=v.workspace_id AND j.harness=v.harness AND j.session_id=v.session_id
+   AND j.history_generation=p->>'generation'AND j.lease_nonce=(p->>'largeLease')::uuid AND j.state='running'AND j.lease_expires_at>clock_timestamp())THEN RETURN false;END IF;
   ok:=sessions.publish_session_large_read(a->>0,a->>1,a->>2,a->>3,(a->>4)::bigint,a->>5,snapshot,a->>7,a->>8,a->>9,a->>10,a->>11,(a->>12)::integer,(p->>'largeLease')::uuid);
  END IF;
  RETURN ok;
@@ -960,8 +989,12 @@ LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $invalidate$
 BEGIN
  IF NOT pg_try_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:directory-events',p_org,p_ws,p_harness,p_session),0))THEN
   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='history: logical scope busy';END IF;
+ INSERT INTO sessions.ingest_history_required_scopes AS r(org_id,workspace_id,harness,session_id)VALUES(p_org,p_ws,p_harness,p_session)
+  ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET request_version=r.request_version+1,requested_at=clock_timestamp();
  UPDATE sessions.ingest_history_scope_current SET ready=false WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_harness AND session_id=p_session;
- UPDATE sessions.session_replay_publications SET epoch=nextval('sessions.session_replay_epoch_seq')WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_harness AND session_id=p_session;
+ UPDATE sessions.session_directory SET state='unknown',short_summary=NULL WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_harness AND session_id=p_session AND(state<>'unknown'OR short_summary IS NOT NULL);
+ INSERT INTO sessions.session_replay_publications AS a(org_id,workspace_id,harness,session_id)VALUES(p_org,p_ws,p_harness,p_session)
+  ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET epoch=nextval('sessions.session_replay_epoch_seq');
  UPDATE sessions.ingest_history_derived_objects o SET cleanup_state='retired',row_version=row_version+1 FROM sessions.ingest_history_scope_versions v
   WHERE o.authority_id=v.authority_id AND v.org_id=p_org AND v.workspace_id=p_ws AND v.harness=p_harness AND v.session_id=p_session AND o.cleanup_state='live';
 END $invalidate$;
@@ -985,3 +1018,148 @@ CREATE TRIGGER ingest_history_control_changed AFTER INSERT ON sessions.ingest_co
  REFERENCING NEW TABLE AS history_controls FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_history_control_changed();
 REVOKE ALL ON FUNCTION sessions.ingest_history_invalidate_scope(text,text,text,text),sessions.ingest_history_control_changed()
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+
+-- Old physical classifiers cannot overwrite a managed logical verdict merely
+-- because their late invocation has a newer wall clock.
+CREATE OR REPLACE FUNCTION sessions.session_publication_is_managed(p_org text,p_ws text,p_harness text,p_session text,p_machine text)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $managed$
+ SELECT EXISTS(SELECT 1 FROM sessions.ingest_publication_heads WHERE org_id=p_org AND workspace_id=p_ws
+  AND physical_source=p_harness AND physical_session=p_session AND machine_id=p_machine)
+ OR EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes r WHERE r.org_id=p_org AND r.workspace_id=p_ws AND r.harness=p_harness
+  AND(r.session_id=p_session OR r.session_id IN(SELECT coalesce(s.canonical_session_id,s.session_id)FROM sessions.session_index s
+    WHERE s.org_id=p_org AND s.workspace_id=p_ws AND s.harness=p_harness AND s.session_id=p_session AND s.machine_id=p_machine)))
+ OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current c WHERE c.org_id=p_org AND c.workspace_id=p_ws AND c.harness=p_harness
+  AND(c.session_id=p_session OR c.session_id IN(SELECT coalesce(s.canonical_session_id,s.session_id)FROM sessions.session_index s
+    WHERE s.org_id=p_org AND s.workspace_id=p_ws AND s.harness=p_harness AND s.session_id=p_session AND s.machine_id=p_machine)));
+$managed$;
+CREATE FUNCTION sessions.ingest_history_directory_state()RETURNS trigger
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $directory_state$
+DECLARE assigned text;
+BEGIN
+ IF NOT EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes r WHERE r.org_id=NEW.org_id AND r.workspace_id=NEW.workspace_id AND r.harness=NEW.harness AND r.session_id=NEW.session_id)
+  AND NOT EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current c WHERE c.org_id=NEW.org_id AND c.workspace_id=NEW.workspace_id AND c.harness=NEW.harness AND c.session_id=NEW.session_id)THEN RETURN NEW;END IF;
+ IF NEW.deleted_at IS NULL AND(TG_OP='INSERT'OR NEW.event_projection_epoch IS NOT DISTINCT FROM OLD.event_projection_epoch)THEN
+  SELECT q.state INTO assigned FROM sessions.ingest_history_states q JOIN sessions.ingest_history_scope_current c
+   ON c.org_id=q.org_id AND c.workspace_id=q.workspace_id AND c.harness=q.harness AND c.session_id=q.session_id AND c.authority_id=q.authority_id AND c.ready
+   JOIN sessions.ingest_history_scope_versions v ON v.authority_id=q.authority_id AND v.state='ready'
+   JOIN sessions.session_replay_publications a ON a.org_id=q.org_id AND a.workspace_id=q.workspace_id AND a.harness=q.harness AND a.session_id=q.session_id AND a.epoch=q.source_epoch
+   WHERE q.org_id=NEW.org_id AND q.workspace_id=NEW.workspace_id AND q.harness=NEW.harness AND q.session_id=NEW.session_id
+    AND q.source_fingerprint=v.source_fingerprint AND q.source_epoch=v.source_epoch AND q.mask_sha256=v.mask_sha256;
+ END IF;
+ -- Managed summaries are encrypted registered objects; legacy unqualified
+ -- plaintext writes must not become an apparent current short summary.
+ NEW.short_summary:=NULL;NEW.state:=coalesce(assigned,'unknown');RETURN NEW;
+END $directory_state$;
+CREATE TRIGGER ingest_history_directory_state BEFORE INSERT OR UPDATE ON sessions.session_directory
+ FOR EACH ROW EXECUTE FUNCTION sessions.ingest_history_directory_state();
+REVOKE ALL ON FUNCTION sessions.ingest_history_directory_state()FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+
+-- Generation-bound managed graph jobs share the proven570 lease/completion
+-- transaction; old physical workers must not consume logical-mask work.
+ALTER TABLE sessions.session_large_read_jobs ADD COLUMN history_generation text
+ CHECK(history_generation IS NULL OR history_generation~'^[a-f0-9]{64}$');
+CREATE OR REPLACE FUNCTION sessions.claim_session_large_read(p_nonce uuid,p_lease_seconds integer DEFAULT 120)
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
+DECLARE j sessions.session_large_read_jobs%ROWTYPE;c jsonb;
+BEGIN
+ IF p_nonce IS NULL OR p_lease_seconds IS NULL OR p_lease_seconds NOT BETWEEN 30 AND 300 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='large read: invalid lease'; END IF;
+ FOR j IN SELECT * FROM sessions.session_large_read_jobs WHERE
+ ((state='queued' AND available_at<=clock_timestamp()) OR (state='running' AND lease_expires_at<=clock_timestamp()))
+ AND NOT EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes h WHERE h.org_id=session_large_read_jobs.org_id AND h.workspace_id=session_large_read_jobs.workspace_id AND h.harness=session_large_read_jobs.harness AND h.session_id=session_large_read_jobs.session_id)
+ AND NOT EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current h WHERE h.org_id=session_large_read_jobs.org_id AND h.workspace_id=session_large_read_jobs.workspace_id AND h.harness=session_large_read_jobs.harness AND h.session_id=session_large_read_jobs.session_id)
+ ORDER BY available_at,updated_at LIMIT 100 FOR UPDATE SKIP LOCKED LOOP
+  IF j.attempts>=5 THEN
+   UPDATE sessions.session_large_read_jobs SET state='failed',lease_nonce=NULL,lease_expires_at=NULL,last_error='attempts_exhausted',updated_at=now() WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
+   CONTINUE;
+  END IF;
+  c:=sessions.capture_session_replay_pages(j.org_id,j.workspace_id,j.harness,j.session_id);
+  IF NOT (c->>'exists')::boolean OR (c->>'blocked')::boolean OR c->'source'->>'epoch' IS DISTINCT FROM j.source_epoch::text
+   OR c->'source'->>'fingerprint' IS DISTINCT FROM j.source_fingerprint THEN
+   UPDATE sessions.session_large_read_jobs SET state='superseded',lease_nonce=NULL,lease_expires_at=NULL,updated_at=now()
+    WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
+   CONTINUE;
+  END IF;
+  UPDATE sessions.session_large_read_jobs SET state='running',lease_nonce=p_nonce,lease_expires_at=clock_timestamp()+make_interval(secs=>p_lease_seconds),attempts=attempts+1,last_error=NULL,updated_at=now()
+   WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
+  RETURN jsonb_build_object('identity',c->'identity','source',c->'source','leaseNonce',p_nonce::text);
+ END LOOP;
+ RETURN NULL;
+END $claim$;
+
+CREATE TABLE sessions.ingest_history_graph_scan(
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),after_identity text[],
+ CHECK(after_identity IS NULL OR cardinality(after_identity)=4)
+);
+INSERT INTO sessions.ingest_history_graph_scan VALUES(true,NULL);
+ALTER TABLE sessions.ingest_history_graph_scan ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.ingest_history_graph_scan FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+CREATE FUNCTION sessions.session_history_large_job(p jsonb)RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $large_job$
+DECLARE action text;nonce uuid;j sessions.session_large_read_jobs%ROWTYPE;c jsonb;ok boolean;o text;w text;h text;sid text;
+ cursor_id text[];last_id text[];r record;scanned integer:=0;changed integer:=0;
+BEGIN
+ PERFORM sessions.ingest_require_generation(p->>'generation');
+ action:=p->>'action';
+ IF action='discover'THEN
+  PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','action']);
+  SELECT after_identity INTO cursor_id FROM sessions.ingest_history_graph_scan WHERE singleton FOR UPDATE SKIP LOCKED;
+  IF NOT FOUND THEN RETURN jsonb_build_object('busy',true,'scanned',0,'changed',0,'cycleComplete',false);END IF;
+  FOR r IN SELECT sc.org_id,sc.workspace_id,sc.harness,sc.session_id FROM sessions.ingest_history_scope_current sc
+   JOIN sessions.ingest_history_scope_versions sv USING(authority_id)WHERE sc.ready AND sv.state='ready'AND(cursor_id IS NULL OR
+    ROW(sc.org_id COLLATE "C",sc.workspace_id COLLATE "C",sc.harness COLLATE "C",sc.session_id COLLATE "C")>
+    ROW(cursor_id[1]COLLATE "C",cursor_id[2]COLLATE "C",cursor_id[3]COLLATE "C",cursor_id[4]COLLATE "C"))
+   ORDER BY sc.org_id COLLATE "C",sc.workspace_id COLLATE "C",sc.harness COLLATE "C",sc.session_id COLLATE "C" LIMIT 128 LOOP
+   scanned:=scanned+1;last_id:=ARRAY[r.org_id,r.workspace_id,r.harness,r.session_id];
+   c:=sessions.session_history_capture(jsonb_build_object('generation',p->>'generation','identity',jsonb_build_object('orgId',r.org_id,'workspaceId',r.workspace_id,'source',r.harness,'sessionId',r.session_id)));
+   IF c->>'exists'='true'AND c->>'blocked'='false'AND c#>>'{snapshot,history,ready}'='true'THEN
+    c:=sessions.enqueue_session_large_read(r.org_id,r.workspace_id,r.harness,r.session_id);
+    IF c->>'changed'='true'THEN changed:=changed+1;END IF;
+   END IF;
+  END LOOP;
+  UPDATE sessions.ingest_history_graph_scan SET after_identity=CASE WHEN scanned<128 THEN NULL ELSE last_id END WHERE singleton;
+  RETURN jsonb_build_object('busy',false,'scanned',scanned,'changed',changed,'cycleComplete',scanned<128);
+ END IF;
+ IF action='claim'THEN PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','action','leaseNonce']);
+ ELSIF action IN('heartbeat','retry')THEN PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','action','leaseNonce','identity']);
+ ELSE RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: invalid graph job action';END IF;
+ IF jsonb_typeof(p->'leaseNonce')IS DISTINCT FROM'string'OR p->>'leaseNonce'!~'^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$'THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: invalid graph lease nonce';END IF;
+ nonce:=(p->>'leaseNonce')::uuid;
+ IF action='claim'THEN
+  FOR j IN SELECT q.*FROM sessions.session_large_read_jobs q
+   JOIN sessions.ingest_history_scope_current sc ON sc.org_id=q.org_id AND sc.workspace_id=q.workspace_id AND sc.harness=q.harness AND sc.session_id=q.session_id
+   JOIN sessions.ingest_history_scope_versions sv USING(authority_id)
+   WHERE sc.ready AND sv.state='ready'AND
+    ((q.state='queued'AND q.available_at<=clock_timestamp())OR(q.state='running'AND q.lease_expires_at<=clock_timestamp()))
+   ORDER BY q.available_at,q.updated_at LIMIT 100 FOR UPDATE OF q SKIP LOCKED LOOP
+   IF j.attempts>=5 THEN
+    UPDATE sessions.session_large_read_jobs SET state='failed',lease_nonce=NULL,lease_expires_at=NULL,last_error='attempts_exhausted',updated_at=clock_timestamp()
+     WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;CONTINUE;
+   END IF;
+   c:=sessions.session_history_capture(jsonb_build_object('generation',p->>'generation','identity',jsonb_build_object('orgId',j.org_id,'workspaceId',j.workspace_id,'source',j.harness,'sessionId',j.session_id)));
+   IF c->>'exists'IS DISTINCT FROM'true'OR c->>'blocked'IS DISTINCT FROM'false'OR c#>>'{snapshot,history,ready}'IS DISTINCT FROM'true'
+    OR c#>>'{source,epoch}'IS DISTINCT FROM j.source_epoch::text OR c#>>'{source,fingerprint}'IS DISTINCT FROM j.source_fingerprint THEN
+    UPDATE sessions.session_large_read_jobs SET state='superseded',lease_nonce=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+     WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;CONTINUE;
+   END IF;
+   UPDATE sessions.session_large_read_jobs SET state='running',lease_nonce=nonce,lease_expires_at=clock_timestamp()+interval'120 seconds',history_generation=p->>'generation',
+    attempts=attempts+1,last_error=NULL,updated_at=clock_timestamp()
+    WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
+   RETURN jsonb_build_object('identity',c->'identity','source',c->'source','leaseNonce',nonce::text,'schemaGeneration',p->>'generation');
+  END LOOP;
+  RETURN NULL;
+ END IF;
+ PERFORM sessions.ingest_exact_keys(p->'identity',ARRAY['orgId','workspaceId','source','sessionId']);
+ o:=sessions.ingest_identifier(p#>'{identity,orgId}',false);w:=sessions.ingest_identifier(p#>'{identity,workspaceId}',true);
+ h:=sessions.ingest_identifier(p#>'{identity,source}',false);sid:=sessions.ingest_identifier(p#>'{identity,sessionId}',false);
+ SELECT *INTO j FROM sessions.session_large_read_jobs WHERE org_id=o AND workspace_id=w AND harness=h AND session_id=sid FOR UPDATE;
+ IF NOT FOUND OR j.state<>'running'OR j.lease_nonce IS DISTINCT FROM nonce OR j.history_generation IS DISTINCT FROM p->>'generation'
+  OR j.lease_expires_at<=clock_timestamp()THEN RETURN jsonb_build_object('ok',false);END IF;
+ IF action='heartbeat'THEN ok:=sessions.heartbeat_session_large_read(o,w,h,sid,nonce);
+ ELSE ok:=sessions.retry_session_large_read(o,w,h,sid,nonce,'large_processing_failed');END IF;
+ RETURN jsonb_build_object('ok',ok);
+END $large_job$;
+REVOKE ALL ON FUNCTION sessions.session_history_large_job(jsonb)FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+GRANT EXECUTE ON FUNCTION sessions.session_history_large_job(jsonb)TO bulls96_session_ingest;

@@ -2,7 +2,7 @@
 -- Operational rollback retains installed authority/object ledgers; never forget late PUT obligations.
 DO $rollback_guard$ BEGIN
  IF EXISTS(SELECT 1 FROM sessions.ingest_history_plans)OR EXISTS(SELECT 1 FROM sessions.ingest_history_reconcile_outbox)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_history_privacy_outbox)OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_versions)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_history_privacy_outbox)OR EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes)OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_versions)
   OR EXISTS(SELECT 1 FROM sessions.ingest_history_derived_objects)OR to_regprocedure('sessions.session_history_model_claim(jsonb)')IS NOT NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: retain authority/object ledgers; stop consumers for operational rollback';END IF;
 END $rollback_guard$;
@@ -10,6 +10,7 @@ DROP TRIGGER IF EXISTS ingest_history_pointer_sync ON sessions.session_index;
 DROP TRIGGER IF EXISTS ingest_history_native_insert ON sessions.ingest_lazy_native_slots;
 DROP TRIGGER IF EXISTS ingest_history_native_update ON sessions.ingest_lazy_native_slots;
 DROP TRIGGER IF EXISTS ingest_history_control_changed ON sessions.ingest_control_receipts;
+DROP TRIGGER IF EXISTS ingest_history_directory_state ON sessions.session_directory;
 CREATE OR REPLACE FUNCTION sessions.session_replay_source_snapshot(p_org text,p_workspace text,p_harness text,p_session text)
 RETURNS jsonb LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $snapshot$
  SELECT jsonb_build_object('epoch',a.epoch::text,
@@ -60,7 +61,39 @@ BEGIN
   WHERE org_id=p_org AND workspace_id=p_workspace AND harness=p_harness AND session_id=p_session AND epoch=p_epoch;
  RETURN FOUND;
 END $publish$;
+CREATE OR REPLACE FUNCTION sessions.session_publication_is_managed(p_org text,p_ws text,p_harness text,p_session text,p_machine text)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $managed$
+ SELECT EXISTS(SELECT 1 FROM sessions.ingest_publication_heads WHERE org_id=p_org AND workspace_id=p_ws
+  AND physical_source=p_harness AND physical_session=p_session AND machine_id=p_machine);
+$managed$;
+CREATE OR REPLACE FUNCTION sessions.claim_session_large_read(p_nonce uuid,p_lease_seconds integer DEFAULT 120)
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
+DECLARE j sessions.session_large_read_jobs%ROWTYPE;c jsonb;
+BEGIN
+ IF p_nonce IS NULL OR p_lease_seconds IS NULL OR p_lease_seconds NOT BETWEEN 30 AND 300 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='large read: invalid lease'; END IF;
+ FOR j IN SELECT * FROM sessions.session_large_read_jobs WHERE
+ (state='queued' AND available_at<=clock_timestamp()) OR (state='running' AND lease_expires_at<=clock_timestamp())
+ ORDER BY available_at,updated_at LIMIT 100 FOR UPDATE SKIP LOCKED LOOP
+  IF j.attempts>=5 THEN
+   UPDATE sessions.session_large_read_jobs SET state='failed',lease_nonce=NULL,lease_expires_at=NULL,last_error='attempts_exhausted',updated_at=now() WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
+   CONTINUE;
+  END IF;
+  c:=sessions.capture_session_replay_pages(j.org_id,j.workspace_id,j.harness,j.session_id);
+  IF NOT (c->>'exists')::boolean OR (c->>'blocked')::boolean OR c->'source'->>'epoch' IS DISTINCT FROM j.source_epoch::text
+   OR c->'source'->>'fingerprint' IS DISTINCT FROM j.source_fingerprint THEN
+   UPDATE sessions.session_large_read_jobs SET state='superseded',lease_nonce=NULL,lease_expires_at=NULL,updated_at=now()
+    WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
+   CONTINUE;
+  END IF;
+  UPDATE sessions.session_large_read_jobs SET state='running',lease_nonce=p_nonce,lease_expires_at=clock_timestamp()+make_interval(secs=>p_lease_seconds),attempts=attempts+1,last_error=NULL,updated_at=now()
+   WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
+  RETURN jsonb_build_object('identity',c->'identity','source',c->'source','leaseNonce',p_nonce::text);
+ END LOOP;
+ RETURN NULL;
+END $claim$;
 DROP FUNCTION IF EXISTS
+ sessions.session_history_large_job(jsonb),
+ sessions.ingest_history_directory_state(),
  sessions.ingest_history_control_changed(),
  sessions.ingest_history_invalidate_scope(text,text,text,text),
  sessions.session_history_register_artifact(jsonb),
@@ -95,6 +128,7 @@ DROP FUNCTION IF EXISTS
  sessions.ingest_history_pointer(sessions.session_index),
  sessions.ingest_history_root(text);
 DROP TABLE IF EXISTS
+ sessions.ingest_history_graph_scan,
  sessions.ingest_history_privacy_outbox,
  sessions.ingest_history_scope_owners,
  sessions.ingest_history_states,
@@ -103,6 +137,7 @@ DROP TABLE IF EXISTS
  sessions.ingest_history_scope_keys,
  sessions.ingest_history_scope_current,
  sessions.ingest_history_scope_versions,
+ sessions.ingest_history_required_scopes,
  sessions.ingest_history_mask_pages,
  sessions.ingest_history_reconcile_outbox,
  sessions.ingest_history_plan_refs,
@@ -114,3 +149,4 @@ DROP TABLE IF EXISTS
  sessions.ingest_history_pointer_refs,
  sessions.ingest_history_carriers;
 DROP SEQUENCE IF EXISTS sessions.ingest_history_inventory_epoch;
+ALTER TABLE sessions.session_large_read_jobs DROP COLUMN history_generation;

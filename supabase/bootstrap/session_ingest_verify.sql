@@ -41,6 +41,7 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_reset_uploaded_sessions(jsonb)',
  'sessions.ingest_set_session_uploads(jsonb)',
  'sessions.session_history_capture(jsonb)',
+ 'sessions.session_history_large_job(jsonb)',
  'sessions.session_history_mask_page(jsonb)',
  'sessions.session_history_register_artifact(jsonb)',
  'sessions.session_history_register_object(jsonb)',

@@ -6,7 +6,7 @@ const file=(p:string)=>new URL(p,root);
 const sql=await readFile(file("supabase/migrations/20261104062000_canonical_history_lineage.sql"),"utf8");
 const defs=new Map<string,{secdef:boolean}>();
 for(const m of sql.matchAll(/CREATE(?: OR REPLACE)? FUNCTION\s+(sessions\.\w+)\(([^)]*)\)([\s\S]*?)\s+AS\s+\$[a-z_]+\$/gi)){
- const types=m[2]!.trim()?m[2]!.split(",").map(p=>p.trim().split(/\s+/).slice(1).join(" ").replace(/^timestamptz$/,"timestamp with time zone").replace(/^int$/,"integer")).join(","):"";
+ const types=m[2]!.trim()?m[2]!.split(",").map(p=>p.trim().replace(/\s+DEFAULT\s+[\s\S]*$/i,"").split(/\s+/).slice(1).join(" ").replace(/^timestamptz$/,"timestamp with time zone").replace(/^int$/,"integer")).join(","):"";
  defs.set(m[1]+"("+types+")",{secdef:/SECURITY DEFINER/i.test(m[3]!)});
 }
 const grants=new Map<string,string[]>();
@@ -61,10 +61,12 @@ verify=verify.replace(/v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
  "v_allowed text[] := ARRAY[\n"+Object.entries(acl.functions).filter(([,v])=>(v as string[]).includes("bulls96_session_ingest:EXECUTE")).map(([k])=>k).sort().map(k=>" '"+k+"'").join(",\n")+"\n ]::text[];");
 
 const prior=await readFile(file("supabase/migrations/20261104056000_session_replay_pages.sql"),"utf8");
-const restore=["session_replay_source_snapshot","publish_session_replay_pages"].map(name=>{
- const pattern=new RegExp("CREATE FUNCTION sessions\\."+name+"\\([\\s\\S]*?AS\\s+\\$([a-z_]+)\\$[\\s\\S]*?\\$\\1\\$;","i");
- const match=prior.match(pattern);if(!match)throw Error("History rollback original missing "+name);
- return match[0].replace("CREATE FUNCTION","CREATE OR REPLACE FUNCTION");
+const large=await readFile(file("supabase/migrations/20261104057000_session_large_read_jobs.sql"),"utf8");
+const ordinary=await readFile(file("supabase/migrations/20261104060000_ingest_canonical_publication.sql"),"utf8");
+const restore=["session_replay_source_snapshot","publish_session_replay_pages","session_publication_is_managed","claim_session_large_read"].map(name=>{
+ const pattern=new RegExp("CREATE(?: OR REPLACE)? FUNCTION sessions\\."+name+"\\([\\s\\S]*?AS\\s+\\$([a-z_]+)\\$[\\s\\S]*?\\$\\1\\$;","i");
+ const match=(name==="session_publication_is_managed"?ordinary:name==="claim_session_large_read"?large:prior).match(pattern);if(!match)throw Error("History rollback original missing "+name);
+ return match[0].replace(/^CREATE FUNCTION/,"CREATE OR REPLACE FUNCTION");
 });
 const ownSig=[...defs.keys()].filter(k=>k.startsWith("sessions.ingest_history_")||k.startsWith("sessions.session_history_")).reverse();
 const ownTables=[...sql.matchAll(/CREATE TABLE\s+(sessions\.ingest_history_\w+)\(/g)].map(m=>m[1]!).reverse();
@@ -74,13 +76,14 @@ const down=[
  "-- Operational rollback retains installed authority/object ledgers; never forget late PUT obligations.",
  "DO $rollback_guard$ BEGIN",
  " IF EXISTS(SELECT 1 FROM sessions.ingest_history_plans)OR EXISTS(SELECT 1 FROM sessions.ingest_history_reconcile_outbox)",
- "  OR EXISTS(SELECT 1 FROM sessions.ingest_history_privacy_outbox)OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_versions)",
+ "  OR EXISTS(SELECT 1 FROM sessions.ingest_history_privacy_outbox)OR EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes)OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_versions)",
  "  OR EXISTS(SELECT 1 FROM sessions.ingest_history_derived_objects)OR to_regprocedure('sessions.session_history_model_claim(jsonb)')IS NOT NULL",
  " THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: retain authority/object ledgers; stop consumers for operational rollback';END IF;",
  "END $rollback_guard$;",...ownTriggers,...restore,
  "DROP FUNCTION IF EXISTS\n "+ownSig.join(",\n ")+";",
  "DROP TABLE IF EXISTS\n "+ownTables.join(",\n ")+";",
  "DROP SEQUENCE IF EXISTS sessions.ingest_history_inventory_epoch;",
+ "ALTER TABLE sessions.session_large_read_jobs DROP COLUMN history_generation;",
 ].join("\n")+"\n";
 
 const outputs={
