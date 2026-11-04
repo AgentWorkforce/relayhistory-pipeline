@@ -94,9 +94,14 @@ export async function ensureBufferedBarrier(store: ObjectStore, t: BufferedGcTic
   const bytes = new TextEncoder().encode(JSON.stringify({ v: 1, kind: 'buffered-redaction', stage_token: t.stageToken, claim_token: t.claimToken, original_sha256: t.sha256 }));
   const expected = sha(bytes);
   for (let n = 0; n < 8; n++) {
-    let current;
+    let current, deniedRead: unknown;
     try { current = await store.getObject(objectKey(t.key)); }
-    catch (e) { if (!isObjectStoreError(e, 'not_found')) throw e; }
+    catch (e) {
+      // S3 without broad ListBucket may report 403 for a missing key. A
+      // conditional create can prove absence without overwriting unreadable data.
+      if (isObjectStoreError(e, 'unauthorized') && e.status === 403) deniedRead = e;
+      else if (!isObjectStoreError(e, 'not_found')) throw e;
+    }
     if (current) {
       const body = await boundedBody(current.body, Math.max(t.bytes, bytes.byteLength));
       const digest = sha(body);
@@ -108,7 +113,10 @@ export async function ensureBufferedBarrier(store: ObjectStore, t: BufferedGcTic
       if (body.byteLength !== t.bytes || digest !== t.sha256) no('barrier_unexpected_content');
     }
     try { await store.put(objectKey(t.key), bytes, current ? { ifMatch: current.meta.version, contentType: 'application/json' } : { ifNoneMatch: true, contentType: 'application/json' }); }
-    catch (e) { if (!isObjectStoreError(e, 'already_exists') && !isObjectStoreError(e, 'precondition_failed')) throw e; }
+    catch (e) {
+      if (!isObjectStoreError(e, 'already_exists') && !isObjectStoreError(e, 'precondition_failed')) throw e;
+      if (deniedRead) throw deniedRead; // Existing unreadable object remains untouched.
+    }
   }
   return no('barrier_contended');
 }

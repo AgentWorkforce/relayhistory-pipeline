@@ -210,7 +210,7 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
       if (typeof r.released !== "boolean") throw new LedgerUnavailableError("ledger_bad_result");
     },
     async setSessionUploads(input: SelectionInput): Promise<void> {
-      const r = (await call(run, "ingest_set_session_uploads", input)) as Record<string, unknown>;
+      const r = (await call(run, "ingest_set_session_uploads", options.acceptanceMode==="buffered"?buffered(input):input)) as Record<string, unknown>;
       if (typeof r.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
     },
     async fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][], attempt: StagedAttempt): Promise<[string, string][]> {
@@ -226,7 +226,7 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
       return { committed: r.committed, rearmed: r.rearmed };
     },
     async resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number> {
-      const r = (await call(run, "ingest_reset_uploaded_sessions", { tenant, requestId })) as Record<string, unknown>;
+      const r = (await call(run, "ingest_reset_uploaded_sessions", options.acceptanceMode==="buffered"?buffered({tenant,requestId}):{tenant,requestId})) as Record<string, unknown>;
       if (typeof r.deleted !== "number" || !Number.isSafeInteger(r.deleted) || r.deleted < 0) throw new LedgerUnavailableError("ledger_bad_result");
       return r.deleted;
     },

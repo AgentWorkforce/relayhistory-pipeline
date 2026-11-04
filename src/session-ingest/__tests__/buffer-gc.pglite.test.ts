@@ -27,7 +27,8 @@ async function fixture(){
   catch(e){await db.exec("ROLLBACK");throw e}
  };
  const rpc=async(name:string,p:unknown)=>(await as("bulls96_session_ingest","SELECT sessions.ingest_buffer_gc_"+name+"($1::jsonb) AS r",[JSON.stringify(name==="claim"?{generation,...p as any}:p)])).rows[0]!.r as any;
- const ledger=sqlLedger(((s:string,p:unknown[])=>as("bulls96_session_ingest",s,p)) as never);
+ await db.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until) VALUES($1,repeat('a',64),repeat('b',64),$2,clock_timestamp()+interval '1 hour')",[tenant.orgId,generation]);
+ const ledger=sqlLedger(((s:string,p:unknown[])=>as("bulls96_session_ingest",s,p)) as never,{acceptanceMode:"buffered",expectedGeneration:generation});
  let serial=0;
  async function stage(opts:{ack?:boolean;groups?:number[][];expired?:boolean}={}){
   const batch="batch-"+(++serial),claim=randomUUID(),token=randomUUID(),digest=hash(batch),sha=hash(token);

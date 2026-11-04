@@ -37,3 +37,14 @@ test("refuses truncated inventory without a next version cursor before deleting"
   await expect(f.eraser.eraseObjectExcept(key, "barrier")).rejects.toMatchObject({ code: "erasure_inventory" });
   expect(f.deleted).toEqual([]);
 });
+
+for(const [name,xml] of [
+ ["missing version ID", "<ListVersionsResult><Version><Key>"+key+"</Key><IsLatest>false</IsLatest></Version><Version><Key>"+key+"</Key><VersionId>barrier</VersionId><IsLatest>true</IsLatest></Version><IsTruncated>false</IsTruncated></ListVersionsResult>"],
+ ["invalid latest flag", "<ListVersionsResult><Version><Key>"+key+"</Key><VersionId>old</VersionId><IsLatest>unknown</IsLatest></Version><Version><Key>"+key+"</Key><VersionId>barrier</VersionId><IsLatest>true</IsLatest></Version><IsTruncated>false</IsTruncated></ListVersionsResult>"],
+ ["truncated XML", "<ListVersionsResult><Version><Key>"+key+"</Key><VersionId>barrier</VersionId><IsLatest>true</IsLatest></Version><IsTruncated>false</IsTruncated><Version>"],
+] as const) test("refuses unproven inventory: "+name+" before deleting",async()=>{
+ let deletes=0;
+ const eraser=createS3Eraser({bucket:"unit-bucket",region:"us-east-1",credentials:{accessKeyId:"unit-access",secretAccessKey:"unit-secret"},fetch:(async(_u,init)=>{if(init?.method==="DELETE")deletes++;return new Response(xml)}) as typeof fetch});
+ await expect(eraser.eraseObjectExcept(key,"barrier")).rejects.toMatchObject({code:"erasure_inventory"});
+ expect(deletes).toBe(0);
+});
