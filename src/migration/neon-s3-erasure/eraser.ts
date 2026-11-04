@@ -47,10 +47,17 @@ export interface S3EraserConfig {
   fetch?: typeof fetch;
 }
 
+export interface PreservedVersionEraser {
+  /** Keep the current non-delete barrier version; permanently remove only older versions. */
+  eraseObjectExcept(key: string, preservedVersionId: string): Promise<{ deleted: number; kept: number }>;
+}
+
 interface Version {
   key: string;
   versionId: string;
   lastModified?: number;
+  latest: boolean;
+  deleteMarker: boolean;
 }
 
 /** Split versions into those strictly older than `before` (erasable) and the rest (kept). */
@@ -64,7 +71,7 @@ function cut<T extends { lastModified?: number }>(list: T[], before?: Date): { e
 
 const coded = (code: string, message: string) => Object.assign(new Error(message), { code });
 
-export function createS3Eraser(cfg: S3EraserConfig): Eraser {
+export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser {
   const doFetch = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const url = (key = "") => {
     if (cfg.endpoint) {
@@ -83,8 +90,9 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser {
     return res;
   };
 
-  async function versions(prefix: string): Promise<Version[]> {
+  async function versions(prefix: string, strict = false): Promise<Version[]> {
     const out: Version[] = [];
+    const pages = new Set<string>();
     let keyMarker: string | undefined;
     let versionMarker: string | undefined;
     for (;;) {
@@ -102,11 +110,19 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser {
           const modified = Date.parse(xmlText(el, "LastModified") ?? "");
           // xmlText already decodes entities; decoding again would mangle a literal `&amp;`.
           if (key !== undefined && versionId !== undefined)
-            out.push({ key, versionId, ...(Number.isFinite(modified) ? { lastModified: modified } : {}) });
+            out.push({ key, versionId, latest: xmlText(el, "IsLatest") === "true", deleteMarker: tag === "DeleteMarker", ...(Number.isFinite(modified) ? { lastModified: modified } : {}) });
         }
-      if (xmlText(xml, "IsTruncated") !== "true") return out;
+      const truncated = xmlText(xml, "IsTruncated");
+      if (strict && truncated !== "true" && truncated !== "false") throw coded("erasure_inventory", "version pagination is unproven");
+      if (truncated !== "true") return out;
       keyMarker = xmlText(xml, "NextKeyMarker");
       versionMarker = xmlText(xml, "NextVersionIdMarker");
+      if (strict) {
+        const cursor = JSON.stringify([keyMarker, versionMarker]);
+        if (keyMarker === undefined || versionMarker === undefined || pages.has(cursor) || pages.size >= 100 || out.length > 10000)
+          throw coded("erasure_inventory", "version pagination is incomplete or unbounded");
+        pages.add(cursor);
+      }
       if (keyMarker === undefined) return out;
     }
   }
@@ -125,6 +141,20 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser {
   }
 
   return {
+    eraseObjectExcept: async (key, preservedVersionId) => {
+      if (!preservedVersionId || /[\x00-\x1f\x7f]/u.test(preservedVersionId))
+        throw coded("erasure_preserved_version", "a concrete preserved version is required");
+      const all = (await versions(key, true)).filter((v) => v.key === key);
+      const latest = all.filter((v) => v.latest);
+      if (latest.length !== 1 || latest[0]!.deleteMarker || latest[0]!.versionId !== preservedVersionId)
+        throw coded("erasure_barrier_not_current", "the preserved non-delete barrier must be current");
+      const erase = all.filter((v) => v.versionId !== preservedVersionId);
+      const deleted = await remove(erase);
+      const remaining = (await versions(key, true)).filter((v) => v.key === key);
+      if (remaining.length !== 1 || remaining[0]!.versionId !== preservedVersionId || !remaining[0]!.latest || remaining[0]!.deleteMarker)
+        throw coded("erasure_inventory_changed", "permanent erasure must leave only the verified current barrier");
+      return { deleted, kept: 1 };
+    },
     eraseObject: async (key) => remove((await versions(key)).filter((v) => v.key === key)),
     erasePrefix: async (prefix) => {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");

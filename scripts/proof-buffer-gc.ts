@@ -3,6 +3,7 @@ import pg from "pg";
 import {execFileSync} from "node:child_process";
 import {readFileSync,readdirSync,mkdirSync,writeFileSync} from "node:fs";
 import {join} from "node:path";
+import {generation as schemaGeneration} from "../src/hoopdb/migrate.ts";
 import {createHash,randomUUID} from "node:crypto";
 const out=process.env.BUFFER_GC_PROOF_OUT??"";
 if(process.env.BUFFER_GC_DISPOSABLE!=="1"||!out.startsWith("/home/khaliqgant/relay-briefs/buffer-gc-real-"))throw new Error("disposable_only");
@@ -26,7 +27,8 @@ const sha=(s:string)=>createHash("sha256").update(s).digest("hex");
 const sleep=(ms:number)=>new Promise(r=>setTimeout(r,ms));
 async function rejected(p:Promise<unknown>,code:string){const e=await p.then(()=>null,e=>e);assert(e?.code===code,"expected_"+code)}
 async function check(name:string,work:()=>Promise<void>){stage=name;const t=Date.now();await work();proof.cases.push({name,ms:Date.now()-t,pass:true})}
-async function rpc(name:string,p:unknown){await actor.query("BEGIN");try{await actor.query("SET LOCAL ROLE bulls96_session_ingest");const r=(await actor.query("SELECT sessions.ingest_buffer_gc_"+name+"($1::jsonb) AS r",[JSON.stringify(p)])).rows[0].r;await actor.query("COMMIT");return r}catch(e){await actor.query("ROLLBACK");throw e}}
+const generation=await schemaGeneration();
+async function rpc(name:string,p:unknown){await actor.query("BEGIN");try{await actor.query("SET LOCAL ROLE bulls96_session_ingest");const r=(await actor.query("SELECT sessions.ingest_buffer_gc_"+name+"($1::jsonb) AS r",[JSON.stringify(name==="claim"?{generation,...p as any}:p)])).rows[0].r;await actor.query("COMMIT");return r}catch(e){await actor.query("ROLLBACK");throw e}}
 let serial=0;
 async function fixture(){
  const batch="batch-"+(++serial),claim=randomUUID(),token=randomUUID(),digest=sha(batch),body=sha(token),org="org-"+serial;
@@ -46,6 +48,8 @@ try{
  await db.query(readFileSync(join(root,"supabase/tests/supabase_shim.sql"),"utf8"));
  for(const name of ["session_directory_search_worker","session_token_verifier","session_ingest_roles"])await db.query(readFileSync(join(root,"supabase/bootstrap/"+name+".sql"),"utf8"));
  for(const name of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.query(readFileSync(join(root,"supabase/migrations/"+name),"utf8"));
+ await db.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now())");
+ await db.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status) VALUES('session_directory_search_worker',$1,'pass') ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,status=excluded.status",[generation]);
  await check("prepare expiry after actual outbox lock rolls back child registration",async()=>{
   const f=await fixture();
   await db.query("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()+interval '250 milliseconds' WHERE stage_token=$1",[f.token]);

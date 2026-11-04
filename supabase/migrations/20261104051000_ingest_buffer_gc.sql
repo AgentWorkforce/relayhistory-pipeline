@@ -4,6 +4,7 @@ ALTER TABLE sessions.ingest_stage_intents
  ADD COLUMN gc_lease_token uuid,
  ADD COLUMN gc_lease_until timestamptz,
  ADD COLUMN gc_lease_version bigint,
+ ADD COLUMN gc_generation text CHECK(gc_generation IS NULL OR gc_generation ~ '^[0-9a-f]{64}$'),
  ADD COLUMN gc_checked_at timestamptz,
  ADD COLUMN gc_keep_groups jsonb,
  ADD COLUMN gc_replacement_stage_token uuid REFERENCES sessions.ingest_stage_intents(stage_token) ON DELETE RESTRICT,
@@ -76,9 +77,11 @@ END $kept$;
 CREATE FUNCTION sessions.ingest_buffer_gc_locked(p_stage uuid,p_lease uuid)
 RETURNS sessions.ingest_stage_intents
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $locked$
-DECLARE s sessions.ingest_stage_intents%ROWTYPE;v_user text;v_org text;v_ws text;
+DECLARE s sessions.ingest_stage_intents%ROWTYPE;v_user text;v_org text;v_ws text;v_generation text;
 BEGIN
- SELECT org_id,workspace_id,user_id INTO v_org,v_ws,v_user FROM sessions.ingest_stage_intents WHERE stage_token=p_stage;
+ SELECT org_id,workspace_id,user_id,gc_generation INTO v_org,v_ws,v_user,v_generation FROM sessions.ingest_stage_intents WHERE stage_token=p_stage;
+ IF v_generation IS NULL THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='buffer gc: unknown lease generation';END IF;
+ PERFORM sessions.ingest_require_generation(v_generation);
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='buffer gc: unknown ticket';END IF;
  PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
  PERFORM 1 FROM sessions.ingest_batches WHERE org_id=v_org AND workspace_id=v_ws
@@ -86,7 +89,7 @@ BEGIN
   AND batch_id=(SELECT batch_id FROM sessions.ingest_stage_intents WHERE stage_token=p_stage) FOR UPDATE;
  SELECT * INTO s FROM sessions.ingest_stage_intents WHERE stage_token=p_stage FOR UPDATE;
  IF NOT FOUND OR ROW(s.org_id,s.workspace_id,s.user_id) IS DISTINCT FROM ROW(v_org,v_ws,v_user)
-  OR p_lease IS NULL OR s.gc_lease_token IS DISTINCT FROM p_lease OR s.gc_lease_version IS DISTINCT FROM s.row_version
+  OR s.gc_generation IS DISTINCT FROM v_generation OR p_lease IS NULL OR s.gc_lease_token IS DISTINCT FROM p_lease OR s.gc_lease_version IS DISTINCT FROM s.row_version
   OR s.gc_lease_until IS NULL OR clock_timestamp()>=s.gc_lease_until OR s.cleanup_state='redacted'
  THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='buffer gc: stale lease';END IF;
  RETURN s;
@@ -94,12 +97,16 @@ END $locked$;
 
 CREATE FUNCTION sessions.ingest_buffer_gc_claim(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
-DECLARE v_limit int;candidate record;s sessions.ingest_stage_intents%ROWTYPE;
+DECLARE v_limit int;v_generation text;candidate record;s sessions.ingest_stage_intents%ROWTYPE;
  child sessions.ingest_stage_intents%ROWTYPE;parent sessions.ingest_stage_intents%ROWTYPE;
  v_keep jsonb;v_phase text;v_ticket jsonb;v_tickets jsonb:='[]';v_has_outbox boolean;v_abort boolean;v_token uuid;v_outbox_version bigint;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
- PERFORM sessions.ingest_exact_keys(p,ARRAY['limit']);
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['limit','generation']);
+ v_generation:=sessions.ingest_digest(p->'generation');
+ -- Marker first: metadata operations never wait for it while holding user/table
+ -- locks. The migrator's PENDING update waits for this short operation to finish.
+ PERFORM sessions.ingest_require_generation(v_generation);
  v_limit:=sessions.ingest_bounded(p->'limit',1,100);
  FOR candidate IN SELECT stage_token,org_id,workspace_id,user_id,origin_id,batch_id
   FROM sessions.ingest_stage_intents
@@ -174,7 +181,7 @@ BEGIN
    END IF;
   END IF;
   v_token:=gen_random_uuid();
-  UPDATE sessions.ingest_stage_intents SET gc_lease_token=v_token,gc_lease_until=clock_timestamp()+interval '5 minutes',
+  UPDATE sessions.ingest_stage_intents SET gc_generation=v_generation,gc_lease_token=v_token,gc_lease_until=clock_timestamp()+interval '5 minutes',
    row_version=row_version+1,gc_lease_version=row_version+1,gc_checked_at=clock_timestamp(),gc_keep_groups=v_keep,
    gc_replacement_stage_token=s.gc_replacement_stage_token,gc_outbox_version=v_outbox_version,
    cleanup_state=CASE WHEN v_abort THEN 'retired' ELSE cleanup_state END
@@ -304,6 +311,8 @@ BEGIN
   OR v_barrier='null' OR octet_length(v_barrier) NOT BETWEEN 1 AND 2048 OR v_barrier~'[[:cntrl:]]'
  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='buffer gc: barrier version required';END IF;
  SELECT * INTO s FROM sessions.ingest_stage_intents WHERE stage_token=(p->>'stageToken')::uuid;
+ IF s.gc_generation IS NULL THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='buffer gc: unknown lease generation';END IF;
+ PERFORM sessions.ingest_require_generation(s.gc_generation);
  IF s.cleanup_state='redacted' AND s.gc_lease_token=(p->>'leaseToken')::uuid AND s.gc_barrier_version_id=v_barrier
  THEN RETURN jsonb_build_object('finished',true);END IF;
  s:=sessions.ingest_buffer_gc_locked((p->>'stageToken')::uuid,(p->>'leaseToken')::uuid);

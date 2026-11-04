@@ -59,6 +59,7 @@ export interface IngestWorkerEnv {
   INGEST_INLINE_MAX_SESSIONS?: string;
   INGEST_REPLICA_MODE?: string;
   INGEST_ACCEPTANCE_MODE?: string;
+  INGEST_EXPECT_GENERATION?:string;
 }
 
 interface SecretBinding {
@@ -99,6 +100,7 @@ export interface IngestSettings {
   inlineMaxSessions: number;
   replicaMode: ReplicaMode;
   acceptanceMode: IngestAcceptanceMode;
+  expectedGeneration?:string;
 }
 
 /** The settings, or null while any required one is missing (every request is then 503 not_configured). */
@@ -113,6 +115,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   if (!accessKeyId || !secretAccessKey || !signingKey) return null;
   const acceptanceMode = env.INGEST_ACCEPTANCE_MODE ?? "canonical";
   if (acceptanceMode !== "canonical" && acceptanceMode !== "buffered") throw new Error("session ingest: acceptance mode invalid");
+  if(acceptanceMode==="buffered"&&(!/^[a-f0-9]{64}$/.test(env.INGEST_EXPECT_GENERATION??"")||env.INGEST_KEY_ROOT&&env.INGEST_KEY_ROOT!=="96bulls"))throw new Error("session ingest: buffered generation or prefix invalid");
   const raw = env.INGEST_REPLICA_MODE ?? "off";
   if (!["off", "queue", "required", "best_effort"].includes(raw)) throw new Error("session ingest: INGEST_REPLICA_MODE must be off, queue, required or best_effort");
   const mode: ReplicaMode = raw === "queue" ? "required" : (raw as ReplicaMode);
@@ -131,6 +134,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     maxPerOrg: limit(env.INGEST_MAX_PER_ORG, 32, "INGEST_MAX_PER_ORG"),
     inlineMaxSessions: acceptanceMode === "buffered" ? 0 : limit(env.INGEST_INLINE_MAX_SESSIONS, 40, "INGEST_INLINE_MAX_SESSIONS"),
     acceptanceMode,
+    ...(acceptanceMode==="buffered"?{expectedGeneration:env.INGEST_EXPECT_GENERATION!}:{}),
     replicaMode: mode,
   };
 }
@@ -187,7 +191,7 @@ export default {
     const app = createIngestApp({
       signingKey: settings.signingKey,
       deliver: {
-        ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode}),
+        ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration}),
         acceptanceMode:settings.acceptanceMode,
         target,
         replica,
