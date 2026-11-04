@@ -1,86 +1,122 @@
 /**
- * Canonical feature producer: turns publication-image evidence into the same
- * rows the legacy journal copier emits for the four logical pools
- * (event + brief, keyword + dense). Pure port-driven — no I/O, no live calls.
- * Missing required inputs hard-refuse rather than fabricate.
+ * Canonical feature producer: projects canonical publication-image rows into
+ * the exact FeatureSnapshot contract the legacy journal copier feeds
+ * eventFeatureRow/briefFeatureRow. Reuses the legacy row validators unedited —
+ * row-shape parity is by construction. Authority fields (revision, sourceHash,
+ * version) carry REAL canonical values: a managed version counter initialized
+ * above the last legacy feature clock, and the image's content hash. Nothing is
+ * fabricated; missing inputs hard-refuse via the same EventFeatureError.
+ *
+ * Retirement contract (native 040600): the producer consumes durable
+ * publication + retirement state only — S3 events and old Neon tombstones are
+ * insufficient. Replaced images emit tombstones for their exact prior keyset.
  */
+import {
+  EventFeatureError,
+  eventFeatureRow,
+} from "./event-publisher.ts";
+import {
+  briefFeatureRow,
+} from "./brief-publisher.ts";
+import type { FeatureSnapshot } from "./source.ts";
 
-/** Bounded read port over a canonical publication image. */
-export interface CanonicalImagePort {
-  schemaGeneration(): Promise<string>;
-  imageKey(): Promise<string>;
-  revision(): Promise<bigint>;
-  /** Rows projected from the image in bounded pages. */
-  rows(page: number, size: number): Promise<CanonicalRow[] | null>;
-}
-export interface CanonicalRow {
+/** One projected row from a canonical image page. */
+export interface CanonicalEventRow {
   orgId: string; workspaceId: string; source: string; sessionId: string;
   machineId: string; kind: string; eventId: string; ts: string;
-  userId?: string; actorName?: string; actorRole?: string;
-  projectId?: string; taskTitle?: string; content?: string;
-  taskRefText?: string; tagsJson?: string;
-  embedding?: number[] | null; embeddingModel?: string | null;
-}
-
-/** Injected embedding provider — the 1536/t-e-3-small contract only. */
-export interface EmbeddingPort {
-  embed(inputs: string[]): Promise<number[][]>;
-}
-/** Durable version/outbox port — initialized ABOVE the last legacy clock. */
-export interface VersionPort {
-  current(): Promise<bigint>;
-  next(): Promise<bigint>;
-}
-
-export type ProducerResult =
-  | { kind: "rows"; rows: CanonicalFeatureRow[]; version: bigint }
-  | { kind: "refused"; reason: string };
-
-export interface CanonicalFeatureRow {
-  orgId: string; workspaceId: string; source: string; sessionId: string;
-  machineId: string; kind: string; eventId: string; ts: string;
-  version: bigint; sourceRevision: bigint; sourceHash: string; deleted: number;
   ingestedAt: string; userId: string;
   actorName: string | null; actorRole: string | null;
   projectId: string | null; projectFolded: string | null;
   taskTitle: string | null; taskTitleFolded: string | null;
   content: string | null; contentFolded: string | null;
   taskRefText: string; taskRefTextFolded: string;
-  tagsJson: string;
-  embedding: number[]; embeddingModel: string | null; embeddingDim: number;
+  tags: unknown; embedding: string | null; embeddingModel: string | null;
   contentHash: string | null;
 }
+/** Prior-image keyset entry emitted as a tombstone on replacement/retire. */
+export interface CanonicalTombstone {
+  orgId: string; workspaceId: string; source: string; sessionId: string;
+  machineId: string; kind: string; eventId: string; ts: string;
+}
 
-/** Derive feature rows from one image page; null rows page = end of image. */
-export async function produceEventFeatures(
-  image: CanonicalImagePort,
-  embed: EmbeddingPort,
-  versions: VersionPort,
-): Promise<ProducerResult> {
-  const page = await image.rows(0, 1000);
-  if (page === null) return { kind: "refused", reason: "image_unavailable" };
-  const version = await versions.next();
-  const rows: CanonicalFeatureRow[] = [];
-  for (const r of page) {
-    const embedding = r.embedding ?? null;
-    if (embedding !== null && embedding.length !== 1536)
-      return { kind: "refused", reason: `bad_embedding_dim:${embedding.length}` };
-    rows.push({
+/** Durable managed version counter — initialized ABOVE the last legacy clock. */
+export interface CanonicalVersionPort {
+  /** Revision space shared with the legacy feature clock; strictly increasing. */
+  next(): Promise<string>;
+}
+/** Image identity: schemaGeneration/imageKey/revision + a real content hash. */
+export interface CanonicalImageEvidence {
+  schemaGeneration: string;
+  imageKey: string;
+  revision: string;
+  /** 64-hex lower-case hash over the image's canonical content. */
+  sourceHash: string;
+}
+
+export type CanonicalProduceResult =
+  | { kind: "rows"; rows: Record<string, unknown>[] }
+  | { kind: "refused"; reason: string };
+
+const eventSnapshot = (
+  r: CanonicalEventRow,
+  e: CanonicalImageEvidence,
+): FeatureSnapshot => ({
+  reference: {
+    kind: "event",
+    key: {
       orgId: r.orgId, workspaceId: r.workspaceId, source: r.source,
       sessionId: r.sessionId, machineId: r.machineId, kind: r.kind,
-      eventId: r.eventId, ts: r.ts, version,
-      sourceRevision: await image.revision(), sourceHash: "", deleted: 0,
-      ingestedAt: r.ts, userId: r.userId ?? "",
-      actorName: r.actorName ?? null, actorRole: r.actorRole ?? null,
-      projectId: r.projectId ?? null, projectFolded: null,
-      taskTitle: r.taskTitle ?? null, taskTitleFolded: null,
-      content: r.content ?? null, contentFolded: null,
-      taskRefText: r.taskRefText ?? "", taskRefTextFolded: "",
-      tagsJson: r.tagsJson ?? "[]",
-      embedding: embedding ?? [], embeddingModel: r.embeddingModel ?? null,
-      embeddingDim: embedding?.length ?? 0,
-      contentHash: null,
-    });
+      eventId: r.eventId, ts: r.ts,
+    },
+    revision: e.revision, sourceHash: e.sourceHash, deleted: false,
+  },
+  row: {
+    org_id: r.orgId, workspace_id: r.workspaceId, source: r.source,
+    session_id: r.sessionId, machine_id: r.machineId, kind: r.kind,
+    event_id: r.eventId, ts: r.ts, ingested_at: r.ingestedAt,
+    user_id: r.userId, actor_name: r.actorName, actor_role: r.actorRole,
+    project_id: r.projectId, project_folded: r.projectFolded,
+    task_title: r.taskTitle, task_title_folded: r.taskTitleFolded,
+    content: r.content, content_folded: r.contentFolded,
+    task_ref_text: r.taskRefText, task_ref_text_folded: r.taskRefTextFolded,
+    tags: r.tags, embedding: r.embedding, embedding_model: r.embeddingModel,
+    content_hash: r.contentHash,
+  },
+});
+const tombstoneSnapshot = (
+  t: CanonicalTombstone,
+  e: CanonicalImageEvidence,
+): FeatureSnapshot => ({
+  reference: {
+    kind: "event",
+    key: {
+      orgId: t.orgId, workspaceId: t.workspaceId, source: t.source,
+      sessionId: t.sessionId, machineId: t.machineId, kind: t.kind,
+      eventId: t.eventId, ts: t.ts,
+    },
+    revision: e.revision, sourceHash: e.sourceHash, deleted: true,
+  },
+  row: null,
+});
+
+/** Event-pool rows for one canonical image page + its replaced keyset. */
+export function produceEventFeatures(
+  rows: CanonicalEventRow[],
+  tombstones: CanonicalTombstone[],
+  e: CanonicalImageEvidence,
+): CanonicalProduceResult {
+  try {
+    return {
+      kind: "rows",
+      rows: [
+        ...rows.map((r) => eventFeatureRow(eventSnapshot(r, e), e.revision)),
+        ...tombstones.map((t) =>
+          eventFeatureRow(tombstoneSnapshot(t, e), e.revision)),
+      ],
+    };
+  } catch (err) {
+    if (err instanceof EventFeatureError)
+      return { kind: "refused", reason: err.reason };
+    throw err;
   }
-  return { kind: "rows", rows, version };
 }
