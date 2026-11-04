@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname,join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
@@ -15,7 +15,7 @@ import { sqlLedger } from "../ledger-sql.ts";
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 /** psql meta-commands (\set) are not SQL. */
-const sql = (path: string) => read(path).split("\n").filter((l) => !l.startsWith("\\")).join("\n");
+function sql(path:string):string{return read(path).split("\n").map(line=>line.startsWith("\\ir ")?sql(join(dirname(path),line.slice(4).trim())):line.startsWith("\\")?"":line).join("\n");}
 const ROLE = sql("supabase/bootstrap/session_ingest_role.sql");
 const VERIFY = sql("supabase/bootstrap/session_ingest_role_verify.sql");
 

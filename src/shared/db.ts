@@ -114,6 +114,7 @@ const TOKEN_VERIFIER_VERIFY_SQL = readFileSync(
   fileURLToPath(new URL("../../supabase/bootstrap/session_token_verifier_verify.sql", import.meta.url)),
   "utf8",
 );
+const INGEST_ROLE_VERIFY_SQL = readFileSync(fileURLToPath(new URL("../../supabase/bootstrap/session_ingest_verify.sql",import.meta.url)),"utf8");
 
 /**
  * Live sessions-function boundary, read-only, part of every readiness check: no sessions
@@ -215,6 +216,7 @@ export async function schemaVerdict(
       stage = "verify";
       await tx.query(ROLE_VERIFY_SQL);
       await tx.query(TOKEN_VERIFIER_VERIFY_SQL);
+      await tx.query(INGEST_ROLE_VERIFY_SQL);
       await tx.query(SESSIONS_FUNCTION_GATE_SQL);
       if (opts.afterVerify) await opts.afterVerify(); // test seam: a concurrent flip lands here
       stage = "final";

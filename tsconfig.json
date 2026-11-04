@@ -30,7 +30,9 @@
     "stacks",
     "alchemy.run.ts",
     "smoke",
-    "src/types/*.d.ts"
+    "src/types/*.d.ts",
+    "scripts/proof-buffer-gc.ts",
+    "scripts/sync-ingest-buffer-gc-boundary.ts"
   ],
   "exclude": [
     "node_modules",
