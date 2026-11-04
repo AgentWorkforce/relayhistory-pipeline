@@ -52,7 +52,7 @@ ACK; acknowledged receipts remain metadata inputs for qualified drain.
 
 Org admission has exactly these owner-only fields:
 org_id, privacy_baseline_sha256, retention_contract_sha256, schema_generation,
-valid_until. There is no mode column. The ceremony must prove every frozen-Neon
+valid_until;040520 adds owner-bound control_epoch. There is no mode column. The ceremony must prove every frozen-Neon
 owner packet, seeder ACK, matching compiled PASS and permanent retention evidence.
 Hashes alone do not establish completeness. Close by retained-row UPDATE setting
 valid_until in the past, never DELETE. Close waits producer/control SHARE locks;
@@ -105,3 +105,5 @@ notification/response ownership and backlog coverage remain operator duties.
 Rollback closes retained admission, drains/rejects producers and controls, and
 keeps GC scheduled until every acknowledged/retired object has verified retention
 or erasure evidence. Never disable GC as the first rollback step.
+
+Ordered dual-control epoch/version/digest contract: [ordered-ingest-controls.md](ordered-ingest-controls.md).

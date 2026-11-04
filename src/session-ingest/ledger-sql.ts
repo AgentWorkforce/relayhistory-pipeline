@@ -1,3 +1,4 @@
+import {orderedControl,orderedControlResult} from "./control-protocol.ts";
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 /**
  * The ledger over SQL: one call per claim and per commit, each to its
@@ -166,6 +167,13 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
   if(options.acceptanceMode==="buffered"&&(typeof options.expectedGeneration!=="string"||!/^[a-f0-9]{64}$/.test(options.expectedGeneration)))throw new LedgerUnavailableError("ledger_generation_required");
   const buffered=(input:unknown)=>({...input as Record<string,unknown>,generation:options.expectedGeneration});
   return {
+    async applyOrderedControl(input) {
+      if(options.acceptanceMode!=="buffered")throw new LedgerUnavailableError("ledger_mode_refused");
+      const control=orderedControl(input.control);
+      const fn=control.kind==="selection"?"ingest_set_session_uploads":"ingest_reset_uploaded_sessions";
+      const r=await call(run,fn,buffered(input));
+      try{return orderedControlResult(r,control)}catch{throw new LedgerUnavailableError("ledger_control_ack_refused")}
+    },
     async claim(input: ClaimInput): Promise<ClaimResult> {
       return parseClaimResult((await call(run, options.acceptanceMode === "buffered" ? "ingest_claim_buffered_batch" : "ingest_claim_batch", options.acceptanceMode==="buffered"?buffered(input):input)) as Record<string, unknown>);
     },

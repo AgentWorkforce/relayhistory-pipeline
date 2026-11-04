@@ -1,3 +1,4 @@
+import type {OrderedControl,OrderedControlResult} from "./control-protocol.ts";
 import type { BufferedStageSpec, BufferedStageIntent } from "./buffered-protocol.ts";
 /**
  * The session ingest's Supabase ledger: everything `accept_delivery_batch`
@@ -160,7 +161,12 @@ export interface SelectionInput {
   enabled: boolean;
 }
 
+export type OrderedControlInput =
+ | (SelectionInput & {control:OrderedControl & {kind:"selection"}})
+ | {tenant:LedgerTenant;requestId:string;control:OrderedControl & {kind:"reset"}};
 export interface Ledger {
+  /** Private verified-identity path. Unsupported stores must fail, never fall back. */
+  applyOrderedControl?(input:OrderedControlInput):Promise<OrderedControlResult>;
   claim(input: ClaimInput): Promise<ClaimResult>;
   prepareBufferStage?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & BufferedStageSpec): Promise<BufferedStageIntent>;
   commitBuffered?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & {stageToken:string}): Promise<void>;
