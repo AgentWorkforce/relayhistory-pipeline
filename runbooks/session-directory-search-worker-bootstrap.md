@@ -353,6 +353,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261103090000_session_brief_documents.sql` | table sessions.session_brief_document_outbox |
 | `upstream:20261103080000_session_large_read_jobs.sql` | table sessions.session_large_read_jobs |
 | `upstream:20261103040000_session_replay_pages.sql` | table sessions.session_replay_publications |
+| `upstream:20261103080000_session_large_read_jobs.sql` | table sessions.session_large_read_jobs |
 | `upstream:20261102020000_session_brief_state.sql`              | ALTER-only: column sessions.session_briefs.state                                                                        |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

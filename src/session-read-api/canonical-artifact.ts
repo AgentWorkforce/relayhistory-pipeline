@@ -5,6 +5,7 @@
 export const ARTIFACT_VERSION = 1 as const;
 export const ARTIFACT_TABLES = ["convergence_events", "session_catalog", "session_catalog_agents", "session_relationships", "session_markers", "session_commit_links", "conversation_turns", "session_links", "session_outcomes"] as const;
 export const ARTIFACT_MAX_OBJECT_BYTES = 256 * 1024;
+export const ARTIFACT_MAX_ROW_BYTES = 64 * 1024 * 1024;
 export const ARTIFACT_MAX_ROWS_PER_PAGE = 1000;
 export const ARTIFACT_FANOUT = 128;
 export const ARTIFACT_MAX_DEPTH = 4;

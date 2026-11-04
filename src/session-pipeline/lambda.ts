@@ -139,7 +139,7 @@ export function supabasePool(url: string, max: number): HoopDb {
   };
 }
 
-async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
   const client = await db.pool.connect();
   try {
     await client.query("BEGIN");

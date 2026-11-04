@@ -31,7 +31,7 @@ BEGIN
  available_at=clock_timestamp(),lease_nonce=NULL,lease_expires_at=NULL,attempts=0,last_error=NULL,updated_at=now()
  WHERE j.source_epoch IS DISTINCT FROM excluded.source_epoch OR j.source_fingerprint IS DISTINCT FROM excluded.source_fingerprint
     OR j.state='superseded';
- RETURN jsonb_build_object('enqueued',true,'identity',c->'identity','source',c->'source');
+ RETURN jsonb_build_object('enqueued',true,'changed',FOUND,'identity',c->'identity','source',c->'source');
 END $enqueue$;
 
 CREATE FUNCTION sessions.claim_session_large_read(p_nonce uuid,p_lease_seconds integer DEFAULT 120)
@@ -118,7 +118,7 @@ DECLARE c jsonb;b numeric;n numeric;unknown_count bigint;
 BEGIN
  c:=sessions.capture_session_replay_pages(p_org,p_workspace,p_harness,p_session);
  IF NOT (c->>'exists')::boolean OR (c->>'blocked')::boolean THEN RETURN jsonb_build_object('delegated',false); END IF;
- SELECT coalesce(sum(p.raw_bytes),0),coalesce(sum(p.event_count),0),count(*) FILTER(WHERE p.raw_bytes IS NULL OR p.event_count IS NULL) INTO b,n,unknown_count FROM sessions.session_index p
+ SELECT coalesce(sum(p.raw_bytes),0),coalesce(sum(p.event_count),0),count(*) FILTER(WHERE p.raw_bytes IS NULL OR p.event_count IS NULL OR p.raw_bytes=0 OR p.event_count=0) INTO b,n,unknown_count FROM sessions.session_index p
  WHERE p.org_id=p_org AND p.workspace_id=p_workspace AND p.harness=p_harness
  AND coalesce(p.canonical_session_id,p.session_id)=c->'identity'->>'sessionId' AND p.deleted_at IS NULL;
  -- A conservative selector, not a source validation waiver. The large worker
@@ -141,8 +141,41 @@ GRANT EXECUTE ON FUNCTION sessions.enqueue_session_large_read(text,text,text,tex
 REVOKE ALL ON FUNCTION sessions.route_session_large_read(text,text,text,text) FROM PUBLIC,anon,authenticated,service_role;
 GRANT EXECUTE ON FUNCTION sessions.route_session_large_read(text,text,text,text) TO service_role;
 
+
+-- A durable keyset cursor rotates through every large scope, including after a
+-- missed object event. Bounded pages do not silently strand a later cohort.
+CREATE TABLE sessions.session_large_read_scan(
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),after_identity text[],
+ updated_at timestamptz NOT NULL DEFAULT now(),CHECK(after_identity IS NULL OR cardinality(after_identity)=4)
+);
+INSERT INTO sessions.session_large_read_scan(singleton) VALUES(true);
+ALTER TABLE sessions.session_large_read_scan ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_large_read_scan FROM PUBLIC,anon,authenticated,service_role;
+CREATE FUNCTION sessions.discover_session_large_reads()
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $discover$
+DECLARE cursor_id text[];last_id text[];s record;c jsonb;scanned integer:=0;changed integer:=0;
+BEGIN
+ SELECT after_identity INTO cursor_id FROM sessions.session_large_read_scan WHERE singleton FOR UPDATE SKIP LOCKED;
+ IF NOT FOUND THEN RETURN jsonb_build_object('busy',true,'scanned',0,'changed',0,'cycleComplete',false); END IF;
+ FOR s IN SELECT p.org_id,p.workspace_id,p.harness,coalesce(p.canonical_session_id,p.session_id) canonical_id
+ FROM sessions.session_index p WHERE p.deleted_at IS NULL AND (cursor_id IS NULL OR
+ ROW(p.org_id COLLATE "C",p.workspace_id COLLATE "C",p.harness COLLATE "C",coalesce(p.canonical_session_id,p.session_id) COLLATE "C")>
+ ROW(cursor_id[1] COLLATE "C",cursor_id[2] COLLATE "C",cursor_id[3] COLLATE "C",cursor_id[4] COLLATE "C"))
+ GROUP BY p.org_id,p.workspace_id,p.harness,coalesce(p.canonical_session_id,p.session_id)
+ HAVING bool_or(p.raw_bytes IS NULL OR p.event_count IS NULL OR p.raw_bytes=0 OR p.event_count=0) OR sum(p.raw_bytes)>67108864 OR sum(p.event_count)>100000
+ ORDER BY p.org_id COLLATE "C",p.workspace_id COLLATE "C",p.harness COLLATE "C",coalesce(p.canonical_session_id,p.session_id) COLLATE "C" LIMIT 128 LOOP
+  scanned:=scanned+1;last_id:=ARRAY[s.org_id,s.workspace_id,s.harness,s.canonical_id];
+  c:=sessions.enqueue_session_large_read(s.org_id,s.workspace_id,s.harness,s.canonical_id);
+  IF coalesce((c->>'changed')::boolean,false) THEN changed:=changed+1;END IF;
+ END LOOP;
+ UPDATE sessions.session_large_read_scan SET after_identity=CASE WHEN scanned<128 THEN NULL ELSE last_id END,updated_at=now() WHERE singleton;
+ RETURN jsonb_build_object('busy',false,'scanned',scanned,'changed',changed,'cycleComplete',scanned<128);
+END $discover$;
+REVOKE ALL ON FUNCTION sessions.discover_session_large_reads() FROM PUBLIC,anon,authenticated,service_role;
+GRANT EXECUTE ON FUNCTION sessions.discover_session_large_reads() TO service_role;
+
 DO $acl$ DECLARE f text;g text;BEGIN
- FOREACH f IN ARRAY ARRAY['sessions.enqueue_session_large_read(text,text,text,text)','sessions.claim_session_large_read(uuid,integer)','sessions.heartbeat_session_large_read(text,text,text,text,uuid)','sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)','sessions.retry_session_large_read(text,text,text,text,uuid,text)','sessions.route_session_large_read(text,text,text,text)'] LOOP
+ FOREACH f IN ARRAY ARRAY['sessions.enqueue_session_large_read(text,text,text,text)','sessions.claim_session_large_read(uuid,integer)','sessions.heartbeat_session_large_read(text,text,text,text,uuid)','sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)','sessions.retry_session_large_read(text,text,text,text,uuid,text)','sessions.route_session_large_read(text,text,text,text)','sessions.discover_session_large_reads()'] LOOP
  FOR g IN SELECT r.rolname FROM pg_proc p CROSS JOIN LATERAL aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a JOIN pg_roles r ON r.oid=a.grantee WHERE p.oid=f::regprocedure AND a.grantee<>p.proowner AND r.rolname<>'service_role'
  LOOP EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I',f,g);END LOOP;
  END LOOP;

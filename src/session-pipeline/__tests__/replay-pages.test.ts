@@ -43,3 +43,10 @@ test("actual multi-machine union honors per-origin revision, acceptance order an
  for(const e of await entries(store,index,"convergence_events"))rows.push(await row(store,e));
  expect(rows.length).toBe(5);expect(rows.find(r=>r.delivery_record_id==="event-000000000001")?.content).toBe("last accepted independent source");expect(rows.some(r=>r.delivery_record_id==="event-000000000002")).toBe(false);
 });
+
+test('publisher refuses a row beyond the shared hydrated consumer bound before any artifact write',async()=>{
+ const {ARTIFACT_MAX_ROW_BYTES}=await import('../../session-read-api/canonical-artifact.ts');
+ let writes=0;const forbidden={put:async()=>{writes++;throw Error('unexpected write')}} as unknown as ObjectStore;
+ await expect(materializeCanonicalArtifacts(forbidden,input([{table:'convergence_events',row:{content:'x'.repeat(ARTIFACT_MAX_ROW_BYTES)}}]))).rejects.toMatchObject({code:'artifact_row_bound'});
+ expect(writes).toBe(0);
+});
