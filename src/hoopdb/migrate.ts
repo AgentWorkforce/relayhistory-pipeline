@@ -70,6 +70,7 @@ const INGEST_ROLE_VERIFY = join(ROOT,"supabase/bootstrap/session_ingest_verify.s
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
 // The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
 const WORKER_VERIFY = ROLE_VERIFY_SQL_PATH;
+const INGEST_SEED_VERIFY = join(ROOT,"supabase/bootstrap/session_ingest_seeder_verify.sql");
 const OURS = join(ROOT, "src/hoopdb/migrations");
 
 export const MIGRATION_LEDGER = "sessions.__96bulls_migrations";
@@ -271,6 +272,7 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
             name: "verify:session_token_verifier",
             path: TOKEN_VERIFIER_VERIFY,
           },
+          {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
           {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
         ]
       : []),
@@ -301,6 +303,7 @@ export async function generation(): Promise<string> {
     ...ours.map((f) => ({ name: `96bulls:${f}`, path: join(OURS, f) })),
     { name: "verify:session_directory_search_worker", path: WORKER_VERIFY },
     { name: "verify:session_token_verifier", path: TOKEN_VERIFIER_VERIFY },
+    {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
     {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
   ];
   const parts: string[][] = [];

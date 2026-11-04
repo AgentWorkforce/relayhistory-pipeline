@@ -138,13 +138,36 @@
     "sessions.ingest_revision(jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_seed_close_baseline()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_seed_fence_baseline(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest_seeder:EXECUTE"
+    ],
     "sessions.ingest_seed_fences(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_seed_proven_records(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest_seeder:EXECUTE"
     ],
     "sessions.ingest_seed_records(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_seed_scope_capture(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest_seeder:EXECUTE"
+    ],
+    "sessions.ingest_seed_scope_page(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest_seeder:EXECUTE"
+    ],
+    "sessions.ingest_seed_scope_state(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_seed_source_changed()": [
+      "<owner>:EXECUTE"
     ],
     "sessions.ingest_session_pairs(jsonb)": [
       "<owner>:EXECUTE"

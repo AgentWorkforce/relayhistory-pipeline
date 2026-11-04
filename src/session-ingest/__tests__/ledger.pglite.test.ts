@@ -433,28 +433,13 @@ describe("session ingest ledger", () => {
     await expect(ledger.acquireSlot(req("h8", "user-1", { ttlSeconds: 0 }))).rejects.toMatchObject({ code: "ledger_input_refused" });
   });
 
-  test("seed: only the seeder role, keeps the max, never lowers, equal keeps the stored row", async () => {
-    const db = await database();
-    const ledger = sqlLedger(runAs(db));
-    await land(ledger, claimInput({ records: [rec("r1", 3, "3"), rec("r2", 1, "1")] }));
-    const row = (record_id: string, revision: number, d: string) => ({
-      org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", record_id, revision, revision_id: `${record_id}:seed${revision}`, digest: hex(d),
-      user_id: "user-1", source: "claude", session_id: "s1",
-    });
-    const seed = [row("r1", 2, "a"), row("r2", 1, "b"), row("r2", 4, "c"), row("r3", 1, "d"), row("r3", 2, "e")];
-    const call = (role: string) => runAs(db, role)("SELECT sessions.ingest_seed_records($1::jsonb) AS r", [JSON.stringify(seed)]);
-    await expect(call("bulls96_session_ingest")).rejects.toThrow(/permission denied|caller/);
-    const r = await call("bulls96_session_ingest_seeder");
-    expect(r.rows[0]!.r).toEqual({ upserted: 2 });
-    expect(await revisions(db)).toEqual([
-      { record_id: "r1", revision: 3, revision_id: "r1:r3", digest: hex("3") },
-      { record_id: "r2", revision: 4, revision_id: "r2:seed4", digest: hex("c") },
-      { record_id: "r3", revision: 2, revision_id: "r3:seed2", digest: hex("e") },
-    ]);
-    // Seeding again changes nothing; an equal revision with another digest keeps the row.
-    const again = await runAs(db, "bulls96_session_ingest_seeder")("SELECT sessions.ingest_seed_records($1::jsonb) AS r", [JSON.stringify([row("r3", 2, "f")])]);
-    expect(again.rows[0]!.r).toEqual({ upserted: 0 });
-    expect((await revisions(db))[2]!.digest).toBe(hex("e"));
+  test("retired unproven record seed is denied even to the seeder and cannot alter committed revisions", async () => {
+    const db=await database(),ledger=sqlLedger(runAs(db));
+    await land(ledger,claimInput({records:[rec("r1",3,"3")]}));
+    const before=await revisions(db);
+    for(const role of ["bulls96_session_ingest","bulls96_session_ingest_seeder","service_role"])
+      await expect(runAs(db,role)("SELECT sessions.ingest_seed_records($1::jsonb)",[JSON.stringify([])])).rejects.toMatchObject({code:"42501"});
+    expect(await revisions(db)).toEqual(before);
   });
 
   test("another role is refused even with EXECUTE", async () => {
@@ -551,17 +536,14 @@ describe("deletion, re-enable and reset forget revisions (review High 2)", () =>
     expect(deletions.rows).toEqual([{ source: "claude", session_id: "s-1" }, { source: "codex", session_id: "s-9" }]);
   });
 
-  test("the seed copies Neon's tombstones and forgets the seeded revisions of those sessions", async () => {
-    const db = await database();
-    const seeder = runAs(db, "bulls96_session_ingest_seeder");
-    const row = (record_id: string, session_id: string) => ({ org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", record_id, revision: 1, revision_id: `${record_id}:1`, digest: hex("a"), user_id: "user-1", source: "claude", session_id });
-    await seeder("SELECT sessions.ingest_seed_records($1::jsonb)", [JSON.stringify([row("a", "s-1"), row("b", "s-2")])]);
-    await seeder("SELECT sessions.ingest_seed_fences($1::jsonb)", [JSON.stringify({ deletions: [{ org_id: "org-a", workspace_id: "ws-a", user_id: "user-1", origin_id: "origin-1", source: "claude", session_id: "s-1" }], resets: [{ org_id: "org-a", workspace_id: "ws-a", user_id: "user-1", request_id: "neon-req", deleted: 1 }] })]);
-    expect((await revisions(db)).map((r) => r.record_id)).toEqual(["b"]);
-    expect((await db.query("SELECT count(*)::int AS n FROM sessions.upload_resets")).rows[0]).toEqual({ n: 1 });
-    // The ingest role cannot seed fences.
-    await expect(runAs(db)("SELECT sessions.ingest_seed_fences($1::jsonb)", [JSON.stringify({ deletions: [], resets: [] })])).rejects.toThrow();
+  test("retired bulk fence seed is denied and cannot inject tombstones or reset history",async()=>{
+    const db=await database();
+    for(const role of ["bulls96_session_ingest","bulls96_session_ingest_seeder"])
+      await expect(runAs(db,role)("SELECT sessions.ingest_seed_fences($1::jsonb)",[JSON.stringify({deletions:[],resets:[]})])).rejects.toMatchObject({code:"42501"});
+    expect((await db.query("SELECT count(*)::int AS n FROM sessions.upload_deletions")).rows[0]).toEqual({n:0});
+    expect((await db.query("SELECT count(*)::int AS n FROM sessions.upload_resets")).rows[0]).toEqual({n:0});
   });
+
 });
 
 describe("staged fan-out SQL (review Medium)", () => {
