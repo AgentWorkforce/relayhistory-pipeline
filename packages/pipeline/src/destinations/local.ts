@@ -2,8 +2,10 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { createFsStore } from "@relayhistory/object-store/fs";
-import { objectKey, ObjectStoreError } from "@relayhistory/object-store";
+// As with lib/pipeline/object-layout.ts, this repository typechecks/tests the
+// pipeline before building object-store/dist. Reuse its source implementation.
+import { createFsStore } from "../../../object-store/src/fs.js";
+import { objectKey, ObjectStoreError } from "../../../object-store/src/index.js";
 import {
   assertDestinationLabel,
   DestinationError,

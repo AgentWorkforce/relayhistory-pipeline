@@ -72,7 +72,9 @@ can supply their own destinations without a product-specific routing protocol.
 
 ## Verification
 
-Run from `packages/pipeline` after the root frozen install and object-store build:
+Run from `packages/pipeline` after the root frozen install. Like the existing
+pipeline object-layout facade, the local adapter reuses object-store source;
+generated `object-store/dist` output is not required:
 
 ```sh
 bun run typecheck
