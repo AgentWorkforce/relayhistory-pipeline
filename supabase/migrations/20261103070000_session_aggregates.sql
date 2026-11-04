@@ -12,6 +12,9 @@
 --   tool_commit        (sha, ts, normalized stats, provenance call key)
 -- No content, record payloads, args, or transcript text crosses into Supabase.
 --
+-- Candidates are ALL-TIME for the scope (publication folds the whole canonical
+-- fold, not the caller's window); window semantics live in the read.
+--
 -- Publication is gated: each published batch carries the source epoch and the
 -- union content hash (CAS) it was folded from. session_output/session_activity
 -- return 42501 when the tenant's window has no ready publication — a missing or
@@ -89,7 +92,14 @@ BEGIN
         CASE candidate_type WHEN 'explicit_commit' THEN 0 ELSE 1 END, ts
     )
     SELECT
-      count(*) FILTER (WHERE candidate_type IN ('assistant_message','legacy_turn'))::bigint,
+      (count(*) FILTER (WHERE candidate_type = 'assistant_message')
+       -- Legacy turns count only when their session produced no in-window
+       -- assistant message (the oracle's window-scoped suppression — the fold
+       -- itself is all-time, so this cannot live in deriveCandidates).
+       + count(*) FILTER (WHERE candidate_type = 'legacy_turn' AND NOT EXISTS (
+           SELECT 1 FROM scoped m
+            WHERE m.candidate_type = 'assistant_message'
+              AND m.source = scoped.source AND m.session_id = scoped.session_id)))::bigint,
       (SELECT count(*) FROM commits)::bigint,
       (SELECT COALESCE(sum((stats->>'added')::bigint), 0) FROM commits WHERE stats ? 'added')::bigint,
       (SELECT COALESCE(sum((stats->>'removed')::bigint), 0) FROM commits WHERE stats ? 'removed')::bigint,

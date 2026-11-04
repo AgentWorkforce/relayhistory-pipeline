@@ -35,8 +35,8 @@ const TOOLS = new Set(["exec_command","exec","Bash","bash","shell","run_shell_co
 export function deriveCandidates(
   events: FoldEvent[], turns: LegacyTurn[], links: CommitRecord[], outcomes: CommitRecord[],
 ): CandidateRow[] {
-  // events/turns are the caller's in-window sets; a legacy turn is suppressed
-  // only when its session already produced an in-window assistant message.
+  // Publication is ALL-TIME per scope: turn suppression is applied at read
+  // time in session_output (window-scoped), so every legacy turn is kept here.
   const out: CandidateRow[] = [];
   const messageIds = new Map<string, string>();
   for (const e of events) {
@@ -51,11 +51,9 @@ export function deriveCandidates(
     out.push({ orgId: e.orgId, workspaceId: e.workspaceId, source: e.source, sessionId: e.sessionId,
       type: "assistant_message", dedupKey: key, ts: e.ts });
   }
-  const msgSessions = new Set(out.map(c => `${c.source}:${c.sessionId}`));
   for (const t of turns)
-    if (!msgSessions.has(`${t.source}:${t.sessionId}`))
-      out.push({ orgId: t.orgId, workspaceId: t.workspaceId, source: t.source, sessionId: t.sessionId,
-        type: "legacy_turn", dedupKey: t.id, ts: t.ts });
+    out.push({ orgId: t.orgId, workspaceId: t.workspaceId, source: t.source, sessionId: t.sessionId,
+      type: "legacy_turn", dedupKey: t.id, ts: t.ts });
   for (const c of [...links, ...outcomes])
     out.push({ orgId: c.orgId, workspaceId: c.workspaceId, source: c.source, sessionId: c.sessionId,
       type: "explicit_commit", dedupKey: c.sha.toLowerCase(), ts: c.ts,
