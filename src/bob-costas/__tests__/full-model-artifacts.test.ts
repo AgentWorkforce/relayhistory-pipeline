@@ -31,7 +31,7 @@ test("encrypted intermediate intent always precedes PUT and binds original captu
 test("both encrypted summary pointers retain same large epoch, source and usage; text never enters SQL",async()=>{
  const f=await fixture(),checkpoint=initialFullModelCheckpoint(fullModelSourceBinding(captured),H);checkpoint.inputComplete=true;checkpoint.units="1";checkpoint.calls="1";
  const result=await prepareFullModelResults(f.d,{checkpoint,model:"fixture-model",builtAt:"2026-11-04T00:00:00Z",signal:AbortSignal.timeout(10000),conclusion:{short:"PRIVATE-SHORT",long:"PRIVATE-LONG",state:"done",stateReason:"observed complete"}});
- expect(result.pointers.map(p=>p.kind)).toEqual(["short","long"]);expect(result.state).toBe("done");expect(f.events).toEqual(["intent","put","intent","put"]);
+ expect(result.pointers.map(p=>p.kind)).toEqual(["short","long"]);expect(result.state).toBeNull();expect(f.events).toEqual(["intent","put","intent","put"]);
  for(const p of result.pointers){expect(p.status).toBe("ready");expect(p.keyId).toBe("hkdf1:k1");expect(JSON.stringify(f.intents.get(p.objectKey!))).not.toContain("PRIVATE");}
 });
 test("empty result has no model text/object writes; uncompleted source refuses",async()=>{

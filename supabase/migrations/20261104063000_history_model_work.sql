@@ -197,7 +197,7 @@ BEGIN
    OR jsonb_array_length(p->'pointers')<>2
    OR (SELECT array_agg(x->>'kind' ORDER BY x->>'kind') FROM jsonb_array_elements(p->'pointers')x)
        IS DISTINCT FROM ARRAY['long','short']::text[]
-   OR p->>'state' NOT IN('active','done','abandoned','unknown') OR p->>'classifiedAt' IS NULL THEN
+   OR NOT(p->'state'='null'::jsonb OR p->>'state' IN('active','done','abandoned','unknown')) OR p->>'classifiedAt' IS NULL THEN
    RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='invalid complete model metadata';END IF;
   locked:=sessions.session_history_source_lock(w.evidence);
   IF locked->>'current' IS DISTINCT FROM 'true' THEN RETURN jsonb_build_object('advanced',false);END IF;
@@ -205,7 +205,7 @@ BEGIN
    IF sessions.session_history_summary_publish(w.evidence||jsonb_build_object('pointer',pointer))->>'applied' IS DISTINCT FROM 'true' THEN
     RAISE EXCEPTION USING ERRCODE='RH063',MESSAGE='model summary authority changed';END IF;
   END LOOP;
-  IF sessions.session_history_state_publish(w.evidence||jsonb_build_object('state',p->>'state','classifiedAt',p->>'classifiedAt'))->>'applied' IS DISTINCT FROM 'true' THEN
+  IF p->'state'<>'null'::jsonb AND sessions.session_history_state_publish(w.evidence||jsonb_build_object('state',p->>'state','classifiedAt',p->>'classifiedAt'))->>'applied' IS DISTINCT FROM 'true' THEN
    RAISE EXCEPTION USING ERRCODE='RH063',MESSAGE='model state authority changed';END IF;
  END IF;
  UPDATE sessions.history_model_work SET checkpoint=p->'next',checkpoint_version=checkpoint_version+1,

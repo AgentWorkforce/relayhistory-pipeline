@@ -44,7 +44,7 @@ export async function heartbeatFullModelWork(db:SqlExecutor,t:FullModelTicket):P
  return r.renewed;
 }
 export async function checkpointFullModelWork(db:SqlExecutor,t:FullModelTicket,next:FullModelCheckpoint,done?:{
- pointers:HistorySummaryPointer[];state:"active"|"done"|"abandoned"|"unknown";classifiedAt:string;
+ pointers:HistorySummaryPointer[];state:"active"|"done"|"abandoned"|"unknown"|null;classifiedAt:string;
 }):Promise<boolean>{
  validateFullModelCheckpoint(next,fullModelSourceBinding(t.captured),t.config.protocolSha256);
  const r=await rpc(db,"checkpoint",{...lease(t),next,done:!!done,...done});

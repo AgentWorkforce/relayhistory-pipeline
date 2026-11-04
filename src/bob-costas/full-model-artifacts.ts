@@ -46,7 +46,7 @@ export function modelArtifactPorts(d:ModelArtifactDeps){
  * FINAL wall-clock expiry check. Empty input never fabricates summary text. */
 export async function prepareFullModelResults(d:ModelArtifactDeps,args:{
  conclusion:FullModelConclusion|null;checkpoint:FullModelCheckpoint;model:string;builtAt:string;signal:AbortSignal;
-}):Promise<{pointers:HistorySummaryPointer[];state:"active"|"done"|"abandoned"|"unknown";classifiedAt:string}>{
+}):Promise<{pointers:HistorySummaryPointer[];state:null;classifiedAt:string}>{
  if(!Number.isFinite(Date.parse(args.builtAt))||args.checkpoint.sourceBinding!==fullModelSourceBinding(d.captured)||args.checkpoint.configSha256!==d.configSha256||!args.checkpoint.inputComplete)throw Error("model_result_binding");
  const ids={orgId:d.captured.identity.orgId,workspaceId:d.captured.identity.workspaceId},pointers:HistorySummaryPointer[]=[];
  for(const kind of ["short","long"] as const){
@@ -65,5 +65,8 @@ export async function prepareFullModelResults(d:ModelArtifactDeps,args:{
   pointers.push({kind,status:"ready",objectKey:prepared.key,objectSha256:prepared.sha256,objectBytes:prepared.bytes,keyId:prepared.keyId,model:args.model,builtAt:args.builtAt});
  }
  args.signal.throwIfAborted();
- return {pointers,state:args.conclusion?.state??"unknown",classifiedAt:args.builtAt};
+ // Evidence-only model state is retained encrypted in the long object. No
+ // logical closed/endedAt policy is attested yet, so this cannot change the
+ // authoritative Referee state from a physical-carrier or model guess.
+ return {pointers,state:null,classifiedAt:args.builtAt};
 }
