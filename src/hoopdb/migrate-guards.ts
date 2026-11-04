@@ -182,7 +182,12 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
   "sessions.session_index_batch(jsonb)",
   "sessions.session_index_scrub_sticky()",
+  "sessions.session_publication_is_managed(text,text,text,text,text)",
+  "sessions.session_publication_lock(jsonb)",
+  "sessions.session_publication_probe(jsonb)",
+  "sessions.session_publication_register_object(jsonb)",
   "sessions.set_session_state(text,text,text,text,text,text,timestamp with time zone)",
+  "sessions.set_session_state_for_publication(text,text,text,text,text,text,bigint,text,timestamp with time zone,text)",
   "sessions.upsert_machine(text,text,text,text,text,text,timestamp with time zone)",
   "sessions.upsert_session_index(jsonb)",
 ] as const;
@@ -1065,7 +1070,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "8fd3f8093d5f862b951277f5da921ed61435949ea61d284b56ac39c41714d142";
+  "41359cbc4ef669435d885f2e3d7ef1f76ac6d95c82d858b40213c1c9ddd7a439";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

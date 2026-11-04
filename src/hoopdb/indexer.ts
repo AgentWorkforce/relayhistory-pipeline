@@ -16,6 +16,9 @@ import { log } from "../shared/log.ts";
 import { indexerReconcileRoot } from "./reconcile-root.ts";
 import { runWorker } from "../shared/worker.ts";
 import { hoopDbSessionIndex } from "./index.ts";
+import {expectedSchema}from "./migrate.ts";
+import {inTransaction}from "../shared/db.ts";
+const publicationSchema=await expectedSchema();
 import {
   backfillActivationHandler,
   backfillActivationLimits,
@@ -40,6 +43,9 @@ await runWorker({
       reader: lockerManifestReader(),
       queue: postgresPipelineQueue(db),
       current,
+      publication:{schemaGeneration:publicationSchema.generation,transact:work=>inTransaction(db,async tx=>{
+        await tx.query("SET LOCAL statement_timeout='5s';SET LOCAL lock_timeout='1s'");return work(tx);
+      })},
     }),
   }),
   handlers: (db, current) => ({
