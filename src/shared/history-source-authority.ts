@@ -89,3 +89,17 @@ export async function readHistorySummary(db:SqlExecutor,captured:HistorySourceRe
  if(r.pointer?.kind!==kind)no("history_summary_pointer");
  return r.pointer as HistorySummaryPointer;
 }
+
+/** Artifact namespace is server-derived and shared by the existing materializer. */
+export function historyReplayPrefix(captured:HistorySourceReference,generation:string):string{
+ if(!HEX.test(generation)||!captured.derivedAnchorKey.endsWith("/manifest.json"))no("history_artifact_generation");
+ return captured.derivedAnchorKey.slice(0,-"manifest.json".length)+"derived/replay/"+generation+"/";
+}
+export async function registerHistoryArtifactObject(db:SqlExecutor,captured:HistorySourceReference,spec:{key:string;sha256:string;bytes:number}):Promise<void>{
+ if((await result(db,"register_artifact",{...evidence(captured),...spec})).registered!==true)no("history_artifact_registration");
+}
+export async function publishHistoryReplay(db:SqlExecutor,captured:HistorySourceReference,parameters:unknown[],largeLease:string|null=null):Promise<boolean>{
+ const r=await db.query<{result:boolean}>("SELECT sessions.session_history_replay_publish($1::jsonb) AS result",[JSON.stringify({...evidence(captured),parameters,largeLease})]);
+ if(r.rows.length!==1||typeof r.rows[0]?.result!=="boolean")no("history_replay_publish");
+ return r.rows[0].result;
+}

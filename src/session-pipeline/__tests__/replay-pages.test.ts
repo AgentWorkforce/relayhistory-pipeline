@@ -52,3 +52,35 @@ test('publisher refuses a row beyond the shared hydrated consumer bound before a
 });
 
 test("actual materializer preserves public persisted-source order after canonical turn attribution",async()=>{const s=await storage(),small="00000000-0000-4000-8000-000000000001",large="ffffffff-ffff-4fff-8fff-ffffffffffff",turnRow=(id:string,stored:string)=>({table:"conversation_turns",row:{org_id:identity.orgId,workspace_id:identity.workspaceId,source:identity.source,session_id:identity.sessionId,id,legacy_stored_source:stored,turn_index:0,session_owner:"owner",content:"kept",role:"assistant",actor_name:"actor",actor_role:"assistant",metadata:{nativeCli:"claude"},ts:"2026-11-01T00:00:00.000001Z"}}),made=await materializeCanonicalArtifacts(s,{identity,source:{epoch:"1",fingerprint:"b".repeat(64)},generation:"d".repeat(64),prefix:"fixture/",rows:[turnRow(small,"z-label"),turnRow(large,"a-label")],legacyCoverage:null});const all=await entries(s,made.document,"conversation_turns");expect((await Promise.all(all.map(e=>row(s,e)))).map(r=>r.id)).toEqual([large,small]);expect((await Promise.all(all.map(e=>row(s,e)))).map(r=>r.legacy_stored_source)).toEqual(["a-label","z-label"])});
+
+test("managed replay requires exact mask, registers graph before PUT and publishes only qualified namespace",async()=>{
+ const x=await replayDatabase();dbs.push(x);const store=await storage();
+ await exportReplayFixture(store,x.db,1,1,[{kind:"session_event",origin_id:"moved-origin",record_id:"moved-native",revision:"1",accepted_seq:"2",operation:"upsert",received_at:"2026-11-01T10:00:00Z",payload:{text:"must stay hidden",role:"assistant",ts_ms:Date.parse("2026-11-01T10:00:00Z")}}]);
+ const {generation}=await import("../../hoopdb/migrate.ts"),{captureHistorySource,readHistoryReplayDescriptor,publishHistoryReplay}=await import("../../shared/history-source-authority.ts");
+ const gen=await generation(),id="12345678-1234-1234-1234-123456789abc",scope={orgId:identity.orgId,workspaceId:identity.workspaceId,harness:identity.source,sessionId:identity.sessionId};
+ await x.pg.exec("SET ROLE bulls96_session_ingest");
+ const mask=(await x.db.query<any>("SELECT sessions.ingest_history_mask_register($1::jsonb) r",[JSON.stringify({generation:gen,document:{protocol:"history-mask-v1",orgId:identity.orgId,workspaceId:identity.workspaceId,prefix:"",kind:"leaf",count:"1",items:[{recordId:"moved-native",winner:null}]}})])).rows[0].r;
+ await x.pg.exec("RESET ROLE");
+ const anchor="96bulls/org_replay/upload-generations/g="+id+"/v1/ws=ws_replay/m=history_scope/h=claude/d=2026/11/01/s=logical/publications/"+id+"/manifest.json";
+ await x.db.query("INSERT INTO sessions.ingest_history_scope_versions(authority_id,org_id,workspace_id,harness,session_id,source_epoch,mask_sha256,record_count,derived_anchor_key,bucket,region,key_root,state,pointer_snapshot_sha256) SELECT $1,org_id,workspace_id,harness,session_id,epoch,$2,1,$3,'replay-fixture','us-east-1','96bulls','ready',repeat('a',64) FROM sessions.session_replay_publications WHERE org_id=$4",[id,mask.sha256,anchor,identity.orgId]);
+ await x.db.query("INSERT INTO sessions.ingest_history_scope_current VALUES($1,$2,$3,$4,$5,true)",[identity.orgId,identity.workspaceId,identity.source,identity.sessionId,id]);
+ await x.db.query("UPDATE sessions.ingest_history_scope_versions SET source_fingerprint=encode(sha256(convert_to(sessions.session_replay_source_snapshot(org_id,workspace_id,harness,session_id)::text,'UTF8')),'hex') WHERE authority_id=$1",[id]);
+ const history=await captureHistorySource(x.db,identity,{schemaGeneration:gen}),deps={db:x.db,store,provider:"s3",bucket:"replay-fixture",prefix:{PIPELINE_KEY_PREFIX:"96bulls",PIPELINE_ORG_FROM_PREFIX:"true"}};
+ await expect(produceCanonicalReplay(scope,deps)).rejects.toMatchObject({code:"artifact_history_authority_required"});
+ const cap=(await x.db.query<any>("SELECT sessions.capture_session_replay_pages($1,$2,$3,$4) c",[identity.orgId,identity.workspaceId,identity.source,identity.sessionId])).rows[0].c;
+ const forgedGeneration="f".repeat(64),forgedHash="e".repeat(64),forgedPrefix=anchor.slice(0,-"manifest.json".length)+"derived/replay/"+forgedGeneration+"/";
+ expect(await publishHistoryReplay(x.db,history,[identity.orgId,identity.workspaceId,identity.source,identity.sessionId,history.source.epoch,history.source.fingerprint,JSON.stringify(cap.snapshot),forgedGeneration,"d".repeat(64),forgedPrefix,forgedPrefix+forgedHash+".json",forgedHash,100])).toBe(false);
+
+ let checked=0;
+ const registered=new Proxy(store,{get(target,key){if(key==="put")return async(k:any,b:any,o:any)=>{
+   const rows=(await x.db.query("SELECT object_key FROM sessions.ingest_history_derived_objects WHERE object_key=$1 AND cleanup_state='live'",[String(k)])).rows;
+   expect(rows.length).toBe(1);checked++;return target.put(k,b,o);
+ };const value=Reflect.get(target,key);return typeof value==="function"?value.bind(target):value}});
+ const result=await produceCanonicalReplay(scope,{...deps,history,store:registered});
+ expect(result.published).toBe(true);expect(result.rows).toBe(1);expect(checked).toBeGreaterThan(0);expect(result.publication!.prefix).toContain("/derived/replay/");
+ expect(await readHistoryReplayDescriptor(x.db,history)).toEqual(result.publication!);
+ const doc=JSON.parse(new TextDecoder().decode(await read(store,result.publication!.index)));
+ expect((await entries(store,doc,"convergence_events")).length).toBe(1);
+ const old=(await x.db.query<any>("SELECT sessions.publish_session_replay_pages($1,$2,$3,$4,$5::bigint,$6,$7::jsonb,$8,$9,$10,$11,$12,$13::integer) ok",[identity.orgId,identity.workspaceId,identity.source,identity.sessionId,history.source.epoch,history.source.fingerprint,"{}",result.publication!.generation,"c".repeat(64),result.publication!.prefix,result.publication!.index.key,result.publication!.index.sha256,result.publication!.index.bytes])).rows[0].ok;
+ expect(old).toBe(false);
+});
