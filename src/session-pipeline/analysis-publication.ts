@@ -24,7 +24,7 @@ export async function buildSessionAnalysisArtifacts(store:ObjectStore,identity:A
  const snapshotSha256=artifactDigest(payloadBytes),generation=analysisArtifactGeneration(identity,source,snapshot,snapshotSha256);
  const items=snapshot.payload.outcome==="ok"?[snapshot.payload.requests,snapshot.payload.analyses]:[[],[]];
  const rows=items.flatMap((items,n)=>items.map((payload,ordinal)=>({table:ANALYSIS_ARTIFACT_TABLES[n]!,row:{org_id:identity.orgId,workspace_id:identity.workspaceId,source:identity.source,session_id:identity.sessionId,ordinal,payload}})));
- const graph=await materializeCanonicalArtifacts(store,{identity,generation,source,prefix,rows,legacyCoverage:null});
+ const graph=await materializeCanonicalArtifacts(store,{identity,generation,source,prefix,rows,additionalTables:ANALYSIS_ARTIFACT_TABLES,legacyCoverage:null});
  const document:SessionAnalysisIndex={version:1,kind:"session-analysis-index",codec:"canonical-analysis-graph-v1",projection:"read_session_analysis_v1/0031",outcome:snapshot.payload.outcome,identity,source,generation,snapshotAt:snapshot.snapshotAt,snapshotId:snapshot.snapshotId,snapshotSha256,graph:graph.index,counts:{requests:items[0]!.length,analyses:items[1]!.length}};
  const bytes=new TextEncoder().encode(JSON.stringify(document)),sha256=artifactDigest(bytes),key=prefix+sha256+".json";
  if(bytes.length>ARTIFACT_MAX_OBJECT_BYTES)refuse("analysis_index_bound");

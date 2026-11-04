@@ -13,3 +13,15 @@ test("numeric history ordinals preserve actual SQL ordering across double digit 
 test("wrapper read-back digest is verified after all graph objects were verified",async()=>{const base=await store(),wrapped=new Proxy(base,{get(target,key){if(key==="get")return async(k:any)=>{const bytes=await readAll(await target.get(k));try{if(JSON.parse(new TextDecoder().decode(bytes)).kind==="session-analysis-index")bytes[0]^=1}catch{}return new Blob([bytes]).stream()};const v=Reflect.get(target,key,target);return typeof v==="function"?v.bind(target):v}}) as ObjectStore;await expect(buildSessionAnalysisArtifacts(wrapped,identity,source,"fixture/",snapshot)).rejects.toMatchObject({code:"analysis_write_verification_failed"})});
 
 test("aggregate public response above16MiB refuses before any object write",async()=>{const base=await store();let writes=0;const wrapped=new Proxy(base,{get(target,key){if(key==="put")return (...args:any[])=>{writes++;return (target.put as any)(...args)};const v=Reflect.get(target,key,target);return typeof v==="function"?v.bind(target):v}}) as ObjectStore;for(const contentBytes of [17*1024*1024,16*1024*1024-32*1024])await expect(buildSessionAnalysisArtifacts(wrapped,identity,source,"fixture/",{...snapshot,payload:{outcome:"ok",sessionId:identity.sessionId,requests:[],analyses:[{id:"large",result:{content:"x".repeat(contentBytes)}}]}})).rejects.toMatchObject({code:"analysis_response_bound"});expect(writes).toBe(0)});
+
+test.each([
+ ["empty",{outcome:"ok",sessionId:identity.sessionId,requests:[],analyses:[]}],
+ ["request-only",{outcome:"ok",sessionId:identity.sessionId,requests:[{id:"00000000-0000-4000-8000-000000000001",sessionId:identity.sessionId,analysisId:null,status:"queued"}],analyses:[]}],
+ ["not-found",{outcome:"not_found"}],
+] as const)("%s snapshot declares both protocol tables, including zero-row views",async(_label,payload)=>{
+ const s=await store(),made=await buildSessionAnalysisArtifacts(s,identity,source,"fixture/",{...snapshot,payload} as SessionAnalysisSnapshot),graph=await json(s,made.document.graph.key);
+ for(const [name,count] of [["session_analysis_requests",payload.outcome==="ok"?payload.requests.length:0],["session_analyses",0]] as const){
+  expect(graph.tables[name]?.raw?.count).toBe(count);
+  if(count===0)expect(graph.tables[name].raw.root).toBeNull();
+ }
+});

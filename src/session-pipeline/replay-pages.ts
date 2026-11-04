@@ -39,6 +39,8 @@ export function compareArtifactRows(a: ArtifactRow, b: ArtifactRow): number {
 }
 export interface MaterializeInput {
   identity: ArtifactIdentity; generation: string; source: ArtifactSource; prefix: string;
+  /** Declare empty protocol tables explicitly; missing views remain invalid. */
+  additionalTables?: readonly string[];
   rows: ArtifactRow[]; legacyCoverage: ArtifactIndex["legacyCoverage"];
 }
 export interface MaterializeResult { index: ArtifactRef; document: ArtifactIndex; objects: number; bytes: number }
@@ -151,7 +153,7 @@ export async function materializeCanonicalArtifacts(store: ObjectStore, input: M
   for (const item of input.rows) {
     const group = groups.get(item.table) ?? []; group.push(item); groups.set(item.table, group);
   }
-  for (const table of ARTIFACT_TABLES) if (!groups.has(table)) groups.set(table, []);
+  for (const table of [...ARTIFACT_TABLES, ...(input.additionalTables ?? [])]) if (!groups.has(table)) groups.set(table, []);
   const tables: ArtifactIndex["tables"] = {};
   for (const [table, items] of [...groups].sort(([a], [b]) => textCompare(a, b))) {
     items.sort(compareArtifactRows); tables[table] = {};
