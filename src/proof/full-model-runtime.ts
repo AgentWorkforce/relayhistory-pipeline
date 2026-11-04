@@ -16,7 +16,7 @@ import{exportReplayFixture,REPLAY_FIXTURE_IDENTITY as identity}from"../session-p
 import{createS3Store,type ObjectStore}from"../../packages/object-store/src/index.ts";
 import{signRequest}from"../../packages/object-store/src/sigv4.ts";
 import{sha256Hex}from"../../packages/object-store/src/crypto.ts";
-import{captureHistorySource,readHistorySummary}from"../shared/history-source-authority.ts";
+import{captureHistorySource,captureHistorySourceReference,readHistorySummary}from"../shared/history-source-authority.ts";
 import{sqlHistoryMaskStore,updateHistoryMask}from"../shared/history-mask.ts";
 import{historyRecordContentSha256}from"../shared/history-visibility.ts";
 import{produceCanonicalReplay}from"../session-pipeline/replay-publication.ts";
@@ -145,7 +145,9 @@ try{
  const {enqueueFullModelWork,modelWorkConfig}=await import("../bob-costas/full-model-ledger.ts");
  const modelPool=new pg.Pool({host:"127.0.0.1",port,user:"bulls96_session_model",database:"postgres",connectionTimeoutMillis:1000,max:1});pools.push(modelPool);
  const modelDb={query:async<T>(q:string,p?:unknown[])=>({rows:(await modelPool.query(q,p)).rows as T[]})};
- await enqueueFullModelWork(modelDb,history,modelWorkConfig("fixture-refusal","hkdf1:fixture",graph.publication!));
+ const compact=await captureHistorySourceReference(modelDb,identity,{schemaGeneration:gen});
+ const key=await keyring.currentKey({orgId:identity.orgId,workspaceId:identity.workspaceId});
+ await enqueueFullModelWork(modelDb,compact,modelWorkConfig("fixture-refusal",key.keyId,graph.publication!));
  providerMode="refusal";proof.packagedInvocations++;
  const refused=await api({...env,BOB_COSTAS_MODEL:"fixture-refusal"},()=>300000,overrides);
  assert.equal(refused.failed,1);assert.equal(refused.completed,0);
