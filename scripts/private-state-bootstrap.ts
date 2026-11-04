@@ -1064,7 +1064,10 @@ export async function runStateBootstrap(options: {
   }
 }
 const PREFIX = "docs/plans/cf-state-bootstrap-96bulls";
-export async function captureStateBootstrap(argv = process.argv.slice(2)) {
+export async function captureStateBootstrap(
+  argv = process.argv.slice(2),
+  onePasswordPort: OnePasswordPort = runOnePassword,
+) {
   const mode = argv[0];
   if (
     argv[1] !== "--expected-sha" ||
@@ -1156,7 +1159,11 @@ export async function captureStateBootstrap(argv = process.argv.slice(2)) {
       argv[4],
     );
     recheckSource();
-    const reserved = await prepareOnePasswordSink(spec, captured.generation);
+    const reserved = await prepareOnePasswordSink(
+      spec,
+      captured.generation,
+      onePasswordPort,
+    );
     return await runStateBootstrap({
       mode: "create",
       spec,
