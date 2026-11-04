@@ -31,6 +31,7 @@ CREATE TABLE sessions.session_aggregate_publications (
   superseded_by bigint REFERENCES sessions.session_aggregate_publications(id)
 );
 CREATE TABLE sessions.session_aggregate_candidates (
+  id bigint GENERATED ALWAYS AS IDENTITY,
   org_id text NOT NULL,
   workspace_id text NOT NULL,
   source text NOT NULL,
@@ -45,8 +46,14 @@ CREATE TABLE sessions.session_aggregate_candidates (
   provenance jsonb NOT NULL DEFAULT '{}'::jsonb,
   publication_id bigint NOT NULL
     REFERENCES sessions.session_aggregate_publications(id) ON DELETE CASCADE,
-  PRIMARY KEY (publication_id, candidate_type, dedup_key)
+  PRIMARY KEY (id)
 );
+-- Message and turn rows dedup by their dedup key; commit candidates pool every
+-- row per sha (the read's GROUP sha min(ts)/max stats needs link+outcome+tool
+-- rows for the same sha to all arrive).
+CREATE UNIQUE INDEX session_aggregate_candidates_message_dedup
+  ON sessions.session_aggregate_candidates (publication_id, candidate_type, dedup_key)
+  WHERE candidate_type IN ('assistant_message', 'legacy_turn');
 
 CREATE INDEX session_aggregate_candidates_scope
   ON sessions.session_aggregate_candidates (org_id, workspace_id, ts);

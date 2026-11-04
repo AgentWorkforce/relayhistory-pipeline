@@ -4,7 +4,7 @@
  * supersedes the prior ones for the same scope, so reads see exactly one ready
  * set — staged rows from a non-ready publication stay invisible.
  */
-import type { SqlQuery, TenantRunner } from "./liveness.ts";
+import type { SqlQuery } from "./liveness.ts";
 import type { CandidateRow } from "./aggregate-fold.ts";
 
 export interface PublicationInput {
@@ -13,10 +13,12 @@ export interface PublicationInput {
   candidates: CandidateRow[];
 }
 
+// The writer runs on a writable connection (the pipeline publish lane), never
+// the read-only tenant runner — org/workspace scope lives in the row values.
 export async function publishAggregates(
-  run: TenantRunner, input: PublicationInput,
+  q: SqlQuery, input: PublicationInput,
 ): Promise<{ publicationId: number; rows: number }> {
-  return run(input.orgId, input.workspaceId, async (q: SqlQuery) => {
+  return (async () => {
     const pub = await q.query<{ id: string }>(
       `INSERT INTO sessions.session_aggregate_publications
          (org_id, workspace_id, source_epoch, union_cas, ready)
@@ -28,7 +30,7 @@ export async function publishAggregates(
         `INSERT INTO sessions.session_aggregate_candidates
            (org_id, workspace_id, source, session_id, candidate_type, dedup_key, ts, stats, provenance, publication_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-         ON CONFLICT (publication_id, candidate_type, dedup_key) DO NOTHING`,
+         ON CONFLICT DO NOTHING`,
         [input.orgId, input.workspaceId, c.source, c.sessionId, c.type,
          c.dedupKey, c.ts, JSON.stringify(c.stats ?? {}), JSON.stringify(c.provenance ?? {}), id]);
     // Fence: a publication goes ready only while the fold's CAS is still the
@@ -46,5 +48,5 @@ export async function publishAggregates(
     await q.query(
       `UPDATE sessions.session_aggregate_publications SET ready=true WHERE id=$1`, [id]);
     return { publicationId: id, rows: input.candidates.length };
-  });
+  })();
 }
