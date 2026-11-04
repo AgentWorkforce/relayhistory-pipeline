@@ -82,11 +82,6 @@
       "sha256": "06addaf7b8a1d5f4d8ce30e9ebefe4ecfd2941b560bddf2c568bda772ee28dee"
     },
     {
-      "name": "upstream:20261102010000_session_ingest_ledger.sql",
-      "path": "supabase/migrations/20261102010000_session_ingest_ledger.sql",
-      "sha256": "21a0be7dc69afa7d3b1d1b27e31fee9778c1a6a0c3b20246e3029fa2f1356fa6"
-    },
-    {
       "name": "upstream:20261102020000_session_brief_state.sql",
       "path": "supabase/migrations/20261102020000_session_brief_state.sql",
       "sha256": "5bd8f34617393742968fa2018d04a64e0f3838a6afb4a65d14537986d8be7d87"
