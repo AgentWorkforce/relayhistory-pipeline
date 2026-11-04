@@ -134,17 +134,23 @@ describe("session ingest roles: provisioned by the bootstrap, verified by the mi
     expect(error?.message).toContain("bulls96_session_ingest");
   });
 
-  test("an elevated or member role fails it closed, 55000; the bootstrap is idempotent and never alters a role", async () => {
+  test("an elevated role fails the migration closed, 55000", async () => {
     const elevated = await upTo(async (db) => {
       await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
       await db.exec("ALTER ROLE bulls96_session_ingest_seeder INHERIT");
     });
     expect(elevated.error?.code).toBe("55000");
+  });
+
+  test("a member role fails the migration closed, 55000", async () => {
     const member = await upTo(async (db) => {
       await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
       await db.exec("GRANT service_role TO bulls96_session_ingest");
     });
     expect(member.error?.code).toBe("55000");
+  });
+
+  test("the bootstrap is idempotent and refuses to alter an elevated existing role", async () => {
     const ok = await upTo(async (db) => {
       await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
       await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
