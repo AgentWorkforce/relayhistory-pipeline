@@ -105,7 +105,8 @@ try{
   res.writeHead(200,{"content-type":"application/json"});res.end(JSON.stringify({status:"completed",model:"fixture-model-v1",usage:{input_tokens:100,output_tokens:20},output}));
  });
  await new Promise<void>(r=>provider!.listen(0,"127.0.0.1",r));const providerUrl="http://127.0.0.1:"+(provider.address()as any).port;
- const api=(await import(pathToFileURL(bundle).href)).runFullModelJob;
+ const actualJob=(await import(pathToFileURL(bundle).href)).runFullModelJob;
+ const api=async(...args:any[])=>{proof.packagedInvocations++;return actualJob(...args)};
  const env={SESSION_FULL_MODEL_ENABLED:"true",BOB_COSTAS_MODEL:"fixture-model",BOB_COSTAS_MODEL_TIMEOUT_MS:"1000",AWS_REGION:region,HOOPDB_DB_MODE:"supabase",PIPELINE_RAW_S3_BUCKET:bucket,SESSION_MODEL_KMS_KEY_ARN:"arn:aws:kms:us-east-1:941433935742:key/11111111-1111-4111-8111-111111111111",SESSION_MODEL_SECRET_ARN:"arn:aws:secretsmanager:us-east-1:941433935742:secret:96bulls/proof/session-model-abcdef",SESSION_MODEL_EXPECT_GENERATION:gen};
  process.env.AWS_ACCESS_KEY_ID="ASIA"+"X".repeat(16);process.env.AWS_SECRET_ACCESS_KEY="synthetic-only";process.env.AWS_SESSION_TOKEN="synthetic-managed-token";
  let crash=true;const jobPools:pg.Pool[]=[];
@@ -126,7 +127,7 @@ try{
  const providerFetch=(async(input:any,init?:RequestInit)=>{assert.equal(String(input),"https://api.openai.com/v1/responses");return fetch(providerUrl,init)})as typeof fetch;
  const overrides={secret:async()=>JSON.stringify({hoopdb_url:"postgres://bulls96_session_model.pyamkrhoyszgzirqqffq:unused@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require",openai_api_key:"owned-fixture-not-live",summary_master_keys:keyText}),
  pool:(c:pg.PoolConfig)=>{assert.equal(c.host,"aws-0-us-east-1.pooler.supabase.com");assert.equal((c.ssl as any).rejectUnauthorized,true);const p=new pg.Pool({host:"127.0.0.1",port,database:"postgres",user:"bulls96_session_model",connectionTimeoutMillis:1000,max:1});jobPools.push(p);return p},fetcher:bridge,providerFetch};
- const run=async()=>{proof.packagedInvocations++;return api(env,()=>300000,overrides)};
+ const run=async()=>api(env,()=>300000,overrides);
  assert.equal((await api({},()=>300000,{secret:async()=>{throw Error("off_io")}})).enabled,false);check("packaged default OFF performs no credential/SQL/provider IO");
  const first=await run();assert.equal(first.failed,1);
  const failed=(await owner.query("SELECT checkpoint,status FROM sessions.history_model_work")).rows[0];assert.equal(failed.status,"pending");assert.equal(failed.checkpoint.calls,"0");assert.equal(failed.checkpoint.cursor.rowOrdinal,"0");
@@ -148,7 +149,7 @@ try{
  const compact=await captureHistorySourceReference(modelDb,identity,{schemaGeneration:gen});
  const key=await keyring.currentKey({orgId:identity.orgId,workspaceId:identity.workspaceId});
  await enqueueFullModelWork(modelDb,compact,modelWorkConfig("fixture-refusal",key.keyId,graph.publication!));
- providerMode="refusal";proof.packagedInvocations++;
+ providerMode="refusal";
  const refused=await api({...env,BOB_COSTAS_MODEL:"fixture-refusal"},()=>300000,overrides);
  assert.equal(refused.failed,1);assert.equal(refused.completed,0);
  const refusal=(await owner.query("SELECT status,last_error_code FROM sessions.history_model_work WHERE config->>'model'='fixture-refusal'")).rows[0];
