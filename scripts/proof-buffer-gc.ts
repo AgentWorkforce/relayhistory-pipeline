@@ -78,6 +78,22 @@ try{
   assert((await db.query("SELECT cleanup_state FROM sessions.ingest_stage_intents WHERE stage_token=$1",[f.token])).rows[0].cleanup_state==="retired","finish_rollback");
   await db.query("DROP TRIGGER gc_proof_delay ON sessions.ingest_stage_intents;DROP FUNCTION sessions.gc_proof_delay()");
  });
+ await check("real PG17 pure phase2 enforces effective privileges and both approved role profiles",async()=>{
+  const verify=readFileSync(join(root,"supabase/bootstrap/session_ingest_verify.sql"),"utf8");
+  await db.query("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC");
+  await db.query(verify);
+  await db.query("GRANT MAINTAIN ON sessions.ingest_stage_intents TO PUBLIC");await rejected(db.query(verify),"55000");
+  await db.query("REVOKE MAINTAIN ON sessions.ingest_stage_intents FROM PUBLIC");
+  await db.query("GRANT SELECT(stage_key) ON sessions.ingest_stage_intents TO PUBLIC");await rejected(db.query(verify),"55000");
+  await db.query("REVOKE SELECT(stage_key) ON sessions.ingest_stage_intents FROM PUBLIC");
+  await db.query("ALTER ROLE bulls96_session_ingest LOGIN");
+  try{
+   await rejected(db.query(verify),"55000");
+   await db.query("ALTER ROLE bulls96_session_ingest SET statement_timeout='5s';ALTER ROLE bulls96_session_ingest SET lock_timeout='2s';ALTER ROLE bulls96_session_ingest SET idle_in_transaction_session_timeout='10s'");
+   await db.query(verify);
+  }finally{await db.query("ALTER ROLE bulls96_session_ingest NOLOGIN;ALTER ROLE bulls96_session_ingest RESET ALL")}
+  await db.query(verify);
+ });
  await sleep(100);
  assert((await monitor.query("SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name='buffer-gc-proof-actor' AND state<>'idle'")).rows[0].n===0,"no_late_active_query");
  assert((await blocker.query("SELECT 1 AS n")).rows[0].n===1,"unrelated_client_preserved");

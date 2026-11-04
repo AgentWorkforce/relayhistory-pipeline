@@ -183,7 +183,7 @@ for(const control of [
 });
 
 async function bufferReceipt(f:Awaited<ReturnType<typeof fixture>>){
- await f.db.exec("ALTER TABLE sessions.ingest_batches ADD COLUMN publication_state text NOT NULL DEFAULT 'canonical' CHECK(publication_state IN('buffered','canonical'))");
+ await f.db.exec("ALTER TABLE sessions.ingest_batches ADD COLUMN IF NOT EXISTS publication_state text NOT NULL DEFAULT 'canonical' CHECK(publication_state IN('buffered','canonical'))");
  await f.db.query("INSERT INTO sessions.ingest_batches(org_id,workspace_id,origin_id,batch_id,user_id,digest,receipt_id,state,publication_state) VALUES($1,$2,'origin-1','buffered-receipt',$3,repeat('c',64),'rhr_'||repeat('d',64),'pending','buffered')",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
 }
 test("trusted buffered receipt leaves historical proof open, but explicit canonical admission closes it",async()=>{

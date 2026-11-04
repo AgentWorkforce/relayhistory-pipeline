@@ -115,3 +115,36 @@ test("malformed cross-session and duplicate ordinals never permit dropping an ac
   await expect(f.rpc("claim",{limit:10})).rejects.toMatchObject({code:"55000"});
  }
 });
+
+test("pure ingest phase2 accepts bare/profiled roles by OID and rejects effective PUBLIC/MAINTAIN/column drift",async()=>{
+ const f=await fixture(),verify=readFileSync(join(root,"supabase/bootstrap/session_ingest_verify.sql"),"utf8");
+ await f.db.exec("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC;SET search_path=sessions,public");
+ await f.db.exec(verify);
+ await f.db.exec("GRANT SELECT(stage_key) ON sessions.ingest_stage_intents TO PUBLIC");
+ await expect(f.db.exec(verify)).rejects.toMatchObject({code:"55000"});
+ await f.db.exec("REVOKE SELECT(stage_key) ON sessions.ingest_stage_intents FROM PUBLIC");
+ if(Number((await f.db.query<{v:string}>("SELECT current_setting('server_version_num') AS v")).rows[0]!.v)>=170000){
+  await f.db.exec("GRANT MAINTAIN ON sessions.ingest_stage_intents TO PUBLIC");
+  await expect(f.db.exec(verify)).rejects.toMatchObject({code:"55000"});
+  await f.db.exec("REVOKE MAINTAIN ON sessions.ingest_stage_intents FROM PUBLIC");
+ }
+ await f.db.exec("ALTER ROLE bulls96_session_ingest LOGIN");
+ await expect(f.db.exec(verify)).rejects.toMatchObject({code:"55000"});
+ await f.db.exec(readFileSync(join(root,"supabase/bootstrap/session_ingest_role.sql"),"utf8").split("\n").filter(l=>!l.startsWith("\\")).join("\n"));
+ await f.db.exec(verify);
+ await f.db.exec("ALTER ROLE bulls96_session_ingest SET statement_timeout='60s'");
+ await expect(f.db.exec(verify)).rejects.toMatchObject({code:"55000"});
+});
+
+test("publisher's shared exclusion lease blocks GC but cannot masquerade as a GC plan",async()=>{
+ const f=await fixture(),s=await f.stage(),token=randomUUID();
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET row_version=row_version+1,gc_lease_version=row_version+1,gc_lease_token=$1,gc_lease_until=clock_timestamp()+interval '5 minutes',gc_keep_groups=NULL WHERE stage_token=$2",[token,s.token]);
+ await f.disable();
+ expect((await f.rpc("claim",{limit:10})).tickets).toEqual([]);
+ const sha=hash("publisher-copy");
+ await expect(f.rpc("prepare",{stageToken:s.token,leaseToken:token,key:s.keyFor(sha),sha256:sha,bytes:8,groupOrdinals:[[1],[2]]})).rejects.toMatchObject({code:"40001"});
+ await expect(f.rpc("swap",{stageToken:s.token,leaseToken:token,replacementStageToken:null})).rejects.toMatchObject({code:"40001"});
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1 second' WHERE stage_token=$1",[s.token]);
+ const t=(await f.rpc("claim",{limit:10})).tickets[0];
+ expect(t.stageToken).toBe(s.token);expect(t.leaseToken).not.toBe(token);
+});

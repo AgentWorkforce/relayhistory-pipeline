@@ -2694,3 +2694,23 @@ describe("S3 proof seeder phase 2",()=>{
   expect((await db.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0]).toEqual({status:"pending"});
  });
 });
+
+describe("buffered ingest phase2",()=>{
+ test("direct ingest-only column drift closes live gate while unrelated role verifiers remain valid",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  const expected=await expectedSchema();
+  expect(await schemaVerdict(expected,transact(db))).toEqual({ok:true});
+  await db.exec("GRANT SELECT(stage_key) ON sessions.ingest_stage_intents TO bulls96_session_ingest");
+  for(const file of ["session_directory_search_worker_verify.sql","session_token_verifier_verify.sql","session_ingest_seeder_verify.sql"])
+   await db.exec(readFileSync(join(root,"supabase/bootstrap",file),"utf8"));
+  expect((await schemaVerdict(expected,transact(db))).ok).toBe(false);
+ });
+ test("ingest failure after all other verifiers leaves the generation marker pending",async()=>{
+  const db=await fresh();
+  const error=await failure(runMigrations(client(db),{profile:LOCAL,beforeVerify:async()=>{
+   await db.exec("GRANT SELECT ON sessions.ingest_stage_intents TO bulls96_session_ingest");
+  }}));
+  expect(error).not.toBeNull();
+  expect((await db.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0]).toEqual({status:"pending"});
+ });
+});
