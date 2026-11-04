@@ -36,6 +36,8 @@ import {
 } from "../migration-sentinels.ts";
 import {
   expectedSchema,
+  inspectMigrations,
+  migrationLedgerSha256,
   migrate,
   migrationProfile,
   plan,
@@ -1846,6 +1848,26 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
   });
 
+  test("release read-only plan preserves the populated ledger/marker and reuses checksum/ACL guards", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    await runMigrations(client(db), { profile: SUPA_ET });
+    const before = await snapshot(db);
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const report = await inspectMigrations(client(db), SUPA_ET);
+    await db.exec("ROLLBACK");
+    expect(report.inventory.every(s => !s.pending)).toBe(true);
+    expect(report.inventory.length).toBeGreaterThan(20);
+    expect(report.ledgerSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(await snapshot(db)).toEqual(before);
+    // The inspection cannot turn ledger drift into an apparently successful plan.
+    await db.exec("UPDATE sessions.__96bulls_migrations SET sha256 = repeat('0',64) WHERE name = (SELECT min(name) FROM sessions.__96bulls_migrations)");
+    await db.exec("BEGIN READ ONLY");
+    const error = await failure(inspectMigrations(client(db), SUPA_ET));
+    await db.exec("ROLLBACK");
+    expect(error?.code).toBe("migration_changed");
+  });
+
   test("event-trigger mode (supabase): the reviewed bootstrap passes a fresh full migrate; the trigger enforces the boundary afterwards", async () => {
     const db = await supabaseLike();
     await db.exec(ET_BOOT);
@@ -2672,5 +2694,31 @@ describe("session token verifier phase 2", () => {
     await expect(verify()).rejects.toThrow(
       /session token verifier is not in the approved shape/,
     );
+  });
+});
+
+
+describe("release pre-write fences", () => {
+  test("a changed planned ledger refuses before the first persistent write", async () => {
+    const db = await fresh();
+    let invoked = false;
+    const error = await failure(runMigrations(client(db), {
+      profile: LOCAL, steps: [], expectedLedgerSha256: "0".repeat(64),
+      beforeWrite: async () => { invoked = true; },
+    }));
+    expect(error?.code).toBe("release_ledger_changed");
+    expect(invoked).toBe(false);
+    expect(await snapshot(db)).toEqual({ledger:null,marker:null});
+  });
+  test("a revoked live release gate refuses under the lock before schema/marker creation", async () => {
+    const db = await fresh();
+    let invoked = false;
+    const error = await failure(runMigrations(client(db), {
+      profile: LOCAL, steps: [], expectedLedgerSha256:migrationLedgerSha256(new Map()),
+      beforeWrite: async () => { invoked = true; throw Object.assign(new Error("refused"),{code:"live_release_refused"}); },
+    }));
+    expect(error?.code).toBe("live_release_refused");
+    expect(invoked).toBe(true);
+    expect(await snapshot(db)).toEqual({ledger:null,marker:null});
   });
 });
