@@ -1,4 +1,4 @@
-import {orderedFixtureLedger} from "../src/session-ingest/__tests__/ordered-support.ts";
+import {orderedFixtureLedger,initializeFixtureSeatClock} from "../src/session-ingest/__tests__/ordered-support.ts";
 /** Actual owned Node24 -> PG17 -> producer/typed GC ports -> versioned MinIO.
  * No production URL/credential is accepted. Synthetic localhost containers only.
  */
@@ -90,6 +90,7 @@ try{
   try{await owner.query("SELECT sessions.ingest_seed_fence_baseline($1::jsonb)",[JSON.stringify({org_id:tenant.orgId,workspace_id:tenant.workspaceId,user_id:tenant.userId,deletions:[],resets:[]})]);await owner.query("COMMIT")}
   catch(e){await owner.query("ROLLBACK");throw e}
   await owner.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch) VALUES($1,repeat('a',64),repeat('b',64),$2,clock_timestamp()+interval '1 hour',repeat('3',64))",[tenant.orgId,expected]);
+  await initializeFixtureSeatClock(owner,expected);
   const records=["gone","kept"].map((id,i)=>({schema_version:1 as const,origin_id:origin,revision_id:"actual-revision-"+id,record_id:"record-"+id,revision:7,kind:"session_event" as const,source:"claude",session_id:id,operation:"upsert" as const,payload:{text:i?"keep exact legitimate message":"erase this original message",ts_ms:1761955200000}}));
   const batch:HistoryExportBatch={schema_version:1,origin_id:origin,batch_id:"actual-batch-"+n,job_id:"job-"+n,generation:1,destination_id:"fixture",instance_id:"fixture",account_id:await deliveryAccount(tenant),mapping_version:DELIVERY_MAPPING_VERSION,records};
   const row=async()=>{const r=(await owner.query("SELECT * FROM sessions.ingest_stage_intents WHERE org_id=$1 AND parent_stage_token IS NULL ORDER BY created_at DESC LIMIT 1",[tenant.orgId])).rows[0];assert(r,"intent");return r};

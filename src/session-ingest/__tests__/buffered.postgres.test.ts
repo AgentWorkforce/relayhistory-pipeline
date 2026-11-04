@@ -1,4 +1,4 @@
-import {orderedFixtureLedger} from "./ordered-support.ts";
+import {orderedFixtureLedger,initializeFixtureSeatClock} from "./ordered-support.ts";
 /**
  * Opt-in, owned PostgreSQL + filesystem object proof. No deployed credentials.
  */
@@ -51,6 +51,7 @@ async function fixture(admit=true,boundary=false){
  await pool.query("BEGIN;SET LOCAL ROLE bulls96_session_ingest_seeder");
  try{await pool.query("SELECT sessions.ingest_seed_fence_baseline($1::jsonb)",[JSON.stringify({org_id:TENANT.orgId,workspace_id:TENANT.workspaceId,user_id:TENANT.userId,deletions:[],resets:[]})]);await pool.query("COMMIT")}catch(e){await pool.query("ROLLBACK");throw e}
  if(admit)await pool.query("INSERT INTO sessions.ingest_buffer_admission VALUES($1,$2,$2,$2,clock_timestamp()+interval '1 hour',repeat('3',64))",[TENANT.orgId,"a".repeat(64)]);
+ if(admit)await initializeFixtureSeatClock(pool,"a".repeat(64));
  const run=async(t:string,p:unknown[])=>{const c=await pool.connect();try{await c.query("SET ROLE bulls96_session_ingest");return await c.query(t,p);}finally{await c.query("RESET ROLE");c.release();}};
  const ledger=orderedFixtureLedger(sqlLedger(run,{acceptanceMode:"buffered",expectedGeneration:"a".repeat(64)}),pool);
  const deps={ledger,target:{store,keyRoot:"96bulls"},acceptanceMode:"buffered" as const,inlineMaxSessions:0,fanout:async()=>{throw Error("buffer_queue_called");}};

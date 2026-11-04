@@ -1,3 +1,4 @@
+import {initializeFixtureSeatClock} from "../src/session-ingest/__tests__/ordered-support.ts";
 /** Owned PG17 target proof; no production URL/credentials or inferred epoch. */
 import pg from "pg";
 import {createHash} from "node:crypto";
@@ -38,6 +39,7 @@ try{
   await owner.query("BEGIN;SET LOCAL ROLE bulls96_session_ingest_seeder");
   try{await owner.query("SELECT sessions.ingest_seed_fence_baseline($1::jsonb)",[JSON.stringify({org_id:tenant.orgId,workspace_id:tenant.workspaceId,user_id:tenant.userId,deletions:[],resets:[]})]);await owner.query("COMMIT")}catch(e){await owner.query("ROLLBACK");throw e}
   await owner.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch) VALUES($1,repeat('a',64),repeat('b',64),$2,clock_timestamp()+interval '1 hour',$3)",[tenant.orgId,expected,epoch]);
+  await initializeFixtureSeatClock(owner,expected);
   const selection=(enabled:boolean):SelectionInput=>({tenant,originId:origin,sessions:[["claude","session"]],enabled});
   const control=async(kind:OrderedControl["kind"],version:string,payload:unknown,e=epoch):Promise<OrderedControl>=>{
    const r=await owner.query("SELECT encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',$1::text,$2::text,$3::text,$4::text,$5::text,$6::jsonb)::text,'UTF8')),'hex') AS h",[e,tenant.orgId,tenant.workspaceId,tenant.userId,kind,JSON.stringify(payload)]);

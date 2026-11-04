@@ -16,3 +16,13 @@ export function orderedFixtureLedger(base:Ledger,db:{query(s:string,p?:any[]):Pr
   return(await base.applyOrderedControl!({tenant,requestId,control:{...c,kind:"reset"}})).deleted!;
  }};
 }
+
+/** Synthetic owner attestation only; production must use the real two-source exporter. */
+export function fixtureSeatBaseline(generation:string,epoch="3".repeat(64),floor="9007199254740993"){
+ return{protocol:"delivery-acceptance-floor-v1",controlEpoch:epoch,capturedAt:"2026-11-04T00:00:00.000000Z",
+ sourceSequences:["sessions.delivery_catalog_acceptance_seq","sessions.delivery_projection_acceptance_seq"].map((sequenceRegclass,i)=>({sequenceRegclass,sequenceOid:String(i+1),allocatedHighWater:floor,isCalled:true,incrementBy:"1",cycle:false})),
+ allocatedHighWater:floor,generation,sourceIdentitySha256:"c".repeat(64),sourceProofSha256:"d".repeat(64)};
+}
+export async function initializeFixtureSeatClock(db:{query(s:string,p?:any[]):Promise<unknown>},generation:string,epoch="3".repeat(64)){
+ await db.query("SELECT sessions.ingest_receipt_seat_initialize($1::jsonb)",[JSON.stringify(fixtureSeatBaseline(generation,epoch))]);
+}

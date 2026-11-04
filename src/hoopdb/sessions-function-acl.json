@@ -121,6 +121,18 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_receipt_seat_ack()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_receipt_seat_initialize(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_receipt_seat_records(uuid,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_receipt_seats_for_stage(uuid)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_records(jsonb)": [
       "<owner>:EXECUTE"
     ],
