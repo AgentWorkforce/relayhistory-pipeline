@@ -61,10 +61,16 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_buffer_gc_groups(jsonb,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_buffer_gc_kept(uuid)": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_buffer_gc_locked(uuid,uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_buffer_gc_ordinals(uuid)": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_buffer_gc_prepare(jsonb)": [
@@ -124,6 +130,39 @@
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_identifier(jsonb,boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_ack(jsonb,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_ack_batch(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_attempt(uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_attempt_ack(uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_begin(jsonb,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_clear(jsonb,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_guard(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_policy_set(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_records(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_stage_seats(uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_lazy_user(jsonb,text,jsonb)": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_lock_fences(text,text,text)": [

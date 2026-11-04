@@ -43,7 +43,8 @@
     "scripts/generate-ordered-control-neon-fixture.ts",
     "scripts/proof-receipt-seats.ts",
     "scripts/sync-ingest-seat-boundary.ts",
-    "scripts/sync-ingest-custody-boundary.ts"
+    "scripts/sync-ingest-custody-boundary.ts",
+    "scripts/sync-ingest-lazy-boundary.ts"
   ],
   "exclude": [
     "node_modules",

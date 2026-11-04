@@ -165,7 +165,7 @@ test("ticket matches the shared consumer fields including original reset epoch a
  const f=await fixture(),s=await f.stage();await f.disable();
  const t=(await f.rpc("claim",{limit:1})).tickets[0];
  expect(t).toEqual({stageToken:s.token,claimToken:s.claim,leaseToken:expect.any(String),rowVersion:"2",
-  key:s.keyFor(s.sha),sha256:s.sha,bytes:10,groupOrdinals:[[0],[1],[2]],keepGroupIndexes:[1,2],
+  key:s.keyFor(s.sha),sha256:s.sha,bytes:10,groupOrdinals:[[0],[1],[2]],keepGroupIndexes:[1,2],keepOrdinals:[1,2],
   receiptState:"acknowledged",phase:"plan",resetEpoch:"0",cleanupState:"live"});
 });
 test("a legal mixed-source no-session group remains readable and reset removes every original ordinal",async()=>{

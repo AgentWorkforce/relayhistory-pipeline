@@ -359,6 +359,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261104050000_buffered_upload_receipts.sql` | table sessions.ingest_stage_intents |
 | `upstream:20261104051000_ingest_buffer_gc.sql` | column sessions.ingest_stage_intents.gc_lease_token |
 | `upstream:20261104052000_ordered_ingest_controls.sql` | column sessions.ingest_buffer_admission.control_epoch |
+| `upstream:20261104055000_lazy_current_custody.sql` | table sessions.ingest_lazy_policy |
 | `upstream:20261104054000_ingest_custody_baseline.sql` | table sessions.ingest_custody_imports |
 | `upstream:20261104053000_ingest_first_ack_seats.sql` | table sessions.ingest_receipt_seat_clock |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
