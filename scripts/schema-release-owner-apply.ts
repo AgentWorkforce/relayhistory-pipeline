@@ -134,7 +134,7 @@ export async function ownerApplyMain(argv = process.argv.slice(2)) {
     connectionTimeoutMillis: 10000,
     query_timeout: 300000,
     options:
-      "-c role=postgres -c statement_timeout=300000 -c lock_timeout=5000 -c idle_in_transaction_session_timeout=60000",
+      "-c statement_timeout=300000 -c lock_timeout=5000 -c idle_in_transaction_session_timeout=60000",
     application_name: "96bulls-owner-schema-" + input.mode,
   });
   login.password = "";

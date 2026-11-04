@@ -169,7 +169,7 @@ test("role-control audit refuses explicit and dynamic role resets but permits co
 test("canonical actual source role audit is read-only and passes unchanged", async () => {
   await auditCanonicalOwnerSql();
 });
-function fake(failure = "", resetOwner = true) {
+function fake(failure = "", resetOwner = false) {
   const calls: string[] = [];
   let role = "postgres",
     inTx = false;
@@ -185,7 +185,8 @@ function fake(failure = "", resetOwner = true) {
         if (sql.startsWith("BEGIN") && failure === "begin")
           throw Error(failure);
         if (sql.startsWith("BEGIN")) inTx = true;
-        if (sql === "ROLLBACK") inTx = false;
+        if (sql === "ROLLBACK") { inTx = false; role = failure === "rollback_role" ? "cli_login_postgres" : "postgres"; }
+        if (sql === "SET SESSION ROLE postgres" || (sql === "SET LOCAL ROLE postgres" && failure !== "local_role")) role = "postgres";
         if (sql === "RESET ROLE")
           role = resetOwner ? "postgres" : "cli_login_postgres";
         if (sql.includes("current_user AS owner"))
@@ -196,7 +197,7 @@ function fake(failure = "", resetOwner = true) {
                 login: A.login,
                 db: A.database,
                 schemaOwner: A.owner,
-                role,
+                role: role === "cli_login_postgres" ? "none" : role,
                 pid: 42,
                 ro: inTx ? "on" : "off",
               },
@@ -222,16 +223,28 @@ test.each(["connect", "begin", "rollback"])(
     if (failure === "connect") expect(x.calls).toEqual(["connect", "end"]);
   },
 );
-test("reset baseline must already be postgres before work can start", async () => {
-  const x = fake("", false);
+test("an unexpected owner reset baseline refuses before work", async () => {
+  const x = fake("", true);
   let work = false;
   await expect(
     withOwnerSession(x.client as any, async () => {
       work = true;
     }),
-  ).rejects.toThrow("owner_session_identity");
+  ).rejects.toThrow("owner_reset_baseline");
   expect(work).toBe(false);
   expect(x.calls.at(-1)).toBe("end");
+});
+test("temporary-login reset is restored locally and rollback preserves the explicit session owner", async () => {
+  const x = fake(); let work = false;
+  await withOwnerSession(x.client as any, async () => { work = true; });
+  expect(work).toBe(true);
+  expect(x.calls).toContain("RESET ROLE");
+  expect(x.calls).toContain("SET LOCAL ROLE postgres");
+});
+test.each(["local_role", "rollback_role"])("failed explicit owner restoration (%s) refuses before work", async failure => {
+  const x = fake(failure); let work = false;
+  await expect(withOwnerSession(x.client as any, async () => {work = true;})).rejects.toThrow("owner_session_identity");
+  expect(work).toBe(false); expect(x.calls.at(-1)).toBe("end");
 });
 test("fenced canonical client rejects role change before submitting SQL; rollback stays available", async () => {
   const x = fake();

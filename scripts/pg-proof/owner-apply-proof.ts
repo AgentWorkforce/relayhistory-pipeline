@@ -67,6 +67,7 @@ await admin.query(
   await read("supabase/bootstrap/session_directory_search_worker.sql"),
 );
 await admin.query(await read("supabase/bootstrap/session_token_verifier.sql"));
+await admin.query(await read("supabase/bootstrap/session_ingest_roles.sql"));
 await admin.query(
   "DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_runtime') THEN CREATE ROLE bulls96_runtime LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION; END IF; END $$",
 );
@@ -88,7 +89,7 @@ await admin.query(
   "RESET ROLE;ALTER ROLE postgres NOSUPERUSER;ALTER DEFAULT PRIVILEGES FOR ROLE proof_admin REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
 );
 const events: any[] = [];
-function client(startup = true) {
+function client(startup = false) {
   return new pg.Client({
     host: "127.0.0.1",
     port,
@@ -102,19 +103,19 @@ function client(startup = true) {
 }
 let entered = false;
 try {
-  await withOwnerSession(client(false), async () => {
+  await withOwnerSession(client(true), async () => {
     entered = true;
   });
-  throw Error("missing startup role accepted");
+  throw Error("unexpected owner reset baseline accepted");
 } catch (e: any) {
-  if (e.code !== "owner_session_identity") throw e;
-  events.push({ case: "no-startup-reset-refused", entered });
+  if (e.code !== "owner_reset_baseline") throw e;
+  events.push({ case: "unexpected-startup-reset-refused", entered });
 }
 const c = client();
 await withOwnerSession(c, async (pid: number) => {
   const guard = ownerFencedClient(c, pid);
   const first = await ownerIdentity(c, pid, false);
-  await c.query("BEGIN;RESET ROLE;COMMIT");
+  await c.query("BEGIN;RESET ROLE;SET LOCAL ROLE postgres;ROLLBACK");
   const afterReset = await ownerIdentity(c, pid, false);
   try {
     await guard.query(
@@ -252,7 +253,7 @@ await withOwnerSession(c, async (pid: number) => {
     )
   ).rows;
   events.push({
-    case: "startup-reset-owner-and-canonical-migrator",
+    case: "explicit-role-restoration-and-canonical-migrator",
     pid,
     firstOwner: first.owner,
     afterResetOwner: afterReset.owner,

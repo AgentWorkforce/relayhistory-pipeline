@@ -252,9 +252,22 @@ export async function withOwnerSession<T>(
     connected = true;
     await client.query("SET SESSION ROLE postgres");
     await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-    await client.query("RESET ROLE");
     const identity = await ownerIdentity(client, undefined, true);
+    // Supavisor drops startup role options. Probe its real reset baseline in
+    // read-only SQL, restoring only the owner role already granted to this login.
+    // Canonical migration queries may never issue role control.
+    await client.query("RESET ROLE");
+    const reset = (await client.query<any>(
+      "SELECT current_user AS owner,session_user AS login,current_database() AS db,current_setting('role') AS role,pg_backend_pid() AS pid,current_setting('transaction_read_only') AS ro",
+    )).rows[0];
+    if (!reset || reset.owner !== OWNER_APPLY.login ||
+        reset.login !== OWNER_APPLY.login || reset.db !== OWNER_APPLY.database ||
+        reset.role !== "none" || reset.pid !== identity.pid || reset.ro !== "on")
+      ownerApplyRefuse("owner_reset_baseline");
+    await client.query("SET LOCAL ROLE postgres");
+    await ownerIdentity(client, identity.pid, true);
     await client.query("ROLLBACK");
+    // Rollback must restore the prior SESSION owner on the SAME backend.
     await ownerIdentity(client, identity.pid, false);
     return await work(identity.pid);
   } finally {
@@ -339,7 +352,7 @@ export interface OwnerCapture {
   existingBoundarySha256: string;
   wrapperSha256: string;
   wrapperProsrcSha256: string;
-  resetRoleOwnerVerified: true;
+  ownerRoleRestorationVerified: true;
   captureGeneration: string;
 }
 export function ownerCapture(
@@ -372,7 +385,7 @@ export function ownerCapture(
     existingBoundarySha256: hash(inspection.existingBoundary),
     wrapperSha256: wrapper.sha256,
     wrapperProsrcSha256: wrapper.prosrcSha256,
-    resetRoleOwnerVerified: true as const,
+    ownerRoleRestorationVerified: true as const,
   };
   return { ...body, captureGeneration: hash(body) };
 }
@@ -402,7 +415,7 @@ export function validateOwnerApply(
     capture.ledgerSha256 !== OWNER_APPLY.ledger ||
     capture.wrapperSha256 !== wrapper.sha256 ||
     capture.wrapperProsrcSha256 !== wrapper.prosrcSha256 ||
-    capture.resetRoleOwnerVerified !== true
+    capture.ownerRoleRestorationVerified !== true
   )
     ownerApplyRefuse("owner_capture_binding");
   freshAt(capture.at, now);
