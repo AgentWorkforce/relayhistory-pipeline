@@ -27,8 +27,10 @@ export interface ReplayProducerDeps {
 export interface ReplayProducerResult { published: boolean; reason?: "absent" | "source_blocked"; publication?: ArtifactPublication; rows?: number; objects?: number; bytes?: number }
 const fail = (code: string): never => { throw new ArtifactBuildError(code); };
 const scopeOf = (i: CanonicalIdentity): SessionScope => ({ orgId: i.orgId, workspaceId: i.workspaceId, harness: i.source, sessionId: i.sessionId });
-async function capture(db: SqlExecutor, scope: SessionScope): Promise<ReplayCapture> {
-  const { rows } = await db.query<{captured: ReplayCapture}>("SELECT sessions.capture_session_replay_pages($1,$2,$3,$4) AS captured", [scope.orgId,scope.workspaceId,scope.harness,scope.sessionId]);
+async function capture(db: SqlExecutor, scope: SessionScope, history?:HistorySourceCapture): Promise<ReplayCapture> {
+  const { rows } = history
+    ? await db.query<{captured:ReplayCapture}>("SELECT sessions.session_history_capture($1::jsonb) AS captured",[JSON.stringify({generation:history.schemaGeneration,identity:{orgId:scope.orgId,workspaceId:scope.workspaceId,source:scope.harness,sessionId:scope.sessionId}})])
+    : await db.query<{captured: ReplayCapture}>("SELECT sessions.capture_session_replay_pages($1,$2,$3,$4) AS captured", [scope.orgId,scope.workspaceId,scope.harness,scope.sessionId]);
   const c = rows[0]?.captured;
   if (!c || typeof c.exists !== "boolean" || typeof c.blocked !== "boolean" || c.identity?.orgId !== scope.orgId || c.identity?.workspaceId !== scope.workspaceId || c.identity?.source !== scope.harness || typeof c.identity.sessionId !== "string" || !c.identity.sessionId || !/^[0-9a-f]{64}$/u.test(c.source?.fingerprint ?? "") || !Array.isArray(c.snapshot?.pointers)) fail("artifact_capture_invalid");
   if (c.exists && (!/^[1-9][0-9]*$/u.test(c.source.epoch) || c.snapshot.epoch !== c.source.epoch || !c.snapshot.pointers.length || c.snapshot.pointers.length > ARTIFACT_MAX_SOURCE_POINTERS)) fail("artifact_capture_bound");
@@ -40,7 +42,7 @@ export function canonicalArtifactGeneration(sourceGeneration: string, source: Ar
   return artifactDigest(JSON.stringify(["canonical-read-artifact-v1",sourceGeneration,source.epoch,source.fingerprint]));
 }
 export async function produceCanonicalReplay(scope: SessionScope, deps: ReplayProducerDeps): Promise<ReplayProducerResult> {
-  const first = await capture(deps.db, scope);
+  const first = await capture(deps.db, scope,deps.history);
   if (!first.exists) return { published: false, reason: "absent" };
   if (first.blocked) return { published: false, reason: "source_blocked" };
   const identity = first.identity, managed = (first.snapshot.history as {required?:unknown}|undefined)?.required === true;
@@ -49,7 +51,7 @@ export async function produceCanonicalReplay(scope: SessionScope, deps: ReplayPr
   if(history && !managed) fail("artifact_history_authority_uninstalled");
   // Each re-read includes the monotonic source epoch, not merely pointer values.
   const current = async () => {
-    const c = await capture(deps.db, scopeOf(identity));
+    const c = await capture(deps.db, scopeOf(identity),history);
     if (!c.exists || c.blocked || c.source.epoch !== first.source.epoch || c.source.fingerprint !== first.source.fingerprint || JSON.stringify(c.identity) !== JSON.stringify(identity)) fail("artifact_source_changed");
     return c.snapshot.pointers;
   };

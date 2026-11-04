@@ -76,7 +76,17 @@ test("managed replay requires exact mask, registers graph before PUT and publish
    const rows=(await x.db.query("SELECT object_key FROM sessions.ingest_history_derived_objects WHERE object_key=$1 AND cleanup_state='live'",[String(k)])).rows;
    expect(rows.length).toBe(1);checked++;return target.put(k,b,o);
  };const value=Reflect.get(target,key);return typeof value==="function"?value.bind(target):value}});
- const result=await produceCanonicalReplay(scope,{...deps,history,store:registered});
+
+ const missing={originId:"missing",recordId:"not-in-any-carrier",kind:"session_event",revision:"1",acceptedSeq:"123",operation:"upsert" as const,userId:"user_replay",source:identity.source,sessionId:identity.sessionId,contentSha256:"a".repeat(64),lineage:"1"};
+ const missingHistory={...history,mask:{...history.mask,winners:new Map([...history.mask.winners,[missing.recordId,missing] as const])}};
+ await expect(produceCanonicalReplay(scope,{...deps,history:missingHistory,store:registered})).rejects.toMatchObject({code:"history_visibility_missing_body"});
+ expect(checked).toBe(0);
+ const actorDB:any={query:async(sql:string,params:unknown[])=>{
+  await x.pg.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");
+  try{const result=await x.db.query(sql,params);await x.pg.exec("COMMIT");return result}catch(error){await x.pg.exec("ROLLBACK");throw error}
+ }};
+ await expect(actorDB.query("SELECT sessions.capture_session_replay_pages($1,$2,$3,$4)",[identity.orgId,identity.workspaceId,identity.source,identity.sessionId])).rejects.toMatchObject({code:"42501"});
+ const result=await produceCanonicalReplay(scope,{...deps,db:actorDB,history,store:registered});
  expect(result.published).toBe(true);expect(result.rows).toBe(1);expect(checked).toBeGreaterThan(0);expect(result.publication!.prefix).toContain("/derived/replay/");
  expect(await readHistoryReplayDescriptor(x.db,history)).toEqual(result.publication!);
  const doc=JSON.parse(new TextDecoder().decode(await read(store,result.publication!.index)));

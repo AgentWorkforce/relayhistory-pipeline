@@ -40,3 +40,14 @@ export function historyRecordVisible(record:RelayhistoryStreamRecord,userId:stri
  if(w.kind!==record.kind||w.operation!==record.operation||w.contentSha256!==historyRecordContentSha256(record))no("history_visibility_body_mismatch");
  return true;
 }
+
+
+/** A metadata mask cannot turn a missing current body into an empty success.
+ * Hidden other-scope/NULL/tombstone winners do not require a visible upsert. */
+export function assertHistoryMaskCoverage(mask:HistoryLogicalMask,visible:Iterable<RelayhistoryStreamRecord>):void{
+ const seen=new Set<string>();for(const record of visible)
+  if(record.kind!==CONVERGENCE_EVENT_KIND&&!isLegacyRelayhistoryRecord(record)&&record.operation==="upsert")seen.add(record.record_id);
+ for(const [recordId,winner]of mask.winners)
+  if(winner&&winner.operation==="upsert"&&winner.source===mask.scope.source&&winner.sessionId===mask.scope.sessionId&&!seen.has(recordId))
+   no("history_visibility_missing_body");
+}
