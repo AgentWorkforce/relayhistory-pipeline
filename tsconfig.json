@@ -30,7 +30,8 @@
     "stacks",
     "alchemy.run.ts",
     "smoke",
-    "src/types/*.d.ts"
+    "src/types/*.d.ts",
+    "scripts/schema-release-*.ts"
   ],
   "exclude": [
     "node_modules",
