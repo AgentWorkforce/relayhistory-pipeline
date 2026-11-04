@@ -41,5 +41,7 @@ test("build plugin only replaces its own schema module", async () => {
   await packagedDerivedSchemaSource(path => watched.push(path));
   expect(watched).toContain(ROLE_VERIFY_SQL_PATH);
   expect(watched).toContain(TOKEN_VERIFIER_VERIFY_SQL_PATH);
-  expect(watched.some(path => path.endsWith("0005_derived_pointer_erasure.sql"))).toBe(true);
+  const assets = await derivedSchemaAssets();
+  for (const name of assets.expected.names)
+    expect(watched.some(path => path.endsWith(name.slice(name.indexOf(":") + 1)))).toBe(true);
 });
