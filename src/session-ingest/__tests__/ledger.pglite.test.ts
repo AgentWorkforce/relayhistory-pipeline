@@ -571,3 +571,34 @@ describe("staged fan-out SQL (review Medium)", () => {
     expect(await ledger.commitRevisions(tenant, "origin-1", MACHINE, [rec("a", 1, "1")])).toEqual({ committed: 0, rearmed: 0 });
   });
 });
+
+describe("pending session ownership fences", () => {
+  test("a disable between claim and direct commit never restores a stale revision", async () => {
+    const db=await database(),ledger=sqlLedger(runAs(db)),c=claimInput();
+    await ledger.claim(c);
+    await ledger.setSessionUploads({tenant,originId:c.originId,sessions:c.sessions,enabled:false});
+    expect(await ledger.commit(commitInput(c))).toEqual({rearmed:1});
+    expect(await revisions(db)).toEqual([]);
+    await ledger.setSessionUploads({tenant,originId:c.originId,sessions:c.sessions,enabled:true});
+    expect(await ledger.claim({...c,batchId:"after-erase"})).toMatchObject({kind:"claimed",stale:[]});
+  });
+  test("reset includes pending and staged ownership before any revision is committed", async () => {
+    const db=await database(),ledger=sqlLedger(runAs(db)),c=claimInput();
+    await ledger.claim(c);await ledger.commit(commitInput(c,c.sessions,[]));
+    expect(await revisions(db)).toEqual([]);
+    expect(await ledger.resetUploadedSessions(tenant,"staged-reset")).toBe(1);
+    expect(await ledger.fanoutFence(tenant,c.originId,c.sessions)).toEqual(c.sessions);
+    expect(await ledger.commitRevisions(tenant,c.originId,MACHINE,c.records)).toEqual({committed:0,rearmed:1});
+    expect(await revisions(db)).toEqual([]);
+  });
+  test("ownership reset remains scoped by tenant, workspace and user", async () => {
+    const db=await database(),ledger=sqlLedger(runAs(db)),c=claimInput();
+    await ledger.claim(c);
+    for(const t of [{...tenant,orgId:"other-org"},{...tenant,workspaceId:"other-ws"},{...tenant,userId:"other-user"}]) {
+      await ledger.claim({...c,tenant:t,batchId:"other-"+t.orgId+t.workspaceId+t.userId});
+      expect(await ledger.resetUploadedSessions(t,"isolated")).toBe(1);
+    }
+    expect(await ledger.fanoutFence(tenant,c.originId,c.sessions)).toEqual([]);
+    expect(await ledger.resetUploadedSessions(tenant,"own-reset")).toBe(1);
+  });
+});

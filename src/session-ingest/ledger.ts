@@ -8,11 +8,13 @@
  *                                  the record-revision 409 (0026's checks), no content
  *   sessions.upload_deletions      (org, ws, user, origin, source, session_id) deletion fences
  *   sessions.upload_resets         (org, ws, user, request_id) a user's "delete all" resets
+ *   sessions.ingest_session_ownership pending/committed session keys visible to reset
  *   sessions.upload_erasure_rearm  sessions a tombstone reached after an ingest claim: the
  *                                  erasure job sweeps them again
  *
  * Two calls per batch, each one round trip and one short transaction, with
- * row locks on the batch's own rows only (no per-user advisory lock):
+ * short per-(org,workspace,user) row locking for fence decisions (no advisory
+ * locks). S3 writes stay outside those transactions:
  *
  *   claim  (before any S3 write) fences, replay/409, stale records, pending claim
  *   commit (after the S3 writes) pending -> committed, written revisions, fence recheck
