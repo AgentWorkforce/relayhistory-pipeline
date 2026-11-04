@@ -115,3 +115,9 @@ The operator proposal preserves existing principals/statements, denies this GC r
 The existing transcript-store K-45 objective is immediate logical deletion and physical purge within 48 hours; it does not impose a waiting canary. The owned capacity case now creates 20 acknowledged batches with 500 records/groups each through the actual producer, then checks the default claim scans all 20 inside its 1.8 second metadata budget. Root measured 305 ms on owned PostgreSQL17/Node24/MinIO (106 S3 requests across 14 groups, about 299 MiB peak RSS). This does not prove production latency, sustained arrival capacity or the physical purge objective. Review actual backlog/throughput and retain active GC while admission closes.
 
 Ordered dual-control epoch/version/digest contract: [ordered-ingest-controls.md](ordered-ingest-controls.md).
+
+### Buffered GC scope correction (2026-11-04)
+
+IAM glob `*` matches `/`, so `96bulls/*/buffered-batches/*` also matched canonical derived objects whose family was `buffered-batches`. The identity policy now permits only the actual stage producer shape `96bulls/*/buffered-batches/v1/ws=*/m=srv_*/b=*.staged.ndjson.zst`, with explicit canonical `upload-generations` denies for object actions, version listing and KMS encryption contexts. The proposed bucket/CMK policies carry the same boundaries; their v2 proposals supersede the earlier broad-prefix proposals. Nothing has been applied.
+
+Four scope tests use the actual stage-key producer and an IAM wildcard/condition evaluator. Reverting the bounded allow or removing any one of the three canonical denies fails its corresponding adversarial assertion. This checks the declared policy boundary, not effective AWS access: reviewed resource policies, a live transport probe and admission checks are still required before activation.

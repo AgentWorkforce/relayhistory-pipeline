@@ -106,7 +106,7 @@
                     "s3:DeleteObjectVersion"
                   ],
                   "Resource": {
-                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/*"
+                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/v1/ws=*/m=srv_*/b=*.staged.ndjson.zst"
                   }
                 },
                 {
@@ -115,7 +115,7 @@
                     "s3:PutObject"
                   ],
                   "Resource": {
-                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/*"
+                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/v1/ws=*/m=srv_*/b=*.staged.ndjson.zst"
                   },
                   "Condition": {
                     "StringEquals": {
@@ -136,7 +136,7 @@
                   },
                   "Condition": {
                     "StringLike": {
-                      "s3:prefix": "96bulls/*/buffered-batches/*"
+                      "s3:prefix": "96bulls/*/buffered-batches/v1/ws=*/m=srv_*/b=*.staged.ndjson.zst"
                     }
                   }
                 },
@@ -156,7 +156,7 @@
                     },
                     "StringLike": {
                       "kms:EncryptionContext:aws:s3:arn": {
-                        "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/*"
+                        "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/v1/ws=*/m=srv_*/b=*.staged.ndjson.zst"
                       }
                     }
                   }
@@ -172,6 +172,49 @@
                       "LogGroup",
                       "Arn"
                     ]
+                  }
+                },
+                {
+                  "Sid": "NeverCanonicalObjects",
+                  "Effect": "Deny",
+                  "Action": [
+                    "s3:*"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/upload-generations/*"
+                  }
+                },
+                {
+                  "Sid": "NeverListCanonicalVersions",
+                  "Effect": "Deny",
+                  "Action": [
+                    "s3:ListBucketVersions"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}"
+                  },
+                  "Condition": {
+                    "StringLike": {
+                      "s3:prefix": "96bulls/*/upload-generations/*"
+                    }
+                  }
+                },
+                {
+                  "Sid": "NeverCanonicalCryptography",
+                  "Effect": "Deny",
+                  "Action": [
+                    "kms:Decrypt",
+                    "kms:GenerateDataKey"
+                  ],
+                  "Resource": {
+                    "Ref": "KmsKeyArn"
+                  },
+                  "Condition": {
+                    "StringLike": {
+                      "kms:EncryptionContext:aws:s3:arn": {
+                        "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/upload-generations/*"
+                      }
+                    }
                   }
                 }
               ]
