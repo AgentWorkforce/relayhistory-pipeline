@@ -230,7 +230,7 @@ function rememberedBatches(manifest: ManifestV1 | null): Map<string, number> {
   return out;
 }
 
-function admittedIdentity(manifest: ManifestV1 | null, userId: string, sessionId: string): Record<string, unknown> {
+export function admittedIdentity(manifest: ManifestV1 | null, userId: string, sessionId: string): Record<string, unknown> {
   const stored = manifest?.extensions?.[BULLS_EXTENSION];
   if (stored !== undefined && (stored === null || typeof stored !== "object" || Array.isArray(stored)))
     throw new IngestWriteError("manifest_identity_mismatch");
@@ -241,7 +241,7 @@ function admittedIdentity(manifest: ManifestV1 | null, userId: string, sessionId
   return { ...identity, user_id: userId, canonical_session_id: sessionId };
 }
 
-function nextManifest(args: {
+export function nextManifest(args: {
   batches: [string, number][];
   prev: ManifestV1 | null;
   location: SessionLocation;
@@ -308,7 +308,7 @@ export interface Group {
 export type LineMeta = [revisionId: string, digest: string, source: string, sessionId: string | null];
 
 /** The payload's own clock of a chunk line, else `fallback`. */
-function lineTimeMs(line: string, fallback: number): number {
+export function lineTimeMs(line: string, fallback: number): number {
   try {
     const payload = (JSON.parse(line) as { payload?: Record<string, unknown> | null }).payload ?? {};
     for (const field of TIME_FIELDS) {

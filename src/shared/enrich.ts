@@ -49,6 +49,9 @@ export function manifestKeyOf(message: StageMessage): string | undefined {
   if (!key) return undefined;
   const loc = parseSessionKey(key);
   if (!loc) return undefined;
+  // Immutable managed snapshots and their derived children share one publication.
+  const publication=/^publications\/([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\//.exec(loc.rest??'');
+  if(publication)return key.slice(0,key.length-loc.rest.length)+publication[0]+'manifest.json';
   return buildManifestKey(loc);
 }
 

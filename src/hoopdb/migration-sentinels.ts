@@ -30,6 +30,7 @@ export interface Sentinel {
 }
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
+  "upstream:20261104060000_ingest_canonical_publication.sql": {evidence:"table sessions.ingest_publication_heads",sql:relation("sessions.ingest_publication_heads")},
   "upstream:20261104051000_ingest_buffer_gc.sql": {evidence:"column sessions.ingest_stage_intents.gc_lease_token",sql:column("sessions.ingest_stage_intents","gc_lease_token")},
   "upstream:20261025000000_sessions_index.sql": {
     evidence: "table sessions.session_index",
