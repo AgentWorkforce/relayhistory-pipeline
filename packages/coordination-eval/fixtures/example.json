@@ -1,0 +1,208 @@
+{
+  "schemaVersion": 1,
+  "synthetic": true,
+  "scope": {
+    "organizationId": "example-org",
+    "workspaceId": "example-workspace"
+  },
+  "window": {
+    "since": "2026-10-21T07:00:00.000Z",
+    "until": "2026-11-04T08:00:00.000Z"
+  },
+  "coverage": {
+    "status": "partial",
+    "notes": "Synthetic excerpts only. No real team sessions were evaluated.",
+    "baselineSelection": "Two invented workstreams demonstrate the baseline; a third targeted example demonstrates the review queue."
+  },
+  "provenance": {
+    "source": "synthetic fixture",
+    "exportedAt": "2026-11-04T09:00:00.000Z",
+    "redacted": true
+  },
+  "sessions": [
+    {
+      "key": "backend",
+      "organizationId": "example-org",
+      "workspaceId": "example-workspace",
+      "source": "codex",
+      "sessionId": "example-backend"
+    },
+    {
+      "key": "frontend",
+      "organizationId": "example-org",
+      "workspaceId": "example-workspace",
+      "source": "claude",
+      "sessionId": "example-frontend"
+    },
+    {
+      "key": "producer",
+      "organizationId": "example-org",
+      "workspaceId": "example-workspace",
+      "source": "codex",
+      "sessionId": "example-producer"
+    },
+    {
+      "key": "consumer",
+      "organizationId": "example-org",
+      "workspaceId": "example-workspace",
+      "source": "claude",
+      "sessionId": "example-consumer"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "api-decision",
+      "sessionKey": "backend",
+      "machineId": "example-machine",
+      "eventId": "event-1",
+      "kind": "message",
+      "occurredAt": "2026-11-02T10:12:00.000Z",
+      "availableAt": "2026-11-02T10:13:00.000Z",
+      "text": "The response uses nextCursor. Page numbers are not supported.",
+      "truncated": false
+    },
+    {
+      "id": "client-action",
+      "sessionKey": "frontend",
+      "machineId": "example-machine",
+      "eventId": "event-2",
+      "kind": "message",
+      "occurredAt": "2026-11-02T10:34:00.000Z",
+      "availableAt": "2026-11-02T10:35:00.000Z",
+      "text": "Implementing the client request with a page number parameter.",
+      "truncated": false
+    },
+    {
+      "id": "client-revision",
+      "sessionKey": "frontend",
+      "machineId": "example-machine",
+      "eventId": "event-3",
+      "kind": "message",
+      "occurredAt": "2026-11-03T09:20:00.000Z",
+      "availableAt": "2026-11-03T09:21:00.000Z",
+      "text": "The integration check failed because the API expects a cursor. Replaced the page-number request and the check now passes.",
+      "truncated": false
+    },
+    {
+      "id": "ready-message",
+      "sessionKey": "producer",
+      "machineId": "example-machine",
+      "eventId": "event-4",
+      "kind": "message",
+      "occurredAt": "2026-11-02T11:00:00.000Z",
+      "availableAt": "2026-11-02T11:01:00.000Z",
+      "text": "Sent the consumer agent the finalized response schema and its passing contract test.",
+      "truncated": false
+    },
+    {
+      "id": "acknowledgment",
+      "sessionKey": "consumer",
+      "machineId": "example-machine",
+      "eventId": "event-5",
+      "kind": "message",
+      "occurredAt": "2026-11-02T11:05:00.000Z",
+      "availableAt": "2026-11-02T11:06:00.000Z",
+      "text": "Received the schema. Updating the integration to match the supplied contract.",
+      "truncated": false
+    },
+    {
+      "id": "integration-pass",
+      "sessionKey": "consumer",
+      "machineId": "example-machine",
+      "eventId": "event-6",
+      "kind": "message",
+      "occurredAt": "2026-11-02T11:15:00.000Z",
+      "availableAt": "2026-11-02T11:16:00.000Z",
+      "text": "The integration contract test passes with the shared schema.",
+      "truncated": false
+    }
+  ],
+  "workstreams": [
+    {
+      "id": "pagination",
+      "title": "Pagination integration",
+      "selection": "baseline",
+      "sessionKeys": ["backend", "frontend"],
+      "state": "done",
+      "summary": "The client was revised after an API mismatch; the integration check now passes.",
+      "summaryEvidenceIds": ["client-revision"],
+      "assessment": "reviewed"
+    },
+    {
+      "id": "schema-handoff",
+      "title": "Schema handoff",
+      "selection": "baseline",
+      "sessionKeys": ["producer", "consumer"],
+      "state": "done",
+      "summary": "The consumer acknowledged the shared schema and passed its integration check.",
+      "summaryEvidenceIds": ["acknowledgment", "integration-pass"],
+      "assessment": "reviewed"
+    },
+    {
+      "id": "investigation",
+      "title": "Potential repeated schema investigation",
+      "selection": "targeted",
+      "sessionKeys": ["producer", "consumer"],
+      "state": "unknown",
+      "summary": "The same excerpts were selected for a second hypothesis; independent review is still required.",
+      "summaryEvidenceIds": ["ready-message", "acknowledgment"],
+      "assessment": "pending"
+    }
+  ],
+  "findings": [
+    {
+      "id": "pagination-mismatch",
+      "incidentId": "incident-pagination",
+      "workstreamId": "pagination",
+      "kind": "conflicting_decisions",
+      "description": "The client used page numbers after a cursor-only decision existed in the backend session, then required revision.",
+      "checkpoint": "2026-11-02T10:30:00.000Z",
+      "factEvidenceIds": ["api-decision"],
+      "actionEvidenceIds": ["client-action"],
+      "outcomeEvidenceIds": ["client-revision"],
+      "proposedMessage": "The API uses nextCursor and does not support page numbers. Read the backend decision before implementing the client request.",
+      "communication": "not_observed",
+      "review": {
+        "verdict": "confirmed",
+        "reviewer": "Example reviewer",
+        "reason": "Synthetic example: the excerpts support the mismatch and revision. The effect of an earlier message remains untested."
+      }
+    },
+    {
+      "id": "successful-handoff",
+      "incidentId": "incident-handoff",
+      "workstreamId": "schema-handoff",
+      "kind": "successful_coordination",
+      "description": "A shared schema was acknowledged and used by the dependent agent before its integration check passed.",
+      "checkpoint": "2026-11-02T11:04:00.000Z",
+      "factEvidenceIds": ["ready-message"],
+      "actionEvidenceIds": ["acknowledgment"],
+      "outcomeEvidenceIds": ["integration-pass"],
+      "proposedMessage": null,
+      "communication": "observed",
+      "review": {
+        "verdict": "confirmed",
+        "reviewer": "Example reviewer",
+        "reason": "Synthetic positive control: observed communication and a dependent action, with no claim about the counterfactual."
+      }
+    },
+    {
+      "id": "investigation-candidate",
+      "incidentId": "incident-investigation",
+      "workstreamId": "investigation",
+      "kind": "repeated_investigation",
+      "description": "Candidate hypothesis only: check whether the consumer repeated discovery or intentionally validated a shared contract.",
+      "checkpoint": "2026-11-02T11:04:00.000Z",
+      "factEvidenceIds": ["ready-message"],
+      "actionEvidenceIds": ["acknowledgment"],
+      "outcomeEvidenceIds": ["integration-pass"],
+      "proposedMessage": null,
+      "communication": "observed",
+      "review": {
+        "verdict": "pending",
+        "reviewer": null,
+        "reason": "A reviewer must distinguish useful validation from repeated discovery. This candidate does not count as a finding in the baseline."
+      }
+    }
+  ]
+}
