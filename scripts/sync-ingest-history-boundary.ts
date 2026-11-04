@@ -27,7 +27,7 @@ if(modelSQL)for(const m of modelSQL.matchAll(/GRANT EXECUTE ON FUNCTION\s+(sessi
 }
 
 const acl=JSON.parse(await readFile(file("src/hoopdb/sessions-function-acl.json"),"utf8"));
-for(const key of Object.keys(acl.functions))if((key.startsWith("sessions.ingest_history_")||key.startsWith("sessions.session_history_")))delete acl.functions[key];
+for(const key of defs.keys())if(key.startsWith("sessions.ingest_history_")||key.startsWith("sessions.session_history_"))delete acl.functions[key];
 for(const key of defs.keys()){
  if((key.startsWith("sessions.ingest_history_")||key.startsWith("sessions.session_history_")))
   acl.functions[key]=["<owner>:EXECUTE",...(grants.get(key)??[])];
