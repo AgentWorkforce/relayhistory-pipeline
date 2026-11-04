@@ -72,17 +72,29 @@ BEGIN
       MESSAGE = 'session output: no ready aggregate publication for this workspace';
   END IF;
   RETURN QUERY
+    -- Only the current ready publication counts; staged/superseded rows are
+    -- invisible to the read (the EXISTS gate above is existence, not scoping).
+    WITH scoped AS MATERIALIZED (
+      SELECT c.* FROM sessions.session_aggregate_candidates c
+      JOIN sessions.session_aggregate_publications p ON p.id = c.publication_id
+      WHERE p.org_id = v_org AND p.workspace_id = p_workspace_id
+        AND p.ready AND p.superseded_by IS NULL
+        AND c.ts >= p_since AND c.ts <= p_until
+    ), commits AS (
+      -- One row per sha, explicit links/outcomes preferred over tool-derived;
+      -- earliest ts wins inside a type (the oracle's prefix+min(ts) semantics).
+      SELECT DISTINCT ON (dedup_key) dedup_key, stats
+      FROM scoped WHERE candidate_type IN ('explicit_commit','tool_commit')
+      ORDER BY dedup_key,
+        CASE candidate_type WHEN 'explicit_commit' THEN 0 ELSE 1 END, ts
+    )
     SELECT
-      count(*) FILTER (WHERE c.candidate_type IN ('assistant_message','legacy_turn'))::bigint,
-      count(DISTINCT c.dedup_key) FILTER (WHERE c.candidate_type IN ('explicit_commit','tool_commit'))::bigint,
-      COALESCE(sum((c.stats->>'added')::bigint) FILTER (WHERE c.stats ? 'added'), 0)::bigint,
-      COALESCE(sum((c.stats->>'removed')::bigint) FILTER (WHERE c.stats ? 'removed'), 0)::bigint,
-      (count(DISTINCT c.dedup_key) FILTER (
-        WHERE c.candidate_type IN ('explicit_commit','tool_commit')
-          AND NOT (c.stats ? 'added' AND c.stats ? 'removed')))::bigint
-    FROM sessions.session_aggregate_candidates c
-    WHERE c.org_id = v_org AND c.workspace_id = p_workspace_id
-      AND c.ts >= p_since AND c.ts <= p_until;
+      count(*) FILTER (WHERE candidate_type IN ('assistant_message','legacy_turn'))::bigint,
+      (SELECT count(*) FROM commits)::bigint,
+      (SELECT COALESCE(sum((stats->>'added')::bigint), 0) FROM commits WHERE stats ? 'added')::bigint,
+      (SELECT COALESCE(sum((stats->>'removed')::bigint), 0) FROM commits WHERE stats ? 'removed')::bigint,
+      (SELECT count(*) FROM commits WHERE NOT (stats ? 'added' AND stats ? 'removed'))::bigint
+    FROM scoped;
 END
 $fn$;
 
@@ -95,6 +107,12 @@ DECLARE
   v_org text;
 BEGIN
   SELECT s.org_id INTO v_org FROM sessions.session_directory_worker_scope(p_workspace_id) AS s;
+  IF NOT EXISTS (SELECT 1 FROM sessions.session_aggregate_publications p
+                  WHERE p.org_id = v_org AND p.workspace_id = p_workspace_id
+                    AND p.ready AND p.superseded_by IS NULL) THEN
+    RAISE EXCEPTION USING ERRCODE = '42501',
+      MESSAGE = 'session activity: no ready aggregate publication for this workspace';
+  END IF;
   RETURN QUERY
     -- Compact metadata answers non-q activity: distinct sessions per UTC day and
     -- source from event_times (20261103010000), not transcript rows.

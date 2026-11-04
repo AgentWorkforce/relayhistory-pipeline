@@ -28,13 +28,15 @@ export interface CandidateRow {
   stats?: Record<string, number>; provenance?: Record<string, string>;
 }
 
-const GIT_COMMIT = /\mgit\M[^\n]*\mcommit\M/;
+const GIT_COMMIT = /\bgit\b[^\n]*\bcommit\b/;
 const RESULT_SHA = /(?:^|\n)\[[^\]\n]+ ([0-9a-f]{7,40})\][^\n]*\n[ \t]*[0-9]+ files? changed(?:, ([0-9]+) insertions?\(\+\))?(?:, ([0-9]+) deletions?\(-\))?/g;
 const TOOLS = new Set(["exec_command","exec","Bash","bash","shell","run_shell_command"]);
 
 export function deriveCandidates(
   events: FoldEvent[], turns: LegacyTurn[], links: CommitRecord[], outcomes: CommitRecord[],
 ): CandidateRow[] {
+  // events/turns are the caller's in-window sets; a legacy turn is suppressed
+  // only when its session already produced an in-window assistant message.
   const out: CandidateRow[] = [];
   const messageIds = new Map<string, string>();
   for (const e of events) {
@@ -59,13 +61,19 @@ export function deriveCandidates(
       type: "explicit_commit", dedupKey: c.sha.toLowerCase(), ts: c.ts,
       stats: c.stats, provenance: { method: c.provenance } });
   for (const call of events.filter(e => e.toolName && TOOLS.has(e.toolName) && GIT_COMMIT.test(e.record?.payload?.args_json ?? ""))) {
-    const results = events.filter(e => e.actorRole === "tool_result");
+    // Correlate tool_result events to THIS call by the shared payload key
+    // (message_id/request_key/delivery_record_id), not every result in the set.
+    const callKey = call.record?.payload?.message_id || call.requestKey || call.deliveryRecordId;
+    const results = events.filter(e => e.actorRole === "tool_result" &&
+      e.source === call.source && e.sessionId === call.sessionId &&
+      callKey !== undefined &&
+      (e.record?.payload?.message_id === callKey || e.requestKey === callKey || e.deliveryRecordId === callKey));
     for (const r of results)
       for (const m of (r.content ?? "").matchAll(RESULT_SHA) as unknown as RegExpExecArray[])
         out.push({ orgId: r.orgId, workspaceId: r.workspaceId, source: r.source, sessionId: r.sessionId,
           type: "tool_commit", dedupKey: m[1]!.toLowerCase(), ts: r.ts,
           stats: { added: +(m[2] ?? 0), removed: +(m[3] ?? 0) },
-          provenance: { call: r.deliveryRecordId ?? r.eventId ?? "" } });
+          provenance: { call: callKey ?? "" } });
   }
   return out;
 }
