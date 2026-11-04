@@ -1,7 +1,8 @@
 // GENERATED from relayhistory-cloud packages/relayhistory/src/lib/search-feature-journal.ts
-// Source commit: e69cf044470bc0e4d3fc2e1c1e860c58b69019cb; SHA256: 8b732e8365efdbc7cc857d284cae639e5869dc52fa2dfdf04ffea1159501f077
+// Source commit: d482b688a4d52028fdc3613b8f1e7990eb31572a; SHA256: b43043e3b2898b5e44b317ed7e95d3382db49db65438e9976fe6f80b68f0bd11
 // Regenerate/check: bun scripts/sync-search-feature-source.ts --source <RHC-worktree> [--check]
 /** Readonly legacy feature source API. No connection, token, model or writes. */
+export const FEATURE_SOURCE_PAGE_BYTES = 16 * 1024 * 1024;
 export type FeatureKind = "event" | "brief";
 export interface FeatureReader {
   query<T>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
@@ -123,10 +124,12 @@ export async function readFeatureJournalPage(
       db,
       `WITH observed AS MATERIALIZED(SELECT revision FROM sessions.search_feature_clock WHERE singleton),
  selected AS MATERIALIZED(SELECT c.* FROM sessions.search_feature_changes c,observed o WHERE c.feature_type=$1 AND c.revision>$2::bigint AND c.revision<=o.revision ORDER BY c.revision LIMIT $3)
- SELECT jsonb_build_object('observedRevision',o.revision::text,'rows',coalesce((SELECT jsonb_agg(jsonb_build_object('kind',s.feature_type,'key',s.feature_key,'revision',s.revision::text,'sourceHash',s.source_hash,'deleted',s.deleted) ORDER BY s.revision) FROM selected s),'[]'::jsonb)) p FROM observed o`,
+ , packed AS MATERIALIZED(SELECT coalesce(jsonb_agg(jsonb_build_object('kind',s.feature_type,'key',s.feature_key,'revision',s.revision::text,'sourceHash',s.source_hash,'deleted',s.deleted) ORDER BY s.revision),'[]'::jsonb) data FROM selected s)
+ SELECT jsonb_build_object('observedRevision',o.revision::text,'too_large',octet_length(p.data::text)>${FEATURE_SOURCE_PAGE_BYTES},'rows',CASE WHEN octet_length(p.data::text)>${FEATURE_SOURCE_PAGE_BYTES} THEN '[]'::jsonb ELSE p.data END) p FROM observed o,packed p`,
       [k, afterRevision, batch + 1],
     )
   ).rows[0]?.p;
+  if (result?.too_large === true) return fail("page_bytes");
   if (
     !result ||
     !decimal(result.observedRevision) ||
@@ -169,20 +172,25 @@ export async function readFeatureSnapshots(
     if (keys.has(k)) return fail("duplicate");
     keys.add(k);
   }
-  const rows = (
+  const packet = (
     await sourceQuery<any>(
       db,
       `WITH wanted AS MATERIALIZED(SELECT x.kind,x.key,x.ordinal FROM jsonb_to_recordset($1::jsonb) AS x(kind text,key jsonb,ordinal integer)),
  current AS MATERIALIZED(SELECT w.*,h.revision,h.source_hash,h.deleted,sessions.search_feature_payload(w.kind,w.key) payload
  FROM wanted w LEFT JOIN sessions.search_feature_heads h ON h.feature_type=w.kind AND h.feature_key=w.key)
- SELECT kind,key,ordinal,revision::text,source_hash,deleted,payload,${payloadHashSql} actual_hash FROM current ORDER BY ordinal`,
+ , encoded AS MATERIALIZED(SELECT kind,key,ordinal,revision::text revision,source_hash,deleted,payload,${payloadHashSql} actual_hash FROM current),
+ packed AS MATERIALIZED(SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY ordinal),'[]'::jsonb) data FROM encoded e)
+ SELECT jsonb_build_object('too_large',octet_length(data::text)>${FEATURE_SOURCE_PAGE_BYTES},'rows',CASE WHEN octet_length(data::text)>${FEATURE_SOURCE_PAGE_BYTES} THEN '[]'::jsonb ELSE data END) page FROM packed`,
       [
         JSON.stringify(
           wanted.map((r, ordinal) => ({ kind: r.kind, key: r.key, ordinal })),
         ),
       ],
     )
-  ).rows;
+  ).rows[0]?.page;
+  if (packet?.too_large === true) return fail("page_bytes");
+  if (!packet || !Array.isArray(packet.rows)) return fail("snapshot_invalid");
+  const rows: any[] = packet.rows;
   if (rows.length !== wanted.length) return fail("snapshot_missing");
   return rows.map((r, n) => {
     const original = wanted[n]!;
@@ -272,14 +280,19 @@ export async function readFeatureBaselinePage(
         })
         .join(",")})`
     : "";
-  const rows = (
+  const packet = (
     await sourceQuery<any>(
       db,
       `WITH source AS MATERIALIZED(SELECT sessions.${keyFn}(s) key,sessions.${payloadFn}(s) payload,${columns.map((c) => `s.${c}`).join(",")} FROM sessions.${table} s WHERE true ${where} ORDER BY ${tuple} LIMIT $1)
- SELECT s.*,encode(sha256(convert_to(coalesce(payload,jsonb_build_array('deleted','${k}',key))::text,'UTF8')),'hex') actual_hash FROM source s ORDER BY ${tuple}`,
+ ,encoded AS MATERIALIZED(SELECT s.*,encode(sha256(convert_to(coalesce(payload,jsonb_build_array('deleted','${k}',key))::text,'UTF8')),'hex') actual_hash FROM source s),
+ packed AS MATERIALIZED(SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY ${tuple}),'[]'::jsonb) data FROM encoded s)
+ SELECT jsonb_build_object('too_large',octet_length(data::text)>${FEATURE_SOURCE_PAGE_BYTES},'rows',CASE WHEN octet_length(data::text)>${FEATURE_SOURCE_PAGE_BYTES} THEN '[]'::jsonb ELSE data END) page FROM packed`,
       params,
     )
-  ).rows;
+  ).rows[0]?.page;
+  if (packet?.too_large === true) return fail("page_bytes");
+  if (!packet || !Array.isArray(packet.rows)) return fail("baseline_invalid");
+  const rows: any[] = packet.rows;
   if (rows.length > batch + 1) return fail("baseline_invalid");
   const selected = rows.slice(0, batch);
   const refs = selected.map((r) =>
@@ -306,8 +319,29 @@ export interface FeatureSourceAuthority {
   repository: string;
   apiSha256: string;
   migrationSha256: string;
+  catalogSha256: string;
   identitySha256: string;
   catalog: {
+    relations: ReadonlyArray<{
+      identity: string;
+      kind: string;
+      rls: boolean;
+      forceRls: boolean;
+    }>;
+    database: {
+      datcollate: string;
+      datctype: string;
+      datlocprovider: string;
+      datlocale: string;
+    };
+    columns: ReadonlyArray<{
+      table: string;
+      column: string;
+      collation: string;
+      provider: string;
+      schema: string;
+      version: string | null;
+    }>;
     functions: ReadonlyArray<{
       identity: string;
       bodyHash: string;
@@ -361,18 +395,30 @@ export async function verifyFeatureSourceAuthority(
     ![
       expected.apiSha256,
       expected.migrationSha256,
+      expected.catalogSha256,
       expected.identitySha256,
     ].every(hex) ||
     expected.catalog?.functions?.length !== 11 ||
-    expected.catalog?.triggers?.length !== 3
+    expected.catalog?.triggers?.length !== 3 ||
+    expected.catalog?.columns?.length !== 16 ||
+    expected.catalog?.relations?.length !== 7
   )
     return fail("authority_invalid");
+  const catalogBytes = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(stableMetadata(expected.catalog)),
+  );
+  const catalogHash = Array.from(new Uint8Array(catalogBytes), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+  if (catalogHash !== expected.catalogSha256) return fail("authority_invalid");
   const identityBytes = await crypto.subtle.digest(
     "SHA-256",
     new TextEncoder().encode(
       JSON.stringify({
         apiSha256: expected.apiSha256,
         migrationSha256: expected.migrationSha256,
+        catalogSha256: expected.catalogSha256,
       }),
     ),
   );
@@ -386,17 +432,28 @@ export async function verifyFeatureSourceAuthority(
     triggers = [...expected.catalog.triggers].sort((a, b) =>
       a.table + "/" + a.name < b.table + "/" + b.name ? -1 : 1,
     );
+  const columns = [...expected.catalog.columns].sort((a, b) =>
+    a.table + "/" + a.column < b.table + "/" + b.column ? -1 : 1,
+  );
+  const relations = [...expected.catalog.relations].sort((a, b) =>
+    a.identity < b.identity ? -1 : 1,
+  );
   const report = (
     await sourceQuery<any>(
       db,
       `WITH f AS MATERIALIZED(SELECT * FROM jsonb_to_recordset($1::jsonb) x(identity text)),
- t AS MATERIALIZED(SELECT * FROM jsonb_to_recordset($2::jsonb) x("table" text,name text,"functionIdentity" text))
+ t AS MATERIALIZED(SELECT * FROM jsonb_to_recordset($2::jsonb) x("table" text,name text,"functionIdentity" text)),
+ cdef AS MATERIALIZED(SELECT * FROM jsonb_to_recordset($3::jsonb) x("table" text,"column" text)),
+ rdef AS MATERIALIZED(SELECT * FROM jsonb_to_recordset($4::jsonb) x(identity text))
  SELECT (SELECT checksum FROM sessions.__migrations WHERE name='0076_search_feature_journal.sql') checksum,
  (SELECT revision::text FROM sessions.search_feature_clock WHERE singleton) observed_revision,
  (SELECT jsonb_agg(jsonb_build_object('identity',f.identity,'bodyHash',encode(sha256(convert_to(p.prosrc,'UTF8')),'hex'),'language',l.lanname,'securityDefiner',p.prosecdef,'volatility',p.provolatile::text,'config',coalesce(to_jsonb(p.proconfig),'[]'::jsonb)) ORDER BY f.identity)
  FROM f LEFT JOIN pg_catalog.pg_proc p ON p.oid=to_regprocedure(f.identity) LEFT JOIN pg_catalog.pg_language l ON l.oid=p.prolang) functions,
  (SELECT jsonb_agg(jsonb_build_object('table',t."table",'name',t.name,'functionIdentity',CASE WHEN g.tgfoid=to_regprocedure(t."functionIdentity") THEN t."functionIdentity" ELSE NULL END,'enabled',g.tgenabled::text,'type',g.tgtype::integer,'internal',g.tgisinternal,'when',g.tgqual IS NOT NULL,'args',g.tgnargs::integer,'columns',g.tgattr::text,'deferrable',g.tgdeferrable,'initiallyDeferred',g.tginitdeferred,'constraint',g.tgconstraint<>0) ORDER BY t."table",t.name)
  FROM t LEFT JOIN pg_catalog.pg_trigger g ON g.tgrelid=to_regclass(t."table") AND g.tgname=t.name) triggers,
+ (SELECT jsonb_build_object('datcollate',d.datcollate,'datctype',d.datctype,'datlocprovider',d.datlocprovider::text,'datlocale',coalesce(to_jsonb(d)->>'datlocale','')) FROM pg_catalog.pg_database d WHERE datname=current_database()) database,
+ (SELECT jsonb_agg(jsonb_build_object('table',e."table",'column',e."column",'collation',c.collname,'provider',c.collprovider::text,'schema',n.nspname,'version',c.collversion) ORDER BY e."table",e."column") FROM cdef e LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=to_regclass(e."table") AND a.attname=e."column" AND a.attnum>0 AND NOT a.attisdropped LEFT JOIN pg_catalog.pg_collation c ON c.oid=a.attcollation LEFT JOIN pg_catalog.pg_namespace n ON n.oid=c.collnamespace) columns,
+ (SELECT jsonb_agg(jsonb_build_object('identity',e.identity,'kind',c.relkind::text,'rls',c.relrowsecurity,'forceRls',c.relforcerowsecurity) ORDER BY e.identity) FROM rdef e LEFT JOIN pg_catalog.pg_class c ON c.oid=to_regclass(e.identity)) relations,
  pg_catalog.pg_get_viewdef(to_regclass('sessions.search_feature_heads'),false) heads_view`,
       [
         JSON.stringify(fns.map((f) => ({ identity: f.identity }))),
@@ -407,11 +464,21 @@ export async function verifyFeatureSourceAuthority(
             functionIdentity: t.functionIdentity,
           })),
         ),
+        JSON.stringify(
+          columns.map((c) => ({ table: c.table, column: c.column })),
+        ),
+        JSON.stringify(relations.map((r) => ({ identity: r.identity }))),
       ],
     )
   ).rows;
   if (report.length !== 1) return fail("authority_mismatch");
   const r = report[0];
+  if (stableMetadata(r.database) !== stableMetadata(expected.catalog.database))
+    return fail("authority_collation_mismatch");
+  if (stableMetadata(r.relations) !== stableMetadata(relations))
+    return fail("authority_visibility_mismatch");
+  if (stableMetadata(r.columns) !== stableMetadata(columns))
+    return fail("authority_collation_mismatch");
   if (
     r.checksum !== expected.migrationSha256 ||
     !decimal(r.observed_revision) ||

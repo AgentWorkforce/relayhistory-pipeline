@@ -16,7 +16,7 @@ export async function readLegacyCasefoldProfile(
     const metadata = async () => {
       const r = (
         await db.query<Record<string, string>>(
-          "SELECT datcollate,datctype,datlocprovider FROM pg_catalog.pg_database WHERE datname=current_database()",
+          "SELECT datcollate,datctype,datlocprovider,coalesce(to_jsonb(d)->>'datlocale','') datlocale FROM pg_catalog.pg_database d WHERE datname=current_database()",
         )
       ).rows;
       if (r.length !== 1) throw new BriefFeatureError("casefold_profile");
@@ -30,7 +30,17 @@ export async function readLegacyCasefoldProfile(
       )
     )
       throw new BriefFeatureError("casefold_profile");
-    if (source.datlocprovider !== "c")
+    if (typeof source.datlocale !== "string")
+      throw new BriefFeatureError("casefold_profile");
+    if (
+      !(
+        (source.datlocprovider === "c" && source.datlocale === "") ||
+        (source.datlocprovider === "b" &&
+          source.datcollate === "C.UTF-8" &&
+          source.datctype === "C.UTF-8" &&
+          source.datlocale === "C.UTF-8")
+      )
+    )
       throw new BriefFeatureError("casefold_contextual");
     for (let start = 1; start <= 0x10ffff; start += 8192) {
       const chars: string[] = [];
