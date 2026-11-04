@@ -10,6 +10,7 @@ setDefaultTimeout(30000);
 const root=join(import.meta.dir,"../../.."),open:PGlite[]=[];
 afterEach(async()=>{for(const db of open.splice(0))await db.close()});
 const hash=(s:string)=>createHash("sha256").update(s).digest("hex");
+const generation="a".repeat(64);
 const tenant={orgId:"org-a",workspaceId:"ws-a",userId:"user-a"},origin="origin-a";
 async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(db);
@@ -19,12 +20,13 @@ async function fixture(){
   await db.exec(read("supabase/bootstrap/"+name+".sql"));
  for(const name of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())
   await db.exec(read("supabase/migrations/"+name));
+ await db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now());INSERT INTO sessions.__96bulls_role_validation(name,generation,status) VALUES('session_directory_search_worker','"+generation+"','pass') ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,status=excluded.status");
  const as=async(role:string,text:string,params:unknown[]=[])=>{
   await db.exec("BEGIN;SET LOCAL ROLE "+role);
   try{const r=await db.query(text,params as never);await db.exec("COMMIT");return r}
   catch(e){await db.exec("ROLLBACK");throw e}
  };
- const rpc=async(name:string,p:unknown)=>(await as("bulls96_session_ingest","SELECT sessions.ingest_buffer_gc_"+name+"($1::jsonb) AS r",[JSON.stringify(p)])).rows[0]!.r as any;
+ const rpc=async(name:string,p:unknown)=>(await as("bulls96_session_ingest","SELECT sessions.ingest_buffer_gc_"+name+"($1::jsonb) AS r",[JSON.stringify(name==="claim"?{generation,...p as any}:p)])).rows[0]!.r as any;
  const ledger=sqlLedger(((s:string,p:unknown[])=>as("bulls96_session_ingest",s,p)) as never);
  let serial=0;
  async function stage(opts:{ack?:boolean;groups?:number[][];expired?:boolean}={}){

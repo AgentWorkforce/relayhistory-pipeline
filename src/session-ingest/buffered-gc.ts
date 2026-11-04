@@ -46,7 +46,8 @@ export interface BufferedGcLedger {
   swap(ticket: BufferedGcTicket, replacementStageToken: string | null): Promise<boolean>;
   finish(ticket: BufferedGcTicket, barrierVersionId: string): Promise<boolean>;
 }
-export function sqlBufferedGcLedger(db: BufferedGcSql): BufferedGcLedger {
+export function sqlBufferedGcLedger(db: BufferedGcSql,expectedGeneration:string): BufferedGcLedger {
+  if(!/^[a-f0-9]{64}$/.test(expectedGeneration))no("generation_required");
   const call = async (name: string, p: unknown): Promise<Record<string, any>> => {
     let value: unknown;
     try { value = (await db.query(`SELECT sessions.${name}($1::jsonb) AS result`, [JSON.stringify(p)])).rows[0]?.result; }
@@ -58,7 +59,7 @@ export function sqlBufferedGcLedger(db: BufferedGcSql): BufferedGcLedger {
   return {
     async claim(limit) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) no('claim_limit');
-      const r = await call('ingest_buffer_gc_claim', { limit });
+      const r = await call('ingest_buffer_gc_claim', { limit,generation:expectedGeneration });
       if (!Array.isArray(r.tickets) || r.tickets.length > limit) no('sql_tickets');
       r.tickets.forEach(assertBufferedTicket);
       return r.tickets;
