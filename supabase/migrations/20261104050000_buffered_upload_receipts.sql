@@ -5,12 +5,14 @@ ALTER TABLE sessions.ingest_batches
  ADD COLUMN buffer_receipt_kind text CHECK(buffer_receipt_kind IN('staged','suppressed'));
 ALTER TABLE sessions.ingest_claim_attempts
  ADD COLUMN records jsonb CHECK(records IS NULL OR jsonb_typeof(records)='array'),
- ADD COLUMN reset_epoch bigint CHECK(reset_epoch IS NULL OR reset_epoch>=0);
+ ADD COLUMN reset_epoch bigint CHECK(reset_epoch IS NULL OR reset_epoch>=0),
+ ADD COLUMN schema_generation text CHECK(schema_generation IS NULL OR schema_generation ~ '^[0-9a-f]{64}$');
 
 CREATE TABLE sessions.ingest_buffer_admission (
  org_id text PRIMARY KEY,
  privacy_baseline_sha256 text NOT NULL CHECK(privacy_baseline_sha256 ~ '^[0-9a-f]{64}$'),
  retention_contract_sha256 text NOT NULL CHECK(retention_contract_sha256 ~ '^[0-9a-f]{64}$'),
+ schema_generation text NOT NULL CHECK(schema_generation ~ '^[0-9a-f]{64}$'),
  valid_until timestamptz NOT NULL
 );
 -- Each intent is registered beforePUT. Retired keys remain durable cleanup
@@ -51,10 +53,30 @@ ALTER TABLE sessions.ingest_buffer_outbox ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.ingest_buffer_admission,sessions.ingest_stage_intents,sessions.ingest_buffer_outbox
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
+-- Shared current-PASS fence. Take this before USER/BATCH/INTENT locks.
+-- Owner-only invoker: callers are the reviewed security-definer RPCs.
+CREATE FUNCTION sessions.ingest_require_generation(p_expected text) RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $generation$
+BEGIN
+ IF p_expected IS NULL OR p_expected!~'^[0-9a-f]{64}$'
+ THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: generation required';END IF;
+ PERFORM 1 FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'
+  AND generation=p_expected AND status='pass' FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: generation not ready';END IF;
+END $generation$;
+REVOKE ALL ON FUNCTION sessions.ingest_require_generation(text)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
 CREATE FUNCTION sessions.ingest_require_buffer_admission(p_org text) RETURNS void
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $admission$
+DECLARE v_generation text;
 BEGIN
- IF NOT EXISTS(SELECT 1 FROM sessions.ingest_buffer_admission WHERE org_id=p_org AND valid_until>clock_timestamp()) THEN
+ SELECT generation INTO v_generation FROM sessions.__96bulls_role_validation
+  WHERE name='session_directory_search_worker' AND status='pass' FOR SHARE;
+ IF v_generation IS NULL THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: generation not ready';END IF;
+ PERFORM 1 FROM sessions.ingest_buffer_admission
+  WHERE org_id=p_org AND valid_until>clock_timestamp() AND schema_generation=v_generation FOR SHARE;
+ IF NOT FOUND THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered privacy or retention baseline not ready';
  END IF;
 END
@@ -101,6 +123,11 @@ BEGIN
                 FROM sessions.ingest_session_pairs(p -> 'sessions') AS x);
   v_items := sessions.ingest_records(p -> 'records');
 
+  IF p_mode='canonical' AND (
+    EXISTS(SELECT 1 FROM sessions.ingest_buffer_admission WHERE org_id=k.org_id) OR
+    EXISTS(SELECT 1 FROM sessions.ingest_batches WHERE org_id=k.org_id AND publication_state='buffered')) THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: explicit buffered publication authority required';
+  END IF;
   PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
 
   -- (a) A known batch id: its receipt, a resume, or a batch-id 409. The primary key
@@ -281,22 +308,41 @@ LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $ca
  SELECT sessions.ingest_claim_batch_mode(p,'canonical');
 $canonical$;
 CREATE FUNCTION sessions.ingest_claim_buffered_batch(p jsonb) RETURNS jsonb
-LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $buffered$
- SELECT sessions.ingest_claim_batch_mode(p,'buffered');
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $buffered$
+DECLARE v_generation text;v_result jsonb;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','receiptId','sessions','records','generation']);
+ v_generation:=sessions.ingest_digest(p->'generation');
+ PERFORM sessions.ingest_require_generation(v_generation);
+ PERFORM sessions.ingest_require_buffer_admission(p#>>'{tenant,orgId}');
+ v_result:=sessions.ingest_claim_batch_mode(p-'generation','buffered');
+ IF v_result->>'kind' IN('claimed','resume') THEN
+  UPDATE sessions.ingest_claim_attempts SET schema_generation=v_generation
+   WHERE claim_token=(v_result->>'claimToken')::uuid AND (schema_generation IS NULL OR schema_generation=v_generation);
+  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: claim generation collision';END IF;
+ END IF;
+ PERFORM sessions.ingest_require_buffer_admission(p#>>'{tenant,orgId}');
+ RETURN v_result;
+END
 $buffered$;
 
 CREATE FUNCTION sessions.ingest_prepare_buffer_stage(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $prepare$
-DECLARE k record;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;
+DECLARE k record;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;v_generation text;
  v_key text;v_sha text;v_bytes bigint;v_groups jsonb;v_count integer;v_distinct integer;v_token uuid;v_pairs jsonb;v_fenced jsonb;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
- PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','claimToken','key','sha256','bytes','groupOrdinals']);
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','claimToken','key','sha256','bytes','groupOrdinals','generation']);
+ v_generation:=sessions.ingest_digest(p->'generation');
+ PERFORM sessions.ingest_require_generation(v_generation);
  k:=sessions.ingest_batch_key(p);
- PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
  PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+ PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
  PERFORM sessions.ingest_attempt_epochs(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,p->>'claimToken');
  SELECT * INTO a FROM sessions.ingest_claim_attempts WHERE claim_token=(p->>'claimToken')::uuid;
+ IF a.schema_generation IS DISTINCT FROM v_generation
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: claim generation changed';END IF;
  IF a.reset_epoch IS NULL OR a.records IS NULL THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: attempt lacks buffered proof'; END IF;
  PERFORM 1 FROM sessions.ingest_batches b WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id
   AND b.origin_id=k.origin_id AND b.batch_id=k.batch_id AND b.user_id=k.user_id AND b.digest=k.digest
@@ -361,7 +407,8 @@ BEGIN
     OR t.parent_stage_token IS NOT NULL THEN
    RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: buffered intent refused';
   END IF;
-  RETURN jsonb_build_object('stageToken',t.stage_token,'expiresAt',t.expires_at);
+  PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+ RETURN jsonb_build_object('stageToken',t.stage_token,'expiresAt',t.expires_at);
  END IF;
  v_token:=gen_random_uuid();
  INSERT INTO sessions.ingest_stage_intents(stage_token,claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,
@@ -369,23 +416,28 @@ BEGIN
  VALUES(v_token,a.claim_token,k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,
    v_key,v_sha,v_bytes,v_groups,a.reset_epoch,clock_timestamp()+interval '120 seconds')
  RETURNING * INTO t;
+ PERFORM sessions.ingest_require_buffer_admission(k.org_id);
  RETURN jsonb_build_object('stageToken',t.stage_token,'expiresAt',t.expires_at);
 END
 $prepare$;
 
 CREATE FUNCTION sessions.ingest_commit_buffered_batch(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $bcommit$
-DECLARE k record;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;
+DECLARE k record;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;v_generation text;
  v_pairs jsonb;v_fenced jsonb;v_invalid boolean;v_stage uuid;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
- PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','claimToken','stageToken']);
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['tenant','originId','batchId','batchDigest','claimToken','stageToken','generation']);
+ v_generation:=sessions.ingest_digest(p->'generation');
+ PERFORM sessions.ingest_require_generation(v_generation);
  k:=sessions.ingest_batch_key(p);
- PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
  PERFORM sessions.ingest_require_buffer_admission(k.org_id);
+ PERFORM sessions.ingest_lock_fences(k.org_id,k.workspace_id,k.user_id);
  PERFORM sessions.ingest_attempt_epochs(k.org_id,k.workspace_id,k.user_id,k.origin_id,k.batch_id,k.digest,p->>'claimToken');
  v_stage:=(p->>'stageToken')::uuid;
  SELECT * INTO a FROM sessions.ingest_claim_attempts WHERE claim_token=(p->>'claimToken')::uuid;
+ IF a.schema_generation IS DISTINCT FROM v_generation
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: claim generation changed';END IF;
  PERFORM 1 FROM sessions.ingest_batches b WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id
   AND b.origin_id=k.origin_id AND b.batch_id=k.batch_id AND b.user_id=k.user_id AND b.digest=k.digest
   AND b.publication_state='buffered' FOR UPDATE;
@@ -409,6 +461,7 @@ BEGIN
  IF t.receipt_state='acknowledged' THEN
   IF EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox o WHERE o.org_id=k.org_id AND o.workspace_id=k.workspace_id
     AND o.origin_id=k.origin_id AND o.batch_id=k.batch_id AND o.digest=k.digest AND o.active_stage_token=v_stage) THEN
+   PERFORM sessions.ingest_require_buffer_admission(k.org_id);
    RETURN jsonb_build_object('kind','committed');
   END IF;
   RETURN jsonb_build_object('kind','intent_invalid');
@@ -422,6 +475,8 @@ BEGIN
  UPDATE sessions.ingest_batches b SET state='committed',committed_at=coalesce(b.committed_at,clock_timestamp()),buffer_receipt_kind='staged'
  WHERE b.org_id=k.org_id AND b.workspace_id=k.workspace_id AND b.origin_id=k.origin_id AND b.batch_id=k.batch_id
   AND b.user_id=k.user_id AND b.digest=k.digest AND b.publication_state='buffered';
+ IF clock_timestamp()>=t.expires_at THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered intent expired';END IF;
+ PERFORM sessions.ingest_require_buffer_admission(k.org_id);
  RETURN jsonb_build_object('kind','committed');
 END
 $bcommit$;
@@ -625,3 +680,73 @@ BEGIN
   RETURN jsonb_build_object('rearmed', v_rearmed,'invalidated',v_invalidated);
 END
 $commit$;
+
+-- Guard existing controls without broadening grants or scope.
+CREATE OR REPLACE FUNCTION sessions.ingest_set_session_uploads(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $select$
+DECLARE
+  t jsonb;
+  v_org text;v_generation text;v_result jsonb;
+BEGIN
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  -- Retained enrollment/history cannot fall back after admission closes.
+  v_org:=p#>>'{tenant,orgId}';
+  IF p?'generation' OR EXISTS(SELECT 1 FROM sessions.ingest_buffer_admission WHERE org_id=v_org)
+    OR EXISTS(SELECT 1 FROM sessions.ingest_batches WHERE org_id=v_org AND publication_state='buffered') THEN
+   v_generation:=sessions.ingest_digest(p->'generation');
+   PERFORM sessions.ingest_require_generation(v_generation);
+   PERFORM sessions.ingest_require_buffer_admission(v_org);
+   p:=p-'generation';
+  END IF;
+  PERFORM sessions.ingest_exact_keys(p, ARRAY['tenant', 'originId', 'sessions', 'enabled']);
+  t := p -> 'tenant';
+  PERFORM sessions.ingest_exact_keys(t, ARRAY['orgId', 'workspaceId', 'userId']);
+  IF jsonb_typeof(p -> 'enabled') IS DISTINCT FROM 'boolean' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session ingest: enabled is malformed';
+  END IF;
+  v_result:=jsonb_build_object('updated', sessions.ingest_apply_selection(
+    sessions.ingest_identifier(t -> 'orgId', false), sessions.ingest_identifier(t -> 'workspaceId', true),
+    sessions.ingest_identifier(t -> 'userId', false), sessions.ingest_identifier(p -> 'originId', false),
+    p -> 'sessions', (p ->> 'enabled')::boolean));
+  IF v_generation IS NOT NULL THEN PERFORM sessions.ingest_require_buffer_admission(v_org);END IF;
+  RETURN v_result;
+END
+$select$;
+
+-- Guard existing controls without broadening grants or scope.
+CREATE OR REPLACE FUNCTION sessions.ingest_reset_uploaded_sessions(p jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $resetfn$
+DECLARE
+  t jsonb;
+  v_org text;v_generation text;v_result jsonb;
+BEGIN
+  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+  -- Retained enrollment/history cannot fall back after admission closes.
+  v_org:=p#>>'{tenant,orgId}';
+  IF p?'generation' OR EXISTS(SELECT 1 FROM sessions.ingest_buffer_admission WHERE org_id=v_org)
+    OR EXISTS(SELECT 1 FROM sessions.ingest_batches WHERE org_id=v_org AND publication_state='buffered') THEN
+   v_generation:=sessions.ingest_digest(p->'generation');
+   PERFORM sessions.ingest_require_generation(v_generation);
+   PERFORM sessions.ingest_require_buffer_admission(v_org);
+   p:=p-'generation';
+  END IF;
+  PERFORM sessions.ingest_exact_keys(p, ARRAY['tenant', 'requestId']);
+  t := p -> 'tenant';
+  PERFORM sessions.ingest_exact_keys(t, ARRAY['orgId', 'workspaceId', 'userId']);
+  v_result:=jsonb_build_object('deleted', sessions.ingest_apply_reset(
+    sessions.ingest_identifier(t -> 'orgId', false), sessions.ingest_identifier(t -> 'workspaceId', true),
+    sessions.ingest_identifier(t -> 'userId', false), sessions.ingest_identifier(p -> 'requestId', false)));
+  IF v_generation IS NOT NULL THEN PERFORM sessions.ingest_require_buffer_admission(v_org);END IF;
+  RETURN v_result;
+END
+$resetfn$;

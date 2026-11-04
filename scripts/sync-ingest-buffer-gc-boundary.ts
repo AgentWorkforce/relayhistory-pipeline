@@ -9,7 +9,11 @@ for(const m of sql.matchAll(/CREATE(?: OR REPLACE)? FUNCTION\s+(sessions\.ingest
  const types=m[2]!.trim()?m[2]!.split(",").map(p=>p.trim().split(/\s+/).slice(1).join(" ")).join(","):"";
  defs.set(m[1]+"("+types+")",{secdef:/SECURITY DEFINER/i.test(m[3]!)});
 }
-if(defs.size!==6)throw Error("GC SQL function inventory incomplete");
+const bufferSql=await readFile(file("supabase/migrations/20261104050000_buffered_upload_receipts.sql"),"utf8");
+const shared=bufferSql.match(/CREATE FUNCTION\s+(sessions\.ingest_require_generation)\(([^)]*)\)([\s\S]*?)\s+AS\s+\$[a-z_]+\$/i);
+if(!shared)throw Error("generation helper source missing");
+defs.set(shared[1]+"("+shared[2]!.trim().split(/\s+/).slice(1).join(" ")+")",{secdef:/SECURITY DEFINER/i.test(shared[3]!)});
+if(defs.size!==7)throw Error("GC SQL function inventory incomplete");
 const grants=new Set<string>();
 for(const m of sql.matchAll(/GRANT EXECUTE ON FUNCTION([\s\S]*?)TO\s+bulls96_session_ingest\s*;/gi))
  for(const sig of m[1]!.replace(/\s+/g,"").split(/,(?=sessions\.)/)){

@@ -8,14 +8,14 @@ describe("buffer-only runtime gate",()=>{
   expect((await ingestSettings(full))?.inlineMaxSessions).toBe(40);
   await expect(ingestSettings({...full,INGEST_INLINE_MAX_SESSIONS:"0"})).rejects.toThrow();
   await expect(ingestSettings({...full,INGEST_ACCEPTANCE_MODE:"buffered"})).rejects.toThrow();
-  const s=await ingestSettings({...full,INGEST_ACCEPTANCE_MODE:"buffered",INGEST_INLINE_MAX_SESSIONS:"0",INGEST_REPLICA_MODE:"off"});
+  const s=await ingestSettings({...full,INGEST_ACCEPTANCE_MODE:"buffered",INGEST_INLINE_MAX_SESSIONS:"0",INGEST_REPLICA_MODE:"off",INGEST_EXPECT_GENERATION:"a".repeat(64)});
   expect(s?.acceptanceMode).toBe("buffered");expect(s?.inlineMaxSessions).toBe(0);expect(s?.replicaMode).toBe("off");
   await expect(ingestSettings({...full,INGEST_ACCEPTANCE_MODE:"buffered",INGEST_INLINE_MAX_SESSIONS:"0",INGEST_REPLICA_MODE:"required"})).rejects.toThrow();
   await expect(ingestSettings({...full,INGEST_ACCEPTANCE_MODE:"caller-chosen"})).rejects.toThrow();
  });
  test("accidentally unpaused queue retries without DB connection, S3 or ACK",async()=>{
   let connectionReads=0,retries=0,acks=0;
-  const env={...full,INGEST_ACCEPTANCE_MODE:"buffered",INGEST_INLINE_MAX_SESSIONS:"0",
+  const env={...full,INGEST_ACCEPTANCE_MODE:"buffered",INGEST_INLINE_MAX_SESSIONS:"0",INGEST_EXPECT_GENERATION:"a".repeat(64),
    HYPERDRIVE:{get connectionString(){connectionReads++;throw Error("db_unused");}}};
   await worker.queue({messages:[{body:{v:1,kind:"ingest-fanout",key:"never-read",from:0,to:1},ack(){acks++;},retry(o){expect(o?.delaySeconds).toBe(300);retries++;}}]},env);
   expect(connectionReads).toBe(0);expect(retries).toBe(1);expect(acks).toBe(0);
