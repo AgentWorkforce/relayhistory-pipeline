@@ -1,5 +1,5 @@
 // GENERATED from relayhistory-cloud packages/relayhistory/src/lib/search-feature-journal.ts
-// Source commit: d953f2b2974438dd74c7cd4b7daaddbd05a6cf24; SHA256: ee32443826d955142d7279008cbabe68c0fcdfc094cd843a917dae2172eb2026
+// Source commit: 94a2c06ddc7560fa1403b9a2e8dec756ef184ed2; SHA256: 8b732e8365efdbc7cc857d284cae639e5869dc52fa2dfdf04ffea1159501f077
 // Regenerate/check: bun scripts/sync-search-feature-source.ts --source <RHC-worktree> [--check]
 /** Readonly legacy feature source API. No connection, token, model or writes. */
 export type FeatureKind = "event" | "brief";
@@ -298,4 +298,129 @@ export async function readFeatureBaselinePage(
         ? JSON.stringify({ kind: k, after: columns.map((c) => last[c]) })
         : null;
   return { rows: snapshots, nextCursor };
+}
+
+/** Generated expected metadata comes from committed0076 SQL, never source rows. */
+export interface FeatureSourceAuthority {
+  version: 1;
+  repository: string;
+  apiSha256: string;
+  migrationSha256: string;
+  identitySha256: string;
+  catalog: {
+    functions: ReadonlyArray<{
+      identity: string;
+      bodyHash: string;
+      language: string;
+      securityDefiner: boolean;
+      volatility: string;
+      config: readonly string[];
+    }>;
+    triggers: ReadonlyArray<{
+      table: string;
+      name: string;
+      functionIdentity: string;
+      enabled: string;
+      type: number;
+      internal: boolean;
+      when: boolean;
+      args: number;
+      columns: string;
+      deferrable: boolean;
+      initiallyDeferred: boolean;
+      constraint: boolean;
+    }>;
+    headsView: string;
+  };
+}
+const stableMetadata = (v: unknown): string =>
+  JSON.stringify(v, (_key, item) =>
+    item && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.entries(item).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+        )
+      : item,
+  );
+const normalizedHeadsView = (s: string) =>
+  s
+    .toLowerCase()
+    .replace(/"|\s/g, "")
+    .replace(/sessions\./g, "")
+    .replace(/search_feature_changes\./g, "");
+/** Attest the installed ledger, payload/queue/refresh definitions and triggers,
+ * in ONE read snapshot. Compiled constants alone never prove live SQL identity. */
+export async function verifyFeatureSourceAuthority(
+  db: FeatureReader,
+  expected: FeatureSourceAuthority,
+): Promise<{ identitySha256: string; observedRevision: string }> {
+  const hex = (s: unknown) => typeof s === "string" && /^[a-f0-9]{64}$/.test(s);
+  if (
+    !expected ||
+    expected.version !== 1 ||
+    expected.repository !== "AgentWorkforce/relayhistory-cloud" ||
+    ![
+      expected.apiSha256,
+      expected.migrationSha256,
+      expected.identitySha256,
+    ].every(hex) ||
+    expected.catalog?.functions?.length !== 11 ||
+    expected.catalog?.triggers?.length !== 3
+  )
+    return fail("authority_invalid");
+  const identityBytes = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(
+      JSON.stringify({
+        apiSha256: expected.apiSha256,
+        migrationSha256: expected.migrationSha256,
+      }),
+    ),
+  );
+  const identity = Array.from(new Uint8Array(identityBytes), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+  if (identity !== expected.identitySha256) return fail("authority_invalid");
+  const fns = [...expected.catalog.functions].sort((a, b) =>
+      a.identity < b.identity ? -1 : a.identity > b.identity ? 1 : 0,
+    ),
+    triggers = [...expected.catalog.triggers].sort((a, b) =>
+      a.table + "/" + a.name < b.table + "/" + b.name ? -1 : 1,
+    );
+  const report = (
+    await sourceQuery<any>(
+      db,
+      `WITH f AS MATERIALIZED(SELECT * FROM jsonb_to_recordset($1::jsonb) x(identity text)),
+ t AS MATERIALIZED(SELECT * FROM jsonb_to_recordset($2::jsonb) x("table" text,name text,"functionIdentity" text))
+ SELECT (SELECT checksum FROM sessions.__migrations WHERE name='0076_search_feature_journal.sql') checksum,
+ (SELECT revision::text FROM sessions.search_feature_clock WHERE singleton) observed_revision,
+ (SELECT jsonb_agg(jsonb_build_object('identity',f.identity,'bodyHash',encode(sha256(convert_to(p.prosrc,'UTF8')),'hex'),'language',l.lanname,'securityDefiner',p.prosecdef,'volatility',p.provolatile::text,'config',coalesce(to_jsonb(p.proconfig),'[]'::jsonb)) ORDER BY f.identity)
+ FROM f LEFT JOIN pg_catalog.pg_proc p ON p.oid=to_regprocedure(f.identity) LEFT JOIN pg_catalog.pg_language l ON l.oid=p.prolang) functions,
+ (SELECT jsonb_agg(jsonb_build_object('table',t."table",'name',t.name,'functionIdentity',CASE WHEN g.tgfoid=to_regprocedure(t."functionIdentity") THEN t."functionIdentity" ELSE NULL END,'enabled',g.tgenabled::text,'type',g.tgtype::integer,'internal',g.tgisinternal,'when',g.tgqual IS NOT NULL,'args',g.tgnargs::integer,'columns',g.tgattr::text,'deferrable',g.tgdeferrable,'initiallyDeferred',g.tginitdeferred,'constraint',g.tgconstraint<>0) ORDER BY t."table",t.name)
+ FROM t LEFT JOIN pg_catalog.pg_trigger g ON g.tgrelid=to_regclass(t."table") AND g.tgname=t.name) triggers,
+ pg_catalog.pg_get_viewdef(to_regclass('sessions.search_feature_heads'),false) heads_view`,
+      [
+        JSON.stringify(fns.map((f) => ({ identity: f.identity }))),
+        JSON.stringify(
+          triggers.map((t) => ({
+            table: t.table,
+            name: t.name,
+            functionIdentity: t.functionIdentity,
+          })),
+        ),
+      ],
+    )
+  ).rows;
+  if (report.length !== 1) return fail("authority_mismatch");
+  const r = report[0];
+  if (
+    r.checksum !== expected.migrationSha256 ||
+    !decimal(r.observed_revision) ||
+    stableMetadata(r.functions) !== stableMetadata(fns) ||
+    stableMetadata(r.triggers) !== stableMetadata(triggers) ||
+    typeof r.heads_view !== "string" ||
+    normalizedHeadsView(r.heads_view) !==
+      normalizedHeadsView(expected.catalog.headsView)
+  )
+    return fail("authority_mismatch");
+  return { identitySha256: identity, observedRevision: r.observed_revision };
 }
