@@ -350,6 +350,9 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261102000000_session_briefs.sql`                   | table sessions.session_briefs                                                                                           |
 | `upstream:20261102010000_session_directory_canonical_ids.sql`  | column sessions.session_index.canonical_session_id                                                                      |
 | `upstream:20261104022000_session_ingest_ledger.sql`            | table sessions.ingest_batches                                                                                           |
+| `upstream:20261104021000_session_directory_event_metadata.sql` | table sessions.session_directory_event_times |
+| `upstream:20261103040000_session_replay_pages.sql` | table sessions.session_replay_publications |
+| `upstream:20261103080000_session_large_read_jobs.sql` | table sessions.session_large_read_jobs |
 | `upstream:20261102020000_session_brief_state.sql`              | ALTER-only: column sessions.session_briefs.state                                                                        |
 | `upstream:20261104021000_session_directory_event_metadata.sql` | table sessions.session_directory_event_times                                                                            |
 | `upstream:20261104020000_auth_sessions.sql`                    | table sessions.auth_sessions                                                                                            |

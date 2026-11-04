@@ -22,5 +22,8 @@ export default defineConfig({
       { find: /^@rhc\/(.*)$/, replacement: here("../pipeline/src/$1") },
     ],
   },
-  test: { include: ["test/canonical.test.ts"], testTimeout: 30000 },
+  test: {
+    include: ["test/canonical.test.ts", "test/canonical-pages.test.ts"],
+    testTimeout: 30000,
+  },
 });

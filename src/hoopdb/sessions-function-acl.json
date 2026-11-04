@@ -21,10 +21,30 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.capture_session_replay_pages(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.claim_session_large_read(uuid,integer)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.claimless_window_activations_append_only()": [
       "<owner>:EXECUTE"
     ],
     "sessions.clean_root_commit(text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.discover_session_large_reads()": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.enqueue_session_large_read(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.heartbeat_session_large_read(text,text,text,text,uuid)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
@@ -350,6 +370,14 @@
     "sessions.pipeline_jobs_observability()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.publish_session_replay_pages(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.repo_backfill_report()": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -378,6 +406,14 @@
       "service_role:EXECUTE"
     ],
     "sessions.resolve_repo(text,text,text,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.retry_session_large_read(text,text,text,text,uuid,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.route_session_large_read(text,text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
@@ -442,6 +478,10 @@
     "sessions.session_directory_record_fences()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_directory_replay_pages(text,text,text)": [
+      "<owner>:EXECUTE",
+      "session_directory_search_worker:EXECUTE"
+    ],
     "sessions.session_directory_search_query(text)": [
       "<owner>:EXECUTE"
     ],
@@ -481,6 +521,15 @@
     "sessions.session_publication_register_object(jsonb)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.session_replay_directory_changed()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_replay_source_snapshot(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_replay_sources_changed()": [
+      "<owner>:EXECUTE"
     ],
     "sessions.set_session_state(text,text,text,text,text,text,timestamp with time zone)": [
       "<owner>:EXECUTE",

@@ -99,11 +99,13 @@ describe("session pipeline: wiring", () => {
       PIPELINE_ORG_FROM_PREFIX: "true",
       SESSION_PIPELINE_SECRET_ARN: "96bulls/aws-sessions-prod/session-pipeline",
       SEARCH_INDEX_ENABLED: "0",
+      SESSION_REPLAY_PAGES_ENABLED: "0",
       PIPELINE_FANOUT: "off",
       PIPELINE_RECONCILE_LOOKBACK_MINUTES: "60",
     });
     for (const value of Object.values(env)) expect(value).not.toMatch(/postgres(ql)?:\/\/|password|clickhouse\.cloud/i);
     expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true } }).SEARCH_INDEX_ENABLED).toBe("1");
+    expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { replayPages: true } }).SESSION_REPLAY_PAGES_ENABLED).toBe("1");
   });
 
   it("briefs start off: SESSION_BRIEF_ENABLED=false and the schedule DISABLED; enabled sets both, and the caps only when given", () => {
@@ -190,7 +192,7 @@ describe("session pipeline: inputs", () => {
     ({ ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline } }) as unknown as AwsInputs & Record<string, unknown>;
   const validate = (i: AwsInputs & Record<string, unknown>) => assertTranscriptStoreInputs(STAGE, i);
   it("accepts the documented settings and refuses anything else", () => {
-    expect(() => validate(withPipeline({ searchIndex: true, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ searchIndex: true, replayPages: true, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
     expect(() => validate(withPipeline({ queue: "x" }))).toThrow(/sessionPipeline.queue is not a known setting/);
     expect(() => validate(withPipeline({ maxConcurrency: 50 }))).toThrow(/maxConcurrency/);
     expect(() => validate(withPipeline({ reconcileMinutes: 1 }))).toThrow(/reconcileMinutes/);

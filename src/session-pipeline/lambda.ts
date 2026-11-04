@@ -1,3 +1,4 @@
+import { routeLargeRead } from "./large-read-worker.ts";
 /**
  * AWS Lambda entry for the sessions-prod session pipeline
  * (stacks/aws/session-pipeline.ts, runbooks/sessions-prod-session-pipeline.md).
@@ -62,6 +63,8 @@ export interface LambdaEnv {
   secretArn: string;
   queueUrl: string;
   searchEnabled: boolean;
+  replayPagesEnabled: boolean;
+  largeScopeHandoffEnabled?: boolean;
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
   dbPoolMax: number;
@@ -83,6 +86,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     secretArn: need("SESSION_PIPELINE_SECRET_ARN"),
     queueUrl: need("SESSION_PIPELINE_QUEUE_URL"),
     searchEnabled: env.SEARCH_INDEX_ENABLED === "1",
+    replayPagesEnabled: env.SESSION_REPLAY_PAGES_ENABLED === "1",
+    largeScopeHandoffEnabled: env.SESSION_LARGE_READ_HANDOFF_ENABLED === "1",
     fanout,
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
@@ -135,7 +140,7 @@ export function supabasePool(url: string, max: number): HoopDb {
   };
 }
 
-async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
   const client = await db.pool.connect();
   try {
     await client.query("BEGIN");
@@ -223,6 +228,12 @@ async function init(): Promise<Runtime> {
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
     };
   }
+  if (env.replayPagesEnabled) {
+    // This stage needs scoped Put/Get on normalized read artifacts in addition to raw reads.
+    // Wiring code does not grant that permission or enable this default-off flag.
+    deps.replay = { db, store, provider: "s3", bucket: env.bucket, prefix: bindings };
+  }
+  if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large={route:scope=>routeLargeRead(db,scope)};
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
   const brief = briefTick({

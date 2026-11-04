@@ -78,6 +78,10 @@ const EVENTS = "20261104021000_session_directory_event_metadata.sql";
 const EVENTS_UP = read(`supabase/migrations/${EVENTS}`);
 const EVENTS_DOWN = read(`supabase/rollbacks/${EVENTS.replace(/\.sql$/, ".down.sql")}`);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
+// Newer additive consumers of the event/list columns unwind in strict reverse
+// dependency order. Their explicit down files are part of the schema contract.
+const LATER_PHASES=readdirSync(join(root,"supabase/rollbacks")).filter(f=>f.endsWith(".down.sql")&&f>EVENTS.replace(/\.sql$/,".down.sql")).sort();
+
 const TOKEN_ISSUER = "https://issuer.test/session-directory";
 const RPC_SIGNATURE = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
 
@@ -2299,6 +2303,7 @@ describe("short_summary rollback", () => {
     await insertRow(db);
     await summarize(db, KEY, "pelican rollback check");
     // Reverse dependency order: event metadata also depends on G6 and the list/catalog phases.
+    for(const file of [...LATER_PHASES].reverse())await db.exec(read(`supabase/rollbacks/${file}`));
     await db.exec(EVENTS_DOWN);
     await db.exec(BRIEFS_DOWN);
     await db.exec(LIST_DOWN);
@@ -2344,6 +2349,7 @@ describe("short_summary rollback", () => {
     await db.exec(LIST_UP);
     await db.exec(BRIEFS_UP);
     await db.exec(EVENTS_UP);
+    for(const file of LATER_PHASES)await db.exec(read(`supabase/migrations/${file.replace(/\.down\.sql$/,".sql")}`));
     await db.query(
       "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
       [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],
@@ -2410,20 +2416,11 @@ describe("Worker role validation in two phases", () => {
         JOIN pg_roles r ON r.oid = a.grantee WHERE r.rolname = $1 ORDER BY 1`,
       [WORKER],
     );
-    const approved = await db.query<{ fn: string }>(
-      `SELECT unnest(ARRAY[
-         to_regprocedure($1)::text,
-         'sessions.session_directory_pointers(text,text,text)',
-         'sessions.session_directory_readiness()',
-         'sessions.list_session_directory(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
-         'sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)',
-         'sessions.list_session_directory_events(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer,text)',
-         'sessions.session_directory_event_activity(text,timestamp with time zone,timestamp with time zone)',
-         'sessions.session_brief(text,text,text)']) AS fn ORDER BY 1`,
-      [RPC_SIGNATURE],
-    );
+    const manifest=JSON.parse(read("src/hoopdb/sessions-function-acl.json")) as {functions:Record<string,string[]>};
+    const signatures=Object.entries(manifest.functions).filter(([,acl])=>acl.includes(WORKER+":EXECUTE")).map(([signature])=>signature);
+    const approved=await db.query<{fn:string}>("SELECT to_regprocedure(sig)::text fn FROM unnest($1::text[]) sig ORDER BY 1",[signatures]);
     expect(fns.rows).toEqual(approved.rows);
-    expect(fns.rows).toHaveLength(8);
+    expect(fns.rows).toHaveLength(signatures.length);
   });
 
   test("phase 2 ignores PUBLIC-derived EXECUTE: only aclitems naming the role count", async () => {
