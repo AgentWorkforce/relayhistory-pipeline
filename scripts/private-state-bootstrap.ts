@@ -565,18 +565,28 @@ export function bootstrapMetadata(
         !Array.isArray(b.result) ||
         !obj(p) ||
         p.page !== page ||
-        !Number.isSafeInteger(p.total_pages) ||
-        p.total_pages < 1 ||
-        p.total_pages > 100 ||
+        p.per_page !== 100 ||
         !Number.isSafeInteger(p.total_count) ||
-        p.total_count < 0
+        p.total_count < 0 ||
+        !Number.isSafeInteger(p.count) ||
+        p.count !== b.result.length ||
+        p.count > 100
+      )
+        no("metadata_pagination");
+      const lastPage = Math.max(1, Math.ceil(p.total_count / p.per_page));
+      if (
+        lastPage > 100 ||
+        page > lastPage ||
+        p.count !==
+          Math.min(100, Math.max(0, p.total_count - (page - 1) * 100)) ||
+        (p.total_pages !== undefined && p.total_pages !== lastPage)
       )
         no("metadata_pagination");
       if (total !== undefined && total !== p.total_count)
         no("metadata_changed");
       total = p.total_count;
       values.push(...b.result);
-      if (page === p.total_pages) {
+      if (page === lastPage) {
         if (values.length !== total) no("metadata_pagination");
         return values;
       }
