@@ -49,14 +49,21 @@ function setup(s = fixture()) {
       return {
         rows: [
           {
-            ordinal: 0,
-            kind: r.kind,
-            key: r.key,
-            revision: r.revision,
-            source_hash: r.sourceHash,
-            deleted: r.deleted,
-            payload: current.row,
-            actual_hash: r.sourceHash,
+            page: {
+              too_large: false,
+              rows: [
+                {
+                  ordinal: 0,
+                  kind: r.kind,
+                  key: r.key,
+                  revision: r.revision,
+                  source_hash: r.sourceHash,
+                  deleted: r.deleted,
+                  payload: current.row,
+                  actual_hash: r.sourceHash,
+                },
+              ],
+            },
           },
         ] as T[],
       };
