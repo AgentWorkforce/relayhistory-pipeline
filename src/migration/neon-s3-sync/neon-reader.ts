@@ -167,12 +167,24 @@ export async function catalogPage(
   return rows;
 }
 
-/** Whether Neon still has anything to export for a group (a rollup or a catalog row). */
-export async function groupExistsInNeon(db: Queryable, orgId: string, sessionId: string): Promise<boolean> {
+/**
+ * Whether Neon still has anything to export for a group. Legacy-only evidence
+ * (conversation turns, links, outcomes) counts only with `includeLegacy`
+ * (the eraser's `S3X_ERASER_RECOGNIZES_LEGACY`), so the default guard is the
+ * rollup/catalog check the running eraser already uses.
+ */
+export async function groupExistsInNeon(db: Queryable, orgId: string, sessionId: string, includeLegacy = false): Promise<boolean> {
   const { rows } = await db.query(
     `SELECT 1 FROM sessions.session_rollups WHERE org_id = $1 AND session_id = $2
      UNION ALL
-     SELECT 1 FROM sessions.session_catalog WHERE org_id = $1 AND session_id = $2
+     SELECT 1 FROM sessions.session_catalog WHERE org_id = $1 AND session_id = $2${
+       includeLegacy
+         ? `
+     UNION ALL SELECT 1 FROM sessions.conversation_turns WHERE org_id=$1 AND session_id=$2
+     UNION ALL SELECT 1 FROM sessions.session_links WHERE org_id=$1 AND session_id=$2
+     UNION ALL SELECT 1 FROM sessions.session_outcomes WHERE org_id=$1 AND session_id=$2`
+         : ""
+     }
      LIMIT 1`,
     [orgId, sessionId],
   );
