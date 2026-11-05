@@ -117,3 +117,22 @@ describe("canonical_feature_changed (620 invoker client)", () => {
     expect(db.table.filter((r) => r.kind !== "seed").length).toBe(0);
   });
 });
+
+// The CONCRETE class surface enforces the union — an incomplete pair fails to
+// compile, not only the alias assignment.
+describe("class surface enforces the union (compile)", () => {
+  test("incomplete prior pair is a type error on the real class call", async () => {
+    const db = { query: async <T>(_t: string, _p?: unknown[]) =>
+      ({ rows: [] as T[] }) };
+    const fn = new CanonicalFeatureChanged(db);
+    // @ts-expect-error priorPointerSet missing when priorSource is set
+    await expect(fn.canonicalFeatureChanged({
+      scope: { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s",
+               generation: "a".repeat(64) },
+      source: { authorityId: "u", epoch: "1", fingerprint: "a".repeat(64) },
+      priorSource: { authorityId: "v", epoch: "2",
+                     fingerprint: "b".repeat(64) },
+      pointerSet: { authorityId: "u", hash: "c".repeat(64), count: "1" },
+    } as never)).rejects.toThrow();
+  });
+});

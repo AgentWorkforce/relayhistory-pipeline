@@ -7,19 +7,16 @@
  * server-constructed, never app-provided.
  */
 import type { SqlQuery } from "./canonical-journal.ts";
-import type { CanonicalFeatureChangedPort } from "./canonical-version.ts";
+import type {
+  CanonicalFeatureChangedInput,
+  CanonicalFeatureChangedPort,
+} from "./canonical-version.ts";
 
 export class CanonicalFeatureChanged implements CanonicalFeatureChangedPort {
   constructor(readonly db: SqlQuery) {}
-  async canonicalFeatureChanged(input: {
-    scope: { orgId: string; workspaceId: string; harness: string;
-             sessionId: string; generation: string };
-    source: { authorityId: string; epoch: string; fingerprint: string };
-    priorSource: { authorityId: string; epoch: string; fingerprint: string } | null;
-    pointerSet: { authorityId: string; hash: string; count: string };
-    /** Required when priorSource is set: the PRIOR image's inventory. */
-    priorPointerSet?: { authorityId: string; hash: string; count: string };
-  }): Promise<string> {
+  async canonicalFeatureChanged(
+    input: CanonicalFeatureChangedInput,
+  ): Promise<string> {
     if (!input.scope?.orgId || !input.scope.sessionId ||
         !input.source?.epoch || !input.source.fingerprint ||
         !input.pointerSet?.hash)

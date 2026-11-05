@@ -7,6 +7,7 @@
  * source authority + unchanged bindings. A stale revision at/below the
  * checkpoint is fenced before any write.
  */
+import { createHash } from "node:crypto";
 import type { ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { EVENT_FEATURES_TABLE } from "./event-schema.ts";
 import { BRIEF_FEATURES_TABLE } from "./brief-schema.ts";
@@ -76,6 +77,10 @@ const projectAll = <T>(
   return { kind: "rows" as const, rows: out };
 };
 
+const hashRows = (rows: unknown[]) =>
+  createHash("sha256").update(JSON.stringify(rows)).digest("hex");
+const hash = (v: unknown): v is string =>
+  typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
 /** Drain one bounded page source: pages until the terminal cursor. */
 async function* pageAll(
   port: CanonicalImagePort,
@@ -112,6 +117,14 @@ export async function copyCanonicalEntry(
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
+  // #233 fences: the image descriptor must be complete and still match the
+  // journal's image identity + pointer set + source hash.
+  const descriptor = await images.imageDescriptor(entry);
+  if (!descriptor?.complete || descriptor.imageKey !== entry.imageKey ||
+      descriptor.pointerSetHash !== entry.pointerSet.hash ||
+      !hash(descriptor.sourceHash) ||
+      (entry.kind === "publish" && descriptor.sourceHash !== entry.sourceHash))
+    return { kind: "refused", reason: "image_descriptor_changed" };
   const ev: CanonicalImageEvidence = {
     schemaGeneration: entry.schemaGeneration,
     imageKey: entry.imageKey,
@@ -156,8 +169,21 @@ export async function copyCanonicalEntry(
   };
   let total = 0, terminalEvent = "", terminalBrief = "";
   for (const kind of ["event", "brief"] as const) {
+    const seen = new Set<string>();
     for await (const { page, request } of pageAll(images, entry, kind,
         entry.kind === "retire", resume[kind])) {
+      // #233 fences: page source + pointer binding + recomputed hash +
+      // well-shaped non-repeating cursor.
+      if (!Array.isArray(page.rows) || page.source !== entry.imageKey ||
+          page.pointerSetHash !== entry.pointerSet.hash ||
+          !hash(page.pageSha256) || page.pageSha256 !== hashRows(page.rows) ||
+          !(page.cursor === null ||
+            (typeof page.cursor === "string" && page.cursor.length > 0 &&
+             page.cursor.length <= 4096)) ||
+          (page.cursor !== null &&
+            (page.cursor === request || seen.has(page.cursor))))
+        return { kind: "refused", reason: "image_page_changed" };
+      if (page.cursor !== null) seen.add(page.cursor);
       const r = await insertOnePage(kind, page, request);
       if (r.kind === "refused") return r;
       total += r.rows.length;
