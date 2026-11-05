@@ -1,4 +1,5 @@
 import { readerMaxRuleset } from "../../pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { isLegacySourceTable, sortLegacyRows } from "../../../src/session-read-api/canonical-legacy.ts";
 import {
   canonicalArtifactPage,
   type ArtifactReadDeps,
@@ -475,6 +476,8 @@ export async function canonicalHandle(
         (a, b) =>
           (order === "asc" ? 1 : -1) * compareArtifactEventRows(a.row, b.row),
       );
+    // Legacy tables in Neon's key order, reversed for desc (activation gate 9).
+    if (isLegacySourceTable(table)) sortLegacyRows(table, all, order);
     if (offset > all.length) throw new CanonicalReadError("cursor", 400);
     const rows = [];
     let bytes = 0;
