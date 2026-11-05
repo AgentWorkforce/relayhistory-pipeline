@@ -2,7 +2,7 @@
 
 This is dormant preparation. Neither building the image nor rendering a chart authorizes a production rollout, schema apply, privilege grant or flag change.
 
-Build `docker/large-read-worker.Dockerfile` with `SOURCE_REVISION` equal to the checked-out commit. It uses Bun 1.4.2 only to install and bundle, and Node 24.21.0 to execute. The separate services image does not contain this entry point. Run `node --max-old-space-size=49152 /app/large-read-main.mjs` under the independently measured capacity envelope; no public ingress is needed. Disabled startup performs no credential reads or network calls.
+Build `docker/large-read-worker.Dockerfile` with `SOURCE_REVISION` equal to the checked-out commit. It uses Bun 1.4.2 only to install and bundle, and Node 24.21.0 to execute. The bundle is produced by `scripts/build-large-read-worker.ts` with the same derived-schema plugin as the Lambda build, so the migration generation and verifier SQL are embedded and the runtime image contains neither `supabase/` nor `node_modules`. The separate services image does not contain this entry point. The image CMD is `node --max-old-space-size=49152 /app/large-read-main.mjs`; run it under the independently measured capacity envelope; no public ingress is needed. Disabled startup reads no credentials, opens no sockets and makes no database, S3 or network calls; it only loads the bundle (Node reads its own OpenSSL/resolver configuration) and writes one JSON status line to stdout.
 
 Required environment when explicitly enabled:
 

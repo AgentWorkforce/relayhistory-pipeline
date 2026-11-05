@@ -1,4 +1,5 @@
-/** Explicit Node job entry point. The disabled path reads no credentials and performs no I/O. */
+/** Explicit Node job entry point. The disabled path reads no credentials, opens no connections and
+ * only writes its status line. Bundled by scripts/build-large-read-worker.ts (embedded schema assets). */
 import {createS3Store,objectStoreManifestReader} from "../shared/vendor.ts";
 import {supabasePool,parseSecret,transaction} from "./lambda.ts";
 import {lambdaCredentials} from "./aws-json.ts";
