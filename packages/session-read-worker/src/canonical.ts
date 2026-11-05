@@ -114,6 +114,26 @@ function tokenTenant(
     throw new CanonicalReadError("authorization", 401);
   }
 }
+/** PostgREST resolves RPCs by argument NAME, so the body keys must match each SQL
+ * signature exactly. request_session_analysis_cache(p_workspace,p_harness,p_session)
+ * (20261105023000_session_analysis_publications.sql) is the only claim RPC without the
+ * _id suffix; every other one here takes (p_workspace_id,p_harness,p_session_id). */
+export function canonicalRpcBody(
+  rpc: string,
+  identity: Pick<CanonicalIdentity, "workspaceId" | "source" | "sessionId">,
+): Record<string, string> {
+  return rpc === "request_session_analysis_cache"
+    ? {
+        p_workspace: identity.workspaceId,
+        p_harness: identity.source,
+        p_session: identity.sessionId,
+      }
+    : {
+        p_workspace_id: identity.workspaceId,
+        p_harness: identity.source,
+        p_session_id: identity.sessionId,
+      };
+}
 function canonicalMetadataReader(
   env: CanonicalEnv,
   token: string,
@@ -142,11 +162,7 @@ function canonicalMetadataReader(
         "content-profile": "sessions",
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        p_workspace_id: identity.workspaceId,
-        p_harness: identity.source,
-        p_session_id: identity.sessionId,
-      }),
+      body: JSON.stringify(canonicalRpcBody(rpc, identity)),
       signal,
     });
     if (!response.ok) {
@@ -158,6 +174,16 @@ function canonicalMetadataReader(
     }
     return boundedJson(response, signal);
   };
+}
+export { tokenTenant as canonicalTokenTenant };
+export function canonicalClaimReader(
+  env: CanonicalEnv,
+  token: string,
+  signal: AbortSignal,
+  rpc: "session_directory_analysis_cache" | "request_session_analysis_cache",
+  fetcher: typeof fetch = fetch,
+) {
+  return canonicalMetadataReader(env, token, signal, fetcher, rpc);
 }
 export function canonicalPointerReader(
   env: CanonicalEnv,
