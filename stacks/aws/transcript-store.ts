@@ -222,7 +222,7 @@ export type TranscriptStorePlanPhase =
 function sessionReadApiPhase(operations: ReadonlyMap<string, string>): TranscriptStorePlanPhase | undefined {
   const api = SESSION_READ_API_RESOURCES.map((r) => operations.get(r));
   const others = [...operations].filter(([r]) => !(SESSION_READ_API_RESOURCES as readonly string[]).includes(r));
-
+  if (!others.every(([, a]) => a === "noop")) return undefined;
   if (api.every((a) => a === "create" || a === "noop") && api.some((a) => a === "create")) return "session read api rollout";
   if (api.every((a) => a === "update" || a === "noop") && api.some((a) => a === "update")) return "session read api update";
   return undefined;
