@@ -88,7 +88,7 @@ edited to get there.
 | `packages/pipeline/vitest.config.ts` | upstream config minus the cloud-client alias (30 s hook timeout for PGlite) |
 | `src/env.ts` | Types only: `Bindings` with `ENVIRONMENT`, `POSTHOG_*` and the `env.ts.patch` additions copied verbatim (including the seven `Queue<StageMessage>` bindings and `PIPELINE_TELEMETRY_ID_KEY`), `Variables` (with `traceId`), `AppEnv`, `AppContext`, `AuthContext`. The rest of the relayhistory Worker's bindings are left out |
 | `src/lib/logger.ts` | Upstream file at `f544f6d` with `logger.ts.patch` applied |
-| `src/lib/scrub.ts` | Verbatim upstream file at `f544f6d` (last changed in `cdc55a6`, #179). Since the #211 port it carries no header (see below) |
+| `src/lib/scrub.ts` | Verbatim upstream file at `f544f6d` (last changed in `cdc55a6`, #179). Since the #211 port it carries no header (see below). Now byte-identical with relayhistory-cloud PR #269 at `ad36081b` (`packages/relayhistory/src/lib/scrub.ts`, scrub rule set 3; open upstream as of 2026-11-05), no longer with `f544f6d` |
 | `src/middleware/auth.ts` | `getAuth` and `requireScope` copied unchanged, and a re-export of `AuthContext`. No token verification: the host app authenticates and sets `auth` on the context |
 | `src/app.ts` | Minimal `createApp({ auth? })`: the `app.ts.patch` id/trace-id middleware echoing `X-Relay-Trace-Id`, one request log line carrying `trace_id` (the `observability.ts.patch` hunk, without upstream's request stats), `/health`, `pipelineOpsRoutes` under `/v1` outside auth, and `pipelineRoutes` under `/v1` behind `auth`. The default `auth` answers 401 unless `auth` is already set |
 | `supabase/migrations/20261025000{000,100,200,300}_*.sql`, `supabase/tests/supabase_shim.sql` | Verbatim from `f544f6d`. See `supabase/README.md` |
@@ -248,7 +248,7 @@ throwaway local container that was removed afterwards.
 | relayhistory-cloud (#211 head `d9f2ba2`) | 96BullSessions | How |
 | --- | --- | --- |
 | `packages/object-store/**` (32 files, incl. `s3.ts` and `test/unit.test.ts` changed by #211) | `packages/object-store/**` | whole package, byte-identical (on relayhistory-cloud `main` since #174/#205, unchanged by #210) |
-| `packages/relayhistory/src/lib/pipeline/{adapter,object-layout,raw-chunks,reconcile}.ts` (added) | `packages/pipeline/src/lib/pipeline/` | byte-identical at the move. `raw-chunks.ts` has since diverged here: scrub rule set 2 (#108) segments strings past the scrub bound. |
+| `packages/relayhistory/src/lib/pipeline/{adapter,object-layout,raw-chunks,reconcile}.ts` (added) | `packages/pipeline/src/lib/pipeline/` | byte-identical at the move. `raw-chunks.ts` has since diverged here: scrub rule set 2 (#108) segments strings past the scrub bound. Rule set 3 (#162) is also carried here (`SCRUB_RULESET_VERSION` 3). |
 | `packages/relayhistory/src/lib/pipeline/{events,telemetry-ids,trace}.ts` (changed) | `packages/pipeline/src/lib/pipeline/` | overwritten, byte-identical |
 | `packages/relayhistory/src/routes/pipeline.ts` (changed) | `packages/pipeline/src/routes/pipeline.ts` | overwritten, byte-identical |
 | `packages/relayhistory/test/{pipeline-adapter,scrub-ruleset-version}.test.ts` (added) | `packages/pipeline/test/` | byte-identical |
@@ -259,7 +259,7 @@ throwaway local container that was removed afterwards.
 
 After the port, every file under `packages/pipeline/src/lib/pipeline/`,
 `src/routes/pipeline.ts` and `test/` (including `test/support/`) matches its
-blob at `d9f2ba2` (checked with `cmp`), and so does `src/lib/scrub.ts`.
+blob at `d9f2ba2` (checked with `cmp`), and so did `src/lib/scrub.ts` (until rule set 3, #162; see its row above).
 
 The moved files import the object store by relative path
 (`../../../../object-store/src/index.js` from `lib/pipeline/`,
@@ -281,7 +281,8 @@ gitignored.
   mentioned them in the header.
 - `packages/pipeline/src/lib/scrub.ts`: the six-line provenance header was
   removed, so the file is now byte-identical to upstream `lib/scrub.ts` at
-  `f544f6d` and `d9f2ba2` (blob unchanged since `cdc55a6`, #179).
+  `f544f6d` and `d9f2ba2` (blob unchanged since `cdc55a6`, #179). At the port; #162
+  has since moved it to relayhistory-cloud #269 `ad36081b` (rule set 3).
   `test/scrub-ruleset-version.test.ts` pins `SCRUB_RULESET_VERSION = 1` to the
   sha256 of that file (`db9d65c7ab230d67488900203bb78ca8bd3ad16949a0a51b5d3d117d0cff49f8`),
   so any header fails the test. Provenance is recorded here instead.
