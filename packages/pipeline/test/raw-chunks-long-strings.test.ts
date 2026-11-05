@@ -163,7 +163,11 @@ describe("a gap between a credential keyword and its value is never cut", () => 
 
 describe("bounded CPU before a refusal", () => {
   it("a 263 KB adversarial string is refused in well under a second (was ~53 s)", () => {
-    const bad = "key: ".repeat(Math.ceil((MAX_SCRUB_CHARS + 1000) / 5));
+    // Every candidate cut follows a keyword and its colon. (It was `key: `, one
+    // space: whether that is refused depends on how the context window's start
+    // pairs the `key: key:` matches, and with the wider window of the #162 review
+    // fix it is segmented correctly instead. Two spaces is refused at any alignment.)
+    const bad = "key:  ".repeat(Math.ceil((MAX_SCRUB_CHARS + 1000) / 6));
     const t0 = performance.now();
     expect(() => scrubLong(bad)).toThrow(/scrub limit/);
     const t1 = performance.now();
@@ -457,5 +461,64 @@ describe("a header that shares its dashes with a footer leaves the block open, a
     expect(scrubText(text)).not.toContain(body);
     const out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
     expect(out).not.toContain(body);
+  });
+});
+
+// ------------------------- adversarial review of #162 (rule set 3), finding 1
+
+describe("a quoted secret value is never cut from its key (the context check covers the rule's reach)", () => {
+  const TAIL = "SECRETTAIL";
+  /**
+   * `key`, then `w` x `inner`, one space, the tail and `close`, placed so that the
+   * value's inner space is the last whitespace below `MAX_SCRUB_CHARS`: the only cut
+   * a segmenter can take near the bound is inside the value, with the key more than
+   * 4096 characters before it. The value (inner + 1 + tail + pad) stays within
+   * the rule's 4096-character look-ahead, so the rule closes it and redacts it whole.
+   */
+  function atBound(key: string, inner: number, close: string, pad: string) {
+    const region = `${key}${"w".repeat(inner)} ${TAIL}${pad}${close}`;
+    const spaceAt = key.length + inner;
+    const p = MAX_SCRUB_CHARS - 1 - spaceAt;
+    const prefix = `${"a ".repeat(Math.floor((p - 1) / 2)).padEnd(p - 1, "a")} `;
+    const tail = " tail".repeat(100);
+    const text = prefix + region + tail;
+    expect(text.lastIndexOf(" ", MAX_SCRUB_CHARS - 1)).toBe(MAX_SCRUB_CHARS - 1);
+    return { text, region, expected: prefix + scrubText(region) + tail };
+  }
+  const cases: Array<[string, string, number, string, string]> = [
+    // The reported input: 16-space gaps around the colon, a 4070-character value.
+    ["16-space gaps, 4070-char value", `"password"${" ".repeat(16)}:${" ".repeat(16)}"`, 4070, '"', "zzzzzzzzzz"],
+    ["no padding, inner space at value offset 4084", '"password": "', 4084, '"', ""],
+    ["escaped twice (\\\\\\\" quotes)", '\\\\\\"password\\\\\\": \\\\\\"', 4080, '\\\\\\"', ""],
+  ];
+  for (const [label, key, inner, close, pad] of cases) {
+    it(`scrubLong: ${label}`, () => {
+      const { text, region, expected } = atBound(key, inner, close, pad);
+      // The rule redacts the whole value when it sees the key...
+      expect(scrubText(region).includes(TAIL)).toBe(false);
+      // ...and so does the segmented scrub: equal to scrubbing the text whole.
+      const out = scrubLong(text);
+      expect(out.includes(TAIL), "the secret tail survived").toBe(false);
+      expect(out === expected, "differs from the whole-text scrub").toBe(true);
+    });
+    it(`scrubRecords, the line path: ${label}`, () => {
+      const { text, expected } = atBound(key, inner, close, pad);
+      const out = dec.decode(scrubRecords(enc.encode(`${text}\n`)).scrubbed);
+      expect(out.includes(TAIL), "the secret tail survived").toBe(false);
+      expect(out === `${expected}\n`, "differs from the whole-text scrub").toBe(true);
+    });
+  }
+  it("scrubRecords' line-run cut (safeCut) keeps a quoted value on the overflowing line whole", () => {
+    // Lines cut only at line boundaries, which the quoted rule never crosses; pin it.
+    const filler = words(999);
+    const lines: string[] = [];
+    while (lines.join("\n").length < MAX_SCRUB_CHARS - 2000) lines.push(filler);
+    lines.push(`"password"${" ".repeat(16)}:${" ".repeat(16)}"${"w".repeat(4070)} ${TAIL}zzzzzzzzzz"`);
+    for (let i = 0; i < 20; i++) lines.push(filler);
+    const text = `${lines.join("\n")}\n`;
+    expect(text.length).toBeGreaterThan(MAX_SCRUB_CHARS);
+    const out = dec.decode(scrubRecords(enc.encode(text)).scrubbed);
+    expect(out.includes(TAIL), "the secret tail survived").toBe(false);
+    expect(out === `${lines.map((l) => scrubText(l)).join("\n")}\n`, "differs from scrubbing each line").toBe(true);
   });
 });
