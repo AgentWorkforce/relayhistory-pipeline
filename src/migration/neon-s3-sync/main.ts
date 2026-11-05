@@ -214,6 +214,12 @@ export async function main() {
   // state lock or any connection, so export sealing runs on the bound sealer. Any other value: no
   // call, exactly as before (the seam selects lazily on the first seal and refuses non-TS there).
   if (process.env.SCRUB_ENGINE === "wasm-bindgen") await initScrubEngine();
+  // Retired (activation gates 1-3): legacy evidence is exported only by the
+  // one-shot runner `bun run migration:legacy-export` (src/migration/legacy-export).
+  if (env("S3X_INCLUDE_LEGACY_SOURCES", "false") !== "false")
+    throw Object.assign(new Error("S3X_INCLUDE_LEGACY_SOURCES is retired; use migration:legacy-export"), {
+      code: "legacy_sources_retired",
+    });
   const execute = flag("execute");
   const urlFile = env("NEON_URL_FILE");
   const url = urlFile ? readFileSync(urlFile, "utf8").trim() : env("NEON_URL");
@@ -285,7 +291,6 @@ export async function main() {
       log,
       {
         ...DEFAULT_SYNC_CONFIG,
-        includeLegacySources: env("S3X_INCLUDE_LEGACY_SOURCES", "false") === "true",
         recentMs: Number(env("S3X_RECENT_DAYS", "14")) * 86_400_000,
       },
       () => stop,

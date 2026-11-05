@@ -273,6 +273,8 @@ export function relayhistoryEventTime(record: RelayhistoryStreamRecord): number 
 const LEGACY_RECORD_KINDS = new Set([
   "legacy_conversation_turn", "legacy_session_link", "legacy_session_outcome", "legacy_scope",
 ]);
+/** The dedicated machine carrying one-shot legacy table exports. */
+export const RELAYHISTORY_LEGACY_MACHINE_ID = "rh-legacy-tables-v1";
 export const isLegacyRelayhistoryRecord = (record: Pick<RelayhistoryStreamRecord, "kind">) => LEGACY_RECORD_KINDS.has(record.kind);
 /** The record's revision seat: origin and record id, plus the kind for legacy kinds. */
 export function relayhistoryRecordKey(
