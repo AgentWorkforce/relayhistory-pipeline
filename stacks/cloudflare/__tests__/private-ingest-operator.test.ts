@@ -261,6 +261,43 @@ async function actualPlanProof(mode: "canonical" | "buffered") {
     expect(assertOperatorSnapshot(native, input)).toHaveLength(
       mode === "buffered" ? 15 : 13,
     );
+    // Installed Alchemy's NoopUpdate omits row.props. Check the exact
+    // no-op node shape against existing resolved state and keep all guards.
+    const noopRows = Object.fromEntries(Object.entries(native.native.resources)
+      .map(([id, node]: [string, any]) => {
+        const { props, ...rest } = node;
+        return [id, { ...rest, action: "noop",
+          state: { ...node.state, status: "updated", props } }];
+      }));
+    const noopSnapshot = { ...native, native: { ...native.native, resources: noopRows } };
+    expect(assertOperatorSnapshot(noopSnapshot, input)).toHaveLength(
+      mode === "buffered" ? 15 : 13);
+    const fanout = noopRows["session-ingest-fanout"];
+    for (const status of ["creating", "updating", "deleted", undefined]) {
+      const rows = { ...noopRows, "session-ingest-fanout": {
+        ...fanout, state: { ...fanout.state, status } } };
+      expect(() => assertOperatorSnapshot(
+        { ...native, native: { ...native.native, resources: rows } }, input))
+        .toThrow("native_noop_state");
+    }
+    for (const props of [undefined, null, [], { ...fanout.state.props, name: "foreign" },
+      { ...fanout.state.props, deliveryPaused: mode === "buffered" ? false : true }]) {
+      const rows = { ...noopRows, "session-ingest-fanout": {
+        ...fanout, state: { ...fanout.state, props } } };
+      expect(() => assertOperatorSnapshot(
+        { ...native, native: { ...native.native, resources: rows } }, input)).toThrow();
+    }
+    expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native,
+      resources: { ...noopRows, "session-ingest-fanout": { ...fanout, state: undefined } } } },
+      input)).toThrow("native_noop_state");
+    // A stale valid state must never hide missing or unsafe proposed props.
+    for (const props of [undefined, { ...fanout.state.props, name: "foreign" },
+      { ...fanout.state.props, deliveryPaused: mode === "buffered" ? false : true }]) {
+      const rows = { ...noopRows, "session-ingest-fanout": {
+        ...fanout, action: "update", props } };
+      expect(() => assertOperatorSnapshot(
+        { ...native, native: { ...native.native, resources: rows } }, input)).toThrow();
+    }
     const queue = native.native.resources["session-ingest-fanout"];
     if (mode === "buffered") {
       const worker = native.native.resources["session-ingest"];

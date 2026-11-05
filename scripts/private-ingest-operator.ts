@@ -611,11 +611,20 @@ export function assertOperatorSnapshot(
     )
       refuse("native_resource_inventory");
     seen.add(id);
+    // Alchemy NoopUpdate carries existing resolved props only in state.
+    // Never use state as a fallback for create/update: those must validate
+    // the proposed props that Stack.apply will actually use.
+    if (row.action === "noop" &&
+      !["created", "updated"].includes(row.state?.status))
+      refuse("native_noop_state");
+    const props = row.action === "noop" ? row.state?.props : row.props;
+    if (!props || typeof props !== "object" || Array.isArray(props))
+      refuse("native_resource_props");
     if (id === "session-ingest") {
-      assertPrivateWorker(row.props, () => refuse("native_private_worker"));
-      if (row.props.main !== "src/session-ingest/worker.ts")
+      assertPrivateWorker(props, () => refuse("native_private_worker"));
+      if (props.main !== "src/session-ingest/worker.ts")
         refuse("native_worker_entrypoint");
-      assertNoSecretLiterals(row.props.env, () =>
+      assertNoSecretLiterals(props.env, () =>
         refuse("native_secret_literal"),
       );
       const vars = sessionIngestVars(input.sessionIngest),
@@ -633,7 +642,7 @@ export function assertOperatorSnapshot(
         S3_SECRET_ACCESS_KEY: S3_SECRET_KEY_SECRET,
         INGEST_SIGNING_KEY: SIGNING_KEY_SECRET,
       })) {
-        const value = row.props.env[name];
+        const value = props.env[name];
         if (
           value.Type !== "Cloudflare.SecretsStore.Secret" ||
           value.secretName !== secretName ||
@@ -704,15 +713,15 @@ export function assertOperatorSnapshot(
     }
     if (
       ["session-ingest-fanout", "session-ingest-fanout-dlq"].includes(id) &&
-      row.props.deliveryPaused !==
+      props.deliveryPaused !==
         (input.sessionIngest.acceptanceMode === "buffered" ? true : undefined)
     )
       refuse("native_queue_pause");
     if (id !== "session-ingest" && row.bindings.length)
       refuse("native_binding_inventory");
     if (
-      (id === "session-ingest-fanout" && row.props.name !== FANOUT_QUEUE) ||
-      (id === "session-ingest-fanout-dlq" && row.props.name !== FANOUT_DLQ)
+      (id === "session-ingest-fanout" && props.name !== FANOUT_QUEUE) ||
+      (id === "session-ingest-fanout-dlq" && props.name !== FANOUT_DLQ)
     )
       refuse("native_queue_identity");
   }
