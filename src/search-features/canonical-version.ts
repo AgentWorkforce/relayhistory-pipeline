@@ -65,14 +65,21 @@ export interface CanonicalSourceAuthority {
 export interface CanonicalPointerSet {
   authorityId: string; hash: string; count: string; }
 
+/** The 610 invoker input — both-or-neither prior pair, type-level enforced. */
+export type CanonicalFeatureChangedInput = {
+  scope: CanonicalScope;
+  source: CanonicalSourceAuthority;
+  pointerSet: CanonicalPointerSet;
+} & (
+  | { priorSource: null; priorPointerSet?: never }
+  | { priorSource: CanonicalSourceAuthority;
+      priorPointerSet: CanonicalPointerSet }
+);
+
 /** The 610 transaction port: OWNER-ONLY INVOKER inside the 620 final CAS. */
 export interface CanonicalFeatureChangedPort {
-  canonicalFeatureChanged(input: {
-    scope: CanonicalScope;
-    source: CanonicalSourceAuthority;     // priorSource null = new scope
-    priorSource: CanonicalSourceAuthority | null;
-    pointerSet: CanonicalPointerSet;
-  }): Promise<string>; // returns the allocated managed revision
+  canonicalFeatureChanged(
+    input: CanonicalFeatureChangedInput): Promise<string>;
 }
 
 /** Per-page acknowledgment — idempotent restart-safe progress. */
