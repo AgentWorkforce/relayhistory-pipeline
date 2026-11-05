@@ -111,10 +111,12 @@ export async function copyCanonicalEntry(
   ch: ClickHouseClient,
   state: CanonicalCycleState,
   entry: CanonicalJournalEntry,
-  /** Restart position per pool: last ACKed cursor (null = start). */
-  resume: { event: string | null; brief: string | null } =
-    { event: null, brief: null },
 ): Promise<CanonicalCycleResult> {
+  // Resume derives from the durable chain, not a caller-supplied cursor.
+  const resume = {
+    event: (await acks.resumeCursor(entry, "event")).cursor,
+    brief: (await acks.resumeCursor(entry, "brief")).cursor,
+  };
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
   // #233 fences: the image descriptor must be complete and still match the

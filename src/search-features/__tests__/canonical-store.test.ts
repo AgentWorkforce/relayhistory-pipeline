@@ -6,6 +6,8 @@ import {
 
 const SCOPE = JSON.stringify({ orgId: "o", workspaceId: "w", harness: "h",
   sessionId: "s", generation: "a".repeat(64) });
+const HS1_KEY = "hs1:" + "a".repeat(64) + ":" + "a".repeat(64) +
+  ":12345678-1234-1234-1234-123456789012";
 const AUTH = JSON.stringify({ authorityId: "12345678-1234-1234-1234-123456789012", epoch: "1", fingerprint: "a".repeat(64) });
 const PTR = JSON.stringify({ authorityId: "12345678-1234-1234-1234-123456789012", hash: "c".repeat(64), count: "1" });
 const fakeDb = () => {
@@ -58,14 +60,14 @@ const fakeDb = () => {
   };
   return { table, query };
 };
-const pub = (rev: string, key = "i") => ({
+const pub = (rev: string, key = HS1_KEY) => ({
   kind: "publish" as const, revision: rev, imageKey: key,
   schemaGeneration: "g", sourceHash: "a".repeat(64),
   scope: JSON.parse(SCOPE), sourceAuthority: JSON.parse(AUTH),
   pointerSet: JSON.parse(PTR),
 });
 const ret = (rev: string) => ({
-  kind: "retire" as const, revision: rev, imageKey: "i",
+  kind: "retire" as const, revision: rev, imageKey: HS1_KEY,
   schemaGeneration: "g", priorKeysetHash: "c".repeat(64),
   scope: JSON.parse(SCOPE), priorSourceAuthority: JSON.parse(AUTH),
   pointerSet: JSON.parse(PTR),
@@ -82,7 +84,7 @@ describe("canonical journal store", () => {
     const j = new CanonicalJournalStore({ query: db.query });
     // PG/PGlite drivers return jsonb as parsed objects, not strings.
     const objRow = {
-      revision: "10", kind: "publish", imageKey: "i",
+      revision: "10", kind: "publish", imageKey: HS1_KEY,
       schemaGeneration: "g", sourceHash: "a".repeat(64),
       scope: JSON.parse(SCOPE),               // OBJECT, not string
       sourceAuthority: JSON.parse(AUTH),      // OBJECT
@@ -92,7 +94,7 @@ describe("canonical journal store", () => {
     const out = await j.entries("0", 10);
     expect(out.entries[0]!.kind).toBe("publish");
     const retireObj = {
-      revision: "20", kind: "retire", imageKey: "i",
+      revision: "20", kind: "retire", imageKey: HS1_KEY,
       schemaGeneration: "g", sourceHash: "a".repeat(64),
       priorKeysetHash: "c".repeat(64),
       scope: JSON.parse(SCOPE),
@@ -119,7 +121,7 @@ describe("canonical journal store", () => {
     // A real 610 retire row: prior authority in source_authority,
     // prior_source_authority NULL.
     await db.query("INSERT INTO j VALUES($1)", [{
-      revision: "10", kind: "retire", imageKey: "i",
+      revision: "10", kind: "retire", imageKey: HS1_KEY,
       schemaGeneration: "g", sourceHash: "a".repeat(64),
       priorKeysetHash: "c".repeat(64), scope: JSON.parse(SCOPE),
       priorSourceAuthority: JSON.parse(AUTH),
@@ -134,7 +136,7 @@ describe("canonical journal store", () => {
   test("entries paging: hasMore, nextRevision, limit != completeness", async () => {
     const db = fakeDb();
     const j = new CanonicalJournalStore({ query: db.query });
-    for (const r of ["10", "20", "30"]) await db.query("INSERT INTO j VALUES($1)", [pub(r, "i" + r)]);
+    for (const r of ["10", "20", "30"]) await db.query("INSERT INTO j VALUES($1)", [pub(r, HS1_KEY)]);
     const first = await j.entries("10", 1);
     expect(first.entries.map((e) => e.revision)).toEqual(["20"]);
     expect(first.hasMore).toBe(true);

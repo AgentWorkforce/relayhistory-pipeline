@@ -34,9 +34,16 @@ type Row = {
   pointer_set: unknown;
 };
 /** jsonb decode: a real driver returns the parsed object; a raw string parses. */
-const jsonb = <T>(v: unknown): T =>
-  typeof v === "string" ? (JSON.parse(v) as T) : (v as T);
+const jsonb = <T>(v: unknown): T => {
+  if (typeof v === "string") return JSON.parse(v) as T;
+  if (v && typeof v === "object") return v as T;
+  throw new Error("journal_row_invalid");
+};
+const HS1 = /^hs1:[a-f0-9]{64}:[a-f0-9]{64}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const toEntry = (r: Row): CanonicalJournalEntry => {
+  if (r.kind !== "publish" && r.kind !== "retire")
+    throw new Error("journal_kind_invalid");
+  if (!HS1.test(r.image_key)) throw new Error("journal_image_key_invalid");
   const scope = jsonb<CanonicalScope>(r.scope);
   const pointerSet = jsonb<CanonicalPointerSet>(r.pointer_set);
   return r.kind === "retire"

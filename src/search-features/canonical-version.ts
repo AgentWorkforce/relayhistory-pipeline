@@ -90,6 +90,11 @@ export interface CanonicalPageAckPort {
     nextCursor: string | null;      // the following page's cursor (null=terminal)
     pageSha256: string;
   }): Promise<void>;
+  /** Durable resume: the verified next edge from the page chain. */
+  resumeCursor(
+    entry: CanonicalJournalEntry, pool: "event" | "brief",
+  ): Promise<{ state: "empty" | "resume" | "complete";
+               cursor: string | null }>;
   /** finish CAS: both pool terminal descriptors + all page ACKs + current
    *  source authority + unchanged target/profile bindings. */
   finish(input: {

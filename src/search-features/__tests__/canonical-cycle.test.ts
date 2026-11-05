@@ -72,6 +72,7 @@ const fakeAcks = () => {
   const a: CanonicalPageAckPort = {
     ackPage: async (i) => { acked.push(`${i.kind}:${i.cursor}`); },
     finish: async (i) => { finished.push(i); },
+    resumeCursor: async () => ({ state: "empty" as const, cursor: null }),
   };
   return { a, acked, finished };
 };

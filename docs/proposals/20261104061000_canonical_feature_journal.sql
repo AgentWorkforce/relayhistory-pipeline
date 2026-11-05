@@ -50,7 +50,7 @@ CREATE TABLE sessions.canonical_feature_copy_state(
   kind text NOT NULL CHECK (kind IN ('publish','retire')),
   image_key text NOT NULL,
   source_authority jsonb NOT NULL, pointer_set jsonb NOT NULL,
-  profile_binding text NOT NULL,
+  profile_binding text NOT NULL, target_binding text NOT NULL,
   dirty boolean NOT NULL DEFAULT true);
 REVOKE ALL ON sessions.canonical_feature_page_ack,
   sessions.canonical_feature_copy_state
@@ -62,7 +62,7 @@ GRANT SELECT ON sessions.canonical_feature_journal
   TO bulls96_canonical_feature_producer;
 GRANT INSERT,SELECT ON sessions.canonical_feature_page_ack
   TO bulls96_canonical_feature_producer;
-GRANT INSERT,SELECT,UPDATE(dirty) ON sessions.canonical_feature_copy_state
+GRANT INSERT,SELECT ON sessions.canonical_feature_copy_state
   TO bulls96_canonical_feature_producer;
 
 -- Server-side finish: locks the state row, matches the exact journal entry
@@ -71,7 +71,10 @@ GRANT INSERT,SELECT,UPDATE(dirty) ON sessions.canonical_feature_copy_state
 CREATE OR REPLACE FUNCTION sessions.finish_canonical_copy(
   p_revision bigint,
   p_source_authority jsonb,
-  p_profile_binding text
+  p_profile_binding text,
+  p_terminal_event text,
+  p_terminal_brief text,
+  p_target_binding text
 ) RETURNS boolean
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path='' AS $finish$
 DECLARE
@@ -89,11 +92,15 @@ BEGIN
   IF NOT FOUND OR NOT v_st.dirty
      OR v_st.source_authority IS DISTINCT FROM p_source_authority
      OR v_st.profile_binding IS DISTINCT FROM p_profile_binding
+     OR v_st.target_binding IS DISTINCT FROM p_target_binding
   THEN RETURN false; END IF;
-  -- The state row must still bind the exact journal entry (identity drift
-  -- refuses: a superseded or mismatched entry cannot finish).
-  IF NOT EXISTS(SELECT 1 FROM sessions.canonical_feature_journal
-    WHERE revision=p_revision AND image_key=v_st.image_key AND kind=v_st.kind)
+  -- The state row must bind the exact journal row INCLUDING its authority
+  -- and pointer set — a superseded or drifted entry cannot finish.
+  IF NOT EXISTS(SELECT 1 FROM sessions.canonical_feature_journal j
+    WHERE j.revision=p_revision AND j.image_key=v_st.image_key
+      AND j.kind=v_st.kind
+      AND j.source_authority=v_st.source_authority
+      AND j.pointer_set=v_st.pointer_set)
   THEN RETURN false; END IF;
 
   -- Each pool's chain must start at 'start', be acyclic (every cursor
@@ -124,9 +131,22 @@ BEGIN
     -- The chain must reach the terminal in exactly v_count steps — a branch
     -- or disconnected component leaves pages unvisited.
     IF v_steps<>v_count THEN RETURN false; END IF;
+    -- The terminal page's hash must equal the supplied terminal descriptor —
+    -- the produced image's own terminal, not an arbitrary page.
+    IF NOT EXISTS(SELECT 1 FROM sessions.canonical_feature_page_ack
+      WHERE entry_revision=p_revision AND pool=v_pool
+        AND next_cursor IS NULL
+        AND page_sha256 = CASE WHEN v_pool='event'
+          THEN p_terminal_event ELSE p_terminal_brief END)
+    THEN RETURN false; END IF;
   END LOOP;
   UPDATE sessions.canonical_feature_copy_state SET dirty=false
     WHERE entry_revision=p_revision;
   RETURN true;
 END;
 $finish$;
+REVOKE ALL ON FUNCTION sessions.finish_canonical_copy(bigint,jsonb,text)
+  FROM PUBLIC,anon,authenticated,service_role,
+  bulls96_session_ingest,bulls96_session_ingest_seeder;
+GRANT EXECUTE ON FUNCTION sessions.finish_canonical_copy(bigint,jsonb,text)
+  TO bulls96_canonical_feature_producer;

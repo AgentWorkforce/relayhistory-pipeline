@@ -41,15 +41,14 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
       [entry.revision, entry.kind, entry.imageKey, auth,
         JSON.stringify(entry.pointerSet), profileBinding]);
     if (!rows.length) {
-      const { rows: ex } = await this.db.query<{
-        source_authority: unknown; pointer_set: unknown;
-        profile_binding: string }>(
-        `SELECT source_authority,pointer_set,profile_binding FROM ${ST}` +
-          ` WHERE entry_revision=$1`, [entry.revision]);
-      if (!ex.length || JSON.stringify(ex[0]!.source_authority) !== auth ||
-          JSON.stringify(ex[0]!.pointer_set) !== JSON.stringify(entry.pointerSet) ||
-          ex[0]!.profile_binding !== profileBinding)
-        throw new Error("begin_drift");
+      // Compare in SQL via jsonb equality — not TS stringify (key-order).
+      const { rows: drift } = await this.db.query<{ ok: boolean }>(
+        `SELECT source_authority=$2 AND pointer_set=$3 AND kind=$4` +
+          ` AND image_key=$5 AND profile_binding=$6 AS ok` +
+          ` FROM ${ST} WHERE entry_revision=$1`,
+        [entry.revision, auth, JSON.stringify(entry.pointerSet),
+          entry.kind, entry.imageKey, profileBinding]);
+      if (!drift.length || !drift[0]!.ok) throw new Error("begin_drift");
     }
   }
 
@@ -82,16 +81,32 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
     }
   }
 
-  /** Durable resume: the verified next cursor from the chain's last edge. */
+  /** Durable resume: walk the chain from 'start' and return the next edge —
+   * explicit states: no-progress | mid-chain cursor | complete.
+   * An opaque cursor ORDER BY is not chain order — walk the actual edges. */
   async resumeCursor(
     entry: CanonicalJournalEntry, pool: "event" | "brief",
-  ): Promise<string | null> {
-    const { rows } = await this.db.query<{ next_cursor: string | null }>(
-      `SELECT next_cursor FROM ${PAGE}` +
-        ` WHERE entry_revision=$1 AND pool=$2 AND next_cursor IS NOT NULL` +
-        ` ORDER BY cursor DESC LIMIT 1`,
+  ): Promise<{ state: "empty" | "resume" | "complete";
+               cursor: string | null }> {
+    const { rows: chain } = await this.db.query<{
+      cursor: string; next_cursor: string | null }>(
+      `SELECT cursor,next_cursor FROM ${PAGE}` +
+        ` WHERE entry_revision=$1 AND pool=$2`,
       [entry.revision, pool]);
-    return rows[0]?.next_cursor ?? null;
+    if (!chain.length) return { state: "empty", cursor: null };
+    let cursor: string | null = "start";
+    const seen = new Set<string>(["start"]);
+    for (;;) {
+      const edge = chain.find((r) => r.cursor === cursor);
+      if (!edge)                        // a dangling edge: corrupt chain
+        return { state: "resume", cursor };
+      if (edge.next_cursor === null)    // reached the terminal
+        return { state: "complete", cursor: null };
+      if (seen.has(edge.next_cursor))   // a cycle — corrupt
+        return { state: "resume", cursor };
+      seen.add(edge.next_cursor);
+      cursor = edge.next_cursor;
+    }
   }
 
   /** All ACKed pages for a revision/pool, in insertion order (the chain). */
@@ -120,6 +135,7 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
     terminalEvent: string; terminalBrief: string;
     sourceAuthority: { authorityId: string; epoch: string; fingerprint: string };
     profileBinding: string;
+    targetBinding?: string;
   }): Promise<void> {
     const e = input.entry;
     // Chain contiguity: each page's next_cursor feeds the next page's cursor;
@@ -136,9 +152,10 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
     // matches the exact journal entry + bindings, and verifies both
     // start-anchored chains before flipping dirty->complete.
     const { rows } = await this.db.query<{ ok: boolean }>(
-      `SELECT sessions.finish_canonical_copy($1,$2,$3) AS ok`,
+      `SELECT sessions.finish_canonical_copy($1,$2,$3,$4,$5,$6) AS ok`,
       [e.revision, JSON.stringify(input.sourceAuthority),
-        input.profileBinding]);
+        input.profileBinding, input.terminalEvent, input.terminalBrief,
+        input.targetBinding ?? ""]);
     if (!rows[0]?.ok)
       throw new Error("finish_cas: stale bindings, broken chain, or done");
   }
