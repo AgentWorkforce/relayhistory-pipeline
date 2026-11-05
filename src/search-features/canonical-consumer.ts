@@ -1,11 +1,11 @@
 /**
  * Supervised leased consumer: durable runtime between the canonical journal
- * and the event+brief pools. One live owner per partition via a heartbeat'd
- * lease (owner + TTL, not owner alone); crash-safe restart from durable
- * ACK/finish state; readiness only after BOTH pools finish the exact
- * revision; bounded retries; dead-letter only for stable poison codes
- * (never lease/infra failures, which are retryable holds); default-off,
- * org/workspace allowlist validated before any DB access.
+ * and the event+brief pools. Scoped to the exact canary tenant (the journal
+ * read is fenced — an out-of-scope entry never reaches a descriptor or a CH
+ * write); ONE bound partition per canary+target; heartbeat'd lease with a
+ * still-fresh TTL (a stale owner cannot resurrect); durable partition
+ * checkpoint CAS'd only after a copied or scope-skipped revision; dead-letter
+ * persists only stable poison codes (lease/infra/unknown refuse -> hold).
  */
 import type { SqlQuery, CanonicalJournalStore } from "./canonical-journal.ts";
 import type { CanonicalJournalEntry } from "./canonical-version.ts";
@@ -16,36 +16,30 @@ import type { ClickHouseClient } from "../session-pipeline/vendor/search-index/c
 
 const LEASE = "sessions.canonical_feature_consumer_lease";
 const DEAD = "sessions.canonical_feature_consumer_dead_letter";
-/** Stable bounded poison codes — never a raw exception message. */
-const POISON = new Set([
-  "row_invalid", "image_page_changed", "image_descriptor_changed",
-  "row_bound",
-]);
-/** Retryable holds — lease/infra failures pause, never poison. */
+const CKPT = "sessions.canonical_feature_consumer_checkpoint";
+/** The exact canary scope AND its single bound partition name. */
+const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
+  workspaceId: "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63" };
+const PARTITION = "c4fae7b9-1220c1dc-0";
+const POISON: Record<string, true> = {
+  row_invalid: true, image_page_changed: true,
+  image_descriptor_changed: true, row_bound: true,
+};
 const HOLD = new Set(["lease_lost", "heartbeat_failed", "db_timeout"]);
 
 export interface ConsumerConfig {
-  /** The EXACT canary scope; validated before any DB access. */
-  allowlist: { orgId: string; workspaceId: string }[];
   targetId: string;
   ownerId: string;
-  partition: string;
-  leaseTtlMs: number;           // bounded
+  leaseTtlMs: number;
   maxRetries: number;
   pageSize: number;
 }
-/** Fail-closed config: exact canary scope + bounded numeric knobs. */
+/** Fail-closed: exact canary scope, the bound partition, bounded knobs. */
 export function validateConfig(cfg: ConsumerConfig): void {
-  const ok = cfg.allowlist.length === 1 &&
-    cfg.allowlist[0]!.orgId === "c4fae7b9-43a9-44e8-94d5-455aa579d67b" &&
-    cfg.allowlist[0]!.workspaceId === "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63";
-  if (!ok) throw new Error("config_not_canary_scope");
   if (typeof cfg.targetId !== "string" || !cfg.targetId.length ||
       cfg.targetId.length > 256) throw new Error("config_bad_target");
   if (typeof cfg.ownerId !== "string" || !cfg.ownerId.length ||
       cfg.ownerId.length > 128) throw new Error("config_bad_owner");
-  if (typeof cfg.partition !== "string" || !cfg.partition.length ||
-      cfg.partition.length > 64) throw new Error("config_bad_partition");
   for (const [k, min, max] of [
     ["leaseTtlMs", 1, 300000], ["maxRetries", 0, 10], ["pageSize", 1, 1000],
   ] as const) {
@@ -54,6 +48,8 @@ export function validateConfig(cfg: ConsumerConfig): void {
       throw new Error(`config_bad_${k}`);
   }
 }
+const inScope = (e: CanonicalJournalEntry) =>
+  e.scope.orgId === CANARY.orgId && e.scope.workspaceId === CANARY.workspaceId;
 
 export class CanonicalConsumer {
   constructor(
@@ -63,11 +59,7 @@ export class CanonicalConsumer {
     readonly cfg: ConsumerConfig,
   ) { validateConfig(cfg); }
 
-  /**
-   * Acquire-or-renew the drain lease in ONE atomic statement: inserts a new
-   * owner, or takes over an expired one, or renews the SAME owner's fresh
-   * lease. A live different owner cannot take it. ttl stays an integer param.
-   */
+  /** One atomic acquire/renew/takeover — the bound partition only. */
   async acquireLease(): Promise<boolean> {
     const { rows } = await this.db.query<{ n: number }>(
       `INSERT INTO ${LEASE}(partition,owner,heartbeat_at)` +
@@ -76,76 +68,93 @@ export class CanonicalConsumer {
         ` WHERE ${LEASE}.owner=$2` +
         `    OR ${LEASE}.heartbeat_at < now() - make_interval(secs => $3)` +
         ` RETURNING 1 AS n`,
-      [this.cfg.partition, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
+      [PARTITION, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
     return rows.length > 0;
   }
-  /** Heartbeat — fails if this owner no longer holds the lease (0 rows). */
+  /** Heartbeat — requires a still-fresh held lease; a stale owner cannot. */
   async heartbeat(): Promise<boolean> {
     const { rows } = await this.db.query<{ n: number }>(
       `UPDATE ${LEASE} SET heartbeat_at=now()` +
-        ` WHERE partition=$1 AND owner=$2 RETURNING 1 AS n`,
-      [this.cfg.partition, this.cfg.ownerId]);
+        ` WHERE partition=$1 AND owner=$2` +
+        ` AND heartbeat_at >= now() - make_interval(secs => $3)` +
+        ` RETURNING 1 AS n`,
+      [PARTITION, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
     return rows.length > 0;
   }
-  /** The lease guard — held only while THIS owner is within TTL. */
   private leaseHeld() {
     return this.db.query<{ n: number }>(
       `SELECT 1 AS n FROM ${LEASE} WHERE partition=$1 AND owner=$2` +
         ` AND heartbeat_at >= now() - make_interval(secs => $3)`,
-      [this.cfg.partition, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000])
+      [PARTITION, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000])
       .then((r) => r.rows.length > 0);
   }
-
-  /** Dead-letter only for STABLE poison codes — bounded, never raw messages. */
+  /** Durable partition checkpoint — CAS'd only after a real advance. */
+  private async readCheckpoint(): Promise<string> {
+    const { rows } = await this.db.query<{ rev: string | number }>(
+      `SELECT rev FROM ${CKPT} WHERE partition=$1`, [PARTITION]);
+    return rows.length ? String(rows[0]!.rev) : "0";
+  }
+  private async advanceCheckpoint(rev: string): Promise<void> {
+    await this.db.query(
+      `INSERT INTO ${CKPT}(partition,rev) VALUES($1,$2::bigint)` +
+        ` ON CONFLICT (partition) DO UPDATE SET rev=$2::bigint` +
+        ` WHERE ${CKPT}.rev < $2::bigint`,
+      [PARTITION, rev]);
+  }
+  /** Dead-letter: stable poison code only; immutable (no update/delete). */
   async deadLetter(entry: CanonicalJournalEntry, code: string): Promise<void> {
-    if (!POISON.has(code)) return;           // not poison: never record
+    if (!POISON[code]) return;
     await this.db.query(
       `INSERT INTO ${DEAD}(entry_revision,image_key,reason,attempts,dead_at)` +
-        ` VALUES($1,$2,$3,1,now()) ON CONFLICT (entry_revision)` +
-        ` DO UPDATE SET attempts=` +
-        ` canonical_feature_consumer_dead_letter.attempts+1`,
+        ` VALUES($1,$2,$3,1,now()) ON CONFLICT (entry_revision) DO NOTHING`,
       [entry.revision, entry.imageKey, code]);
   }
 
   /**
-   * Drain the journal from a checkpoint: revision-ordered paging, per-entry
-   * copy with bounded retries. Ordering is fail-atomic: the FIRST non-copied
-   * entry stops the drain WITHOUT advancing the checkpoint (a dead letter is
-   * evidence, not a pass; a hold pauses the whole run).
+   * Drain: revision-ordered, scope-fenced, fail-atomic. Out-of-scope entries
+   * are scope-skipped (checkpoint advances, zero image/CH access); a copied
+   * entry advances the durable checkpoint; a hold or poison stops the drain.
    */
   async drain(
     images: CanonicalImagePort, ch: ClickHouseClient,
-  ): Promise<{ copied: number; dead: number; checkpoint: string }> {
+  ): Promise<{ copied: number; dead: number; skipped: number;
+              checkpoint: string }> {
     if (!(await this.acquireLease()))
-      return { copied: 0, dead: 0, checkpoint: "0" };
-    let checkpoint = "0", copied = 0, dead = 0;
-    let lastRev = "0";
+      return { copied: 0, dead: 0, skipped: 0,
+        checkpoint: await this.readCheckpoint() };
+    let copied = 0, dead = 0, skipped = 0;
+    let checkpoint = await this.readCheckpoint();
     for (;;) {
       const { entries, hasMore } =
         await this.journal.entries(checkpoint, this.cfg.pageSize);
       for (const entry of entries) {
-        // Strict revision order — an out-of-order or repeated page refuses.
-        if (BigInt(entry.revision) <= BigInt(lastRev))
-          return { copied, dead, checkpoint };
-        lastRev = entry.revision;
+        if (BigInt(entry.revision) <= BigInt(checkpoint))
+          continue;                       // already consumed
+        if (!inScope(entry)) {            // scope-skipped: never touches CH
+          checkpoint = entry.revision;
+          await this.advanceCheckpoint(checkpoint);
+          skipped++;
+          continue;
+        }
         const r = await this.copyOnce(images, ch, checkpoint, entry);
-        if (r === "copied") { copied++; checkpoint = entry.revision; }
-        else {
-          // A hold or dead entry stops the whole drain — never advance past
-          // it and never let later revisions in the page copy.
+        if (r === "copied") {
+          copied++;
+          checkpoint = entry.revision;
+          await this.advanceCheckpoint(checkpoint);
+        } else {
           if (r === "dead") { dead++; await this.deadLetter(entry, "row_invalid"); }
-          return { copied, dead, checkpoint };
+          return { copied, dead, skipped, checkpoint };
         }
         if (!(await this.heartbeat()))
-          return { copied, dead, checkpoint };   // lost mid-drain: hold
+          return { copied, dead, skipped, checkpoint };
       }
       if (!hasMore) break;
-      checkpoint = lastRev;
+      checkpoint = entries[entries.length - 1]!.revision;
     }
-    return { copied, dead, checkpoint };
+    return { copied, dead, skipped, checkpoint };
   }
 
-  /** One bounded attempt set; lease/infra -> hold, poison -> dead. */
+  /** One bounded attempt set; only a stable poison code -> dead. */
   private async copyOnce(
     images: CanonicalImagePort, ch: ClickHouseClient,
     checkpoint: string, entry: CanonicalJournalEntry,
@@ -159,12 +168,13 @@ export class CanonicalConsumer {
         if (r.kind === "copied") return "copied";
         const reason = (r as { reason: string }).reason;
         if (HOLD.has(reason)) return "hold";
-        if (i === this.cfg.maxRetries) return "dead";
+        if (POISON[reason] && i === this.cfg.maxRetries) return "dead";
+        if (!POISON[reason]) return "hold";   // unknown -> hold, never poison
       } catch {
-        if (i === this.cfg.maxRetries) return "hold"; // infra: retryable
+        return "hold";                          // infra: retryable hold
       }
       await new Promise((r) => setTimeout(r, Math.min(50 * (i + 1), 500)));
     }
-    return "dead";
+    return "hold";
   }
 }
