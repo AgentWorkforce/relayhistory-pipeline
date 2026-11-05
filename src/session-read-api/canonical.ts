@@ -3,6 +3,7 @@ import {isManifestRest} from "../../packages/object-store/src/index.ts";
  * The successful claim-bound pointer RPC is the authentication boundary. No
  * object is read from an unverified JWT claim or caller-supplied object key.
  */
+import { canonicalLegacy } from "./canonical-legacy.ts";
 import { createHash } from "node:crypto";
 import { readCanonicalScope, manifestUserId } from "./canonical-projection.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
@@ -119,6 +120,7 @@ export async function canonicalSnapshot(
   if (!pointers.length)
     return {
       generation: version,
+      legacyCoverage: null,
       rows: [] as Array<{ table: string; row: Record<string, unknown> }>,
     };
   const byKey = new Map(pointers.map((p) => [p.manifest_key, p]));
@@ -191,5 +193,10 @@ export async function canonicalSnapshot(
   const fresh = checked(await deps.pointers(identity), identity, deps);
   if (generation(fresh, identity) !== version)
     throw new CanonicalReadError("source_generation_changed");
-  return { generation: version, rows: result.projectionRows };
+  const legacy = canonicalLegacy(result.records, identity);
+  return {
+    generation: version,
+    legacyCoverage: legacy.coverage,
+    rows: [...result.projectionRows, ...legacy.rows],
+  };
 }
