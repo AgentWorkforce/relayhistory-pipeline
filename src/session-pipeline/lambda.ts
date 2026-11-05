@@ -1,3 +1,4 @@
+import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
 /**
  * AWS Lambda entry for the sessions-prod session pipeline
  * (stacks/aws/session-pipeline.ts, runbooks/sessions-prod-session-pipeline.md).
@@ -79,6 +80,7 @@ export interface LambdaEnv {
   queueUrl: string;
   searchEnabled: boolean;
   replayPagesEnabled: boolean;
+  largeScopeHandoffEnabled?: boolean;
   analysisCacheEnabled: boolean;
   /** SESSION_DESKTOP_CATALOG_ENABLED=1: the search stage writes the complete desktop catalog; off (default): the pre-#182 writer. */
   desktopCatalogEnabled: boolean;
@@ -108,6 +110,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     queueUrl: need("SESSION_PIPELINE_QUEUE_URL"),
     searchEnabled: env.SEARCH_INDEX_ENABLED === "1",
     replayPagesEnabled: env.SESSION_REPLAY_PAGES_ENABLED === "1",
+    largeScopeHandoffEnabled: env.SESSION_LARGE_READ_HANDOFF_ENABLED === "1",
     analysisCacheEnabled: env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
     desktopCatalogEnabled: env.SESSION_DESKTOP_CATALOG_ENABLED === "1",
     fanout,
@@ -174,7 +177,7 @@ export function supabasePool(url: string, max: number): HoopDb {
   };
 }
 
-async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>): Promise<T> {
   const client = await db.pool.connect();
   try {
     await client.query("BEGIN");
@@ -285,6 +288,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     // Wiring code does not grant that permission or enable this default-off flag.
     deps.replay = { db, store, provider: "s3", bucket: env.bucket, prefix: bindings };
   }
+  if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large={route:scope=>routeLargeRead(db,scope),jobState:scope=>largeReadJobState(db,scope)};
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
   const brief = briefTick({

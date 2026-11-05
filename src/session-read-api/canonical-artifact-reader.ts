@@ -9,6 +9,7 @@ import {
   compareArtifactEventRows,
   ARTIFACT_VERSION,
   ARTIFACT_MAX_OBJECT_BYTES,
+  ARTIFACT_MAX_ROW_BYTES,
   ARTIFACT_MAX_ROWS_PER_PAGE,
   ARTIFACT_FANOUT,
   ARTIFACT_MAX_DEPTH,
@@ -44,7 +45,7 @@ export interface ArtifactQuery {
   since?: string;
   until?: string;
 }
-const MAX_ROW_BYTES = 64 * 1024 * 1024,
+const MAX_ROW_BYTES = ARTIFACT_MAX_ROW_BYTES,
   MAX_REPLY_BYTES = 2 * 1024 * 1024,
   MAX_FETCHES = 4096;
 const encoder = new TextEncoder();

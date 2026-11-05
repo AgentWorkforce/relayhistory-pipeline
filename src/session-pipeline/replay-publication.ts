@@ -1,3 +1,4 @@
+import type { NodeReadProfile } from "../session-read-api/node-read-profile.ts";
 /** Capture/full-union hydration/immutable writes/CAS. All database calls use backend
  * RPCs; the public claim RPC has the existing search-worker JWT policy. */
 import * as zlib from "node:zlib";
@@ -13,6 +14,8 @@ export interface ReplayCapture {
   snapshot: { epoch: string; pointers: CanonicalPointer[]; [key: string]: unknown };
 }
 export interface ReplayProducerDeps {
+  profile?: NodeReadProfile;
+  publish?: (params: unknown[]) => Promise<boolean>;
   db: SqlExecutor; store: ObjectStore; provider: string; bucket: string;
   prefix: { PIPELINE_ORG_FROM_PREFIX?: string; PIPELINE_KEY_PREFIX?: string };
   decompress?: (bytes: Uint8Array, maxBytes: number) => Uint8Array;
@@ -49,6 +52,24 @@ export function classifyReplayFailure(error: unknown): ReplayRefusal | null {
   if (error instanceof Error && (error as { code?: unknown }).code === "54000") return capacity("54000");
   return null;
 }
+/**
+ * Deterministic capture_session_replay_pages refusals (migration 20261105026000),
+ * classified by SQLSTATE plus the exact RAISE message prefix. The same function
+ * raises transient 55000s ("source epoch missing"; route_session_large_read's
+ * "durable handoff unavailable") that must stay retryable, so code alone is not enough.
+ */
+export type CaptureRefusal = "capture_ambiguous_source" | "capture_capacity_exceeded";
+const CAPTURE_REFUSAL_MESSAGES: readonly (readonly [code: string, message: string, refusal: CaptureRefusal])[] = [
+  ["55000", "replay capture: ambiguous canonical source", "capture_ambiguous_source"],
+  ["54000", "replay capture: pointer capacity exceeded", "capture_capacity_exceeded"],
+  ["54000", "replay capture: metadata capacity exceeded", "capture_capacity_exceeded"],
+];
+export function captureRefusal(error: unknown): CaptureRefusal | undefined {
+  const e = error as { code?: unknown; message?: unknown } | null;
+  if (typeof e?.code !== "string" || typeof e.message !== "string") return undefined;
+  for (const [code, message, refusal] of CAPTURE_REFUSAL_MESSAGES) if (e.code === code && e.message.startsWith(message)) return refusal;
+  return undefined;
+}
 export interface ReplayProducerResult { published: boolean; reason?: "absent" | "source_blocked"; publication?: ArtifactPublication; rows?: number; objects?: number; bytes?: number }
 const fail = (code: string): never => { throw new ArtifactBuildError(code); };
 const scopeOf = (i: CanonicalIdentity): SessionScope => ({ orgId: i.orgId, workspaceId: i.workspaceId, harness: i.source, sessionId: i.sessionId });
@@ -79,7 +100,7 @@ export async function produceCanonicalReplay(scope: SessionScope, deps: ReplayPr
     store: deps.store, provider: deps.provider, bucket: deps.bucket, prefix: deps.prefix,
     pointers: current,
     decompress: deps.decompress ?? ((bytes,maxBytes) => new Uint8Array(zlib.zstdDecompressSync(bytes,{maxOutputLength:maxBytes}))),
-  }, identity);
+  }, identity, deps.profile);
   if (!snapshot.exists) fail("artifact_source_changed");
   const sourceGeneration = canonicalSourceGeneration(first.snapshot.pointers,identity);
   if (snapshot.generation !== sourceGeneration) fail("artifact_source_changed");
@@ -91,10 +112,10 @@ export async function produceCanonicalReplay(scope: SessionScope, deps: ReplayPr
   const prefix = `${anchor.manifest_key.slice(0,-"manifest.json".length)}normalized/read-projection-v1/${rawSha}/${generation}/`;
   const timing = canonicalTimingProjection(identity,snapshot.rows,snapshot.legacyCoverage !== null);
   const rows = timing ? [...snapshot.rows,timing] : snapshot.rows;
-  const made = await materializeCanonicalArtifacts(deps.store,{ identity,generation,source:first.source,prefix,rows,legacyCoverage:snapshot.legacyCoverage });
+  const made = await materializeCanonicalArtifacts(deps.store,{ identity,generation,source:first.source,prefix,rows,profile:deps.profile,legacyCoverage:snapshot.legacyCoverage });
   await current(); // Objects are verified, but stale work still must publish nothing.
   const params = [identity.orgId,identity.workspaceId,identity.source,identity.sessionId,first.source.epoch,first.source.fingerprint,JSON.stringify(first.snapshot),generation,sourceGeneration,prefix,made.index.key,made.index.sha256,made.index.bytes];
-  const { rows: acknowledgement } = await deps.db.query<{published:boolean}>("SELECT sessions.publish_session_replay_pages($1,$2,$3,$4,$5::bigint,$6,$7::jsonb,$8,$9,$10,$11,$12,$13::integer) AS published",params);
-  if (acknowledgement[0]?.published !== true) fail("artifact_publish_cas_failed");
-  return { published:true, publication:{version:1,identity,generation,source:first.source,prefix,index:made.index}, rows:snapshot.rows.length, objects:made.objects, bytes:made.bytes };
+  const published = deps.publish ? await deps.publish(params) : (await deps.db.query<{published:boolean}>("SELECT sessions.publish_session_replay_pages($1,$2,$3,$4,$5::bigint,$6,$7::jsonb,$8,$9,$10,$11,$12,$13::integer) AS published",params)).rows[0]?.published;
+  if (published !== true) fail("artifact_publish_cas_failed");
+  return { published:true, publication:{version:1,identity,generation,source:first.source,prefix,index:made.index}, rows:snapshot.rows.filter(row=>row.table!=="session_directory_event_values").length, objects:made.objects, bytes:made.bytes };
 }

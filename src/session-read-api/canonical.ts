@@ -1,4 +1,5 @@
 import {isManifestRest} from "../../packages/object-store/src/index.ts";
+import { nodeReadBudget, type NodeReadProfile } from "./node-read-profile.ts";
 /** Canonical S3 session projections, shared with the live S3 -> CH writer.
  * The successful claim-bound pointer RPC is the authentication boundary. No
  * object is read from an unverified JWT claim or caller-supplied object key.
@@ -118,16 +119,24 @@ export function canonicalSourceGeneration(
     )
     .digest("hex");
 }
-export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity) {
-  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS);
+/**
+ * Live raw read (/canonical raw, timing, turns). Display values are projected only when the
+ * caller asks for them (`directoryValues: true`, i.e. table=session_directory_event_values);
+ * every other read does no display work and returns exactly the pre-#184 snapshot. When
+ * projected, a display-value refusal omits those rows (`displayOmitted`) instead of failing.
+ */
+export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, options: { directoryValues?: boolean } = {}) {
+  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS, 500000, options.directoryValues === true ? "optional" : undefined);
 }
 /** Trusted Node producer only. Never called by the raw Worker request path. */
-export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity) {
-  return snapshotWithLimits(deps, identity, ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS, ARTIFACT_MAX_SOURCE_POINTERS + 1);
+export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, profile: NodeReadProfile = "standard") {
+  const budget=nodeReadBudget(profile);
+  return snapshotWithLimits(deps, identity, budget.sourceBytes, budget.sourceRecords, ARTIFACT_MAX_SOURCE_POINTERS + 1,budget.projectedRows,"required");
 }
 async function snapshotWithLimits(
   deps: CanonicalDeps, identity: CanonicalIdentity,
-  maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number,
+  maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number, maxRows: number,
+  directoryValues: "required" | "optional" | undefined,
 ) {
   const pointers = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive),
     version = canonicalSourceGeneration(pointers, identity);
@@ -198,8 +207,9 @@ async function snapshotWithLimits(
     {
       maxScopeBytes,
       maxScopeEvents,
-      maxRows: 500000,
+      maxRows,
       insertBatch: 5000,
+      ...(directoryValues ? { directoryValues } : {}),
     },
     0,
     identity.sessionId,
@@ -217,5 +227,7 @@ async function snapshotWithLimits(
     exists: true,
     legacyCoverage: legacy.coverage,
     rows: [...result.projectionRows, ...mergeTurnRows(legacy.rows, live)],
+    /** Bounded directory_display_* code when display rows were omitted (raw read only). */
+    ...(result.displayOmitted ? { displayOmitted: result.displayOmitted } : {}),
   };
 }

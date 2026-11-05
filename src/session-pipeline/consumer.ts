@@ -14,7 +14,8 @@ import { errorFields, log } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
-import { classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
+import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
+import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
 
 export interface QueueRecord {
   messageId: string;
@@ -31,6 +32,11 @@ export interface ConsumerDeps {
   search?: SearchIndexDeps;
   /** Explicitly absent by default; independent Node artifact publication stage. */
   replay?: ReplayProducerDeps;
+  /**
+   * Absent by default (SESSION_LARGE_READ_HANDOFF_ENABLED). `delegated: true` means durable
+   * canonical-epoch handoff; `jobState` reads the job behind a delegated route, once per routed scope.
+   */
+  large?: { route: (scope: SessionScope) => Promise<LargeRoute>; jobState?: (scope: SessionScope) => Promise<LargeJobState | null> };
   /**
    * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
    * another pass holds the session, so the event is neither lost nor failed.
@@ -91,9 +97,38 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }
   }
 
+  const delegated=new Set<string>();
+  if(deps.large&&(deps.search||deps.replay))for(const {scope,messageIds} of scopes.values()){
+    if(messageIds.every(id=>failed.has(id)))continue;
+    const ids={org_id:scope.orgId,workspace_id:scope.workspaceId,harness:scope.harness,session_id:scope.sessionId};
+    let routed:LargeRoute;
+    try{routed=await deps.large.route(scope)}
+    catch(error){
+      // route_session_large_read captures first, so it raises the same refusals as the replay
+      // stage (#179). A capacity/superseded refusal is not retryable here: log it and let search
+      // and replay apply their own limits. A permanently ambiguous canonical source (55000 with
+      // capture's exact message) is deterministic too: retrying only reaches the DLQ with search
+      // skipped every time. Anything else (55000 durable handoff unavailable or source epoch
+      // missing, 22023, connection errors) fails the batch and is retried.
+      const refusal=classifyReplayFailure(error);
+      if(refusal){log.warn("large scope handoff refused",{stage:"large-read",...ids,...errorFields(error),reason:refusal.reason,error_code:refusal.code});continue}
+      if(captureRefusal(error)==="capture_ambiguous_source"){log.warn("large scope handoff refused",{stage:"large-read",...ids,...errorFields(error),reason:"large_handoff_ambiguous_source",error_code:"55000"});continue}
+      log.error("large scope handoff failed",{stage:"large-read",...ids,...errorFields(error)});for(const id of messageIds)failed.add(id);continue;
+    }
+    if(!routed.delegated)continue;
+    delegated.add(scopeId(scope));
+    if(!deps.large.jobState)continue;
+    // Search/replay are skipped for a delegated scope, so a job that will never run is a gap:
+    // `failed` is never claimed again until the source changes. Make it visible.
+    try{
+      const job=await deps.large.jobState(routed.identity??scope);
+      if(job&&job.state!=="failed")log.info("large scope delegated",{stage:"large-read",...ids,state:job.state,attempt:job.attempts});
+      else log.warn("large scope job will not be processed",{stage:"large-read",...ids,state:job?.state??"missing",attempt:job?.attempts,reason:job?"large_job_failed":"large_job_missing"});
+    }catch(error){log.warn("large scope job state unavailable",{stage:"large-read",...ids,...errorFields(error)})}
+  }
   if (deps.search) {
     for (const { scope, messageIds, manifestKey } of scopes.values()) {
-      if (messageIds.every((id) => failed.has(id))) continue;
+      if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       try {
         const result = await indexSearchScope(scope, deps.search);
@@ -134,7 +169,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   }
   if (deps.replay) {
     for (const { scope, messageIds } of scopes.values()) {
-      if (messageIds.every(id => failed.has(id))) continue;
+      if (delegated.has(scopeId(scope)) || messageIds.every(id => failed.has(id))) continue;
       const started = Date.now();
       try {
         const result = await produceCanonicalReplay(scope, deps.replay);
@@ -152,8 +187,11 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           continue;
         }
         if (refusal?.kind === "capacity") {
-          // TODO(#184): route oversize scopes to the large-read path (session_large_read_jobs)
-          // instead of only logging; the producer does not enqueue there yet.
+          // Oversize scopes go to the large-read path before search/replay run: deps.large
+          // (route_session_large_read -> session_large_read_jobs, default off) delegates them
+          // above. A capacity refusal here is a scope that was not delegated (handoff off,
+          // metadata under the route thresholds, or the route itself refused on capacity);
+          // it is logged, not retried.
           log.warn("canonical replay refused", { ...fields, reason: refusal.reason, error_code: refusal.code });
           continue;
         }

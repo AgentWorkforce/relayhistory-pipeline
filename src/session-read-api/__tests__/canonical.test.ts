@@ -751,3 +751,70 @@ test("missing pointer sources attest absence without inventing legacy coverage",
   });
   expect(objects).toBe(0);
 });
+import { canonicalProducerSnapshot, CanonicalReadError } from "../canonical.ts";
+test("a directory display refusal omits display rows on the live raw read but refuses the producer with a stable code", async () => {
+  const record = (cwd: string) => ({
+    kind: "session_event",
+    origin_id: "origin",
+    record_id: "r1",
+    revision: "1",
+    operation: "upsert",
+    received_at: AT,
+    payload: { ts_ms: Date.parse(AT), text: "opening prompt", role: "user", message_id: "msg-1", cwd },
+  });
+  const display = (rows: Array<{ table: string; row: Record<string, unknown> }>) =>
+    rows.filter((r) => r.table === "session_directory_event_values");
+  await replaceCanonicalRecords([record("/work/project")]);
+  const ok = await canonicalSnapshot(deps, identity, { directoryValues: true });
+  expect(display(ok.rows).map((r) => r.row.project_id)).toContain("/work/project");
+  expect("displayOmitted" in ok).toBe(false);
+  // A >1 MiB project path makes the display value refuse (directory_display_bound).
+  await replaceCanonicalRecords([record("/" + "x".repeat(1024 * 1024))]);
+  const raw: any = await canonicalSnapshot(deps, identity, { directoryValues: true }).catch((e) => ({ rejected: e?.reason, details: e?.details }));
+  // Not requested (raw /canonical of any other table, timing, turns): no display projection ran,
+  // so the same refusing fixture reports nothing and the snapshot carries no display table.
+  const plain: any = await canonicalSnapshot(deps, identity);
+  expect("displayOmitted" in plain).toBe(false);
+  expect(display(plain.rows)).toEqual([]);
+  expect(raw).toMatchObject({ exists: true });
+  expect(display(raw.rows)).toEqual([]);
+  expect(raw.rows.some((r: { table: string }) => r.table === "convergence_events")).toBe(true);
+  expect((raw as { displayOmitted?: string }).displayOmitted).toBe("directory_display_bound");
+  const lines: string[] = [], err = console.error;
+  console.error = (line: string) => void lines.push(line);
+  let response: Response;
+  try {
+    response = await canonicalHandle(request("&table=session_directory_event_values"), { CANONICAL_READ_ENABLED: "true" }, fetch, deps);
+  } finally { console.error = err; }
+  expect(response.status).toBe(200);
+  expect(((await response.json()) as any).rows).toEqual([]);
+  expect(lines.map((l) => JSON.parse(l))).toEqual([expect.objectContaining({ level: "warn", message: "canonical display values omitted", reason: "directory_display_bound", session_id: "sess:1" })]);
+  const refused = await canonicalProducerSnapshot(deps, identity).catch((e) => e);
+  expect(refused).toBeInstanceOf(CanonicalReadError);
+  expect(refused).toMatchObject({ reason: "canonical_projection_incomplete", details: ["directory_display_bound"] });
+});
+test("display values are lazy: a raw snapshot without the request is the pre-#184 snapshot, byte for byte", async () => {
+  const record = (id: string, text: string, cwd?: string) => ({
+    kind: "session_event",
+    origin_id: "origin",
+    record_id: id,
+    revision: "1",
+    operation: "upsert",
+    received_at: AT,
+    payload: { ts_ms: Date.parse(AT), text, role: "user", message_id: `msg-${id}`, ...(cwd ? { cwd } : {}) },
+  });
+  await replaceCanonicalRecords([record("r1", "opening prompt", "/work/project"), record("r2", "follow up")]);
+  const plain = await canonicalSnapshot(deps, identity);
+  const requested = await canonicalSnapshot(deps, identity, { directoryValues: true });
+  // The opt-in read really projects display values for this fixture...
+  expect(requested.rows.some((r) => r.table === "session_directory_event_values")).toBe(true);
+  // ...and the default read is exactly the opt-in read minus that table: no new table key,
+  // no displayOmitted key, same generation, same rows in the same order.
+  expect(Object.keys(plain).sort()).toEqual(["exists", "generation", "legacyCoverage", "rows"]);
+  expect(plain.rows.some((r) => r.table === "session_directory_event_values")).toBe(false);
+  expect(JSON.stringify(plain)).toBe(JSON.stringify({ ...requested, rows: requested.rows.filter((r) => r.table !== "session_directory_event_values") }));
+  // Raw route: other tables never carry display rows; the display table is served on request.
+  const rows = async (table: string) => ((await (await canonicalHandle(request(`&table=${table}`), { CANONICAL_READ_ENABLED: "true" }, fetch, deps)).json()) as { rows: unknown[] }).rows;
+  expect((await rows("convergence_events")).length).toBe(2);
+  expect((await rows("session_directory_event_values")).length).toBeGreaterThan(0);
+});
