@@ -1542,8 +1542,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // The very next migrate reapplies 024000, 025000, 026000 and 030000; the post-validation
     // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D]));
     expect(await passed()).toBe(true);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_consumer_lease')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_consumer_lease");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBe("sessions.session_brief_document_scopes");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBe("sessions.ingest_history_switch");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_copy_state");

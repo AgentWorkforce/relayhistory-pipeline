@@ -1,7 +1,7 @@
 // Real-PG consumer proof: exact proposal DDL, real CanonicalConsumer,
 // mid-copy lease transfer -> old worker stops, durable checkpoint, takeover.
 // Run: bun scripts/proof-canonical-consumer-lease.ts <pgPort>
-import { Pool } from "pg";
+import { Client, Pool } from "pg";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { copyCanonicalEntry } from "../src/search-features/canonical-cycle.ts";
@@ -10,13 +10,11 @@ import { CanonicalJournalStore } from "../src/search-features/canonical-journal.
 import { CanonicalPageAckStore } from "../src/search-features/canonical-ack-store.ts";
 
 const port = Number(process.argv[2] ?? 32770);
-// Host/port guard: only ever run against a loopback disposable fixture,
-// never an arbitrary host/port.
+// Guard: only ever run against a loopback disposable fixture — real check.
 if (process.env.PROOF_DISPOSABLE !== "1")
   throw new Error("refused: set PROOF_DISPOSABLE=1 on a disposable database");
-if (!["127.0.0.1", "localhost"].includes(
-    process.env.PROOF_HOST ?? "127.0.0.1") || port < 1 || port > 65535)
-  throw new Error("refused: proof host must be loopback with a valid port");
+if (!Number.isInteger(port) || port < 1 || port > 65535)
+  throw new Error("refused: proof port must be a valid integer");
 const admin = new Pool({ host: "127.0.0.1", port, user: "postgres",
   password: "synthetic-feature-only", database: "postgres" });
 let failures = 0;
@@ -55,9 +53,14 @@ const OTHER = { orgId: "o2", workspaceId: "other-ws", harness: "h",
 await db.query(`INSERT INTO sessions.ingest_history_scope_versions VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [UID, "o2", "other-ws", "h", "s", 1, A, PTR.hash, 1]);
 await db.query(`SELECT sessions.canonical_feature_changed($1,$2,$3,$4,$5)`, [JSON.stringify(OTHER), JSON.stringify(AUTH), null, JSON.stringify(PTR), null]);
 
-const prod = new Pool({ host: "127.0.0.1", port, user: "postgres",
+// One dedicated Client holds SET ROLE for every runtime op — a Pool would
+// rotate connections and silently drop the role.
+const prod = new Client({ host: "127.0.0.1", port, user: "postgres",
   password: "synthetic-feature-only", database: DB });
+await prod.connect();
 await prod.query("SET ROLE bulls96_canonical_feature_producer");
+const { rows: [who] } = await prod.query("SELECT current_user AS u");
+check("runtime_runs_as_producer", who.u === "bulls96_canonical_feature_producer");
 const sql = { query: (t: string, p?: unknown[]) => prod.query(t, p) };
 const journal = new CanonicalJournalStore(sql);
 const store = new CanonicalPageAckStore(sql);
@@ -137,7 +140,6 @@ const del = await prod.query(
   .catch((e: { code?: string }) => e);
 check("producer_dead_letter_delete_denied",
   (del as { code?: string }).code === "42501");
-await prod.query("RESET ROLE");
 await prod.end();
 await db.end();
 await admin.query(`DROP DATABASE IF EXISTS ${DB}`);
