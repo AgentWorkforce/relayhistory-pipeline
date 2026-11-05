@@ -11,11 +11,22 @@ import type { SessionUnit } from "../../migration/neon-s3-sync/neon-reader.ts";
 import type { RelayhistoryStreamRecord } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 export const REPLAY_FIXTURE_IDENTITY = { orgId:"org_replay",workspaceId:"ws_replay",source:"claude",sessionId:"large:replay" };
 export const REPLAY_FIXTURE_AT = "2026-11-01T10:00:00.000Z";
+const executor = (pg: PGlite) => ({ async query<T>(sql:string,params?:unknown[]) { if(params?.length)return pg.query<T>(sql,params);const r=await pg.exec(sql);return {rows:(r.at(-1)?.rows??[]) as T[]}; } });
 export async function replayDatabase() {
  const pg = new PGlite({extensions:{btree_gin,pg_trgm}});
- const db = { async query<T>(sql:string,params?:unknown[]) { if(params?.length)return pg.query<T>(sql,params);const r=await pg.exec(sql);return {rows:(r.at(-1)?.rows??[]) as T[]}; } };
+ const db = executor(pg);
  await runMigrations(db,{profile:{mode:"local",shim:true,bootstrap:true,verify:true,runtimeRole:"postgres"}});
  return {pg,db};
+}
+/** Tests: one migrated template per test file; each test gets an isolated clone (~1 s instead of a ~5 s migration). */
+let template: Promise<PGlite> | undefined;
+export const PGLITE_TEST_TIMEOUT = 30_000;
+export function warmReplayTemplate(): Promise<unknown> { return template ??= replayDatabase().then(x => x.pg); }
+export async function closeReplayTemplate() { const t = template; template = undefined; if (t) await (await t).close(); }
+export async function clonedReplayDatabase(): Promise<Awaited<ReturnType<typeof replayDatabase>>> {
+ await warmReplayTemplate();
+ const pg = await (await template!).clone() as PGlite;
+ return {pg,db:executor(pg)};
 }
 export async function addReplayPointer(db: ReturnType<typeof replayDatabase> extends Promise<infer R> ? R extends {db:infer D}?D:never:never, pointer: { identity?:{orgId:string;workspaceId:string;source:string;sessionId:string}; key:string; digest:string; physicalSession:string; physicalMachine:string; canonicalSession?:string; canonicalMachine?:string; user?:string; revision?:number; trace?:string }) {
  const i=pointer.identity??REPLAY_FIXTURE_IDENTITY;

@@ -146,6 +146,31 @@ Activation, in order (each step is the lead's):
 
 Expected shadow differences: Neon froze at the cutover, so a session with activity after it is more complete on S3 (`equal: false` there is not a regression). Compare sessions whose last activity predates the cutover.
 
+## Session turns and metadata (P3d)
+
+`GET /v1/sessions/:id/turns` and `/metadata` come from the same canonical S3 objects as timing, never Neon (`session-turns-source.ts`):
+- every harness scope holding a pointer for the session id (at most 4; with `source`, only that one), read with `canonicalSnapshot`;
+- its `conversation_turns` rows: the legacy export (`legacy_conversation_turn`) merged with live `conversation_turn` records from relayhistory `TURNS_WRITE_PATH=dual|forward` (`canonical-turns.ts`; a live record wins per (workspace, stored source, turn_index));
+- de-duplicated by Neon row id, ordered as relayhistory orders them, `ts` as a JS Date serializes.
+
+501s Cloud falls back on: `turns_workspace_not_enabled`, `turns_not_configured`, `org_scope` (no `workspace=`), `turns_no_pointers`, `turns_harness_bound`, `turns_unknown` (a scope without the export's coverage marker), `turns_truncated`, `turns_attribution`, `turns_canonical_<reason>` (including `_deadline` after 3 s). Erased sessions: `turns: []` and metadata 404, as relayhistory after erasure. A session with no turns: metadata 404 (Cloud falls back on any non-2xx in `on` mode).
+
+Activation, in order (each step is the lead's), after the timing steps 1, 2 and 4 above:
+1. Run the legacy turns export for the canary workspace (docs/canonical-legacy-source.md) and its verifier; without it every read is `turns_unknown`.
+2. In Cloud, `SESSIONS_READ_96BULLS_ROUTES` adds `session_turns=shadow,session_metadata=shadow`; watch `[sessions-read-shadow] route=session_turns` / `session_metadata` for `equal`, then `on`. Only callers that send `workspace=` reach 96Bulls (Cloud's dashboard replay does not yet).
+3. Expected shadow differences: a turn re-POSTed after `TURNS_WRITE_PATH=forward` carries the new request's row id (Neon keeps the first id); under `dual` ids match.
+
+Read-only checks (Neon, any time):
+```sql
+-- turns the canary workspace holds, and how many sessions
+SELECT count(*) AS turns, count(DISTINCT session_id) AS sessions, max(ts) AS newest
+  FROM sessions.conversation_turns WHERE org_id = :'org' AND workspace_id = :'ws';
+-- one session's rows in relayhistory's order (compare with the Worker's answer)
+SELECT id, source, turn_index, role, ts FROM sessions.conversation_turns
+ WHERE org_id = :'org' AND workspace_id = :'ws' AND session_id = :'session'
+ ORDER BY turn_index, workspace_id COLLATE "C", source COLLATE "C", id;
+```
+
 ## Rollback
 
 - **Fastest:** set the route back to `shadow` or `off` in Cloud. This needs no Worker change.
