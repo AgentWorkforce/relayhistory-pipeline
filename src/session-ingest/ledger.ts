@@ -1,3 +1,6 @@
+import type {CurrentCustodyPacket,CurrentCustodyAck} from "./custody-protocol.ts";
+import type {OrderedControl,OrderedControlResult} from "./control-protocol.ts";
+import type { BufferedStageSpec, BufferedStageIntent } from "./buffered-protocol.ts";
 /**
  * The session ingest's Supabase ledger: everything `accept_delivery_batch`
  * decided in Neon that is not transcript content.
@@ -8,11 +11,13 @@
  *                                  the record-revision 409 (0026's checks), no content
  *   sessions.upload_deletions      (org, ws, user, origin, source, session_id) deletion fences
  *   sessions.upload_resets         (org, ws, user, request_id) a user's "delete all" resets
+ *   sessions.ingest_session_ownership pending/committed session keys visible to reset
  *   sessions.upload_erasure_rearm  sessions a tombstone reached after an ingest claim: the
  *                                  erasure job sweeps them again
  *
  * Two calls per batch, each one round trip and one short transaction, with
- * row locks on the batch's own rows only (no per-user advisory lock):
+ * short per-(org,workspace,user) row locking for fence decisions (no advisory
+ * locks). S3 writes stay outside those transactions:
  *
  *   claim  (before any S3 write) fences, replay/409, stale records, pending claim
  *   commit (after the S3 writes) pending -> committed, written revisions, fence recheck
@@ -51,6 +56,7 @@ export interface LedgerRecord {
 }
 
 export interface ClaimInput {
+  custody?:CurrentCustodyPacket;
   tenant: LedgerTenant;
   originId: string;
   batchId: string;
@@ -83,11 +89,11 @@ export interface RevisionConflict {
  * revisions. `resets`: the user's reset count, which the optional Neon
  * replica's guard compares at apply time (relayhistory's `fence.resets`).
  */
-export type ClaimResult =
+type BaseClaimResult =
   /** First sight of this batch: claimed `pending`. */
-  | { kind: "claimed"; deleted: [string, string][]; stale: number[]; resets: number }
+  | { kind: "claimed"; claimToken: string; deleted: [string, string][]; stale: number[]; resets: number }
   /** A pending claim with this digest (an earlier attempt stopped part way): re-run, every step is idempotent. */
-  | { kind: "resume"; deleted: [string, string][]; stale: number[]; resets: number }
+  | { kind: "resume"; claimToken: string; deleted: [string, string][]; stale: number[]; resets: number }
   /**
    * Every record is stale or deleted: the claim committed the batch itself in
    * the same round trip. Nothing is written to S3 and commit is not called.
@@ -100,11 +106,22 @@ export type ClaimResult =
   /** 409 record_revision (#250: in-batch reuse of a new revision only): first MAX_DELIVERY_CONFLICTS, and the total. */
   | { kind: "revision_conflict"; conflicts: RevisionConflict[]; count: number };
 
+export type ClaimResult = BaseClaimResult & {custodyAck?:CurrentCustodyAck};
+
+/** A server-issued immutable claim snapshot, carried through object IO. */
+export interface ClaimAttempt {
+  batchId: string;
+  batchDigest: string;
+  claimToken: string;
+}
+export type StagedAttempt = Pick<ClaimAttempt, "batchDigest" | "claimToken">;
+
 export interface CommitInput {
   tenant: LedgerTenant;
   originId: string;
   batchId: string;
   batchDigest: string;
+  claimToken: string;
   /** Sessions this batch wrote to S3 (after the deletion filter). */
   sessions: [source: string, sessionId: string][];
   /** Exactly the records written to S3: their revisions become stored (max wins, equal keeps). */
@@ -148,8 +165,29 @@ export interface SelectionInput {
   enabled: boolean;
 }
 
+export type OrderedControlInput =
+ | (SelectionInput & {control:OrderedControl & {kind:"selection"};custody?:CurrentCustodyPacket})
+ | {tenant:LedgerTenant;requestId:string;control:OrderedControl & {kind:"reset"};custody?:CurrentCustodyPacket};
+/** P1 frozen-source custody: the witness relayhistory would build against Neon, built in Supabase. */
+export interface FrozenWitnessCandidate { preparedOrd: number; recordId: string; revision: string; revisionId: string; candidateDigest: string; source: string; sessionId: string | null }
+export interface FrozenWitnessInput { kind: "batch" | "selection" | "reset"; tenant: LedgerTenant; originId: string | null; batchId: string | null; batchDigest: string | null; originalRecordCount: number; candidates: FrozenWitnessCandidate[] }
+export interface SourceControlBeginInput { epoch: string; tenant: LedgerTenant; kind: "selection" | "reset"; payload: unknown }
+export interface SourceControlHead { epoch: string; version: string; digest: string; kind: "selection" | "reset"; pending: true; apply: boolean }
+export interface SourceControlCompleteInput { epoch: string; tenant: LedgerTenant; version: string; digest: string; kind: "selection" | "reset"; outcome: "applied" | "replay" | "stale" }
 export interface Ledger {
+  /** Frozen-source custody witness (refuses unless the sealed copy and policy agree). */
+  frozenWitness?(input: FrozenWitnessInput): Promise<CurrentCustodyPacket>;
+  /** Frozen Neon legacy receipt for a retried pre-cutover batch (refuses while a control is pending). */
+  frozenReceipt?(input: { tenant: LedgerTenant; originId: string; batchId: string }): Promise<{ digest: string; receipt: Record<string, unknown> } | null>;
+  /** Supabase-first mirror of Neon's control head; relayhistory calls it BEFORE Neon begins. */
+  sourceControlBegin?(input: SourceControlBeginInput): Promise<SourceControlHead>;
+  /** Mirror completion; relayhistory calls it AFTER Neon completes. */
+  sourceControlComplete?(input: SourceControlCompleteInput): Promise<{ completed: true; superseded: boolean }>;
+  /** Private verified-identity path. Unsupported stores must fail, never fall back. */
+  applyOrderedControl?(input:OrderedControlInput):Promise<OrderedControlResult>;
   claim(input: ClaimInput): Promise<ClaimResult>;
+  prepareBufferStage?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & BufferedStageSpec): Promise<BufferedStageIntent>;
+  commitBuffered?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & {stageToken:string}): Promise<CurrentCustodyAck|void>;
   commit(input: CommitInput): Promise<CommitResult>;
   acquireSlot(request: SlotRequest): Promise<SlotResult>;
   releaseSlot(tenant: LedgerTenant, holder: string): Promise<void>;
@@ -157,9 +195,9 @@ export interface Ledger {
   /** The number of sessions the reset tombstoned (a replayed request id answers its first count). */
   resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number>;
   /** Staged path: the slice's sessions fenced right now (skipped by the fan-out). */
-  fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][]): Promise<[string, string][]>;
+  fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][], attempt: StagedAttempt): Promise<[string, string][]>;
   /** Staged path: the records one slice wrote become stored (a session fenced since is re-armed instead). */
-  commitRevisions(tenant: LedgerTenant, originId: string, machineId: string, records: LedgerRecord[]): Promise<{ committed: number; rearmed: number }>;
+  commitRevisions(tenant: LedgerTenant, originId: string, machineId: string, records: LedgerRecord[], attempt: StagedAttempt): Promise<{ committed: number; rearmed: number }>;
 }
 
 /** The ledger is unreachable or refused: the batch answers 503 (retryable), never a fallback. */

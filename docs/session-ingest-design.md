@@ -77,7 +77,7 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
   - Batch digests and the content-addressed `receiptId` therefore match exactly. So do the 400/403/413/415/422 answers, the 409 bodies (`conflict`, `conflicts`, `conflictCount`), the error envelope, `X-Correlation-Id`, `limits.contentEncodings` and both 2 MiB bounds. A gzip bomb stops at the cap.
 - **Credentials:**
   - **S3:** the existing transcript **srv-writer** IAM user. Its grants are exactly the ingest's prefixes (`m=srv_*`, `live-sessions/*`, `live-batches/*`), SSE-KMS only, with no delete. Its keys are Secrets Store bindings set from 1Password. **No AWS stack change.**
-  - **Supabase:** Hyperdrive to the transaction pooler, as `bulls96_session_ingest`. Alchemy looks it up by id and never holds the password.
+  - **Supabase:** Hyperdrive to the Supavisor **session** pooler (`aws-0-us-east-1.pooler.supabase.com:5432`), as `bulls96_session_ingest.<project>`, with caching disabled and `verify-full` against the Supabase Root 2021 CA, the same shape as the read API's Hyperdrive. Hyperdrive does its own connection pooling, so the transaction pooler is not needed. The live config is `96bulls-session-ingest` (`0fcc0265e96f43a39976b5aa4263f4a6`, created 2026-11-05). Alchemy looks it up by id and never holds the password.
 - **Layout:** relayhistory's live writer exactly. The same `m=srv_<sha256(ws␟origin␟user)>` machine, line shape, `live-sessions/` pointer, and manifest owner `relayhistory-api:delivery` with the `relayhistory_live` replay extension.
   - This is deliberate. During the transition both Workers append to the **same** session manifests; the manifest compare-and-swap makes that safe, and a batch one of them already wrote is a no-op for the other.
   - `writer.plugin_version` (`96bulls-session-ingest/1`) says which one wrote a revision.
@@ -124,7 +124,7 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
 
 ## 3. Ledger (Supabase)
 
-Migration `supabase/migrations/20261102010000_session_ingest_ledger.sql`. It never creates or alters a role (review High 1: a CNPG / Cloud SQL migration owner has no CREATEROLE). `supabase/bootstrap/session_ingest_roles.sql` provisions both roles NOLOGIN before migrate (`src/hoopdb/migrate.ts` runs it as its bootstrap step, the runbook as `postgres` on Supabase); the migration verifies them and fails closed (42704 absent, 55000 elevated or a member). After migrate, `session_ingest_role.sql` makes the ingest role LOGIN with a 5 s statement timeout. Each function refuses any other caller, and no advisory lock is taken anywhere (a test asserts it).
+Migration `supabase/migrations/20261104022000_session_ingest_ledger.sql`. It never creates or alters a role (review High 1: a CNPG / Cloud SQL migration owner has no CREATEROLE). `supabase/bootstrap/session_ingest_roles.sql` provisions both roles NOLOGIN before migrate (`src/hoopdb/migrate.ts` runs it as its bootstrap step, the runbook as `postgres` on Supabase); the migration verifies them and fails closed (42704 absent, 55000 elevated or a member). After migrate, `session_ingest_role.sql` makes the ingest role LOGIN with a 5 s statement timeout. Each function refuses any other caller, and no advisory lock is taken anywhere (a test asserts it).
 
 - **`ingest_batches`** holds idempotency and receipts.
   - Same digest and committed: **replay**. The receipt is recomputed from the request, since it is content-addressed. The stored `receipt_id` is cross-checked, and a mismatch is a 503.

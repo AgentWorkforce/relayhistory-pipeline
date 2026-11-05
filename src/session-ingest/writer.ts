@@ -62,6 +62,8 @@ export const LIVE_OWNER = "relayhistory-api:delivery";
 export const INGEST_PLUGIN_VERSION = "96bulls-session-ingest/1";
 /** Manifest extension recording which batches each chunk holds (replay dedupe), as relayhistory. */
 export const LIVE_EXTENSION = "relayhistory_live";
+/** Authenticated user and pre-layout session identity consumed by the session pipeline. */
+export const BULLS_EXTENSION = "96bulls";
 const REMEMBERED_BATCHES = 64;
 export const CAS_ATTEMPTS = 8;
 /** Session groups written at once: a Worker keeps at most six connections open. */
@@ -72,7 +74,7 @@ export const NO_SESSION_HARNESS = "_none";
 export const NO_SESSION_ID = "_origin";
 
 export class IngestWriteError extends Error {
-  constructor(readonly code: "tenant_not_a_segment" | "foreign_manifest" | "manifest_contended" | "pointer_invalid") {
+  constructor(readonly code: "tenant_not_a_segment" | "foreign_manifest" | "manifest_identity_mismatch" | "manifest_contended" | "pointer_invalid") {
     super(`session ingest write refused: ${code}`);
     this.name = "IngestWriteError";
   }
@@ -228,7 +230,18 @@ function rememberedBatches(manifest: ManifestV1 | null): Map<string, number> {
   return out;
 }
 
-function nextManifest(args: {
+export function admittedIdentity(manifest: ManifestV1 | null, userId: string, sessionId: string): Record<string, unknown> {
+  const stored = manifest?.extensions?.[BULLS_EXTENSION];
+  if (stored !== undefined && (stored === null || typeof stored !== "object" || Array.isArray(stored)))
+    throw new IngestWriteError("manifest_identity_mismatch");
+  const identity = (stored ?? {}) as Record<string, unknown>;
+  if (("user_id" in identity && identity.user_id !== userId) ||
+      ("canonical_session_id" in identity && identity.canonical_session_id !== sessionId))
+    throw new IngestWriteError("manifest_identity_mismatch");
+  return { ...identity, user_id: userId, canonical_session_id: sessionId };
+}
+
+export function nextManifest(args: {
   batches: [string, number][];
   prev: ManifestV1 | null;
   location: SessionLocation;
@@ -240,6 +253,7 @@ function nextManifest(args: {
   contentSha256: string;
   chunks: ChunkEntry[];
   now: string;
+  identity: Record<string, unknown>;
 }): ManifestV1 {
   const { prev, entry, chunks, now } = args;
   const epochs = prev?.raw.epochs ?? [{ epoch: 0, opened_at: now, reason: "initial" as const, first_seq: 0, opened_by: LIVE_OWNER }];
@@ -270,7 +284,11 @@ function nextManifest(args: {
       scrub: { ruleset: SCRUB_RULESET, version: scrubVersion },
     },
     ...(prev?.server !== undefined ? { server: prev.server } : {}),
-    extensions: { ...(prev?.extensions ?? {}), [LIVE_EXTENSION]: { batches: args.batches } },
+    extensions: {
+      ...(prev?.extensions ?? {}),
+      [LIVE_EXTENSION]: { batches: args.batches },
+      [BULLS_EXTENSION]: args.identity,
+    },
   } as ManifestV1;
 }
 
@@ -290,7 +308,7 @@ export interface Group {
 export type LineMeta = [revisionId: string, digest: string, source: string, sessionId: string | null];
 
 /** The payload's own clock of a chunk line, else `fallback`. */
-function lineTimeMs(line: string, fallback: number): number {
+export function lineTimeMs(line: string, fallback: number): number {
   try {
     const payload = (JSON.parse(line) as { payload?: Record<string, unknown> | null }).payload ?? {};
     for (const field of TIME_FIELDS) {
@@ -306,6 +324,7 @@ function lineTimeMs(line: string, fallback: number): number {
 export interface GroupBatch {
   orgId: string;
   workspaceId: string;
+  userId: string;
   batchDigest: string;
 }
 
@@ -337,6 +356,7 @@ async function writeGroup(
     const stored = await readJson(target.store, key);
     const prev = stored ? await parseManifest(stored.text, key) : null;
     if (prev && prev.raw.owner !== LIVE_OWNER) throw new IngestWriteError("foreign_manifest");
+    const identity = admittedIdentity(prev, batch.userId, group.sessionId);
     // A replayed batch was already appended (by this service or by relayhistory-api).
     const remembered = rememberedBatches(prev);
     const seq = remembered.get(batch.batchDigest);
@@ -369,6 +389,7 @@ async function writeGroup(
       traceId,
       contentSha256: await computeContentSha256(chunks),
       chunks,
+      identity,
       now: new Date(Math.max(now().getTime(), Date.parse(prev?.updated_at ?? "0"))).toISOString(),
     });
     await parseManifest(manifest, key);
@@ -416,7 +437,7 @@ export function groupRecords(records: PreparedDeliveryRecord[], receivedAt: Date
 /** Groups written to their session manifests, `INGEST_CONCURRENCY` at a time, each retried in place. */
 export async function writeGroups(
   target: WriteTarget,
-  batch: GroupBatch & { originId: string; userId: string },
+  batch: GroupBatch & { originId: string },
   groups: Group[],
   receivedAt: Date,
 ): Promise<{ manifests: ManifestWrite[]; parts: WritePart[]; machineId: string }> {

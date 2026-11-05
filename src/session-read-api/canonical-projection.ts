@@ -1,5 +1,6 @@
 /** Shared canonical S3 reader/projection. The live CH writer and read Worker
  * invoke this same implementation; neither maintains a shadow event mapping. */
+import { canonicalDirectoryValues } from "./canonical-directory-values.ts";
 import { createHash } from "node:crypto";
 import {
   CONVERGENCE_EVENT_KIND,
@@ -8,6 +9,7 @@ import {
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import {
   normalizeRelayhistoryRecords,
+  isLegacyRelayhistoryRecord,
   parseRelayhistoryRecord,
   relayhistoryExportProvenance,
   type RelayhistoryStreamRecord,
@@ -16,6 +18,9 @@ import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.t
 import {
   chunkKeys,
   parseSessionKey,
+  isManifestRest,
+  isPublicationManifestRest,
+  parseUploadGenerationPrefix,
   type ManifestV1,
   type ObjectStore,
 } from "../../packages/object-store/src/index.ts";
@@ -59,6 +64,13 @@ interface SearchIndexLimits {
   maxScopeEvents: number;
   maxRows: number;
   insertBatch: number;
+  /**
+   * Read-artifact projection only; legacy CH writer does not construct display values.
+   * "required" (artifact producer): a directory_display_* refusal makes the projection
+   * incomplete with that reason code. "optional" (live raw read): the display values are
+   * omitted and the code is reported in `displayOmitted`; the read itself still succeeds.
+   */
+  directoryValues?: "required" | "optional";
 }
 const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
 const SEP = "\u001f";
@@ -88,13 +100,27 @@ export async function readManifestRecords(
   decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
   maxRecords = Number.POSITIVE_INFINITY,
 ): Promise<RelayhistoryStreamRecord[]> {
+  const rows: RelayhistoryStreamRecord[] = [];
+  for await (const row of streamManifestRecords(manifest, store, prefix, decompress, maxRecords))
+    rows.push(row);
+  return rows;
+}
+
+/** Bounded chunk-by-chunk reader; proofs need not retain full session payloads. */
+export async function* streamManifestRecords(
+  manifest: ManifestV1,
+  store: ObjectStore,
+  prefix: string,
+  decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
+  maxRecords = Number.POSITIVE_INFINITY,
+): AsyncGenerator<RelayhistoryStreamRecord> {
   if (manifest.raw.format !== "ndjson")
     throw new PipelineError(
       "raw_format_unsupported",
       "only ndjson raw is indexed",
       false,
     );
-  const records: RelayhistoryStreamRecord[] = [];
+  let records = 0;
   for (const { entry, key } of chunkKeys(manifest, { prefix })) {
     if (
       entry.stored_bytes > MAX_CHUNK_BYTES ||
@@ -162,16 +188,16 @@ export async function readManifestRecords(
     }
     for (const line of text.split("\n"))
       if (line) {
-        if (records.length >= maxRecords)
+        if (records >= maxRecords)
           throw new PipelineError(
             "scope_too_large",
             "actual canonical record count exceeds scope limit",
             false,
           );
-        records.push(parseRelayhistoryRecord(line));
+        records += 1;
+        yield parseRelayhistoryRecord(line);
       }
   }
-  return records;
 }
 
 type Json = Record<string, unknown>;
@@ -225,6 +251,7 @@ export function projectedToNeonRow(
 }
 
 export interface ScopeRead {
+  records: RelayhistoryStreamRecord[];
   projectionRows: Array<{ table: string; row: Record<string, unknown> }>;
   rows: IndexRow[];
   manifests: number;
@@ -237,6 +264,8 @@ export interface ScopeRead {
   catalog: DirectoryCatalog;
   directorySessionId: string | null;
   events: DirectoryEvents | null;
+  /** directory_display_* code when optional display values were omitted. */
+  displayOmitted?: string | null;
   sources: DirectoryEventInput["sources"];
 }
 
@@ -274,7 +303,9 @@ export async function readCanonicalScope(
     const s = manifest.session;
     const at = parseSessionKey(key);
     if (
-      !at ||
+      !at || !isManifestRest(at.rest) ||
+      ((parseUploadGenerationPrefix(at.prefix)?.base ?? at.prefix ?? "") !== prefix) ||
+      (isPublicationManifestRest(at.rest) && !parseUploadGenerationPrefix(at.prefix)) ||
       s.workspace_id !== scope.workspaceId ||
       s.harness !== scope.harness ||
       s.session_id !== at.sessionId ||
@@ -335,6 +366,7 @@ export async function readCanonicalScope(
       events: null,
       sources: [],
       projectionRows: [],
+      records: [],
     };
 
   let parsedRecords = 0;
@@ -343,7 +375,7 @@ export async function readCanonicalScope(
       const records = await readManifestRecords(
         manifest,
         deps.store,
-        prefix,
+        parseSessionKey(manifestKeysByBody.get(manifest)!)?.prefix ?? prefix,
         decompress,
         limits.maxScopeEvents - parsedRecords,
       );
@@ -363,6 +395,7 @@ export async function readCanonicalScope(
           events: null,
           sources: [],
           projectionRows: [],
+          records: [],
         };
       if (error instanceof PipelineError && error.retryable) throw error;
       complete = false;
@@ -374,9 +407,11 @@ export async function readCanonicalScope(
 
   // Fold every copy together; a conflicting copy (same revision, different
   // bytes) falls back to folding each manifest on its own, without deletes.
+  let canonicalRecords: RelayhistoryStreamRecord[] = [];
   let groups: { records: RelayhistoryStreamRecord[]; part: Part }[];
   try {
     const all = normalizeRelayhistoryRecords(parts.flatMap((p) => p.records));
+    canonicalRecords = all;
     const owner = new Map<string, Part>();
     for (const part of parts)
       for (const r of part.records)
@@ -414,7 +449,11 @@ export async function readCanonicalScope(
   const ownerByEvent = new Map<string, { userId: string; sessionId: string }>();
   for (const part of parts)
     for (const record of part.records) {
-      if (record.kind === CONVERGENCE_EVENT_KIND) continue;
+      if (
+        record.kind === CONVERGENCE_EVENT_KIND ||
+        isLegacyRelayhistoryRecord(record)
+      )
+        continue;
       const identity = JSON.stringify([
         deliveryMachine(scope.workspaceId, record.origin_id),
         record.record_id,
@@ -497,7 +536,25 @@ export async function readCanonicalScope(
     complete = false;
     reasons.push("directory_event_metadata_invalid");
   }
+  // Both locators were selected from metadataByKey. Fetch only those rows:
+  // display materialization never scans/copies the full transcript a second time.
+  let displayValues: ReturnType<typeof canonicalDirectoryValues> = [];
+  let displayOmitted: string | null = null;
+  if (limits.directoryValues && metadata) {
+    try {
+      displayValues = canonicalDirectoryValues({orgId:scope.orgId,workspaceId:scope.workspaceId},metadata,
+        [...new Set([metadata.openingEvent,metadata.projectEvent].flatMap(event=>event ? [keyOf({machineId:event.machine_id,source:event.source,kind:event.kind,eventId:event.event_id})] : []))]
+          .map(key=>metadataByKey.get(key)!));
+    } catch (error) {
+      const code = error instanceof Error && /^directory_display_[a-z_]+$/.test(error.message) ? error.message : null;
+      if (!code) throw error;
+      reasons.push(code);
+      if (limits.directoryValues === "required") complete = false;
+      else displayOmitted = code;
+    }
+  }
   return {
+    records: canonicalRecords,
     projectionRows: [
       ...catalogRows,
       ...[...metadataByKey.values()].map(
@@ -506,6 +563,7 @@ export async function readCanonicalScope(
           row,
         }),
       ),
+      ...displayValues,
     ],
     rows: [...byKey.values()],
     manifests: parts.length,
@@ -516,6 +574,7 @@ export async function readCanonicalScope(
     catalog: directoryCatalogFromProjection(catalogRows),
     directorySessionId: directoryIds.size === 1 ? [...directoryIds][0]! : null,
     events: metadata,
+    displayOmitted,
     sources: parts.map(({ manifest }) => ({
       manifestKey: manifestKeysByBody.get(manifest)!,
       revision: String(manifest.revision),

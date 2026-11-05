@@ -110,10 +110,13 @@ const ROLE_VERIFY_SQL = readFileSync(ROLE_VERIFY_SQL_PATH, "utf8");
 // The auth token verifier's phase 2 (supabase/bootstrap/session_token_verifier_verify.sql):
 // the same contract for session_token_verifier — run by the migrator's verify step, the
 // external mark_pass wrapper, and this live gate. Read-only.
-const TOKEN_VERIFIER_VERIFY_SQL = readFileSync(
-  fileURLToPath(new URL("../../supabase/bootstrap/session_token_verifier_verify.sql", import.meta.url)),
-  "utf8",
-);
+export const INGEST_SEED_VERIFY_SQL_PATH=fileURLToPath(new URL("../../supabase/bootstrap/session_ingest_seeder_verify.sql",import.meta.url));
+export const TOKEN_VERIFIER_VERIFY_SQL_PATH=fileURLToPath(new URL("../../supabase/bootstrap/session_token_verifier_verify.sql",import.meta.url));
+export const INGEST_ROLE_VERIFY_SQL_PATH=fileURLToPath(new URL("../../supabase/bootstrap/session_ingest_verify.sql",import.meta.url));
+const INGEST_SEED_VERIFY_SQL=readFileSync(INGEST_SEED_VERIFY_SQL_PATH,"utf8");
+const TOKEN_VERIFIER_VERIFY_SQL=readFileSync(TOKEN_VERIFIER_VERIFY_SQL_PATH,"utf8");
+const INGEST_ROLE_VERIFY_SQL=readFileSync(INGEST_ROLE_VERIFY_SQL_PATH,"utf8");
+export interface SchemaVerifierSql {searchWorker:string;tokenVerifier:string;ingestSeeder:string;ingest:string}
 
 /**
  * Live sessions-function boundary, read-only, part of every readiness check: no sessions
@@ -215,6 +218,8 @@ export async function schemaVerdict(
       stage = "verify";
       await tx.query(ROLE_VERIFY_SQL);
       await tx.query(TOKEN_VERIFIER_VERIFY_SQL);
+      await tx.query(INGEST_SEED_VERIFY_SQL);
+      await tx.query(INGEST_ROLE_VERIFY_SQL);
       await tx.query(SESSIONS_FUNCTION_GATE_SQL);
       if (opts.afterVerify) await opts.afterVerify(); // test seam: a concurrent flip lands here
       stage = "final";

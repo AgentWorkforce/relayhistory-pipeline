@@ -253,7 +253,7 @@ beforeAll(async () => {
     String(input) === JWKS_URL
       ? Response.json(JWKS)
       : realFetch(input, init)) as typeof fetch;
-});
+}, 120_000);
 afterAll(async () => {
   globalThis.fetch = realFetch;
   await db?.close();

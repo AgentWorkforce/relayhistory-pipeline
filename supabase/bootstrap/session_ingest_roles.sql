@@ -1,6 +1,6 @@
 -- Phase 1: privileged bootstrap for the session ingest roles. Before migrate.
 --
--- The migration (supabase/migrations/20261102010000_session_ingest_ledger.sql) never
+-- The migration (supabase/migrations/20261104022000_session_ingest_ledger.sql) never
 -- creates or alters a role: a CNPG/Cloud SQL migration owner has no CREATEROLE. It
 -- verifies these roles (42704 if absent, 55000 if they differ) and grants EXECUTE on
 -- the ingest functions to them. This file provisions them, the pattern of
@@ -8,6 +8,8 @@
 --
 --   roles     bulls96_session_ingest         the ingest Worker's ledger login (made
 --                                            LOGIN after migrate by session_ingest_role.sql)
+--             bulls96_canonical_feature_producer  the 610 producer: read-only on the canonical
+--                                            feature journal and the frozen pointer pages
 --             bulls96_session_ingest_seeder  the revision seed (granted to an operator
 --                                            login for scripts/session-ingest-seed.ts)
 --   attrs     NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
@@ -30,7 +32,7 @@ DECLARE
   v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
   v_version int := current_setting('server_version_num')::int;
 BEGIN
-  FOREACH v_name IN ARRAY ARRAY['bulls96_session_ingest', 'bulls96_session_ingest_seeder'] LOOP
+  FOREACH v_name IN ARRAY ARRAY['bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer'] LOOP
     SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
     IF NOT FOUND THEN
       SELECT rolsuper, rolcreaterole INTO v_me FROM pg_roles WHERE rolname = current_user;

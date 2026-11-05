@@ -1,0 +1,84 @@
+Plan: 4 to create, 15 binding changes
+
+[session-ingest] create
+[session-ingest/HYPERDRIVE] create
+[session-ingest/INGEST_ACCEPTANCE_MODE] create
+[session-ingest/INGEST_EXPECT_GENERATION] create
+[session-ingest/INGEST_FANOUT] create
+[session-ingest/INGEST_INLINE_MAX_SESSIONS] create
+[session-ingest/INGEST_KEY_ROOT] create
+[session-ingest/INGEST_KMS_KEY_ARN] create
+[session-ingest/INGEST_MAX_PER_ORG] create
+[session-ingest/INGEST_MAX_PER_USER] create
+[session-ingest/INGEST_REPLICA_MODE] create
+[session-ingest/INGEST_S3_BUCKET] create
+[session-ingest/INGEST_S3_REGION] create
+[session-ingest/INGEST_SIGNING_KEY] create
+[session-ingest/S3_ACCESS_KEY_ID] create
+[session-ingest/S3_SECRET_ACCESS_KEY] create
+  properties:
+    compatibility:
+      date: 2026-10-01
+      flags:
+        - nodejs_compat
+    domain: null
+    env:
+      HYPERDRIVE:
+        LogicalId: HYPERDRIVE
+        Type: Cloudflare.Hyperdrive
+        accountId: f7232cb80f6fab86a95426302af243e4
+        dev: (undefined)
+        hyperdriveId: 0fcc0265e96f43a39976b5aa4263f4a6
+        name: 96bulls-session-ingest
+      INGEST_ACCEPTANCE_MODE: buffered
+      INGEST_EXPECT_GENERATION: d2569f3498e6b66302aef514a04711304e2ee263b2e413f7488f8d142a8958f0
+      INGEST_FANOUT: (known after apply)
+      INGEST_INLINE_MAX_SESSIONS: "0"
+      INGEST_KEY_ROOT: 96bulls
+      INGEST_KMS_KEY_ARN: arn:aws:kms:us-east-1:941433935742:key/c74376a5-f6ff-4ef0-9a26-543c940094ba
+      INGEST_MAX_PER_ORG: "32"
+      INGEST_MAX_PER_USER: "4"
+      INGEST_REPLICA_MODE: off
+      INGEST_S3_BUCKET: 96bulls-aws-sessions-prod-transcripts-941433935742
+      INGEST_S3_REGION: us-east-1
+      INGEST_SIGNING_KEY:
+        LogicalId: external:96bulls-session-ingest-signing-key
+        Type: Cloudflare.SecretsStore.Secret
+        secretName: 96bulls-session-ingest-signing-key
+        storeId: 59e0dcc52f0a4bd7863730548299fb2f
+      S3_ACCESS_KEY_ID:
+        LogicalId: external:96bulls-session-ingest-s3-access-key-id
+        Type: Cloudflare.SecretsStore.Secret
+        secretName: 96bulls-session-ingest-s3-access-key-id
+        storeId: 59e0dcc52f0a4bd7863730548299fb2f
+      S3_SECRET_ACCESS_KEY:
+        LogicalId: external:96bulls-session-ingest-s3-secret-access-key
+        Type: Cloudflare.SecretsStore.Secret
+        secretName: 96bulls-session-ingest-s3-secret-access-key
+        storeId: 59e0dcc52f0a4bd7863730548299fb2f
+    isExternal: true
+    main: src/session-ingest/worker.ts
+    name: 96bulls-session-ingest
+    placement:
+      mode: smart
+    routes: []
+    workersDev: false
+
+[session-ingest-fanout] create
+  properties:
+    deliveryPaused: true
+    name: 96bulls-session-ingest-fanout
+
+[session-ingest-fanout-consumer] create
+  properties:
+    deadLetterQueue: (known after apply)
+    queueId: (known after apply)
+    scriptName: (known after apply)
+    settings:
+      batchSize: 1
+      maxRetries: 10
+
+[session-ingest-fanout-dlq] create
+  properties:
+    deliveryPaused: true
+    name: 96bulls-session-ingest-fanout-dlq

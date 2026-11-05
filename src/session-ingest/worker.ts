@@ -26,6 +26,7 @@
  * is 503 `not_configured` and nothing is written.
  */
 import pg from "pg";
+import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { createS3Store, objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { log } from "../shared/log.ts";
@@ -57,6 +58,10 @@ export interface IngestWorkerEnv {
   INGEST_MAX_PER_ORG?: string;
   INGEST_INLINE_MAX_SESSIONS?: string;
   INGEST_REPLICA_MODE?: string;
+  INGEST_ACCEPTANCE_MODE?: string;
+  INGEST_EXPECT_GENERATION?:string;
+  /** P1: relayhistory (default) | shadow | frozen-supabase (sessions.ingest_frozen_source_witness). */
+  INGEST_CUSTODY_SOURCE?: string;
 }
 
 interface SecretBinding {
@@ -96,6 +101,8 @@ export interface IngestSettings {
   maxPerOrg: number;
   inlineMaxSessions: number;
   replicaMode: ReplicaMode;
+  acceptanceMode: IngestAcceptanceMode;
+  expectedGeneration?:string;
 }
 
 /** The settings, or null while any required one is missing (every request is then 503 not_configured). */
@@ -108,9 +115,13 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     secret(env.INGEST_SIGNING_KEY),
   ]);
   if (!accessKeyId || !secretAccessKey || !signingKey) return null;
+  const acceptanceMode = env.INGEST_ACCEPTANCE_MODE ?? "canonical";
+  if (acceptanceMode !== "canonical" && acceptanceMode !== "buffered") throw new Error("session ingest: acceptance mode invalid");
+  if(acceptanceMode==="buffered"&&(!/^[a-f0-9]{64}$/.test(env.INGEST_EXPECT_GENERATION??"")||env.INGEST_KEY_ROOT&&env.INGEST_KEY_ROOT!=="96bulls"))throw new Error("session ingest: buffered generation or prefix invalid");
   const raw = env.INGEST_REPLICA_MODE ?? "off";
   if (!["off", "queue", "required", "best_effort"].includes(raw)) throw new Error("session ingest: INGEST_REPLICA_MODE must be off, queue, required or best_effort");
   const mode: ReplicaMode = raw === "queue" ? "required" : (raw as ReplicaMode);
+  if (acceptanceMode === "buffered" && (mode !== "off" || env.INGEST_INLINE_MAX_SESSIONS !== "0")) throw new Error("session ingest: buffered requires inline0 and replicaoff");
   // A replica that must be sent but has no queue would refuse every batch: not configured.
   if (mode !== "off" && !env.NEON_REPLICA) return null;
   return {
@@ -123,7 +134,9 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     signingKey,
     maxPerUser: limit(env.INGEST_MAX_PER_USER, 4, "INGEST_MAX_PER_USER"),
     maxPerOrg: limit(env.INGEST_MAX_PER_ORG, 32, "INGEST_MAX_PER_ORG"),
-    inlineMaxSessions: limit(env.INGEST_INLINE_MAX_SESSIONS, 40, "INGEST_INLINE_MAX_SESSIONS"),
+    inlineMaxSessions: acceptanceMode === "buffered" ? 0 : limit(env.INGEST_INLINE_MAX_SESSIONS, 40, "INGEST_INLINE_MAX_SESSIONS"),
+    acceptanceMode,
+    ...(acceptanceMode==="buffered"?{expectedGeneration:env.INGEST_EXPECT_GENERATION!}:{}),
     replicaMode: mode,
   };
 }
@@ -177,10 +190,15 @@ export default {
           },
         }
       : undefined;
+    const custodySource = env.INGEST_CUSTODY_SOURCE?.trim() || "relayhistory";
+    if (!["relayhistory", "shadow", "frozen-supabase"].includes(custodySource) || (custodySource !== "relayhistory" && (env.INGEST_ACCEPTANCE_MODE ?? "canonical") !== "buffered"))
+      throw new Error("session ingest: INGEST_CUSTODY_SOURCE must be relayhistory, shadow or frozen-supabase (the latter two only in buffered mode)");
     const app = createIngestApp({
+      custodySource: custodySource as "relayhistory" | "shadow" | "frozen-supabase",
       signingKey: settings.signingKey,
       deliver: {
-        ledger: sqlLedger(run),
+        ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration}),
+        acceptanceMode:settings.acceptanceMode,
         target,
         replica,
         // Slot TTL: past the Worker's wall-clock budget, so a lost release frees itself.
@@ -188,6 +206,7 @@ export default {
         inlineMaxSessions: settings.inlineMaxSessions,
         fanout: (messages) => env.INGEST_FANOUT!.sendBatch(messages.map((body) => ({ body }))),
       },
+      onboarding: { run },
     });
     try {
       return await app.fetch(request);
@@ -204,6 +223,11 @@ export default {
    */
   async queue(batch: { messages: { body: unknown; ack(): void; retry(o?: { delaySeconds?: number }): void }[] }, env: IngestWorkerEnv): Promise<void> {
     const settings = await ingestSettings(env).catch(() => null);
+    if (settings?.acceptanceMode === "buffered") {
+      for (const message of batch.messages) message.retry({delaySeconds:300});
+      log.info("session ingest fanout refused", {reason:"buffered_publication_refused"});
+      return;
+    }
     const client = settings && env.HYPERDRIVE ? new pg.Client({ connectionString: env.HYPERDRIVE.connectionString }) : null;
     client?.on("error", (err: Error) => log.error("session ingest db error", { error_code: (err as { code?: string }).code ?? "db_error" }));
     let connected: Promise<void> | undefined;

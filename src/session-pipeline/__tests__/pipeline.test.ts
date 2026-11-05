@@ -30,7 +30,7 @@ import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
-import { RECONCILE_DEADLINE_MS, reconcileRecent } from "../lambda.ts";
+import { RECONCILE_DEADLINE_MS, lambdaEnv, reconcileRecent } from "../lambda.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -382,6 +382,24 @@ describe("search index from S3", () => {
     expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ inserted: 0, deleted: 0, complete: true });
   });
 
+  test("rows of kinds S3 never carries survive a complete pass; erasure still removes them", async () => {
+    const ch = fakeClickHouse();
+    let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "one")])];
+    const sb = fakeSupabase(() => keys);
+    await indexSearchScope(scope, searchDeps(ch.ch, sb.transact));
+    // A row written by another ingest path (Neon tail) in a kind the exported stream never carries.
+    const base = ch.final()[0]!;
+    ch.rows.push({ ...base, kind: "tool_result", event_id: "tail:tr1", fingerprint: "neon-x" });
+    // A stale activity-kind row S3 no longer has is still removed.
+    ch.rows.push({ ...base, event_id: "tail:stale", fingerprint: "neon-y" });
+    expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ complete: true, deleted: 1 });
+    expect(ch.final().some((r) => r.kind === "tool_result" && r.event_id === "tail:tr1")).toBe(true);
+    expect(ch.final().some((r) => r.event_id === "tail:stale")).toBe(false);
+    keys = [];
+    expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect(ch.final()).toHaveLength(0);
+  });
+
   test("a retracted record, an edit and an erasure propagate; an incomplete read never deletes", async () => {
     const t = (s: number) => Date.parse(`2026-11-01T10:00:0${s}Z`);
     let keys = [await writeSession("srv_bb", [event("r1", "1", t(1), "one"), event("r2", "1", t(2), "two")])];
@@ -578,6 +596,91 @@ describe("SQS consumer", () => {
     };
     return { deps, sb };
   }
+
+  // SEARCH_INDEX_ENABLED=1 and SESSION_DESKTOP_CATALOG_ENABLED as lambda.ts wires them into the search deps.
+  // Every statement the search stage sends is captured raw (SQL text and parameters).
+  function searchOnConsumer(ch: ClickHouseClient, live: () => string[], desktopCatalogEnv: string | undefined) {
+    const { deps, sb } = consumer(ch, live);
+    const env = lambdaEnv({
+      AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "bucket", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true",
+      SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs", SEARCH_INDEX_ENABLED: "1",
+      ...(desktopCatalogEnv === undefined ? {} : { SESSION_DESKTOP_CATALOG_ENABLED: desktopCatalogEnv }),
+    });
+    expect(env.searchEnabled).toBe(true);
+    const raw: { text: string; params: unknown[] }[] = [];
+    const transact: SearchIndexDeps["transact"] = (work) =>
+      sb.transact((tx) => work({ query: (text: string, params?: unknown[]) => (raw.push({ text, params: params ?? [] }), tx.query(text, params)) } as SqlExecutor));
+    deps.search = { ...deps.search!, transact, ...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}) };
+    return { deps, sb, raw };
+  }
+
+  /** The columns a catalog statement writes: the directory UPDATE's SET targets and each companion INSERT's column list. */
+  function catalogWrite(raw: { text: string; params: unknown[] }[]) {
+    const writes = raw.filter((q) => q.text.includes("INSERT INTO sessions.session_directory_agents"));
+    expect(writes).toHaveLength(1);
+    const { text, params } = writes[0]!;
+    const sql = text.replace(/--[^\n]*/g, "");
+    const set = /UPDATE sessions\.session_directory AS d\s+SET([\s\S]*?)\s+FROM live AS l/.exec(sql)![1]!;
+    const targets: string[] = [];
+    let depth = 0, part = "";
+    for (const c of `${set},`) {
+      if (c === "(") depth++;
+      if (c === ")") depth--;
+      if (c === "," && depth === 0) { targets.push(part.split("=")[0]!.trim()); part = ""; } else part += c;
+    }
+    const insert = (table: string) => new RegExp(`INSERT INTO sessions\\.${table}\\s*\\(([^)]*)\\)`).exec(sql)![1]!.split(",").map((s) => s.trim());
+    return { sql, params, directory: targets, agents: insert("session_directory_agents"), relationships: insert("session_directory_relationships") };
+  }
+
+  // Pinned from 0c12036's src/hoopdb/session-directory-catalog.ts (unchanged until a49219d^1, the main before #182).
+  const PRE_182_DIRECTORY_COLUMNS = ["agent_names", "catalog_models", "project_key", "project_key_method", "initial_commit", "originator", "agent_version", "project_id", "git_repo", "git_branch", "agent_name", "agent_name_normalized", "search_text", "catalog_projected_at"];
+  const PRE_182_AGENT_COLUMNS = ["org_id", "workspace_id", "harness", "session_id", "agent_name", "agent_name_normalized", "last_activity_at"];
+  const PRE_182_RELATIONSHIP_COLUMNS = ["org_id", "workspace_id", "harness", "parent_session_id", "relationship_uid", "child_session_id"];
+  // #182's writer adds only migration 20261105022000 columns.
+  const MIGRATION_022000_DIRECTORY_COLUMNS = ["catalog_read_projected_at", "catalog_read_version", "catalog_read_epoch", "catalog_models_complete", "catalog_relationships_complete"];
+  const MIGRATION_022000_RELATIONSHIP_COLUMNS = ["child_model", "child_agent_name", "child_agent_type"];
+
+  const catalogSession = (): RelayhistoryStreamRecord[] => [
+    event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello"),
+    { kind: "session", origin_id: "desktop-origin", record_id: "session-1", revision: "1", operation: "upsert", received_at: AT,
+      payload: { project_key: "github.com/acme/widgets", project_key_method: "git_remote", repo_url: "git@github.com:acme/widgets.git", git_branch: "main", agent_name: "codex", models_json: ["gpt-5"] } },
+  ];
+
+  test("desktop catalog off: SEARCH_INDEX_ENABLED=1 indexes and runs the pre-#182 catalog writer, column for column", async () => {
+    const key = await writeSession("srv_bb", catalogSession());
+    for (const flag of [undefined, "0", "true", " 1"]) {
+      const ch = fakeClickHouse();
+      const { deps, raw } = searchOnConsumer(ch.ch, () => [key], flag);
+      expect("desktopCatalog" in deps.search!).toBe(false);
+      expect((await processBatch([{ messageId: "m1", body: s3Put(key, "01") }], deps)).batchItemFailures).toEqual([]);
+      expect(ch.final().map((r) => r.content)).toEqual(["hello"]);
+      expect(ch.state.at(-1)?.needs_full).toBe(0);
+      const w = catalogWrite(raw);
+      expect(w.directory).toEqual(PRE_182_DIRECTORY_COLUMNS);
+      expect(w.agents).toEqual(PRE_182_AGENT_COLUMNS);
+      expect(w.relationships).toEqual(PRE_182_RELATIONSHIP_COLUMNS);
+      expect(w.sql).toContain("DO UPDATE SET child_session_id = excluded.child_session_id\n");
+      for (const column of [...MIGRATION_022000_DIRECTORY_COLUMNS, ...MIGRATION_022000_RELATIONSHIP_COLUMNS, "event_projection_epoch"]) expect(w.sql).not.toContain(column);
+      // The pre-#182 parameters: key, agents, models, project key/method, commit, originator, version, id, repo, branch, normalized agents, edge uids, edge children.
+      expect(w.params).toEqual(["org_1", "ws_1", "claude", "sess_1", ["codex"], ["gpt-5"], "github.com/acme/widgets", "git_remote", null, null, null, "acme/widgets", "git@github.com:acme/widgets.git", "main", ["codex"], [], []]);
+    }
+  });
+
+  test("desktop catalog on: SESSION_DESKTOP_CATALOG_ENABLED=1 runs the #182 writer with the 20261105022000 columns", async () => {
+    const key = await writeSession("srv_bb", catalogSession());
+    const ch = fakeClickHouse();
+    const { deps, raw } = searchOnConsumer(ch.ch, () => [key], "1");
+    expect(deps.search!.desktopCatalog).toBe(true);
+    expect((await processBatch([{ messageId: "m1", body: s3Put(key, "01") }], deps)).batchItemFailures).toEqual([]);
+    expect(ch.final().map((r) => r.content)).toEqual(["hello"]);
+    const w = catalogWrite(raw);
+    expect(w.directory).toEqual([...PRE_182_DIRECTORY_COLUMNS, ...MIGRATION_022000_DIRECTORY_COLUMNS]);
+    expect(w.agents).toEqual(PRE_182_AGENT_COLUMNS);
+    expect(w.relationships).toEqual([...PRE_182_RELATIONSHIP_COLUMNS, ...MIGRATION_022000_RELATIONSHIP_COLUMNS]);
+    expect(w.params).toHaveLength(23);
+    expect(w.params.slice(0, 17)).toEqual(["org_1", "ws_1", "claude", "sess_1", ["codex"], ["gpt-5"], "github.com/acme/widgets", "git_remote", null, null, null, "acme/widgets", "git@github.com:acme/widgets.git", "main", ["codex"], [], []]);
+    expect(w.params.slice(17)).toEqual([[], [], [], 1, true, true]);
+  });
 
   test("a manifest put upserts the pointer, then indexes its session; duplicates in a batch collapse", async () => {
     const key = await writeSession("srv_bb", [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello")]);

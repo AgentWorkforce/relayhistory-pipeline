@@ -1,11 +1,12 @@
 /**
  * The stage worker runtime every consumer shares: one poll loop per stage over
  * `sessions.pipeline_jobs`, each message handled inside a span that continues
- * the message's traceparent. Upstream ships `pollPostgresStage` but no runner.
+ * the message's traceparent. Persistent worker-runtime bindings own stage
+ * delivery; the outer loop retains health, readiness gates and side ticks.
  */
 import {
   pipelineQueueDeps,
-  pollPostgresStage,
+  postgresStageConsumer,
   postgresDeadLetterStore,
   postgresPipelineQueue,
   type PipelineImplementations,
@@ -32,8 +33,11 @@ import { liveDataPathVerdict, workloadReadyLive } from "./data-path.ts";
 import { errorFields, log } from "./log.ts";
 import { initTelemetry, shutdownTelemetry, withSpan } from "./telemetry.ts";
 import { createServer } from "node:http";
+import { setTimeout as idleDelay } from "node:timers/promises";
+import { createWorkerRuntime } from "@rhc/runtime/workers.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
+import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 
 export interface WorkerOptions {
   service: string;
@@ -83,7 +87,23 @@ async function attestReaders(readers: ManifestReaderName[], db: HoopDb) {
   }
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Run one complete gated cycle at a time; shutdown drains the current cycle. */
+export async function runWorkerLoop(io: {
+  signal: AbortSignal;
+  idleMs: number;
+  tick: () => Promise<number>;
+}): Promise<void> {
+  while (!io.signal.aborted) {
+    const claimed = await io.tick();
+    if (claimed === 0 && !io.signal.aborted) {
+      try {
+        await idleDelay(io.idleMs, undefined, { signal: io.signal });
+      } catch (error) {
+        if (!io.signal.aborted) throw error;
+      }
+    }
+  }
+}
 
 /** Wraps a handler so its work runs in a span on the message's trace, with allowlisted attrs. */
 export function traced(
@@ -274,10 +294,12 @@ export function serveHealth(health: WorkerHealth, port: number) {
 /**
  * One worker tick: every claim path, gated. The live gate (gateOpen: ledger, marker,
  * phase 2 and the sessions-function boundary) runs before EACH stage's claim and before
- * the side tick; once it is closed, nothing further in the tick runs. Exported so a
+ * the side tick; shutdown is rechecked after each asynchronous gate. Once closed,
+ * nothing further in the tick runs. Exported so a
  * table-driven test can prove the order over every claim path.
  */
 export async function workerTick<S>(io: {
+  signal?: AbortSignal;
   stages: readonly S[];
   gate: () => Promise<boolean>;
   poll: (stage: S) => Promise<number>;
@@ -285,17 +307,22 @@ export async function workerTick<S>(io: {
 }): Promise<{ claimed: number; gated: boolean }> {
   let claimed = 0;
   for (const stage of io.stages) {
-    if (!(await io.gate())) return { claimed, gated: true };
+    if (io.signal?.aborted || !(await io.gate()) || io.signal?.aborted)
+      return { claimed, gated: true };
     claimed += await io.poll(stage);
   }
   if (io.tick) {
-    if (!(await io.gate())) return { claimed, gated: true };
+    if (io.signal?.aborted || !(await io.gate()) || io.signal?.aborted)
+      return { claimed, gated: true };
     await io.tick();
   }
   return { claimed, gated: false };
 }
 
 export async function runWorker(opts: WorkerOptions): Promise<never> {
+  // Fail closed on a mis-set adapter selection (docs/search-and-runtime-adapters.md).
+  // Unset (every current install) resolves to postgres + workers: no change.
+  validateAdapterEnv(process.env, { runtime: ["workers"] });
   process.env.OTEL_SERVICE_NAME ||= opts.service;
   initTelemetry(opts.service);
   const health: WorkerHealth = {
@@ -303,7 +330,7 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
     lastTickAt: Date.now(),
     consecutiveDbFailures: 0,
   };
-  serveHealth(health, integer("WORKER_HEALTH_PORT", 8081));
+  const healthServer = serveHealth(health, integer("WORKER_HEALTH_PORT", 8081));
   const db = openHoopDb();
   // Waiting for HoopDb or a long migration is progress, not a stall.
   const startupBeat = setInterval(
@@ -368,85 +395,108 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   const batchSize = integer("WORKER_BATCH_SIZE", 10);
   const leaseSeconds = integer("WORKER_LEASE_SECONDS", 300);
   log.info("worker started", { count: opts.stages.length });
-  let stopping = false;
-  const stop = async () => {
-    stopping = true;
-    await shutdownTelemetry();
-    await db.end();
-    process.exit(0);
+  const stageBindings = new Map(opts.stages.map(stage => {
+    const consumer = postgresStageConsumer({ sql: db, stage, deps, batchSize, leaseSeconds });
+    const binding = createWorkerRuntime({ source: consumer.source, batchSize }).bind(consumer.work);
+    return [stage, { consumer, binding }] as const;
+  }));
+  const controller = new AbortController();
+  const stop = () => {
+    health.ready = false;
+    controller.abort();
   };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
-  for (;;) {
-    if (stopping) await sleep(idleMs);
-    let claimed = 0;
-    // One cheap probe per tick: a failing HoopDb (e.g. rotated password) marks the worker unhealthy.
-    try {
-      await db.query("SELECT 1");
-      health.consecutiveDbFailures = 0;
-    } catch (err) {
-      health.consecutiveDbFailures += 1;
-      log.warn("hoopdb probe failed", {
-        count: health.consecutiveDbFailures,
-        ...errorFields(err),
-      });
-    }
-    health.lastTickAt = Date.now();
-    // The live gate, checked again before EVERY claim (each stage's batch) and before
-    // the side tick. Current-tick semantics: a verdict holds only as of its final read,
-    // so the most a closing gate can leave running is the one batch claimed just before
-    // it closed: at most WORKER_BATCH_SIZE messages of one stage, which finish inside
-    // their pollPostgresStage call (acked, retried or dead-lettered). A batch cut short
-    // by a crash is re-delivered when its lease (WORKER_LEASE_SECONDS) expires. While
-    // the gate is closed the worker claims nothing.
-    const r = await workerTick({
-      stages: opts.stages,
-      gate: () => gateOpen(health),
-      poll: async (stage) => {
+  try {
+    await runWorkerLoop({
+      signal: controller.signal,
+      idleMs,
+      tick: async () => {
+        // One cheap probe per tick: a failing HoopDb (e.g. rotated password) marks the worker unhealthy.
         try {
-          const p = await pollPostgresStage({
-            sql: db,
-            stage,
-            deps,
-            batchSize,
-            leaseSeconds,
-          });
-          if (p.claimed)
-            log.info("poll", {
-              stage,
-              claimed: p.claimed,
-              acked: p.acked,
-              retried: p.retried,
-              exhausted: p.exhausted,
-            });
-          return p.claimed;
+          await db.query("SELECT 1");
+          health.consecutiveDbFailures = 0;
         } catch (err) {
-          log.error("poll failed", { stage, ...errorFields(err) });
-          return 0;
+          health.consecutiveDbFailures += 1;
+          log.warn("hoopdb probe failed", {
+            count: health.consecutiveDbFailures,
+            ...errorFields(err),
+          });
         }
-      },
-      ...(opts.tick
-        ? {
-            tick: async () => {
-              // Long side work (reconcile) keeps the progress clock moving while it runs.
-              const tickBeat = setInterval(
-                () => (health.lastTickAt = Date.now()),
-                10_000,
-              );
-              try {
-                await opts.tick!(db, new Date());
-              } catch (err) {
-                log.error("tick failed", errorFields(err));
-              } finally {
-                clearInterval(tickBeat);
+        health.lastTickAt = Date.now();
+        // The live gate, checked again before EVERY claim (each stage's batch) and before
+        // the side tick. Current-tick semantics: a verdict holds only as of its final read,
+        // so the most a closing gate can leave running is the one batch claimed just before
+        // it closed: at most WORKER_BATCH_SIZE messages of one stage, which finish inside
+        // their worker runtime tick (acked, retried or dead-lettered). A batch cut short
+        // by a crash is re-delivered when its lease (WORKER_LEASE_SECONDS) expires. While
+        // the gate is closed the worker claims nothing.
+        const r = await workerTick({
+          signal: controller.signal,
+          stages: opts.stages,
+          gate: () => gateOpen(health),
+          poll: async (stage) => {
+            try {
+              const { consumer, binding } = stageBindings.get(stage)!;
+              const count = await binding.tick(controller.signal);
+              const p = count === 0
+                ? { claimed: 0, acked: 0, retried: 0, exhausted: 0 }
+                : consumer.result();
+              if (p.claimed)
+                log.info("poll", {
+                  stage,
+                  claimed: p.claimed,
+                  acked: p.acked,
+                  retried: p.retried,
+                  exhausted: p.exhausted,
+                });
+              return p.claimed;
+            } catch (err) {
+              log.error("poll failed", { stage, ...errorFields(err) });
+              return 0;
+            }
+          },
+          ...(opts.tick
+            ? {
+                tick: async () => {
+                  // Long side work (reconcile) keeps the progress clock moving while it runs.
+                  const tickBeat = setInterval(
+                    () => (health.lastTickAt = Date.now()),
+                    10_000,
+                  );
+                  try {
+                    await opts.tick!(db, new Date());
+                  } catch (err) {
+                    log.error("tick failed", errorFields(err));
+                  } finally {
+                    clearInterval(tickBeat);
+                  }
+                },
               }
-            },
-          }
-        : {}),
+            : {}),
+        });
+        return r.claimed;
+      },
     });
-    claimed += r.claimed;
-    if (claimed === 0) await sleep(idleMs);
+  } finally {
+    health.ready = false;
+    process.off("SIGTERM", stop);
+    process.off("SIGINT", stop);
+    // No new deliveries can start; the active delivery/side tick has drained.
+    // A crash or forced kill still recovers through the unchanged lease expiry.
+    // Readiness probes use HoopDb too: drain HTTP requests before ending its pool.
+    const serverCleanup = await Promise.allSettled([
+      new Promise<void>((resolve, reject) => healthServer.close(error => error ? reject(error) : resolve())),
+    ]);
+    const cleanup = [...serverCleanup, ...await Promise.allSettled([
+      shutdownTelemetry(),
+      db.end(),
+    ])];
+    const failed = cleanup.filter(r => r.status === "rejected");
+    for (const result of failed) if (result.status === "rejected") log.warn("worker shutdown failed", errorFields(result.reason));
+    if (failed.length) process.exit(1);
   }
+  process.exit(0);
 }
 
 /** The object-store reader and raw store for this deployment, from env. */

@@ -9,6 +9,7 @@ name: deploy session-read-worker
 #   SESSION_READ_SUPABASE_CA_ID   the uploaded Supabase Root 2021 CA certificate id
 #   SESSION_READ_ORIGIN          https://sessions-read.agentrelay.com (also Cloud's SESSIONS_READ_96BULLS_URL)
 #   SESSION_READ_COMPLETE_SINCE  ISO UTC timestamp ClickHouse is complete from, or "epoch"
+#   SESSION_READ_TIMING_ASSUME_NO_TURNS  optional "true" (runbook, "Session timing")
 # Environment secret: CLOUDFLARE_API_TOKEN (Workers Scripts:Edit, Hyperdrive:Read).
 #
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
@@ -42,6 +43,8 @@ jobs:
       EXPECTED_CA_ID: ${{ vars.SESSION_READ_SUPABASE_CA_ID }}
       ORIGIN: ${{ vars.SESSION_READ_ORIGIN }}
       COMPLETE_SINCE: ${{ vars.SESSION_READ_COMPLETE_SINCE }}
+      DIRECTORY_WORKSPACES: ${{ vars.SESSION_READ_DIRECTORY_WORKSPACES }}
+      TIMING_ASSUME_NO_TURNS: ${{ vars.SESSION_READ_TIMING_ASSUME_NO_TURNS }}
     defaults:
       run:
         working-directory: packages/session-read-worker
@@ -95,6 +98,8 @@ jobs:
           bunx wrangler deploy --config wrangler.deploy.jsonc \
             --var "READ_API_ORIGIN:$ORIGIN" \
             --var "READ_API_COMPLETE_SINCE:$COMPLETE_SINCE" \
+            ${DIRECTORY_WORKSPACES:+--var "READ_API_DIRECTORY_WORKSPACES:$DIRECTORY_WORKSPACES"} \
+            ${TIMING_ASSUME_NO_TURNS:+--var "READ_API_TIMING_ASSUME_NO_TURNS:$TIMING_ASSUME_NO_TURNS"} \
             --message "96BullSessions ${GITHUB_SHA}"
       - name: Check the Worker's secrets exist (names only)
         env:
