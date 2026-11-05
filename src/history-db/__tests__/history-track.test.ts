@@ -67,14 +67,15 @@ describe("runHistoryMigrations", () => {
     const db = new PGlite(); open.push(db);
     const c = client(db);
     const dir = scratchTrack();
-    writeFileSync(join(dir, "0002_example.sql"), "CREATE TABLE history.example (org_id text NOT NULL, seen_at timestamptz NOT NULL, PRIMARY KEY (org_id));\n");
+    writeFileSync(join(dir, "0900_example.sql"), "CREATE TABLE history.example (org_id text NOT NULL, seen_at timestamptz NOT NULL, PRIMARY KEY (org_id));\n");
+    const files = readdirSync(dir).filter((f) => f.endsWith(".sql")).length;
     const gen = await historyGeneration(dir);
     expect(await historyReady(c, gen)).toBe(false);
     const first = await runHistoryMigrations(c, { dir });
-    expect(first).toMatchObject({ applied: 2, skipped: 0, generation: gen });
+    expect(first).toMatchObject({ applied: files, skipped: 0, generation: gen });
     expect(await historyReady(c, gen)).toBe(true);
     const second = await runHistoryMigrations(c, { dir });
-    expect(second).toMatchObject({ applied: 0, skipped: 2, generation: gen });
+    expect(second).toMatchObject({ applied: 0, skipped: files, generation: gen });
     expect((await db.query("SELECT to_regclass('sessions.__96bulls_migrations') AS t")).rows[0]).toEqual({ t: null });
   });
 
@@ -84,7 +85,7 @@ describe("runHistoryMigrations", () => {
     const dir = scratchTrack();
     const plan = await inspectHistory(c, dir);
     await runHistoryMigrations(c, { dir });
-    writeFileSync(join(dir, "0002_late.sql"), "CREATE TABLE history.late (org_id text NOT NULL, at timestamptz NOT NULL);\n");
+    writeFileSync(join(dir, "0900_late.sql"), "CREATE TABLE history.late (org_id text NOT NULL, at timestamptz NOT NULL);\n");
     await expect(runHistoryMigrations(c, { dir, expectedLedgerSha256: plan.ledgerSha256 })).rejects.toMatchObject({ code: "history_ledger_changed" });
     expect((await db.query("SELECT to_regclass('history.late') AS t")).rows[0]).toEqual({ t: null });
   });
@@ -93,9 +94,9 @@ describe("runHistoryMigrations", () => {
     const db = new PGlite(); open.push(db);
     const c = client(db);
     const dir = scratchTrack();
-    writeFileSync(join(dir, "0002_x.sql"), "CREATE TABLE history.x (org_id text NOT NULL, at timestamptz NOT NULL);\n");
+    writeFileSync(join(dir, "0900_x.sql"), "CREATE TABLE history.x (org_id text NOT NULL, at timestamptz NOT NULL);\n");
     await runHistoryMigrations(c, { dir });
-    writeFileSync(join(dir, "0002_x.sql"), "CREATE TABLE history.x (org_id text NOT NULL, at timestamptz NOT NULL, y int);\n");
+    writeFileSync(join(dir, "0900_x.sql"), "CREATE TABLE history.x (org_id text NOT NULL, at timestamptz NOT NULL, y int);\n");
     await expect(runHistoryMigrations(c, { dir })).rejects.toMatchObject({ code: "history_migration_changed" });
   });
 
@@ -103,9 +104,9 @@ describe("runHistoryMigrations", () => {
     const db = new PGlite(); open.push(db);
     const c = client(db);
     const dir = scratchTrack();
-    writeFileSync(join(dir, "0002_broken.sql"), "CREATE TABLE history.broken (org_id text NOT NULL, at timestamptz NOT NULL); SELECT nope();\n");
+    writeFileSync(join(dir, "0900_broken.sql"), "CREATE TABLE history.broken (org_id text NOT NULL, at timestamptz NOT NULL); SELECT nope();\n");
     await expect(runHistoryMigrations(c, { dir })).rejects.toThrow();
-    expect((await db.query("SELECT name FROM history.__history_migrations ORDER BY name")).rows).toEqual([{ name: "0001_history_schema.sql" }]);
+    expect((await db.query<{ name: string }>("SELECT name FROM history.__history_migrations ORDER BY name")).rows.map((r) => r.name)).not.toContain("0900_broken.sql");
     expect((await db.query("SELECT to_regclass('history.broken') AS t")).rows[0]).toEqual({ t: null });
     expect(await historyReady(c, await historyGeneration(dir))).toBe(false);
   });

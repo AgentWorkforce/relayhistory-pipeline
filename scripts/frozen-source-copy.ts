@@ -6,6 +6,9 @@
  *   bun scripts/frozen-source-copy.ts --plan                   read-only: per-org Neon row counts, no writes
  *   bun scripts/frozen-source-copy.ts --copy [--org X] [--concurrency 2] [--page 5000] [--max-page-ms 4000]
  *   bun scripts/frozen-source-copy.ts --seal                   verify every org (Neon vs Supabase digest) and write the seal
+ *   bun scripts/frozen-source-copy.ts --repair-head --org O --workspace W --user U [--execute]
+ *                                                              re-seed ONE stale mirror control head from Neon (dry run by default;
+ *                                                              src/hoopdb/frozen-control-head-repair.ts has the refusal rules)
  *
  * Idempotent and resumable: inserts are ON CONFLICT DO NOTHING keyed by the native key, progress is
  * per org (a sealed org is skipped), and the seal is written only when EVERY Neon org verifies.
@@ -18,11 +21,12 @@ import { createHash } from "node:crypto";
 import pg from "pg";
 import { parseCliLogin } from "./schema-release-owner-operator-plan.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
+import { repairControlHead } from "../src/hoopdb/frozen-control-head-repair.ts";
 
 const REF = "pyamkrhoyszgzirqqffq", HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = process.env.SUPABASE_CLI ?? "/home/khaliqgant/.local/bin/supabase";
 const args = process.argv.slice(2), flag = (k: string) => args.includes(k), val = (k: string, d: string) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1]! : d; };
-const mode = flag("--plan") ? "plan" : flag("--copy") ? "copy" : flag("--seal") ? "seal" : "";
-if (!mode) { console.error("one of --plan | --copy | --seal"); process.exit(64); }
+const mode = flag("--plan") ? "plan" : flag("--copy") ? "copy" : flag("--seal") ? "seal" : flag("--repair-head") ? "repair-head" : "";
+if (!mode) { console.error("one of --plan | --copy | --seal | --repair-head"); process.exit(64); }
 const PAGE = Number(val("--page", "5000")), CONC = Number(val("--concurrency", "2")), MAX_PAGE_MS = Number(val("--max-page-ms", "4000")), ONLY = val("--org", "");
 const { neonOwnerUrl } = JSON.parse(readFileSync(0, "utf8").split("\n")[0] || "{}");
 if (!/^postgresql:\/\/neondb_owner:.+ep-floral-pond-apkvat38/.test(neonOwnerUrl ?? "")) { console.error("neonOwnerUrl (production owner) required on stdin"); process.exit(64); }
@@ -120,7 +124,21 @@ async function copyOrg(org: string) {
   } finally { await n.end().catch(() => {}); await s.end().catch(() => {}); }
 }
 
+async function repairHead() {
+  const key = { org: val("--org", ""), workspace: val("--workspace", ""), user: val("--user", "") };
+  if (!key.org || !key.user || !args.includes("--workspace") || [key.org, key.workspace, key.user].some((v) => v.startsWith("--"))) { console.error("--repair-head needs --org, --workspace (may be empty string) and --user"); process.exit(64); }
+  const n = neon(); await n.connect();
+  try {
+    const s = await supa();
+    try {
+      const r = await repairControlHead(n, s, key, { dryRun: !flag("--execute") });
+      log("control head repair", { ...r });
+    } finally { await s.end().catch(() => {}); }
+  } finally { await n.end().catch(() => {}); }
+}
+
 async function main() {
+  if (mode === "repair-head") return repairHead();
   const n = neon(); await n.connect();
   try {
     await n.query("BEGIN READ ONLY");
