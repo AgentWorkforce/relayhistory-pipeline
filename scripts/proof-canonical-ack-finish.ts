@@ -15,9 +15,14 @@ const check = (name: string, cond: boolean) => {
   if (!cond) failures++;
 };
 await db.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE; CREATE SCHEMA ${SCHEMA}`);
-// The real DDL grants the producer role — create it so grants apply unmodified.
-await db.query(`CREATE ROLE bulls96_canonical_feature_producer NOLOGIN`)
-  .catch(() => {});
+// The real DDL ACL names these roles — create each idempotently so the
+// grants apply UNMODIFIED on a bare PG17 (no blanket error swallowing).
+for (const role of ["anon", "authenticated", "service_role",
+    "bulls96_session_ingest", "bulls96_session_ingest_seeder",
+    "bulls96_canonical_feature_producer"])
+  await db.query(
+    `DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='${role}')` +
+    ` THEN CREATE ROLE ${role} NOLOGIN; END IF; END $$;`);
 // Apply the REAL #230 025000 writer migration (vendored snapshot at
 // 226410e721beca5885082382094d1b38e3318c64) + the companion state DDL.
 // Self-contained: read the vendored fixture, no shell/out-of-tree paths.
