@@ -81,7 +81,7 @@ describe("canonical copy cycle (paged contract)", () => {
   test("publish drains all pages, acks each, finish CAS", async () => {
     const ch = fakeCH(), { a, acked, finished } = fakeAcks();
     const out = await copyCanonicalEntry(images(), a, ch,
-      { checkpoint: "0" }, publish());
+      { checkpoint: "0" }, publish(), "target-a");
     expect(out.kind).toBe("copied");
     expect(out.checkpoint).toBe(REV);
     const rows = ch.inserts.flat();
@@ -92,7 +92,7 @@ describe("canonical copy cycle (paged contract)", () => {
   test("retire pages prior keysets into tombstones", async () => {
     const ch = fakeCH(), { a } = fakeAcks();
     const out = await copyCanonicalEntry(images(), a, ch,
-      { checkpoint: "10" }, retire());
+      { checkpoint: "10" }, retire(), "target-a");
     expect(out.kind).toBe("copied");
     const rows = ch.inserts.flat();
     expect(rows.every((r) => r.deleted === 1)).toBe(true);
@@ -102,7 +102,7 @@ describe("canonical copy cycle (paged contract)", () => {
     const ch = fakeCH(), { a, acked } = fakeAcks();
     const out = await copyCanonicalEntry(images(), a, ch,
       { checkpoint: "10" },
-      { ...publish(), revision: "10" });
+      { ...publish(), revision: "10" }, "target-a");
     expect(out).toEqual({ kind: "refused", reason: "stale_revision" });
     expect(ch.inserts.length).toBe(0);
     expect(acked.length).toBe(0);

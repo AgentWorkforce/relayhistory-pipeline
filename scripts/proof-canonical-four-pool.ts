@@ -88,13 +88,13 @@ const state = { checkpoint: "0" };
 const pub = await copyCanonicalEntry(imagePort, acks, ch, state,
   { kind: "publish", revision: REV, imageKey: "img-1",
     schemaGeneration: "g1", sourceHash: HASH, scope: SCOPE,
-    sourceAuthority: AUTH, pointerSet: PTR });
+    sourceAuthority: AUTH, pointerSet: PTR }, "target-a");
 if (pub.kind !== "copied") throw Error("publish refused: " + pub.reason);
 const ret = await copyCanonicalEntry(imagePort, acks, ch,
   { checkpoint: pub.checkpoint },
   { kind: "retire", revision: "1000002", imageKey: "img-1",
     schemaGeneration: "g1", priorKeysetHash: HASH, scope: SCOPE,
-    priorSourceAuthority: AUTH, pointerSet: PTR });
+    priorSourceAuthority: AUTH, pointerSet: PTR }, "target-a");
 if (ret.kind !== "copied") throw Error("retire refused: " + ret.reason);
 const evRows = await ch.select<Record<string,unknown>>(
   "SELECT event_id,deleted,version,source_revision" +

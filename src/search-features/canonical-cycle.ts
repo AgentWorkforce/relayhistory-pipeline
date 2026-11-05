@@ -117,6 +117,11 @@ export async function copyCanonicalEntry(
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
+  // targetId is REQUIRED at runtime — an empty/absent deployment identity
+  // cannot safely bind ACK/finish state.
+  if (typeof targetId !== "string" || targetId.length === 0 ||
+      targetId.length > 256)
+    return { kind: "refused", reason: "target_id_required" };
   const sourceAuthority: CanonicalSourceAuthority =
     entry.kind === "publish" ? entry.sourceAuthority : entry.priorSourceAuthority;
   // Bindings are the REAL identities — the versioned projection profile and
