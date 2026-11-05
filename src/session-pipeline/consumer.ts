@@ -14,6 +14,7 @@ import { errorFields, log } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
+import { classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 
 export interface QueueRecord {
   messageId: string;
@@ -28,6 +29,8 @@ export interface ConsumerDeps {
   pointer: PointerDeps;
   /** Absent while the search index is switched off: only pointers are written. */
   search?: SearchIndexDeps;
+  /** Explicitly absent by default; independent Node artifact publication stage. */
+  replay?: ReplayProducerDeps;
   /**
    * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
    * another pass holds the session, so the event is neither lost nor failed.
@@ -125,6 +128,36 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ...errorFields(error),
           duration_ms: Date.now() - started,
         });
+        for (const id of messageIds) failed.add(id);
+      }
+    }
+  }
+  if (deps.replay) {
+    for (const { scope, messageIds } of scopes.values()) {
+      if (messageIds.every(id => failed.has(id))) continue;
+      const started = Date.now();
+      try {
+        const result = await produceCanonicalReplay(scope, deps.replay);
+        log.info("canonical replay materialized", { stage: "replay-pages", org_id: scope.orgId, session_id: scope.sessionId,
+          ok: result.published, reason: result.reason, count: result.rows, objects: result.objects, duration_ms: Date.now()-started });
+      } catch (error) {
+        // Retrying cannot fix a superseded source or a capacity refusal: log it and
+        // keep the message (its pointer and search stages already succeeded).
+        const refusal = classifyReplayFailure(error);
+        const fields = { stage: "replay-pages", org_id: scope.orgId, session_id: scope.sessionId, ok: false,
+          ...errorFields(error), duration_ms: Date.now()-started };
+        if (refusal?.kind === "superseded") {
+          // The newer source write has its own object event, which re-runs this scope.
+          log.info("canonical replay superseded", { ...fields, reason: refusal.reason, error_code: refusal.code });
+          continue;
+        }
+        if (refusal?.kind === "capacity") {
+          // TODO(#184): route oversize scopes to the large-read path (session_large_read_jobs)
+          // instead of only logging; the producer does not enqueue there yet.
+          log.warn("canonical replay refused", { ...fields, reason: refusal.reason, error_code: refusal.code });
+          continue;
+        }
+        log.error("canonical replay publication failed", fields);
         for (const id of messageIds) failed.add(id);
       }
     }
