@@ -5,6 +5,7 @@ import {isManifestRest} from "../../packages/object-store/src/index.ts";
  */
 import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS, ARTIFACT_MAX_SOURCE_POINTERS } from "./canonical-artifact.ts";
 import { canonicalLegacy } from "./canonical-legacy.ts";
+import { canonicalLiveTurns, mergeTurnRows } from "./canonical-turns.ts";
 import { createHash } from "node:crypto";
 import { readCanonicalScope, manifestUserId } from "./canonical-projection.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
@@ -209,10 +210,12 @@ async function snapshotWithLimits(
   if (canonicalSourceGeneration(fresh, identity) !== version)
     throw new CanonicalReadError("source_generation_changed");
   const legacy = canonicalLegacy(result.records, identity);
+  // Live relay session turns (canonical-turns.ts) replace the legacy row of the same key.
+  const live = canonicalLiveTurns(result.records, identity);
   return {
     generation: version,
     exists: true,
     legacyCoverage: legacy.coverage,
-    rows: [...result.projectionRows, ...legacy.rows],
+    rows: [...result.projectionRows, ...mergeTurnRows(legacy.rows, live)],
   };
 }
