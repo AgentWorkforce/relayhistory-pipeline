@@ -30,7 +30,11 @@ No live configuration is changed by these instructions or the unit tests.
    `/v1/internal/amp/operation`, allow a 100 KiB request and 17 MiB response,
    and leave at least 60 seconds for a response. The authenticated route is
    separate from the user-upload JWT surface; it refuses calls without its
-   dedicated token. Leave it disabled on unrelated/customer deployments.
+   dedicated token. On the AWS ingest, explicitly set
+   `eks.ingress.ampTransportEnabled: true` in the reviewed deployment inputs.
+   The default WAF still blocks all internal routes. This opt-in excludes only
+   the exact POST Amp route from that block; managed rules, rate limits and
+   every other internal-route block remain in force. Leave it disabled on unrelated/customer deployments.
 4. Set Cloud's `AMP_TRANSPORT_ORIGIN` repository/environment variable to that
    ingest's bare HTTPS origin. Deploy full SST once to attach the new linked
    secret; subsequent fast-path deploys preserve the binding and origin.

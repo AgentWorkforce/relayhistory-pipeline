@@ -1,5 +1,5 @@
 // Generated from AgentWorkforce/relayhistory sdk-ts/src/amp-source.ts. Do not edit here.
-// sha256: 2130a33e6eda82229ca38da0ae219843c2892e87c164c6809d42528c7b1c8a1d
+// sha256: d4c06a6e9ecd82d84dbd88b0692ab13ff4f05c8599e933dd2ff5d9cd62c38961
 /** Amp evidence projection. Cloud owns credentials, scheduling and delivery;
  * this module owns interpreting provider JSON. Unknown fields stay in raw. */
 export type AmpMessage = Record<string, unknown>;
@@ -19,6 +19,7 @@ export type AmpEvidence = {
     messageId: string;
     messageVersion: number | null;
     raw: AmpMessage;
+    toolResults?: Array<{ id: string; status: string | null; output?: unknown; error?: unknown }>;
     timestampInferred?: true;
   };
 };
@@ -67,7 +68,7 @@ export function ampEvidence(
     )
       throw new Error('AMP_INVALID_MESSAGE_VERSION');
     const role = typeof raw.role === 'string' ? raw.role : null;
-    const content =
+    const prose =
       typeof raw.content === 'string'
         ? raw.content
         : Array.isArray(raw.content)
@@ -98,27 +99,54 @@ export function ampEvidence(
             : [];
         })
       : [];
+    const toolResults = role === 'user' && Array.isArray(raw.content)
+      ? raw.content.flatMap((block) => {
+          const result = object(block);
+          if (result.type !== 'tool_result' || typeof result.toolUseID !== 'string' || !result.toolUseID) return [];
+          const run = object(result.run);
+          return [{
+            id: result.toolUseID,
+            status: typeof run.status === 'string' ? run.status : null,
+            ...(Object.hasOwn(run, 'result') ? { output: run.result } : {}),
+            ...(Object.hasOwn(run, 'error') ? { error: run.error } : {}),
+          }];
+        })
+      : [];
+    const onlyToolResults = !prose.trim() && toolResults.length > 0 &&
+      Array.isArray(raw.content) && raw.content.every((block) => {
+        const part = object(block);
+        return (part.type === 'tool_result' && typeof part.toolUseID === 'string' && !!part.toolUseID) ||
+          (part.type === 'text' && typeof part.text === 'string' && !part.text.trim());
+      });
+    const content = onlyToolResults
+      ? toolResults.flatMap((result) => [result.output, result.error]
+          .map((value) => typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value))
+          .filter((text) => text.trim())).join('\n')
+      : prose;
     return {
       v: 1,
       source: 'amp',
       sessionId,
       eventId: `amp:${sessionId}:${messageId}`,
       lens: 'history',
-      kind: role === 'user' && content
+      kind: onlyToolResults
+        ? 'tool_call'
+        : role === 'user' && content.trim()
         ? 'prompt'
-        : role === 'assistant' && content
+        : role === 'assistant' && content.trim()
           ? 'assistant'
           : toolCalls.length || role === 'tool'
             ? 'tool_call'
             : 'marker',
       ts: new Date(time).toISOString(),
       content,
-      actorRole: role,
+      actorRole: onlyToolResults ? 'tool' : role,
       ...(toolCalls.length ? { toolCalls } : {}),
       record: {
         messageId,
         messageVersion: version === undefined ? null : Number(version),
         raw,
+        ...(toolResults.length ? { toolResults } : {}),
         ...(nativeDate == null ? { timestampInferred: true as const } : {}),
       },
     };
@@ -152,8 +180,8 @@ if(!op||!['discover','export','inject'].includes(op.kind)||(op.kind!=='discover'
 const args=['--log-file','/dev/null'];
 if(op.kind==='discover')args.push('threads','search','author:me','--json','--limit','100');
 else if(op.kind==='export')args.push('threads','export',op.threadId);
-else if(op.kind==='inject')args.push('threads','continue',op.threadId,'-ox',op.text);
-const r=spawnSync(process.env.RELAY_AMP_CLI_PATH||'/tmp/relay-amp/node_modules/.bin/amp',args,{encoding:'utf8',timeout:45000,maxBuffer:16777216,env:{...process.env,RELAY_AMP_OPERATION:''}});
+else if(op.kind==='inject')args.push('threads','continue',op.threadId,'-ox');
+const r=spawnSync(process.env.RELAY_AMP_CLI_PATH||'/tmp/relay-amp/node_modules/.bin/amp',args,{encoding:'utf8',input:op.kind==='inject'?op.text:undefined,timeout:45000,maxBuffer:16777216,env:{...process.env,RELAY_AMP_OPERATION:''}});
 if(r.status!==0){process.stdout.write(JSON.stringify({ok:false,outcome:op.kind==='inject'?'unknown':'rejected',code:'amp_command_failed'}));process.exit(0)}
 if(op.kind==='inject')process.stdout.write(JSON.stringify({ok:true,value:{accepted:true}}));
 else{try{process.stdout.write(JSON.stringify({ok:true,value:JSON.parse(r.stdout)}))}catch{process.stdout.write(JSON.stringify({ok:false,outcome:'rejected',code:'amp_invalid_json'}))}}`;
