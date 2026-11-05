@@ -46,8 +46,9 @@ export interface ErasureConfig {
   slaWarnMs: number;
   /**
    * Whether the existence guard also counts legacy-only evidence (conversation
-   * turns, links, outcomes). `S3X_ERASER_RECOGNIZES_LEGACY`; enable before the
-   * exporter's `S3X_INCLUDE_LEGACY_SOURCES`.
+   * turns, links, outcomes). `S3X_ERASER_RECOGNIZES_LEGACY`. Legacy manifests
+   * from `migration:legacy-export` are never in this job's queue, so this only
+   * changes when a delivery group's own prefixes may be erased.
    */
   recognizeLegacy: boolean;
 }

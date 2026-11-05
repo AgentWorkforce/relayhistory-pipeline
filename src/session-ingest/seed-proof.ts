@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import type { ManifestReader } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
 import type { ObjectStore } from "../../packages/object-store/src/index.ts";
 import { computeContentSha256, parseSessionKey } from "../../packages/object-store/src/index.ts";
-import { chooseRelayhistoryRevision, relayhistoryRevisionContent, relayhistoryExportProvenance, type RelayhistoryRevisionSeat } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
+import { chooseRelayhistoryRevision, relayhistoryRevisionContent, relayhistoryExportProvenance, isLegacyRelayhistoryRecord, type RelayhistoryRevisionSeat } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import { streamManifestRecords } from "../session-read-api/canonical-projection.ts";
 import { canonicalManifestIdentity, manifestUserId } from "../shared/manifest-identity.ts";
 import { DELIVERY_KINDS, retiredDeliveryRecord } from "./vendor/delivery/delivery-contracts.ts";
@@ -135,7 +135,9 @@ export class SeedProofIndex {
           fail("seed_manifest_owner");
         count++;
         if (!(DELIVERY_KINDS as readonly string[]).includes(record.kind)) {
-          if(record.kind==="convergence_event" || retiredDeliveryRecord(record)) {unseeded++;continue;}
+          // Exported legacy evidence (conversation_turns/links/outcomes) is not delivery and is never seeded.
+          if(record.kind==="convergence_event" || retiredDeliveryRecord(record) ||
+             (exported && isLegacyRelayhistoryRecord(record))) {unseeded++;continue;}
           fail("seed_record_kind_unsupported");
         }
         const noSession=pointer.harness===NO_SESSION_HARNESS && pointer.session_id===NO_SESSION_ID;

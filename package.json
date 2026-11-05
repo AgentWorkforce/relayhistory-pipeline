@@ -35,7 +35,8 @@
     "migration:sequence-fence": "bun run src/migration/relayhistory-sequence-fence.ts",
     "migration:verify": "bun run src/migration/relayhistory-verify.ts",
     "migration:neon-s3-sync": "bun run src/migration/neon-s3-sync/main.ts",
-    "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts"
+    "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts",
+    "migration:legacy-export": "bun run src/migration/legacy-export/main.ts"
   },
   "dependencies": {
     "@96bulls/pipeline": "workspace:*",
