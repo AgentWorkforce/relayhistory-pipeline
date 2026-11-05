@@ -10,18 +10,27 @@ import { CanonicalJournalStore } from "../src/search-features/canonical-journal.
 import { CanonicalPageAckStore } from "../src/search-features/canonical-ack-store.ts";
 
 const port = Number(process.argv[2] ?? 32770);
-const db = new Pool({ host: "127.0.0.1", port, user: "postgres",
+// Host/port guard: only ever run against a loopback disposable fixture,
+// never an arbitrary host/port.
+if (process.env.PROOF_DISPOSABLE !== "1")
+  throw new Error("refused: set PROOF_DISPOSABLE=1 on a disposable database");
+if (!["127.0.0.1", "localhost"].includes(
+    process.env.PROOF_HOST ?? "127.0.0.1") || port < 1 || port > 65535)
+  throw new Error("refused: proof host must be loopback with a valid port");
+const admin = new Pool({ host: "127.0.0.1", port, user: "postgres",
   password: "synthetic-feature-only", database: "postgres" });
 let failures = 0;
 const check = (n: string, ok: boolean) => {
   console.log(n, ok ? "PASS" : "FAIL"); if (!ok) failures++; };
 
-// Safety gate: this proof drops/creates its schema — only run against an
-// explicitly disposable database, never a shared or real one.
-if (process.env.PROOF_DISPOSABLE !== "1")
-  throw new Error("refused: set PROOF_DISPOSABLE=1 on a disposable database");
+// Its own throwaway DATABASE — never touches the shared `postgres` db.
+const DB = "canonical_consumer_proof";
+await admin.query(`DROP DATABASE IF EXISTS ${DB}`);
+await admin.query(`CREATE DATABASE ${DB}`);
+const db = new Pool({ host: "127.0.0.1", port, user: "postgres",
+  password: "synthetic-feature-only", database: DB });
 const SCHEMA = "sessions";
-await db.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE; CREATE SCHEMA ${SCHEMA}`);
+await db.query(`CREATE SCHEMA ${SCHEMA}`);
 for (const r of ["anon", "authenticated", "service_role",
     "bulls96_session_ingest", "bulls96_session_ingest_seeder",
     "bulls96_canonical_feature_producer"])
@@ -47,7 +56,7 @@ await db.query(`INSERT INTO sessions.ingest_history_scope_versions VALUES($1,$2,
 await db.query(`SELECT sessions.canonical_feature_changed($1,$2,$3,$4,$5)`, [JSON.stringify(OTHER), JSON.stringify(AUTH), null, JSON.stringify(PTR), null]);
 
 const prod = new Pool({ host: "127.0.0.1", port, user: "postgres",
-  password: "synthetic-feature-only", database: "postgres" });
+  password: "synthetic-feature-only", database: DB });
 await prod.query("SET ROLE bulls96_canonical_feature_producer");
 const sql = { query: (t: string, p?: unknown[]) => prod.query(t, p) };
 const journal = new CanonicalJournalStore(sql);
@@ -80,7 +89,7 @@ const CFG = { enabled: true, targetId: "target-A", ownerId: "workerA",
 // Disabled consumer: zero queries at all (count every DB call).
 let queries = 0;
 const counting = { query: (t: string, p?: unknown[]) => { queries++;
-  return db.query(t, p); } };
+  return sql.query(t, p); } };
 const off = new CanonicalConsumer(counting, journal, store,
   { ...CFG, enabled: false });
 const offOut = await off.drain(images, ch);
@@ -131,5 +140,7 @@ check("producer_dead_letter_delete_denied",
 await prod.query("RESET ROLE");
 await prod.end();
 await db.end();
+await admin.query(`DROP DATABASE IF EXISTS ${DB}`);
+await admin.end();
 if (failures) { console.log(`${failures} FAILURES`); process.exit(1); }
 console.log("ALL PASS");

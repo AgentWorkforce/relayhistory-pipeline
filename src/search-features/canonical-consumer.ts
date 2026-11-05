@@ -126,10 +126,10 @@ export class CanonicalConsumer {
         ` AND rev < $2::bigint` +
         ` AND EXISTS (SELECT 1 FROM ${LEASE}` +
         `   WHERE partition=$1 AND owner=$3` +
-        `   AND heartbeat_at >= now() - make_interval(secs => $4))` +
+        `   AND heartbeat_at >=` +
+        `    now() - (${LEASE}.ttl_ms || ' milliseconds')::interval)` +
         ` RETURNING 1 AS n`,
-      [this.ensurePartition(), rev, this.cfg.ownerId,
-        this.cfg.leaseTtlMs / 1000]);
+      [this.ensurePartition(), rev, this.cfg.ownerId]);
     return rows.length > 0;
   }
   private async seedCheckpoint(): Promise<void> {

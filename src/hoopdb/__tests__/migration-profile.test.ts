@@ -1516,7 +1516,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = (name: string) =>
       db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8"));
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
