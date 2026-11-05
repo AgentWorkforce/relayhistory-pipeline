@@ -1,9 +1,8 @@
-import { nodeReadBudget, type NodeReadProfile } from "../session-read-api/node-read-profile.ts";
 /** Node-only, write-before-publication materializer. No Worker source-budget lift. */
 import { createHash } from "node:crypto";
 import {
   ARTIFACT_VERSION, ARTIFACT_TABLES, ARTIFACT_MAX_OBJECT_BYTES, ARTIFACT_MAX_ROWS_PER_PAGE,
-  ARTIFACT_FANOUT, ARTIFACT_MAX_DEPTH, ARTIFACT_STRING_SEGMENT_CHARS, ARTIFACT_MAX_ROW_BYTES,
+  ARTIFACT_FANOUT, ARTIFACT_MAX_DEPTH, ARTIFACT_STRING_SEGMENT_CHARS,
   ARTIFACT_BLOB_SEGMENT_BYTES, artifactViewRow, compareArtifactEventRows,
   type ArtifactIdentity, type ArtifactSource, type ArtifactRef, type ArtifactRangeRef,
   type ArtifactNode, type ArtifactEntry, type ArtifactPage, type ArtifactIndex,
@@ -39,7 +38,6 @@ export function compareArtifactRows(a: ArtifactRow, b: ArtifactRow): number {
 }
 export interface MaterializeInput {
   identity: ArtifactIdentity; generation: string; source: ArtifactSource; prefix: string;
-  profile?: NodeReadProfile;
   rows: ArtifactRow[]; legacyCoverage: ArtifactIndex["legacyCoverage"];
 }
 export interface MaterializeResult { index: ArtifactRef; document: ArtifactIndex; objects: number; bytes: number }
@@ -52,7 +50,7 @@ class Writer {
     const sha256 = artifactDigest(bytes), key = `${this.input.prefix}${sha256}.${extension}`;
     const cached = this.written.get(key); if (cached) return cached;
     // Output expansion is bounded separately from the admitted raw source budget.
-    if (this.bytes + bytes.length > nodeReadBudget(this.input.profile).artifactBytes) refuse("artifact_output_bound");
+    if (this.bytes + bytes.length > 2 * 1024 ** 3) refuse("artifact_output_bound");
     this.bytes += bytes.length;
     const ack = await this.store.put(objectKey(key), bytes, { ifNoneMatch: true, contentSha256: sha256, contentType: extension === "json" ? "application/json" : "application/octet-stream" });
     if (ack.contentSha256 !== sha256 || ack.size !== bytes.length) refuse("artifact_write_ack_invalid");
@@ -106,9 +104,6 @@ class Writer {
   }
   async entry(item: ArtifactRow, view: ArtifactView): Promise<ArtifactEntry> {
     let row = artifactViewRow(item, view).row;
-    // Never acknowledge a generation containing a row the public consumer refuses.
-    // Measure the hydrated envelope before splitting content or nested objects.
-    if (bytesOf({table:item.table,row}).length > ARTIFACT_MAX_ROW_BYTES) refuse("artifact_row_bound");
     let content: ArtifactString | undefined;
     if (view === "replay" && typeof row.content === "string" && bytesOf(row.content).length > 32 * 1024) {
       content = await this.string(row.content); row = { ...row, content: null };
@@ -150,7 +145,7 @@ class Writer {
 /** Called only after authoritative full-union projection succeeds. Publication is a separate CAS. */
 export async function materializeCanonicalArtifacts(store: ObjectStore, input: MaterializeInput): Promise<MaterializeResult> {
   if (!/^[0-9a-f]{64}$/u.test(input.generation) || !/^[0-9a-f]{64}$/u.test(input.source.fingerprint) || !/^[1-9][0-9]*$/u.test(input.source.epoch) || !input.prefix.endsWith("/")) refuse("artifact_identity_invalid");
-  if (input.rows.length > nodeReadBudget(input.profile).artifactRows) refuse("artifact_row_bound");
+  if (input.rows.length > 2_000_000) refuse("artifact_row_bound");
   const writer = new Writer(store, input), groups = new Map<string, ArtifactRow[]>();
   for (const item of input.rows) {
     const group = groups.get(item.table) ?? []; group.push(item); groups.set(item.table, group);

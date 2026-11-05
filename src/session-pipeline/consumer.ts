@@ -31,8 +31,6 @@ export interface ConsumerDeps {
   search?: SearchIndexDeps;
   /** Explicitly absent by default; independent Node artifact publication stage. */
   replay?: ReplayProducerDeps;
-  /** Absent by default. A true return means durable canonical-epoch handoff. */
-  large?: { route: (scope: SessionScope) => Promise<boolean> };
   /**
    * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
    * another pass holds the session, so the event is neither lost nor failed.
@@ -93,15 +91,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     }
   }
 
-  const delegated=new Set<string>();
-  if(deps.large&&(deps.search||deps.replay))for(const {scope,messageIds} of scopes.values()){
-    if(messageIds.every(id=>failed.has(id)))continue;
-    try{if(await deps.large.route(scope))delegated.add(scopeId(scope))}
-    catch(error){log.error("large scope handoff failed",{stage:"large-read",...errorFields(error)});for(const id of messageIds)failed.add(id)}
-  }
   if (deps.search) {
     for (const { scope, messageIds, manifestKey } of scopes.values()) {
-      if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
+      if (messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       try {
         const result = await indexSearchScope(scope, deps.search);
@@ -142,7 +134,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   }
   if (deps.replay) {
     for (const { scope, messageIds } of scopes.values()) {
-      if (delegated.has(scopeId(scope)) || messageIds.every(id => failed.has(id))) continue;
+      if (messageIds.every(id => failed.has(id))) continue;
       const started = Date.now();
       try {
         const result = await produceCanonicalReplay(scope, deps.replay);

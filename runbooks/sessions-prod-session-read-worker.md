@@ -34,6 +34,10 @@ The same `b96e1:` cursors are issued and accepted. A cursor that the Lambda issu
 | `READ_API_COMPLETE_SINCE` | GitHub env var `SESSION_READ_COMPLETE_SINCE` | the same value as the Lambda's `sessionReadApi.completeSince` |
 | `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | `wrangler.jsonc` vars | `https://api.relayauth.dev/.well-known/jwks.json` and `https://relayauth.dev`, as on the Lambda since #158. Never leave them unset: the verifier's fallback JWKS does not resolve, so every token would be refused with a 401 |
 
+| `READ_API_DIRECTORY_WORKSPACES` | GitHub env var `SESSION_READ_DIRECTORY_WORKSPACES` | the P3 canary allowlist (directory list/activity and session timing); unset = every P3 route answers 501 |
+| `PIPELINE_RAW_S3_BUCKET`, `_REGION`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` (+ optional `_ENDPOINT`, `_SSE`), `PIPELINE_KEY_PREFIX`, `PIPELINE_ORG_FROM_PREFIX` | Worker secrets / vars | session timing's canonical S3 read: a GetObject-only key on the raw bucket, the same key layout the session-pipeline Lambda writes. Unset = timing answers 501 `timing_not_configured` |
+| `READ_API_TIMING_ASSUME_NO_TURNS` | GitHub env var `SESSION_READ_TIMING_ASSUME_NO_TURNS` | `true` only for canary workspaces a read-only count showed have no Neon `conversation_turns` (see "Session timing" below); unset = such sessions answer 501 `timing_turns_unknown` |
+
 **Fail-closed defaults:**
 - With no origin, every `/v1` request gets a 401.
 - With a missing ClickHouse secret, a missing `completeSince` or a missing Hyperdrive binding, every request gets a 503.
@@ -122,6 +126,25 @@ The ClickHouse user and the Supabase role already exist: the Lambda uses them. S
     - The sessions-prod plan contract refuses deletes, so this needs its own reviewed change: a `session read api retire` phase that deletes exactly the three read-API resources, applied by the lead.
     - Until it lands, the Lambda is idle but still deployed.
     - Keep `src/session-read-api/lambda.ts` until then, so the rollback below stays possible.
+
+## Session timing (P3c)
+
+`GET /v1/sessions/:id/timing` is computed from the session's canonical S3 objects, never Neon or ClickHouse:
+
+1. the session's live pointer rows, read as `bulls96_read_api` (tenant-bound RLS) with the object-pointer columns `session_read_api_role.sql` grants;
+2. the manifests and chunks they name, digest-checked (`canonical.ts canonicalSnapshot`, the same 16 MiB / 100k-event bounds as `/v1/canonical`);
+3. the shared delivery projection (the port of Neon's delivery projection) and the timing port (`timing.ts`), which the parity suite holds equal to relayhistory's `session_timing_compute` v1.
+
+Every case it cannot answer exactly is a 501 Cloud falls back on: `timing_workspace_not_enabled`, `timing_not_configured`, `timing_no_pointers`, `timing_turns_unknown`, `timing_canonical_<reason>` (including `timing_canonical_deadline` after 3 s, below Cloud's 4 s timeout) and `timing_<input>`.
+
+Activation, in order (each step is the lead's):
+1. Apply the widened grant: rerun `supabase/bootstrap/session_read_api_role.sql`, then `session_read_api_role_verify.sql`. Rollback: `REVOKE SELECT (canonical_session_id, machine_id, canonical_machine_id, user_id, storage_provider, bucket, manifest_key, content_sha256, raw_format, revision) ON sessions.session_index FROM bulls96_read_api;` and the previous verify file.
+2. Give the Worker the raw-store secrets above (a GetObject-only key on the raw bucket prefix).
+3. Count the canary workspace's Neon `conversation_turns` read-only. If zero, set `SESSION_READ_TIMING_ASSUME_NO_TURNS=true`; otherwise leave it unset until the legacy turn export (docs/canonical-legacy-source.md) has run.
+4. Redeploy, then put the workspace on `SESSION_READ_DIRECTORY_WORKSPACES` (if it is not already).
+5. In Cloud, `SESSIONS_READ_96BULLS_ROUTES` adds `session_timing=shadow`; watch `[sessions-read-shadow] route=session_timing` for `equal`, `shadowStatus` and `shadowMs`, then `session_timing=on`.
+
+Expected shadow differences: Neon froze at the cutover, so a session with activity after it is more complete on S3 (`equal: false` there is not a regression). Compare sessions whose last activity predates the cutover.
 
 ## Rollback
 

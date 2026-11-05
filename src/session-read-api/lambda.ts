@@ -19,8 +19,10 @@ import { log } from "../shared/log.ts";
 import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { SUPABASE_PROD_CA_2021 } from "../session-pipeline/supabase-ca.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
-import { createReadApi } from "./app.ts";
-import { relayAuthVerifier } from "./auth.ts";
+import { createReadApi, parseDirectoryWorkspaces } from "./app.ts";
+import { sqlDirectory } from "./directory.ts";
+import { relayAuthVerifier, type AuthConfig } from "./auth.ts";
+import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
 import { poolTenantRunner, sqlLiveness } from "./liveness.ts";
 
@@ -47,6 +49,18 @@ export function parseReadApiSecret(text: string): ReadApiSecret {
 }
 
 export { parseCompleteSince };
+
+/**
+ * The verifier's destinations from env, validated with the shared transport
+ * rule. Unset JWKS/issuer fall back to the hosted RelayAuth defaults in
+ * packages/pipeline/src/env.ts; a self-host sets both.
+ */
+export function readApiAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig {
+  const policy = destinationPolicy(env);
+  const jwksUrl = env.RELAYAUTH_JWKS_URL?.trim() || undefined;
+  if (jwksUrl) assertDestinationUrl("RELAYAUTH_JWKS_URL", jwksUrl, policy);
+  return { origin: env.READ_API_ORIGIN || undefined, jwksUrl, issuer: env.RELAYAUTH_ISSUER };
+}
 
 type App = ReturnType<typeof createReadApi>;
 let appPromise: Promise<App> | undefined;
@@ -77,9 +91,11 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env): Promise<App> {
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   return createReadApi({
-    verify: relayAuthVerifier({ origin: env.READ_API_ORIGIN || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL, issuer: env.RELAYAUTH_ISSUER }),
+    verify: relayAuthVerifier(readApiAuthConfig(env)),
     ch: createClickHouseClient(secret.clickhouse),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
+    directory: sqlDirectory(poolTenantRunner(pool as never)),
+    directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     completeSinceMs,
     log: (fields) => log.info("session read", fields),
   });

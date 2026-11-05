@@ -1,4 +1,4 @@
-import { nodeReadBudget, type NodeReadProfile } from "./node-read-profile.ts";
+import {isManifestRest} from "../../packages/object-store/src/index.ts";
 /** Canonical S3 session projections, shared with the live S3 -> CH writer.
  * The successful claim-bound pointer RPC is the authentication boundary. No
  * object is read from an unverified JWT claim or caller-supplied object key.
@@ -119,13 +119,12 @@ export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdenti
   return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS);
 }
 /** Trusted Node producer only. Never called by the raw Worker request path. */
-export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, profile: NodeReadProfile = "standard") {
-  const budget=nodeReadBudget(profile);
-  return snapshotWithLimits(deps, identity, budget.sourceBytes, budget.sourceRecords, ARTIFACT_MAX_SOURCE_POINTERS + 1,budget.projectedRows);
+export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity) {
+  return snapshotWithLimits(deps, identity, ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS, ARTIFACT_MAX_SOURCE_POINTERS + 1);
 }
 async function snapshotWithLimits(
   deps: CanonicalDeps, identity: CanonicalIdentity,
-  maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number, maxRows=500000,
+  maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number,
 ) {
   const pointers = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive),
     version = canonicalSourceGeneration(pointers, identity);
@@ -185,7 +184,7 @@ async function snapshotWithLimits(
           const at = parseSessionKey(key);
           if (
             !at ||
-            at.rest !== "manifest.json" ||
+            !isManifestRest(at.rest) ||
             !prefixAllowed(deps.prefix, at.prefix, identity.orgId)
           )
             throw new CanonicalReadError("prefix_mismatch");
@@ -196,7 +195,7 @@ async function snapshotWithLimits(
     {
       maxScopeBytes,
       maxScopeEvents,
-      maxRows,
+      maxRows: 500000,
       insertBatch: 5000,
       directoryValues: true,
     },
