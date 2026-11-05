@@ -719,8 +719,10 @@ export async function canonicalArtifactPage(
       // encoded reply item is strictly larger. Refuse (first row) or stop
       // (later rows) on the declared size before allocating or fetching any
       // segment; the post-hydrate size checks below stay authoritative.
+      // Views with a MAX_ROW_BYTES first-row allowance (analysis snapshots are
+      // bounded by their own ANALYSIS_MAX_SNAPSHOT_BYTES budget) are exempt.
       if (
-        !["replay", "legacy"].includes(view) &&
+        !["replay", "legacy", "analysis"].includes(view) &&
         obj(entry) &&
         obj(entry.rowJson) &&
         count(entry.rowJson.bytes) &&
