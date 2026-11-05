@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
-import { EC2_USER_DATA_ENCODED_LIMIT, decide, fileReader, hostBoundaryPolicy, hostRolePolicy, hostRoleProps, hostTemplate, networkParams, userDataBase64 } from "@agentworkforce/layered-agent";
+import { EC2_USER_DATA_ENCODED_LIMIT, RELAY_SESSIONS_KIT_FILES, WORKER_KIT_FILES, decide, fileReader, hostBoundaryPolicy, hostRolePolicy, hostRoleProps, hostTemplate, networkParams, userDataBase64 } from "@agentworkforce/layered-agent";
 import agent from "../agent.config.ts";
 
 const AGENT_DIR = fileURLToPath(new URL("..", import.meta.url));
@@ -91,7 +91,11 @@ test(`user data: under ${USER_DATA_BUDGET} bytes encoded (EC2 caps it at ${EC2_U
   console.log(`user data: ${encoded.length} bytes base64 (limit ${EC2_USER_DATA_ENCODED_LIMIT}, budget ${USER_DATA_BUDGET})`);
   assert.ok(encoded.length < USER_DATA_BUDGET, `user data is ${encoded.length} bytes encoded`);
   const script = gunzipSync(Buffer.from(encoded, "base64")).toString("utf8");
-  for (const f of agent.files) assert.ok(script.includes(`cat > /opt/agent-host/${f.name} <<'`), f.name);
+  // The optional kit files (workers, relay sessions) are not in user data; they
+  // reach the host over SSM in the hot update after first boot (kit 0.1.10).
+  const optional: readonly string[] = [...WORKER_KIT_FILES, ...RELAY_SESSIONS_KIT_FILES];
+  for (const f of agent.files) if (!optional.includes(f.name)) assert.ok(script.includes(`cat > /opt/agent-host/${f.name} <<'`), f.name);
+  for (const f of optional) assert.ok(!script.includes(`/opt/agent-host/${f} <<'`), `${f} is not in user data`);
   assert.doesNotMatch(script, /sk-ant-|ghp_|ghs_|gho_|github_pat_|BEGIN [A-Z ]*PRIVATE KEY/);
 });
 
