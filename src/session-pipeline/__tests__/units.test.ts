@@ -6,6 +6,7 @@ import { signV4 } from "../aws-json.ts";
 import { decodeS3Key, parseQueueBody, sequencerAfter } from "../s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
 import { handler, lambdaEnv, parseSecret } from "../lambda.ts";
+import { searchIndexLimits, SEARCH_INDEX_DEFAULT_LIMITS, REPLAY_SEARCH_INDEX_LIMITS } from "../search-index.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
@@ -145,6 +146,21 @@ describe("configuration", () => {
     SESSION_PIPELINE_SECRET_ARN: "arn",
     SESSION_PIPELINE_QUEUE_URL: "https://sqs",
   };
+
+  test("search index limits stay 64 MiB / 100k / 500k unless the replay stage is on", () => {
+    const original = { maxScopeBytes: 64 * 1024 * 1024, maxScopeEvents: 100_000, maxRows: 500_000, insertBatch: 5_000 };
+    expect({ ...SEARCH_INDEX_DEFAULT_LIMITS }).toEqual(original);
+    expect(searchIndexLimits(lambdaEnv(base).replayPagesEnabled)).toEqual(original);
+    expect(searchIndexLimits(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1" }).replayPagesEnabled)).toEqual(original);
+    expect(searchIndexLimits(lambdaEnv({ ...base, SESSION_REPLAY_PAGES_ENABLED: "true" }).replayPagesEnabled)).toEqual(original);
+    const raised = { maxScopeBytes: 256 * 1024 * 1024, maxScopeEvents: 1_000_000, maxRows: 1_000_000, insertBatch: 5_000 };
+    expect(searchIndexLimits(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_REPLAY_PAGES_ENABLED: "1" }).replayPagesEnabled)).toEqual(raised);
+    expect({ ...REPLAY_SEARCH_INDEX_LIMITS }).toEqual(raised);
+    // The lambda wires the search stage through this switch, never a raised constant.
+    const lambdaSource = readFileSync(here("../lambda.ts"), "utf8");
+    expect(lambdaSource).toContain("limits: searchIndexLimits(env.replayPagesEnabled),");
+    expect(lambdaSource).not.toContain("REPLAY_SEARCH_INDEX_LIMITS");
+  });
 
   test("defaults keep the search index and fan-out off", () => {
     expect(lambdaEnv(base)).toMatchObject({ keyPrefix: "96bulls", searchEnabled: false, replayPagesEnabled: false, fanout: "off" });
