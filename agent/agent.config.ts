@@ -30,6 +30,11 @@ export default defineLayeredAgent({
   instanceType: "m7i.xlarge",
   rootVolumeGiB: 100,
   laneFiles: ["lead-prompt.md", "setup-lane.sh", "share-lead-session.sh"],
+  // Relay workers (module 0.1.7): long-running parallel work, e.g. one worker
+  // per PR stack from the triage. Two at a time on this 4-vCPU / 16 GiB box
+  // (the default is 3); in-process subagents stay the default for
+  // implementation.
+  workers: { maxConcurrent: 2 },
   // The first repo is the lead's working directory and the ledger's
   // repository (LEDGER_REPO=~/build/sessions-pipeline).
   repos: ["AgentWorkforce/sessions-pipeline", "AgentWorkforce/sessions-pipeline-cloud"],
