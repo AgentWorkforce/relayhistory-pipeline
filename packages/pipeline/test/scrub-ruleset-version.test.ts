@@ -32,7 +32,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Then the literal-prefix rules stopped starting after a `-` inside a longer token
   // (they cut SendGrid and other full-shape keys and leaked their start; a glued
   // `word-sk-…` is taken later, whole), and the SendGrid rule moved ahead of them.
-  3: "d30f52154b6a189d763a97c2a026ab6c579bff80cbd4ed6af72304b84b73204e",
+  // Then the glued-prefix pass tries the relay_ rule first (its body may hold a `.`), so
+  // `build-relay_…-sk-….tail` is no longer split at the `.` by the `sk-` rule.
+  3: "e7607073a3afca3db6b015945f0b5fab256202f355b740f515987ec162bf3076",
 };
 
 const read = (rel: string) =>

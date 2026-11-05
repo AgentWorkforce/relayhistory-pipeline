@@ -201,24 +201,30 @@ const TOKEN_START = "(?<![A-Za-z0-9_-])";
  * after every full-shape rule (SendGrid, GitLab, Slack, Capy, relay, JWT, Google), so a
  * key whose body holds `-sk-…` is already redacted whole. A match starts only where a
  * token starts and tries the literal prefix at each `-` in it, so it costs no more than
- * the old `\b` start did. Built on first use from `SECRET_PATTERNS`, so the two lists
+ * the old `\b` start did. The relay_ rule goes first: its body may hold `.`, which no other
+ * prefix rule's does, so a `sk-` rule run first would stop at the `.` and split a glued
+ * `relay_…-sk-….tail` token. Built on first use from `SECRET_PATTERNS`, so the two lists
  * cannot drift apart.
  */
 let gluedPrefixRules: [RegExp, Replacement][] | undefined;
 function redactGluedPrefixes(text: string): string {
-  gluedPrefixRules ??= SECRET_PATTERNS.flatMap((rule): [RegExp, Replacement][] =>
-    typeof rule !== "function" && rule[0].source.startsWith(TOKEN_START)
-      ? [
-          [
-            new RegExp(
-              `${TOKEN_START}[A-Za-z0-9_-]*?-(?:${rule[0].source.slice(TOKEN_START.length)})[A-Za-z0-9_-]*`,
-              rule[0].flags,
-            ),
-            rule[1],
-          ],
-        ]
-      : [],
-  );
+  if (!gluedPrefixRules) {
+    const rules = SECRET_PATTERNS.flatMap((rule): [RegExp, Replacement][] =>
+      typeof rule !== "function" && rule[0].source.startsWith(TOKEN_START)
+        ? [
+            [
+              new RegExp(
+                `${TOKEN_START}[A-Za-z0-9_-]*?-(?:${rule[0].source.slice(TOKEN_START.length)})[A-Za-z0-9_-]*`,
+                rule[0].flags,
+              ),
+              rule[1],
+            ],
+          ]
+        : [],
+    );
+    const isRelay = ([pattern]: [RegExp, Replacement]) => pattern.source.includes("relay_");
+    gluedPrefixRules = [...rules.filter(isRelay), ...rules.filter((r) => !isRelay(r))];
+  }
   return gluedPrefixRules.reduce(
     (out, [pattern, replacement]) => out.replace(pattern, replacement as any),
     text,
