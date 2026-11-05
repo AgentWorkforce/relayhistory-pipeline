@@ -51,8 +51,8 @@ async function consumerFixture(){
  const deps:any={pointer:{db:{...x.db,pool:undefined,end:async()=>{}},lock:async(_scope:any,work:any)=>work(),reader:objectStoreManifestReader(store,{provider:"s3",bucket:"replay-fixture"}),exists:async(k:any)=>(await store.head(objectKey(k)))!==undefined,orgs:prefixOrgResolver,allowPrefix:(p:any,o:any)=>prefixAllowed(bindings,p,o),fanout:droppedFanout}};
  const wire=(over:{store?:ObjectStore;db?:any}={})=>{deps.replay={db:over.db??x.db,store:over.store??store,provider:"s3",bucket:"replay-fixture",prefix:bindings}};
  const lines:any[]=[];
- const run=async()=>{const out=process.stdout.write,err=process.stderr.write;const tap=(w:any)=>(chunk:any,...rest:any[])=>{for(const l of String(chunk).split("\n"))if(l.startsWith("{"))try{const j=JSON.parse(l);if(j.stage==="replay-pages")lines.push(j)}catch{}return w.call(process.stdout,chunk,...rest)};
-  process.stdout.write=tap(out) as any;process.stderr.write=tap(err) as any;
+ const run=async()=>{const out=process.stdout.write,err=process.stderr.write;const tap=(w:any,stream:NodeJS.WriteStream)=>(chunk:any,...rest:any[])=>{for(const l of String(chunk).split("\n"))if(l.startsWith("{"))try{const j=JSON.parse(l);if(j.stage==="replay-pages")lines.push(j)}catch{}return w.call(stream,chunk,...rest)};
+  process.stdout.write=tap(out,process.stdout) as any;process.stderr.write=tap(err,process.stderr) as any;
   try{return await processBatch([{messageId:"fixture",body:JSON.stringify({reconcile:{key}})}],deps)}finally{process.stdout.write=out;process.stderr.write=err}};
  const published=async()=>(await x.db.query<{n:number}>("SELECT count(*)::int n FROM sessions.session_replay_publications WHERE index_key IS NOT NULL")).rows[0]!.n;
  return {x,store,wire,run,lines,published};
