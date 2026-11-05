@@ -63,3 +63,58 @@ GRANT SELECT ON sessions.canonical_feature_journal
 GRANT INSERT,SELECT,UPDATE(dirty) ON sessions.canonical_feature_page_ack,
   sessions.canonical_feature_copy_state
   TO bulls96_canonical_feature_producer;
+
+-- Server-side finish: verifies BOTH contiguous page chains (initial cursor ->
+-- terminal), the exact journal entry, and unchanged authority/profile, then
+-- CAS dirty->complete in one transaction. A skipped or misordered page fails
+-- the chain check — a partial image is never marked done.
+CREATE OR REPLACE FUNCTION sessions.finish_canonical_copy(
+  p_revision bigint,
+  p_source_authority jsonb,
+  p_profile_binding text
+) RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path='' AS $finish$
+DECLARE
+  v_st sessions.canonical_feature_copy_state%ROWTYPE;
+  v_pool text;
+  v_prev_next text;
+  v_last text;
+  v_terminal_ok boolean;
+BEGIN
+  SELECT * INTO v_st FROM sessions.canonical_feature_copy_state
+    WHERE entry_revision=p_revision FOR UPDATE;
+  IF NOT FOUND THEN RETURN false; END IF;
+  IF NOT v_st.dirty THEN RETURN false; END IF;
+  IF v_st.source_authority IS DISTINCT FROM p_source_authority
+     OR v_st.profile_binding IS DISTINCT FROM p_profile_binding
+  THEN RETURN false; END IF;
+
+  -- Each pool's chain must be contiguous: page[i].next_cursor = page[i+1].cursor
+  -- and the LAST page is the terminal (next_cursor IS NULL).
+  FOR v_pool IN SELECT pool FROM (VALUES('event'),('brief'))p(pool)
+  LOOP
+    v_prev_next := NULL;
+    v_terminal_ok := false;
+    FOR v_last IN
+      SELECT cursor,next_cursor FROM sessions.canonical_feature_page_ack
+        WHERE entry_revision=p_revision AND pool=v_pool ORDER BY cursor
+    LOOP
+      IF v_prev_next IS DISTINCT FROM NULL
+         AND v_last IS DISTINCT FROM v_prev_next
+      THEN RETURN false; END IF;          -- a gap/skipped page
+      v_prev_next := v_last;
+    END LOOP;
+    -- Terminal: the last page has next_cursor IS NULL.
+    SELECT count(*)=0 INTO v_terminal_ok
+      FROM sessions.canonical_feature_page_ack
+      WHERE entry_revision=p_revision AND pool=v_pool AND next_cursor IS NOT NULL
+        AND next_cursor NOT IN (SELECT cursor FROM sessions.canonical_feature_page_ack
+          WHERE entry_revision=p_revision AND pool=v_pool)
+        AND next_cursor IS NOT NULL;
+    IF NOT v_terminal_ok THEN RETURN false; END IF;
+  END LOOP;
+  UPDATE sessions.canonical_feature_copy_state SET dirty=false
+    WHERE entry_revision=p_revision;
+  RETURN true;
+END;
+$finish$;
