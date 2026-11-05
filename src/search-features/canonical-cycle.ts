@@ -8,6 +8,8 @@
  * checkpoint is fenced before any write.
  */
 import type { ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
+import { EVENT_FEATURES_TABLE } from "./event-schema.ts";
+import { BRIEF_FEATURES_TABLE } from "./brief-schema.ts";
 import {
   boundPage,
   projectBriefRow,
@@ -136,7 +138,9 @@ export async function copyCanonicalEntry(
             entry.kind === "retire"
               ? (rows.rows as CanonicalBriefTombstone[]) : [], ev);
     if (produced.kind !== "rows") return produced;
-    await ch.insert("session_feature_rows", produced.rows);
+    await ch.insert(
+      kind === "event" ? EVENT_FEATURES_TABLE : BRIEF_FEATURES_TABLE,
+      produced.rows);
     await acks.ackPage({
       entry, kind, cursor: page.cursor ?? "terminal",
       pageSha256: page.pageSha256,
