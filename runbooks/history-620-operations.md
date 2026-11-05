@@ -126,8 +126,11 @@ a quieter moment; nothing needs to be undone.
 
 Use the down only when the kill switch is not enough, that is, before any authority was installed.
 
-Once `20261105029000` (P3b read API, #236) or any other later upstream migration has landed, the
-026000 down refuses until that later file has been rolled back first and its ledger row removed.
+Once any later upstream migration has landed—including 027000 project events,
+028000 semantic state, 029000 P3b reads or 030000 consumer progress—the 026000
+down refuses until every later file has been rolled back in reverse order and
+its ledger row removed. The 030000 named down removes its own row after safely
+dropping the restartable producer-progress state.
 
 The down **refuses** (nothing is dropped) when:
 - any plan, scope version, derived object or model-work function exists

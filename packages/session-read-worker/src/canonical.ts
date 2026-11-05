@@ -7,6 +7,7 @@ import { objectKey } from "../../object-store/src/index.ts";
 import { decompress } from "fzstd";
 import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
 import type { Bindings } from "../../pipeline/src/env.ts";
+import { logLine } from "../../../src/shared/log.ts";
 import {
   canonicalSnapshot,
   CanonicalReadError,
@@ -44,6 +45,7 @@ const tables = new Set([
   "session_links",
   "session_outcomes",
   "session_timing",
+  "session_directory_event_values",
 ]);
 async function boundedJson(
   response: Response,
@@ -114,6 +116,26 @@ function tokenTenant(
     throw new CanonicalReadError("authorization", 401);
   }
 }
+/** PostgREST resolves RPCs by argument NAME, so the body keys must match each SQL
+ * signature exactly. request_session_analysis_cache(p_workspace,p_harness,p_session)
+ * (20261105023000_session_analysis_publications.sql) is the only claim RPC without the
+ * _id suffix; every other one here takes (p_workspace_id,p_harness,p_session_id). */
+export function canonicalRpcBody(
+  rpc: string,
+  identity: Pick<CanonicalIdentity, "workspaceId" | "source" | "sessionId">,
+): Record<string, string> {
+  return rpc === "request_session_analysis_cache"
+    ? {
+        p_workspace: identity.workspaceId,
+        p_harness: identity.source,
+        p_session: identity.sessionId,
+      }
+    : {
+        p_workspace_id: identity.workspaceId,
+        p_harness: identity.source,
+        p_session_id: identity.sessionId,
+      };
+}
 function canonicalMetadataReader(
   env: CanonicalEnv,
   token: string,
@@ -142,11 +164,7 @@ function canonicalMetadataReader(
         "content-profile": "sessions",
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        p_workspace_id: identity.workspaceId,
-        p_harness: identity.source,
-        p_session_id: identity.sessionId,
-      }),
+      body: JSON.stringify(canonicalRpcBody(rpc, identity)),
       signal,
     });
     if (!response.ok) {
@@ -158,6 +176,16 @@ function canonicalMetadataReader(
     }
     return boundedJson(response, signal);
   };
+}
+export { tokenTenant as canonicalTokenTenant };
+export function canonicalClaimReader(
+  env: CanonicalEnv,
+  token: string,
+  signal: AbortSignal,
+  rpc: "session_directory_analysis_cache" | "request_session_analysis_cache",
+  fetcher: typeof fetch = fetch,
+) {
+  return canonicalMetadataReader(env, token, signal, fetcher, rpc);
 }
 export function canonicalPointerReader(
   env: CanonicalEnv,
@@ -357,9 +385,13 @@ export async function canonicalHandle(
       };
     }
     const snapshot = await Promise.race([
-      canonicalSnapshot(deps, identity),
+      // Display values only for the table that returns them; every other table reads as before.
+      canonicalSnapshot(deps, identity, { directoryValues: table === "session_directory_event_values" }),
       deadline,
     ]);
+    // Requested display values are optional on the raw path: their refusal omits those rows only.
+    if ("displayOmitted" in snapshot && snapshot.displayOmitted && table === "session_directory_event_values")
+      console.error(logLine("warn", "canonical display values omitted", { service: "96bulls-session-read-worker", stage: "canonical-read", org_id: identity.orgId, workspace_id: identity.workspaceId, harness: identity.source, session_id: identity.sessionId, reason: snapshot.displayOmitted }));
     if (
       expectedGeneration !== null &&
       expectedGeneration !== snapshot.generation

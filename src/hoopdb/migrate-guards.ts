@@ -163,10 +163,13 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
 ] as const;
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
+  "sessions.ack_session_brief_documents(uuid,jsonb)",
   "sessions.applied_repo_evidence(jsonb,jsonb)",
+  "sessions.backfill_session_brief_documents(integer)",
   "sessions.canonical_remote(text)",
   "sessions.capture_session_replay_pages(text,text,text,text)",
   "sessions.claim_session_analysis_cache()",
+  "sessions.claim_session_brief_documents(uuid,integer)",
   "sessions.claim_session_large_read(uuid,integer)",
   "sessions.clean_root_commit(text)",
   "sessions.discover_session_large_reads()",
@@ -190,6 +193,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.repo_visibility_ids(text,uuid)",
   "sessions.repos_maintain(integer)",
   "sessions.resolve_repo(text,text,text,timestamp with time zone)",
+  "sessions.retry_session_brief_documents(uuid,text)",
   "sessions.retry_session_large_read(text,text,text,text,uuid,text)",
   "sessions.route_session_large_read(text,text,text,text)",
   "sessions.session_directory_project_text(text,text,text)",
@@ -1084,7 +1088,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "a77570f95773e06d507c3aa87bdfb73d1499efeccac48cc4087268efb4217390";
+  "8fcf0f6f2876c08d96dd667f69f6fa1f3a52c8cb7ba0b431e4ddac08243cb434";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

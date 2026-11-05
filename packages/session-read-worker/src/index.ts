@@ -23,6 +23,7 @@
  */
 import pg from "pg";
 import { decompress } from "fzstd";
+import { canonicalAnalysisHandle } from "./analysis-cache.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
 import { canonicalSnapshot, CanonicalReadError } from "../../../src/session-read-api/canonical.ts";
@@ -178,6 +179,7 @@ export interface Overrides {
 }
 
 export async function handle(request: Request, env: Env, ctx: ExecutionContext, overrides: Overrides = {}): Promise<Response> {
+  if (new URL(request.url).pathname.startsWith("/v1/canonical/analyses/")) return canonicalAnalysisHandle(request, env, overrides.fetcher);
   if (new URL(request.url).pathname.startsWith("/v1/canonical/")) return canonicalHandle(request, env, overrides.fetcher);
   // GET only, as the Lambda's Function URL adapter (HEAD is not a read the contract has).
   if (request.method !== "GET") return json(405, "method_not_allowed", "GET only", { allow: "GET" });

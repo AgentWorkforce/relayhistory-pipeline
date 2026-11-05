@@ -119,14 +119,15 @@ describe("unified sessions function-boundary generator", () => {
     await expect(generate(repo, LANES, [...VERIFIERS, VERIFIERS[0]!])).rejects.toThrow("is configured twice");
   });
 
-  test("the empty read-api, canonical-project-events and canonical-feature-consumer slots are present and inert", async () => {
+  test("the remaining empty read-api and canonical-project-events slots are inert; the consumer slot is filled", async () => {
     const slots = LANES.filter((l) => l.migration === null);
-    expect(slots.map((l) => l.lane).sort()).toEqual(["canonical-feature-consumer", "canonical-project-events", "read-api"]);
+    expect(slots.map((l) => l.lane).sort()).toEqual(["canonical-project-events", "read-api"]);
     for (const l of slots) {
       expect([Object.keys(l.functions).length, Object.keys(l.replaces).length, l.prefixes.length, l.grantSources.length]).toEqual([0, 0, 0, 0]);
       expect(l.extraOutputs).toBeUndefined();
     }
     const summary = (await generate(repo, LANES, VERIFIERS)).summary.lanes;
     for (const l of slots) expect(summary[l.lane]).toEqual({ functions: 0, replaces: 0, grants: 0 });
+    expect(summary["canonical-feature-consumer"]).toEqual({ functions: 2, replaces: 0, grants: 1 });
   });
 });
