@@ -308,6 +308,7 @@ test("readonly plan rejects a changed current ledger/source/generation before ca
     p = JSON.parse(x.planText);
   for (const changed of [
     { ledgerSha256: "e".repeat(64) },
+    { ledgerSha256: "de0e2fa02ba662bbc1e0ec23e1f619100d3b7cd824e8d055b04c44076d452729" },
     { sourceSha: "e".repeat(40) },
     { generation: "e".repeat(64) },
     { project: "another" },
@@ -327,9 +328,9 @@ test("backend identity drift refuses the next canonical SQL before submission", 
   expect(x.calls.some((q) => q.includes("CREATE TABLE"))).toBe(false);
 });
 
-test("the live apply ledger pin is the post-462 resume ledger (175 baseline + the 13)", () => {
+test("Window #2 requires the verified post-Window #1 ledger", () => {
   expect(A.ledger).toBe(
-    "de0e2fa02ba662bbc1e0ec23e1f619100d3b7cd824e8d055b04c44076d452729",
+    "3173f2df7f749fd79c340286f3284d91d8f5a8b988b7f1b1a11e01c3a3307641",
   );
 });
 
