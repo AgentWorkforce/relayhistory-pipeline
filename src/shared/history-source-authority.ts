@@ -13,10 +13,8 @@ export interface HistorySourceCapture{
 }
 export type HistorySourceReference=Omit<HistorySourceCapture,"mask">;
 export interface HistorySourceOptions{schemaGeneration:string;profile?:NodeReadProfile;signal?:AbortSignal}
-export interface HistorySummaryPointer{
- kind:"short"|"long";status:"ready"|"disabled"|"quarantined"|"empty"|"unsupported";
- objectKey:string|null;objectSha256:string|null;objectBytes:number|null;keyId:string|null;model:string|null;builtAt:string;
-}
+import type{HistorySummaryPointer}from"./history-public-contract.ts";
+export type{HistorySummaryPointer}from"./history-public-contract.ts";
 const HEX=/^[a-f0-9]{64}$/,UUID=/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/,DEC=/^(0|[1-9][0-9]{0,18})$/,MAX=9223372036854775807n;
 function no(code:string):never{throw Object.assign(Error(code),{code})}
 function positive(v:unknown):v is string{return typeof v==="string"&&DEC.test(v)&&BigInt(v)>0n&&BigInt(v)<=MAX}
