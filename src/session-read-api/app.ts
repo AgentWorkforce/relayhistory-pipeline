@@ -27,11 +27,14 @@
  * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
  * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
  * `directory_not_migrated` until migration 20261105029000 is applied. Never Neon.
- *   GET /v1/sessions/:id/timing, /v1/sessions/output, /v1/digest/daily and the turns
- *   and metadata reads are registered and answer 501 with a reason naming the store
- *   they still need: their relayhistory semantics read tables that neither ClickHouse
- *   nor the directory holds yet (session_timing cache, commit links and outcomes,
- *   conversation_turns, digest cache), and this backend never answers approximately.
+ *   GET /v1/sessions/:id/timing     recorded timing from the session's canonical S3 objects
+ *                                   (session-timing-source.ts, timing.ts), same allowlist.
+ *   GET /v1/sessions/output, /v1/digest/daily and the turns and metadata reads are
+ *   registered and answer 501 with a reason naming the store they still need: their
+ *   relayhistory semantics read tables that neither ClickHouse, S3 nor the directory
+ *   holds yet (per-message and commit facts, session_outcomes, conversation_turns and
+ *   its live writer, the digest narrative cache), and this backend never answers
+ *   approximately.
  *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
@@ -42,6 +45,9 @@ import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vend
 import { CursorError, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
+import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
+import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
+import { TimingInputError } from "./timing.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
   DirectoryError,
@@ -80,6 +86,19 @@ export interface ReadApiDeps {
   directory?: Directory;
   /** READ_API_DIRECTORY_WORKSPACES: workspaces the directory routes serve; "*" = all. Absent/empty = none. */
   directoryWorkspaces?: ReadonlySet<string> | "*";
+  /** Session timing from canonical S3 (session-timing-source.ts); absent = 501 `timing_not_configured`. */
+  timing?: TimingDeps;
+}
+
+export interface TimingDeps {
+  /** Pointer rows of the session, live or tombstoned (tenant-bound, read role). */
+  state(identity: CanonicalIdentity): Promise<{ pointers: number; live: number }>;
+  /** The session's canonical projection; `signal` aborts its object reads at the deadline. */
+  source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows>;
+  /** READ_API_TIMING_ASSUME_NO_TURNS (session-timing-source.ts TimingOptions). */
+  assumeNoTurns: boolean;
+  /** Below Cloud's 4 s read timeout, so a slow session falls back cleanly as a 501. Default 3000. */
+  deadlineMs?: number;
 }
 
 /** READ_API_DIRECTORY_WORKSPACES: unset or blank = none; "*" = every workspace; else comma-separated ids. */
@@ -356,10 +375,15 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   });
 
+  /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing"): void {
+    const allowed = deps.directoryWorkspaces;
+    if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
+  }
+
   /** The canary allowlist, then the directory itself. */
   function directoryFor(identity: VerifiedIdentity): Directory {
-    const allowed = deps.directoryWorkspaces;
-    if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported("directory_workspace_not_enabled");
+    requireCanary(identity, "directory");
     if (!deps.directory) throw unsupported("directory_not_configured");
     return deps.directory;
   }
@@ -463,6 +487,69 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   });
 
+  /**
+   * GET /v1/sessions/:id/timing (relayhistory routes/recall.ts): recorded timing over the
+   * whole stored session, from its canonical S3 objects (session-timing-source.ts), never
+   * Neon. Same canary allowlist as the directory routes. Every case this backend cannot
+   * time exactly is a 501 naming why, and Cloud reads relayhistory instead:
+   *   timing_no_pointers       no Supabase pointer row (Neon may still hold the session)
+   *   timing_turns_unknown     no legacy turn evidence (READ_API_TIMING_ASSUME_NO_TURNS)
+   *   timing_canonical_<r>     the canonical read refused (bounds, digests, generation, deadline)
+   *   timing_<r>               an input the port refuses exactly where the SQL would
+   * A session whose every pointer is tombstoned is erased: the empty timing, as relayhistory
+   * answers once erasure has purged its rows.
+   */
+  app.get("/v1/sessions/:sessionId/timing", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      requireCanary(identity, "timing");
+      const sources = c.req.queries("source") ?? [];
+      const source = sources[0]?.trim();
+      if (sources.length !== 1 || !source) throw bad("source must be supplied exactly once and be non-empty");
+      const timing = deps.timing;
+      if (!timing) throw unsupported("timing_not_configured");
+      const sessionId = c.req.param("sessionId");
+      if (!sessionId || sessionId.length > MAX_ID_CHARS) throw unsupported("timing_session_id");
+      const scope: CanonicalIdentity = { orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId };
+      const state = await timing.state(scope);
+      if (state.pointers === 0) throw unsupported("timing_no_pointers");
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let snapshot: CanonicalRows;
+      if (state.live === 0) snapshot = { rows: [], legacyCoverage: { version: 1, tables: [] } };
+      else {
+        try {
+          snapshot = await Promise.race([
+            timing.source(scope, controller.signal),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => {
+                // Settle the race first: aborting can reject the read synchronously.
+                reject(new CanonicalReadError("deadline"));
+                controller.abort();
+              }, timing.deadlineMs ?? 3000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      const payload = timingFromCanonical(scope, snapshot, { assumeNoTurns: timing.assumeNoTurns });
+      log({
+        route: c.req.routePath,
+        reason: state.live === 0 ? "timing_erased" : "timing_served",
+        turns: snapshot.legacyCoverage ? "legacy" : "assumed_none",
+        events: payload.coverage.eventCount,
+        correlation_id: c.get("correlationId"),
+      });
+      return c.json({ ...payload, correlationId: c.get("correlationId") });
+    } catch (error) {
+      if (error instanceof CanonicalReadError) return fail(c, unsupported(`timing_canonical_${error.reason}`));
+      if (error instanceof TimingInputError) return fail(c, unsupported(`timing_${error.reason}`));
+      return fail(c, error);
+    }
+  });
+
   // Registered so their 501 names what they still need; see the header comment.
   const notMigrated = (reason: string) => async (c: Context) => {
     try {
@@ -473,7 +560,6 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   };
   app.get("/v1/sessions/output", notMigrated("output_not_migrated"));
-  app.get("/v1/sessions/:sessionId/timing", notMigrated("timing_not_migrated"));
   app.get("/v1/sessions/:sessionId/turns", notMigrated("turns_not_migrated"));
   app.get("/v1/sessions/:sessionId/metadata", notMigrated("turns_not_migrated"));
   app.get("/v1/digest/daily", notMigrated("digest_not_migrated"));
