@@ -24,7 +24,7 @@ for (const role of ["anon", "authenticated", "service_role",
     `DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='${role}')` +
     ` THEN CREATE ROLE ${role} NOLOGIN; END IF; END $$;`);
 // Apply the REAL #230 025000 writer migration (vendored snapshot at
-// 226410e721beca5885082382094d1b38e3318c64) + the companion state DDL.
+// 5638186f32377c6ef86451d66bd5f50011ff2a2f) + the companion state DDL.
 // Self-contained: read the vendored fixture, no shell/out-of-tree paths.
 const writer = readFileSync(
   "scripts/fixtures/230-writer-20261105025000.sql", "utf8")
