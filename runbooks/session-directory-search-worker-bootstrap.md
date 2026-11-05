@@ -349,6 +349,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261101050000_session_directory_list.sql`           | table sessions.session_directory_agents                                                                                 |
 | `upstream:20261102000000_session_briefs.sql`                   | table sessions.session_briefs                                                                                           |
 | `upstream:20261102010000_session_directory_canonical_ids.sql`  | column sessions.session_index.canonical_session_id                                                                      |
+| `upstream:20261105024000_session_brief_documents.sql`          | table sessions.session_brief_document_outbox                                                                            |
 | `upstream:20261104022000_session_ingest_ledger.sql`            | table sessions.ingest_batches                                                                                           |
 | `upstream:20261104021000_session_directory_event_metadata.sql` | table sessions.session_directory_event_times |
 | `upstream:20261105020000_session_replay_pages.sql` | table sessions.session_replay_publications |
@@ -369,6 +370,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261104053000_ingest_first_ack_seats.sql` | table sessions.ingest_receipt_seat_clock |
 | `upstream:20261105025000_canonical_feature_journal.sql` | table sessions.canonical_feature_journal |
 | `upstream:20261105026000_canonical_history_lineage.sql` | table sessions.ingest_history_carriers |
+| `upstream:20261105030000_canonical_feature_consumer_acks.sql` | table sessions.canonical_feature_copy_state |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
@@ -425,7 +427,7 @@ RPC. Real PostgreSQL tests show both sides:
 | PostgREST RPC, `Content-Profile: sessions` (so `sessions` is an exposed schema) | the search Worker, via `authenticator` role switching                                                                                                                                                                                                                                                          | `src/proof/aws/checks.ts` (`/rpc/search_session_directory`), #73 real-PostgREST tests |
 | `authenticator` memberships                                                     | `session_directory_search_worker` (NOINHERIT, no ADMIN: the Worker contract); on Supabase also the platform's `anon`, `authenticated`, `service_role`                                                                                                                                                          | migration 20261030020000 role guard; Supabase platform defaults                       |
 | USAGE on `sessions`                                                             | `authenticated`, `service_role` (20261025000000), `session_directory_search_worker` (20261030020000); `anon` has none                                                                                                                                                                                          | the migrations; PGlite mapping                                                        |
-| EXECUTE (effective, after a clean migrate)                                      | Worker: only `search_session_directory`, `session_directory_pointers`, `session_directory_readiness`, `session_brief`. `authenticated`: `jwt_org_id`, `jwt_workspace_ids`, `member_of`, `repo_group`, `repo_live`, `repo_visibility_ids`. `service_role`: every function except the Worker's four. `anon`: none. PUBLIC: none. | `src/hoopdb/sessions-function-acl.json` (exact, CI-checked)                           |
+| EXECUTE (effective, after a clean migrate)                                      | Worker: only the exact JWT-scoped read RPCs in the manifest. `authenticated`: `jwt_org_id`, `jwt_workspace_ids`, `member_of`, `repo_group`, `repo_live`, `repo_visibility_ids`. `service_role`: only the exact runtime RPCs in the manifest. `anon`: none. PUBLIC: none. | `src/hoopdb/sessions-function-acl.json` (exact, CI-checked)                           |
 
 So the "(B) `sessions` is unexposed and no untrusted role has USAGE" alternative **cannot
 hold**: exposure is by design, and `authenticated` holds USAGE. Exposure is not the

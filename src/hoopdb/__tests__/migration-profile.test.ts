@@ -1503,24 +1503,46 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   };
   const platformList = [...SUPABASE_PLATFORM_SUPERUSERS];
 
-  test("620 down then reapply through the real migrator (supabase, global-default-revoke): the down commits, the next run reapplies 026000 with no function_acl_drift and the marker passes", async () => {
+  test("window-two down/reapply through the real migrator: later migrations refuse out-of-order rollback and the next run restores the gap-free prefix", async () => {
     const db = await supabaseLike();
     await db.exec(OWNER_FN_DEFAULT_REVOKE);
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
+    const B = "upstream:20261105024000_session_brief_documents.sql";
+    const J = "upstream:20261105025000_canonical_feature_journal.sql";
     const L = "upstream:20261105026000_canonical_history_lineage.sql";
+    const C = "upstream:20261105030000_canonical_feature_consumer_acks.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
-    expect(await names()).toContain(L);
+    const rollback = (name: string) =>
+      db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8"));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C]));
     expect(await passed()).toBe(true);
-    // The named down, committed as the owner (not inside a test rollback).
-    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql"), "utf8"));
+    const outOfOrder = await failure(
+      rollback("20261105024000_session_brief_documents.down.sql"),
+    );
+    expect(outOfOrder?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C]));
+    // Later lanes roll back first and remove their own ledger rows; only then
+    // can the next down preserve a gap-free applied prefix.
+    await rollback("20261105030000_canonical_feature_consumer_acks.down.sql");
+    expect(await names()).not.toContain(C);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBeNull();
+    await rollback("20261105026000_canonical_history_lineage.down.sql");
     expect(await names()).not.toContain(L);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBeNull();
-    // The very next migrate reapplies 026000; the post-validation exact-ACL check finds no drift.
+    await rollback("20261105025000_canonical_feature_journal.down.sql");
+    expect(await names()).not.toContain(J);
+    await rollback("20261105024000_session_brief_documents.down.sql");
+    expect(await names()).not.toContain(B);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBeNull();
+    // The very next migrate reapplies 024000, 025000, 026000 and 030000; the post-validation
+    // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toContain(L);
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C]));
     expect(await passed()).toBe(true);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBe("sessions.session_brief_document_scopes");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBe("sessions.ingest_history_switch");
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_copy_state");
     // And a no-op rerun stays clean.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
   });
