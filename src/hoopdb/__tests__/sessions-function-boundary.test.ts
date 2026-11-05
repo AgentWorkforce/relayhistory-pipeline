@@ -125,11 +125,16 @@ describe("unified sessions function-boundary generator", () => {
     await expect(generate(repo, LANES, [...VERIFIERS, VERIFIERS[0]!])).rejects.toThrow("is configured twice");
   });
 
-  test("remaining empty slots claim no functions, prefixes or outputs", () => {
-    for(const slot of LANES.filter(l=>l.migration===null)){
+  test("required lanes are present and remaining empty slots are inert", async () => {
+    expect(LANES.map(l=>l.lane)).toEqual(expect.arrayContaining(["ingest-history","read-api","canonical-project-events","canonical-feature-consumer"]));
+    const slots=LANES.filter(l=>l.migration===null);
+    for(const slot of slots){
       expect(slot.functions).toEqual({});expect(slot.replaces).toEqual({});
       expect(slot.prefixes).toEqual([]);expect(slot.grantSources).toEqual([]);
       expect(slot.extraOutputs).toBeUndefined();
     }
+    const summary=(await generate(repo,LANES,VERIFIERS)).summary.lanes;
+    for(const slot of slots)expect(summary[slot.lane]).toEqual({functions:0,replaces:0,grants:0});
+
   });
 });
