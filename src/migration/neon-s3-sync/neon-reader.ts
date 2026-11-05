@@ -167,15 +167,12 @@ export async function catalogPage(
   return rows;
 }
 
-/** Whether Neon still has anything to export for a group, including legacy-only evidence. */
+/** Whether Neon still has anything to export for a group (a rollup or a catalog row). */
 export async function groupExistsInNeon(db: Queryable, orgId: string, sessionId: string): Promise<boolean> {
   const { rows } = await db.query(
     `SELECT 1 FROM sessions.session_rollups WHERE org_id = $1 AND session_id = $2
      UNION ALL
      SELECT 1 FROM sessions.session_catalog WHERE org_id = $1 AND session_id = $2
-     UNION ALL SELECT 1 FROM sessions.conversation_turns WHERE org_id=$1 AND session_id=$2
-     UNION ALL SELECT 1 FROM sessions.session_links WHERE org_id=$1 AND session_id=$2
-     UNION ALL SELECT 1 FROM sessions.session_outcomes WHERE org_id=$1 AND session_id=$2
      LIMIT 1`,
     [orgId, sessionId],
   );

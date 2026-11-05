@@ -147,8 +147,8 @@ describe("configuration", () => {
   };
 
   test("defaults keep the search index and fan-out off", () => {
-    expect(lambdaEnv(base)).toMatchObject({ keyPrefix: "96bulls", searchEnabled: false, replayPagesEnabled: false, fanout: "off" });
-    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_REPLAY_PAGES_ENABLED: "1", PIPELINE_FANOUT: "postgres" })).toMatchObject({ searchEnabled: true, replayPagesEnabled: true, fanout: "postgres" });
+    expect(lambdaEnv(base)).toMatchObject({ keyPrefix: "96bulls", searchEnabled: false, fanout: "off" });
+    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", PIPELINE_FANOUT: "postgres" })).toMatchObject({ searchEnabled: true, fanout: "postgres" });
   });
 
   test("refuses the single-tenant layout and unknown fan-out", () => {
@@ -214,5 +214,3 @@ describe("brief schedule invocation", () => {
     }
   });
 });
-
-test("analysis cache defaults off before runtime init and rejects invalid readonly source secret shape",async()=>{const saved=process.env.SESSION_ANALYSIS_CACHE_ENABLED;try{for(const value of [undefined,"0","true"]){if(value===undefined)delete process.env.SESSION_ANALYSIS_CACHE_ENABLED;else process.env.SESSION_ANALYSIS_CACHE_ENABLED=value;expect(await handler({analysisCache:true})).toEqual({ok:true});expect(await handler({analysisCacheReconcile:true})).toEqual({ok:true})}expect(()=>parseSecret(JSON.stringify({hoopdb_url:"postgres://fixture",analysis_source_readonly_url:"mysql://fixture"}))).toThrow(/readonly_url/)}finally{if(saved===undefined)delete process.env.SESSION_ANALYSIS_CACHE_ENABLED;else process.env.SESSION_ANALYSIS_CACHE_ENABLED=saved}});

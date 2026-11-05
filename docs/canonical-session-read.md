@@ -38,7 +38,7 @@ sets are reread after hydration; drift refuses the read. No incomplete/partial
 projection is returned as a complete session.
 
 Query parameters are `workspace`, `source`, `table`, `limit`, `order`, and opaque
-`cursor`, `view` and `maxContent`. A source is required. Tables are the six existing projection tables plus the three explicitly scoped legacy evidence tables described in canonical-legacy-source.md.
+`cursor`, `view` and `maxContent`. A source is required. Tables are the six existing projection tables.
 Convergence rows sort by exact timestamp/event identity in either direction.
 Cursors bind tenant/session/source, source generation, table, order, view, content limit and offset.
 A changed generation requires restarting pagination; it never silently continues

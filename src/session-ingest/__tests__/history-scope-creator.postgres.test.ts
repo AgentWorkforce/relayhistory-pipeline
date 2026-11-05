@@ -2,7 +2,20 @@ import { afterAll, beforeAll, expect, test, setDefaultTimeout } from "bun:test";
 import pg from "pg";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { sqlHistoryMaskStore, updateHistoryMask } from "../../shared/history-mask.ts";
+
+// Minimal SQL-only mask builder (history-mask-v1): leaves sorted by sha256(recordId); a 16-way
+// root node above 500 records. Mirrors ingest_history_mask_register's own validation.
+import { createHash } from "node:crypto";
+const shaHex = (s: string) => createHash("sha256").update(s).digest("hex");
+async function registerMask(reg: (doc: unknown) => Promise<any>, orgId: string, workspaceId: string, recordIds: string[]) {
+  const sorted = [...recordIds].sort((a, b) => (shaHex(a) < shaHex(b) ? -1 : 1));
+  const leaf = (prefix: string, ids: string[]) => reg({ protocol: "history-mask-v1", orgId, workspaceId, prefix, kind: "leaf", count: String(ids.length), items: ids.map((recordId) => ({ recordId, winner: null })) });
+  if (sorted.length <= 500) { const r = await leaf("", sorted); return { sha256: r.sha256 as string, count: String(sorted.length) }; }
+  const items: { digit: string; sha256: string }[] = [];
+  for (const d of "0123456789abcdef") { const ids = sorted.filter((x) => shaHex(x)[0] === d); if (ids.length) items.push({ digit: d, sha256: (await leaf(d, ids)).sha256 }); }
+  const r = await reg({ protocol: "history-mask-v1", orgId, workspaceId, prefix: "", kind: "node", count: String(sorted.length), items });
+  return { sha256: r.sha256 as string, count: String(sorted.length) };
+}
 setDefaultTimeout(120000);
 // Real PostgreSQL races for the production scope creator (PGlite has one connection).
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
@@ -33,7 +46,7 @@ async function scope() {
   const row = { org_id: org, workspace_id: ws, user_id: "race-user", harness: "claude", session_id: identity.sessionId, machine_id: "srv_origin", created_at: "2026-11-01T00:00:00Z", last_activity_at: "2026-11-01T00:00:00Z", storage_provider: "s3", bucket: "race-fixture", manifest_key: "96bulls/" + org + "/v1/ws=" + ws + "/m=srv_origin/h=claude/d=2026/11/01/s=" + identity.sessionId + "/manifest.json", content_sha256: "\\x" + "a".repeat(64), raw_format: "ndjson", revision: 1, trace_id: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18" };
   await pool.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([row])]);
   await pool.query("INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at) VALUES($1,$2,$3,$4,now(),now())", [org, ws, "claude", identity.sessionId]);
-  const mask = await updateHistoryMask(sqlHistoryMaskStore(runner() as any, gen, org, ws), { orgId: org, workspaceId: ws }, null, [{ recordId: "k1", winner: null }]);
+  const mask = await registerMask((doc) => runner().query("SELECT sessions.ingest_history_mask_register($1::jsonb) r", [JSON.stringify({ generation: gen, document: doc })]).then((x: any) => x.rows[0].r), org, ws, ["k1"]);
   const anchor = (g: string) => "96bulls/" + org + "/upload-generations/g=" + g + "/v1/ws=" + ws + "/m=history_scope/h=claude/d=2026/11/01/s=" + identity.sessionId + "/publications/" + g + "/manifest.json";
   return { identity, mask, anchor };
 }

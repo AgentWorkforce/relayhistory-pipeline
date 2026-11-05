@@ -8,7 +8,6 @@ import {
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import {
   normalizeRelayhistoryRecords,
-  isLegacyRelayhistoryRecord,
   parseRelayhistoryRecord,
   relayhistoryExportProvenance,
   type RelayhistoryStreamRecord,
@@ -21,7 +20,6 @@ import {
   isPublicationManifestRest,
   parseUploadGenerationPrefix,
   type ManifestV1,
-  type ChunkEntry,
   type ObjectStore,
 } from "../../packages/object-store/src/index.ts";
 import {
@@ -47,16 +45,13 @@ import {
   canonicalManifestIdentity,
   manifestUserId as admittedManifestUserId,
 } from "../shared/manifest-identity.ts";
-import {boundedObjectStore} from "../shared/bounded-object-store.ts";
 interface SessionScope {
   orgId: string;
   workspaceId: string;
   harness: string;
   sessionId: string;
 }
-import{historyRecordVisible,assertHistoryMaskCoverage,type HistoryLogicalMask}from"../shared/history-visibility.ts";
 interface SearchIndexDeps {
-  historyMask?:HistoryLogicalMask;
   reader: ManifestReader;
   store: ObjectStore;
   prefixFor: (orgId: string) => string;
@@ -102,30 +97,22 @@ export async function readManifestRecords(
   return rows;
 }
 
-export interface CanonicalStreamOptions {
-  maxRecords?:number; maxRawBytes?:number; signal?:AbortSignal;
-}
-export interface VerifiedCanonicalChunk {
-  key:string; entry:ChunkEntry; stored:Uint8Array; raw:Uint8Array; text:string;
-}
-export interface CanonicalRecordLine { raw:string; record:RelayhistoryStreamRecord|null }
-/** One chunk verified before any record is yielded. Raw text is retained exactly
- * so a filtered rewrite never rounds numeric literals or changes string escapes. */
-export async function* streamVerifiedManifestChunks(
-  manifest:ManifestV1,store:ObjectStore,prefix:string,
-  decompress:(stored:Uint8Array,maxOutputLength:number)=>Uint8Array,
-  options:CanonicalStreamOptions={},
-):AsyncGenerator<VerifiedCanonicalChunk>{
+/** Bounded chunk-by-chunk reader; proofs need not retain full session payloads. */
+export async function* streamManifestRecords(
+  manifest: ManifestV1,
+  store: ObjectStore,
+  prefix: string,
+  decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
+  maxRecords = Number.POSITIVE_INFINITY,
+): AsyncGenerator<RelayhistoryStreamRecord> {
   if (manifest.raw.format !== "ndjson")
     throw new PipelineError(
       "raw_format_unsupported",
       "only ndjson raw is indexed",
       false,
     );
-  let rawBytes = 0;
-  if(options.signal)store=boundedObjectStore(store,options.signal);
+  let records = 0;
   for (const { entry, key } of chunkKeys(manifest, { prefix })) {
-    options.signal?.throwIfAborted();
     if (
       entry.stored_bytes > MAX_CHUNK_BYTES ||
       (entry.stored_raw_bytes ?? entry.bytes) > MAX_CHUNK_BYTES
@@ -139,7 +126,6 @@ export async function* streamVerifiedManifestChunks(
     try {
       stored = await readCapped(await store.get(key), entry.stored_bytes);
     } catch (error) {
-      options.signal?.throwIfAborted();
       if ((error as { code?: unknown } | null)?.code === "not_found")
         throw new PipelineError(
           "chunk_missing",
@@ -152,7 +138,6 @@ export async function* streamVerifiedManifestChunks(
         true,
       );
     }
-    options.signal?.throwIfAborted();
     if (
       !stored ||
       stored.byteLength !== entry.stored_bytes ||
@@ -174,12 +159,6 @@ export async function* streamVerifiedManifestChunks(
         false,
       );
     }
-    options.signal?.throwIfAborted();
-    rawBytes += raw.byteLength;
-    if(raw.byteLength>MAX_CHUNK_BYTES || rawBytes>(options.maxRawBytes??Number.POSITIVE_INFINITY))
-      throw new PipelineError("scope_too_large","actual canonical bytes exceed scope limit",false);
-    if (entry.stored_raw_bytes!==undefined && raw.byteLength!==entry.stored_raw_bytes)
-      throw new PipelineError("chunk_digest_mismatch","a raw chunk has the wrong decoded length",false);
     if (entry.raw_sha256 && sha256(raw) !== entry.raw_sha256)
       throw new PipelineError(
         "chunk_digest_mismatch",
@@ -198,40 +177,18 @@ export async function* streamVerifiedManifestChunks(
         false,
       );
     }
-    yield {key:String(key),entry,stored,raw,text};
+    for (const line of text.split("\n"))
+      if (line) {
+        if (records >= maxRecords)
+          throw new PipelineError(
+            "scope_too_large",
+            "actual canonical record count exceeds scope limit",
+            false,
+          );
+        records += 1;
+        yield parseRelayhistoryRecord(line);
+      }
   }
-}
-/** The reader and rewrite share exactly one canonical line parser. Blank LF
- * separators are preserved for rewrites, but do not become logical records. */
-export function* canonicalChunkLines(chunk:Pick<VerifiedCanonicalChunk,"text">):Generator<CanonicalRecordLine>{
-  let at=0;
-  while(at<chunk.text.length){
-    const lf=chunk.text.indexOf("\n",at),end=lf<0?chunk.text.length:lf+1;
-    const raw=chunk.text.slice(at,end),line=lf<0?raw:raw.slice(0,-1);at=end;
-    yield {raw,record:line?parseRelayhistoryRecord(line):null};
-  }
-}
-export async function* streamManifestRecordLines(
-  manifest:ManifestV1,store:ObjectStore,prefix:string,
-  decompress:(stored:Uint8Array,maxOutputLength:number)=>Uint8Array,
-  options:CanonicalStreamOptions={},
-):AsyncGenerator<CanonicalRecordLine & {record:RelayhistoryStreamRecord}>{
-  let records=0;
-  for await(const chunk of streamVerifiedManifestChunks(manifest,store,prefix,decompress,options))
-    for(const line of canonicalChunkLines(chunk))if(line.record){
-      options.signal?.throwIfAborted();
-      if(records>=(options.maxRecords??Number.POSITIVE_INFINITY))
-        throw new PipelineError("scope_too_large","actual canonical record count exceeds scope limit",false);
-      records+=1;yield {raw:line.raw,record:line.record};
-    }
-}
-/** Backwards-compatible record-only view over the shared verified raw iterator. */
-export async function* streamManifestRecords(
-  manifest:ManifestV1,store:ObjectStore,prefix:string,
-  decompress:(stored:Uint8Array,maxOutputLength:number)=>Uint8Array,
-  maxRecords=Number.POSITIVE_INFINITY,
-):AsyncGenerator<RelayhistoryStreamRecord>{
-  for await(const line of streamManifestRecordLines(manifest,store,prefix,decompress,{maxRecords}))yield line.record;
 }
 
 type Json = Record<string, unknown>;
@@ -285,7 +242,6 @@ export function projectedToNeonRow(
 }
 
 export interface ScopeRead {
-  records: RelayhistoryStreamRecord[];
   projectionRows: Array<{ table: string; row: Record<string, unknown> }>;
   rows: IndexRow[];
   manifests: number;
@@ -398,7 +354,6 @@ export async function readCanonicalScope(
       events: null,
       sources: [],
       projectionRows: [],
-      records: [],
     };
 
   let parsedRecords = 0;
@@ -427,7 +382,6 @@ export async function readCanonicalScope(
           events: null,
           sources: [],
           projectionRows: [],
-          records: [],
         };
       if (error instanceof PipelineError && error.retryable) throw error;
       complete = false;
@@ -437,22 +391,11 @@ export async function readCanonicalScope(
     }
   }
 
-  // Retain independent physical copies for privacy/fallback, but project only
-  // the globally current delivery winner, even when it lives in another scope.
-  if(deps.historyMask){
-    if(deps.historyMask.scope.orgId!==scope.orgId||deps.historyMask.scope.workspaceId!==scope.workspaceId||deps.historyMask.scope.source!==scope.harness||deps.historyMask.scope.sessionId!==scope.sessionId)
-      throw new PipelineError("history_visibility_scope","logical source mask belongs to another scope",false);
-    for(const part of parts)part.records=part.records.filter(r=>historyRecordVisible(r,part.userId,deps.historyMask!));
-    assertHistoryMaskCoverage(deps.historyMask,parts.flatMap(part=>part.records));
-  }
-
   // Fold every copy together; a conflicting copy (same revision, different
   // bytes) falls back to folding each manifest on its own, without deletes.
-  let canonicalRecords: RelayhistoryStreamRecord[] = [];
   let groups: { records: RelayhistoryStreamRecord[]; part: Part }[];
   try {
     const all = normalizeRelayhistoryRecords(parts.flatMap((p) => p.records));
-    canonicalRecords = all;
     const owner = new Map<string, Part>();
     for (const part of parts)
       for (const r of part.records)
@@ -490,11 +433,7 @@ export async function readCanonicalScope(
   const ownerByEvent = new Map<string, { userId: string; sessionId: string }>();
   for (const part of parts)
     for (const record of part.records) {
-      if (
-        record.kind === CONVERGENCE_EVENT_KIND ||
-        isLegacyRelayhistoryRecord(record)
-      )
-        continue;
+      if (record.kind === CONVERGENCE_EVENT_KIND) continue;
       const identity = JSON.stringify([
         deliveryMachine(scope.workspaceId, record.origin_id),
         record.record_id,
@@ -578,7 +517,6 @@ export async function readCanonicalScope(
     reasons.push("directory_event_metadata_invalid");
   }
   return {
-    records: canonicalRecords,
     projectionRows: [
       ...catalogRows,
       ...[...metadataByKey.values()].map(

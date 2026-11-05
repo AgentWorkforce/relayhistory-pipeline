@@ -41,10 +41,6 @@ import{derivedSchemaBuildPlugin}from "./derived-schema-build.ts";
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
   searchIndex?: boolean;
-  /** Default off. Requires separately reviewed normalized-prefix write/KMS permission and publication migration. */
-  replayPages?: boolean;
-  /** Dormant full v1 analysis-cache worker; separate readonly source secret required. */
-  analysisCache?: boolean;
   /** Lambda concurrency cap from the queue (2-10). Default 4. */
   maxConcurrency?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
@@ -89,7 +85,6 @@ export const SESSION_PIPELINE_RESOURCES = [
 export const SESSION_BRIEF_RESOURCES = ["session-brief-schedule", "session-brief-permission"] as const;
 /** The brief tick runs this often. */
 export const BRIEF_SCHEDULE_MINUTES = 1;
-export const SESSION_ANALYSIS_CACHE_RESOURCES=["session-analysis-cache-schedule","session-analysis-cache-permission","session-analysis-reconcile-schedule","session-analysis-reconcile-permission"] as const;
 
 /** Function timeout; the queue's visibility timeout is six times this (AWS guidance for SQS sources). */
 export const FUNCTION_TIMEOUT_SECONDS = 300;
@@ -131,10 +126,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
-  if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
-  if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
@@ -278,8 +271,6 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_PIPELINE_SECRET_ARN: i.names.secret,
     SESSION_PIPELINE_QUEUE_URL: i.names.queueUrl,
     SEARCH_INDEX_ENABLED: i.p.searchIndex ? "1" : "0",
-    SESSION_REPLAY_PAGES_ENABLED: i.p.replayPages ? "1" : "0",
-    SESSION_ANALYSIS_CACHE_ENABLED:i.p.analysisCache?"1":"0",
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",
@@ -330,7 +321,7 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
  * and brief rules, this account) and the function's own role (the reconcile chain),
  * all `lambda:InvokeFunction` only. Nothing public, no Function URL action.
  */
-export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; analysisRuleArn?:string; analysisReconcileRuleArn?:string; roleArn: string }) {
+export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; roleArn: string }) {
   return [
     {
       id: "session-reconcile-permission",
@@ -362,8 +353,6 @@ export function sessionPipelinePermissions(i: { accountId: string; functionName:
         sourceAccount: i.accountId,
       },
     },
-    ...(i.analysisReconcileRuleArn?[{id:"session-analysis-reconcile-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisReconcileRuleArn,sourceAccount:i.accountId}}]:[]),
-    ...(i.analysisRuleArn?[{id:"session-analysis-cache-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisRuleArn,sourceAccount:i.accountId}}]:[]),
   ] as const;
 }
 
@@ -380,15 +369,6 @@ export function briefScheduleProps(i: { names: SessionPipelineNames; functionArn
     targets: [{ Id: "session-pipeline", Arn: i.functionArn, Input: JSON.stringify({ brief: true }) }],
     tags: i.tags,
   };
-}
-
-/** Disabled by default; source definition alone does not enable a running rule. */
-export function analysisCacheScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
- return {name:i.names.rule+"-analysis-cache",description:"96bulls bounded demand analysis-cache refresh",scheduleExpression:"rate(1 minute)",state:i.p.analysisCache?"ENABLED" as const:"DISABLED" as const,targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({analysisCache:true})}],tags:i.tags};
-}
-
-export function analysisReconcileScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
- return {name:i.names.rule+"-analysis-backfill",description:"96bulls bounded analysis-cache source discovery",scheduleExpression:"rate(30 minutes)",state:i.p.analysisCache?"ENABLED" as const:"DISABLED" as const,targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({analysisCacheReconcile:true})}],tags:i.tags};
 }
 
 /** Step 1, before the transcripts key and bucket: the function (and so its role) must exist first. */
@@ -448,15 +428,11 @@ export const sessionPipelineWiring = (
       tags: i.tags("session-pipeline"),
     } as never);
     const briefRule = yield* AWS.EventBridge.Rule("session-brief-schedule", briefScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
-    const analysisRule=yield* AWS.EventBridge.Rule("session-analysis-cache-schedule",analysisCacheScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
-    const analysisReconcileRule=yield* AWS.EventBridge.Rule("session-analysis-reconcile-schedule",analysisReconcileScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
     for (const { id, props } of sessionPipelinePermissions({
       accountId: i.accountId,
       functionName: i.fn.functionName as unknown as string,
       ruleArn: (rule as unknown as { ruleArn: string }).ruleArn,
       briefRuleArn: (briefRule as unknown as { ruleArn: string }).ruleArn,
-      analysisRuleArn:(analysisRule as unknown as {ruleArn:string}).ruleArn,
-      analysisReconcileRuleArn:(analysisReconcileRule as unknown as {ruleArn:string}).ruleArn,
       roleArn,
     }))
       yield* AWS.Lambda.Permission(id, props as never);

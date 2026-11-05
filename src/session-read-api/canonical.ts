@@ -1,11 +1,8 @@
 import {isManifestRest} from "../../packages/object-store/src/index.ts";
-import { nodeReadBudget, type NodeReadProfile } from "./node-read-profile.ts";
 /** Canonical S3 session projections, shared with the live S3 -> CH writer.
  * The successful claim-bound pointer RPC is the authentication boundary. No
  * object is read from an unverified JWT claim or caller-supplied object key.
  */
-import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS, ARTIFACT_MAX_SOURCE_POINTERS } from "./canonical-artifact.ts";
-import { canonicalLegacy } from "./canonical-legacy.ts";
 import { createHash } from "node:crypto";
 import { readCanonicalScope, manifestUserId } from "./canonical-projection.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
@@ -33,8 +30,6 @@ export interface CanonicalPointer {
   manifest_key: string;
   content_sha256: string;
   raw_format: string;
-  /** Available to the Node catalog capture; legacy compact pointer RPC omits it. */
-  manifest_etag?: string | null;
   revision: number | string;
   deleted_at: null;
 }
@@ -47,9 +42,7 @@ export class CanonicalReadError extends Error {
     this.name = "CanonicalReadError";
   }
 }
-import type{HistoryLogicalMask}from"../shared/history-visibility.ts";
 export interface CanonicalDeps {
-  historyMask?:HistoryLogicalMask;
   pointers(identity: CanonicalIdentity): Promise<CanonicalPointer[]>;
   store: ObjectStore;
   provider: string;
@@ -64,9 +57,8 @@ function checked(
   pointers: CanonicalPointer[],
   identity: CanonicalIdentity,
   deps: CanonicalDeps,
-  maxPointersExclusive = MAX_POINTERS,
 ): CanonicalPointer[] {
-  if (!Array.isArray(pointers) || pointers.length >= maxPointersExclusive)
+  if (!Array.isArray(pointers) || pointers.length >= MAX_POINTERS)
     throw new CanonicalReadError("pointer_bound");
   const seen = new Set<string>();
   for (const p of pointers) {
@@ -94,7 +86,7 @@ function checked(
   }
   return pointers;
 }
-export function canonicalSourceGeneration(
+function generation(
   pointers: CanonicalPointer[],
   identity: CanonicalIdentity,
 ): string {
@@ -118,25 +110,15 @@ export function canonicalSourceGeneration(
     )
     .digest("hex");
 }
-export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity) {
-  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS);
-}
-/** Trusted Node producer only. Never called by the raw Worker request path. */
-export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, profile: NodeReadProfile = "standard") {
-  const budget=nodeReadBudget(profile);
-  return snapshotWithLimits(deps, identity, budget.sourceBytes, budget.sourceRecords, ARTIFACT_MAX_SOURCE_POINTERS + 1,budget.projectedRows);
-}
-async function snapshotWithLimits(
-  deps: CanonicalDeps, identity: CanonicalIdentity,
-  maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number, maxRows=500000,
+export async function canonicalSnapshot(
+  deps: CanonicalDeps,
+  identity: CanonicalIdentity,
 ) {
-  const pointers = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive),
-    version = canonicalSourceGeneration(pointers, identity);
+  const pointers = checked(await deps.pointers(identity), identity, deps),
+    version = generation(pointers, identity);
   if (!pointers.length)
     return {
       generation: version,
-      exists: false,
-      legacyCoverage: null,
       rows: [] as Array<{ table: string; row: Record<string, unknown> }>,
     };
   const byKey = new Map(pointers.map((p) => [p.manifest_key, p]));
@@ -155,7 +137,6 @@ async function snapshotWithLimits(
     [...byKey.keys()],
     {
       store: deps.store,
-      historyMask:deps.historyMask,
       prefixFor: () =>
         deps.prefix.PIPELINE_ORG_FROM_PREFIX === "true"
           ? [deps.prefix.PIPELINE_KEY_PREFIX, identity.orgId]
@@ -175,7 +156,6 @@ async function snapshotWithLimits(
           // content_sha256 is the RAW CHUNK HASH CHAIN, not SHA256(manifest bytes).
           if (
             m.raw.content_sha256 !== digest(p.content_sha256) ||
-            (p.manifest_etag != null && read.etag !== p.manifest_etag) ||
             manifestUserId(m) !== p.user_id ||
             String(m.revision) !== String(p.revision) ||
             canonical.sessionId !== p.session_id ||
@@ -198,9 +178,9 @@ async function snapshotWithLimits(
       },
     },
     {
-      maxScopeBytes,
-      maxScopeEvents,
-      maxRows,
+      maxScopeBytes: CANONICAL_SCOPE_BYTES,
+      maxScopeEvents: 100000,
+      maxRows: 500000,
       insertBatch: 5000,
     },
     0,
@@ -208,14 +188,8 @@ async function snapshotWithLimits(
   );
   if (!result.complete || result.directorySessionId !== identity.sessionId)
     throw new CanonicalReadError("canonical_projection_incomplete");
-  const fresh = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive);
-  if (canonicalSourceGeneration(fresh, identity) !== version)
+  const fresh = checked(await deps.pointers(identity), identity, deps);
+  if (generation(fresh, identity) !== version)
     throw new CanonicalReadError("source_generation_changed");
-  const legacy = canonicalLegacy(result.records, identity);
-  return {
-    generation: version,
-    exists: true,
-    legacyCoverage: legacy.coverage,
-    rows: [...result.projectionRows, ...legacy.rows],
-  };
+  return { generation: version, rows: result.projectionRows };
 }

@@ -738,14 +738,6 @@ function zstdEncoder(): Promise<ZstdCompress | null> {
   return zstd;
 }
 
-/** The exact encoder used by sealRawChunk, without scrubbing or storage. Only
- * verified already-scrubbed canonical rewrite paths may use it to retain bytes. */
-export async function encodeRawChunkFrame(scrubbed: Uint8Array): Promise<Uint8Array> {
-  const encode = await zstdEncoder();
-  if (!encode) throw new PipelineError("zstd_unavailable", "this runtime cannot zstd-compress raw chunks", false);
-  return encode(scrubbed);
-}
-
 export async function rawChunkSealingAvailable() {
   return (await zstdEncoder()) !== null;
 }

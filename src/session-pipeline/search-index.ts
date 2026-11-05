@@ -36,7 +36,6 @@
  *
  * Nothing here logs content; errors carry codes only.
  */
-import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../session-read-api/canonical-artifact.ts";
 import { readCanonicalScope } from "../session-read-api/canonical-projection.ts";
 export { manifestUserId, readManifestRecords, projectedToNeonRow } from "../session-read-api/canonical-projection.ts";
 import * as zlib from "node:zlib";
@@ -81,12 +80,11 @@ export interface SearchIndexLimits {
 }
 
 const DEFAULT_LIMITS: SearchIndexLimits = {
-  // This trusted Node path shares the producer source bound. Raw/projection
-  // copies still need measured execution capacity; this does not lift Worker
-  // limits or cover production cohorts above the explicit 256 MiB ceiling.
-  maxScopeBytes: ARTIFACT_MAX_SOURCE_BYTES,
-  maxScopeEvents: ARTIFACT_MAX_SOURCE_RECORDS,
-  maxRows: 1_000_000,
+  // Raw text is held several times over (strings, records, projected and index
+  // rows), and an out-of-memory kill fails the whole batch: stay well inside 3 GB.
+  maxScopeBytes: 64 * 1024 * 1024,
+  maxScopeEvents: 100_000,
+  maxRows: 500_000,
   insertBatch: 5_000,
 };
 
@@ -230,15 +228,6 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     const keys = pointerSnapshot.keys;
     const { rows: canonicalLock } = await tx.query<{ok:boolean}>("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok", [["96bulls:directory-events",scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId].join("\u001f")]);
     if (!canonicalLock[0]?.ok) return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,busy:true,reasons:["canonical_scope_busy"]};
-    // The physical indexer cannot attest a logical winner mask. A stale
-    // event/reconciliation pass stops before any S3 or ClickHouse IO.
-    const managed=(await tx.query<{managed:boolean}>("SELECT (sessions.session_publication_is_managed($1,$2,$3,$4,NULL)"+
-      " OR EXISTS(SELECT 1 FROM sessions.session_index i WHERE i.org_id=$1 AND i.workspace_id=$2 AND i.harness=$3"+
-      " AND coalesce(i.canonical_session_id,i.session_id)=$4"+
-      " AND sessions.session_publication_is_managed($1,$2,$3,i.session_id,i.machine_id))) AS managed",
-      [scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId])).rows[0]?.managed;
-    if(typeof managed!=="boolean")throw new Error("history_index_authority_unavailable");
-    if(managed)return{manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["history_visibility_required"]};
     const at = now();
     const version = at.getTime();
     // A stale DB alias is not authority to delete another canonical session.

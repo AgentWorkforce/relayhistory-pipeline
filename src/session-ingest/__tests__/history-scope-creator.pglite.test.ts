@@ -4,8 +4,20 @@ import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { captureHistorySource } from "../../shared/history-source-authority.ts";
-import { sqlHistoryMaskStore, updateHistoryMask } from "../../shared/history-mask.ts";
+
+// Minimal SQL-only mask builder (history-mask-v1): leaves sorted by sha256(recordId); a 16-way
+// root node above 500 records. Mirrors ingest_history_mask_register's own validation.
+import { createHash } from "node:crypto";
+const shaHex = (s: string) => createHash("sha256").update(s).digest("hex");
+async function registerMask(reg: (doc: unknown) => Promise<any>, orgId: string, workspaceId: string, recordIds: string[]) {
+  const sorted = [...recordIds].sort((a, b) => (shaHex(a) < shaHex(b) ? -1 : 1));
+  const leaf = (prefix: string, ids: string[]) => reg({ protocol: "history-mask-v1", orgId, workspaceId, prefix, kind: "leaf", count: String(ids.length), items: ids.map((recordId) => ({ recordId, winner: null })) });
+  if (sorted.length <= 500) { const r = await leaf("", sorted); return { sha256: r.sha256 as string, count: String(sorted.length) }; }
+  const items: { digit: string; sha256: string }[] = [];
+  for (const d of "0123456789abcdef") { const ids = sorted.filter((x) => shaHex(x)[0] === d); if (ids.length) items.push({ digit: d, sha256: (await leaf(d, ids)).sha256 }); }
+  const r = await reg({ protocol: "history-mask-v1", orgId, workspaceId, prefix: "", kind: "node", count: String(sorted.length), items });
+  return { sha256: r.sha256 as string, count: String(sorted.length) };
+}
 setDefaultTimeout(60000);
 // Production scope-version creator + final install CAS (sessions.ingest_history_scope_*):
 // the fixture INSERTs other suites use are replaced here by the real protocol.
@@ -31,7 +43,7 @@ async function scope(records: string[]) {
   const row = { org_id: org, workspace_id: ws, user_id: "creator-user", harness: "claude", session_id: identity.sessionId, machine_id: "srv_origin", created_at: "2026-11-01T00:00:00Z", last_activity_at: "2026-11-01T00:00:00Z", storage_provider: "s3", bucket: "creator-fixture", manifest_key: "96bulls/" + org + "/v1/ws=" + ws + "/m=srv_origin/h=claude/d=2026/11/01/s=" + identity.sessionId + "/manifest.json", content_sha256: "\\x" + "a".repeat(64), raw_format: "ndjson", revision: 1, trace_id: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18" };
   await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([row])]);
   await db.query("INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at) VALUES($1,$2,$3,$4,now(),now())", [org, ws, "claude", identity.sessionId]);
-  const mask = await updateHistoryMask(sqlHistoryMaskStore(run, gen, org, ws), { orgId: org, workspaceId: ws }, null, records.map((recordId) => ({ recordId, winner: null })));
+  const mask = await registerMask((doc) => rpc("ingest_history_mask_register", { generation: gen, document: doc }), org, ws, records);
   const anchor = (g: string) => "96bulls/" + org + "/upload-generations/g=" + g + "/v1/ws=" + ws + "/m=history_scope/h=claude/d=2026/11/01/s=" + identity.sessionId + "/publications/" + g + "/manifest.json";
   return { identity, mask, anchor, row };
 }
@@ -51,10 +63,14 @@ test("the production creator installs a ready scope that the existing capture/pe
   expect(c.epoch).toMatch(/^[1-9][0-9]*$/);
   const r = await install(b, s);
   expect(r).toMatchObject({ installed: true, retiredAuthorityId: null, maskSha256: s.mask.sha256, recordCount: "1200" });
-  const captured = await captureHistorySource(run, s.identity, { schemaGeneration: gen });
-  expect(captured.authorityId).toBe(r.authorityId);
-  expect(captured.source).toEqual(r.source);
-  expect(captured.mask.winners.size).toBe(1200);
+  // The existing authority path (ingest_history_source_current via session_history_source_lock and
+  // session_history_mask_page) accepts exactly what the creator installed.
+  const evidence = { generation: gen, identity: s.identity, source: r.source, authorityId: r.authorityId, maskSha256: r.maskSha256 };
+  expect(await rpc("session_history_source_lock", evidence)).toEqual({ current: true });
+  let after = "0", seen = 0;
+  for (;;) { const page = await rpc("session_history_mask_page", { ...evidence, after }); seen += page.records.length; if (page.next === null) break; after = page.next; }
+  expect(seen).toBe(1200);
+  expect((await rpc("session_history_capture", { generation: gen, identity: s.identity })).blocked).toBe(false);
   expect((await db.query("SELECT state FROM sessions.ingest_history_scope_builds WHERE build_id=$1", [b.buildId])).rows[0]).toEqual({ state: "installed" });
 });
 

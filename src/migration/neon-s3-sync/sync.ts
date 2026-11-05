@@ -3,7 +3,6 @@
  * priority (erasure, changed, last 14 days newest first, then history newest
  * first), export them, and log progress as counts only.
  */
-import { withLegacySource, includeLegacyUnits, legacyActivityPage } from "./legacy-source.ts";
 import type { Queryable } from "../relayhistory-export.ts";
 import { erasableByExporter, exportUnit, type ExportTarget } from "./export-session.ts";
 import {
@@ -28,8 +27,6 @@ export interface LockGuard {
 }
 
 export interface SyncConfig {
-  /** Explicit dormant opt-in; includes legacy evidence and completeness records. */
-  includeLegacySources?: boolean;
   recentMs: number;
   revSweepEveryMs: number;
   actSweepEveryMs: number;
@@ -127,12 +124,8 @@ export class Syncer {
       await this.throttle.take(rows, bytes);
       await this.guardLocks();
     };
-    const makeSource = (d: Queryable) => {
-      const source = sourceFor(d, this.hook);
-      return this.cfg.includeLegacySources ? withLegacySource(d, source, this.hook) : source;
-    };
-    this.source = makeSource(db);
-    this.lanes = [{ db, source: this.source }, ...extraDbs.map((d) => ({ db: d, source: makeSource(d) }))];
+    this.source = sourceFor(db, this.hook);
+    this.lanes = [{ db, source: this.source }, ...extraDbs.map((d) => ({ db: d, source: sourceFor(d, this.hook) }))];
   }
 
   /** Pause while Neon shows lock waiters beyond the guard (another backfill, a convoy). */
@@ -215,20 +208,6 @@ export class Syncer {
       if (rows.length === 0) break;
       cat = rows.at(-1)!;
     }
-    if (this.cfg.includeLegacySources) {
-      let legacy: Parameters<typeof legacyActivityPage>[1] = null;
-      for (;;) {
-        if (this.stopped()) break;
-        const rows = await legacyActivityPage(this.db, legacy);
-        await this.hook(Math.ceil(rows.length / 50), 0);
-        this.state.seeActivity(id, rows, true);
-        // Legacy updates do not universally bump session_revisions; force a reread.
-        this.state.forceChanged(rows);
-        n += rows.length;
-        if (!rows.length) break;
-        legacy = rows.at(-1)!;
-      }
-    }
     if (this.stopped()) return;
     this.state.setMeta("act_sweep_done", String(id));
     this.state.setMeta("act_sweep_at", String(this.throttle.now()));
@@ -263,10 +242,7 @@ export class Syncer {
       const keys: string[] = [];
       const truncations: { key: string; strings: number; maxChars: number }[] = [];
       const erase: { key: string; kind: "object" | "prefix"; org_id: string; reason: string }[] = [];
-      const currentUnits = await sessionUnits(lane.db, work.org_id, work.session_id);
-      const units = this.cfg.includeLegacySources
-        ? await includeLegacyUnits(lane.db, work.org_id, work.session_id, currentUnits)
-        : currentUnits;
+      const units = await sessionUnits(lane.db, work.org_id, work.session_id);
       await this.hook(units.length, 0);
       for (const unit of units) {
         const target = {

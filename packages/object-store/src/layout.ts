@@ -206,11 +206,3 @@ function checkInteger(name: string, value: number): void {
     );
   }
 }
-
-export function publicationDerivedKey(manifest: string, artifactId: string, family: string): ObjectKey {
-  const at = parseSessionKey(manifest);
-  if (!at || !parseUploadGenerationPrefix(at.prefix) || !isPublicationManifestRest(at.rest) ||
-      !PUBLICATION_UUID.test(artifactId) || !/^[a-z][a-z0-9-]{0,63}$/.test(family))
-    throw new ObjectStoreError("invalid_argument", "layout", "invalid publication derived key");
-  return objectKey(manifest.slice(0,-MANIFEST_FILE.length) + "derived/" + family + "/" + artifactId + ".bin");
-}
