@@ -104,8 +104,9 @@ describe("the 501 fallback contract", () => {
     ["/v1/events?workspace=ws-a&q=x&order=asc", "search_ascending"],
     ["/v1/events?workspace=ws-a&q=x&limit=101", "search_limit"],
     ["/v1/events?workspace=ws-a&q=x&cursor=events-v2:abc", "foreign_cursor"],
-    ["/v1/sessions?workspace=ws-a", "route"],
-    ["/v1/sessions/s-1/timing?workspace=ws-a&source=codex", "route"],
+    // P3b: registered directory routes; off the canary allowlist (none here) they fall back.
+    ["/v1/sessions?workspace=ws-a", "directory_workspace_not_enabled"],
+    ["/v1/sessions/s-1/timing?workspace=ws-a&source=codex", "timing_not_migrated"],
   ])("%s → 501 %s", async (path, reason) => {
     const { get } = api();
     const r = await get(path);

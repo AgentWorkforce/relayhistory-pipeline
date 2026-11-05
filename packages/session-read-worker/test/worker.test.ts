@@ -351,6 +351,35 @@ describe("reads through ClickHouse and Supabase", () => {
   });
 });
 
+describe("directory list and activity (P3b)", () => {
+  test("off the canary allowlist every workspace falls back; on it, 501 until migration 20261105020000 exists", async () => {
+    const t = tenant();
+    const bearer = await token(t);
+    const call = async (path: string, over: Partial<Env> = {}) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${bearer}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const list = `/v1/sessions?workspace=${t.ws}`;
+    const activity = `/v1/sessions/activity?workspace=${t.ws}&since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z`;
+    for (const over of [{}, { READ_API_DIRECTORY_WORKSPACES: "" }, { READ_API_DIRECTORY_WORKSPACES: "ws-someone-else" }]) {
+      for (const path of [list, activity]) {
+        const r = await call(path, over);
+        expect(r.status).toBe(501);
+        expect((await body(r)).error.reason).toBe("directory_workspace_not_enabled");
+      }
+    }
+    for (const allow of [t.ws, `ws-other,${t.ws}`, "*"]) {
+      for (const path of [list, activity]) {
+        const r = await call(path, { READ_API_DIRECTORY_WORKSPACES: allow });
+        expect(r.status).toBe(501);
+        expect((await body(r)).error.reason).toBe("directory_not_migrated");
+      }
+    }
+  });
+});
+
 describe("bulls96_read_api through Hyperdrive", () => {
   async function asRole<T>(work: (c: pg.Client) => Promise<T>): Promise<T> {
     const c = await connectPg(E.SUPABASE.connectionString);
