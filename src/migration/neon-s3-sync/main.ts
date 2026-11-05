@@ -257,7 +257,11 @@ export async function main() {
       },
       throttle,
       log,
-      { ...DEFAULT_SYNC_CONFIG, recentMs: Number(env("S3X_RECENT_DAYS", "14")) * 86_400_000 },
+      {
+        ...DEFAULT_SYNC_CONFIG,
+        includeLegacySources: env("S3X_INCLUDE_LEGACY_SOURCES", "false") === "true",
+        recentMs: Number(env("S3X_RECENT_DAYS", "14")) * 86_400_000,
+      },
       () => stop,
       undefined,
       extra,

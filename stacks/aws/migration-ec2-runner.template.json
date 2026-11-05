@@ -1,0 +1,232 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Temporary sessions migration compute only. No application credentials, source changes, database migrations or traffic activation.",
+  "Parameters": {
+    "InstanceType": {
+      "Type": "String",
+      "Default": "r7i.xlarge",
+      "AllowedValues": [
+        "r7i.xlarge",
+        "r7i.2xlarge"
+      ]
+    },
+    "ImageId": {
+      "Type": "AWS::EC2::Image::Id"
+    },
+    "SubnetId": {
+      "Type": "AWS::EC2::Subnet::Id"
+    },
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id"
+    }
+  },
+  "Resources": {
+    "RunnerRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "sessions-migration-runner-20261104",
+        "Path": "/sessions/migration/",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        ],
+        "Tags": [
+          {
+            "Key": "Product",
+            "Value": "sessions-pipeline"
+          },
+          {
+            "Key": "Purpose",
+            "Value": "temporary-migration-runner"
+          },
+          {
+            "Key": "MigrationRun",
+            "Value": "sessions-20261104"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "DenyParameterStoreValues",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Deny",
+                  "Action": [
+                    "ssm:GetParameter",
+                    "ssm:GetParameters",
+                    "ssm:GetParameterHistory",
+                    "ssm:GetParametersByPath"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "RunnerProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "InstanceProfileName": "sessions-migration-runner-20261104",
+        "Path": "/sessions/migration/",
+        "Roles": [
+          {
+            "Ref": "RunnerRole"
+          }
+        ]
+      }
+    },
+    "RunnerSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Sessions migration runner; no inbound access; HTTPS/database egress only",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Package, SSM and later authorized service HTTPS"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 5432,
+            "ToPort": 5432,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Later authorized database TLS"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 6543,
+            "ToPort": 6543,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Later authorized Supabase pooler TLS"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 8443,
+            "ToPort": 8443,
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Existing ClickHouse HTTPS endpoint verified on port 8443"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Product",
+            "Value": "sessions-pipeline"
+          },
+          {
+            "Key": "Purpose",
+            "Value": "temporary-migration-runner"
+          },
+          {
+            "Key": "MigrationRun",
+            "Value": "sessions-20261104"
+          }
+        ]
+      }
+    },
+    "Runner": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "ImageId": {
+          "Ref": "ImageId"
+        },
+        "InstanceType": {
+          "Ref": "InstanceType"
+        },
+        "IamInstanceProfile": {
+          "Ref": "RunnerProfile"
+        },
+        "MetadataOptions": {
+          "HttpTokens": "required",
+          "HttpEndpoint": "enabled",
+          "HttpPutResponseHopLimit": 1
+        },
+        "InstanceInitiatedShutdownBehavior": "terminate",
+        "BlockDeviceMappings": [
+          {
+            "DeviceName": "/dev/xvda",
+            "Ebs": {
+              "VolumeSize": 100,
+              "VolumeType": "gp3",
+              "Encrypted": true,
+              "DeleteOnTermination": true
+            }
+          }
+        ],
+        "NetworkInterfaces": [
+          {
+            "DeviceIndex": "0",
+            "AssociatePublicIpAddress": true,
+            "SubnetId": {
+              "Ref": "SubnetId"
+            },
+            "GroupSet": [
+              {
+                "Ref": "RunnerSecurityGroup"
+              }
+            ]
+          }
+        ],
+        "UserData": {
+          "Fn::Base64": "#!/bin/bash\nset -euo pipefail\n# No application image, secret, database call or enabled migration at boot.\ninstall -d -m 0755 /opt/session-migration\nprintf '%s\\n' 'Migration applications disabled; infrastructure only.' > /opt/session-migration/runtime-disabled.txt\n# First boot writes one absolute expiry; the enabled persistent timer survives reboot.\nexpiry=\"$(date -u -d '+6 hours' '+%Y-%m-%d %H:%M:%S UTC')\"\ncat > /etc/systemd/system/sessions-migration-expiry.service <<'SERVICE'\n[Unit]\nDescription=Terminate only this temporary migration instance at its deadline\n[Service]\nType=oneshot\nExecStart=/usr/bin/systemctl poweroff\nSERVICE\ncat > /etc/systemd/system/sessions-migration-expiry.timer <<TIMER\n[Unit]\nDescription=Absolute expiry for this temporary migration instance\n[Timer]\nOnCalendar=$expiry\nPersistent=true\nAccuracySec=1s\nUnit=sessions-migration-expiry.service\n[Install]\nWantedBy=timers.target\nTIMER\nsystemctl daemon-reload\nsystemctl enable --now sessions-migration-expiry.timer\n\ndnf install -y docker\nsystemctl enable --now docker\nsystemctl enable --now amazon-ssm-agent\ndocker info --format '{{.ServerVersion}}' > /opt/session-migration/docker-ready.txt\n"
+        },
+        "Tags": [
+          {
+            "Key": "Product",
+            "Value": "sessions-pipeline"
+          },
+          {
+            "Key": "Purpose",
+            "Value": "temporary-migration-runner"
+          },
+          {
+            "Key": "MigrationRun",
+            "Value": "sessions-20261104"
+          },
+          {
+            "Key": "Name",
+            "Value": "sessions-migration-runner-20261104"
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "InstanceId": {
+      "Value": {
+        "Ref": "Runner"
+      }
+    },
+    "RoleArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "RunnerRole",
+          "Arn"
+        ]
+      }
+    },
+    "SecurityGroupId": {
+      "Value": {
+        "Ref": "RunnerSecurityGroup"
+      }
+    }
+  }
+}

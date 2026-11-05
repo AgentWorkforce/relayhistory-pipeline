@@ -60,6 +60,8 @@ export interface IngestWorkerEnv {
   INGEST_REPLICA_MODE?: string;
   INGEST_ACCEPTANCE_MODE?: string;
   INGEST_EXPECT_GENERATION?:string;
+  /** P1: relayhistory (default) | shadow | frozen-supabase (sessions.ingest_frozen_source_witness). */
+  INGEST_CUSTODY_SOURCE?: string;
 }
 
 interface SecretBinding {
@@ -188,7 +190,11 @@ export default {
           },
         }
       : undefined;
+    const custodySource = env.INGEST_CUSTODY_SOURCE?.trim() || "relayhistory";
+    if (!["relayhistory", "shadow", "frozen-supabase"].includes(custodySource) || (custodySource !== "relayhistory" && (env.INGEST_ACCEPTANCE_MODE ?? "canonical") !== "buffered"))
+      throw new Error("session ingest: INGEST_CUSTODY_SOURCE must be relayhistory, shadow or frozen-supabase (the latter two only in buffered mode)");
     const app = createIngestApp({
+      custodySource: custodySource as "relayhistory" | "shadow" | "frozen-supabase",
       signingKey: settings.signingKey,
       deliver: {
         ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration}),
@@ -200,6 +206,7 @@ export default {
         inlineMaxSessions: settings.inlineMaxSessions,
         fanout: (messages) => env.INGEST_FANOUT!.sendBatch(messages.map((body) => ({ body }))),
       },
+      onboarding: { run },
     });
     try {
       return await app.fetch(request);

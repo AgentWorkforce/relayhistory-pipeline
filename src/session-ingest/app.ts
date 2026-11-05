@@ -1,3 +1,4 @@
+import type {FrozenWitnessInput,LedgerTenant} from "./ledger.ts";
 import {decodeCustodyEnvelope} from "./custody-wire.ts";
 import {validatedCustodyAck} from "./custody-ack.ts";
 import {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER,PRIVATE_CUSTODY_BYTES,type CurrentCustodyPacket} from "./custody-protocol.ts";
@@ -9,6 +10,7 @@ import {orderedControl,orderedControlResult,type OrderedControl} from "./control
  *
  *   POST /v1/delivery/batches   rth:sync   one batch -> receipt (same shapes, same codes)
  *   GET  /v1/delivery/limits    rth:sync   DELIVERY_LIMITS + contentEncodings
+ *   POST /v1/turns/batches      rth:sync   relay session turns as records (turns.ts), same receipt
  *   GET  /healthz                          liveness only
  *
  * Every other route is `501 unsupported_by_backend`. Selection, reset and
@@ -35,15 +37,19 @@ import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
-import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES } from "./vendor/delivery/delivery-contracts.ts";
-import { parseDeliveryRequest, requireDeliveryAccount } from "./vendor/delivery/prepare.ts";
+import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
+import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
+import { parseTurnBatch } from "./turns.ts";
+import { heartbeatProgress, ProgressError, readConnection, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
 
 export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl};
 
 export const SYNC_SCOPE = "rth:sync";
 export type ContentEncoding = "zstd" | "gzip";
 
+/** relayhistory-cloud's read scope; only the onboarding status read accepts it here. */
+export const READ_SCOPE = "rth:read";
 export const IDENTITY_HEADER = "x-relay-ingest-identity";
 export const SIGNATURE_HEADER = "x-relay-ingest-signature";
 /** How old (or how far ahead) a signature may be. */
@@ -109,7 +115,16 @@ export interface IngestAppDeps {
   /** The shared HMAC key (Secrets Store). Unset with no `identify`: every request is 401 not_configured. */
   signingKey?: string;
   deliver: DeliverDeps;
+  /** P5b G2: the onboarding heartbeat on history.probe_connections. Unset: those routes answer 503. */
+  onboarding?: { run: OnboardingRun };
   log?: (fields: Record<string, unknown>) => void;
+  /**
+   * P1 custody source (INGEST_CUSTODY_SOURCE). "relayhistory" (default): only the signed Neon witness
+   * relayhistory sends. "shadow": additionally build the Supabase frozen-source witness and log
+   * match/mismatch, never changing the answer. "frozen-supabase": when relayhistory sends no witness,
+   * build it from the sealed Supabase copy (refuses, never guesses, when unsealed).
+   */
+  custodySource?: "relayhistory" | "shadow" | "frozen-supabase";
 }
 
 type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined } };
@@ -261,6 +276,30 @@ export function parseReset(body: unknown): { account_id: string; request_id: str
 export function createIngestApp(deps: IngestAppDeps) {
   const app = new Hono<Env>();
   const emit = deps.log ?? ((fields) => log.info("session ingest", fields));
+  const custodyMode = deps.custodySource ?? "relayhistory";
+  const frozenWitness = async (input: FrozenWitnessInput): Promise<CurrentCustodyPacket> => {
+    if (!deps.deliver.ledger.frozenWitness) throw new IngestUnavailable("fence", "custody_source_unavailable");
+    return deps.deliver.ledger.frozenWitness(input);
+  };
+  const batchWitnessInput = async (tenant: LedgerTenant, batch: Parameters<typeof prepareDelivery>[1]): Promise<FrozenWitnessInput> => {
+    const p = await prepareDelivery(tenant, batch);
+    return { kind: "batch", tenant, originId: p.originId, batchId: p.batchId, batchDigest: p.batchDigest, originalRecordCount: (batch as { records: unknown[] }).records.length,
+      candidates: p.records.map((r, i) => ({ preparedOrd: i, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id, candidateDigest: r.digest, source: r.source, sessionId: r.session_id ?? null })) };
+  };
+  const controlWitnessInput = (kind: "selection" | "reset", tenant: LedgerTenant, originId: string | null): FrozenWitnessInput =>
+    ({ kind, tenant, originId, batchId: null, batchDigest: null, originalRecordCount: 0, candidates: [] });
+  /** Shadow compare: never throws, never changes the response. Logs no identifiers or content. */
+  const shadow = async (route: string, received: CurrentCustodyPacket, input: () => Promise<FrozenWitnessInput> | FrozenWitnessInput) => {
+    if (custodyMode !== "shadow") return;
+    try {
+      const frozen = await frozenWitness(await input());
+      const differing = frozen.sourceDigest === received.sourceDigest ? [] : Object.keys({ ...received.witness, ...frozen.witness }).filter((k) =>
+        JSON.stringify((received.witness as unknown as Record<string, unknown>)[k]) !== JSON.stringify((frozen.witness as unknown as Record<string, unknown>)[k])).sort();
+      emit({ route: "custody.shadow", source_route: route, outcome: differing.length ? "mismatch" : "match", differing_fields: differing.join(",") || undefined });
+    } catch (error) {
+      emit({ route: "custody.shadow", source_route: route, outcome: "frozen_unavailable", error_code: (error as { code?: string; cause_code?: string })?.cause_code ?? (error as { code?: string })?.code ?? "error" });
+    }
+  };
 
   app.use("*", async (c, next) => {
     const requestId = crypto.randomUUID();
@@ -293,19 +332,62 @@ export function createIngestApp(deps: IngestAppDeps) {
       emit({ route: "auth", outcome: "error", error_code: "identity_failed" });
       return c.json(errorBody(c, "invalid_token", "invalid or expired token"), 401);
     }
-    if (!c.get("identity").scopes.includes(SYNC_SCOPE)) return c.json(errorBody(c, "forbidden", `missing required scope: ${SYNC_SCOPE}`), 403);
+    // The onboarding status read is the only rth:read route here; everything else needs rth:sync.
+    const scope = c.req.method === "GET" && new URL(c.req.url).pathname === "/v1/onboarding/connection" ? READ_SCOPE : SYNC_SCOPE;
+    if (!c.get("identity").scopes.includes(scope)) return c.json(errorBody(c, "forbidden", `missing required scope: ${scope}`), 403);
     await next();
+  });
+
+  // P5b G2: relayhistory-cloud's onboarding heartbeat (same validation and response), stored
+  // in history.probe_connections. relayhistory forwards here when ONBOARDING_BACKEND=ingest.
+  app.post("/v1/onboarding/heartbeat", async (c) => {
+    const identity = c.get("identity");
+    if (!deps.onboarding) return c.json(errorBody(c, "not_configured", "onboarding is not configured"), 503);
+    if (!identity.workspaceId) return c.json({ error: "Workspace required" }, 403);
+    let parsed;
+    try {
+      parsed = heartbeatProgress(c.get("body"));
+    } catch (error) {
+      if (error instanceof ProgressError || error instanceof SyntaxError) return c.json({ error: "Invalid progress" }, 400);
+      throw error;
+    }
+    if ("tooLarge" in parsed) return c.json({ error: "Progress too large" }, 413);
+    try {
+      const lastSeenAt = await recordHeartbeat(deps.onboarding.run, identity, parsed.progress);
+      emit({ route: "onboarding.heartbeat", outcome: "ok", org_id: identity.orgId });
+      return c.json({ connected: true, lastSeenAt });
+    } catch (error) {
+      emit({ route: "onboarding.heartbeat", outcome: "error", error_code: (error as { code?: string }).code ?? "onboarding_failed" });
+      return c.json(errorBody(c, "onboarding_unavailable", "onboarding is temporarily unavailable"), 503);
+    }
+  });
+
+  app.get("/v1/onboarding/connection", async (c) => {
+    const identity = c.get("identity");
+    if (!deps.onboarding) return c.json(errorBody(c, "not_configured", "onboarding is not configured"), 503);
+    if (!identity.workspaceId) return c.json({ error: "Workspace required" }, 403);
+    try {
+      return c.json(await readConnection(deps.onboarding.run, identity));
+    } catch (error) {
+      emit({ route: "onboarding.connection", outcome: "error", error_code: (error as { code?: string }).code ?? "onboarding_failed" });
+      return c.json(errorBody(c, "onboarding_unavailable", "onboarding is temporarily unavailable"), 503);
+    }
   });
 
   app.get("/v1/delivery/limits", (c) => c.json({ ...DELIVERY_LIMITS, contentEncodings: contentEncodings() }));
 
-  app.post("/v1/delivery/batches", async (c) => {
+  // One acceptance path for the public delivery shape and the private turns shape: the
+  // same custody (relayhistory witness, shadow, or frozen-supabase), claim, buffer and receipt.
+  const acceptBatch = async (c: Context<Env>, route: string, parse: (value: unknown, identity: IngestIdentity) => HistoryExportBatch) => {
     const started = Date.now();
     const identity = c.get("identity");
     const read: BodyRead = { bytes: 0, wireBytes: 0, encoding: "identity" };
-    const fields: Record<string, unknown> = { route: "delivery.batches", org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
+    const fields: Record<string, unknown> = { route, org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
     try {
-      const batch = parseDeliveryRequest(await jsonOf(c, read));
+      const batch = parse(await jsonOf(c, read), identity);
+      const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
+      if (!c.get("custody") && custodyMode === "frozen-supabase") c.set("custody", await frozenWitness(await batchWitnessInput(tenant, batch)));
+      else if (c.get("custody")) await shadow(route, c.get("custody")!, () => batchWitnessInput(tenant, batch));
       const custody=c.get("custody");
       if(custody&&custody.witness.originalRecordCount!==batch.records.length)throw new IngestUnavailable("fence","custody_record_count");
       const result = await deliverBatch({...deps.deliver,...(custody?{custody}:{})}, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, batch);
@@ -324,7 +406,13 @@ export function createIngestApp(deps: IngestAppDeps) {
       });
       return failure(c, error);
     }
-  });
+  };
+
+  app.post("/v1/delivery/batches", (c) => acceptBatch(c, "delivery.batches", (value) => parseDeliveryRequest(value)));
+
+  // Relay session journal turns (relayhistory TURNS_WRITE_PATH=dual|forward): turns.ts.
+  // Same signed binding, rth:sync and custody as a batch; only the turn record shape.
+  app.post("/v1/turns/batches", (c) => acceptBatch(c, "turns.batches", parseTurnBatch));
 
   // Private archive replay. Unlike the public batch route, this accepts the
   // exact prepared values retained by the old Neon replica archive. It is
@@ -366,6 +454,9 @@ export function createIngestApp(deps: IngestAppDeps) {
         enabled: input.enabled,
       };
       let controlAck;
+      {const t={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
+       if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("selection",t,input.origin_id)));
+       else if(identity.control&&c.get("custody"))await shadow("delivery.sessions.selection",c.get("custody")!,()=>controlWitnessInput("selection",t,input.origin_id));}
       const custody=c.get("custody");if(custody&&!identity.control)throw new IngestUnavailable("fence","control_unavailable");
       if(identity.control){
         if(identity.control.kind!=="selection"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
@@ -386,6 +477,9 @@ export function createIngestApp(deps: IngestAppDeps) {
       await requireDeliveryAccount(identity, input.account_id);
       const tenant={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
       let deleted:number,controlAck;
+      {const t={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
+       if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("reset",t,null)));
+       else if(identity.control&&c.get("custody"))await shadow("delivery.sessions.reset",c.get("custody")!,()=>controlWitnessInput("reset",t,null));}
       const custody=c.get("custody");if(custody&&!identity.control)throw new IngestUnavailable("fence","control_unavailable");
       if(identity.control){
         if(identity.control.kind!=="reset"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
@@ -396,6 +490,71 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json({ reset: true, deleted,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
       emit({ route: "delivery.sessions.reset", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+
+  // Supabase-first mirror of Neon's privacy-control head (P1 option a). relayhistory: begin here,
+  // then Neon begin (must return the same {version,digest}), apply, Neon complete, then complete here.
+  const controlKind = (v: unknown): "selection" | "reset" => (v === "selection" || v === "reset" ? v : invalid("Invalid control kind"));
+  // relayhistory frozen-supabase mode: the two remaining Neon reads on POST /v1/delivery/batches.
+  app.post("/v1/custody/legacy-receipt", async (c) => {
+    const identity = c.get("identity");
+    try {
+      if (!deps.deliver.ledger.frozenReceipt) throw new IngestUnavailable("fence", "custody_source_unavailable");
+      const b = await jsonOf(c);if (!isObject(b)) invalid("Expected batch identity");
+      const v = b as Record<string, unknown>;exactKeys(v, ["originId", "batchId"]);
+      if (!identifier(v.originId) || !identifier(v.batchId)) invalid("Invalid batch identity");
+      const stored = await deps.deliver.ledger.frozenReceipt({ tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, originId: v.originId as string, batchId: v.batchId as string });
+      return c.json({ stored });
+    } catch (error) {
+      emit({ route: "custody.legacy_receipt", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+  // 200 {pending:false} when no privacy control is pending for this user, else 503 (fail closed).
+  app.post("/v1/custody/pending", async (c) => {
+    const identity = c.get("identity");
+    try {
+      const b = await jsonOf(c);if (!isObject(b)) invalid("Expected origin");
+      const v = b as Record<string, unknown>;exactKeys(v, ["originId"]);
+      if (!identifier(v.originId)) invalid("Invalid origin");
+      await frozenWitness({ kind: "batch", tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, originId: v.originId as string,
+        batchId: "pending-check", batchDigest: "0".repeat(64), originalRecordCount: 0, candidates: [] });
+      return c.json({ pending: false });
+    } catch (error) {
+      emit({ route: "custody.pending", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+  app.post("/v1/custody/control/begin", async (c) => {
+    const identity = c.get("identity");
+    try {
+      if (!deps.deliver.ledger.sourceControlBegin) throw new IngestUnavailable("fence", "control_unavailable");
+      const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control");
+      exactKeys(b as Record<string, unknown>, ["epoch", "kind", "payload"]);
+      const head = await deps.deliver.ledger.sourceControlBegin({ epoch: String((b as Record<string, unknown>).epoch), kind: controlKind((b as Record<string, unknown>).kind), payload: (b as Record<string, unknown>).payload,
+        tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId } });
+      emit({ route: "custody.control.begin", outcome: head.apply ? "begun" : "pending_replay", org_id: identity.orgId });
+      return c.json(head);
+    } catch (error) {
+      emit({ route: "custody.control.begin", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+  app.post("/v1/custody/control/complete", async (c) => {
+    const identity = c.get("identity");
+    try {
+      if (!deps.deliver.ledger.sourceControlComplete) throw new IngestUnavailable("fence", "control_unavailable");
+      const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control completion");
+      const v = b as Record<string, unknown>;exactKeys(v, ["epoch", "version", "digest", "kind", "outcome"]);
+      if (v.outcome !== "applied" && v.outcome !== "replay" && v.outcome !== "stale") invalid("Invalid control outcome");
+      const r = await deps.deliver.ledger.sourceControlComplete({ epoch: String(v.epoch), version: String(v.version), digest: String(v.digest), kind: controlKind(v.kind), outcome: v.outcome as "applied" | "replay" | "stale",
+        tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId } });
+      emit({ route: "custody.control.complete", outcome: r.superseded ? "superseded" : "completed", org_id: identity.orgId });
+      return c.json(r);
+    } catch (error) {
+      emit({ route: "custody.control.complete", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
       return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
     }
   });

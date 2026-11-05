@@ -8,7 +8,8 @@
  * `--execute` it sweeps and reports what it would erase, deleting nothing.
  * Shares the exporter's watermark (`S3X_STATE`) on the same host.
  *
- *   NEON_URL_FILE, S3X_STATE, S3X_BUCKET, S3X_EXPECT_BUCKET, S3X_REGION, S3X_ENDPOINT, S3X_KEY_ROOT
+ *   NEON_URL_FILE, S3X_STATE, S3X_BUCKET, S3X_EXPECT_BUCKET, S3X_REGION, S3X_ENDPOINT, S3X_KEY_ROOT,
+ *   S3X_ERASER_RECOGNIZES_LEGACY ("true" keeps legacy-only groups; default false)
  */
 import { readFileSync } from "node:fs";
 import type { Queryable } from "../relayhistory-export.ts";
@@ -64,8 +65,13 @@ export async function main() {
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => void (stop = true));
   try {
     const db = await sessionReadOnly(client as unknown as Queryable);
-    const job = new ErasureJob(db, state, eraser, log, { ...DEFAULT_ERASURE_CONFIG, keyRoot: env("S3X_KEY_ROOT", "96bulls")! }, Date.now, undefined, () => stop);
-    log({ message: "start", execute });
+    const cfg = {
+      ...DEFAULT_ERASURE_CONFIG,
+      keyRoot: env("S3X_KEY_ROOT", "96bulls")!,
+      recognizeLegacy: env("S3X_ERASER_RECOGNIZES_LEGACY", "false") === "true",
+    };
+    const job = new ErasureJob(db, state, eraser, log, cfg, Date.now, undefined, () => stop);
+    log({ message: "start", execute, recognize_legacy: cfg.recognizeLegacy });
     // A dry run changes nothing: it sweeps and reports what it would erase.
     if (!execute) {
       await job.sweep({ dryRun: true });

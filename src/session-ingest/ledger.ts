@@ -168,7 +168,21 @@ export interface SelectionInput {
 export type OrderedControlInput =
  | (SelectionInput & {control:OrderedControl & {kind:"selection"};custody?:CurrentCustodyPacket})
  | {tenant:LedgerTenant;requestId:string;control:OrderedControl & {kind:"reset"};custody?:CurrentCustodyPacket};
+/** P1 frozen-source custody: the witness relayhistory would build against Neon, built in Supabase. */
+export interface FrozenWitnessCandidate { preparedOrd: number; recordId: string; revision: string; revisionId: string; candidateDigest: string; source: string; sessionId: string | null }
+export interface FrozenWitnessInput { kind: "batch" | "selection" | "reset"; tenant: LedgerTenant; originId: string | null; batchId: string | null; batchDigest: string | null; originalRecordCount: number; candidates: FrozenWitnessCandidate[] }
+export interface SourceControlBeginInput { epoch: string; tenant: LedgerTenant; kind: "selection" | "reset"; payload: unknown }
+export interface SourceControlHead { epoch: string; version: string; digest: string; kind: "selection" | "reset"; pending: true; apply: boolean }
+export interface SourceControlCompleteInput { epoch: string; tenant: LedgerTenant; version: string; digest: string; kind: "selection" | "reset"; outcome: "applied" | "replay" | "stale" }
 export interface Ledger {
+  /** Frozen-source custody witness (refuses unless the sealed copy and policy agree). */
+  frozenWitness?(input: FrozenWitnessInput): Promise<CurrentCustodyPacket>;
+  /** Frozen Neon legacy receipt for a retried pre-cutover batch (refuses while a control is pending). */
+  frozenReceipt?(input: { tenant: LedgerTenant; originId: string; batchId: string }): Promise<{ digest: string; receipt: Record<string, unknown> } | null>;
+  /** Supabase-first mirror of Neon's control head; relayhistory calls it BEFORE Neon begins. */
+  sourceControlBegin?(input: SourceControlBeginInput): Promise<SourceControlHead>;
+  /** Mirror completion; relayhistory calls it AFTER Neon completes. */
+  sourceControlComplete?(input: SourceControlCompleteInput): Promise<{ completed: true; superseded: boolean }>;
   /** Private verified-identity path. Unsupported stores must fail, never fall back. */
   applyOrderedControl?(input:OrderedControlInput):Promise<OrderedControlResult>;
   claim(input: ClaimInput): Promise<ClaimResult>;
