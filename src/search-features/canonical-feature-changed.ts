@@ -21,8 +21,8 @@ export class CanonicalFeatureChanged implements CanonicalFeatureChangedPort {
   async canonicalFeatureChanged(input: {
     scope: { orgId: string; workspaceId: string; harness: string;
              sessionId: string };
-    source: { epoch: string; fingerprint: string };
-    priorSource: { epoch: string; fingerprint: string } | null;
+    source: { authorityId?: string; epoch: string; fingerprint: string };
+    priorSource: { authorityId?: string; epoch: string; fingerprint: string } | null;
     pointerSet: { hash: string; count: number; pointers: unknown[] };
     /** Required when priorSource is set: the PRIOR image's inventory. */
     priorPointerSet?: { hash: string; count: number; pointers: unknown[] };
@@ -31,12 +31,8 @@ export class CanonicalFeatureChanged implements CanonicalFeatureChangedPort {
         !input.source?.epoch || !input.source.fingerprint ||
         !input.pointerSet?.hash)
       throw new Error("canonical_feature_changed: invalid input");
-    // Pointer-set integrity: hash covers the exact pointers and count matches.
-    for (const ps of [input.pointerSet, input.priorPointerSet].filter(Boolean)) {
-      const set = ps as { hash: string; count: number; pointers: unknown[] };
-      if (!Array.isArray(set.pointers) || set.count !== set.pointers.length)
-        throw new Error("pointer_set_invalid");
-    }
+    // Pointer sets carry only hash+count — the caller validates the hash
+    // covers the exact inventory; nothing raw is persisted in the journal.
     // priorSource and priorPointerSet must be both NULL or both set.
     if ((input.priorSource === null) !== (input.priorPointerSet === undefined))
       throw new Error("prior_incomplete");
@@ -46,7 +42,9 @@ export class CanonicalFeatureChanged implements CanonicalFeatureChangedPort {
       throw new Error("self_retire");
     const versions = new CanonicalVersionStore(this.db);
     const journal = new CanonicalJournalStore(this.db);
-    const imageKey = `${input.scope.orgId}:${input.scope.sessionId}`;
+    // Immutable authority versions: imageKey binds the authority identity,
+    // not just org:session — a replacement is a distinct authority version.
+    const imageKey = `${input.scope.orgId}:${input.scope.sessionId}@${input.source.authorityId ?? input.source.fingerprint}`;
     if (input.priorSource !== null) {
       // Replacement: TWO ordered rows — retire the PRIOR image's exact
       // inventory, then publish the NEW image. The producer consumes the pair

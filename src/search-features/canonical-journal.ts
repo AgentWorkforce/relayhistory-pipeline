@@ -83,8 +83,14 @@ export class CanonicalVersionStore implements CanonicalVersionPort {
         [aboveLegacyClock]);
   }
   async next(): Promise<string> {
-    // Single-writer allocation: the caller holds the transaction; the insert
-    // itself is the counter advance. Revision = last+1 under the row lock.
+    // Fail closed: no seed row means the counter was never initialized above
+    // the legacy clock — refusing beats silently allocating revision 1 in the
+    // legacy space.
+    const { rows: seeds } = await this.db.query<{ revision: string }>(
+      "SELECT 1::text AS revision FROM sessions.canonical_feature_journal" +
+        " WHERE kind = 'seed' LIMIT 1");
+    if (!seeds.length) throw new Error("unseeded");
+    // Allocation above every prior entry (seed + publish + retire).
     const { rows } = await this.db.query<{ revision: string }>(
       "SELECT COALESCE(MAX(revision),0)+1::text AS revision" +
         " FROM sessions.canonical_feature_journal FOR UPDATE");

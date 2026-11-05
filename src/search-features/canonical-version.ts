@@ -58,11 +58,10 @@ export interface CanonicalScope {
 }
 /** Replay source authority: publication epoch + snapshot fingerprint. */
 export interface CanonicalSourceAuthority {
-  epoch: string; fingerprint: string;
+  authorityId?: string; epoch: string; fingerprint: string;
 }
 /** Exact captured inventory identity — hash and count, never payload bytes. */
-export interface CanonicalPointerSet {
-  hash: string; count: number; pointers: unknown[]; }
+export interface CanonicalPointerSet { hash: string; count: number; }
 
 /** The 610 transaction port: OWNER-ONLY INVOKER inside the 620 final CAS. */
 export interface CanonicalFeatureChangedPort {

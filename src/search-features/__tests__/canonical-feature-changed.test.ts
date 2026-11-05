@@ -8,9 +8,19 @@ const fakeDb = () => {
       return { rows: table.length
         ? [{ revision: String(Math.max(...table.map((r) => Number(r.revision)))) } as T]
         : [] as T[] };
-    if (text.includes("COALESCE(MAX(revision)"))
+    if (text.includes("SELECT 1::text AS revision") && text.includes("kind = 'seed'"))
+      return { rows: table.some((r) => r.kind === "seed")
+        ? [{ revision: "1" } as T] : [] as T[] };
+    if (text.includes("COALESCE(MAX(revision)")) {
+      if (text.includes("kind = 'seed'")) {
+        const seeds = table.filter((r) => r.kind === "seed");
+        return { rows: seeds.length
+          ? [{ revision: String(Math.max(...seeds.map((r) => Number(r.revision)))) } as T]
+          : [] as T[] };
+      }
       return { rows: [{ revision: String(
         table.length ? Math.max(...table.map((r) => Number(r.revision))) + 1 : 1) } as T] };
+    }
     if (text.startsWith("INSERT")) {
       const isSeed = text.includes("'seed'");
       table.push({
@@ -31,7 +41,7 @@ const fakeDb = () => {
 const base = {
   scope: { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s" },
   source: { epoch: "1", fingerprint: "a".repeat(64) },
-  pointerSet: { hash: "p".repeat(64), count: 1, pointers: ["k1"] },
+  pointerSet: { hash: "p".repeat(64), count: 1 },
 };
 describe("canonical_feature_changed (620 invoker)", () => {
   test("priorSource null -> publish entry appended with managed revision", async () => {
@@ -51,7 +61,7 @@ describe("canonical_feature_changed (620 invoker)", () => {
     const fn = new CanonicalFeatureChanged({ query: db.query });
     await db.query("INSERT INTO sessions.canonical_feature_journal(revision,kind,org_id,workspace_id,scope,schema_generation,image_key,source_hash,source_authority,pointer_set) VALUES($1,'seed','','','{}','','','{}','{}')", ["100"]);
     const prior = { epoch: "0", fingerprint: "b".repeat(64) };
-    const priorPtr = { hash: "q".repeat(64), count: 1, pointers: ["k1"] };
+    const priorPtr = { hash: "q".repeat(64), count: 1 };
     const rev = await fn.canonicalFeatureChanged({
       ...base, priorSource: prior, priorPointerSet: priorPtr });
     const rows = db.table.filter((r) => r.kind !== "seed")
@@ -59,7 +69,7 @@ describe("canonical_feature_changed (620 invoker)", () => {
     expect(rows.length).toBe(2);
     expect(rows[0]!.kind).toBe("retire");
     expect(rows[0]!.prior_keyset_hash).toBe(priorPtr.hash);   // prior SET hash
-    expect(JSON.parse(rows[0]!.pointer_set as string)).toEqual({ ...priorPtr, pointers: ["k1"] });
+    expect(JSON.parse(rows[0]!.pointer_set as string)).toEqual(priorPtr);
     expect(rows[1]!.kind).toBe("publish");
     expect(rows[1]!.source_hash).toBe(base.source.fingerprint);
     expect(JSON.parse(rows[1]!.pointer_set as string)).toEqual(base.pointerSet); // NEW inventory
@@ -74,6 +84,22 @@ describe("canonical_feature_changed (620 invoker)", () => {
       priorSource: { epoch: "0", fingerprint: "b".repeat(64) },
     })).rejects.toThrow("prior_incomplete");
     expect(db.table.filter((r) => r.kind !== "seed").length).toBe(0);
+  });
+  test("unseeded journal refuses next() — never allocates revision 1", async () => {
+    const db = fakeDb();
+    const fn = new CanonicalFeatureChanged({ query: db.query });
+    await expect(fn.canonicalFeatureChanged({ ...base, priorSource: null }))
+      .rejects.toThrow("unseeded");
+  });
+  test("self-retire refused (prior fp == new fp)", async () => {
+    const db = fakeDb();
+    const fn = new CanonicalFeatureChanged({ query: db.query });
+    await db.query("INSERT INTO sessions.canonical_feature_journal(revision,kind,org_id,workspace_id,scope,schema_generation,image_key,source_hash,source_authority,pointer_set) VALUES($1,'seed','','','{}','','','{}','{}')", ["100"]);
+    await expect(fn.canonicalFeatureChanged({
+      ...base,
+      priorSource: { epoch: "0", fingerprint: base.source.fingerprint },
+      priorPointerSet: { hash: "x".repeat(64), count: 1 },
+    })).rejects.toThrow("self_retire");
   });
   test("invalid input refuses before any write", async () => {
     const db = fakeDb();

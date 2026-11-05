@@ -17,7 +17,6 @@ export interface CanonicalDescriptor {
   imageKey: string; sourceHash: string; schemaGeneration: string;
   epoch: string; fingerprint: string;
   pointerSetHash: string; pointerSetCount: number;
-  pointers: unknown[];
 }
 export type CanonicalDescriptorPort =
   (imageKey: string) => Promise<CanonicalDescriptor | null>;
@@ -61,7 +60,6 @@ export async function* manifestIndexImages(
         fingerprint: d.fingerprint,
         pointerSetHash: d.pointerSetHash,
         pointerSetCount: d.pointerSetCount,
-        pointers: d.pointers,
       };
     }
   }
