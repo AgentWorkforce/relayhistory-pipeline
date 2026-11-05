@@ -44,6 +44,25 @@ without taking any lock.
 5s. It overrides a shorter (or longer) timeout set by the caller. The caller's own setting applies only
 to statements outside the function.
 
+If `set_live(true)` keeps returning 55P03, something is holding a lock on `session_index` that
+conflicts with SHARE. Look in `pg_stat_activity` and `pg_locks` for:
+- autovacuum or `ANALYZE` on `sessions.session_index`, or a `CREATE INDEX CONCURRENTLY` on it (each
+  holds SHARE UPDATE EXCLUSIVE);
+- a long-running indexer transaction.
+
+NOWAIT never cancels autovacuum: wait for it to finish, or pause the indexer briefly, then retry.
+
+```sql
+SELECT a.pid, a.state, a.backend_type, l.mode, l.granted, left(a.query, 120) AS query
+  FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+ WHERE l.relation = 'sessions.session_index'::regclass;
+```
+
+There is also a known, pre-existing three-way 40P01 between `set_live(false)`, a running
+`ingest_history_pointer_ref_backfill` page and a lazy selection/reset control. PostgreSQL's deadlock
+detector resolves it by aborting one of them. It only involves operator calls, and nothing is left
+half-done, so retry the aborted call (the switch or the backfill page).
+
 - **Off:** every in-flight build is abandoned; every 620 trigger (ACK, control, directory,
   session_index) returns immediately; every read gate behaves as main; `ingest_history_scope_begin`
   and `ingest_history_scope_install` refuse with `history: 620 is switched off`. Pointer tracking stops
