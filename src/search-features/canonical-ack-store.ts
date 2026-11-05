@@ -29,13 +29,28 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
    * refuses if they drifted.
    */
   async begin(entry: CanonicalJournalEntry, profileBinding: string) {
-    await this.db.query(
+    // Drift refuses: a begin on an existing revision whose identity/bindings
+    // changed is a conflict, never a silent accept.
+    const auth = JSON.stringify(
+      "sourceAuthority" in entry ? entry.sourceAuthority
+        : entry.priorSourceAuthority);
+    const { rows } = await this.db.query<{ n: number }>(
       `INSERT INTO ${ST}(entry_revision,kind,image_key,source_authority,` +
         ` pointer_set,profile_binding,dirty) VALUES($1,$2,$3,$4,$5,$6,true)` +
-        ` ON CONFLICT (entry_revision) DO NOTHING`,
-      [entry.revision, entry.kind, entry.imageKey,
-        JSON.stringify("sourceAuthority" in entry ? entry.sourceAuthority : entry.priorSourceAuthority),
+        ` ON CONFLICT (entry_revision) DO NOTHING RETURNING 1 AS n`,
+      [entry.revision, entry.kind, entry.imageKey, auth,
         JSON.stringify(entry.pointerSet), profileBinding]);
+    if (!rows.length) {
+      const { rows: ex } = await this.db.query<{
+        source_authority: unknown; pointer_set: unknown;
+        profile_binding: string }>(
+        `SELECT source_authority,pointer_set,profile_binding FROM ${ST}` +
+          ` WHERE entry_revision=$1`, [entry.revision]);
+      if (!ex.length || JSON.stringify(ex[0]!.source_authority) !== auth ||
+          JSON.stringify(ex[0]!.pointer_set) !== JSON.stringify(entry.pointerSet) ||
+          ex[0]!.profile_binding !== profileBinding)
+        throw new Error("begin_drift");
+    }
   }
 
   /** Immutable page ACK — same page replays no-op; a mismatch refuses. */
@@ -65,6 +80,18 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
         throw new Error("ack_mismatch");
       // identical replay — no-op
     }
+  }
+
+  /** Durable resume: the verified next cursor from the chain's last edge. */
+  async resumeCursor(
+    entry: CanonicalJournalEntry, pool: "event" | "brief",
+  ): Promise<string | null> {
+    const { rows } = await this.db.query<{ next_cursor: string | null }>(
+      `SELECT next_cursor FROM ${PAGE}` +
+        ` WHERE entry_revision=$1 AND pool=$2 AND next_cursor IS NOT NULL` +
+        ` ORDER BY cursor DESC LIMIT 1`,
+      [entry.revision, pool]);
+    return rows[0]?.next_cursor ?? null;
   }
 
   /** All ACKed pages for a revision/pool, in insertion order (the chain). */
@@ -105,19 +132,14 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
       // contiguity check happens server-side in the production RPC; here the
       // chain rows are verified by the finish RPC (see finish_canonical_copy).
     }
-    // Finish CAS: the journal entry must still be current (its revision is
-    // the alloc high-water or a pending pair's member) AND the bindings
-    // unchanged — a superseded entry cannot finish.
-    const { rows } = await this.db.query<{ n: number }>(
-      `UPDATE ${ST} SET dirty=false` +
-        ` WHERE entry_revision=$1 AND dirty=true` +
-        ` AND source_authority=$2 AND profile_binding=$3` +
-        ` AND EXISTS (SELECT 1 FROM sessions.canonical_feature_journal j` +
-        `   WHERE j.revision=$1 AND j.image_key=$4 AND j.kind=$5)` +
-        ` RETURNING 1 AS n`,
+    // The CAS proof lives in the owner-side RPC: it locks the state row,
+    // matches the exact journal entry + bindings, and verifies both
+    // start-anchored chains before flipping dirty->complete.
+    const { rows } = await this.db.query<{ ok: boolean }>(
+      `SELECT sessions.finish_canonical_copy($1,$2,$3) AS ok`,
       [e.revision, JSON.stringify(input.sourceAuthority),
-        input.profileBinding, e.imageKey, e.kind]);
-    if (!rows.length)
-      throw new Error("finish_cas: stale bindings, superseded, or done");
+        input.profileBinding]);
+    if (!rows[0]?.ok)
+      throw new Error("finish_cas: stale bindings, broken chain, or done");
   }
 }

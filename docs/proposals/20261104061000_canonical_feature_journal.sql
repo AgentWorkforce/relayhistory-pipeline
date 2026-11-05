@@ -60,14 +60,14 @@ REVOKE ALL ON sessions.canonical_feature_page_ack,
 -- (never the journal or creator authority). OWNER-ONLY RPC boundary pending.
 GRANT SELECT ON sessions.canonical_feature_journal
   TO bulls96_canonical_feature_producer;
-GRANT INSERT,SELECT,UPDATE(dirty) ON sessions.canonical_feature_page_ack,
-  sessions.canonical_feature_copy_state
+GRANT INSERT,SELECT ON sessions.canonical_feature_page_ack
+  TO bulls96_canonical_feature_producer;
+GRANT INSERT,SELECT,UPDATE(dirty) ON sessions.canonical_feature_copy_state
   TO bulls96_canonical_feature_producer;
 
--- Server-side finish: verifies BOTH contiguous page chains (initial cursor ->
--- terminal), the exact journal entry, and unchanged authority/profile, then
--- CAS dirty->complete in one transaction. A skipped or misordered page fails
--- the chain check — a partial image is never marked done.
+-- Server-side finish: locks the state row, matches the exact journal entry
+-- and bindings, proves BOTH start-anchored acyclic page chains end at exactly
+-- one terminal page, then CAS dirty->complete in one transaction.
 CREATE OR REPLACE FUNCTION sessions.finish_canonical_copy(
   p_revision bigint,
   p_source_authority jsonb,
@@ -77,41 +77,53 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path='' AS $finish$
 DECLARE
   v_st sessions.canonical_feature_copy_state%ROWTYPE;
   v_pool text;
-  v_prev_next text;
-  v_last text;
-  v_terminal_ok boolean;
+  v_cursor text;
+  v_next text;
+  v_seen text[];
+  v_steps int;
+  v_count int;
+  v_terminal int;
 BEGIN
   SELECT * INTO v_st FROM sessions.canonical_feature_copy_state
     WHERE entry_revision=p_revision FOR UPDATE;
-  IF NOT FOUND THEN RETURN false; END IF;
-  IF NOT v_st.dirty THEN RETURN false; END IF;
-  IF v_st.source_authority IS DISTINCT FROM p_source_authority
+  IF NOT FOUND OR NOT v_st.dirty
+     OR v_st.source_authority IS DISTINCT FROM p_source_authority
      OR v_st.profile_binding IS DISTINCT FROM p_profile_binding
   THEN RETURN false; END IF;
+  -- The state row must still bind the exact journal entry (identity drift
+  -- refuses: a superseded or mismatched entry cannot finish).
+  IF NOT EXISTS(SELECT 1 FROM sessions.canonical_feature_journal
+    WHERE revision=p_revision AND image_key=v_st.image_key AND kind=v_st.kind)
+  THEN RETURN false; END IF;
 
-  -- Each pool's chain must be contiguous: page[i].next_cursor = page[i+1].cursor
-  -- and the LAST page is the terminal (next_cursor IS NULL).
+  -- Each pool's chain must start at 'start', be acyclic (every cursor
+  -- visited once, each page's next feeds the next), and end at exactly one
+  -- terminal page (next_cursor IS NULL).
   FOR v_pool IN SELECT pool FROM (VALUES('event'),('brief'))p(pool)
   LOOP
-    v_prev_next := NULL;
-    v_terminal_ok := false;
-    FOR v_last IN
-      SELECT cursor,next_cursor FROM sessions.canonical_feature_page_ack
-        WHERE entry_revision=p_revision AND pool=v_pool ORDER BY cursor
+    SELECT count(*) INTO v_count FROM sessions.canonical_feature_page_ack
+      WHERE entry_revision=p_revision AND pool=v_pool;
+    IF v_count=0 THEN RETURN false; END IF;   -- zero pages -> not finished
+    -- Exactly one terminal page (next_cursor IS NULL).
+    SELECT count(*) INTO v_terminal FROM sessions.canonical_feature_page_ack
+      WHERE entry_revision=p_revision AND pool=v_pool AND next_cursor IS NULL;
+    IF v_terminal<>1 THEN RETURN false; END IF;
+    -- Walk the chain from 'start'; a gap/branch/disconnected component or a
+    -- repeated cursor (cycle) terminates before v_count steps -> refuse.
+    v_cursor:='start'; v_steps:=0; v_seen:=ARRAY[]::text[];
     LOOP
-      IF v_prev_next IS DISTINCT FROM NULL
-         AND v_last IS DISTINCT FROM v_prev_next
-      THEN RETURN false; END IF;          -- a gap/skipped page
-      v_prev_next := v_last;
+      IF v_cursor=ANY(v_seen) THEN RETURN false; END IF;  -- cycle
+      v_seen:=v_seen||v_cursor;
+      SELECT next_cursor INTO v_next FROM sessions.canonical_feature_page_ack
+        WHERE entry_revision=p_revision AND pool=v_pool AND cursor=v_cursor;
+      IF NOT FOUND THEN RETURN false; END IF;   -- dangling next -> gap
+      v_steps:=v_steps+1;
+      EXIT WHEN v_next IS NULL;
+      v_cursor:=v_next;
     END LOOP;
-    -- Terminal: the last page has next_cursor IS NULL.
-    SELECT count(*)=0 INTO v_terminal_ok
-      FROM sessions.canonical_feature_page_ack
-      WHERE entry_revision=p_revision AND pool=v_pool AND next_cursor IS NOT NULL
-        AND next_cursor NOT IN (SELECT cursor FROM sessions.canonical_feature_page_ack
-          WHERE entry_revision=p_revision AND pool=v_pool)
-        AND next_cursor IS NOT NULL;
-    IF NOT v_terminal_ok THEN RETURN false; END IF;
+    -- The chain must reach the terminal in exactly v_count steps — a branch
+    -- or disconnected component leaves pages unvisited.
+    IF v_steps<>v_count THEN RETURN false; END IF;
   END LOOP;
   UPDATE sessions.canonical_feature_copy_state SET dirty=false
     WHERE entry_revision=p_revision;
