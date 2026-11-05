@@ -10,7 +10,7 @@ await db.query(`CREATE TABLE sessions.canonical_feature_journal(revision bigint 
 CREATE TABLE sessions.canonical_feature_page_ack(entry_revision bigint,kind text,pool text,cursor text,next_cursor text,page_sha256 text,PRIMARY KEY(entry_revision,pool,cursor));
 CREATE TABLE sessions.canonical_feature_copy_state(entry_revision bigint PRIMARY KEY,kind text,image_key text,source_authority jsonb,pointer_set jsonb,profile_binding text,target_binding text DEFAULT '',dirty boolean NOT NULL DEFAULT true);`);
 const sql = readFileSync(
-  "docs/proposals/20261104061000_canonical_feature_journal.sql","utf8");
+  "docs/proposals/20261105025000_canonical_feature_journal.sql","utf8");
 const rpc = sql.match(
   /CREATE OR REPLACE FUNCTION sessions\.finish_canonical_copy[\s\S]*?\$finish\$;/)?.[0];
 await db.query(rpc!);
