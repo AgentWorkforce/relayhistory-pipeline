@@ -17,40 +17,49 @@ Khaliq's separate explicit approval.
 
 ### Required for the Friday canary
 
-| ID | Deliverable | Owner | Done evidence |
-| --- | --- | --- | --- |
-| F1 | Announced slim #230 (schema + production creator only), then restack #233 on its exact head | 620 creator agent; migration-completeness | Final base SHA; clean stacked diff; creator race suite |
-| F2 | Correct owner-only 610 ABI: explicit seed above drained legacy high-water; initial publish; atomic exact prior retirement then replacement publish; no raw pointer arrays in the journal | migration-completeness + supporter-cloud + 620 creator agent | Fresh and replacement transaction tests; missing-seed refusal; rollback emits no row; restricted-role ACL/rollback/sentinel checks |
-| F3 | Publish new buffered uploads into ready canonical scopes and directory/replay authorities; drain only the bounded post-cutover catch-up for the canary scope | 620 creator/publication owner + sessionspipelinegrok | Captured cutover high-water; zero unpublished/dirty rows for the selected scope; exact read hydration succeeds |
-| F4 | Run a durable leased journal consumer with bounded 184 materialization, per-page ACKs, two-pool terminal finish CAS, retry/DLQ and metrics | migration-completeness + supporter-cloud | Restart/stale-worker tests; zero selected-scope journal backlog; immutable worker build identity |
-| F5 | Install event, brief, directory-document, authority and profile tables with separate least-privilege writer/reader roles and existing secret bindings | migration-completeness + supporter-cloud; bulls-migrator as operator | Reviewed DDL/grants; endpoint/database/schema hashes; live restricted-role probes |
-| F6 | Complete only the selected scope's directory-document baseline and journal catch-up; never expose partial workspace results | migration-completeness + sessionspipelinegrok | Event, brief and directory pools at the same captured revision; readiness clean |
-| F7 | Serve the uploaded session from Supabase-backed list/detail/summary reads | bulls-migrator read-path lane + Cloud UI lane | Buffered upload visible in directory and exact session hydration; tenant/auth negative tests; rollback flag recorded |
-| F8 | Land canonical reader/visibility stack #179+ and route the canary scope only after readiness succeeds | canonical #179+ owner + migration-completeness | Legacy-filter parity, cursor stability, exact hydration authority and fail-closed dirty-state tests |
-| F9 | One-org canary: upload, read, keyword search, semantic search when a stored vector exists, replace, delete/tombstone, latency and rollback | bulls-migrator coordinates; all owners provide evidence | Timestamped request/results, FINAL rows, parity report, no dirty/backlog, rollback rehearsal |
-| F10 | Replace the Neon-trigger project feeds with durable canonical-publication events in Cloud's current queue ABI: brief completion `{eventId}` and session revision `{kind:"session.revised",eventId,generation}` with decimal-string generation | 620 publication owner + migration-completeness + P5b/Cloud project-events owner | Outbox commits with publication; Cloud resolves trusted event metadata from the new authority, admits once under duplicate delivery, generation-fences acknowledgements, recovers failed sends, and refreshes the canary project summary |
+The minimum path to the first visible post-cutover upload is ordered F1/F2,
+F3, F4/F5, F6, F7, F8, then the narrow F9 proof. “First-visible gate”
+means the upload must appear in canonical list/detail/summary reads and keyword
+search through the production-shaped paths. It does not claim complete project
+summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
+
+| ID | First-visible gate | Deliverable | Owner | Done evidence |
+| --- | --- | --- | --- | --- |
+| F1 | **REQUIRED** | Announced slim #230 (schema + production creator only), then restack #233 on its exact head | 620 creator agent; migration-completeness | Final base SHA; clean stacked diff; creator race suite |
+| F2 | **REQUIRED** | Correct owner-only 610 ABI: explicit seed above drained legacy high-water; initial publish; atomic exact prior retirement then replacement publish; no raw pointer arrays in the journal | migration-completeness + supporter-cloud + 620 creator agent | Fresh and replacement transaction tests; missing-seed refusal; rollback emits no row; restricted-role ACL/rollback/sentinel checks |
+| F3 | **REQUIRED** | Publish new buffered uploads into ready canonical scopes and directory/replay authorities; drain only the bounded post-cutover catch-up for the canary scope | 620 creator/publication owner + sessionspipelinegrok | Captured cutover high-water; zero unpublished/dirty rows for the selected scope; exact read hydration succeeds |
+| F4 | **REQUIRED** | Run a durable leased journal consumer with bounded 184 materialization, per-page ACKs, two-pool terminal finish CAS, retry/DLQ and metrics | migration-completeness + supporter-cloud | Restart/stale-worker tests; zero selected-scope journal backlog; immutable worker build identity |
+| F5 | **REQUIRED** | Install event, brief, directory-document, authority and profile tables with separate least-privilege writer/reader roles and existing secret bindings | migration-completeness + supporter-cloud; bulls-migrator as operator | Reviewed DDL/grants; endpoint/database/schema hashes; live restricted-role probes |
+| F6 | **REQUIRED** | Complete only the selected scope's directory-document baseline and journal catch-up; never expose partial workspace results | migration-completeness + sessionspipelinegrok | Event, brief and directory pools at the same captured revision; readiness clean |
+| F7 | **REQUIRED** | Serve the uploaded session from Supabase-backed list/detail/summary reads. The API path gates first visibility; the broad Cloud UI rollout does not | bulls-migrator read-path lane + Cloud UI lane | Buffered upload visible in directory and exact session hydration; tenant/auth negative tests; rollback flag recorded |
+| F8 | **REQUIRED** | Land canonical reader/visibility stack #179+ and route the canary scope only after readiness succeeds | canonical #179+ owner + migration-completeness | Legacy-filter parity, cursor stability, exact hydration authority and fail-closed dirty-state tests |
+| F9 | **REQUIRED subset** | First-visible proof: upload, read, keyword search, latency and rollback. Semantic search when a stored vector exists, replacement and delete/tombstone remain required for the full Friday canary but do not gate the first visible session | bulls-migrator coordinates; all owners provide evidence | Timestamped upload/read/keyword results, FINAL rows, no dirty/backlog and rollback rehearsal; then the remaining full-canary evidence |
+| F10 | **LATER than first visibility; REQUIRED Friday** | Replace the Neon-trigger project feeds with durable canonical-publication events in Cloud's current queue ABI: brief completion `{eventId}` and session revision `{kind:"session.revised",eventId,generation}` with decimal-string generation | 620 publication owner + migration-completeness + P5b/Cloud project-events owner | Outbox commits with publication; Cloud resolves trusted event metadata from the new authority, admits once under duplicate delivery, generation-fences acknowledgements, recovers failed sends, and refreshes the canary project summary |
 
 ### Required later for broad migration
 
-| ID | Deliverable | Owner | Why it can follow the bounded canary |
-| --- | --- | --- | --- |
-| L1 | Dedupe and resume the full 61M corpus plus live catch-up using the existing S3 manifest index and pipeline backfill already running | sessionspipelinegrok + migration-completeness | The Friday canary uses a fully complete bounded scope; broad workspaces remain on the current reader |
-| L2 | Complete model-summary generation and its full backfill | model lane | New-upload read/search can use existing title, short summary and stored feature vectors without claiming full model coverage |
-| L3 | Finish physical A/B carrier retirement, shared-reference reconciliation, late-PUT barriers and end-to-end S3 erasure | 620 retirement owner + bulls-migrator | Search tombstones are required for the canary; broad source-retirement activation remains blocked until this is complete |
-| L4 | Prove the largest real images and all oversize cohorts on the high-memory/streaming path | 620 materializer owner + supporter-cloud | The canary must select a proven bounded scope; unsupported scopes remain fail-closed |
-| L5 | Configure per-org retention across Supabase, ClickHouse and S3, including journal retention | migration-completeness + retirement owner | No TTL or deletion policy is enabled merely to meet the canary date |
-| L6 | Backfill every directory document, enable embeddings/model bindings where required, complete broad UI rollout and retire the legacy reader only after parity | canonical #179+ owner + Cloud UI lane + model lane | Broad cutover requires complete coverage and rollback evidence, not just a successful canary |
+| ID | First-visible gate | Deliverable | Owner | Why it can follow the bounded canary |
+| --- | --- | --- | --- | --- |
+| L1 | **LATER** | Dedupe and resume the full 61M corpus plus live catch-up using the existing S3 manifest index and pipeline backfill already running | sessionspipelinegrok + migration-completeness | The Friday canary uses a fully complete bounded scope; broad workspaces remain on the current reader |
+| L2 | **LATER** | Complete model-summary generation and its full backfill | model lane | New-upload read/search can use existing title, short summary and stored feature vectors without claiming full model coverage |
+| L3 | **LATER** | Finish physical A/B carrier retirement, shared-reference reconciliation, late-PUT barriers and end-to-end S3 erasure | 620 retirement owner + bulls-migrator | Search tombstones are required for the full canary delete proof; broad source-retirement activation remains blocked until this is complete |
+| L4 | **LATER** | Prove the largest real images and all oversize cohorts on the high-memory/streaming path | 620 materializer owner + supporter-cloud | The selected canary scope must pass the bounded 184 path; largest-cohort proof does not gate its first visible session and unsupported scopes remain fail-closed |
+| L5 | **LATER** | Configure per-org retention across Supabase, ClickHouse and S3, including journal retention | migration-completeness + retirement owner | No TTL or deletion policy is enabled merely to meet the canary date |
+| L6 | **LATER** | Backfill every directory document, enable embeddings/model bindings where required, complete broad UI rollout and retire the legacy reader only after parity | canonical #179+ owner + Cloud UI lane + model lane | Broad cutover requires complete coverage and rollback evidence, not just a successful canary |
 
 ## Publication authority
 
 - Merge and apply the 610/620 creator stack only in its planned generation
   window. The owner-only journal append is composed into the final install CAS,
   but schema presence alone is not activation.
-- Fix the replacement journal ABI before merge. The current wrapper emits only
-  one `retire` row when `priorSource` exists, never a `publish` row for the new
-  image, and records the new pointer set on the retire row. It must durably
-  order an exact prior-key retirement and replacement publication, carrying a
-  verified descriptor for each image, without a visibility gap.
+- Keep the replacement journal ABI on hold until its actual SQL passes the
+  PostgreSQL 17 contract suite. The 2026-11-05 audit of `8602ca9` found a valid
+  publish failing in `image_key` construction, the retire authority written to a
+  different column than the reader consumes, non-exact/NULL-unsafe JSON
+  validation, stale shared ABI types and a non-idempotent backfill calling the
+  live final-CAS RPC. It must durably order an exact prior-key retirement and
+  replacement publication, carrying a verified descriptor for each image,
+  without a visibility gap.
 - Define and rehearse the operator-only seed row. It must put the journal above
   the drained legacy feature high-water before any scope install or backfill;
   no data-plane identity may allocate or append revisions.
