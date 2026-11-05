@@ -82,13 +82,16 @@ async function* pageAll(
   entry: CanonicalJournalEntry,
   kind: "event" | "brief",
   prior: boolean,
-): AsyncGenerator<CanonicalImagePage, void, void> {
-  let cursor: string | null = null;
+  resumeCursor: string | null = null,
+): AsyncGenerator<{ page: CanonicalImagePage; request: string | null },
+                  void, void> {
+  // Resume at the last ACKed cursor — a restart continues the verified chain.
+  let cursor: string | null = resumeCursor;
   do {
     const page: CanonicalImagePage = prior
       ? await port.priorKeyPages(entry, kind, cursor)
       : await port.imagePages(entry, kind, cursor);
-    yield page;
+    yield { page, request: cursor };
     cursor = page.cursor;
   } while (cursor !== null);
 }
@@ -103,6 +106,9 @@ export async function copyCanonicalEntry(
   ch: ClickHouseClient,
   state: CanonicalCycleState,
   entry: CanonicalJournalEntry,
+  /** Restart position per pool: last ACKed cursor (null = start). */
+  resume: { event: string | null; brief: string | null } =
+    { event: null, brief: null },
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
@@ -117,6 +123,7 @@ export async function copyCanonicalEntry(
     entry.kind === "publish" ? entry.sourceAuthority : entry.priorSourceAuthority;
   const insertOnePage = async (
     kind: "event" | "brief", page: CanonicalImagePage,
+    request: string | null,
   ) => {
     const rows =
       kind === "event"
@@ -142,16 +149,16 @@ export async function copyCanonicalEntry(
       kind === "event" ? EVENT_FEATURES_TABLE : BRIEF_FEATURES_TABLE,
       produced.rows);
     await acks.ackPage({
-      entry, kind, cursor: page.cursor ?? "terminal",
-      pageSha256: page.pageSha256,
+      entry, kind, cursor: request ?? "start",
+      nextCursor: page.cursor, pageSha256: page.pageSha256,
     });
     return produced;
   };
   let total = 0, terminalEvent = "", terminalBrief = "";
   for (const kind of ["event", "brief"] as const) {
-    for await (const page of pageAll(images, entry, kind,
-        entry.kind === "retire")) {
-      const r = await insertOnePage(kind, page);
+    for await (const { page, request } of pageAll(images, entry, kind,
+        entry.kind === "retire", resume[kind])) {
+      const r = await insertOnePage(kind, page, request);
       if (r.kind === "refused") return r;
       total += r.rows.length;
     }

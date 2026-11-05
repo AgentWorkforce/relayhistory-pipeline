@@ -86,7 +86,9 @@ export interface CanonicalFeatureChangedPort {
 export interface CanonicalPageAckPort {
   ackPage(input: {
     entry: CanonicalJournalEntry; kind: "event" | "brief";
-    cursor: string; pageSha256: string;
+    cursor: string;                 // the request cursor that produced this page
+    nextCursor: string | null;      // the following page's cursor (null=terminal)
+    pageSha256: string;
   }): Promise<void>;
   /** finish CAS: both pool terminal descriptors + all page ACKs + current
    *  source authority + unchanged target/profile bindings. */
