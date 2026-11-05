@@ -22,8 +22,11 @@ const fakeDb = () => {
       return { rows: [] as T[] };
     }
     if (text.includes("consumer_dead_letter") && text.includes("INSERT")) {
-      if (!dead.some((d) => d.revision === params[0]))
-        dead.push({ revision: params[0], reason: params[2] });
+      // (entry_revision, partition, image_key, reason, attempts, dead_at)
+      if (!dead.some((d) => d.revision === params[0] &&
+        d.partition === params[1]))
+        dead.push({ revision: params[0], partition: params[1],
+          reason: params[3] });
       return { rows: [] as T[] };
     }
     if (text.includes("consumer_checkpoint") && text.includes("SELECT")) {
@@ -148,5 +151,41 @@ describe("canonical consumer — enabled gate + target/partition split", () => {
       journal([entry("10", OTHER), entry("10", OTHER)]) as never, acks, CFG);
     const out = await c.drain(images as never, ch as never);
     expect(out.checkpoint).toBe("10");   // first accepted, repeat held
+  });
+});
+
+describe("canonical consumer — poison map + renewal", () => {
+  test("every stable producer poison code persists verbatim", async () => {
+    const db = fakeDb();
+    const c = new CanonicalConsumer({ query: db.query },
+      journal([]) as never, acks, CFG);
+    for (const code of ["reference_invalid", "tombstone_invalid",
+        "payload_invalid", "vector_invalid", "payload_bound",
+        "batch_invalid", "duplicate", "row_invalid", "corrupt_chain"])
+      await c.deadLetter(entry("1" + Math.random()), code);
+    expect(db.dead.length).toBe(9);
+    // a hold/unknown code is NEVER persisted
+    await c.deadLetter(entry("99"), "source_changed");
+    await c.deadLetter(entry("98"), "something_random");
+    expect(db.dead.length).toBe(9);
+  });
+  test("heartbeat renews a held lease; a stale owner cannot renew", async () => {
+    const db = fakeDb();
+    const a = new CanonicalConsumer({ query: db.query },
+      journal([]) as never, acks, CFG);
+    expect(await a.acquireLease()).toBe(true);
+    expect(await a.heartbeat()).toBe(true);    // held -> renew succeeds
+    const b = new CanonicalConsumer({ query: db.query },
+      journal([]) as never, acks, { ...CFG, ownerId: "b" });
+    expect(await b.heartbeat()).toBe(false);   // not the owner -> cannot renew
+  });
+  test("disabled: every public method is zero-access", async () => {
+    const db = fakeDb();
+    const c = new CanonicalConsumer({ query: db.query },
+      journal([]) as never, acks, { ...CFG, enabled: false });
+    expect(await c.acquireLease()).toBe(false);
+    expect(await c.heartbeat()).toBe(false);
+    await c.deadLetter(entry("1"), "row_invalid");
+    expect(db.lease.length + db.dead.length).toBe(0);
   });
 });

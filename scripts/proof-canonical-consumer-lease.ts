@@ -41,7 +41,10 @@ const OTHER = { orgId: "o2", workspaceId: "other-ws", harness: "h",
 await db.query(`INSERT INTO sessions.ingest_history_scope_versions VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [UID, "o2", "other-ws", "h", "s", 1, A, PTR.hash, 1]);
 await db.query(`SELECT sessions.canonical_feature_changed($1,$2,$3,$4,$5)`, [JSON.stringify(OTHER), JSON.stringify(AUTH), null, JSON.stringify(PTR), null]);
 
-const sql = { query: (t: string, p?: unknown[]) => db.query(t, p) };
+const prod = new Pool({ host: "127.0.0.1", port, user: "postgres",
+  password: "synthetic-feature-only", database: "postgres" });
+await prod.query("SET ROLE bulls96_canonical_feature_producer");
+const sql = { query: (t: string, p?: unknown[]) => prod.query(t, p) };
 const journal = new CanonicalJournalStore(sql);
 const store = new CanonicalPageAckStore(sql);
 const ch = { database: "d", insert: async () => {} };
@@ -106,8 +109,6 @@ check("mid_copy_hold_checkpoint_held",
 check("mid_copy_durable_still_dirty", st.rows[0]?.dirty === true);
 // B (the new owner) resumes and finishes rev103.
 const out3 = await b.drain(images, ch);
-console.log("out3", JSON.stringify(out3));
-console.log("out3",JSON.stringify(out3));
 check("takeover_B_finishes", out3.copied === 1 &&
   out3.checkpoint === "103");
 // Different target => disjoint partition: fresh checkpoint, begin_drift holds.
@@ -116,10 +117,7 @@ const c2 = new CanonicalConsumer(counting, journal, store,
 const out4 = await c2.drain(images, ch);
 check("different_target_disjoint_partition",
   out4.copied === 0 && out4.checkpoint === "0");
-// Producer-role ACL: page_ack/lease/dead-letter are insert-select only.
-const prod = new Pool({ host: "127.0.0.1", port, user: "postgres",
-  password: "synthetic-feature-only", database: "postgres" });
-await prod.query("SET ROLE bulls96_canonical_feature_producer");
+// Producer-role ACL: dead-letter is insert-select only.
 const del = await prod.query(
   `DELETE FROM sessions.canonical_feature_consumer_dead_letter`)
   .catch((e: { code?: string }) => e);

@@ -82,8 +82,10 @@ export class CanonicalConsumer {
     return this.partition;
   }
 
+  private get on(): boolean { return this.cfg.enabled === true; }
   /** One atomic acquire/renew/takeover — the bound partition only. */
   async acquireLease(): Promise<boolean> {
+    if (!this.on) return false;
     const { rows } = await this.db.query<{ n: number }>(
       `INSERT INTO ${LEASE}(partition,owner,heartbeat_at)` +
         ` VALUES($1,$2,now()) ON CONFLICT (partition)` +
@@ -94,8 +96,11 @@ export class CanonicalConsumer {
       [this.ensurePartition(), this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
     return rows.length > 0;
   }
-  /** Heartbeat — requires a still-fresh held lease; a stale owner cannot. */
+  /** Atomic renew-and-held: one statement checks THIS owner is still fresh
+   *  AND extends the lease — used as the page/finish guard so a long copy
+   *  stays owned and a lost lease stops the worker. */
   async heartbeat(): Promise<boolean> {
+    if (!this.on) return false;
     const { rows } = await this.db.query<{ n: number }>(
       `UPDATE ${LEASE} SET heartbeat_at=now()` +
         ` WHERE partition=$1 AND owner=$2` +
@@ -138,7 +143,7 @@ export class CanonicalConsumer {
   }
   /** Dead-letter: stable poison code only; immutable (no update/delete). */
   async deadLetter(entry: CanonicalJournalEntry, code: string): Promise<void> {
-    if (!POISON[code]) return;
+    if (!this.on || !POISON[code]) return;
     await this.db.query(
       `INSERT INTO ${DEAD}(entry_revision,partition,image_key,reason,` +
         `attempts,dead_at)` +
@@ -214,8 +219,8 @@ export class CanonicalConsumer {
       try {
         const r = await copyCanonicalEntry(
           images, this.acks, ch, { checkpoint }, entry, this.cfg.targetId,
-          { beforeWrite: () => this.leaseHeld(),
-            beforeFinish: () => this.leaseHeld() });
+          { beforeWrite: () => this.heartbeat(),
+            beforeFinish: () => this.heartbeat() });
         if (r.kind === "copied") return "copied";
         const reason = (r as { reason: string }).reason;
         if (HOLD.has(reason)) return "hold";
