@@ -29,9 +29,9 @@ export async function largeReadMain(env:NodeJS.ProcessEnv=process.env,factory:(e
  type Page={busy:boolean;scanned:number;changed:number;cycleComplete:boolean};
  const discover=async():Promise<Page|null>=>{
    let page:Page|undefined;
-   // One scope discovery cannot enqueue (54000 capacity, ambiguous source, ...) rolls back the
-   // whole page, cursor included. Log the bounded code and keep claiming already-queued jobs.
-   // Follow-up migration 20261105032000 isolates per-scope discovery failures.
+   // Since migration 20261105032000 a scope discovery cannot enqueue (54000 capacity, ambiguous
+   // source, ...) is recorded in sessions.session_large_read_scope_errors and skipped; only a
+   // transient/server-wide error still rolls back the page. Log the bounded code and keep claiming.
    try{page=(await runtime.deps.db.query<{r:Page}>("SELECT sessions.discover_session_large_reads() r")).rows[0]?.r}
    catch(error){log.error("large worker discovery failed",{stage:"large-read",...errorFields(error),reason:classifyReplayFailure(error)?.reason??"discovery_failed"});discoveryFailures++;return null}
    if(!page||typeof page.busy!=="boolean"||!Number.isSafeInteger(page.scanned)||page.scanned<0||page.scanned>128||!Number.isSafeInteger(page.changed)||page.changed<0||page.changed>page.scanned||typeof page.cycleComplete!=="boolean")throw new Error("large worker invalid discovery");

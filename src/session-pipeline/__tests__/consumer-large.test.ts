@@ -42,7 +42,7 @@ test("flag off: no deps.large, no routing call, search runs as before",async()=>
  expect(f.deps.large).toBeUndefined();
  const r=await f.run();
  expect(r).toMatchObject({failures:[],searched:true,lines:[]});
- // The real route would delegate this fixture (0/NULL counts): it must not have been consulted.
+ // The route must not have been consulted: no job exists for this fixture.
  expect((await f.x.db.query<{n:number}>("SELECT count(*)::int n FROM sessions.session_large_read_jobs")).rows[0]!.n).toBe(0);
 },60000);
 
@@ -122,9 +122,19 @@ test("flag on + job state read failure: still delegated, warned, batch succeeds"
  expect(r.lines).toEqual([expect.objectContaining({level:"warn",message:"large scope job state unavailable",error_code:"42501"})]);
 },60000);
 
+test("real route + unmeasured (0 count) pointers: not delegated, search runs, nothing queued (032000)",async()=>{
+ const f=await fixture();
+ f.deps.large={route:s=>routeLargeRead(f.x.db,s),jobState:s=>largeReadJobState(f.x.db,s)};
+ const r=await f.run();
+ expect(r).toMatchObject({failures:[],searched:true,lines:[]});
+ expect((await f.x.db.query<{n:number}>("SELECT count(*)::int n FROM sessions.session_large_read_jobs")).rows[0]!.n).toBe(0);
+},60000);
+
 test("real route + real job state: a failed job is a logged gap, not silent",async()=>{
  const f=await fixture();
  f.deps.large={route:s=>routeLargeRead(f.x.db,s),jobState:s=>largeReadJobState(f.x.db,s)};
+ // Routing selects on measured size only (032000): make the fixture measured-large.
+ await f.x.pg.exec("UPDATE sessions.session_index SET raw_bytes=67108865");
  const first=await f.run();
  expect(first).toMatchObject({failures:[],searched:false});
  expect(first.lines).toEqual([expect.objectContaining({level:"info",message:"large scope delegated",state:"queued",attempt:0})]);
