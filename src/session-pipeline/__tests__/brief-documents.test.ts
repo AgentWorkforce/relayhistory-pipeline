@@ -64,6 +64,39 @@ async function ack(x: Awaited<ReturnType<typeof fresh>>, items: any[]) {
     )
   ).rows[0]!.n;
 }
+test("brief-document queue accepts an empty workspace but rejects a missing or null workspace", async () => {
+  const x = await replayDatabase();
+  open.push(x);
+  const document = {
+    version: 1,
+    orgId: "org_empty_workspace",
+    workspaceId: "",
+    source: "codex",
+    sessionId: "session_empty_workspace",
+  };
+  await x.db.query(
+    "SELECT sessions.queue_session_brief_document($1::jsonb)",
+    [JSON.stringify(document)],
+  );
+  expect(
+    (
+      await x.db.query<{ n: number }>(
+        "SELECT count(*)::int n FROM sessions.session_brief_document_outbox WHERE org_id=$1 AND workspace_id='' AND harness=$2 AND session_id=$3",
+        [document.orgId, document.source, document.sessionId],
+      )
+    ).rows[0]!.n,
+  ).toBe(1);
+  for (const invalid of [
+    (({ workspaceId: _workspaceId, ...rest }) => rest)(document),
+    { ...document, workspaceId: null },
+  ]) {
+    await expect(
+      x.db.query("SELECT sessions.queue_session_brief_document($1::jsonb)", [
+        JSON.stringify(invalid),
+      ]),
+    ).rejects.toMatchObject({ code: "22023" });
+  }
+});
 test("relevant directory writes queue metadata once; publisher acknowledges exact epoch/hash", async () => {
   const x = await fresh();
   const b = await backfill(x);

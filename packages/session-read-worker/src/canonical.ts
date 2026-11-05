@@ -180,6 +180,7 @@ export async function canonicalHandle(
           "order",
           "view",
           "maxContent",
+          "generation",
         ].includes(key) ||
         url.searchParams.getAll(key).length !== 1
       )
@@ -238,13 +239,28 @@ export async function canonicalHandle(
       canonicalSnapshot(deps, identity),
       deadline,
     ]);
+    const expectedGeneration = url.searchParams.get("generation");
+    if (
+      expectedGeneration !== null &&
+      !/^[0-9a-f]{64}$/u.test(expectedGeneration)
+    )
+      throw new CanonicalReadError("parameter", 400);
+    if (
+      expectedGeneration !== null &&
+      expectedGeneration !== snapshot.generation
+    )
+      throw new CanonicalReadError("source_generation_changed");
     const view = url.searchParams.get("view") ?? "raw";
     const rawMax = url.searchParams.get("maxContent"),
       maxContent = rawMax === null ? undefined : Number(rawMax);
     if (
-      (view === "raw" && maxContent !== undefined) ||
-      !["raw", "replay"].includes(view) ||
-      (view === "replay" && table !== "convergence_events") ||
+      (view !== "replay" && maxContent !== undefined) ||
+      !["raw", "replay", "bounds", "legacy"].includes(view) ||
+      (["replay", "bounds"].includes(view) && table !== "convergence_events") ||
+      (view === "legacy" &&
+        !["conversation_turns", "session_links", "session_outcomes"].includes(
+          table,
+        )) ||
       (maxContent !== undefined &&
         (!Number.isFinite(maxContent) ||
           maxContent <= 0 ||
@@ -277,6 +293,22 @@ export async function canonicalHandle(
     const all = snapshot.rows
       .filter((row) => row.table === table)
       .map((item) => {
+        if (view === "bounds")
+          return {
+            ...item,
+            row: Object.fromEntries(
+              [
+                "org_id",
+                "workspace_id",
+                "source",
+                "session_id",
+                "event_id",
+                "machine_id",
+                "kind",
+                "ts",
+              ].map((k) => [k, item.row[k]]),
+            ),
+          };
         if (view !== "replay") return item;
         const { record, ...row } = item.row;
         const payload =
@@ -328,7 +360,10 @@ export async function canonicalHandle(
       if (bytes + size > MAX_BODY - 4096 && rows.length) break;
       if (
         !rows.length &&
-        size > (view === "replay" ? 64 * 1024 * 1024 : MAX_BODY - 4096)
+        size >
+          (["replay", "legacy"].includes(view)
+            ? 64 * 1024 * 1024
+            : MAX_BODY - 4096)
       )
         throw new CanonicalReadError("row_bound");
       rows.push(row);
@@ -342,6 +377,7 @@ export async function canonicalHandle(
         source,
         sessionId,
         generation: snapshot.generation,
+        exists: snapshot.exists,
         legacyCoverage: snapshot.legacyCoverage,
         rows,
         nextCursor:
