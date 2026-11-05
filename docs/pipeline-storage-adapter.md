@@ -77,7 +77,7 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   key, with `raw-sha256`, `raw-bytes`, `scrub-ruleset` and `scrub-version`
   metadata;
 - the response is the chunk entry and the `raw.scrub` marker
-  (`relayhistory-scrub`, the current version, 2 from scrub rule set 2) for the client's manifest.
+  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3) for the client's manifest.
 
 The unscrubbed bytes are never written to storage. If the key already holds
 an object (identical bytes or not), it is kept and described from its own

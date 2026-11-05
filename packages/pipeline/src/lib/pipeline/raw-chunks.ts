@@ -45,8 +45,15 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  * - 2: the same rules; a longer string or run is scrubbed whole, in segments
  *   cut only where no rule can match across the cut (`scrubLong`). Output for
  *   anything within the bound is byte-identical to version 1.
+ * - 3: version 2's segmenter with new rules: quoted secret keys at any JSON
+ *   escaping depth (`\"password\": \"…\"`), Cloudflare `cfut_`/`cfat_`/`cfk_`
+ *   tokens, GitHub fine-grained, GitLab, npm, Hugging Face, SendGrid and
+ *   Slack webhook credentials, non-Bearer `Authorization` schemes, and a
+ *   high-entropy fallback only next to a secret name. Chunks sealed at 1 or 2
+ *   may hold secrets these rules now catch. The segmenter's context check
+ *   (`CUT_CONTEXT_CHARS`) is widened past the quoted rule's reach.
  */
-export const SCRUB_RULESET_VERSION = 2;
+export const SCRUB_RULESET_VERSION = 3;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";
@@ -291,7 +298,19 @@ const withinBudget = (b: CutBudget) => b.checks < MAX_CUT_CHECKS && b.candidates
 
 /** How far back `safeCut` looks for a boundary, and how much text it scrubs. */
 const CUT_SEARCH_CHARS = 65_536;
-const CUT_CONTEXT_CHARS = 4096;
+/**
+ * How much text on each side of a cut the context check scrubs. It must exceed
+ * the longest match any rule can make, or a match whose start is out of view
+ * passes the check and is split. The longest is the quoted key/value rule in
+ * `lib/scrub.ts`: up to `MAX_QUOTED_VALUE` (4096) characters of value, plus a key
+ * of up to 64, two quotes and their backslash runs (16 each, before the key and
+ * before the value, and again before the closing quote) and a separator with up
+ * to 16 whitespace on each side: about 4,250 characters in all. At 4096 a value
+ * whose key began more than 4096 characters before the cut was redacted only up
+ * to its first space before the cut, and the rest was stored. Twice
+ * `MAX_QUOTED_VALUE` leaves room for a later rule to reach a little further.
+ */
+const CUT_CONTEXT_CHARS = 8192;
 
 /**
  * Where a segment may end so that `next` starts the following one: the latest

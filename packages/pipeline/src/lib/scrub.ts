@@ -48,7 +48,219 @@ function redactJwtsInRun(run: string): string {
   return out.join(".");
 }
 
-const SECRET_PATTERNS: Array<[RegExp, Replacement]> = [
+/**
+ * Whether a key names a secret, for the quoted key/value rule. Compound names
+ * (`api_key`, `accessKey`, `SecretAccessKey`, `client-secret`, `sessiontoken`…) count
+ * wherever they end the key. Single words (`password`, `token`, `auth`…) count only as a
+ * whole word at the end of the key: at its start, after a non-letter (`db_password`,
+ * `x-auth-token`, `cf.token`) or at a camelCase hump (`githubToken`), so `oauth`,
+ * `author` and `tokens` are not secret names. A bare `key` is not one either: quoted
+ * `"key"` is everywhere in tool output (S3 object keys, keyboard events, cache keys).
+ */
+const SECRET_KEY_COMPOUND =
+  /(?:api|access|private|secret|auth|signing|encryption|master)[_ -]?key$|client[_ -]?secret$|(?:session|access|refresh|auth|id|bot|bearer|api)[_ -]?token$/i;
+const SECRET_KEY_WORD =
+  /(?:password|passwd|passphrase|secret|token|auth|authorization|credentials?|bearer)$/i;
+
+export function isSecretKeyName(name: string): boolean {
+  if (SECRET_KEY_COMPOUND.test(name)) return true;
+  const m = SECRET_KEY_WORD.exec(name);
+  if (!m) return false;
+  if (m.index === 0) return true;
+  const prev = name[m.index - 1] as string;
+  if (!/[A-Za-z]/.test(prev)) return true;
+  return /[a-z]/.test(prev) && /[A-Z]/.test(name[m.index] as string);
+}
+
+/**
+ * A quoted key at any JSON escaping depth (`"k"`, `\"k\"`, `\\\"k\\\"`, `'k'`, `` `k` ``),
+ * then `:`, `=` or `=>` with optional whitespace. The leading lookbehind starts the
+ * match at the beginning of a backslash run, and every quantifier is bounded, so each
+ * start position is O(1) and the scan is linear.
+ */
+const QUOTED_KEY =
+  /(?<!\\)(\\{0,16})(["'`])([A-Za-z0-9_. -]{1,64})\1\2([ \t]{0,16}(?:=>|[:=])[ \t]{0,16})/g;
+
+/** Longest quoted value the quoted key/value rule looks through for its closing quote. */
+const MAX_QUOTED_VALUE = 4096;
+
+/** JSON literals and numbers after a quoted secret key are not secrets (`"max_token": 512`). */
+const NON_SECRET_BARE =
+  /^(?:true|false|null|undefined|none|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)$/i;
+
+/** Values the quoted key/value rule keeps: already redacted, or a 1Password reference. */
+const keepQuotedValue = (value: string) =>
+  value === REDACTED || value.startsWith("op://");
+
+/** Number of backslashes immediately before `at`. */
+function backslashesBefore(text: string, at: number): number {
+  let n = 0;
+  while (at - n - 1 >= 0 && text[at - n - 1] === "\\") n += 1;
+  return n;
+}
+
+/**
+ * Redact the value of every quoted secret key, keeping the key, the separator and the
+ * value's quotes: `"password": "x"`, `\"password\": \"x\"` (a JSON document inside a
+ * JSON string, such as a tool result), deeper escapings, single-quoted and backtick
+ * forms, and a generated-looking unquoted value after a quoted one-word key
+ * (`'token' => <generated>`). A quoted value ends at the matching closing quote: a
+ * quote escaped once more than the opening one (an inner quote) does not end it, and
+ * nor does one preceded by an escaped backslash. A value with no closing quote on its
+ * line is redacted to the next whitespace. JSON literals and numbers are kept, as are
+ * values already redacted and `op://` references.
+ */
+function redactQuotedSecretValues(text: string): string {
+  if (!/[:=]/.test(text)) return text;
+  let out = "";
+  let last = 0;
+  // Per quote kind (quote character and backslash count), the span a scan already
+  // walked without finding a closing quote. A later value of the same kind that starts
+  // inside it cannot close there either, so it is not walked again: every character is
+  // scanned at most once per kind and the pass stays linear.
+  const unclosed = new Map<string, [number, number]>();
+  QUOTED_KEY.lastIndex = 0;
+  for (let m = QUOTED_KEY.exec(text); m; m = QUOTED_KEY.exec(text)) {
+    const end = m.index + m[0].length;
+    if (!isSecretKeyName((m[3] as string).trim())) continue;
+    let bs = 0;
+    while (bs < 16 && text[end + bs] === "\\") bs += 1;
+    const quote = text[end + bs];
+    let valueStart: number;
+    let valueEnd: number;
+    if (quote === '"' || quote === "'" || quote === "`") {
+      valueStart = end + bs + 1;
+      // At escaping depth d the opening quote has 2^d - 1 backslashes, and a quote is
+      // the closing one when its backslash run is that many modulo 2^(d+1): one more
+      // backslash pair is an escaped backslash, an odd excess is an inner quote.
+      const period = (bs + 1) & bs ? 0 : 2 * (bs + 1);
+      const kind = `${quote}${bs}`;
+      const seen = unclosed.get(kind);
+      let i = valueStart;
+      valueEnd = -1;
+      if (seen && valueStart >= seen[0] && valueStart < seen[1])
+        i = text.length;
+      while (i < text.length && i - valueStart <= MAX_QUOTED_VALUE) {
+        const c = text[i];
+        if (c === "\n" || c === "\r") break;
+        if (c === quote) {
+          const run = backslashesBefore(text, i);
+          const own = i - run >= valueStart ? run : i - valueStart;
+          if (period ? own % period === bs : own === bs) {
+            valueEnd = i - bs;
+            break;
+          }
+        }
+        i += 1;
+      }
+      if (valueEnd === -1) {
+        if (i < text.length) unclosed.set(kind, [valueStart, i]);
+        else if (!seen || valueStart < seen[0] || valueStart >= seen[1])
+          unclosed.set(kind, [valueStart, text.length]);
+        // No closing quote on this line: redact up to the next whitespace.
+        const ws = text
+          .slice(valueStart, valueStart + MAX_QUOTED_VALUE)
+          .search(/\s/);
+        valueEnd =
+          ws === -1
+            ? Math.min(text.length, valueStart + MAX_QUOTED_VALUE)
+            : valueStart + ws;
+      }
+    } else {
+      // An unquoted value is taken only after a one-word key (no space: in
+      // `Error 401 "Invalid authentication token": please run …` the quotes hold
+      // prose) and only when it looks generated (`looksGenerated`), so code is kept:
+      // `case "token": return parseToken(input);`, `case 'auth': handleAuth(req)`.
+      // A short or word-like unquoted password after a quoted key is kept too.
+      if (bs > 0 || (m[3] as string).includes(" ")) continue;
+      valueStart = end;
+      const bare = /^[^\s"'`,;{}[\]\\]+/.exec(
+        text.slice(end, end + MAX_QUOTED_VALUE),
+      );
+      if (!bare || NON_SECRET_BARE.test(bare[0]) || !looksGenerated(bare[0]))
+        continue;
+      valueEnd = end + bare[0].length;
+    }
+    const value = text.slice(valueStart, valueEnd);
+    if (valueEnd <= valueStart || keepQuotedValue(value)) continue;
+    out += text.slice(last, valueStart) + REDACTED;
+    last = valueEnd;
+    QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, valueEnd);
+  }
+  return last === 0 ? text : out + text.slice(last);
+}
+
+/** The start of every literal-prefix rule (see the provider key prefixes). */
+const TOKEN_START = "(?<![A-Za-z0-9_-])";
+
+/**
+ * Each literal-prefix rule (those starting with `TOKEN_START`) for a prefix glued to a
+ * longer token by `-` (`word-sk-…`, `foo-ghp_…`, `id-glpat-…`), which the old `\b` start
+ * caught. The whole `-`-joined token is redacted, not only the prefixed part, so neither
+ * the start of a key it is glued to nor a second glued key after it is left behind. Run
+ * after every full-shape rule (SendGrid, GitLab, Slack, Capy, relay, JWT, Google), so a
+ * key whose body holds `-sk-…` is already redacted whole. A match starts only where a
+ * token starts and tries the literal prefix at each `-` in it, so it costs no more than
+ * the old `\b` start did. The relay_ rule goes first: its body may hold `.`, which no other
+ * prefix rule's does, so a `sk-` rule run first would stop at the `.` and split a glued
+ * `relay_…-sk-….tail` token. Built on first use from `SECRET_PATTERNS`, so the two lists
+ * cannot drift apart.
+ */
+let gluedPrefixRules: [RegExp, Replacement][] | undefined;
+function redactGluedPrefixes(text: string): string {
+  if (!gluedPrefixRules) {
+    const rules = SECRET_PATTERNS.flatMap((rule): [RegExp, Replacement][] =>
+      typeof rule !== "function" && rule[0].source.startsWith(TOKEN_START)
+        ? [
+            [
+              new RegExp(
+                `${TOKEN_START}[A-Za-z0-9_-]*?-(?:${rule[0].source.slice(TOKEN_START.length)})[A-Za-z0-9_-]*`,
+                rule[0].flags,
+              ),
+              rule[1],
+            ],
+          ]
+        : [],
+    );
+    const isRelay = ([pattern]: [RegExp, Replacement]) => pattern.source.includes("relay_");
+    gluedPrefixRules = [...rules.filter(isRelay), ...rules.filter((r) => !isRelay(r))];
+  }
+  return gluedPrefixRules.reduce(
+    (out, [pattern, replacement]) => out.replace(pattern, replacement as any),
+    text,
+  );
+}
+
+/** Shannon entropy of `s` in bits per character. */
+function entropy(s: string): number {
+  const counts = new Map<string, number>();
+  for (const c of s) counts.set(c, (counts.get(c) ?? 0) + 1);
+  let h = 0;
+  for (const n of counts.values()) {
+    const p = n / s.length;
+    h -= p * Math.log2(p);
+  }
+  return h;
+}
+
+/**
+ * Whether a token next to a secret name looks generated: 20+ characters drawing on at
+ * least two of lowercase, uppercase and digits, with at least 3.5 bits of entropy per
+ * character. Only ever asked about a token directly after a secret name (the fallback
+ * rule), never about free text, so commit shas, digests and ids elsewhere in a
+ * transcript are kept.
+ */
+function looksGenerated(token: string): boolean {
+  const classes =
+    Number(/[a-z]/.test(token)) +
+    Number(/[A-Z]/.test(token)) +
+    Number(/\d/.test(token));
+  return token.length >= 20 && classes >= 2 && entropy(token) >= 3.5;
+}
+
+type Rule = [RegExp, Replacement] | ((text: string) => string);
+
+const SECRET_PATTERNS: Rule[] = [
   // PEM private keys (PKCS#1/#8, EC, OpenSSH, encrypted) and armored PGP private key
   // blocks (`-----BEGIN PGP PRIVATE KEY BLOCK-----`), each up to its footer.
   [
@@ -60,21 +272,59 @@ const SECRET_PATTERNS: Array<[RegExp, Replacement]> = [
   [/(^|[\s"'(=:/])\/Users\/[^/\s]+(?=\/)/g, "$1~"],
   [/(^|[\s"'(=:/])\/home\/[^/\s]+(?=\/)/g, "$1~"],
   [/(^|[\s"'(=])([A-Z]:\\Users\\[^\\\s]+)(?=\\)/gi, "$1~"],
-  [/\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b/gi, `Bearer ${REDACTED}`],
-  // Provider key prefixes. The hyphen form covers OpenAI-style `sk-…`; the underscore form
+  // The token runs to the end of its characters, so a trailing `-`, `_` or `=` padding is
+  // part of it (a `\b` end used to leave it behind); a sentence-ending dot is not.
+  [
+    /\bBearer\s+[A-Za-z0-9._~+/=-]{15,}[A-Za-z0-9_~+/=-](?![A-Za-z0-9_~+/=-])/gi,
+    `Bearer ${REDACTED}`,
+  ],
+  // SendGrid API keys (`SG.` + 22 + `.` + 43). Ahead of the prefix rules below: either
+  // segment can start with or contain `sk-`/`ghp_`-like text, and a prefix rule run first
+  // would redact only that tail and leave the start of the key behind.
+  [/\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g, REDACTED],
+  // Provider key prefixes. The hyphen form covers OpenAI-style `sk-…` (`sk-proj-…`) and
+  // Anthropic `sk-ant-…`; the underscore form
   // covers Stripe-style `sk_live_…`/`sk_test_…` (and rk_/pk_) which the hyphen pattern misses.
-  [/\b(?:sk|rk|pk|ak)-[A-Za-z0-9_-]{20,}\b/g, REDACTED],
-  [/\b(?:(?:sk|rk|pk)_(?:live|test)_|whsec_)[A-Za-z0-9]{10,}\b/g, REDACTED],
-  [/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, REDACTED],
+  // These literal-prefix rules start at `(?<![A-Za-z0-9_-])`, not `\b`: `\b` also fires
+  // after a `-` inside a longer token, so `-sk-…`/`-ghp_…` in the body of a later
+  // full-shape key (GitLab, Slack, Capy, Google, a JWT) was redacted alone and the key's
+  // start leaked. The lookbehind is `\b` plus `-` (`_` and alphanumerics already fail
+  // `\b`); a prefix glued to a token by `-` (`word-sk-…`) is taken later instead, with
+  // the token it is glued to, by `redactGluedPrefixes` once the full-shape rules have run.
+  [/(?<![A-Za-z0-9_-])(?:sk|rk|pk|ak)-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])(?:(?:sk|rk|pk)_(?:live|test)_|whsec_)[A-Za-z0-9]{10,}\b/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])gh[pousr]_[A-Za-z0-9_]{20,}\b/g, REDACTED],
   // AWS access/secret-access key IDs (AKIA long-term, ASIA temporary).
-  [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, REDACTED],
-  // Slack tokens (xoxb/xoxp/xoxa/xoxr/xoxs-… and app-level xapp-…).
-  [/\b(?:xox[baprs]|xapp)-[A-Za-z0-9-]{10,}\b/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, REDACTED],
+  // GitHub fine-grained personal access tokens (`github_pat_…`); the classic and app
+  // tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`) are the rule above.
+  [/(?<![A-Za-z0-9_-])github_pat_[A-Za-z0-9_]{22,}/g, REDACTED],
+  // GitLab personal/project/group access tokens.
+  [/(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,}/g, REDACTED],
+  // npm access tokens (`npm_` + 36).
+  [/(?<![A-Za-z0-9_-])npm_[A-Za-z0-9]{36}\b/g, REDACTED],
+  // Hugging Face user access tokens (`hf_` + 34 letters).
+  [/(?<![A-Za-z0-9_-])hf_[A-Za-z]{34}\b/g, REDACTED],
+  // Cloudflare scannable credentials: `cfk_` (Global API Key), `cfut_` (user API token)
+  // and `cfat_` (account API token), each a 40-character alphanumeric body and an
+  // 8-character hex CRC32 checksum (53 characters for `cfut_`/`cfat_`). The body is taken
+  // as 40 or more so a longer variant is still caught; the prefix keeps it tight.
+  // Legacy unprefixed Cloudflare credentials (37-hex Global API Keys, 40-character API
+  // tokens) have no shape of their own and are caught next to their name instead:
+  // `X-Auth-Key: …`, `CLOUDFLARE_API_TOKEN=…`, `"api_token": "…"`, `Bearer …`.
+  [/(?<![A-Za-z0-9_-])cf(?:k|ut|at)_[A-Za-z0-9]{40,}/g, REDACTED],
+  // Slack tokens (xoxb/xoxp/xoxa/xoxr/xoxs/xoxe-… and app-level xapp-…).
+  [/(?<![A-Za-z0-9_-])(?:xox[baprse]|xapp)-[A-Za-z0-9-]{10,}(?![A-Za-z0-9_-])/g, REDACTED],
+  // Slack incoming webhook URLs carry their credential in the path; keep the host.
+  [
+    /(hooks\.slack\.com\/(?:services|workflows|triggers)\/)[A-Za-z0-9_/-]{8,}/g,
+    `$1${REDACTED}`,
+  ],
   // Capy API keys (`capy_…`), Cursor/Grok Bot routine keys (`crsr_…`) and Agent Relay
   // tokens (`relay_ag_…`, `relay_pa_…`, `relay_ws_…`, `relay_id_…`). Capy and Grok Bot
   // transcripts are uploaded to history, and a turn that set up a routine can echo its key.
-  [/\b(?:capy|crsr)_[A-Za-z0-9_-]{16,}/g, REDACTED],
-  [/\brelay_(?:ag|pa|ws|id)_[A-Za-z0-9._-]{16,}/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])(?:capy|crsr)_[A-Za-z0-9_-]{16,}/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])relay_(?:ag|pa|ws|id)_[A-Za-z0-9._-]{16,}/g, REDACTED],
   // Capy automation webhook URLs carry their credential in the path: the URL itself is
   // the secret. Keep the host and route so the reference stays diagnosable. The last
   // character can't be a dot, so a sentence-ending period survives.
@@ -88,7 +338,7 @@ const SECRET_PATTERNS: Array<[RegExp, Replacement]> = [
   // there is no length cap a large token could slip past.
   [/[A-Za-z0-9_.-]{35,}/g, redactJwtsInRun],
   // Service-local relayhistory tokens. Distinct from URL userinfo / Bearer.
-  [/\brth_(?:at|rt|st)_[A-Za-z0-9_]{8,}\b/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])rth_(?:at|rt|st)_[A-Za-z0-9_]{8,}\b/g, REDACTED],
   // OAuth authorize URLs: keep host+path so "stuck at auth.openai.com/oauth/authorize"
   // remains diagnosable, redact the challenge/state/secret query values.
   [
@@ -96,7 +346,21 @@ const SECRET_PATTERNS: Array<[RegExp, Replacement]> = [
     `$1${REDACTED}`,
   ],
   // Google API keys (AIza + 35 chars).
-  [/\bAIza[0-9A-Za-z_-]{30,}\b/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{30,}(?![A-Za-z0-9_-])/g, REDACTED],
+  // The literal-prefix rules again, for a prefix glued to a longer token by `-`. Last of
+  // the token rules: see `redactGluedPrefixes`.
+  redactGluedPrefixes,
+  // Quoted secret keys in every JSON/YAML/Python form, at any escaping depth:
+  // `"password": "…"`, `\"api_key\": \"…\"` (a JSON document inside a tool-result string),
+  // `'token' => '…'`. The value is redacted, the key and quotes kept. See
+  // `redactQuotedSecretValues`.
+  redactQuotedSecretValues,
+  // `Authorization: Basic …` / `Token …` / `Bot …` and other non-Bearer schemes (Bearer is
+  // its own rule above): the credential after the scheme, keeping the scheme.
+  [
+    /(\bauthorization(?![A-Za-z0-9])[^A-Za-z0-9\r\n]{1,8}(?:Basic|Token|Bot|Digest|Negotiate|NTLM)\s+)[A-Za-z0-9._~+/=-]{8,}/gi,
+    `$1${REDACTED}`,
+  ],
   // `<name>=<value>` / `<name>: <value>` secret assignments. The identifier may be prefixed
   // (STRIPE_KEY, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, DB_PASSWORD) — `(?:[A-Za-z0-9]+_)*`
   // absorbs the prefix segments so the trailing sensitive word still anchors. The leading `\b`
@@ -106,7 +370,7 @@ const SECRET_PATTERNS: Array<[RegExp, Replacement]> = [
     // literal is the same quadratic shape fixed in the URL and email patterns. Eight
     // underscore-separated segments is far past any real identifier
     // (`AWS_SECRET_ACCESS_KEY` is three).
-    /\b(?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|pwd)\s*[:=]\s*["'`]?[^"'`\s,;]+/gi,
+    /\b(?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?)\s*[:=]\s*["'`]?[^"'`\s,;]+/gi,
     (match) => {
       // Pick the separator POSITIONALLY (first `:` or `=`) — that is the real name/value
       // delimiter, since the identifier name contains neither. Choosing by `includes("=")`
@@ -117,6 +381,19 @@ const SECRET_PATTERNS: Array<[RegExp, Replacement]> = [
       const separator = match[idx];
       return `${match.slice(0, idx)}${separator}${REDACTED}`;
     },
+  ],
+  // Fallback: a generated-looking token (see `looksGenerated`) directly after a secret
+  // name with only punctuation or a little whitespace between them, in shapes the
+  // assignment rules do not parse: `--token <t>`, `password -> <t>`,
+  // `API key <t>`. Only next to a secret name, so hashes and ids elsewhere are kept. The
+  // token is bounded (a longer run is left whole) so each start stays O(1).
+  // The gap may not start with `/`, `.` or `-`: there the name is a path segment, a
+  // member or a word in a branch name (`src/token/TokenRefreshService.java`,
+  // `token.getAccessTokenSilently()`, `feature/secret-RotateKeys2026`), not a label.
+  [
+    /(?<![A-Za-z0-9])((?:password|passwd|passphrase|secret|token|credentials?|api[_ -]?key|access[_ -]?key|private[_ -]?key|secret[_ -]?key|client[_ -]?secret|auth[_ -]?token|session[_ -]?token)(?![A-Za-z0-9_./-])[^A-Za-z0-9\r\n]{1,8})([A-Za-z0-9_+/=.-]{20,512})(?![A-Za-z0-9_+/=.-])/gi,
+    (match, lead, token) =>
+      looksGenerated(token as string) ? `${lead}${REDACTED}` : match,
   ],
   // A URL scheme is short by definition — RFC 3986 registers nothing close to 32 chars.
   // Leaving the scheme `[a-z0-9+.-]*` unbounded made this pattern QUADRATIC: on any long
@@ -391,7 +668,10 @@ export function exceedsScrubBound(value: string): boolean {
  */
 export function scrubText(value: string): string {
   return SECRET_PATTERNS.reduce(
-    (text, [pattern, replacement]) => text.replace(pattern, replacement as any),
+    (text, rule) =>
+      typeof rule === "function"
+        ? rule(text)
+        : text.replace(rule[0], rule[1] as any),
     boundForScrub(value),
   );
 }
