@@ -42,6 +42,7 @@ import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
+import { searchIndexLimits } from "./search-index.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
@@ -62,6 +63,7 @@ export interface LambdaEnv {
   secretArn: string;
   queueUrl: string;
   searchEnabled: boolean;
+  replayPagesEnabled: boolean;
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
   dbPoolMax: number;
@@ -83,6 +85,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     secretArn: need("SESSION_PIPELINE_SECRET_ARN"),
     queueUrl: need("SESSION_PIPELINE_QUEUE_URL"),
     searchEnabled: env.SEARCH_INDEX_ENABLED === "1",
+    replayPagesEnabled: env.SESSION_REPLAY_PAGES_ENABLED === "1",
     fanout,
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
@@ -221,7 +224,14 @@ async function init(): Promise<Runtime> {
       store,
       ch: createClickHouseClient(secret.clickhouse),
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
+      // Raised to the replay producer's source bound only when that stage is on.
+      limits: searchIndexLimits(env.replayPagesEnabled),
     };
+  }
+  if (env.replayPagesEnabled) {
+    // This stage needs scoped Put/Get on normalized read artifacts in addition to raw reads.
+    // Wiring code does not grant that permission or enable this default-off flag.
+    deps.replay = { db, store, provider: "s3", bucket: env.bucket, prefix: bindings };
   }
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
