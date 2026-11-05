@@ -14,7 +14,7 @@ import { errorFields, log } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
-import { classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
+import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
 
 export interface QueueRecord {
@@ -106,10 +106,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     catch(error){
       // route_session_large_read captures first, so it raises the same refusals as the replay
       // stage (#179). A capacity/superseded refusal is not retryable here: log it and let search
-      // and replay apply their own limits. Anything else (e.g. 55000 durable handoff
-      // unavailable) fails the batch and is retried.
+      // and replay apply their own limits. A permanently ambiguous canonical source (55000 with
+      // capture's exact message) is deterministic too: retrying only reaches the DLQ with search
+      // skipped every time. Anything else (55000 durable handoff unavailable or source epoch
+      // missing, 22023, connection errors) fails the batch and is retried.
       const refusal=classifyReplayFailure(error);
       if(refusal){log.warn("large scope handoff refused",{stage:"large-read",...ids,...errorFields(error),reason:refusal.reason,error_code:refusal.code});continue}
+      if(captureRefusal(error)==="capture_ambiguous_source"){log.warn("large scope handoff refused",{stage:"large-read",...ids,...errorFields(error),reason:"large_handoff_ambiguous_source",error_code:"55000"});continue}
       log.error("large scope handoff failed",{stage:"large-read",...ids,...errorFields(error)});for(const id of messageIds)failed.add(id);continue;
     }
     if(!routed.delegated)continue;

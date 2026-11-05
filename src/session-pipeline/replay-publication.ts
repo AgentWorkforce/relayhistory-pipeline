@@ -52,6 +52,24 @@ export function classifyReplayFailure(error: unknown): ReplayRefusal | null {
   if (error instanceof Error && (error as { code?: unknown }).code === "54000") return capacity("54000");
   return null;
 }
+/**
+ * Deterministic capture_session_replay_pages refusals (migration 20261105026000),
+ * classified by SQLSTATE plus the exact RAISE message prefix. The same function
+ * raises transient 55000s ("source epoch missing"; route_session_large_read's
+ * "durable handoff unavailable") that must stay retryable, so code alone is not enough.
+ */
+export type CaptureRefusal = "capture_ambiguous_source" | "capture_capacity_exceeded";
+const CAPTURE_REFUSAL_MESSAGES: readonly (readonly [code: string, message: string, refusal: CaptureRefusal])[] = [
+  ["55000", "replay capture: ambiguous canonical source", "capture_ambiguous_source"],
+  ["54000", "replay capture: pointer capacity exceeded", "capture_capacity_exceeded"],
+  ["54000", "replay capture: metadata capacity exceeded", "capture_capacity_exceeded"],
+];
+export function captureRefusal(error: unknown): CaptureRefusal | undefined {
+  const e = error as { code?: unknown; message?: unknown } | null;
+  if (typeof e?.code !== "string" || typeof e.message !== "string") return undefined;
+  for (const [code, message, refusal] of CAPTURE_REFUSAL_MESSAGES) if (e.code === code && e.message.startsWith(message)) return refusal;
+  return undefined;
+}
 export interface ReplayProducerResult { published: boolean; reason?: "absent" | "source_blocked"; publication?: ArtifactPublication; rows?: number; objects?: number; bytes?: number }
 const fail = (code: string): never => { throw new ArtifactBuildError(code); };
 const scopeOf = (i: CanonicalIdentity): SessionScope => ({ orgId: i.orgId, workspaceId: i.workspaceId, harness: i.source, sessionId: i.sessionId });

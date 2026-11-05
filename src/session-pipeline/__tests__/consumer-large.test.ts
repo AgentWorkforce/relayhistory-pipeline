@@ -33,7 +33,7 @@ async function fixture(){
   try{const r=await processBatch(messages,deps);return {failures:r.batchItemFailures.map(f=>f.itemIdentifier),searched:searches>before,lines}}
   finally{process.stdout.write=out;process.stderr.write=err}
  };
- return {x,deps,run};
+ return {x,deps,run,source};
 }
 const pgError=(code:string,message:string)=>Object.assign(new Error(message),{code});
 
@@ -71,9 +71,40 @@ test.each([
  expect(r.lines).toEqual([expect.objectContaining({level:"warn",message:"large scope handoff refused",reason:"replay_capacity_refused",error_code:"54000"})]);
 },60000);
 
+test("flag on + 55000 ambiguous canonical source: logged refusal, not failed, search runs",async()=>{
+ const f=await fixture();
+ f.deps.large={route:async()=>{throw pgError("55000","replay capture: ambiguous canonical source")},jobState:async()=>{throw new Error("must not be read")}};
+ const r=await f.run();
+ expect(r.failures).toEqual([]);expect(r.searched).toBe(true);
+ expect(r.lines).toEqual([expect.objectContaining({level:"warn",message:"large scope handoff refused",reason:"large_handoff_ambiguous_source",error_code:"55000",org_id:expect.any(String),workspace_id:expect.any(String),harness:expect.any(String),session_id:expect.any(String)})]);
+ for(const l of r.lines)expect(Object.keys(l).every(k=>!/text|content|payload|message_text/.test(k))).toBe(true);
+},60000);
+
+test("real route + ambiguous canonical source in PGlite: refusal falls through to search",async()=>{
+ const f=await fixture();
+ f.deps.large={route:s=>routeLargeRead(f.x.db,s),jobState:s=>largeReadJobState(f.x.db,s)};
+ // A second live physical pointer of the same session id (another machine) resolves to a
+ // different canonical id: capture_session_replay_pages raises 55000 ambiguous canonical source.
+ await f.x.pg.exec("ALTER TABLE sessions.session_index DISABLE TRIGGER USER");
+ await f.x.pg.exec("CREATE TEMP TABLE twin AS SELECT * FROM sessions.session_index LIMIT 1");
+ await f.x.pg.exec("UPDATE twin SET machine_id='machine:twin',canonical_session_id='other-canonical',canonical_machine_id=NULL,manifest_key=manifest_key||'.twin'");
+ await f.x.pg.exec("INSERT INTO sessions.session_index SELECT * FROM twin");
+ await f.x.pg.exec("ALTER TABLE sessions.session_index ENABLE TRIGGER USER");
+ await expect(f.x.db.query("SELECT sessions.capture_session_replay_pages('org_replay','ws_replay','claude','large_replay')")).rejects.toMatchObject({code:"55000",message:"replay capture: ambiguous canonical source"});
+ const r=await f.run();
+ expect(r.failures).toEqual([]);expect(r.searched).toBe(true);
+ expect(r.lines).toEqual([expect.objectContaining({level:"warn",message:"large scope handoff refused",reason:"large_handoff_ambiguous_source",error_code:"55000"})]);
+ expect((await f.x.db.query<{n:number}>("SELECT count(*)::int n FROM sessions.session_large_read_jobs")).rows[0]!.n).toBe(0);
+},60000);
+
 test.each([
  ["unexpected error",new Error("boom")],
  ["55000 durable handoff unavailable (enqueue infrastructure, retried)",pgError("55000","large read: durable handoff unavailable")],
+ ["55000 source epoch missing (may be transient, retried)",pgError("55000","replay capture: source epoch missing")],
+ ["55000 with an unrecognised message",pgError("55000","object not in prerequisite state")],
+ ["55000 ambiguous message without a SQLSTATE",new Error("replay capture: ambiguous canonical source")],
+ ["22023 invalid scope",pgError("22023","replay capture: invalid scope")],
+ ["connection error",pgError("ECONNRESET","read ECONNRESET")],
  ["invalid route result",new Error("large_handoff_invalid")],
 ])("flag on + %s: batch failure, search skipped",async(_name,error)=>{
  const f=await fixture();
