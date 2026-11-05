@@ -639,6 +639,7 @@ describe("SQS consumer", () => {
   // #182's writer adds only migration 20261105022000 columns.
   const MIGRATION_022000_DIRECTORY_COLUMNS = ["catalog_read_projected_at", "catalog_read_version", "catalog_read_epoch", "catalog_models_complete", "catalog_relationships_complete"];
   const MIGRATION_022000_RELATIONSHIP_COLUMNS = ["child_model", "child_agent_name", "child_agent_type"];
+  const MIGRATION_031000_DIRECTORY_COLUMNS = ["catalog_forgotten_child_edges"];
 
   const catalogSession = (): RelayhistoryStreamRecord[] => [
     event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello"),
@@ -674,12 +675,16 @@ describe("SQS consumer", () => {
     expect((await processBatch([{ messageId: "m1", body: s3Put(key, "01") }], deps)).batchItemFailures).toEqual([]);
     expect(ch.final().map((r) => r.content)).toEqual(["hello"]);
     const w = catalogWrite(raw);
-    expect(w.directory).toEqual([...PRE_182_DIRECTORY_COLUMNS, ...MIGRATION_022000_DIRECTORY_COLUMNS]);
+    expect(w.directory).toEqual([...PRE_182_DIRECTORY_COLUMNS, ...MIGRATION_022000_DIRECTORY_COLUMNS, ...MIGRATION_031000_DIRECTORY_COLUMNS]);
     expect(w.agents).toEqual(PRE_182_AGENT_COLUMNS);
     expect(w.relationships).toEqual([...PRE_182_RELATIONSHIP_COLUMNS, ...MIGRATION_022000_RELATIONSHIP_COLUMNS]);
-    expect(w.params).toHaveLength(23);
+    expect(w.params).toHaveLength(24);
     expect(w.params.slice(0, 17)).toEqual(["org_1", "ws_1", "claude", "sess_1", ["codex"], ["gpt-5"], "github.com/acme/widgets", "git_remote", null, null, null, "acme/widgets", "git@github.com:acme/widgets.git", "main", ["codex"], [], []]);
-    expect(w.params.slice(17)).toEqual([[], [], [], 1, true, true]);
+    // $24: the writer epoch fence is the same epoch writeDirectoryEvents was fenced on.
+    const events = raw.filter((q) => q.text.includes("d.event_projection_epoch=$24::bigint") && q.text.includes("session_directory_event_times"));
+    expect(events).toHaveLength(1);
+    expect(w.params.slice(17)).toEqual([[], [], [], 1, true, true, events[0]!.params[23]]);
+    expect(w.sql).toContain("d.event_projection_epoch = $24::bigint");
   });
 
   test("a manifest put upserts the pointer, then indexes its session; duplicates in a batch collapse", async () => {

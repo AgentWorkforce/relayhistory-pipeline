@@ -18,6 +18,18 @@
  * declares `scopeSerialization: "actor"`.
  */
 
+/** Identity shared by manifest work and deployment-specific stage deliveries. */
+export interface WorkItemIdentity {
+  readonly id: string;
+  readonly attempt: number;
+}
+
+export interface ScheduleWorkItem extends WorkItemIdentity {
+  readonly type: "schedule";
+  readonly job: string;
+  readonly firedAtMs: number;
+}
+
 export type WorkItem =
   | {
       readonly type: "manifest-landed";
@@ -36,14 +48,7 @@ export type WorkItem =
       /** 1 on first delivery. */
       readonly attempt: number;
     }
-  | {
-      readonly type: "schedule";
-      readonly id: string;
-      /** A job named in PipelineWork.schedules. */
-      readonly job: string;
-      readonly firedAtMs: number;
-      readonly attempt: number;
-    };
+  | ScheduleWorkItem;
 
 export type WorkOutcome =
   | { readonly status: "done" }
@@ -62,13 +67,13 @@ export interface WorkContext {
   readonly signal?: AbortSignal;
 }
 
-export interface PipelineWork {
+export interface PipelineWork<Item extends WorkItemIdentity = WorkItem> {
   /**
    * Handle one delivery batch. Return an outcome per item id; a missing id is
    * treated as retry. Throwing retries the whole batch. Never throws for one
    * bad item: return `dead` for it instead.
    */
-  handle(items: readonly WorkItem[], context: WorkContext): Promise<ReadonlyMap<string, WorkOutcome>>;
+  handle(items: readonly (Item | ScheduleWorkItem)[], context: WorkContext): Promise<ReadonlyMap<string, WorkOutcome>>;
   readonly schedules: readonly ScheduleSpec[];
 }
 
@@ -93,10 +98,10 @@ export interface RuntimeCapabilities {
  * A runtime adapter. `Binding` is platform-shaped: a `run(signal)` loop for
  * workers, a Lambda `handler`, a Cloud Run `fetch`, actor classes for Terse.
  */
-export interface PipelineRuntimeAdapter<Binding = unknown> {
+export interface PipelineRuntimeAdapter<Binding = unknown, Item extends WorkItemIdentity = WorkItem> {
   readonly kind: string;
   capabilities(): RuntimeCapabilities;
-  bind(work: PipelineWork): Binding;
+  bind(work: PipelineWork<Item>): Binding;
 }
 
 export const DEFAULT_RETRY_DELAY_SECONDS = 30;
@@ -106,9 +111,9 @@ export const DEFAULT_RETRY_DELAY_SECONDS = 30;
  * outcome becomes `retry`. Every runtime uses this so the failure semantics
  * are identical across platforms.
  */
-export async function settle(
-  work: PipelineWork,
-  items: readonly WorkItem[],
+export async function settle<Item extends WorkItemIdentity = WorkItem>(
+  work: PipelineWork<Item>,
+  items: readonly (Item | ScheduleWorkItem)[],
   context: WorkContext,
 ): Promise<Map<string, WorkOutcome>> {
   const out = new Map<string, WorkOutcome>();
@@ -137,7 +142,7 @@ export async function settle(
   return out;
 }
 
-export function scheduleItem(job: string, firedAtMs: number, attempt = 1, id = `schedule:${job}:${firedAtMs}`): WorkItem {
+export function scheduleItem(job: string, firedAtMs: number, attempt = 1, id = `schedule:${job}:${firedAtMs}`): ScheduleWorkItem {
   return { type: "schedule", id, job, firedAtMs, attempt };
 }
 
