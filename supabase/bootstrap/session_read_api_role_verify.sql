@@ -1,6 +1,6 @@
 -- Read-only verification of the session read API role (session_read_api_role.sql).
 -- Raises, listing every problem, unless the role has exactly the approved shape:
--- attributes, no memberships, exactly the six-column SELECT on session_index and
+-- attributes, no memberships, exactly the approved column SELECT on session_index and
 -- schema USAGE as its effective privileges in schema sessions, no EXECUTE on any
 -- sessions function, and the tenant-bound RLS policy on session_index.
 \set ON_ERROR_STOP 1
@@ -56,7 +56,9 @@ BEGIN
       FROM pg_attribute a
      WHERE a.attrelid = 'sessions.session_index'::regclass AND a.attnum > 0 AND NOT a.attisdropped
   LOOP
-    IF v_row.sel <> (v_row.attname IN ('org_id', 'workspace_id', 'harness', 'session_id', 'created_at', 'deleted_at')) THEN
+    IF v_row.sel <> (v_row.attname IN ('org_id', 'workspace_id', 'harness', 'session_id', 'created_at', 'deleted_at',
+                                       'canonical_session_id', 'machine_id', 'canonical_machine_id', 'user_id',
+                                       'storage_provider', 'bucket', 'manifest_key', 'content_sha256', 'raw_format', 'revision')) THEN
       v_problems := array_append(v_problems, (format('column %s: SELECT is %s', v_row.attname, CASE WHEN v_row.sel THEN 'granted' ELSE 'missing' END))::text);
     END IF;
   END LOOP;
