@@ -155,7 +155,7 @@ CREATE TRIGGER ingest_history_pointer_sync AFTER INSERT OR UPDATE OR DELETE ON s
 -- pages it, resumably, in bounded batches after deploy. Returns the next cursor, NULL when done.
 CREATE FUNCTION sessions.ingest_history_pointer_ref_backfill(p_after jsonb,p_limit integer)RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $initial_refs$
-DECLARE r sessions.session_index%ROWTYPE;v_root text;v_key text;v_pointer jsonb;v_sha text;v_known boolean;v_last jsonb;old_ref sessions.ingest_history_pointer_refs%ROWTYPE;
+DECLARE r sessions.session_index%ROWTYPE;v_root text;v_key text;v_pointer jsonb;v_sha text;v_known boolean;v_last jsonb;old_ref sessions.ingest_history_pointer_refs%ROWTYPE;v_done boolean;
 BEGIN
  IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 5000 OR(p_after IS NOT NULL AND jsonb_typeof(p_after)<>'array')THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: pointer ref backfill bound';END IF;
@@ -188,9 +188,20 @@ BEGIN
   IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: carrier hash collision';END IF;
   INSERT INTO sessions.ingest_history_pointer_refs VALUES(r.org_id,r.workspace_id,r.harness,r.session_id,r.machine_id,v_key,v_pointer,v_sha);
  END LOOP;
- -- A short page is the end of the key space: every row older than the arming is now covered.
- IF v_last IS NULL OR(SELECT count(*)FROM sessions.session_index i WHERE i.manifest_key IS NOT NULL AND i.storage_provider IS NOT NULL AND i.bucket IS NOT NULL
-   AND ROW(i.org_id,i.workspace_id,i.harness,i.session_id,i.machine_id)>ROW(v_last->>0,v_last->>1,v_last->>2,v_last->>3,v_last->>4))=0 THEN
+ v_done:=v_last IS NULL OR NOT EXISTS(SELECT 1 FROM sessions.session_index i WHERE i.manifest_key IS NOT NULL AND i.storage_provider IS NOT NULL AND i.bucket IS NOT NULL
+   AND ROW(i.org_id,i.workspace_id,i.harness,i.session_id,i.machine_id)>ROW(v_last->>0,v_last->>1,v_last->>2,v_last->>3,v_last->>4));
+ -- Orphans in this page's key range: a ref whose session_index row was deleted (or lost its pointer)
+ -- while tracking was off has no row to visit above. Remove it, and rescan its carrier.
+ WITH gone AS(DELETE FROM sessions.ingest_history_pointer_refs f
+   WHERE(p_after IS NULL OR ROW(f.org_id,f.workspace_id,f.harness,f.session_id,f.machine_id)>ROW(p_after->>0,p_after->>1,p_after->>2,p_after->>3,p_after->>4))
+    AND(v_done OR ROW(f.org_id,f.workspace_id,f.harness,f.session_id,f.machine_id)<=ROW(v_last->>0,v_last->>1,v_last->>2,v_last->>3,v_last->>4))
+    AND NOT EXISTS(SELECT 1 FROM sessions.session_index i WHERE i.org_id=f.org_id AND i.workspace_id=f.workspace_id AND i.harness=f.harness
+     AND i.session_id=f.session_id AND i.machine_id=f.machine_id AND i.manifest_key IS NOT NULL AND i.storage_provider IS NOT NULL AND i.bucket IS NOT NULL)
+   RETURNING f.carrier_sha256)
+ UPDATE sessions.ingest_history_carriers SET epoch=nextval('sessions.ingest_history_inventory_epoch'),scan_complete=false
+  WHERE carrier_sha256 IN(SELECT carrier_sha256 FROM gone);
+ -- The last page is the end of the key space: every row older than the arming is now covered.
+ IF v_done THEN
   UPDATE sessions.ingest_history_switch SET refs_complete=true,changed_at=clock_timestamp()WHERE singleton AND NOT refs_complete;
   RETURN NULL;
  END IF;
@@ -214,6 +225,12 @@ BEGIN
    AND EXISTS(SELECT 1 FROM sessions.ingest_history_pointer_refs r WHERE r.carrier_sha256=q.carrier_sha256)
   ORDER BY q.carrier_sha256 FOR UPDATE SKIP LOCKED LIMIT 1;
  IF NOT FOUND THEN RETURN jsonb_build_object('ticket',NULL);END IF;
+ -- Never admit a scan over a dangling reference (its session_index row is gone or lost its pointer):
+ -- the backfill prunes those; until it has, this carrier is refused (bounded: this carrier's refs only).
+ IF EXISTS(SELECT 1 FROM sessions.ingest_history_pointer_refs f WHERE f.carrier_sha256=c.carrier_sha256 AND NOT EXISTS(
+   SELECT 1 FROM sessions.session_index i WHERE i.org_id=f.org_id AND i.workspace_id=f.workspace_id AND i.harness=f.harness AND i.session_id=f.session_id
+    AND i.machine_id=f.machine_id AND i.manifest_key IS NOT NULL AND i.storage_provider IS NOT NULL AND i.bucket IS NOT NULL))
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: dangling pointer references; rerun the pointer backfill';END IF;
  INSERT INTO sessions.ingest_history_scan_refs(scan_token,ref_ordinal,carrier_sha256,pointer,pointer_sha256)
  SELECT v_token,row_number()OVER(ORDER BY r.org_id COLLATE"C",r.workspace_id COLLATE"C",r.harness COLLATE"C",r.session_id COLLATE"C",r.machine_id COLLATE"C")-1,
   r.carrier_sha256,r.pointer,r.pointer_sha256 FROM sessions.ingest_history_pointer_refs r WHERE r.carrier_sha256=c.carrier_sha256;
@@ -1886,8 +1903,9 @@ END $scopeinstall$;
 -- Owner-only operational switch. OFF: abandon every in-flight build, then every live hook and read gate
 -- is inert (main behavior) with all ledgers kept. ON (from off): every installed scope is invalidated,
 -- because ACKs/controls while off were not tracked; its next build re-derives it. Lock order: seat
--- clock, switch row, build rows (sorted), scope locks (sorted) - the ACK's order; begin/install take
--- the switch row before any build row.
+-- clock, switch row, (ON only) session_index SHARE, build rows (sorted), scope locks (sorted) - the
+-- ACK's order (no seat-clock holder writes session_index); begin/install take the switch row before
+-- any build row.
 CREATE FUNCTION sessions.ingest_history_set_live(p_live boolean)RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $set_live$
 DECLARE w sessions.ingest_history_switch%ROWTYPE;r record;n bigint:=0;v_builds uuid[];
@@ -1901,10 +1919,16 @@ BEGIN
  SELECT array_agg(build_id)INTO v_builds FROM sessions.ingest_history_scope_builds WHERE state IN('keys','captured');
  PERFORM sessions.ingest_history_fence_builds(v_builds);
  IF NOT p_live THEN
-  UPDATE sessions.ingest_history_switch SET live=false,changed_at=clock_timestamp()WHERE singleton;
+  -- OFF stops pointer tracking too (ingest_history_tracking() is false): the reference inventory is no
+  -- longer attested. refs_complete is cleared here and only a fresh full backfill pass sets it again.
+  UPDATE sessions.ingest_history_switch SET live=false,refs_complete=false,changed_at=clock_timestamp()WHERE singleton;
   RETURN jsonb_build_object('live',false,'changed',true,'abandonedBuilds',coalesce(cardinality(v_builds),0)::text);
  END IF;
- UPDATE sessions.ingest_history_switch SET live=true,changed_at=clock_timestamp()WHERE singleton;
+ -- Resume waits out every session_index writer that began while OFF (SHARE blocks new writers only until
+ -- this transaction commits; later writers see live=true and are tracked), exactly as arming does. It
+ -- never restores refs_complete: inventory work stays refused until a fresh full backfill pass.
+ LOCK TABLE sessions.session_index IN SHARE MODE;
+ UPDATE sessions.ingest_history_switch SET live=true,refs_complete=false,changed_at=clock_timestamp()WHERE singleton;
  FOR r IN SELECT org_id,workspace_id,harness,session_id FROM sessions.ingest_history_scope_current
   ORDER BY org_id COLLATE"C",workspace_id COLLATE"C",harness COLLATE"C",session_id COLLATE"C" LOOP
   PERFORM sessions.ingest_history_invalidate_scope(r.org_id,r.workspace_id,r.harness,r.session_id);n:=n+1;

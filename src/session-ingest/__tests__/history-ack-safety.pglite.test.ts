@@ -337,3 +337,59 @@ test("pointer tracking is dormant until armed; the backfill refuses unarmed, rew
   expect((await db.query<any>("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [s.identity.orgId])).rows[0].r).toBe("3");
   await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
 });
+
+test("kill -> write -> resume: the pointer attestation is dropped; inventory refuses until a fresh backfill repairs update, delete and insert", async () => {
+  const backfill = async () => { let c: unknown = null, n = 0; do { c = (await db.query<any>("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [c === null ? null : JSON.stringify(c)])).rows[0].c; n++; } while (c !== null && n < 100); };
+  const sw = async () => (await db.query<any>("SELECT live,pointer_tracking p,refs_complete c FROM sessions.ingest_history_switch")).rows[0];
+  const refOf = async (org: string) => (await db.query<any>("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [org])).rows.map((x) => x.r);
+  const claim = () => rpc("ingest_history_inventory_claim", { generation: gen, bucket: "kill-resume-none" });
+  const upd = await scope(["k1"]), del = await scope(["k1"]);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  expect(await sw()).toEqual({ live: true, p: true, c: true });
+  expect(await refOf(upd.identity.orgId)).toEqual(["1"]);
+  expect(await refOf(del.identity.orgId)).toEqual(["1"]);
+  await db.query("SELECT sessions.ingest_history_set_live(false)");
+  expect(await sw()).toEqual({ live: false, p: true, c: false });             // OFF drops the attestation
+  // Untracked writes while OFF: an update, a delete and a brand-new pointer.
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...upd.row, revision: 2, content_sha256: "\\x" + "b".repeat(64) }])]);
+  await db.query("DELETE FROM sessions.session_index WHERE org_id=$1", [del.identity.orgId]);
+  const ins = await scope(["k1"]);
+  expect(await refOf(upd.identity.orgId)).toEqual(["1"]);                    // stale while OFF, as designed
+  expect(await refOf(del.identity.orgId)).toEqual(["1"]);
+  expect(await refOf(ins.identity.orgId)).toEqual([]);
+  await db.query("SELECT sessions.ingest_history_set_live(true)");
+  expect(await sw()).toEqual({ live: true, p: true, c: false });              // resume never restores it
+  await expect(claim()).rejects.toThrow("not tracked and backfilled");
+  await backfill();
+  expect(await sw()).toEqual({ live: true, p: true, c: true });
+  expect(await refOf(upd.identity.orgId)).toEqual(["2"]);
+  expect(await refOf(del.identity.orgId)).toEqual([]);                        // orphan removed
+  expect(await refOf(ins.identity.orgId)).toEqual(["1"]);
+  expect(await claim()).toEqual({ ticket: null });                            // admitted only now
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});
+
+test("disarm -> DELETE -> rearm: the full backfill prunes the dangling ref before attesting; a claim refuses a dangling ref", async () => {
+  const backfill = async () => { let c: unknown = null, n = 0; do { c = (await db.query<any>("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [c === null ? null : JSON.stringify(c)])).rows[0].c; n++; } while (c !== null && n < 100); };
+  const dangling = async () => (await db.query<any>("SELECT count(*)::int n FROM sessions.ingest_history_pointer_refs f WHERE NOT EXISTS(SELECT 1 FROM sessions.session_index i WHERE i.org_id=f.org_id AND i.workspace_id=f.workspace_id AND i.harness=f.harness AND i.session_id=f.session_id AND i.machine_id=f.machine_id)")).rows[0].n;
+  const s = await scope(["k1"]), keep = await scope(["k1"]);
+  for (const x of [s, keep]) await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...x.row, bucket: "dangle-bucket", revision: 2 }])]);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+  await db.query("DELETE FROM sessions.session_index WHERE org_id=$1", [s.identity.orgId]);   // untracked delete
+  expect(await dangling()).toBe(1);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  expect(await dangling()).toBe(0);
+  expect((await db.query<any>("SELECT refs_complete FROM sessions.ingest_history_switch")).rows[0].refs_complete).toBe(true);
+  // A dangling ref that still exists (planted here) is never admitted to a scan.
+  const carrier = (await db.query<any>("SELECT carrier_sha256 c FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [keep.identity.orgId])).rows[0].c;
+  await db.query("INSERT INTO sessions.ingest_history_pointer_refs VALUES($1,$2,'claude','ghost','srv_origin',$3,'{}'::jsonb,$4)", [keep.identity.orgId, keep.identity.workspaceId, carrier, "e".repeat(64)]);
+  await expect(rpc("ingest_history_inventory_claim", { generation: gen, bucket: "dangle-bucket" })).rejects.toThrow("dangling pointer references");
+  await backfill();                                                         // prunes it
+  expect(await dangling()).toBe(0);
+  expect((await rpc("ingest_history_inventory_claim", { generation: gen, bucket: "dangle-bucket" })).ticket).not.toBeNull();
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});

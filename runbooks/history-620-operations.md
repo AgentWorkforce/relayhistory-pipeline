@@ -32,9 +32,12 @@ SELECT sessions.ingest_history_set_live(true);   -- on again
 
 - **Off:** every in-flight build is abandoned; every 620 trigger (ACK, control, directory,
   session_index) returns immediately; every read gate behaves as main; `ingest_history_scope_begin`
-  and `ingest_history_scope_install` refuse with `history: 620 is switched off`. All ledgers stay:
+  and `ingest_history_scope_install` refuse with `history: 620 is switched off`. Pointer tracking stops
+  too, so `refs_complete` is cleared and the inventory is no longer attested. All ledgers stay:
   scope versions, current rows, derived objects, the feature journal, outboxes and builds.
-- **On:** every in-flight build is abandoned again (one that raced the switch saw untracked changes),
+- **On:** takes a SHARE lock on `session_index`, which waits out every writer that began while off
+  (run it with a `lock_timeout`); it never restores `refs_complete`, so rerun the full pointer backfill
+  before any inventory work. Every in-flight build is abandoned again (one that raced the switch saw untracked changes),
   and every installed scope is invalidated in the same transaction (ACKs and controls while off
   were not tracked), so its directory row is cleared and its next build re-derives it. The cost is
   one `ingest_history_invalidate_scope` per installed scope.
@@ -50,7 +53,9 @@ nothing before History needs the inventory.
 2. Page the backfill until it returns NULL. Each page locks its `session_index` rows (`FOR UPDATE`),
    so keep pages small (for example 500) in production:
    `SELECT sessions.ingest_history_pointer_ref_backfill(<cursor or NULL>, 500);`
-3. The final page sets `refs_complete`. `ingest_history_inventory_claim` refuses until then.
+3. Each page also prunes references in its key range whose `session_index` row is gone or lost its
+   pointer (an untracked delete). The final page sets `refs_complete`. `ingest_history_inventory_claim`
+   refuses until then, and it also refuses a carrier that still has a dangling reference.
 
 Disarming (`set_pointer_tracking(false)`) clears `refs_complete`. Re-arming requires a fresh full
 backfill pass, which rewrites any reference left stale while disarmed.

@@ -285,3 +285,28 @@ test.skipIf(!url)("ACK vs control on a managed scope's owner: both commit (one w
   } finally { ack.release(); ctl.release(); }
   expect((await pool.query("SELECT ready FROM sessions.ingest_history_scope_current WHERE org_id=$1", [s.identity.orgId])).rows[0].ready).toBe(false);
 });
+
+test.skipIf(!url)("resume (set_live true) waits out a session_index writer that began while OFF; the backfill then sees its row", async () => {
+  const s = await scope();
+  const backfill = async () => { let c: unknown = null, n = 0; do { c = (await pool.query("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [c === null ? null : JSON.stringify(c)])).rows[0].c; n++; } while (c !== null && n < 100); };
+  await pool.query("INSERT INTO sessions.ingest_receipt_seat_clock(singleton,control_epoch,source_identity_sha256,allocated_high_water,last_seat,baseline,initial_generation) VALUES(true,$1,$2,0,0,'{}'::jsonb,$3) ON CONFLICT DO NOTHING", [sha("seat-epoch"), sha("seat-src"), gen]);
+  await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  await pool.query("SELECT sessions.ingest_history_set_live(false)");
+  const writer = await pool.connect(), resumer = await pool.connect();
+  try {
+    await writer.query("BEGIN");
+    await writer.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...s.row, revision: 5, content_sha256: "\\x" + "d".repeat(64) }])]);   // untracked, uncommitted
+    let resumed = false;
+    const resume = resumer.query("SELECT sessions.ingest_history_set_live(true)").then(() => { resumed = true; });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(resumed).toBe(false);                                            // waiting on the OFF-era writer
+    await writer.query("COMMIT");
+    await resume;
+  } finally { writer.release(); resumer.release(); }
+  const sw = (await pool.query("SELECT live,refs_complete FROM sessions.ingest_history_switch")).rows[0];
+  expect(sw).toEqual({ live: true, refs_complete: false });
+  await backfill();
+  expect((await pool.query("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [s.identity.orgId])).rows.map((x) => x.r)).toEqual(["5"]);
+  await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});
