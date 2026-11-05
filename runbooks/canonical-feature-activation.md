@@ -28,7 +28,7 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 | F1 | **REQUIRED** | Announced slim #230 (schema + production creator only), then compose #233 on its exact merged head | 620 creator agent; migration-completeness | #230 head `6bce87c`, merged as main `233c62b`; creator/ACK/race reviews clear; #233 final diff still pending |
 | F2 | **REQUIRED** | Correct owner-only 610 ABI: explicit seed above drained legacy high-water; initial publish; atomic exact prior retirement then replacement publish; no raw pointer arrays in the journal | migration-completeness + supporter-cloud + 620 creator agent | Fresh and replacement transaction tests; missing-seed refusal; rollback emits no row; restricted-role ACL/rollback/sentinel checks |
 | F3 | **REQUIRED** | Publish new buffered uploads into ready canonical scopes and directory/replay authorities; drain only the bounded post-cutover catch-up for the canary scope | 620 creator agent (scope-build driver); bulls-migrator as production operator | Captured cutover high-water; zero unpublished/dirty rows for the selected scope; exact read hydration succeeds |
-| F4 | **REQUIRED** | Run a durable leased journal consumer with bounded 184 materialization, per-page ACKs, two-pool terminal finish CAS, retry/DLQ and metrics | migration-completeness + supporter-cloud | Restart/stale-worker tests; zero selected-scope journal backlog; immutable worker build identity |
+| F4 | **REQUIRED** | Run a durable leased journal consumer with bounded 184 materialization, per-page ACKs, two-pool terminal finish CAS, retry/DLQ and metrics | migration-completeness + supporter-cloud | Restart/stale-worker tests; zero selected-scope journal backlog; immutable worker build identity; runtime in `src/search-features/canonical-consumer{,-runner}.ts` on lease/checkpoint/dead-letter tables from `20261105036000` |
 | F5 | **REQUIRED** | Install event, brief, directory-document, authority and profile tables with separate least-privilege writer/reader roles and existing secret bindings | migration-completeness + supporter-cloud; bulls-migrator as operator | Reviewed DDL/grants; endpoint/database/schema hashes; live restricted-role probes |
 | F6 | **REQUIRED** | Complete only the selected scope's directory-document baseline and journal catch-up; never expose partial workspace results | migration-completeness; bulls-migrator as production operator | Event, brief and directory pools at the same captured revision; readiness clean |
 | F7 | **REQUIRED** | Serve the uploaded session from Supabase-backed list/detail/summary reads. The API path gates first visibility; the broad Cloud UI rollout does not | bulls-migrator read-path lane + Cloud UI lane | Buffered upload visible in directory and exact session hydration; tenant/auth negative tests; rollback flag recorded |
@@ -60,9 +60,13 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
   producer cannot append journal rows. The concrete TypeScript journal writer
   remains retired; seed/allocation/CAS evidence comes from #230's SQL tests.
 - Durable page ACK/copy-state tables and `finish_canonical_copy` live in the
-  registry-assigned `20261105030000_canonical_feature_consumer_acks.sql`.
-  The migration is dormant metadata/schema: applying it does not start a
-  consumer or authorize traffic activation.
+  registry-assigned `20261105030000_canonical_feature_consumer_acks.sql`;
+  the leased consumer's own lease/checkpoint/dead-letter tables live in the
+  registry v3.1 `20261105036000_canonical_consumer_lease.sql` (provenance
+  proposal-only 031000->033000->036000). Both are dormant metadata/schema:
+  applying them does not start a consumer or authorize traffic activation.
+  The runtime itself is default-off (`enabled` gate) and scope-fenced to the
+  canary org/workspace only.
 - Brief-document publication in `20261105024000` is independently default-off.
   Applying the migration creates no scope/outbox rows. After the window is
   applied and before its bounded backfill, the database owner enables it with

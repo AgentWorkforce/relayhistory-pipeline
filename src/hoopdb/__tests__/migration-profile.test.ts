@@ -1512,6 +1512,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const L = "upstream:20261105026000_canonical_history_lineage.sql";
     const C = "upstream:20261105030000_canonical_feature_consumer_acks.sql";
     const D = "upstream:20261105031000_desktop_catalog_forget_reproject.sql";
+    const E = "upstream:20261105036000_canonical_consumer_lease.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = (name: string) =>
@@ -1539,6 +1540,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
     // can the next down preserve a gap-free applied prefix.
+    await rollback("20261105036000_canonical_consumer_lease.down.sql");
+    expect(await names()).not.toContain(E);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_consumer_lease')::text r")).rows[0]?.r).toBeNull();
     await rollback("20261105031000_desktop_catalog_forget_reproject.down.sql");
     expect(await names()).not.toContain(D);
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBeNull();
@@ -1558,10 +1562,11 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // The very next migrate reapplies 024000, 025000, 026000, 030000 and 031000; the
     // post-validation exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, E]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await passed()).toBe(true);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_consumer_lease')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_consumer_lease");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBe("sessions.session_brief_document_scopes");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBe("sessions.ingest_history_switch");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_copy_state");
