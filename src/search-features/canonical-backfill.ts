@@ -40,7 +40,7 @@ export interface CanonicalPublishOnce {
     scope: { orgId: string; workspaceId: string; harness: string;
              sessionId: string; generation: string };
     source: { authorityId: string; epoch: string; fingerprint: string };
-    pointerSet: { authorityId: string; hash: string; count: number };
+    pointerSet: { authorityId: string; hash: string; count: string };
   }): Promise<string>;
 }
 export async function backfillFromIndex(
@@ -60,7 +60,7 @@ export async function backfillFromIndex(
       source: { epoch: img.epoch, fingerprint: img.fingerprint,
                 authorityId: img.authorityId },
       pointerSet: { authorityId: img.authorityId,
-                    hash: img.pointerSetHash, count: img.pointerSetCount },
+                    hash: img.pointerSetHash, count: String(img.pointerSetCount) },
     });
     entries += 1;
   }

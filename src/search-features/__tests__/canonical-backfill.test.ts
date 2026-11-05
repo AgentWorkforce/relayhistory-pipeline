@@ -10,7 +10,7 @@ const KEY = (org: string, ws: string, ses: string, date: string) =>
 const descriptor = async (key: string) => ({
   imageKey: key, sourceHash: "a".repeat(64), schemaGeneration: "g1",
   authorityId: "u-" + key.slice(-3), epoch: "1", fingerprint: "f".repeat(64),
-  pointerSetHash: "p".repeat(64), pointerSetCount: 1,
+  pointerSetHash: "p".repeat(64), pointerSetCount: "1",
 });
 const fakePublish = () => {
   const table: Record<string, unknown>[] = [];

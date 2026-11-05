@@ -23,18 +23,22 @@ export interface SqlQuery {
 type Row = {
   revision: string | number;
   kind: string;
-  scope: string;
+  // jsonb columns: drivers return parsed objects, fixtures may give strings.
+  scope: unknown;
   schema_generation: string;
   image_key: string;
   source_hash: string;
   prior_keyset_hash: string | null;
-  source_authority: string;
-  prior_source_authority: string | null;
-  pointer_set: string;
+  source_authority: unknown;
+  prior_source_authority: unknown;
+  pointer_set: unknown;
 };
+/** jsonb decode: a real driver returns the parsed object; a raw string parses. */
+const jsonb = <T>(v: unknown): T =>
+  typeof v === "string" ? (JSON.parse(v) as T) : (v as T);
 const toEntry = (r: Row): CanonicalJournalEntry => {
-  const scope = JSON.parse(r.scope) as CanonicalScope;
-  const pointerSet = JSON.parse(r.pointer_set) as CanonicalPointerSet;
+  const scope = jsonb<CanonicalScope>(r.scope);
+  const pointerSet = jsonb<CanonicalPointerSet>(r.pointer_set);
   return r.kind === "retire"
     ? { kind: "retire", revision: String(r.revision),
         imageKey: r.image_key, schemaGeneration: r.schema_generation,
@@ -43,16 +47,16 @@ const toEntry = (r: Row): CanonicalJournalEntry => {
         // 610 CHECK: prior authority lives in source_authority on retire
         // (prior_source_authority is always NULL for a retire row).
         priorSourceAuthority:
-          JSON.parse(r.source_authority) as CanonicalSourceAuthority,
+          jsonb<CanonicalSourceAuthority>(r.source_authority),
         pointerSet }
     : { kind: "publish", revision: String(r.revision),
         imageKey: r.image_key, schemaGeneration: r.schema_generation,
         sourceHash: r.source_hash, scope,
         sourceAuthority:
-          JSON.parse(r.source_authority) as CanonicalSourceAuthority,
+          jsonb<CanonicalSourceAuthority>(r.source_authority),
         ...(r.prior_source_authority
           ? { priorSourceAuthority:
-              JSON.parse(r.prior_source_authority) as CanonicalSourceAuthority }
+              jsonb<CanonicalSourceAuthority>(r.prior_source_authority) }
           : {}),
         ...(r.prior_keyset_hash ? { priorKeysetHash: r.prior_keyset_hash } : {}),
         pointerSet };

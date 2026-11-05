@@ -65,7 +65,7 @@ describe("canonical_feature_changed (620 invoker client)", () => {
     const fn = new CanonicalFeatureChanged({ query: db.query });
     await seed(db);
     const prior = { authorityId: "87654321-4321-4321-4321-210987654321",
-                    epoch: "0", fingerprint: "b".repeat(64) };
+                    epoch: "2", fingerprint: "b".repeat(64) };
     const priorPtr = { authorityId: "87654321-4321-4321-4321-210987654321",
                        hash: "d".repeat(64), count: "1" };
     const rev = await fn.canonicalFeatureChanged({
@@ -91,7 +91,7 @@ describe("canonical_feature_changed (620 invoker client)", () => {
     const fn = new CanonicalFeatureChanged({ query: db.query });
     await seed(db);
     await expect(fn.canonicalFeatureChanged({
-      ...base, priorSource: { authorityId: "u", epoch: "0", fingerprint: "b".repeat(64) },
+      ...base, priorSource: { authorityId: "u", epoch: "2", fingerprint: "b".repeat(64) },
     })).rejects.toThrow("prior_incomplete");
   });
   test("self-retire refused", async () => {
@@ -101,7 +101,7 @@ describe("canonical_feature_changed (620 invoker client)", () => {
     await expect(fn.canonicalFeatureChanged({
       ...base,
       priorSource: { authorityId: "87654321-4321-4321-4321-210987654321",
-                     epoch: "0", fingerprint: base.source.fingerprint },
+                     epoch: "2", fingerprint: base.source.fingerprint },
       priorPointerSet: { authorityId: "87654321-4321-4321-4321-210987654321",
                          hash: "d".repeat(64), count: "1" },
     })).rejects.toThrow("self_retire");

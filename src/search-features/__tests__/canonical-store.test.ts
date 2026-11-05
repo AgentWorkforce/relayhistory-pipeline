@@ -33,18 +33,21 @@ const fakeDb = () => {
         const srcAuth = e.kind === "retire"
           ? JSON.stringify(e.priorSourceAuthority)
           : e.sourceAuthority ? JSON.stringify(e.sourceAuthority) : null;
+        // Store raw jsonb values AS GIVEN (object stays object — the real
+        // driver returns parsed objects, so the decoder must handle both).
         table.push({
           revision: e.revision, kind: e.kind,
           org_id: (e.scope as Record<string, unknown>)?.orgId,
           workspace_id: (e.scope as Record<string, unknown>)?.workspaceId,
-          scope: JSON.stringify(e.scope),
+          scope: e.scope,
           schema_generation: e.schemaGeneration, image_key: e.imageKey,
           source_hash: e.sourceHash,
           prior_keyset_hash: e.priorKeysetHash ?? null,
-          source_authority: srcAuth,
-          prior_source_authority: e.kind === "publish" && e.priorSourceAuthority
-            ? JSON.stringify(e.priorSourceAuthority) : null,
-          pointer_set: JSON.stringify(e.pointerSet),
+          source_authority: e.kind === "retire"
+            ? e.priorSourceAuthority : e.sourceAuthority,
+          prior_source_authority: e.kind === "publish"
+            ? e.priorSourceAuthority ?? null : null,
+          pointer_set: e.pointerSet,
         });
       } else {
         table.push({ revision: params[0], kind: "seed" });
@@ -68,6 +71,39 @@ const ret = (rev: string) => ({
   pointerSet: JSON.parse(PTR),
 });
 describe("canonical journal store", () => {
+  test("append is read-only — always rejects (sole writer is _install)", async () => {
+    const db = fakeDb();
+    const j = new CanonicalJournalStore({ query: db.query });
+    await expect(j.append(pub("10"), "0"))
+      .rejects.toThrow("sole writer");
+  });
+  test("jsonb decoder accepts OBJECT-VALUED columns (real driver shape)", async () => {
+    const db = fakeDb();
+    const j = new CanonicalJournalStore({ query: db.query });
+    // PG/PGlite drivers return jsonb as parsed objects, not strings.
+    const objRow = {
+      revision: "10", kind: "publish", imageKey: "i",
+      schemaGeneration: "g", sourceHash: "a".repeat(64),
+      scope: JSON.parse(SCOPE),               // OBJECT, not string
+      sourceAuthority: JSON.parse(AUTH),      // OBJECT
+      pointerSet: JSON.parse(PTR),            // OBJECT
+    };
+    await db.query("INSERT INTO j VALUES($1)", [objRow]);
+    const out = await j.entries("0", 10);
+    expect(out.entries[0]!.kind).toBe("publish");
+    const retireObj = {
+      revision: "20", kind: "retire", imageKey: "i",
+      schemaGeneration: "g", sourceHash: "a".repeat(64),
+      priorKeysetHash: "c".repeat(64),
+      scope: JSON.parse(SCOPE),
+      priorSourceAuthority: JSON.parse(AUTH), // retire carries it in source_authority
+      pointerSet: JSON.parse(PTR),
+    };
+    await db.query("INSERT INTO j VALUES($1)", [retireObj]);
+    const r = (await j.entries("10", 10)).entries[0]!;
+    if (r.kind !== "retire") throw new Error("expected retire");
+    expect(r.priorSourceAuthority.fingerprint).toBe("a".repeat(64));
+  });
   test("append writes publish/retire entries; stale fences", async () => {
     const db = fakeDb();
     const j = new CanonicalJournalStore({ query: db.query });
