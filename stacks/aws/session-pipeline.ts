@@ -137,6 +137,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
   // The pipeline role has only s3:ListBucket/GetObject: enabling the stage now would fail every replay put.
   if (v.replayPages === true) refuse("transcriptStore.sessionPipeline.replayPages requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet");
+  // Same gap for the analysis cache: publications are normalized-prefix S3 writes the role cannot make yet.
+  if (v.analysisCache === true) refuse("transcriptStore.sessionPipeline.analysisCache requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
