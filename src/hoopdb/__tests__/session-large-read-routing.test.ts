@@ -1,6 +1,6 @@
 // Migration 20261105032000 (large-read routing fixes, #184 findings 2 and 5): per-scope discovery
 // isolation with bounded retries, per-job claim isolation, measured-size-only routing, unchanged
-// function boundary, apply order after 030000, and down/reapply. PGlite; no service credential.
+// function boundary, apply order after 031000, and down/reapply. PGlite; no service credential.
 import {afterAll,afterEach,beforeAll,expect,test} from "bun:test";
 import {readFileSync,readdirSync} from "node:fs";
 import {join} from "node:path";
@@ -200,14 +200,13 @@ test("boundary: signatures, owner, SECURITY DEFINER, search_path and grants are 
  }
 },PGLITE_TEST_TIMEOUT*4);
 
-test("order: 032000 applies directly after 030000 with no dependency on 031000",async()=>{
+test("order: 032000 sorts and applies directly after 031000 and does not depend on its objects",async()=>{
  const x=await fresh();
  const upstream=readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort();
  expect(upstream.at(-1)).toBe(`${FILE}.sql`);
- expect(upstream.at(-2)).toBe("20261105030000_canonical_feature_consumer_acks.sql");
- expect(upstream.some(f=>f.startsWith("20261105031000"))).toBe(false);
+ expect(upstream.slice(-3,-1)).toEqual(["20261105030000_canonical_feature_consumer_acks.sql","20261105031000_desktop_catalog_forget_reproject.sql"]);
  const ledger=(await x.pg.query<{name:string}>("SELECT name FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' ORDER BY applied_at,name COLLATE \"C\"")).rows.map(r=>r.name);
- expect(ledger.slice(-2)).toEqual(["upstream:20261105030000_canonical_feature_consumer_acks.sql",LEDGER]);
+ expect(ledger.slice(-3)).toEqual(["upstream:20261105030000_canonical_feature_consumer_acks.sql","upstream:20261105031000_desktop_catalog_forget_reproject.sql",LEDGER]);
  const sql=readFileSync(join(root,"supabase/migrations",`${FILE}.sql`),"utf8")+readFileSync(join(root,`supabase/rollbacks/${FILE}.down.sql`),"utf8");
  for(const dep of ["031000","desktop_catalog"])expect(sql.includes(dep)).toBe(false);
  // No GRANT/REVOKE on any function: CREATE OR REPLACE keeps the original ACL.

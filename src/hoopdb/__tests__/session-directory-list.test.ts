@@ -587,6 +587,11 @@ describe("session_directory_activity", () => {
 
 describe("catalog writer and projector", () => {
   const key = { orgId: "org-a", workspaceId: "ws-a", harness: "codex", sessionId: "s-1" };
+  // The desktop catalog writer is fenced on the row's current event epoch (20261105031000 review).
+  const at = async (db: PGlite, sessionId: string) => ({
+    expectedEpoch:
+      (await db.query<{ e: string }>("SELECT event_projection_epoch::text AS e FROM sessions.session_directory WHERE session_id = $1", [sessionId])).rows[0]?.e ?? "0",
+  });
 
   async function pointer(db: PGlite, machine: string, deleted = false, last = "2026-10-05T00:00:00Z") {
     await db.query(
@@ -658,7 +663,7 @@ describe("catalog writer and projector", () => {
           { relationshipUid: "r1", childSessionId: "child-1" },
           { relationshipUid: "r2", childSessionId: null },
         ],
-      }),
+      }, await at(db, "s-1")),
     ).toEqual({ written: true });
     const rows = await list(db, { agent: "helm-chief" });
     expect(ids(rows)).toEqual(["s-1"]);
@@ -699,7 +704,7 @@ describe("catalog writer and projector", () => {
         agentNames: ["x"], models: [], projectKey: null, projectKeyMethod: null,
         projectId: null, gitRepo: null, gitBranch: null,
         initialCommit: null, originator: null, agentVersion: null, relationships: [],
-      })).written,
+      }, await at(db, "s-1"))).written,
     ).toBe(false);
   });
 
@@ -724,7 +729,7 @@ describe("catalog writer and projector", () => {
         { relationshipUid: "ra", childSessionId: "kid-a" },
         { relationshipUid: "rb", childSessionId: "kid-b" },
       ],
-    });
+    }, await at(db, "parent"));
     const parent = async () => (await list(db, {})).find((row) => row.session_id === "parent")!;
     expect((await parent()).child_session_count).toBe(2);
     // Tombstone kid-a (any writer), hard-delete kid-b (erasure).
@@ -737,7 +742,7 @@ describe("catalog writer and projector", () => {
     await writeDirectoryCatalog(db as never, dirKey("parent"), {
       ...EMPTY,
       relationships: [{ relationshipUid: "ra", childSessionId: "kid-a" }],
-    });
+    }, await at(db, "parent"));
     expect((await parent()).child_session_count).toBe(0);
   });
 
@@ -757,7 +762,7 @@ describe("catalog writer and projector", () => {
       },
     };
     const write = { ...EMPTY, agentNames: ["bot"], relationships: [{ relationshipUid: "r", childSessionId: "c" }] };
-    expect((await writeDirectoryCatalog(counting as never, dirKey("p"), write)).written).toBe(true);
+    expect((await writeDirectoryCatalog(counting as never, dirKey("p"), write, await at(db, "p"))).written).toBe(true);
     expect(statements).toBe(1);
     // Tombstone after the write: its triggers remove the agents and edges.
     await db.exec("UPDATE sessions.session_directory SET deleted_at = now() WHERE session_id = 'p'");
@@ -769,7 +774,7 @@ describe("catalog writer and projector", () => {
     expect(await left()).toBe(0);
     expect((await list(db, {})).find((row) => row.session_id === "c")!.parent_session_ids).toEqual([]);
     // Tombstone before the write: nothing is written.
-    expect((await writeDirectoryCatalog(db as never, dirKey("p"), write)).written).toBe(false);
+    expect((await writeDirectoryCatalog(db as never, dirKey("p"), write, await at(db, "p"))).written).toBe(false);
     expect(await left()).toBe(0);
   });
 });
@@ -883,6 +888,7 @@ describe("migration up/down/up", () => {
     const db = await database();
     await seed(db, FIXTURE);
     // Newer migrations depending on catalog columns must roll back first.
+    await db.exec(read("supabase/rollbacks/20261105031000_desktop_catalog_forget_reproject.down.sql"));
     await db.exec(read("supabase/rollbacks/20261105023000_session_analysis_publications.down.sql"));
     await db.exec(read("supabase/rollbacks/20261105022000_session_desktop_catalog.down.sql"));
     await db.exec(read("supabase/rollbacks/20261105020000_session_replay_pages.down.sql"));
@@ -899,6 +905,7 @@ describe("migration up/down/up", () => {
     await db.exec(read("supabase/migrations/20261105020000_session_replay_pages.sql"));
     await db.exec(read("supabase/migrations/20261105022000_session_desktop_catalog.sql"));
     await db.exec(read("supabase/migrations/20261105023000_session_analysis_publications.sql"));
+    await db.exec(read("supabase/migrations/20261105031000_desktop_catalog_forget_reproject.sql"));
     expect(ids(await list(db, {}))).toEqual(["s1", "s2", "s3", "s4"]);
   });
 });
