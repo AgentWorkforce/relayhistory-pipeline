@@ -372,6 +372,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105026000_canonical_history_lineage.sql` | table sessions.ingest_history_carriers |
 | `upstream:20261105030000_canonical_feature_consumer_acks.sql` | table sessions.canonical_feature_copy_state |
 | `upstream:20261105031000_desktop_catalog_forget_reproject.sql` | table sessions.session_desktop_catalog_reproject |
+| `upstream:20261105032000_session_large_read_routing_fixes.sql` | table sessions.session_large_read_scope_errors |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |

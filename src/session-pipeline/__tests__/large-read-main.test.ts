@@ -1,7 +1,7 @@
 import {expect,test} from 'bun:test';
 import {largeReadMain} from '../large-read-main.ts';
 import type {LargeReadRuntime} from '../large-read-main.ts';
-function runtime(pages:Array<{busy:boolean;scanned:number;changed:number;cycleComplete:boolean}>) {
+function runtime(pages:Array<{busy:boolean;scanned:number;changed:number;cycleComplete:boolean;failed?:number;skipped?:number}>) {
  let scans=0,claims=0,closed=0;
  return { factory:()=>({deps:{db:{query:async(sql:string)=>{
   if(sql.includes('discover_session_large_reads'))return {rows:[{r:pages[Math.min(scans++,pages.length-1)]}]};
@@ -60,4 +60,15 @@ test('an unclassified discovery error is logged and claims still run',async()=>{
  let result;try{result=await largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},factory).catch(e=>({rejected:e?.code}))}finally{process.stderr.write=err}
  expect(result).toMatchObject({enabled:true,discoveryFailures:2});
  expect(claims).toBe(1);expect(lines[0]).toMatchObject({error_code:'55000',reason:'discovery_failed'});
+});
+test('per-scope discovery failed/skipped counts (032000) reach the status line; inconsistent counts are refused',async()=>{
+ const f=runtime([{busy:false,scanned:5,changed:1,cycleComplete:false,failed:1,skipped:2},{busy:false,scanned:3,changed:0,cycleComplete:true,failed:0,skipped:3}]);
+ expect(await largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},f.factory)).toEqual({enabled:true,processed:0,published:0,failed:0,scanned:8,cycleComplete:true,discoveryScopesFailed:1,discoveryScopesSkipped:5});
+ // Zero counts keep the pre-032000 shape.
+ const z=runtime([{busy:false,scanned:0,changed:0,cycleComplete:true,failed:0,skipped:0}]);
+ expect(await largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},z.factory)).toEqual({enabled:true,processed:0,published:0,failed:0,scanned:0,cycleComplete:true});
+ for(const bad of [{failed:-1},{skipped:1.5},{failed:2,skipped:2}]){
+  const b=runtime([{busy:false,scanned:3,changed:0,cycleComplete:false,...bad}]);
+  await expect(largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},b.factory)).rejects.toThrow('invalid discovery');
+ }
 });

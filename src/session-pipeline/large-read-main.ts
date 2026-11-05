@@ -25,17 +25,20 @@ export async function largeReadMain(env:NodeJS.ProcessEnv=process.env,factory:(e
  const maxJobs=Number(env.SESSION_LARGE_READ_MAX_JOBS??"1");if(!Number.isInteger(maxJobs)||maxJobs<1||maxJobs>10)throw new Error("large worker invalid job bound");
  const runtime=factory(env),stop=new AbortController(),terminate=()=>stop.abort(),timer=setTimeout(terminate,30*60*1000);
  process.once("SIGTERM",terminate);process.once("SIGINT",terminate);
- let processed=0,published=0,failed=0,scanned=0,cycleComplete=false,scanPages=0,discoveryFailures=0;
- type Page={busy:boolean;scanned:number;changed:number;cycleComplete:boolean};
+ let processed=0,published=0,failed=0,scanned=0,cycleComplete=false,scanPages=0,discoveryFailures=0,discoveryScopesFailed=0,discoveryScopesSkipped=0;
+ // failed/skipped: per-scope refusals recorded in scope_errors / scopes skipped (backoff, failed, transient); 032000+.
+ type Page={busy:boolean;scanned:number;changed:number;cycleComplete:boolean;failed?:number;skipped?:number};
  const discover=async():Promise<Page|null>=>{
    let page:Page|undefined;
-   // One scope discovery cannot enqueue (54000 capacity, ambiguous source, ...) rolls back the
-   // whole page, cursor included. Log the bounded code and keep claiming already-queued jobs.
-   // Follow-up migration 20261105032000 isolates per-scope discovery failures.
+   // Since migration 20261105032000 a scope discovery cannot enqueue (54000 capacity, ambiguous
+   // source, ...) is recorded in sessions.session_large_read_scope_errors and skipped; only a
+   // transient/server-wide error still rolls back the page. Log the bounded code and keep claiming.
    try{page=(await runtime.deps.db.query<{r:Page}>("SELECT sessions.discover_session_large_reads() r")).rows[0]?.r}
    catch(error){log.error("large worker discovery failed",{stage:"large-read",...errorFields(error),reason:classifyReplayFailure(error)?.reason??"discovery_failed"});discoveryFailures++;return null}
    if(!page||typeof page.busy!=="boolean"||!Number.isSafeInteger(page.scanned)||page.scanned<0||page.scanned>128||!Number.isSafeInteger(page.changed)||page.changed<0||page.changed>page.scanned||typeof page.cycleComplete!=="boolean")throw new Error("large worker invalid discovery");
-   scanned+=page.scanned;cycleComplete=page.cycleComplete;return page;
+   const scopeFailed=page.failed??0,scopeSkipped=page.skipped??0;
+   if(!Number.isSafeInteger(scopeFailed)||scopeFailed<0||!Number.isSafeInteger(scopeSkipped)||scopeSkipped<0||page.changed+scopeFailed+scopeSkipped>page.scanned)throw new Error("large worker invalid discovery");
+   scanned+=page.scanned;cycleComplete=page.cycleComplete;discoveryScopesFailed+=scopeFailed;discoveryScopesSkipped+=scopeSkipped;return page;
  };
  try{
   // Always advance the durable reconciliation cursor, even under a busy queue.
@@ -47,7 +50,7 @@ export async function largeReadMain(env:NodeJS.ProcessEnv=process.env,factory:(e
    const page=await discover();if(!page||page.busy)break; // a failing page would fail again: stop, do not spin
    if(page.cycleComplete&&page.changed===0)break;
   }
-  return {enabled:true,processed,published,failed,scanned,cycleComplete,...(discoveryFailures?{discoveryFailures}:{})};
+  return {enabled:true,processed,published,failed,scanned,cycleComplete,...(discoveryFailures?{discoveryFailures}:{}),...(discoveryScopesFailed?{discoveryScopesFailed}:{}),...(discoveryScopesSkipped?{discoveryScopesSkipped}:{})};
  }finally{clearTimeout(timer);process.removeListener("SIGTERM",terminate);process.removeListener("SIGINT",terminate);await runtime.close()}
 }
 if(import.meta.main)largeReadMain().then(result=>{console.info(JSON.stringify({message:"large canonical worker",...result}));if(result.failed||("discoveryFailures" in result&&result.discoveryFailures))process.exitCode=1}).catch(error=>{console.error(JSON.stringify({message:"large canonical worker failed",code:typeof error?.code==="string"?error.code:"worker_error"}));process.exitCode=1});
