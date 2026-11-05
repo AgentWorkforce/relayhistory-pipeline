@@ -32,6 +32,42 @@
     "sessions.canonical_feature_source_valid(jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.canonical_project_event_ack_v1(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_project_events:EXECUTE"
+    ],
+    "sessions.canonical_project_event_is_current(sessions.canonical_project_events,text,boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_project_event_json(sessions.canonical_project_events)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_project_event_read_v1(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_project_events:EXECUTE"
+    ],
+    "sessions.canonical_project_events_claim_v1(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.canonical_project_events_guard(jsonb,boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_project_events_journal_changed()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_project_events_pending_v1(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_project_events:EXECUTE"
+    ],
+    "sessions.canonical_project_events_release_v1(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.canonical_project_events_sent_v1(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.canonical_remote(text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"

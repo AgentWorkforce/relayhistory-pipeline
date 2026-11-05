@@ -47,6 +47,31 @@ const runtimeBlock=wrapper.match(/v_runtime_fns text\[\] := ARRAY\[([\s\S]*?)\]:
 if(!runtimeBlock)throw Error("boundary runtime manifest source missing");
 const runtime=[...runtimeBlock[1]!.matchAll(/'([^']+)'/g)].map(m=>m[1]!).filter(k=>!k.startsWith("sessions.ingest_history_")&&!k.startsWith("sessions.session_history_")&&!k.startsWith("sessions.session_directory_history_"));
 wrapper=wrapper.replace(runtimeBlock[0],"v_runtime_fns text[] := ARRAY[\n"+[...new Set([...runtime,...runtimeNew])].sort().map(k=>"    '"+k+"'").join(",\n")+"\n  ]::text[];");
+// F10 owns only its standalone registry-v2 migration. Derive its private/actor
+// ACLs here so rerunning the 620 generator preserves the composed inventory.
+let projectSQL:string|undefined;
+try{projectSQL=await readFile(file("supabase/migrations/20261105027000_canonical_project_events.sql"),"utf8")}catch(e){if((e as NodeJS.ErrnoException).code!=="ENOENT")throw e}
+if(projectSQL){
+ const projectDefs=new Map<string,{secdef:boolean}>();
+ for(const m of projectSQL.matchAll(/CREATE(?: OR REPLACE)? FUNCTION\s+(sessions\.canonical_project_\w+)\(([^)]*)\)([\s\S]*?)\s+AS\s+\$[a-z_]+\$/gi)){
+  const types=m[2]!.trim()?m[2]!.split(",").map(p=>p.trim().replace(/\s+DEFAULT\s+[\s\S]*$/i,"").split(/\s+/).slice(1).join(" ").replace(/^timestamptz$/,"timestamp with time zone").replace(/^int$/,"integer")).join(","):"";
+  projectDefs.set(m[1]+"("+types+")",{secdef:/SECURITY DEFINER/i.test(m[3]!)});
+ }
+ const projectGrants=new Map<string,string[]>();
+ for(const m of projectSQL.matchAll(/GRANT EXECUTE ON FUNCTION([\s\S]*?)TO\s+(bulls96_project_events|bulls96_session_ingest)\s*;/gi))
+  for(const sig of m[1]!.replace(/\s+/g,"").split(/,(?=sessions\.)/)){
+   if(!projectDefs.has(sig))throw Error("project grant outside F10 source: "+sig);projectGrants.set(sig,[...(projectGrants.get(sig)??[]),m[2]+":EXECUTE"]);
+  }
+ if(projectDefs.size!==10||projectGrants.size!==6)throw Error("F10 function inventory incomplete");
+ for(const sig of Object.keys(acl.functions))if(sig.startsWith("sessions.canonical_project_"))delete acl.functions[sig];
+ for(let i=secdefs.length-1;i>=0;i--)if(secdefs[i]!.startsWith("sessions.canonical_project_"))secdefs.splice(i,1);
+ for(const[sig,d]of projectDefs){acl.functions[sig]=["<owner>:EXECUTE",...(projectGrants.get(sig)??[])];if(d.secdef)secdefs.push(sig);}
+ acl.functions=Object.fromEntries(Object.entries(acl.functions).sort(([a],[b])=>a<b?-1:a>b?1:0));
+ wrapper=wrapper.replace(/v_manifest jsonb := \$manifest\$[\s\S]*?\$manifest\$::jsonb;/,
+  ()=>"v_manifest jsonb := $manifest$"+JSON.stringify(acl.functions)+"$manifest$::jsonb;");
+ wrapper=wrapper.replace(/v_secdef text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
+  "v_secdef text[] := ARRAY[\n"+[...new Set(secdefs)].sort().map(k=>"    '"+k+"'").join(",\n")+"\n  ]::text[];");
+}
 const body=wrapper.match(/v_body text := \$boundary\$([\s\S]*?)\$boundary\$;/)?.[1];
 if(!body)throw Error("boundary body missing");
 const bodySHA=createHash("sha256").update(body).digest("hex");
@@ -64,6 +89,9 @@ let workerVerify=await readFile(file("supabase/bootstrap/session_directory_searc
 if(!/v_approved text\[\] := ARRAY\[[\s\S]*?\];/.test(workerVerify))throw Error("History worker verifier source missing");
 workerVerify=workerVerify.replace(/v_approved text\[\] := ARRAY\[[\s\S]*?\];/,
  "v_approved text[] := ARRAY[\n"+Object.entries(acl.functions).filter(([,v])=>(v as string[]).includes("session_directory_search_worker:EXECUTE")).map(([k])=>k).sort().map(k=>" '"+k+"'").join(",\n")+"\n ];");
+// F10 actor verifier derives its exact three capabilities from the same manifest.
+const projectVerify=verify.replace(/v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
+ "v_allowed text[] := ARRAY[\n"+Object.entries(acl.functions).filter(([,v])=>(v as string[]).includes("bulls96_project_events:EXECUTE")).map(([k])=>k).sort().map(k=>" '"+k+"'").join(",\n")+"\n ]::text[];").replaceAll("bulls96_session_ingest","bulls96_project_events").replaceAll("session ingest","canonical project events");
 const prior=await readFile(file("supabase/migrations/20261105020000_session_replay_pages.sql"),"utf8");
 const pointers=await readFile(file("supabase/migrations/20261102010000_session_directory_canonical_ids.sql"),"utf8");
 const briefs=await readFile(file("supabase/migrations/20261102020000_session_brief_state.sql"),"utf8");
@@ -100,6 +128,7 @@ const outputs={
  "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql":wrapper,
  "src/hoopdb/migrate-guards.ts":guards,
  "supabase/bootstrap/session_ingest_verify.sql":verify,
+ ...(projectSQL?{"supabase/bootstrap/canonical_project_events_verify.sql":projectVerify}:{}),
  "supabase/bootstrap/session_directory_search_worker_verify.sql":workerVerify,
 };
 const check=process.argv.includes("--check");
