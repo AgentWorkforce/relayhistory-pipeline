@@ -26,7 +26,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Updated before release (#162 adversarial review: the segmenter's CUT_CONTEXT_CHARS
   // widened from 4096 to 8192, past the quoted rule's reach). Version 3 has sealed no
   // chunk: it is only on the unmerged #162 branch.
-  3: "bfa4c222f7db86b2038de775c0ddfd5059288198ea8f4af976cba165460f827b",
+  // Then the entropy fallback stopped firing after a `/`, `.` or `-` (paths, members,
+  // branch names).
+  3: "5ed0e283977024c59f6e4fef3c51531b81358f1c95a1dc1bf449ccfcda1ec369",
 };
 
 const read = (rel: string) =>

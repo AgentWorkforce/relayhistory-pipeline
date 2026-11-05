@@ -328,8 +328,11 @@ const SECRET_PATTERNS: Rule[] = [
   // assignment rules do not parse: `--token <t>`, `password -> <t>`,
   // `API key <t>`. Only next to a secret name, so hashes and ids elsewhere are kept. The
   // token is bounded (a longer run is left whole) so each start stays O(1).
+  // The gap may not start with `/`, `.` or `-`: there the name is a path segment, a
+  // member or a word in a branch name (`src/token/TokenRefreshService.java`,
+  // `token.getAccessTokenSilently()`, `feature/secret-RotateKeys2026`), not a label.
   [
-    /(?<![A-Za-z0-9])((?:password|passwd|passphrase|secret|token|credentials?|api[_ -]?key|access[_ -]?key|private[_ -]?key|secret[_ -]?key|client[_ -]?secret|auth[_ -]?token|session[_ -]?token)(?![A-Za-z0-9_])[^A-Za-z0-9\r\n]{1,8})([A-Za-z0-9_+/=.-]{20,512})(?![A-Za-z0-9_+/=.-])/gi,
+    /(?<![A-Za-z0-9])((?:password|passwd|passphrase|secret|token|credentials?|api[_ -]?key|access[_ -]?key|private[_ -]?key|secret[_ -]?key|client[_ -]?secret|auth[_ -]?token|session[_ -]?token)(?![A-Za-z0-9_./-])[^A-Za-z0-9\r\n]{1,8})([A-Za-z0-9_+/=.-]{20,512})(?![A-Za-z0-9_+/=.-])/gi,
     (match, lead, token) =>
       looksGenerated(token as string) ? `${lead}${REDACTED}` : match,
   ],
