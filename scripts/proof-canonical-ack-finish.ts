@@ -23,8 +23,8 @@ await db.query(ddl);
 const A = "a".repeat(64), UID = "12345678-1234-1234-1234-123456789012";
 const SCOPE = { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s",
   generation: A };
-const HS1 = `hs1:${createHash("sha256")
-  .update(JSON.stringify(SCOPE)).digest("hex")}:${A}:${UID}`;
+import { canonicalImageKey } from "../src/search-features/canonical-image-key.ts";
+const HS1 = canonicalImageKey(SCOPE, UID);
 const AUTH = { authorityId: UID, epoch: "1", fingerprint: A };
 const PTR = { authorityId: UID, hash: "c".repeat(64), count: "1" };
 await db.query(`INSERT INTO ${SCHEMA}.canonical_feature_journal(revision,kind,org_id,workspace_id,scope,schema_generation,image_key,source_hash,source_authority,pointer_set) VALUES(10,'publish','o','w',$1,$2,$3,$4,$5,$6)`,

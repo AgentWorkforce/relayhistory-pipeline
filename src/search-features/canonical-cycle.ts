@@ -111,9 +111,9 @@ export async function copyCanonicalEntry(
   ch: ClickHouseClient,
   state: CanonicalCycleState,
   entry: CanonicalJournalEntry,
-  /** Stable, non-secret deployment identity — the actual CH target's ID.
+  /** Stable, non-secret deployment identity — REQUIRED (no unsafe default).
    *  Two deployments sharing database/table names still differ. */
-  targetId?: string,
+  targetId: string,
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
@@ -124,8 +124,7 @@ export async function copyCanonicalEntry(
   // deployment's own target ID), not the source image.
   const profileBinding = `builtin-fold@1:${entry.schemaGeneration}`;
   const targetBinding =
-    `${targetId ?? "default"}:${ch.database}:` +
-    `${EVENT_FEATURES_TABLE}:${BRIEF_FEATURES_TABLE}:v1`;
+    `${targetId}:${ch.database}:${EVENT_FEATURES_TABLE}:${BRIEF_FEATURES_TABLE}:v1`;
   // Durable state FIRST — a committed entry reports already_complete and
   // advances the checkpoint without ever touching the source descriptor.
   const began = await acks.begin(entry, profileBinding, targetBinding);

@@ -6,11 +6,10 @@ import {
 
 const SCOPE = JSON.stringify({ orgId: "o", workspaceId: "w", harness: "h",
   sessionId: "s", generation: "a".repeat(64) });
-import { createHash } from "node:crypto";
+import { canonicalImageKey } from "../canonical-image-key.ts";
 const SCOPE_OBJ = JSON.parse(SCOPE);
-const HS1_KEY = "hs1:" +
-  createHash("sha256").update(JSON.stringify(SCOPE_OBJ)).digest("hex") + ":" +
-  SCOPE_OBJ.generation + ":12345678-1234-1234-1234-123456789012";
+const AUTH_ID = "12345678-1234-1234-1234-123456789012";
+const HS1_KEY = canonicalImageKey(SCOPE_OBJ, AUTH_ID);
 const AUTH = JSON.stringify({ authorityId: "12345678-1234-1234-1234-123456789012", epoch: "1", fingerprint: "a".repeat(64) });
 const PTR = JSON.stringify({ authorityId: "12345678-1234-1234-1234-123456789012", hash: "c".repeat(64), count: "1" });
 const fakeDb = () => {

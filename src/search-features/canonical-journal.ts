@@ -7,7 +7,7 @@
  * Implements CanonicalVersionPort + CanonicalJournalPort over a write-capable
  * connection (SqlQuery-compatible). DDL is held: 040610 is a proposal only.
  */
-import { createHash } from "node:crypto";
+import { canonicalImageKey } from "./canonical-image-key.ts";
 import type {
   CanonicalJournalEntry,
   CanonicalJournalPort,
@@ -84,10 +84,9 @@ const toEntry = (r: Row): CanonicalJournalEntry => {
   const hs1Auth = r.image_key.split(":")[3]!;
   const hs1Gen = r.image_key.split(":")[2]!;
   const hs1Scope = r.image_key.split(":")[1]!;
-  // The hs1 scope digest recomputes from the scope's own identity — a
-  // misrouted tenant scope with a syntactically valid key refuses.
-  if (createHash("sha256")
-        .update(JSON.stringify(scope)).digest("hex") !== hs1Scope ||
+  // The #230 digest: sha256 of the unit-separator-joined identity fields
+  // prefixed 'history-scope-v1' — NOT JSON.stringify(scope).
+  if (canonicalImageKey(scope, hs1Auth) !== r.image_key ||
       hs1Gen !== scope.generation || hs1Gen !== r.schema_generation ||
       r.org_id !== scope.orgId || r.workspace_id !== scope.workspaceId)
     throw new Error("journal_row_invalid");
