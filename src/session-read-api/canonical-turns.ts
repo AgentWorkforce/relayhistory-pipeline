@@ -12,13 +12,13 @@
  * returns from dual/forward to Neon-only after the export (docs/relay-session-turns.md).
  */
 import type { RelayhistoryStreamRecord } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
-import type { CanonicalIdentity } from "./canonical.ts";
+import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
 import { TURN_KIND, TURN_ORIGIN_ID, TURN_PAYLOAD_KEYS, turnRecordId } from "../session-ingest/turns.ts";
 
 type Row = { table: string; row: Record<string, unknown> };
 
 function fail(): never {
-  throw new Error("canonical live turn invalid");
+  throw new CanonicalReadError("live_turn_invalid");
 }
 
 /** Live turn records of this scope as Neon-shaped rows; any record outside the scope or shape fails the read. */

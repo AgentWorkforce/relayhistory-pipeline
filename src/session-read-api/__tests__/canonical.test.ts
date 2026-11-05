@@ -604,7 +604,10 @@ test("replay pages admit a legally large first event and bind view/content bound
   expect(sameCap.status).toBe(200);
 });
 
-test("provider exposes scoped legacy table pages and explicit coverage without Neon", async () => {
+// Gate 4: legacy records are accepted only from an exporter-owned legacy-machine
+// manifest (the positive path is canonical-legacy-source.test.ts); a live
+// delivery manifest carrying them is refused, never served.
+test("provider refuses legacy records carried by a live delivery manifest", async () => {
   const scope = {
     org_id: "org_1",
     workspace_id: "ws_1",
@@ -651,17 +654,7 @@ test("provider exposes scoped legacy table pages and explicit coverage without N
     fetch,
     deps,
   );
-  expect(response.status).toBe(200);
-  const result: any = await response.json();
-  expect(result.legacyCoverage).toEqual({
-    version: 1,
-    tables: ["conversation_turns", "session_links", "session_outcomes"],
-  });
-  expect(result.rows).toHaveLength(1);
-  expect(result.rows[0]).toMatchObject({
-    table: "conversation_turns",
-    row: { id: "id", content: "legacy body" },
-  });
+  expect(response.status).toBe(503);
 });
 
 test("immutable publication snapshot uses existing canonical fold and generation-qualified raw namespace",async()=>{
