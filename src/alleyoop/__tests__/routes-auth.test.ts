@@ -18,7 +18,7 @@ const deps = new Proxy({}, { get: () => boom }) as never;
 function app() {
   const a = new Hono<AppEnv>();
   for (const path of PUBLIC_INGEST_PATHS) a.get(path, (c) => c.json({ ok: true }));
-  mountIngestApi(a, { courierManifests: createCourierManifestRoutes(deps), pipeline: createPipelineRoutes(deps) }, new Hono<AppEnv>());
+  mountIngestApi(a, { courierManifests: createCourierManifestRoutes(deps), pipeline: createPipelineRoutes(deps) }, new Hono<AppEnv>(), { ampTransportToken: () => "fixture-platform-amp-transport-token" });
   return a;
 }
 

@@ -3,8 +3,10 @@
  * tested without HoopDb. Only PUBLIC_INGEST_PATHS answer without credentials:
  * health checks and the public JWKS. Every `/v1` route requires a RelayAuth JWT
  * (requireAuth), and the operator routes under `/v1/internal/pipeline/*` require
- * PIPELINE_OPS_SECRET (and answer 503 where it is not configured).
+ * PIPELINE_OPS_SECRET (and answer 503 where it is not configured). The ingest
+ * also mounts the fixed Amp transport separately with AMP_TRANSPORT_TOKEN.
  */
+import { createAmpTransportRoutes } from "../amp/routes.ts";
 import type { Hono } from "hono";
 import { orgAllowlist } from "./org-allowlist.ts";
 import { pipelineOpsRoutes, requireAuth, type AppEnv } from "../shared/vendor.ts";
@@ -21,8 +23,9 @@ export function mountIngestApi(
   app: Hono<AppEnv>,
   routes: { courierManifests: Hono<AppEnv>; pipeline: Hono<AppEnv> },
   v1: Hono<AppEnv>,
-  opts: { relayhistoryOrigin?: string | undefined; allowedOrgIds?: readonly string[] | undefined } = {},
+  opts: { ampTransportToken?: () => string | undefined; relayhistoryOrigin?: string | undefined; allowedOrgIds?: readonly string[] | undefined } = {},
 ) {
+  app.route("/", createAmpTransportRoutes({ token: opts.ampTransportToken ?? (() => undefined) }));
   v1.use("*", async (c, next) => requireAuth(c as never, next));
   if (opts.allowedOrgIds?.length) v1.use("*", orgAllowlist(opts.allowedOrgIds));
   // Upload routes on an origin-bound deployment: only assertions minted for

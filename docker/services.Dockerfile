@@ -11,6 +11,13 @@ COPY packages packages
 RUN bun run --filter @relayhistory/object-store build
 COPY supabase supabase
 COPY certs certs
+# Cache the CLI layer independently from other service source changes.
+COPY src/amp src/amp
+COPY scripts/sync-amp-provider.mjs scripts/sync-amp-provider.mjs
+COPY scripts/install-amp-cli.ts scripts/install-amp-cli.ts
+RUN bun scripts/sync-amp-provider.mjs --check
+# Install and execute the pinned native binary once, as an image-build check.
+RUN bun scripts/install-amp-cli.ts
 COPY src src
 COPY stacks stacks
 COPY docker/entrypoint.sh /entrypoint.sh
