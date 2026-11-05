@@ -11,6 +11,9 @@ on:
       ref_note:
         description: 'Where the approval was given (date, call/message)'
         required: true
+      source_sha:
+        description: 'Reviewed full 40-character source commit on main (defaults to this workflow commit)'
+        required: false
 permissions:
   contents: read
   packages: write
@@ -25,18 +28,37 @@ jobs:
     runs-on: ${{ vars.DEPLOY_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
+      - name: Validate requested source commit
+        env:
+          SOURCE_SHA: ${{ github.event.inputs.source_sha || github.sha }}
+        run: |
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Source must be a full lowercase 40-character commit SHA" >&2
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
+          ref: ${{ github.event.inputs.source_sha || github.sha }}
       # A customer image must come from a reviewed commit on main.
       - name: Verify the source commit is reviewed on main
+        id: source
+        env:
+          SOURCE_SHA: ${{ github.event.inputs.source_sha || github.sha }}
         run: |
           git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$(git rev-parse "${GITHUB_SHA}^{commit}")" origin/main; then
-            echo "Refusing to publish ${GITHUB_SHA}: it is not on main" >&2
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$SOURCE_SHA" ]]; then
+            echo "Checked out source differs from the requested commit" >&2
             exit 1
           fi
+          if ! git merge-base --is-ancestor "$actual" origin/main; then
+            echo "Refusing to publish ${actual}: it is not on main" >&2
+            exit 1
+          fi
+          echo "sha=$actual" >> "$GITHUB_OUTPUT"
+          echo "Reviewed image source: $actual" >> "$GITHUB_STEP_SUMMARY"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -52,13 +74,13 @@ jobs:
           file: docker/services.Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          # The moving :main tag is written only from main; any other ref gets its sha tag only.
+          # A pinned older source gets only its SHA tag; it must not move :main backwards.
           tags: |
-            ghcr.io/agentworkforce/96bulls-services:sha-${{ github.sha }}
-            ${{ github.ref == 'refs/heads/main' && 'ghcr.io/agentworkforce/96bulls-services:main' || '' }}
+            ghcr.io/agentworkforce/96bulls-services:sha-${{ steps.source.outputs.sha }}
+            ${{ github.ref == 'refs/heads/main' && steps.source.outputs.sha == github.sha && 'ghcr.io/agentworkforce/96bulls-services:main' || '' }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
             96bulls.approval=${{ github.event.inputs.ref_note }}
           # Customer releases need an SBOM and verifiable (max-mode) provenance;
           # the signed GitHub attestation below covers the pushed digest.
@@ -69,6 +91,22 @@ jobs:
         with:
           subject-name: ghcr.io/agentworkforce/96bulls-services
           subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      # GitHub provenance identifies the workflow commit. Also bind the actual
+      # reviewed checkout when publication deliberately uses an older source.
+      - name: Attest reviewed image source
+        uses: actions/attest@ce27ba3b4a9a139d9a20a4a07d69fabb52f1e5bc # v2.4.0
+        with:
+          subject-name: ghcr.io/agentworkforce/96bulls-services
+          subject-digest: ${{ steps.build.outputs.digest }}
+          predicate-type: https://agentrelay.com/attestations/reviewed-image-source/v1
+          predicate: >-
+            {
+              "repository": "${{ github.server_url }}/${{ github.repository }}",
+              "source_sha": "${{ steps.source.outputs.sha }}",
+              "workflow_sha": "${{ github.sha }}",
+              "source_ref": "refs/heads/main"
+            }
           push-to-registry: true
       - name: Digest
         run: |

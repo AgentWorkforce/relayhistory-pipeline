@@ -36,6 +36,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105030000_canonical_feature_consumer_acks.sql": { evidence: "table sessions.canonical_feature_copy_state", sql: relation("sessions.canonical_feature_copy_state") },
   "upstream:20261105031000_desktop_catalog_forget_reproject.sql": { evidence: "table sessions.session_desktop_catalog_reproject", sql: relation("sessions.session_desktop_catalog_reproject") },
   "upstream:20261105032000_session_large_read_routing_fixes.sql": { evidence: "table sessions.session_large_read_scope_errors", sql: relation("sessions.session_large_read_scope_errors") },
+  "upstream:20261105035000_semantic_copy_state.sql": {evidence:"table sessions.search_feature_copy_state",sql:relation("sessions.search_feature_copy_state")},
   "upstream:20261105036000_canonical_consumer_lease.sql": { evidence: "table sessions.canonical_feature_consumer_lease", sql: relation("sessions.canonical_feature_consumer_lease") },
   "upstream:20261105010000_frozen_source_custody.sql": {evidence:"table sessions.ingest_frozen_source_completeness",sql:relation("sessions.ingest_frozen_source_completeness")},
   "upstream:20261104055000_lazy_current_custody.sql": {evidence:"table sessions.ingest_lazy_policy",sql:relation("sessions.ingest_lazy_policy")},

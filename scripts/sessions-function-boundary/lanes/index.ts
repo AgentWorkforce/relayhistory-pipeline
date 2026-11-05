@@ -5,6 +5,7 @@ import { canonicalProjectEvents } from "./canonical-project-events.ts";
 import { desktopCatalog } from "./desktop-catalog.ts";
 import { ingestHistory } from "./ingest-history.ts";
 import { readApi } from "./read-api.ts";
+import { semanticCopy } from "./semantic-copy.ts";
 
 /** Every lane the unified generator composes. Order does not affect the output. */
-export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, canonicalProjectEvents, canonicalFeatureConsumer, desktopCatalog];
+export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, canonicalProjectEvents, canonicalFeatureConsumer, desktopCatalog, semanticCopy];
