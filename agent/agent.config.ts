@@ -40,4 +40,9 @@ export default defineLayeredAgent({
   repos: ["AgentWorkforce/sessions-pipeline", "AgentWorkforce/sessions-pipeline-cloud"],
   relayDescription: "sessions-pipeline layered lead (EC2, Fable)",
   names: { platformPrefix: `/relaycast-agent-host/${stage}` },
+  // The Agent Relay sessions MCP (module 0.1.9): the lead can search and read
+  // the team's shared sessions as agent-relay-sessions. The host role and its
+  // boundary read exactly this parameter; the boundary comes from this
+  // agent's entry in layered-agents infra/agents.ts, which must match.
+  relaySessions: { tokenParam: `/relaycast-agent-host/${stage}/relay-sessions-token-sessions-pipeline` },
 });

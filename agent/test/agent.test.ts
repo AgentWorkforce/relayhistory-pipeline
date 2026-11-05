@@ -52,8 +52,12 @@ test("network: the existing agent-hosts VPC ids relaycast-cloud's agent-host sta
   });
 });
 
-test("secrets: the host reads exactly the kit's two shared parameters and writes none", () => {
-  assert.deepEqual(agent.secrets.map((s) => s.param), ["/relaycast-agent-host/dev/anthropic-api-key", "/relaycast-agent-host/dev/nango-secret-key"]);
+test("secrets: the host reads exactly the kit's two shared parameters and its sessions MCP token, and writes none", () => {
+  assert.deepEqual(agent.secrets.map((s) => s.param), [
+    "/relaycast-agent-host/dev/anthropic-api-key",
+    "/relaycast-agent-host/dev/nango-secret-key",
+    "/relaycast-agent-host/dev/relay-sessions-token-sessions-pipeline",
+  ]);
   const policy = hostRolePolicy(agent, "500268966557");
   const ssm = policy.Statement.filter((s) => s.Action.some((a) => a.startsWith("ssm:")));
   assert.deepEqual(ssm, [{
@@ -63,9 +67,15 @@ test("secrets: the host reads exactly the kit's two shared parameters and writes
     Resource: [
       "arn:aws:ssm:us-west-2:500268966557:parameter/relaycast-agent-host/dev/anthropic-api-key",
       "arn:aws:ssm:us-west-2:500268966557:parameter/relaycast-agent-host/dev/nango-secret-key",
+      "arn:aws:ssm:us-west-2:500268966557:parameter/relaycast-agent-host/dev/relay-sessions-token-sessions-pipeline",
     ],
   }]);
+  // The token is read by name (load-secrets.sh -> kit/relay-sessions.sh -> ~/.claude.json), never exported to secrets.env.
   assert.match(agent.envFile, /^EXPORT_SECRETS=$/m);
+  assert.match(agent.envFile, /^RELAY_SESSIONS_PARAM=\/relaycast-agent-host\/dev\/relay-sessions-token-sessions-pipeline$/m);
+  // The boundary allows reading it too (built the same way in layered-agents infra/agents.ts).
+  const boundaryReads = hostBoundaryPolicy(agent, "500268966557").Statement.filter((s) => s.Action.includes("ssm:GetParameter")).flatMap((s) => [s.Resource].flat());
+  assert.ok(boundaryReads.includes("arn:aws:ssm:us-west-2:500268966557:parameter/relaycast-agent-host/dev/relay-sessions-token-sessions-pipeline"));
 });
 
 test("the host role carries the platform's permissions boundary (the deploy role may write it only under that boundary)", () => {
@@ -85,13 +95,15 @@ test(`user data: under ${USER_DATA_BUDGET} bytes encoded (EC2 caps it at ${EC2_U
   assert.doesNotMatch(script, /sk-ant-|ghp_|ghs_|gho_|github_pat_|BEGIN [A-Z ]*PRIVATE KEY/);
 });
 
-test("the lead runs on Fable: the rendered lead unit starts Claude Code with --model claude-fable-5-1", () => {
-  // The model is the kit's (setup.sh's lead unit), not a per-agent setting;
-  // implementation goes to sonnet or opus subagents per the routing block.
+test("the lead runs on Fable: the rendered lead unit starts the kit's lead-run.sh, which runs Claude Code with --model claude-fable-5-1", () => {
+  // The model is the kit's (lead-run.sh, which the lead unit starts), not a
+  // per-agent setting; implementation goes to sonnet or opus subagents per
+  // the routing block. lead-run.sh resumes the conversation on a restart.
   const script = gunzipSync(Buffer.from(userDataBase64(agent, read), "base64")).toString("utf8");
   const launch = script.split("\n").filter((l) => l.startsWith("ExecStart=/usr/bin/tmux new-session -d -s lead "));
   assert.equal(launch.length, 1);
-  assert.match(launch[0]!, /"claude --model claude-fable-5-1 --dangerously-skip-permissions --append-system-prompt-file \/opt\/agent-host\/lead-prompt\.md /);
+  assert.equal(launch[0], "ExecStart=/usr/bin/tmux new-session -d -s lead /opt/agent-host/lead-run.sh /opt/agent-host/lead-prompt.md");
+  assert.match(script, /claude --model claude-fable-5-1 --dangerously-skip-permissions --append-system-prompt-file "\$p"/);
   // Every hard-coded model id is Fable. (The worker launcher passes its model
   // through "$model", which defaults to the lead's Fable; it is not a literal.)
   assert.deepEqual([...new Set([...script.matchAll(/claude --model ([a-z0-9][\w.-]*)/g)].map((m) => m[1]))], ["claude-fable-5-1"]);
