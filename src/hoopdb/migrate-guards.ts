@@ -165,12 +165,24 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
 export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.applied_repo_evidence(jsonb,jsonb)",
   "sessions.canonical_remote(text)",
+  "sessions.capture_session_replay_pages(text,text,text,text)",
+  "sessions.claim_session_analysis_cache()",
+  "sessions.claim_session_large_read(uuid,integer)",
   "sessions.clean_root_commit(text)",
+  "sessions.discover_session_large_reads()",
+  "sessions.enqueue_session_analysis_cache(text,text,text,text)",
+  "sessions.enqueue_session_large_read(text,text,text,text)",
+  "sessions.finish_session_analysis_cache(text,text,text,text,bigint,text,uuid,text)",
+  "sessions.heartbeat_session_analysis_cache(text,text,text,text,bigint,text,uuid)",
+  "sessions.heartbeat_session_large_read(text,text,text,text,uuid)",
   "sessions.jwt_org_id()",
   "sessions.jwt_workspace_ids()",
   "sessions.legacy_remote(text)",
   "sessions.lock_repo_catalog(text)",
   "sessions.member_of(text,text[])",
+  "sessions.publish_session_analysis_cache(text,text,text,text,bigint,text,timestamp with time zone,text,text,text,text,text,text,integer,uuid)",
+  "sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)",
+  "sessions.publish_session_replay_pages(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer)",
   "sessions.repo_backfill_report()",
   "sessions.repo_backfill_step(integer,text)",
   "sessions.repo_group(text,uuid)",
@@ -178,6 +190,8 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.repo_visibility_ids(text,uuid)",
   "sessions.repos_maintain(integer)",
   "sessions.resolve_repo(text,text,text,timestamp with time zone)",
+  "sessions.retry_session_large_read(text,text,text,text,uuid,text)",
+  "sessions.route_session_large_read(text,text,text,text)",
   "sessions.session_directory_project_text(text,text,text)",
   "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
   "sessions.session_index_batch(jsonb)",
@@ -1070,7 +1084,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "41359cbc4ef669435d885f2e3d7ef1f76ac6d95c82d858b40213c1c9ddd7a439";
+  "b0d17ee3e5e76191d3ae411b806582aa74b2064e23ef9e54ef6f8af0b185dc02";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

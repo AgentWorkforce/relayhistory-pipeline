@@ -25,9 +25,15 @@ export const MAX_DIRECTORY_RELATIONSHIPS = 500;
 export type DirectoryRelationship = {
   relationshipUid: string;
   childSessionId: string | null;
+  childModel?: string | null;
+  childAgentName?: string | null;
+  childAgentType?: string | null;
 };
 
 export type DirectoryCatalog = {
+  metadataVersion?: 1;
+  modelsComplete?: boolean;
+  relationshipsComplete?: boolean;
   agentNames: string[];
   models: string[];
   projectKey: string | null;
@@ -53,7 +59,11 @@ const codePoints = (value: string) => Array.from(value).length;
 function bounded(value: unknown, max: number): string | null {
   if (typeof value !== "string") return null;
   const text = value.trim();
-  if (text === "" || codePoints(text) > max || /[\u0000-\u001f\u007f]/.test(text))
+  if (
+    text === "" ||
+    codePoints(text) > max ||
+    /[\u0000-\u001f\u007f]/.test(text)
+  )
     return null;
   return text;
 }
@@ -107,6 +117,9 @@ export function directoryCatalogFromProjection(
   rows: readonly CatalogProjectionRow[],
 ): DirectoryCatalog {
   const catalog: DirectoryCatalog = {
+    metadataVersion: 1,
+    modelsComplete: true,
+    relationshipsComplete: true,
     agentNames: [],
     models: [],
     projectKey: null,
@@ -121,10 +134,20 @@ export function directoryCatalogFromProjection(
   };
   const agents = new Map<string, string>();
   const modelSet = new Set<string>();
-  const edges = new Map<string, string | null>();
+  const edges = new Map<string, DirectoryRelationship>();
   for (const { table, row } of rows) {
     if (table === "session_catalog") {
       for (const model of models(row.models)) modelSet.add(model);
+      if (
+        Array.isArray(row.models) &&
+        row.models.some(
+          (value) =>
+            typeof value === "string" &&
+            value !== "" &&
+            bounded(value, 200) !== value,
+        )
+      )
+        catalog.modelsComplete = false;
       catalog.projectKeyMethod =
         bounded(row.project_key_method, 64) ?? catalog.projectKeyMethod;
       catalog.projectKey = bounded(row.project_key, 512) ?? catalog.projectKey;
@@ -141,26 +164,55 @@ export function directoryCatalogFromProjection(
       if (name) agents.set(normalizeDirectoryAgent(name), name);
     } else if (table === "session_relationships") {
       const uid = bounded(row.relationship_uid, 255);
-      if (uid) edges.set(uid, bounded(row.child_session_id, 255));
+      if (!uid) {
+        catalog.relationshipsComplete = false;
+        continue;
+      }
+      const edge: DirectoryRelationship = {
+        relationshipUid: uid,
+        childSessionId: bounded(row.child_session_id, 255),
+      };
+      for (const [raw, key] of [
+        ["child_model", "childModel"],
+        ["child_agent_name", "childAgentName"],
+        ["child_agent_type", "childAgentType"],
+      ] as const) {
+        if (Object.hasOwn(row, raw)) {
+          const value = row[raw];
+          if (value === null) edge[key] = null;
+          else if (
+            typeof value === "string" &&
+            Array.from(value).length <= 200 &&
+            !/[\u0000-\u001f\u007f]/u.test(value)
+          )
+            edge[key] = value;
+          else {
+            edge[key] = null;
+            catalog.relationshipsComplete = false;
+          }
+        } else catalog.relationshipsComplete = false;
+      }
+      edges.set(uid, edge);
     }
   }
   if (
     catalog.projectKey !== null &&
-    (catalog.projectKeyMethod === "path" || looksLikeLocalPath(catalog.projectKey))
+    (catalog.projectKeyMethod === "path" ||
+      looksLikeLocalPath(catalog.projectKey))
   )
     catalog.projectKey = null;
   catalog.agentNames = [...agents.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([, name]) => name)
     .slice(0, MAX_DIRECTORY_AGENTS);
+  if (modelSet.size > MAX_DIRECTORY_MODELS) catalog.modelsComplete = false;
+  if (edges.size > MAX_DIRECTORY_RELATIONSHIPS)
+    catalog.relationshipsComplete = false;
   catalog.models = [...modelSet].sort().slice(0, MAX_DIRECTORY_MODELS);
   catalog.relationships = [...edges.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .slice(0, MAX_DIRECTORY_RELATIONSHIPS)
-    .map(([relationshipUid, childSessionId]) => ({
-      relationshipUid,
-      childSessionId,
-    }));
+    .map(([, edge]) => edge);
   return catalog;
 }
 
@@ -211,12 +263,15 @@ export async function writeDirectoryCatalog(
       row: {
         relationship_uid: edge.relationshipUid,
         child_session_id: edge.childSessionId,
+        child_model: edge.childModel ?? null,
+        child_agent_name: edge.childAgentName ?? null,
+        child_agent_type: edge.childAgentType ?? null,
       },
     })),
   ]);
   const { rows } = await db.query<{ written: boolean }>(
     `WITH live AS MATERIALIZED (
-       SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at
+       SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at, d.event_projection_epoch
          FROM sessions.session_directory AS d
         WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
           AND d.deleted_at IS NULL
@@ -237,7 +292,9 @@ export async function writeDirectoryCatalog(
                 d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]),
                 coalesce($12, d.project_id), coalesce($13, d.git_repo),
                 coalesce($14, d.git_branch), d.model, d.short_summary),
-              catalog_projected_at = now()
+              catalog_projected_at = now(), catalog_read_projected_at = now(),
+              catalog_read_version=$21::smallint,catalog_read_epoch=l.event_projection_epoch,
+              catalog_models_complete=$22::boolean,catalog_relationships_complete=$23::boolean
          FROM live AS l
         WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id
           AND d.harness = l.harness AND d.session_id = l.session_id
@@ -256,8 +313,8 @@ export async function writeDirectoryCatalog(
        ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized)
        DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at
      ), edges AS (
-       SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child
-         FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child)
+       SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child, e.model, e.name, e.agent_type
+         FROM live AS l, unnest($16::text[], $17::text[], $18::text[], $19::text[], $20::text[]) AS e(uid, child, model, name, agent_type)
         WHERE e.child IS NULL OR NOT EXISTS (
           SELECT 1 FROM sessions.session_directory AS c
            WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id
@@ -270,10 +327,11 @@ export async function writeDirectoryCatalog(
           AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e))
      ), put_edges AS (
        INSERT INTO sessions.session_directory_relationships
-         (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id)
-       SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e
+         (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id,child_model,child_agent_name,child_agent_type)
+       SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child,e.model,e.name,e.agent_type FROM edges AS e
        ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid)
-       DO UPDATE SET child_session_id = excluded.child_session_id
+       DO UPDATE SET child_session_id = excluded.child_session_id,child_model=excluded.child_model,
+         child_agent_name=excluded.child_agent_name,child_agent_type=excluded.child_agent_type
      )
      SELECT EXISTS (SELECT 1 FROM updated) AS written`,
     [
@@ -294,6 +352,16 @@ export async function writeDirectoryCatalog(
       catalog.agentNames.map(normalizeDirectoryAgent),
       catalog.relationships.map((edge) => edge.relationshipUid),
       catalog.relationships.map((edge) => edge.childSessionId),
+      catalog.relationships.map((edge) => edge.childModel ?? null),
+      catalog.relationships.map((edge) => edge.childAgentName ?? null),
+      catalog.relationships.map((edge) => edge.childAgentType ?? null),
+      input.metadataVersion === 1 ? 1 : 0,
+      input.metadataVersion === 1 &&
+        input.modelsComplete === true &&
+        catalog.modelsComplete === true,
+      input.metadataVersion === 1 &&
+        input.relationshipsComplete === true &&
+        catalog.relationshipsComplete === true,
     ],
   );
   return { written: rows[0]?.written === true };

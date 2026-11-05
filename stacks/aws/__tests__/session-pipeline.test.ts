@@ -8,6 +8,9 @@ import {
   DELIVERY_DELAY_SECONDS,
   FUNCTION_TIMEOUT_SECONDS,
   SESSION_BRIEF_RESOURCES,
+  SESSION_ANALYSIS_CACHE_RESOURCES,
+  analysisCacheScheduleProps,
+  analysisReconcileScheduleProps,
   SESSION_PIPELINE_RESOURCES,
   VISIBILITY_TIMEOUT_SECONDS,
   briefScheduleProps,
@@ -99,11 +102,13 @@ describe("session pipeline: wiring", () => {
       PIPELINE_ORG_FROM_PREFIX: "true",
       SESSION_PIPELINE_SECRET_ARN: "96bulls/aws-sessions-prod/session-pipeline",
       SEARCH_INDEX_ENABLED: "0",
+      SESSION_REPLAY_PAGES_ENABLED: "0",
       PIPELINE_FANOUT: "off",
       PIPELINE_RECONCILE_LOOKBACK_MINUTES: "60",
     });
     for (const value of Object.values(env)) expect(value).not.toMatch(/postgres(ql)?:\/\/|password|clickhouse\.cloud/i);
     expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true } }).SEARCH_INDEX_ENABLED).toBe("1");
+    expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { replayPages: true } }).SESSION_REPLAY_PAGES_ENABLED).toBe("1");
   });
 
   it("briefs start off: SESSION_BRIEF_ENABLED=false and the schedule DISABLED; enabled sets both, and the caps only when given", () => {
@@ -190,7 +195,7 @@ describe("session pipeline: inputs", () => {
     ({ ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline } }) as unknown as AwsInputs & Record<string, unknown>;
   const validate = (i: AwsInputs & Record<string, unknown>) => assertTranscriptStoreInputs(STAGE, i);
   it("accepts the documented settings and refuses anything else", () => {
-    expect(() => validate(withPipeline({ searchIndex: true, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ searchIndex: true, replayPages: true, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
     expect(() => validate(withPipeline({ queue: "x" }))).toThrow(/sessionPipeline.queue is not a known setting/);
     expect(() => validate(withPipeline({ maxConcurrency: 50 }))).toThrow(/maxConcurrency/);
     expect(() => validate(withPipeline({ reconcileMinutes: 1 }))).toThrow(/reconcileMinutes/);
@@ -264,6 +269,10 @@ describe("session pipeline: deploy plan contract", () => {
     expect(() => check(plan({ transcripts: "update" }, store))).toThrow(/initial, recovery/);
   });
 
+  const withAnalysis=[...all,...SESSION_ANALYSIS_CACHE_RESOURCES];
+  it("analysis schedule is dormant and its invoke permission is bound to the exact rule/account",()=>{const input={names:p,functionArn:"arn:lambda",p:{},tags:{}};expect(analysisCacheScheduleProps(input)).toMatchObject({state:"DISABLED",scheduleExpression:"rate(1 minute)",targets:[{Input:JSON.stringify({analysisCache:true})}]});expect(analysisCacheScheduleProps({...input,p:{analysisCache:true}}).state).toBe("ENABLED");expect(analysisReconcileScheduleProps(input)).toMatchObject({state:"DISABLED",scheduleExpression:"rate(30 minutes)",targets:[{Input:JSON.stringify({analysisCacheReconcile:true})}]});const grants=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:`arn:aws:events:${REGION}:${ACCOUNT}:rule/${p.rule}`,briefRuleArn:"brief",analysisRuleArn:"exact-analysis-rule",roleArn:ROLE});expect(grants.at(-1)!.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn:"exact-analysis-rule",sourceAccount:ACCOUNT})});
+  it("analysis phase requires both resources and refuses permission widening, mixed schedules and unrelated writes",()=>{const creates=Object.fromEntries(SESSION_ANALYSIS_CACHE_RESOURCES.map(r=>[r,"create"]));expect(check(plan(creates,withAnalysis))).toBe("session analysis cache rollout");expect(check(plan({"session-analysis-cache-schedule":"update"},withAnalysis))).toBe("session analysis cache update");for(const permission of ["session-analysis-cache-permission","session-analysis-reconcile-permission"])expect(()=>check(plan({[permission]:"update"},withAnalysis))).toThrow(/unsafe action combination/);expect(()=>check(plan(creates,[...all,"session-analysis-cache-schedule"]))).toThrow(/missing resource session-analysis-cache-permission/);expect(()=>check(plan({...creates,trail:"update"},withAnalysis))).toThrow(/must be noop or a session pipeline update/);expect(()=>check(plan({...creates,"session-brief-schedule":"update"},[...withAnalysis,...SESSION_BRIEF_RESOURCES]))).toThrow(/separate reviewed phases/);for(const action of ["delete","replace"])expect(()=>check(plan({"session-analysis-cache-schedule":action},withAnalysis))).toThrow(/forbidden action/)});
+  it("analysis phases refuse unproven role and read-api cascades",()=>{const creates=Object.fromEntries(SESSION_ANALYSIS_CACHE_RESOURCES.map(r=>[r,"create"]));expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withAnalysis))).toThrow(/transcripts updates without the role-ARN cascade/);const withApi=[...withAnalysis,"session-read-api","session-read-api-secret","session-read-api-errors-alarm","session-read-api-throttles-alarm"];expect(()=>check(plan({...creates,"session-read-api":"update"},withApi))).toThrow(/session-read-api may update only with no declared property changes/);expect(()=>check(plan({...creates,"session-read-api-errors-alarm":"update"},withApi))).toThrow(/read api may not change/)});
   const withBrief = [...all, ...SESSION_BRIEF_RESOURCES];
   const briefCreates = Object.fromEntries(SESSION_BRIEF_RESOURCES.map((r) => [r, "create"]));
 

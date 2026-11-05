@@ -10,7 +10,8 @@
     "typecheck": "bun run check:deploy-config && tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
     "dry-run": "wrangler deploy --dry-run --outdir dist",
-    "test:canonical": "vitest run --config vitest.canonical.config.ts"
+    "test:canonical": "vitest run --config vitest.canonical.config.ts",
+    "test:artifact-capacity": "vitest run --config vitest.artifact-capacity.config.ts"
   },
   "dependencies": {
     "hono": "4.12.26",
