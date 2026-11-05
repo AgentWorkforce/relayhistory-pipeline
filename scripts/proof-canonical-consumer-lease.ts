@@ -23,7 +23,7 @@ for (const r of ["anon", "authenticated", "service_role",
   await db.query(`DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='${r}') THEN CREATE ROLE ${r} NOLOGIN; END IF; END $$;`);
 await db.query(readFileSync("scripts/fixtures/230-writer-20261105025000.sql", "utf8"));
 await db.query(readFileSync("supabase/migrations/20261105030000_canonical_feature_consumer_acks.sql", "utf8"));
-await db.query(readFileSync("docs/proposals/20261105033000_canonical_consumer_lease.sql", "utf8"));
+await db.query(readFileSync("docs/proposals/20261105036000_canonical_consumer_lease.sql", "utf8"));
 
 const A = "a".repeat(64), UID = "12345678-1234-1234-1234-123456789012";
 const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
