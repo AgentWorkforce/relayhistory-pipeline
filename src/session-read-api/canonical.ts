@@ -3,6 +3,7 @@ import {isManifestRest} from "../../packages/object-store/src/index.ts";
  * The successful claim-bound pointer RPC is the authentication boundary. No
  * object is read from an unverified JWT claim or caller-supplied object key.
  */
+import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS, ARTIFACT_MAX_SOURCE_POINTERS } from "./canonical-artifact.ts";
 import { canonicalLegacy } from "./canonical-legacy.ts";
 import { createHash } from "node:crypto";
 import { readCanonicalScope, manifestUserId } from "./canonical-projection.ts";
@@ -31,6 +32,8 @@ export interface CanonicalPointer {
   manifest_key: string;
   content_sha256: string;
   raw_format: string;
+  /** Available to the Node catalog capture; legacy compact pointer RPC omits it. */
+  manifest_etag?: string | null;
   revision: number | string;
   deleted_at: null;
 }
@@ -58,8 +61,9 @@ function checked(
   pointers: CanonicalPointer[],
   identity: CanonicalIdentity,
   deps: CanonicalDeps,
+  maxPointersExclusive = MAX_POINTERS,
 ): CanonicalPointer[] {
-  if (!Array.isArray(pointers) || pointers.length >= MAX_POINTERS)
+  if (!Array.isArray(pointers) || pointers.length >= maxPointersExclusive)
     throw new CanonicalReadError("pointer_bound");
   const seen = new Set<string>();
   for (const p of pointers) {
@@ -87,7 +91,7 @@ function checked(
   }
   return pointers;
 }
-function generation(
+export function canonicalSourceGeneration(
   pointers: CanonicalPointer[],
   identity: CanonicalIdentity,
 ): string {
@@ -111,15 +115,23 @@ function generation(
     )
     .digest("hex");
 }
-export async function canonicalSnapshot(
-  deps: CanonicalDeps,
-  identity: CanonicalIdentity,
+export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity) {
+  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS);
+}
+/** Trusted Node producer only. Never called by the raw Worker request path. */
+export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity) {
+  return snapshotWithLimits(deps, identity, ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS, ARTIFACT_MAX_SOURCE_POINTERS + 1);
+}
+async function snapshotWithLimits(
+  deps: CanonicalDeps, identity: CanonicalIdentity,
+  maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number,
 ) {
-  const pointers = checked(await deps.pointers(identity), identity, deps),
-    version = generation(pointers, identity);
+  const pointers = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive),
+    version = canonicalSourceGeneration(pointers, identity);
   if (!pointers.length)
     return {
       generation: version,
+      exists: false,
       legacyCoverage: null,
       rows: [] as Array<{ table: string; row: Record<string, unknown> }>,
     };
@@ -158,6 +170,7 @@ export async function canonicalSnapshot(
           // content_sha256 is the RAW CHUNK HASH CHAIN, not SHA256(manifest bytes).
           if (
             m.raw.content_sha256 !== digest(p.content_sha256) ||
+            (p.manifest_etag != null && read.etag !== p.manifest_etag) ||
             manifestUserId(m) !== p.user_id ||
             String(m.revision) !== String(p.revision) ||
             canonical.sessionId !== p.session_id ||
@@ -180,8 +193,8 @@ export async function canonicalSnapshot(
       },
     },
     {
-      maxScopeBytes: CANONICAL_SCOPE_BYTES,
-      maxScopeEvents: 100000,
+      maxScopeBytes,
+      maxScopeEvents,
       maxRows: 500000,
       insertBatch: 5000,
     },
@@ -190,12 +203,13 @@ export async function canonicalSnapshot(
   );
   if (!result.complete || result.directorySessionId !== identity.sessionId)
     throw new CanonicalReadError("canonical_projection_incomplete");
-  const fresh = checked(await deps.pointers(identity), identity, deps);
-  if (generation(fresh, identity) !== version)
+  const fresh = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive);
+  if (canonicalSourceGeneration(fresh, identity) !== version)
     throw new CanonicalReadError("source_generation_changed");
   const legacy = canonicalLegacy(result.records, identity);
   return {
     generation: version,
+    exists: true,
     legacyCoverage: legacy.coverage,
     rows: [...result.projectionRows, ...legacy.rows],
   };
