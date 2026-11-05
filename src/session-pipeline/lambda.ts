@@ -21,8 +21,9 @@
  * rebuilds missing summaries when it does). SESSION_BRIEF_ENABLED=true arms brief
  * wakeups as sessions index and lets the brief schedule run; with no
  * `openai_api_key` a brief tick claims nothing (src/session-brief/config.ts).
- * SESSION_DESKTOP_CATALOG_ENABLED=1 (only the literal "1"; default off) lets the
- * search stage write the desktop catalog; SEARCH_INDEX_ENABLED alone never does
+ * SESSION_DESKTOP_CATALOG_ENABLED=1 (only the literal "1"; default off) switches the
+ * search stage from the pre-#182 catalog writer to the complete desktop catalog writer
+ * (migration 20261105022000 columns); SEARCH_INDEX_ENABLED alone never does
  * (docs/session-desktop-catalog.md, Activation blockers).
  */
 import pg from "pg";
@@ -67,7 +68,7 @@ export interface LambdaEnv {
   queueUrl: string;
   searchEnabled: boolean;
   replayPagesEnabled: boolean;
-  /** SESSION_DESKTOP_CATALOG_ENABLED=1: the search stage also writes the desktop catalog (default off). */
+  /** SESSION_DESKTOP_CATALOG_ENABLED=1: the search stage writes the complete desktop catalog; off (default): the pre-#182 writer. */
   desktopCatalogEnabled: boolean;
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
@@ -232,8 +233,8 @@ async function init(): Promise<Runtime> {
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
       // Raised to the replay producer's source bound only when that stage is on.
       limits: searchIndexLimits(env.replayPagesEnabled),
-      // Default off and separate from SEARCH_INDEX_ENABLED: the desktop catalog writer
-      // waits on migration 20261105031000 (docs/session-desktop-catalog.md).
+      // Default off and separate from SEARCH_INDEX_ENABLED: off keeps the pre-#182 catalog
+      // writer; the desktop catalog writer waits on migration 20261105031000 (docs/session-desktop-catalog.md).
       ...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}),
     };
   }

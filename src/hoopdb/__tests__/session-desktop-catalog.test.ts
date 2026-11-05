@@ -6,7 +6,9 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   directoryCatalogFromProjection,
+  directoryCatalogWriter,
   writeDirectoryCatalog,
+  writeLegacyDirectoryCatalog,
 } from "../session-directory-catalog.ts";
 const root = join(import.meta.dir, "../../.."),
   read = (p: string) => readFileSync(join(root, p), "utf8"),
@@ -14,7 +16,7 @@ const root = join(import.meta.dir, "../../.."),
 afterEach(async () => {
   for (const db of opened.splice(0)) await db.close();
 });
-async function database() {
+async function database(before?: string) {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   opened.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
@@ -22,7 +24,8 @@ async function database() {
   await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
   await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort())
-    await db.exec(read("supabase/migrations/" + file));
+    if (before === undefined || file < before)
+      await db.exec(read("supabase/migrations/" + file));
   await db.query(
     "INSERT INTO sessions.session_directory_search_token_policy(issuer,audience) VALUES('https://issuer.test','session-directory-search')",
   );
@@ -230,4 +233,42 @@ test("worker has no direct table grant; missing/tombstoned sessions are not live
   } finally {
     await db.exec("RESET ROLE");
   }
+});
+
+const legacyKey = { orgId: "org-a", workspaceId: "ws-a", harness: "codex", sessionId: "legacy" };
+const legacyCatalog = () =>
+  directoryCatalogFromProjection([
+    { table: "session_catalog", row: { models: ["gpt-model"], project_key: "github.com/acme/widgets", project_key_method: "git_remote", project_id: "acme/widgets", repo_url: "git@github.com:acme/widgets.git", git_branch: "main" } },
+    { table: "session_catalog_agents", row: { agent_name: "codex" } },
+    { table: "session_relationships", row: { relationship_uid: "edge", child_session_id: "child", child_model: "m", child_agent_name: "guardian", child_agent_type: "guardian" } },
+  ]);
+async function seedLegacy(db: PGlite) {
+  await db.query(
+    "INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at) VALUES('org-a','ws-a','codex','legacy',now(),now())",
+  );
+}
+test("flag off selects the pre-#182 writer, flag on the 20261105022000 writer", () => {
+  expect(directoryCatalogWriter(false)).toBe(writeLegacyDirectoryCatalog);
+  expect(directoryCatalogWriter(true)).toBe(writeDirectoryCatalog);
+});
+test("pre-#182 writer runs on a schema without 20261105022000; the #182 writer cannot", async () => {
+  const db = await database("20261105022000");
+  await seedLegacy(db);
+  expect(await writeLegacyDirectoryCatalog(db as never, legacyKey, legacyCatalog())).toEqual({ written: true });
+  const row = (await db.query<Record<string, unknown>>(
+    "SELECT agent_names,catalog_models,project_key,project_id,git_repo,git_branch,agent_name,catalog_projected_at IS NOT NULL AS projected FROM sessions.session_directory WHERE session_id='legacy'",
+  )).rows[0];
+  expect(row).toEqual({ agent_names: ["codex"], catalog_models: ["gpt-model"], project_key: "github.com/acme/widgets", project_id: "acme/widgets", git_repo: "git@github.com:acme/widgets.git", git_branch: "main", agent_name: "codex", projected: true });
+  expect((await db.query("SELECT relationship_uid,child_session_id FROM sessions.session_directory_relationships")).rows).toEqual([{ relationship_uid: "edge", child_session_id: "child" }]);
+  expect((await db.query("SELECT agent_name FROM sessions.session_directory_agents")).rows).toEqual([{ agent_name: "codex" }]);
+  await expect(writeDirectoryCatalog(db as never, legacyKey, legacyCatalog())).rejects.toThrow();
+});
+test("pre-#182 writer on the full schema leaves every 20261105022000 column untouched", async () => {
+  const db = await database();
+  await seedLegacy(db);
+  expect(await writeLegacyDirectoryCatalog(db as never, legacyKey, legacyCatalog())).toEqual({ written: true });
+  expect((await db.query(
+    "SELECT catalog_projected_at IS NOT NULL AS projected,catalog_read_projected_at,catalog_read_epoch FROM sessions.session_directory WHERE session_id='legacy'",
+  )).rows[0]).toEqual({ projected: true, catalog_read_projected_at: null, catalog_read_epoch: null });
+  expect((await db.query("SELECT child_model,child_agent_name,child_agent_type FROM sessions.session_directory_relationships")).rows).toEqual([{ child_model: null, child_agent_name: null, child_agent_type: null }]);
 });

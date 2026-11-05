@@ -23,6 +23,11 @@ The catalog must not be served until these are resolved:
 
 ### Writer switch: `SESSION_DESKTOP_CATALOG_ENABLED`
 
-The search stage (`src/session-pipeline/search-index.ts`) writes the catalog only when the session pipeline Lambda runs with `SESSION_DESKTOP_CATALOG_ENABLED=1` (only the literal `"1"`; unset or any other value is off, with no error). `SEARCH_INDEX_ENABLED=1` alone must never activate the writer: the search stage is live in production, and with this switch off it does what it did before #182 except that it skips the catalog write entirely (no catalog query, same results, partial states and failure handling).
+Flag off = pre-#182 writer; flag on = complete catalog with 20261105022000 columns. The search stage (`src/session-pipeline/search-index.ts`) picks its catalog writer with `directoryCatalogWriter` (`src/hoopdb/session-directory-catalog.ts`) from the session pipeline Lambda's `SESSION_DESKTOP_CATALOG_ENABLED`. Only the literal `"1"` turns it on; unset or any other value is off, with no error.
+
+- **Off (default):** `writeLegacyDirectoryCatalog`, the writer as it was before #182 (0c12036, unchanged until a49219d^1). It writes the same columns, values and query shape: agent names, catalog models, project key and method, initial commit, originator, agent version, project id, repo, branch, the scalar agent and search text, `catalog_projected_at`, agent rows, and parent -> child edges (uid and child id only). It writes none of 20261105022000's columns (no `child_*` edge metadata, no `catalog_read_*`, no completeness flags) and runs on a schema without that migration.
+- **On:** `writeDirectoryCatalog`, #182's complete desktop catalog writer, which needs 20261105022000 and records the readiness markers this read model checks.
+
+`SEARCH_INDEX_ENABLED=1` alone must never select the desktop writer: the search stage is live in production and must keep writing exactly what it wrote before #182.
 
 The stack (`stacks/aws/session-pipeline.ts`) always sets `SESSION_DESKTOP_CATALOG_ENABLED="0"` and refuses `transcriptStore.sessionPipeline.desktopCatalog: true` ("desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet"). Activation is: land and review the forget/reproject fix (follow-up migration 20261105031000, blocker 1 above), resolve or accept the other blockers, then lift the stack refusal and wire the env to the input in a reviewed PR, and only then flip the flag. Applying migrations and deploying still need the owner's separate approval.

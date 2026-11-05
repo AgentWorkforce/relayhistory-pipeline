@@ -303,7 +303,7 @@ describe("search index from S3", () => {
     const deps={...searchDeps(ch.ch,sb.transact),writeEvents:async(_db:unknown,_key:unknown,input:unknown)=>{writes.push(input);return {written:true};}};
     expect(await indexSearchScope(scope,deps)).toMatchObject({complete:false});expect(writes).toHaveLength(0);
   });
-  test("with the desktop catalog flag on, writes project/repository catalog only after a complete canonical scope projection", async () => {
+  test("writes project/repository catalog only after a complete canonical scope projection", async () => {
     const sessionRecord: RelayhistoryStreamRecord = {
       kind: "session",
       origin_id: "desktop-origin",
@@ -338,7 +338,6 @@ describe("search index from S3", () => {
     }> = [];
     const deps: SearchIndexDeps = {
       ...searchDeps(ch.ch, sb.transact),
-      desktopCatalog: true,
       writeCatalog: async (_db, key, catalog) => {
         writes.push({ key, catalog });
         return { written: true };
@@ -599,7 +598,8 @@ describe("SQS consumer", () => {
   }
 
   // SEARCH_INDEX_ENABLED=1 and SESSION_DESKTOP_CATALOG_ENABLED as lambda.ts wires them into the search deps.
-  function searchOnConsumer(ch: ClickHouseClient, live: () => string[], desktopCatalogEnv: string | undefined, writeCatalog?: SearchIndexDeps["writeCatalog"]) {
+  // Every statement the search stage sends is captured raw (SQL text and parameters).
+  function searchOnConsumer(ch: ClickHouseClient, live: () => string[], desktopCatalogEnv: string | undefined) {
     const { deps, sb } = consumer(ch, live);
     const env = lambdaEnv({
       AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "bucket", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true",
@@ -607,52 +607,79 @@ describe("SQS consumer", () => {
       ...(desktopCatalogEnv === undefined ? {} : { SESSION_DESKTOP_CATALOG_ENABLED: desktopCatalogEnv }),
     });
     expect(env.searchEnabled).toBe(true);
-    deps.search = { ...deps.search!, ...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}), ...(writeCatalog ? { writeCatalog } : {}) };
-    return { deps, sb };
+    const raw: { text: string; params: unknown[] }[] = [];
+    const transact: SearchIndexDeps["transact"] = (work) =>
+      sb.transact((tx) => work({ query: (text: string, params?: unknown[]) => (raw.push({ text, params: params ?? [] }), tx.query(text, params)) } as SqlExecutor));
+    deps.search = { ...deps.search!, transact, ...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}) };
+    return { deps, sb, raw };
   }
-  const catalogQueries = (calls: string[]) => calls.filter((c) => c.includes("session_directory_agents") || c.includes("catalog_projected_at"));
 
-  test("desktop catalog: SEARCH_INDEX_ENABLED=1 with SESSION_DESKTOP_CATALOG_ENABLED unset indexes but never calls the catalog writer", async () => {
-    const key = await writeSession("srv_bb", [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello")]);
-    for (const flag of [undefined, "0", "true"]) {
+  /** The columns a catalog statement writes: the directory UPDATE's SET targets and each companion INSERT's column list. */
+  function catalogWrite(raw: { text: string; params: unknown[] }[]) {
+    const writes = raw.filter((q) => q.text.includes("INSERT INTO sessions.session_directory_agents"));
+    expect(writes).toHaveLength(1);
+    const { text, params } = writes[0]!;
+    const sql = text.replace(/--[^\n]*/g, "");
+    const set = /UPDATE sessions\.session_directory AS d\s+SET([\s\S]*?)\s+FROM live AS l/.exec(sql)![1]!;
+    const targets: string[] = [];
+    let depth = 0, part = "";
+    for (const c of `${set},`) {
+      if (c === "(") depth++;
+      if (c === ")") depth--;
+      if (c === "," && depth === 0) { targets.push(part.split("=")[0]!.trim()); part = ""; } else part += c;
+    }
+    const insert = (table: string) => new RegExp(`INSERT INTO sessions\\.${table}\\s*\\(([^)]*)\\)`).exec(sql)![1]!.split(",").map((s) => s.trim());
+    return { sql, params, directory: targets, agents: insert("session_directory_agents"), relationships: insert("session_directory_relationships") };
+  }
+
+  // Pinned from 0c12036's src/hoopdb/session-directory-catalog.ts (unchanged until a49219d^1, the main before #182).
+  const PRE_182_DIRECTORY_COLUMNS = ["agent_names", "catalog_models", "project_key", "project_key_method", "initial_commit", "originator", "agent_version", "project_id", "git_repo", "git_branch", "agent_name", "agent_name_normalized", "search_text", "catalog_projected_at"];
+  const PRE_182_AGENT_COLUMNS = ["org_id", "workspace_id", "harness", "session_id", "agent_name", "agent_name_normalized", "last_activity_at"];
+  const PRE_182_RELATIONSHIP_COLUMNS = ["org_id", "workspace_id", "harness", "parent_session_id", "relationship_uid", "child_session_id"];
+  // #182's writer adds only migration 20261105022000 columns.
+  const MIGRATION_022000_DIRECTORY_COLUMNS = ["catalog_read_projected_at", "catalog_read_version", "catalog_read_epoch", "catalog_models_complete", "catalog_relationships_complete"];
+  const MIGRATION_022000_RELATIONSHIP_COLUMNS = ["child_model", "child_agent_name", "child_agent_type"];
+
+  const catalogSession = (): RelayhistoryStreamRecord[] => [
+    event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello"),
+    { kind: "session", origin_id: "desktop-origin", record_id: "session-1", revision: "1", operation: "upsert", received_at: AT,
+      payload: { project_key: "github.com/acme/widgets", project_key_method: "git_remote", repo_url: "git@github.com:acme/widgets.git", git_branch: "main", agent_name: "codex", models_json: ["gpt-5"] } },
+  ];
+
+  test("desktop catalog off: SEARCH_INDEX_ENABLED=1 indexes and runs the pre-#182 catalog writer, column for column", async () => {
+    const key = await writeSession("srv_bb", catalogSession());
+    for (const flag of [undefined, "0", "true", " 1"]) {
       const ch = fakeClickHouse();
-      const spied: unknown[] = [];
-      const { deps, sb } = searchOnConsumer(ch.ch, () => [key], flag, async (_db, k) => {
-        spied.push(k);
-        return { written: true };
-      });
+      const { deps, raw } = searchOnConsumer(ch.ch, () => [key], flag);
       expect("desktopCatalog" in deps.search!).toBe(false);
       expect((await processBatch([{ messageId: "m1", body: s3Put(key, "01") }], deps)).batchItemFailures).toEqual([]);
       expect(ch.final().map((r) => r.content)).toEqual(["hello"]);
       expect(ch.state.at(-1)?.needs_full).toBe(0);
-      expect(sb.calls.some((c) => c.includes("event_projection_sources"))).toBe(true);
-      expect(spied).toEqual([]);
-      expect(catalogQueries(sb.calls)).toEqual([]);
+      const w = catalogWrite(raw);
+      expect(w.directory).toEqual(PRE_182_DIRECTORY_COLUMNS);
+      expect(w.agents).toEqual(PRE_182_AGENT_COLUMNS);
+      expect(w.relationships).toEqual(PRE_182_RELATIONSHIP_COLUMNS);
+      expect(w.sql).toContain("DO UPDATE SET child_session_id = excluded.child_session_id\n");
+      for (const column of [...MIGRATION_022000_DIRECTORY_COLUMNS, ...MIGRATION_022000_RELATIONSHIP_COLUMNS, "event_projection_epoch"]) expect(w.sql).not.toContain(column);
+      // The pre-#182 parameters: key, agents, models, project key/method, commit, originator, version, id, repo, branch, normalized agents, edge uids, edge children.
+      expect(w.params).toEqual(["org_1", "ws_1", "claude", "sess_1", ["codex"], ["gpt-5"], "github.com/acme/widgets", "git_remote", null, null, null, "acme/widgets", "git@github.com:acme/widgets.git", "main", ["codex"], [], []]);
     }
-    // The real writer (no seam) issues no catalog query either.
-    const ch = fakeClickHouse();
-    const { deps, sb } = searchOnConsumer(ch.ch, () => [key], undefined);
-    expect((await processBatch([{ messageId: "m2", body: s3Put(key, "02") }], deps)).batchItemFailures).toEqual([]);
-    expect(ch.final().map((r) => r.content)).toEqual(["hello"]);
-    expect(catalogQueries(sb.calls)).toEqual([]);
   });
 
-  test("desktop catalog: SESSION_DESKTOP_CATALOG_ENABLED=1 calls the catalog writer after a complete pass", async () => {
-    const key = await writeSession("srv_bb", [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello")]);
+  test("desktop catalog on: SESSION_DESKTOP_CATALOG_ENABLED=1 runs the #182 writer with the 20261105022000 columns", async () => {
+    const key = await writeSession("srv_bb", catalogSession());
     const ch = fakeClickHouse();
-    const spied: unknown[] = [];
-    const { deps } = searchOnConsumer(ch.ch, () => [key], "1", async (_db, k) => {
-      spied.push(k);
-      return { written: true };
-    });
+    const { deps, raw } = searchOnConsumer(ch.ch, () => [key], "1");
     expect(deps.search!.desktopCatalog).toBe(true);
     expect((await processBatch([{ messageId: "m1", body: s3Put(key, "01") }], deps)).batchItemFailures).toEqual([]);
     expect(ch.final().map((r) => r.content)).toEqual(["hello"]);
-    expect(spied).toEqual([{ orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: scope.sessionId }]);
-    // Without the seam the real writer reaches the database.
-    const real = searchOnConsumer(fakeClickHouse().ch, () => [key], "1");
-    expect((await processBatch([{ messageId: "m2", body: s3Put(key, "02") }], real.deps)).batchItemFailures).toEqual([]);
-    expect(catalogQueries(real.sb.calls)).toHaveLength(1);
+    const w = catalogWrite(raw);
+    expect(w.directory).toEqual([...PRE_182_DIRECTORY_COLUMNS, ...MIGRATION_022000_DIRECTORY_COLUMNS]);
+    expect(w.agents).toEqual(PRE_182_AGENT_COLUMNS);
+    expect(w.relationships).toEqual([...PRE_182_RELATIONSHIP_COLUMNS, ...MIGRATION_022000_RELATIONSHIP_COLUMNS]);
+    expect(w.params).toHaveLength(23);
+    expect(w.params.slice(0, 17)).toEqual(["org_1", "ws_1", "claude", "sess_1", ["codex"], ["gpt-5"], "github.com/acme/widgets", "git_remote", null, null, null, "acme/widgets", "git@github.com:acme/widgets.git", "main", ["codex"], [], []]);
+    expect(w.params.slice(17)).toEqual([[], [], [], 1, true, true]);
   });
 
   test("a manifest put upserts the pointer, then indexes its session; duplicates in a batch collapse", async () => {
