@@ -356,7 +356,6 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105021000_session_large_read_jobs.sql` | table sessions.session_large_read_jobs |
 | `upstream:20261105022000_session_desktop_catalog.sql` | column sessions.session_directory.catalog_read_version |
 | `upstream:20261105023000_session_analysis_publications.sql` | table sessions.session_analysis_publications |
-| `upstream:20261103100000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261102020000_session_brief_state.sql`              | ALTER-only: column sessions.session_briefs.state                                                                        |
 | `upstream:20261104020000_auth_sessions.sql`                    | table sessions.auth_sessions                                                                                            |
 | `upstream:20261104020100_auth_session_verify.sql`              | table sessions.auth_token_verifier_policy                                                                               |
@@ -372,6 +371,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105025000_canonical_feature_journal.sql` | table sessions.canonical_feature_journal |
 | `upstream:20261105026000_canonical_history_lineage.sql` | table sessions.ingest_history_carriers |
 | `upstream:20261105030000_canonical_feature_consumer_acks.sql` | table sessions.canonical_feature_copy_state |
+| `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

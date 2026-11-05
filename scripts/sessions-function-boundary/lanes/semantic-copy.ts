@@ -1,7 +1,7 @@
 /** Lane: dormant global semantic-feature copier checkpoints (#191). */
 import type { LaneManifest } from "../types.ts";
 
-const MIGRATION = "supabase/migrations/20261103100000_semantic_copy_state.sql";
+const MIGRATION = "supabase/migrations/20261105035000_semantic_copy_state.sql";
 
 export const semanticCopy: LaneManifest = {
   lane: "semantic-copy",

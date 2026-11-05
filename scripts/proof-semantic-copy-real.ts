@@ -35,7 +35,7 @@ await owner.query("GRANT USAGE ON SCHEMA sessions TO semantic_source_reader");
 for(const r of FEATURE_SOURCE_AUTHORITY.catalog.relations)await owner.query(r.identity==="sessions.__migrations"?"GRANT SELECT(name,checksum) ON "+r.identity+" TO semantic_source_reader":"GRANT SELECT ON "+r.identity+" TO semantic_source_reader");
 for(const f of FEATURE_SOURCE_AUTHORITY.catalog.functions)if(!f.securityDefiner)await owner.query("GRANT EXECUTE ON FUNCTION "+f.identity+" TO semantic_source_reader");
 await metadataOwner.query("CREATE SCHEMA sessions;GRANT USAGE ON SCHEMA sessions TO service_role");
-await metadataOwner.query(await readFile(root+"/supabase/migrations/20261103100000_semantic_copy_state.sql","utf8"));
+await metadataOwner.query(await readFile(root+"/supabase/migrations/20261105035000_semantic_copy_state.sql","utf8"));
 const sourcePool=new pg.Pool({...credentials,database:"semantic_source_fixture",connectionTimeoutMillis:1000,user:"semantic_source_reader",options:"-c default_transaction_read_only=on -c statement_timeout=15000"}),statePool=new pg.Pool({...credentials,database:"semantic_state_fixture",connectionTimeoutMillis:1000,user:"service_role"});
 const source=new SemanticPostgresExecutor(sourcePool,true),db=new SemanticPostgresExecutor(statePool);
 const endpoint="http://127.0.0.1:"+chport,rootCh=createClickHouseClient({url:endpoint,user:"proof",password:"synthetic-semantic-only",database:"default"});await rootCh.command("DROP DATABASE IF EXISTS semantic_copy_fixture");await rootCh.command("CREATE DATABASE semantic_copy_fixture");
