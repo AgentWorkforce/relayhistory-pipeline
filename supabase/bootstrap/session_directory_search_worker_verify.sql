@@ -70,6 +70,7 @@ DECLARE
  'sessions.request_session_analysis_cache(text,text,text)',
  'sessions.search_session_directory(text,text,text,text,text,boolean,text,text,text,text,text,timestamp with time zone,timestamp with time zone,text,timestamp with time zone,text,text,text,integer)',
  'sessions.session_brief(text,text,text)',
+ 'sessions.session_brief_document_authority(text,text[],text[])',
  'sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)',
  'sessions.session_directory_analysis_cache(text,text,text)',
  'sessions.session_directory_desktop_catalog(text,text,text)',

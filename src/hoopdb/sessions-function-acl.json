@@ -1,6 +1,10 @@
 {
   "comment": "Expected ACL of every sessions function after a clean migrate (src/hoopdb/migrate-guards.ts sessionsFunctionAcl). Regenerate only in a reviewed change; tests compare it exactly on PGlite and real PostgreSQL 15/17.",
   "functions": {
+    "sessions.ack_session_brief_documents(uuid,jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.applied_repo_evidence(jsonb,jsonb)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -17,6 +21,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.backfill_session_brief_documents(integer)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.canonical_feature_changed(jsonb,jsonb,jsonb,jsonb)": [
       "<owner>:EXECUTE"
     ],
@@ -29,6 +37,10 @@
       "service_role:EXECUTE"
     ],
     "sessions.claim_session_analysis_cache()": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.claim_session_brief_documents(uuid,integer)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
@@ -531,6 +543,9 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.queue_session_brief_document(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.repo_backfill_report()": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -566,6 +581,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.retry_session_brief_documents(uuid,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.retry_session_large_read(text,text,text,text,uuid,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -584,6 +603,16 @@
     "sessions.session_brief(text,text,text)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
+    ],
+    "sessions.session_brief_document_authority(text,text[],text[])": [
+      "<owner>:EXECUTE",
+      "session_directory_search_worker:EXECUTE"
+    ],
+    "sessions.session_brief_document_changed()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_brief_document_json(sessions.session_directory,boolean)": [
+      "<owner>:EXECUTE"
     ],
     "sessions.session_briefs_forget()": [
       "<owner>:EXECUTE"
