@@ -139,3 +139,36 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test src/session-pipeline/__tests__/brief-documents.postgres.test.ts
+  consumer-lease:
+    name: canonical consumer lease proof (PG ${{ matrix.pg }})
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      # Fresh superuser container: the proof creates/drops its own database.
+      - name: Canonical consumer lease proof (own database)
+        env:
+          PROOF_DISPOSABLE: "1"
+        run: |
+          set -o pipefail
+          bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
+            tee consumer-lease-pg${{ matrix.pg }}.log
+          grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}.log

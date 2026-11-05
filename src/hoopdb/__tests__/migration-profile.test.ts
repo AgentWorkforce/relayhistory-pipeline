@@ -1513,24 +1513,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const C = "upstream:20261105030000_canonical_feature_consumer_acks.sql";
     const D = "upstream:20261105031000_desktop_catalog_forget_reproject.sql";
     const S = "upstream:20261105035000_semantic_copy_state.sql";
+    const E = "upstream:20261105036000_canonical_consumer_lease.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = (name: string) =>
       db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8"));
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, S]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, S, E]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, S]));
-    // 035000 is the latest lane: 031000 and 030000 both refuse while it is applied.
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, S, E]));
+    // 036000 is the latest lane: 035000, 031000 and 030000 all refuse while it is applied.
+    expect((await failure(rollback("20261105035000_semantic_copy_state.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105031000_desktop_catalog_forget_reproject.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105030000_canonical_feature_consumer_acks.down.sql")))?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([C, D]));
-    await rollback("20261105035000_semantic_copy_state.down.sql");
-    expect(await names()).not.toContain(S);
-    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.search_feature_copy_state')::text r")).rows[0]?.r).toBeNull();
+    expect(await names()).toEqual(expect.arrayContaining([C, D, S, E]));
     const relation = async (name: string) =>
       (await db.query<{ r: string | null }>("SELECT to_regclass($1)::text r", [name])).rows[0]?.r ?? null;
     const catalogRpc = async () =>
@@ -1547,6 +1546,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
     // can the next down preserve a gap-free applied prefix.
+    await rollback("20261105036000_canonical_consumer_lease.down.sql");
+    expect(await names()).not.toContain(E);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_consumer_lease')::text r")).rows[0]?.r).toBeNull();
+    await rollback("20261105035000_semantic_copy_state.down.sql");
+    expect(await names()).not.toContain(S);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.search_feature_copy_state')::text r")).rows[0]?.r).toBeNull();
     await rollback("20261105031000_desktop_catalog_forget_reproject.down.sql");
     expect(await names()).not.toContain(D);
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBeNull();
@@ -1563,13 +1568,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105024000_session_brief_documents.down.sql");
     expect(await names()).not.toContain(B);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBeNull();
-    // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000 and 035000; the
+    // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 035000 and 036000; the
     // post-validation exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, S]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, S, E]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await passed()).toBe(true);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_consumer_lease')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_consumer_lease");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBe("sessions.session_brief_document_scopes");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBe("sessions.ingest_history_switch");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_copy_state");

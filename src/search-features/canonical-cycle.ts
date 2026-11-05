@@ -114,6 +114,13 @@ export async function copyCanonicalEntry(
   /** Stable, non-secret deployment identity — REQUIRED (no unsafe default).
    *  Two deployments sharing database/table names still differ. */
   targetId: string,
+  /** Lease/ownership gates — a lost lease stops the copy BEFORE the next
+   *  CH write and BEFORE finish, leaving restartable durable state. */
+  guards?: { beforeWrite?: () => Promise<boolean>;
+             beforeFinish?: () => Promise<boolean> },
+  /** Genuine cancellation: checked at every side-effecting boundary so a
+   *  timed-out/aborted op performs zero later CH/ACK/finish effects. */
+  signal?: AbortSignal,
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
@@ -182,9 +189,15 @@ export async function copyCanonicalEntry(
             entry.kind === "retire"
               ? (rows.rows as CanonicalBriefTombstone[]) : [], ev);
     if (produced.kind !== "rows") return produced;
+    // Post-await fences: an abort between boundaries performs zero later
+    // CH/ACK effects even if the blocked promise releases afterward.
+    if (signal?.aborted)
+      return { kind: "refused" as const, reason: "aborted" };
     await ch.insert(
       kind === "event" ? EVENT_FEATURES_TABLE : BRIEF_FEATURES_TABLE,
       produced.rows);
+    if (signal?.aborted)
+      return { kind: "refused" as const, reason: "aborted" };
     await acks.ackPage({
       entry, kind, cursor: request ?? "start",
       nextCursor: page.cursor, pageSha256: page.pageSha256,
@@ -206,6 +219,9 @@ export async function copyCanonicalEntry(
         entry.kind === "retire", rs[kind].cursor)) {
       // #233 fences: page source + pointer binding + recomputed hash +
       // well-shaped non-repeating cursor.
+      if (signal?.aborted) return { kind: "refused", reason: "aborted" };
+      if (guards?.beforeWrite && !(await guards.beforeWrite()))
+        return { kind: "refused", reason: "lease_lost" };
       if (!Array.isArray(page.rows) || page.source !== entry.imageKey ||
           page.pointerSetHash !== entry.pointerSet.hash ||
           !hash(page.pageSha256) || page.pageSha256 !== hashRows(page.rows) ||
@@ -227,6 +243,12 @@ export async function copyCanonicalEntry(
       }
     }
   }
+  if (signal?.aborted) return { kind: "refused", reason: "aborted" };
+  if (guards?.beforeFinish && !(await guards.beforeFinish()))
+    return { kind: "refused", reason: "lease_lost" };
+  // An abort inside beforeFinish must still refuse — check again before the
+  // finish CAS so a released-abort performs zero later effects.
+  if (signal?.aborted) return { kind: "refused", reason: "aborted" };
   // finish CAS: terminal descriptors + all page ACKs + still-current authority
   await acks.finish({
     entry, terminalEvent, terminalBrief,
