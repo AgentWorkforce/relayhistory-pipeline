@@ -40,8 +40,10 @@ const toEntry = (r: Row): CanonicalJournalEntry => {
         imageKey: r.image_key, schemaGeneration: r.schema_generation,
         sourceHash: r.source_hash, priorKeysetHash: r.prior_keyset_hash ?? "",
         scope,
+        // 610 CHECK: prior authority lives in source_authority on retire
+        // (prior_source_authority is always NULL for a retire row).
         priorSourceAuthority:
-          JSON.parse(r.prior_source_authority ?? "null") as CanonicalSourceAuthority,
+          JSON.parse(r.source_authority) as CanonicalSourceAuthority,
         pointerSet }
     : { kind: "publish", revision: String(r.revision),
         imageKey: r.image_key, schemaGeneration: r.schema_generation,
@@ -93,9 +95,8 @@ export class CanonicalJournalStore implements CanonicalJournalPort {
       hasMore: rows.length === limit,
     };
   }
-  /** CAS-fenced append — a stale revision can never land. */
-  async append(entry: CanonicalJournalEntry, observed: string): Promise<void> {
-    if (BigInt(entry.revision) <= BigInt(observed))
-      throw new Error("stale_revision");
+  /** Sole writer is the 620 _install invoker — never a no-op. */
+  async append(_e: CanonicalJournalEntry, _o: string): Promise<void> {
+    throw new Error("journal is read-only; sole writer is the _install invoker");
   }
 }

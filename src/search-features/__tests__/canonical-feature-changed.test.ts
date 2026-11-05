@@ -40,9 +40,12 @@ const fakeDb = () => {
   return { table, query };
 };
 const base = {
-  scope: { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s" },
-  source: { authorityId: "u-1", epoch: "1", fingerprint: "a".repeat(64) },
-  pointerSet: { hash: "p".repeat(64), count: 1 },
+  scope: { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s",
+           generation: "a".repeat(64) },
+  source: { authorityId: "12345678-1234-1234-1234-123456789012",
+            epoch: "1", fingerprint: "a".repeat(64) },
+  pointerSet: { authorityId: "12345678-1234-1234-1234-123456789012",
+                hash: "c".repeat(64), count: "1" },
 };
 const seed = (db: ReturnType<typeof fakeDb>) =>
   db.query("INSERT INTO x(revision,kind) VALUES($1,'seed')", ["100"]);
@@ -61,8 +64,10 @@ describe("canonical_feature_changed (620 invoker client)", () => {
     const db = fakeDb();
     const fn = new CanonicalFeatureChanged({ query: db.query });
     await seed(db);
-    const prior = { authorityId: "u-0", epoch: "0", fingerprint: "b".repeat(64) };
-    const priorPtr = { hash: "q".repeat(64), count: 1 };
+    const prior = { authorityId: "87654321-4321-4321-4321-210987654321",
+                    epoch: "0", fingerprint: "b".repeat(64) };
+    const priorPtr = { authorityId: "87654321-4321-4321-4321-210987654321",
+                       hash: "d".repeat(64), count: "1" };
     const rev = await fn.canonicalFeatureChanged({
       ...base, priorSource: prior, priorPointerSet: priorPtr });
     const rows = db.table.filter((r) => r.kind !== "seed")
@@ -95,9 +100,10 @@ describe("canonical_feature_changed (620 invoker client)", () => {
     await seed(db);
     await expect(fn.canonicalFeatureChanged({
       ...base,
-      priorSource: { authorityId: "u-0", epoch: "0",
-                     fingerprint: base.source.fingerprint },
-      priorPointerSet: { hash: "x".repeat(64), count: 1 },
+      priorSource: { authorityId: "87654321-4321-4321-4321-210987654321",
+                     epoch: "0", fingerprint: base.source.fingerprint },
+      priorPointerSet: { authorityId: "87654321-4321-4321-4321-210987654321",
+                         hash: "d".repeat(64), count: "1" },
     })).rejects.toThrow("self_retire");
   });
   test("invalid input refuses before any write", async () => {

@@ -55,6 +55,7 @@ export type CanonicalJournalEntry =
 /** One logical scope the journal is always scoped to (native contract). */
 export interface CanonicalScope {
   orgId: string; workspaceId: string; harness: string; sessionId: string;
+  generation: string;
 }
 /** Replay source authority: publication epoch + snapshot fingerprint. */
 export interface CanonicalSourceAuthority {
@@ -62,7 +63,7 @@ export interface CanonicalSourceAuthority {
 }
 /** Exact captured inventory identity — hash and count, never payload bytes. */
 export interface CanonicalPointerSet {
-  authorityId: string; hash: string; count: number; }
+  authorityId: string; hash: string; count: string; }
 
 /** The 610 transaction port: OWNER-ONLY INVOKER inside the 620 final CAS. */
 export interface CanonicalFeatureChangedPort {
