@@ -18,7 +18,7 @@ export interface CanonicalBackfillImage {
   orgId: string; workspaceId: string; harness: string; sessionId: string;
   imageKey: string; sourceHash: string;
   schemaGeneration: string; epoch: string; fingerprint: string;
-  pointerSetHash: string; pointerSetCount: number;
+  pointerSetHash: string; pointerSetCount: number; pointers: unknown[];
 }
 
 /** The index enumeration port — a stream of image descriptors (JSONL or RPC). */
@@ -55,7 +55,8 @@ export async function backfillFromIndex(
         harness: img.harness, sessionId: img.sessionId,
       },
       sourceAuthority: { epoch: img.epoch, fingerprint: img.fingerprint },
-      pointerSet: { hash: img.pointerSetHash, count: img.pointerSetCount },
+      pointerSet: { hash: img.pointerSetHash, count: img.pointerSetCount,
+        pointers: img.pointers },
     };
     await journal.append(entry, String(BigInt(revision) - 1n));
     entries += 1;

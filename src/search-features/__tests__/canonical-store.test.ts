@@ -7,7 +7,7 @@ import {
 const SCOPE = JSON.stringify({ orgId: "o", workspaceId: "w", harness: "h",
   sessionId: "s" });
 const AUTH = JSON.stringify({ epoch: "1", fingerprint: "a".repeat(64) });
-const PTR = JSON.stringify({ hash: "p".repeat(64), count: 1 });
+const PTR = JSON.stringify({ hash: "p".repeat(64), count: 1, pointers: ["k1"] });
 const fakeDb = () => {
   const table: Record<string, unknown>[] = [];
   const query = async <T>(text: string, params: unknown[] = []) => {

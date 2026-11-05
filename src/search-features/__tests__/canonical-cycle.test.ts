@@ -9,7 +9,7 @@ import { featureVersion } from "../source.ts";
 const HASH = "a".repeat(64);
 const SCOPE = { orgId: "org", workspaceId: "ws", harness: "h", sessionId: "s-1" };
 const AUTH = { epoch: "7", fingerprint: "f".repeat(64) };
-const PTR = { hash: "p".repeat(64), count: 1 };
+const PTR = { hash: "p".repeat(64), count: 1, pointers: ["k1"] };
 const REV = "1000001";
 const stamp = "2026-10-30T10:00:00.000000Z";
 

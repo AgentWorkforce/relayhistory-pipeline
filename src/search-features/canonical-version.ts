@@ -43,9 +43,13 @@ export interface CanonicalJournalPort {
 export type CanonicalJournalEntry =
   | { kind: "publish"; revision: string; imageKey: string;
       schemaGeneration: string; sourceHash: string; scope: CanonicalScope;
-      sourceAuthority: CanonicalSourceAuthority; pointerSet: CanonicalPointerSet }
+      sourceAuthority: CanonicalSourceAuthority; pointerSet: CanonicalPointerSet;
+      /** Replacement only: prior authority + prior SET hash (retire context). */
+      priorSourceAuthority?: CanonicalSourceAuthority;
+      priorKeysetHash?: string }
   | { kind: "retire"; revision: string; imageKey: string;
-      schemaGeneration: string; priorKeysetHash: string; scope: CanonicalScope;
+      schemaGeneration: string; sourceHash: string; priorKeysetHash: string;
+      scope: CanonicalScope;
       priorSourceAuthority: CanonicalSourceAuthority; pointerSet: CanonicalPointerSet };
 
 /** One logical scope the journal is always scoped to (native contract). */
@@ -57,7 +61,8 @@ export interface CanonicalSourceAuthority {
   epoch: string; fingerprint: string;
 }
 /** Exact captured inventory identity — hash and count, never payload bytes. */
-export interface CanonicalPointerSet { hash: string; count: number; }
+export interface CanonicalPointerSet {
+  hash: string; count: number; pointers: unknown[]; }
 
 /** The 610 transaction port: OWNER-ONLY INVOKER inside the 620 final CAS. */
 export interface CanonicalFeatureChangedPort {

@@ -38,7 +38,8 @@ const toEntry = (r: Row): CanonicalJournalEntry => {
   return r.kind === "retire"
     ? { kind: "retire", revision: String(r.revision),
         imageKey: r.image_key, schemaGeneration: r.schema_generation,
-        priorKeysetHash: r.prior_keyset_hash ?? "", scope,
+        sourceHash: r.source_hash, priorKeysetHash: r.prior_keyset_hash ?? "",
+        scope,
         priorSourceAuthority:
           JSON.parse(r.prior_source_authority ?? "null") as CanonicalSourceAuthority,
         pointerSet }
@@ -47,6 +48,11 @@ const toEntry = (r: Row): CanonicalJournalEntry => {
         sourceHash: r.source_hash, scope,
         sourceAuthority:
           JSON.parse(r.source_authority) as CanonicalSourceAuthority,
+        ...(r.prior_source_authority
+          ? { priorSourceAuthority:
+              JSON.parse(r.prior_source_authority) as CanonicalSourceAuthority }
+          : {}),
+        ...(r.prior_keyset_hash ? { priorKeysetHash: r.prior_keyset_hash } : {}),
         pointerSet };
 };
 
@@ -109,11 +115,14 @@ export class CanonicalJournalStore implements CanonicalJournalPort {
     const scope = JSON.stringify(entry.scope);
     const ptr = JSON.stringify(entry.pointerSet);
     const cols = entry.kind === "retire"
-      ? ["retire", scope, entry.schemaGeneration, entry.imageKey, "",
-          entry.priorKeysetHash, "",
+      ? ["retire", scope, entry.schemaGeneration, entry.imageKey,
+          entry.sourceHash, entry.priorKeysetHash, "",
           JSON.stringify(entry.priorSourceAuthority), ptr]
       : ["publish", scope, entry.schemaGeneration, entry.imageKey,
-          entry.sourceHash, "", JSON.stringify(entry.sourceAuthority), "", ptr];
+          entry.sourceHash, entry.priorKeysetHash ?? "",
+          JSON.stringify(entry.sourceAuthority),
+          entry.priorSourceAuthority
+            ? JSON.stringify(entry.priorSourceAuthority) : "", ptr];
     // cols = [kind, scope, schema_generation, image_key, source_hash,
     //         prior_keyset_hash, source_authority, prior_source_authority,
     //         pointer_set]
