@@ -44,6 +44,11 @@ export interface RuntimeHealth {
   readonly lastAt: string | null;
 }
 
+// Bounded collision-resistant fencing identity: a fresh nonce per RUN,
+// capped under the 128-char owner bound regardless of the base length.
+const fencedOwner = (ownerId: string) =>
+  `${ownerId.slice(0, 48)}:${randomUUID().slice(0, 8)}`;
+
 const abortableSleep = (ms: number, sig?: AbortSignal) =>
   new Promise<void>((res) => {
     if (sig?.aborted) return res();
@@ -70,12 +75,10 @@ export class CanonicalConsumerRunner {
     acks: CanonicalPageAckStore, images: CanonicalImagePort,
     ch: ClickHouseClient, cfg: RuntimeConfig,
   ): CanonicalConsumerRunner {
-    // Instance-unique fencing identity: a concurrent run or a re-deployed
-    // worker never shares ownership of the same lease row.
-    const fenced = { ...cfg,
-      ownerId: `${cfg.ownerId}:${randomUUID().slice(0, 8)}` };
     return new CanonicalConsumerRunner(
-      new CanonicalConsumer(db, journal, acks, fenced), images, ch, cfg);
+      new CanonicalConsumer(db, journal, acks,
+        { ...cfg, ownerId: fencedOwner(cfg.ownerId) }),
+      images, ch, cfg);
   }
 
   health(): RuntimeHealth {
@@ -97,8 +100,16 @@ export class CanonicalConsumerRunner {
       const deadline = Date.now() + this.cfg.deadlineMs;
       while (!this.stopped && !signal?.aborted && Date.now() < deadline) {
         try {
+          // Remaining budget bounds THIS drain: external abort OR the run
+          // deadline cancels the operation in-band via AbortSignal.any.
+          const remaining = Math.max(1, deadline - Date.now());
+          const bounded = AbortSignal.any
+            ? AbortSignal.any(
+                [signal ?? new AbortController().signal,
+                 AbortSignal.timeout(remaining)])
+            : signal;
           const r = await this.consumer.drain(
-            this.images, this.ch, signal);
+            this.images, this.ch, bounded);
           this.stats = { ...this.stats, runs: this.stats.runs + 1,
             copied: this.stats.copied + r.copied,
             dead: this.stats.dead + r.dead,
@@ -116,6 +127,9 @@ export class CanonicalConsumerRunner {
         }
         await abortableSleep(this.cfg.pollIntervalMs, signal);
       }
+      if (signal?.aborted || this.stopped ||
+          Date.now() >= deadline)
+        this.stats.status = signal?.aborted ? "aborted" : "deadline";
       return this.health();
     } finally {
       this.running = false;

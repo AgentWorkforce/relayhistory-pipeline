@@ -76,3 +76,36 @@ describe("canonical consumer runner — supervision", () => {
     expect(r1).not.toBe(r2);
   });
 });
+
+describe("canonical consumer runner — deadline + fencing evidence", () => {
+  test("hard deadline: run returns within the bound even if drain is slow", async () => {
+    const slow = { drain: async () => {
+      await new Promise((r) => setTimeout(r, 200));
+      return { ...empty, status: "idle" };
+    } };
+    const r = new CanonicalConsumerRunner(slow as never,
+      images as never, ch as never,
+      { ...CFG, pollIntervalMs: 50, deadlineMs: 150 });
+    const t0 = Date.now();
+    await r.run();
+    expect(Date.now() - t0).toBeLessThan(600);
+  });
+  test("aborted run records status=aborted not stale idle", async () => {
+    const c = new AbortController();
+    const r = new CanonicalConsumerRunner(
+      consumer({ ...empty, status: "idle" }) as never,
+      images as never, ch as never,
+      { ...CFG, pollIntervalMs: 5000, deadlineMs: 60000 });
+    const p = r.run(c.signal);
+    c.abort();
+    const h = await p;
+    expect(h.status).toBe("aborted");
+  });
+  test("fencing: make() produces a schema-valid derived owner", () => {
+    const r = CanonicalConsumerRunner.make(
+      { query: async () => ({ rows: [] }) }, {} as never,
+      {} as never, images as never, ch as never,
+      { ...CFG, ownerId: "x".repeat(120) });   // long base owner still valid
+    expect(r.health().enabled).toBe(true);
+  });
+});

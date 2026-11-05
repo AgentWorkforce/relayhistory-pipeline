@@ -171,7 +171,9 @@ export class CanonicalConsumer {
     // The explicit gate: disabled returns a constant — no partition
     // derivation, no lease, no journal, no CH, zero DB queries.
     if (this.cfg.enabled !== true) return none("idle");
-    if (!(await this.acquireLease())) return none("no_lease");
+    if (!(await this.acquireLease()))
+      return { ...none("no_lease"),
+        checkpoint: await this.readCheckpoint() };
     await this.seedCheckpoint();
     let copied = 0, dead = 0, skipped = 0;
     let checkpoint = await this.readCheckpoint();
@@ -231,24 +233,23 @@ export class CanonicalConsumer {
     // renew the lease, but a hung op must not outlive the TTL and let a
     // competing owner take over mid-write.
     const writeBudget = Math.min(this.cfg.leaseTtlMs / 2, 5000);
-    const withTimeout = <T>(p: Promise<T>, sig?: AbortSignal) =>
-      Promise.race([
-        p,
-        new Promise<T>((_, rej) => {
-          const t = setTimeout(() => rej(new Error("write_timeout")),
-            writeBudget);
-          sig?.addEventListener("abort", () => {
-            clearTimeout(t); rej(new Error("aborted"));
-          }, { once: true });
-        }),
-      ]);
     for (let i = 0; i <= this.cfg.maxRetries; i++) {
       if (signal?.aborted) return "aborted";
+      // One controller: timeout OR external abort cancels the op in-band —
+      // the cycle checks the same signal at every side-effecting boundary,
+      // so a timed-out op performs zero later CH/ACK/finish effects.
+      const ctl = new AbortController();
+      const onAbort = () => ctl.abort();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const timer = setTimeout(() => ctl.abort(), writeBudget);
       try {
-        const r = await withTimeout(copyCanonicalEntry(
+        const r = await copyCanonicalEntry(
           images, this.acks, ch, { checkpoint }, entry, this.cfg.targetId,
           { beforeWrite: () => this.heartbeat(),
-            beforeFinish: () => this.heartbeat() }), signal);
+            beforeFinish: () => this.heartbeat() }, ctl.signal);
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        if (ctl.signal.aborted) return "aborted";
         if (r.kind === "copied") return "copied";
         const reason = (r as { reason: string }).reason;
         if (HOLD.has(reason)) return "hold";
@@ -256,7 +257,9 @@ export class CanonicalConsumer {
           return reason;                        // exact stable poison code
         if (!POISON[reason]) return "hold";   // unknown -> hold, never poison
       } catch (e) {
-        if ((e as Error).message === "aborted") return "aborted";
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        if (ctl.signal.aborted || signal?.aborted) return "aborted";
         return "hold";                          // infra: retryable hold
       }
       await new Promise((r) => setTimeout(r, Math.min(50 * (i + 1), 500)));

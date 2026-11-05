@@ -118,6 +118,9 @@ export async function copyCanonicalEntry(
    *  CH write and BEFORE finish, leaving restartable durable state. */
   guards?: { beforeWrite?: () => Promise<boolean>;
              beforeFinish?: () => Promise<boolean> },
+  /** Genuine cancellation: checked at every side-effecting boundary so a
+   *  timed-out/aborted op performs zero later CH/ACK/finish effects. */
+  signal?: AbortSignal,
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
@@ -210,6 +213,7 @@ export async function copyCanonicalEntry(
         entry.kind === "retire", rs[kind].cursor)) {
       // #233 fences: page source + pointer binding + recomputed hash +
       // well-shaped non-repeating cursor.
+      if (signal?.aborted) return { kind: "refused", reason: "aborted" };
       if (guards?.beforeWrite && !(await guards.beforeWrite()))
         return { kind: "refused", reason: "lease_lost" };
       if (!Array.isArray(page.rows) || page.source !== entry.imageKey ||
@@ -233,6 +237,7 @@ export async function copyCanonicalEntry(
       }
     }
   }
+  if (signal?.aborted) return { kind: "refused", reason: "aborted" };
   if (guards?.beforeFinish && !(await guards.beforeFinish()))
     return { kind: "refused", reason: "lease_lost" };
   // finish CAS: terminal descriptors + all page ACKs + still-current authority
